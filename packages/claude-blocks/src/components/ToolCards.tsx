@@ -26,6 +26,38 @@ export interface CollapseInjection {
 
 const HL_FONT = { style: { fontFamily: 'inherit' } } as const;
 
+/**
+ * Prism tokenises the WHOLE string and builds a React element per token, but
+ * the card body is a 180-320px scroll box — everything past the first screens
+ * is DOM nobody looks at. Measured (E2E ct-e2e14 §2.4): a 29KB / 6000-line
+ * `seq` output cost 2.27s of main-thread work on expand, with the payload
+ * ALREADY in memory — the delay was rendering, not loading, and it repeated
+ * on every re-expand.
+ *
+ * Threshold deliberately equals the dehydration threshold in
+ * `history-payload-dehydrate.js`: content too big to ship eagerly is also too
+ * big to tokenise. Past it the plain <pre> path renders the identical text
+ * (same mono font, same scroll box, one text node instead of thousands of
+ * elements) and only trades syntax colors — a readability aid — for a card
+ * that opens now. Real source files stay under it and keep highlighting.
+ */
+const HIGHLIGHT_MAX_CHARS = 16 * 1024;
+
+const PlainOutput: React.FC<{ text: string; maxHeight: number; topBorder?: boolean }> =
+({ text, maxHeight, topBorder }) => (
+  <pre
+    className="cb-plain-out"
+    style={{
+      maxHeight,
+      marginTop: topBorder ? 6 : 0,
+      paddingTop: 6,
+      borderTop: topBorder ? '1px solid var(--cb-tool-border)' : undefined,
+    }}
+  >
+    {text}
+  </pre>
+);
+
 // ---- Bash ----
 const BashCard: React.FC<{ args: Record<string, any>; result: any; status: ToolStatus } & CollapseInjection> =
 ({ args, result, status, ...collapse }) => {
@@ -42,15 +74,19 @@ const BashCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
       {description && <div className="cb-bash-desc">{description}</div>}
       {cmd && <div className="cb-bash-cmd">{cmd}</div>}
       {resultText && (
-        <SyntaxHighlighter
-          language="bash"
-          style={oneDark as any}
-          PreTag="div"
-          customStyle={{ margin: (cmd || description) ? '6px 0 0' : 0, padding: '6px 0 0', background: 'transparent', fontSize: '0.92em', maxHeight: '180px', overflow: 'auto', borderTop: (cmd || description) ? '1px solid var(--cb-tool-border)' : undefined }}
-          codeTagProps={HL_FONT}
-        >
-          {resultText}
-        </SyntaxHighlighter>
+        resultText.length > HIGHLIGHT_MAX_CHARS ? (
+          <PlainOutput text={resultText} maxHeight={180} topBorder={!!(cmd || description)} />
+        ) : (
+          <SyntaxHighlighter
+            language="bash"
+            style={oneDark as any}
+            PreTag="div"
+            customStyle={{ margin: (cmd || description) ? '6px 0 0' : 0, padding: '6px 0 0', background: 'transparent', fontSize: '0.92em', maxHeight: '180px', overflow: 'auto', borderTop: (cmd || description) ? '1px solid var(--cb-tool-border)' : undefined }}
+            codeTagProps={HL_FONT}
+          >
+            {resultText}
+          </SyntaxHighlighter>
+        )
       )}
     </div>
   ) : null;
@@ -68,15 +104,19 @@ const ReadCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
   const badges = lines.length > 0 ? <span className="cb-read-badge">{lines.length} lines</span> : null;
   const preview = path ? <span>{path}</span> : <span className="cb-italic-dim">(no path)</span>;
   const body = content ? (
-    <SyntaxHighlighter
-      language={lang}
-      style={oneDark as any}
-      PreTag="div"
-      customStyle={{ margin: 0, padding: '6px 0 0', background: 'transparent', fontSize: '0.92em', maxHeight: '320px', overflow: 'auto' }}
-      codeTagProps={HL_FONT}
-    >
-      {content}
-    </SyntaxHighlighter>
+    content.length > HIGHLIGHT_MAX_CHARS ? (
+      <PlainOutput text={content} maxHeight={320} />
+    ) : (
+      <SyntaxHighlighter
+        language={lang}
+        style={oneDark as any}
+        PreTag="div"
+        customStyle={{ margin: 0, padding: '6px 0 0', background: 'transparent', fontSize: '0.92em', maxHeight: '320px', overflow: 'auto' }}
+        codeTagProps={HL_FONT}
+      >
+        {content}
+      </SyntaxHighlighter>
+    )
   ) : null;
   return <ToolCard status={status} icon={<FileTextIcon size={13} />} label="Read" badges={badges} preview={preview} body={body} defaultOpen={false} {...collapse} />;
 };

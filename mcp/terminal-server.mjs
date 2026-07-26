@@ -490,6 +490,19 @@ const TOOLS = [
     },
   },
   {
+    name: 'close_tab',
+    description: 'Close an open Noted Terminal tab through the Project API. Use this after get_delegation_result for a one-off full-session test that will not be reused. Idle tabs close normally; force=true is only for an explicitly approved close while the agent is still busy.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Target tab to close.' },
+        projectId: { type: 'string', description: 'Optional project id for external or cross-project calls.' },
+        force: { type: 'boolean', description: 'Allow closing a busy/streaming AI tab. Default false.' },
+      },
+      required: ['tabId'],
+    },
+  },
+  {
     name: 'link_file',
     description: 'Attach an existing file as a purple child tab under an open AI session, using the same hierarchy as desktop drag-and-drop. Inside a full Noted Terminal session, omit tabId to attach to itself. Passing another tabId attaches to that session, including across open projects. Repeating the same file+parent operation reuses the existing child.',
     inputSchema: {
@@ -518,6 +531,8 @@ const TOOLS = [
         model: { type: 'string', description: 'Optional provider model override.' },
         effort: { type: 'string', description: 'Optional Codex effort override.' },
         thinking: { type: 'string', description: 'Optional Claude thinking mode.' },
+        placement: { type: 'string', enum: ['child', 'root'], description: 'Placement for a newly created target. Default child when source and target are in the same project; use root for an independent session.' },
+        parentTabId: { type: 'string', description: 'Optional explicit visual parent for a newly created target in the target project.' },
         notifySource: { type: 'boolean', description: 'Default true. Queue one short completion notification in the source input.' },
         queue: { type: 'boolean', description: 'Default true. Queue on a busy target instead of failing.' },
         runId: { type: 'string', description: 'Optional idempotency key.' },
@@ -581,6 +596,20 @@ const TOOLS = [
       properties: {
         sessionId: { type: 'string' },
         cwd: { type: 'string' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'get_session_progress',
+    description: 'Read tool-operation progress for a running Claude/Codex full session without rereading its transcript. The first call returns a bounded recent snapshot and nextCursor; pass that cursor on the next explicit check to receive only newer operations. This is stateless and does not replace the lifecycle completion notification.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+        cursor: { type: 'string', description: 'Opaque nextCursor returned by the previous call.' },
+        limit: { type: 'integer', description: 'Maximum operations to return, default 25 and maximum 100.' },
       },
       required: ['sessionId'],
     },
@@ -835,6 +864,8 @@ const TOOLS = [
         background: { type: 'boolean', description: 'Default true. Keep MCP-created tabs in background; set false only when the user explicitly wants focus.' },
         model: { type: 'string', description: 'Optional model override when command is "codex" or "claude" and the Project API supports it.' },
         effort: { type: 'string', description: 'Optional effort override when command is "codex" and the Project API supports it.' },
+        placement: { type: 'string', enum: ['child', 'root'], description: 'AI tabs default to child of the current full session in the same project. Use root for an independent session.' },
+        parentTabId: { type: 'string', description: 'Optional explicit visual parent for a new AI tab.' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Required in external mode when multiple projects are open and cwd is omitted.' },
       },
     },
@@ -1217,6 +1248,8 @@ async function callTool(name, args) {
         model: args.model || undefined,
         effort: args.effort || undefined,
         thinking: args.thinking || undefined,
+        placement: args.placement || 'child',
+        parentTabId: args.parentTabId || undefined,
         notifySource: args.notifySource !== false,
         queue: args.queue !== false,
       });
@@ -1262,6 +1295,20 @@ async function callTool(name, args) {
 
     case 'session_stats': {
       const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/stats' + qs({ cwd: args.cwd });
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      return JSON.stringify(
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        null,
+        2,
+      );
+    }
+
+    case 'get_session_progress': {
+      const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/progress' + qs({
+        cwd: args.cwd,
+        cursor: args.cursor,
+        limit: args.limit,
+      });
       const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
       return JSON.stringify(
         await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
@@ -1478,11 +1525,32 @@ async function callTool(name, args) {
       return 'Last ' + result.lines + ' lines from tab ' + args.tabId + ':\n\n' + result.output;
     }
 
+    case 'close_tab': {
+      const target = projectHint(args, args.tabId);
+      const result = await httpApiPost(
+        target,
+        '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/close',
+        {
+          requireIdle: args.force !== true,
+          aiBusy: args.force === true,
+        },
+      );
+      return JSON.stringify({
+        ok: result?.success !== false && result?.closed !== false,
+        tabId: args.tabId,
+        ...result,
+      }, null, 2);
+    }
+
     case 'create_tab': {
       const target = resolveExternalCreateTarget(args);
       const cwd = args.cwd || target.cwd || PROJECT_CWD;
       const agent = simpleAgentCommand(args.command);
       if (agent && target.projectId) {
+        const placement = args.placement || 'child';
+        const defaultParentTabId = target.projectId === PARENT_PROJECT_ID
+          ? PARENT_TAB_ID
+          : undefined;
         const result = await httpApiPost(
           target,
           '/api/projects/' + encodeURIComponent(target.projectId) + '/agent-tabs',
@@ -1491,6 +1559,11 @@ async function callTool(name, args) {
             name: args.name || undefined,
             model: args.model || undefined,
             effort: args.effort || undefined,
+            placement,
+            parentTabId: placement === 'root'
+              ? undefined
+              : (args.parentTabId || defaultParentTabId),
+            background: args.background !== false,
           },
         );
         return agent[0].toUpperCase() + agent.slice(1) + ' agent tab created in background through Project API. Tab ID: ' + (result.tabId || '-');

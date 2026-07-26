@@ -58,6 +58,12 @@ const {
   validateFreshAgentRuntimeStatus,
 } = require('./project-api-runtime-contract');
 const { OrchestrationRunStore, isActiveStatus } = require('./orchestration-runs');
+const {
+  buildDelegationResultTarget,
+  isAgentStatusBusyForClose,
+  resolveNewAgentTabPlacement,
+  resolveOrchestrationSendOptions,
+} = require('./orchestration-request-plan');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 // Lazy-require the helpers (loaded fresh each call so missing module just
@@ -2145,8 +2151,30 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
       let target = targetTabId ? findOrchestrationTabDescriptor(targetTabId) : null;
       let targetCreated = false;
+      let targetPlacement = null;
       if (targetTabId && !target) return sendJson(res, 404, { ok: false, error: 'target tab not found' });
       if (!targetTabId) {
+        targetPlacement = resolveNewAgentTabPlacement({
+          placement: body.placement,
+          parentTabId: cleanOptionalString(body.parentTabId, ''),
+          sourceTabId,
+          sourceProjectId: source.projectId,
+          targetProjectId,
+        });
+        if (targetPlacement.visualParentTabId) {
+          const parent = targetPlacement.visualParentTabId === sourceTabId
+            ? source
+            : findOrchestrationTabDescriptor(targetPlacement.visualParentTabId);
+          if (!parent) {
+            return sendJson(res, 404, { ok: false, error: 'parent tab not found' });
+          }
+          if (parent.projectId !== targetProjectId) {
+            return sendJson(res, 409, {
+              ok: false,
+              error: 'parent tab must belong to the target project',
+            });
+          }
+        }
         const created = await bridgeRequest('createAgentTab', {
           projectId: targetProjectId,
           toolType: targetToolType,
@@ -2155,6 +2183,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
           background: true,
           codexModel: cleanOptionalString(body.model || body.codexModel, ''),
           codexEffort: cleanOptionalString(body.effort || body.codexEffort, ''),
+          visualParentTabId: targetPlacement.visualParentTabId,
+          afterTabId: targetPlacement.afterTabId,
         }, 12_000);
         targetTabId = created?.tabId || '';
         if (!targetTabId) return sendJson(res, 500, { ok: false, error: 'failed to create target tab' });
@@ -2194,6 +2224,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         targetCwd: target.cwd,
         targetToolType: target.toolType,
         targetCreated,
+        targetPlacement: targetPlacement?.placement || null,
+        targetParentTabId: targetPlacement?.visualParentTabId || null,
         notifySource,
         promptHash: promptFingerprint(prompt),
         promptChars: prompt.length,
@@ -2215,17 +2247,26 @@ async function handleApi(req, res, parsed, sdkSessions) {
       });
       emitOrchestrationRun(await getOrchestrationRunStore().get(run.runId), 'sending');
 
+      const sendOptions = resolveOrchestrationSendOptions({
+        targetCreated,
+        targetToolType: target.toolType,
+        baselineStatus,
+        queueRequested: body.queue !== false,
+        model: cleanOptionalString(body.model, '') || undefined,
+        effort: cleanOptionalString(body.effort, '') || undefined,
+        thinking: cleanOptionalString(body.thinking, '') || undefined,
+      });
       const sendResult = await runAgentSendScenario({
         tabId: targetTabId,
         prompt,
-        model: cleanOptionalString(body.model, ''),
-        effort: cleanOptionalString(body.effort, ''),
-        thinking: cleanOptionalString(body.thinking, ''),
+        model: sendOptions.model,
+        effort: sendOptions.effort,
+        thinking: sendOptions.thinking,
         cwd: target.cwd,
         handoffId: 'orchestration:' + run.runId,
         source: 'orchestration:' + sourceTabId,
         statusAtSend: baselineStatus,
-        queue: body.queue !== false,
+        queue: sendOptions.queue,
         ownership: 'project',
         timeoutMs: 60_000,
       });
@@ -2265,7 +2306,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         });
         emitOrchestrationRun(failed, 'orchestration-error');
       }
-      return sendJson(res, Number(error?.statusCode) || 500, { ok: false, runId: createdRunId, error: String(error?.message || error) });
+      return sendJson(res, Number(error?.statusCode || error?.status) || 500, { ok: false, runId: createdRunId, error: String(error?.message || error) });
     }
   }
 
@@ -2299,6 +2340,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       runId,
       status: run.status,
       sessionId: result.sessionId || run.sessionId || null,
+      ...buildDelegationResultTarget(run),
       turnIndex: result.turnIndex ?? run.resultTurnIndex ?? null,
       userUuid: result.userUuid || run.resultUserUuid || null,
       assistantText: result.assistantText || '',
@@ -3012,6 +3054,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       let tabId = null;
       let sessionId = null;
       let reused = false;
+      let targetCreated = false;
       if (conversationKey && externalRunByConversationKey.has(conversationKey)) {
         const prevRunId = externalRunByConversationKey.get(conversationKey);
         const prevRun = externalRuns.get(prevRunId);
@@ -3061,6 +3104,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         }, 8000);
         tabId = tab?.tabId;
         if (!tabId) return sendJson(res, 500, { error: 'failed to create tab' });
+        targetCreated = true;
       }
       const run = { ...externalRun, tabId, sessionId, stopTimer: null, closeTimer: null };
       externalRuns.set(runId, run);
@@ -3084,14 +3128,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
       run.status = 'sending';
       run.sessionId = sessionId;
       setExternalRunMeta(tabId, { status: 'sending', sessionId, autoStopAt: null, autoCloseAt: null });
+      const sendOptions = resolveOrchestrationSendOptions({
+        targetCreated,
+        targetToolType: provider,
+        baselineStatus: status?.status || 'active',
+        queueRequested: body.queue === true,
+        model: cleanOptionalString(body.model, '') || undefined,
+        effort: cleanOptionalString(body.effort, '') || undefined,
+      });
       const sendResult = await runAgentSendScenario({
         tabId,
         prompt,
-        model: cleanOptionalString(body.model, ''),
-        effort: cleanOptionalString(body.effort, ''),
+        model: sendOptions.model,
+        effort: sendOptions.effort,
         source: 'external:' + source,
         statusAtSend: status?.status || 'active',
-        queue: body.queue === true,
+        queue: sendOptions.queue,
         ownership: 'external',
         timeoutMs: 60_000,
       });
@@ -3184,6 +3236,21 @@ async function handleApi(req, res, parsed, sdkSessions) {
     try {
       const body = await readBody(req);
       const toolType = body.toolType === 'codex' ? 'codex' : 'claude';
+      const placement = resolveNewAgentTabPlacement({
+        placement: body.placement,
+        parentTabId: cleanOptionalString(body.parentTabId, ''),
+        targetProjectId: projectId,
+      });
+      if (placement.visualParentTabId) {
+        const parent = findOrchestrationTabDescriptor(placement.visualParentTabId);
+        if (!parent) return sendJson(res, 404, { ok: false, error: 'parent tab not found' });
+        if (parent.projectId !== projectId) {
+          return sendJson(res, 409, {
+            ok: false,
+            error: 'parent tab must belong to the target project',
+          });
+        }
+      }
       console.log('[WebAgentTabs] START project=' + shortId(projectId, 12)
         + ' tool=' + toolType
         + ' model=' + (cleanOptionalString(body.model || body.codexModel, '') || '-')
@@ -3195,6 +3262,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         name: cleanOptionalString(body.name, ''),
         codexModel: cleanOptionalString(body.model || body.codexModel, ''),
         codexEffort: cleanOptionalString(body.effort || body.codexEffort, ''),
+        visualParentTabId: placement.visualParentTabId,
+        afterTabId: placement.afterTabId,
+        background: body.background !== false,
       }, 12_000);
       console.log('[WebAgentTabs] OK project=' + shortId(projectId, 12)
         + ' tool=' + toolType
@@ -3696,6 +3766,18 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
+      if (body.requireIdle === true) {
+        const status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+        const lifecycle = status?.status || status?.sessionStatus || 'unknown';
+        if (isAgentStatusBusyForClose(status)) {
+          return sendJson(res, 409, {
+            ok: false,
+            closed: false,
+            error: 'tab_is_busy',
+            status: lifecycle,
+          });
+        }
+      }
       const data = await bridgeRequest('closeTab', {
         tabId,
         aiBusyOverride: body.aiBusy === true || body.streaming === true

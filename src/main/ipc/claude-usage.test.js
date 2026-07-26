@@ -431,6 +431,121 @@ test('a hydrated current OAuth account refetches even when its persisted snapsho
   assert.equal(result.stale, false);
 });
 
+test('v2 persistence separates OAuth from statusline and still refetches after a pre-read statusline event', async () => {
+  const db = createFakeDb();
+  const auth = authFor('a');
+  const sessionId = 'persisted-v2-session';
+  const processId = 410;
+  _api.setClaudeUsageProjectManagerForTests({ db });
+
+  await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => BASE_NOW,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      five: 51,
+      weekly: 61,
+      limits: [fableLimit({ percent: 31 })],
+    })),
+  });
+  await _api.recordStatuslineUsage(statuslinePayload({
+    sessionId,
+    ppid: processId,
+    five: 12,
+    weekly: 22,
+    at: BASE_NOW + 1000,
+  }), {
+    authReader: async () => auth,
+    now: () => BASE_NOW + 1000,
+  });
+
+  const persisted = db.snapshot();
+  const persistedAccount = persisted.accounts.find(
+    (item) => item.account.accountKey === auth.accountKey,
+  );
+  assert.equal(persisted.version, 2);
+  assert.equal(persistedAccount.oauthSnapshot.source, 'anthropic-oauth-api');
+  assert.equal(persistedAccount.oauthSnapshot.usage.five_hour.utilization, 51);
+  assert.equal(persistedAccount.oauthSnapshot.usage.model_scoped[0].utilization, 31);
+  assert.equal(persistedAccount.statuslineSnapshot.source, 'claude-statusline');
+  assert.equal(persistedAccount.statuslineSnapshot.usage.five_hour.utilization, 12);
+  assert.deepEqual(persistedAccount.statuslineSnapshot.usage.model_scoped, []);
+  const serialized = JSON.stringify(persisted);
+  assert.doesNotMatch(
+    serialized,
+    /oauth-secret-a|fingerprint-a|org-raw-a|a@example\.com|persisted-v2-session/,
+  );
+
+  _api.resetClaudeUsageStateForTests();
+  _api.setClaudeUsageProjectManagerForTests({ db });
+  await _api.recordStatuslineUsage(statuslinePayload({
+    sessionId,
+    ppid: processId,
+    five: 13,
+    weekly: 23,
+    at: BASE_NOW + 2000,
+  }), {
+    authReader: async () => auth,
+    now: () => BASE_NOW + 2000,
+  });
+
+  let requests = 0;
+  const result = await _api.getUsage({
+    force: false,
+    authReader: async () => auth,
+    now: () => BASE_NOW + 3000,
+    fetchImpl: async () => {
+      requests += 1;
+      return fetchResponse(usagePayload({
+        five: 52,
+        weekly: 62,
+        limits: [fableLimit({ percent: 32 })],
+      }));
+    },
+  });
+  assert.equal(requests, 1);
+  assert.equal(result.source, 'anthropic-oauth-api');
+  assert.equal(result.data.five_hour.utilization, 52);
+  assert.equal(result.data.seven_day.utilization, 62);
+  assert.equal(result.data.model_scoped[0].utilization, 32);
+});
+
+test('legacy v1 statusline data migrates into a Fable-free fallback snapshot', () => {
+  const auth = authFor('a');
+  const timestamp = new Date(BASE_NOW).toISOString();
+  const legacyUsage = _api.normalizeClaudeUsageData(usagePayload({
+    five: 14,
+    weekly: 24,
+    limits: [fableLimit({ percent: 34 })],
+  }));
+  const [entry] = _api.parseClaudeUsageState({
+    version: 1,
+    accounts: [{
+      account: {
+        accountKey: auth.accountKey,
+        kind: auth.currentKind,
+        credentialKind: auth.credentialKind,
+        usageEndpointEligible: true,
+        label: auth.label,
+        source: 'claude-statusline',
+        timestamp,
+        usage: legacyUsage,
+      },
+      fetchedAt: BASE_NOW,
+      lastAttemptAt: BASE_NOW,
+      touchedAt: BASE_NOW,
+    }],
+    sessionBindings: [],
+  });
+
+  assert.equal(entry.oauthSnapshot, null);
+  assert.equal(entry.statuslineSnapshot.source, 'claude-statusline');
+  assert.equal(entry.statuslineSnapshot.usage.five_hour.utilization, 14);
+  assert.equal(entry.statuslineSnapshot.usage.seven_day.utilization, 24);
+  assert.deepEqual(entry.statuslineSnapshot.usage.model_scoped, []);
+  assert.deepEqual(entry.account.usage.model_scoped, []);
+});
+
 test('binds statusline quota to session plus process identity across login switches', async () => {
   const db = createFakeDb();
   _api.setClaudeUsageProjectManagerForTests({ db });
@@ -473,124 +588,125 @@ test('binds statusline quota to session plus process identity across login switc
   ]));
 });
 
-test('fresh official statusline stays authoritative while OAuth supplements Fable', async () => {
-  const auth = authFor('a');
-  await _api.recordStatuslineUsage(statuslinePayload(), {
-    authReader: async () => auth,
-    now: () => BASE_NOW,
-  });
-  let requests = 0;
-  const result = await _api.getUsage({
-    force: true,
-    authReader: async () => auth,
-    now: () => BASE_NOW + 10_000,
-    fetchImpl: async () => {
-      requests += 1;
-      return fetchResponse({
-        five_hour: { utilization: 150, resets_at: 'not-a-date' },
-        seven_day: null,
-        limits: [fableLimit()],
-      });
-    },
-  });
-  assert.equal(requests, 1);
-  assert.equal(result.source, 'claude-statusline');
-  assert.equal(result.data.five_hour.utilization, 36);
-  assert.equal(result.data.seven_day.utilization, 39);
-  assert.equal(result.data.model_scoped[0].display_name, 'Fable');
-  assert.equal(result.data.model_scoped[0].utilization, 21);
-
-  const cached = await _api.getUsage({
-    force: false,
-    authReader: async () => auth,
-    now: () => BASE_NOW + 20_000,
-    fetchImpl: async () => {
-      requests += 1;
-      return fetchResponse(usagePayload({ limits: [fableLimit({ percent: 22 })] }));
-    },
-  });
-  assert.equal(requests, 1);
-  assert.equal(cached.data.model_scoped[0].utilization, 21);
-
+test('a partial statusline snapshot leaves its missing window unknown instead of inheriting old data', async () => {
+  const auth = authFor('a', { currentKind: 'claude-managed-key', oauthToken: null });
   await _api.recordStatuslineUsage(statuslinePayload({
-    five: 37,
-    weekly: 40,
-    at: BASE_NOW + 30_000,
+    five: 20,
+    weekly: 30,
   }), {
     authReader: async () => auth,
-    now: () => BASE_NOW + 30_000,
-  });
-  const afterStatusline = _api.listClaudeUsageAccounts(auth.accountKey, BASE_NOW + 30_000)[0];
-  assert.equal(afterStatusline.usage.five_hour.utilization, 37);
-  assert.equal(afterStatusline.usage.model_scoped[0].utilization, 21);
-});
-
-test('an old live statusline remains the common-limit source while OAuth updates only Fable', async () => {
-  const auth = authFor('a');
-  await _api.recordStatuslineUsage(statuslinePayload(), {
-    authReader: async () => auth,
     now: () => BASE_NOW,
   });
 
-  const result = await _api.getUsage({
-    force: true,
-    authReader: async () => auth,
-    now: () => BASE_NOW + 400_000,
-    fetchImpl: async () => fetchResponse(usagePayload({
-      five: 90,
-      weekly: 90,
-      limits: [fableLimit({ percent: 25 })],
-    })),
-  });
-
-  assert.equal(result.source, 'claude-statusline');
-  assert.equal(result.data.five_hour.utilization, 36);
-  assert.equal(result.data.seven_day.utilization, 39);
-  assert.equal(result.data.model_scoped[0].utilization, 25);
-  assert.equal(result.stale, true);
-});
-
-test('an optional Fable failure keeps common limits healthy and eventually hides stale Fable', async () => {
-  const auth = authFor('a');
-  await _api.getUsage({
-    force: true,
-    authReader: async () => auth,
-    now: () => BASE_NOW,
-    fetchImpl: async () => fetchResponse(usagePayload({ limits: [fableLimit()] })),
-  });
-  await _api.recordStatuslineUsage(statuslinePayload({ at: BASE_NOW + 1000 }), {
+  await _api.recordStatuslineUsage(statuslinePayload({
+    five: 21,
+    weekly: null,
+    at: BASE_NOW + 1000,
+  }), {
     authReader: async () => auth,
     now: () => BASE_NOW + 1000,
   });
 
+  const account = _api.listClaudeUsageAccounts(auth.accountKey, BASE_NOW + 1000)[0];
+  assert.equal(account.usage.five_hour.utilization, 21);
+  assert.equal(account.usage.seven_day, null);
+  assert.deepEqual(account.usage.model_scoped, []);
+  assert.equal(account.timestamp, new Date(BASE_NOW + 1000).toISOString());
+});
+
+test('max OAuth applies one complete API snapshot and keeps statusline as an unmixed fallback', async () => {
+  const auth = authFor('a');
+  let nowMs = BASE_NOW;
+  await _api.recordStatuslineUsage(statuslinePayload({
+    five: 11,
+    weekly: 22,
+  }), {
+    authReader: async () => auth,
+    now: () => nowMs,
+  });
+
+  nowMs += 1000;
   let result = await _api.getUsage({
     force: true,
     authReader: async () => auth,
-    now: () => BASE_NOW + 2000,
-    fetchImpl: async () => fetchResponse({}, 503),
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      five: 61,
+      weekly: 72,
+      limits: [fableLimit({ percent: 33 })],
+    })),
   });
+  assert.equal(result.source, 'anthropic-oauth-api');
+  assert.equal(result.data.five_hour.utilization, 61);
+  assert.equal(result.data.seven_day.utilization, 72);
+  assert.equal(result.data.model_scoped[0].utilization, 33);
+  const oauthTimestamp = result.lastSuccessAt;
 
-  assert.equal(result.ok, true);
-  assert.equal(result.error, null);
-  assert.equal(result.source, 'claude-statusline');
-  assert.equal(result.data.five_hour.utilization, 36);
-  assert.equal(result.data.model_scoped[0].utilization, 21);
-
-  await _api.recordStatuslineUsage(statuslinePayload({ at: BASE_NOW + 400_000 }), {
+  nowMs += 1000;
+  await _api.recordStatuslineUsage(statuslinePayload({
+    five: 12,
+    weekly: 23,
+    at: nowMs,
+  }), {
     authReader: async () => auth,
-    now: () => BASE_NOW + 400_000,
+    now: () => nowMs,
   });
+  let account = _api.listClaudeUsageAccounts(auth.accountKey, nowMs)[0];
+  assert.equal(account.source, 'anthropic-oauth-api');
+  assert.equal(account.usage.five_hour.utilization, 61);
+  assert.equal(account.usage.seven_day.utilization, 72);
+  assert.equal(account.usage.model_scoped[0].utilization, 33);
+  assert.equal(account.timestamp, oauthTimestamp);
+
+  nowMs += 1000;
   result = await _api.getUsage({
     force: true,
     authReader: async () => auth,
-    now: () => BASE_NOW + 401_000,
+    now: () => nowMs,
     fetchImpl: async () => fetchResponse({}, 503),
   });
-  assert.equal(result.ok, true);
+  assert.equal(result.source, 'claude-statusline');
+  assert.equal(result.data.five_hour.utilization, 12);
+  assert.equal(result.data.seven_day.utilization, 23);
   assert.deepEqual(result.data.model_scoped, []);
+  assert.equal(result.error, null);
 });
 
-test('a statusline snapshot arriving during OAuth refresh wins while keeping Fable', async () => {
+test('invalid common OAuth data rejects a response even when its Fable limit is valid', async () => {
+  const db = createFakeDb();
+  _api.setClaudeUsageProjectManagerForTests({ db });
+  const auth = authFor('a');
+  let nowMs = BASE_NOW;
+  let result = await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({ limits: [fableLimit()] })),
+  });
+  assert.equal(result.source, 'anthropic-oauth-api');
+  assert.equal(db.snapshots.length, 1);
+
+  nowMs += 1000;
+  result = await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      five: 150,
+      weekly: 40,
+      limits: [fableLimit({ percent: 5 })],
+    })),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.source, 'anthropic-oauth-api');
+  assert.equal(result.data.five_hour.utilization, 36);
+  assert.equal(result.data.seven_day.utilization, 39);
+  assert.equal(result.data.model_scoped[0].utilization, 21);
+  assert.match(result.error, /between 0 and 100/);
+  assert.equal(db.snapshots.length, 1);
+});
+
+test('a statusline snapshot arriving during OAuth refresh cannot create a hybrid snapshot', async () => {
   const auth = authFor('a');
   const pending = deferred();
   let nowMs = BASE_NOW;
@@ -618,9 +734,9 @@ test('a statusline snapshot arriving during OAuth refresh wins while keeping Fab
   })));
 
   const result = await refresh;
-  assert.equal(result.source, 'claude-statusline');
-  assert.equal(result.data.five_hour.utilization, 24);
-  assert.equal(result.data.seven_day.utilization, 31);
+  assert.equal(result.source, 'anthropic-oauth-api');
+  assert.equal(result.data.five_hour.utilization, 90);
+  assert.equal(result.data.seven_day.utilization, 90);
   assert.equal(result.data.model_scoped[0].utilization, 21);
 });
 
@@ -676,27 +792,143 @@ test('holds a transient same-generation regression and accepts a legitimate elap
   assert.equal(account.usage.seven_day.utilization, 0);
 });
 
-test('preserves last good values on invalid response and blocks force-refresh storms after 429', async () => {
+test('a Fable regression holds the entire OAuth candidate until matching confirmation', async () => {
   const auth = authFor('a');
   let nowMs = BASE_NOW;
-  let mode = 'valid';
+  let result = await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      five: 36,
+      weekly: 39,
+      limits: [fableLimit({ percent: 64 })],
+    })),
+  });
+  assert.equal(result.data.model_scoped[0].utilization, 64);
+
+  nowMs += 1000;
+  result = await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      five: 37,
+      weekly: 40,
+      limits: [fableLimit({ percent: 1 })],
+    })),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.data.five_hour.utilization, 36);
+  assert.equal(result.data.seven_day.utilization, 39);
+  assert.equal(result.data.model_scoped[0].utilization, 64);
+  assert.match(result.warning, /inconsistent/i);
+
+  nowMs = BASE_NOW + 32_000;
+  result = await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      five: 37,
+      weekly: 40,
+      limits: [fableLimit({ percent: 1 })],
+    })),
+  });
+  assert.equal(result.data.five_hour.utilization, 37);
+  assert.equal(result.data.seven_day.utilization, 40);
+  assert.equal(result.data.model_scoped[0].utilization, 1);
+  assert.equal(result.warning, null);
+});
+
+test('a different Fable candidate cannot confirm the pending OAuth snapshot', async () => {
+  const auth = authFor('a');
+  let nowMs = BASE_NOW;
+  let result = await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      limits: [fableLimit({ percent: 64 })],
+    })),
+  });
+  assert.equal(result.data.model_scoped[0].utilization, 64);
+
+  nowMs += 1000;
+  result = await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      limits: [fableLimit({ percent: 1 })],
+    })),
+  });
+  assert.equal(result.data.model_scoped[0].utilization, 64);
+  assert.match(result.warning, /inconsistent/i);
+
+  nowMs = BASE_NOW + 32_000;
+  result = await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      limits: [fableLimit({ percent: 2 })],
+    })),
+  });
+  assert.equal(result.data.model_scoped[0].utilization, 64);
+  assert.match(result.warning, /inconsistent/i);
+
+  nowMs = BASE_NOW + 63_000;
+  result = await _api.getUsage({
+    force: true,
+    authReader: async () => auth,
+    now: () => nowMs,
+    fetchImpl: async () => fetchResponse(usagePayload({
+      limits: [fableLimit({ percent: 2 })],
+    })),
+  });
+  assert.equal(result.data.model_scoped[0].utilization, 2);
+  assert.equal(result.warning, null);
+});
+
+test('429 uses the complete statusline fallback and force refresh still respects backoff', async () => {
+  const auth = authFor('a');
+  let nowMs = BASE_NOW;
+  await _api.recordStatuslineUsage(statuslinePayload({
+    five: 18,
+    weekly: 28,
+  }), {
+    authReader: async () => auth,
+    now: () => nowMs,
+  });
+
   let requests = 0;
   const fetchImpl = async () => {
     requests += 1;
-    if (mode === 'invalid') return fetchResponse(usagePayload({ weekly: 150 }));
-    if (mode === 'rate-limit') return fetchResponse({}, 429, { 'retry-after': '120' });
-    return fetchResponse(usagePayload({ five: 36, weekly: 39 }));
+    if (requests === 1) {
+      return fetchResponse({}, 429, { 'retry-after': '120' });
+    }
+    return fetchResponse(usagePayload({
+      five: 55,
+      weekly: 65,
+      limits: [fableLimit({ percent: 15 })],
+    }));
   };
 
+  nowMs += 1000;
   let result = await _api.getUsage({
     force: true,
     authReader: async () => auth,
     fetchImpl,
     now: () => nowMs,
   });
-  assert.equal(result.data.seven_day.utilization, 39);
+  assert.equal(requests, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.source, 'claude-statusline');
+  assert.equal(result.data.five_hour.utilization, 18);
+  assert.equal(result.data.seven_day.utilization, 28);
+  assert.deepEqual(result.data.model_scoped, []);
 
-  mode = 'invalid';
   nowMs += 1000;
   result = await _api.getUsage({
     force: true,
@@ -704,30 +936,21 @@ test('preserves last good values on invalid response and blocks force-refresh st
     fetchImpl,
     now: () => nowMs,
   });
-  assert.equal(result.ok, false);
-  assert.equal(result.data.seven_day.utilization, 39);
-  assert.match(result.error, /between 0 and 100/);
+  assert.equal(requests, 1);
+  assert.equal(result.source, 'claude-statusline');
 
-  mode = 'rate-limit';
-  nowMs += 1000;
+  nowMs = BASE_NOW + 122_000;
   result = await _api.getUsage({
     force: true,
     authReader: async () => auth,
     fetchImpl,
     now: () => nowMs,
   });
-  assert.equal(result.data.seven_day.utilization, 39);
-  assert.match(result.error, /rate limited/);
-  const after429Requests = requests;
-
-  nowMs += 1000;
-  await _api.getUsage({
-    force: true,
-    authReader: async () => auth,
-    fetchImpl,
-    now: () => nowMs,
-  });
-  assert.equal(requests, after429Requests);
+  assert.equal(requests, 2);
+  assert.equal(result.source, 'anthropic-oauth-api');
+  assert.equal(result.data.five_hour.utilization, 55);
+  assert.equal(result.data.seven_day.utilization, 65);
+  assert.equal(result.data.model_scoped[0].utilization, 15);
 });
 
 test('joins the new-account request and never attaches the old result after auth switch', async () => {
@@ -819,7 +1042,7 @@ test('token rotation on the same stable account refetches and discards the old-t
   assert.equal(calls.length, 2);
 });
 
-test('a statusline update cannot roll a rotated token back into repeated OAuth refreshes', async () => {
+test('token rotation keeps the complete OAuth snapshot authoritative over later statusline updates', async () => {
   const oldAuth = authFor('a', {
     oauthToken: 'oauth-old',
     tokenFingerprint: 'fingerprint-old',
@@ -831,12 +1054,26 @@ test('a statusline update cannot roll a rotated token back into repeated OAuth r
   let currentAuth = oldAuth;
   let nowMs = BASE_NOW;
   let requests = 0;
-  const fetchImpl = async () => {
+  const fetchImpl = async (_url, options) => {
     requests += 1;
-    return fetchResponse(usagePayload({ limits: [fableLimit()] }));
+    if (options.headers.Authorization === 'Bearer oauth-old') {
+      return fetchResponse(usagePayload({
+        five: 20,
+        weekly: 30,
+        limits: [fableLimit({ percent: 10 })],
+      }));
+    }
+    return fetchResponse(usagePayload({
+      five: 60,
+      weekly: 70,
+      limits: [fableLimit({ percent: 25 })],
+    }));
   };
 
-  await _api.recordStatuslineUsage(statuslinePayload(), {
+  await _api.recordStatuslineUsage(statuslinePayload({
+    five: 12,
+    weekly: 22,
+  }), {
     authReader: async () => currentAuth,
     now: () => nowMs,
   });
@@ -859,7 +1096,11 @@ test('a statusline update cannot roll a rotated token back into repeated OAuth r
   assert.equal(requests, 2);
 
   nowMs += 1000;
-  await _api.recordStatuslineUsage(statuslinePayload({ at: nowMs }), {
+  await _api.recordStatuslineUsage(statuslinePayload({
+    five: 80,
+    weekly: 90,
+    at: nowMs,
+  }), {
     authReader: async () => currentAuth,
     now: () => nowMs,
   });
@@ -872,8 +1113,10 @@ test('a statusline update cannot roll a rotated token back into repeated OAuth r
   });
 
   assert.equal(requests, 2);
-  assert.equal(result.source, 'claude-statusline');
-  assert.equal(result.data.model_scoped[0].utilization, 21);
+  assert.equal(result.source, 'anthropic-oauth-api');
+  assert.equal(result.data.five_hour.utilization, 60);
+  assert.equal(result.data.seven_day.utilization, 70);
+  assert.equal(result.data.model_scoped[0].utilization, 25);
 });
 
 test('daily history requests only the selected account and never attributes unscoped rows', () => {

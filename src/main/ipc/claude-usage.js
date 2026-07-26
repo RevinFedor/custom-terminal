@@ -1,10 +1,10 @@
 // Claude usage limits IPC.
 //
-// Current Claude identity comes from `claude auth status --json`. Quota data
-// primarily arrives through Claude Code's official statusLine `rate_limits`
-// payload and is recorded by the existing bridge watcher in main.js. Older
-// OAuth credentials may also query /api/oauth/usage. A `/login managed key`
-// is deliberately not treated as OAuth: it is an API-shaped credential and
+// Current Claude identity comes from `claude auth status --json`. OAuth
+// subscriptions read one atomic quota snapshot from /api/oauth/usage.
+// Claude Code's official statusLine `rate_limits` remains the fallback for
+// managed logins and temporary OAuth failures. A `/login managed key` is
+// deliberately not treated as OAuth: it is an API-shaped credential and
 // Anthropic rejects it on the OAuth usage endpoint.
 
 const { ipcMain } = require('electron');
@@ -377,12 +377,9 @@ function normalizeModelScopedUsage(raw) {
   return [...normalized.values()];
 }
 
-function normalizeClaudeUsageData(raw, { statusline = false, modelScopedOnly = false } = {}) {
+function normalizeClaudeUsageData(raw, { statusline = false } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ClaudeUsageError('invalid_response', 'Claude usage response must be an object');
-  }
-  if (modelScopedOnly) {
-    return { model_scoped: normalizeModelScopedUsage(raw) };
   }
   const data = {
     five_hour: normalizeUsageBucket(raw.five_hour, 'five_hour', statusline ? 'used_percentage' : 'utilization'),
@@ -398,6 +395,24 @@ function normalizeClaudeUsageData(raw, { statusline = false, modelScopedOnly = f
     throw new ClaudeUsageError('invalid_response', 'Claude usage has no five-hour or seven-day window');
   }
   return data;
+}
+
+function requireCompleteOAuthUsage(data) {
+  if (!data?.five_hour || !data?.seven_day) {
+    throw new ClaudeUsageError(
+      'invalid_response',
+      'Claude OAuth usage must contain both five-hour and seven-day windows',
+    );
+  }
+  return data;
+}
+
+function statuslineUsageOnly(data) {
+  return {
+    five_hour: data?.five_hour || null,
+    seven_day: data?.seven_day || null,
+    model_scoped: [],
+  };
 }
 
 function retryAfterDelayMs(value, nowMs = Date.now()) {
@@ -424,102 +439,124 @@ function usageBucketSnapshot(data, key) {
   };
 }
 
-function mergeClaudeUsageData(previous, candidate) {
-  if (!previous) return candidate;
-  const candidateHasModelScopes = Object.prototype.hasOwnProperty.call(candidate || {}, 'model_scoped');
-  return {
-    ...previous,
-    ...candidate,
-    five_hour: candidate?.five_hour || previous.five_hour || null,
-    seven_day: candidate?.seven_day || previous.seven_day || null,
-    seven_day_opus: candidate?.seven_day_opus || previous.seven_day_opus || null,
-    seven_day_sonnet: candidate?.seven_day_sonnet || previous.seven_day_sonnet || null,
-    extra_usage: candidate?.extra_usage || previous.extra_usage || null,
-    model_scoped: candidateHasModelScopes
-      ? candidate.model_scoped
-      : (previous.model_scoped || []),
-  };
+function modelScopedUsageSnapshots(data) {
+  const result = new Map();
+  for (const item of Array.isArray(data?.model_scoped) ? data.model_scoped : []) {
+    const name = typeof item?.display_name === 'string'
+      ? item.display_name.trim().toLocaleLowerCase('en-US')
+      : '';
+    const utilization = Number(item?.utilization);
+    if (!name || !Number.isFinite(utilization)) continue;
+    const resetMs = Date.parse(item?.resets_at || '');
+    result.set(name, {
+      utilization,
+      resetMs: Number.isFinite(resetMs) ? resetMs : null,
+    });
+  }
+  return result;
+}
+
+function usageBucketsMatch(left, right) {
+  if (!left && !right) return true;
+  if (!left || !right || Math.abs(left.utilization - right.utilization) > 0.01) return false;
+  if (left.resetMs == null && right.resetMs == null) return true;
+  return left.resetMs != null
+    && right.resetMs != null
+    && Math.abs(left.resetMs - right.resetMs) <= 1000;
 }
 
 function claudeUsageSnapshotsMatch(left, right) {
   for (const key of ['five_hour', 'seven_day']) {
-    const a = usageBucketSnapshot(left, key);
-    const b = usageBucketSnapshot(right, key);
-    if (!a && !b) continue;
-    if (!a || !b || Math.abs(a.utilization - b.utilization) > 0.01) return false;
-    if (a.resetMs == null && b.resetMs == null) continue;
-    if (a.resetMs == null || b.resetMs == null || Math.abs(a.resetMs - b.resetMs) > 1000) return false;
+    if (!usageBucketsMatch(usageBucketSnapshot(left, key), usageBucketSnapshot(right, key))) {
+      return false;
+    }
+  }
+  const leftModels = modelScopedUsageSnapshots(left);
+  const rightModels = modelScopedUsageSnapshots(right);
+  if (leftModels.size !== rightModels.size) return false;
+  for (const [name, leftBucket] of leftModels) {
+    if (!usageBucketsMatch(leftBucket, rightModels.get(name) || null)) return false;
   }
   return true;
+}
+
+function classifyUsageBucket(oldBucket, newBucket, nowMs) {
+  if (!oldBucket || !newBucket) return 'accept';
+  const previousResetElapsed = oldBucket.resetMs != null && oldBucket.resetMs <= nowMs;
+  if (oldBucket.resetMs != null && newBucket.resetMs != null) {
+    const resetDelta = newBucket.resetMs - oldBucket.resetMs;
+    if (resetDelta < -CLAUDE_USAGE_RESET_TOLERANCE_MS) return 'obsolete';
+    if (!previousResetElapsed && Math.abs(resetDelta) > CLAUDE_USAGE_RESET_TOLERANCE_MS) {
+      return 'suspicious';
+    }
+  }
+  if (!previousResetElapsed
+    && oldBucket.utilization - newBucket.utilization >= CLAUDE_USAGE_REGRESSION_POINTS) {
+    return 'suspicious';
+  }
+  return 'accept';
 }
 
 function classifyClaudeUsageSnapshot(previous, candidate, nowMs = Date.now()) {
   let suspicious = false;
   for (const key of ['five_hour', 'seven_day']) {
-    const oldBucket = usageBucketSnapshot(previous, key);
-    const newBucket = usageBucketSnapshot(candidate, key);
-    if (!oldBucket || !newBucket) continue;
-    const previousResetElapsed = oldBucket.resetMs != null && oldBucket.resetMs <= nowMs;
-    if (oldBucket.resetMs != null && newBucket.resetMs != null) {
-      const resetDelta = newBucket.resetMs - oldBucket.resetMs;
-      if (resetDelta < -CLAUDE_USAGE_RESET_TOLERANCE_MS) return 'obsolete';
-      if (!previousResetElapsed && Math.abs(resetDelta) > CLAUDE_USAGE_RESET_TOLERANCE_MS) {
-        suspicious = true;
-      }
-    }
-    if (!previousResetElapsed
-      && oldBucket.utilization - newBucket.utilization >= CLAUDE_USAGE_REGRESSION_POINTS) {
-      suspicious = true;
-    }
+    const classification = classifyUsageBucket(
+      usageBucketSnapshot(previous, key),
+      usageBucketSnapshot(candidate, key),
+      nowMs,
+    );
+    if (classification === 'obsolete') return 'obsolete';
+    if (classification === 'suspicious') suspicious = true;
+  }
+  const oldModels = modelScopedUsageSnapshots(previous);
+  const newModels = modelScopedUsageSnapshots(candidate);
+  for (const [name, oldBucket] of oldModels) {
+    const newBucket = newModels.get(name);
+    if (!newBucket) continue;
+    const classification = classifyUsageBucket(oldBucket, newBucket, nowMs);
+    if (classification === 'obsolete') return 'obsolete';
+    if (classification === 'suspicious') suspicious = true;
   }
   return suspicious ? 'suspicious' : 'accept';
 }
 
-function reconcileClaudeUsageSnapshot(previousEntry, candidate, nowMs = Date.now()) {
-  const previousUsage = previousEntry?.account?.usage || null;
-  const mergedUsage = mergeClaudeUsageData(previousUsage, candidate?.data);
-  if (!mergedUsage) return { entry: previousEntry || null, accepted: false, status: 'invalid' };
+function reconcileClaudeUsageSourceSnapshot(
+  previousSnapshot,
+  candidate,
+  nowMs = Date.now(),
+) {
+  const previousUsage = previousSnapshot?.usage || null;
+  const nextUsage = candidate?.data || null;
+  if (!nextUsage) {
+    return { snapshot: previousSnapshot || null, accepted: false, status: 'invalid' };
+  }
+  const acceptedSnapshot = {
+    usage: nextUsage,
+    source: candidate.source,
+    timestamp: new Date(candidate.fetchedAt).toISOString(),
+    fetchedAt: candidate.fetchedAt,
+    pending: null,
+    warning: null,
+  };
   if (!previousUsage) {
     return {
-      entry: {
-        ...(previousEntry || {}),
-        account: {
-          ...(previousEntry?.account || {}),
-          usage: mergedUsage,
-          source: candidate.source,
-          timestamp: new Date(candidate.fetchedAt).toISOString(),
-        },
-        fetchedAt: candidate.fetchedAt,
-        pending: null,
-        warning: null,
-      },
+      snapshot: acceptedSnapshot,
       accepted: true,
       status: 'accepted',
     };
   }
-  const classification = classifyClaudeUsageSnapshot(previousUsage, mergedUsage, nowMs);
+  const classification = classifyClaudeUsageSnapshot(previousUsage, nextUsage, nowMs);
   if (classification === 'accept') {
     return {
-      entry: {
-        ...previousEntry,
-        account: {
-          ...previousEntry.account,
-          usage: mergedUsage,
-          source: candidate.source,
-          timestamp: new Date(candidate.fetchedAt).toISOString(),
-        },
-        fetchedAt: candidate.fetchedAt,
-        pending: null,
-        warning: null,
-      },
+      snapshot: acceptedSnapshot,
       accepted: true,
       status: 'accepted',
     };
   }
   if (classification === 'obsolete') {
     return {
-      entry: {
-        ...previousEntry,
+      snapshot: {
+        ...previousSnapshot,
         pending: null,
         warning: CLAUDE_USAGE_INCONSISTENT_WARNING,
       },
@@ -527,31 +564,22 @@ function reconcileClaudeUsageSnapshot(previousEntry, candidate, nowMs = Date.now
       status: 'obsolete',
     };
   }
-  const pending = previousEntry?.pending || null;
-  const pendingMatches = pending?.data && claudeUsageSnapshotsMatch(pending.data, mergedUsage);
+  const pending = previousSnapshot?.pending || null;
+  const pendingMatches = pending?.source === candidate.source
+    && pending?.data
+    && claudeUsageSnapshotsMatch(pending.data, nextUsage);
   if (pendingMatches && nowMs - Number(pending.firstSeenAt || nowMs) >= CLAUDE_USAGE_PENDING_CONFIRM_MS) {
     return {
-      entry: {
-        ...previousEntry,
-        account: {
-          ...previousEntry.account,
-          usage: mergedUsage,
-          source: candidate.source,
-          timestamp: new Date(candidate.fetchedAt).toISOString(),
-        },
-        fetchedAt: candidate.fetchedAt,
-        pending: null,
-        warning: null,
-      },
+      snapshot: acceptedSnapshot,
       accepted: true,
       status: 'confirmed',
     };
   }
   return {
-    entry: {
-      ...previousEntry,
+    snapshot: {
+      ...previousSnapshot,
       pending: {
-        data: mergedUsage,
+        data: nextUsage,
         source: candidate.source,
         fetchedAt: candidate.fetchedAt,
         firstSeenAt: pendingMatches ? pending.firstSeenAt : nowMs,
@@ -568,7 +596,6 @@ async function fetchUsage(token, {
   fetchImpl = global.fetch,
   timeoutMs = USAGE_TIMEOUT_MS,
   now = Date.now,
-  modelScopedOnly = false,
 } = {}) {
   if (!token) throw new ClaudeUsageError('auth_missing', 'Claude OAuth token is unavailable');
   if (typeof fetchImpl !== 'function') throw new ClaudeUsageError('network_error', 'Fetch is unavailable');
@@ -604,7 +631,7 @@ async function fetchUsage(token, {
       throw new ClaudeUsageError('invalid_response', 'Anthropic usage response is not JSON');
     }
     return {
-      data: normalizeClaudeUsageData(payload, { modelScopedOnly }),
+      data: requireCompleteOAuthUsage(normalizeClaudeUsageData(payload)),
       fetchedAt: now(),
     };
   } catch (error) {
@@ -869,6 +896,34 @@ function sanitizeClaudePersistedAccount(raw) {
   };
 }
 
+function sanitizePersistedUsageSnapshot(raw, source, { requireComplete = false } = {}) {
+  if (!raw?.usage) return null;
+  let usage;
+  try {
+    usage = normalizeClaudeUsageData(raw.usage);
+    if (requireComplete) requireCompleteOAuthUsage(usage);
+  } catch {
+    return null;
+  }
+  if (source === 'claude-statusline') {
+    usage = statuslineUsageOnly(usage);
+  }
+  const fetchedAt = Number(raw.fetchedAt || 0);
+  const timestampMs = Date.parse(raw.timestamp || '');
+  const normalizedFetchedAt = fetchedAt > 0
+    ? fetchedAt
+    : (Number.isFinite(timestampMs) ? timestampMs : 0);
+  if (!normalizedFetchedAt) return null;
+  return {
+    usage,
+    source,
+    timestamp: new Date(normalizedFetchedAt).toISOString(),
+    fetchedAt: normalizedFetchedAt,
+    pending: null,
+    warning: null,
+  };
+}
+
 function serializeClaudeUsageState(entries = claudeUsageByAccount) {
   const accounts = [...entries.entries()]
     .map(([accountKey, entry]) => {
@@ -876,6 +931,15 @@ function serializeClaudeUsageState(entries = claudeUsageByAccount) {
       if (!account) return null;
       return {
         account,
+        oauthSnapshot: sanitizePersistedUsageSnapshot(
+          entry?.oauthSnapshot,
+          'anthropic-oauth-api',
+          { requireComplete: true },
+        ),
+        statuslineSnapshot: sanitizePersistedUsageSnapshot(
+          entry?.statuslineSnapshot,
+          'claude-statusline',
+        ),
         fetchedAt: Number(entry?.fetchedAt || 0) || 0,
         lastAttemptAt: Number(entry?.lastAttemptAt || 0) || null,
         touchedAt: Number(entry?.touchedAt || entry?.fetchedAt || 0) || 0,
@@ -898,7 +962,7 @@ function serializeClaudeUsageState(entries = claudeUsageByAccount) {
     .filter(Boolean)
     .sort((left, right) => right.touchedAt - left.touchedAt)
     .slice(0, CLAUDE_STATUSLINE_PERSISTED_BINDING_LIMIT);
-  return { version: 1, accounts, sessionBindings };
+  return { version: 2, accounts, sessionBindings };
 }
 
 function parseClaudeUsageState(raw) {
@@ -906,12 +970,46 @@ function parseClaudeUsageState(raw) {
   if (typeof raw === 'string') {
     try { parsed = JSON.parse(raw); } catch { return []; }
   }
-  if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.accounts)) return [];
+  if (!parsed || ![1, 2].includes(parsed.version) || !Array.isArray(parsed.accounts)) return [];
   return parsed.accounts.slice(0, 8).map((item) => {
     const account = sanitizeClaudePersistedAccount(item?.account);
     if (!account) return null;
+    let oauthSnapshot = parsed.version === 2
+      ? sanitizePersistedUsageSnapshot(
+        item?.oauthSnapshot,
+        'anthropic-oauth-api',
+        { requireComplete: true },
+      )
+      : null;
+    let statuslineSnapshot = parsed.version === 2
+      ? sanitizePersistedUsageSnapshot(item?.statuslineSnapshot, 'claude-statusline')
+      : null;
+    if (parsed.version === 1 && account.usage) {
+      const legacySnapshot = {
+        usage: account.usage,
+        timestamp: account.timestamp,
+        fetchedAt: Number(item?.fetchedAt || 0) || Date.parse(account.timestamp || ''),
+      };
+      if (account.source === 'anthropic-oauth-api') {
+        oauthSnapshot = sanitizePersistedUsageSnapshot(
+          legacySnapshot,
+          'anthropic-oauth-api',
+          { requireComplete: true },
+        );
+      } else if (account.source === 'claude-statusline') {
+        statuslineSnapshot = sanitizePersistedUsageSnapshot(
+          legacySnapshot,
+          'claude-statusline',
+        );
+        if (statuslineSnapshot) {
+          account.usage = statuslineSnapshot.usage;
+        }
+      }
+    }
     return {
       account,
+      oauthSnapshot,
+      statuslineSnapshot,
       tokenFingerprint: null,
       fetchedAt: Number(item?.fetchedAt || 0) || 0,
       lastAttemptAt: Number(item?.lastAttemptAt || 0) || null,
@@ -932,7 +1030,7 @@ function parseClaudeStatuslineBindings(raw) {
   if (typeof raw === 'string') {
     try { parsed = JSON.parse(raw); } catch { return []; }
   }
-  if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.sessionBindings)) return [];
+  if (!parsed || ![1, 2].includes(parsed.version) || !Array.isArray(parsed.sessionBindings)) return [];
   return parsed.sessionBindings.slice(0, CLAUDE_STATUSLINE_PERSISTED_BINDING_LIMIT).map((item) => {
     const bindingHash = sanitizePersistedText(item?.bindingHash, 32);
     const accountKey = sanitizePersistedText(item?.accountKey, 80);
@@ -1014,10 +1112,40 @@ function pruneClaudeStatuslineBindings() {
   }
 }
 
+function displayClaudeUsageSnapshot(entry, snapshot) {
+  if (!entry || !snapshot?.usage) return entry;
+  return {
+    ...entry,
+    account: {
+      ...(entry.account || {}),
+      usage: snapshot.usage,
+      source: snapshot.source,
+      timestamp: snapshot.timestamp,
+    },
+    fetchedAt: snapshot.fetchedAt,
+    pending: snapshot.pending || null,
+    warning: snapshot.warning || null,
+  };
+}
+
+function hasFreshOAuthUsageSnapshot(entry, tokenFingerprint, nowMs) {
+  const snapshot = entry?.oauthSnapshot;
+  return !!snapshot?.usage
+    && entry?.tokenFingerprint === tokenFingerprint
+    && !entry?.needsLiveRefresh
+    && Number(snapshot.fetchedAt || 0) > 0
+    && nowMs - Number(snapshot.fetchedAt) < CACHE_TTL_MS;
+}
+
 function ensureCurrentAuthAccount(auth, now = Date.now()) {
   if (!auth?.accountKey) return null;
   const descriptor = accountFromAuth(auth);
   const previous = claudeUsageByAccount.get(auth.accountKey) || null;
+  const tokenChanged = previous?.tokenFingerprint != null
+    && previous.tokenFingerprint !== auth.tokenFingerprint;
+  const oauthSnapshot = tokenChanged && previous?.oauthSnapshot
+    ? { ...previous.oauthSnapshot, pending: null, warning: null }
+    : (previous?.oauthSnapshot || null);
   const next = {
     ...previous,
     account: {
@@ -1028,17 +1156,21 @@ function ensureCurrentAuthAccount(auth, now = Date.now()) {
       source: previous?.account?.usage ? previous.account.source : descriptor.source,
       timestamp: previous?.account?.usage ? previous.account.timestamp : null,
     },
+    oauthSnapshot,
+    statuslineSnapshot: previous?.statuslineSnapshot || null,
     tokenFingerprint: auth.tokenFingerprint,
     touchedAt: now,
     error: previous?.error || null,
     errorAt: previous?.errorAt || 0,
+    oauthErrorAt: tokenChanged ? 0 : (previous?.oauthErrorAt || 0),
+    oauthRetryNotBefore: previous?.oauthRetryNotBefore || 0,
     billing: previous?.billing || null,
-    pending: previous?.pending || null,
-    warning: previous?.warning || null,
+    pending: tokenChanged ? null : (previous?.pending || null),
+    warning: tokenChanged ? null : (previous?.warning || null),
     retryNotBefore: previous?.retryNotBefore || 0,
     needsLiveRefresh: previous
       ? (previous.needsLiveRefresh === true
-        || (previous.tokenFingerprint != null && previous.tokenFingerprint !== auth.tokenFingerprint))
+        || tokenChanged)
       : false,
   };
   claudeUsageByAccount.set(auth.accountKey, next);
@@ -1199,7 +1331,9 @@ async function recordStatuslineUsage(data, {
   }
   let usage;
   try {
-    usage = normalizeClaudeUsageData(data.rate_limits, { statusline: true });
+    usage = statuslineUsageOnly(
+      normalizeClaudeUsageData(data.rate_limits, { statusline: true }),
+    );
   } catch (error) {
     console.warn('[ClaudeUsage] rejected invalid statusline rate_limits:', error?.message || String(error));
     return { accepted: false, reason: error?.code || 'invalid-response' };
@@ -1212,32 +1346,60 @@ async function recordStatuslineUsage(data, {
     ? Math.min(nowMs, bridgeAt * 1000)
     : nowMs;
   const previous = claudeUsageByAccount.get(binding.accountKey) || null;
+  const accountKind = previous?.account?.kind || binding.account?.kind || 'claude-managed-key';
   const timestamp = new Date(fetchedAt).toISOString();
-  const reconciled = reconcileClaudeUsageSnapshot(previous, {
+  const reconciled = reconcileClaudeUsageSourceSnapshot(previous?.statuslineSnapshot || null, {
     data: usage,
     source: 'claude-statusline',
     fetchedAt,
   }, nowMs);
-  const next = {
-    ...(reconciled.entry || previous || {}),
+  let next = {
+    ...(previous || {}),
     account: {
       ...binding.account,
-      ...(reconciled.entry?.account || previous?.account || {}),
+      ...(previous?.account || {}),
     },
+    statuslineSnapshot: reconciled.snapshot,
     tokenFingerprint: previous?.tokenFingerprint || binding.tokenFingerprint,
     lastAttemptAt: fetchedAt,
     touchedAt: nowMs,
-    error: null,
-    errorAt: 0,
     billing: previous?.billing || null,
-    retryNotBefore: 0,
-    needsLiveRefresh: reconciled.accepted ? false : (previous?.needsLiveRefresh || false),
+    needsLiveRefresh: accountKind === 'max-oauth'
+      ? (previous?.needsLiveRefresh === true || !previous?.oauthSnapshot?.usage)
+      : (reconciled.accepted ? false : (previous?.needsLiveRefresh || false)),
   };
+  if (accountKind !== 'max-oauth') {
+    next = {
+      ...next,
+      error: null,
+      errorAt: 0,
+      retryNotBefore: 0,
+    };
+  }
+  const oauthIsDisplayed = accountKind === 'max-oauth'
+    && previous?.account?.source === 'anthropic-oauth-api'
+    && previous?.account?.usage;
+  const fallbackSupersedesFailedOAuth = accountKind === 'max-oauth'
+    && Number(previous?.oauthErrorAt || 0) > 0
+    && Number(reconciled.snapshot?.fetchedAt || 0) >= Number(previous?.oauthSnapshot?.fetchedAt || 0);
+  if (!oauthIsDisplayed || fallbackSupersedesFailedOAuth) {
+    next = displayClaudeUsageSnapshot(next, reconciled.snapshot);
+    if (accountKind === 'max-oauth') {
+      next = {
+        ...next,
+        error: null,
+        errorAt: 0,
+        needsLiveRefresh: false,
+      };
+    }
+  }
   claudeUsageByAccount.set(binding.accountKey, next);
   pruneClaudeUsageAccounts(binding.accountKey);
   if (reconciled.accepted) {
     persistClaudeUsageState();
-    saveUsageSnapshot(binding.accountKey, next.account.usage, next.fetchedAt);
+    if (accountKind !== 'max-oauth') {
+      saveUsageSnapshot(binding.accountKey, next.account.usage, next.fetchedAt);
+    }
   }
   return {
     accepted: reconciled.accepted,
@@ -1252,9 +1414,8 @@ async function fetchCurrentClaudeUsage(auth, {
   authReader,
   fetchImpl,
   now,
-  modelScopedOnly = false,
 } = {}) {
-  const inflightKey = `${auth.accountKey}:${auth.tokenFingerprint || 'session'}:${auth.currentKind}:${modelScopedOnly ? 'model-scoped' : 'full'}`;
+  const inflightKey = `${auth.accountKey}:${auth.tokenFingerprint || 'session'}:${auth.currentKind}:full`;
   let request = claudeUsageInflight.get(inflightKey);
   if (!request) {
     request = (async () => {
@@ -1268,7 +1429,7 @@ async function fetchCurrentClaudeUsage(auth, {
           fetchedAt: now(),
         };
       } else {
-        result = await fetchUsage(auth.oauthToken, { fetchImpl, now, modelScopedOnly });
+        result = await fetchUsage(auth.oauthToken, { fetchImpl, now });
       }
       const latestAuth = await authReader();
       if (!authMatches(auth, latestAuth)) {
@@ -1321,14 +1482,6 @@ async function getUsage(opts = {}) {
   }
 
   const current = claudeUsageByAccount.get(auth.accountKey) || null;
-  const hasStatuslinePrimary = !current?.needsLiveRefresh
-    && current?.account?.usage
-    && current.account.source === 'claude-statusline';
-  const hasFreshModelQuota = current?.tokenFingerprint === auth.tokenFingerprint
-    && Number(current?.modelQuotaFetchedAt || 0) > 0
-    && nowMs - Number(current.modelQuotaFetchedAt) < CACHE_TTL_MS;
-  const enrichmentOnly = auth.currentKind === 'max-oauth' && hasStatuslinePrimary;
-  const needsModelQuotaRefresh = enrichmentOnly && (force || !hasFreshModelQuota);
 
   // Managed /login credentials cannot call /api/oauth/usage. The official
   // statusLine snapshot is the only quota source; refresh re-reads auth but
@@ -1342,25 +1495,30 @@ async function getUsage(opts = {}) {
     });
   }
 
-  if (auth.currentKind !== 'api-platform' && hasStatuslinePrimary && !needsModelQuotaRefresh) {
+  if (auth.currentKind === 'max-oauth') {
+    if (current?.oauthRetryNotBefore && nowMs < current.oauthRetryNotBefore) {
+      return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
+    }
+    if (!force && current?.oauthErrorAt
+      && nowMs - current.oauthErrorAt < ERROR_COOLDOWN_MS) {
+      return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
+    }
+    if (!force && hasFreshOAuthUsageSnapshot(current, auth.tokenFingerprint, nowMs)) {
+      return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
+    }
+  }
+  if (auth.currentKind === 'api-platform'
+    && current?.retryNotBefore && nowMs < current.retryNotBefore) {
     return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
   }
-  if (enrichmentOnly && current?.modelQuotaRetryNotBefore && nowMs < current.modelQuotaRetryNotBefore) {
-    return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
-  }
-  if (enrichmentOnly && !force && current?.modelQuotaErrorAt
-    && nowMs - current.modelQuotaErrorAt < ERROR_COOLDOWN_MS) {
-    return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
-  }
-  if (current?.retryNotBefore && nowMs < current.retryNotBefore) {
-    return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
-  }
-  if (!force && current?.errorAt
+  if (auth.currentKind === 'api-platform'
+    && !force && current?.errorAt
     && current.tokenFingerprint === auth.tokenFingerprint
     && nowMs - current.errorAt < ERROR_COOLDOWN_MS) {
     return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
   }
-  if (!force && !current?.error && current?.account?.usage
+  if (auth.currentKind === 'api-platform'
+    && !force && !current?.error && current?.account?.usage
     && !current.needsLiveRefresh
     && current.tokenFingerprint === auth.tokenFingerprint
     && nowMs - Number(current.fetchedAt || 0) < CACHE_TTL_MS) {
@@ -1374,14 +1532,9 @@ async function getUsage(opts = {}) {
       authReader,
       fetchImpl,
       now,
-      modelScopedOnly: enrichmentOnly,
     });
     auth = result.auth || auth;
     const previous = claudeUsageByAccount.get(auth.accountKey) || null;
-    const preserveStatuslinePrimary = auth.currentKind === 'max-oauth'
-      && !previous?.needsLiveRefresh
-      && previous?.account?.usage
-      && previous.account.source === 'claude-statusline';
     if (auth.currentKind === 'api-platform') {
       claudeUsageByAccount.set(auth.accountKey, {
         ...previous,
@@ -1395,52 +1548,30 @@ async function getUsage(opts = {}) {
         retryNotBefore: 0,
         needsLiveRefresh: false,
       });
-    } else if (preserveStatuslinePrimary) {
-      const mergedUsage = mergeClaudeUsageData(previous.account.usage, {
-        model_scoped: result.data?.model_scoped || [],
-      });
-      claudeUsageByAccount.set(auth.accountKey, {
-        ...previous,
-        account: {
-          ...previous.account,
-          ...accountFromAuth(auth),
-          usage: mergedUsage,
-          source: previous.account.source,
-          timestamp: previous.account.timestamp,
-        },
-        tokenFingerprint: auth.tokenFingerprint,
-        modelQuotaFetchedAt: result.fetchedAt,
-        modelQuotaErrorAt: 0,
-        modelQuotaRetryNotBefore: 0,
-        touchedAt: lastAttemptAt,
-        error: null,
-        errorAt: 0,
-        retryNotBefore: 0,
-        needsLiveRefresh: false,
-      });
     } else {
-      const reconciled = reconcileClaudeUsageSnapshot(previous, {
+      const reconciled = reconcileClaudeUsageSourceSnapshot(previous?.oauthSnapshot || null, {
         data: result.data,
         source: 'anthropic-oauth-api',
         fetchedAt: result.fetchedAt,
       }, lastAttemptAt);
-      const next = {
-        ...(reconciled.entry || previous || {}),
+      let next = {
+        ...previous,
         account: {
           ...accountFromAuth(auth),
-          ...(reconciled.entry?.account || previous?.account || {}),
+          ...(previous?.account || {}),
         },
+        oauthSnapshot: reconciled.snapshot,
         tokenFingerprint: auth.tokenFingerprint,
-        lastAttemptAt,
         touchedAt: lastAttemptAt,
+        lastAttemptAt,
         error: null,
         errorAt: 0,
         retryNotBefore: 0,
-        modelQuotaFetchedAt: result.fetchedAt,
-        modelQuotaErrorAt: 0,
-        modelQuotaRetryNotBefore: 0,
+        oauthErrorAt: 0,
+        oauthRetryNotBefore: 0,
         needsLiveRefresh: reconciled.accepted ? false : (previous?.needsLiveRefresh || false),
       };
+      next = displayClaudeUsageSnapshot(next, reconciled.snapshot);
       claudeUsageByAccount.set(auth.accountKey, next);
       if (reconciled.accepted) {
         saveUsageSnapshot(auth.accountKey, next.account.usage, next.fetchedAt);
@@ -1476,29 +1607,50 @@ async function getUsage(opts = {}) {
     }
     const previous = claudeUsageByAccount.get(auth.accountKey) || null;
     const failureAt = now();
-    const preserveStatuslinePrimary = auth.currentKind === 'max-oauth'
-      && !previous?.needsLiveRefresh
-      && previous?.account?.usage
-      && previous.account.source === 'claude-statusline';
-    if (preserveStatuslinePrimary) {
-      const modelQuotaIsStale = !previous.modelQuotaFetchedAt
-        || failureAt - Number(previous.modelQuotaFetchedAt) > USAGE_STALE_MS;
-      claudeUsageByAccount.set(auth.accountKey, {
+    if (auth.currentKind === 'max-oauth' && previous?.statuslineSnapshot?.usage) {
+      const fallback = previous.statuslineSnapshot;
+      const oauthFetchedAt = Number(previous?.oauthSnapshot?.fetchedAt || 0);
+      const shouldUseFallback = previous?.account?.source === 'claude-statusline'
+        || Number(fallback.fetchedAt || 0) >= oauthFetchedAt;
+      let next = {
         ...previous,
-        account: modelQuotaIsStale
-          ? {
-              ...previous.account,
-              usage: mergeClaudeUsageData(previous.account.usage, { model_scoped: [] }),
-            }
-          : previous.account,
         tokenFingerprint: auth.tokenFingerprint,
+        lastAttemptAt,
         touchedAt: lastAttemptAt,
-        modelQuotaErrorAt: failureAt,
-        modelQuotaRetryNotBefore: error?.code === 'rate_limited'
+        oauthErrorAt: failureAt,
+        oauthRetryNotBefore: error?.code === 'rate_limited'
           ? failureAt + Number(error.retryAfterMs || ERROR_COOLDOWN_MS)
           : 0,
-      });
-      console.warn('[ClaudeUsage] optional model quota refresh failed account=' + auth.label + ' code=' + (error?.code || 'network_error'));
+      };
+      if (shouldUseFallback) {
+        const fallbackWasAlreadyDisplayed = previous?.account?.source === 'claude-statusline'
+          && Number(previous?.fetchedAt || 0) === Number(fallback.fetchedAt || 0);
+        next = displayClaudeUsageSnapshot({
+          ...next,
+          error: null,
+          errorAt: 0,
+          retryNotBefore: 0,
+          needsLiveRefresh: false,
+        }, fallback);
+        if (!fallbackWasAlreadyDisplayed) {
+          saveUsageSnapshot(auth.accountKey, fallback.usage, fallback.fetchedAt);
+        }
+      } else {
+        next = {
+          ...next,
+          error: error?.message || String(error),
+          errorAt: failureAt,
+          needsLiveRefresh: true,
+        };
+      }
+      claudeUsageByAccount.set(auth.accountKey, next);
+      pruneClaudeUsageAccounts(auth.accountKey);
+      persistClaudeUsageState();
+      console.warn(
+        '[ClaudeUsage] OAuth usage refresh failed account=' + auth.label
+        + ' display=' + (shouldUseFallback ? 'statusline-fallback' : 'last-oauth')
+        + ' code=' + (error?.code || 'network_error'),
+      );
       return buildUsageResponse({
         requestedAccountKey,
         currentAccountKey: auth.accountKey,
@@ -1515,6 +1667,13 @@ async function getUsage(opts = {}) {
       retryNotBefore: error?.code === 'rate_limited'
         ? now() + Number(error.retryAfterMs || ERROR_COOLDOWN_MS)
         : (previous?.retryNotBefore || 0),
+      oauthErrorAt: auth.currentKind === 'max-oauth' ? failureAt : (previous?.oauthErrorAt || 0),
+      oauthRetryNotBefore: auth.currentKind === 'max-oauth' && error?.code === 'rate_limited'
+        ? failureAt + Number(error.retryAfterMs || ERROR_COOLDOWN_MS)
+        : (previous?.oauthRetryNotBefore || 0),
+      needsLiveRefresh: auth.currentKind === 'max-oauth'
+        ? true
+        : (previous?.needsLiveRefresh || false),
     });
     pruneClaudeUsageAccounts(auth.accountKey);
     console.warn('[ClaudeUsage] refresh failed account=' + auth.label + ' code=' + (error?.code || 'network_error'));

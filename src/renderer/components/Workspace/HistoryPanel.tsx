@@ -1247,24 +1247,34 @@ const collectHistoryBackgroundChips = (
   entries: FullHistoryEntry[],
   isTurnBusy: boolean,
   agentProcessAlive: boolean,
+  currentSessionId: string,
 ): HistoryBackgroundChip[] => {
   // A chip is the LIVE face of work. Two liveness models:
   //
-  // 1. Turn-scoped work (Claude Tasks, background Bash of the current turn):
+  // 1. Turn-scoped work (Claude Task subagents without an explicit status):
   //    lives only in the LAST turn while that turn is busy right now.
   //    Historical turns are full of result-less cards (aborted turns,
   //    docs-noise, rewound branches); treating them as running produced
   //    boards of eternal "1236m" chips after a restart. Claude Escape kills
-  //    the whole turn including its subagents, so busy=false is terminal.
+  //    the turn's subagents, so busy=false is terminal for them.
   //
-  // 2. Process-scoped work (Codex in-process subagents with an EXPLICIT
-  //    rollout status): agents legitimately outlive their spawn turn —
-  //    spawn in turn N, wait_agent in turn N+2 — so busy=false with a
-  //    running agent is a normal state, not a stale card. Their gate is the
-  //    agent process itself: a dead codex process cannot host in-process
-  //    agents, and no terminal rollout event will ever arrive for them.
+  // 2. Process-scoped work — outlives its spawn turn but never the host
+  //    process (gate: composer availability), scanned across ALL turns
+  //    because "spawn in turn N, still running in turn N+2" is its normal
+  //    shape (a last-turn-only scan silently dropped these chips the moment
+  //    the user sent another prompt):
+  //    - Codex in-process subagents with an EXPLICIT rollout status: no
+  //      terminal event can ever arrive for a dead codex process.
+  //    - Claude background Bash (run_in_background): the turn ends at the
+  //      ACCEPTANCE while the OS process keeps running; the outcome arrives
+  //      later as an injected <task-notification> turn. E2E (ct-e2e13 C)
+  //      showed a fast turn ends before the acceptance even reaches the
+  //      renderer, so a busy-gated bash chip is unobservable by design.
+  //      Epoch guard: `claude --resume` copies the parent transcript with
+  //      the ORIGINAL sessionId, and those copied acceptances can never
+  //      notify in this process — only acceptances from the current session
+  //      epoch are live.
   if (!isTurnBusy && !agentProcessAlive) return [];
-  const explicitOnly = !isTurnBusy;
   let lastTurnStart = 0;
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     if (entries[i].role === 'user' && !isLocalPromptEntry(entries[i])) {
@@ -1273,12 +1283,16 @@ const collectHistoryBackgroundChips = (
     }
   }
   const chips: HistoryBackgroundChip[] = [];
-  for (let i = lastTurnStart; i < entries.length; i += 1) {
+  for (let i = 0; i < entries.length; i += 1) {
     const entry = entries[i];
     if (!Array.isArray(entry.actions)) continue;
+    const inLastTurn = i >= lastTurnStart;
     for (const action of entry.actions) {
       if (isRawAction(action) && action.rawTool.backgroundStatus === 'running') {
-        if (explicitOnly) continue; // turn-scoped: dies with the turn
+        if (!agentProcessAlive) continue; // process-scoped
+        if (entry.sessionId && currentSessionId && entry.sessionId !== currentSessionId) {
+          continue; // resume-copied acceptance from a previous epoch
+        }
         const command = typeof action.rawTool.args?.command === 'string'
           ? action.rawTool.args.command
           : '';
@@ -1296,8 +1310,8 @@ const collectHistoryBackgroundChips = (
       // Explicit rollout status (Codex) is process-scoped truth; a Claude
       // Task without one is turn-scoped and needs the busy gate.
       const running = action.subagentStatus
-        ? action.subagentStatus === 'running'
-        : (!explicitOnly && action.result == null);
+        ? (action.subagentStatus === 'running' && agentProcessAlive)
+        : (inLastTurn && isTurnBusy && action.result == null);
       if (running) {
         chips.push({
           key: 'task:' + (action.toolUseId || entry.uuid),
@@ -6110,8 +6124,8 @@ function HistoryPanel({
     || agentProcessStatus === 'busy'
     || agentProcessStatus === 'starting';
   const backgroundHistoryChips = useMemo(
-    () => collectHistoryBackgroundChips(entries, isTurnBusy, agentProcessAlive),
-    [entries, isTurnBusy, agentProcessAlive],
+    () => collectHistoryBackgroundChips(entries, isTurnBusy, agentProcessAlive, sessionId || ''),
+    [entries, isTurnBusy, agentProcessAlive, sessionId],
   );
   const liveBackgroundUuids = useMemo(
     () => new Set(backgroundHistoryChips.map((chip) => chip.entryUuid)),
@@ -7921,7 +7935,16 @@ function HistoryPanel({
             historyOwnerKeyRef.current !== ownerAtRestore
             || historyOwnerGenerationRef.current !== generationAtRestore
             || scrollRestoreGenRef.current !== restoreGenAtStart
-          ) return;
+          ) {
+            // Cancellation is part of the acceptance contract (user wheel
+            // must take ownership) — log it, a silent exit is untestable.
+            historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
+              + ' uuid=' + anchor.uuid.slice(0, 8)
+              + ' attempts=' + attempts
+              + ' reason=' + (scrollRestoreGenRef.current !== restoreGenAtStart
+                ? 'superseded-or-user-scroll' : 'owner-change'));
+            return;
+          }
           const scroller = virtuosoScrollerRef.current;
           if (!scroller) return;
           attempts += 1;

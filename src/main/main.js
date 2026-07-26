@@ -122,6 +122,11 @@ const srcMainDir = path.join(__dirname, '..', '..', 'src', 'main');
 const srcSharedDir = path.join(__dirname, '..', '..', 'src', 'shared');
 const { createXtermWritePump } = require(path.join(srcSharedDir, 'xterm-write-pump.cjs'));
 const {
+  prebindClaudeHookPid,
+  resolveClaudeHookTab,
+} = require(path.join(srcMainDir, 'claude-hook-routing'));
+const { buildSessionProgress } = require(path.join(srcMainDir, 'session-progress'));
+const {
   deleteTerminalRuntimeIfOwned,
   ownsTerminalRuntime,
 } = require(path.join(srcMainDir, 'terminal-runtime-identity.cjs'));
@@ -324,6 +329,7 @@ const {
 const {
   buildAgentShellLaunchInput,
   decideAgentShellLaunchAdmission,
+  isAgentShellLaunchInterruptPrelude,
 } = require(path.join(srcMainDir, 'ai-shell-launch'));
 const {
   classifyCodexMcpStartupBlockerHandling,
@@ -1515,7 +1521,14 @@ function markClaudeShellLaunchStarted(tabId, sessionId = null, reason = 'claude-
   commandState.isRunning = true;
   clearTerminalCommandOrigin(tabId, commandState, reason);
   terminalCommandState.set(tabId, commandState);
-  claudeStartupIntents.set(tabId, { sessionId: sessionId || null, at: Date.now(), reason });
+  claudeStartupIntents.set(tabId, {
+    sessionId: sessionId || null,
+    at: Date.now(),
+    reason,
+    terminalToken: terminals.get(tabId) || null,
+    expectsInterruptPrelude: true,
+    sawOscCommandStart: false,
+  });
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'claude' });
   }
@@ -5164,9 +5177,10 @@ function formatInterruptedAiSessionIds(entries) {
 
 // ========== Claude Turn Event Bridge ==========
 // Deterministic end-of-turn signal sourced from Claude Code's Stop hook.
-// Hook script writes one JSON line per event into this socket; we look up the
-// tab by session_id (using bridgeKnownSessions as the source of truth) and
-// broadcast 'claude:turn-state' to the renderer.
+// Hook script writes one JSON line per event into this socket. A known
+// session_id is the primary route; the already-proven launch PID bridges the
+// short first-turn window before statusLine binds the new JSONL to the tab.
+// The resolved event is broadcast as 'claude:turn-state' to the renderer.
 // Per-PID socket path so dev+prod (and N parallel instances) never stomp on
 // each other. Before this fix: both instances wrote to /tmp/noted-terminal-claude-hook.sock,
 // the second one unlink'd the first's socket and rebound — first instance's
@@ -5309,14 +5323,6 @@ const grabInputPidToTab = new Map(); // cliPid → tabId, used by non-Claude ext
 function stageCodexImageRefs(tabId, refs) {
   const token = codexImageBindings.stage(tabId, refs);
   return token ? { token, refs } : { token: null, refs: [] };
-}
-
-function findTabIdBySession(sessionId) {
-  if (!sessionId) return null;
-  for (const [tabId, sid] of bridgeKnownSessions) {
-    if (sid === sessionId) return tabId;
-  }
-  return null;
 }
 
 function resolveClaudeSessionFileForTab(tabId, sessionId = bridgeKnownSessions.get(tabId) || null) {
@@ -5849,7 +5855,7 @@ function startClaudeHookServer() {
           console.warn('[ClaudeHook] Bad JSON conn=' + connId + ':', e.message);
           continue;
         }
-        const { event, session_id, last_assistant_message, ts, transcript_path } = msg;
+        const { event, session_id, last_assistant_message, ts, transcript_path, ppid } = msg;
         const eventSeq = ++claudeHookEventSeq;
 
         // Send ack back to script so it can distinguish "kernel buffered"
@@ -5935,11 +5941,27 @@ function startClaudeHookServer() {
           continue;
         }
 
-        const tabId = findTabIdBySession(session_id);
+        const hookRoute = resolveClaudeHookTab({
+          sessionId: session_id,
+          ppid,
+          sessionByTab: bridgeKnownSessions,
+          tabByPid: bridgePidCache,
+          hasTab: (candidateTabId) => terminals.has(candidateTabId),
+        });
+        const tabId = hookRoute.tabId;
         if (!tabId) {
           // Session not in our tab map — could be a stray claude process outside our terminal.
-          console.log('[ClaudeHook] #' + eventSeq + ' ' + event + ' session=' + (session_id || '').slice(0, 8) + ' (no tab match)');
+          console.log('[ClaudeHook] #' + eventSeq + ' ' + event
+            + ' session=' + (session_id || '').slice(0, 8)
+            + ' ppid=' + (Number.isSafeInteger(Number(ppid)) ? Number(ppid) : '-')
+            + ' (no tab match)');
           continue;
+        }
+        if (hookRoute.source === 'pid') {
+          console.log('[ClaudeHookRoute] tab=' + String(tabId).slice(-12)
+            + ' session=' + (session_id || '').slice(0, 8)
+            + ' ppid=' + hookRoute.pid
+            + ' source=launch-pid-before-session');
         }
 
         claudeHookLastEvent.set(tabId, { event, ts: Date.now(), sessionId: session_id });
@@ -6182,22 +6204,32 @@ function startClaudeHookServer() {
         claudeSpinnerIdleTimer.delete(tabId);
         const prevSpinner = claudeSpinnerBusy.get(tabId);
         claudeSpinnerBusy.set(tabId, busy);
+        const lifecycleReason = (!busy && event === 'StopFailure') ? 'error' : undefined;
         if (mainWindow && !mainWindow.isDestroyed()) {
           // Hook events are the authoritative turn bracket and must always reach
           // workflow consumers. A spinner heuristic may already have written the
           // same boolean into claudeSpinnerBusy; suppressing this event by value
           // would hide the real Stop/StopFailure outcome from PromptQueueRunner.
-          const reason = (!busy && event === 'StopFailure') ? 'error' : undefined;
-          mainWindow.webContents.send('claude:busy-state', { tabId, busy, reason });
+          mainWindow.webContents.send('claude:busy-state', { tabId, busy, reason: lifecycleReason });
         }
         // Mirror busy-state to any mobile-web subscribers of this PTY+Claude
         // tab — otherwise phone composer never learns Claude is processing
         // and a Send during turn races with the previous prompt's JSONL write.
+        // This hook edge is authoritative and must be published even when the
+        // presentation spinner already wrote the same boolean. Orchestration
+        // requires the matching start edge before it can accept a later done.
         // (SDK tabs already have their own webBroadcast path in sdkStartQuery.)
-        if (prevSpinner !== busy) {
-          console.log('[MobBcast] busy tab=' + String(tabId).slice(-12) + ' busy=' + busy + ' src=spinner-state');
-          _webBroadcast(tabId, { type: 'busy', busy });
-          if (!busy) _webBroadcast(tabId, { type: 'done', sessionId: session_id });
+        console.log('[MobBcast] busy tab=' + String(tabId).slice(-12)
+          + ' busy=' + busy
+          + ' src=claude-hook'
+          + ' prevSpinner=' + (prevSpinner === undefined ? 'undef' : prevSpinner));
+        _webBroadcast(tabId, { type: 'busy', busy, reason: lifecycleReason });
+        if (!busy) {
+          _webBroadcast(tabId, {
+            type: 'done',
+            sessionId: session_id,
+            reason: lifecycleReason,
+          });
         }
         // Activity tracking — authoritative turn edges (idempotent recorder).
         recordActivity(tabId, busy, 'claude', {
@@ -6788,6 +6820,16 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
         terminalShellReadiness.markCommandBoundary(tabId, terminalToken);
         console.log(`[OSC 133] Tab ${tabId}: Command STARTED (B)`);
         console.warn(`[RunAfterDiag] B tab=${tabId.slice(-8)} claudeCliActive=${claudeCliActive.has(tabId)} spinnerBusy=${claudeSpinnerBusy.get(tabId) === true}`);
+        {
+          const startupIntent = claudeStartupIntents.get(tabId);
+          if (
+            startupIntent
+            && startupIntent.terminalToken === terminals.get(tabId)
+            && (!terminalToken || startupIntent.terminalToken === terminalToken)
+          ) {
+            startupIntent.sawOscCommandStart = true;
+          }
+        }
         clearClaudeEditableLastPrompt(tabId, 'osc-command-started');
         if (codexFinishDebounceTimers.has(tabId)) {
           clearTimeout(codexFinishDebounceTimers.get(tabId));
@@ -6844,8 +6886,28 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
         // evidence that Codex exited.
         const wasRunningBeforeD = state.isRunning === true;
         const runSeqAtD = Number(state.runSeq || 0);
-        state.lastExitCode = param ? parseInt(param, 10) : 0;
-        console.log(`[OSC 133] Tab ${tabId}: Command FINISHED (D) exitCode=${state.lastExitCode}`);
+        const exitCodeAtD = param ? parseInt(param, 10) : 0;
+        console.log(`[OSC 133] Tab ${tabId}: Command FINISHED (D) exitCode=${exitCodeAtD}`);
+        {
+          const startupIntent = claudeStartupIntents.get(tabId);
+          const sameTerminal = !!startupIntent
+            && startupIntent.terminalToken === terminals.get(tabId)
+            && (!terminalToken || startupIntent.terminalToken === terminalToken);
+          if (isAgentShellLaunchInterruptPrelude({
+            exitCode: exitCodeAtD,
+            expectsInterruptPrelude: startupIntent?.expectsInterruptPrelude === true,
+            sawOscCommandStart: startupIntent?.sawOscCommandStart === true,
+            sameTerminal,
+          })) {
+            console.warn('[AgentShellLaunch] suppress interrupt prelude command-finished tab='
+              + String(tabId).slice(-12)
+              + ' exitCode=' + exitCodeAtD
+              + ' runSeq=' + runSeqAtD
+              + ' reason=' + (startupIntent?.reason || '-'));
+            break;
+          }
+        }
+        state.lastExitCode = exitCodeAtD;
         clearClaudeEditableLastPrompt(tabId, 'osc-command-finished');
         // [RunAfterDiag] Correlate D markers with Claude liveness. If a D fires
         // while claudeCliActive/claudeSpinnerBusy is true, the shell is claiming
@@ -6976,7 +7038,7 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
           if (claudeCliActive.has(tabId)) {
             claudeCliActive.delete(tabId);
           }
-          if (bridgeKnownSessions.has(tabId)) {
+          if (bridgeKnownSessions.has(tabId) || findClaudePidByTab(tabId)) {
             clearBridgeTab(tabId);
           } else if (hadPromptReady) {
             console.log('[MobBcast] busy+snapshot tab=' + String(tabId).slice(-12) + ' busy=false status=inactive src=command-finished-no-bridge');
@@ -7516,6 +7578,18 @@ function shortKnowledgeDocsPath(filePath) {
   return segs.length >= 2 ? segs.slice(-2).join('/') : segs[0];
 }
 
+function _sessionProgressToolDetail(input) {
+  if (!input || typeof input !== 'object') return null;
+  const keys = ['file_path', 'path', 'command', 'query', 'pattern', 'summary', 'description', 'url'];
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value !== 'string' || !value.trim()) continue;
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    return normalized.length > 200 ? normalized.slice(0, 199) + '…' : normalized;
+  }
+  return null;
+}
+
 // Group the active branch into turns. A turn starts at a user prompt (or a
 // compact_boundary) and includes all subsequent assistant records until the
 // next user prompt / boundary. Tool_result records are attached to the
@@ -7598,9 +7672,14 @@ function _groupIntoTurns(branch) {
             preview: block.text.slice(0, 160),
           });
         } else if (block.type === 'tool_use' && block.name) {
+          const toolIndex = current.toolUses.length;
           current.toolUses.push({
-            idx: current.toolUses.length,
+            idx: toolIndex,
             name: block.name,
+            detail: _sessionProgressToolDetail(block.input),
+            operationId: String(block.id || `${entry.uuid}:tool:${toolIndex}`),
+            assistantUuid: entry.uuid || null,
+            timestamp: entry.timestamp || null,
           });
           // Same forward-expand logic the Timeline uses to compute docsEdited
           // (green dot in UI). Tracked per turn so overseer can tell apart
@@ -7760,7 +7839,20 @@ async function _loadCodexSessionTurns(sessionId, cwd) {
       }
       for (const action of entry.actions || []) {
         const name = action?.rawTool?.toolName || action?.tool || 'tool';
-        current.toolUses.push({ idx: current.toolUses.length, name });
+        const toolIndex = current.toolUses.length;
+        current.toolUses.push({
+          idx: toolIndex,
+          name,
+          detail: _sessionProgressToolDetail(action?.rawTool?.args),
+          operationId: String(
+            action?.id
+            || action?.rawTool?.toolUseId
+            || action?.rawTool?.toolCallId
+            || `${entry.uuid}:action:${toolIndex}`,
+          ),
+          assistantUuid: entry.uuid || null,
+          timestamp: entry.timestamp || null,
+        });
         blocks.push({ type: 'tool_use', name });
       }
       const rec = {
@@ -8105,6 +8197,23 @@ async function handleOverseerRequest(rawUrl) {
   const cwd = url.searchParams.get('cwd') || null;
 
   const data = await _loadSessionTurns(sessionId, cwd);
+
+  if (subpath === '/progress') {
+    const progress = buildSessionProgress({
+      sessionId,
+      turns: data.turns,
+      cursor: url.searchParams.get('cursor') || null,
+      limit: url.searchParams.get('limit'),
+    });
+    return {
+      body: {
+        sessionId,
+        engine: data.engine || 'claude',
+        branchLength: data.branchLength,
+        ...progress,
+      },
+    };
+  }
 
   if (subpath === '/stats' || subpath === '') {
     // Aggregate counts so the agent can decide whether the session is worth
@@ -9811,7 +9920,7 @@ function startMcpHttpServer() {
           res.end(JSON.stringify(out.body));
         } catch (e) {
           console.error('[MCP:Overseer] Error:', e.message, e.stack);
-          res.writeHead(500);
+          res.writeHead(Number(e?.statusCode || e?.status) || 500);
           res.end(JSON.stringify({ error: e.message }));
         }
       })();
@@ -12564,6 +12673,19 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     stagedCodexImageRefs = prepared.staged;
     codexImagePasteSegments = prepared.replaced > 0 ? prepared.segments : null;
   }
+  if (
+    submit
+    && submitSequence !== '\t'
+    && !isCodexPasteSource
+    && !fast
+    && broadcastTabId
+  ) {
+    // A fresh Claude can accept its first prompt before StatusLine creates the
+    // JSONL/session binding. Prove the exact process under this PTY immediately
+    // before Enter so UserPromptSubmit can route the first durable record back
+    // to the source tab and settle its temporary History handoff.
+    await prebindClaudeHookRouteForSubmit(broadcastTabId, logPrefix);
+  }
   if (submit && !isCodexPasteSource && !fast && broadcastTabId) {
     const sessionHints = [
       bridgeKnownSessions.get(broadcastTabId) || null,
@@ -14333,6 +14455,61 @@ function findClaudePidByTab(tabId) {
   return null;
 }
 
+function findLiveClaudePidByTab(tabId) {
+  for (const [pid, tid] of bridgePidCache) {
+    if (tid !== tabId) continue;
+    try {
+      process.kill(pid, 0);
+      return pid;
+    } catch {
+      bridgePidCache.delete(pid);
+    }
+  }
+  return null;
+}
+
+async function prebindClaudeHookRouteForSubmit(tabId, logPrefix = '[safePaste]') {
+  if (!tabId || !terminals.has(tabId)) {
+    return { bound: false, tabId: null, pid: null, reason: 'tab-unavailable' };
+  }
+
+  const livePid = findLiveClaudePidByTab(tabId);
+  if (livePid) {
+    return { bound: true, tabId, pid: livePid, reason: 'live-pid-cache' };
+  }
+
+  invalidateAiProcessLookupCache(tabId, 'claude');
+  const lookup = await inspectAiDescendantProcessesByTab(
+    tabId,
+    'claude',
+    { forceFresh: true },
+  );
+  if (lookup.status !== AI_PROCESS_LOOKUP_STATUS.FOUND) {
+    const reason = lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN
+      ? 'process-lookup-unknown'
+      : 'claude-process-absent';
+    console.warn(logPrefix + ' [ClaudeHookRoute] pre-submit proof unavailable tab='
+      + String(tabId).slice(-12)
+      + ' reason=' + reason
+      + ' error=' + (lookup.error?.message || '-'));
+    return { bound: false, tabId, pid: null, reason };
+  }
+
+  const binding = prebindClaudeHookPid({
+    tabId,
+    matches: lookup.matches,
+    tabByPid: bridgePidCache,
+    hasTab: candidateTabId => terminals.has(candidateTabId),
+  });
+  if (binding.bound) {
+    console.log(logPrefix + ' [ClaudeHookRoute] prebound tab='
+      + String(tabId).slice(-12)
+      + ' ppid=' + binding.pid
+      + ' source=pre-submit-process-proof');
+  }
+  return binding;
+}
+
 // Liveness check for "is Claude running in this tab's PTY" — the guard every
 // input-write handler (grab / copy / clear / append / replay) needs before
 // pasting into the terminal (refusing protects against bracketed paste landing
@@ -14346,11 +14523,12 @@ function findClaudePidByTab(tabId) {
 // store DID get the sessionId. The guards then refused grab/replay with
 // "No Claude session running in this tab" even though Claude was answering.
 //
-// The drift-immune signal is bridgePidCache: it's populated in processFile only
-// AFTER `ps` confirmed a real `claude` process parented by THIS tab's shell
-// (PID + command-name validated, not cwd). A live claude child is authoritative
-// liveness regardless of cwd. We still verify the cached PID is alive so a
-// shell-side restart that left a stale cache entry doesn't read as alive.
+// The drift-immune signal is bridgePidCache: it is populated only AFTER `ps`
+// confirmed a real `claude` process parented by THIS tab's shell, either at
+// launch acceptance or in processFile (PID + command-name validated, not cwd).
+// A live claude child is authoritative liveness regardless of cwd. We still
+// verify the cached PID is alive so a shell-side restart that left a stale
+// cache entry doesn't read as alive.
 // A pure bash/zsh tab has neither a bridge session nor a claude child → still
 // refused, so the anti-rm-rf intent is preserved.
 function hasLiveClaudeInTab(tabId) {
@@ -14684,6 +14862,14 @@ async function waitForAiLaunchAccepted(tabId, expectedName, options = {}) {
     }
     if (lookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND) {
       const match = lastMatches[0];
+      if (expectedName === 'claude') {
+        bridgePidCache.set(match.pid, tabId);
+        console.log(
+          '[ClaudeHookRoute] prebound tab=' + String(tabId).slice(-12) +
+          ' ppid=' + match.pid +
+          ' source=launch-accepted'
+        );
+      }
       console.log(
         '[AgentLaunchAccepted] tab=' + String(tabId).slice(-12) +
         ' tool=' + expectedName +

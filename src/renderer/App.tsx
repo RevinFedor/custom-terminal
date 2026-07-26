@@ -3087,11 +3087,29 @@ function App() {
           return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
         }
         if (action === 'createAgentTab') {
-          const { projectId, toolType, name, externalRun, codexDeveloperInstructions, codexModel, codexEffort, startNow, background } = payload || {};
+          const {
+            projectId,
+            toolType,
+            name,
+            externalRun,
+            codexDeveloperInstructions,
+            codexModel,
+            codexEffort,
+            startNow,
+            background,
+            visualParentTabId,
+            afterTabId,
+          } = payload || {};
           if (!projectId) return reply(false, null, 'projectId required');
           const agent: AgentHistoryTool = toolType === 'codex' ? 'codex' : 'claude';
           const ws = await ensureProjectWorkspace(projectId);
           if (!ws) return reply(false, null, 'project not open');
+          const requestedVisualParentId = typeof visualParentTabId === 'string' && visualParentTabId.trim()
+            ? visualParentTabId.trim()
+            : undefined;
+          if (requestedVisualParentId && !ws.tabs.has(requestedVisualParentId)) {
+            return reply(false, null, 'visual parent tab is not open in target project');
+          }
           const cwd = ws.projectPath && !ws.projectPath.startsWith('__unset__') ? ws.projectPath : undefined;
           const pendingAction: any = { type: agent === 'codex' ? 'codex-new' : 'claude-new' };
           if (agent === 'codex' && typeof codexDeveloperInstructions === 'string' && codexDeveloperInstructions.trim()) {
@@ -3099,7 +3117,7 @@ function App() {
           }
           const shouldStartNow = startNow === true;
           const explicitName = typeof name === 'string' && name.trim() ? name.trim() : undefined;
-          const tabId = await state.createTab(projectId, explicitName, cwd, {
+          const createOptions = {
             commandType: agent,
             color: agent,
             pendingAction: shouldStartNow ? undefined : pendingAction,
@@ -3109,7 +3127,18 @@ function App() {
             codexEffort: typeof codexEffort === 'string' ? codexEffort : undefined,
             externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
             background: background === true,
-          } as any);
+            ...(requestedVisualParentId
+              ? {
+                afterTabId: typeof afterTabId === 'string' && afterTabId.trim()
+                  ? afterTabId.trim()
+                  : requestedVisualParentId,
+                visualParentTabId: requestedVisualParentId,
+              }
+              : {}),
+          } as any;
+          const tabId = requestedVisualParentId
+            ? await state.createTabAfterCurrent(projectId, explicitName, cwd, createOptions)
+            : await state.createTab(projectId, explicitName, cwd, createOptions);
           const tab = ws.tabs.get(tabId);
           let launchAccepted: any = null;
           if (shouldStartNow) {
@@ -3149,6 +3178,7 @@ function App() {
             toolType: agent,
             commandType: agent,
             color: tab?.color || agent,
+            visualParentTabId: tab?.visualParentTabId || null,
             sessionStatus: shouldStartNow ? 'starting' : 'inactive',
             inputReady: false,
             conversationMaterialized: false,

@@ -156,6 +156,7 @@ class SessionTranscriptService {
     const stashed = historyPayloadStash.get(toolType, sessionId, payloadId);
     if (typeof stashed === 'string') {
       const capped = capPayloadForRender(stashed);
+      console.log(`[FullHistory:Rehydrate] session=${String(sessionId).slice(0, 8)} payload=${payloadId.slice(0, 24)} source=stash bytes=${stashed.length}`);
       return { success: true, source: 'stash', payloadId, ...capped };
     }
     try {
@@ -183,9 +184,11 @@ class SessionTranscriptService {
     }
     const rebuilt = historyPayloadStash.get(toolType, sessionId, payloadId);
     if (typeof rebuilt !== 'string') {
+      console.log(`[FullHistory:Rehydrate] session=${String(sessionId).slice(0, 8)} payload=${payloadId.slice(0, 24)} source=miss`);
       return { success: false, error: 'payload not found', payloadId };
     }
     const capped = capPayloadForRender(rebuilt);
+    console.log(`[FullHistory:Rehydrate] session=${String(sessionId).slice(0, 8)} payload=${payloadId.slice(0, 24)} source=rebuild bytes=${rebuilt.length}`);
     return { success: true, source: 'rebuild', payloadId, ...capped };
   }
 

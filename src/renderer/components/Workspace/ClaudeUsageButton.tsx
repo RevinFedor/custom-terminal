@@ -607,7 +607,7 @@ function claudeUsageSourceLabel(source: string | null | undefined, kind?: string
   if (source === 'claude-statusline' || source === 'statusline' || source === 'claude-code-statusline') {
     return 'Claude Code';
   }
-  if (source === 'anthropic-usage-api') return 'Anthropic';
+  if (source === 'anthropic-usage-api' || source === 'anthropic-oauth-api') return 'Anthropic';
   if (source === 'admin-api') return 'Anthropic Admin';
   if (source?.startsWith('keychain:')) return kind === 'max-oauth' ? 'Anthropic' : 'Claude Code';
   if (source === 'persisted') return 'Anthropic';
@@ -954,8 +954,11 @@ function ClaudeUsageChip({
       if (typeof res?.lastAttemptAt === 'number') setLastAttemptAt(res.lastAttemptAt);
       const weekly = selectedUsage?.seven_day?.utilization ?? null;
       const fiveHour = selectedUsage?.five_hour?.utilization ?? null;
+      const fable = selectedUsage?.model_scoped?.find(
+        (item) => String(item?.display_name || '').trim().toLowerCase() === 'fable'
+      )?.utilization ?? null;
       console.log(
-        `[ClaudeUsage] refresh ${res?.ok ? 'ok' : 'failed'} account=${selected?.label || 'unknown'} kind=${selected?.kind || res?.authKind || 'unknown'} accounts=${nextAccounts.length} weekly=${weekly ?? 'null'} fiveHour=${fiveHour ?? 'null'} force=${force}`
+        `[ClaudeUsage] refresh ${res?.ok ? 'ok' : 'failed'} account=${selected?.label || 'unknown'} kind=${selected?.kind || res?.authKind || 'unknown'} accounts=${nextAccounts.length} source=${selected?.source || res?.source || 'unknown'} weekly=${weekly ?? 'null'} fiveHour=${fiveHour ?? 'null'} fable=${fable ?? 'null'} force=${force}`
       );
     } catch (e: any) {
       if (seq !== refreshSeqRef.current || requestedContext !== refreshContextRef.current) return;

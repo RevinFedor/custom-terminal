@@ -1212,6 +1212,178 @@ function extractClaudeToolDiffHunks({
   return parseClaudeStructuredPatchHunks(metadata.structuredPatch);
 }
 
+// A <task-notification> (the real outcome of backgrounded work) reaches the
+// transcript through TWO different carriers, and both must be indexed:
+//
+//   1. a standalone user record whose content holds the notification text;
+//   2. an `attachment` record — the notification piggybacks on the NEXT user
+//      prompt (`attachment.prompt`), so it never appears as its own message.
+//
+// Reading only carrier (1) left whole classes of agents with no terminal
+// state at all: in the live corpus 8 of 16 async agents notified exclusively
+// through carrier (2), and their cards stayed "running" forever.
+function extractClaudeTaskNotificationTexts(rec) {
+  if (!rec || typeof rec !== 'object') return [];
+  const texts = [];
+  const push = (value) => {
+    if (typeof value === 'string' && value.includes('<task-notification>')) texts.push(value);
+  };
+  if (rec.type === 'user') {
+    const content = rec.message?.content;
+    if (typeof content === 'string') push(content);
+    else if (Array.isArray(content)) {
+      for (const part of content) if (part?.type === 'text') push(part.text);
+    }
+  }
+  if (rec.type === 'attachment') {
+    const attachment = rec.attachment;
+    if (typeof attachment === 'string') push(attachment);
+    else if (attachment && typeof attachment === 'object') {
+      push(attachment.prompt);
+      push(attachment.content);
+      push(attachment.text);
+    }
+  }
+  return texts;
+}
+
+// Parse one notification text into the record the projection stores.
+// A single text carries exactly one <tool-use-id> and one <task-id>; the
+// latter is the AGENT identity, which is how a resume (SendMessage) refers
+// to it — the spawn call id is not mentioned there.
+function parseClaudeTaskNotification(text, timestamp = '') {
+  const useId = (text.match(/<tool-use-id>([^<]+)<\/tool-use-id>/) || [])[1];
+  if (!useId) return null;
+  const agentId = (text.match(/<task-id>([^<]+)<\/task-id>/) || [])[1];
+  return {
+    toolUseId: useId.trim(),
+    agentId: agentId ? agentId.trim() : '',
+    status: ((text.match(/<status>([^<]+)<\/status>/) || [])[1] || 'completed').trim(),
+    summary: ((text.match(/<summary>([\s\S]*?)<\/summary>/) || [])[1] || '').trim(),
+    result: ((text.match(/<result>([\s\S]*?)<\/result>/) || [])[1] || '').trim(),
+    timestamp: timestamp || '',
+  };
+}
+
+// A finished agent can be RESUMED: `SendMessage` queues another prompt to it
+// ("The user can send it another message and resume it, so the same task-id
+// may notify more than once" — the CLI says so in every notification's
+// <note>). The resume addresses the AGENT id, not the spawn call id, and its
+// own tool_result is only a delivery receipt ("Message queued for delivery
+// to <agentId> at its next tool round").
+//
+// So "latest notification wins" is not enough: a resume that lands AFTER the
+// last notification means the agent is working again, and the card must go
+// back to running until the next notification arrives. Without this the chip
+// stays dark for the whole resumed run.
+function collectClaudeAgentResumes(recordMap) {
+  const resumes = new Map(); // agentId → last resume timestamp/order
+  let order = 0;
+  for (const [, rec] of recordMap) {
+    order += 1;
+    if (rec?.type !== 'assistant' || !Array.isArray(rec.message?.content)) continue;
+    for (const part of rec.message.content) {
+      if (part?.type !== 'tool_use' || part.name !== 'SendMessage') continue;
+      const target = typeof part.input?.to === 'string' ? part.input.to.trim() : '';
+      // Only agent ids matter here; "main" and teammate names are not
+      // backgrounded agents of this transcript.
+      if (!target || target === 'main') continue;
+      resumes.set(target, { order, timestamp: rec.timestamp || '' });
+    }
+  }
+  return resumes;
+}
+
+// Build the tool_use_id → latest-notification index over a record map.
+// Later records win: an agent can notify more than once (progress "running"
+// pings, then the terminal state). A notification that is older than the last
+// resume of the same agent is stale — the agent was restarted after it.
+function buildClaudeTaskNotificationIndex(recordMap) {
+  const index = new Map();
+  const notificationOrder = new Map();
+  const resumes = collectClaudeAgentResumes(recordMap);
+  let order = 0;
+  for (const [, rec] of recordMap) {
+    order += 1;
+    for (const text of extractClaudeTaskNotificationTexts(rec)) {
+      const parsed = parseClaudeTaskNotification(text, rec?.timestamp);
+      if (!parsed) continue;
+      index.set(parsed.toolUseId, parsed);
+      notificationOrder.set(parsed.toolUseId, order);
+    }
+  }
+  for (const [toolUseId, notification] of index) {
+    const resume = notification.agentId ? resumes.get(notification.agentId) : null;
+    if (resume && resume.order > (notificationOrder.get(toolUseId) || 0)) {
+      // Resumed after its last notification → running again.
+      index.set(toolUseId, { ...notification, status: 'running', resumedAt: resume.timestamp });
+    }
+  }
+  return index;
+}
+
+// Sidecar terminal proof for async agents that will NEVER notify.
+//
+// The CLI writes `<projectDir>/<sessionId>/subagents/agent-<id>.meta.json`
+// per spawned agent, and marks `stoppedByUser: true` when the user aborts it.
+// A user-stopped agent emits no <task-notification> at all — verified across
+// the live corpus: every stoppedByUser agent had zero notifications in every
+// session file, so notification-only liveness left those cards "running"
+// forever (this is the "came back two hours later, chip still spinning" bug).
+//
+// The whole project directory is scanned, not just this chain: `--resume`
+// and fork copy spawn records into the new session file with REWRITTEN
+// sessionIds, while the sidecar stays under the session that actually
+// spawned the agent. Scoping the scan to the current chain therefore left
+// exactly the inherited cards spinning — the ones a returning user sees.
+// tool_use ids are globally unique, so a project-wide scan cannot mismatch.
+// Missing/unreadable sidecars are simply absent (never a synthesised state).
+function readClaudeStoppedAgentToolUseIds(projectDir) {
+  const stopped = new Set();
+  if (!projectDir) return stopped;
+  let sessionDirs;
+  try {
+    sessionDirs = fs.readdirSync(projectDir, { withFileTypes: true })
+      .filter((item) => item.isDirectory())
+      .map((item) => item.name);
+  } catch {
+    return stopped;
+  }
+  for (const sessionDir of sessionDirs) {
+    const dir = path.join(projectDir, sessionDir, 'subagents');
+    let files;
+    try {
+      files = fs.readdirSync(dir);
+    } catch {
+      continue; // this session spawned no agents
+    }
+    for (const name of files) {
+      if (!name.endsWith('.meta.json')) continue;
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+        if (meta?.stoppedByUser === true && meta.toolUseId) {
+          stopped.add(String(meta.toolUseId));
+        }
+      } catch {
+        // Unreadable/partial sidecar: no proof either way, leave it alone.
+      }
+    }
+  }
+  return stopped;
+}
+
+// Claude async (backgrounded) Agent status from its latest task-notification.
+// No notification yet, or a mid-run progress ping (status "running") → the
+// agent is still RUNNING. "completed" → completed. Every other status
+// (failed/killed/stopped/future-unknown) is terminal-interrupted: an unknown
+// status word must kill the live chip, never resurrect a zombie.
+function deriveClaudeAsyncAgentStatus(notification) {
+  const status = String(notification?.status || '').trim().toLowerCase();
+  if (!status || status === 'running') return 'running';
+  if (status === 'completed') return 'completed';
+  return 'interrupted';
+}
+
 // Programmatic API for handlers below. Populated by register() so that other
 // modules (HTTP routes in main.js, overseer MCP endpoints) can call the SAME
 // implementation that IPC uses, without going through ipcMain.
@@ -1224,6 +1396,10 @@ const _api = {
   parseClaudeStructuredPatchHunks,
   extractClaudeToolDiffHunks,
   rebuildHistoryPayloadStash,
+  deriveClaudeAsyncAgentStatus,
+  buildClaudeTaskNotificationIndex,
+  extractClaudeTaskNotificationTexts,
+  readClaudeStoppedAgentToolUseIds,
 };
 
 // Stash-miss recovery for dehydrated Claude payloads. Payload identity is
@@ -1236,25 +1412,10 @@ async function rebuildHistoryPayloadStash({ sessionId, cwd, stash }) {
   const { recordMap } = await resolveSessionChain(sessionId, cwd);
   let rebuilt = 0;
   // Background notifications first: the projection appends them to the
-  // acceptance result text, so the rebuilt payload must match byte-for-byte.
-  const notifications = new Map();
-  for (const [, rec] of recordMap) {
-    if (rec?.type !== 'user') continue;
-    const content = rec.message?.content;
-    const text = typeof content === 'string'
-      ? content
-      : Array.isArray(content)
-        ? (content.find((part) => part?.type === 'text')?.text || '')
-        : '';
-    if (!text.includes('<task-notification>')) continue;
-    const useId = (text.match(/<tool-use-id>([^<]+)<\/tool-use-id>/) || [])[1];
-    if (!useId) continue;
-    notifications.set(useId.trim(), {
-      status: ((text.match(/<status>([^<]+)<\/status>/) || [])[1] || 'completed').trim(),
-      summary: ((text.match(/<summary>([\s\S]*?)<\/summary>/) || [])[1] || '').trim(),
-      result: ((text.match(/<result>([\s\S]*?)<\/result>/) || [])[1] || '').trim(),
-    });
-  }
+  // acceptance result text, so the rebuilt payload must match byte-for-byte —
+  // which means using the SAME index builder (both carriers) as the
+  // projection, or a rehydrated payload would silently lose the outcome.
+  const notifications = buildClaudeTaskNotificationIndex(recordMap);
   // Background identity mirrors the projection: the CALL's explicit
   // run_in_background arg, never result-text phrases.
   const backgroundCallIds = new Set();
@@ -4288,33 +4449,17 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
 
       // Background work (Bash run_in_background, async Agent/Task) resolves in
       // two steps: an immediate acceptance tool_result ("running in background
-      // with ID…"), then a <task-notification> user-record carrying the real
-      // outcome. The notification is filtered from History as service-noise,
-      // so without this index the card keeps showing only the acceptance text.
-      // <tool-use-id> inside the notification is exact identity.
-      const taskNotificationByToolUseId = new Map();
-      for (const [, rec] of recordMap) {
-        if (rec?.type !== 'user') continue;
-        const content = rec.message?.content;
-        const text = typeof content === 'string'
-          ? content
-          : Array.isArray(content)
-            ? (content.find((part) => part?.type === 'text')?.text || '')
-            : '';
-        if (!text.includes('<task-notification>')) continue;
-        const useId = (text.match(/<tool-use-id>([^<]+)<\/tool-use-id>/) || [])[1];
-        if (!useId) continue;
-        const status = (text.match(/<status>([^<]+)<\/status>/) || [])[1] || 'completed';
-        const summary = (text.match(/<summary>([\s\S]*?)<\/summary>/) || [])[1] || '';
-        const resultBody = (text.match(/<result>([\s\S]*?)<\/result>/) || [])[1] || '';
-        // Latest notification wins: a task can notify more than once.
-        taskNotificationByToolUseId.set(useId.trim(), {
-          status: status.trim(),
-          summary: summary.trim(),
-          result: resultBody.trim(),
-          timestamp: rec.timestamp || '',
-        });
-      }
+      // with ID…"), then a <task-notification> carrying the real outcome.
+      // The notification is filtered from History as service-noise, so without
+      // this index the card keeps showing only the acceptance text.
+      // <tool-use-id> inside the notification is exact identity, and BOTH
+      // carriers (own record / attachment on the next prompt) are indexed.
+      const taskNotificationByToolUseId = buildClaudeTaskNotificationIndex(recordMap);
+      // User-stopped agents never notify — their terminal proof is the
+      // sidecar meta file written next to this chain's session files.
+      const stoppedAgentToolUseIds = readClaudeStoppedAgentToolUseIds(
+        findSessionFile(sessionId, cwd)?.projectDir,
+      );
 
       // Format tool action label (standalone, no includeCode dependency)
       const mkFileAction = (toolName, input) => {
@@ -4341,7 +4486,10 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           }
           case 'Glob': return '\u{1F50D} glob ' + (input.pattern || '?');
           case 'Grep': return '\u{1F50D} grep ' + (input.pattern || '?');
-          case 'Task': {
+          // The CLI renamed the subagent tool Task → Agent; both build the
+          // same card (renderer contract stays `tool: 'Task'`).
+          case 'Task':
+          case 'Agent': {
             const taskObj = {
               tool: 'Task',
               description: input.description || input.prompt?.substring(0, 60) || 'Task agent',
@@ -4662,12 +4810,41 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                   };
                 };
 
-                if (name === 'Task') {
+                if (name === 'Task' || name === 'Agent') {
                   // Subagents keep the legacy SubAgentBlock path — NOT touched.
+                  // 'Agent' is the CLI's current name for the same tool.
                   const actionObj = fmtAction(name, input, block.id);
                   if (typeof actionObj === 'object' && actionObj.tool === 'Task') {
                     const rr = findToolResult();
                     if (rr) actionObj.result = rr.text;
+                    // Async launch (backgrounded agent): the tool_result is
+                    // only an acceptance receipt — internal metadata, never
+                    // the answer. Structural identity is toolUseResult.isAsync
+                    // on the acceptance record (never result-text phrases).
+                    // The real outcome arrives later as a <task-notification>;
+                    // until a terminal one lands the agent is RUNNING and
+                    // legitimately outlives its spawn turn (process-scoped
+                    // liveness, same model as Codex in-process subagents).
+                    const acceptance = toolResultRecordByUseId.get(block.id);
+                    if (acceptance?.record?.toolUseResult?.isAsync === true) {
+                      const notification = taskNotificationByToolUseId.get(block.id);
+                      const status = deriveClaudeAsyncAgentStatus(notification);
+                      // A user-stopped agent will never notify: the sidecar
+                      // proof is terminal and outranks "no notification yet".
+                      const userStopped = stoppedAgentToolUseIds.has(block.id);
+                      actionObj.subagentStatus = userStopped && status === 'running'
+                        ? 'interrupted'
+                        : status;
+                      if (actionObj.subagentStatus === 'running') {
+                        // Hide the acceptance boilerplate while running.
+                        delete actionObj.result;
+                      } else {
+                        const body = [notification?.summary, notification?.result]
+                          .filter(Boolean).join('\n')
+                          || (userStopped ? 'Агент остановлен.' : '');
+                        if (body) actionObj.result = body;
+                      }
+                    }
                   }
                   actions.push(actionObj);
                 } else {
