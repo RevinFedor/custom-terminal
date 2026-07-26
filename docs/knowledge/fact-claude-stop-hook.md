@@ -111,16 +111,17 @@ Stop / StopFailure → cancel pending spinner-idle-timer
 
 **Решение:** отдельный event `claude:process-started` fires когда `bridgePidCache` видит **новый Claude PID** для tab'а — это происходит ровно один раз на каждый реальный spawn процесса. PID меняется при каждом запуске binary, даже если sessionId тот же.
 
-Renderer:
-```ts
-ipcRenderer.on('claude:process-started', (_, { tabId, sessionId, claudePid }) => {
-  // Одноразовые side effects: auto-inject /effort, /think и т.п.
-});
-```
+Renderer по-прежнему получает `claude:process-started` для presentation-side
+liveness, welcome/analytics и привязки sessionId. Startup-настройки из этого
+handler больше не запускаются.
 
-Использовать для всего что должно случиться **один раз на спавн** и которому нужен PID/sessionId: welcome-toast, регистрация в аналитике. **Не использовать** для отслеживания sessionId (для этого session-detected).
-
-**`/effort` инжект больше НЕ висит на этом сигнале как на главном.** `claude:process-started` (= `Bridge:Fresh`) лагает 3-6с после старта Claude — bridge.json должен появиться, пережить DeadTranscript-guard (у свежей сессии JSONL ещё не на диске), затем PID зарезолвиться. За это время prompt в TUI уже нарисован; юзер видел готовую строку без effort'а и кликал руками → дубль. Главный сигнал для `/effort` теперь `claude:tui-ready` (Claude нарисовал `⏵` в PTY, ~0.8с), `process-started` оставлен **fallback'ом** под once-per-process sentinel. Полная механика — `fact-claude-tui-control.md::Auto-inject /effort`, принцип выбора сигнала — `methodology/переносимый-дизайн.md::Liveness ≠ readiness`.
+**`/effort` не принадлежит ни одному renderer-event handler.**
+`claude:process-started` (= `Bridge:Fresh`) и более ранний
+`claude:tui-ready` — два readiness-input одной main-side транзакции по launch
+generation. Первый прибывший открывает её, второй только join'ится. Так новый
+PID остаётся fallback, если prompt не распознан, но два сигнала физически не
+могут поделить `/model` и `/effort` между разными владельцами. Полная механика
+— `fact-claude-tui-control.md::Startup defaults /model + /effort`.
 
 ## Prompt Queue — grab-input flow
 

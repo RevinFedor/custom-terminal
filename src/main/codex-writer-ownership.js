@@ -284,9 +284,11 @@ function selectCodexNativeRewindWriter(candidates, {
   if (stableSourceProof) {
     const soleCandidate = allCandidates.length === 1 ? allCandidates[0] : null;
     const soleMeta = candidateSessionMeta(soleCandidate);
+    const stableJournalPhase = stableSourceProof.journalPhase === 'rollback-applied'
+      || String(stableSourceProof.journalPhase || '').startsWith('stable-source');
     const stableSourceSelected = stableSourceProof.kind === 'native-rewind-stable-source'
       && stableSourceProof.rollbackDurable === true
-      && stableSourceProof.journalPhase === 'rollback-applied'
+      && stableJournalPhase
       && stableSourceProof.terminalGenerationMatches === true
       && stableSourceProof.runSeqMatches === true
       && stableSourceProof.boundSessionMatches === true
@@ -398,10 +400,12 @@ function selectCodexSettledRewindWriter(candidates, {
   lineage = [],
 } = {}) {
   const allCandidates = Array.isArray(candidates) ? candidates : [];
-  if (kind !== 'native-rewind-settled-writer' || valid !== true) {
+  const supportedKind = kind === 'native-rewind-settled-writer'
+    || kind === 'native-rewind-delayed-child';
+  if (!supportedKind || valid !== true) {
     return {
       status: 'unresolved',
-      reason: kind === 'native-rewind-settled-writer'
+      reason: supportedKind
         ? 'settled-writer-proof-invalid'
         : 'not-native-rewind-settled-writer',
       candidates: allCandidates,
@@ -470,6 +474,66 @@ function selectCodexSettledRewindWriter(candidates, {
     };
   }
 
+  // Codex may apply native Rewind to the live thread without creating the
+  // replacement rollout until the next Enter. During that interval the
+  // settled writer is intentionally the source itself. Preserve that proof
+  // only while it remains the sole writable user rollout; the appearance of
+  // any competitor requires the separate exact post-Enter audit transaction.
+  if (String(sessionId) === String(sourceSessionId)) {
+    if (allCandidates.length !== 1) {
+      return {
+        status: 'unresolved',
+        reason: 'settled-stable-source-competitor-present',
+        candidates: allCandidates,
+      };
+    }
+    return {
+      status: 'selected',
+      candidate: exactCandidates[0],
+      sessionId: String(sessionId),
+      sourceSessionId: String(sourceSessionId),
+      actionGeneration,
+      lineageDepth: 0,
+      lineageRelation: 'stable-source',
+      ancestors: [],
+      candidates: allCandidates,
+    };
+  }
+
+  // A delayed child is committed only after an exact post-Enter audit and an
+  // atomic source→child DB CAS. Codex does not write `forked_from_id` for this
+  // variant, so later lsof revalidation preserves that already-committed
+  // identity while the only competing user rollout is the exact source.
+  if (kind === 'native-rewind-delayed-child') {
+    const competitors = allCandidates.filter((candidate) => candidate !== exactCandidates[0]);
+    const invalidCompetitor = competitors.find((candidate) => {
+      const meta = candidateSessionMeta(candidate);
+      return String(meta.id || '') !== String(sourceSessionId);
+    });
+    if (invalidCompetitor) {
+      return {
+        status: 'unresolved',
+        reason: 'delayed-settled-writer-unrelated-competitor',
+        rejectedSessionId: candidateSessionMeta(invalidCompetitor).id || null,
+        candidates: allCandidates,
+      };
+    }
+    return {
+      status: 'selected',
+      candidate: exactCandidates[0],
+      sessionId: String(sessionId),
+      sourceSessionId: String(sourceSessionId),
+      actionGeneration,
+      lineageDepth: null,
+      lineageRelation: 'delayed-stable-source-child',
+      ancestors: competitors.map(() => ({
+        sessionId: String(sourceSessionId),
+        lineageDepth: null,
+      })),
+      candidates: allCandidates,
+    };
+  }
+
   const { parents, conflicts } = buildCodexHandoffParentMap(allCandidates, lineage);
   const sourceAncestry = resolveCodexHandoffLineage(
     sessionId,
@@ -530,6 +594,186 @@ function selectCodexSettledRewindWriter(candidates, {
     lineageRelation: sourceAncestry.relation,
     ancestors,
     candidates: allCandidates,
+  };
+}
+
+/**
+ * Select the writer that Codex materializes on the first Enter after a
+ * stable-source native Rewind.
+ *
+ * Codex 0.145 can create this rollout without `forked_from_id`, so ancestry is
+ * not authority here. The replacement is accepted only when the retained
+ * Rewind transaction, current PTY/run/binding, durable submit record, and one
+ * exact causal `user_message` audit all agree. No recency/mtime fallback is
+ * permitted.
+ */
+function selectCodexDelayedStableSourceWriter(candidates, {
+  kind = null,
+  valid = false,
+  sourceSessionId = null,
+  sourceFilePath = null,
+  actionGeneration = null,
+  observerGeneration = null,
+  actionStartedAtMs = null,
+  stableSourceSettledAtMs = null,
+  journalPhase = null,
+  terminalToken = null,
+  observerTerminalToken = null,
+  runSeq = null,
+  observerRunSeq = null,
+  boundSessionId = null,
+  cwd = null,
+  submitProof = null,
+  liveProofs = [],
+} = {}) {
+  const allCandidates = Array.isArray(candidates) ? candidates : [];
+  const unresolved = (reason, extra = {}) => ({
+    status: 'unresolved',
+    reason,
+    sourceSessionId: sourceSessionId ? String(sourceSessionId) : null,
+    actionGeneration: actionGeneration || null,
+    candidates: allCandidates,
+    ...extra,
+  });
+  if (kind !== 'native-rewind-delayed-stable-source' || valid !== true) {
+    return unresolved('delayed-stable-source-proof-invalid');
+  }
+  if (!sourceSessionId
+    || !sourceFilePath
+    || !actionGeneration
+    || !observerGeneration
+    || !terminalToken
+    || !observerTerminalToken
+    || !Number.isInteger(runSeq)
+    || runSeq <= 0
+    || !Number.isInteger(observerRunSeq)
+    || observerRunSeq <= 0
+    || !boundSessionId
+    || !cwd) {
+    return unresolved('delayed-stable-source-context-missing');
+  }
+  if (actionGeneration !== observerGeneration) {
+    return unresolved('stale-delayed-action-generation');
+  }
+  if (terminalToken !== observerTerminalToken) {
+    return unresolved('stale-delayed-terminal');
+  }
+  if (runSeq !== observerRunSeq) {
+    return unresolved('stale-delayed-run');
+  }
+  if (String(boundSessionId) !== String(sourceSessionId)) {
+    return unresolved('delayed-source-binding-mismatch');
+  }
+  const actionStartedAt = Number(actionStartedAtMs);
+  const settledAt = Number(stableSourceSettledAtMs);
+  if (!Number.isFinite(actionStartedAt)
+    || actionStartedAt <= 0
+    || !Number.isFinite(settledAt)
+    || settledAt < actionStartedAt) {
+    return unresolved('delayed-stable-source-boundary-missing');
+  }
+  if (journalPhase !== 'stable-source-submit-written') {
+    return unresolved('delayed-submit-not-written');
+  }
+
+  const sentAt = Number(submitProof?.sentAtMs);
+  const writtenAt = Number(submitProof?.submitWrittenAtMs);
+  const expectedLen = Number(submitProof?.expectedLen);
+  const expectedHash = String(submitProof?.expectedHash || '');
+  const submitId = String(submitProof?.submitId || '');
+  if (!submitId
+    || String(submitProof?.sourceSessionId || '') !== String(sourceSessionId)
+    || String(submitProof?.actionGeneration || '') !== String(actionGeneration)
+    || !Number.isSafeInteger(expectedLen)
+    || expectedLen < 0
+    || !/^[a-f0-9]{16}$/i.test(expectedHash)
+    || !Number.isFinite(sentAt)
+    || sentAt < settledAt
+    || !Number.isFinite(writtenAt)
+    || writtenAt < sentAt) {
+    return unresolved('delayed-submit-proof-invalid');
+  }
+
+  const canonicalSourcePath = canonicalizeExistingPath(sourceFilePath);
+  const sourceCandidates = allCandidates.filter((candidate) => {
+    const meta = candidateSessionMeta(candidate);
+    return String(meta.id || '') === String(sourceSessionId)
+      && canonicalizeExistingPath(candidate.filePath) === canonicalSourcePath;
+  });
+  // The live process is allowed to close the source descriptor as soon as it
+  // opens the delayed child. The retained journal + exact pre-Enter source
+  // boundary still prove where this submit began, so zero source candidates
+  // is valid. More than one exact source descriptor remains ambiguous.
+  if (sourceCandidates.length > 1) {
+    return unresolved('duplicate-delayed-source-candidate');
+  }
+
+  const expectedCwd = path.resolve(String(cwd));
+  for (const candidate of allCandidates) {
+    const meta = candidateSessionMeta(candidate);
+    if (!meta.id || !meta.cwd || path.resolve(String(meta.cwd)) !== expectedCwd) {
+      return unresolved('delayed-candidate-cwd-mismatch', {
+        rejectedSessionId: meta.id || null,
+      });
+    }
+  }
+
+  const proven = [];
+  const rejected = [];
+  for (const candidate of allCandidates) {
+    const meta = candidateSessionMeta(candidate);
+    const sessionId = meta.id ? String(meta.id) : '';
+    if (!sessionId || sessionId === String(sourceSessionId)) continue;
+    const matchingProofs = (Array.isArray(liveProofs) ? liveProofs : []).filter((proof) => {
+      if (proof?.kind !== 'user-message-audit') return false;
+      if (String(proof.sessionId || '') !== sessionId) return false;
+      if (String(proof.sourceSessionId || '') !== String(sourceSessionId)) return false;
+      if (String(proof.actionGeneration || '') !== String(actionGeneration)) return false;
+      if (String(proof.submitId || '') !== submitId) return false;
+      if (Number(proof.expectedLen) !== expectedLen) return false;
+      if (String(proof.expectedHash || '') !== expectedHash) return false;
+      const auditSentAt = Number(proof.auditSentAtMs);
+      const recordAt = Number(proof.recordTimestampMs);
+      const createdAt = Number(proof.candidateCreatedAtMs);
+      const observedAt = Number(proof.observedAtMs);
+      return Number.isFinite(auditSentAt)
+        && auditSentAt === sentAt
+        && Number.isFinite(recordAt)
+        && recordAt >= sentAt
+        && Number.isFinite(createdAt)
+        && createdAt >= sentAt
+        && Number.isFinite(observedAt)
+        && observedAt >= recordAt;
+    });
+    if (matchingProofs.length === 0) {
+      rejected.push({ sessionId, reason: 'exact-post-enter-audit-missing' });
+      continue;
+    }
+    proven.push({
+      candidate,
+      sessionId,
+      liveProof: matchingProofs[0],
+    });
+  }
+
+  if (proven.length !== 1) {
+    return unresolved(
+      proven.length > 1
+        ? 'multiple-delayed-audit-writers'
+        : 'delayed-audit-writer-missing',
+      { proven, rejected },
+    );
+  }
+  return {
+    status: 'selected',
+    ...proven[0],
+    sourceSessionId: String(sourceSessionId),
+    actionGeneration,
+    lineageDepth: null,
+    lineageRelation: 'delayed-stable-source-child',
+    submitId,
+    candidates: allCandidates,
+    rejected,
   };
 }
 
@@ -627,9 +871,18 @@ function shouldCloseCodexRewindProtocolUi({
 function classifyCodexWriterObservationScope({
   capturedIntentGeneration = null,
   currentIntentGeneration = null,
+  capturedObservationGeneration = null,
+  currentObservationGeneration = null,
   expectedObserver = null,
   currentObserver = null,
 } = {}) {
+  if (capturedObservationGeneration !== currentObservationGeneration) {
+    return {
+      status: 'stale-observation-generation',
+      expectedObservationGeneration: capturedObservationGeneration,
+      currentObservationGeneration,
+    };
+  }
   const captured = capturedIntentGeneration || null;
   const current = currentIntentGeneration || null;
   if (captured !== current) {
@@ -723,6 +976,9 @@ async function resolveCodexUserWriterProof(proof, {
     const handoffSelection = handoff
       ? selectCodexNativeRewindWriter(userCandidates, handoff)
       : null;
+    const settledSelection = !handoff && settledWriter
+      ? selectCodexSettledRewindWriter(userCandidates, settledWriter)
+      : null;
     // Once the native-Rewind action boundary has been crossed, even a single
     // open rollout is not automatically the new writer. It may simply be the
     // still-open source. Require the same ancestry + exact-generation live
@@ -737,6 +993,16 @@ async function resolveCodexUserWriterProof(proof, {
         handoffProof: handoffSelection,
       };
     }
+    if (!handoff && settledWriter && settledSelection?.status !== 'selected') {
+      return {
+        status: 'ambiguous',
+        reason: 'settled-writer-unresolved',
+        candidates: userCandidates,
+        ignoredCandidates,
+        allCandidates: classified,
+        settledWriterProof: settledSelection,
+      };
+    }
     return {
       status: 'owned',
       filePath: selected.filePath,
@@ -747,6 +1013,7 @@ async function resolveCodexUserWriterProof(proof, {
       ignoredCandidates,
       allCandidates: classified,
       ...(handoffSelection ? { handoffProof: handoffSelection } : {}),
+      ...(settledSelection ? { settledWriterProof: settledSelection } : {}),
     };
   }
   if (userCandidates.length > 1) {
@@ -1123,6 +1390,7 @@ module.exports = {
   deriveCodexSettledWriterProofScope,
   shouldUseSettledCodexRewindWriterProof,
   selectCodexNativeRewindWriter,
+  selectCodexDelayedStableSourceWriter,
   selectCodexSettledRewindWriter,
   runKeyedExclusive,
   runKeyedSingleFlight,

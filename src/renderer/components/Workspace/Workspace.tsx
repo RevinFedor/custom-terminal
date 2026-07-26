@@ -1,4 +1,4 @@
-import React, { useCallback, useDeferredValue, useEffect, useMemo, useState, useRef } from 'react';
+import React, { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
 import ReactDOM from 'react-dom';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -272,7 +272,9 @@ export default function Workspace() {
         && current.description === next.description
         && current.detail === next.detail
         && current.sessionId === next.sessionId
-        && current.spinner === next.spinner) return current;
+        && current.spinner === next.spinner
+        && current.retryLabel === next.retryLabel
+        && current.onRetry === next.onRetry) return current;
       return next;
     });
   }, []);
@@ -763,6 +765,77 @@ export default function Workspace() {
     : effectiveGeminiSessionId && effectiveCommandType === 'gemini'
       ? 'gemini'
       : 'claude') as 'claude' | 'gemini' | 'codex';
+  // Timeline can hold hundreds of rendered rows. Switching its owner in the
+  // urgent tab-click render synchronously tears down the old tree before the
+  // new primary History surface can paint. Keep the previous Timeline owner
+  // hidden for that cheap urgent frame, then hand the atomic owner tuple over
+  // through React's deferred lane. The primary History surface therefore owns
+  // the first paint without ever exposing the previous tab's Timeline rows.
+  const timelineOwnerIdentity = useMemo(
+    () => (showTimeline && effectiveTab
+      ? {
+          tabId: effectiveTab.id,
+          sessionId: timelineSessionId || '',
+          cwd: effectiveTab.cwd || currentProject?.path || '',
+          toolType: timelineToolType,
+        }
+      : null),
+    [showTimeline, effectiveTab?.id, effectiveTab?.cwd, timelineSessionId, timelineToolType, currentProject?.path],
+  );
+  const deferredTimelineOwner = useDeferredValue(timelineOwnerIdentity);
+  const timelineOwnerIsCurrent = !!timelineOwnerIdentity
+    && deferredTimelineOwner === timelineOwnerIdentity;
+  const deferredTimelineOwnerKey = deferredTimelineOwner
+    ? JSON.stringify([
+        deferredTimelineOwner.tabId,
+        deferredTimelineOwner.sessionId,
+        deferredTimelineOwner.cwd,
+        deferredTimelineOwner.toolType,
+      ])
+    : '';
+  // The visibility boundary below can hide the previous rail without asking
+  // the 100s-of-rows Timeline component to render in the urgent click frame.
+  // Freeze its small runtime flags at the last committed owner until the
+  // deferred owner catches up; normal same-owner busy/visibility changes still
+  // flow immediately.
+  const committedTimelineRuntimeRef = useRef<{
+    ownerKey: string;
+    isActive: boolean;
+    isTurnBusy: boolean;
+    isVisible: boolean;
+    historySurfaceVisible: boolean;
+  } | null>(null);
+  const currentTimelineRuntime = {
+    ownerKey: deferredTimelineOwnerKey,
+    isActive: isCommandRunning,
+    isTurnBusy: effectiveAiBusy,
+    isVisible: workspaceView === 'workspace' && currentView === 'terminal',
+    historySurfaceVisible: historyIsPrimary,
+  };
+  const timelineRuntimeForRender = timelineOwnerIsCurrent
+    ? currentTimelineRuntime
+    : committedTimelineRuntimeRef.current?.ownerKey === deferredTimelineOwnerKey
+      ? committedTimelineRuntimeRef.current
+      : {
+          ownerKey: deferredTimelineOwnerKey,
+          isActive: false,
+          isTurnBusy: false,
+          isVisible: false,
+          historySurfaceVisible: false,
+        };
+  useLayoutEffect(() => {
+    if (!timelineOwnerIsCurrent || !deferredTimelineOwner) return;
+    committedTimelineRuntimeRef.current = currentTimelineRuntime;
+  }, [
+    timelineOwnerIsCurrent,
+    deferredTimelineOwner,
+    deferredTimelineOwnerKey,
+    isCommandRunning,
+    effectiveAiBusy,
+    workspaceView,
+    currentView,
+    historyIsPrimary,
+  ]);
   const historyToolType = historyIsPrimary ? (primaryHistoryTool as 'claude' | 'codex') : timelineToolType;
   const historySessionId = historyIsPrimary
     ? (historyToolType === 'codex' ? effectiveCodexSessionId : effectiveClaudeSessionId)
@@ -987,19 +1060,34 @@ export default function Workspace() {
           {!historyIsPrimary && historyPinned && historyPanelNode}
 
           {/* Timeline — inside terminal row so it only spans terminal height */}
-          {showTimeline && (
-            <Timeline
-              tabId={effectiveTab.id}
-              sessionId={timelineSessionId}
-              cwd={effectiveTab.cwd || currentProject.path}
-              isActive={isCommandRunning}
-              isTurnBusy={effectiveAiBusy}
-              isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
-              isOpen={true}
-              toolType={timelineToolType}
-              pinned={timelinePinned}
-              historySurfaceVisible={historyIsPrimary}
-            />
+          {deferredTimelineOwner && (
+            <div
+              data-timeline-owner-boundary
+              aria-hidden={!timelineOwnerIsCurrent}
+              style={{
+                display: 'contents',
+                visibility: timelineOwnerIsCurrent ? 'visible' : 'hidden',
+                pointerEvents: timelineOwnerIsCurrent ? 'auto' : 'none',
+              }}
+            >
+              <Timeline
+                tabId={deferredTimelineOwner.tabId}
+                sessionId={deferredTimelineOwner.sessionId}
+                cwd={deferredTimelineOwner.cwd}
+                isActive={timelineRuntimeForRender.isActive}
+                isTurnBusy={timelineRuntimeForRender.isTurnBusy}
+                isVisible={timelineRuntimeForRender.isVisible}
+                isOpen={true}
+                toolType={deferredTimelineOwner.toolType}
+                pinned={timelinePinned}
+                historySurfaceVisible={timelineRuntimeForRender.historySurfaceVisible}
+              />
+              <style>
+                {timelineOwnerIsCurrent
+                  ? ''
+                  : '[data-timeline-portal]{visibility:hidden!important;pointer-events:none!important}'}
+              </style>
+            </div>
           )}
         </div>
 

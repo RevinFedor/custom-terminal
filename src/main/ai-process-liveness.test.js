@@ -3,12 +3,14 @@ const assert = require('node:assert/strict');
 
 const {
   AI_PROCESS_LOOKUP_STATUS,
+  buildAiStopScope,
   decideCodexExitProbe,
   inspectProcessLookup,
   inspectProcessLookupCached,
   requireKnownProcessLookup,
   resolveClaudeRuntimeAfterFailedStop,
   resolveProcessPresence,
+  selectAiProcessForStop,
 } = require('./ai-process-liveness');
 
 test('distinguishes a failed process observation from proven absence', async () => {
@@ -99,4 +101,98 @@ test('failed Claude Stop ignores stale spinner when authoritative turn is idle',
     busy: false,
     inputReady: true,
   });
+});
+
+test('Stop selection prefers a direct AI child over nested candidates', () => {
+  const direct = { pid: 31, depth: 1, processName: 'claude', cmd: 'claude' };
+  const selected = selectAiProcessForStop([
+    { pid: 10, depth: 2, processName: 'codex', cmd: 'codex' },
+    direct,
+  ]);
+
+  assert.equal(selected, direct);
+});
+
+test('Stop selection preserves ps order among direct AI children', () => {
+  const selected = selectAiProcessForStop([
+    { pid: 99, depth: 1, processName: 'gemini', cmd: 'gemini' },
+    { pid: 41, depth: 1, processName: 'claude', cmd: 'claude' },
+  ]);
+
+  assert.equal(selected.pid, 41);
+  assert.equal(selected.processName, 'claude');
+});
+
+test('Stop selection uses the shallowest nested Codex fallback', () => {
+  const selected = selectAiProcessForStop([
+    { pid: 90, depth: 4, processName: 'codex', cmd: 'vendor codex' },
+    { pid: 80, depth: 2, processName: 'codex', cmd: 'node codex' },
+    { pid: 70, depth: 2, processName: 'codex', cmd: 'node codex' },
+  ]);
+
+  assert.equal(selected.pid, 70);
+  assert.equal(selected.depth, 2);
+});
+
+test('Stop selection does not invent a nested fallback for Claude', () => {
+  assert.equal(selectAiProcessForStop([
+    { pid: 50, depth: 2, processName: 'claude', cmd: 'wrapper → claude' },
+  ]), null);
+});
+
+test('Stop selection rejects malformed or non-AI candidates', () => {
+  assert.equal(selectAiProcessForStop(null), null);
+  assert.equal(selectAiProcessForStop([
+    { pid: 0, depth: 1, processName: 'codex' },
+    { pid: 9, depth: 0, processName: 'claude' },
+    { pid: 10, depth: 1, processName: 'shell' },
+  ]), null);
+});
+
+test('Stop scope covers the selected AI process and every proven descendant', () => {
+  const children = new Map([
+    [20, [
+      { pid: 30, ppid: 20, pgid: 20, cmd: 'tool-wrapper' },
+      { pid: 31, ppid: 20, pgid: 31, cmd: 'tool-shell' },
+    ]],
+    [30, [{ pid: 40, ppid: 30, pgid: 20, cmd: 'sleep 90' }]],
+    [31, [{ pid: 41, ppid: 31, pgid: 31, cmd: 'language-server' }]],
+    [999, [{ pid: 1000, ppid: 999, pgid: 999, cmd: 'unrelated' }]],
+  ]);
+
+  assert.deepEqual(buildAiStopScope({
+    candidate: { pid: 20, ppid: 10, pgid: 20 },
+    children,
+    shellPid: 10,
+  }), {
+    rootPid: 20,
+    processGroups: [31, 20],
+    signalPids: [],
+    trackedPids: [41, 40, 31, 30, 20],
+  });
+});
+
+test('Stop scope falls back to explicit descendant PIDs for unsafe or missing process groups', () => {
+  const children = new Map([
+    [20, [
+      { pid: 30, ppid: 20, pgid: 10, cmd: 'inherits shell group' },
+      { pid: 31, ppid: 20, cmd: 'missing pgid' },
+    ]],
+  ]);
+
+  assert.deepEqual(buildAiStopScope({
+    candidate: { pid: 20, ppid: 10, pgid: 10 },
+    children,
+    shellPid: 10,
+  }), {
+    rootPid: 20,
+    processGroups: [],
+    signalPids: [31, 30, 20],
+    trackedPids: [31, 30, 20],
+  });
+});
+
+test('Stop scope rejects an invalid selected process', () => {
+  assert.equal(buildAiStopScope({ candidate: { pid: 0 }, children: new Map() }), null);
+  assert.equal(buildAiStopScope({ candidate: null, children: new Map() }), null);
 });

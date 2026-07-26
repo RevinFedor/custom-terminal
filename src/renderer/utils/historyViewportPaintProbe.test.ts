@@ -84,3 +84,30 @@ test('A to B before the first mounted row invalidates A and only publishes B', (
   assert.equal(probe.isActive(ownerB), false);
   assert.equal(frames.pending, 0);
 });
+
+test('a transient previous-owner row must survive the paint boundary before publish', () => {
+  const frames = createFrameHarness();
+  const probe = createHistoryViewportPaintProbe(frames);
+  const ownerB = owner('B', 2);
+  let mountedForOwner = true;
+  let published = 0;
+
+  probe.start(ownerB, () => mountedForOwner, () => { published += 1; });
+
+  // The first frame sees a row, but it disappears while React replaces the
+  // previous virtualized owner. The post-paint frame must not publish ready.
+  assert.equal(frames.flushOne(), true);
+  mountedForOwner = false;
+  assert.equal(frames.flushOne(), true);
+  assert.equal(published, 0);
+  assert.equal(probe.isActive(ownerB), true);
+  assert.equal(frames.pending, 1);
+
+  // A real B row mounts and remains present for a complete paint boundary.
+  mountedForOwner = true;
+  assert.equal(frames.flushOne(), true);
+  assert.equal(frames.flushOne(), true);
+  assert.equal(published, 1);
+  assert.equal(probe.isActive(ownerB), false);
+  assert.equal(frames.pending, 0);
+});

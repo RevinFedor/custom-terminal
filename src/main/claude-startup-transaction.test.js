@@ -99,11 +99,14 @@ test('per-command proof windows do not overlap', async () => {
 
 test('absent proof triggers exactly one automatic retry, then succeeds', async () => {
   let modelProofs = 0;
+  const recovery = { kind: 'submit-existing-input' };
   const h = makeHarness({
     proofScript: (args) => {
       if (args.command === '/model haiku') {
         modelProofs += 1;
-        return modelProofs === 1 ? { outcome: PROOF.ABSENT } : { outcome: PROOF.FOUND };
+        return modelProofs === 1
+          ? { outcome: PROOF.ABSENT, recovery }
+          : { outcome: PROOF.FOUND };
       }
       return { outcome: PROOF.FOUND };
     },
@@ -116,6 +119,7 @@ test('absent proof triggers exactly one automatic retry, then succeeds', async (
 
   assert.equal(result.status, 'ready');
   assert.equal(h.sends.filter((s) => s.command === '/model haiku').length, 2, 'one retry send');
+  assert.deepEqual(h.sends[1].recovery, recovery, 'retry executes the proven safe recovery mode');
   assert.ok(h.logs.some((l) => l.includes('[StartupRetry] decision=absent action=auto-retry')));
 });
 

@@ -28,6 +28,7 @@ const {
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
   shouldUseSettledCodexRewindWriterProof,
+  selectCodexDelayedStableSourceWriter,
   selectCodexNativeRewindWriter,
   selectCodexSettledRewindWriter,
   isCodexWriterProofOwnershipQuarantined,
@@ -781,6 +782,166 @@ test('settled Rewind proof fails closed for stale scope, wrong identity, or non-
   assert.equal(withDescendant.rejectedSessionId, 'grandchild');
 });
 
+test('settled stable-source proof survives an ordinary sole-source revalidation', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const source = sessionsDir + '/rollout-source-stable.jsonl';
+  const terminalToken = {};
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 101,
+    output: `p101\nf20\nau\nn${source}\n`,
+  }], sessionsDir);
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: async () => ({
+      meta: { id: 'source-stable', source: 'cli', cwd: '/work' },
+    }),
+    isUserSession: () => true,
+    settledWriter: {
+      kind: 'native-rewind-settled-writer',
+      valid: true,
+      sessionId: 'source-stable',
+      filePath: source,
+      sourceSessionId: 'source-stable',
+      actionGeneration: 'rewind-stable',
+      observerGeneration: 'rewind-stable',
+      terminalToken,
+      observerTerminalToken: terminalToken,
+      runSeq: 8,
+      observerRunSeq: 8,
+      boundSessionId: 'source-stable',
+    },
+  });
+
+  assert.equal(proof.status, 'owned');
+  assert.equal(proof.filePath, source);
+  assert.equal(proof.settledWriterProof.lineageRelation, 'stable-source');
+});
+
+test('delayed stable-source writer requires one exact post-Enter audit on the current PTY scope', () => {
+  const terminalToken = {};
+  const source = {
+    filePath: '/sessions/source-delayed.jsonl',
+    meta: { id: 'source-delayed', source: 'cli', cwd: '/work' },
+  };
+  const child = {
+    filePath: '/sessions/child-delayed.jsonl',
+    meta: {
+      id: 'child-delayed',
+      source: 'cli',
+      cwd: '/work',
+      forked_from_id: null,
+    },
+  };
+  const base = {
+    kind: 'native-rewind-delayed-stable-source',
+    valid: true,
+    sourceSessionId: 'source-delayed',
+    sourceFilePath: source.filePath,
+    actionGeneration: 'rewind-delayed-1',
+    observerGeneration: 'rewind-delayed-1',
+    actionStartedAtMs: 1000,
+    stableSourceSettledAtMs: 1100,
+    journalPhase: 'stable-source-submit-written',
+    terminalToken,
+    observerTerminalToken: terminalToken,
+    runSeq: 9,
+    observerRunSeq: 9,
+    boundSessionId: 'source-delayed',
+    cwd: '/work',
+    submitProof: {
+      submitId: 'submit-1',
+      sourceSessionId: 'source-delayed',
+      actionGeneration: 'rewind-delayed-1',
+      expectedLen: 12,
+      expectedHash: '0123456789abcdef',
+      sentAtMs: 1200,
+      submitWrittenAtMs: 1210,
+    },
+    liveProofs: [{
+      kind: 'user-message-audit',
+      sessionId: 'child-delayed',
+      sourceSessionId: 'source-delayed',
+      actionGeneration: 'rewind-delayed-1',
+      submitId: 'submit-1',
+      expectedLen: 12,
+      expectedHash: '0123456789abcdef',
+      auditSentAtMs: 1200,
+      candidateCreatedAtMs: 1215,
+      recordTimestampMs: 1220,
+      observedAtMs: 1230,
+    }],
+  };
+
+  const selected = selectCodexDelayedStableSourceWriter([source, child], base);
+  assert.equal(selected.status, 'selected');
+  assert.equal(selected.sessionId, 'child-delayed');
+  assert.equal(selected.lineageRelation, 'delayed-stable-source-child');
+  const sourceDescriptorClosed = selectCodexDelayedStableSourceWriter([child], base);
+  assert.equal(sourceDescriptorClosed.status, 'selected');
+  assert.equal(sourceDescriptorClosed.sessionId, 'child-delayed');
+
+  const cases = [
+    ['no audit', { liveProofs: [] }, 'delayed-audit-writer-missing'],
+    ['wrong hash', {
+      liveProofs: [{ ...base.liveProofs[0], expectedHash: 'fedcba9876543210' }],
+    }, 'delayed-audit-writer-missing'],
+    ['record before Enter', {
+      liveProofs: [{ ...base.liveProofs[0], recordTimestampMs: 1199 }],
+    }, 'delayed-audit-writer-missing'],
+    ['candidate before Enter', {
+      liveProofs: [{ ...base.liveProofs[0], candidateCreatedAtMs: 1199 }],
+    }, 'delayed-audit-writer-missing'],
+    ['submit not written', {
+      journalPhase: 'stable-source-submit-armed',
+    }, 'delayed-submit-not-written'],
+    ['stale terminal', {
+      observerTerminalToken: {},
+    }, 'stale-delayed-terminal'],
+    ['stale run', {
+      observerRunSeq: 10,
+    }, 'stale-delayed-run'],
+    ['stale action', {
+      observerGeneration: 'rewind-delayed-2',
+    }, 'stale-delayed-action-generation'],
+    ['binding changed', {
+      boundSessionId: 'unrelated',
+    }, 'delayed-source-binding-mismatch'],
+  ];
+  for (const [label, override, expectedReason] of cases) {
+    const result = selectCodexDelayedStableSourceWriter(
+      [source, child],
+      { ...base, ...override },
+    );
+    assert.equal(result.status, 'unresolved', label);
+    assert.equal(result.reason, expectedReason, label);
+  }
+
+  const wrongCwd = {
+    ...child,
+    meta: { ...child.meta, cwd: '/other' },
+  };
+  assert.equal(
+    selectCodexDelayedStableSourceWriter([source, wrongCwd], base).reason,
+    'delayed-candidate-cwd-mismatch',
+  );
+
+  const secondChild = {
+    filePath: '/sessions/child-delayed-2.jsonl',
+    meta: { id: 'child-delayed-2', source: 'cli', cwd: '/work' },
+  };
+  const twoMatches = selectCodexDelayedStableSourceWriter(
+    [source, child, secondChild],
+    {
+      ...base,
+      liveProofs: [
+        base.liveProofs[0],
+        { ...base.liveProofs[0], sessionId: 'child-delayed-2' },
+      ],
+    },
+  );
+  assert.equal(twoMatches.status, 'unresolved');
+  assert.equal(twoMatches.reason, 'multiple-delayed-audit-writers');
+});
+
 test('a queued observer accepts only the exact already-committed native Rewind transaction', () => {
   const terminalToken = {};
   const intent = {
@@ -886,7 +1047,22 @@ test('writer observation becomes stale before it may invalidate a newer proof', 
   const observer = {};
   assert.deepEqual(classifyCodexWriterObservationScope({
     capturedIntentGeneration: null,
+    currentIntentGeneration: null,
+    capturedObservationGeneration: 7,
+    currentObservationGeneration: 9,
+    expectedObserver: null,
+    currentObserver: null,
+  }), {
+    status: 'stale-observation-generation',
+    expectedObservationGeneration: 7,
+    currentObservationGeneration: 9,
+  }, 'null → Rewind → null is still stale after the monotonic ownership generation advances');
+
+  assert.deepEqual(classifyCodexWriterObservationScope({
+    capturedIntentGeneration: null,
     currentIntentGeneration: 'rewind-b-c',
+    capturedObservationGeneration: 9,
+    currentObservationGeneration: 9,
     expectedObserver: null,
     currentObserver: null,
   }), {
@@ -898,6 +1074,8 @@ test('writer observation becomes stale before it may invalidate a newer proof', 
   assert.deepEqual(classifyCodexWriterObservationScope({
     capturedIntentGeneration: 'rewind-a-b',
     currentIntentGeneration: 'rewind-b-c',
+    capturedObservationGeneration: 9,
+    currentObservationGeneration: 9,
     expectedObserver: observer,
     currentObserver: observer,
   }), {
@@ -909,6 +1087,8 @@ test('writer observation becomes stale before it may invalidate a newer proof', 
   assert.deepEqual(classifyCodexWriterObservationScope({
     capturedIntentGeneration: 'rewind-b-c',
     currentIntentGeneration: 'rewind-b-c',
+    capturedObservationGeneration: 9,
+    currentObservationGeneration: 9,
     expectedObserver: observer,
     currentObserver: {},
   }), {
@@ -918,6 +1098,8 @@ test('writer observation becomes stale before it may invalidate a newer proof', 
   assert.deepEqual(classifyCodexWriterObservationScope({
     capturedIntentGeneration: 'rewind-b-c',
     currentIntentGeneration: 'rewind-b-c',
+    capturedObservationGeneration: 9,
+    currentObservationGeneration: 9,
     expectedObserver: observer,
     currentObserver: observer,
   }), {

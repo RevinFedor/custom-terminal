@@ -54,6 +54,11 @@ import {
   setHistoryReadingAnchor,
 } from '../../utils/historyReadingAnchor';
 import {
+  shouldCaptureDelayedCodexRewindPrefix,
+  shouldClearRewindPreviewForOwnerTransition,
+  type CodexWriterTransitionEvent,
+} from '../../utils/historyRewindPreviewOwner';
+import {
   buildPromptImagePayload,
   collectPromptImageRefIds,
   getPromptImageAttachmentState,
@@ -1026,7 +1031,7 @@ const SubAgentBlock = memo(({ action }: { action: TaskAction }) => {
             Результат
           </button>
           {showResult && (
-            <div style={{
+            <div data-history-empty-state="unbound-session" style={{
               marginTop: 2, fontSize: '0.85em', color: '#bbb',
               whiteSpace: 'pre-wrap', wordBreak: 'break-word',
               maxHeight: 300, overflowY: 'auto',
@@ -5511,6 +5516,58 @@ function AgentHistoryControls({
         </button>
       </Tooltip>
 
+      {activeLifecycle?.kind === 'error' && (
+        <span
+          role="status"
+          data-agent-lifecycle-description
+          title={activeLifecycle.detail || activeLifecycle.description}
+          style={{
+            color: '#fca5a5',
+            fontSize: aiSecondaryFontSize,
+            fontWeight: 600,
+            lineHeight: '20px',
+            whiteSpace: 'nowrap',
+            flexShrink: 0,
+          }}
+        >
+          {activeLifecycle.description}
+        </span>
+      )}
+
+      {activeLifecycle?.kind === 'error' && activeLifecycle.onRetry && (
+        <button
+          type="button"
+          data-agent-lifecycle-retry
+          aria-label={activeLifecycle.retryLabel || 'Retry startup settings'}
+          onMouseDown={(event) => {
+            // Keep the user's composer selection/draft intact while the shared
+            // TerminalArea owner starts the retry transaction.
+            event.preventDefault();
+          }}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            activeLifecycle.onRetry?.();
+          }}
+          style={{
+            height: 20,
+            padding: '0 7px',
+            borderRadius: 5,
+            border: '1px solid rgba(248, 113, 113, 0.5)',
+            background: 'rgba(127, 29, 29, 0.22)',
+            color: '#fecaca',
+            fontSize: aiSecondaryFontSize,
+            fontWeight: 750,
+            letterSpacing: '0.035em',
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+            flexShrink: 0,
+          }}
+        >
+          {activeLifecycle.retryLabel || 'RETRY SETTINGS'}
+        </button>
+      )}
+
       {activityDurationLabel && (
         <span
           data-history-response-timer
@@ -5869,6 +5926,8 @@ function AgentHistoryControls({
 }
 
 const HISTORY_VIRTUOSO_COMPONENTS = { Footer: HistoryBottomSpacer };
+const HISTORY_INITIAL_VIEWPORT_BUFFER = { top: 0, bottom: 0 };
+const HISTORY_SETTLED_VIEWPORT_BUFFER = { top: 600, bottom: 600 };
 
 
 function HistoryPanel({
@@ -5936,6 +5995,10 @@ function HistoryPanel({
     () => makeHistorySnapshotKey(historySnapshotOwner),
     [historySnapshotOwner],
   );
+  const historyOwnerDomId = useMemo(
+    () => historyOwnerDigest(historyOwnerKey),
+    [historyOwnerKey],
+  );
   const historyOwnerKeyRef = useRef(historyOwnerKey);
   const historyOwnerGenerationRef = useRef(0);
   const historyLoadFlightRef = useRef<{
@@ -5944,7 +6007,7 @@ function HistoryPanel({
     trailingRefresh: boolean;
     promise: Promise<boolean>;
   } | null>(null);
-  const previewSessionKeyRef = useRef(tabId + ':' + sessionId);
+  const rewindPreviewOwnerRef = useRef({ tabId, sessionId });
 
   // Save scroll position + clean up CSS highlights on unmount.
   // Virtuoso owns scrolling — the scrollTop we save belongs to the inner
@@ -6074,6 +6137,52 @@ function HistoryPanel({
   ));
   const presentationEntriesRef = useRef(entries);
   presentationEntriesRef.current = entries;
+  useEffect(() => {
+    const captureDelayedWriterPrefix = (
+      _event: unknown,
+      data: CodexWriterTransitionEvent = {},
+    ) => {
+      const preview = useUIStore.getState().historyRewindPreviews[tabId] || null;
+      const currentSessionId = useWorkspaceStore.getState().getCodexSessionId(tabId);
+      if (!shouldCaptureDelayedCodexRewindPrefix({
+        tabId,
+        currentSessionId,
+        preview,
+        event: data,
+      })) return;
+
+      const previousRows = presentationEntriesRef.current;
+      const targetIdx = previousRows.findIndex((entry) => entry.uuid === preview!.targetUuid);
+      if (targetIdx <= 0) return;
+      const prefix = previousRows
+        .slice(0, targetIdx)
+        .filter((entry) => !isLocalRewindEntry(entry) && !isLocalPromptEntry(entry));
+      if (prefix.length === 0) return;
+
+      rewindPrefixHandoffRef.current = {
+        sourceSessionId: String(data.previousSessionId),
+        expectedChildSessionId: String(data.sessionId),
+        entries: prefix,
+        capturedAt: Date.now(),
+      };
+      historyDiag('REWIND_PREFIX_CAPTURE_DELAYED tab=' + tabId.slice(-12)
+        + ' op=' + preview!.opId
+        + ' source=' + String(data.previousSessionId).slice(0, 8)
+        + ' child=' + String(data.sessionId).slice(0, 8)
+        + ' generation=' + String(data.writerGeneration)
+        + ' prefixRows=' + prefix.length
+        + ' target=' + String(preview!.targetUuid).slice(0, 8));
+    };
+
+    // Main publishes every proven Codex writer replacement through this
+    // existing channel before renderer state adopts it. The direct
+    // codex:session-detected event is a second delivery of the same proof and
+    // is deliberately not registered here.
+    ipcRenderer.on('terminal:mcp-ai-tab', captureDelayedWriterPrefix);
+    return () => {
+      ipcRenderer.removeListener('terminal:mcp-ai-tab', captureDelayedWriterPrefix);
+    };
+  }, [tabId]);
   const persistVolatileOverlay = useCallback((
     owner: HistorySnapshotOwner,
     sourceEntries: FullHistoryEntry[],
@@ -6276,6 +6385,38 @@ function HistoryPanel({
     && displayEntries.length > 0
     && viewportReadyOwnerKey !== historyOwnerKey;
   const visibleSurfaceLoading = surfaceLoading || viewportAwaitingFirstRange;
+  const historyViewportBuffer = viewportReadyOwnerKey === historyOwnerKey
+    ? HISTORY_SETTLED_VIEWPORT_BUFFER
+    : HISTORY_INITIAL_VIEWPORT_BUFFER;
+  const publishHistorySurfacePresented = useCallback(({
+    ownerKey,
+    generation,
+    proof,
+    domRows,
+    foreignDomRows,
+    cache,
+  }: {
+    ownerKey: string;
+    generation: number;
+    proof: 'mounted-painted-row' | 'painted-empty-state';
+    domRows: number;
+    foreignDomRows: number;
+    cache: 'hit' | 'miss';
+  }) => {
+    window.dispatchEvent(new CustomEvent('history-panel:surface-presented', {
+      detail: {
+        tabId,
+        sessionId: sessionId || null,
+        toolType,
+        owner: historyOwnerDigest(ownerKey),
+        generation,
+        proof,
+        domRows,
+        foreignDomRows,
+        cache,
+      },
+    }));
+  }, [sessionId, tabId, toolType]);
   const displayEntryIndexByUuid = useMemo(() => {
     const index = new Map<string, number>();
     for (let i = 0; i < displayEntries.length; i += 1) {
@@ -6984,6 +7125,7 @@ function HistoryPanel({
     mode?: 'native' | 'ai';
     toolType?: string;
     sourceSessionId?: string | null;
+    writerGeneration?: string;
     persisted?: boolean;
     historyInputDraft?: boolean;
     error?: string;
@@ -7096,7 +7238,6 @@ function HistoryPanel({
       status === 'done' && (
         detail.persisted === true ||
         detail.mode === 'ai' ||
-        detail.toolType === 'codex' ||
         detail.toolType === 'gemini'
       );
     if (isDurableRewind) {
@@ -7113,8 +7254,22 @@ function HistoryPanel({
       rewindDraftPresentationRef.current.delete(opId);
       return;
     }
-    if (status === 'done' && detail.mode === 'native' && detail.targetUuid && targetText && (detail.toolType || toolType) === 'claude') {
-      setHistoryRewindPreview(tabId, { opId, targetUuid: detail.targetUuid, targetText, startedAt: now, sessionId });
+    const nativePreviewTool = detail.toolType || toolType;
+    if (
+      status === 'done'
+      && detail.mode === 'native'
+      && detail.targetUuid
+      && targetText
+      && (nativePreviewTool === 'claude' || nativePreviewTool === 'codex')
+    ) {
+      setHistoryRewindPreview(tabId, {
+        opId,
+        targetUuid: detail.targetUuid,
+        targetText,
+        startedAt: now,
+        sessionId,
+        writerGeneration: detail.writerGeneration,
+      });
       setHistoryPromptDraft(tabId, restoredPresentation.text, restoredDraftOptions);
       if (detail.historyDraftWarning) {
         window.dispatchEvent(new CustomEvent('history-panel:draft-warning', {
@@ -7148,9 +7303,10 @@ function HistoryPanel({
   }, [historySnapshotOwner, persistVolatileOverlay, sessionId, setHistoryPromptDraft, setHistoryRewindPreview, tabId, toolType]);
 
   useEffect(() => {
-    const sessionKey = tabId + ':' + sessionId;
-    if (previewSessionKeyRef.current !== sessionKey) {
-      previewSessionKeyRef.current = sessionKey;
+    const previousOwner = rewindPreviewOwnerRef.current;
+    const currentOwner = { tabId, sessionId };
+    rewindPreviewOwnerRef.current = currentOwner;
+    if (shouldClearRewindPreviewForOwnerTransition(previousOwner, currentOwner)) {
       setHistoryRewindPreview(tabId, null);
     }
   }, [tabId, sessionId, setHistoryRewindPreview]);
@@ -7673,6 +7829,7 @@ function HistoryPanel({
         historyDraftWarning?: string;
         mode?: 'native' | 'ai';
         toolType?: string;
+        writerGeneration?: string;
         persisted?: boolean;
         historyInputDraft?: boolean;
         error?: string;
@@ -7682,18 +7839,18 @@ function HistoryPanel({
       const durableDone = detail.status === 'done' && (
         detail.persisted === true ||
         detail.mode === 'ai' ||
-        detail.toolType === 'codex' ||
         detail.toolType === 'gemini'
       );
       if (!durableDone) {
         upsertLocalRewindEntry(detail);
         return;
       }
-      if (detail.toolType === 'codex') {
-        // Main returns Codex success only after the child writer is durably
-        // bound. The session-id prop change is the refresh event: it tears down
-        // the source owner and loads the child once. Polling for the target UUID
-        // to disappear from the immutable source file can never converge.
+      if (detail.toolType === 'codex' && detail.persisted === true) {
+        // A persisted Codex result means the writer moved to a durably bound
+        // child. The session-id prop change is the refresh event: it tears down
+        // the source owner and loads the child once. A proven stable-source
+        // result is deliberately not marked persisted and takes the preview
+        // path above until a later user message materializes the new branch.
         upsertLocalRewindEntry(detail);
         return;
       }
@@ -7737,6 +7894,63 @@ function HistoryPanel({
     toolType,
     viewportAwaitingFirstRange,
     visibleSurfaceLoading,
+  ]);
+
+  // A valid empty transcript is also a finished presentation. Publish it only
+  // after the exact owner's empty-state element survives a paint boundary, so
+  // Timeline cannot be released by an async result that has not reached DOM.
+  useEffect(() => {
+    if (
+      surfaceLoading
+      || transcriptEntries.length !== 0
+      || presentedOwnerKey !== historyOwnerKey
+      || historyOwnerKeyRef.current !== historyOwnerKey
+    ) return;
+
+    const ownerAtSchedule = historyOwnerKey;
+    const generationAtSchedule = historyOwnerGenerationRef.current;
+    const presentedProofKey = ownerAtSchedule + ':' + generationAtSchedule;
+    let secondFrame = 0;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        if (
+          historyOwnerKeyRef.current !== ownerAtSchedule
+          || historyOwnerGenerationRef.current !== generationAtSchedule
+          || surfacePresentedOwnerRef.current === presentedProofKey
+          || !panelRef.current?.querySelector('[data-history-empty-state]')
+        ) return;
+        const cacheAtPaint = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner)
+          ? 'hit'
+          : 'miss';
+        surfacePresentedOwnerRef.current = presentedProofKey;
+        historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
+          + ' owner=' + historyOwnerDigest(ownerAtSchedule)
+          + ' generation=' + generationAtSchedule
+          + ' cache=' + cacheAtPaint
+          + ' domRows=0 foreignDomRows=0 loader=hidden'
+          + ' proof=painted-empty-state');
+        publishHistorySurfacePresented({
+          ownerKey: ownerAtSchedule,
+          generation: generationAtSchedule,
+          proof: 'painted-empty-state',
+          domRows: 0,
+          foreignDomRows: 0,
+          cache: cacheAtPaint,
+        });
+      });
+    });
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame) cancelAnimationFrame(secondFrame);
+    };
+  }, [
+    historyOwnerKey,
+    historySnapshotOwner,
+    presentedOwnerKey,
+    publishHistorySurfacePresented,
+    surfaceLoading,
+    tabId,
+    transcriptEntries.length,
   ]);
 
   // Initial load on mount / session change / tool type switch
@@ -7862,9 +8076,6 @@ function HistoryPanel({
       // A cached child projection wins over the display-only prefix; drop the
       // handoff so a LATER unrelated owner change cannot consume stale rows.
       rewindPrefixHandoffRef.current = null;
-      viewportReadyOwnerKeyRef.current = historyOwnerKey;
-      setViewportReadyOwnerKey(historyOwnerKey);
-      setViewportProofRequired(false);
       const rawCachedEntries = cachedSnapshot.entries as unknown as FullHistoryEntry[];
       reconcileLiveToolResultsAgainstDurable(rawCachedEntries, historyOwnerKey);
       const presentedCachedEntries = filterSuppressedPromptEntries(
@@ -7875,6 +8086,10 @@ function HistoryPanel({
         presentedCachedEntries,
         restoredLocalEntries,
       );
+      const needsViewportProof = cachedEntries.length > 0;
+      viewportReadyOwnerKeyRef.current = needsViewportProof ? '' : historyOwnerKey;
+      setViewportReadyOwnerKey(needsViewportProof ? '' : historyOwnerKey);
+      setViewportProofRequired(needsViewportProof);
       presentationEntriesRef.current = cachedEntries;
       setEntries(cachedEntries);
       setClaudeMemoryBoundaryUuid(cachedSnapshot.claudeMemoryBoundaryUuid);
@@ -7906,12 +8121,13 @@ function HistoryPanel({
           + ' child=' + (sessionId ? sessionId.slice(0, 8) : 'none')
           + ' prefixRows=' + prefixRows.length);
         rewindPrefixOnScreenRef.current = historyOwnerKey;
-        // The prefix rows were painted by this same list moments ago (the
-        // rewind swapped the session in place, no tab switch) — the cold
-        // paint gate is not needed; the child projection swaps in on load.
-        viewportReadyOwnerKeyRef.current = historyOwnerKey;
-        setViewportReadyOwnerKey(historyOwnerKey);
-        setViewportProofRequired(false);
+        // The owner-keyed virtualized viewport remounts for the child. Keep
+        // the loader until that new viewport has painted one of the proven
+        // prefix rows; the source viewport itself is not child presentation
+        // proof even though the rows are a valid common prefix.
+        viewportReadyOwnerKeyRef.current = '';
+        setViewportReadyOwnerKey('');
+        setViewportProofRequired(true);
         setLoading(false);
       } else {
         // Strict loader contract for every other cold owner: the loader
@@ -8788,6 +9004,11 @@ function HistoryPanel({
     <div
       ref={panelRef}
       data-history-main={mainSurface ? '1' : undefined}
+      data-history-owner={historyOwnerDomId}
+      data-history-session={sessionId || undefined}
+      data-history-viewport-ready={
+        viewportReadyOwnerKey === historyOwnerKey ? '1' : '0'
+      }
       style={{
         position: embedded ? 'relative' : 'absolute',
         top: 0,
@@ -8997,13 +9218,14 @@ function HistoryPanel({
               </div>
             </div>
           ) : (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#555', fontSize: 13 }}>
+            <div data-history-empty-state="empty-transcript" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#555', fontSize: 13 }}>
               No history entries
             </div>
           )
         ) : (
           <>
           <Virtuoso
+            key={historyOwnerKey}
             ref={virtuosoRef}
             data={transcriptEntries}
             components={HISTORY_VIRTUOSO_COMPONENTS}
@@ -9055,7 +9277,9 @@ function HistoryPanel({
                   () => (
                     historyOwnerKeyRef.current === ownerAtRange
                     && historyOwnerGenerationRef.current === generationAtRange
-                    && !!virtuosoScrollerRef.current?.querySelector('[data-uuid]')
+                    && !!virtuosoScrollerRef.current?.querySelector(
+                      `[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
+                    )
                   ),
                   () => {
                     if (
@@ -9088,32 +9312,49 @@ function HistoryPanel({
                   () => (
                     historyOwnerKeyRef.current === ownerAtRange
                     && historyOwnerGenerationRef.current === generationAtRange
-                    && !!virtuosoScrollerRef.current?.querySelector('[data-uuid]')
+                    && !!virtuosoScrollerRef.current?.querySelector(
+                      `[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
+                    )
                   ),
                   () => {
                     if (
                       historyOwnerKeyRef.current !== ownerAtRange
                       || historyOwnerGenerationRef.current !== generationAtRange
                     ) return;
-                    const domRows = virtuosoScrollerRef.current
+                    const allDomRows = virtuosoScrollerRef.current
                       ?.querySelectorAll('[data-uuid]').length || 0;
+                    const domRows = virtuosoScrollerRef.current
+                      ?.querySelectorAll(
+                        `[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
+                      ).length || 0;
                     surfacePresentedOwnerRef.current = presentedProofKey;
                     historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
                       + ' owner=' + historyOwnerDigest(ownerAtRange)
                       + ' generation=' + generationAtRange
                       + ' cache=' + cacheAtRange
                       + ' domRows=' + domRows
+                      + ' foreignDomRows=' + Math.max(0, allDomRows - domRows)
                       + ' loader=' + (visibleSurfaceLoading ? 'visible' : 'hidden')
                       + ' proof=mounted-painted-row');
+                    publishHistorySurfacePresented({
+                      ownerKey: ownerAtRange,
+                      generation: generationAtRange,
+                      proof: 'mounted-painted-row',
+                      domRows,
+                      foreignDomRows: Math.max(0, allDomRows - domRows),
+                      cache: cacheAtRange,
+                    });
                   },
                 );
               }
               recomputeVisibleUuids();
             }}
-            // Pre-render a vertical buffer on either side so flash highlights
-            // and Cmd+F treeWalker include the immediate neighborhood (Virtuoso
-            // would otherwise unmount items just past the viewport).
-            increaseViewportBy={{ top: 600, bottom: 600 }}
+            // The first owner proof mounts only the actual viewport, keeping a
+            // cache-hit switch below one frame budget even when the tail has
+            // heavyweight cards. Immediately after that proof the full buffer
+            // returns, so flash highlights and Cmd+F still include the same
+            // neighborhood as before.
+            increaseViewportBy={historyViewportBuffer}
             // Start at the requested Timeline target when Cmd+click opened the
             // panel; otherwise start at the tail, matching the usual History
             // open behavior for long sessions.
@@ -9145,6 +9386,7 @@ function HistoryPanel({
               return (
                 <div
                   data-uuid={presentedEntry.uuid}
+                  data-history-row-owner={historyOwnerDomId}
                   data-history-live-entry={presentedEntry.liveProjection ? '1' : undefined}
                   data-history-durable-source={
                     !presentedEntry.liveProjection

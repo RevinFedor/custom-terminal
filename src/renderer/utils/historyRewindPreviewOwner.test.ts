@@ -1,0 +1,131 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  shouldCaptureDelayedCodexRewindPrefix,
+  shouldClearRewindPreviewForOwnerTransition,
+  type HistoryRewindPreviewOwner,
+} from './historyRewindPreviewOwner.ts';
+
+test('switching tabs preserves the independently owned rewind previews', () => {
+  const transitions: Array<[HistoryRewindPreviewOwner, HistoryRewindPreviewOwner]> = [
+    [
+      { tabId: 'tab-c', sessionId: 'session-c' },
+      { tabId: 'tab-a', sessionId: 'session-a' },
+    ],
+    [
+      { tabId: 'tab-a', sessionId: 'session-a' },
+      { tabId: 'tab-b', sessionId: 'session-b' },
+    ],
+    [
+      { tabId: 'tab-b', sessionId: 'session-b' },
+      { tabId: 'tab-c', sessionId: 'session-c' },
+    ],
+  ];
+
+  assert.deepEqual(
+    transitions.map(([previous, current]) =>
+      shouldClearRewindPreviewForOwnerTransition(previous, current)),
+    [false, false, false],
+  );
+});
+
+test('replacing the session inside one tab invalidates only that tab preview', () => {
+  assert.equal(
+    shouldClearRewindPreviewForOwnerTransition(
+      { tabId: 'tab-a', sessionId: 'session-old' },
+      { tabId: 'tab-a', sessionId: 'session-new' },
+    ),
+    true,
+  );
+});
+
+test('an unchanged owner does not clear its preview', () => {
+  assert.equal(
+    shouldClearRewindPreviewForOwnerTransition(
+      { tabId: 'tab-a', sessionId: 'session-a' },
+      { tabId: 'tab-a', sessionId: 'session-a' },
+    ),
+    false,
+  );
+});
+
+test('a tab switch is not a session replacement even when one side has no session yet', () => {
+  assert.equal(
+    shouldClearRewindPreviewForOwnerTransition(
+      { tabId: 'tab-starting', sessionId: null },
+      { tabId: 'tab-ready', sessionId: 'session-ready' },
+    ),
+    false,
+  );
+});
+
+test('delayed Codex writer proof authorizes the exact retained Rewind prefix', () => {
+  const event = {
+    tabId: 'tab-a',
+    engine: 'codex',
+    sessionId: 'child-a',
+    previousSessionId: 'source-a',
+    writerProven: true,
+    writerProof: 'native-rewind-delayed-child',
+    writerGeneration: 'rewind-generation-a',
+  };
+  const preview = {
+    sessionId: 'source-a',
+    writerGeneration: 'rewind-generation-a',
+  };
+
+  assert.equal(shouldCaptureDelayedCodexRewindPrefix({
+    tabId: 'tab-a',
+    currentSessionId: 'source-a',
+    preview,
+    event,
+  }), true);
+  assert.equal(shouldCaptureDelayedCodexRewindPrefix({
+    tabId: 'tab-a',
+    currentSessionId: 'child-a',
+    preview,
+    event,
+  }), true, 'listener ordering may expose either side of the already-proven transition');
+});
+
+test('delayed Codex prefix handoff rejects stale, generic, and cross-tab writer events', () => {
+  const base = {
+    tabId: 'tab-a',
+    currentSessionId: 'source-a',
+    preview: {
+      sessionId: 'source-a',
+      writerGeneration: 'rewind-generation-a',
+    },
+    event: {
+      tabId: 'tab-a',
+      engine: 'codex',
+      sessionId: 'child-a',
+      previousSessionId: 'source-a',
+      writerProven: true,
+      writerProof: 'native-rewind-delayed-child',
+      writerGeneration: 'rewind-generation-a',
+    },
+  };
+  const cases = [
+    { event: { ...base.event, tabId: 'tab-b' } },
+    { event: { ...base.event, engine: 'claude' } },
+    { event: { ...base.event, writerProven: false } },
+    { event: { ...base.event, writerProof: 'process-open-rollout' } },
+    { event: { ...base.event, previousSessionId: 'other-source' } },
+    { event: { ...base.event, sessionId: 'source-a' } },
+    { event: { ...base.event, writerGeneration: 'other-generation' } },
+    { preview: { ...base.preview, writerGeneration: null } },
+    { currentSessionId: 'unrelated-session' },
+  ];
+
+  for (const override of cases) {
+    assert.equal(
+      shouldCaptureDelayedCodexRewindPrefix({
+        ...base,
+        ...override,
+      }),
+      false,
+    );
+  }
+});

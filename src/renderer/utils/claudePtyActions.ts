@@ -187,70 +187,91 @@ async function applyClaudePtySettingInner({
     source,
     stashFirst: true,
     armPromptBoundaryOnSubmit: true,
+    // Main must keep the startup transaction behind this manual choice until
+    // the renderer reports the existing JSONL proof result. Without this
+    // explicit contract, startup could call the launch "ready", then discover
+    // that the manual command failed and leave the configured default unapplied.
+    expectSettingClaimResult: true,
   });
   if (sent?.success !== true) {
     throw new Error(sent?.error || 'Claude setting command was not sent');
   }
-
-  let observed = await waitForClaudePtySettingProof({
-    tabId,
-    kind,
-    command,
-    afterMs,
-    source,
-    timeoutMs: 6500,
-  });
-
-  if (!observed.proof) {
-    // One bounded retry is allowed only when main atomically copied the current
-    // composer and it still equals this exact command at the Enter boundary.
-    // A changed or unknown draft is never submitted.
-    const retry = await ipcRenderer.invoke('claude:retry-exact-setting-input', {
+  const startupSettingClaimId = Number(sent?.startupSettingClaimId || 0);
+  const settleStartupClaim = async (success: boolean, reason: string) => {
+    if (!Number.isFinite(startupSettingClaimId) || startupSettingClaimId <= 0) return;
+    await ipcRenderer.invoke('claude:set-setting-claim-result', {
       tabId,
-      command,
-      reason: source + ':proof-timeout',
-    }).catch((error: any) => ({
-      success: false,
-      submitted: false,
-      error: errorText(error),
-    }));
-    if (retry?.submitted === true) {
-      observed = await waitForClaudePtySettingProof({
-        tabId,
-        kind,
-        command,
-        afterMs,
-        source: source + ':exact-retry',
-        timeoutMs: 3500,
-      });
-    }
-  }
-
-  if (!observed.proof) {
-    const last = observed.last || {};
-    throw new Error(
-      command + ' was not confirmed by Claude'
-      + '; reason=' + (last.reason || 'timeout')
-      + '; wrapper=' + !!last.wrapperSeen
-      + '; stdout=' + !!last.stdoutSeen
-      + (last.error ? '; error=' + last.error : ''),
-    );
-  }
-
-  console.warn('[ClaudePtySetting] confirmed tab=' + shortTab(tabId)
-    + ' command=' + JSON.stringify(command)
-    + ' session=' + shortSid(observed.proof.sessionId || undefined)
-    + ' timestamp=' + (observed.proof.timestamp || '-'));
-  return {
-    success: true,
-    tabId,
-    kind,
-    value: normalizedValue,
-    command,
-    proof: observed.proof.reason || 'jsonl-stdout',
-    sessionId: observed.proof.sessionId || null,
-    timestamp: observed.proof.timestamp || null,
+      claimId: startupSettingClaimId,
+      success,
+      reason,
+    }).catch(() => null);
   };
+
+  try {
+    let observed = await waitForClaudePtySettingProof({
+      tabId,
+      kind,
+      command,
+      afterMs,
+      source,
+      timeoutMs: 6500,
+    });
+
+    if (!observed.proof) {
+      // One bounded retry is allowed only when main atomically copied the current
+      // composer and it still equals this exact command at the Enter boundary.
+      // A changed or unknown draft is never submitted.
+      const retry = await ipcRenderer.invoke('claude:retry-exact-setting-input', {
+        tabId,
+        command,
+        reason: source + ':proof-timeout',
+      }).catch((error: any) => ({
+        success: false,
+        submitted: false,
+        error: errorText(error),
+      }));
+      if (retry?.submitted === true) {
+        observed = await waitForClaudePtySettingProof({
+          tabId,
+          kind,
+          command,
+          afterMs,
+          source: source + ':exact-retry',
+          timeoutMs: 3500,
+        });
+      }
+    }
+
+    if (!observed.proof) {
+      const last = observed.last || {};
+      throw new Error(
+        command + ' was not confirmed by Claude'
+        + '; reason=' + (last.reason || 'timeout')
+        + '; wrapper=' + !!last.wrapperSeen
+        + '; stdout=' + !!last.stdoutSeen
+        + (last.error ? '; error=' + last.error : ''),
+      );
+    }
+
+    await settleStartupClaim(true, 'jsonl-proof-found');
+    console.warn('[ClaudePtySetting] confirmed tab=' + shortTab(tabId)
+      + ' command=' + JSON.stringify(command)
+      + ' session=' + shortSid(observed.proof.sessionId || undefined)
+      + ' timestamp=' + (observed.proof.timestamp || '-'));
+    return {
+      success: true,
+      tabId,
+      kind,
+      value: normalizedValue,
+      command,
+      proof: observed.proof.reason || 'jsonl-stdout',
+      sessionId: observed.proof.sessionId || null,
+      timestamp: observed.proof.timestamp || null,
+    };
+  } catch (error) {
+    await settleStartupClaim(false, 'jsonl-proof-failed');
+    throw error;
+  }
 }
 
 export async function applyClaudePtySetting({

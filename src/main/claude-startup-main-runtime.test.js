@@ -1,0 +1,448 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  classifyClaudeStartupDeliveryProof,
+  createClaudeStartupMainRuntime,
+  selectClaudeStartupSettingsSession,
+} = require('./claude-startup-main-runtime');
+const { PROOF } = require('./claude-startup-transaction');
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function harness(overrides = {}) {
+  let generation = 'launch-1';
+  let now = 100;
+  const sends = [];
+  const gates = [];
+  const proofs = [];
+  const runtime = createClaudeStartupMainRuntime({
+    now: () => ++now,
+    log: () => {},
+    currentLaunchGeneration: () => generation,
+    resolveSettings: async () => ({ model: 'haiku', effort: 'high' }),
+    sendCommand: async (payload) => {
+      sends.push(payload);
+      return { success: true };
+    },
+    proveCommand: async (payload) => {
+      proofs.push(payload);
+      return { outcome: PROOF.FOUND };
+    },
+    publishGate: (gate) => gates.push(gate),
+    ...overrides,
+  });
+  return {
+    runtime,
+    sends,
+    gates,
+    proofs,
+    setGeneration(next) { generation = next; },
+  };
+}
+
+test('fresh launch ignores a stale persisted writer while resume keeps explicit identity', () => {
+  assert.equal(selectClaudeStartupSettingsSession({
+    launchMode: 'fresh',
+    readinessSessionId: 'new-bridge-session',
+    persistedSessionId: 'stale-stopped-session',
+  }), null);
+  assert.equal(selectClaudeStartupSettingsSession({
+    launchMode: 'resume',
+    launchSessionId: 'explicit-resume-session',
+    readinessSessionId: 'bridge-session',
+    persistedSessionId: 'stale-stopped-session',
+  }), 'explicit-resume-session');
+  assert.equal(selectClaudeStartupSettingsSession({
+    launchMode: 'unknown',
+    readinessSessionId: 'bridge-session',
+    persistedSessionId: 'stale-stopped-session',
+  }), 'bridge-session');
+});
+
+test('only explicit no-Enter plus the exact composer command proves startup non-delivery', () => {
+  const scan = {
+    success: false,
+    outcome: PROOF.UNRESOLVED,
+    reason: 'stdout-not-found',
+  };
+  const emptyComposer = classifyClaudeStartupDeliveryProof({
+    scan,
+    composer: { success: true, exact: false, empty: true },
+  });
+  assert.equal(emptyComposer.outcome, PROOF.UNRESOLVED);
+  assert.equal(emptyComposer.composerProof, 'empty');
+
+  const unknownComposer = classifyClaudeStartupDeliveryProof({
+    scan,
+    composer: { success: false, error: 'copy_input_failed' },
+  });
+  assert.equal(unknownComposer.outcome, PROOF.UNRESOLVED);
+  assert.equal(unknownComposer.composerProof, 'unknown');
+
+  const exactComposer = classifyClaudeStartupDeliveryProof({
+    scan,
+    composer: { success: true, exact: true, empty: false },
+    sendResult: { success: true, submitted: false },
+  });
+  assert.equal(exactComposer.outcome, PROOF.ABSENT);
+  assert.equal(exactComposer.reason, 'exact-input-awaiting-submit');
+  assert.deepEqual(exactComposer.recovery, { kind: 'submit-existing-input' });
+  assert.equal(exactComposer.submitProof, 'not-written');
+
+  const exactButEnterMayHaveBeenWritten = classifyClaudeStartupDeliveryProof({
+    scan,
+    composer: { success: true, exact: true, empty: false },
+    sendResult: { success: true },
+  });
+  assert.equal(exactButEnterMayHaveBeenWritten.outcome, PROOF.UNRESOLVED);
+  assert.equal(exactButEnterMayHaveBeenWritten.composerProof, 'exact');
+  assert.equal(exactButEnterMayHaveBeenWritten.submitProof, 'unknown');
+
+  const exactAfterEnterWasWritten = classifyClaudeStartupDeliveryProof({
+    scan,
+    composer: { success: true, exact: true, empty: false },
+    sendResult: { success: true, submitted: true },
+  });
+  assert.equal(exactAfterEnterWasWritten.outcome, PROOF.UNRESOLVED);
+  assert.equal(exactAfterEnterWasWritten.submitProof, 'written');
+});
+
+test('both readiness signals join one main-owned sequence', async () => {
+  let resolves = 0;
+  const h = harness({
+    resolveSettings: async () => {
+      resolves += 1;
+      return { model: 'haiku', effort: 'high' };
+    },
+  });
+  const first = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  const second = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'process-started',
+  });
+  assert.equal(first.started, true);
+  assert.equal(second.joined, true);
+  await Promise.all([first.promise, second.promise]);
+  assert.equal(resolves, 1);
+  assert.deepEqual(h.sends.map((item) => item.command), ['/model haiku', '/effort high']);
+  assert.deepEqual(h.gates.map((item) => item.status), ['pending', 'ready']);
+});
+
+test('manual effort selected while model proof is pending wins over default effort', async () => {
+  const modelProof = deferred();
+  const h = harness({
+    proveCommand: async (payload) => {
+      if (payload.command.startsWith('/model')) return modelProof.promise;
+      return { outcome: PROOF.FOUND };
+    },
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const claim = h.runtime.claimManualSetting('tab-a', '/effort max', 'controlbar:effort');
+  assert.ok(claim);
+  modelProof.resolve({ outcome: PROOF.FOUND });
+  await run.promise;
+  assert.deepEqual(h.sends.map((item) => item.command), ['/model haiku']);
+  assert.equal(h.gates.at(-1).status, 'ready');
+});
+
+test('startup waits for a pending manual proof and skips its default after confirmation', async () => {
+  const modelProof = deferred();
+  const h = harness({
+    proveCommand: async (payload) => {
+      if (payload.command.startsWith('/model')) return modelProof.promise;
+      return { outcome: PROOF.FOUND };
+    },
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const manual = h.runtime.claimManualSetting(
+    'tab-a',
+    '/effort max',
+    'controlbar:effort',
+    { expectsSettlement: true },
+  );
+  modelProof.resolve({ outcome: PROOF.FOUND });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(h.gates.at(-1).status, 'pending');
+  assert.deepEqual(h.sends.map((item) => item.command), ['/model haiku']);
+
+  assert.equal(
+    h.runtime.settleManualClaim('tab-a', manual.claim.id, true, 'jsonl-proof-found'),
+    true,
+  );
+  const result = await run.promise;
+  assert.equal(result.status, 'ready');
+  assert.deepEqual(h.sends.map((item) => item.command), ['/model haiku']);
+});
+
+test('failed pending manual proof makes startup apply the configured default', async () => {
+  const modelProof = deferred();
+  const h = harness({
+    proveCommand: async (payload) => {
+      if (payload.command.startsWith('/model')) return modelProof.promise;
+      return { outcome: PROOF.FOUND };
+    },
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const manual = h.runtime.claimManualSetting(
+    'tab-a',
+    '/effort max',
+    'controlbar:effort',
+    { expectsSettlement: true },
+  );
+  modelProof.resolve({ outcome: PROOF.FOUND });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(h.gates.at(-1).status, 'pending');
+
+  assert.equal(
+    h.runtime.settleManualClaim('tab-a', manual.claim.id, false, 'jsonl-proof-failed'),
+    true,
+  );
+  const result = await run.promise;
+  assert.equal(result.status, 'ready');
+  assert.deepEqual(
+    h.sends.map((item) => item.command),
+    ['/model haiku', '/effort high'],
+  );
+});
+
+test('renderer loss releases a pending manual proof and resumes the startup default', async () => {
+  const modelProof = deferred();
+  const h = harness({
+    proveCommand: async (payload) => {
+      if (payload.command.startsWith('/model')) return modelProof.promise;
+      return { outcome: PROOF.FOUND };
+    },
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  h.runtime.claimManualSetting(
+    'tab-a',
+    '/effort max',
+    'controlbar:effort',
+    { expectsSettlement: true },
+  );
+  modelProof.resolve({ outcome: PROOF.FOUND });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(h.runtime.abandonPendingManualClaims('renderer-navigation'), 1);
+  const result = await run.promise;
+  assert.equal(result.status, 'ready');
+  assert.deepEqual(
+    h.sends.map((item) => item.command),
+    ['/model haiku', '/effort high'],
+  );
+});
+
+test('a newer manual choice of the same setting survives the older startup proof', async () => {
+  const modelProof = deferred();
+  const h = harness({
+    resolveSettings: async () => ({ model: 'haiku', effort: 'none' }),
+    proveCommand: async () => modelProof.promise,
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  h.runtime.claimManualSetting('tab-a', '/model opus', 'controlbar:model');
+  modelProof.resolve({ outcome: PROOF.FOUND });
+  await run.promise;
+  const snapshot = h.runtime.snapshot('tab-a');
+  assert.equal(snapshot.claims.model.value, 'opus');
+  assert.equal(snapshot.claims.model.via, 'controlbar:model');
+});
+
+test('failed newer manual choice rolls back to the already-proven startup setting', async () => {
+  const modelProof = deferred();
+  const h = harness({
+    resolveSettings: async () => ({ model: 'haiku', effort: 'none' }),
+    proveCommand: async () => modelProof.promise,
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const manual = h.runtime.claimManualSetting(
+    'tab-a',
+    '/model opus',
+    'controlbar:model',
+    { expectsSettlement: true },
+  );
+  modelProof.resolve({ outcome: PROOF.FOUND });
+  await run.promise;
+  assert.equal(h.runtime.snapshot('tab-a').claims.model.value, 'opus');
+
+  assert.equal(
+    h.runtime.settleManualClaim('tab-a', manual.claim.id, false, 'jsonl-proof-failed'),
+    true,
+  );
+  const snapshot = h.runtime.snapshot('tab-a');
+  assert.equal(snapshot.claims.model.value, 'haiku');
+  assert.equal(snapshot.claims.model.via, 'startup-defaults');
+});
+
+test('failed manual send can roll its claim back', () => {
+  const h = harness();
+  const token = h.runtime.claimManualSetting('tab-a', '/model opus', 'controlbar:model');
+  assert.ok(token);
+  assert.equal(h.runtime.snapshot('tab-a').claims.model.value, 'opus');
+  assert.equal(h.runtime.rollbackManualClaim(token), true);
+  assert.equal(h.runtime.snapshot('tab-a').claims.model, null);
+});
+
+test('a later manual proof failure rolls back only its matching pending claim', () => {
+  const h = harness();
+  const first = h.runtime.claimManualSetting('tab-a', '/model haiku', 'controlbar:model');
+  const second = h.runtime.claimManualSetting('tab-a', '/model opus', 'controlbar:model');
+  assert.equal(h.runtime.settleManualClaim('tab-a', first.claim.id, false), false);
+  assert.equal(h.runtime.snapshot('tab-a').claims.model.value, 'opus');
+  assert.equal(h.runtime.settleManualClaim('tab-a', second.claim.id, false), true);
+  assert.equal(h.runtime.snapshot('tab-a').claims.model, null);
+});
+
+test('manual retry keeps proven model and only retries failed effort', async () => {
+  let effortAttempts = 0;
+  const h = harness({
+    proveCommand: async (payload) => {
+      if (payload.command.startsWith('/model')) return { outcome: PROOF.FOUND };
+      effortAttempts += 1;
+      return effortAttempts <= 2
+        ? { outcome: PROOF.ABSENT, reason: 'stdout-not-found' }
+        : { outcome: PROOF.FOUND };
+    },
+  });
+  const first = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  const firstResult = await first.promise;
+  assert.equal(firstResult.status, 'failed');
+  assert.deepEqual(
+    h.sends.map((item) => item.command),
+    ['/model haiku', '/effort high', '/effort high'],
+  );
+  const retry = h.runtime.retry('tab-a');
+  assert.equal(retry.started, true);
+  const retryResult = await retry.promise;
+  assert.equal(retryResult.status, 'ready');
+  assert.deepEqual(
+    h.sends.map((item) => item.command),
+    ['/model haiku', '/effort high', '/effort high', '/effort high'],
+  );
+});
+
+test('stale generation cannot start or publish a gate', async () => {
+  const h = harness();
+  h.setGeneration('launch-2');
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  assert.equal(run.reason, 'stale-generation');
+  await run.promise;
+  assert.equal(h.sends.length, 0);
+  assert.equal(h.gates.length, 0);
+});
+
+test('retry source is explicit so first-attempt fault hooks do not swallow it twice', async () => {
+  let proofCount = 0;
+  const h = harness({
+    proveCommand: async () => {
+      proofCount += 1;
+      return proofCount === 1
+        ? { outcome: PROOF.ABSENT }
+        : { outcome: PROOF.FOUND };
+    },
+    resolveSettings: async () => ({ model: 'none', effort: 'high' }),
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  await run.promise;
+  assert.equal(h.sends.length, 2);
+  assert.equal(h.sends[0].source, 'startup-defaults:tui-ready-effort');
+  assert.equal(h.sends[1].source, 'startup-defaults:tui-ready-effort:retry');
+});
+
+test('unresolved proof publishes an actionable failed gate without auto-retry', async () => {
+  const h = harness({
+    resolveSettings: async () => ({ model: 'haiku', effort: 'none' }),
+    proveCommand: async () => ({
+      outcome: PROOF.UNRESOLVED,
+      reason: 'session-file-missing',
+    }),
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  const result = await run.promise;
+  assert.equal(result.status, 'failed');
+  assert.equal(h.sends.length, 1);
+  assert.equal(h.gates.at(-1).status, 'failed');
+  assert.equal(h.gates.at(-1).failedCommand, '/model haiku');
+  assert.equal(h.gates.at(-1).proofOutcome, PROOF.UNRESOLVED);
+  assert.equal(h.gates.at(-1).userRetryable, true);
+});
+
+test('no configured steps still closes the durable gate as ready', async () => {
+  const h = harness({
+    resolveSettings: async () => ({ model: 'none', effort: 'none' }),
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  const result = await run.promise;
+  assert.equal(result.status, 'ready');
+  assert.equal(h.sends.length, 0);
+  assert.deepEqual(h.gates.map((item) => item.status), ['pending', 'ready']);
+});

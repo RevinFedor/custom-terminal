@@ -12,6 +12,7 @@ const {
   readClaudeUserRecords,
   readLastClaudeUserRecord,
   selectClaudePendingPromptAudit,
+  shouldStageClaudeUserPromptAudit,
 } = require('./claude-prompt-audit');
 
 function userRecord(uuid, text, timestamp = '2026-07-24T10:00:00.000Z') {
@@ -22,6 +23,45 @@ function userRecord(uuid, text, timestamp = '2026-07-24T10:00:00.000Z') {
     message: { role: 'user', content: text },
   };
 }
+
+test('only ordinary submitted Claude prompts enter the user-message audit', () => {
+  const base = {
+    broadcastTabId: 'tab-a',
+    submit: true,
+    submitSequence: '\r',
+    content: 'ordinary prompt',
+  };
+
+  assert.equal(shouldStageClaudeUserPromptAudit(base), true);
+  assert.equal(shouldStageClaudeUserPromptAudit({
+    ...base,
+    content: '/model haiku',
+  }), false);
+  assert.equal(shouldStageClaudeUserPromptAudit({
+    ...base,
+    content: '   /effort medium',
+  }), false);
+  assert.equal(shouldStageClaudeUserPromptAudit({
+    ...base,
+    submit: false,
+  }), false);
+  assert.equal(shouldStageClaudeUserPromptAudit({
+    ...base,
+    submitSequence: '\t',
+  }), false);
+  assert.equal(shouldStageClaudeUserPromptAudit({
+    ...base,
+    fast: true,
+  }), false);
+  assert.equal(shouldStageClaudeUserPromptAudit({
+    ...base,
+    isCodexPasteSource: true,
+  }), false);
+  assert.equal(shouldStageClaudeUserPromptAudit({
+    ...base,
+    broadcastTabId: null,
+  }), false);
+});
 
 test('an identical pre-submit Claude record cannot satisfy the next audit', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-audit-'));

@@ -571,6 +571,8 @@ export interface AgentLifecycleSummary {
   description: string;
   detail?: string | null;
   spinner: boolean;
+  retryLabel?: string;
+  onRetry?: () => void;
 }
 
 interface TerminalAreaProps {
@@ -926,17 +928,31 @@ function TerminalArea({
     setSessionStarting(null);
   }, [sessionStarting, startingDismissKey]);
 
-  // Explicit retry of the startup settings. Runs the same transaction the
-  // readiness signals drive — Terminal.tsx owns it and exposes a retry entry
-  // point, so there is still exactly one owner of the sequence.
-  const handleRetryStartupDefaults = useCallback(() => {
+  // Explicit user approval re-enters the main-owned transaction for the same
+  // live launch. Main keeps already-proven earlier steps and retries only the
+  // failed setting.
+  const handleRetryStartupDefaults = useCallback(async () => {
     const current = sessionStarting;
     if (!current || current.engine !== 'claude') return;
     console.warn('[StartupRetry] decision=user action=manual-retry tab=' + current.tabId.slice(-12)
       + ' command=' + (current.startupFailedCommand || '-'));
     setSessionStarting(null);
-    window.dispatchEvent(new CustomEvent('claude-startup-defaults-retry', {
-      detail: { tabId: current.tabId },
+    const result = await ipcRenderer.invoke('claude:retry-startup-defaults', {
+      tabId: current.tabId,
+    }).catch((error: any) => ({
+      success: false,
+      accepted: false,
+      error: error?.message || String(error),
+    }));
+    if (result?.accepted === true) return;
+    setSessionStarting((prev) => applyClaudeStartupDefaultsGate(prev, current, {
+      tabId: current.tabId,
+      status: 'failed',
+      reason: 'manual-retry-rejected',
+      error: result?.error || result?.reason || 'No live Claude launch to retry',
+      failedCommand: current.startupFailedCommand || null,
+      proofOutcome: current.startupProofOutcome || null,
+      userRetryable: false,
     }));
   }, [sessionStarting]);
 
@@ -1020,6 +1036,8 @@ function TerminalArea({
     }
     if (showSessionStartingOverlay && sessionStarting) {
       const presentation = getSessionStartingPresentation(sessionStarting);
+      const canRetryStartupSettings = presentation.isError
+        && sessionStarting.startupUserRetryable === true;
       return {
         tabId: sessionStarting.tabId,
         sessionId: sessionStarting.sessionId || null,
@@ -1028,10 +1046,12 @@ function TerminalArea({
         description: presentation.subtitle,
         detail: presentation.detail,
         spinner: !presentation.isError,
+        retryLabel: canRetryStartupSettings ? 'RETRY SETTINGS' : undefined,
+        onRetry: canRetryStartupSettings ? handleRetryStartupDefaults : undefined,
       };
     }
     return null;
-  }, [activeTabIdForOverlay, activeTabInterruptedEngine, activeTabSessionId, agentStopping, sessionStarting, showAgentStoppingOverlay, showInterruptedOverlay, showSessionStartingOverlay]);
+  }, [activeTabIdForOverlay, activeTabInterruptedEngine, activeTabSessionId, agentStopping, handleRetryStartupDefaults, sessionStarting, showAgentStoppingOverlay, showInterruptedOverlay, showSessionStartingOverlay]);
 
   useEffect(() => {
     onLifecycleStatusChange?.(lifecycleSummary);

@@ -20,3 +20,22 @@ export function planTimelineTranscriptRefresh({
     refresh,
   };
 }
+
+/**
+ * A primary History surface and its Timeline are siblings. During an owner
+ * switch Timeline may hydrate its cached rail only after History proves that
+ * the same tab/session/tool has reached a painted presentation boundary.
+ * Matching every identity field prevents a late event from the previous tab
+ * from releasing the next owner's heavier render.
+ */
+export function matchesHistorySurfacePresented({
+  detail,
+  tabId,
+  sessionId,
+  toolType,
+} = {}) {
+  if (!detail || typeof detail !== 'object') return false;
+  return detail.tabId === tabId
+    && (detail.sessionId || null) === (sessionId || null)
+    && detail.toolType === toolType;
+}

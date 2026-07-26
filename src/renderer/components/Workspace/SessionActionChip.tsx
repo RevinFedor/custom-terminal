@@ -115,14 +115,28 @@ export default function SessionActionChip({
         : hasAnySession
           ? `${idleLabel === 'Resume' ? 'Возобновить' : 'Продолжить'} сессию ${defaultLabel}`
           : `Запустить ${defaultLabel}`;
+  const intendedAction = disabled
+    ? 'disabled'
+    : mode === 'sdk'
+      ? (isCommandRunning ? 'stop' : 'focus')
+      : isCommandRunning
+        ? 'stop'
+        : hasAnySession
+          ? 'continue'
+          : 'start';
   return (
     <ControlHint label={helpLabel}>
     <span
+      data-session-action-chip
+      data-session-type={sessionType}
+      data-session-mode={mode}
+      data-session-action={intendedAction}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onClick={handleClick}
       className="text-xs font-medium cursor-pointer relative inline-flex items-center justify-center"
       aria-disabled={disabled}
+      aria-label={helpLabel}
       title={disabled ? disabledTitle : undefined}
       style={{
         color,

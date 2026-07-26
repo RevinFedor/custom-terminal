@@ -68,6 +68,15 @@ export const createHistoryViewportPaintProbe = ({
     const publishAfterPaint = () => {
       scheduledFrame = null;
       if (!stillOwnsProbe()) return;
+      // A row from the previous virtualized owner can survive for one frame
+      // while React swaps the list. It is not presentation proof for the new
+      // owner, and it may disappear before this post-paint callback. Require
+      // the caller's owner-specific predicate to remain true across the paint
+      // boundary before hiding the loader.
+      if (!hasMountedRow()) {
+        scheduledFrame = requestFrame(waitForMountedRow);
+        return;
+      }
       activeOwner = null;
       publishReady();
     };

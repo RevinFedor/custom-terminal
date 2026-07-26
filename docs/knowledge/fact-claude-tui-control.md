@@ -287,22 +287,36 @@ PTY chunk/renderer-текст теперь только будит провер�
 
 ### Startup defaults `/model` + `/effort` при запуске Claude
 
-В StatusBar справа — app-level defaults для будущей сессии. Для fresh Claude они заполняют стартовые Model/Effort; для Resume сначала читаются последние подтверждённые значения активной ветки возобновляемой сессии, а defaults заполняют только отсутствующие поля. Ошибка чтения существующей сессии означает `unknown`: startup не инжектит defaults поверх неизвестного состояния Claude.
+В StatusBar справа — app-level defaults для будущей сессии. Для fresh Claude
+они заполняют стартовые Model/Effort; старый `claudeSessionId`, оставшийся в
+SQLite строки переиспользованной вкладки, не превращает Start в Continue. Для
+Resume/Fork launch generation несёт явный session intent: сначала читаются
+последние подтверждённые значения активной ветки именно этой сессии, а defaults
+заполняют только отсутствующие поля. Ошибка чтения существующей сессии означает
+`unknown`: startup не инжектит defaults поверх неизвестного состояния Claude.
 
 ```
 Claude рисует prompt-символ ⏵ в PTY → main эмитит claude:tui-ready (~0.8с после старта)
-→ Terminal получает session settings из активной JSONL-ветки или defaults для fresh/пустых полей
-→ если model ≠ 'none': шлёт /model <value>, при необходимости подтверждает текущий picker
+→ main открывает/присоединяет одну транзакцию по launch generation
+→ main получает session settings из активной JSONL-ветки или SQLite defaults для fresh/пустых полей
+→ если model ≠ 'none': main шлёт /model <value>, при необходимости подтверждает текущий picker
 → ждёт прямую JSONL-пару wrapper → local-command stdout
 → затем так же применяет /effort <value>
-→ sentinels только гасят дубли между tui-ready, Bridge:Fresh и ручными кликами
+→ main публикует durable gate; renderer только отображает его
 ```
 
 `claude:tui-ready` эмитится из того же места `main.js`, где Handshake детектит prompt-символ (`stripVTControlCharacters(data).includes('⏵' | '>')` в state `WAITING_PROMPT`). Это момент когда Claude **готов принять ввод**, а не просто «процесс жив». Принцип «liveness ≠ readiness, бери ранний сигнал» — `methodology/переносимый-дизайн.md::Liveness ≠ readiness`.
 
+**Владелец транзакции — Electron main, не Terminal renderer.** И
+`tui-ready`, и `process-started` напрямую входят в один
+`claudeStartupMainRuntime`; первый сигнал регистрирует транзакцию до первого
+`await`, второй с тем же generation только join'ится. Renderer не содержит
+send/prove/retry-кода. Это принципиально: скрытие History/Terminal, remount или
+переключение вкладки не может потерять либо создать второго владельца.
+
 Start/resume и последовательное применение `/model`/`/effort` показываются той же компактной lifecycle-плашкой, что запуск Codex: без backdrop и без захвата focus у терминала. Видимое TUI-подтверждение остаётся доступным для ручного управления, но сама плашка держится до authoritative ready или явной ошибки — наличие меню под ней не завершает startup gate.
 
-**Bridge:Fresh (`claude:process-started`) — fallback готовности, не proof настройки.** Раньше инжект и завершение `/model` зависели от bridge, но свежий Claude TUI готов принять slash-команду раньше появления bridge-файла, а Effort bridge вообще не содержит. `handleProcessStarted` остаётся fallback, если `⏵` не распарсился, но применённость обоих settings доказывает только JSONL stdout своей команды.
+**Bridge:Fresh (`claude:process-started`) — второй readiness-input, не второй initiator и не proof настройки.** Раньше инжект и завершение `/model` зависели от bridge, но свежий Claude TUI готов принять slash-команду раньше появления bridge-файла, а Effort bridge вообще не содержит. Если `⏵` не распарсился, новый PID может открыть ту же main-транзакцию; если `tui-ready` уже открыл её, process-started только join'ится. Применённость обоих settings доказывает только JSONL stdout своей команды.
 
 **`/model` completion barrier — JSONL local-command stdout, не return из paste и не bridge-update.** Return из отправки доказывает только доставку Enter. Следующий `/effort` разрешён после прямого stdout-ребёнка wrapper'а `/model`; поэтому поздний `Switch model?` не проглатывает effort, а изменение модели через терминал и UI получает один и тот же proof.
 
@@ -310,7 +324,19 @@ Start/resume и последовательное применение `/model`/`
 
 После шрама 2026-06-21 boundary proof разделён на два слоя: main-side detector по-прежнему инжектит OSC 7777 marker в PTY для terminal/Timeline, но одновременно отправляет direct `claude:prompt-boundary` event в renderer. `waitForPromptBoundaryAfter` должен просыпаться от direct seq, а не зависеть только от того, что xterm parser успел зарегистрировать marker. См. `fix-boundary-bridge-race.md::Дополнение 2026-06-21`.
 
-Если barrier timed out, сначала проверяй текущий composer, а не просто закрывай status. Production-шрам: после перезапуска в input остался точный `/model haiku`; это значит paste/Enter path дошёл до composer, но не завершил apply. Контракт recovery узкий: если composer ровно равен ожидаемой slash-command (`/model <X>` или `/effort <Y>`), можно один раз отправить дополнительный `Enter` и снова ждать тот же authoritative barrier. Если после retry команда всё ещё ровно лежит в input, её можно exact-clear'ить и перевести startup defaults gate в failed. Lifecycle-плашка при failed не исчезает как при успехе, а остаётся неблокирующим error-state: пропажа статуса всё ещё означала бы ложную 100% готовность, но ошибка не должна закрывать терминал backdrop'ом или забирать focus.
+Proof имеет три исхода: `found`, `absent`, `unresolved`. Только доказанное
+`absent` разрешает **один** автоматический повтор. Доказательство здесь
+составное: владелец отправки явно знает, что ещё не писал `Enter`, а main через
+current-composer copy одновременно видит в поле ровно эту slash-команду.
+Повторяется только `Enter`, а не весь paste. Exact-команда без первого факта
+тоже не считается достаточной: это мог быть восстановленный пользовательский
+черновик с тем же текстом. Одного отсутствия строки в JSONL недостаточно; при
+неизвестном submit, пустом, изменившемся или нечитаемом composer результат
+`unresolved`, потому что настройка могла уже примениться. Автоматического
+повтора тогда нет, gate остаётся failed с точной командой и кнопкой Retry —
+пользователь сам решает, принимать ли риск повторного применения.
+Lifecycle-плашка не исчезает как при успехе, не закрывает терминал backdrop'ом
+и не забирает focus.
 
 Completion chain для Rewind из остановленной сессии:
 1. Timeline поднимает `claude --resume` той же session id.
@@ -321,11 +347,29 @@ Completion chain для Rewind из остановленной сессии:
 
 **Graveyard — Bridge:Fresh как единственный сигнал → двойной `/effort`.** Пока инжект висел только на `Bridge:Fresh`, юзер видел нарисованный prompt без эффекта (3-6с лага), решал что «эффект не выставился», кликал `/effort` руками в ControlBar → улетал **первый** `/effort`, потом запоздавший Bridge:Fresh догонял **вторым**. В JSONL/scrollback копилось два `/effort max` подряд. Детерминированно подтверждено счётчиками `[EffortDiag][HANDLER-ENTRY] callN` / `[INVOKE-FIRE] invokeN` — handler входил один раз, но первая команда уходила за 391мс **до** него (это был ручной клик). Чинится связкой ранний-сигнал + sentinel ниже.
 
-**Once-per-process sentinels `_modelSentForTab` и `_effortSentForTab` — только дедупликация.** Любой источник slash-setting (ранний `tui-ready`, fallback `Bridge:Fresh`, ручной клик ControlBar/mobile) первым делом ставит метку; остальные видят её и делают early-return. Отображаемое и восстанавливаемое значение из sentinel не читается. Сброс — НЕ на `process-started`: tui-ready fires раньше Bridge:Fresh, и если сбрасывать там — fallback пошлёт дубль.
+**Main launch-scoped claims — только дедупликация/ownership, не proof значения.**
+Подтверждённый startup-step и явный ручной выбор ControlBar/mobile записываются
+в main для текущего launch generation. Если пользователь выбрал effort, пока
+startup ещё доказывает model, следующий default-effort ждёт результат
+существующего JSONL-proof ручной команды. При успехе явный выбор выигрывает и
+default пропускается; при ошибке claim откатывается и startup применяет default
+сам. Поэтому gate не может стать ready на одном лишь факте отправки ручной
+команды. Renderer navigation/crash явно освобождает оставшиеся proof-waiters,
+чтобы main не завис навсегда. Отображаемое и восстанавливаемое значение
+по-прежнему берётся из подтверждённой JSONL-ветки. Renderer-карты
+`_modelSentForTab` / `_effortSentForTab` остались только зеркалом
+presentation/cross-client UI и не управляют startup.
+
+**PID hook-route ≠ Bridge readiness.** `safePasteAndSubmit` может заранее
+связать PID Claude с вкладкой, чтобы `UserPromptSubmit` hook не потерял первый
+prompt. Эта route-привязка не означает, что `claude:process-started` уже
+публиковался. Fresh-once состояние Bridge хранится отдельно: первая statusLine
+запись процесса всё равно join'ится к уже открытой startup-транзакции, а
+повторные записи того же процесса ничего не инициируют.
 
 **Сброс sentinel'а — на смерти Claude (`command-finished`), не только на смерти shell (`terminal:exit`).** Первая версия чистила `_effortSentForTab` **только** в `handleExit` (PTY exit = shell умер). Но `claude-c` (Continue/restart) **переиспользует тот же shell PTY** — shell не выходит, `terminal:exit` не fires, sentinel от **первого** запуска в жизни таба живёт вечно. Каждый последующий рестарт Claude: `tui-ready` fires → `_effortSentForTab.has(tabId)` → `true` → early-return → `/effort` **молча не отправляется**. Эффект: `/effort` инжектится ровно один раз за всю жизнь вкладки, при рестартах — никогда. Юзер: *«сессию я перезапускал, при перезапуске почему-то автоматически /effort не срабатывал, хотя он установлен системой»*.
 
-Прод-подтверждение (tab-283, `ea2ae02c`, 2026-06-03): на 4 рестартах подряд лог `[Terminal:EffortInject] … SKIP — already sent via tui-ready` (callN=2,3,4,5), и **ни одной** строки `[Terminal:TuiReady] … /effort max` после первой. Сигнал смерти Claude при живом shell — **OSC 133 D** (`terminal:command-finished`, тот же что гасит `claudeProcessAlive`). Фикс: `_effortSentForTab.delete(tabId)` в `Terminal.tsx::onFinished` (handler `terminal:command-finished`). `handleExit` сброс оставлен как belt-and-braces для настоящего shell-exit. Принцип: **once-per-process sentinel должен сбрасываться на смерти ТОГО процесса, к которому привязан (Claude), а не на смерти контейнера (shell)** — иначе reuse контейнера навсегда залипит метку.
+Прод-подтверждение (tab-283, `ea2ae02c`, 2026-06-03): на 4 рестартах подряд лог `[Terminal:EffortInject] … SKIP — already sent via tui-ready` (callN=2,3,4,5), и **ни одной** строки `[Terminal:TuiReady] … /effort max` после первой. Сигнал смерти Claude при живом shell — **OSC 133 D** (`terminal:command-finished`, тот же что гасит `claudeProcessAlive`). Теперь он очищает launch generation, main-транзакцию и main claims; renderer очищает лишь свои UI-зеркала. Принцип: **once-per-process состояние должно сбрасываться на смерти ТОГО процесса, к которому привязано (Claude), а не на смерти контейнера (shell)** — иначе reuse контейнера навсегда залипит метку.
 
 **Почему без setTimeout:** `safePasteAndSubmit` сам ждёт sync-marker `\x1b[?2026l` от Ink. Если инпут ещё не готов — ждёт **внутри** функции (event-driven). Возвращается за 8-30ms на happy path. Раньше был paranoid `setTimeout(800ms)` обёртка — это "timeout как safety net вместо причины", антипаттерн (см. `methodology/переносимый-дизайн.md::Воспринимаемая задержка UI-команд`).
 

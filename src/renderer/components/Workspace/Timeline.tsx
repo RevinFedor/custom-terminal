@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, ArrowUpToLine } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
@@ -26,6 +26,7 @@ import {
 } from '../../store/useTimelineOutlineStore';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { requireConfirmedCodexWriter } from '../../utils/codexWriterIdentity';
+import { requireCommittedCodexRewind } from '../../utils/codexRewindCommit';
 import {
   prepareCodexRewindRuntime,
   revalidatePreparedCodexRewindRuntime,
@@ -33,7 +34,11 @@ import {
 } from '../../utils/agentScenarios';
 import { getHistoryAgentRuntime, type AgentHistoryTool, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
 import type { HistoryDurableRevision } from '../../utils/historySnapshotCache';
-import { planTimelineTranscriptRefresh } from '../../utils/timelineTranscriptRefresh.mjs';
+import { shouldClearRewindPreviewForOwnerTransition } from '../../utils/historyRewindPreviewOwner';
+import {
+  matchesHistorySurfacePresented,
+  planTimelineTranscriptRefresh,
+} from '../../utils/timelineTranscriptRefresh.mjs';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
@@ -131,7 +136,12 @@ const DOCS_TIMELINE_COLORS = {
 
 // Portal for tooltip to escape overflow:hidden
 const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  return createPortal(children, document.body);
+  return createPortal(
+    <div data-timeline-portal style={{ display: 'contents' }}>
+      {children}
+    </div>,
+    document.body,
+  );
 };
 
 // Portal for status labels (Rewinding, Copying) to stay on top of all panels
@@ -144,6 +154,7 @@ const StatusLabelPortal: React.FC<{
 }> = ({ label, top, rightOffset, color }) => {
   return createPortal(
     <div
+      data-timeline-portal
       className="fixed pointer-events-none transition-all duration-300"
       style={{
         top,
@@ -651,6 +662,10 @@ function Timeline({
   const [loadingOwnerKey, setLoadingOwnerKey] = useState<string | null>(
     sessionId ? timelineOwnerKey : null
   );
+  const [historyPresentedOwnerKey, setHistoryPresentedOwnerKey] = useState('');
+  const [hydratedTimelineOwnerKey, setHydratedTimelineOwnerKey] = useState('');
+  const historyPresentationGateOpen = !historySurfaceVisible
+    || historyPresentedOwnerKey === timelineOwnerKey;
   const isLoading = loadingOwnerKey === timelineOwnerKey;
   const entriesCountRef = useRef(0);
   entriesCountRef.current = entries.length;
@@ -662,6 +677,8 @@ function Timeline({
   const timelineInstanceIdRef = useRef(Math.random().toString(36).slice(2, 8));
   const isVisibleRef = useRef(isVisible);
   isVisibleRef.current = isVisible;
+  const historyPresentationGateOpenRef = useRef(historyPresentationGateOpen);
+  historyPresentationGateOpenRef.current = historyPresentationGateOpen;
   const isTurnBusyRef = useRef(isTurnBusy);
   isTurnBusyRef.current = isTurnBusy;
   const deferredTranscriptRefreshRef = useRef(false);
@@ -1315,6 +1332,34 @@ function Timeline({
   const debugHoverBridges = useUIStore(state => state.debugHoverBridges);
   const freezeCmdPopups = useUIStore(state => state.freezeCmdPopups);
 
+  useLayoutEffect(() => {
+    if (!historySurfaceVisible) return;
+    const onHistorySurfacePresented = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (!matchesHistorySurfacePresented({
+        detail,
+        tabId,
+        sessionId,
+        toolType,
+      })) return;
+      setHistoryPresentedOwnerKey(timelineOwnerKey);
+      if (import.meta.env.DEV) {
+        console.warn(
+          '[Timeline:HistoryGate] released'
+          + ' tab=' + tabId.slice(-8)
+          + ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none')
+          + ' tool=' + toolType
+          + ' proof=' + String(detail?.proof || 'unknown')
+          + ' abs=' + perfAbsNow().toFixed(1)
+        );
+      }
+    };
+    window.addEventListener('history-panel:surface-presented', onHistorySurfacePresented);
+    return () => {
+      window.removeEventListener('history-panel:surface-presented', onHistorySurfacePresented);
+    };
+  }, [historySurfaceVisible, sessionId, tabId, timelineOwnerKey, toolType]);
+
   // All copy settings as a single object — spread into IPC invoke calls (range-copy, single-copy,
   // edit-range source fetch, rewind compact). Centralises forwarding so adding a future flag
   // doesn't require touching every callsite.
@@ -1345,11 +1390,12 @@ function Timeline({
       : 'closed';
   const setHistoryPanelOpen = useUIStore(state => state.setHistoryPanelOpen);
   const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
-  const rewindPreviewSessionKeyRef = useRef(tabId + ':' + sessionId);
+  const rewindPreviewOwnerRef = useRef({ tabId, sessionId });
   useEffect(() => {
-    const sessionKey = tabId + ':' + sessionId;
-    if (rewindPreviewSessionKeyRef.current !== sessionKey) {
-      rewindPreviewSessionKeyRef.current = sessionKey;
+    const previousOwner = rewindPreviewOwnerRef.current;
+    const currentOwner = { tabId, sessionId };
+    rewindPreviewOwnerRef.current = currentOwner;
+    if (shouldClearRewindPreviewForOwnerTransition(previousOwner, currentOwner)) {
       setHistoryRewindPreview(tabId, null);
     }
   }, [sessionId, setHistoryRewindPreview, tabId]);
@@ -2015,25 +2061,57 @@ function Timeline({
       promise: null,
       trailingReason: null,
     };
-    const cachedSnapshot = isCodex && sessionId
-      ? getTimelineSnapshotCache(timelineOwnerKey)
-      : null;
-    // A durable cached rail is painted immediately. Its revision is still
-    // validated asynchronously, so A → B → A never flashes an empty Timeline
-    // or rebuilds a 700 MB rollout merely to rediscover unchanged dots.
-    setLoadingOwnerKey(sessionId && !cachedSnapshot ? timelineOwnerKey : null);
+    // Clear the previous owner's rail synchronously, but do not hydrate a
+    // large cached rail inside this layout boundary. On the primary History
+    // surface that work waits for History's exact painted-owner proof; this
+    // keeps a 300-dot Timeline from blocking the first History frame.
+    setLoadingOwnerKey(sessionId ? timelineOwnerKey : null);
+    setHydratedTimelineOwnerKey('');
     setEntriesSnapshot({
       ownerKey: timelineOwnerKey,
-      entries: cachedSnapshot?.entries || [],
+      entries: [],
     });
     setSessionBoundaries([]);
     setForkMarkers([]);
-    setCodexSessionMeta(cachedSnapshot?.sessionMeta || null);
+    setCodexSessionMeta(null);
     setClaudeMemoryBoundaryUuid(null);
     setNotes({});
     setNotePositions({});
     setRewindMarkers(new Set());
-  }, [timelineOwnerKey, sessionId, isCodex]);
+  }, [timelineOwnerKey, sessionId]);
+
+  // Hydrate a cached rail only after the primary History owner has survived a
+  // paint boundary. The transition keeps this secondary surface interruptible;
+  // the exact cached revision is still validated by the normal load effect
+  // after hydration commits.
+  useEffect(() => {
+    if (!historyPresentationGateOpen) return;
+    const ownerKeyAtHydration = timelineOwnerKey;
+    const cachedSnapshot = isCodex && sessionId
+      ? getTimelineSnapshotCache(ownerKeyAtHydration)
+      : null;
+    const commitHydration = () => {
+      if (timelineOwnerKeyRef.current !== ownerKeyAtHydration) return;
+      if (cachedSnapshot) {
+        setEntriesSnapshot({
+          ownerKey: ownerKeyAtHydration,
+          entries: cachedSnapshot.entries,
+        });
+        setCodexSessionMeta(cachedSnapshot.sessionMeta || null);
+      }
+      setHydratedTimelineOwnerKey(ownerKeyAtHydration);
+    };
+    if (cachedSnapshot) {
+      startTransition(commitHydration);
+    } else {
+      commitHydration();
+    }
+  }, [
+    historyPresentationGateOpen,
+    isCodex,
+    sessionId,
+    timelineOwnerKey,
+  ]);
 
   // Load timeline and fork markers when sessionId changes
   const runTimelineLoad = useCallback(async (reason = 'unknown') => {
@@ -2122,11 +2200,20 @@ function Timeline({
         });
         if (!ownsLoad()) return;
         if (timelineResult.success && timelineResult.unchanged === true && cachedSnapshot) {
-          setEntriesSnapshot({
-            ownerKey: ownerKeyAtStart,
-            entries: cachedSnapshot.entries,
-          });
-          setCodexSessionMeta(cachedSnapshot.sessionMeta || null);
+          setEntriesSnapshot((current) => (
+            current.ownerKey === ownerKeyAtStart
+            && current.entries === cachedSnapshot.entries
+              ? current
+              : {
+                  ownerKey: ownerKeyAtStart,
+                  entries: cachedSnapshot.entries,
+                }
+          ));
+          setCodexSessionMeta((current) => (
+            current === (cachedSnapshot.sessionMeta || null)
+              ? current
+              : cachedSnapshot.sessionMeta || null
+          ));
         } else if (timelineResult.success) {
           const nextEntries = timelineResult.entries || [];
           const nextSessionMeta = timelineResult.sessionMeta || null;
@@ -2323,7 +2410,7 @@ function Timeline({
       pending: deferredTranscriptRefreshRef.current,
       isTurnBusy,
       documentVisible: document.visibilityState === 'visible',
-      surfaceVisible: isVisible,
+      surfaceVisible: isVisible && historyPresentationGateOpen,
     });
     deferredTranscriptRefreshRef.current = plan.pending;
     if (!plan.refresh) return;
@@ -2341,32 +2428,48 @@ function Timeline({
       ' abs=' + perfAbsNow().toFixed(1)
     );
     void loadTimeline(refreshReason);
-  }, [isTurnBusy, isVisible, loadTimeline, sessionId, tabId]);
+  }, [
+    historyPresentationGateOpen,
+    isTurnBusy,
+    isVisible,
+    loadTimeline,
+    sessionId,
+    tabId,
+  ]);
 
   // effect: loadTimeline callback identity changes (sessionId/cwd/tabId/isGemini) → trigger initial timeline load
   useEffect(() => {
+    if (
+      !historyPresentationGateOpen
+      || hydratedTimelineOwnerKey !== timelineOwnerKey
+    ) return;
     loadTimeline('effect');
-  }, [loadTimeline]);
+  }, [
+    historyPresentationGateOpen,
+    hydratedTimelineOwnerKey,
+    loadTimeline,
+    timelineOwnerKey,
+  ]);
 
   useEffect(() => {
-    if (!summaryToolType || !sessionId) return;
+    if (!historyPresentationGateOpen || !summaryToolType || !sessionId) return;
     void loadPromptSummaries(summaryToolType, sessionId);
-  }, [summaryToolType, sessionId, loadPromptSummaries]);
+  }, [historyPresentationGateOpen, summaryToolType, sessionId, loadPromptSummaries]);
 
   useEffect(() => {
-    if (!summaryToolType || !sessionId) return;
+    if (!historyPresentationGateOpen || !summaryToolType || !sessionId) return;
     void loadTimelineOutline(summaryToolType, sessionId);
-  }, [summaryToolType, sessionId, loadTimelineOutline]);
+  }, [historyPresentationGateOpen, summaryToolType, sessionId, loadTimelineOutline]);
 
   useEffect(() => {
-    if (!summaryToolType || !sessionId) return;
+    if (!historyPresentationGateOpen || !summaryToolType || !sessionId) return;
     void loadTimelineActionOverrides(summaryToolType, sessionId);
-  }, [summaryToolType, sessionId, loadTimelineActionOverrides]);
+  }, [historyPresentationGateOpen, summaryToolType, sessionId, loadTimelineActionOverrides]);
 
   useEffect(() => {
-    if (!summaryToolType || !sessionId) return;
+    if (!historyPresentationGateOpen || !summaryToolType || !sessionId) return;
     syncTimelineOutlineUuids(summaryToolType, sessionId, outlineEligibleUuids);
-  }, [summaryToolType, sessionId, outlineEligibleUuids, syncTimelineOutlineUuids]);
+  }, [historyPresentationGateOpen, summaryToolType, sessionId, outlineEligibleUuids, syncTimelineOutlineUuids]);
 
   useEffect(() => {
     if (!outlineSessionKey) {
@@ -2898,7 +3001,8 @@ function Timeline({
       if (detail?.sessionId !== sessionId) return;
       if (detail?.toolType && detail.toolType !== toolType) return;
       const busy = isTurnBusyRef.current;
-      const surfaceVisible = isVisibleRef.current;
+      const surfaceVisible = isVisibleRef.current
+        && historyPresentationGateOpenRef.current;
       const documentVisible = document.visibilityState === 'visible';
       const plan = planTimelineTranscriptRefresh({
         pending: deferredTranscriptRefreshRef.current,
@@ -2971,7 +3075,8 @@ function Timeline({
           invalidation: true,
           isTurnBusy: isTurnBusyRef.current,
           documentVisible: true,
-          surfaceVisible: isVisibleRef.current,
+          surfaceVisible: isVisibleRef.current
+            && historyPresentationGateOpenRef.current,
         });
         deferredTranscriptRefreshRef.current = plan.pending;
         if (plan.refresh) {
@@ -4284,6 +4389,7 @@ function Timeline({
         historyDraftText?: string;
         historyDraftImages?: HistoryPromptDraftImageRef[];
         historyDraftWarning?: string;
+        writerGeneration?: string;
       } = {}
     ) => {
       if (status === 'done') {
@@ -4293,7 +4399,12 @@ function Timeline({
         const durable = options.persisted === true || (!isCodex && (mode === 'ai' || isGemini));
         if (durable) {
           setHistoryRewindPreview(tabId, null);
-        } else if (mode === 'native' && toolType === 'claude' && options.historyInputDraft === true && targetDraft) {
+        } else if (
+          mode === 'native'
+          && (toolType === 'claude' || toolType === 'codex')
+          && options.historyInputDraft === true
+          && targetDraft
+        ) {
           setHistoryPromptDraft(
             tabId,
             targetDraft,
@@ -4307,6 +4418,7 @@ function Timeline({
             targetText: targetDraft,
             startedAt: Date.now(),
             sessionId,
+            writerGeneration: options.writerGeneration,
           });
         }
       }
@@ -4325,6 +4437,7 @@ function Timeline({
           historyDraftText: options.historyDraftText,
           historyDraftImages: options.historyDraftImages,
           historyDraftWarning: options.historyDraftWarning,
+          writerGeneration: options.writerGeneration,
           error,
           message,
         }
@@ -4624,6 +4737,7 @@ function Timeline({
     if (!isThisRewindActive()) return;
     if (!setThisRewindPhase('rewinding', 'Rewinding terminal history')) return;
 
+    let codexWriterChanged = false;
     try {
       if (isCodex) {
         preparedCodex = await revalidatePreparedCodexRewindRuntime({
@@ -4674,28 +4788,21 @@ function Timeline({
       if (!setThisRewindPhase('committing', 'Rewind applied; saving the resulting session')) return;
       let completedSessionId: string | null | undefined;
       if (isCodex) {
-        const sourceSessionId = String(rewindResult.sourceSessionId || '');
-        const activeSessionId = String(rewindResult.activeSessionId || '');
-        if (rewindResult.bindingCommitted !== true
-          || rewindResult.handoffStatus !== 'adopted-child'
-          || !sourceSessionId
-          || !activeSessionId) {
-          throw new Error('Codex Rewind применился, но новая ветка сессии не подтверждена');
-        }
         const currentSessionId = useWorkspaceStore.getState().getCodexSessionId(tabId);
-        if (currentSessionId !== sourceSessionId && currentSessionId !== activeSessionId) {
-          throw new Error('Результат Codex Rewind устарел: вкладка уже перешла на другую ветку');
-        }
-        const adopted = await useWorkspaceStore.getState().setCodexSessionId(
-          tabId,
-          activeSessionId,
-          'detected',
-        );
-        if (!adopted) {
-          throw new Error('Новая ветка Codex сохранена, но вкладка не смогла на неё переключиться');
+        const committed = requireCommittedCodexRewind(rewindResult, currentSessionId);
+        codexWriterChanged = committed.writerChanged;
+        if (committed.writerChanged) {
+          const adopted = await useWorkspaceStore.getState().setCodexSessionId(
+            tabId,
+            committed.activeSessionId,
+            'detected',
+          );
+          if (!adopted) {
+            throw new Error('Новая ветка Codex сохранена, но вкладка не смогла на неё переключиться');
+          }
         }
         if (!isThisRewindActive()) return;
-        completedSessionId = activeSessionId;
+        completedSessionId = committed.activeSessionId;
       }
 
       if (!useRewindOperationStore.getState().complete(tabId, rewindOpId, completedSessionId)) return;
@@ -4751,12 +4858,15 @@ function Timeline({
         mode === 'ai' ? 'Gemini Rewind: text inserted and submitted.' : undefined,
         {
           persisted: isCodex
-            ? rewindResult.bindingCommitted === true
+            ? codexWriterChanged
             : mode === 'ai' || isGemini,
           historyInputDraft: mode === 'native' && rewindResult.historyInputDraft === true,
           historyDraftText: typeof rewindResult.historyDraftText === 'string' ? rewindResult.historyDraftText : undefined,
           historyDraftImages: Array.isArray(rewindResult.historyDraftImages) ? rewindResult.historyDraftImages : undefined,
           historyDraftWarning: typeof rewindResult.historyDraftWarning === 'string' ? rewindResult.historyDraftWarning : undefined,
+          writerGeneration: typeof rewindResult.handoffGeneration === 'string'
+            ? rewindResult.handoffGeneration
+            : undefined,
         }
       );
       setTimeout(() => clearThisRewindState(), 1200);
@@ -8680,4 +8790,8 @@ function Timeline({
   );
 }
 
-export default Timeline;
+// Parent owner handoff is deferred so History can own the urgent tab-switch
+// paint. Memoization is essential here: while the old owner is hidden by the
+// lightweight Workspace boundary, identical props must not make this
+// hundreds-of-rows component render just to disappear one frame later.
+export default React.memo(Timeline);

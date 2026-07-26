@@ -12,6 +12,7 @@ import { readFileSync, readdirSync, statSync } from 'fs';
 import { basename, join, resolve } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
+import { buildStartAiRequest } from './terminal-start-ai-request.mjs';
 
 const PORT_DIR = join(homedir(), '.noted-terminal');
 const TOKEN_PATH = join(PORT_DIR, 'web-token.txt');
@@ -1494,17 +1495,7 @@ async function callTool(name, args) {
 
     case 'start_ai': {
       const target = projectHint(args, args.tabId);
-      const body = {
-        tabId: args.tabId,
-        agent: args.agent,
-        sessionId: args.sessionId || undefined,
-        mode: args.mode || undefined,
-        cwd: args.cwd || target.cwd || undefined,
-        model: args.model || undefined,
-        effort: args.effort || undefined,
-        parentProjectId: target.projectId || undefined,
-        sourceMeta: buildSourceMeta(),
-      };
+      const body = buildStartAiRequest(args, target, buildSourceMeta());
       const result = target.port
         ? await httpPostOnPort(target.port, '/terminal/ai-start', body)
         : await httpPost('/terminal/ai-start', body, target.cwd);

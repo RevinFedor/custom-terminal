@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS,
   HistorySnapshotCache,
   HistoryVolatileOverlayCache,
   estimateHistoryEntriesBytesFast,
@@ -40,6 +41,14 @@ test('owner key distinguishes tab, tool, session and cwd without delimiter colli
   ]);
 
   assert.equal(keys.size, 7);
+});
+
+test('default oversized pool protects three production-sized terminal owners', () => {
+  assert.equal(DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS.maxOversizedSnapshots, 3);
+  assert.equal(
+    DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS.maxOversizedBytes,
+    240 * 1024 * 1024,
+  );
 });
 
 test('get promotes a snapshot so LRU eviction removes the untouched owner', () => {
@@ -135,27 +144,31 @@ test('oversized LRU retains the latest two large owners without copying their en
   assert.equal(cache.get(thirdOwner)?.entries, thirdEntries);
 });
 
-test('A → B → A between two production-sized owners is an oversized cache hit', () => {
+test('A → B → C → A keeps all three production-sized owners as cache hits', () => {
   const cache = new HistorySnapshotCache({
     maxBytes: 64 * 1024,
     maxEntries: 100,
     maxSnapshots: 2,
-    maxOversizedBytes: 160 * 1024,
-    maxOversizedSnapshots: 2,
+    maxOversizedBytes: 240 * 1024,
+    maxOversizedSnapshots: 3,
   });
   const ownerA = owner('large-a');
   const ownerB = owner('large-b');
+  const ownerC = owner('large-c');
   const entriesA = [{ uuid: 'a', content: 'a'.repeat(33 * 1024) }];
   const entriesB = [{ uuid: 'b', content: 'b'.repeat(33 * 1024) }];
+  const entriesC = [{ uuid: 'c', content: 'c'.repeat(33 * 1024) }];
 
   assert.equal(cache.set(ownerA, { entries: entriesA }).stored, true);
   assert.equal(cache.set(ownerB, { entries: entriesB }).stored, true);
+  assert.equal(cache.set(ownerC, { entries: entriesC }).stored, true);
 
   assert.equal(cache.get(ownerA)?.entries, entriesA);
   assert.equal(cache.get(ownerB)?.entries, entriesB);
-  assert.equal(cache.stats().snapshots, 2);
-  assert.ok(cache.stats().approxBytes > 128 * 1024);
-  assert.ok(cache.stats().approxBytes <= 160 * 1024);
+  assert.equal(cache.get(ownerC)?.entries, entriesC);
+  assert.equal(cache.stats().snapshots, 3);
+  assert.ok(cache.stats().approxBytes > 192 * 1024);
+  assert.ok(cache.stats().approxBytes <= 240 * 1024);
 });
 
 test('oversized byte pool stays hard bounded and rejects one snapshot beyond it', () => {

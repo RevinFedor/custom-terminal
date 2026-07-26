@@ -2,6 +2,8 @@ import type { AgentHistoryTool, AgentPtyStatus, HistoryAgentRuntime } from './hi
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './claudeStartupDefaultsReady';
 import { terminalRegistry } from './terminalRegistry';
 import { useUIStore, type HistoryPromptDraftImageRef } from '../store/useUIStore';
+import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import { requireCommittedCodexRewind } from './codexRewindCommit';
 import { requireConfirmedCodexWriter } from './codexWriterIdentity';
 import { selectRewindOperation } from '../store/rewindOperationState';
 import { useRewindOperationStore } from '../store/useRewindOperationStore';
@@ -845,6 +847,7 @@ export async function rewindAgentTimelineScenario({
       historyDraftText?: string;
       historyDraftImages?: HistoryPromptDraftImageRef[];
       historyDraftWarning?: string;
+      writerGeneration?: string;
     } = {},
   ) => {
     window.dispatchEvent(new CustomEvent('history-panel:rewind-log', {
@@ -864,6 +867,7 @@ export async function rewindAgentTimelineScenario({
         historyDraftText: options.historyDraftText,
         historyDraftImages: options.historyDraftImages,
         historyDraftWarning: options.historyDraftWarning,
+        writerGeneration: options.writerGeneration,
       },
     }));
   };
@@ -1038,9 +1042,34 @@ export async function rewindAgentTimelineScenario({
       });
     }
 
-    const activeSessionId = typeof result.activeSessionId === 'string'
+    let codexWriterChanged = false;
+    let activeSessionId = typeof result.activeSessionId === 'string'
       ? result.activeSessionId
       : (preparedCodex?.writerSessionId || sessionId);
+    if (toolType === 'codex') {
+      const committed = requireCommittedCodexRewind(
+        result,
+        useWorkspaceStore.getState().getCodexSessionId(tabId),
+      );
+      codexWriterChanged = committed.writerChanged;
+      activeSessionId = committed.activeSessionId;
+      if (committed.writerChanged) {
+        const adopted = await useWorkspaceStore.getState().setCodexSessionId(
+          tabId,
+          committed.activeSessionId,
+          'detected',
+        );
+        if (!adopted) {
+          throw new Error('Новая ветка Codex сохранена, но вкладка не смогла на неё переключиться');
+        }
+      }
+      if (!getOwnedOperation()) {
+        return staleResult({
+          runtimeSessionId: preparedCodex?.writerSessionId,
+          runtimeSuccess: true,
+        });
+      }
+    }
     const completed = useRewindOperationStore.getState().complete(tabId, opId, activeSessionId);
     if (!completed) {
       return staleResult({
@@ -1053,34 +1082,47 @@ export async function rewindAgentTimelineScenario({
       ? result.historyDraftImages
       : [];
     const targetDraft = String(result.historyDraftText || targetFullText || targetText || '').trim();
-    if (rewindMode === 'native' && toolType === 'claude' && result.historyInputDraft === true && targetDraft) {
+    const historyProjectionPersisted = toolType === 'codex'
+      ? codexWriterChanged
+      : result.persisted === true || result.bindingCommitted === true;
+    if (
+      rewindMode === 'native'
+      && (toolType === 'claude' || toolType === 'codex')
+      && result.historyInputDraft === true
+      && targetDraft
+    ) {
       const store = useUIStore.getState();
       store.setHistoryPromptDraft(
         tabId,
         targetDraft,
         historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined,
       );
-      if (typeof startUuid === 'string' && startUuid.trim()) {
+      if (!historyProjectionPersisted && typeof startUuid === 'string' && startUuid.trim()) {
         store.setHistoryRewindPreview(tabId, {
           opId,
           targetUuid: startUuid,
           targetText: targetDraft,
           startedAt: Date.now(),
           sessionId,
+          writerGeneration: typeof result.handoffGeneration === 'string'
+            ? result.handoffGeneration
+            : undefined,
         });
       }
     }
 
     emitHistoryRewindLog('done', {
-      persisted: result.persisted === true
-        || result.bindingCommitted === true
-        || rewindMode === 'ai'
-        || toolType === 'codex',
+      persisted: toolType === 'codex'
+        ? codexWriterChanged
+        : historyProjectionPersisted || rewindMode === 'ai',
       historyInputDraft: result.historyInputDraft === true,
       historyDraftText: targetDraft || undefined,
       historyDraftImages: historyDraftImages.length > 0 ? historyDraftImages : undefined,
       historyDraftWarning: typeof result.historyDraftWarning === 'string'
         ? result.historyDraftWarning
+        : undefined,
+      writerGeneration: typeof result.handoffGeneration === 'string'
+        ? result.handoffGeneration
         : undefined,
     });
     setTimeout(() => {

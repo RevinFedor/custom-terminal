@@ -68,6 +68,7 @@ export interface HistoryRewindPreview {
   targetText: string;
   startedAt: number;
   sessionId?: string;
+  writerGeneration?: string;
 }
 
 export interface HistoryPromptDraftImageRef {

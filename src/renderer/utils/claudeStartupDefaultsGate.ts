@@ -47,6 +47,77 @@ function emitGateEvent(
   } catch {}
 }
 
+function emitLocalGateEvent(payload: {
+  tabId: string;
+  status: GateStatus;
+  reason?: string;
+  error?: string;
+  at?: number;
+  failedCommand?: string | null;
+  proofOutcome?: 'found' | 'absent' | 'unresolved' | null;
+  userRetryable?: boolean;
+}) {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent('claude-startup-defaults-gate', {
+    detail: {
+      ...payload,
+      at: Number(payload.at) || Date.now(),
+    },
+  }));
+}
+
+// Main is the source of truth for the startup transaction. This applies its
+// snapshot to the renderer-side waiter cache and emits the existing DOM event
+// for UI consumers, without echoing the state back over IPC.
+export function applyClaudeStartupDefaultsGateFromMain(payload: any) {
+  const tabId = String(payload?.tabId || '');
+  const status = String(payload?.status || '') as GateStatus;
+  if (!tabId || !['pending', 'ready', 'failed', 'cleared'].includes(status)) return;
+  const existing = getGate(tabId);
+  const waiters = existing?.waiters || new Set<(error?: Error) => void>();
+  const reason = String(payload?.reason || '');
+  const at = Number(payload?.at) || Date.now();
+
+  if (status === 'cleared') {
+    gates.delete(tabId);
+    if (existing?.status === 'pending') {
+      const error = new Error('Claude startup defaults gate cleared before ready');
+      for (const resolve of waiters) resolve(error);
+    }
+    emitLocalGateEvent({ tabId, status, reason, at });
+    return;
+  }
+
+  const detail: GateFailureDetail = {
+    failedCommand: payload?.failedCommand || null,
+    proofOutcome: payload?.proofOutcome || null,
+    userRetryable: payload?.userRetryable === true,
+  };
+  const message = payload?.error ? String(payload.error) : undefined;
+  gates.set(tabId, {
+    status,
+    at,
+    reason,
+    error: message,
+    detail,
+    waiters: status === 'pending' ? waiters : new Set(),
+  });
+  if (status === 'ready') {
+    for (const resolve of waiters) resolve();
+  } else if (status === 'failed') {
+    const error = new Error(message || reason || 'Claude startup defaults failed');
+    for (const resolve of waiters) resolve(error);
+  }
+  emitLocalGateEvent({
+    tabId,
+    status,
+    reason,
+    error: message,
+    at,
+    ...detail,
+  });
+}
+
 export function markClaudeStartupDefaultsPending(tabId: string, reason: string) {
   if (!tabId) return;
   const existing = getGate(tabId);
@@ -173,4 +244,20 @@ export async function waitForClaudeStartupDefaultsReady(tabId: string, timeoutMs
     const timer = setTimeout(() => finish(new Error('Claude startup defaults did not become ready in ' + timeoutMs + 'ms')), timeoutMs);
     existing.waiters.add(finish);
   });
+}
+
+if (typeof window !== 'undefined') {
+  try {
+    const ipcRenderer = (window as any).require?.('electron')?.ipcRenderer;
+    const listenerKey = '__claudeStartupDefaultsGateMainListener';
+    const previous = (window as any)[listenerKey];
+    if (previous) {
+      ipcRenderer?.removeListener?.('claude:startup-defaults-gate-state', previous);
+    }
+    const listener = (_event: unknown, payload: unknown) => {
+      applyClaudeStartupDefaultsGateFromMain(payload);
+    };
+    (window as any)[listenerKey] = listener;
+    ipcRenderer?.on?.('claude:startup-defaults-gate-state', listener);
+  } catch {}
 }

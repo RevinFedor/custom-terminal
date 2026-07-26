@@ -121,9 +121,111 @@ function resolveClaudeRuntimeAfterFailedStop({
   };
 }
 
+function selectAiProcessForStop(matches) {
+  if (!Array.isArray(matches)) return null;
+
+  const candidates = matches.filter((match) => {
+    const pid = Number(match?.pid);
+    const depth = Number(match?.depth);
+    const processName = String(match?.processName || '');
+    return Number.isInteger(pid)
+      && pid > 0
+      && Number.isInteger(depth)
+      && depth > 0
+      && (processName === 'claude' || processName === 'gemini' || processName === 'codex');
+  });
+
+  // Preserve the historical Stop contract: a direct AI child of the tab's
+  // shell wins, in ps/PID order. Codex alone supports a nested fallback
+  // because its install layouts may insert a node/vendor wrapper.
+  const direct = candidates
+    .filter((match) => Number(match.depth) === 1)
+    .sort((a, b) => Number(a.pid) - Number(b.pid))[0];
+  if (direct) return direct;
+
+  return candidates
+    .filter((match) => Number(match.depth) > 1 && match.processName === 'codex')
+    .sort((a, b) => Number(a.depth) - Number(b.depth) || Number(a.pid) - Number(b.pid))[0]
+    || null;
+}
+
+/**
+ * Build the exact process scope owned by one selected AI process.
+ *
+ * A Stop must not end at the Claude/Codex parent while leaving a tool command
+ * (for example `sleep`, a shell, or a language server) orphaned behind it.
+ * Process groups are used only when their leader is itself inside the proven
+ * descendant tree. Everything not covered by such a group remains an explicit
+ * PID target, so missing/odd PGID data degrades safely to the observed tree.
+ */
+function buildAiStopScope({
+  candidate,
+  children,
+  shellPid,
+} = {}) {
+  const rootPid = Number(candidate?.pid);
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return null;
+
+  const members = [{
+    pid: rootPid,
+    ppid: Number(candidate?.ppid) || null,
+    pgid: Number(candidate?.pgid) || null,
+    depth: 0,
+  }];
+  const seen = new Set([rootPid]);
+  const stack = [{ pid: rootPid, depth: 0 }];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const descendants = children instanceof Map
+      ? (children.get(current.pid) || children.get(String(current.pid)) || [])
+      : [];
+    for (const child of descendants) {
+      const pid = Number(child?.pid);
+      if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) continue;
+      seen.add(pid);
+      const member = {
+        pid,
+        ppid: Number(child?.ppid) || current.pid,
+        pgid: Number(child?.pgid) || null,
+        depth: current.depth + 1,
+      };
+      members.push(member);
+      stack.push({ pid, depth: member.depth });
+    }
+  }
+
+  // Deepest jobs first. A group is safe only when its leader is a proven
+  // member of this AI subtree; this prevents a malformed PGID from targeting
+  // the terminal shell or another tab's foreground job.
+  const normalizedShellPid = Number(shellPid);
+  const processGroups = members
+    .filter((member) => member.pgid === member.pid
+      && member.pgid > 1
+      && member.pgid !== normalizedShellPid)
+    .sort((a, b) => b.depth - a.depth || b.pid - a.pid)
+    .map((member) => member.pgid);
+  const groupSet = new Set(processGroups);
+  const signalPids = members
+    .filter((member) => !groupSet.has(member.pgid))
+    .sort((a, b) => b.depth - a.depth || b.pid - a.pid)
+    .map((member) => member.pid);
+
+  return {
+    rootPid,
+    processGroups,
+    signalPids,
+    trackedPids: members
+      .slice()
+      .sort((a, b) => b.depth - a.depth || b.pid - a.pid)
+      .map((member) => member.pid),
+  };
+}
+
 module.exports = {
   AI_PROCESS_LOOKUP_STATUS,
   AiProcessLookupError,
+  buildAiStopScope,
   decideCodexExitProbe,
   inspectProcessLookup,
   inspectProcessLookupCached,
@@ -131,5 +233,6 @@ module.exports = {
   requireKnownProcessLookup,
   resolveClaudeRuntimeAfterFailedStop,
   resolveProcessPresence,
+  selectAiProcessForStop,
   unknownProcessLookup,
 };

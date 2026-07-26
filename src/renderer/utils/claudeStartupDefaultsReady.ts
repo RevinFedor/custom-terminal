@@ -1,5 +1,5 @@
 import {
-  markClaudeStartupDefaultsReady,
+  fetchClaudeStartupDefaultsGate,
   waitForClaudeStartupDefaultsReady,
 } from './claudeStartupDefaultsGate';
 import { terminalRegistry } from './terminalRegistry';
@@ -68,9 +68,15 @@ export async function waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId
     await waitForClaudeStartupDefaultsReady(tabId, timeoutMs);
     return;
   } catch (e) {
-    if (isPromptBoundaryStartupError(e) && await isClaudeStartupPromptReadyByVisiblePrompt(tabId, label + ':wait-fallback')) {
-      markClaudeStartupDefaultsReady(tabId, 'visible-prompt-fallback');
-      return;
+    if (isPromptBoundaryStartupError(e)) {
+      // A main-owned gate is authoritative even when the renderer sees a
+      // prompt. Visible text cannot turn a failed/unknown settings proof into
+      // success. The fallback exists only for a legacy process that published
+      // no gate at all.
+      const gate = await fetchClaudeStartupDefaultsGate(tabId);
+      if (!gate && await isClaudeStartupPromptReadyByVisiblePrompt(tabId, label + ':wait-fallback')) {
+        return;
+      }
     }
     throw e;
   }

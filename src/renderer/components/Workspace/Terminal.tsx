@@ -99,14 +99,6 @@ import { log } from '../../utils/logger';
 import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import {
-  clearClaudeStartupDefaultsGate,
-  getClaudeStartupDefaultsGateSnapshot,
-  markClaudeStartupDefaultsFailed,
-  markClaudeStartupDefaultsPending,
-  markClaudeStartupDefaultsReady,
-} from '../../utils/claudeStartupDefaultsGate';
-import { isClaudeStartupPromptReadyByVisiblePrompt } from '../../utils/claudeStartupDefaultsReady';
-import {
   isCodexSettingsPickerVisible,
   parseCodexModelChangeAcknowledgement,
   planCodexPickerStateApplication,
@@ -196,24 +188,18 @@ const _effortDiagSeen = new Map<string, Set<string>>(); // tabId → set of mark
 const _effortHandlerCalls = new Map<string, number>(); // [EffortDiag2026-05] handler invocation counter per tab — distinguishes "handler fired twice" from "handler fired once, log delayed"
 const _effortInjectCalls = new Map<string, number>(); // [EffortDiag2026-05] invoke-fire counter — must equal handler-call counter; if not, second sender exists
 
-// Once-per-Claude-process sentinel: any path that sends /effort (tui-ready early
-// path, Bridge:Fresh fallback path, manual ControlBar click) sets this. Other
-// paths see it set and short-circuit. Cleared when the Claude process exits so
-// the next fresh spawn starts clean. Exposed on window for ControlBar access.
-// `level` is diagnostic/dedupe metadata only. The source of truth for the
-// current conversation is the confirmed wrapper→stdout pair on its active
-// JSONL branch; manual terminal commands never touch this map.
+// Renderer-side mirror of explicit /effort choices, exposed for ControlBar and
+// mobile presentation. It is not the startup owner: main keeps its own
+// launch-scoped claims and the confirmed wrapper→stdout pair on the active
+// JSONL branch remains the source of truth.
 const _effortSentForTab = new Map<string, { at: number; via: string; level: string }>();
 (window as any).__effortSentForTab = _effortSentForTab;
 
-// Same once-per-Claude-process guard for startup /model. It prevents the
-// Bridge:Fresh fallback from replaying the StatusBar default after tui-ready or
-// a manual ControlBar click already selected a model in this live process.
+// Same presentation mirror for explicit /model choices.
 const _modelSentForTab = new Map<string, { at: number; via: string; model: string }>();
 (window as any).__modelSentForTab = _modelSentForTab;
 
 const _claudeBridgeModelByTab = new Map<string, { model: string; at: number }>();
-const _claudeVisibleSettingsDialogConfirmCooldown = new Map<string, number>();
 
 function _bridgeModelMatchesTarget(targetModel: string, bridgeModel: string | null | undefined): boolean {
   const target = String(targetModel || '').trim().toLowerCase();
@@ -227,62 +213,6 @@ function _bridgeModelMatchesTarget(targetModel: string, bridgeModel: string | nu
   const needles = [target, option?.label?.toLowerCase()]
     .filter((v): v is string => !!v && v !== 'default');
   return needles.some((needle) => live.includes(needle));
-}
-
-function detectClaudeSettingsDialogFromVisibleText(text: string): 'ModelDialog' | 'EffortDialog' | null {
-  const normalized = String(text || '').replace(/\u00a0/g, ' ');
-  if (!normalized.trim()) return null;
-  const compact = normalized.replace(/\s+/g, '');
-  if (/Changeeffortlevel\?/i.test(compact)) return 'EffortDialog';
-  if (/Switchmodel\?/i.test(compact)) return 'ModelDialog';
-  if (/(?:❯|>)1\.Yes,?switchto/i.test(compact)) return 'ModelDialog';
-  return null;
-}
-
-function confirmClaudeSettingsDialogFromVisibleText(tabId: string, label: string): boolean {
-  const text = terminalRegistry.getVisibleText(tabId);
-  const dialogType = detectClaudeSettingsDialogFromVisibleText(text);
-  if (!dialogType) return false;
-
-  const now = Date.now();
-  const key = tabId + ':' + dialogType;
-  const last = _claudeVisibleSettingsDialogConfirmCooldown.get(key) || 0;
-  if (now - last < 150) return true;
-
-  _claudeVisibleSettingsDialogConfirmCooldown.set(key, now);
-  const preview = text.replace(/\s+/g, ' ').trim().slice(-180);
-  console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
-    + ' visible ' + dialogType
-    + ' requesting current-frame confirm label=' + label
-    + ' preview=' + preview);
-  // Renderer visibility is only a wake-up hint. Main re-reads the headless
-  // current frame and verifies the PTY/input generation before Enter.
-  void ipcRenderer.invoke('claude:confirm-settings-dialog', {
-    tabId,
-    kind: dialogType === 'ModelDialog' ? 'model' : 'effort',
-    reason: 'startup-defaults:' + label,
-  }).catch((error: any) => {
-    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
-      + ' confirm request failed label=' + label
-      + ' error=' + (error?.message || String(error)));
-  });
-  return true;
-}
-
-async function withClaudeVisibleSettingsDialogAutoConfirm<T>(
-  tabId: string,
-  label: string,
-  work: () => Promise<T>,
-): Promise<T> {
-  confirmClaudeSettingsDialogFromVisibleText(tabId, label + ':initial');
-  const timer = window.setInterval(() => {
-    confirmClaudeSettingsDialogFromVisibleText(tabId, label + ':poll');
-  }, 250);
-  try {
-    return await work();
-  } finally {
-    window.clearInterval(timer);
-  }
 }
 
 function _effortDiag(tabId: string, label: string, extra?: string) {
@@ -408,81 +338,6 @@ const getSetTerminalSelection = () => useUIStore.getState().setTerminalSelection
 // Get Claude session setter/getter outside of component
 const getSetClaudeSessionId = () => useWorkspaceStore.getState().setClaudeSessionId;
 const getClaudeSessionId = (tabId: string) => useWorkspaceStore.getState().getClaudeSessionId(tabId);
-
-type ClaudeStartupSettings = {
-  model: string;
-  effort: string;
-  sessionId: string | null;
-  source: 'session-history' | 'app-defaults' | 'session-settings-unknown';
-};
-
-async function resolveClaudeStartupSettings(
-  tabId: string,
-  sessionIdHint?: string | null,
-): Promise<ClaudeStartupSettings> {
-  const defaults = {
-    model: useUIStore.getState().defaultClaudeModel,
-    effort: useUIStore.getState().defaultClaudeEffort,
-  };
-  let sessionId = String(sessionIdHint || getClaudeSessionId(tabId) || '').trim() || null;
-  let cwd: string | null = null;
-  for (const [, workspace] of useWorkspaceStore.getState().openProjects) {
-    const tab = workspace.tabs.get(tabId);
-    if (!tab) continue;
-    sessionId = sessionId || tab.claudeSessionId || null;
-    cwd = tab.cwd || null;
-    break;
-  }
-  if (!sessionId) {
-    return { ...defaults, sessionId: null, source: 'app-defaults' };
-  }
-
-  try {
-    const result = await ipcRenderer.invoke('claude:get-confirmed-settings', {
-      tabId,
-      sessionId,
-      cwd,
-    });
-    if (result?.success === true && result.sessionId === sessionId) {
-      const hasSessionSetting = !!result.model || !!result.effort;
-      const resolved = {
-        model: result.model || defaults.model,
-        effort: result.effort || defaults.effort,
-        sessionId,
-        source: hasSessionSetting ? 'session-history' as const : 'app-defaults' as const,
-      };
-      console.warn(
-        '[Terminal:StartupSettings] tab=' + tabId.slice(-12)
-        + ' sid=' + sessionId.slice(0, 8)
-        + ' source=' + resolved.source
-        + ' model=' + (resolved.model || 'none')
-        + ' effort=' + (resolved.effort || 'none')
-      );
-      return resolved;
-    }
-    console.warn(
-      '[Terminal:StartupSettings] tab=' + tabId.slice(-12)
-      + ' sid=' + sessionId.slice(0, 8)
-      + ' fallback=claude-session-state reason=' + (result?.reason || 'unconfirmed-result')
-    );
-  } catch (error: any) {
-    console.warn(
-      '[Terminal:StartupSettings] tab=' + tabId.slice(-12)
-      + ' sid=' + sessionId.slice(0, 8)
-      + ' fallback=claude-session-state error=' + String(error?.message || error)
-    );
-  }
-  // A failed lookup is `unknown`, not proof that this resumed session has no
-  // settings. Injecting app defaults here could silently overwrite the model
-  // or effort Claude just restored from its own conversation. Skip injection
-  // and let the resumed CLI state stand until JSONL becomes readable again.
-  return {
-    model: 'none',
-    effort: 'none',
-    sessionId,
-    source: 'session-settings-unknown',
-  };
-}
 
 // Get Gemini session setter/getter outside of component
 const getSetGeminiSessionId = () => useWorkspaceStore.getState().setGeminiSessionId;
@@ -1027,415 +882,9 @@ const normalizeLocalImagePathTexts = (text: string): string[] => {
   return paths;
 };
 
-async function waitForClaudeStartupPromptBoundaryResult(tabId: string, afterSeq: number, label: string, timeoutMs = 3000) {
-  const seq = await terminalRegistry.waitForPromptBoundaryAfter(tabId, afterSeq, timeoutMs);
-  console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' ' + label + ' promptBoundary=' + (seq === null ? 'timeout' : seq));
-  return seq === null ? 'timeout' : 'prompt-boundary:' + seq;
-}
-
-async function waitForClaudeStartupPromptBoundary(tabId: string, afterSeq: number, label: string) {
-  const result = await waitForClaudeStartupPromptBoundaryResult(tabId, afterSeq, label);
-  if (result === 'timeout') {
-    if (await isClaudeStartupPromptReadyByVisiblePrompt(tabId, label + ':prompt-visible-fallback')) {
-      return 'visible-prompt-fallback';
-    }
-    throw new Error(label + ' did not return a prompt boundary');
-  }
-  return result;
-}
-
-async function waitForClaudeStartupPromptBoundaryWithRecovery(tabId: string, afterSeq: number, command: string, label: string) {
-  let result = await waitForClaudeStartupPromptBoundaryResult(tabId, afterSeq, label);
-  if (result === 'timeout') {
-    result = await retryStuckClaudeStartupSlashCommand(
-      tabId,
-      command,
-      label,
-      () => waitForClaudeStartupPromptBoundaryResult(tabId, afterSeq, label + ':retry', 3500)
-    );
-  }
-  if (result === 'timeout') {
-    if (await isClaudeStartupPromptReadyByVisiblePrompt(tabId, label + ':prompt-visible-fallback')) {
-      return 'visible-prompt-fallback';
-    }
-    throw new Error(label + ' did not return a prompt boundary');
-  }
-  return result;
-}
-
-const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
-
-type ClaudeStartupSlashProof = {
-  success?: boolean;
-  reason?: string;
-  timestamp?: string | null;
-  wrapperSeen?: boolean;
-  stdoutSeen?: boolean;
-  sessionId?: string | null;
-  file?: string;
-  error?: string;
-};
-
-async function waitForClaudeStartupSlashProofResult(
-  tabId: string,
-  command: string,
-  afterMs: number,
-  label: string,
-  timeoutMs = 6500,
-) {
-  const deadline = Date.now() + timeoutMs;
-  let last: ClaudeStartupSlashProof | null = null;
-  while (Date.now() <= deadline) {
-    const result = await ipcRenderer.invoke('claude:startup-slash-proof', {
-      tabId,
-      command,
-      afterMs,
-      label,
-    }).catch((e: any) => ({ success: false, reason: 'ipc-error', error: e?.message || String(e) }));
-    last = result || null;
-    if (result?.success === true) {
-      const proof = 'jsonl-stdout:' + (result.timestamp || 'no-ts');
-      console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12)
-        + ' ' + label
-        + ' slashProof=' + proof
-        + ' command=' + JSON.stringify(command)
-        + ' file=' + (result.file || '-'));
-      return { status: proof, last };
-    }
-    await sleep(180);
-  }
-  console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12)
-    + ' ' + label
-    + ' slashProof=timeout command=' + JSON.stringify(command)
-    + ' last=' + JSON.stringify(last || null));
-  return { status: 'timeout', last };
-}
-
-// Single-owner startup settings runner.
-//
-// Both readiness signals (`claude:tui-ready`, `claude:process-started`) call
-// this with the launch generation main stamped on the event. The FIRST call of
-// a generation opens the transaction; every later call joins the same promise.
-// Previously each signal decided independently, guarding on sentinels the
-// other set asynchronously — a TOCTOU window that in production split one
-// startup across two owners (`/model` from the bridge path, `/effort` from the
-// tui path) and then collided their pastes on one PTY.
-//
-// Ownership is decided by generation, not by which event arrived first, so an
-// event or proof belonging to an older launch can never close or fail the
-// current transaction.
-type StartupTxEntry = {
-  generation: string;
-  promise: Promise<void>;
-  joins: number;
-  openedBy: string;
-};
-const _claudeStartupTxByTab = new Map<string, StartupTxEntry>();
-
-function startupTxTrace(tabId: string, event: string, entry: StartupTxEntry | null, detail = '') {
-  console.warn('[StartupTx] ' + event
-    + ' tab=' + tabId.slice(-12)
-    + ' gen=' + (entry?.generation || '-')
-    + ' owner=' + (entry?.openedBy || '-')
-    + (detail ? ' ' + detail : ''));
-}
-
-async function runClaudeStartupSettingsTransaction(
-  tabId: string,
-  generation: string,
-  trigger: 'tui-ready' | 'process-started',
-  sessionIdHint?: string | null,
-): Promise<void> {
-  const existing = _claudeStartupTxByTab.get(tabId);
-  if (existing) {
-    if (existing.generation === generation) {
-      existing.joins += 1;
-      startupTxTrace(tabId, 'join', existing, 'trigger=' + trigger + ' joins=' + existing.joins);
-      await existing.promise.catch(() => {});
-      return;
-    }
-    startupTxTrace(tabId, 'superseded', existing, 'byGeneration=' + generation);
-  }
-
-  const entry: StartupTxEntry = {
-    generation,
-    joins: 0,
-    openedBy: trigger,
-    promise: Promise.resolve(),
-  };
-
-  const work = (async () => {
-    startupTxTrace(tabId, 'open', entry, 'trigger=' + trigger);
-    markClaudeStartupDefaultsPending(tabId, trigger);
-    const settings = await resolveClaudeStartupSettings(tabId, sessionIdHint || undefined);
-
-    const steps: Array<{ command: string; source: string; label: string; sentinel: 'model' | 'effort'; value: string }> = [];
-    // The sentinels are still consulted, but their role changed. They no longer
-    // arbitrate between two startup owners (the generation does that now) —
-    // they mark "this setting was already applied in this live process". The
-    // case that matters is a manual ControlBar click while the user waits for
-    // tui-ready: an explicit user choice must not be overwritten by the startup
-    // default a moment later.
-    const modelSentinel = _modelSentForTab.get(tabId);
-    const effortSentinel = _effortSentForTab.get(tabId);
-    if (settings.model && settings.model !== 'none' && !modelSentinel) {
-      steps.push({
-        command: '/model ' + settings.model,
-        source: 'startup-defaults:' + trigger + '-model',
-        label: 'startup-model',
-        sentinel: 'model',
-        value: settings.model,
-      });
-    } else if (modelSentinel) {
-      startupTxTrace(tabId, 'skip-model', entry, 'alreadyApplied=' + modelSentinel.via);
-    }
-    // Kill-switch: effort='none' disables only /effort — /model has its own
-    // independent StatusBar default.
-    if (settings.effort && settings.effort !== 'none' && !effortSentinel) {
-      steps.push({
-        command: '/effort ' + settings.effort,
-        source: 'startup-defaults:' + trigger + '-effort',
-        label: 'startup-effort',
-        sentinel: 'effort',
-        value: settings.effort,
-      });
-    } else if (effortSentinel) {
-      startupTxTrace(tabId, 'skip-effort', entry, 'alreadyApplied=' + effortSentinel.via);
-    }
-
-    if (steps.length === 0) {
-      startupTxTrace(tabId, 'ready', entry, 'steps=0');
-      markClaudeStartupDefaultsReady(tabId, trigger);
-      return;
-    }
-
-    let retryUsed = false;
-    for (const step of steps) {
-      // Generation guard after every await: a newer launch (manual relaunch,
-      // restart) must not have its settings written by this stale transaction.
-      if (_claudeStartupTxByTab.get(tabId)?.generation !== generation) {
-        startupTxTrace(tabId, 'abandoned', entry, 'command=' + step.command);
-        return;
-      }
-      // Claim the sentinel BEFORE the send, not after: a manual ControlBar
-      // click landing mid-transaction must see the setting as taken, and a
-      // failed step releases it below so the user's retry can proceed.
-      if (step.sentinel === 'model') {
-        _modelSentForTab.set(tabId, { at: Date.now(), via: trigger, model: step.value });
-      } else {
-        _effortSentForTab.set(tabId, { at: Date.now(), via: trigger, level: step.value });
-      }
-      const outcome = await runClaudeStartupStep(tabId, step, { allowRetry: !retryUsed });
-      if (outcome.retried) retryUsed = true;
-      if (outcome.status === 'found') continue;
-
-      // Release the claim so an explicit user retry is not skipped as
-      // "already applied".
-      if (step.sentinel === 'model') _modelSentForTab.delete(tabId);
-      else _effortSentForTab.delete(tabId);
-
-      const message = step.command + ' was not confirmed (' + outcome.status
-        + (outcome.reason ? '/' + outcome.reason : '') + ')';
-      startupTxTrace(tabId, 'failed', entry, 'command=' + step.command + ' outcome=' + outcome.status);
-      markClaudeStartupDefaultsFailed(tabId, trigger, new Error(message), {
-        failedCommand: step.command,
-        proofOutcome: outcome.status,
-        // Both `absent` (after its one automatic retry) and `unresolved` stay
-        // user-retryable; neither is retried automatically again.
-        userRetryable: true,
-      });
-      return;
-    }
-
-    startupTxTrace(tabId, 'ready', entry, 'steps=' + steps.length);
-    markClaudeStartupDefaultsReady(tabId, trigger);
-  })();
-
-  entry.promise = work.catch((error: unknown) => {
-    startupTxTrace(tabId, 'error', entry, String(error));
-    markClaudeStartupDefaultsFailed(tabId, trigger, error, { userRetryable: true });
-  }).finally(() => {
-    if (_claudeStartupTxByTab.get(tabId) === entry) _claudeStartupTxByTab.delete(tabId);
-  });
-
-  _claudeStartupTxByTab.set(tabId, entry);
-  await entry.promise;
-}
-
-// One command of the transaction: send, prove, and — only for a provably
-// absent command — retry exactly once. `unresolved` (unreadable transcript,
-// scan error) is never auto-retried: re-sending a command whose delivery is
-// unknown can apply the setting twice.
-async function runClaudeStartupStep(
-  tabId: string,
-  step: { command: string; source: string; label: string },
-  options: { allowRetry: boolean },
-): Promise<{ status: 'found' | 'absent' | 'unresolved'; reason?: string; retried?: boolean }> {
-  let retried = false;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    // Per-command epoch, captured immediately before THIS command's paste. The
-    // old code reused a timestamp taken before the previous command started, so
-    // both proof windows overlapped.
-    const afterMs = Date.now();
-    const send = await ipcRenderer.invoke('claude:send-command', tabId, step.command, {
-      source: step.source + (attempt > 1 ? ':retry' : ''),
-      stashFirst: true,
-      armPromptBoundaryOnSubmit: true,
-    }).catch((error: any) => ({ success: false, error: error?.message || String(error) }));
-
-    if (send?.success !== true) {
-      return { status: 'unresolved', reason: send?.error || 'send-failed', retried };
-    }
-
-    const proof = await withClaudeVisibleSettingsDialogAutoConfirm(
-      tabId,
-      step.label + (attempt > 1 ? ':retry' : ''),
-      () => waitForClaudeStartupSlashProofOutcome(tabId, step.command, afterMs, step.label),
-    );
-
-    if (proof.status === 'found') return { status: 'found', retried };
-
-    if (proof.status === 'absent' && options.allowRetry && attempt === 1) {
-      console.warn('[StartupRetry] decision=absent action=auto-retry'
-        + ' tab=' + tabId.slice(-12)
-        + ' command=' + JSON.stringify(step.command));
-      retried = true;
-      continue;
-    }
-
-    console.warn('[StartupRetry] decision=' + proof.status
-      + ' action=await-user'
-      + ' tab=' + tabId.slice(-12)
-      + ' command=' + JSON.stringify(step.command)
-      + ' reason=' + (proof.reason || '-'));
-    return { status: proof.status, reason: proof.reason, retried };
-  }
-  return { status: 'absent', reason: 'retry-exhausted', retried };
-}
-
-// Three-valued proof wrapper over the polling scanner. `found` needs no
-// explanation; `absent` means the transcript was read and the command is
-// provably not in it (the retryable case); `unresolved` means the prover could
-// not answer at all and must not be converted into a hard failure.
-async function waitForClaudeStartupSlashProofOutcome(
-  tabId: string,
-  command: string,
-  afterMs: number,
-  label: string,
-): Promise<{ status: 'found' | 'absent' | 'unresolved'; reason?: string }> {
-  const result = await waitForClaudeStartupSlashProofResult(tabId, command, afterMs, label);
-  if (result.status !== 'timeout') return { status: 'found' };
-  const last: any = result.last || {};
-  if (last.outcome === 'absent' || last.outcome === 'unresolved' || last.outcome === 'found') {
-    return { status: last.outcome, reason: last.reason };
-  }
-  // Legacy shapes: only a successfully-read transcript proves absence.
-  const reason = String(last.reason || 'timeout');
-  const provenAbsent = reason === 'stdout-not-found' || reason === 'stdout-unmatched' || reason === 'empty-file';
-  return { status: provenAbsent ? 'absent' : 'unresolved', reason };
-}
-
-async function waitForClaudeStartupSlashProofWithRecovery(tabId: string, command: string, afterMs: number, label: string) {
-  let result = await waitForClaudeStartupSlashProofResult(tabId, command, afterMs, label);
-  if (result.status === 'timeout') {
-    const retryResult = await retryStuckClaudeStartupSlashCommand(
-      tabId,
-      command,
-      label,
-      async () => (await waitForClaudeStartupSlashProofResult(tabId, command, afterMs, label + ':retry', 3500)).status
-    );
-    if (retryResult !== 'timeout') return retryResult;
-    result = await waitForClaudeStartupSlashProofResult(tabId, command, afterMs, label + ':final', 800);
-  }
-  if (result.status === 'timeout') {
-    const last = result.last || {};
-    throw new Error(command + ' did not produce local-command stdout proof; reason='
-      + (last.reason || 'timeout')
-      + ' wrapperSeen=' + !!last.wrapperSeen
-      + ' stdoutSeen=' + !!last.stdoutSeen
-      + ' file=' + (last.file || '-')
-      + ' error=' + (last.error || '-'));
-  }
-  return result.status;
-}
-
-// Removed: the late-bridge recovery path. It was a THIRD startup-settings
-// initiator that re-sent `/effort` on its own, keyed off a gate failure message
-// ("/model … did not confirm through bridge") that no code path emits anymore.
-// Startup settings now belong to one generation-keyed transaction; a failed
-// step releases its sentinel so an explicit user retry can re-run it, which is
-// what this recovery was approximating.
-
-const normalizeStartupSlashText = (text: unknown) => String(text || '').replace(/\u00a0/g, ' ').trim();
-
-async function copyClaudeStartupInput(tabId: string, label: string) {
-  try {
-    const result = await ipcRenderer.invoke('claude:copy-input', tabId);
-    const text = normalizeStartupSlashText(result?.text);
-    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' copy-input label=' + label +
-      ' success=' + (result?.success === true) +
-      ' chars=' + text.length +
-      ' text="' + text.slice(0, 80) + '"' +
-      ' error=' + (result?.error || '-'));
-    return { success: result?.success === true, text, error: result?.error || null };
-  } catch (e: any) {
-    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' copy-input label=' + label + ' threw ' + (e?.message || String(e)));
-    return { success: false, text: '', error: e?.message || String(e) };
-  }
-}
-
-async function clearClaudeStartupInputIfStill(tabId: string, command: string, label: string) {
-  try {
-    const clear = await ipcRenderer.invoke('claude:clear-exact-setting-input', {
-      tabId,
-      command,
-      reason: label,
-    });
-    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' clear stuck ' + label +
-      ' success=' + (clear?.success === true) +
-      ' cleared=' + (clear?.cleared === true) +
-      ' reason=' + (clear?.reason || '-') +
-      ' error=' + (clear?.error || '-'));
-    return clear?.cleared === true;
-  } catch (e: any) {
-    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' clear stuck ' + label + ' threw ' + (e?.message || String(e)));
-    return false;
-  }
-}
-
-async function retryStuckClaudeStartupSlashCommand(
-  tabId: string,
-  command: string,
-  label: string,
-  confirm: () => Promise<string>
-) {
-  const expected = normalizeStartupSlashText(command);
-  const current = await copyClaudeStartupInput(tabId, label + ':timeout');
-  if (current.success && current.text === expected) {
-    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' retry Enter for stuck ' + label + ' command="' + expected + '"');
-    const retry = await ipcRenderer.invoke('claude:retry-exact-setting-input', {
-      tabId,
-      command,
-      reason: label,
-    }).catch((error: any) => ({
-      success: false,
-      submitted: false,
-      error: error?.message || String(error),
-    }));
-    if (retry?.submitted === true) {
-      const retryConfirm = await confirm().catch(() => 'timeout');
-      console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' retry result ' + label + '=' + retryConfirm);
-      if (retryConfirm !== 'timeout') return retryConfirm;
-    } else {
-      console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
-        + ' retry skipped ' + label
-        + ' reason=' + (retry?.reason || retry?.error || 'unknown'));
-    }
-  }
-  await clearClaudeStartupInputIfStill(tabId, command, label);
-  return 'timeout';
-}
-
+// Claude startup settings are orchestrated entirely in Electron main. This
+// renderer intentionally has no send/prove/retry implementation: it only
+// observes the durable gate snapshot published by main.
 const terminalWarmQueue = new Map<string, () => void>();
 let terminalWarmScheduled: any = null;
 
@@ -2071,32 +1520,12 @@ function Terminal({
         console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' command-finished → alive=false');
         claudeProcessAliveRef.current = false;
         setClaudeProcessAlive(false);
-        // Clear the once-per-process /effort sentinel on claude DEATH too — not
-        // only on terminal:exit. `claude-c` restart reuses the SAME shell PTY,
-        // so the shell never exits and handleExit never fires; the sentinel set
-        // by the FIRST launch's tui-ready survives forever, and every restart's
-        // tui-ready then silently early-returns (`_effortSentForTab.has` → true)
-        // → /effort is injected only on the very first launch in the tab's life,
-        // never on restarts. Prod-confirmed: tab-283 (ea2ae02c) logged
-        // "SKIP — already sent via tui-ready" on callN=2..5 with NO TuiReady
-        // inject line. OSC 133 D (command-finished) is the deterministic
-        // "claude process died, shell alive" signal. See
-        // fact-claude-tui-control.md::Auto-inject /effort.
+        // These renderer maps mirror explicit user choices for ControlBar and
+        // mobile presentation only. Main clears its own launch-scoped startup
+        // claims from the same OSC 133 D lifecycle edge.
         _effortSentForTab.delete(tabId);
         _modelSentForTab.delete(tabId);
         _claudeBridgeModelByTab.delete(tabId);
-        const inflightTx = _claudeStartupTxByTab.get(tabId);
-        if (inflightTx) {
-          console.warn('[StartupTx] process-died tab=' + tabId.slice(-12)
-            + ' gen=' + inflightTx.generation
-            + ' owner=' + inflightTx.openedBy
-            + ' inflight=true');
-          // Drop the binding so the next launch's generation opens cleanly; the
-          // running promise itself resolves harmlessly (its generation guard
-          // makes every remaining step a no-op).
-          _claudeStartupTxByTab.delete(tabId);
-        }
-        clearClaudeStartupDefaultsGate(tabId);
         finalizeAiLaunchSnapshot(tabId);
       }
     };
@@ -2627,9 +2056,6 @@ function Terminal({
         _effortSentForTab.delete(tabId);
         _modelSentForTab.delete(tabId);
         _claudeBridgeModelByTab.delete(tabId);
-        _claudeVisibleSettingsDialogConfirmCooldown.delete(tabId + ':ModelDialog');
-        _claudeVisibleSettingsDialogConfirmCooldown.delete(tabId + ':EffortDialog');
-        clearClaudeStartupDefaultsGate(tabId);
       }
     };
 
@@ -2755,29 +2181,24 @@ function Terminal({
         if (!prev) console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' process-started → alive=true');
         return true;
       });
-      // Readiness input #2. Everything above (focus diagnostics, commandType
-      // promotion, alive assertion) is this handler's own business; the startup
-      // settings themselves belong to the generation-keyed transaction, which
-      // tui-ready may already have opened. No sentinel is consulted here — the
-      // TOCTOU window between these two events is exactly what split one
-      // startup across two owners in production.
-      const launchGeneration = data.launchGeneration
-        || ('process-started-' + (data.claudePid || Date.now()));
-      _effortDiag(tabId, '⚡ PROCESS-STARTED', 'pid=' + data.claudePid + ' gen=' + launchGeneration);
-      await runClaudeStartupSettingsTransaction(tabId, launchGeneration, 'process-started', data.sessionId);
+      // Main owns startup settings. Renderer keeps only the presentation-side
+      // liveness/focus work above and observes the resulting gate snapshot.
+      _effortDiag(
+        tabId,
+        '⚡ PROCESS-STARTED',
+        'pid=' + data.claudePid + ' gen=' + (data.launchGeneration || '-'),
+      );
     };
 
-    // Early "Claude TUI ready" signal — fires the moment Claude renders ⏵ in
-    // the PTY stream, 2-6 seconds BEFORE Bridge:Fresh in prod logs. Startup
-    // defaults are applied here in command order: /model first, then /effort.
-    // The sentinels make the later Bridge:Fresh path a no-op once this fires.
-    // Readiness input #1. Ownership of the startup settings belongs to the
-    // transaction keyed by launch generation, not to this handler: whichever
-    // signal arrives first opens it, the other joins the same promise.
-    const handleTuiReady = async (_: any, data: { tabId: string; ts: number; launchGeneration?: string }) => {
+    // Main already consumed this readiness signal and owns the settings
+    // transaction. Renderer keeps the listener only for diagnostics.
+    const handleTuiReady = (_: any, data: { tabId: string; ts: number; launchGeneration?: string }) => {
       if (data.tabId !== tabId) return;
-      const generation = data.launchGeneration || ('tui-ready-' + (Number(data.ts) || Date.now()));
-      await runClaudeStartupSettingsTransaction(tabId, generation, 'tui-ready');
+      _effortDiag(
+        tabId,
+        '⚡ TUI-READY',
+        'gen=' + (data.launchGeneration || '-') + ' ts=' + (Number(data.ts) || '-'),
+      );
     };
 
     // /status interception: update session ID if not yet captured (no toast)
@@ -2846,17 +2267,6 @@ function Terminal({
       terminalRegistry.registerPromptBoundary(tabId, seq);
       ipcRenderer.send('claude:prompt-boundary-ack', { tabId, seq });
     };
-
-    // Explicit user retry of the startup settings. It re-enters the same
-    // transaction under a fresh generation id, so the retry is still a single
-    // owner and cannot interleave with a still-running attempt.
-    const handleStartupDefaultsRetry = (event: Event) => {
-      const detail = (event as CustomEvent<{ tabId?: string }>).detail || {};
-      if (detail.tabId !== tabId) return;
-      const generation = 'user-retry-' + Date.now();
-      void runClaudeStartupSettingsTransaction(tabId, generation, 'tui-ready');
-    };
-    window.addEventListener('claude-startup-defaults-retry', handleStartupDefaultsRetry);
 
     // Register IPC listeners synchronously
     ipcRenderer.on('terminal:prompt-ready', handleShellPromptReady);
@@ -3460,7 +2870,6 @@ function Terminal({
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
       ipcRenderer.removeListener('claude:process-started', handleProcessStarted);
       ipcRenderer.removeListener('claude:tui-ready', handleTuiReady);
-      window.removeEventListener('claude-startup-defaults-retry', handleStartupDefaultsRetry);
       ipcRenderer.removeListener('claude:prompt-boundary', handleClaudePromptBoundary);
       ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
       ipcRenderer.removeListener('claude:bridge-update', handleBridgeUpdate);

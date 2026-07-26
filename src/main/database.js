@@ -1912,6 +1912,426 @@ class DatabaseManager {
     return transaction();
   }
 
+  settlePendingCodexStableSourceHandoff({
+    journalKey,
+    projectId,
+    tabId,
+    sourceSessionId,
+    actionGeneration,
+    settledAtMs,
+  } = {}) {
+    const normalizedSettledAtMs = Number(settledAtMs);
+    if (!journalKey
+      || !projectId
+      || !tabId
+      || !sourceSessionId
+      || !actionGeneration
+      || !Number.isFinite(normalizedSettledAtMs)
+      || normalizedSettledAtMs <= 0) {
+      return { success: false, error: 'codex_stable_source_settlement_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const inspection = this.inspectPendingCodexWriterHandoff(journalKey);
+      if (inspection.status === 'absent') {
+        return { success: false, error: 'codex_handoff_journal_missing', retryable: true };
+      }
+      if (inspection.status === 'invalid') {
+        return {
+          success: false,
+          error: inspection.error,
+          reason: inspection.reason,
+          retryable: false,
+        };
+      }
+      const journal = inspection.journal;
+      if (journal.version !== 2
+        || journal.projectId !== projectId
+        || journal.tabId !== tabId
+        || journal.sourceSessionId !== sourceSessionId
+        || journal.actionGeneration !== actionGeneration) {
+        return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
+      }
+      const rollbackProofValid = (
+        (journal.phase === 'rollback-applied'
+          || journal.phase === 'stable-source-settled')
+        && Number.isFinite(Number(journal.appliedAtMs))
+        && Number(journal.appliedAtMs) >= Number(journal.actionStartedAtMs)
+        && journal.restoredTextHash === journal.targetTextHash
+      );
+      if (!rollbackProofValid) {
+        return {
+          success: false,
+          error: 'codex_stable_source_rollback_proof_missing',
+          retryable: false,
+        };
+      }
+      const tabRow = this.db.prepare(
+        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      ).get(projectId, tabId);
+      if (!tabRow) {
+        return { success: false, error: 'codex_tab_row_missing', retryable: true };
+      }
+      if ((tabRow.codex_session_id || null) !== sourceSessionId) {
+        return {
+          success: false,
+          error: 'codex_handoff_binding_changed',
+          retryable: false,
+          currentSessionId: tabRow.codex_session_id || null,
+        };
+      }
+      if (journal.phase === 'stable-source-settled') {
+        return {
+          success: true,
+          updated: false,
+          currentSessionId: sourceSessionId,
+          journalRetained: true,
+          journal,
+        };
+      }
+      const nextJournal = {
+        ...journal,
+        phase: 'stable-source-settled',
+        stableSourceSettledAtMs: normalizedSettledAtMs,
+      };
+      const updated = this.db.prepare(`
+        UPDATE app_state
+        SET value = ?, updated_at = strftime('%s', 'now')
+        WHERE key = ? AND value = ?
+      `).run(JSON.stringify(nextJournal), journalKey, inspection.rawValue);
+      if (updated.changes !== 1) {
+        return {
+          success: false,
+          error: 'codex_stable_source_settlement_compare_and_set_failed',
+          retryable: true,
+        };
+      }
+      return {
+        success: true,
+        updated: true,
+        currentSessionId: sourceSessionId,
+        journalRetained: true,
+        journal: nextJournal,
+      };
+    });
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
+
+  armPendingCodexStableSourceSubmit({
+    journalKey,
+    projectId,
+    tabId,
+    sourceSessionId,
+    actionGeneration,
+    submitId,
+    expectedLen,
+    expectedHash,
+    sentAtMs,
+    sourceFilePath,
+    sourceFileSize,
+    runSeq,
+  } = {}) {
+    const normalizedExpectedLen = Number(expectedLen);
+    const normalizedSentAtMs = Number(sentAtMs);
+    const normalizedSourceFileSize = sourceFileSize === null
+      || sourceFileSize === undefined
+      ? null
+      : Number(sourceFileSize);
+    const normalizedRunSeq = Number(runSeq);
+    if (!journalKey
+      || !projectId
+      || !tabId
+      || !sourceSessionId
+      || !actionGeneration
+      || !submitId
+      || !Number.isSafeInteger(normalizedExpectedLen)
+      || normalizedExpectedLen < 0
+      || !/^[a-f0-9]{16}$/i.test(String(expectedHash || ''))
+      || !Number.isFinite(normalizedSentAtMs)
+      || normalizedSentAtMs <= 0
+      || !path.isAbsolute(String(sourceFilePath || ''))
+      || (normalizedSourceFileSize !== null
+        && (!Number.isSafeInteger(normalizedSourceFileSize) || normalizedSourceFileSize < 0))
+      || !Number.isInteger(normalizedRunSeq)
+      || normalizedRunSeq <= 0) {
+      return { success: false, error: 'codex_stable_source_submit_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const inspection = this.inspectPendingCodexWriterHandoff(journalKey);
+      if (inspection.status !== 'present') {
+        return {
+          success: false,
+          error: inspection.error || 'codex_handoff_journal_missing',
+          reason: inspection.reason || null,
+          retryable: inspection.status === 'absent',
+        };
+      }
+      const journal = inspection.journal;
+      if (journal.version !== 2
+        || journal.projectId !== projectId
+        || journal.tabId !== tabId
+        || journal.sourceSessionId !== sourceSessionId
+        || journal.actionGeneration !== actionGeneration) {
+        return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
+      }
+      if (journal.phase === 'stable-source-submit-armed'
+        || journal.phase === 'stable-source-submit-written') {
+        const existing = journal.submitProof || null;
+        const sameSubmit = existing?.submitId === submitId
+          && Number(existing.expectedLen) === normalizedExpectedLen
+          && existing.expectedHash === expectedHash
+          && Number(existing.sentAtMs) === normalizedSentAtMs;
+        return sameSubmit
+          ? {
+              success: true,
+              updated: false,
+              journal,
+              alreadyWritten: journal.phase === 'stable-source-submit-written',
+            }
+          : {
+              success: false,
+              error: 'codex_stable_source_submit_already_armed',
+              retryable: false,
+            };
+      }
+      if (journal.phase !== 'stable-source-settled'
+        || !Number.isFinite(Number(journal.stableSourceSettledAtMs))
+        || normalizedSentAtMs < Number(journal.stableSourceSettledAtMs)) {
+        return {
+          success: false,
+          error: 'codex_stable_source_settlement_missing',
+          retryable: false,
+        };
+      }
+      const tabRow = this.db.prepare(
+        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      ).get(projectId, tabId);
+      if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
+      if ((tabRow.codex_session_id || null) !== sourceSessionId) {
+        return {
+          success: false,
+          error: 'codex_handoff_binding_changed',
+          retryable: false,
+          currentSessionId: tabRow.codex_session_id || null,
+        };
+      }
+      const nextJournal = {
+        ...journal,
+        phase: 'stable-source-submit-armed',
+        submitProof: {
+          version: 1,
+          submitId,
+          sourceSessionId,
+          actionGeneration,
+          expectedLen: normalizedExpectedLen,
+          expectedHash: String(expectedHash),
+          sentAtMs: normalizedSentAtMs,
+          sourceFilePath: path.resolve(sourceFilePath),
+          sourceFileSize: normalizedSourceFileSize,
+          runSeq: normalizedRunSeq,
+        },
+      };
+      const updated = this.db.prepare(`
+        UPDATE app_state
+        SET value = ?, updated_at = strftime('%s', 'now')
+        WHERE key = ? AND value = ?
+      `).run(JSON.stringify(nextJournal), journalKey, inspection.rawValue);
+      return updated.changes === 1
+        ? { success: true, updated: true, journal: nextJournal, alreadyWritten: false }
+        : {
+            success: false,
+            error: 'codex_stable_source_submit_compare_and_set_failed',
+            retryable: true,
+          };
+    });
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
+
+  markPendingCodexStableSourceSubmitWritten({
+    journalKey,
+    projectId,
+    tabId,
+    sourceSessionId,
+    actionGeneration,
+    submitId,
+    submitWrittenAtMs,
+  } = {}) {
+    const normalizedWrittenAtMs = Number(submitWrittenAtMs);
+    if (!journalKey
+      || !projectId
+      || !tabId
+      || !sourceSessionId
+      || !actionGeneration
+      || !submitId
+      || !Number.isFinite(normalizedWrittenAtMs)
+      || normalizedWrittenAtMs <= 0) {
+      return { success: false, error: 'codex_stable_source_submit_write_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const inspection = this.inspectPendingCodexWriterHandoff(journalKey);
+      if (inspection.status !== 'present') {
+        return {
+          success: false,
+          error: inspection.error || 'codex_handoff_journal_missing',
+          reason: inspection.reason || null,
+          retryable: inspection.status === 'absent',
+        };
+      }
+      const journal = inspection.journal;
+      const submitProof = journal.submitProof || null;
+      if (journal.version !== 2
+        || journal.projectId !== projectId
+        || journal.tabId !== tabId
+        || journal.sourceSessionId !== sourceSessionId
+        || journal.actionGeneration !== actionGeneration
+        || submitProof?.submitId !== submitId
+        || submitProof?.sourceSessionId !== sourceSessionId
+        || submitProof?.actionGeneration !== actionGeneration) {
+        return { success: false, error: 'codex_stable_source_submit_stale', retryable: false };
+      }
+      if (journal.phase === 'stable-source-submit-written') {
+        return {
+          success: true,
+          updated: false,
+          journal,
+        };
+      }
+      if (journal.phase !== 'stable-source-submit-armed'
+        || normalizedWrittenAtMs < Number(submitProof.sentAtMs)) {
+        return {
+          success: false,
+          error: 'codex_stable_source_submit_not_armed',
+          retryable: false,
+        };
+      }
+      const tabRow = this.db.prepare(
+        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      ).get(projectId, tabId);
+      if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
+      if ((tabRow.codex_session_id || null) !== sourceSessionId) {
+        return {
+          success: false,
+          error: 'codex_handoff_binding_changed',
+          retryable: false,
+          currentSessionId: tabRow.codex_session_id || null,
+        };
+      }
+      const nextJournal = {
+        ...journal,
+        phase: 'stable-source-submit-written',
+        submitProof: {
+          ...submitProof,
+          submitWrittenAtMs: normalizedWrittenAtMs,
+        },
+      };
+      const updated = this.db.prepare(`
+        UPDATE app_state
+        SET value = ?, updated_at = strftime('%s', 'now')
+        WHERE key = ? AND value = ?
+      `).run(JSON.stringify(nextJournal), journalKey, inspection.rawValue);
+      return updated.changes === 1
+        ? { success: true, updated: true, journal: nextJournal }
+        : {
+            success: false,
+            error: 'codex_stable_source_submit_write_compare_and_set_failed',
+            retryable: true,
+          };
+    });
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
+
+  releasePendingCodexStableSourceSubmit({
+    journalKey,
+    projectId,
+    tabId,
+    sourceSessionId,
+    actionGeneration,
+    submitId,
+  } = {}) {
+    if (!journalKey
+      || !projectId
+      || !tabId
+      || !sourceSessionId
+      || !actionGeneration
+      || !submitId) {
+      return { success: false, error: 'codex_stable_source_submit_release_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const inspection = this.inspectPendingCodexWriterHandoff(journalKey);
+      if (inspection.status !== 'present') {
+        return {
+          success: false,
+          error: inspection.error || 'codex_handoff_journal_missing',
+          retryable: inspection.status === 'absent',
+        };
+      }
+      const journal = inspection.journal;
+      if (journal.projectId !== projectId
+        || journal.tabId !== tabId
+        || journal.sourceSessionId !== sourceSessionId
+        || journal.actionGeneration !== actionGeneration
+        || journal.submitProof?.submitId !== submitId) {
+        return { success: false, error: 'codex_stable_source_submit_stale', retryable: false };
+      }
+      if (journal.phase === 'stable-source-submit-written') {
+        return {
+          success: false,
+          error: 'codex_stable_source_submit_may_have_been_written',
+          retryable: false,
+        };
+      }
+      if (journal.phase !== 'stable-source-submit-armed') {
+        return { success: false, error: 'codex_stable_source_submit_not_armed', retryable: false };
+      }
+      const nextJournal = { ...journal, phase: 'stable-source-settled' };
+      delete nextJournal.submitProof;
+      const updated = this.db.prepare(`
+        UPDATE app_state
+        SET value = ?, updated_at = strftime('%s', 'now')
+        WHERE key = ? AND value = ?
+      `).run(JSON.stringify(nextJournal), journalKey, inspection.rawValue);
+      return updated.changes === 1
+        ? { success: true, updated: true, journal: nextJournal }
+        : {
+            success: false,
+            error: 'codex_stable_source_submit_release_compare_and_set_failed',
+            retryable: true,
+          };
+    });
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
+
   commitPendingCodexWriterHandoff({
     journalKey,
     projectId,
@@ -1922,6 +2342,13 @@ class DatabaseManager {
   } = {}) {
     if (!journalKey || !projectId || !tabId || !sourceSessionId || !nextSessionId || !actionGeneration) {
       return { success: false, error: 'codex_handoff_commit_invalid' };
+    }
+    if (sourceSessionId === nextSessionId) {
+      return {
+        success: false,
+        error: 'codex_handoff_stable_source_requires_settlement',
+        retryable: false,
+      };
     }
     const transaction = this.db.transaction(() => {
       const journalInspection = this.inspectPendingCodexWriterHandoff(journalKey);

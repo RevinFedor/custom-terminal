@@ -2,11 +2,33 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const {
+  AGENT_SHELL_TOOL_CLASSIFIER,
   buildAgentShellLaunchInput,
+  classifyAgentShellCommand,
+  createClaudeBridgeProcessStartTracker,
   decideAgentShellLaunchAdmission,
   isAgentShellLaunchInterruptPrelude,
+  parseOsc133AgentTool,
+  shouldClaimManualClaudeShellLaunch,
+  shouldClearClaudeShellLaunchOnCommandFinished,
 } = require('./ai-shell-launch');
+
+test('hook-route prebinding cannot consume the first Bridge process-start signal', () => {
+  const tracker = createClaudeBridgeProcessStartTracker();
+
+  // The hook router may already know pid -> tab before statusLine writes its
+  // first bridge file. Fresh-process ownership is deliberately independent of
+  // that routing cache, so the first Bridge observation still emits readiness.
+  assert.equal(tracker.claim(4242, 'tab-a'), true);
+  assert.equal(tracker.claim(4242, 'tab-a'), false);
+
+  assert.equal(tracker.clearTab('tab-a'), 1);
+  assert.equal(tracker.claim(4242, 'tab-a'), true, 'a later process generation can emit again');
+  assert.equal(tracker.clearPid(4242), true);
+  assert.equal(tracker.claim(4242, 'tab-b'), true, 'PID reuse by another tab is a fresh owner');
+});
 
 test('agent shell launch cancels the raw shell draft before the command', () => {
   assert.equal(
@@ -61,4 +83,87 @@ test('only the expected Ctrl+C edge before the new OSC command start is launch p
     sawOscCommandStart: false,
     sameTerminal: false,
   }), false);
+});
+
+test('shell command classification identifies agent executable positions without returning arguments', () => {
+  assert.equal(classifyAgentShellCommand('claude --dangerously-skip-permissions'), 'claude');
+  assert.equal(classifyAgentShellCommand(' command claude --resume secret-session-id'), 'claude');
+  assert.equal(classifyAgentShellCommand('cd /tmp && /opt/bin/claude --resume secret-session-id'), 'claude');
+  assert.equal(classifyAgentShellCommand('echo claude --dangerously-skip-permissions'), null);
+  assert.equal(classifyAgentShellCommand('printf codex | sed s/x/y/'), null);
+  assert.equal(classifyAgentShellCommand('codex resume secret-session-id'), 'codex');
+  assert.equal(classifyAgentShellCommand('gemini'), 'gemini');
+});
+
+test('generated shell classifier emits only allow-listed tool names', () => {
+  assert.match(AGENT_SHELL_TOOL_CLASSIFIER, /printf "claude"/);
+  assert.match(AGENT_SHELL_TOOL_CLASSIFIER, /printf "codex"/);
+  assert.match(AGENT_SHELL_TOOL_CLASSIFIER, /printf "gemini"/);
+  assert.doesNotMatch(AGENT_SHELL_TOOL_CLASSIFIER, /printf[^\n]*__ct_cmd/);
+});
+
+test('generated classifier runs in both supported shells', () => {
+  for (const shell of ['/bin/zsh', '/bin/bash']) {
+    const classify = (command) => spawnSync(
+      shell,
+      ['-fc', AGENT_SHELL_TOOL_CLASSIFIER + '\n__ct_agent_tool "$1"', 'noted-test', command],
+      { encoding: 'utf8' },
+    );
+    const direct = classify('claude --dangerously-skip-permissions');
+    assert.equal(direct.status, 0, direct.stderr);
+    assert.equal(direct.stdout, 'claude');
+    assert.equal(classify('cd /tmp && /opt/bin/codex resume secret').stdout, 'codex');
+    assert.equal(classify('echo claude --dangerously-skip-permissions').stdout, '');
+  }
+});
+
+test('OSC 133 tool metadata accepts only the explicit allow-list', () => {
+  assert.equal(parseOsc133AgentTool('tool=claude'), 'claude');
+  assert.equal(parseOsc133AgentTool('source=shell;tool=codex'), 'codex');
+  assert.equal(parseOsc133AgentTool('tool=CLAUDE'), 'claude');
+  assert.equal(parseOsc133AgentTool('tool=unknown'), null);
+  assert.equal(parseOsc133AgentTool('tool=claude --resume secret'), null);
+  assert.equal(parseOsc133AgentTool(null), null);
+});
+
+test('manual Claude OSC command claims lifecycle only when no accepted launch already owns it', () => {
+  assert.deepEqual(
+    shouldClaimManualClaudeShellLaunch({ oscTool: 'claude' }),
+    { claim: true, reason: 'manual_shell_command' },
+  );
+  assert.deepEqual(
+    shouldClaimManualClaudeShellLaunch({ oscTool: 'claude', hasMatchingStartupIntent: true }),
+    { claim: false, reason: 'launch_already_claimed' },
+  );
+  assert.equal(shouldClaimManualClaudeShellLaunch({ oscTool: 'codex' }).claim, false);
+  assert.equal(shouldClaimManualClaudeShellLaunch({ oscTool: null }).claim, false);
+});
+
+test('manual shell claim is cleared by its real command-finished boundary', () => {
+  assert.deepEqual(shouldClearClaudeShellLaunchOnCommandFinished({
+    hasClaudeState: true,
+    startupIntentReason: 'claude-shell-osc',
+    sawOscCommandStart: true,
+    sameTerminal: true,
+  }), {
+    clear: true,
+    reason: 'manual-shell-command-finished',
+  });
+
+  assert.equal(shouldClearClaudeShellLaunchOnCommandFinished({
+    hasClaudeState: true,
+    startupIntentReason: 'claude-run-command',
+    sawOscCommandStart: true,
+    sameTerminal: true,
+  }).clear, false);
+  assert.equal(shouldClearClaudeShellLaunchOnCommandFinished({
+    hasClaudeState: true,
+    startupIntentReason: 'claude-shell-osc',
+    sawOscCommandStart: true,
+    sameTerminal: false,
+  }).clear, false);
+  assert.equal(shouldClearClaudeShellLaunchOnCommandFinished({
+    hasClaudeState: false,
+    hasPendingPrompt: false,
+  }).clear, true);
 });

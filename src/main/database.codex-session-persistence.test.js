@@ -664,9 +664,135 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
   assert.equal(manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId), 'project-b-child-v2');
   assert.equal(manager.getAppState(v2HandoffKey), null);
 
-  manager.setAppState(v2HandoffKey, {
+  const stableActionGeneration = 'rewind-generation-v2-stable-source';
+  const stableAppliedAtMs = Date.now();
+  const stableJournal = {
     ...v2HandoffJournal,
     sourceSessionId: 'project-b-child-v2',
+    actionGeneration: stableActionGeneration,
+    actionStartedAtMs: stableAppliedAtMs - 10,
+    phase: 'rollback-applied',
+    appliedAtMs: stableAppliedAtMs,
+    restoredTextHash: v2HandoffJournal.targetTextHash,
+  };
+  manager.setAppState(v2HandoffKey, stableJournal);
+  const stableSettlement = manager.settlePendingCodexStableSourceHandoff({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: stableActionGeneration,
+    settledAtMs: stableAppliedAtMs + 1,
+  });
+  assert.equal(stableSettlement.success, true);
+  assert.equal(stableSettlement.journalRetained, true);
+  assert.equal(
+    manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId),
+    'project-b-child-v2',
+    'stable-source settlement does not rewrite the binding',
+  );
+  assert.equal(
+    manager.getAppState(v2HandoffKey).phase,
+    'stable-source-settled',
+    'stable-source retains the exact Rewind journal for the first subsequent Enter',
+  );
+  assert.equal(
+    manager.commitPendingCodexWriterHandoff({
+      journalKey: v2HandoffKey,
+      projectId: scopedProjectB.id,
+      tabId: projectBTabId,
+      sourceSessionId: 'project-b-child-v2',
+      nextSessionId: 'project-b-child-v2',
+      actionGeneration: stableActionGeneration,
+    }).error,
+    'codex_handoff_stable_source_requires_settlement',
+    'the generic child commit cannot consume a source-to-source transaction',
+  );
+
+  const firstSubmit = manager.armPendingCodexStableSourceSubmit({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: stableActionGeneration,
+    submitId: 'submit-release-before-enter',
+    expectedLen: 12,
+    expectedHash: '0123456789abcdef',
+    sentAtMs: stableAppliedAtMs + 2,
+    sourceFilePath: path.join(tempRoot, 'source-v2.jsonl'),
+    sourceFileSize: 123,
+    runSeq: 7,
+  });
+  assert.equal(firstSubmit.success, true);
+  assert.equal(manager.getAppState(v2HandoffKey).phase, 'stable-source-submit-armed');
+  const releasedSubmit = manager.releasePendingCodexStableSourceSubmit({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: stableActionGeneration,
+    submitId: 'submit-release-before-enter',
+  });
+  assert.equal(releasedSubmit.success, true);
+  assert.equal(manager.getAppState(v2HandoffKey).phase, 'stable-source-settled');
+
+  const delayedSubmitId = 'submit-delayed-child';
+  const delayedSubmit = manager.armPendingCodexStableSourceSubmit({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: stableActionGeneration,
+    submitId: delayedSubmitId,
+    expectedLen: 17,
+    expectedHash: 'fedcba9876543210',
+    sentAtMs: stableAppliedAtMs + 3,
+    sourceFilePath: path.join(tempRoot, 'source-v2.jsonl'),
+    sourceFileSize: 123,
+    runSeq: 7,
+  });
+  assert.equal(delayedSubmit.success, true);
+  const writtenSubmit = manager.markPendingCodexStableSourceSubmitWritten({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: stableActionGeneration,
+    submitId: delayedSubmitId,
+    submitWrittenAtMs: stableAppliedAtMs + 4,
+  });
+  assert.equal(writtenSubmit.success, true);
+  assert.equal(manager.getAppState(v2HandoffKey).phase, 'stable-source-submit-written');
+  assert.equal(
+    manager.releasePendingCodexStableSourceSubmit({
+      journalKey: v2HandoffKey,
+      projectId: scopedProjectB.id,
+      tabId: projectBTabId,
+      sourceSessionId: 'project-b-child-v2',
+      actionGeneration: stableActionGeneration,
+      submitId: delayedSubmitId,
+    }).error,
+    'codex_stable_source_submit_may_have_been_written',
+    'a possibly-sent command keeps its durable proof instead of reopening blind retry',
+  );
+  const delayedCommit = manager.commitPendingCodexWriterHandoff({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    nextSessionId: 'project-b-delayed-child',
+    actionGeneration: stableActionGeneration,
+  });
+  assert.equal(delayedCommit.success, true);
+  assert.equal(
+    manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId),
+    'project-b-delayed-child',
+  );
+  assert.equal(manager.getAppState(v2HandoffKey), null);
+
+  manager.setAppState(v2HandoffKey, {
+    ...v2HandoffJournal,
+    sourceSessionId: 'project-b-delayed-child',
     actionGeneration: 'rewind-generation-v2-invalid',
     targetTextHash: null,
   });
@@ -675,7 +801,7 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
   assert.equal(invalidV2Inspection.error, 'codex_handoff_journal_invalid');
   manager.setAppState(v2HandoffKey, {
     ...v2HandoffJournal,
-    sourceSessionId: 'project-b-child-v2',
+    sourceSessionId: 'project-b-delayed-child',
     actionGeneration: 'rewind-generation-v2-missing-target',
     targetUuid: null,
   });
@@ -686,7 +812,7 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
   );
   manager.setAppState(v2HandoffKey, {
     ...v2HandoffJournal,
-    sourceSessionId: 'project-b-child-v2',
+    sourceSessionId: 'project-b-delayed-child',
     actionGeneration: 'rewind-generation-v2-line-zero',
     targetSourceLine: 0,
   });

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { planTimelineTranscriptRefresh } from './timelineTranscriptRefresh.mjs';
+import {
+  matchesHistorySurfacePresented,
+  planTimelineTranscriptRefresh,
+} from './timelineTranscriptRefresh.mjs';
 
 test('hidden Timeline retains invalidation until Project Home closes', () => {
   const hidden = planTimelineTranscriptRefresh({
@@ -48,4 +51,41 @@ test('busy invalidation remains pending until both turn and surface are ready', 
     documentVisible: true,
     surfaceVisible: true,
   }), { pending: false, refresh: true });
+});
+
+test('History presentation gate accepts only the exact Timeline owner', () => {
+  const expected = {
+    tabId: 'tab-b',
+    sessionId: 'session-b',
+    toolType: 'codex',
+  };
+  assert.equal(matchesHistorySurfacePresented({
+    ...expected,
+    detail: { ...expected, proof: 'mounted-painted-row' },
+  }), true);
+  assert.equal(matchesHistorySurfacePresented({
+    ...expected,
+    detail: { ...expected, tabId: 'tab-a' },
+  }), false);
+  assert.equal(matchesHistorySurfacePresented({
+    ...expected,
+    detail: { ...expected, sessionId: 'session-a' },
+  }), false);
+  assert.equal(matchesHistorySurfacePresented({
+    ...expected,
+    detail: { ...expected, toolType: 'claude' },
+  }), false);
+});
+
+test('History presentation gate normalizes an absent session id to null', () => {
+  assert.equal(matchesHistorySurfacePresented({
+    tabId: 'tab-a',
+    sessionId: null,
+    toolType: 'claude',
+    detail: {
+      tabId: 'tab-a',
+      sessionId: undefined,
+      toolType: 'claude',
+    },
+  }), true);
 });

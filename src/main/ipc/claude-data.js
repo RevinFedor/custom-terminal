@@ -81,7 +81,98 @@ function shortKnowledgeDocsPath(filePath) {
 // JSONL is append-only — when file grows we only parse NEW bytes, not the whole file.
 // For a 159MB session file: first read ~3.5s, all subsequent reads ~0ms (if no new entries)
 // or microseconds (if only a few new lines added).
+const CLAUDE_JSONL_CACHE_MAX_RAW_BYTES = 768 * 1024 * 1024;
+const CLAUDE_JSONL_CACHE_MAX_FILES = 3;
+const CLAUDE_JSONL_PARSE_YIELD_LINES = 2_000;
+const CLAUDE_JSONL_PARSE_YIELD_CHARS = 4 * 1024 * 1024;
 const _jsonlCache = new Map();
+let _jsonlCacheRawBytes = 0;
+const _jsonlInflight = new Map();
+const _jsonlEpochByFile = new Map();
+let _jsonlGlobalEpoch = 0;
+let _jsonlInflightJoinCount = 0;
+let _jsonlParseYieldCount = 0;
+
+function deleteClaudeJsonlCacheEntry(filePath) {
+  const cached = _jsonlCache.get(filePath);
+  if (!cached) return false;
+  _jsonlCache.delete(filePath);
+  _jsonlCacheRawBytes = Math.max(
+    0,
+    _jsonlCacheRawBytes - (Number(cached.size) || 0),
+  );
+  return true;
+}
+
+function pruneClaudeJsonlCache(protectedFilePath) {
+  while (
+    _jsonlCache.size > CLAUDE_JSONL_CACHE_MAX_FILES
+    || _jsonlCacheRawBytes > CLAUDE_JSONL_CACHE_MAX_RAW_BYTES
+  ) {
+    let victim = null;
+    for (const filePath of _jsonlCache.keys()) {
+      if (filePath !== protectedFilePath) {
+        victim = filePath;
+        break;
+      }
+    }
+    if (!victim) break;
+    const cached = _jsonlCache.get(victim);
+    deleteClaudeJsonlCacheEntry(victim);
+    console.log(
+      '[ClaudeJsonlCache] evict file=' + path.basename(victim)
+      + ' sizeKB=' + Math.round((Number(cached?.size) || 0) / 1024)
+      + ' remainingFiles=' + _jsonlCache.size
+      + ' remainingRawMB=' + Math.round(_jsonlCacheRawBytes / (1024 * 1024)),
+    );
+  }
+}
+
+function setClaudeJsonlCacheEntry(filePath, cached) {
+  deleteClaudeJsonlCacheEntry(filePath);
+  _jsonlCache.set(filePath, cached);
+  _jsonlCacheRawBytes += Number(cached?.size) || 0;
+  pruneClaudeJsonlCache(filePath);
+}
+
+function touchClaudeJsonlCacheEntry(filePath, cached) {
+  _jsonlCache.delete(filePath);
+  _jsonlCache.set(filePath, cached);
+}
+
+function claudeJsonlEpoch(filePath) {
+  return _jsonlGlobalEpoch + ':' + (_jsonlEpochByFile.get(filePath) || 0);
+}
+
+function invalidateClaudeJsonlCache(filePath) {
+  if (!filePath) return;
+  _jsonlEpochByFile.set(filePath, (_jsonlEpochByFile.get(filePath) || 0) + 1);
+  deleteClaudeJsonlCacheEntry(filePath);
+}
+
+function clearClaudeJsonlCache() {
+  _jsonlGlobalEpoch += 1;
+  _jsonlEpochByFile.clear();
+  _jsonlCache.clear();
+  _jsonlCacheRawBytes = 0;
+}
+
+function getClaudeJsonlCacheStats() {
+  return {
+    files: _jsonlCache.size,
+    rawBytes: _jsonlCacheRawBytes,
+    filePaths: [..._jsonlCache.keys()],
+    inflight: _jsonlInflight.size,
+    inflightJoins: _jsonlInflightJoinCount,
+    parseYields: _jsonlParseYieldCount,
+  };
+}
+
+function resetClaudeJsonlCacheForTests() {
+  clearClaudeJsonlCache();
+  _jsonlInflightJoinCount = 0;
+  _jsonlParseYieldCount = 0;
+}
 // Dedup keys for [JsonlChainDiag:ChainBreak] log line — Timeline polls every 2s,
 // without this Set the same break writes 30+ identical lines per minute, drowning the log.
 // Key: `${sessionId}:${missingParentUuid}` — first hit logs, subsequent hits silently skip.
@@ -363,7 +454,7 @@ async function _deleteEffortEntries(sessionId, cwd, projectManager) {
     if (keepText.length > 0) {
       await fs.promises.appendFile(filePath, keepText, 'utf8');
     }
-    _jsonlCache.delete(filePath);
+    invalidateClaudeJsonlCache(filePath);
 
     const removed = (wrapperIdx >= 0 ? 1 : 0) + (pairedIdx >= 0 ? 1 : 0);
     const removedUuids = [];
@@ -551,7 +642,7 @@ function _trimTrailingStartupSlashEntriesFromFile(filePath, sessionId = 'unknown
 
     const truncateAt = lines[cutIdx].byteStart;
     fs.truncateSync(filePath, truncateAt);
-    _jsonlCache.delete(filePath);
+    invalidateClaudeJsonlCache(filePath);
 
     const removed = lines.length - cutIdx;
     console.log('[TrimStartupSlash] session=' + String(sessionId).slice(0, 8) + ' trimmed trailing startup slash blocks (' + removed + ' lines, model=' + removedByCommand.model + ', effort=' + removedByCommand.effort + ') at offset ' + truncateAt);
@@ -569,14 +660,21 @@ function _trimTrailingEffortEntries(sessionId, cwd) {
   return _trimTrailingStartupSlashEntriesFromFile(found.filePath, sessionId);
 }
 
-// Parse JSONL lines into an existing recordMap (shared logic for full + incremental reads)
-function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, queueOperations, startFileIndex, bridgeSessionIdIn, startQueueIndex = 0) {
+// Parse JSONL lines into an existing recordMap (shared logic for full +
+// incremental reads). Large transcripts yield cooperatively between bounded
+// batches so one History read cannot monopolize Electron's main loop.
+async function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, queueOperations, startFileIndex, bridgeSessionIdIn, startQueueIndex = 0) {
   let lastRecord = null;
   let bridgeSessionId = bridgeSessionIdIn;
   let fileIndex = startFileIndex;
   let queueIndex = startQueueIndex;
+  let linesSinceYield = 0;
+  let charsSinceYield = 0;
+  let yieldCount = 0;
 
   for (const line of lines) {
+    linesSinceYield += 1;
+    charsSinceYield += line.length;
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
@@ -603,28 +701,40 @@ function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, queueOpe
         }
       }
     } catch {}
+
+    if (
+      linesSinceYield >= CLAUDE_JSONL_PARSE_YIELD_LINES
+      || charsSinceYield >= CLAUDE_JSONL_PARSE_YIELD_CHARS
+    ) {
+      await new Promise((resolve) => setImmediate(resolve));
+      linesSinceYield = 0;
+      charsSinceYield = 0;
+      yieldCount += 1;
+    }
   }
 
-  return { lastRecord, bridgeSessionId, fileIndex, queueIndex };
+  _jsonlParseYieldCount += yieldCount;
+  return { lastRecord, bridgeSessionId, fileIndex, queueIndex, yieldCount };
 }
 
 // Load all records from a JSONL file into a Map (uuid → record)
 // Incremental: JSONL is append-only — when file grows we only parse NEW bytes.
 // First read of a 159MB file takes ~3.5s (CPU-bound JSON parse).
 // Subsequent reads with new entries only parse the delta — near-instant.
-async function loadJsonlRecords(filePath) {
+async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
   let stat;
   try {
-    stat = fs.statSync(filePath);
+    stat = await fs.promises.stat(filePath);
   } catch {
-    return {
+    deleteClaudeJsonlCacheEntry(filePath);
+    return { stale: false, value: {
       recordMap: new Map(),
       lastRecord: null,
       bridgeSessionId: null,
       progressEntries: [],
       queueOperations: [],
       sourceSnapshot: null,
-    };
+    } };
   }
 
   const cached = _jsonlCache.get(filePath);
@@ -638,14 +748,15 @@ async function loadJsonlRecords(filePath) {
 
   // ── Case 1: File unchanged → return cached result immediately ──────────────
   if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
-    return {
+    touchClaudeJsonlCacheEntry(filePath, cached);
+    return { stale: false, value: {
       recordMap: cached.recordMap,
       lastRecord: cached.lastRecord,
       bridgeSessionId: cached.bridgeSessionId,
       progressEntries: cached.progressEntries,
       queueOperations: cached.queueOperations || [],
       sourceSnapshot,
-    };
+    } };
   }
 
   // ── Case 2: File grew (normal for active sessions) → read ONLY new bytes ──
@@ -664,8 +775,9 @@ async function loadJsonlRecords(filePath) {
     try {
       const newByteCount = stat.size - prevSize;
       const buf = Buffer.allocUnsafe(newByteCount);
-      await fd.read(buf, 0, newByteCount, prevSize);
-      newContent = buf.toString('utf-8');
+      const { bytesRead } = await fd.read(buf, 0, newByteCount, prevSize);
+      if (bytesRead !== newByteCount) return { stale: true, value: null };
+      newContent = buf.subarray(0, bytesRead).toString('utf-8');
     } finally {
       await fd.close();
     }
@@ -676,61 +788,152 @@ async function loadJsonlRecords(filePath) {
     // Last element may be incomplete (file written mid-line) — save as leftover
     const leftover = lines.pop();
 
-    const queueOperations = cached.queueOperations || [];
-    const { lastRecord, bridgeSessionId, fileIndex, queueIndex } = _parseJsonlLines(
-      lines, sessionId, cached.recordMap, cached.progressEntries, queueOperations,
+    // Stage the delta separately. If an edit/rewind invalidates this file while
+    // parsing is yielded, the old shared Map remains untouched.
+    const deltaRecordMap = new Map();
+    const deltaProgressEntries = [];
+    const deltaQueueOperations = [];
+    const {
+      lastRecord,
+      bridgeSessionId,
+      fileIndex,
+      queueIndex,
+      yieldCount,
+    } = await _parseJsonlLines(
+      lines, sessionId, deltaRecordMap, deltaProgressEntries, deltaQueueOperations,
       prevFileIndex, prevBridgeSessionId, prevQueueIndex
     );
+
+    if (
+      claudeJsonlEpoch(filePath) !== expectedEpoch
+      || _jsonlCache.get(filePath) !== cached
+    ) {
+      return { stale: true, value: null };
+    }
+
+    for (const [uuid, entry] of deltaRecordMap) cached.recordMap.set(uuid, entry);
+    cached.progressEntries.push(...deltaProgressEntries);
+    const queueOperations = cached.queueOperations || [];
+    queueOperations.push(...deltaQueueOperations);
 
     const newLastRecord = lastRecord || cached.lastRecord;
     const newBridgeId = bridgeSessionId !== undefined ? bridgeSessionId : cached.bridgeSessionId;
 
-    // Only advance cache if we're ahead — prevents concurrent call from reverting state
-    if (stat.size >= cached.size) {
-      _jsonlCache.set(filePath, {
-        size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
-        recordMap: cached.recordMap, lastRecord: newLastRecord,
-        bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries,
-        queueOperations, fileIndex, queueIndex
-      });
-    }
+    setClaudeJsonlCacheEntry(filePath, {
+      size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
+      recordMap: cached.recordMap, lastRecord: newLastRecord,
+      bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries,
+      queueOperations, fileIndex, queueIndex
+    });
+    console.log(
+      '[ClaudeJsonlCache] append file=' + path.basename(filePath)
+      + ' bytes=' + (stat.size - prevSize)
+      + ' records=' + deltaRecordMap.size
+      + ' yields=' + yieldCount
+      + ' total=' + cached.recordMap.size
+      + ' cacheFiles=' + _jsonlCache.size
+      + ' cacheRawMB=' + Math.round(_jsonlCacheRawBytes / (1024 * 1024)),
+    );
 
-    return {
+    return { stale: false, value: {
       recordMap: cached.recordMap,
       lastRecord: newLastRecord,
       bridgeSessionId: newBridgeId,
       progressEntries: cached.progressEntries,
       queueOperations,
       sourceSnapshot,
-    };
+    } };
   }
 
   // ── Case 3: First read or file shrunk (shouldn't happen for JSONL) → full read ──
-  const content = await fs.promises.readFile(filePath, 'utf-8');
+  const contentBuffer = await fs.promises.readFile(filePath);
+  const content = contentBuffer.toString('utf-8');
   const lines = content.split('\n');
   const leftover = lines.pop(); // may be incomplete last line
 
   const recordMap = new Map();
   const progressEntries = [];
   const queueOperations = [];
-  const { lastRecord, bridgeSessionId, fileIndex, queueIndex } = _parseJsonlLines(
+  const {
+    lastRecord,
+    bridgeSessionId,
+    fileIndex,
+    queueIndex,
+    yieldCount,
+  } = await _parseJsonlLines(
     lines, sessionId, recordMap, progressEntries, queueOperations, 0, null, 0
   );
 
-  _jsonlCache.set(filePath, {
-    size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
+  if (claudeJsonlEpoch(filePath) !== expectedEpoch) {
+    return { stale: true, value: null };
+  }
+
+  // readFile may include bytes appended after the initial stat. The parsed
+  // byte count is the only safe next incremental offset.
+  const capturedSize = contentBuffer.length;
+  let capturedMtimeMs = stat.mtimeMs;
+  try {
+    capturedMtimeMs = (await fs.promises.stat(filePath)).mtimeMs;
+  } catch {}
+  setClaudeJsonlCacheEntry(filePath, {
+    size: capturedSize, mtimeMs: capturedMtimeMs, leftover: leftover || '',
     recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null,
     progressEntries, queueOperations, fileIndex, queueIndex
   });
+  console.log(
+    '[ClaudeJsonlCache] full file=' + path.basename(filePath)
+    + ' sizeKB=' + Math.round(capturedSize / 1024)
+    + ' records=' + recordMap.size
+    + ' yields=' + yieldCount
+    + ' cacheFiles=' + _jsonlCache.size
+    + ' cacheRawMB=' + Math.round(_jsonlCacheRawBytes / (1024 * 1024))
+    + (cached ? ' reason=rewrite-or-shrink' : ' reason=first-read'),
+  );
 
-  return {
+  return { stale: false, value: {
     recordMap,
     lastRecord,
     bridgeSessionId: bridgeSessionId || null,
     progressEntries,
     queueOperations,
-    sourceSnapshot,
-  };
+    sourceSnapshot: {
+      ...sourceSnapshot,
+      size: capturedSize,
+      mtimeMs: capturedMtimeMs,
+    },
+  } };
+}
+
+async function loadJsonlRecords(filePath) {
+  while (true) {
+    const epoch = claudeJsonlEpoch(filePath);
+    let entry = _jsonlInflight.get(filePath);
+    if (!entry || entry.epoch !== epoch) {
+      entry = {
+        epoch,
+        promise: _loadJsonlRecordsOnce(filePath, epoch),
+      };
+      _jsonlInflight.set(filePath, entry);
+    } else {
+      _jsonlInflightJoinCount += 1;
+      console.log('[ClaudeJsonlCache] join file=' + path.basename(filePath));
+    }
+
+    let result;
+    try {
+      result = await entry.promise;
+    } finally {
+      if (_jsonlInflight.get(filePath) === entry) {
+        _jsonlInflight.delete(filePath);
+      }
+    }
+
+    if (result.stale || claudeJsonlEpoch(filePath) !== epoch) {
+      console.log('[ClaudeJsonlCache] retry-stale file=' + path.basename(filePath));
+      continue;
+    }
+    return result.value;
+  }
 }
 
 function _injectQueueOperationsIntoBranch(activeBranch, queueOperations) {
@@ -1400,6 +1603,10 @@ const _api = {
   buildClaudeTaskNotificationIndex,
   extractClaudeTaskNotificationTexts,
   readClaudeStoppedAgentToolUseIds,
+  invalidateJsonlCache: invalidateClaudeJsonlCache,
+  clearJsonlCache: clearClaudeJsonlCache,
+  getJsonlCacheStats: getClaudeJsonlCacheStats,
+  resetJsonlCacheForTests: resetClaudeJsonlCacheForTests,
 };
 
 // Stash-miss recovery for dehydrated Claude payloads. Payload identity is
@@ -2694,7 +2901,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       await fs.promises.rename(tmpPath, filePath);
 
       // Invalidate cache
-      _jsonlCache.delete(filePath);
+      invalidateClaudeJsonlCache(filePath);
 
       // If range started from beginning (bridge removed), clean session_links
       // so resolveSessionChain doesn't re-attach parent session
@@ -3006,7 +3213,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         }
       }
 
-      _jsonlCache.delete(filePath);
+      invalidateClaudeJsonlCache(filePath);
 
       // Count removed by type for the toast message
       let removedUsers = 0, removedAssistants = 0, removedOther = 0;
@@ -3125,7 +3332,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       await fs.promises.writeFile(tmpPath, outputLines.join('\n') + '\n', 'utf-8');
       await fs.promises.rename(tmpPath, filePath);
 
-      _jsonlCache.delete(filePath);
+      invalidateClaudeJsonlCache(filePath);
 
       // Drop any timeline note attached to this UUID — there's nothing to anchor it to.
       if (projectManager?.db) {
@@ -3282,7 +3489,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
               if (!_cacheInvalidated) {
                 _cacheInvalidated = true;
                 console.log('[Timeline:Backtrace] BREAK at uuid=' + currentUuid.substring(0, 8) + ' — invalidating JSONL cache and retrying');
-                _jsonlCache.clear();
+                clearClaudeJsonlCache();
                 const fresh = await resolveSessionChain(sessionId, cwd);
                 if (fresh.mergedMap.has(currentUuid)) {
                   recordMap = fresh.mergedMap;
@@ -5400,7 +5607,7 @@ async function repairJsonlChainBreaks(sessionId, cwd) {
     fs.writeFileSync(filePath, newLines.join('\n'), 'utf-8');
     console.log('[JsonlAutoRepair] session=' + sessionId.substring(0, 8) + ' repaired=' + fixes.length + ' backup=' + backupPath);
     // Invalidate cache so next read picks up changes
-    _jsonlCache.delete(filePath);
+    invalidateClaudeJsonlCache(filePath);
     return { repaired: fixes.length, backupPath };
   } catch (e) {
     console.error('[JsonlAutoRepair] Error for session ' + sessionId + ':', e.message);

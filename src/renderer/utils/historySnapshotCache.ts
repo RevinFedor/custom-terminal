@@ -5,8 +5,9 @@
  * - keeps the original immutable-by-contract arrays (no second full clone);
  * - estimates memory without JSON.stringify;
  * - bounds the normal LRU by bytes, total row count, and owner count;
- * - retains the two latest practically-sized oversized snapshots in a separate
- *   byte-bounded LRU, so A → B → A does not reload two large sessions;
+ * - retains the three latest practically-sized oversized snapshots in a
+ *   separate byte-bounded LRU, so three concurrent terminal owners can switch
+ *   without reparsing a previously visited large session;
  * - keys by every owner dimension that can select a different transcript.
  */
 
@@ -121,10 +122,11 @@ export const DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS: Readonly<HistorySnapshotCach
   maxBytes: 64 * 1024 * 1024,
   maxEntries: 40_000,
   maxSnapshots: 8,
-  // Production histories observed around 67 MiB each. This keeps the last two
-  // with headroom while preventing an unbounded chain of large owner graphs.
-  maxOversizedBytes: 160 * 1024 * 1024,
-  maxOversizedSnapshots: 2,
+  // Production histories observed around 67 MiB each. Keep the three terminal
+  // owners from the concurrency contract with headroom, while retaining a hard
+  // bound against an unbounded chain of large owner graphs.
+  maxOversizedBytes: 240 * 1024 * 1024,
+  maxOversizedSnapshots: 3,
 });
 
 export const DEFAULT_HISTORY_VOLATILE_OVERLAY_CACHE_LIMITS:

@@ -60,10 +60,11 @@ function describeStep(step) {
 }
 
 class ClaudeStartupTransaction {
-  constructor({ tabId, generation, steps, deps }) {
+  constructor({ tabId, generation, steps, resolveSteps, deps }) {
     this.tabId = tabId;
     this.generation = generation;
-    this.steps = steps;
+    this.steps = Array.isArray(steps) ? steps : [];
+    this.resolveSteps = typeof resolveSteps === 'function' ? resolveSteps : null;
     this.deps = deps;
     this.phase = PHASE.IDLE;
     this.openedBy = null;
@@ -107,6 +108,11 @@ class ClaudeStartupTransaction {
       this.trace('step-send-failed', 'error=' + error);
       return { ok: false, error, step, sendFailed: true };
     }
+    if (send.skipped === true) {
+      this.trace('step-skipped', 'command="' + describeStep(step)
+        + '" reason=' + (send.reason || 'host-skip'));
+      return { ok: true, step, skipped: true };
+    }
 
     let proof = normalizeProof(await this.deps.proveCommand({
       tabId: this.tabId,
@@ -118,14 +124,17 @@ class ClaudeStartupTransaction {
       afterMs: startedAt,
       label: step.label,
       attempt: 1,
+      sendResult: send,
     }));
     this.trace('step-proof', 'outcome=' + proof.outcome + (proof.reason ? ' reason=' + proof.reason : ''));
 
     if (proof.outcome === PROOF.ABSENT && !this.retryUsed) {
       // Automatic retry is allowed for exactly one case: the command provably
-      // never landed. An empty composer plus no stdout is the signature of a
-      // swallowed paste — the very state the old retry treated as "nothing is
-      // stuck" and gave up on.
+      // was not submitted. The prover requires both facts: the send path
+      // explicitly reports that Enter was not written, and the current
+      // composer still contains the exact command. A missing JSONL row,
+      // an empty/unknown composer, or an uncertain Enter is unresolved because
+      // the command may already have applied.
       this.retryUsed = true;
       this.deps.log('[StartupRetry] decision=absent action=auto-retry'
         + ' tab=' + String(this.tabId).slice(-12)
@@ -136,9 +145,10 @@ class ClaudeStartupTransaction {
         tabId: this.tabId,
         generation: this.generation,
         command: step.command,
-        source: step.source,
+        source: step.source + ':retry',
         label: step.label + ':retry',
         retry: true,
+        recovery: proof.recovery || null,
       });
       if (!retrySend || retrySend.success !== true) {
         const error = (retrySend && (retrySend.error || retrySend.reason)) || 'retry-send-failed';
@@ -152,6 +162,7 @@ class ClaudeStartupTransaction {
         afterMs: retryStartedAt,
         label: step.label + ':retry',
         attempt: 2,
+        sendResult: retrySend,
       }));
       this.trace('step-retry-proof', 'outcome=' + proof.outcome);
     } else if (proof.outcome === PROOF.UNRESOLVED) {
@@ -181,6 +192,16 @@ class ClaudeStartupTransaction {
   }
 
   async run() {
+    if (this.resolveSteps) {
+      this.trace('steps-resolve-start');
+      this.steps = await this.resolveSteps({
+        tabId: this.tabId,
+        generation: this.generation,
+        openedBy: this.openedBy,
+      });
+      if (!Array.isArray(this.steps)) this.steps = [];
+      this.trace('steps-resolve-done', 'steps=' + this.steps.length);
+    }
     for (const step of this.steps) {
       if (this.deps.isCancelled && this.deps.isCancelled(this.generation)) {
         this.phase = PHASE.FAILED;
@@ -239,7 +260,15 @@ function createClaudeStartupCoordinator(deps = {}) {
   // `trigger` is the readiness signal that arrived ('tui-ready' |
   // 'process-started' | 'manual'). It is recorded for diagnostics but it does
   // NOT decide ownership — the generation does.
-  function ensureTransaction({ tabId, generation, trigger, steps, sendCommand, proveCommand }) {
+  function ensureTransaction({
+    tabId,
+    generation,
+    trigger,
+    steps,
+    resolveSteps,
+    sendCommand,
+    proveCommand,
+  }) {
     if (!tabId || !generation) {
       return { started: false, reason: 'missing-identity' };
     }
@@ -260,6 +289,7 @@ function createClaudeStartupCoordinator(deps = {}) {
       tabId,
       generation,
       steps,
+      resolveSteps,
       deps: {
         now,
         log,
@@ -269,7 +299,10 @@ function createClaudeStartupCoordinator(deps = {}) {
       },
     });
     transaction.openedBy = trigger;
-    transaction.trace('open', 'trigger=' + trigger + ' steps=' + steps.length);
+    transaction.trace(
+      'open',
+      'trigger=' + trigger + ' steps=' + (Array.isArray(steps) ? steps.length : 'deferred'),
+    );
 
     // Register BEFORE running: `run()` executes synchronously up to its first
     // await and immediately asks `isCancelled(generation)`, which resolves

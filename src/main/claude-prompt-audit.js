@@ -5,6 +5,22 @@ const path = require('node:path');
 
 const DEFAULT_CLAUDE_AUDIT_READ_BYTES = 2 * 1024 * 1024;
 
+function shouldStageClaudeUserPromptAudit({
+  fast = false,
+  broadcastTabId = null,
+  submit = false,
+  submitSequence = '\r',
+  isCodexPasteSource = false,
+  content = '',
+} = {}) {
+  return !fast
+    && !!broadcastTabId
+    && submit === true
+    && submitSequence !== '\t'
+    && !isCodexPasteSource
+    && !String(content || '').trimStart().startsWith('/');
+}
+
 function extractClaudeUserText(record) {
   if (record?.type !== 'user') return null;
   const message = record.message;
@@ -336,4 +352,5 @@ module.exports = {
   readLastClaudeUserRecord,
   readLastClaudeUserRecordFromBuffer,
   selectClaudePendingPromptAudit,
+  shouldStageClaudeUserPromptAudit,
 };
