@@ -4447,6 +4447,22 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // Reset overlay flags when new session starts (so overlay shows again if interrupted)
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
+        // Point-write this tab's id FIRST, then the usual full save. The full
+        // save carries the whole tab array and could otherwise roll back a
+        // sibling tab's id that the bridge assigned while this array was being
+        // assembled; main's snapshot guard now protects existing rows, and this
+        // targeted write is what actually commits the new value.
+        void ipcRenderer.invoke('claude:persist-session-id', {
+          tabId,
+          sessionId,
+          expectedSessionId: prev || null,
+        }).then((result: any) => {
+          if (result?.success === false) {
+            console.warn('[Store:setClaudeSessionId] point-write rejected tab=' + tabId.slice(-8)
+              + ' error=' + (result?.error || 'unknown')
+              + ' current=' + (result?.currentSessionId ? String(result.currentSessionId).slice(0, 8) : 'none'));
+          }
+        }).catch(() => {});
         // Save to database so session persists across restarts and native
         // clients reload tab-level Resume/Copy capabilities.
         saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'claude-session-id');

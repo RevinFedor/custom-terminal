@@ -110,7 +110,12 @@ export interface HistoryAgentRuntime {
   startFresh?: (args: { tabId: string; cwd?: string }) => Promise<AgentResumeResult>;
   resume: (args: { tabId: string; sessionId: string; cwd?: string }) => Promise<AgentResumeResult>;
   sendPrompt: (tabId: string, prompt: string, options?: AgentSendPromptOptions) => Promise<any>;
-  interruptTurn: (tabId: string) => { success: boolean; interrupted?: boolean; error?: string };
+  // `context.busy` lets a runtime refuse an interrupt that would do something
+  // else entirely on an idle composer (Codex: Escape opens native Rewind).
+  interruptTurn: (
+    tabId: string,
+    context?: { busy?: boolean },
+  ) => { success: boolean; interrupted?: boolean; error?: string; skipped?: string };
   stopProcess: (tabId: string) => Promise<any>;
   grabDraft: (tabId: string) => Promise<AgentDraftGrabResult>;
   probeDraft?: (tabId: string, reason: string) => Promise<{ hasDraft: boolean | null; preview: string; source: string; [key: string]: any }>;
@@ -521,8 +526,22 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   return work;
 }
 
-function interruptCodexTurn(tabId: string): { success: boolean; interrupted?: boolean; error?: string } {
+function interruptCodexTurn(
+  tabId: string,
+  context?: { busy?: boolean },
+): { success: boolean; interrupted?: boolean; error?: string; skipped?: string } {
   if (!tabId) return { success: false, error: 'tabId required' };
+  // Escape is only an interrupt while Codex is actually answering. On an idle
+  // composer the same byte opens Codex's native backtrack/Rewind picker, so
+  // sending it as a generic "cancel" hijacks the terminal into a mode the user
+  // never asked for. Refusing silently would be just as bad — a skipped path
+  // and a path that was never called look identical in a log — hence the
+  // explicit trace.
+  if (context?.busy === false) {
+    console.log('[CodexInterrupt] skipped tab=' + shortTab(tabId)
+      + ' reason=idle-composer-would-open-rewind');
+    return { success: true, interrupted: false, skipped: 'idle-composer' };
+  }
   const now = Date.now();
   const prev = codexLastInterruptAt.get(tabId) || 0;
   if (now - prev < INTERRUPT_DEDUP_MS) {

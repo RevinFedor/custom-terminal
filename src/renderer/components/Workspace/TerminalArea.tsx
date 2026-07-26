@@ -16,6 +16,7 @@ import {
   isSessionStartingProbeCurrent,
   syncSessionStartingWithPresence,
 } from '../../utils/sessionStartingState.mjs';
+import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -31,6 +32,9 @@ type SessionStartingState = {
   startupPending?: boolean;
   startupFailed?: boolean;
   startupError?: string | null;
+  startupFailedCommand?: string | null;
+  startupProofOutcome?: string | null;
+  startupUserRetryable?: boolean;
   stickySource?: 'claude-startup-defaults';
 };
 
@@ -186,10 +190,19 @@ const getSessionStartingPresentation = (state: SessionStartingState) => {
   const isError = state.startupFailed === true;
 
   if (isError) {
+    const failedCommand = String(state.startupFailedCommand || '');
+    const proofOutcome = String(state.startupProofOutcome || '');
     return {
       isError: true,
       title: `${engineLabel} START FAILED`,
-      subtitle: 'Terminal input did not become ready',
+      // Name the command that actually failed. "Terminal input did not become
+      // ready" was wrong in the real incident: the input WAS ready, one startup
+      // command was swallowed by the TUI.
+      subtitle: failedCommand
+        ? (proofOutcome === 'unresolved'
+          ? `Could not confirm ${failedCommand}`
+          : `${failedCommand} was not applied`)
+        : 'Terminal input did not become ready',
       detail: state.startupError || 'Close this status or stop the process and try again',
     };
   }
@@ -263,6 +276,8 @@ const AgentLifecycleStatusCard = memo(({
   topOffset = 12,
   onDismiss,
   dismissLabel = 'Dismiss agent status',
+  onRetry,
+  retryLabel = 'RETRY',
 }: {
   title: string;
   subtitle: string;
@@ -271,6 +286,8 @@ const AgentLifecycleStatusCard = memo(({
   topOffset?: number;
   onDismiss?: () => void;
   dismissLabel?: string;
+  onRetry?: () => void;
+  retryLabel?: string;
 }) => {
   const isError = tone === 'error';
   const isStopping = tone === 'stopping';
@@ -343,6 +360,29 @@ const AgentLifecycleStatusCard = memo(({
               {detail}
             </div>
           ) : null}
+          {onRetry ? (
+            // Explicit retry. Automatic re-send happens only for a provably
+            // undelivered command; when the delivery is unknown the decision is
+            // the user's, so applying the setting twice stays impossible
+            // without an intent.
+            <button
+              type="button"
+              className="pointer-events-auto mt-1.5 cursor-pointer rounded-md border px-2 py-0.5 text-[10px] font-bold tracking-[0.1em]"
+              style={{
+                borderColor: 'rgba(239,68,68,0.5)',
+                background: 'rgba(239,68,68,0.12)',
+                color: '#fecaca',
+              }}
+              onMouseDown={keepTerminalFocus}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onRetry();
+              }}
+            >
+              {retryLabel}
+            </button>
+          ) : null}
         </div>
 
         {onDismiss ? (
@@ -364,10 +404,12 @@ const AgentLifecycleStatusCard = memo(({
 const SessionStartingOverlay = memo(({
   state,
   onDismiss,
+  onRetry,
   topOffset = 12,
 }: {
   state: SessionStartingState;
   onDismiss: () => void;
+  onRetry?: () => void;
   topOffset?: number;
 }) => {
   const presentation = getSessionStartingPresentation(state);
@@ -380,6 +422,8 @@ const SessionStartingOverlay = memo(({
       topOffset={topOffset}
       onDismiss={onDismiss}
       dismissLabel="Dismiss starting status"
+      onRetry={presentation.isError && state.startupUserRetryable ? onRetry : undefined}
+      retryLabel="RETRY SETTINGS"
     />
   );
 });
@@ -615,6 +659,38 @@ function TerminalArea({
     activeAgentStartingInfoRef.current = activeAgentStartingInfo;
   }, [activeAgentStartingInfo]);
 
+  // Re-read the startup gate whenever this surface (re)binds to a Claude tab.
+  // The gate event is delivered only to the ACTIVE tab; in the 2026-07-25
+  // incident the `failed` event landed 549ms after the user switched away, the
+  // active-tab guard dropped it, and coming back showed a generic "starting"
+  // with no reason — while the failure was still recorded in both the renderer
+  // map and main's mirror. The event is now an optimization; this is the
+  // contract.
+  useEffect(() => {
+    const info = activeAgentStartingInfo;
+    if (!info || info.engine !== 'claude' || currentView !== 'terminal') return;
+    let cancelled = false;
+    fetchClaudeStartupDefaultsGate(info.tabId).then((gate) => {
+      if (cancelled || !gate) return;
+      if (activeAgentStartingInfoRef.current?.tabId !== info.tabId) return;
+      if (gate.status !== 'pending' && gate.status !== 'failed') return;
+      setSessionStarting((prev) => applyClaudeStartupDefaultsGate(prev, info, {
+        tabId: info.tabId,
+        status: gate.status,
+        reason: gate.reason,
+        error: gate.error,
+        failedCommand: gate.failedCommand,
+        proofOutcome: gate.proofOutcome,
+        userRetryable: gate.userRetryable,
+      }));
+      console.warn('[SessionStartingOverlay] gate-restored tab=' + info.tabId.slice(-12)
+        + ' status=' + gate.status
+        + ' command=' + (gate.failedCommand || '-')
+        + ' outcome=' + (gate.proofOutcome || '-'));
+    });
+    return () => { cancelled = true; };
+  }, [activeAgentStartingInfo, currentView]);
+
   useEffect(() => {
     if (!activeTabId || currentView !== 'terminal') {
       setAgentStopping(null);
@@ -795,6 +871,9 @@ function TerminalArea({
         status?: string;
         reason?: string;
         error?: string | null;
+        failedCommand?: string | null;
+        proofOutcome?: string | null;
+        userRetryable?: boolean;
       }>).detail || {};
       const gateTabId = detail.tabId || '';
       const info = activeAgentStartingInfoRef.current;
@@ -846,6 +925,20 @@ function TerminalArea({
     }
     setSessionStarting(null);
   }, [sessionStarting, startingDismissKey]);
+
+  // Explicit retry of the startup settings. Runs the same transaction the
+  // readiness signals drive — Terminal.tsx owns it and exposes a retry entry
+  // point, so there is still exactly one owner of the sequence.
+  const handleRetryStartupDefaults = useCallback(() => {
+    const current = sessionStarting;
+    if (!current || current.engine !== 'claude') return;
+    console.warn('[StartupRetry] decision=user action=manual-retry tab=' + current.tabId.slice(-12)
+      + ' command=' + (current.startupFailedCommand || '-'));
+    setSessionStarting(null);
+    window.dispatchEvent(new CustomEvent('claude-startup-defaults-retry', {
+      detail: { tabId: current.tabId },
+    }));
+  }, [sessionStarting]);
 
   // DEBUG: Track render reason
   const renderCountRef = useRef(0);
@@ -1254,6 +1347,7 @@ function TerminalArea({
             key={`${sessionStarting.tabId}:${sessionStarting.since}`}
             state={sessionStarting}
             onDismiss={handleDismissSessionStarting}
+            onRetry={handleRetryStartupDefaults}
             topOffset={activeExternalRun ? 44 : 12}
           />
         )}

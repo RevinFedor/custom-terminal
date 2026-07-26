@@ -127,6 +127,10 @@ const {
 } = require(path.join(srcMainDir, 'claude-hook-routing'));
 const { buildSessionProgress } = require(path.join(srcMainDir, 'session-progress'));
 const {
+  createClaudeStartupCoordinator,
+  PROOF: CLAUDE_STARTUP_PROOF,
+} = require(path.join(srcMainDir, 'claude-startup-transaction'));
+const {
   deleteTerminalRuntimeIfOwned,
   ownsTerminalRuntime,
 } = require(path.join(srcMainDir, 'terminal-runtime-identity.cjs'));
@@ -3146,6 +3150,20 @@ ipcMain.on('agent:tui-ready-internal', (_event, payload = {}) => {
   scheduleProjectActivityBroadcast(toolType + '-ready');
 });
 
+// Re-queryable snapshot of the startup gate. The incident showed why an event
+// alone is not a contract: the `failed` event arrived 549ms AFTER the user had
+// switched tabs, TerminalArea's active-tab guard dropped it, and nothing ever
+// re-read the state — the user came back to a generic "starting" with no
+// reason. The data was alive in both the renderer map and this mirror; there
+// was simply no way to ask for it. Presentation now reads this on mount /
+// tab-switch / view-change and treats the event as an optimization.
+ipcMain.handle('claude:get-startup-defaults-gate', (_event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  if (!tabId) return { success: false, error: 'tabId required', gate: null };
+  const gate = claudeStartupDefaultsGateByTab.get(tabId) || null;
+  return { success: true, tabId, gate: gate ? { ...gate } : null };
+});
+
 ipcMain.on('claude:startup-defaults-gate', (_event, payload = {}) => {
   const tabId = String(payload?.tabId || '');
   if (!tabId) return;
@@ -3173,6 +3191,12 @@ ipcMain.on('claude:startup-defaults-gate', (_event, payload = {}) => {
     status,
     reason: String(payload?.reason || ''),
     error: payload?.error ? String(payload.error) : null,
+    // Which command failed and whether the user may retry it. The generic
+    // "terminal input did not become ready" subtitle contradicted the real
+    // cause in the incident; the card must be able to name `/effort max`.
+    failedCommand: payload?.failedCommand ? String(payload.failedCommand) : null,
+    proofOutcome: payload?.proofOutcome ? String(payload.proofOutcome) : null,
+    userRetryable: payload?.userRetryable === true,
     at: Date.now(),
   });
   const sessionId = bridgeKnownSessions.get(tabId) || null;
@@ -3834,6 +3858,50 @@ const codexResumeSourceLeases = new Map(); // sourceSessionId → { tabId, launc
 const aiStoppingTabs = new Map(); // tabId → { toolType, reason, since, sessionId }
 const claudeStartupIntents = new Map(); // tabId → { sessionId, at, reason }
 const claudeStartupDefaultsGateByTab = new Map(); // tabId → { status, reason, error, at }
+
+// Launch generation of the live Claude process per tab. This is the identity
+// the startup-settings transaction is keyed by: readiness signals
+// (`process-started`, `tui-ready`) are inputs to ONE owner rather than two
+// competing initiators, and a proof or event belonging to an older launch can
+// no longer close (or fail) the current transaction. Bumped on every fresh
+// spawn, cleared when the process dies.
+const claudeLaunchGenerationByTab = new Map(); // tabId → { generation, pid, at }
+let claudeLaunchGenerationSeq = 0;
+
+function beginClaudeLaunchGeneration(tabId, pid, reason = 'process-started') {
+  if (!tabId) return null;
+  claudeLaunchGenerationSeq += 1;
+  const generation = 'claude-launch-' + claudeLaunchGenerationSeq;
+  claudeLaunchGenerationByTab.set(tabId, { generation, pid: pid || null, at: Date.now() });
+  console.log('[StartupTx] generation-open tab=' + String(tabId).slice(-12)
+    + ' gen=' + generation + ' pid=' + (pid || '-') + ' reason=' + reason);
+  return generation;
+}
+
+// Readiness can arrive before we ever saw a bridge PID (tui-ready fires 2-6s
+// earlier in prod). The first signal to arrive opens the generation so both
+// signals of the same launch land on the same transaction.
+function ensureClaudeLaunchGeneration(tabId, pid, reason) {
+  const existing = claudeLaunchGenerationByTab.get(tabId);
+  if (existing) {
+    if (pid && !existing.pid) existing.pid = pid;
+    // A different live PID means a genuinely new launch (manual relaunch in the
+    // shell, restart) even if we never observed the old one exiting.
+    if (pid && existing.pid && existing.pid !== pid) {
+      return beginClaudeLaunchGeneration(tabId, pid, reason + ':pid-change');
+    }
+    return existing.generation;
+  }
+  return beginClaudeLaunchGeneration(tabId, pid, reason);
+}
+
+function clearClaudeLaunchGeneration(tabId, reason = 'process-exit') {
+  const existing = claudeLaunchGenerationByTab.get(tabId);
+  if (!existing) return;
+  claudeLaunchGenerationByTab.delete(tabId);
+  console.log('[StartupTx] generation-clear tab=' + String(tabId).slice(-12)
+    + ' gen=' + existing.generation + ' reason=' + reason);
+}
 const bridgeMetadata = new Map(); // tabId → { model, contextPct }
 const bridgePidCache = new Map(); // claudePid → tabId
 const bridgeFileMtimes = new Map(); // filename → mtimeMs
@@ -4072,13 +4140,16 @@ function startSessionBridge() {
       // so handlers can correlate "new PID + same/different sessionId".
       if (isFreshProcess && mainWindow && !mainWindow.isDestroyed()) {
         console.log('[Bridge:Fresh] tab=' + tabId.slice(-12) + ' claudePid=' + data.ppid + ' session=' + data.session_id.slice(0, 8));
+        // Both readiness signals carry the same launch generation, so the
+        // renderer can join one transaction instead of racing two owners.
+        const launchGeneration = ensureClaudeLaunchGeneration(tabId, data.ppid, 'bridge-fresh');
         // [EffortDiag2026-05] main-side emit log — written synchronously here,
         // not relayed through renderer. If renderer logs show only 1 [Terminal:EffortInject]
         // but main shows 2 [Bridge:Fresh] for the same tab, processFile entered
         // the isFreshProcess branch twice (PID cache miss twice).
         console.warn('[EffortDiag2026-05][MAIN-EMIT] tab=' + tabId.slice(-12) + ' claudePid=' + data.ppid + ' sessionId=' + data.session_id.slice(0, 8) + ' ts=' + Date.now());
         mainWindow.webContents.send('claude:process-started', {
-          tabId, sessionId: data.session_id, claudePid: data.ppid,
+          tabId, sessionId: data.session_id, claudePid: data.ppid, launchGeneration,
         });
       }
 
@@ -4244,6 +4315,7 @@ function clearBridgeTab(tabId) {
   // in busy with no way to reach Resume. Also broadcast busy=false so the
   // mobile composer's loader resets regardless of which event ordering wins.
   claudePromptReady.delete(tabId);
+  clearClaudeLaunchGeneration(tabId, 'bridge-clear');
   if (had) {
     console.log('[MobBcast] busy+snapshot tab=' + String(tabId).slice(-12) + ' busy=false status=inactive src=clearBridgeTab');
     _webBroadcast(tabId, { type: 'busy', busy: false });
@@ -4323,10 +4395,14 @@ function publishClaudePromptReady(tabId, reason = 'prompt-ready') {
   if (!tabId || claudePromptReady.has(tabId)) return false;
   claudePromptReady.add(tabId);
   const turnBusy = !!claudeTurnBusy.get(tabId);
+  // tui-ready usually lands BEFORE bridge.json exists, so it is normally the
+  // signal that opens the generation. Whichever arrives first opens it; the
+  // other joins the same transaction.
+  const launchGeneration = ensureClaudeLaunchGeneration(tabId, null, 'tui-ready');
   console.log('[TUI-Ready] tab=' + String(tabId).slice(-12) +
     ' — emitting claude:tui-ready (' + reason + ')');
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
+    mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now(), launchGeneration });
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'claude' });
   _webBroadcast(tabId, {
@@ -5381,6 +5457,39 @@ function resolveClaudeStartupSlashSessionId(tabId) {
   } catch {
     return null;
   }
+}
+
+// Three-valued proof, per the project rule for fallible lookups
+// (found / absent / unknown). The distinction is load-bearing for the startup
+// transaction: `absent` is the only outcome that may be auto-retried, while
+// `unresolved` (unreadable transcript, scan error, file truncated under the
+// reader) must never be — re-sending a command whose delivery is unknown can
+// apply the setting twice. Before this, every non-found result collapsed into
+// `success:false`, so a transient read error looked exactly like a swallowed
+// command and produced a hard "startup failed".
+// Dev-only fault injection for E2E. Some acceptance conditions cannot be
+// reached honestly: killing the process yields `cleared`, not `failed`, so a
+// scenario checking the failure path would silently verify a different path.
+// Enabled only by explicit env; every activation is logged so a run can prove
+// the hook fired rather than assuming it did.
+const CLAUDE_STARTUP_TEST_FAULT = String(process.env.NOTED_TEST_STARTUP_FAULT || '').trim();
+function claudeStartupTestFaultActive(kind) {
+  if (!CLAUDE_STARTUP_TEST_FAULT) return false;
+  const active = CLAUDE_STARTUP_TEST_FAULT === kind;
+  if (active) console.warn('[TestFault] active kind=' + kind);
+  return active;
+}
+
+function claudeStartupProofOutcome(result) {
+  if (result?.success === true) return CLAUDE_STARTUP_PROOF.FOUND;
+  const reason = String(result?.reason || '');
+  // The transcript was read successfully and the command is provably not in it.
+  if (reason === 'stdout-not-found' || reason === 'stdout-unmatched' || reason === 'empty-file') {
+    return CLAUDE_STARTUP_PROOF.ABSENT;
+  }
+  // session-file-missing / scan-error / unsupported-command / anything new:
+  // the prover could not answer.
+  return CLAUDE_STARTUP_PROOF.UNRESOLVED;
 }
 
 function scanClaudeStartupSlashProof(tabId, command, afterMs) {
@@ -14328,13 +14437,21 @@ ipcMain.handle('claude:startup-slash-proof', (event, payload = {}) => {
   const command = String(payload?.command || '');
   const afterMs = Number(payload?.afterMs || 0);
   const label = String(payload?.label || 'startup-slash-proof');
-  if (!tabId || !command) return { success: false, reason: 'missing-args' };
+  if (!tabId || !command) return { success: false, reason: 'missing-args', outcome: CLAUDE_STARTUP_PROOF.UNRESOLVED };
+  // Fault injection: force the prover to report "cannot answer" so the
+  // unresolved branch (no auto-retry, user decides) is testable end to end.
+  if (claudeStartupTestFaultActive('proof-unresolved')) {
+    console.warn('[TestFault] proof-unresolved tab=' + tabId.slice(-12) + ' command=' + JSON.stringify(command));
+    return { success: false, reason: 'test-fault-unresolved', outcome: CLAUDE_STARTUP_PROOF.UNRESOLVED };
+  }
   const result = scanClaudeStartupSlashProof(tabId, command, afterMs);
+  result.outcome = claudeStartupProofOutcome(result);
   console.log('[ClaudeStartupSlashProof] tab=' + tabId.slice(-12)
     + ' label=' + label
     + ' command=' + JSON.stringify(command)
     + ' afterMs=' + (afterMs || 0)
     + ' success=' + (result.success === true)
+    + ' outcome=' + result.outcome
     + ' reason=' + (result.reason || '-')
     + ' wrapperSeen=' + !!result.wrapperSeen
     + ' stdoutSeen=' + !!result.stdoutSeen
@@ -15265,6 +15382,19 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
   const shouldDismissAutocomplete = sendOptions.dismissAutocomplete === true;
   const awaitClaudeUserMessageAudit = sendOptions.awaitUserMessageAudit === true && !isSlashCommand;
   console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' handoff=' + (handoffId || '-') + ' stashFirst=' + stashFirst + ' awaitAudit=' + awaitClaudeUserMessageAudit + ' slash=' + isSlashCommand + ' ts=' + Date.now());
+  // Fault injection: report the send as successful but never write it to the
+  // PTY — exactly what a swallowed paste looks like from the caller's side.
+  // Only the first attempt is swallowed, so the automatic retry (allowed only
+  // for a provably absent command) can be observed succeeding.
+  if (
+    claudeStartupTestFaultActive('swallow-effort')
+    && String(command || '').startsWith('/effort')
+    && !source.includes(':retry')
+  ) {
+    console.warn('[TestFault] swallow-effort tab=' + String(tabId).slice(-12)
+      + ' command=' + JSON.stringify(command) + ' source=' + source);
+    return { success: true, submitted: true, testFault: 'swallow-effort' };
+  }
   const term = terminals.get(tabId);
   if (!term) {
     console.log('[send-command] ❌ Terminal not found for tabId=' + tabId);
@@ -18908,6 +19038,42 @@ ipcMain.handle('prompt-queue:materialize-image-refs', async (_event, { refs } = 
   } catch (error) {
     console.warn('[PromptQueueAssets] materialize IPC failed:', error?.message || error);
     return { success: false, refs: [], available: 0, missing: Array.isArray(refs) ? refs.length : 0, error: error?.message || 'materialize_failed' };
+  }
+});
+
+// Point-write for the Claude session id, mirroring the Codex path. Without it
+// the only writer was a full `saveTabs` carrying a possibly stale tab array,
+// which could roll another tab's freshly-detected id back to its previous
+// value — the one data-loss risk found in the concurrency audit.
+ipcMain.handle('claude:persist-session-id', (event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  const sessionId = payload?.sessionId ? String(payload.sessionId) : null;
+  const expectedSessionId = payload?.expectedSessionId ? String(payload.expectedSessionId) : null;
+  if (!tabId) return { success: false, error: 'tabId required' };
+  const projectId = resolveAuthoritativeTabProjectId(tabId);
+  if (!projectId) return { success: false, error: 'project_not_resolved' };
+  try {
+    const current = projectManager.db.getTabClaudeSessionId(projectId, tabId);
+    if (current === undefined) return { success: false, error: 'claude_tab_row_missing' };
+    if (current === sessionId) return { success: true, updated: false, currentSessionId: current };
+    const updated = projectManager.db.compareAndSetTabClaudeSessionId(
+      projectId,
+      tabId,
+      expectedSessionId ?? current ?? null,
+      sessionId,
+    );
+    if (!updated) {
+      const now = projectManager.db.getTabClaudeSessionId(projectId, tabId);
+      console.warn('[Claude:Persist] compare-and-set conflict tab=' + tabId.slice(-12)
+        + ' expected=' + (expectedSessionId ? expectedSessionId.slice(0, 8) : '-')
+        + ' current=' + (now ? String(now).slice(0, 8) : 'none'));
+      return { success: false, error: 'claude_session_compare_and_set_conflict', currentSessionId: now };
+    }
+    console.log('[Claude:Persist] point-write tab=' + tabId.slice(-12)
+      + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
+    return { success: true, updated: true };
+  } catch (error) {
+    return { success: false, error: error?.message || String(error) };
   }
 });
 

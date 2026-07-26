@@ -27,18 +27,23 @@ export interface CollapseInjection {
 const HL_FONT = { style: { fontFamily: 'inherit' } } as const;
 
 /**
- * Prism tokenises the WHOLE string and builds a React element per token, but
- * the card body is a 180-320px scroll box — everything past the first screens
- * is DOM nobody looks at. Measured (E2E ct-e2e14 §2.4): a 29KB / 6000-line
- * `seq` output cost 2.27s of main-thread work on expand, with the payload
- * ALREADY in memory — the delay was rendering, not loading, and it repeated
- * on every re-expand.
+ * Highlighting is not slow because it tokenises — it is slow because it emits
+ * one wrapper element per coloured token, and those thousands of nodes get
+ * laid out inside a box that shows ~15 lines. Measured (E2E ct-e2e14 §2.4):
+ * a 29KB / 6000-line `seq` output cost 2.27s of main-thread work on expand
+ * with the payload ALREADY in memory, repeating on every re-expand; the plain
+ * path brought that to 95ms (verified ct-e2e15).
+ *
+ * Why not defer offscreen parts here, the way `DiffView` does? Deferral needs
+ * per-row block elements the browser can individually skip. This output is one
+ * flat run of inline token spans — there are no rows to skip, so the entire
+ * blob is built either way. A diff has real rows; a highlighted blob does not.
  *
  * Threshold deliberately equals the dehydration threshold in
  * `history-payload-dehydrate.js`: content too big to ship eagerly is also too
  * big to tokenise. Past it the plain <pre> path renders the identical text
  * (same mono font, same scroll box, one text node instead of thousands of
- * elements) and only trades syntax colors — a readability aid — for a card
+ * elements) and only trades syntax colours — a readability aid — for a card
  * that opens now. Real source files stay under it and keep highlighting.
  */
 const HIGHLIGHT_MAX_CHARS = 16 * 1024;

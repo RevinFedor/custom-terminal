@@ -116,6 +116,37 @@ test('Claude defaults gate owns stickiness until its own ready signal', () => {
   }), null);
 });
 
+test('a failed gate carries the command that failed and its proof outcome', () => {
+  // The incident's card said "terminal input did not become ready" while the
+  // input was in fact ready and a single startup command had been swallowed.
+  const failed = applyClaudeStartupDefaultsGate(null, claudeInfo, {
+    tabId: claudeInfo.tabId,
+    status: 'failed',
+    reason: 'tui-ready',
+    error: '/effort max was not confirmed (absent)',
+    failedCommand: '/effort max',
+    proofOutcome: 'absent',
+    userRetryable: true,
+  }, 1);
+  assert.equal(failed.startupFailed, true);
+  assert.equal(failed.startupFailedCommand, '/effort max');
+  assert.equal(failed.startupProofOutcome, 'absent');
+  assert.equal(failed.startupUserRetryable, true);
+});
+
+test('a pending gate carries no failure detail', () => {
+  const pending = applyClaudeStartupDefaultsGate(null, claudeInfo, {
+    tabId: claudeInfo.tabId,
+    status: 'pending',
+    reason: 'tui-ready',
+    failedCommand: '/model haiku',
+  }, 1);
+  assert.equal(pending.startupPending, true);
+  assert.equal(pending.startupFailedCommand, null,
+    'a command name must not leak into a pending card');
+  assert.equal(pending.startupUserRetryable, false);
+});
+
 test('Claude defaults cleared signal removes a failed gate card', () => {
   const failed = applyClaudeStartupDefaultsGate(null, claudeInfo, {
     tabId: claudeInfo.tabId,

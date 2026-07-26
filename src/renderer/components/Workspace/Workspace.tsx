@@ -139,7 +139,8 @@ export default function Workspace() {
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
-  const [isCommandRunning, setIsCommandRunning] = useState(false);
+  const [commandRunningByTab, setCommandRunningByTab] = useState<Map<string, boolean>>(() => new Map());
+  const commandStateSeqRef = useRef(0);
   const [floatingTerminalOpenTabs, setFloatingTerminalOpenTabs] = useState<Record<string, boolean>>({});
   const [historyControlsHeight, setHistoryControlsHeight] = useState(0);
   const [agentLifecycleStatus, setAgentLifecycleStatus] = useState<AgentLifecycleSummary | null>(null);
@@ -215,6 +216,11 @@ export default function Workspace() {
     }
     return activeTab;
   }, [viewingSubAgentTabId, activeProject, activeTab]);
+  // Derived from the per-tab map so switching tabs shows THIS tab's state
+  // rather than whatever the previously focused tab last reported.
+  const isCommandRunning = effectiveTab?.id
+    ? commandRunningByTab.get(effectiveTab.id) === true
+    : false;
   const primaryHistoryTool = effectiveCommandType === 'codex'
     ? 'codex'
     : effectiveCommandType === 'claude'
@@ -530,20 +536,31 @@ export default function Workspace() {
     return () => window.removeEventListener('mousedown', onDown, true);
   }, [workspaceView, currentView, effectiveTab?.id, timelinePinned, setTimelineTreeMode]);
 
-  // Listen for OSC 133 command lifecycle events (Shell Integration)
+  // Listen for OSC 133 command lifecycle events (Shell Integration).
+  //
+  // The flag is per-tab even though only the effective tab renders it: events
+  // for background tabs used to be discarded outright, so a tab that started a
+  // command while unfocused came back looking idle. The map keeps every tab's
+  // last known state; the derived boolean below is what the UI consumes.
   useEffect(() => {
     if (!effectiveTab?.id) return;
+    const boundTabId = effectiveTab.id;
+    // Generation guard for the async initial read: on a fast A→B→C switch the
+    // reply for an earlier tab could otherwise land as the current tab's state.
+    const requestGeneration = ++commandStateSeqRef.current;
 
     const handleCommandStarted = (_: any, data: { tabId: string }) => {
-      if (data.tabId === effectiveTab.id) {
-        setIsCommandRunning(true);
-      }
+      if (!data?.tabId) return;
+      setCommandRunningByTab((prev) => (prev.get(data.tabId) === true
+        ? prev
+        : new Map(prev).set(data.tabId, true)));
     };
 
     const handleCommandFinished = (_: any, data: { tabId: string; exitCode: number }) => {
-      if (data.tabId === effectiveTab.id) {
-        setIsCommandRunning(false);
-      }
+      if (!data?.tabId) return;
+      setCommandRunningByTab((prev) => (prev.get(data.tabId) === false
+        ? prev
+        : new Map(prev).set(data.tabId, false)));
     };
 
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
@@ -551,12 +568,16 @@ export default function Workspace() {
 
     // Get initial state
     ipcRenderer.invoke('terminal:getCommandState', {
-      tabId: effectiveTab.id,
+      tabId: boundTabId,
       caller: 'Workspace.effectiveTabSync',
       expectedProcess: 'codex',
       allowProcessTreeLookup: effectiveCommandType === 'codex' || !!effectiveCodexSessionId,
     }).then((state: any) => {
-      setIsCommandRunning(state?.isRunning || false);
+      if (requestGeneration !== commandStateSeqRef.current) return;
+      const running = state?.isRunning || false;
+      setCommandRunningByTab((prev) => (prev.get(boundTabId) === running
+        ? prev
+        : new Map(prev).set(boundTabId, running)));
     });
 
     return () => {

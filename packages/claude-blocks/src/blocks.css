@@ -289,6 +289,22 @@
   overflow-y: visible;
 }
 .cb-diff-row { display: flex; align-items: flex-start; }
+/* Long diffs only (see DIFF_DEFER_MIN_ROWS): let the browser skip building
+   rows that are outside the diff's own scroll box, and build them shortly
+   before they scroll into view. `contain-intrinsic-size: auto <h>` is the load-
+   bearing half — it reserves one line-height for a not-yet-built row and then
+   REMEMBERS the real height once measured, so the scrollbar and the row
+   numbering stay stable instead of resizing as the user scrolls. Colour,
+   markup and highlighting are untouched: this changes WHEN a row is built,
+   never how it looks. */
+.cb-diff-defer {
+  content-visibility: auto;
+  /* One text line is the right guess for a code row; `auto` means the browser
+     replaces this estimate with the row's real measured height the first time
+     it builds it, and keeps it afterwards. A literal em here would resolve
+     against this row's own font-size, which is what one line already is. */
+  contain-intrinsic-size: auto 1.55em;
+}
 /* Фон строк задаётся inline через токены (--cb-diff-add-bg/del-bg), эти
    классы — семантические хуки для override в потребителе при желании. */
 .cb-diff-row--add {}

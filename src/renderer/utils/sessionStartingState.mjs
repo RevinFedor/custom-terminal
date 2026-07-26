@@ -125,6 +125,12 @@ export function applyClaudeStartupDefaultsGate(previous, info, detail, now = Dat
     startupError: failed
       ? (detail.error || detail.reason || 'Claude startup defaults failed')
       : null,
+    // Which command failed, so the card can say `/effort max` instead of the
+    // generic "terminal input did not become ready" — that subtitle actively
+    // contradicted the real cause in the 2026-07-25 incident.
+    startupFailedCommand: failed ? (detail.failedCommand || null) : null,
+    startupProofOutcome: failed ? (detail.proofOutcome || null) : null,
+    startupUserRetryable: failed ? detail.userRetryable === true : false,
     stickySource: CLAUDE_STARTUP_DEFAULTS_SOURCE,
   };
 }

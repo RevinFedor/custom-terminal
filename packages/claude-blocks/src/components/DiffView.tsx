@@ -11,6 +11,13 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import type { DiffEntry } from '../helpers';
 import { numberDiff } from '../helpers';
 
+/**
+ * Below this row count a diff is cheap enough to build in full; deferring it
+ * would only add containment bookkeeping. Roughly two screenfuls of the 320px
+ * diff box.
+ */
+const DIFF_DEFER_MIN_ROWS = 40;
+
 function HighlightedLine({ line, language }: { line: string; language: string }) {
   return (
     <SyntaxHighlighter
@@ -64,6 +71,18 @@ export function DiffView({
   const rows = hasReal
     ? numberDiff(entries, resolvedOldStart, resolvedNewStart)
     : null;
+  // Highlighting splits every line into one wrapper per colour, so a row costs
+  // ~42 layout nodes instead of 1 — a 280-line diff builds ~12k of them while
+  // its own 320px scroll box shows about 20. Measured cost: 0.4-0.8s of paint
+  // after the loader had already been hidden (prod 26.07). Tokenising is NOT
+  // the expensive part (4.4ms for 280 lines), so the fix must not touch
+  // colour: rows below the fold simply must not be built until they approach
+  // the viewport. `cb-diff-defer` hands that decision to the browser — it
+  // skips offscreen rows, builds them slightly before they scroll in, and
+  // reclaims them after, with no scroll listeners and no second virtualiser
+  // nested inside Virtuoso. Cheap diffs stay eager: below this size the
+  // containment bookkeeping costs more than the rows it would save.
+  const deferRows = entries.length > DIFF_DEFER_MIN_ROWS;
   return (
     <div className="cb-diff" data-diff-lang={language}>
       {entries.map((e, idx) => {
@@ -82,7 +101,11 @@ export function DiffView({
           ? (e.tag === 'del' ? r.oldNo : r.newNo)
           : unknownLineNumbers ? '' : idx + 1;
         return (
-          <div key={idx} className={rowClass} style={{ background: bg }}>
+          <div
+            key={idx}
+            className={deferRows ? rowClass + ' cb-diff-defer' : rowClass}
+            style={{ background: bg }}
+          >
             <span className="cb-diff-no">{no}</span>
             <span className={markClass}>{sign}</span>
             <span className="cb-diff-code" style={{ color: e.tag === 'del' ? 'var(--cb-diff-del-text)' : undefined }}>

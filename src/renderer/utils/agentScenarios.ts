@@ -156,12 +156,17 @@ export function interruptAgentTurnScenario({
   tabId,
   toolType,
   runtime,
+  busy,
 }: {
   tabId: string;
   toolType: AgentHistoryTool;
   runtime: HistoryAgentRuntime;
+  // Callers that know the live turn state pass it through so a runtime can
+  // refuse an interrupt whose keystroke means something else when idle.
+  // Unknown (undefined) keeps the previous behaviour.
+  busy?: boolean;
 }): any {
-  const result = runtime.interruptTurn(tabId);
+  const result = runtime.interruptTurn(tabId, { busy });
   return { tabId, toolType, interrupted: !!result.interrupted, ...(result || {}) };
 }
 

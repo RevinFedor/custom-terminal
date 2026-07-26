@@ -75,6 +75,10 @@ interface Props {
 const CACHE_TTL_MIN = 60; // server-side 1h TTL (see fact-provider-proxy.md)
 type PtyTransitionEngine = 'claude' | 'codex';
 type SessionActionBlockedStatus = Extract<AgentPtyStatus, 'starting' | 'stopping'> | null;
+// Upper bound for an inline chip action (fork, clipboard fork). Generous
+// enough for a real fork of a large session, short enough that a stuck
+// operation reports instead of spinning for the rest of the session.
+const INLINE_ACTION_DEADLINE_MS = 90_000;
 type InlineAsyncActionKey =
   | 'fork-to-pty'
   | 'fork-to-sdk'
@@ -996,6 +1000,21 @@ export default function ClaudeControlBar({
     const identity = { tabId, key, seq: ++inlineActionSeqRef.current };
     inlineActionRef.current = identity;
     setInlineAction(identity);
+    // Terminal guarantee. `finally` already covers resolve and throw, but an
+    // operation that never settles at all (a promise that stays pending —
+    // dropped IPC reply, an await on an event that will not arrive) left the
+    // spinner running forever, clearable only by switching tabs and back. A
+    // loader must have a terminal condition it cannot avoid, so a bounded
+    // deadline reports the timeout instead of spinning silently.
+    const deadline = window.setTimeout(() => {
+      const current = inlineActionRef.current;
+      if (current?.seq !== identity.seq) return;
+      console.warn('[InlineAction] cleared tab=' + identity.tabId.slice(-12)
+        + ' key=' + identity.key + ' seq=' + identity.seq + ' reason=deadline');
+      inlineActionRef.current = null;
+      setInlineAction((visible) => (visible?.seq === identity.seq ? null : visible));
+      showToast('Действие не завершилось — попробуйте ещё раз', 'error');
+    }, INLINE_ACTION_DEADLINE_MS);
     try {
       await action();
     } catch (error: any) {
@@ -1003,12 +1022,15 @@ export default function ClaudeControlBar({
         + ' action=' + key + ' error=' + String(error?.message || error));
       showToast('Действие не выполнено: ' + String(error?.message || error), 'error');
     } finally {
+      window.clearTimeout(deadline);
       const current = inlineActionRef.current;
       if (
         current?.tabId === identity.tabId
         && current.key === identity.key
         && current.seq === identity.seq
       ) {
+        console.warn('[InlineAction] cleared tab=' + identity.tabId.slice(-12)
+          + ' key=' + identity.key + ' seq=' + identity.seq + ' reason=settled');
         inlineActionRef.current = null;
         setInlineAction((visible) => (
           visible?.tabId === identity.tabId
@@ -3294,12 +3316,12 @@ export default function ClaudeControlBar({
             label={codexForkProbeFailed
               ? 'Не удалось проверить активную историю Codex — нажмите, чтобы повторить'
               : codexForkWaitingForHistory
-              ? 'Codex работает, активная история ещё подтверждается'
+              ? 'После Resume ветка Codex подтвердится вашим первым сообщением — до этого форк недоступен'
               : 'Создать fork сессии в новой PTY-вкладке'}
           >
           <button
             type="button"
-            aria-busy={isInlineActionLoading('fork-to-pty') || codexForkWaitingForHistory}
+            aria-busy={isInlineActionLoading('fork-to-pty')}
             aria-disabled={inlineAction?.tabId === tabId || codexForkWaitingForHistory}
             className="text-[10px] px-1.5 py-0.5 rounded text-[#999] hover:text-white cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
             style={{
@@ -3324,10 +3346,21 @@ export default function ClaudeControlBar({
               ? 'Активная история Codex ещё подтверждается'
               : 'Fork в новую вкладку'}
           >
-            <InlineActionContent loading={isInlineActionLoading('fork-to-pty') || codexForkWaitingForHistory}>
+            {/* A spinner promises "this finishes on its own". In the Codex
+                provisional window it does not: the writer is confirmed by the
+                user's FIRST MESSAGE, so the chip used to spin indefinitely with
+                the real reason hidden in a hover title. Waiting-for-writer is a
+                static state (dimmed label + hint), and the spinner is reserved
+                for an actual in-flight fork. */}
+            <InlineActionContent loading={isInlineActionLoading('fork-to-pty')}>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
                 <span>⑂→</span>
                 <span style={{ fontSize: '11px' }}>▭</span>
+                {codexForkWaitingForHistory && (
+                  <span style={{ fontSize: '9px', opacity: 0.75, marginLeft: 2 }}>
+                    ждёт 1-е сообщение
+                  </span>
+                )}
               </span>
             </InlineActionContent>
           </button>

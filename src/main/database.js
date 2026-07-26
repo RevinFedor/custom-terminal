@@ -1352,6 +1352,15 @@ class DatabaseManager {
   // renderer workspace snapshot is only a cache and may still carry the resume
   // source (or a previously active writer), so it must not own this column for
   // an existing row. New rows are seeded by saveTabs below.
+  getTabClaudeSessionId(projectId, tabId) {
+    if (arguments.length < 2 || !projectId || !tabId) return undefined;
+    const row = this.db.prepare(
+      'SELECT claude_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+    ).get(projectId, tabId);
+    if (!row) return undefined;
+    return row.claude_session_id || null;
+  }
+
   getTabCodexSessionId(projectId, tabId) {
     if (arguments.length < 2 || !projectId || !tabId) return undefined;
     const row = this.db.prepare(
@@ -1469,6 +1478,28 @@ class DatabaseManager {
       projectId,
       tabId,
     );
+    return info.changes === 1;
+  }
+
+  // Claude session identity had no point-write path at all: the renderer
+  // mutated its tab object and fired a full `saveTabs`, which wrote
+  // `claude_session_id` verbatim from an array that may have been assembled
+  // BEFORE a neighbouring tab received its new id from the bridge. The
+  // neighbour's id was then rolled back, and after a restart that tab opened
+  // on a stale (or foreign) session while its JSONL was intact. Same contract
+  // as the Codex CAS above: write only if the row still holds what the caller
+  // saw.
+  compareAndSetTabClaudeSessionId(projectId, tabId, expectedSessionId, nextSessionId) {
+    if (arguments.length < 4 || !projectId || !tabId) return false;
+    const expected = typeof expectedSessionId === 'string' && expectedSessionId.trim()
+      ? expectedSessionId.trim()
+      : null;
+    const next = typeof nextSessionId === 'string' && nextSessionId.trim()
+      ? nextSessionId.trim()
+      : null;
+    const info = this.db.prepare(
+      'UPDATE tabs SET claude_session_id = ? WHERE project_id = ? AND tab_id = ? AND claude_session_id IS ?'
+    ).run(next, projectId, tabId, expected);
     return info.changes === 1;
   }
 
@@ -2253,6 +2284,16 @@ class DatabaseManager {
       for (const r of rows) codexSessionSnapshot.set(r.tab_id, r.codex_session_id);
     }
 
+    // Same protection for Claude. A renderer save carries whatever the tab
+    // array held when it was built; if the bridge assigned a new session id to
+    // another tab in between, that id must not be rolled back by this write.
+    // A new tab (absent here) may still seed its incoming id.
+    const claudeSessionSnapshot = new Map();
+    {
+      const rows = this.db.prepare('SELECT tab_id, claude_session_id FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL').all(projectId);
+      for (const r of rows) claudeSessionSnapshot.set(r.tab_id, r.claude_session_id);
+    }
+
     // Main can point-write an exact model/effort proof before renderer receives
     // the matching IPC event. Preserve whichever side has the newer proof
     // timestamp so an unrelated stale full save cannot resurrect old launch
@@ -2359,6 +2400,9 @@ class DatabaseManager {
         const codexSessionId = codexSessionSnapshot.has(tab.tabId)
           ? codexSessionSnapshot.get(tab.tabId)
           : (tab.codexSessionId || null);
+        const claudeSessionId = claudeSessionSnapshot.has(tab.tabId)
+          ? claudeSessionSnapshot.get(tab.tabId)
+          : (tab.claudeSessionId || null);
         const incomingCodexSettings = {
           model: tab.codexModel || null,
           effort: tab.codexEffort || null,
@@ -2384,7 +2428,7 @@ class DatabaseManager {
           )
           ? persistedCodexSettings
           : incomingCodexSettings;
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, claudeSessionId, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
