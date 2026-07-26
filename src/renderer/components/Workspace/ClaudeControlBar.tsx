@@ -1166,6 +1166,15 @@ export default function ClaudeControlBar({
       if (ptyTransitionEngine !== 'codex' || data?.tabId !== tabId) return;
       void refreshSessionActionBlockedStatus('codex-session-detected');
     };
+    // Writer re-proof with the SAME session id (proof invalidated by a
+    // process-unknown outage, then re-proven) never emits session-detected.
+    // Without this wire the fork gate stays ready=false until a manual
+    // spinner click — the confirmed "infinite fork loader" path.
+    const onCodexWriterReproven = (_: any, data: { tabId?: string; engine?: string; writerProven?: boolean }) => {
+      if (ptyTransitionEngine !== 'codex' || data?.tabId !== tabId) return;
+      if (data?.engine !== 'codex' || data?.writerProven !== true) return;
+      void refreshSessionActionBlockedStatus('codex-writer-reproven');
+    };
     const onCodexNotReady = (_: any, data: { tabId?: string; reason?: string | null }) => {
       if (ptyTransitionEngine !== 'codex' || data?.tabId !== tabId) return;
       void refreshSessionActionBlockedStatus('codex-not-ready:' + (data.reason || '-'));
@@ -1189,6 +1198,7 @@ export default function ClaudeControlBar({
     ipcRenderer.on('claude:busy-state', onAgentBusy);
     ipcRenderer.on('codex:busy-state', onAgentBusy);
     ipcRenderer.on('codex:session-detected', onCodexSessionDetected);
+    ipcRenderer.on('terminal:mcp-ai-tab', onCodexWriterReproven);
     ipcRenderer.on('codex:tui-not-ready', onCodexNotReady);
     ipcRenderer.on('codex:tui-manual-action-required', onCodexManualAction);
     ipcRenderer.on('agent:stopping-state', onAgentStopping);
@@ -1200,6 +1210,7 @@ export default function ClaudeControlBar({
       ipcRenderer.removeListener('claude:busy-state', onAgentBusy);
       ipcRenderer.removeListener('codex:busy-state', onAgentBusy);
       ipcRenderer.removeListener('codex:session-detected', onCodexSessionDetected);
+      ipcRenderer.removeListener('terminal:mcp-ai-tab', onCodexWriterReproven);
       ipcRenderer.removeListener('codex:tui-not-ready', onCodexNotReady);
       ipcRenderer.removeListener('codex:tui-manual-action-required', onCodexManualAction);
       ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);

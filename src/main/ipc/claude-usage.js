@@ -32,6 +32,8 @@ const CLAUDE_USAGE_PENDING_CONFIRM_MS = 30 * 1000;
 const CLAUDE_USAGE_REGRESSION_POINTS = 10;
 const CLAUDE_USAGE_RESET_TOLERANCE_MS = 2 * 60 * 1000;
 const CLAUDE_USAGE_INCONSISTENT_WARNING = 'Claude returned inconsistent usage. Showing the last verified value.';
+const CLAUDE_STATUSLINE_BINDING_LIMIT = 512;
+const CLAUDE_STATUSLINE_PERSISTED_BINDING_LIMIT = 128;
 
 let _projectManager = null;
 let claudeUsageStateStore = null;
@@ -41,6 +43,7 @@ const claudeUsageByAccount = new Map();
 const claudeUsageInflight = new Map();
 const statuslineSessionBindings = new Map();
 const statuslineBindingInflight = new Map();
+const persistedStatuslineBindings = new Map();
 
 class ClaudeUsageError extends Error {
   constructor(code, message, status = null) {
@@ -214,6 +217,10 @@ async function readClaudeAuthState({
   ]);
 
   const status = statusResult && typeof statusResult === 'object' ? statusResult : null;
+  // Keychain entries can outlive a login and cannot identify which account is
+  // currently active on their own. Without the authoritative CLI status, keep
+  // saved snapshots stale instead of inventing a current account.
+  if (!status) return null;
   const apiPayload = parseKeychainPayload(apiRaw);
   const oauthPayload = parseKeychainPayload(oauthRaw);
   const apiKeyFromApiService = extractApiKey(apiPayload);
@@ -328,9 +335,54 @@ function normalizeExtraUsage(raw) {
   return result;
 }
 
-function normalizeClaudeUsageData(raw, { statusline = false } = {}) {
+function normalizeModelScopedUsage(raw) {
+  let source = null;
+  let fromLimits = false;
+  if (Array.isArray(raw?.model_scoped)) {
+    source = raw.model_scoped;
+  } else if (Array.isArray(raw?.limits)) {
+    source = raw.limits;
+    fromLimits = true;
+  }
+  if (!source) return [];
+
+  const normalized = new Map();
+  for (const item of source.slice(0, 64)) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    if (fromLimits && (item.kind !== 'weekly_scoped' || item.group !== 'weekly')) continue;
+    const rawName = fromLimits ? item?.scope?.model?.display_name : item.display_name;
+    if (typeof rawName !== 'string') continue;
+    const displayName = rawName.trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (!displayName) continue;
+    try {
+      const utilization = normalizePercent(
+        fromLimits ? item.percent : item.utilization,
+        `model_scoped.${displayName}.utilization`,
+      );
+      const resetsAt = normalizeResetAt(
+        item.resets_at ?? item.reset_at ?? null,
+        `model_scoped.${displayName}.resets_at`,
+      );
+      normalized.set(displayName.toLocaleLowerCase('en-US'), {
+        display_name: displayName,
+        utilization,
+        resets_at: resetsAt,
+      });
+    } catch {
+      // Model-specific limits are optional. One malformed entry must not hide
+      // otherwise valid five-hour and weekly usage.
+    }
+    if (normalized.size >= 16) break;
+  }
+  return [...normalized.values()];
+}
+
+function normalizeClaudeUsageData(raw, { statusline = false, modelScopedOnly = false } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ClaudeUsageError('invalid_response', 'Claude usage response must be an object');
+  }
+  if (modelScopedOnly) {
+    return { model_scoped: normalizeModelScopedUsage(raw) };
   }
   const data = {
     five_hour: normalizeUsageBucket(raw.five_hour, 'five_hour', statusline ? 'used_percentage' : 'utilization'),
@@ -339,6 +391,9 @@ function normalizeClaudeUsageData(raw, { statusline = false } = {}) {
     seven_day_sonnet: normalizeUsageBucket(raw.seven_day_sonnet, 'seven_day_sonnet'),
     extra_usage: normalizeExtraUsage(raw.extra_usage),
   };
+  if (!statusline) {
+    data.model_scoped = normalizeModelScopedUsage(raw);
+  }
   if (!data.five_hour && !data.seven_day) {
     throw new ClaudeUsageError('invalid_response', 'Claude usage has no five-hour or seven-day window');
   }
@@ -371,6 +426,7 @@ function usageBucketSnapshot(data, key) {
 
 function mergeClaudeUsageData(previous, candidate) {
   if (!previous) return candidate;
+  const candidateHasModelScopes = Object.prototype.hasOwnProperty.call(candidate || {}, 'model_scoped');
   return {
     ...previous,
     ...candidate,
@@ -379,6 +435,9 @@ function mergeClaudeUsageData(previous, candidate) {
     seven_day_opus: candidate?.seven_day_opus || previous.seven_day_opus || null,
     seven_day_sonnet: candidate?.seven_day_sonnet || previous.seven_day_sonnet || null,
     extra_usage: candidate?.extra_usage || previous.extra_usage || null,
+    model_scoped: candidateHasModelScopes
+      ? candidate.model_scoped
+      : (previous.model_scoped || []),
   };
 }
 
@@ -509,6 +568,7 @@ async function fetchUsage(token, {
   fetchImpl = global.fetch,
   timeoutMs = USAGE_TIMEOUT_MS,
   now = Date.now,
+  modelScopedOnly = false,
 } = {}) {
   if (!token) throw new ClaudeUsageError('auth_missing', 'Claude OAuth token is unavailable');
   if (typeof fetchImpl !== 'function') throw new ClaudeUsageError('network_error', 'Fetch is unavailable');
@@ -544,7 +604,7 @@ async function fetchUsage(token, {
       throw new ClaudeUsageError('invalid_response', 'Anthropic usage response is not JSON');
     }
     return {
-      data: normalizeClaudeUsageData(payload),
+      data: normalizeClaudeUsageData(payload, { modelScopedOnly }),
       fetchedAt: now(),
     };
   } catch (error) {
@@ -796,7 +856,9 @@ function sanitizeClaudePersistedAccount(raw) {
       .includes(raw?.credentialKind) ? raw.credentialKind : null,
     usageEndpointEligible: raw?.usageEndpointEligible === true,
     label: label || 'Claude account',
-    accountHint: sanitizePersistedText(raw?.accountHint, 80),
+    accountHint: kind === 'api-platform'
+      ? 'Anthropic API Platform'
+      : (kind === 'claude-managed-key' ? 'Claude.ai managed login' : 'Claude subscription'),
     accountIdHint: null,
     source,
     timestamp: Number.isFinite(timestampMs) ? new Date(timestampMs).toISOString() : null,
@@ -822,7 +884,21 @@ function serializeClaudeUsageState(entries = claudeUsageByAccount) {
     .filter(Boolean)
     .sort((left, right) => right.touchedAt - left.touchedAt)
     .slice(0, 8);
-  return { version: 1, accounts };
+  const sessionBindings = [...persistedStatuslineBindings.entries()]
+    .map(([bindingHash, binding]) => (
+      /^[a-f0-9]{32}$/.test(bindingHash)
+      && claudeUsageByAccount.has(binding?.accountKey)
+        ? {
+            bindingHash,
+            accountKey: binding.accountKey,
+            touchedAt: Number(binding.touchedAt || 0) || 0,
+          }
+        : null
+    ))
+    .filter(Boolean)
+    .sort((left, right) => right.touchedAt - left.touchedAt)
+    .slice(0, CLAUDE_STATUSLINE_PERSISTED_BINDING_LIMIT);
+  return { version: 1, accounts, sessionBindings };
 }
 
 function parseClaudeUsageState(raw) {
@@ -846,6 +922,26 @@ function parseClaudeUsageState(raw) {
       pending: null,
       warning: null,
       retryNotBefore: 0,
+      needsLiveRefresh: true,
+    };
+  }).filter(Boolean);
+}
+
+function parseClaudeStatuslineBindings(raw) {
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch { return []; }
+  }
+  if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.sessionBindings)) return [];
+  return parsed.sessionBindings.slice(0, CLAUDE_STATUSLINE_PERSISTED_BINDING_LIMIT).map((item) => {
+    const bindingHash = sanitizePersistedText(item?.bindingHash, 32);
+    const accountKey = sanitizePersistedText(item?.accountKey, 80);
+    if (!bindingHash || !/^[a-f0-9]{32}$/.test(bindingHash)) return null;
+    if (!accountKey || !/^claude:[a-f0-9]{20}$/.test(accountKey)) return null;
+    return {
+      bindingHash,
+      accountKey,
+      touchedAt: Number(item?.touchedAt || 0) || 0,
     };
   }).filter(Boolean);
 }
@@ -860,8 +956,14 @@ function hydrateClaudeUsageState() {
   if (!store?.getAppState) return;
   claudeUsageStateHydrated = true;
   try {
-    for (const entry of parseClaudeUsageState(store.getAppState(CLAUDE_USAGE_PERSISTENCE_KEY))) {
+    const raw = store.getAppState(CLAUDE_USAGE_PERSISTENCE_KEY);
+    for (const entry of parseClaudeUsageState(raw)) {
       claudeUsageByAccount.set(entry.account.accountKey, entry);
+    }
+    for (const binding of parseClaudeStatuslineBindings(raw)) {
+      if (claudeUsageByAccount.has(binding.accountKey)) {
+        persistedStatuslineBindings.set(binding.bindingHash, binding);
+      }
     }
   } catch (error) {
     console.warn('[ClaudeUsage] persisted accounts restore failed:', error?.message || String(error));
@@ -885,6 +987,30 @@ function pruneClaudeUsageAccounts(currentAccountKey = null) {
     .sort((left, right) => Number(left[1]?.touchedAt || 0) - Number(right[1]?.touchedAt || 0));
   while (claudeUsageByAccount.size > 8 && removable.length > 0) {
     claudeUsageByAccount.delete(removable.shift()[0]);
+  }
+  for (const [bindingHash, binding] of persistedStatuslineBindings) {
+    if (!claudeUsageByAccount.has(binding.accountKey)) {
+      persistedStatuslineBindings.delete(bindingHash);
+    }
+  }
+}
+
+function pruneClaudeStatuslineBindings() {
+  while (statuslineSessionBindings.size > CLAUDE_STATUSLINE_BINDING_LIMIT) {
+    statuslineSessionBindings.delete(statuslineSessionBindings.keys().next().value);
+  }
+  while (persistedStatuslineBindings.size > CLAUDE_STATUSLINE_PERSISTED_BINDING_LIMIT) {
+    let oldestKey = null;
+    let oldestAt = Number.POSITIVE_INFINITY;
+    for (const [bindingHash, binding] of persistedStatuslineBindings) {
+      const touchedAt = Number(binding?.touchedAt || 0);
+      if (touchedAt < oldestAt) {
+        oldestKey = bindingHash;
+        oldestAt = touchedAt;
+      }
+    }
+    if (!oldestKey) break;
+    persistedStatuslineBindings.delete(oldestKey);
   }
 }
 
@@ -910,6 +1036,10 @@ function ensureCurrentAuthAccount(auth, now = Date.now()) {
     pending: previous?.pending || null,
     warning: previous?.warning || null,
     retryNotBefore: previous?.retryNotBefore || 0,
+    needsLiveRefresh: previous
+      ? (previous.needsLiveRefresh === true
+        || (previous.tokenFingerprint != null && previous.tokenFingerprint !== auth.tokenFingerprint))
+      : false,
   };
   claudeUsageByAccount.set(auth.accountKey, next);
   pruneClaudeUsageAccounts(auth.accountKey);
@@ -927,7 +1057,7 @@ function listClaudeUsageAccounts(currentAccountKey = null, now = Date.now()) {
       return {
         ...account,
         isCurrent,
-        stale: !isCurrent || !account.usage || !!entry.error || !!entry.warning
+        stale: !isCurrent || !account.usage || !!entry.error || !!entry.warning || !!entry.needsLiveRefresh
           || !fetchedAt || now - fetchedAt > USAGE_STALE_MS,
         lastError: isCurrent ? (entry.error || null) : null,
         warning: isCurrent ? (entry.warning || null) : null,
@@ -1007,6 +1137,25 @@ function saveUsageSnapshot(accountKey, data, fetchedAt) {
 async function bindStatuslineSession(bindingKey, authReader) {
   const existing = statuslineSessionBindings.get(bindingKey);
   if (existing) return existing;
+  const bindingHash = shortHash(`statusline-binding-v1|${bindingKey}`, 32);
+  const persisted = persistedStatuslineBindings.get(bindingHash);
+  const persistedAccount = persisted
+    ? claudeUsageByAccount.get(persisted.accountKey)?.account
+    : null;
+  if (persistedAccount) {
+    const binding = {
+      accountKey: persisted.accountKey,
+      tokenFingerprint: null,
+      account: persistedAccount,
+    };
+    statuslineSessionBindings.set(bindingKey, binding);
+    persistedStatuslineBindings.set(bindingHash, {
+      ...persisted,
+      touchedAt: Date.now(),
+    });
+    pruneClaudeStatuslineBindings();
+    return binding;
+  }
   let inflight = statuslineBindingInflight.get(bindingKey);
   if (!inflight) {
     inflight = (async () => {
@@ -1020,6 +1169,12 @@ async function bindStatuslineSession(bindingKey, authReader) {
         account: accountFromAuth(after),
       };
       statuslineSessionBindings.set(bindingKey, binding);
+      persistedStatuslineBindings.set(bindingHash, {
+        bindingHash,
+        accountKey: after.accountKey,
+        touchedAt: Date.now(),
+      });
+      pruneClaudeStatuslineBindings();
       return binding;
     })();
     statuslineBindingInflight.set(bindingKey, inflight);
@@ -1069,16 +1224,17 @@ async function recordStatuslineUsage(data, {
       ...binding.account,
       ...(reconciled.entry?.account || previous?.account || {}),
     },
-    tokenFingerprint: binding.tokenFingerprint,
+    tokenFingerprint: previous?.tokenFingerprint || binding.tokenFingerprint,
     lastAttemptAt: fetchedAt,
     touchedAt: nowMs,
     error: null,
     errorAt: 0,
     billing: previous?.billing || null,
     retryNotBefore: 0,
+    needsLiveRefresh: reconciled.accepted ? false : (previous?.needsLiveRefresh || false),
   };
   claudeUsageByAccount.set(binding.accountKey, next);
-  pruneClaudeUsageAccounts(null);
+  pruneClaudeUsageAccounts(binding.accountKey);
   if (reconciled.accepted) {
     persistClaudeUsageState();
     saveUsageSnapshot(binding.accountKey, next.account.usage, next.fetchedAt);
@@ -1096,8 +1252,9 @@ async function fetchCurrentClaudeUsage(auth, {
   authReader,
   fetchImpl,
   now,
+  modelScopedOnly = false,
 } = {}) {
-  const inflightKey = `${auth.accountKey}:${auth.tokenFingerprint || 'session'}:${auth.currentKind}`;
+  const inflightKey = `${auth.accountKey}:${auth.tokenFingerprint || 'session'}:${auth.currentKind}:${modelScopedOnly ? 'model-scoped' : 'full'}`;
   let request = claudeUsageInflight.get(inflightKey);
   if (!request) {
     request = (async () => {
@@ -1111,7 +1268,7 @@ async function fetchCurrentClaudeUsage(auth, {
           fetchedAt: now(),
         };
       } else {
-        result = await fetchUsage(auth.oauthToken, { fetchImpl, now });
+        result = await fetchUsage(auth.oauthToken, { fetchImpl, now, modelScopedOnly });
       }
       const latestAuth = await authReader();
       if (!authMatches(auth, latestAuth)) {
@@ -1164,9 +1321,14 @@ async function getUsage(opts = {}) {
   }
 
   const current = claudeUsageByAccount.get(auth.accountKey) || null;
-  const hasFreshPrimarySnapshot = current?.account?.usage
-    && current.account.source === 'claude-statusline'
-    && nowMs - Number(current.fetchedAt || 0) < CACHE_TTL_MS;
+  const hasStatuslinePrimary = !current?.needsLiveRefresh
+    && current?.account?.usage
+    && current.account.source === 'claude-statusline';
+  const hasFreshModelQuota = current?.tokenFingerprint === auth.tokenFingerprint
+    && Number(current?.modelQuotaFetchedAt || 0) > 0
+    && nowMs - Number(current.modelQuotaFetchedAt) < CACHE_TTL_MS;
+  const enrichmentOnly = auth.currentKind === 'max-oauth' && hasStatuslinePrimary;
+  const needsModelQuotaRefresh = enrichmentOnly && (force || !hasFreshModelQuota);
 
   // Managed /login credentials cannot call /api/oauth/usage. The official
   // statusLine snapshot is the only quota source; refresh re-reads auth but
@@ -1180,7 +1342,14 @@ async function getUsage(opts = {}) {
     });
   }
 
-  if (auth.currentKind !== 'api-platform' && hasFreshPrimarySnapshot) {
+  if (auth.currentKind !== 'api-platform' && hasStatuslinePrimary && !needsModelQuotaRefresh) {
+    return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
+  }
+  if (enrichmentOnly && current?.modelQuotaRetryNotBefore && nowMs < current.modelQuotaRetryNotBefore) {
+    return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
+  }
+  if (enrichmentOnly && !force && current?.modelQuotaErrorAt
+    && nowMs - current.modelQuotaErrorAt < ERROR_COOLDOWN_MS) {
     return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
   }
   if (current?.retryNotBefore && nowMs < current.retryNotBefore) {
@@ -1192,6 +1361,7 @@ async function getUsage(opts = {}) {
     return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
   }
   if (!force && !current?.error && current?.account?.usage
+    && !current.needsLiveRefresh
     && current.tokenFingerprint === auth.tokenFingerprint
     && nowMs - Number(current.fetchedAt || 0) < CACHE_TTL_MS) {
     return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
@@ -1204,9 +1374,14 @@ async function getUsage(opts = {}) {
       authReader,
       fetchImpl,
       now,
+      modelScopedOnly: enrichmentOnly,
     });
     auth = result.auth || auth;
     const previous = claudeUsageByAccount.get(auth.accountKey) || null;
+    const preserveStatuslinePrimary = auth.currentKind === 'max-oauth'
+      && !previous?.needsLiveRefresh
+      && previous?.account?.usage
+      && previous.account.source === 'claude-statusline';
     if (auth.currentKind === 'api-platform') {
       claudeUsageByAccount.set(auth.accountKey, {
         ...previous,
@@ -1218,6 +1393,30 @@ async function getUsage(opts = {}) {
         error: result.billing?.error || null,
         errorAt: result.billing?.error ? lastAttemptAt : 0,
         retryNotBefore: 0,
+        needsLiveRefresh: false,
+      });
+    } else if (preserveStatuslinePrimary) {
+      const mergedUsage = mergeClaudeUsageData(previous.account.usage, {
+        model_scoped: result.data?.model_scoped || [],
+      });
+      claudeUsageByAccount.set(auth.accountKey, {
+        ...previous,
+        account: {
+          ...previous.account,
+          ...accountFromAuth(auth),
+          usage: mergedUsage,
+          source: previous.account.source,
+          timestamp: previous.account.timestamp,
+        },
+        tokenFingerprint: auth.tokenFingerprint,
+        modelQuotaFetchedAt: result.fetchedAt,
+        modelQuotaErrorAt: 0,
+        modelQuotaRetryNotBefore: 0,
+        touchedAt: lastAttemptAt,
+        error: null,
+        errorAt: 0,
+        retryNotBefore: 0,
+        needsLiveRefresh: false,
       });
     } else {
       const reconciled = reconcileClaudeUsageSnapshot(previous, {
@@ -1237,6 +1436,10 @@ async function getUsage(opts = {}) {
         error: null,
         errorAt: 0,
         retryNotBefore: 0,
+        modelQuotaFetchedAt: result.fetchedAt,
+        modelQuotaErrorAt: 0,
+        modelQuotaRetryNotBefore: 0,
+        needsLiveRefresh: reconciled.accepted ? false : (previous?.needsLiveRefresh || false),
       };
       claudeUsageByAccount.set(auth.accountKey, next);
       if (reconciled.accepted) {
@@ -1272,6 +1475,36 @@ async function getUsage(opts = {}) {
       });
     }
     const previous = claudeUsageByAccount.get(auth.accountKey) || null;
+    const failureAt = now();
+    const preserveStatuslinePrimary = auth.currentKind === 'max-oauth'
+      && !previous?.needsLiveRefresh
+      && previous?.account?.usage
+      && previous.account.source === 'claude-statusline';
+    if (preserveStatuslinePrimary) {
+      const modelQuotaIsStale = !previous.modelQuotaFetchedAt
+        || failureAt - Number(previous.modelQuotaFetchedAt) > USAGE_STALE_MS;
+      claudeUsageByAccount.set(auth.accountKey, {
+        ...previous,
+        account: modelQuotaIsStale
+          ? {
+              ...previous.account,
+              usage: mergeClaudeUsageData(previous.account.usage, { model_scoped: [] }),
+            }
+          : previous.account,
+        tokenFingerprint: auth.tokenFingerprint,
+        touchedAt: lastAttemptAt,
+        modelQuotaErrorAt: failureAt,
+        modelQuotaRetryNotBefore: error?.code === 'rate_limited'
+          ? failureAt + Number(error.retryAfterMs || ERROR_COOLDOWN_MS)
+          : 0,
+      });
+      console.warn('[ClaudeUsage] optional model quota refresh failed account=' + auth.label + ' code=' + (error?.code || 'network_error'));
+      return buildUsageResponse({
+        requestedAccountKey,
+        currentAccountKey: auth.accountKey,
+        now: now(),
+      });
+    }
     claudeUsageByAccount.set(auth.accountKey, {
       ...previous,
       tokenFingerprint: auth.tokenFingerprint,
@@ -1612,6 +1845,7 @@ function resetClaudeUsageStateForTests() {
   claudeUsageInflight.clear();
   statuslineSessionBindings.clear();
   statuslineBindingInflight.clear();
+  persistedStatuslineBindings.clear();
   claudeUsageStateStore = null;
   claudeUsageStateHydrated = false;
   apiBillingCache = { at: 0, accountKey: null, data: null, error: null, lastAttemptAt: 0 };

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
+import React, { useCallback, useDeferredValue, useEffect, useMemo, useState, useRef } from 'react';
 import ReactDOM from 'react-dom';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -18,6 +18,7 @@ import TabTaskPlanPanel from './TabTaskPlanPanel';
 import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from '../../constants/systemProjects';
+import { linkFileTab } from '../../utils/linkFileTab';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -63,7 +64,6 @@ export default function Workspace() {
   }, [activeProjectId, setSidebarScrollTop]);
   const setOpenFilePath = useWorkspaceStore((s) => s.setOpenFilePath);
   const rewriteFilePathReferences = useWorkspaceStore((s) => s.rewriteFilePathReferences);
-  const createTabAfterCurrent = useWorkspaceStore((s) => s.createTabAfterCurrent);
   // Subscribe to sidebarOpen so Workspace re-renders when sidebar toggles
   const sidebarOpenForRender = useWorkspaceStore((s) => {
     if (isInboxProjectId(s.activeProjectId)) return false;
@@ -164,32 +164,12 @@ export default function Workspace() {
   const currentView = activeProject?.currentView || 'terminal';
 
   const handleLinkFileToTab = useCallback(async (filePath: string, targetTabId: string) => {
-    const state = useWorkspaceStore.getState();
-    let targetProjectId: string | null = null;
-    let targetTab: any = null;
-    for (const [projectId, workspace] of state.openProjects) {
-      const candidate = workspace.tabs.get(targetTabId);
-      if (!candidate) continue;
-      targetProjectId = projectId;
-      targetTab = candidate;
-      break;
-    }
-    if (!targetProjectId || !targetTab) return;
-
-    const fileName = path.basename(filePath);
-    const fileDir = path.dirname(filePath);
-    await createTabAfterCurrent(targetProjectId, fileName, targetTab.cwd || fileDir, {
-      tabType: 'file',
-      filePath,
-      color: 'purple',
-      nameSetManually: true,
-      background: true,
-      afterTabId: targetTabId,
-      visualParentTabId: targetTabId,
-      groupId: targetTab.groupId,
-    } as any);
-    useUIStore.getState().showToast(`Linked ${fileName}`, 'success');
-  }, [createTabAfterCurrent]);
+    const result = await linkFileTab(filePath, targetTabId);
+    useUIStore.getState().showToast(
+      result.reused ? `${path.basename(filePath)} already linked` : `Linked ${path.basename(filePath)}`,
+      result.reused ? 'info' : 'success',
+    );
+  }, []);
 
   const handleSidebarPathChanged = useCallback((oldPath: string, newPath: string) => {
     rewriteFilePathReferences(oldPath, newPath);
@@ -745,14 +725,6 @@ export default function Workspace() {
     }
   }, [isHistoryOpen, historyMounted]);
 
-  if (!activeProject || !activeProjectId || !currentProject) {
-    console.warn('[Workspace:EARLY_RETURN] Empty workspace!', { activeProject: !!activeProject, activeProjectId, currentProject: !!currentProject });
-    return <div className="flex-1 bg-bg-main" />;
-  }
-
-  // Get current tab's cwd for FileExplorer (fallback to project path).
-  const explorerPath = resolvedExplorerPath || rawExplorerPath || projectRootPath;
-
   // Session IDs come from fine-grained selectors (top of component) — not effectiveTab.
   // This ensures Workspace re-renders when Bridge updates session ID via set({}).
   // Show timeline if ANY session exists — don't gate on commandType match.
@@ -777,16 +749,55 @@ export default function Workspace() {
   const shouldRenderHistoryPanel = !!effectiveTab
     && currentView === 'terminal'
     && (historyIsPrimary || ((isHistoryOpen || historyMounted) && !!historySessionId));
-  const historyPanelNode = shouldRenderHistoryPanel ? (
+  // Two-frame tab switch. Building a giant History for the new owner inside
+  // the same render as the tab click kept ONE frame busy for 100-440ms: the
+  // clicked tab's highlight appeared late and right-click/Open were dead
+  // until the heavy commit finished. Deferring the OWNER IDENTITY lets React
+  // commit a cheap frame first (tab highlight, live buttons, History shows
+  // its loader) and render the heavy content interruptibly right after.
+  // The identity moves as ONE object: tearing tabId/sessionId/toolType
+  // across frames would violate the atomic owner+rows+loading contract.
+  // These hooks MUST live above the empty-workspace early return below —
+  // activeProject is transiently null during restore/HMR, and a hook that
+  // only exists on non-empty renders crashes with "Rendered more hooks than
+  // during the previous render" the moment the workspace hydrates.
+  const historyOwnerTabId = effectiveTab?.id || '';
+  const historyOwnerCwd = effectiveTab?.cwd || currentProject?.path || '';
+  const historyOwnerControls = (historyToolType === 'claude' || historyToolType === 'codex') && effectiveTabType !== 'claude-sdk';
+  const historyOwnerIdentity = useMemo(
+    () => (shouldRenderHistoryPanel && historyOwnerTabId
+      ? {
+          tabId: historyOwnerTabId,
+          sessionId: historySessionId || '',
+          cwd: historyOwnerCwd,
+          toolType: historyToolType,
+          enableControls: historyOwnerControls,
+        }
+      : null),
+    // Primitive deps only: a same-values identity object must keep its
+    // reference, otherwise every store tick re-arms the deferred pass.
+    [shouldRenderHistoryPanel, historyOwnerTabId, historySessionId, historyOwnerCwd, historyToolType, historyOwnerControls],
+  );
+  const deferredHistoryOwner = useDeferredValue(historyOwnerIdentity);
+
+  if (!activeProject || !activeProjectId || !currentProject) {
+    console.warn('[Workspace:EARLY_RETURN] Empty workspace!', { activeProject: !!activeProject, activeProjectId, currentProject: !!currentProject });
+    return <div className="flex-1 bg-bg-main" />;
+  }
+
+  // Get current tab's cwd for FileExplorer (fallback to project path).
+  const explorerPath = resolvedExplorerPath || rawExplorerPath || projectRootPath;
+
+  const historyPanelNode = deferredHistoryOwner ? (
     <HistoryPanel
-      tabId={effectiveTab.id}
-      sessionId={historySessionId || ''}
-      cwd={effectiveTab.cwd || currentProject.path}
+      tabId={deferredHistoryOwner.tabId}
+      sessionId={deferredHistoryOwner.sessionId}
+      cwd={deferredHistoryOwner.cwd}
       width={historyPanelWidth}
       notesPanelWidth={notesPanelWidth}
       isOpen={historyIsPrimary || isHistoryOpen}
-      toolType={historyToolType}
-      enableClaudePtyControls={(historyToolType === 'claude' || historyToolType === 'codex') && effectiveTabType !== 'claude-sdk'}
+      toolType={deferredHistoryOwner.toolType}
+      enableClaudePtyControls={deferredHistoryOwner.enableControls}
       embedded={historyIsPrimary || historyPinned}
       embeddedFill={historyIsPrimary}
       mainSurface={historyIsPrimary}

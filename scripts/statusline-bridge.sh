@@ -56,6 +56,7 @@ PCT=$(printf '%s' "$payload" | "$JQ_BIN" -r '.context_pct')
 if [[ -n "$SESSION_ID" && "$SESSION_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   BRIDGE_DIR="$HOME/.claude/bridge"
   mkdir -p "$BRIDGE_DIR"
+  chmod 700 "$BRIDGE_DIR"
   BRIDGE_FILE="$BRIDGE_DIR/${SESSION_ID}.json"
   TMP_FILE=$(mktemp "$BRIDGE_DIR/.${SESSION_ID}.XXXXXX")
   if [ -n "$TMP_FILE" ]; then
@@ -63,7 +64,6 @@ if [[ -n "$SESSION_ID" && "$SESSION_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
     printf '%s\n' "$payload" > "$TMP_FILE"
     mv -f "$TMP_FILE" "$BRIDGE_FILE"
   fi
-  printf '%s\n' "$SESSION_ID" >> "$BRIDGE_DIR/_debug.log"
 fi
 
 echo "[$MODEL] ${PCT}%"

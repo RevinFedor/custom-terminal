@@ -1,7 +1,7 @@
 # Fix: Multi-instance MCP Isolation (PID-based Ports)
 
 ## Проблема
-Изначально приложение использовало единый файл `~/.noted-terminal/mcp-port` для передачи номера порта HTTP-сервера MCP-клиентам (terminal / overseer server). Это создавало критические гонки (race conditions) при параллельном запуске нескольких экземпляров приложения (например, dev-версия и prod-версия, или два окна разработки).
+Изначально приложение использовало единый файл `~/.noted-terminal/mcp-port` для передачи номера порта HTTP-сервера MCP-клиентам. Это создавало критические гонки (race conditions) при параллельном запуске нескольких экземпляров приложения (например, dev-версия и prod-версия, или два окна разработки).
 
 ### Симптомы
 - MCP-вызов из AI-агента в одном окне "приземляется" в main-процессе другого окна (например, `terminal` MCP перезапускает вкладку не в том instance).
@@ -20,7 +20,7 @@
 3. **Удаление:** При нормальном выходе удаляется только файл, соответствующий текущему PID.
 
 ## Алгоритм обнаружения (Process Tree Walking)
-Поскольку MCP-сервер (terminal / overseer) запускается самим AI-CLI (Claude / Gemini / Codex, который запущен в шелле, который запущен в `node-pty`), он не знает PID "своего" Electron напрямую. 
+Поскольку Terminal MCP запускается самим AI-CLI (Claude / Gemini / Codex, который запущен в шелле, который запущен в `node-pty`), он не знает PID "своего" Electron напрямую.
 
 Для поиска правильного порта реализован **Process Tree Walking**:
 1. **Цепочка:** `MCP-сервер (node)` → `AI-CLI (Claude/Gemini/Codex)` → `zsh/bash` → `Electron (node-pty)`.
@@ -34,9 +34,9 @@
 Dashboard поэтому строит карту владельцев из живых `mcp-port-<pid>` файлов, валидирует main PID и поднимается по parent chain Claude/Gemini/Codex/MCP процесса. Термин `external` в UI значит «не принадлежит ни одному живому custom-terminal instance». Для batch kill это критично: кнопка `external only` не должна закрывать вкладки dev из production и вкладки production из dev. Симптом старой логики — пользователь нажимает крестик в одном окне, а пропадают AI-процессы, открытые в другом окне.
 
 ## Invisible Intent: Почему не `execSync` в Main
-Согласно правилам `CLAUDE.md`, Main-процесс не должен блокироваться на системных вызовах. Поэтому тяжелая работа по обходу дерева процессов (`ps -p PID -o ppid=`) вынесена в сам MCP-сервер (terminal / overseer), который является независимым процессом Node.js.
+Согласно правилам `CLAUDE.md`, Main-процесс не должен блокироваться на системных вызовах. Поэтому тяжёлая работа по обходу дерева процессов (`ps -p PID -o ppid=`) вынесена в Terminal MCP, который является независимым процессом Node.js.
 
 ## Связанные файлы
 - `src/main/main.js` — реализация записи и очистки портов (mcpHttpServer).
-- `.claude/mcp/terminal-server.mjs`, `~/.claude/mcp/overseer-server.mjs` — клиенты, реализующие алгоритм поиска порта.
-- [`fact-terminal-mcp.md`](fact-terminal-mcp.md) — архитектура terminal + overseer MCP поверх общего HTTP backend.
+- `mcp/terminal-server.mjs` и установленная копия `~/.claude/mcp/terminal-server.mjs` — клиент, реализующий алгоритм поиска порта.
+- [`fact-terminal-mcp.md`](fact-terminal-mcp.md) — единая публичная MCP-поверхность поверх раздельных live/history HTTP boundaries.

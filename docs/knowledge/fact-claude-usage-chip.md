@@ -1,55 +1,40 @@
-# Feature: AI Usage Chips (Claude + Codex)
+# Feature: Unified AI Usage (Claude + Codex)
 
-Два цветных chip'а в [`ProjectToolbar.tsx`](../../src/renderer/components/Workspace/ProjectToolbar.tsx) слева от `DictationHistoryButton`, реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). Claude-чип показывает **недельный % лимита** Anthropic Max-подписки, если текущий Claude Code auth — OAuth Max; если текущий auth — API Platform key, popover переключается в API-account режим с key/org/spend вместо Max quota. Codex-чип показывает weekly/5-hour лимиты выбранного OpenAI Codex аккаунта и отдельный popover без Claude-only token-cost секции; account-log/rollout JSONL остаются bounded fallback'ом только когда для нужного аккаунта ещё нет verified OpenAI snapshot.
+Единый контрол в [`ProjectToolbar.tsx`](../../src/renderer/components/Workspace/ProjectToolbar.tsx), реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). Слева постоянно виден Codex, справа Claude; половины соприкасаются без зазора и открывают один общий popover на нужном провайдере.
 
-## Лицо чипов: иконка + проценты + reset countdown
+## Компактное лицо и общий popover
 
-Claude-чип несёт три элемента в одну строку: provider-иконка, `weekly%` в severity-цвете и compact weekly reset countdown `1d 12h` / `12h 30m` / `45m` через `formatResetShort()`. Codex-чип на компактном лице показывает две пары в slash-модели: `weekly% weekly-reset / 5-hour% 5-hour-reset`, например `45% 6d 1h / 7% 2h 10m`. Reset-текст светлее обычного muted grey (`#bbb`, как idle Docs button), потому что старый `#6b7280` сливался с серым toolbar-фоном.
+Codex сохраняет slash-модель: иконка, `weekly left + reset / 5-hour left + reset`. У Claude порядок расширен и фиксирован: иконка, `weekly left + reset / 5-hour left + reset / Fable left`. У Fable в компактном лице **нет отдельного времени reset**: это ограничение внутри недельного бюджета, а не самостоятельное третье окно. Процент означает **остаток**, а не расход: `54%` и заполнение на 54% описывают одно и то же. Цвет определяется срочностью по расходу: зелёный при большом остатке, затем жёлтый, оранжевый и красный у исчерпания. В компактном лице отдельной мини-шкалы нет.
 
-Mini progress bar/gauge в компактном chip'е **не показывается** — процент уже является точным сигналом, а короткая полоска рядом с ним дублирует ту же семантику и добавляет визуальный шум. ProgressRow остаётся только внутри раскрытого popover'а, где есть место для подписи `Weekly` / `5-hour` и точной reset-даты.
+Codex-иконка — inline SVG-глиф без белой app-плашки. Claude использует общий `ClaudeSparkle`. Countdown обновляется раз в минуту и остаётся видимым при закрытом popover.
 
-Codex-иконка в chip'е — inline SVG-глиф без белого tile-фона из скачанного ассета. Полный `codex-color.svg` включает белую app-плашку; в toolbar на тёмном фоне она читалась как рамка/broken image. В компактном usage-чипе нужен только внутренний градиентный знак, увеличенный относительно стандартной 12px иконки, чтобы занимать доступную площадь без фоновой коробки.
+Popover физически один и не размонтируется при смене провайдера. В первой строке слева находится двухпозиционный переключатель Codex/Claude, справа — история аккаунтов выбранного провайдера. Во второй строке находятся источник, возраст снимка, `current/stale` и `refresh`. Дублирующие email/reset-заголовок, строки `Plan` и отдельная строка `Source` удалены. `Activity` принадлежит общему контейнеру, поэтому раскрытие и данные сохраняются при переключении Codex ↔ Claude. Высота ограничена окном, длинное содержимое прокручивается.
 
-Тикер countdown'а теперь **always-on** (60s), не только при открытом popover'е — чип показывает обратный отсчёт постоянно. 60s резолюция: грубейшая показанная единица — минуты.
+Текущий popover намеренно показывает только лимиты выбранного провайдера и общий `Activity`. У Claude строки всегда идут в порядке `Weekly`, `5-hour`, `Fable`; у Fable не показывается отдельная дата сброса. Секции `This tab`, `By day (last 7d)` и `Extra credits` на frontend не рендерятся. Расчёт токенов вкладки, дневные снимки и поле дополнительных кредитов в backend сохранены, чтобы их можно было вернуть без потери данных. Появление Fable не является причиной показывать `Extra credits`.
 
-## Два provider-чипа, не общий переключатель
+Зелёная точка у аккаунта означает только текущий логин соответствующего CLI. Выбранный исторический аккаунт получает рамку, серую точку и `stale`; выбор не делает его текущим. Смена аккаунта, вкладки или провайдера увеличивает поколение запроса: запоздавший ответ старого контекста не имеет права менять новый экран. Загрузки лимитов и `Activity` имеют renderer deadline и всегда завершают spinner.
 
-Claude и Codex лимиты независимы по источнику, периоду reset'а и смыслу процента, поэтому показываются двумя sibling-чипами рядом, а не одним общим popover'ом с внутренним переключателем. Пользователь сравнивает бюджеты боковым зрением: `Claude 64% 5d 19h` рядом с `Codex 45% 6d 1h / 7% 2h 10m`. Если спрятать Codex внутрь Claude popover'а, второй бюджет станет discoverability-операцией, а не постоянным статусом.
+## Почему weekly остаётся первой метрикой
 
-Каждый provider-чип сам открывает свой popover и сам refresh'ится. Общей остаётся только Activity-секция и shared визуальный язык: provider icon → weekly% → compact reset text. Подробности переносимого принципа — `methodology/переносимый-дизайн.md::Независимые provider quotas`.
+Пятичасовой расход меняется резко, недельный лучше описывает долгосрочный бюджет. Поэтому weekly стоит первым и определяет основной цвет половины. Пятичасовой остаток остаётся вторым постоянным числом, а в popover оба окна получают полноценную шкалу и точную дату сброса.
 
-## Почему weekly остаётся первой метрикой на chip'е
+## Источник Claude: statusLine для общих окон, OAuth только дополнение для Fable
 
-5-hour utilization прыгает резко (один burst-разговор поднимает с 5% до 60%), `weekly` — медленно интегрированное число, более релевантное для долгосрочного планирования сессий. Поэтому цвет и первый процент compact-chip'а остаются weekly: это число сигналит «пора замедлиться / можно ещё» на горизонте недели.
+Основной источник общих подписочных лимитов — официальный JSON Claude Code `statusLine.rate_limits`: `five_hour` и `seven_day` с `used_percentage` и `resets_at`. Он остаётся авторитетным для Weekly и 5-hour. Официальный контракт сейчас не передаёт scope модели для этих окон и не обещает отдельный Fable-лимит, поэтому statusLine не может сам подтвердить строку Fable. Скрипт [`scripts/statusline-bridge.sh`](../../scripts/statusline-bridge.sh) атомарно пишет только разрешённые поля, main принимает снимок до отправки существующего `claude:bridge-update`. Отсутствие общего окна может быть нормальным до первого ответа Claude, у неподписочного входа или из-за upstream-регрессии; оно остаётся `unknown`, никогда не превращается в `0% used`.
 
-Codex — исключение на уровне компактного preview: пользователь явно сравнивает weekly и 5-hour до раскрытия popover'а, поэтому chip показывает `weekly / 5-hour` и для utilization, и для reset countdown. Это не отменяет weekly-first модель: цвет chip'а всё равно берётся из weekly, weekly стоит первым, а пятичасовой bucket получает тактическое второе число. В раскрытом popover'е обе строки остаются полноценными `ProgressRow`.
+Аккаунт подтверждается через `claude auth status --json`. Связь снимка строится по сочетанию session id и PID процесса Claude, поэтому две продолженные сессии с одинаковым session id после смены логина не смешиваются. При штатной ротации OAuth-токена старый процесс Claude не имеет права вернуть аккаунту прежнюю подпись токена и запустить повторный сетевой refresh на каждом statusLine-событии. Сохраняется только хеш связи процесса с аккаунтом; максимум 512 связей в памяти и 128 между рестартами.
 
-Цветовые пороги выбраны асимметрично — `<50% green` (комфорт), `<75% yellow` (внимание), `<90% orange` (плотно), `≥90% red` (надо тормозить). Не равномерные 25%-сегменты — последние 25% психологически важнее первых 75%, разрешение в верхней зоне нужно выше.
+`GET https://api.anthropic.com/api/oauth/usage` используется только как дополнительный источник для реально подтверждённого Claude OAuth. Помимо старых общих полей endpoint может вернуть `limits[]`: Fable распознаётся только по model scope записи (`scope.model.display_name`, например `Fable`) и показывает её remaining percentage. Флаг `is_active` не используется как фильтр: реальный отображаемый Fable-лимит может прийти с `is_active: false`. Это вспомогательное доказательство Fable, а не замена statusLine для Weekly и 5-hour. Нет подходящей Fable-записи, OAuth недоступен или поле отсутствует — Fable остаётся `unknown`, а не `0%`. Даже когда endpoint отдаёт `resets_at`, UI не показывает отдельный Fable reset: Fable — сублимит общего weekly budget, не дополнительная квота; исчерпание Fable не означает, что пользователь получил больше weekly usage. `/login managed key` не является OAuth и никогда не отправляется в этот endpoint как Bearer. `Claude Code-credentials` также содержит OAuth других MCP: извлечение Claude-токена намеренно не рекурсивное, поэтому Figma `accessToken` не может стать Claude credential. Приложение не расходует и не обновляет refresh token Claude Code.
 
-## Источник данных лимитов: macOS Keychain + /oauth/usage
+OAuth-запрос имеет физический timeout, singleflight, cooldown и `Retry-After` gate. Ручной refresh обходит обычный кэш, но не rate-limit gate, account guard и не заменяет общие окна уже подтверждённого live statusLine — даже когда этот снимок успел стать `stale`. В таком случае Weekly/5-hour остаются видимыми с честным возрастом и пометкой `stale`, а OAuth обновляет только Fable. Перед применением результата auth читается повторно; смена логина во время запроса отбрасывает старые данные и старую ошибку.
 
-Backend — [`ipc/claude-usage.js`](../../src/main/ipc/claude-usage.js), IPC `claude-usage:get`. Читает OAuth token через `security find-generic-password -s "Claude Code-credentials" -w` (та же запись, которую создаёт `claude` CLI при `claude login`). JSON в keychain → `claudeAiOauth.accessToken`. Не сохраняем token в env-var проекта — был бы дубль, разъезжающийся при `claude logout/login`.
+Свежесть Fable учитывается отдельно от свежести общих окон. Краткий сетевой сбой сохраняет последнее известное значение, но свежий statusLine не может бесконечно маскировать старый Fable: после общего stale-порога третий процент скрывается до нового подтверждённого model-scoped ответа. Повреждённые или отсутствующие общие поля OAuth не мешают принять валидный Fable, потому что в режиме дополнения они не участвуют в проверке.
 
-Endpoint — `GET https://api.anthropic.com/api/oauth/usage` с заголовками `Authorization: Bearer …` + `anthropic-beta: oauth-2025-04-20`. Тот же, что использует Swift-приложение Blimp-Labs/claude-usage-bar.
+Очевидная регрессия внутри ещё не наступившего окна (`64/61% used → 1/0% used`) сначала хранится как кандидат, а последнее проверенное значение остаётся на экране. Кандидат принимается после второго совпавшего наблюдения не раньше 30 секунд; реально наступивший reset принимается сразу. Этот слой защищает от одиночного upstream-флапа, но не пытается «исправлять» стабильно неверный ответ провайдера.
 
-Кэш 170s в памяти main-процесса. Polling-интервал в renderer'е 3 минуты — если две вкладки запрашивают подряд, второй запрос вернётся из кэша. Force-refresh кнопка в popover'е игнорирует кэш и cooldown. Подробности — секция «Polling cadence» ниже.
+До восьми Claude-аккаунтов сохраняются как маскированные, нормализованные снимки. Токены, полный email, raw org id и raw session id не сохраняются. Исторический аккаунт никогда не обновляется credential'ом текущего.
 
-Ответ:
-```json
-{
-  "five_hour":  { "utilization": 7,  "resets_at": "2026-05-20T06:20:00Z" },
-  "seven_day":  { "utilization": 2,  "resets_at": "2026-05-27T01:00:00Z" },
-  "seven_day_opus":   {...},
-  "seven_day_sonnet": {...},
-  "extra_usage": { "is_enabled": true, "monthly_limit": 20000, "used_credits": 142, "utilization": 0.71 }
-}
-```
-
-`extra_usage` — overflow в pay-as-you-go USD-кредитах после исчерпания Max-плана. `used_credits` и `monthly_limit` в **центах**, не в долларах — делим на 100.
-
-Claude Code может быть залогинен не через Max OAuth, а через API Platform key (`security` service `"Claude Code"`). Такой ключ **может запускать Claude Code локально**, но `/api/oauth/usage` для него недоступен: Max quota, weekly reset и extra usage относятся только к OAuth Max token. Поэтому accounts в Claude popover — это не косметика: `api:<hash>` и `oauth:<hash>` разные auth sources, один может быть current, другой cached/secondary. Текущий key source показывается в шапке, чтобы не путать “Claude работает” с “Max quota доступна”. Если текущий auth стал API Platform, но renderer продолжает просить старый `selectedAccountKey` OAuth, backend выберет requested account раньше current account — это осознанная account-persist логика, но UX-риск: можно продолжить смотреть Max quota, пока Claude фактически работает API key'ем. При правке account selection проверяй `selectedAccountKey` vs `currentAccountKey` в логах, а не только вид чипа.
-
-Для API Platform публичная информация ограничена: обычный API key валидируется через `GET /v1/models?limit=1` и даёт `anthropic-organization-id` в headers; spend читается только через Admin API key (`ANTHROPIC_ADMIN_API_KEY` / `ANTHROPIC_ADMIN_KEY`) и `GET /v1/organizations/cost_report` bucket'ами за последние 31 день. Этот endpoint возвращает cost report (month spend, last 7d, latest bucket), но **не возвращает remaining credits / balance**. В UI строка `Credits left` намеренно показывает `not exposed`: баланс остаётся только в Claude Console Billing, не выводить фейковый `$0` и не пытаться выводить остаток из spend. Важно: cost report принадлежит admin key, а строка `Org` рядом с ним берётся из selected API key status. Если ключи из разных Anthropic org, UI может показать spend одного org рядом с id другого — при расследовании API-режима сверяй оба источника, не называй это quota.
+Для API Platform обычный API key валидируется через `GET /v1/models?limit=1`; расход доступен только при отдельном Admin API key через `GET /v1/organizations/cost_report`. Этот API возвращает spend, но не remaining balance, поэтому UI честно показывает `Credits left: not exposed`. Admin key изолирован в main process и удалён из env renderer, PTY, SDK и дочерних утилит.
 
 ## Источник данных Codex: тот же account API, что у web dashboard
 
@@ -77,7 +62,7 @@ Renderer больше не опрашивает `refreshing=true` каждые 1
 
 Не пересчитывать Codex лимит из `last_token_usage.total_tokens`. Локальные токены не равны провайдерскому quota%, потому что provider применяет собственную формулу и reset-бакеты. Конкретика Codex JSONL — [`fact-codex.md`](fact-codex.md).
 
-## Источник данных per-tab tokens: JSONL агрегирование
+## Источник данных per-tab tokens: JSONL агрегирование (backend сохранён, UI скрыт)
 
 Backend — [`ipc/claude-tokens.js`](../../src/main/ipc/claude-tokens.js), IPC `claude-tokens:summary { sessionId, cwd }`. Не переизобретаем — используем `resolveSessionChain` из [`claude-data.js`](../../src/main/ipc/claude-data.js), который и так умеет ходить по resume-цепи через bridge entries + SQLite session_links. Это критично: после `claude --resume` транскрипт расползается по 2-5 JSONL-файлам, считать токены по одному файлу = пропустить большую часть истории. См. CLAUDE.md anti-pattern «Разница sessionId в одном JSONL ≠ bridge».
 
@@ -100,7 +85,7 @@ Edit-range / fork ломают cache — следующий после прав�
 | **Total billed** | все записи в файлах chain'а | «Сколько я фактически списал?» — Anthropic не возвращает деньги за удалённые turn'ы |
 | **Wasted** | Total − Active | «Сколько ушло на эксперименты, которые потом откатил» |
 
-`Total billed` отображается только если отличается от `Active branch` больше чем на $0.01 — для нерастущих в файле сессий это шум. `Wasted` — оранжевым, как индикатор «есть смысл следить».
+При возможном возврате секции `Total billed` должен отображаться только если отличается от `Active branch` больше чем на $0.01 — для нерастущих в файле сессий это шум. `Wasted` — оранжевым, как индикатор «есть смысл следить».
 
 ## Pricing-таблица (Anthropic, состояние май 2026)
 
@@ -125,15 +110,15 @@ Edit-range / fork ломают cache — следующий после прав�
 |---|---|---|
 | Click по чипу | **Light pin** — закреп к **текущему табу** | Click-outside / Esc / смена активной вкладки |
 | ⌘ зажат + наведён на чип | **Transient peek** | Курсор увели с чипа и popover'а; ⌘ отпущен |
-| ⌘⇧ нажат при открытом popover'е | **Sticky pin** (белая рамка + бейдж `PINNED`) | Только повторный ⌘⇧ или клик по самому чипу |
+| ⌘⇧ нажат при открытом popover'е | **Sticky pin** (белая рамка) | Только повторный ⌘⇧ или клик по самому чипу |
 
-В sticky-режиме секция «This tab» **реактивно пересчитывается** на новую active session при переключении табов/проектов. Это **отличает popover от классического snapshot-pin'а** (см. `methodology/переносимый-дизайн.md::Sticky pin: snapshot vs reactive content`) — общий ⌘⇧-закреп описывает поведение «окно прибито к источнику», здесь источник = текущий active tab и он подвижен.
+В текущем UI sticky-режим не содержит tab-зависимой секции: закреплённое окно показывает выбранного провайдера, его аккаунт и общий `Activity`.
 
-Хинт `⌘⇧ to pin across tabs` в нижней части popover'а появляется только пока не sticky, помогает discovery. При активации бейдж `PINNED` заменяет хинт.
+Хинт `⌘⇧ to pin across tabs` в нижней части popover'а появляется только пока не sticky.
 
-**Trap** — при имплементации легко завязать click-outside handler на оба state'а (`clicked` и `sticky`) и mousedown по TabBar сбросит sticky тоже. Зафиксировано в `methodology/сценарии-багов-design.md::4.7 Sticky pin не должен сбрасываться общим click-outside handler'ом`.
+**Trap:** общий click-outside handler не должен закрывать sticky. Иначе клик по TabBar закрывает окно в тот момент, когда пользователь пытается проверить другую вкладку, и режим теряет смысл. Click-outside и Esc закрывают light pin; sticky снимается только явным жестом.
 
-## Состояние «expanded» секции «This tab» — ephemeral
+## Исторический контракт «This tab» (frontend сейчас скрыт)
 
 Юзер: *«состояние раскрыто/свернуто не должно сохраняться если я закрыл бар»*. Раскрытое состояние секции сохраняется только пока popover открыт (можно пересекать вкладки в sticky-pin режиме — раскрытое остаётся). При полном закрытии popover'а (click-outside, Esc, повторное снятие sticky) — сбрасывается. Нет localStorage / SQLite persistence. Аналогично — `methodology/переносимый-дизайн.md::Expanded-state дочерней секции — ephemeral`.
 
@@ -145,15 +130,11 @@ Edit-range / fork ломают cache — следующий после прав�
 
 Sticky-pin — единственное состояние с **заметной** рамкой: `rgba(255,255,255,0.4)` на чипе и `0.45` на popover'е. Это не путается с обычным open — sticky редкий жест, должен быть отличим с одного взгляда.
 
-## Daily history: SQLite snapshots, не реконструкция
+## Daily history: SQLite snapshots, не реконструкция (frontend сейчас скрыт)
 
-Расход недельного лимита по дням храним как сырые snapshot'ы `/oauth/usage` — таблица `claude_usage_snapshots` в `database.js`, append на каждый успешный network fetch (раз в минуту пока chip живой). Альтернатива — пересчитать `weekly%` ретроактивно из JSONL-токенов × pricing — отвергнута: Anthropic взвешивает модели и `extra_credits` overflow по непубличной формуле, наш USD-эквивалент коррелирует но регулярно расходится на 5-15 п.п. с цифрой на чипе. Юзер бы увидел два разных числа за один день и потерял бы доверие к графику. Принцип уровня методологии — `methodology/переносимый-дизайн.md::Историю провайдерского ресурса храним как снимки источника`.
+Расход по дням хранится как append-only снимки того же источника, который был принят для чипа: официальный statusLine или подтверждённый OAuth usage. Локальные JSONL-токены не реконструируют провайдерскую квоту, потому что формула Anthropic непублична.
 
-Размер таблицы: 1440 строк/день × ~50 байт ≈ 26 MB/год. **Prune убран** (май-2026) по запросу юзера — история хранится вечно, чтобы «By day» график мог смотреть назад на произвольный диапазон, не только последнюю неделю. Append-only, никаких updates — snapshot = факт того что API вернуло в момент `ts`, не подлежит правке. (Раньше был auto-prune `WHERE ts < now - 60d` в каждом insert — удалён из `saveClaudeUsageSnapshot`.)
-
-Snapshot пишется **только на live network fetch**, не на cache-hit — иначе одну и ту же точку получишь как 5 разных записей за 5 минут. Кэш в памяти 5 минут (см. секцию выше) → 1 snapshot/min эффективно, не 1/cache-hit/sec.
-
-**Backfill ретроактивный.** Фича запущена 21-мая после того как неделя уже была частично потрачена. Чтобы график не показал «0% за вчера» (false-empty), прод-БД получила seed 3 точек по памяти юзера: 20-мая 04:00 MSK=5%, 20-мая 22:00 MSK=22%, 21-мая 10:00=29%. Это разовая операция под конкретный момент жизни проекта, **не** миграция и не fixtures — следующие запуски накопят полноценную историю polling'ом, seed-блок никогда не выполнится повторно.
+Каждая строка обязана иметь `account_key`. Запрос истории всегда передаёт выбранный Claude account key; старые строки с `NULL` остаются в базе как legacy evidence, но не показываются ни одному аккаунту. Снимок записывается только после принятия значения: cache-hit, отклонённый ответ и ожидающий подтверждения скачок историю не загрязняют. Prune отсутствует.
 
 ## Reset detection: смена дня в `resets_at`
 
@@ -167,17 +148,11 @@ Anthropic ротирует weekly-бакет раз в неделю. После 
 
 ## Cold-start fallback + error cooldown
 
-Cold start с 429 даёт прочерк в чипе вместо реальных %. Чтобы этого не было, при пустом in-memory кэше + failed live fetch main reconstruct'ит минимальный `/oauth/usage`-shape объект из **последнего persisted snapshot** в SQLite (`getLatestClaudeUsageSnapshot`) и отдаёт его как `data` рядом с `error`. Renderer видит `data≠null` → рисует %, баннер ошибки остаётся снизу popover'а. Поля `extra_usage`/Opus/Sonnet могут отсутствовать (в snapshot'е персистится только weekly + 5h), но основной weekly чипа всегда есть.
+До восьми нормализованных account snapshots живут в `app_state`, поэтому после рестарта исторические аккаунты появляются сразу как `stale`. Текущий login всё равно заново подтверждается через CLI; сохранённый токен или Keychain сам по себе не назначает аккаунт текущим. SQLite fallback допускается только по совпавшему account key.
 
-Ограничение fallback'а: `claude_usage_snapshots` не account-scoped и не проверяет что `weekly_resets_at/five_hour_resets_at` ещё в будущем. Это нормально как «последнее известное число с error banner», но не текущее состояние. Если app cold-start'ит после reset, live `/oauth/usage` падает 429/network error, а последний SQLite snapshot был до reset'а, renderer покажет старые проценты с ошибкой. В прод-БД 2026-06-18 последний Claude snapshot был от 2026-06-15 с `weekly_resets_at=2026-06-17`, то есть уже устаревший. Не путать это с Codex flapping: Claude не выбирает между поколениями логов на успешном live fetch, stale возникает только на cache/fallback error path.
+Обычный Claude-путь event-driven: новый statusLine снимок приходит после ответа Claude и обновляет UI через существующее событие. Visibility refresh и редкий десятиминутный fallback обнаруживают внешний login/logout, но не превращают managed login в сетевой polling `/oauth/usage`. Для настоящего OAuth действуют cache, error cooldown и `Retry-After`; manual refresh не может пробить server backoff.
 
-**Polling cadence 180s, cooldown 180s.** Anthropic `/oauth/usage` отдаёт 429 даже при 1 запросе/мин — endpoint предназначен для редкого опроса, не для мониторинга. Renderer тикает раз в **3 минуты**, backend `CACHE_TTL_MS=170s` (чуть меньше polling-а, чтобы плановый тик гарантированно дёргал сеть). `ERROR_COOLDOWN_MS=180s` — фоновый poll **не делает live fetch 3 мин после failed live fetch**, возвращает закешированный error + последние данные. Force-refresh кнопка cooldown игнорирует. Cache-hit branch явно возвращает `error: null`, без этого renderer получал stale error из cached payload и оставлял баннер видимым после успешного polling'а.
-
-**`lastAttemptAt` + flash при force-refresh.** Backend на каждом вызове `getUsage` (включая cooldown/cache-hit ветви) возвращает `lastAttemptAt` — timestamp последней попытки live fetch. Renderer показывает в банере ошибки `Last attempt 12s ago: HTTP 429…` и подсвечивает короткой `flash-fail` анимацией (450ms красноватый фон), когда `now - lastAttemptAt < 2000ms`. Это нужно, чтобы юзер видел: повторный клик refresh **реально** триггернул запрос, который вернулся той же ошибкой — без этого статичный текст «Last fetch failed» выглядел как «кнопка не работает». На force-refresh ещё держим spinner минимум 400ms, чтобы клик ощутимо мигнул даже на синхронном cache-hit. См. ClaudeUsageButton.tsx::refresh, ClaudeUsageButton.tsx::error-banner.
-
-## Header reset в popover'е
-
-В шапке popover'а вместо статичного заголовка «Claude usage» / «Codex usage» отображается точная локальная дата и время недельного reset'а: `weekly reset 17 июн., 09:34`. Относительное `in 5d 19h 59m` уже есть в компактном chip'е, поэтому в раскрытом popover'е оно дублировало бы то же число. Popover отвечает на другой вопрос: «когда именно обновится бакет», без mental math и без пересчёта countdown'а.
+Старые числа остаются на экране во время запроса. `Source`, возраст и `stale` показывают их качество, ошибка отображается отдельно. Загрузки лимитов и `Activity` имеют 12-секундный deadline; каждый новый контекст отменяет право старого ответа обновлять экран.
 
 ## Baseline дня = последний snapshot предыдущего дня
 
@@ -186,6 +161,15 @@ Cold start с 429 даёт прочерк в чипе вместо реальн�
 Baseline = последний snapshot **предыдущего** local-дня (не UTC) — что юзер видел как «накопилось к моменту когда лёг спать». Если день первый в истории (нет prev-дня) — baseline = первый snapshot этого дня. Если день был reset'нут — baseline = post-reset value (см. секцию выше).
 
 Local-date, не UTC: юзер думает о расходе «вчера vs сегодня» в своей таймзоне (MSK сейчас, может смениться при переезде). UTC-bucket дал бы баг типа «MSK 02:00 пишется как новый день, юзер ещё за ноутом» (UTC уже сменилась в 03:00 предыдущего вечера). Bucketing — через `new Date(ts*1000).getDate()` локального процесса.
+
+## Проверенные внешние источники (2026-07-24)
+
+- [Claude Code status line](https://code.claude.com/docs/en/statusline) — официальный контракт `rate_limits`, момент появления и nullable windows.
+- [Claude Fable 5 on your plan](https://support.claude.com/en/articles/15424964-claude-fable-5-on-your-plan) — Fable на подходящих Max/premium планах расходует общий weekly limit и ограничен до 50% этого лимита, а не добавляет новую weekly quota.
+- [Claude Code authentication](https://code.claude.com/docs/en/authentication) — поддерживаемые виды login; subscription quota и API Platform limits не одно и то же.
+- [CodexBar provider docs](https://github.com/steipete/CodexBar/blob/main/docs/providers.md) и [Claude OAuth fetcher](https://github.com/steipete/CodexBar/blob/main/Sources/CodexBarCore/Providers/Claude/ClaudeOAuth/ClaudeOAuthUsageFetcher.swift) — сравнение OAuth/web/CLI/local fallback, обработка `Retry-After` и пример `limits[]` с model-scoped окнами.
+- [Claude Code #24317](https://github.com/anthropics/claude-code/issues/24317) — гонка rotating refresh token между параллельными Claude-процессами; причина не обновлять CLI-owned credential.
+- [Claude Code #29579](https://github.com/anthropics/claude-code/issues/29579) и [#54750](https://github.com/anthropics/claude-code/issues/54750) — реальные расхождения/скачки usage meter; причина хранить source/timestamp и подтверждать резкую регрессию.
 
 ## Связанные документы
 

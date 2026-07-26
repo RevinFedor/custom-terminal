@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, RotateCcw, AlertTriangle, Copy, Check } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, RotateCcw, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import {
   HISTORY_PANEL_DEFAULT_WIDTH,
@@ -48,6 +48,11 @@ import {
   createHistoryViewportPaintProbe,
   type HistoryViewportPaintOwner,
 } from '../../utils/historyViewportPaintProbe';
+import {
+  captureHistoryAnchorFromDom,
+  getHistoryReadingAnchor,
+  setHistoryReadingAnchor,
+} from '../../utils/historyReadingAnchor';
 import {
   buildPromptImagePayload,
   collectPromptImageRefIds,
@@ -167,9 +172,19 @@ interface TaskAction {
   toolUseId?: string;
   result?: string;
   history?: Array<{ type: string; content?: string; tools?: string[] }>;
+  // Codex in-process subagents (multi_agent_v1 / collaboration): live status
+  // from rollout events + child rollout session id for future drill-in.
+  subagentStatus?: 'running' | 'completed' | 'interrupted';
+  agentSessionId?: string;
 }
 // Raw tool carrier emitted by the main-process parser for every non-Task
 // tool_use — full name+input+result, rendered via the package ToolCallPart.
+// Reference to a payload dehydrated in main: the entry carries a short
+// preview; the full text is fetched by exact payloadId on expand.
+interface HistoryPayloadRef {
+  payloadId: string;
+  totalChars: number;
+}
 interface RawAction {
   tool: '__raw__';
   rawTool: {
@@ -177,7 +192,11 @@ interface RawAction {
     toolName: string;
     args: Record<string, any>;
     result?: string;
+    resultRef?: HistoryPayloadRef;
     isError?: boolean;
+    // Background Bash lifecycle (run_in_background): 'running' while only
+    // the acceptance result exists; the task-notification outcome otherwise.
+    backgroundStatus?: string;
     diffHunks?: Array<{
       oldStart: number;
       newStart: number;
@@ -213,9 +232,11 @@ interface FullHistoryEntry {
   rewindStatus?: 'rewinding' | 'done' | 'failed';
   optimisticAt?: number;
   thinking?: string;
+  thinkingRef?: HistoryPayloadRef;
   actions?: Action[];
   sessionId: string;
   compactSummary?: string;
+  compactSummaryRef?: HistoryPayloadRef;
   preTokens?: number;
   promptChips?: HistoryPromptDraftChip[];
   requiresAuditIdentity?: boolean;
@@ -353,6 +374,11 @@ const EMPTY_HISTORY_LIVE_TOOL_RESULTS = new Map<string, HistoryLiveToolResult>()
 const LOCAL_PROMPT_PREFIX = 'local-prompt-';
 const LOCAL_REWIND_PREFIX = 'local-rewind-';
 const LOCAL_PROMPT_FAILURE_TTL_MS = HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS;
+// An in-flight local rewind row whose completion event was lost (crash mid-op)
+// may survive at most this long in the persisted overlay. Long enough for any
+// legitimate Rewind (AI mode deadline is 170s), short enough that a stale
+// "REWINDING…" cannot haunt the owner across sessions.
+const LOCAL_REWIND_STALE_TTL_MS = 5 * 60 * 1000;
 const HISTORY_SCROLL_PIXEL_CAP_WARN_PX = 16_000_000;
 const REWIND_BUSY_GUARD_RE = /\bis (?:busy|starting); wait (?:for the current turn|until the current loader finishes) before rewind\b/i;
 const EMPTY_HISTORY_DRAFT_IMAGES: HistoryPromptDraftImageRef[] = [];
@@ -625,6 +651,7 @@ const historyActionPresentationEqual = (left: Action, right: Action) => {
   if (isRawAction(left) && isRawAction(right)) {
     return left.rawTool.toolName === right.rawTool.toolName &&
       left.rawTool.result === right.rawTool.result &&
+      left.rawTool.resultRef?.payloadId === right.rawTool.resultRef?.payloadId &&
       left.rawTool.isError === right.rawTool.isError &&
       JSON.stringify(left.rawTool.args || {}) === JSON.stringify(right.rawTool.args || {}) &&
       JSON.stringify(left.rawTool.diffHunks || []) === JSON.stringify(right.rawTool.diffHunks || []);
@@ -671,8 +698,10 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.responseTiming?.endTs !== right.responseTiming?.endTs ||
     left.responseTiming?.durationMs !== right.responseTiming?.durationMs ||
     left.thinking !== right.thinking ||
+    left.thinkingRef?.payloadId !== right.thinkingRef?.payloadId ||
     left.sessionId !== right.sessionId ||
     left.compactSummary !== right.compactSummary ||
+    left.compactSummaryRef?.payloadId !== right.compactSummaryRef?.payloadId ||
     left.preTokens !== right.preTokens ||
     !haveSameComposerChips(left.promptChips || [], right.promptChips || [])
   ) return false;
@@ -880,10 +909,17 @@ const SubAgentBlock = memo(({ action }: { action: TaskAction }) => {
   const historyRef = useRef<HTMLDivElement>(null);
   const toggleResult = useHistoryRevealToggle(resultRef, showResult, setShowResult);
   const toggleHistory = useHistoryRevealToggle(historyRef, showHistory, setShowHistory);
+  // Codex subagent live status: the loader is INHERITED by the card while the
+  // in-process agent works; interrupted is amber, not an error red.
+  const subagentRunning = action.subagentStatus === 'running';
+  const subagentInterrupted = action.subagentStatus === 'interrupted';
 
   return (
-    <div style={{ marginTop: 4, borderLeft: '3px solid #60a5fa', paddingLeft: 8 }}>
-      <span style={{ fontSize: '0.85em', color: '#60a5fa' }}>
+    <div style={{ marginTop: 4, borderLeft: '3px solid ' + (subagentInterrupted ? '#d97706' : '#60a5fa'), paddingLeft: 8 }}>
+      <span style={{ fontSize: '0.85em', color: subagentInterrupted ? '#d97706' : '#60a5fa', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+        {subagentRunning && (
+          <Loader2 size={11} strokeWidth={2.5} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
+        )}
         {'\u{1F9F5}'} {action.description || 'Task agent'}
       </span>
 
@@ -968,6 +1004,11 @@ const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
   const toggleOpen = useHistoryRevealToggle(anchorRef, open, setOpen);
   const hasSummary = !!entry.compactSummary;
   const visible = open || (hovered && altHeld);
+  const { text: presentedSummary } = useRehydratedPayload(
+    entry.compactSummary,
+    entry.compactSummaryRef,
+    visible,
+  );
   const tokensLabel = entry.preTokens ? `${Math.round(entry.preTokens / 1000)}k tokens` : null;
 
   useEffect(() => {
@@ -1020,30 +1061,126 @@ const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
           whiteSpace: 'pre-wrap', wordBreak: 'break-word',
           maxHeight: 300, overflowY: 'auto',
         }}>
-          {entry.compactSummary}
+          {presentedSummary || entry.compactSummary}
         </div>
       )}
     </div>
   );
 });
 
-const HistoryThinkBlock = memo(({ text }: { text: string }) => {
+const HistoryThinkBlock = memo(({ text, payloadRef }: {
+  text: string;
+  payloadRef?: HistoryPayloadRef;
+}) => {
   const anchorRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const onToggle = useHistoryRevealToggle(anchorRef, open, setOpen);
-  return <CBThinkBlock text={text} open={open} onToggle={onToggle} anchorRef={anchorRef} />;
+  const { text: presented } = useRehydratedPayload(text, payloadRef, open);
+  return <CBThinkBlock text={presented || text} open={open} onToggle={onToggle} anchorRef={anchorRef} />;
 });
+
+// Session-scoped fetch context for dehydrated payloads. Card components sit
+// several layers below the panel; the context avoids threading
+// toolType/sessionId/cwd through every action render.
+const HistoryPayloadContext = React.createContext<{
+  toolType: 'claude' | 'gemini' | 'codex';
+  sessionId: string;
+  cwd?: string;
+} | null>(null);
+
+// In-flight and resolved payloads for the current renderer lifetime. Resolved
+// texts are kept per payloadId so re-expanding a card is instant; bounded by
+// count — payloads are display-sized after the render cap.
+const rehydratedPayloadCache = new Map<string, string>();
+const REHYDRATED_PAYLOAD_CACHE_MAX = 64;
+
+const rememberRehydratedPayload = (key: string, text: string) => {
+  rehydratedPayloadCache.delete(key);
+  rehydratedPayloadCache.set(key, text);
+  while (rehydratedPayloadCache.size > REHYDRATED_PAYLOAD_CACHE_MAX) {
+    const lruKey = rehydratedPayloadCache.keys().next().value as string | undefined;
+    if (lruKey === undefined) break;
+    rehydratedPayloadCache.delete(lruKey);
+  }
+};
+
+/**
+ * Lazy full-payload loader for a dehydrated ref. Returns the preview until
+ * `wanted` becomes true, then swaps in the full text once fetched. Fetch
+ * failures keep the preview and surface a short inline notice — the data on
+ * disk is intact, only this read failed.
+ */
+const useRehydratedPayload = (
+  preview: string | undefined,
+  ref: HistoryPayloadRef | undefined,
+  wanted: boolean,
+): { text: string | undefined; pending: boolean; failed: boolean } => {
+  const context = React.useContext(HistoryPayloadContext);
+  const cacheKey = context && ref
+    ? context.toolType + ':' + context.sessionId + ':' + ref.payloadId
+    : '';
+  const [, force] = React.useReducer((x: number) => x + 1, 0);
+  const stateRef = useRef<{ key: string; pending: boolean; failed: boolean }>({
+    key: '',
+    pending: false,
+    failed: false,
+  });
+  useEffect(() => {
+    if (!wanted || !ref || !cacheKey || !context) return;
+    if (rehydratedPayloadCache.has(cacheKey)) return;
+    if (stateRef.current.key === cacheKey && (stateRef.current.pending || stateRef.current.failed)) return;
+    stateRef.current = { key: cacheKey, pending: true, failed: false };
+    force();
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await ipcRenderer.invoke('history:get-tool-payload', {
+          toolType: context.toolType,
+          sessionId: context.sessionId,
+          cwd: context.cwd,
+          payloadId: ref.payloadId,
+        });
+        if (cancelled) return;
+        if (result?.success && typeof result.payload === 'string') {
+          const text = result.truncatedForRender
+            ? result.payload + '\n… (показаны первые ' + Math.round(result.payload.length / 1024) + ' KB из ' + Math.round((result.totalChars || 0) / 1024) + ' KB)'
+            : result.payload;
+          rememberRehydratedPayload(cacheKey, text);
+          stateRef.current = { key: cacheKey, pending: false, failed: false };
+        } else {
+          stateRef.current = { key: cacheKey, pending: false, failed: true };
+        }
+      } catch {
+        if (!cancelled) stateRef.current = { key: cacheKey, pending: false, failed: true };
+      }
+      if (!cancelled) force();
+    })();
+    return () => { cancelled = true; };
+  }, [wanted, cacheKey, ref, context]);
+
+  if (!ref || !cacheKey) return { text: preview, pending: false, failed: false };
+  const cached = rehydratedPayloadCache.get(cacheKey);
+  if (cached !== undefined) return { text: cached, pending: false, failed: false };
+  const isCurrent = stateRef.current.key === cacheKey;
+  return {
+    text: preview,
+    pending: wanted && isCurrent && stateRef.current.pending,
+    failed: isCurrent && stateRef.current.failed,
+  };
+};
 
 const HistoryToolCallPart = memo(({
   toolName,
   args,
   result,
+  resultRef,
   isError,
   diffHunks,
 }: {
   toolName: string;
   args: Record<string, any>;
   result?: string;
+  resultRef?: HistoryPayloadRef;
   isError?: boolean;
   diffHunks?: Array<{
     oldStart: number;
@@ -1056,6 +1193,9 @@ const HistoryToolCallPart = memo(({
     toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit'
   ));
   const onToggle = useHistoryRevealToggle(anchorRef, open, setOpen);
+  // The full output is fetched when the card is expanded; the preview renders
+  // in the collapsed header either way.
+  const { text: presentedResult, pending, failed } = useRehydratedPayload(result, resultRef, open);
 
   return (
     <div
@@ -1065,11 +1205,321 @@ const HistoryToolCallPart = memo(({
       <CBToolCallPart
         toolName={toolName}
         args={args}
-        result={result}
+        result={presentedResult}
         isError={isError}
         diffHunks={diffHunks}
         collapse={{ open, onToggle, anchorRef }}
       />
+      {open && pending && (
+        <div style={{ fontSize: '0.8em', color: '#818cf8', padding: '2px 8px' }}>
+          загружается полный вывод…
+        </div>
+      )}
+      {open && failed && (
+        <div style={{ fontSize: '0.8em', color: '#d97706', padding: '2px 8px' }}>
+          полный вывод не загрузился — показан фрагмент
+        </div>
+      )}
+    </div>
+  );
+});
+
+// ── Background-process zone ────────────────────────────────────────────────
+// Active background work (run_in_background Bash, in-process subagents) as a
+// chips strip above the composer — the same presentation the SDK tab uses
+// (BackgroundTasksBar): the inline card stays in the transcript with a
+// terminal/handed-off state, while the LIVE face of the process is the chip.
+// Chips derive purely from durable entries; no separate lifecycle store.
+interface HistoryBackgroundChip {
+  key: string;
+  kind: 'bash' | 'subagent';
+  label: string;
+  entryUuid: string;
+  startedAt: number;
+  // Detail-pane payload (workflow-style expansion above the bar).
+  taskHistory?: Array<{ type: string; content?: string; tools?: string[] }>;
+  taskResult?: string;
+  agentSessionId?: string;
+  bashAcceptance?: string;
+}
+
+const collectHistoryBackgroundChips = (
+  entries: FullHistoryEntry[],
+  isTurnBusy: boolean,
+  agentProcessAlive: boolean,
+): HistoryBackgroundChip[] => {
+  // A chip is the LIVE face of work. Two liveness models:
+  //
+  // 1. Turn-scoped work (Claude Tasks, background Bash of the current turn):
+  //    lives only in the LAST turn while that turn is busy right now.
+  //    Historical turns are full of result-less cards (aborted turns,
+  //    docs-noise, rewound branches); treating them as running produced
+  //    boards of eternal "1236m" chips after a restart. Claude Escape kills
+  //    the whole turn including its subagents, so busy=false is terminal.
+  //
+  // 2. Process-scoped work (Codex in-process subagents with an EXPLICIT
+  //    rollout status): agents legitimately outlive their spawn turn —
+  //    spawn in turn N, wait_agent in turn N+2 — so busy=false with a
+  //    running agent is a normal state, not a stale card. Their gate is the
+  //    agent process itself: a dead codex process cannot host in-process
+  //    agents, and no terminal rollout event will ever arrive for them.
+  if (!isTurnBusy && !agentProcessAlive) return [];
+  const explicitOnly = !isTurnBusy;
+  let lastTurnStart = 0;
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    if (entries[i].role === 'user' && !isLocalPromptEntry(entries[i])) {
+      lastTurnStart = i;
+      break;
+    }
+  }
+  const chips: HistoryBackgroundChip[] = [];
+  for (let i = lastTurnStart; i < entries.length; i += 1) {
+    const entry = entries[i];
+    if (!Array.isArray(entry.actions)) continue;
+    for (const action of entry.actions) {
+      if (isRawAction(action) && action.rawTool.backgroundStatus === 'running') {
+        if (explicitOnly) continue; // turn-scoped: dies with the turn
+        const command = typeof action.rawTool.args?.command === 'string'
+          ? action.rawTool.args.command
+          : '';
+        chips.push({
+          key: 'bash:' + (action.rawTool.toolUseId || entry.uuid),
+          kind: 'bash',
+          label: command.slice(0, 80) || action.rawTool.toolName,
+          entryUuid: entry.uuid,
+          startedAt: Date.parse(entry.timestamp || '') || 0,
+          bashAcceptance: action.rawTool.result,
+        });
+        continue;
+      }
+      if (!isTaskAction(action)) continue;
+      // Explicit rollout status (Codex) is process-scoped truth; a Claude
+      // Task without one is turn-scoped and needs the busy gate.
+      const running = action.subagentStatus
+        ? action.subagentStatus === 'running'
+        : (!explicitOnly && action.result == null);
+      if (running) {
+        chips.push({
+          key: 'task:' + (action.toolUseId || entry.uuid),
+          kind: 'subagent',
+          label: (action.description || 'Task agent').slice(0, 80),
+          entryUuid: entry.uuid,
+          startedAt: Date.parse(entry.timestamp || '') || 0,
+          taskHistory: action.history,
+          taskResult: action.result,
+          agentSessionId: action.agentSessionId,
+        });
+      }
+    }
+  }
+  // Newest first, matching the SDK bar.
+  return chips.sort((a, b) => b.startedAt - a.startedAt);
+};
+
+// Entry uuids that currently have a LIVE background chip. The inline
+// «РАБОТАЕТ В ФОНЕ» badge follows chip liveness: a background card whose
+// process died with the turn (no notification ever) must not pulse forever.
+const HistoryBackgroundLiveContext = React.createContext<ReadonlySet<string>>(new Set());
+
+const HistoryBackgroundDot = () => (
+  <span
+    className="inline-block w-[6px] h-[6px] rounded-full shrink-0"
+    style={{
+      background: '#d97706',
+      animation: 'sdk-bg-task-pulse 1.4s ease-in-out infinite',
+      boxShadow: '0 0 4px rgba(217, 119, 6, 0.4)',
+    }}
+  />
+);
+
+const formatBackgroundElapsed = (startedAt: number) => {
+  if (!startedAt) return '';
+  const s = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  return rs === 0 ? m + 'm' : m + 'm ' + rs + 's';
+};
+
+// Workflow-style detail pane above the chips bar: what the agent is doing
+// right now (Claude — Task progress turns; bash — the acceptance output).
+// Read-only by design: no input; stopping stays on the existing Escape flow
+// which interrupts the whole turn.
+const HistoryBackgroundDetailPane = memo(({
+  chip,
+  onJumpToCard,
+  onClose,
+}: {
+  chip: HistoryBackgroundChip;
+  onJumpToCard: (entryUuid: string) => void;
+  onClose: () => void;
+}) => {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const stepCount = chip.taskHistory?.length || 0;
+  // Follow the newest step while the agent works.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [stepCount]);
+  return (
+    <div
+      data-history-background-detail
+      style={{
+        maxHeight: 260,
+        display: 'flex',
+        flexDirection: 'column',
+        borderTop: '1px solid #2a2a2a',
+        background: '#111111',
+      }}
+    >
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: '5px 10px', borderBottom: '1px solid #222',
+        color: '#bdbdbd', fontSize: '0.85em',
+      }}>
+        <HistoryBackgroundDot />
+        {chip.kind === 'bash'
+          ? <TerminalSquare size={12} style={{ color: '#d97706', flexShrink: 0 }} />
+          : <Bot size={12} style={{ color: '#d97706', flexShrink: 0 }} />}
+        <span className="truncate" style={{ flex: 1, fontFamily: 'monospace' }}>{chip.label}</span>
+        <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums' }}>
+          {formatBackgroundElapsed(chip.startedAt)}
+        </span>
+        <button
+          type="button"
+          onClick={() => onJumpToCard(chip.entryUuid)}
+          style={{
+            background: 'none', border: '1px solid #333', borderRadius: 4,
+            color: '#999', fontSize: '0.9em', padding: '1px 8px', cursor: 'pointer',
+          }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = '#ddd'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = '#999'; }}
+        >
+          в историю
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close agent pane"
+          style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: 2 }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = '#ddd'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = '#666'; }}
+        >
+          <X size={13} />
+        </button>
+      </div>
+      <div
+        ref={scrollRef}
+        style={{ overflowY: 'auto', padding: '6px 10px', fontSize: '0.82em', color: '#aaa' }}
+      >
+        {chip.kind === 'subagent' && (chip.taskHistory?.length ? (
+          chip.taskHistory.map((turn, index) => (
+            <div key={index} style={{ marginBottom: 6 }}>
+              {turn.content && (
+                <div style={{
+                  whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                  color: turn.type === 'user' ? '#8a8a8a' : '#bbb',
+                  maxHeight: 120, overflow: 'hidden',
+                }}>
+                  {turn.content.slice(0, 600)}
+                </div>
+              )}
+              {turn.tools?.map((tool, toolIndex) => (
+                <div key={toolIndex} style={{ color: '#7a7a7a', fontFamily: 'monospace', fontSize: '0.95em' }}>
+                  {tool}
+                </div>
+              ))}
+            </div>
+          ))
+        ) : (
+          <div style={{ color: '#666' }}>
+            Агент работает — промежуточные шаги появятся здесь по мере записи.
+          </div>
+        ))}
+        {chip.kind === 'bash' && (
+          <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'monospace' }}>
+            {chip.bashAcceptance || 'Команда работает в фоне; итог придёт уведомлением.'}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
+const HistoryBackgroundTasksBar = memo(({
+  chips,
+  expandedKey,
+  onToggle,
+  onJumpToCard,
+}: {
+  chips: HistoryBackgroundChip[];
+  expandedKey: string | null;
+  onToggle: (chipKey: string) => void;
+  onJumpToCard: (entryUuid: string) => void;
+}) => {
+  // 1s tick keeps elapsed labels live while anything runs.
+  const [, force] = React.useReducer((x: number) => x + 1, 0);
+  useEffect(() => {
+    if (chips.length === 0) return;
+    const handle = window.setInterval(() => force(), 1000);
+    return () => window.clearInterval(handle);
+  }, [chips.length]);
+  if (chips.length === 0) return null;
+  const expandedChip = expandedKey
+    ? chips.find((chip) => chip.key === expandedKey) || null
+    : null;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column' }}>
+      {expandedChip && (
+        <HistoryBackgroundDetailPane
+          chip={expandedChip}
+          onJumpToCard={onJumpToCard}
+          onClose={() => onToggle(expandedChip.key)}
+        />
+      )}
+      <div
+        data-history-background-tasks
+        className="flex items-stretch overflow-x-auto shrink-0"
+        style={{ borderTop: '1px solid #2a2a2a', background: '#141414' }}
+      >
+        {chips.map((chip, index) => {
+          const expanded = chip.key === expandedKey;
+          return (
+            <React.Fragment key={chip.key}>
+              {index > 0 && (
+                <span
+                  aria-hidden
+                  className="self-stretch shrink-0"
+                  style={{ width: 1, background: '#2a2a2a', margin: '4px 0' }}
+                />
+              )}
+              <button
+                type="button"
+                onClick={() => onToggle(chip.key)}
+                onMouseDown={(event) => event.preventDefault()}
+                className="group inline-flex items-center gap-1.5 px-2.5 py-1 text-[0.85em] font-mono shrink-0 cursor-pointer transition-colors outline-none"
+                style={{
+                  background: expanded ? 'rgba(217, 119, 6, 0.10)' : 'transparent',
+                  color: '#bdbdbd',
+                  minHeight: 22,
+                }}
+                onMouseEnter={(event) => { if (!expanded) (event.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)'; }}
+                onMouseLeave={(event) => { if (!expanded) (event.currentTarget as HTMLElement).style.background = 'transparent'; }}
+                title={chip.label}
+              >
+                <HistoryBackgroundDot />
+                {chip.kind === 'bash'
+                  ? <TerminalSquare size={11} style={{ color: '#d97706' }} />
+                  : <Bot size={11} style={{ color: '#d97706' }} />}
+                <span className="truncate max-w-[220px]">{chip.label}</span>
+                {chip.startedAt > 0 && (
+                  <span className="text-[0.85em] text-[#666] tabular-nums">{formatBackgroundElapsed(chip.startedAt)}</span>
+                )}
+              </button>
+            </React.Fragment>
+          );
+        })}
+      </div>
     </div>
   );
 });
@@ -1570,6 +2020,7 @@ const HistoryUserEntry = memo(({
 const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const liveBackgroundUuids = React.useContext(HistoryBackgroundLiveContext);
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
   }, []);
@@ -1603,7 +2054,7 @@ const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
       ) : undefined}
       className={isStandaloneToolRow ? 'hp-assistant-tool-only' : undefined}
     >
-      {entry.thinking && <HistoryThinkBlock text={entry.thinking} />}
+      {entry.thinking && <HistoryThinkBlock text={entry.thinking} payloadRef={entry.thinkingRef} />}
 
       {entry.content && (
         <div style={{ fontSize: '1em' }}>
@@ -1618,15 +2069,32 @@ const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
           const historyResult = toolResult == null && toolName.toLowerCase().includes('mcp')
             ? ''
             : toolResult;
+          const backgroundRunning = action.rawTool.backgroundStatus === 'running'
+            && liveBackgroundUuids.has(entry.uuid);
           return (
-            <HistoryToolCallPart
-              key={'raw' + index + ':' + toolName}
-              toolName={toolName}
-              args={action.rawTool.args || {}}
-              result={historyResult}
-              isError={action.rawTool.isError}
-              diffHunks={action.rawTool.diffHunks}
-            />
+            <div key={'raw' + index + ':' + toolName}>
+              <HistoryToolCallPart
+                toolName={toolName}
+                args={action.rawTool.args || {}}
+                result={historyResult}
+                resultRef={action.rawTool.resultRef}
+                isError={action.rawTool.isError}
+                diffHunks={action.rawTool.diffHunks}
+              />
+              {backgroundRunning && (
+                // The card holds only the acceptance text; the live face of
+                // this process is the chip in the background strip below.
+                <div style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 5,
+                  marginTop: 2, padding: '1px 6px', borderRadius: 4,
+                  background: 'rgba(217, 119, 6, 0.08)',
+                  color: '#d97706', fontSize: '0.75em', letterSpacing: 0.4,
+                }}>
+                  <HistoryBackgroundDot />
+                  РАБОТАЕТ В ФОНЕ
+                </div>
+              )}
+            </div>
           );
         }
         if (isTaskAction(action)) return <SubAgentBlock key={'task' + index} action={action} />;
@@ -5378,16 +5846,28 @@ function HistoryPanel({
   // Save scroll position + clean up CSS highlights on unmount.
   // Virtuoso owns scrolling — the scrollTop we save belongs to the inner
   // scroller element (via scrollerRef), not scrollRef.
+  // The position is keyed by tab + session: after Rewind/fork the child branch
+  // is a different document, and replaying the source branch's pixel offset
+  // into the truncated child list lands on an unrelated row.
+  const scrollPositionKey = tabId + ':' + (sessionId || 'no-session');
+  const scrollPositionKeyRef = useRef(scrollPositionKey);
+  scrollPositionKeyRef.current = scrollPositionKey;
+  // Cleanup on owner change intentionally does NOT read the DOM to save a
+  // position. This panel is persistently mounted: by the time this cleanup
+  // runs the render already committed the NEXT owner (the key ref points at
+  // the new tab and the scroller may show transitional content), so a save
+  // here poisoned the DESTINATION tab's stored position on every switch —
+  // the proven "scroll restore never works anywhere" bug. Position saving
+  // lives solely in the scroll-idle handler, which captures its owner key
+  // synchronously with the gesture.
   useEffect(() => {
     return () => {
-      const el = virtuosoScrollerRef.current;
-      if (el) setHistoryScrollPosition(tabId, el.scrollTop);
       if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
       const CSS_HL = (CSS as any).highlights;
       CSS_HL?.delete('hp-search');
       CSS_HL?.delete('hp-search-current');
     };
-  }, [tabId, setHistoryScrollPosition]);
+  }, [tabId]);
 
   // Slide animation state
   const [slideIn, setSlideIn] = useState(false);
@@ -5402,6 +5882,23 @@ function HistoryPanel({
   }, [isOpen]);
 
   const firstRenderSnapshot = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
+  // Rewind owner handoff: when the tab's session flips source → child while a
+  // rewind operation owns this tab, the previous owner's rows up to the rewind
+  // target are a PROVEN COMMON PREFIX of the child branch (the writer proof
+  // compared both histories turn-by-turn before commit). Present that prefix
+  // instead of tearing down to an empty loader; the child's real projection
+  // replaces it in one commit when loadHistory lands. Held per owner-key so a
+  // later unrelated session change can never resurrect it.
+  const rewindPrefixHandoffRef = useRef<{
+    sourceSessionId: string;
+    expectedChildSessionId: string | null;
+    entries: FullHistoryEntry[];
+    capturedAt: number;
+  } | null>(null);
+  // True while the visible rows are a display-only rewind prefix that has
+  // not yet been replaced by the child owner's durable projection. A failed
+  // first load must not leave the prefix standing as if it were final.
+  const rewindPrefixOnScreenRef = useRef<string | null>(null);
   const [entries, setEntries] = useState<FullHistoryEntry[]>(
     () => (firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined) || [],
   );
@@ -5484,7 +5981,19 @@ function HistoryPanel({
     const activeSuppressions = Array.from(suppressions.entries())
       .filter(([, suppression]) => suppression.expiresAt > now);
     const localEntries = sourceEntries.filter((entry) => {
-      if (isLocalRewindEntry(entry)) return true;
+      if (isLocalRewindEntry(entry)) {
+        // Terminal rewind rows are removed by their own events; an IN-FLIGHT
+        // row that outlives its operation (crash mid-op, lost rewind-log
+        // event) must not resurrect as an eternal "REWINDING…" on the next
+        // visit to this owner. Failed rows keep the shorter failure TTL.
+        const rewindAgeMs = now - (
+          entry.optimisticAt || Date.parse(entry.timestamp || '') || now
+        );
+        if (entry.rewindStatus === 'failed') {
+          return rewindAgeMs < LOCAL_PROMPT_FAILURE_TTL_MS;
+        }
+        return rewindAgeMs < LOCAL_REWIND_STALE_TTL_MS;
+      }
       if (!isLocalPromptEntry(entry)) return false;
       const ageMs = now - (
         entry.statusChangedAt ||
@@ -5547,12 +6056,16 @@ function HistoryPanel({
         if (!toolUseId) continue;
         const expected = remaining.get(toolUseId);
         if (!expected) continue;
-        if (
-          isRawAction(action)
-          && action.rawTool.result === expected.result
-          && action.rawTool.isError === expected.isError
-        ) {
-          remaining.delete(toolUseId);
+        if (isRawAction(action)) {
+          // A dehydrated durable result carries only a preview; its ref proves
+          // the durable side has the FULL text of this exact call, which is
+          // strictly newer knowledge than the live overlay copy.
+          const durableCoversLive = action.rawTool.resultRef
+            ? typeof action.rawTool.result === 'string'
+            : action.rawTool.result === expected.result;
+          if (durableCoversLive && action.rawTool.isError === expected.isError) {
+            remaining.delete(toolUseId);
+          }
         } else if (
           isTaskAction(action)
           && action.result === expected.result
@@ -5581,6 +6094,53 @@ function HistoryPanel({
       && liveToolResultsRef.current.results.size > 0
     );
   }, []);
+  const historyPayloadContextValue = useMemo(
+    () => (sessionId ? { toolType, sessionId, cwd } : null),
+    [toolType, sessionId, cwd],
+  );
+  // Background chips derive from durable rows only; local/optimistic rows
+  // can never be background work. Process liveness comes from the composer
+  // availability the controls already publish (status: active/busy/starting
+  // = agent process alive) — Codex in-process subagents outlive their spawn
+  // turn but never their host process.
+  const agentProcessStatus = useUIStore(
+    (s) => s.historyComposerAvailability[tabId]?.status || 'inactive',
+  );
+  const agentProcessAlive = agentProcessStatus === 'active'
+    || agentProcessStatus === 'busy'
+    || agentProcessStatus === 'starting';
+  const backgroundHistoryChips = useMemo(
+    () => collectHistoryBackgroundChips(entries, isTurnBusy, agentProcessAlive),
+    [entries, isTurnBusy, agentProcessAlive],
+  );
+  const liveBackgroundUuids = useMemo(
+    () => new Set(backgroundHistoryChips.map((chip) => chip.entryUuid)),
+    [backgroundHistoryChips],
+  );
+  // Tab-level loader inheritance: a Codex subagent can outlive its spawn
+  // turn, so the tab must keep spinning while any background chip is live
+  // even though the parent turn's busy flag is already false. Broadcast the
+  // live count; TabBar folds it into the shimmer (display-only — lifecycle
+  // busy ownership stays with the runtime signals).
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('history-panel:background-work', {
+      detail: { tabId, count: backgroundHistoryChips.length },
+    }));
+    return () => {
+      // Unmount must not leave the tab shimmering from a stale count.
+      window.dispatchEvent(new CustomEvent('history-panel:background-work', {
+        detail: { tabId, count: 0 },
+      }));
+    };
+  }, [tabId, backgroundHistoryChips.length]);
+  const [expandedBackgroundChipKey, setExpandedBackgroundChipKey] = useState<string | null>(null);
+  // Auto-close the pane when its chip finishes (mirrors the SDK bar).
+  useEffect(() => {
+    if (!expandedBackgroundChipKey) return;
+    if (!backgroundHistoryChips.some((chip) => chip.key === expandedBackgroundChipKey)) {
+      setExpandedBackgroundChipKey(null);
+    }
+  }, [backgroundHistoryChips, expandedBackgroundChipKey]);
   const rewindPreviewResult = useMemo(
     () => buildRewindPreviewEntries(renderEntries, rewindPreview),
     [renderEntries, rewindPreview],
@@ -5626,9 +6186,28 @@ function HistoryPanel({
     if (!historyScrollToUuid || displayEntries.length === 0) return -1;
     return displayEntryIndexByUuid.get(historyScrollToUuid) ?? -1;
   }, [displayEntryIndexByUuid, displayEntries.length, historyScrollToUuid]);
+  // Reading-anchor restore target. An explicit Timeline jump wins; otherwise
+  // a saved non-follow-bottom anchor puts the exact row the user last read
+  // at the exact in-row offset; follow-bottom (or no anchor) starts at the
+  // tail. Row identity + offset survives remounts, re-measures and app
+  // restarts, unlike a raw pixel scrollTop.
+  const initialAnchorLocation = useMemo(() => {
+    if (displayEntries.length === 0) return null;
+    const anchor = getHistoryReadingAnchor(scrollPositionKey);
+    if (!anchor || anchor.followBottom) return null;
+    const index = displayEntryIndexByUuid.get(anchor.uuid);
+    if (index === undefined) return null;
+    return {
+      index,
+      align: 'start' as const,
+      behavior: 'auto' as const,
+      offset: anchor.offsetPx,
+    };
+  }, [displayEntryIndexByUuid, displayEntries.length, scrollPositionKey]);
   const initialTopMostItemIndex = pendingInitialHistoryIndex >= 0
     ? { index: pendingInitialHistoryIndex, align: 'center' as const, behavior: 'auto' as const }
-    : (displayEntries.length > 0 ? displayEntries.length - 1 : 0);
+    : initialAnchorLocation
+      ?? (displayEntries.length > 0 ? displayEntries.length - 1 : 0);
   const rewindPreviewHiddenCount = rewindPreviewResult.hiddenCount;
   // Last entry uuid Claude's own backtrace reaches before stopping at the first
   // orphan. Any entry at index <= boundary is part of the chain-break zone:
@@ -5651,6 +6230,9 @@ function HistoryPanel({
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const isResizing = useRef(false);
   const isAtBottomRef = useRef(true);
+  // Bumped by real user scroll intent and by owner change; the scroll-restore
+  // convergence loop checks it each frame so it never fights the user.
+  const scrollRestoreGenRef = useRef(0);
   const [controlsHeight, setControlsHeight] = useState(0);
   const controlsHeightRef = useRef(0);
   const prevVisibleUuidsRef = useRef('');
@@ -6298,12 +6880,47 @@ function HistoryPanel({
     historyDraftWarning?: string;
     mode?: 'native' | 'ai';
     toolType?: string;
+    sourceSessionId?: string | null;
     persisted?: boolean;
     historyInputDraft?: boolean;
     error?: string;
     message?: string;
   }) => {
     if (detail.tabId !== tabId) return;
+    // Owner guard for ROW-INSERTING events only ('start'/'failed'): a late
+    // event from the SOURCE branch of a completed Rewind must not inject a
+    // local rewind row into the adopted CHILD owner's overlay. 'done' is
+    // exempt on purpose — a successful Codex Rewind swaps the tab session
+    // BEFORE emitting done, so the done event legitimately carries the source
+    // id; it only removes rows and restores the draft (tab-level, idempotent).
+    // Events without a session stamp stay tab-scoped (legacy emitters).
+    if (
+      detail.status !== 'done'
+      && typeof detail.sourceSessionId === 'string'
+      && detail.sourceSessionId
+      && sessionId
+      && detail.sourceSessionId !== sessionId
+    ) {
+      historyDiag('REWIND_LOG_STALE_OWNER tab=' + tabId.slice(-12)
+        + ' op=' + (detail.opId || '-')
+        + ' eventSession=' + detail.sourceSessionId.slice(0, 8)
+        + ' currentSession=' + String(sessionId).slice(0, 8)
+        + ' status=' + (detail.status || 'start'));
+      // A late-stage rewind failure can land after the tab already adopted
+      // the child session (Codex swaps before the result settles). The row
+      // belongs to the source overlay and is dropped, but the failure itself
+      // is tab-level news the user must still see — otherwise the rewind
+      // dies silently with no failed row and no error banner.
+      if (detail.status === 'failed') {
+        window.dispatchEvent(new CustomEvent('history-panel:agent-error', {
+          detail: {
+            tabId,
+            message: String(detail.error || detail.message || 'Rewind failed'),
+          },
+        }));
+      }
+      return;
+    }
     const opId = detail.opId || String(Date.now());
     const status = detail.status || 'start';
     const targetText = normalizeHistoryPromptText(detail.targetText || '');
@@ -6552,6 +7169,9 @@ function HistoryPanel({
         cwd,
         tabId,
         ifRevision: revisionForRequest,
+        // Desktop History rehydrates payloads on card expand; heavy tool
+        // outputs/thinking arrive as previews + refs instead of megabytes.
+        dehydrate: true,
       });
       if (!isCurrentOwner()) {
         historyDiag('LOAD_STALE_DROP tab=' + tabId.slice(-12) +
@@ -6680,6 +7300,9 @@ function HistoryPanel({
           presentationEntriesRef.current = newEntries;
           persistVolatileOverlay(historySnapshotOwner, newEntries);
           historyLoaderReasonRef.current = 'load-success';
+          // The durable projection replaced any display-only rewind prefix
+          // wholesale; nothing partial is on screen.
+          rewindPrefixOnScreenRef.current = null;
           historyDiag('LOAD_APPLY tab=' + tabId.slice(-12) +
             ' session=' + sessionId.slice(0, 8) +
             ' seq=' + loadSequence +
@@ -6744,6 +7367,12 @@ function HistoryPanel({
       if (!isRefresh) {
         historyLoaderReasonRef.current = 'load-result-failed';
         setLoading(false);
+        if (rewindPrefixOnScreenRef.current === historyOwnerKey) {
+          // The rows on screen are still the display-only rewind prefix and
+          // the child projection failed to load — say so instead of letting
+          // the prefix stand as if it were the final history.
+          setError('История новой ветки не загрузилась: ' + String(result?.error || 'load failed') + '. Показан общий префикс до отката.');
+        }
       }
       historyDiag('LOAD_RESULT_FAIL tab=' + tabId.slice(-12) +
         ' session=' + sessionId.slice(0, 8) +
@@ -6764,6 +7393,9 @@ function HistoryPanel({
       if (!isRefresh) {
         historyLoaderReasonRef.current = 'load-exception';
         setLoading(false);
+        if (rewindPrefixOnScreenRef.current === historyOwnerKey) {
+          setError('История новой ветки не загрузилась: ' + String((e as any)?.message || e) + '. Показан общий префикс до отката.');
+        }
       }
       historyDiag('LOAD_ERROR tab=' + tabId.slice(-12) +
         ' session=' + sessionId.slice(0, 8) +
@@ -7027,6 +7659,65 @@ function HistoryPanel({
     surfacePresentedOwnerRef.current = '';
     setPresentedOwnerKey(historyOwnerKey);
     initialLoadDoneRef.current = false;
+    // New owner starts pinned to the tail until ITS rows report otherwise;
+    // a leftover false from the previous owner would suppress followOutput
+    // on a tab that opens at the bottom.
+    isAtBottomRef.current = true;
+    if (scrollSaveTimerRef.current) {
+      // A scroll-idle save armed by the previous owner must not observe the
+      // next owner's scroller (the timer's own stale-guard also covers this;
+      // clearing here just avoids the no-op wakeup).
+      clearTimeout(scrollSaveTimerRef.current);
+      scrollSaveTimerRef.current = null;
+    }
+    // Rewind owner handoff capture: presentationEntriesRef still holds the
+    // PREVIOUS owner's rows at this point. If this session change was caused
+    // by a rewind that adopted a child branch, everything strictly before the
+    // rewind target is a proven common prefix of the new branch — hold it for
+    // the cache-miss branch below instead of flashing an empty loader.
+    {
+      const activeOp = selectActiveRewindOperation(useRewindOperationStore.getState(), tabId);
+      const previousRows = presentationEntriesRef.current;
+      // The child adoption a rewind performs happens only while the operation
+      // is committing (Timeline swaps the session right after mutation proof)
+      // or done (activeSessionId carries the exact child). A session swap
+      // during earlier phases cannot be this rewind's doing — e.g. a stale
+      // bridge takeover racing a still-compacting rewind — and showing the
+      // source prefix for such a swap would present another session's rows.
+      const opPhaseAllowsAdoption = activeOp?.phase === 'committing' || activeOp?.phase === 'done';
+      if (
+        activeOp
+        && opPhaseAllowsAdoption
+        && activeOp.sourceSessionId
+        && sessionId
+        && activeOp.sourceSessionId !== sessionId
+        && (activeOp.phase === 'committing'
+          ? !activeOp.activeSessionId || activeOp.activeSessionId === sessionId
+          : activeOp.activeSessionId === sessionId)
+        && previousRows.length > 0
+      ) {
+        const targetIdx = previousRows.findIndex((entry) => entry.uuid === activeOp.targetUuid);
+        if (targetIdx > 0) {
+          const prefix = previousRows
+            .slice(0, targetIdx)
+            .filter((entry) => !isLocalRewindEntry(entry) && !isLocalPromptEntry(entry));
+          if (prefix.length > 0) {
+            rewindPrefixHandoffRef.current = {
+              sourceSessionId: activeOp.sourceSessionId,
+              expectedChildSessionId: sessionId,
+              entries: prefix,
+              capturedAt: Date.now(),
+            };
+            historyDiag('REWIND_PREFIX_CAPTURE tab=' + tabId.slice(-12)
+              + ' op=' + activeOp.opId
+              + ' source=' + activeOp.sourceSessionId.slice(0, 8)
+              + ' child=' + sessionId.slice(0, 8)
+              + ' prefixRows=' + prefix.length
+              + ' target=' + String(activeOp.targetUuid).slice(0, 8));
+          }
+        }
+      }
+    }
     const volatileOverlay = sessionId
       ? historyVolatileOverlayCache.get<
           FullHistoryEntry,
@@ -7065,6 +7756,9 @@ function HistoryPanel({
       ' cacheApproxBytes=' + cacheStats.approxBytes +
       ' localEntries=' + restoredLocalEntries.length);
     if (cachedSnapshot) {
+      // A cached child projection wins over the display-only prefix; drop the
+      // handoff so a LATER unrelated owner change cannot consume stale rows.
+      rewindPrefixHandoffRef.current = null;
       viewportReadyOwnerKeyRef.current = historyOwnerKey;
       setViewportReadyOwnerKey(historyOwnerKey);
       setViewportProofRequired(false);
@@ -7084,15 +7778,51 @@ function HistoryPanel({
       historyRevisionRef.current = cachedSnapshot.revision;
       lastServerEntryUuidsRef.current = new Set(rawCachedEntries.map((entry) => entry.uuid));
       rawServerEntriesRef.current = rawCachedEntries;
+      rewindPrefixOnScreenRef.current = null;
       setLoading(false);
       persistVolatileOverlay(historySnapshotOwner, cachedEntries);
     } else {
-      viewportReadyOwnerKeyRef.current = '';
-      setViewportReadyOwnerKey('');
-      setViewportProofRequired(true);
-      setLoading(!!sessionId);
-      presentationEntriesRef.current = restoredLocalEntries;
-      setEntries(restoredLocalEntries);
+      // Cache miss. A rewind-adopted child may present the proven common
+      // prefix of its source branch while the real projection loads — the
+      // screen keeps the conversation up to the rewind target instead of
+      // flashing empty. The prefix is display-only: it is NOT written to the
+      // snapshot cache or treated as server truth, and loadHistory's commit
+      // replaces it wholesale (owner+generation guarded).
+      const prefixHandoff = rewindPrefixHandoffRef.current;
+      rewindPrefixHandoffRef.current = null;
+      const prefixRows = prefixHandoff
+        && prefixHandoff.expectedChildSessionId === sessionId
+        && Date.now() - prefixHandoff.capturedAt < 30_000
+        ? prefixHandoff.entries
+        : [];
+      const initialRows = prefixRows.length > 0
+        ? mergeServerAndLocalEntries(prefixRows, restoredLocalEntries)
+        : restoredLocalEntries;
+      if (prefixRows.length > 0) {
+        historyDiag('REWIND_PREFIX_PRESENT tab=' + tabId.slice(-12)
+          + ' child=' + (sessionId ? sessionId.slice(0, 8) : 'none')
+          + ' prefixRows=' + prefixRows.length);
+        rewindPrefixOnScreenRef.current = historyOwnerKey;
+        // The prefix rows were painted by this same list moments ago (the
+        // rewind swapped the session in place, no tab switch) — the cold
+        // paint gate is not needed; the child projection swaps in on load.
+        viewportReadyOwnerKeyRef.current = historyOwnerKey;
+        setViewportReadyOwnerKey(historyOwnerKey);
+        setViewportProofRequired(false);
+        setLoading(false);
+      } else {
+        // Strict loader contract for every other cold owner: the loader
+        // stays visible until a real row is mounted AND painted (viewport
+        // proof). Fast-path presentation of stale fragments here produced
+        // dark frames with no indicator — a screen with rows=0 and no
+        // loader must be impossible by construction, not caught by tests.
+        viewportReadyOwnerKeyRef.current = '';
+        setViewportReadyOwnerKey('');
+        setViewportProofRequired(true);
+        setLoading(!!sessionId);
+      }
+      presentationEntriesRef.current = initialRows;
+      setEntries(initialRows);
       setClaudeMemoryBoundaryUuid(null);
       historyRevisionRef.current = null;
       lastServerEntryUuidsRef.current = new Set();
@@ -7146,26 +7876,137 @@ function HistoryPanel({
     reconcileLiveProjectionAgainstDurable,
   ]);
 
-  // Restore saved scroll position after initial load completes.
-  // Virtuoso owns the scroller, so we write into `virtuosoScrollerRef.current.scrollTop`
-  // after the scroller element has been attached. `initialScrollTop` would be
-  // cleaner but it requires the scroller to be mounted on first render — our
-  // session/loading flow rebuilds the list, so a write-once useEffect is more
-  // robust. Retry once: Virtuoso may re-measure items after first paint.
+  // Restore the reading position once per owner, after the surface is ready.
+  // Anchor first (row identity + in-row offset — stable across remeasures,
+  // remounts and app restarts), then the legacy pixel slot, then the tail.
+  // An explicit Timeline jump (historyScrollToUuid) owns the position and
+  // must not be raced by a competing restore.
   useEffect(() => {
     if (surfaceLoading || initialLoadDoneRef.current) return;
+    if (displayEntries.length === 0) return;
+    if (useUIStore.getState().historyScrollToUuid) {
+      // Timeline navigation wins; mark restore as done so it cannot fire
+      // later and yank the viewport away from the jump target.
+      initialLoadDoneRef.current = true;
+      return;
+    }
     initialLoadDoneRef.current = true;
-    const savedPos = useUIStore.getState().historyScrollPositions[tabId];
-    if (savedPos && savedPos > 0) {
+    const anchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
+    if (anchor && !anchor.followBottom) {
+      const index = displayEntryIndexByUuidRef.current.get(anchor.uuid);
+      if (index !== undefined) {
+        // The restored position is mid-list: Virtuoso followOutput must not
+        // treat a live append as "user is at the tail" and yank away.
+        isAtBottomRef.current = false;
+        // Convergence loop, not a single shot. On a cold (cache=miss) list
+        // Virtuoso jumps using ESTIMATED heights; rows above the target then
+        // measure taller/shorter and the landed position silently drifts
+        // (E2E-proven: ~11 rows off while the log claimed success). Re-issue
+        // the jump each frame until the target row's DOM rect is stable at
+        // the intended offset — the same stability signal the Timeline-jump
+        // loop relies on. Cancelled by owner change or real user scroll.
+        const ownerAtRestore = historyOwnerKey;
+        const generationAtRestore = historyOwnerGenerationRef.current;
+        const restoreGenAtStart = ++scrollRestoreGenRef.current;
+        const startedAt = performance.now();
+        let attempts = 0;
+        let stableFrames = 0;
+        let stagnantFrames = 0;
+        let jumpedLastFrame = false;
+        let lastTop: number | null = null;
+        let lastDrift: number | null = null;
+        const MAX_ATTEMPTS = 240;
+        const step = () => {
+          if (
+            historyOwnerKeyRef.current !== ownerAtRestore
+            || historyOwnerGenerationRef.current !== generationAtRestore
+            || scrollRestoreGenRef.current !== restoreGenAtStart
+          ) return;
+          const scroller = virtuosoScrollerRef.current;
+          if (!scroller) return;
+          attempts += 1;
+          const node = scroller.querySelector(`[data-uuid="${CSS.escape(anchor.uuid)}"]`) as HTMLElement | null;
+          const scrollerTop = scroller.getBoundingClientRect().top;
+          const nodeTop = node ? node.getBoundingClientRect().top : null;
+          const desiredTop = scrollerTop - anchor.offsetPx;
+          const drift = nodeTop === null ? null : nodeTop - desiredTop;
+          lastDrift = drift;
+          const atDesired = drift !== null && Math.abs(drift) <= 2;
+          const unchanged = nodeTop !== null && lastTop !== null
+            && Math.abs(nodeTop - lastTop) <= 1;
+          if (atDesired && unchanged) stableFrames += 1;
+          else stableFrames = 0;
+          // A re-issued jump that no longer moves the row means Virtuoso has
+          // landed as close as fractional row heights allow (E2E-measured
+          // 3-4px residual drift). Accept that position instead of burning
+          // the whole attempt budget re-jumping at a target the layout
+          // cannot express — settled=0 at a correct position is exactly the
+          // "log disagrees with reality" class this loop exists to close.
+          if (!atDesired && unchanged && jumpedLastFrame) stagnantFrames += 1;
+          else if (!unchanged) stagnantFrames = 0;
+          lastTop = nodeTop;
+          const converged = stableFrames >= 2;
+          const acceptedDrift = stagnantFrames >= 3;
+          if (converged || acceptedDrift || attempts >= MAX_ATTEMPTS) {
+            historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
+              + ' uuid=' + anchor.uuid.slice(0, 8)
+              + ' attempts=' + attempts
+              + ' settled=' + (converged ? '1' : acceptedDrift ? 'drift' : '0')
+              + ' driftPx=' + (lastDrift === null ? 'na' : Math.round(lastDrift))
+              + ' elapsedMs=' + Math.round(performance.now() - startedAt));
+            return;
+          }
+          jumpedLastFrame = false;
+          if (!atDesired) {
+            const currentIndex = displayEntryIndexByUuidRef.current.get(anchor.uuid);
+            if (currentIndex === undefined) return; // row vanished mid-restore
+            virtuosoRef.current?.scrollToIndex({
+              index: currentIndex,
+              align: 'start',
+              behavior: 'auto',
+              offset: anchor.offsetPx,
+            });
+            jumpedLastFrame = true;
+          }
+          requestAnimationFrame(step);
+        };
+        historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12)
+          + ' mode=anchor uuid=' + anchor.uuid.slice(0, 8)
+          + ' idx=' + index + ' offset=' + anchor.offsetPx);
+        requestAnimationFrame(step);
+        return;
+      }
+      // Anchor row vanished (rewind/edit truncated the branch): fall through
+      // to the tail rather than showing an unrelated pixel position.
+    }
+    if (anchor?.followBottom) {
+      historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12) + ' mode=tail');
       requestAnimationFrame(() => {
-        const el = virtuosoScrollerRef.current;
-        if (el) {
-          el.scrollTop = savedPos;
-          requestAnimationFrame(() => { if (el) el.scrollTop = savedPos; });
+        const count = lengthRef.current;
+        if (count > 0) {
+          virtuosoRef.current?.scrollToIndex({ index: count - 1, align: 'end', behavior: 'auto' });
         }
       });
+      return;
     }
-  }, [surfaceLoading, tabId]);
+    if (!anchor) {
+      // Legacy pixel fallback for positions saved before the anchor existed.
+      const positions = useUIStore.getState().historyScrollPositions;
+      const savedPos = positions[scrollPositionKeyRef.current] ?? positions[tabId];
+      if (savedPos && savedPos > 0) {
+        historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12) + ' mode=legacy-px px=' + Math.round(savedPos));
+        requestAnimationFrame(() => {
+          const el = virtuosoScrollerRef.current;
+          if (el) {
+            el.scrollTop = savedPos;
+            requestAnimationFrame(() => { if (el) el.scrollTop = savedPos; });
+          }
+        });
+      }
+    }
+    // `entries` in deps: on a cold owner this effect must re-run when the
+    // first projection lands (surfaceLoading flips earlier than rows exist).
+  }, [surfaceLoading, tabId, historyOwnerKey, entries]);
 
   // Codex already exposes a canonical incremental transcript for web/SSE.
   // Project that same stream into desktop History while the turn is busy,
@@ -7446,6 +8287,9 @@ function HistoryPanel({
       isAtBottomRef.current = false;
       historyTailPinScheduler.cancel();
     }
+    // Any real wheel/touch takes position ownership from a running restore
+    // convergence loop (same contract as the Timeline-jump cancel below).
+    scrollRestoreGenRef.current += 1;
     if (cancelHistoryScrollFromUser(reason)) return;
     const lastJump = lastProgrammaticHistoryScrollRef.current;
     if (!lastJump || lastJump.userIntentLogged) return;
@@ -7652,8 +8496,33 @@ function HistoryPanel({
     scrollDirectionRef.current = el.scrollTop >= lastScrollTopRef.current ? 'down' : 'up';
     lastScrollTopRef.current = el.scrollTop;
     if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+    // Capture the owner key NOW, not when the timer fires: the panel is
+    // persistently mounted, so 150ms later the tab may already be a
+    // different one and a ref read would file this position under the
+    // destination tab's key (the proven cross-tab poisoning bug).
+    const saveKey = scrollPositionKeyRef.current;
     scrollSaveTimerRef.current = setTimeout(() => {
-      setHistoryScrollPosition(tabId, el.scrollTop);
+      // Stale-guard: fire only while the same owner is still presented and
+      // the scroller shows ITS rows. An owner switch mid-debounce discards
+      // the save — the anchor already stored on the previous idle tick wins.
+      if (scrollPositionKeyRef.current !== saveKey) return;
+      if (!el.isConnected) return;
+      setHistoryScrollPosition(saveKey, el.scrollTop);
+      // Reading anchor: row identity + in-row offset instead of raw pixels.
+      // Virtualized heights are estimates until measured, so scrollTop stops
+      // meaning anything across remounts/re-measures; the anchor survives
+      // both and an app restart (localStorage).
+      const anchor = captureHistoryAnchorFromDom(el, isHistoryTailPinned(el));
+      if (anchor) {
+        setHistoryReadingAnchor(saveKey, {
+          ...anchor,
+          savedAt: Date.now(),
+        });
+        historyDiag('SCROLL_SAVE tab=' + tabId.slice(-12)
+          + ' uuid=' + anchor.uuid.slice(0, 8)
+          + ' offset=' + anchor.offsetPx
+          + ' followBottom=' + (anchor.followBottom ? '1' : '0'));
+      }
     }, 150);
   }, [clearHistoryToolScrollFocus, tabId, setHistoryScrollPosition]);
 
@@ -7962,15 +8831,36 @@ function HistoryPanel({
 
       {/* Content */}
       <div data-history-content-stage style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+        <HistoryPayloadContext.Provider value={historyPayloadContextValue}>
+        <HistoryBackgroundLiveContext.Provider value={liveBackgroundUuids}>
         {surfaceLoading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#818cf8', fontSize: 13, gap: 8 }}>
             <HistorySpinner size={16} />
             Loading...
           </div>
         ) : transcriptEntries.length === 0 ? (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#555', fontSize: 13 }}>
-            No history entries
-          </div>
+          !sessionId && (toolType === 'claude' || toolType === 'codex') ? (
+            // The tab has an agent but no confirmed history file yet
+            // (session binding lost across a restart, or writer proof still
+            // pending). The old bare "No history entries" here read as a
+            // silent gray screen — the loader hides on reason=no-session and
+            // nothing explained the wait.
+            <div style={{
+              display: 'flex', flexDirection: 'column', alignItems: 'center',
+              justifyContent: 'center', height: '100%', color: '#777',
+              fontSize: 13, gap: 8, textAlign: 'center', padding: '0 24px',
+            }}>
+              <HistorySpinner size={14} />
+              <div>Файл истории ещё не подтверждён</div>
+              <div style={{ fontSize: 11, color: '#555' }}>
+                История появится, когда приложение свяжет вкладку с сессией — обычно после первого сообщения или Resume.
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#555', fontSize: 13 }}>
+              No history entries
+            </div>
+          )
         ) : (
           <>
           <Virtuoso
@@ -8166,6 +9056,33 @@ function HistoryPanel({
             </div>
           )}
           </>
+        )}
+        </HistoryBackgroundLiveContext.Provider>
+        </HistoryPayloadContext.Provider>
+        {backgroundHistoryChips.length > 0 && (
+          // Live face of background work (bash run_in_background, subagents):
+          // chips strip pinned above the composer, SDK-tab presentation. A
+          // chip click expands the workflow-style detail pane above the bar;
+          // «в историю» inside the pane jumps to the transcript card. The
+          // inline card keeps the handed-off/terminal state.
+          <div
+            style={{
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              bottom: mainSurface ? controlsHeight : 0,
+              zIndex: 7,
+            }}
+          >
+            <HistoryBackgroundTasksBar
+              chips={backgroundHistoryChips}
+              expandedKey={expandedBackgroundChipKey}
+              onToggle={(chipKey) => setExpandedBackgroundChipKey(
+                (current) => current === chipKey ? null : chipKey,
+              )}
+              onJumpToCard={(entryUuid) => setHistoryScrollToUuid(entryUuid)}
+            />
+          </div>
         )}
         {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll */}
         <ControlHint label="Прокрутить History вниз">

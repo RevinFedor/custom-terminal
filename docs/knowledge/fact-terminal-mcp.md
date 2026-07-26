@@ -5,15 +5,19 @@ MCP-сервер для управления терминальными вкла
 
 ## Архитектура
 
-### Два MCP-сервера, один HTTP backend
-Проект использует два отдельных MCP-сервера, и оба ходят в один и тот же main-process HTTP:
-- `.claude/mcp/terminal-server.mjs` — Terminal Management (tabs, restart, run, output, AI live control). *Оператор*: что сейчас крутится, запустить/отправить prompt/остановить.
-- `~/.claude/mcp/overseer-server.mjs` — контроль сессий (чтение + редактирование истории через `/overseer/*` endpoints). *Историк/редактор*: что сессия сделала, прочитать/переписать транскрипт. Полная механика — [`fact-overseer-mcp.md`](fact-overseer-mcp.md).
+### Один публичный MCP, несколько внутренних границ
+После унификации публичная AI-поверхность одна: `~/.claude/mcp/terminal-server.mjs`. Она не переносит бизнес-логику в MCP, а типизированно вызывает существующие main-process HTTP/API-сценарии:
+- live process control и shell output;
+- Project API для agent send/interrupt/rewind и долговечной оркестрации;
+- `/overseer/*` как внутренний read/edit backend истории;
+- renderer bridge для persistent UI-state: план задач, имя вкладки и file-child.
 
-Граница по blast radius: terminal MCP может убить dev-сервер, overseer MCP — переписать JSONL. Оба общаются с main process через один и тот же HTTP-сервер (`mcpHttpServer` на localhost). Порт обнаруживается через `~/.noted-terminal/mcp-port-<PID>` (см. [`fix-mcp-multi-instance.md`](fix-mcp-multi-instance.md)).
+Отдельный `overseer-server.mjs`, его MCP-регистрация и skill удалены. Причина объединения — не смешать blast radius, а дать нейронке одну обнаруживаемую поверхность: раньше правила выбора между двумя MCP жили в длинном skill/prompt и регулярно приводили к чтению ответа через terminal output или polling не того канала. Опасные операции по-прежнему разделены отдельными методами и approval-контрактами. Механика истории описана в [`fact-session-history.md`](fact-session-history.md).
 
-### Определение проекта
-MCP-сервер определяет проект через `process.cwd()` (как knowledge-server). Это позволяет одному серверу обслуживать любой проект без конфигурации. Main process находит проект в SQLite по path и отдаёт только его вкладки.
+### Определение проекта и своей вкладки
+Внутри полноценной Noted Terminal-сессии main передаёт MCP `NOTED_PARENT_PROJECT_ID`, `NOTED_PARENT_TAB_ID` и `NOTED_MAIN_PID`. Они приоритетнее cwd и активной вкладки UI: пользователь может смотреть другой проект, пока агент работает в фоне. `current_context` возвращает доказанную пару project/tab и известный sessionId; self-операции (`rename_tab`, `link_file`, `get_tab_plan`, `apply_tab_plan_changes`) принимают отсутствующий `tabId` как эту родительскую вкладку.
+
+Внешний клиент без parent env использует `list_projects` и передаёт явный `projectId`/`tabId`. `process.cwd()` остаётся fallback для старых callers, но не source of truth для собственной идентичности.
 
 ### Tab Data: SQLite + Live State
 `/terminal/tabs` объединяет данные из двух источников:
@@ -35,7 +39,11 @@ Terminal MCP публикует две отдельные команды стр�
 
 Terminal MCP управляет **живым процессом**, а не историей. `start_ai` создаёт или переиспользует вкладку и запускает `claude` / `codex` / `gemini` через те же app-native launch hooks, что UI. `send_prompt` вставляет prompt в целевую вкладку через существующий safe paste path, `stop_ai` останавливает AI process-tree без уничтожения shell. Для `codex-c` / `codex-f` / `claude-c` / `claude-f` create-tab aliases проходят через pendingAction, чтобы renderer применил тот же resume/fork flow, что пользовательская кнопка.
 
-`send_prompt` / `Status: sent` — это delivery-only сигнал. Он подтверждает, что prompt доставлен в PTY/agent tab, но не ждёт завершения ответа. Completion и финальный текст читать через Overseer (`list_open_sessions` → `busy/status` → `session_stats/list_turns/get_assistant_text`), иначе агент начинает парсить TUI-output и преждевременно объявляет long-running Claude «не ответившим».
+`send_prompt` / `Status: sent` — это delivery-only сигнал. Он подтверждает, что prompt доставлен в PTY/agent tab, но не ждёт завершения ответа. Для ручной инспекции уже открытой сессии history-tools того же Terminal MCP читают `list_open_sessions` → `busy/status` → targeted turn/text. Для долгой делегации этот цикл запрещён: `delegate_to_session` создаёт persistent run, источник получает одно completion-уведомление, затем вызывает `get_delegation_result` ровно один раз. Так 30-минутный turn не держит HTTP/MCP-вызов и переживает restart.
+
+`/terminal/ai-prompt` с `submit=true` для Claude **и Codex** не пишет в PTY напрямую: main пересылает запрос в renderer scenario layer (`sendAgentPromptScenario`) — тот же путь, что History Enter / Project API / Inbox. Это даёт MCP-отправке готовность/queue/audit-проверки и статус-паритет: `submitted_unverified` возвращается как HTTP 202 (доставлено в TUI, durable-подтверждение ещё не пришло), а не теряется. Прямой `safePasteAndSubmit` остался только для paste-без-submit (`submit=false`) и Gemini, у которого нет scenario runtime. Следствие: если renderer недоступен (окно перезагружается), Claude/Codex submit вернёт ошибку bridge, а не молча вставит байты в PTY.
+
+Два fail-closed edge этого маршрута. (1) Bridge-timeout (60с) ≠ ошибка доставки: renderer-сценарий может законно жить дольше (launch-if-needed + readiness + paste) и всё ещё доставить prompt — ответ в этом случае HTTP 202 `delivery_unknown` с предупреждением не повторять тот же prompt вслепую; повтор в живую AI-сессию хуже неизвестного статуса (тот же принцип, что completion prompt после rebuild выше). (2) Если renderer ещё не гидрировал workspace store (запрос сразу после старта приложения), сценарий не сваливается в Claude SDK fallback — для MCP-источников это была бы отправка НЕ тем агентом в Codex-вкладку; возвращается явная ошибка «tab not resolved yet, retry after load».
 
 `build_install_noted_terminal` — исключение из обычных terminal-actions: это fire-and-forget
 handoff в Voice Record, а не команда в текущей PTY. Использовать его, когда агент внутри
@@ -56,7 +64,13 @@ Completion prompt после rebuild — **одноразовая доставк
 уже получить ввод, а доказательство могло сорваться на audit/readiness edge. Повтор здесь хуже
 ошибки статуса — пользователь получает несколько одинаковых команд в живой AI-сессии.
 
-Граница с Overseer: если нужно узнать, что агент уже сделал, читать session history через overseer. Если нужно заставить живую вкладку что-то сделать сейчас, использовать terminal MCP. Не пытаться реализовать Codex orchestration через rewrite rollout JSONL: Codex history append-only и не имеет Claude edit-range модели.
+Единый namespace не отменяет внутреннюю границу: live-действия идут через scenario layer, чтение/редактирование прошлого — через history backend. Не пытаться реализовать Codex orchestration через rewrite rollout JSONL: Codex history append-only и не имеет Claude edit-range модели.
+
+## План задач и дочерний файл
+
+Блок в левом верхнем углу вкладки — структурированный план задач: `get_tab_plan` читает его, а `apply_tab_plan_changes` атомарно применяет только заранее показанный и подтверждённый пользователем пакет операций. Старое поле `tab.notes` остаётся совместимостью удалённой Markdown-поверхности и не выставляется как новый публичный метод. `list_notes` — третья, независимая сущность: пользовательские якоря Timeline.
+
+`link_file` не создаёт новую иерархию. Он вызывает тот же renderer-сценарий, что desktop Link File/DnD: `tabType='file'`, `visualParentTabId=<AI tab>`, inherited `groupId`, background creation. Путь сначала canonicalize/проверяется сервером; повтор той же пары canonical file + parent возвращает существующий file-tab. Без `tabId` файл прикрепляется к родительской полноценной сессии, с явным `tabId` — к другой открытой AI-вкладке, в том числе другого проекта.
 
 ## MCP activity events
 
@@ -96,4 +110,4 @@ Shell остаётся живым. Output buffer не теряется. PTY pid 
 **Ловушка (апрель 2026):** Первая реализация была `{lines: string[]}` с `push() + splice(0, excess)` — O(n) splice на каждом onData чанке. При 15+ табах с активными Claude это давало ~750 splice/сек в main event loop, что вместе с Timeline backtrace polling вызывало thermal throttling (kernel_task до 200%). Симптом: macOS становится медленным даже после остановки всех Claude-процессов — память под давлением, page-out, kernel жонглирует страницами.
 
 ## Развёртывание
-Сервер копируется в каждый проект как `.claude/mcp/terminal-server.mjs`. Регистрация: `.mcp.json` (Claude) + `.claude/settings.json` (auto-approval) + `~/.gemini/settings.json` (глобальный для Gemini).
+Repo source — `mcp/terminal-server.mjs`, установленная копия — `~/.claude/mcp/terminal-server.mjs`. Claude и Codex регистрируют только имя `terminal`; отдельной регистрации `overseer` нет. Skill-source живёт в `~/.claude/skills/terminal/` и автоматически зеркалится в `~/.codex/skills/terminal/`.

@@ -118,6 +118,11 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
       runAfterTabId: 'closed-target',
       workflowArmedAt: 888,
     },
+    'tab-long-delay': {
+      items: [],
+      autoRun: false,
+      firstDelaySeconds: 90061,
+    },
     'tab-merge-arm': {
       items: [{ id: 'persisted-merge-item', text: 'persisted merge', createdAt: 3 }],
       autoRun: false,
@@ -137,6 +142,11 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.equal(queueModule.hasRuntimeWorkflowArm('tab-1'), false);
   assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-persisted-arm').workflowArmedAt, 777);
   assert.equal(queueModule.hasRuntimeWorkflowArm('tab-persisted-arm'), false);
+  assert.equal(
+    queueModule.usePromptQueueStore.getState().getQueue('tab-long-delay').firstDelaySeconds,
+    90061,
+    'persisted delays longer than one hour are preserved',
+  );
   queueModule.usePromptQueueStore.getState().clearStaleRunAfterTab('tab-stale-target', 'different-target');
   assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-stale-target').runAfterTabId, 'closed-target');
   queueModule.usePromptQueueStore.getState().clearStaleRunAfterTab('tab-stale-target', 'closed-target');

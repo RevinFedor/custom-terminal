@@ -28,6 +28,7 @@ const net = require('net');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
+const { buildChildProcessEnv } = require('./child-process-env');
 
 const MAIN_PID = parseInt(process.argv[2], 10) || 0;
 const LOG_PATH = process.argv[3] || '';
@@ -158,7 +159,10 @@ function maybeSample(p, silentMs) {
   const out = path.join(os.tmpdir(), 'noted-wd-sample-' + p.label + '-' + p.pid + '-' + now + '.txt');
   wdLog('[Watchdog] SAMPLING proc=' + p.label + ' pid=' + p.pid + ' silentMs=' + silentMs + ' file=' + out);
   // 1 second at 1ms interval — short enough to land inside 1-2s stalls.
-  execFile(SAMPLE_BIN, [String(p.pid), '1', '1', '-file', out], { timeout: 20000 }, (err) => {
+  execFile(SAMPLE_BIN, [String(p.pid), '1', '1', '-file', out], {
+    timeout: 20000,
+    env: buildChildProcessEnv(),
+  }, (err) => {
     sampleInFlight = false;
     if (err) {
       wdLog('[Watchdog] SAMPLE-FAILED proc=' + p.label + ' pid=' + p.pid + ' error=' + String(err.message || err).slice(0, 200));

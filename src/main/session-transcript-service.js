@@ -11,6 +11,11 @@ const {
 const {
   decorateHistoryResponseTimings,
 } = require('./history-response-timings');
+const {
+  dehydrateHistoryEntries,
+  historyPayloadStash,
+  capPayloadForRender,
+} = require('./history-payload-dehydrate');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -116,6 +121,12 @@ class SessionTranscriptService {
     this.sessions = new Map();
     this.sessionInitInflight = new Map();
     this.consumerToKey = new Map();
+    // Resolved transcript paths survive state teardown. Switching away from
+    // a tab drops its last consumer and closes the state; without this memo
+    // every switch BACK re-walked the whole sessions tree (~400ms of main
+    // loop per subscribe — the measured right-click delay). A session's file
+    // never moves; existence is re-checked on reuse.
+    this.resolvedPathCache = new Map(); // `${toolType}:${sessionId}` → filePath
   }
 
   registerIpc() {
@@ -125,6 +136,57 @@ class SessionTranscriptService {
     ipcMain.handle('agent-transcript:get-timeline', async (_event, payload = {}) => this.getTimeline(payload));
     ipcMain.handle('agent-transcript:get-history', async (_event, payload = {}) => this.getHistory(payload));
     ipcMain.handle('agent-transcript:get-messages', async (_event, payload = {}) => this.getMessages(payload));
+    ipcMain.handle('history:get-tool-payload', async (_event, payload = {}) => this.getToolPayload(payload));
+  }
+
+  /**
+   * Rehydrates one dehydrated payload on demand (card expand). The stash is
+   * the fast path; a Codex miss re-runs the projection once (LRU-cached
+   * records make it cheap), a Claude miss re-reads the session chain. Exact
+   * identity only — payloadId is deterministic per source record.
+   */
+  async getToolPayload(payload = {}) {
+    const toolType = normalizeToolType(payload.toolType);
+    const sessionId = payload.sessionId;
+    const cwd = payload.cwd;
+    const payloadId = typeof payload.payloadId === 'string' ? payload.payloadId : '';
+    if (!sessionId || !payloadId) {
+      return { success: false, error: 'sessionId and payloadId required' };
+    }
+    const stashed = historyPayloadStash.get(toolType, sessionId, payloadId);
+    if (typeof stashed === 'string') {
+      const capped = capPayloadForRender(stashed);
+      return { success: true, source: 'stash', payloadId, ...capped };
+    }
+    try {
+      if (toolType === 'codex') {
+        const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
+        if (!loaded?.success) return { success: false, error: loaded?.error || 'session not found' };
+        const entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
+        dehydrateHistoryEntries({
+          toolType,
+          sessionId,
+          entries,
+          stash: historyPayloadStash,
+        });
+      } else if (toolType === 'claude') {
+        const rebuild = this.claudeData?._api?.rebuildHistoryPayloadStash;
+        if (typeof rebuild !== 'function') {
+          return { success: false, error: 'claude payload rebuild unavailable' };
+        }
+        await rebuild({ sessionId, cwd, stash: historyPayloadStash });
+      } else {
+        return { success: false, error: 'unsupported toolType' };
+      }
+    } catch (error) {
+      return { success: false, error: String(error?.message || error) };
+    }
+    const rebuilt = historyPayloadStash.get(toolType, sessionId, payloadId);
+    if (typeof rebuilt !== 'string') {
+      return { success: false, error: 'payload not found', payloadId };
+    }
+    const capped = capPayloadForRender(rebuilt);
+    return { success: true, source: 'rebuild', payloadId, ...capped };
   }
 
   async subscribe(payload = {}) {
@@ -137,7 +199,19 @@ class SessionTranscriptService {
     const key = transcriptKey(toolType, sessionId, cwd);
     const prevKey = this.consumerToKey.get(consumerId);
     if (prevKey && prevKey !== key) this._removeConsumer(prevKey, consumerId);
+    const ensureStartedAt = Date.now();
     const state = await this._ensureState({ key, toolType, sessionId, cwd });
+    const ensureMs = Date.now() - ensureStartedAt;
+    if (ensureMs > 50) {
+      // Attribution probe for external IpcSlow reports on this channel: when
+      // this line is ABSENT next to a slow subscribe, the handler's own work
+      // was cheap and the measured latency was queue-wait behind another
+      // main-loop blocker — look for the concurrent sync op, not here.
+      console.log('[TranscriptService:SubscribeSlow] tool=' + toolType
+        + ' session=' + shortId(sessionId)
+        + ' ensureMs=' + ensureMs
+        + ' cachedState=' + (this.sessions.get(key) === state && ensureMs < 5 ? '1' : '0'));
+    }
     state.consumers.set(consumerId, { tabId: tabId || null, consumerId });
     this.consumerToKey.set(consumerId, key);
     this._startWatcher(state);
@@ -180,10 +254,7 @@ class SessionTranscriptService {
           payload.ifRevision,
           { toolType, sessionId, cwd },
           {
-            resolvePrimaryFile: async () => {
-              const found = await this.codexData?._api?.findCodexSessionFile?.(sessionId, cwd);
-              return found?.filePath || null;
-            },
+            resolvePrimaryFile: async () => this._resolveFilePath(toolType, sessionId, cwd),
           }
         );
         if (validation.unchanged) {
@@ -258,10 +329,7 @@ class SessionTranscriptService {
           { toolType, sessionId, cwd },
           {
             context: revisionContext,
-            resolvePrimaryFile: async () => {
-              const found = await this.codexData?._api?.findCodexSessionFile?.(sessionId, cwd);
-              return found?.filePath || null;
-            },
+            resolvePrimaryFile: async () => this._resolveFilePath(toolType, sessionId, cwd),
           }
         );
         const presentationStillCurrent = !validation.unchanged
@@ -283,6 +351,23 @@ class SessionTranscriptService {
       const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
       if (!loaded?.success) return loaded || { success: false, error: 'codex parser unavailable', entries: [] };
       const entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
+      // Heavy payloads (tool outputs, thinking, compact snapshots) leave main
+      // as previews + refs; the renderer pulls full text on expand through
+      // history:get-tool-payload. OPT-IN per call: web/iOS consumers of this
+      // service have no rehydration path yet and keep full payloads.
+      if (payload.dehydrate === true) {
+        const dehydration = dehydrateHistoryEntries({
+          toolType,
+          sessionId,
+          entries,
+          stash: historyPayloadStash,
+        });
+        if (dehydration.dehydrated > 0) {
+          console.log('[TranscriptService:Dehydrate] session=' + sessionId.slice(0, 8)
+            + ' payloads=' + dehydration.dehydrated
+            + ' savedKb=' + Math.round(dehydration.savedChars / 1024));
+        }
+      }
       const presentedEntries = decorateHistoryPromptPresentations(this.promptPresentationStore, {
         toolType,
         sessionId,
@@ -419,12 +504,28 @@ class SessionTranscriptService {
   }
 
   async _resolveFilePath(toolType, sessionId, cwd) {
+    const cacheKey = toolType + ':' + sessionId;
+    const cached = this.resolvedPathCache.get(cacheKey);
+    if (cached) {
+      // Existence check only — a vanished file (deleted session) falls
+      // through to a fresh discovery walk.
+      try {
+        await fs.promises.access(cached);
+        return cached;
+      } catch {
+        this.resolvedPathCache.delete(cacheKey);
+      }
+    }
+    let filePath = null;
     if (toolType === 'codex') {
       const found = await this.codexData?._api?.findCodexSessionFile?.(sessionId, cwd);
-      return found?.filePath || null;
+      filePath = found?.filePath || null;
+    } else {
+      const found = this.claudeData?.findSessionFile?.(sessionId, cwd);
+      filePath = found?.filePath || null;
     }
-    const found = this.claudeData?.findSessionFile?.(sessionId, cwd);
-    return found?.filePath || null;
+    if (filePath) this.resolvedPathCache.set(cacheKey, filePath);
+    return filePath;
   }
 
   async _refreshFile(state) {

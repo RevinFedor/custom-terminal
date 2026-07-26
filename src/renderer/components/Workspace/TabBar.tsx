@@ -3714,6 +3714,26 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const restartAfterBusyRef = useRef<Map<string, boolean>>(new Map());
   const restartAfterScriptRunsRef = useRef<Map<string, RestartAfterScriptRunState>>(new Map());
   const [pasteBusyMap, setPasteBusyMap] = useState<Map<string, boolean>>(new Map());
+  // Live background work (in-process subagents / background Bash chips)
+  // published by HistoryPanel; keeps the tab shimmer on when a Codex agent
+  // outlives its spawn turn. Display-only.
+  const [backgroundWorkMap, setBackgroundWorkMap] = useState<Map<string, boolean>>(new Map());
+  useEffect(() => {
+    const onBackgroundWork = (event: Event) => {
+      const detail = (event as CustomEvent).detail as { tabId?: string; count?: number } | undefined;
+      if (!detail?.tabId) return;
+      const active = (detail.count || 0) > 0;
+      setBackgroundWorkMap((prev) => {
+        if ((prev.get(detail.tabId!) || false) === active) return prev;
+        const next = new Map(prev);
+        if (active) next.set(detail.tabId!, true);
+        else next.delete(detail.tabId!);
+        return next;
+      });
+    };
+    window.addEventListener('history-panel:background-work', onBackgroundWork);
+    return () => window.removeEventListener('history-panel:background-work', onBackgroundWork);
+  }, []);
   const claudeSpinnerVisualIdleTimersRef = useRef<Map<string, number>>(new Map());
   // Awaiting-user-input: Claude called AskUserQuestion and is blocked waiting for
   // the human to answer. Deterministic, bracketed by PreToolUse/PostToolUse hooks
@@ -3726,9 +3746,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   };
   const isTabTurnBusy = (tab: TabData): boolean => {
     const pasteBusy = pasteBusyMap.get(tab.id) || false;
+    // In-process subagents (Codex) legitimately outlive their spawn turn;
+    // while any live background chip exists the tab inherits the loader even
+    // though the turn's own busy flag already dropped. Display-only signal
+    // from HistoryPanel — lifecycle ownership stays with the runtime maps.
+    const backgroundWork = backgroundWorkMap.get(tab.id) || false;
     if (tab.commandType === 'gemini') return (geminiBusyMap.get(tab.id) || false) || pasteBusy;
-    if (tab.commandType === 'codex') return (codexBusyMap.get(tab.id) || false) || pasteBusy;
-    return (claudeBusyMap.get(tab.id) || false) || pasteBusy;
+    if (tab.commandType === 'codex') return (codexBusyMap.get(tab.id) || false) || pasteBusy || backgroundWork;
+    return (claudeBusyMap.get(tab.id) || false) || pasteBusy || backgroundWork;
   };
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);

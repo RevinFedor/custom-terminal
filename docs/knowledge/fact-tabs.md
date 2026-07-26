@@ -201,6 +201,23 @@ Status marker 8px (dot или square, sizePx 4..16) рисуется absolute н
 
 Natural completion определяется тем же outcome-языком, что Run-after: `busy:false` без reason (Claude/Gemini/SDK natural end) или `reason:'task_complete'` для Codex, когда есть непустой `last_agent_message` либо корневая assistant-запись `phase:'final_answer'` с явным `turn_id`, совпадающим с завершившимся turn. `codex-no-final-result`, `manual-stop`, `interrupt`, `turn_aborted`, `close`, `watchdog`, `local-command` и error-like reasons — только cleanup/liveness edges, они не должны звонить и не должны зажигать completed-сигнал. Это закрывает пользовательские симптомы «нажал Escape/ручную остановку, а уведомление всё равно пришло» и «Codex показал ошибку без ответа, но вкладка позвонила как готовая»: окончание работы ещё не доказывает результат.
 
+У прошедшего этот guard завершения есть независимый Telegram-канал: renderer
+посылает `tab-notification:completed` даже когда вкладка видима и
+`completionNotificationFired=false`; видимость управляет unread/APNs-проекцией, но
+не отменяет явно включённый внешний сигнал. Main формирует canonical
+`eventId=tabId:firedAt`, сначала сохраняет его в durable FIFO и затем доставляет в
+SC Desktop. `400/401/403` считаются постоянной ошибкой контракта; `404/429/5xx`,
+timeout и network failure остаются в очереди с backoff. Поэтому удалённый или
+остановленный получатель не «теряет» уведомления, а накапливает backlog, который
+после восстановления может отправиться сразу.
+
+SC Desktop обязан дедуплицировать тот же `eventId`: Telegram мог принять сообщение
+до потери HTTP-ответа, после чего sender закономерно повторит запрос. Этот канал не
+заменяет `tab-notification:fired` → project-activity/APNs, а работает параллельно.
+Владелец receiver-контракта:
+`/Users/fedor/Desktop/sc-desktop/docs/knowledge/fact-sc-desk.md::Custom Terminal:
+исходящие Telegram-уведомления`.
+
 Звук и unread-визуал намеренно разделены. Если пользователь явно включил уведомление, completion event dispatch'ится даже когда target-tab сейчас активен и видим: системный звук должен сработать один раз независимо от foreground visibility. Но красный unread-state (`completionNotificationFired`) ставится только если цель не видна (`activeProjectId/workspace.activeTabId/currentView` не указывают на этот terminal tab), иначе пользователю нечего «догонять взглядом» — он уже на месте. Native Notification создаётся silent, а звук отдельно гейтится Settings → Системные → «Уведомления вкладки / Системный звук».
 
 Визуальные состояния: до завершения armed-вкладка получает лёгкую красную inset-рамку без анимации; после завершения невидимой вкладки появляется красная traveling-border рамка (`tab-completion-notification-alert`). Project tab агрегирует дочерние fired-вкладки красным inline count-badge и такой же красной рамкой вокруг project tab; форма родителя остаётся агрегирующей, как у зелёного process-badge, а не копирует session-level edge-strip. При переходе на проект или на саму вкладку notification state очищается сразу в store, но компонент держит локальный `dismiss` примерно на 420ms и плавно гасит рамку. Если fired-state уже оказался на текущей активной вкладке (race/restore/старое состояние), первый `pointermove` в любом месте окна тоже считается acknowledgement и очищает state тем же путём: пользователь уже смотрит на эту вкладку, клика по ней может не быть. Этот fade-out — только presentation-layer: automation, sound и persistent-arming читают очищенный semantic state, не визуальную задержку.
@@ -251,6 +268,8 @@ Transport lifecycle не считается завершённым по перв
 ### Файловые вкладки как visual-child
 
 Файл, прикреплённый из file explorer через `Link File`, становится обычной видимой вкладкой `tabType='file'`, но не AI/terminal-сессией. Он создаётся рядом с выбранной Claude/Codex/SDK-вкладкой, наследует её `groupId` и получает `visualParentTabId=<targetTabId>`, чтобы читаться как рабочий артефакт этой сессии. Мотивация UX: пользователь хочет открыть нужный файл прямо из области вкладок и не возвращаться в дерево через `Cmd+B` только ради просмотра.
+
+Тот же сценарий доступен внешним callers через `POST /api/terminal-tabs/:tabId/link-file` и `Terminal MCP::link_file`; отдельной MCP-модели вложений нет. Сервер принимает только существующий абсолютный файл и canonicalize'ит путь, renderer ищет target по всем открытым project workspace. Пара canonical path + `visualParentTabId` идемпотентна: повтор возвращает прежний file-tab. Внутри полноценной AI-сессии отсутствующий `tabId` берётся из `NOTED_PARENT_TAB_ID`, поэтому scratchpad может прикрепить себя без угадывания собственного ID; явный `tabId` адресует другую сессию.
 
 File-tab участвует в тех же механиках порядка, группировки, DnD и visual-child стрелок, что и обычные вкладки. При этом его контекстное меню урезано по смыслу: остаются `Copy Path`, `Open in Finder`, `Copy Content`, `Status` и `Unlink File`; `Обновить название`, Favorites, Stop/Restart и rename не показываются. `Open in Finder` делает OS reveal того же `filePath`, что был прикреплён из дерева: file-tab не должен требовать возвращаться в `Cmd+B` только чтобы найти файл в Finder. `Unlink File` закрывает вкладку/связь, но **не удаляет файл с диска** — destructive file operation остаётся в file tree. Background/color editing отключены, потому что фиолетовый фон — semantic marker “это файл”, а не пользовательская раскраска сессии. Header file-menu показывает имя файла в fixed-width меню через `truncate` + полный `title`: длинный linked markdown не должен растягивать context-menu шире обычной вкладки.
 

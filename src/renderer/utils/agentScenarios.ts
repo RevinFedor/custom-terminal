@@ -200,6 +200,13 @@ export function inspectAgentDraftScenario({
   return { tabId, toolType, ...(result || {}) };
 }
 
+// One-shot wake-up on the runtime's ready event. A ready signal is a WAKE
+// HINT, not readiness truth: Codex can emit tui-ready and revoke it ~70ms
+// later when an MCP-startup blocker appears, then emit a fresh ready after
+// startup completes. Callers therefore drive this from a re-arming loop
+// (arm listener → check presence → sleep) so a revoked signal fails one
+// check and the next armed wait catches the re-emitted ready. The deadline
+// is the only failure edge.
 function createAgentReadyWait(tabId: string, runtime: HistoryAgentRuntime, timeoutMs = 30000, purpose = 'ready') {
   let cleanup = () => {};
   const promise = new Promise<void>((resolve, reject) => {
@@ -223,7 +230,10 @@ function createAgentReadyWait(tabId: string, runtime: HistoryAgentRuntime, timeo
       if (runtime.readyEvent) ipcRenderer.removeListener(runtime.readyEvent, handler);
     };
     if (!runtime.readyEvent) {
-      finish();
+      // No push signal for this runtime: resolve after a short pause so the
+      // caller's re-arming loop becomes a paced presence poll instead of a
+      // zero-delay busy-spin for the whole deadline.
+      setTimeout(() => finish(), Math.min(500, timeoutMs));
     } else {
       ipcRenderer.on(runtime.readyEvent, handler);
     }
@@ -439,54 +449,58 @@ async function ensureAgentReadyForRewind({
     return { status: 'active', resumed: false, resumeSourceSessionId: null };
   }
 
-  const readyWait = createAgentReadyWait(tabId, runtime, 30000, 'rewind');
+  const deadline = Date.now() + 30000;
   let resumedForRewind = false;
-  try {
-    if (!presence || presence.status === 'inactive') {
-      resumedForRewind = true;
-      console.log('[AgentScenario:rewind] resume before rewind tool=' + toolType + ' tab=' + String(tabId).slice(-12));
-      const resumeResult = await runtime.resume({ tabId, sessionId, cwd });
-      if (resumeResult?.success === false) {
-        throw new Error(resumeResult.error || runtime.label + ' resume failed before rewind');
+  let launchedThisCall = false;
+  if (!presence || presence.status === 'inactive') {
+    resumedForRewind = true;
+    launchedThisCall = true;
+    console.log('[AgentScenario:rewind] resume before rewind tool=' + toolType + ' tab=' + String(tabId).slice(-12));
+    const resumeResult = await runtime.resume({ tabId, sessionId, cwd });
+    if (resumeResult?.success === false) {
+      throw new Error(resumeResult.error || runtime.label + ' resume failed before rewind');
+    }
+  }
+
+  // Re-arming readiness loop: a ready event is a wake hint, not truth — a
+  // startup blocker can revoke it right after emission. Each pass re-arms the
+  // listener BEFORE probing so no edge is lost, and a revoked ready simply
+  // waits for the re-emitted one. Only the deadline fails the wait.
+  for (let pass = 0; ; pass += 1) {
+    const remainingMs = deadline - Date.now();
+    const readyWait = createAgentReadyWait(tabId, runtime, Math.max(1, remainingMs), 'rewind');
+    try {
+      presence = await runtime.getPresence(tabId).catch(() => null);
+      if (pass > 0) {
+        console.log('[AgentScenario:rewind] presence after wait tool=' + toolType
+          + ' tab=' + String(tabId).slice(-12)
+          + ' pass=' + pass
+          + ' status=' + (presence?.status || 'unknown')
+          + ' inputReady=' + !!presence?.inputReady
+          + ' busy=' + !!presence?.isBusy);
       }
-    }
-
-    presence = await runtime.getPresence(tabId).catch(() => null);
-    if (presence?.status === 'stopping' || presence?.status === 'busy' || (presence?.status === 'starting' && !resumedForRewind)) {
-      throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
-    }
-    if ((presence?.status === 'active' && presence?.inputReady) || isCodexProvisionalComposerReady()) {
+      if (presence?.status === 'stopping' || presence?.status === 'busy') {
+        throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
+      }
+      if (presence?.status === 'starting' && !launchedThisCall) {
+        throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
+      }
+      if ((presence?.status === 'active' && presence?.inputReady) || isCodexProvisionalComposerReady()) {
+        readyWait.cancel();
+        await waitStartupDefaultsIfNeeded();
+        return {
+          status: 'active',
+          resumed: resumedForRewind,
+          resumeSourceSessionId: resumedForRewind ? sessionId : null,
+        };
+      }
+      if (remainingMs <= 0) {
+        throw new Error(runtime.label + ' session is not ready for rewind');
+      }
+      await readyWait.promise;
+    } finally {
       readyWait.cancel();
-      await waitStartupDefaultsIfNeeded();
-      return {
-        status: 'active',
-        resumed: resumedForRewind,
-        resumeSourceSessionId: resumedForRewind ? sessionId : null,
-      };
     }
-
-    await readyWait.promise;
-    presence = await runtime.getPresence(tabId).catch(() => null);
-    console.log('[AgentScenario:rewind] presence after wait tool=' + toolType
-      + ' tab=' + String(tabId).slice(-12)
-      + ' status=' + (presence?.status || 'unknown')
-      + ' inputReady=' + !!presence?.inputReady
-      + ' busy=' + !!presence?.isBusy);
-    if (isAgentRewindBlockedStatus(presence?.status) && !isCodexProvisionalComposerReady()) {
-      throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
-    }
-    if (!((presence?.status === 'active' && presence?.inputReady) || isCodexProvisionalComposerReady())) {
-      throw new Error(runtime.label + ' session is not ready for rewind');
-    }
-    await waitStartupDefaultsIfNeeded();
-    return {
-      status: 'active',
-      resumed: resumedForRewind,
-      resumeSourceSessionId: resumedForRewind ? sessionId : null,
-    };
-  } catch (err) {
-    readyWait.cancel();
-    throw err;
   }
 }
 
@@ -660,51 +674,60 @@ async function ensureAgentReadyForSend({
     }
   }
 
-  const readyWait = createAgentReadyWait(tabId, runtime, 30000, 'send');
-  try {
-    if (!presence || presence.status === 'inactive') {
-      const hasSession = typeof sessionId === 'string' && sessionId.length > 0;
-      const actionLabel = hasSession ? 'resume' : 'start-fresh';
-      if (!hasSession && !runtime.startFresh) {
+  if (!presence || presence.status === 'inactive') {
+    const hasSession = typeof sessionId === 'string' && sessionId.length > 0;
+    const actionLabel = hasSession ? 'resume' : 'start-fresh';
+    if (!hasSession && !runtime.startFresh) {
+      throw new Error(runtime.label + ' session is inactive and cannot start fresh');
+    }
+    console.log('[AgentScenario:send] ' + actionLabel + ' before send tool=' + toolType + ' tab=' + String(tabId).slice(-12));
+    const resumeResult = hasSession
+      ? await runtime.resume({ tabId, sessionId, cwd })
+      : await runtime.startFresh!({ tabId, cwd });
+    if (resumeResult?.success === false) {
+      throw new Error(resumeResult.error || runtime.label + ' ' + actionLabel + ' failed before send');
+    }
+  }
+
+  // Re-arming readiness loop. Enter is one submit intent: the scenario owns
+  // Start/Resume → readiness → submit and must survive a REVOKED ready
+  // signal. Codex emits tui-ready, can invalidate it ~70ms later on an
+  // MCP-startup blocker, then emits a fresh ready when startup completes.
+  // The old single-listener wait consumed the revoked signal, saw
+  // starting/inputReady=false once and rolled the send back — the proven
+  // "Enter needs a second press" bug (production 21:30 + two E2E repros).
+  // Each pass arms the listener BEFORE probing so no edge is lost; only the
+  // deadline fails the wait.
+  const deadline = Date.now() + 30000;
+  for (let pass = 0; ; pass += 1) {
+    const remainingMs = deadline - Date.now();
+    const readyWait = createAgentReadyWait(tabId, runtime, Math.max(1, remainingMs), 'send');
+    try {
+      presence = await runtime.getPresence(tabId).catch(() => null);
+      if (pass > 0) {
+        console.log('[AgentScenario:send] presence after wait tool=' + toolType
+          + ' tab=' + String(tabId).slice(-12)
+          + ' pass=' + pass
+          + ' status=' + (presence?.status || 'unknown')
+          + ' inputReady=' + !!presence?.inputReady
+          + ' busy=' + !!presence?.isBusy);
+      }
+      if (presence?.status === 'stopping') {
+        throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
+      }
+      if (presence?.status === 'busy') return 'busy';
+      if (isReadyComposer()) {
         readyWait.cancel();
-        throw new Error(runtime.label + ' session is inactive and cannot start fresh');
+        await waitStartupDefaultsIfNeeded();
+        return 'active';
       }
-      console.log('[AgentScenario:send] ' + actionLabel + ' before send tool=' + toolType + ' tab=' + String(tabId).slice(-12));
-      const resumeResult = hasSession
-        ? await runtime.resume({ tabId, sessionId, cwd })
-        : await runtime.startFresh!({ tabId, cwd });
-      if (resumeResult?.success === false) {
-        throw new Error(resumeResult.error || runtime.label + ' ' + actionLabel + ' failed before send');
+      if (remainingMs <= 0) {
+        throw new Error(runtime.label + ' session is not ready for send');
       }
-    }
-
-    presence = await runtime.getPresence(tabId).catch(() => null);
-    if (presence?.status === 'stopping') {
-      throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
-    }
-    if (presence?.status === 'busy') return 'busy';
-    if (isReadyComposer()) {
+      await readyWait.promise;
+    } finally {
       readyWait.cancel();
-      await waitStartupDefaultsIfNeeded();
-      return 'active';
     }
-
-    await readyWait.promise;
-    presence = await runtime.getPresence(tabId).catch(() => null);
-    console.log('[AgentScenario:send] presence after wait tool=' + toolType
-      + ' tab=' + String(tabId).slice(-12)
-      + ' status=' + (presence?.status || 'unknown')
-      + ' inputReady=' + !!presence?.inputReady
-      + ' busy=' + !!presence?.isBusy);
-    if (presence?.status === 'busy') return 'busy';
-    if (!isReadyComposer()) {
-      throw new Error(runtime.label + ' session is not ready for send');
-    }
-    await waitStartupDefaultsIfNeeded();
-    return 'active';
-  } catch (err) {
-    readyWait.cancel();
-    throw err;
   }
 }
 
@@ -828,6 +851,7 @@ export async function rewindAgentTimelineScenario({
         targetText: normalizedTargetText,
         mode: rewindMode,
         toolType,
+        sourceSessionId: sessionId || null,
         error: options.error,
         message: options.message,
         persisted: options.persisted,

@@ -705,7 +705,8 @@ class DatabaseManager {
       )
     `);
 
-    // claude_usage_snapshots — sample of /oauth/usage every minute.
+    // claude_usage_snapshots — accepted Claude quota snapshots from the
+    // official status-line payload or the authenticated usage endpoint.
     // Storage: 1440 rows/day × ~50B ≈ 26 MB/year. Kept FOREVER (no prune) —
     // user wants unbounded history so the "By day" chart can look back over
     // arbitrary ranges, not just the last week.
@@ -4333,9 +4334,8 @@ class DatabaseManager {
 
   // ========== CLAUDE USAGE SNAPSHOTS ==========
 
-  // Append one snapshot from /oauth/usage. NO pruning — history is retained
-  // indefinitely (user opted out of the 60-day window so long-range "By day"
-  // charts have real data to draw).
+  // Append one accepted, account-scoped quota snapshot. NO pruning — history
+  // is retained indefinitely so long-range "By day" charts have real data.
   saveClaudeUsageSnapshot(snapshot) {
     if (!snapshot) return;
     const ts = snapshot.ts || Math.floor(Date.now() / 1000);
@@ -4360,10 +4360,9 @@ class DatabaseManager {
     }
   }
 
-  // Last persisted snapshot — used as fallback usage data when live /oauth/usage
-  // is rate-limited and the in-memory cache is empty (e.g. fresh app start
-  // hits 429 before any successful fetch). Lets the chip show real numbers
-  // instead of a dash even when API is temporarily unavailable.
+  // Last account-scoped snapshot. Legacy rows without an account key are
+  // intentionally excluded so a login switch cannot inherit another
+  // account's quota.
   getLatestClaudeUsageSnapshot(accountKey) {
     if (!accountKey) return undefined;
     return this.db.prepare(`

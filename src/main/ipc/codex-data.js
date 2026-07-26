@@ -8,6 +8,11 @@ const {
   validateHistoryRevision,
 } = require('../history-revision');
 const { buildChildProcessEnv } = require('../child-process-env');
+const {
+  createCodexSubagentTracker,
+  isCodexSubagentControlCall,
+  isCodexSubagentSpawnCall,
+} = require('../codex-subagent-cards');
 const { execFile } = require('child_process');
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -1060,6 +1065,22 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
   if (qualifiedName === 'wait') {
     return [{ toolName: 'Wait', args: { summary: input.cell_id ? `Task ${input.cell_id}` : 'Background task' } }];
   }
+  // In-process subagents (live stream path — the durable parser intercepts
+  // these earlier and builds full Task cards). Never surface the v2 encrypted
+  // message; task_name/agent_type are the readable identity.
+  if (namespace === 'multi_agent_v1' || namespace === 'collaboration') {
+    if (qualifiedName === 'spawn_agent') {
+      const label = String(input.task_name || '').trim()
+        || (typeof input.message === 'string' && !input.message.startsWith('gAAAA')
+          ? String(input.message).slice(0, 60)
+          : 'Subagent');
+      const agentType = String(input.agent_type || '').trim();
+      return [{ toolName: 'Subagent', args: { summary: agentType ? label + ' (' + agentType + ')' : label } }];
+    }
+    if (qualifiedName === 'wait_agent') {
+      return [{ toolName: 'Wait', args: { summary: 'Waiting for subagents' } }];
+    }
+  }
   return [{ toolName: humanizeCodexToolName(qualifiedName), args: input }];
 }
 
@@ -1823,15 +1844,37 @@ function logCodexSessionCandidateSkip(meta, filePath, reason, { sourceSessionId 
     ' source=' + (sourceSessionId || 'n/a'));
 }
 
+// sessionId → filePath memo. The sessions tree holds hundreds of rollouts
+// (dozens over 100MB); the full walk plus metadata reads costs ~400ms of
+// main-loop time, and every consumer (subscribe, timeline, history, hover)
+// used to pay it again after any state teardown. A rollout never moves once
+// created; existence is re-verified before reuse and a miss falls through to
+// the normal walk.
+const codexSessionFilePathMemo = new Map();
+
 async function findCodexSessionFile(sessionId, cwd, {
   allowContentScan = true,
   sessionsDir = CODEX_SESSIONS_DIR,
 } = {}) {
   if (!sessionId || !fs.existsSync(sessionsDir)) return null;
 
+  const memoKey = sessionId + ':' + (sessionsDir || '');
+  const memoized = codexSessionFilePathMemo.get(memoKey);
+  if (memoized) {
+    try {
+      await fs.promises.access(memoized);
+      return { filePath: memoized };
+    } catch {
+      codexSessionFilePathMemo.delete(memoKey);
+    }
+  }
+
   const files = await walkJsonlFiles(sessionsDir);
   const suffixHit = files.find((file) => path.basename(file).includes(sessionId) && path.basename(file).endsWith('.jsonl'));
-  if (suffixHit) return { filePath: suffixHit };
+  if (suffixHit) {
+    codexSessionFilePathMemo.set(memoKey, suffixHit);
+    return { filePath: suffixHit };
+  }
   if (!allowContentScan) return null;
 
   const normalizedCwd = cwd ? path.resolve(cwd) : null;
@@ -1847,8 +1890,10 @@ async function findCodexSessionFile(sessionId, cwd, {
     if (normalizedCwd && meta.cwd && path.resolve(meta.cwd) !== normalizedCwd) {
       // Keep searching for an exact cwd match, but accept this below if it is
       // the only match.
+      codexSessionFilePathMemo.set(memoKey, filePath);
       return { filePath };
     }
+    codexSessionFilePathMemo.set(memoKey, filePath);
     return { filePath };
   }
   return null;
@@ -2480,8 +2525,13 @@ function buildCodexTimeline(records, sessionId) {
 
     if (record.type === 'event_msg') {
       if (payload.type === 'user_message') {
-        currentTurnIndex += 1;
         const text = payload.message || extractTextContent(payload.content) || '';
+        // Service record, not a user turn: a fire-and-forget subagent
+        // announces completion via <subagent_notification> inside a user
+        // message. Full history feeds it to the card tracker; Timeline must
+        // not mint a phantom dot for it.
+        if (text.includes('<subagent_notification>')) continue;
+        currentTurnIndex += 1;
         const entry = {
           uuid: stableUuid(sessionId, record.__line, 'codex-user'),
           sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
@@ -2587,6 +2637,7 @@ function buildCodexFullHistory(records, sessionId) {
   const sessionCwd = getSessionMeta(records).cwd || '';
   const pendingCalls = new Map();
   const pendingExecCells = new Map();
+  const subagents = createCodexSubagentTracker();
   let currentTurnIndex = -1;
   let pendingThinking = '';
   let latestTokenCountInfo = null;
@@ -2652,13 +2703,24 @@ function buildCodexFullHistory(records, sessionId) {
       if (payload.type === 'patch_apply_end') {
         attachCodexPatchApplyEvent(pendingCalls, payload, sessionCwd);
       } else if (payload.type === 'user_message') {
+        const userText = payload.message || extractTextContent(payload.content) || '';
+        // Third subagent completion path: a fire-and-forget child announces
+        // its outcome via <subagent_notification> INSIDE a user message —
+        // no wait_agent output, no agent_message FINAL_ANSWER ever arrives
+        // (E2E-proven zombie: card climbed 4m+ as running). Feed the tracker
+        // and keep the service record out of the transcript, like Claude's
+        // <task-notification> filter.
+        if (userText.includes('<subagent_notification>')) {
+          subagents.onSubagentNotification(userText);
+          continue;
+        }
         currentTurnIndex += 1;
         entries.push({
           uuid: stableUuid(sessionId, record.__line, 'codex-user'),
           sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
           role: 'user',
           timestamp: recordTimestamp(record),
-          content: payload.message || extractTextContent(payload.content) || '',
+          content: userText,
           sessionId,
           turnIndex: currentTurnIndex,
         });
@@ -2668,6 +2730,11 @@ function buildCodexFullHistory(records, sessionId) {
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
       } else if (payload.type === 'token_count') {
         latestTokenCountInfo = payload.info || {};
+      } else if (payload.type === 'sub_agent_activity') {
+        // v2 collaboration: the only parent-side link spawn call → child
+        // rollout (agent_thread_id) + live status kinds started/interacted/
+        // interrupted. Mutates the already-pushed Task card in place.
+        subagents.onSubAgentActivity(payload);
       } else if (isCompactPayload(payload)) {
         if (compactCompanionLines.has(record.__line)) {
           continue;
@@ -2702,6 +2769,15 @@ function buildCodexFullHistory(records, sessionId) {
       continue;
     }
 
+    if (payload.type === 'agent_message') {
+      // v2 collaboration result carrier: FINAL_ANSWER payload is plaintext and
+      // becomes the Task card's result; interim MESSAGE payloads are encrypted
+      // and only prove liveness. Never rendered as a normal assistant row —
+      // author is the subagent, not this session's assistant.
+      subagents.onAgentMessage(payload, extractTextContent);
+      continue;
+    }
+
     if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
       const callId = payload.call_id || payload.id || stableUuid(sessionId, record.__line, 'codex-call');
       const args = payload.arguments
@@ -2709,7 +2785,7 @@ function buildCodexFullHistory(records, sessionId) {
         : (payload.input && typeof payload.input === 'string'
           ? { input: payload.input }
           : (payload.input || {}));
-      pendingCalls.set(callId, {
+      const pendingCall = {
         callId,
         toolName: payload.name || payload.tool_name || payload.type,
         namespace: payload.namespace || '',
@@ -2725,7 +2801,14 @@ function buildCodexFullHistory(records, sessionId) {
         line: record.__line,
         byteOffset: record.__byteOffset,
         record,
-      });
+      };
+      // Register spawn cards at CALL time: the v2 sub_agent_activity(started)
+      // event that binds the child thread id arrives BETWEEN the call and its
+      // output, so output-time registration would drop that linkage.
+      if (isCodexSubagentSpawnCall(pendingCall)) {
+        pendingCall.subagentCard = subagents.registerSpawn(pendingCall);
+      }
+      pendingCalls.set(callId, pendingCall);
       continue;
     }
 
@@ -2740,6 +2823,37 @@ function buildCodexFullHistory(records, sessionId) {
         line: record.__line,
         byteOffset: record.__byteOffset,
       };
+      // Subagent lifecycle: spawn becomes a Task card (SubAgentBlock UX like
+      // the Claude SDK tab); v1 spawn output binds agent_id/nickname; control
+      // calls (wait/close/…) feed results into existing cards instead of
+      // rendering as generic "Spawn Agent"/"Wait Agent" JSON cards.
+      if (isCodexSubagentSpawnCall(call)) {
+        const card = call.subagentCard || subagents.registerSpawn(call);
+        subagents.attachSpawnOutput(call.callId, payload.output);
+        pushAssistantEntry(
+          entries,
+          sessionId,
+          record,
+          currentTurnIndex,
+          '',
+          pendingThinking,
+          [card],
+          call.line,
+          call.byteOffset,
+        );
+        pendingThinking = '';
+        pendingCalls.delete(callId);
+        continue;
+      }
+      if (isCodexSubagentControlCall(call)) {
+        const absorbed = subagents.absorbControlOutput(call, payload.output);
+        if (absorbed) {
+          pushAssistantEntry(entries, sessionId, record, currentTurnIndex, '', pendingThinking, null);
+          pendingThinking = '';
+          pendingCalls.delete(callId);
+          continue;
+        }
+      }
       const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
       const pendingCellActions = waitCellId ? pendingExecCells.get(waitCellId) : null;
       if (pendingCellActions) {
@@ -2778,6 +2892,26 @@ function buildCodexFullHistory(records, sessionId) {
   for (const call of pendingCalls.values()) {
     const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
     if (waitCellId && pendingExecCells.has(waitCellId)) continue;
+    // In-flight spawn (no output yet): show a running Task card, not raw JSON.
+    if (isCodexSubagentSpawnCall(call)) {
+      const card = call.subagentCard || subagents.registerSpawn(call);
+      pushAssistantEntry(
+        entries,
+        sessionId,
+        call.record || { __line: call.line, timestamp: call.timestamp },
+        currentTurnIndex,
+        '',
+        pendingThinking,
+        [card],
+      );
+      pendingThinking = '';
+      continue;
+    }
+    // An in-flight wait_agent while subagent cards exist is control-plane
+    // noise — the cards already carry the live status.
+    if (isCodexSubagentControlCall(call) && call.toolName === 'wait_agent' && subagents.hasCards()) {
+      continue;
+    }
     const decoded = codexHistoryActionsForCall(call, undefined, false);
     pushAssistantEntry(
       entries,
@@ -2798,7 +2932,11 @@ const CODEX_SHELL_TOOLS = new Set([
   'exec_command', 'write_stdin', 'read_output', 'run_command', 'restart_process',
   'kill_process', 'run_chain',
 ]);
-const CODEX_SUBAGENT_NAMES = new Set(['spawn_agent', 'resume_agent', 'wait_agent', 'send_input', 'close_agent']);
+// Both rollout generations: v1 multi_agent_v1 + v2 collaboration tool names.
+const CODEX_SUBAGENT_NAMES = new Set([
+  'spawn_agent', 'resume_agent', 'wait_agent', 'send_input', 'close_agent',
+  'send_message', 'followup_task', 'interrupt_agent', 'list_agents',
+]);
 const CODEX_OUTPUT_LIMIT = 60_000;
 
 function stringifyCompact(value, max = CODEX_OUTPUT_LIMIT) {
@@ -2847,7 +2985,7 @@ function codexToolGroup(call) {
   const namespace = call?.namespace || '';
   if (type === 'web_search_call' || name === 'web_search') return 'web';
   if (type === 'tool_search_call' || type === 'tool_search_output' || name === 'tool_search') return 'toolSearch';
-  if (namespace === 'multi_agent_v1' || CODEX_SUBAGENT_NAMES.has(name)) return 'subagent';
+  if (namespace === 'multi_agent_v1' || namespace === 'collaboration' || CODEX_SUBAGENT_NAMES.has(name)) return 'subagent';
   if (name === 'apply_patch') return 'editing';
   if (namespace && namespace.startsWith('mcp__')) return 'mcp';
   if (CODEX_SHELL_TOOLS.has(name)) return 'bash';
@@ -2881,7 +3019,7 @@ function codexToolLabel(call) {
   const namespace = call?.namespace || '';
   if (name === 'apply_patch') return '🧩 apply_patch';
   if (CODEX_SHELL_TOOLS.has(name)) return `🖥 ${name}`;
-  if (namespace === 'multi_agent_v1' || CODEX_SUBAGENT_NAMES.has(name)) return `🧵 ${name}`;
+  if (namespace === 'multi_agent_v1' || namespace === 'collaboration' || CODEX_SUBAGENT_NAMES.has(name)) return `🧵 ${name}`;
   if (namespace && namespace.startsWith('mcp__')) return `🔌 ${namespace} / ${name}`;
   if (name === 'web_search') return '🌐 web_search';
   if (name === 'tool_search') return '🧰 tool_search';

@@ -143,7 +143,9 @@ const {
 const {
   captureClaudePromptAuditBoundary,
   classifyClaudeAuditRecordAfterBoundary,
+  readClaudeUserRecords,
   readLastClaudeUserRecord,
+  selectClaudePendingPromptAudit,
 } = require(path.join(srcMainDir, 'claude-prompt-audit'));
 const {
   classifyManualPtyInputAtBoundary,
@@ -4248,17 +4250,7 @@ function clearBridgeTab(tabId) {
   clearTimeout(claudeTurnWatchdog.get(tabId));
   claudeTurnWatchdog.delete(tabId);
   claudeSpinnerLastSeenAt.delete(tabId);
-  const pendingAudit = pendingPasteAudit.get(tabId);
-  if (pendingAudit?.awaitUserMessage) {
-    finishClaudePasteAudit(tabId, pendingAudit, {
-      success: false,
-      error: 'claude_bridge_cleared_before_user_message',
-      expectedLen: pendingAudit.expectedLen,
-      expectedHash: pendingAudit.expectedHash,
-    });
-  } else {
-    pendingPasteAudit.delete(tabId);
-  }
+  finalizeClaudePasteAuditsOnBridgeClear(tabId);
   stopInterruptWatcher(tabId);
   stopClaudeLocalCommandWatcher(tabId, 'bridge-clear');
   claudeInputLineBuffers.delete(tabId);
@@ -6007,143 +5999,144 @@ function startClaudeHookServer() {
         // detectable evidence instead of "feels wrong".
         if (event === 'UserPromptSubmit') {
           clearClaudeEditableLastPrompt(tabId, 'user-prompt-submit');
-          const audit = pendingPasteAudit.get(tabId);
-          console.log('[PasteAudit] UserPromptSubmit tab=' + tabId.slice(-12) + ' hasAudit=' + !!audit + ' handoff=' + (audit?.handoffId || '-') + ' source=' + (audit?.source || '-') + ' transcript=' + (transcript_path || '-'));
-          if (audit && transcript_path) {
+          const auditsAtHook = getPendingClaudePasteAudits(tabId);
+          console.log('[PasteAudit] UserPromptSubmit tab=' + tabId.slice(-12) + ' pending=' + auditsAtHook.length + ' handoffs=' + auditsAtHook.map(a => a.handoffId || '-').join(',') + ' transcript=' + (transcript_path || '-'));
+          if (auditsAtHook.length > 0 && transcript_path) {
             // Best-effort, never block the hook ack. Read async, log result.
+            // Each pending expectation owns its own confirmation: a record
+            // that matches none of them leaves every audit pending (unknown)
+            // instead of failing a neighbor — the same contract Codex uses.
             (async () => {
               try {
-                const crypto = require('crypto');
-                const delays = [0, 80, 220, 520, 1000];
-                let finalText = null;
-                let finalRecord = null;
-                let finalHash = null;
-                let finalLen = 0;
+                const resolvedHookPath = path.resolve(transcript_path);
+                // Bounded reads only; the tail extends past the 8s caller
+                // timeout so a slow JSONL flush confirms late instead of
+                // leaving the expectation to the next hook event.
+                const delays = [0, 80, 220, 520, 1000, 2200, 4200];
+                const confirmSelection = (selection, attempt) => {
+                  const { audit, candidate } = selection;
+                  const actualText = candidate.text;
+                  const actualLen = actualText.length;
+                  const actualHash = pasteAuditHash(actualText);
+                  const auditSessionId = candidate.record?.sessionId
+                    || path.basename(transcript_path, '.jsonl')
+                    || audit.historySessionId;
+                  const auditTimestamp = candidate.record?.timestamp
+                    || new Date(audit.sentAt).toISOString();
+                  const entryUuid = candidate.record?.uuid || null;
+                  const presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
+                    toolType: 'claude',
+                    sessionId: auditSessionId,
+                    entryUuid,
+                    auditTimestamp,
+                    actualText,
+                    actualHash,
+                    snapshot: audit.presentationSnapshot,
+                  });
+                  console.log('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' ✅ match len=' + actualLen + ' hash=' + actualHash + ' attempt=' + (attempt + 1) + ' late=' + (audit.callerTimedOut === true) + ' (sent ' + (Date.now() - audit.sentAt) + 'ms ago)');
+                  finishClaudePasteAudit(tabId, audit, {
+                    success: true,
+                    actualLen,
+                    actualHash,
+                    sessionId: auditSessionId,
+                    entryUuid,
+                    auditTimestamp,
+                    presentationSaved,
+                    expectedLen: audit.expectedLen,
+                    expectedHash: audit.expectedHash,
+                  });
+                };
+                const claimedByteOffsets = new Set();
+                let lastCandidates = [];
                 for (let attempt = 0; attempt < delays.length; attempt++) {
                   const delay = delays[attempt];
                   if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-                  const foundUser = await readLastClaudeUserRecord(
-                    transcript_path,
-                    audit.preSubmitBoundary,
-                  );
-                  if (foundUser === null) {
-                    if (attempt === delays.length - 1) {
-                      console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' no user record found in transcript ' + transcript_path + ' attempts=' + delays.length);
+                  const pending = getPendingClaudePasteAudits(tabId);
+                  if (pending.length === 0) return;
+                  // One bounded read serves every expectation: start from the
+                  // earliest same-file boundary, or fall back to the bounded
+                  // tail when any boundary points at another (resume) file.
+                  let readBoundary = null;
+                  for (const auditItem of pending) {
+                    const boundaryItem = auditItem.preSubmitBoundary;
+                    if (
+                      boundaryItem?.available !== true
+                      || !boundaryItem.transcriptPath
+                      || path.resolve(boundaryItem.transcriptPath) !== resolvedHookPath
+                      || !Number.isFinite(Number(boundaryItem.fileSize))
+                    ) {
+                      readBoundary = null;
+                      break;
                     }
-                    continue;
+                    if (!readBoundary || Number(boundaryItem.fileSize) < Number(readBoundary.fileSize)) {
+                      readBoundary = boundaryItem;
+                    }
                   }
-                  const actualText = foundUser.text;
-                  const actualLen = actualText.length;
-                  const actualHash = crypto.createHash('sha1').update(actualText).digest('hex').slice(0, 16);
-                  finalText = actualText;
-                  finalRecord = foundUser.record;
-                  finalHash = actualHash;
-                  finalLen = actualLen;
-                  const match = actualLen === audit.expectedLen && actualHash === audit.expectedHash;
-                  // The file tail can still point at the previous identical
-                  // prompt when UserPromptSubmit arrives before JSONL flush.
-                  // Text/hash equality is not causal proof. The exact
-                  // pre-Enter byte/UUID boundary is: the candidate must either
-                  // begin after the captured file size or carry a new UUID in
-                  // a linked child transcript.
-                  const causality = classifyClaudeAuditRecordAfterBoundary(
-                    foundUser,
-                    audit.preSubmitBoundary,
-                  );
-                  if (match && causality.causal) {
-                    const auditSessionId = finalRecord?.sessionId
-                      || path.basename(transcript_path, '.jsonl')
-                      || audit.historySessionId;
-                    const auditTimestamp = finalRecord?.timestamp
-                      || new Date(audit.sentAt).toISOString();
-                    const entryUuid = finalRecord?.uuid || null;
-                    const presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
-                      toolType: 'claude',
-                      sessionId: auditSessionId,
-                      entryUuid,
-                      auditTimestamp,
-                      actualText,
-                      actualHash,
-                      snapshot: audit.presentationSnapshot,
+                  const candidates = await readClaudeUserRecords(transcript_path, readBoundary);
+                  lastCandidates = candidates;
+                  let matched = 0;
+                  for (;;) {
+                    const alive = getPendingClaudePasteAudits(tabId);
+                    if (alive.length === 0) break;
+                    const selection = selectClaudePendingPromptAudit(alive, candidates, {
+                      hashText: pasteAuditHash,
+                      claimedByteOffsets,
                     });
-                    console.log('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' ✅ match len=' + actualLen + ' hash=' + actualHash + ' attempt=' + (attempt + 1) + ' (sent ' + (Date.now() - audit.sentAt) + 'ms ago)');
-                    finishClaudePasteAudit(tabId, audit, {
-                      success: true,
-                      actualLen,
-                      actualHash,
-                      sessionId: auditSessionId,
-                      entryUuid,
-                      auditTimestamp,
-                      presentationSaved,
-                      expectedLen: audit.expectedLen,
-                      expectedHash: audit.expectedHash,
-                    });
-                    return;
+                    if (!selection) break;
+                    claimedByteOffsets.add(selection.candidate.byteOffset);
+                    confirmSelection(selection, attempt);
+                    matched += 1;
                   }
-                  if (match && !causality.causal) {
-                    console.log('[PasteAudit] tab=' + tabId.slice(-12)
-                      + ' handoff=' + (audit.handoffId || '-')
-                      + ' source=' + (audit.source || '-')
-                      + ' stale identical tail attempt=' + (attempt + 1)
-                      + ' causalReason=' + causality.reason
-                      + ' byteOffset=' + (foundUser.byteOffset ?? 'unknown')
-                      + ' boundary=' + (audit.preSubmitBoundary?.fileSize ?? 'unknown')
-                      + ' — waiting for the new JSONL record');
-                  }
+                  const remaining = getPendingClaudePasteAudits(tabId);
+                  if (remaining.length === 0) return;
                   if (attempt < delays.length - 1) {
-                    console.log('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' pending mismatch attempt=' + (attempt + 1) + ' expectedHash=' + audit.expectedHash + ' actualHash=' + actualHash + ' — retrying');
+                    console.log('[PasteAudit] tab=' + tabId.slice(-12)
+                      + ' matched=' + matched
+                      + ' remaining=' + remaining.map(a => a.handoffId || '-').join(',')
+                      + ' candidates=' + candidates.length
+                      + ' attempt=' + (attempt + 1)
+                      + ' — retrying');
                   }
                 }
-                if (finalText !== null) {
-                  console.warn('[PasteAudit:MISMATCH] tab=' + tabId.slice(-12)
-                    + ' handoff=' + (audit.handoffId || '-')
-                    + ' source=' + (audit.source || '-')
-                    + ' expectedLen=' + audit.expectedLen + ' actualLen=' + finalLen
-                    + ' Δ=' + (finalLen - audit.expectedLen)
-                    + ' expectedHash=' + audit.expectedHash + ' actualHash=' + finalHash
-                    + ' expectedHead=[' + audit.headPreview + ']'
-                    + ' actualHead=[' + finalText.substring(0, 80).replace(/\s+/g, ' ') + ']'
-                    + ' expectedTail=[' + audit.tailPreview + ']'
-                    + ' actualTail=[' + finalText.substring(Math.max(0, finalText.length - 80)).replace(/\s+/g, ' ') + ']'
+                // No definitive verdict: the remaining expectations stay
+                // pending for late reconciliation (next UserPromptSubmit,
+                // bridge-clear final scan, or age-bound eviction). Log the
+                // newest unclaimed causal record for corruption forensics —
+                // it is evidence, not identity proof, because it may belong
+                // to a manual terminal submit.
+                const remaining = getPendingClaudePasteAudits(tabId);
+                if (remaining.length === 0) return;
+                const unclaimed = lastCandidates.filter((candidate) => !claimedByteOffsets.has(candidate.byteOffset));
+                const newestUnclaimed = unclaimed[unclaimed.length - 1] || null;
+                if (newestUnclaimed) {
+                  const newestAudit = remaining[remaining.length - 1];
+                  console.warn('[PasteAudit:MISMATCH-CANDIDATE] tab=' + tabId.slice(-12)
+                    + ' pending=' + remaining.map(a => a.handoffId || '-').join(',')
+                    + ' expectedLen=' + newestAudit.expectedLen + ' actualLen=' + newestUnclaimed.text.length
+                    + ' Δ=' + (newestUnclaimed.text.length - newestAudit.expectedLen)
+                    + ' expectedHash=' + newestAudit.expectedHash + ' actualHash=' + pasteAuditHash(newestUnclaimed.text)
+                    + ' expectedHead=[' + newestAudit.headPreview + ']'
+                    + ' actualHead=[' + newestUnclaimed.text.substring(0, 80).replace(/\s+/g, ' ') + ']'
+                    + ' expectedTail=[' + newestAudit.tailPreview + ']'
+                    + ' actualTail=[' + newestUnclaimed.text.substring(Math.max(0, newestUnclaimed.text.length - 80)).replace(/\s+/g, ' ') + ']'
                     + ' attempts=' + delays.length
-                    + ' transcript=' + transcript_path);
-                  finishClaudePasteAudit(tabId, audit, {
-                    success: false,
-                    error: 'claude_user_message_audit_mismatch',
-                    expectedLen: audit.expectedLen,
-                    actualLen: finalLen,
-                    expectedHash: audit.expectedHash,
-                    actualHash: finalHash,
-                  });
+                    + ' transcript=' + transcript_path
+                    + ' — kept pending, not failed');
                 } else {
-                  finishClaudePasteAudit(tabId, audit, {
-                    success: false,
-                    error: 'claude_user_message_audit_no_user_record',
-                    expectedLen: audit.expectedLen,
-                    expectedHash: audit.expectedHash,
-                  });
+                  console.warn('[PasteAudit] tab=' + tabId.slice(-12)
+                    + ' no causal user record after ' + delays.length + ' attempts'
+                    + ' pending=' + remaining.map(a => a.handoffId || '-').join(',')
+                    + ' transcript=' + transcript_path
+                    + ' — kept pending for late reconciliation');
                 }
               } catch (e) {
-                console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' check failed: ' + e.message);
-                finishClaudePasteAudit(tabId, audit, {
-                  success: false,
-                  error: 'claude_user_message_audit_check_failed',
-                  message: e?.message || String(e),
-                  expectedLen: audit.expectedLen,
-                  expectedHash: audit.expectedHash,
-                });
-              } finally {
-                if (pendingPasteAudit.get(tabId) === audit && !audit.awaitUserMessage) pendingPasteAudit.delete(tabId);
+                console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' check failed: ' + e.message + ' — audits kept pending');
               }
             })();
-          } else if (audit && !transcript_path) {
-            console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' staged but transcript_path missing — cleared');
-            finishClaudePasteAudit(tabId, audit, {
-              success: false,
-              error: 'claude_user_message_audit_missing_transcript',
-              expectedLen: audit.expectedLen,
-              expectedHash: audit.expectedHash,
-            });
+          } else if (auditsAtHook.length > 0 && !transcript_path) {
+            // A hook event without transcript_path proves nothing about
+            // delivery; keep expectations pending for the next event.
+            console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' pending=' + auditsAtHook.length + ' but transcript_path missing — kept pending');
           }
         }
 
@@ -9149,19 +9142,61 @@ function startMcpHttpServer() {
             sourceMeta: sourceMeta || null,
           });
 
-          if (engine === 'claude' && submit !== false) {
-            const result = await rendererBridgeRequestForMcp('sendAgentPromptScenario', {
-              tabId,
-              prompt,
-              source: 'mcp-ai-prompt',
-              queue: false,
-            }, 60_000);
+          if ((engine === 'claude' || engine === 'codex') && submit !== false) {
+            // One shared send scenario for both agents. The direct
+            // safePasteAndSubmit path below remains only for paste-without-
+            // submit and for Gemini, which has no scenario runtime yet —
+            // otherwise this MCP route would be the last Codex entrypoint
+            // bypassing the launch/readiness/handoff contract.
+            let result;
+            try {
+              result = await rendererBridgeRequestForMcp('sendAgentPromptScenario', {
+                tabId,
+                prompt,
+                source: engine === 'codex' ? 'codex-mcp-ai-prompt' : 'mcp-ai-prompt',
+                queue: false,
+              }, 60_000);
+            } catch (bridgeError) {
+              const message = String(bridgeError?.message || bridgeError);
+              if (/bridge timeout/i.test(message)) {
+                // The renderer scenario keeps running after this deadline
+                // (launch-if-needed + readiness + paste can legitimately
+                // outlive it) and may still deliver the prompt. Answering
+                // 500 here invites a blind client retry — a duplicate in a
+                // live AI session, which is worse than an unknown status.
+                console.warn('[MCP:Terminal] POST /terminal/ai-prompt bridge timeout tabId=' + tabId
+                  + ' engine=' + engine + ' → 202 delivery_unknown (do not retry blindly)');
+                emitTerminalMcpActivity('send_prompt', {
+                  id: activityId,
+                  status: 'sent',
+                  tabId,
+                  targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+                  engine,
+                  promptChars: prompt.length,
+                  sourceMeta: sourceMeta || null,
+                  error: 'bridge_timeout_delivery_unknown',
+                });
+                res.writeHead(202);
+                res.end(JSON.stringify({
+                  status: 'delivery_unknown',
+                  error: 'bridge_timeout_delivery_unknown',
+                  warning: 'The send scenario may still complete in the app; do not retry the same prompt without checking the session history first.',
+                  tabId,
+                  engine,
+                }));
+                return;
+              }
+              throw bridgeError;
+            }
             const success = result?.success !== false;
-            const responseStatus = success ? (result?.queued ? 'queued' : 'sent') : 'failed';
-            console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=claude submit=true chars=' + prompt.length + ' status=' + responseStatus + ' success=' + success + ' via=scenario');
+            const submittedUnverified = !success && result?.submitted === true;
+            const responseStatus = success
+              ? (result?.queued ? 'queued' : 'sent')
+              : (submittedUnverified ? 'submitted_unverified' : 'failed');
+            console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=' + engine + ' submit=true chars=' + prompt.length + ' status=' + responseStatus + ' success=' + success + ' via=scenario');
             emitTerminalMcpActivity('send_prompt', {
               id: activityId,
-              status: success ? 'sent' : 'error',
+              status: success ? 'sent' : (submittedUnverified ? 'sent' : 'error'),
               tabId,
               targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
               engine,
@@ -9169,7 +9204,7 @@ function startMcpHttpServer() {
               sourceMeta: sourceMeta || null,
               error: success ? undefined : (result?.error || 'sendAgentPromptScenario failed'),
             });
-            res.writeHead(success ? 200 : 500);
+            res.writeHead(success ? 200 : (submittedUnverified ? 202 : 500));
             res.end(JSON.stringify({
               status: responseStatus,
               tabId,
@@ -11529,16 +11564,143 @@ function markActivePtySubmit(term, { identityPending = false } = {}) {
   operation.submittedAt = Date.now();
 }
 
-// Per-tab prompt delivery audits. Claude currently owns one synchronous hook
-// expectation; Codex owns an ordered set because compact/queueing can delay A
-// until after B has already been submitted. A later expectation must never
-// replace or fail an earlier one.
-const pendingPasteAudit = new Map();
+// Per-tab prompt delivery audits. Both agents own an ordered set: type-ahead,
+// compact and queueing can delay confirmation of A until after B has already
+// been submitted. A later expectation must never replace or fail an earlier
+// one, and a bounded caller timeout means "not confirmed yet", never failure.
+const pendingPasteAudit = new Map(); // tabId → Claude audit[] (ordered)
 const pendingCodexPasteAudit = new Map();
 const CLAUDE_PASTE_AUDIT_TIMEOUT_MS = 8000;
 const CODEX_PASTE_AUDIT_TIMEOUT_MS = 8000;
+const CLAUDE_PASTE_AUDIT_MAX_AGE_MS = 30 * 60 * 1000;
+const CLAUDE_PASTE_AUDIT_MAX_PENDING_PER_TAB = 32;
 const CODEX_PASTE_AUDIT_MAX_AGE_MS = 30 * 60 * 1000;
 const CODEX_PASTE_AUDIT_MAX_PENDING_PER_TAB = 32;
+
+function dropClaudePasteAuditUnconfirmed(tabId, audit, reason) {
+  if (!audit || audit.finished === true) return false;
+  const audits = pendingPasteAudit.get(tabId);
+  const index = Array.isArray(audits) ? audits.indexOf(audit) : -1;
+  if (index >= 0) {
+    audits.splice(index, 1);
+    if (audits.length === 0) pendingPasteAudit.delete(tabId);
+  }
+  if (audit.timer) clearTimeout(audit.timer);
+  audit.timer = null;
+  audit.finished = true;
+  audit.result = {
+    success: false,
+    error: 'claude_user_message_audit_unconfirmed_evicted',
+    lateReconciliationPending: true,
+    expectedLen: audit.expectedLen,
+    expectedHash: audit.expectedHash,
+  };
+  if (typeof audit.resolve === 'function') {
+    audit.resolve(audit.result);
+    audit.resolve = null;
+  }
+  // Memory/observer bound, not a delivery verdict: publishing it as an audit
+  // result would turn "we no longer know" into SEND FAILED on a delivered row.
+  console.warn('[PasteAudit:EVICT_UNCONFIRMED] tab=' + String(tabId).slice(-12)
+    + ' handoff=' + (audit.handoffId || '-')
+    + ' reason=' + reason
+    + ' ageMs=' + Math.max(0, Date.now() - Number(audit.sentAt || Date.now()))
+    + ' expectedLen=' + Number(audit.expectedLen || 0));
+  audit.presentationSnapshot = null;
+  return true;
+}
+
+function pruneClaudePasteAudits(tabId, now = Date.now()) {
+  const audits = pendingPasteAudit.get(tabId);
+  if (!Array.isArray(audits) || audits.length === 0) return;
+  const retention = partitionCodexPendingPromptAuditsForRetention(audits, {
+    now,
+    maxAgeMs: CLAUDE_PASTE_AUDIT_MAX_AGE_MS,
+    maxPending: CLAUDE_PASTE_AUDIT_MAX_PENDING_PER_TAB,
+  });
+  for (const { audit, reason } of retention.evicted) {
+    dropClaudePasteAuditUnconfirmed(tabId, audit, reason);
+  }
+}
+
+function getPendingClaudePasteAudits(tabId) {
+  pruneClaudePasteAudits(tabId);
+  const audits = pendingPasteAudit.get(tabId);
+  return Array.isArray(audits) ? audits : [];
+}
+
+function enqueueClaudePasteAudit(tabId, audit) {
+  const audits = getPendingClaudePasteAudits(tabId);
+  if (audits.length === 0) {
+    pendingPasteAudit.set(tabId, [audit]);
+    return;
+  }
+  audits.push(audit);
+  pruneClaudePasteAudits(tabId);
+}
+
+// Bridge clear = the Claude process is gone. Run one final scan of the
+// already-written tail for each pending expectation; anything still
+// unconfirmed is evicted as unknown (lateReconciliationPending), never as a
+// proven delivery failure — mirroring the Codex watcher-close contract.
+function finalizeClaudePasteAuditsOnBridgeClear(tabId) {
+  const audits = getPendingClaudePasteAudits(tabId);
+  if (audits.length === 0) return;
+  const snapshot = [...audits];
+  (async () => {
+    const claimedByteOffsets = new Set();
+    for (const audit of snapshot) {
+      if (audit.finished === true) continue;
+      const transcriptPath = audit.preSubmitBoundary?.transcriptPath || null;
+      if (transcriptPath) {
+        try {
+          const candidates = await readClaudeUserRecords(transcriptPath, audit.preSubmitBoundary);
+          const selection = selectClaudePendingPromptAudit([audit], candidates, {
+            hashText: pasteAuditHash,
+            claimedByteOffsets,
+          });
+          if (selection) {
+            claimedByteOffsets.add(selection.candidate.byteOffset);
+            const actualText = selection.candidate.text;
+            const record = selection.candidate.record;
+            const actualHash = pasteAuditHash(actualText);
+            const auditSessionId = record?.sessionId || audit.historySessionId || null;
+            const auditTimestamp = record?.timestamp || new Date(audit.sentAt).toISOString();
+            const presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
+              toolType: 'claude',
+              sessionId: auditSessionId,
+              entryUuid: record?.uuid || null,
+              auditTimestamp,
+              actualText,
+              actualHash,
+              snapshot: audit.presentationSnapshot,
+            });
+            console.log('[PasteAudit] bridge-clear final scan confirmed tab=' + String(tabId).slice(-12)
+              + ' handoff=' + (audit.handoffId || '-')
+              + ' presentationSaved=' + presentationSaved);
+            finishClaudePasteAudit(tabId, audit, {
+              success: true,
+              actualLen: actualText.length,
+              actualHash,
+              sessionId: auditSessionId,
+              entryUuid: record?.uuid || null,
+              auditTimestamp,
+              presentationSaved,
+              expectedLen: audit.expectedLen,
+              expectedHash: audit.expectedHash,
+            });
+            continue;
+          }
+        } catch (e) {
+          console.warn('[PasteAudit] bridge-clear final scan failed tab=' + String(tabId).slice(-12)
+            + ' handoff=' + (audit.handoffId || '-')
+            + ' error=' + (e?.message || String(e)));
+        }
+      }
+      dropClaudePasteAuditUnconfirmed(tabId, audit, 'bridge-clear');
+    }
+  })();
+}
 
 function dropCodexPasteAuditUnconfirmed(tabId, audit, reason) {
   if (!audit || audit.finished === true) return false;
@@ -11702,9 +11864,17 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
 }
 
 function finishClaudePasteAudit(tabId, audit, result) {
-  if (!audit) return;
+  if (!audit || audit.finished === true) return;
+  audit.finished = true;
+  audit.result = result;
   if (audit.timer) clearTimeout(audit.timer);
-  if (pendingPasteAudit.get(tabId) === audit) pendingPasteAudit.delete(tabId);
+  audit.timer = null;
+  const audits = pendingPasteAudit.get(tabId);
+  if (Array.isArray(audits)) {
+    const index = audits.indexOf(audit);
+    if (index >= 0) audits.splice(index, 1);
+    if (audits.length === 0) pendingPasteAudit.delete(tabId);
+  }
   publishAgentPromptAuditResult(tabId, audit, result, 'claude');
   if (typeof audit.resolve === 'function') {
     audit.resolve(result);
@@ -11716,9 +11886,16 @@ function waitForClaudePasteAudit(tabId, audit, timeoutMs = CLAUDE_PASTE_AUDIT_TI
   if (!audit) {
     return Promise.resolve({ success: false, error: 'claude_audit_missing' });
   }
+  if (audit.finished === true) {
+    return Promise.resolve(audit.result || {
+      success: false,
+      error: 'claude_audit_finished_without_result',
+    });
+  }
   return new Promise((resolve) => {
     audit.resolve = resolve;
     audit.timer = setTimeout(() => {
+      audit.timer = null;
       console.warn('[PasteAudit:TIMEOUT] tab=' + String(tabId).slice(-12)
         + ' handoff=' + (audit.handoffId || '-')
         + ' source=' + (audit.source || '-')
@@ -11728,12 +11905,23 @@ function waitForClaudePasteAudit(tabId, audit, timeoutMs = CLAUDE_PASTE_AUDIT_TI
         + ' expectedTail=' + JSON.stringify(audit.tailPreview)
         + ' waited=' + timeoutMs + 'ms'
         + ' sentAgeMs=' + (Date.now() - audit.sentAt));
-      finishClaudePasteAudit(tabId, audit, {
+      const timeoutResult = {
         success: false,
         error: 'claude_user_message_audit_timeout',
         expectedLen: audit.expectedLen,
         expectedHash: audit.expectedHash,
-      });
+        lateReconciliationPending: true,
+      };
+      audit.callerTimedOut = true;
+      audit.callerTimedOutAt = Date.now();
+      if (typeof audit.resolve === 'function') {
+        audit.resolve(timeoutResult);
+        audit.resolve = null;
+      }
+      // Timeout bounds the caller, not the delivery truth. A slow JSONL flush
+      // or type-ahead can delay UserPromptSubmit confirmation past this
+      // window; the audit stays pending for late reconciliation instead of
+      // turning "unconfirmed" into SEND FAILED on a delivered prompt.
     }, timeoutMs);
   });
 }
@@ -12254,6 +12442,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // The Codex rollout audit is cleaned up from `finally`, so its reference
   // must live in the function scope rather than inside the `try` block.
   let stagedCodexAudit = null;
+  // Same constraint for the Claude audit: `finally` finalizes an unsubmitted
+  // staged audit, so the binding must be visible outside the `try` block.
+  let stagedClaudeAudit = null;
   const normalizedPresentationSnapshot = normalizePromptPresentationSnapshot(presentationSnapshot);
   const emitBusy = (busy) => {
     if (pasteBusyPublished === busy) return;
@@ -12451,7 +12642,6 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
 
   const t0 = Date.now();
   const resolvedSubmitLabel = submitLabel || (submitSequence === '\t' ? 'Tab' : (submitSequence === '\r' ? 'Enter' : JSON.stringify(submitSequence)));
-  let stagedClaudeAudit = null;
   const shouldVerifyCodexVisibleDraft = !!(verifyCodexVisibleDraftBeforeSubmit && submit && isCodexPasteSource && !fast && broadcastTabId);
   codexPromptInFlightState = submit && isCodexPasteSource && broadcastTabId && submitSequence !== '\t'
     ? beginCodexPromptInFlight(broadcastTabId, 'safe-paste-submit', { source, handoffId })
@@ -12821,19 +13011,14 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       }
     } else if (isCodexPasteSource) {
       console.warn(logPrefix + ' [CodexPasteAudit] skipped: broadcastTab=' + (broadcastTabId || '-') + ' await=' + !!awaitCodexUserMessageAudit);
-    } else if (!fast && broadcastTabId) {
+    } else if (!fast && broadcastTabId && submit) {
       try {
         const expectedHash = pasteAuditHash(content);
-        const previousAudit = pendingPasteAudit.get(broadcastTabId);
-        if (previousAudit) {
-          console.warn(logPrefix + ' [PasteAudit] replacing previous pending audit source=' + (previousAudit.source || '-') + ' expectedHash=' + (previousAudit.expectedHash || '-'));
-          finishClaudePasteAudit(broadcastTabId, previousAudit, {
-            success: false,
-            error: 'claude_audit_superseded',
-            expectedLen: previousAudit.expectedLen,
-            expectedHash: previousAudit.expectedHash,
-          });
-        }
+        // Ordered set, not a single slot: a second send must never replace or
+        // fail an earlier pending expectation (tab-2004 class, Claude parity).
+        // Staged only for calls that press Enter themselves: a paste-only call
+        // would leave a dangling expectation that a later identical send's
+        // record could be claimed by (oldest-first), stealing its confirmation.
         stagedClaudeAudit = {
           handoffId: handoffId || null,
           source: source || null,
@@ -12846,12 +13031,16 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           awaitUserMessage: !!awaitClaudeUserMessageAudit,
           resolve: null,
           timer: null,
+          callerTimedOut: false,
+          callerTimedOutAt: null,
+          finished: false,
+          result: null,
           presentationSnapshot: normalizedPresentationSnapshot,
           historySessionId: presentationSnapshot?.historySessionId || null,
           preSubmitBoundary: claudeAuditBoundary,
         };
-        pendingPasteAudit.set(broadcastTabId, stagedClaudeAudit);
-        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] staged handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash + ' await=' + !!awaitClaudeUserMessageAudit);
+        enqueueClaudePasteAudit(broadcastTabId, stagedClaudeAudit);
+        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] staged handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash + ' await=' + !!awaitClaudeUserMessageAudit + ' pending=' + getPendingClaudePasteAudits(broadcastTabId).length);
       } catch (e) {
         console.warn(logPrefix + ' [PasteAudit] stage failed:', e.message);
       }
@@ -12920,6 +13109,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       }
     }
     term.write(submitSequence);
+    if (stagedClaudeAudit) stagedClaudeAudit.submitWritten = true;
     markActivePtySubmit(term, {
       identityPending: isCodexPasteSource
         && !!codexSubmissionWatcher
@@ -13039,6 +13229,20 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         error: 'codex_submit_not_sent',
         expectedLen: stagedCodexAudit.expectedLen,
         expectedHash: stagedCodexAudit.expectedHash,
+      });
+    }
+    // A staged Claude expectation whose Enter never reached the PTY (guard
+    // refusal, render timeout, thrown error) must not linger in the ordered
+    // set: an identical later send would otherwise be claimed by this dead
+    // expectation (oldest-first) and the real delivery would stay pending.
+    if (stagedClaudeAudit
+      && stagedClaudeAudit.finished !== true
+      && stagedClaudeAudit.submitWritten !== true) {
+      finishClaudePasteAudit(broadcastTabId, stagedClaudeAudit, {
+        success: false,
+        error: 'claude_submit_not_sent',
+        expectedLen: stagedClaudeAudit.expectedLen,
+        expectedHash: stagedClaudeAudit.expectedHash,
       });
     }
     if (codexPromptInFlightState && broadcastTabId && !codexPromptInFlightState.submitted) {
@@ -13321,7 +13525,8 @@ async function handleTerminalInput(
     }
     const claudeSid = bridgeKnownSessions.get(tabId) || null;
     if (claudeSid || findClaudePidByTab(tabId)) {
-      const audit = pendingPasteAudit.get(tabId) || null;
+      const audits = getPendingClaudePasteAudits(tabId);
+      const newestAudit = audits[audits.length - 1] || null;
       console.warn(
         '[ClaudeInterruptInput]' +
         ' tab=' + String(tabId).slice(-12) +
@@ -13329,9 +13534,9 @@ async function handleTerminalInput(
         ' session=' + String(claudeSid || 'none').slice(0, 8) +
         ' turnBusy=' + (claudeTurnBusy.get(tabId) === true) +
         ' spinnerBusy=' + (claudeSpinnerBusy.get(tabId) === true) +
-        ' pendingAudit=' + !!audit +
-        ' handoff=' + (audit?.handoffId || '-') +
-        ' auditAgeMs=' + (audit ? Date.now() - audit.sentAt : 0)
+        ' pendingAudits=' + audits.length +
+        ' handoff=' + (newestAudit?.handoffId || '-') +
+        ' auditAgeMs=' + (newestAudit ? Date.now() - newestAudit.sentAt : 0)
       );
     }
     cancelClaudeLocalCommandFromInput(tabId, data);

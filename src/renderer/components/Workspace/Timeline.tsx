@@ -926,6 +926,7 @@ function Timeline({
         targetText: operation.targetText,
         mode: operation.mode,
         toolType: operation.toolType,
+        sourceSessionId: operation.sourceSessionId || null,
         error: 'Rewind cancelled',
       }
     }));
@@ -4318,6 +4319,7 @@ function Timeline({
           targetText: entry.content,
           mode,
           toolType,
+          sourceSessionId: sessionId,
           persisted: options.persisted ?? (!isCodex && (mode === 'ai' || isGemini) && status === 'done'),
           historyInputDraft: options.historyInputDraft,
           historyDraftText: options.historyDraftText,

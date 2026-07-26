@@ -5,6 +5,11 @@ const os = require('os');
 const crypto = require('crypto');
 const { performance: nodePerformance } = require('node:perf_hooks');
 const {
+  dehydrateHistoryEntries,
+  historyPayloadStash,
+  capPayloadForRender,
+} = require('../history-payload-dehydrate');
+const {
   buildHistoryRevision,
   validateHistoryRevision,
 } = require('../history-revision');
@@ -1218,7 +1223,85 @@ const _api = {
   getConfirmedSettings: null, // ({tabId, sessionId?, cwd?}) → active-branch model/effort proof
   parseClaudeStructuredPatchHunks,
   extractClaudeToolDiffHunks,
+  rebuildHistoryPayloadStash,
 };
+
+// Stash-miss recovery for dehydrated Claude payloads. Payload identity is
+// deterministic per source record (result:<tool_use_id>, thinking:<uuid>), so
+// the originals can be re-extracted from the cached recordMap without
+// re-running the whole projection. The session chain read is LRU-cached by
+// loadJsonlRecords, so a cold call costs one chain walk.
+async function rebuildHistoryPayloadStash({ sessionId, cwd, stash }) {
+  if (!sessionId || !stash) return { rebuilt: 0 };
+  const { recordMap } = await resolveSessionChain(sessionId, cwd);
+  let rebuilt = 0;
+  // Background notifications first: the projection appends them to the
+  // acceptance result text, so the rebuilt payload must match byte-for-byte.
+  const notifications = new Map();
+  for (const [, rec] of recordMap) {
+    if (rec?.type !== 'user') continue;
+    const content = rec.message?.content;
+    const text = typeof content === 'string'
+      ? content
+      : Array.isArray(content)
+        ? (content.find((part) => part?.type === 'text')?.text || '')
+        : '';
+    if (!text.includes('<task-notification>')) continue;
+    const useId = (text.match(/<tool-use-id>([^<]+)<\/tool-use-id>/) || [])[1];
+    if (!useId) continue;
+    notifications.set(useId.trim(), {
+      status: ((text.match(/<status>([^<]+)<\/status>/) || [])[1] || 'completed').trim(),
+      summary: ((text.match(/<summary>([\s\S]*?)<\/summary>/) || [])[1] || '').trim(),
+      result: ((text.match(/<result>([\s\S]*?)<\/result>/) || [])[1] || '').trim(),
+    });
+  }
+  // Background identity mirrors the projection: the CALL's explicit
+  // run_in_background arg, never result-text phrases.
+  const backgroundCallIds = new Set();
+  for (const [, rec] of recordMap) {
+    if (rec?.type !== 'assistant' || !Array.isArray(rec.message?.content)) continue;
+    for (const part of rec.message.content) {
+      if (part?.type === 'tool_use' && part.id && part.input?.run_in_background === true) {
+        backgroundCallIds.add(part.id);
+      }
+    }
+  }
+  for (const [, rec] of recordMap) {
+    if (rec?.type === 'user' && Array.isArray(rec.message?.content)) {
+      for (const part of rec.message.content) {
+        if (part?.type === 'tool_result' && part.tool_use_id) {
+          const rc = part.content;
+          let text = typeof rc === 'string' ? rc
+            : Array.isArray(rc) ? rc.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
+          if (!text) continue;
+          const notification = notifications.get(part.tool_use_id);
+          if (notification && backgroundCallIds.has(part.tool_use_id)) {
+            const notificationBody = [
+              '— background ' + (notification.status || 'completed') + ' —',
+              notification.summary,
+              notification.result,
+            ].filter(Boolean).join('\n');
+            text = text.trimEnd() + '\n\n' + notificationBody;
+          }
+          stash.set('claude', sessionId, 'result:' + part.tool_use_id, text);
+          rebuilt += 1;
+        }
+      }
+      continue;
+    }
+    if (rec?.type === 'assistant' && Array.isArray(rec.message?.content)) {
+      const thinkingParts = [];
+      for (const part of rec.message.content) {
+        if (part?.type === 'thinking' && part.thinking) thinkingParts.push(part.thinking);
+      }
+      if (thinkingParts.length > 0 && rec.uuid) {
+        stash.set('claude', sessionId, 'thinking:' + rec.uuid, thinkingParts.join('\n\n---\n\n'));
+        rebuilt += 1;
+      }
+    }
+  }
+  return { rebuilt };
+}
 
 function _normalizePromptStatusText(text) {
   return String(text || '')
@@ -1630,10 +1713,24 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
 
                 let toolResult = null;
                 if (groupOn) {
+                  // Range scan first (keeps copy semantics range-scoped), then
+                  // the recordMap-wide fallback: parallel tool calls park
+                  // sibling tool_results OFF the parentUuid branch, so a
+                  // branch/range-only scan misses every result but the last.
                   for (let j = i + 1; j < range.length; j++) {
                     const nextEntry = range[j];
                     if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
                       const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
+                      if (res) {
+                        toolResult = res;
+                        break;
+                      }
+                    }
+                  }
+                  if (!toolResult) {
+                    for (const [, rec] of recordMap) {
+                      if (rec?.type !== 'user' || !Array.isArray(rec.message?.content)) continue;
+                      const res = rec.message.content.find(c => c?.type === 'tool_result' && c.tool_use_id === block.id);
                       if (res) {
                         toolResult = res;
                         break;
@@ -3786,6 +3883,20 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         progressByToolUseId.get(key).push(pe);
       }
 
+      // Sibling tool_result records from parallel tool calls live OFF the
+      // parentUuid branch (only the last result continues it) — an all-records
+      // index by tool_use_id is the exact-identity lookup the export needs.
+      const exportToolResultByUseId = new Map();
+      for (const [, rec] of recordMap) {
+        if (rec?.type !== 'user' || !Array.isArray(rec.message?.content)) continue;
+        for (const part of rec.message.content) {
+          if (part?.type === 'tool_result' && part.tool_use_id
+            && !exportToolResultByUseId.has(part.tool_use_id)) {
+            exportToolResultByUseId.set(part.tool_use_id, part);
+          }
+        }
+      }
+
       const groupFlags = {
         reading: !!includeReading,
         editing: !!includeEditing,
@@ -3887,19 +3998,9 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                   || (group === 'tools' && groupFlags.tools)
                   || (group === 'subagent' && (includeSubagentResult || includeSubagentHistory));
 
-                let toolResult = null;
-                if (groupOn) {
-                  for (let j = i + 1; j < activeBranch.length; j++) {
-                    const nextEntry = activeBranch[j];
-                    if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
-                      const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
-                      if (res) {
-                        toolResult = res;
-                        break;
-                      }
-                    }
-                  }
-                }
+                const toolResult = groupOn
+                  ? (exportToolResultByUseId.get(block.id) || null)
+                  : null;
                 const action = formatTool(block.name, block.input || {}, toolResult, block.id);
                 if (action) toolActions.push(action);
               }
@@ -4164,6 +4265,56 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         sessionBoundaries,
         log: (message) => console.log('[FullHistory:Backtrace] ' + message),
       });
+
+      // Parallel tool calls write sibling records: assistant tool_use blocks
+      // chain A1←A2←A3, while their tool_result user-records attach to their
+      // OWN parents (R1←A1, R2←A2) and only the last result continues the
+      // branch. A branch-only forward scan therefore never finds R1/R2 and the
+      // finished Bash/MCP card spins forever. tool_use ids are globally unique
+      // per call, so an all-records index is exact identity — and it also
+      // removes the O(n²) forward scan on long sessions. Rewind abandons a
+      // tool_use together with its result, so off-branch results here can only
+      // belong to on-branch calls.
+      const toolResultRecordByUseId = new Map();
+      for (const [, rec] of recordMap) {
+        if (rec?.type !== 'user' || !Array.isArray(rec.message?.content)) continue;
+        for (const part of rec.message.content) {
+          if (part?.type === 'tool_result' && part.tool_use_id
+            && !toolResultRecordByUseId.has(part.tool_use_id)) {
+            toolResultRecordByUseId.set(part.tool_use_id, { record: rec, block: part });
+          }
+        }
+      }
+
+      // Background work (Bash run_in_background, async Agent/Task) resolves in
+      // two steps: an immediate acceptance tool_result ("running in background
+      // with ID…"), then a <task-notification> user-record carrying the real
+      // outcome. The notification is filtered from History as service-noise,
+      // so without this index the card keeps showing only the acceptance text.
+      // <tool-use-id> inside the notification is exact identity.
+      const taskNotificationByToolUseId = new Map();
+      for (const [, rec] of recordMap) {
+        if (rec?.type !== 'user') continue;
+        const content = rec.message?.content;
+        const text = typeof content === 'string'
+          ? content
+          : Array.isArray(content)
+            ? (content.find((part) => part?.type === 'text')?.text || '')
+            : '';
+        if (!text.includes('<task-notification>')) continue;
+        const useId = (text.match(/<tool-use-id>([^<]+)<\/tool-use-id>/) || [])[1];
+        if (!useId) continue;
+        const status = (text.match(/<status>([^<]+)<\/status>/) || [])[1] || 'completed';
+        const summary = (text.match(/<summary>([\s\S]*?)<\/summary>/) || [])[1] || '';
+        const resultBody = (text.match(/<result>([\s\S]*?)<\/result>/) || [])[1] || '';
+        // Latest notification wins: a task can notify more than once.
+        taskNotificationByToolUseId.set(useId.trim(), {
+          status: status.trim(),
+          summary: summary.trim(),
+          result: resultBody.trim(),
+          timestamp: rec.timestamp || '',
+        });
+      }
 
       // Format tool action label (standalone, no includeCode dependency)
       const mkFileAction = (toolName, input) => {
@@ -4459,34 +4610,56 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                 const name = block.name;
                 const input = block.input || {};
 
-                // Generic tool_result finder — walks forward for the user-record
-                // tool_result matching this tool_use id. Used both for Task (final
-                // answer) AND for the raw-tool carrier below (so the HistoryPanel
-                // package renderer can show Bash output / Read content / etc.).
+                // Generic tool_result finder — exact identity lookup over ALL
+                // records (parallel tool calls park sibling results off the
+                // parentUuid branch; a branch-only forward walk missed them and
+                // left finished Bash/MCP cards spinning forever). Used both for
+                // Task (final answer) AND for the raw-tool carrier below.
                 const findToolResult = () => {
-                  for (let j = i + 1; j < historyBranch.length; j++) {
-                    const nextEntry = historyBranch[j];
-                    if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
-                      const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
-                      if (res) {
-                        const rc = res.content;
-                        const text = typeof rc === 'string' ? rc
-                          : Array.isArray(rc) ? rc.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
-                        const diffHunks = extractClaudeToolDiffHunks({
-                          assistantEntry: entry,
-                          toolBlock: block,
-                          resultEntry: nextEntry,
-                          resultBlock: res,
-                        });
-                        return {
-                          text,
-                          isError: !!res.is_error,
-                          diffHunks: diffHunks || undefined,
-                        };
-                      }
-                    }
+                  const found = toolResultRecordByUseId.get(block.id);
+                  if (!found) return null;
+                  const res = found.block;
+                  const rc = res.content;
+                  let text = typeof rc === 'string' ? rc
+                    : Array.isArray(rc) ? rc.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
+                  // Background handoff: the immediate result only ACCEPTED the
+                  // work ("running in background…"). The real outcome arrives
+                  // later as a <task-notification> keyed by this tool_use id —
+                  // append it so the card reaches a terminal state instead of
+                  // spinning on the acceptance text forever.
+                  const notification = taskNotificationByToolUseId.get(block.id);
+                  // Background identity comes from the CALL (explicit
+                  // run_in_background arg), never from phrases in the result
+                  // text: docs_search/Read outputs legitimately contain the
+                  // words "running in background" and were spawning phantom
+                  // background chips for ordinary finished tools.
+                  const isBackgroundAccepted = input?.run_in_background === true;
+                  if (notification && isBackgroundAccepted) {
+                    const notificationBody = [
+                      '— background ' + (notification.status || 'completed') + ' —',
+                      notification.summary,
+                      notification.result,
+                    ].filter(Boolean).join('\n');
+                    text = text.trimEnd() + '\n\n' + notificationBody;
                   }
-                  return null;
+                  const diffHunks = extractClaudeToolDiffHunks({
+                    assistantEntry: entry,
+                    toolBlock: block,
+                    resultEntry: found.record,
+                    resultBlock: res,
+                  });
+                  return {
+                    text,
+                    isError: !!res.is_error,
+                    diffHunks: diffHunks || undefined,
+                    // Accepted-but-unnotified background work is RUNNING: the
+                    // acceptance result exists (so the card is not spinning),
+                    // but the real outcome has not arrived yet — the chips
+                    // bar shows it as an active background task.
+                    backgroundStatus: notification
+                      ? (notification.status || 'completed')
+                      : (isBackgroundAccepted ? 'running' : undefined),
+                  };
                 };
 
                 if (name === 'Task') {
@@ -4507,11 +4680,16 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                   actions.push({
                     tool: '__raw__',
                     rawTool: {
+                      // tool_use id is globally unique per call — it is both
+                      // the live-result match key and the payload identity
+                      // for lazy rehydration of a dehydrated result.
+                      toolUseId: block.id,
                       toolName: name,
                       args: input,
                       result: rr ? rr.text : undefined,
                       isError: rr ? rr.isError : undefined,
                       diffHunks: rr ? rr.diffHunks : undefined,
+                      backgroundStatus: rr ? rr.backgroundStatus : undefined,
                     },
                   });
                 }
@@ -4634,6 +4812,32 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         historySources,
         { context: finalRevisionContext }
       );
+      // Heavy tool outputs / thinking leave main as short previews + payload
+      // refs; the renderer pulls the full text only on expand
+      // (history:get-tool-payload). This keeps the IPC clone and renderer
+      // retained-state proportional to what is on screen instead of to
+      // transcript size. OPT-IN per call: web/iOS and Timeline consumers of
+      // this channel have no rehydration path and keep full payloads until
+      // they adopt one — silently handing them previews would be a
+      // capability downgrade.
+      if (payload.dehydrate === true) {
+        const dehydration = dehydrateHistoryEntries({
+          toolType: 'claude',
+          sessionId,
+          entries: timedEntries,
+          stash: historyPayloadStash,
+          // Claude compact summaries stay inline: they are few, bounded
+          // prose, and their extraction depends on branch look-ahead — the
+          // stash-miss rebuild recovers payloads from recordMap by exact
+          // identity, which covers tool results and thinking only.
+          dehydrateCompact: false,
+        });
+        if (dehydration.dehydrated > 0) {
+          console.log('[FullHistory:Dehydrate] session=' + sessionId.slice(0, 8)
+            + ' payloads=' + dehydration.dehydrated
+            + ' savedKb=' + Math.round(dehydration.savedChars / 1024));
+        }
+      }
       return {
         success: true,
         unchanged: false,

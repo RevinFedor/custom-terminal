@@ -13,6 +13,7 @@
 //   POST /api/terminal-tabs/:tabId/send            → send prompt through scenario layer
 //   POST /api/terminal-tabs/:tabId/stop            → stop terminal runtime
 //   POST /api/terminal-tabs/:tabId/fork            → fork Claude/Codex into a neighbour tab
+//   POST /api/terminal-tabs/:tabId/link-file       → attach a file tab under an AI session
 //   GET  /api/terminal-tabs/:tabId/history         → load JSONL/rollout session history
 //   POST /api/terminal-tabs/:tabId/edit-range      → Claude JSONL / Codex rollout middle compact
 //   POST /api/terminal-tabs/:tabId/delete-range    → Claude JSONL / Codex rollout middle delete
@@ -1379,8 +1380,9 @@ async function sendOrchestrationCompletionNotification(run) {
       'runId: ' + current.runId,
       'Исполнитель: ' + (current.targetTabName || current.targetTabId) + ' (' + (current.targetToolType || 'agent') + ').',
       'Результат не вставлен в сообщение. Получи его одним запросом:',
-      'curl -sS -H "Authorization: Bearer $(cat ~/.noted-terminal/web-token.txt)" "' + baseUrl + '/api/orchestrations/' + encodeURIComponent(current.runId) + '/result"',
-      'Не используй Overseer и не опрашивай статус повторно. После GET продолжи исходную задачу.',
+      'Terminal MCP: get_delegation_result({ runId: "' + current.runId + '" })',
+      'HTTP fallback: curl -sS -H "Authorization: Bearer $(cat ~/.noted-terminal/web-token.txt)" "' + baseUrl + '/api/orchestrations/' + encodeURIComponent(current.runId) + '/result"',
+      'Не опрашивай статус повторно. После получения результата продолжи исходную задачу.',
     ].join('\n');
     const result = await runAgentSendScenario({
       tabId: current.sourceTabId,
@@ -3127,18 +3129,51 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const runId = decId(m[1]);
     const run = externalRuns.get(runId);
     if (!run?.tabId) return sendJson(res, 404, { error: 'run not found' });
+    const prevStatus = run.status;
+    // An unproven stop must fully restore the pre-attempt state: the status
+    // AND the auto-stop safety timer this handler cleared before trying.
+    // Otherwise a refused stop leaves the run alive with its token-burn
+    // guard silently disarmed. Only re-arm what actually existed — mid-turn
+    // runs have no stop timer yet (it arms on turn-done), and inventing one
+    // here would auto-kill the agent mid-answer.
+    const hadStopTimer = !!run.stopTimer;
+    const revertToPreStop = () => {
+      run.status = prevStatus;
+      setExternalRunMeta(run.tabId, { status: prevStatus, autoStopAt: null });
+      if (hadStopTimer) scheduleExternalRunStop(run, 'rearm-after-stop-unconfirmed');
+    };
     try {
       clearExternalRunTimer(run, 'stopTimer');
       run.status = 'stopping';
       setExternalRunMeta(run.tabId, { status: 'stopping', autoStopAt: null });
       const data = await runAgentStopScenario(run.tabId, 5000);
+      // The run may only be marked stopped on a proven stop. A structured
+      // refusal / lookupUnknown keeps the process alive — marking the run
+      // stopped and scheduling auto-close would close a tab whose agent is
+      // still running (same contract as /stop's classify above).
+      const stopProven = data?.success === true || data?.stopped === true;
+      if (!stopProven) {
+        revertToPreStop();
+        return sendJson(res, 409, {
+          ok: false,
+          runId,
+          tabId: run.tabId,
+          stopped: false,
+          error: data?.error || 'agent_stop_unconfirmed',
+          ...data,
+        });
+      }
       run.status = 'stopped';
       run.stoppedAt = Date.now();
       setExternalRunMeta(run.tabId, { status: 'stopped', stoppedAt: run.stoppedAt, autoStopAt: null, stopReason: 'api' });
       scheduleExternalRunClose(run, 'api-stop');
       return sendJson(res, 200, { ok: true, runId, tabId: run.tabId, stopped: true, ...data });
     } catch (e) {
-      return sendJson(res, 500, { ok: false, runId, error: String(e.message || e) });
+      // Bridge timeout / renderer gone: the stop is unproven, same contract
+      // as the structured refusal — do not leave the run in 'stopping'
+      // forever with no safety timer.
+      revertToPreStop();
+      return sendJson(res, 500, { ok: false, runId, stopped: false, error: String(e.message || e) });
     }
   }
 
@@ -3615,6 +3650,30 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 409, { error: String(e.message) });
+    }
+  }
+
+  // Link a real file to an open AI tab using the same renderer/store scenario
+  // as the desktop drag-and-drop flow. Canonicalization keeps the operation
+  // idempotent across symlinks and relative-path aliases.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/link-file$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    try {
+      const body = await readBody(req);
+      const requestedPath = typeof body.path === 'string' ? body.path.trim() : '';
+      if (!requestedPath) return sendJson(res, 400, { error: 'path required' });
+      if (!path.isAbsolute(requestedPath)) {
+        return sendJson(res, 400, { error: 'path must be absolute' });
+      }
+      const filePath = await fs.promises.realpath(requestedPath);
+      const stat = await fs.promises.stat(filePath);
+      if (!stat.isFile()) return sendJson(res, 400, { error: 'path must point to a file' });
+      const data = await bridgeRequest('linkFileToTab', { tabId, filePath });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      const code = e?.code === 'ENOENT' || e?.code === 'ENOTDIR' ? 404 : 409;
+      return sendJson(res, code, { error: String(e.message || e) });
     }
   }
 

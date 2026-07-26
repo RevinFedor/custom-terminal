@@ -62,7 +62,9 @@ ipcRenderer.send('terminal:input', tabId, 'prompt text\r')
 
 ### Гарантия отсутствия регрессий: PasteAudit
 
-После единственного `term.write` нет per-chunk verification. Post-hoc audit через UserPromptSubmit hook: `safePasteAndSubmit` перед Enter записывает `{expectedLen, expectedHash}` в `pendingPasteAudit.set(tabId, ...)`. Hook handler читает `transcript_path` JSONL, извлекает последний user-record, считает sha1, сравнивает. Mismatch → `[PasteAudit:MISMATCH] expectedLen=X actualLen=Y Δ=Z hashes...`. Подробнее в `fix-claude-paste-stuck-queue.md::Защита от регрессий`.
+После единственного `term.write` нет per-chunk verification. Post-hoc audit через UserPromptSubmit hook: `safePasteAndSubmit` перед Enter ставит ожидание `{expectedLen, expectedHash, preSubmitBoundary}` в **упорядоченный per-tab список** (`pendingPasteAudit: tabId → audit[]`), где boundary — байтовая позиция и последний UUID JSONL до Enter. Hook handler читает не «последнюю» user-запись, а все кандидаты после самой ранней boundary, и сводит их oldest-first: самая ранняя причинная запись подтверждает самое раннее ожидание (len+hash+позиция после boundary; один byte offset подтверждает ровно один audit). Так два подряд одинаковых prompt'а (type-ahead) получают каждый своё подтверждение, а не «второй усыновил запись первого».
+
+Судьбы ожидания: подтверждён → `✅ match`; запись не совпала → кандидат логируется `MISMATCH-CANDIDATE … kept pending` и ожидание ЖИВЁТ дальше (поздний JSONL-flush — норма); timeout → caller получает `success:false, lateReconciliationPending:true` (это «ещё не согласовано», НЕ delivery failure — SEND FAILED из него делать нельзя), само ожидание остаётся до bridge-clear; Enter так и не ушёл в PTY (guard/ошибка до submit) → finally-блок финализирует `claude_submit_not_sent`, чтобы мёртвое ожидание не украло durable-запись у следующей одинаковой отправки; выход Claude → финальный tail-scan, потом evict unconfirmed (`…_unconfirmed_evicted`, presentation sidecar сохраняется при позднем подтверждении). Кап: 32 pending на вкладку / 30 мин. Подробнее в `fix-claude-paste-stuck-queue.md::Защита от регрессий`.
 
 ### Параллельная причина N chip'ов на ручной Cmd+V
 

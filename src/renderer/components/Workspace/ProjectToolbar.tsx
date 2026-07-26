@@ -858,7 +858,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       {/* One adjoining Codex + Claude usage control. Each half opens the same
           downward popover on its provider; Claude prefers the official
           statusline quota payload and Codex uses the account usage endpoint. */}
-      <div className="flex items-center gap-1 pr-2">
+      <div data-usage-summary-controls className="flex items-center gap-1 pr-2">
         <Tooltip content={outline
           ? `Пересобрать группы всей текущей сессии${outlineNewCount > 0 ? ` · новых ходов: ${outlineNewCount}` : ''}`
           : 'Сгруппировать весь Timeline текущей сессии'}>
@@ -904,7 +904,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
         </Tooltip>
       </div>
 
-      <div className="flex items-center pr-2">
+      <div className="flex min-w-0 items-center pr-2">
         <ClaudeUsageButton />
       </div>
 

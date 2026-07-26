@@ -71,6 +71,7 @@ import { getClaudeStartupDefaultsGateSnapshot } from './utils/claudeStartupDefau
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
 import { generateTabTitleFromSession } from './utils/generateTabTitle';
+import { linkFileTab } from './utils/linkFileTab';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -2315,6 +2316,12 @@ function App() {
           }
           return reply(false, null, 'tab not in any open project');
         }
+        if (action === 'linkFileToTab') {
+          const { tabId, filePath } = payload || {};
+          if (!tabId || !filePath) return reply(false, null, 'tabId+filePath required');
+          const result = await linkFileTab(filePath, tabId);
+          return reply(true, result);
+        }
         if (action === 'renameProject') {
           const { projectId, name } = payload || {};
           if (!projectId || !name) return reply(false, null, 'projectId+name required');
@@ -3494,6 +3501,14 @@ function App() {
               maybeAutoTitleAfterMobileSend(tabId, toolType, cwd || tab?.cwd);
             }
             return reply(true, { tabId, toolType, ...(result || {}) });
+          }
+          // MCP ai-prompt requests were already engine-proven in main against
+          // the live PTY. If the workspace store cannot resolve the tab yet
+          // (startup hydration race), falling through to the SDK path would
+          // start a Claude SDK session in a PTY tab — for Codex that is the
+          // wrong agent entirely. Fail explicitly; the client retries later.
+          if (source === 'mcp-ai-prompt' || source === 'codex-mcp-ai-prompt') {
+            return reply(false, null, 'tab not resolved in workspace store yet (hydration); retry after the app finishes loading');
           }
           // SDK path (default)
           const sendCwd = cwd || tab?.cwd;

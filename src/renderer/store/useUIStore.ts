@@ -46,7 +46,7 @@ import type { CodexSettings, DefaultCodexEffort, DefaultCodexModel } from '../co
 import {
   DEFAULT_CODEX_MODEL,
   DEFAULT_CODEX_SETTINGS,
-  normalizeCodexEfforts,
+  normalizeCodexEffortOptions,
   normalizeCodexModelOptions,
   normalizeCodexRemovedModelIds,
   resolveCodexPersistentEffortForModel,
@@ -1775,6 +1775,8 @@ const LOCAL_KEY_CODEX_SETTINGS = 'noted-terminal-codex-settings';
 const normalizeCodexSettings = (raw: unknown): CodexSettings => {
   const obj = raw && typeof raw === 'object' ? raw as Partial<CodexSettings> : {};
   const rawModels = Array.isArray(obj.models) ? obj.models : [];
+  const effortOptions = normalizeCodexEffortOptions(obj.effortOptions, obj.efforts);
+  const availableEfforts = new Set(effortOptions.map((option) => option.id));
   const removedModelIds = normalizeCodexRemovedModelIds(obj.removedModelIds);
   const removed = new Set(removedModelIds);
   const legacyDefaultOrder = [
@@ -1788,7 +1790,12 @@ const normalizeCodexSettings = (raw: unknown): CodexSettings => {
   ];
   const canonicalOrder = DEFAULT_CODEX_SETTINGS.models.map((model) => model.id);
   let models = normalizeCodexModelOptions(rawModels, !removed.has(DEFAULT_CODEX_MODEL))
-    .filter((model) => !removed.has(model.id));
+    .filter((model) => !removed.has(model.id))
+    .map((model) => ({
+      ...model,
+      efforts: (model.efforts || []).filter((effort) => availableEfforts.has(effort)),
+      supportedEfforts: (model.supportedEfforts || []).filter((effort) => availableEfforts.has(effort)),
+    }));
   // The original built-in order put 5.5 first. Move untouched legacy settings
   // to the current catalog order without disturbing a user-made custom order.
   if (
@@ -1807,7 +1814,8 @@ const normalizeCodexSettings = (raw: unknown): CodexSettings => {
     : null;
   return {
     models,
-    efforts: normalizeCodexEfforts(obj.efforts),
+    effortOptions,
+    efforts: effortOptions.map((option) => option.id),
     quickModel,
     quickEffort,
     removedModelIds,
@@ -1820,7 +1828,9 @@ const loadCodexSettings = (): CodexSettings => {
   } catch {}
   return normalizeCodexSettings(DEFAULT_CODEX_SETTINGS);
 };
+let codexSettingsMutationVersion = 0;
 const saveCodexSettings = (settings: CodexSettings) => {
+  codexSettingsMutationVersion += 1;
   const normalized = normalizeCodexSettings(settings);
   try { localStorage.setItem(LOCAL_KEY_CODEX_SETTINGS, JSON.stringify(normalized)); } catch {}
   try {
@@ -1829,11 +1839,12 @@ const saveCodexSettings = (settings: CodexSettings) => {
   } catch {}
 };
 const initialCodexSettings = loadCodexSettings();
+const initialCodexSettingsMutationVersion = codexSettingsMutationVersion;
 (async () => {
   try {
     const { ipcRenderer } = window.require('electron');
     const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_SETTINGS);
-    if (v !== null && v !== undefined) {
+    if (v !== null && v !== undefined && codexSettingsMutationVersion === initialCodexSettingsMutationVersion) {
       const normalized = normalizeCodexSettings(v);
       useUIStore.getState().setCodexSettings(normalized);
       try { localStorage.setItem(LOCAL_KEY_CODEX_SETTINGS, JSON.stringify(normalized)); } catch {}
@@ -1852,7 +1863,9 @@ const loadClaudeCodeSettings = (): ClaudeCodeSettings => {
   return normalizeClaudeCodeSettings(DEFAULT_CLAUDE_CODE_SETTINGS);
 };
 
+let claudeCodeSettingsMutationVersion = 0;
 const saveClaudeCodeSettings = (settings: ClaudeCodeSettings) => {
+  claudeCodeSettingsMutationVersion += 1;
   const normalized = normalizeClaudeCodeSettings(settings);
   try { localStorage.setItem(LOCAL_KEY_CLAUDE_CODE_SETTINGS, JSON.stringify(normalized)); } catch {}
   try {
@@ -1862,15 +1875,14 @@ const saveClaudeCodeSettings = (settings: ClaudeCodeSettings) => {
 };
 
 const initialClaudeCodeSettings = loadClaudeCodeSettings();
+const initialClaudeCodeSettingsMutationVersion = claudeCodeSettingsMutationVersion;
 (async () => {
   try {
     const { ipcRenderer } = window.require('electron');
     const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CLAUDE_CODE_SETTINGS);
-    if (v !== null && v !== undefined) {
+    if (v !== null && v !== undefined && claudeCodeSettingsMutationVersion === initialClaudeCodeSettingsMutationVersion) {
       const normalized = normalizeClaudeCodeSettings(v);
-      // Use the public setter so an edited command also keeps the selected
-      // default model/effort coherent. This additionally writes the migrated
-      // shape back to SQLite, removing legacy duplicate Fable rows for good.
+      // Use the public setter so a hydrated model/effort pair stays coherent.
       useUIStore.getState().setClaudeCodeSettings(normalized);
     }
   } catch {}

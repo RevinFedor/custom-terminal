@@ -59,7 +59,7 @@ async function readBoundedTail(handle, fileSize, maxReadBytes) {
   };
 }
 
-function readLastClaudeUserRecordFromBuffer(
+function readClaudeUserRecordsFromBuffer(
   buffer,
   transcriptPath = null,
   {
@@ -73,7 +73,7 @@ function readLastClaudeUserRecordFromBuffer(
   let parseStart = 0;
   if (skipLeadingPartial) {
     const firstNewline = source.indexOf(0x0a);
-    if (firstNewline < 0) return null;
+    if (firstNewline < 0) return [];
     parseStart = firstNewline + 1;
   }
 
@@ -105,10 +105,15 @@ function readLastClaudeUserRecordFromBuffer(
     if (newline < 0) break;
     lineStart = newline + 1;
   }
+  return candidates;
+}
+
+function readLastClaudeUserRecordFromBuffer(buffer, transcriptPath = null, options = {}) {
+  const candidates = readClaudeUserRecordsFromBuffer(buffer, transcriptPath, options);
   return candidates[candidates.length - 1] || null;
 }
 
-async function readLastClaudeUserRecord(
+async function readClaudeUserRecords(
   transcriptPath,
   boundary = null,
   { maxReadBytes = DEFAULT_CLAUDE_AUDIT_READ_BYTES } = {},
@@ -127,10 +132,10 @@ async function readLastClaudeUserRecord(
 
     if (sameFileBoundary) {
       const start = Math.max(0, Number(boundary.fileSize));
-      if (fileSize <= start) return null;
+      if (fileSize <= start) return [];
       const length = Math.min(fileSize - start, normalizeReadLimit(maxReadBytes));
       const read = await readRange(handle, start, length);
-      return readLastClaudeUserRecordFromBuffer(read.buffer, resolvedPath, {
+      return readClaudeUserRecordsFromBuffer(read.buffer, resolvedPath, {
         baseOffset: start,
         skipLeadingPartial: boundary.endedWithNewline !== true,
         bytesRead: read.bytesRead,
@@ -139,7 +144,7 @@ async function readLastClaudeUserRecord(
     }
 
     const tail = await readBoundedTail(handle, fileSize, maxReadBytes);
-    return readLastClaudeUserRecordFromBuffer(tail.buffer, resolvedPath, {
+    return readClaudeUserRecordsFromBuffer(tail.buffer, resolvedPath, {
       baseOffset: tail.baseOffset,
       skipLeadingPartial: tail.skipLeadingPartial,
       bytesRead: tail.bytesRead,
@@ -148,6 +153,51 @@ async function readLastClaudeUserRecord(
   } finally {
     await handle.close();
   }
+}
+
+async function readLastClaudeUserRecord(
+  transcriptPath,
+  boundary = null,
+  options = {},
+) {
+  const candidates = await readClaudeUserRecords(transcriptPath, boundary, options);
+  return candidates[candidates.length - 1] || null;
+}
+
+/**
+ * Ordered multi-audit selection, mirroring selectCodexPendingPromptAudit: given
+ * every user record found after the shared read boundary, match each pending
+ * audit by exact len+hash against a causal (post-its-own-boundary) record.
+ * Text equality alone is not identity — causality comes first, and one record
+ * confirms at most one audit (earliest expectation wins).
+ */
+function selectClaudePendingPromptAudit(
+  audits,
+  candidates,
+  {
+    classify = classifyClaudeAuditRecordAfterBoundary,
+    hashText = (text) => require('node:crypto')
+      .createHash('sha1').update(String(text || '')).digest('hex').slice(0, 16),
+    claimedByteOffsets = new Set(),
+  } = {},
+) {
+  const source = Array.isArray(audits) ? audits : [];
+  const records = Array.isArray(candidates) ? candidates : [];
+  for (const audit of source) {
+    if (!audit || audit.finished === true) continue;
+    // Oldest-first: the earliest causal record after this audit's boundary is
+    // its own submit; newer matching records belong to later expectations.
+    for (let i = 0; i < records.length; i += 1) {
+      const candidate = records[i];
+      if (!candidate || claimedByteOffsets.has(candidate.byteOffset)) continue;
+      if (candidate.text.length !== Number(audit.expectedLen)) continue;
+      if (hashText(candidate.text) !== String(audit.expectedHash || '')) continue;
+      const causality = classify(candidate, audit.preSubmitBoundary);
+      if (!causality.causal) continue;
+      return { audit, candidate, causality };
+    }
+  }
+  return null;
 }
 
 async function captureClaudePromptAuditBoundary(
@@ -264,6 +314,9 @@ module.exports = {
   captureClaudePromptAuditBoundary,
   classifyClaudeAuditRecordAfterBoundary,
   extractClaudeUserText,
+  readClaudeUserRecords,
+  readClaudeUserRecordsFromBuffer,
   readLastClaudeUserRecord,
   readLastClaudeUserRecordFromBuffer,
+  selectClaudePendingPromptAudit,
 };

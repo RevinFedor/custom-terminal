@@ -12,6 +12,10 @@ import {
   normalizeComposerChips,
   serializeComposerDraft,
 } from '../utils/composerChips.mjs';
+import {
+  getFirstDelayRemainingSeconds,
+  normalizeFirstDelaySeconds,
+} from '../utils/promptQueueDelay';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -366,7 +370,7 @@ export type TabQueue = {
   //                            overwrite firstDelaySeconds with it, then clear the slot —
   //                            so the input shows what was left, not the original value.
   //                            When countdown reaches 0 and fires, clear both slots
-  //                            to 0/null so the UI returns to the empty placeholder.
+  //                            to 0/null so the UI returns to 0 ч / 0 м / 0 с.
   // Neither slot is consumed for items 2..N — only on the very first arm-after-empty edge.
   firstDelaySeconds: number;
   firstDelayCountdownAt: number | null;
@@ -747,7 +751,10 @@ function wouldCreateRunAfterCycle(
 // history/JSONL audit can time out after the agent has already started; keeping
 // the item in that case would make a retry duplicate the submission.
 export function queueSendTransferredOwnership(result: unknown): boolean {
-  if (!result || typeof result !== 'object') return true;
+  // A void/malformed transport return proves nothing about delivery. Treating
+  // it as "transferred" would settle the row as sent with zero audit proof —
+  // fail closed instead (ownership stays with the queue/composer).
+  if (!result || typeof result !== 'object') return false;
   const sendResult = result as { success?: boolean; submitted?: boolean };
   return sendResult.success !== false || sendResult.submitted === true;
 }
@@ -1250,13 +1257,13 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
     },
 
     setFirstDelaySeconds: (tabId, value) => {
-      const clamped = Math.max(0, Math.min(3600, Math.floor(value)));
+      const normalized = normalizeFirstDelaySeconds(value);
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
         // Editing the input while a countdown is running is treated as cancel-edit-restart:
         // we drop the active countdown slot, the new value becomes the value the input shows.
-        next.set(tabId, { ...cur, firstDelaySeconds: clamped, firstDelayCountdownAt: null });
+        next.set(tabId, { ...cur, firstDelaySeconds: normalized, firstDelayCountdownAt: null });
         return { queues: next };
       });
     },
@@ -1275,8 +1282,10 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       setAndPersist((state) => {
         const cur = state.queues.get(tabId);
         if (!cur || cur.firstDelayCountdownAt === null) return state;
-        const elapsedMs = Date.now() - cur.firstDelayCountdownAt;
-        const remaining = Math.max(0, cur.firstDelaySeconds - Math.floor(elapsedMs / 1000));
+        const remaining = getFirstDelayRemainingSeconds(
+          cur.firstDelaySeconds,
+          cur.firstDelayCountdownAt,
+        );
         const next = new Map(state.queues);
         next.set(tabId, { ...cur, firstDelaySeconds: remaining, firstDelayCountdownAt: null });
         return { queues: next };
@@ -1640,7 +1649,7 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     ? entry.items.map(normalizePersistedQueuedPrompt).filter((item): item is QueuedPrompt => item !== null)
     : [];
   const firstDelaySeconds = typeof entry.firstDelaySeconds === 'number'
-    ? Math.max(0, Math.min(3600, Math.floor(entry.firstDelaySeconds)))
+    ? normalizeFirstDelaySeconds(entry.firstDelaySeconds)
     : 0;
   const previewId = typeof entry.previewId === 'string' && items.some((item) => item.id === entry.previewId)
     ? entry.previewId

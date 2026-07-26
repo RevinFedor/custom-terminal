@@ -14,8 +14,21 @@ export interface CodexModelOption {
   visible?: boolean;
 }
 
+/** A user-owned row in the Codex effort catalog. */
+export interface CodexEffortOption {
+  /** Stable identity survives a command/value rename. */
+  key: string;
+  /** Value sent to Codex when the row is enabled for a model. */
+  id: string;
+  /** Human-facing name shown in settings and pickers. */
+  label: string;
+}
+
 export interface CodexSettings {
   models: CodexModelOption[];
+  /** Editable catalog; per-model checkboxes only enable its supported rows. */
+  effortOptions?: CodexEffortOption[];
+  /** Legacy flat catalog kept for backward-compatible migration. */
   efforts: string[];
   /** One globally configured pair for the ControlBar quick-switch button. */
   quickModel?: string | null;
@@ -34,6 +47,12 @@ export const CODEX_PERSISTENT_EFFORT_LEVELS = CODEX_EFFORT_LEVELS.filter(
   (level) => level !== 'ultra',
 );
 export type CodexEffortLevel = typeof CODEX_EFFORT_LEVELS[number];
+
+export const DEFAULT_CODEX_EFFORT_OPTIONS: CodexEffortOption[] = CODEX_EFFORT_LEVELS.map((id) => ({
+  key: `builtin:${id}`,
+  id,
+  label: id,
+}));
 
 export const CODEX_EFFORT_LABELS: Record<CodexEffortLevel, string> = {
   minimal: 'min',
@@ -63,6 +82,7 @@ export const DEFAULT_CODEX_MODEL_OPTIONS: CodexModelOption[] = [
 
 export const DEFAULT_CODEX_SETTINGS: CodexSettings = {
   models: DEFAULT_CODEX_MODEL_OPTIONS,
+  effortOptions: DEFAULT_CODEX_EFFORT_OPTIONS.map((option) => ({ ...option })),
   efforts: [...CODEX_EFFORT_LEVELS],
   quickModel: null,
   quickEffort: null,
@@ -158,6 +178,46 @@ export const normalizeCodexEfforts = (raw: unknown): string[] => {
     ? raw.map((v) => String(v || '').trim()).filter((v, index, arr) => v && arr.indexOf(v) === index)
     : [];
   return efforts.length > 0 ? efforts : [...CODEX_EFFORT_LEVELS];
+};
+
+/**
+ * The catalog is provider-owned configuration, not a live capability list.
+ * A new Codex value can be prepared here, while the live picker still decides
+ * which individual model is actually allowed to use it.
+ */
+export const normalizeCodexEffortOptions = (
+  raw: unknown,
+  legacyRaw: unknown = undefined,
+): CodexEffortOption[] => {
+  const candidates = Array.isArray(raw)
+    ? raw
+    : (Array.isArray(legacyRaw) ? legacyRaw : DEFAULT_CODEX_EFFORT_OPTIONS);
+  const options: CodexEffortOption[] = [];
+  const seenKeys = new Set<string>();
+  const seenIds = new Set<string>();
+
+  candidates.forEach((value, index) => {
+    const item = value && typeof value === 'object'
+      ? value as Record<string, unknown>
+      : { id: value };
+    const id = String(item.id || '').trim();
+    if (!id) return;
+    const fallback = DEFAULT_CODEX_EFFORT_OPTIONS.find((option) => option.id === id);
+    const explicitKey = String(item.key || '').trim();
+    const key = explicitKey || fallback?.key || `custom:${id || index}`;
+    if (seenKeys.has(key) || seenIds.has(id)) return;
+    options.push({
+      key,
+      id,
+      label: String(item.label || fallback?.label || id).trim() || id,
+    });
+    seenKeys.add(key);
+    seenIds.add(id);
+  });
+
+  return options.length > 0
+    ? options
+    : DEFAULT_CODEX_EFFORT_OPTIONS.map((option) => ({ ...option }));
 };
 
 export const resolveCodexEffortForModel = (

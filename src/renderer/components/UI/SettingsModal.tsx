@@ -15,15 +15,19 @@ import {
   claudeEffortsForModel,
   claudeSupportedEffortsForModel,
   DEFAULT_CLAUDE_CODE_SETTINGS,
+  DEFAULT_CLAUDE_EFFORT_OPTIONS,
   resolveClaudeEffortForModel,
+  type ClaudeEffortOption,
   type ClaudeCodeModelOption,
 } from '../../constants/claudeLevels';
 import {
-  CODEX_EFFORT_LEVELS,
   codexSupportedEffortsForModel,
   DEFAULT_CODEX_SETTINGS,
+  DEFAULT_CODEX_EFFORT_OPTIONS,
+  DEFAULT_CODEX_MODEL_OPTIONS,
   mergeCodexModelOptions,
   resolveCodexPersistentEffortForModel,
+  type CodexEffortOption,
   type CodexModelOption,
 } from '../../constants/codexSettings';
 import {
@@ -297,10 +301,12 @@ function ModelSettingsColumnHeader({
   title,
   accent,
   onAdd,
+  addTitle,
 }: {
   title: string;
   accent: string;
   onAdd: () => void;
+  addTitle?: string;
 }) {
   return (
     <div style={{
@@ -316,7 +322,7 @@ function ModelSettingsColumnHeader({
       <button
         type="button"
         onClick={onAdd}
-        title={`Добавить модель ${title}`}
+        title={addTitle || `Добавить модель ${title}`}
         style={{
           display: 'inline-flex', alignItems: 'center', gap: 4,
           height: 23, padding: '0 7px', borderRadius: 6,
@@ -331,17 +337,17 @@ function ModelSettingsColumnHeader({
   );
 }
 
-function compactEffortLabel(level: string): string {
-  if (level === 'medium') return 'med';
-  if (level === 'xhigh') return 'xhi';
-  if (level === 'ultracode') return 'ultra';
-  return level;
+function compactEffortLabel(label: string): string {
+  if (label === 'medium') return 'med';
+  if (label === 'xhigh') return 'xhi';
+  if (label === 'ultracode') return 'ultra';
+  return label;
 }
 
 type ModelSettingsTreeRowProps = {
   accent: string;
   model: Pick<ClaudeCodeModelOption, 'id' | 'label' | 'efforts' | 'supportedEfforts' | 'visible'>;
-  effortOptions: readonly string[];
+  effortOptions: readonly { key: string; id: string; label: string }[];
   onVisibleChange: (visible: boolean) => void;
   onLabelCommit: (label: string) => void;
   onCommandCommit: (command: string) => void;
@@ -364,6 +370,12 @@ function ModelSettingsTreeRow({
 }: ModelSettingsTreeRowProps) {
   const selectedEfforts = (model.efforts || []).filter(Boolean);
   const [deleteHovered, setDeleteHovered] = useState(false);
+  const [label, setLabel] = useState(model.label);
+  const [command, setCommand] = useState(model.id);
+
+  useEffect(() => setLabel(model.label), [model.label]);
+  useEffect(() => setCommand(model.id), [model.id]);
+
   return (
     <div style={{ padding: '5px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.055)' }}>
       <div style={{ display: 'grid', gridTemplateColumns: '20px minmax(74px, 0.62fr) minmax(130px, 1fr) 24px', gap: 6, alignItems: 'center' }}>
@@ -376,16 +388,18 @@ function ModelSettingsTreeRow({
           style={{ width: 14, height: 14, margin: '0 auto', accentColor: accent, cursor: 'pointer' }}
         />
         <input
-          defaultValue={model.label}
-          onBlur={(event) => onLabelCommit(event.currentTarget.value)}
+          value={label}
+          onChange={(event) => setLabel(event.currentTarget.value)}
+          onBlur={() => onLabelCommit(label)}
           onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }}
           aria-label={`Название модели ${model.label}`}
           style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px' }}
           title="Название в интерфейсе"
         />
         <input
-          defaultValue={model.id}
-          onBlur={(event) => onCommandCommit(event.currentTarget.value)}
+          value={command}
+          onChange={(event) => setCommand(event.currentTarget.value)}
+          onBlur={() => onCommandCommit(command)}
           onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }}
           aria-label={`Команда модели ${model.label}`}
           style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
@@ -424,12 +438,12 @@ function ModelSettingsTreeRow({
         <div style={{ minWidth: 0, display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '3px 5px', minHeight: 23 }}>
           <span style={{ color: '#6d6d72', fontSize: 10, marginRight: 1, whiteSpace: 'nowrap' }}>effort</span>
           {effortOptions.map((effort) => {
-            const selected = selectedEfforts.includes(effort);
+            const selected = selectedEfforts.includes(effort.id);
             const isLastSelected = selected && selectedEfforts.length <= 1;
             return (
               <label
-                key={effort}
-                title={isLastSelected ? 'Хотя бы один уровень должен оставаться доступным' : `Разрешить ${effort} для ${model.label}`}
+                key={effort.key}
+                title={isLastSelected ? 'Хотя бы один уровень должен оставаться доступным' : `Разрешить ${effort.label} для ${model.label}`}
                 style={{
                   display: 'inline-flex', alignItems: 'center', gap: 3,
                   height: 20, padding: 0,
@@ -446,16 +460,96 @@ function ModelSettingsTreeRow({
                   type="checkbox"
                   checked={selected}
                   disabled={isLastSelected}
-                  onChange={(event) => onEffortChange(effort, event.currentTarget.checked)}
-                  aria-label={`Разрешить ${effort} для ${model.label}`}
+                  onChange={(event) => onEffortChange(effort.id, event.currentTarget.checked)}
+                  aria-label={`Разрешить ${effort.label} для ${model.label}`}
                   style={{ width: 11, height: 11, margin: 0, accentColor: accent, cursor: isLastSelected ? 'not-allowed' : 'pointer' }}
                 />
-                {compactEffortLabel(effort)}
+                {compactEffortLabel(effort.label)}
               </label>
             );
           })}
         </div>
         <span aria-hidden />
+      </div>
+    </div>
+  );
+}
+
+type EffortSettingsTreeRowProps = {
+  option: { key: string; id: string; label: string };
+  provider: string;
+  onLabelCommit: (label: string) => void;
+  onCommandCommit: (command: string) => void;
+  onDelete: () => void;
+  commandReadOnly?: boolean;
+};
+
+/** Catalog rows own the reusable effort values; model-row checkboxes only opt in. */
+function EffortSettingsTreeRow({
+  option,
+  provider,
+  onLabelCommit,
+  onCommandCommit,
+  onDelete,
+  commandReadOnly = false,
+}: EffortSettingsTreeRowProps) {
+  const [label, setLabel] = useState(option.label);
+  const [command, setCommand] = useState(option.id);
+  const [deleteHovered, setDeleteHovered] = useState(false);
+
+  useEffect(() => setLabel(option.label), [option.label]);
+  useEffect(() => setCommand(option.id), [option.id]);
+
+  return (
+    <div style={{ padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,0.055)' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '20px minmax(74px, 0.62fr) minmax(130px, 1fr) 24px', gap: 6, alignItems: 'center' }}>
+        <div aria-hidden />
+        <input
+          value={label}
+          onChange={(event) => setLabel(event.currentTarget.value)}
+          onBlur={() => onLabelCommit(label)}
+          onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }}
+          aria-label={`Название effort ${option.label} для ${provider}`}
+          title="Название в интерфейсе"
+          style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px' }}
+        />
+        <input
+          value={command}
+          readOnly={commandReadOnly}
+          onChange={(event) => setCommand(event.currentTarget.value)}
+          onBlur={() => onCommandCommit(command)}
+          onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }}
+          aria-label={`Команда effort ${option.label} для ${provider}`}
+          title={commandReadOnly
+            ? 'Значение подтверждается live-каталогом Codex; новое значение добавьте отдельной строкой'
+            : 'Значение, которое приложение отправляет агенту'}
+          style={{
+            ...vrFieldStyle,
+            height: 28,
+            fontSize: 11.5,
+            padding: '5px 7px',
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            opacity: commandReadOnly ? 0.58 : 1,
+            cursor: commandReadOnly ? 'not-allowed' : 'text',
+          }}
+        />
+        <button
+          type="button"
+          onClick={onDelete}
+          onMouseEnter={() => setDeleteHovered(true)}
+          onMouseLeave={() => setDeleteHovered(false)}
+          aria-label={`Удалить effort ${option.label} для ${provider}`}
+          title={`Удалить ${option.label}`}
+          style={{
+            width: 24, height: 24, padding: 0, border: 'none', borderRadius: 6,
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            background: deleteHovered ? 'rgba(239,68,68,0.18)' : 'transparent',
+            color: deleteHovered ? '#ff6262' : '#6d3438', cursor: 'pointer',
+            transition: 'background 120ms ease, color 120ms ease',
+          }}
+        >
+          <Trash2 size={13} strokeWidth={1.8} />
+        </button>
       </div>
     </div>
   );
@@ -1427,12 +1521,57 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setSemanticAutoIndexIterations = useUIStore((s) => s.setSemanticAutoIndexIterations);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
   const setClaudeCodeSettings = useUIStore((s) => s.setClaudeCodeSettings);
+  const defaultClaudeEffort = useUIStore((s) => s.defaultClaudeEffort);
+  const setDefaultClaudeEffort = useUIStore((s) => s.setDefaultClaudeEffort);
   const codexSettings = useUIStore((s) => s.codexSettings);
   const setCodexSettings = useUIStore((s) => s.setCodexSettings);
+  const defaultCodexEffort = useUIStore((s) => s.defaultCodexEffort);
+  const setDefaultCodexEffort = useUIStore((s) => s.setDefaultCodexEffort);
   const [liveCodexModels, setLiveCodexModels] = useState<CodexModelOption[]>([]);
   const codexModelsForSettings = useMemo(
     () => mergeCodexModelOptions(liveCodexModels, codexSettings.models, codexSettings.removedModelIds),
     [liveCodexModels, codexSettings.models, codexSettings.removedModelIds],
+  );
+  const claudeEffortOptions = useMemo<ClaudeEffortOption[]>(
+    () => claudeCodeSettings.effortOptions?.length
+      ? claudeCodeSettings.effortOptions
+      : DEFAULT_CLAUDE_EFFORT_OPTIONS,
+    [claudeCodeSettings.effortOptions],
+  );
+  const codexEffortOptions = useMemo<CodexEffortOption[]>(
+    () => codexSettings.effortOptions?.length
+      ? codexSettings.effortOptions
+      : DEFAULT_CODEX_EFFORT_OPTIONS,
+    [codexSettings.effortOptions],
+  );
+  const knownCodexModelIds = useMemo(
+    () => new Set([
+      ...DEFAULT_CODEX_MODEL_OPTIONS.map((model) => model.id),
+      ...liveCodexModels.map((model) => model.id),
+    ]),
+    [liveCodexModels],
+  );
+  const claudeEffortOptionsForModel = (model: ClaudeCodeModelOption) => {
+    const supported = new Set(claudeSupportedEffortsForModel(model));
+    return claudeEffortOptions.filter((option) => (
+      supported.has(option.id)
+      || !CLAUDE_EFFORT_LEVELS.some((level) => level === option.id)
+    ));
+  };
+  const codexEffortOptionsForModel = (model: CodexModelOption) => {
+    const supported = new Set(codexSupportedEffortsForModel(model));
+    return codexEffortOptions.filter((option) => (
+      !knownCodexModelIds.has(model.id) || supported.has(option.id)
+    ));
+  };
+  const codexEffortCommandIsLiveBound = (option: CodexEffortOption) => (
+    codexModelsForSettings.some((model) => (
+      knownCodexModelIds.has(model.id)
+      && codexSupportedEffortsForModel(model).includes(option.id)
+    ))
+  );
+  const effortLabel = (options: readonly { id: string; label: string }[], effort: string) => (
+    options.find((option) => option.id === effort)?.label || effort
   );
   const quickClaudeModel = claudeCodeSettings.models.find((model) => model.id === claudeCodeSettings.quickModel);
   const quickClaudeEfforts = quickClaudeModel ? claudeEffortsForModel(quickClaudeModel) : [];
@@ -1497,7 +1636,13 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [textInsertCopied, setTextInsertCopied] = useState(false);
   const [textInsertCopying, setTextInsertCopying] = useState(false);
   const textInsertCopiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const closeSettings = useCallback(() => onClose(), [onClose]);
+  // Escape/backdrop-close does not always move focus through a button first.
+  // Commit the currently edited model/effort field before its row unmounts.
+  const closeSettings = useCallback(() => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) active.blur();
+    onClose();
+  }, [onClose]);
 
   // Local copies of AI prompt fields for editing
   const [localPromptContent, setLocalPromptContent] = useState('');
@@ -3037,6 +3182,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [closeSettings, isOpen]);
 
+  const replaceEffortId = (efforts: readonly string[] | undefined, from: string, to: string) => (
+    Array.from(new Set((efforts || []).map((effort) => (effort === from ? to : effort))))
+  );
+
   const commitClaudeCodeModel = (index: number, patch: Partial<ClaudeCodeModelOption>) => {
     const current = claudeCodeSettings.models[index];
     if (!current) return;
@@ -3052,13 +3201,96 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setClaudeCodeModelEffort = (index: number, effort: string, selected: boolean) => {
     const model = claudeCodeSettings.models[index];
     if (!model) return;
-    const current = model.efforts || [];
-    const next = selected
-      ? [...current, effort]
-      : current.filter((level) => level !== effort);
-    const efforts = claudeSupportedEffortsForModel(model).filter((level) => next.includes(level));
+    const selectedEfforts = new Set(model.efforts || []);
+    const supportedEfforts = new Set(claudeSupportedEffortsForModel(model));
+    if (selected) {
+      selectedEfforts.add(effort);
+      // Built-in incompatibilities (such as Haiku max) are never rendered as
+      // checkbox choices. A user-added catalog value is intentionally opt-in.
+      supportedEfforts.add(effort);
+    } else {
+      selectedEfforts.delete(effort);
+    }
+    const catalogIds = claudeEffortOptions.map((option) => option.id);
+    const efforts = catalogIds.filter((id) => supportedEfforts.has(id) && selectedEfforts.has(id));
     if (efforts.length === 0) return;
-    commitClaudeCodeModel(index, { efforts });
+    commitClaudeCodeModel(index, {
+      efforts,
+      supportedEfforts: catalogIds.filter((id) => supportedEfforts.has(id)),
+    });
+  };
+
+  const commitClaudeEffort = (key: string, patch: Partial<ClaudeEffortOption>) => {
+    const current = claudeEffortOptions.find((option) => option.key === key);
+    if (!current) return;
+    const nextId = patch.id === undefined ? current.id : patch.id.trim();
+    if (!nextId) {
+      showToast('У effort должно быть значение команды', 'warning');
+      return;
+    }
+    if (nextId !== current.id && claudeEffortOptions.some((option) => option.key !== key && option.id === nextId)) {
+      showToast('Такое значение effort уже есть у Claude Code', 'warning');
+      return;
+    }
+    const effortOptions = claudeEffortOptions.map((option) => (
+      option.key === key
+        ? { ...option, ...patch, id: nextId, label: patch.label === undefined ? option.label : patch.label.trim() || nextId }
+        : option
+    ));
+    const renamed = nextId !== current.id;
+    const models = renamed
+      ? claudeCodeSettings.models.map((model) => ({
+        ...model,
+        efforts: replaceEffortId(model.efforts, current.id, nextId),
+        supportedEfforts: replaceEffortId(model.supportedEfforts, current.id, nextId),
+      }))
+      : claudeCodeSettings.models;
+    const quickEffort = renamed && claudeCodeSettings.quickEffort === current.id
+      ? nextId
+      : claudeCodeSettings.quickEffort;
+    setClaudeCodeSettings({ ...claudeCodeSettings, effortOptions, models, quickEffort });
+    if (renamed && defaultClaudeEffort === current.id) setDefaultClaudeEffort(nextId);
+  };
+
+  const addClaudeEffort = () => {
+    const serial = claudeEffortOptions.length + 1;
+    let id = `custom-claude-effort-${serial}`;
+    while (claudeEffortOptions.some((option) => option.id === id)) {
+      id = `custom-claude-effort-${Date.now().toString(36)}-${serial}`;
+    }
+    setClaudeCodeSettings({
+      ...claudeCodeSettings,
+      effortOptions: [...claudeEffortOptions, {
+        key: `custom:${Date.now().toString(36)}:${serial}`,
+        id,
+        label: 'Новый effort',
+      }],
+    });
+  };
+
+  const deleteClaudeEffort = (key: string) => {
+    const target = claudeEffortOptions.find((option) => option.key === key);
+    if (!target) return;
+    const lastSelectedFor = claudeCodeSettings.models.find((model) => (
+      (model.efforts || []).includes(target.id)
+      && (model.efforts || []).filter((effort) => effort !== target.id).length === 0
+    ));
+    if (lastSelectedFor) {
+      showToast(`Нельзя удалить ${target.label}: у ${lastSelectedFor.label} должен остаться хотя бы один effort`, 'warning');
+      return;
+    }
+    const effortOptions = claudeEffortOptions.filter((option) => option.key !== key);
+    const models = claudeCodeSettings.models.map((model) => ({
+      ...model,
+      efforts: (model.efforts || []).filter((effort) => effort !== target.id),
+      supportedEfforts: (model.supportedEfforts || []).filter((effort) => effort !== target.id),
+    }));
+    setClaudeCodeSettings({
+      ...claudeCodeSettings,
+      effortOptions,
+      models,
+      quickEffort: claudeCodeSettings.quickEffort === target.id ? null : claudeCodeSettings.quickEffort,
+    });
   };
 
   const addClaudeCodeModel = () => {
@@ -3067,7 +3299,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     while (claudeCodeSettings.models.some((model) => model.id === id)) {
       id = `custom-claude-${Date.now().toString(36)}-${serial}`;
     }
-    const supportedEfforts = [...CLAUDE_EFFORT_LEVELS];
+    const supportedEfforts = claudeEffortOptions.map((option) => option.id);
     setClaudeCodeSettings({
       ...claudeCodeSettings,
       models: [...claudeCodeSettings.models, {
@@ -3112,16 +3344,27 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setClaudeCodeSettings({ ...claudeCodeSettings, quickEffort });
   };
 
-  const commitCodexModel = (modelId: string, patch: { id?: string; label?: string; efforts?: string[]; visible?: boolean }) => {
+  const commitCodexModel = (modelId: string, patch: {
+    id?: string;
+    label?: string;
+    efforts?: string[];
+    supportedEfforts?: string[];
+    visible?: boolean;
+  }) => {
     const current = codexModelsForSettings.find((model) => model.id === modelId);
     if (!current) return;
     const nextId = patch.id === undefined ? modelId : patch.id.trim();
     if (!nextId || (nextId !== modelId && codexModelsForSettings.some((model) => model.id === nextId))) return;
     const models = codexModelsForSettings.map((model) => {
       if (model.id !== modelId) return model;
-      if (patch.efforts === undefined) return { ...model, ...patch, id: nextId };
-      const supportedEfforts = codexSupportedEffortsForModel(model);
-      const efforts = supportedEfforts.filter((effort) => patch.efforts?.includes(effort));
+      if (patch.efforts === undefined && patch.supportedEfforts === undefined) return { ...model, ...patch, id: nextId };
+      const supportedEfforts = (patch.supportedEfforts || codexSupportedEffortsForModel(model))
+        .filter((effort, index, efforts) => (
+          codexEffortOptions.some((option) => option.id === effort)
+          && efforts.indexOf(effort) === index
+        ));
+      const requestedEfforts = patch.efforts || model.efforts || [];
+      const efforts = supportedEfforts.filter((effort) => requestedEfforts.includes(effort));
       const defaultEffort = efforts.includes(model.defaultEffort || '')
         ? model.defaultEffort
         : (efforts[0] || model.defaultEffort);
@@ -3145,13 +3388,94 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setCodexModelEffort = (modelId: string, effort: string, selected: boolean) => {
     const model = codexModelsForSettings.find((candidate) => candidate.id === modelId);
     if (!model) return;
-    const current = model.efforts || [];
-    const next = selected
-      ? [...current, effort]
-      : current.filter((level) => level !== effort);
-    const efforts = codexSupportedEffortsForModel(model).filter((level) => next.includes(level));
+    const selectedEfforts = new Set(model.efforts || []);
+    const supportedEfforts = new Set(codexSupportedEffortsForModel(model));
+    if (selected) {
+      selectedEfforts.add(effort);
+      if (!knownCodexModelIds.has(model.id)) supportedEfforts.add(effort);
+    } else {
+      selectedEfforts.delete(effort);
+    }
+    const catalogIds = codexEffortOptions.map((option) => option.id);
+    const efforts = catalogIds.filter((id) => supportedEfforts.has(id) && selectedEfforts.has(id));
     if (efforts.length === 0) return;
-    commitCodexModel(modelId, { efforts });
+    commitCodexModel(modelId, {
+      efforts,
+      supportedEfforts: catalogIds.filter((id) => supportedEfforts.has(id)),
+    });
+  };
+
+  const commitCodexEffort = (key: string, patch: Partial<CodexEffortOption>) => {
+    const current = codexEffortOptions.find((option) => option.key === key);
+    if (!current) return;
+    const nextId = patch.id === undefined ? current.id : patch.id.trim();
+    if (!nextId) {
+      showToast('У effort должно быть значение команды', 'warning');
+      return;
+    }
+    if (nextId !== current.id && codexEffortOptions.some((option) => option.key !== key && option.id === nextId)) {
+      showToast('Такое значение effort уже есть у Codex', 'warning');
+      return;
+    }
+    const effortOptions = codexEffortOptions.map((option) => (
+      option.key === key
+        ? { ...option, ...patch, id: nextId, label: patch.label === undefined ? option.label : patch.label.trim() || nextId }
+        : option
+    ));
+    const renamed = nextId !== current.id;
+    const models = renamed
+      ? codexModelsForSettings.map((model) => ({
+        ...model,
+        efforts: replaceEffortId(model.efforts, current.id, nextId),
+        supportedEfforts: replaceEffortId(model.supportedEfforts, current.id, nextId),
+      }))
+      : codexModelsForSettings;
+    const quickEffort = renamed && codexSettings.quickEffort === current.id
+      ? nextId
+      : codexSettings.quickEffort;
+    setCodexSettings({ ...codexSettings, effortOptions, models, quickEffort });
+    if (renamed && defaultCodexEffort === current.id) setDefaultCodexEffort(nextId);
+  };
+
+  const addCodexEffort = () => {
+    const serial = codexEffortOptions.length + 1;
+    let id = `custom-codex-effort-${serial}`;
+    while (codexEffortOptions.some((option) => option.id === id)) {
+      id = `custom-codex-effort-${Date.now().toString(36)}-${serial}`;
+    }
+    setCodexSettings({
+      ...codexSettings,
+      effortOptions: [...codexEffortOptions, {
+        key: `custom:${Date.now().toString(36)}:${serial}`,
+        id,
+        label: 'Новый effort',
+      }],
+    });
+  };
+
+  const deleteCodexEffort = (key: string) => {
+    const target = codexEffortOptions.find((option) => option.key === key);
+    if (!target) return;
+    const lastSelectedFor = codexModelsForSettings.find((model) => (
+      (model.efforts || []).includes(target.id)
+      && (model.efforts || []).filter((effort) => effort !== target.id).length === 0
+    ));
+    if (lastSelectedFor) {
+      showToast(`Нельзя удалить ${target.label}: у ${lastSelectedFor.label} должен остаться хотя бы один effort`, 'warning');
+      return;
+    }
+    const effortOptions = codexEffortOptions.filter((option) => option.key !== key);
+    const models = codexModelsForSettings.map((model) => ({
+      ...model,
+      efforts: (model.efforts || []).filter((effort) => effort !== target.id),
+      supportedEfforts: (model.supportedEfforts || []).filter((effort) => effort !== target.id),
+    }));
+    setCodexSettings({
+      ...codexSettings,
+      effortOptions,
+      models,
+      quickEffort: codexSettings.quickEffort === target.id ? null : codexSettings.quickEffort,
+    });
   };
 
   const addCodexModel = () => {
@@ -3160,13 +3484,13 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     while (codexModelsForSettings.some((model) => model.id === id)) {
       id = `custom-codex-${Date.now().toString(36)}-${serial}`;
     }
-    const supportedEfforts = [...CODEX_EFFORT_LEVELS];
+    const supportedEfforts = codexEffortOptions.map((option) => option.id);
     setCodexSettings({
       ...codexSettings,
       models: [...codexModelsForSettings, {
         id,
         label: 'Новая модель',
-        defaultEffort: 'medium',
+        defaultEffort: supportedEfforts.includes('medium') ? 'medium' : supportedEfforts[0],
         efforts: supportedEfforts,
         supportedEfforts,
         visible: true,
@@ -3539,7 +3863,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                           key={model.key || `${index}-${model.id}`}
                           accent="#DA7756"
                           model={model}
-                          effortOptions={claudeSupportedEffortsForModel(model)}
+                          effortOptions={claudeEffortOptionsForModel(model)}
                           onVisibleChange={(visible) => commitClaudeCodeModel(index, { visible })}
                           onLabelCommit={(label) => commitClaudeCodeModel(index, { label })}
                           onCommandCommit={(id) => commitClaudeCodeModel(index, { id })}
@@ -3547,6 +3871,26 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                           onDelete={() => deleteClaudeCodeModel(index)}
                         />
                       ))}
+                    </div>
+                    <div style={{ marginTop: 7 }}>
+                      <ModelSettingsColumnHeader
+                        title="Effort"
+                        accent="#DA7756"
+                        onAdd={addClaudeEffort}
+                        addTitle="Добавить effort для Claude Code"
+                      />
+                      <div style={{ display: 'grid', gap: 1 }}>
+                        {claudeEffortOptions.map((option) => (
+                          <EffortSettingsTreeRow
+                            key={option.key}
+                            option={option}
+                            provider="Claude Code"
+                            onLabelCommit={(label) => commitClaudeEffort(option.key, { label })}
+                            onCommandCommit={(id) => commitClaudeEffort(option.key, { id })}
+                            onDelete={() => deleteClaudeEffort(option.key)}
+                          />
+                        ))}
+                      </div>
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6, marginTop: 10 }}>
                       <span
@@ -3574,7 +3918,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                         title="Уровень усилий для быстрого переключения"
                       >
                         {quickClaudeEfforts.map((effort) => (
-                          <option key={effort} value={effort}>{compactEffortLabel(effort)}</option>
+                          <option key={effort} value={effort}>{compactEffortLabel(effortLabel(claudeEffortOptions, effort))}</option>
                         ))}
                       </select>
                     </div>
@@ -3588,7 +3932,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                           key={model.id}
                           accent="#34D399"
                           model={model}
-                          effortOptions={codexSupportedEffortsForModel(model)}
+                          effortOptions={codexEffortOptionsForModel(model)}
                           onVisibleChange={(visible) => commitCodexModel(model.id, { visible })}
                           onLabelCommit={(label) => commitCodexModel(model.id, { label })}
                           onCommandCommit={(id) => commitCodexModel(model.id, { id })}
@@ -3596,6 +3940,27 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                           onDelete={() => deleteCodexModel(model.id)}
                         />
                       ))}
+                    </div>
+                    <div style={{ marginTop: 7 }}>
+                      <ModelSettingsColumnHeader
+                        title="Effort"
+                        accent="#34D399"
+                        onAdd={addCodexEffort}
+                        addTitle="Добавить effort для Codex"
+                      />
+                      <div style={{ display: 'grid', gap: 1 }}>
+                        {codexEffortOptions.map((option) => (
+                          <EffortSettingsTreeRow
+                            key={option.key}
+                            option={option}
+                            provider="Codex"
+                            commandReadOnly={codexEffortCommandIsLiveBound(option)}
+                            onLabelCommit={(label) => commitCodexEffort(option.key, { label })}
+                            onCommandCommit={(id) => commitCodexEffort(option.key, { id })}
+                            onDelete={() => deleteCodexEffort(option.key)}
+                          />
+                        ))}
+                      </div>
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6, marginTop: 10 }}>
                       <span
@@ -3623,7 +3988,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                         title="Уровень усилий для быстрого переключения"
                       >
                         {quickCodexEfforts.map((effort) => (
-                          <option key={effort} value={effort}>{effort === 'medium' ? 'med' : effort === 'xhigh' ? 'xhi' : effort}</option>
+                          <option key={effort} value={effort}>{compactEffortLabel(effortLabel(codexEffortOptions, effort))}</option>
                         ))}
                       </select>
                     </div>

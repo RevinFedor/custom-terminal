@@ -69,8 +69,22 @@ export interface ClaudeCodeModelOption {
   cmd?: boolean;
 }
 
+/**
+ * A provider-owned effort row. `key` stays stable while its command is edited,
+ * exactly like the stable key on a Claude model row.
+ */
+export interface ClaudeEffortOption {
+  key: string;
+  /** Value passed to `/effort`. */
+  id: string;
+  /** Name shown in settings and pickers. */
+  label: string;
+}
+
 export interface ClaudeCodeSettings {
   models: ClaudeCodeModelOption[];
+  /** Editable Claude Code effort catalog; model checkboxes only select from it. */
+  effortOptions?: ClaudeEffortOption[];
   /** Built-in rows explicitly removed by the user must not be re-added. */
   deletedModelKeys?: string[];
   /** One model/effort pair for the Claude ControlBar quick-switch button. */
@@ -83,6 +97,12 @@ export interface ClaudeCodeSettings {
 const DEFAULT_CLAUDE_EFFORTS = [...CLAUDE_EFFORT_LEVELS];
 const DEFAULT_HAIKU_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 
+export const DEFAULT_CLAUDE_EFFORT_OPTIONS: ClaudeEffortOption[] = CLAUDE_EFFORT_LEVELS.map((id) => ({
+  key: `builtin:${id}`,
+  id,
+  label: id,
+}));
+
 // Claude model name list — same memoization concern, ships from Anthropic.
 // Haiku deliberately stops at xhigh: the current CLI metadata does not expose
 // max for it, and ultracode is not an available choice for that row.
@@ -91,7 +111,7 @@ export const DEFAULT_CLAUDE_CODE_MODELS: ClaudeCodeModelOption[] = [
   { key: 'sonnet', id: 'sonnet', label: 'sonnet', efforts: [...DEFAULT_CLAUDE_EFFORTS], supportedEfforts: [...DEFAULT_CLAUDE_EFFORTS], visible: true, cmd: true },
   { key: 'opus', id: 'opus', label: 'opus', efforts: [...DEFAULT_CLAUDE_EFFORTS], supportedEfforts: [...DEFAULT_CLAUDE_EFFORTS], visible: true, cmd: true },
   { key: 'haiku', id: 'haiku', label: 'haiku', efforts: [...DEFAULT_HAIKU_EFFORTS], supportedEfforts: [...DEFAULT_HAIKU_EFFORTS], visible: true, cmd: true },
-  { key: 'fable', id: 'fable', label: 'fable', efforts: [...DEFAULT_CLAUDE_EFFORTS], supportedEfforts: [...DEFAULT_CLAUDE_EFFORTS], visible: true, cmd: true },
+  { key: 'fable', id: 'claude-fable-5[1m]', label: 'fable', efforts: [...DEFAULT_CLAUDE_EFFORTS], supportedEfforts: [...DEFAULT_CLAUDE_EFFORTS], visible: true, cmd: true },
 ];
 
 export const DEFAULT_CLAUDE_CODE_SETTINGS: ClaudeCodeSettings = {
@@ -100,6 +120,7 @@ export const DEFAULT_CLAUDE_CODE_SETTINGS: ClaudeCodeSettings = {
     efforts: [...(model.efforts || [])],
     supportedEfforts: [...(model.supportedEfforts || [])],
   })),
+  effortOptions: DEFAULT_CLAUDE_EFFORT_OPTIONS.map((option) => ({ ...option })),
   deletedModelKeys: [],
   quickModel: null,
   quickEffort: null,
@@ -109,16 +130,45 @@ const normalizeClaudeEffortValues = (raw: unknown): string[] => (
   Array.isArray(raw)
     ? raw
       .map((value) => String(value || '').trim())
-      .filter((value, index, values) => (
-        CLAUDE_EFFORT_LEVELS.includes(value as ClaudeEffortLevel)
-        && values.indexOf(value) === index
-      ))
+      .filter((value, index, values) => value && values.indexOf(value) === index)
     : []
 );
 
 const normalizeClaudeEffortList = (raw: unknown, fallback: string[]): string[] => {
   const efforts = normalizeClaudeEffortValues(raw);
   return efforts.length > 0 ? efforts : [...fallback];
+};
+
+const normalizeClaudeEffortOptions = (raw: unknown, legacyRaw: unknown): ClaudeEffortOption[] => {
+  const candidates = Array.isArray(raw)
+    ? raw
+    : (Array.isArray(legacyRaw) ? legacyRaw : DEFAULT_CLAUDE_EFFORT_OPTIONS);
+  const options: ClaudeEffortOption[] = [];
+  const seenKeys = new Set<string>();
+  const seenIds = new Set<string>();
+
+  candidates.forEach((value, index) => {
+    const item = value && typeof value === 'object'
+      ? value as Record<string, unknown>
+      : { id: value };
+    const id = String(item.id || '').trim();
+    if (!id) return;
+    const fallback = DEFAULT_CLAUDE_EFFORT_OPTIONS.find((option) => option.id === id);
+    const explicitKey = String(item.key || '').trim();
+    const key = explicitKey || fallback?.key || `custom:${id || index}`;
+    if (seenKeys.has(key) || seenIds.has(id)) return;
+    options.push({
+      key,
+      id,
+      label: String(item.label || fallback?.label || id).trim() || id,
+    });
+    seenKeys.add(key);
+    seenIds.add(id);
+  });
+
+  return options.length > 0
+    ? options
+    : DEFAULT_CLAUDE_EFFORT_OPTIONS.map((option) => ({ ...option }));
 };
 
 const defaultClaudeModelForKey = (key: string | undefined): ClaudeCodeModelOption | undefined => (
@@ -164,12 +214,15 @@ export const claudeSupportedEffortsForModel = (
 
 /**
  * Accept the old global-effort shape and migrate it into per-model rows.
- * A row's stable `key` prevents a command edit (notably Fable → `fable`) from
- * being mistaken for deletion and causing the shipped default to be appended.
+ * Stable keys prevent an edited command from being mistaken for deletion and
+ * causing a shipped default to be appended.
  */
 export const normalizeClaudeCodeSettings = (raw: unknown): ClaudeCodeSettings => {
   const obj = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
-  const legacyEfforts = normalizeClaudeEffortList(obj.efforts, DEFAULT_CLAUDE_EFFORTS);
+  const effortOptions = normalizeClaudeEffortOptions(obj.effortOptions, obj.efforts);
+  const availableEfforts = new Set(effortOptions.map((option) => option.id));
+  const legacyEfforts = normalizeClaudeEffortList(obj.efforts, DEFAULT_CLAUDE_EFFORTS)
+    .filter((effort) => availableEfforts.has(effort));
   const rawModels = Array.isArray(obj.models) ? obj.models : [];
   const deletedModelKeys = normalizeDeletedClaudeModelKeys(obj.deletedModelKeys);
   const deleted = new Set(deletedModelKeys);
@@ -183,16 +236,13 @@ export const normalizeClaudeCodeSettings = (raw: unknown): ClaudeCodeSettings =>
     if (seen.has(key) || deleted.has(key)) return;
 
     const fallback = defaultClaudeModelForKey(key);
-    let id = String(item.id || '').trim();
+    const id = String(item.id || '').trim();
     if (!id) return;
-    // `claude-fable-5[1m]` was a bad shipped command. Keep the stable Fable
-    // row, but migrate its command to the actual alias the user expects.
-    if (key === 'fable' && (id === 'claude-fable-5' || id === 'claude-fable-5[1m]')) id = 'fable';
     const label = String(item.label || fallback?.label || id).trim() || id;
     const supportedEfforts = claudeSupportedEffortsForModel({
       key,
       supportedEfforts: normalizeClaudeEffortValues(item.supportedEfforts),
-    });
+    }).filter((effort) => availableEfforts.has(effort));
     const fallbackEfforts = (fallback?.efforts || DEFAULT_CLAUDE_EFFORTS)
       .filter((effort) => legacyEfforts.includes(effort) && supportedEfforts.includes(effort));
     const requestedEfforts = normalizeClaudeEffortList(
@@ -214,10 +264,13 @@ export const normalizeClaudeCodeSettings = (raw: unknown): ClaudeCodeSettings =>
   for (const fallback of DEFAULT_CLAUDE_CODE_MODELS) {
     const key = fallback.key || fallback.id;
     if (seen.has(key) || deleted.has(key)) continue;
+    const supportedEfforts = (fallback.supportedEfforts || fallback.efforts || DEFAULT_CLAUDE_EFFORTS)
+      .filter((effort) => availableEfforts.has(effort));
     models.push({
       ...fallback,
-      efforts: [...(fallback.efforts || DEFAULT_CLAUDE_EFFORTS)],
-      supportedEfforts: [...(fallback.supportedEfforts || fallback.efforts || DEFAULT_CLAUDE_EFFORTS)],
+      efforts: (fallback.efforts || DEFAULT_CLAUDE_EFFORTS)
+        .filter((effort) => supportedEfforts.includes(effort)),
+      supportedEfforts,
       visible: fallback.visible !== false,
     });
   }
@@ -236,7 +289,7 @@ export const normalizeClaudeCodeSettings = (raw: unknown): ClaudeCodeSettings =>
   const quickEffort = quickModel
     ? resolveClaudeEffortForModel(resolvedModels.find((model) => model.id === quickModel), obj.quickEffort)
     : null;
-  return { models: resolvedModels, deletedModelKeys, quickModel, quickEffort };
+  return { models: resolvedModels, effortOptions, deletedModelKeys, quickModel, quickEffort };
 };
 
 export const claudeEffortsForModel = (

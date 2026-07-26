@@ -62,64 +62,46 @@ Noted Terminal запускает настоящие локальные AI CLI �
 
 ## API surfaces
 
-### 1. Terminal MCP — управлять живыми вкладками
+### 1. Terminal MCP — единая AI-поверхность
 
-Для внешнего AI это основной путь: он не пишет bytes в PTY напрямую, а вызывает готовые tools.
+Для внешнего AI это основной путь: один MCP управляет живыми вкладками, долговечной делегацией, метаданными вкладки и структурной историей. Внутри приложения live/history/edit остаются разными границами безопасности, но агенту не нужно выбирать между двумя MCP.
 
 | Tool | Что делает |
 |---|---|
+| `current_context` | возвращает собственные project/tab/session id без догадок по активной вкладке |
 | `list_projects` | показывает открытые проекты Noted Terminal |
 | `list_tabs` | показывает вкладки, live PID, commandType, sessionId |
 | `create_tab` | создаёт terminal/AI вкладку |
 | `start_ai` | запускает или resume'ит Claude/Codex через native launch hooks |
 | `send_prompt` | доставляет prompt в live AI TUI через TUI-safe paste |
 | `stop_ai` | останавливает AI process, не уничтожая shell tab |
+| `delegate_to_session` | создаёт долговечный orchestration run: доставка, отслеживание и уведомление о завершении |
+| `get_delegation_result` | один раз читает готовый структурный ответ после уведомления |
+| `rename_tab` / `get_tab_plan` / `apply_tab_plan_changes` | управляет именем и структурированным планом в левом верхнем углу вкладки |
+| `link_file` | прикрепляет существующий файл к своей или указанной AI-вкладке как visual-child |
+| `list_open_sessions` / `session_stats` / `list_turns` | даёт карту сохранённой Claude/Codex-истории без terminal scrollback |
+| `get_user_prompt` / `get_thinking` / `get_assistant_text` | точечно читает выбранный блок истории |
+| `fork_session` / `propose_edit` / `apply_edit` | безопасно форкает и редактирует Claude history; Codex остаётся read-only |
 | `run_command` / `restart_process` / `kill_process` | управляет обычными shell/dev-server вкладками |
 | `read_output` | читает хвост terminal output как fallback |
 
 Где смотреть:
 
 - MCP wrapper: [mcp/terminal-server.mjs](mcp/terminal-server.mjs)
-- HTTP backend: [src/main/main.js](src/main/main.js) — `startMcpHttpServer()`, routes `/terminal/*`
-- docs: [docs/knowledge/fact-terminal-mcp.md](docs/knowledge/fact-terminal-mcp.md), [docs/knowledge/fact-mcp-routing.md](docs/knowledge/fact-mcp-routing.md)
+- HTTP backend: [src/main/main.js](src/main/main.js) и [src/main/web-server.js](src/main/web-server.js)
+- docs: [docs/knowledge/fact-terminal-mcp.md](docs/knowledge/fact-terminal-mcp.md), [docs/knowledge/fact-session-history.md](docs/knowledge/fact-session-history.md)
 
 Минимальный сценарий для внешнего агента:
 
 ```text
-list_projects
-→ list_tabs { color: "" }
-→ create_tab или start_ai
-→ send_prompt { tabId, prompt }
-→ wait через Overseer busy/status
-→ get_assistant_text / list_turns
+delegate_to_session { projectId, toolType, prompt }
+→ дождаться одного уведомления в исходной вкладке
+→ get_delegation_result { runId }
 ```
 
-### 2. Overseer MCP — читать и редактировать историю
+`send_prompt` остаётся низкоуровневым live-действием и подтверждает только доставку. Для работы на 30 минут и переживания restart нужен `delegate_to_session`: run хранится в приложении и завершается по lifecycle/SSE без polling истории.
 
-Overseer — read/edit API поверх Claude JSONL и Codex rollout. Он нужен, когда важно не "что видно на экране", а что реально записано в транскрипте.
-
-| Tool | Что делает |
-|---|---|
-| `list_open_sessions` | все Claude/Codex сессии во всех открытых проектах |
-| `session_stats` | масштаб сессии без загрузки контента |
-| `list_turns` | карта ходов: previews, размеры блоков, tool names |
-| `get_user_prompt` / `get_thinking` / `get_assistant_text` | точечное чтение нужного блока |
-| `list_notes` | заметки и rewind-маркеры Timeline |
-| `fork_session` | безопасная копия Claude-сессии |
-| `propose_edit` | dry-run edit/delete range |
-| `apply_edit` | реальное Claude edit-range/delete-range через тот же pipeline, что UI |
-
-Где смотреть:
-
-- MCP wrapper: [mcp/overseer-server.mjs](mcp/overseer-server.mjs)
-- HTTP backend: [src/main/main.js](src/main/main.js) — routes `/overseer/*`
-- Claude parser/edit engine: [src/main/ipc/claude-data.js](src/main/ipc/claude-data.js)
-- Codex parser: [src/main/ipc/codex-data.js](src/main/ipc/codex-data.js)
-- docs: [docs/knowledge/fact-overseer-mcp.md](docs/knowledge/fact-overseer-mcp.md), [docs/knowledge/fact-backtrace-jsonl.md](docs/knowledge/fact-backtrace-jsonl.md)
-
-Граница: Codex через Overseer сейчас read-only. У Codex нет Claude `parentUuid` DAG и edit-range модели, поэтому fork/edit/apply для Codex намеренно unsupported.
-
-### 3. Mobile / external REST + SSE API
+### 2. Mobile / external REST + SSE API
 
 Mobile API уже используется web/mobile клиентами и нативным iOS-клиентом. Это не web-зеркало терминала: клиент получает структурные snapshots/history/timeline/events и отправляет команды в тот же backend.
 
@@ -311,10 +293,10 @@ the same Mac server and is not required for local testing.
 
 Claude Code в PTY-табе, Claude SDK-таб, Codex — любой локальный чат, подключённый к MCP, может **прочитать историю** и **отредактировать** любую другую сессию в приложении. Открыл 5 сессий (фича, багфикс, рефакторинг, форк) — спрашиваешь одну из них *«что сейчас делается в остальных и на чём они остановились»*, и получаешь ответ из распарсенных транскриптов, а не из догадок по имени вкладки.
 
-Работает это потому что весь парсинг JSONL обоих агентов экспонирован через HTTP в main process. Два глобальных stdio-MCP — тонкие обёртки над ним:
+Работает это потому что парсинг JSONL обоих агентов и управление PTY экспонированы через внутренние HTTP boundaries main process. Один глобальный stdio-MCP даёт агенту общую точку входа, а права и проверки остаются у соответствующего backend-сценария:
 
 <details open>
-<summary><b>overseer MCP</b> — контроль сессий (чтение + редактирование истории)</summary>
+<summary><b>Terminal MCP: история и редактирование</b></summary>
 
 Гранулярный доступ: агент **сам решает сколько контекста забрать**. Сначала карта сессии (только размеры), потом точечный pull нужных блоков. Сессия 19MB / 262 turn'а → читаемый overview за **~6K токенов** — без затягивания дампа в контекст.
 
@@ -334,22 +316,23 @@ Claude Code в PTY-табе, Claude SDK-таб, Codex — любой локал�
 </details>
 
 <details>
-<summary><b>terminal MCP</b> — контроль вкладок (живые процессы)</summary>
+<summary><b>Terminal MCP: live-сессии и делегирование</b></summary>
 
 | Tool | |
 |------|--|
-| `list_tabs` | вкладки проекта: что запущено, PID, цвет, тип (claude / codex / devServer / shell) |
-| `run_command` · `restart_process` · `kill_process` | управление процессом в табе |
-| `read_output` | хвост вывода терминала |
-| `create_tab` · `run_chain` | создание вкладок, последовательные пайплайны |
-
-Project-scoped (фильтрует по cwd). Управляет **живым** состоянием, не историей.
+| `current_context` | собственные project/tab/session id текущей вкладки |
+| `list_tabs` | вкладки проекта: PID, цвет, тип и session id |
+| `create_tab` · `start_ai` · `send_prompt` · `stop_ai` | низкоуровневое управление живой PTY-сессией |
+| `delegate_to_session` · `get_delegation_result` | долговечная работа с уведомлением вместо polling |
+| `rename_tab` · `get_tab_plan` · `apply_tab_plan_changes` | имя и структурированный план задач вкладки |
+| `link_file` | visual-child файл у AI-вкладки |
+| `run_command` · `restart_process` · `kill_process` | управление shell/dev-server процессом |
 
 </details>
 
-> **Граница чёткая:** terminal MCP — *оператор* (что сейчас крутится, перезапустить/убить), overseer MCP — *историк/редактор* (что сессия сделала, прочитать/переписать). Разный blast radius: terminal может убить dev-сервер, overseer переписать транскрипт. Подключаешь оба, когда нужно и то и другое — конфликта нет, оба ходят в один main-process HTTP.
+> **Граница остаётся строгой внутри приложения:** live-команды не переписывают JSONL, а history edit не управляет процессом. Объединена только обнаруживаемая MCP-поверхность, чтобы агент не выбирал канал по длинной внешней инструкции.
 
-**Типичный flow:** внешнему чату даёшь имя проекта → `list_open_sessions` показывает вкладки → `session_stats` + `list_turns` локализуют где мясо → `get_thinking` на ключевой ход → *«сессия багфикса застряла на 30 итерациях вокруг loader'а, не смогла поднять dev через MCP»*. Захотел почистить → `propose_edit` показывает план, `apply_edit` сжимает диапазон в summary на форке.
+**Типичный flow:** для долгой работы `delegate_to_session` создаёт вкладку/run и сразу возвращает `runId` → приложение само следит за lifecycle и показывает состояние рядом с Run After → после завершения вставляет короткое уведомление в исходный input → агент один раз вызывает `get_delegation_result`. Для исследования существующей истории: `list_open_sessions` → `session_stats` / `list_turns` → точечный `get_thinking` или `get_assistant_text`.
 
 ---
 
@@ -410,10 +393,9 @@ npm run dev                  # dev mode с hot-reload
 npm run build:i              # собирает, копирует в /Applications, запускает
 ```
 
-**MCP-серверы** (overseer / terminal) регистрируются глобально один раз:
+**Terminal MCP** регистрируется глобально один раз:
 
 ```bash
-claude mcp add overseer node "$(pwd)/mcp/overseer-server.mjs" --scope user
 claude mcp add terminal node "$(pwd)/mcp/terminal-server.mjs" --scope user
 ```
 
@@ -467,9 +449,9 @@ claude mcp add terminal node "$(pwd)/mcp/terminal-server.mjs" --scope user
 - Timeline из `event_msg.user_message` + `turn_context` (model/effort) + `token_count` (context% / rate-limits)
 - History из `response_item`: reasoning summary → thinking, message → ответ, `function_call` + output → tool card
 - Compact из top-level `type:"compacted"` с `payload.replacement_history`; `thread_rolled_back` откатывает turn'ы
-- Нет parentUuid-DAG: Overseer читает Codex, но fork/edit через Overseer намеренно не поддерживаются
+- Нет parentUuid-DAG: history-методы Terminal MCP читают Codex, но fork/edit намеренно не поддерживаются
 
-Обе модели отдаются через единый HTTP-слой в main, поверх которого работают Timeline UI, History Panel и overseer MCP.
+Обе модели отдаются через единый HTTP-слой в main, поверх которого работают Timeline UI, History Panel и history-методы Terminal MCP.
 
 </details>
 

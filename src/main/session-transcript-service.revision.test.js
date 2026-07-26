@@ -165,13 +165,7 @@ test('Codex history revision changes when prompt presentation metadata changes',
   let changePresentationDuringValidation = false;
   const codexData = {
     _api: {
-      findCodexSessionFile: async () => {
-        if (changePresentationDuringValidation) {
-          changePresentationDuringValidation = false;
-          presentationRevision = 'presentation-raced';
-        }
-        return { filePath };
-      },
+      findCodexSessionFile: async () => ({ filePath }),
       loadSessionRecords: async () => {
         loadCalls += 1;
         const stat = await fs.promises.stat(filePath);
@@ -196,8 +190,21 @@ test('Codex history revision changes when prompt presentation metadata changes',
       }],
     },
   };
+  // The raced scenario: presentation metadata changes while validation is in
+  // flight. The pre-validation read returns the OLD value, the post-validation
+  // consistency re-read sees the NEW one. (Previously triggered from
+  // findCodexSessionFile; the service now memoizes resolved paths, so the
+  // trigger lives in the store getter — the only hook validation still calls.)
+  let presentationReads = 0;
   const promptPresentationStore = {
-    getHistoryPromptPresentationRevision: () => presentationRevision,
+    getHistoryPromptPresentationRevision: () => {
+      presentationReads += 1;
+      if (changePresentationDuringValidation && presentationReads > 1) {
+        changePresentationDuringValidation = false;
+        presentationRevision = 'presentation-raced';
+      }
+      return presentationRevision;
+    },
     getHistoryPromptPresentations: () => [],
     getHistoryPromptPresentationsForEntries: () => [],
   };
@@ -235,6 +242,7 @@ test('Codex history revision changes when prompt presentation metadata changes',
   assert.notEqual(refreshed.revision.token, first.revision.token);
 
   changePresentationDuringValidation = true;
+  presentationReads = 0;
   const raced = await service.getHistory({
     toolType: 'codex',
     sessionId: 'session-a',

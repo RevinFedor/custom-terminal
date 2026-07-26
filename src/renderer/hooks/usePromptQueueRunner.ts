@@ -8,6 +8,7 @@ import { isWorkflowOutcomeAtOrAfterArm, planWorkflowReconciliation } from '../ut
 import { getHistoryAgentRuntime } from '../utils/historyAgentRuntimes';
 import { getClaudeStartupDefaultsGateSnapshot } from '../utils/claudeStartupDefaultsGate';
 import { serializeComposerDraft } from '../utils/composerChips.mjs';
+import { getFirstDelayRemainingMs, MAX_BROWSER_TIMEOUT_MS } from '../utils/promptQueueDelay';
 import {
   beginHistoryPromptHandoff,
   historyPromptHandoffAuditProofFromSendResult,
@@ -26,6 +27,16 @@ function findProjectIdForTab(tabId: string): string | null {
     if (ws.tabs.has(tabId)) return projId;
   }
   return null;
+}
+
+// Launch cwd contract: the freshest tab cwd (OSC 7 tracked), not project root.
+function getTabCwd(tabId: string): string | undefined {
+  const state = useWorkspaceStore.getState();
+  for (const ws of state.openProjects.values()) {
+    const tab = ws.tabs.get(tabId) as { cwd?: string } | undefined;
+    if (tab) return tab.cwd || undefined;
+  }
+  return undefined;
 }
 
 // True if `tabId` exists in any open project workspace. Used to validate stale
@@ -246,21 +257,20 @@ type DeferredOwnerSend = {
 // result separate from `queueAwaitingBusyStart` (which means Enter was already
 // accepted) and retry exactly once when the owner's TUI becomes input-ready.
 const deferredOwnerSends = new Map<string, DeferredOwnerSend>();
+// Launch-if-needed bookkeeping: one launch initiation per queue head. The
+// runner and direct History Enter share one product operation — "deliver the
+// prompt" — so an inactive owner is started/resumed through the same runtime
+// launch boundary History uses, then the send stays deferred until the
+// authoritative tui-ready retries it. Without this the queue waits forever
+// for a readiness signal nothing will ever produce (the proven Run After
+// entry-point gap).
+const queueOwnerLaunchInitiated = new Map<string, { headId: string; at: number }>();
 const claudeQueueStartupPending = new Set<string>();
 const queueReadinessWakePending = new Map<string, string>();
-const queueOwnerReadinessListeners = new Set<(ownerTabId: string, source: string) => void>();
 let queueSendAttemptSequence = 0;
 
 function signalQueueOwnerReadiness(ownerTabId: string, source: string): void {
   retryDeferredOwnerSend(ownerTabId, source);
-  for (const listener of queueOwnerReadinessListeners) listener(ownerTabId, source);
-}
-
-function subscribeQueueOwnerReadiness(
-  listener: (ownerTabId: string, source: string) => void,
-): () => void {
-  queueOwnerReadinessListeners.add(listener);
-  return () => queueOwnerReadinessListeners.delete(listener);
 }
 
 async function readQueueOwnerReadiness(ownerTabId: string): Promise<{
@@ -305,6 +315,9 @@ async function readQueueOwnerReadiness(ownerTabId: string): Promise<{
 
 function clearDeferredOwnerSend(ownerTabId: string, reason: string): void {
   queueReadinessWakePending.delete(ownerTabId);
+  // Launch bookkeeping follows the deferred intent: once the deferred send is
+  // gone (committed, disarmed, stale) the next queue head may launch again.
+  queueOwnerLaunchInitiated.delete(ownerTabId);
   if (!deferredOwnerSends.delete(ownerTabId)) return;
   console.log('[PromptQueueRunner] deferred owner cleared owner=' + ownerTabId.slice(-8) + ' reason=' + reason);
 }
@@ -427,6 +440,77 @@ function beginValidatedQueueSend(
       return;
     }
     if (!readiness.ready) {
+      // Launch-if-needed: an INACTIVE owner will never emit the readiness
+      // signal this deferred send waits for. Run After is the same product
+      // operation as Enter on a stopped tab, so initiate Start/Resume through
+      // the shared runtime launch boundary and keep the send deferred until
+      // authoritative tui-ready retries it. One initiation per queue head —
+      // a failed/blocked launch must not loop.
+      if (readiness.status === 'inactive') {
+        const initiated = queueOwnerLaunchInitiated.get(ownerTabId);
+        if (initiated?.headId !== head.id) {
+          queueOwnerLaunchInitiated.set(ownerTabId, { headId: head.id, at: Date.now() });
+          const agent = getPromptQueueAgent(ownerTabId);
+          const runtime = getHistoryAgentRuntime(agent);
+          const ownerSessionId = getPromptQueueSessionId(ownerTabId, agent);
+          const ownerCwd = getTabCwd(ownerTabId);
+          console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
+            + ' inactive → LAUNCH_FOR_QUEUE agent=' + agent
+            + ' mode=' + (ownerSessionId ? 'resume' : 'start-fresh')
+            + ' session=' + (ownerSessionId ? ownerSessionId.slice(0, 8) : 'none'));
+          let launchFailure: string | null = null;
+          try {
+            const launch = ownerSessionId
+              ? await runtime.resume({ tabId: ownerTabId, sessionId: ownerSessionId, cwd: ownerCwd })
+              : runtime.startFresh
+                ? await runtime.startFresh({ tabId: ownerTabId, cwd: ownerCwd })
+                : { success: false, error: 'cannot start fresh' };
+            if (launch?.success === false) {
+              launchFailure = String(launch?.error || 'unknown');
+            }
+          } catch (error: any) {
+            launchFailure = String(error?.message || error);
+          }
+          if (launchFailure) {
+            // A refusal can be benign: a concurrent launch (History Enter,
+            // auto-resume) may own the shell right now, in which case the
+            // readiness event WILL arrive and the deferred send must stay.
+            // Re-probe presence and only treat proven-still-inactive as the
+            // terminal outcome; that one follows the DISARM contract —
+            // waiting silently for a readiness signal nothing will produce
+            // is the exact stall this feature closes.
+            const recheck = await readQueueOwnerReadiness(ownerTabId);
+            if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
+              // A newer arm/head owns the queue now; the stale failure must
+              // not disarm it. Its own launch path re-runs from scratch.
+              clearDeferredOwnerAttempt(ownerTabId, attempt, 'launch-failure-became-stale');
+              return;
+            }
+            if (recheck.status === 'inactive') {
+              console.warn('[PromptQueueRunner] ' + label + ' launch-for-queue failed owner=' + ownerTabId.slice(-8)
+                + ' error=' + launchFailure + ' recheck=inactive → DISARM');
+              clearDeferredOwnerAttempt(ownerTabId, attempt, 'launch-for-queue-failed');
+              const store = usePromptQueueStore.getState();
+              store.setAutoRun(ownerTabId, false);
+              store.setStopAfter(ownerTabId, false);
+              useUIStore.getState().showToast(
+                'Run after остановлен: не удалось запустить агента (' + launchFailure + ')',
+                'error',
+                5000,
+                false,
+                undefined,
+                undefined,
+                undefined,
+                ownerTabId,
+              );
+              return;
+            }
+            console.warn('[PromptQueueRunner] ' + label + ' launch-for-queue refused owner=' + ownerTabId.slice(-8)
+              + ' error=' + launchFailure + ' recheck=' + recheck.status
+              + ' → keep deferred (concurrent launch owns readiness)');
+          }
+        }
+      }
       console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
         + ' trigger=' + triggerTabId.slice(-8)
         + ' → WAIT owner readiness status=' + readiness.status
@@ -434,6 +518,7 @@ function beginValidatedQueueSend(
         + ' reason=' + readiness.reason);
       return;
     }
+    queueOwnerLaunchInitiated.delete(ownerTabId);
 
     const validation = await ensureQueuedPromptImagesReady(ownerTabId, head.id);
     if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
@@ -781,6 +866,7 @@ export function usePromptQueueRunner() {
       const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
       const beforePop = countEnabledQueuedPrompts(queue.items);
       if (!queue.autoRun || beforePop === 0) return false;
+      if (queue.firstDelayCountdownAt !== null) return false;
       if (queueSendInflight.has(ownerTabId)) return false;
       if (prevBusyRef.get(ownerTabId) === true) {
         console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8) + ' is busy → wait before firing trigger=' + triggerTabId.slice(-8));
@@ -796,6 +882,7 @@ export function usePromptQueueRunner() {
       if (!canValidateQueueTabs()) return null;
       const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
       if (!queue.autoRun || countEnabledQueuedPrompts(queue.items) === 0) return null;
+      if (queue.firstDelayCountdownAt !== null) return null;
       if (queueAwaitingBusyStart.has(ownerTabId)) return ownerTabId;
       if (queueSendInflight.has(ownerTabId)) return ownerTabId;
       if (prevBusyRef.get(ownerTabId) === true) return null;
@@ -870,7 +957,9 @@ export function usePromptQueueRunner() {
           usePromptQueueStore.getState().cleanupClosedTab(ownerTabId);
           continue;
         }
-        if (!q.autoRun || countEnabledQueuedPrompts(q.items) === 0) continue;
+        if (!q.autoRun
+          || countEnabledQueuedPrompts(q.items) === 0
+          || q.firstDelayCountdownAt !== null) continue;
         if (outcomeTs !== null && !workflowAcceptsNaturalOutcome(q, outcomeTs)) continue;
         // Validate stale target before pivoting — if the picked tab was closed,
         // self-clear and fall through to default own-tab behaviour. This is
@@ -1003,9 +1092,6 @@ export function usePromptQueueRunner() {
 
         if (busy) {
           queueAwaitingBusyStart.delete(tabId);
-          const { clearFirstDelayCountdown } = usePromptQueueStore.getState();
-          const q = usePromptQueueStore.getState().getQueue(tabId);
-          if (q.firstDelayCountdownAt !== null) clearFirstDelayCountdown(tabId);
         }
 
         const compactLocalCommandDone = isSuccessfulCompactLocalCommandEnd(data);
@@ -1044,6 +1130,7 @@ export function usePromptQueueRunner() {
           console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' command=/compact localReason=' + data.localCommandReason + ' → CONTINUE queue after compact');
         }
         processSuccessfulWorkflowOutcome(classifiedData, channel + '-live');
+        signalQueueOwnerReadiness(tabId, channel + '-turn-idle');
       };
 
     const applyCodexTurnStateSnapshot = (tabId: string, state: any, source: string): void => {
@@ -1289,10 +1376,10 @@ export function usePromptQueueRunner() {
     };
   }, []);
 
-  // Cold-start watcher: when ALL three conditions are true and the EFFECTIVE
-  // trigger tab (own tab OR runAfterTabId) is idle, either fire immediately OR
-  // start the firstDelay countdown.
-  //   queue.items.length > 0  AND  queue.autoRun === true  AND  trigger is idle
+  // Cold-start watcher: when queue items + autoRun become true, an own-tab
+  // firstDelay starts immediately from that explicit arm edge. Runtime
+  // readiness is checked only when the delay expires. With zero delay, the
+  // effective trigger still has to be authoritatively idle before firing.
   // Triggered on EITHER of two edges (whichever happens last makes the trio true):
   //   (a) items 0 → N  (user added a prompt; autoRun was already on)
   //   (b) autoRun false → true (user armed; items were already queued)
@@ -1317,14 +1404,19 @@ export function usePromptQueueRunner() {
     };
 
     let firing = false;
-    const fireHead = (ownerTabId: string, triggerTabId: string): boolean => {
+    const fireHead = (
+      ownerTabId: string,
+      triggerTabId: string,
+      options: { deferWhileBusy?: boolean } = {},
+    ): boolean => {
       if (firing) return false;
       firing = true;
       try {
         const q = usePromptQueueStore.getState().getQueue(ownerTabId);
         if (!q.autoRun || countEnabledQueuedPrompts(q.items) === 0) return false;
+        if (q.firstDelayCountdownAt !== null) return false;
         if (queueSendInflight.has(ownerTabId)) return false;
-        if (prevBusyRef.get(ownerTabId) === true) return false;
+        if (prevBusyRef.get(ownerTabId) === true && options.deferWhileBusy !== true) return false;
         const head = q.items.find(isQueuedPromptEnabled);
         if (head) {
           return beginValidatedQueueSend(ownerTabId, triggerTabId, head, 'cold-start');
@@ -1335,155 +1427,53 @@ export function usePromptQueueRunner() {
       }
     };
 
-    type FirstDelayReadinessRequest = {
-      requestId: number;
-      headId: string;
-      workflowArmedAt: number | null;
-    };
-    const firstDelayReadinessPending = new Map<string, FirstDelayReadinessRequest>();
-    const firstDelayReadinessInflight = new Map<string, FirstDelayReadinessRequest>();
-    const firstDelayReadinessWakePending = new Map<string, string>();
-    let firstDelayReadinessSequence = 0;
-
-    const firstDelayRequestIsCurrent = (
-      ownerTabId: string,
-      request: FirstDelayReadinessRequest,
-    ): boolean => {
-      if (firstDelayReadinessPending.get(ownerTabId) !== request) return false;
-      const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
-      const head = queue.items.find(isQueuedPromptEnabled);
-      return queue.autoRun
-        && head?.id === request.headId
-        && queue.workflowArmedAt === request.workflowArmedAt
-        && queue.firstDelayCountdownAt === null
-        && !queueSendInflight.has(ownerTabId)
-        && !queueAwaitingBusyStart.has(ownerTabId)
-        && !deferredOwnerSends.has(ownerTabId)
-        && getEffectiveQueueTrigger(ownerTabId, queue) === ownerTabId;
-    };
-
-    const clearFirstDelayReadiness = (ownerTabId: string, reason: string): void => {
-      firstDelayReadinessWakePending.delete(ownerTabId);
-      if (!firstDelayReadinessPending.delete(ownerTabId)) return;
-      console.log('[PromptQueueRunner] first-delay readiness cleared owner=' + ownerTabId.slice(-8)
-        + ' reason=' + reason);
-    };
-
-    const startFirstDelayAfterReadiness = (
-      ownerTabId: string,
-      request: FirstDelayReadinessRequest,
-    ): void => {
-      if (!firstDelayRequestIsCurrent(ownerTabId, request)) {
-        clearFirstDelayReadiness(ownerTabId, 'ready-became-stale');
-        return;
-      }
-      const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
-      firstDelayReadinessPending.delete(ownerTabId);
-      firstDelayReadinessWakePending.delete(ownerTabId);
-      if (queue.firstDelaySeconds <= 0) {
-        fireHead(ownerTabId, ownerTabId);
+    const scheduleFirstDelayTimer = (ownerTabId: string): void => {
+      const latestQueue = usePromptQueueStore.getState().getQueue(ownerTabId);
+      if (!latestQueue.autoRun
+        || countEnabledQueuedPrompts(latestQueue.items) === 0
+        || latestQueue.firstDelayCountdownAt === null) {
+        usePromptQueueStore.getState().clearFirstDelayCountdown(ownerTabId);
         return;
       }
 
-      const delayMs = queue.firstDelaySeconds * 1000;
-      usePromptQueueStore.getState().startFirstDelayCountdown(ownerTabId);
-      clearTimer(ownerTabId);
+      const remainingMs = getFirstDelayRemainingMs(
+        latestQueue.firstDelaySeconds,
+        latestQueue.firstDelayCountdownAt,
+      );
+      if (remainingMs <= 0) {
+        usePromptQueueStore.getState().consumeFirstDelayCountdown(ownerTabId);
+        // The deadline is authoritative even if the owner is busy or a stale
+        // busy snapshot survived a process stop. The validated send path
+        // re-reads runtime presence and waits/launches without bypassing safety.
+        fireHead(ownerTabId, ownerTabId, { deferWhileBusy: true });
+        return;
+      }
+
+      const sliceMs = Math.min(remainingMs, MAX_BROWSER_TIMEOUT_MS);
       pendingTimers.set(ownerTabId, setTimeout(() => {
         pendingTimers.delete(ownerTabId);
-        const latestQueue = usePromptQueueStore.getState().getQueue(ownerTabId);
-        if (!latestQueue.autoRun
-          || countEnabledQueuedPrompts(latestQueue.items) === 0
-          || latestQueue.firstDelayCountdownAt === null) {
-          usePromptQueueStore.getState().clearFirstDelayCountdown(ownerTabId);
-          return;
-        }
-        usePromptQueueStore.getState().consumeFirstDelayCountdown(ownerTabId);
-        fireHead(ownerTabId, ownerTabId);
-      }, delayMs));
-      console.log('[PromptQueueRunner] first-delay countdown started after readiness owner='
-        + ownerTabId.slice(-8) + ' seconds=' + queue.firstDelaySeconds
-        + ' request=' + request.requestId);
+        scheduleFirstDelayTimer(ownerTabId);
+      }, sliceMs));
     };
 
-    const checkFirstDelayOwnerReadiness = (ownerTabId: string, source: string): boolean => {
-      const request = firstDelayReadinessPending.get(ownerTabId);
-      if (!request) return false;
-      if (firstDelayReadinessInflight.has(ownerTabId)) {
-        firstDelayReadinessWakePending.set(ownerTabId, source);
-        return true;
-      }
-      if (!firstDelayRequestIsCurrent(ownerTabId, request)) {
-        clearFirstDelayReadiness(ownerTabId, 'stale-before-check:' + source);
-        return false;
-      }
-
-      firstDelayReadinessInflight.set(ownerTabId, request);
-      void readQueueOwnerReadiness(ownerTabId).then((readiness) => {
-        if (!firstDelayRequestIsCurrent(ownerTabId, request)) {
-          clearFirstDelayReadiness(ownerTabId, 'stale-after-check:' + source);
-          return;
-        }
-        if (!readiness.ready) {
-          console.log('[PromptQueueRunner] first-delay waits for owner readiness owner='
-            + ownerTabId.slice(-8) + ' status=' + readiness.status
-            + ' inputReady=' + readiness.inputReady + ' source=' + source);
-          return;
-        }
-        startFirstDelayAfterReadiness(ownerTabId, request);
-      }).catch((error: unknown) => {
-        console.warn('[PromptQueueRunner] first-delay readiness check failed owner='
-          + ownerTabId.slice(-8) + ' source=' + source, error);
-      }).finally(() => {
-        if (firstDelayReadinessInflight.get(ownerTabId) === request) {
-          firstDelayReadinessInflight.delete(ownerTabId);
-        }
-        const wakeSource = firstDelayReadinessWakePending.get(ownerTabId) || null;
-        firstDelayReadinessWakePending.delete(ownerTabId);
-        if (wakeSource && firstDelayReadinessPending.has(ownerTabId)) {
-          checkFirstDelayOwnerReadiness(ownerTabId, 'latched:' + wakeSource);
-        }
-      });
-      return true;
-    };
-
-    const waitForFirstDelayOwnerReadiness = (ownerTabId: string, source: string): boolean => {
+    const startFirstDelayCountdown = (ownerTabId: string, source: string): boolean => {
       const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
       const head = queue.items.find(isQueuedPromptEnabled);
       if (!queue.autoRun
         || !head
+        || queue.firstDelaySeconds <= 0
         || queue.firstDelayCountdownAt !== null
         || getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true }) !== ownerTabId) {
-        clearFirstDelayReadiness(ownerTabId, 'invalid-request:' + source);
         return false;
       }
-
-      const existing = firstDelayReadinessPending.get(ownerTabId);
-      const request = existing
-        && existing.headId === head.id
-        && existing.workflowArmedAt === queue.workflowArmedAt
-        ? existing
-        : {
-            requestId: ++firstDelayReadinessSequence,
-            headId: head.id,
-            workflowArmedAt: queue.workflowArmedAt,
-          };
-      firstDelayReadinessPending.set(ownerTabId, request);
-      return checkFirstDelayOwnerReadiness(ownerTabId, source);
+      usePromptQueueStore.getState().startFirstDelayCountdown(ownerTabId);
+      clearTimer(ownerTabId);
+      scheduleFirstDelayTimer(ownerTabId);
+      console.log('[PromptQueueRunner] first-delay countdown started on arm owner='
+        + ownerTabId.slice(-8) + ' seconds=' + queue.firstDelaySeconds
+        + ' source=' + source);
+      return true;
     };
-
-    const pruneFirstDelayReadiness = (): void => {
-      for (const [ownerTabId, request] of firstDelayReadinessPending) {
-        if (!firstDelayRequestIsCurrent(ownerTabId, request)) {
-          clearFirstDelayReadiness(ownerTabId, 'queue-changed');
-        }
-      }
-    };
-
-    const unsubscribeOwnerReadiness = subscribeQueueOwnerReadiness((ownerTabId, source) => {
-      if (firstDelayReadinessPending.has(ownerTabId)) {
-        checkFirstDelayOwnerReadiness(ownerTabId, source);
-      }
-    });
 
     const verifyCodexTriggerIdleThenFire = (ownerTabId: string, triggerTabId: string): boolean => {
       if (getWorkspaceCommandType(triggerTabId) !== 'codex') return false;
@@ -1543,7 +1533,7 @@ export function usePromptQueueRunner() {
 
         if (q2.firstDelayCountdownAt !== null) return;
         if (q2.firstDelaySeconds > 0) {
-          waitForFirstDelayOwnerReadiness(ownerTabId, 'codex-own-cold-start');
+          startFirstDelayCountdown(ownerTabId, 'codex-own-cold-start');
         } else {
           fireHead(ownerTabId, ownerTabId);
         }
@@ -1570,8 +1560,9 @@ export function usePromptQueueRunner() {
         const runtimeArm = hasRuntimeWorkflowArm(tabId);
         if (!prevQ && !runtimeArm) continue;
 
-        // Disarm-while-counting: if autoRun went false OR claude turned busy
-        // while a countdown was running, cancel the pending timer.
+        // Disarm/manual cancellation clears the active timer. Agent busy-state
+        // does not: the countdown is a user-visible deadline that starts when
+        // Run after is armed, while readiness gates only the eventual send.
         if (prevQ && prevQ.firstDelayCountdownAt !== null && q.firstDelayCountdownAt === null) {
           clearTimer(tabId);
         }
@@ -1639,24 +1630,23 @@ export function usePromptQueueRunner() {
           continue;
         }
 
-        // Default own-tab cold-start (unchanged behaviour).
+        if (q.firstDelayCountdownAt !== null) continue;
+        if (q.firstDelaySeconds > 0) {
+          startFirstDelayCountdown(tabId, 'own-arm');
+          continue;
+        }
+
+        // With no first delay, preserve the original cold-start readiness
+        // checks before attempting an immediate send.
         if (verifyCodexTriggerIdleThenFire(tabId, tabId)) continue;
         const isBusy = prevBusyRef.get(tabId) ?? false;
         if (isBusy) continue;
-
-        if (q.firstDelayCountdownAt !== null) continue;
-
-        if (q.firstDelaySeconds > 0) {
-          waitForFirstDelayOwnerReadiness(tabId, 'own-cold-start');
-        } else {
-          fireHead(tabId, tabId);
-        }
+        fireHead(tabId, tabId);
       }
     };
 
     const unsubscribeQueue = usePromptQueueStore.subscribe((state, prevState) => {
       pruneDeferredOwnerSends();
-      pruneFirstDelayReadiness();
       evaluateQueues(state, prevState);
     });
     const unsubscribeReconciliation = subscribeWorkflowRestoreReconciliation(() => {
@@ -1673,12 +1663,8 @@ export function usePromptQueueRunner() {
     return () => {
       unsubscribeQueue();
       unsubscribeReconciliation();
-      unsubscribeOwnerReadiness();
       for (const t of pendingTimers.values()) clearTimeout(t);
       pendingTimers.clear();
-      firstDelayReadinessPending.clear();
-      firstDelayReadinessInflight.clear();
-      firstDelayReadinessWakePending.clear();
     };
   }, []);
 }

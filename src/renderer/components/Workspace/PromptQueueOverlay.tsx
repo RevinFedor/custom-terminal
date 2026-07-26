@@ -22,6 +22,12 @@ import {
   restoreComposerChipToText,
   serializeComposerDraft,
 } from '../../utils/composerChips.mjs';
+import {
+  combineFirstDelayParts,
+  formatFirstDelayCountdown,
+  getFirstDelayRemainingSeconds,
+  splitFirstDelaySeconds,
+} from '../../utils/promptQueueDelay';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { OrchestrationStatusChip } from './OrchestrationStatusChip';
 import ControlHint from '../UI/ControlHint';
@@ -1679,11 +1685,8 @@ export function PromptQueueOverlay({
               waitingTabIds={pendingQueueTabIds}
               panelRef={panelRef}
             />
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4, width: '100%' }}>
+            <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
               <FirstDelayInput tabId={tabId} autoRun={autoRun} />
-              {activeItemCount > 0 && (
-                <span style={{ color: TEXT_DIM, fontSize: 9, userSelect: 'none', flexShrink: 0 }}>·{activeItemCount}</span>
-              )}
             </div>
           </div>
 
@@ -2961,23 +2964,54 @@ export function PromptQueueOverlay({
 
 // ─── FirstDelayInput ────────────────────────────────────────────────────────
 // Replaces the old "Очередь" header text. Two modes driven by store state:
-//   idle      — number input with placeholder "сек", user types desired delay.
+//   idle      — separate hour/minute/second inputs for the pending delay.
 //   counting  — read-only countdown display ticking from N → 0 once per second.
 // When countdown reaches 0 the runner pops + fires (we just stop ticking here).
 // Disarming Run while counting freezes "what's left" back into firstDelaySeconds.
-// Natural fire consumes the delay back to 0, which renders as an empty input.
+// Natural fire consumes the delay back to 0, rendered as 0 ч / 0 м / 0 с.
 type FirstDelayInputProps = { tabId: string; autoRun: boolean };
+type FirstDelayInputParts = { hours: string; minutes: string; seconds: string };
+const FIRST_DELAY_FIELDS: Array<{
+  key: keyof FirstDelayInputParts;
+  unit: string;
+  ariaLabel: string;
+  max?: number;
+}> = [
+  { key: 'hours', unit: 'ч', ariaLabel: 'Часы задержки' },
+  { key: 'minutes', unit: 'м', ariaLabel: 'Минуты задержки', max: 59 },
+  { key: 'seconds', unit: 'с', ariaLabel: 'Секунды задержки', max: 59 },
+];
+
+function firstDelayInputParts(value: number): FirstDelayInputParts {
+  const parts = splitFirstDelaySeconds(value);
+  return {
+    hours: String(parts.hours),
+    minutes: String(parts.minutes),
+    seconds: String(parts.seconds),
+  };
+}
+
+function firstDelayCountdownParts(value: number): FirstDelayInputParts {
+  const parts = splitFirstDelaySeconds(value);
+  return {
+    hours: String(parts.hours),
+    minutes: String(parts.minutes),
+    seconds: String(parts.seconds),
+  };
+}
+
 function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
   const cfg = usePromptQueueStore((s) => s.queues.get(tabId)?.firstDelaySeconds ?? 0);
   const countdownAt = usePromptQueueStore((s) => s.queues.get(tabId)?.firstDelayCountdownAt ?? null);
   const setFirstDelaySeconds = usePromptQueueStore((s) => s.setFirstDelaySeconds);
-  const [text, setText] = useState<string>(cfg === 0 ? '' : String(cfg));
+  const [parts, setParts] = useState<FirstDelayInputParts>(() => firstDelayInputParts(cfg));
+  const skipNextBlurRef = useRef(false);
 
   // External writes (countdown finished, cancel-edit, etc) → mirror into local
   // input only when we're NOT counting (counting mode renders from `remaining`).
   useEffect(() => {
     if (countdownAt !== null) return;
-    setText(cfg === 0 ? '' : String(cfg));
+    setParts(firstDelayInputParts(cfg));
   }, [cfg, countdownAt]);
 
   // Tick once per second while counting. State is fully derivable from store
@@ -2990,83 +3024,192 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
   }, [countdownAt]);
 
   const remaining = countdownAt !== null
-    ? Math.max(0, cfg - Math.floor((Date.now() - countdownAt) / 1000))
+    ? getFirstDelayRemainingSeconds(cfg, countdownAt)
     : null;
 
-  // Counting display — read-only, monochrome to fit the dark panel.
+  // Counting keeps the same three-field geometry as editing. At the hour
+  // boundary the user sees 1:00:00 → 0:59:59 instead of a replacement label.
   if (remaining !== null) {
+    const countdownParts = firstDelayCountdownParts(remaining);
     return (
       <ControlHint label="Осталось до отправки первого сообщения" shortcut="Выключение Run after отменит таймер" side="left">
-      <span
+      <div
+        role="group"
+        aria-label="Обратный отсчёт Run after"
+        data-first-delay-countdown
         style={{
-          width: '100%',           // matches the trigger above (left column)
-          padding: '2px 6px',
-          background: 'transparent',
-          border: `1px solid ${PULSE}`,
-          borderRadius: 4,
-          color: PULSE,
-          fontSize: 11,
-          fontVariantNumeric: 'tabular-nums',
-          textAlign: 'center',
-          userSelect: 'none',
-          boxSizing: 'border-box',
+          display: 'grid',
+          gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+          gap: 2,
+          width: '100%',
+          minWidth: 0,
         }}
-        title="Countdown to first prompt — toggle Run after to cancel"
+        title={`${formatFirstDelayCountdown(remaining)} до отправки первого сообщения`}
       >
-        {remaining}s
-      </span>
+        {FIRST_DELAY_FIELDS.map((field) => (
+          <label
+            key={field.key}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              minWidth: 0,
+              height: 21,
+              background: `${PULSE}12`,
+              border: `1px solid ${PULSE}`,
+              borderRadius: 4,
+              boxSizing: 'border-box',
+              cursor: 'default',
+            }}
+          >
+            <input
+              type="number"
+              className="pq-no-spin"
+              value={countdownParts[field.key]}
+              readOnly
+              tabIndex={-1}
+              aria-label={`${field.ariaLabel}, осталось`}
+              style={{
+                width: '100%',
+                minWidth: 0,
+                padding: '2px 1px 2px 3px',
+                background: 'transparent',
+                border: 'none',
+                color: PULSE,
+                fontSize: 10,
+                fontVariantNumeric: 'tabular-nums',
+                textAlign: 'right',
+                outline: 'none',
+                cursor: 'default',
+                boxSizing: 'border-box',
+              }}
+            />
+            <span
+              aria-hidden="true"
+              style={{
+                flexShrink: 0,
+                paddingRight: 2,
+                color: PULSE,
+                fontSize: 8,
+                userSelect: 'none',
+              }}
+            >
+              {field.unit}
+            </span>
+          </label>
+        ))}
+      </div>
       </ControlHint>
     );
   }
 
-  // Editable input — number, "сек" placeholder, theme-matched dark.
+  // Editable duration — three compact fields, persisted as the existing total
+  // seconds value so old saved queues remain compatible.
   // Disabled while autoRun is on but countdown hasn't started yet (delay=0
   // immediate-fire path) — kept readable, just locked out so the user doesn't
   // race the runner with a mid-arm edit.
   const disabled = autoRun;
+  const resetParts = () => setParts(firstDelayInputParts(cfg));
+  const commitParts = () => {
+    const parsed = {
+      hours: parts.hours.trim() === '' ? 0 : Number(parts.hours),
+      minutes: parts.minutes.trim() === '' ? 0 : Number(parts.minutes),
+      seconds: parts.seconds.trim() === '' ? 0 : Number(parts.seconds),
+    };
+    if (Object.values(parsed).some((value) => !Number.isFinite(value) || value < 0)) {
+      resetParts();
+      return;
+    }
+    const total = combineFirstDelayParts(parsed.hours, parsed.minutes, parsed.seconds);
+    setFirstDelaySeconds(tabId, total);
+    setParts(firstDelayInputParts(total));
+  };
   return (
-    <ControlHint label="Задержка перед первым сообщением очереди" shortcut="0–3600 секунд" side="left">
-    <input
-      type="number"
-      className="pq-no-spin"
-      min={0}
-      max={3600}
-      value={text}
-      placeholder="сек"
-      disabled={disabled}
-      onChange={(e) => setText(e.target.value)}
-      onBlur={() => {
-        const n = Number(text);
-        if (!Number.isFinite(n) || n < 0) {
-          setText(cfg === 0 ? '' : String(cfg));
-          return;
-        }
-        const clamped = Math.max(0, Math.min(3600, Math.floor(n)));
-        setFirstDelaySeconds(tabId, clamped);
-        setText(clamped === 0 ? '' : String(clamped));
-      }}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-        if (e.key === 'Escape') {
-          setText(cfg === 0 ? '' : String(cfg));
-          (e.target as HTMLInputElement).blur();
-        }
-      }}
+    <ControlHint label="Задержка перед первым сообщением очереди" shortcut="часы · минуты · секунды" side="left">
+    <div
+      role="group"
+      aria-label="Задержка Run after"
       style={{
-        width: '100%',             // matches the trigger above (left column)
-        padding: '2px 6px',
-        background: '#1a1a1a',
-        border: `1px solid ${BORDER}`,
-        borderRadius: 4,
-        color: disabled ? TEXT_DIM : '#ddd',
-        fontSize: 11,
-        fontVariantNumeric: 'tabular-nums',
-        textAlign: 'center',
-        outline: 'none',
-        cursor: disabled ? 'not-allowed' : 'text',
-        boxSizing: 'border-box',
+        display: 'grid',
+        gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+        gap: 2,
+        width: '100%',
+        minWidth: 0,
       }}
-    />
+    >
+      {FIRST_DELAY_FIELDS.map((field) => (
+        <label
+          key={field.key}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            minWidth: 0,
+            height: 21,
+            background: '#1a1a1a',
+            border: `1px solid ${BORDER}`,
+            borderRadius: 4,
+            boxSizing: 'border-box',
+            cursor: disabled ? 'not-allowed' : 'text',
+          }}
+        >
+          <input
+            type="number"
+            className="pq-no-spin"
+            min={0}
+            max={field.max}
+            step={1}
+            inputMode="numeric"
+            aria-label={field.ariaLabel}
+            value={parts[field.key]}
+            disabled={disabled}
+            onChange={(event) => {
+              setParts((current) => ({ ...current, [field.key]: event.target.value }));
+            }}
+            onBlur={() => {
+              if (skipNextBlurRef.current) {
+                skipNextBlurRef.current = false;
+                return;
+              }
+              commitParts();
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') (event.target as HTMLInputElement).blur();
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                skipNextBlurRef.current = true;
+                resetParts();
+                (event.target as HTMLInputElement).blur();
+              }
+            }}
+            style={{
+              width: '100%',
+              minWidth: 0,
+              padding: '2px 1px 2px 3px',
+              background: 'transparent',
+              border: 'none',
+              color: disabled ? TEXT_DIM : '#ddd',
+              fontSize: 10,
+              fontVariantNumeric: 'tabular-nums',
+              textAlign: 'right',
+              outline: 'none',
+              cursor: disabled ? 'not-allowed' : 'text',
+              boxSizing: 'border-box',
+            }}
+          />
+          <span
+            aria-hidden="true"
+            style={{
+              flexShrink: 0,
+              paddingRight: 2,
+              color: disabled ? TEXT_DIM : TEXT_MUTED,
+              fontSize: 8,
+              userSelect: 'none',
+            }}
+          >
+            {field.unit}
+          </span>
+        </label>
+      ))}
+    </div>
     </ControlHint>
   );
 }

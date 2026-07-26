@@ -9,7 +9,9 @@ const path = require('node:path');
 const {
   captureClaudePromptAuditBoundary,
   classifyClaudeAuditRecordAfterBoundary,
+  readClaudeUserRecords,
   readLastClaudeUserRecord,
+  selectClaudePendingPromptAudit,
 } = require('./claude-prompt-audit');
 
 function userRecord(uuid, text, timestamp = '2026-07-24T10:00:00.000Z') {
@@ -120,4 +122,91 @@ test('large JSONL prefixes and partial appended lines use bounded tail/offset re
     causal: true,
     reason: 'record-after-byte-boundary',
   });
+});
+
+function sha16(text) {
+  return require('node:crypto').createHash('sha1').update(String(text || '')).digest('hex').slice(0, 16);
+}
+
+function makeAudit(text, boundary, extra = {}) {
+  return {
+    expectedLen: text.length,
+    expectedHash: sha16(text),
+    preSubmitBoundary: boundary,
+    finished: false,
+    sentAt: Date.now(),
+    ...extra,
+  };
+}
+
+test('two same-text audits are confirmed by two causal records, not one', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-audit-multi-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const transcriptPath = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(transcriptPath, '');
+
+  const boundaryA = await captureClaudePromptAuditBoundary(transcriptPath);
+  fs.appendFileSync(transcriptPath, JSON.stringify(userRecord('uuid-a', 'same prompt')) + '\n');
+  const boundaryB = await captureClaudePromptAuditBoundary(transcriptPath);
+  fs.appendFileSync(transcriptPath, JSON.stringify(userRecord('uuid-b', 'same prompt')) + '\n');
+
+  const auditA = makeAudit('same prompt', boundaryA, { handoffId: 'A' });
+  const auditB = makeAudit('same prompt', boundaryB, { handoffId: 'B' });
+  const candidates = await readClaudeUserRecords(transcriptPath, boundaryA);
+  assert.equal(candidates.length, 2);
+
+  const claimed = new Set();
+  const first = selectClaudePendingPromptAudit([auditA, auditB], candidates, {
+    hashText: sha16,
+    claimedByteOffsets: claimed,
+  });
+  assert.equal(first.audit.handoffId, 'A');
+  claimed.add(first.candidate.byteOffset);
+  first.audit.finished = true;
+
+  const second = selectClaudePendingPromptAudit([auditA, auditB], candidates, {
+    hashText: sha16,
+    claimedByteOffsets: claimed,
+  });
+  assert.equal(second.audit.handoffId, 'B');
+  assert.notEqual(second.candidate.byteOffset, first.candidate.byteOffset);
+  claimed.add(second.candidate.byteOffset);
+  second.audit.finished = true;
+
+  const third = selectClaudePendingPromptAudit([auditA, auditB], candidates, {
+    hashText: sha16,
+    claimedByteOffsets: claimed,
+  });
+  assert.equal(third, null, 'no live audits remain');
+});
+
+test('a mismatching record confirms nothing and fails no neighbor', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-audit-mismatch-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const transcriptPath = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(transcriptPath, '');
+  const boundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  fs.appendFileSync(transcriptPath, JSON.stringify(userRecord('uuid-x', 'manual terminal submit')) + '\n');
+
+  const audit = makeAudit('expected prompt', boundary, { handoffId: 'P' });
+  const candidates = await readClaudeUserRecords(transcriptPath, boundary);
+  const selection = selectClaudePendingPromptAudit([audit], candidates, { hashText: sha16 });
+  assert.equal(selection, null, 'text mismatch leaves the audit pending (unknown)');
+  assert.equal(audit.finished, false);
+});
+
+test('a pre-boundary identical record cannot confirm the later audit', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-audit-precausal-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const transcriptPath = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(transcriptPath, JSON.stringify(userRecord('uuid-old', 'same prompt')) + '\n');
+  const boundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  const audit = makeAudit('same prompt', boundary, { handoffId: 'L' });
+
+  // Read WITHOUT the boundary (bounded tail) so the stale record is visible
+  // to the selector — causality classification must still reject it.
+  const candidates = await readClaudeUserRecords(transcriptPath, null);
+  assert.equal(candidates.length, 1);
+  const selection = selectClaudePendingPromptAudit([audit], candidates, { hashText: sha16 });
+  assert.equal(selection, null, 'stale identical tail is not causal proof');
 });

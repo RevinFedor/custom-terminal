@@ -310,7 +310,7 @@ GET  /api/me                                   → ping, проверка ток
 GET  /api/projects                             → SQLite + isOpen/isActive + project icon из renderer bridge
 GET  /api/inbox                                → system Inbox project metadata
 POST /api/inbox/runs                           → внешний Codex run в system Inbox: create/reuse tab по conversationKey, wait TUI-ready, send prompt, return runId/tabId/eventsUrl
-POST /api/inbox/runs/:runId/stop               → остановка внешнего Codex run тем же stop-flow, что desktop/PTY Codex
+POST /api/inbox/runs/:runId/stop               → остановка внешнего Codex run тем же stop-flow, что desktop/PTY Codex. Fail-closed: недоказанный stop (structured refusal / lookupUnknown / bridge error) возвращает 409 `agent_stop_unconfirmed` (или 500 при исключении), run возвращается в прежний статус, авто-close НЕ планируется, ранее взведённый auto-stop таймер перевзводится. Клиенты обязаны обрабатывать не-200: раньше route всегда отвечал 200 и мог закрыть вкладку с ещё живым агентом
 POST /api/projects/:id/rename                  → renameProject (через bridge → updateProject{name} → project:save-metadata)
 GET  /api/projects/:id/tabs                    → tabs + groups + statuses + timelineCount + live state + statusMarker/processBar/contextPct
 POST /api/inbox/sdk-tabs                       → createSDKTab в system Inbox, без projectId у клиента

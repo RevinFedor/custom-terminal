@@ -187,7 +187,9 @@ startTransition(() => {
 - **GPU Layer:** При использовании `will-change: transform` и `transform`-анимаций спиннеры продолжают вращаться на **уровне композитора** (GPU layer), даже когда Main Thread занят reconciliation тяжелого DOM-дерева.
 - **UX:** Пользователь видит **плавные анимации** вместо застывшего спиннера, что создает ощущение плавности и отзывчивости даже при загрузке сотен элементов.
 
-`startTransition`, Virtuoso и GPU-layer оптимизируют presentation budget, но не уменьшают уже разобранный JSONL, full History payload и его копии. Тихое truncation тяжёлых tool-results не является допустимым memory-fix: оно отнимает inspect/copy capability. Полное решение должно начинать progressive disclosure на data boundary: lightweight row с identity, full detail по expand/Copy.
+`startTransition`, Virtuoso и GPU-layer оптимизируют presentation budget, но не уменьшают уже разобранный JSONL, full History payload и его копии. Тихое truncation тяжёлых tool-results не является допустимым memory-fix: оно отнимает inspect/copy capability.
+
+**Progressive disclosure на data boundary — реализован (2026-07-25).** Пользовательский симптом «переключаюсь между большими сессиями — фриз; правый клик по вкладке открывается через 1-2с когда вкладка отвиснет» закрыт тремя слоями: (1) дегидрация — tool-output/thinking >16KB уходят из main превью+ссылкой, полный текст по раскрытию карточки (`history:get-tool-payload`), IPC clone и retained renderer state перестали расти с размером сессии; (2) tail-window холодного открытия — первый кадр гиганта это последние ~120 записей, полное — фоном; (3) якорь чтения + window-mini-cache — возврат в вытесненную сессию мгновенно показывает последний виденный фрагмент, а не loader. Все окна display-only (контракт rewind-префикса). Детали: `fact-transcript-сервис.md::Дегидрация тяжёлых payload`, `fact-история-как-основная-поверхность.md::Быстрый возврат`.
 
 ### GPU-ускорение для лоадеров
 Лоадеры (спиннеры) используют трансформацию вместо анимации CSS:

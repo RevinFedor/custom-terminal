@@ -1,18 +1,15 @@
 #!/usr/bin/env node
 // =============================================================================
-// MCP Terminal Server — manage terminal tabs in Noted Terminal
+// MCP Terminal Server — one API-first surface for full Noted Terminal sessions
 // Standalone process. Communicates with Noted Terminal via HTTP on localhost.
 // Implements MCP JSON-RPC 2.0 over stdio (zero SDK dependencies).
 //
-// Tools: list_tabs, get_tab_plan, apply_tab_plan_changes,
-//        restart_process, run_command, start_ai, send_prompt,
-//        read_output, create_tab, kill_process, stop_ai, interrupt_ai,
-//        read_draft, draft_state, rewind_ai, get_pending_question,
-//        answer_question, run_chain
+// Live control, durable cross-tab delegation, transcript inspection/editing,
+// task plans, and file linking all delegate to existing app/API scenarios.
 // =============================================================================
 
 import { readFileSync, readdirSync, statSync } from 'fs';
-import { basename, join } from 'path';
+import { basename, join, resolve } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
 
@@ -260,6 +257,39 @@ function buildSourceMeta() {
   };
 }
 
+function qs(params) {
+  const pairs = [];
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value === undefined || value === null || value === '') continue;
+    pairs.push(encodeURIComponent(key) + '=' + encodeURIComponent(value));
+  }
+  return pairs.length ? '?' + pairs.join('&') : '';
+}
+
+async function liveSessionSnapshot(sessionId, cwd) {
+  try {
+    const result = await httpGet('/overseer/sessions', cwd);
+    return (result.sessions || []).find((session) => session.sessionId === sessionId) || null;
+  } catch (error) {
+    return { lifecycleUnavailable: true, error: String(error?.message || error) };
+  }
+}
+
+async function historyResultWithLifecycle(sessionId, cwd, result) {
+  const lifecycle = await liveSessionSnapshot(sessionId, cwd);
+  return {
+    lifecycle,
+    waitGate: lifecycle?.lifecycleUnavailable
+      ? 'Lifecycle unavailable. Do not infer completion from stable transcript text.'
+      : lifecycle?.busy
+        ? 'BUSY: transcript blocks may still be partial.'
+        : lifecycle
+          ? 'NOT BUSY: the latest transcript state is complete.'
+          : 'Session is not attached to an open tab; no live completion signal is available.',
+    ...result,
+  };
+}
+
 function simpleAgentCommand(command) {
   const c = typeof command === 'string' ? command.trim().toLowerCase() : '';
   if (c === 'claude' || c === 'codex') return c;
@@ -415,7 +445,7 @@ const TOOLS = [
   },
   {
     name: 'list_tabs',
-    description: 'List terminal tabs. In Claude/Codex inside Noted Terminal, this is scoped to the parent project. In external mode (Voice Record), omit projectId/cwd to list tabs across all open Noted Terminal projects, or pass projectId/cwd to scope one project. By default returns only green devServer tabs; pass color="" to see all tabs. AI tabs include sessionId when known so you can jump into overseer MCP reads.',
+    description: 'List terminal tabs. In Claude/Codex inside Noted Terminal, this is scoped to the parent project. In external mode (Voice Record), omit projectId/cwd to list tabs across all open Noted Terminal projects, or pass projectId/cwd to scope one project. By default returns only green devServer tabs; pass color="" to see all tabs. AI tabs include sessionId for the history tools in this same MCP.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -436,6 +466,242 @@ const TOOLS = [
           description: 'When true, list tabs across every open Noted Terminal project.',
         },
       },
+    },
+  },
+  {
+    name: 'current_context',
+    description: 'Return the Noted Terminal project, tab, cwd, and known AI session for the full session that owns this MCP process. Use this when the user says "this tab", asks the session to rename itself, or wants to attach a file to itself. Outside Noted Terminal the parent identifiers are unavailable and explicit projectId/tabId must be used.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'rename_tab',
+    description: 'Rename an open Noted Terminal tab through the Project API. Inside a full Noted Terminal session, omit tabId to rename the current tab.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Optional target tab. Defaults to the full session that owns this MCP process.' },
+        name: { type: 'string', description: 'New visible tab name.' },
+        projectId: { type: 'string', description: 'Optional project id for external or cross-project calls.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'link_file',
+    description: 'Attach an existing file as a purple child tab under an open AI session, using the same hierarchy as desktop drag-and-drop. Inside a full Noted Terminal session, omit tabId to attach to itself. Passing another tabId attaches to that session, including across open projects. Repeating the same file+parent operation reuses the existing child.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Existing file path. Relative paths resolve from the MCP project cwd.' },
+        tabId: { type: 'string', description: 'Optional target AI tab. Defaults to the full session that owns this MCP process.' },
+        projectId: { type: 'string', description: 'Optional project id for external or cross-project calls.' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'delegate_to_session',
+    description: 'Start a persistent cross-tab delegation through the Project API. This is for a separate visible Claude/Codex session, not for a temporary internal subagent. It returns immediately with a durable runId; the source tab receives one completion notification, and get_delegation_result reads the final answer in one request. Pass targetTabId to reuse a session or targetProjectId+toolType to create a background session.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Task sent to the target full session.' },
+        sourceTabId: { type: 'string', description: 'Optional source tab. Defaults to the session that owns this MCP process.' },
+        targetTabId: { type: 'string', description: 'Existing target AI tab. Mutually exclusive with creating via targetProjectId.' },
+        targetProjectId: { type: 'string', description: 'Project where a new target session should be created.' },
+        toolType: { type: 'string', enum: ['claude', 'codex'], description: 'Provider for a newly created target. Default claude.' },
+        name: { type: 'string', description: 'Visible name for a newly created target tab.' },
+        label: { type: 'string', description: 'Short orchestration label shown in the source/target UI.' },
+        model: { type: 'string', description: 'Optional provider model override.' },
+        effort: { type: 'string', description: 'Optional Codex effort override.' },
+        thinking: { type: 'string', description: 'Optional Claude thinking mode.' },
+        notifySource: { type: 'boolean', description: 'Default true. Queue one short completion notification in the source input.' },
+        queue: { type: 'boolean', description: 'Default true. Queue on a busy target instead of failing.' },
+        runId: { type: 'string', description: 'Optional idempotency key.' },
+      },
+      required: ['prompt'],
+    },
+  },
+  {
+    name: 'get_delegation',
+    description: 'Read the durable status of one cross-tab delegation. Prefer the completion notification over repeated polling; call this for an explicit status check or after restart.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        runId: { type: 'string' },
+        cwd: { type: 'string', description: 'Optional project cwd used to locate the owning app instance.' },
+      },
+      required: ['runId'],
+    },
+  },
+  {
+    name: 'get_delegation_result',
+    description: 'Read the completed assistant answer for a delegation in one request. A 202 response means the run or transcript materialization is not ready yet; wait for the source completion notification instead of polling in a loop.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        runId: { type: 'string' },
+        maxChars: { type: 'integer', description: 'Maximum answer characters, default 100000 and max 250000.' },
+        cwd: { type: 'string', description: 'Optional project cwd used to locate the owning app instance.' },
+      },
+      required: ['runId'],
+    },
+  },
+  {
+    name: 'cancel_delegation',
+    description: 'Cancel a durable delegation. By default only the run is cancelled; set interrupt=true to also soft-interrupt the target turn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        runId: { type: 'string' },
+        interrupt: { type: 'boolean' },
+        cwd: { type: 'string', description: 'Optional project cwd used to locate the owning app instance.' },
+      },
+      required: ['runId'],
+    },
+  },
+  {
+    name: 'list_open_sessions',
+    description: 'List open Claude/Codex sessions with tab identity, model, context usage, and the authoritative busy/status lifecycle. Use this for inspection, not for sending prompts. A response is complete only when busy=false or the lifecycle reports a terminal completion event.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string', description: 'Optional cwd to choose a Noted Terminal instance.' },
+      },
+    },
+  },
+  {
+    name: 'session_stats',
+    description: 'Read metadata and size statistics for one Claude/Codex transcript without loading its content. Includes the live lifecycle wait gate, context/model data when available, Timeline note counts, compaction markers, and docs activity.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'list_turns',
+    description: 'List addressable transcript turns with previews, block sizes, UUIDs, tools, notes, and docs markers. Content remains paginated; use the targeted read tools for full blocks.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+        limit: { type: 'integer', description: 'Default 50, maximum 500.' },
+        offset: { type: 'integer', description: 'Pagination offset.' },
+        kind: { type: 'string', description: 'Optional user, compact_summary, or compact_boundary filter.' },
+        includeNoise: { type: 'boolean', description: 'Include command/system/interrupted noise prompts.' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'list_notes',
+    description: 'List user-authored Timeline notes, rewind markers, and orphan notes for a session. Use this first when the user names a Timeline anchor.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'get_user_prompt',
+    description: 'Read one user prompt by turnIndex, optionally sliced by character offsets. Negative offsets are supported.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+        turnIndex: { type: 'integer' },
+        start: { type: 'integer' },
+        end: { type: 'integer' },
+      },
+      required: ['sessionId', 'turnIndex'],
+    },
+  },
+  {
+    name: 'get_thinking',
+    description: 'Read thinking blocks from one turn. Omit block for a size/preview map; pass block for full or ranged content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+        turnIndex: { type: 'integer' },
+        block: { type: 'integer' },
+        start: { type: 'integer' },
+        end: { type: 'integer' },
+      },
+      required: ['sessionId', 'turnIndex'],
+    },
+  },
+  {
+    name: 'get_assistant_text',
+    description: 'Read assistant text blocks from one turn. Omit block for a size/preview map; pass block for full or ranged content. The result includes lifecycle and must not be treated as final while busy=true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+        turnIndex: { type: 'integer' },
+        block: { type: 'integer' },
+        start: { type: 'integer' },
+        end: { type: 'integer' },
+      },
+      required: ['sessionId', 'turnIndex'],
+    },
+  },
+  {
+    name: 'fork_session',
+    description: 'Create an independent Claude history fork before editing. This edits history through the existing backend pipeline and does not start or control a live process. Codex history fork/edit is unsupported.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'propose_edit',
+    description: 'Dry-run a Claude transcript compact/delete operation through the same backtrace and range expansion used by Timeline. Always show this plan to the user before apply_edit.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+        startUuid: { type: 'string' },
+        endUuid: { type: 'string' },
+        mode: { type: 'string', enum: ['compact', 'delete'] },
+      },
+      required: ['sessionId', 'startUuid', 'endUuid', 'mode'],
+    },
+  },
+  {
+    name: 'apply_edit',
+    description: 'Apply an explicitly approved Claude transcript compact/delete operation through the existing atomic history pipeline. Default autoFork=true preserves the source session. Always call propose_edit and obtain user confirmation first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+        startUuid: { type: 'string' },
+        endUuid: { type: 'string' },
+        mode: { type: 'string', enum: ['compact', 'delete'] },
+        compactText: { type: 'string', description: 'Required for compact mode.' },
+        autoFork: { type: 'boolean', description: 'Default true. Use false only for follow-up edits on the returned fork.' },
+      },
+      required: ['sessionId', 'startUuid', 'endUuid', 'mode'],
     },
   },
   {
@@ -774,7 +1040,7 @@ async function handleRequest(msg) {
     return jsonRpcResponse(id, {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'noted-terminal-tabs', version: '1.0.0' },
+      serverInfo: { name: 'noted-terminal', version: '2.0.0' },
     });
   }
 
@@ -873,6 +1139,215 @@ async function callTool(name, args) {
         text += '\n';
       }
       return text;
+    }
+
+    case 'current_context': {
+      if (!PARENT_TAB_ID && !PARENT_PROJECT_ID) {
+        return JSON.stringify({
+          insideNotedTerminalSession: false,
+          projectCwd: PROJECT_CWD,
+          message: 'No parent tab identity is available. Pass explicit projectId/tabId to session-scoped tools.',
+        }, null, 2);
+      }
+      const target = projectHint({ projectId: PARENT_PROJECT_ID, cwd: PROJECT_CWD }, PARENT_TAB_ID);
+      const params = ['cwd=' + encodeURIComponent(target.cwd || PROJECT_CWD), 'color='];
+      if (target.projectId) params.push('parentProjectId=' + encodeURIComponent(target.projectId));
+      const result = target.port
+        ? await httpGetOnPort(target.port, '/terminal/tabs?' + params.join('&'))
+        : await httpGet('/terminal/tabs?' + params.join('&'), target.cwd);
+      const tab = (result.tabs || []).find((candidate) => candidate.tabId === PARENT_TAB_ID) || null;
+      return JSON.stringify({
+        insideNotedTerminalSession: true,
+        projectId: target.projectId || PARENT_PROJECT_ID || null,
+        projectCwd: target.cwd || PROJECT_CWD,
+        tabId: PARENT_TAB_ID || null,
+        tab,
+      }, null, 2);
+    }
+
+    case 'rename_tab': {
+      const tabId = args.tabId || PARENT_TAB_ID;
+      const name = String(args.name || '').trim();
+      if (!tabId) throw new Error('tabId is required outside a parent Noted Terminal session');
+      if (!name) throw new Error('name is required');
+      const target = projectHint(args, tabId);
+      const result = await httpApiPost(
+        target,
+        '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/rename',
+        { name },
+      );
+      return JSON.stringify({ ok: true, ...result }, null, 2);
+    }
+
+    case 'link_file': {
+      const tabId = args.tabId || PARENT_TAB_ID;
+      if (!tabId) throw new Error('tabId is required outside a parent Noted Terminal session');
+      const requestedPath = String(args.path || '').trim();
+      if (!requestedPath) throw new Error('path is required');
+      const filePath = resolve(PROJECT_CWD, requestedPath);
+      const target = projectHint(args, tabId);
+      const result = await httpApiPost(
+        target,
+        '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/link-file',
+        { path: filePath },
+      );
+      return JSON.stringify({ ok: true, ...result }, null, 2);
+    }
+
+    case 'delegate_to_session': {
+      const sourceTabId = args.sourceTabId || PARENT_TAB_ID;
+      if (!sourceTabId) throw new Error('sourceTabId is required outside a parent Noted Terminal session');
+      const targetProjectId = args.targetProjectId || (!args.targetTabId ? PARENT_PROJECT_ID : undefined);
+      if (!args.targetTabId && !targetProjectId) {
+        throw new Error('targetTabId or targetProjectId is required');
+      }
+      const target = projectHint({
+        projectId: targetProjectId || PARENT_PROJECT_ID,
+        cwd: PROJECT_CWD,
+      }, sourceTabId);
+      const result = await httpApiPost(target, '/api/orchestrations', {
+        runId: args.runId || undefined,
+        sourceTabId,
+        targetTabId: args.targetTabId || undefined,
+        targetProjectId: targetProjectId || undefined,
+        toolType: args.toolType || 'claude',
+        name: args.name || undefined,
+        label: args.label || undefined,
+        prompt: args.prompt,
+        model: args.model || undefined,
+        effort: args.effort || undefined,
+        thinking: args.thinking || undefined,
+        notifySource: args.notifySource !== false,
+        queue: args.queue !== false,
+      });
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'get_delegation': {
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD });
+      const result = await httpApiGet(
+        target,
+        '/api/orchestrations/' + encodeURIComponent(args.runId),
+      );
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'get_delegation_result': {
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD });
+      const maxChars = Math.max(500, Math.min(250_000, Number(args.maxChars) || 100_000));
+      const result = await httpApiGet(
+        target,
+        '/api/orchestrations/' + encodeURIComponent(args.runId) + '/result?maxChars=' + maxChars,
+      );
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'cancel_delegation': {
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD });
+      const result = await httpApiPost(
+        target,
+        '/api/orchestrations/' + encodeURIComponent(args.runId) + '/cancel',
+        { interrupt: args.interrupt === true },
+      );
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'list_open_sessions': {
+      const result = await httpGet('/overseer/sessions', args.cwd || PROJECT_CWD);
+      return JSON.stringify({
+        waitRule: 'Treat assistant output as final only when busy=false or a terminal completion event is present.',
+        ...result,
+      }, null, 2);
+    }
+
+    case 'session_stats': {
+      const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/stats' + qs({ cwd: args.cwd });
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      return JSON.stringify(
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        null,
+        2,
+      );
+    }
+
+    case 'list_turns': {
+      const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/turns' + qs({
+        cwd: args.cwd,
+        limit: args.limit,
+        offset: args.offset,
+        kind: args.kind,
+        includeNoise: args.includeNoise ? 1 : undefined,
+      });
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      return JSON.stringify(
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        null,
+        2,
+      );
+    }
+
+    case 'list_notes': {
+      const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/notes' + qs({ cwd: args.cwd });
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'get_user_prompt': {
+      const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId)
+        + '/turn/' + args.turnIndex + '/user'
+        + qs({ cwd: args.cwd, start: args.start, end: args.end });
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      return JSON.stringify(
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        null,
+        2,
+      );
+    }
+
+    case 'get_thinking':
+    case 'get_assistant_text': {
+      const part = name === 'get_thinking' ? 'thinking' : 'text';
+      const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId)
+        + '/turn/' + args.turnIndex + '/' + part
+        + qs({ cwd: args.cwd, block: args.block, start: args.start, end: args.end });
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      return JSON.stringify(
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        null,
+        2,
+      );
+    }
+
+    case 'fork_session': {
+      const result = await httpPost('/overseer/fork', {
+        sessionId: args.sessionId,
+        cwd: args.cwd,
+      }, args.cwd || PROJECT_CWD);
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'propose_edit': {
+      const result = await httpPost('/overseer/propose-edit', {
+        sessionId: args.sessionId,
+        cwd: args.cwd,
+        startUuid: args.startUuid,
+        endUuid: args.endUuid,
+        mode: args.mode,
+      }, args.cwd || PROJECT_CWD);
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'apply_edit': {
+      const result = await httpPost('/overseer/apply-edit', {
+        sessionId: args.sessionId,
+        cwd: args.cwd,
+        startUuid: args.startUuid,
+        endUuid: args.endUuid,
+        mode: args.mode,
+        compactText: args.compactText,
+        autoFork: args.autoFork === undefined ? true : args.autoFork === true,
+      }, args.cwd || PROJECT_CWD);
+      return JSON.stringify(result, null, 2);
     }
 
     case 'get_tab_plan': {
