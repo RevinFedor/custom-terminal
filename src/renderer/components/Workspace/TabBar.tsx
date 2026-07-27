@@ -5,6 +5,11 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
 import { useUIStore } from '../../store/useUIStore';
+import {
+  isOrchestrationCompletionBlocked,
+  subscribeOrchestrationRunChanges,
+  useOrchestrationStore,
+} from '../../store/useOrchestrationStore';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { refreshGeneratedTabTitle, type RefreshTabTitleReason } from '../../utils/generateTabTitle';
@@ -1055,6 +1060,7 @@ const TabItem = memo(({
   const [isHovered, setIsHovered] = useState(false);
   const [isRestartButtonHovered, setIsRestartButtonHovered] = useState(false);
   const [taskArchivePreviewOpen, setTaskArchivePreviewOpen] = useState(false);
+  const isOrchestrationInheritedBusy = useOrchestrationStore((s) => s.inheritedBusyTabIds.has(tab.id));
   const bodyCursorRef = useRef<string | null>(null);
   const doubleClickRenameRef = useRef(false);
 
@@ -1532,6 +1538,7 @@ const TabItem = memo(({
   //   Если оба true (PTY claude думает) — рендерятся оба: полоса слева + shimmer.
   const verticalHasProcess = hasProcess || sdkProcessAlive;
   const verticalIsAiBusy = isBusy;
+  const verticalIsInheritedBusy = isOrchestrationInheritedBusy && !verticalIsAiBusy;
   // Awaiting-input pulses purple OVER the busy shimmer (awaiting ⊆ busy). Kept
   // separate so "Claude needs my answer" reads differently from "Claude is thinking".
   const verticalIsAwaiting = isAwaitingInput;
@@ -1827,13 +1834,14 @@ const TabItem = memo(({
   }, [completionNotificationFired]);
 
   useEffect(() => {
-    const rendersProcessBar = isVerticalMode && !isCollapsed && (verticalHasProcess || verticalIsAiBusy);
-    const rendersShimmer = rendersProcessBar && verticalIsAiBusy;
+    const rendersProcessBar = isVerticalMode && !isCollapsed && (verticalHasProcess || verticalIsAiBusy || verticalIsInheritedBusy);
+    const rendersShimmer = rendersProcessBar && (verticalIsAiBusy || verticalIsInheritedBusy);
     const signature = [
       isVerticalMode ? 1 : 0,
       isCollapsed ? 1 : 0,
       verticalHasProcess ? 1 : 0,
       verticalIsAiBusy ? 1 : 0,
+      verticalIsInheritedBusy ? 1 : 0,
       verticalIsAwaiting ? 1 : 0,
       isTitleNaming ? 1 : 0,
       processBarPosition,
@@ -1854,6 +1862,7 @@ const TabItem = memo(({
       ' hasProcess=' + hasProcess +
       ' sdkProcess=' + sdkProcessAlive +
       ' busy=' + isBusy +
+      ' inheritedBusy=' + verticalIsInheritedBusy +
       ' awaiting=' + isAwaitingInput +
       ' titleNaming=' + isTitleNaming +
       ' processBar=' + rendersProcessBar +
@@ -1866,6 +1875,7 @@ const TabItem = memo(({
     isCollapsed,
     verticalHasProcess,
     verticalIsAiBusy,
+    verticalIsInheritedBusy,
     verticalIsAwaiting,
     isTitleNaming,
     processBarPosition,
@@ -1962,7 +1972,7 @@ const TabItem = memo(({
                   Если активен только один сигнал — рисуется только он. Если AI думает
                   без PTY (SDK-таб) — цвет полоски статичный colorA, блик ползёт.
                   overflow:hidden держит shimmer-overlay строго внутри полоски. */}
-              {(verticalHasProcess || verticalIsAiBusy) && (
+              {(verticalHasProcess || verticalIsAiBusy || verticalIsInheritedBusy) && (
                 <div
                   className="tab-process-bar-static"
                   style={{
@@ -1976,6 +1986,7 @@ const TabItem = memo(({
                     pointerEvents: 'none',
                     zIndex: 5,
                     overflow: 'hidden',
+                    backgroundColor: verticalIsInheritedBusy ? 'var(--process-bar-inherited-color, #A855F7)' : undefined,
                     // Закруглённые углы только на «своей» стороне вкладки.
                     ...(processBarPosition === 'right'
                       ? { borderTopRightRadius: tabGeo.borderRadius, borderBottomRightRadius: tabGeo.borderRadius }
@@ -1983,6 +1994,7 @@ const TabItem = memo(({
                   }}
                 >
                   {verticalIsAiBusy && <div className="tab-process-bar-ai-shimmer-overlay" />}
+                  {verticalIsInheritedBusy && <div className="tab-process-bar-ai-shimmer-overlay tab-process-bar-inherited-shimmer-overlay" />}
                 </div>
               )}
               {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
@@ -3712,6 +3724,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
   const [codexBusyMap, setCodexBusyMap] = useState<Map<string, boolean>>(new Map());
   const restartAfterBusyRef = useRef<Map<string, boolean>>(new Map());
+  const restartAfterDeferredNaturalRef = useRef<Set<string>>(new Set());
   const restartAfterScriptRunsRef = useRef<Map<string, RestartAfterScriptRunState>>(new Map());
   const [pasteBusyMap, setPasteBusyMap] = useState<Map<string, boolean>>(new Map());
   // Live background work (in-process subagents / background Bash chips)
@@ -4047,23 +4060,50 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       });
     };
 
-    const applyRestartAfterBusyEdge = (triggerTabId: string, busy: boolean, reason?: string) => {
-      // Claude PTY spinner edges are visual heuristics, not authoritative turn boundaries.
-      if (reason === 'spinner') return;
-      const prevBusy = restartAfterBusyRef.current.get(triggerTabId) || false;
-      restartAfterBusyRef.current.set(triggerTabId, busy);
-      if (busy) {
-        return;
-      }
-      if (!prevBusy) return;
-      const naturalEnd = isNaturalAgentTurnEndReason(reason);
-      const restartTargets = useWorkspaceStore.getState().consumeRestartAfterTriggerIdle(triggerTabId, naturalEnd);
+    const executeRestartAfterTrigger = (triggerTabId: string, reason?: string) => {
+      const restartTargets = useWorkspaceStore.getState().consumeRestartAfterTriggerIdle(triggerTabId, true);
       for (const target of restartTargets) {
         if (target.tabId === triggerTabId) continue;
         console.warn('[TabBar:RestartAfter] trigger=' + triggerTabId.slice(-8) + ' target=' + target.tabId.slice(-8) + ' command=' + JSON.stringify(target.command || '') + ' reason=' + (reason || 'natural'));
         void runRestartAfterAction(target.tabId, target.command, { coalesceFiniteScript: true });
       }
     };
+
+    const applyRestartAfterBusyEdge = (triggerTabId: string, busy: boolean, reason?: string) => {
+      // Claude PTY spinner edges are visual heuristics, not authoritative turn boundaries.
+      if (reason === 'spinner') return;
+      const prevBusy = restartAfterBusyRef.current.get(triggerTabId) || false;
+      restartAfterBusyRef.current.set(triggerTabId, busy);
+      if (busy) {
+        restartAfterDeferredNaturalRef.current.delete(triggerTabId);
+        return;
+      }
+      if (!prevBusy) return;
+      const naturalEnd = isNaturalAgentTurnEndReason(reason);
+      if (!naturalEnd) return;
+      if (isOrchestrationCompletionBlocked(triggerTabId)) {
+        restartAfterDeferredNaturalRef.current.add(triggerTabId);
+        console.warn('[TabBar:RestartAfter] deferred trigger=' + triggerTabId.slice(-8) + ' while descendants/handoff remain active');
+        return;
+      }
+      executeRestartAfterTrigger(triggerTabId, reason);
+    };
+
+    const unsubscribeRestartAfterOrchestration = subscribeOrchestrationRunChanges((change) => {
+      if (!change.releaseKind) return;
+      const triggerTabId = change.sourceTabId;
+      if (change.releaseKind === 'handoff-started') {
+        restartAfterDeferredNaturalRef.current.delete(triggerTabId);
+        return;
+      }
+      if (change.releaseKind === 'abnormal') {
+        restartAfterDeferredNaturalRef.current.delete(triggerTabId);
+        return;
+      }
+      if (restartAfterBusyRef.current.get(triggerTabId) === true) return;
+      restartAfterDeferredNaturalRef.current.delete(triggerTabId);
+      executeRestartAfterTrigger(triggerTabId, 'orchestration-complete');
+    });
 
     const handleClaudeBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
       console.warn('[TabBar:BusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
@@ -4185,6 +4225,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('terminal:stop-progress', handleStopProgress);
+      unsubscribeRestartAfterOrchestration();
       claudeSpinnerVisualIdleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
       claudeSpinnerVisualIdleTimersRef.current.clear();
     };

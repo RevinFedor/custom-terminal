@@ -10,6 +10,12 @@ import { getClaudeStartupDefaultsGateSnapshot } from '../utils/claudeStartupDefa
 import { serializeComposerDraft } from '../utils/composerChips.mjs';
 import { getFirstDelayRemainingMs, MAX_BROWSER_TIMEOUT_MS } from '../utils/promptQueueDelay';
 import {
+  initializeOrchestrationStore,
+  isOrchestrationCompletionBlocked,
+  subscribeOrchestrationRunChanges,
+  useOrchestrationStore,
+} from '../store/useOrchestrationStore';
+import {
   beginHistoryPromptHandoff,
   historyPromptHandoffAuditProofFromSendResult,
   retractHistoryPromptHandoff,
@@ -52,7 +58,10 @@ function tabExists(tabId: string): boolean {
 
 function canValidateQueueTabs(): boolean {
   const state = useWorkspaceStore.getState();
-  return isPromptQueueStoreHydrated() && !state.isRestoring && state.openProjects.size > 0;
+  return isPromptQueueStoreHydrated()
+    && useOrchestrationStore.getState().initialized
+    && !state.isRestoring
+    && state.openProjects.size > 0;
 }
 
 function tabCanTriggerQueue(ownerTabId: string, targetTabId: string): boolean {
@@ -237,6 +246,11 @@ function withPostPrompt(tabId: string, body: string): string {
 // turn-end handler AND the cold-start subscription — they must share the same
 // truth or edges get double-counted / missed.
 const prevBusyRef = new Map<string, boolean>();
+
+function isTabWorkflowBlocked(tabId: string): boolean {
+  return prevBusyRef.get(tabId) === true || isOrchestrationCompletionBlocked(tabId);
+}
+
 const queueSendInflight = new Set<string>();
 // An unlock is only a retry signal when a concrete send attempt actually hit
 // the editor lock. Merely opening/editing a queue item must not synthesize a
@@ -372,7 +386,8 @@ function retryDeferredOwnerSend(ownerTabId: string, source: string): boolean {
     clearDeferredOwnerSend(ownerTabId, 'stale:' + source);
     return false;
   }
-  if (prevBusyRef.get(ownerTabId) === true) return false;
+  if (isTabWorkflowBlocked(ownerTabId)
+    || isTabWorkflowBlocked(deferred.triggerTabId)) return false;
   console.log('[PromptQueueRunner] retry deferred owner=' + ownerTabId.slice(-8)
     + ' trigger=' + deferred.triggerTabId.slice(-8) + ' source=' + source);
   return beginValidatedQueueSend(ownerTabId, deferred.triggerTabId, head, deferred.label);
@@ -396,7 +411,8 @@ function pruneDeferredOwnerSends(): void {
 function queueOwnerHasPendingContinuation(ownerTabId: string): boolean {
   if (queueAwaitingBusyStart.has(ownerTabId)
     || queueSendInflight.has(ownerTabId)
-    || deferredOwnerSends.has(ownerTabId)) return true;
+    || deferredOwnerSends.has(ownerTabId)
+    || isOrchestrationCompletionBlocked(ownerTabId)) return true;
   return hasPendingPromptQueueContinuation(usePromptQueueStore.getState().getQueue(ownerTabId));
 }
 
@@ -407,6 +423,7 @@ function beginValidatedQueueSend(
   label: 'turn-end' | 'cold-start',
 ): boolean {
   if (queueSendInflight.has(ownerTabId)) return false;
+  if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) return false;
   if (isPromptQueueEditorLocked(ownerTabId)) {
     queueEditorBlockedOwners.add(ownerTabId);
     console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8)
@@ -556,7 +573,7 @@ function beginValidatedQueueSend(
     }
     const latestQueue = usePromptQueueStore.getState().getQueue(ownerTabId);
     const latestHead = latestQueue.items.find(isQueuedPromptEnabled);
-    if (prevBusyRef.get(ownerTabId) === true) {
+    if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) {
       console.log('[PromptQueueRunner] ' + label + ' validation became stale owner=' + ownerTabId.slice(-8)
         + ' expected=' + head.id.slice(-8) + ' actual=' + (latestHead?.id.slice(-8) || '-'));
       return;
@@ -584,6 +601,12 @@ function beginValidatedQueueSend(
     if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
       queueAwaitingBusyStart.delete(ownerTabId);
       clearDeferredOwnerAttempt(ownerTabId, attempt, 'send-boundary-became-stale');
+      return;
+    }
+    if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) {
+      queueAwaitingBusyStart.delete(ownerTabId);
+      console.log('[PromptQueueRunner] ' + label + ' workflow became blocked before send owner='
+        + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8));
       return;
     }
     console.log('[PromptQueueRunner] ' + label + ' fire owner=' + ownerTabId.slice(-8)
@@ -719,6 +742,11 @@ type DeferredWorkflowOutcomeSet = {
   abnormal: DeferredWorkflowOutcome | null;
 };
 const deferredWorkflowOutcomes = new Map<string, DeferredWorkflowOutcomeSet>();
+const deferredOrchestrationNaturalOutcomes = new Map<string, {
+  data: BusyStatePayload;
+  source: string;
+  outcomeTs: number;
+}>();
 const processedNaturalOutcomes = new Map<string, { latestTs: number; keys: Set<string> }>();
 const workflowRestoreReconciliationListeners = new Set<() => void>();
 let workflowRestoreReconciled = false;
@@ -868,8 +896,8 @@ export function usePromptQueueRunner() {
       if (!queue.autoRun || beforePop === 0) return false;
       if (queue.firstDelayCountdownAt !== null) return false;
       if (queueSendInflight.has(ownerTabId)) return false;
-      if (prevBusyRef.get(ownerTabId) === true) {
-        console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8) + ' is busy → wait before firing trigger=' + triggerTabId.slice(-8));
+      if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) {
+        console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8) + ' workflow is busy → wait before firing trigger=' + triggerTabId.slice(-8));
         return false;
       }
 
@@ -885,7 +913,7 @@ export function usePromptQueueRunner() {
       if (queue.firstDelayCountdownAt !== null) return null;
       if (queueAwaitingBusyStart.has(ownerTabId)) return ownerTabId;
       if (queueSendInflight.has(ownerTabId)) return ownerTabId;
-      if (prevBusyRef.get(ownerTabId) === true) return null;
+      if (isTabWorkflowBlocked(ownerTabId)) return null;
 
       const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
       if (effectiveTrigger === ownerTabId) return ownerTabId;
@@ -893,7 +921,7 @@ export function usePromptQueueRunner() {
       // Pivoted queue can only fire when its target has a real idle snapshot.
       // No busy history means "wait for the first busy→idle edge", not "idle".
       if (!prevBusyRef.has(effectiveTrigger)) return null;
-      if (prevBusyRef.get(effectiveTrigger) === true) return null;
+      if (isTabWorkflowBlocked(effectiveTrigger)) return null;
       return effectiveTrigger;
     };
 
@@ -982,6 +1010,15 @@ export function usePromptQueueRunner() {
         return;
       }
       const outcomeTs = Number(explicitTs);
+      if (isOrchestrationCompletionBlocked(data.tabId)) {
+        const current = deferredOrchestrationNaturalOutcomes.get(data.tabId);
+        if (!current || outcomeTs >= current.outcomeTs) {
+          deferredOrchestrationNaturalOutcomes.set(data.tabId, { data, source, outcomeTs });
+        }
+        console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
+          + ' source=' + source + ' has inherited orchestration activity → DEFER workflow outcome');
+        return;
+      }
       if (prevBusyRef.get(data.tabId) === true) {
         console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
           + ' source=' + source + ' has a newer busy turn → WAIT');
@@ -1092,6 +1129,7 @@ export function usePromptQueueRunner() {
 
         if (busy) {
           queueAwaitingBusyStart.delete(tabId);
+          deferredOrchestrationNaturalOutcomes.delete(tabId);
         }
 
         const compactLocalCommandDone = isSuccessfulCompactLocalCommandEnd(data);
@@ -1316,6 +1354,51 @@ export function usePromptQueueRunner() {
     const claudeHandler = handleBusyState('claude');
     const geminiHandler = handleBusyState('gemini');
     const codexHandler = handleBusyState('codex');
+    void initializeOrchestrationStore();
+    const unsubscribeOrchestration = subscribeOrchestrationRunChanges((change) => {
+      const tabId = change.sourceTabId;
+      if (!change.releaseKind) return;
+
+      if (change.releaseKind === 'handoff-started') {
+        // The completion notification has become a real parent turn. Its
+        // authoritative busy→idle edge now owns every Run After transition.
+        deferredOrchestrationNaturalOutcomes.delete(tabId);
+        return;
+      }
+
+      if (change.releaseKind === 'abnormal') {
+        deferredOrchestrationNaturalOutcomes.delete(tabId);
+        const outcome: BusyStatePayload = {
+          tabId,
+          busy: false,
+          reason: 'orchestration-abnormal',
+          outcomeTs: change.run.completedAt || Date.now(),
+          turnId: change.run.runId,
+        };
+        if (canProcessWorkflowOutcomes()) {
+          applyAbnormalQueueOutcome(outcome, 'orchestration-release', explicitOutcomeTimestamp(outcome));
+        } else {
+          rememberDeferredWorkflowOutcome(outcome);
+        }
+        return;
+      }
+
+      if (prevBusyRef.get(tabId) === true) return;
+      const deferred = deferredOrchestrationNaturalOutcomes.get(tabId);
+      if (deferred) {
+        deferredOrchestrationNaturalOutcomes.delete(tabId);
+        processSuccessfulWorkflowOutcome(
+          deferred.data,
+          deferred.source + '-orchestration-release',
+          deferred.outcomeTs,
+        );
+      }
+      for (const [ownerTabId, attempt] of deferredOwnerSends) {
+        if (ownerTabId === tabId || attempt.triggerTabId === tabId) {
+          retryDeferredOwnerSend(ownerTabId, 'orchestration-release');
+        }
+      }
+    });
     const commandStartedHandler = (_: unknown, data: { tabId?: string; commandType?: string | null }) => {
       if (!data?.tabId || data.commandType !== 'claude') return;
       claudeQueueStartupPending.add(data.tabId);
@@ -1358,6 +1441,7 @@ export function usePromptQueueRunner() {
     window.addEventListener('claude-startup-defaults-gate', claudeStartupGateHandler);
     const unsubscribeQueueHydration = subscribePromptQueueHydration(maybeReconcileRestoredWorkflows);
     const unsubscribeWorkspaceHydration = useWorkspaceStore.subscribe(maybeReconcileRestoredWorkflows);
+    const unsubscribeOrchestrationHydration = useOrchestrationStore.subscribe(maybeReconcileRestoredWorkflows);
     maybeReconcileRestoredWorkflows();
     return () => {
       ipcRenderer.removeListener('claude:busy-state', claudeHandler);
@@ -1371,6 +1455,8 @@ export function usePromptQueueRunner() {
       window.removeEventListener('claude-startup-defaults-gate', claudeStartupGateHandler);
       unsubscribeQueueHydration();
       unsubscribeWorkspaceHydration();
+      unsubscribeOrchestrationHydration();
+      unsubscribeOrchestration();
       ipcRenderer.removeListener('agent-prompt:audit-result', onPromptAuditResult);
       unsubscribeEditorLocks();
     };
@@ -1416,6 +1502,8 @@ export function usePromptQueueRunner() {
         if (!q.autoRun || countEnabledQueuedPrompts(q.items) === 0) return false;
         if (q.firstDelayCountdownAt !== null) return false;
         if (queueSendInflight.has(ownerTabId)) return false;
+        if (isOrchestrationCompletionBlocked(ownerTabId)
+          || isOrchestrationCompletionBlocked(triggerTabId)) return false;
         if (prevBusyRef.get(ownerTabId) === true && options.deferWhileBusy !== true) return false;
         const head = q.items.find(isQueuedPromptEnabled);
         if (head) {
@@ -1477,6 +1565,8 @@ export function usePromptQueueRunner() {
 
     const verifyCodexTriggerIdleThenFire = (ownerTabId: string, triggerTabId: string): boolean => {
       if (getWorkspaceCommandType(triggerTabId) !== 'codex') return false;
+      if (isOrchestrationCompletionBlocked(ownerTabId)
+        || isOrchestrationCompletionBlocked(triggerTabId)) return true;
       const key = ownerTabId + '→' + triggerTabId;
       if (codexTriggerCheckInflight.has(key)) return true;
       codexTriggerCheckInflight.add(key);
@@ -1520,7 +1610,7 @@ export function usePromptQueueRunner() {
         const q2 = usePromptQueueStore.getState().getQueue(ownerTabId);
         if (!q2.autoRun || countEnabledQueuedPrompts(q2.items) === 0) return;
         if (queueSendInflight.has(ownerTabId) || queueAwaitingBusyStart.has(ownerTabId)) return;
-        if (prevBusyRef.get(ownerTabId) === true) return;
+        if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) return;
 
         if (ownerTabId !== triggerTabId) {
           if (queueOwnerHasPendingContinuation(triggerTabId)) {
@@ -1614,7 +1704,7 @@ export function usePromptQueueRunner() {
             console.log('[PromptQueueRunner] cold-start owner=' + tabId.slice(-8) + ' target=' + effectiveTrigger.slice(-8) + ' has no busy history → wait');
             continue;
           }
-          if (prevBusyRef.get(effectiveTrigger) === true) {
+          if (isTabWorkflowBlocked(tabId) || isTabWorkflowBlocked(effectiveTrigger)) {
             // Target is busy right now — wait for its idle edge.
             continue;
           }
@@ -1639,7 +1729,7 @@ export function usePromptQueueRunner() {
         // With no first delay, preserve the original cold-start readiness
         // checks before attempting an immediate send.
         if (verifyCodexTriggerIdleThenFire(tabId, tabId)) continue;
-        const isBusy = prevBusyRef.get(tabId) ?? false;
+        const isBusy = isTabWorkflowBlocked(tabId);
         if (isBusy) continue;
         fireHead(tabId, tabId);
       }
@@ -1656,6 +1746,11 @@ export function usePromptQueueRunner() {
       // must never be synthesized as fresh 0→N / false→true edges.
       evaluateQueues(current, current, { forceRuntimeArms: true });
     });
+    const unsubscribeOrchestration = subscribeOrchestrationRunChanges((change) => {
+      if (change.releaseKind !== 'success' || isTabWorkflowBlocked(change.sourceTabId)) return;
+      const current = usePromptQueueStore.getState();
+      evaluateQueues(current, current, { forceRuntimeArms: true });
+    });
     if (workflowRestoreReconciled) {
       const current = usePromptQueueStore.getState();
       evaluateQueues(current, current, { forceRuntimeArms: true });
@@ -1663,6 +1758,7 @@ export function usePromptQueueRunner() {
     return () => {
       unsubscribeQueue();
       unsubscribeReconciliation();
+      unsubscribeOrchestration();
       for (const t of pendingTimers.values()) clearTimeout(t);
       pendingTimers.clear();
     };

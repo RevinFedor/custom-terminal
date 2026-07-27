@@ -199,6 +199,16 @@ interface TimelineEntry {
   subAgentTaskId?: string;
   docsEdited?: string[];
   docsSearchQueries?: string[];
+  semanticTags?: Array<{
+    id?: string;
+    kind: 'orchestration';
+    runId: string;
+    phase: 'request' | 'completion' | 'failure';
+    parentRunId?: string;
+    sourceTabId?: string;
+    targetTabId?: string;
+    outcome?: string;
+  }>;
   responseTokens?: number;
   responseModel?: string;          // last assistant.message.model for this turn (e.g. 'deepseek-v4-flash', 'claude-opus-4-7')
   responseHasThinking?: boolean;   // any assistant content block of type 'thinking' in this turn
@@ -231,6 +241,7 @@ interface GroupInfo {
   groupSize: number;
   agentName: string;
   hasTimeout: boolean;
+  groupKind: 'subagent' | 'orchestration';
   startIndex: number; // first entry index in the group
 }
 
@@ -311,7 +322,7 @@ function selectAutoTabTitlePrompt(
     const boundaryIndex = forkMarkerLastSnapIndex.length > 0
       ? Math.max(...forkMarkerLastSnapIndex)
       : -1;
-    return entries.find((entry, index) => index > boundaryIndex && isEligibleTabTitleEntry(entry));
+    return entries.find((entry, index) => index > boundaryIndex && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry));
   }
 
   const forkedFromId = codexSessionMeta?.forked_from_id;
@@ -326,6 +337,7 @@ function selectAutoTabTitlePrompt(
     return entries.find((entry) => {
       return typeof entry.sourceLine === 'number'
         && entry.sourceLine > forkLiveStartLine
+        && !getOrchestrationTag(entry)
         && isEligibleTabTitleEntry(entry);
     });
   }
@@ -335,7 +347,9 @@ function selectAutoTabTitlePrompt(
   if (!Number.isFinite(startedAt)) return undefined;
   return entries.find((entry) => {
     const entryAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
-    return Number.isFinite(entryAt) && entryAt >= startedAt + 1000 && isEligibleTabTitleEntry(entry);
+    return Number.isFinite(entryAt) && entryAt >= startedAt + 1000
+      && !getOrchestrationTag(entry)
+      && isEligibleTabTitleEntry(entry);
   });
 }
 
@@ -442,7 +456,13 @@ function getSearchLines(content: string): string[] {
   return result;
 }
 
-// Build grouping map: consecutive sub-agent entries with same taskId/name → collapsed group
+function getOrchestrationTag(entry: TimelineEntry) {
+  return entry.semanticTags?.find(tag => tag.kind === 'orchestration') || null;
+}
+
+// Build grouping map for consecutive built-in sub-agent or durable Terminal MCP
+// turns. The structural sidecar tag is the only orchestration classifier; text
+// such as "[Оркестрация]" is intentionally ignored.
 function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
   const groups = new Map<number, GroupInfo>();
   let i = 0;
@@ -450,7 +470,12 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
 
   while (i < entries.length) {
     const entry = entries[i];
-    if (!entry.isSubAgent && !entry.isSubAgentTimeout) {
+    const groupKind = getOrchestrationTag(entry)
+      ? 'orchestration'
+      : (entry.isSubAgent || entry.isSubAgentTimeout)
+        ? 'subagent'
+        : null;
+    if (!groupKind) {
       i++;
       continue;
     }
@@ -458,8 +483,15 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
     const startIdx = i;
     let j = i + 1;
 
-    // Group ALL consecutive sub-agent entries together (one orchestration round)
-    while (j < entries.length && (entries[j].isSubAgent || entries[j].isSubAgentTimeout)) {
+    // Keep provider-internal agents and durable Terminal MCP calls as separate
+    // visual groups even when they happen next to each other.
+    while (j < entries.length) {
+      const candidateKind = getOrchestrationTag(entries[j])
+        ? 'orchestration'
+        : (entries[j].isSubAgent || entries[j].isSubAgentTimeout)
+          ? 'subagent'
+          : null;
+      if (candidateKind !== groupKind) break;
       j++;
     }
 
@@ -471,7 +503,11 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
     for (let k = startIdx; k < j; k++) {
       if (entries[k].subAgentName) agentNames.add(entries[k].subAgentName!);
     }
-    const agentName = agentNames.size === 1 ? [...agentNames][0] : (agentNames.size > 1 ? `${agentNames.size} agents` : 'Claude');
+    const agentName = groupKind === 'orchestration'
+      ? 'Terminal MCP'
+      : agentNames.size === 1
+        ? [...agentNames][0]
+        : (agentNames.size > 1 ? `${agentNames.size} agents` : 'Claude');
 
     if (size > 1) {
       // First entry is BOTH header and first child
@@ -482,6 +518,7 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
         groupSize: size,
         agentName,
         hasTimeout,
+        groupKind,
         startIndex: startIdx,
       });
 
@@ -494,6 +531,7 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
           groupSize: size,
           agentName,
           hasTimeout,
+          groupKind,
           startIndex: startIdx,
         });
       }
@@ -506,6 +544,7 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
         groupSize: 1,
         agentName,
         hasTimeout,
+        groupKind,
         startIndex: startIdx,
       });
     }
@@ -1519,7 +1558,7 @@ function Timeline({
   }, [entries]);
 
   const outlineEligibleUuids = useMemo(() => entries
-    .filter((entry) => entry.uuid && !entry.isSubAgent && !entry.isSubAgentTimeout && isEligibleTabTitleEntry(entry))
+    .filter((entry) => entry.uuid && !entry.isSubAgent && !entry.isSubAgentTimeout && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry))
     .map((entry) => entry.uuid), [entries]);
 
   const semanticGroups = useMemo<TimelineSemanticGroup[]>(() => {
@@ -2548,7 +2587,7 @@ function Timeline({
   useEffect(() => {
     if (!promptSummaryAutoEnabled || !summaryToolType || !sessionId) return;
     if (!promptSummaryLoadedSessionKeys.has(`${summaryToolType}:${sessionId}`)) return;
-    const eligibleEntries = entries.filter((entry) => entry.uuid && isEligibleTabTitleEntry(entry));
+    const eligibleEntries = entries.filter((entry) => entry.uuid && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry));
     let cancelled = false;
     // Long sessions can contain hundreds of eligible prompts. Launching every
     // AI request in the same render creates a network/state-update storm; the
@@ -2558,7 +2597,7 @@ function Timeline({
       for (let i = 0; i < eligibleEntries.length; i++) {
         if (cancelled) return;
         const entry = eligibleEntries[i];
-        if (!entry.uuid || !isEligibleTabTitleEntry(entry)) continue;
+        if (!entry.uuid || getOrchestrationTag(entry) || !isEligibleTabTitleEntry(entry)) continue;
         const entryAt = Date.parse(entry.timestamp || '');
         if (promptSummaryAutoSince > 0 && (!Number.isFinite(entryAt) || entryAt < promptSummaryAutoSince - 1000)) continue;
         const previousUserMessages = promptSummaryPreviousUserCount > 0
@@ -5044,7 +5083,7 @@ function Timeline({
   };
 
   const handleRefreshTimelineAction = async (entry: TimelineEntry) => {
-    if (!summaryToolType || !sessionId || !isEligibleTabTitleEntry(entry) || refreshingActionUuid) return;
+    if (!summaryToolType || !sessionId || getOrchestrationTag(entry) || !isEligibleTabTitleEntry(entry) || refreshingActionUuid) return;
     const eligibleEntries = entries.filter((candidate) => candidate.uuid && isEligibleTabTitleEntry(candidate));
     const targetIndex = eligibleEntries.findIndex((candidate) => candidate.uuid === entry.uuid);
     if (targetIndex < 0) return;
@@ -5977,11 +6016,19 @@ function Timeline({
             const isPlan = !!entry.isPlan;
             const isDocsEdit = entry.type === 'docs_edit';
             const isDocsSearch = entry.type === 'docs_search';
+            const docsEditedCount = entry.docsEdited?.length || (isDocsEdit ? 1 : 0);
+            const docsSearchCount = entry.docsSearchQueries?.length || (isDocsSearch ? 1 : 0);
             const dotClickState = clickedState?.index === index ? clickedState.status : null;
 
             // Entry type flags
             const entryIsSubAgent = !!(entry.isSubAgent || entry.isSubAgentTimeout);
             const entryIsTimeout = !!entry.isSubAgentTimeout;
+            const orchestrationTag = getOrchestrationTag(entry);
+            const entryIsOrchestration = !!orchestrationTag;
+            const orchestrationGroup = groupInfo?.groupKind === 'orchestration';
+            const groupAccent = orchestrationGroup ? '#a855f7' : '#818cf8';
+            const groupAccentDim = orchestrationGroup ? '#7e22ce' : '#7c86f0';
+            const groupAccentRgb = orchestrationGroup ? '168, 85, 247' : '129, 140, 248';
             const isHovered = hoveredIndex === index || activeTooltipIndex === index;
 
             // ── Dot color ──
@@ -6011,12 +6058,6 @@ function Timeline({
             } else if (isContinued) {
               dotColor = isHovered ? '#f59e0b' : '#a67c1a';
               dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
-            } else if (isDocsEdit) {
-              dotColor = isHovered ? DOCS_TIMELINE_COLORS.edited.hover : (isPromptVisible ? DOCS_TIMELINE_COLORS.edited.visible : DOCS_TIMELINE_COLORS.edited.dim);
-              dotGlow = isHovered ? `0 0 10px rgba(${DOCS_TIMELINE_COLORS.edited.glow}, 0.5)` : (isPromptVisible ? `0 0 6px rgba(${DOCS_TIMELINE_COLORS.edited.glow}, 0.22)` : 'none');
-            } else if (isDocsSearch) {
-              dotColor = isHovered ? DOCS_TIMELINE_COLORS.search.hover : (isPromptVisible ? DOCS_TIMELINE_COLORS.search.visible : DOCS_TIMELINE_COLORS.search.dim);
-              dotGlow = isHovered ? `0 0 10px rgba(${DOCS_TIMELINE_COLORS.search.glow}, 0.5)` : (isPromptVisible ? `0 0 6px rgba(${DOCS_TIMELINE_COLORS.search.glow}, 0.22)` : 'none');
             } else if (isPlan) {
               dotColor = isHovered ? '#5eada3' : '#3d7a72';
               dotGlow = isHovered ? '0 0 10px rgba(94, 173, 163, 0.5)' : 'none';
@@ -6029,16 +6070,9 @@ function Timeline({
             } else if (entryIsSubAgent) {
               dotColor = isHovered ? '#818cf8' : (isPromptVisible ? '#7c86f0' : '#5c63b8');
               dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : (isPromptVisible ? '0 0 6px rgba(129, 140, 248, 0.2)' : 'none');
-            } else if (entry.docsEdited && entry.docsEdited.length > 0) {
-              // User turn that resulted in docs/CLAUDE.md edits — colour the user dot green
-              // instead of emitting a separate docs_edit dot. Edit takes precedence over search:
-              // editing is a "stronger" signal (file actually changed) than reading.
-              dotColor = isHovered ? DOCS_TIMELINE_COLORS.edited.hover : (isPromptVisible ? DOCS_TIMELINE_COLORS.edited.visible : DOCS_TIMELINE_COLORS.edited.dim);
-              dotGlow = isHovered ? `0 0 10px rgba(${DOCS_TIMELINE_COLORS.edited.glow}, 0.5)` : (isPromptVisible ? `0 0 6px rgba(${DOCS_TIMELINE_COLORS.edited.glow}, 0.25)` : 'none');
-            } else if (entry.docsSearchQueries && entry.docsSearchQueries.length > 0) {
-              // User turn that triggered docs_search but no edits — lighter green tone.
-              dotColor = isHovered ? DOCS_TIMELINE_COLORS.search.hover : (isPromptVisible ? DOCS_TIMELINE_COLORS.search.visible : DOCS_TIMELINE_COLORS.search.dim);
-              dotGlow = isHovered ? `0 0 10px rgba(${DOCS_TIMELINE_COLORS.search.glow}, 0.5)` : (isPromptVisible ? `0 0 6px rgba(${DOCS_TIMELINE_COLORS.search.glow}, 0.25)` : 'none');
+            } else if (entryIsOrchestration) {
+              dotColor = isHovered ? '#c084fc' : (isPromptVisible ? '#a855f7' : '#7e22ce');
+              dotGlow = isHovered ? '0 0 10px rgba(168, 85, 247, 0.55)' : (isPromptVisible ? '0 0 6px rgba(168, 85, 247, 0.25)' : 'none');
             } else {
               dotColor = isHovered ? '#fff' : (isPromptVisible ? '#ccc' : '#999');
               dotGlow = isHovered ? '0 0 10px rgba(255, 255, 255, 0.5)' : (isPromptVisible ? '0 0 6px rgba(255, 255, 255, 0.15)' : 'none');
@@ -6062,18 +6096,19 @@ function Timeline({
             // Group headers (×N meta markers) — always bright, never dimmed
             const isGroupMeta = isGroupCollapsed || isExpandedHeader;
             if (isGroupMeta) {
-              dotColor = isHovered ? '#818cf8' : '#7c86f0';
-              dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : '0 0 6px rgba(129, 140, 248, 0.2)';
+              dotColor = isHovered ? groupAccent : groupAccentDim;
+              dotGlow = isHovered ? `0 0 10px rgba(${groupAccentRgb}, 0.5)` : `0 0 6px rgba(${groupAccentRgb}, 0.2)`;
             }
 
             // Note position — use editing position when actively editing this entry
             const isEditingThis = activeNoteIndex === index && isNoteEditing;
             const hasNote = !!notes[entry.uuid] || isEditingThis;
             const notePos = isEditingThis ? noteEditPosition : (notePositions[entry.uuid] || 'before');
-            // Note on dot: override color to purple
+            // Notes use cyan so durable Terminal MCP calls own the purple
+            // semantic channel in the same rail.
             if (hasNote && notePos === 'dot') {
-              dotColor = isHovered ? '#c084fc' : '#9333ea';
-              dotGlow = isHovered ? '0 0 10px rgba(168, 85, 247, 0.5)' : '0 0 6px rgba(168, 85, 247, 0.25)';
+              dotColor = isHovered ? '#67e8f9' : '#0891b2';
+              dotGlow = isHovered ? '0 0 10px rgba(34, 211, 238, 0.5)' : '0 0 6px rgba(34, 211, 238, 0.25)';
             }
             // Rewind marker: override color to pink
             if (rewindMarkers.has(entry.uuid)) {
@@ -6107,14 +6142,14 @@ function Timeline({
                     <div style={{
                       flex: 1,
                       height: '1px',
-                      backgroundColor: 'rgba(129, 140, 248, 0.2)',
+                      backgroundColor: `rgba(${groupAccentRgb}, 0.2)`,
                       marginRight: '3px',
                     }} />
                     {/* Badge */}
                     <span className="pointer-events-none select-none shrink-0" style={{
                       fontSize: '9px',
                       lineHeight: '1',
-                      color: 'rgba(129, 140, 248, 0.9)',
+                      color: groupAccent,
                       fontFamily: 'monospace',
                       fontWeight: 600,
                     }}>
@@ -6124,7 +6159,7 @@ function Timeline({
                     <div style={{
                       flex: 1,
                       height: '1px',
-                      backgroundColor: 'rgba(129, 140, 248, 0.2)',
+                      backgroundColor: `rgba(${groupAccentRgb}, 0.2)`,
                       marginLeft: '3px',
                     }} />
                   </div>
@@ -6144,8 +6179,8 @@ function Timeline({
                           width: noteHovered ? '18px' : '14px',
                           height: noteHovered ? '3px' : '2px',
                           borderRadius: '1px',
-                          backgroundColor: noteHovered ? '#c084fc' : '#9333ea',
-                          boxShadow: noteHovered ? '0 0 8px rgba(168, 85, 247, 0.5)' : 'none',
+                          backgroundColor: noteHovered ? '#67e8f9' : '#0891b2',
+                          boxShadow: noteHovered ? '0 0 8px rgba(34, 211, 238, 0.5)' : 'none',
                           transition: 'background-color 0.2s, box-shadow 0.2s',
                         }}
                       />
@@ -6168,6 +6203,9 @@ function Timeline({
                     // Phase 2: Click on collapsed group header toggles expansion
                     if (groupInfo?.isGroupHeader && !isGroupExpanded) {
                       e.stopPropagation();
+                      if (groupInfo.groupKind === 'orchestration' && !isExpandedLayout) {
+                        setTimelineTreeMode(tabId, true);
+                      }
                       setExpandedGroups(prev => {
                         const next = new Set(prev);
                         next.add(groupInfo.groupId);
@@ -6252,11 +6290,12 @@ function Timeline({
                             style={{
                               width: expW,
                               height: expH,
-                              borderRadius: expR,
+                              borderRadius: entryIsOrchestration ? '2px' : expR,
                               backgroundColor: isUnreachable && !displaysAsCompact ? 'transparent' : dotColor,
-                              border: isUnreachable && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
+                              border: isUnreachable && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
                               boxShadow: dotGlow,
                               boxSizing: 'border-box',
+                              transform: entryIsOrchestration ? 'rotate(45deg)' : undefined,
                               pointerEvents: 'auto',
                               transition: 'background-color 0.2s, box-shadow 0.2s',
                             }}
@@ -6271,11 +6310,12 @@ function Timeline({
                         style={{
                           width: dotWidth,
                           height: dotHeight,
-                          borderRadius: dotRadius,
+                          borderRadius: entryIsOrchestration ? '2px' : dotRadius,
                           backgroundColor: isUnreachable && !isHovered && !displaysAsCompact ? 'transparent' : dotColor,
-                          border: isUnreachable && !isHovered && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
+                          border: isUnreachable && !isHovered && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
                           boxShadow: dotGlow,
                           boxSizing: 'border-box',
+                          transform: entryIsOrchestration ? 'rotate(45deg)' : undefined,
                           pointerEvents: 'auto',
                           transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
                         }}
@@ -6303,14 +6343,45 @@ function Timeline({
                     </>
                   )}
 
+                  {(docsEditedCount > 0 || docsSearchCount > 0) && (
+                    <div
+                      className="absolute pointer-events-none select-none flex items-center gap-[2px]"
+                      aria-label={`${docsEditedCount > 0 ? `${docsEditedCount} docs edits` : ''}${docsEditedCount > 0 && docsSearchCount > 0 ? ', ' : ''}${docsSearchCount > 0 ? `${docsSearchCount} docs searches` : ''}`}
+                      style={isExpandedLayout ? {
+                        right: groupInfo?.isGroupHeader && !isGroupExpanded ? '24px' : '5px',
+                        top: '3px',
+                        zIndex: 2,
+                      } : {
+                        left: 'calc(50% + 5px)',
+                        top: 'calc(50% - 8px)',
+                        zIndex: 2,
+                      }}
+                    >
+                      {docsEditedCount > 0 && (
+                        <Pencil
+                          size={Math.max(7, Math.min(9, Math.round(timelineFontSize * 0.62)))}
+                          strokeWidth={2.2}
+                          color={DOCS_TIMELINE_COLORS.edited.visible}
+                        />
+                      )}
+                      {docsSearchCount > 0 && (
+                        <Search
+                          size={Math.max(7, Math.min(9, Math.round(timelineFontSize * 0.62)))}
+                          strokeWidth={2.2}
+                          color={DOCS_TIMELINE_COLORS.search.visible}
+                        />
+                      )}
+                    </div>
+                  )}
+
                   {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
-                  {isExpandedLayout && !isExpandedHeader && (() => {
+                  {isExpandedLayout && (() => {
                     const rawEntryContent = entry.content || '';
                     const previewLimit = expandedPreviewCharLimit(timelineLineClamp);
                     const metaPrompt = semanticMetaPromptByUuid.get(entry.uuid);
                     const semanticActionMeta = semanticActionByUuid.get(entry.uuid);
                     const semanticAction = semanticActionMeta?.description;
-                    const promptSummary = summaryToolType && sessionId && isEligibleTabTitleEntry(entry)
+                    const promptSummary = summaryToolType && sessionId && !entryIsOrchestration && isEligibleTabTitleEntry(entry)
                       ? promptSummaries[timelineSummaryKey(summaryToolType, sessionId, entry.uuid)]?.summary?.trim()
                       : '';
                     let previewText = displaysAsCompact
@@ -6334,7 +6405,7 @@ function Timeline({
                     } else if (!displaysAsCompact && semanticAction) {
                       previewText = semanticAction;
                       isSummaryPreview = true;
-                    } else if (!displaysAsCompact && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
+                    } else if (!displaysAsCompact && !entryIsOrchestration && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
                       const key = timelineSummaryKey(summaryToolType, sessionId, entry.uuid);
                       const row = promptSummaries[key];
                       if (row?.summary) {
@@ -6391,7 +6462,7 @@ function Timeline({
                         transform: 'translateY(-50%)',
                         fontSize: '9px',
                         lineHeight: '1',
-                        color: 'rgba(129, 140, 248, 0.9)',
+                        color: groupAccent,
                         fontWeight: 600,
                         fontFamily: 'monospace',
                       }}
@@ -6457,8 +6528,8 @@ function Timeline({
                           width: noteHovered ? '18px' : '14px',
                           height: noteHovered ? '3px' : '2px',
                           borderRadius: '1px',
-                          backgroundColor: noteHovered ? '#c084fc' : '#9333ea',
-                          boxShadow: noteHovered ? '0 0 8px rgba(168, 85, 247, 0.5)' : 'none',
+                          backgroundColor: noteHovered ? '#67e8f9' : '#0891b2',
+                          boxShadow: noteHovered ? '0 0 8px rgba(34, 211, 238, 0.5)' : 'none',
                           transition: 'background-color 0.2s, box-shadow 0.2s',
                         }}
                       />
@@ -7401,6 +7472,33 @@ function Timeline({
                     </div>
                     <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
                   </>
+                ) : getOrchestrationTag(currentActiveEntry) ? (
+                  <>
+                    <div className="flex items-center gap-2">
+                      <div style={{ width: '7px', height: '7px', borderRadius: '2px', backgroundColor: '#a855f7', transform: 'rotate(45deg)', flexShrink: 0 }} />
+                      <span style={{ color: '#c084fc' }} className="font-medium text-[11px]">
+                        {getOrchestrationTag(currentActiveEntry)?.phase === 'request'
+                          ? 'Terminal MCP request'
+                          : getOrchestrationTag(currentActiveEntry)?.phase === 'failure'
+                            ? 'Terminal MCP failure'
+                            : 'Terminal MCP result'}
+                      </span>
+                    </div>
+                    {(() => {
+                      const gi = groupMap.get(activeTooltipIndex!);
+                      if (gi?.isGroupHeader && !expandedGroups.has(gi.groupId)) {
+                        return <span className="text-[10px] text-white/40">×{gi.groupSize} calls</span>;
+                      }
+                      return null;
+                    })()}
+                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
+                      {currentActiveEntry.content}
+                    </div>
+                    <div className="flex items-center gap-2 mt-0 pt-1 border-t border-white/5 shrink-0">
+                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                      <span className="text-[9px] text-white/25 font-mono truncate">{getOrchestrationTag(currentActiveEntry)?.runId}</span>
+                    </div>
+                  </>
                 ) : (currentActiveEntry.isSubAgent || currentActiveEntry.isSubAgentTimeout) ? (
                   <>
                     <div className="flex items-center gap-2">
@@ -7504,7 +7602,7 @@ function Timeline({
                     {/* Inline note preview when note is on dot */}
                     {notes[currentActiveEntry.uuid] && (notePositions[currentActiveEntry.uuid] || 'before') === 'dot' && (
                       <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-purple-500/15 shrink-0">
-                        <StickyNote size={10} className="shrink-0 mt-0.5" style={{ color: '#9333ea' }} />
+                        <StickyNote size={10} className="shrink-0 mt-0.5" style={{ color: '#0891b2' }} />
                         <div className="text-purple-300/80 leading-snug font-mono text-[10px] line-clamp-2 flex-1" style={{ whiteSpace: 'pre-wrap' }}>
                           {notes[currentActiveEntry.uuid]}
                         </div>
@@ -8511,7 +8609,7 @@ function Timeline({
                   outline: 'none',
                   backgroundColor: 'rgba(25, 25, 25, 0.98)',
                   backdropFilter: 'blur(12px)',
-                  border: isLockedTooltip ? '1px solid #fff' : '1px solid rgba(168, 85, 247, 0.3)',
+                  border: isLockedTooltip ? '1px solid #fff' : '1px solid rgba(34, 211, 238, 0.3)',
                   borderRadius: '6px 0 0 6px',
                   padding: '10px 14px',
                   fontSize: '12px',
@@ -8557,7 +8655,7 @@ function Timeline({
                                 disabled={!canUp}
                                 className="p-1 rounded transition-colors cursor-pointer disabled:cursor-not-allowed"
                                 style={{
-                                  color: canUp ? '#c084fc' : 'rgba(255,255,255,0.15)',
+                                  color: canUp ? '#67e8f9' : 'rgba(255,255,255,0.15)',
                                 }}
                               >
                                 <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -8571,7 +8669,7 @@ function Timeline({
                                 disabled={!canDown}
                                 className="p-1 rounded transition-colors cursor-pointer disabled:cursor-not-allowed"
                                 style={{
-                                  color: canDown ? '#c084fc' : 'rgba(255,255,255,0.15)',
+                                  color: canDown ? '#67e8f9' : 'rgba(255,255,255,0.15)',
                                 }}
                               >
                                 <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -8609,8 +8707,8 @@ function Timeline({
                                 onClick={(e) => { e.stopPropagation(); setNoteEditPosition(opt.value); }}
                                 className="p-1 rounded transition-colors cursor-pointer"
                                 style={{
-                                  color: noteEditPosition === opt.value ? '#c084fc' : 'rgba(255,255,255,0.3)',
-                                  backgroundColor: noteEditPosition === opt.value ? 'rgba(168, 85, 247, 0.15)' : 'transparent',
+                                  color: noteEditPosition === opt.value ? '#67e8f9' : 'rgba(255,255,255,0.3)',
+                                  backgroundColor: noteEditPosition === opt.value ? 'rgba(34, 211, 238, 0.15)' : 'transparent',
                                 }}
                               >
                                 {opt.icon}

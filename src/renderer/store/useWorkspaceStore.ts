@@ -2751,6 +2751,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Save tabs (forceCleanup when called from batch close, and when the last
     // tab is intentionally closed so SQLite removes the final persisted row).
     saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-closed', options?.forceCleanup || workspace.tabs.size === 0);
+    await ipcRenderer.invoke('orchestration:tab-closed', {
+      tabId,
+      projectId: workspace.projectId,
+    }).catch((error: any) => {
+      console.warn('[CloseTab] orchestration cleanup failed tab=' + tabId.slice(-12) + ': ' + (error?.message || error));
+    });
     console.log('[CloseTab] state-updated tab=' + tabId.slice(-12) +
       ' remaining=' + workspace.tabs.size +
       ' active=' + (workspace.activeTabId ? workspace.activeTabId.slice(-12) : 'none') +

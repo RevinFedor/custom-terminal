@@ -182,6 +182,7 @@ function saveTaskStatuses(list: SessionStatusDef[]) {
 export interface ProcessBarSettings {
   colorA: string;       // базовый цвет полоски процесса
   shimmerColor: string; // цвет бегущего AI-busy блика поверх полоски
+  inheritedColor: string; // цвет ожидания дочернего Terminal MCP run
   shimmerSpacingPct: number; // высота repeat-tile в %, визуально = расстояние между бликами
   shimmerOpacityPct: number; // peak-alpha блика в %, края считаются слабее в CSS vars
   position: 'left' | 'right'; // где рисовать полоску — у левого или правого края вкладки
@@ -190,6 +191,7 @@ export interface ProcessBarSettings {
 const DEFAULT_PROCESS_BAR: ProcessBarSettings = {
   colorA: '#155E75',        // cyan-800 — приглушённая базовая полоса
   shimmerColor: '#FFFFFF',  // белый блик, который раньше был зашит в CSS
+  inheritedColor: '#A855F7', // purple-500 — ожидание дочерней полной сессии
   shimmerSpacingPct: 50,
   shimmerOpacityPct: 55,
   position: 'left',
@@ -214,6 +216,9 @@ function loadProcessBar(): ProcessBarSettings {
       shimmerColor: typeof parsed.shimmerColor === 'string'
         ? parsed.shimmerColor
         : DEFAULT_PROCESS_BAR.shimmerColor,
+      inheritedColor: typeof parsed.inheritedColor === 'string'
+        ? parsed.inheritedColor
+        : DEFAULT_PROCESS_BAR.inheritedColor,
       shimmerSpacingPct: Math.max(20, Math.min(200, Math.round(rawSpacing))),
       shimmerOpacityPct: Math.max(5, Math.min(100, Math.round(rawOpacity))),
       position: parsed.position === 'right' ? 'right' : 'left',
@@ -2097,6 +2102,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const next: ProcessBarSettings = {
       colorA: typeof patch.colorA === 'string' ? patch.colorA : cur.colorA,
       shimmerColor: typeof patch.shimmerColor === 'string' ? patch.shimmerColor : cur.shimmerColor,
+      inheritedColor: typeof patch.inheritedColor === 'string' ? patch.inheritedColor : cur.inheritedColor,
       shimmerSpacingPct: typeof patch.shimmerSpacingPct === 'number'
         ? Math.max(20, Math.min(200, Math.round(patch.shimmerSpacingPct)))
         : cur.shimmerSpacingPct,

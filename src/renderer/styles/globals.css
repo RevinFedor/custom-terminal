@@ -317,6 +317,13 @@
   will-change: background-position;
 }
 
+.tab-process-bar-inherited-shimmer-overlay {
+  /* Keep the inherited base strip purple, but reuse the configured loader
+     highlight so movement remains visible instead of compositing purple on
+     the exact same purple. */
+  --process-bar-shimmer-rgb: var(--process-bar-inherited-shimmer-rgb, 168, 85, 247);
+}
+
 /* AI-busy: горизонтальный шиммер по ширине вкладки.
    ВАЖНО: keyframes должны привести stripe ПОЛНОСТЬЮ за край viewport'а с обеих сторон,
    иначе на стыке цикла будет видимый «снап» (яркий пик зависает у правого края и резко

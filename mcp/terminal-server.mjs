@@ -518,7 +518,7 @@ const TOOLS = [
   },
   {
     name: 'delegate_to_session',
-    description: 'Start a persistent cross-tab delegation through the Project API. This is for a separate visible Claude/Codex session, not for a temporary internal subagent. It returns immediately with a durable runId; the source tab receives one completion notification, and get_delegation_result reads the final answer in one request. Pass targetTabId to reuse a session or targetProjectId+toolType to create a background session.',
+    description: 'Start a persistent cross-tab delegation through the Project API. This is for a separate visible Claude/Codex session, not for a temporary internal subagent. It returns immediately with a durable runId; the source tab receives one completion notification, and get_delegation_result reads the final outcome in one request. A delegation created by an executor is linked to that executor run automatically and waits for nested Terminal MCP delegations by default.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -534,6 +534,8 @@ const TOOLS = [
         thinking: { type: 'string', description: 'Optional Claude thinking mode.' },
         placement: { type: 'string', enum: ['child', 'root'], description: 'Placement for a newly created target. Default child when source and target are in the same project; use root for an independent session.' },
         parentTabId: { type: 'string', description: 'Optional explicit visual parent for a newly created target in the target project.' },
+        parentRunId: { type: 'string', description: 'Optional explicit orchestration parent. Normally inferred from the source tab active run.' },
+        waitForDescendants: { type: 'boolean', description: 'Default true. Keep the parent run active until nested Terminal MCP delegations are consumed. Set false only when an early report is intentional.' },
         notifySource: { type: 'boolean', description: 'Default true. Queue one short completion notification in the source input.' },
         queue: { type: 'boolean', description: 'Default true. Queue on a busy target instead of failing.' },
         runId: { type: 'string', description: 'Optional idempotency key.' },
@@ -555,7 +557,7 @@ const TOOLS = [
   },
   {
     name: 'get_delegation_result',
-    description: 'Read the completed assistant answer for a delegation in one request. A 202 response means the run or transcript materialization is not ready yet; wait for the source completion notification instead of polling in a loop.',
+    description: 'Read the final assistant answer or terminal failure for a delegation in one request. A 202 response means the run or transcript materialization is not ready yet; wait for the source completion notification instead of polling in a loop.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1251,6 +1253,8 @@ async function callTool(name, args) {
         thinking: args.thinking || undefined,
         placement: args.placement || 'child',
         parentTabId: args.parentTabId || undefined,
+        parentRunId: args.parentRunId || undefined,
+        waitForDescendants: args.waitForDescendants !== false,
         notifySource: args.notifySource !== false,
         queue: args.queue !== false,
       });

@@ -18,6 +18,9 @@ interface TooltipProps {
   // Simple labels should not expose the selectable body and Copy action bar.
   // Interactive mode remains the default for existing long-form tooltips.
   interactive?: boolean;
+  // Replace the generic Close/Copy row for domain-specific interactive cards.
+  // `false` removes the row entirely; `undefined` keeps the generic controls.
+  actionBar?: React.ReactNode | false;
 }
 
 // ─── Global Cmd-key state ────────────────────────────────────
@@ -78,6 +81,7 @@ export default function Tooltip({
   disabled = false,
   always = false,
   interactive = true,
+  actionBar,
 }: TooltipProps) {
   const [hovering, setHovering] = useState(false);
   const [visible, setVisible] = useState(false);
@@ -348,11 +352,7 @@ export default function Tooltip({
             outlineOffset: 0,
           }}
         >
-          {/* Action bar — single row, [✕] left, [Copy] right. Always rendered
-              (not hidden until hover) so the layout stays stable and the user
-              can mouse to it without the box shifting. The body sits below;
-              text inside it is selectable. */}
-          {interactive && <div
+          {interactive && actionBar !== false && <div
             data-tooltip-actions
             style={{
               display: 'flex',
@@ -366,46 +366,48 @@ export default function Tooltip({
               color: '#888',
             }}
           >
-            <button
-              type="button"
-              onClick={(e) => { e.stopPropagation(); setHovering(false); setInTip(false); setVisible(false); }}
-              title="Закрыть"
-              style={{
-                background: 'transparent',
-                border: 'none',
-                color: '#888',
-                cursor: 'pointer',
-                padding: '2px 6px',
-                fontSize: 12,
-                lineHeight: 1,
-                borderRadius: 3,
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = '#fff'; (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = '#888'; (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
-            >
-              ✕
-            </button>
-            <button
-              type="button"
-              onClick={(e) => { e.stopPropagation(); handleCopy(); }}
-              title="Копировать содержимое"
-              style={{
-                background: 'transparent',
-                border: '1px solid rgba(255,255,255,0.12)',
-                color: copied ? '#4ade80' : '#aaa',
-                cursor: 'pointer',
-                padding: '1px 8px',
-                fontSize: 10,
-                lineHeight: 1.4,
-                borderRadius: 3,
-                fontFamily: 'inherit',
-                transition: 'color 120ms, background 120ms',
-              }}
-              onMouseEnter={(e) => { if (!copied) { (e.currentTarget as HTMLElement).style.color = '#fff'; (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'; } }}
-              onMouseLeave={(e) => { if (!copied) { (e.currentTarget as HTMLElement).style.color = '#aaa'; (e.currentTarget as HTMLElement).style.background = 'transparent'; } }}
-            >
-              {copied ? '✓ Скопировано' : 'Копировать'}
-            </button>
+            {actionBar === undefined ? <>
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); setHovering(false); setInTip(false); setVisible(false); }}
+                title="Закрыть"
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: '#888',
+                  cursor: 'pointer',
+                  padding: '2px 6px',
+                  fontSize: 12,
+                  lineHeight: 1,
+                  borderRadius: 3,
+                }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = '#fff'; (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = '#888'; (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+              >
+                ✕
+              </button>
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); handleCopy(); }}
+                title="Копировать содержимое"
+                style={{
+                  background: 'transparent',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  color: copied ? '#4ade80' : '#aaa',
+                  cursor: 'pointer',
+                  padding: '1px 8px',
+                  fontSize: 10,
+                  lineHeight: 1.4,
+                  borderRadius: 3,
+                  fontFamily: 'inherit',
+                  transition: 'color 120ms, background 120ms',
+                }}
+                onMouseEnter={(e) => { if (!copied) { (e.currentTarget as HTMLElement).style.color = '#fff'; (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'; } }}
+                onMouseLeave={(e) => { if (!copied) { (e.currentTarget as HTMLElement).style.color = '#aaa'; (e.currentTarget as HTMLElement).style.background = 'transparent'; } }}
+              >
+                {copied ? '✓ Скопировано' : 'Копировать'}
+              </button>
+            </> : actionBar}
           </div>}
           <div
             data-tooltip-body

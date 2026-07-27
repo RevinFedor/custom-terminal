@@ -1362,7 +1362,24 @@ async function inspectJsonlFiles(rootDir, maxFiles = 4000) {
   return { files, errors, truncated };
 }
 
-async function parseJsonlFile(filePath) {
+async function parseJsonlFile(filePath, options = {}) {
+  if (options.forceFresh === true) {
+    // A task_complete append can land while another reader is still consuming
+    // the previous file size. Await and discard that snapshot before the
+    // orchestration result reader takes its authoritative final view.
+    while (_codexJsonlInflight.has(filePath)) {
+      const pending = _codexJsonlInflight.get(filePath);
+      try {
+        await pending;
+      } catch {
+        // The fresh read below owns the retry and the resulting error.
+      }
+      if (_codexJsonlInflight.get(filePath) === pending) {
+        _codexJsonlInflight.delete(filePath);
+      }
+    }
+    invalidateCodexJsonlCache(filePath);
+  }
   const inflight = _codexJsonlInflight.get(filePath);
   if (inflight) {
     const records = await inflight;
@@ -2597,6 +2614,8 @@ function buildCodexTimeline(records, sessionId) {
             };
           }
         }
+      } else if (payload.type === 'task_complete' && currentUser) {
+        currentUser.responseComplete = true;
       } else if (isCompactPayload(payload)) {
         if (compactCompanionLines.has(record.__line)) {
           continue;
@@ -3935,6 +3954,7 @@ function buildCodexTurnAssistantResult(records, sessionId, entryUuid, maxChars =
   return projected.assistantText
     ? {
       success: true,
+      complete: collected.target.responseComplete === true,
       assistantText: projected.assistantText,
       assistantChars: projected.assistantChars,
       truncated: projected.truncated,
@@ -5606,10 +5626,10 @@ function listCodexModels() {
   });
 }
 
-async function loadSessionRecords(sessionId, cwd) {
+async function loadSessionRecords(sessionId, cwd, options = {}) {
   const found = await findCodexSessionFile(sessionId, cwd);
   if (!found) return { success: false, error: 'Codex session file not found' };
-  const records = await parseJsonlFile(found.filePath);
+  const records = await parseJsonlFile(found.filePath, options);
   const sourceSnapshot = await getCodexJsonlSourceSnapshot(found.filePath, sessionId);
   return { success: true, records, filePath: found.filePath, sourceSnapshot };
 }

@@ -37,6 +37,7 @@ import {
 import { hydratePromptQueueStore, usePromptQueueStore, serializePromptQueueCore, flushPromptQueueStoreSync } from './store/usePromptQueueStore';
 import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
+import { initializeOrchestrationStore, useOrchestrationStore } from './store/useOrchestrationStore';
 import { buildCodexRunPayload } from './utils/codexLaunch';
 import {
   getCodexDisplaySessionId,
@@ -389,6 +390,7 @@ interface ProjectTabItemProps {
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
   completionNotificationCount?: number; // Count of completed tabs with armed notification
   isProjectBusy?: boolean; // Any tab in project has Claude/Gemini thinking
+  isProjectInheritedBusy?: boolean; // A source tab is waiting for a Terminal MCP child
   isProjectAwaiting?: boolean; // Any tab in project blocked on AskUserQuestion (needs answer)
   isEditing: boolean;
   editValue: string;
@@ -428,6 +430,7 @@ const ProjectTabItem = memo(({
   onTabDrop,
   isAreaActive,
   isProjectBusy = false,
+  isProjectInheritedBusy = false,
   isProjectAwaiting = false,
   isProjectLoading = false,
   isPinnedSystem = false
@@ -571,7 +574,7 @@ const ProjectTabItem = memo(({
   // Text color: active (selected) = black, has processes = white, idle = gray
   const textColor = isActive
     ? 'text-black'
-    : activeProcessCount > 0
+    : activeProcessCount > 0 || isProjectBusy
       ? 'text-white'
       : 'text-gray-400 hover:text-white';
   const dropState = structuredDropState
@@ -677,15 +680,17 @@ const ProjectTabItem = memo(({
             <span className="max-w-[120px] truncate">{projectName}</span>
           </>
         )}
-        {activeProcessCount > 0 && !isEditing && (
+        {(activeProcessCount > 0 || isProjectBusy || isProjectLoading) && !isEditing && (
           <span
             className="relative flex items-center justify-center text-[10px] font-medium rounded-full"
             style={{
               minWidth: '16px',
               height: '16px',
               padding: '0 4px',
-              backgroundColor: isActive ? 'rgba(74, 222, 128, 0.3)' : 'rgba(74, 222, 128, 0.2)',
-              color: isActive ? '#166534' : '#4ade80',
+              backgroundColor: isProjectInheritedBusy
+                ? 'color-mix(in srgb, var(--process-bar-inherited-color, #A855F7) 24%, transparent)'
+                : (isActive ? 'rgba(74, 222, 128, 0.3)' : 'rgba(74, 222, 128, 0.2)'),
+              color: isProjectInheritedBusy ? 'var(--process-bar-inherited-color, #A855F7)' : (isActive ? '#166534' : '#4ade80'),
               boxSizing: 'border-box',
             }}
           >
@@ -693,14 +698,16 @@ const ProjectTabItem = memo(({
               <span
                 className="absolute inset-0 rounded-full"
                 style={{
-                  border: '2px solid rgba(74, 222, 128, 0.2)',
-                  borderTopColor: '#4ade80',
+                  border: isProjectInheritedBusy
+                    ? '2px solid color-mix(in srgb, var(--process-bar-inherited-color, #A855F7) 20%, transparent)'
+                    : '2px solid rgba(74, 222, 128, 0.2)',
+                  borderTopColor: isProjectInheritedBusy ? 'var(--process-bar-inherited-color, #A855F7)' : '#4ade80',
                   boxSizing: 'border-box',
                   animation: 'tab-dot-spin 0.8s linear infinite',
                 }}
               />
             )}
-            {activeProcessCount}
+            {activeProcessCount > 0 ? activeProcessCount : null}
           </span>
         )}
         {completionNotificationCount > 0 && !isEditing && (
@@ -845,6 +852,7 @@ function App() {
   // runner above tolerates queue items appearing after mount (subscribes to
   // store deltas), so this doesn't need to block render.
   useEffect(() => { hydratePromptQueueStore(); }, []);
+  useEffect(() => { void initializeOrchestrationStore(); }, []);
 
   // Individual selectors — only re-render when specific values change (not on every store mutation)
   const view = useWorkspaceStore((s) => s.view);
@@ -871,6 +879,13 @@ function App() {
   const { projects, loadProjects, updateProject } = useProjectsStore();
   const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, dragAreaWidth, setDragAreaWidth } = useUIStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
+  const inheritedBusyProjectKey = useOrchestrationStore((s) => (
+    Array.from(s.inheritedBusyProjectIds).sort().join('\u0000')
+  ));
+  const inheritedBusyProjectIds = useMemo(
+    () => new Set(inheritedBusyProjectKey ? inheritedBusyProjectKey.split('\u0000') : []),
+    [inheritedBusyProjectKey],
+  );
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -889,6 +904,10 @@ function App() {
     const peakAlpha = opacityPctToAlpha(processBar.shimmerOpacityPct);
     root.style.setProperty('--process-bar-color-a', processBar.colorA);
     root.style.setProperty('--process-bar-shimmer-rgb', hexToRgbTriplet(processBar.shimmerColor));
+    root.style.setProperty('--process-bar-inherited-color', processBar.inheritedColor);
+    // Inherited activity changes the strip color, not the loader highlight.
+    // Using the same RGB for both makes the animated overlay pixel-identical.
+    root.style.setProperty('--process-bar-inherited-shimmer-rgb', hexToRgbTriplet(processBar.shimmerColor));
     root.style.setProperty('--process-bar-shimmer-spacing', `${processBar.shimmerSpacingPct}%`);
     root.style.setProperty('--process-bar-shimmer-alpha', String(peakAlpha));
     root.style.setProperty('--process-bar-shimmer-edge-alpha', String(Math.max(0.01, peakAlpha * 0.22)));
@@ -896,13 +915,14 @@ function App() {
       '[App:ProcessBarVars]' +
       ' colorA=' + processBar.colorA +
       ' shimmerColor=' + processBar.shimmerColor +
+      ' inheritedColor=' + processBar.inheritedColor +
       ' rgb=' + hexToRgbTriplet(processBar.shimmerColor) +
       ' spacingPct=' + processBar.shimmerSpacingPct +
       ' opacityPct=' + processBar.shimmerOpacityPct +
       ' peakAlpha=' + peakAlpha.toFixed(3) +
       ' edgeAlpha=' + Math.max(0.01, peakAlpha * 0.22).toFixed(3)
     );
-  }, [processBar.colorA, processBar.shimmerColor, processBar.shimmerSpacingPct, processBar.shimmerOpacityPct]);
+  }, [processBar.colorA, processBar.shimmerColor, processBar.inheritedColor, processBar.shimmerSpacingPct, processBar.shimmerOpacityPct]);
 
   useEffect(() => {
     const showNativeNotification = async (detail: TabCompletionNotificationDetail) => {
@@ -2217,6 +2237,7 @@ function App() {
             processBar: {
               colorA: uiState.processBar.colorA,
               shimmerColor: uiState.processBar.shimmerColor,
+              inheritedColor: uiState.processBar.inheritedColor,
               shimmerSpacingPct: uiState.processBar.shimmerSpacingPct,
               shimmerOpacityPct: uiState.processBar.shimmerOpacityPct,
               position: uiState.processBar.position,
@@ -2269,6 +2290,7 @@ function App() {
             processBar: {
               colorA: uiState.processBar.colorA,
               shimmerColor: uiState.processBar.shimmerColor,
+              inheritedColor: uiState.processBar.inheritedColor,
               shimmerSpacingPct: uiState.processBar.shimmerSpacingPct,
               shimmerOpacityPct: uiState.processBar.shimmerOpacityPct,
               position: uiState.processBar.position,
@@ -3405,13 +3427,18 @@ function App() {
           }
         }
         if (action === 'interruptClaudeTurn' || action === 'interruptAgentTurnScenario') {
-          const { tabId } = payload || {};
+          const { tabId, busy } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           const { toolType, runtime } = describeAgentTab(tabId);
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           console.log('[MobInterrupt:Bridge] interruptAgentTurn tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
-            const result = interruptAgentTurnScenario({ tabId, toolType, runtime });
+            const result = interruptAgentTurnScenario({
+              tabId,
+              toolType,
+              runtime,
+              busy: typeof busy === 'boolean' ? busy : undefined,
+            });
             return reply(true, result);
           } catch (e: any) {
             console.log('[MobInterrupt:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
@@ -3493,7 +3520,7 @@ function App() {
           // Single dispatch entry for agent send. `sendMessageAuto` is the old
           // bridge name kept for route compatibility; the implementation is now
           // the shared scenario used by Project API and Inbox API.
-          const { tabId, prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue, returnDraftOnConflict } = payload || {};
+          const { tabId, prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue, returnDraftOnConflict, presentationSnapshot } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
           const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
           if (runtime && toolType) {
@@ -3520,10 +3547,12 @@ function App() {
                 queue,
                 model,
                 effort,
+                thinking,
                 returnDraftOnConflict,
                 presentationSnapshot: {
                   historySessionId: sessionId,
-                  promptChips: [],
+                  promptChips: presentationSnapshot?.promptChips || [],
+                  semanticTags: presentationSnapshot?.semanticTags || [],
                 },
               }),
             });
@@ -4691,13 +4720,15 @@ function App() {
     });
 
     const isProjectLoading = apiLoadingProjects.has(projectId);
+    const hasInheritedBusyTab = inheritedBusyProjectIds.has(projectId);
     return {
       activeCount,
       hasAwaitingTab,
       completionNotificationCount,
       interruptedCount,
       isProjectLoading,
-      hasProjectShimmer: hasBusyTab || hasPasteBusyTab || isProjectLoading,
+      hasProjectInheritedShimmer: hasInheritedBusyTab && !hasBusyTab && !hasPasteBusyTab && !isProjectLoading,
+      hasProjectShimmer: hasBusyTab || hasPasteBusyTab || hasInheritedBusyTab || isProjectLoading,
     };
   };
   const inboxIndicators = getProjectTabIndicators(INBOX_PROJECT_ID, inboxWorkspace);
@@ -4842,6 +4873,7 @@ function App() {
             interruptedCount={inboxIndicators.interruptedCount}
             completionNotificationCount={inboxIndicators.completionNotificationCount}
             isProjectBusy={inboxIndicators.hasProjectShimmer}
+            isProjectInheritedBusy={inboxIndicators.hasProjectInheritedShimmer}
             isProjectAwaiting={inboxIndicators.hasAwaitingTab}
             isProjectLoading={inboxIndicators.isProjectLoading}
             isEditing={false}
@@ -4898,6 +4930,7 @@ function App() {
                 interruptedCount={indicators.interruptedCount}
                 completionNotificationCount={indicators.completionNotificationCount}
                 isProjectBusy={indicators.hasProjectShimmer}
+                isProjectInheritedBusy={indicators.hasProjectInheritedShimmer}
                 isProjectAwaiting={indicators.hasAwaitingTab}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}

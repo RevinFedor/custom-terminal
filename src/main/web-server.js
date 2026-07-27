@@ -59,7 +59,13 @@ const {
 const {
   waitForAgentReadyTransition,
 } = require('./agent-ready-wait');
-const { OrchestrationRunStore, isActiveStatus } = require('./orchestration-runs');
+const {
+  OrchestrationRunStore,
+  hasNewerTargetRun,
+  isActiveStatus,
+  isTerminalStatus,
+  isCompleteOrchestrationResult,
+} = require('./orchestration-runs');
 const {
   buildDelegationResultTarget,
   isAgentStatusBusyForClose,
@@ -182,6 +188,9 @@ const externalRunByConversationKey = new Map(); // conversationKey -> runId
 const DEFAULT_EXTERNAL_AUTO_CLOSE_MS = 15 * 60 * 1000;
 let orchestrationRunStore = null;
 const orchestrationCompletionInflight = new Set();
+const orchestrationNotificationInflight = new Set();
+const orchestrationAutoStopInflight = new Set();
+let orchestrationPolicyTimer = null;
 
 function getOrchestrationRunStore() {
   if (!orchestrationRunStore) {
@@ -1178,6 +1187,7 @@ async function runAgentSendScenario({
   statusAtSend,
   queue,
   ownership,
+  presentationSnapshot,
   timeoutMs = 60_000,
 }) {
   return await bridgeRequest('sendAgentPromptScenario', {
@@ -1191,6 +1201,7 @@ async function runAgentSendScenario({
     source,
     statusAtSend,
     queue: queue === true,
+    presentationSnapshot: presentationSnapshot || null,
     // Project/History/iOS controls the terminal tab directly: leave a found
     // terminal draft untouched and report conflict. External Inbox owns its
     // own chat composer: atomically pull terminal draft out for caller rollback.
@@ -1202,8 +1213,11 @@ async function runAgentStopScenario(tabId, timeoutMs = 5000) {
   return await bridgeRequest('stopAgentProcessScenario', { tabId }, timeoutMs);
 }
 
-async function runAgentInterruptScenario(tabId, timeoutMs = 2000) {
-  return await bridgeRequest('interruptAgentTurnScenario', { tabId }, timeoutMs);
+async function runAgentInterruptScenario(tabId, timeoutMs = 2000, busy) {
+  return await bridgeRequest('interruptAgentTurnScenario', {
+    tabId,
+    ...(typeof busy === 'boolean' ? { busy } : {}),
+  }, timeoutMs);
 }
 
 async function runAgentGrabDraftScenario(tabId, timeoutMs = 5000) {
@@ -1287,7 +1301,11 @@ function emitOrchestrationRun(run, reason = 'changed') {
   for (const tabId of tabIds) webBroadcast(tabId, payload);
 }
 
-async function probeOrchestrationResult(run, { maxChars = 100_000, sessionInfo = null } = {}) {
+async function probeOrchestrationResult(run, {
+  maxChars = 100_000,
+  sessionInfo = null,
+  forceFresh = false,
+} = {}) {
   if (!run || typeof getAgentTurnResult !== 'function') {
     return { found: false, resultAvailable: false, error: 'result reader unavailable' };
   }
@@ -1299,13 +1317,16 @@ async function probeOrchestrationResult(run, { maxChars = 100_000, sessionInfo =
     const result = await getAgentTurnResult({
       sessionId,
       cwd,
-      promptHash: run.promptHash,
-      requestedAt: run.createdAt,
+      promptHash: run.resultPromptHash || (run.resultAfterAt ? undefined : run.promptHash),
+      requestedAt: run.resultPromptRequestedAt || run.createdAt,
+      resultAfterAt: run.resultPromptHash ? undefined : run.resultAfterAt,
+      forceFresh,
       maxChars,
     });
     return {
       ...(result || {}),
       found: result?.found === true,
+      resultComplete: result?.complete === true,
       resultAvailable: typeof result?.assistantText === 'string' && result.assistantText.length > 0,
       sessionId,
     };
@@ -1314,73 +1335,164 @@ async function probeOrchestrationResult(run, { maxChars = 100_000, sessionInfo =
   }
 }
 
+function emitOrchestrationChanges(changed, reason) {
+  for (const run of Array.isArray(changed) ? changed : []) emitOrchestrationRun(run, reason);
+}
+
+function orchestrationNotificationText(run) {
+  const baseUrl = 'http://127.0.0.1:' + resolvedPort;
+  const success = run.status === 'completed';
+  return [
+    success ? '[Оркестрация] Запрос завершён.' : '[Оркестрация] Запрос завершён с ошибкой.',
+    'runId: ' + run.runId,
+    'Исполнитель: ' + (run.targetTabName || run.targetTabId) + ' (' + (run.targetToolType || 'agent') + ').',
+    success ? null : 'Исход: ' + (run.outcome || run.status) + '. ' + (run.error || 'Подробности не указаны.'),
+    'Результат не вставлен в сообщение. Получи его одним запросом:',
+    'Terminal MCP: get_delegation_result({ runId: "' + run.runId + '" })',
+    'HTTP fallback: curl -sS -H "Authorization: Bearer $(cat ~/.noted-terminal/web-token.txt)" "' + baseUrl + '/api/orchestrations/' + encodeURIComponent(run.runId) + '/result"',
+    'Не опрашивай статус повторно. После получения результата продолжи исходную задачу.',
+  ].filter(Boolean).join('\n');
+}
+
+function orchestrationPresentationSnapshot(run, phase) {
+  if (!run?.runId) return null;
+  return {
+    semanticTags: [{
+      kind: 'orchestration',
+      runId: run.runId,
+      phase,
+      parentRunId: run.parentRunId || undefined,
+      sourceTabId: run.sourceTabId || undefined,
+      targetTabId: run.targetTabId || undefined,
+      outcome: run.outcome || undefined,
+    }],
+  };
+}
+
 async function sendOrchestrationCompletionNotification(run) {
+  if (!run?.runId || orchestrationNotificationInflight.has(run.runId)) return;
   const store = getOrchestrationRunStore();
   const current = await store.getInternal(run.runId);
-  if (!current || current.notifySource === false || current.notificationStatus === 'sent' || current.notificationStatus === 'queued') return;
-  if (!current.sourceTabId || current.sourceTabId === current.targetTabId) return;
-  await store.patch(current.runId, { notificationStatus: 'sending', notificationAttemptedAt: Date.now() });
-  emitOrchestrationRun(await store.get(current.runId), 'notification-sending');
+  if (!current || !isTerminalStatus(current.status)) return;
+  if (current.status === 'completed' && current.resultComplete !== true) return;
+  if (current.notifySource === false || current.notificationSuppressed) return;
+  if (['sent', 'queued', 'suppressed', 'source-closed'].includes(current.notificationStatus)) return;
+  if (!current.sourceTabId || current.sourceTabId === current.targetTabId) {
+    const suppressed = await store.markNotification(current.runId, 'suppressed');
+    emitOrchestrationChanges(suppressed?.changed, 'notification-suppressed');
+    return;
+  }
+
+  orchestrationNotificationInflight.add(run.runId);
+  const notificationText = orchestrationNotificationText(current);
+  const sending = await store.markNotification(current.runId, 'sending', {
+    notificationAttemptedAt: Date.now(),
+    notificationPromptHash: promptFingerprint(notificationText),
+  });
+  emitOrchestrationChanges(sending?.changed, 'notification-sending');
   try {
     const status = await resolveAgentSessionInfo(current.sourceTabId, 2000);
-    const baseUrl = 'http://127.0.0.1:' + resolvedPort;
-    const message = [
-      '[Оркестрация] Запрос завершён.',
-      'runId: ' + current.runId,
-      'Исполнитель: ' + (current.targetTabName || current.targetTabId) + ' (' + (current.targetToolType || 'agent') + ').',
-      'Результат не вставлен в сообщение. Получи его одним запросом:',
-      'Terminal MCP: get_delegation_result({ runId: "' + current.runId + '" })',
-      'HTTP fallback: curl -sS -H "Authorization: Bearer $(cat ~/.noted-terminal/web-token.txt)" "' + baseUrl + '/api/orchestrations/' + encodeURIComponent(current.runId) + '/result"',
-      'Не опрашивай статус повторно. После получения результата продолжи исходную задачу.',
-    ].join('\n');
+    if (!status) {
+      const sourceClosed = await store.markNotification(current.runId, 'source-closed', {
+        notificationSuppressed: true,
+        notificationError: 'source tab unavailable',
+      });
+      emitOrchestrationChanges(sourceClosed?.changed, 'notification-source-closed');
+      return;
+    }
     const result = await runAgentSendScenario({
       tabId: current.sourceTabId,
-      prompt: message,
+      prompt: notificationText,
       handoffId: 'orchestration-complete:' + current.runId,
-      source: 'orchestration-completion',
+      source: 'orchestration-completion:' + current.runId,
       statusAtSend: status?.status || status?.sessionStatus || 'unknown',
       queue: true,
       ownership: 'project',
+      presentationSnapshot: orchestrationPresentationSnapshot(
+        current,
+        current.status === 'completed' ? 'completion' : 'failure',
+      ),
       timeoutMs: 60_000,
     });
     if (isSendFailure(result)) {
-      await store.patch(current.runId, {
-        notificationStatus: result?.code === 'terminal_draft_conflict' ? 'draft-conflict' : 'failed',
+      const notificationStatus = result?.code === 'terminal_draft_conflict'
+        ? 'waiting-for-input'
+        : 'failed';
+      const failed = await store.markNotification(current.runId, notificationStatus, {
         notificationError: result?.error || result?.message || 'notification send failed',
       });
+      emitOrchestrationChanges(failed?.changed, 'notification-finished');
     } else {
-      await store.patch(current.runId, {
-        notificationStatus: result?.queued ? 'queued' : 'sent',
+      const delivered = await store.markNotification(current.runId, result?.queued ? 'queued' : 'sent', {
         notificationDeliveredAt: Date.now(),
         notificationError: null,
       });
+      emitOrchestrationChanges(delivered?.changed, 'notification-finished');
+      for (const settled of delivered?.settled || []) {
+        await finalizeSettledOrchestration(settled, 'ancestor-settled');
+      }
     }
   } catch (error) {
-    await store.patch(current.runId, {
-      notificationStatus: 'failed',
+    const failed = await store.markNotification(current.runId, 'failed', {
       notificationError: String(error?.message || error),
     });
+    emitOrchestrationChanges(failed?.changed, 'notification-finished');
+  } finally {
+    orchestrationNotificationInflight.delete(run.runId);
   }
-  emitOrchestrationRun(await store.get(current.runId), 'notification-finished');
 }
 
-async function finalizeCompletedOrchestration(run, reason = 'completed') {
-  if (!run || orchestrationCompletionInflight.has(run.runId)) return;
+async function finalizeSettledOrchestration(run, reason = 'settled') {
+  if (!run || !isTerminalStatus(run.status) || orchestrationCompletionInflight.has(run.runId)) return;
   orchestrationCompletionInflight.add(run.runId);
   try {
     const store = getOrchestrationRunStore();
-    const probe = await probeOrchestrationResult(await store.getInternal(run.runId));
-    await store.patch(run.runId, {
-      resultAvailable: probe.resultAvailable === true,
-      resultTurnIndex: Number.isInteger(probe.turnIndex) ? probe.turnIndex : null,
-      resultUserUuid: probe.userUuid || null,
-      resultError: probe.found ? null : (probe.error || 'matching turn not found'),
-      sessionId: probe.sessionId || run.sessionId || null,
-    });
-    emitOrchestrationRun(await store.get(run.runId), reason);
-    await sendOrchestrationCompletionNotification(await store.get(run.runId));
+    const current = await store.getInternal(run.runId);
+    if (!current) return;
+    const patch = {};
+    if (current.status === 'completed') {
+      const probe = await probeOrchestrationResult(current, { forceFresh: true });
+      Object.assign(patch, {
+        resultComplete: isCompleteOrchestrationResult(probe),
+        resultAvailable: probe.resultAvailable === true,
+        resultTurnIndex: Number.isInteger(probe.turnIndex) ? probe.turnIndex : null,
+        resultUserUuid: probe.userUuid || null,
+        resultError: !probe.found
+          ? (probe.error || 'matching turn not found')
+          : (probe.resultComplete === true ? null : 'matching transcript turn is incomplete'),
+        sessionId: probe.sessionId || current.sessionId || null,
+      });
+      if (current.targetCreated && current.autoStopCreatedTargets !== false && current.successAutoStopMs > 0 && !current.autoStopAt) {
+        patch.autoStopAt = (current.completedAt || Date.now()) + current.successAutoStopMs;
+        patch.autoStopStatus = 'scheduled';
+      }
+    }
+    if (Object.keys(patch).length) await store.patch(current.runId, patch);
+    const finalized = await store.get(current.runId);
+    emitOrchestrationRun(finalized, reason);
+    if (finalized.status === 'completed' && finalized.resultComplete !== true) {
+      console.warn('[Orchestration] completion withheld until transcript is complete run=' + finalized.runId);
+      return;
+    }
+    await sendOrchestrationCompletionNotification(finalized);
   } finally {
     orchestrationCompletionInflight.delete(run.runId);
+    void scheduleOrchestrationPolicyTimer();
+  }
+}
+
+async function finalizeSettledOrchestrations(runs, reason) {
+  for (const run of Array.isArray(runs) ? runs : []) {
+    await finalizeSettledOrchestration(run, reason);
+  }
+}
+
+async function retryWaitingNotificationsForSource(tabId) {
+  const runs = await getOrchestrationRunStore().listForTab(tabId);
+  for (const run of runs) {
+    if (run.sourceTabId !== tabId || !isTerminalStatus(run.status)) continue;
+    if (run.notificationStatus !== 'waiting-for-input' && run.notificationStatus !== 'failed') continue;
+    await sendOrchestrationCompletionNotification(run);
   }
 }
 
@@ -1389,8 +1501,10 @@ async function processOrchestrationLifecycle(tabId, payload) {
   try {
     const store = getOrchestrationRunStore();
     const result = await store.applyLifecycle(tabId, payload);
-    for (const run of result.changed) emitOrchestrationRun(run, 'target-lifecycle');
-    for (const run of result.completed) await finalizeCompletedOrchestration(run, 'target-completed');
+    emitOrchestrationChanges(result.changed, 'target-lifecycle');
+    await finalizeSettledOrchestrations(result.settled, 'target-settled');
+    if (payload.type === 'done') await retryWaitingNotificationsForSource(tabId);
+    void scheduleOrchestrationPolicyTimer();
   } catch (error) {
     console.warn('[Orchestration] lifecycle failed tab=' + shortId(tabId, 12) + ' error=' + (error?.message || error));
   }
@@ -1402,17 +1516,82 @@ async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
   if (!run || !isActiveStatus(run.status)) return store.get(runId);
   const sessionInfo = await resolveAgentSessionInfo(run.targetTabId, 2000).catch(() => null);
   const status = sessionInfo?.status || sessionInfo?.sessionStatus || 'unknown';
-  const probe = await probeOrchestrationResult(run, { sessionInfo });
+  const probe = await probeOrchestrationResult(run, {
+    sessionInfo,
+    forceFresh: status !== 'busy',
+  });
   const reconciled = await store.reconcile(runId, {
     busy: status === 'busy',
     sessionId: probe.sessionId || sessionInfo?.sessionId || run.sessionId || null,
     resultFound: probe.found === true,
+    resultComplete: probe.resultComplete === true,
     resultAvailable: probe.resultAvailable === true,
     turnIndex: probe.turnIndex,
   });
   if (reconciled.changed) emitOrchestrationRun(reconciled.changed, reason);
-  if (reconciled.completed) await finalizeCompletedOrchestration(reconciled.changed, 'recovered-completion');
+  await finalizeSettledOrchestrations(reconciled.settled, 'recovered-settled');
   return store.get(runId);
+}
+
+async function processDueOrchestrationPolicies() {
+  const store = getOrchestrationRunStore();
+  const now = Date.now();
+  const expired = await store.expireRecoveryDeadlines(now);
+  emitOrchestrationChanges(expired.changed, 'recovery-expired');
+  await finalizeSettledOrchestrations(expired.settled, 'recovery-expired');
+
+  const allRuns = await store.listAll();
+  for (const run of allRuns) {
+    if (run.status !== 'completed' || !run.autoStopAt || run.autoStopAt > now || run.autoStopFinishedAt) continue;
+    if (orchestrationAutoStopInflight.has(run.runId)) continue;
+    orchestrationAutoStopInflight.add(run.runId);
+    try {
+      const hasNewerRun = hasNewerTargetRun(allRuns, run);
+      const status = await resolveAgentSessionInfo(run.targetTabId, 2000).catch(() => null);
+      const busy = status && (status.status === 'busy' || status.sessionStatus === 'busy');
+      if (hasNewerRun || busy) {
+        const skipped = await store.patch(run.runId, {
+          autoStopFinishedAt: now,
+          autoStopStatus: hasNewerRun ? 'skipped-new-run' : 'skipped-busy',
+        });
+        emitOrchestrationRun(skipped, 'auto-stop-skipped');
+        continue;
+      }
+      const stopResult = await runAgentStopScenario(run.targetTabId, 8000).catch((error) => ({
+        success: false,
+        error: String(error?.message || error),
+      }));
+      const stopped = await store.patch(run.runId, {
+        autoStopFinishedAt: Date.now(),
+        autoStopStatus: stopResult?.success === false ? 'failed' : 'stopped',
+        autoStopError: stopResult?.success === false ? (stopResult.error || 'stop failed') : null,
+      });
+      emitOrchestrationRun(stopped, 'auto-stop-finished');
+    } finally {
+      orchestrationAutoStopInflight.delete(run.runId);
+    }
+  }
+}
+
+async function scheduleOrchestrationPolicyTimer() {
+  if (orchestrationPolicyTimer) clearTimeout(orchestrationPolicyTimer);
+  orchestrationPolicyTimer = null;
+  const store = getOrchestrationRunStore();
+  const recoveryAt = await store.nextRecoveryDeadline();
+  const allRuns = await store.listAll();
+  const autoStopAt = allRuns.reduce((next, run) => {
+    if (run.status !== 'completed' || !run.autoStopAt || run.autoStopFinishedAt) return next;
+    return next === null || run.autoStopAt < next ? run.autoStopAt : next;
+  }, null);
+  const nextAt = [recoveryAt, autoStopAt].filter((value) => Number.isFinite(value)).sort((a, b) => a - b)[0];
+  if (!nextAt) return;
+  const delay = Math.max(0, Math.min(0x7fffffff, nextAt - Date.now()));
+  orchestrationPolicyTimer = setTimeout(() => {
+    orchestrationPolicyTimer = null;
+    void processDueOrchestrationPolicies()
+      .catch((error) => console.warn('[Orchestration] policy timer failed:', error?.message || error))
+      .finally(() => scheduleOrchestrationPolicyTimer());
+  }, delay);
 }
 
 async function reconcileActiveOrchestrations() {
@@ -1421,6 +1600,98 @@ async function reconcileActiveOrchestrations() {
   for (const run of active) {
     await reconcileOrchestrationRun(run.runId, 'startup-reconcile');
   }
+  await processDueOrchestrationPolicies();
+  await scheduleOrchestrationPolicyTimer();
+}
+
+async function performOrchestrationAction(runId, action) {
+  const store = getOrchestrationRunStore();
+  const current = await store.get(runId);
+  if (!current) return { ok: false, statusCode: 404, error: 'run not found' };
+
+  if (action === 'cancel') {
+    if (isTerminalStatus(current.status)) {
+      return { ok: false, error: 'run is already settled', run: withOrchestrationUrls(current) };
+    }
+    const cancellation = await store.cancel(runId, {
+      reason: 'cancelled-by-user',
+      suppressNotification: true,
+    });
+    emitOrchestrationChanges(cancellation?.changed, 'cancelled-by-user');
+    await finalizeSettledOrchestrations(cancellation?.settled, 'cancelled-by-user');
+    const interrupt = current.status === 'running'
+      ? await runAgentInterruptScenario(current.targetTabId, 5000, true)
+        .catch((error) => ({ success: false, error: String(error?.message || error) }))
+      : null;
+    void scheduleOrchestrationPolicyTimer();
+    return {
+      ok: true,
+      run: withOrchestrationUrls(cancellation?.run),
+      interrupt,
+    };
+  }
+
+  if (action === 'report') {
+    const resolved = await store.resolveRecovery(runId, 'report');
+    const run = resolved?.run;
+    if (!run || run.status !== 'failed') {
+      return { ok: false, error: 'run is not waiting for recovery', run: withOrchestrationUrls(run) };
+    }
+    emitOrchestrationChanges(resolved.changed, 'recovery-reported');
+    await finalizeSettledOrchestrations(resolved.settled, 'recovery-reported');
+    return { ok: true, run: withOrchestrationUrls(await store.get(runId)) };
+  }
+
+  if (action === 'dismiss') {
+    const resolved = await store.resolveRecovery(runId, 'dismiss');
+    const run = resolved?.run;
+    if (!run || run.status !== 'cancelled') {
+      return { ok: false, error: 'run is not waiting for recovery', run: withOrchestrationUrls(run) };
+    }
+    emitOrchestrationChanges(resolved.changed, 'recovery-dismissed');
+    await finalizeSettledOrchestrations(resolved.settled, 'recovery-dismissed');
+    void scheduleOrchestrationPolicyTimer();
+    return { ok: true, run: withOrchestrationUrls(run) };
+  }
+
+  if (action === 'retry') {
+    if (!findOrchestrationTabDescriptor(current.targetTabId)) {
+      return {
+        ok: false,
+        error: 'target tab is closed; restore the tab from History before reconnecting',
+        run: withOrchestrationUrls(current),
+      };
+    }
+    const resolved = await store.resolveRecovery(runId, 'reopen');
+    const run = resolved?.run;
+    if (!run || run.status !== 'queued') {
+      return { ok: false, error: 'run is not waiting for recovery', run: withOrchestrationUrls(run) };
+    }
+    emitOrchestrationChanges(resolved.changed, 'recovery-reopened');
+    void scheduleOrchestrationPolicyTimer();
+    return { ok: true, waitingForInput: true, run: withOrchestrationUrls(run) };
+  }
+
+  if (action === 'deliver') {
+    if (!isTerminalStatus(current.status)) {
+      return { ok: false, error: 'run is not settled', run: withOrchestrationUrls(current) };
+    }
+    await sendOrchestrationCompletionNotification(current);
+    return { ok: true, run: withOrchestrationUrls(await store.get(runId)) };
+  }
+
+  return { ok: false, statusCode: 400, error: 'unsupported action' };
+}
+
+async function handleOrchestrationTabClosed(tabId) {
+  if (!tabId) return [];
+  const store = getOrchestrationRunStore();
+  const targetRuns = await store.handleTargetClosed(tabId);
+  const sourceRuns = await store.handleSourceClosed(tabId);
+  emitOrchestrationChanges(targetRuns, 'target-tab-closed');
+  emitOrchestrationChanges(sourceRuns, 'source-tab-closed');
+  void scheduleOrchestrationPolicyTimer();
+  return [...targetRuns, ...sourceRuns].map(withOrchestrationUrls);
 }
 
 function mobileTimelineColor(kind) {
@@ -2069,6 +2340,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
     return sendJson(res, 200, { ok: true, runs: runs.map(withOrchestrationUrls) });
   }
 
+  if (parsed.pathname === '/api/orchestrations/settings' && req.method === 'GET') {
+    return sendJson(res, 200, { ok: true, settings: await getOrchestrationRunStore().getSettings() });
+  }
+
+  if (parsed.pathname === '/api/orchestrations/settings' && req.method === 'POST') {
+    const body = await readBody(req);
+    const settings = await getOrchestrationRunStore().updateSettings({
+      failureGraceMs: Object.prototype.hasOwnProperty.call(body, 'failureGraceMs') ? body.failureGraceMs : undefined,
+      successAutoStopMs: Object.prototype.hasOwnProperty.call(body, 'successAutoStopMs') ? body.successAutoStopMs : undefined,
+      reactToManualInterrupt: typeof body.reactToManualInterrupt === 'boolean' ? body.reactToManualInterrupt : undefined,
+      autoStopCreatedTargets: typeof body.autoStopCreatedTargets === 'boolean' ? body.autoStopCreatedTargets : undefined,
+    });
+    void scheduleOrchestrationPolicyTimer();
+    return sendJson(res, 200, { ok: true, settings });
+  }
+
   if (parsed.pathname === '/api/orchestrations' && req.method === 'POST') {
     let createdRunId = null;
     try {
@@ -2174,7 +2461,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         targetCreated,
         targetPlacement: targetPlacement?.placement || null,
         targetParentTabId: targetPlacement?.visualParentTabId || null,
+        parentRunId: cleanOptionalString(body.parentRunId, '') || undefined,
+        waitForDescendants: body.waitForDescendants !== false,
         notifySource,
+        failureGraceMs: Number.isFinite(Number(body.failureGraceMs)) ? Number(body.failureGraceMs) : undefined,
+        successAutoStopMs: Number.isFinite(Number(body.successAutoStopMs)) ? Number(body.successAutoStopMs) : undefined,
+        reactToManualInterrupt: typeof body.reactToManualInterrupt === 'boolean' ? body.reactToManualInterrupt : undefined,
+        autoStopCreatedTargets: typeof body.autoStopCreatedTargets === 'boolean' ? body.autoStopCreatedTargets : undefined,
         promptHash: promptFingerprint(prompt),
         promptChars: prompt.length,
       });
@@ -2216,16 +2509,18 @@ async function handleApi(req, res, parsed, sdkSessions) {
         statusAtSend: baselineStatus,
         queue: sendOptions.queue,
         ownership: 'project',
+        presentationSnapshot: orchestrationPresentationSnapshot(run, 'request'),
         timeoutMs: 60_000,
       });
       if (isSendFailure(sendResult)) {
-        const failed = await getOrchestrationRunStore().patch(run.runId, {
-          status: 'failed',
-          completedAt: Date.now(),
-          completionReason: 'send-failed',
-          error: sendResult?.error || sendResult?.message || 'send failed',
-        });
-        emitOrchestrationRun(failed, 'send-failed');
+        const failed = await getOrchestrationRunStore().beginRecovery(
+          run.runId,
+          targetCreated ? 'startup_failed' : 'failed',
+          sendResult?.error || sendResult?.message || 'send failed',
+        );
+        emitOrchestrationChanges(failed.changed, 'send-failed');
+        await finalizeSettledOrchestrations(failed.settled, 'send-failed');
+        void scheduleOrchestrationPolicyTimer();
         return sendSendFailure(res, sendResult, { runId: run.runId, targetTabId });
       }
 
@@ -2246,13 +2541,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
       });
     } catch (error) {
       if (createdRunId) {
-        const failed = await getOrchestrationRunStore().patch(createdRunId, {
-          status: 'failed',
-          completedAt: Date.now(),
-          completionReason: 'orchestration-error',
-          error: String(error?.message || error),
-        });
-        emitOrchestrationRun(failed, 'orchestration-error');
+        const failed = await getOrchestrationRunStore().beginRecovery(
+          createdRunId,
+          'startup_failed',
+          String(error?.message || error),
+        );
+        emitOrchestrationChanges(failed.changed, 'orchestration-error');
+        await finalizeSettledOrchestrations(failed.settled, 'orchestration-error');
+        void scheduleOrchestrationPolicyTimer();
       }
       return sendJson(res, Number(error?.statusCode || error?.status) || 500, { ok: false, runId: createdRunId, error: String(error?.message || error) });
     }
@@ -2266,25 +2562,44 @@ async function handleApi(req, res, parsed, sdkSessions) {
     if (isActiveStatus(run.status)) {
       return sendJson(res, 202, { ok: true, ready: false, status: run.status, run: withOrchestrationUrls(run) });
     }
-    if (run.status !== 'completed') {
-      return sendJson(res, 409, { ok: false, ready: false, status: run.status, error: run.error || 'run did not complete' });
-    }
     const internal = await getOrchestrationRunStore().getInternal(runId);
     const result = await probeOrchestrationResult(internal, {
       maxChars: Math.max(500, Math.min(250_000, Number(parsed.query.maxChars) || 100_000)),
+      forceFresh: true,
     });
-    if (!result.found) {
+    if (run.status !== 'completed') {
+      return sendJson(res, 200, {
+        ok: true,
+        ready: true,
+        success: false,
+        runId,
+        status: run.status,
+        outcome: run.outcome || run.status,
+        error: run.error || 'run did not complete',
+        sessionId: result.sessionId || run.sessionId || null,
+        ...buildDelegationResultTarget(run),
+        turnIndex: result.turnIndex ?? run.resultTurnIndex ?? null,
+        userUuid: result.userUuid || run.resultUserUuid || null,
+        assistantText: result.found ? (result.assistantText || '') : '',
+        assistantChars: result.found ? (Number(result.assistantChars) || (result.assistantText || '').length) : 0,
+        truncated: result.truncated === true,
+      });
+    }
+    if (!isCompleteOrchestrationResult(result)) {
       return sendJson(res, 202, {
         ok: true,
         ready: false,
         status: run.status,
-        error: result.error || 'matching transcript turn not materialized',
+        error: result.error || (result.found
+          ? 'matching transcript turn is incomplete'
+          : 'matching transcript turn not materialized'),
         run: withOrchestrationUrls(run),
       });
     }
     return sendJson(res, 200, {
       ok: true,
       ready: true,
+      success: true,
       runId,
       status: run.status,
       sessionId: result.sessionId || run.sessionId || null,
@@ -2303,18 +2618,27 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const current = await getOrchestrationRunStore().get(runId);
     if (!current) return sendJson(res, 404, { ok: false, error: 'run not found' });
     const body = await readBody(req);
-    const cancelled = await getOrchestrationRunStore().patch(runId, {
-      status: 'cancelled',
-      completedAt: Date.now(),
-      completionReason: 'cancelled-by-api',
-      error: null,
+    const cancellation = await getOrchestrationRunStore().cancel(runId, {
+      reason: 'cancelled-by-api',
+      suppressNotification: true,
     });
-    emitOrchestrationRun(cancelled, 'cancelled');
+    const cancelled = cancellation?.run;
+    emitOrchestrationChanges(cancellation?.changed, 'cancelled');
+    await finalizeSettledOrchestrations(cancellation?.settled, 'cancelled');
     let interrupt = null;
     if (body.interrupt === true) {
       interrupt = await runAgentInterruptScenario(current.targetTabId, 5000).catch((error) => ({ success: false, error: String(error?.message || error) }));
     }
     return sendJson(res, 200, { ok: true, run: withOrchestrationUrls(cancelled), interrupt });
+  }
+
+  const orchestrationActionMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)\/action$/);
+  if (orchestrationActionMatch && req.method === 'POST') {
+    const runId = decId(orchestrationActionMatch[1]);
+    const body = await readBody(req);
+    const action = cleanOptionalString(body.action, '');
+    const result = await performOrchestrationAction(runId, action);
+    return sendJson(res, result?.ok === false ? (result.statusCode || 409) : 200, result);
   }
 
   const orchestrationAckMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)\/ack$/);
@@ -4861,6 +5185,8 @@ function writeWebServerDiscovery() {
 }
 
 function stop() {
+  if (orchestrationPolicyTimer) clearTimeout(orchestrationPolicyTimer);
+  orchestrationPolicyTimer = null;
   if (wss) try { wss.close(); } catch {}
   if (httpServer) try { httpServer.close(); } catch {}
   try { fs.unlinkSync(DISCOVERY_FILE); } catch {}
@@ -4957,6 +5283,20 @@ async function acknowledgeOrchestrationRun(runId, tabId) {
   return run ? withOrchestrationUrls(run) : null;
 }
 
+async function listActiveOrchestrationRuns() {
+  return (await getOrchestrationRunStore().listActive()).map(withOrchestrationUrls);
+}
+
+async function getOrchestrationSettings() {
+  return getOrchestrationRunStore().getSettings();
+}
+
+async function updateOrchestrationSettings(patch) {
+  const settings = await getOrchestrationRunStore().updateSettings(patch || {});
+  void scheduleOrchestrationPolicyTimer();
+  return settings;
+}
+
 module.exports = {
   start,
   stop,
@@ -4965,7 +5305,12 @@ module.exports = {
   getInfo,
   updateExternalRunSettings,
   listOrchestrationRunsForTab,
+  listActiveOrchestrationRuns,
   acknowledgeOrchestrationRun,
+  getOrchestrationSettings,
+  updateOrchestrationSettings,
+  performOrchestrationAction,
+  handleOrchestrationTabClosed,
   notifyClaudeSessionAvailable,
   sendTabCompletionPush,
 };

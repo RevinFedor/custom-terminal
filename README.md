@@ -393,13 +393,13 @@ npm run dev                  # dev mode с hot-reload
 npm run build:i              # собирает, копирует в /Applications, запускает
 ```
 
-**Terminal MCP** регистрируется глобально один раз:
+**Terminal MCP** регистрируется глобально один раз для Claude и Codex:
 
 ```bash
-claude mcp add terminal node "$(pwd)/mcp/terminal-server.mjs" --scope user
+npm run install:terminal-mcp
 ```
 
-После этого любой агент в любом проекте получает к ним доступ.
+Установщик копирует standalone-сервер в `~/.claude/mcp/`, сохраняет остальные MCP-настройки и добавляет Codex-наследование `NOTED_PARENT_*`. После этого любая полная сессия в Noted Terminal получает свой project/tab context; перезапусти уже открытые Claude/Codex процессы после обновления.
 
 ## Tech Stack
 

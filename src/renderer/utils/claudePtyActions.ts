@@ -52,6 +52,10 @@ export interface ClaudePtySendOptions {
   handoffId?: string;
   source?: string;
   statusAtSend?: string;
+  queue?: boolean;
+  model?: string;
+  effort?: string;
+  thinking?: string;
   presentationSnapshot?: {
     historySessionId?: string | null;
     promptChips?: Array<{
@@ -60,6 +64,16 @@ export interface ClaudePtySendOptions {
       label?: string;
       text: string;
       sourceKey?: string;
+    }>;
+    semanticTags?: Array<{
+      id?: string;
+      kind: 'orchestration';
+      runId: string;
+      phase: 'request' | 'completion' | 'failure';
+      parentRunId?: string;
+      sourceTabId?: string;
+      targetTabId?: string;
+      outcome?: string;
     }>;
   };
 }
@@ -472,7 +486,39 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
     ' source=' + (options.source || '-') +
     ' statusAtSend=' + (options.statusAtSend || '-') +
     ' chars=' + prompt.length);
-  const work = ipcRenderer.invoke('terminal:paste', {
+  const work = (async () => {
+    const requestedModel = String(options.model || '').trim();
+    const requestedEffort = String(options.effort || '').trim();
+    if (requestedModel && requestedModel !== 'none') {
+      await applyClaudePtySetting({
+        tabId,
+        kind: 'model',
+        value: requestedModel,
+        source: (options.source || 'claude-pty-action') + ':model',
+      });
+    }
+    if (requestedEffort && requestedEffort !== 'none') {
+      await applyClaudePtySetting({
+        tabId,
+        kind: 'effort',
+        value: requestedEffort,
+        source: (options.source || 'claude-pty-action') + ':effort',
+      });
+    }
+    if (typeof options.thinking === 'string' && options.thinking.trim()) {
+      const wantThinking = options.thinking !== 'disabled';
+      const thinkMap: Map<string, boolean> = (window as any).__thinkStateForTab
+        || ((window as any).__thinkStateForTab = new Map());
+      const currentThinking = thinkMap.has(tabId) ? thinkMap.get(tabId)! : true;
+      if (currentThinking !== wantThinking) {
+        const toggle = await ipcRenderer.invoke('claude:toggle-thinking', tabId);
+        if (toggle?.success === false) {
+          throw new Error(toggle?.error || 'Claude thinking mode was not applied');
+        }
+        thinkMap.set(tabId, typeof toggle?.thinking === 'boolean' ? toggle.thinking : wantThinking);
+      }
+    }
+    return ipcRenderer.invoke('terminal:paste', {
       tabId,
       content: prompt,
       submit: true,
@@ -480,7 +526,8 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
       handoffId: options.handoffId || null,
       source: options.source || 'claude-pty-action',
       presentationSnapshot: options.presentationSnapshot || null,
-    })
+    });
+  })()
     .then((result: any) => {
       console.log('[ClaudePtyActions:send] done tab=' + shortTab(tabId) +
         ' handoff=' + (options.handoffId || '-') +

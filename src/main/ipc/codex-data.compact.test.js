@@ -99,6 +99,7 @@ test('orchestration result keeps one Codex turn together across mid-turn compact
   const result = _api.buildCodexTurnAssistantResult(records, sessionId, target.uuid, 100000);
 
   assert.equal(result.success, true);
+  assert.equal(result.complete, true);
   assert.equal(result.turnIndex, 0);
   assert.equal(result.assistantMessageCount, 3);
   assert.equal(result.assistantBlockCount, 3);
@@ -129,6 +130,7 @@ test('orchestration result bounds a long compacted turn while preserving its fin
   const result = _api.buildCodexTurnAssistantResult(records, sessionId, target.uuid, 500);
 
   assert.equal(result.success, true);
+  assert.equal(result.complete, false);
   assert.equal(result.truncated, true);
   assert.equal(result.assistantChars, first.length + 2 + final.length);
   assert.ok(result.assistantText.length <= 500);
@@ -188,6 +190,29 @@ test('keeps incremental JSONL cache exact across partial append and rewrite', as
   const rewrittenRead = await _api.parseJsonlFile(filePath);
   assert.deepEqual(rewrittenRead.map((record) => record.__line), [0]);
   assert.equal(rewrittenRead[0].payload.message, 'first');
+});
+
+test('forceFresh result read bypasses a same-size same-mtime Codex cache snapshot', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-jsonl-fresh-'));
+  const filePath = path.join(dir, 'rollout.jsonl');
+  const fixedTime = new Date('2026-07-27T12:00:00.000Z');
+  const source = (message) => JSON.stringify({
+    type: 'event_msg',
+    payload: { type: 'user_message', message },
+  }) + '\n';
+  t.after(async () => {
+    _api.invalidateJsonlCache(filePath);
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  });
+
+  await fs.promises.writeFile(filePath, source('old'), 'utf8');
+  await fs.promises.utimes(filePath, fixedTime, fixedTime);
+  assert.equal((await _api.parseJsonlFile(filePath))[0].payload.message, 'old');
+
+  await fs.promises.writeFile(filePath, source('new'), 'utf8');
+  await fs.promises.utimes(filePath, fixedTime, fixedTime);
+  assert.equal((await _api.parseJsonlFile(filePath))[0].payload.message, 'old');
+  assert.equal((await _api.parseJsonlFile(filePath, { forceFresh: true }))[0].payload.message, 'new');
 });
 
 test('bounds fully parsed Codex rollout cache across sessions', async (t) => {

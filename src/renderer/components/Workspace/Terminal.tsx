@@ -1481,7 +1481,9 @@ function Terminal({
   const timelineWidth = useUIStore((state) => state.timelineWidth);
   const timelinePinned = useUIStore((state) => state.timelinePinned);
   const promptQueueRightInset =
-    timelineTreeMode && !historyPanelOpen && !timelinePinned
+    timelineTreeMode
+      && !timelinePinned
+      && (promptQueueInputSurface === 'history' || !historyPanelOpen)
       ? Math.max(0, timelineWidth - TIMELINE_COLLAPSED_SLOT_WIDTH)
       : 0;
   const workspaceView = useWorkspaceStore((state) => state.view);
@@ -3652,7 +3654,7 @@ function Terminal({
           tabId={tabId}
           sessionType={promptQueueAgent}
           agentBusy={agentBusy}
-          rightInset={promptQueueInputSurface === 'history' ? 0 : promptQueueRightInset}
+          rightInset={promptQueueRightInset}
           hideHistoryToggle={hidePromptQueueHistoryToggle}
           inputSurface={promptQueueInputSurface}
         />;

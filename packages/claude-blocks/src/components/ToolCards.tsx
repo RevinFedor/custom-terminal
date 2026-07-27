@@ -172,6 +172,12 @@ const EditCard: React.FC<{
     </span>
   ) : null;
   const preview = path ? <span>{path}</span> : <span className="cb-italic-dim">(no path)</span>;
+  // Deferral is judged on what the CARD paints, not on one hunk: the card is
+  // split into a DiffView per hunk, so a per-hunk test let 38 small hunks
+  // (341 rows total) render eagerly while a single 45-row diff got deferred.
+  const cardRowCount = canonicalHunks
+    ? canonicalHunks.reduce((sum, hunk) => sum + hunk.entries.length, 0)
+    : fallbackDiff.length;
   const body = canonicalHunks ? (
     <div className="cb-diff-hunks">
       {canonicalHunks.map((hunk, index) => (
@@ -181,6 +187,7 @@ const EditCard: React.FC<{
             language={lang}
             oldStart={hunk.oldStart}
             newStart={hunk.newStart}
+            cardRowCount={cardRowCount}
           />
         </div>
       ))}

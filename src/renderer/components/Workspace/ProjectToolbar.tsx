@@ -12,6 +12,7 @@ import SemanticIndexButton from './SemanticIndexButton';
 import CopySessionWithChips from './CopySessionWithChips';
 import DocsButton from './DocsButton';
 import ClaudeUsageButton from './ClaudeUsageButton';
+import ResourceUsageButton from './ResourceUsageButton';
 import GitStatusButton from './GitStatusButton';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
@@ -903,6 +904,14 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           </button>
         </Tooltip>
       </div>
+
+      {/* Потребление ресурсов проекта: вкладки с их инструментами, само
+          приложение и брошенные остатки. Замер идёт только пока панель открыта. */}
+      {!isSystemProject && (
+        <div className="flex min-w-0 items-center pr-2">
+          <ResourceUsageButton />
+        </div>
+      )}
 
       <div className="flex min-w-0 items-center pr-2">
         <ClaudeUsageButton />

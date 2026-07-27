@@ -23,6 +23,7 @@ export interface SendAgentPromptScenarioArgs {
   queue?: boolean;
   model?: string;
   effort?: string;
+  thinking?: string;
   returnDraftOnConflict?: boolean;
   presentationSnapshot?: {
     historySessionId?: string | null;
@@ -32,6 +33,16 @@ export interface SendAgentPromptScenarioArgs {
       label?: string;
       text: string;
       sourceKey?: string;
+    }>;
+    semanticTags?: Array<{
+      id?: string;
+      kind: 'orchestration';
+      runId: string;
+      phase: 'request' | 'completion' | 'failure';
+      parentRunId?: string;
+      sourceTabId?: string;
+      targetTabId?: string;
+      outcome?: string;
     }>;
   };
 }
@@ -55,6 +66,7 @@ export async function sendAgentPromptScenario({
   queue,
   model,
   effort,
+  thinking,
   returnDraftOnConflict,
   presentationSnapshot,
 }: SendAgentPromptScenarioArgs): Promise<any> {
@@ -73,8 +85,11 @@ export async function sendAgentPromptScenario({
       + ' effective=' + statusForSend);
   }
 
-  if (statusForSend === 'active' && queue !== true && runtime.inspectDraft) {
-    const visual = runtime.inspectDraft(tabId);
+  const canInspectDraft = !!runtime.probeDraft || !!runtime.inspectDraft;
+  if ((statusForSend === 'active' || statusForSend === 'busy') && canInspectDraft) {
+    const visual = runtime.probeDraft
+      ? await runtime.probeDraft(tabId, 'agent-send-preflight:' + (source || 'unknown'))
+      : runtime.inspectDraft!(tabId);
     if (visual?.hasDraft === true) {
       let draftText = '';
       let draftImages = 0;
@@ -110,7 +125,9 @@ export async function sendAgentPromptScenario({
         originalPrompt: prompt,
       };
     }
-    if (visual?.hasDraft === null && visual.source !== 'no-terminal') {
+    const absenceIsExpected = visual?.source === 'no-terminal'
+      || visual?.source === 'claude-composer:presence-not-live';
+    if (visual?.hasDraft === null && statusForSend === 'active' && !absenceIsExpected) {
       return {
         tabId,
         toolType,
@@ -132,6 +149,7 @@ export async function sendAgentPromptScenario({
     queue: queue === true,
     model: typeof model === 'string' ? model : undefined,
     effort: typeof effort === 'string' ? effort : undefined,
+    thinking: typeof thinking === 'string' ? thinking : undefined,
     presentationSnapshot,
   });
   return {

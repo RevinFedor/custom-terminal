@@ -248,8 +248,29 @@ function normalizePromptPresentationSnapshot(snapshot) {
         : {}),
     }];
   });
-  return promptChips.length > 0
-    ? { version: 1, promptChips }
+  const tags = Array.isArray(snapshot?.semanticTags) ? snapshot.semanticTags : [];
+  const semanticTags = tags.flatMap((tag, index) => {
+    if (tag?.kind !== 'orchestration') return [];
+    const runId = String(tag.runId || '').trim();
+    const phase = String(tag.phase || '').trim();
+    if (!runId || !['request', 'completion', 'failure'].includes(phase)) return [];
+    const optionalString = (value) => {
+      const text = String(value || '').trim();
+      return text || undefined;
+    };
+    return [{
+      id: String(tag.id || `durable-orchestration-tag-${index}`),
+      kind: 'orchestration',
+      runId,
+      phase,
+      ...(optionalString(tag.parentRunId) ? { parentRunId: optionalString(tag.parentRunId) } : {}),
+      ...(optionalString(tag.sourceTabId) ? { sourceTabId: optionalString(tag.sourceTabId) } : {}),
+      ...(optionalString(tag.targetTabId) ? { targetTabId: optionalString(tag.targetTabId) } : {}),
+      ...(optionalString(tag.outcome) ? { outcome: optionalString(tag.outcome) } : {}),
+    }];
+  });
+  return promptChips.length > 0 || semanticTags.length > 0
+    ? { version: 2, promptChips, semanticTags }
     : null;
 }
 
@@ -273,7 +294,10 @@ function saveAuditedPromptPresentation(db, {
     auditTimestamp,
     transportHash: hash,
     schemaVersion: normalized.version,
-    chips: normalized.promptChips,
+    // The legacy column is named chips_json, but schema v2 also stores
+    // presentation-neutral semantic tags. Readers split the two kinds before
+    // exposing them to History/Timeline.
+    chips: [...normalized.promptChips, ...normalized.semanticTags],
   });
 }
 
@@ -305,7 +329,8 @@ function decorateHistoryPromptPresentations(db, {
 
   let changed = false;
   const decorated = source.map((entry) => {
-    if (entry?.role !== 'user' || !entry.uuid) return entry;
+    const isUserEntry = entry?.role === 'user' || entry?.type === 'user' || entry?.kind === 'user';
+    if (!isUserEntry || !entry.uuid) return entry;
     let row = exact.get(entry.uuid) || null;
     if (!row) {
       const timestamp = String(entry.timestamp || '');
@@ -322,10 +347,14 @@ function decorateHistoryPromptPresentations(db, {
       }
     }
     if (!row || !Array.isArray(row.chips) || row.chips.length === 0) return entry;
+    const promptChips = row.chips.filter(item => item?.kind === 'prompt');
+    const semanticTags = row.chips.filter(item => item?.kind === 'orchestration');
+    if (promptChips.length === 0 && semanticTags.length === 0) return entry;
     changed = true;
     return {
       ...entry,
-      promptChips: row.chips,
+      ...(promptChips.length > 0 ? { promptChips } : {}),
+      ...(semanticTags.length > 0 ? { semanticTags } : {}),
     };
   });
   return changed ? decorated : source;

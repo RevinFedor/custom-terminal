@@ -79,6 +79,7 @@ export interface AgentSendPromptOptions {
   queue?: boolean;
   model?: string;
   effort?: string;
+  thinking?: string;
   presentationSnapshot?: {
     historySessionId?: string | null;
     promptChips?: Array<{
@@ -87,6 +88,16 @@ export interface AgentSendPromptOptions {
       label?: string;
       text: string;
       sourceKey?: string;
+    }>;
+    semanticTags?: Array<{
+      id?: string;
+      kind: 'orchestration';
+      runId: string;
+      phase: 'request' | 'completion' | 'failure';
+      parentRunId?: string;
+      sourceTabId?: string;
+      targetTabId?: string;
+      outcome?: string;
     }>;
   };
 }
@@ -627,6 +638,25 @@ async function probeCodexDraft(tabId: string, reason: string) {
   return resolved;
 }
 
+async function probeClaudeDraft(tabId: string, reason: string) {
+  const resolved = await ipcRenderer.invoke('claude:get-draft-state', tabId, {
+    reason,
+    timeoutMs: 700,
+  }).catch((error: any) => ({
+    success: false,
+    hasDraft: null,
+    preview: '',
+    source: 'claude-composer:probe-error',
+    error: errorText(error),
+  }));
+  console.log('[ClaudePtyActions:draft] authoritative-probe tab=' + shortTab(tabId)
+    + ' reason=' + reason
+    + ' hasDraft=' + resolved.hasDraft
+    + ' source=' + (resolved.source || '-')
+    + ' preview=' + JSON.stringify(resolved.preview || ''));
+  return resolved;
+}
+
 const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   toolType: 'claude',
   label: 'Claude',
@@ -651,6 +681,7 @@ const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   interruptTurn: interruptClaudePtyTurn,
   stopProcess: stopClaudePtyProcess,
   grabDraft: grabClaudePtyDraft,
+  probeDraft: probeClaudeDraft,
   getPendingQuestion: getClaudePendingQuestion,
   answerQuestion: answerClaudeQuestion,
 };

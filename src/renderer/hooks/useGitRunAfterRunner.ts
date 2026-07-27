@@ -4,6 +4,11 @@ import { useGitRunAfterStore, type GitRunAfterTask } from '../store/useGitRunAft
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
+import {
+  initializeOrchestrationStore,
+  isOrchestrationCompletionBlocked,
+  subscribeOrchestrationRunChanges,
+} from '../store/useOrchestrationStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -15,6 +20,7 @@ type BusyStatePayload = {
 
 const previousBusy = new Map<string, boolean>();
 const inflightTasks = new Set<string>();
+const deferredNaturalCompletions = new Set<string>();
 
 function trimError(error: unknown): string {
   return String(error || 'Unknown error').replace(/\s+/g, ' ').trim().slice(0, 240);
@@ -79,7 +85,23 @@ async function executeTask(task: GitRunAfterTask): Promise<void> {
 
 export function useGitRunAfterRunner(): void {
   useEffect(() => {
+    void initializeOrchestrationStore();
     for (const [tabId, busy] of getBusyTabsSnapshot()) previousBusy.set(tabId, busy);
+
+    const waitingTasksFor = (tabId: string): GitRunAfterTask[] => (
+      Array.from(useGitRunAfterStore.getState().tasks.values())
+        .filter((task) => task.phase === 'waiting' && task.triggerTabId === tabId)
+    );
+
+    const cancelWaitingTasks = (tabId: string, reason: string): void => {
+      const waiting = waitingTasksFor(tabId);
+      for (const task of waiting) {
+        useGitRunAfterStore.getState().clearTask(task.projectKey, task.id);
+      }
+      if (!waiting.length) return;
+      useUIStore.getState().showToast('Git run after cancelled: target tab did not complete', 'warning', 3000);
+      console.log('[GitRunAfter] cancel trigger=' + tabId.slice(-12) + ' reason=' + reason + ' tasks=' + waiting.length);
+    };
 
     const handleBusyState = (_channel: 'claude' | 'gemini' | 'codex') =>
       (_event: unknown, payload: BusyStatePayload) => {
@@ -89,9 +111,9 @@ export function useGitRunAfterRunner(): void {
         const busy = payload?.busy === true;
         const wasBusy = previousBusy.get(tabId) === true;
         previousBusy.set(tabId, busy);
+        if (busy) deferredNaturalCompletions.delete(tabId);
 
-        const waiting = Array.from(useGitRunAfterStore.getState().tasks.values())
-          .filter((task) => task.phase === 'waiting' && task.triggerTabId === tabId);
+        const waiting = waitingTasksFor(tabId);
         if (!waiting.length) return;
 
         // local-command is a non-turn UI bracket, not success or failure.
@@ -101,15 +123,16 @@ export function useGitRunAfterRunner(): void {
         // new reasons (for example codex-descendants-exited) look successful and
         // could run Git work after a false lifecycle edge.
         if (!busy && !isNaturalAgentTurnEndReason(payload?.reason)) {
-          for (const task of waiting) {
-            useGitRunAfterStore.getState().clearTask(task.projectKey, task.id);
-          }
-          useUIStore.getState().showToast('Git run after cancelled: target tab did not complete', 'warning', 3000);
-          console.log('[GitRunAfter] cancel trigger=' + tabId.slice(-12) + ' reason=' + payload.reason + ' tasks=' + waiting.length);
+          cancelWaitingTasks(tabId, payload.reason || 'abnormal');
           return;
         }
 
         if (!wasBusy || busy) return;
+        if (isOrchestrationCompletionBlocked(tabId)) {
+          deferredNaturalCompletions.add(tabId);
+          console.log('[GitRunAfter] defer trigger=' + tabId.slice(-12) + ' while descendants/handoff remain active');
+          return;
+        }
         for (const task of waiting) void executeTask(task);
       };
 
@@ -119,6 +142,22 @@ export function useGitRunAfterRunner(): void {
     ipcRenderer.on('claude:busy-state', handleClaudeBusy);
     ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
     ipcRenderer.on('codex:busy-state', handleCodexBusy);
+    const unsubscribeOrchestration = subscribeOrchestrationRunChanges((change) => {
+      if (!change.releaseKind) return;
+      const tabId = change.sourceTabId;
+      if (change.releaseKind === 'handoff-started') {
+        deferredNaturalCompletions.delete(tabId);
+        return;
+      }
+      if (change.releaseKind === 'abnormal') {
+        deferredNaturalCompletions.delete(tabId);
+        cancelWaitingTasks(tabId, 'orchestration-abnormal');
+        return;
+      }
+      if (previousBusy.get(tabId) === true) return;
+      deferredNaturalCompletions.delete(tabId);
+      for (const task of waitingTasksFor(tabId)) void executeTask(task);
+    });
 
     const unsubscribeWorkspace = useWorkspaceStore.subscribe((state) => {
       if (state.isRestoring) return;
@@ -138,6 +177,7 @@ export function useGitRunAfterRunner(): void {
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
+      unsubscribeOrchestration();
       unsubscribeWorkspace();
     };
   }, []);

@@ -77,6 +77,92 @@ test('Codex Timeline durable revision skips unchanged full projection', async (t
   assert.equal(projectionCalls, 2);
 });
 
+test('Codex Timeline projects semantic tags and invalidates cache when sidecar changes', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'timeline-presentation-revision-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session-timeline.jsonl');
+  await fs.promises.writeFile(filePath, '{"type":"session_meta"}\n');
+
+  let presentationRevision = 'presentation-1';
+  let phase = 'completion';
+  let loadCalls = 0;
+  const codexData = {
+    _api: {
+      findCodexSessionFile: async () => ({ filePath }),
+      loadSessionRecords: async () => {
+        loadCalls += 1;
+        const stat = await fs.promises.stat(filePath);
+        return {
+          success: true,
+          records: [{ type: 'record' }],
+          filePath,
+          sourceSnapshot: {
+            filePath,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs,
+            sessionId: 'session-timeline',
+            linkKind: 'end',
+          },
+        };
+      },
+      buildCodexTimeline: () => [{
+        uuid: 'timeline-row',
+        role: 'user',
+        content: 'notification',
+        timestamp: '2026-07-27T00:00:00.000Z',
+      }],
+      getTimelineSessionMeta: () => ({ id: 'session-timeline' }),
+    },
+  };
+  const promptPresentationStore = {
+    getHistoryPromptPresentationRevision: () => presentationRevision,
+    getHistoryPromptPresentations: () => [{
+      entryUuid: 'timeline-row',
+      auditTimestamp: '2026-07-27T00:00:00.000Z',
+      transportHash: 'hash',
+      chips: [{ kind: 'orchestration', runId: 'run-1', phase }],
+    }],
+    getHistoryPromptPresentationsForEntries: () => [],
+  };
+  const service = new SessionTranscriptService({
+    getMainWindow: () => null,
+    webBroadcast: null,
+    claudeData: null,
+    codexData,
+    promptPresentationStore,
+  });
+
+  const first = await service.getTimeline({
+    toolType: 'codex',
+    sessionId: 'session-timeline',
+    cwd: dir,
+  });
+  assert.equal(first.entries[0].semanticTags[0].runId, 'run-1');
+  assert.equal(first.entries[0].semanticTags[0].phase, 'completion');
+
+  const unchanged = await service.getTimeline({
+    toolType: 'codex',
+    sessionId: 'session-timeline',
+    cwd: dir,
+    ifRevision: first.revision,
+  });
+  assert.equal(unchanged.unchanged, true);
+  assert.equal(loadCalls, 1);
+
+  presentationRevision = 'presentation-2';
+  phase = 'failure';
+  const refreshed = await service.getTimeline({
+    toolType: 'codex',
+    sessionId: 'session-timeline',
+    cwd: dir,
+    ifRevision: first.revision,
+  });
+  assert.equal(refreshed.unchanged, false);
+  assert.equal(refreshed.entries[0].semanticTags[0].phase, 'failure');
+  assert.notEqual(refreshed.revision.token, first.revision.token);
+  assert.equal(loadCalls, 2);
+});
+
 test('Codex history returns unchanged before loading or projecting records', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'transcript-revision-'));
   t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));

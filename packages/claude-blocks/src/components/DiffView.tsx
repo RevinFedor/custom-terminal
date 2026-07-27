@@ -55,6 +55,7 @@ export function DiffView({
   oldStart,
   newStart,
   unknownLineNumbers = false,
+  cardRowCount,
 }: {
   entries: DiffEntry[];
   language: string;
@@ -62,6 +63,15 @@ export function DiffView({
   oldStart?: number;
   newStart?: number;
   unknownLineNumbers?: boolean;
+  /**
+   * Total rows across ALL hunks of the owning card, when the card renders more
+   * than one. The cost that matters is what a single card paints, and a card is
+   * split into one DiffView per hunk — so judging each hunk on its own size
+   * lets a card of 38 small hunks (341 rows, prod 26.07) escape deferral
+   * entirely while a single 45-row diff gets deferred. Defaults to this
+   * DiffView's own length for single-hunk callers.
+   */
+  cardRowCount?: number;
 }) {
   const resolvedOldStart = oldStart ?? startLine;
   const resolvedNewStart = newStart ?? startLine;
@@ -82,7 +92,7 @@ export function DiffView({
   // reclaims them after, with no scroll listeners and no second virtualiser
   // nested inside Virtuoso. Cheap diffs stay eager: below this size the
   // containment bookkeeping costs more than the rows it would save.
-  const deferRows = entries.length > DIFF_DEFER_MIN_ROWS;
+  const deferRows = (cardRowCount ?? entries.length) > DIFF_DEFER_MIN_ROWS;
   return (
     <div className="cb-diff" data-diff-lang={language}>
       {entries.map((e, idx) => {

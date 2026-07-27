@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom';
 import { ChevronDown, Folder, Hourglass, LoaderCircle, X } from 'lucide-react';
 import { useWorkspaceStore, type TabColor, type TabGroup } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
+import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import ControlHint from '../UI/ControlHint';
 
@@ -403,6 +404,7 @@ export function RunAfterTabPicker({
   }, [fingerprint, ownerProjectIdProp, tabId, selectedInputKey]);
 
   const [busyMap, setBusyMap] = useState<Map<string, boolean>>(() => getBusyTabsSnapshot());
+  const inheritedBusyTabIds = useOrchestrationStore((state) => state.inheritedBusyTabIds);
   useEffect(() => {
     setBusyMap(getBusyTabsSnapshot());
 
@@ -568,7 +570,7 @@ export function RunAfterTabPicker({
 
   const selectedIdSet = useMemo(() => new Set(selectedInputIds), [selectedInputKey]);
   const statusFor = (id: string): TabRuntimeStatus => {
-    if (busyMap.get(id) === true) return 'busy';
+    if (busyMap.get(id) === true || inheritedBusyTabIds.has(id)) return 'busy';
     if (waitingTabIds?.has(id)) return 'waiting';
     if (waitingTabIds && selectedIdSet.has(id) && !busyMap.has(id)) return 'waiting';
     return 'idle';
@@ -606,7 +608,7 @@ export function RunAfterTabPicker({
   const isVisibleTab = useCallback((t: AiTab) => {
     if (t.id === tabId) return false;
     return showAllTabs || statusFor(t.id) !== 'idle' || selectedIdSet.has(t.id);
-  }, [showAllTabs, tabId, busyMap, selectedIdSet, waitingTabIds]);
+  }, [showAllTabs, tabId, busyMap, inheritedBusyTabIds, selectedIdSet, waitingTabIds]);
   const visibleRows = useMemo(() => {
     if (!selectedProject) return [];
     const rows: PickerRow[] = [];

@@ -95,6 +95,44 @@ test('a hash or timestamp mismatch never attaches presentation metadata', () => 
   }), source);
 });
 
+test('an audited orchestration tag decorates only the proven user record', () => {
+  const store = createStore();
+  const content = '[Оркестрация] Запрос завершён.\nrunId: run-1';
+  assert.equal(saveAuditedPromptPresentation(store, {
+    toolType: 'claude',
+    sessionId: 'source-session',
+    auditTimestamp: '2026-07-27T08:00:00.000Z',
+    actualText: content,
+    snapshot: {
+      semanticTags: [{
+        kind: 'orchestration',
+        runId: 'run-1',
+        phase: 'completion',
+        sourceTabId: 'source-tab',
+        targetTabId: 'target-tab',
+      }],
+    },
+  }), true);
+
+  const entries = [{
+    uuid: 'claude-user-entry-1',
+    type: 'user',
+    timestamp: '2026-07-27T08:00:00.000Z',
+    content,
+  }];
+  const decorated = decorateHistoryPromptPresentations(store, {
+    toolType: 'claude',
+    sessionId: 'source-session',
+    entries,
+  });
+
+  assert.equal(decorated[0].semanticTags[0].kind, 'orchestration');
+  assert.equal(decorated[0].semanticTags[0].runId, 'run-1');
+  assert.equal(decorated[0].semanticTags[0].phase, 'completion');
+  assert.equal(decorated[0].promptChips, undefined);
+  assert.equal(store.rows[0].schemaVersion, 2);
+});
+
 function codexUser(line, timestamp, message) {
   return {
     __line: line,

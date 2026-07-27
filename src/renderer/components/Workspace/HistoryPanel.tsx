@@ -6074,11 +6074,22 @@ function HistoryPanel({
   );
   const [loading, setLoading] = useState(() => !firstRenderSnapshot);
   const [presentedOwnerKey, setPresentedOwnerKey] = useState(historyOwnerKey);
-  const [viewportReadyOwnerKey, setViewportReadyOwnerKey] = useState(
-    () => firstRenderSnapshot ? historyOwnerKey : '',
-  );
-  const [viewportProofRequired, setViewportProofRequired] = useState(() => !firstRenderSnapshot);
-  const viewportReadyOwnerKeyRef = useRef(firstRenderSnapshot ? historyOwnerKey : '');
+  // Nobody is "already presented" before a frame exists — including a first
+  // render seeded from the snapshot cache. Marking the warm owner ready here
+  // pre-answered the paint proof and reopened the blank-frame hole from the
+  // other side (see viewportProofRequired below).
+  const [viewportReadyOwnerKey, setViewportReadyOwnerKey] = useState('');
+  // Paint proof is required on EVERY owner, warm cache included. Having the
+  // rows in memory is not having them on screen: the warm path used to drop the
+  // loader the moment the data was there, and the rows themselves still cost
+  // 180-760ms of layout on heavy tabs — the user stared at a blank surface for
+  // that whole gap (prod 26.07, LOADER_HIDDEN → SURFACE_PRESENTED measured
+  // repeatedly at ~190ms on one tab and 24ms on its neighbour). Skipping the
+  // proof for a cache hit was an assumption that "ready data" equals "ready
+  // frame", and it is the one hole through which every blank-frame report came.
+  const [viewportProofRequired, setViewportProofRequired] = useState(true);
+  const viewportReadyOwnerKeyRef = useRef('');
+  const loaderHiddenAtRef = useRef<number | null>(null);
   const viewportPaintProbeRef = useRef<ReturnType<typeof createHistoryViewportPaintProbe> | null>(null);
   if (!viewportPaintProbeRef.current) {
     viewportPaintProbeRef.current = createHistoryViewportPaintProbe();
@@ -6329,6 +6340,21 @@ function HistoryPanel({
     () => new Set(backgroundHistoryChips.map((chip) => chip.entryUuid)),
     [backgroundHistoryChips],
   );
+  // Observable trace of the background zone. Both the presence AND the
+  // absence of chips are acceptance conditions of the E2E scenarios, and a
+  // silently-empty strip is indistinguishable from a strip that was never
+  // computed — so the line prints on every change of the live set, including
+  // the transition to zero, together with the gates that produced it.
+  const backgroundChipsDigest = backgroundHistoryChips
+    .map((chip) => chip.kind + ':' + chip.key)
+    .join(',');
+  useEffect(() => {
+    historyDiag('BACKGROUND_CHIPS tab=' + tabId.slice(-12)
+      + ' count=' + backgroundHistoryChips.length
+      + ' turnBusy=' + (isTurnBusy ? '1' : '0')
+      + ' processAlive=' + (agentProcessAlive ? '1' : '0')
+      + ' keys=' + (backgroundChipsDigest || '-'));
+  }, [tabId, backgroundChipsDigest, backgroundHistoryChips.length, isTurnBusy, agentProcessAlive]);
   // Tab-level loader inheritance: a Codex subagent can outlive its spawn
   // turn, so the tab must keep spinning while any background chip is live
   // even though the parent turn's busy flag is already false. Broadcast the
@@ -6378,8 +6404,9 @@ function HistoryPanel({
   );
   // A cold owner becomes data-ready before Virtuoso has mounted its first
   // measured row. Keep the loader over the already-mounted list during that
-  // short gap; otherwise the user sees a blank History surface. A cache hit is
-  // presentation-ready immediately and never takes this cold-only path.
+  // gap; otherwise the user sees a blank History surface. This applies to warm
+  // owners too — see viewportProofRequired: a cache hit delivers data instantly
+  // but not pixels.
   const viewportAwaitingFirstRange = !surfaceLoading
     && viewportProofRequired
     && displayEntries.length > 0
@@ -6787,7 +6814,21 @@ function HistoryPanel({
     const nextHeight = Math.max(0, Math.ceil(height));
     if (controlsHeightRef.current === nextHeight) return;
     const previousHeight = controlsHeightRef.current;
-    const shouldKeepTailVisible = isAtBottomRef.current;
+    // Re-pin permission is read from the LIVE scroller, not from the cached
+    // flag. The cached one is only as fresh as the last scroll event, and the
+    // composer resizes on its own schedule while the agent streams — so a user
+    // reading upward kept being yanked back down (prod 26.07: three unrequested
+    // jumps to the tail in 8s while the pointer never moved). Reading position
+    // now makes the decision reflect where the user actually is.
+    //
+    // The intent flag still wins when it says "not at bottom": a wheel-up is
+    // recorded there immediately, before the 4px pin threshold is even cleared,
+    // and that intent must not be overridden by a scroller that has not moved
+    // far enough yet.
+    const scroller = virtuosoScrollerRef.current;
+    const liveAtBottom = scroller ? isHistoryTailPinned(scroller) : null;
+    const shouldKeepTailVisible = isAtBottomRef.current
+      && (liveAtBottom === null || liveAtBottom);
     controlsHeightRef.current = nextHeight;
     setControlsHeight(nextHeight);
     onControlsHeightChange?.(nextHeight);
@@ -6795,7 +6836,9 @@ function HistoryPanel({
       ' from=' + previousHeight +
       ' to=' + nextHeight +
       ' main=' + (mainSurface ? '1' : '0') +
-      ' atBottom=' + (shouldKeepTailVisible ? '1' : '0'));
+      ' atBottom=' + (shouldKeepTailVisible ? '1' : '0') +
+      ' cachedAtBottom=' + (isAtBottomRef.current ? '1' : '0') +
+      ' liveAtBottom=' + (liveAtBottom === null ? 'na' : liveAtBottom ? '1' : '0'));
     if (mainSurface) {
       historyTailPinScheduler.schedule({ shouldPin: shouldKeepTailVisible });
     }
@@ -7874,6 +7917,8 @@ function HistoryPanel({
   // Broadcast loading state to InfoPanel button
   useEffect(() => {
     const snapshot = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
+    // Stamped so SURFACE_PRESENTED can report the blank-frame window directly.
+    loaderHiddenAtRef.current = visibleSurfaceLoading ? null : performance.now();
     historyDiag((visibleSurfaceLoading ? 'LOADER_VISIBLE' : 'LOADER_HIDDEN') +
       ' tab=' + tabId.slice(-12) +
       ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') +
@@ -9309,13 +9354,25 @@ function HistoryPanel({
                   : 'miss';
                 surfacePresentedProbeRef.current?.start(
                   viewportPaintOwner,
-                  () => (
-                    historyOwnerKeyRef.current === ownerAtRange
-                    && historyOwnerGenerationRef.current === generationAtRange
-                    && !!virtuosoScrollerRef.current?.querySelector(
+                  () => {
+                    if (
+                      historyOwnerKeyRef.current !== ownerAtRange
+                      || historyOwnerGenerationRef.current !== generationAtRange
+                    ) return false;
+                    const row = virtuosoScrollerRef.current?.querySelector(
                       `[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
-                    )
-                  ),
+                    ) as HTMLElement | null;
+                    if (!row) return false;
+                    // Being IN the markup is not being ON the screen. Under load
+                    // — a heavy tab still painting while the user already
+                    // switched away — this proof fired with a row that had zero
+                    // height, and the surface was declared presented at
+                    // `domRows=0 loader=hidden`: exactly the blank frame the
+                    // strict loader contract exists to forbid (prod 26.07,
+                    // reproduced on every sub-second switch). A real row has
+                    // non-zero height.
+                    return row.getBoundingClientRect().height > 0;
+                  },
                   () => {
                     if (
                       historyOwnerKeyRef.current !== ownerAtRange
@@ -9328,6 +9385,17 @@ function HistoryPanel({
                         `[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
                       ).length || 0;
                     surfacePresentedOwnerRef.current = presentedProofKey;
+                    // paintGapMs is the number the blank-frame class is judged
+                    // on: how long the surface stood between "loader gone" and
+                    // "rows on screen". Deriving it by pairing two log lines
+                    // worked but made every check a manual join; as its own
+                    // field it is one grep. deferredDiffRows proves the diff
+                    // deferral actually engaged — its absence is how a
+                    // threshold bug (per-hunk instead of per-card) survived a
+                    // full run unnoticed.
+                    const deferredDiffRows = virtuosoScrollerRef.current
+                      ?.querySelectorAll('.cb-diff-defer').length || 0;
+                    const loaderHiddenAt = loaderHiddenAtRef.current;
                     historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
                       + ' owner=' + historyOwnerDigest(ownerAtRange)
                       + ' generation=' + generationAtRange
@@ -9335,6 +9403,9 @@ function HistoryPanel({
                       + ' domRows=' + domRows
                       + ' foreignDomRows=' + Math.max(0, allDomRows - domRows)
                       + ' loader=' + (visibleSurfaceLoading ? 'visible' : 'hidden')
+                      + ' paintGapMs=' + (loaderHiddenAt === null
+                        ? 'na' : Math.round(performance.now() - loaderHiddenAt))
+                      + ' deferredDiffRows=' + deferredDiffRows
                       + ' proof=mounted-painted-row');
                     publishHistorySurfacePresented({
                       ownerKey: ownerAtRange,

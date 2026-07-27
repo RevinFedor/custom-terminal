@@ -75,6 +75,10 @@ function createCodexSubagentTracker() {
     // Terminal states are monotonic: a late "interacted" activity replayed
     // from catch-up must not resurrect a completed card as running.
     if (card.subagentStatus === 'completed') return;
+    // A rejected spawn never produced an agent, so no later event can belong
+    // to it — the only exception is an explicit re-spawn, which is a new call
+    // and therefore a new card.
+    if (card.spawnRejected) return;
     card.subagentStatus = status;
     card.description = card.baseDescription + statusSuffix(status);
   };
@@ -103,17 +107,56 @@ function createCodexSubagentTracker() {
       return card;
     },
 
-    /** v1 spawn output: {agent_id, nickname}. */
+    /**
+     * Spawn output — the moment the attempt either becomes an agent or dies.
+     *
+     * Success carries an identity, and WHICH identity depends on the protocol
+     * (both shapes verified over 190 real spawn outputs):
+     *   v1 multi_agent_v1 → {"agent_id":"019f…","nickname":"Faraday"}
+     *   v2 collaboration  → {"task_name":"/root/<name>"}   (no agent_id!)
+     * A REJECTED spawn carries neither — just a plain error string:
+     *   "Full-history forked agents inherit the parent agent type; …"
+     *   "collab spawn failed: agent thread limit reached"
+     *   "collab spawn failed: thread-store internal error: No space left…"
+     *
+     * A rejected spawn never created an agent, so nothing will ever complete
+     * it: no wait_agent status, no close_agent, no notification. Registering
+     * the card as `running` at CALL time and never re-checking the outcome is
+     * what produced permanent phantom chips in production 2026-07-26 — two
+     * chips whose successful retries (15s later) sat completed right beside
+     * them. The card stays (the attempt happened and the user deserves to see
+     * why it failed) but is terminal, never live.
+     *
+     * Identity presence is the structural test; error phrases are only used
+     * as the human-readable reason, never as the detector.
+     */
     attachSpawnOutput(callId, outputPayload) {
       const card = cardByCallId.get(String(callId || ''));
       if (!card) return;
       const output = parseMaybeJson(outputPayload);
       const agentId = String(output?.agent_id || '').trim();
+      const taskName = String(output?.task_name || '').trim();
       const nickname = String(output?.nickname || '').trim();
+      if (!agentId && !taskName) {
+        // Rejections arrive as PLAIN TEXT, which JSON parsing drops to null —
+        // read the reason from the raw payload, falling back to structured
+        // error fields when the refusal did come back as an object.
+        const raw = typeof outputPayload === 'string' ? outputPayload.trim() : '';
+        const structured = String(output?.error || output?.message || '').trim();
+        const reason = structured || raw;
+        card.spawnRejected = true;
+        card.subagentStatus = 'interrupted';
+        card.description = card.baseDescription + ' · не запущен';
+        card.result = reason || 'Запуск агента отклонён.';
+        return;
+      }
       if (agentId) {
         card.agentSessionId = agentId;
         cardByAgentKey.set(agentId, card);
       }
+      // v2 confirms the agent path; register it so later activity/messages
+      // addressed to `/root/<task_name>` find this card.
+      if (taskName) cardByAgentKey.set(taskName, card);
       if (nickname) {
         card.baseDescription = card.baseDescription + ' — ' + nickname;
         card.description = card.baseDescription + (card.subagentStatus === 'running' ? ' · running' : '');
@@ -228,7 +271,25 @@ function createCodexSubagentTracker() {
       const name = String(call?.toolName || '');
       const output = parseMaybeJson(outputPayload);
       let absorbed = false;
-      if (name === 'wait_agent') {
+      if (name === 'resume_agent' || name === 'send_input' || name === 'send_message'
+        || name === 'followup_task') {
+        // A FINISHED agent can be put back to work: `resume_agent {id}` →
+        // {"status":"pending_init"}, then send_input hands it the next task.
+        // Without this the card stays "completed" for the whole resumed run
+        // and its chip never comes back — the Codex mirror of the Claude
+        // SendMessage resume hole (both found 2026-07-26). The next
+        // wait_agent/close_agent output completes it again, so this only
+        // reopens the live window, never overrides a real terminal event.
+        const target = String(call?.args?.id || call?.args?.target
+          || call?.args?.agent_id || call?.args?.name || '').trim();
+        const card = target ? cardByAgentKey.get(target) : null;
+        // A rejected spawn is never resumable — nothing was ever created.
+        if (card && !card.spawnRejected) {
+          card.subagentStatus = 'running';
+          card.description = card.baseDescription + ' · running';
+          absorbed = true;
+        }
+      } else if (name === 'wait_agent') {
         const status = output?.status;
         if (status && typeof status === 'object') {
           for (const [agentKey, agentStatus] of Object.entries(status)) {
@@ -247,13 +308,31 @@ function createCodexSubagentTracker() {
         // control-plane noise once cards exist.
         absorbed = cardByCallId.size > 0;
       } else if (name === 'close_agent') {
-        const completed = output?.previous_status?.completed;
+        // close_agent is TERMINAL by definition: the agent is gone afterwards,
+        // whatever it was doing. Its output reports the status the agent had
+        // BEFORE closing, in two shapes (verified over 32 real closes):
+        //   {"previous_status":{"completed":"<text>"}}  — finished on its own
+        //   {"previous_status":"running"}               — closed mid-flight
+        // The second shape is a plain string, so reading `.completed` from it
+        // yields undefined and the card was left `running` forever — no other
+        // event can ever arrive for a closed agent. Real case: two explorer
+        // agents whose wait_agent timed out and were then force-closed sat as
+        // permanent live chips (4 of 32 closes in the corpus).
+        const previous = output?.previous_status;
+        const completed = typeof previous?.completed === 'string' ? previous.completed : null;
         const target = String(call?.args?.target || '').trim();
         const card = target ? cardByAgentKey.get(target) : null;
-        if (card && typeof completed === 'string') {
-          card.result = completed;
-          card.subagentStatus = 'completed';
-          card.description = card.baseDescription;
+        if (card) {
+          if (completed !== null) {
+            card.result = completed;
+            card.subagentStatus = 'completed';
+            card.description = card.baseDescription;
+          } else if (card.subagentStatus !== 'completed') {
+            // Closed without its own result: terminal, but not a success.
+            card.subagentStatus = 'interrupted';
+            card.description = card.baseDescription + ' · закрыт';
+            if (!card.result) card.result = 'Агент закрыт до завершения задачи.';
+          }
         }
         absorbed = !!card;
       } else if (name === 'list_agents') {

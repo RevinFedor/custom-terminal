@@ -53,7 +53,9 @@ main-owned снимок; renderer не обязан успеть принять 
 bridge. Поэтому холодный/reloading renderer не оставляет API на однажды
 прочитанном `pending`, а startup failure возвращается явно вместо ложного 504.
 
-`send_prompt` / `Status: sent` — это delivery-only сигнал. Он подтверждает, что prompt доставлен в PTY/agent tab, но не ждёт завершения ответа. Для ручной инспекции уже открытой сессии history-tools того же Terminal MCP читают `list_open_sessions` → `busy/status` → targeted turn/text. Для долгой делегации этот цикл запрещён: `delegate_to_session` создаёт persistent run, источник получает одно completion-уведомление, затем вызывает `get_delegation_result` ровно один раз. Так 30-минутный turn не держит HTTP/MCP-вызов и переживает restart.
+`send_prompt` / `Status: sent` — это delivery-only сигнал. Он подтверждает, что prompt доставлен в PTY/agent tab, но не ждёт завершения ответа. Для ручной инспекции уже открытой сессии history-tools того же Terminal MCP читают `list_open_sessions` → `busy/status` → targeted turn/text. Для долгой делегации этот цикл запрещён: `delegate_to_session` создаёт persistent run, после чего текущий assistant-turn заканчивается. Completion-уведомление приходит отдельным следующим user-turn, и только он вызывает `get_delegation_result` ровно один раз. Чтение result/status/transcript до этого уведомления является polling и не доказывает штатный flow. Так 30-минутный turn не держит HTTP/MCP-вызов и переживает restart.
+
+Вложенная делегация сохраняет ту же модель. Когда target активного run сам вызывает `delegate_to_session`, Project API связывает новый вызов через `parentRunId`; `waitForDescendants` по умолчанию не даёт target отчитаться наверх, пока его дочерняя ветка не закончена и результат не обработан следующим turn. Это зависимость durable run, а не visual-child вкладки и не встроенный Claude/Codex subagent. Ранний отчёт разрешается только явным `waitForDescendants:false`; progress/status polling не заменяет этот параметр.
 
 У Codex один provider-turn может пройти через context compaction без второго
 пользовательского сообщения. History показывает compact и post-compact
@@ -61,6 +63,14 @@ bridge. Поэтому холодный/reloading renderer не оставляе
 собирает все assistant-блоки исходного реального turn до следующего реального
 user message. Иначе длинный E2E-run возвращал только вводные комментарии до
 compact, хотя финальный ответ уже был записан перед `task_complete`.
+
+Наличие хотя бы одного assistant-блока не является готовым результатом. Для
+Codex нужен `task_complete` того же turn, для Claude — конечный `stop_reason`;
+до этого `/result` остаётся `ready:false`, а completion-уведомление не
+отправляется. Финальная проверка обходит обычный JSONL-кэш: task-complete может
+дописаться, пока другой читатель ещё заканчивает старый снимок с тем же
+размером/mtime. Это сохраняет контракт «одно уведомление → один fetch» и не
+требует polling или таймаута.
 
 `get_session_progress` решает другой сценарий: по явному запросу посмотреть, какие структурные операции появились в уже существующей сессии после прошлого просмотра. Клиент возвращает opaque cursor из предыдущего ответа; сервер не хранит watermark и не решает за агента, что уже прочитано. Если Rewind/fork заменил ветку и cursor больше не принадлежит текущей истории, ответ явно помечает reset вместо молчаливого пропуска. Этот метод не является completion-gate: готовность по-прежнему определяется `busy/status`, а progress не возвращает полные аргументы и результаты инструментов.
 
@@ -138,6 +148,8 @@ Shell остаётся живым. Output buffer не теряется. PTY pid 
 
 ## Развёртывание
 Repo source — `mcp/terminal-server.mjs`, установленная копия — `~/.claude/mcp/terminal-server.mjs`. Claude и Codex регистрируют только имя `terminal`; отдельной регистрации `overseer` нет. Skill-source живёт в `~/.claude/skills/terminal/` и автоматически зеркалится в `~/.codex/skills/terminal/`.
+
+Каноническая установка выполняется `npm run install:terminal-mcp`. Установщик атомарно копирует repo source, сохраняет резервные копии изменяемых конфигов и точечно нормализует регистрацию Claude/Codex, не перезаписывая другие MCP и не печатая секреты. В `env_vars` регистрации обязательно прокидываются `NOTED_MAIN_PID`, `NOTED_PARENT_PROJECT_ID` и `NOTED_PARENT_TAB_ID`: MCP-процесс, запущенный Codex/Claude, не получает эти значения автоматически только потому, что их имел родительский CLI. Dry-run и повторный запуск должны быть идемпотентны.
 
 Каноническое направление развёртывания — только из repo source в установленную копию. Обратное копирование опасно: установленный сервер может отставать и стереть новые методы из актуального source. Перед заменой нужно сравнить обе копии, после неё — проверить `tools/list` именно у установленного сервера.
 

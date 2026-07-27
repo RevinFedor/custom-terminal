@@ -539,10 +539,11 @@ class DatabaseManager {
       ON timeline_prompt_summaries(updated_at DESC)
     `);
 
-    // Presentation-only metadata for reversible composer chips. The canonical
-    // user prompt remains in Claude/Codex JSONL byte-for-byte; labels and chip
-    // boundaries live here and are attached only after a post-Enter audit has
-    // identified the durable user record.
+    // Presentation-only metadata for reversible composer chips and semantic
+    // user-turn tags. The canonical prompt remains in Claude/Codex JSONL
+    // byte-for-byte; metadata is attached only after a post-Enter audit has
+    // identified the durable user record. `chips_json` is the legacy column
+    // name; schema v2 may contain both prompt and orchestration items.
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS history_prompt_presentations (
         tool_type TEXT NOT NULL,

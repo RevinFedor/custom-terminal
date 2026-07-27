@@ -147,6 +147,9 @@ const {
   createProcessTreeSnapshotSingleFlight,
 } = require(path.join(srcMainDir, 'process-tree-snapshot-single-flight'));
 const {
+  createProcessMetricsService,
+} = require(path.join(srcMainDir, 'process-metrics-service'));
+const {
   waitForNextPtySynchronizedFrame,
 } = require(path.join(srcMainDir, 'pty-synchronized-frame'));
 const {
@@ -8580,20 +8583,23 @@ function _groupIntoTurns(branch) {
 // /overseer/session/:id/* handlers.
 const _overseerTurnsCache = new Map(); // sessionId → { mtimeMs, turns, lastRecord, recordMap }
 
-async function _loadCodexSessionTurns(sessionId, cwd) {
+async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
   if (!codexDataModule?._api?.loadSessionRecords || !codexDataModule?._api?.buildCodexFullHistory) {
     const err = new Error('Codex overseer loader is unavailable');
     err.status = 500;
     throw err;
   }
-  const loaded = await codexDataModule._api.loadSessionRecords(sessionId, cwd);
+  const cacheKey = 'codex:' + sessionId;
+  if (options.forceFresh === true) _overseerTurnsCache.delete(cacheKey);
+  const loaded = await codexDataModule._api.loadSessionRecords(sessionId, cwd, {
+    forceFresh: options.forceFresh === true,
+  });
   if (!loaded?.success) {
     const err = new Error(loaded?.error || `Codex session ${sessionId} not found on disk`);
     err.status = 404;
     throw err;
   }
   const stat = fs.statSync(loaded.filePath);
-  const cacheKey = 'codex:' + sessionId;
   const cached = _overseerTurnsCache.get(cacheKey);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
     const annotations = _loadSessionAnnotations(sessionId, cached.turns);
@@ -8748,13 +8754,14 @@ async function _loadCodexSessionTurns(sessionId, cwd) {
   return result;
 }
 
-async function _loadSessionTurns(sessionId, cwd) {
+async function _loadSessionTurns(sessionId, cwd, options = {}) {
   const located = findSessionFile(sessionId, cwd);
   if (!located) {
-    return _loadCodexSessionTurns(sessionId, cwd);
+    return _loadCodexSessionTurns(sessionId, cwd, options);
   }
   const stat = fs.statSync(located.filePath);
   const cacheKey = 'claude:' + sessionId;
+  if (options.forceFresh === true) _overseerTurnsCache.delete(cacheKey);
   const cached = _overseerTurnsCache.get(cacheKey);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
     // Annotations (notes, rewind markers) can change WITHOUT JSONL changing,
@@ -8895,6 +8902,14 @@ function _collectAssistantBlocks(turn, recordMap) {
   return { thinking, text };
 }
 
+function _claudeTurnHasCompletionProof(turn, recordMap) {
+  for (const uuid of turn?.assistantUuids || []) {
+    const stopReason = String(recordMap.get(uuid)?.message?.stop_reason || '').trim();
+    if (stopReason && stopReason !== 'tool_use' && stopReason !== 'pause_turn') return true;
+  }
+  return false;
+}
+
 function _sliceText(s, start, end) {
   if (start == null && end == null) return s;
   const len = s.length;
@@ -8909,23 +8924,43 @@ function _orchestrationPromptHash(value) {
   return crypto.createHash('sha256').update(normalized).digest('hex');
 }
 
-async function _getAgentTurnResultForOrchestration({ sessionId, cwd, promptHash, requestedAt, maxChars = 100_000 }) {
-  if (!sessionId || !promptHash) return { found: false, error: 'sessionId and promptHash required' };
-  const data = await _loadSessionTurns(sessionId, cwd);
-  const lowerBound = Number(requestedAt) > 0 ? Number(requestedAt) - 5 * 60 * 1000 : 0;
+async function _getAgentTurnResultForOrchestration({
+  sessionId,
+  cwd,
+  promptHash,
+  requestedAt,
+  resultAfterAt,
+  forceFresh = false,
+  maxChars = 100_000,
+}) {
+  const latestAfter = Number(resultAfterAt) > 0 ? Number(resultAfterAt) : 0;
+  if (!sessionId || (!promptHash && !latestAfter)) {
+    return { found: false, error: 'sessionId and promptHash or resultAfterAt required' };
+  }
+  const data = await _loadSessionTurns(sessionId, cwd, { forceFresh });
+  const lowerBound = latestAfter || (Number(requestedAt) > 0 ? Number(requestedAt) - 5 * 60 * 1000 : 0);
   let match = null;
   for (let index = data.turns.length - 1; index >= 0; index--) {
     const turn = data.turns[index];
     if (turn?.kind !== 'user' || !turn.userUuid) continue;
-    const record = data.recordMap.get(turn.userUuid);
-    const userText = _extractUserText(record);
-    if (!userText || _orchestrationPromptHash(userText) !== promptHash) continue;
     const timestampMs = Date.parse(turn.userTimestamp || '');
     if (lowerBound && Number.isFinite(timestampMs) && timestampMs < lowerBound) continue;
+    if (latestAfter) {
+      if (!Array.isArray(turn.assistantUuids) || turn.assistantUuids.length === 0) continue;
+    } else {
+      const record = data.recordMap.get(turn.userUuid);
+      const userText = _extractUserText(record);
+      if (!userText || _orchestrationPromptHash(userText) !== promptHash) continue;
+    }
     match = { turn, turnIndex: index };
     break;
   }
-  if (!match) return { found: false, error: 'matching user turn not found' };
+  if (!match) {
+    return {
+      found: false,
+      error: latestAfter ? 'completed continuation turn not found' : 'matching user turn not found',
+    };
+  }
   if (
     data.engine === 'codex'
     && codexDataModule?._api?.loadSessionRecords
@@ -8942,6 +8977,7 @@ async function _getAgentTurnResultForOrchestration({ sessionId, cwd, promptHash,
       if (codexResult?.success) {
         return {
           found: true,
+          complete: codexResult.complete === true,
           turnIndex: match.turnIndex,
           userUuid: match.turn.userUuid,
           assistantText: codexResult.assistantText,
@@ -8963,6 +8999,7 @@ async function _getAgentTurnResultForOrchestration({ sessionId, cwd, promptHash,
     : joined.slice(0, Math.floor(limit * 0.4)).trimEnd() + '\n…\n' + joined.slice(-(limit - Math.floor(limit * 0.4) - 3)).trimStart();
   return {
     found: true,
+    complete: _claudeTurnHasCompletionProof(match.turn, data.recordMap),
     turnIndex: match.turnIndex,
     userUuid: match.turn.userUuid,
     assistantText,
@@ -11225,10 +11262,28 @@ app.whenReady().then(async () => {
       if (!tabId) return [];
       return webServer.listOrchestrationRunsForTab(tabId);
     });
+    ipcMain.handle('orchestration:list-active', async () => {
+      return webServer.listActiveOrchestrationRuns();
+    });
     ipcMain.handle('orchestration:acknowledge', async (_event, payload = {}) => {
       if (!payload.runId || !payload.tabId) return { ok: false, error: 'runId+tabId required' };
       const run = await webServer.acknowledgeOrchestrationRun(payload.runId, payload.tabId);
       return run ? { ok: true, run } : { ok: false, error: 'run not found' };
+    });
+    ipcMain.handle('orchestration:get-settings', async () => {
+      return webServer.getOrchestrationSettings();
+    });
+    ipcMain.handle('orchestration:update-settings', async (_event, payload = {}) => {
+      return webServer.updateOrchestrationSettings(payload);
+    });
+    ipcMain.handle('orchestration:action', async (_event, payload = {}) => {
+      if (!payload.runId || !payload.action) return { ok: false, error: 'runId+action required' };
+      return webServer.performOrchestrationAction(payload.runId, payload.action);
+    });
+    ipcMain.handle('orchestration:tab-closed', async (_event, payload = {}) => {
+      if (!payload.tabId) return { ok: false, error: 'tabId required' };
+      const runs = await webServer.handleOrchestrationTabClosed(payload.tabId);
+      return { ok: true, runs };
     });
     // Renderer → web relay for prompt-queue deltas. usePromptQueueWebSync (App
     // root) fires this whenever a tab's queue core changes; we fan it out to any
@@ -22407,6 +22462,81 @@ ipcMain.handle('system:detect-project-ports', async (event, cwd) => {
   projectPortsCache.set(cwd, { ports, ts: Date.now() });
   console.log('[free-ports] Detected for ' + cwd + ': [' + ports.join(', ') + ']');
   return { ports, cached: false };
+});
+
+// ---------------------------------------------------------------------------
+// Потребление ресурсов по вкладкам проекта.
+//
+// Источник — прямой запрос к ядру (см. process-metrics-source.js), а не разбор
+// вывода ps: ps не видит сжатую память и на главном процессе занижает почти
+// вдвое. Один снимок покрывает все процессы сразу, поэтому цена не зависит от
+// числа вкладок.
+// ---------------------------------------------------------------------------
+
+/**
+ * Процессы самого приложения: главный, вспомогательные (отрисовка, графика) и
+ * встроенные Claude-агенты. Их надо забрать отдельно, иначе вкладка, чей shell
+ * порождён главным процессом, утащит приложение в свой итог.
+ */
+function collectAppPids() {
+  const pids = new Set([process.pid]);
+  try {
+    for (const metric of app.getAppMetrics()) {
+      if (metric && Number.isInteger(metric.pid)) pids.add(metric.pid);
+    }
+  } catch (error) {
+    console.warn('[ProcessMetrics] getAppMetrics failed: ' + (error && error.message));
+  }
+  return [...pids];
+}
+
+/** Живые вкладки с их процессами — основа для раскладки «вкладка → инструменты». */
+function collectMetricsTabs() {
+  const tabs = [];
+  for (const [tabId, ptyProcess] of terminals) {
+    if (!ptyProcess || !Number.isInteger(ptyProcess.pid)) continue;
+    tabs.push({
+      tabId,
+      pid: ptyProcess.pid,
+      projectId: terminalProjectIds.get(tabId) || null,
+      cwd: terminalProjects.get(tabId) || null,
+    });
+  }
+  return tabs;
+}
+
+let processMetricsProjectId = null;
+
+const processMetricsService = createProcessMetricsService({
+  collectContext: () => ({
+    tabs: collectMetricsTabs(),
+    appPids: collectAppPids(),
+    projectId: processMetricsProjectId,
+  }),
+  onUpdate: (payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:process-metrics', payload);
+    }
+  },
+});
+
+ipcMain.handle('system:process-metrics-subscribe', (event, options = {}) => {
+  processMetricsProjectId = (options && options.projectId) || null;
+  const subscriberId = event.sender.id;
+  const payload = processMetricsService.subscribe(subscriberId);
+
+  // Renderer может перезагрузиться или закрыться, не отписавшись. Без этого
+  // замер продолжал бы крутиться на несуществующего слушателя.
+  event.sender.once('destroyed', () => {
+    processMetricsService.unsubscribe(subscriberId);
+  });
+
+  return payload;
+});
+
+ipcMain.handle('system:process-metrics-unsubscribe', (event) => {
+  processMetricsService.unsubscribe(event.sender.id);
+  return { success: true };
 });
 
 // Kill whatever holds the given ports. Returns per-port outcome.

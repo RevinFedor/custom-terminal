@@ -1235,9 +1235,10 @@ function ProcessBarEditor() {
   const processBar = useUIStore((s) => s.processBar);
   const setProcessBar = useUIStore((s) => s.setProcessBar);
 
-  const [pickerOpen, setPickerOpen] = useState<'a' | 'b' | null>(null);
+  const [pickerOpen, setPickerOpen] = useState<'a' | 'b' | 'c' | null>(null);
   const [hexDraftA, setHexDraftA] = useState<string | null>(null);
   const [hexDraftB, setHexDraftB] = useState<string | null>(null);
+  const [hexDraftC, setHexDraftC] = useState<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -1288,11 +1289,18 @@ function ProcessBarEditor() {
     </div>
   );
 
-  const colorChip = (which: 'a' | 'b') => {
-    const current = which === 'a' ? processBar.colorA : processBar.shimmerColor;
-    const draft = which === 'a' ? hexDraftA : hexDraftB;
-    const setDraft = which === 'a' ? setHexDraftA : setHexDraftB;
-    const label = which === 'a' ? 'Полоса' : 'Блик';
+  const colorChip = (which: 'a' | 'b' | 'c') => {
+    const current = which === 'a'
+      ? processBar.colorA
+      : which === 'b'
+        ? processBar.shimmerColor
+        : processBar.inheritedColor;
+    const draft = which === 'a' ? hexDraftA : which === 'b' ? hexDraftB : hexDraftC;
+    const setDraft = which === 'a' ? setHexDraftA : which === 'b' ? setHexDraftB : setHexDraftC;
+    const label = which === 'a' ? 'Полоса' : which === 'b' ? 'Блик' : 'Дочерний';
+    const updateColor = (color: string) => setProcessBar(
+      which === 'a' ? { colorA: color } : which === 'b' ? { shimmerColor: color } : { inheritedColor: color },
+    );
 
     return (
       <div style={{
@@ -1323,7 +1331,7 @@ function ProcessBarEditor() {
             const next = `#${e.target.value}`;
             setDraft(next);
             const norm = normalizeHexValue(next);
-            if (norm) setProcessBar(which === 'a' ? { colorA: norm } : { shimmerColor: norm });
+            if (norm) updateColor(norm);
           }}
           onBlur={() => setDraft(null)}
           maxLength={7}
@@ -1348,7 +1356,7 @@ function ProcessBarEditor() {
           >
             <HexColorPicker
               color={current}
-              onChange={(c) => setProcessBar(which === 'a' ? { colorA: c.toUpperCase() } : { shimmerColor: c.toUpperCase() })}
+              onChange={(c) => updateColor(c.toUpperCase())}
             />
           </div>
         )}
@@ -1392,6 +1400,7 @@ function ProcessBarEditor() {
 
         {colorChip('a')}
         {colorChip('b')}
+        {colorChip('c')}
 
         {/* Shimmer spacing — компактный inline-chip */}
         <div style={{

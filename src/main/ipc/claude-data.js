@@ -3998,6 +3998,11 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       const latestStartedAt = nodePerformance.now();
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
       const latestMs = nodePerformance.now() - latestStartedAt;
+      const presentedEntries = decorateHistoryPromptPresentations(projectManager?.db, {
+        toolType: 'claude',
+        sessionId,
+        entries,
+      });
 
       // Claude's own backtrace stops at the first orphan — everything before
       // is invisible to the live Claude process even though it's on disk.
@@ -4019,7 +4024,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
         ' recordMap=' + recordMap.size +
         ' activeBranch=' + activeBranch.length +
-        ' entries=' + entries.length +
+        ' entries=' + presentedEntries.length +
         ' boundaries=' + sessionBoundaries.length +
         ' resolveMs=' + resolveMs.toFixed(1) +
         ' backtraceMs=' + backtraceMs.toFixed(1) +
@@ -4028,7 +4033,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         ' totalMs=' + (nodePerformance.now() - timelineStartedAt).toFixed(1)
       );
       _endPerfOp(opId);
-      return { success: true, entries: entries, latestSessionId, sessionBoundaries, chainBreaks: _chainBreaks, claudeMemoryBoundaryUuid };
+      return { success: true, entries: presentedEntries, latestSessionId, sessionBoundaries, chainBreaks: _chainBreaks, claudeMemoryBoundaryUuid };
 
     } catch (error) {
       console.error('[Claude Timeline] Error:', error);

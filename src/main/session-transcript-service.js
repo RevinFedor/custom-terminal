@@ -252,15 +252,24 @@ class SessionTranscriptService {
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
     if (toolType === 'codex') {
+      const presentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
+        ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
+        : 'none';
+      const revisionContext = JSON.stringify({ promptPresentationRevision: presentationRevision });
       if (payload.ifRevision) {
         const validation = await validateHistoryRevision(
           payload.ifRevision,
           { toolType, sessionId, cwd },
           {
+            context: revisionContext,
             resolvePrimaryFile: async () => this._resolveFilePath(toolType, sessionId, cwd),
           }
         );
-        if (validation.unchanged) {
+        const presentationStillCurrent = !validation.unchanged
+          || !this.promptPresentationStore?.getHistoryPromptPresentationRevision
+          || this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
+            === presentationRevision;
+        if (validation.unchanged && presentationStillCurrent) {
           return {
             success: true,
             unchanged: true,
@@ -273,17 +282,28 @@ class SessionTranscriptService {
       if (!loaded?.success) return loaded || { success: false, error: 'codex parser unavailable', entries: [] };
       const loadedAt = Date.now();
       const entries = this.codexData._api.buildCodexTimeline(loaded.records || [], sessionId);
+      const presentedEntries = decorateHistoryPromptPresentations(this.promptPresentationStore, {
+        toolType,
+        sessionId,
+        entries,
+      });
       const sessionMeta = this.codexData._api.getTimelineSessionMeta(loaded.records || []);
+      const finalPresentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
+        ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
+        : 'none';
       const revision = buildHistoryRevision(
         { toolType, sessionId, cwd },
-        loaded.sourceSnapshot ? [loaded.sourceSnapshot] : []
+        loaded.sourceSnapshot ? [loaded.sourceSnapshot] : [],
+        {
+          context: JSON.stringify({ promptPresentationRevision: finalPresentationRevision }),
+        }
       );
       const finishedAt = Date.now();
       if (finishedAt - startedAt >= 50) {
         console.log('[TranscriptService:TimelineProjection] tool=codex' +
           ' session=' + shortId(sessionId) +
           ' records=' + (loaded.records?.length || 0) +
-          ' entries=' + entries.length +
+          ' entries=' + presentedEntries.length +
           ' loadMs=' + (loadedAt - startedAt) +
           ' projectMs=' + (finishedAt - loadedAt) +
           ' totalMs=' + (finishedAt - startedAt));
@@ -291,7 +311,7 @@ class SessionTranscriptService {
       return {
         success: true,
         unchanged: false,
-        entries,
+        entries: presentedEntries,
         sessionMeta,
         sessionBoundaries: [],
         claudeMemoryBoundaryUuid: null,
@@ -301,9 +321,14 @@ class SessionTranscriptService {
     }
     const found = this.claudeData?.findSessionFile?.(sessionId, cwd);
     if (!found) return { success: true, entries: [], sessionId, toolType };
+    const entries = this.claudeData.parseTimelineEntries(found.filePath);
     return {
       success: true,
-      entries: this.claudeData.parseTimelineEntries(found.filePath),
+      entries: decorateHistoryPromptPresentations(this.promptPresentationStore, {
+        toolType,
+        sessionId,
+        entries,
+      }),
       sessionId,
       toolType,
       filePath: found.filePath,
