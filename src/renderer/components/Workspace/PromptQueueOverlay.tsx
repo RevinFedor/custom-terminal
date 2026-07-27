@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowDown, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Plus, RefreshCw, Square, Trash2, TriangleAlert, X } from 'lucide-react';
+import { ArrowDown, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, Square, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, releasePromptQueueEditorLock, usePromptQueueStore, type QueuedComposerChip, type QueuedImageMarkerRange, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
@@ -236,6 +236,8 @@ export function PromptQueueOverlay({
   const closeAfter = queue?.closeAfter ?? false;
   const postPromptEnabled = queue?.postPromptEnabled ?? false;
   const postPromptText = queue?.postPromptText ?? '';
+  const loopPromptEnabled = queue?.loopPromptEnabled ?? false;
+  const loopPromptText = queue?.loopPromptText ?? '';
   const collapsed = queue?.panelCollapsed ?? false;
   const firstChipArmedHint = queue?.firstChipHintActive ?? false;
   const runAfterTabId = queue?.runAfterTabId ?? null;
@@ -244,6 +246,7 @@ export function PromptQueueOverlay({
     addPrompt, removePrompt, updatePrompt, reorderPrompt,
     setAutoRun, setStopAfter, setCloseAfter, setRunAfterTab: setRunAfterTabInStore,
     setPostPromptEnabled, setPostPromptText,
+    setLoopPromptEnabled, setLoopPromptText,
     setPanelCollapsed, setPreviewId,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
   } = usePromptQueueStore.getState();
@@ -280,9 +283,11 @@ export function PromptQueueOverlay({
   const [editorChipPreviewId, setEditorChipPreviewId] = useState<string | null>(null);
   const [editorTitle, setEditorTitle] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
-  // When true, the editor edits the per-tab post-prompt body (not a chip).
-  // editingId is ignored in this mode. Save writes via setPostPromptText.
-  const [isPostPromptMode, setIsPostPromptMode] = useState(false);
+  type SpecialPromptMode = 'post' | 'loop';
+  // Special prompts reuse the queue editor surface but never become queue
+  // chips. The explicit mode keeps blur-save ownership deterministic.
+  const [specialPromptMode, setSpecialPromptMode] = useState<SpecialPromptMode | null>(null);
+  const isSpecialPromptMode = specialPromptMode !== null;
   const [editorAutoFocus, setEditorAutoFocus] = useState(false);
   const [editorFocusWithin, setEditorFocusWithin] = useState(false);
   const [editorPinned, setEditorPinned] = useState(false);
@@ -315,7 +320,7 @@ export function PromptQueueOverlay({
   const editorPayloadLockedRef = useRef(false);
   const editorLastWrittenRef = useRef<{
     id: string | null;
-    post: boolean;
+    specialMode: SpecialPromptMode | null;
     text: string;
     chips: QueuedComposerChip[];
   } | null>(null);
@@ -323,14 +328,14 @@ export function PromptQueueOverlay({
     text: false,
     chips: false,
     title: false,
-    post: false,
+    special: false,
   });
   const removingIdsRef = useRef<Set<string>>(new Set());
   const chipCloseSuppressRef = useRef<{ id: string; until: number } | null>(null);
   const titleGeneratingIdsRef = useRef<Set<string>>(new Set());
   const editorInitialRef = useRef<{
     id: string | null;
-    post: boolean;
+    specialMode: SpecialPromptMode | null;
     text: string;
     chips: QueuedComposerChip[];
     title: string;
@@ -345,10 +350,10 @@ export function PromptQueueOverlay({
     [editingId, items],
   );
   const editorImageMarkerRanges = useMemo(
-    () => isPostPromptMode
+    () => isSpecialPromptMode
       ? []
       : getQueuedImageMarkerHighlightRanges(editorText, editingItem?.imagePaths),
-    [editingItem?.imagePaths, editorText, isPostPromptMode],
+    [editingItem?.imagePaths, editorText, isSpecialPromptMode],
   );
 
   // ─── fixed width + drag-resize ─────────────────────────────────────────────
@@ -457,10 +462,10 @@ export function PromptQueueOverlay({
     editorPayloadLockedRef.current = acquired;
     if (!acquired) {
       console.warn('[PromptQueue] editor payload lock refused tab=' + tabId.slice(-8)
-        + ' item=' + (itemId?.slice(-8) || 'post'));
+        + ' item=' + (itemId?.slice(-8) || specialPromptMode || 'new'));
     }
     return acquired;
-  }, [tabId]);
+  }, [specialPromptMode, tabId]);
 
   const releaseEditorPayloadLock = useCallback((wakeAutoRun = true) => {
     if (!editorPayloadLockedRef.current) return;
@@ -477,7 +482,7 @@ export function PromptQueueOverlay({
     setEditorChipPreviewId(null);
     setEditorTitle('');
     setEditingId(null);
-    setIsPostPromptMode(false);
+    setSpecialPromptMode(null);
     setEditorAutoFocus(false);
     setEditorFocusWithin(false);
     setEditorPinned(false);
@@ -487,7 +492,7 @@ export function PromptQueueOverlay({
       text: false,
       chips: false,
       title: false,
-      post: false,
+      special: false,
     };
   }, [editingId, releaseEditorPayloadLock, setPreviewId, tabId]);
 
@@ -597,12 +602,13 @@ export function PromptQueueOverlay({
     if (!initial) return false;
     const normalizedChips = normalizeComposerChips(nextChips) as QueuedComposerChip[];
 
-    if (initial.post) {
+    if (initial.specialMode) {
       if (!acquireEditorPayloadLock(null)) return false;
-      setPostPromptText(tabId, nextText);
+      if (initial.specialMode === 'post') setPostPromptText(tabId, nextText);
+      else setLoopPromptText(tabId, nextText);
       editorLastWrittenRef.current = {
         id: null,
-        post: true,
+        specialMode: initial.specialMode,
         text: nextText,
         chips: [],
       };
@@ -612,7 +618,7 @@ export function PromptQueueOverlay({
     if (!initial.id) {
       editorLastWrittenRef.current = {
         id: null,
-        post: false,
+        specialMode: null,
         text: nextText,
         chips: normalizedChips,
       };
@@ -635,13 +641,13 @@ export function PromptQueueOverlay({
     if (accepted) {
       editorLastWrittenRef.current = {
         id: initial.id,
-        post: false,
+        specialMode: null,
         text: nextText,
         chips: normalizedChips,
       };
     }
     return accepted;
-  }, [acquireEditorPayloadLock, setPostPromptText, tabId, updatePrompt]);
+  }, [acquireEditorPayloadLock, setLoopPromptText, setPostPromptText, tabId, updatePrompt]);
 
   const commitEditor = useCallback((opts?: { close?: boolean; wakeAutoRun?: boolean }) => {
     if (!editorOpen || committingRef.current) return false;
@@ -653,8 +659,8 @@ export function PromptQueueOverlay({
     committingRef.current = true;
     let changed = false;
     try {
-      if (initial.post) {
-        changed = editorDirtyFieldsRef.current.post;
+      if (initial.specialMode) {
+        changed = editorDirtyFieldsRef.current.special;
         if (editorLastWrittenRef.current?.text !== editorText) {
           writeThroughEditorPayload(editorText, []);
         }
@@ -780,7 +786,7 @@ export function PromptQueueOverlay({
           text: false,
           chips: false,
           title: false,
-          post: false,
+          special: false,
         };
         releaseEditorPayloadLock(opts?.wakeAutoRun !== false);
       }
@@ -810,12 +816,12 @@ export function PromptQueueOverlay({
   }, []);
 
   const closePinnedEditorFromChip = useCallback((id: string) => {
-    if (!editorOpen || !editorPinned || editingId !== id || isPostPromptMode) return false;
+    if (!editorOpen || !editorPinned || editingId !== id || isSpecialPromptMode) return false;
     suppressChipReopen(id);
     commitEditor();
     blurActiveElement();
     return true;
-  }, [blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isPostPromptMode, suppressChipReopen]);
+  }, [blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isSpecialPromptMode, suppressChipReopen]);
 
   const openChipContextMenu = useCallback((id: string, e: React.MouseEvent) => {
     e.preventDefault();
@@ -903,7 +909,7 @@ export function PromptQueueOverlay({
   const openEditor = useCallback((id?: string, mode: 'hover' | 'pin' | 'restore' = 'pin') => {
     if (id && mode === 'hover' && isChipReopenSuppressed(id)) return;
     if (mode === 'hover' && editorPinned) return;
-    if (editorOpen && !isPostPromptMode) {
+    if (editorOpen && !isSpecialPromptMode) {
       if (id && editingId === id) {
         if (mode === 'hover') return;
         if (mode === 'restore') return;
@@ -950,7 +956,7 @@ export function PromptQueueOverlay({
       text: false,
       chips: false,
       title: false,
-      post: false,
+      special: false,
     };
     if (id) {
       const it = usePromptQueueStore.getState().getQueue(tabId).items.find((i) => i.id === id);
@@ -964,7 +970,7 @@ export function PromptQueueOverlay({
       if (mode === 'pin') setPreviewId(tabId, id);
       editorInitialRef.current = {
         id,
-        post: false,
+        specialMode: null,
         text: it.text,
         chips: (it.chips || []).map((chip) => ({ ...chip })),
         title,
@@ -972,7 +978,7 @@ export function PromptQueueOverlay({
       };
       editorLastWrittenRef.current = {
         id,
-        post: false,
+        specialMode: null,
         text: it.text,
         chips: (it.chips || []).map((chip) => ({ ...chip })),
       };
@@ -985,7 +991,7 @@ export function PromptQueueOverlay({
       if (mode === 'pin') setPreviewId(tabId, null);
       editorInitialRef.current = {
         id: null,
-        post: false,
+        specialMode: null,
         text: '',
         chips: [],
         title: '',
@@ -993,24 +999,22 @@ export function PromptQueueOverlay({
       };
       editorLastWrittenRef.current = {
         id: null,
-        post: false,
+        specialMode: null,
         text: '',
         chips: [],
       };
     }
-    setIsPostPromptMode(false);
+    setSpecialPromptMode(null);
     setEditorAutoFocus(mode === 'pin');
     setEditorFocusWithin(false);
     setEditorPinned(mode !== 'hover');
     setEditorAnchor(anchor);
     setEditorOpen(true);
-  }, [anchorEditor, blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isChipReopenSuppressed, isPostPromptMode, setPreviewId, suppressChipReopen, tabId]);
+  }, [anchorEditor, blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isChipReopenSuppressed, isSpecialPromptMode, setPreviewId, suppressChipReopen, tabId]);
 
-  // Same editor surface as openEditor, but loads the per-tab post-prompt body.
-  // Switching editor purpose first commits the currently open surface, matching
-  // the blur-save contract and avoiding silent draft loss.
-  const openPostPromptEditor = useCallback(() => {
-    if (editorOpen && isPostPromptMode) {
+  // Same editor surface as queue items, but with a distinct durable owner.
+  const openSpecialPromptEditor = useCallback((mode: SpecialPromptMode) => {
+    if (editorOpen && specialPromptMode === mode) {
       commitEditor();
       return;
     }
@@ -1021,35 +1025,44 @@ export function PromptQueueOverlay({
       text: false,
       chips: false,
       title: false,
-      post: false,
+      special: false,
     };
+    const text = mode === 'post' ? postPromptText : loopPromptText;
     setPreviewId(tabId, null);
-    setEditorText(postPromptText);
+    setEditorText(text);
     setEditorChips([]);
     setEditorChipPreviewId(null);
     setEditorTitle('');
     setEditingId(null);
-    setIsPostPromptMode(true);
+    setSpecialPromptMode(mode);
     setEditorAutoFocus(true);
     setEditorFocusWithin(false);
     setEditorPinned(true);
     editorInitialRef.current = {
       id: null,
-      post: true,
-      text: postPromptText,
+      specialMode: mode,
+      text,
       chips: [],
       title: '',
       titleManual: false,
     };
     editorLastWrittenRef.current = {
       id: null,
-      post: true,
-      text: postPromptText,
+      specialMode: mode,
+      text,
       chips: [],
     };
     setEditorAnchor(anchor);
     setEditorOpen(true);
-  }, [anchorEditor, commitEditor, editorOpen, isPostPromptMode, postPromptText, setPreviewId, tabId]);
+  }, [anchorEditor, commitEditor, editorOpen, loopPromptText, postPromptText, setPreviewId, specialPromptMode, tabId]);
+
+  const openPostPromptEditor = useCallback(() => {
+    openSpecialPromptEditor('post');
+  }, [openSpecialPromptEditor]);
+
+  const openLoopPromptEditor = useCallback(() => {
+    openSpecialPromptEditor('loop');
+  }, [openSpecialPromptEditor]);
 
   useEffect(() => {
     if (!chipContextMenu) return;
@@ -1118,7 +1131,7 @@ export function PromptQueueOverlay({
     if (!editorOpen || !editorAnchor) return;
     const textarea = editorTextareaRef.current;
     if (!textarea) return;
-    const chromeHeight = isPostPromptMode ? 0 : editorTitleHeight + 1;
+    const chromeHeight = isSpecialPromptMode ? 0 : editorTitleHeight + 1;
     const maxTextareaHeight = Math.max(
       editorTextareaMinHeight,
       editorAnchor.maxHeight - chromeHeight
@@ -1137,7 +1150,7 @@ export function PromptQueueOverlay({
       highlight.scrollTop = textarea.scrollTop;
       highlight.scrollLeft = textarea.scrollLeft;
     }
-  }, [editorAnchor, editorOpen, editorSize.width, editorText, editorTextareaMinHeight, editorTitleHeight, isPostPromptMode]);
+  }, [editorAnchor, editorOpen, editorSize.width, editorText, editorTextareaMinHeight, editorTitleHeight, isSpecialPromptMode]);
 
   useEffect(() => {
     if (!editingId) return;
@@ -1146,7 +1159,7 @@ export function PromptQueueOverlay({
 
   useEffect(() => {
     if (!pinnedPreviewId || collapsed || panelClosing) return;
-    if (editorOpen && editorPinned && editingId === pinnedPreviewId && !isPostPromptMode) return;
+    if (editorOpen && editorPinned && editingId === pinnedPreviewId && !isSpecialPromptMode) return;
     if (!items.some((i) => i.id === pinnedPreviewId)) {
       setPreviewId(tabId, null);
       return;
@@ -1158,7 +1171,7 @@ export function PromptQueueOverlay({
     editingId,
     editorOpen,
     editorPinned,
-    isPostPromptMode,
+    isSpecialPromptMode,
     items,
     openEditor,
     panelClosing,
@@ -1555,7 +1568,7 @@ export function PromptQueueOverlay({
     ? COLLAPSED_RAIL_COMPACT_WIDTH
     : COLLAPSED_RAIL_FULL_WIDTH;
   const arrowExpanded = !collapsed && !panelClosing;
-  const addEditorActive = editorOpen && !isPostPromptMode && editingId === null;
+  const addEditorActive = editorOpen && !isSpecialPromptMode && editingId === null;
   const railRunBg = autoRun
     ? (railRunHover ? '#342a52' : '#2b2340')
     : firstChipArmedHint
@@ -1891,11 +1904,7 @@ export function PromptQueueOverlay({
                     (e.currentTarget as HTMLElement).style.color = TEXT_MUTED;
                   }}
                 >
-                  {/* Power-off icon — minimal Lucide-style stroke SVG. */}
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                    <path d="M12 2v10" />
-                    <path d="M18.4 6.6a9 9 0 1 1-12.77.04" />
-                  </svg>
+                  <Power size={11} strokeWidth={2.4} aria-hidden="true" />
                 </button>
                 </ControlHint>
               </div>
@@ -1957,15 +1966,66 @@ export function PromptQueueOverlay({
               onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = `${TINT}1a`; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
             >
-              {/* Pencil icon as SVG instead of "✎" U+270E — that glyph has a
-                  large descender that gets vertically clipped by the parent
-                  header's tight padding in this monospace font. SVG renders
-                  at exactly the width/height we ask for, no font-metric
-                  surprises. */}
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d="M12 20h9" />
-                <path d="M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4Z" />
-              </svg>
+              <Pencil size={11} strokeWidth={2.4} aria-hidden="true" />
+            </button>
+            </ControlHint>
+          </div>
+
+          {/* Loop is a standalone prompt sent again after every authoritative
+              natural completion. It is intentionally separate from Post,
+              which only decorates consumable queue items. */}
+          <div
+            style={{
+              display: 'flex',
+              width: '100%',
+              border: `1px solid ${loopPromptEnabled ? PULSE : BORDER}`,
+              borderRadius: 10,
+              overflow: 'hidden',
+              transition: 'border-color 0.15s',
+            }}
+          >
+            <ControlHint
+              label={loopPromptEnabled ? 'Остановить циклический prompt' : 'Отправлять prompt после каждого завершения'}
+              side="left"
+            >
+            <button
+              onClick={() => setLoopPromptEnabled(tabId, !loopPromptEnabled)}
+              title={loopPromptText ? 'Loop: ' + (loopPromptText.length > 60 ? loopPromptText.slice(0, 60) + '…' : loopPromptText) : 'Loop is empty — click the pencil to add text'}
+              style={{
+                flex: 1,
+                padding: '2px 6px',
+                background: loopPromptEnabled ? `${PULSE}22` : 'transparent',
+                border: 'none',
+                color: loopPromptEnabled ? PULSE : TEXT_MUTED,
+                cursor: 'pointer', fontSize: 9, letterSpacing: 0,
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 4,
+                whiteSpace: 'nowrap',
+                transition: 'all 0.15s',
+              }}
+            >
+              <RefreshCw size={10} strokeWidth={2.2} />
+              Loop
+            </button>
+            </ControlHint>
+            <ControlHint label="Изменить циклический prompt" side="left">
+            <button
+              data-editor-trigger="loop"
+              onClick={openLoopPromptEditor}
+              title="Edit loop prompt"
+              style={{
+                padding: '2px 6px',
+                background: 'transparent',
+                border: 'none',
+                borderLeft: `1px solid ${loopPromptEnabled ? PULSE : BORDER}`,
+                color: loopPromptEnabled ? PULSE : TEXT_MUTED,
+                cursor: 'pointer', lineHeight: 1,
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                transition: 'all 0.15s',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = `${PULSE}1a`; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              <Pencil size={11} strokeWidth={2.4} aria-hidden="true" />
             </button>
             </ControlHint>
           </div>
@@ -2499,7 +2559,7 @@ export function PromptQueueOverlay({
             }, 0);
           }}
         >
-          {!isPostPromptMode && (
+          {!isSpecialPromptMode && (
             <>
               <input
                 ref={editorTitleInputRef}
@@ -2631,7 +2691,7 @@ export function PromptQueueOverlay({
               flex: '0 0 auto',
               width: '100%',
               minHeight: editorTextareaMinHeight,
-              maxHeight: editorAnchor.maxHeight - (isPostPromptMode ? 0 : editorTitleHeight + 1),
+              maxHeight: editorAnchor.maxHeight - (isSpecialPromptMode ? 0 : editorTitleHeight + 1),
               background: '#0e0e0e',
               overflow: 'hidden',
             }}
@@ -2663,11 +2723,11 @@ export function PromptQueueOverlay({
             <textarea
               ref={editorTextareaRef}
               className="pq-image-marker-textarea"
-              autoFocus={editorAutoFocus && isPostPromptMode}
+              autoFocus={editorAutoFocus && isSpecialPromptMode}
               value={editorText}
               onChange={(e) => {
                 const nextText = e.target.value;
-                if (isPostPromptMode) editorDirtyFieldsRef.current.post = true;
+                if (isSpecialPromptMode) editorDirtyFieldsRef.current.special = true;
                 else editorDirtyFieldsRef.current.text = true;
                 setEditorText(nextText);
                 writeThroughEditorPayload(nextText, editorChips);
@@ -2688,7 +2748,7 @@ export function PromptQueueOverlay({
                 display: 'block',
                 width: '100%',
                 minHeight: editorTextareaMinHeight,
-                maxHeight: editorAnchor.maxHeight - (isPostPromptMode ? 0 : editorTitleHeight + 1),
+                maxHeight: editorAnchor.maxHeight - (isSpecialPromptMode ? 0 : editorTitleHeight + 1),
                 background: 'transparent',
                 color: 'transparent',
                 WebkitTextFillColor: 'transparent',

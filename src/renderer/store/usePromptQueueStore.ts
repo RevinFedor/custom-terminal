@@ -22,7 +22,7 @@ const { ipcRenderer } = window.require('electron');
 // SQLite-backed persistence via the existing app:setState / app:getState
 // pattern (same as defaultClaudeEffort, debugHoverBridges, freePorts).
 // Persist: items, autoRun, stopAfter, firstDelaySeconds, postPromptEnabled,
-// postPromptText, panelCollapsed, previewId PER TAB. Skip:
+// postPromptText, loopPromptEnabled, loopPromptText, panelCollapsed, previewId PER TAB. Skip:
 // firstChipHintActive (UI-only).
 // Serialized shape: { [tabId]: { items, autoRun, stopAfter, firstDelaySeconds,
 //                                postPromptEnabled, postPromptText, panelCollapsed,
@@ -121,8 +121,8 @@ function markPromptQueueStoreHydrated(): void {
   }
 }
 
-function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'>> {
-  const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'>> = {};
+function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptText' | 'loopPromptArmedAt' | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'>> {
+  const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptText' | 'loopPromptArmedAt' | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'>> = {};
   for (const [tabId, q] of snapshot) {
     // Skip cold tabs with no persistable state — saves space + avoids polluting
     // the kv store with thousands of empty rows over time. Non-default delay
@@ -136,6 +136,8 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       q.firstDelaySeconds === 0 &&
       !q.postPromptEnabled &&
       !q.postPromptText &&
+      !q.loopPromptEnabled &&
+      !q.loopPromptText &&
       !q.runAfterTabId &&
       !q.panelCollapsed &&
       !q.previewId
@@ -148,6 +150,9 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       firstDelaySeconds: q.firstDelaySeconds,
       postPromptEnabled: q.postPromptEnabled,
       postPromptText: q.postPromptText,
+      loopPromptEnabled: q.loopPromptEnabled,
+      loopPromptText: q.loopPromptText,
+      loopPromptArmedAt: q.loopPromptArmedAt,
       runAfterTabId: q.runAfterTabId,
       workflowArmedAt: q.workflowArmedAt,
       panelCollapsed: q.panelCollapsed,
@@ -384,6 +389,15 @@ export type TabQueue = {
   postPromptEnabled: boolean;
   postPromptText: string;
 
+  // A persistent own-tab continuation. Unlike Post, this is a standalone
+  // prompt; unlike queue items, it is not consumed after a successful send.
+  // It fires only after an authoritative natural completion and repeats until
+  // disabled. The separate arm timestamp prevents a newly edited Loop from
+  // consuming an older completion restored from disk.
+  loopPromptEnabled: boolean;
+  loopPromptText: string;
+  loopPromptArmedAt: number | null;
+
   // ── Overlay collapsed/expanded state ─────────────────────────────────────
   // Per-tab UI state for the Run-after panel. Default is expanded (false);
   // if the user collapses a specific tab, that choice persists across tab
@@ -507,6 +521,8 @@ interface PromptQueueStore {
   // setPostPromptText writes the body. Both are persisted.
   setPostPromptEnabled: (tabId: string, value: boolean) => void;
   setPostPromptText: (tabId: string, text: string) => void;
+  setLoopPromptEnabled: (tabId: string, value: boolean) => void;
+  setLoopPromptText: (tabId: string, text: string) => void;
   setPanelCollapsed: (tabId: string, value: boolean) => void;
 
   // First-chip armed hint helpers. consumeFirstChipHint clears the flag after
@@ -524,7 +540,11 @@ interface PromptQueueStore {
 
   // Cancel every active workflow whose owner or selected pivot is the trigger.
   // Queued items stay available for a deliberate retry.
-  disarmQueuesForTrigger: (triggerTabId: string, outcomeTs?: number | null) => string[];
+  disarmQueuesForTrigger: (
+    triggerTabId: string,
+    outcomeTs?: number | null,
+    options?: { preservePivoted?: boolean },
+  ) => string[];
 
   // Drop queue state owned by a closed tab and clear run-after pivots that
   // pointed at it. Called from workspace closeTab.
@@ -543,6 +563,9 @@ const EMPTY: TabQueue = {
   firstDelayCountdownAt: null,
   postPromptEnabled: false,
   postPromptText: '',
+  loopPromptEnabled: false,
+  loopPromptText: '',
+  loopPromptArmedAt: null,
   panelCollapsed: false,
   firstChipHintActive: false,
   stopBeforeCloseArm: false,
@@ -571,6 +594,9 @@ type PreHydrateQueueField =
   | 'firstDelaySeconds'
   | 'postPromptEnabled'
   | 'postPromptText'
+  | 'loopPromptEnabled'
+  | 'loopPromptText'
+  | 'loopPromptArmedAt'
   | 'runAfterTabId'
   | 'workflowArmedAt'
   | 'panelCollapsed'
@@ -609,6 +635,9 @@ function trackPreHydrateQueueChanges(before: Map<string, TabQueue>, after: Map<s
     if (baseline.firstDelaySeconds !== current.firstDelaySeconds) changed.add('firstDelaySeconds');
     if (baseline.postPromptEnabled !== current.postPromptEnabled) changed.add('postPromptEnabled');
     if (baseline.postPromptText !== current.postPromptText) changed.add('postPromptText');
+    if (baseline.loopPromptEnabled !== current.loopPromptEnabled) changed.add('loopPromptEnabled');
+    if (baseline.loopPromptText !== current.loopPromptText) changed.add('loopPromptText');
+    if (baseline.loopPromptArmedAt !== current.loopPromptArmedAt) changed.add('loopPromptArmedAt');
     if (baseline.runAfterTabId !== current.runAfterTabId) changed.add('runAfterTabId');
     if (baseline.workflowArmedAt !== current.workflowArmedAt) changed.add('workflowArmedAt');
     if (baseline.panelCollapsed !== current.panelCollapsed) changed.add('panelCollapsed');
@@ -648,6 +677,9 @@ function mergeHydratedQueue(
   if (changed?.has('firstDelaySeconds')) merged.firstDelaySeconds = current.firstDelaySeconds;
   if (changed?.has('postPromptEnabled')) merged.postPromptEnabled = current.postPromptEnabled;
   if (changed?.has('postPromptText')) merged.postPromptText = current.postPromptText;
+  if (changed?.has('loopPromptEnabled')) merged.loopPromptEnabled = current.loopPromptEnabled;
+  if (changed?.has('loopPromptText')) merged.loopPromptText = current.loopPromptText;
+  if (changed?.has('loopPromptArmedAt')) merged.loopPromptArmedAt = current.loopPromptArmedAt;
   if (changed?.has('runAfterTabId')) merged.runAfterTabId = current.runAfterTabId;
   if (changed?.has('workflowArmedAt')) merged.workflowArmedAt = current.workflowArmedAt;
   if (changed?.has('panelCollapsed')) merged.panelCollapsed = current.panelCollapsed;
@@ -672,6 +704,7 @@ export type PromptQueueCore = Pick<
   TabQueue,
   'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'runAfterTabId'
   | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText'
+  | 'loopPromptEnabled' | 'loopPromptText'
 >;
 
 export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
@@ -684,6 +717,8 @@ export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
     firstDelaySeconds: q.firstDelaySeconds,
     postPromptEnabled: q.postPromptEnabled,
     postPromptText: q.postPromptText,
+    loopPromptEnabled: q.loopPromptEnabled,
+    loopPromptText: q.loopPromptText,
   };
 }
 
@@ -725,9 +760,16 @@ export function countEnabledQueuedPrompts(items: QueuedPrompt[]): number {
 }
 
 export function hasPendingPromptQueueContinuation(
-  queue: Pick<TabQueue, 'autoRun' | 'items'>,
+  queue: Pick<TabQueue, 'autoRun' | 'items' | 'loopPromptEnabled' | 'loopPromptText'>,
 ): boolean {
-  return queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0;
+  return (queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0)
+    || isLoopPromptActive(queue);
+}
+
+export function isLoopPromptActive(
+  queue: Pick<TabQueue, 'loopPromptEnabled' | 'loopPromptText'>,
+): boolean {
+  return queue.loopPromptEnabled && queue.loopPromptText.trim().length > 0;
 }
 
 function wouldCreateRunAfterCycle(
@@ -1339,6 +1381,36 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       });
     },
 
+    setLoopPromptEnabled: (tabId, value) => {
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        const cur = next.get(tabId) ?? EMPTY;
+        if (cur.loopPromptEnabled === value) return state;
+        next.set(tabId, {
+          ...cur,
+          loopPromptEnabled: value,
+          loopPromptArmedAt: value ? Date.now() : null,
+        });
+        return { queues: next };
+      });
+    },
+
+    setLoopPromptText: (tabId, text) => {
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        const cur = next.get(tabId) ?? EMPTY;
+        if (cur.loopPromptText === text) return state;
+        next.set(tabId, {
+          ...cur,
+          loopPromptText: text,
+          // Editing an enabled Loop changes the operation itself. Correlate the
+          // new body only with completions that happen after this edit.
+          loopPromptArmedAt: cur.loopPromptEnabled ? Date.now() : cur.loopPromptArmedAt,
+        });
+        return { queues: next };
+      });
+    },
+
     setPanelCollapsed: (tabId, value) => {
       setAndPersist((state) => {
         const next = new Map(state.queues);
@@ -1415,7 +1487,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       return { removed, beforeCount, targetCleared };
     },
 
-    disarmQueuesForTrigger: (triggerTabId, outcomeTs = null) => {
+    disarmQueuesForTrigger: (triggerTabId, outcomeTs = null, options = {}) => {
       const disarmed: string[] = [];
       const classifiedOutcomeTs = Number.isFinite(outcomeTs) ? Number(outcomeTs) : null;
       setAndPersist((state) => {
@@ -1424,26 +1496,44 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         for (const [ownerTabId, cur] of state.queues) {
           const ownsTrigger = ownerTabId === triggerTabId;
           const waitsOnTrigger = cur.runAfterTabId === triggerTabId;
-          const hasActivePromise = cur.autoRun || cur.stopAfter || cur.closeAfter || cur.firstDelayCountdownAt !== null;
-          if ((!ownsTrigger && !waitsOnTrigger) || !hasActivePromise) continue;
+          const hasQueuePromise = cur.autoRun || cur.stopAfter || cur.closeAfter || cur.firstDelayCountdownAt !== null;
+          const queueMatches = hasQueuePromise
+            && (ownsTrigger || (waitsOnTrigger && options.preservePivoted !== true));
+          const loopMatches = ownsTrigger && cur.loopPromptEnabled;
+          if (!queueMatches && !loopMatches) continue;
           // A user can deliberately re-arm after an old failure while restore is
           // still hydrating. Never let that stale outcome cancel the newer arm;
           // legacy queues without a timestamp remain fail-closed.
-          if (cur.workflowArmedAt !== null
-            && (classifiedOutcomeTs === null || cur.workflowArmedAt > classifiedOutcomeTs)) continue;
+          const disarmQueue = queueMatches && (
+            cur.workflowArmedAt === null
+            || (classifiedOutcomeTs !== null && cur.workflowArmedAt <= classifiedOutcomeTs)
+          );
+          const disarmLoop = loopMatches && (
+            cur.loopPromptArmedAt === null
+            || (classifiedOutcomeTs !== null && cur.loopPromptArmedAt <= classifiedOutcomeTs)
+          );
+          if (!disarmQueue && !disarmLoop) continue;
           next.set(ownerTabId, {
             ...cur,
-            autoRun: false,
-            stopAfter: false,
-            closeAfter: false,
-            stopBeforeCloseArm: false,
-            firstDelayCountdownAt: null,
-            runAfterTabId: null,
-            workflowArmedAt: null,
+            ...(disarmQueue ? {
+              autoRun: false,
+              stopAfter: false,
+              closeAfter: false,
+              stopBeforeCloseArm: false,
+              firstDelayCountdownAt: null,
+              runAfterTabId: null,
+              workflowArmedAt: null,
+            } : {}),
+            ...(disarmLoop ? {
+              loopPromptEnabled: false,
+              loopPromptArmedAt: null,
+            } : {}),
           });
           disarmed.push(ownerTabId);
-          runtimeWorkflowArmTabs.delete(ownerTabId);
-          automaticRunAfterTargetClearTabs.delete(ownerTabId);
+          if (disarmQueue) {
+            runtimeWorkflowArmTabs.delete(ownerTabId);
+            automaticRunAfterTargetClearTabs.delete(ownerTabId);
+          }
           changed = true;
         }
         return changed ? { queues: next } : state;
@@ -1595,6 +1685,9 @@ type PersistedTabQueue = {
   firstDelaySeconds?: number;
   postPromptEnabled?: boolean;
   postPromptText?: string;
+  loopPromptEnabled?: boolean;
+  loopPromptText?: string;
+  loopPromptArmedAt?: number | null;
   runAfterTabId?: string | null;
   workflowArmedAt?: number | null;
   panelCollapsed?: boolean;
@@ -1663,6 +1756,11 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     firstDelayCountdownAt: null,
     postPromptEnabled: !!entry.postPromptEnabled,
     postPromptText: typeof entry.postPromptText === 'string' ? entry.postPromptText : '',
+    loopPromptEnabled: !!entry.loopPromptEnabled,
+    loopPromptText: typeof entry.loopPromptText === 'string' ? entry.loopPromptText : '',
+    loopPromptArmedAt: typeof entry.loopPromptArmedAt === 'number' && Number.isFinite(entry.loopPromptArmedAt)
+      ? Number(entry.loopPromptArmedAt)
+      : null,
     panelCollapsed: !!entry.panelCollapsed,
     firstChipHintActive: false,
     stopBeforeCloseArm: false,

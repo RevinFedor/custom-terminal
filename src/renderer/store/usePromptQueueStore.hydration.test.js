@@ -123,6 +123,12 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
       autoRun: false,
       firstDelaySeconds: 90061,
     },
+    'tab-loop': {
+      items: [],
+      loopPromptEnabled: true,
+      loopPromptText: 'continue until done',
+      loopPromptArmedAt: 444,
+    },
     'tab-merge-arm': {
       items: [{ id: 'persisted-merge-item', text: 'persisted merge', createdAt: 3 }],
       autoRun: false,
@@ -147,6 +153,11 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
     90061,
     'persisted delays longer than one hour are preserved',
   );
+  const hydratedLoop = queueModule.usePromptQueueStore.getState().getQueue('tab-loop');
+  assert.equal(hydratedLoop.loopPromptEnabled, true);
+  assert.equal(hydratedLoop.loopPromptText, 'continue until done');
+  assert.equal(hydratedLoop.loopPromptArmedAt, 444);
+  assert.equal(queueModule.hasPendingPromptQueueContinuation(hydratedLoop), true);
   queueModule.usePromptQueueStore.getState().clearStaleRunAfterTab('tab-stale-target', 'different-target');
   assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-stale-target').runAfterTabId, 'closed-target');
   queueModule.usePromptQueueStore.getState().clearStaleRunAfterTab('tab-stale-target', 'closed-target');
@@ -277,6 +288,28 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
     fakeNow = 70_000;
     store.addPrompt('tab-add-edge', 'arrived while armed');
     assert.equal(store.getQueue('tab-add-edge').workflowArmedAt, 70_000);
+
+    fakeNow = 80_000;
+    store.setLoopPromptText('tab-loop-runtime', 'are you really finished?');
+    store.setLoopPromptEnabled('tab-loop-runtime', true);
+    assert.equal(store.getQueue('tab-loop-runtime').loopPromptArmedAt, 80_000);
+    fakeNow = 81_000;
+    store.setLoopPromptText('tab-loop-runtime', 'finish the remaining work');
+    assert.equal(store.getQueue('tab-loop-runtime').loopPromptArmedAt, 81_000);
+
+    fakeNow = 90_000;
+    store.addPrompt('tab-pivot-owner', 'run after target');
+    store.setAutoRun('tab-pivot-owner', true);
+    store.setRunAfterTab('tab-pivot-owner', 'tab-pivot-target');
+    assert.deepEqual(
+      store.disarmQueuesForTrigger('tab-pivot-target', 90_000, { preservePivoted: true }),
+      [],
+      'recoverable target interrupt preserves a foreign Run After subscriber',
+    );
+    assert.equal(store.getQueue('tab-pivot-owner').autoRun, true);
+    assert.equal(store.getQueue('tab-pivot-owner').runAfterTabId, 'tab-pivot-target');
+    assert.deepEqual(store.disarmQueuesForTrigger('tab-pivot-target', 90_000), ['tab-pivot-owner']);
+    assert.equal(store.getQueue('tab-pivot-owner').autoRun, false);
   } finally {
     Date.now = realDateNow;
   }
@@ -304,6 +337,9 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.equal(saved['tab-merge-arm'].workflowArmedAt, 5_000);
   assert.equal(saved['tab-enable-edge'].workflowArmedAt, 50_000);
   assert.equal(saved['tab-add-edge'].workflowArmedAt, 70_000);
+  assert.equal(saved['tab-loop'].loopPromptArmedAt, 444);
+  assert.equal(saved['tab-loop-runtime'].loopPromptText, 'finish the remaining work');
+  assert.equal(saved['tab-loop-runtime'].loopPromptArmedAt, 81_000);
   queueModule.usePromptQueueStore.getState().cleanupClosedTab('tab-add-edge');
   assert.equal(queueModule.hasRuntimeWorkflowArm('tab-add-edge'), false);
   queueModule.usePromptQueueStore.getState().clearQueue('tab-enable-edge');

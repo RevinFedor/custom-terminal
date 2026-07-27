@@ -6,7 +6,7 @@
 Команда: **`npm run build:i-obs`** (`i` = install, `obs` = observe). Реализация — `scripts/build-when-idle.js` (чистый Node, без зависимостей).
 
 ## Что считается «активным» (блокирует ребилд)
-Единый источник правды — `computeActiveLoaders()` в `src/main/main.js`. **Переиспользует те же самые live-Map'ы, что питают per-tab loader в UI** — никакого второго понятия «busy» не вводится:
+Единый ответ `/api/active-loaders` объединяет два авторитетных main-process источника: runtime-снимок `computeActiveLoaders()` и durable store оркестраций. Runtime-часть **переиспользует те же самые live-Map'ы, что питают per-tab loader в UI**; inherited/completion-часть читается прямо из сохранённых run, а не из renderer/Zustand:
 
 | Источник | Map в main | Семантика |
 |---|---|---|
@@ -16,8 +16,9 @@
 | Codex | `codexTurnWatchers` | блокирует только rollout `task_started → task_complete/turn_aborted`; живой idle Codex CLI не blocker |
 | Restart-after non-AI процесс | `terminalCommandState.isRunning` + `activeCommandSource === 'restart-after'` + (`tabs.restart_after_tab_ids` или legacy `tabs.restart_after_tab_id`) | `running`. Ручные shell-команды (`npm run dev`, `npm run build`, `./deploy.sh`) сами по себе **не блокируют** `build:i-obs`; blocker'ом становится только команда, которую реально запустил `Restart after`, пока у вкладки есть хотя бы одна trigger-подписка. AI CLI tabs исключены из этой ветки, потому что их PTY-процесс может быть живым и idle |
 | Git-операции | `ipc/git.js` active operations registry | `kind:"git"` для generate/commit/undo/push/fetch/checkout пока операция in-flight. Это нужно для сценария Git run-after: AI-вкладка завершилась, Git-панель начала generate+commit, и `build:i-obs` не должен закрыть приложение между AI-trigger и фактическим commit/push |
+| Оркестрация | `orchestration-runs.json` через `OrchestrationRunStore.listActive()` | `kind:"orchestration"`: активный child блокирует и реальный target, и inherited source; `waiting_descendants`/`waiting_recovery` остаются blocker'ами; после terminal-state source остаётся `completion-handoff`, пока post-Enter audit не подтвердит точный `runId`. Generic `busy:true` не снимает этот blocker. После restart тот же exact prompt hash сверяется с transcript и детерминированно очищает уже обработанный stale handoff |
 
-Дедупликация по `tabId` (один таб = максимум один loader; claude-ветка выигрывает у process-ветки для того же таба).
+Дедупликация по `tabId` (один таб = максимум один loader). Runtime-loader имеет приоритет над orchestration-проекцией того же таба; активный child всё равно сохраняет отдельный target-blocker. Это важно для `returnTo.tabId`: Voice Record исключает только вызывающий source, но не работающую целевую вкладку.
 
 Идемпотентно для idle-определения: `idle === (loaders.length === 0)`.
 
@@ -30,10 +31,10 @@
 
 ```
 GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token.txt)
-→ { idle:bool, count:int, loaders:[{tabId,kind,status,project,name,cwd,command?,source?}], ts }
+→ { idle:bool, count:int, loaders:[{tabId,kind,status,project,name,cwd,command?,source?,runId?,role?}], ts }
 ```
 
-`computeActiveLoaders` **инжектится** в `web-server.start({ sdkSessions, computeActiveLoaders })` (не импортируется) — web-server остаётся leaf-модулем без back-reference в main. Считается в main против live-Map'ов, поэтому отвечает корректно **даже когда renderer перезагружается/расфокушен** (в отличие от bridgeRequest-пути `getClaudeTabStatusBatch`, который ходит в renderer).
+`computeActiveLoaders` **инжектится** в `web-server.start({ sdkSessions, computeActiveLoaders })` (не импортируется). Web-server дополняет этот снимок своим main-owned orchestration store и дедуплицирует результат по `tabId`. Поэтому ответ корректен **даже когда renderer перезагружается/расфокушен** (в отличие от bridgeRequest-пути `getClaudeTabStatusBatch`, который ходит в renderer).
 
 **Fail-safe:** если инжекция отсутствует (старый код) — эндпоинт отдаёт `503 {idle:false}`, НЕ `idle:true`. Никогда не green-light'ит ребилд при сломанном состоянии.
 
@@ -78,7 +79,7 @@ GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token
   `kind:"process"` / devServer через `POST /terminal/stop`. Новый `/api/active-loaders` не
   возвращает ручные shell-команды как blockers, а restart-after-owned процессы отдаёт отдельным
   `kind:"restart-after"` — их нужно ждать, а не auto-stop'ить. AI/Claude/Codex/Gemini blockers
-  также никогда не auto-stop'ятся, чтобы не убить turn посередине.
+  и `kind:"orchestration"` также никогда не auto-stop'ятся, чтобы не убить turn или completion-handoff посередине.
   Результат пишется в `wait.autoStopped`/`job.autoStopped` для desktop и iOS status UI.
   Если установленный прод ещё не знает `/terminal/stop`, Voice Record использует fallback
   Ctrl+C через старый `/terminal/run` route.
@@ -126,7 +127,7 @@ job фиксируется как `sent_unverified` и повторно тот �
 `POLL_MS=1000`, `IDLE_CONFIRM=2`, `NO_BUILD=1` (только наблюдать), `PORT=7878` (форсить порт, минуя discovery — для теста).
 
 ## Тестирование без ребилда
-`web-server.js` требует electron (`ipcMain`/`app`/`BrowserWindow`). Для headless-харнесса замокать через `Module._load` shim (`require('electron')` → fake), `start({sdkSessions:new Map(), computeActiveLoaders: ()=>mockState})`, дёргать скрипт с `PORT=<mockport>`. Логика `computeActiveLoaders` юнит-тестится копией функции с mock-Map'ами (stale-bridge skip, дедуп, gemini=false, teardown→idle).
+`web-server.js` требует electron (`ipcMain`/`app`/`BrowserWindow`). Для headless-харнесса замокать через `Module._load` shim (`require('electron')` → fake), `start({sdkSessions:new Map(), computeActiveLoaders: ()=>mockState})`, дёргать скрипт с `PORT=<mockport>`. Runtime-логика тестируется с mock-Map'ами; orchestration merge покрыт отдельно: source+target активного run, recovery, completion-handoff до exact proof, исчезновение после proof и дедуп с runtime-loader. В DEV live endpoint вернул stale `tab-2142` как `kind:"orchestration", status:"completion-handoff"`, тогда как run с уже подтверждённым exact follow-up в список не попал. Сам build/install в E2E не запускается.
 
 ## Связанное
 - `fact-claude-stop-hook.md` — откуда `claudeTurnBusy` (authoritative busy)

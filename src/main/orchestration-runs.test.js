@@ -7,6 +7,10 @@ const {
   OrchestrationRunStore,
   hasNewerTargetRun,
   isCompleteOrchestrationResult,
+  mergeActiveLoadersWithOrchestrations,
+  orchestrationCompletionRunIdFromAudit,
+  orchestrationInstallBlockers,
+  shouldRetryWaitingNotificationForSourceLifecycle,
 } = require('./orchestration-runs');
 
 async function makeStore() {
@@ -27,6 +31,208 @@ function baseRun(runId, targetTabId = 'target-1') {
     promptHash: 'hash-' + runId,
   };
 }
+
+function completionAuditProof(runId, sourceTabId = 'source-1') {
+  return {
+    kind: 'prompt-audit',
+    sourceTabId,
+    handoffId: 'orchestration-complete:' + runId,
+    source: 'orchestration-completion:' + runId,
+    auditTimestamp: '2026-07-27T17:41:08.000Z',
+    actualHash: 'audit-' + runId,
+    sessionId: 'session-' + sourceTabId,
+  };
+}
+
+async function finishRunAndQueueNotification(store, runId, targetTabId, attemptedAt = Date.now()) {
+  await store.create(baseRun(runId, targetTabId));
+  await store.markDelivery(runId);
+  await store.applyLifecycle(targetTabId, { type: 'busy', busy: true });
+  await store.applyLifecycle(targetTabId, { type: 'done', reason: 'task_complete' });
+  await store.markNotification(runId, 'sending', {
+    notificationAttemptedAt: attemptedAt,
+    notificationPromptHash: 'notification-hash-' + runId,
+    notificationHandoffId: 'orchestration-complete:' + runId,
+  });
+  await store.markNotification(runId, 'sent', { notificationDeliveredAt: attemptedAt + 1 });
+}
+
+test('waiting source notifications retry on a source turn start, not on idle noise', () => {
+  assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({ type: 'busy', busy: true }), true);
+  assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({ type: 'busy', busy: false }), false);
+  assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({ type: 'done' }), true);
+  assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({ type: 'message' }), false);
+});
+
+test('only an exact successful completion audit exposes its run id', () => {
+  assert.equal(orchestrationCompletionRunIdFromAudit({
+    ...completionAuditProof('run-a'),
+    success: true,
+  }), 'run-a');
+  assert.equal(orchestrationCompletionRunIdFromAudit({
+    ...completionAuditProof('run-a'),
+    success: false,
+  }), null);
+  assert.equal(orchestrationCompletionRunIdFromAudit({
+    ...completionAuditProof('run-a'),
+    success: true,
+    source: 'orchestration-completion:run-b',
+  }), null);
+  assert.equal(orchestrationCompletionRunIdFromAudit({
+    ...completionAuditProof('run-a'),
+    success: true,
+    handoffId: 'external-run-a',
+  }), null);
+});
+
+test('an active orchestration blocks install on both its inherited source and real target', () => {
+  const blockers = orchestrationInstallBlockers({
+    ...baseRun('run-a', 'target-a'),
+    status: 'running',
+    sourceProjectName: 'source-project',
+    targetProjectName: 'target-project',
+  });
+  assert.deepEqual(blockers.map((loader) => [loader.tabId, loader.role, loader.status]), [
+    ['source-1', 'source', 'inherited-busy'],
+    ['target-a', 'target', 'running'],
+  ]);
+});
+
+test('active-loaders stays non-idle for Voice Record and deduplicates runtime with orchestration by tab', () => {
+  const snapshot = mergeActiveLoadersWithOrchestrations({
+    idle: false,
+    count: 1,
+    loaders: [{ tabId: 'source-1', kind: 'claude', status: 'busy' }],
+    ts: 100,
+  }, [{
+    ...baseRun('run-a', 'target-a'),
+    status: 'running',
+  }]);
+  assert.equal(snapshot.idle, false);
+  assert.equal(snapshot.count, 2);
+  assert.deepEqual(snapshot.loaders.map((loader) => [loader.tabId, loader.kind]), [
+    ['source-1', 'claude'],
+    ['target-a', 'orchestration'],
+  ]);
+});
+
+test('Voice Record caller exclusion removes only the source and keeps the active target blocker', () => {
+  const snapshot = mergeActiveLoadersWithOrchestrations(
+    { idle: true, count: 0, loaders: [], ts: 100 },
+    [{ ...baseRun('run-a', 'target-a'), status: 'running' }],
+  );
+  const returnToTabId = 'source-1';
+  const blockersSeenByObserver = snapshot.loaders.filter((loader) => loader.tabId !== returnToTabId);
+  assert.deepEqual(blockersSeenByObserver.map((loader) => [loader.tabId, loader.role]), [
+    ['target-a', 'target'],
+  ]);
+});
+
+test('completion handoff blocks install until the exact follow-up proof and then disappears', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await finishRunAndQueueNotification(store, 'run-a', 'target-a', 100);
+    let snapshot = mergeActiveLoadersWithOrchestrations(
+      { idle: true, count: 0, loaders: [], ts: 100 },
+      await store.listActive(),
+    );
+    assert.equal(snapshot.idle, false);
+    assert.deepEqual(snapshot.loaders.map((loader) => [loader.tabId, loader.status]), [
+      ['source-1', 'completion-handoff'],
+    ]);
+
+    await store.applyLifecycle('source-1', { type: 'busy', busy: true });
+    snapshot = mergeActiveLoadersWithOrchestrations(
+      { idle: true, count: 0, loaders: [], ts: 200 },
+      await store.listActive(),
+    );
+    assert.equal(snapshot.idle, false);
+
+    await store.confirmSourceFollowup('run-a', completionAuditProof('run-a'), { now: 300 });
+    snapshot = mergeActiveLoadersWithOrchestrations(
+      { idle: true, count: 0, loaders: [], ts: 300 },
+      await store.listActive(),
+    );
+    assert.equal(snapshot.idle, true);
+    assert.deepEqual(snapshot.loaders, []);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('waiting recovery remains an install blocker on source and target', () => {
+  const blockers = orchestrationInstallBlockers({
+    ...baseRun('run-a', 'target-a'),
+    status: 'waiting_recovery',
+  });
+  assert.deepEqual(blockers.map((loader) => [loader.tabId, loader.status]), [
+    ['source-1', 'recovery'],
+    ['target-a', 'recovery'],
+  ]);
+});
+
+test('generic source busy cannot shift two pending notifications by one run', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    // Notification A is accepted while the source is already working, so it
+    // cannot rely on a fresh busy edge of its own.
+    await store.applyLifecycle('source-1', { type: 'busy', busy: true });
+    await finishRunAndQueueNotification(store, 'run-a', 'target-a', 100);
+    await finishRunAndQueueNotification(store, 'run-b', 'target-b', 200);
+    assert.deepEqual((await store.listActive()).map((run) => run.runId), ['run-a', 'run-b']);
+
+    await store.applyLifecycle('source-1', { type: 'busy', busy: true });
+    assert.equal((await store.get('run-a')).sourceFollowupStartedAt, null);
+    assert.equal((await store.get('run-b')).sourceFollowupStartedAt, null);
+
+    const confirmedB = await store.confirmSourceFollowup(
+      'run-b',
+      completionAuditProof('run-b'),
+      { now: 300 },
+    );
+    assert.equal(confirmedB.confirmed, true);
+    assert.equal((await store.get('run-b')).sourceFollowupStartedAt, 300);
+    assert.equal((await store.get('run-a')).sourceFollowupStartedAt, null);
+    assert.deepEqual((await store.listActive()).map((run) => run.runId), ['run-a']);
+
+    await store.applyLifecycle('source-1', { type: 'busy', busy: true });
+    assert.equal((await store.get('run-a')).sourceFollowupStartedAt, null);
+
+    await store.confirmSourceFollowup(
+      'run-a',
+      completionAuditProof('run-a'),
+      { now: 400 },
+    );
+    assert.equal((await store.get('run-a')).sourceFollowupStartedAt, 400);
+    assert.deepEqual(await store.listActive(), []);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('wrong handoff or prompt hash cannot release a pending inherited loader', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await finishRunAndQueueNotification(store, 'run-a', 'target-a', 100);
+    const wrongAudit = await store.confirmSourceFollowup('run-a', {
+      ...completionAuditProof('run-a'),
+      handoffId: 'orchestration-complete:run-b',
+    });
+    assert.equal(wrongAudit.confirmed, false);
+    const wrongTranscript = await store.confirmSourceFollowup('run-a', {
+      kind: 'transcript',
+      sourceTabId: 'source-1',
+      notificationPromptHash: 'notification-hash-run-b',
+    });
+    assert.equal(wrongTranscript.confirmed, false);
+    assert.equal((await store.get('run-a')).sourceFollowupPending, true);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
 
 test('queue-capable idle target completes after its own busy-to-done lifecycle', async () => {
   const { store, cleanup } = await makeStore();
@@ -122,7 +328,7 @@ test('aborted target turn is a failure, not a successful completion', async () =
   }
 });
 
-test('parent waits until a completed child notification is consumed by a new turn', async () => {
+test('parent waits until a completed child notification is confirmed by its exact audit', async () => {
   const { store, cleanup } = await makeStore();
   try {
     await store.create(baseRun('parent', 'worker'));
@@ -145,10 +351,13 @@ test('parent waits until a completed child notification is consumed by a new tur
 
     await store.patch('child', {
       notificationPromptHash: 'hash-child-completion',
+      notificationHandoffId: 'orchestration-complete:child',
       notificationAttemptedAt: Date.now(),
     });
     await store.markNotification('child', 'queued');
     await store.applyLifecycle('worker', { type: 'busy', busy: true });
+    assert.equal((await store.get('child')).parentConsumedAt, undefined);
+    await store.confirmSourceFollowup('child', completionAuditProof('child', 'worker'));
     const consumedChild = await store.get('child');
     assert.ok(consumedChild.parentConsumedAt);
     assert.equal((await store.get('parent')).status, 'running');
@@ -163,7 +372,7 @@ test('parent waits until a completed child notification is consumed by a new tur
   }
 });
 
-test('parallel child notifications are consumed one target turn at a time', async () => {
+test('parallel child notifications are consumed only by their own exact audits', async () => {
   const { store, cleanup } = await makeStore();
   try {
     await store.create(baseRun('parent', 'worker'));
@@ -176,6 +385,7 @@ test('parallel child notifications are consumed one target turn at a time', asyn
     await store.applyLifecycle('tester-a', { type: 'done', reason: 'task_complete' });
     await store.patch('child-a', {
       notificationPromptHash: 'hash-child-a-completion',
+      notificationHandoffId: 'orchestration-complete:child-a',
       notificationAttemptedAt: 100,
     });
     await store.markNotification('child-a', 'queued');
@@ -186,6 +396,7 @@ test('parallel child notifications are consumed one target turn at a time', asyn
     await store.applyLifecycle('tester-b', { type: 'done', reason: 'task_complete' });
     await store.patch('child-b', {
       notificationPromptHash: 'hash-child-b-completion',
+      notificationHandoffId: 'orchestration-complete:child-b',
       notificationAttemptedAt: 200,
     });
     await store.markNotification('child-b', 'queued');
@@ -194,16 +405,20 @@ test('parallel child notifications are consumed one target turn at a time', asyn
     assert.deepEqual((await store.get('parent')).waitingOnRunIds, ['child-a', 'child-b']);
 
     await store.applyLifecycle('worker', { type: 'busy', busy: true });
-    assert.ok((await store.get('child-a')).parentConsumedAt);
+    assert.equal((await store.get('child-a')).parentConsumedAt, undefined);
     assert.equal((await store.get('child-b')).parentConsumedAt, undefined);
-    assert.equal((await store.getInternal('parent')).resultPromptHash, 'hash-child-a-completion');
-    await store.applyLifecycle('worker', { type: 'done', reason: 'task_complete' });
-    assert.equal((await store.get('parent')).status, 'waiting_descendants');
-    assert.deepEqual((await store.get('parent')).waitingOnRunIds, ['child-b']);
 
-    await store.applyLifecycle('worker', { type: 'busy', busy: true });
+    await store.confirmSourceFollowup('child-b', completionAuditProof('child-b', 'worker'));
+    assert.equal((await store.get('child-a')).parentConsumedAt, undefined);
     assert.ok((await store.get('child-b')).parentConsumedAt);
     assert.equal((await store.getInternal('parent')).resultPromptHash, 'hash-child-b-completion');
+    await store.applyLifecycle('worker', { type: 'done', reason: 'task_complete' });
+    assert.equal((await store.get('parent')).status, 'waiting_descendants');
+    assert.deepEqual((await store.get('parent')).waitingOnRunIds, ['child-a']);
+
+    await store.confirmSourceFollowup('child-a', completionAuditProof('child-a', 'worker'));
+    assert.ok((await store.get('child-a')).parentConsumedAt);
+    assert.equal((await store.getInternal('parent')).resultPromptHash, 'hash-child-a-completion');
     const final = await store.applyLifecycle('worker', { type: 'done', reason: 'task_complete' });
     assert.deepEqual(final.settled.map((run) => run.runId), ['parent']);
   } finally {
@@ -388,6 +603,33 @@ test('transcript reconciliation recovers a completed run after restart', async (
   } finally {
     await store.flush();
     await cleanup();
+  }
+});
+
+test('restart reconciliation clears only the persisted run with exact notification prompt hash', async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'noted-orchestration-followup-'));
+  const filePath = path.join(dir, 'runs.json');
+  try {
+    const first = new OrchestrationRunStore(filePath);
+    await finishRunAndQueueNotification(first, 'run-a', 'target-a', 100);
+    await finishRunAndQueueNotification(first, 'run-b', 'target-b', 200);
+    await first.flush();
+
+    const second = new OrchestrationRunStore(filePath);
+    const confirmation = await second.confirmSourceFollowup('run-a', {
+      kind: 'transcript',
+      sourceTabId: 'source-1',
+      notificationPromptHash: 'notification-hash-run-a',
+      sessionId: 'source-session',
+      userUuid: 'user-turn-a',
+    }, { now: 500 });
+    assert.equal(confirmation.confirmed, true);
+    assert.equal((await second.get('run-a')).sourceFollowupStartedAt, 500);
+    assert.equal((await second.get('run-a')).sourceFollowupProofKind, 'transcript');
+    assert.equal((await second.get('run-b')).sourceFollowupStartedAt, null);
+    await second.flush();
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
   }
 });
 

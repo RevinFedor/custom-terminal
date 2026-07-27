@@ -7,3 +7,12 @@
 export function isNaturalAgentTurnEndReason(reason) {
   return !reason || reason === 'task_complete';
 }
+
+/**
+ * A recoverable user-level interruption pauses a target turn but does not
+ * settle work that another tab explicitly waits on. The interrupted tab's own
+ * workflow still fails closed; only pivoted Run After subscriptions survive.
+ */
+export function isRecoverableAgentTurnInterruption(reason) {
+  return reason === 'interrupt' || reason === 'turn_aborted';
+}

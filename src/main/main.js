@@ -12996,12 +12996,8 @@ function pasteAuditPreview(text, start = 0) {
 }
 
 function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
-  if (
-    !audit?.handoffId
-    || !mainWindow
-    || mainWindow.isDestroyed()
-  ) return;
-  mainWindow.webContents.send('agent-prompt:audit-result', {
+  if (!audit?.handoffId) return;
+  const detail = {
     tabId,
     handoffId: audit.handoffId,
     toolType,
@@ -13016,7 +13012,28 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
     sourceIdentity: result?.sourceIdentity || null,
     canonicalized: result?.canonicalized === true,
     canonicalReason: result?.canonicalReason || null,
-  });
+    entryUuid: result?.entryUuid || null,
+    expectedHash: result?.expectedHash || audit.expectedHash || null,
+    expectedLen: Number.isFinite(result?.expectedLen)
+      ? Number(result.expectedLen)
+      : (Number.isFinite(audit.expectedLen) ? Number(audit.expectedLen) : null),
+  };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('agent-prompt:audit-result', detail);
+  }
+  try {
+    const routeAudit = require(path.join(srcMainDir, 'web-server')).notifyAgentPromptAuditResult;
+    const routed = typeof routeAudit === 'function' ? routeAudit(detail) : null;
+    if (routed && typeof routed.catch === 'function') {
+      void routed.catch((error) => {
+        console.warn('[Orchestration] prompt audit routing failed handoff='
+          + audit.handoffId + ' error=' + (error?.message || String(error)));
+      });
+    }
+  } catch (error) {
+    console.warn('[Orchestration] prompt audit router unavailable handoff='
+      + audit.handoffId + ' error=' + (error?.message || String(error)));
+  }
 }
 
 function finishClaudePasteAudit(tabId, audit, result) {

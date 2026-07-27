@@ -65,6 +65,9 @@ const {
   isActiveStatus,
   isTerminalStatus,
   isCompleteOrchestrationResult,
+  shouldRetryWaitingNotificationForSourceLifecycle,
+  orchestrationCompletionRunIdFromAudit,
+  mergeActiveLoadersWithOrchestrations,
 } = require('./orchestration-runs');
 const {
   buildDelegationResultTarget,
@@ -1385,9 +1388,11 @@ async function sendOrchestrationCompletionNotification(run) {
 
   orchestrationNotificationInflight.add(run.runId);
   const notificationText = orchestrationNotificationText(current);
+  const notificationHandoffId = 'orchestration-complete:' + current.runId;
   const sending = await store.markNotification(current.runId, 'sending', {
     notificationAttemptedAt: Date.now(),
     notificationPromptHash: promptFingerprint(notificationText),
+    notificationHandoffId,
   });
   emitOrchestrationChanges(sending?.changed, 'notification-sending');
   try {
@@ -1403,7 +1408,7 @@ async function sendOrchestrationCompletionNotification(run) {
     const result = await runAgentSendScenario({
       tabId: current.sourceTabId,
       prompt: notificationText,
-      handoffId: 'orchestration-complete:' + current.runId,
+      handoffId: notificationHandoffId,
       source: 'orchestration-completion:' + current.runId,
       statusAtSend: status?.status || status?.sessionStatus || 'unknown',
       queue: true,
@@ -1428,6 +1433,20 @@ async function sendOrchestrationCompletionNotification(run) {
         notificationError: null,
       });
       emitOrchestrationChanges(delivered?.changed, 'notification-finished');
+      const audit = result?.codexAudit || result?.pasteAudit || null;
+      if (audit?.success === true) {
+        await notifyAgentPromptAuditResult({
+          tabId: current.sourceTabId,
+          handoffId: notificationHandoffId,
+          source: 'orchestration-completion:' + current.runId,
+          success: true,
+          auditTimestamp: audit.auditTimestamp || null,
+          actualHash: audit.actualHash || null,
+          actualLen: Number.isFinite(audit.actualLen) ? Number(audit.actualLen) : null,
+          sessionId: audit.sessionId || null,
+          entryUuid: audit.entryUuid || null,
+        });
+      }
       for (const settled of delivered?.settled || []) {
         await finalizeSettledOrchestration(settled, 'ancestor-settled');
       }
@@ -1440,6 +1459,83 @@ async function sendOrchestrationCompletionNotification(run) {
   } finally {
     orchestrationNotificationInflight.delete(run.runId);
   }
+}
+
+async function notifyAgentPromptAuditResult(detail = {}) {
+  const runId = orchestrationCompletionRunIdFromAudit(detail);
+  if (!runId) return { matched: false, confirmed: false };
+  const store = getOrchestrationRunStore();
+  const confirmation = await store.confirmSourceFollowup(runId, {
+    kind: 'prompt-audit',
+    sourceTabId: detail.tabId,
+    handoffId: detail.handoffId,
+    source: detail.source,
+    auditTimestamp: detail.auditTimestamp || null,
+    actualHash: detail.actualHash || null,
+    sessionId: detail.sessionId || null,
+    userUuid: detail.entryUuid || null,
+  });
+  if (confirmation.confirmed) {
+    console.log('[Orchestration] source follow-up confirmed run=' + runId
+      + ' proof=prompt-audit tab=' + shortId(detail.tabId, 12));
+  } else {
+    console.warn('[Orchestration] source follow-up audit rejected run=' + runId
+      + ' reason=' + (confirmation.reason || 'unknown'));
+  }
+  emitOrchestrationChanges(confirmation.changed, 'source-followup-audit-confirmed');
+  await finalizeSettledOrchestrations(confirmation.settled, 'source-followup-audit-settled');
+  if (confirmation.confirmed && !confirmation.idempotent && confirmation.run?.parentRunId) {
+    await reconcileOrchestrationRun(
+      confirmation.run.parentRunId,
+      'source-followup-audit-parent-reconcile',
+    );
+  }
+  return { matched: true, ...confirmation };
+}
+
+async function reconcileOrchestrationSourceFollowup(run, reason = 'source-followup-reconcile') {
+  const store = getOrchestrationRunStore();
+  const current = await store.getInternal(run?.runId);
+  if (!current
+    || current.sourceFollowupPending !== true
+    || current.sourceFollowupStartedAt
+    || !current.notificationPromptHash
+    || typeof getAgentTurnResult !== 'function') {
+    return { confirmed: false, reason: 'source-followup-not-reconcilable' };
+  }
+  const sourceInfo = await resolveAgentSessionInfo(current.sourceTabId, 2000).catch(() => null);
+  const sessionId = sourceInfo?.sessionId || current.sourceFollowupSessionId || null;
+  const cwd = sourceInfo?.cwd || current.sourceProjectPath || null;
+  if (!sessionId) return { confirmed: false, reason: 'source-session-unresolved' };
+  const proof = await getAgentTurnResult({
+    sessionId,
+    cwd,
+    promptHash: current.notificationPromptHash,
+    requestedAt: current.notificationAttemptedAt
+      || current.notificationDeliveredAt
+      || current.completedAt
+      || current.createdAt,
+    forceFresh: true,
+    maxChars: 500,
+  }).catch((error) => ({ found: false, error: String(error?.message || error) }));
+  if (proof?.found !== true) {
+    return { confirmed: false, reason: proof?.error || 'source-followup-turn-not-found' };
+  }
+  const confirmation = await store.confirmSourceFollowup(current.runId, {
+    kind: 'transcript',
+    sourceTabId: current.sourceTabId,
+    notificationPromptHash: current.notificationPromptHash,
+    sessionId,
+    userUuid: proof.userUuid || null,
+  });
+  if (confirmation.confirmed) {
+    console.log('[Orchestration] source follow-up reconciled run=' + current.runId
+      + ' proof=transcript tab=' + shortId(current.sourceTabId, 12)
+      + ' user=' + shortId(proof.userUuid, 12));
+  }
+  emitOrchestrationChanges(confirmation.changed, reason);
+  await finalizeSettledOrchestrations(confirmation.settled, reason + '-settled');
+  return confirmation;
 }
 
 async function finalizeSettledOrchestration(run, reason = 'settled') {
@@ -1503,7 +1599,13 @@ async function processOrchestrationLifecycle(tabId, payload) {
     const result = await store.applyLifecycle(tabId, payload);
     emitOrchestrationChanges(result.changed, 'target-lifecycle');
     await finalizeSettledOrchestrations(result.settled, 'target-settled');
-    if (payload.type === 'done') await retryWaitingNotificationsForSource(tabId);
+    // A busy:true edge is the event-driven wake-up for a notification which
+    // previously hit a composer draft. Delivery still repeats the authoritative
+    // draft preflight; only an empty composer may accept the notification.
+    // This lets it queue behind the active turn without guessing from a timer.
+    if (shouldRetryWaitingNotificationForSourceLifecycle(payload)) {
+      await retryWaitingNotificationsForSource(tabId);
+    }
     void scheduleOrchestrationPolicyTimer();
   } catch (error) {
     console.warn('[Orchestration] lifecycle failed tab=' + shortId(tabId, 12) + ' error=' + (error?.message || error));
@@ -1598,7 +1700,10 @@ async function reconcileActiveOrchestrations() {
   const store = getOrchestrationRunStore();
   const active = await store.listActive();
   for (const run of active) {
-    await reconcileOrchestrationRun(run.runId, 'startup-reconcile');
+    if (isActiveStatus(run.status)) {
+      await reconcileOrchestrationRun(run.runId, 'startup-reconcile');
+    }
+    await reconcileOrchestrationSourceFollowup(run, 'startup-source-followup-reconcile');
   }
   await processDueOrchestrationPolicies();
   await scheduleOrchestrationPolicyTimer();
@@ -2166,7 +2271,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 503, { error: 'active-loaders unavailable', idle: false });
     }
     try {
-      const snapshot = computeActiveLoaders();
+      const runtimeSnapshot = await Promise.resolve(computeActiveLoaders());
+      const orchestrationRuns = await getOrchestrationRunStore().listActive();
+      const snapshot = mergeActiveLoadersWithOrchestrations(runtimeSnapshot, orchestrationRuns);
       logActiveLoadersSnapshot(snapshot, 200);
       return sendJson(res, 200, snapshot);
     } catch (e) {
@@ -5313,4 +5420,5 @@ module.exports = {
   handleOrchestrationTabClosed,
   notifyClaudeSessionAvailable,
   sendTabCompletionPush,
+  notifyAgentPromptAuditResult,
 };

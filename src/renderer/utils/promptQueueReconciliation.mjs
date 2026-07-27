@@ -5,6 +5,33 @@ export function isWorkflowOutcomeAtOrAfterArm(workflowArmedAt, outcomeTs) {
 }
 
 /**
+ * One natural completion can start only one continuation. An own-tab queue
+ * owns the edge before Loop even when its delay/readiness gate is still
+ * pending; a queue pivoted to another tab does not consume this tab's edge.
+ */
+export function choosePromptQueueContinuationForOutcome({
+  queueActive,
+  queueTriggerIsOwner,
+  queueArmedAt,
+  loopActive,
+  loopArmedAt,
+}, outcomeTs) {
+  if (queueActive
+    && queueTriggerIsOwner
+    && isWorkflowOutcomeAtOrAfterArm(queueArmedAt, outcomeTs)) {
+    return 'queue';
+  }
+  if (loopActive
+    && (loopArmedAt === null
+      || (Number.isFinite(loopArmedAt)
+        && Number.isFinite(outcomeTs)
+        && Number(outcomeTs) >= Number(loopArmedAt)))) {
+    return 'loop';
+  }
+  return null;
+}
+
+/**
  * Initial restore must apply every known failure before it considers success.
  * For success, only the newest classified outcome for a trigger is relevant;
  * replaying older successes could consume multiple queue items at startup.

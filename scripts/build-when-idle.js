@@ -8,10 +8,11 @@
 // `npm run build:install`, which gracefully quits the app, rebuilds, reinstalls
 // and reopens it.
 //
-// "Active" reuses the EXACT live Maps that drive the per-tab UI loader
-// (computeActiveLoaders() in src/main/main.js) — there is no second notion of
-// busy. While you close tabs one by one, this prints each one going idle and
-// updates the live list; when the last goes away, the build fires.
+// "Active" merges the exact main-process runtime Maps with the durable
+// orchestration store. This includes inherited child work and an exact
+// completion handoff even when the source agent itself is idle. While blockers
+// clear one by one, this prints each transition; when the last goes away, the
+// build fires.
 //
 // Invoked by: npm run build:i-obs
 //

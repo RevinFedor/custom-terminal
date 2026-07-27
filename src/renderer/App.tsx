@@ -2922,6 +2922,8 @@ function App() {
               case 'setFirstDelaySeconds': s.setFirstDelaySeconds(tabId, Number(a.value) || 0); break;
               case 'setPostPromptEnabled': s.setPostPromptEnabled(tabId, !!a.value); break;
               case 'setPostPromptText':    s.setPostPromptText(tabId, String(a.value ?? '')); break;
+              case 'setLoopPromptEnabled': s.setLoopPromptEnabled(tabId, !!a.value); break;
+              case 'setLoopPromptText':    s.setLoopPromptText(tabId, String(a.value ?? '')); break;
               default: return reply(false, null, 'unknown op: ' + op);
             }
           } catch (e: any) {
