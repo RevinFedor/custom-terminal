@@ -32,6 +32,125 @@ function selectClaudeStartupSettingsSession({
   return String(readinessSessionId || launch || persistedSessionId || '').trim() || null;
 }
 
+function normalizeClaudeStartupIntent(providerState) {
+  if (!providerState || providerState.type !== 'anthropic') return null;
+  const model = String(providerState.startupModel || '').trim();
+  const effort = String(providerState.startupEffort || '').trim();
+  if (!model || model === 'none' || !effort || effort === 'none') return null;
+  return { model, effort };
+}
+
+function applyClaudeStartupIntent(settings, intent) {
+  const normalized = normalizeClaudeStartupIntent({
+    type: 'anthropic',
+    startupModel: intent?.model,
+    startupEffort: intent?.effort,
+  });
+  if (!normalized) return settings;
+  return {
+    ...(settings || {}),
+    model: normalized.model,
+    effort: normalized.effort,
+    source: 'tab-startup-intent',
+  };
+}
+
+/**
+ * Recover the last confirmed model/effort pair across durable fork ancestry.
+ *
+ * A compact fork deliberately removes the pre-compact JSONL prefix. The
+ * startup slash-command proof can live in that removed prefix (and trailing
+ * startup commands are also trimmed before Resume), so the child alone may
+ * truthfully report no setting. Fork markers are durable and identify the
+ * exact parent whose history the child came from. Walk that lineage only
+ * after each child lookup succeeded: a failed child read is unknown and must
+ * never be overwritten with an older parent's value.
+ */
+async function resolveClaudeSettingsAcrossForkChain({
+  sessionId,
+  readSettings,
+  getParentSession,
+  maxDepth = 16,
+} = {}) {
+  if (typeof readSettings !== 'function') throw new TypeError('readSettings is required');
+  if (typeof getParentSession !== 'function') throw new TypeError('getParentSession is required');
+
+  const rootSessionId = String(sessionId || '').trim();
+  if (!rootSessionId) {
+    return { success: false, reason: 'missing-session-id', sessionId: rootSessionId };
+  }
+
+  const visited = new Set();
+  const lineage = [];
+  let currentSessionId = rootSessionId;
+  let model = null;
+  let effort = null;
+  let modelSessionId = null;
+  let effortSessionId = null;
+  let latestSessionId = rootSessionId;
+
+  for (let depth = 0; depth < maxDepth && currentSessionId; depth += 1) {
+    if (visited.has(currentSessionId)) {
+      return {
+        success: true,
+        sessionId: rootSessionId,
+        latestSessionId,
+        model,
+        effort,
+        modelSessionId,
+        effortSessionId,
+        lineage,
+        inherited: !!(
+          (modelSessionId && modelSessionId !== rootSessionId)
+          || (effortSessionId && effortSessionId !== rootSessionId)
+        ),
+        reason: 'fork-cycle-stopped',
+      };
+    }
+    visited.add(currentSessionId);
+    lineage.push(currentSessionId);
+
+    const result = await readSettings(currentSessionId);
+    if (result?.success !== true) {
+      if (currentSessionId === rootSessionId) return result || {
+        success: false,
+        reason: 'settings-read-failed',
+        sessionId: rootSessionId,
+      };
+      break;
+    }
+    if (depth === 0 && result.latestSessionId) latestSessionId = result.latestSessionId;
+    if (!model && result.model) {
+      model = result.model;
+      modelSessionId = currentSessionId;
+    }
+    if (!effort && result.effort) {
+      effort = result.effort;
+      effortSessionId = currentSessionId;
+    }
+    if (model && effort) break;
+
+    const parent = getParentSession(currentSessionId);
+    currentSessionId = String(parent?.source_session_id || '').trim() || null;
+  }
+
+  return {
+    success: true,
+    sessionId: rootSessionId,
+    latestSessionId,
+    model,
+    effort,
+    modelSessionId,
+    effortSessionId,
+    lineage,
+    inherited: !!(
+      (modelSessionId && modelSessionId !== rootSessionId)
+      || (effortSessionId && effortSessionId !== rootSessionId)
+    ),
+    reason: model || effort ? 'confirmed' : 'no-confirmed-settings',
+  };
+}
+
 function classifyClaudeStartupDeliveryProof({
   scan = null,
   composer = null,
@@ -502,8 +621,11 @@ function createClaudeStartupMainRuntime({
 }
 
 module.exports = {
+  applyClaudeStartupIntent,
   classifyClaudeStartupDeliveryProof,
   createClaudeStartupMainRuntime,
+  normalizeClaudeStartupIntent,
   parseSettingCommand,
+  resolveClaudeSettingsAcrossForkChain,
   selectClaudeStartupSettingsSession,
 };

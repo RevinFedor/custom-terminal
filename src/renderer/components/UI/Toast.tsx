@@ -41,6 +41,9 @@ export default function ToastContainer() {
 
   return (
     <div
+      data-toast-container
+      aria-live="polite"
+      aria-relevant="additions text"
       style={{
         position: 'fixed',
         top: '52px',
@@ -61,6 +64,10 @@ export default function ToastContainer() {
         return (
           <div
             key={toast.id}
+            data-toast
+            data-toast-id={toast.id}
+            data-toast-type={toast.type}
+            role={toast.type === 'error' || toast.type === 'warning' ? 'alert' : 'status'}
             ref={() => {
               if (!shouldAnimate) return;
               animatedToastIdsRef.current.add(toast.id);
@@ -123,7 +130,7 @@ export default function ToastContainer() {
                    toast.type === 'pink' ? '✦' : 'ℹ'}
                 </span>
               )}
-              <span className="text-xs font-medium flex-1 leading-snug">
+              <span data-toast-message className="text-xs font-medium flex-1 leading-snug">
                 {toast.message}
                 {toast.actionLabel && (
                   <span

@@ -3,8 +3,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  applyClaudeStartupIntent,
   classifyClaudeStartupDeliveryProof,
   createClaudeStartupMainRuntime,
+  normalizeClaudeStartupIntent,
+  resolveClaudeSettingsAcrossForkChain,
   selectClaudeStartupSettingsSession,
 } = require('./claude-startup-main-runtime');
 const { PROOF } = require('./claude-startup-transaction');
@@ -63,6 +66,96 @@ test('fresh launch ignores a stale persisted writer while resume keeps explicit 
     readinessSessionId: 'bridge-session',
     persistedSessionId: 'stale-stopped-session',
   }), 'bridge-session');
+});
+
+test('only a complete Anthropic next-launch pair overrides resolved settings', () => {
+  assert.deepEqual(normalizeClaudeStartupIntent({
+    type: 'anthropic',
+    startupModel: 'haiku',
+    startupEffort: 'medium',
+  }), { model: 'haiku', effort: 'medium' });
+  assert.equal(normalizeClaudeStartupIntent({
+    type: 'anthropic',
+    startupModel: 'haiku',
+  }), null);
+  assert.equal(normalizeClaudeStartupIntent({
+    type: 'deepseek',
+    startupModel: 'haiku',
+    startupEffort: 'medium',
+  }), null);
+
+  assert.deepEqual(applyClaudeStartupIntent({
+    model: 'opus',
+    effort: 'high',
+    sessionId: 'source-session',
+    source: 'session-history',
+  }, {
+    model: 'haiku',
+    effort: 'medium',
+  }), {
+    model: 'haiku',
+    effort: 'medium',
+    sessionId: 'source-session',
+    source: 'tab-startup-intent',
+  });
+});
+
+test('compact fork inherits a complete confirmed pair from its durable parent', async () => {
+  const reads = [];
+  const result = await resolveClaudeSettingsAcrossForkChain({
+    sessionId: 'compact-child',
+    readSettings: async (sessionId) => {
+      reads.push(sessionId);
+      if (sessionId === 'compact-child') {
+        return { success: true, sessionId, model: null, effort: null };
+      }
+      return { success: true, sessionId, model: 'haiku', effort: 'medium' };
+    },
+    getParentSession: (sessionId) => sessionId === 'compact-child'
+      ? { source_session_id: 'source-parent' }
+      : null,
+  });
+
+  assert.deepEqual(reads, ['compact-child', 'source-parent']);
+  assert.equal(result.success, true);
+  assert.equal(result.model, 'haiku');
+  assert.equal(result.effort, 'medium');
+  assert.equal(result.modelSessionId, 'source-parent');
+  assert.equal(result.effortSessionId, 'source-parent');
+  assert.equal(result.inherited, true);
+});
+
+test('child-confirmed fields win while a fork parent fills only missing settings', async () => {
+  const result = await resolveClaudeSettingsAcrossForkChain({
+    sessionId: 'child',
+    readSettings: async (sessionId) => sessionId === 'child'
+      ? { success: true, sessionId, model: null, effort: 'max' }
+      : { success: true, sessionId, model: 'haiku', effort: 'medium' },
+    getParentSession: (sessionId) => sessionId === 'child'
+      ? { source_session_id: 'parent' }
+      : null,
+  });
+
+  assert.equal(result.model, 'haiku');
+  assert.equal(result.effort, 'max');
+  assert.equal(result.modelSessionId, 'parent');
+  assert.equal(result.effortSessionId, 'child');
+});
+
+test('unknown child settings never fall back to an older fork parent', async () => {
+  let parentReads = 0;
+  const result = await resolveClaudeSettingsAcrossForkChain({
+    sessionId: 'child',
+    readSettings: async (sessionId) => {
+      if (sessionId !== 'child') parentReads += 1;
+      return { success: false, sessionId, reason: 'settings-read-failed' };
+    },
+    getParentSession: () => ({ source_session_id: 'parent' }),
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.reason, 'settings-read-failed');
+  assert.equal(parentReads, 0);
 });
 
 test('only explicit no-Enter plus the exact composer command proves startup non-delivery', () => {

@@ -3307,20 +3307,25 @@ async function writeCodexJsonlExclusive(filePath, records) {
   }
 }
 
-async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords) {
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const newSessionId = crypto.randomUUID();
-  const { yyyy, mm, dd } = codexDateParts(now);
-  const dir = path.join(CODEX_SESSIONS_DIR, yyyy, mm, dd);
-  await fs.promises.mkdir(dir, { recursive: true });
-
+function rewriteCodexEditedForkMetadata(
+  records,
+  sourceSessionId,
+  cwd,
+  outputRecords,
+  newSessionId,
+  nowIso,
+) {
   const metaIdx = outputRecords.findIndex((record) => record?.type === 'session_meta');
   if (metaIdx >= 0) {
     const meta = outputRecords[metaIdx];
     meta.timestamp = nowIso;
     meta.payload = { ...(meta.payload || {}) };
     meta.payload.id = newSessionId;
+    // Current Codex rollouts may carry both identity aliases. Keeping the
+    // copied source session_id next to the new id makes the edited rollout
+    // self-contradictory and causes the Resume settings proof to reject it.
+    // Both fields describe this new rollout; forked_from_id preserves ancestry.
+    meta.payload.session_id = newSessionId;
     meta.payload.timestamp = nowIso;
     meta.payload.cwd = cwd || meta.payload.cwd || getSessionMeta(records).cwd || '';
     meta.payload.forked_from_id = sourceSessionId;
@@ -3332,6 +3337,7 @@ async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords
       type: 'session_meta',
       payload: {
         id: newSessionId,
+        session_id: newSessionId,
         timestamp: nowIso,
         cwd: cwd || '',
         originator: 'noted-terminal',
@@ -3341,6 +3347,24 @@ async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords
       },
     });
   }
+}
+
+async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords) {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const newSessionId = crypto.randomUUID();
+  const { yyyy, mm, dd } = codexDateParts(now);
+  const dir = path.join(CODEX_SESSIONS_DIR, yyyy, mm, dd);
+  await fs.promises.mkdir(dir, { recursive: true });
+
+  rewriteCodexEditedForkMetadata(
+    records,
+    sourceSessionId,
+    cwd,
+    outputRecords,
+    newSessionId,
+    nowIso,
+  );
 
   let filePath = '';
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -3478,6 +3502,69 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     selectedCount: selected.length,
     selectedTurns: Array.from(selectedTurns),
     selectedCompacts: Array.from(selectedCompacts),
+  };
+}
+
+function planCodexForkFromLatestCompact(records, sessionId) {
+  const wrappers = buildCodexVisibleRecordWrappers(records, sessionId);
+  let compactIndex = -1;
+  for (let index = wrappers.length - 1; index >= 0; index -= 1) {
+    if (wrappers[index]?.record?.type === 'compacted') {
+      compactIndex = index;
+      break;
+    }
+  }
+  if (compactIndex < 0) {
+    return {
+      success: false,
+      reason: 'no-compact',
+      error: 'В этой Codex-сессии ещё нет сжатия контекста',
+    };
+  }
+
+  const outputRecords = [];
+  const sessionMeta = wrappers.find((wrapper) => wrapper?.record?.type === 'session_meta');
+  if (sessionMeta) outputRecords.push(cloneCodexRecordForWrite(sessionMeta.record));
+  for (let index = compactIndex; index < wrappers.length; index += 1) {
+    const record = wrappers[index]?.record;
+    if (!record || record.type === 'session_meta') continue;
+    outputRecords.push(cloneCodexRecordForWrite(record));
+  }
+
+  return {
+    success: true,
+    outputRecords,
+    compactLine: wrappers[compactIndex]?.line ?? null,
+    removedRecordCount: wrappers
+      .slice(0, compactIndex)
+      .filter((wrapper) => wrapper?.record?.type !== 'session_meta')
+      .length,
+    retainedRecordCount: outputRecords.filter((record) => record?.type !== 'session_meta').length,
+  };
+}
+
+async function forkCodexFromLatestCompact({ sessionId, cwd }) {
+  if (!sessionId) return { success: false, error: 'sessionId required' };
+  const loaded = await loadSessionRecords(sessionId, cwd);
+  if (!loaded.success) return loaded;
+  const plan = planCodexForkFromLatestCompact(loaded.records, sessionId);
+  if (!plan.success) return plan;
+
+  const result = await writeCodexEditedFork(
+    loaded.records,
+    sessionId,
+    cwd,
+    plan.outputRecords,
+  );
+  return {
+    success: true,
+    newSessionId: result.newSessionId,
+    filePath: result.filePath,
+    sourceFilePath: loaded.filePath,
+    fromLatestCompact: true,
+    compactLine: plan.compactLine,
+    removedRecordCount: plan.removedRecordCount,
+    retainedRecordCount: plan.retainedRecordCount,
   };
 }
 
@@ -3781,37 +3868,44 @@ function buildCodexRangeExport(records, sessionId, cwd, opts, startUuid, endUuid
   };
 }
 
-function boundCodexAssistantContext(blocks, maxChars = 8000) {
+function projectCodexAssistantContext(blocks, maxChars = 8000, maxLimit = 16000) {
   const values = (Array.isArray(blocks) ? blocks : [])
     .map((value) => String(value || '').trim())
     .filter(Boolean);
-  if (values.length === 0) return '';
-  const limit = Math.max(500, Math.min(16000, Number(maxChars) || 8000));
+  if (values.length === 0) {
+    return { assistantText: '', assistantChars: 0, truncated: false };
+  }
+  const limit = Math.max(500, Math.min(maxLimit, Number(maxChars) || 8000));
   const joined = values.join('\n\n');
-  if (joined.length <= limit) return joined;
+  if (joined.length <= limit) {
+    return { assistantText: joined, assistantChars: joined.length, truncated: false };
+  }
   const first = values[0];
   const last = values[values.length - 1];
+  let assistantText;
   if (values.length === 1) {
     const head = Math.floor(limit * 0.4);
-    return first.slice(0, head).trimEnd() + '\n…\n' + first.slice(-(limit - head - 3)).trimStart();
+    assistantText = first.slice(0, head).trimEnd() + '\n…\n' + first.slice(-(limit - head - 3)).trimStart();
+  } else {
+    const firstLimit = Math.min(Math.floor(limit * 0.35), first.length);
+    const lastLimit = Math.max(0, limit - firstLimit - 3);
+    assistantText = first.slice(0, firstLimit).trimEnd() + '\n…\n' + last.slice(-lastLimit).trimStart();
   }
-  const firstLimit = Math.min(Math.floor(limit * 0.35), first.length);
-  const lastLimit = Math.max(0, limit - firstLimit - 3);
-  return first.slice(0, firstLimit).trimEnd() + '\n…\n' + last.slice(-lastLimit).trimStart();
+  return { assistantText, assistantChars: joined.length, truncated: true };
 }
 
-function buildCodexTurnAssistantContext(records, sessionId, entryUuid, maxChars = 8000) {
+function boundCodexAssistantContext(blocks, maxChars = 8000) {
+  return projectCodexAssistantContext(blocks, maxChars, 16000).assistantText;
+}
+
+function collectCodexTurnAssistantBlocks(records, sessionId, entryUuid) {
   const timeline = buildCodexTimeline(records, sessionId);
   const target = timeline.find((entry) => entry.uuid === entryUuid && typeof entry.turnIndex === 'number');
   if (!target) return { success: false, error: 'Timeline turn not found' };
   const cleanEntries = buildCodexCleanEntries(records, sessionId, codexCopyOptions({
-    // Keep user rows in the intermediate projection even though this helper
-    // returns assistant text only. `thread_rolled_back` is resolved against
-    // the rows present in that projection; omitting a just-submitted user that
-    // was rolled back before any assistant output makes the rollback remove
-    // the previous assistant turn instead and shifts every later turnIndex.
-    // Filtering to assistant rows happens below, after structural indexing is
-    // complete, so no user text leaks into the returned context.
+    // Keep user rows in the structural projection so rollback indexing stays
+    // identical to Timeline. Assistant filtering happens only after the exact
+    // real user turn has been identified.
     includeUser: true,
     includeClaude: true,
     includeText: true,
@@ -3825,9 +3919,43 @@ function buildCodexTurnAssistantContext(records, sessionId, entryUuid, maxChars 
   const assistantBlocks = cleanEntries
     .filter((entry) => entry.kind === 'assistant' && entry.turnIndex === target.turnIndex)
     .map((entry) => entry.text);
-  const assistantText = boundCodexAssistantContext(assistantBlocks, maxChars);
+  return { success: true, target, assistantBlocks };
+}
+
+// Orchestration completion is one provider turn, even when Codex compacts its
+// context in the middle of that turn. The normal History projection exposes
+// the post-compact continuation as a synthetic row for navigation, while the
+// clean projection deliberately keeps it under the original real user turn.
+// Reuse that projection here so get_delegation_result includes the final answer
+// and still stops before the next real user message.
+function buildCodexTurnAssistantResult(records, sessionId, entryUuid, maxChars = 100000) {
+  const collected = collectCodexTurnAssistantBlocks(records, sessionId, entryUuid);
+  if (!collected.success) return collected;
+  const projected = projectCodexAssistantContext(collected.assistantBlocks, maxChars, 250000);
+  return projected.assistantText
+    ? {
+      success: true,
+      assistantText: projected.assistantText,
+      assistantChars: projected.assistantChars,
+      truncated: projected.truncated,
+      assistantMessageCount: collected.assistantBlocks.length,
+      assistantBlockCount: collected.assistantBlocks.length,
+      turnIndex: collected.target.turnIndex,
+    }
+    : { success: false, error: 'No completed assistant response found' };
+}
+
+function buildCodexTurnAssistantContext(records, sessionId, entryUuid, maxChars = 8000) {
+  const collected = collectCodexTurnAssistantBlocks(records, sessionId, entryUuid);
+  if (!collected.success) return collected;
+  const assistantText = boundCodexAssistantContext(collected.assistantBlocks, maxChars);
   return assistantText
-    ? { success: true, assistantText, assistantMessageCount: assistantBlocks.length, turnIndex: target.turnIndex }
+    ? {
+      success: true,
+      assistantText,
+      assistantMessageCount: collected.assistantBlocks.length,
+      turnIndex: collected.target.turnIndex,
+    }
     : { success: false, error: 'No completed assistant response found' };
 }
 
@@ -5612,6 +5740,22 @@ function register({ projectManager, transcriptService } = {}) {
     }
   });
 
+  ipcMain.handle('codex:fork-from-latest-compact', async (_event, params = {}) => {
+    try {
+      const result = await forkCodexFromLatestCompact(params);
+      console.log(
+        '[CodexData] fork-from-latest-compact' +
+        ' session=' + String(params?.sessionId || '').slice(0, 8) +
+        ' success=' + (result?.success === true ? '1' : '0') +
+        ' reason=' + String(result?.reason || (result?.success === true ? 'created' : 'error'))
+      );
+      return result;
+    } catch (error) {
+      console.error('[CodexData] fork-from-latest-compact error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   ipcMain.handle('codex:list-models', async () => {
     try {
       const models = await listCodexModels();
@@ -5785,8 +5929,10 @@ module.exports = {
   buildCodexCleanExport,
   buildCodexRangeExport,
   buildCodexTurnAssistantContext,
+  buildCodexTurnAssistantResult,
   editCodexRange,
   deleteCodexRange,
+  forkCodexFromLatestCompact,
   getTimelineSessionMeta,
   listCodexModels,
   invalidateCodexJsonlCache,
@@ -5812,11 +5958,15 @@ module.exports = {
     buildCodexCleanExport,
     buildCodexRangeExport,
     buildCodexTurnAssistantContext,
+    buildCodexTurnAssistantResult,
     buildCodexVisibleRecordWrappers,
     planCodexRangeRewrite,
+    planCodexForkFromLatestCompact,
+    rewriteCodexEditedForkMetadata,
     writeCodexJsonlExclusive,
     editCodexRange,
     deleteCodexRange,
+    forkCodexFromLatestCompact,
     loadSessionRecords,
     buildCodexFullHistory,
     buildCodexTimeline,

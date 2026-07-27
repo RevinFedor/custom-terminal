@@ -24,7 +24,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil, Minimize2 } from 'lucide-react';
 import {
   normalizeSelectedVisualRootIds,
   orderVisualHierarchyItems,
@@ -240,6 +240,7 @@ interface TabData {
   color?: TabColor;
   isUtility?: boolean;
   commandType?: string;
+  cwd?: string;
   wasInterrupted?: boolean;
   claudeSessionId?: string;
   geminiSessionId?: string;
@@ -3625,7 +3626,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const moveTabGroupToProject = useWorkspaceStore((state) => state.moveTabGroupToProject);
   const createTabGroup = useWorkspaceStore((state) => state.createTabGroup);
   const applyTabLayout = useWorkspaceStore((state) => state.applyTabLayout);
-  const setTabVisualParent = useWorkspaceStore((state) => state.setTabVisualParent);
   const toggleTabSelection = useWorkspaceStore((state) => state.toggleTabSelection);
   const selectTabRange = useWorkspaceStore((state) => state.selectTabRange);
   const clearSelection = useWorkspaceStore((state) => state.clearSelection);
@@ -6875,31 +6875,135 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     setProjectView(projectId, 'terminal');
   };
 
-  const getVisualParentCandidateId = (tabId: string, direction: 'up' | 'down'): string | null => {
-    const index = mainTabsForDisplay.findIndex(tab => tab.id === tabId);
-    if (index === -1) return null;
-    const step = direction === 'up' ? -1 : 1;
-    for (let i = index + step; i >= 0 && i < mainTabsForDisplay.length; i += step) {
-      const candidate = mainTabsForDisplay[i];
-      if (!candidate || candidate.id === tabId) continue;
-      if (candidate.visualParentTabId === tabId) continue;
-      return candidate.id;
-    }
-    return null;
-  };
-
   const contextMenuTabId = contextMenu?.tabId || null;
   const contextTabForMenu = contextMenuTabId ? workspace?.tabs.get(contextMenuTabId) : null;
   const isContextFileTab = contextTabForMenu?.tabType === 'file';
-  const visualParentAboveId = contextMenuTabId ? getVisualParentCandidateId(contextMenuTabId, 'up') : null;
-  const visualParentBelowId = contextMenuTabId ? getVisualParentCandidateId(contextMenuTabId, 'down') : null;
+  const contextForkProvider = contextTabForMenu?.commandType === 'claude'
+    ? 'claude'
+    : contextTabForMenu?.commandType === 'codex'
+      ? 'codex'
+      : contextTabForMenu?.claudeSessionId && !contextTabForMenu?.codexSessionId
+        ? 'claude'
+        : contextTabForMenu?.codexSessionId && !contextTabForMenu?.claudeSessionId
+          ? 'codex'
+          : null;
+  const contextForkSessionAvailable = contextForkProvider === 'claude'
+    ? !!contextTabForMenu?.claudeSessionId
+    : contextForkProvider === 'codex'
+      ? !!contextTabForMenu?.codexSessionId
+      : false;
 
-  const attachVisualParent = (direction: 'up' | 'down') => {
-    if (!contextMenu) return;
-    const parentId = direction === 'up' ? visualParentAboveId : visualParentBelowId;
-    if (!parentId) return;
-    setTabVisualParent(projectId, contextMenu.tabId, parentId);
+  const resolveContextForkSessionId = async (
+    tab: TabData,
+    provider: 'claude' | 'codex',
+    operation: string,
+  ): Promise<string | null> => {
+    if (provider === 'codex') {
+      try {
+        return await requireCodexSurfaceSessionId({
+          tabId: tab.id,
+          historicalSessionId: tab.codexSessionId,
+          operation,
+          requireMutationSafe: true,
+        });
+      } catch (error: any) {
+        showToast(error?.message || 'Не удалось подтвердить Codex-сессию', 'warning');
+        return null;
+      }
+    }
+    if (!tab.claudeSessionId) return null;
+    try {
+      const materialization = await ipcRenderer.invoke('claude:session-materialization', {
+        sessionId: tab.claudeSessionId,
+        cwd: tab.cwd || workspace.projectPath || '',
+      });
+      if (materialization?.materialized !== true && materialization?.conversationMaterialized !== true) {
+        showToast('У этой вкладки ещё нет сохранённой беседы Claude', 'warning');
+        return null;
+      }
+    } catch (error: any) {
+      showToast('Не удалось проверить историю Claude: ' + (error?.message || String(error)), 'warning');
+      return null;
+    }
+    return tab.claudeSessionId;
+  };
+
+  const handleContextFork = async (fromLatestCompact: boolean) => {
+    const menu = contextMenu;
+    const tab = menu ? workspace.tabs.get(menu.tabId) : null;
+    const provider = contextForkProvider;
+    if (!menu || !tab || !provider || !contextForkSessionAvailable) return;
     setContextMenu(null);
+
+    const sourceSessionId = await resolveContextForkSessionId(
+      tab,
+      provider,
+      fromLatestCompact ? 'создать fork от последнего compact' : 'создать fork сессии',
+    );
+    if (!sourceSessionId) return;
+
+    const cwd = tab.cwd || workspace.projectPath || '';
+    let launchSessionId = sourceSessionId;
+    if (fromLatestCompact) {
+      const result = provider === 'claude'
+        ? await ipcRenderer.invoke('claude:fork-session-file', {
+          sourceSessionId,
+          cwd,
+          skipChainResolve: true,
+          fromLatestCompact: true,
+        })
+        : await ipcRenderer.invoke('codex:fork-from-latest-compact', {
+          sessionId: sourceSessionId,
+          cwd,
+        });
+      if (!result?.success || !result?.newSessionId) {
+        const noCompact = result?.reason === 'no-compact';
+        const message = noCompact
+          ? (result?.error || `В этой ${provider === 'claude' ? 'Claude' : 'Codex'}-сессии ещё нет сжатия контекста`)
+          : 'Compact fork не создан: ' + (result?.error || 'неизвестная ошибка');
+        console.warn(
+          '[CompactFork] rejected' +
+          ' tab=' + String(tab.id).slice(-12) +
+          ' provider=' + provider +
+          ' reason=' + String(result?.reason || 'error')
+        );
+        showToast(
+          message,
+          noCompact ? 'info' : 'error',
+          noCompact ? 6000 : 4500,
+        );
+        return;
+      }
+      launchSessionId = result.newSessionId;
+    }
+
+    const suffix = fromLatestCompact ? '_compact' : '_fork';
+    const forkName = tab.name ? `${tab.name}${suffix}` : undefined;
+    try {
+      await useWorkspaceStore.getState().createTabAfterCurrent(projectId, forkName, cwd, {
+        pendingAction: fromLatestCompact
+          ? {
+            type: provider === 'claude' ? 'claude-compact-fork' : 'codex-compact-fork',
+            sessionId: launchSessionId,
+            sourceSessionId,
+          }
+          : {
+            type: provider === 'claude' ? 'claude-fork' : 'codex-fork',
+            sessionId: launchSessionId,
+          },
+        nameSetManually: false,
+        afterTabId: tab.id,
+        visualParentTabId: tab.id,
+      });
+      showToast(
+        fromLatestCompact
+          ? `Fork ${provider === 'claude' ? 'Claude' : 'Codex'} от последнего compact создан`
+          : `Fork ${provider === 'claude' ? 'Claude' : 'Codex'} создан`,
+        'success',
+      );
+    } catch (error: any) {
+      showToast('Не удалось открыть вкладку fork: ' + (error?.message || String(error)), 'error');
+    }
   };
 
   const handleCloseTab = async (e: React.MouseEvent, tabId: string) => {
@@ -9817,32 +9921,31 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             </>
           )}
 
-          {/* Visual parent split control */}
-          {!isMultiSelect && (
-            <div className="grid grid-cols-2 border-t border-[#333] border-b border-[#333]">
+          {/* Session fork: ordinary full-history fork + compact-tail fork. */}
+          {!isMultiSelect && contextForkProvider && contextForkSessionAvailable && (
+            <div
+              data-tab-fork-split
+              className="grid grid-cols-[4fr_1fr] border-t border-[#333] border-b border-[#333]"
+            >
               <button
-                className={`px-4 py-1.5 text-[13px] flex items-center justify-center gap-2 ${
-                  visualParentAboveId
-                    ? 'text-[#ccc] hover:bg-white/10 cursor-pointer'
-                    : 'text-[#555] cursor-not-allowed'
-                }`}
-                disabled={!visualParentAboveId}
-                title="Make this tab child of the nearest visible tab above"
-                onClick={() => attachVisualParent('up')}
+                data-tab-fork
+                className="px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-2"
+                title="Fork the complete session"
+                aria-label="Fork complete session"
+                onClick={() => void handleContextFork(false)}
               >
-                <ArrowUp size={13} className={visualParentAboveId ? 'text-[#8b5cf6]' : 'text-[#555]'} />
+                <span className="text-[#8b5cf6] text-[14px] leading-none">⑂→▭</span>
+                <span>Fork</span>
               </button>
               <button
-                className={`px-4 py-1.5 text-[13px] flex items-center justify-center gap-2 border-l border-[#333] ${
-                  visualParentBelowId
-                    ? 'text-[#ccc] hover:bg-white/10 cursor-pointer'
-                    : 'text-[#555] cursor-not-allowed'
-                }`}
-                disabled={!visualParentBelowId}
-                title="Make this tab child of the nearest visible tab below"
-                onClick={() => attachVisualParent('down')}
+                data-tab-fork-compact
+                className="px-1 py-1.5 text-[11px] text-[#c4b5fd] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-1 border-l border-[#333]"
+                title="Fork from latest compact"
+                aria-label="Fork from latest compact"
+                onClick={() => void handleContextFork(true)}
               >
-                <ArrowDown size={13} className={visualParentBelowId ? 'text-[#8b5cf6]' : 'text-[#555]'} />
+                <Minimize2 size={12} />
+                <span>C</span>
               </button>
             </div>
           )}

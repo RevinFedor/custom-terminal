@@ -25,6 +25,7 @@ const {
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
   validateCodexPtySubmitAdmission,
+  verifyCodexNextLaunchSettings,
 } = require('./codex-runtime-contract');
 
 test('only the native FAST service-tier command is admitted during an active turn', () => {
@@ -149,6 +150,64 @@ test('command launch settings restore both Resume and Fork from proven source se
     effort: null,
     settingsSource: 'new-thread-without-conversation-only-effort',
   });
+});
+
+test('an explicit stopped-tab pair overrides Resume source settings exactly once', () => {
+  assert.deepEqual(planCodexCommandLaunchSettings({
+    command: 'codex-c',
+    model: 'gpt-5.6-terra',
+    effort: 'high',
+    preferRequestedSettings: true,
+    sourceSettingsStatus: 'found',
+    sourceModel: 'gpt-5.6-sol',
+    sourceEffort: 'max',
+  }), {
+    allowed: true,
+    model: 'gpt-5.6-terra',
+    effort: 'high',
+    settingsSource: 'resume-tab-intent',
+  });
+  assert.equal(planCodexCommandLaunchSettings({
+    command: 'codex-c',
+    model: 'gpt-5.6-terra',
+    preferRequestedSettings: true,
+  }).allowed, false);
+  assert.deepEqual(planCodexCommandLaunchSettings({
+    command: 'codex-c',
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+    preferRequestedSettings: true,
+  }), {
+    allowed: false,
+    error: 'codex_resume_intent_ultra_not_persistent',
+    settingsSource: 'resume-tab-intent',
+  });
+});
+
+test('next-launch Codex readiness requires the composer to prove the requested pair', () => {
+  assert.deepEqual(verifyCodexNextLaunchSettings({
+    settingsIntent: 'next-launch',
+    requestedModel: 'gpt-5.6-terra',
+    requestedEffort: 'high',
+    composerModel: 'gpt-5.6-terra',
+    composerEffort: 'high',
+  }), {
+    required: true,
+    matches: true,
+    error: null,
+    requested: { model: 'gpt-5.6-terra', effort: 'high' },
+    observed: { model: 'gpt-5.6-terra', effort: 'high' },
+  });
+  assert.equal(verifyCodexNextLaunchSettings({
+    settingsIntent: 'next-launch',
+    requestedModel: 'gpt-5.6-terra',
+    requestedEffort: 'high',
+    composerModel: 'gpt-5.6-sol',
+    composerEffort: 'max',
+  }).error, 'codex_next_launch_settings_mismatch');
+  assert.deepEqual(verifyCodexNextLaunchSettings({
+    settingsIntent: null,
+  }), { required: false, matches: true, error: null });
 });
 
 test('fresh absence beats cached runtime state outside exact launch admission', () => {

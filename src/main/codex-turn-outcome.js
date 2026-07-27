@@ -232,6 +232,12 @@ function prepareCodexSourceProofReplay(state, {
   state.sourceWriterReplayOffset = null;
   state.sourceWriterReplayPartial = null;
   state.sourceWriterReplayPartialStartOffset = null;
+  // Audit-only parsing is allowed while the source lifecycle is withheld.
+  // Once ownership is proven, the exact held byte range is replayed through
+  // the normal parser, so its separate partial buffer must not leak across the
+  // ownership boundary.
+  state.sourceAuditPartial = '';
+  state.sourceAuditPartialStartOffset = targetOffset;
   state.catchUpGeneration = Number(state.catchUpGeneration || 0) + 1;
   if (replayOffset != null) {
     state.offset = Math.min(targetOffset, replayOffset);

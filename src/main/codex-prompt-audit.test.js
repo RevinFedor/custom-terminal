@@ -5,10 +5,58 @@ const assert = require('node:assert/strict');
 const {
   codexAuditRecordIsAfterBoundary,
   codexCanonicalUserMessageMatch,
+  consumeCodexUserMessageAuditChunk,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
   selectCodexPendingPromptAudit,
 } = require('./codex-prompt-audit');
+
+test('provisional source audit parser finds a user_message without consuming lifecycle rows', () => {
+  const prefix = JSON.stringify({
+    timestamp: '2026-07-27T04:07:08.094Z',
+    type: 'event_msg',
+    payload: { type: 'task_started' },
+  }) + '\n';
+  const user = JSON.stringify({
+    timestamp: '2026-07-27T04:07:13.102Z',
+    type: 'event_msg',
+    payload: { type: 'user_message', message: 'Reply only C3-AUDIT-070359' },
+  }) + '\n';
+  const result = consumeCodexUserMessageAuditChunk({
+    chunk: prefix + user,
+    incomingStartOffset: 119_292,
+  });
+
+  assert.equal(result.records.length, 1);
+  assert.equal(result.records[0].record.payload.message, 'Reply only C3-AUDIT-070359');
+  assert.equal(result.records[0].byteOffset, 119_292 + Buffer.byteLength(prefix));
+  assert.equal(result.partial, '');
+});
+
+test('provisional source audit parser carries a split JSONL row with its original byte offset', () => {
+  const line = JSON.stringify({
+    timestamp: '2026-07-27T04:07:13.102Z',
+    type: 'event_msg',
+    payload: { type: 'user_message', message: 'split audit row' },
+  });
+  const splitAt = 47;
+  const first = consumeCodexUserMessageAuditChunk({
+    chunk: line.slice(0, splitAt),
+    incomingStartOffset: 240_143,
+  });
+  assert.equal(first.records.length, 0);
+
+  const second = consumeCodexUserMessageAuditChunk({
+    chunk: line.slice(splitAt) + '\n',
+    incomingStartOffset: 240_143 + Buffer.byteLength(line.slice(0, splitAt)),
+    partial: first.partial,
+    partialStartOffset: first.partialStartOffset,
+  });
+  assert.equal(second.records.length, 1);
+  assert.equal(second.records[0].byteOffset, 240_143);
+  assert.equal(second.records[0].record.payload.message, 'split audit row');
+  assert.equal(second.partial, '');
+});
 
 test('same-file identical records before the pre-Enter byte boundary are not causal', () => {
   const audit = {

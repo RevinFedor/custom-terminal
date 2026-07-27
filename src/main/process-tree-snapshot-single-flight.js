@@ -20,10 +20,12 @@ function createProcessTreeSnapshotSingleFlight({
   }
 
   let inflight = null;
+  let generation = 0;
 
   function startCapture(forceFresh) {
     const entry = {
       forceFresh,
+      generation,
       waiters: 0,
       promise: null,
     };
@@ -35,6 +37,8 @@ function createProcessTreeSnapshotSingleFlight({
       .then(() => capture({
         forceFresh,
         getWaiterCount: () => entry.waiters,
+        generation: entry.generation,
+        isCurrent: () => generation === entry.generation,
       }))
       .finally(() => {
         if (inflight === entry) inflight = null;
@@ -55,6 +59,21 @@ function createProcessTreeSnapshotSingleFlight({
           waitMs: 0,
           waiters: owner.waiters,
         };
+      }
+
+      // A destructive lifecycle boundary (for example, a proven Stop) may
+      // invalidate a ps capture that started while the old process still
+      // existed. Callers that arrive after that boundary must wait for the old
+      // OS command to settle and then form one new capture wave; joining the
+      // old promise would resurrect the stopped process for the cache TTL.
+      if (active.generation !== generation) {
+        try {
+          await active.promise;
+        } catch {
+          // The invalidated observation belongs to the old generation either
+          // way. Its result/error must not be inherited by a new caller.
+        }
+        continue;
       }
 
       // A normal capture may have started before the destructive caller's
@@ -84,6 +103,10 @@ function createProcessTreeSnapshotSingleFlight({
 
   return {
     get,
+    invalidate() {
+      generation += 1;
+      return generation;
+    },
     snapshot() {
       if (!inflight) return null;
       return {

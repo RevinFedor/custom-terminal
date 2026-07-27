@@ -32,6 +32,7 @@ const {
   selectCodexNativeRewindWriter,
   selectCodexSettledRewindWriter,
   isCodexWriterProofOwnershipQuarantined,
+  isCodexResumeSourceAuditPending,
   runKeyedExclusive,
   runKeyedSingleFlight,
   shouldRetryCodexDescriptorProbePass,
@@ -1318,6 +1319,65 @@ test('resume source stays provisional through TUI ready until append or linked w
     sourceMode: 'resume',
     sourceMatch: 'direct-fork',
   }).status, 'commit');
+});
+
+test('automated Resume source waits for exact user_message audit before adoption', () => {
+  const pending = classifyCodexWriterAdoption({
+    sourceMode: 'resume',
+    sourceMatch: 'source-in-place',
+    linkedBoundaryFound: true,
+    sourceAppendObserved: true,
+    sourceSubmitAuditPending: true,
+  });
+  assert.equal(pending.status, 'provisional-source');
+  assert.equal(pending.reason, 'awaiting-user-message-audit');
+
+  assert.equal(classifyCodexWriterAdoption({
+    sourceMode: 'resume',
+    sourceMatch: 'source-in-place',
+    linkedBoundaryFound: true,
+    sourceAppendObserved: true,
+    sourceSubmitAuditPending: false,
+  }).status, 'commit');
+
+  assert.equal(classifyCodexWriterAdoption({
+    sourceMode: 'resume',
+    sourceMatch: 'direct-fork',
+    sourceSubmitAuditPending: true,
+  }).status, 'commit');
+});
+
+test('Resume source audit gate belongs to one exact source and launch', () => {
+  const discovery = {
+    sourceMode: 'resume',
+    sourceSessionId: 'source-a',
+    launchId: 'launch-1',
+    provisionalSubmitReservation: {
+      sourceSessionId: 'source-a',
+      launchId: 'launch-1',
+      requiresUserMessageAudit: true,
+      auditMatched: false,
+    },
+  };
+  assert.equal(isCodexResumeSourceAuditPending({
+    sourceMode: 'resume',
+    sourceSessionId: 'source-a',
+    launchId: 'launch-1',
+    discovery,
+  }), true);
+  assert.equal(isCodexResumeSourceAuditPending({
+    sourceMode: 'resume',
+    sourceSessionId: 'source-a',
+    launchId: 'launch-2',
+    discovery,
+  }), false);
+  discovery.provisionalSubmitReservation.auditMatched = true;
+  assert.equal(isCodexResumeSourceAuditPending({
+    sourceMode: 'resume',
+    sourceSessionId: 'source-a',
+    launchId: 'launch-1',
+    discovery,
+  }), false);
 });
 
 test('provisional first action requires one exact launch-scoped source proof chain', () => {

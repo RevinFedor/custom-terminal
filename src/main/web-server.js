@@ -50,13 +50,15 @@ const zlib = require('zlib');
 const { app, BrowserWindow, ipcMain } = require('electron');
 const {
   codexSessionIdFromAuthoritativeStatus,
-  isCodexComposerReadyForGuardedSend,
 } = require('./codex-runtime-contract');
 const {
   classifyAgentActionBridgeError,
   classifyAgentActionResult,
   validateFreshAgentRuntimeStatus,
 } = require('./project-api-runtime-contract');
+const {
+  waitForAgentReadyTransition,
+} = require('./agent-ready-wait');
 const { OrchestrationRunStore, isActiveStatus } = require('./orchestration-runs');
 const {
   buildDelegationResultTarget,
@@ -155,6 +157,10 @@ let answerClaudeQuestion = null;
 let getClaudePendingQuestion = null;
 let transcriptService = null;
 let getAgentTurnResult = null;
+// Main owns the agent startup/readiness state. The renderer bridge remains a
+// compatibility fallback for isolated module use, but live Project API waits
+// must not depend on a renderer projection arriving before the main-owned wake.
+let readAgentStartReadiness = null;
 // Main-owned Codex process/writer resolver. Renderer state and SQLite are not
 // authoritative for a live rollout, so web routes fall back to this callback
 // when the bridge is unavailable instead of publishing the saved resume ID.
@@ -467,90 +473,27 @@ function cleanupExternalRun(run) {
   if (run.runId) externalRuns.delete(run.runId);
 }
 
-async function waitForAgentReady(tabId, timeoutMs = 20_000) {
-  const limitMs = Math.max(1000, Math.min(60_000, Number(timeoutMs) || 20_000));
-  let last = null;
-  const isManualActionRequiredStatus = (status) => {
-    if (!status) return false;
-    if (status.manualActionRequired === true) return true;
-    const blockers = Array.isArray(status.lastNotReady?.blockers) ? status.lastNotReady.blockers : [];
-    return blockers.includes('auth-required');
-  };
-  const readStatus = async () => {
-    try {
-      last = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
-      if (isManualActionRequiredStatus(last)) {
-        const err = new Error('codex_auth_required');
-        err.code = 'codex_auth_required';
-        err.status = last;
-        throw err;
-      }
-      // Codex resume can have a fully-ready composer before the CLI proves
-      // whether it will append to the source rollout or create a linked child.
-      // That is ready for one guarded submit, but it is not a current-session
-      // identity. Main revalidates the exact launch/source proof under the PTY
-      // write lock and audits the post-Enter user_message.
-      const codexProvisionalComposerReady = isCodexComposerReadyForGuardedSend(last)
-        && last?.status === 'starting';
-      if (last && ((last.status === 'active' || last.status === 'busy') && last.inputReady === true
-        || codexProvisionalComposerReady)) {
-        return last;
-      }
-    } catch (e) {
-      if (e?.code === 'codex_auth_required') throw e;
-      last = { error: String(e.message || e) };
-    }
-    return null;
-  };
+async function readAgentReadyStatus(tabId) {
+  if (readAgentStartReadiness) {
+    return await readAgentStartReadiness(tabId);
+  }
+  return await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+}
 
-  return await new Promise((resolve, reject) => {
-    let settled = false;
-    let timer = null;
-	    const finish = (err, status) => {
-	      if (settled) return;
-	      settled = true;
-	      if (timer) clearTimeout(timer);
-	      ipcMain.removeListener('agent:tui-ready-internal', onReady);
-	      ipcMain.removeListener('claude:startup-defaults-gate', onStartupDefaultsGate);
-	      if (err) reject(err);
-	      else resolve(status);
-	    };
-    const fail = () => {
-      const err = new Error('agent did not become ready');
-      err.status = last;
-      finish(err);
-    };
-    const check = () => {
-      readStatus()
-        .then((status) => { if (status) finish(null, status); })
-        .catch((e) => {
-          last = { error: String(e.message || e) };
-          if (e?.code === 'codex_auth_required') finish(e);
-        });
-    };
-	    const onReady = (_event, payload) => {
-	      const readyTabId = typeof payload === 'string' ? payload : payload?.tabId;
-	      if (readyTabId !== tabId) return;
-	      check();
-	    };
-	    const onStartupDefaultsGate = (_event, payload = {}) => {
-	      if (payload?.tabId !== tabId) return;
-	      console.log('[WebReadyWait] wake tab=' + shortId(tabId, 12)
-	        + ' source=startup-defaults status=' + (payload?.status || '-')
-	        + ' reason=' + (payload?.reason || '-'));
-	      check();
-	    };
-	    ipcMain.on('agent:tui-ready-internal', onReady);
-	    ipcMain.on('claude:startup-defaults-gate', onStartupDefaultsGate);
-	    timer = setTimeout(fail, limitMs);
-	    check();
-	  });
-	}
+async function waitForAgentReady(tabId, timeoutMs = 20_000) {
+  return await waitForAgentReadyTransition({
+    tabId,
+    timeoutMs,
+    eventBus: ipcMain,
+    readStatus: () => readAgentReadyStatus(tabId),
+    log: (message) => console.log(message.replace('[AgentReadyWait]', '[WebReadyWait]')),
+  });
+}
 
 async function readFreshReadyRuntimeStatus(tabId, label) {
   let status;
   try {
-    status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+    status = await readAgentReadyStatus(tabId);
   } catch (error) {
     const wrapped = new Error('runtime snapshot unavailable after startup defaults: ' + String(error?.message || error));
     wrapped.code = error?.code === 'bridge_timeout'
@@ -1588,7 +1531,12 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
         reason: 'snapshot-replay',
         completedAt: run.completedAt || null,
       }));
-    } else if (run.status === 'send_failed' || run.status === 'start_timeout') {
+    } else if (
+      run.status === 'send_failed'
+      || run.status === 'start_timeout'
+      || run.status === 'start_failed'
+      || run.status === 'auth_required'
+    ) {
       sink.send(JSON.stringify({
         type: 'error',
         tabId,
@@ -3120,6 +3068,18 @@ async function handleApi(req, res, parsed, sdkSessions) {
           setExternalRunMeta(tabId, { status: 'auth_required', error: 'codex_auth_required' });
           return sendJson(res, 409, { ok: false, runId, tabId, error: 'codex_auth_required', status: e.status || null });
         }
+        if (e?.code === 'agent_startup_defaults_failed') {
+          run.status = 'start_failed';
+          setExternalRunMeta(tabId, { status: 'start_failed', error: String(e.message || e) });
+          return sendJson(res, 409, {
+            ok: false,
+            runId,
+            tabId,
+            error: e.code,
+            detail: String(e.message || e),
+            status: e.status || null,
+          });
+        }
         run.status = 'start_timeout';
         setExternalRunMeta(tabId, { status: 'start_timeout', error: String(e.message || e) });
         return sendJson(res, 504, { ok: false, runId, tabId, error: 'agent did not become ready', status: e.status || null });
@@ -3349,22 +3309,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
         const status = await waitForAgentReady(tabId, startupTimeoutMs);
         const startedTool = data?.toolType || status?.toolType || status?.commandType || data?.commandType;
         const needsStartupDefaults = startedTool === 'claude';
-        let defaultsReady = !needsStartupDefaults;
-        let defaultsError = null;
+        const defaultsReady = needsStartupDefaults
+          ? status?.startupDefaultsReady === true
+          : true;
+        const defaultsError = status?.startupDefaultsError || null;
         let liveStatus = status;
-        if (needsStartupDefaults) {
-          try {
-            const defaults = await bridgeRequest('waitAgentStartupDefaultsReady', { tabId, timeoutMs: startupTimeoutMs }, Math.max(5000, startupTimeoutMs));
-            defaultsReady = defaults?.defaultsReady === true;
-            defaultsError = defaults?.error || defaults?.reason || null;
-          } catch (defaultsErr) {
-            defaultsError = String(defaultsErr.message || defaultsErr);
-            console.warn('[MobStart] startup defaults not ready after fresh start tab=' + shortId(tabId, 12)
-              + ' runtimeStatus=' + (status?.status || '-')
-              + ' error=' + defaultsError
-              + ' continuingWithLiveRuntime=true');
-          }
-        }
         try {
           liveStatus = await readFreshReadyRuntimeStatus(tabId, 'start-after-defaults');
         } catch (freshErr) {
@@ -3402,7 +3351,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           materializationReason: 'timeline-empty',
         });
       } catch (readyErr) {
-        return sendJson(res, readyErr?.code === 'codex_auth_required' ? 409 : 504, {
+        return sendJson(res, Number(readyErr?.statusCode) || 504, {
           ...(data || {}),
           ok: false,
           success: false,
@@ -3439,20 +3388,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
       try {
         const status = await waitForAgentReady(tabId, startupTimeoutMs);
-        let defaultsReady = false;
-        let defaultsError = null;
+        const defaultsReady = status?.startupDefaultsReady === true;
+        const defaultsError = status?.startupDefaultsError || null;
         let liveStatus = status;
-        try {
-          const defaults = await bridgeRequest('waitAgentStartupDefaultsReady', { tabId, timeoutMs: startupTimeoutMs }, Math.max(5000, startupTimeoutMs));
-          defaultsReady = defaults?.defaultsReady === true;
-          defaultsError = defaults?.error || defaults?.reason || null;
-        } catch (defaultsErr) {
-          defaultsError = String(defaultsErr.message || defaultsErr);
-          console.warn('[MobResume] startup defaults not ready after live resume tab=' + shortId(tabId, 12)
-            + ' runtimeStatus=' + (status?.status || '-')
-            + ' error=' + defaultsError
-            + ' continuingWithLiveRuntime=true');
-        }
         try {
           liveStatus = await readFreshReadyRuntimeStatus(tabId, 'resume-after-defaults');
         } catch (freshErr) {
@@ -3485,7 +3423,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           inputReady: liveStatus?.inputReady === true,
         });
       } catch (readyErr) {
-        return sendJson(res, readyErr?.code === 'codex_auth_required' ? 409 : 504, {
+        return sendJson(res, Number(readyErr?.statusCode) || 504, {
           ...(data || {}),
           ok: false,
           success: false,
@@ -4840,7 +4778,17 @@ function attachWebSocket(server, sdkSessions) {
 
 // ───────── lifecycle ─────────
 
-function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectActivity: computeProjectActivityFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn, transcriptService: transcriptServiceFn, resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn, getAgentTurnResult: getAgentTurnResultFn }) {
+function start({
+  sdkSessions,
+  computeActiveLoaders: computeFn,
+  computeProjectActivity: computeProjectActivityFn,
+  answerClaudeQuestion: answerFn,
+  getClaudePendingQuestion: getQFn,
+  transcriptService: transcriptServiceFn,
+  resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn,
+  getAgentTurnResult: getAgentTurnResultFn,
+  readAgentStartReadiness: readAgentStartReadinessFn,
+}) {
   if (httpServer) {
     console.log('[WebServer] already started');
     return;
@@ -4853,6 +4801,7 @@ function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectAct
   transcriptService = transcriptServiceFn || null;
   resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
   getAgentTurnResult = getAgentTurnResultFn || null;
+  readAgentStartReadiness = readAgentStartReadinessFn || null;
   token = loadOrCreateToken();
   registerBridgeReplyHandler();
   void getOrchestrationRunStore().initialize()
@@ -4930,6 +4879,7 @@ function stop() {
   transcriptService = null;
   resolveCodexRuntimeSessionInfo = null;
   getAgentTurnResult = null;
+  readAgentStartReadiness = null;
   subscribers.clear();
 }
 

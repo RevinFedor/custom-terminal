@@ -39,7 +39,28 @@ Terminal MCP публикует две отдельные команды стр�
 
 Terminal MCP управляет **живым процессом**, а не историей. `start_ai` создаёт или переиспользует вкладку и запускает `claude` / `codex` / `gemini` через те же app-native launch hooks, что UI. `send_prompt` вставляет prompt в целевую вкладку через существующий safe paste path, `stop_ai` останавливает AI process-tree без уничтожения shell. Для `codex-c` / `codex-f` / `claude-c` / `claude-f` create-tab aliases проходят через pendingAction, чтобы renderer применил тот же resume/fork flow, что пользовательская кнопка.
 
+`start_ai` подтверждает не только запись launch-команды. Для Claude ответ
+`ready:true/inputReady:true` возможен после TUI prompt **и** ready startup-gate
+для `/model`/`/effort`; для Codex — после доказанной готовности composer и
+проверки запрошенной next-launch пары. Первый TUI edge лишь будит проверку.
+Для Claude он также только открывает транзакцию: первый settings-paste ждёт
+устойчивого composer-frame после последней startup-перерисовки. Если запуск сразу
+получил пользовательский prompt, тот ждёт доказанных model/effort и не может
+обогнать их.
+Последующий main-side переход settings `pending → ready/failed` будит тот же
+waiter второй раз. И пробуждение, и повторное чтение используют один
+main-owned снимок; renderer не обязан успеть принять IPC и вернуть его через
+bridge. Поэтому холодный/reloading renderer не оставляет API на однажды
+прочитанном `pending`, а startup failure возвращается явно вместо ложного 504.
+
 `send_prompt` / `Status: sent` — это delivery-only сигнал. Он подтверждает, что prompt доставлен в PTY/agent tab, но не ждёт завершения ответа. Для ручной инспекции уже открытой сессии history-tools того же Terminal MCP читают `list_open_sessions` → `busy/status` → targeted turn/text. Для долгой делегации этот цикл запрещён: `delegate_to_session` создаёт persistent run, источник получает одно completion-уведомление, затем вызывает `get_delegation_result` ровно один раз. Так 30-минутный turn не держит HTTP/MCP-вызов и переживает restart.
+
+У Codex один provider-turn может пройти через context compaction без второго
+пользовательского сообщения. History показывает compact и post-compact
+продолжение отдельными навигационными строками, но `get_delegation_result`
+собирает все assistant-блоки исходного реального turn до следующего реального
+user message. Иначе длинный E2E-run возвращал только вводные комментарии до
+compact, хотя финальный ответ уже был записан перед `task_complete`.
 
 `get_session_progress` решает другой сценарий: по явному запросу посмотреть, какие структурные операции появились в уже существующей сессии после прошлого просмотра. Клиент возвращает opaque cursor из предыдущего ответа; сервер не хранит watermark и не решает за агента, что уже прочитано. Если Rewind/fork заменил ветку и cursor больше не принадлежит текущей истории, ответ явно помечает reset вместо молчаливого пропуска. Этот метод не является completion-gate: готовность по-прежнему определяется `busy/status`, а progress не возвращает полные аргументы и результаты инструментов.
 

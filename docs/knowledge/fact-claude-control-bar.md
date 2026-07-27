@@ -100,6 +100,16 @@ Tab-метаданные (`tabType`, `sdkModel`, `sdkEffort`, `sdkThinking`) ч�
 
 PTY-Claude Model/Effort в ControlBar — проекция подтверждённого состояния **текущей сессии**, а не local mirror глобальных defaults. При привязке сессии bar читает её активную `parentUuid`-ветку и принимает только прямую пару `/<setting> value` → `<local-command-stdout>Set ...</local-command-stdout>`. Тот же transcript watcher обновляет bar после ручной команды в терминале; после Rewind физически более новые записи отброшенной ветки не выигрывают. Поэтому renderer/app restart восстанавливает фактические `model/effort`, а не сбрасывает их в `default`/`unset`.
 
+Когда типизированная Claude/Codex PTY-вкладка остановлена, те же Model/Effort
+становятся выбором **следующего запуска**. Для Claude сохраняется только полная
+совместимая пара; при Start/Continue она имеет приоритет над подтверждёнными
+настройками Resume и app defaults, применяется последовательно и исчезает из
+pending-состояния только после proof обеих команд в точном launch generation.
+Для Codex остановленный выбор также хранится полной парой без owner старой
+сессии; Resume применяет её один раз и не объявляет готовность, пока composer
+footer не подтвердит именно эту пару. Поэтому pending-выбор показывается выше
+старого подтверждённого значения, но не выдаётся за уже применённое live-state.
+
 StatusBar при этом остаётся настройкой **будущих** запусков. `_modelSentForTab` / `_effortSentForTab` лишь не дают двум startup-путям повторно отправить одну команду и очищаются со смертью процесса; они не являются источником отображаемого значения. Ошибка чтения JSONL не разрешает подменить состояние текущей сессии StatusBar-default'ом. `thinkLocal` остаётся отдельным TUI-mirror. См. `fact-claude-tui-control.md::Startup defaults /model + /effort при запуске Claude`.
 
 ## Context % bridge: три канала — PTY, SDK, Codex
@@ -131,13 +141,21 @@ Codex: `codex:context-update` IPC `{tabId, sessionId, contextPct}`. **Цифра
 
 PTY-табы получают `isCommandRunning` от Workspace через OSC 133 D/B (см. `fact-terminal-core.md::OSC 133`). SDK-табы PTY не имеют — этот канал всегда возвращает `false`, и chip/right-cluster никогда не узнают что query сейчас идёт. Решение — ControlBar **локально** подписывается на `claude:busy-state` IPC (main forward'ит туда `claude-sdk:busy-state` через одну общую шину) с guard'ом `isSDKTab && data.tabId === tabId`. Полученный `sdkBusy` подаётся в `SessionActionChip` вместо `isCommandRunning` (только для SDK-режима); для PTY режима остаётся OSC-канал. Это единственный способ узнать busy-state для SDK таб'а на уровне ControlBar, не таская дополнительный prop из Workspace.
 
-## Right cluster для SDK всегда enabled
+## Right cluster до запуска и после Stop
 
-PTY-режим: правый кластер (Provider/Model/Effort/Think) затемнён когда `!isCommandRunning` — без живого TUI slash-команды улетят в мёртвый shell и потеряются. SDK-режим: параметры применяются **аргументом** при следующем `query()` вызове (см. `fact-claude-sdk-tab.md::Effort: продуктовая таблица по модели, ultracode через settings`), не slash-командой в живой TUI. Юзер может выбрать модель/effort/think **до** первого сообщения, настройки персистятся в `Tab.sdk*` полях, в первый же submit пойдут.
+Model/Effort доступны в трёх случаях: SDK-вкладка, живой Claude/Codex PTY и
+типизированная остановленная Claude/Codex PTY-вкладка. В stopped PTY клик не
+шлёт slash-команду в shell, а сохраняет полную пару следующего запуска. Think
+для stopped Claude и `/fast` для stopped Codex остаются disabled: это live-only
+действия. Conversation-only Codex Ultra тоже нельзя сохранить как future
+default. На pristine shell правый кластер по-прежнему скрыт — до выбора типа
+агента неизвестно, к какому запуску относить настройки.
 
-Codex - узкое исключение внутри PTY: при `task_started` Model и Effort остаются доступны, потому что native `/model` явно разрешён во время task и меняет параметры будущей работы сессии. Effort не применяется «сырым» slash-command'ом; он проходит тем же picker-flow и меняет `tab.codexModel/codexEffort` только по success-result native picker, не по самому клику.
-
-Гард в коде — `const canControl = isSDKTab ? true : isCommandRunning;`. Без этого SDK таб без session_id показывал кластер с `opacity: 0.4` + `pointer-events: none`, юзер видел disabled кнопки и не мог поменять модель до отправки первого prompt'а.
+SDK-режим применяет параметры **аргументом** при следующем `query()` вызове
+(см. `fact-claude-sdk-tab.md::Effort: продуктовая таблица по модели,
+ultracode через settings`). Codex при `task_started` сохраняет отдельное узкое
+исключение: Model/Effort остаются доступны через native `/model` для следующей
+работы текущей сессии; значение меняется только после success-result picker'а.
 
 ## Visibility guards для clipboard-fork chips
 

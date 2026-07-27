@@ -42,6 +42,7 @@ import {
   planCodexSettingsControlAvailability,
   resolveCodexEffectiveSettings,
 } from '../../utils/codexEffectiveSettings.mjs';
+import { planAgentSettingsAvailability } from '../../utils/agentSettingsAvailability.mjs';
 import { applyClaudePtySetting } from '../../utils/claudePtyActions';
 
 const { ipcRenderer } = window.require('electron');
@@ -386,6 +387,8 @@ export default function ClaudeControlBar({
   const launchCwd = currentTabCwd || projectPath;
   const defaultCodexModel = useUIStore((s) => s.defaultCodexModel);
   const defaultCodexEffort = useUIStore((s) => s.defaultCodexEffort);
+  const defaultClaudeModel = useUIStore((s) => s.defaultClaudeModel);
+  const defaultClaudeEffort = useUIStore((s) => s.defaultClaudeEffort);
   const persistentCodexModel = codexTabModel || (defaultCodexModel !== 'none' ? defaultCodexModel : DEFAULT_CODEX_MODEL);
   const persistentCodexEffort = codexTabEffort || (defaultCodexEffort !== 'none' ? defaultCodexEffort : DEFAULT_CODEX_EFFORT);
   const effectiveCodexSettings = resolveCodexEffectiveSettings({
@@ -946,7 +949,13 @@ export default function ClaudeControlBar({
   }, [tabId]);
 
   // Provider state (PTY only — SDK runs directly against Anthropic).
-  const [providerState, setProviderState] = useState<{ type: string; model?: string; effort?: string }>({ type: 'anthropic' });
+  const [providerState, setProviderState] = useState<{
+    type: string;
+    model?: string;
+    effort?: string;
+    startupModel?: string;
+    startupEffort?: string;
+  }>({ type: 'anthropic' });
   const providerMemoryRef = useRef<Record<string, string | null>>({ anthropic: null, zen: 'minimax-m2.7', deepseek: 'deepseek-v4-flash' });
   useEffect(() => {
     if (isSDKTab) return;
@@ -1369,6 +1378,7 @@ export default function ClaudeControlBar({
   const updateCodexState = (state: {
     codexModel?: string;
     codexEffort?: string;
+    codexSettingsProofAt?: number;
     codexSettingsProofSessionId?: string;
   }) => {
     useWorkspaceStore.getState().updateCodexState(tabId, state);
@@ -1432,6 +1442,13 @@ export default function ClaudeControlBar({
   const isAnthropicPTY = !isSDKTab && providerState.type === 'anthropic';
   const isDeepSeekPTY = !isSDKTab && providerState.type === 'deepseek';
   const supportsKnobs = isSDKTab || isAnthropicPTY || isDeepSeekPTY || isCodex;
+  const settingsAvailability = planAgentSettingsAvailability({
+    supportsKnobs,
+    isSDKTab,
+    hasAnySession,
+    isCommandRunning,
+    commandType,
+  });
   // Codex permits `/model` while it streams. The native picker changes the
   // session setting for subsequent work; the response already in flight keeps
   // its original params. Effort uses the same native picker path, so it follows
@@ -1456,14 +1473,14 @@ export default function ClaudeControlBar({
   const codexEffortDisabled = codexControlAvailability.partialSettingDisabled;
   const codexExplicitPairDisabled = codexControlAvailability.explicitPairDisabled;
   const codexQuickDisabled = codexControlAvailability.quickDisabled;
-  const claudeQuickDisabled = !isSDKTab && (!isAnthropicPTY || !isCommandRunning);
+  const claudeQuickDisabled = !isSDKTab && !isAnthropicPTY;
   const codexFastDisabled = isCodex && !isCommandRunning;
 
   // Cache cooldown chip: Claude only (Anthropic PTY or SDK). DeepSeek/Zen have
   // no prompt cache, so the chip is meaningless there — hide entirely. Also
   // needs at least one cache-bearing turn captured this session.
   const showCacheChip = !isCodex && (isSDKTab || isAnthropicPTY) && cacheData != null;
-  const showRightCluster = supportsKnobs && (isSDKTab || hasAnySession || isCommandRunning);
+  const showRightCluster = settingsAvailability.showRightCluster;
   const isPrimaryHistoryAgent = historyIsPrimary
     && (sessionType === 'claude' || sessionType === 'codex')
     && !isSDKTab;
@@ -1525,9 +1542,21 @@ export default function ClaudeControlBar({
     && codexModel === quickCodexModel!.id
     && codexEffort === quickCodexEffort;
   const claudeCodeModels = claudeCodeSettings.models;
+  const pendingClaudeModel = isAnthropicPTY
+    ? providerState.startupModel
+    : undefined;
+  const pendingClaudeEffort = isAnthropicPTY
+    ? providerState.startupEffort
+    : undefined;
+  const fallbackClaudeModel = defaultClaudeModel !== 'none'
+    ? defaultClaudeModel
+    : 'default';
+  const fallbackClaudeEffort = defaultClaudeEffort !== 'none'
+    ? defaultClaudeEffort
+    : undefined;
 
   // Model active id
-  const lm = claudeModel?.toLowerCase() || '';
+  const lm = (pendingClaudeModel || claudeModel || fallbackClaudeModel).toLowerCase();
   const modelActiveId: string = (() => {
     if (isCodex) return codexModel;
     if (isSDKTab) return sdkModel || 'default';
@@ -1561,6 +1590,7 @@ export default function ClaudeControlBar({
     if (isCodex) return codexEffort;
     if (isSDKTab) return sdkEffort;
     if (isDeepSeekPTY) return providerState.effort || 'medium';
+    if (isAnthropicPTY) return pendingClaudeEffort || effortLocal || fallbackClaudeEffort;
     return effortLocal;
   })();
 
@@ -1932,6 +1962,33 @@ export default function ClaudeControlBar({
     }
     if (!isAnthropicPTY) return false;
 
+    if (!isCommandRunning) {
+      const actionReason = `claude-next-launch:${model}/${effort}`;
+      setLocalBusy(true, actionReason);
+      try {
+        const next = await ipcRenderer.invoke('provider:set-options', {
+          tabId,
+          startupModel: model,
+          startupEffort: effort,
+        });
+        if (!next || next.startupModel !== model || next.startupEffort !== effort) {
+          throw new Error('next-launch settings were not persisted');
+        }
+        setProviderState(next);
+        console.log('[ClaudeControlBar] next-launch settings saved tab='
+          + tabId.slice(-12) + ' model=' + model + ' effort=' + effort);
+        return true;
+      } catch (error: any) {
+        console.error('[ClaudeControlBar] next-launch settings failed:', error);
+        showToast('Не удалось сохранить настройки следующего запуска: '
+          + String(error?.message || error), 'error');
+        return false;
+      } finally {
+        setLocalBusy(false, actionReason + ':finally');
+        focusTerminal();
+      }
+    }
+
     const actionReason = `claude-${source}:${model}/${effort}`;
     const sentinelVia = source === 'quick' ? 'quick-preset' : 'model-effort';
     const modelSentinelMap = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
@@ -1996,7 +2053,13 @@ export default function ClaudeControlBar({
         focusTerminal();
         return { success: false, model, effort: null };
       }
-      updateCodexState(requestedState);
+      updateCodexState({
+        ...requestedState,
+        codexSettingsProofAt: Date.now(),
+        // This pair is intent for the next writer, not proof owned by the
+        // stopped source conversation currently bound to the tab.
+        codexSettingsProofSessionId: undefined,
+      });
       focusTerminal();
       return { success: true, model, effort };
     }
@@ -2139,6 +2202,19 @@ export default function ClaudeControlBar({
     }
     if (activeProvider.id === 'anthropic') {
       const nextModel = claudeCodeModels.find((model) => model.id === mid);
+      if (!isCommandRunning) {
+        const nextEffort = resolveClaudeEffortForModel(
+          nextModel,
+          effortActive || fallbackClaudeEffort || 'medium',
+        );
+        if (!nextEffort) {
+          showToast('Для этой модели не найден совместимый effort', 'error');
+          return;
+        }
+        const success = await applyClaudeModelAndEffort(mid, nextEffort, 'pair');
+        if (success) clearQuickClaudeToggle();
+        return;
+      }
       const nextEffort = effortLocal && !claudeEffortsForModel(nextModel).includes(effortLocal)
         ? resolveClaudeEffortForModel(nextModel, effortLocal)
         : null;
@@ -2201,6 +2277,9 @@ export default function ClaudeControlBar({
       focusTerminal();
     } else if (isDeepSeekPTY) {
       await setEffortOnDeepSeek(level);
+    } else if (!isCommandRunning) {
+      const success = await applyClaudeModelAndEffort(modelActiveId, level, 'pair');
+      if (success) clearQuickClaudeToggle();
     } else {
       await setEffortOnPTY(level);
     }
@@ -2367,6 +2446,7 @@ export default function ClaudeControlBar({
   };
 
   const toggleThink = async () => {
+    if (settingsAvailability.liveOnlyControlsDisabled) return;
     const actionReason = 'think-toggle';
     if (!beginControlAction(actionReason)) return;
     if (isSDKTab) {
@@ -3011,6 +3091,9 @@ export default function ClaudeControlBar({
         {...popupHoverProps(key)}
         getAnchorRect={() => triggerRefs.current[key]?.getBoundingClientRect() || null}
         zIndex={10050}
+        data-agent-settings-scope="tab"
+        data-session-type={sessionType}
+        data-agent-settings-popup={key}
       >
         <div style={popupCardStyle}>{children}</div>
       </CenteredUpwardPopover>,
@@ -3067,7 +3150,7 @@ export default function ClaudeControlBar({
   //                              | canSend | availability| availability|         |             |
   //   legacy PTY presentation    | -       | raw Mic / Enter / ^C     | -       | -           | -
   // terminal → History draft     | disabled| + semantic pull+clear    | disabled| -       | -           | -
-  // Right cluster Provider/Model | hidden  | enabled     | dimmed      | enabled | shimmer     | enabled
+  // Right cluster Provider/Model | enabled | enabled     | enabled     | enabled | shimmer     | enabled
   //   /Effort/Think              |         |             |             |         |             |
   //
   // 1) Claude-F / SDK / SDK-F / Codex / Codex-F появляются ТОЛЬКО когда нет сохранённой сессии И нет
@@ -3739,11 +3822,10 @@ export default function ClaudeControlBar({
           • PTY new: нет sessionId и нет живого процесса → кластер скрыт целиком,
             чтобы новая вкладка не показывала дефолтные Claude-модели перед выбором
             Claude/Codex.
-          • PTY idle with session: !isCommandRunning → opacity 0.4. Provider/Model/Effort/Think
-            применяются slash-командами в живой TUI; когда процесс убит, БД
-            хранит session row, но TUI нет — команды улетят в мёртвый shell
-            и потеряются. SessionActionChip справа от этого кластера
-            ориентируется на тот же сигнал (показывает Continue вместо Stop).
+          • PTY stopped/new with a selected Claude/Codex type: Model/Effort
+            remain enabled and save a complete pair for the next launch.
+            Think and Codex /fast stay disabled because they require a live TUI.
+            SessionActionChip справа показывает Start/Continue.
           • SDK: **всегда enabled**. SDK таб не имеет PTY — model/effort/
             think применяются параметром при следующем `query()` вызове
             (см. fact-claude-sdk-tab.md). Юзер может выбрать модель ДО
@@ -3758,18 +3840,20 @@ export default function ClaudeControlBar({
             `/fast` — отдельная live-команда, которую Codex не принимает во
             время streaming, поэтому она disabled до завершения turn. */}
       {showRightCluster && (() => {
-        const canControl = isSDKTab ? true : isCommandRunning;
+        const canControl = settingsAvailability.modelEffortInteractive;
         const modelOptions = isCodex ? visibleCodexModels : (isSDKTab || isAnthropicPTY) ? visibleClaudeModels : activeProvider.models;
         const supportsModelEffortPair = isCodex || isSDKTab || (sessionType === 'claude' && isAnthropicPTY);
         return (
         <div
           className={isLocalBusy ? 'control-bar-busy-overlay' : undefined}
+          data-agent-settings-scope="tab"
+          data-session-type={sessionType}
           style={{
             position: 'relative',
             display: 'flex',
             alignItems: 'center',
             gap: 6,
-            pointerEvents: (isBusy || !canControl) ? 'none' : 'auto',
+            pointerEvents: isBusy ? 'none' : 'auto',
             opacity: !canControl ? 0.4 : 1,
             transition: 'opacity 0.15s',
           }}
@@ -3856,10 +3940,10 @@ export default function ClaudeControlBar({
                   ? (quickPresetIsCodex
                     ? (isCommandRunning
                       ? 'Быстрое переключение станет доступно после подтверждения текущих model и effort'
-                      : 'Быстрое переключение доступно только при живом Codex')
+                      : 'Выберите обычные model и effort для следующего запуска Codex')
                     : (isCommandRunning
                       ? 'Быстрое переключение доступно только для Claude'
-                      : 'Быстрое переключение станет доступно после запуска Claude'))
+                      : 'Выберите обычные model и effort для следующего запуска Claude'))
                   : !hasQuickPreset
                     ? 'Задайте модель и effort для быстрого переключения в Настройках'
                     : quickPresetApplied && quickPresetMatchesCurrent
@@ -3903,6 +3987,8 @@ export default function ClaudeControlBar({
           <div style={{ position: 'relative' }}>
             <button
               {...triggerProps('model')}
+              data-agent-setting-trigger="model"
+              data-setting-value={modelActiveId}
               disabled={codexModelMenuDisabled}
               style={{
                 ...triggerStyle,
@@ -3918,7 +4004,7 @@ export default function ClaudeControlBar({
                 } : {}),
               }}
               title={codexModelMenuDisabled
-                ? 'Model доступен только при живом Codex'
+                ? 'Model пока недоступен'
                 : codexModelDisabled
                   ? 'Текущая пара не подтверждена: наведите на модель и выберите model + effort вместе'
                 : codexTurnBusy
@@ -3937,6 +4023,9 @@ export default function ClaudeControlBar({
                     return (
                       <button
                         key={model.id}
+                        data-agent-setting-option="model"
+                        data-setting-value={model.id}
+                        aria-pressed={active}
                         disabled={isCodex && codexModelMenuDisabled}
                         aria-disabled={modelPairDisabled}
                         style={pillStyle(active, modelPairDisabled)}
@@ -3959,6 +4048,9 @@ export default function ClaudeControlBar({
                 return (
                   <button
                     key={model.id}
+                    data-agent-setting-option="model"
+                    data-setting-value={model.id}
+                    aria-pressed={active}
                     disabled={codexModelDisabled}
                     style={pillStyle(active, codexModelDisabled)}
                     onClick={() => pickModel(model.id)}
@@ -3982,6 +4074,10 @@ export default function ClaudeControlBar({
                   horizontalAlign="end"
                   gap={4}
                   zIndex={10055}
+                  data-agent-settings-scope="tab"
+                  data-session-type={sessionType}
+                  data-agent-settings-popup="model-effort"
+                  data-model-value={hoveredModel.id}
                   style={{ width: 'max-content' }}
                   onMouseEnter={() => setHoveredPopup('model')}
                   onMouseLeave={(event) => {
@@ -4014,20 +4110,30 @@ export default function ClaudeControlBar({
                       whiteSpace: 'nowrap',
                     }}
                   >
-                    {hoveredEfforts.map((effort) => (
-                      <button
-                        key={effort}
-                        type="button"
-                        disabled={modelEffortPairDisabled}
-                        onClick={() => isCodex
-                          ? pickCodexModelEffort(hoveredModel.id, effort)
-                          : pickClaudeModelEffort(hoveredModel.id, effort)}
-                        style={pillStyle(hoveredModel.id === modelActiveId && effort === effortActive, modelEffortPairDisabled)}
-                        title={`Выбрать ${hoveredModel.label} / ${effort}`}
-                      >
-                        {effort === 'medium' ? 'med' : effort === 'xhigh' ? 'xhi' : effort}
-                      </button>
-                    ))}
+                    {hoveredEfforts.map((effort) => {
+                      const stoppedUltra = isCodex && !isCommandRunning && effort === 'ultra';
+                      const disabled = modelEffortPairDisabled || stoppedUltra;
+                      return (
+                        <button
+                          key={effort}
+                          type="button"
+                          data-agent-setting-option="model-effort"
+                          data-model-value={hoveredModel.id}
+                          data-effort-value={effort}
+                          aria-pressed={hoveredModel.id === modelActiveId && effort === effortActive}
+                          disabled={disabled}
+                          onClick={() => isCodex
+                            ? pickCodexModelEffort(hoveredModel.id, effort)
+                            : pickClaudeModelEffort(hoveredModel.id, effort)}
+                          style={pillStyle(hoveredModel.id === modelActiveId && effort === effortActive, disabled)}
+                          title={stoppedUltra
+                            ? 'Ultra можно включить только в живой сессии Codex'
+                            : `Выбрать ${hoveredModel.label} / ${effort}`}
+                        >
+                          {effort === 'medium' ? 'med' : effort === 'xhigh' ? 'xhi' : effort}
+                        </button>
+                      );
+                    })}
                   </div>
                 </CenteredUpwardPopover>,
                 document.body,
@@ -4048,6 +4154,7 @@ export default function ClaudeControlBar({
             disabled={codexEffortDisabled}
           >
           <div
+            data-agent-setting-group="effort"
             style={{
               display: 'inline-flex',
               alignItems: 'center',
@@ -4071,27 +4178,31 @@ export default function ClaudeControlBar({
                   ? 'ultra — максимальное размышление и проактивная работа с несколькими агентами; расход может быстро вырасти.'
                   : 'ultracode — xhigh + авто dynamic-workflows на всю сессию (Claude сам решает когда запускать workflow). Дорого по токенам; сбрасывается в начале новой сессии.'
                 : level;
+              const stoppedCodexUltra = isCodex && !isCommandRunning && level === 'ultra';
+              const effortChoiceDisabled = codexEffortDisabled || stoppedCodexUltra;
               // ultracode pill: purple accent (matches workflow chip), separated
               // from the plain levels by a thin divider so it reads as a mode.
-              const ultraStyle = isUltra ? {
-                ...pillStyle(active, false),
-                ...(active
-                  ? { backgroundColor: '#7c5cd6', borderColor: '#a78bfa', color: '#fff' }
-                  : { color: '#a78bfa', borderColor: 'rgba(167,139,250,0.4)' }),
-              } : pillStyle(active, false);
               return (
                 <React.Fragment key={level}>
                   {isUltra && <span aria-hidden style={{ width: 1, alignSelf: 'stretch', background: 'rgba(255,255,255,0.12)', margin: '2px 2px' }} />}
                   <button
-                    disabled={codexEffortDisabled}
+                    data-agent-setting-option="effort"
+                    data-setting-value={level}
+                    aria-pressed={active}
+                    disabled={effortChoiceDisabled}
                     style={isUltra ? {
-                      ...ultraStyle,
-                      ...(codexEffortDisabled ? { color: '#555', backgroundColor: '#222', borderColor: 'rgba(255,255,255,0.08)', cursor: 'not-allowed' } : {}),
+                      ...pillStyle(active, effortChoiceDisabled),
+                      ...(active
+                        ? { backgroundColor: '#7c5cd6', borderColor: '#a78bfa', color: '#fff' }
+                        : { color: '#a78bfa', borderColor: 'rgba(167,139,250,0.4)' }),
+                      ...(effortChoiceDisabled ? { color: '#555', backgroundColor: '#222', borderColor: 'rgba(255,255,255,0.08)', cursor: 'not-allowed' } : {}),
                     } : {
-                      ...pillStyle(active, codexEffortDisabled),
-                      ...(codexEffortDisabled ? { color: '#555', backgroundColor: '#222', cursor: 'not-allowed' } : {}),
+                      ...pillStyle(active, effortChoiceDisabled),
+                      ...(effortChoiceDisabled ? { color: '#555', backgroundColor: '#222', cursor: 'not-allowed' } : {}),
                     }}
-                    title={title}
+                    title={stoppedCodexUltra
+                      ? 'Ultra можно включить только в живой сессии Codex'
+                      : title}
                     onClick={() => pickEffort(level)}
                   >{label}</button>
                 </React.Fragment>
@@ -4140,16 +4251,29 @@ export default function ClaudeControlBar({
 
 	          {/* Think — single toggle, no dropdown */}
           {!isDeepSeekPTY && !isCodex && (
-            <ControlHint label={thinkActive ? 'Выключить Think' : 'Включить Think'}>
+            <ControlHint
+              label={settingsAvailability.liveOnlyControlsDisabled
+                ? 'Think доступен после запуска Claude'
+                : (thinkActive ? 'Выключить Think' : 'Включить Think')}
+              disabled={settingsAvailability.liveOnlyControlsDisabled}
+            >
             <button
+              disabled={settingsAvailability.liveOnlyControlsDisabled}
               style={{
                 ...triggerStyle,
-                color: thinkActive ? '#fff' : '#888',
-                borderColor: thinkActive ? '#DA7756' : 'rgba(255,255,255,0.08)',
-                backgroundColor: thinkActive ? 'rgba(218,119,86,0.18)' : 'transparent',
+                color: settingsAvailability.liveOnlyControlsDisabled ? '#555' : (thinkActive ? '#fff' : '#888'),
+                borderColor: settingsAvailability.liveOnlyControlsDisabled
+                  ? 'rgba(255,255,255,0.08)'
+                  : (thinkActive ? '#DA7756' : 'rgba(255,255,255,0.08)'),
+                backgroundColor: settingsAvailability.liveOnlyControlsDisabled
+                  ? '#222'
+                  : (thinkActive ? 'rgba(218,119,86,0.18)' : 'transparent'),
+                cursor: settingsAvailability.liveOnlyControlsDisabled ? 'not-allowed' : triggerStyle.cursor,
               }}
               onClick={toggleThink}
-              title="Think mode"
+              title={settingsAvailability.liveOnlyControlsDisabled
+                ? 'Think доступен после запуска Claude'
+                : 'Think mode'}
             >
               Think
             </button>

@@ -294,18 +294,34 @@ Resume/Fork launch generation несёт явный session intent: сначал
 последние подтверждённые значения активной ветки именно этой сессии, а defaults
 заполняют только отсутствующие поля. Ошибка чтения существующей сессии означает
 `unknown`: startup не инжектит defaults поверх неизвестного состояния Claude.
+Полная пара, которую пользователь выбрал в ControlBar на остановленной вкладке,
+является явным next-launch intent и имеет приоритет над обоими источниками.
+Она остаётся durable после failed/superseded launch и удаляется только после
+`ready` того же поколения, доказавшего и `/model`, и `/effort`.
 
 ```
 Claude рисует prompt-символ ⏵ в PTY → main эмитит claude:tui-ready (~0.8с после старта)
 → main открывает/присоединяет одну транзакцию по launch generation
 → main получает session settings из активной JSONL-ветки или SQLite defaults для fresh/пустых полей
+→ транзакция ждёт устойчивый composer-frame того же generation: после последнего startup redraw наступила output-silence граница
 → если model ≠ 'none': main шлёт /model <value>, при необходимости подтверждает текущий picker
 → ждёт прямую JSONL-пару wrapper → local-command stdout
 → затем так же применяет /effort <value>
 → main публикует durable gate; renderer только отображает его
+→ Project API/Terminal MCP получают отдельный readiness-change и завершают start wait
 ```
 
-`claude:tui-ready` эмитится из того же места `main.js`, где Handshake детектит prompt-символ (`stripVTControlCharacters(data).includes('⏵' | '>')` в state `WAITING_PROMPT`). Это момент когда Claude **готов принять ввод**, а не просто «процесс жив». Принцип «liveness ≠ readiness, бери ранний сигнал» — `methodology/переносимый-дизайн.md::Liveness ≠ readiness`.
+`claude:tui-ready` эмитится из того же места `main.js`, где Handshake впервые
+детектит prompt-символ (`⏵` или `>`). Это ранний readiness-input: он доказывает,
+что startup TUI дошёл до composer-фазы, но ещё не разрешает первый paste. Claude
+может продолжать перерисовывать autocomplete/footer, и Enter, отправленный в это
+окно, останется текстом в composer. Поэтому первый `/model` ждёт отдельный
+generation-scoped stable-frame: существующий output-silence debounce сбрасывается
+каждым новым PTY chunk и закрывается только после последней перерисовки. Это не
+фиксированное ожидание готовности — разрешение приходит от фактического окончания
+потока redraw. Шрам 2026-07-27: Project API C2 увидел `⏵`, сразу вставил
+`/model haiku`, а финальный startup redraw пришёл ещё примерно через 0,9с;
+команда осталась в поле и транзакция корректно завершилась `unresolved`.
 
 **Владелец транзакции — Electron main, не Terminal renderer.** И
 `tui-ready`, и `process-started` напрямую входят в один
@@ -316,7 +332,23 @@ send/prove/retry-кода. Это принципиально: скрытие His
 
 Start/resume и последовательное применение `/model`/`/effort` показываются той же компактной lifecycle-плашкой, что запуск Codex: без backdrop и без захвата focus у терминала. Видимое TUI-подтверждение остаётся доступным для ручного управления, но сама плашка держится до authoritative ready или явной ошибки — наличие меню под ней не завершает startup gate.
 
-**Bridge:Fresh (`claude:process-started`) — второй readiness-input, не второй initiator и не proof настройки.** Раньше инжект и завершение `/model` зависели от bridge, но свежий Claude TUI готов принять slash-команду раньше появления bridge-файла, а Effort bridge вообще не содержит. Если `⏵` не распарсился, новый PID может открыть ту же main-транзакцию; если `tui-ready` уже открыл её, process-started только join'ится. Применённость обоих settings доказывает только JSONL stdout своей команды.
+**Bridge:Fresh (`claude:process-started`) — второй readiness-input, не второй initiator и не proof настройки.** Раньше инжект и завершение `/model` зависели от bridge, но свежий Claude TUI показывает первый prompt раньше появления bridge-файла, а Effort bridge вообще не содержит. Если `⏵` не распарсился, новый PID может открыть ту же main-транзакцию; если `tui-ready` уже открыл её, process-started только join'ится. Ни один из этих двух сигналов не обходит stable-frame перед первым вводом. Применённость обоих settings доказывает только JSONL stdout своей команды.
+
+Если launch одновременно несёт первый пользовательский prompt, он остаётся в
+очереди того же поколения до `startup gate = ready`. Stable-frame разрешает
+служебную последовательность `/model` → `/effort`, но не пользовательский текст;
+текст отправляется только после доказательства обеих настроек. При actionable
+startup failure prompt сохраняется и уходит после успешного ручного Retry, а при
+смене поколения старый dispatcher теряет ownership.
+
+**Raw TUI ready не равен внешней готовности ввода.** До gate-ready main
+публикует `starting/inputReady=false`. Project API и Terminal MCP подписаны не
+только на первый TUI edge, но и на последующее main-side изменение readiness;
+повторная проверка также читает main-owned gate, а не его возможную запоздалую
+проекцию в renderer. Поэтому они не застревают на однажды прочитанном `pending`
+и не возвращают успех до завершения startup settings. Failure той же
+транзакции будит waiter сразу и возвращает явную ошибку вместо ожидания
+watchdog timeout.
 
 **`/model` completion barrier — JSONL local-command stdout, не return из paste и не bridge-update.** Return из отправки доказывает только доставку Enter. Следующий `/effort` разрешён после прямого stdout-ребёнка wrapper'а `/model`; поэтому поздний `Switch model?` не проглатывает effort, а изменение модели через терминал и UI получает один и тот же proof.
 

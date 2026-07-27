@@ -138,6 +138,65 @@ test('keeps edit-range replacement behavior while sharing the range rewrite plan
   ]);
 });
 
+test('plans a Codex fork from only the latest compact snapshot and its visible tail', () => {
+  const records = rangeFixture();
+  const before = JSON.stringify(records);
+  const plan = _api.planCodexForkFromLatestCompact(records, 'source-session');
+
+  assert.equal(plan.success, true);
+  assert.equal(plan.outputRecords[0].type, 'session_meta');
+  assert.equal(plan.outputRecords[1].type, 'compacted');
+  assert.equal(plan.outputRecords[1].timestamp, '2026-07-13T10:00:08.000Z');
+  assert.deepEqual(userTexts(plan.outputRecords), ['turn three']);
+  assert.equal(plan.outputRecords.some((entry) => entry.payload?.message === 'turn zero'), false);
+  assert.equal(plan.outputRecords.some((entry) => entry.payload?.message === 'turn one'), false);
+  assert.equal(plan.outputRecords.some((entry) => entry.payload?.message === 'turn two'), false);
+  assert.equal(JSON.stringify(records), before);
+});
+
+test('rewrites both Codex rollout identity aliases for an edited compact fork', () => {
+  const records = rangeFixture();
+  records[0].payload.session_id = 'source-session';
+  const before = JSON.stringify(records);
+  const plan = _api.planCodexForkFromLatestCompact(records, 'source-session');
+  const childSessionId = 'child-session';
+  const childTimestamp = '2026-07-27T08:15:00.000Z';
+
+  _api.rewriteCodexEditedForkMetadata(
+    records,
+    'source-session',
+    '/tmp/child-project',
+    plan.outputRecords,
+    childSessionId,
+    childTimestamp,
+  );
+
+  assert.deepEqual(plan.outputRecords[0], {
+    type: 'session_meta',
+    payload: {
+      id: childSessionId,
+      session_id: childSessionId,
+      cwd: '/tmp/child-project',
+      timestamp: childTimestamp,
+      forked_from_id: 'source-session',
+      source: 'cli',
+      thread_source: 'user',
+    },
+    timestamp: childTimestamp,
+  });
+  assert.equal(JSON.stringify(records), before, 'source metadata must remain unchanged');
+});
+
+test('Codex compact fork planner fails explicitly when no compact snapshot exists', () => {
+  const records = rangeFixture().filter((entry) => entry.type !== 'compacted');
+  const plan = _api.planCodexForkFromLatestCompact(records, 'source-session');
+  assert.deepEqual(plan, {
+    success: false,
+    reason: 'no-compact',
+    error: 'В этой Codex-сессии ещё нет сжатия контекста',
+  });
+});
+
 test('writes large rewritten rollouts in valid JSONL chunks and keeps exclusive ownership', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-range-rewrite-'));
   t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));

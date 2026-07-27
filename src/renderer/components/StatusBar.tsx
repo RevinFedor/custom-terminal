@@ -657,6 +657,9 @@ function EngineDefaultsSelector({
     <>
       <button
         ref={chipRef}
+        data-agent-settings-scope="global"
+        data-session-type={engine.toLowerCase()}
+        data-agent-setting-trigger="defaults"
         onClick={() => setClicked(!clicked)}
         onMouseEnter={() => setChipHover(true)}
         onMouseLeave={() => setChipHover(false)}
@@ -761,6 +764,9 @@ function EngineDefaultsPopup({
   return (
     <CenteredUpwardPopover
       ref={popupRef}
+      data-agent-settings-scope="global"
+      data-session-type={engine.toLowerCase()}
+      data-agent-settings-popup="defaults"
       onMouseEnter={onPopupEnter}
       onMouseLeave={onPopupLeave}
       getAnchorRect={() => chipRef.current?.getBoundingClientRect() || null}
@@ -844,6 +850,9 @@ function EngineOptionRow<T>({
           return (
             <button
               key={key}
+              data-agent-setting-option={label.toLowerCase()}
+              data-setting-value={key}
+              aria-pressed={isActive}
               onClick={() => onSelect(option)}
               className="text-[10px] px-1.5 py-1 rounded cursor-pointer"
               style={{

@@ -95,10 +95,30 @@ function planCodexCommandLaunchSettings({
   command = 'codex',
   model = null,
   effort = null,
+  preferRequestedSettings = false,
   sourceSettingsStatus = 'absent',
   sourceModel = null,
   sourceEffort = null,
 } = {}) {
+  if (command === 'codex-c' && preferRequestedSettings === true) {
+    const requestedModel = typeof model === 'string' ? model.trim() : '';
+    const requestedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+    if (!requestedModel || !requestedEffort || requestedEffort === 'ultra') {
+      return {
+        allowed: false,
+        error: requestedEffort === 'ultra'
+          ? 'codex_resume_intent_ultra_not_persistent'
+          : 'codex_resume_intent_settings_incomplete',
+        settingsSource: 'resume-tab-intent',
+      };
+    }
+    return {
+      allowed: true,
+      model: requestedModel,
+      effort: requestedEffort,
+      settingsSource: 'resume-tab-intent',
+    };
+  }
   if (command === 'codex-c' || command === 'codex-f') {
     const sourceKind = command === 'codex-c' ? 'resume' : 'fork';
     if (sourceSettingsStatus !== 'found' || !sourceModel || !sourceEffort) {
@@ -126,6 +146,44 @@ function planCodexCommandLaunchSettings({
     settingsSource: normalizedEffort === 'ultra'
       ? 'new-thread-without-conversation-only-effort'
       : 'persistent-fallback',
+  };
+}
+
+function verifyCodexNextLaunchSettings({
+  settingsIntent = null,
+  requestedModel = null,
+  requestedEffort = null,
+  composerModel = null,
+  composerEffort = null,
+} = {}) {
+  if (settingsIntent !== 'next-launch') {
+    return { required: false, matches: true, error: null };
+  }
+  const requested = {
+    model: String(requestedModel || '').trim(),
+    effort: String(requestedEffort || '').trim().toLowerCase(),
+  };
+  const observed = {
+    model: String(composerModel || '').trim(),
+    effort: String(composerEffort || '').trim().toLowerCase(),
+  };
+  if (!requested.model || !requested.effort || !observed.model || !observed.effort) {
+    return {
+      required: true,
+      matches: false,
+      error: 'codex_next_launch_settings_unproven',
+      requested,
+      observed,
+    };
+  }
+  const matches = requested.model === observed.model
+    && requested.effort === observed.effort;
+  return {
+    required: true,
+    matches,
+    error: matches ? null : 'codex_next_launch_settings_mismatch',
+    requested,
+    observed,
   };
 }
 
@@ -578,4 +636,5 @@ module.exports = {
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
   validateCodexPtySubmitAdmission,
+  verifyCodexNextLaunchSettings,
 };

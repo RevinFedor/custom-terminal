@@ -151,11 +151,63 @@ function partitionCodexPendingPromptAuditsForRetention(
   return { retained, evicted };
 }
 
+// A provisional Resume watcher intentionally withholds normal lifecycle
+// processing until writer ownership is proven. The first post-Enter
+// user_message is itself part of that proof, so it needs a narrow parser that
+// can inspect only audit records without publishing busy/history state. Keep a
+// separate partial buffer from the normal turn parser: once ownership is
+// accepted, the held byte range is replayed through the full parser.
+function consumeCodexUserMessageAuditChunk({
+  chunk = '',
+  incomingStartOffset = 0,
+  partial = '',
+  partialStartOffset = null,
+} = {}) {
+  const incoming = Buffer.from(String(chunk || ''), 'utf8');
+  const carried = Buffer.from(String(partial || ''), 'utf8');
+  const combined = carried.length > 0
+    ? Buffer.concat([carried, incoming])
+    : incoming;
+  const combinedStartOffset = carried.length > 0 && Number.isFinite(partialStartOffset)
+    ? Number(partialStartOffset)
+    : Math.max(0, Number(incomingStartOffset) || 0);
+  const records = [];
+  let lineStart = 0;
+  let newlineIndex = combined.indexOf(0x0a, lineStart);
+  while (newlineIndex >= 0) {
+    const text = combined.subarray(lineStart, newlineIndex).toString('utf8').trim();
+    if (text) {
+      try {
+        const record = JSON.parse(text);
+        if (record?.type === 'event_msg' && record?.payload?.type === 'user_message') {
+          records.push({
+            record,
+            byteOffset: combinedStartOffset + lineStart,
+          });
+        }
+      } catch {
+        // A complete newline-delimited record that does not parse is not
+        // delivery proof. The full watcher owns diagnostics for malformed
+        // rollout rows; this narrow reader only extracts positive evidence.
+      }
+    }
+    lineStart = newlineIndex + 1;
+    newlineIndex = combined.indexOf(0x0a, lineStart);
+  }
+  const remaining = combined.subarray(lineStart);
+  return {
+    records,
+    partial: remaining.toString('utf8'),
+    partialStartOffset: combinedStartOffset + lineStart,
+  };
+}
+
 module.exports = {
   codexAuditRecordIsAfterBoundary,
   codexCanonicalUserMessageMatch,
   codexPromptHasImageMarker,
   collectCodexPayloadImagePaths,
+  consumeCodexUserMessageAuditChunk,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
   selectCodexPendingPromptAudit,

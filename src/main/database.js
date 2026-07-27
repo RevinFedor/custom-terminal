@@ -12,6 +12,10 @@ const {
   redoTaskPlan,
   chooseNewestTaskPlan,
 } = require('./tab-task-plan');
+const {
+  normalizeForkMarkerEntryUuids,
+  parseForkMarkerEntryUuidsJson,
+} = require('./fork-marker-snapshot');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const INBOX_PROJECT_NAME = 'Inbox';
 const INBOX_PROJECT_DESCRIPTION = 'System workspace for API-created and unassigned agent tabs.';
@@ -2692,6 +2696,18 @@ class DatabaseManager {
       for (const r of rows) cacheStatsSnapshot.set(r.tab_id, r.cache_stats);
     }
 
+    // Provider state is main-owned and point-written before the IPC call that
+    // changed it resolves. A subsequent renderer action (for example Start,
+    // which sets command_type) can immediately trigger a full save carrying
+    // the older tab projection. Preserve the row value for existing tabs so
+    // that unrelated saves cannot erase a just-selected next-launch pair or
+    // resurrect one that main already consumed after a proven startup.
+    const providerStateSnapshot = new Map();
+    {
+      const rows = this.db.prepare('SELECT tab_id, provider_state FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL').all(projectId);
+      for (const r of rows) providerStateSnapshot.set(r.tab_id, r.provider_state);
+    }
+
     // Task-plan writes can arrive directly from Terminal MCP while the renderer
     // still holds an older tab snapshot. Keep the document with the highest
     // revision so an unrelated rename/save cannot roll an MCP edit back.
@@ -2788,12 +2804,17 @@ class DatabaseManager {
           : null;
         // providerState: serialize only if non-default (anthropic, no model/effort/thinking).
         // Default state == NULL — saves space and aligns with "fresh tab" semantics.
-        const providerStateJson = tab.providerState && (
+        const incomingProviderStateJson = tab.providerState && (
           tab.providerState.type !== 'anthropic' ||
           tab.providerState.model ||
           tab.providerState.effort ||
-          tab.providerState.thinking
+          tab.providerState.thinking ||
+          tab.providerState.startupModel ||
+          tab.providerState.startupEffort
         ) ? JSON.stringify(tab.providerState) : null;
+        const providerStateJson = providerStateSnapshot.has(tab.tabId)
+          ? providerStateSnapshot.get(tab.tabId)
+          : incomingProviderStateJson;
         const externalRunJson = tab.externalRun && typeof tab.externalRun === 'object'
           ? JSON.stringify(tab.externalRun)
           : null;
@@ -4497,12 +4518,16 @@ class DatabaseManager {
       // eliminating false boundaries. Inherited markers would only cause wrong blue stripes.
 
       // Add the new fork marker
-      const entryUuidsJson = JSON.stringify(entryUuids || []);
+      const normalizedEntryUuids = normalizeForkMarkerEntryUuids(entryUuids);
+      if (!Array.isArray(entryUuids)) {
+        console.warn('[DB] Fork marker snapshot rejected non-array value; saving empty boundary');
+      }
+      const entryUuidsJson = JSON.stringify(normalizedEntryUuids);
       this.db.prepare(`
         INSERT OR REPLACE INTO fork_markers (source_session_id, forked_to_session_id, entry_uuids_json)
         VALUES (?, ?, ?)
       `).run(sourceSessionId, forkedToSessionId, entryUuidsJson);
-      console.log('[DB] Fork marker saved:', { sourceSessionId, forkedToSessionId, entryCount: entryUuids?.length || 0 });
+      console.log('[DB] Fork marker saved:', { sourceSessionId, forkedToSessionId, entryCount: normalizedEntryUuids.length });
 
       // Invalidate cache for both endpoints so the next Timeline read sees the new marker.
       this.invalidateForkMarkerCache(sourceSessionId);
@@ -4577,7 +4602,7 @@ class DatabaseManager {
     const markers = rows.map(row => ({
       source_session_id: row.source_session_id,
       fork_session_id: row.forked_to_session_id,
-      entry_uuids: JSON.parse(row.entry_uuids_json || '[]'),
+      entry_uuids: parseForkMarkerEntryUuidsJson(row.entry_uuids_json),
       created_at: row.created_at,
       hidden: !!row.hidden
     }));

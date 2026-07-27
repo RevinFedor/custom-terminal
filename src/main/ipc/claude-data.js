@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const readline = require('node:readline');
 const { performance: nodePerformance } = require('node:perf_hooks');
 const {
   dehydrateHistoryEntries,
@@ -1181,9 +1182,9 @@ function resolveLatestSessionInChain(sessionId, cwd) {
 // ========== TIMELINE PARSER FUNCTION ==========
 // Shared function to parse Timeline entries from JSONL file using Backtrace algorithm
 // Returns array of entry UUIDs in display order (for fork marker snapshot)
-function parseTimelineUuids(sourcePath) {
+async function parseTimelineUuids(sourcePath) {
   try {
-    const content = fs.readFileSync(sourcePath, 'utf-8');
+    const content = await fs.promises.readFile(sourcePath, 'utf-8');
     const lines = content.trim().split('\n').filter(line => line.trim());
 
     const recordMap = new Map();
@@ -1305,6 +1306,127 @@ function parseTimelineUuids(sourcePath) {
   } catch (e) {
     console.error('[parseTimelineUuids] Error:', e.message);
     return [];
+  }
+}
+
+function isClaudeCompactBoundaryRecord(record) {
+  return record?.type === 'system' && record?.subtype === 'compact_boundary';
+}
+
+async function inspectClaudeForkSource(sourcePath) {
+  const input = fs.createReadStream(sourcePath, { encoding: 'utf8' });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  let lineCount = 0;
+  let nonEmptyLineCount = 0;
+  let lastCompactLineIndex = -1;
+  try {
+    for await (const line of lines) {
+      const lineIndex = lineCount;
+      lineCount += 1;
+      if (!line.trim()) continue;
+      nonEmptyLineCount += 1;
+      try {
+        if (isClaudeCompactBoundaryRecord(JSON.parse(line))) {
+          lastCompactLineIndex = lineIndex;
+        }
+      } catch {
+        // Preserve malformed/non-JSON rows during an ordinary fork. They are
+        // not positive proof of a compact boundary.
+      }
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+  return { lineCount, nonEmptyLineCount, lastCompactLineIndex };
+}
+
+async function writeClaudeForkJsonlExclusive({
+  sourcePath,
+  destPath,
+  newSessionId,
+  startLine = 0,
+}) {
+  let output = null;
+  let created = false;
+  let input = null;
+  let lines = null;
+  try {
+    output = await fs.promises.open(destPath, 'wx');
+    created = true;
+    input = fs.createReadStream(sourcePath, { encoding: 'utf8' });
+    lines = readline.createInterface({ input, crlfDelay: Infinity });
+    let lineIndex = 0;
+    let retainedLineCount = 0;
+    let retainedRecordCount = 0;
+    let compactRootRelinked = false;
+    const retainedUuids = [];
+    let chunk = '';
+    let chunkBytes = 0;
+    const flush = async () => {
+      if (!output || !chunk) return;
+      await output.appendFile(chunk, 'utf8');
+      chunk = '';
+      chunkBytes = 0;
+    };
+
+    for await (const rawLine of lines) {
+      const currentLine = lineIndex;
+      lineIndex += 1;
+      if (currentLine < startLine) continue;
+
+      let line = rawLine;
+      if (rawLine.trim()) {
+        retainedRecordCount += 1;
+        try {
+          const record = JSON.parse(rawLine);
+          // A compact fork starts a brand-new self-contained JSONL at the
+          // retained boundary. Claude's source boundary keeps a
+          // logicalParentUuid into the deliberately removed prefix; carrying
+          // that pointer into the child makes every backtrace report a false
+          // chain gap. The retained boundary is the child's real root.
+          if (
+            startLine > 0
+            && currentLine === startLine
+            && isClaudeCompactBoundaryRecord(record)
+          ) {
+            record.parentUuid = null;
+            record.logicalParentUuid = null;
+            compactRootRelinked = true;
+          }
+          if (record.sessionId) record.sessionId = newSessionId;
+          if (record.uuid) retainedUuids.push(record.uuid);
+          line = JSON.stringify(record);
+        } catch {
+          // Keep a non-JSON line byte-for-byte apart from the normalized JSONL
+          // newline. A bad row must not make an ordinary fork silently lose
+          // surrounding valid history.
+        }
+      }
+      retainedLineCount += 1;
+      const serialized = line + '\n';
+      const bytes = Buffer.byteLength(serialized);
+      if (chunkBytes > 0 && chunkBytes + bytes > 1024 * 1024) await flush();
+      if (bytes >= 1024 * 1024) await output.appendFile(serialized, 'utf8');
+      else {
+        chunk += serialized;
+        chunkBytes += bytes;
+      }
+    }
+    await flush();
+    if (retainedRecordCount === 0) {
+      throw new Error('Claude fork contains no retained records');
+    }
+    await output.close();
+    output = null;
+    return { retainedLineCount, retainedRecordCount, retainedUuids, compactRootRelinked };
+  } catch (error) {
+    if (output) await output.close().catch(() => {});
+    if (created) await fs.promises.unlink(destPath).catch(() => {});
+    throw error;
+  } finally {
+    lines?.close();
+    input?.destroy();
   }
 }
 
@@ -1592,7 +1714,7 @@ function deriveClaudeAsyncAgentStatus(notification) {
 // implementation that IPC uses, without going through ipcMain.
 // Each entry is the raw async function with payload argument (no `event`).
 const _api = {
-  forkSessionFile: null,   // ({sourceSessionId, cwd, skipChainResolve?}) → {success, newSessionId, forkEntryCount}
+  forkSessionFile: null,   // ({sourceSessionId, cwd, skipChainResolve?, fromLatestCompact?}) → {success, newSessionId, forkEntryCount}
   editRange: null,         // ({sessionId, cwd, startUuid, endUuid, compactText}) → {success, removedCount, ...}
   deleteRange: null,       // ({sessionId, cwd, startUuid, endUuid}) → {success, removedCount, fileDeleted}
   getConfirmedSettings: null, // ({tabId, sessionId?, cwd?}) → active-branch model/effort proof
@@ -1607,6 +1729,8 @@ const _api = {
   clearJsonlCache: clearClaudeJsonlCache,
   getJsonlCacheStats: getClaudeJsonlCacheStats,
   resetJsonlCacheForTests: resetClaudeJsonlCacheForTests,
+  inspectClaudeForkSource,
+  writeClaudeForkJsonlExclusive,
 };
 
 // Stash-miss recovery for dehydrated Claude payloads. Payload identity is
@@ -2513,9 +2637,9 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
 
   // Fork Claude session file: copy .jsonl with new UUID
   // Searches ALL project directories under ~/.claude/projects/ to find the session file
-  _api.forkSessionFile = async function ({ sourceSessionId, cwd, skipChainResolve }) {
+  _api.forkSessionFile = async function ({ sourceSessionId, cwd, skipChainResolve, fromLatestCompact = false }) {
     console.log('[Claude Fork] ========================================');
-    console.log('[Claude Fork] Requested source session:', sourceSessionId, 'skipChainResolve:', !!skipChainResolve);
+    console.log('[Claude Fork] Requested source session:', sourceSessionId, 'skipChainResolve:', !!skipChainResolve, 'fromLatestCompact:', !!fromLatestCompact);
     console.log('[Claude Fork] Current cwd:', cwd);
 
     try {
@@ -2546,11 +2670,18 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       console.log('[Claude Fork] Session cwd:', sessionCwd || '(unknown)');
       console.log('[Claude Fork] Destination project dir:', projectDir);
 
-      // Check source file is not empty
-      const stats = fs.statSync(sourcePath);
-      if (stats.size === 0) {
+      const sourceInspection = await inspectClaudeForkSource(sourcePath);
+      if (sourceInspection.nonEmptyLineCount === 0) {
         console.error('[Claude Fork] Source file is empty:', sourcePath);
         return { success: false, error: 'Source session is empty' };
+      }
+      if (fromLatestCompact && sourceInspection.lastCompactLineIndex < 0) {
+        console.warn('[Claude Fork] No compact boundary:', sourcePath);
+        return {
+          success: false,
+          reason: 'no-compact',
+          error: 'В этой Claude-сессии ещё нет сжатия контекста',
+        };
       }
 
       // Generate new UUID
@@ -2562,25 +2693,20 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       }
       const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
 
-      // Get Timeline UUIDs snapshot using Backtrace algorithm (same as Timeline UI)
-      const entryUuids = parseTimelineUuids(sourcePath);
-      console.log('[Claude Fork] Timeline entries:', entryUuids.length);
-
-      // Copy the file and rewrite all sessionIds to newSessionId
-      // This prevents a false "Clear Context" boundary in Timeline
-      // (old entries had source sessionId, new ones get forked sessionId)
-      fs.copyFileSync(sourcePath, destPath);
-      const rawLines = fs.readFileSync(destPath, 'utf-8').split('\n');
-      const rewritten = rawLines.map(line => {
-        if (!line.trim()) return line;
-        try {
-          const rec = JSON.parse(line);
-          if (rec.sessionId) rec.sessionId = newSessionId;
-          return JSON.stringify(rec);
-        } catch { return line; }
+      const startLine = fromLatestCompact ? sourceInspection.lastCompactLineIndex : 0;
+      const written = await writeClaudeForkJsonlExclusive({
+        sourcePath,
+        destPath,
+        newSessionId,
+        startLine,
       });
-      fs.writeFileSync(destPath, rewritten.join('\n'));
-      console.log('[Claude Fork] Copied and rewrote sessionIds:', sourcePath, '->', destPath);
+      // Snapshot the history actually inherited by the child. For a compact
+      // fork this deliberately excludes every pre-compact UUID.
+      const entryUuids = await parseTimelineUuids(destPath);
+      console.log('[Claude Fork] Copied and rewrote sessionIds:', sourcePath, '->', destPath,
+        'startLine:', startLine, 'retainedRecords:', written.retainedRecordCount,
+        'timelineEntries:', entryUuids.length,
+        'compactRootRelinked:', written.compactRootRelinked);
 
       // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
       try {
@@ -2594,15 +2720,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       // the fork. They're keyed on (entry_uuid, session_id) — fork rewrote sessionIds
       // so without an explicit copy they wouldn't show up on the new tab's Timeline.
       try {
-        const allUuids = [];
-        for (const line of rewritten) {
-          if (!line.trim()) continue;
-          try {
-            const r = JSON.parse(line);
-            if (r.uuid) allUuids.push(r.uuid);
-          } catch {}
-        }
-        const copied = projectManager.db.copyTimelineMetadataForFork(newSessionId, allUuids, null);
+        const copied = projectManager.db.copyTimelineMetadataForFork(newSessionId, written.retainedUuids, null);
         if (copied.notes > 0 || copied.rewindMarkers > 0) {
           console.log('[Claude Fork] Copied timeline metadata: notes=' + copied.notes + ' rewindMarkers=' + copied.rewindMarkers);
         }
@@ -2610,10 +2728,17 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         console.warn('[Claude Fork] Could not copy timeline metadata:', e.message);
       }
 
-      // Wait for Claude to index the new file
-      await new Promise(resolve => setTimeout(resolve, 500));
-
-      return { success: true, newSessionId, forkEntryCount: entryUuids.length, sessionCwd, projectDir };
+      return {
+        success: true,
+        newSessionId,
+        forkEntryCount: entryUuids.length,
+        sessionCwd,
+        projectDir,
+        fromLatestCompact: !!fromLatestCompact,
+        removedLineCount: startLine,
+        retainedRecordCount: written.retainedRecordCount,
+        compactRootRelinked: written.compactRootRelinked,
+      };
     } catch (error) {
       console.error('[Claude Fork] Error:', error);
       return { success: false, error: error.message };
@@ -4070,7 +4195,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         forkMarkers = projectManager.db.getForkMarkers(sessionId);
         console.log('[Claude Export] Fork markers found:', forkMarkers.length);
         for (const marker of forkMarkers) {
-          const snapshotSet = new Set(marker.entry_uuids || []);
+          const snapshotSet = new Set(Array.isArray(marker.entry_uuids) ? marker.entry_uuids : []);
           if (snapshotSet.size === 0) {
             hasForkAtBeginning = true;
             continue;
@@ -4746,7 +4871,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       try {
         const forkMarkers = projectManager.db.getForkMarkers(sessionId);
         for (const marker of forkMarkers) {
-          if ((marker.entry_uuids || []).length === 0) {
+          if ((Array.isArray(marker.entry_uuids) ? marker.entry_uuids : []).length === 0) {
             hasForkAtBeginning = true;
             break;
           }

@@ -171,3 +171,46 @@ test('failed normal capture does not prevent a waiting force-fresh retry', async
   assert.equal(freshResult.value.id, 'fresh-after-failure');
   assert.equal(attempts, 2);
 });
+
+test('invalidation prevents post-boundary callers from joining an older capture', async () => {
+  const oldGate = deferred();
+  const freshGate = deferred();
+  const calls = [];
+  const published = [];
+  const singleFlight = createProcessTreeSnapshotSingleFlight({
+    capture: async (context) => {
+      const callIndex = calls.length;
+      calls.push(context);
+      const value = await (callIndex === 0 ? oldGate.promise : freshGate.promise);
+      if (context.isCurrent()) published.push(value.id);
+      return value;
+    },
+  });
+
+  const beforeBoundary = singleFlight.get();
+  await nextTurn();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].isCurrent(), true);
+
+  assert.equal(singleFlight.invalidate(), 1);
+  assert.equal(calls[0].isCurrent(), false);
+
+  const afterBoundaryOne = singleFlight.get();
+  const afterBoundaryTwo = singleFlight.get();
+  await nextTurn();
+  assert.equal(calls.length, 1, 'new callers wait out the invalidated OS command');
+
+  oldGate.resolve({ id: 'pre-stop-process-tree' });
+  assert.equal((await beforeBoundary).value.id, 'pre-stop-process-tree');
+  await nextTurn();
+  assert.equal(calls.length, 2, 'one trailing capture owns the new generation');
+  assert.equal(calls[1].generation, 1);
+  assert.equal(calls[1].isCurrent(), true);
+  assert.deepEqual(published, [], 'the old generation cannot republish its snapshot');
+
+  freshGate.resolve({ id: 'post-stop-process-tree' });
+  const [first, second] = await Promise.all([afterBoundaryOne, afterBoundaryTwo]);
+  assert.equal(first.value.id, 'post-stop-process-tree');
+  assert.equal(second.value.id, 'post-stop-process-tree');
+  assert.deepEqual(published, ['post-stop-process-tree']);
+});

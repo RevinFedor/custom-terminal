@@ -543,6 +543,25 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       }
       break;
 
+    case 'claude-compact-fork':
+      if (pendingAction.sessionId) {
+        getSetTabCommandType()(tabId, 'claude');
+        useWorkspaceStore.getState().markAiForkAutoTitle(
+          tabId,
+          'claude',
+          pendingAction.sourceSessionId || pendingAction.sessionId,
+        );
+        markPendingResume(tabId, pendingAction.sessionId);
+        void launchPendingAgentAction(tabId, pendingAction.type, 'claude:run-command', {
+          tabId,
+          command: 'claude-c',
+          sessionId: pendingAction.sessionId,
+        }, pendingAction.sessionId);
+      } else {
+        clearTabPendingAction(tabId);
+      }
+      break;
+
     case 'claude-new': {
       const store = useWorkspaceStore.getState();
       store.setTabCommandType(tabId, 'claude');
@@ -618,6 +637,24 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
           tabId,
           command: 'codex-c',
           sessionId: pendingAction.sessionId
+        }));
+      } else {
+        clearTabPendingAction(tabId);
+      }
+      break;
+
+    case 'codex-compact-fork':
+      if (pendingAction.sessionId) {
+        getSetTabCommandType()(tabId, 'codex');
+        useWorkspaceStore.getState().markAiForkAutoTitle(
+          tabId,
+          'codex',
+          pendingAction.sourceSessionId || pendingAction.sessionId,
+        );
+        void launchPendingAgentAction(tabId, pendingAction.type, 'codex:run-command', buildCodexRunPayload({
+          tabId,
+          command: 'codex-c',
+          sessionId: pendingAction.sessionId,
         }));
       } else {
         clearTabPendingAction(tabId);

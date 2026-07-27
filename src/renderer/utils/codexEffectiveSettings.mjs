@@ -14,6 +14,24 @@ const CODEX_PICKER_HEADER_RE = /(?:Select Model and Effort|Select Model(?!\s+and
 const CODEX_CLIPPED_MODEL_PICKER_RE = /\[…\s*\d+\s+lines?\]\s*ctrl\s*\+\s*a\s+view all/i;
 const CODEX_WRITER_DEPENDENT_PICKER_SOURCES = new Set(['model', 'effort', 'quick']);
 
+export function hasCodexNextLaunchSettingsIntent({
+  model,
+  effort,
+  proofAt,
+  proofSessionId,
+  modelMigrationPending = false,
+} = {}) {
+  const cleanModel = typeof model === 'string' ? model.trim() : '';
+  const cleanEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+  const owner = typeof proofSessionId === 'string' ? proofSessionId.trim() : '';
+  return modelMigrationPending !== true
+    && !!cleanModel
+    && !!cleanEffort
+    && cleanEffort !== 'ultra'
+    && Number(proofAt || 0) > 0
+    && !owner;
+}
+
 /**
  * A newly started Codex process consumes the selected tab/global fallback
  * settings. Continue and fork instead resolve settings from their source
@@ -52,14 +70,24 @@ export function planCodexSettingsControlAvailability({
     };
   }
   const processUnavailable = isCommandRunning !== true;
-  const partialSettingDisabled = processUnavailable || effectiveSettingsKnown !== true;
+  if (processUnavailable) {
+    // With no live writer, every action is a durable next-launch choice. It
+    // must not require ownership proof from the stopped source conversation.
+    return {
+      modelMenuDisabled: false,
+      partialSettingDisabled: false,
+      explicitPairDisabled: false,
+      quickDisabled: false,
+    };
+  }
+  const partialSettingDisabled = effectiveSettingsKnown !== true;
   return {
     // Recovery path: the model catalog remains reachable while Codex is live
     // so the user can choose an explicit model+effort pair without inheriting
     // stale renderer state.
-    modelMenuDisabled: processUnavailable,
+    modelMenuDisabled: false,
     partialSettingDisabled,
-    explicitPairDisabled: processUnavailable,
+    explicitPairDisabled: false,
     quickDisabled: partialSettingDisabled,
   };
 }

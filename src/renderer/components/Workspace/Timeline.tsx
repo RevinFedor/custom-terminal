@@ -39,6 +39,10 @@ import {
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
 } from '../../utils/timelineTranscriptRefresh.mjs';
+import {
+  normalizeForkMarkerEntryUuids,
+  normalizeForkMarkers,
+} from '../../utils/forkMarkerSnapshot.mjs';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
@@ -1637,7 +1641,10 @@ function Timeline({
   }, [entryIndexByUuid, claudeMemoryBoundaryUuid]);
   // Precompute fork snapshot UUID Sets for suppressing inherited plan mode boundaries
   const forkSnapshotSets = useMemo(() =>
-    forkMarkers.filter(m => m.entry_uuids && m.entry_uuids.length > 0).map(m => new Set(m.entry_uuids)),
+    forkMarkers
+      .map(m => normalizeForkMarkerEntryUuids(m.entry_uuids))
+      .filter(snapshot => snapshot.length > 0)
+      .map(snapshot => new Set(snapshot)),
     [forkMarkers]
   );
   // Per-marker, the index of the LAST entry whose UUID is in the snapshot.
@@ -1648,8 +1655,8 @@ function Timeline({
   const forkMarkerLastSnapIndex = useMemo(() => {
     const arr: number[] = [];
     for (const m of forkMarkers) {
-      const snap = m.entry_uuids;
-      if (!snap || snap.length === 0) { arr.push(-1); continue; }
+      const snap = normalizeForkMarkerEntryUuids(m.entry_uuids);
+      if (snap.length === 0) { arr.push(-1); continue; }
       let lastIdx = -1;
       for (const uuid of snap) {
         const index = entryIndexByUuid.get(uuid);
@@ -2309,7 +2316,7 @@ function Timeline({
           // Only keep directParent marker (forked_to === sessionId) — shows fork point in CHILD sessions.
           // fromMe markers (source === sessionId) are NOT shown in parent — fork point is
           // already visible in the child's timeline via its own directParent marker.
-          const all = markersResult.markers || [];
+          const all = normalizeForkMarkers(markersResult.markers) as ForkMarker[];
           const toMe = all.filter((m: ForkMarker) => m.fork_session_id === sessionId);
           let directParent: ForkMarker | null = null;
           for (const m of toMe) {
@@ -5600,8 +5607,9 @@ function Timeline({
   // Fork marker tooltip position (same pattern as notes)
   const activeForkMarker = activeForkMarkerIndex !== null ? forkMarkers.find(m => {
     if (m.hidden) return false; // hidden markers don't show tooltip
-    if (!m.entry_uuids || m.entry_uuids.length === 0) return false;
-    const snap = new Set(m.entry_uuids);
+    const snapshot = normalizeForkMarkerEntryUuids(m.entry_uuids);
+    if (snapshot.length === 0) return false;
+    const snap = new Set(snapshot);
     const e = entries[activeForkMarkerIndex];
     if (!e || !snap.has(e.uuid)) return false;
     const next = entries[activeForkMarkerIndex + 1];

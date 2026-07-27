@@ -340,6 +340,8 @@ test('writer proof waits for an in-flight source scan before rewinding the held 
     sourceWriterProofPending: true,
     sourceWriterReplayOffset: 100,
     sourceWriterReplayPartial: 'held-partial',
+    sourceAuditPartial: 'audit-only-partial',
+    sourceAuditPartialStartOffset: 275,
     catchUpGeneration: 4,
   };
 
@@ -373,6 +375,8 @@ test('writer proof waits for an in-flight source scan before rewinding the held 
   assert.equal(state.sourceObservationLaunchId, null);
   assert.equal(state.offset, 100);
   assert.equal(state.partial, 'held-partial');
+  assert.equal(state.sourceAuditPartial, '');
+  assert.equal(state.sourceAuditPartialStartOffset, 300);
   assert.equal(state.releasePublicSuppressionTargetOffset, 300);
   assert.equal(state.publicTurnStateSuppressed, true);
   assert.equal(state.catchUpPublicationsSuppressed, true);

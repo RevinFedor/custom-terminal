@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  hasCodexNextLaunchSettingsIntent,
   deriveCodexEffectiveSettingsFromHistory,
   isCodexSettingsPickerVisible,
   parseCodexModelChangeAcknowledgement,
@@ -12,6 +13,26 @@ import {
   resolveCodexEffectiveSettings,
   stripCodexTerminalControls,
 } from './codexEffectiveSettings.mjs';
+
+test('stopped Codex intent is complete, persistent, and has no old writer owner', () => {
+  assert.equal(hasCodexNextLaunchSettingsIntent({
+    model: 'gpt-5.6-terra',
+    effort: 'high',
+    proofAt: 123,
+    proofSessionId: undefined,
+  }), true);
+  assert.equal(hasCodexNextLaunchSettingsIntent({
+    model: 'gpt-5.6-terra',
+    effort: 'high',
+    proofAt: 123,
+    proofSessionId: 'old-writer',
+  }), false);
+  assert.equal(hasCodexNextLaunchSettingsIntent({
+    model: 'gpt-5.6-terra',
+    effort: 'ultra',
+    proofAt: 123,
+  }), false);
+});
 
 test('persists selected settings only after an accepted fresh Codex launch', () => {
   assert.deepEqual(planCodexLaunchSettingsPersistence({
@@ -116,10 +137,10 @@ test('live Codex keeps explicit-pair recovery UI available without a settings ow
     isCommandRunning: false,
     effectiveSettingsKnown: false,
   }), {
-    modelMenuDisabled: true,
-    partialSettingDisabled: true,
-    explicitPairDisabled: true,
-    quickDisabled: true,
+    modelMenuDisabled: false,
+    partialSettingDisabled: false,
+    explicitPairDisabled: false,
+    quickDisabled: false,
   });
 });
 

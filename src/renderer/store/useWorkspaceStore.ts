@@ -483,8 +483,10 @@ const consumePendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, s
 
 const isPendingAiForkLaunch = (commandType: CommandType, pendingAction?: PendingAction): boolean => {
   if (!pendingAction) return false;
-  return (commandType === 'claude' && pendingAction.type === 'claude-fork')
-    || (commandType === 'codex' && pendingAction.type === 'codex-fork');
+  return (commandType === 'claude'
+      && (pendingAction.type === 'claude-fork' || pendingAction.type === 'claude-compact-fork'))
+    || (commandType === 'codex'
+      && (pendingAction.type === 'codex-fork' || pendingAction.type === 'codex-compact-fork'));
 };
 
 // Helper: Check if tab has an interrupted AI session that can be resumed
@@ -494,8 +496,9 @@ export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionI
 
 // Typed pending action - executed after terminal is ready
 export interface PendingAction {
-  type: 'claude-fork' | 'claude-continue' | 'claude-new' | 'gemini-fork' | 'gemini-continue' | 'gemini-new' | 'codex-fork' | 'codex-continue' | 'codex-new' | 'shell-command';
+  type: 'claude-fork' | 'claude-compact-fork' | 'claude-continue' | 'claude-new' | 'gemini-fork' | 'gemini-continue' | 'gemini-new' | 'codex-fork' | 'codex-compact-fork' | 'codex-continue' | 'codex-new' | 'shell-command';
   sessionId?: string;    // For AI fork/continue actions
+  sourceSessionId?: string; // Original branch for pre-created compact forks
   command?: string;      // For shell-command
   developerInstructions?: string; // Codex external-run launch config
 }
@@ -714,12 +717,20 @@ interface Tab {
    * (tabs.provider_state JSON). Authoritative writer is main process — it owns
    * `providerStates` Map and writes the row directly through DB on every
    * provider:switch / provider:set-options. This field on the Tab is the
-   * cached projection: read on tabs load, updated via `provider:state-changed`
-   * IPC broadcast from main. Renderer never writes it back via saveTabs.
+   * cached projection: read on tabs load. Full saveTabs writes preserve the
+   * newer main-owned DB value, so this potentially stale projection cannot
+   * roll back a point-write.
    * Default (undefined / {type:'anthropic'} with no extras) means "subscription
    * Claude API, model picked by Claude TUI itself".
    */
-  providerState?: { type: string; model?: string; effort?: string; thinking?: string };
+  providerState?: {
+    type: string;
+    model?: string;
+    effort?: string;
+    thinking?: string;
+    startupModel?: string;
+    startupEffort?: string;
+  };
   // Background tasks: live state for Agent/Bash subagents and background bash
   // commands that have been moved off the foreground turn. Populated from SDK
   // task_started / task_progress / task_updated / task_notification events.

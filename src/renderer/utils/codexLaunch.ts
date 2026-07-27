@@ -1,5 +1,6 @@
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import { hasCodexNextLaunchSettingsIntent } from './codexEffectiveSettings.mjs';
 
 export interface CodexRunPayloadBase {
   tabId: string;
@@ -15,6 +16,7 @@ export interface CodexRunPayload extends CodexRunPayloadBase {
   modelSource?: 'tab' | 'global';
   effortSource?: 'tab' | 'global';
   modelMigrationPending?: boolean;
+  settingsIntent?: 'next-launch';
 }
 
 const cleanSetting = (value: unknown): string | undefined => {
@@ -32,6 +34,8 @@ const cleanPersistentEffort = (value: unknown): string | undefined => {
 const findCodexTabState = (tabId: string): {
   codexModel?: string;
   codexEffort?: string;
+  codexSettingsProofAt?: number;
+  codexSettingsProofSessionId?: string;
   codexModelMigrationPending?: boolean;
 } => {
   const state = useWorkspaceStore.getState();
@@ -41,6 +45,8 @@ const findCodexTabState = (tabId: string): {
       return {
         codexModel: tab.codexModel,
         codexEffort: tab.codexEffort,
+        codexSettingsProofAt: tab.codexSettingsProofAt,
+        codexSettingsProofSessionId: tab.codexSettingsProofSessionId,
         codexModelMigrationPending: tab.codexModelMigrationPending,
       };
     }
@@ -54,6 +60,7 @@ export const getCodexLaunchOptions = (tabId: string): {
   modelSource?: 'tab' | 'global';
   effortSource?: 'tab' | 'global';
   modelMigrationPending?: boolean;
+  settingsIntent?: 'next-launch';
 } => {
   const tab = findCodexTabState(tabId);
   if (tab.codexModelMigrationPending === true) {
@@ -66,12 +73,20 @@ export const getCodexLaunchOptions = (tabId: string): {
   const globalEffort = cleanPersistentEffort(ui.defaultCodexEffort);
   const model = tabModel ?? globalModel;
   const effort = tabEffort ?? globalEffort;
+  const nextLaunchIntent = hasCodexNextLaunchSettingsIntent({
+    model: tabModel,
+    effort: tabEffort,
+    proofAt: tab.codexSettingsProofAt,
+    proofSessionId: tab.codexSettingsProofSessionId,
+    modelMigrationPending: tab.codexModelMigrationPending,
+  });
 
   return {
     model,
     effort,
     ...(model ? { modelSource: tabModel ? 'tab' as const : 'global' as const } : {}),
     ...(effort ? { effortSource: tabEffort ? 'tab' as const : 'global' as const } : {}),
+    ...(nextLaunchIntent ? { settingsIntent: 'next-launch' as const } : {}),
   };
 };
 
@@ -82,6 +97,7 @@ export const buildCodexRunPayload = (base: CodexRunPayloadBase): CodexRunPayload
     modelSource,
     effortSource,
     modelMigrationPending,
+    settingsIntent,
   } = getCodexLaunchOptions(base.tabId);
   return {
     ...base,
@@ -90,5 +106,6 @@ export const buildCodexRunPayload = (base: CodexRunPayloadBase): CodexRunPayload
     ...(modelSource ? { modelSource } : {}),
     ...(effortSource ? { effortSource } : {}),
     ...(modelMigrationPending ? { modelMigrationPending: true } : {}),
+    ...(settingsIntent ? { settingsIntent } : {}),
   };
 };

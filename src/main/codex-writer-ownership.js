@@ -1125,7 +1125,24 @@ function classifyCodexWriterAdoption({
   sourceMatch = null,
   linkedBoundaryFound = false,
   sourceAppendObserved = false,
+  sourceSubmitAuditPending = false,
 } = {}) {
+  // A process-owned source rollout plus task_started proves where Codex began
+  // writing, but it does not prove that an automated paste supplied that turn's
+  // user text. While the exact launch-scoped user_message audit is pending, keep
+  // the old Resume source provisional. Manual Enter has no such reservation and
+  // continues to settle from the normal append/task boundary.
+  if (
+    sourceMode === 'resume'
+    && sourceMatch === 'source-in-place'
+    && sourceSubmitAuditPending === true
+  ) {
+    return {
+      status: 'provisional-source',
+      sourceSettled: false,
+      reason: 'awaiting-user-message-audit',
+    };
+  }
   const sourceSettled = sourceMatch !== 'source-in-place'
     || linkedBoundaryFound === true
     || sourceAppendObserved === true;
@@ -1133,6 +1150,25 @@ function classifyCodexWriterAdoption({
     return { status: 'provisional-source', sourceSettled: false };
   }
   return { status: 'commit', sourceSettled };
+}
+
+function isCodexResumeSourceAuditPending({
+  sourceMode = null,
+  sourceSessionId = null,
+  launchId = null,
+  discovery = null,
+} = {}) {
+  const reservation = discovery?.provisionalSubmitReservation || null;
+  return sourceMode === 'resume'
+    && !!sourceSessionId
+    && !!launchId
+    && discovery?.sourceMode === 'resume'
+    && discovery?.sourceSessionId === sourceSessionId
+    && discovery?.launchId === launchId
+    && reservation?.sourceSessionId === sourceSessionId
+    && reservation?.launchId === launchId
+    && reservation?.requiresUserMessageAudit === true
+    && reservation?.auditMatched !== true;
 }
 
 function classifyCodexProvisionalActionAuthorization({
@@ -1370,6 +1406,7 @@ module.exports = {
   classifyManualCodexSubmitAfterWriteQueue,
   classifyCodexBranchWriterHandoffSettlement,
   classifyCodexWriterAdoption,
+  isCodexResumeSourceAuditPending,
   classifyCodexProvisionalActionAuthorization,
   classifyCodexWriterHandoffSettlement,
   claimExclusiveActionReservation,

@@ -81,6 +81,61 @@ test('extracts the selected Codex turn after a user-only rollback, never the nex
   assert.doesNotMatch(result.assistantText, /Prior answer|private reasoning|Unrelated next answer/);
 });
 
+test('orchestration result keeps one Codex turn together across mid-turn compaction', () => {
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'user_message', message: 'run the matrix' } },
+    { __line: 2, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Starting the run.' }] } },
+    { __line: 3, type: 'compacted', payload: { replacement_history: [] } },
+    { __line: 4, type: 'event_msg', payload: { type: 'context_compacted' } },
+    { __line: 5, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Still running after compact.' }] } },
+    { __line: 6, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'FINAL RESULT: all done.' }] } },
+    { __line: 7, type: 'event_msg', payload: { type: 'task_complete' } },
+    { __line: 8, type: 'event_msg', payload: { type: 'user_message', message: 'unrelated next request' } },
+    { __line: 9, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'UNRELATED NEXT ANSWER' }] } },
+  ];
+  const sessionId = 'orchestration-compact-session';
+  const target = _api.buildCodexTimeline(records, sessionId)
+    .find((entry) => entry.type === 'user' && entry.content === 'run the matrix');
+  const result = _api.buildCodexTurnAssistantResult(records, sessionId, target.uuid, 100000);
+
+  assert.equal(result.success, true);
+  assert.equal(result.turnIndex, 0);
+  assert.equal(result.assistantMessageCount, 3);
+  assert.equal(result.assistantBlockCount, 3);
+  assert.equal(result.truncated, false);
+  assert.equal(result.assistantChars, [
+    'Starting the run.',
+    'Still running after compact.',
+    'FINAL RESULT: all done.',
+  ].join('\n\n').length);
+  assert.match(result.assistantText, /Starting the run/);
+  assert.match(result.assistantText, /Still running after compact/);
+  assert.match(result.assistantText, /FINAL RESULT: all done/);
+  assert.doesNotMatch(result.assistantText, /UNRELATED NEXT ANSWER/);
+});
+
+test('orchestration result bounds a long compacted turn while preserving its final tail', () => {
+  const first = 'HEAD-SENTINEL ' + 'a'.repeat(700);
+  const final = 'b'.repeat(700) + ' FINAL-TAIL-SENTINEL';
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'user_message', message: 'long run' } },
+    { __line: 2, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: first }] } },
+    { __line: 3, type: 'compacted', payload: { replacement_history: [] } },
+    { __line: 4, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: final }] } },
+  ];
+  const sessionId = 'orchestration-long-session';
+  const target = _api.buildCodexTimeline(records, sessionId)
+    .find((entry) => entry.type === 'user');
+  const result = _api.buildCodexTurnAssistantResult(records, sessionId, target.uuid, 500);
+
+  assert.equal(result.success, true);
+  assert.equal(result.truncated, true);
+  assert.equal(result.assistantChars, first.length + 2 + final.length);
+  assert.ok(result.assistantText.length <= 500);
+  assert.match(result.assistantText, /^HEAD-SENTINEL/);
+  assert.match(result.assistantText, /FINAL-TAIL-SENTINEL$/);
+});
+
 test('reads JSONL incrementally across chunk and UTF-8 boundaries', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-jsonl-stream-'));
   t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
