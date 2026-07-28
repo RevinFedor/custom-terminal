@@ -1,4 +1,9 @@
-import type { AgentHistoryTool, AgentPtyStatus, HistoryAgentRuntime } from './historyAgentRuntimes';
+import type {
+  AgentDraftInspection,
+  AgentHistoryTool,
+  AgentPtyStatus,
+  HistoryAgentRuntime,
+} from './historyAgentRuntimes';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './claudeStartupDefaultsReady';
 import { terminalRegistry } from './terminalRegistry';
 import { useUIStore, type HistoryPromptDraftImageRef } from '../store/useUIStore';
@@ -7,6 +12,11 @@ import { requireCommittedCodexRewind } from './codexRewindCommit';
 import { requireConfirmedCodexWriter } from './codexWriterIdentity';
 import { selectRewindOperation } from '../store/rewindOperationState';
 import { useRewindOperationStore } from '../store/useRewindOperationStore';
+import {
+  createCoordinatedAgentSendCancellationWait,
+  isCoordinatedAgentSendCancellationRequested,
+} from './agentActionCoordinator.mjs';
+import { classifyAgentDraftPreflight } from './agentDraftPreflight.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -25,6 +35,7 @@ export interface SendAgentPromptScenarioArgs {
   effort?: string;
   thinking?: string;
   returnDraftOnConflict?: boolean;
+  coordinatedSendToken?: number | null;
   presentationSnapshot?: {
     historySessionId?: string | null;
     promptChips?: Array<{
@@ -68,8 +79,17 @@ export async function sendAgentPromptScenario({
   effort,
   thinking,
   returnDraftOnConflict,
+  coordinatedSendToken,
   presentationSnapshot,
 }: SendAgentPromptScenarioArgs): Promise<any> {
+  const assertSendNotCancelled = () => {
+    if (
+      coordinatedSendToken
+      && isCoordinatedAgentSendCancellationRequested(tabId, coordinatedSendToken)
+    ) {
+      throw new Error('Send cancelled before terminal submission');
+    }
+  };
   const requestedStatusForSend = normalizeStatus(statusAtSend);
   const statusForSend = await ensureAgentReadyForSend({
     tabId,
@@ -77,7 +97,9 @@ export async function sendAgentPromptScenario({
     runtime,
     sessionId,
     cwd,
+    coordinatedSendToken,
   }) || requestedStatusForSend;
+  assertSendNotCancelled();
   if (requestedStatusForSend && statusForSend && requestedStatusForSend !== statusForSend) {
     console.log('[AgentScenario:send] status override tool=' + toolType
       + ' tab=' + String(tabId).slice(-12)
@@ -90,7 +112,9 @@ export async function sendAgentPromptScenario({
     const visual = runtime.probeDraft
       ? await runtime.probeDraft(tabId, 'agent-send-preflight:' + (source || 'unknown'))
       : runtime.inspectDraft!(tabId);
-    if (visual?.hasDraft === true) {
+    assertSendNotCancelled();
+    const draftDecision = classifyAgentDraftPreflight(visual);
+    if (draftDecision.decision === 'conflict') {
       let draftText = '';
       let draftImages = 0;
       if (returnDraftOnConflict === true) {
@@ -125,9 +149,7 @@ export async function sendAgentPromptScenario({
         originalPrompt: prompt,
       };
     }
-    const absenceIsExpected = visual?.source === 'no-terminal'
-      || visual?.source === 'claude-composer:presence-not-live';
-    if (visual?.hasDraft === null && statusForSend === 'active' && !absenceIsExpected) {
+    if (draftDecision.decision === 'unknown') {
       return {
         tabId,
         toolType,
@@ -137,11 +159,14 @@ export async function sendAgentPromptScenario({
         error: 'Terminal draft state is unknown; send stopped before touching input',
         draftPreview: visual.preview || '',
         draftSource: visual.source || '',
+        proofOutcome: visual.proofOutcome || 'unknown',
+        proofReason: draftDecision.reason,
         originalPrompt: prompt,
       };
     }
   }
 
+  assertSendNotCancelled();
   const result = await runtime.sendPrompt(tabId, prompt, {
     handoffId: typeof handoffId === 'string' ? handoffId : undefined,
     source: typeof source === 'string' ? source : 'mobile-native',
@@ -212,12 +237,12 @@ export function inspectAgentDraftScenario({
   toolType: AgentHistoryTool;
   runtime: HistoryAgentRuntime;
 }): any {
-  let result = runtime.inspectDraft
+  let result: AgentDraftInspection = runtime.inspectDraft
     ? runtime.inspectDraft(tabId)
     : { hasDraft: null, preview: '', source: 'unsupported' };
   if (result?.source === 'no-terminal') {
     result = {
-      ...(result || {}),
+      ...result,
       mountedForInspect: false,
       debug: [result?.debug, 'mount=not-mounted focus=preserved'].filter(Boolean).join(' '),
     };
@@ -661,20 +686,32 @@ async function ensureAgentReadyForSend({
   runtime,
   sessionId,
   cwd,
+  coordinatedSendToken,
 }: {
   tabId: string;
   toolType: AgentHistoryTool;
   runtime: HistoryAgentRuntime;
   sessionId?: string | null;
   cwd?: string;
+  coordinatedSendToken?: number | null;
 }) {
+  const assertSendNotCancelled = () => {
+    if (
+      coordinatedSendToken
+      && isCoordinatedAgentSendCancellationRequested(tabId, coordinatedSendToken)
+    ) {
+      throw new Error('Send cancelled before terminal submission');
+    }
+  };
   const waitStartupDefaultsIfNeeded = async () => {
     if (toolType === 'claude') await waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, 15000, 'agent-send');
+    assertSendNotCancelled();
   };
   let presence = await runtime.getPresence(tabId).catch((err: any) => {
     console.warn('[AgentScenario:send] presence failed before send tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' ' + (err?.message || err));
     return null;
   });
+  assertSendNotCancelled();
   console.log('[AgentScenario:send] presence before tool=' + toolType
     + ' tab=' + String(tabId).slice(-12)
     + ' status=' + (presence?.status || 'unknown')
@@ -712,6 +749,7 @@ async function ensureAgentReadyForSend({
     if (resumeResult?.success === false) {
       throw new Error(resumeResult.error || runtime.label + ' ' + actionLabel + ' failed before send');
     }
+    assertSendNotCancelled();
   }
 
   // Re-arming readiness loop. Enter is one submit intent: the scenario owns
@@ -725,10 +763,15 @@ async function ensureAgentReadyForSend({
   // deadline fails the wait.
   const deadline = Date.now() + 30000;
   for (let pass = 0; ; pass += 1) {
+    assertSendNotCancelled();
     const remainingMs = deadline - Date.now();
     const readyWait = createAgentReadyWait(tabId, runtime, Math.max(1, remainingMs), 'send');
+    const cancellationWait = coordinatedSendToken
+      ? createCoordinatedAgentSendCancellationWait(tabId, coordinatedSendToken)
+      : null;
     try {
       presence = await runtime.getPresence(tabId).catch(() => null);
+      assertSendNotCancelled();
       if (pass > 0) {
         console.log('[AgentScenario:send] presence after wait tool=' + toolType
           + ' tab=' + String(tabId).slice(-12)
@@ -749,9 +792,18 @@ async function ensureAgentReadyForSend({
       if (remainingMs <= 0) {
         throw new Error(runtime.label + ' session is not ready for send');
       }
-      await readyWait.promise;
+      if (cancellationWait) {
+        const outcome = await Promise.race([
+          readyWait.promise.then(() => 'ready'),
+          cancellationWait.promise.then(() => 'cancelled'),
+        ]);
+        if (outcome === 'cancelled') assertSendNotCancelled();
+      } else {
+        await readyWait.promise;
+      }
     } finally {
       readyWait.cancel();
+      cancellationWait?.cancel();
     }
   }
 }

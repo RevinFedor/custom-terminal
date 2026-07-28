@@ -1,7 +1,10 @@
 'use strict';
 
+const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+
 const fs = require('node:fs');
 const path = require('node:path');
+const { extractClaudePromptCarrier } = require('./claude-prompt-carriers');
 
 const DEFAULT_CLAUDE_AUDIT_READ_BYTES = 2 * 1024 * 1024;
 
@@ -22,15 +25,7 @@ function shouldStageClaudeUserPromptAudit({
 }
 
 function extractClaudeUserText(record) {
-  if (record?.type !== 'user') return null;
-  const message = record.message;
-  if (!message || message.role !== 'user') return null;
-  if (typeof message.content === 'string') return message.content;
-  if (!Array.isArray(message.content)) return null;
-  const textPart = message.content.find(part => (
-    part && part.type === 'text' && typeof part.text === 'string'
-  ));
-  return textPart?.text ?? null;
+  return extractClaudePromptCarrier(record)?.text ?? null;
 }
 
 function normalizeReadLimit(value) {
@@ -102,11 +97,13 @@ function readClaudeUserRecordsFromBuffer(
     if (rawLine) {
       try {
         const record = JSON.parse(rawLine);
-        const text = extractClaudeUserText(record);
+        const carrier = extractClaudePromptCarrier(record);
+        const text = carrier?.text ?? null;
         if (text !== null) {
           candidates.push({
             record,
             text,
+            promptCarrierKind: carrier.kind,
             byteOffset: Number(baseOffset) + lineStart,
             transcriptPath: transcriptPath ? path.resolve(transcriptPath) : null,
             bytesRead: Number.isFinite(bytesRead) ? bytesRead : source.length,
@@ -182,7 +179,7 @@ async function readLastClaudeUserRecord(
 
 /**
  * Ordered multi-audit selection, mirroring selectCodexPendingPromptAudit: given
- * every user record found after the shared read boundary, match each pending
+ * every prompt carrier found after the shared read boundary, match each pending
  * audit by exact len+hash against a causal (post-its-own-boundary) record.
  * Text equality alone is not identity — causality comes first, and one record
  * confirms at most one audit (earliest expectation wins).
@@ -192,8 +189,7 @@ function selectClaudePendingPromptAudit(
   candidates,
   {
     classify = classifyClaudeAuditRecordAfterBoundary,
-    hashText = (text) => require('node:crypto')
-      .createHash('sha1').update(String(text || '')).digest('hex').slice(0, 16),
+    hashText = promptAuditFingerprint,
     claimedByteOffsets = new Set(),
   } = {},
 ) {
@@ -214,6 +210,152 @@ function selectClaudePendingPromptAudit(
     }
   }
   return null;
+}
+
+/**
+ * Assigns a live prompt carrier to the exact app-owned send without treating
+ * text equality as ownership. A queue-operation first claims the oldest
+ * causal audit after its byte boundary. The first later canonical carrier is
+ * then joined to that exact queue claim in FIFO order; replays keep the same
+ * owner. Manual xterm prompts have no audit and therefore remain unowned.
+ */
+function selectClaudeLivePromptOwner(
+  audits,
+  candidate,
+  {
+    classify = classifyClaudeAuditRecordAfterBoundary,
+    hashText = promptAuditFingerprint,
+  } = {},
+) {
+  if (!candidate?.record || typeof candidate.text !== 'string') return null;
+  const source = (Array.isArray(audits) ? audits : [])
+    .filter((audit) => audit && audit.finished !== true);
+  const candidateHash = hashText(candidate.text);
+  const candidateLen = candidate.text.length;
+  const candidateOffset = Number(candidate.byteOffset);
+  const candidateUuid = String(candidate.record?.uuid || '');
+  const candidateKind = String(candidate.promptCarrierKind || '');
+
+  // Exact replay of an already claimed canonical record.
+  for (const audit of source) {
+    if (candidateUuid && audit.liveCanonicalPromptUuid === candidateUuid) {
+      return { audit, candidate, reason: 'canonical-replay' };
+    }
+    const queueClaim = audit.liveQueuePromptClaim;
+    if (
+      candidateKind === 'queue-operation'
+      && queueClaim
+      && Number.isFinite(candidateOffset)
+      && Number(queueClaim.byteOffset) === candidateOffset
+      && queueClaim.hash === candidateHash
+    ) {
+      return { audit, candidate, reason: 'queue-replay' };
+    }
+  }
+
+  const matchesAuditPayload = (audit) => (
+    candidateLen === Number(audit.expectedLen)
+    && candidateHash === String(audit.expectedHash || '')
+  );
+
+  // A queue carrier has already established the app-owned FIFO position.
+  // The first matching canonical record after that exact byte offset belongs
+  // to this audit; later identical prompts cannot steal it.
+  if (candidateKind !== 'queue-operation') {
+    for (const audit of source) {
+      const queueClaim = audit.liveQueuePromptClaim;
+      if (!queueClaim || audit.liveCanonicalPromptUuid || !matchesAuditPayload(audit)) continue;
+      const claimOffset = Number(queueClaim.byteOffset);
+      if (
+        Number.isFinite(candidateOffset)
+        && Number.isFinite(claimOffset)
+        && candidateOffset < claimOffset
+      ) continue;
+      audit.liveCanonicalPromptUuid = candidateUuid || null;
+      return { audit, candidate, reason: 'canonical-after-exact-queue-claim' };
+    }
+  }
+
+  // Once an audit has claimed a queue position it cannot claim a second
+  // enqueue with identical text. That second carrier belongs to another send.
+  const unclaimed = source.filter((audit) => !audit.liveQueuePromptClaim && !audit.liveCanonicalPromptUuid);
+  const selection = selectClaudePendingPromptAudit(unclaimed, [candidate], {
+    classify,
+    hashText,
+  });
+  if (!selection) return null;
+  if (candidateKind === 'queue-operation') {
+    selection.audit.liveQueuePromptClaim = {
+      byteOffset: Number.isFinite(candidateOffset) ? candidateOffset : null,
+      timestamp: candidate.record?.timestamp || null,
+      sessionId: candidate.record?.sessionId || null,
+      hash: candidateHash,
+    };
+    return { ...selection, reason: 'causal-queue-claim' };
+  }
+  selection.audit.liveCanonicalPromptUuid = candidateUuid || null;
+  return { ...selection, reason: 'causal-canonical-claim' };
+}
+
+/**
+ * Converts an exact live canonical carrier into the same audit proof normally
+ * produced by the UserPromptSubmit hook. Claude does not emit that hook for a
+ * prompt accepted while another turn is streaming: it writes an enqueue and,
+ * later, a queued_command attachment instead. The enqueue proves queue order;
+ * only the canonical record (with its UUID) is strong enough to finish the
+ * History handoff.
+ */
+function buildClaudeLivePromptAuditConfirmation(
+  selection,
+  candidate,
+  {
+    sessionId = null,
+    hashText = promptAuditFingerprint,
+  } = {},
+) {
+  const audit = selection?.audit || null;
+  const record = candidate?.record || null;
+  const kind = String(candidate?.promptCarrierKind || '');
+  const actualText = typeof candidate?.text === 'string' ? candidate.text : '';
+  const entryUuid = typeof record?.uuid === 'string' ? record.uuid : '';
+  if (
+    !audit?.handoffId
+    || audit.finished === true
+    || (kind !== 'user' && kind !== 'queued_command')
+    || !actualText
+    || !entryUuid
+  ) return null;
+
+  const actualHash = hashText(actualText);
+  if (
+    actualText.length !== Number(audit.expectedLen)
+    || actualHash !== String(audit.expectedHash || '')
+  ) return null;
+
+  const auditSessionId = record.sessionId
+    || record.session_id
+    || sessionId
+    || audit.historySessionId
+    || null;
+  return {
+    audit,
+    result: {
+      success: true,
+      actualLen: actualText.length,
+      actualHash,
+      sessionId: auditSessionId,
+      entryUuid,
+      auditTimestamp: record.timestamp || new Date(audit.sentAt).toISOString(),
+      expectedLen: audit.expectedLen,
+      expectedHash: audit.expectedHash,
+      canonicalized: true,
+      canonicalReason: selection.reason || selection.causality?.reason || 'live-canonical-carrier',
+    },
+    actualText,
+    recordByteOffset: Number.isFinite(Number(candidate.byteOffset))
+      ? Number(candidate.byteOffset)
+      : null,
+  };
 }
 
 async function captureClaudePromptAuditBoundary(
@@ -351,6 +493,8 @@ module.exports = {
   readClaudeUserRecordsFromBuffer,
   readLastClaudeUserRecord,
   readLastClaudeUserRecordFromBuffer,
+  buildClaudeLivePromptAuditConfirmation,
+  selectClaudeLivePromptOwner,
   selectClaudePendingPromptAudit,
   shouldStageClaudeUserPromptAudit,
 };

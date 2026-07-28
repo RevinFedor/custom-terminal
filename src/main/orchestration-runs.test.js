@@ -8,8 +8,10 @@ const {
   hasNewerTargetRun,
   isCompleteOrchestrationResult,
   mergeActiveLoadersWithOrchestrations,
+  orchestrationTargetRunIdFromAudit,
   orchestrationCompletionRunIdFromAudit,
   orchestrationInstallBlockers,
+  shouldScheduleCreatedTargetAutoStop,
   shouldRetryWaitingNotificationForSourceLifecycle,
 } = require('./orchestration-runs');
 
@@ -30,7 +32,9 @@ function baseRun(runId, targetTabId = 'target-1') {
     sourceProjectId: 'project-a',
     targetTabId,
     targetProjectId: 'project-b',
-    promptHash: 'hash-' + runId,
+    promptHash: 'transcript-hash-' + runId,
+    targetPromptAuditHash: 'audit-hash-' + runId,
+    promptChars: 20,
   };
 }
 
@@ -46,11 +50,29 @@ function completionAuditProof(runId, sourceTabId = 'source-1') {
   };
 }
 
+function targetAuditProof(runId, targetTabId = 'target-1', sourceTabId = 'source-1') {
+  return {
+    targetTabId,
+    handoffId: 'orchestration:' + runId,
+    source: 'orchestration:' + sourceTabId,
+    toolType: 'claude',
+    auditTimestamp: '2026-07-28T07:26:39.981Z',
+    expectedHash: 'audit-hash-' + runId,
+    actualHash: 'audit-hash-' + runId,
+    expectedLen: 20,
+    actualLen: 20,
+    sessionId: 'session-' + targetTabId,
+    userUuid: 'user-' + runId,
+  };
+}
+
 async function finishRunAndQueueNotification(store, runId, targetTabId, attemptedAt = Date.now()) {
   await store.create(baseRun(runId, targetTabId));
   await store.markDelivery(runId);
   await store.applyLifecycle(targetTabId, { type: 'busy', busy: true });
   await store.applyLifecycle(targetTabId, { type: 'done', reason: 'task_complete' });
+  // Production only attempts source notification after exact final-result proof.
+  await store.patch(runId, { resultComplete: true, resultProofStatus: 'complete' });
   await store.markNotification(runId, 'sending', {
     notificationAttemptedAt: attemptedAt,
     notificationPromptHash: 'notification-hash-' + runId,
@@ -59,10 +81,16 @@ async function finishRunAndQueueNotification(store, runId, targetTabId, attempte
   await store.markNotification(runId, 'sent', { notificationDeliveredAt: attemptedAt + 1 });
 }
 
-test('waiting source notifications retry on a source turn start, not on idle noise', () => {
+test('waiting source notifications retry on a source turn start or proven-ready snapshot, not idle noise', () => {
   assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({ type: 'busy', busy: true }), true);
   assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({ type: 'busy', busy: false }), false);
   assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({ type: 'done' }), true);
+  assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({
+    type: 'snapshot', inputReady: true, busy: false, starting: false,
+  }), true);
+  assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({
+    type: 'snapshot', inputReady: false, busy: false,
+  }), false);
   assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({ type: 'message' }), false);
 });
 
@@ -70,6 +98,11 @@ test('only an exact successful completion audit exposes its run id', () => {
   assert.equal(orchestrationCompletionRunIdFromAudit({
     ...completionAuditProof('run-a'),
     success: true,
+  }), 'run-a');
+  assert.equal(orchestrationCompletionRunIdFromAudit({
+    ...completionAuditProof('run-a'),
+    success: true,
+    source: 'codex-orchestration-completion:run-a',
   }), 'run-a');
   assert.equal(orchestrationCompletionRunIdFromAudit({
     ...completionAuditProof('run-a'),
@@ -83,7 +116,28 @@ test('only an exact successful completion audit exposes its run id', () => {
   assert.equal(orchestrationCompletionRunIdFromAudit({
     ...completionAuditProof('run-a'),
     success: true,
+    source: 'codex-codex-orchestration-completion:run-a',
+  }), null);
+  assert.equal(orchestrationCompletionRunIdFromAudit({
+    ...completionAuditProof('run-a'),
+    success: true,
     handoffId: 'external-run-a',
+  }), null);
+});
+
+test('only a successful exact target handoff exposes its orchestration run id', () => {
+  assert.equal(orchestrationTargetRunIdFromAudit({
+    ...targetAuditProof('run-a'),
+    success: true,
+  }), 'run-a');
+  assert.equal(orchestrationTargetRunIdFromAudit({
+    ...targetAuditProof('run-a'),
+    success: false,
+  }), null);
+  assert.equal(orchestrationTargetRunIdFromAudit({
+    ...targetAuditProof('run-a'),
+    success: true,
+    handoffId: 'orchestration-complete:run-a',
   }), null);
 });
 
@@ -163,6 +217,30 @@ test('completion handoff blocks install until the exact follow-up proof and then
   }
 });
 
+test('restart reconciliation retains a completed run whose result proof is still pending', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({
+      ...baseRun('run-result-race', 'target-a'),
+      notifySource: false,
+    });
+    await store.markDelivery('run-result-race');
+    await store.applyLifecycle('target-a', { type: 'busy', busy: true });
+    await store.applyLifecycle('target-a', { type: 'done', reason: 'task_complete' });
+    await store.patch('run-result-race', {
+      resultComplete: false,
+      resultProofStatus: 'awaiting-transcript',
+    });
+
+    assert.deepEqual((await store.listActive()).map((run) => run.runId), [
+      'run-result-race',
+    ]);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
 test('waiting recovery remains an install blocker on source and target', () => {
   const blockers = orchestrationInstallBlockers({
     ...baseRun('run-a', 'target-a'),
@@ -208,6 +286,40 @@ test('generic source busy cannot shift two pending notifications by one run', as
     );
     assert.equal((await store.get('run-a')).sourceFollowupStartedAt, 400);
     assert.deepEqual(await store.listActive(), []);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('Codex completion audit is canonicalized and cannot regress from sent back to queued', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-codex-source', 'target-a'));
+    await store.markDelivery('run-codex-source');
+    await store.applyLifecycle('target-a', { type: 'busy', busy: true });
+    await store.applyLifecycle('target-a', { type: 'done', reason: 'task_complete' });
+    await store.patch('run-codex-source', { resultComplete: true });
+    await store.markNotification('run-codex-source', 'sending', {
+      notificationPromptHash: 'notification-hash-run-codex-source',
+      notificationHandoffId: 'orchestration-complete:run-codex-source',
+    });
+
+    const confirmed = await store.confirmSourceFollowup('run-codex-source', {
+      ...completionAuditProof('run-codex-source'),
+      source: 'codex-orchestration-completion:run-codex-source',
+    }, { now: 500 });
+    assert.equal(confirmed.confirmed, true);
+    assert.equal((await store.get('run-codex-source')).notificationStatus, 'sent');
+
+    // The scenario call returns queued after the post-Enter audit in the live
+    // race. That weaker reply must not overwrite the exact materialization.
+    await store.markNotification('run-codex-source', 'queued', {
+      notificationDeliveredAt: 600,
+    });
+    const run = await store.get('run-codex-source');
+    assert.equal(run.notificationStatus, 'sent');
+    assert.equal(run.sourceFollowupStartedAt, 500);
   } finally {
     await store.flush();
     await cleanup();
@@ -267,6 +379,247 @@ test('startup lifecycle is ignored until prompt delivery is accepted', async () 
     await store.applyLifecycle('target-1', { type: 'busy', busy: true, sessionId: 'startup-session' });
     const event = await store.applyLifecycle('target-1', { type: 'done', reason: 'task_complete', sessionId: 'startup-session' });
     assert.equal(event.completed.length, 1);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('exact target prompt proof repairs a busy edge that raced before delivery acceptance', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({ ...baseRun('run-race'), targetToolType: 'claude' });
+    await store.patch('run-race', { status: 'sending' });
+
+    // This is the live E2E order: UserPromptSubmit arrives while the HTTP send
+    // route is still resolving the accepted runtime identity.
+    await store.applyLifecycle('target-1', {
+      type: 'busy',
+      busy: true,
+      sessionId: 'session-target-1',
+    });
+    assert.equal((await store.get('run-race')).status, 'sending');
+
+    await store.markDelivery('run-race', { sessionId: 'session-target-1' });
+    assert.equal((await store.get('run-race')).status, 'sent');
+    const proof = await store.confirmTargetPromptDelivery(
+      'run-race',
+      targetAuditProof('run-race'),
+    );
+    assert.equal(proof.confirmed, true);
+    assert.equal((await store.get('run-race')).status, 'running');
+
+    const done = await store.applyLifecycle('target-1', {
+      type: 'done',
+      reason: 'task_complete',
+      sessionId: 'session-target-1',
+    });
+    assert.equal(done.completed.length, 1);
+    assert.equal((await store.get('run-race')).status, 'completed');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('target prompt proof is order-independent and rejects neighboring identities', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({ ...baseRun('run-a'), targetToolType: 'claude' });
+    const wrongSource = await store.confirmTargetPromptDelivery('run-a', {
+      ...targetAuditProof('run-a'),
+      source: 'orchestration:source-other',
+    });
+    assert.equal(wrongSource.confirmed, false);
+    assert.equal(wrongSource.reason, 'target-prompt-identity-mismatch');
+    const wrongHash = await store.confirmTargetPromptDelivery('run-a', {
+      ...targetAuditProof('run-a'),
+      expectedHash: 'audit-hash-run-b',
+    });
+    assert.equal(wrongHash.confirmed, false);
+    assert.equal(wrongHash.reason, 'target-prompt-hash-mismatch');
+
+    const early = await store.confirmTargetPromptDelivery('run-a', {
+      ...targetAuditProof('run-a'),
+      source: 'codex-orchestration:source-1',
+    });
+    assert.equal(early.confirmed, true);
+    assert.equal((await store.get('run-a')).status, 'creating');
+
+    await store.markDelivery('run-a', { sessionId: 'session-target-1' });
+    const run = await store.get('run-a');
+    assert.equal(run.status, 'running');
+    assert.equal(run.targetPromptProofKind, 'prompt-audit');
+    assert.equal(run.targetPromptProofUserUuid, 'user-run-a');
+
+    await store.create({ ...baseRun('run-canonical'), targetToolType: 'codex' });
+    const canonical = await store.confirmTargetPromptDelivery('run-canonical', {
+      ...targetAuditProof('run-canonical'),
+      toolType: 'codex',
+      canonicalized: true,
+      actualHash: 'canonicalized-actual-hash',
+      actualLen: 19,
+    });
+    assert.equal(canonical.confirmed, true);
+    assert.equal((await store.get('run-canonical')).targetPromptProofCanonicalized, true);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('Codex lifecycle advances only the run bound to the same process generation', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({
+      ...baseRun('run-generation'),
+      targetToolType: 'codex',
+    });
+    await store.markDelivery('run-generation', {
+      lifecycleGeneration: 'pty-a:7',
+    });
+
+    const staleBusy = await store.applyLifecycle('target-1', {
+      type: 'busy',
+      busy: true,
+      lifecycleGeneration: 'pty-b:1',
+    });
+    assert.equal(staleBusy.ignored, true);
+    assert.equal(staleBusy.ignoreReason, 'process-generation-changed');
+    assert.equal((await store.get('run-generation')).status, 'sent');
+
+    await store.applyLifecycle('target-1', {
+      type: 'busy',
+      busy: true,
+      lifecycleGeneration: 'pty-a:7',
+    });
+    assert.equal((await store.get('run-generation')).status, 'running');
+
+    await store.applyLifecycle('target-1', {
+      type: 'done',
+      reason: 'task_complete',
+      lifecycleGeneration: 'pty-a:7',
+    });
+    assert.equal((await store.get('run-generation')).status, 'completed');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('restart reconciliation does not revive an unfinished Codex run from a new process', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({
+      ...baseRun('run-restart'),
+      targetToolType: 'codex',
+    });
+    await store.markDelivery('run-restart', {
+      lifecycleGeneration: 'old-main:3',
+    });
+    await store.applyLifecycle('target-1', {
+      type: 'busy',
+      busy: true,
+      lifecycleGeneration: 'old-main:3',
+    });
+
+    const reconciled = await store.reconcile('run-restart', {
+      busy: true,
+      lifecycleGeneration: 'new-main:1',
+      resultFound: false,
+      resultComplete: false,
+    });
+    assert.equal(reconciled.completed, false);
+    const run = await store.get('run-restart');
+    assert.equal(run.status, 'waiting_recovery');
+    assert.equal(run.outcome, 'process_replaced');
+    assert.match(run.error, /process ownership changed/);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('unknown Codex generation is not treated as a proven process replacement', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({
+      ...baseRun('run-generation-unknown'),
+      targetToolType: 'codex',
+    });
+    await store.markDelivery('run-generation-unknown', {
+      lifecycleGeneration: 'main-a:4',
+      sessionId: 'session-a',
+    });
+    await store.applyLifecycle('target-1', {
+      type: 'busy',
+      busy: true,
+      lifecycleGeneration: 'main-a:4',
+    });
+
+    const missingObservation = await store.applyLifecycle('target-1', {
+      type: 'busy',
+      busy: true,
+      lifecycleGeneration: null,
+    });
+    assert.equal(missingObservation.ignored, true);
+    assert.equal(missingObservation.generationVerdict, 'unknown');
+    assert.equal(missingObservation.ignoreReason, 'observed-generation-unproven');
+
+    const reconciled = await store.reconcile('run-generation-unknown', {
+      busy: true,
+      lifecycleGeneration: null,
+      sessionId: 'unrelated-session',
+      resultFound: false,
+      resultComplete: false,
+    });
+    assert.equal(reconciled.completed, false);
+    const run = await store.get('run-generation-unknown');
+    assert.equal(run.status, 'running');
+    assert.equal(run.outcome, null);
+    assert.equal(run.error, undefined);
+    assert.equal(run.sessionId, 'session-a');
+
+    await store.create({
+      ...baseRun('run-expected-generation-unknown', 'target-2'),
+      targetToolType: 'codex',
+    });
+    await store.markDelivery('run-expected-generation-unknown');
+    const missingExpected = await store.applyLifecycle('target-2', {
+      type: 'busy',
+      busy: true,
+      lifecycleGeneration: 'main-b:1',
+    });
+    assert.equal(missingExpected.ignored, true);
+    assert.equal(missingExpected.generationVerdict, 'unknown');
+    assert.equal(missingExpected.ignoreReason, 'expected-generation-unproven');
+    assert.equal((await store.get('run-expected-generation-unknown')).status, 'sent');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('exact transcript completion still settles a Codex run after its process was replaced', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({
+      ...baseRun('run-transcript'),
+      targetToolType: 'codex',
+    });
+    await store.markDelivery('run-transcript', {
+      lifecycleGeneration: 'old-main:9',
+    });
+    const reconciled = await store.reconcile('run-transcript', {
+      busy: false,
+      lifecycleGeneration: 'new-main:1',
+      resultFound: true,
+      resultComplete: true,
+      resultAvailable: true,
+      turnIndex: 42,
+    });
+    assert.equal(reconciled.completed, true);
+    assert.equal((await store.get('run-transcript')).status, 'completed');
   } finally {
     await store.flush();
     await cleanup();
@@ -481,13 +834,38 @@ test('recovery deadline produces a final failure that can be notified', async ()
   }
 });
 
-test('new confirmed work reopens an interrupted run automatically', async () => {
+test('only an explicit recovery action can adopt the next turn after interruption', async () => {
   const { store, cleanup } = await makeStore();
   try {
     await store.create(baseRun('run-1'));
     await store.markDelivery('run-1');
     await store.applyLifecycle('target-1', { type: 'busy', busy: true });
     await store.applyLifecycle('target-1', { type: 'done', reason: 'turn_aborted' });
+    const unrelatedBusy = await store.applyLifecycle('target-1', { type: 'busy', busy: true });
+    assert.equal(unrelatedBusy.ignored, true);
+    assert.equal(unrelatedBusy.ignoreReason, 'recovery-continuation-unproven');
+    await store.reconcile('run-1', {
+      busy: true,
+      resultFound: false,
+      resultComplete: false,
+    });
+    const stillWaiting = await store.getInternal('run-1');
+    assert.equal(stillWaiting.status, 'waiting_recovery');
+    assert.equal(stillWaiting.promptHash, 'transcript-hash-run-1');
+    assert.equal(stillWaiting.resultPromptHash, null);
+    assert.equal(stillWaiting.resultAfterAt, null);
+
+    await store.resolveRecovery('run-1', 'reopen', {
+      sessionId: 'recovered-session',
+      lifecycleGeneration: 'recovered-main:1',
+    });
+    const armed = await store.getInternal('run-1');
+    assert.equal(armed.status, 'queued');
+    assert.equal(armed.resultPromptHash, null);
+    assert.ok(armed.resultAfterAt > 0);
+    assert.equal(armed.sessionId, 'recovered-session');
+    assert.equal(armed.targetLifecycleGeneration, 'recovered-main:1');
+
     await store.applyLifecycle('target-1', { type: 'busy', busy: true });
     const reopened = await store.get('run-1');
     assert.equal(reopened.status, 'running');
@@ -533,6 +911,27 @@ test('closing a source suppresses a settled notification that can no longer be d
     assert.equal(run.status, 'completed');
     assert.equal(run.notificationStatus, 'source-closed');
     assert.equal(run.notificationSuppressed, true);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('closing a source releases a sent notification that still lacks exact follow-up proof', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await finishRunAndQueueNotification(store, 'run-1', 'target-1');
+    const before = await store.get('run-1');
+    assert.equal(before.notificationStatus, 'sent');
+    assert.equal(before.sourceFollowupPending, true);
+
+    const changed = await store.handleSourceClosed('source-1');
+    assert.deepEqual(changed.map((run) => run.runId), ['run-1']);
+    const run = await store.get('run-1');
+    assert.equal(run.notificationStatus, 'source-closed');
+    assert.equal(run.notificationSuppressed, true);
+    assert.equal(run.sourceFollowupPending, false);
+    assert.deepEqual(orchestrationInstallBlockers(run), []);
   } finally {
     await store.flush();
     await cleanup();
@@ -655,6 +1054,103 @@ test('orchestration settings persist and are snapshotted into new runs', async (
     const run = await second.get('run-1');
     assert.equal(run.failureGraceMs, 1234);
     assert.equal(run.successAutoStopMs, 5678);
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an orchestration-created target keeps auto-stop ownership when later runs reuse it', async () => {
+  const { store, filePath, cleanup } = await makeStore();
+  try {
+    const created = await store.create({
+      ...baseRun('created-run', 'managed-target'),
+      targetCreated: true,
+    });
+    assert.equal(created.targetCreated, true);
+    assert.equal(created.targetCreatedByOrchestration, true);
+
+    const reused = await store.create({
+      ...baseRun('reused-run', 'managed-target'),
+      targetCreated: false,
+    });
+    assert.equal(reused.targetCreated, false);
+    assert.equal(reused.targetCreatedByOrchestration, true);
+    assert.equal(shouldScheduleCreatedTargetAutoStop({
+      ...reused,
+      status: 'completed',
+      successAutoStopMs: 300_000,
+      autoStopCreatedTargets: true,
+    }), true);
+
+    const manual = await store.create({
+      ...baseRun('manual-run', 'manual-target'),
+      targetCreated: false,
+    });
+    assert.equal(manual.targetCreatedByOrchestration, false);
+    assert.equal(shouldScheduleCreatedTargetAutoStop({
+      ...manual,
+      status: 'completed',
+      successAutoStopMs: 300_000,
+      autoStopCreatedTargets: true,
+    }), false);
+
+    await store.flush();
+    const persisted = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
+    assert.deepEqual(persisted.createdTargetTabIds, ['managed-target']);
+
+    const restored = new OrchestrationRunStore(filePath);
+    const reusedAfterRestart = await restored.create({
+      ...baseRun('reused-after-restart', 'managed-target'),
+      targetCreated: false,
+    });
+    assert.equal(reusedAfterRestart.targetCreatedByOrchestration, true);
+    await restored.flush();
+  } finally {
+    await cleanup();
+  }
+});
+
+test('v2 run history backfills orchestration-created target ownership', async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'noted-orchestration-owned-target-'));
+  const filePath = path.join(dir, 'runs.json');
+  try {
+    const now = Date.now();
+    await fs.promises.writeFile(filePath, JSON.stringify({
+      version: 2,
+      settings: {},
+      runs: [
+        {
+          ...baseRun('legacy-created', 'legacy-managed-target'),
+          targetCreated: true,
+          status: 'completed',
+          createdAt: now - 20_000,
+          completedAt: now - 19_000,
+          autoStopAt: now - 18_000,
+          autoStopStatus: 'stopped',
+          autoStopFinishedAt: now - 17_000,
+        },
+        {
+          ...baseRun('legacy-reused-before-fix', 'legacy-managed-target'),
+          targetCreated: false,
+          status: 'completed',
+          createdAt: now - 10_000,
+          completedAt: now - 5_000,
+        },
+      ],
+    }), 'utf8');
+
+    const store = new OrchestrationRunStore(filePath);
+    const backfilled = await store.get('legacy-reused-before-fix');
+    assert.equal(backfilled.targetCreatedByOrchestration, true);
+    assert.equal(backfilled.autoStopAt, now + 295_000);
+    assert.equal(backfilled.autoStopStatus, 'scheduled');
+
+    const reused = await store.create({
+      ...baseRun('legacy-reused', 'legacy-managed-target'),
+      targetCreated: false,
+    });
+    assert.equal(reused.targetCreatedByOrchestration, true);
+    await store.flush();
   } finally {
     await fs.promises.rm(dir, { recursive: true, force: true });
   }

@@ -1,3 +1,8 @@
+import {
+  claudeHistoryQueuePresentationIdentity,
+  reduceClaudeHistoryPromptCarrier,
+} from './historyClaudePromptCarriers.mjs';
+
 const FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 
 const isObject = (value) =>
@@ -186,7 +191,7 @@ const projectUserEntry = (canonical, envelope, blocks) => {
   };
 };
 
-const upsertEntry = (entries, incoming) => {
+const upsertEntry = (entries, incoming, { beforeFirstQueued = false } = {}) => {
   const index = entries.findIndex((entry) =>
     entry?.uuid === incoming.uuid
     || (
@@ -194,7 +199,21 @@ const upsertEntry = (entries, incoming) => {
       && entry?.sourceIdentity === incoming.sourceIdentity
     )
   );
-  if (index < 0) return [...entries, incoming];
+  if (index < 0) {
+    if (beforeFirstQueued) {
+      const queuedIndex = entries.findIndex((entry) => (
+        entry?.role === 'queued' && entry?.queueStatus === 'queued'
+      ));
+      if (queuedIndex >= 0) {
+        return [
+          ...entries.slice(0, queuedIndex),
+          incoming,
+          ...entries.slice(queuedIndex),
+        ];
+      }
+    }
+    return [...entries, incoming];
+  }
 
   const existing = entries[index];
   const merged = {
@@ -284,6 +303,48 @@ export function applyHistoryLiveToolResultsToEntry(entry, results) {
 }
 
 /**
+ * Retires transient live tool results once the exact durable action exists.
+ *
+ * A Task/spawn output is only the child identity/acceptance carrier. The same
+ * durable Task action is later enriched with the child's terminal result, so
+ * comparing both result strings can never settle: they intentionally describe
+ * different lifecycle phases. Exact toolUseId ownership is sufficient for a
+ * Task because its live result is not rendered as the Task outcome. Raw tools
+ * still require exact result/error coverage (or an exact dehydrated ref).
+ */
+export function reconcileHistoryLiveToolResults(durableEntries, liveResults) {
+  const source = liveResults instanceof Map ? liveResults : new Map();
+  if (source.size === 0) return source;
+  const remaining = new Map(source);
+  for (const entry of Array.isArray(durableEntries) ? durableEntries : []) {
+    for (const action of Array.isArray(entry?.actions) ? entry.actions : []) {
+      const toolUseId = actionToolUseId(action);
+      if (!toolUseId) continue;
+      if (action?.tool === 'Task') {
+        // Live Task blocks stamp the one decoded card as
+        // `${callId}:canonical:0`; the durable card keeps the provider's
+        // original callId. Both are the same exact spawn action, not fuzzy
+        // text matching. Delete either carrier only for this one-card Task
+        // shape.
+        remaining.delete(toolUseId);
+        remaining.delete(toolUseId + ':canonical:0');
+        continue;
+      }
+      if (!remaining.has(toolUseId)) continue;
+      if (action?.tool !== '__raw__' || !isObject(action.rawTool)) continue;
+      const expected = remaining.get(toolUseId);
+      const durableCoversLive = action.rawTool.resultRef
+        ? typeof action.rawTool.result === 'string'
+        : action.rawTool.result === expected?.result;
+      if (durableCoversLive && Boolean(action.rawTool.isError) === Boolean(expected?.isError)) {
+        remaining.delete(toolUseId);
+      }
+    }
+  }
+  return remaining.size === source.size ? source : remaining;
+}
+
+/**
  * Removes live rows only after their durable counterparts belong to the
  * committed History presentation. The caller owns the commit boundary (React
  * uses a layout effect) so a fetched-but-not-yet-rendered snapshot cannot
@@ -292,7 +353,7 @@ export function applyHistoryLiveToolResultsToEntry(entry, results) {
 export function reconcileCommittedHistoryLiveProjection(liveEntries, durableEntries) {
   const durableIdentities = new Set(
     (durableEntries || [])
-      .map((entry) => entry?.sourceIdentity)
+      .map((entry) => historyLivePresentationIdentity(entry))
       .filter(Boolean),
   );
   const source = Array.isArray(liveEntries) ? liveEntries : [];
@@ -300,7 +361,8 @@ export function reconcileCommittedHistoryLiveProjection(liveEntries, durableEntr
     return { entries: source, durableIdentities };
   }
   const remaining = source.filter((entry) =>
-    !entry?.sourceIdentity || !durableIdentities.has(entry.sourceIdentity)
+    !historyLivePresentationIdentity(entry)
+    || !durableIdentities.has(historyLivePresentationIdentity(entry))
   );
   return {
     entries: remaining.length === source.length ? source : remaining,
@@ -322,11 +384,12 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
 
   const durableIdentities = new Set(
     durable
-      .map((entry) => entry?.sourceIdentity)
+      .map((entry) => historyLivePresentationIdentity(entry))
       .filter(Boolean),
   );
   const unmatchedLive = live.filter((entry) =>
-    !entry?.sourceIdentity || !durableIdentities.has(entry.sourceIdentity)
+    !historyLivePresentationIdentity(entry)
+    || !durableIdentities.has(historyLivePresentationIdentity(entry))
   );
   if (unmatchedLive.length === 0) return durable;
 
@@ -358,16 +421,46 @@ export function historyLivePresentationKey(entry) {
   // Local user prompts gain their audit identity after they are already on
   // screen; keying those by source would remount the row merely because its
   // delivery proof arrived.
-  if (sourceIdentity && entry?.role === 'assistant') {
+  if (
+    sourceIdentity
+    && (
+      entry?.role === 'assistant'
+      || sourceIdentity.startsWith('claude-queue:')
+    )
+  ) {
     return 'source:' + sourceIdentity;
   }
+  const queueIdentity = claudeHistoryQueuePresentationIdentity(entry);
+  if (queueIdentity) return 'source:' + queueIdentity;
   return 'uuid:' + String(entry?.uuid || '');
 }
 
-const CODEX_TURN_BOUNDARIES = new Set([
+export function historyLivePresentationIdentity(entry) {
+  const sourceIdentity = String(entry?.sourceIdentity || '');
+  if (sourceIdentity) return sourceIdentity;
+  const queueIdentity = claudeHistoryQueuePresentationIdentity(entry);
+  if (queueIdentity) return queueIdentity;
+  // Claude's durable projection preserves the JSONL assistant UUID directly.
+  // That UUID is the exact live→durable identity even though Claude does not
+  // add Codex's separate sourceIdentity field.
+  if (entry?.role === 'assistant' && entry?.uuid) {
+    return 'assistant-uuid:' + String(entry.uuid);
+  }
+  if (entry?.role === 'user' && entry?.uuid) {
+    return 'user-uuid:' + String(entry.uuid);
+  }
+  return '';
+}
+
+const TURN_BOUNDARIES_THAT_CLEAR_PENDING_THINKING = new Set([
   'task_started',
   'task_complete',
   'turn_aborted',
+  // Provider-neutral presentation boundary emitted by History when its
+  // authoritative turn lifecycle settles. Claude has no Codex-style rollout
+  // boundary, so this releases a thinking-only live record that the durable
+  // Claude projection deliberately does not materialize.
+  'turn_settled',
 ]);
 
 const clearPendingThinking = (entries, sessionId) => {
@@ -391,9 +484,20 @@ export function reduceHistoryLiveProjection(
   const entries = Array.isArray(currentEntries) ? currentEntries : [];
   if (
     envelope?.type === 'turn_boundary'
-    && CODEX_TURN_BOUNDARIES.has(envelope.boundary)
+    && TURN_BOUNDARIES_THAT_CLEAR_PENDING_THINKING.has(envelope.boundary)
   ) {
     return clearPendingThinking(entries, String(envelope.sessionId || ''));
+  }
+  const promptCarrier = reduceClaudeHistoryPromptCarrier(entries, envelope, {
+    includeUserText,
+  });
+  if (promptCarrier.handled) {
+    return promptCarrier.promptBoundary
+      ? clearPendingThinking(
+          promptCarrier.entries,
+          String(envelope?.sessionId || envelope?.message?.sessionId || ''),
+        )
+      : promptCarrier.entries;
   }
   const canonical = unwrapLiveMessage(envelope);
   if (!canonical) return entries;
@@ -437,7 +541,7 @@ export function reduceHistoryLiveProjection(
         next = next.filter((candidate) => !pendingUuids.has(candidate?.uuid));
       }
     }
-    return upsertEntry(next, entry);
+    return upsertEntry(next, entry, { beforeFirstQueued: true });
   }
   if (role === 'user') {
     const entry = projectUserEntry(canonical, envelope, blocks);

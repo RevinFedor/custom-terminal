@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   beginCoordinatedAgentSend,
+  bindCoordinatedAgentSendHandoff,
+  createCoordinatedAgentSendCancellationWait,
   getCoordinatedAgentAction,
+  isCoordinatedAgentSendCancellationRequested,
   requestCoordinatedStopAfterSend,
   resetCoordinatedAgentActionsForTests,
   settleCoordinatedAgentSend,
@@ -92,4 +95,45 @@ test('an unknown queued Stop result is a failure, not a proven stop', async () =
   });
   assert.equal(settled.stopped, false);
   assert.equal(settled.reason, 'queued-stop-failed');
+});
+
+test('queued Stop wakes the exact in-flight readiness wait before submit', async () => {
+  const first = beginCoordinatedAgentSend('tab-a', 100);
+  const wait = createCoordinatedAgentSendCancellationWait('tab-a', first.token);
+  assert.equal(isCoordinatedAgentSendCancellationRequested('tab-a', first.token), false);
+
+  requestCoordinatedStopAfterSend('tab-a', 125);
+  const cancelled = await wait.promise;
+  assert.equal(cancelled.token, first.token);
+  assert.equal(cancelled.stopRequestedAt, 125);
+  assert.equal(isCoordinatedAgentSendCancellationRequested('tab-a', first.token), true);
+});
+
+test('binds one exact handoff so Stop can cancel the matching main-side write', () => {
+  const send = beginCoordinatedAgentSend('tab-a', 100);
+  const bound = bindCoordinatedAgentSendHandoff('tab-a', send.token, 'handoff-a');
+  assert.equal(bound.bound, true);
+  assert.equal(getCoordinatedAgentAction('tab-a')?.handoffId, 'handoff-a');
+  assert.equal(bindCoordinatedAgentSendHandoff('tab-a', send.token, 'handoff-b').bound, false);
+});
+
+test('Stop for a newer action cannot cancel a stale readiness waiter', async () => {
+  const first = beginCoordinatedAgentSend('tab-a', 100);
+  await settleCoordinatedAgentSend({
+    tabId: 'tab-a',
+    token: first.token,
+    runQueuedStop: async () => ({ success: true }),
+  });
+  const staleWait = createCoordinatedAgentSendCancellationWait('tab-a', first.token);
+  const second = beginCoordinatedAgentSend('tab-a', 200);
+  requestCoordinatedStopAfterSend('tab-a', 225);
+
+  const outcome = await Promise.race([
+    staleWait.promise.then(() => 'stale-cancelled'),
+    Promise.resolve('not-cancelled'),
+  ]);
+  staleWait.cancel();
+  assert.equal(outcome, 'not-cancelled');
+  assert.equal(isCoordinatedAgentSendCancellationRequested('tab-a', first.token), false);
+  assert.equal(isCoordinatedAgentSendCancellationRequested('tab-a', second.token), true);
 });

@@ -2,6 +2,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { _api } = require('./codex-data');
+const {
+  recordCodexProcessActionOwnership,
+  resetCodexProcessActionOwnershipForTests,
+} = require('../codex-process-action-ownership');
 
 function historyFor(...items) {
   const records = [
@@ -40,6 +44,115 @@ function output(callId, value, isError = false) {
 function rawActions(history) {
   return history.flatMap((entry) => entry.actions || []).map((action) => action.rawTool);
 }
+
+test('durable Codex subagent cards carry only exact live process-generation proof', (t) => {
+  resetCodexProcessActionOwnershipForTests();
+  t.after(() => resetCodexProcessActionOwnershipForTests());
+  const sessionId = 'history-tools-session';
+  const exactCall = {
+    __line: 2,
+    __byteOffset: 120,
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      namespace: 'collaboration',
+      name: 'spawn_agent',
+      call_id: 'spawn-exact',
+      arguments: JSON.stringify({ task_name: 'exact child', message: 'inspect' }),
+    },
+  };
+  const historicalCall = {
+    __line: 3,
+    __byteOffset: 240,
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      namespace: 'collaboration',
+      name: 'spawn_agent',
+      call_id: 'spawn-old',
+      arguments: JSON.stringify({ task_name: 'old child', message: 'inspect' }),
+    },
+  };
+  recordCodexProcessActionOwnership({
+    sessionId,
+    callId: 'spawn-exact',
+    sourceByteOffset: 120,
+    lifecycleGeneration: 'pty-current:7',
+  });
+
+  const history = _api.buildCodexFullHistory([
+    {
+      __line: 1,
+      __byteOffset: 0,
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'spawn children' },
+    },
+    exactCall,
+    historicalCall,
+  ], sessionId);
+  const tasks = history.flatMap((entry) => entry.actions || [])
+    .filter((action) => action?.tool === 'Task');
+  const exact = tasks.find((action) => action.toolUseId === 'spawn-exact');
+  const historical = tasks.find((action) => action.toolUseId === 'spawn-old');
+  assert.equal(exact?.processGeneration, 'pty-current:7');
+  assert.equal(historical?.processGeneration, undefined);
+});
+
+test('response_item subagent notification closes a fire-and-forget Codex card', () => {
+  const history = _api.buildCodexFullHistory([
+    {
+      __line: 1,
+      __byteOffset: 0,
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'spawn one child' },
+    },
+    {
+      __line: 2,
+      __byteOffset: 100,
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        namespace: 'multi_agent_v1',
+        name: 'spawn_agent',
+        call_id: 'spawn-fire-and-forget',
+        arguments: JSON.stringify({ message: 'reply later' }),
+      },
+    },
+    {
+      __line: 3,
+      __byteOffset: 200,
+      type: 'response_item',
+      payload: {
+        type: 'function_call_output',
+        call_id: 'spawn-fire-and-forget',
+        output: JSON.stringify({ agent_id: 'child-session-1', nickname: 'Child' }),
+      },
+    },
+    {
+      __line: 4,
+      __byteOffset: 300,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{
+          type: 'input_text',
+          text: '<subagent_notification>\n'
+            + JSON.stringify({
+              agent_path: 'child-session-1',
+              status: { completed: 'child finished' },
+            })
+            + '\n</subagent_notification>',
+        }],
+      },
+    },
+  ], 'history-tools-session');
+
+  const task = history.flatMap((entry) => entry.actions || [])
+    .find((action) => action?.tool === 'Task');
+  assert.equal(task?.subagentStatus, 'completed');
+  assert.equal(task?.result, 'child finished');
+});
 
 test('assistant source identity follows the JSONL byte owner, not a transient live UUID', () => {
   const records = [

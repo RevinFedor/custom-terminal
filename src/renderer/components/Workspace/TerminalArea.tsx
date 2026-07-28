@@ -10,10 +10,13 @@ import { clearPendingResume, markPendingResume } from '../../utils/pendingResume
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import {
+  applyAgentLaunchPreparationSnapshot,
   applyClaudeStartupDefaultsGate,
+  describeLaunchPreparationFailure,
   hideSessionStartingFromLifecycle,
   invalidateSessionStartingProbeSequence,
   isSessionStartingProbeCurrent,
+  restoreClaudeStartupDefaultsGate,
   syncSessionStartingWithPresence,
 } from '../../utils/sessionStartingState.mjs';
 import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
@@ -36,6 +39,10 @@ type SessionStartingState = {
   startupProofOutcome?: string | null;
   startupUserRetryable?: boolean;
   stickySource?: 'claude-startup-defaults';
+  launchPreparing?: boolean;
+  launchPreparationPhase?: string | null;
+  launchPreparationToken?: number | null;
+  launchPreparationStatus?: 'preparing' | 'accepted' | 'rejected' | null;
 };
 
 type AgentStoppingState = {
@@ -189,9 +196,22 @@ const getSessionStartingPresentation = (state: SessionStartingState) => {
   const hasBlocker = (name: string) => blockers.has(name) || reason.includes(name);
   const isError = state.startupFailed === true;
 
+  if (state.launchPreparing) {
+    const repairingHistory = state.launchPreparationPhase === 'repairing-history';
+    return {
+      isError: false,
+      title: state.sessionId ? `PREPARING ${engineLabel} SESSION...` : `STARTING ${engineLabel}...`,
+      subtitle: repairingHistory
+        ? 'Checking the saved conversation before launch'
+        : 'Checking the terminal before launch',
+      detail: sessionLabel ? `Session ${sessionLabel}` : null,
+    };
+  }
+
   if (isError) {
     const failedCommand = String(state.startupFailedCommand || '');
     const proofOutcome = String(state.startupProofOutcome || '');
+    const launchFailure = describeLaunchPreparationFailure(state);
     return {
       isError: true,
       title: `${engineLabel} START FAILED`,
@@ -202,8 +222,10 @@ const getSessionStartingPresentation = (state: SessionStartingState) => {
         ? (proofOutcome === 'unresolved'
           ? `Could not confirm ${failedCommand}`
           : `${failedCommand} was not applied`)
-        : 'Terminal input did not become ready',
-      detail: state.startupError || 'Close this status or stop the process and try again',
+        : (launchFailure?.subtitle || 'Terminal input did not become ready'),
+      detail: launchFailure?.detail
+        || state.startupError
+        || 'Close this status or stop the process and try again',
     };
   }
 
@@ -571,6 +593,8 @@ export interface AgentLifecycleSummary {
   description: string;
   detail?: string | null;
   spinner: boolean;
+  dismissLabel?: string;
+  onDismiss?: () => void;
   retryLabel?: string;
   onRetry?: () => void;
 }
@@ -657,9 +681,45 @@ function TerminalArea({
     );
   }, []);
 
+  const applyLaunchPreparationState = useCallback((state: any) => {
+    const info = activeAgentStartingInfoRef.current;
+    if (!info || currentView !== 'terminal') return;
+    const tabId = String(state?.tabId || info.tabId);
+    const engine = state?.toolType === 'codex'
+      ? 'codex'
+      : (state?.toolType === 'claude' ? 'claude' : info.engine);
+    if (info.tabId !== tabId || info.engine !== engine) return;
+    const restoresVisibleState = state?.preparing === true
+      || (state && state.preparing === false && state.accepted !== true && state.cleared !== true);
+    if (restoresVisibleState) {
+      dismissedStartingKeysRef.current.delete(startingDismissKey(info));
+      invalidateStartingProbeForTab(tabId);
+    } else if (state?.cleared === true) {
+      invalidateStartingProbeForTab(tabId);
+    }
+    setSessionStarting((prev) => applyAgentLaunchPreparationSnapshot(prev, info, state));
+  }, [currentView, invalidateStartingProbeForTab, startingDismissKey]);
+
   useEffect(() => {
     activeAgentStartingInfoRef.current = activeAgentStartingInfo;
   }, [activeAgentStartingInfo]);
+
+  // Launch preparation starts before a shell command exists, so neither OSC
+  // command state nor TUI presence can reconstruct it. Main keeps an exact
+  // tab-scoped snapshot; this read makes tab switches lossless.
+  useEffect(() => {
+    const info = activeAgentStartingInfo;
+    if (!info || currentView !== 'terminal') return;
+    let cancelled = false;
+    ipcRenderer.invoke('agent:get-launch-preparation-state', info.tabId)
+      .then((result: any) => {
+        if (cancelled) return;
+        if (activeAgentStartingInfoRef.current?.tabId !== info.tabId) return;
+        applyLaunchPreparationState(result?.state || null);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [activeAgentStartingInfo, activeAgentStartingKey, applyLaunchPreparationState, currentView]);
 
   // Re-read the startup gate whenever this surface (re)binds to a Claude tab.
   // The gate event is delivered only to the ACTIVE tab; in the 2026-07-25
@@ -673,22 +733,13 @@ function TerminalArea({
     if (!info || info.engine !== 'claude' || currentView !== 'terminal') return;
     let cancelled = false;
     fetchClaudeStartupDefaultsGate(info.tabId).then((gate) => {
-      if (cancelled || !gate) return;
+      if (cancelled) return;
       if (activeAgentStartingInfoRef.current?.tabId !== info.tabId) return;
-      if (gate.status !== 'pending' && gate.status !== 'failed') return;
-      setSessionStarting((prev) => applyClaudeStartupDefaultsGate(prev, info, {
-        tabId: info.tabId,
-        status: gate.status,
-        reason: gate.reason,
-        error: gate.error,
-        failedCommand: gate.failedCommand,
-        proofOutcome: gate.proofOutcome,
-        userRetryable: gate.userRetryable,
-      }));
+      setSessionStarting((prev) => restoreClaudeStartupDefaultsGate(prev, info, gate));
       console.warn('[SessionStartingOverlay] gate-restored tab=' + info.tabId.slice(-12)
-        + ' status=' + gate.status
-        + ' command=' + (gate.failedCommand || '-')
-        + ' outcome=' + (gate.proofOutcome || '-'));
+        + ' status=' + (gate?.status || 'absent')
+        + ' command=' + (gate?.failedCommand || '-')
+        + ' outcome=' + (gate?.proofOutcome || '-'));
     });
     return () => { cancelled = true; };
   }, [activeAgentStartingInfo, currentView]);
@@ -831,6 +882,9 @@ function TerminalArea({
       if (!eventTabId || !info || info.tabId !== eventTabId || info.engine !== 'codex' || currentView !== 'terminal') return;
       void refreshSessionStarting('codex-manual-action:' + (data.type || '-'));
     };
+    const onLaunchPreparation = (_: any, state: any) => {
+      applyLaunchPreparationState(state);
+    };
     const onAgentStopping = (_: any, data: {
       tabId?: string;
       toolType?: string | null;
@@ -901,6 +955,7 @@ function TerminalArea({
     ipcRenderer.on('codex:tui-ready', onCodexReady);
     ipcRenderer.on('codex:tui-not-ready', onCodexNotReady);
     ipcRenderer.on('codex:tui-manual-action-required', onCodexManualAction);
+    ipcRenderer.on('agent:launch-preparation-state', onLaunchPreparation);
     ipcRenderer.on('claude:busy-state', onClaudeBusy);
     ipcRenderer.on('codex:busy-state', onCodexBusy);
     ipcRenderer.on('agent:stopping-state', onAgentStopping);
@@ -912,21 +967,42 @@ function TerminalArea({
       ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
       ipcRenderer.removeListener('codex:tui-not-ready', onCodexNotReady);
       ipcRenderer.removeListener('codex:tui-manual-action-required', onCodexManualAction);
+      ipcRenderer.removeListener('agent:launch-preparation-state', onLaunchPreparation);
       ipcRenderer.removeListener('claude:busy-state', onClaudeBusy);
       ipcRenderer.removeListener('codex:busy-state', onCodexBusy);
       ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
       window.removeEventListener('claude-startup-defaults-gate', onClaudeStartupGate);
     };
-  }, [activeTabId, currentView, invalidateStartingProbeForTab, refreshSessionStarting, startingDismissKey]);
+  }, [activeTabId, applyLaunchPreparationState, currentView, invalidateStartingProbeForTab, refreshSessionStarting, startingDismissKey]);
 
   const handleDismissSessionStarting = useCallback(() => {
     const current = sessionStarting;
     if (current) {
       dismissedStartingKeysRef.current.add(startingDismissKey(current));
       console.warn('[SessionStartingOverlay] dismissed tab=' + current.tabId.slice(-12) + ' engine=' + current.engine);
+      if (
+        current.launchPreparationStatus === 'rejected'
+        && Number(current.launchPreparationToken || 0) > 0
+      ) {
+        void ipcRenderer.invoke('agent:clear-launch-preparation-state', {
+          tabId: current.tabId,
+          token: current.launchPreparationToken,
+          reason: 'user-dismissed',
+        }).then((result: any) => {
+          // A new launch may supersede the card between click and IPC. Its
+          // exact token is intentionally not cleared; immediately apply the
+          // authoritative replacement instead.
+          if (result?.cleared !== true && result?.state) {
+            applyLaunchPreparationState(result.state);
+          }
+        }).catch((error: any) => {
+          console.warn('[SessionStartingOverlay] launch failure dismiss failed tab='
+            + current.tabId.slice(-12) + ' error=' + (error?.message || String(error)));
+        });
+      }
     }
     setSessionStarting(null);
-  }, [sessionStarting, startingDismissKey]);
+  }, [applyLaunchPreparationState, sessionStarting, startingDismissKey]);
 
   // Explicit user approval re-enters the main-owned transaction for the same
   // live launch. Main keeps already-proven earlier steps and retries only the
@@ -999,16 +1075,16 @@ function TerminalArea({
   const showAgentStoppingOverlay = !!agentStopping
     && currentView === 'terminal'
     && activeTabIdForOverlay === agentStopping.tabId;
+  const showSessionStartingOverlay = !!sessionStarting
+    && currentView === 'terminal'
+    && !showAgentStoppingOverlay
+    && activeTabIdForOverlay === sessionStarting.tabId;
   const showInterruptedOverlay = !!activeTabInterruptedEngine
     && !!activeTabSessionId
     && currentView === 'terminal'
     && !isRestoring
-    && !showAgentStoppingOverlay;
-  const showSessionStartingOverlay = !!sessionStarting
-    && currentView === 'terminal'
     && !showAgentStoppingOverlay
-    && !showInterruptedOverlay
-    && activeTabIdForOverlay === sessionStarting.tabId;
+    && !showSessionStartingOverlay;
 
   const lifecycleSummary = useMemo<AgentLifecycleSummary | null>(() => {
     if (showAgentStoppingOverlay && agentStopping) {
@@ -1046,12 +1122,14 @@ function TerminalArea({
         description: presentation.subtitle,
         detail: presentation.detail,
         spinner: !presentation.isError,
+        dismissLabel: presentation.isError ? 'Dismiss starting status' : undefined,
+        onDismiss: presentation.isError ? handleDismissSessionStarting : undefined,
         retryLabel: canRetryStartupSettings ? 'RETRY SETTINGS' : undefined,
         onRetry: canRetryStartupSettings ? handleRetryStartupDefaults : undefined,
       };
     }
     return null;
-  }, [activeTabIdForOverlay, activeTabInterruptedEngine, activeTabSessionId, agentStopping, handleRetryStartupDefaults, sessionStarting, showAgentStoppingOverlay, showInterruptedOverlay, showSessionStartingOverlay]);
+  }, [activeTabIdForOverlay, activeTabInterruptedEngine, activeTabSessionId, agentStopping, handleDismissSessionStarting, handleRetryStartupDefaults, sessionStarting, showAgentStoppingOverlay, showInterruptedOverlay, showSessionStartingOverlay]);
 
   useEffect(() => {
     onLifecycleStatusChange?.(lifecycleSummary);

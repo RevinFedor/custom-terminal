@@ -78,6 +78,20 @@ test('a read refreshes recency so an active tab survives eviction', () => {
   assert.equal(getHistoryMeasuredLayout('tab:1', 10), null);
 });
 
+test('refuses a zero offset that would overwrite a real position', () => {
+  saveHistoryMeasuredLayout('tab:a', snap(3, 43140), 2304);
+  // The transient "list is still at the top" sample seen right after a
+  // restore is applied — accepting it lost the user's place entirely.
+  assert.equal(saveHistoryMeasuredLayout('tab:a', snap(3, 0), 2304), false);
+  assert.equal(getHistoryMeasuredLayout('tab:a', 2304)?.scrollTop, 43140);
+});
+
+test('accepts a zero offset when nothing better is stored', () => {
+  // A genuine top-of-list visit must still be recordable.
+  assert.equal(saveHistoryMeasuredLayout('tab:top', snap(3, 0), 100), true);
+  assert.equal(getHistoryMeasuredLayout('tab:top', 100)?.scrollTop, 0);
+});
+
 test('re-saving the same owner replaces, not duplicates', () => {
   saveHistoryMeasuredLayout('tab:a', snap(3, 10), 500);
   saveHistoryMeasuredLayout('tab:a', snap(5, 999), 500);

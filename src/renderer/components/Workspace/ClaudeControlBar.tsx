@@ -439,6 +439,9 @@ export default function ClaudeControlBar({
   const historyCanInterruptTurn = useUIStore(
     (s) => s.historyComposerAvailability[tabId]?.canInterruptTurn === true,
   );
+  const historyCanStopProcess = useUIStore(
+    (s) => s.historyComposerAvailability[tabId]?.canStopProcess === true,
+  );
   const historyCanPullDraft = useUIStore(
     (s) => s.historyComposerAvailability[tabId]?.canPullDraft === true,
   );
@@ -2653,11 +2656,14 @@ export default function ClaudeControlBar({
 
   const sendStopCurrentTurn = () => {
     if (!showComposerInputActions) return;
-    if (isPrimaryHistoryAgent && !historyCanInterruptTurn) return;
+    if (isPrimaryHistoryAgent && !historyCanInterruptTurn && !historyCanStopProcess) return;
     cancelPendingEnterRef.current = true;
     if (enterPending) setEnterPending(false);
     if (isPrimaryHistoryAgent) {
-      window.dispatchEvent(new CustomEvent('history-panel:interrupt-turn', {
+      window.dispatchEvent(new CustomEvent(
+        historyCanInterruptTurn
+          ? 'history-panel:interrupt-turn'
+          : 'history-panel:stop-process', {
         detail: { tabId, source: 'control-bar' },
       }));
       focusHistoryComposer();
@@ -3733,16 +3739,16 @@ export default function ClaudeControlBar({
             <ControlHint
               label={isPrimaryHistoryAgent ? 'Остановить текущий ответ' : 'Отправить Ctrl+C в живой CLI'}
               shortcut={isPrimaryHistoryAgent ? 'Процесс останется запущен' : 'Результат зависит от текущего экрана'}
-              disabled={isPrimaryHistoryAgent && !historyCanInterruptTurn}
+              disabled={isPrimaryHistoryAgent && !historyCanInterruptTurn && !historyCanStopProcess}
             >
             <button
               onMouseDown={(e) => e.preventDefault()}
               onClick={sendStopCurrentTurn}
-              disabled={isPrimaryHistoryAgent && !historyCanInterruptTurn}
+              disabled={isPrimaryHistoryAgent && !historyCanInterruptTurn && !historyCanStopProcess}
               aria-label={isPrimaryHistoryAgent
                 ? `Stop current ${sessionType === 'codex' ? 'Codex' : 'Claude'} response`
                 : `Send Ctrl+C to ${sessionType === 'codex' ? 'Codex' : 'Claude'}`}
-              className={`inline-flex items-center justify-center gap-1 transition-colors ${isPrimaryHistoryAgent && !historyCanInterruptTurn ? '' : 'cursor-pointer'}`}
+              className={`inline-flex items-center justify-center gap-1 transition-colors ${isPrimaryHistoryAgent && !historyCanInterruptTurn && !historyCanStopProcess ? '' : 'cursor-pointer'}`}
               style={{
                 height: 22,
                 minWidth: 34,
@@ -3750,29 +3756,33 @@ export default function ClaudeControlBar({
                 background: 'transparent',
                 border: '1px solid rgba(248,113,113,0.30)',
                 borderRadius: 4,
-                color: isPrimaryHistoryAgent && !historyCanInterruptTurn ? '#5f4545' : '#f87171',
-                cursor: isPrimaryHistoryAgent && !historyCanInterruptTurn ? 'default' : 'pointer',
+                color: isPrimaryHistoryAgent && !historyCanInterruptTurn && !historyCanStopProcess ? '#5f4545' : '#f87171',
+                cursor: isPrimaryHistoryAgent && !historyCanInterruptTurn && !historyCanStopProcess ? 'default' : 'pointer',
                 fontSize: 11,
                 fontWeight: 650,
                 lineHeight: 1,
                 flexShrink: 0,
               }}
               onMouseEnter={(e) => {
-                if (isPrimaryHistoryAgent && !historyCanInterruptTurn) return;
+                if (isPrimaryHistoryAgent && !historyCanInterruptTurn && !historyCanStopProcess) return;
                 const el = e.currentTarget as HTMLButtonElement;
                 el.style.backgroundColor = 'rgba(248,113,113,0.12)';
                 el.style.borderColor = 'rgba(248,113,113,0.58)';
                 el.style.color = '#fecaca';
               }}
               onMouseLeave={(e) => {
-                if (isPrimaryHistoryAgent && !historyCanInterruptTurn) return;
+                if (isPrimaryHistoryAgent && !historyCanInterruptTurn && !historyCanStopProcess) return;
                 const el = e.currentTarget as HTMLButtonElement;
                 el.style.backgroundColor = 'transparent';
                 el.style.borderColor = 'rgba(248,113,113,0.30)';
                 el.style.color = '#f87171';
               }}
               title={isPrimaryHistoryAgent
-                ? (historyCanInterruptTurn ? 'Stop the current response' : 'No interruptible response')
+                ? (historyCanInterruptTurn
+                    ? 'Stop the current response'
+                    : historyCanStopProcess
+                      ? 'Cancel this Send and stop the process'
+                      : 'No interruptible response')
                 : `Send Ctrl+C to ${sessionType === 'codex' ? 'Codex' : 'Claude'} - clears input first if it is not empty`}
             >
               <span

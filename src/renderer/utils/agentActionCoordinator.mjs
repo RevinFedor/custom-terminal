@@ -33,10 +33,29 @@ export function beginCoordinatedAgentSend(tabId, now = Date.now()) {
     phase: 'sending',
     startedAt: Number(now) || Date.now(),
     stopRequestedAt: null,
+    handoffId: null,
   };
   actionsByTab.set(key, state);
   emit(key, 'send-started');
   return { started: true, token: state.token, state: snapshot(state) };
+}
+
+export function bindCoordinatedAgentSendHandoff(tabId, token, handoffId) {
+  const key = String(tabId || '');
+  const state = actionsByTab.get(key);
+  const exactHandoffId = String(handoffId || '').trim();
+  if (!state || state.token !== token) {
+    return { bound: false, reason: 'stale-send', state: snapshot(state) };
+  }
+  if (!exactHandoffId) {
+    return { bound: false, reason: 'missing-handoff', state: snapshot(state) };
+  }
+  if (state.handoffId && state.handoffId !== exactHandoffId) {
+    return { bound: false, reason: 'handoff-already-bound', state: snapshot(state) };
+  }
+  state.handoffId = exactHandoffId;
+  emit(key, 'send-handoff-bound');
+  return { bound: true, handoffId: exactHandoffId, state: snapshot(state) };
 }
 
 export function requestCoordinatedStopAfterSend(tabId, now = Date.now()) {
@@ -51,6 +70,51 @@ export function requestCoordinatedStopAfterSend(tabId, now = Date.now()) {
   state.stopRequestedAt = Number(now) || Date.now();
   emit(key, 'stop-queued');
   return { queued: true, deduped: false, token: state.token, state: snapshot(state) };
+}
+
+export function isCoordinatedAgentSendCancellationRequested(tabId, token) {
+  const state = actionsByTab.get(String(tabId || ''));
+  return !!state
+    && state.token === token
+    && state.stopRequestedAt !== null;
+}
+
+// Event-driven cancellation edge for the Start/Resume → readiness phase.
+// Stop must wake that wait immediately; otherwise the original prompt can be
+// submitted to a process the user has already asked to cancel.
+export function createCoordinatedAgentSendCancellationWait(tabId, token) {
+  const key = String(tabId || '');
+  let settled = false;
+  let unsubscribe = () => {};
+  let resolvePromise;
+  const promise = new Promise((resolve) => {
+    resolvePromise = resolve;
+  });
+  const finish = (state) => {
+    if (settled) return;
+    settled = true;
+    unsubscribe();
+    resolvePromise({
+      tabId: key,
+      token,
+      stopRequestedAt: state?.stopRequestedAt ?? null,
+    });
+  };
+  unsubscribe = subscribeCoordinatedAgentActions((event) => {
+    if (event.tabId !== key) return;
+    if (event.state?.token !== token || event.state?.stopRequestedAt === null) return;
+    finish(event.state);
+  });
+  const current = actionsByTab.get(key);
+  if (current?.token === token && current.stopRequestedAt !== null) finish(current);
+  return {
+    promise,
+    cancel: () => {
+      if (settled) return;
+      settled = true;
+      unsubscribe();
+    },
+  };
 }
 
 export async function settleCoordinatedAgentSend({

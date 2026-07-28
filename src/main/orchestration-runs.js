@@ -14,6 +14,8 @@ const ACTIVE_STATUSES = new Set([
 ]);
 const SOURCE_FOLLOWUP_DELIVERY_STATUSES = new Set(['pending', 'sending', 'sent', 'queued']);
 const SOURCE_FOLLOWUP_PROBLEM_STATUSES = new Set(['waiting-for-input', 'failed']);
+const ORCHESTRATION_TARGET_HANDOFF_PREFIX = 'orchestration:';
+const ORCHESTRATION_TARGET_SOURCE_PREFIX = 'orchestration:';
 const ORCHESTRATION_COMPLETION_HANDOFF_PREFIX = 'orchestration-complete:';
 const ORCHESTRATION_COMPLETION_SOURCE_PREFIX = 'orchestration-completion:';
 const MAX_SETTLED_RUNS = 200;
@@ -57,6 +59,10 @@ function isSourceNotificationBlocked(run) {
 
 function isTrackedOrchestrationRun(run) {
   return isActiveStatus(run?.status)
+    // A Stop edge can beat the final JSONL append. Keep the durable run in
+    // startup reconciliation even when it has no separate source notification;
+    // otherwise a restart removes the only owner capable of proving the result.
+    || (run?.status === 'completed' && run.resultComplete === false)
     || isSourceFollowupPending(run)
     || isSourceNotificationBlocked(run);
 }
@@ -65,9 +71,58 @@ function isCompleteOrchestrationResult(result) {
   return result?.found === true && result?.resultComplete === true;
 }
 
+function shouldScheduleCreatedTargetAutoStop(run) {
+  return run?.status === 'completed'
+    && run.targetCreatedByOrchestration === true
+    && run.autoStopCreatedTargets !== false
+    && Number(run.successAutoStopMs) > 0
+    && !run.autoStopAt
+    && !run.autoStopFinishedAt;
+}
+
+function requiresExactLifecycleGeneration(run) {
+  return run?.targetToolType === 'codex';
+}
+
+function lifecycleGenerationCheck(run, observedGeneration) {
+  if (!requiresExactLifecycleGeneration(run)) {
+    return { verdict: 'not-required', reason: null };
+  }
+  const expected = typeof run?.targetLifecycleGeneration === 'string'
+    ? run.targetLifecycleGeneration.trim()
+    : '';
+  const observed = typeof observedGeneration === 'string'
+    ? observedGeneration.trim()
+    : '';
+  if (!expected) return { verdict: 'unknown', reason: 'expected-generation-unproven' };
+  if (!observed) return { verdict: 'unknown', reason: 'observed-generation-unproven' };
+  return expected === observed
+    ? { verdict: 'match', reason: null }
+    : { verdict: 'changed', reason: 'process-generation-changed' };
+}
+
 function shouldRetryWaitingNotificationForSourceLifecycle(payload) {
   return payload?.type === 'done'
-    || (payload?.type === 'busy' && payload?.busy === true);
+    || (payload?.type === 'busy' && payload?.busy === true)
+    || (payload?.type === 'snapshot'
+      && payload?.inputReady === true
+      && payload?.busy !== true
+      && payload?.starting !== true
+      && payload?.stopping !== true);
+}
+
+function canonicalPromptAuditSource(value) {
+  const source = typeof value === 'string' ? value.trim() : '';
+  return source.startsWith('codex-') ? source.slice('codex-'.length) : source;
+}
+
+function orchestrationTargetRunIdFromAudit(payload) {
+  if (payload?.success !== true) return null;
+  const handoffId = typeof payload?.handoffId === 'string' ? payload.handoffId.trim() : '';
+  if (!handoffId.startsWith(ORCHESTRATION_TARGET_HANDOFF_PREFIX)) return null;
+  const runId = handoffId.slice(ORCHESTRATION_TARGET_HANDOFF_PREFIX.length).trim();
+  if (!runId || handoffId !== ORCHESTRATION_TARGET_HANDOFF_PREFIX + runId) return null;
+  return runId;
 }
 
 function orchestrationCompletionRunIdFromAudit(payload) {
@@ -77,7 +132,12 @@ function orchestrationCompletionRunIdFromAudit(payload) {
   const runId = handoffId.slice(ORCHESTRATION_COMPLETION_HANDOFF_PREFIX.length).trim();
   if (!runId || handoffId !== ORCHESTRATION_COMPLETION_HANDOFF_PREFIX + runId) return null;
   const source = typeof payload?.source === 'string' ? payload.source.trim() : '';
-  if (source !== ORCHESTRATION_COMPLETION_SOURCE_PREFIX + runId) return null;
+  // Codex normalizes every PTY source with one `codex-` prefix before staging
+  // its rollout audit. The handoff remains provider-neutral. Canonicalize only
+  // that one known transport prefix; arbitrary suffix/prefix matches are still
+  // rejected so an audit cannot confirm a neighboring run.
+  const canonicalSource = canonicalPromptAuditSource(source);
+  if (canonicalSource !== ORCHESTRATION_COMPLETION_SOURCE_PREFIX + runId) return null;
   return runId;
 }
 
@@ -224,6 +284,9 @@ function publicRun(run) {
     promptHash: _promptHash,
     resultPromptHash: _resultPromptHash,
     notificationPromptHash: _notificationPromptHash,
+    targetPromptProofHash: _targetPromptProofHash,
+    targetPromptProofExpectedHash: _targetPromptProofExpectedHash,
+    targetPromptAuditHash: _targetPromptAuditHash,
     targetBusySeen: _targetBusySeen,
     waitingForPriorTurn: _waitingForPriorTurn,
     ...safe
@@ -235,6 +298,7 @@ class OrchestrationRunStore {
   constructor(filePath) {
     this.filePath = filePath;
     this.runs = new Map();
+    this.createdTargetTabIds = new Set();
     this.settings = { ...DEFAULT_ORCHESTRATION_SETTINGS };
     this.initialized = false;
     this.initializePromise = null;
@@ -249,7 +313,19 @@ class OrchestrationRunStore {
         const raw = await fs.promises.readFile(this.filePath, 'utf8');
         const parsed = JSON.parse(raw);
         this.settings = normalizeSettings(parsed?.settings);
-        for (const stored of Array.isArray(parsed?.runs) ? parsed.runs : []) {
+        const storedRuns = Array.isArray(parsed?.runs) ? parsed.runs : [];
+        for (const tabId of Array.isArray(parsed?.createdTargetTabIds) ? parsed.createdTargetTabIds : []) {
+          if (typeof tabId === 'string' && tabId) this.createdTargetTabIds.add(tabId);
+        }
+        // Backfill ownership from v2 stores before settled-run pruning removes
+        // the original run which physically created the executor tab.
+        for (const stored of storedRuns) {
+          if (stored?.targetCreated === true && stored?.targetTabId) {
+            this.createdTargetTabIds.add(stored.targetTabId);
+          }
+        }
+        let migrationNeeded = !Array.isArray(parsed?.createdTargetTabIds);
+        for (const stored of storedRuns) {
           if (!stored?.runId || !stored?.targetTabId) continue;
           const run = {
             waitForDescendants: stored.waitForDescendants !== false,
@@ -259,6 +335,11 @@ class OrchestrationRunStore {
             autoStopCreatedTargets: stored.autoStopCreatedTargets !== false,
             ...stored,
           };
+          run.targetCreatedByOrchestration = stored.targetCreatedByOrchestration === true
+            || this.createdTargetTabIds.has(stored.targetTabId);
+          if (stored.targetCreatedByOrchestration !== run.targetCreatedByOrchestration) {
+            migrationNeeded = true;
+          }
           // Legacy notification failures predate the persistent attention flag.
           // Surface only failures that still block the source, not every old run.
           if (isSourceNotificationBlocked(run) && !run.attentionRequiredAt) {
@@ -266,7 +347,9 @@ class OrchestrationRunStore {
           }
           this.runs.set(run.runId, run);
         }
+        migrationNeeded = this._backfillCreatedTargetAutoStops() || migrationNeeded;
         this._pruneInMemory();
+        if (migrationNeeded) this._schedulePersist();
       } catch (error) {
         if (error?.code !== 'ENOENT') {
           console.warn('[OrchestrationRuns] load failed:', error?.message || error);
@@ -284,9 +367,13 @@ class OrchestrationRunStore {
     const predecessor = this._activeForTarget(input.targetTabId).at(-1) || null;
     const parentRunId = input.parentRunId || this._inferParentRunId(input.sourceTabId);
     if (parentRunId) this._validateParent(parentRunId, input);
+    if (input.targetCreated === true && input.targetTabId) {
+      this.createdTargetTabIds.add(input.targetTabId);
+    }
     const now = Date.now();
     const run = {
       ...input,
+      targetCreatedByOrchestration: this.createdTargetTabIds.has(input.targetTabId),
       status: 'creating',
       createdAt: now,
       updatedAt: now,
@@ -333,7 +420,11 @@ class OrchestrationRunStore {
     return publicRun(run);
   }
 
-  async markDelivery(runId, { baselineBusy = false, sessionId = null } = {}) {
+  async markDelivery(runId, {
+    baselineBusy = false,
+    sessionId = null,
+    lifecycleGeneration = null,
+  } = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
     if (!run || isTerminalStatus(run.status)) return publicRun(run);
@@ -342,17 +433,98 @@ class OrchestrationRunStore {
     run.waitingForPriorTurn = !waitingForPredecessor && baselineBusy;
     run.status = (waitingForPredecessor || run.waitingForPriorTurn) ? 'queued' : 'sent';
     run.sessionId = sessionId || run.sessionId || null;
+    run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
     run.deliveryAcceptedAt = Date.now();
+    if (run.targetPromptProofAt && !waitingForPredecessor) {
+      run.waitingForPriorTurn = false;
+      run.targetBusySeen = true;
+      run.status = 'running';
+      run.startedAt ||= run.targetPromptProofAt;
+    }
     run.updatedAt = Date.now();
     this._schedulePersist();
     return publicRun(run);
+  }
+
+  async confirmTargetPromptDelivery(runId, proof = {}, options = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    const changed = [];
+    if (!run) return { confirmed: false, reason: 'run-not-found', changed };
+    if (run.targetPromptProofAt) {
+      const sameProof = proof.actualHash === run.targetPromptProofHash
+        && proof.expectedHash === run.targetPromptProofExpectedHash
+        && (!proof.userUuid || !run.targetPromptProofUserUuid || proof.userUuid === run.targetPromptProofUserUuid);
+      return {
+        confirmed: sameProof,
+        idempotent: sameProof,
+        reason: sameProof ? null : 'target-prompt-proof-conflict',
+        run: publicRun(run),
+        changed,
+      };
+    }
+    if (isTerminalStatus(run.status)) {
+      return { confirmed: false, reason: 'run-already-settled', run: publicRun(run), changed };
+    }
+    if (proof.targetTabId !== run.targetTabId) {
+      return { confirmed: false, reason: 'target-tab-mismatch', run: publicRun(run), changed };
+    }
+    const expectedHandoffId = ORCHESTRATION_TARGET_HANDOFF_PREFIX + run.runId;
+    const expectedSource = ORCHESTRATION_TARGET_SOURCE_PREFIX + run.sourceTabId;
+    if (proof.handoffId !== expectedHandoffId
+      || canonicalPromptAuditSource(proof.source) !== expectedSource) {
+      return { confirmed: false, reason: 'target-prompt-identity-mismatch', run: publicRun(run), changed };
+    }
+    // promptHash is the full transcript lookup identity (SHA-256). PasteAudit
+    // emits a separate short transport identity. Comparing those two domains
+    // made every real audit fail even though unit fixtures used equal strings.
+    if (!run.targetPromptAuditHash || proof.expectedHash !== run.targetPromptAuditHash) {
+      return { confirmed: false, reason: 'target-prompt-hash-mismatch', run: publicRun(run), changed };
+    }
+    if (proof.toolType && run.targetToolType && proof.toolType !== run.targetToolType) {
+      return { confirmed: false, reason: 'target-tool-mismatch', run: publicRun(run), changed };
+    }
+
+    const parsedAuditAt = Date.parse(String(proof.auditTimestamp || ''));
+    const requestedNow = Number(options.now);
+    const now = Number.isFinite(requestedNow)
+      ? requestedNow
+      : (Number.isFinite(parsedAuditAt) ? parsedAuditAt : Date.now());
+    run.targetPromptProofAt = now;
+    run.targetPromptProofKind = 'prompt-audit';
+    run.targetPromptProofHash = proof.actualHash;
+    run.targetPromptProofExpectedHash = proof.expectedHash;
+    run.targetPromptProofCanonicalized = proof.canonicalized === true;
+    run.targetPromptProofActualLen = Number.isFinite(proof.actualLen) ? Number(proof.actualLen) : null;
+    run.targetPromptProofExpectedLen = Number.isFinite(proof.expectedLen) ? Number(proof.expectedLen) : null;
+    run.targetPromptProofSessionId = proof.sessionId || null;
+    run.targetPromptProofUserUuid = proof.userUuid || null;
+    run.sessionId = proof.sessionId || run.sessionId || null;
+
+    const predecessor = run.predecessorRunId ? this.runs.get(run.predecessorRunId) : null;
+    if (run.deliveryAcceptedAt && (!predecessor || isTerminalStatus(predecessor.status))) {
+      run.waitingForPriorTurn = false;
+      run.targetBusySeen = true;
+      run.status = 'running';
+      run.startedAt ||= now;
+    }
+    run.updatedAt = now;
+    this._pushChanged(changed, run);
+    this._schedulePersist();
+    return { confirmed: true, run: publicRun(run), changed };
   }
 
   async markNotification(runId, status, patch = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
     if (!run) return null;
-    run.notificationStatus = status;
+    // Exact prompt/transcript proof is stronger than the transport's earlier
+    // `queued` reply. The reply can resolve after the audit event, so never
+    // regress an already materialized source notification back to queued.
+    run.notificationStatus = run.sourceFollowupStartedAt
+      && (status === 'sent' || status === 'queued')
+      ? 'sent'
+      : status;
     Object.assign(run, patch);
     if (status === 'sent' || status === 'queued') {
       run.notificationDeliveredAt ||= Date.now();
@@ -380,6 +552,19 @@ class OrchestrationRunStore {
     const now = Date.now();
 
     if (head?.deliveryAcceptedAt) {
+      const generationCheck = lifecycleGenerationCheck(head, payload.lifecycleGeneration);
+      if (generationCheck.verdict === 'changed' || generationCheck.verdict === 'unknown') {
+        return {
+          changed,
+          settled,
+          completed: [],
+          ignored: true,
+          generationVerdict: generationCheck.verdict,
+          ignoreReason: generationCheck.reason,
+          expectedLifecycleGeneration: head.targetLifecycleGeneration || null,
+          observedLifecycleGeneration: payload.lifecycleGeneration || null,
+        };
+      }
       const sessionId = payload.sessionId || head.sessionId || null;
       if (payload.type === 'busy' && payload.busy === true) {
         if (!head.waitingForPriorTurn) {
@@ -389,19 +574,18 @@ class OrchestrationRunStore {
           if (head.status === 'waiting_descendants') {
             return { changed, settled, completed: [] };
           }
+          // A generic busy edge proves only that the tab is working again. It
+          // does not prove that this turn continues the interrupted delegation.
+          // The explicit recovery action arms the next causal turn by moving
+          // the run back to queued and recording its result boundary.
           if (head.status === 'waiting_recovery' || head.outcome) {
-            const continuationAfterAt = head.ownCompletedAt || now;
-            head.resultPromptHash = null;
-            head.resultAfterAt = continuationAfterAt;
-            head.resultPromptRequestedAt = continuationAfterAt;
-            head.outcome = null;
-            head.ownCompletedAt = null;
-            head.completedAt = null;
-            head.completionReason = null;
-            head.error = null;
-            head.recoveryDeadlineAt = null;
-            head.waitingOnRunIds = [];
-            head.recoveryAttempt = (head.recoveryAttempt || 0) + 1;
+            return {
+              changed,
+              settled,
+              completed: [],
+              ignored: true,
+              ignoreReason: 'recovery-continuation-unproven',
+            };
           }
           head.targetBusySeen = true;
           head.status = 'running';
@@ -466,7 +650,8 @@ class OrchestrationRunStore {
       const expectedHandoffId = run.notificationHandoffId
         || ORCHESTRATION_COMPLETION_HANDOFF_PREFIX + run.runId;
       const expectedSource = ORCHESTRATION_COMPLETION_SOURCE_PREFIX + run.runId;
-      if (proof.handoffId !== expectedHandoffId || proof.source !== expectedSource) {
+      if (proof.handoffId !== expectedHandoffId
+        || canonicalPromptAuditSource(proof.source) !== expectedSource) {
         return { confirmed: false, reason: 'notification-identity-mismatch', run: publicRun(run), changed, settled };
       }
     } else if (!run.notificationPromptHash
@@ -485,6 +670,13 @@ class OrchestrationRunStore {
     run.sourceFollowupSessionId = proof.sessionId || null;
     run.sourceFollowupUserUuid = proof.userUuid || null;
     run.sourceFollowupAuditHash = proof.actualHash || null;
+    // A causal prompt audit or transcript match proves that the notification
+    // has materialized in the source session. `queued` describes only the
+    // earlier Enter transport; after exact proof the durable delivery state is
+    // unambiguously sent.
+    run.notificationStatus = 'sent';
+    run.notificationDeliveredAt ||= now;
+    run.notificationError = null;
     run.updatedAt = now;
 
     const parent = run.parentRunId ? this.runs.get(run.parentRunId) : null;
@@ -527,6 +719,7 @@ class OrchestrationRunStore {
     const resultComplete = observation.resultComplete === true;
     const busy = observation.busy === true;
     const now = Date.now();
+    const generationCheck = lifecycleGenerationCheck(run, observation.lifecycleGeneration);
 
     if (resultFound && resultComplete) {
       run.waitingForPriorTurn = false;
@@ -543,29 +736,52 @@ class OrchestrationRunStore {
         run.completionReason ||= 'recovered-from-transcript';
         this._settleSuccessfulRun(run, changed, settled, now);
       }
+    } else if (generationCheck.verdict === 'changed') {
+      if (run.status !== 'waiting_recovery') {
+        this._beginRecovery(
+          run,
+          'process_replaced',
+          'target process ownership changed: ' + generationCheck.reason,
+          changed,
+          settled,
+          now,
+        );
+        this._refreshAncestors(run.parentRunId, changed, settled, now);
+      }
+      run.observedLifecycleGeneration = observation.lifecycleGeneration || null;
+      run.updatedAt = now;
+    } else if (generationCheck.verdict === 'unknown') {
+      // An unavailable process observation is neither a match nor proof that
+      // ownership changed. Keep the existing run untouched until an exact
+      // generation or transcript result arrives.
     } else if (busy && !run.waitingForPriorTurn && run.status !== 'waiting_descendants') {
       if (run.status === 'waiting_recovery') {
-        const continuationAfterAt = run.ownCompletedAt || now;
-        run.resultPromptHash = null;
-        run.resultAfterAt = continuationAfterAt;
-        run.resultPromptRequestedAt = continuationAfterAt;
-        run.outcome = null;
-        run.ownCompletedAt = null;
-        run.recoveryDeadlineAt = null;
-        run.error = null;
+        return {
+          changed: publicRun(run),
+          completed: false,
+          generationVerdict: generationCheck.verdict,
+          ignored: true,
+          ignoreReason: 'recovery-continuation-unproven',
+        };
       }
       run.targetBusySeen = true;
       run.status = 'running';
       run.startedAt ||= now;
       this._pushChanged(changed, run);
     }
-    if (observation.sessionId) run.sessionId = observation.sessionId;
+    const canAdoptObservedSession = (resultFound && resultComplete)
+      || generationCheck.verdict === 'match'
+      || generationCheck.verdict === 'not-required';
+    if (observation.sessionId && canAdoptObservedSession) {
+      run.sessionId = observation.sessionId;
+    }
     run.updatedAt = now;
     this._schedulePersist();
     return {
       changed: publicRun(run),
       completed: settled.some((item) => item.runId === run.runId && item.status === 'completed'),
       settled,
+      generationVerdict: generationCheck.verdict,
     };
   }
 
@@ -610,9 +826,16 @@ class OrchestrationRunStore {
     const now = Date.now();
     for (const run of this.runs.values()) {
       if (run.sourceTabId !== tabId) continue;
-      if (['sent', 'queued', 'suppressed', 'source-closed'].includes(run.notificationStatus)) continue;
+      this._syncSourceFollowupState(run);
+      if (['suppressed', 'source-closed'].includes(run.notificationStatus)) continue;
+      // `sent`/`queued` means only that Enter was attempted. Until exact
+      // prompt-audit/transcript proof arrives, closing the source makes that
+      // handoff impossible to consume and must release the inherited blocker.
+      if (['sent', 'queued'].includes(run.notificationStatus)
+        && (run.sourceFollowupStartedAt || run.sourceFollowupPending !== true)) continue;
       run.notificationStatus = 'source-closed';
       run.notificationSuppressed = true;
+      run.sourceFollowupPending = false;
       run.parentFollowupPending = false;
       run.parentConsumedAt ||= now;
       run.updatedAt = now;
@@ -622,7 +845,7 @@ class OrchestrationRunStore {
     return changed;
   }
 
-  async resolveRecovery(runId, action) {
+  async resolveRecovery(runId, action, proof = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
     if (!run || run.status !== 'waiting_recovery') {
@@ -652,7 +875,11 @@ class OrchestrationRunStore {
       this._pushChanged(changed, run);
       settled.push(publicRun(run));
     } else if (action === 'reopen') {
+      const continuationAfterAt = run.ownCompletedAt || now;
       run.status = 'queued';
+      run.resultPromptHash = null;
+      run.resultAfterAt = continuationAfterAt;
+      run.resultPromptRequestedAt = continuationAfterAt;
       run.outcome = null;
       run.ownCompletedAt = null;
       run.completedAt = null;
@@ -660,6 +887,12 @@ class OrchestrationRunStore {
       run.error = null;
       run.targetBusySeen = false;
       run.waitingForPriorTurn = false;
+      run.sessionId = proof.sessionId || run.sessionId || null;
+      run.targetLifecycleGeneration = proof.lifecycleGeneration
+        || run.targetLifecycleGeneration
+        || null;
+      run.recoveryAttempt = (run.recoveryAttempt || 0) + 1;
+      run.recoveryReopenedAt = now;
       run.updatedAt = now;
       this._pushChanged(changed, run);
     } else {
@@ -967,11 +1200,32 @@ class OrchestrationRunStore {
     }
   }
 
+  _backfillCreatedTargetAutoStops() {
+    const latestCompletedByTarget = new Map();
+    for (const run of this.runs.values()) {
+      if (run.status !== 'completed' || run.targetCreatedByOrchestration !== true) continue;
+      const previous = latestCompletedByTarget.get(run.targetTabId);
+      if (!previous || Number(run.createdAt || 0) > Number(previous.createdAt || 0)) {
+        latestCompletedByTarget.set(run.targetTabId, run);
+      }
+    }
+
+    let changed = false;
+    for (const run of latestCompletedByTarget.values()) {
+      if (!shouldScheduleCreatedTargetAutoStop(run)) continue;
+      run.autoStopAt = Number(run.completedAt || Date.now()) + run.successAutoStopMs;
+      run.autoStopStatus = 'scheduled';
+      changed = true;
+    }
+    return changed;
+  }
+
   _schedulePersist() {
     this._pruneInMemory();
     const snapshot = JSON.stringify({
-      version: 2,
+      version: 3,
       settings: this.settings,
+      createdTargetTabIds: Array.from(this.createdTargetTabIds),
       runs: Array.from(this.runs.values()),
     }, null, 2);
     this.persistChain = this.persistChain
@@ -994,7 +1248,9 @@ module.exports = {
   isActiveStatus,
   isTerminalStatus,
   isCompleteOrchestrationResult,
+  shouldScheduleCreatedTargetAutoStop,
   shouldRetryWaitingNotificationForSourceLifecycle,
+  orchestrationTargetRunIdFromAudit,
   orchestrationCompletionRunIdFromAudit,
   orchestrationInstallBlockers,
   mergeActiveLoadersWithOrchestrations,

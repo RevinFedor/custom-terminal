@@ -31,11 +31,13 @@ import {
 import { sendAgentPromptScenario, stopAgentProcessScenario } from '../../utils/agentScenarios';
 import {
   beginCoordinatedAgentSend,
+  bindCoordinatedAgentSendHandoff,
   getCoordinatedAgentAction,
   requestCoordinatedStopAfterSend,
   settleCoordinatedAgentSend,
   subscribeCoordinatedAgentActions,
 } from '../../utils/agentActionCoordinator.mjs';
+import { isHistoryTaskBackgroundLive } from '../../utils/historyBackgroundLiveness.mjs';
 import {
   estimateHistoryEntriesBytesFast,
   historySnapshotCache,
@@ -59,6 +61,7 @@ import {
   dropHistoryMeasuredLayout,
 } from '../../utils/historyMeasuredLayout';
 import {
+  projectNativeRewindPreview,
   shouldCaptureDelayedCodexRewindPrefix,
   shouldClearRewindPreviewForOwnerTransition,
   type CodexWriterTransitionEvent,
@@ -102,10 +105,17 @@ import {
   applyHistoryLiveToolResultsToEntry,
   buildHistoryLivePresentation,
   extractHistoryLiveToolResults,
+  historyLivePresentationIdentity,
   historyLivePresentationKey,
   reconcileCommittedHistoryLiveProjection,
+  reconcileHistoryLiveToolResults,
   reduceHistoryLiveProjection,
 } from '../../utils/historyLiveProjection.mjs';
+import {
+  extractClaudeHistoryPromptCarrierText,
+  hasClaudeHistoryLiveQueuePrompt,
+  isClaudeHistoryPromptLocallyOwned,
+} from '../../utils/historyClaudePromptCarriers.mjs';
 import {
   beginHistoryPromptHandoff,
   consumeHistoryPromptHandoff,
@@ -186,6 +196,7 @@ interface TaskAction {
   // from rollout events + child rollout session id for future drill-in.
   subagentStatus?: 'running' | 'completed' | 'interrupted';
   agentSessionId?: string;
+  processGeneration?: string;
 }
 // Raw tool carrier emitted by the main-process parser for every non-Task
 // tool_use — full name+input+result, rendered via the package ToolCallPart.
@@ -253,6 +264,7 @@ interface FullHistoryEntry {
   auditTimestamp?: string;
   auditHash?: string;
   auditSessionId?: string;
+  auditEntryUuid?: string;
   liveProjection?: boolean;
   sourceIdentity?: string;
   livePendingThinking?: boolean;
@@ -357,6 +369,7 @@ interface PromptHandoffMeta {
   requiresAuditIdentity?: boolean;
   auditTimestamp?: string;
   auditHash?: string;
+  auditEntryUuid?: string;
   sourceIdentity?: string;
 }
 
@@ -574,6 +587,9 @@ const findServerPromptEntry = (
   const localAt = localEntry.optimisticAt || Date.parse(localEntry.timestamp) || Date.now();
   return serverEntries.find((entry) => {
     if (excludedUuids.has(entry.uuid)) return false;
+    if (localEntry.auditEntryUuid) {
+      return entry.uuid === localEntry.auditEntryUuid;
+    }
     const durableIdentity = {
       role: entry.role,
       normalizedText: normalizeHistoryPromptIdentityText(entry.content),
@@ -748,27 +764,11 @@ const shouldCarryAfterRewindTarget = (entry: FullHistoryEntry, preview: HistoryR
 
 const buildRewindPreviewEntries = (rawEntries: FullHistoryEntry[], preview: HistoryRewindPreview | null) => {
   if (!preview) return { entries: rawEntries, hiddenCount: 0 };
-  const targetIndex = rawEntries.findIndex((entry) => entry.uuid === preview.targetUuid);
-  if (targetIndex < 0) return { entries: rawEntries, hiddenCount: 0 };
-
-  const entries = rawEntries.slice(0, targetIndex);
-  const targetEntry = rawEntries[targetIndex];
-  if (targetEntry) {
-    entries.push(targetEntry.role === 'user'
-      ? {
-          ...targetEntry,
-          deliveryStatus: 'editable-last-prompt',
-          statusReason: targetEntry.statusReason || 'rewind-preview',
-        }
-      : targetEntry);
-  }
-  let hiddenCount = 0;
-  for (let i = targetIndex + 1; i < rawEntries.length; i++) {
-    const entry = rawEntries[i];
-    if (shouldCarryAfterRewindTarget(entry, preview)) entries.push(entry);
-    else hiddenCount++;
-  }
-  return { entries, hiddenCount };
+  return projectNativeRewindPreview(
+    rawEntries,
+    preview.targetUuid,
+    (entry) => shouldCarryAfterRewindTarget(entry, preview),
+  );
 };
 
 const serverHistoryMaterializedRewindBranch = (serverEntries: FullHistoryEntry[], preview: HistoryRewindPreview) => {
@@ -1349,6 +1349,7 @@ const collectHistoryBackgroundChips = (
   isTurnBusy: boolean,
   agentProcessAlive: boolean,
   currentSessionId: string,
+  currentProcessGeneration: string | null,
 ): HistoryBackgroundChip[] => {
   // A chip is the LIVE face of work. Two liveness models:
   //
@@ -1410,9 +1411,15 @@ const collectHistoryBackgroundChips = (
       if (!isTaskAction(action)) continue;
       // Explicit rollout status (Codex) is process-scoped truth; a Claude
       // Task without one is turn-scoped and needs the busy gate.
-      const running = action.subagentStatus
-        ? (action.subagentStatus === 'running' && agentProcessAlive)
-        : (inLastTurn && isTurnBusy && action.result == null);
+      const running = isHistoryTaskBackgroundLive({
+        subagentStatus: action.subagentStatus,
+        actionProcessGeneration: action.processGeneration,
+        currentProcessGeneration,
+        agentProcessAlive,
+        inLastTurn,
+        isTurnBusy,
+        hasResult: action.result != null,
+      });
       if (running) {
         chips.push({
           key: 'task:' + (action.toolUseId || entry.uuid),
@@ -2351,6 +2358,20 @@ const historyPanelStyleText = `@keyframes hp-flash {
   from { stroke-dashoffset: 0; }
   to { stroke-dashoffset: -100; }
 }
+@keyframes hp-owner-transition-forward {
+  0%, 100% { transform: translateX(-1px); opacity: 0.35; }
+  50% { transform: translateX(1px); opacity: 1; }
+}
+@keyframes hp-owner-transition-backward {
+  0%, 100% { transform: translateX(1px); opacity: 1; }
+  50% { transform: translateX(-1px); opacity: 0.35; }
+}
+.hp-owner-transition-forward {
+  animation: hp-owner-transition-forward 0.8s ease-in-out infinite;
+}
+.hp-owner-transition-backward {
+  animation: hp-owner-transition-backward 0.8s ease-in-out infinite;
+}
 .hp-terminal-perimeter-loader {
   animation: hp-terminal-perimeter 0.9s linear infinite;
 }
@@ -2359,6 +2380,10 @@ const historyPanelStyleText = `@keyframes hp-flash {
     animation: none;
     stroke-dasharray: 100 0;
     stroke-dashoffset: 0;
+  }
+  .hp-owner-transition-forward,
+  .hp-owner-transition-backward {
+    animation: none;
   }
 }
 ::highlight(hp-search) {
@@ -2647,6 +2672,27 @@ function HistoryTerminalActivityIcon({
           strokeWidth="2.2"
         />
       )}
+    </svg>
+  );
+}
+
+function HistoryOwnerTransitionIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+      data-history-owner-transition="true"
+      style={{ display: 'block', flexShrink: 0, color: '#818cf8' }}
+    >
+      <path className="hp-owner-transition-forward" d="M3 6.5h11m0 0-3-3m3 3-3 3" />
+      <path className="hp-owner-transition-backward" d="M17 13.5H6m0 0 3-3m-3 3 3 3" />
     </svg>
   );
 }
@@ -3292,6 +3338,7 @@ function AgentHistoryControls({
       auditTimestamp?: string;
       auditHash?: string;
       auditSessionId?: string;
+      auditEntryUuid?: string;
       sourceIdentity?: string;
     }
   ) => void;
@@ -3304,6 +3351,7 @@ function AgentHistoryControls({
       auditTimestamp?: string;
       auditHash?: string;
       auditSessionId?: string;
+      auditEntryUuid?: string;
       sourceIdentity?: string;
     },
   ) => void;
@@ -3321,6 +3369,8 @@ function AgentHistoryControls({
 }) {
   const runtime = useMemo(() => getHistoryAgentRuntime(toolType), [toolType]);
   const [status, setStatus] = useState<AgentPtyStatus>('inactive');
+  const [processLifecycleGeneration, setProcessLifecycleGeneration] = useState<string | null>(null);
+  const [presenceResolving, setPresenceResolving] = useState(true);
   const prompt = useUIStore(useCallback((s) => s.historyPromptDrafts[tabId] || '', [tabId]));
   const historyComposerFontSize = useUIStore((s) => s.historyComposerFontSize);
   const aiSecondaryFontSize = useUIStore((s) => s.aiSecondaryFontSize);
@@ -3599,8 +3649,18 @@ function AgentHistoryControls({
         flight.trailing = false;
         const presenceGeneration = presenceGenerationRef.current;
         try {
-          const presence = await runtime.getPresence(tabId, projectId);
-          if (presenceOwnerKeyRef.current !== ownerKey) return;
+          const presence = await runtime.getPresence(tabId, projectId, {
+            consumer: 'history-panel',
+            ownerKey,
+            generation: presenceGeneration,
+          });
+          if (presenceOwnerKeyRef.current !== ownerKey) {
+            console.log('[' + runtime.logPrefix + '] stale presence ignored tab=' + tabId.slice(-12)
+              + ' reason=owner-change requested=' + ownerKey
+              + ' current=' + presenceOwnerKeyRef.current
+              + ' generation=' + presenceGeneration);
+            return;
+          }
           if (presenceGenerationRef.current !== presenceGeneration) {
             console.log('[' + runtime.logPrefix + '] stale presence ignored tab=' + tabId.slice(-12)
               + ' generation=' + presenceGeneration + ' current=' + presenceGenerationRef.current);
@@ -3614,6 +3674,11 @@ function AgentHistoryControls({
             continue;
           }
           setStatusFrom(presence.status, 'presence');
+          setProcessLifecycleGeneration(
+            runtime.toolType === 'codex'
+              ? (presence.runtimeSnapshot?.lifecycleGeneration || null)
+              : null,
+          );
           if (runtime.toolType === 'claude') {
             const materialized = presence.conversationMaterialized === true || presence.canResume === true;
             setResumeMaterialized(materialized);
@@ -3628,10 +3693,17 @@ function AgentHistoryControls({
             setPendingQuestionFrom(null, 'presence-not-awaiting');
           }
         } catch (e: any) {
-          if (presenceOwnerKeyRef.current !== ownerKey) return;
+          if (presenceOwnerKeyRef.current !== ownerKey) {
+            console.log('[' + runtime.logPrefix + '] stale presence failure ignored tab=' + tabId.slice(-12)
+              + ' reason=owner-change requested=' + ownerKey
+              + ' current=' + presenceOwnerKeyRef.current
+              + ' generation=' + presenceGeneration);
+            return;
+          }
           if (presenceGenerationRef.current !== presenceGeneration) continue;
           console.warn('[' + runtime.logPrefix + '] presence failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
           setStatusFrom('inactive', 'presence-error');
+          setProcessLifecycleGeneration(null);
         }
       } while (flight.trailing && presenceOwnerKeyRef.current === ownerKey);
     })().finally(() => {
@@ -3705,20 +3777,25 @@ function AgentHistoryControls({
     setActivityTiming(null);
     setPasteActivityStartedAt(null);
     setActivityClock(Date.now());
+    setPresenceResolving(true);
+    setProcessLifecycleGeneration(null);
     setStatusFrom(
       coordinatedAction?.stopRequestedAt
         ? 'stopping'
         : coordinatedAction
           ? 'starting'
-          : 'inactive',
+          : 'unknown',
       coordinatedAction ? 'tab-bind-coordinated-action' : 'tab-bind',
     );
-    refreshPresence();
+    const ownerAtBind = presenceOwnerKey;
+    void refreshPresence().finally(() => {
+      if (presenceOwnerKeyRef.current === ownerAtBind) setPresenceResolving(false);
+    });
     void refreshActivityTiming('tab-bind');
     return () => {
       clearEmptyDraftNoticeTimer();
     };
-  }, [clearEmptyDraftNoticeTimer, refreshActivityTiming, refreshPresence, setStatusFrom, tabId, toolType]);
+  }, [clearEmptyDraftNoticeTimer, presenceOwnerKey, refreshActivityTiming, refreshPresence, setStatusFrom, tabId, toolType]);
 
   useEffect(() => {
     const handleTimingChanged = (_event: any, detail: { tabId?: string }) => {
@@ -3833,10 +3910,11 @@ function AgentHistoryControls({
         return;
       }
       const current = statusRef.current;
+      if (runtime.toolType === 'codex') setProcessLifecycleGeneration(null);
       const next = current === 'active' || current === 'busy' ? current : 'starting';
       setStatusFrom(next, 'command-started');
     };
-    const handleBusy = (_: any, data: { tabId?: string; busy?: boolean; reason?: string }) => {
+    const handleBusy = (_: any, data: { tabId?: string; busy?: boolean; reason?: string; lifecycleGeneration?: string | null }) => {
       if (data?.tabId !== tabId) return;
       if (processStopInFlightRef.current) {
         console.log('[' + runtime.logPrefix + '] busy event ignored during Stop tab=' + tabId.slice(-12)
@@ -3846,6 +3924,9 @@ function AgentHistoryControls({
       if (isNonAuthoritativeBusyEvent(data)) {
         refreshPresence();
         return;
+      }
+      if (runtime.toolType === 'codex' && data.lifecycleGeneration) {
+        setProcessLifecycleGeneration(data.lifecycleGeneration);
       }
       if (data.busy) setStatusFrom('busy', 'busy-state');
       else {
@@ -4326,6 +4407,19 @@ function AgentHistoryControls({
       if (kind === 'stop' && activeKind === 'send') {
         const queued = requestCoordinatedStopAfterSend(tabId);
         if (queued.queued && !queued.deduped) {
+          if (queued.state?.handoffId) {
+            const cancelled = await ipcRenderer.invoke('agent:cancel-send', {
+              tabId,
+              handoffId: queued.state.handoffId,
+            }).catch((cause: any) => ({
+              cancelled: false,
+              reason: String(cause?.message || cause),
+            }));
+            historyDiag('CANCEL_SEND_BOUNDARY tab=' + tabId.slice(-12)
+              + ' handoff=' + queued.state.handoffId
+              + ' cancelled=' + !!cancelled?.cancelled
+              + ' reason=' + (cancelled?.reason || '-'));
+          }
           processStopInFlightRef.current = true;
           presenceGenerationRef.current += 1;
           setStatusFrom('stopping', 'stop-queued-after-send');
@@ -4378,11 +4472,73 @@ function AgentHistoryControls({
       auditTimestamp?: string;
       auditHash?: string;
       auditSessionId?: string;
+      auditEntryUuid?: string;
       sourceIdentity?: string;
     } | undefined;
     let clearedPromptText: string | null = null;
     let clearedPromptImages: HistoryPromptDraftImageRef[] = [];
     let clearedPromptChips: HistoryPromptDraftChip[] = [];
+    let sendRefusalPasteWritten = false;
+    let deferredSendRollback = false;
+    const restoreClearedSendSnapshot = (reason: string) => {
+      const restorePrompt = clearedPromptText;
+      if (
+        sendOwnershipTransferred
+        || (
+          restorePrompt === null
+          && clearedPromptImages.length === 0
+          && clearedPromptChips.length === 0
+        )
+      ) return;
+      const current = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
+      const currentImages = useUIStore.getState().historyPromptDraftImages[actionTabId] || [];
+      const currentChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
+      const hasNewDraft = !!current || currentImages.length > 0 || currentChips.length > 0;
+      if (!hasNewDraft) {
+        setHistoryPromptDraft(actionTabId, restorePrompt || '', {
+          images: clearedPromptImages,
+          chips: clearedPromptChips,
+        });
+        historyDiag('SEND_ROLLBACK_RESTORE tab=' + actionTabId.slice(-12)
+          + ' handoff=' + (sendHandoffId || '-')
+          + ' reason=' + reason
+          + ' mode=exact'
+          + ' chars=' + (restorePrompt || '').length
+          + ' images=' + clearedPromptImages.length
+          + ' chips=' + clearedPromptChips.length);
+        return;
+      }
+      const merged = mergeFailedHistoryAuthoringSnapshot({
+        currentText: current,
+        currentImages,
+        currentChips,
+        snapshotText: restorePrompt || '',
+        snapshotImages: clearedPromptImages,
+        snapshotChips: clearedPromptChips,
+        createChipId: (chip: HistoryPromptDraftChip) => createComposerChipId(chip.kind),
+      });
+      setHistoryPromptDraft(actionTabId, merged.text, {
+        images: merged.images,
+        chips: merged.chips,
+      });
+      if (isCurrentAction()) {
+        setDraftWarning('Send stopped before Enter. The failed prompt was restored before your newer draft.');
+      }
+      historyDiag('SEND_ROLLBACK_RESTORE tab=' + actionTabId.slice(-12)
+        + ' handoff=' + (sendHandoffId || '-')
+        + ' reason=' + reason
+        + ' mode=prepend-merge'
+        + ' snapshotChars=' + (restorePrompt || '').length
+        + ' currentChars=' + current.length
+        + ' mergedChars=' + merged.text.length
+        + ' snapshotHash=' + historyOwnerDigest(restorePrompt || '')
+        + ' currentHash=' + historyOwnerDigest(current)
+        + ' mergedHash=' + historyOwnerDigest(merged.text)
+        + ' images=' + clearedPromptImages.length + '->' + merged.images.length
+        + ' remappedImages=' + merged.remappedImageCount
+        + ' missingImageIds=' + merged.missingImageSourceIds.join(',')
+        + ' chips=' + clearedPromptChips.length + '+' + currentChips.length + '->' + merged.chips.length);
+    };
     actionInFlightRef.current = true;
     activeActionKindRef.current = kind;
     setBusyAction(kind);
@@ -4499,6 +4655,16 @@ function AgentHistoryControls({
         const handoffId = createPromptHandoffId();
         const submittedAt = Date.now();
         sendHandoffId = handoffId;
+        if (coordinatedSendToken) {
+          const bound = bindCoordinatedAgentSendHandoff(
+            actionTabId,
+            coordinatedSendToken,
+            handoffId,
+          );
+          if (!bound.bound) {
+            throw new Error('Send handoff could not be bound to its cancellation owner');
+          }
+        }
         if (statusAtSend === 'inactive') {
           // Enter is the user's single submit intent. The scenario layer owns
           // Start/Resume + readiness; History only projects that lifecycle
@@ -4580,6 +4746,7 @@ function AgentHistoryControls({
           statusAtSend,
           queue: statusAtSend === 'busy',
           returnDraftOnConflict: true,
+          coordinatedSendToken,
           presentationSnapshot: {
             historySessionId: sessionId || null,
             promptChips: promptChipsForHistory,
@@ -4601,6 +4768,7 @@ function AgentHistoryControls({
           auditTimestamp: auditProof?.auditTimestamp,
           auditHash: auditProof?.actualHash,
           auditSessionId: auditProof?.sessionId || undefined,
+          auditEntryUuid: auditProof?.entryUuid,
           sourceIdentity: auditProof?.sourceIdentity,
         };
         if (resultOwnershipTransferred) {
@@ -4623,9 +4791,9 @@ function AgentHistoryControls({
           ' submitted=' + !!result?.submitted +
           ' chunks=' + (result?.chunksTotal ?? 'na') +
           ' error=' + (result?.error || '-'));
-        if (!isCurrentAction()) return;
         sendOwnershipTransferred = resultOwnershipTransferred;
         sendDeliveryUnconfirmed = result?.success === false && result?.submitted === true;
+        sendRefusalPasteWritten = result?.pasteWritten === true;
         sendTransferredQueueStatus = resultQueueStatus;
         historyDiag('SEND_OWNERSHIP tab=' + tabId.slice(-12) +
           ' handoff=' + handoffId +
@@ -4634,6 +4802,7 @@ function AgentHistoryControls({
           ' submitted=' + !!result?.submitted +
           ' success=' + (result?.success !== false));
         if (!sendOwnershipTransferred) throw new Error(result?.error || 'Send failed before submit');
+        if (!isCurrentAction()) return;
         onPromptStatusChange(
           handoffId,
           sendTransferredQueueStatus,
@@ -4723,7 +4892,8 @@ function AgentHistoryControls({
         setStatusFrom('inactive', 'stop-process-click');
       }
     } catch (e: any) {
-      if (!isCurrentAction()) {
+      const currentAction = isCurrentAction();
+      if (!currentAction && kind !== 'send') {
         console.log('[' + runtime.logPrefix + '] stale action error ignored tab=' + actionTabId.slice(-12)
           + ' kind=' + kind + ' actionSeq=' + actionSeq + ' currentSeq=' + actionSeqRef.current);
         return;
@@ -4744,60 +4914,25 @@ function AgentHistoryControls({
           retractHistoryPromptHandoff(actionTabId, sendHandoffId, 'send-pre-submit-error');
           onPromptStatusChange(sendHandoffId, 'failed', 'send-pre-submit-error');
         }
-        const restorePrompt = clearedPromptText;
-        if (!sendOwnershipTransferred && (restorePrompt !== null || clearedPromptChips.length > 0)) {
-          const current = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
-          const currentImages = useUIStore.getState().historyPromptDraftImages[actionTabId] || [];
-          const currentChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
-          const hasNewDraft = !!current || currentImages.length > 0 || currentChips.length > 0;
-          if (!hasNewDraft) {
-            setHistoryPromptDraft(actionTabId, restorePrompt || '', {
-              images: clearedPromptImages,
-              chips: clearedPromptChips,
-            });
-            historyDiag('SEND_ROLLBACK_RESTORE tab=' + actionTabId.slice(-12) +
-              ' handoff=' + sendHandoffId +
-              ' mode=exact' +
-              ' chars=' + (restorePrompt || '').length +
-              ' images=' + clearedPromptImages.length +
-              ' chips=' + clearedPromptChips.length);
+        if (!sendOwnershipTransferred) {
+          if (sendRefusalPasteWritten) {
+            deferredSendRollback = true;
+            historyDiag('SEND_ROLLBACK_DEFER tab=' + actionTabId.slice(-12)
+              + ' handoff=' + sendHandoffId
+              + ' reason=paste-written-awaiting-stop-proof');
           } else {
-            const merged = mergeFailedHistoryAuthoringSnapshot({
-              currentText: current,
-              currentImages,
-              currentChips,
-              snapshotText: restorePrompt || '',
-              snapshotImages: clearedPromptImages,
-              snapshotChips: clearedPromptChips,
-              createChipId: (chip: HistoryPromptDraftChip) => createComposerChipId(chip.kind),
-            });
-            setHistoryPromptDraft(actionTabId, merged.text, {
-              images: merged.images,
-              chips: merged.chips,
-            });
-            setDraftWarning('Send stopped before Enter. The failed prompt was restored before your newer draft.');
-            historyDiag('SEND_ROLLBACK_RESTORE tab=' + actionTabId.slice(-12) +
-              ' handoff=' + sendHandoffId +
-              ' mode=prepend-merge' +
-              ' snapshotChars=' + (restorePrompt || '').length +
-              ' currentChars=' + current.length +
-              ' mergedChars=' + merged.text.length +
-              ' snapshotHash=' + historyOwnerDigest(restorePrompt || '') +
-              ' currentHash=' + historyOwnerDigest(current) +
-              ' mergedHash=' + historyOwnerDigest(merged.text) +
-              ' images=' + clearedPromptImages.length + '->' + merged.images.length +
-              ' remappedImages=' + merged.remappedImageCount +
-              ' missingImageIds=' + merged.missingImageSourceIds.join(',') +
-              ' chips=' + clearedPromptChips.length + '+' + currentChips.length + '->' + merged.chips.length);
+            restoreClearedSendSnapshot('pre-paste-refusal');
           }
         }
       }
-      setError(String(e?.message || e));
-      if (kind === 'stop') {
-        processStopInFlightRef.current = false;
-        presenceGenerationRef.current += 1;
+      if (currentAction) {
+        setError(String(e?.message || e));
+        if (kind === 'stop') {
+          processStopInFlightRef.current = false;
+          presenceGenerationRef.current += 1;
+        }
+        refreshPresence();
       }
-      refreshPresence();
     } finally {
       const keepInterruptAwait =
         kind === 'interrupt' &&
@@ -4810,7 +4945,7 @@ function AgentHistoryControls({
         setBusyAction(null);
       }
       if (kind === 'send' && coordinatedSendToken) {
-        await settleCoordinatedAgentSend({
+        const coordinatedSettlement = await settleCoordinatedAgentSend({
           tabId: actionTabId,
           token: coordinatedSendToken,
           runQueuedStop: async () => {
@@ -4829,6 +4964,25 @@ function AgentHistoryControls({
             });
           },
         });
+        if (deferredSendRollback) {
+          if (coordinatedSettlement.stopped) {
+            restoreClearedSendSnapshot('post-paste-stop-proved');
+          } else {
+            historyDiag('SEND_ROLLBACK_WITHHELD tab=' + actionTabId.slice(-12)
+              + ' handoff=' + (sendHandoffId || '-')
+              + ' reason=stop-not-proved'
+              + ' settlement=' + (coordinatedSettlement.reason || '-'));
+            if (isCurrentAction()) {
+              setDraftWarning('Send was cancelled after paste, but process stop was not proven. The prompt was not restored to avoid sending it twice.');
+            }
+          }
+        }
+        if (sendHandoffId) {
+          await ipcRenderer.invoke('agent:clear-send-cancel', {
+            tabId: actionTabId,
+            handoffId: sendHandoffId,
+          }).catch(() => null);
+        }
       }
     }
   }, [busyAction, cwd, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, resumeMaterialized, runtime, sessionId, setHistoryPromptDraft, setStatusFrom, tabId]);
@@ -4851,6 +5005,16 @@ function AgentHistoryControls({
     };
     window.addEventListener('history-panel:interrupt-turn', interruptTurn);
     return () => window.removeEventListener('history-panel:interrupt-turn', interruptTurn);
+  }, [runAction, tabId]);
+
+  useEffect(() => {
+    const stopProcess = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
+      if (detail?.tabId !== tabId) return;
+      void runAction('stop');
+    };
+    window.addEventListener('history-panel:stop-process', stopProcess);
+    return () => window.removeEventListener('history-panel:stop-process', stopProcess);
   }, [runAction, tabId]);
 
   useEffect(() => {
@@ -4998,7 +5162,10 @@ function AgentHistoryControls({
     && (prompt.trim().length > 0 || draftChips.length > 0);
   const canGrabDraft = (status === 'active' || status === 'busy') && !pendingQuestion && !controlsLocked;
   const canInterruptTurn = isTurnBusy && !controlsLocked;
-  const canStopProcess = (status === 'active' || status === 'busy' || status === 'starting') && !effectiveStopping && !busyAction;
+  const canStopProcess = busyAction === 'send'
+    || ((status === 'active' || status === 'busy' || status === 'starting')
+      && !effectiveStopping
+      && !busyAction);
   const visibleDraftWarning = draftWarning || derivedDraftWarning;
   const draftNoticeMeta = visibleDraftWarning ? getDraftNoticeMeta(visibleDraftWarning) : null;
 
@@ -5015,6 +5182,8 @@ function AgentHistoryControls({
       canInterruptTurn,
       canPullDraft: canGrabDraft,
       status,
+      lifecycleGeneration: processLifecycleGeneration,
+      canStopProcess,
     }, ownerId);
     historyDiag('COMPOSER_AVAILABILITY tab=' + tabId.slice(-12) +
       ' status=' + status +
@@ -5027,7 +5196,9 @@ function AgentHistoryControls({
     canAcceptSubmitIntent,
     canInterruptTurn,
     canSend,
+    canStopProcess,
     overlayComposer,
+    processLifecycleGeneration,
     setHistoryComposerAvailability,
     status,
     tabId,
@@ -5417,7 +5588,7 @@ function AgentHistoryControls({
     || !!activeLifecycle
     || status === 'starting'
     || status === 'stopping'
-    || status === 'unknown';
+    || (status === 'unknown' && !presenceResolving);
   const showBusyLoader = (status === 'busy' || isPasteBusy) && !showStatusText;
   const displayedActivityTiming = activityTiming?.state === 'running'
     ? activityTiming
@@ -5510,12 +5681,16 @@ function AgentHistoryControls({
             flexShrink: 0,
           }}
         >
-          <HistoryTerminalActivityIcon
-            size={20}
-            busy={showBusyLoader}
-            active={!!(terminalOpen && onToggleTerminal)}
-            color={statusAccent}
-          />
+          {presenceResolving ? (
+            <HistoryOwnerTransitionIcon size={20} />
+          ) : (
+            <HistoryTerminalActivityIcon
+              size={20}
+              busy={showBusyLoader}
+              active={!!(terminalOpen && onToggleTerminal)}
+              color={statusAccent}
+            />
+          )}
           {showStatusText && (
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {statusTitle}
@@ -5540,6 +5715,42 @@ function AgentHistoryControls({
         >
           {activeLifecycle.description}
         </span>
+      )}
+
+      {activeLifecycle?.kind === 'error' && activeLifecycle.onDismiss && (
+        <button
+          type="button"
+          data-agent-lifecycle-dismiss
+          aria-label={activeLifecycle.dismissLabel || 'Dismiss starting status'}
+          onMouseDown={(event) => {
+            // Do not move focus out of the History composer while clearing the
+            // same main-owned failure that the floating terminal can clear.
+            event.preventDefault();
+          }}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            activeLifecycle.onDismiss?.();
+          }}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 20,
+            height: 20,
+            padding: 0,
+            borderRadius: 5,
+            border: '1px solid rgba(248, 113, 113, 0.35)',
+            background: 'rgba(127, 29, 29, 0.16)',
+            color: '#fca5a5',
+            fontSize: 16,
+            lineHeight: 1,
+            cursor: 'pointer',
+            flexShrink: 0,
+          }}
+        >
+          ×
+        </button>
       )}
 
       {activeLifecycle?.kind === 'error' && activeLifecycle.onRetry && (
@@ -6010,6 +6221,10 @@ function HistoryPanel({
   );
   const historyOwnerKeyRef = useRef(historyOwnerKey);
   const historyOwnerGenerationRef = useRef(0);
+  // Reactive mirror of the generation. The ref alone cannot drive the list's
+  // remount key — refs do not re-render — and the list only consumes restored
+  // geometry at mount.
+  const [historyOwnerVisitState, setHistoryOwnerVisitState] = useState(0);
   const historyLoadFlightRef = useRef<{
     ownerKey: string;
     generation: number;
@@ -6152,7 +6367,7 @@ function HistoryPanel({
       (firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined)
       || []
     )
-      .map((entry) => entry.sourceIdentity)
+      .map((entry) => historyLivePresentationIdentity(entry))
       .filter((identity): identity is string => !!identity),
   ));
   const presentationEntriesRef = useRef(entries);
@@ -6281,31 +6496,7 @@ function HistoryPanel({
   ) => {
     const live = liveToolResultsRef.current;
     if (live.ownerKey !== ownerKey || live.results.size === 0) return;
-    const remaining = new Map(live.results);
-    for (const entry of durableEntries) {
-      for (const action of entry.actions || []) {
-        const toolUseId = historyActionToolUseId(action);
-        if (!toolUseId) continue;
-        const expected = remaining.get(toolUseId);
-        if (!expected) continue;
-        if (isRawAction(action)) {
-          // A dehydrated durable result carries only a preview; its ref proves
-          // the durable side has the FULL text of this exact call, which is
-          // strictly newer knowledge than the live overlay copy.
-          const durableCoversLive = action.rawTool.resultRef
-            ? typeof action.rawTool.result === 'string'
-            : action.rawTool.result === expected.result;
-          if (durableCoversLive && action.rawTool.isError === expected.isError) {
-            remaining.delete(toolUseId);
-          }
-        } else if (
-          isTaskAction(action)
-          && action.result === expected.result
-        ) {
-          remaining.delete(toolUseId);
-        }
-      }
-    }
+    const remaining = reconcileHistoryLiveToolResults(durableEntries, live.results);
     if (remaining.size === live.results.size) return;
     liveToolResultsRef.current = { ownerKey, results: remaining };
     setLiveToolResults(remaining);
@@ -6314,13 +6505,14 @@ function HistoryPanel({
     const live = liveProjectionRef.current;
     const durableIdentities = new Set(
       rawServerEntriesRef.current
-        .map((entry) => entry.sourceIdentity)
+        .map((entry) => historyLivePresentationIdentity(entry))
         .filter((identity): identity is string => !!identity),
     );
     const hasUnmatchedProjection = live.ownerKey === ownerKey
-      && live.entries.some((entry) =>
-        !entry.sourceIdentity || !durableIdentities.has(entry.sourceIdentity)
-      );
+      && live.entries.some((entry) => {
+        const identity = historyLivePresentationIdentity(entry);
+        return !identity || !durableIdentities.has(identity);
+      });
     return hasUnmatchedProjection || (
       liveToolResultsRef.current.ownerKey === ownerKey
       && liveToolResultsRef.current.results.size > 0
@@ -6337,6 +6529,9 @@ function HistoryPanel({
   // turn but never their host process.
   const agentProcessStatus = useUIStore(
     (s) => s.historyComposerAvailability[tabId]?.status || 'inactive',
+  );
+  const agentProcessGeneration = useUIStore(
+    (s) => s.historyComposerAvailability[tabId]?.lifecycleGeneration || null,
   );
   const agentProcessAlive = agentProcessStatus === 'active'
     || agentProcessStatus === 'busy'
@@ -6359,8 +6554,14 @@ function HistoryPanel({
     [entries, chipLiveEntries],
   );
   const backgroundHistoryChips = useMemo(
-    () => collectHistoryBackgroundChips(chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId || ''),
-    [chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId],
+    () => collectHistoryBackgroundChips(
+      chipSourceEntries,
+      isTurnBusy,
+      agentProcessAlive,
+      sessionId || '',
+      agentProcessGeneration,
+    ),
+    [chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration],
   );
   const liveBackgroundUuids = useMemo(
     () => new Set(backgroundHistoryChips.map((chip) => chip.entryUuid)),
@@ -6379,8 +6580,9 @@ function HistoryPanel({
       + ' count=' + backgroundHistoryChips.length
       + ' turnBusy=' + (isTurnBusy ? '1' : '0')
       + ' processAlive=' + (agentProcessAlive ? '1' : '0')
+      + ' processGeneration=' + (agentProcessGeneration || '-')
       + ' keys=' + (backgroundChipsDigest || '-'));
-  }, [tabId, backgroundChipsDigest, backgroundHistoryChips.length, isTurnBusy, agentProcessAlive]);
+  }, [tabId, backgroundChipsDigest, backgroundHistoryChips.length, isTurnBusy, agentProcessAlive, agentProcessGeneration]);
   // Tab-level loader inheritance: a Codex subagent can outlive its spawn
   // turn, so the tab must keep spinning while any background chip is live
   // even though the parent turn's busy flag is already false. Broadcast the
@@ -6509,6 +6711,18 @@ function HistoryPanel({
   // owner (the list is keyed by owner, so it is read exactly at mount). An
   // explicit Timeline jump owns the position and must not be overridden by a
   // stored scroll offset.
+  // Per-visit identity for the virtualized list.
+  //
+  // `restoreStateFrom` is consumed exactly once, gated on Virtuoso's own mount
+  // signal — re-passing it to a live list does nothing. So a return to the same
+  // tab must produce a genuine mount, and the only reliable "this is a new
+  // visit" signal is the owner GENERATION, which the panel already increments
+  // on every owner takeover. Deriving it from a key comparison (as a first
+  // attempt did) missed returns to the same tab entirely: the key is identical,
+  // so the counter never moved, the list was reused, and the restored offset
+  // was silently discarded — the log showed 55846 going in while the screen sat
+  // at 0 (e2e24).
+  const historyOwnerVisit = historyOwnerVisitState;
   const restoredMeasuredLayout = useMemo(() => {
     if (pendingInitialHistoryIndex >= 0) return null;
     if (displayEntries.length === 0) return null;
@@ -6520,10 +6734,12 @@ function HistoryPanel({
         + ' scrollTop=' + Math.round(layout.scrollTop));
     }
     return layout;
-    // Deliberately owner-scoped: re-reading on every entries change would swap
-    // Virtuoso's restore prop mid-life and re-anchor the list under the user.
+    // Scoped to owner+visit, not to entries: re-reading on every entries
+    // change would swap the restore prop mid-life and re-anchor the list under
+    // the user, but scoping to the owner alone made a return to the same tab
+    // reuse the FIRST visit's snapshot forever.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [historyOwnerKey]);
+  }, [historyOwnerKey, historyOwnerVisit]);
   const rewindPreviewHiddenCount = rewindPreviewResult.hiddenCount;
   // Last entry uuid Claude's own backtrace reaches before stopping at the first
   // orphan. Any entry at index <= boundary is part of the chain-break zone:
@@ -6901,6 +7117,7 @@ function HistoryPanel({
       auditTimestamp?: string;
       auditHash?: string;
       auditSessionId?: string;
+      auditEntryUuid?: string;
       sourceIdentity?: string;
       sessionId?: string;
     }
@@ -6931,6 +7148,7 @@ function HistoryPanel({
       auditTimestamp: meta.auditTimestamp,
       auditHash: meta.auditHash,
       auditSessionId: meta.auditSessionId,
+      auditEntryUuid: meta.auditEntryUuid,
       sourceIdentity: meta.sourceIdentity,
     };
     promptHandoffMetaRef.current.set(handoffId, {
@@ -6940,6 +7158,7 @@ function HistoryPanel({
       requiresAuditIdentity: meta.requiresAuditIdentity === true,
       auditTimestamp: meta.auditTimestamp,
       auditHash: meta.auditHash,
+      auditEntryUuid: meta.auditEntryUuid,
       sourceIdentity: meta.sourceIdentity,
     });
     historyDiag('LOCAL_APPEND tab=' + tabId.slice(-12) +
@@ -6967,6 +7186,7 @@ function HistoryPanel({
               auditTimestamp: entry.auditTimestamp,
               auditHash: entry.auditHash,
               auditSessionId: entry.auditSessionId,
+              auditEntryUuid: entry.auditEntryUuid,
               sourceIdentity: entry.sourceIdentity,
               sessionId: entry.sessionId,
             }
@@ -6986,6 +7206,7 @@ function HistoryPanel({
       auditTimestamp?: string;
       auditHash?: string;
       auditSessionId?: string;
+      auditEntryUuid?: string;
       sourceIdentity?: string;
     },
     changedAtOverride?: number,
@@ -7001,6 +7222,7 @@ function HistoryPanel({
         requiresAuditIdentity: identity.requiresAuditIdentity,
         auditTimestamp: identity.auditTimestamp,
         auditHash: identity.auditHash,
+        auditEntryUuid: identity.auditEntryUuid,
         sourceIdentity: identity.sourceIdentity,
         sessionId: identity.auditSessionId || handoffMeta.sessionId,
       });
@@ -7018,6 +7240,7 @@ function HistoryPanel({
         auditTimestamp: identity?.auditTimestamp || handoffMeta.auditTimestamp,
         auditHash: identity?.auditHash || handoffMeta.auditHash,
         auditSessionId: identity?.auditSessionId || handoffMeta.sessionId,
+        auditEntryUuid: identity?.auditEntryUuid || handoffMeta.auditEntryUuid,
         sourceIdentity: identity?.sourceIdentity || handoffMeta.sourceIdentity,
         sessionId: identity?.auditSessionId || handoffMeta.sessionId || sessionId,
       } as FullHistoryEntry,
@@ -7080,6 +7303,7 @@ function HistoryPanel({
                 auditTimestamp: identity.auditTimestamp,
                 auditHash: identity.auditHash,
                 auditSessionId: identity.auditSessionId,
+                auditEntryUuid: identity.auditEntryUuid,
                 sourceIdentity: identity.sourceIdentity,
                 sessionId: identity.auditSessionId || entry.sessionId,
               }
@@ -7142,6 +7366,7 @@ function HistoryPanel({
         auditTimestamp: record.auditProof?.auditTimestamp,
         auditHash: record.auditProof?.actualHash,
         auditSessionId,
+        auditEntryUuid: record.auditProof?.entryUuid,
         sourceIdentity: record.auditProof?.sourceIdentity,
       };
       if (
@@ -7430,6 +7655,7 @@ function HistoryPanel({
         auditTimestamp: handoff.auditProof?.auditTimestamp,
         auditHash: handoff.auditProof?.actualHash,
         auditSessionId: handoff.auditProof?.sessionId || undefined,
+        auditEntryUuid: handoff.auditProof?.entryUuid,
         sourceIdentity: handoff.auditProof?.sourceIdentity,
       };
       const matched = findServerPromptEntry(
@@ -8018,11 +8244,19 @@ function HistoryPanel({
           ? 'hit'
           : 'miss';
         surfacePresentedOwnerRef.current = presentedProofKey;
+        // `loader=` must report the ACTUAL loader state, not a constant. This
+        // branch hard-coded `hidden`, so an empty-state frame — a legitimately
+        // painted "no history" placeholder — was indistinguishable in the log
+        // from the forbidden blank frame (no rows AND no indicator). An
+        // independent reviewer read exactly that and filed a regression that
+        // did not exist (e2e21). A log line that cannot express the difference
+        // between the safe and the unsafe case is a trap for whoever reads it.
         historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
           + ' owner=' + historyOwnerDigest(ownerAtSchedule)
           + ' generation=' + generationAtSchedule
           + ' cache=' + cacheAtPaint
-          + ' domRows=0 foreignDomRows=0 loader=hidden'
+          + ' domRows=0 foreignDomRows=0'
+          + ' loader=' + (visibleSurfaceLoading ? 'visible' : 'hidden')
           + ' proof=painted-empty-state');
         publishHistorySurfacePresented({
           ownerKey: ownerAtSchedule,
@@ -8059,6 +8293,9 @@ function HistoryPanel({
     const ownerStartedAt = Date.now();
     historyOwnerStartedAtRef.current = ownerStartedAt;
     historyOwnerGenerationRef.current = generation;
+    // Publish the generation so the list's key changes and it truly remounts;
+    // that mount is the only moment restored geometry is applied.
+    setHistoryOwnerVisitState(generation);
     historyOwnerKeyRef.current = historyOwnerKey;
     deferredTranscriptRefreshRef.current = false;
     liveProjectionRef.current = { ownerKey: historyOwnerKey, entries: [] };
@@ -8288,7 +8525,7 @@ function HistoryPanel({
     ) return;
     durableSourceIdentitiesRef.current = new Set(
       entries
-        .map((entry) => entry.sourceIdentity)
+        .map((entry) => historyLivePresentationIdentity(entry))
         .filter((identity): identity is string => !!identity),
     );
     reconcileLiveProjectionAgainstDurable(entries, historyOwnerKey);
@@ -8328,6 +8565,13 @@ function HistoryPanel({
       // then report honestly whether the row was reachable at all.
       const driftOwner = historyOwnerKey;
       const driftGeneration = historyOwnerGenerationRef.current;
+      // Freeze the target. Re-reading the anchor inside the loop compared the
+      // restored position against an anchor the user's own scrolling had
+      // already MOVED — a moving target, so the "error" was partly just the
+      // reader scrolling (e2e20: 153px and 331px readings that A5 proved
+      // visually correct). What is being verified is "did the restore land
+      // where we were asked to land", so the ask must be captured up front.
+      const driftAnchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
       let driftFrames = 0;
       let stableTop: number | null = null;
       let stableFrames = 0;
@@ -8339,7 +8583,7 @@ function HistoryPanel({
         ) return;
         driftFrames += 1;
         const scroller = virtuosoScrollerRef.current;
-        const anchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
+        const anchor = driftAnchor;
         const node = scroller && anchor
           ? scroller.querySelector(
             `[data-uuid="${CSS.escape(anchor.uuid)}"]`,
@@ -8537,13 +8781,13 @@ function HistoryPanel({
     // first projection lands (surfaceLoading flips earlier than rows exist).
   }, [surfaceLoading, tabId, historyOwnerKey, entries, restoredMeasuredLayout]);
 
-  // Codex already exposes a canonical incremental transcript for web/SSE.
-  // Project that same stream into desktop History while the turn is busy,
+  // Both PTY agents expose canonical incremental transcript records. Project
+  // that same stream into desktop History while the turn is busy,
   // instead of reparsing and cloning the complete rollout after every append.
   // User messages remain owned by the prompt-handoff layer, so the live stream
   // cannot create a second copy before the durable audit arrives.
   useEffect(() => {
-    if (!sessionId || toolType !== 'codex') return;
+    if (!sessionId || (toolType !== 'codex' && toolType !== 'claude')) return;
     const ownerKey = historyOwnerKey;
     const clearLiveProjection = () => {
       if (liveProjectionRef.current.ownerKey !== ownerKey) return;
@@ -8553,29 +8797,58 @@ function HistoryPanel({
       setLiveToolResults(new Map());
     };
     const onLiveMessage = (_event: any, detail: any) => {
-      if (detail?.tabId !== tabId || detail?.toolType !== 'codex') return;
+      if (detail?.tabId !== tabId || detail?.toolType !== toolType) return;
       if (detail?.sessionId !== sessionId) return;
       if (historyOwnerKeyRef.current !== ownerKey) return;
       const current = liveProjectionRef.current.ownerKey === ownerKey
         ? liveProjectionRef.current.entries
         : [];
-      const reduced = reduceHistoryLiveProjection(current, detail);
+      const record = detail?.message;
+      const carrierText = toolType === 'claude'
+        ? extractClaudeHistoryPromptCarrierText(detail)
+        : '';
+      const locallyOwnedPrompt = !!carrierText && isClaudeHistoryPromptLocallyOwned(
+        detail,
+        Array.from(promptHandoffMetaRef.current.entries()).map(([handoffId, handoff]) => ({
+          handoffId,
+          auditEntryUuid: handoff.auditEntryUuid,
+        })),
+      );
+      const isQueueSettlement = record?.type === 'queue-operation'
+        && (
+          record.operation === 'dequeue'
+          || record.operation === 'remove'
+          || record.operation === 'popAll'
+        );
+      // History-originated sends already own an optimistic prompt row. Native
+      // xterm input has no such owner, so its exact Claude queue/user carrier
+      // becomes the live row. Queue settlement remains enabled only when that
+      // native live row actually exists.
+      const includeUserText = toolType === 'claude' && (
+        isQueueSettlement
+          ? hasClaudeHistoryLiveQueuePrompt(current)
+          : !locallyOwnedPrompt
+      );
+      const reduced = reduceHistoryLiveProjection(current, detail, {
+        includeUserText,
+      });
       let projectionChanged = reduced !== current;
       if (projectionChanged) {
         const alreadyPresentedLiveIdentities = new Set(
           current
-            .map((entry) => entry.sourceIdentity)
+            .map((entry) => historyLivePresentationIdentity(entry))
             .filter((identity): identity is string => !!identity),
         );
         const projected = reduced
           .map((entry: FullHistoryEntry) => (
             entry.liveProjection ? entry : { ...entry, liveProjection: true }
           ))
-          .filter((entry: FullHistoryEntry) =>
-            !entry.sourceIdentity
-            || !durableSourceIdentitiesRef.current.has(entry.sourceIdentity)
-            || alreadyPresentedLiveIdentities.has(entry.sourceIdentity)
-          );
+          .filter((entry: FullHistoryEntry) => {
+            const identity = historyLivePresentationIdentity(entry);
+            return !identity
+              || !durableSourceIdentitiesRef.current.has(identity)
+              || alreadyPresentedLiveIdentities.has(identity);
+          });
         projectionChanged = projected !== current;
         liveProjectionRef.current = { ownerKey, entries: projected };
         setLiveEntries(projected);
@@ -8696,11 +8969,25 @@ function HistoryPanel({
   }, [sessionId, cwd, tabId, toolType, flushLiveHistoryToDurable, historyOwnerKey]);
 
   useEffect(() => {
+    if (isTurnBusy) return;
+    // Claude may publish a standalone thinking record that is intentionally
+    // absent from the durable History projection. It remains visible while the
+    // turn is live, but at the authoritative settled edge it must not become a
+    // permanent unmatched row or force three full-history reloads forever.
+    const live = liveProjectionRef.current;
+    if (live.ownerKey === historyOwnerKey && live.entries.length > 0) {
+      const settledEntries = reduceHistoryLiveProjection(live.entries, {
+        type: 'turn_boundary',
+        boundary: 'turn_settled',
+        sessionId,
+      }) as FullHistoryEntry[];
+      if (settledEntries !== live.entries) {
+        liveProjectionRef.current = { ownerKey: historyOwnerKey, entries: settledEntries };
+        setLiveEntries(settledEntries);
+      }
+    }
     const hasLiveProjection = hasUnmatchedLiveForOwner(historyOwnerKey);
-    if (
-      isTurnBusy
-      || (!deferredTranscriptRefreshRef.current && !hasLiveProjection)
-    ) return;
+    if (!deferredTranscriptRefreshRef.current && !hasLiveProjection) return;
     historyDiag('TRANSCRIPT_FLUSH tab=' + tabId.slice(-12) +
       ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
       ' tool=' + toolType +
@@ -9422,7 +9709,16 @@ function HistoryPanel({
         ) : (
           <>
           <Virtuoso
-            key={historyOwnerKey}
+            // Keyed by owner AND visit. `restoreStateFrom` is read once, at
+            // mount — so a return to the SAME tab reused the existing list and
+            // silently ignored the restored geometry: the log showed the right
+            // offset going in (50802) while the screen sat at 0 from the third
+            // return onward (e2e23). Including the visit generation makes each
+            // return a real mount, which is the only moment the prop has any
+            // effect. The generation already increments per owner takeover, so
+            // this adds no remounts beyond the ones that were happening anyway
+            // for cross-tab switches.
+            key={historyOwnerKey + ':' + historyOwnerVisit}
             ref={virtuosoRef}
             data={transcriptEntries}
             components={HISTORY_VIRTUOSO_COMPONENTS}
@@ -9573,12 +9869,21 @@ function HistoryPanel({
                       foreignDomRows: Math.max(0, allDomRows - domRows),
                       cache: cacheAtRange,
                     });
-                    // Baseline geometry sample. Scroll-idle sampling covers a
-                    // user who actually reads; a visit that is only opened and
-                    // left (or switched away from within the debounce window)
-                    // would otherwise store nothing and pay the full anchor
-                    // hunt on the next return.
+                    // Baseline geometry sample: covers a visit that is opened
+                    // and left before any scroll-idle tick, which would
+                    // otherwise store nothing and pay the full anchor hunt on
+                    // the next return.
+                    //
+                    // Deferred by two frames on purpose. At presentation time
+                    // the list may still sit at offset 0 while it applies the
+                    // restored geometry; sampling right here captured that
+                    // transient zero and overwrote a perfectly good saved
+                    // position with the top of the list (e2e22: three saves at
+                    // 43140 then one at 0, after which every return landed at
+                    // the very top). The store rejects such a regression too,
+                    // but not creating it is the actual fix.
                     const layoutItems = lengthRef.current;
+                    requestAnimationFrame(() => requestAnimationFrame(() => {
                     try {
                       virtuosoRef.current?.getState((snapshot) => {
                         if (historyOwnerKeyRef.current !== ownerAtRange) return;
@@ -9594,6 +9899,7 @@ function HistoryPanel({
                         }
                       });
                     } catch { /* geometry is optional */ }
+                    }));
                   },
                 );
               }
@@ -9614,11 +9920,19 @@ function HistoryPanel({
             {...(restoredMeasuredLayout
               ? { restoreStateFrom: restoredMeasuredLayout as any }
               : { initialTopMostItemIndex })}
-            followOutput={() => (
-              isAtBottomRef.current
-                ? 'auto'
-                : false
-            )}
+            // Same live-position rule as the composer-resize path: the cached
+            // flag alone is only as fresh as the last scroll event, and rows
+            // append on the agent's schedule, not the reader's. A user
+            // scrolling upward through a streaming session kept being pulled
+            // back to the tail (prod e2e17: four saves at followBottom=0 then
+            // one at 1, with no downward input in between). Intent must be
+            // held AND the scroller must still actually be at the bottom.
+            followOutput={() => {
+              if (!isAtBottomRef.current) return false;
+              const scroller = virtuosoScrollerRef.current;
+              if (scroller && !isHistoryTailPinned(scroller)) return false;
+              return 'auto';
+            }}
             className="hp-history-transcript"
             style={{
               height: '100%',

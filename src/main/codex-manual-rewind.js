@@ -18,23 +18,43 @@ function isPureCodexEscapeBurst(data) {
 
 function classifyManualCodexEnterFrame(snapshot) {
   const lines = Array.isArray(snapshot?.lines) ? snapshot.lines : [];
-  const normalizedLines = lines.map((line) => normalizeManualRewindText(line?.text || ''));
+  const normalizedRows = lines.map((line) => ({
+    row: Number(line?.row),
+    text: normalizeManualRewindText(line?.text || ''),
+  }));
   const active = snapshot?.codexActivePrompt || null;
+  const activeRow = Number(active?.row);
   const selectedText = normalizeManualRewindText(
     stripLeadingCodexComposerPromptGlyph(active?.text || ''),
   );
   // Neither word is enough by itself: ordinary history or a user's draft may
   // contain "TRANSCRIPT" / "enter to edit message". Native Rewind is proven
-  // only by the two separate chrome rows that Codex renders around its overlay.
-  const hasTranscriptTitle = normalizedLines.some((line) => (
-    /^[\s/\\|─━_-]*T\s+R\s+A\s+N\s+S\s+C\s+R\s+I\s+P\s+T[\s/\\|─━_-]*$/i.test(line)
+  // only by the ordered overlay geometry: a slash-delimited TRANSCRIPT title
+  // above the active inverse row, followed by Codex's two adjacent footer rows.
+  // The final word is allowed to be clipped as "mess" by a narrow xterm; the
+  // preceding title/navigation/edit controls must still match exactly.
+  const titleRows = normalizedRows.filter(({ text }) => (
+    /(?:^|[\/\\|─━_-])\s*T\s+R\s+A\s+N\s+S\s+C\s+R\s+I\s+P\s+T\s*(?=$|[\/\\|─━_-])/i.test(text)
   ));
-  const hasTranscriptFooter = normalizedLines.some((line) => (
-    /\besc\s*\/\s*←\s+to\s+edit\s+prev\b.*\benter\s+to\s+edit\s+message\b/i.test(line)
+  const scrollFooterPattern = /^↑\s*\/\s*↓\s+to\s+scroll\s+pgup\s*\/\s*pgdn\s+to\s+page\s+home\s*\/\s*end\s+to\s+jump$/i;
+  const editFooterPattern = /^q\s+to\s+quit\s+esc\s*\/\s*←\s+to\s+edit\s+prev\s+→\s+to\s+edit\s+next\s+enter\s+to\s+edit\s+(?:mess|message)$/i;
+  const hasTranscriptTitle = titleRows.some(({ row }) => (
+    Number.isFinite(row) && Number.isFinite(activeRow) && row < activeRow
   ));
+  const hasTranscriptFooter = normalizedRows.some((row, index) => {
+    if (!scrollFooterPattern.test(row.text)) return false;
+    const next = normalizedRows[index + 1];
+    return !!next
+      && Number.isFinite(row.row)
+      && Number.isFinite(next.row)
+      && Number.isFinite(activeRow)
+      && row.row > activeRow
+      && next.row === row.row + 1
+      && editFooterPattern.test(next.text);
+  });
   const hasTranscriptChrome = hasTranscriptTitle && hasTranscriptFooter;
   const activePromptProven = active?.hasInverse === true
-    && Number.isFinite(Number(active?.row))
+    && Number.isFinite(activeRow)
     && selectedText.length > 0;
 
   if (snapshot?.success === true && hasTranscriptChrome && activePromptProven) {
@@ -42,7 +62,7 @@ function classifyManualCodexEnterFrame(snapshot) {
       kind: 'native-rewind-confirm',
       proven: true,
       selectedText,
-      selectedRow: Number(active.row),
+      selectedRow: activeRow,
       reason: 'headless-transcript-active-prompt',
     };
   }

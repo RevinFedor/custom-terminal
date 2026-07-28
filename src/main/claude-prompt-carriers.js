@@ -1,0 +1,128 @@
+'use strict';
+
+const crypto = require('node:crypto');
+
+function extractQueuedCommandPromptText(prompt) {
+  if (typeof prompt === 'string') return prompt;
+  if (Array.isArray(prompt)) {
+    return prompt.map((item) => {
+      if (!item) return '';
+      if (typeof item === 'string') return item;
+      if (typeof item.text === 'string') return item.text;
+      if (typeof item.content === 'string') return item.content;
+      if (typeof item.message === 'string') return item.message;
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  if (prompt && typeof prompt === 'object') {
+    if (typeof prompt.text === 'string') return prompt.text;
+    if (typeof prompt.content === 'string') return prompt.content;
+    if (typeof prompt.message === 'string') return prompt.message;
+  }
+  return '';
+}
+
+function extractClaudePromptCarrier(entry) {
+  if (entry?.type === 'attachment' && entry?.attachment?.type === 'queued_command') {
+    const text = extractQueuedCommandPromptText(entry.attachment.prompt).trim();
+    if (!text) return null;
+    return {
+      kind: 'queued_command',
+      text,
+      uuid: entry.uuid || null,
+      timestamp: entry.timestamp || null,
+    };
+  }
+  if (entry?.type !== 'user') return null;
+  // Claude persists tool-produced UI payloads (for example screenshot
+  // references) as `user` records with isMeta=true.  They are part of the
+  // current model turn, not a new prompt.  Treating one as a carrier splits
+  // the turn and can leave the exact originating prompt looking incomplete
+  // even though a later assistant record has stop_reason=end_turn.
+  if (entry.isMeta === true) return null;
+  const content = entry.message?.content;
+  if (Array.isArray(content) && content.some((block) => block?.type === 'tool_result')) return null;
+  let text = null;
+  if (typeof content === 'string') text = content;
+  if (Array.isArray(content)) {
+    const block = content.find((item) => item?.type === 'text' && typeof item.text === 'string');
+    text = block?.text || null;
+  }
+  if (text == null) return null;
+  return {
+    kind: entry.isCompactSummary === true ? 'compact_summary' : 'user',
+    text,
+    uuid: entry.uuid || null,
+    timestamp: entry.timestamp || null,
+  };
+}
+
+function promptFingerprint(value) {
+  const normalized = String(value || '').replace(/\r\n/g, '\n').trim();
+  return crypto.createHash('sha256').update(normalized).digest('hex');
+}
+
+/**
+ * Finds the one synthetic queue row replaced by a durable Claude prompt.
+ * Exact timestamp/session wins; otherwise the oldest same-text row wins.
+ * Walking from the end is incorrect when two identical prompts are queued.
+ */
+function selectClaudeQueuedPromptIndex(
+  pendingEntries,
+  { text, timestamp = '', sessionId = '', normalizeText = (value) => String(value || '').trim() },
+) {
+  const normalized = normalizeText(text);
+  if (!normalized) return -1;
+  const expectedTimestamp = String(timestamp || '');
+  const expectedSessionId = String(sessionId || '');
+  const candidates = (Array.isArray(pendingEntries) ? pendingEntries : [])
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => {
+      if (normalizeText(entry?.content) !== normalized) return false;
+      const candidateSessionId = String(entry?.sessionId || '');
+      return !expectedSessionId || !candidateSessionId || candidateSessionId === expectedSessionId;
+    });
+  if (expectedTimestamp) {
+    const exact = candidates.find(({ entry }) => (
+      String(entry?.timestamp || '') === expectedTimestamp
+    ));
+    if (exact) return exact.index;
+  }
+  return candidates[0]?.index ?? -1;
+}
+
+function findMatchingClaudePromptTurn({
+  turns,
+  recordMap,
+  promptHash,
+  requestedAt,
+  resultAfterAt,
+}) {
+  const latestAfter = Number(resultAfterAt) > 0 ? Number(resultAfterAt) : 0;
+  const lowerBound = latestAfter
+    || (Number(requestedAt) > 0 ? Number(requestedAt) - 5 * 60 * 1000 : 0);
+  const rows = Array.isArray(turns) ? turns : [];
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const turn = rows[index];
+    if ((turn?.kind !== 'user' && turn?.kind !== 'queued_command') || !turn.userUuid) continue;
+    const timestampMs = Date.parse(turn.userTimestamp || '');
+    if (lowerBound && Number.isFinite(timestampMs) && timestampMs < lowerBound) continue;
+    if (latestAfter) {
+      if (!Array.isArray(turn.assistantUuids) || turn.assistantUuids.length === 0) continue;
+    } else {
+      const record = recordMap?.get?.(turn.userUuid);
+      const carrier = extractClaudePromptCarrier(record);
+      if (!carrier?.text || promptFingerprint(carrier.text) !== promptHash) continue;
+    }
+    return { turn, turnIndex: index };
+  }
+  return null;
+}
+
+module.exports = {
+  extractClaudePromptCarrier,
+  extractQueuedCommandPromptText,
+  findMatchingClaudePromptTurn,
+  promptFingerprint,
+  selectClaudeQueuedPromptIndex,
+};

@@ -73,6 +73,7 @@ import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSett
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
 import { generateTabTitleFromSession } from './utils/generateTabTitle';
 import { linkFileTab } from './utils/linkFileTab';
+import { resolveDockBusyBadgeState } from './utils/dockBusyBadgeState.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -169,7 +170,12 @@ function loadDockBaseIconImage() {
   return dockBaseIconImagePromise;
 }
 
-function drawDockBusyIcon(baseImage: HTMLImageElement, displayCount: string) {
+function drawDockBusyIcon(
+  baseImage: HTMLImageElement,
+  displayCount: string,
+  badgeColor: string,
+  kind: 'active' | 'inherited',
+) {
   const canvas = document.createElement('canvas');
   canvas.width = DOCK_BUSY_ICON_SIZE;
   canvas.height = DOCK_BUSY_ICON_SIZE;
@@ -193,13 +199,13 @@ function drawDockBusyIcon(baseImage: HTMLImageElement, displayCount: string) {
   ctx.fill();
   ctx.restore();
 
-  ctx.fillStyle = '#4ade80';
+  ctx.fillStyle = badgeColor;
   ctx.beginPath();
   ctx.arc(cx, cy, radius, 0, Math.PI * 2);
   ctx.fill();
 
   ctx.lineWidth = 9;
-  ctx.strokeStyle = 'rgba(5, 46, 22, 0.28)';
+  ctx.strokeStyle = kind === 'inherited' ? 'rgba(59, 7, 100, 0.28)' : 'rgba(5, 46, 22, 0.28)';
   ctx.beginPath();
   ctx.arc(cx, cy, radius - 4, 0, Math.PI * 2);
   ctx.stroke();
@@ -213,19 +219,21 @@ function drawDockBusyIcon(baseImage: HTMLImageElement, displayCount: string) {
   return canvas.toDataURL('image/png');
 }
 
-async function getDockBusyIconDataUrl(count: number) {
+async function getDockBusyIconDataUrl(count: number, kind: 'active' | 'inherited', inheritedColor: string) {
   const displayCount = count > 99 ? '99+' : String(Math.max(0, Math.floor(count)));
-  const cached = dockBusyIconCache.get(displayCount);
+  const badgeColor = kind === 'inherited' ? inheritedColor : '#4ade80';
+  const cacheKey = `${kind}:${badgeColor}:${displayCount}`;
+  const cached = dockBusyIconCache.get(cacheKey);
   if (cached) return cached;
 
   const promise = (async () => {
     const baseImage = await loadDockBaseIconImage();
     if (!baseImage) return null;
 
-    return drawDockBusyIcon(baseImage, displayCount);
+    return drawDockBusyIcon(baseImage, displayCount, badgeColor, kind);
   })();
 
-  dockBusyIconCache.set(displayCount, promise);
+  dockBusyIconCache.set(cacheKey, promise);
   return promise;
 }
 
@@ -882,9 +890,16 @@ function App() {
   const inheritedBusyProjectKey = useOrchestrationStore((s) => (
     Array.from(s.inheritedBusyProjectIds).sort().join('\u0000')
   ));
+  const inheritedBusyTabKey = useOrchestrationStore((s) => (
+    Array.from(s.inheritedBusyTabIds).sort().join('\u0000')
+  ));
   const inheritedBusyProjectIds = useMemo(
     () => new Set(inheritedBusyProjectKey ? inheritedBusyProjectKey.split('\u0000') : []),
     [inheritedBusyProjectKey],
+  );
+  const inheritedBusyTabIds = useMemo(
+    () => new Set(inheritedBusyTabKey ? inheritedBusyTabKey.split('\u0000') : []),
+    [inheritedBusyTabKey],
   );
 
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -4077,36 +4092,11 @@ function App() {
                   console.warn('[AutoResume] Resumed codex pending=' + (runResult?.acceptancePending === true), tabId, sessionId.substring(0, 8));
                   return { ok: true, item };
                 }
-                // Repair dangling parentUuid in JSONL before resume so Claude CLI
-                // backtrace doesn't truncate history at first orphan (slash-command
-                // assistant or attachment virtual parent never written to disk).
-                // When repair returns repaired > 0 — surface to user: this is the
-                // moment we ACTUALLY saved history that Claude TUI would have lost.
-                try {
-                  const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd, tabId });
-                  if (repairRes?.success === false) {
-                    console.warn('[AutoResume] JSONL repair blocked tab=' + tabId.slice(-12) + ' sid=' + sessionId.substring(0, 8) + ': ' + (repairRes?.error || repairRes?.reason || 'unknown'));
-                    return { ok: false, item, error: repairRes?.error || repairRes?.reason || 'JSONL repair blocked' };
-                  }
-                  const fixedCount = repairRes?.repaired || 0;
-                  if (fixedCount > 0) {
-                    showToast(
-                      `Перед открытием сессии починили ${fixedCount} orphan${fixedCount === 1 ? '' : 's'} parentUuid — без этого Claude обрезал бы историю.`,
-                      'info',
-                      8000,
-                      false,
-                      undefined,
-                      undefined,
-                      undefined,
-                      tabId
-                    );
-                  }
-                } catch (e: any) { console.warn('[AutoResume] JSONL repair skipped:', e?.message || String(e)); }
-                // Reserve sessionId immediately before writing to PTY: SessionBridge fires
-                // claude:session-detected within ~1-2 sec, and any stale bridge
-                // file (Claude CLI keeps months-old bridge JSONs around) racing
-                // ahead of the real resume would stomp this tab. The flag stops
-                // exactly that race. See utils/pendingResume.ts.
+                // Main owns the complete Resume transaction now: exact bridge
+                // ownership, tail trim, JSONL chain repair, final shell proof,
+                // and the PTY write.  Keeping those steps in one transaction is
+                // what lets the UI show a re-queryable preparation state instead
+                // of leaving the tab as "interrupted" during the repair.
                 markPendingResume(tabId, sessionId);
                 const runResult = await ipcRenderer.invoke('claude:run-command', {
                   tabId,
@@ -4117,6 +4107,19 @@ function App() {
                 if (runResult?.success === false || runResult?.accepted === false) {
                   clearPendingResume(tabId);
                   return { ok: false, item, error: runResult.error || runResult.reason || 'Claude start failed' };
+                }
+                const fixedCount = Number(runResult?.repaired || 0);
+                if (fixedCount > 0) {
+                  showToast(
+                    `Перед открытием сессии починили ${fixedCount} orphan${fixedCount === 1 ? '' : 's'} parentUuid — без этого Claude обрезал бы историю.`,
+                    'info',
+                    8000,
+                    false,
+                    undefined,
+                    undefined,
+                    undefined,
+                    tabId
+                  );
                 }
                 s.clearInterruptedState(tabId);
                 console.warn('[AutoResume] Resumed claude', tabId, sessionId.substring(0, 8));
@@ -4734,16 +4737,21 @@ function App() {
     };
   };
   const inboxIndicators = getProjectTabIndicators(INBOX_PROJECT_ID, inboxWorkspace);
-  const dockBusyTabCount = useMemo(() => {
-    const busyTabIds = new Set<string>();
+  const dockBusyState = useMemo(() => {
+    const normalBusyTabIds = new Set<string>();
+    const visibleInheritedBusyTabIds = new Set<string>();
     openProjects.forEach((workspace: any) => {
       workspace?.tabs?.forEach((tab: any, tabId: string) => {
         if (!tab || tab.tabType === 'file') return;
-        if (busyTabs.get(tabId) || pasteBusyTabs.get(tabId)) busyTabIds.add(tabId);
+        if (busyTabs.get(tabId) || pasteBusyTabs.get(tabId)) normalBusyTabIds.add(tabId);
+        if (inheritedBusyTabIds.has(tabId)) visibleInheritedBusyTabIds.add(tabId);
       });
     });
-    return busyTabIds.size;
-  }, [openProjects, busyTabs, pasteBusyTabs]);
+    return resolveDockBusyBadgeState(normalBusyTabIds, visibleInheritedBusyTabIds) as {
+      count: number;
+      kind: 'active' | 'inherited';
+    };
+  }, [openProjects, busyTabs, pasteBusyTabs, inheritedBusyTabIds]);
 
   useEffect(() => {
     const isMacDock = /Mac/i.test(navigator.platform || '');
@@ -4760,17 +4768,25 @@ function App() {
       ipcRenderer.invoke('dock:reset-icon').catch(() => {});
     };
 
-    if (dockBusyTabCount <= 0) {
+    if (dockBusyState.count <= 0) {
       reset();
       return () => {};
     }
 
     (async () => {
       try {
-        const dataUrl = await getDockBusyIconDataUrl(dockBusyTabCount);
+        const dataUrl = await getDockBusyIconDataUrl(
+          dockBusyState.count,
+          dockBusyState.kind,
+          processBar.inheritedColor,
+        );
         if (disposed) return;
         if (dataUrl) {
-          const result = await ipcRenderer.invoke('dock:set-icon-data-url', { dataUrl, count: dockBusyTabCount });
+          const result = await ipcRenderer.invoke('dock:set-icon-data-url', {
+            dataUrl,
+            count: dockBusyState.count,
+            kind: dockBusyState.kind,
+          });
           if (result?.success === false) await stopCustomDockBadge(result?.error || 'set-icon-failed');
         } else {
           await stopCustomDockBadge('draw-failed');
@@ -4783,7 +4799,7 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [dockBusyTabCount]);
+  }, [dockBusyState.count, dockBusyState.kind, processBar.inheritedColor]);
 
   // Show loading screen while restoring session
   if (isRestoring) {

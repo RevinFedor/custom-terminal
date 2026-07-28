@@ -29,7 +29,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil, Minimize2 } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
 import {
   normalizeSelectedVisualRootIds,
   orderVisualHierarchyItems,
@@ -7032,6 +7032,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             type: provider === 'claude' ? 'claude-fork' : 'codex-fork',
             sessionId: launchSessionId,
           },
+        // Compact fork is materialized by the app before this tab exists, so
+        // its exact history identity is already proven for reads. Keep the
+        // runtime writer proof separate: the pending resume still has to earn
+        // live ownership before new output is attributed to this tab.
+        claudeSessionId: fromLatestCompact && provider === 'claude' ? launchSessionId : undefined,
+        codexSessionId: fromLatestCompact && provider === 'codex' ? launchSessionId : undefined,
         nameSetManually: false,
         afterTabId: tab.id,
         visualParentTabId: tab.id,
@@ -9966,27 +9972,26 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           {!isMultiSelect && contextForkProvider && contextForkSessionAvailable && (
             <div
               data-tab-fork-split
-              className="grid grid-cols-[4fr_1fr] border-t border-[#333] border-b border-[#333]"
+              className="grid grid-cols-[7fr_3fr] border-t border-[#333] border-b border-[#333]"
             >
               <button
-                data-tab-fork
-                className="px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-2"
-                title="Fork the complete session"
-                aria-label="Fork complete session"
-                onClick={() => void handleContextFork(false)}
-              >
-                <span className="text-[#8b5cf6] text-[14px] leading-none">⑂→▭</span>
-                <span>Fork</span>
-              </button>
-              <button
                 data-tab-fork-compact
-                className="px-1 py-1.5 text-[11px] text-[#c4b5fd] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-1 border-l border-[#333]"
+                className="px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-2"
                 title="Fork from latest compact"
                 aria-label="Fork from latest compact"
                 onClick={() => void handleContextFork(true)}
               >
-                <Minimize2 size={12} />
-                <span>C</span>
+                <span className="text-[#8b5cf6] text-[14px] leading-none">⑂→▭</span>
+                <span>Compact Fork</span>
+              </button>
+              <button
+                data-tab-fork
+                className="px-2 py-1.5 text-[12px] text-[#c4b5fd] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#333]"
+                title="Fork the complete session"
+                aria-label="Fork complete session"
+                onClick={() => void handleContextFork(false)}
+              >
+                <span>Fork</span>
               </button>
             </div>
           )}

@@ -57,6 +57,18 @@ export function saveHistoryMeasuredLayout(
   // An empty measurement set is not knowledge — storing it would answer
   // "restore?" with a snapshot that teaches Virtuoso nothing.
   if (snapshot.ranges.length === 0) return false;
+  // A zero offset from a list that had a real one is almost always the
+  // baseline sample firing before the restore has been applied — the list is
+  // momentarily at the top, and storing that overwrites the position the user
+  // actually left. Observed live (e2e22): three good saves at 43140, then one
+  // at 0, and from that point every return landed at the very top. A genuine
+  // "user scrolled to the top" is re-recorded by the next scroll-idle sample
+  // anyway, so refusing this one costs nothing and prevents silent loss.
+  const previous = store.get(ownerKey);
+  const nextScrollTop = Number(snapshot.scrollTop) || 0;
+  if (nextScrollTop === 0 && previous && previous.snapshot.scrollTop > 0) {
+    return false;
+  }
   store.delete(ownerKey);
   store.set(ownerKey, {
     snapshot: { ranges: snapshot.ranges, scrollTop: Number(snapshot.scrollTop) || 0 },

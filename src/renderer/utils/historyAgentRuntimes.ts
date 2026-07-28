@@ -35,6 +35,17 @@ export type AgentDraftGrabResult = ClaudePtyDraftGrabResult;
 export type AgentPendingQuestion = ClaudePendingQuestion;
 export type AgentQuestion = ClaudeQuestion;
 
+export interface AgentDraftInspection {
+  hasDraft: boolean | null;
+  preview: string;
+  source: string;
+  proofOutcome?: 'found' | 'absent' | 'unknown' | string;
+  proofReason?: string | null;
+  debug?: string;
+  mountedForInspect?: boolean;
+  [key: string]: any;
+}
+
 export interface AgentPtyPresence {
   status: AgentPtyStatus;
   hasBridge?: boolean;
@@ -57,6 +68,12 @@ export interface AgentPtyPresence {
   // Bridge/API callers must reuse it instead of issuing a second identity read
   // and combining two different process generations.
   runtimeSnapshot?: any;
+}
+
+export interface AgentPresenceRequestContext {
+  consumer: 'history-panel';
+  ownerKey: string;
+  generation: number;
 }
 
 export interface AgentResumeResult {
@@ -117,7 +134,11 @@ export interface HistoryAgentRuntime {
   allowSendWhileBusy: boolean;
   optimisticBusyOnSend: boolean;
   optimisticActiveOnInterrupt: boolean;
-  getPresence: (tabId: string, projectId?: string | null) => Promise<AgentPtyPresence>;
+  getPresence: (
+    tabId: string,
+    projectId?: string | null,
+    context?: AgentPresenceRequestContext,
+  ) => Promise<AgentPtyPresence>;
   startFresh?: (args: { tabId: string; cwd?: string }) => Promise<AgentResumeResult>;
   resume: (args: { tabId: string; sessionId: string; cwd?: string }) => Promise<AgentResumeResult>;
   sendPrompt: (tabId: string, prompt: string, options?: AgentSendPromptOptions) => Promise<any>;
@@ -129,8 +150,8 @@ export interface HistoryAgentRuntime {
   ) => { success: boolean; interrupted?: boolean; error?: string; skipped?: string };
   stopProcess: (tabId: string) => Promise<any>;
   grabDraft: (tabId: string) => Promise<AgentDraftGrabResult>;
-  probeDraft?: (tabId: string, reason: string) => Promise<{ hasDraft: boolean | null; preview: string; source: string; [key: string]: any }>;
-  inspectDraft?: (tabId: string) => { hasDraft: boolean | null; preview: string; source: string };
+  probeDraft?: (tabId: string, reason: string) => Promise<AgentDraftInspection>;
+  inspectDraft?: (tabId: string) => AgentDraftInspection;
   getPendingQuestion?: (tabId: string) => Promise<AgentPendingQuestion | null>;
   answerQuestion?: (args: {
     tabId: string;
@@ -244,6 +265,7 @@ async function startFreshClaudePtySession({
 async function getCodexPtyPresence(
   tabId: string,
   projectIdHint?: string | null,
+  _requestContext?: AgentPresenceRequestContext,
 ): Promise<AgentPtyPresence> {
   const context = findTabRuntimeContext(tabId, projectIdHint);
   const tab = context?.tab || null;
@@ -652,6 +674,8 @@ async function probeClaudeDraft(tabId: string, reason: string) {
   console.log('[ClaudePtyActions:draft] authoritative-probe tab=' + shortTab(tabId)
     + ' reason=' + reason
     + ' hasDraft=' + resolved.hasDraft
+    + ' proof=' + (resolved.proofOutcome || 'unknown')
+    + ' proofReason=' + (resolved.proofReason || resolved.error || '-')
     + ' source=' + (resolved.source || '-')
     + ' preview=' + JSON.stringify(resolved.preview || ''));
   return resolved;

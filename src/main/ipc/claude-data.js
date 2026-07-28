@@ -24,6 +24,9 @@ const {
 const {
   decorateHistoryResponseTimings,
 } = require('../history-response-timings');
+const {
+  selectClaudeQueuedPromptIndex,
+} = require('../claude-prompt-carriers');
 
 let _projectManager = null;
 let _getClaudeEditableLastPromptState = null;
@@ -4919,15 +4922,13 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         if (text.startsWith('Caveat: The messages below')) return true;
         return false;
       };
-      const dropMatchingQueuedEntry = (cleanContent) => {
-        const normalized = normalizeQueuedText(cleanContent);
-        let idx = -1;
-        for (let qIdx = pendingQueueEntries.length - 1; qIdx >= 0; qIdx--) {
-          if (normalizeQueuedText(pendingQueueEntries[qIdx].content) === normalized) {
-            idx = qIdx;
-            break;
-          }
-        }
+      const dropMatchingQueuedEntry = (cleanContent, timestamp, entrySid) => {
+        const idx = selectClaudeQueuedPromptIndex(pendingQueueEntries, {
+          text: cleanContent,
+          timestamp,
+          sessionId: entrySid,
+          normalizeText: normalizeQueuedText,
+        });
         if (idx < 0) return;
         const queued = pendingQueueEntries[idx];
         pendingQueueEntries.splice(idx, 1);
@@ -4965,7 +4966,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command') {
           const cleanContent = normalizeQueuedText(extractQueuedCommandPromptText(entry.attachment.prompt));
           if (!cleanContent || shouldSkipPromptText(cleanContent)) continue;
-          dropMatchingQueuedEntry(cleanContent);
+          dropMatchingQueuedEntry(cleanContent, entry.timestamp, entrySid);
           const slashEntry = slashCommandEntryFromText(cleanContent, entry.uuid, entry.timestamp, entrySid);
           if (slashEntry) {
             entries.push(slashEntry);
@@ -5033,7 +5034,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
 
           let cleanContent = normalizeQueuedText(rawContent);
           if (!cleanContent) continue;
-          dropMatchingQueuedEntry(cleanContent);
+          dropMatchingQueuedEntry(cleanContent, entry.timestamp, entrySid);
 
           if (entry.isCompactSummary) {
             let pairedWithCompactBoundary = false;

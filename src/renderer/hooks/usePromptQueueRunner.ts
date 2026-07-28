@@ -1098,6 +1098,7 @@ export function usePromptQueueRunner() {
             actualHash: detail.actualHash,
             actualLen: detail.actualLen,
             sessionId: detail.sessionId,
+            entryUuid: detail.entryUuid,
             sourceIdentity: detail.sourceIdentity,
             canonicalized: detail.canonicalized,
             canonicalReason: detail.canonicalReason,

@@ -6,6 +6,7 @@ import {
   extractHistoryLiveToolResults,
   historyLivePresentationKey,
   reconcileCommittedHistoryLiveProjection,
+  reconcileHistoryLiveToolResults,
   reduceHistoryLiveProjection,
 } from './historyLiveProjection.mjs';
 
@@ -43,6 +44,47 @@ test('live row remains until the committed durable projection contains it', () =
   assert.equal(afterCommit.durableIdentities.has('source-b'), false);
 });
 
+test('durable Task identity retires spawn acceptance without comparing it to the child final result', () => {
+  const live = new Map([[
+    'spawn-1:canonical:0',
+    { toolUseId: 'spawn-1:canonical:0', result: '{"agent_id":"child-1"}', isError: false },
+  ]]);
+  const remaining = reconcileHistoryLiveToolResults([{
+    uuid: 'task-row',
+    actions: [{
+      tool: 'Task',
+      // Durable parser keeps the provider call id; the live projection stamps
+      // its single decoded card with the canonical :0 suffix.
+      toolUseId: 'spawn-1',
+      subagentStatus: 'completed',
+      result: 'CHILD-FINAL',
+    }],
+  }], live);
+  assert.equal(remaining.size, 0);
+});
+
+test('raw live tool result remains until exact durable result coverage exists', () => {
+  const live = new Map([[
+    'call-raw',
+    { toolUseId: 'call-raw', result: 'expected output', isError: false },
+  ]]);
+  const pending = reconcileHistoryLiveToolResults([{
+    actions: [{
+      tool: '__raw__',
+      rawTool: { toolUseId: 'call-raw', result: 'older output', isError: false },
+    }],
+  }], live);
+  assert.strictEqual(pending, live);
+
+  const settled = reconcileHistoryLiveToolResults([{
+    actions: [{
+      tool: '__raw__',
+      rawTool: { toolUseId: 'call-raw', result: 'expected output', isError: false },
+    }],
+  }], live);
+  assert.equal(settled.size, 0);
+});
+
 test('one presentation prefers durable data without duplicating its live row', () => {
   const durable = [
     { uuid: 'user-1', role: 'user' },
@@ -65,6 +107,38 @@ test('one presentation prefers durable data without duplicating its live row', (
   assert.strictEqual(presented, durable);
   assert.equal(presented.length, 2);
   assert.equal(presented[1].content, 'Final answer');
+});
+
+test('Claude live assistant hands off to durable history by its exact JSONL uuid', () => {
+  const rawClaude = canonical(
+    'claude-assistant-uuid',
+    'assistant',
+    [{ type: 'text', text: 'Streaming Claude answer' }],
+  );
+  const live = reduceHistoryLiveProjection([], {
+    tabId: 'tab-claude',
+    toolType: 'claude',
+    sessionId: 'session-a',
+    message: rawClaude,
+  });
+  assert.equal(live.length, 1);
+  assert.equal(live[0].uuid, 'claude-assistant-uuid');
+  assert.equal(live[0].content, 'Streaming Claude answer');
+
+  const durable = [{
+    uuid: 'claude-assistant-uuid',
+    role: 'assistant',
+    content: 'Final Claude answer',
+  }];
+  assert.strictEqual(buildHistoryLivePresentation(durable, live), durable);
+  assert.deepEqual(
+    reconcileCommittedHistoryLiveProjection(live, durable).entries,
+    [],
+  );
+  assert.equal(
+    historyLivePresentationKey(live[0]),
+    historyLivePresentationKey(durable[0]),
+  );
 });
 
 test('unmatched live rows append to the durable list and keep a stable handoff key', () => {
@@ -274,6 +348,25 @@ test('temporary reasoning is folded into the next durable-shaped assistant row',
     thinking: 'Inspecting state',
     sessionId: 'session-a',
   }]);
+});
+
+test('Claude thinking-only live row is released at the authoritative settled boundary', () => {
+  const thinking = reduceHistoryLiveProjection([], envelope(canonical(
+    'claude-thinking-only',
+    'assistant',
+    [{ type: 'thinking', thinking: 'Temporary Claude reasoning' }],
+    { livePendingThinking: true },
+  )));
+  assert.equal(thinking.length, 1);
+  assert.equal(thinking[0].thinking, 'Temporary Claude reasoning');
+
+  const settled = reduceHistoryLiveProjection(thinking, {
+    type: 'turn_boundary',
+    boundary: 'turn_settled',
+    sessionId: 'session-a',
+  });
+  assert.deepEqual(settled, []);
+  assert.equal(buildHistoryLivePresentation([], settled).length, 0);
 });
 
 test('turn abort clears pending reasoning before the next prompt and answer', () => {

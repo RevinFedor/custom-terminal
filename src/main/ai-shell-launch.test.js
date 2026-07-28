@@ -167,3 +167,25 @@ test('manual shell claim is cleared by its real command-finished boundary', () =
     hasPendingPrompt: false,
   }).clear, true);
 });
+
+test('graceful shutdown preserves Claude session ownership through command-finished', () => {
+  assert.deepEqual(shouldClearClaudeShellLaunchOnCommandFinished({
+    hasClaudeState: true,
+    startupIntentReason: 'claude-shell-osc',
+    sawOscCommandStart: true,
+    sameTerminal: true,
+    gracefulShutdownInProgress: true,
+  }), {
+    clear: false,
+    reason: 'graceful-shutdown-preserve-session',
+  });
+
+  assert.deepEqual(shouldClearClaudeShellLaunchOnCommandFinished({
+    hasClaudeState: false,
+    hasPendingPrompt: false,
+    gracefulShutdownInProgress: true,
+  }), {
+    clear: false,
+    reason: 'graceful-shutdown-preserve-session',
+  });
+});

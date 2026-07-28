@@ -121,7 +121,14 @@ function shouldClearClaudeShellLaunchOnCommandFinished({
   startupIntentReason = null,
   sawOscCommandStart = false,
   sameTerminal = false,
+  gracefulShutdownInProgress = false,
 } = {}) {
+  // before-quit has already persisted this live Claude tab as interrupted.
+  // Clearing its ownership on the OSC D emitted by Ctrl+C would let will-quit
+  // erase that fresh marker without being able to re-create it.
+  if (gracefulShutdownInProgress) {
+    return { clear: false, reason: 'graceful-shutdown-preserve-session' };
+  }
   if (!hasClaudeState && !hasPendingPrompt) {
     return { clear: true, reason: 'unclaimed-shell-finish' };
   }

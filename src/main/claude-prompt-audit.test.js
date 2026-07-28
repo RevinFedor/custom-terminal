@@ -7,10 +7,12 @@ const os = require('node:os');
 const path = require('node:path');
 
 const {
+  buildClaudeLivePromptAuditConfirmation,
   captureClaudePromptAuditBoundary,
   classifyClaudeAuditRecordAfterBoundary,
   readClaudeUserRecords,
   readLastClaudeUserRecord,
+  selectClaudeLivePromptOwner,
   selectClaudePendingPromptAudit,
   shouldStageClaudeUserPromptAudit,
 } = require('./claude-prompt-audit');
@@ -21,6 +23,18 @@ function userRecord(uuid, text, timestamp = '2026-07-24T10:00:00.000Z') {
     uuid,
     timestamp,
     message: { role: 'user', content: text },
+  };
+}
+
+function queuedCommandRecord(uuid, text, timestamp = '2026-07-24T10:00:00.000Z') {
+  return {
+    type: 'attachment',
+    uuid,
+    timestamp,
+    attachment: {
+      type: 'queued_command',
+      prompt: [{ type: 'text', text }],
+    },
   };
 }
 
@@ -85,6 +99,30 @@ test('an identical pre-submit Claude record cannot satisfy the next audit', asyn
     causal: true,
     reason: 'record-after-byte-boundary',
   });
+});
+
+test('a Claude queued_command is exact live delivery proof after the submit boundary', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-audit-queued-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const transcriptPath = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(transcriptPath, JSON.stringify(userRecord('old-uuid', 'manual turn')) + '\n');
+  const boundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  const text = '[Оркестрация] Запрос завершён. runId: exact-run';
+  fs.appendFileSync(
+    transcriptPath,
+    JSON.stringify(queuedCommandRecord('queued-uuid', text)) + '\n',
+  );
+
+  const candidates = await readClaudeUserRecords(transcriptPath, boundary);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].record.uuid, 'queued-uuid');
+  assert.equal(candidates[0].text, text);
+  assert.equal(candidates[0].promptCarrierKind, 'queued_command');
+  const selection = selectClaudePendingPromptAudit([
+    makeAudit(text, boundary, { handoffId: 'orchestration-complete:exact-run' }),
+  ], candidates, { hashText: sha16 });
+  assert.equal(selection?.candidate?.record?.uuid, 'queued-uuid');
+  assert.equal(selection?.causality?.reason, 'record-after-byte-boundary');
 });
 
 test('resume child rejects a copied identical tail and accepts only a new UUID', async (t) => {
@@ -178,6 +216,170 @@ function makeAudit(text, boundary, extra = {}) {
     ...extra,
   };
 }
+
+test('live queue claim and its canonical record keep one exact handoff owner', () => {
+  const text = 'same prompt';
+  const boundary = { available: true, transcriptPath: '/tmp/live.jsonl', fileSize: 80 };
+  const auditA = makeAudit(text, boundary, { handoffId: 'A' });
+  const auditB = makeAudit(text, boundary, { handoffId: 'B' });
+  const queueCandidate = {
+    record: {
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: text,
+      timestamp: '2026-07-28T10:00:00.000Z',
+      sessionId: 'session-a',
+    },
+    text,
+    promptCarrierKind: 'queue-operation',
+    byteOffset: 100,
+    transcriptPath: '/tmp/live.jsonl',
+  };
+
+  const claimed = selectClaudeLivePromptOwner([auditA, auditB], queueCandidate, { hashText: sha16 });
+  assert.equal(claimed?.audit?.handoffId, 'A');
+  assert.equal(claimed?.reason, 'causal-queue-claim');
+
+  const replay = selectClaudeLivePromptOwner([auditA, auditB], queueCandidate, { hashText: sha16 });
+  assert.equal(replay?.audit?.handoffId, 'A');
+  assert.equal(replay?.reason, 'queue-replay');
+
+  const canonical = selectClaudeLivePromptOwner([auditA, auditB], {
+    record: userRecord('canonical-a', text),
+    text,
+    promptCarrierKind: 'user',
+    byteOffset: 140,
+    transcriptPath: '/tmp/live.jsonl',
+  }, { hashText: sha16 });
+  assert.equal(canonical?.audit?.handoffId, 'A');
+  assert.equal(canonical?.reason, 'canonical-after-exact-queue-claim');
+
+  const canonicalReplay = selectClaudeLivePromptOwner([auditA, auditB], {
+    record: userRecord('canonical-a', text),
+    text,
+    promptCarrierKind: 'user',
+    byteOffset: 140,
+    transcriptPath: '/tmp/live.jsonl',
+  }, { hashText: sha16 });
+  assert.equal(canonicalReplay?.audit?.handoffId, 'A');
+  assert.equal(canonicalReplay?.reason, 'canonical-replay');
+});
+
+test('an identical later queue carrier cannot steal an already claimed handoff', () => {
+  const text = 'same prompt';
+  const boundary = { available: true, transcriptPath: '/tmp/live.jsonl', fileSize: 80 };
+  const auditA = makeAudit(text, boundary, { handoffId: 'A' });
+  const auditB = makeAudit(text, boundary, { handoffId: 'B' });
+  const first = selectClaudeLivePromptOwner([auditA, auditB], {
+    record: { type: 'queue-operation', operation: 'enqueue', content: text, timestamp: 't1' },
+    text,
+    promptCarrierKind: 'queue-operation',
+    byteOffset: 100,
+    transcriptPath: '/tmp/live.jsonl',
+  }, { hashText: sha16 });
+  const second = selectClaudeLivePromptOwner([auditA, auditB], {
+    record: { type: 'queue-operation', operation: 'enqueue', content: text, timestamp: 't2' },
+    text,
+    promptCarrierKind: 'queue-operation',
+    byteOffset: 120,
+    transcriptPath: '/tmp/live.jsonl',
+  }, { hashText: sha16 });
+
+  assert.equal(first?.audit?.handoffId, 'A');
+  assert.equal(second?.audit?.handoffId, 'B');
+  assert.notEqual(auditA.liveQueuePromptClaim.byteOffset, auditB.liveQueuePromptClaim.byteOffset);
+});
+
+test('a live queued_command completes only its exact claimed History audit', () => {
+  const text = 'same prompt';
+  const boundary = { available: true, transcriptPath: '/tmp/live.jsonl', fileSize: 80 };
+  const historyAudit = makeAudit(text, boundary, { handoffId: 'history-A' });
+
+  const enqueue = {
+    record: {
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: text,
+      timestamp: '2026-07-24T10:00:00.100Z',
+    },
+    text,
+    promptCarrierKind: 'queue-operation',
+    byteOffset: 100,
+    transcriptPath: '/tmp/live.jsonl',
+  };
+  const queueSelection = selectClaudeLivePromptOwner([historyAudit], enqueue, { hashText: sha16 });
+  assert.equal(queueSelection?.audit?.handoffId, 'history-A');
+  assert.equal(
+    buildClaudeLivePromptAuditConfirmation(queueSelection, enqueue, { hashText: sha16 }),
+    null,
+    'enqueue establishes FIFO ownership but is not yet canonical UUID proof',
+  );
+
+  const nativeDuplicate = {
+    ...enqueue,
+    record: { ...enqueue.record, timestamp: '2026-07-24T10:00:00.200Z' },
+    byteOffset: 120,
+  };
+  assert.equal(
+    selectClaudeLivePromptOwner([historyAudit], nativeDuplicate, { hashText: sha16 }),
+    null,
+    'an identical native xterm enqueue has no app handoff to claim',
+  );
+
+  const canonical = {
+    record: queuedCommandRecord('queued-history-a', text, '2026-07-24T10:00:00.100Z'),
+    text,
+    promptCarrierKind: 'queued_command',
+    byteOffset: 140,
+    transcriptPath: '/tmp/live.jsonl',
+  };
+  const canonicalSelection = selectClaudeLivePromptOwner([historyAudit], canonical, { hashText: sha16 });
+  const confirmation = buildClaudeLivePromptAuditConfirmation(
+    canonicalSelection,
+    canonical,
+    { sessionId: 'session-live', hashText: sha16 },
+  );
+  assert.equal(confirmation?.audit?.handoffId, 'history-A');
+  assert.deepEqual(confirmation?.result, {
+    success: true,
+    actualLen: text.length,
+    actualHash: sha16(text),
+    sessionId: 'session-live',
+    entryUuid: 'queued-history-a',
+    auditTimestamp: '2026-07-24T10:00:00.100Z',
+    expectedLen: text.length,
+    expectedHash: sha16(text),
+    canonicalized: true,
+    canonicalReason: 'canonical-after-exact-queue-claim',
+  });
+  assert.equal(confirmation?.recordByteOffset, 140);
+});
+
+test('an ordinary live user carrier completes its exact History audit without a queue claim', () => {
+  const text = 'ordinary prompt';
+  const boundary = { available: true, transcriptPath: '/tmp/live.jsonl', fileSize: 80 };
+  const historyAudit = makeAudit(text, boundary, { handoffId: 'history-direct' });
+  const canonical = {
+    record: userRecord('direct-user-uuid', text),
+    text,
+    promptCarrierKind: 'user',
+    byteOffset: 100,
+    transcriptPath: '/tmp/live.jsonl',
+  };
+
+  const selection = selectClaudeLivePromptOwner([historyAudit], canonical, { hashText: sha16 });
+  assert.equal(selection?.audit?.handoffId, 'history-direct');
+  assert.equal(selection?.reason, 'causal-canonical-claim');
+
+  const confirmation = buildClaudeLivePromptAuditConfirmation(
+    selection,
+    canonical,
+    { sessionId: 'session-live', hashText: sha16 },
+  );
+  assert.equal(confirmation?.result?.entryUuid, 'direct-user-uuid');
+  assert.equal(confirmation?.result?.canonicalReason, 'causal-canonical-claim');
+  assert.equal(confirmation?.result?.success, true);
+});
 
 test('two same-text audits are confirmed by two causal records, not one', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-audit-multi-'));

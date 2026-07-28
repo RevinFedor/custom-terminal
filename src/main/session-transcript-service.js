@@ -58,6 +58,26 @@ function isCodexLiveMessageRecord(record) {
     payloadType === 'custom_tool_call_output';
 }
 
+// Claude can persist reasoning as a standalone assistant record even though
+// the durable History projection intentionally materializes only assistant
+// records that contain visible text or tool calls. Keep that reasoning live
+// while the turn runs, but mark it as ephemeral so the renderer can fold it
+// into the next visible assistant row or discard it at the exact turn boundary.
+function isClaudePendingThinkingRecord(record) {
+  if (record?.type !== 'assistant') return false;
+  const content = record?.message?.content;
+  if (!Array.isArray(content)) return false;
+  const hasThinking = content.some((block) =>
+    block?.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0
+  );
+  if (!hasThinking) return false;
+  const hasVisibleText = content.some((block) =>
+    block?.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0
+  );
+  const hasToolCall = content.some((block) => block?.type === 'tool_use');
+  return !hasVisibleText && !hasToolCall;
+}
+
 function codexRecordToMobileMessage(record, sessionId) {
   const payload = record?.payload || {};
   if (isCodexUserMessageRecord(record)) {
@@ -109,12 +129,18 @@ class SessionTranscriptService {
   constructor({
     getMainWindow,
     webBroadcast,
+    onChanged = null,
+    resolveClaudePromptOwner = null,
     claudeData,
     codexData,
     promptPresentationStore = null,
   }) {
     this.getMainWindow = getMainWindow;
     this.webBroadcast = webBroadcast;
+    this.onChanged = typeof onChanged === 'function' ? onChanged : null;
+    this.resolveClaudePromptOwner = typeof resolveClaudePromptOwner === 'function'
+      ? resolveClaudePromptOwner
+      : null;
     this.claudeData = claudeData;
     this.codexData = codexData;
     this.promptPresentationStore = promptPresentationStore;
@@ -614,6 +640,8 @@ class SessionTranscriptService {
       if (!changed) return;
       if (state.toolType === 'codex') {
         await this._broadcastCodexDelta(state, oldSize);
+      } else if (state.toolType === 'claude') {
+        await this._broadcastClaudeDelta(state, oldSize);
       }
       this._emitChanged(state, reason);
     } finally {
@@ -683,6 +711,112 @@ class SessionTranscriptService {
       ' leftover=' + state.leftover.length);
   }
 
+  async _broadcastClaudeDelta(state, oldSize) {
+    if (!state.filePath || state.size <= oldSize) {
+      if (state.size < oldSize) {
+        state.offset = 0;
+        state.leftover = '';
+      }
+      return;
+    }
+    const start = Math.max(0, state.offset || oldSize);
+    if (state.size <= start) return;
+    const fd = await fs.promises.open(state.filePath, 'r');
+    let text = '';
+    try {
+      const byteCount = state.size - start;
+      const buf = Buffer.allocUnsafe(byteCount);
+      await fd.read(buf, 0, byteCount, start);
+      text = buf.toString('utf8');
+    } finally {
+      await fd.close();
+    }
+    state.offset = state.size;
+    const previousLeftover = state.leftover || '';
+    const bufferBaseOffset = Math.max(0, start - Buffer.byteLength(previousLeftover));
+    const buffer = previousLeftover + text;
+    const lines = buffer.split('\n');
+    state.leftover = lines.pop() || '';
+    let parsed = 0;
+    let sent = 0;
+    let lineByteOffset = bufferBaseOffset;
+    const mainWindow = this.getMainWindow?.();
+    for (const line of lines) {
+      const recordByteOffset = lineByteOffset;
+      lineByteOffset += Buffer.byteLength(line) + 1;
+      if (!line.trim()) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+        parsed += 1;
+      } catch {
+        continue;
+      }
+      const content = record?.message?.content;
+      const hasToolResult = record?.type === 'user'
+        && Array.isArray(content)
+        && content.some((block) => block?.type === 'tool_result');
+      const isOrdinaryUser = record?.type === 'user'
+        && record?.isMeta !== true
+        && !hasToolResult;
+      const isQueueOperation = record?.type === 'queue-operation';
+      const isQueuedCommand = record?.type === 'attachment'
+        && record?.attachment?.type === 'queued_command';
+      if (
+        record?.type !== 'assistant'
+        && !hasToolResult
+        && !isOrdinaryUser
+        && !isQueueOperation
+        && !isQueuedCommand
+      ) continue;
+      if (isClaudePendingThinkingRecord(record)) {
+        record.livePendingThinking = true;
+      }
+      if (!mainWindow || mainWindow.isDestroyed()) continue;
+      // History, Timeline and the control bar can all subscribe to the same
+      // session for one tab. A JSONL record is a tab event, not a subscriber
+      // event: replaying `dequeue` once per consumer advances multiple queued
+      // prompts. Fan out once per distinct tab instead.
+      const tabIds = new Set(
+        Array.from(state.consumers.values())
+          .map((consumer) => String(consumer?.tabId || ''))
+          .filter(Boolean),
+      );
+      for (const tabId of tabIds) {
+        let promptOwner = null;
+        if (this.resolveClaudePromptOwner && (isOrdinaryUser || isQueueOperation || isQueuedCommand)) {
+          try {
+            promptOwner = this.resolveClaudePromptOwner({
+              tabId,
+              sessionId: state.sessionId,
+              transcriptPath: state.filePath,
+              recordByteOffset,
+              record,
+            }) || null;
+          } catch (error) {
+            console.warn('[TranscriptService:ClaudeDelta] prompt owner unresolved tab='
+              + shortId(tabId) + ' error=' + (error?.message || error));
+          }
+        }
+        mainWindow.webContents.send('agent-transcript:live-message', {
+          tabId,
+          toolType: 'claude',
+          sessionId: state.sessionId,
+          timestamp: record.timestamp || new Date().toISOString(),
+          recordByteOffset,
+          message: record,
+          ...(promptOwner ? { promptOwner } : {}),
+        });
+        sent += 1;
+      }
+    }
+    console.log('[TranscriptService:ClaudeDelta] session=' + shortId(state.sessionId)
+      + ' bytes=' + (state.size - start)
+      + ' parsed=' + parsed
+      + ' sent=' + sent
+      + ' leftover=' + state.leftover.length);
+  }
+
   _emitChanged(state, reason) {
     const meta = {
       type: 'transcript-changed',
@@ -697,6 +831,22 @@ class SessionTranscriptService {
     const mainWindow = this.getMainWindow?.();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('agent-transcript:changed', meta);
+    }
+    if (this.onChanged) {
+      try {
+        const notified = this.onChanged(meta);
+        if (notified && typeof notified.catch === 'function') {
+          void notified.catch((error) => {
+            console.warn('[TranscriptService:ChangedHook] failed tool=' + state.toolType
+              + ' session=' + shortId(state.sessionId)
+              + ' error=' + (error?.message || error));
+          });
+        }
+      } catch (error) {
+        console.warn('[TranscriptService:ChangedHook] failed tool=' + state.toolType
+          + ' session=' + shortId(state.sessionId)
+          + ' error=' + (error?.message || error));
+      }
     }
     this._webBroadcast(state, meta);
     console.log('[TranscriptService:Changed] tool=' + state.toolType +
@@ -748,4 +898,8 @@ function createSessionTranscriptService(opts) {
   return new SessionTranscriptService(opts);
 }
 
-module.exports = { createSessionTranscriptService, SessionTranscriptService };
+module.exports = {
+  createSessionTranscriptService,
+  SessionTranscriptService,
+  isClaudePendingThinkingRecord,
+};

@@ -22,7 +22,8 @@ function overlaySnapshot(selectedText = 'older prompt') {
     lines: [
       { row: 10, text: '        T R A N S C R I P T' },
       { row: 11, text: `› ${selectedText}` },
-      { row: 12, text: 'esc/← to edit prev  → to edit next  enter to edit message' },
+      { row: 12, text: '↑/↓ to scroll  pgup/pgdn to page  home/end to jump' },
+      { row: 13, text: 'q to quit  esc/← to edit prev  → to edit next  enter to edit message' },
     ],
     codexActivePrompt: {
       row: 11,
@@ -82,6 +83,66 @@ test('physical Enter is classified as native Rewind only for a proven headless o
     classifyManualCodexEnterFrame(footerWithoutTitle).kind,
     'ordinary-enter',
     'the exact footer without the separate transcript title is insufficient',
+  );
+
+  const footerOutOfOrder = overlaySnapshot('old prompt reused as draft');
+  footerOutOfOrder.lines[2].row = 14;
+  assert.equal(
+    classifyManualCodexEnterFrame(footerOutOfOrder).kind,
+    'ordinary-enter',
+    'the two footer rows must be adjacent current-frame chrome',
+  );
+});
+
+test('real narrow Codex transcript frame accepts the right-edge clipped message label', () => {
+  const mkFrame = (selectedText) => ({
+    success: true,
+    rows: 22,
+    cols: 69,
+    viewportY: 186,
+    lines: [
+      { row: 186, text: '/ T R A N S C R I P T / / / / / / / / / / / / / / / / /' },
+      { row: 189, text: `› ${selectedText}` },
+      { row: 205, text: '↑/↓ to scroll pgup/pgdn to page home/end to jump' },
+      { row: 206, text: 'q to quit esc/← to edit prev → to edit next enter to edit mess' },
+    ],
+    codexActivePrompt: {
+      row: 189,
+      text: `› ${selectedText}`,
+      hasInverse: true,
+    },
+  });
+
+  const realFrameA = mkFrame('S10_A_MATERIALIZE_R4_ROOTFIX');
+  assert.deepEqual(
+    classifyManualCodexEnterFrame(realFrameA),
+    {
+      kind: 'native-rewind-confirm',
+      proven: true,
+      selectedText: 'S10_A_MATERIALIZE_R4_ROOTFIX',
+      selectedRow: 189,
+      reason: 'headless-transcript-active-prompt',
+    },
+  );
+
+  const realFrameB = mkFrame('S10_B_MATERIALIZE_R4_ROOTFIX');
+  assert.deepEqual(
+    classifyManualCodexEnterFrame(realFrameB),
+    {
+      kind: 'native-rewind-confirm',
+      proven: true,
+      selectedText: 'S10_B_MATERIALIZE_R4_ROOTFIX',
+      selectedRow: 189,
+      reason: 'headless-transcript-active-prompt',
+    },
+  );
+
+  const quotedChromeInOrdinaryScrollback = structuredClone(realFrameA);
+  quotedChromeInOrdinaryScrollback.lines[0].text = 'Response quoted T R A N S C R I P T';
+  assert.equal(
+    classifyManualCodexEnterFrame(quotedChromeInOrdinaryScrollback).kind,
+    'ordinary-enter',
+    'quoted words without the exact slash-delimited title remain ordinary input',
   );
 });
 

@@ -4,7 +4,64 @@ const os = require('os');
 const path = require('path');
 const test = require('node:test');
 
-const { SessionTranscriptService } = require('./session-transcript-service');
+const {
+  SessionTranscriptService,
+  isClaudePendingThinkingRecord,
+} = require('./session-transcript-service');
+
+test('Claude thinking-only records are marked ephemeral before live History delivery', async (t) => {
+  const record = {
+    type: 'assistant',
+    uuid: 'thinking-only',
+    timestamp: '2026-07-28T05:00:00.000Z',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'thinking', thinking: 'temporary reasoning' }],
+    },
+  };
+  assert.equal(isClaudePendingThinkingRecord(record), true);
+  assert.equal(isClaudePendingThinkingRecord({
+    ...record,
+    message: {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'reasoning' },
+        { type: 'text', text: 'visible answer' },
+      ],
+    },
+  }), false);
+
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-live-thinking-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session.jsonl');
+  const line = JSON.stringify(record) + '\n';
+  await fs.promises.writeFile(filePath, line);
+  const delivered = [];
+  const service = new SessionTranscriptService({
+    getMainWindow: () => ({
+      isDestroyed: () => false,
+      webContents: {
+        send: (channel, payload) => delivered.push({ channel, payload }),
+      },
+    }),
+    webBroadcast: null,
+    claudeData: null,
+    codexData: null,
+  });
+  await service._broadcastClaudeDelta({
+    filePath,
+    size: Buffer.byteLength(line),
+    offset: 0,
+    leftover: '',
+    sessionId: 'session-a',
+    consumers: new Map([['history', { tabId: 'tab-a' }]]),
+  }, 0);
+
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].channel, 'agent-transcript:live-message');
+  assert.equal(delivered[0].payload.message.uuid, 'thinking-only');
+  assert.equal(delivered[0].payload.message.livePendingThinking, true);
+});
 
 test('Codex Timeline durable revision skips unchanged full projection', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'timeline-revision-'));
@@ -490,6 +547,37 @@ test('a transcript change received during an active read gets one trailing read'
   assert.equal(state.trailingReadReason, null);
 });
 
+test('transcript changes notify the main-process proof owner with exact session identity', () => {
+  const observed = [];
+  const service = new SessionTranscriptService({
+    getMainWindow: () => null,
+    webBroadcast: null,
+    onChanged: (meta) => observed.push(meta),
+    claudeData: null,
+    codexData: null,
+  });
+  service._emitChanged({
+    toolType: 'claude',
+    sessionId: 'session-proof',
+    version: 7,
+    size: 4096,
+    mtimeMs: 1234,
+    filePath: '/tmp/session-proof.jsonl',
+    consumers: new Map(),
+  }, 'fs-watch');
+
+  assert.deepEqual(observed, [{
+    type: 'transcript-changed',
+    toolType: 'claude',
+    sessionId: 'session-proof',
+    version: 7,
+    size: 4096,
+    mtimeMs: 1234,
+    filePath: '/tmp/session-proof.jsonl',
+    reason: 'fs-watch',
+  }]);
+});
+
 test('concurrent subscribers share one initialized state and one watcher', async () => {
   const service = new SessionTranscriptService({
     getMainWindow: () => null,
@@ -564,4 +652,113 @@ test('concurrent subscribers share one initialized state and one watcher', async
   await service.unsubscribe({ consumerId: 'timeline:tab-shared' });
   assert.equal(service.sessions.size, 0);
   assert.equal(watcherStops, 1);
+});
+
+test('Claude transcript watcher emits appended answer, tool, and exact prompt carriers as live messages', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-live-delta-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session.jsonl');
+  const initial = JSON.stringify({ type: 'user', uuid: 'user-old', message: { role: 'user', content: 'old' } }) + '\n';
+  await fs.promises.writeFile(filePath, initial);
+  const sent = [];
+  const ownerProbes = [];
+  const service = new SessionTranscriptService({
+    getMainWindow: () => ({
+      isDestroyed: () => false,
+      webContents: { send: (channel, payload) => sent.push({ channel, payload }) },
+    }),
+    webBroadcast: null,
+    resolveClaudePromptOwner: (probe) => {
+      ownerProbes.push(probe);
+      return probe.record?.uuid === 'queue-noise'
+        ? { handoffId: 'history-handoff' }
+        : null;
+    },
+    claudeData: null,
+    codexData: null,
+  });
+  const appended = [
+    {
+      type: 'assistant',
+      uuid: 'assistant-live',
+      sessionId: 'session-claude',
+      timestamp: '2026-07-28T02:21:17.000Z',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'live answer' }] },
+    },
+    {
+      type: 'user',
+      uuid: 'tool-result-live',
+      sessionId: 'session-claude',
+      timestamp: '2026-07-28T02:21:18.000Z',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok' }] },
+    },
+    {
+      type: 'queue-operation',
+      uuid: 'queue-noise',
+      operation: 'enqueue',
+      content: 'native queued prompt',
+      sessionId: 'session-claude',
+      timestamp: '2026-07-28T02:21:19.000Z',
+    },
+    {
+      type: 'attachment',
+      uuid: 'queued-command-live',
+      sessionId: 'session-claude',
+      timestamp: '2026-07-28T02:21:20.000Z',
+      attachment: { type: 'queued_command', prompt: 'native queued prompt' },
+    },
+    {
+      type: 'user',
+      uuid: 'ordinary-user-live',
+      sessionId: 'session-claude',
+      timestamp: '2026-07-28T02:21:21.000Z',
+      message: { role: 'user', content: 'ordinary native prompt' },
+    },
+    {
+      type: 'user',
+      uuid: 'meta-user-noise',
+      isMeta: true,
+      sessionId: 'session-claude',
+      timestamp: '2026-07-28T02:21:22.000Z',
+      message: { role: 'user', content: 'internal metadata' },
+    },
+  ].map((record) => JSON.stringify(record)).join('\n') + '\n';
+  await fs.promises.appendFile(filePath, appended);
+  const stat = await fs.promises.stat(filePath);
+  const state = {
+    filePath,
+    size: stat.size,
+    offset: Buffer.byteLength(initial),
+    leftover: '',
+    sessionId: 'session-claude',
+    consumers: new Map([
+      ['history:tab-a', { consumerId: 'history:tab-a', tabId: 'tab-a' }],
+      ['timeline:tab-a', { consumerId: 'timeline:tab-a', tabId: 'tab-a' }],
+      ['controls:tab-a', { consumerId: 'controls:tab-a', tabId: 'tab-a' }],
+    ]),
+  };
+
+  await service._broadcastClaudeDelta(state, Buffer.byteLength(initial));
+
+  assert.deepEqual(sent.map((item) => item.channel), [
+    'agent-transcript:live-message',
+    'agent-transcript:live-message',
+    'agent-transcript:live-message',
+    'agent-transcript:live-message',
+    'agent-transcript:live-message',
+  ]);
+  assert.deepEqual(sent.map((item) => item.payload.message.uuid), [
+    'assistant-live',
+    'tool-result-live',
+    'queue-noise',
+    'queued-command-live',
+    'ordinary-user-live',
+  ]);
+  assert.equal(sent[0].payload.toolType, 'claude');
+  assert.equal(sent[0].payload.tabId, 'tab-a');
+  assert.equal(sent[2].payload.promptOwner.handoffId, 'history-handoff');
+  assert.equal(Number.isFinite(sent[2].payload.recordByteOffset), true);
+  assert.equal(ownerProbes.length, 3);
+  assert.equal(ownerProbes[0].tabId, 'tab-a');
+  assert.equal(Number.isFinite(ownerProbes[0].recordByteOffset), true);
 });

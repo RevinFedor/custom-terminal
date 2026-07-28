@@ -7,7 +7,6 @@ import {
   ChevronRight,
   CircleAlert,
   CircleCheck,
-  CircleStop,
   History as HistoryIcon,
   LoaderCircle,
   RotateCcw,
@@ -89,6 +88,12 @@ function hasPendingSourceHandoff(run: OrchestrationRun, tabId: string): boolean 
     && !hasSourceNotificationError(run, tabId);
 }
 
+function canCancelPendingSourceHandoff(run: OrchestrationRun, tabId: string): boolean {
+  return hasPendingSourceHandoff(run, tabId)
+    && !run.notificationCancelRequestedAt
+    && (run.notificationStatus === 'pending' || run.notificationStatus === 'sending');
+}
+
 function attentionDismissedForTab(run: OrchestrationRun, tabId: string): boolean {
   if (run.sourceTabId === tabId && run.sourceAttentionDismissedAt) return true;
   if (run.targetTabId === tabId && run.targetAttentionDismissedAt) return true;
@@ -110,7 +115,14 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   }
   if (run.status === 'failed') return { color: '#f87171', icon: 'error', label: 'Ошибка', spinning: false };
   if (run.status === 'waiting_recovery') return { color: '#fbbf24', icon: 'error', label: 'Связь прервана', spinning: false };
-  if (hasPendingSourceHandoff(run, tabId)) return { color: '#a78bfa', icon: 'loading', label: 'Передача результата', spinning: true };
+  if (hasPendingSourceHandoff(run, tabId)) {
+    return {
+      color: '#a78bfa',
+      icon: 'loading',
+      label: run.notificationCancelRequestedAt ? 'Отмена передачи' : 'Передача результата',
+      spinning: true,
+    };
+  }
   if (run.status === 'completed') return { color: '#4ade80', icon: 'success', label: 'Готово', spinning: false };
   if (run.status === 'cancelled') return { color: '#737373', icon: 'cancelled', label: 'Закрыто', spinning: false };
   return {
@@ -281,7 +293,25 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
   }, [tabId]);
 
   const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'cancel') => {
-    const result = await ipcRenderer.invoke('orchestration:action', { runId: run.runId, action, tabId }).catch((error: unknown) => ({
+    let cancelSendAccepted = false;
+    if (action === 'cancel') {
+      const cancellingSourceHandoff = canCancelPendingSourceHandoff(run, tabId);
+      const cancellationTabId = cancellingSourceHandoff ? run.sourceTabId : run.targetTabId;
+      const cancellationHandoffId = cancellingSourceHandoff
+        ? (run.notificationHandoffId || `orchestration-complete:${run.runId}`)
+        : `orchestration:${run.runId}`;
+      const sendCancellation = await ipcRenderer.invoke('agent:cancel-send', {
+        tabId: cancellationTabId,
+        handoffId: cancellationHandoffId,
+      }).catch(() => null);
+      cancelSendAccepted = sendCancellation?.cancelled === true;
+    }
+    const result = await ipcRenderer.invoke('orchestration:action', {
+      runId: run.runId,
+      action,
+      tabId,
+      cancelSendAccepted,
+    }).catch((error: unknown) => ({
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     }));
@@ -362,7 +392,8 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
 
   const renderTooltipActions = (run: OrchestrationRun) => {
     const isSource = run.sourceTabId === tabId;
-    const canCancel = ACTIVE.has(run.status) && run.status !== 'waiting_recovery';
+    const canCancelActiveRun = ACTIVE.has(run.status) && run.status !== 'waiting_recovery';
+    const canCancelHandoff = canCancelPendingSourceHandoff(run, tabId);
     const presentation = runPresentation(run, tabId);
     const canDismissAttention = presentation.icon === 'error'
       && run.status !== 'waiting_recovery'
@@ -375,7 +406,13 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
           <span>{isSource ? 'Исходящий запрос' : 'Входящий запрос'}</span>
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
-          {canCancel && actionButton(run, 'cancel', 'Отменить текущий запрос', <CircleStop size={13} />, '#f87171')}
+          {(canCancelActiveRun || canCancelHandoff) && actionButton(
+            run,
+            'cancel',
+            canCancelHandoff ? 'Отменить передачу результата' : 'Отменить текущий запрос',
+            <X size={13} />,
+            '#f87171',
+          )}
           {run.status === 'waiting_recovery' && actionButton(run, 'retry', 'Восстановить связь', <RotateCcw size={13} />, '#fbbf24')}
           {run.status === 'waiting_recovery' && actionButton(run, 'report', 'Передать ошибку родителю', <Send size={13} />, '#f87171')}
           {run.status === 'waiting_recovery' && actionButton(run, 'dismiss', 'Закрыть без сообщения', <X size={13} />, '#a3a3a3')}

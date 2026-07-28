@@ -27,6 +27,7 @@ export interface HistoryPromptHandoffAuditProof {
   auditTimestamp: string;
   actualHash: string;
   sessionId: string | null;
+  entryUuid?: string;
   sourceIdentity?: string;
   actualLen?: number;
   canonicalized?: boolean;
@@ -144,6 +145,7 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
       + stringBytes(value.auditProof.auditTimestamp)
       + stringBytes(value.auditProof.actualHash)
       + stringBytes(value.auditProof.sessionId)
+      + stringBytes(value.auditProof.entryUuid)
       + stringBytes(value.auditProof.sourceIdentity)
       + stringBytes(value.auditProof.canonicalReason);
   }
@@ -178,6 +180,9 @@ function freezeProof(
     auditTimestamp: String(proof.auditTimestamp || ''),
     actualHash: String(proof.actualHash || ''),
     sessionId: typeof proof.sessionId === 'string' ? proof.sessionId : null,
+    ...(typeof proof.entryUuid === 'string' && proof.entryUuid
+      ? { entryUuid: proof.entryUuid }
+      : {}),
     ...(typeof proof.sourceIdentity === 'string' && proof.sourceIdentity
       ? { sourceIdentity: proof.sourceIdentity }
       : {}),
@@ -481,6 +486,9 @@ export function historyPromptHandoffAuditProofFromSendResult(
     auditTimestamp: String(audit.auditTimestamp),
     actualHash: String(audit.actualHash),
     sessionId: typeof audit.sessionId === 'string' ? audit.sessionId : null,
+    ...(typeof audit.entryUuid === 'string' && audit.entryUuid
+      ? { entryUuid: audit.entryUuid }
+      : {}),
     ...(typeof audit.sourceIdentity === 'string' && audit.sourceIdentity
       ? { sourceIdentity: audit.sourceIdentity }
       : {}),

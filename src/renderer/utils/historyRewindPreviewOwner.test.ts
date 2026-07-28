@@ -2,10 +2,37 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  projectNativeRewindPreview,
   shouldCaptureDelayedCodexRewindPrefix,
   shouldClearRewindPreviewForOwnerTransition,
   type HistoryRewindPreviewOwner,
 } from './historyRewindPreviewOwner.ts';
+
+test('native Rewind moves the target prompt out of History and into draft ownership', () => {
+  const source = [
+    { uuid: 'before', role: 'assistant' },
+    { uuid: 'target', role: 'user' },
+    { uuid: 'old-future', role: 'assistant' },
+    { uuid: 'local-status', role: 'rewind' },
+  ];
+
+  const projected = projectNativeRewindPreview(
+    source,
+    'target',
+    (entry) => entry.uuid === 'local-status',
+  );
+
+  assert.deepEqual(projected.entries.map((entry) => entry.uuid), ['before', 'local-status']);
+  assert.equal(projected.hiddenCount, 2, 'the restored target and old future are no longer sent History rows');
+  assert.deepEqual(source.map((entry) => entry.uuid), ['before', 'target', 'old-future', 'local-status']);
+});
+
+test('native Rewind preview is a no-op when its exact target is absent', () => {
+  const source = [{ uuid: 'before' }];
+  const projected = projectNativeRewindPreview(source, 'missing', () => false);
+  assert.strictEqual(projected.entries, source);
+  assert.equal(projected.hiddenCount, 0);
+});
 
 test('switching tabs preserves the independently owned rewind previews', () => {
   const transitions: Array<[HistoryRewindPreviewOwner, HistoryRewindPreviewOwner]> = [

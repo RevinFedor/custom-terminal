@@ -313,8 +313,16 @@ export async function applyClaudePtySetting({
   }
 }
 
-export async function getClaudePtyPresence(tabId: string): Promise<ClaudePtyPresence> {
-  const presence = await ipcRenderer.invoke('claude:get-presence', tabId);
+export async function getClaudePtyPresence(
+  tabId: string,
+  _projectId?: string | null,
+  requestContext?: {
+    consumer: 'history-panel';
+    ownerKey: string;
+    generation: number;
+  },
+): Promise<ClaudePtyPresence> {
+  const presence = await ipcRenderer.invoke('claude:get-presence', tabId, requestContext);
   return {
     status: presence?.status || 'inactive',
     hasBridge: !!presence?.hasBridge,
@@ -436,24 +444,10 @@ async function resumeClaudePtySessionInner({
     };
   }
 
-  let repaired = 0;
-  if (repair) {
-    try {
-      const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd, tabId });
-      repaired = Number(repairRes?.repaired || 0);
-      if (repairRes?.success === false) {
-        console.warn('[ClaudePtyActions:resume] JSONL repair reported failure tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId) + ': ' + (repairRes?.error || 'unknown'));
-        return { success: false, sessionId, error: repairRes?.error || 'JSONL repair failed' };
-      } else {
-        console.log('[ClaudePtyActions:resume] repair-done tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId) + ' repaired=' + repaired);
-      }
-    } catch (e: any) {
-      console.warn('[ClaudePtyActions:resume] JSONL repair skipped tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId) + ': ' + errorText(e));
-    }
-  }
-
-  // Arm stale-bridge protection immediately before the PTY write. Starting the
-  // 15s TTL before JSONL repair can burn the guard window on large sessions.
+  // Main owns repair + final launch admission as one transaction.  This flag
+  // is still armed before the IPC so a stale statusline update cannot replace
+  // the requested session between the accepted PTY write and its first fresh
+  // bridge record.
   markPendingResume(tabId, sessionId);
   console.log('[ClaudePtyActions:resume] pending-marked-and-write tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId));
   const runResult = await ipcRenderer.invoke('claude:run-command', {
@@ -461,13 +455,14 @@ async function resumeClaudePtySessionInner({
     command: 'claude-c',
     sessionId,
     ...(cwd ? { cdTo: cwd } : {}),
+    ...(repair ? {} : { skipResumeRepair: true }),
   }).catch((e: any) => ({ success: false, error: errorText(e) }));
   if (runResult?.success === false) {
     clearPendingResume(tabId);
-    return { success: false, sessionId, repaired, error: runResult.error || runResult.reason || 'Claude resume failed' };
+    return { success: false, sessionId, repaired: Number(runResult?.repaired || 0), error: runResult.error || runResult.reason || 'Claude resume failed' };
   }
   store.clearInterruptedState(tabId);
-  return { success: true, sessionId, repaired };
+  return { success: true, sessionId, repaired: Number(runResult?.repaired || 0) };
 }
 
 export async function sendClaudePtyPrompt(tabId: string, prompt: string, options: ClaudePtySendOptions = {}): Promise<any> {
@@ -525,6 +520,7 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
       fast: false,
       handoffId: options.handoffId || null,
       source: options.source || 'claude-pty-action',
+      verifyClaudeVisibleDraftBeforePaste: true,
       presentationSnapshot: options.presentationSnapshot || null,
     });
   })()

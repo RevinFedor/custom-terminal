@@ -65,7 +65,9 @@ const {
   isActiveStatus,
   isTerminalStatus,
   isCompleteOrchestrationResult,
+  shouldScheduleCreatedTargetAutoStop,
   shouldRetryWaitingNotificationForSourceLifecycle,
+  orchestrationTargetRunIdFromAudit,
   orchestrationCompletionRunIdFromAudit,
   mergeActiveLoadersWithOrchestrations,
 } = require('./orchestration-runs');
@@ -78,6 +80,15 @@ const {
 const {
   findTaskCompletionBlockers,
 } = require('./task-completion-intent');
+const {
+  createOrchestrationProofCoordinator,
+} = require('./orchestration-proof-coordinator');
+const {
+  promptAuditFingerprint,
+} = require('./prompt-audit-fingerprint');
+const {
+  findUniqueLegacySourceFollowupProof,
+} = require('./orchestration-source-reconcile');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 // Lazy-require the helpers (loaded fresh each call so missing module just
@@ -195,15 +206,105 @@ const externalRunByConversationKey = new Map(); // conversationKey -> runId
 const DEFAULT_EXTERNAL_AUTO_CLOSE_MS = 15 * 60 * 1000;
 let orchestrationRunStore = null;
 const orchestrationCompletionInflight = new Set();
+const orchestrationCompletionTrailing = new Set();
 const orchestrationNotificationInflight = new Set();
 const orchestrationAutoStopInflight = new Set();
 let orchestrationPolicyTimer = null;
+let orchestrationResultProofCoordinator = null;
+let orchestrationSourceProofCoordinator = null;
 
 function getOrchestrationRunStore() {
   if (!orchestrationRunStore) {
     orchestrationRunStore = new OrchestrationRunStore(path.join(app.getPath('userData'), 'orchestration-runs.json'));
   }
   return orchestrationRunStore;
+}
+
+function ensureOrchestrationProofCoordinators() {
+  if (!transcriptService) return false;
+  // Capture the service instance. stop() intentionally nulls the global
+  // reference while coordinator unsubscribe work may still be draining.
+  const proofTranscriptService = transcriptService;
+  if (!orchestrationResultProofCoordinator) {
+    orchestrationResultProofCoordinator = createOrchestrationProofCoordinator({
+      label: 'result',
+      subscribe: (payload) => proofTranscriptService.subscribe(payload),
+      unsubscribe: (payload) => proofTranscriptService.unsubscribe(payload),
+      onWake: async (runId, meta) => {
+        console.log('[OrchestrationResultProof] wake run=' + runId
+          + ' session=' + String(meta?.sessionId || '').slice(0, 8)
+          + ' version=' + (meta?.version ?? '-')
+          + ' size=' + (meta?.size ?? '-'));
+        const run = await getOrchestrationRunStore().getInternal(runId);
+        if (!run) return;
+        if (isActiveStatus(run.status)) {
+          await reconcileOrchestrationRun(runId, 'target-transcript-changed');
+        } else {
+          await finalizeSettledOrchestration(run, 'target-transcript-changed');
+        }
+      },
+    });
+  }
+  if (!orchestrationSourceProofCoordinator) {
+    orchestrationSourceProofCoordinator = createOrchestrationProofCoordinator({
+      label: 'source-followup',
+      subscribe: (payload) => proofTranscriptService.subscribe(payload),
+      unsubscribe: (payload) => proofTranscriptService.unsubscribe(payload),
+      onWake: async (runId, meta) => {
+        console.log('[OrchestrationSourceProof] wake run=' + runId
+          + ' session=' + String(meta?.sessionId || '').slice(0, 8)
+          + ' version=' + (meta?.version ?? '-')
+          + ' size=' + (meta?.size ?? '-'));
+        const run = await getOrchestrationRunStore().getInternal(runId);
+        if (run) await reconcileOrchestrationSourceFollowup(run, 'source-transcript-changed');
+      },
+    });
+  }
+  return true;
+}
+
+async function armOrchestrationResultProof(run, probe = {}) {
+  if (!run?.runId || !ensureOrchestrationProofCoordinators()) {
+    return { success: false, error: 'transcript-service-unavailable' };
+  }
+  const sessionId = probe.sessionId || run.sessionId || null;
+  return orchestrationResultProofCoordinator.arm({
+    runId: run.runId,
+    toolType: run.targetToolType,
+    sessionId,
+    cwd: run.targetCwd || run.targetProjectPath || null,
+  });
+}
+
+async function releaseOrchestrationResultProof(runId, reason) {
+  return orchestrationResultProofCoordinator?.release(runId, reason) || false;
+}
+
+async function armOrchestrationSourceProof(run, sourceInfo = null) {
+  if (!run?.runId || !ensureOrchestrationProofCoordinators()) {
+    return { success: false, error: 'transcript-service-unavailable' };
+  }
+  const sessionId = run.notificationSourceSessionId || sourceInfo?.sessionId || null;
+  const toolType = sourceInfo?.toolType || sourceInfo?.commandType || null;
+  if (!sessionId || (toolType !== 'claude' && toolType !== 'codex')) {
+    return { success: false, error: 'source-transcript-identity-unresolved' };
+  }
+  return orchestrationSourceProofCoordinator.arm({
+    runId: run.runId,
+    toolType,
+    sessionId,
+    cwd: sourceInfo?.cwd || run.sourceProjectPath || null,
+  });
+}
+
+async function releaseOrchestrationSourceProof(runId, reason) {
+  return orchestrationSourceProofCoordinator?.release(runId, reason) || false;
+}
+
+function notifyAgentTranscriptChanged(meta = {}) {
+  const resultWakes = orchestrationResultProofCoordinator?.handleTranscriptChanged(meta) || 0;
+  const sourceWakes = orchestrationSourceProofCoordinator?.handleTranscriptChanged(meta) || 0;
+  return { resultWakes, sourceWakes };
 }
 
 function shortId(value, len = 8) {
@@ -1384,6 +1485,17 @@ async function sendOrchestrationCompletionNotification(run) {
   if (current.status === 'completed' && current.resultComplete !== true) return;
   if (current.notifySource === false || current.notificationSuppressed) return;
   if (['sent', 'queued', 'suppressed', 'source-closed'].includes(current.notificationStatus)) return;
+  if (current.notificationCancelRequestedAt && !current.sourceFollowupStartedAt) {
+    const suppressed = await store.markNotification(current.runId, 'suppressed', {
+      notificationDismissedAt: Date.now(),
+      notificationError: null,
+    });
+    emitOrchestrationChanges(suppressed?.changed, 'notification-cancelled');
+    for (const settled of suppressed?.settled || []) {
+      await finalizeSettledOrchestration(settled, 'ancestor-settled');
+    }
+    return;
+  }
   if (!current.sourceTabId || current.sourceTabId === current.targetTabId) {
     const suppressed = await store.markNotification(current.runId, 'suppressed');
     emitOrchestrationChanges(suppressed?.changed, 'notification-suppressed');
@@ -1402,12 +1514,23 @@ async function sendOrchestrationCompletionNotification(run) {
   try {
     const status = await resolveAgentSessionInfo(current.sourceTabId, 2000);
     if (!status) {
+      await releaseOrchestrationSourceProof(current.runId, 'source-unavailable');
       const sourceClosed = await store.markNotification(current.runId, 'source-closed', {
         notificationSuppressed: true,
         notificationError: 'source tab unavailable',
       });
       emitOrchestrationChanges(sourceClosed?.changed, 'notification-source-closed');
       return;
+    }
+    const notificationSourceSessionId = status?.sessionId || current.notificationSourceSessionId || null;
+    if (notificationSourceSessionId) {
+      await store.patch(current.runId, { notificationSourceSessionId });
+      const proofRun = await store.getInternal(current.runId);
+      const armed = await armOrchestrationSourceProof(proofRun, status);
+      if (armed?.success !== true) {
+        console.warn('[OrchestrationSourceProof] arm failed run=' + current.runId
+          + ' error=' + (armed?.error || 'unknown'));
+      }
     }
     const result = await runAgentSendScenario({
       tabId: current.sourceTabId,
@@ -1424,6 +1547,19 @@ async function sendOrchestrationCompletionNotification(run) {
       timeoutMs: 60_000,
     });
     if (isSendFailure(result)) {
+      await releaseOrchestrationSourceProof(current.runId, 'notification-send-failed');
+      const latest = await store.getInternal(current.runId);
+      if (result?.error === 'agent_send_cancelled' || latest?.notificationCancelRequestedAt) {
+        const suppressed = await store.markNotification(current.runId, 'suppressed', {
+          notificationDismissedAt: Date.now(),
+          notificationError: null,
+        });
+        emitOrchestrationChanges(suppressed?.changed, 'notification-cancelled');
+        for (const settled of suppressed?.settled || []) {
+          await finalizeSettledOrchestration(settled, 'ancestor-settled');
+        }
+        return;
+      }
       const notificationStatus = result?.code === 'terminal_draft_conflict'
         ? 'waiting-for-input'
         : 'failed';
@@ -1435,6 +1571,10 @@ async function sendOrchestrationCompletionNotification(run) {
       const delivered = await store.markNotification(current.runId, result?.queued ? 'queued' : 'sent', {
         notificationDeliveredAt: Date.now(),
         notificationError: null,
+        // Cancellation is checked immediately before Enter. If the send still
+        // succeeds, the request arrived after that boundary and cannot retract
+        // the provider message; do not leave the UI claiming cancellation.
+        notificationCancelRequestedAt: null,
       });
       emitOrchestrationChanges(delivered?.changed, 'notification-finished');
       const audit = result?.codexAudit || result?.pasteAudit || null;
@@ -1451,11 +1591,32 @@ async function sendOrchestrationCompletionNotification(run) {
           entryUuid: audit.entryUuid || null,
         });
       }
+      const deliveredRun = await store.getInternal(current.runId);
+      const sourceProof = await reconcileOrchestrationSourceFollowup(
+        deliveredRun,
+        'notification-transcript-proof',
+      );
+      if (sourceProof?.confirmed === true) {
+        await releaseOrchestrationSourceProof(current.runId, 'source-followup-proved');
+      }
       for (const settled of delivered?.settled || []) {
         await finalizeSettledOrchestration(settled, 'ancestor-settled');
       }
     }
   } catch (error) {
+    await releaseOrchestrationSourceProof(current.runId, 'notification-send-threw');
+    const latest = await store.getInternal(current.runId);
+    if (latest?.notificationCancelRequestedAt) {
+      const suppressed = await store.markNotification(current.runId, 'suppressed', {
+        notificationDismissedAt: Date.now(),
+        notificationError: null,
+      });
+      emitOrchestrationChanges(suppressed?.changed, 'notification-cancelled');
+      for (const settled of suppressed?.settled || []) {
+        await finalizeSettledOrchestration(settled, 'ancestor-settled');
+      }
+      return;
+    }
     const failed = await store.markNotification(current.runId, 'failed', {
       notificationError: String(error?.message || error),
     });
@@ -1466,9 +1627,46 @@ async function sendOrchestrationCompletionNotification(run) {
 }
 
 async function notifyAgentPromptAuditResult(detail = {}) {
+  const store = getOrchestrationRunStore();
+  const targetRunId = orchestrationTargetRunIdFromAudit(detail);
+  if (targetRunId) {
+    const confirmation = await store.confirmTargetPromptDelivery(targetRunId, {
+      targetTabId: detail.tabId,
+      handoffId: detail.handoffId,
+      source: detail.source,
+      toolType: detail.toolType,
+      auditTimestamp: detail.auditTimestamp || null,
+      actualHash: detail.actualHash || null,
+      expectedHash: detail.expectedHash || null,
+      actualLen: Number.isFinite(detail.actualLen) ? Number(detail.actualLen) : null,
+      expectedLen: Number.isFinite(detail.expectedLen) ? Number(detail.expectedLen) : null,
+      canonicalized: detail.canonicalized === true,
+      sessionId: detail.sessionId || null,
+      userUuid: detail.entryUuid || null,
+    });
+    if (confirmation.confirmed) {
+      console.log('[Orchestration] target prompt confirmed run=' + targetRunId
+        + ' proof=prompt-audit tab=' + shortId(detail.tabId, 12)
+        + ' session=' + shortId(detail.sessionId));
+      const proofRun = await store.getInternal(targetRunId);
+      const armed = await armOrchestrationResultProof(proofRun, {
+        sessionId: detail.sessionId || proofRun?.sessionId || null,
+      });
+      if (armed?.success !== true) {
+        console.warn('[OrchestrationResultProof] target arm failed run=' + targetRunId
+          + ' error=' + (armed?.error || 'unknown'));
+      }
+      await reconcileOrchestrationRun(targetRunId, 'target-prompt-audit');
+    } else {
+      console.warn('[Orchestration] target prompt audit rejected run=' + targetRunId
+        + ' reason=' + (confirmation.reason || 'unknown'));
+    }
+    emitOrchestrationChanges(confirmation.changed, 'target-prompt-audit-confirmed');
+    return { matched: true, kind: 'target-delivery', ...confirmation };
+  }
+
   const runId = orchestrationCompletionRunIdFromAudit(detail);
   if (!runId) return { matched: false, confirmed: false };
-  const store = getOrchestrationRunStore();
   const confirmation = await store.confirmSourceFollowup(runId, {
     kind: 'prompt-audit',
     sourceTabId: detail.tabId,
@@ -1482,6 +1680,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
   if (confirmation.confirmed) {
     console.log('[Orchestration] source follow-up confirmed run=' + runId
       + ' proof=prompt-audit tab=' + shortId(detail.tabId, 12));
+    await releaseOrchestrationSourceProof(runId, 'source-followup-audit-proved');
   } else {
     console.warn('[Orchestration] source follow-up audit rejected run=' + runId
       + ' reason=' + (confirmation.reason || 'unknown'));
@@ -1500,28 +1699,61 @@ async function notifyAgentPromptAuditResult(detail = {}) {
 async function reconcileOrchestrationSourceFollowup(run, reason = 'source-followup-reconcile') {
   const store = getOrchestrationRunStore();
   const current = await store.getInternal(run?.runId);
-  if (!current
-    || current.sourceFollowupPending !== true
-    || current.sourceFollowupStartedAt
+  if (!current) return { confirmed: false, reason: 'run-not-found' };
+  if (current.sourceFollowupStartedAt) {
+    await releaseOrchestrationSourceProof(current.runId, 'source-followup-already-proved');
+    return { confirmed: true, idempotent: true, run: current };
+  }
+  if (current.sourceFollowupPending !== true
     || !current.notificationPromptHash
     || typeof getAgentTurnResult !== 'function') {
     return { confirmed: false, reason: 'source-followup-not-reconcilable' };
   }
   const sourceInfo = await resolveAgentSessionInfo(current.sourceTabId, 2000).catch(() => null);
-  const sessionId = sourceInfo?.sessionId || current.sourceFollowupSessionId || null;
-  const cwd = sourceInfo?.cwd || current.sourceProjectPath || null;
-  if (!sessionId) return { confirmed: false, reason: 'source-session-unresolved' };
-  const proof = await getAgentTurnResult({
-    sessionId,
-    cwd,
+  let sessionId = current.notificationSourceSessionId
+    || sourceInfo?.sessionId
+    || current.sourceFollowupSessionId
+    || null;
+  let cwd = sourceInfo?.cwd || current.sourceProjectPath || null;
+  const requestedAt = current.notificationAttemptedAt
+    || current.notificationDeliveredAt
+    || current.completedAt
+    || current.createdAt;
+  const probeSession = (candidateSessionId, candidateCwd) => getAgentTurnResult({
+    sessionId: candidateSessionId,
+    cwd: candidateCwd,
     promptHash: current.notificationPromptHash,
-    requestedAt: current.notificationAttemptedAt
-      || current.notificationDeliveredAt
-      || current.completedAt
-      || current.createdAt,
+    requestedAt,
     forceFresh: true,
     maxChars: 500,
   }).catch((error) => ({ found: false, error: String(error?.message || error) }));
+  let proof = sessionId ? await probeSession(sessionId, cwd) : null;
+  if (!sessionId) {
+    let projects = [];
+    try {
+      projects = require('./project-manager').db.getAllProjects();
+    } catch {}
+    const legacy = await findUniqueLegacySourceFollowupProof({
+      run: current,
+      projects,
+      probe: (candidate) => probeSession(candidate.sessionId, candidate.cwd || current.sourceProjectPath || null),
+    });
+    if (legacy.found !== true) {
+      return { confirmed: false, reason: legacy.reason || 'source-session-unresolved' };
+    }
+    sessionId = legacy.candidate.sessionId;
+    cwd = legacy.candidate.cwd || current.sourceProjectPath || null;
+    proof = legacy.proof;
+    await store.patch(current.runId, {
+      notificationSourceSessionId: sessionId,
+      sourceFollowupLegacyResolvedAt: Date.now(),
+      sourceFollowupLegacyTabId: legacy.candidate.tabId || null,
+    });
+    console.log('[Orchestration] legacy source session resolved run=' + current.runId
+      + ' staleTab=' + shortId(current.sourceTabId, 12)
+      + ' currentTab=' + shortId(legacy.candidate.tabId, 12)
+      + ' session=' + shortId(sessionId));
+  }
   if (proof?.found !== true) {
     return { confirmed: false, reason: proof?.error || 'source-followup-turn-not-found' };
   }
@@ -1536,6 +1768,7 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
     console.log('[Orchestration] source follow-up reconciled run=' + current.runId
       + ' proof=transcript tab=' + shortId(current.sourceTabId, 12)
       + ' user=' + shortId(proof.userUuid, 12));
+    await releaseOrchestrationSourceProof(current.runId, 'source-followup-proved');
   }
   emitOrchestrationChanges(confirmation.changed, reason);
   await finalizeSettledOrchestrations(confirmation.settled, reason + '-settled');
@@ -1543,7 +1776,14 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
 }
 
 async function finalizeSettledOrchestration(run, reason = 'settled') {
-  if (!run || !isTerminalStatus(run.status) || orchestrationCompletionInflight.has(run.runId)) return;
+  if (!run || !isTerminalStatus(run.status)) return;
+  if (orchestrationCompletionInflight.has(run.runId)) {
+    // A transcript edge can land while the completion probe is still reading
+    // the previous file revision. Remember one trailing pass instead of
+    // dropping that edge or starting two competing result owners.
+    orchestrationCompletionTrailing.add(run.runId);
+    return;
+  }
   orchestrationCompletionInflight.add(run.runId);
   try {
     const store = getOrchestrationRunStore();
@@ -1551,18 +1791,42 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
     if (!current) return;
     const patch = {};
     if (current.status === 'completed') {
-      const probe = await probeOrchestrationResult(current, { forceFresh: true });
+      let probe = await probeOrchestrationResult(current, { forceFresh: true });
+      let watcher = null;
+      if (!isCompleteOrchestrationResult(probe)) {
+        // Subscribe first, then read again. If JSONL changes between the first
+        // probe and watcher setup, the second read sees it. If it changes after
+        // watcher setup, notifyAgentTranscriptChanged schedules a trailing pass.
+        watcher = await armOrchestrationResultProof(current, probe);
+        if (watcher?.success === true) {
+          probe = await probeOrchestrationResult(current, { forceFresh: true });
+        }
+      }
+      const resultComplete = isCompleteOrchestrationResult(probe);
+      const sourceSnapshot = probe?.sourceSnapshot || null;
       Object.assign(patch, {
-        resultComplete: isCompleteOrchestrationResult(probe),
+        resultComplete,
         resultAvailable: probe.resultAvailable === true,
         resultTurnIndex: Number.isInteger(probe.turnIndex) ? probe.turnIndex : null,
         resultUserUuid: probe.userUuid || null,
+        resultPromptCarrierKind: probe.promptCarrierKind || null,
+        resultProofStatus: resultComplete ? 'complete' : 'awaiting-transcript',
+        resultProofObservedSize: Number.isFinite(Number(sourceSnapshot?.size))
+          ? Number(sourceSnapshot.size)
+          : null,
+        resultProofObservedMtimeMs: Number.isFinite(Number(sourceSnapshot?.mtimeMs))
+          ? Number(sourceSnapshot.mtimeMs)
+          : null,
         resultError: !probe.found
           ? (probe.error || 'matching turn not found')
-          : (probe.resultComplete === true ? null : 'matching transcript turn is incomplete'),
+          : (resultComplete
+            ? null
+            : (watcher?.success === false
+              ? 'matching transcript turn is incomplete; watcher unavailable: ' + watcher.error
+              : 'matching transcript turn is incomplete')),
         sessionId: probe.sessionId || current.sessionId || null,
       });
-      if (current.targetCreated && current.autoStopCreatedTargets !== false && current.successAutoStopMs > 0 && !current.autoStopAt) {
+      if (resultComplete && shouldScheduleCreatedTargetAutoStop(current)) {
         patch.autoStopAt = (current.completedAt || Date.now()) + current.successAutoStopMs;
         patch.autoStopStatus = 'scheduled';
       }
@@ -1571,12 +1835,24 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
     const finalized = await store.get(current.runId);
     emitOrchestrationRun(finalized, reason);
     if (finalized.status === 'completed' && finalized.resultComplete !== true) {
-      console.warn('[Orchestration] completion withheld until transcript is complete run=' + finalized.runId);
+      console.warn('[Orchestration] completion awaiting transcript proof run=' + finalized.runId
+        + ' session=' + String(finalized.sessionId || '').slice(0, 8)
+        + ' found=' + (finalized.resultAvailable === true)
+        + ' size=' + (finalized.resultProofObservedSize ?? '-')
+        + ' mtime=' + (finalized.resultProofObservedMtimeMs ?? '-')
+        + ' watcher=' + (orchestrationResultProofCoordinator?.snapshot()
+          .some((entry) => entry.runId === finalized.runId) ? 'armed' : 'unavailable'));
       return;
     }
+    await releaseOrchestrationResultProof(finalized.runId, 'result-proved');
     await sendOrchestrationCompletionNotification(finalized);
   } finally {
     orchestrationCompletionInflight.delete(run.runId);
+    const replay = orchestrationCompletionTrailing.delete(run.runId);
+    if (replay) {
+      const latest = await getOrchestrationRunStore().getInternal(run.runId);
+      if (latest) await finalizeSettledOrchestration(latest, 'trailing-transcript-proof');
+    }
     void scheduleOrchestrationPolicyTimer();
   }
 }
@@ -1597,12 +1873,14 @@ async function retryWaitingNotificationsForSource(tabId) {
 }
 
 async function processOrchestrationLifecycle(tabId, payload) {
-  if (!tabId || (payload?.type !== 'busy' && payload?.type !== 'done')) return;
+  if (!tabId || !['busy', 'done', 'snapshot'].includes(payload?.type)) return;
   try {
     const store = getOrchestrationRunStore();
-    const result = await store.applyLifecycle(tabId, payload);
-    emitOrchestrationChanges(result.changed, 'target-lifecycle');
-    await finalizeSettledOrchestrations(result.settled, 'target-settled');
+    if (payload.type === 'busy' || payload.type === 'done') {
+      const result = await store.applyLifecycle(tabId, payload);
+      emitOrchestrationChanges(result.changed, 'target-lifecycle');
+      await finalizeSettledOrchestrations(result.settled, 'target-settled');
+    }
     // A busy:true edge is the event-driven wake-up for a notification which
     // previously hit a composer draft. Delivery still repeats the authoritative
     // draft preflight; only an empty composer may accept the notification.
@@ -1628,6 +1906,7 @@ async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
   });
   const reconciled = await store.reconcile(runId, {
     busy: status === 'busy',
+    lifecycleGeneration: sessionInfo?.lifecycleGeneration || null,
     sessionId: probe.sessionId || sessionInfo?.sessionId || run.sessionId || null,
     resultFound: probe.found === true,
     resultComplete: probe.resultComplete === true,
@@ -1706,8 +1985,26 @@ async function reconcileActiveOrchestrations() {
   for (const run of active) {
     if (isActiveStatus(run.status)) {
       await reconcileOrchestrationRun(run.runId, 'startup-reconcile');
+    } else if (run.status === 'completed' && run.resultComplete !== true) {
+      // A previous process may have observed Stop before the final JSONL line
+      // became durable. Re-arm the exact transcript proof on startup so these
+      // runs self-heal instead of preserving an inherited loader forever.
+      await finalizeSettledOrchestration(run, 'startup-result-proof-reconcile');
     }
-    await reconcileOrchestrationSourceFollowup(run, 'startup-source-followup-reconcile');
+    const current = await store.getInternal(run.runId);
+    if (current?.sourceFollowupPending === true && !current.sourceFollowupStartedAt) {
+      const sourceInfo = await resolveAgentSessionInfo(current.sourceTabId, 2000).catch(() => null);
+      if (sourceInfo?.sessionId) {
+        await store.patch(current.runId, {
+          notificationSourceSessionId: current.notificationSourceSessionId || sourceInfo.sessionId,
+        });
+        await armOrchestrationSourceProof({
+          ...current,
+          notificationSourceSessionId: current.notificationSourceSessionId || sourceInfo.sessionId,
+        }, sourceInfo);
+      }
+      await reconcileOrchestrationSourceFollowup(current, 'startup-source-followup-reconcile');
+    }
   }
   await processDueOrchestrationPolicies();
   await scheduleOrchestrationPolicyTimer();
@@ -1720,7 +2017,32 @@ async function performOrchestrationAction(runId, action, options = {}) {
 
   if (action === 'cancel') {
     if (isTerminalStatus(current.status)) {
-      return { ok: false, error: 'run is already settled', run: withOrchestrationUrls(current) };
+      const canCancelNotification = current.sourceFollowupPending === true
+        && !current.sourceFollowupStartedAt
+        && (current.notificationStatus === 'pending' || current.notificationStatus === 'sending');
+      if (!canCancelNotification) {
+        return { ok: false, error: 'run is already settled', run: withOrchestrationUrls(current) };
+      }
+      if (orchestrationNotificationInflight.has(runId)) {
+        if (options.cancelSendAccepted !== true) {
+          return {
+            ok: false,
+            error: 'notification delivery cancellation requires exact handoff control',
+            run: withOrchestrationUrls(current),
+          };
+        }
+        const pending = await store.patch(runId, { notificationCancelRequestedAt: Date.now() });
+        emitOrchestrationRun(pending, 'notification-cancel-requested');
+        return { ok: true, cancellationPending: true, run: withOrchestrationUrls(pending) };
+      }
+      const suppressed = await store.markNotification(runId, 'suppressed', {
+        notificationDismissedAt: Date.now(),
+        notificationError: null,
+      });
+      emitOrchestrationChanges(suppressed?.changed, 'notification-cancelled');
+      await finalizeSettledOrchestrations(suppressed?.settled, 'notification-cancelled');
+      void scheduleOrchestrationPolicyTimer();
+      return { ok: true, run: withOrchestrationUrls(suppressed?.run) };
     }
     const cancellation = await store.cancel(runId, {
       reason: 'cancelled-by-user',
@@ -1784,7 +2106,25 @@ async function performOrchestrationAction(runId, action, options = {}) {
         run: withOrchestrationUrls(current),
       };
     }
-    const resolved = await store.resolveRecovery(runId, 'reopen');
+    const targetInfo = await resolveAgentSessionInfo(current.targetTabId, 2000).catch(() => null);
+    if (!targetInfo) {
+      return {
+        ok: false,
+        error: 'target runtime is not ready; start or restore it before reconnecting',
+        run: withOrchestrationUrls(current),
+      };
+    }
+    if (current.targetToolType === 'codex' && !targetInfo.lifecycleGeneration) {
+      return {
+        ok: false,
+        error: 'target process generation is not proven; retry once the Codex composer is ready',
+        run: withOrchestrationUrls(current),
+      };
+    }
+    const resolved = await store.resolveRecovery(runId, 'reopen', {
+      sessionId: targetInfo.sessionId || null,
+      lifecycleGeneration: targetInfo.lifecycleGeneration || null,
+    });
     const run = resolved?.run;
     if (!run || run.status !== 'queued') {
       return { ok: false, error: 'run is not waiting for recovery', run: withOrchestrationUrls(run) };
@@ -1810,6 +2150,9 @@ async function handleOrchestrationTabClosed(tabId) {
   const store = getOrchestrationRunStore();
   const targetRuns = await store.handleTargetClosed(tabId);
   const sourceRuns = await store.handleSourceClosed(tabId);
+  for (const run of sourceRuns) {
+    await releaseOrchestrationSourceProof(run.runId, 'source-tab-closed');
+  }
   emitOrchestrationChanges(targetRuns, 'target-tab-closed');
   emitOrchestrationChanges(sourceRuns, 'source-tab-closed');
   void scheduleOrchestrationPolicyTimer();
@@ -2116,6 +2459,7 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500) {
       writerConfirmed: runtime?.writerConfirmed === true,
       writerUsableForMutation: runtime?.writerUsableForMutation === true,
       canCopySessionId: runtime?.canCopySessionId === true,
+      lifecycleGeneration: runtime?.lifecycleGeneration || null,
       canResume: sessionStatus === 'inactive' && !!sessionId,
     };
   };
@@ -2593,6 +2937,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         reactToManualInterrupt: typeof body.reactToManualInterrupt === 'boolean' ? body.reactToManualInterrupt : undefined,
         autoStopCreatedTargets: typeof body.autoStopCreatedTargets === 'boolean' ? body.autoStopCreatedTargets : undefined,
         promptHash: promptFingerprint(prompt),
+        targetPromptAuditHash: promptAuditFingerprint(prompt),
         promptChars: prompt.length,
       });
       createdRunId = run.runId;
@@ -2648,10 +2993,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
         return sendSendFailure(res, sendResult, { runId: run.runId, targetTabId });
       }
 
+      // Bind the durable run to the exact process generation which accepted
+      // this prompt. A later process in the same tab is a different owner.
+      const acceptedRuntime = await resolveAgentSessionInfo(targetTabId, 2000).catch(() => null);
       const accepted = await getOrchestrationRunStore().markDelivery(run.runId, {
         queued: sendResult?.queued === true,
         baselineBusy: baselineStatus === 'busy',
-        sessionId: sendResult?.sessionId || targetStatus?.sessionId || null,
+        sessionId: sendResult?.sessionId || acceptedRuntime?.sessionId || targetStatus?.sessionId || null,
+        lifecycleGeneration: acceptedRuntime?.lifecycleGeneration || null,
       });
       emitOrchestrationRun(accepted, 'delivery-accepted');
       // The provider may emit task_started while the send scenario is still
@@ -2681,12 +3030,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
   const orchestrationResultMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)\/result$/);
   if (orchestrationResultMatch && req.method === 'GET') {
     const runId = decId(orchestrationResultMatch[1]);
-    const run = await reconcileOrchestrationRun(runId, 'result-read');
+    let run = await reconcileOrchestrationRun(runId, 'result-read');
     if (!run) return sendJson(res, 404, { ok: false, error: 'run not found' });
     if (isActiveStatus(run.status)) {
       return sendJson(res, 202, { ok: true, ready: false, status: run.status, run: withOrchestrationUrls(run) });
     }
-    const internal = await getOrchestrationRunStore().getInternal(runId);
+    let internal = await getOrchestrationRunStore().getInternal(runId);
+    if (run.status === 'completed' && run.resultComplete !== true) {
+      await finalizeSettledOrchestration(internal, 'result-read-finalize');
+      run = await getOrchestrationRunStore().get(runId);
+      internal = await getOrchestrationRunStore().getInternal(runId);
+    }
     const result = await probeOrchestrationResult(internal, {
       maxChars: Math.max(500, Math.min(250_000, Number(parsed.query.maxChars) || 100_000)),
       forceFresh: true,
@@ -2719,6 +3073,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
           : 'matching transcript turn not materialized'),
         run: withOrchestrationUrls(run),
       });
+    }
+    if (run.resultComplete !== true) {
+      // The explicit result read may be the first observer after the final
+      // JSONL append. Persist that proof and deliver the source notification;
+      // returning 200 without repairing the durable run recreates the purple
+      // loader on restart.
+      await finalizeSettledOrchestration(internal, 'result-read-proved');
+      run = await getOrchestrationRunStore().get(runId);
     }
     return sendJson(res, 200, {
       ok: true,
@@ -4877,7 +5239,7 @@ function webBroadcast(tabId, payload) {
   payload = withMessageProjection(payload);
   const type = payload && payload.type;
   const loggable = BCAST_LOG_TYPES.has(type);
-  if (type === 'busy' || type === 'done') {
+  if (type === 'busy' || type === 'done' || type === 'snapshot') {
     void processOrchestrationLifecycle(tabId, payload);
   }
   const runId = externalRunByTabId.get(tabId);
@@ -5288,6 +5650,7 @@ function start({
   answerClaudeQuestion = answerFn || null;
   getClaudePendingQuestion = getQFn || null;
   transcriptService = transcriptServiceFn || null;
+  ensureOrchestrationProofCoordinators();
   resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
   getAgentTurnResult = getAgentTurnResultFn || null;
   readAgentStartReadiness = readAgentStartReadinessFn || null;
@@ -5353,6 +5716,15 @@ function writeWebServerDiscovery() {
 function stop() {
   if (orchestrationPolicyTimer) clearTimeout(orchestrationPolicyTimer);
   orchestrationPolicyTimer = null;
+  if (orchestrationResultProofCoordinator) {
+    void orchestrationResultProofCoordinator.stop('web-server-stop');
+    orchestrationResultProofCoordinator = null;
+  }
+  if (orchestrationSourceProofCoordinator) {
+    void orchestrationSourceProofCoordinator.stop('web-server-stop');
+    orchestrationSourceProofCoordinator = null;
+  }
+  orchestrationCompletionTrailing.clear();
   if (wss) try { wss.close(); } catch {}
   if (httpServer) try { httpServer.close(); } catch {}
   try { fs.unlinkSync(DISCOVERY_FILE); } catch {}
@@ -5481,4 +5853,5 @@ module.exports = {
   notifyClaudeSessionAvailable,
   sendTabCompletionPush,
   notifyAgentPromptAuditResult,
+  notifyAgentTranscriptChanged,
 };

@@ -633,6 +633,114 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
     'an unresolved stale journal is retained for diagnosis instead of being guessed away',
   );
 
+  const quarantinedActionGeneration = 'rewind-generation-quarantined-c1-c2';
+  const quarantinedJournal = {
+    version: 2,
+    projectId: scopedProjectA.id,
+    tabId: projectATabId,
+    cwd: tempRoot,
+    sourceSessionId: 'manual-runtime-c1',
+    expectedBindingSessionId: 'saved-session-a',
+    sourceBindingMode: 'quarantined-manual-writer',
+    sourceLifecycleGeneration: 'terminal-epoch:9',
+    sourceRunSeq: 9,
+    actionGeneration: quarantinedActionGeneration,
+    actionStartedAtMs: Date.now(),
+    targetUuid: 'manual-c1-target',
+    targetSourceLine: 9,
+    targetTextHash: hashCodexRewindTargetText('manual C1 target'),
+    rollbackTurns: 1,
+    phase: 'confirm-enter-boundary',
+  };
+  manager.setAppState(handoffKey, {
+    ...quarantinedJournal,
+    version: 1,
+  });
+  assert.equal(
+    manager.inspectPendingCodexWriterHandoff(handoffKey).status,
+    'invalid',
+    'a separated A/C1 binding requires the exact-target v2 journal contract',
+  );
+  manager.updateTabCodexSessionId(scopedProjectA.id, projectATabId, 'newer-binding-d');
+  manager.setAppState(handoffKey, quarantinedJournal);
+  const changedBindingCommit = manager.commitPendingCodexWriterHandoff({
+    journalKey: handoffKey,
+    projectId: scopedProjectA.id,
+    tabId: projectATabId,
+    sourceSessionId: 'manual-runtime-c1',
+    nextSessionId: 'rewind-child-c2',
+    actionGeneration: quarantinedActionGeneration,
+  });
+  assert.equal(changedBindingCommit.success, false);
+  assert.equal(changedBindingCommit.error, 'codex_handoff_binding_changed');
+  assert.equal(
+    manager.getTabCodexSessionId(scopedProjectA.id, projectATabId),
+    'newer-binding-d',
+    'a stale quarantined Rewind never overwrites a newer durable binding',
+  );
+  assert.deepEqual(
+    manager.getAppState(handoffKey),
+    quarantinedJournal,
+    'the unresolved exact journal remains available for deterministic recovery',
+  );
+
+  manager.updateTabCodexSessionId(scopedProjectA.id, projectATabId, 'saved-session-a');
+  const recordedReplacement = manager.recordPendingCodexRewindReplacementCandidate({
+    journalKey: handoffKey,
+    projectId: scopedProjectA.id,
+    tabId: projectATabId,
+    sourceSessionId: 'manual-runtime-c1',
+    candidateSessionId: 'rewind-child-c2',
+    actionGeneration: quarantinedActionGeneration,
+    candidateCreatedAtMs: quarantinedJournal.actionStartedAtMs + 1,
+    observedAtMs: quarantinedJournal.actionStartedAtMs + 2,
+    retainedPrefixLength: 0,
+    postActionMessageCount: 1,
+  });
+  assert.equal(recordedReplacement.success, true);
+  assert.equal(
+    manager.getAppState(handoffKey).replacementCandidateProof.sessionId,
+    'rewind-child-c2',
+    'the exact same-process root replacement is durable before the binding CAS',
+  );
+  assert.equal(manager.recordPendingCodexRewindReplacementCandidate({
+    journalKey: handoffKey,
+    projectId: scopedProjectA.id,
+    tabId: projectATabId,
+    sourceSessionId: 'manual-runtime-c1',
+    candidateSessionId: 'unrelated-root',
+    actionGeneration: quarantinedActionGeneration,
+    candidateCreatedAtMs: quarantinedJournal.actionStartedAtMs + 1,
+    observedAtMs: quarantinedJournal.actionStartedAtMs + 3,
+    retainedPrefixLength: 0,
+    postActionMessageCount: 1,
+  }).error, 'codex_rewind_replacement_candidate_ambiguous');
+  assert.equal(manager.commitPendingCodexWriterHandoff({
+    journalKey: handoffKey,
+    projectId: scopedProjectA.id,
+    tabId: projectATabId,
+    sourceSessionId: 'manual-runtime-c1',
+    nextSessionId: 'unrelated-root',
+    actionGeneration: quarantinedActionGeneration,
+  }).error, 'codex_handoff_replacement_candidate_changed');
+  const quarantinedCommit = manager.commitPendingCodexWriterHandoff({
+    journalKey: handoffKey,
+    projectId: scopedProjectA.id,
+    tabId: projectATabId,
+    sourceSessionId: 'manual-runtime-c1',
+    nextSessionId: 'rewind-child-c2',
+    actionGeneration: quarantinedActionGeneration,
+  });
+  assert.equal(quarantinedCommit.success, true);
+  assert.equal(quarantinedCommit.updated, true);
+  assert.equal(quarantinedCommit.expectedBindingSessionId, 'saved-session-a');
+  assert.equal(
+    manager.getTabCodexSessionId(scopedProjectA.id, projectATabId),
+    'rewind-child-c2',
+    'exact C1 -> C2 Rewind commits A -> C2 without ever publishing C1',
+  );
+  assert.equal(manager.getAppState(handoffKey), null);
+
   const v2HandoffKey = `codex.pending-writer-handoff.v1:${projectBTabId}`;
   const v2HandoffJournal = {
     version: 2,

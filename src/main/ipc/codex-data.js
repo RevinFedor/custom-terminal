@@ -13,6 +13,9 @@ const {
   isCodexSubagentControlCall,
   isCodexSubagentSpawnCall,
 } = require('../codex-subagent-cards');
+const {
+  getCodexProcessActionGeneration,
+} = require('../codex-process-action-ownership');
 const { execFile } = require('child_process');
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -2686,6 +2689,16 @@ function buildCodexFullHistory(records, sessionId) {
   const pendingCalls = new Map();
   const pendingExecCells = new Map();
   const subagents = createCodexSubagentTracker();
+  const registerSubagentSpawn = (call) => {
+    const card = subagents.registerSpawn(call);
+    const processGeneration = getCodexProcessActionGeneration({
+      sessionId,
+      callId: call?.callId,
+      sourceByteOffset: call?.byteOffset,
+    });
+    if (processGeneration) card.processGeneration = processGeneration;
+    return card;
+  };
   let currentTurnIndex = -1;
   let pendingThinking = '';
   let latestTokenCountInfo = null;
@@ -2804,6 +2817,21 @@ function buildCodexFullHistory(records, sessionId) {
 
     if (record.type !== 'response_item') continue;
 
+    if (payload.type === 'message' && payload.role === 'user') {
+      const userText = extractTextContent(payload.content) || '';
+      // Codex currently persists fire-and-forget subagent completion in two
+      // legitimate carrier shapes. Older rollouts used event_msg
+      // user_message; newer/mixed protocol runs can write only a
+      // response_item user message. Both carry the same exact agent identity
+      // and must close the same Task card. Normal user response_items remain
+      // ignored here because their paired event_msg is the canonical visible
+      // transcript row.
+      if (userText.includes('<subagent_notification>')) {
+        subagents.onSubagentNotification(userText);
+      }
+      continue;
+    }
+
     if (payload.type === 'reasoning') {
       const text = extractReasoning(payload.summary);
       if (text) pendingThinking = pendingThinking ? `${pendingThinking}\n${text}` : text;
@@ -2854,7 +2882,7 @@ function buildCodexFullHistory(records, sessionId) {
       // event that binds the child thread id arrives BETWEEN the call and its
       // output, so output-time registration would drop that linkage.
       if (isCodexSubagentSpawnCall(pendingCall)) {
-        pendingCall.subagentCard = subagents.registerSpawn(pendingCall);
+        pendingCall.subagentCard = registerSubagentSpawn(pendingCall);
       }
       pendingCalls.set(callId, pendingCall);
       continue;
@@ -2876,7 +2904,7 @@ function buildCodexFullHistory(records, sessionId) {
       // calls (wait/close/…) feed results into existing cards instead of
       // rendering as generic "Spawn Agent"/"Wait Agent" JSON cards.
       if (isCodexSubagentSpawnCall(call)) {
-        const card = call.subagentCard || subagents.registerSpawn(call);
+        const card = call.subagentCard || registerSubagentSpawn(call);
         subagents.attachSpawnOutput(call.callId, payload.output);
         pushAssistantEntry(
           entries,
@@ -2942,7 +2970,7 @@ function buildCodexFullHistory(records, sessionId) {
     if (waitCellId && pendingExecCells.has(waitCellId)) continue;
     // In-flight spawn (no output yet): show a running Task card, not raw JSON.
     if (isCodexSubagentSpawnCall(call)) {
-      const card = call.subagentCard || subagents.registerSpawn(call);
+      const card = call.subagentCard || registerSubagentSpawn(call);
       pushAssistantEntry(
         entries,
         sessionId,

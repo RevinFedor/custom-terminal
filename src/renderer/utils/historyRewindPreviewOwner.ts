@@ -18,6 +18,33 @@ export interface CodexWriterTransitionEvent {
   writerGeneration?: string | null;
 }
 
+/**
+ * Projects a native Rewind preview without presenting the restored target as
+ * both a sent History row and the current composer draft. Rows that appeared
+ * after the operation started (for example local status rows) may be retained
+ * by the caller, but the target itself is always removed from History because
+ * ownership of that text has moved back to the composer.
+ */
+export function projectNativeRewindPreview<T extends { uuid?: string | null }>(
+  entries: T[],
+  targetUuid: string,
+  shouldRetainAfterTarget: (entry: T) => boolean,
+): { entries: T[]; hiddenCount: number } {
+  const source = Array.isArray(entries) ? entries : [];
+  const targetIndex = source.findIndex((entry) => entry?.uuid === targetUuid);
+  if (targetIndex < 0) return { entries: source, hiddenCount: 0 };
+
+  const visible = source.slice(0, targetIndex);
+  // The target row is hidden from History because it is now the draft.
+  let hiddenCount = 1;
+  for (let index = targetIndex + 1; index < source.length; index++) {
+    const entry = source[index];
+    if (shouldRetainAfterTarget(entry)) visible.push(entry);
+    else hiddenCount++;
+  }
+  return { entries: visible, hiddenCount };
+}
+
 const normalizeOwnerValue = (value: string | null | undefined) => String(value || '');
 
 /**

@@ -9,6 +9,8 @@ const path = require('node:path');
 const {
   classifyManualCodexSubmitAfterWriteQueue,
   classifyCodexBranchWriterHandoffSettlement,
+  classifyCodexNativeRewindReplacementProjection,
+  reconcileCodexNativeRewindReplacementProof,
   classifyCodexWriterAdoption,
   classifyCodexProvisionalActionAuthorization,
   classifyCodexWriterHandoffSettlement,
@@ -23,10 +25,12 @@ const {
   resolveCodexUserWriterProof,
   resolveCodexWriterProof,
   isCommittedCodexNativeRewindReplay,
+  classifyCodexWriterHandoffObserverAdoption,
   resolveCodexRewindCompletionProof,
   shouldCloseCodexRewindProtocolUi,
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
+  projectCodexWriterProofKind,
   shouldUseSettledCodexRewindWriterProof,
   selectCodexDelayedStableSourceWriter,
   selectCodexNativeRewindWriter,
@@ -642,6 +646,254 @@ test('native Rewind rejects stale generations, unrelated writers, and multiple p
   assert.equal(multiple.reason, 'multiple-proven-descendants');
 });
 
+test('native Rewind accepts a root replacement only with exact target-prefix and live action proof', () => {
+  const actionGeneration = 'rewind-root-replacement';
+  const actionStartedAtMs = 12_000;
+  const targetTextHash = 'a'.repeat(64);
+  const sourceMessages = [
+    { uuid: 'source-1', sourceLine: 10, textHash: 'b'.repeat(64), signature: 'sig-1', timestampMs: 10_000 },
+    { uuid: 'source-2', sourceLine: 20, textHash: targetTextHash, signature: 'sig-2', timestampMs: 11_000 },
+  ];
+  const replacement = {
+    filePath: '/sessions/replacement.jsonl',
+    meta: { id: 'replacement', timestamp: new Date(12_001).toISOString() },
+  };
+  const replacementProof = classifyCodexNativeRewindReplacementProjection({
+    sourceSessionId: 'source',
+    candidateSessionId: 'replacement',
+    actionGeneration,
+    actionStartedAtMs,
+    candidateCreatedAtMs: 12_001,
+    targetUuid: 'source-2',
+    targetSourceLine: 20,
+    targetTextHash,
+    rollbackTurns: 1,
+    sourceMessages,
+    candidateMessages: [
+      sourceMessages[0],
+      { uuid: 'replacement-new', sourceLine: 30, signature: 'new', timestampMs: 12_010 },
+    ],
+  });
+  assert.equal(replacementProof.proven, true);
+
+  const selected = selectCodexNativeRewindWriter([replacement], {
+    kind: 'native-rewind',
+    sourceSessionId: 'source',
+    actionGeneration,
+    observerGeneration: actionGeneration,
+    actionStartedAtMs,
+    targetUuid: 'source-2',
+    targetSourceLine: 20,
+    targetTextHash,
+    rollbackTurns: 1,
+    replacementProofs: [replacementProof],
+    liveProofs: [{
+      sessionId: 'replacement',
+      actionGeneration,
+      kind: 'rollout-created',
+      boundaryAtMs: 12_001,
+      observedAtMs: 12_002,
+    }],
+  });
+  assert.equal(selected.status, 'selected');
+  assert.equal(selected.lineageRelation, 'rewind-replacement');
+  assert.equal(selected.replacementProof.reason, 'exact-target-prefix');
+});
+
+test('Codex 0.145 root replacement with an empty retained prefix resolves through the full writer filter', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sourcePath = sessionsDir + '/rollout-source-c1.jsonl';
+  const replacementPath = sessionsDir + '/rollout-replacement-c2.jsonl';
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 410,
+    output: `p410\nf20\nau\nn${sourcePath}\nf21\nau\nn${replacementPath}\n`,
+  }], sessionsDir);
+  const actionGeneration = 'rewind-codex-0145';
+  const actionStartedAtMs = 50_000;
+  const targetTextHash = '1'.repeat(64);
+  const replacementProof = classifyCodexNativeRewindReplacementProjection({
+    sourceSessionId: 'c1',
+    candidateSessionId: 'c2',
+    actionGeneration,
+    actionStartedAtMs,
+    candidateCreatedAtMs: 50_001,
+    targetUuid: 'codex-user-c1-9',
+    targetSourceLine: 9,
+    targetTextHash,
+    rollbackTurns: 1,
+    sourceMessages: [{
+      uuid: 'codex-user-c1-9',
+      sourceLine: 9,
+      textHash: targetTextHash,
+      signature: 'original-target',
+      timestampMs: 49_000,
+    }],
+    candidateMessages: [{
+      uuid: 'codex-user-c2-10',
+      sourceLine: 10,
+      textHash: '2'.repeat(64),
+      signature: 'edited-restored-prompt',
+      timestampMs: 50_020,
+    }],
+  });
+  const metadata = new Map([
+    [sourcePath, { meta: { id: 'c1', source: 'cli' } }],
+    [replacementPath, {
+      meta: {
+        id: 'c2',
+        source: 'cli',
+        timestamp: new Date(50_001).toISOString(),
+        forked_from_id: null,
+      },
+    }],
+  ]);
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: async filePath => metadata.get(filePath),
+    isUserSession: () => true,
+    handoff: {
+      kind: 'native-rewind',
+      sourceSessionId: 'c1',
+      actionGeneration,
+      observerGeneration: actionGeneration,
+      actionStartedAtMs,
+      targetUuid: 'codex-user-c1-9',
+      targetSourceLine: 9,
+      targetTextHash,
+      rollbackTurns: 1,
+      replacementProofs: [replacementProof],
+      liveProofs: [{
+        sessionId: 'c2',
+        actionGeneration,
+        kind: 'rollout-created',
+        boundaryAtMs: 50_001,
+        observedAtMs: 50_002,
+      }],
+    },
+  });
+  assert.equal(proof.status, 'owned');
+  assert.equal(proof.filePath, replacementPath);
+  assert.equal(proof.handoffProof.lineageRelation, 'rewind-replacement');
+});
+
+test('root replacement proof rejects wrong prefix, stale suffix, and declared fork lineage', () => {
+  const base = {
+    sourceSessionId: 'source',
+    candidateSessionId: 'replacement',
+    actionGeneration: 'rewind-root-reject',
+    actionStartedAtMs: 20_000,
+    candidateCreatedAtMs: 20_001,
+    targetUuid: 'source-2',
+    targetSourceLine: 20,
+    targetTextHash: 'c'.repeat(64),
+    rollbackTurns: 1,
+    sourceMessages: [
+      { uuid: 'source-1', sourceLine: 10, textHash: 'd'.repeat(64), signature: 'sig-1', timestampMs: 18_000 },
+      { uuid: 'source-2', sourceLine: 20, textHash: 'c'.repeat(64), signature: 'sig-2', timestampMs: 19_000 },
+    ],
+  };
+  assert.equal(classifyCodexNativeRewindReplacementProjection({
+    ...base,
+    candidateMessages: [{ signature: 'wrong', timestampMs: 18_000 }],
+  }).reason, 'replacement-prefix-content-mismatch');
+  assert.equal(classifyCodexNativeRewindReplacementProjection({
+    ...base,
+    candidateMessages: [base.sourceMessages[0], { signature: 'old', timestampMs: 19_999 }],
+  }).reason, 'replacement-suffix-outside-action-epoch');
+  assert.equal(classifyCodexNativeRewindReplacementProjection({
+    ...base,
+    candidateForkedFromId: 'other',
+    candidateMessages: [base.sourceMessages[0]],
+  }).reason, 'replacement-declared-lineage-present');
+});
+
+test('two exact root replacements remain ambiguous instead of choosing by recency', () => {
+  const actionGeneration = 'rewind-root-ambiguous';
+  const targetTextHash = 'e'.repeat(64);
+  const sourceMessages = [{
+    uuid: 'target', sourceLine: 4, textHash: targetTextHash, signature: 'target', timestampMs: 29_000,
+  }];
+  const proofFor = (sessionId, createdAtMs) => classifyCodexNativeRewindReplacementProjection({
+    sourceSessionId: 'source',
+    candidateSessionId: sessionId,
+    actionGeneration,
+    actionStartedAtMs: 30_000,
+    candidateCreatedAtMs: createdAtMs,
+    targetUuid: 'target',
+    targetSourceLine: 4,
+    targetTextHash,
+    rollbackTurns: 1,
+    sourceMessages,
+    candidateMessages: [],
+  });
+  const candidates = ['replacement-a', 'replacement-b'].map(id => ({
+    filePath: '/sessions/' + id + '.jsonl',
+    meta: { id },
+  }));
+  const selection = selectCodexNativeRewindWriter(candidates, {
+    kind: 'native-rewind',
+    sourceSessionId: 'source',
+    actionGeneration,
+    observerGeneration: actionGeneration,
+    actionStartedAtMs: 30_000,
+    targetUuid: 'target',
+    targetSourceLine: 4,
+    targetTextHash,
+    rollbackTurns: 1,
+    replacementProofs: [proofFor('replacement-a', 30_001), proofFor('replacement-b', 30_002)],
+    liveProofs: ['replacement-a', 'replacement-b'].map((sessionId, index) => ({
+      sessionId,
+      actionGeneration,
+      kind: 'rollout-created',
+      boundaryAtMs: 30_001 + index,
+      observedAtMs: 30_003,
+    })),
+  });
+  assert.equal(selection.status, 'unresolved');
+  assert.equal(selection.reason, 'multiple-proven-rewind-writers');
+});
+
+test('restart reconcile accepts only the recorded root replacement and tolerates later turns', () => {
+  const computed = {
+    proven: true,
+    kind: 'rewind-replacement',
+    sessionId: 'replacement',
+    sourceSessionId: 'source',
+    actionGeneration: 'rewind-restart',
+    candidateCreatedAtMs: 40_001,
+    targetUuid: 'target',
+    targetSourceLine: 9,
+    targetTextHash: 'f'.repeat(64),
+    rollbackTurns: 2,
+    retainedPrefixLength: 3,
+    postActionMessageCount: 4,
+  };
+  const recorded = {
+    version: 1,
+    kind: 'rewind-replacement',
+    sessionId: 'replacement',
+    sourceSessionId: 'source',
+    actionGeneration: 'rewind-restart',
+    candidateCreatedAtMs: 40_001,
+    targetUuid: 'target',
+    targetSourceLine: 9,
+    targetTextHash: 'f'.repeat(64),
+    rollbackTurns: 2,
+    retainedPrefixLength: 3,
+    postActionMessageCount: 1,
+  };
+  const reconciled = reconcileCodexNativeRewindReplacementProof(computed, recorded);
+  assert.equal(reconciled.proven, true);
+  assert.equal(reconciled.reason, 'exact-recorded-replacement');
+  assert.equal(reconcileCodexNativeRewindReplacementProof(computed, {
+    ...recorded,
+    sessionId: 'unrelated',
+  }).reason, 'replacement-durable-proof-identity-mismatch');
+  assert.equal(reconcileCodexNativeRewindReplacementProof({
+    ...computed,
+    postActionMessageCount: 0,
+  }, recorded).reason, 'replacement-durable-proof-regressed');
+});
+
 test('settled native Rewind proof resolves source plus exact child only while every scope still matches', async () => {
   const sessionsDir = '/Users/fedor/.codex/sessions';
   const source = sessionsDir + '/rollout-source.jsonl';
@@ -972,6 +1224,10 @@ test('a queued observer accepts only the exact already-committed native Rewind t
   assert.equal(isCommittedCodexNativeRewindReplay(base), true);
   assert.equal(isCommittedCodexNativeRewindReplay({
     ...base,
+    proof: { ...proof, kind: 'native-rewind-replacement' },
+  }), true, 'an exact root replacement uses the same idempotent commit boundary');
+  assert.equal(isCommittedCodexNativeRewindReplay({
+    ...base,
     intent: { ...intent, launchId: 'rewind-b-c' },
   }), false, 'a newer Rewind generation cannot borrow the previous commit');
   assert.equal(isCommittedCodexNativeRewindReplay({
@@ -1004,6 +1260,121 @@ test('a queued observer accepts only the exact already-committed native Rewind t
     ...base,
     observerCurrent: false,
   }), false, 'a replaced observer cannot replay a completed handoff');
+});
+
+test('an exact post-action writer consumes its handoff observer, while a quarantined manual writer does not', () => {
+  const selection = {
+    status: 'selected',
+    sessionId: 'replacement-c2',
+    actionGeneration: 'rewind-c1-c2',
+  };
+  assert.deepEqual(classifyCodexWriterHandoffObserverAdoption({
+    actionBoundarySet: true,
+    selection,
+    actionGeneration: 'rewind-c1-c2',
+    adoptedSessionId: 'replacement-c2',
+    baselineSessionId: 'manual-c1',
+  }), {
+    accepted: true,
+    exactActionWriter: true,
+    manualWriterChange: false,
+    finalizeObserver: true,
+  });
+
+  assert.deepEqual(classifyCodexWriterHandoffObserverAdoption({
+    actionBoundarySet: false,
+    selection: null,
+    actionGeneration: null,
+    adoptedSessionId: 'manual-c1',
+    baselineSessionId: 'persisted-a',
+  }), {
+    accepted: true,
+    exactActionWriter: false,
+    manualWriterChange: true,
+    finalizeObserver: false,
+  }, 'manual C1 must remain quarantined so the same observer can own later Rewind');
+
+  assert.equal(classifyCodexWriterHandoffObserverAdoption({
+    actionBoundarySet: true,
+    selection: { ...selection, sessionId: 'other' },
+    actionGeneration: 'rewind-c1-c2',
+    adoptedSessionId: 'replacement-c2',
+    baselineSessionId: 'manual-c1',
+  }).accepted, false);
+});
+
+test('a committed root replacement stays authoritative while its exact runtime source is still writable', () => {
+  const terminalToken = {};
+  const source = {
+    filePath: '/sessions/manual-c1.jsonl',
+    meta: { id: 'manual-c1', forked_from_id: 'unrelated-b' },
+  };
+  const replacement = {
+    filePath: '/sessions/replacement-c2.jsonl',
+    meta: { id: 'replacement-c2', forked_from_id: null },
+  };
+  const base = {
+    kind: 'native-rewind-replacement',
+    valid: true,
+    sessionId: 'replacement-c2',
+    filePath: replacement.filePath,
+    sourceSessionId: 'manual-c1',
+    actionGeneration: 'rewind-c1-c2',
+    observerGeneration: 'rewind-c1-c2',
+    terminalToken,
+    observerTerminalToken: terminalToken,
+    runSeq: 44,
+    observerRunSeq: 44,
+    boundSessionId: 'replacement-c2',
+  };
+  const selected = selectCodexSettledRewindWriter([source, replacement], base);
+  assert.equal(selected.status, 'selected');
+  assert.equal(selected.sessionId, 'replacement-c2');
+  assert.equal(selected.lineageRelation, 'rewind-replacement');
+
+  const unrelated = {
+    filePath: '/sessions/unrelated-d.jsonl',
+    meta: { id: 'unrelated-d', forked_from_id: null },
+  };
+  const held = selectCodexSettledRewindWriter([source, replacement, unrelated], base);
+  assert.equal(held.status, 'unresolved');
+  assert.equal(held.reason, 'replacement-settled-writer-unrelated-competitor');
+});
+
+test('the full public writer filter revalidates a committed root replacement after its handoff closes', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const source = sessionsDir + '/rollout-manual-c1.jsonl';
+  const replacement = sessionsDir + '/rollout-replacement-c2.jsonl';
+  const terminalToken = {};
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 100,
+    output: `p100\nf20\nau\nn${source}\nf21\nau\nn${replacement}\n`,
+  }], sessionsDir);
+  const metadata = new Map([
+    [source, { meta: { id: 'manual-c1', forked_from_id: 'unrelated-b', source: 'cli' } }],
+    [replacement, { meta: { id: 'replacement-c2', forked_from_id: null, source: 'cli' } }],
+  ]);
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: async filePath => metadata.get(filePath),
+    isUserSession: () => true,
+    settledWriter: {
+      kind: 'native-rewind-replacement',
+      valid: true,
+      sessionId: 'replacement-c2',
+      filePath: replacement,
+      sourceSessionId: 'manual-c1',
+      actionGeneration: 'rewind-c1-c2',
+      observerGeneration: 'rewind-c1-c2',
+      terminalToken,
+      observerTerminalToken: terminalToken,
+      runSeq: 44,
+      observerRunSeq: 44,
+      boundSessionId: 'replacement-c2',
+    },
+  });
+  assert.equal(proof.status, 'owned');
+  assert.equal(proof.filePath, replacement);
+  assert.equal(proof.settledWriterProof.lineageRelation, 'rewind-replacement');
 });
 
 test('Rewind completion accepts either stable source or the exact child commit that consumed its journal', () => {
@@ -1136,6 +1507,24 @@ test('a public reconciliation preserves the settled Rewind source lineage', () =
     actionGeneration: null,
     sourceSessionId: null,
   });
+});
+
+test('public revalidation preserves the distinct no-lineage Rewind proof kinds', () => {
+  assert.equal(projectCodexWriterProofKind({
+    nativeRewindReplacementProven: true,
+  }), 'native-rewind-replacement');
+  assert.equal(projectCodexWriterProofKind({
+    settledReplacementWriterProven: true,
+    settledRewindWriterProven: true,
+  }), 'native-rewind-replacement');
+  assert.equal(projectCodexWriterProofKind({
+    settledDelayedRewindWriterProven: true,
+    settledRewindWriterProven: true,
+  }), 'native-rewind-delayed-child');
+  assert.equal(projectCodexWriterProofKind({
+    settledRewindWriterProven: true,
+  }), 'native-rewind-settled-writer');
+  assert.equal(projectCodexWriterProofKind({}), 'process-open-rollout');
 });
 
 test('active native Rewind B to C ignores settled B and selects exact live child C', async () => {

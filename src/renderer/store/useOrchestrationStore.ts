@@ -46,6 +46,8 @@ export type OrchestrationRun = {
   notificationAttemptedAt?: number | null;
   notificationDeliveredAt?: number | null;
   notificationDismissedAt?: number | null;
+  notificationHandoffId?: string | null;
+  notificationCancelRequestedAt?: number | null;
   sourceFollowupPending?: boolean;
   sourceFollowupStartedAt?: number | null;
   attentionRequiredAt?: number | null;

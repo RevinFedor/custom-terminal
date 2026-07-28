@@ -110,6 +110,8 @@ export interface HistoryComposerAvailability {
   canInterruptTurn: boolean;
   canPullDraft: boolean;
   status: string;
+  lifecycleGeneration?: string | null;
+  canStopProcess?: boolean;
 }
 
 export type PromptQueueInputSurface = 'terminal' | 'history';
@@ -2655,6 +2657,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
       && current.canInterruptTurn === availability.canInterruptTurn
       && current.canPullDraft === availability.canPullDraft
       && current.status === availability.status
+      && current.lifecycleGeneration === availability.lifecycleGeneration
+      && current.canStopProcess === availability.canStopProcess
     ) {
       return {};
     }

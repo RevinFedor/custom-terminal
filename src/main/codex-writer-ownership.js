@@ -177,6 +177,8 @@ const CODEX_HANDOFF_LIVE_PROOF_KINDS = new Set([
   'user-message-audit',
 ]);
 
+const CODEX_NATIVE_REWIND_REPLACEMENT_RELATION = 'rewind-replacement';
+
 function candidateSessionMeta(candidate) {
   return candidate?.meta || candidate?.metadata?.meta || {};
 }
@@ -246,6 +248,178 @@ function resolveCodexHandoffLineage(sessionId, sourceSessionId, parents, conflic
 }
 
 /**
+ * Prove the history shape of the root rollout that Codex 0.145+ may create for
+ * native Rewind without emitting `forked_from_id`.
+ *
+ * This helper never uses file recency. The exact target is re-derived from the
+ * source projection, the retained prefix must match record-for-record, and any
+ * candidate messages after that prefix must belong to the post-action epoch.
+ * Process/PTY ownership is deliberately checked by the caller at the live
+ * admission boundary.
+ */
+function classifyCodexNativeRewindReplacementProjection({
+  sourceSessionId = null,
+  candidateSessionId = null,
+  candidateForkedFromId = null,
+  actionGeneration = null,
+  actionStartedAtMs = null,
+  candidateCreatedAtMs = null,
+  targetUuid = null,
+  targetSourceLine = null,
+  targetTextHash = null,
+  rollbackTurns = null,
+  sourceMessages = [],
+  candidateMessages = [],
+} = {}) {
+  const source = String(sourceSessionId || '').trim();
+  const candidate = String(candidateSessionId || '').trim();
+  const actionStartedAt = Number(actionStartedAtMs);
+  const createdAt = Number(candidateCreatedAtMs);
+  const targetLine = Number(targetSourceLine);
+  const rollbackDepth = Number(rollbackTurns);
+  const sourceProjection = Array.isArray(sourceMessages) ? sourceMessages : [];
+  const candidateProjection = Array.isArray(candidateMessages) ? candidateMessages : [];
+  const reject = (reason, extra = {}) => ({
+    proven: false,
+    reason,
+    kind: CODEX_NATIVE_REWIND_REPLACEMENT_RELATION,
+    sourceSessionId: source || null,
+    sessionId: candidate || null,
+    actionGeneration: actionGeneration || null,
+    ...extra,
+  });
+
+  if (!source || !candidate || source === candidate || !actionGeneration) {
+    return reject('replacement-identity-missing');
+  }
+  if (candidateForkedFromId) {
+    return reject('replacement-declared-lineage-present');
+  }
+  if (!Number.isFinite(actionStartedAt)
+    || actionStartedAt <= 0
+    || !Number.isFinite(createdAt)
+    || createdAt < actionStartedAt) {
+    return reject('replacement-creation-boundary-invalid');
+  }
+  if (!targetUuid
+    || !Number.isInteger(targetLine)
+    || targetLine < 1
+    || !/^[a-f0-9]{64}$/i.test(String(targetTextHash || ''))
+    || !Number.isInteger(rollbackDepth)
+    || rollbackDepth < 1) {
+    return reject('replacement-target-context-missing');
+  }
+
+  const targetIndex = sourceProjection.findIndex(
+    message => Number(message?.sourceLine) === targetLine
+  );
+  if (targetIndex < 0) return reject('target-line-not-in-source-projection');
+  const target = sourceProjection[targetIndex] || {};
+  if (String(target.uuid || '') !== String(targetUuid)) {
+    return reject('target-uuid-mismatch');
+  }
+  if (String(target.textHash || '') !== String(targetTextHash)) {
+    return reject('target-text-hash-mismatch');
+  }
+  const expectedRollbackTurns = sourceProjection.length - targetIndex;
+  if (expectedRollbackTurns !== rollbackDepth) {
+    return reject('rollback-depth-mismatch', {
+      expectedRollbackTurns,
+      journalRollbackTurns: rollbackDepth,
+    });
+  }
+
+  const expectedPrefix = sourceProjection.slice(0, targetIndex);
+  if (candidateProjection.length < expectedPrefix.length) {
+    return reject('replacement-prefix-too-short', {
+      expectedLength: expectedPrefix.length,
+      candidateLength: candidateProjection.length,
+    });
+  }
+  const mismatchIndex = expectedPrefix.findIndex(
+    (message, index) => String(message?.signature || '')
+      !== String(candidateProjection[index]?.signature || '')
+  );
+  if (mismatchIndex >= 0) {
+    return reject('replacement-prefix-content-mismatch', { mismatchIndex });
+  }
+
+  const suffix = candidateProjection.slice(expectedPrefix.length);
+  const staleSuffixIndex = suffix.findIndex((message) => {
+    const timestampMs = Number(message?.timestampMs);
+    return !Number.isFinite(timestampMs) || timestampMs < actionStartedAt;
+  });
+  if (staleSuffixIndex >= 0) {
+    return reject('replacement-suffix-outside-action-epoch', {
+      suffixIndex: staleSuffixIndex,
+    });
+  }
+
+  return {
+    proven: true,
+    reason: 'exact-target-prefix',
+    kind: CODEX_NATIVE_REWIND_REPLACEMENT_RELATION,
+    sourceSessionId: source,
+    sessionId: candidate,
+    actionGeneration,
+    actionStartedAtMs: actionStartedAt,
+    candidateCreatedAtMs: createdAt,
+    targetUuid: String(targetUuid),
+    targetSourceLine: targetLine,
+    targetTextHash: String(targetTextHash),
+    rollbackTurns: rollbackDepth,
+    targetIndex,
+    retainedPrefixLength: expectedPrefix.length,
+    postActionMessageCount: suffix.length,
+    retainedPrefixExact: true,
+    suffixAfterAction: true,
+  };
+}
+
+function reconcileCodexNativeRewindReplacementProof(computedProof, recordedProof) {
+  if (computedProof?.proven !== true
+    || computedProof?.kind !== CODEX_NATIVE_REWIND_REPLACEMENT_RELATION) {
+    return { proven: false, reason: computedProof?.reason || 'replacement-proof-unproven' };
+  }
+  if (!recordedProof
+    || recordedProof.version !== 1
+    || recordedProof.kind !== CODEX_NATIVE_REWIND_REPLACEMENT_RELATION) {
+    return { proven: false, reason: 'replacement-durable-proof-missing' };
+  }
+  const exactFields = [
+    'sessionId',
+    'sourceSessionId',
+    'actionGeneration',
+    'targetUuid',
+    'targetTextHash',
+  ];
+  if (exactFields.some(field => String(computedProof[field] || '')
+    !== String(recordedProof[field] || ''))) {
+    return { proven: false, reason: 'replacement-durable-proof-identity-mismatch' };
+  }
+  const exactNumbers = [
+    'candidateCreatedAtMs',
+    'targetSourceLine',
+    'rollbackTurns',
+    'retainedPrefixLength',
+  ];
+  if (exactNumbers.some(field => Number(computedProof[field])
+    !== Number(recordedProof[field]))) {
+    return { proven: false, reason: 'replacement-durable-proof-shape-mismatch' };
+  }
+  if (Number(computedProof.postActionMessageCount)
+    < Number(recordedProof.postActionMessageCount)) {
+    return { proven: false, reason: 'replacement-durable-proof-regressed' };
+  }
+  return {
+    ...computedProof,
+    proven: true,
+    reason: 'exact-recorded-replacement',
+    recordedPostActionMessageCount: Number(recordedProof.postActionMessageCount),
+  };
+}
+
+/**
  * Select a new Codex writer while an explicit native Rewind handoff is active.
  *
  * This is deliberately stricter than the normal process-open resolver. A fork
@@ -262,8 +436,13 @@ function selectCodexNativeRewindWriter(candidates, {
   observerGeneration = null,
   actionStartedAtMs = null,
   liveProofs = [],
+  replacementProofs = [],
   lineage = [],
   stableSourceProof = null,
+  targetUuid = null,
+  targetSourceLine = null,
+  targetTextHash = null,
+  rollbackTurns = null,
 } = {}) {
   const allCandidates = Array.isArray(candidates) ? candidates : [];
   if (kind !== 'native-rewind') {
@@ -316,17 +495,6 @@ function selectCodexNativeRewindWriter(candidates, {
   for (const candidate of allCandidates) {
     const meta = candidateSessionMeta(candidate);
     const sessionId = meta.id ? String(meta.id) : '';
-    const ancestry = resolveCodexHandoffLineage(
-      sessionId,
-      sourceSessionId,
-      parents,
-      conflicts,
-    );
-    if (!ancestry.proven) {
-      rejected.push({ sessionId: sessionId || null, reason: ancestry.reason });
-      continue;
-    }
-
     const matchingProofs = (Array.isArray(liveProofs) ? liveProofs : []).filter((proof) => {
       if (String(proof?.sessionId || '') !== sessionId) return false;
       if (proof?.actionGeneration !== actionGeneration) return false;
@@ -343,6 +511,51 @@ function selectCodexNativeRewindWriter(candidates, {
       continue;
     }
     matchingProofs.sort((a, b) => Number(b.boundaryAtMs) - Number(a.boundaryAtMs));
+
+    const ancestry = resolveCodexHandoffLineage(
+      sessionId,
+      sourceSessionId,
+      parents,
+      conflicts,
+    );
+    if (!ancestry.proven) {
+      const metaForkedFromId = meta.forked_from_id ? String(meta.forked_from_id) : '';
+      const matchingReplacementProofs = (Array.isArray(replacementProofs)
+        ? replacementProofs
+        : []).filter((proof) => (
+        proof?.proven === true
+        && proof?.kind === CODEX_NATIVE_REWIND_REPLACEMENT_RELATION
+        && !metaForkedFromId
+        && String(proof.sessionId || '') === sessionId
+        && String(proof.sourceSessionId || '') === String(sourceSessionId)
+        && String(proof.actionGeneration || '') === String(actionGeneration)
+        && String(proof.targetUuid || '') === String(targetUuid || '')
+        && Number(proof.targetSourceLine) === Number(targetSourceLine)
+        && String(proof.targetTextHash || '') === String(targetTextHash || '')
+        && Number(proof.rollbackTurns) === Number(rollbackTurns)
+        && proof.retainedPrefixExact === true
+        && proof.suffixAfterAction === true
+        && Number(proof.candidateCreatedAtMs) >= startedAt
+      ));
+      if (matchingReplacementProofs.length !== 1) {
+        rejected.push({
+          sessionId: sessionId || null,
+          reason: matchingReplacementProofs.length > 1
+            ? 'multiple-replacement-proofs'
+            : ancestry.reason,
+        });
+        continue;
+      }
+      proven.push({
+        candidate,
+        sessionId,
+        lineageDepth: 0,
+        lineageRelation: CODEX_NATIVE_REWIND_REPLACEMENT_RELATION,
+        liveProof: matchingProofs[0],
+        replacementProof: matchingReplacementProofs[0],
+      });
+      continue;
+    }
     proven.push({
       candidate,
       sessionId,
@@ -364,7 +577,11 @@ function selectCodexNativeRewindWriter(candidates, {
   }
   return {
     status: 'unresolved',
-    reason: proven.length > 1 ? 'multiple-proven-descendants' : 'no-proven-descendant',
+    reason: proven.length > 1
+      ? (proven.some(item => item.lineageRelation === CODEX_NATIVE_REWIND_REPLACEMENT_RELATION)
+        ? 'multiple-proven-rewind-writers'
+        : 'multiple-proven-descendants')
+      : 'no-proven-descendant',
     sourceSessionId: String(sourceSessionId),
     actionGeneration,
     candidates: allCandidates,
@@ -401,7 +618,8 @@ function selectCodexSettledRewindWriter(candidates, {
 } = {}) {
   const allCandidates = Array.isArray(candidates) ? candidates : [];
   const supportedKind = kind === 'native-rewind-settled-writer'
-    || kind === 'native-rewind-delayed-child';
+    || kind === 'native-rewind-delayed-child'
+    || kind === 'native-rewind-replacement';
   if (!supportedKind || valid !== true) {
     return {
       status: 'unresolved',
@@ -504,7 +722,8 @@ function selectCodexSettledRewindWriter(candidates, {
   // atomic source→child DB CAS. Codex does not write `forked_from_id` for this
   // variant, so later lsof revalidation preserves that already-committed
   // identity while the only competing user rollout is the exact source.
-  if (kind === 'native-rewind-delayed-child') {
+  if (kind === 'native-rewind-delayed-child'
+    || kind === 'native-rewind-replacement') {
     const competitors = allCandidates.filter((candidate) => candidate !== exactCandidates[0]);
     const invalidCompetitor = competitors.find((candidate) => {
       const meta = candidateSessionMeta(candidate);
@@ -513,7 +732,9 @@ function selectCodexSettledRewindWriter(candidates, {
     if (invalidCompetitor) {
       return {
         status: 'unresolved',
-        reason: 'delayed-settled-writer-unrelated-competitor',
+        reason: kind === 'native-rewind-replacement'
+          ? 'replacement-settled-writer-unrelated-competitor'
+          : 'delayed-settled-writer-unrelated-competitor',
         rejectedSessionId: candidateSessionMeta(invalidCompetitor).id || null,
         candidates: allCandidates,
       };
@@ -525,7 +746,9 @@ function selectCodexSettledRewindWriter(candidates, {
       sourceSessionId: String(sourceSessionId),
       actionGeneration,
       lineageDepth: null,
-      lineageRelation: 'delayed-stable-source-child',
+      lineageRelation: kind === 'native-rewind-replacement'
+        ? CODEX_NATIVE_REWIND_REPLACEMENT_RELATION
+        : 'delayed-stable-source-child',
       ancestors: competitors.map(() => ({
         sessionId: String(sourceSessionId),
         lineageDepth: null,
@@ -801,7 +1024,10 @@ function isCommittedCodexNativeRewindReplay({
     || !intent?.sourceSessionId
     || !intent?.launchId
     || !candidateSessionId
-    || proof?.kind !== 'native-rewind-settled-writer'
+    || (
+      proof?.kind !== 'native-rewind-settled-writer'
+      && proof?.kind !== 'native-rewind-replacement'
+    )
     || proof?.valid !== true
     || observerCurrent !== true) {
     return false;
@@ -817,6 +1043,38 @@ function isCommittedCodexNativeRewindReplay({
     && Number.isInteger(Number(runSeq))
     && Number(runSeq) > 0
     && Number(proof.runSeq) === Number(runSeq);
+}
+
+/**
+ * Decide whether a writer-handoff watcher has completed the one transition it
+ * owns. A manual writer observed before the user confirms Rewind remains only
+ * a quarantined runtime source, so that watcher must stay alive. Once an exact
+ * post-action writer is adopted, the watcher is spent and must be closed; if
+ * it stays registered, later public process probes keep applying the consumed
+ * handoff transaction and can revoke the writer that transaction just proved.
+ */
+function classifyCodexWriterHandoffObserverAdoption({
+  actionBoundarySet = false,
+  selection = null,
+  actionGeneration = null,
+  adoptedSessionId = null,
+  baselineSessionId = null,
+} = {}) {
+  const exactActionWriter = actionBoundarySet === true
+    && selection?.status === 'selected'
+    && !!actionGeneration
+    && selection.actionGeneration === actionGeneration
+    && selection.sessionId === adoptedSessionId;
+  const manualWriterChange = actionBoundarySet !== true
+    && !!baselineSessionId
+    && !!adoptedSessionId
+    && String(baselineSessionId) !== String(adoptedSessionId);
+  return {
+    accepted: exactActionWriter || manualWriterChange,
+    exactActionWriter,
+    manualWriterChange,
+    finalizeObserver: exactActionWriter,
+  };
 }
 
 /**
@@ -920,6 +1178,26 @@ function deriveCodexSettledWriterProofScope({
     actionGeneration: null,
     sourceSessionId: null,
   };
+}
+
+function projectCodexWriterProofKind({
+  delayedRewindWriterProven = false,
+  settledDelayedRewindWriterProven = false,
+  nativeRewindReplacementProven = false,
+  settledReplacementWriterProven = false,
+  nativeRewindHandoffProven = false,
+  settledRewindWriterProven = false,
+} = {}) {
+  if (delayedRewindWriterProven || settledDelayedRewindWriterProven) {
+    return 'native-rewind-delayed-child';
+  }
+  if (nativeRewindReplacementProven || settledReplacementWriterProven) {
+    return 'native-rewind-replacement';
+  }
+  if (nativeRewindHandoffProven || settledRewindWriterProven) {
+    return 'native-rewind-settled-writer';
+  }
+  return 'process-open-rollout';
 }
 
 function shouldUseSettledCodexRewindWriterProof({
@@ -1409,6 +1687,8 @@ module.exports = {
   isCodexResumeSourceAuditPending,
   classifyCodexProvisionalActionAuthorization,
   classifyCodexWriterHandoffSettlement,
+  classifyCodexNativeRewindReplacementProjection,
+  reconcileCodexNativeRewindReplacementProof,
   claimExclusiveActionReservation,
   claimCodexResumeSourceLease,
   isRetryableCodexDescriptorProbeTimeout,
@@ -1421,10 +1701,12 @@ module.exports = {
   resolveCodexUserWriterProof,
   resolveCodexWriterProof,
   isCommittedCodexNativeRewindReplay,
+  classifyCodexWriterHandoffObserverAdoption,
   resolveCodexRewindCompletionProof,
   shouldCloseCodexRewindProtocolUi,
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
+  projectCodexWriterProofKind,
   shouldUseSettledCodexRewindWriterProof,
   selectCodexNativeRewindWriter,
   selectCodexDelayedStableSourceWriter,

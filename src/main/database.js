@@ -64,7 +64,63 @@ function inspectCodexWriterHandoffValue(journalKey, rawValue) {
     && Number.isInteger(Number(journal.rollbackTurns))
     && Number(journal.rollbackTurns) >= 1
   );
-  const valid = baseValid && versionValid;
+  const optionalBindingValid = journal?.expectedBindingSessionId === undefined
+    || (
+      typeof journal.expectedBindingSessionId === 'string'
+      && journal.expectedBindingSessionId.trim()
+    );
+  const optionalRuntimeGenerationValid = (
+    journal?.sourceLifecycleGeneration === undefined
+    || (
+      typeof journal.sourceLifecycleGeneration === 'string'
+      && journal.sourceLifecycleGeneration.trim()
+    )
+  ) && (
+    journal?.sourceRunSeq === undefined
+    || (
+      Number.isInteger(Number(journal.sourceRunSeq))
+      && Number(journal.sourceRunSeq) > 0
+    )
+  );
+  const hasSeparatedBinding = typeof journal?.expectedBindingSessionId === 'string'
+    && journal.expectedBindingSessionId.trim()
+    && journal.expectedBindingSessionId.trim() !== String(journal?.sourceSessionId || '').trim();
+  const separatedBindingValid = !hasSeparatedBinding || (
+    journal.version === 2
+    && journal.sourceBindingMode === 'quarantined-manual-writer'
+    && typeof journal.sourceLifecycleGeneration === 'string'
+    && journal.sourceLifecycleGeneration.trim()
+    && Number.isInteger(Number(journal.sourceRunSeq))
+      && Number(journal.sourceRunSeq) > 0
+  );
+  const replacementCandidateProof = journal?.replacementCandidateProof;
+  const optionalReplacementCandidateValid = replacementCandidateProof === undefined || (
+    replacementCandidateProof
+    && replacementCandidateProof.version === 1
+    && replacementCandidateProof.kind === 'rewind-replacement'
+    && typeof replacementCandidateProof.sessionId === 'string'
+    && replacementCandidateProof.sessionId.trim()
+    && replacementCandidateProof.sessionId.trim() !== String(journal?.sourceSessionId || '').trim()
+    && replacementCandidateProof.sourceSessionId === journal.sourceSessionId
+    && replacementCandidateProof.actionGeneration === journal.actionGeneration
+    && Number.isFinite(Number(replacementCandidateProof.candidateCreatedAtMs))
+    && Number(replacementCandidateProof.candidateCreatedAtMs) >= Number(journal.actionStartedAtMs)
+    && Number.isFinite(Number(replacementCandidateProof.observedAtMs))
+    && Number(replacementCandidateProof.observedAtMs)
+      >= Number(replacementCandidateProof.candidateCreatedAtMs)
+    && replacementCandidateProof.targetUuid === journal.targetUuid
+    && Number(replacementCandidateProof.targetSourceLine) === Number(journal.targetSourceLine)
+    && replacementCandidateProof.targetTextHash === journal.targetTextHash
+    && Number(replacementCandidateProof.rollbackTurns) === Number(journal.rollbackTurns)
+    && replacementCandidateProof.retainedPrefixExact === true
+    && replacementCandidateProof.suffixAfterAction === true
+  );
+  const valid = baseValid
+    && versionValid
+    && optionalBindingValid
+    && optionalRuntimeGenerationValid
+    && separatedBindingValid
+    && optionalReplacementCandidateValid;
   if (!valid) {
     return {
       status: 'invalid',
@@ -2376,6 +2432,22 @@ class DatabaseManager {
         return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
       }
 
+      // `sourceSessionId` is the rollout on which native Rewind actually ran.
+      // For a quarantined manual writer that source is intentionally different
+      // from the durable tab binding. The journal captures both identities at
+      // the pre-Enter boundary; only the durable expectation participates in
+      // the SQLite CAS.
+      const expectedBindingSessionId = journal.expectedBindingSessionId || sourceSessionId;
+      const replacementCandidateSessionId = journal.replacementCandidateProof?.sessionId || null;
+      if (replacementCandidateSessionId && replacementCandidateSessionId !== nextSessionId) {
+        return {
+          success: false,
+          error: 'codex_handoff_replacement_candidate_changed',
+          retryable: false,
+          replacementCandidateSessionId,
+        };
+      }
+
       const tabRow = this.db.prepare(
         'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
       ).get(projectId, tabId);
@@ -2383,7 +2455,7 @@ class DatabaseManager {
         return { success: false, error: 'codex_tab_row_missing', retryable: true };
       }
       const currentSessionId = tabRow.codex_session_id || null;
-      if (currentSessionId !== sourceSessionId && currentSessionId !== nextSessionId) {
+      if (currentSessionId !== expectedBindingSessionId && currentSessionId !== nextSessionId) {
         return {
           success: false,
           error: 'codex_handoff_binding_changed',
@@ -2391,10 +2463,10 @@ class DatabaseManager {
           currentSessionId,
         };
       }
-      if (currentSessionId === sourceSessionId) {
+      if (currentSessionId === expectedBindingSessionId) {
         const updated = this.db.prepare(
           'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ? AND codex_session_id IS ?'
-        ).run(nextSessionId, projectId, tabId, sourceSessionId);
+        ).run(nextSessionId, projectId, tabId, expectedBindingSessionId);
         if (updated.changes !== 1) {
           return { success: false, error: 'codex_handoff_compare_and_set_failed', retryable: true };
         }
@@ -2402,12 +2474,133 @@ class DatabaseManager {
       this.db.prepare('DELETE FROM app_state WHERE key = ?').run(journalKey);
       return {
         success: true,
-        updated: currentSessionId === sourceSessionId,
+        updated: currentSessionId === expectedBindingSessionId,
         currentSessionId,
+        expectedBindingSessionId,
         journalCleared: true,
       };
     });
 
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
+
+  recordPendingCodexRewindReplacementCandidate({
+    journalKey,
+    projectId,
+    tabId,
+    sourceSessionId,
+    candidateSessionId,
+    actionGeneration,
+    candidateCreatedAtMs,
+    observedAtMs,
+    retainedPrefixLength,
+    postActionMessageCount,
+  } = {}) {
+    const createdAt = Number(candidateCreatedAtMs);
+    const observedAt = Number(observedAtMs);
+    const retainedCount = Number(retainedPrefixLength);
+    const postActionCount = Number(postActionMessageCount);
+    if (!journalKey
+      || !projectId
+      || !tabId
+      || !sourceSessionId
+      || !candidateSessionId
+      || candidateSessionId === sourceSessionId
+      || !actionGeneration
+      || !Number.isFinite(createdAt)
+      || !Number.isFinite(observedAt)
+      || observedAt < createdAt
+      || !Number.isInteger(retainedCount)
+      || retainedCount < 0
+      || !Number.isInteger(postActionCount)
+      || postActionCount < 0) {
+      return { success: false, error: 'codex_rewind_replacement_candidate_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const inspection = this.inspectPendingCodexWriterHandoff(journalKey);
+      if (inspection.status !== 'present') {
+        return {
+          success: false,
+          error: inspection.error || 'codex_handoff_journal_missing',
+          reason: inspection.reason || null,
+          retryable: inspection.status === 'absent',
+        };
+      }
+      const journal = inspection.journal;
+      if (journal.version !== 2
+        || journal.projectId !== projectId
+        || journal.tabId !== tabId
+        || journal.sourceSessionId !== sourceSessionId
+        || journal.actionGeneration !== actionGeneration
+        || createdAt < Number(journal.actionStartedAtMs)) {
+        return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
+      }
+      const expectedBindingSessionId = journal.expectedBindingSessionId || sourceSessionId;
+      const tabRow = this.db.prepare(
+        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      ).get(projectId, tabId);
+      if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
+      const currentSessionId = tabRow.codex_session_id || null;
+      if (currentSessionId !== expectedBindingSessionId
+        && currentSessionId !== candidateSessionId) {
+        return {
+          success: false,
+          error: 'codex_handoff_binding_changed',
+          retryable: false,
+          currentSessionId,
+        };
+      }
+
+      const existing = journal.replacementCandidateProof || null;
+      if (existing) {
+        return existing.sessionId === candidateSessionId
+          ? { success: true, updated: false, journal, proof: existing }
+          : {
+              success: false,
+              error: 'codex_rewind_replacement_candidate_ambiguous',
+              retryable: false,
+              existingSessionId: existing.sessionId,
+            };
+      }
+      const proof = {
+        version: 1,
+        kind: 'rewind-replacement',
+        sessionId: candidateSessionId,
+        sourceSessionId,
+        actionGeneration,
+        candidateCreatedAtMs: createdAt,
+        observedAtMs: observedAt,
+        targetUuid: journal.targetUuid,
+        targetSourceLine: Number(journal.targetSourceLine),
+        targetTextHash: journal.targetTextHash,
+        rollbackTurns: Number(journal.rollbackTurns),
+        retainedPrefixLength: retainedCount,
+        postActionMessageCount: postActionCount,
+        retainedPrefixExact: true,
+        suffixAfterAction: true,
+      };
+      const nextJournal = { ...journal, replacementCandidateProof: proof };
+      const updated = this.db.prepare(`
+        UPDATE app_state
+        SET value = ?, updated_at = strftime('%s', 'now')
+        WHERE key = ? AND value = ?
+      `).run(JSON.stringify(nextJournal), journalKey, inspection.rawValue);
+      return updated.changes === 1
+        ? { success: true, updated: true, journal: nextJournal, proof }
+        : {
+            success: false,
+            error: 'codex_rewind_replacement_candidate_compare_and_set_failed',
+            retryable: true,
+          };
+    });
     try {
       return transaction();
     } catch (error) {

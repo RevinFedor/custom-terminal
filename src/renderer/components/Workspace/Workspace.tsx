@@ -273,6 +273,8 @@ export default function Workspace() {
         && current.detail === next.detail
         && current.sessionId === next.sessionId
         && current.spinner === next.spinner
+        && current.dismissLabel === next.dismissLabel
+        && current.onDismiss === next.onDismiss
         && current.retryLabel === next.retryLabel
         && current.onRetry === next.onRetry) return current;
       return next;
