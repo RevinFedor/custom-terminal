@@ -126,6 +126,12 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
       && (typeof block.id === 'string' || typeof block.tool_use_id === 'string'))
     .map((block) => {
       const toolUseId = String(block.id || block.tool_use_id);
+      // A subagent spawn arrives with its ready-made card: rebuild the Task
+      // row instead of a generic tool row, otherwise the background-chip strip
+      // (which matches on `tool: 'Task'`) never sees the running agent.
+      if (isObject(block.subagentCard) && block.subagentCard.tool === 'Task') {
+        return { ...block.subagentCard, toolUseId };
+      }
       return {
         tool: '__raw__',
         rawTool: {

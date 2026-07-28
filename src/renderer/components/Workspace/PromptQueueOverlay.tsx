@@ -237,7 +237,7 @@ export function PromptQueueOverlay({
   const postPromptEnabled = queue?.postPromptEnabled ?? false;
   const postPromptText = queue?.postPromptText ?? '';
   const loopPromptEnabled = queue?.loopPromptEnabled ?? false;
-  const loopPromptText = queue?.loopPromptText ?? '';
+  const loopPromptText = usePromptQueueStore((s) => s.sharedLoopPromptText);
   const collapsed = queue?.panelCollapsed ?? false;
   const firstChipArmedHint = queue?.firstChipHintActive ?? false;
   const runAfterTabId = queue?.runAfterTabId ?? null;

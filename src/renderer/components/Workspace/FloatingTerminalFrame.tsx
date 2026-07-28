@@ -107,6 +107,11 @@ export default function FloatingTerminalFrame({
   const pendingGeometryRef = useRef<Geometry | null>(null);
   const incrementTerminalFontSize = useUIStore((state) => state.incrementTerminalFontSize);
   const decrementTerminalFontSize = useUIStore((state) => state.decrementTerminalFontSize);
+  const selectedInputSurface = useUIStore((state) => (
+    tabId ? (state.promptQueueInputSurfaceTabs[tabId] ?? 'history') : 'history'
+  ));
+  const setPromptQueueInputSurface = useUIStore((state) => state.setPromptQueueInputSurface);
+  const terminalSelected = floating && open && selectedInputSurface === 'terminal';
 
   const setGeometry = useCallback((next: Geometry) => {
     const normalized = normalizeFloatingTerminalGeometry(next);
@@ -160,6 +165,11 @@ export default function FloatingTerminalFrame({
       if (second !== null) cancelAnimationFrame(second);
     };
   }, [floating, open, tabId]);
+
+  useEffect(() => {
+    if (!floating || open || !tabId || selectedInputSurface !== 'terminal') return;
+    setPromptQueueInputSurface(tabId, 'history');
+  }, [floating, open, selectedInputSurface, setPromptQueueInputSurface, tabId]);
 
   const flushPreview = useCallback(() => {
     rafRef.current = null;
@@ -257,7 +267,9 @@ export default function FloatingTerminalFrame({
     visibility: open ? 'visible' : 'hidden',
     opacity: open ? 1 : 0,
     pointerEvents: open ? 'auto' : 'none',
-    border: '1px solid rgba(255,255,255,0.2)',
+    border: terminalSelected
+      ? '1px solid rgba(255,255,255,0.92)'
+      : '1px solid rgba(255,255,255,0.2)',
     borderRadius: 8,
     boxShadow: '0 18px 50px rgba(0,0,0,0.55)',
     background: '#151515',
@@ -287,6 +299,10 @@ export default function FloatingTerminalFrame({
         ref={frameRef}
         data-floating-terminal
         data-floating-terminal-open={isPresented ? '1' : '0'}
+        data-floating-terminal-selected={terminalSelected ? '1' : '0'}
+        onPointerDownCapture={() => {
+          if (floating && open && tabId) setPromptQueueInputSurface(tabId, 'terminal');
+        }}
         style={{
           position: 'absolute',
           overflow: 'visible',

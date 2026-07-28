@@ -259,6 +259,11 @@ class OrchestrationRunStore {
             autoStopCreatedTargets: stored.autoStopCreatedTargets !== false,
             ...stored,
           };
+          // Legacy notification failures predate the persistent attention flag.
+          // Surface only failures that still block the source, not every old run.
+          if (isSourceNotificationBlocked(run) && !run.attentionRequiredAt) {
+            run.attentionRequiredAt = run.notificationAttemptedAt || run.updatedAt || run.completedAt || Date.now();
+          }
           this.runs.set(run.runId, run);
         }
         this._pruneInMemory();
@@ -359,7 +364,8 @@ class OrchestrationRunStore {
     }
     this._syncSourceFollowupState(run);
     run.updatedAt = Date.now();
-    const changed = [publicRun(run)];
+    const changed = [];
+    this._pushChanged(changed, run);
     const settled = [];
     this._refreshAncestors(run.parentRunId, changed, settled, Date.now());
     this._schedulePersist();
@@ -736,11 +742,52 @@ class OrchestrationRunStore {
     const run = this.runs.get(runId);
     if (!run) return null;
     const now = Date.now();
-    if (run.sourceTabId === tabId) run.sourceAcknowledgedAt = now;
-    if (run.targetTabId === tabId) run.targetAcknowledgedAt = now;
+    if (run.sourceTabId === tabId) {
+      run.sourceAcknowledgedAt = now;
+    }
+    if (run.targetTabId === tabId) {
+      run.targetAcknowledgedAt = now;
+    }
     run.updatedAt = now;
     this._schedulePersist();
     return publicRun(run);
+  }
+
+  async dismissAttention(runId, tabId) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run) return { run: null, changed: [], settled: [], dismissed: false };
+    if (run.sourceTabId !== tabId && run.targetTabId !== tabId) {
+      return { run: publicRun(run), changed: [], settled: [], dismissed: false };
+    }
+
+    const now = Date.now();
+    const changed = [];
+    const settled = [];
+    if (run.sourceTabId === tabId) {
+      run.sourceAcknowledgedAt = now;
+      run.sourceAttentionDismissedAt = now;
+    }
+    if (run.targetTabId === tabId) {
+      run.targetAcknowledgedAt = now;
+      run.targetAttentionDismissedAt = now;
+    }
+
+    // Closing a source-side delivery error is an explicit decision not to inject
+    // that old completion into the composer. Persist it and release descendants.
+    if (run.sourceTabId === tabId && isSourceNotificationBlocked(run)) {
+      run.notificationStatus = 'suppressed';
+      run.notificationSuppressed = true;
+      run.notificationDismissedAt = now;
+      run.parentFollowupPending = false;
+      run.parentConsumedAt ||= now;
+    }
+
+    run.updatedAt = now;
+    this._pushChanged(changed, run);
+    this._refreshAncestors(run.parentRunId, changed, settled, now);
+    this._schedulePersist();
+    return { run: publicRun(run), changed, settled, dismissed: true };
   }
 
   async listForTab(tabId, { activeOnly = false } = {}) {
@@ -886,6 +933,9 @@ class OrchestrationRunStore {
   }
 
   _pushChanged(changed, run) {
+    if ((run.status === 'failed' || isSourceNotificationBlocked(run)) && !run.attentionRequiredAt) {
+      run.attentionRequiredAt = run.updatedAt || Date.now();
+    }
     this._syncSourceFollowupState(run);
     const item = publicRun(run);
     const index = changed.findIndex((candidate) => candidate.runId === item.runId);

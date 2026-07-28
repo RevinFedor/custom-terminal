@@ -112,6 +112,8 @@ export interface HistoryComposerAvailability {
   status: string;
 }
 
+export type PromptQueueInputSurface = 'terminal' | 'history';
+
 export interface ApiSettings {
   claudeModel: ApiClaudeModel;
   claudeThinking: ThinkingLevel;
@@ -561,6 +563,7 @@ interface UIStore {
   historyPromptDraftChips: Record<string, HistoryPromptDraftChip[]>;
   historyComposerAvailability: Record<string, HistoryComposerAvailability>;
   historyRewindPreviews: Record<string, HistoryRewindPreview>;
+  promptQueueInputSurfaceTabs: Record<string, PromptQueueInputSurface>;
   setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
@@ -577,6 +580,7 @@ interface UIStore {
     ownerId: string,
   ) => void;
   setHistoryRewindPreview: (tabId: string, preview: HistoryRewindPreview | null) => void;
+  setPromptQueueInputSurface: (tabId: string, surface: PromptQueueInputSurface) => void;
 
   // Timeline panel visibility (per-tab state, default open)
   timelinePanelOpenTabs: Record<string, boolean>;
@@ -2533,9 +2537,19 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyPromptDraftChips: {},
   historyComposerAvailability: {},
   historyRewindPreviews: {},
+  promptQueueInputSurfaceTabs: {},
   setHistoryPanelOpen: (tabId, open) => set(state => ({
     historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
   })),
+  setPromptQueueInputSurface: (tabId, surface) => set(state => {
+    if (state.promptQueueInputSurfaceTabs[tabId] === surface) return state;
+    return {
+      promptQueueInputSurfaceTabs: {
+        ...state.promptQueueInputSurfaceTabs,
+        [tabId]: surface,
+      },
+    };
+  }),
   setHistoryScrollToUuid: (uuid) => set({ historyScrollToUuid: uuid }),
   setHistoryVisibleUuids: (tabId, uuids) => set(state => ({
     historyVisibleUuids: { ...state.historyVisibleUuids, [tabId]: uuids }

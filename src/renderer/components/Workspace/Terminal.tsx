@@ -1477,6 +1477,12 @@ function Terminal({
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
   const historyPanelOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
+  const selectedPromptQueueInputSurface = useUIStore((state) => (
+    promptQueueInputSurface === 'history'
+      ? (presentedProp ? (state.promptQueueInputSurfaceTabs[tabId] ?? 'history') : 'history')
+      : 'terminal'
+  ));
+  const setPromptQueueInputSurface = useUIStore((state) => state.setPromptQueueInputSurface);
   const timelineTreeMode = useUIStore((state) => state.timelineTreeModeTabs[tabId] ?? false);
   const timelineWidth = useUIStore((state) => state.timelineWidth);
   const timelinePinned = useUIStore((state) => state.timelinePinned);
@@ -3575,6 +3581,9 @@ function Terminal({
 
   // Handle click to focus
   const handleClick = () => {
+    if (promptQueueInputSurface === 'history') {
+      setPromptQueueInputSurface(tabId, 'terminal');
+    }
     if (xtermInstance.current) {
       xtermInstance.current.focus();
     }
@@ -3656,7 +3665,7 @@ function Terminal({
           agentBusy={agentBusy}
           rightInset={promptQueueRightInset}
           hideHistoryToggle={hidePromptQueueHistoryToggle}
-          inputSurface={promptQueueInputSurface}
+          inputSurface={selectedPromptQueueInputSurface}
         />;
         return promptQueuePortalHost ? createPortal(overlay, promptQueuePortalHost) : overlay;
       })()}

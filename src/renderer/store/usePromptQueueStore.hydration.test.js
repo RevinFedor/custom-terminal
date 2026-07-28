@@ -50,6 +50,15 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   t.after(() => { delete global.window; });
 
   const queueModule = require(outfile);
+  assert.equal(
+    queueModule.parsePersistedSharedLoopPrompt(JSON.stringify('shared persisted prompt')),
+    'shared persisted prompt',
+  );
+  assert.equal(
+    queueModule.parsePersistedSharedLoopPrompt('legacy direct prompt'),
+    'legacy direct prompt',
+  );
+  assert.equal(queueModule.parsePersistedSharedLoopPrompt({}), null);
   assert.equal(queueModule.isPromptQueueStoreHydrated(), false);
   let hydrationNotifications = 0;
   const unsubscribeHydration = queueModule.subscribePromptQueueHydration(() => {
@@ -315,9 +324,13 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   }
 
   queueModule.flushPromptQueueStoreSync();
-  assert.equal(syncWrites.length, 1);
-  assert.equal(syncWrites[0].channel, 'app:setStateSync');
-  const saved = JSON.parse(syncWrites[0].payload.value);
+  assert.equal(syncWrites.length, 2);
+  assert.ok(syncWrites.every((write) => write.channel === 'app:setStateSync'));
+  const queueWrite = syncWrites.find((write) => write.payload.key === 'promptQueueByTab');
+  const sharedLoopWrite = syncWrites.find((write) => write.payload.key === 'promptQueueSharedLoopPrompt');
+  assert.ok(queueWrite);
+  assert.ok(sharedLoopWrite);
+  const saved = JSON.parse(queueWrite.payload.value);
   assert.deepEqual(
     saved['tab-1'].items[0].imagePaths.map((ref) => ref.assetId),
     [firstAssetId, secondAssetId],
@@ -337,9 +350,15 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.equal(saved['tab-merge-arm'].workflowArmedAt, 5_000);
   assert.equal(saved['tab-enable-edge'].workflowArmedAt, 50_000);
   assert.equal(saved['tab-add-edge'].workflowArmedAt, 70_000);
-  assert.equal(saved['tab-loop'].loopPromptArmedAt, 444);
-  assert.equal(saved['tab-loop-runtime'].loopPromptText, 'finish the remaining work');
+  assert.equal(saved['tab-loop'].loopPromptArmedAt, 81_000);
+  assert.equal(saved['tab-loop-runtime'].loopPromptText, undefined);
   assert.equal(saved['tab-loop-runtime'].loopPromptArmedAt, 81_000);
+  assert.equal(JSON.parse(sharedLoopWrite.payload.value), 'finish the remaining work');
+  assert.equal(
+    queueModule.usePromptQueueStore.getState().getQueue('tab-loop').loopPromptText,
+    'finish the remaining work',
+    'editing Loop in one tab changes the shared body for every tab',
+  );
   queueModule.usePromptQueueStore.getState().cleanupClosedTab('tab-add-edge');
   assert.equal(queueModule.hasRuntimeWorkflowArm('tab-add-edge'), false);
   queueModule.usePromptQueueStore.getState().clearQueue('tab-enable-edge');

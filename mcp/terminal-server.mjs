@@ -478,6 +478,14 @@ const TOOLS = [
     },
   },
   {
+    name: 'complete_task',
+    description: 'Mark the current active response as the final successful completion of its task. Call this exactly once, near the end of the response, only when all requested work is genuinely complete and no child Terminal MCP delegations remain unresolved. Do not call it for partial progress, plans, waiting, errors, or when more work will continue. The mark is bound to this exact live turn; it does not finish the turn itself and becomes effective only if that same turn ends successfully.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
     name: 'rename_tab',
     description: 'Rename an open Noted Terminal tab through the Project API. Inside a full Noted Terminal session, omit tabId to rename the current tab.',
     inputSchema: {
@@ -1196,6 +1204,23 @@ async function callTool(name, args) {
         projectCwd: target.cwd || PROJECT_CWD,
         tabId: PARENT_TAB_ID || null,
         tab,
+      }, null, 2);
+    }
+
+    case 'complete_task': {
+      if (EXTERNAL_MODE || !PARENT_TAB_ID) {
+        throw new Error('complete_task is available only inside the full Noted Terminal session that owns this MCP process');
+      }
+      const target = projectHint({ projectId: PARENT_PROJECT_ID, cwd: PROJECT_CWD }, PARENT_TAB_ID);
+      const result = await httpApiPost(
+        target,
+        '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID) + '/complete-task',
+        { sourceMeta: buildSourceMeta() },
+      );
+      return JSON.stringify({
+        ok: true,
+        message: 'Current turn marked complete. Finish the final response now; do not start more work in this turn.',
+        ...result,
       }, null, 2);
     }
 

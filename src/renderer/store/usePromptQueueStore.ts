@@ -22,17 +22,34 @@ const { ipcRenderer } = window.require('electron');
 // SQLite-backed persistence via the existing app:setState / app:getState
 // pattern (same as defaultClaudeEffort, debugHoverBridges, freePorts).
 // Persist: items, autoRun, stopAfter, firstDelaySeconds, postPromptEnabled,
-// postPromptText, loopPromptEnabled, loopPromptText, panelCollapsed, previewId PER TAB. Skip:
+// postPromptText, loopPromptEnabled, panelCollapsed, previewId PER TAB. Skip:
 // firstChipHintActive (UI-only).
 // Serialized shape: { [tabId]: { items, autoRun, stopAfter, firstDelaySeconds,
 //                                postPromptEnabled, postPromptText, panelCollapsed,
 //                                previewId } }.
 const APP_STATE_KEY_QUEUE = 'promptQueueByTab';
+const APP_STATE_KEY_SHARED_LOOP_PROMPT = 'promptQueueSharedLoopPrompt';
+export const DEFAULT_SHARED_LOOP_PROMPT = [
+  'Проверь, полностью ли выполнена исходная задача.',
+  'Если осталась работа, продолжай её сейчас и не ограничивайся планом или обещанием.',
+].join(' ');
+
+export function parsePersistedSharedLoopPrompt(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === 'string') return parsed;
+  } catch {
+    // Older/dev rows may contain the prompt directly rather than JSON text.
+  }
+  return raw;
+}
 
 // Throttle disk writes — drag-reorder fires many state updates per second and
 // SQLite IO on every keystroke would be wasteful. 250ms covers fast typing and
 // drag-reorder without losing the last value on unmount.
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let sharedLoopPromptSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let hasHydratedPromptQueueStore = false;
 let hydratePromptQueuePromise: Promise<void> | null = null;
 const promptQueueHydrationListeners = new Set<() => void>();
@@ -121,8 +138,14 @@ function markPromptQueueStoreHydrated(): void {
   }
 }
 
-function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptText' | 'loopPromptArmedAt' | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'>> {
-  const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptText' | 'loopPromptArmedAt' | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'>> = {};
+type PersistedTabQueueSnapshot = Pick<TabQueue,
+  'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds'
+  | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptArmedAt'
+  | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'
+>;
+
+function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, PersistedTabQueueSnapshot> {
+  const out: Record<string, PersistedTabQueueSnapshot> = {};
   for (const [tabId, q] of snapshot) {
     // Skip cold tabs with no persistable state — saves space + avoids polluting
     // the kv store with thousands of empty rows over time. Non-default delay
@@ -137,7 +160,6 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       !q.postPromptEnabled &&
       !q.postPromptText &&
       !q.loopPromptEnabled &&
-      !q.loopPromptText &&
       !q.runAfterTabId &&
       !q.panelCollapsed &&
       !q.previewId
@@ -151,7 +173,6 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       postPromptEnabled: q.postPromptEnabled,
       postPromptText: q.postPromptText,
       loopPromptEnabled: q.loopPromptEnabled,
-      loopPromptText: q.loopPromptText,
       loopPromptArmedAt: q.loopPromptArmedAt,
       runAfterTabId: q.runAfterTabId,
       workflowArmedAt: q.workflowArmedAt,
@@ -160,6 +181,18 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
     };
   }
   return out;
+}
+
+function scheduleSharedLoopPromptSave(text: string): void {
+  if (!hasHydratedPromptQueueStore) return;
+  if (sharedLoopPromptSaveTimer) clearTimeout(sharedLoopPromptSaveTimer);
+  sharedLoopPromptSaveTimer = setTimeout(() => {
+    sharedLoopPromptSaveTimer = null;
+    ipcRenderer.invoke('app:setState', {
+      key: APP_STATE_KEY_SHARED_LOOP_PROMPT,
+      value: JSON.stringify(text),
+    }).catch((e: unknown) => console.warn('[PromptQueue] shared Loop prompt save failed:', e));
+  }, 250);
 }
 
 function scheduleSave(snapshot: Map<string, TabQueue>) {
@@ -182,6 +215,10 @@ export function flushPromptQueueStoreSync(): void {
     clearTimeout(saveTimer);
     saveTimer = null;
   }
+  if (sharedLoopPromptSaveTimer) {
+    clearTimeout(sharedLoopPromptSaveTimer);
+    sharedLoopPromptSaveTimer = null;
+  }
   try {
     const out = serializePromptQueueSnapshot(usePromptQueueStore.getState().queues);
     if (!hasHydratedPromptQueueStore) {
@@ -189,6 +226,10 @@ export function flushPromptQueueStoreSync(): void {
       return;
     }
     ipcRenderer.sendSync('app:setStateSync', { key: APP_STATE_KEY_QUEUE, value: JSON.stringify(out) });
+    ipcRenderer.sendSync('app:setStateSync', {
+      key: APP_STATE_KEY_SHARED_LOOP_PROMPT,
+      value: JSON.stringify(usePromptQueueStore.getState().sharedLoopPromptText),
+    });
   } catch (e) {
     console.warn('[PromptQueue] sync save failed:', e);
   }
@@ -456,6 +497,9 @@ export type TabQueue = {
 interface PromptQueueStore {
   // Per-tab queues. Outside Claude tabs the overlay is hidden, but state survives tab switching.
   queues: Map<string, TabQueue>;
+  // One editable Loop body shared by every tab. Per-tab state keeps only the
+  // enabled flag and arm timestamp; SQLite stores this text under one key.
+  sharedLoopPromptText: string;
 
   addPrompt: (
     tabId: string,
@@ -564,7 +608,7 @@ const EMPTY: TabQueue = {
   postPromptEnabled: false,
   postPromptText: '',
   loopPromptEnabled: false,
-  loopPromptText: '',
+  loopPromptText: DEFAULT_SHARED_LOOP_PROMPT,
   loopPromptArmedAt: null,
   panelCollapsed: false,
   firstChipHintActive: false,
@@ -604,6 +648,7 @@ type PreHydrateQueueField =
   | 'deleted';
 
 const preHydrateQueueChanges = new Map<string, Set<PreHydrateQueueField>>();
+let preHydrateSharedLoopPromptChanged = false;
 
 function trackPreHydrateQueueChanges(before: Map<string, TabQueue>, after: Map<string, TabQueue>): void {
   if (hasHydratedPromptQueueStore) return;
@@ -867,17 +912,24 @@ function queuedPromptMatchesExpected(
 export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
   // setAndPersist: write next state, then schedule a debounced disk save.
   // PreviewId-only mutations skip the save (UI-only, see scheduleSave).
-  const setAndPersist = (updater: (state: { queues: Map<string, TabQueue> }) => { queues: Map<string, TabQueue> }, opts?: { skipSave?: boolean }) => {
+  const setAndPersist = (updater: (state: PromptQueueStore) => { queues: Map<string, TabQueue> }, opts?: { skipSave?: boolean }) => {
     set((state) => {
       const next = updater(state);
-      trackPreHydrateQueueChanges(state.queues, next.queues);
-      if (!opts?.skipSave) scheduleSave(next.queues);
-      return next;
+      let normalizedQueues = next.queues;
+      for (const [tabId, queue] of next.queues) {
+        if (queue.loopPromptText === state.sharedLoopPromptText) continue;
+        if (normalizedQueues === next.queues) normalizedQueues = new Map(next.queues);
+        normalizedQueues.set(tabId, { ...queue, loopPromptText: state.sharedLoopPromptText });
+      }
+      trackPreHydrateQueueChanges(state.queues, normalizedQueues);
+      if (!opts?.skipSave) scheduleSave(normalizedQueues);
+      return { queues: normalizedQueues };
     });
   };
 
   return {
     queues: new Map(),
+    sharedLoopPromptText: DEFAULT_SHARED_LOOP_PROMPT,
 
     addPrompt: (tabId, text, images, imagePaths, title, chips) => {
       const id = nextId();
@@ -1388,6 +1440,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         if (cur.loopPromptEnabled === value) return state;
         next.set(tabId, {
           ...cur,
+          loopPromptText: state.sharedLoopPromptText,
           loopPromptEnabled: value,
           loopPromptArmedAt: value ? Date.now() : null,
         });
@@ -1396,18 +1449,23 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
     },
 
     setLoopPromptText: (tabId, text) => {
-      setAndPersist((state) => {
+      if (!hasHydratedPromptQueueStore) preHydrateSharedLoopPromptChanged = true;
+      set((state) => {
+        if (state.sharedLoopPromptText === text) return state;
         const next = new Map(state.queues);
-        const cur = next.get(tabId) ?? EMPTY;
-        if (cur.loopPromptText === text) return state;
-        next.set(tabId, {
-          ...cur,
-          loopPromptText: text,
-          // Editing an enabled Loop changes the operation itself. Correlate the
-          // new body only with completions that happen after this edit.
-          loopPromptArmedAt: cur.loopPromptEnabled ? Date.now() : cur.loopPromptArmedAt,
-        });
-        return { queues: next };
+        const editedAt = Date.now();
+        for (const [ownerTabId, queue] of next) {
+          next.set(ownerTabId, {
+            ...queue,
+            loopPromptText: text,
+            // Editing the shared body changes every enabled Loop operation.
+            loopPromptArmedAt: queue.loopPromptEnabled ? editedAt : queue.loopPromptArmedAt,
+          });
+        }
+        trackPreHydrateQueueChanges(state.queues, next);
+        scheduleSave(next);
+        scheduleSharedLoopPromptSave(text);
+        return { queues: next, sharedLoopPromptText: text };
       });
     },
 
@@ -1567,7 +1625,13 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       });
     },
 
-    getQueue: (tabId) => get().queues.get(tabId) ?? EMPTY,
+    getQueue: (tabId) => {
+      const state = get();
+      const queue = state.queues.get(tabId) ?? EMPTY;
+      return queue.loopPromptText === state.sharedLoopPromptText
+        ? queue
+        : { ...queue, loopPromptText: state.sharedLoopPromptText };
+    },
   };
 });
 
@@ -1781,7 +1845,10 @@ export function hydratePromptQueueStore(): Promise<void> {
 
   hydratePromptQueuePromise = (async () => {
     try {
-      const raw = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_QUEUE);
+      const [raw, rawSharedLoopPrompt] = await Promise.all([
+        ipcRenderer.invoke('app:getState', APP_STATE_KEY_QUEUE),
+        ipcRenderer.invoke('app:getState', APP_STATE_KEY_SHARED_LOOP_PROMPT),
+      ]);
       const parsedValue = !raw ? {} : (typeof raw === 'string' ? JSON.parse(raw) : raw);
       const parsed = parsedValue && typeof parsedValue === 'object' && !Array.isArray(parsedValue)
         ? parsedValue as Record<string, PersistedTabQueue>
@@ -1792,18 +1859,36 @@ export function hydratePromptQueueStore(): Promise<void> {
         persistedQueues.set(tabId, makeHydratedTabQueue(entry));
       }
 
+      const legacySharedLoopPrompt = Array.from(persistedQueues.values())
+        .filter((queue) => queue.loopPromptText.trim().length > 0)
+        .sort((a, b) => (b.loopPromptArmedAt ?? -1) - (a.loopPromptArmedAt ?? -1))[0]
+        ?.loopPromptText;
+      const persistedSharedLoopPrompt = parsePersistedSharedLoopPrompt(rawSharedLoopPrompt)
+        ?? legacySharedLoopPrompt
+        ?? DEFAULT_SHARED_LOOP_PROMPT;
+
       usePromptQueueStore.setState((state) => {
+        const sharedLoopPromptText = preHydrateSharedLoopPromptChanged
+          ? state.sharedLoopPromptText
+          : persistedSharedLoopPrompt;
         const next = new Map(state.queues);
         for (const [tabId, persisted] of persistedQueues) {
           const merged = mergeHydratedQueue(persisted, next.get(tabId), preHydrateQueueChanges.get(tabId));
-          if (merged) next.set(tabId, merged);
+          if (merged) next.set(tabId, { ...merged, loopPromptText: sharedLoopPromptText });
           else next.delete(tabId);
         }
-        return { queues: next };
+        for (const [tabId, queue] of next) {
+          if (queue.loopPromptText !== sharedLoopPromptText) {
+            next.set(tabId, { ...queue, loopPromptText: sharedLoopPromptText });
+          }
+        }
+        return { queues: next, sharedLoopPromptText };
       });
       markPromptQueueStoreHydrated();
       preHydrateQueueChanges.clear();
+      preHydrateSharedLoopPromptChanged = false;
       scheduleSave(usePromptQueueStore.getState().queues);
+      scheduleSharedLoopPromptSave(usePromptQueueStore.getState().sharedLoopPromptText);
 
       const validationTasks: Promise<unknown>[] = [];
       for (const [tabId, queue] of usePromptQueueStore.getState().queues) {
@@ -1818,9 +1903,11 @@ export function hydratePromptQueueStore(): Promise<void> {
       // failure. Existing in-memory actions remain saveable on the next mutation.
       markPromptQueueStoreHydrated();
       preHydrateQueueChanges.clear();
+      preHydrateSharedLoopPromptChanged = false;
       if (usePromptQueueStore.getState().queues.size > 0) {
         scheduleSave(usePromptQueueStore.getState().queues);
       }
+      scheduleSharedLoopPromptSave(usePromptQueueStore.getState().sharedLoopPromptText);
       console.warn('[PromptQueue] hydrate failed:', e instanceof Error ? e.message : String(e));
     }
   })().finally(() => {

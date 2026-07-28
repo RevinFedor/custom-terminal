@@ -29,6 +29,7 @@ export type OrchestrationRun = {
   sourceProjectName?: string;
   sourceProjectPath?: string;
   sourceAcknowledgedAt?: number | null;
+  sourceAttentionDismissedAt?: number | null;
   targetTabId: string;
   targetTabName?: string;
   targetProjectId: string;
@@ -36,6 +37,7 @@ export type OrchestrationRun = {
   targetProjectPath?: string;
   targetToolType?: 'claude' | 'codex';
   targetAcknowledgedAt?: number | null;
+  targetAttentionDismissedAt?: number | null;
   parentRunId?: string | null;
   waitForDescendants?: boolean;
   waitingOnRunIds?: string[];
@@ -43,8 +45,14 @@ export type OrchestrationRun = {
   notificationSuppressed?: boolean;
   notificationAttemptedAt?: number | null;
   notificationDeliveredAt?: number | null;
+  notificationDismissedAt?: number | null;
   sourceFollowupPending?: boolean;
   sourceFollowupStartedAt?: number | null;
+  attentionRequiredAt?: number | null;
+  completionReason?: string | null;
+  notificationError?: string | null;
+  resultError?: string | null;
+  recoveryReason?: string | null;
   error?: string | null;
 };
 
@@ -161,8 +169,9 @@ function releaseKindForRun(
     return 'handoff-started';
   }
   if (run.status === 'completed'
-    && run.notificationSuppressed !== true
-    && !['failed', 'source-closed', 'suppressed'].includes(run.notificationStatus || '')) {
+    && (run.notificationDismissedAt
+      || (run.notificationSuppressed !== true
+        && !['failed', 'source-closed', 'suppressed'].includes(run.notificationStatus || '')))) {
     return 'success';
   }
   return 'abnormal';

@@ -3,6 +3,8 @@ import type { CSSProperties, ReactNode } from 'react';
 import {
   ArrowDownLeft,
   ArrowUpRight,
+  ChevronDown,
+  ChevronRight,
   CircleAlert,
   CircleCheck,
   CircleStop,
@@ -42,6 +44,9 @@ const ACTIVE = new Set<OrchestrationStatus>([
   'waiting_recovery',
 ]);
 
+const SUCCESS_VISIBLE_MS = 4_000;
+const NOTIFICATION_ERRORS = new Set(['waiting-for-input', 'failed']);
+
 const STATUS_LABEL: Record<OrchestrationStatus, string> = {
   creating: 'Создание',
   starting: 'Запуск',
@@ -64,13 +69,68 @@ function statusColor(status: OrchestrationStatus): string {
   return '#a78bfa';
 }
 
-function StatusIcon({ status }: { status: OrchestrationStatus }) {
-  if (status === 'completed') return <CircleCheck size={14} strokeWidth={2.2} />;
-  if (status === 'failed' || status === 'waiting_recovery') return <CircleAlert size={14} strokeWidth={2.2} />;
-  if (status === 'cancelled') return <X size={14} strokeWidth={2.2} />;
+type RunPresentation = {
+  color: string;
+  icon: 'success' | 'error' | 'cancelled' | 'loading';
+  label: string;
+  spinning: boolean;
+};
+
+function hasSourceNotificationError(run: OrchestrationRun, tabId: string): boolean {
+  return run.sourceTabId === tabId
+    && run.notificationSuppressed !== true
+    && NOTIFICATION_ERRORS.has(run.notificationStatus || '');
+}
+
+function hasPendingSourceHandoff(run: OrchestrationRun, tabId: string): boolean {
+  return run.sourceTabId === tabId
+    && run.sourceFollowupPending === true
+    && !run.sourceFollowupStartedAt
+    && !hasSourceNotificationError(run, tabId);
+}
+
+function attentionDismissedForTab(run: OrchestrationRun, tabId: string): boolean {
+  if (run.sourceTabId === tabId && run.sourceAttentionDismissedAt) return true;
+  if (run.targetTabId === tabId && run.targetAttentionDismissedAt) return true;
+  return false;
+}
+
+function successVisibleAt(run: OrchestrationRun): number | null {
+  return run.sourceFollowupStartedAt || run.completedAt || null;
+}
+
+function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation {
+  if (hasSourceNotificationError(run, tabId)) {
+    return {
+      color: '#f87171',
+      icon: 'error',
+      label: run.notificationStatus === 'waiting-for-input' ? 'Не доставлено' : 'Ошибка доставки',
+      spinning: false,
+    };
+  }
+  if (run.status === 'failed') return { color: '#f87171', icon: 'error', label: 'Ошибка', spinning: false };
+  if (run.status === 'waiting_recovery') return { color: '#fbbf24', icon: 'error', label: 'Связь прервана', spinning: false };
+  if (hasPendingSourceHandoff(run, tabId)) return { color: '#a78bfa', icon: 'loading', label: 'Передача результата', spinning: true };
+  if (run.status === 'completed') return { color: '#4ade80', icon: 'success', label: 'Готово', spinning: false };
+  if (run.status === 'cancelled') return { color: '#737373', icon: 'cancelled', label: 'Закрыто', spinning: false };
+  return {
+    color: statusColor(run.status),
+    icon: 'loading',
+    label: STATUS_LABEL[run.status],
+    spinning: run.status === 'running'
+      || run.status === 'starting'
+      || run.status === 'sending'
+      || run.status === 'waiting_descendants',
+  };
+}
+
+function StatusIcon({ presentation }: { presentation: RunPresentation }) {
+  if (presentation.icon === 'success') return <CircleCheck size={14} strokeWidth={2.2} />;
+  if (presentation.icon === 'error') return <CircleAlert size={14} strokeWidth={2.2} />;
+  if (presentation.icon === 'cancelled') return <X size={14} strokeWidth={2.2} />;
   return (
     <LoaderCircle
-      className={status === 'running' || status === 'starting' || status === 'sending' || status === 'waiting_descendants' ? 'animate-spin' : ''}
+      className={presentation.spinning ? 'animate-spin' : ''}
       size={14}
       strokeWidth={2.2}
     />
@@ -97,6 +157,7 @@ function minutes(ms: number): number {
 export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
   const [runs, setRuns] = useState<OrchestrationRun[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(() => new Set());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<OrchestrationSettings | null>(null);
   const [actionError, setActionError] = useState<Record<string, string>>({});
@@ -107,7 +168,10 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
     let alive = true;
     void ipcRenderer.invoke('orchestration:list-for-tab', tabId)
       .then((items: OrchestrationRun[]) => {
-        if (alive) setRuns(Array.isArray(items) ? items : []);
+        if (alive) {
+          setRuns(Array.isArray(items) ? items : []);
+          setNow(Date.now());
+        }
       })
       .catch(() => {});
     void ipcRenderer.invoke('orchestration:get-settings')
@@ -124,6 +188,7 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
         next.push(run);
         return next;
       });
+      setNow(Date.now());
     };
     ipcRenderer.on('orchestration:changed', onChanged);
     return () => {
@@ -164,10 +229,30 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
 
   const orderedRuns = useMemo(() => [...runs]
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)), [runs]);
-  const activeRuns = useMemo(() => orderedRuns.filter((run) => (
-    ACTIVE.has(run.status)
-    || (run.sourceTabId === tabId && ['waiting-for-input', 'failed'].includes(run.notificationStatus || ''))
-  )), [orderedRuns, tabId]);
+  const nextSuccessExpiry = useMemo(() => orderedRuns.reduce<number | null>((nearest, run) => {
+    const presentation = runPresentation(run, tabId);
+    const visibleAt = successVisibleAt(run);
+    if (presentation.icon !== 'success' || !visibleAt) return nearest;
+    const expiresAt = visibleAt + SUCCESS_VISIBLE_MS;
+    if (expiresAt <= Date.now()) return nearest;
+    return nearest === null || expiresAt < nearest ? expiresAt : nearest;
+  }, null), [orderedRuns, tabId]);
+  useEffect(() => {
+    if (!nextSuccessExpiry) return;
+    const timer = window.setTimeout(() => setNow(Date.now()), Math.max(0, nextSuccessExpiry - Date.now()) + 20);
+    return () => window.clearTimeout(timer);
+  }, [nextSuccessExpiry]);
+
+  const statusRuns = useMemo(() => orderedRuns.filter((run) => {
+    if (ACTIVE.has(run.status) || hasPendingSourceHandoff(run, tabId)) return true;
+    const presentation = runPresentation(run, tabId);
+    if (presentation.icon === 'error') {
+      return Boolean(run.attentionRequiredAt) && !attentionDismissedForTab(run, tabId);
+    }
+    return presentation.icon === 'success'
+      && Boolean(successVisibleAt(run))
+      && Number(successVisibleAt(run)) + SUCCESS_VISIBLE_MS > now;
+  }), [now, orderedRuns, tabId]);
 
   const openLinkedTab = useCallback(async (run: OrchestrationRun) => {
     const isSource = run.sourceTabId === tabId;
@@ -195,8 +280,8 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
     void ipcRenderer.invoke('orchestration:acknowledge', { runId: run.runId, tabId }).catch(() => {});
   }, [tabId]);
 
-  const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'cancel') => {
-    const result = await ipcRenderer.invoke('orchestration:action', { runId: run.runId, action }).catch((error: unknown) => ({
+  const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'cancel') => {
+    const result = await ipcRenderer.invoke('orchestration:action', { runId: run.runId, action, tabId }).catch((error: unknown) => ({
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     }));
@@ -207,7 +292,7 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
       ...current,
       [run.runId]: result?.ok === false ? (result.error || 'Действие не выполнено') : '',
     }));
-  }, []);
+  }, [tabId]);
 
   const saveSettings = useCallback(async (patch: Partial<OrchestrationSettings>) => {
     setSettings((current) => current ? { ...current, ...patch } : current);
@@ -219,7 +304,7 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
 
   const actionButton = (
     run: OrchestrationRun,
-    action: 'retry' | 'report' | 'dismiss' | 'cancel',
+    action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'cancel',
     label: string,
     icon: ReactNode,
     color: string,
@@ -254,12 +339,12 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
     const isSource = run.sourceTabId === tabId;
     const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
     const linkedProjectName = isSource ? run.targetProjectName : run.sourceProjectName;
-    const color = statusColor(run.status);
+    const presentation = runPresentation(run, tabId);
     const remaining = countdown(run.recoveryDeadlineAt, now);
     return (
       <div style={{ width: 276, display: 'grid', gap: 6, fontSize: 11, lineHeight: 1.35 }}>
         <div style={{ display: 'grid', gridTemplateColumns: '70px minmax(0, 1fr)', gap: '3px 7px', color: '#a3a3a3' }}>
-          <span>Состояние</span><span style={{ color }}>{STATUS_LABEL[run.status]}</span>
+          <span>Состояние</span><span style={{ color: presentation.color }}>{presentation.label}</span>
           {remaining && <><span>Отправка</span><span style={{ color: '#fbbf24', fontVariantNumeric: 'tabular-nums' }}>{remaining}</span></>}
           <span>Проект</span><span style={{ color: '#e5e7eb' }}>{linkedProjectName || '—'}</span>
           <span>Вкладка</span><span style={{ color: '#e5e7eb' }}>{linkedTabName || '—'}</span>
@@ -268,6 +353,8 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
           {run.notificationStatus && isSource && <><span>Уведомление</span><span>{run.notificationStatus}</span></>}
         </div>
         {run.error && <div style={{ color: '#fca5a5', overflowWrap: 'anywhere' }}>{run.error}</div>}
+        {run.notificationError && <div style={{ color: '#fca5a5', overflowWrap: 'anywhere' }}>{run.notificationError}</div>}
+        {run.resultError && <div style={{ color: '#fca5a5', overflowWrap: 'anywhere' }}>{run.resultError}</div>}
         {actionError[run.runId] && <div style={{ color: '#fca5a5' }}>{actionError[run.runId]}</div>}
       </div>
     );
@@ -276,6 +363,11 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
   const renderTooltipActions = (run: OrchestrationRun) => {
     const isSource = run.sourceTabId === tabId;
     const canCancel = ACTIVE.has(run.status) && run.status !== 'waiting_recovery';
+    const presentation = runPresentation(run, tabId);
+    const canDismissAttention = presentation.icon === 'error'
+      && run.status !== 'waiting_recovery'
+      && Boolean(run.attentionRequiredAt)
+      && !attentionDismissedForTab(run, tabId);
     return (
       <div style={{ width: '100%', minWidth: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
         <span style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 5, color: '#f3f4f6', fontWeight: 600 }}>
@@ -287,6 +379,7 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
           {run.status === 'waiting_recovery' && actionButton(run, 'retry', 'Восстановить связь', <RotateCcw size={13} />, '#fbbf24')}
           {run.status === 'waiting_recovery' && actionButton(run, 'report', 'Передать ошибку родителю', <Send size={13} />, '#f87171')}
           {run.status === 'waiting_recovery' && actionButton(run, 'dismiss', 'Закрыть без сообщения', <X size={13} />, '#a3a3a3')}
+          {canDismissAttention && actionButton(run, 'dismiss-attention', 'Закрыть уведомление об ошибке', <X size={13} />, '#a3a3a3')}
         </span>
       </div>
     );
@@ -324,23 +417,73 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
           const isSource = run.sourceTabId === tabId;
           const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
           const linkedProjectName = isSource ? run.targetProjectName : run.sourceProjectName;
-          const color = statusColor(run.status);
+          const presentation = runPresentation(run, tabId);
+          const expanded = expandedRunIds.has(run.runId);
+          const canDismissAttention = presentation.icon === 'error'
+            && run.status !== 'waiting_recovery'
+            && Boolean(run.attentionRequiredAt)
+            && !attentionDismissedForTab(run, tabId);
+          const details = [
+            ['Ошибка', run.error],
+            ['Ошибка доставки', run.notificationError],
+            ['Результат', run.resultError],
+            ['Причина', run.completionReason],
+            ['Исход', run.outcome],
+          ].filter((item): item is [string, string] => Boolean(item[1]));
           return (
-            <button
-              key={run.runId}
-              type="button"
-              data-orchestration-run-id={run.runId}
-              onClick={() => void openLinkedTab(run)}
-              style={{ width: '100%', padding: '7px 9px', display: 'grid', gap: 3, border: 0, borderBottom: '1px solid #292929', background: 'transparent', color: '#d4d4d4', textAlign: 'left', cursor: 'pointer' }}
-            >
-              <span style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
-                <span style={{ color, display: 'grid', placeItems: 'center', flexShrink: 0 }}><StatusIcon status={run.status} /></span>
-                <span style={{ color: '#8f8f8f', display: 'grid', placeItems: 'center', flexShrink: 0 }}>{isSource ? <ArrowUpRight size={12} /> : <ArrowDownLeft size={12} />}</span>
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, fontWeight: 600 }}>{run.label || linkedTabName || 'Запрос'}</span>
-                <span style={{ marginLeft: 'auto', color, fontSize: 9, flexShrink: 0 }}>{STATUS_LABEL[run.status]}</span>
-              </span>
-              <span style={{ paddingLeft: 31, color: '#858585', fontSize: 9, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{linkedProjectName || '—'} · {linkedTabName || '—'} · {runTime(run.createdAt)}</span>
-            </button>
+            <div key={run.runId} data-orchestration-run-id={run.runId} style={{ borderBottom: '1px solid #292929', background: expanded ? '#191919' : 'transparent' }}>
+              <div style={{ minHeight: 44, padding: '0 6px 0 3px', display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto', alignItems: 'center', gap: 3 }}>
+                <button
+                  type="button"
+                  aria-expanded={expanded}
+                  onClick={() => setExpandedRunIds((current) => {
+                    const next = new Set(current);
+                    if (next.has(run.runId)) next.delete(run.runId);
+                    else next.add(run.runId);
+                    return next;
+                  })}
+                  style={{ minWidth: 0, alignSelf: 'stretch', padding: '5px 4px', display: 'grid', gridTemplateColumns: '14px 14px minmax(0, 1fr)', gridTemplateRows: 'auto auto', alignItems: 'center', columnGap: 5, border: 0, background: 'transparent', color: '#d4d4d4', textAlign: 'left', cursor: 'pointer' }}
+                >
+                  <span style={{ gridRow: '1 / 3', color: '#737373', display: 'grid', placeItems: 'center' }}>{expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
+                  <span style={{ color: presentation.color, display: 'grid', placeItems: 'center' }}><StatusIcon presentation={presentation} /></span>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, fontWeight: 600 }}>{run.label || linkedTabName || 'Запрос'}</span>
+                  <span style={{ color: '#8f8f8f', display: 'grid', placeItems: 'center' }}>{isSource ? <ArrowUpRight size={12} /> : <ArrowDownLeft size={12} />}</span>
+                  <span style={{ color: '#858585', fontSize: 9, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{linkedProjectName || '—'} · {linkedTabName || '—'} · {runTime(run.createdAt)}</span>
+                </button>
+                <span style={{ color: presentation.color, fontSize: 9, whiteSpace: 'nowrap' }}>{presentation.label}</span>
+                {canDismissAttention ? (
+                  <button
+                    type="button"
+                    aria-label="Закрыть уведомление об ошибке"
+                    title="Закрыть уведомление об ошибке"
+                    onClick={() => void runAction(run, 'dismiss-attention')}
+                    style={{ width: 23, height: 23, display: 'grid', placeItems: 'center', border: 0, borderRadius: 4, background: 'transparent', color: '#999', cursor: 'pointer' }}
+                  >
+                    <X size={13} />
+                  </button>
+                ) : <span style={{ width: 23 }} />}
+              </div>
+              {expanded && (
+                <div data-orchestration-run-details={run.runId} style={{ margin: '0 8px 8px 36px', padding: '7px 8px', display: 'grid', gridTemplateColumns: '62px minmax(0, 1fr)', gap: '4px 7px', borderLeft: `2px solid ${presentation.color}`, background: '#121212', color: '#919191', fontSize: 9, lineHeight: 1.35 }}>
+                  <span>Состояние</span><span style={{ color: presentation.color }}>{presentation.label}</span>
+                  {run.notificationStatus && isSource && <><span>Доставка</span><span>{run.notificationStatus}</span></>}
+                  {details.map(([label, value]) => (
+                    <div key={`${run.runId}-${label}`} style={{ display: 'contents' }}>
+                      <span>{label}</span>
+                      <span style={{ color: label === 'Ошибка' || label === 'Ошибка доставки' || label === 'Результат' ? '#fca5a5' : '#c7c7c7', overflowWrap: 'anywhere' }}>{value}</span>
+                    </div>
+                  ))}
+                  <span>runId</span><span style={{ color: '#aaa', fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.runId}</span>
+                  <span />
+                  <span style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
+                    <button type="button" title="Открыть связанную вкладку" aria-label="Открыть связанную вкладку" onClick={() => void openLinkedTab(run)} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: '1px solid #333', borderRadius: 4, background: '#191919', color: '#aaa', cursor: 'pointer' }}>
+                      {isSource ? <ArrowUpRight size={13} /> : <ArrowDownLeft size={13} />}
+                    </button>
+                  </span>
+                  {actionError[run.runId] && <><span>Действие</span><span style={{ color: '#fca5a5' }}>{actionError[run.runId]}</span></>}
+                </div>
+              )}
+            </div>
           );
         })}
       </div>
@@ -381,12 +524,17 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
       data-orchestration-status
       style={{ position: 'absolute', top: 2, right: rightOffset + 4, zIndex: 3, display: 'flex', alignItems: 'flex-start', gap: 4, pointerEvents: 'auto' }}
     >
-      {activeRuns.length > 0 && (
+      {statusRuns.length > 0 && (
         <div data-orchestration-active-list style={{ width: 178, maxHeight: 82, overflowY: 'auto', border: '1px solid #444', borderRadius: 5, background: '#171717', boxShadow: '0 2px 10px rgba(0,0,0,0.22)' }}>
-          {activeRuns.map((run, index) => {
+          {statusRuns.map((run, index) => {
             const isSource = run.sourceTabId === tabId;
             const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
-            const color = statusColor(run.status);
+            const presentation = runPresentation(run, tabId);
+            const canDismissAttention = presentation.icon === 'error'
+              && run.status !== 'waiting_recovery'
+              && Boolean(run.attentionRequiredAt)
+              && !attentionDismissedForTab(run, tabId);
+            const canDismissRecovery = run.status === 'waiting_recovery';
             return (
               <Tooltip
                 key={run.runId}
@@ -395,18 +543,34 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
                 side="bottom"
                 always
               >
-                <button
-                  type="button"
-                  data-orchestration-active-run={run.runId}
-                  onClick={() => void openLinkedTab(run)}
-                  aria-label={`Открыть ${linkedTabName || 'связанную вкладку'}`}
-                  style={{ width: '100%', height: 26, padding: '0 6px', display: 'flex', alignItems: 'center', gap: 5, border: 0, borderBottom: index < activeRuns.length - 1 ? '1px solid #303030' : 0, background: 'transparent', color, cursor: 'pointer', boxSizing: 'border-box' }}
-                >
-                  <StatusIcon status={run.status} />
-                  {isSource ? <ArrowUpRight size={12} strokeWidth={2.2} /> : <ArrowDownLeft size={12} strokeWidth={2.2} />}
-                  <span style={{ color: '#d4d4d4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left', fontSize: 10 }}>{linkedTabName || 'Запрос'}</span>
-                  {run.status === 'waiting_recovery' && countdown(run.recoveryDeadlineAt, now) && <span style={{ fontSize: 9, fontVariantNumeric: 'tabular-nums' }}>{countdown(run.recoveryDeadlineAt, now)}</span>}
-                </button>
+                <div data-orchestration-active-run={run.runId} style={{ width: '100%', height: 26, display: 'flex', alignItems: 'center', borderBottom: index < statusRuns.length - 1 ? '1px solid #303030' : 0, boxSizing: 'border-box' }}>
+                  <button
+                    type="button"
+                    onClick={() => void openLinkedTab(run)}
+                    aria-label={`Открыть ${linkedTabName || 'связанную вкладку'}`}
+                    style={{ minWidth: 0, height: '100%', padding: '0 4px 0 6px', display: 'flex', alignItems: 'center', gap: 5, flex: 1, border: 0, background: 'transparent', color: presentation.color, cursor: 'pointer' }}
+                  >
+                    <StatusIcon presentation={presentation} />
+                    {isSource ? <ArrowUpRight size={12} strokeWidth={2.2} /> : <ArrowDownLeft size={12} strokeWidth={2.2} />}
+                    <span style={{ color: '#d4d4d4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left', fontSize: 10 }}>{linkedTabName || 'Запрос'}</span>
+                    {run.status === 'waiting_recovery' && countdown(run.recoveryDeadlineAt, now) && <span style={{ fontSize: 9, fontVariantNumeric: 'tabular-nums' }}>{countdown(run.recoveryDeadlineAt, now)}</span>}
+                  </button>
+                  {(canDismissAttention || canDismissRecovery) && (
+                    <button
+                      type="button"
+                      data-orchestration-dismiss={run.runId}
+                      title={canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке'}
+                      aria-label={canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке'}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void runAction(run, canDismissRecovery ? 'dismiss' : 'dismiss-attention');
+                      }}
+                      style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', flexShrink: 0, border: 0, background: 'transparent', color: '#999', cursor: 'pointer' }}
+                    >
+                      <X size={13} />
+                    </button>
+                  )}
+                </div>
               </Tooltip>
             );
           })}

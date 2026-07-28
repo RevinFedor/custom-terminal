@@ -75,6 +75,9 @@ const {
   resolveNewAgentTabPlacement,
   resolveOrchestrationSendOptions,
 } = require('./orchestration-request-plan');
+const {
+  findTaskCompletionBlockers,
+} = require('./task-completion-intent');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 // Lazy-require the helpers (loaded fresh each call so missing module just
@@ -166,6 +169,7 @@ let answerClaudeQuestion = null;
 let getClaudePendingQuestion = null;
 let transcriptService = null;
 let getAgentTurnResult = null;
+let registerTaskCompletionIntent = null;
 // Main owns the agent startup/readiness state. The renderer bridge remains a
 // compatibility fallback for isolated module use, but live Project API waits
 // must not depend on a renderer projection arriving before the main-owned wake.
@@ -1709,7 +1713,7 @@ async function reconcileActiveOrchestrations() {
   await scheduleOrchestrationPolicyTimer();
 }
 
-async function performOrchestrationAction(runId, action) {
+async function performOrchestrationAction(runId, action, options = {}) {
   const store = getOrchestrationRunStore();
   const current = await store.get(runId);
   if (!current) return { ok: false, statusCode: 404, error: 'run not found' };
@@ -1757,6 +1761,19 @@ async function performOrchestrationAction(runId, action) {
     await finalizeSettledOrchestrations(resolved.settled, 'recovery-dismissed');
     void scheduleOrchestrationPolicyTimer();
     return { ok: true, run: withOrchestrationUrls(run) };
+  }
+
+  if (action === 'dismiss-attention') {
+    const tabId = cleanOptionalString(options.tabId, '');
+    if (!tabId) return { ok: false, error: 'tabId required', run: withOrchestrationUrls(current) };
+    const dismissed = await store.dismissAttention(runId, tabId);
+    if (!dismissed?.dismissed) {
+      return { ok: false, error: 'run does not belong to this tab', run: withOrchestrationUrls(dismissed?.run) };
+    }
+    emitOrchestrationChanges(dismissed.changed, 'attention-dismissed');
+    await finalizeSettledOrchestrations(dismissed.settled, 'attention-dismissed');
+    void scheduleOrchestrationPolicyTimer();
+    return { ok: true, run: withOrchestrationUrls(dismissed.run) };
   }
 
   if (action === 'retry') {
@@ -2744,7 +2761,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const runId = decId(orchestrationActionMatch[1]);
     const body = await readBody(req);
     const action = cleanOptionalString(body.action, '');
-    const result = await performOrchestrationAction(runId, action);
+    const result = await performOrchestrationAction(runId, action, {
+      tabId: cleanOptionalString(body.tabId, ''),
+    });
     return sendJson(res, result?.ok === false ? (result.statusCode || 409) : 200, result);
   }
 
@@ -4377,6 +4396,44 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
   }
 
+  // Explicit task completion is scoped to the caller's current live turn. It
+  // does not finish a run by itself; main attaches the intent to the matching
+  // authoritative turn-end edge, where Loop can consume it exactly once.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/complete-task$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    const body = await readBody(req);
+    const sourceTabId = cleanOptionalString(body?.sourceMeta?.tabId, '') || tabId;
+    if (sourceTabId !== tabId) {
+      return sendJson(res, 403, { ok: false, code: 'source_tab_mismatch' });
+    }
+    if (typeof registerTaskCompletionIntent !== 'function') {
+      return sendJson(res, 503, { ok: false, code: 'completion_registry_unavailable' });
+    }
+
+    const blockers = findTaskCompletionBlockers(
+      await getOrchestrationRunStore().listActive(),
+      tabId,
+    );
+    if (blockers.length > 0) {
+      return sendJson(res, 409, {
+        ok: false,
+        code: 'active_child_delegations',
+        blockers,
+      });
+    }
+
+    const result = registerTaskCompletionIntent({ tabId, sourceTabId });
+    if (result?.ok !== true) {
+      return sendJson(res, 409, { ok: false, code: result?.code || 'completion_rejected' });
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      idempotent: result.idempotent === true,
+      turn: result.turn,
+    });
+  }
+
   // Timeline entries for a tab (any tab — SDK or terminal — as long as it has
   // a Claude session). Goes through bridgeRequest → renderer reads tab.cwd +
   // claudeSessionId from the live store, then we call the IPC directly here.
@@ -5219,6 +5276,7 @@ function start({
   resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn,
   getAgentTurnResult: getAgentTurnResultFn,
   readAgentStartReadiness: readAgentStartReadinessFn,
+  registerTaskCompletionIntent: registerTaskCompletionIntentFn,
 }) {
   if (httpServer) {
     console.log('[WebServer] already started');
@@ -5233,6 +5291,7 @@ function start({
   resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
   getAgentTurnResult = getAgentTurnResultFn || null;
   readAgentStartReadiness = readAgentStartReadinessFn || null;
+  registerTaskCompletionIntent = registerTaskCompletionIntentFn || null;
   token = loadOrCreateToken();
   registerBridgeReplyHandler();
   void getOrchestrationRunStore().initialize()
@@ -5313,6 +5372,7 @@ function stop() {
   resolveCodexRuntimeSessionInfo = null;
   getAgentTurnResult = null;
   readAgentStartReadiness = null;
+  registerTaskCompletionIntent = null;
   subscribers.clear();
 }
 

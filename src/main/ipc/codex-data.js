@@ -1065,9 +1065,20 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
   if (qualifiedName === 'wait') {
     return [{ toolName: 'Wait', args: { summary: input.cell_id ? `Task ${input.cell_id}` : 'Background task' } }];
   }
-  // In-process subagents (live stream path — the durable parser intercepts
-  // these earlier and builds full Task cards). Never surface the v2 encrypted
-  // message; task_name/agent_type are the readable identity.
+  // In-process subagents. The durable parser builds full Task cards; the LIVE
+  // stream reaches this same decoder, and its shape decides whether the agent
+  // is visible as background work at all.
+  //
+  // A live spawn must therefore emit the SAME `tool: 'Task'` card shape the
+  // durable side uses — the background-chip strip recognises subagents by that
+  // shape alone. Emitting a generic `Subagent` tool row rendered a plausible
+  // card but was invisible to the strip: E2E ct-e2e24 showed a `default` agent
+  // running 41s with three recomputes inside its lifetime and `count=0` in all
+  // of them, while the log said `projected=Subagent`. Explorer only "worked"
+  // earlier because its durable reload happened to land inside the window.
+  //
+  // Never surface the v2 encrypted message; task_name/agent_type are the
+  // readable identity.
   if (namespace === 'multi_agent_v1' || namespace === 'collaboration') {
     if (qualifiedName === 'spawn_agent') {
       const label = String(input.task_name || '').trim()
@@ -1075,7 +1086,12 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
           ? String(input.message).slice(0, 60)
           : 'Subagent');
       const agentType = String(input.agent_type || '').trim();
-      return [{ toolName: 'Subagent', args: { summary: agentType ? label + ' (' + agentType + ')' : label } }];
+      const description = agentType ? label + ' (' + agentType + ')' : label;
+      // `running` is the live truth: a spawn that was rejected or already
+      // finished is re-projected by the durable parser, which wins by source
+      // identity and carries the terminal status.
+      // toolUseId is stamped by the caller, which owns the call identity.
+      return [{ tool: 'Task', description, subagentStatus: 'running' }];
     }
     if (qualifiedName === 'wait_agent') {
       return [{ toolName: 'Wait', args: { summary: 'Waiting for subagents' } }];
@@ -1137,17 +1153,30 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
 
   const cellId = call?.toolName === 'exec' ? codexHistoryCellId(rawOutput) : null;
   if (!cellId) assignCodexHistoryResults(callGroups, rawOutput, isError);
-  const actions = callGroups.flat().map((action, index) => ({
-    tool: '__raw__',
-    rawTool: {
-      ...(callId ? { toolUseId: `${callId}:canonical:${index}` } : {}),
-      toolName: action.toolName,
-      args: action.args || {},
-      result: action.result,
-      isError: action.isError,
-      diffHunks: action.diffHunks,
-    },
-  }));
+  const actions = callGroups.flat().map((action, index) => {
+    // A subagent card is already in its final shape — wrapping it as a raw
+    // tool row would hide it from the background-chip strip, which recognises
+    // subagents by `tool: 'Task'` alone (E2E ct-e2e24: live spawns projected
+    // as generic tool rows never produced a chip).
+    if (action?.tool === 'Task') {
+      return {
+        ...action,
+        ...(callId && !action.toolUseId ? { toolUseId: String(callId) } : {}),
+        ...(action.result === undefined ? {} : { result: action.result }),
+      };
+    }
+    return {
+      tool: '__raw__',
+      rawTool: {
+        ...(callId ? { toolUseId: `${callId}:canonical:${index}` } : {}),
+        toolName: action.toolName,
+        args: action.args || {},
+        result: action.result,
+        isError: action.isError,
+        diffHunks: action.diffHunks,
+      },
+    };
+  });
   return { actions, cellId };
 }
 

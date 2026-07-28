@@ -120,6 +120,10 @@ if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
 // Load modules from src/main (works for both dev and production)
 const srcMainDir = path.join(__dirname, '..', '..', 'src', 'main');
 const srcSharedDir = path.join(__dirname, '..', '..', 'src', 'shared');
+const {
+  TaskCompletionIntentRegistry,
+} = require(path.join(srcMainDir, 'task-completion-intent'));
+const taskCompletionIntents = new TaskCompletionIntentRegistry();
 const { createXtermWritePump } = require(path.join(srcSharedDir, 'xterm-write-pump.cjs'));
 const {
   prebindClaudeHookPid,
@@ -5693,6 +5697,16 @@ const CLAUDE_HOOK_DISCOVERY_FILE = path.join(CLAUDE_HOOK_DISCOVERY_DIR, 'claude-
 // all users this can be removed.
 const CLAUDE_HOOK_SOCK_LEGACY = '/tmp/noted-terminal-claude-hook.sock';
 const claudeTurnBusy = new Map(); // tabId → boolean (true = turn in flight)
+
+function registerTaskCompletionIntent({ tabId, sourceTabId = null } = {}) {
+  const current = taskCompletionIntents.getTurn(tabId);
+  if (!current) return { ok: false, code: 'no_active_turn' };
+  const liveBusy = current.provider === 'codex'
+    ? codexTurnWatchers.get(tabId)?.busy === true
+    : claudeTurnBusy.get(tabId) === true;
+  if (!liveBusy) return { ok: false, code: 'no_active_turn' };
+  return taskCompletionIntents.requestCompletion({ tabId, sourceTabId });
+}
 const claudeTurnWatchdog = new Map(); // tabId → timeout ID (silent-tool-stop safety)
 const CLAUDE_TURN_WATCHDOG_MS = 60 * 60 * 1000; // 60min — safety net against silent-tool-stop (#29881) and hook-script crashes; only fires when Stop legitimately never arrives
 const CLAUDE_TURN_WATCHDOG_EXTENSION_MS = 15 * 60 * 1000;
@@ -5747,6 +5761,7 @@ function scheduleClaudeTurnWatchdog(tabId, sessionId, delayMs = CLAUDE_TURN_WATC
     claudeTurnBusy.set(tabId, false);
     claudeSpinnerBusy.set(tabId, false);
     claudeSpinnerLastSeenAt.delete(tabId);
+    taskCompletionIntents.abortTurn(tabId);
     recordActivity(tabId, false, 'claude');
     if (mainWindow && !mainWindow.isDestroyed()) {
       // Stop never arrived within the watchdog window and no fresh Claude-side
@@ -6464,6 +6479,7 @@ function startInterruptWatcher(tabId, sessionId) {
           console.warn('[ClaudeInterrupt:JSONL] tab=' + tabId.slice(-12) + ' interruption record found in transcript — forcing busy=false (' + hit.text + ')');
           claudeTurnBusy.set(tabId, false);
           claudeSpinnerBusy.set(tabId, false);
+          taskCompletionIntents.abortTurn(tabId);
           clearTimeout(claudeTurnWatchdog.get(tabId));
           claudeTurnWatchdog.delete(tabId);
           recordActivity(tabId, false, 'claude');
@@ -6561,6 +6577,7 @@ function armInterruptIdleProbe(tabId) {
     console.warn('[ClaudeInterrupt:Idle] tab=' + tabId.slice(-12) + ' Esc/Ctrl+C без JSONL-записей за ' + ageMs + 'ms — forcing busy=false');
     claudeTurnBusy.set(tabId, false);
     claudeSpinnerBusy.set(tabId, false);
+    taskCompletionIntents.abortTurn(tabId);
     clearTimeout(claudeTurnWatchdog.get(tabId));
     claudeTurnWatchdog.delete(tabId);
     recordActivity(tabId, false, 'claude');
@@ -6725,7 +6742,8 @@ function startClaudeHookServer() {
             + ' source=launch-pid-before-session');
         }
 
-        claudeHookLastEvent.set(tabId, { event, ts: Date.now(), sessionId: session_id });
+        const hookEventTs = Date.now();
+        claudeHookLastEvent.set(tabId, { event, ts: hookEventTs, sessionId: session_id });
 
         // ── Awaiting-user-input: AskUserQuestion brackets ──
         // PreToolUse(AskUserQuestion) fires the instant Claude blocks on its
@@ -6926,6 +6944,35 @@ function startClaudeHookServer() {
         const busy = event === 'UserPromptSubmit';
         const prev = claudeTurnBusy.get(tabId);
         claudeTurnBusy.set(tabId, busy);
+        const taskTurn = busy
+          ? taskCompletionIntents.beginTurn({
+              tabId,
+              provider: 'claude',
+              sessionId: session_id,
+            })
+          : taskCompletionIntents.finishTurn({
+              tabId,
+              provider: 'claude',
+              sessionId: session_id,
+              success: event === 'Stop',
+            });
+        const taskTurnId = taskTurn?.turn
+          ? 'claude:' + taskTurn.turn.generation
+          : (taskTurn?.generation ? 'claude:' + taskTurn.generation : null);
+        const taskCompletionMeta = !busy && taskTurn?.explicitTaskComplete === true
+          ? {
+              explicitTaskComplete: true,
+              taskCompletionIntentId: taskTurn.taskCompletionIntentId,
+              taskCompletionRequestedAt: taskTurn.taskCompletionRequestedAt,
+            }
+          : {};
+        claudeHookLastEvent.set(tabId, {
+          event,
+          ts: hookEventTs,
+          sessionId: session_id,
+          turnId: taskTurnId,
+          ...taskCompletionMeta,
+        });
         if (busy) {
           // Do not let a spinner frame from the previous turn count as fresh
           // liveness when this turn's watchdog eventually checks the tab.
@@ -6971,7 +7018,14 @@ function startClaudeHookServer() {
           // workflow consumers. A spinner heuristic may already have written the
           // same boolean into claudeSpinnerBusy; suppressing this event by value
           // would hide the real Stop/StopFailure outcome from PromptQueueRunner.
-          mainWindow.webContents.send('claude:busy-state', { tabId, busy, reason: lifecycleReason });
+          mainWindow.webContents.send('claude:busy-state', {
+            tabId,
+            busy,
+            reason: lifecycleReason,
+            turnId: taskTurnId,
+            outcomeTs: busy ? null : hookEventTs,
+            ...taskCompletionMeta,
+          });
         }
         // Mirror busy-state to any mobile-web subscribers of this PTY+Claude
         // tab — otherwise phone composer never learns Claude is processing
@@ -7023,6 +7077,8 @@ function startClaudeHookServer() {
             busy,
             success: event !== 'StopFailure',
             lastAssistantMessage: last_assistant_message || null,
+            turnId: taskTurnId,
+            ...taskCompletionMeta,
           });
         }
       }
@@ -11240,6 +11296,7 @@ app.whenReady().then(async () => {
       }),
       getAgentTurnResult: _getAgentTurnResultForOrchestration,
       readAgentStartReadiness: readMainAgentStartReadinessForTab,
+      registerTaskCompletionIntent,
     });
     console.log('[Startup] Mobile WebServer OK');
 
@@ -11278,7 +11335,9 @@ app.whenReady().then(async () => {
     });
     ipcMain.handle('orchestration:action', async (_event, payload = {}) => {
       if (!payload.runId || !payload.action) return { ok: false, error: 'runId+action required' };
-      return webServer.performOrchestrationAction(payload.runId, payload.action);
+      return webServer.performOrchestrationAction(payload.runId, payload.action, {
+        tabId: payload.tabId || '',
+      });
     });
     ipcMain.handle('orchestration:tab-closed', async (_event, payload = {}) => {
       if (!payload.tabId) return { ok: false, error: 'tabId required' };
@@ -12634,8 +12693,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 	      clearBridgeTab(tabId);
 	      clearCodexKnownSession(tabId, 'pty-exit');
       clearCodexTuiReady(tabId, 'pty-exit');
-      clearCodexStartupAutoEnter(tabId, 'pty-exit');
-      clearTimeout(geminiSpinnerIdleTimers.get(tabId));
+	      clearCodexStartupAutoEnter(tabId, 'pty-exit');
+	      taskCompletionIntents.abortTurn(tabId);
+	      clearTimeout(geminiSpinnerIdleTimers.get(tabId));
       geminiSpinnerBusy.delete(tabId);
       geminiSpinnerIdleTimers.delete(tabId);
       geminiActiveTabs.delete(tabId);
@@ -23105,6 +23165,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
       stopClaudeLocalCommandWatcher(tabId, stopReason);
       claudeSpinnerBusy.set(tabId, false);
       claudeTurnBusy.set(tabId, false);
+      taskCompletionIntents.abortTurn(tabId);
       claudeHookLastEvent.set(tabId, {
         event: 'ManualStopNoProcess',
         ts: Date.now(),
@@ -23191,6 +23252,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
     const wasBusy = claudeSpinnerBusy.get(tabId) === true || claudeTurnBusy.get(tabId) === true || wasLocalBusy;
     claudeSpinnerBusy.set(tabId, false);
     claudeTurnBusy.set(tabId, false);
+    taskCompletionIntents.abortTurn(tabId);
     claudeHookLastEvent.set(tabId, {
       event: 'ManualStop',
       ts: Date.now(),
@@ -25474,6 +25536,29 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
       hasFinalResult: false,
     }, outcomeDetails?.timestamp, outcomeDetails?.turnId || state.currentTurnId);
   }
+  const exactTurnId = outcomeDetails?.turnId || state?.currentTurnId || null;
+  const taskTurn = busy
+    ? taskCompletionIntents.beginTurn({
+        tabId,
+        provider: 'codex',
+        sessionId: state?.sessionId || null,
+        turnId: exactTurnId,
+        reuseExactTurn: true,
+      })
+    : taskCompletionIntents.finishTurn({
+        tabId,
+        provider: 'codex',
+        sessionId: state?.sessionId || null,
+        turnId: exactTurnId,
+        success: reason === 'task_complete' && outcomeDetails?.outcome?.hasFinalResult === true,
+      });
+  const taskCompletionMeta = !busy && taskTurn?.explicitTaskComplete === true
+    ? {
+        explicitTaskComplete: true,
+        taskCompletionIntentId: taskTurn.taskCompletionIntentId,
+        taskCompletionRequestedAt: taskTurn.taskCompletionRequestedAt,
+      }
+    : {};
   console.log('[CodexTurn] busy tab=' + String(tabId).slice(-12) + ' busy=' + busy + ' reason=' + reason);
   if (busy) {
     clearCodexMcpStartupWatchdog(tabId, 'turn-busy:' + (reason || 'busy'));
@@ -25494,12 +25579,13 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
       tabId,
       busy,
       reason,
-      turnId: outcomeDetails?.turnId || state?.currentTurnId || null,
+      turnId: exactTurnId,
       outcomeTs: Number.isFinite(state?.lastOutcomeTs)
         ? state.lastOutcomeTs
         : (!busy && outcomeDetails?.allowTimestampFallback !== false
           ? codexOutcomeTimestampMs(outcomeDetails?.timestamp)
           : null),
+      ...taskCompletionMeta,
     });
   }
   const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
@@ -26388,6 +26474,11 @@ function decodeCodexLiveToolActions(call, output, isError) {
   if (typeof decode !== 'function') return { actions: [], cellId: null };
   const decoded = decode(call, output, isError) || {};
   const actions = (decoded.actions || []).map((action) => {
+    // Subagent cards keep their own shape end-to-end: the background-chip
+    // strip recognises them by `tool: 'Task'`, and flattening them into a
+    // generic tool row makes a running agent invisible as background work
+    // (E2E ct-e2e24 — a 41s agent with zero chips).
+    if (action?.tool === 'Task') return action;
     const raw = action?.tool === '__raw__' ? action.rawTool : action;
     return {
       toolName: raw?.toolName || raw?.name || raw?.tool || 'Tool',
@@ -26497,11 +26588,14 @@ function buildCodexLiveRawMessage(state, record) {
     }
 
     const decoded = decodeCodexLiveToolActions(call, undefined, false);
-    const projected = decoded.actions.map((action, index) => ({
-      id: `${callId}:canonical:${index}`,
-      toolName: action.toolName,
-      args: action.args,
-    }));
+    const projected = decoded.actions.map((action, index) => (
+      // Carry the subagent card through unchanged; only its identity is
+      // stamped here. Reducing it to {toolName,args} would strip the shape
+      // the background-chip strip looks for.
+      action?.tool === 'Task'
+        ? { id: `${callId}:canonical:${index}`, subagentCard: action, toolName: 'Subagent' }
+        : { id: `${callId}:canonical:${index}`, toolName: action.toolName, args: action.args }
+    ));
     if (projected.length === 0) {
       console.warn('[CodexTurn:ToolProjection]' +
         ' tab=' + String(state.tabId).slice(-12) +
@@ -26530,6 +26624,10 @@ function buildCodexLiveRawMessage(state, record) {
           id: item.id,
           name: item.toolName,
           input: item.args,
+          // Subagent spawns travel with their card so the renderer rebuilds a
+          // Task row instead of a generic tool row — that shape is what makes
+          // a running agent visible in the background-chip strip.
+          ...(item.subagentCard ? { subagentCard: item.subagentCard } : {}),
         })),
       },
     };

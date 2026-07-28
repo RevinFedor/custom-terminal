@@ -54,6 +54,11 @@ import {
   setHistoryReadingAnchor,
 } from '../../utils/historyReadingAnchor';
 import {
+  saveHistoryMeasuredLayout,
+  getHistoryMeasuredLayout,
+  dropHistoryMeasuredLayout,
+} from '../../utils/historyMeasuredLayout';
+import {
   shouldCaptureDelayedCodexRewindPrefix,
   shouldClearRewindPreviewForOwnerTransition,
   type CodexWriterTransitionEvent,
@@ -375,6 +380,8 @@ interface HistoryLiveToolResult {
 }
 
 const EMPTY_HISTORY_LIVE_TOOL_RESULTS = new Map<string, HistoryLiveToolResult>();
+// Stable identity so a "no live rows" render never invalidates chip memos.
+const EMPTY_HISTORY_ENTRIES: FullHistoryEntry[] = [];
 
 const LOCAL_PROMPT_PREFIX = 'local-prompt-';
 const LOCAL_REWIND_PREFIX = 'local-rewind-';
@@ -3330,6 +3337,7 @@ function AgentHistoryControls({
   const draftChips = useUIStore(useCallback((s) => s.historyPromptDraftChips[tabId] || EMPTY_HISTORY_DRAFT_CHIPS, [tabId]));
   const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
   const setHistoryComposerAvailability = useUIStore((s) => s.setHistoryComposerAvailability);
+  const setPromptQueueInputSurface = useUIStore((s) => s.setPromptQueueInputSurface);
   const removeHistoryPromptDraftChip = useUIStore((s) => s.removeHistoryPromptDraftChip);
   const setPrompt = useCallback((
     next: string | ((prev: string) => string),
@@ -5900,6 +5908,7 @@ function AgentHistoryControls({
                   wordBreak: 'break-word',
                 }}
                 onFocus={(e) => {
+                  setPromptQueueInputSurface(tabId, 'history');
                   promptCaretRef.current = {
                     start: e.currentTarget.selectionStart ?? 0,
                     end: e.currentTarget.selectionEnd ?? 0,
@@ -6332,9 +6341,26 @@ function HistoryPanel({
   const agentProcessAlive = agentProcessStatus === 'active'
     || agentProcessStatus === 'busy'
     || agentProcessStatus === 'starting';
+  // Chips must see the SAME rows the transcript shows, durable + live. A Codex
+  // subagent is durable only after the rollout is re-read, but its spawn is
+  // already on screen through the live stream — computing chips from durable
+  // rows alone meant a short-lived agent was never a chip at all (E2E ct-e2e22:
+  // three agents, each alive ~2s, zero chips, while every durable recompute
+  // landed in the gaps between them). Live rows carry the same Task-card shape,
+  // so the collector needs no special case; the durable row wins later by
+  // source identity exactly as it does in the transcript.
+  const chipLiveEntries = liveProjectionRef.current.ownerKey === historyOwnerKey
+    ? liveEntries
+    : EMPTY_HISTORY_ENTRIES;
+  const chipSourceEntries = useMemo(
+    () => (chipLiveEntries.length === 0
+      ? entries
+      : buildHistoryLivePresentation(entries, chipLiveEntries) as FullHistoryEntry[]),
+    [entries, chipLiveEntries],
+  );
   const backgroundHistoryChips = useMemo(
-    () => collectHistoryBackgroundChips(entries, isTurnBusy, agentProcessAlive, sessionId || ''),
-    [entries, isTurnBusy, agentProcessAlive, sessionId],
+    () => collectHistoryBackgroundChips(chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId || ''),
+    [chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId],
   );
   const liveBackgroundUuids = useMemo(
     () => new Set(backgroundHistoryChips.map((chip) => chip.entryUuid)),
@@ -6479,6 +6505,25 @@ function HistoryPanel({
     ? { index: pendingInitialHistoryIndex, align: 'center' as const, behavior: 'auto' as const }
     : initialAnchorLocation
       ?? (displayEntries.length > 0 ? displayEntries.length - 1 : 0);
+  // Measured geometry of THIS owner from its previous visit, resolved once per
+  // owner (the list is keyed by owner, so it is read exactly at mount). An
+  // explicit Timeline jump owns the position and must not be overridden by a
+  // stored scroll offset.
+  const restoredMeasuredLayout = useMemo(() => {
+    if (pendingInitialHistoryIndex >= 0) return null;
+    if (displayEntries.length === 0) return null;
+    const layout = getHistoryMeasuredLayout(historyOwnerKey, displayEntries.length);
+    if (layout) {
+      historyDiag('LAYOUT_RESTORE tab=' + tabId.slice(-12)
+        + ' owner=' + historyOwnerDigest(historyOwnerKey)
+        + ' ranges=' + layout.ranges.length
+        + ' scrollTop=' + Math.round(layout.scrollTop));
+    }
+    return layout;
+    // Deliberately owner-scoped: re-reading on every entries change would swap
+    // Virtuoso's restore prop mid-life and re-anchor the list under the user.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyOwnerKey]);
   const rewindPreviewHiddenCount = rewindPreviewResult.hiddenCount;
   // Last entry uuid Claude's own backtrace reaches before stopping at the first
   // orphan. Any entry at index <= boundary is part of the chain-break zone:
@@ -7879,6 +7924,11 @@ function HistoryPanel({
         message?: string;
       };
       if (detail.tabId !== tabId) return;
+      // A rewind rewrites the branch: stored row sizes describe a list that no
+      // longer exists, and restoring them would place the viewport by geometry
+      // from a different history. Cheap to drop — the next visit just measures
+      // again.
+      dropHistoryMeasuredLayout(historyOwnerKey);
       const durableDone = detail.status === 'done' && (
         detail.persisted === true ||
         detail.mode === 'ai' ||
@@ -7912,7 +7962,7 @@ function HistoryPanel({
     };
     window.addEventListener('history-panel:rewind-log', handler);
     return () => window.removeEventListener('history-panel:rewind-log', handler);
-  }, [tabId, upsertLocalRewindEntry, waitForDurableRewindHistory]);
+  }, [tabId, historyOwnerKey, upsertLocalRewindEntry, waitForDurableRewindHistory]);
 
   // Broadcast loading state to InfoPanel button
   useEffect(() => {
@@ -8201,6 +8251,15 @@ function HistoryPanel({
     return () => {
       viewportPaintProbeRef.current?.cancel(viewportPaintOwner);
       surfacePresentedProbeRef.current?.cancel(viewportPaintOwner);
+      // Geometry is captured continuously while the owner is alive (see the
+      // sampling effect below), NOT here. `getState` resolves through
+      // Virtuoso's own reactive graph: by the time this cleanup runs the list
+      // for this owner is already unmounting, the graph has no live publisher
+      // left, and the callback simply never fires — measured live (e2e17) as
+      // 20 cleanups producing zero LAYOUT_SAVE lines while the same boot
+      // logged 21 other new-instrumentation lines, i.e. the code shipped and
+      // the call was silently dropped. Teardown is the wrong moment to ask a
+      // dying component anything.
       persistVolatileOverlay(
         historySnapshotOwner,
         presentationEntriesRef.current,
@@ -8255,6 +8314,75 @@ function HistoryPanel({
       return;
     }
     initialLoadDoneRef.current = true;
+    if (restoredMeasuredLayout) {
+      // Virtuoso was handed real measured sizes plus this owner's scroll
+      // offset, so the list is already where the user left it. Running the
+      // anchor loop on top would be two mechanisms steering one viewport —
+      // exactly the fight this whole area keeps producing. Verify instead of
+      // re-position: report the residual drift so a bad restore is visible in
+      // the log rather than silently "fine".
+      // Wait for the anchor row to actually exist before measuring. A single
+      // rAF fires before Virtuoso has mounted rows from the restored geometry,
+      // so the row lookup missed and every drift reading came back `na` — a
+      // verification that never verifies (e2e18: 20/20 na). Poll a few frames,
+      // then report honestly whether the row was reachable at all.
+      const driftOwner = historyOwnerKey;
+      const driftGeneration = historyOwnerGenerationRef.current;
+      let driftFrames = 0;
+      let stableTop: number | null = null;
+      let stableFrames = 0;
+      const MAX_DRIFT_FRAMES = 30;
+      const measureDrift = () => {
+        if (
+          historyOwnerKeyRef.current !== driftOwner
+          || historyOwnerGenerationRef.current !== driftGeneration
+        ) return;
+        driftFrames += 1;
+        const scroller = virtuosoScrollerRef.current;
+        const anchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
+        const node = scroller && anchor
+          ? scroller.querySelector(
+            `[data-uuid="${CSS.escape(anchor.uuid)}"]`,
+          ) as HTMLElement | null
+          : null;
+        if (!node && driftFrames < MAX_DRIFT_FRAMES) {
+          requestAnimationFrame(measureDrift);
+          return;
+        }
+        // The row EXISTING is not the row having SETTLED. Virtuoso mounts rows
+        // and keeps adjusting scrollTop for a few frames while it applies the
+        // restored geometry; sampling at first sight caught that motion and
+        // reported it as restore error — e2e19 read 340px and 107px at frames
+        // 3 and 7, while every reading that waited to frame 5+ was 0-2px. The
+        // measurement must wait for the position to stop moving, otherwise it
+        // measures its own impatience. Two identical frames = settled.
+        if (node && driftFrames < MAX_DRIFT_FRAMES) {
+          const top = node.getBoundingClientRect().top;
+          if (stableTop !== null && Math.abs(top - stableTop) <= 1) stableFrames += 1;
+          else stableFrames = 0;
+          stableTop = top;
+          if (stableFrames < 2) {
+            requestAnimationFrame(measureDrift);
+            return;
+          }
+        }
+        let driftPx: number | string = 'row-not-mounted';
+        if (node && scroller && anchor) {
+          driftPx = Math.round(
+            node.getBoundingClientRect().top
+            - (scroller.getBoundingClientRect().top - anchor.offsetPx),
+          );
+        } else if (!anchor) {
+          driftPx = 'no-anchor';
+        }
+        historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12)
+          + ' mode=measured-layout attempts=0'
+          + ' driftPx=' + driftPx
+          + ' frames=' + driftFrames);
+      };
+      requestAnimationFrame(measureDrift);
+      return;
+    }
     // Position ownership, identical for every restore mode: the tab we started
     // for must still be the one on screen, and no newer restore or real user
     // wheel/touch may have taken over (the gesture always wins).
@@ -8407,7 +8535,7 @@ function HistoryPanel({
     }
     // `entries` in deps: on a cold owner this effect must re-run when the
     // first projection lands (surfaceLoading flips earlier than rows exist).
-  }, [surfaceLoading, tabId, historyOwnerKey, entries]);
+  }, [surfaceLoading, tabId, historyOwnerKey, entries, restoredMeasuredLayout]);
 
   // Codex already exposes a canonical incremental transcript for web/SSE.
   // Project that same stream into desktop History while the turn is busy,
@@ -8924,6 +9052,30 @@ function HistoryPanel({
           + ' offset=' + anchor.offsetPx
           + ' followBottom=' + (anchor.followBottom ? '1' : '0'));
       }
+      // Deferral state of what is on screen NOW. The presentation-time count
+      // only describes the first frame of the owner, so scrolling to a diff
+      // card produced no evidence that deferral engaged (e2e18 read
+      // deferredDiffRows=0 with a diff card plainly visible and concluded the
+      // feature was broken — it was the probe that was blind, not the feature).
+      const deferRowsNow = el.querySelectorAll('.cb-diff-defer').length;
+      if (deferRowsNow > 0) {
+        historyDiag('DEFER_LIVE tab=' + tabId.slice(-12)
+          + ' rows=' + deferRowsNow
+          + ' range=' + visibleRangeRef.current.start + '-' + visibleRangeRef.current.end);
+      }
+      // Sample the MEASURED geometry on the same scroll-idle tick. The list is
+      // alive here, so Virtuoso's reactive graph can actually answer — unlike
+      // at owner teardown, where the request is dropped silently. Scroll-idle
+      // is also the moment the geometry is most complete: whatever the user
+      // just scrolled past has been measured for real.
+      const layoutKey = historyOwnerKeyRef.current;
+      const layoutItems = lengthRef.current;
+      try {
+        virtuosoRef.current?.getState((snapshot) => {
+          if (historyOwnerKeyRef.current !== layoutKey) return; // owner moved on
+          saveHistoryMeasuredLayout(layoutKey, snapshot as any, layoutItems);
+        });
+      } catch { /* geometry is optional; never break position saving */ }
     }, 150);
   }, [clearHistoryToolScrollFocus, tabId, setHistoryScrollPosition]);
 
@@ -9393,6 +9545,12 @@ function HistoryPanel({
                     // deferral actually engaged — its absence is how a
                     // threshold bug (per-hunk instead of per-card) survived a
                     // full run unnoticed.
+                    // Counted at presentation time, i.e. the first painted
+                    // frame of THIS owner. It says whether deferral is active
+                    // for what is on screen right now — not whether the
+                    // session contains deferrable diffs at all. Scrolling to a
+                    // diff later does not retroactively change this line; the
+                    // live count is published separately on scroll idle.
                     const deferredDiffRows = virtuosoScrollerRef.current
                       ?.querySelectorAll('.cb-diff-defer').length || 0;
                     const loaderHiddenAt = loaderHiddenAtRef.current;
@@ -9415,6 +9573,27 @@ function HistoryPanel({
                       foreignDomRows: Math.max(0, allDomRows - domRows),
                       cache: cacheAtRange,
                     });
+                    // Baseline geometry sample. Scroll-idle sampling covers a
+                    // user who actually reads; a visit that is only opened and
+                    // left (or switched away from within the debounce window)
+                    // would otherwise store nothing and pay the full anchor
+                    // hunt on the next return.
+                    const layoutItems = lengthRef.current;
+                    try {
+                      virtuosoRef.current?.getState((snapshot) => {
+                        if (historyOwnerKeyRef.current !== ownerAtRange) return;
+                        const saved = saveHistoryMeasuredLayout(
+                          ownerAtRange, snapshot as any, layoutItems,
+                        );
+                        if (saved) {
+                          historyDiag('LAYOUT_SAVE tab=' + tabId.slice(-12)
+                            + ' owner=' + historyOwnerDigest(ownerAtRange)
+                            + ' ranges=' + ((snapshot as any)?.ranges?.length ?? 0)
+                            + ' items=' + layoutItems
+                            + ' at=presented');
+                        }
+                      });
+                    } catch { /* geometry is optional */ }
                   },
                 );
               }
@@ -9426,10 +9605,15 @@ function HistoryPanel({
             // returns, so flash highlights and Cmd+F still include the same
             // neighborhood as before.
             increaseViewportBy={historyViewportBuffer}
-            // Start at the requested Timeline target when Cmd+click opened the
-            // panel; otherwise start at the tail, matching the usual History
-            // open behavior for long sessions.
-            initialTopMostItemIndex={initialTopMostItemIndex}
+            // Measured geometry from the previous visit to this same owner.
+            // With it Virtuoso places the list from REAL sizes instead of
+            // estimating and being corrected frame by frame. Mutually
+            // exclusive with initialTopMostItemIndex — the snapshot already
+            // carries its own scroll offset, and passing both makes the two
+            // fight over the initial position.
+            {...(restoredMeasuredLayout
+              ? { restoreStateFrom: restoredMeasuredLayout as any }
+              : { initialTopMostItemIndex })}
             followOutput={() => (
               isAtBottomRef.current
                 ? 'auto'

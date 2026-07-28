@@ -15,8 +15,10 @@ const {
 
 async function makeStore() {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'noted-orchestration-'));
+  const filePath = path.join(dir, 'runs.json');
   return {
-    store: new OrchestrationRunStore(path.join(dir, 'runs.json')),
+    store: new OrchestrationRunStore(filePath),
+    filePath,
     cleanup: () => fs.promises.rm(dir, { recursive: true, force: true }),
   };
 }
@@ -534,6 +536,81 @@ test('closing a source suppresses a settled notification that can no longer be d
   } finally {
     await store.flush();
     await cleanup();
+  }
+});
+
+test('dismissing a source delivery error preserves the result and releases its blocker', async () => {
+  const { store, filePath, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-1'));
+    await store.markDelivery('run-1');
+    await store.applyLifecycle('target-1', { type: 'busy', busy: true });
+    await store.applyLifecycle('target-1', { type: 'done', reason: 'task_complete' });
+    await store.markNotification('run-1', 'failed', {
+      notificationError: 'codex_existing_draft_before_paste',
+    });
+
+    const blocked = await store.get('run-1');
+    assert.equal(blocked.status, 'completed');
+    assert.ok(blocked.attentionRequiredAt);
+    assert.equal(orchestrationInstallBlockers(blocked)[0]?.status, 'notification-blocked');
+
+    const acknowledged = await store.acknowledge('run-1', 'source-1');
+    assert.equal(acknowledged.sourceAttentionDismissedAt, undefined);
+    assert.equal(orchestrationInstallBlockers(acknowledged)[0]?.status, 'notification-blocked');
+
+    const dismissed = await store.dismissAttention('run-1', 'source-1');
+    assert.equal(dismissed.dismissed, true);
+    assert.equal(dismissed.run.status, 'completed');
+    assert.equal(dismissed.run.notificationStatus, 'suppressed');
+    assert.equal(dismissed.run.notificationSuppressed, true);
+    assert.ok(dismissed.run.notificationDismissedAt);
+    assert.ok(dismissed.run.sourceAttentionDismissedAt);
+    assert.deepEqual(orchestrationInstallBlockers(dismissed.run), []);
+
+    await store.flush();
+    const restored = await new OrchestrationRunStore(filePath).get('run-1');
+    assert.ok(restored.sourceAttentionDismissedAt);
+    assert.ok(restored.notificationDismissedAt);
+    assert.deepEqual(orchestrationInstallBlockers(restored), []);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('legacy blocking notification failures become visible without surfacing every old failure', async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'noted-orchestration-legacy-attention-'));
+  const filePath = path.join(dir, 'runs.json');
+  const now = Date.now();
+  try {
+    await fs.promises.writeFile(filePath, JSON.stringify({
+      runs: [{
+        ...baseRun('delivery-failed'),
+        status: 'completed',
+        createdAt: now - 3000,
+        completedAt: now - 2000,
+        updatedAt: now - 1000,
+        notifySource: true,
+        notificationStatus: 'failed',
+        notificationError: 'legacy draft conflict',
+      }, {
+        ...baseRun('old-target-failure', 'target-2'),
+        status: 'failed',
+        createdAt: now - 3000,
+        completedAt: now - 2000,
+        updatedAt: now - 1000,
+        notifySource: true,
+        notificationStatus: 'sent',
+      }],
+    }), 'utf8');
+
+    const store = new OrchestrationRunStore(filePath);
+    assert.ok((await store.get('delivery-failed')).attentionRequiredAt);
+    assert.equal((await store.get('old-target-failure')).attentionRequiredAt, undefined);
+    await store.flush();
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
   }
 });
 

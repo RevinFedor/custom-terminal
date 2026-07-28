@@ -15,12 +15,14 @@ export function choosePromptQueueContinuationForOutcome({
   queueArmedAt,
   loopActive,
   loopArmedAt,
+  explicitTaskComplete = false,
 }, outcomeTs) {
   if (queueActive
     && queueTriggerIsOwner
     && isWorkflowOutcomeAtOrAfterArm(queueArmedAt, outcomeTs)) {
     return 'queue';
   }
+  if (explicitTaskComplete) return null;
   if (loopActive
     && (loopArmedAt === null
       || (Number.isFinite(loopArmedAt)

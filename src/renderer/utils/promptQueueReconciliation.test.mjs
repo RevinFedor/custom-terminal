@@ -40,6 +40,22 @@ test('an own queue claims one completion before Loop, including while delayed', 
   );
 });
 
+test('explicit task completion suppresses Loop but not an already queued prompt', () => {
+  const base = {
+    queueActive: false,
+    queueTriggerIsOwner: true,
+    queueArmedAt: 100,
+    loopActive: true,
+    loopArmedAt: 100,
+    explicitTaskComplete: true,
+  };
+  assert.equal(choosePromptQueueContinuationForOutcome(base, 200), null);
+  assert.equal(
+    choosePromptQueueContinuationForOutcome({ ...base, queueActive: true }, 200),
+    'queue',
+  );
+});
+
 test('restore applies all abnormal evidence before only the latest success per trigger', () => {
   const earlySuccess = { tabId: 'a', kind: 'natural', timestamp: 100, source: 'buffer' };
   const failure = { tabId: 'a', kind: 'abnormal', timestamp: 150, source: 'main' };

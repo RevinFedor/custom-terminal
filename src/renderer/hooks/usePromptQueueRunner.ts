@@ -176,6 +176,14 @@ type QueueStateSnapshot = { queues: Map<string, TabQueue> };
 
 type ContinuationKind = 'queue' | 'loop';
 
+const LOOP_TASK_COMPLETION_PROTOCOL = [
+  '<terminal_task_completion_protocol>',
+  'Это автоматическая проверка завершения.',
+  'Если задача полностью готова и нет незавершённых дочерних Terminal MCP-run, вызови Terminal MCP complete_task ровно один раз ближе к концу этого ответа, затем верни финальный итог.',
+  'Если работа продолжается, есть ошибка или ожидание, complete_task не вызывай.',
+  '</terminal_task_completion_protocol>',
+].join('\n');
+
 function shortPromptFingerprint(value: string): string {
   let hash = 0x811c9dc5;
   for (let index = 0; index < value.length; index += 1) {
@@ -190,7 +198,7 @@ function getLoopPrompt(queue: TabQueue): QueuedPrompt | null {
   const text = queue.loopPromptText.trim();
   return {
     id: 'loop-' + (queue.loopPromptArmedAt ?? 'legacy') + '-' + shortPromptFingerprint(text),
-    text,
+    text: text + '\n\n' + LOOP_TASK_COMPLETION_PROTOCOL,
     images: 0,
     chips: [],
     createdAt: queue.loopPromptArmedAt ?? 0,
@@ -812,6 +820,9 @@ type BusyStatePayload = {
   lastAbnormalOutcomeReason?: string | null;
   lastAbnormalOutcomeTs?: number | null;
   lastAbnormalOutcomeTurnId?: string | null;
+  explicitTaskComplete?: boolean;
+  taskCompletionIntentId?: string | null;
+  taskCompletionRequestedAt?: number | null;
 };
 
 type DeferredWorkflowOutcome = BusyStatePayload & { receivedAt: number };
@@ -1172,6 +1183,16 @@ export function usePromptQueueRunner() {
       }
 
       const tabId = data.tabId;
+      const explicitTaskComplete = data.explicitTaskComplete === true;
+      if (explicitTaskComplete) {
+        const currentQueue = usePromptQueueStore.getState().getQueue(tabId);
+        if (currentQueue.loopPromptEnabled) {
+          usePromptQueueStore.getState().setLoopPromptEnabled(tabId, false);
+        }
+        console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
+          + ' exact turn marked complete intent=' + (data.taskCompletionIntentId || '-')
+          + ' → Loop disabled');
+      }
       const ownersAtOutcome = findOwnersWaitingOn(tabId, outcomeTs);
       if (getPromptQueueAgent(tabId) === 'codex') {
         console.log('[PromptQueueRunner] codex successful outcome tab=' + tabId.slice(-12)
@@ -1197,6 +1218,7 @@ export function usePromptQueueRunner() {
         queueArmedAt: ownQueueBefore.workflowArmedAt,
         loopActive: isLoopPromptActive(ownQueueBefore),
         loopArmedAt: ownQueueBefore.loopPromptArmedAt,
+        explicitTaskComplete,
       }, outcomeTs);
 
       if (continuationKind && ownersAtOutcome.length > 0) {
