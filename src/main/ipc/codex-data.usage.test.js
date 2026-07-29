@@ -26,6 +26,32 @@ function whamPayload(overrides = {}) {
   };
 }
 
+function resetCreditsPayload(overrides = {}) {
+  return {
+    available_count: 2,
+    total_earned_count: 0,
+    credits: [
+      {
+        id: 'credit-a',
+        reset_type: 'codex_rate_limits',
+        is_supported_by_plan: true,
+        status: 'available',
+        expires_at: '2030-07-31T19:10:31.038193Z',
+        title: 'Full reset',
+      },
+      {
+        id: 'credit-b',
+        reset_type: 'codex_rate_limits',
+        is_supported_by_plan: true,
+        status: 'available',
+        expires_at: '2030-08-12T18:11:58.357747Z',
+        title: 'Full reset',
+      },
+    ],
+    ...overrides,
+  };
+}
+
 const BASE_NOW = Date.parse('2027-07-10T17:20:00Z');
 
 function iso(ms) {
@@ -178,6 +204,75 @@ test('maps five-hour and weekly windows by duration, not response position', () 
   assert.equal(usage.five_hour.utilization, 20);
   assert.equal(usage.seven_day.utilization, 80);
   assert.equal(usage.plan_type, 'pro_future');
+});
+
+test('maps weekly-only main and model-specific limits without reviving a removed five-hour window', () => {
+  const payload = whamPayload({
+    credits: { has_credits: true, unlimited: false, balance: '12.5' },
+    rate_limit: {
+      primary_window: {
+        used_percent: 54,
+        limit_window_seconds: 604_800,
+        reset_at: 1_800_600_000,
+      },
+      secondary_window: null,
+    },
+    additional_rate_limits: [
+      {
+        limit_name: 'GPT-5.3-Codex-Spark',
+        metered_feature: 'codex_bengalfox',
+        rate_limit: {
+          primary_window: {
+            used_percent: 6,
+            limit_window_seconds: 604_800,
+            reset_at: 1_800_700_000,
+          },
+          secondary_window: null,
+        },
+      },
+    ],
+  });
+  const current = _api.buildCodexUsageFromWhamResponse(payload, 1_790_000_000_000);
+  assert.equal(current.authoritative_windows, true);
+  assert.equal(current.five_hour, null);
+  assert.equal(current.seven_day.utilization, 54);
+  assert.equal(current.additional_rate_limits.length, 1);
+  assert.equal(current.additional_rate_limits[0].key, 'codex_bengalfox');
+  assert.equal(current.additional_rate_limits[0].seven_day.utilization, 6);
+  assert.equal(current.additional_rate_limits[0].five_hour, null);
+  assert.equal(current.credits.balance, 12.5);
+
+  const previous = usageResult({ five: 100, weekly: 53 }).account.usage;
+  const reconciled = _api.canonicalizeCodexUsage(current, previous);
+  assert.equal(reconciled.five_hour, null);
+  assert.equal(reconciled.seven_day.utilization, 54);
+
+  const returned = _api.buildCodexUsageFromWhamResponse(whamPayload({
+    rate_limit: {
+      primary_window: { used_percent: 55, limit_window_seconds: 604_800, reset_at: 1_800_600_000 },
+      secondary_window: { used_percent: 8, limit_window_seconds: 18_000, reset_at: 1_800_000_000 },
+    },
+  }), 1_790_000_001_000);
+  const restored = _api.canonicalizeCodexUsage(returned, reconciled);
+  assert.equal(restored.five_hour.utilization, 8);
+  assert.equal(restored.seven_day.utilization, 55);
+});
+
+test('drops malformed and duplicate additional limits without disturbing main usage', () => {
+  const usage = _api.buildCodexUsageFromWhamResponse(whamPayload({
+    additional_rate_limits: [
+      null,
+      { limit_name: 'Unknown', metered_feature: 'unknown', rate_limit: { primary_window: { used_percent: 5, limit_window_seconds: 86_400 }, secondary_window: null } },
+      { limit_name: 'Spark', metered_feature: 'spark', rate_limit: { primary_window: { used_percent: 10, limit_window_seconds: 604_800, reset_at: 1_900_000_000 }, secondary_window: null } },
+      { limit_name: 'Spark duplicate', metered_feature: 'spark', rate_limit: { primary_window: { used_percent: 20, limit_window_seconds: 604_800, reset_at: 1_900_000_000 }, secondary_window: null } },
+      { limit_name: 'Broken', metered_feature: 'broken', rate_limit: { primary_window: { used_percent: 150, limit_window_seconds: 604_800 }, secondary_window: null } },
+    ],
+  }), 1_790_000_000_000);
+  assert.equal(usage.five_hour.utilization, 34);
+  assert.equal(usage.seven_day.utilization, 100);
+  assert.equal(usage.additional_rate_limits.length, 1);
+  assert.equal(usage.additional_rate_limits[0].key, 'spark');
+  assert.equal(usage.additional_rate_limits[0].seven_day.utilization, 10);
 });
 
 test('compares reset generations by duration after windows change position', () => {
@@ -341,6 +436,39 @@ test('uses account-bound OAuth headers and maps a valid OpenAI response', async 
   assert.equal(result.account.usage.seven_day.utilization, 100);
 });
 
+test('filters reset-credit inventory to available supported future Codex resets', () => {
+  const snapshot = _api.buildCodexResetCreditsFromResponse(resetCreditsPayload({
+    available_count: 6,
+    credits: [
+      ...resetCreditsPayload().credits,
+      { reset_type: 'other', is_supported_by_plan: true, status: 'available', expires_at: '2030-09-01T00:00:00Z', title: 'Wrong type' },
+      { reset_type: 'codex_rate_limits', is_supported_by_plan: false, status: 'available', expires_at: '2030-09-01T00:00:00Z', title: 'Unsupported' },
+      { reset_type: 'codex_rate_limits', is_supported_by_plan: true, status: 'redeemed', expires_at: '2030-09-01T00:00:00Z', title: 'Redeemed' },
+      { reset_type: 'codex_rate_limits', is_supported_by_plan: true, status: 'available', expires_at: '2020-09-01T00:00:00Z', title: 'Expired' },
+    ],
+  }), Date.parse('2027-01-01T00:00:00Z'));
+  assert.equal(snapshot.available_count, 2);
+  assert.equal(snapshot.credits.length, 2);
+  assert.deepEqual(Object.keys(snapshot.credits[0]).sort(), ['expires_at', 'title']);
+  assert.ok(Date.parse(snapshot.credits[0].expires_at) < Date.parse(snapshot.credits[1].expires_at));
+  assert.doesNotMatch(JSON.stringify(snapshot), /credit-a|description|profile/i);
+});
+
+test('uses account-bound OAuth headers for reset-credit inventory', async () => {
+  let request;
+  const result = await _api.fetchCodexResetCreditsFromOpenAI(authFor('reset'), {
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return fetchResponse(resetCreditsPayload());
+    },
+    now: () => Date.parse('2027-01-01T00:00:00Z'),
+  });
+  assert.equal(request.url, 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits');
+  assert.equal(request.options.headers.Authorization, 'Bearer token-reset');
+  assert.equal(request.options.headers['ChatGPT-Account-Id'], 'workspace-reset');
+  assert.equal(result.available_count, 2);
+});
+
 test('rejects a response attributed to a different email', async () => {
   const fetchImpl = async () => ({
     ok: true,
@@ -477,6 +605,51 @@ test('preferred server account replaces only the matching cached account', () =>
   const merged = _api.mergeCodexPreferredAccounts(cached, server);
   assert.equal(merged.find((item) => item.accountKey === 'a').usage.marker, 'server-a');
   assert.equal(merged.find((item) => item.accountKey === 'b').usage.marker, 'old-b');
+});
+
+test('fetches reset credits once alongside initial usage consensus and keeps them runtime-only', async () => {
+  _api.resetCodexUsageStateForTests();
+  const auth = authFor('credits');
+  const store = createFakeUsageStore();
+  _api.setCodexUsageStateStoreForTests(store);
+  let usageRequests = 0;
+  let resetRequests = 0;
+  const result = await _api.getCodexRemoteUsage({
+    force: true,
+    verifyInitial: true,
+    authReader: () => auth,
+    fetchImpl: async () => {
+      usageRequests += 1;
+      return fetchResponse(whamUsageFor(auth));
+    },
+    resetCreditsFetchImpl: async () => {
+      resetRequests += 1;
+      return fetchResponse(resetCreditsPayload());
+    },
+  });
+  assert.equal(usageRequests, 3);
+  assert.equal(resetRequests, 1);
+  assert.equal(result.accounts[0].reset_credits.available_count, 2);
+  assert.equal(result.accounts[0].reset_credits.credits.length, 2);
+  assert.equal(store.writes.length, 1);
+  assert.doesNotMatch(JSON.stringify(store.snapshot()), /reset_credits|credit-a|credit-b/);
+  _api.resetCodexUsageStateForTests();
+});
+
+test('keeps verified usage when the optional reset-credit request fails', async () => {
+  _api.resetCodexUsageStateForTests();
+  const auth = authFor('optional');
+  const result = await _api.getCodexRemoteUsage({
+    force: true,
+    authReader: () => auth,
+    fetchImpl: async () => fetchResponse(whamUsageFor(auth, { five: 22, weekly: 33 })),
+    resetCreditsFetchImpl: async () => fetchResponse({ error: 'temporary' }, 503),
+  });
+  assert.equal(result.error, null);
+  assert.equal(result.accounts[0].usage.five_hour.utilization, 22);
+  assert.equal(result.accounts[0].usage.seven_day.utilization, 33);
+  assert.equal(result.accounts[0].reset_credits, null);
+  _api.resetCodexUsageStateForTests();
 });
 
 test('coalesces concurrent refreshes for the same account', async () => {
@@ -1187,6 +1360,25 @@ test('persists at most eight sanitized account snapshots and safely ignores corr
       weekly: 20 + index,
       fetchedAt: BASE_NOW + index,
     });
+    if (index === 9) {
+      result.account.usage = {
+        ...result.account.usage,
+        authoritative_windows: true,
+        additional_rate_limits_observed: true,
+        additional_rate_limits: [{
+          key: 'codex_bengalfox',
+          label: 'GPT-5.3-Codex-Spark',
+          five_hour: null,
+          seven_day: {
+            utilization: 6,
+            resets_at: iso(BASE_NOW + 4 * 24 * 60 * 60 * 1000),
+            window_minutes: 10_080,
+          },
+        }],
+        credits: { has_credits: true, unlimited: false, balance: 12.5 },
+      };
+      result.account.reset_credits = resetCreditsPayload();
+    }
     entries.set(result.account.accountKey, {
       ...acceptedEntry({
         ...result,
@@ -1223,6 +1415,11 @@ test('persists at most eight sanitized account snapshots and safely ignores corr
   assert.equal(restored[0].tokenFingerprint, null);
   assert.equal(restored[0].pending, null);
   assert.equal(restored[0].error, null);
+  assert.equal(restored[0].account.usage.authoritative_windows, true);
+  assert.equal(restored[0].account.usage.additional_rate_limits.length, 1);
+  assert.equal(restored[0].account.usage.additional_rate_limits[0].seven_day.utilization, 6);
+  assert.equal(restored[0].account.usage.credits.balance, 12.5);
+  assert.equal(Object.hasOwn(restored[0].account, 'reset_credits'), false);
 
   assert.deepEqual(_api.parseCodexUsageState('{broken json'), []);
   assert.deepEqual(_api.parseCodexUsageState({ version: 2, accounts: serialized.accounts }), []);
@@ -1236,6 +1433,51 @@ test('persists at most eight sanitized account snapshots and safely ignores corr
       { account: { accountKey: 'infinite-usage', usage: { seven_day: { utilization: Infinity, window_minutes: 10_080 } } } },
     ],
   }), []);
+});
+
+test('keeps an authoritative weekly-only account weekly-only after persistence roundtrip', () => {
+  const usage = _api.buildCodexUsageFromWhamResponse(whamPayload({
+    rate_limit: {
+      primary_window: { used_percent: 54, limit_window_seconds: 604_800, reset_at: 1_900_000_000 },
+      secondary_window: null,
+    },
+  }), Date.parse('2027-01-01T00:00:00Z'));
+  const result = usageResult();
+  result.account.usage = usage;
+  const serialized = _api.serializeCodexUsageState(new Map([
+    [result.account.accountKey, acceptedEntry(result)],
+  ]));
+  const [restored] = _api.parseCodexUsageState(serialized);
+  assert.equal(restored.account.usage.authoritative_windows, true);
+  assert.equal(restored.account.usage.five_hour, null);
+  assert.equal(restored.account.usage.seven_day.utilization, 54);
+});
+
+test('accepts an explicit five-hour removal and restores it when the API returns it again', async () => {
+  _api.resetCodexUsageStateForTests();
+  const auth = authFor('window-transition');
+  const responses = [
+    whamUsageFor(auth, { five: 20, weekly: 40 }),
+    whamUsageFor(auth, { five: null, weekly: 41 }),
+    whamUsageFor(auth, { five: 7, weekly: 42 }),
+  ];
+  let requestIndex = 0;
+  const fetchImpl = async () => fetchResponse(responses[requestIndex++]);
+
+  const present = await _api.getCodexRemoteUsage({ force: true, fetchImpl, authReader: () => auth });
+  assert.equal(present.accounts[0].usage.five_hour.utilization, 20);
+
+  const absent = await _api.getCodexRemoteUsage({ force: true, fetchImpl, authReader: () => auth });
+  assert.equal(absent.warning, null);
+  assert.equal(absent.accounts[0].usage.five_hour, null);
+  assert.equal(absent.accounts[0].usage.seven_day.utilization, 41);
+
+  const returned = await _api.getCodexRemoteUsage({ force: true, fetchImpl, authReader: () => auth });
+  assert.equal(returned.warning, null);
+  assert.equal(returned.accounts[0].usage.five_hour.utilization, 7);
+  assert.equal(returned.accounts[0].usage.seven_day.utilization, 42);
+  assert.equal(requestIndex, 3);
+  _api.resetCodexUsageStateForTests();
 });
 
 test('keeps the verified value and persisted state across a forced 99/100 upstream outlier', async () => {

@@ -53,6 +53,8 @@ export type OrchestrationRun = {
   attentionRequiredAt?: number | null;
   completionReason?: string | null;
   notificationError?: string | null;
+  notificationUnconfirmedAt?: number | null;
+  notificationUnconfirmedReason?: string | null;
   resultError?: string | null;
   recoveryReason?: string | null;
   error?: string | null;
@@ -84,6 +86,7 @@ const SOURCE_FOLLOWUP_DELIVERY_STATUSES = new Set([
 const SOURCE_NOTIFICATION_PROBLEM_STATUSES = new Set([
   'waiting-for-input',
   'failed',
+  'unconfirmed',
 ]);
 
 export type OrchestrationRunReleaseKind = 'handoff-started' | 'success' | 'abnormal';

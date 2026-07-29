@@ -587,7 +587,7 @@ interface PromptQueueStore {
   disarmQueuesForTrigger: (
     triggerTabId: string,
     outcomeTs?: number | null,
-    options?: { preservePivoted?: boolean },
+    options?: { preservePivoted?: boolean; preserveLoop?: boolean },
   ) => string[];
 
   // Drop queue state owned by a closed tab and clear run-after pivots that
@@ -1557,7 +1557,9 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           const hasQueuePromise = cur.autoRun || cur.stopAfter || cur.closeAfter || cur.firstDelayCountdownAt !== null;
           const queueMatches = hasQueuePromise
             && (ownsTrigger || (waitsOnTrigger && options.preservePivoted !== true));
-          const loopMatches = ownsTrigger && cur.loopPromptEnabled;
+          const loopMatches = ownsTrigger
+            && cur.loopPromptEnabled
+            && options.preserveLoop !== true;
           if (!queueMatches && !loopMatches) continue;
           // A user can deliberately re-arm after an old failure while restore is
           // still hydrating. Never let that stale outcome cancel the newer arm;

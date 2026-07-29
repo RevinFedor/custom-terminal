@@ -133,6 +133,38 @@ test('an audited orchestration tag decorates only the proven user record', () =>
   assert.equal(store.rows[0].schemaVersion, 2);
 });
 
+test('an audited Loop prompt keeps its origin outside the canonical prompt text', () => {
+  const store = createStore();
+  const content = 'Проверь, полностью ли выполнена исходная задача.';
+  assert.equal(saveAuditedPromptPresentation(store, {
+    toolType: 'claude',
+    sessionId: 'loop-session',
+    auditTimestamp: '2026-07-29T01:00:00.000Z',
+    actualText: content,
+    snapshot: {
+      semanticTags: [{ kind: 'prompt-origin', source: 'loop' }],
+    },
+  }), true);
+
+  const decorated = decorateHistoryPromptPresentations(store, {
+    toolType: 'claude',
+    sessionId: 'loop-session',
+    entries: [{
+      uuid: 'claude-loop-entry-1',
+      type: 'user',
+      timestamp: '2026-07-29T01:00:00.000Z',
+      content,
+    }],
+  });
+
+  assert.equal(decorated[0].content, content);
+  assert.deepEqual(decorated[0].semanticTags, [{
+    id: 'durable-prompt-origin-tag-0',
+    kind: 'prompt-origin',
+    source: 'loop',
+  }]);
+});
+
 function codexUser(line, timestamp, message) {
   return {
     __line: line,

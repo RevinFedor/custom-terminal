@@ -319,6 +319,25 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
     assert.equal(store.getQueue('tab-pivot-owner').runAfterTabId, 'tab-pivot-target');
     assert.deepEqual(store.disarmQueuesForTrigger('tab-pivot-target', 90_000), ['tab-pivot-owner']);
     assert.equal(store.getQueue('tab-pivot-owner').autoRun, false);
+
+    fakeNow = 100_000;
+    store.setLoopPromptEnabled('tab-interrupted-loop', true);
+    store.addPrompt('tab-interrupted-loop', 'one-shot work');
+    store.setAutoRun('tab-interrupted-loop', true);
+    assert.deepEqual(
+      store.disarmQueuesForTrigger('tab-interrupted-loop', 100_000, {
+        preservePivoted: true,
+        preserveLoop: true,
+      }),
+      ['tab-interrupted-loop'],
+      'recoverable interrupt still disarms the one-shot workflow',
+    );
+    assert.equal(store.getQueue('tab-interrupted-loop').autoRun, false);
+    assert.equal(
+      store.getQueue('tab-interrupted-loop').loopPromptEnabled,
+      true,
+      'recoverable interrupt keeps Loop armed for the next natural completion',
+    );
   } finally {
     Date.now = realDateNow;
   }

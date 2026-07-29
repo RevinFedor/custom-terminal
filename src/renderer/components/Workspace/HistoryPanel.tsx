@@ -197,6 +197,12 @@ interface TaskAction {
   subagentStatus?: 'running' | 'completed' | 'interrupted';
   agentSessionId?: string;
   processGeneration?: string;
+  // Handles back to the agent's OWN transcript, so the detail pane can show
+  // what it is really doing. `agentId` addresses a Claude agent directly;
+  // `taskPrompt` is the fallback for a running one whose id does not exist yet
+  // (see subagent-transcript.js).
+  agentId?: string;
+  taskPrompt?: string;
 }
 // Raw tool carrier emitted by the main-process parser for every non-Task
 // tool_use — full name+input+result, rendered via the package ToolCallPart.
@@ -1341,7 +1347,17 @@ interface HistoryBackgroundChip {
   taskHistory?: Array<{ type: string; content?: string; tools?: string[] }>;
   taskResult?: string;
   agentSessionId?: string;
+  agentId?: string;
+  taskPrompt?: string;
   bashAcceptance?: string;
+}
+
+// One parsed step of a subagent's own transcript (main-side reader).
+interface SubagentStep {
+  kind: 'tool' | 'message' | 'thinking';
+  text: string;
+  tool?: string;
+  final?: boolean;
 }
 
 const collectHistoryBackgroundChips = (
@@ -1430,6 +1446,8 @@ const collectHistoryBackgroundChips = (
           taskHistory: action.history,
           taskResult: action.result,
           agentSessionId: action.agentSessionId,
+          agentId: action.agentId,
+          taskPrompt: action.taskPrompt,
         });
       }
     }
@@ -1463,21 +1481,108 @@ const formatBackgroundElapsed = (startedAt: number) => {
   return rs === 0 ? m + 'm' : m + 'm ' + rs + 's';
 };
 
+// Live steps of one subagent, tailed from its own transcript.
+//
+// The agent writes into its OWN file and returns only a final answer to the
+// parent, so the parent transcript can never show the work. Reading is
+// incremental: real agents produce thousands of records (one explorer wrote
+// 3810), and re-parsing the whole file every tick would stall the main process
+// precisely while the user is watching. `offset` advances by consumed bytes;
+// a partial trailing line is left for the next tick instead of being dropped.
+const useSubagentSteps = (chip: HistoryBackgroundChip | null, tabId: string, toolType: string, cwd: string, sessionId: string) => {
+  const [steps, setSteps] = useState<SubagentStep[]>([]);
+  const [pending, setPending] = useState(false);
+  const offsetRef = useRef(0);
+  const chipKey = chip?.kind === 'subagent' ? chip.key : '';
+
+  useEffect(() => {
+    if (!chipKey) { setSteps([]); setPending(false); offsetRef.current = 0; return; }
+    let cancelled = false;
+    offsetRef.current = 0;
+    setSteps([]);
+    setPending(true);
+    // A LIVE Codex card has no thread id yet: the spawn is rendered when the
+    // call appears, while the id arrives later (spawn output in v1, an activity
+    // event in v2). The main-side watcher already knows it, so ask before the
+    // first read — otherwise the pane sits on "loading" for the agent's whole
+    // life (E2E ct-e2e27).
+    let resolvedThreadId = chip?.agentSessionId || '';
+    const tick = async () => {
+      try {
+        if (toolType === 'codex' && !resolvedThreadId) {
+          const resolved = await ipcRenderer.invoke('subagent:resolve-codex-thread', {
+            tabId,
+            callId: chip?.key?.replace(/^task:/, '') || '',
+          });
+          if (resolved?.threadId) resolvedThreadId = resolved.threadId;
+        }
+        const res = await ipcRenderer.invoke('subagent:read-steps', {
+          chipKey,
+          toolType,
+          parentSessionId: sessionId,
+          cwd,
+          agentId: chip?.agentId,
+          agentSessionId: resolvedThreadId,
+          taskText: chip?.taskPrompt || chip?.label,
+          spawnedAt: chip?.startedAt,
+          offset: offsetRef.current,
+        });
+        if (cancelled) return;
+        if (res?.success && Array.isArray(res.steps)) {
+          offsetRef.current = Number(res.offset) || offsetRef.current;
+          if (res.steps.length > 0) {
+            // Append: each tick returns only what was newly written.
+            setSteps((prev) => [...prev, ...res.steps].slice(-400));
+            setPending(false);
+          } else if (!res.pending) {
+            setPending(false);
+          }
+        }
+      } catch { /* transient: the file may be mid-rotation */ }
+    };
+    tick();
+    const timer = window.setInterval(tick, 1200);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [chipKey, toolType, cwd, sessionId, chip?.agentId, chip?.agentSessionId, chip?.taskPrompt, chip?.label, chip?.startedAt]);
+
+  return { steps, pending };
+};
+
 // Workflow-style detail pane above the chips bar: what the agent is doing
-// right now (Claude — Task progress turns; bash — the acceptance output).
+// right now — its real steps, tailed live from the agent's own transcript.
 // Read-only by design: no input; stopping stays on the existing Escape flow
 // which interrupts the whole turn.
 const HistoryBackgroundDetailPane = memo(({
   chip,
   onJumpToCard,
   onClose,
+  tabId,
+  toolType,
+  cwd,
+  sessionId,
 }: {
   chip: HistoryBackgroundChip;
   onJumpToCard: (entryUuid: string) => void;
   onClose: () => void;
+  tabId: string;
+  toolType: string;
+  cwd: string;
+  sessionId: string;
 }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const stepCount = chip.taskHistory?.length || 0;
+  const { steps: liveSteps, pending: stepsPending } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
+  const [showThinking, setShowThinking] = useState(false);
+  // Reasoning dwarfs everything else (784 thinking records vs 39 answers on a
+  // real Codex agent), so it is folded away unless explicitly asked for.
+  const visibleSteps = useMemo(
+    () => (showThinking ? liveSteps : liveSteps.filter((step) => step.kind !== 'thinking')),
+    [liveSteps, showThinking],
+  );
+  const thinkingCount = useMemo(
+    () => liveSteps.reduce((sum, step) => sum + (step.kind === 'thinking' ? 1 : 0), 0),
+    [liveSteps],
+  );
+  const stepCount = visibleSteps.length || chip.taskHistory?.length || 0;
   // Follow the newest step while the agent works.
   useEffect(() => {
     const el = scrollRef.current;
@@ -1534,28 +1639,62 @@ const HistoryBackgroundDetailPane = memo(({
         ref={scrollRef}
         style={{ overflowY: 'auto', padding: '6px 10px', fontSize: '0.82em', color: '#aaa' }}
       >
-        {chip.kind === 'subagent' && (chip.taskHistory?.length ? (
-          chip.taskHistory.map((turn, index) => (
-            <div key={index} style={{ marginBottom: 6 }}>
-              {turn.content && (
-                <div style={{
-                  whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                  color: turn.type === 'user' ? '#8a8a8a' : '#bbb',
-                  maxHeight: 120, overflow: 'hidden',
-                }}>
-                  {turn.content.slice(0, 600)}
-                </div>
-              )}
-              {turn.tools?.map((tool, toolIndex) => (
-                <div key={toolIndex} style={{ color: '#7a7a7a', fontFamily: 'monospace', fontSize: '0.95em' }}>
-                  {tool}
-                </div>
-              ))}
-            </div>
-          ))
+        {chip.kind === 'subagent' && (visibleSteps.length > 0 ? (
+          <>
+            {visibleSteps.map((step, index) => (
+              <div key={index} style={{ marginBottom: 5 }}>
+                {step.kind === 'tool' && (
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
+                    <span style={{ color: '#60a5fa', fontFamily: 'monospace', flexShrink: 0 }}>
+                      {step.tool}
+                    </span>
+                    <span style={{
+                      color: '#7a7a7a', fontFamily: 'monospace', fontSize: '0.95em',
+                      whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                      maxHeight: 44, overflow: 'hidden',
+                    }}>
+                      {step.text}
+                    </span>
+                  </div>
+                )}
+                {step.kind === 'message' && (
+                  <div style={{
+                    whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                    color: step.final ? '#ddd' : '#bbb',
+                    maxHeight: 140, overflow: 'hidden',
+                  }}>
+                    {step.text}
+                  </div>
+                )}
+                {step.kind === 'thinking' && (
+                  <div style={{
+                    whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                    color: '#6b6b6b', fontStyle: 'italic',
+                    maxHeight: 100, overflow: 'hidden',
+                  }}>
+                    {step.text}
+                  </div>
+                )}
+              </div>
+            ))}
+            {thinkingCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowThinking((value) => !value)}
+                style={{
+                  background: 'none', border: 'none', color: '#666',
+                  cursor: 'pointer', fontSize: '0.95em', padding: '2px 0',
+                }}
+              >
+                {showThinking ? 'скрыть размышления' : 'показать размышления (' + thinkingCount + ')'}
+              </button>
+            )}
+          </>
         ) : (
           <div style={{ color: '#666' }}>
-            Агент работает — промежуточные шаги появятся здесь по мере записи.
+            {stepsPending
+              ? 'Загружаем шаги агента…'
+              : 'Агент работает — промежуточные шаги появятся здесь по мере записи.'}
           </div>
         ))}
         {chip.kind === 'bash' && (
@@ -1573,11 +1712,21 @@ const HistoryBackgroundTasksBar = memo(({
   expandedKey,
   onToggle,
   onJumpToCard,
+  tabId,
+  toolType,
+  cwd,
+  sessionId,
 }: {
   chips: HistoryBackgroundChip[];
   expandedKey: string | null;
   onToggle: (chipKey: string) => void;
   onJumpToCard: (entryUuid: string) => void;
+  // Passed through to the detail pane, which needs them to locate the
+  // expanded agent's own transcript.
+  tabId: string;
+  toolType: string;
+  cwd: string;
+  sessionId: string;
 }) => {
   // 1s tick keeps elapsed labels live while anything runs.
   const [, force] = React.useReducer((x: number) => x + 1, 0);
@@ -1597,6 +1746,10 @@ const HistoryBackgroundTasksBar = memo(({
           chip={expandedChip}
           onJumpToCard={onJumpToCard}
           onClose={() => onToggle(expandedChip.key)}
+          tabId={tabId}
+          toolType={toolType}
+          cwd={cwd}
+          sessionId={sessionId}
         />
       )}
       <div
@@ -6592,12 +6745,11 @@ function HistoryPanel({
     window.dispatchEvent(new CustomEvent('history-panel:background-work', {
       detail: { tabId, count: backgroundHistoryChips.length },
     }));
-    return () => {
-      // Unmount must not leave the tab shimmering from a stale count.
-      window.dispatchEvent(new CustomEvent('history-panel:background-work', {
-        detail: { tabId, count: 0 },
-      }));
-    };
+    // No zeroing on unmount: the count is now owned by the main-process
+    // watcher (`tab:background-work`), which sees every tab whether or not its
+    // History is open. Publishing 0 here used to erase a still-running agent
+    // the moment the user switched away — the tab looked idle until clicked
+    // back, which is exactly how a live agent stayed invisible.
   }, [tabId, backgroundHistoryChips.length]);
   const [expandedBackgroundChipKey, setExpandedBackgroundChipKey] = useState<string | null>(null);
   // Auto-close the pane when its chip finishes (mirrors the SDK bar).
@@ -10032,6 +10184,10 @@ function HistoryPanel({
                 (current) => current === chipKey ? null : chipKey,
               )}
               onJumpToCard={(entryUuid) => setHistoryScrollToUuid(entryUuid)}
+              tabId={tabId}
+              toolType={toolType}
+              cwd={cwd}
+              sessionId={sessionId || ''}
             />
           </div>
         )}

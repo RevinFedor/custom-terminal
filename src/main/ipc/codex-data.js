@@ -14,6 +14,10 @@ const {
   isCodexSubagentSpawnCall,
 } = require('../codex-subagent-cards');
 const {
+  findCodexAgentFile,
+  isAgentFinishedByOwnTranscript,
+} = require('../subagent-transcript');
+const {
   getCodexProcessActionGeneration,
 } = require('../codex-process-action-ownership');
 const { execFile } = require('child_process');
@@ -23,6 +27,7 @@ const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
 const CODEX_LOGS_DB = path.join(CODEX_HOME, 'logs_2.sqlite');
 const CODEX_AUTH_JSON = path.join(CODEX_HOME, 'auth.json');
 const CODEX_USAGE_API_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const CODEX_RESET_CREDITS_API_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const USAGE_ACCOUNTS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS = 1200;
@@ -31,6 +36,7 @@ const CODEX_REMOTE_USAGE_CACHE_TTL_MS = 55 * 1000;
 const CODEX_REMOTE_USAGE_STALE_MS = 6 * 60 * 1000;
 const CODEX_REMOTE_USAGE_ERROR_COOLDOWN_MS = 60 * 1000;
 const CODEX_REMOTE_USAGE_TIMEOUT_MS = 8 * 1000;
+const CODEX_RESET_CREDITS_TIMEOUT_MS = 4 * 1000;
 const CODEX_USAGE_PERSISTENCE_KEY = 'codexUsageAccounts.v1';
 const CODEX_USAGE_PENDING_CONFIRM_MS = 30 * 1000;
 const CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS = 2 * 60;
@@ -3001,6 +3007,32 @@ function buildCodexFullHistory(records, sessionId) {
     pendingThinking = '';
   }
 
+  // Last resort for cards the parent never closed. `wait_agent` is routinely
+  // called with no target, and its "Wait completed" output names nobody — so an
+  // agent that really finished can leave zero terminal trace in this rollout
+  // and keep animating the tab forever (live production tab: 12 of 36 spawns,
+  // 11 of them plainly finished in their own file). Each such agent is checked
+  // against its OWN transcript, which is authoritative about itself.
+  const stillRunning = subagents.runningCards();
+  if (stillRunning.length > 0) {
+    let resolved = 0;
+    for (const card of stillRunning) {
+      const threadId = card.agentSessionId;
+      if (!threadId) continue;
+      const filePath = findCodexAgentFile({ agentSessionId: threadId });
+      if (!filePath) continue;
+      if (!isAgentFinishedByOwnTranscript({ toolType: 'codex', filePath })) continue;
+      card.subagentStatus = 'completed';
+      card.description = card.baseDescription;
+      if (!card.result) card.result = 'Агент завершил работу (по его собственной истории).';
+      resolved += 1;
+    }
+    if (resolved > 0) {
+      console.log('[CodexSubagents] closed by own transcript: ' + resolved
+        + '/' + stillRunning.length + ' session=' + String(sessionId).slice(0, 8));
+    }
+  }
+
   return entries.map(({ turnIndex, ...entry }) => entry);
 }
 
@@ -4508,6 +4540,75 @@ function normalizeCodexWhamWindow(raw, receivedAtMs) {
   };
 }
 
+function normalizeCodexCreditBalance(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const balance = parseCodexNumber(raw.balance);
+  const hasCredits = typeof raw.has_credits === 'boolean' ? raw.has_credits : null;
+  const unlimited = typeof raw.unlimited === 'boolean' ? raw.unlimited : null;
+  const overageLimitReached = typeof raw.overage_limit_reached === 'boolean'
+    ? raw.overage_limit_reached
+    : null;
+  if (balance == null && hasCredits == null && unlimited == null && overageLimitReached == null) return null;
+  return {
+    has_credits: hasCredits,
+    unlimited,
+    overage_limit_reached: overageLimitReached,
+    balance: balance != null && balance >= 0 ? balance : null,
+  };
+}
+
+function normalizeCodexAdditionalRateLimits(rawLimits, receivedAtMs) {
+  if (!Array.isArray(rawLimits)) return null;
+  const normalized = [];
+  const seen = new Set();
+  for (const raw of rawLimits.slice(0, 16)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const rateLimit = raw.rate_limit;
+    if (!rateLimit || typeof rateLimit !== 'object') continue;
+    const primary = normalizeCodexWhamWindow(rateLimit.primary_window ?? rateLimit.primary, receivedAtMs);
+    const secondary = normalizeCodexWhamWindow(rateLimit.secondary_window ?? rateLimit.secondary, receivedAtMs);
+    const usage = buildCodexUsageFromRateLimits({ primary, secondary }, null, null);
+    if (!usage?.five_hour && !usage?.seven_day) continue;
+
+    const rawKey = typeof raw.metered_feature === 'string' ? raw.metered_feature.trim() : '';
+    const rawLabel = typeof raw.limit_name === 'string' ? raw.limit_name.trim() : '';
+    const key = (rawKey || rawLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')).slice(0, 120);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push({
+      key,
+      label: (rawLabel || 'Additional Codex limit').slice(0, 120),
+      five_hour: usage.five_hour,
+      seven_day: usage.seven_day,
+    });
+  }
+  return normalized;
+}
+
+function sanitizeCodexAdditionalRateLimits(rawLimits) {
+  if (!Array.isArray(rawLimits)) return [];
+  const normalized = [];
+  const seen = new Set();
+  for (const raw of rawLimits.slice(0, 16)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const key = typeof raw.key === 'string' ? raw.key.trim().slice(0, 120) : '';
+    const label = typeof raw.label === 'string' ? raw.label.trim().slice(0, 120) : '';
+    if (!key || !label || seen.has(key)) continue;
+    const fiveHour = normalizeCodexLimitBucket(raw.five_hour);
+    const sevenDay = normalizeCodexLimitBucket(raw.seven_day);
+    if (!fiveHour && !sevenDay) continue;
+    seen.add(key);
+    normalized.push({ key, label, five_hour: fiveHour, seven_day: sevenDay });
+  }
+  return normalized;
+}
+
+function codexWhamWindowsAreAuthoritative(rateLimit, usage) {
+  const hasBothSlots = Object.prototype.hasOwnProperty.call(rateLimit, 'primary_window')
+    && Object.prototype.hasOwnProperty.call(rateLimit, 'secondary_window');
+  return hasBothSlots && !!(usage?.five_hour || usage?.seven_day);
+}
+
 function buildCodexUsageFromWhamResponse(payload, receivedAtMs = Date.now()) {
   const rateLimit = payload?.rate_limit;
   if (!rateLimit || typeof rateLimit !== 'object') {
@@ -4520,16 +4621,50 @@ function buildCodexUsageFromWhamResponse(payload, receivedAtMs = Date.now()) {
     throw new CodexUsageFetchError('invalid_response', 'OpenAI usage response has no valid windows');
   }
 
-  return buildCodexUsageFromRateLimits({
+  const usage = buildCodexUsageFromRateLimits({
     limit_id: 'codex',
     limit_name: null,
     primary,
     secondary,
-    credits: payload?.credits || rateLimit.credits || null,
+    credits: normalizeCodexCreditBalance(payload?.credits || rateLimit.credits || null),
     individual_limit: rateLimit.individual_limit || payload?.spend_control?.individual_limit || null,
     plan_type: payload?.plan_type || rateLimit.plan_type || null,
     rate_limit_reached_type: payload?.rate_limit_reached_type || rateLimit.rate_limit_reached_type || null,
   }, new Date(receivedAtMs).toISOString(), null);
+  return {
+    ...usage,
+    authoritative_windows: codexWhamWindowsAreAuthoritative(rateLimit, usage),
+    additional_rate_limits_observed: Array.isArray(payload?.additional_rate_limits),
+    additional_rate_limits: normalizeCodexAdditionalRateLimits(payload?.additional_rate_limits, receivedAtMs),
+  };
+}
+
+function buildCodexResetCreditsFromResponse(payload, receivedAtMs = Date.now()) {
+  const availableCount = parseCodexNumber(payload?.available_count);
+  if (!Number.isInteger(availableCount) || availableCount < 0 || !Array.isArray(payload?.credits)) {
+    throw new CodexUsageFetchError('invalid_response', 'OpenAI reset credits response is invalid');
+  }
+  const credits = payload.credits
+    .slice(0, 32)
+    .filter((credit) => credit && typeof credit === 'object')
+    .filter((credit) => credit.status === 'available')
+    .filter((credit) => credit.reset_type === 'codex_rate_limits')
+    .filter((credit) => credit.is_supported_by_plan !== false)
+    .map((credit) => {
+      const expiresAt = normalizeCodexReset(credit.expires_at);
+      if (!expiresAt || Date.parse(expiresAt) <= receivedAtMs) return null;
+      const title = typeof credit.title === 'string' && credit.title.trim()
+        ? credit.title.trim().slice(0, 80)
+        : 'Full reset';
+      return { title, expires_at: expiresAt };
+    })
+    .filter(Boolean)
+    .sort((left, right) => Date.parse(left.expires_at) - Date.parse(right.expires_at));
+  return {
+    available_count: credits.length,
+    credits,
+    timestamp: new Date(receivedAtMs).toISOString(),
+  };
 }
 
 function codexUsageErrorMessage(error) {
@@ -4548,20 +4683,36 @@ function codexUsageErrorMessage(error) {
 
 function canonicalizeCodexUsage(usage, previousUsage = null) {
   if (!usage || typeof usage !== 'object') return null;
-  const fiveHour = usage.five_hour || previousUsage?.five_hour || null;
-  const sevenDay = usage.seven_day || previousUsage?.seven_day || null;
+  const authoritativeWindows = usage.authoritative_windows === true;
+  const fiveHour = usage.five_hour
+    || (!authoritativeWindows ? previousUsage?.five_hour : null)
+    || null;
+  const sevenDay = usage.seven_day
+    || (!authoritativeWindows ? previousUsage?.seven_day : null)
+    || null;
   if (!fiveHour && !sevenDay) return null;
+  const ownAdditionalLimits = sanitizeCodexAdditionalRateLimits(usage.additional_rate_limits);
+  const additionalLimitsObserved = usage.additional_rate_limits_observed === true;
+  const additionalRateLimits = additionalLimitsObserved || ownAdditionalLimits.length > 0
+    ? ownAdditionalLimits
+    : sanitizeCodexAdditionalRateLimits(previousUsage?.additional_rate_limits);
+  const credits = normalizeCodexCreditBalance(usage.credits)
+    || normalizeCodexCreditBalance(previousUsage?.credits);
   return {
     ...usage,
     primary: fiveHour ? { ...fiveHour, window_minutes: 5 * 60 } : null,
     secondary: sevenDay ? { ...sevenDay, window_minutes: 7 * 24 * 60 } : null,
     five_hour: fiveHour,
     seven_day: sevenDay,
+    authoritative_windows: authoritativeWindows || previousUsage?.authoritative_windows === true,
+    additional_rate_limits_observed: additionalLimitsObserved
+      || previousUsage?.additional_rate_limits_observed === true,
+    additional_rate_limits: additionalRateLimits,
+    credits,
   };
 }
 
-function codexUsageWindowSnapshot(usage, key) {
-  const bucket = usage?.[key];
+function codexUsageBucketSnapshot(bucket) {
   if (!bucket || typeof bucket !== 'object') return null;
   const utilization = parseCodexNumber(bucket.utilization);
   if (utilization == null || utilization < 0 || utilization > 100) return null;
@@ -4572,10 +4723,32 @@ function codexUsageWindowSnapshot(usage, key) {
   };
 }
 
-function codexUsageSnapshotsMatch(leftUsage, rightUsage) {
+function codexUsageWindowSnapshot(usage, key) {
+  return codexUsageBucketSnapshot(usage?.[key]);
+}
+
+function codexUsageWindowSnapshots(usage) {
+  const snapshots = new Map();
   for (const key of ['five_hour', 'seven_day']) {
-    const left = codexUsageWindowSnapshot(leftUsage, key);
-    const right = codexUsageWindowSnapshot(rightUsage, key);
+    const snapshot = codexUsageWindowSnapshot(usage, key);
+    if (snapshot) snapshots.set(`main:${key}`, snapshot);
+  }
+  for (const limit of sanitizeCodexAdditionalRateLimits(usage?.additional_rate_limits)) {
+    for (const key of ['five_hour', 'seven_day']) {
+      const snapshot = codexUsageBucketSnapshot(limit[key]);
+      if (snapshot) snapshots.set(`${limit.key}:${key}`, snapshot);
+    }
+  }
+  return snapshots;
+}
+
+function codexUsageSnapshotsMatch(leftUsage, rightUsage) {
+  const leftSnapshots = codexUsageWindowSnapshots(leftUsage);
+  const rightSnapshots = codexUsageWindowSnapshots(rightUsage);
+  const keys = new Set([...leftSnapshots.keys(), ...rightSnapshots.keys()]);
+  for (const key of keys) {
+    const left = leftSnapshots.get(key) || null;
+    const right = rightSnapshots.get(key) || null;
     if (!left && !right) continue;
     if (!left || !right) return false;
     if (Math.abs(left.utilization - right.utilization) > 12) return false;
@@ -4592,9 +4765,12 @@ function classifyCodexUsageSnapshot(previousUsage, candidateUsage, nowMs = Date.
   let suspicious = false;
   let olderWindows = 0;
 
-  for (const key of ['five_hour', 'seven_day']) {
-    const previous = codexUsageWindowSnapshot(previousUsage, key);
-    const candidate = codexUsageWindowSnapshot(candidateUsage, key);
+  const previousSnapshots = codexUsageWindowSnapshots(previousUsage);
+  const candidateSnapshots = codexUsageWindowSnapshots(candidateUsage);
+  const keys = new Set([...previousSnapshots.keys(), ...candidateSnapshots.keys()]);
+  for (const key of keys) {
+    const previous = previousSnapshots.get(key) || null;
+    const candidate = candidateSnapshots.get(key) || null;
     if (!previous || !candidate) continue;
 
     const previousResetElapsed = previous.resetMs != null && previous.resetMs <= nowMs;
@@ -4725,12 +4901,19 @@ function sanitizeCodexPersistedAccount(raw) {
   const rawHint = typeof raw?.accountHint === 'string' ? raw.accountHint.trim().slice(0, 80) : '';
   const label = rawLabel.includes('@') ? maskCodexEmail(rawLabel) : rawLabel;
   const accountHint = rawHint.includes('@') ? maskCodexEmail(rawHint) : rawHint;
-  const usage = canonicalizeCodexUsage(buildCodexUsageFromRateLimits({
+  const rebuiltUsage = buildCodexUsageFromRateLimits({
     primary: raw?.usage?.five_hour || raw?.usage?.primary || null,
     secondary: raw?.usage?.seven_day || raw?.usage?.secondary || null,
     limit_id: 'codex',
     plan_type: typeof raw?.usage?.plan_type === 'string' ? raw.usage.plan_type.slice(0, 80) : null,
-  }, normalizeCodexReset(raw?.usage?.timestamp || raw?.timestamp), null));
+    credits: normalizeCodexCreditBalance(raw?.usage?.credits),
+  }, normalizeCodexReset(raw?.usage?.timestamp || raw?.timestamp), null);
+  const usage = canonicalizeCodexUsage(rebuiltUsage ? {
+    ...rebuiltUsage,
+    authoritative_windows: raw?.usage?.authoritative_windows === true,
+    additional_rate_limits_observed: raw?.usage?.additional_rate_limits_observed === true,
+    additional_rate_limits: sanitizeCodexAdditionalRateLimits(raw?.usage?.additional_rate_limits),
+  } : null);
   if (!usage || !['five_hour', 'seven_day'].some((key) => codexUsageWindowSnapshot(usage, key))) return null;
   return {
     accountKey,
@@ -4888,6 +5071,62 @@ async function fetchCodexUsageFromOpenAI(auth, {
   }
 }
 
+async function fetchCodexResetCreditsFromOpenAI(auth, {
+  fetchImpl = global.fetch,
+  timeoutMs = CODEX_RESET_CREDITS_TIMEOUT_MS,
+  now = Date.now,
+} = {}) {
+  if (!auth?.accessToken || !auth?.accountId || !auth?.accountKey) {
+    throw new CodexUsageFetchError('auth_missing', 'Missing Codex ChatGPT OAuth credentials');
+  }
+  if (typeof fetchImpl !== 'function') {
+    throw new CodexUsageFetchError('network_error', 'Fetch is unavailable');
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(CODEX_RESET_CREDITS_API_URL, {
+      method: 'GET',
+      cache: 'no-store',
+      redirect: 'error',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${auth.accessToken}`,
+        'ChatGPT-Account-Id': auth.accountId,
+        Accept: 'application/json',
+        'User-Agent': 'Noted Terminal',
+      },
+    });
+    if (response.status === 401 || response.status === 403) {
+      throw new CodexUsageFetchError('unauthorized', 'Codex OAuth token is invalid', response.status);
+    }
+    if (response.status === 429) {
+      throw new CodexUsageFetchError('rate_limited', 'OpenAI reset credits are temporarily rate limited', response.status);
+    }
+    if (!response.ok) {
+      throw new CodexUsageFetchError('server_error', 'OpenAI reset credits request failed', response.status);
+    }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new CodexUsageFetchError('invalid_response', 'OpenAI reset credits response is not JSON');
+    }
+    const responseDateMs = Date.parse(response.headers?.get?.('date') || '');
+    const receivedAtMs = Number.isFinite(responseDateMs) ? responseDateMs : now();
+    return buildCodexResetCreditsFromResponse(payload, receivedAtMs);
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new CodexUsageFetchError('timeout', 'OpenAI reset credits request timed out');
+    }
+    if (error instanceof CodexUsageFetchError) throw error;
+    throw new CodexUsageFetchError('network_error', error?.message || String(error));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function pruneCodexRemoteUsageAccounts(currentAccountKey = null) {
   if (codexRemoteUsageByAccount.size <= 8) return;
   const removable = [...codexRemoteUsageByAccount.entries()]
@@ -4925,6 +5164,7 @@ async function getCodexRemoteUsage({
   force = false,
   verifyInitial = false,
   fetchImpl = global.fetch,
+  resetCreditsFetchImpl = null,
   authReader = readCurrentCodexAuthSession,
   authRetryCount = 0,
 } = {}) {
@@ -4987,6 +5227,16 @@ async function getCodexRemoteUsage({
   if (!request) {
     request = (async () => {
       const attemptAuth = auth;
+      const shouldFetchResetCredits = typeof resetCreditsFetchImpl === 'function'
+        || fetchImpl === global.fetch;
+      const resetCreditsRequest = shouldFetchResetCredits
+        ? fetchCodexResetCreditsFromOpenAI(attemptAuth, {
+          fetchImpl: resetCreditsFetchImpl || global.fetch,
+        }).then(
+          (value) => ({ value, error: null }),
+          (error) => ({ value: null, error })
+        )
+        : Promise.resolve({ value: null, error: null });
       let result;
       try {
         result = await fetchCodexUsageFromOpenAI(attemptAuth, { fetchImpl });
@@ -5012,6 +5262,18 @@ async function getCodexRemoteUsage({
             throw new CodexUsageFetchError('inconsistent_response', 'Initial OpenAI usage responses did not agree');
           }
           result = consensus;
+        }
+        const resetCreditsResult = await resetCreditsRequest;
+        result = {
+          ...result,
+          account: {
+            ...result.account,
+            reset_credits: resetCreditsResult.value,
+          },
+        };
+        if (resetCreditsResult.error) {
+          console.warn('[CodexData] reset credits unavailable account=' + result.account.label +
+            ' error=' + compactPreview(resetCreditsResult.error?.message || String(resetCreditsResult.error), 120));
         }
       } catch (error) {
         error.authSnapshot = attemptAuth;
@@ -5046,6 +5308,12 @@ async function getCodexRemoteUsage({
       error: null,
       errorAt: 0,
     };
+    if (nextEntry.account) {
+      nextEntry.account = {
+        ...nextEntry.account,
+        reset_credits: result.account.reset_credits || null,
+      };
+    }
     codexRemoteUsageByAccount.set(result.account.accountKey, nextEntry);
     pruneCodexRemoteUsageAccounts(auth.accountKey);
     if (reconciled.accepted) persistCodexUsageState();
@@ -5073,6 +5341,7 @@ async function getCodexRemoteUsage({
           force: false,
           verifyInitial,
           fetchImpl,
+          resetCreditsFetchImpl,
           authReader,
           authRetryCount: authRetryCount + 1,
         });
@@ -6061,7 +6330,9 @@ module.exports = {
     compareCodexRateSnapshotFreshness,
     compareCodexUsageFreshness,
     normalizeCodexWhamWindow,
+    normalizeCodexAdditionalRateLimits,
     buildCodexUsageFromWhamResponse,
+    buildCodexResetCreditsFromResponse,
     buildCodexUsageFromRateLimits,
     canonicalizeCodexUsage,
     codexUsageSnapshotsMatch,
@@ -6071,6 +6342,7 @@ module.exports = {
     serializeCodexUsageState,
     parseCodexUsageState,
     fetchCodexUsageFromOpenAI,
+    fetchCodexResetCreditsFromOpenAI,
     getCodexRemoteUsage,
     readCurrentCodexAuthSession,
     mergeCodexPreferredAccounts,

@@ -10,8 +10,9 @@ export function isNaturalAgentTurnEndReason(reason) {
 
 /**
  * A recoverable user-level interruption pauses a target turn but does not
- * settle work that another tab explicitly waits on. The interrupted tab's own
- * workflow still fails closed; only pivoted Run After subscriptions survive.
+ * settle work that another tab explicitly waits on. The interrupted tab's
+ * one-shot queue still fails closed; pivoted Run After and its repeating Loop
+ * survive to observe the next natural completion.
  */
 export function isRecoverableAgentTurnInterruption(reason) {
   return reason === 'interrupt' || reason === 'turn_aborted';

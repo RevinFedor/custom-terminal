@@ -74,6 +74,10 @@ export interface ClaudePtySendOptions {
       sourceTabId?: string;
       targetTabId?: string;
       outcome?: string;
+    } | {
+      id?: string;
+      kind: 'prompt-origin';
+      source: 'loop';
     }>;
   };
 }

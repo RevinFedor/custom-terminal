@@ -1,7 +1,7 @@
 // Unified Codex + Claude usage control for the project toolbar.
 //
-// Compact display: the adjoining halves show remaining weekly and 5-hour
-// capacity for each provider; Claude appends its Fable sublimit. Both halves
+// Compact display: the adjoining halves show each provider's available limit
+// windows; Claude appends its Fable sublimit. Both halves
 // open the same popover shell; its provider toggle swaps the limit details
 // while shared activity stays mounted.
 // Two affordances per project convention (Cmd+Hover, design.md::Closing /
@@ -25,6 +25,11 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback, useId } from
 import { createPortal } from 'react-dom';
 import { RefreshCw, ChevronRight } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import {
+  buildCodexAdditionalLimitRows,
+  buildCodexMainUsageView,
+  visibleCodexResetCredits,
+} from '../../utils/codexUsagePresentation.mjs';
 import { ClaudeSparkle } from './CopySessionButton';
 
 const { ipcRenderer } = (window as any).require('electron');
@@ -147,6 +152,27 @@ interface CodexUsageData {
   limit_name?: string | null;
   plan_type?: string | null;
   timestamp?: string | null;
+  authoritative_windows?: boolean;
+  additional_rate_limits?: Array<{
+    key: string;
+    label: string;
+    five_hour?: UsageBucket | null;
+    seven_day?: UsageBucket | null;
+  }>;
+  credits?: {
+    has_credits?: boolean | null;
+    unlimited?: boolean | null;
+    overage_limit_reached?: boolean | null;
+    balance?: number | null;
+  } | null;
+}
+interface CodexResetCredits {
+  available_count: number;
+  timestamp?: string | null;
+  credits: Array<{
+    title: string;
+    expires_at: string;
+  }>;
 }
 interface CodexUsageAccount {
   accountKey: string;
@@ -162,6 +188,7 @@ interface CodexUsageAccount {
   lastError?: string | null;
   warning?: string | null;
   lastAttemptAt?: number | null;
+  reset_credits?: CodexResetCredits | null;
   usage: CodexUsageData;
 }
 interface CodexUsageResponse {
@@ -626,6 +653,18 @@ function formatResetDateTime(iso: string | null | undefined): string {
   }).format(d);
 }
 
+function formatCodexResetCreditExpiry(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(d);
+}
+
 // Ultra-compact reset countdown for the CHIP itself (always visible, must be
 // tiny): "1d 12h" / "12h 30m" / "45m" / "now". Always ≤2 units. The header
 // popover uses the exact local reset date/time; this one trades precision for width.
@@ -708,6 +747,80 @@ function ProgressRow({
           background: color,
           transition: 'width 0.3s ease',
         }} />
+      </div>
+    </div>
+  );
+}
+
+function codexLimitShortLabel(label: string): string {
+  const trimmed = String(label || '').trim();
+  return trimmed.replace(/^GPT-[\d.]+-Codex-/i, '') || 'Additional';
+}
+
+function formatCodexCreditBalance(credits: CodexUsageData['credits']): string | null {
+  if (!credits) return null;
+  if (credits.unlimited) return 'unlimited';
+  if (typeof credits.balance === 'number' && Number.isFinite(credits.balance) && credits.balance > 0) {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: 'USD',
+      minimumFractionDigits: credits.balance < 10 ? 2 : 0,
+      maximumFractionDigits: 2,
+    }).format(credits.balance);
+  }
+  if (credits.has_credits) return 'available';
+  return null;
+}
+
+function CodexCreditBalanceRow({ credits }: { credits: CodexUsageData['credits'] }) {
+  const value = formatCodexCreditBalance(credits);
+  if (!value) return null;
+  return (
+    <div style={{
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'baseline',
+      padding: '8px 12px',
+      borderTop: '1px solid rgba(255,255,255,0.08)',
+      fontSize: 11,
+    }}>
+      <span style={{ color: '#aaa' }}>Codex credits</span>
+      <span style={{ color: '#ddd', fontVariantNumeric: 'tabular-nums' }}>{value}</span>
+    </div>
+  );
+}
+
+function CodexResetCreditsSection({ snapshot }: { snapshot: CodexResetCredits | null | undefined }) {
+  const credits = visibleCodexResetCredits(snapshot, Date.now());
+  if (credits.length === 0) return null;
+  return (
+    <div style={{
+      padding: '8px 12px',
+      borderTop: '1px solid rgba(255,255,255,0.08)',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 6,
+      fontSize: 11,
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+        <span style={{ color: '#ddd' }}>Usage resets</span>
+        <span style={{ color: '#aaa', fontVariantNumeric: 'tabular-nums' }}>
+          {credits.length} available
+        </span>
+      </div>
+      <div role="list" aria-label="Available Codex usage resets" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {credits.map((credit, index) => (
+          <div
+            role="listitem"
+            key={`${credit.expires_at}-${index}`}
+            style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 }}
+          >
+            <span style={{ color: '#888' }}>{credit.title || 'Full reset'}</span>
+            <span style={{ color: '#bbb', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+              expires {formatCodexResetCreditExpiry(credit.expires_at)}
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -1515,11 +1628,14 @@ function CodexUsageChip({
   const usageData = selectedAccount?.usage || data;
   const weekly = usageData?.seven_day || null;
   const fiveHour = usageData?.five_hour || null;
-  const weeklyUsedPct = weekly?.utilization ?? null;
-  const fiveHourUsedPct = fiveHour?.utilization ?? null;
+  const mainUsageView = buildCodexMainUsageView(usageData);
+  const weeklyUsedPct = mainUsageView.weeklyUsed;
+  const fiveHourUsedPct = mainUsageView.fiveHourUsed;
   const weeklyLeftPct = pctRemaining(weeklyUsedPct);
   const fiveHourLeftPct = pctRemaining(fiveHourUsedPct);
-  const chipColor = colorForPct(weeklyUsedPct);
+  const hasWeekly = mainUsageView.hasWeekly;
+  const hasFiveHour = mainUsageView.hasFiveHour;
+  const chipColor = colorForPct(hasWeekly ? weeklyUsedPct : fiveHourUsedPct);
   const fiveHourColor = colorForPct(fiveHourUsedPct);
   const resetShort = formatResetShort(weekly?.resets_at);
   const fiveHourResetShort = formatResetShort(fiveHour?.resets_at);
@@ -1529,6 +1645,11 @@ function CodexUsageChip({
   const selectedStale = selectedAccount?.stale ?? stale;
   const selectedIsCurrent = !!selectedAccount?.accountKey
     && (selectedAccount.isCurrent || selectedAccount.accountKey === currentAccountKey);
+  const resetCredits = selectedIsCurrent ? selectedAccount?.reset_credits : null;
+  const additionalRateLimits = Array.isArray(usageData?.additional_rate_limits)
+    ? usageData.additional_rate_limits
+    : [];
+  const additionalLimitRows = buildCodexAdditionalLimitRows(additionalRateLimits);
   const hasCurrentAccount = !!currentAccountKey
     && accounts.some((account) => account.accountKey === currentAccountKey);
   const canRetryMissingCurrentAccount = !!currentAccountKey && !hasCurrentAccount;
@@ -1536,6 +1657,18 @@ function CodexUsageChip({
     || (!!selectedAccount && !selectedIsCurrent && !canRetryMissingCurrentAccount);
   const snapshotTimestamp = selectedAccount?.timestamp || lastSuccessAt || usageData?.timestamp || null;
   const refreshVisualLoading = loading;
+  const ariaMetrics = [
+    hasWeekly ? `weekly left ${formatPct(weeklyLeftPct)}` : null,
+    hasFiveHour ? `5-hour left ${formatPct(fiveHourLeftPct)}` : null,
+  ].filter(Boolean).join(', ');
+  const titleMetrics = [
+    hasWeekly
+      ? `weekly left: ${formatPct(weeklyLeftPct)} (used ${formatPct(weeklyUsedPct)})${resetShort ? `, resets in ${resetShort}` : ''}`
+      : null,
+    hasFiveHour
+      ? `5-hour left: ${formatPct(fiveHourLeftPct)} (used ${formatPct(fiveHourUsedPct)})${fiveHourResetShort ? `, resets in ${fiveHourResetShort}` : ''}`
+      : null,
+  ].filter(Boolean).join(' • ');
 
   const selectAccount = (account: CodexUsageAccount) => {
     if (!account?.accountKey) return;
@@ -1563,6 +1696,14 @@ function CodexUsageChip({
   const accountOptions: UsageAccountOption[] = accounts.map((account) => {
     const accountWeeklyUsed = account.usage?.seven_day?.utilization ?? null;
     const accountFiveHourUsed = account.usage?.five_hour?.utilization ?? null;
+    const accountMetrics = [
+      accountWeeklyUsed != null
+        ? `weekly left ${formatPct(pctRemaining(accountWeeklyUsed))} (used ${formatPct(accountWeeklyUsed)})`
+        : null,
+      accountFiveHourUsed != null
+        ? `5-hour left ${formatPct(pctRemaining(accountFiveHourUsed))} (used ${formatPct(accountFiveHourUsed)})`
+        : null,
+    ].filter(Boolean).join(' • ');
     const accountCurrent = !!account.accountKey
       && (account.isCurrent || account.accountKey === currentAccountKey);
     return {
@@ -1571,7 +1712,7 @@ function CodexUsageChip({
       selected: account.accountKey === (selectedAccount?.accountKey || selectedAccountKey),
       current: accountCurrent,
       onSelect: () => selectAccount(account),
-      title: `${account.label} • weekly left ${formatPct(pctRemaining(accountWeeklyUsed))} (used ${formatPct(accountWeeklyUsed)}) • 5-hour left ${formatPct(pctRemaining(accountFiveHourUsed))} (used ${formatPct(accountFiveHourUsed)})${account.plan_type ? ` • ${account.plan_type}` : ''}${accountCurrent ? ' • current Codex login' : ''}${account.stale ? ' • stale' : ''}`,
+      title: `${account.label}${accountMetrics ? ` • ${accountMetrics}` : ''}${account.plan_type ? ` • ${account.plan_type}` : ''}${accountCurrent ? ' • current Codex login' : ''}${account.stale ? ' • stale' : ''}`,
     };
   });
   const codexSourceText = `${codexUsageSourceLabel(selectedSource)} · ${formatSnapshotAge(snapshotTimestamp)}${selectedStale ? ' · stale' : ''}${selectedIsCurrent ? ' · current' : ''}`;
@@ -1585,11 +1726,11 @@ function CodexUsageChip({
         onClick={onTriggerClick}
         onMouseEnter={onTriggerEnter}
         onMouseLeave={onTriggerLeave}
-        aria-label={`Codex usage${accountLabel ? ` for ${accountLabel}` : ''}: weekly left ${formatPct(weeklyLeftPct)}, 5-hour left ${formatPct(fiveHourLeftPct)}`}
+        aria-label={`Codex usage${accountLabel ? ` for ${accountLabel}` : ''}${ariaMetrics ? `: ${ariaMetrics}` : ''}`}
         aria-expanded={showPopover}
         aria-haspopup="dialog"
-        title={weeklyUsedPct != null || fiveHourUsedPct != null
-          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly left: ${formatPct(weeklyLeftPct)} (used ${formatPct(weeklyUsedPct)}) • 5-hour left: ${formatPct(fiveHourLeftPct)} (used ${formatPct(fiveHourUsedPct)})${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${loading ? ' • updating' : ''}${selectedStale ? ' • stale' : ''}`
+        title={titleMetrics
+          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} ${titleMetrics}${loading ? ' • updating' : ''}${selectedStale ? ' • stale' : ''}`
           : (loading ? 'Codex usage is updating' : (error || 'Codex usage is unavailable'))}
         style={{
           position: 'relative',
@@ -1602,7 +1743,7 @@ function CodexUsageChip({
           maxWidth: 210,
           padding: '0 7px',
           background: showPopover ? `${chipColor}0A` : 'transparent',
-          color: weeklyUsedPct != null ? chipColor : '#888',
+          color: hasWeekly || hasFiveHour ? chipColor : '#888',
           border: `1px solid ${sticky ? 'rgba(255,255,255,0.4)' : (showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)')}`,
           borderRadius: '4px 0 0 4px',
           fontSize: 11,
@@ -1625,16 +1766,21 @@ function CodexUsageChip({
           </>
         ) : (
           <>
-            <CodexIcon size={15} muted={weeklyUsedPct == null} />
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <span>{formatPct(weeklyLeftPct)}</span>
-              {resetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{resetShort}</span>}
-            </span>
-            <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <span style={{ color: fiveHourUsedPct != null ? fiveHourColor : '#6b7280' }}>{formatPct(fiveHourLeftPct)}</span>
-              {fiveHourResetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{fiveHourResetShort}</span>}
-            </span>
+            <CodexIcon size={15} muted={!hasWeekly && !hasFiveHour} />
+            {hasWeekly && (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span>{formatPct(weeklyLeftPct)}</span>
+                {resetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{resetShort}</span>}
+              </span>
+            )}
+            {mainUsageView.showDivider && <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>}
+            {hasFiveHour && (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ color: fiveHourColor }}>{formatPct(fiveHourLeftPct)}</span>
+                {fiveHourResetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{fiveHourResetShort}</span>}
+              </span>
+            )}
+            {!hasWeekly && !hasFiveHour && <span>—</span>}
           </>
         )}
       </button>
@@ -1666,26 +1812,43 @@ function CodexUsageChip({
 
           {usageData ? (
             <>
-              <ProgressRow
-                label="Weekly left (Codex)"
-                pct={weeklyLeftPct}
-                displayPct={weeklyLeftPct}
-                colorPct={weeklyUsedPct}
-                resetsAt={weekly?.resets_at}
-              />
-              <ProgressRow
-                label="5-hour left"
-                pct={fiveHourLeftPct}
-                displayPct={fiveHourLeftPct}
-                colorPct={fiveHourUsedPct}
-                resetsAt={fiveHour?.resets_at}
-              />
+              {hasWeekly && (
+                <ProgressRow
+                  label="Weekly left (Codex)"
+                  pct={weeklyLeftPct}
+                  displayPct={weeklyLeftPct}
+                  colorPct={weeklyUsedPct}
+                  resetsAt={weekly?.resets_at}
+                />
+              )}
+              {hasFiveHour && (
+                <ProgressRow
+                  label="5-hour left"
+                  pct={fiveHourLeftPct}
+                  displayPct={fiveHourLeftPct}
+                  colorPct={fiveHourUsedPct}
+                  resetsAt={fiveHour?.resets_at}
+                />
+              )}
+              {additionalLimitRows.map((row) => (
+                <ProgressRow
+                  key={row.key}
+                  label={`${codexLimitShortLabel(row.label)} ${row.kind === 'five-hour' ? '5-hour' : 'weekly'} left`}
+                  pct={pctRemaining(row.usedPercent)}
+                  displayPct={pctRemaining(row.usedPercent)}
+                  colorPct={row.usedPercent}
+                  resetsAt={row.resetsAt}
+                />
+              ))}
+              <CodexCreditBalanceRow credits={usageData.credits} />
             </>
           ) : !error ? (
             <div style={{ padding: '12px', fontSize: 11, color: '#666' }}>
               No Codex limit sample yet.
             </div>
           ) : null}
+
+          <CodexResetCreditsSection snapshot={resetCredits} />
 
         </>,
         popoverHost

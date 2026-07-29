@@ -356,6 +356,23 @@ function createCodexSubagentTracker() {
     hasCards() {
       return cardByCallId.size > 0;
     },
+
+    /**
+     * Cards still marked running after the whole rollout was replayed.
+     *
+     * The parent is not a reliable witness of completion: `wait_agent` is
+     * routinely called with no target, and its `Wait completed` output names
+     * nobody — so a finished agent can leave zero terminal trace here. In a
+     * live production tab 12 of 36 spawns ended that way and animated the tab
+     * forever. The caller resolves these against each agent's OWN transcript.
+     */
+    runningCards() {
+      const running = [];
+      for (const card of cardByCallId.values()) {
+        if (card.subagentStatus === 'running' && !card.spawnRejected) running.push(card);
+      }
+      return running;
+    },
   };
 }
 

@@ -13,6 +13,7 @@ const {
   orchestrationInstallBlockers,
   shouldScheduleCreatedTargetAutoStop,
   shouldRetryWaitingNotificationForSourceLifecycle,
+  shouldMarkSourceFollowupUnconfirmed,
 } = require('./orchestration-runs');
 
 async function makeStore() {
@@ -211,6 +212,67 @@ test('completion handoff blocks install until the exact follow-up proof and then
     );
     assert.equal(snapshot.idle, true);
     assert.deepEqual(snapshot.loaders, []);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('startup reconciliation exposes an unconfirmed source handoff without losing late exact proof', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await finishRunAndQueueNotification(store, 'run-unconfirmed', 'target-a', 100);
+    const sent = await store.get('run-unconfirmed');
+    assert.equal(shouldMarkSourceFollowupUnconfirmed(sent, {
+      confirmed: false,
+      reason: 'source-followup-turn-not-found',
+    }), true);
+    assert.equal(shouldMarkSourceFollowupUnconfirmed(sent, { confirmed: true }), false);
+
+    await store.markNotification('run-unconfirmed', 'unconfirmed', {
+      notificationError: 'exact delivery proof missing after restart',
+      notificationUnconfirmedAt: 200,
+      notificationUnconfirmedReason: 'source-followup-turn-not-found',
+    });
+    const unconfirmed = await store.get('run-unconfirmed');
+    assert.equal(unconfirmed.sourceFollowupPending, true);
+    assert.equal(unconfirmed.notificationStatus, 'unconfirmed');
+    assert.equal(orchestrationInstallBlockers(unconfirmed)[0]?.status, 'notification-blocked');
+    assert.deepEqual((await store.listActive()).map((run) => run.runId), ['run-unconfirmed']);
+
+    const confirmed = await store.confirmSourceFollowup(
+      'run-unconfirmed',
+      completionAuditProof('run-unconfirmed'),
+      { now: 300 },
+    );
+    assert.equal(confirmed.confirmed, true);
+    const resolved = await store.get('run-unconfirmed');
+    assert.equal(resolved.notificationStatus, 'sent');
+    assert.equal(resolved.sourceFollowupPending, false);
+    assert.equal(resolved.sourceFollowupStartedAt, 300);
+    assert.equal(resolved.notificationUnconfirmedAt, null);
+    assert.deepEqual(orchestrationInstallBlockers(resolved), []);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('dismissing an unconfirmed handoff preserves the result and releases its blocker', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await finishRunAndQueueNotification(store, 'run-unconfirmed-dismiss', 'target-a', 100);
+    await store.markNotification('run-unconfirmed-dismiss', 'unconfirmed', {
+      notificationError: 'exact delivery proof missing after restart',
+    });
+
+    const dismissed = await store.dismissAttention('run-unconfirmed-dismiss', 'source-1');
+    assert.equal(dismissed.dismissed, true);
+    assert.equal(dismissed.run.status, 'completed');
+    assert.equal(dismissed.run.notificationStatus, 'suppressed');
+    assert.equal(dismissed.run.notificationSuppressed, true);
+    assert.equal(dismissed.run.sourceFollowupPending, false);
+    assert.deepEqual(orchestrationInstallBlockers(dismissed.run), []);
   } finally {
     await store.flush();
     await cleanup();

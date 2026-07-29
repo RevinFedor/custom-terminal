@@ -4834,6 +4834,12 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
               tool: 'Task',
               description: input.description || input.prompt?.substring(0, 60) || 'Task agent',
               toolUseId: toolUseId,
+              // The agent writes its steps into its OWN transcript; the detail
+              // pane needs a way back to that file. A finished agent is found
+              // by id (from the completion notification, attached below), but a
+              // RUNNING one has no id yet — it is located by this exact task
+              // text, which is also the agent's first record.
+              taskPrompt: typeof input.prompt === 'string' ? input.prompt.slice(0, 400) : '',
             };
             // Attach progress history from agent_progress entries
             const taskProgress = toolUseId ? (progressByToolUseId.get(toolUseId) || []) : [];
@@ -5164,8 +5170,19 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                     // legitimately outlives its spawn turn (process-scoped
                     // liveness, same model as Codex in-process subagents).
                     const acceptance = toolResultRecordByUseId.get(block.id);
+                    // The acceptance receipt carries the agent id for async
+                    // launches; the completion notification repeats it. Either
+                    // source lets the detail pane open the agent's transcript
+                    // directly instead of searching for it.
+                    const acceptedAgentId = acceptance?.record?.toolUseResult?.agentId;
+                    if (typeof acceptedAgentId === 'string' && acceptedAgentId) {
+                      actionObj.agentId = acceptedAgentId;
+                    }
                     if (acceptance?.record?.toolUseResult?.isAsync === true) {
                       const notification = taskNotificationByToolUseId.get(block.id);
+                      if (!actionObj.agentId && notification?.agentId) {
+                        actionObj.agentId = notification.agentId;
+                      }
                       const status = deriveClaudeAsyncAgentStatus(notification);
                       // A user-stopped agent will never notify: the sidecar
                       // proof is terminal and outranks "no notification yet".

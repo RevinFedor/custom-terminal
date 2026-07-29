@@ -44,7 +44,7 @@ const ACTIVE = new Set<OrchestrationStatus>([
 ]);
 
 const SUCCESS_VISIBLE_MS = 4_000;
-const NOTIFICATION_ERRORS = new Set(['waiting-for-input', 'failed']);
+const NOTIFICATION_ERRORS = new Set(['waiting-for-input', 'failed', 'unconfirmed']);
 
 const STATUS_LABEL: Record<OrchestrationStatus, string> = {
   creating: 'Создание',
@@ -94,6 +94,10 @@ function canCancelPendingSourceHandoff(run: OrchestrationRun, tabId: string): bo
     && (run.notificationStatus === 'pending' || run.notificationStatus === 'sending');
 }
 
+function canRetrySourceNotification(run: OrchestrationRun, tabId: string): boolean {
+  return hasSourceNotificationError(run, tabId);
+}
+
 function attentionDismissedForTab(run: OrchestrationRun, tabId: string): boolean {
   if (run.sourceTabId === tabId && run.sourceAttentionDismissedAt) return true;
   if (run.targetTabId === tabId && run.targetAttentionDismissedAt) return true;
@@ -106,10 +110,13 @@ function successVisibleAt(run: OrchestrationRun): number | null {
 
 function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation {
   if (hasSourceNotificationError(run, tabId)) {
+    const unconfirmed = run.notificationStatus === 'unconfirmed';
     return {
-      color: '#f87171',
+      color: unconfirmed ? '#fbbf24' : '#f87171',
       icon: 'error',
-      label: run.notificationStatus === 'waiting-for-input' ? 'Не доставлено' : 'Ошибка доставки',
+      label: unconfirmed
+        ? 'Доставка не подтверждена'
+        : run.notificationStatus === 'waiting-for-input' ? 'Не доставлено' : 'Ошибка доставки',
       spinning: false,
     };
   }
@@ -394,6 +401,7 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
     const isSource = run.sourceTabId === tabId;
     const canCancelActiveRun = ACTIVE.has(run.status) && run.status !== 'waiting_recovery';
     const canCancelHandoff = canCancelPendingSourceHandoff(run, tabId);
+    const canRetryNotification = canRetrySourceNotification(run, tabId);
     const presentation = runPresentation(run, tabId);
     const canDismissAttention = presentation.icon === 'error'
       && run.status !== 'waiting_recovery'
@@ -413,6 +421,7 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
             <X size={13} />,
             '#f87171',
           )}
+          {canRetryNotification && actionButton(run, 'retry', 'Повторить доставку результата', <RotateCcw size={13} />, '#fbbf24')}
           {run.status === 'waiting_recovery' && actionButton(run, 'retry', 'Восстановить связь', <RotateCcw size={13} />, '#fbbf24')}
           {run.status === 'waiting_recovery' && actionButton(run, 'report', 'Передать ошибку родителю', <Send size={13} />, '#f87171')}
           {run.status === 'waiting_recovery' && actionButton(run, 'dismiss', 'Закрыть без сообщения', <X size={13} />, '#a3a3a3')}

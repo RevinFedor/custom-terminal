@@ -144,6 +144,10 @@ function sendQueueCommand(
         text: string;
         sourceKey?: string;
       }>;
+      semanticTags?: Array<{
+        kind: 'prompt-origin';
+        source: 'loop';
+      }>;
     };
   },
   source: 'prompt-queue' | 'prompt-loop' = 'prompt-queue',
@@ -707,6 +711,9 @@ function beginValidatedQueueSend(
       presentationSnapshot: {
         historySessionId: sessionIdHint,
         promptChips,
+        ...(kind === 'loop'
+          ? { semanticTags: [{ kind: 'prompt-origin' as const, source: 'loop' as const }] }
+          : {}),
       },
     }, kind === 'loop' ? 'prompt-loop' : 'prompt-queue');
     if (!queueSendTransferredOwnership(res)) {
@@ -890,16 +897,18 @@ function applyAbnormalQueueOutcome(
     if (!tabExists(ownerTabId)) queueState.cleanupClosedTab(ownerTabId);
   }
   const preservePivoted = isRecoverableAgentTurnInterruption(data.reason);
+  const preserveLoop = preservePivoted;
   const disarmedOwners = usePromptQueueStore.getState().disarmQueuesForTrigger(
     data.tabId,
     outcomeTs,
-    { preservePivoted },
+    { preservePivoted, preserveLoop },
   );
   console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
     + ' reason=' + (data.reason || '-')
     + ' outcomeTs=' + outcomeTs
     + ' source=' + source
     + ' preservePivoted=' + (preservePivoted ? '1' : '0')
+    + ' preserveLoop=' + (preserveLoop ? '1' : '0')
     + ' → DISARM trigger workflow owners=' + (disarmedOwners.length ? disarmedOwners.map(shortQueueTabId).join(',') : 'none/newer-arm'));
   return disarmedOwners;
 }

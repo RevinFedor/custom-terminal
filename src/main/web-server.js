@@ -67,6 +67,7 @@ const {
   isCompleteOrchestrationResult,
   shouldScheduleCreatedTargetAutoStop,
   shouldRetryWaitingNotificationForSourceLifecycle,
+  shouldMarkSourceFollowupUnconfirmed,
   orchestrationTargetRunIdFromAudit,
   orchestrationCompletionRunIdFromAudit,
   mergeActiveLoadersWithOrchestrations,
@@ -1477,7 +1478,7 @@ function orchestrationPresentationSnapshot(run, phase) {
   };
 }
 
-async function sendOrchestrationCompletionNotification(run) {
+async function sendOrchestrationCompletionNotification(run, options = {}) {
   if (!run?.runId || orchestrationNotificationInflight.has(run.runId)) return;
   const store = getOrchestrationRunStore();
   const current = await store.getInternal(run.runId);
@@ -1485,6 +1486,7 @@ async function sendOrchestrationCompletionNotification(run) {
   if (current.status === 'completed' && current.resultComplete !== true) return;
   if (current.notifySource === false || current.notificationSuppressed) return;
   if (['sent', 'queued', 'suppressed', 'source-closed'].includes(current.notificationStatus)) return;
+  if (current.notificationStatus === 'unconfirmed' && options.force !== true) return;
   if (current.notificationCancelRequestedAt && !current.sourceFollowupStartedAt) {
     const suppressed = await store.markNotification(current.runId, 'suppressed', {
       notificationDismissedAt: Date.now(),
@@ -2003,7 +2005,19 @@ async function reconcileActiveOrchestrations() {
           notificationSourceSessionId: current.notificationSourceSessionId || sourceInfo.sessionId,
         }, sourceInfo);
       }
-      await reconcileOrchestrationSourceFollowup(current, 'startup-source-followup-reconcile');
+      const sourceProof = await reconcileOrchestrationSourceFollowup(
+        current,
+        'startup-source-followup-reconcile',
+      );
+      const afterReconcile = await store.getInternal(current.runId);
+      if (shouldMarkSourceFollowupUnconfirmed(afterReconcile, sourceProof)) {
+        const unconfirmed = await store.markNotification(current.runId, 'unconfirmed', {
+          notificationError: 'Точное подтверждение доставки не найдено после перезапуска',
+          notificationUnconfirmedAt: Date.now(),
+          notificationUnconfirmedReason: sourceProof?.reason || 'source-followup-turn-not-found',
+        });
+        emitOrchestrationChanges(unconfirmed?.changed, 'source-followup-unconfirmed');
+      }
     }
   }
   await processDueOrchestrationPolicies();
@@ -2099,6 +2113,15 @@ async function performOrchestrationAction(runId, action, options = {}) {
   }
 
   if (action === 'retry') {
+    const actionTabId = cleanOptionalString(options.tabId, '');
+    const canRetrySourceNotification = current.sourceTabId === actionTabId
+      && isTerminalStatus(current.status)
+      && ['waiting-for-input', 'failed', 'unconfirmed'].includes(current.notificationStatus);
+    if (canRetrySourceNotification) {
+      await sendOrchestrationCompletionNotification(current, { force: true });
+      const retried = await store.get(runId);
+      return { ok: true, run: withOrchestrationUrls(retried) };
+    }
     if (!findOrchestrationTabDescriptor(current.targetTabId)) {
       return {
         ok: false,

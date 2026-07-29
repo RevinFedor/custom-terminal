@@ -131,6 +131,11 @@ const {
 } = require(path.join(srcMainDir, 'claude-hook-routing'));
 const { buildSessionProgress } = require(path.join(srcMainDir, 'session-progress'));
 const {
+  findClaudeAgentFile,
+  findCodexAgentFile,
+  readAgentSteps,
+} = require(path.join(srcMainDir, 'subagent-transcript'));
+const {
   parseClaudeComposerCurrentFrame,
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
@@ -27882,6 +27887,145 @@ function rearmCodexProcessActionBoundary(tabId, reason) {
   return true;
 }
 
+// Live subagent count per tab, maintained by the always-running rollout
+// watcher rather than by the History surface.
+//
+// The count used to be computed by HistoryPanel and broadcast outward, which
+// made it a property of the OPEN WINDOW instead of the session: a tab with a
+// working agent showed nothing until the user clicked it, and closing History
+// zeroed it again. The watcher, by contrast, reads the rollout for every tab
+// for the whole life of the app.
+//
+// Terminal proof stays the same as in the durable projection: an agent is
+// counted from its spawn until wait/close/interrupt names it — and, for agents
+// the parent never closes (`wait_agent` with no target names nobody), until its
+// OWN transcript shows it finished.
+const codexTabLiveSubagents = new Map(); // tabId → Map<agentKey, {threadId}>
+
+function publishCodexSubagentActivity(tabId) {
+  const live = codexTabLiveSubagents.get(tabId);
+  const count = live ? live.size : 0;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('tab:background-work', { tabId, count });
+  }
+}
+
+/**
+ * Child thread id of a live Codex subagent, by its spawn call id.
+ *
+ * A live card cannot carry the id itself: the spawn is rendered the moment the
+ * call appears, while the id arrives later (v1 in the spawn output, v2 in a
+ * `sub_agent_activity` event). Without it the detail pane cannot find the
+ * agent's transcript and sits on "loading" forever — that was the E2E ct-e2e27
+ * failure. The watcher already learns the id, so the pane asks it here.
+ */
+function resolveCodexLiveAgentThreadId(tabId, callId) {
+  const live = codexTabLiveSubagents.get(tabId);
+  if (!live) return '';
+  const wanted = String(callId || '');
+  if (wanted) {
+    const direct = live.get(wanted);
+    if (direct?.threadId) return direct.threadId;
+    // Live cards key on `<callId>:canonical:<n>`; match the call prefix.
+    const prefix = wanted.split(':')[0];
+    const byPrefix = live.get(prefix);
+    if (byPrefix?.threadId) return byPrefix.threadId;
+  }
+  // Single live agent on this tab — unambiguous.
+  if (live.size === 1) {
+    const [only] = [...live.values()];
+    if (only?.threadId) return only.threadId;
+  }
+  return '';
+}
+
+ipcMain.handle('subagent:resolve-codex-thread', async (_event, { tabId, callId } = {}) => {
+  if (!tabId) return { success: false, threadId: '' };
+  return { success: true, threadId: resolveCodexLiveAgentThreadId(tabId, callId) };
+});
+
+function trackCodexTabSubagentActivity(state, record) {
+  const tabId = state?.tabId;
+  if (!tabId) return;
+  const payload = record?.payload || record;
+  const type = payload?.type;
+  let changed = false;
+  const live = codexTabLiveSubagents.get(tabId) || new Map();
+
+  if (type === 'function_call' && payload.name === 'spawn_agent') {
+    let args = payload.arguments;
+    if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = null; } }
+    const key = String(payload.call_id || '');
+    if (key) {
+      live.set(key, { taskName: args?.task_name ? '/root/' + args.task_name : '', threadId: '' });
+      changed = true;
+    }
+  } else if (type === 'function_call_output') {
+    const callId = String(payload.call_id || '');
+    let output = payload.output;
+    if (typeof output === 'object') { try { output = JSON.stringify(output); } catch { output = ''; } }
+    const text = String(output || '');
+    const entry = live.get(callId);
+    if (entry) {
+      // A rejected spawn never became an agent — drop it immediately.
+      if (!/"agent_id"|"task_name"/.test(text)) { live.delete(callId); changed = true; }
+      else {
+        const threadId = (text.match(/"agent_id"\s*:\s*"([^"]+)"/) || [])[1] || '';
+        if (threadId) entry.threadId = threadId;
+      }
+    }
+    // Any output naming a tracked agent as completed closes it.
+    if (/"completed"/.test(text) || /"previous_status"/.test(text)) {
+      for (const [key, value] of [...live]) {
+        if ((value.threadId && text.includes(value.threadId))
+          || (value.taskName && text.includes(value.taskName))) {
+          live.delete(key);
+          changed = true;
+        }
+      }
+    }
+  } else if (type === 'function_call'
+    && (payload.name === 'close_agent' || payload.name === 'interrupt_agent')) {
+    let args = payload.arguments;
+    if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = null; } }
+    const target = String(args?.target || args?.id || '');
+    for (const [key, value] of [...live]) {
+      if (target && (value.threadId === target || value.taskName === target
+        || value.taskName.endsWith(target))) {
+        live.delete(key);
+        changed = true;
+      }
+    }
+  } else if (type === 'sub_agent_activity') {
+    const threadId = String(payload.agent_thread_id || '');
+    const agentPath = String(payload.agent_path || '');
+    for (const value of live.values()) {
+      if (threadId && (value.taskName === agentPath || !value.threadId)) value.threadId = threadId;
+    }
+    if (String(payload.kind || '') === 'interrupted') {
+      for (const [key, value] of [...live]) {
+        if (value.threadId === threadId || value.taskName === agentPath) { live.delete(key); changed = true; }
+      }
+    }
+  }
+
+  // Sweep: agents the parent never closed, but whose own transcript is done.
+  if (live.size > 0 && (type === 'task_complete' || type === 'function_call_output')) {
+    for (const [key, value] of [...live]) {
+      if (!value.threadId) continue;
+      const filePath = findCodexAgentFile({ agentSessionId: value.threadId });
+      if (filePath && isAgentFinishedByOwnTranscript({ toolType: 'codex', filePath })) {
+        live.delete(key);
+        changed = true;
+      }
+    }
+  }
+
+  if (live.size > 0) codexTabLiveSubagents.set(tabId, live);
+  else codexTabLiveSubagents.delete(tabId);
+  if (changed) publishCodexSubagentActivity(tabId);
+}
+
 function processCodexTurnLine(state, line, sourceByteOffset = null) {
   const text = String(line || '').trim();
   if (!text) return;
@@ -27895,6 +28039,7 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     record.__byteOffset = Number(sourceByteOffset);
   }
   recordCodexLiveSubagentOwnership(state, record);
+  trackCodexTabSubagentActivity(state, record);
   const event = codexEventType(record);
   if (event === 'user_message' && state.manualBindingConflict) {
     promoteCodexManualWriterBindingAfterUserMessage(state, record);
@@ -38845,6 +38990,55 @@ ipcMain.handle('claude-sdk:get-subagent-messages', async (event, { sessionId, ag
   } catch (err) {
     console.error('[ClaudeSDK] get-subagent-messages failed:', err.message);
     return { success: false, error: String(err.message || err), messages: [] };
+  }
+});
+
+// Live steps of a PTY subagent (Claude Task/Agent, Codex in-process agent) for
+// the History background-detail pane. The agent writes its work into its own
+// transcript and hands the parent only the final answer, so without this the
+// pane can only show a placeholder.
+//
+// Identity differs per provider and per lifecycle stage:
+//   - Codex knows the child thread id from the spawn output → direct lookup;
+//   - Claude learns its agentId only from the completion notification, so a
+//     RUNNING agent is located positionally (newest file in the session's
+//     subagents dir whose first record is this exact task text).
+// Resolution is cached per chip key: the file never moves, and re-scanning the
+// projects tree on every tick is what made tab switches janky before.
+const subagentFilePathCache = new Map();
+
+ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
+  const {
+    chipKey,
+    toolType,
+    parentSessionId,
+    cwd,
+    agentId,
+    agentSessionId,
+    taskText,
+    spawnedAt,
+    offset = 0,
+  } = payload;
+  try {
+    let filePath = chipKey ? subagentFilePathCache.get(chipKey) : null;
+    if (filePath && !fs.existsSync(filePath)) {
+      subagentFilePathCache.delete(chipKey);
+      filePath = null;
+    }
+    if (!filePath) {
+      filePath = toolType === 'codex'
+        ? findCodexAgentFile({ agentSessionId: agentSessionId || agentId })
+        : findClaudeAgentFile({ parentSessionId, cwd, agentId, taskText, spawnedAt });
+      if (filePath && chipKey) subagentFilePathCache.set(chipKey, filePath);
+    }
+    if (!filePath) {
+      // Not an error: a just-spawned agent may not have flushed its file yet.
+      return { success: true, steps: [], offset: 0, size: 0, pending: true };
+    }
+    return readAgentSteps({ toolType, filePath, offset });
+  } catch (error) {
+    console.error('[SubagentSteps] read failed:', error.message);
+    return { success: false, error: String(error.message || error), steps: [], offset: 0, size: 0 };
   }
 });
 

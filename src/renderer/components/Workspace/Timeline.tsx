@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, ArrowUpToLine } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -39,6 +39,12 @@ import {
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
 } from '../../utils/timelineTranscriptRefresh.mjs';
+import {
+  buildTimelineCornerBadges,
+  collectTimelineDocs,
+  isTimelineGroupExpanded,
+  timelineMarkerGeometry,
+} from '../../utils/timelineMarkerPresentation.mjs';
 import {
   normalizeForkMarkerEntryUuids,
   normalizeForkMarkers,
@@ -208,6 +214,10 @@ interface TimelineEntry {
     sourceTabId?: string;
     targetTabId?: string;
     outcome?: string;
+  } | {
+    id?: string;
+    kind: 'prompt-origin';
+    source: 'loop';
   }>;
   responseTokens?: number;
   responseModel?: string;          // last assistant.message.model for this turn (e.g. 'deepseek-v4-flash', 'claude-opus-4-7')
@@ -458,6 +468,10 @@ function getSearchLines(content: string): string[] {
 
 function getOrchestrationTag(entry: TimelineEntry) {
   return entry.semanticTags?.find(tag => tag.kind === 'orchestration') || null;
+}
+
+function getLoopPromptOriginTag(entry: TimelineEntry) {
+  return entry.semanticTags?.find(tag => tag.kind === 'prompt-origin' && tag.source === 'loop') || null;
 }
 
 // Build grouping map for consecutive built-in sub-agent or durable Terminal MCP
@@ -1339,6 +1353,10 @@ function Timeline({
   // visualisation is replaced. Width drag-resizable in expanded mode.
   const isExpandedLayout = readOnly ? false : treeMode;
   const effectiveWidth = isExpandedLayout ? timelineWidth : 32;
+  useEffect(() => {
+    if (isOpen && isExpandedLayout) return;
+    setExpandedGroups((current) => current.size > 0 ? new Set() : current);
+  }, [isExpandedLayout, isOpen, tabId]);
   const [widthTransitionTabKey, setWidthTransitionTabKey] = useState(tabId);
   const widthTransitionEnabled = widthTransitionTabKey === tabId;
   useLayoutEffect(() => {
@@ -1549,6 +1567,22 @@ function Timeline({
 
   // Compute group map for sub-agent entries (Phase 2)
   const groupMap = useMemo(() => computeGroups(entries), [entries]);
+  const collapsedGroupPresentation = useMemo(() => {
+    const presentations = new Map<string, {
+      edited: string[];
+      searched: string[];
+      isLoop: boolean;
+    }>();
+    for (const info of groupMap.values()) {
+      if (!info.isGroupHeader || presentations.has(info.groupId)) continue;
+      const members = entries.slice(info.startIndex, info.startIndex + info.groupSize);
+      presentations.set(info.groupId, {
+        ...collectTimelineDocs(members),
+        isLoop: members.some(candidate => !!getLoopPromptOriginTag(candidate)),
+      });
+    }
+    return presentations;
+  }, [entries, groupMap]);
   const entryIndexByUuid = useMemo(() => {
     const indexByUuid = new Map<string, number>();
     entries.forEach((entry, index) => {
@@ -5357,6 +5391,92 @@ function Timeline({
     && entries[currentActiveEntryIndex - 1]?.type === 'compact'
     ? entries[currentActiveEntryIndex - 1]
     : currentActiveEntry;
+  const currentActiveGroupInfo = activeTooltipIndex !== null
+    ? groupMap.get(activeTooltipIndex)
+    : undefined;
+  const currentActiveGroupExpanded = !!(
+    currentActiveGroupInfo?.groupId
+    && isTimelineGroupExpanded(isExpandedLayout, expandedGroups.has(currentActiveGroupInfo.groupId))
+  );
+  const currentActivePresentationEntries = currentActiveEntry
+    ? currentActiveGroupInfo?.isGroupHeader && !currentActiveGroupExpanded
+      ? entries.slice(
+          currentActiveGroupInfo.startIndex,
+          currentActiveGroupInfo.startIndex + currentActiveGroupInfo.groupSize,
+        )
+      : [currentActiveEntry]
+    : [];
+  const currentActiveDocs = collectTimelineDocs(currentActivePresentationEntries);
+  const currentActiveDocsKey = currentActiveGroupInfo?.isGroupHeader && !currentActiveGroupExpanded
+    ? `timeline-group:${currentActiveGroupInfo.groupId}`
+    : currentActiveEntry?.uuid || 'timeline-entry';
+
+  const renderAttachedDocsActivity = (files: string[], queries: string[], expansionKey: string) => (
+    <>
+      {files.length > 0 && (() => {
+        const open = expandedDocsEdit.has(expansionKey);
+        return (
+          <div className={`pb-1.5 mb-1.5 border-b ${DOCS_TIMELINE_COLORS.edited.borderClass} shrink-0`}>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setExpandedDocsEdit(prev => {
+                  const next = new Set(prev);
+                  if (next.has(expansionKey)) next.delete(expansionKey); else next.add(expansionKey);
+                  return next;
+                });
+              }}
+              className={`w-full text-left flex items-center gap-1.5 ${DOCS_TIMELINE_COLORS.edited.hoverClass} rounded px-0.5 py-0.5 cursor-pointer`}
+              style={{ color: DOCS_TIMELINE_COLORS.edited.tooltip }}
+            >
+              <Pencil size={10} className="shrink-0" style={{ color: DOCS_TIMELINE_COLORS.edited.visible }} />
+              <span className="leading-snug font-mono text-[10px] flex-1 font-medium">
+                Docs updated ({files.length})
+              </span>
+            </button>
+            {open && (
+              <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: DOCS_TIMELINE_COLORS.edited.tooltipMuted }}>
+                {files.map((file, index) => (
+                  <div key={`${file}:${index}`} className="break-all" style={{ opacity: 0.85 }}>{file}</div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+      {queries.length > 0 && (() => {
+        const open = expandedDocsSearch.has(expansionKey);
+        return (
+          <div className={`pb-1.5 mb-1.5 border-b ${DOCS_TIMELINE_COLORS.search.borderClass} shrink-0`}>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setExpandedDocsSearch(prev => {
+                  const next = new Set(prev);
+                  if (next.has(expansionKey)) next.delete(expansionKey); else next.add(expansionKey);
+                  return next;
+                });
+              }}
+              className={`w-full text-left flex items-start gap-1.5 ${DOCS_TIMELINE_COLORS.search.hoverClass} rounded px-0.5 py-0.5 cursor-pointer`}
+              style={{ color: DOCS_TIMELINE_COLORS.search.tooltip }}
+            >
+              <Search size={10} className="shrink-0 mt-0.5" style={{ color: DOCS_TIMELINE_COLORS.search.visible }} />
+              <span className="leading-snug font-mono text-[10px] flex-1 font-medium">
+                Docs search ({queries.length})
+              </span>
+            </button>
+            {open && (
+              <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: DOCS_TIMELINE_COLORS.search.tooltipMuted }}>
+                {queries.map((query, index) => (
+                  <div key={`${query}:${index}`} className="break-words" style={{ opacity: 0.85 }}>«{query}»</div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+    </>
+  );
 
   const getCodexUsageTotal = (entry: TimelineEntry): number | null => {
     const u = entry.codexUsage;
@@ -5768,7 +5888,7 @@ function Timeline({
         {group.title}
       </span>
       <span style={{ color: 'rgba(216,180,254,0.7)', fontSize: 9, fontFamily: 'monospace', flexShrink: 0, marginTop: 2 }}>
-        ×{group.memberUuids.length}
+        {group.memberUuids.length}
       </span>
     </div>
   );
@@ -5937,6 +6057,10 @@ function Timeline({
           {/* ──── SEGMENT LOOP (entries.map → per-entry dot, note strips, fork stripes, plan-mode boundaries) ──── */}
           {entries.map((entry, index) => {
             const groupInfo = groupMap.get(index);
+            const isGroupExpanded = !!(
+              groupInfo?.groupId
+              && isTimelineGroupExpanded(isExpandedLayout, expandedGroups.has(groupInfo.groupId))
+            );
             const semanticMembership = semanticGroupByUuid.get(entry.uuid);
             const semanticGroup = semanticMembership?.group;
             const codexCompactCluster = codexCompactClusters.get(index);
@@ -5957,7 +6081,7 @@ function Timeline({
             }
 
             // Phase 2: Hide collapsed group children (but NOT the header)
-            if (groupInfo?.isGroupChild && !groupInfo?.isGroupHeader && !expandedGroups.has(groupInfo.groupId)) {
+            if (groupInfo?.isGroupChild && !groupInfo?.isGroupHeader && !isGroupExpanded) {
               // Still need ref for visibility system — render invisible placeholder
               return <div key={entry.uuid} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
             }
@@ -6001,7 +6125,6 @@ function Timeline({
             })();
 
             // Phase 2: Group state
-            const isGroupExpanded = !!(groupInfo?.groupId && expandedGroups.has(groupInfo.groupId));
             const isGroupCollapsed = !!(groupInfo?.isGroupHeader && !isGroupExpanded);
             const isGroupChild = !!(groupInfo?.isGroupChild && isGroupExpanded);
             // When collapsed, header entry is the visible toggle (not a child)
@@ -6016,8 +6139,6 @@ function Timeline({
             const isPlan = !!entry.isPlan;
             const isDocsEdit = entry.type === 'docs_edit';
             const isDocsSearch = entry.type === 'docs_search';
-            const docsEditedCount = entry.docsEdited?.length || (isDocsEdit ? 1 : 0);
-            const docsSearchCount = entry.docsSearchQueries?.length || (isDocsSearch ? 1 : 0);
             const dotClickState = clickedState?.index === index ? clickedState.status : null;
 
             // Entry type flags
@@ -6030,6 +6151,22 @@ function Timeline({
             const groupAccentDim = orchestrationGroup ? '#7e22ce' : '#7c86f0';
             const groupAccentRgb = orchestrationGroup ? '168, 85, 247' : '129, 140, 248';
             const isHovered = hoveredIndex === index || activeTooltipIndex === index;
+            const groupPresentation = isGroupCollapsed && groupInfo
+              ? collapsedGroupPresentation.get(groupInfo.groupId)
+              : undefined;
+            const markerEdited = groupPresentation?.edited
+              || entry.docsEdited
+              || (isDocsEdit && entry.content ? [entry.content] : []);
+            const markerSearched = groupPresentation?.searched
+              || entry.docsSearchQueries
+              || (isDocsSearch && entry.content ? [entry.content] : []);
+            const isLoopPrompt = groupPresentation?.isLoop ?? !!getLoopPromptOriginTag(entry);
+            const cornerBadges = buildTimelineCornerBadges({
+              isLoop: isLoopPrompt,
+              docsEditedCount: markerEdited.length,
+              docsSearchCount: markerSearched.length,
+              collapsedGroupSize: isGroupCollapsed ? groupInfo?.groupSize || 0 : 0,
+            });
 
             // ── Dot color ──
             let dotColor: string;
@@ -6079,17 +6216,16 @@ function Timeline({
             }
 
             // ── Dot size ──
-            const dotWidth = displaysAsCompact
-              ? (isHovered ? '10px' : '7px')
-              : showAsChild
-                ? (isHovered ? '8px' : (isInViewport ? '8px' : '4px'))
-                : (isHovered ? '10px' : (isInViewport ? '10px' : '5px'));
-            const dotHeight = displaysAsCompact
-              ? (isHovered ? '10px' : '7px')
-              : showAsChild
-                ? (isHovered ? '8px' : (isInViewport ? '3px' : '4px'))
-                : (isHovered ? '10px' : (isInViewport ? '3px' : '5px'));
-            const dotRadius = displaysAsCompact ? '50%' : (isInViewport && !isHovered ? '1px' : '50%');
+            const dotGeometry = timelineMarkerGeometry({
+              isOrchestration: entryIsOrchestration,
+              displaysAsCompact,
+              showAsChild,
+              isHovered,
+              isInViewport,
+            });
+            const dotWidth = dotGeometry.width;
+            const dotHeight = dotGeometry.height;
+            const dotRadius = dotGeometry.radius;
 
             // Expanded group header: render toggle bar THEN the entry as child
             const isExpandedHeader = !!(groupInfo?.isGroupHeader && isGroupExpanded);
@@ -6153,7 +6289,7 @@ function Timeline({
                       fontFamily: 'monospace',
                       fontWeight: 600,
                     }}>
-                      ×{groupInfo!.groupSize}
+                      {groupInfo!.groupSize}
                     </span>
                     {/* Right line */}
                     <div style={{
@@ -6233,7 +6369,11 @@ function Timeline({
                       : (treeMode
                           ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
                           : (showAsChild ? '4px' : undefined)),
-                    paddingRight: isExpandedLayout ? '8px' : undefined,
+                    paddingRight: isExpandedLayout
+                      ? (cornerBadges.items.length > 0
+                          ? (cornerBadges.items.some((item: { slot: string }) => item.slot.endsWith('left')) ? '34px' : '22px')
+                          : '8px')
+                      : undefined,
                     paddingTop: isExpandedLayout ? '6px' : undefined,
                     paddingBottom: isExpandedLayout ? '6px' : undefined,
                     gap: isExpandedLayout ? '6px' : undefined,
@@ -6343,36 +6483,64 @@ function Timeline({
                     </>
                   )}
 
-                  {(docsEditedCount > 0 || docsSearchCount > 0) && (
-                    <div
-                      className="absolute pointer-events-none select-none flex items-center gap-[2px]"
-                      aria-label={`${docsEditedCount > 0 ? `${docsEditedCount} docs edits` : ''}${docsEditedCount > 0 && docsSearchCount > 0 ? ', ' : ''}${docsSearchCount > 0 ? `${docsSearchCount} docs searches` : ''}`}
-                      style={isExpandedLayout ? {
-                        right: groupInfo?.isGroupHeader && !isGroupExpanded ? '24px' : '5px',
-                        top: '3px',
-                        zIndex: 2,
-                      } : {
-                        left: 'calc(50% + 5px)',
-                        top: 'calc(50% - 8px)',
-                        zIndex: 2,
-                      }}
-                    >
-                      {docsEditedCount > 0 && (
-                        <Pencil
-                          size={Math.max(7, Math.min(9, Math.round(timelineFontSize * 0.62)))}
-                          strokeWidth={2.2}
-                          color={DOCS_TIMELINE_COLORS.edited.visible}
-                        />
-                      )}
-                      {docsSearchCount > 0 && (
-                        <Search
-                          size={Math.max(7, Math.min(9, Math.round(timelineFontSize * 0.62)))}
-                          strokeWidth={2.2}
-                          color={DOCS_TIMELINE_COLORS.search.visible}
-                        />
-                      )}
-                    </div>
-                  )}
+                  {cornerBadges.items.map((badge: { kind: string; slot: string; text?: string }) => {
+                    const isRight = badge.slot.endsWith('right');
+                    const isTop = badge.slot.startsWith('top');
+                    const offset = isExpandedLayout
+                      ? (isRight ? '5px' : '18px')
+                      : '2px';
+                    const positionStyle: React.CSSProperties = {
+                      position: 'absolute',
+                      zIndex: 2,
+                      ...(isExpandedLayout
+                        ? { right: offset }
+                        : { [isRight ? 'right' : 'left']: offset }),
+                      [isTop ? 'top' : 'bottom']: isExpandedLayout ? '3px' : '2px',
+                    };
+                    if (badge.kind === 'count') {
+                      return (
+                        <span
+                          key={`${badge.kind}:${badge.slot}`}
+                          className="pointer-events-none select-none"
+                          aria-label={`${badge.text} grouped calls`}
+                          style={{
+                            ...positionStyle,
+                            color: groupAccent,
+                            fontFamily: 'monospace',
+                            fontSize: '9px',
+                            fontWeight: 600,
+                            lineHeight: 1,
+                          }}
+                        >
+                          {badge.text}
+                        </span>
+                      );
+                    }
+                    const size = isExpandedLayout
+                      ? Math.max(7, Math.min(9, Math.round(timelineFontSize * 0.62)))
+                      : 7;
+                    const Icon = badge.kind === 'loop'
+                      ? Repeat2
+                      : badge.kind === 'docs-edit'
+                        ? Pencil
+                        : Search;
+                    const color = badge.kind === 'loop'
+                      ? '#60a5fa'
+                      : badge.kind === 'docs-edit'
+                        ? DOCS_TIMELINE_COLORS.edited.visible
+                        : DOCS_TIMELINE_COLORS.search.visible;
+                    return (
+                      <Icon
+                        key={`${badge.kind}:${badge.slot}`}
+                        className="pointer-events-none select-none"
+                        aria-label={badge.kind}
+                        size={size}
+                        strokeWidth={2.2}
+                        color={color}
+                        style={positionStyle}
+                      />
+                    );
+                  })}
 
                   {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
                   {isExpandedLayout && (() => {
@@ -6451,25 +6619,6 @@ function Timeline({
                       </div>
                     );
                   })()}
-
-                  {/* Phase 2: Group count badge (collapsed only) */}
-                  {groupInfo?.isGroupHeader && !isGroupExpanded && !treeMode && (
-                    <div
-                      className="absolute pointer-events-none"
-                      style={{
-                        right: '5px',
-                        top: '50%',
-                        transform: 'translateY(-50%)',
-                        fontSize: '9px',
-                        lineHeight: '1',
-                        color: groupAccent,
-                        fontWeight: 600,
-                        fontFamily: 'monospace',
-                      }}
-                    >
-                      ×{groupInfo.groupSize}
-                    </div>
-                  )}
 
                   {/* Loading indicator — mirrors the resting-state Viewport-Dash
                       shape (10×3 white strip) so the click→scroll transition is
@@ -7486,11 +7635,16 @@ function Timeline({
                     </div>
                     {(() => {
                       const gi = groupMap.get(activeTooltipIndex!);
-                      if (gi?.isGroupHeader && !expandedGroups.has(gi.groupId)) {
-                        return <span className="text-[10px] text-white/40">×{gi.groupSize} calls</span>;
+                      if (gi?.isGroupHeader && !isTimelineGroupExpanded(isExpandedLayout, expandedGroups.has(gi.groupId))) {
+                        return <span className="text-[10px] text-white/40">{gi.groupSize} calls</span>;
                       }
                       return null;
                     })()}
+                    {renderAttachedDocsActivity(
+                      currentActiveDocs.edited,
+                      currentActiveDocs.searched,
+                      currentActiveDocsKey,
+                    )}
                     <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
                       {currentActiveEntry.content}
                     </div>
@@ -7509,10 +7663,10 @@ function Timeline({
                     </div>
                     {(() => {
                       const gi = groupMap.get(activeTooltipIndex!);
-                      if (gi?.isGroupHeader && !expandedGroups.has(gi.groupId)) {
+                      if (gi?.isGroupHeader && !isTimelineGroupExpanded(isExpandedLayout, expandedGroups.has(gi.groupId))) {
                         return (
                           <span className="text-[10px] text-white/40">
-                            ×{gi.groupSize} agents{gi.hasTimeout ? ' (with timeout)' : ''}
+                            {gi.groupSize} agents{gi.hasTimeout ? ' (with timeout)' : ''}
                           </span>
                         );
                       }
@@ -7619,78 +7773,11 @@ function Timeline({
                         </Tooltip>
                       </div>
                     )}
-                    {/* Docs-edit / docs-search inline preview — attached to user-entry that triggered them.
-                        Previously rendered as separate green dots on timeline; consolidated here so each
-                        prompt has at most one dot, with docs-info surfaced on hover.
-                        Default: compact one-liner "Docs updated (N) — basename, basename, …".
-                        Click on the line: expand to show full paths / full queries on separate rows.
-                        Keeps tooltip body short so prompt text below is visible without scrolling. */}
-                    {currentActiveEntry.docsEdited && currentActiveEntry.docsEdited.length > 0 && (() => {
-                      const uuid = currentActiveEntry.uuid;
-                      const open = expandedDocsEdit.has(uuid);
-                      const files = currentActiveEntry.docsEdited;
-                      return (
-                        <div className={`pb-1.5 mb-1.5 border-b ${DOCS_TIMELINE_COLORS.edited.borderClass} shrink-0`}>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setExpandedDocsEdit(prev => {
-                                const next = new Set(prev);
-                                if (next.has(uuid)) next.delete(uuid); else next.add(uuid);
-                                return next;
-                              });
-                            }}
-                            className={`w-full text-left flex items-center gap-1.5 ${DOCS_TIMELINE_COLORS.edited.hoverClass} rounded px-0.5 py-0.5 cursor-pointer`}
-                            style={{ color: DOCS_TIMELINE_COLORS.edited.tooltip }}
-                          >
-                            <Pencil size={10} className="shrink-0" style={{ color: DOCS_TIMELINE_COLORS.edited.visible }} />
-                            <span className="leading-snug font-mono text-[10px] flex-1 font-medium">
-                              Docs updated ({files.length})
-                            </span>
-                          </button>
-                          {open && (
-                            <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: DOCS_TIMELINE_COLORS.edited.tooltipMuted }}>
-                              {files.map((f: string, i: number) => (
-                                <div key={i} className="break-all" style={{ opacity: 0.85 }}>{f}</div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })()}
-                    {currentActiveEntry.docsSearchQueries && currentActiveEntry.docsSearchQueries.length > 0 && (() => {
-                      const uuid = currentActiveEntry.uuid;
-                      const open = expandedDocsSearch.has(uuid);
-                      const queries = currentActiveEntry.docsSearchQueries;
-                      return (
-                        <div className={`pb-1.5 mb-1.5 border-b ${DOCS_TIMELINE_COLORS.search.borderClass} shrink-0`}>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setExpandedDocsSearch(prev => {
-                                const next = new Set(prev);
-                                if (next.has(uuid)) next.delete(uuid); else next.add(uuid);
-                                return next;
-                              });
-                            }}
-                            className={`w-full text-left flex items-start gap-1.5 ${DOCS_TIMELINE_COLORS.search.hoverClass} rounded px-0.5 py-0.5 cursor-pointer`}
-                            style={{ color: DOCS_TIMELINE_COLORS.search.tooltip }}
-                          >
-                            <Search size={10} className="shrink-0 mt-0.5" style={{ color: DOCS_TIMELINE_COLORS.search.visible }} />
-                            <span className="leading-snug font-mono text-[10px] flex-1">
-                              <span className="font-medium">Docs search ({queries.length})</span>
-                            </span>
-                          </button>
-                          {open && (
-                            <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: DOCS_TIMELINE_COLORS.search.tooltipMuted }}>
-                              {queries.map((q: string, i: number) => (
-                                <div key={i} className="break-words" style={{ opacity: 0.85 }}>«{q}»</div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })()}
+                    {renderAttachedDocsActivity(
+                      currentActiveDocs.edited,
+                      currentActiveDocs.searched,
+                      currentActiveDocsKey,
+                    )}
                     <div className="text-white/90 leading-snug font-mono scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
                       {currentActiveEntry.content}
                     </div>

@@ -3744,8 +3744,30 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         return next;
       });
     };
+    // Two producers, one map:
+    //   `tab:background-work` — main-process rollout watcher, alive for every
+    //     tab regardless of which one is open. This is the real source.
+    //   `history-panel:background-work` — the open History surface. Kept as a
+    //     faster local echo for the visible tab, but it can no longer be the
+    //     only witness: a tab whose History was never opened used to show no
+    //     activity at all, and closing History zeroed a still-running agent.
+    const onMainBackgroundWork = (_event: unknown, detail: { tabId?: string; count?: number }) => {
+      if (!detail?.tabId) return;
+      const active = (Number(detail.count) || 0) > 0;
+      setBackgroundWorkMap((prev) => {
+        if ((prev.get(detail.tabId!) || false) === active) return prev;
+        const next = new Map(prev);
+        if (active) next.set(detail.tabId!, true);
+        else next.delete(detail.tabId!);
+        return next;
+      });
+    };
     window.addEventListener('history-panel:background-work', onBackgroundWork);
-    return () => window.removeEventListener('history-panel:background-work', onBackgroundWork);
+    ipcRenderer.on('tab:background-work', onMainBackgroundWork);
+    return () => {
+      window.removeEventListener('history-panel:background-work', onBackgroundWork);
+      ipcRenderer.removeListener('tab:background-work', onMainBackgroundWork);
+    };
   }, []);
   const claudeSpinnerVisualIdleTimersRef = useRef<Map<string, number>>(new Map());
   // Awaiting-user-input: Claude called AskUserQuestion and is blocked waiting for
@@ -3757,12 +3779,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const hasVisibleProcessBar = (tab: TabData): boolean => {
     return processStatus.get(tab.id) || false;
   };
+  // A live subagent keeps the tab's ordinary loader on — that is intended, not
+  // a bug: work IS attributable to this session, so the tab looks busy exactly
+  // like it does during its own turn. (The purple orchestration loader is a
+  // different signal and stays separate.) The real defects around this are
+  // elsewhere: the count is only computed while History is mounted, and a
+  // finished agent keeps counting until the parent notices.
   const isTabTurnBusy = (tab: TabData): boolean => {
     const pasteBusy = pasteBusyMap.get(tab.id) || false;
-    // In-process subagents (Codex) legitimately outlive their spawn turn;
-    // while any live background chip exists the tab inherits the loader even
-    // though the turn's own busy flag already dropped. Display-only signal
-    // from HistoryPanel — lifecycle ownership stays with the runtime maps.
     const backgroundWork = backgroundWorkMap.get(tab.id) || false;
     if (tab.commandType === 'gemini') return (geminiBusyMap.get(tab.id) || false) || pasteBusy;
     if (tab.commandType === 'codex') return (codexBusyMap.get(tab.id) || false) || pasteBusy || backgroundWork;

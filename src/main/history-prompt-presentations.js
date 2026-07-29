@@ -250,6 +250,15 @@ function normalizePromptPresentationSnapshot(snapshot) {
   });
   const tags = Array.isArray(snapshot?.semanticTags) ? snapshot.semanticTags : [];
   const semanticTags = tags.flatMap((tag, index) => {
+    if (tag?.kind === 'prompt-origin') {
+      const source = String(tag.source || '').trim();
+      if (source !== 'loop') return [];
+      return [{
+        id: String(tag.id || `durable-prompt-origin-tag-${index}`),
+        kind: 'prompt-origin',
+        source,
+      }];
+    }
     if (tag?.kind !== 'orchestration') return [];
     const runId = String(tag.runId || '').trim();
     const phase = String(tag.phase || '').trim();
@@ -348,7 +357,9 @@ function decorateHistoryPromptPresentations(db, {
     }
     if (!row || !Array.isArray(row.chips) || row.chips.length === 0) return entry;
     const promptChips = row.chips.filter(item => item?.kind === 'prompt');
-    const semanticTags = row.chips.filter(item => item?.kind === 'orchestration');
+    const semanticTags = row.chips.filter(item => (
+      item?.kind === 'orchestration' || item?.kind === 'prompt-origin'
+    ));
     if (promptChips.length === 0 && semanticTags.length === 0) return entry;
     changed = true;
     return {

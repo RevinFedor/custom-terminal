@@ -13,7 +13,11 @@ const ACTIVE_STATUSES = new Set([
   'waiting_recovery',
 ]);
 const SOURCE_FOLLOWUP_DELIVERY_STATUSES = new Set(['pending', 'sending', 'sent', 'queued']);
-const SOURCE_FOLLOWUP_PROBLEM_STATUSES = new Set(['waiting-for-input', 'failed']);
+const SOURCE_FOLLOWUP_RECONCILABLE_STATUSES = new Set([
+  ...SOURCE_FOLLOWUP_DELIVERY_STATUSES,
+  'unconfirmed',
+]);
+const SOURCE_FOLLOWUP_PROBLEM_STATUSES = new Set(['waiting-for-input', 'failed', 'unconfirmed']);
 const ORCHESTRATION_TARGET_HANDOFF_PREFIX = 'orchestration:';
 const ORCHESTRATION_TARGET_SOURCE_PREFIX = 'orchestration:';
 const ORCHESTRATION_COMPLETION_HANDOFF_PREFIX = 'orchestration-complete:';
@@ -55,6 +59,15 @@ function isSourceNotificationBlocked(run) {
   return isTerminalStatus(run?.status)
     && canNotifySource(run)
     && SOURCE_FOLLOWUP_PROBLEM_STATUSES.has(run.notificationStatus);
+}
+
+function shouldMarkSourceFollowupUnconfirmed(run, reconciliation) {
+  return reconciliation?.confirmed !== true
+    && isTerminalStatus(run?.status)
+    && canNotifySource(run)
+    && run.sourceFollowupPending === true
+    && !run.sourceFollowupStartedAt
+    && (run.notificationStatus === 'sent' || run.notificationStatus === 'queued');
 }
 
 function isTrackedOrchestrationRun(run) {
@@ -677,6 +690,9 @@ class OrchestrationRunStore {
     run.notificationStatus = 'sent';
     run.notificationDeliveredAt ||= now;
     run.notificationError = null;
+    run.notificationUnconfirmedAt = null;
+    run.notificationUnconfirmedReason = null;
+    if (run.status === 'completed') run.attentionRequiredAt = null;
     run.updatedAt = now;
 
     const parent = run.parentRunId ? this.runs.get(run.parentRunId) : null;
@@ -1180,7 +1196,7 @@ class OrchestrationRunStore {
     if (!isTerminalStatus(run?.status)
       || !canNotifySource(run)
       || run.sourceFollowupStartedAt
-      || !SOURCE_FOLLOWUP_DELIVERY_STATUSES.has(run.notificationStatus)) {
+      || !SOURCE_FOLLOWUP_RECONCILABLE_STATUSES.has(run.notificationStatus)) {
       run.sourceFollowupPending = false;
       return;
     }
@@ -1250,6 +1266,7 @@ module.exports = {
   isCompleteOrchestrationResult,
   shouldScheduleCreatedTargetAutoStop,
   shouldRetryWaitingNotificationForSourceLifecycle,
+  shouldMarkSourceFollowupUnconfirmed,
   orchestrationTargetRunIdFromAudit,
   orchestrationCompletionRunIdFromAudit,
   orchestrationInstallBlockers,
