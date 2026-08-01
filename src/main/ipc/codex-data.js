@@ -713,9 +713,29 @@ function codexHistoryOutputParts(rawOutput) {
   return parts;
 }
 
+/**
+ * Background cell id announced by Codex when a command keeps running.
+ *
+ * The announcement is a MACHINE line, and its id is always a plain number.
+ * Matching `[^\s]+` anywhere in the output made any PROSE mentioning the
+ * phrase look like a real announcement — and a tool output is mostly prose:
+ * file contents, diffs, an agent quoting our own docs. Scar 2026-07-31
+ * (prod tab-2634): a command printed our documentation sentence «Orchestrated
+ * `exec` может вернуть `Script running with cell ID N`», the parser captured
+ * "N`," as the cell id, and the card was filed away as background work under
+ * an id no `wait` could ever name. Its spinner never stopped — 809 live tool
+ * cards opened against 808 closed, and the one left over was whatever command
+ * happened to be on screen.
+ *
+ * Anchoring to a line start and demanding digits keeps the real announcement
+ * (a line of its own) and rejects every quotation of it: prose that mentions
+ * the phrase mid-sentence no longer matches, and a literal `N` is not a
+ * number. A false negative is cheap — the card stays inline and settles
+ * normally; a false positive strands it forever.
+ */
 function codexHistoryCellId(rawOutput) {
   const text = codexHistoryOutputParts(rawOutput).join('\n');
-  return /Script running with cell ID\s+([^\s]+)/.exec(text)?.[1] || null;
+  return /^\s*Script running with cell ID\s+(\d+)\s*$/m.exec(text)?.[1] || null;
 }
 
 function parseApplyPatchHunks(body) {
@@ -1594,6 +1614,121 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
     leftoverBuffer,
     leftover: leftoverBuffer.toString('utf8'),
   };
+}
+
+async function scanCodexStableSourceRewindProof(filePath, {
+  targetSourceLine,
+  actionStartedAtMs,
+} = {}) {
+  const targetLine = Number(targetSourceLine);
+  const actionAt = Number(actionStartedAtMs);
+  if (!filePath
+    || !Number.isInteger(targetLine)
+    || targetLine < 0
+    || !Number.isFinite(actionAt)) {
+    return {
+      complete: false,
+      error: 'codex_stable_source_scan_input_invalid',
+      targetRecord: null,
+      taskStartedRecord: null,
+      userMessageRecord: null,
+    };
+  }
+
+  let pending = Buffer.alloc(0);
+  let pendingStart = 0;
+  let nextChunkOffset = 0;
+  let lineNumber = 0;
+  let parseErrors = 0;
+  let targetRecord = null;
+  let taskStartedRecord = null;
+  let userMessageRecord = null;
+  let stoppedAtProof = false;
+
+  const inspectLine = (lineBuffer, byteOffset) => {
+    const sourceLine = lineNumber;
+    lineNumber += 1;
+    const raw = lineBuffer.toString('utf8').trim();
+    if (!raw) return false;
+    const couldMatter = sourceLine === targetLine
+      || (sourceLine > targetLine
+        && raw.includes('"event_msg"')
+        && (raw.includes('"task_started"') || raw.includes('"user_message"')));
+    if (!couldMatter) return false;
+    let record;
+    try {
+      record = JSON.parse(raw);
+    } catch {
+      parseErrors += 1;
+      return false;
+    }
+    const decorated = { ...record, __line: sourceLine, __byteOffset: byteOffset };
+    if (sourceLine === targetLine) {
+      targetRecord = decorated;
+      return false;
+    }
+    if (record?.type !== 'event_msg') return false;
+    const timestampMs = parseTimestampMs(record.timestamp);
+    if (!Number.isFinite(timestampMs) || timestampMs < actionAt) return false;
+    if (record.payload?.type === 'task_started' && !taskStartedRecord) {
+      taskStartedRecord = decorated;
+    } else if (record.payload?.type === 'user_message' && !userMessageRecord) {
+      userMessageRecord = decorated;
+    }
+    return !!taskStartedRecord && !!userMessageRecord;
+  };
+
+  try {
+    const stream = fs.createReadStream(filePath, {
+      highWaterMark: CODEX_JSONL_READ_CHUNK_BYTES,
+    });
+    for await (const chunk of stream) {
+      const chunkStart = nextChunkOffset;
+      nextChunkOffset += chunk.length;
+      const data = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
+      const dataStart = pending.length > 0 ? pendingStart : chunkStart;
+      let cursor = 0;
+      let newlineIndex = data.indexOf(0x0a, cursor);
+      while (newlineIndex >= 0) {
+        if (inspectLine(data.subarray(cursor, newlineIndex), dataStart + cursor)) {
+          stoppedAtProof = true;
+          stream.destroy();
+          break;
+        }
+        cursor = newlineIndex + 1;
+        newlineIndex = data.indexOf(0x0a, cursor);
+      }
+      if (stoppedAtProof) break;
+      pending = Buffer.from(data.subarray(cursor));
+      pendingStart = dataStart + cursor;
+    }
+    if (!stoppedAtProof && pending.length > 0) {
+      inspectLine(pending, pendingStart);
+    }
+    return {
+      complete: parseErrors === 0,
+      error: parseErrors > 0 ? 'codex_stable_source_scan_parse_failed' : null,
+      parseErrors,
+      scannedBytes: nextChunkOffset,
+      scannedLines: lineNumber,
+      stoppedAtProof,
+      targetRecord,
+      taskStartedRecord,
+      userMessageRecord,
+    };
+  } catch (error) {
+    return {
+      complete: false,
+      error: error?.message || String(error),
+      parseErrors,
+      scannedBytes: nextChunkOffset,
+      scannedLines: lineNumber,
+      stoppedAtProof,
+      targetRecord,
+      taskStartedRecord,
+      userMessageRecord,
+    };
+  }
 }
 
 async function _parseJsonlFileIncremental(filePath) {
@@ -2544,6 +2679,12 @@ function lastCodexTimelineUser(entries) {
   return null;
 }
 
+function isCodexSubagentNotification(payload = {}) {
+  if (payload.type !== 'user_message') return false;
+  const text = payload.message || extractTextContent(payload.content) || '';
+  return String(text).includes('<subagent_notification>');
+}
+
 function buildCodexTimeline(records, sessionId) {
   const entries = [];
   const compactCompanionLines = codexCompactCompanionLines(records);
@@ -2585,7 +2726,7 @@ function buildCodexTimeline(records, sessionId) {
         // announces completion via <subagent_notification> inside a user
         // message. Full history feeds it to the card tracker; Timeline must
         // not mint a phantom dot for it.
-        if (text.includes('<subagent_notification>')) continue;
+        if (isCodexSubagentNotification(payload)) continue;
         currentTurnIndex += 1;
         const entry = {
           uuid: stableUuid(sessionId, record.__line, 'codex-user'),
@@ -3807,6 +3948,11 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
 
     if (record.type === 'event_msg') {
       if (payload.type === 'user_message') {
+        // Codex persists a built-in subagent completion as an event_msg with a
+        // user role, but it is a service carrier inside the current external
+        // turn. Timeline already ignores it; the clean result projection must
+        // keep the same boundary or it drops the final assistant tail.
+        if (isCodexSubagentNotification(payload)) continue;
         currentTurnIndex += 1;
         if (opts.includeUser) {
           const images = [
@@ -6293,11 +6439,13 @@ module.exports = {
     selectSingleProvenCodexRewindRecoveryCandidate,
     findCodexLinkedLiveBoundary,
     readCodexSessionMetadata,
+    scanCodexStableSourceRewindProof,
     isCodexUserTuiSession,
     parseJsonlFile,
     readJsonlRange,
     getCodexJsonlCacheStats,
     codexCompactCompanionLines,
+    codexHistoryCellId,
     invalidateJsonlCache: invalidateCodexJsonlCache,
     buildCodexCleanEntries,
     extractTextContent,

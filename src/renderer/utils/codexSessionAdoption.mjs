@@ -11,7 +11,12 @@ export function codexSessionAdoptionOptionsFromEvent(event) {
   const effort = typeof rawProof?.effort === 'string' ? rawProof.effort.trim().toLowerCase() : '';
   const proofAt = Number(rawProof?.proofAt);
   const exactProof = model && effort && Number.isFinite(proofAt) && proofAt > 0
-    ? { model, effort, proofAt }
+    ? {
+      model,
+      effort,
+      proofAt,
+      ...(typeof rawProof?.fast === 'boolean' ? { fast: rawProof.fast } : {}),
+    }
     : null;
   return {
     carryCodexSettingsProof: event?.carryCodexSettingsProof === true && (
@@ -38,6 +43,13 @@ export function planCarriedCodexSettingsProofApplication({
   if (!model || !effort || !owner || !Number.isFinite(proofAt) || proofAt <= 0) {
     return { allowed: false, reason: 'carried-codex-settings-proof-invalid' };
   }
+  const serviceTierPatch = typeof proof?.fast === 'boolean'
+    ? {
+      codexLiveServiceTier: proof.fast ? 'priority' : 'default',
+      codexLiveServiceTierSessionId: owner,
+      codexLiveServiceTierSource: 'verified-composer-footer',
+    }
+    : {};
   if (effort === 'ultra') {
     return {
       allowed: true,
@@ -53,6 +65,7 @@ export function planCarriedCodexSettingsProofApplication({
         codexLiveModel: model,
         codexLiveEffort: effort,
         codexLiveSettingsSessionId: owner,
+        ...serviceTierPatch,
       },
     };
   }
@@ -69,6 +82,7 @@ export function planCarriedCodexSettingsProofApplication({
       codexLiveModel: undefined,
       codexLiveEffort: undefined,
       codexLiveSettingsSessionId: undefined,
+      ...serviceTierPatch,
     },
   };
 }

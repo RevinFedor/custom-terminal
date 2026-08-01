@@ -178,6 +178,49 @@ async function readLastClaudeUserRecord(
 }
 
 /**
+ * UserPromptSubmit carries Claude's exact accepted prompt, but not our handoff
+ * id. Bind the new execution turn only when that payload identifies one
+ * already-submitted pending audit. Identical concurrent sends stay unbound;
+ * JSONL confirmation keeps its separate oldest-first ownership contract.
+ */
+function selectUniqueClaudePromptSubmitAudit(
+  audits,
+  submittedPrompt,
+  { hashText = promptAuditFingerprint } = {},
+) {
+  if (typeof submittedPrompt !== 'string') {
+    return {
+      audit: null,
+      matchingAudits: [],
+      reason: 'hook-prompt-unavailable',
+    };
+  }
+  const submittedHash = hashText(submittedPrompt);
+  const submittedLen = submittedPrompt.length;
+  const matchingAudits = (Array.isArray(audits) ? audits : []).filter((audit) => (
+    audit
+    && audit.finished !== true
+    && audit.submitWritten === true
+    && Number(audit.expectedLen) === submittedLen
+    && String(audit.expectedHash || '') === submittedHash
+  ));
+  if (matchingAudits.length === 1) {
+    return {
+      audit: matchingAudits[0],
+      matchingAudits,
+      reason: 'unique-exact-pending-audit',
+    };
+  }
+  return {
+    audit: null,
+    matchingAudits,
+    reason: matchingAudits.length > 1
+      ? 'ambiguous-identical-pending-audits'
+      : 'no-exact-pending-audit',
+  };
+}
+
+/**
  * Ordered multi-audit selection, mirroring selectCodexPendingPromptAudit: given
  * every prompt carrier found after the shared read boundary, match each pending
  * audit by exact len+hash against a causal (post-its-own-boundary) record.
@@ -496,5 +539,6 @@ module.exports = {
   buildClaudeLivePromptAuditConfirmation,
   selectClaudeLivePromptOwner,
   selectClaudePendingPromptAudit,
+  selectUniqueClaudePromptSubmitAudit,
   shouldStageClaudeUserPromptAudit,
 };

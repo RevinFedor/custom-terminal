@@ -18,6 +18,10 @@ export interface AIComposerSurfaceChip {
   className?: string;
   meta?: React.ReactNode;
   collapsedPreview?: React.ReactNode;
+  /** Rich body shown in the same expanded area used by pasted text. */
+  expandedPreview?: React.ReactNode;
+  /** Right-hand metadata in the expanded preview header. */
+  previewMeta?: React.ReactNode;
   expandable?: boolean;
   onActivate?: () => void;
   onRestore?: () => void;
@@ -29,7 +33,18 @@ interface AIComposerSurfaceProps {
   className?: string;
   style?: React.CSSProperties;
   topBar?: React.ReactNode;
+  // Pinned to the far end of the top line, opposite topBar. Hosts controls that
+  // act on the surface itself rather than on the draft, so they never mix into
+  // the status/chip cluster growing from the left.
+  topBarTrailing?: React.ReactNode;
   chips?: AIComposerSurfaceChip[];
+  /**
+   * Chips the consumer renders itself (inline paste blobs inside the input) but
+   * whose expanded content still belongs in this surface's single preview area.
+   * Without them the expand target would be unfindable and clicking such a chip
+   * would silently do nothing.
+   */
+  externalExpandableChips?: AIComposerSurfaceChip[];
   expandedChipId?: string | null;
   onExpandedChipChange?: (chipId: string | null) => void;
   input: React.ReactNode;
@@ -38,6 +53,59 @@ interface AIComposerSurfaceProps {
   overlay?: React.ReactNode;
   secondaryFontSize?: number;
 }
+
+export interface AIComposerImagePreviewProps {
+  src?: string;
+  alt?: string;
+  loading?: boolean;
+  error?: string | null;
+}
+
+export const AIComposerImagePreview: React.FC<AIComposerImagePreviewProps> = ({
+  src,
+  alt = 'Attached image preview',
+  loading = false,
+  error = null,
+}) => (
+  <div
+    data-ai-composer-image-preview
+    data-preview-state={src ? 'ready' : error ? 'error' : loading ? 'loading' : 'unavailable'}
+    style={{
+      minHeight: 72,
+      padding: 8,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      color: error ? '#f59e0b' : '#777',
+      background: 'radial-gradient(circle at center, rgba(255,255,255,0.035), transparent 68%)',
+      textAlign: 'center',
+    }}
+  >
+    {src ? (
+      <img
+        src={src}
+        alt={alt}
+        draggable={false}
+        style={{
+          display: 'block',
+          maxWidth: '100%',
+          maxHeight: 'min(420px, 54vh)',
+          width: 'auto',
+          height: 'auto',
+          objectFit: 'contain',
+          borderRadius: 4,
+          userSelect: 'none',
+        }}
+      />
+    ) : error ? (
+      <span>Image preview unavailable: {error}</span>
+    ) : loading ? (
+      <span>Loading image…</span>
+    ) : (
+      <span>Image preview unavailable</span>
+    )}
+  </div>
+);
 
 /**
  * Shared desktop presentation for AI composers.
@@ -51,7 +119,9 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
   className,
   style,
   topBar,
+  topBarTrailing,
   chips = [],
+  externalExpandableChips = [],
   expandedChipId = null,
   onExpandedChipChange,
   input,
@@ -61,18 +131,35 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
   secondaryFontSize = 11,
 }) => {
   const expandedChip = expandedChipId
-    ? chips.find((chip) => chip.id === expandedChipId && chip.expandable !== false) || null
+    ? [...chips, ...externalExpandableChips].find(
+      (chip) => chip.id === expandedChipId && chip.expandable !== false,
+    ) || null
     : null;
-  const hasTopLine = topBar != null || chips.length > 0;
+  const hasTopLine = topBar != null || topBarTrailing != null || chips.length > 0;
   const secondaryStyle = {
     ['--ai-composer-secondary-font-size' as any]: `${secondaryFontSize}px`,
     ...style,
   } as React.CSSProperties;
 
-  const preview = expandedChip?.text ? (
+  const hasExpandedPreview = !!expandedChip && (
+    typeof expandedChip.text === 'string' || expandedChip.expandedPreview != null
+  );
+  const expandedPreviewMeta = expandedChip?.previewMeta ?? (
+    typeof expandedChip?.text === 'string'
+      ? `${expandedChip.text.length.toLocaleString()} симв.`
+      : null
+  );
+  const isImagePreview = expandedChip?.kind === 'image';
+  const preview = hasExpandedPreview && expandedChip ? (
     <div
       data-ai-composer-chip-preview={expandedChip.id}
+      data-ai-composer-preview-kind={expandedChip.kind}
       style={{
+        // Text benefits from the full composer width. An image does not: a
+        // narrow card at the left keeps the draft visible and avoids turning
+        // a portrait screenshot into a wall-sized overlay.
+        width: isImagePreview ? 'min(440px, calc(100% - 12px))' : '100%',
+        maxWidth: '100%',
         maxHeight: 'min(320px, 48vh)',
         overflow: 'auto',
         marginBottom: 6,
@@ -100,21 +187,23 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
         }}
       >
         <span>{expandedChip.label}</span>
-        <span>{expandedChip.text.length.toLocaleString()} симв.</span>
+        {expandedPreviewMeta != null && <span>{expandedPreviewMeta}</span>}
       </div>
-      <pre
-        style={{
-          margin: 0,
-          padding: 8,
-          color: '#bdbdbd',
-          font: 'inherit',
-          lineHeight: 1.45,
-          whiteSpace: 'pre-wrap',
-          wordBreak: 'break-word',
-        }}
-      >
-        {expandedChip.text}
-      </pre>
+      {typeof expandedChip.text === 'string' ? (
+        <pre
+          style={{
+            margin: 0,
+            padding: 8,
+            color: '#bdbdbd',
+            font: 'inherit',
+            lineHeight: 1.45,
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+          }}
+        >
+          {expandedChip.text}
+        </pre>
+      ) : expandedChip.expandedPreview}
     </div>
   ) : null;
 
@@ -127,6 +216,12 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
         gap: 6,
         minWidth: 0,
         width: '100%',
+        // Fixed slot height. The status control is ~22px while a prompt chip
+        // with its border is taller, so adding the first chip used to grow the
+        // whole composer and shove the input down under the caret. The row now
+        // reserves the taller of the two and never resizes.
+        height: 24,
+        flex: '0 0 auto',
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
         fontSize: secondaryFontSize,
       }}
@@ -151,13 +246,19 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
             alignItems: 'center',
             gap: 5,
             minWidth: 0,
+            // Chips scroll sideways inside the fixed row instead of wrapping:
+            // a second line would defeat the reserved height above.
+            flexWrap: 'nowrap',
+            height: '100%',
             overflowX: 'auto',
             overflowY: 'hidden',
             scrollbarWidth: 'none',
           }}
         >
           {chips.map((chip) => {
-            const expandable = chip.expandable !== false && typeof chip.text === 'string';
+            const expandable = chip.expandable !== false && (
+              typeof chip.text === 'string' || chip.expandedPreview != null
+            );
             const activate = chip.onActivate || (
               expandable && onExpandedChipChange
                 ? () => onExpandedChipChange(expandedChipId === chip.id ? null : chip.id)
@@ -240,6 +341,17 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
             );
           })}
         </div>
+      )}
+      {topBarTrailing != null && (
+        <>
+          <span aria-hidden style={{ flex: 1, minWidth: 4 }} />
+          <div
+            data-ai-composer-top-trailing
+            style={{ display: 'flex', alignItems: 'center', gap: 4, flex: '0 0 auto' }}
+          >
+            {topBarTrailing}
+          </div>
+        </>
       )}
     </div>
   ) : undefined;

@@ -772,6 +772,53 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
   assert.equal(manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId), 'project-b-child-v2');
   assert.equal(manager.getAppState(v2HandoffKey), null);
 
+  const transcriptRecoveryGeneration = 'rewind-generation-v2-transcript-recovery';
+  const transcriptRecoveryStartedAtMs = Date.now();
+  const transcriptRecoveryJournal = {
+    ...v2HandoffJournal,
+    sourceSessionId: 'project-b-child-v2',
+    expectedBindingSessionId: 'project-b-child-v2',
+    actionGeneration: transcriptRecoveryGeneration,
+    actionStartedAtMs: transcriptRecoveryStartedAtMs,
+    phase: 'confirm-enter-boundary',
+  };
+  manager.setAppState(v2HandoffKey, transcriptRecoveryJournal);
+  const transcriptRecoveryArgs = {
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: transcriptRecoveryGeneration,
+    targetSourceLine: transcriptRecoveryJournal.targetSourceLine,
+    targetTextHash: transcriptRecoveryJournal.targetTextHash,
+    taskStartedSourceLine: transcriptRecoveryJournal.targetSourceLine + 2,
+    taskStartedAtMs: transcriptRecoveryStartedAtMs + 10,
+    userMessageSourceLine: transcriptRecoveryJournal.targetSourceLine + 4,
+    userMessageTimestampMs: transcriptRecoveryStartedAtMs + 20,
+  };
+  manager.updateTabCodexSessionId(scopedProjectB.id, projectBTabId, 'newer-binding-before-recovery');
+  const heldTranscriptRecovery = manager.resolvePendingCodexStableSourceFromTranscript(
+    transcriptRecoveryArgs,
+  );
+  assert.equal(heldTranscriptRecovery.success, false);
+  assert.equal(heldTranscriptRecovery.error, 'codex_handoff_binding_changed');
+  assert.deepEqual(
+    manager.getAppState(v2HandoffKey),
+    transcriptRecoveryJournal,
+    'same-source recovery keeps the journal when a newer binding won the race',
+  );
+  manager.updateTabCodexSessionId(scopedProjectB.id, projectBTabId, 'project-b-child-v2');
+  const transcriptRecovery = manager.resolvePendingCodexStableSourceFromTranscript(
+    transcriptRecoveryArgs,
+  );
+  assert.equal(transcriptRecovery.success, true);
+  assert.equal(
+    manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId),
+    'project-b-child-v2',
+    'same-source transcript recovery never rewrites the durable binding',
+  );
+  assert.equal(manager.getAppState(v2HandoffKey), null);
+
   const stableActionGeneration = 'rewind-generation-v2-stable-source';
   const stableAppliedAtMs = Date.now();
   const stableJournal = {

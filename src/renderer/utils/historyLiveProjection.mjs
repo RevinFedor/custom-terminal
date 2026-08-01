@@ -79,6 +79,34 @@ const actionToolUseId = (action) => {
   return '';
 };
 
+/**
+ * Task card for a Claude subagent spawn, built from the live tool_use block.
+ *
+ * The durable builder produces the same shape from the same fields; this is the
+ * live twin of it, not a second source of truth. It deliberately carries only
+ * what the spawn itself proves — description and task text. Status is NOT set:
+ * a fresh spawn is turn-scoped work, and the background-chip rule reads
+ * "no status → alive while the turn is busy". Claiming `running` here would
+ * make it process-scoped and resurrect the eternal-chip bug.
+ *
+ * The CLI renamed the tool Task → Agent; both spawn the same thing, and the
+ * renderer contract stays `tool: 'Task'`.
+ */
+const claudeSubagentSpawnCard = (block, toolUseId) => {
+  const name = String(block?.name || block?.tool_name || '');
+  if (name !== 'Task' && name !== 'Agent') return null;
+  const input = isObject(block.input) ? block.input : (isObject(block.arguments) ? block.arguments : {});
+  const prompt = typeof input.prompt === 'string' ? input.prompt : '';
+  return {
+    tool: 'Task',
+    description: String(input.description || prompt.slice(0, 60) || 'Task agent'),
+    toolUseId,
+    // A running agent has no id yet — the detail pane locates its transcript by
+    // this exact task text, which is also the agent's own first record.
+    taskPrompt: prompt.slice(0, 400),
+  };
+};
+
 const mergeActions = (existing = [], incoming = []) => {
   if (!Array.isArray(existing) || existing.length === 0) return incoming;
   if (!Array.isArray(incoming) || incoming.length === 0) return existing;
@@ -137,6 +165,15 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
       if (isObject(block.subagentCard) && block.subagentCard.tool === 'Task') {
         return { ...block.subagentCard, toolUseId };
       }
+      // Claude has no such prepared card: its live record is the raw tool_use,
+      // so the card must be rebuilt here from the spawn itself. Without this,
+      // a Claude subagent was invisible for its whole life whenever the durable
+      // history could not be re-read — and it never can be while the parent
+      // turn is busy, which is exactly a SYNCHRONOUS agent's entire lifetime.
+      // Scar 2026-07-29: a 42-second synchronous agent produced zero chips
+      // because every durable re-read was deferred with reason=turn-busy.
+      const claudeSpawn = claudeSubagentSpawnCard(block, toolUseId);
+      if (claudeSpawn) return claudeSpawn;
       return {
         tool: '__raw__',
         rawTool: {

@@ -1,4 +1,9 @@
 import { create } from 'zustand';
+import {
+  isOrchestrationCompletionBlocking,
+  isOrchestrationInheritedActivity,
+  shouldRetainOrchestrationRun,
+} from '../utils/orchestrationRunProjection.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -22,7 +27,13 @@ export type OrchestrationRun = {
   outcome?: string | null;
   createdAt: number;
   completedAt?: number | null;
+  deliveryAcceptedAt?: number | null;
+  targetPromptProofAt?: number | null;
   recoveryDeadlineAt?: number | null;
+  pausedAt?: number | null;
+  resumedAt?: number | null;
+  resumeAfterAt?: number | null;
+  resumeAwaitingNewTurn?: boolean;
   sourceTabId: string;
   sourceTabName?: string;
   sourceProjectId: string;
@@ -56,38 +67,11 @@ export type OrchestrationRun = {
   notificationUnconfirmedAt?: number | null;
   notificationUnconfirmedReason?: string | null;
   resultError?: string | null;
+  resultComplete?: boolean;
+  resultProofStatus?: string | null;
   recoveryReason?: string | null;
   error?: string | null;
 };
-
-const INHERITED_ACTIVE = new Set<OrchestrationStatus>([
-  'creating',
-  'starting',
-  'sending',
-  'sent',
-  'queued',
-  'running',
-  'waiting_descendants',
-]);
-
-const TERMINAL_STATUSES = new Set<OrchestrationStatus>([
-  'completed',
-  'failed',
-  'cancelled',
-]);
-
-const SOURCE_FOLLOWUP_DELIVERY_STATUSES = new Set([
-  'pending',
-  'sending',
-  'sent',
-  'queued',
-]);
-
-const SOURCE_NOTIFICATION_PROBLEM_STATUSES = new Set([
-  'waiting-for-input',
-  'failed',
-  'unconfirmed',
-]);
 
 export type OrchestrationRunReleaseKind = 'handoff-started' | 'success' | 'abnormal';
 
@@ -112,53 +96,13 @@ type OrchestrationStore = {
 
 const runChangeListeners = new Set<(change: OrchestrationRunChange) => void>();
 
-function isSeparateSourceRun(run: OrchestrationRun): boolean {
-  return Boolean(run.sourceTabId && run.sourceTabId !== run.targetTabId);
-}
-
-function isSourceFollowupPending(run: OrchestrationRun): boolean {
-  return TERMINAL_STATUSES.has(run.status)
-    && isSeparateSourceRun(run)
-    && run.notificationSuppressed !== true
-    && run.sourceFollowupPending === true
-    && !run.sourceFollowupStartedAt
-    && SOURCE_FOLLOWUP_DELIVERY_STATUSES.has(run.notificationStatus || '');
-}
-
-function isSourceNotificationBlocked(run: OrchestrationRun): boolean {
-  return TERMINAL_STATUSES.has(run.status)
-    && isSeparateSourceRun(run)
-    && run.notificationSuppressed !== true
-    && SOURCE_NOTIFICATION_PROBLEM_STATUSES.has(run.notificationStatus || '');
-}
-
-function isInheritedBusyRun(run: OrchestrationRun): boolean {
-  if (!isSeparateSourceRun(run)) return false;
-  return INHERITED_ACTIVE.has(run.status) || isSourceFollowupPending(run);
-}
-
-function isCompletionBlockedRun(run: OrchestrationRun): boolean {
-  if (!isSeparateSourceRun(run)) return false;
-  return INHERITED_ACTIVE.has(run.status)
-    || run.status === 'waiting_recovery'
-    || isSourceFollowupPending(run)
-    || isSourceNotificationBlocked(run);
-}
-
-function shouldRetainRun(run: OrchestrationRun): boolean {
-  return INHERITED_ACTIVE.has(run.status)
-    || run.status === 'waiting_recovery'
-    || isSourceFollowupPending(run)
-    || isSourceNotificationBlocked(run);
-}
-
 function projections(runs: Iterable<OrchestrationRun>) {
   const inheritedBusyTabIds = new Set<string>();
   const inheritedBusyProjectIds = new Set<string>();
   const completionBlockedTabIds = new Set<string>();
   for (const run of runs) {
-    if (isCompletionBlockedRun(run)) completionBlockedTabIds.add(run.sourceTabId);
-    if (isInheritedBusyRun(run)) {
+    if (isOrchestrationCompletionBlocking(run)) completionBlockedTabIds.add(run.sourceTabId);
+    if (isOrchestrationInheritedActivity(run)) {
       inheritedBusyTabIds.add(run.sourceTabId);
       if (run.sourceProjectId) inheritedBusyProjectIds.add(run.sourceProjectId);
     }
@@ -191,7 +135,7 @@ export const useOrchestrationStore = create<OrchestrationStore>((set, get) => ({
   replaceActiveRuns: (runs) => {
     const activeRuns = new Map(
       (Array.isArray(runs) ? runs : [])
-        .filter(shouldRetainRun)
+        .filter(shouldRetainOrchestrationRun)
         .map((run) => [run.runId, run]),
     );
     set({ activeRuns, ...projections(activeRuns.values()), initialized: true });
@@ -205,7 +149,7 @@ export const useOrchestrationStore = create<OrchestrationStore>((set, get) => ({
       ? previousState.completionBlockedTabIds.has(sourceTabId)
       : false;
     const activeRuns = new Map(previousState.activeRuns);
-    if (shouldRetainRun(run)) activeRuns.set(run.runId, run);
+    if (shouldRetainOrchestrationRun(run)) activeRuns.set(run.runId, run);
     else activeRuns.delete(run.runId);
     const nextProjections = projections(activeRuns.values());
     const completionBlocked = sourceTabId

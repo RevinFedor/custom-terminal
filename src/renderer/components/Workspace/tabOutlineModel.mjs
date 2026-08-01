@@ -93,7 +93,7 @@ function buildTabForest(tabs) {
 }
 
 export function buildTabOutline(tabs = [], groups = []) {
-  const mainTabs = tabs.filter(tab => !tab.parentTabId && !tab.isUtility);
+  const mainTabs = tabs.filter(tab => !tab.parentTabId);
   const groupById = new Map(groups.map(group => [group.id, group]));
   const normalizedTabs = mainTabs.map(tab => ({
     ...tab,
@@ -192,6 +192,20 @@ export function buildTabOutline(tabs = [], groups = []) {
   return result;
 }
 
+export function tabOutlineSubtreeTabIds(outline = [], tabId) {
+  const path = nodePath(outline, tabOutlineTabId(tabId));
+  const source = path?.[path.length - 1];
+  if (!source || source.entityType !== 'tab') return [];
+
+  const result = [];
+  const visit = node => {
+    if (node?.entityType === 'tab' && node.tabId) result.push(node.tabId);
+    for (const child of childrenOf(node)) visit(child);
+  };
+  visit(source);
+  return result;
+}
+
 function firstTabId(node) {
   if (node?.entityType === 'tab') return node.tabId;
   for (const child of childrenOf(node)) {
@@ -280,24 +294,4 @@ export function tabOutlineVerticalSlotPolicy({ sourceNode, baseOutline, slot }) 
   const parentPath = nodePath(baseOutline || [], slot.parentId);
   if (!parentPath) return false;
   return parentPath.filter(node => node?.entityType === 'tab').length <= 4;
-}
-
-export function resolveEmptyUtilityDropTarget({
-  clientX,
-  clientY,
-  startY,
-  containerRect,
-  zoneHeight = 56,
-  activationDistance = 1,
-} = {}) {
-  if (!containerRect || !Number.isFinite(startY)) return null;
-  const left = Number(containerRect.left);
-  const right = Number(containerRect.right);
-  const top = Number(containerRect.top);
-  const bottom = Number(containerRect.bottom);
-  if (![left, right, top, bottom].every(Number.isFinite)) return null;
-  if (clientX < left || clientX > right || clientY < top || clientY > bottom) return null;
-  if (clientY - startY < Math.max(0, Number(activationDistance) || 0)) return null;
-  if (clientY < Math.max(top, bottom - Math.max(1, Number(zoneHeight) || 1))) return null;
-  return { id: 'utility', zone: 'utility', insertIndex: 0 };
 }

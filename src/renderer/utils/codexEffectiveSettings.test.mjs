@@ -284,6 +284,22 @@ test('verified launch composer owns transient settings before the first writer e
   });
 });
 
+test('verified Resume launch settings outrank the saved source until child writer proof', () => {
+  assert.deepEqual(resolveCodexEffectiveSettings({
+    codexSessionId: 'resume-source',
+    codexModel: 'gpt-5.5',
+    codexEffort: 'low',
+    codexLiveModel: 'gpt-5.6-luna',
+    codexLiveEffort: 'medium',
+    codexLiveSettingsSessionId: 'launch:resume-9',
+  }), {
+    model: 'gpt-5.6-luna',
+    effort: 'medium',
+    liveOwned: true,
+    source: 'verified-launch-composer',
+  });
+});
+
 test('launch owner remains transient when picker state is applied', () => {
   assert.deepEqual(planCodexPickerStateApplication({
     result: {

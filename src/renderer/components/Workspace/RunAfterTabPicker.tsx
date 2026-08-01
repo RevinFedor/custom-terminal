@@ -79,7 +79,7 @@ type PickerAnchor = {
   maxHeight: number;
 };
 
-type TabRuntimeStatus = 'busy' | 'waiting' | 'idle';
+type TabRuntimeStatus = 'busy' | 'inherited' | 'waiting' | 'idle';
 
 export type RunAfterTabPickerProps = {
   tabId: string;
@@ -570,7 +570,8 @@ export function RunAfterTabPicker({
 
   const selectedIdSet = useMemo(() => new Set(selectedInputIds), [selectedInputKey]);
   const statusFor = (id: string): TabRuntimeStatus => {
-    if (busyMap.get(id) === true || inheritedBusyTabIds.has(id)) return 'busy';
+    if (busyMap.get(id) === true) return 'busy';
+    if (inheritedBusyTabIds.has(id)) return 'inherited';
     if (waitingTabIds?.has(id)) return 'waiting';
     if (waitingTabIds && selectedIdSet.has(id) && !busyMap.has(id)) return 'waiting';
     return 'idle';
@@ -583,9 +584,11 @@ export function RunAfterTabPicker({
   const selectedTab = selectedTabs[0] ?? null;
   const selectedStatus: TabRuntimeStatus | null = selectedTabs.some((t) => statusFor(t.id) === 'busy')
     ? 'busy'
-    : selectedTabs.some((t) => statusFor(t.id) === 'waiting')
-      ? 'waiting'
-      : (selectedTab ? 'idle' : null);
+    : selectedTabs.some((t) => statusFor(t.id) === 'inherited')
+      ? 'inherited'
+      : selectedTabs.some((t) => statusFor(t.id) === 'waiting')
+        ? 'waiting'
+        : (selectedTab ? 'idle' : null);
   const selectedProject = inventory.groups.find((g) => g.projectId === selectedProjectId) ?? inventory.groups[0] ?? null;
   const targetTabs = selectedProject ? selectedProject.tabs.filter((t) => t.id !== tabId) : [];
   const activeCount = targetTabs.filter((t) => statusFor(t.id) !== 'idle').length;
@@ -659,9 +662,11 @@ export function RunAfterTabPicker({
               : `Run after target saved: ${selectedSummaryText} (off)`
           ) + (selectedStatus === 'busy'
             ? ' (busy now)'
-            : selectedStatus === 'waiting'
-              ? ' (waiting for its Run after trigger)'
-              : '')
+            : selectedStatus === 'inherited'
+              ? ' (child agent is running)'
+              : selectedStatus === 'waiting'
+                ? ' (waiting for its Run after trigger)'
+                : '')
           : 'Pick a tab to wait on'
       }
       style={{
@@ -726,7 +731,14 @@ export function RunAfterTabPicker({
           <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left', fontSize: 11 }}>
             {selectedSummaryText}
           </span>
-          {selectedStatus && <StatusIcon status={selectedStatus} color={activeTargetWait ? '#fff' : '#cfcfcf'} />}
+          {selectedStatus && (
+            <StatusIcon
+              status={selectedStatus}
+              color={selectedStatus === 'inherited'
+                ? 'var(--process-bar-inherited-color, #A855F7)'
+                : (activeTargetWait ? '#fff' : '#cfcfcf')}
+            />
+          )}
         </>
       ) : (
         <>
@@ -775,7 +787,7 @@ export function RunAfterTabPicker({
         overflow: 'hidden',
       }}
     >
-      {selectedStatus === 'busy' && (
+      {(selectedStatus === 'busy' || selectedStatus === 'inherited') && (
         <span
           className="tab-process-bar-static"
           style={{
@@ -787,9 +799,12 @@ export function RunAfterTabPicker({
             pointerEvents: 'none',
             zIndex: 1,
             overflow: 'hidden',
+            backgroundColor: selectedStatus === 'inherited'
+              ? 'var(--process-bar-inherited-color, #A855F7)'
+              : undefined,
           }}
         >
-          <span className="tab-process-bar-ai-shimmer-overlay" />
+          <span className={`tab-process-bar-ai-shimmer-overlay${selectedStatus === 'inherited' ? ' tab-process-bar-inherited-shimmer-overlay' : ''}`} />
         </span>
       )}
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0, flexShrink: 0 }}>
@@ -1296,7 +1311,7 @@ function PickerTabRow({
       }}
       title={status === 'waiting' ? `${tab.name} - waiting for its Run after trigger` : tab.name}
     >
-      {status === 'busy' && (
+      {(status === 'busy' || status === 'inherited') && (
         <span
           className="tab-process-bar-static"
           style={{
@@ -1308,12 +1323,15 @@ function PickerTabRow({
             pointerEvents: 'none',
             zIndex: 2,
             overflow: 'hidden',
+            backgroundColor: status === 'inherited'
+              ? 'var(--process-bar-inherited-color, #A855F7)'
+              : undefined,
             ...(processBarPosition === 'right'
               ? { borderTopRightRadius: tabGeo.borderRadius, borderBottomRightRadius: tabGeo.borderRadius }
               : { borderTopLeftRadius: tabGeo.borderRadius, borderBottomLeftRadius: tabGeo.borderRadius }),
           }}
         >
-          <span className="tab-process-bar-ai-shimmer-overlay" />
+          <span className={`tab-process-bar-ai-shimmer-overlay${status === 'inherited' ? ' tab-process-bar-inherited-shimmer-overlay' : ''}`} />
         </span>
       )}
       {statusMeta && (
@@ -1344,12 +1362,15 @@ function PickerTabRow({
 
 function StatusIcon({ status, color }: { status: TabRuntimeStatus; color: string }) {
   if (status === 'idle') return null;
+  const isBusy = status === 'busy' || status === 'inherited';
   return (
     <span
-      title={status === 'busy' ? 'Agent is running' : 'Waiting for its Run after trigger'}
+      title={status === 'inherited'
+        ? 'Child agent is running'
+        : (status === 'busy' ? 'Agent is running' : 'Waiting for its Run after trigger')}
       style={{ width: 11, height: 11, flexShrink: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
     >
-      {status === 'busy' ? (
+      {isBusy ? (
         <LoaderCircle
           size={9}
           strokeWidth={3}

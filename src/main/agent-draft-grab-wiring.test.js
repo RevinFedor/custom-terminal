@@ -1,0 +1,139 @@
+/**
+ * Wiring guard for the screen-found / exact-empty Ctrl+G reconciliation.
+ *
+ * Prod scar 2026-07-29 (tab-2599): the screen parser reported an old prompt
+ * as a draft, Ctrl+G twice returned zero bytes, but the shared send path still
+ * returned `Terminal has an unsent draft`. The proof also crosses an external
+ * editor boundary, so resolving a generic grab before Claude redraws its next
+ * frame can lose the following paste. These checks keep the exact screen proof
+ * attached to its grab without delaying unrelated grab/copy operations.
+ */
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const mainSource = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+const scenarioSource = fs.readFileSync(
+  path.join(__dirname, '../renderer/utils/agentScenarios.ts'),
+  'utf8',
+);
+const historyPanelSource = fs.readFileSync(
+  path.join(__dirname, '../renderer/components/Workspace/HistoryPanel.tsx'),
+  'utf8',
+);
+const claudeRuntimeSource = fs.readFileSync(
+  path.join(__dirname, '../renderer/utils/claudePtyActions.ts'),
+  'utf8',
+);
+const codexRuntimeSource = fs.readFileSync(
+  path.join(__dirname, '../renderer/utils/historyAgentRuntimes.ts'),
+  'utf8',
+);
+
+test('shared send passes the exact screen proof into the Ctrl+G request', () => {
+  assert.match(
+    scenarioSource,
+    /runtime\.grabDraft\(tabId,\s*\{\s*draftProof:\s*buildExactDraftCaptureProof\(visual\)/,
+    'the grab must carry the exact proof that it is trying to disprove',
+  );
+  assert.match(
+    scenarioSource,
+    /runtime\.copyDraft\(tabId,\s*\{\s*draftProof:\s*buildExactDraftCaptureProof\(visual\)/,
+    'project-owned sends must inspect without removing a real terminal draft',
+  );
+  for (const field of [
+    'terminalRunSeq',
+    'inputRevision',
+    'terminalLifecycleGeneration',
+    'mirrorGeneration',
+  ]) {
+    const helperSource = fs.readFileSync(
+      path.join(__dirname, '../renderer/utils/agentDraftPreflight.mjs'),
+      'utf8',
+    );
+    assert.match(helperSource, new RegExp(field + ':\\s*proof\\?\\.' + field));
+  }
+});
+
+test('an exact empty capture replaces the stale screen-unknown decision', () => {
+  assert.match(
+    scenarioSource,
+    /let draftDecision = classifyAgentDraftPreflight\(visual\)/,
+    'the initial screen decision must be replaceable after exact capture',
+  );
+  assert.match(
+    scenarioSource,
+    /conflict\.decision === 'clear'[\s\S]{0,180}draftDecision = applyAgentDraftCaptureResolution\(draftDecision, conflict\)/,
+    'an exact empty capture must clear the original unknown before its final guard runs',
+  );
+  const resolvedAt = scenarioSource.indexOf(
+    'draftDecision = applyAgentDraftCaptureResolution(draftDecision, conflict)',
+  );
+  const unknownGuardAt = scenarioSource.indexOf(
+    "if (draftDecision.decision === 'unknown')",
+    resolvedAt,
+  );
+  assert.ok(resolvedAt > 0 && unknownGuardAt > resolvedAt,
+    'the final unknown guard must consume the reconciled decision');
+});
+
+test('History composer carries the same exact proof into its ownership-changing grab', () => {
+  assert.match(
+    historyPanelSource,
+    /runtime\.grabDraft\(tabId, draftState \? \{\s*draftProof:\s*buildExactDraftCaptureProof\(draftState\)/,
+  );
+  assert.match(
+    historyPanelSource,
+    /resolveAgentDraftConflict\(draftState, result, \{\s*attemptedCapture:\s*true/,
+    'an empty Ctrl+G result must not silently clear an ambiguous screen without exact identity proof',
+  );
+});
+
+test('main forwards grab options and records identity before Ctrl+G', () => {
+  assert.match(
+    mainSource,
+    /claude:grab-input'[\s\S]{0,180}captureAgentInput\(tabId, 'grab', 'claude', options\)/,
+  );
+  assert.match(
+    mainSource,
+    /codex:grab-input'[\s\S]{0,180}captureAgentInput\(tabId, 'grab', 'codex', options\)/,
+  );
+  assert.match(
+    mainSource,
+    /claude:copy-input'[\s\S]{0,180}captureAgentInput\(tabId, 'copy', 'claude', options\)/,
+  );
+  const identityGuard = mainSource.indexOf('const draftProofMatchesAtWrite =');
+  const pendingProof = mainSource.indexOf(
+    'draftProofIdentityAtWrite: draftProofMatchesAtWrite',
+    identityGuard,
+  );
+  const ctrlGWrite = mainSource.indexOf("term.write('\\x07')", pendingProof);
+  assert.ok(identityGuard > 0 && pendingProof > identityGuard && ctrlGWrite > pendingProof,
+    'the proof identity must be frozen on the pending grab before Ctrl+G is written');
+  assert.match(
+    mainSource,
+    /identityStable = validateAgentInputIdentity[\s\S]{0,180}pending\.draftProofIdentityAtWrite === true/,
+    'an empty grab from a changed generation must stay unknown',
+  );
+});
+
+test('only the exact contradiction waits for Claude editor-return redraw', () => {
+  assert.match(
+    mainSource,
+    /const editorReturnPromise = contradiction\s*&&\s*agent === 'claude'/,
+    'ordinary empty grab/copy must not consume the one redraw frame owned by its caller',
+  );
+  assert.match(
+    mainSource,
+    /exactEmptyProven = exactEmpty\s*&&\s*!!contradiction\s*&&\s*identityStable\s*&&\s*editorReturn\?\.ready === true/,
+  );
+});
+
+test('ownership-changing grab cannot share an in-flight result with non-destructive copy', () => {
+  assert.match(claudeRuntimeSource, /const captureKey = tabId \+ ':' \+ mode;/);
+  assert.match(claudeRuntimeSource, /draftGrabInflight\.get\(captureKey\)/);
+  assert.match(codexRuntimeSource, /const captureKey = tabId \+ ':' \+ mode;/);
+  assert.match(codexRuntimeSource, /codexDraftInflight\.get\(captureKey\)/);
+});

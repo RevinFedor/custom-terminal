@@ -5,6 +5,7 @@ const test = require('node:test');
 const {
   extractClaudePromptCarrier,
   findMatchingClaudePromptTurn,
+  isClaudeTaskNotificationCarrier,
   promptFingerprint,
   selectClaudeQueuedPromptIndex,
 } = require('./claude-prompt-carriers');
@@ -38,6 +39,48 @@ test('extracts exact text from a Claude queued_command attachment', () => {
     uuid: 'q1',
     timestamp: '2026-07-28T02:21:17.000Z',
   });
+});
+
+test('does not split an orchestration turn on Claude task-notification queued_command', () => {
+  const record = {
+    type: 'attachment',
+    uuid: 'task-notification',
+    attachment: {
+      type: 'queued_command',
+      commandMode: 'task-notification',
+      prompt: [
+        '<task-notification>',
+        '<task-id>agent-1</task-id>',
+        '<tool-use-id>toolu_agent_1</tool-use-id>',
+        '<status>completed</status>',
+        '</task-notification>',
+      ].join('\n'),
+    },
+  };
+
+  assert.equal(isClaudeTaskNotificationCarrier(record), true);
+  assert.equal(extractClaudePromptCarrier(record), null);
+});
+
+test('recognizes historical task-notification carriers even without commandMode', () => {
+  const queued = {
+    type: 'attachment',
+    attachment: {
+      type: 'queued_command',
+      prompt: '  <task-notification>\n<tool-use-id>toolu_old</tool-use-id>\n</task-notification>',
+    },
+  };
+  const standalone = {
+    type: 'user',
+    message: {
+      content: '<task-notification>\n<tool-use-id>toolu_old</tool-use-id>\n</task-notification>',
+    },
+  };
+
+  assert.equal(isClaudeTaskNotificationCarrier(queued), true);
+  assert.equal(isClaudeTaskNotificationCarrier(standalone), true);
+  assert.equal(extractClaudePromptCarrier(queued), null);
+  assert.equal(extractClaudePromptCarrier(standalone), null);
 });
 
 test('does not treat tool results as prompt carriers', () => {
@@ -135,4 +178,89 @@ test('ordinary later user carrier falls back to FIFO and never crosses session o
     timestamp: 'later',
     sessionId: 'missing-session',
   }), -1);
+});
+
+test('F3: exact prompt UUID wins when two Claude runs use identical text', () => {
+  const text = 'same orchestration prompt';
+  const first = {
+    type: 'user',
+    uuid: 'user-run-1',
+    timestamp: '2026-07-30T10:00:00.000Z',
+    message: { role: 'user', content: text },
+  };
+  const second = {
+    type: 'user',
+    uuid: 'user-run-2',
+    timestamp: '2026-07-30T10:05:00.000Z',
+    message: { role: 'user', content: text },
+  };
+  const turns = [first, second].map((record) => ({
+    kind: 'user',
+    userUuid: record.uuid,
+    userTimestamp: record.timestamp,
+    assistantUuids: ['assistant-' + record.uuid],
+  }));
+  const match = findMatchingClaudePromptTurn({
+    turns,
+    recordMap: new Map([[first.uuid, first], [second.uuid, second]]),
+    promptHash: promptFingerprint(text),
+    promptUserUuid: first.uuid,
+    requestedAt: Date.parse('2026-07-30T09:59:00.000Z'),
+    resultBeforeAt: Date.parse('2026-07-30T10:02:00.000Z'),
+  });
+  assert.equal(match?.turn?.userUuid, first.uuid);
+});
+
+test('F3: hash fallback cannot cross the completed run upper time boundary', () => {
+  const text = 'legacy identical orchestration prompt';
+  const records = [
+    {
+      type: 'user',
+      uuid: 'legacy-run-1',
+      timestamp: '2026-07-30T10:00:00.000Z',
+      message: { role: 'user', content: text },
+    },
+    {
+      type: 'user',
+      uuid: 'legacy-run-2',
+      timestamp: '2026-07-30T10:05:00.000Z',
+      message: { role: 'user', content: text },
+    },
+  ];
+  const match = findMatchingClaudePromptTurn({
+    turns: records.map((record) => ({
+      kind: 'user',
+      userUuid: record.uuid,
+      userTimestamp: record.timestamp,
+      assistantUuids: ['assistant-' + record.uuid],
+    })),
+    recordMap: new Map(records.map((record) => [record.uuid, record])),
+    promptHash: promptFingerprint(text),
+    requestedAt: Date.parse('2026-07-30T09:59:00.000Z'),
+    resultBeforeAt: Date.parse('2026-07-30T10:02:00.000Z'),
+  });
+  assert.equal(match?.turn?.userUuid, 'legacy-run-1');
+});
+
+test('F3: legacy hash fallback fails closed when identical prompts remain ambiguous', () => {
+  const text = 'ambiguous legacy prompt';
+  const records = ['legacy-a', 'legacy-b'].map((uuid, index) => ({
+    type: 'user',
+    uuid,
+    timestamp: `2026-07-30T10:0${index}:00.000Z`,
+    message: { role: 'user', content: text },
+  }));
+  const match = findMatchingClaudePromptTurn({
+    turns: records.map((record) => ({
+      kind: 'user',
+      userUuid: record.uuid,
+      userTimestamp: record.timestamp,
+      assistantUuids: ['assistant-' + record.uuid],
+    })),
+    recordMap: new Map(records.map((record) => [record.uuid, record])),
+    promptHash: promptFingerprint(text),
+    requestedAt: Date.parse('2026-07-30T09:59:00.000Z'),
+    resultBeforeAt: Date.parse('2026-07-30T10:02:00.000Z'),
+  });
+  assert.equal(match, null);
 });

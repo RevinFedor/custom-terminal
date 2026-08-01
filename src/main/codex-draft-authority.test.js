@@ -2,8 +2,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  createCodexDraftProofWaitTimeoutOutcome,
   enforceCodexInteractiveSurfaceDraftAuthority,
   mergeCodexDraftAuthority,
+  shouldFinishCodexDraftProofWait,
+  shouldWaitForCodexDraftProof,
 } = require('./codex-draft-authority');
 const {
   validateCodexPickerRuntimeAdmission,
@@ -82,6 +85,59 @@ test('renderer-only positive still blocks safely when headless state is unavaila
   assert.equal(result.hasDraft, true);
   assert.equal(result.authority, 'renderer-positive');
   assert.match(result.source, /^renderer-positive:/);
+});
+
+test('send waits only for an unknown frame and never waits away a real draft', () => {
+  assert.equal(shouldWaitForCodexDraftProof({
+    initialHasDraft: null,
+    expected: false,
+    waitOnUnknownOnly: true,
+  }), true);
+  assert.equal(shouldWaitForCodexDraftProof({
+    initialHasDraft: true,
+    expected: false,
+    waitOnUnknownOnly: true,
+  }), false);
+  assert.equal(shouldWaitForCodexDraftProof({
+    initialHasDraft: false,
+    expected: true,
+    waitOnUnknownOnly: false,
+  }), true);
+
+  assert.equal(shouldFinishCodexDraftProofWait({
+    hasDraft: false,
+    expected: false,
+    waitOnUnknownOnly: true,
+  }), true);
+  assert.equal(shouldFinishCodexDraftProofWait({
+    hasDraft: true,
+    expected: false,
+    waitOnUnknownOnly: true,
+  }), true, 'a proven real draft must block immediately instead of waiting for timeout');
+  assert.equal(shouldFinishCodexDraftProofWait({
+    hasDraft: null,
+    expected: false,
+    waitOnUnknownOnly: true,
+  }), false);
+  assert.equal(shouldFinishCodexDraftProofWait({
+    hasDraft: false,
+    expected: true,
+    waitOnUnknownOnly: false,
+  }), false);
+});
+
+test('wait deadline is never evidence that the composer is empty', () => {
+  const result = createCodexDraftProofWaitTimeoutOutcome({
+    source: 'test-fault:codex-draft-unknown-once',
+  });
+
+  assert.deepEqual(result, {
+    success: false,
+    hasDraft: null,
+    preview: '',
+    source: 'test-fault:codex-draft-unknown-once:wait-timeout',
+    error: 'codex-draft-proof-wait-timeout',
+  });
 });
 
 test('fresh renderer positive blocks direct send and routes picker through draft preservation', () => {

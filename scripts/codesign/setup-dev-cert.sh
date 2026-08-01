@@ -1,8 +1,7 @@
 #!/bin/bash
 # One-time setup of a self-signed code-signing certificate so that
-# `electron-builder --mac` produces a signature whose designated requirement
-# is `identifier "com.noted.terminal" and anchor trusted` — STABLE across
-# rebuilds.
+# `npm run sign:local-fast` produces a signature whose designated requirement
+# is tied to `com.noted.terminal` and this certificate — STABLE across rebuilds.
 #
 # Why this exists: an adhoc signature (`codesign -s -`) pins the designated
 # requirement to the binary's CDHash, which changes on every rebuild. macOS
@@ -16,7 +15,8 @@
 #   1. Open Keychain Access → Login → find "Noted Terminal Dev"
 #   2. Double-click → expand "Trust" → set Code Signing = Always Trust
 #   3. Close, authenticate with your login password
-#   4. Run `npm run build:install` — TCC grants will now persist
+#   4. Run `npm run sign:local-fast` after packaging (the normal build scripts
+#      already do this) — TCC grants will now persist
 #
 # Reference: docs/knowledge/fact-codesign-tcc.md
 

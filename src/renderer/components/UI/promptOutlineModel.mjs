@@ -77,13 +77,17 @@ export function buildPromptOutline(prompts = [], groups = []) {
   for (const list of grouped.values()) list.sort(byPosition);
   ungrouped.sort(byPosition);
 
+  const ungroupedForest = buildPromptForest(ungrouped);
+  const ungroupedRoots = new Map(ungroupedForest.map(node => [node.promptId, node]));
+
   const entities = [
     ...sortedGroups.map(group => ({ type: 'group', position: Number(group.position || 0), group })),
-    ...ungrouped
-      .filter(prompt => !prompt.visual_parent_id || !ungrouped.some(candidate => candidate.id === prompt.visual_parent_id))
-      .map(prompt => ({ type: 'prompt', position: Number(prompt.position || 0), prompt })),
+    ...ungroupedForest.map(node => ({
+      type: 'prompt',
+      position: Number(node.rawPrompt?.position || 0),
+      prompt: node.rawPrompt,
+    })),
   ].sort((a, b) => a.position - b.position);
-  const ungroupedRoots = new Map(buildPromptForest(ungrouped).map(node => [node.promptId, node]));
 
   return entities.map(entity => {
     if (entity.type === 'prompt') return ungroupedRoots.get(entity.prompt.id);

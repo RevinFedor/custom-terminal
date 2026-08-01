@@ -654,6 +654,19 @@
   padding: 0 2px 6px;
   border-bottom: 1px solid var(--cb-composer-topbar-border);
 }
+/* Reserved slot: the row keeps its height while empty so adding or removing a
+   prompt chip never resizes the composer under the caret. Height is derived
+   from the chip box (padding 3px + border 1px on both sides + 1.2 line-height)
+   so it stays correct when the label font size changes. */
+.cb-composer-topbar--reserved {
+  min-height: calc(var(--cb-fs-label) * 1.2 + 8px);
+  box-sizing: content-box;
+}
+/* Empty state stays invisible: a divider with nothing above it reads as a
+   stray line, but the space it holds must remain. */
+.cb-composer-topbar--reserved[data-composer-topbar-empty] {
+  border-bottom-color: transparent;
+}
 .cb-composer-chips {
   display: flex;
   flex-wrap: wrap;

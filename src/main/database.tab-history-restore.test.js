@@ -43,12 +43,14 @@ test('tab-history restore reads non-destructively, preserves migration provenanc
   const firstProject = manager.createEmptyProject('History first');
   const secondProject = manager.createEmptyProject('History second');
   const olderId = Number(manager.archiveTab(firstProject.id, {
+    tabId: 'history-tab-older',
     name: 'older',
     cwd: '/tmp',
     commandType: 'codex',
     codexSessionId: 'session-older',
   }));
   const latestId = Number(manager.archiveTab(firstProject.id, {
+    tabId: 'history-tab-latest',
     name: 'latest',
     cwd: '/tmp',
     commandType: 'codex',
@@ -91,6 +93,12 @@ test('tab-history restore reads non-destructively, preserves migration provenanc
 
   assert.equal(manager.getLatestTabHistory(firstProject.id).id, migrationHistoryId);
   assert.equal(manager.getLatestTabHistory(firstProject.id).id, migrationHistoryId, 'read must not consume the row');
+  assert.deepEqual(
+    manager.getTabHistoryEntriesByTabId('history-tab-latest').map((entry) => entry.id),
+    [latestId],
+    'closed-tab lookup must preserve the exact original tab identity',
+  );
+  assert.deepEqual(manager.getTabHistoryEntriesByTabId('missing-tab'), []);
   assert.equal(manager.getTabHistoryEntry(latestId, secondProject.id), undefined, 'lookup must stay project-scoped');
   assert.equal(manager.getLatestTabHistory(secondProject.id).id, otherProjectId);
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -78,15 +78,20 @@ export function updateClaudeConfig(source, serverPath) {
   return JSON.stringify(parsed, null, 2) + '\n';
 }
 
-async function atomicWrite(filePath, content, { backup = true } = {}) {
+async function atomicWrite(filePath, content, { backup = true, mode = null } = {}) {
   await mkdir(dirname(filePath), { recursive: true });
   if (backup && existsSync(filePath)) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     await copyFile(filePath, `${filePath}.bak-${stamp}`);
   }
-  const tempPath = `${filePath}.tmp-${process.pid}`;
-  await writeFile(tempPath, content, 'utf8');
-  await rename(tempPath, filePath);
+  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    await writeFile(tempPath, content, typeof content === 'string' ? 'utf8' : undefined);
+    if (mode != null) await chmod(tempPath, mode);
+    await rename(tempPath, filePath);
+  } finally {
+    await rm(tempPath, { force: true });
+  }
 }
 
 async function readOptional(filePath) {
@@ -94,6 +99,15 @@ async function readOptional(filePath) {
     return await readFile(filePath, 'utf8');
   } catch (error) {
     if (error?.code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+async function readOptionalBuffer(filePath) {
+  try {
+    return await readFile(filePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
     throw error;
   }
 }
@@ -107,8 +121,24 @@ export async function installTerminalMcp(options = {}) {
   const claudePath = join(home, '.claude.json');
   const codexPath = join(home, '.codex', 'config.toml');
 
+  const runtimeChanges = [];
   for (const file of SOURCE_FILES) {
-    if (!existsSync(join(sourceDir, file))) throw new Error('Missing MCP source: ' + join(sourceDir, file));
+    const sourcePath = join(sourceDir, file);
+    const targetPath = join(targetDir, file);
+    if (!existsSync(sourcePath)) throw new Error('Missing MCP source: ' + sourcePath);
+    const [contents, sourceStats, installed] = await Promise.all([
+      readFile(sourcePath),
+      stat(sourcePath),
+      readOptionalBuffer(targetPath),
+    ]);
+    if (!installed || !contents.equals(installed)) {
+      runtimeChanges.push({
+        sourcePath,
+        targetPath,
+        contents,
+        mode: sourceStats.mode & 0o777,
+      });
+    }
   }
 
   const claudeBefore = await readOptional(claudePath);
@@ -117,13 +147,16 @@ export async function installTerminalMcp(options = {}) {
   const codexAfter = updateCodexTerminalSection(codexBefore, serverPath);
   const changed = {
     files: SOURCE_FILES.map((file) => join(targetDir, file)),
+    runtime: runtimeChanges.length > 0,
+    runtimeFiles: runtimeChanges.map((entry) => entry.targetPath),
     claude: claudeAfter !== claudeBefore,
     codex: codexAfter !== codexBefore,
   };
 
   if (!options.dryRun) {
-    await mkdir(targetDir, { recursive: true });
-    for (const file of SOURCE_FILES) await copyFile(join(sourceDir, file), join(targetDir, file));
+    for (const entry of runtimeChanges) {
+      await atomicWrite(entry.targetPath, entry.contents, { backup: false, mode: entry.mode });
+    }
     if (changed.claude) await atomicWrite(claudePath, claudeAfter);
     if (changed.codex) await atomicWrite(codexPath, codexAfter);
   }
@@ -148,4 +181,3 @@ if (isEntryPoint) {
       process.exitCode = 1;
     });
 }
-

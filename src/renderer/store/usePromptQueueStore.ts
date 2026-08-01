@@ -520,6 +520,7 @@ interface PromptQueueStore {
     patch: {
       text?: string;
       chips?: QueuedComposerChip[];
+      imagePaths?: QueuedImageRef[];
       title?: string;
       titleManual?: boolean;
       enabled?: boolean;
@@ -1045,11 +1046,19 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const activeBefore = countEnabledQueuedPrompts(cur.items);
         const items = cur.items.map((p) => {
           if (p.id !== id) return p;
+          const suppliedImagePaths = Array.isArray(patch.imagePaths)
+            ? patch.imagePaths
+            : p.imagePaths;
           const normalized = typeof patch.text === 'string'
-            ? normalizeImagePathMarkersForQueue(patch.text, p.imagePaths)
-            : { text: p.text, imagePaths: p.imagePaths };
+            ? normalizeImagePathMarkersForQueue(patch.text, suppliedImagePaths)
+            : {
+                text: p.text,
+                imagePaths: Array.isArray(patch.imagePaths)
+                  ? retainImagePathsForText(p.text, patch.imagePaths)
+                  : p.imagePaths,
+              };
           const text = normalized.text;
-          const images = typeof patch.text === 'string'
+          const images = typeof patch.text === 'string' || Array.isArray(patch.imagePaths)
             ? Math.max(
                 countImages(text),
                 normalized.imagePaths?.length ?? 0,
@@ -1089,7 +1098,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             chips,
             images,
             imagePaths,
-            attachmentState: typeof patch.text === 'string'
+            attachmentState: typeof patch.text === 'string' || Array.isArray(patch.imagePaths)
               ? getInitialQueuedPromptAttachmentState(text, imagePaths, images)
               : p.attachmentState,
             title,
@@ -1117,7 +1126,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         });
         return { queues: next };
       });
-      if (typeof patch.text === 'string') {
+      if (typeof patch.text === 'string' || Array.isArray(patch.imagePaths)) {
         const updated = get().getQueue(tabId).items.find((item) => item.id === id);
         if (updated?.attachmentState === 'materializing') {
           void ensureQueuedPromptImagesReady(tabId, id);

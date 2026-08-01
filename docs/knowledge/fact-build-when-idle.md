@@ -16,7 +16,7 @@
 | Codex | `codexTurnWatchers` | блокирует только rollout `task_started → task_complete/turn_aborted`; живой idle Codex CLI не blocker |
 | Restart-after non-AI процесс | `terminalCommandState.isRunning` + `activeCommandSource === 'restart-after'` + (`tabs.restart_after_tab_ids` или legacy `tabs.restart_after_tab_id`) | `running`. Ручные shell-команды (`npm run dev`, `npm run build`, `./deploy.sh`) сами по себе **не блокируют** `build:i-obs`; blocker'ом становится только команда, которую реально запустил `Restart after`, пока у вкладки есть хотя бы одна trigger-подписка. AI CLI tabs исключены из этой ветки, потому что их PTY-процесс может быть живым и idle |
 | Git-операции | `ipc/git.js` active operations registry | `kind:"git"` для generate/commit/undo/push/fetch/checkout пока операция in-flight. Это нужно для сценария Git run-after: AI-вкладка завершилась, Git-панель начала generate+commit, и `build:i-obs` не должен закрыть приложение между AI-trigger и фактическим commit/push |
-| Оркестрация | `orchestration-runs.json` через `OrchestrationRunStore.listActive()` | `kind:"orchestration"`: активный child блокирует и реальный target, и inherited source; `waiting_descendants`/`waiting_recovery` остаются blocker'ами; после terminal-state source остаётся `completion-handoff`, пока post-Enter audit не подтвердит точный `runId`. Generic `busy:true` не снимает этот blocker. После restart тот же exact prompt hash сверяется с transcript и детерминированно очищает уже обработанный stale handoff |
+| Оркестрация | `orchestration-runs.json` через `OrchestrationRunStore.listActive()` | `kind:"orchestration"`: активный child блокирует реальный target и inherited source; `waiting_descendants` остаётся работой ветки; `completed + resultComplete=false` проецируется как `result-proof`; после terminal-state source остаётся `completion-handoff`, пока post-Enter audit не подтвердит точный `runId`. `waiting_recovery` и ошибка доставки также блокируют install как нерешённые состояния, но не считаются активной анимацией. Generic `busy:true` ничего из этого не снимает. Все tracked-состояния переживают restart и retention, а auto-stop запрещён до полного result-proof |
 
 Дедупликация по `tabId` (один таб = максимум один loader). Runtime-loader имеет приоритет над orchestration-проекцией того же таба; активный child всё равно сохраняет отдельный target-blocker. Это важно для `returnTo.tabId`: Voice Record исключает только вызывающий source, но не работающую целевую вкладку.
 
@@ -64,6 +64,19 @@ GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token
 в отдельном терминале. Voice Record endpoint `/api/terminal/build-install` этот **wrapper не
 запускает** (он foreground-поллер, а Voice Record — sibling-сервис), но с июня 2026 делает
 **собственную observe-фазу** против того же `/api/active-loaders` перед спавном `build:install`.
+
+Оба пути после observe сходятся в каноническом `npm run build:install`. После успешного
+Electron package-build этот workflow вызывает `npm run install:terminal-mcp`, затем
+`npm run install:claude-hook`, и только после обеих синхронизаций заменяет и открывает новую
+app-копию. Поэтому Voice Record не копирует runtime-интеграции самостоятельно, а новый backend
+не запускается со старым Terminal MCP client или turn-hook без causal prompt identity. Обычный
+`npm run build` остаётся package-only и реальный HOME не меняет.
+
+Синхронизация MCP-файла не перезапускает уже живой stdio MCP. Новую версию получает только
+новый или переподключённый Claude/Codex-процесс; проверка nested orchestration после install
+обязана создать/перезапустить MCP-клиента, а не продолжать процесс, который загрузил старый
+server. Turn-hook, напротив, запускается новым процессом на каждое событие и читает обновлённый
+файл уже на следующем submit, если его registration в Claude settings не менялась.
 
 Раньше (graveyard) endpoint строил **мгновенно** без idle-проверки, полагаясь на то, что iOS
 сделал preflight перед confirm. Это ломалось при AI-hop: агент в одной вкладке дёргал rebuild,
@@ -127,7 +140,7 @@ job фиксируется как `sent_unverified` и повторно тот �
 `POLL_MS=1000`, `IDLE_CONFIRM=2`, `NO_BUILD=1` (только наблюдать), `PORT=7878` (форсить порт, минуя discovery — для теста).
 
 ## Тестирование без ребилда
-`web-server.js` требует electron (`ipcMain`/`app`/`BrowserWindow`). Для headless-харнесса замокать через `Module._load` shim (`require('electron')` → fake), `start({sdkSessions:new Map(), computeActiveLoaders: ()=>mockState})`, дёргать скрипт с `PORT=<mockport>`. Runtime-логика тестируется с mock-Map'ами; orchestration merge покрыт отдельно: source+target активного run, recovery, completion-handoff до exact proof, исчезновение после proof и дедуп с runtime-loader. В DEV live endpoint вернул stale `tab-2142` как `kind:"orchestration", status:"completion-handoff"`, тогда как run с уже подтверждённым exact follow-up в список не попал. Сам build/install в E2E не запускается.
+`web-server.js` требует electron (`ipcMain`/`app`/`BrowserWindow`). Для headless-харнесса замокать через `Module._load` shim (`require('electron')` → fake), `start({sdkSessions:new Map(), computeActiveLoaders: ()=>mockState})`, дёргать скрипт с `PORT=<mockport>`. Runtime-логика тестируется с mock-Map'ами; orchestration merge покрыт отдельно: source+target активного run, recovery без shimmer, `result-proof`, completion-handoff до exact proof, исчезновение после proof и дедуп с runtime-loader. Отдельная регрессия обязана проверять, что incomplete result переживает restart/retention, блокирует install и не запускает auto-stop. В DEV live endpoint вернул stale `tab-2142` как `kind:"orchestration", status:"completion-handoff"`, тогда как run с уже подтверждённым exact follow-up в список не попал. Сам build/install в E2E не запускается.
 
 ## Связанное
 - `fact-claude-stop-hook.md` — откуда `claudeTurnBusy` (authoritative busy)

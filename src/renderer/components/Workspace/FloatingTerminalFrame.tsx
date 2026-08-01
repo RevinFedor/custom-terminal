@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Minus, Plus, SquareTerminal } from 'lucide-react';
+import { ChevronDown, Minus, Plus, SquareTerminal } from 'lucide-react';
 import ControlHint from '../UI/ControlHint';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -333,36 +333,60 @@ export default function FloatingTerminalFrame({
             boxSizing: 'border-box',
           }}
         >
-          <SquareTerminal size={14} />
-          <span style={{ fontSize: 11, fontWeight: 650, letterSpacing: '0.04em' }}>TERMINAL</span>
-          <div style={{ flex: 1 }} />
-          <ControlHint label="Уменьшить шрифт терминала">
-            <button
-              type="button"
-              aria-label="Decrease terminal font size"
-              onPointerDown={(event) => event.stopPropagation()}
-              onClick={decrementTerminalFontSize}
-              style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: 4, cursor: 'pointer', display: 'flex' }}
-            ><Minus size={13} /></button>
-          </ControlHint>
-          <ControlHint label="Увеличить шрифт терминала">
-            <button
-              type="button"
-              aria-label="Increase terminal font size"
-              onPointerDown={(event) => event.stopPropagation()}
-              onClick={incrementTerminalFontSize}
-              style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: 4, cursor: 'pointer', display: 'flex' }}
-            ><Plus size={13} /></button>
-          </ControlHint>
-          <ControlHint label="Скрыть терминал">
+          {/* Collapse leads the row: it acts on the window itself, so it reads
+              before the window's own name instead of trailing the font pair. */}
+          <ControlHint label="Свернуть терминал">
             <button
               type="button"
               aria-label="Hide terminal"
               onPointerDown={(event) => event.stopPropagation()}
               onClick={onClose}
-              style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: 4, cursor: 'pointer', display: 'flex' }}
-            ><Minus size={15} /></button>
+              style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: '4px 2px', cursor: 'pointer', display: 'flex', marginLeft: -3 }}
+            ><ChevronDown size={15} /></button>
           </ControlHint>
+          <SquareTerminal size={14} />
+          <span style={{ fontSize: 11, fontWeight: 650, letterSpacing: '0.04em' }}>TERMINAL</span>
+          {/* Font size stays next to the title as one labelled pair. Bare −/+
+              at the far edge read as window sizing; "Aa" names what changes. */}
+          <div
+            data-floating-terminal-font-group
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 1,
+              marginLeft: 3,
+              padding: '0 2px',
+              borderRadius: 5,
+              border: '1px solid rgba(255,255,255,0.09)',
+              background: 'rgba(255,255,255,0.04)',
+            }}
+          >
+            <ControlHint label="Уменьшить шрифт терминала">
+              <button
+                type="button"
+                aria-label="Decrease terminal font size"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={decrementTerminalFontSize}
+                style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: '2px 3px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 1 }}
+              >
+                <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '-0.02em' }}>Aa</span>
+                <Minus size={11} />
+              </button>
+            </ControlHint>
+            <ControlHint label="Увеличить шрифт терминала">
+              <button
+                type="button"
+                aria-label="Increase terminal font size"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={incrementTerminalFontSize}
+                style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: '2px 3px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 1 }}
+              >
+                <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '-0.02em' }}>Aa</span>
+                <Plus size={11} />
+              </button>
+            </ControlHint>
+          </div>
+          <div style={{ flex: 1 }} />
         </div>
 
         <div

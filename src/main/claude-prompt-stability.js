@@ -3,12 +3,27 @@
 function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () => {} } = {}) {
   const byTab = new Map();
 
-  function settle(entry, result) {
-    if (!entry || entry.settled) return false;
-    entry.settled = true;
-    entry.result = result;
-    entry.resolve(result);
-    return true;
+  function resolveWaiters(entry, result) {
+    if (!entry) return;
+    for (const resolve of Array.from(entry.waiters)) {
+      try { resolve(result); } catch {}
+    }
+    entry.waiters.clear();
+  }
+
+  function readyResult(entry, reason) {
+    return {
+      ready: true,
+      generation: entry.generation,
+      reason,
+      at: now(),
+      lease: {
+        generation: entry.generation,
+        activityEpoch: entry.activityEpoch,
+        busyEpoch: entry.busyEpoch,
+        promptEpoch: entry.promptEpoch,
+      },
+    };
   }
 
   function open(tabId, generation, reason = 'launch-open') {
@@ -16,24 +31,24 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
     const existing = byTab.get(tabId) || null;
     if (existing?.generation === generation) return existing;
     if (existing) {
-      settle(existing, {
+      resolveWaiters(existing, {
         ready: false,
         generation: existing.generation,
         reason: 'generation-superseded',
       });
     }
-
-    let resolve;
-    const promise = new Promise((done) => { resolve = done; });
     const entry = {
       tabId,
       generation,
       openedAt: now(),
       openedReason: reason,
-      settled: false,
+      ready: false,
+      busy: false,
+      activityEpoch: 0,
+      busyEpoch: 0,
+      promptEpoch: 0,
       result: null,
-      resolve,
-      promise,
+      waiters: new Set(),
     };
     byTab.set(tabId, entry);
     log('[ClaudePromptStable] open tab=' + String(tabId).slice(-12)
@@ -45,19 +60,54 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
   function markStable(tabId, generation, reason = 'prompt-output-settled') {
     const entry = byTab.get(tabId) || null;
     if (!entry || entry.generation !== generation) return false;
-    const result = {
-      ready: true,
-      generation,
-      reason,
-      at: now(),
-    };
-    const changed = settle(entry, result);
-    if (changed) {
-      log('[ClaudePromptStable] ready tab=' + String(tabId).slice(-12)
+    entry.promptEpoch += 1;
+    entry.activityEpoch += 1;
+    if (entry.busy) {
+      entry.ready = false;
+      entry.result = null;
+      log('[ClaudePromptStable] prompt-ignored-busy tab=' + String(tabId).slice(-12)
         + ' gen=' + generation
         + ' reason=' + reason);
+      return false;
     }
-    return changed;
+    entry.ready = true;
+    entry.result = readyResult(entry, reason);
+    resolveWaiters(entry, entry.result);
+    log('[ClaudePromptStable] ready tab=' + String(tabId).slice(-12)
+      + ' gen=' + generation
+      + ' promptEpoch=' + entry.promptEpoch
+      + ' activityEpoch=' + entry.activityEpoch
+      + ' reason=' + reason);
+    return true;
+  }
+
+  function markActivity(tabId, generation, reason = 'terminal-activity') {
+    const entry = byTab.get(tabId) || null;
+    if (!entry || entry.generation !== generation) return false;
+    entry.activityEpoch += 1;
+    entry.ready = false;
+    entry.result = null;
+    log('[ClaudePromptStable] invalidate tab=' + String(tabId).slice(-12)
+      + ' gen=' + generation
+      + ' activityEpoch=' + entry.activityEpoch
+      + ' reason=' + reason);
+    return true;
+  }
+
+  function markBusy(tabId, generation, busy, reason = 'turn-state') {
+    const entry = byTab.get(tabId) || null;
+    if (!entry || entry.generation !== generation) return false;
+    entry.busy = busy === true;
+    entry.busyEpoch += 1;
+    entry.activityEpoch += 1;
+    entry.ready = false;
+    entry.result = null;
+    log('[ClaudePromptStable] busy tab=' + String(tabId).slice(-12)
+      + ' gen=' + generation
+      + ' busy=' + entry.busy
+      + ' busyEpoch=' + entry.busyEpoch
+      + ' reason=' + reason);
+    return true;
   }
 
   function wait(tabId, generation) {
@@ -76,14 +126,39 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
         reason: 'stale-generation',
       });
     }
-    return entry.promise;
+    if (entry.ready && !entry.busy && entry.result?.ready === true) {
+      return Promise.resolve({
+        ...entry.result,
+        lease: { ...entry.result.lease },
+      });
+    }
+    return new Promise((resolve) => entry.waiters.add(resolve));
+  }
+
+  function validate(tabId, generation, lease, { allowFrameAdvance = false } = {}) {
+    const entry = byTab.get(tabId) || null;
+    if (!entry || entry.generation !== generation || lease?.generation !== generation) {
+      return { valid: false, reason: 'stale-generation' };
+    }
+    if (entry.busy) return { valid: false, reason: 'claude-turn-busy' };
+    if (Number(lease.busyEpoch) !== Number(entry.busyEpoch)) {
+      return { valid: false, reason: 'claude-busy-generation-changed' };
+    }
+    if (!allowFrameAdvance && (
+      entry.ready !== true
+      || Number(lease.activityEpoch) !== Number(entry.activityEpoch)
+      || Number(lease.promptEpoch) !== Number(entry.promptEpoch)
+    )) {
+      return { valid: false, reason: 'claude-prompt-frame-changed' };
+    }
+    return { valid: true, reason: 'claude-prompt-lease-current' };
   }
 
   function clear(tabId, generation = null, reason = 'cleared') {
     const entry = byTab.get(tabId) || null;
     if (!entry || (generation && entry.generation !== generation)) return false;
     byTab.delete(tabId);
-    settle(entry, {
+    resolveWaiters(entry, {
       ready: false,
       generation: entry.generation,
       reason,
@@ -102,7 +177,12 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
       generation: entry.generation,
       openedAt: entry.openedAt,
       openedReason: entry.openedReason,
-      settled: entry.settled,
+      settled: entry.ready,
+      ready: entry.ready,
+      busy: entry.busy,
+      activityEpoch: entry.activityEpoch,
+      busyEpoch: entry.busyEpoch,
+      promptEpoch: entry.promptEpoch,
       result: entry.result ? { ...entry.result } : null,
     };
   }
@@ -110,7 +190,10 @@ function createClaudePromptStabilityRegistry({ now = () => Date.now(), log = () 
   return {
     open,
     markStable,
+    markActivity,
+    markBusy,
     wait,
+    validate,
     clear,
     snapshot,
   };

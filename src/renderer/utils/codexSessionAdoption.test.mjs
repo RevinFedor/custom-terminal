@@ -110,11 +110,17 @@ test('Resume child applies the exact non-Ultra source pair instead of stale tab 
       model: 'gpt-5.6-luna',
       effort: 'medium',
       proofAt: 456,
+      fast: true,
     },
   });
   assert.deepEqual(options, {
     carryCodexSettingsProof: true,
-    codexSettingsProof: { model: 'gpt-5.6-luna', effort: 'medium', proofAt: 456 },
+    codexSettingsProof: {
+      model: 'gpt-5.6-luna',
+      effort: 'medium',
+      proofAt: 456,
+      fast: true,
+    },
     codexSettingsProofInvalid: false,
   });
   assert.deepEqual(planCarriedCodexSettingsProofApplication({
@@ -134,7 +140,30 @@ test('Resume child applies the exact non-Ultra source pair instead of stale tab 
       codexLiveModel: undefined,
       codexLiveEffort: undefined,
       codexLiveSettingsSessionId: undefined,
+      codexLiveServiceTier: 'priority',
+      codexLiveServiceTierSessionId: 'child-b',
+      codexLiveServiceTierSource: 'verified-composer-footer',
     },
+  });
+});
+
+test('an exact Fast-off footer stays off when the launch owner becomes a writer', () => {
+  const plan = planCarriedCodexSettingsProofApplication({
+    proof: {
+      model: 'gpt-5.6-luna',
+      effort: 'medium',
+      proofAt: 457,
+      fast: false,
+    },
+    nextSessionId: 'child-off',
+  });
+  assert.deepEqual(plan.livePatch, {
+    codexLiveModel: undefined,
+    codexLiveEffort: undefined,
+    codexLiveSettingsSessionId: undefined,
+    codexLiveServiceTier: 'default',
+    codexLiveServiceTierSessionId: 'child-off',
+    codexLiveServiceTierSource: 'verified-composer-footer',
   });
 });
 

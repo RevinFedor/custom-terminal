@@ -9,7 +9,7 @@ import Tooltip from './Tooltip';
 import ControlHint from './ControlHint';
 import ProjectIconsSettings from './ProjectIconsSettings';
 import { HexColorPicker } from 'react-colorful';
-import { ChevronDown, ChevronRight, CircleX, Loader2, Trash2, Plus } from 'lucide-react';
+import { ChevronDown, ChevronRight, CircleX, Loader2, Pencil, Trash2, Plus } from 'lucide-react';
 import {
   CLAUDE_EFFORT_LEVELS,
   claudeEffortsForModel,
@@ -72,6 +72,9 @@ interface Prompt {
 }
 
 type PromptDragState = { prompts: Prompt[]; promptGroups: PromptGroup[] };
+type PromptTreeNodeKind = 'prompt' | 'group';
+type PromptTreeRename = { kind: PromptTreeNodeKind; id: string | number };
+type PromptTreeContextMenu = PromptTreeRename & { x: number; y: number };
 type FlatPromptItem = { type: 'prompt'; origIdx: number; prompt: Prompt };
 type FlatGroupItem = { type: 'group'; group: PromptGroup };
 type FlatItem = FlatPromptItem | FlatGroupItem;
@@ -1622,11 +1625,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   // User prompts (text insertion snippets, not AI prompts)
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [promptGroups, setPromptGroups] = useState<PromptGroup[]>([]);
-  const [editingGroupId, setEditingGroupId] = useState<number | null>(null);
-  const [localGroupName, setLocalGroupName] = useState('');
-  const [localGroupDescription, setLocalGroupDescription] = useState('');
-  const [savedGroupFlash, setSavedGroupFlash] = useState<'name' | 'description' | null>(null);
-  const savedGroupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [promptTreeRename, setPromptTreeRename] = useState<PromptTreeRename | null>(null);
+  const [promptTreeRenameDraft, setPromptTreeRenameDraft] = useState('');
+  const [promptTreeContextMenu, setPromptTreeContextMenu] = useState<PromptTreeContextMenu | null>(null);
+  const promptTreeRenameInputRef = useRef<HTMLInputElement>(null);
   const textListRef = useRef<HTMLDivElement>(null);
 
   // Editing states
@@ -1640,7 +1642,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [localInsertionContent, setLocalInsertionContent] = useState('');
   const [localInsertionFilePaths, setLocalInsertionFilePaths] = useState<string[]>([]);
   const [insertionFileInputs, setInsertionFileInputs] = useState<{ value: string; valid: boolean | null }[]>([]);
-  const [savedInsertionFlash, setSavedInsertionFlash] = useState<'title' | 'content' | null>(null);
+  const [savedInsertionFlash, setSavedInsertionFlash] = useState<'content' | null>(null);
   const savedInsertionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [textInsertCopied, setTextInsertCopied] = useState(false);
   const [textInsertCopying, setTextInsertCopying] = useState(false);
@@ -1715,14 +1717,14 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     } else {
       // Save current AI prompt before resetting (no flash — modal is closing)
       saveCurrentAIPrompt();
-      saveCurrentGroup();
       // Reset editing states when modal closes
       setEditingClaude(false);
       setEditingPromptId(null);
       setEditingDocPrompt(false);
       setEditingPostCheck(false);
       setEditingInsertionIndex(null);
-      setEditingGroupId(null);
+      setPromptTreeRename(null);
+      setPromptTreeContextMenu(null);
     }
   }, [isOpen, docPrompt]);
 
@@ -1817,10 +1819,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const startEditingInsertion = (index: number) => {
     if (index === editingInsertionIndex) return;
     saveCurrentInsertion();
-    saveCurrentGroup();
     saveCurrentAIPrompt();
     setEditingPromptId(null);
-    setEditingGroupId(null);
     setEditingInsertionIndex(index);
     setLocalInsertionTitle(prompts[index].title);
     setLocalInsertionContent(prompts[index].content);
@@ -1828,37 +1828,74 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setInsertionFileInputs([]);
   };
 
-  // Group editing in left panel
-  const saveCurrentGroup = () => {
-    if (editingGroupId !== null) {
-      const g = promptGroups.find(g => g.id === editingGroupId);
-      if (g && (g.name !== localGroupName || g.description !== localGroupDescription)) {
-        const newGroups = promptGroups.map(g => g.id === editingGroupId ? { ...g, name: localGroupName, description: localGroupDescription } : g);
-        setPromptGroups(newGroups);
-        ipcRenderer.invoke('prompt-groups:save', newGroups);
+  const beginPromptTreeRename = (
+    kind: PromptTreeNodeKind,
+    id: string | number,
+    initialName?: string,
+  ) => {
+    const currentName = initialName ?? (kind === 'group'
+      ? promptGroups.find(group => group.id === id)?.name
+      : prompts.find(prompt => prompt.id === id)?.title);
+    if (currentName == null) return;
+    setPromptTreeContextMenu(null);
+    setPromptTreeRename({ kind, id });
+    setPromptTreeRenameDraft(currentName);
+  };
+
+  const commitPromptTreeRename = () => {
+    if (!promptTreeRename) return;
+    const nextName = promptTreeRenameDraft.trim();
+    if (promptTreeRename.kind === 'prompt') {
+      const current = prompts.find(prompt => prompt.id === promptTreeRename.id);
+      if (current && nextName && current.title !== nextName) {
+        const nextPrompts = prompts.map(prompt => prompt.id === promptTreeRename.id
+          ? { ...prompt, title: nextName }
+          : prompt);
+        setPrompts(nextPrompts);
+        savePromptsImmediate(nextPrompts);
+        if (editingInsertionIndex !== null && prompts[editingInsertionIndex]?.id === promptTreeRename.id) {
+          setLocalInsertionTitle(nextName);
+        }
+      }
+    } else {
+      const current = promptGroups.find(group => group.id === promptTreeRename.id);
+      if (current && nextName && current.name !== nextName) {
+        const nextGroups = promptGroups.map(group => group.id === promptTreeRename.id
+          ? { ...group, name: nextName }
+          : group);
+        setPromptGroups(nextGroups);
+        void ipcRenderer.invoke('prompt-groups:save', nextGroups);
       }
     }
+    setPromptTreeRename(null);
   };
 
-  const startEditingGroup = (groupId: number, groupsOverride?: PromptGroup[]) => {
-    if (groupId === editingGroupId) return;
-    saveCurrentInsertion();
-    saveCurrentGroup();
-    saveCurrentAIPrompt();
-    setEditingPromptId(null);
-    setEditingInsertionIndex(null);
-    const list = groupsOverride || promptGroups;
-    const g = list.find(g => g.id === groupId);
-    if (!g) return;
-    setEditingGroupId(groupId);
-    setLocalGroupName(g.name);
-    setLocalGroupDescription(g.description);
-  };
+  useEffect(() => {
+    if (!promptTreeRename) return undefined;
+    const frame = requestAnimationFrame(() => {
+      promptTreeRenameInputRef.current?.focus();
+      promptTreeRenameInputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [promptTreeRename]);
 
-  const closeGroupEditor = () => {
-    saveCurrentGroup();
-    setEditingGroupId(null);
-  };
+  useEffect(() => {
+    if (!promptTreeContextMenu) return undefined;
+    const closeMenu = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-prompt-tree-context-menu]')) return;
+      setPromptTreeContextMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPromptTreeContextMenu(null);
+    };
+    document.addEventListener('pointerdown', closeMenu, true);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeMenu, true);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [promptTreeContextMenu]);
 
   const promptStateWithLocalDrafts = useCallback((): PromptDragState => {
     const nextPrompts = prompts.map(p => ({ ...p }));
@@ -1871,14 +1908,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         file_paths: localInsertionFilePaths,
       };
     }
-    if (editingGroupId !== null) {
-      const gi = nextGroups.findIndex(g => g.id === editingGroupId);
-      if (gi >= 0) {
-        nextGroups[gi] = { ...nextGroups[gi], name: localGroupName, description: localGroupDescription };
-      }
-    }
     return { prompts: nextPrompts, promptGroups: nextGroups };
-  }, [editingGroupId, editingInsertionIndex, localGroupDescription, localGroupName, localInsertionContent, localInsertionFilePaths, localInsertionTitle, promptGroups, prompts]);
+  }, [editingInsertionIndex, localInsertionContent, localInsertionFilePaths, localInsertionTitle, promptGroups, prompts]);
 
   const promptPos = (p: Prompt, fallback: number) => Number.isFinite(Number(p.position)) ? Number(p.position) : fallback;
 
@@ -1967,6 +1998,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
   const promptDnd = useOutlineDnd({
     outline: promptOutline,
+    disabled: promptTreeRename !== null,
     onCommit: commitPromptOutline,
     onExpansionRequest: handlePromptExpansion,
     canHorizontalMove: promptOutlineHorizontalPolicy,
@@ -2159,6 +2191,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setLocalInsertionContent('');
     setLocalInsertionFilePaths([]);
     setInsertionFileInputs([]);
+    beginPromptTreeRename('prompt', newPrompts[idx].id, newPrompts[idx].title);
   };
 
   const addPromptGroup = async () => {
@@ -2167,7 +2200,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     const newGroups = [...promptGroups, newGroup];
     setPromptGroups(newGroups);
     await ipcRenderer.invoke('prompt-groups:save', newGroups);
-    startEditingGroup(newGroup.id, newGroups);
+    beginPromptTreeRename('group', newGroup.id, newGroup.name);
   };
 
   const deletePromptGroup = async (groupId: number) => {
@@ -2179,7 +2212,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       ipcRenderer.invoke('prompts:save', newPrompts),
       ipcRenderer.invoke('prompt-groups:save', newGroups)
     ]);
-    setEditingGroupId(null);
+    if (promptTreeRename?.kind === 'group' && promptTreeRename.id === groupId) {
+      setPromptTreeRename(null);
+    }
     showToast('Group deleted', 'success');
   };
 
@@ -2208,9 +2243,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     }
     if (aiSubTab === 'text') {
       saveCurrentInsertion();
-      saveCurrentGroup();
       setEditingInsertionIndex(null);
-      setEditingGroupId(null);
+      setPromptTreeRename(null);
+      setPromptTreeContextMenu(null);
     }
     setAiSubTab(next);
   };
@@ -2255,7 +2290,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     const connectorColor = 'rgba(139,92,246,0.58)';
     const hierarchyStep = 12;
     const marginLeft = isGroup ? 0 : (inGroup ? 18 : 0) + visualDepth * hierarchyStep;
-    const selected = isGroup ? editingGroupId === node.groupId : promptIndex >= 0 && editingInsertionIndex === promptIndex;
+    const selected = !isGroup && promptIndex >= 0 && editingInsertionIndex === promptIndex;
+    const isRenaming = promptTreeRename?.kind === (isGroup ? 'group' : 'prompt')
+      && promptTreeRename.id === (isGroup ? node.groupId : prompt?.id);
     const dndId = isGroup ? String(node.groupId) : prompt?.id;
     return (
       <div
@@ -2273,14 +2310,37 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         data-visual-parent-id={promptAncestors.length > 0 ? String(promptAncestors[promptAncestors.length - 1]).replace(/^prompt:/, '') : undefined}
         data-visual-depth={isGroup ? undefined : String(visualDepth)}
         data-dnd-navigation-protected={navigationBlocked ? 'true' : undefined}
-        onClick={isGroup ? undefined : (event) => {
-          if (!event.defaultPrevented && promptIndex >= 0) startEditingInsertion(promptIndex);
+        onClick={(event) => {
+          if (event.defaultPrevented || isRenaming) return;
+          if (!isGroup && promptIndex >= 0) {
+            startEditingInsertion(promptIndex);
+          }
         }}
-        onContextMenu={isGroup ? (event) => {
+        onDoubleClick={isGroup ? undefined : (event) => {
           event.preventDefault();
           event.stopPropagation();
-          startEditingGroup(node.groupId);
-        } : undefined}
+          if (
+            !promptDnd.dragState
+            && !event.metaKey
+            && !event.ctrlKey
+            && !event.shiftKey
+            && prompt
+          ) {
+            beginPromptTreeRename('prompt', prompt.id, prompt.title);
+          }
+        }}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const menuWidth = 176;
+          const menuHeight = 82;
+          setPromptTreeContextMenu({
+            kind: isGroup ? 'group' : 'prompt',
+            id: isGroup ? node.groupId : prompt!.id,
+            x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+            y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+          });
+        }}
         style={{
           display: 'flex',
           alignItems: 'center',
@@ -2344,13 +2404,63 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               )}
             </button>
             <VRFolderIcon />
-            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: selected ? '#ddd6fe' : VR_TEXT, fontWeight: 650, fontSize: 13 }}>{liveGroup?.name || 'Группа'}</div>
+            {isRenaming ? (
+              <input
+                ref={promptTreeRenameInputRef}
+                data-outline-dnd-ignore
+                data-prompt-outline-rename="group"
+                value={promptTreeRenameDraft}
+                onChange={(event) => setPromptTreeRenameDraft(event.target.value)}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => event.stopPropagation()}
+                onDoubleClick={(event) => event.stopPropagation()}
+                onContextMenu={(event) => event.stopPropagation()}
+                onBlur={commitPromptTreeRename}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    commitPromptTreeRename();
+                  } else if (event.key === 'Escape') {
+                    event.preventDefault();
+                    setPromptTreeRename(null);
+                  }
+                }}
+                style={{ ...vrFieldStyle, flex: 1, height: 26, padding: '3px 7px', fontSize: 13 }}
+              />
+            ) : (
+              <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: VR_TEXT, fontWeight: 650, fontSize: 13 }}>{liveGroup?.name || 'Группа'}</div>
+            )}
             <VRTag>{node.children?.length || 0}</VRTag>
           </>
         ) : (
           <>
             <VRDocIcon />
-            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: selected ? '#bfdbfe' : VR_TEXT, fontWeight: 620, fontSize: 13 }}>{prompt?.title || 'Untitled'}</div>
+            {isRenaming ? (
+              <input
+                ref={promptTreeRenameInputRef}
+                data-outline-dnd-ignore
+                data-prompt-outline-rename="prompt"
+                value={promptTreeRenameDraft}
+                onChange={(event) => setPromptTreeRenameDraft(event.target.value)}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => event.stopPropagation()}
+                onDoubleClick={(event) => event.stopPropagation()}
+                onContextMenu={(event) => event.stopPropagation()}
+                onBlur={commitPromptTreeRename}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    commitPromptTreeRename();
+                  } else if (event.key === 'Escape') {
+                    event.preventDefault();
+                    setPromptTreeRename(null);
+                  }
+                }}
+                style={{ ...vrFieldStyle, flex: 1, height: 26, padding: '3px 7px', fontSize: 13 }}
+              />
+            ) : (
+              <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: selected ? '#bfdbfe' : VR_TEXT, fontWeight: 620, fontSize: 13 }}>{prompt?.title || 'Untitled'}</div>
+            )}
             {(prompt?.file_paths?.length || 0) > 0 && <VRTag accent>{prompt?.file_paths?.length} файл.</VRTag>}
             {intent && <span aria-hidden data-horizontal-intent={intent.direction} data-horizontal-intent-disabled={intent.blocked ? 'true' : undefined} style={{ color: intent.blocked ? '#73737a' : '#a78bfa', fontSize: 15, fontWeight: 800, lineHeight: 1 }}>{intent.direction === 'left' ? '←' : '→'}{intent.blocked ? '×' : ''}</span>}
           </>
@@ -2444,7 +2554,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   };
 
   const renderTextInsertEditor = () => {
-    const selectedGroup = editingGroupId !== null ? promptGroups.find(g => g.id === editingGroupId) : null;
     const selectedPrompt = editingInsertionIndex !== null ? prompts[editingInsertionIndex] : null;
     return (
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 34%) minmax(360px, 1fr)', gap: 12, height: '100%', minHeight: 0 }}>
@@ -2494,6 +2603,52 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               </>
             )}
           </div>
+          {promptTreeContextMenu && (
+            <div
+              data-prompt-tree-context-menu
+              style={{
+                position: 'fixed',
+                left: promptTreeContextMenu.x,
+                top: promptTreeContextMenu.y,
+                zIndex: 10050,
+                width: 176,
+                padding: 4,
+                borderRadius: 8,
+                border: `1px solid ${VR_BORDER}`,
+                background: '#1d1d21',
+                boxShadow: '0 12px 30px rgba(0,0,0,0.45)',
+              }}
+            >
+              <button
+                data-prompt-tree-context-action="rename"
+                onClick={() => beginPromptTreeRename(
+                  promptTreeContextMenu.kind,
+                  promptTreeContextMenu.id,
+                )}
+                style={promptTreeContextActionStyle()}
+              >
+                <Pencil size={14} />
+                <span>Rename</span>
+              </button>
+              <button
+                data-prompt-tree-context-action="delete"
+                onClick={() => {
+                  const target = promptTreeContextMenu;
+                  setPromptTreeContextMenu(null);
+                  if (target.kind === 'group') {
+                    void deletePromptGroup(Number(target.id));
+                  } else {
+                    const index = prompts.findIndex(prompt => prompt.id === target.id);
+                    if (index >= 0) void deletePrompt(index);
+                  }
+                }}
+                style={promptTreeContextActionStyle(true)}
+              >
+                <Trash2 size={14} />
+                <span>Delete</span>
+              </button>
+            </div>
+          )}
         </div>
 
         <div style={{ minHeight: 0, background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
@@ -2507,20 +2662,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <VRIconBtn title="Удалить промпт" danger onClick={() => editingInsertionIndex !== null && deletePrompt(editingInsertionIndex)}><VRTrashIcon /></VRIconBtn>
               </div>
               <div style={{ padding: 14, overflowY: 'auto', minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}>
-                <VRField label="Название">
-                  <input
-                    value={localInsertionTitle}
-                    placeholder="Название промпта"
-                    onChange={(e) => setLocalInsertionTitle(e.target.value)}
-                    onBlur={() => {
-                      saveCurrentInsertion();
-                      setSavedInsertionFlash('title');
-                      if (savedInsertionTimer.current) clearTimeout(savedInsertionTimer.current);
-                      savedInsertionTimer.current = setTimeout(() => setSavedInsertionFlash(null), 400);
-                    }}
-                    style={{ ...vrFieldStyle, borderColor: savedInsertionFlash === 'title' ? VR_GREEN : VR_BORDER }}
-                  />
-                </VRField>
                 <VRField label="Текст">
                   <textarea
                     value={localInsertionContent}
@@ -2539,32 +2680,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 {renderInsertionFiles()}
               </div>
             </div>
-          ) : selectedGroup ? (
-            <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-              <div style={{ padding: '12px 14px', borderBottom: `1px solid ${VR_BORDER}`, display: 'flex', alignItems: 'center', gap: 10 }}>
-                <VRFolderIcon />
-                <div style={{ color: VR_TEXT, fontSize: 14, fontWeight: 750, flex: 1 }}>Группа</div>
-                <VRIconBtn title="Удалить группу" danger onClick={() => deletePromptGroup(selectedGroup.id)}><VRTrashIcon /></VRIconBtn>
-              </div>
-              <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
-                <VRField label="Название">
-                  <input
-                    value={localGroupName}
-                    onChange={(e) => setLocalGroupName(e.target.value)}
-                    onBlur={() => {
-                      saveCurrentGroup();
-                      setSavedGroupFlash('name');
-                      if (savedGroupTimer.current) clearTimeout(savedGroupTimer.current);
-                      savedGroupTimer.current = setTimeout(() => setSavedGroupFlash(null), 400);
-                    }}
-                    style={{ ...vrFieldStyle, borderColor: savedGroupFlash === 'name' ? VR_GREEN : VR_BORDER }}
-                  />
-                </VRField>
-              </div>
-            </div>
           ) : (
             <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: VR_DIM, fontSize: 13 }}>
-              Выбери промпт или группу слева
+              Выбери промпт слева
             </div>
           )}
         </div>
@@ -4122,6 +4240,25 @@ function vrSmallBtnStyle(kind: 'accent' | 'neutral'): React.CSSProperties {
     fontWeight: 650,
     cursor: 'pointer',
     whiteSpace: 'nowrap',
+  };
+}
+
+function promptTreeContextActionStyle(danger = false): React.CSSProperties {
+  return {
+    width: '100%',
+    height: 34,
+    display: 'flex',
+    alignItems: 'center',
+    gap: 9,
+    padding: '0 9px',
+    border: 'none',
+    borderRadius: 6,
+    background: 'transparent',
+    color: danger ? '#ff7b7b' : '#dedee2',
+    fontSize: 12.5,
+    fontWeight: 620,
+    cursor: 'pointer',
+    textAlign: 'left',
   };
 }
 

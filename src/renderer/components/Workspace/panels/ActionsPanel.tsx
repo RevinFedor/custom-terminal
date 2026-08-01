@@ -890,7 +890,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         .filter(t => t.name.startsWith('docs-')).length;
       const tabName = `docs-${String(existingDocsTabs + 1).padStart(2, '0')}`;
 
-      const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'claude', isUtility: false, nameSetManually: true, background: true });
+      const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'claude', nameSetManually: true, background: true });
       if (!newTabId) throw new Error('Failed to create tab');
       useWorkspaceStore.getState().setTabCommandType(newTabId, 'claude');
 
@@ -1011,7 +1011,7 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
         }
       }
 
-      const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'gemini', isUtility: false, afterTabId, nameSetManually: true, background: true });
+      const newTabId = await createTabAfterCurrent(activeProjectId, tabName, workingDir, { color: 'gemini', afterTabId, nameSetManually: true, background: true });
       if (!newTabId) throw new Error('Failed to create tab');
       docsGeminiTabIdRef.current = newTabId;
       useWorkspaceStore.getState().setTabCommandType(newTabId, 'gemini');

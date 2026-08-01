@@ -16,6 +16,7 @@ const {
   historyPayloadStash,
   capPayloadForRender,
 } = require('./history-payload-dehydrate');
+const { applyHistoryEntryWindow } = require('./history-entry-window');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -466,16 +467,35 @@ class SessionTranscriptService {
           }),
         }
       );
+      const historyWindow = applyHistoryEntryWindow(timedEntries, payload.bounds);
       return {
         success: true,
         unchanged: false,
-        entries: timedEntries,
+        entries: historyWindow.entries,
+        total: historyWindow.total,
+        dropped: historyWindow.dropped,
+        truncated: historyWindow.truncated,
+        boundsApplied: historyWindow.boundsApplied,
+        firstUuid: historyWindow.firstUuid,
+        lastUuid: historyWindow.lastUuid,
         claudeMemoryBoundaryUuid: null,
         filePath: loaded.filePath,
         revision,
       };
     }
-    return { success: false, error: 'claude history compatibility path not migrated', entries: [] };
+    const getFullHistory = this.claudeData?._api?.getFullHistory;
+    if (typeof getFullHistory !== 'function') {
+      return { success: false, error: 'claude history service unavailable', entries: [] };
+    }
+    const mainWindow = this.getMainWindow?.();
+    const sender = mainWindow && !mainWindow.isDestroyed?.() ? mainWindow.webContents : null;
+    return getFullHistory({
+      ...payload,
+      toolType: 'claude',
+      sessionId,
+      cwd,
+      bounds: payload.bounds || null,
+    }, { sender });
   }
 
   async getMessages(payload = {}) {

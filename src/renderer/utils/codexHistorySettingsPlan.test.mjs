@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   codexSettingsProofMatchesActiveWriter,
+  codexSettingsProofMatchesRuntimeOwner,
   isCompleteCodexSettingsRequest,
   planCodexHistorySettings,
   resolveCodexSettingsRuntimeProof,
@@ -106,6 +107,45 @@ test('partial live request blocks while the active writer is not proven', () => 
   assert.equal(plan.proofReason, 'active-writer-unconfirmed');
 });
 
+test('partial request inherits the other setting from the exact provisional launch', () => {
+  assert.deepEqual(planCodexHistorySettings({
+    requestedModel: 'gpt-5.6-sol',
+    currentModel: 'stale-saved-model',
+    currentEffort: 'low',
+    currentProofSessionId: 'resume-source',
+    runtimeSnapshot: {
+      liveLifecycle: true,
+      writerConfirmed: false,
+      provenWriterSessionId: null,
+      codexProvisionalSettingsOwnerId: 'launch:resume-7',
+      codexProvisionalModel: 'gpt-5.6-luna',
+      codexProvisionalEffort: 'medium',
+    },
+    statusAtSend: 'active',
+  }), {
+    hasRequestedSettings: true,
+    blocked: false,
+    model: 'gpt-5.6-sol',
+    effort: 'medium',
+  });
+});
+
+test('incomplete provisional launch proof cannot authorize partial settings inheritance', () => {
+  const plan = planCodexHistorySettings({
+    requestedModel: 'gpt-5.6-sol',
+    currentEffort: 'medium',
+    runtimeSnapshot: {
+      liveLifecycle: true,
+      writerConfirmed: false,
+      codexProvisionalSettingsOwnerId: 'launch:resume-7',
+      codexProvisionalModel: 'gpt-5.6-luna',
+    },
+    statusAtSend: 'active',
+  });
+  assert.equal(plan.blocked, true);
+  assert.equal(plan.code, 'codex_current_settings_unproven');
+});
+
 test('partial request blocks on unknown lifecycle instead of treating it as stopped config', () => {
   const plan = planCodexHistorySettings({
     requestedModel: 'gpt-5.6-sol',
@@ -207,6 +247,10 @@ test('runtime proof resolver accepts only the explicitly confirmed live writer',
   assert.deepEqual(resolveCodexSettingsRuntimeProof(LIVE_WRITER), {
     runtimeState: 'live',
     activeWriterSessionId: 'writer-a',
+    currentSettingsOwnerId: 'writer-a',
+    currentSettingsModel: '',
+    currentSettingsEffort: '',
+    provisionalSettingsProven: false,
   });
   assert.deepEqual(resolveCodexSettingsRuntimeProof({
     liveLifecycle: true,
@@ -215,10 +259,18 @@ test('runtime proof resolver accepts only the explicitly confirmed live writer',
   }), {
     runtimeState: 'live',
     activeWriterSessionId: '',
+    currentSettingsOwnerId: '',
+    currentSettingsModel: '',
+    currentSettingsEffort: '',
+    provisionalSettingsProven: false,
   });
   assert.deepEqual(resolveCodexSettingsRuntimeProof({ liveLifecycle: false }), {
     runtimeState: 'stopped',
     activeWriterSessionId: '',
+    currentSettingsOwnerId: '',
+    currentSettingsModel: '',
+    currentSettingsEffort: '',
+    provisionalSettingsProven: false,
   });
   assert.equal(codexSettingsProofMatchesActiveWriter({
     currentProofSessionId: 'writer-a',
@@ -228,6 +280,16 @@ test('runtime proof resolver accepts only the explicitly confirmed live writer',
     currentProofSessionId: 'old-writer',
     runtimeSnapshot: LIVE_WRITER,
   }), false);
+  assert.equal(codexSettingsProofMatchesRuntimeOwner({
+    currentProofSessionId: 'launch:resume-7',
+    runtimeSnapshot: {
+      liveLifecycle: true,
+      writerConfirmed: false,
+      codexProvisionalSettingsOwnerId: 'launch:resume-7',
+      codexProvisionalModel: 'gpt-5.6-luna',
+      codexProvisionalEffort: 'medium',
+    },
+  }), true);
   assert.equal(isCompleteCodexSettingsRequest({
     requestedModel: 'gpt-5.6-sol',
     requestedEffort: 'max',

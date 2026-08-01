@@ -115,6 +115,27 @@ test('orchestration result keeps one Codex turn together across mid-turn compact
   assert.doesNotMatch(result.assistantText, /UNRELATED NEXT ANSWER/);
 });
 
+test('F2: subagent notification does not split one external Codex result turn', () => {
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'user_message', message: 'run delegated checks' } },
+    { __line: 2, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } },
+    { __line: 3, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Partial result before child completion.' }] } },
+    { __line: 4, type: 'event_msg', payload: { type: 'user_message', message: '<subagent_notification>{"agent_path":"/root/tester","status":{"completed":"ok"}}</subagent_notification>' } },
+    { __line: 5, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Final result after child completion.' }] } },
+    { __line: 6, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } },
+  ];
+  const sessionId = 'codex-subagent-result-session';
+  const target = _api.buildCodexTimeline(records, sessionId)
+    .find((entry) => entry.type === 'user' && entry.content === 'run delegated checks');
+  const result = _api.buildCodexTurnAssistantResult(records, sessionId, target.uuid, 100000);
+
+  assert.equal(result.success, true);
+  assert.equal(result.complete, true);
+  assert.equal(result.assistantMessageCount, 2);
+  assert.match(result.assistantText, /Partial result before child completion/);
+  assert.match(result.assistantText, /Final result after child completion/);
+});
+
 test('orchestration result bounds a long compacted turn while preserving its final tail', () => {
   const first = 'HEAD-SENTINEL ' + 'a'.repeat(700);
   const final = 'b'.repeat(700) + ' FINAL-TAIL-SENTINEL';

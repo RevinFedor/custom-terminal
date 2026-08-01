@@ -46,6 +46,19 @@ export interface ClaudePtyDraftGrabResult {
   imagePaths?: Array<{ id: number; path: string; mediaType: string; size: number }>;
   mode?: string;
   error?: string;
+  proofOutcome?: 'found' | 'absent' | 'unknown' | string;
+  proofReason?: string;
+  editorReturnReady?: boolean;
+  editorReturnReason?: string | null;
+  terminalIdentityStable?: boolean;
+  terminalRunSeq?: number | null;
+  inputRevision?: number | null;
+  terminalLifecycleGeneration?: string | null;
+  mirrorGeneration?: string | null;
+}
+
+export interface ClaudePtyDraftGrabOptions {
+  draftProof?: Record<string, unknown>;
 }
 
 export interface ClaudePtySendOptions {
@@ -561,7 +574,10 @@ export function interruptClaudePtyTurn(tabId: string): { success: boolean; inter
   return { success: true, interrupted: true };
 }
 
-export async function stopClaudePtyProcess(tabId: string): Promise<any> {
+export async function stopClaudePtyProcess(tabId: string, options: {
+  reason?: string | null;
+  authority?: Record<string, unknown> | null;
+} = {}): Promise<any> {
   if (!tabId) return { success: false, error: 'tabId required' };
   const existing = stopInflight.get(tabId);
   if (existing) {
@@ -569,7 +585,12 @@ export async function stopClaudePtyProcess(tabId: string): Promise<any> {
     return existing;
   }
   console.log('[ClaudePtyActions:stop-process] start tab=' + shortTab(tabId));
-  const work = ipcRenderer.invoke('terminal:stop-ai-process', { tabId, toolType: 'claude' })
+  const work = ipcRenderer.invoke('terminal:stop-ai-process', {
+    tabId,
+    toolType: 'claude',
+    ...(options.reason ? { reason: options.reason } : {}),
+    ...(options.authority ? { authority: options.authority } : {}),
+  })
     .then((result: any) => {
       console.log('[ClaudePtyActions:stop-process] done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' error=' + (result?.error || '-'));
       return result;
@@ -646,28 +667,53 @@ export async function answerClaudeQuestion({
   return work;
 }
 
-export async function grabClaudePtyDraft(tabId: string): Promise<ClaudePtyDraftGrabResult> {
+async function captureClaudePtyDraft(
+  tabId: string,
+  mode: 'grab' | 'copy',
+  options: ClaudePtyDraftGrabOptions = {},
+): Promise<ClaudePtyDraftGrabResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
 
-  const existing = draftGrabInflight.get(tabId);
+  // `grab` transfers ownership out of the native composer, while `copy`
+  // deliberately leaves it there. They must never join the same promise:
+  // otherwise an orchestration preflight could accidentally inherit the
+  // destructive semantics of a concurrent History grab (or vice versa).
+  // Main still serializes the physical Ctrl+G operation per tab, so a
+  // cross-mode collision fails closed as `already_in_progress`.
+  const captureKey = tabId + ':' + mode;
+  const existing = draftGrabInflight.get(captureKey);
   if (existing) {
-    console.log('[ClaudePtyActions:draft] join-inflight tab=' + shortTab(tabId));
+    console.log('[ClaudePtyActions:draft] ' + mode + ' join-inflight tab=' + shortTab(tabId));
     return existing;
   }
 
-  console.log('[ClaudePtyActions:draft] grab start tab=' + shortTab(tabId));
-  const work = ipcRenderer.invoke('claude:grab-input', tabId)
+  console.log('[ClaudePtyActions:draft] ' + mode + ' start tab=' + shortTab(tabId));
+  const work = ipcRenderer.invoke('claude:' + mode + '-input', tabId, options)
     .then((result: ClaudePtyDraftGrabResult) => {
-      console.log('[ClaudePtyActions:draft] grab done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' chars=' + (result?.text?.length || 0) + ' images=' + (result?.images || 0) + ' error=' + (result?.error || '-'));
+      console.log('[ClaudePtyActions:draft] ' + mode + ' done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' chars=' + (result?.text?.length || 0) + ' images=' + (result?.images || 0) + ' error=' + (result?.error || '-'));
       return result || { success: false, error: 'empty_result' };
     })
     .catch((e: any) => {
-      console.warn('[ClaudePtyActions:draft] grab error tab=' + shortTab(tabId) + ': ' + errorText(e));
+      console.warn('[ClaudePtyActions:draft] ' + mode + ' error tab=' + shortTab(tabId) + ': ' + errorText(e));
       return { success: false, error: errorText(e) };
     })
     .finally(() => {
-      if (draftGrabInflight.get(tabId) === work) draftGrabInflight.delete(tabId);
+      if (draftGrabInflight.get(captureKey) === work) draftGrabInflight.delete(captureKey);
     });
-  draftGrabInflight.set(tabId, work);
+  draftGrabInflight.set(captureKey, work);
   return work;
+}
+
+export async function grabClaudePtyDraft(
+  tabId: string,
+  options: ClaudePtyDraftGrabOptions = {},
+): Promise<ClaudePtyDraftGrabResult> {
+  return captureClaudePtyDraft(tabId, 'grab', options);
+}
+
+export async function copyClaudePtyDraft(
+  tabId: string,
+  options: ClaudePtyDraftGrabOptions = {},
+): Promise<ClaudePtyDraftGrabResult> {
+  return captureClaudePtyDraft(tabId, 'copy', options);
 }

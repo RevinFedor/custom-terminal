@@ -34,6 +34,7 @@ import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { readCodexDraftAuthority } from '../../utils/codexDraftAuthority.mjs';
+import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 import { isCodexRuntimeForkReady } from '../../utils/codexPtyPresence.mjs';
 import {
   planCodexLaunchSettingsPersistence,
@@ -370,6 +371,20 @@ export default function ClaudeControlBar({
     }
     return undefined;
   });
+  const codexLiveServiceTier = useWorkspaceStore((s) => {
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return t.codexLiveServiceTier;
+    }
+    return undefined;
+  });
+  const codexLiveServiceTierSessionId = useWorkspaceStore((s) => {
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return t.codexLiveServiceTierSessionId;
+    }
+    return undefined;
+  });
   const codexSettingsProofSessionId = useWorkspaceStore((s) => {
     for (const [, ws] of s.openProjects) {
       const t = ws.tabs.get(tabId);
@@ -429,6 +444,16 @@ export default function ClaudeControlBar({
   });
   const isSDKTab = tabType === 'claude-sdk';
   const isCodex = sessionType === 'codex';
+  const codexFastModeState = resolveCodexFastModeState({
+    // A brand-new Codex conversation has no rollout/session id until its first
+    // prompt. The verified launch generation owns the exact footer proof until
+    // the first writer is admitted, then ownership moves to that session id.
+    currentSessionId: codexLiveSettingsSessionId
+      || codexLiveServiceTierSessionId
+      || codexSessionId,
+    serviceTierSessionId: codexLiveServiceTierSessionId,
+    serviceTier: codexLiveServiceTier,
+  });
   const codexTurnBusy = isCodex && tabAiBusy;
   const historyCanSend = useUIStore(
     (s) => s.historyComposerAvailability[tabId]?.canSend === true,
@@ -459,6 +484,7 @@ export default function ClaudeControlBar({
     reason: string | null;
   }>({ sessionId: null, conversationMaterialized: null, timelineCount: null, reason: null });
   const claudeMaterializationRequestRef = useRef(0);
+  const codexFastModeRequestRef = useRef(0);
 
   const refreshClaudeConfirmedSettings = useCallback(async (checkReason: string) => {
     if (!isClaudePtySession || !claudeSessionId) {
@@ -626,6 +652,53 @@ export default function ClaudeControlBar({
     refreshClaudeMaterialization,
     tabId,
   ]);
+
+  const refreshCodexFastMode = useCallback(async (checkReason: string) => {
+    if (!isCodex || !isCommandRunning) return null;
+    const requestSeq = ++codexFastModeRequestRef.current;
+    try {
+      const result = await ipcRenderer.invoke('codex:get-tui-ready', tabId);
+      if (requestSeq !== codexFastModeRequestRef.current) return null;
+      const proof = result?.readyMeta?.serviceTierProof;
+      const ownerId = String(proof?.ownerId || '').trim();
+      const serviceTier = String(proof?.serviceTier || '').trim().toLowerCase();
+      if (!ownerId || !['priority', 'default'].includes(serviceTier)) return null;
+      useWorkspaceStore.getState().updateCodexLiveServiceTier(tabId, {
+        codexLiveServiceTier: serviceTier,
+        codexLiveServiceTierSessionId: ownerId,
+        codexLiveServiceTierSource: String(proof?.source || 'tui-ready-cache'),
+      });
+      console.log('[CodexControlBar:FastMode] tab=' + tabId.slice(-12)
+        + ' owner=' + ownerId.slice(0, 24)
+        + ' tier=' + serviceTier
+        + ' source=' + (proof?.source || '-')
+        + ' check=' + checkReason);
+      return proof;
+    } catch (error: any) {
+      if (requestSeq !== codexFastModeRequestRef.current) return null;
+      console.warn('[CodexControlBar:FastMode] failed tab=' + tabId.slice(-12)
+        + ' check=' + checkReason
+        + ' error=' + String(error?.message || error));
+      return null;
+    }
+  }, [isCodex, isCommandRunning, tabId]);
+
+  useEffect(() => {
+    void refreshCodexFastMode('initial');
+  }, [refreshCodexFastMode]);
+
+  useEffect(() => {
+    if (!isCodex || !isCommandRunning) return;
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      void refreshCodexFastMode('visibility-resume');
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [isCodex, isCommandRunning, refreshCodexFastMode]);
 
   const claudeConversationMaterialized =
     !isClaudePtySession
@@ -1478,6 +1551,14 @@ export default function ClaudeControlBar({
   const codexQuickDisabled = codexControlAvailability.quickDisabled;
   const claudeQuickDisabled = !isSDKTab && !isAnthropicPTY;
   const codexFastDisabled = isCodex && !isCommandRunning;
+  const codexFastStateLabel = codexFastModeState.state === 'on'
+    ? 'Fast включён'
+    : codexFastModeState.state === 'off'
+      ? 'Fast выключен'
+      : 'Состояние Fast ещё не подтверждено';
+  const codexFastTitle = codexFastDisabled
+    ? codexFastStateLabel + '. Переключение доступно только при живом Codex'
+    : codexFastStateLabel + '. Нажмите, чтобы переключить';
 
   // Cache cooldown chip: Claude only (Anthropic PTY or SDK). DeepSeek/Zen have
   // no prompt cache, so the chip is meaningless there — hide entirely. Also
@@ -2420,6 +2501,17 @@ export default function ClaudeControlBar({
           return;
         }
         throw new Error(result?.error || 'Codex /fast failed');
+      }
+      const serviceTierOwnerId = String(result?.serviceTierProof?.ownerId || '').trim();
+      const serviceTier = String(result?.serviceTierProof?.serviceTier || '').trim().toLowerCase();
+      if (serviceTierOwnerId && ['priority', 'default'].includes(serviceTier)) {
+        useWorkspaceStore.getState().updateCodexLiveServiceTier(tabId, {
+          codexLiveServiceTier: serviceTier,
+          codexLiveServiceTierSessionId: serviceTierOwnerId,
+          codexLiveServiceTierSource: result?.serviceTierProof?.source
+            || result.serviceTierSource
+            || 'tui',
+        });
       }
     } catch (e: any) {
       console.warn('[CodexControlBar] /fast failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
@@ -4222,13 +4314,14 @@ export default function ClaudeControlBar({
           </ControlHint>
 
           {isCodex && (
-            <ControlHint label="Переключить быстрый режим Codex" disabled={codexFastDisabled}>
+            <ControlHint label={codexFastStateLabel} disabled={codexFastDisabled}>
             <button
               type="button"
-              aria-label="Send /fast to Codex"
-              title={!isCommandRunning
-                ? '/fast доступен только при живом Codex'
-                : 'Send /fast to Codex'}
+              aria-label={codexFastStateLabel}
+              aria-pressed={codexFastModeState.known ? codexFastModeState.active : undefined}
+              data-codex-fast-state={codexFastModeState.state}
+              data-codex-service-tier={codexFastModeState.serviceTier || ''}
+              title={codexFastTitle}
               disabled={codexFastDisabled}
               onClick={sendCodexFast}
               style={{
@@ -4236,9 +4329,22 @@ export default function ClaudeControlBar({
                 width: 24,
                 padding: 0,
                 justifyContent: 'center',
-                color: codexFastDisabled ? '#555' : '#bbb',
-                borderColor: codexFastDisabled ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.12)',
-                backgroundColor: 'transparent',
+                color: codexFastModeState.active
+                  ? (codexFastDisabled ? '#a8842d' : '#fbbf24')
+                  : codexFastModeState.known
+                    ? (codexFastDisabled ? '#555' : '#bbb')
+                    : '#666',
+                borderColor: codexFastModeState.active
+                  ? 'rgba(251,191,36,0.55)'
+                  : codexFastDisabled
+                    ? 'rgba(255,255,255,0.08)'
+                    : 'rgba(255,255,255,0.12)',
+                backgroundColor: codexFastModeState.active
+                  ? 'rgba(251,191,36,0.14)'
+                  : 'transparent',
+                boxShadow: codexFastModeState.active
+                  ? 'inset 0 0 0 1px rgba(251,191,36,0.08)'
+                  : 'none',
                 cursor: codexFastDisabled ? 'not-allowed' : triggerStyle.cursor,
               }}
             >

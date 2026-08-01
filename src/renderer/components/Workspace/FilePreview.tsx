@@ -52,14 +52,14 @@ export default function FilePreview() {
       const historyTargetId = workspace
         ? [...(workspace.tabHistory || [])].reverse().find((id) => {
             const candidate = workspace.tabs.get(id);
-            return id !== sourceTabId && !!candidate && !candidate.isUtility && candidate.tabType !== 'file';
+            return id !== sourceTabId && !!candidate && candidate.tabType !== 'file';
           })
         : null;
       const fallbackParentId = workspace && fileTab?.visualParentTabId && workspace.tabs.has(fileTab.visualParentTabId)
         ? fileTab.visualParentTabId
         : null;
       const fallbackTabId = workspace
-        ? Array.from(workspace.tabs.values()).find((tab) => tab.id !== sourceTabId && !tab.isUtility && tab.tabType !== 'file')?.id
+        ? Array.from(workspace.tabs.values()).find((tab) => tab.id !== sourceTabId && tab.tabType !== 'file')?.id
         : null;
       const returnTargetId = historyTargetId || fallbackParentId || fallbackTabId || null;
 

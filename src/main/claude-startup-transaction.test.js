@@ -144,6 +144,35 @@ test('unresolved proof is never auto-retried and fails with the command named', 
   assert.ok(h.logs.some((l) => l.includes('[StartupRetry] decision=unresolved action=await-user')));
 });
 
+test('paired terminal command rejection surfaces its exact output and never retries', async () => {
+  const h = makeHarness({
+    proofScript: () => ({
+      outcome: PROOF.UNRESOLVED,
+      terminal: true,
+      reason: 'command-output-rejected',
+      outputPreview: "Model 'missing' not found",
+    }),
+  });
+
+  const opened = h.coordinator.ensureTransaction({
+    tabId: 'tab-terminal-failure',
+    generation: 'g1',
+    trigger: 'tui-ready',
+    steps: [{
+      phase: 'model',
+      command: '/model missing',
+      source: 'startup:model',
+      label: 'model',
+    }],
+    sendCommand: h.sendCommand,
+    proveCommand: h.proveCommand,
+  });
+  const result = await opened.promise;
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error, "Model 'missing' not found");
+  assert.equal(h.sends.length, 1);
+});
+
 test('absent proof after the retry is used does not retry a second time', async () => {
   const h = makeHarness({ proofScript: () => ({ outcome: PROOF.ABSENT }) });
   const run = h.coordinator.ensureTransaction({

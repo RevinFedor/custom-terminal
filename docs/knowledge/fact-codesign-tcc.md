@@ -2,7 +2,7 @@
 
 Каждый `npm run build:install` без правильной подписи **аннулирует Accessibility-разрешение** для приложения, хотя в System Settings → Privacy &amp; Security → Accessibility галочка остаётся включённой. Симптом: `systemPreferences.isTrustedAccessibilityClient(false)` возвращает `false`, `osascript ... keystroke "v"` тихо падает (или возвращает exit≠0), Global Dictation paste не работает.
 
-Решение — **self-signed cert «Noted Terminal Dev» в login keychain**, прописанный в `package.json::build.mac.identity`. После однократного setup'а TCC grant переживает все rebuild'ы.
+Решение — **self-signed cert «Noted Terminal Dev» в login keychain** плюс быстрый локальный post-sign готового `.app`. Стандартный signer `electron-builder` намеренно отключён: он добавлял к частым dev-сборкам минуты. После однократного setup'а сертификата `npm run sign:local-fast` даёт приложению стабильную identity примерно за 2 секунды, и TCC grant переживает rebuild'ы.
 
 ## Симптомы для роутера
 
@@ -27,7 +27,7 @@
 | Adhoc (`codesign -s -`) | `cdhash H"<sha256>"` | ❌ нет |
 | Unsigned | (no DR — каждый запуск проверяется как новый) | ❌ нет |
 
-**CDHash = SHA256 от CodeDirectory** — меняется на каждом ребилде потому что меняются binary pages, временные метки в Mach-O, любая мелочь. Adhoc-подпись пинит TCC grant к конкретному CDHash → следующий build → CDHash другой → tccd проваливает csreq evaluation → permission denied. **UI toggle при этом показывает «включено»** — потому что `auth_value` column обновляется, а csreq остаётся стара́я и невалидная.
+**CDHash = SHA256 от CodeDirectory.** У полностью переподписанного adhoc-bundle он меняется вместе с содержимым сборки. У вообще не переподписанного Electron bundle основной бинарник может случайно оставаться байт-в-байт тем же между JS-only rebuild, поэтому на старом Mac grant иногда долго «работает без подписи». Это не стабильный контракт: смена Electron/macOS, перенос на новый Mac или переоценка невалидного bundle ломает такое совпадение. **UI toggle при этом может показывать «включено»**, хотя сохранённое требование уже не соответствует запущенному процессу.
 
 ## Почему `Identifier=Electron`, а не `com.noted.terminal`
 
@@ -39,7 +39,7 @@
 
 `codesign -dv` показывает **тот** identifier который встроен в CodeDirectory подписи — не то что в Info.plist. Чтобы исправить, надо переподписать с явным `--identifier com.noted.terminal` ИЛИ дать electron-builder подписать с корректной identity.
 
-## Решение: self-signed keychain cert
+## Решение: cert + быстрый локальный post-sign
 
 1. Один раз создаём cert через `scripts/codesign/setup-dev-cert.sh`:
    ```bash
@@ -47,10 +47,24 @@
    ```
    Скрипт делает `openssl req -x509 ... -addext "extendedKeyUsage=codeSigning"` + `security import` в login keychain.
 2. **Вручную** в Keychain Access: Login → «Noted Terminal Dev» → Trust → Code Signing = Always Trust → закрыть, ввести пароль.
-3. `package.json::build.mac.identity = "Noted Terminal Dev"` — electron-builder подхватит cert по subject CN.
-4. **Убрать** `CSC_IDENTITY_AUTO_DISCOVERY=false` из `build:install` script'а — этот env заставляет electron-builder игнорировать identity и не подписывать.
-5. `npm run build:install` → `codesign -dv` должен показать `Identifier=com.noted.terminal`, `Authority=Noted Terminal Dev`, `Signature=adhoc` (потому что self-signed без Apple-chain технически считается «adhoc»-like для Gatekeeper'а, но **csreq стабильный**, потому что есть identifier+anchor trusted).
-6. Один раз в System Settings → Privacy → Accessibility добавить /Applications/Noted Terminal.app. **Дальше permission переживает все rebuild'ы.**
+3. Оставляем `CSC_IDENTITY_AUTO_DISCOVERY=false` и `build.mac.identity = null`, чтобы медленный стандартный signer `electron-builder` не запускался.
+4. Сразу после `electron-builder` оба package-script'а (`build`, `build:install`) вызывают `npm run sign:local-fast`. `scripts/codesign/sign-local-fast.sh` делает один локальный `codesign --deep --timestamp=none`, затем обязательный `codesign --verify --deep --strict` и проверяет identifier/authority.
+5. `npm run build:install` → `codesign -dv` должен показать `Identifier=com.noted.terminal`, `Authority=Noted Terminal Dev`. Сетевого timestamp, notarization и hardened runtime в локальном пути нет.
+6. Один раз в System Settings → Privacy добавить установленное приложение в нужные разделы. **Дальше permission переживает rebuild'ы.**
+
+### Почему не стандартная подпись electron-builder
+
+На реальной 677-МБ сборке `@electron/osx-sign` обнаружил 247 «binary» paths: кроме Mach-O туда попали locale `.pak`, `app.asar`, data-файлы и даже Linux/Windows prebuilds. По умолчанию каждый путь подписывался отдельным `codesign --timestamp` с обращением к Apple. Это и было многоминутным замедлением, ради которого подпись отключили 2026-05-26.
+
+Замеры на том же `.app`:
+
+| Путь | Результат |
+|---|---|
+| Стандартный `@electron/osx-sign` + timestamp | многоминутный; остановлен после 13.9 с далеко до конца списка |
+| Тот же walker без timestamp | 15.95 с |
+| `sign-local-fast` (один local codesign) | 2.09 с, strict verify прошёл |
+
+`codesign --deep` deprecated для production signing, но здесь используется сознательно только для локальной self-signed dev-сборки. Production distribution остаётся отдельным Developer ID + notarization pipeline.
 
 ## Diagnostic команды
 
@@ -76,9 +90,10 @@ tccutil reset Accessibility Electron        # на всякий случай, е
 
 ## Что НЕ делаем (graveyard)
 
-- **`CSC_IDENTITY_AUTO_DISCOVERY=false`** — этот env у нас в `build:install` стоял изначально (видимо чтобы electron-builder не падал в отсутствие Apple Developer cert'а в keychain). Но он полностью отключает подпись. Оставлять имеет смысл только когда **нет никакого** cert'а в keychain и хочется adhoc. С self-signed cert'ом — убрать.
+- **`CSC_IDENTITY_AUTO_DISCOVERY=false` без следующего `sign:local-fast`** — оставляет исходную подпись `Electron` и ломает persistent TCC. В текущем быстром pipeline env нужен, но только в паре с обязательным post-sign.
+- **Обычный `electron-builder` signer для частых локальных rebuild** — корректно подписывает, но текущий walker подписывает сотни data-файлов по одному и с timestamp-сетью; это тот самый медленный путь, который не возвращаем.
 - **`mac.identity: "-"`** (adhoc через electron-builder API) — лучше чем `null` (хоть переподписывает Electron framework), но всё равно adhoc → cdhash-pinned DR → grant не переживёт rebuild. Не путь.
-- **`afterPack` script с `codesign --deep --force --sign -`** — даёт стабильный `--identifier`, но всё ещё adhoc (cdhash-pinned). Решает только косметику с `Identifier=Electron`, не root-cause. Apple официально говорит избегать `--deep` для production — он подписывает frameworks через symlink, что часто бьёт версионирование.
+- **`codesign --deep --force --sign -`** — всё ещё adhoc (cdhash-pinned) и не решает root cause. Текущий fast path принципиально использует постоянный keychain cert и `--timestamp=none`, затем strict-verify. Для production `--deep` не используется.
 - **Удалять и заново добавлять в Privacy panel** — не помогает. UI обновляет `auth_value`, но **не csreq**, csreq остаётся пинить старый cdhash. Нужен `tccutil reset` + новое добавление.
 - **Toggle off/on в Privacy panel** — тот же сценарий, помогает только сменить auth_value, csreq не обновляется.
 - **Перенос .app в другую папку** — `client_type=1` (path-based) grants pinят к абсолютному пути, но всё равно csreq важнее пути. Не workaround.
@@ -91,15 +106,16 @@ Self-signed cert работает **только локально на наше�
 3. `electron-builder --mac` подпишет всё корректно + сделает notarization-call к Apple.
 4. Получившиеся `.app` будут работать у любого пользователя, TCC grant у каждого тоже будет персистент (потому что DR содержит TeamID + identifier, стабильный для всех билдов с одного cert'а).
 
-Это вне scope для текущего dev-workflow, но в `package.json::build.mac.identity` достаточно поменять строку с «Noted Terminal Dev» на «Developer ID Application: ...» — больше ничего трогать не нужно.
+Это отдельный production pipeline: для него нужно отключить local post-sign и вернуть штатную подпись `electron-builder` с Developer ID.
 
 ## Path-зависимости
 
 | Файл | Что делает |
 |---|---|
 | `scripts/codesign/setup-dev-cert.sh` | Одноразовый setup self-signed cert'а через openssl + security import. Идемпотентный (skip если уже есть). |
-| `package.json::build.mac.identity` | `"Noted Terminal Dev"` — имя cert'а, electron-builder ищет его в keychain по subject CN. |
-| `package.json::scripts.build:install` | НЕ должен содержать `CSC_IDENTITY_AUTO_DISCOVERY=false`. |
+| `scripts/codesign/sign-local-fast.sh` | Быстрый post-sign готового app, no timestamp/network, strict verification. |
+| `package.json::build.mac.identity` | `null`, чтобы не запускать медленный стандартный signer. |
+| `package.json::scripts.build/build:install` | После `electron-builder` обязаны вызывать `npm run sign:local-fast`. |
 | `~/Library/Keychains/login.keychain-db` | Хранит cert + private key. **Backup'ить вместе с keychain'ом.** Утрата = новый cert + новый TCC grant. |
 
 ## Связанные системы

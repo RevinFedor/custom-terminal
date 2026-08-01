@@ -22,7 +22,7 @@ function isClaudeComposerStopLine(text) {
   return false;
 }
 
-function unknown(snapshot, reason) {
+function unknown(snapshot, reason, extra = null) {
   return {
     success: true,
     proofOutcome: 'unknown',
@@ -31,6 +31,7 @@ function unknown(snapshot, reason) {
     preview: '',
     source: (snapshot?.source || 'visible-buffer') + ':claude-composer:unknown:' + reason,
     proofReason: reason,
+    ...(extra && typeof extra === 'object' ? extra : {}),
   };
 }
 
@@ -91,7 +92,11 @@ function parseClaudeComposerCurrentFrame(snapshot) {
     promptIndex -= 1;
   }
   if (promptIndex < 0 || promptCellIndex < 0) return unknown(snapshot, 'active-prompt-not-found');
-  if (promptIndex === cursorIndex && cursorX <= promptCellIndex) {
+  const promptLine = lines[promptIndex] || {};
+  const promptCellX = Number.isInteger(Number(promptLine.promptCellX))
+    ? Number(promptLine.promptCellX)
+    : promptCellIndex;
+  if (promptIndex === cursorIndex && cursorX <= promptCellX) {
     return unknown(snapshot, 'cursor-before-composer');
   }
 
@@ -100,6 +105,30 @@ function parseClaudeComposerCurrentFrame(snapshot) {
   const first = cleanClaudeComposerText(firstRaw.slice(promptCellIndex + 1)).trim();
   const placeholderWithStyleProof = CLAUDE_EMPTY_COMPOSER_HINT_RE.test(first)
     && lines[promptIndex]?.promptSuffixAllDim === true;
+
+  // xterm's cursor is the current-frame witness. A genuine one-line draft can
+  // have the cursor at the end, or before the end after the user moved it. The
+  // latter is deliberately ambiguous and is resolved through Claude's exact
+  // external-editor read. The production defect was the same geometry with an
+  // empty composer: Claude repainted `❯ ` but did not erase old cells to the
+  // right, and those residual glyphs were mistaken for a draft.
+  const cursorLine = lines[cursorIndex] || {};
+  const occupiedEndX = Number.isInteger(Number(cursorLine.occupiedEndX))
+    ? Number(cursorLine.occupiedEndX)
+    : cleanClaudeComposerText(cursorLine.text || '').length;
+  const logicalLineContinuesAfterCursor = lines[cursorIndex + 1]?.wrapped === true;
+  if (!placeholderWithStyleProof && (
+    occupiedEndX > cursorX
+    || logicalLineContinuesAfterCursor
+  )) {
+    return unknown(snapshot, 'composer-content-after-cursor', {
+      exactCaptureRecommended: true,
+      promptRow: Number(lines[promptIndex]?.row ?? promptIndex),
+      cursorRow,
+      cursorX,
+      occupiedEndX,
+    });
+  }
   if (first && !placeholderWithStyleProof) parts.push(first);
 
   for (let index = promptIndex + 1; index <= cursorIndex; index += 1) {
@@ -144,6 +173,7 @@ function validateClaudeComposerWriteBoundary({
   currentMirrorGeneration,
   currentMirrorWriteSeq,
   currentMirrorFlushedSeq,
+  currentMirrorSynchronizedOutputOpen,
 }) {
   if (!proof || proof.proofOutcome !== 'absent' || proof.hasDraft !== false) {
     return {
@@ -173,6 +203,12 @@ function validateClaudeComposerWriteBoundary({
   }
   if (!proof.mirrorGeneration || proof.mirrorGeneration !== currentMirrorGeneration) {
     return { valid: false, reason: 'claude_headless_generation_changed' };
+  }
+  if (
+    proof.mirrorSynchronizedOutputOpen === true
+    || currentMirrorSynchronizedOutputOpen === true
+  ) {
+    return { valid: false, reason: 'claude_headless_frame_open' };
   }
   if (
     Number(proof.mirrorWriteSeq) !== Number(currentMirrorWriteSeq)

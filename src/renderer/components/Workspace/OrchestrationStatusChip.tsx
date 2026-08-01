@@ -9,14 +9,18 @@ import {
   CircleCheck,
   History as HistoryIcon,
   LoaderCircle,
+  Pause,
+  Play,
   RotateCcw,
   Send,
   Settings2,
+  TimerOff,
   X,
 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import type { OrchestrationRun, OrchestrationStatus } from '../../store/useOrchestrationStore';
+import { isOrchestrationResultProofPending } from '../../utils/orchestrationRunProjection.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -70,7 +74,7 @@ function statusColor(status: OrchestrationStatus): string {
 
 type RunPresentation = {
   color: string;
-  icon: 'success' | 'error' | 'cancelled' | 'loading';
+  icon: 'success' | 'error' | 'cancelled' | 'loading' | 'recovery';
   label: string;
   spinning: boolean;
 };
@@ -83,6 +87,7 @@ function hasSourceNotificationError(run: OrchestrationRun, tabId: string): boole
 
 function hasPendingSourceHandoff(run: OrchestrationRun, tabId: string): boolean {
   return run.sourceTabId === tabId
+    && !isOrchestrationResultProofPending(run)
     && run.sourceFollowupPending === true
     && !run.sourceFollowupStartedAt
     && !hasSourceNotificationError(run, tabId);
@@ -98,6 +103,18 @@ function canRetrySourceNotification(run: OrchestrationRun, tabId: string): boole
   return hasSourceNotificationError(run, tabId);
 }
 
+function isPaused(run: OrchestrationRun): boolean {
+  return run.status === 'waiting_recovery' && run.outcome === 'paused';
+}
+
+function canPause(run: OrchestrationRun): boolean {
+  if (isPaused(run) || run.sourceFollowupStartedAt || run.sourceFollowupPending === true) return false;
+  if (isOrchestrationResultProofPending(run)) return true;
+  if (run.status === 'waiting_recovery') return run.outcome === 'interrupted';
+  return ACTIVE.has(run.status)
+    && Boolean(run.deliveryAcceptedAt || run.targetPromptProofAt);
+}
+
 function attentionDismissedForTab(run: OrchestrationRun, tabId: string): boolean {
   if (run.sourceTabId === tabId && run.sourceAttentionDismissedAt) return true;
   if (run.targetTabId === tabId && run.targetAttentionDismissedAt) return true;
@@ -109,6 +126,14 @@ function successVisibleAt(run: OrchestrationRun): number | null {
 }
 
 function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation {
+  if (isOrchestrationResultProofPending(run)) {
+    return {
+      color: '#a78bfa',
+      icon: 'loading',
+      label: 'Проверка результата',
+      spinning: true,
+    };
+  }
   if (hasSourceNotificationError(run, tabId)) {
     const unconfirmed = run.notificationStatus === 'unconfirmed';
     return {
@@ -121,7 +146,16 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
     };
   }
   if (run.status === 'failed') return { color: '#f87171', icon: 'error', label: 'Ошибка', spinning: false };
-  if (run.status === 'waiting_recovery') return { color: '#fbbf24', icon: 'error', label: 'Связь прервана', spinning: false };
+  if (run.status === 'waiting_recovery') {
+    return {
+      color: '#fbbf24',
+      icon: 'recovery',
+      label: isPaused(run)
+        ? 'На паузе'
+        : run.outcome === 'interrupted' ? 'Остановлено вручную' : 'Связь прервана',
+      spinning: true,
+    };
+  }
   if (hasPendingSourceHandoff(run, tabId)) {
     return {
       color: '#a78bfa',
@@ -144,15 +178,33 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
 }
 
 function StatusIcon({ presentation }: { presentation: RunPresentation }) {
-  if (presentation.icon === 'success') return <CircleCheck size={14} strokeWidth={2.2} />;
-  if (presentation.icon === 'error') return <CircleAlert size={14} strokeWidth={2.2} />;
-  if (presentation.icon === 'cancelled') return <X size={14} strokeWidth={2.2} />;
+  let icon: ReactNode;
+  if (presentation.icon === 'success') icon = <CircleCheck size={14} strokeWidth={2.2} />;
+  else if (presentation.icon === 'error') icon = <CircleAlert size={14} strokeWidth={2.2} />;
+  else if (presentation.icon === 'cancelled') icon = <X size={14} strokeWidth={2.2} />;
+  else if (presentation.icon === 'recovery') {
+    icon = (
+      <>
+        <LoaderCircle className="animate-spin" size={13} strokeWidth={2.2} />
+        <CircleAlert size={10} strokeWidth={2.4} />
+      </>
+    );
+  } else {
+    icon = (
+      <LoaderCircle
+        className={presentation.spinning ? 'animate-spin' : ''}
+        size={14}
+        strokeWidth={2.2}
+      />
+    );
+  }
   return (
-    <LoaderCircle
-      className={presentation.spinning ? 'animate-spin' : ''}
-      size={14}
-      strokeWidth={2.2}
-    />
+    <span
+      data-orchestration-status-icon={presentation.icon}
+      style={{ width: 26, height: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 2, flexShrink: 0 }}
+    >
+      {icon}
+    </span>
   );
 }
 
@@ -263,7 +315,9 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
   }, [nextSuccessExpiry]);
 
   const statusRuns = useMemo(() => orderedRuns.filter((run) => {
-    if (ACTIVE.has(run.status) || hasPendingSourceHandoff(run, tabId)) return true;
+    if (ACTIVE.has(run.status)
+      || isOrchestrationResultProofPending(run)
+      || hasPendingSourceHandoff(run, tabId)) return true;
     const presentation = runPresentation(run, tabId);
     if (presentation.icon === 'error') {
       return Boolean(run.attentionRequiredAt) && !attentionDismissedForTab(run, tabId);
@@ -299,9 +353,9 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
     void ipcRenderer.invoke('orchestration:acknowledge', { runId: run.runId, tabId }).catch(() => {});
   }, [tabId]);
 
-  const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'cancel') => {
+  const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume') => {
     let cancelSendAccepted = false;
-    if (action === 'cancel') {
+    if (action === 'detach' && !isOrchestrationResultProofPending(run)) {
       const cancellingSourceHandoff = canCancelPendingSourceHandoff(run, tabId);
       const cancellationTabId = cancellingSourceHandoff ? run.sourceTabId : run.targetTabId;
       const cancellationHandoffId = cancellingSourceHandoff
@@ -341,7 +395,7 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
 
   const actionButton = (
     run: OrchestrationRun,
-    action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'cancel',
+    action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume',
     label: string,
     icon: ReactNode,
     color: string,
@@ -383,6 +437,8 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
         <div style={{ display: 'grid', gridTemplateColumns: '70px minmax(0, 1fr)', gap: '3px 7px', color: '#a3a3a3' }}>
           <span>Состояние</span><span style={{ color: presentation.color }}>{presentation.label}</span>
           {remaining && <><span>Отправка</span><span style={{ color: '#fbbf24', fontVariantNumeric: 'tabular-nums' }}>{remaining}</span></>}
+          {run.status === 'waiting_recovery' && run.outcome === 'interrupted' && <><span>Продолжение</span><span style={{ color: '#e5e7eb' }}>Следующее сообщение в этой вкладке</span></>}
+          {isPaused(run) && <><span>Возобновление</span><span style={{ color: '#e5e7eb' }}>Следующий новый ход во вкладке</span></>}
           <span>Проект</span><span style={{ color: '#e5e7eb' }}>{linkedProjectName || '—'}</span>
           <span>Вкладка</span><span style={{ color: '#e5e7eb' }}>{linkedTabName || '—'}</span>
           <span>Начало</span><span>{runTime(run.createdAt)}</span>
@@ -402,6 +458,9 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
     const canCancelActiveRun = ACTIVE.has(run.status) && run.status !== 'waiting_recovery';
     const canCancelHandoff = canCancelPendingSourceHandoff(run, tabId);
     const canRetryNotification = canRetrySourceNotification(run, tabId);
+    const canDetachResultProof = isOrchestrationResultProofPending(run);
+    const paused = isPaused(run);
+    const pauseAvailable = canPause(run);
     const presentation = runPresentation(run, tabId);
     const canDismissAttention = presentation.icon === 'error'
       && run.status !== 'waiting_recovery'
@@ -414,17 +473,26 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
           <span>{isSource ? 'Исходящий запрос' : 'Входящий запрос'}</span>
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
-          {(canCancelActiveRun || canCancelHandoff) && actionButton(
+          {(canCancelActiveRun || canCancelHandoff || canDetachResultProof) && actionButton(
             run,
-            'cancel',
-            canCancelHandoff ? 'Отменить передачу результата' : 'Отменить текущий запрос',
+            'detach',
+            canCancelHandoff ? 'Отменить передачу результата' : 'Отвязать запрос',
             <X size={13} />,
             '#f87171',
           )}
+          {pauseAvailable && actionButton(run, 'pause', 'Поставить связь на паузу', <Pause size={13} />, '#fbbf24')}
+          {paused && actionButton(run, 'resume', 'Продолжить связь со следующего нового хода', <Play size={13} />, '#fbbf24')}
           {canRetryNotification && actionButton(run, 'retry', 'Повторить доставку результата', <RotateCcw size={13} />, '#fbbf24')}
-          {run.status === 'waiting_recovery' && actionButton(run, 'retry', 'Восстановить связь', <RotateCcw size={13} />, '#fbbf24')}
-          {run.status === 'waiting_recovery' && actionButton(run, 'report', 'Передать ошибку родителю', <Send size={13} />, '#f87171')}
-          {run.status === 'waiting_recovery' && actionButton(run, 'dismiss', 'Закрыть без сообщения', <X size={13} />, '#a3a3a3')}
+          {run.status === 'waiting_recovery' && !paused && actionButton(
+            run,
+            'retry',
+            run.outcome === 'interrupted' ? 'Восстановить связь вручную' : 'Восстановить связь',
+            <RotateCcw size={13} />,
+            '#fbbf24',
+          )}
+          {run.status === 'waiting_recovery' && !paused && run.outcome === 'interrupted' && run.recoveryDeadlineAt && actionButton(run, 'wait', 'Продолжить ожидание без таймера', <TimerOff size={13} />, '#fbbf24')}
+          {run.status === 'waiting_recovery' && !paused && actionButton(run, 'report', 'Передать ошибку родителю', <Send size={13} />, '#f87171')}
+          {run.status === 'waiting_recovery' && actionButton(run, paused ? 'detach' : 'dismiss', paused ? 'Отвязать запрос' : 'Закрыть без сообщения', <X size={13} />, '#a3a3a3')}
           {canDismissAttention && actionButton(run, 'dismiss-attention', 'Закрыть уведомление об ошибке', <X size={13} />, '#a3a3a3')}
         </span>
       </div>
@@ -488,7 +556,7 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
                     else next.add(run.runId);
                     return next;
                   })}
-                  style={{ minWidth: 0, alignSelf: 'stretch', padding: '5px 4px', display: 'grid', gridTemplateColumns: '14px 14px minmax(0, 1fr)', gridTemplateRows: 'auto auto', alignItems: 'center', columnGap: 5, border: 0, background: 'transparent', color: '#d4d4d4', textAlign: 'left', cursor: 'pointer' }}
+                  style={{ minWidth: 0, alignSelf: 'stretch', padding: '5px 4px', display: 'grid', gridTemplateColumns: '14px 26px minmax(0, 1fr)', gridTemplateRows: 'auto auto', alignItems: 'center', columnGap: 5, border: 0, background: 'transparent', color: '#d4d4d4', textAlign: 'left', cursor: 'pointer' }}
                 >
                   <span style={{ gridRow: '1 / 3', color: '#737373', display: 'grid', placeItems: 'center' }}>{expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
                   <span style={{ color: presentation.color, display: 'grid', placeItems: 'center' }}><StatusIcon presentation={presentation} /></span>
@@ -581,6 +649,8 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
               && Boolean(run.attentionRequiredAt)
               && !attentionDismissedForTab(run, tabId);
             const canDismissRecovery = run.status === 'waiting_recovery';
+            const canDetachResultProof = isOrchestrationResultProofPending(run);
+            const paused = isPaused(run);
             return (
               <Tooltip
                 key={run.runId}
@@ -601,15 +671,21 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
                     <span style={{ color: '#d4d4d4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left', fontSize: 10 }}>{linkedTabName || 'Запрос'}</span>
                     {run.status === 'waiting_recovery' && countdown(run.recoveryDeadlineAt, now) && <span style={{ fontSize: 9, fontVariantNumeric: 'tabular-nums' }}>{countdown(run.recoveryDeadlineAt, now)}</span>}
                   </button>
-                  {(canDismissAttention || canDismissRecovery) && (
+                  {(canDismissAttention || canDismissRecovery || canDetachResultProof) && (
                     <button
                       type="button"
                       data-orchestration-dismiss={run.runId}
-                      title={canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке'}
-                      aria-label={canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке'}
+                      title={canDetachResultProof || paused
+                        ? 'Отвязать запрос'
+                        : (canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке')}
+                      aria-label={canDetachResultProof || paused
+                        ? 'Отвязать запрос'
+                        : (canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке')}
                       onClick={(event) => {
                         event.stopPropagation();
-                        void runAction(run, canDismissRecovery ? 'dismiss' : 'dismiss-attention');
+                        void runAction(run, canDetachResultProof || paused
+                          ? 'detach'
+                          : (canDismissRecovery ? 'dismiss' : 'dismiss-attention'));
                       }}
                       style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', flexShrink: 0, border: 0, background: 'transparent', color: '#999', cursor: 'pointer' }}
                     >

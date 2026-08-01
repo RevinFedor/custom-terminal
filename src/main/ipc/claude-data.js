@@ -27,6 +27,12 @@ const {
 const {
   selectClaudeQueuedPromptIndex,
 } = require('../claude-prompt-carriers');
+const {
+  promoteAllPendingCompactEntries,
+  promotePendingCompactEntry,
+  promoteQueuedCompactEntry,
+} = require('../claude-compact-queue-projection');
+const { applyHistoryEntryWindow } = require('../history-entry-window');
 
 let _projectManager = null;
 let _getClaudeEditableLastPromptState = null;
@@ -1721,6 +1727,7 @@ const _api = {
   editRange: null,         // ({sessionId, cwd, startUuid, endUuid, compactText}) → {success, removedCount, ...}
   deleteRange: null,       // ({sessionId, cwd, startUuid, endUuid}) → {success, removedCount, fileDeleted}
   getConfirmedSettings: null, // ({tabId, sessionId?, cwd?}) → active-branch model/effort proof
+  getFullHistory: null, // (payload, {sender?}) → main-owned structured History
   parseClaudeStructuredPatchHunks,
   extractClaudeToolDiffHunks,
   rebuildHistoryPayloadStash,
@@ -4648,7 +4655,8 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
   );
 
   // Get full chat history for History Panel (structured entries, not markdown)
-  ipcMain.handle('claude:get-full-history', async (event, payload = {}) => {
+  _api.getFullHistory = async function getFullHistory(payload = {}, context = {}) {
+    const event = { sender: context?.sender || null };
     const { sessionId, cwd, tabId, ifRevision } = payload;
     if (!sessionId) {
       return { success: false, error: 'No session ID provided' };
@@ -4896,11 +4904,27 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
 
       // Build structured entries
       const entries = [];
+      const requestedTailLimit = Number.isFinite(Number(payload.bounds?.last))
+        ? Math.max(1, Math.min(20_000, Math.floor(Number(payload.bounds.last))))
+        : null;
+      const tailOnlyWindow = requestedTailLimit
+        && !payload.bounds?.afterUuid
+        && !payload.bounds?.beforeUuid
+        && !payload.bounds?.aroundUuid;
+      let projectedEntryTotal = 0;
+      const appendProjectedEntry = (value) => {
+        projectedEntryTotal += 1;
+        entries.push(value);
+        // The common cold-open request is `last=N`. Keep only that tail while
+        // projecting so a 100 MB transcript never materializes a second full
+        // rich array merely to discard its prefix afterwards.
+        if (tailOnlyWindow && entries.length > requestedTailLimit) entries.shift();
+      };
       let prevSessionId = null;
       let lastWasCompact = false;
 
       if (hasForkAtBeginning) {
-        entries.push({ uuid: 'fork-begin', role: 'fork', timestamp: '', content: 'FORK', sessionId: '' });
+        appendProjectedEntry({ uuid: 'fork-begin', role: 'fork', timestamp: '', content: 'FORK', sessionId: '' });
       }
 
       const historyBranch = _injectQueueOperationsIntoBranch(activeBranch, allQueueOperations);
@@ -4940,6 +4964,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         pendingQueueEntries.splice(idx, 1);
         const renderedIdx = entries.findIndex(e => e.uuid === queued.uuid);
         if (renderedIdx >= 0) entries.splice(renderedIdx, 1);
+        projectedEntryTotal = Math.max(0, projectedEntryTotal - 1);
       };
 
       for (let i = 0; i < historyBranch.length; i++) {
@@ -4956,7 +4981,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           for (const [, rec] of recordMap) {
             if (rec._isBridge && rec.sessionId === prevSessionId) { hasBridge = true; break; }
           }
-          entries.push({
+          appendProjectedEntry({
             uuid: 'boundary-' + entry.uuid,
             role: hasBridge ? 'plan-mode' : 'fork',
             timestamp: entry.timestamp || '',
@@ -4975,9 +5000,9 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           dropMatchingQueuedEntry(cleanContent, entry.timestamp, entrySid);
           const slashEntry = slashCommandEntryFromText(cleanContent, entry.uuid, entry.timestamp, entrySid);
           if (slashEntry) {
-            entries.push(slashEntry);
+            appendProjectedEntry(slashEntry);
           } else {
-            entries.push({
+            appendProjectedEntry({
               uuid: entry.uuid,
               role: 'user',
               timestamp: entry.timestamp || '',
@@ -5002,10 +5027,20 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
               sessionId: entrySid
             };
             pendingQueueEntries.push(queuedEntry);
-            entries.push(queuedEntry);
+            appendProjectedEntry(queuedEntry);
           } else if (entry.operation === 'dequeue') {
             const queued = pendingQueueEntries.find(q => q.queueStatus === 'queued');
-            if (queued) queued.queueStatus = 'sent';
+            if (queued) {
+              // `/compact` is a command whose delivery and execution are two
+              // different facts. Once Claude consumes the exact queue item it
+              // becomes ordinary slash-command history; the main-owned
+              // operational phase carries COMPACTING until durable proof.
+              // Keeping this row as SENT made it look live forever after its
+              // carrier fell behind the compact boundary.
+              if (!promoteQueuedCompactEntry(pendingQueueEntries, queued, { reason: 'dequeue' })) {
+                queued.queueStatus = 'sent';
+              }
+            }
           } else if (entry.operation === 'remove') {
             const idx = pendingQueueEntries.findIndex(q => q.queueStatus === 'queued');
             if (idx >= 0) {
@@ -5014,9 +5049,12 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
               // interactive AskUserQuestion form without writing a normal user row.
               // Keep it visible as sent; a later matching user row replaces it via
               // dropMatchingQueuedEntry().
-              queued.queueStatus = 'sent';
+              if (!promoteQueuedCompactEntry(pendingQueueEntries, queued, { reason: 'remove' })) {
+                queued.queueStatus = 'sent';
+              }
             }
           } else if (entry.operation === 'popAll') {
+            promoteAllPendingCompactEntries(pendingQueueEntries, { reason: 'popAll' });
             for (const queued of pendingQueueEntries) {
               if (queued.queueStatus === 'queued') queued.queueStatus = 'sent';
             }
@@ -5035,6 +5073,17 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
             }
           }
           if (!rawContent) continue;
+          if (
+            rawContent.includes('<local-command-stdout>')
+            && /Compaction canceled\.?/i.test(rawContent)
+          ) {
+            promotePendingCompactEntry(pendingQueueEntries, {
+              direction: 'last',
+              sessionId: entrySid,
+              reason: 'compact-cancelled',
+            });
+            continue;
+          }
           if (shouldSkipPromptText(rawContent)) continue;
           if (entry.isMeta) continue;
 
@@ -5053,7 +5102,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
             if (pairedWithCompactBoundary) {
               continue;
             }
-            entries.push({
+            appendProjectedEntry({
               uuid: entry.uuid,
               role: 'compact',
               timestamp: entry.timestamp || '',
@@ -5066,13 +5115,13 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
 
           const slashEntry = slashCommandEntryFromText(rawContent, entry.uuid, entry.timestamp, entrySid);
           if (slashEntry) {
-            entries.push(slashEntry);
+            appendProjectedEntry(slashEntry);
             continue;
           }
 
           const isContinued = cleanContent.startsWith('This session is being continued from a previous conversation');
 
-          entries.push({
+          appendProjectedEntry({
             uuid: entry.uuid,
             role: isContinued ? 'continued' : 'user',
             timestamp: entry.timestamp || '',
@@ -5231,7 +5280,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           }
 
           if (textContent.trim() || actions.length > 0) {
-            entries.push({
+            appendProjectedEntry({
               uuid: entry.uuid,
               role: 'assistant',
               timestamp: entry.timestamp || '',
@@ -5242,6 +5291,14 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
             });
           }
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+          // Boundary is the durable completion fallback for Claude versions
+          // that did not emit a queue dequeue/remove record. It settles only
+          // an exact `/compact` owned by this session; quoted text cannot match.
+          promotePendingCompactEntry(pendingQueueEntries, {
+            direction: 'last',
+            sessionId: entrySid,
+            reason: 'compact_boundary',
+          });
           // Look ahead for compact summary content
           let compactSummary = '';
           for (let j = i + 1; j < historyBranch.length; j++) {
@@ -5259,7 +5316,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
             }
             if (next.type === 'user' && !next.isSidechain && !next.isMeta) break;
           }
-          entries.push({
+          appendProjectedEntry({
             uuid: entry.uuid,
             role: 'compact',
             timestamp: entry.timestamp || '',
@@ -5299,10 +5356,21 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         }
       }
 
+      const historyWindow = tailOnlyWindow
+        ? {
+            entries,
+            total: projectedEntryTotal,
+            dropped: Math.max(0, projectedEntryTotal - entries.length),
+            truncated: projectedEntryTotal > entries.length,
+            boundsApplied: true,
+            firstUuid: entries[0]?.uuid || null,
+            lastUuid: entries[entries.length - 1]?.uuid || null,
+          }
+        : applyHistoryEntryWindow(entries, payload.bounds);
       const presentedEntries = decorateHistoryPromptPresentations(_projectManager?.db, {
         toolType: 'claude',
         sessionId,
-        entries,
+        entries: historyWindow.entries,
       });
       let responseTimingBound = false;
       const timedEntries = decorateHistoryResponseTimings(_projectManager?.db, {
@@ -5374,6 +5442,12 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         success: true,
         unchanged: false,
         entries: timedEntries,
+        total: historyWindow.total,
+        dropped: historyWindow.dropped,
+        truncated: historyWindow.truncated,
+        boundsApplied: historyWindow.boundsApplied,
+        firstUuid: historyWindow.firstUuid,
+        lastUuid: historyWindow.lastUuid,
         latestSessionId,
         claudeMemoryBoundaryUuid: _firstOrphanRecoveredFromUuid,
         editableLastPromptStatus,
@@ -5383,7 +5457,11 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       console.error('[Claude FullHistory] Error:', error);
       return { success: false, error: error.message };
     }
-  });
+  };
+
+  ipcMain.handle('claude:get-full-history', (event, payload = {}) => (
+    _api.getFullHistory(payload, { sender: event?.sender || null })
+  ));
 
   // ========== TIMELINE NOTES ==========
 

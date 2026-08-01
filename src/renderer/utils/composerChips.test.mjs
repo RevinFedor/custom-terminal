@@ -2,7 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_AI_COMPOSER_CHIP_THRESHOLD,
+  DICTATION_CLIPBOARD_FLAVOR,
+  isDictationClipboardPayload,
   haveSameComposerChips,
+  buildPasteChipMarker,
+  getPasteMarkerHighlightRanges,
+  insertComposerSnapshotAtSelection,
   insertComposerTextAtSelection,
   isPlainTextPasteShortcut,
   isTerminalOnlyComposerDraft,
@@ -13,6 +18,7 @@ import {
   normalizeComposerChips,
   parsePastedContentParts,
   restoreComposerChipToText,
+  retainPasteChipsForText,
   serializeComposerDraft,
   shouldCreatePasteChip,
   splitPromptChipPresentation,
@@ -261,4 +267,126 @@ test('restore replaces the saved selection and puts the caret after the chip tex
       selectionEnd: 4,
     },
   );
+});
+
+test('dictation clipboard payload is recognised by its flavor', () => {
+  assert.equal(
+    isDictationClipboardPayload({ types: ['text/plain', DICTATION_CLIPBOARD_FLAVOR] }),
+    true,
+  );
+});
+
+test('an ordinary text paste is not treated as dictation', () => {
+  assert.equal(isDictationClipboardPayload({ types: ['text/plain'] }), false);
+});
+
+test('missing or malformed clipboard data never claims dictation', () => {
+  assert.equal(isDictationClipboardPayload(null), false);
+  assert.equal(isDictationClipboardPayload(undefined), false);
+  assert.equal(isDictationClipboardPayload({}), false);
+});
+
+test('DOMStringList-like types without .includes are handled', () => {
+  // Some engines expose DataTransfer.types as a DOMStringList, which has
+  // length/index access but no Array methods.
+  const domStringList = { length: 2, 0: 'text/plain', 1: DICTATION_CLIPBOARD_FLAVOR };
+  assert.equal(isDictationClipboardPayload({ types: domStringList }), true);
+});
+
+// ── Inline paste anchors ────────────────────────────────────────────────────
+// A pasted blob belongs INSIDE the sentence, at the caret it was pasted into,
+// not on a strip above the field. The text carries a short marker; the body
+// stays in the chip store and is expanded in place on send.
+
+const pasteChip = (id, text) => ({ id, kind: 'paste', text, label: 'Вставка' });
+
+test('paste marker is located by its chip and reports its exact range', () => {
+  const chip = pasteChip('paste-1', 'x'.repeat(1692));
+  const marker = buildPasteChipMarker(chip);
+  const text = 'до ' + marker + ' после';
+  const ranges = getPasteMarkerHighlightRanges(text, [chip]);
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0].id, 'paste-1');
+  assert.equal(text.slice(ranges[0].start, ranges[0].end), marker);
+});
+
+test('anchored paste expands in place, keeping the text around it', () => {
+  const chip = pasteChip('paste-1', 'BLOB');
+  const text = 'до ' + buildPasteChipMarker(chip) + ' после';
+  const out = serializeComposerDraft({ text, chips: [chip] });
+  assert.match(out, /до <pasted_content>\nBLOB\n<\/pasted_content> после/);
+});
+
+test('a chip without a marker still ships, as a prefix block', () => {
+  // Drafts created before anchors existed, and any path that adds a chip
+  // without touching the text, must not silently lose their content.
+  const chip = pasteChip('paste-1', 'BLOB');
+  const out = serializeComposerDraft({ text: 'просто текст', chips: [chip] });
+  assert.match(out, /<pasted_content>\nBLOB\n<\/pasted_content>\n\nпросто текст/);
+});
+
+test('deleting the marker drops the chip so its body cannot ride along', () => {
+  const chip = pasteChip('paste-1', 'BLOB');
+  const withMarker = 'до ' + buildPasteChipMarker(chip) + ' после';
+  assert.equal(retainPasteChipsForText(withMarker, [chip]).length, 1);
+  assert.equal(retainPasteChipsForText('до после', [chip]).length, 0);
+});
+
+test('two equal-length pastes map positionally to distinct chips', () => {
+  const a = pasteChip('paste-a', 'AAAA');
+  const b = pasteChip('paste-b', 'BBBB');
+  const marker = buildPasteChipMarker(a);
+  assert.equal(marker, buildPasteChipMarker(b));
+  const ranges = getPasteMarkerHighlightRanges(marker + ' и ' + marker, [a, b]);
+  assert.deepEqual(ranges.map((r) => r.id), ['paste-a', 'paste-b']);
+});
+
+test('snapshot insertion keeps equal-length paste bodies aligned with marker order', () => {
+  const a = pasteChip('paste-a', 'AAAA');
+  const b = pasteChip('paste-b', 'BBBB');
+  const marker = buildPasteChipMarker(a);
+  const result = insertComposerSnapshotAtSelection({
+    text: marker,
+    chips: [a],
+    insertedText: marker + ' then ',
+    insertedChips: [b],
+    selectionStart: 0,
+    selectionEnd: 0,
+  });
+
+  assert.deepEqual(
+    getPasteMarkerHighlightRanges(result.text, result.chips).map((range) => range.id),
+    ['paste-b', 'paste-a'],
+  );
+  assert.equal(
+    serializeComposerDraft(result),
+    '<pasted_content>\nBBBB\n</pasted_content> then <pasted_content>\nAAAA\n</pasted_content>',
+  );
+});
+
+test('snapshot replacement drops a paste chip whose marker was replaced', () => {
+  const a = pasteChip('paste-a', 'AAAA');
+  const b = pasteChip('paste-b', 'BBBB');
+  const marker = buildPasteChipMarker(a);
+  const result = insertComposerSnapshotAtSelection({
+    text: 'before ' + marker + ' after',
+    chips: [a],
+    insertedText: buildPasteChipMarker(b),
+    insertedChips: [b],
+    selectionStart: 7,
+    selectionEnd: 7 + marker.length,
+  });
+
+  assert.deepEqual(result.chips.map((item) => item.id), ['paste-b']);
+  assert.match(serializeComposerDraft(result), /before <pasted_content>\nBBBB/);
+  assert.doesNotMatch(serializeComposerDraft(result), /AAAA/);
+});
+
+test('prompt chips keep their prefix placement alongside an anchored paste', () => {
+  const prompt = { id: 'p1', kind: 'prompt', text: 'PROMPT', label: 'P' };
+  const paste = pasteChip('paste-1', 'BLOB');
+  const text = 'край ' + buildPasteChipMarker(paste);
+  const out = serializeComposerDraft({ text, chips: [prompt, paste] });
+  assert.ok(out.startsWith('PROMPT\n\n'));
+  assert.match(out, /край <pasted_content>\nBLOB\n<\/pasted_content>$/);
 });

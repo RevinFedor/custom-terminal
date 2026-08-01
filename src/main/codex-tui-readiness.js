@@ -199,6 +199,12 @@ function decideCodexMcpStartupDeadline({
 function isCodexMcpRestartSignalSafe({
   expectedWatchdog,
   currentWatchdog,
+  expectedTerminal,
+  currentTerminal,
+  expectedTerminalGeneration,
+  currentTerminalGeneration,
+  expectedRunSeq,
+  currentRunSeq,
   expectedLaunchId,
   currentLaunchId,
   expectedWriteSeq,
@@ -211,6 +217,12 @@ function isCodexMcpRestartSignalSafe({
 } = {}) {
   return !!expectedWatchdog
     && currentWatchdog === expectedWatchdog
+    && !!expectedTerminal
+    && currentTerminal === expectedTerminal
+    && !!expectedTerminalGeneration
+    && currentTerminalGeneration === expectedTerminalGeneration
+    && Number.isInteger(Number(expectedRunSeq))
+    && Number(currentRunSeq) === Number(expectedRunSeq)
     && !!expectedLaunchId
     && currentLaunchId === expectedLaunchId
     && Number.isFinite(expectedWriteSeq)
@@ -226,9 +238,101 @@ function shouldLaunchCodexMcpReplacement(stopResult) {
   return stopResult?.success === true;
 }
 
+function decideCodexMcpReplacementHandoff({
+  stopSucceeded = false,
+  sameTerminal = false,
+  expectedTerminalGeneration = null,
+  currentTerminalGeneration = null,
+  expectedRunSeq = null,
+  currentRunSeq = null,
+  expectedInputRevision = null,
+  currentInputRevision = null,
+  expectedLaunchId = null,
+  currentLaunchId = null,
+  processStatus = 'unknown',
+  watchdogSuperseded = false,
+} = {}) {
+  if (!stopSucceeded) return { allowed: false, reason: 'stop-not-confirmed' };
+  if (!sameTerminal) return { allowed: false, reason: 'terminal-instance-changed' };
+  if (!expectedTerminalGeneration
+    || expectedTerminalGeneration !== currentTerminalGeneration) {
+    return { allowed: false, reason: 'terminal-generation-changed' };
+  }
+  if (!Number.isInteger(Number(expectedRunSeq))
+    || Number(expectedRunSeq) !== Number(currentRunSeq)) {
+    return { allowed: false, reason: 'terminal-run-changed' };
+  }
+  if (!Number.isInteger(Number(expectedInputRevision))
+    || Number(expectedInputRevision) !== Number(currentInputRevision)) {
+    return { allowed: false, reason: 'terminal-input-changed' };
+  }
+  if (!expectedLaunchId || expectedLaunchId !== currentLaunchId) {
+    return { allowed: false, reason: 'launch-generation-changed' };
+  }
+  if (watchdogSuperseded) {
+    return { allowed: false, reason: 'watchdog-generation-changed' };
+  }
+  if (processStatus !== 'absent') {
+    return {
+      allowed: false,
+      reason: processStatus === 'found'
+        ? 'replacement-process-already-present'
+        : 'replacement-process-state-unknown',
+    };
+  }
+  return { allowed: true, reason: 'exact-stopped-launch-handoff' };
+}
+
+function decideCodexMcpStoppedGenerationSettlement({
+  stopAbsenceProven = false,
+  sameTerminal = false,
+  expectedTerminalGeneration = null,
+  currentTerminalGeneration = null,
+  expectedRunSeq = null,
+  currentRunSeq = null,
+  expectedInputRevision = null,
+  currentInputRevision = null,
+  expectedLaunchId = null,
+  currentLaunchId = null,
+  replacementInputBarrierOwned = false,
+  processStatus = 'unknown',
+} = {}) {
+  if (!stopAbsenceProven) return { allowed: false, reason: 'stop-absence-not-proven' };
+  if (!sameTerminal) return { allowed: false, reason: 'terminal-instance-changed' };
+  if (!expectedTerminalGeneration
+    || expectedTerminalGeneration !== currentTerminalGeneration) {
+    return { allowed: false, reason: 'terminal-generation-changed' };
+  }
+  if (!Number.isInteger(Number(expectedRunSeq))
+    || Number(expectedRunSeq) !== Number(currentRunSeq)) {
+    return { allowed: false, reason: 'terminal-run-changed' };
+  }
+  if (!Number.isInteger(Number(expectedInputRevision))
+    || Number(expectedInputRevision) !== Number(currentInputRevision)) {
+    return { allowed: false, reason: 'terminal-input-changed' };
+  }
+  if (!expectedLaunchId || expectedLaunchId !== currentLaunchId) {
+    return { allowed: false, reason: 'launch-generation-changed' };
+  }
+  if (!replacementInputBarrierOwned) {
+    return { allowed: false, reason: 'replacement-input-barrier-changed' };
+  }
+  if (processStatus === 'found') {
+    return { allowed: false, reason: 'replacement-process-already-present' };
+  }
+  return {
+    allowed: true,
+    reason: processStatus === 'absent'
+      ? 'exact-stopped-generation-settlement'
+      : 'exact-stopped-generation-settlement-from-stop-proof',
+  };
+}
+
 module.exports = {
   CODEX_COMPOSER_PROMPT_GLYPHS,
   classifyCodexMcpStartupBlockerHandling,
+  decideCodexMcpReplacementHandoff,
+  decideCodexMcpStoppedGenerationSettlement,
   decideCodexMcpStartupDeadline,
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,

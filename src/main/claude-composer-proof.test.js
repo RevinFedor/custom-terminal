@@ -16,7 +16,12 @@ function snapshot(lines, { baseY = 100, cursorY = 3, cursorX = 8 } = {}) {
     cursorX,
     lines: lines.map((value, index) => ({
       row: baseY + index,
-      ...(typeof value === 'string' ? { text: value, wrapped: false } : value),
+      ...(typeof value === 'string'
+        ? { text: value, wrapped: false, occupiedEndX: value.trimEnd().length }
+        : {
+            ...value,
+            occupiedEndX: value.occupiedEndX ?? String(value.text || '').trimEnd().length,
+          }),
     })),
   };
 }
@@ -42,6 +47,19 @@ test('proves text in the current Claude composer', () => {
   assert.equal(proof.proofOutcome, 'found');
   assert.equal(proof.hasDraft, true);
   assert.equal(proof.text, 'hello from composer\ncontinued line');
+});
+
+test('text beyond the cursor is ambiguous and asks for an exact Claude read', () => {
+  const proof = parseClaudeComposerCurrentFrame(snapshot([
+    'old answer',
+    '────────────',
+    '❯ actual draft text',
+    '',
+  ], { cursorY: 2, cursorX: 4 }));
+  assert.equal(proof.proofOutcome, 'unknown');
+  assert.equal(proof.hasDraft, null);
+  assert.equal(proof.proofReason, 'composer-content-after-cursor');
+  assert.equal(proof.exactCaptureRecommended, true);
 });
 
 test('does not treat real user text shaped like the placeholder as empty', () => {
@@ -98,6 +116,7 @@ function emptyWriteProof(overrides = {}) {
     mirrorGeneration: 'mirror-a',
     mirrorWriteSeq: 19,
     mirrorFlushedSeq: 19,
+    mirrorSynchronizedOutputOpen: false,
     ...overrides,
   };
 }
@@ -112,6 +131,7 @@ test('accepts an empty proof only at the unchanged physical write boundary', () 
     currentMirrorGeneration: 'mirror-a',
     currentMirrorWriteSeq: 19,
     currentMirrorFlushedSeq: 19,
+    currentMirrorSynchronizedOutputOpen: false,
   });
   assert.deepEqual(decision, { valid: true, reason: 'claude_current_composer_empty' });
 });
@@ -126,11 +146,26 @@ test('rejects user input and process/mirror changes between probe and paste', ()
     currentMirrorGeneration: 'mirror-a',
     currentMirrorWriteSeq: 19,
     currentMirrorFlushedSeq: 19,
+    currentMirrorSynchronizedOutputOpen: false,
   };
   assert.equal(validateClaudeComposerWriteBoundary({ ...base, currentInputRevision: 8 }).valid, false);
   assert.equal(validateClaudeComposerWriteBoundary({ ...base, currentRunSeq: 4 }).valid, false);
   assert.equal(validateClaudeComposerWriteBoundary({ ...base, currentLifecycleGeneration: 'pty-a:4' }).valid, false);
   assert.equal(validateClaudeComposerWriteBoundary({ ...base, currentMirrorGeneration: 'mirror-b' }).valid, false);
+  assert.deepEqual(
+    validateClaudeComposerWriteBoundary({
+      ...base,
+      currentMirrorSynchronizedOutputOpen: true,
+    }),
+    { valid: false, reason: 'claude_headless_frame_open' },
+  );
+  assert.deepEqual(
+    validateClaudeComposerWriteBoundary({
+      ...base,
+      proof: emptyWriteProof({ mirrorSynchronizedOutputOpen: true }),
+    }),
+    { valid: false, reason: 'claude_headless_frame_open' },
+  );
 });
 
 test('renderer or unresolved proof never authorizes a background paste', () => {

@@ -1,9 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
-import type { CSSProperties, ReactNode } from 'react';
+import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowDown, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, Square, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
-import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, releasePromptQueueEditorLock, usePromptQueueStore, type QueuedComposerChip, type QueuedImageMarkerRange, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import {
+  ComposerEditor,
+  type ComposerEditorHandle,
+  type ComposerInlineToken,
+} from '@gt-editor/markdown-editor';
+import '@gt-editor/markdown-editor/styles.css';
+import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, releasePromptQueueEditorLock, usePromptQueueStore, type QueuedComposerChip, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -15,13 +21,31 @@ import {
   hasMalformedPromptImageMarker,
   haveSamePromptImageRefs,
   insertPromptImageAttachments,
+  retainPromptImageRefsForText,
 } from '../../utils/promptImageAttachments.mjs';
 import {
+  buildPasteChipMarker,
+  getPasteMarkerHighlightRanges,
   haveSameComposerChips,
+  insertComposerSnapshotAtSelection,
+  isDictationClipboardPayload,
   normalizeComposerChips,
   restoreComposerChipToText,
+  retainPasteChipsForText,
   serializeComposerDraft,
+  shouldCreatePasteChip,
 } from '../../utils/composerChips.mjs';
+import {
+  composerImageUrl,
+  useComposerImagePreview,
+  useComposerImagePreviews,
+} from '../../utils/composerImagePreview';
+import {
+  buildComposerClipboardText,
+  buildPortableImageImportSnapshot,
+  collapsePortableImageImportSnapshot,
+  collectPortableImagePathMarkers,
+} from '../../utils/composerClipboard.mjs';
 import {
   combineFirstDelayParts,
   formatFirstDelayCountdown,
@@ -30,9 +54,10 @@ import {
 } from '../../utils/promptQueueDelay';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { OrchestrationStatusChip } from './OrchestrationStatusChip';
+import { AIComposerImagePreview } from './AIConversation/AIComposerSurface';
 import ControlHint from '../UI/ControlHint';
 
-const { ipcRenderer } = window.require('electron');
+const { ipcRenderer, clipboard } = window.require('electron');
 
 // Map main-process error codes from claude:grab-input → user-facing toast strings.
 // English for consistency with the button labels.
@@ -98,6 +123,9 @@ const EDITOR_TEXTAREA_MIN_HEIGHT = 64;
 const EDITOR_MIN_WIDTH = 280;
 const EDITOR_MIN_HEIGHT = 96;
 const EDITOR_MAX_WIDTH = 760;
+const EDITOR_PREVIEW_GAP = 8;
+const EDITOR_PREVIEW_MAX_WIDTH = 440;
+const EDITOR_PREVIEW_MIN_SIDE_WIDTH = 260;
 const COLLAPSED_RAIL_FULL_WIDTH = 66;
 const COLLAPSED_RAIL_COMPACT_WIDTH = 32;
 const COLLAPSED_RAIL_GAP = 4;
@@ -116,6 +144,11 @@ const ANCHOR_SIDE: 'left' | 'right' = 'right';
 // Resize bounds — must match useUIStore's PROMPT_QUEUE_WIDTH_MIN/MAX clamp.
 const RESIZE_MIN_WIDTH = 240;
 const RESIZE_MAX_WIDTH = 600;
+const RUN_AFTER_IMAGE_PENDING_MARKER = '[Image saving…]';
+
+const createQueuedComposerChipId = () => (
+  'paste-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
+);
 
 function chipTitle(item: QueuedPrompt): string {
   return (item.title || '').trim() || makeDefaultPromptTitle(item.text);
@@ -127,32 +160,6 @@ function takeLeadingChars(value: string, count: number): string {
 
 function shouldPreservePinnedEditorOnOutsideClick(target: Element | null): boolean {
   return !!target?.closest('[data-tab-item], [data-workspace-navigation]');
-}
-
-function renderEditorHighlight(text: string, ranges: QueuedImageMarkerRange[]): ReactNode {
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  for (const range of ranges) {
-    if (range.start > cursor) parts.push(text.slice(cursor, range.start));
-    parts.push(
-      <span
-        key={`${range.start}:${range.end}:${range.id}`}
-        style={{
-          color: IMAGE_TAG_BLUE,
-          background: 'rgba(59,130,246,0.16)',
-          borderRadius: 2,
-          boxShadow: 'inset 0 0 0 1px rgba(96,165,250,0.18)',
-        }}
-      >
-        {text.slice(range.start, range.end)}
-      </span>,
-    );
-    cursor = range.end;
-  }
-  if (cursor < text.length) parts.push(text.slice(cursor));
-  // A zero-width tail keeps the mirror's final empty line equal to textarea.
-  parts.push(<span key="tail">&#8203;</span>);
-  return parts;
 }
 
 type StoredInsertPrompt = { title?: unknown; content?: unknown };
@@ -280,6 +287,7 @@ export function PromptQueueOverlay({
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorText, setEditorText] = useState('');
   const [editorChips, setEditorChips] = useState<QueuedComposerChip[]>([]);
+  const [editorImagePaths, setEditorImagePaths] = useState<QueuedImageRef[]>([]);
   const [editorChipPreviewId, setEditorChipPreviewId] = useState<string | null>(null);
   const [editorTitle, setEditorTitle] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -300,6 +308,11 @@ export function PromptQueueOverlay({
   const [editorSize, setEditorSize] = useState<{ width: number }>({
     width: EDITOR_WIDTH,
   });
+  const [editorViewport, setEditorViewport] = useState(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  }));
+  const [editorMeasuredHeight, setEditorMeasuredHeight] = useState(EDITOR_MIN_HEIGHT);
   const [appearingIds, setAppearingIds] = useState<Set<string>>(new Set());
   const [savedFlashIds, setSavedFlashIds] = useState<Set<string>>(new Set());
   const [titleLoadingIds, setTitleLoadingIds] = useState<Set<string>>(new Set());
@@ -309,9 +322,9 @@ export function PromptQueueOverlay({
   const panelRef = useRef<HTMLDivElement>(null);
   const chipListRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
+  const editorPreviewRef = useRef<HTMLDivElement>(null);
   const editorTitleInputRef = useRef<HTMLInputElement>(null);
-  const editorTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const editorHighlightRef = useRef<HTMLDivElement>(null);
+  const editorTextareaRef = useRef<ComposerEditorHandle>(null);
   const replayButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const committingRef = useRef(false);
   const editorLockTokenRef = useRef(
@@ -323,6 +336,7 @@ export function PromptQueueOverlay({
     specialMode: SpecialPromptMode | null;
     text: string;
     chips: QueuedComposerChip[];
+    imagePaths: QueuedImageRef[];
   } | null>(null);
   const editorDirtyFieldsRef = useRef({
     text: false,
@@ -338,6 +352,7 @@ export function PromptQueueOverlay({
     specialMode: SpecialPromptMode | null;
     text: string;
     chips: QueuedComposerChip[];
+    imagePaths: QueuedImageRef[];
     title: string;
     titleManual: boolean;
   } | null>(null);
@@ -352,9 +367,74 @@ export function PromptQueueOverlay({
   const editorImageMarkerRanges = useMemo(
     () => isSpecialPromptMode
       ? []
-      : getQueuedImageMarkerHighlightRanges(editorText, editingItem?.imagePaths),
-    [editingItem?.imagePaths, editorText, isSpecialPromptMode],
+      : getQueuedImageMarkerHighlightRanges(editorText, editorImagePaths),
+    [editorImagePaths, editorText, isSpecialPromptMode],
   );
+  const editorPasteMarkerRanges = useMemo(
+    () => isSpecialPromptMode
+      ? []
+      : getPasteMarkerHighlightRanges(editorText, editorChips) as Array<{
+          start: number; end: number; id: string;
+        }>,
+    [editorChips, editorText, isSpecialPromptMode],
+  );
+  const editorImagePreviewUrls = useComposerImagePreviews(editorImagePaths);
+  const editorComposerTokens = useMemo<ComposerInlineToken[]>(() => {
+    if (isSpecialPromptMode) return [];
+    const refsById = new Map(editorImagePaths.map((ref) => [Number(ref.id), ref]));
+    const result: ComposerInlineToken[] = [
+      ...editorImageMarkerRanges.map((range) => ({
+        id: `image:${range.id}:${range.start}`,
+        from: range.start,
+        to: range.end,
+        kind: 'image' as const,
+        label: 'image',
+        thumbnailUrl: composerImageUrl(refsById.get(range.id), editorImagePreviewUrls),
+      })),
+      ...editorPasteMarkerRanges.map((range) => ({
+        id: `paste:${range.id}`,
+        from: range.start,
+        to: range.end,
+        kind: 'paste' as const,
+        label: editorText.slice(range.start + 1, Math.max(range.start + 1, range.end - 1)),
+      })),
+    ];
+    const statusPattern = /\[Image saving…\]|\[(?:imagePath|imageError):[^\]\r\n]+\]/gi;
+    let match: RegExpExecArray | null;
+    while ((match = statusPattern.exec(editorText)) !== null) {
+      result.push({
+        id: `status:${match.index}`,
+        from: match.index,
+        to: match.index + match[0].length,
+        kind: match[0] === RUN_AFTER_IMAGE_PENDING_MARKER ? 'pending' : 'error',
+        label: match[0],
+        replace: false,
+      });
+    }
+    return result;
+  }, [editorImageMarkerRanges, editorImagePaths, editorImagePreviewUrls, editorPasteMarkerRanges, editorText, isSpecialPromptMode]);
+  const editorPreviewImageRange = useMemo(() => (
+    editorChipPreviewId
+      ? editorImageMarkerRanges.find((range) => (
+          `image:${range.id}:${range.start}` === editorChipPreviewId
+        ))
+      : undefined
+  ), [editorChipPreviewId, editorImageMarkerRanges]);
+  const editorPreviewImageRef = useMemo(() => (
+    editorPreviewImageRange
+      ? editorImagePaths.find((ref) => Number(ref.id) === Number(editorPreviewImageRange.id))
+      : undefined
+  ), [editorImagePaths, editorPreviewImageRange]);
+  const editorImageDetailPreview = useComposerImagePreview(editorPreviewImageRef, 'detail');
+
+  useEffect(() => {
+    if (!editorChipPreviewId) return;
+    const hasChip = editorChips.some((chip) => chip.id === editorChipPreviewId);
+    const hasImage = editorImageMarkerRanges.some((range) => (
+      `image:${range.id}:${range.start}` === editorChipPreviewId
+    ));
+    if (!hasChip && !hasImage) setEditorChipPreviewId(null);
+  }, [editorChipPreviewId, editorChips, editorImageMarkerRanges]);
 
   // ─── fixed width + drag-resize ─────────────────────────────────────────────
   // The panel has a FIXED width (no `fit-content`) so adding a +grab chip can't
@@ -362,6 +442,7 @@ export function PromptQueueOverlay({
   // persisted in useUIStore. During a drag we render from `dragWidth` (local,
   // for 60fps without store churn) and commit to the store on mouse-up.
   const promptQueueWidth = useUIStore((s) => s.promptQueueWidth);
+  const aiComposerChipThreshold = useUIStore((s) => s.aiComposerChipThreshold);
   const setPromptQueueWidth = useUIStore((s) => s.setPromptQueueWidth);
   const historyPanelOpen = useUIStore((s) => s.historyPanelOpenTabs[tabId] ?? false);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
@@ -479,6 +560,7 @@ export function PromptQueueOverlay({
     setEditorOpen(false);
     setEditorText('');
     setEditorChips([]);
+    setEditorImagePaths([]);
     setEditorChipPreviewId(null);
     setEditorTitle('');
     setEditingId(null);
@@ -597,10 +679,15 @@ export function PromptQueueOverlay({
   const writeThroughEditorPayload = useCallback((
     nextText: string,
     nextChips: QueuedComposerChip[],
+    nextImagePaths?: QueuedImageRef[],
   ): boolean => {
     const initial = editorInitialRef.current;
     if (!initial) return false;
     const normalizedChips = normalizeComposerChips(nextChips) as QueuedComposerChip[];
+    const normalizedImagePaths = Array.isArray(nextImagePaths)
+      ? nextImagePaths.map((ref) => ({ ...ref }))
+      : null;
+    if (normalizedImagePaths) setEditorImagePaths(normalizedImagePaths);
 
     if (initial.specialMode) {
       if (!acquireEditorPayloadLock(null)) return false;
@@ -611,39 +698,50 @@ export function PromptQueueOverlay({
         specialMode: initial.specialMode,
         text: nextText,
         chips: [],
+        imagePaths: [],
       };
       return true;
     }
 
     if (!initial.id) {
+      const previous = editorLastWrittenRef.current;
       editorLastWrittenRef.current = {
         id: null,
         specialMode: null,
         text: nextText,
         chips: normalizedChips,
+        imagePaths: normalizedImagePaths || previous?.imagePaths || [],
       };
       return true;
     }
     if (!acquireEditorPayloadLock(initial.id)) return false;
 
     const previous = editorLastWrittenRef.current;
-    const patch: { text?: string; chips?: QueuedComposerChip[] } = {};
+    const patch: { text?: string; chips?: QueuedComposerChip[]; imagePaths?: QueuedImageRef[] } = {};
     if (!previous || previous.text !== nextText) patch.text = nextText;
     if (!previous || !haveSameComposerChips(previous.chips, normalizedChips)) {
       patch.chips = normalizedChips;
     }
+    if (normalizedImagePaths
+      && !haveSamePromptImageRefs(previous?.imagePaths || [], normalizedImagePaths)) {
+      patch.imagePaths = normalizedImagePaths;
+    }
     if (!Object.prototype.hasOwnProperty.call(patch, 'text')
-      && !Object.prototype.hasOwnProperty.call(patch, 'chips')) {
+      && !Object.prototype.hasOwnProperty.call(patch, 'chips')
+      && !Object.prototype.hasOwnProperty.call(patch, 'imagePaths')) {
       return true;
     }
 
     const accepted = updatePrompt(tabId, initial.id, patch);
     if (accepted) {
+      const current = usePromptQueueStore.getState().getQueue(tabId).items
+        .find((item) => item.id === initial.id);
       editorLastWrittenRef.current = {
         id: initial.id,
         specialMode: null,
-        text: nextText,
-        chips: normalizedChips,
+        text: current?.text ?? nextText,
+        chips: (current?.chips || normalizedChips) as QueuedComposerChip[],
+        imagePaths: (current?.imagePaths || normalizedImagePaths || previous?.imagePaths || []) as QueuedImageRef[],
       };
     }
     return accepted;
@@ -666,6 +764,12 @@ export function PromptQueueOverlay({
         }
         if (opts?.close !== false) resetEditor({ wakeAutoRun: opts?.wakeAutoRun });
         return changed;
+      }
+
+      if (editorText.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) {
+        console.log('[PromptQueue:Images] commit deferred tab=' + tabId.slice(-8)
+          + ' item=' + (initial.id || 'new') + ' reason=image-import-pending');
+        return false;
       }
 
       const normalizedTitle = editorTitle.trim();
@@ -691,13 +795,18 @@ export function PromptQueueOverlay({
           ? normalizedTitle
           : ''
       );
+      const committedImagePaths = retainPromptImageRefsForText(
+        text,
+        editorImagePaths,
+      ) as QueuedImageRef[];
 
       if (initial.id) {
         if (
           editorLastWrittenRef.current?.text !== editorText
           || !haveSameComposerChips(editorLastWrittenRef.current?.chips, editorChips)
+          || !haveSamePromptImageRefs(editorLastWrittenRef.current?.imagePaths, editorImagePaths)
         ) {
-          writeThroughEditorPayload(editorText, editorChips);
+          writeThroughEditorPayload(editorText, editorChips, editorImagePaths);
         }
         const lastWritten = editorLastWrittenRef.current;
         const localPayloadChanged = editorDirtyFieldsRef.current.text
@@ -769,7 +878,14 @@ export function PromptQueueOverlay({
           if (opts?.close !== false) resetEditor({ wakeAutoRun: opts?.wakeAutoRun });
           return false;
         }
-        const id = addPrompt(tabId, text, undefined, undefined, normalizedTitle, editorChips);
+        const id = addPrompt(
+          tabId,
+          text,
+          undefined,
+          committedImagePaths,
+          normalizedTitle,
+          editorChips,
+        );
         const titleWillGenerate = !normalizedTitle && generateRunAfterTitle(
           id,
           serializeComposerDraft({ text, chips: editorChips }),
@@ -792,7 +908,7 @@ export function PromptQueueOverlay({
       }
       window.setTimeout(() => { committingRef.current = false; }, 0);
     }
-  }, [addPrompt, editorChips, editorOpen, editorText, editorTitle, generateRunAfterTitle, markAppearing, markSaved, releaseEditorPayloadLock, removePrompt, resetEditor, tabId, updatePrompt, writeThroughEditorPayload]);
+  }, [addPrompt, editorChips, editorImagePaths, editorOpen, editorText, editorTitle, generateRunAfterTitle, markAppearing, markSaved, releaseEditorPayloadLock, removePrompt, resetEditor, tabId, updatePrompt, writeThroughEditorPayload]);
 
   const suppressChipReopen = useCallback((id: string) => {
     chipCloseSuppressRef.current = { id, until: performance.now() + 450 };
@@ -964,6 +1080,7 @@ export function PromptQueueOverlay({
       const title = chipTitle(it);
       setEditorText(it.text);
       setEditorChips((it.chips || []).map((chip) => ({ ...chip })));
+      setEditorImagePaths((it.imagePaths || []).map((ref) => ({ ...ref })));
       setEditorChipPreviewId(null);
       setEditorTitle(title);
       setEditingId(id);
@@ -973,6 +1090,7 @@ export function PromptQueueOverlay({
         specialMode: null,
         text: it.text,
         chips: (it.chips || []).map((chip) => ({ ...chip })),
+        imagePaths: (it.imagePaths || []).map((ref) => ({ ...ref })),
         title,
         titleManual: !!it.titleManual,
       };
@@ -981,10 +1099,12 @@ export function PromptQueueOverlay({
         specialMode: null,
         text: it.text,
         chips: (it.chips || []).map((chip) => ({ ...chip })),
+        imagePaths: (it.imagePaths || []).map((ref) => ({ ...ref })),
       };
     } else {
       setEditorText('');
       setEditorChips([]);
+      setEditorImagePaths([]);
       setEditorChipPreviewId(null);
       setEditorTitle('');
       setEditingId(null);
@@ -994,6 +1114,7 @@ export function PromptQueueOverlay({
         specialMode: null,
         text: '',
         chips: [],
+        imagePaths: [],
         title: '',
         titleManual: false,
       };
@@ -1002,6 +1123,7 @@ export function PromptQueueOverlay({
         specialMode: null,
         text: '',
         chips: [],
+        imagePaths: [],
       };
     }
     setSpecialPromptMode(null);
@@ -1031,6 +1153,7 @@ export function PromptQueueOverlay({
     setPreviewId(tabId, null);
     setEditorText(text);
     setEditorChips([]);
+    setEditorImagePaths([]);
     setEditorChipPreviewId(null);
     setEditorTitle('');
     setEditingId(null);
@@ -1043,6 +1166,7 @@ export function PromptQueueOverlay({
       specialMode: mode,
       text,
       chips: [],
+      imagePaths: [],
       title: '',
       titleManual: false,
     };
@@ -1051,6 +1175,7 @@ export function PromptQueueOverlay({
       specialMode: mode,
       text,
       chips: [],
+      imagePaths: [],
     };
     setEditorAnchor(anchor);
     setEditorOpen(true);
@@ -1090,6 +1215,7 @@ export function PromptQueueOverlay({
       const targetElement = target instanceof Element ? target : null;
       if (targetElement?.closest('[data-editor-trigger]')) return;
       if (editorRef.current?.contains(target)) return;
+      if (editorPreviewRef.current?.contains(target)) return;
       const replayButton = editingId ? replayButtonRefs.current.get(editingId) : null;
       if (replayButton?.contains(target)) return;
       const currentChip = editingId ? chipRefs.current.get(editingId) : null;
@@ -1111,6 +1237,7 @@ export function PromptQueueOverlay({
     const onMove = (e: MouseEvent) => {
       const trigger = replayButtonRefs.current.get(editingId)?.getBoundingClientRect();
       const editor = editorRef.current?.getBoundingClientRect();
+      const preview = editorPreviewRef.current?.getBoundingClientRect();
       if (!trigger || !editor) return;
       const x = e.clientX;
       const y = e.clientY;
@@ -1119,13 +1246,44 @@ export function PromptQueueOverlay({
         x <= trigger.left + 2 &&
         y >= Math.min(editor.top, trigger.top) - 8 &&
         y <= Math.max(editor.bottom, trigger.bottom) + 8;
-      if (!inRect(trigger, x, y) && !inRect(editor, x, y) && !inBridge) {
+      const inPreviewBridge = !!preview
+        && x >= preview.right - 2
+        && x <= editor.left + 2
+        && y >= Math.min(preview.top, editor.top) - 8
+        && y <= Math.max(preview.bottom, editor.bottom) + 8;
+      if (!inRect(trigger, x, y)
+        && !inRect(editor, x, y)
+        && !inRect(preview, x, y)
+        && !inBridge
+        && !inPreviewBridge) {
         resetEditor();
       }
     };
     window.addEventListener('mousemove', onMove);
     return () => window.removeEventListener('mousemove', onMove);
   }, [editingId, editorFocusWithin, editorOpen, editorPinned, resetEditor]);
+
+  // Preview is a real sibling of the editor, so its fallback-below placement
+  // needs the editor's actual content-driven height. ResizeObserver and the
+  // window resize event keep this event-driven; no polling or timeout geometry.
+  useLayoutEffect(() => {
+    if (!editorOpen) return;
+    const editor = editorRef.current;
+    if (!editor) return;
+    const updateGeometry = () => {
+      const rect = editor.getBoundingClientRect();
+      setEditorMeasuredHeight(rect.height);
+      setEditorViewport({ width: window.innerWidth, height: window.innerHeight });
+    };
+    updateGeometry();
+    const observer = new ResizeObserver(updateGeometry);
+    observer.observe(editor);
+    window.addEventListener('resize', updateGeometry);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', updateGeometry);
+    };
+  }, [editorOpen]);
 
   useLayoutEffect(() => {
     if (!editorOpen || !editorAnchor) return;
@@ -1143,13 +1301,6 @@ export function PromptQueueOverlay({
     );
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY = textarea.scrollHeight > maxTextareaHeight ? 'auto' : 'hidden';
-    const highlight = editorHighlightRef.current;
-    if (highlight) {
-      highlight.style.width = `${textarea.clientWidth}px`;
-      highlight.style.height = `${nextHeight}px`;
-      highlight.scrollTop = textarea.scrollTop;
-      highlight.scrollLeft = textarea.scrollLeft;
-    }
   }, [editorAnchor, editorOpen, editorSize.width, editorText, editorTextareaMinHeight, editorTitleHeight, isSpecialPromptMode]);
 
   useEffect(() => {
@@ -1209,6 +1360,23 @@ export function PromptQueueOverlay({
   // touching stash. Normal click leaves it for review; Cmd+click also submits
   // immediately (same as user pressing Enter after paste). On success the chip
   // is removed from the queue (the prompt has "moved" into the agent input).
+  // Which input the user is actually working in. The prop answers "which
+  // surfaces exist on this tab", not "where is the caret": in terminal-primary
+  // it is pinned to 'history', so grab/Replay always went to the untouched
+  // History draft and reported "input is empty" while the user was typing in
+  // the terminal. The live focus record wins whenever the tab has both inputs;
+  // with nothing focused yet the terminal stays the historical default.
+  //
+  // Both branches carry the full draft, not just text: the History side moves
+  // its images, prompt/paste chips and their refs together (they belong to the
+  // same tab-scoped draft), while the terminal side reads its own images from
+  // the grab IPC. Resolving the surface must not split that triple.
+  const resolveActiveInputSurface = useCallback((): 'terminal' | 'history' => {
+    if (inputSurface !== 'history') return inputSurface;
+    const selected = useUIStore.getState().promptQueueInputSurfaceTabs[tabId];
+    return selected === 'terminal' ? 'terminal' : 'history';
+  }, [inputSurface, tabId]);
+
   const replayChip = useCallback(async (id: string, item: QueuedPrompt, opts?: { submit?: boolean }) => {
     // Guard against double-click while the previous IPC roundtrip is still
     // in flight — second click would queue a second bracketed paste against
@@ -1242,26 +1410,42 @@ export function PromptQueueOverlay({
       const payload = buildQueuedPromptPayload(validation.item);
       const submitNow = opts?.submit === true;
       console.log('[PromptQueue] replay start tab=' + tabId.slice(-8) + ' item=' + id.slice(-8) + ' agent=' + sessionType + ' submit=' + submitNow);
-      if (!submitNow && inputSurface === 'history') {
+      // Same rule as grab: put the prompt back where the user is typing.
+      // Cmd+Replay (submitNow) stays on the confirmed PTY path regardless.
+      const replaySurface = resolveActiveInputSurface();
+      if (!submitNow && replaySurface === 'history') {
         const ui = useUIStore.getState();
         const currentText = ui.historyPromptDrafts[tabId] || '';
         const currentImages = ui.historyPromptDraftImages[tabId] || [];
         const currentChips = ui.historyPromptDraftChips[tabId] || [];
-        const separator = !currentText
-          ? ''
-          : currentText.endsWith('\n\n')
-            ? ''
-            : currentText.endsWith('\n')
-              ? '\n'
-              : '\n\n';
+        // Land where the user was writing, not at the very end. The caret is
+        // read straight off the live textarea: it is the only source that is
+        // still correct after clicks, arrow keys and selections the store
+        // never sees. An unfocused/absent field falls back to the end.
+        const composerEl = document.querySelector<HTMLTextAreaElement>(
+          'textarea[data-history-composer-tab-id="' + tabId + '"]',
+        );
+        const caretStart = composerEl
+          ? Math.max(0, Math.min(composerEl.selectionStart ?? currentText.length, currentText.length))
+          : currentText.length;
+        const caretEnd = composerEl
+          ? Math.max(caretStart, Math.min(composerEl.selectionEnd ?? caretStart, currentText.length))
+          : caretStart;
+        // No separator: the user asked for a raw insertion at the caret, so a
+        // synthetic blank line would corrupt the sentence being typed. Only an
+        // append to non-empty text keeps a single space so words never fuse.
+        const appendingAtEnd = caretStart === currentText.length && caretStart === caretEnd;
+        const needsSpace = appendingAtEnd
+          && currentText.length > 0
+          && !/\s$/.test(currentText);
         const insertedText = validation.item.text
-          ? separator + validation.item.text
+          ? (needsSpace ? ' ' : '') + validation.item.text
           : '';
         const insertion = insertPromptImageAttachments({
           text: currentText,
           imagePaths: currentImages,
-          start: currentText.length,
-          end: currentText.length,
+          start: caretStart,
+          end: caretEnd,
           insertedText,
           insertedImagePaths: validation.item.imagePaths || [],
         });
@@ -1272,19 +1456,40 @@ export function PromptQueueOverlay({
             + ' ids=' + insertion.missingSourceIds.join(','));
           return;
         }
-        ui.setHistoryPromptDraft(tabId, insertion.text, {
+        const insertedComposerText = insertion.text.slice(caretStart, insertion.caret);
+        const authoringInsertion = insertComposerSnapshotAtSelection({
+          text: currentText,
+          chips: currentChips,
+          insertedText: insertedComposerText,
+          insertedChips: validation.item.chips || [],
+          selectionStart: caretStart,
+          selectionEnd: caretEnd,
+        });
+        ui.setHistoryPromptDraft(tabId, authoringInsertion.text, {
           images: insertion.imagePaths,
-          chips: normalizeComposerChips([
-            ...currentChips,
-            ...(validation.item.chips || []),
-          ]),
+          chips: authoringInsertion.chips,
         });
         removePrompt(tabId, id);
         focusHistoryComposer('replay-after-history-transfer');
-        console.log('[PromptQueue] replay transferred to History composer tab=' + tabId.slice(-8) + ' item=' + id.slice(-8));
+        // Leave the caret right after what was inserted so typing continues
+        // from there; without this the field re-focuses at its old offset and
+        // the next character lands inside the pasted prompt.
+        const caretAfterInsert = authoringInsertion.caret;
+        requestAnimationFrame(() => {
+          const el = document.querySelector<HTMLTextAreaElement>(
+            'textarea[data-history-composer-tab-id="' + tabId + '"]',
+          );
+          if (!el) return;
+          const bounded = Math.min(caretAfterInsert, el.value.length);
+          el.setSelectionRange(bounded, bounded);
+        });
+        console.log('[PromptQueue] replay transferred to History composer tab=' + tabId.slice(-8)
+          + ' item=' + id.slice(-8)
+          + ' caret=' + caretStart + '→' + caretAfterInsert
+          + ' atEnd=' + appendingAtEnd);
         return;
       }
-      if (inputSurface === 'terminal') {
+      if (replaySurface === 'terminal') {
         focusActiveTerminal(submitNow ? 'replay-submit-before-ipc' : 'replay-before-ipc');
       }
       const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, payload, {
@@ -1309,7 +1514,7 @@ export function PromptQueueOverlay({
       // Focus terminal so the user sees the appended text immediately + can
       // submit with Enter. Without this, focus might be on the chip button
       // and the user has to click into the terminal first.
-      if (inputSurface === 'history') focusHistoryComposer('replay-submit-after-ipc');
+      if (replaySurface === 'history') focusHistoryComposer('replay-submit-after-ipc');
       else focusActiveTerminal('replay-after-ipc');
     } catch (e: unknown) {
       const m = (e as { message?: string })?.message || String(e);
@@ -1324,7 +1529,7 @@ export function PromptQueueOverlay({
       });
       replayingIdsRef.current.delete(id);
     }
-  }, [tabId, sessionType, showToast, focusActiveTerminal, focusHistoryComposer, inputSurface, removePrompt]);
+  }, [tabId, sessionType, showToast, focusActiveTerminal, focusHistoryComposer, resolveActiveInputSurface, removePrompt]);
 
   useEffect(() => {
     const setCmd = (value: boolean) => {
@@ -1363,9 +1568,345 @@ export function PromptQueueOverlay({
     if (!titleWillGenerate) markAppearing(id);
   }, [addPrompt, generateRunAfterTitle, markAppearing, tabId]);
 
+  // Exactly the same authoring clipboard contract as History: images become
+  // portable paths and Pasted Content anchors expand to their stored bodies.
+  const handleEditorImageAwareCopy = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const element = event.currentTarget;
+    const start = element.selectionStart ?? 0;
+    const end = element.selectionEnd ?? 0;
+    if (start === end) return;
+    const result = buildComposerClipboardText({
+      text: element.value,
+      selectionStart: start,
+      selectionEnd: end,
+      chips: editorChips,
+      imagePaths: editorImagePaths,
+    });
+    if (!result.handled) return;
+    event.preventDefault();
+    if (event.type === 'cut') {
+      const nextText = element.value.slice(0, start) + element.value.slice(end);
+      const nextChips = retainPasteChipsForText(nextText, editorChips) as QueuedComposerChip[];
+      const nextImagePaths = retainPromptImageRefsForText(nextText, editorImagePaths) as QueuedImageRef[];
+      setEditorText(nextText);
+      setEditorChips(nextChips);
+      setEditorImagePaths(nextImagePaths);
+      writeThroughEditorPayload(nextText, nextChips, nextImagePaths);
+    }
+    clipboard.writeText(result.text);
+    if (result.imagePartial > 0 || result.imageMissing > 0) {
+      showToast('Image marker is damaged or has no matching attachment. Copied imageError instead.', 'warning', 4000);
+    } else if (result.pasteMissing > 0) {
+      showToast('Pasted Content marker has no matching text. Copied pasteError instead.', 'warning', 4000);
+    }
+    console.log('[PromptQueue:Clipboard] composer-export tab=' + tabId.slice(-8)
+      + ' type=' + event.type
+      + ' images=' + result.imageResolved
+      + ' imageMissing=' + result.imageMissing
+      + ' imagePartial=' + result.imagePartial
+      + ' pastes=' + result.pasteExpanded
+      + ' pasteMissing=' + result.pasteMissing);
+  }, [editorChips, editorImagePaths, showToast, tabId, writeThroughEditorPayload]);
+
+  const handleEditorImagePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageItem = Array.from(event.clipboardData?.items || [])
+      .find((item) => item.kind === 'file' && item.type.toLowerCase().startsWith('image/'));
+    const pastedText = event.clipboardData?.getData('text/plain') || '';
+    const portableMarkers = imageItem ? [] : collectPortableImagePathMarkers(pastedText);
+
+    if (!imageItem && portableMarkers.length === 0) {
+      if (isDictationClipboardPayload(event.clipboardData)) return;
+      if (!shouldCreatePasteChip(pastedText, aiComposerChipThreshold)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (isSpecialPromptMode) {
+        // Post/Loop have no chip sidecar. Preserve their existing plain-text
+        // capability instead of silently dropping the pasted body.
+        const element = event.currentTarget;
+        const start = element.selectionStart ?? editorText.length;
+        const end = element.selectionEnd ?? start;
+        const nextText = editorText.slice(0, start) + pastedText + editorText.slice(end);
+        setEditorText(nextText);
+        writeThroughEditorPayload(nextText, []);
+        requestAnimationFrame(() => {
+          const textarea = editorTextareaRef.current;
+          const caret = start + pastedText.length;
+          textarea?.focus();
+          textarea?.setSelectionRange(caret, caret);
+        });
+        return;
+      }
+      const chip: QueuedComposerChip = {
+        id: createQueuedComposerChipId(),
+        kind: 'paste',
+        text: pastedText,
+        label: 'Вставка',
+        createdAt: Date.now(),
+      };
+      const insertion = insertComposerSnapshotAtSelection({
+        text: editorText,
+        chips: editorChips,
+        insertedText: buildPasteChipMarker(chip),
+        insertedChips: [chip],
+        selectionStart: event.currentTarget.selectionStart,
+        selectionEnd: event.currentTarget.selectionEnd,
+      });
+      const nextImagePaths = retainPromptImageRefsForText(
+        insertion.text,
+        editorImagePaths,
+      ) as QueuedImageRef[];
+      editorDirtyFieldsRef.current.text = true;
+      editorDirtyFieldsRef.current.chips = true;
+      setEditorText(insertion.text);
+      setEditorChips(insertion.chips as QueuedComposerChip[]);
+      setEditorImagePaths(nextImagePaths);
+      writeThroughEditorPayload(
+        insertion.text,
+        insertion.chips as QueuedComposerChip[],
+        nextImagePaths,
+      );
+      requestAnimationFrame(() => {
+        const textarea = editorTextareaRef.current;
+        textarea?.focus();
+        textarea?.setSelectionRange(insertion.caret, insertion.caret);
+      });
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (isSpecialPromptMode) {
+      showToast('Image attachments are available for queued Run after prompts, not Post/Loop text.', 'warning', 4000);
+      return;
+    }
+    const initial = editorInitialRef.current;
+    if (!initial) return;
+    if (editorText.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) {
+      showToast('Wait for the current image to finish saving.', 'warning', 3000);
+      return;
+    }
+
+    const element = event.currentTarget;
+    const start = Math.max(0, Math.min(element.selectionStart ?? editorText.length, editorText.length));
+    const end = Math.max(start, Math.min(element.selectionEnd ?? start, editorText.length));
+    const pendingText = editorText.slice(0, start) + RUN_AFTER_IMAGE_PENDING_MARKER + editorText.slice(end);
+    const pendingChips = retainPasteChipsForText(pendingText, editorChips) as QueuedComposerChip[];
+    const pendingImagePaths = retainPromptImageRefsForText(
+      pendingText,
+      editorImagePaths,
+    ) as QueuedImageRef[];
+    editorDirtyFieldsRef.current.text = true;
+    editorDirtyFieldsRef.current.chips = true;
+    setEditorText(pendingText);
+    setEditorChips(pendingChips);
+    setEditorImagePaths(pendingImagePaths);
+    writeThroughEditorPayload(pendingText, pendingChips, pendingImagePaths);
+    const pendingCaret = start + RUN_AFTER_IMAGE_PENDING_MARKER.length;
+    requestAnimationFrame(() => {
+      const textarea = editorTextareaRef.current;
+      textarea?.focus();
+      textarea?.setSelectionRange(pendingCaret, pendingCaret);
+    });
+
+    const operation = imageItem
+      ? ipcRenderer.invoke('prompt-queue:save-clipboard-image', { tabId })
+          .then((saved: QueuedImageRef & { success?: boolean }) => ({
+            kind: 'bitmap' as const,
+            refs: saved?.success === true && saved.path ? [{ ...saved, id: 1 }] : [],
+            sourceText: '[imagePath: ' + (saved?.path || '') + ']',
+            saveError: saved?.success === true && saved.path ? null : String((saved as any)?.error || 'save_failed'),
+          }))
+      : ipcRenderer.invoke('prompt-queue:materialize-image-refs', {
+          refs: portableMarkers.map((marker) => ({ id: marker.id, path: marker.path, size: 0 })),
+        }).then((result: { refs?: QueuedImageRef[] }) => ({
+          kind: 'paths' as const,
+          refs: result?.refs || [],
+          sourceText: pastedText,
+          saveError: null,
+        }));
+
+    console.log('[PromptQueue:Images] paste-import start tab=' + tabId.slice(-8)
+      + ' item=' + (initial.id || 'new')
+      + ' kind=' + (imageItem ? 'bitmap' : 'paths')
+      + ' markers=' + (imageItem ? 1 : portableMarkers.length));
+    void operation.then((resolved) => {
+      const liveDraft = editorLastWrittenRef.current;
+      const current = initial.id
+        ? usePromptQueueStore.getState().getQueue(tabId).items
+            .find((item) => item.id === initial.id)
+        : editorInitialRef.current === initial && liveDraft?.specialMode === null
+          ? {
+              text: liveDraft.text,
+              chips: liveDraft.chips,
+              imagePaths: liveDraft.imagePaths,
+            }
+          : null;
+      if (!current) return;
+      const tokenStart = current.text.indexOf(RUN_AFTER_IMAGE_PENDING_MARKER);
+      if (tokenStart < 0) {
+        console.log('[PromptQueue:Images] paste-import dropped tab=' + tabId.slice(-8)
+          + ' item=' + (initial.id || 'new') + ' reason=pending-marker-removed');
+        return;
+      }
+      const sourceSnapshot = resolved.saveError
+        ? {
+            text: '[imageError: clipboard_image_save_failed]',
+            imagePaths: [],
+            imported: 0,
+            missing: 1,
+          }
+        : buildPortableImageImportSnapshot(resolved.sourceText, resolved.refs);
+      const snapshot = collapsePortableImageImportSnapshot({
+        ...sourceSnapshot,
+        threshold: aiComposerChipThreshold,
+        createChipId: createQueuedComposerChipId,
+      });
+      const imageInsertion = insertPromptImageAttachments({
+        text: current.text,
+        imagePaths: current.imagePaths || [],
+        start: tokenStart,
+        end: tokenStart + RUN_AFTER_IMAGE_PENDING_MARKER.length,
+        insertedText: snapshot.text,
+        insertedImagePaths: snapshot.imagePaths,
+      });
+      if (imageInsertion.missingSourceIds.length > 0) {
+        throw new Error('run_after_image_identity_missing');
+      }
+      const remappedInsertedText = imageInsertion.text.slice(tokenStart, imageInsertion.caret);
+      const composerInsertion = insertComposerSnapshotAtSelection({
+        text: current.text,
+        chips: current.chips || [],
+        insertedText: remappedInsertedText,
+        insertedChips: snapshot.chips,
+        selectionStart: tokenStart,
+        selectionEnd: tokenStart + RUN_AFTER_IMAGE_PENDING_MARKER.length,
+      });
+      const nextChips = composerInsertion.chips as QueuedComposerChip[];
+      const nextImagePaths = imageInsertion.imagePaths as QueuedImageRef[];
+      const editorStillOwnsDraft = editorInitialRef.current === initial;
+      const accepted = editorStillOwnsDraft
+        ? writeThroughEditorPayload(composerInsertion.text, nextChips, nextImagePaths)
+        : initial.id
+          ? updatePrompt(tabId, initial.id, {
+              text: composerInsertion.text,
+              chips: nextChips,
+              imagePaths: nextImagePaths,
+            })
+          : false;
+      if (!accepted) throw new Error('run_after_editor_write_rejected');
+      if (editorStillOwnsDraft) {
+        setEditorText(composerInsertion.text);
+        setEditorChips(nextChips);
+        setEditorImagePaths(nextImagePaths);
+      }
+      if (sourceSnapshot.missing > 0) {
+        showToast('One or more image files are unavailable. Inserted imageError instead.', 'warning', 4000);
+      }
+      console.log('[PromptQueue:Images] paste-import ready tab=' + tabId.slice(-8)
+        + ' item=' + (initial.id || 'new')
+        + ' imported=' + sourceSnapshot.imported
+        + ' missing=' + sourceSnapshot.missing
+        + ' pasteChips=' + snapshot.chips.length);
+      if (editorStillOwnsDraft) requestAnimationFrame(() => {
+        const textarea = editorTextareaRef.current;
+        textarea?.focus();
+        textarea?.setSelectionRange(composerInsertion.caret, composerInsertion.caret);
+      });
+    }).catch((cause: any) => {
+      const liveDraft = editorLastWrittenRef.current;
+      const current = initial.id
+        ? usePromptQueueStore.getState().getQueue(tabId).items
+            .find((item) => item.id === initial.id)
+        : editorInitialRef.current === initial && liveDraft?.specialMode === null
+          ? {
+              text: liveDraft.text,
+              chips: liveDraft.chips,
+              imagePaths: liveDraft.imagePaths,
+            }
+          : null;
+      if (!current?.text.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) return;
+      const failedText = current.text.replace(
+        RUN_AFTER_IMAGE_PENDING_MARKER,
+        '[imageError: run_after_image_import_failed]',
+      );
+      const failedChips = retainPasteChipsForText(failedText, current.chips || []) as QueuedComposerChip[];
+      const failedImagePaths = retainPromptImageRefsForText(
+        failedText,
+        current.imagePaths || [],
+      ) as QueuedImageRef[];
+      const editorStillOwnsDraft = editorInitialRef.current === initial;
+      const accepted = editorStillOwnsDraft
+        ? writeThroughEditorPayload(failedText, failedChips, failedImagePaths)
+        : initial.id
+          ? updatePrompt(tabId, initial.id, {
+              text: failedText,
+              chips: failedChips,
+              imagePaths: failedImagePaths,
+            })
+          : false;
+      if (!accepted) return;
+      if (editorStillOwnsDraft) {
+        setEditorText(failedText);
+        setEditorChips(failedChips);
+        setEditorImagePaths(failedImagePaths);
+      }
+      showToast('Could not import the image. Inserted imageError instead.', 'warning', 4000);
+      console.warn('[PromptQueue:Images] paste-import failed tab=' + tabId.slice(-8)
+        + ' item=' + (initial.id || 'new')
+        + ' error=' + String(cause?.message || cause));
+    });
+  }, [aiComposerChipThreshold, editorChips, editorImagePaths, editorText, isSpecialPromptMode, showToast, tabId, updatePrompt, writeThroughEditorPayload]);
+
+  const replaceEditorPasteAnchor = useCallback((
+    chip: QueuedComposerChip,
+    replacement: string,
+  ) => {
+    const range = editorPasteMarkerRanges.find((item) => item.id === chip.id);
+    if (!range) return;
+    const nextText = editorText.slice(0, range.start) + replacement + editorText.slice(range.end);
+    const nextChips = editorChips.filter((item) => item.id !== chip.id);
+    editorDirtyFieldsRef.current.text = true;
+    editorDirtyFieldsRef.current.chips = true;
+    setEditorText(nextText);
+    setEditorChips(nextChips);
+    writeThroughEditorPayload(nextText, nextChips);
+    setEditorChipPreviewId((current) => current === chip.id ? null : current);
+    const caret = range.start + replacement.length;
+    requestAnimationFrame(() => {
+      editorTextareaRef.current?.focus();
+      editorTextareaRef.current?.setSelectionRange(caret, caret);
+    });
+  }, [editorChips, editorPasteMarkerRanges, editorText, writeThroughEditorPayload]);
+
+  const openEditorPasteChipContextMenu = useCallback((chip: QueuedComposerChip) => {
+    ipcRenderer.send('show-paste-chip-context-menu', {
+      chipId: chip.id,
+      chars: (chip.text || '').length,
+      preview: chip.text || '',
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!editorOpen || isSpecialPromptMode) return;
+    const onMenuAction = (_event: unknown, payload: { chipId?: string; action?: string }) => {
+      const chip = editorChips.find((item) => item.id === payload?.chipId);
+      if (!chip || chip.kind !== 'paste') return;
+      if (payload.action === 'preview') {
+        setEditorChipPreviewId((current) => current === chip.id ? null : chip.id);
+      } else if (payload.action === 'restore') {
+        replaceEditorPasteAnchor(chip, chip.text || '');
+      } else if (payload.action === 'discard') {
+        replaceEditorPasteAnchor(chip, '');
+      }
+    };
+    ipcRenderer.on('paste-chip-menu-action', onMenuAction);
+    return () => { ipcRenderer.removeListener('paste-chip-menu-action', onMenuAction); };
+  }, [editorChips, editorOpen, isSpecialPromptMode, replaceEditorPasteAnchor]);
+
   const grabCurrent = useCallback(async () => {
     try {
-      if (inputSurface === 'history') {
+      const resolvedSurface = resolveActiveInputSurface();
+      if (resolvedSurface === 'history') {
         const ui = useUIStore.getState();
         const raw = ui.historyPromptDrafts[tabId] || '';
         const chips = normalizeComposerChips(
@@ -1457,7 +1998,7 @@ export function PromptQueueOverlay({
       showToast(`Grab failed: ${m}`, 'error');
       console.error('[PromptQueue] grab-input error', e);
     }
-  }, [tabId, sessionType, agentLabel, enqueueGrabbedPrompt, focusActiveTerminal, focusHistoryComposer, inputSurface, showToast]);
+  }, [tabId, sessionType, agentLabel, enqueueGrabbedPrompt, focusActiveTerminal, focusHistoryComposer, resolveActiveInputSurface, showToast]);
 
   // Copy moved to InfoPanel — see Copy prompt button next to Copy Session.
 
@@ -1583,6 +2124,58 @@ export function PromptQueueOverlay({
       : activeItemCount
         ? (railRunHover ? '#666' : '#4a4a4a')
         : (railRunHover ? TINT : '#8a4a37');
+
+  const editorPreviewChip = editorChipPreviewId
+    ? editorChips.find((item) => item.id === editorChipPreviewId)
+    : undefined;
+  const editorPreviewFileName = editorPreviewImageRef?.path?.split('/').filter(Boolean).pop()
+    || (editorPreviewImageRange ? `Image #${editorPreviewImageRange.id}` : '');
+  const editorPreviewLabel = editorPreviewChip
+    ? (editorPreviewChip.kind === 'prompt'
+      ? (editorPreviewChip.label || 'Prompt')
+      : 'Pasted content')
+    : editorPreviewImageRange
+      ? `Image #${editorPreviewImageRange.id}`
+      : null;
+  const editorPreviewMeta = editorPreviewChip
+    ? `${editorPreviewChip.text.length.toLocaleString()} symbols`
+    : editorPreviewFileName;
+  const hasEditorPreview = !!editorPreviewLabel;
+  const editorAvailableLeft = editorAnchor
+    ? editorViewport.width
+      - editorAnchor.right
+      - editorSize.width
+      - EDITOR_PREVIEW_GAP
+      - EDITOR_MARGIN
+    : 0;
+  const editorPreviewBeside = editorAvailableLeft >= EDITOR_PREVIEW_MIN_SIDE_WIDTH;
+  const editorPreviewWidth = editorAnchor
+    ? Math.max(
+      180,
+      Math.min(
+        EDITOR_PREVIEW_MAX_WIDTH,
+        editorSize.width,
+        editorPreviewBeside
+          ? editorAvailableLeft
+          : editorViewport.width - editorAnchor.right - EDITOR_MARGIN,
+      ),
+    )
+    : EDITOR_WIDTH;
+  const editorPreviewTop = editorAnchor
+    ? editorPreviewBeside
+      ? editorAnchor.top
+      : editorAnchor.top + editorMeasuredHeight + EDITOR_PREVIEW_GAP
+    : 0;
+  const editorPreviewRight = editorAnchor
+    ? editorPreviewBeside
+      ? editorAnchor.right + editorSize.width + EDITOR_PREVIEW_GAP
+      : editorAnchor.right
+    : 0;
+  const editorPreviewMaxHeight = editorAnchor
+    ? editorPreviewBeside
+      ? editorAnchor.maxHeight
+      : Math.max(80, editorViewport.height - editorPreviewTop - EDITOR_MARGIN)
+    : EDITOR_MIN_HEIGHT;
 
   // ─── render ──────────────────────────────────────────────────────────────
   return (
@@ -2515,6 +3108,73 @@ export function PromptQueueOverlay({
         );
       })(), document.body)}
 
+      {/* Expanded chip content is a sibling of the editor, not a child inside
+          its title/body column. On normal desktop widths it sits immediately
+          to the left; narrow layouts fall back below without covering input. */}
+      {!collapsed && !panelClosing && editorOpen && editorAnchor && hasEditorPreview && (
+        <div
+          ref={editorPreviewRef}
+          className="pq-editor-preview-sibling"
+          data-run-after-preview-sibling
+          data-preview-placement={editorPreviewBeside ? 'left' : 'below'}
+          data-run-after-image-preview={editorPreviewImageRange?.id}
+          style={{
+            position: 'fixed',
+            top: editorPreviewTop,
+            right: editorPreviewRight,
+            width: editorPreviewWidth,
+            maxHeight: editorPreviewMaxHeight,
+            minHeight: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+            color: '#ddd',
+            background: PANEL_BG,
+            border: editorPinned ? '1px solid rgba(190,190,190,0.36)' : `1px solid ${BORDER}`,
+            borderRadius: 6,
+            boxShadow: editorPinned ? '0 0 0 1px rgba(190,190,190,0.10)' : 'none',
+            backdropFilter: 'blur(8px)',
+            boxSizing: 'border-box',
+            pointerEvents: 'auto',
+            zIndex: FLOATING_OVERLAY_Z_INDEX,
+          }}
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <div className="hp-composer-chip-preview-head" style={{ flex: '0 0 auto' }}>
+            <span>{editorPreviewLabel}</span>
+            <span>{editorPreviewMeta}</span>
+          </div>
+          {editorPreviewChip ? (
+            <pre
+              style={{
+                minHeight: 0,
+                margin: 0,
+                padding: 8,
+                overflow: 'auto',
+                color: '#bdbdbd',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                fontSize: promptQueueEditorFontSize,
+                lineHeight: 1.45,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {editorPreviewChip.text}
+            </pre>
+          ) : editorPreviewImageRange ? (
+            <div style={{ minHeight: 0, overflow: 'auto' }}>
+              <AIComposerImagePreview
+                src={editorImageDetailPreview.url}
+                loading={editorImageDetailPreview.loading}
+                error={editorImageDetailPreview.error}
+                alt={`Run after image attachment #${editorPreviewImageRange.id}`}
+              />
+            </div>
+          ) : null}
+        </div>
+      )}
+
       {/* Editor slideout — docked to the LEFT of the queue panel, no scrim.
           Anchored by editorAnchor: top aligned to chip/list/panel, right edge stays fixed.
           Resize controls only width; height stays content-driven by textarea rows. */}
@@ -2587,7 +3247,7 @@ export function PromptQueueOverlay({
                 }}
               />
               <div style={{ height: 1, flexShrink: 0, background: BORDER }} />
-              {editorChips.length > 0 && (
+              {editorChips.some((chip) => chip.kind === 'prompt') && (
                 <div
                   style={{
                     display: 'flex',
@@ -2599,7 +3259,7 @@ export function PromptQueueOverlay({
                     flexShrink: 0,
                   }}
                 >
-                  {editorChips.map((chip) => {
+                  {editorChips.filter((chip) => chip.kind === 'prompt').map((chip) => {
                     const preview = chip.text.slice(0, 70).replace(/\s+/g, ' ')
                       + (chip.text.length > 70 ? '…' : '');
                     return (
@@ -2668,19 +3328,6 @@ export function PromptQueueOverlay({
                       />
                     );
                   })}
-                  {editorChipPreviewId && (() => {
-                    const chip = editorChips.find((item) => item.id === editorChipPreviewId);
-                    if (!chip) return null;
-                    return (
-                      <div className="hp-composer-chip-preview">
-                        <div className="hp-composer-chip-preview-head">
-                          <span>{chip.kind === 'prompt' ? (chip.label || 'Prompt') : 'Pasted content'}</span>
-                          <span>{chip.text.length.toLocaleString()} symbols</span>
-                        </div>
-                        <pre>{chip.text}</pre>
-                      </div>
-                    );
-                  })()}
                 </div>
               )}
             </>
@@ -2696,51 +3343,49 @@ export function PromptQueueOverlay({
               overflow: 'hidden',
             }}
           >
-            <div
-              ref={editorHighlightRef}
-              aria-hidden="true"
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                width: '100%',
-                minHeight: editorTextareaMinHeight,
-                overflow: 'hidden',
-                color: '#ddd',
-                padding: '6px 8px',
-                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                fontSize: promptQueueEditorFontSize,
-                lineHeight: 1.35,
-                whiteSpace: 'pre-wrap',
-                overflowWrap: 'break-word',
-                wordBreak: 'break-word',
-                boxSizing: 'border-box',
-                pointerEvents: 'none',
-              }}
-            >
-              {renderEditorHighlight(editorText, editorImageMarkerRanges)}
-            </div>
-            <textarea
+            <ComposerEditor
               ref={editorTextareaRef}
               className="pq-image-marker-textarea"
               autoFocus={editorAutoFocus && isSpecialPromptMode}
               value={editorText}
-              onChange={(e) => {
-                const nextText = e.target.value;
+              tokens={editorComposerTokens}
+              fontSize={promptQueueEditorFontSize}
+              onChange={(nextText) => {
                 if (isSpecialPromptMode) editorDirtyFieldsRef.current.special = true;
                 else editorDirtyFieldsRef.current.text = true;
+                const nextImagePaths = isSpecialPromptMode
+                  ? []
+                  : retainPromptImageRefsForText(nextText, editorImagePaths) as QueuedImageRef[];
                 setEditorText(nextText);
-                writeThroughEditorPayload(nextText, editorChips);
+                setEditorImagePaths(nextImagePaths);
+                writeThroughEditorPayload(nextText, editorChips, nextImagePaths);
               }}
-              onScroll={(e) => {
-                const highlight = editorHighlightRef.current;
-                if (!highlight) return;
-                highlight.scrollTop = e.currentTarget.scrollTop;
-                highlight.scrollLeft = e.currentTarget.scrollLeft;
-              }}
+              onCopy={handleEditorImageAwareCopy}
+              onCut={handleEditorImageAwareCopy}
+              onPaste={handleEditorImagePaste}
               onKeyDown={(e) => {
                 if (e.key === 'Escape') resetEditor();
                 if (e.key === 'Enter' && e.metaKey) commitEditor();
+              }}
+              onTokenClick={(token) => {
+                if (token.kind === 'image') {
+                  setEditorChipPreviewId((current) => current === token.id ? null : token.id);
+                  return true;
+                }
+                if (token.kind === 'paste') {
+                  const chipId = token.id.slice('paste:'.length);
+                  setEditorChipPreviewId((current) => current === chipId ? null : chipId);
+                  return true;
+                }
+                return false;
+              }}
+              onTokenContextMenu={(token) => {
+                if (token.kind !== 'paste') return false;
+                const chipId = token.id.slice('paste:'.length);
+                const chip = editorChips.find((item) => item.id === chipId);
+                if (!chip) return false;
+                openEditorPasteChipContextMenu(chip);
+                return true;
               }}
               style={{
                 position: 'relative',
@@ -2750,14 +3395,12 @@ export function PromptQueueOverlay({
                 minHeight: editorTextareaMinHeight,
                 maxHeight: editorAnchor.maxHeight - (isSpecialPromptMode ? 0 : editorTitleHeight + 1),
                 background: 'transparent',
-                color: 'transparent',
-                WebkitTextFillColor: 'transparent',
+                color: '#ddd',
                 caretColor: '#ddd',
-                border: 'none', padding: '6px 8px',
+                border: 'none',
                 fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                fontSize: promptQueueEditorFontSize,
                 lineHeight: 1.35,
-                resize: 'none', outline: 'none',
+                outline: 'none',
                 overflowY: 'hidden',
                 overflowWrap: 'break-word',
                 wordBreak: 'break-word',

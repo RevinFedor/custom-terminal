@@ -144,6 +144,91 @@ const DOCS_TIMELINE_COLORS = {
   },
 } as const;
 
+type TimelineCornerBadgeItem = {
+  kind: 'count' | 'loop' | 'docs-edit' | 'docs-search';
+  slot: 'top-right' | 'middle-right' | 'bottom-right' | 'middle-inner';
+  text?: string;
+  tone?: 'compact' | 'group' | null;
+};
+
+const TimelineCornerBadges: React.FC<{
+  items: TimelineCornerBadgeItem[];
+  isExpandedLayout: boolean;
+  timelineFontSize: number;
+  groupAccent: string;
+}> = ({ items, isExpandedLayout, timelineFontSize, groupAccent }) => {
+  const rightColumnCount = items.filter(item => item.slot.endsWith('right')).length;
+  const dense = !isExpandedLayout && rightColumnCount >= 3;
+
+  return <>
+    {items.map((badge) => {
+      const isInner = badge.slot === 'middle-inner';
+      const isTop = badge.slot === 'top-right';
+      const isBottom = badge.slot === 'bottom-right';
+      const positionStyle: React.CSSProperties = {
+        position: 'absolute',
+        zIndex: 2,
+        right: isExpandedLayout
+          ? (isInner ? '18px' : '5px')
+          : (isInner ? '10px' : '2px'),
+        ...(isTop
+          ? { top: isExpandedLayout ? '3px' : '1px' }
+          : isBottom
+            ? { bottom: isExpandedLayout ? '3px' : '1px' }
+            : { top: '50%', transform: 'translateY(-50%)' }),
+      };
+
+      if (badge.kind === 'count') {
+        const compact = badge.tone === 'compact';
+        return (
+          <span
+            key={`${badge.kind}:${badge.slot}`}
+            className="pointer-events-none select-none"
+            aria-label={compact ? `${badge.text} compacts` : `${badge.text} grouped calls`}
+            style={{
+              ...positionStyle,
+              color: compact ? '#f2bf58' : groupAccent,
+              fontFamily: 'monospace',
+              fontSize: isExpandedLayout ? '9px' : (dense ? '8px' : '9px'),
+              fontWeight: compact ? 700 : 600,
+              fontVariantNumeric: 'tabular-nums',
+              lineHeight: 1,
+              textShadow: compact ? '0 1px 2px rgba(0, 0, 0, 0.85)' : undefined,
+            }}
+          >
+            {badge.text}
+          </span>
+        );
+      }
+
+      const size = isExpandedLayout
+        ? Math.max(7, Math.min(9, Math.round(timelineFontSize * 0.62)))
+        : (dense ? 6 : 7);
+      const Icon = badge.kind === 'loop'
+        ? Repeat2
+        : badge.kind === 'docs-edit'
+          ? Pencil
+          : Search;
+      const color = badge.kind === 'loop'
+        ? '#60a5fa'
+        : badge.kind === 'docs-edit'
+          ? DOCS_TIMELINE_COLORS.edited.visible
+          : DOCS_TIMELINE_COLORS.search.visible;
+      return (
+        <Icon
+          key={`${badge.kind}:${badge.slot}`}
+          className="pointer-events-none select-none"
+          aria-label={badge.kind}
+          size={size}
+          strokeWidth={2.2}
+          color={color}
+          style={positionStyle}
+        />
+      );
+    })}
+  </>;
+};
+
 // Portal for tooltip to escape overflow:hidden
 const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   return createPortal(
@@ -912,6 +997,10 @@ function Timeline({
     crossesBoundary: boolean;  // range hit compact/isCompactSummary/continued; Delete confirm can auto-extend to safe boundary
   } | null>(null);
   const [postPromptMode, setPostPromptMode] = useState(false);
+  // Same "add your own instruction first" step, but for a single-point Rewind.
+  // Holds the entry the instruction belongs to: the single-point menu has no
+  // selection range to fall back on, so the target must be explicit.
+  const [singlePostPromptEntryUuid, setSinglePostPromptEntryUuid] = useState<string | null>(null);
   const [postPromptText, setPostPromptText] = useState('');
   const postPromptRef = useRef<HTMLTextAreaElement>(null);
   // Inline confirm for "Удалить историю" inside rangeActionMenu (no side panel)
@@ -3688,6 +3777,11 @@ function Timeline({
         justSetRangeMenuRef.current = true;
         if (e) e.stopPropagation();
 
+        // Mutually exclusive with the single-point menu — same anchor, same
+        // screen position, and this one renders on the higher layer.
+        setContextMenu(null);
+        setSinglePostPromptEntryUuid(null);
+        setPostPromptText('');
         setRangeActionMenu({
           x: 0, y, range,
           startUuid: entries[range.startIndex].uuid,
@@ -3931,6 +4025,18 @@ function Timeline({
     const anchorY = targetRect ? targetRect.top + targetRect.height / 2 : e.clientY;
     const y = getEntryAnchoredPopupTop(targetIndex, menuHeight, menuHeight, anchorY);
 
+    // Both popups anchor to the same left edge of Timeline and are positioned
+    // relative to the clicked dot, so they land on top of each other; the range
+    // menu also sits on a higher layer. Leaving it open meant the visible
+    // "Отменить выделение" was covered by the range menu's own Rewind zone, and
+    // a click aimed at cancelling the selection started a real rewind instead
+    // (caught in E2E 2026-07-31: cleanup click launched a Gemini fetch). Only
+    // one of the two may be open at a time.
+    setRangeActionMenu(null);
+    setDeleteConfirmMode(false);
+    setPostPromptMode(false);
+    setSinglePostPromptEntryUuid(null);
+    setPostPromptText('');
     // x stays 0 — render layer reads `right` from notesPanelWidth + timeline width.
     setContextMenu({ x: 0, y, entry, anchorY });
   };
@@ -4123,6 +4229,50 @@ function Timeline({
     }
   };
 
+  // Third zone of the violet Rewind: open the review window with EMPTY text and
+  // let the user write the replacement summary themselves — no Gemini call at
+  // all. Shared by the selection menu and the single-point menu; duplicating it
+  // per call site is how the two paths drifted apart in the first place (the
+  // single-point flow had no window whatsoever).
+  const openEditRangeWithoutSummary = async (
+    range: { startIndex: number; endIndex: number },
+    startUuid: string,
+    endUuid: string,
+  ) => {
+    if (!sessionId) return;
+    const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
+    const hasCompact = rangeEntries.some((en) => en.type === 'compact' || en.isCompactSummary);
+    const hasContinued = rangeEntries.some((en) => en.type === 'continued');
+    if (!isCodex && (hasCompact || hasContinued)) {
+      useUIStore.getState().showToast(
+        hasCompact
+          ? 'Нельзя редактировать диапазон с compact boundary'
+          : 'Нельзя редактировать через Context Overflow recovery — только текущий сегмент',
+        'error', 3000
+      );
+      return;
+    }
+    selectionStartIdRef.current = null;
+    setSelectionStartId(null);
+    setRangeActionMenu(null);
+    setPostPromptMode(false);
+    try {
+      const copyRangeChannel = isCodex ? 'codex:copy-range' : 'claude:copy-range';
+      const result = await ipcRenderer.invoke(copyRangeChannel, {
+        sessionId, cwd, startUuid, endUuid,
+        ...copyFlags,
+      });
+      if (result.success) {
+        setEditRangeState({ range, phase: 'ready', sourceContent: result.content, compactText: '', autoEditInitial: true });
+      } else {
+        useUIStore.getState().showToast('Не удалось собрать диапазон', 'error', 3000);
+      }
+    } catch (err: any) {
+      console.error('[EditRange:ManualOpen] Failed:', err);
+      useUIStore.getState().showToast('Ошибка: ' + (err.message || err), 'error', 3000);
+    }
+  };
+
   const executeRangeAction = async (mode: 'copy' | 'edit', range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string, additionalPrompt?: string) => {
     if (!sessionId) return;
 
@@ -4303,6 +4453,11 @@ function Timeline({
         return;
       }
       setContextMenu(null);
+      // The single-point instruction editor lives INSIDE this menu, so it must
+      // die with it — a stale target uuid would reopen the editor on the next
+      // right-click instead of showing the buttons.
+      setSinglePostPromptEntryUuid(null);
+      setPostPromptText('');
       // Close expanded tooltip on outside click (skip if resize just ended)
       if (isExpanded && !isResizingTooltipRef.current) {
         // Skip if click target is inside tooltip (resize handle click → drag → mouseup → click)
@@ -5021,6 +5176,44 @@ function Timeline({
     void handleRewind(entry, mode);
     return true;
   };
+
+  // Violet Rewind from a SINGLE point. Same operation as the selection Rewind —
+  // history is rewritten and the removed span becomes one summary — so it must
+  // run through the same code path and open the same review window. The only
+  // difference is where the boundaries come from: one click means "from this
+  // entry to the end of the conversation", which is exactly the span the old
+  // `AI` button already consumed (it copied entry.uuid → last entry) before
+  // pasting the summary blindly into the composer with no window at all.
+  //
+  // `openEmptyWindow` skips Gemini entirely: the window opens with empty text
+  // for the user to write the summary themselves — the same third zone the
+  // selection menu has.
+  const requestHistoryRewrite = useCallback((
+    entry: TimelineEntry,
+    options?: { additionalPrompt?: string; openEmptyWindow?: boolean },
+  ) => {
+    if (!supportsEditRangeActions || !sessionId) return false;
+    const startIndex = entries.findIndex((candidate) => candidate.uuid === entry.uuid);
+    if (startIndex < 0 || entries.length === 0) return false;
+    const endIndex = entries.length - 1;
+    const range = { startIndex, endIndex };
+    const startUuid = entry.uuid;
+    const endUuid = entries[endIndex].uuid;
+    console.warn('[Restore:Rewind] history-rewrite request source=timeline-menu'
+      + ' scope=single-point'
+      + ' empty=' + (options?.openEmptyWindow ? '1' : '0')
+      + ' prompt=' + (options?.additionalPrompt ? options.additionalPrompt.length : 0)
+      + ' range=[' + startIndex + ',' + endIndex + ']'
+      + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none')
+      + ' entry=' + entry.uuid.slice(0, 8));
+    setContextMenu(null);
+    if (options?.openEmptyWindow) {
+      void openEditRangeWithoutSummary(range, startUuid, endUuid);
+      return true;
+    }
+    void executeRangeAction('edit', range, startUuid, endUuid, options?.additionalPrompt);
+    return true;
+  }, [entries, sessionId, supportsEditRangeActions]);
 
   const requestRewindRef = useRef(requestRewind);
   requestRewindRef.current = requestRewind;
@@ -5929,7 +6122,12 @@ function Timeline({
           backdropFilter: 'blur(8px)',
           borderLeft: 'none',
           height: '100%',
-          zIndex: 40,
+          // History and Timeline can now be open at the same time (they no
+          // longer close each other). Both overlay from the right edge when
+          // unpinned, so the expanded rail must sit ABOVE the History overlay
+          // (z-index 101) instead of being half-covered by it. Pinned mode is
+          // normal flex layout and keeps the ordinary level.
+          zIndex: isExpandedLayout && !pinned ? 110 : 40,
           visibility: isVisible ? 'inherit' : 'hidden',
           overflow: slideIn ? 'visible' : 'hidden',
           // Expanded layout overlays content from the right unless StatusBar pin
@@ -6166,7 +6364,10 @@ function Timeline({
               docsEditedCount: markerEdited.length,
               docsSearchCount: markerSearched.length,
               collapsedGroupSize: isGroupCollapsed ? groupInfo?.groupSize || 0 : 0,
+              compactClusterSize: displaysAsCompact && !treeMode ? compactClusterCount : 0,
             });
+            const hasDenseCornerBadges = cornerBadges.items
+              .filter((item: TimelineCornerBadgeItem) => item.slot.endsWith('right')).length >= 3;
 
             // ── Dot color ──
             let dotColor: string;
@@ -6358,10 +6559,10 @@ function Timeline({
                     // dots-only/tree: original flex-grow distribution.
                     flex: isExpandedLayout
                       ? '0 0 auto'
-                      : `1 0 ${treeMode ? '22px' : (showAsChild ? '14px' : '20px')}`,
+                      : `1 0 ${hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')}`,
                     minHeight: isExpandedLayout
                       ? undefined
-                      : (treeMode ? '22px' : (showAsChild ? '14px' : '20px')),
+                      : (hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')),
                     alignItems: isExpandedLayout ? 'flex-start' : undefined,
                     justifyContent: isExpandedLayout ? 'flex-start' : (treeMode ? 'flex-start' : 'center'),
                     paddingLeft: isExpandedLayout
@@ -6371,7 +6572,7 @@ function Timeline({
                           : (showAsChild ? '4px' : undefined)),
                     paddingRight: isExpandedLayout
                       ? (cornerBadges.items.length > 0
-                          ? (cornerBadges.items.some((item: { slot: string }) => item.slot.endsWith('left')) ? '34px' : '22px')
+                          ? (cornerBadges.items.some((item: TimelineCornerBadgeItem) => item.slot.endsWith('inner')) ? '34px' : '22px')
                           : '8px')
                       : undefined,
                     paddingTop: isExpandedLayout ? '6px' : undefined,
@@ -6460,87 +6661,15 @@ function Timeline({
                           transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
                         }}
                       />
-                      {displaysAsCompact && compactClusterCount > 1 && !treeMode && (
-                        <span
-                          className="absolute pointer-events-none select-none"
-                          aria-label={`${compactClusterCount} compacts`}
-                          style={{
-                            left: 'calc(50% + 6px)',
-                            top: 'calc(50% - 7px)',
-                            zIndex: 1,
-                            color: '#f2bf58',
-                            fontFamily: 'monospace',
-                            fontSize: `${Math.max(8, Math.min(9, Math.round(timelineFontSize * 0.7)))}px`,
-                            fontWeight: 700,
-                            fontVariantNumeric: 'tabular-nums',
-                            lineHeight: 1,
-                            textShadow: '0 1px 2px rgba(0, 0, 0, 0.85)',
-                          }}
-                        >
-                          {compactClusterCount}
-                        </span>
-                      )}
                     </>
                   )}
 
-                  {cornerBadges.items.map((badge: { kind: string; slot: string; text?: string }) => {
-                    const isRight = badge.slot.endsWith('right');
-                    const isTop = badge.slot.startsWith('top');
-                    const offset = isExpandedLayout
-                      ? (isRight ? '5px' : '18px')
-                      : '2px';
-                    const positionStyle: React.CSSProperties = {
-                      position: 'absolute',
-                      zIndex: 2,
-                      ...(isExpandedLayout
-                        ? { right: offset }
-                        : { [isRight ? 'right' : 'left']: offset }),
-                      [isTop ? 'top' : 'bottom']: isExpandedLayout ? '3px' : '2px',
-                    };
-                    if (badge.kind === 'count') {
-                      return (
-                        <span
-                          key={`${badge.kind}:${badge.slot}`}
-                          className="pointer-events-none select-none"
-                          aria-label={`${badge.text} grouped calls`}
-                          style={{
-                            ...positionStyle,
-                            color: groupAccent,
-                            fontFamily: 'monospace',
-                            fontSize: '9px',
-                            fontWeight: 600,
-                            lineHeight: 1,
-                          }}
-                        >
-                          {badge.text}
-                        </span>
-                      );
-                    }
-                    const size = isExpandedLayout
-                      ? Math.max(7, Math.min(9, Math.round(timelineFontSize * 0.62)))
-                      : 7;
-                    const Icon = badge.kind === 'loop'
-                      ? Repeat2
-                      : badge.kind === 'docs-edit'
-                        ? Pencil
-                        : Search;
-                    const color = badge.kind === 'loop'
-                      ? '#60a5fa'
-                      : badge.kind === 'docs-edit'
-                        ? DOCS_TIMELINE_COLORS.edited.visible
-                        : DOCS_TIMELINE_COLORS.search.visible;
-                    return (
-                      <Icon
-                        key={`${badge.kind}:${badge.slot}`}
-                        className="pointer-events-none select-none"
-                        aria-label={badge.kind}
-                        size={size}
-                        strokeWidth={2.2}
-                        color={color}
-                        style={positionStyle}
-                      />
-                    );
-                  })}
+                  <TimelineCornerBadges
+                    items={cornerBadges.items as TimelineCornerBadgeItem[]}
+                    isExpandedLayout={isExpandedLayout}
+                    timelineFontSize={timelineFontSize}
+                    groupAccent={groupAccent}
+                  />
 
                   {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
                   {isExpandedLayout && (() => {
@@ -7928,17 +8057,74 @@ function Timeline({
                 right: `${popupRightPx}px`,
                 top: contextMenuTop,
                 backgroundColor: '#1a1a1a',
-                border: '1px solid #333',
+                border: `1px solid ${singlePostPromptEntryUuid ? '#8b5cf6' : '#333'}`,
                 borderRadius: '4px',
                 padding: '4px',
                 zIndex: 10001,
-                minWidth: '160px',
+                minWidth: singlePostPromptEntryUuid ? '320px' : '160px',
+                maxWidth: singlePostPromptEntryUuid ? '400px' : undefined,
                 maxHeight: 'calc(100vh - 40px)',
                 overflowY: 'auto',
                 boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
               }}
             >
-              {!selectionStartId ? (
+              {singlePostPromptEntryUuid ? (() => {
+                // Instruction step of the violet single-point Rewind. Mirrors the
+                // selection version: ⌘+Enter sends, Esc returns to the menu.
+                const targetEntry = entries.find((candidate) => candidate.uuid === singlePostPromptEntryUuid);
+                const submitWithPrompt = () => {
+                  const prompt = postPromptText.trim();
+                  if (!prompt || !targetEntry) return;
+                  setSinglePostPromptEntryUuid(null);
+                  setPostPromptText('');
+                  requestHistoryRewrite(targetEntry, { additionalPrompt: prompt });
+                };
+                return (
+                  <div className="p-1" data-testid="timeline-rewind-rewrite-prompt-editor">
+                    <textarea
+                      ref={postPromptRef}
+                      value={postPromptText}
+                      onChange={(e) => setPostPromptText(e.target.value)}
+                      placeholder="Дополнительная инструкция для Gemini..."
+                      className="w-full bg-[#252525] border border-[#444] rounded px-2 py-1.5 text-[11px] text-white/90 font-mono resize-none focus:outline-none focus:border-violet-500/50 placeholder:text-[#555]"
+                      style={{ minHeight: '28px', maxHeight: '110px', lineHeight: '1.4' }}
+                      rows={1}
+                      onInput={(e) => {
+                        const el = e.currentTarget;
+                        el.style.height = 'auto';
+                        el.style.height = Math.min(el.scrollHeight, 110) + 'px';
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && e.metaKey && postPromptText.trim()) {
+                          e.preventDefault();
+                          submitWithPrompt();
+                        } else if (e.key === 'Escape') {
+                          e.preventDefault();
+                          setSinglePostPromptEntryUuid(null);
+                          setPostPromptText('');
+                        }
+                      }}
+                    />
+                    <div className="flex items-center justify-between mt-1">
+                      <span className="text-[9px] text-[#555]">⌘+Enter • Esc отмена</span>
+                      <button
+                        className="p-1 rounded transition-colors cursor-pointer"
+                        style={{
+                          color: postPromptText.trim() ? '#a78bfa' : '#555',
+                          backgroundColor: postPromptText.trim() ? 'rgba(139, 92, 246, 0.12)' : 'transparent',
+                        }}
+                        disabled={!postPromptText.trim()}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          submitWithPrompt();
+                        }}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })() : !selectionStartId ? (
                 <>
                   {/* "Копировать" — все entries с копируемым контентом:
                       user (промпт + ответы), compact/isCompactSummary (summary),
@@ -7977,8 +8163,16 @@ function Timeline({
                       <div className="border-t border-white/10 my-1" />
                     </>
                   )}
+                  {/* Note action carries the note's OWN colour (#0891b2 — the
+                      same cyan-blue as the note strip and dot on the timeline),
+                      not the violet that now means "rewind by rewriting
+                      history". One colour must not stand for two different
+                      kinds of action in the same menu. */}
                   <button
-                    className="w-full text-left px-3 py-2 text-xs text-purple-400 hover:bg-purple-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
+                    className="w-full text-left px-3 py-2 text-xs rounded transition-colors cursor-pointer flex items-center gap-2"
+                    style={{ color: '#22d3ee' }}
+                    onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'rgba(8, 145, 178, 0.2)'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
                     onClick={(e) => {
                       e.stopPropagation();
                       handleAddNote(contextMenu.entry);
@@ -8083,17 +8277,47 @@ function Timeline({
                       })()}
                     </>
                   )}
-                  {/* Rewind — left side native, right side Gemini compact + native rewind. */}
+                  {/* Two DIFFERENT rewinds, separated by kind and by colour.
+                      Amber = native: the app drives the agent's own /rewind, the
+                      transcript on disk is untouched. Violet = rewrite: the span
+                      is removed from the history file and replaced by one
+                      summary. They used to sit in one amber split control where
+                      the right zone silently ran Gemini and pasted the result
+                      with no review window — the same operation as the selection
+                      Rewind, but with a different colour, name and behaviour. */}
                   {(() => {
                     const rewindAvailability = getRewindRequestState(contextMenu.entry);
                     const canStartRewind = rewindAvailability.canStart;
                     const rewindBusyTitle = rewindAvailability.reason || undefined;
+                    const nativeAgentSuffix = isCodex ? 'Codex' : isGemini ? 'Gemini' : 'Claude';
+                    const nativeLabel = rewindState
+                      ? (rewindState.phase === 'preparing'
+                        ? 'Preparing...'
+                        : rewindState.phase === 'compacting'
+                        ? 'Gemini...'
+                        : rewindState.phase === 'cancelling'
+                        ? 'Cancelling...'
+                        : rewindState.phase === 'committing'
+                        ? 'Finishing...'
+                        : rewindState.phase === 'rewinding'
+                        ? 'Rewind...'
+                        : rewindState.phase === 'done'
+                        ? 'Done'
+                        : 'Paste...')
+                      : 'Rewind (' + nativeAgentSuffix + ')';
+                    // Rewriting history needs a user entry it can actually cut
+                    // at; boundary rows are handled by the delete flow above.
+                    const canRewriteHistory = supportsEditRangeActions
+                      && !!sessionId
+                      && contextMenu.entry.type === 'user'
+                      && !contextMenu.entry.isCompactSummary;
                     return (
                       <>
                         <div className="border-t border-white/10 my-1" />
-                        <div className="flex rounded overflow-hidden">
+                        <Tooltip content={rewindBusyTitle || ('Нативный откат внутри ' + nativeAgentSuffix + ' — история на диске не меняется')}>
                           <button
-                            className={`flex-1 text-left px-3 py-2 text-xs rounded-l transition-colors ${canStartRewind ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                            data-testid="timeline-rewind-native-single"
+                            className={`w-full text-left px-3 py-2 text-xs rounded transition-colors flex items-center gap-2 ${canStartRewind ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
                             disabled={!canStartRewind}
                             title={rewindBusyTitle}
                             onClick={(e) => {
@@ -8101,36 +8325,54 @@ function Timeline({
                               requestRewind(contextMenu.entry, 'native', 'timeline-menu');
                             }}
                           >
-                            {rewindState
-                              ? (rewindState.phase === 'preparing'
-                                ? 'Preparing...'
-                                : rewindState.phase === 'compacting'
-                                ? 'Gemini...'
-                                : rewindState.phase === 'cancelling'
-                                ? 'Cancelling...'
-                                : rewindState.phase === 'committing'
-                                ? 'Finishing...'
-                                : rewindState.phase === 'rewinding'
-                                ? 'Rewind...'
-                                : rewindState.phase === 'done'
-                                ? 'Done'
-                                : 'Paste...')
-                              : 'Rewind'}
+                            <Repeat2 size={12} />
+                            {nativeLabel}
                           </button>
-                          <Tooltip content={rewindBusyTitle || 'Rewind через AI'}>
-                            <button
-                              className={`px-2 py-2 text-[10px] font-bold tracking-wide rounded-r transition-colors border-l border-white/10 ${canStartRewind ? 'text-amber-400/80 hover:bg-amber-600/30 hover:text-amber-300 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
-                              disabled={!canStartRewind}
-                              title={rewindBusyTitle}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                requestRewind(contextMenu.entry, 'ai', 'timeline-menu');
-                              }}
-                            >
-                              AI
-                            </button>
-                          </Tooltip>
-                        </div>
+                        </Tooltip>
+                        {canRewriteHistory && (
+                          // Same three zones as the selection Rewind: summary +
+                          // window, own instruction first, empty window.
+                          <div className="flex rounded overflow-hidden" data-testid="timeline-rewind-rewrite-single">
+                            <Tooltip content="Откат переписыванием истории: диапазон до конца заменится одной сводкой">
+                              <button
+                                className="flex-1 text-left px-3 py-2 text-xs text-violet-400 hover:bg-violet-600/20 transition-colors cursor-pointer flex items-center gap-2"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  requestHistoryRewrite(contextMenu.entry);
+                                }}
+                              >
+                                <Repeat2 size={12} />
+                                Rewind
+                              </button>
+                            </Tooltip>
+                            <Tooltip content="Добавить инструкцию к промпту">
+                              <button
+                                data-testid="timeline-rewind-rewrite-prompt-single"
+                                className="px-2 py-2 text-xs text-violet-400/60 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSinglePostPromptEntryUuid(contextMenu.entry.uuid);
+                                  setPostPromptText('');
+                                  setTimeout(() => postPromptRef.current?.focus(), 50);
+                                }}
+                              >
+                                ▶
+                              </button>
+                            </Tooltip>
+                            <Tooltip content="Открыть пустой чат (без Gemini)">
+                              <button
+                                data-testid="timeline-rewind-rewrite-empty-single"
+                                className="px-2 py-2 text-xs text-violet-400/60 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  requestHistoryRewrite(contextMenu.entry, { openEmptyWindow: true });
+                                }}
+                              >
+                                <Pencil size={11} />
+                              </button>
+                            </Tooltip>
+                          </div>
+                        )}
                       </>
                     );
                   })()}
@@ -8288,19 +8530,25 @@ function Timeline({
                     Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
                   </button>
                   {supportsEditRangeActions && (
-                    <div className="flex rounded overflow-hidden">
+                    // Same action as the single-point violet Rewind — history is
+                    // rewritten and the removed range is replaced by one summary.
+                    // Only the boundaries differ (selection instead of one click),
+                    // so it must not carry a different name: "Редактировать" read
+                    // as a fourth, unrelated operation.
+                    <div className="flex rounded overflow-hidden" data-testid="timeline-rewind-split-range">
                       <button
-                        className="flex-1 text-left px-3 py-2 text-xs text-pink-400 hover:bg-pink-600/20 transition-colors cursor-pointer"
+                        className="flex-1 text-left px-3 py-2 text-xs text-violet-400 hover:bg-violet-600/20 transition-colors cursor-pointer flex items-center gap-2"
                         onClick={(e) => {
                           e.stopPropagation();
                           executeRangeAction('edit', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
                         }}
                       >
-                        Редактировать
+                        <Repeat2 size={12} />
+                        Rewind
                       </button>
                       <Tooltip content="Добавить инструкцию к промпту">
                       <button
-                        className="px-2 py-2 text-xs text-pink-400/60 hover:bg-pink-600/30 hover:text-pink-300 transition-colors cursor-pointer border-l border-white/10"
+                        className="px-2 py-2 text-xs text-violet-400/60 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10"
                         onClick={(e) => {
                           e.stopPropagation();
                           setPostPromptMode(true);
@@ -8313,45 +8561,11 @@ function Timeline({
                       </Tooltip>
                       <Tooltip content="Открыть пустой чат (без Gemini)">
                       <button
-                        className="px-2 py-2 text-xs text-pink-400/60 hover:bg-pink-600/30 hover:text-pink-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
-                        onClick={async (e) => {
+                        className="px-2 py-2 text-xs text-violet-400/60 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
+                        onClick={(e) => {
                           e.stopPropagation();
                           const { range, startUuid, endUuid } = rangeActionMenu;
-                          // Validate same as edit mode.
-                          const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
-                          const hasCompact = rangeEntries.some(en => en.type === 'compact' || en.isCompactSummary);
-                          const hasContinued = rangeEntries.some(en => en.type === 'continued');
-                          if (!isCodex && (hasCompact || hasContinued)) {
-                            useUIStore.getState().showToast(
-                              hasCompact
-                                ? 'Нельзя редактировать диапазон с compact boundary'
-                                : 'Нельзя редактировать через Context Overflow recovery — только текущий сегмент',
-                              'error', 3000
-                            );
-                            return;
-                          }
-                          // Clear selection (mirror executeRangeAction)
-                          selectionStartIdRef.current = null;
-                          setSelectionStartId(null);
-                          setRangeActionMenu(null);
-                          setPostPromptMode(false);
-                          // Open panel immediately with empty compactText — user types own prompt
-                          if (!sessionId) return;
-                          try {
-                            const copyRangeChannel = isCodex ? 'codex:copy-range' : 'claude:copy-range';
-                            const result = await ipcRenderer.invoke(copyRangeChannel, {
-                              sessionId, cwd, startUuid, endUuid,
-                              ...copyFlags,
-                            });
-                            if (result.success) {
-                              setEditRangeState({ range, phase: 'ready', sourceContent: result.content, compactText: '', autoEditInitial: true });
-                            } else {
-                              useUIStore.getState().showToast('Не удалось собрать диапазон', 'error', 3000);
-                            }
-                          } catch (err: any) {
-                            console.error('[EditRange:ManualOpen] Failed:', err);
-                            useUIStore.getState().showToast('Ошибка: ' + (err.message || err), 'error', 3000);
-                          }
+                          void openEditRangeWithoutSummary(range, startUuid, endUuid);
                         }}
                       >
                         <Pencil size={11} />

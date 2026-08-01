@@ -27,26 +27,38 @@ type SidebarScrollSaveState = {
   lastSentAt: number;
   timer: ReturnType<typeof setTimeout> | null;
 };
-const sidebarScrollSaves = new Map<string, SidebarScrollSaveState>();
+// One throttle machine, two independent scroll surfaces (file sidebar and the
+// tab list). Keyed by channel so a tab-list scroll never coalesces with a file
+// tree scroll of the same project.
+const scrollSaveStates = new Map<string, SidebarScrollSaveState>();
 
-const flushSidebarScrollSave = (projectId: string) => {
-  const state = sidebarScrollSaves.get(projectId);
+const SCROLL_SAVE_CHANNELS = {
+  sidebar: 'project:save-sidebar-scroll-top',
+  tabList: 'project:save-tab-list-scroll-top',
+} as const;
+type ScrollSaveSurface = keyof typeof SCROLL_SAVE_CHANNELS;
+
+const scrollSaveKey = (surface: ScrollSaveSurface, projectId: string) => `${surface}:${projectId}`;
+
+const flushScrollSave = (surface: ScrollSaveSurface, projectId: string) => {
+  const state = scrollSaveStates.get(scrollSaveKey(surface, projectId));
   if (!state?.dirty) return;
   if (state.timer) clearTimeout(state.timer);
   state.timer = null;
   state.dirty = false;
   state.lastSentAt = Date.now();
-  void ipcRenderer.invoke('project:save-sidebar-scroll-top', {
+  void ipcRenderer.invoke(SCROLL_SAVE_CHANNELS[surface], {
     projectId,
     scrollTop: state.value,
   }).catch((error: unknown) => {
-    console.error('[Store] Failed to save sidebar scroll:', { projectId, error });
+    console.error('[Store] Failed to save scroll position:', { surface, projectId, error });
   });
 };
 
-const scheduleSidebarScrollSave = (projectId: string, scrollTop: number) => {
+const scheduleScrollSave = (surface: ScrollSaveSurface, projectId: string, scrollTop: number) => {
   const normalized = Number.isFinite(scrollTop) ? Math.max(0, scrollTop) : 0;
-  const state = sidebarScrollSaves.get(projectId) || {
+  const key = scrollSaveKey(surface, projectId);
+  const state = scrollSaveStates.get(key) || {
     value: normalized,
     dirty: false,
     lastSentAt: 0,
@@ -54,15 +66,45 @@ const scheduleSidebarScrollSave = (projectId: string, scrollTop: number) => {
   };
   state.value = normalized;
   state.dirty = true;
-  sidebarScrollSaves.set(projectId, state);
+  scrollSaveStates.set(key, state);
 
   const remaining = SIDEBAR_SCROLL_SAVE_INTERVAL_MS - (Date.now() - state.lastSentAt);
   if (remaining <= 0 && !state.timer) {
-    flushSidebarScrollSave(projectId);
+    flushScrollSave(surface, projectId);
     return;
   }
   if (!state.timer) {
-    state.timer = setTimeout(() => flushSidebarScrollSave(projectId), Math.max(0, remaining));
+    state.timer = setTimeout(() => flushScrollSave(surface, projectId), Math.max(0, remaining));
+  }
+};
+
+const scheduleSidebarScrollSave = (projectId: string, scrollTop: number) =>
+  scheduleScrollSave('sidebar', projectId, scrollTop);
+
+// Shutdown flush. The throttle above keeps the last scroll position in memory
+// for up to SIDEBAR_SCROLL_SAVE_INTERVAL_MS; on quit that pending write would
+// be lost, so the sidebar reopened after restart at a stale offset. Async
+// invoke() does not survive beforeunload — the pending values go out through
+// the same synchronous channel the tab save uses.
+export const flushScrollSavesSync = (): void => {
+  for (const [key, state] of scrollSaveStates) {
+    if (!state.dirty) continue;
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = null;
+    state.dirty = false;
+    const separator = key.indexOf(':');
+    const surface = key.slice(0, separator) as ScrollSaveSurface;
+    const projectId = key.slice(separator + 1);
+    if (!SCROLL_SAVE_CHANNELS[surface] || !projectId) continue;
+    try {
+      ipcRenderer.sendSync('project:save-scroll-top-sync', {
+        surface,
+        projectId,
+        scrollTop: state.value,
+      });
+    } catch (error) {
+      console.error('[Store] Failed to flush scroll position on shutdown:', { surface, projectId, error });
+    }
   }
 };
 
@@ -169,6 +211,7 @@ export interface CodexSessionAdoptionOptions {
     model: string;
     effort: string;
     proofAt: number;
+    fast?: boolean;
   } | null;
   codexSettingsProofInvalid?: boolean;
 }
@@ -506,6 +549,7 @@ export interface PendingAction {
 export interface TabHistoryRestoreEntry {
   id: number;
   project_id: string;
+  tab_id?: string | null;
   name: string;
   name_set_manually?: number | null;
   cwd: string;
@@ -551,7 +595,9 @@ export interface TabHistoryRestoreResult {
 interface TabHistoryRestoreOptions {
   background?: boolean;
   restorePosition?: boolean;
-  resumePolicy?: 'always' | 'if-process-was-running';
+  resumePolicy?: 'never' | 'always' | 'if-process-was-running';
+  expectedTabId?: string;
+  requireExactCwd?: boolean;
 }
 
 interface Tab {
@@ -563,7 +609,7 @@ interface Tab {
   colorSetManually?: boolean; // True if user changed color manually - prevents auto-color override
   nameSetManually?: boolean; // True if user renamed tab manually - prevents auto-rename on commandType detection
   commandType?: CommandType; // Type of running command (for restart button visibility)
-  isUtility?: boolean;
+  isUtility?: boolean; // Legacy persistence field; restored and saved as false.
   tabType?: TabType; // Terminal or browser tab
   url?: string; // URL for browser tabs
   filePath?: string; // Absolute file path for linked file tabs
@@ -579,6 +625,9 @@ interface Tab {
   codexLiveModel?: string; // Transient current-conversation model; never persisted
   codexLiveEffort?: string; // Ultra is conversation-only and lives here
   codexLiveSettingsSessionId?: string; // Exact writer that owns the transient pair
+  codexLiveServiceTier?: string; // Exact live tier; never read from mutable global config
+  codexLiveServiceTierSessionId?: string; // Exact launch generation or rollout that owns the proof
+  codexLiveServiceTierSource?: string; // Verified composer footer or exact /fast acknowledgement
   codexSettingsProofAt?: number; // Time of latest launch/picker/turn_context proof
   codexSettingsProofSessionId?: string; // Session that owns the settings proof
   codexModelMigrationPending?: boolean; // Old launch pair was invalidated before native migration Enter
@@ -851,13 +900,14 @@ interface ProjectWorkspace {
   openFilePath: string | null;
   sidebarExpandedDirs: Record<string, boolean> | null;
   sidebarScrollTop: number;
+  tabListScrollTop: number; // Vertical scroll of the tab list, per project
   currentView: 'terminal' | 'home'; // Per-project view state (Home vs Terminal)
   viewingSubAgentTabId: string | null; // When viewing a sub-agent, points to the Claude sub-agent tab
 }
 
 const restoreTabOptions = (savedTab: any) => ({
   color: savedTab.color,
-  isUtility: savedTab.isUtility,
+  isUtility: false,
   commandType: savedTab.commandType,
   claudeSessionId: savedTab.claudeSessionId,
   geminiSessionId: savedTab.geminiSessionId,
@@ -934,7 +984,7 @@ const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err
     name: savedTab.name || 'Restore failed',
     cwd: savedTab.cwd || workspace.projectPath || '',
     color: savedTab.color,
-    isUtility: savedTab.isUtility,
+    isUtility: false,
     commandType: savedTab.commandType,
     claudeSessionId: savedTab.claudeSessionId,
     geminiSessionId: savedTab.geminiSessionId,
@@ -962,8 +1012,8 @@ const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err
     filePath: savedTab.filePath,
     createdAt: savedTab.createdAt || Math.floor(Date.now() / 1000),
     isCollapsed: savedTab.isCollapsed,
-    groupId: savedTab.isUtility ? undefined : savedTab.groupId,
-    visualParentTabId: savedTab.isUtility ? undefined : savedTab.visualParentTabId,
+    groupId: savedTab.groupId,
+    visualParentTabId: savedTab.visualParentTabId,
     nameSetManually: savedTab.nameSetManually,
     sessionStatus: savedTab.sessionStatus,
     completionNotificationPersistent: savedTab.completionNotificationPersistent || undefined,
@@ -989,6 +1039,7 @@ const buildHistoryPendingAction = (
   entry: TabHistoryRestoreEntry,
   policy: TabHistoryRestoreOptions['resumePolicy'] = 'always'
 ): PendingAction | undefined => {
+  if (policy === 'never') return undefined;
   if (policy === 'if-process-was-running' && !entry.process_was_running) return undefined;
 
   if (entry.command_type === 'claude') {
@@ -1106,6 +1157,27 @@ const isAiBusyTab = (tab?: Pick<Tab, 'aiBusy' | 'claudeBusy' | 'sdkState'> | nul
   return !!(tab?.aiBusy || tab?.claudeBusy || isSdkBusyState(tab));
 };
 
+// Native macOS sheet instead of window.confirm: the latter blocks the renderer
+// thread, so terminal output and the closing loader freeze behind the prompt.
+// Fails closed — an undeliverable dialog must never authorize the close.
+const confirmDestructiveClose = async (options: {
+  message: string;
+  detail?: string;
+}): Promise<boolean> => {
+  try {
+    const result = await ipcRenderer.invoke('ui:confirm-destructive', {
+      message: options.message,
+      detail: options.detail,
+      confirmLabel: 'Закрыть вкладку',
+      cancelLabel: 'Отмена',
+    });
+    return result?.confirmed === true;
+  } catch (error: any) {
+    console.warn('[CloseTab] confirm dialog failed: ' + (error?.message || error));
+    return false;
+  }
+};
+
 const makeDefaultSavedTab = (workspace: ProjectWorkspace, cwd?: string | null, tabId?: string) => ({
   tabId: tabId || `${workspace.projectId}-tab-${workspace.tabCounter++}`,
   name: 'Terminal 1',
@@ -1182,8 +1254,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string) => Promise<TabHistoryRestoreResult>;
@@ -1204,7 +1276,7 @@ interface WorkspaceStore {
   // Reorder tabs
   reorderTabs: (projectId: string, oldIndex: number, newIndex: number) => void;
 
-  // Tab color and utility
+  // Tab color and status
   setTabColor: (projectId: string, tabId: string, color: TabColor, manual?: boolean) => void;
   setTabSessionStatus: (projectId: string, tabId: string, status: string | null) => void;
   setTabCompletionNotificationArmed: (projectId: string, tabId: string, armed: boolean) => void;
@@ -1220,12 +1292,10 @@ interface WorkspaceStore {
   getAiLaunchSnapshot: (tabId: string) => AiLaunchSnapshot | null;
   clearAiLaunchSnapshot: (tabId: string, reason?: string) => void;
   discardUnmaterializedAiLaunchSession: (tabId: string, reason: string) => Promise<boolean>;
-  toggleTabUtility: (projectId: string, tabId: string) => void;
   toggleTabCollapsed: (projectId: string, tabId: string) => void;
 
   // Advanced drag & drop
-  reorderInZone: (projectId: string, zone: 'main' | 'utility', orderedIds: string[]) => void;
-  moveTabToZone: (projectId: string, tabId: string, toUtility: boolean, atIndex: number, sourceIds?: string[]) => void;
+  reorderInZone: (projectId: string, zone: 'main', orderedIds: string[]) => void;
   moveTabToProject: (sourceProjectId: string, tabId: string, targetProjectId: string) => Promise<boolean>;
   moveTabsToProject: (sourceProjectId: string, tabIds: string[], targetProjectId: string) => Promise<boolean>;
   moveTabGroupToProject: (sourceProjectId: string, groupId: string, targetProjectId: string) => Promise<boolean>;
@@ -1268,6 +1338,7 @@ interface WorkspaceStore {
   getCodexSessionId: (tabId: string) => string | null;
   updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort' | 'codexSettingsProofAt' | 'codexSettingsProofSessionId' | 'codexModelMigrationPending' | 'codexModelMigrationRestoreDefaultModel' | 'codexModelMigrationRestoreDefaultEffort' | 'codexModelMigrationSourceModel' | 'codexModelMigrationSourceEffort' | 'codexModelMigrationTargetModel' | 'codexModelMigrationConfigPath' | 'codexModelMigrationConfigFingerprint' | 'codexModelMigrationConfigAlreadyTarget'>>) => void;
   updateCodexLiveState: (tabId: string, state: Pick<Tab, 'codexLiveModel' | 'codexLiveEffort' | 'codexLiveSettingsSessionId'>) => void;
+  updateCodexLiveServiceTier: (tabId: string, state: Pick<Tab, 'codexLiveServiceTier' | 'codexLiveServiceTierSessionId' | 'codexLiveServiceTierSource'>) => void;
   updateExternalRunMeta: (tabId: string, meta: Partial<NonNullable<Tab['externalRun']>>) => void;
 
   setClaudeActive: (tabId: string, alive: boolean) => void;
@@ -1327,6 +1398,8 @@ interface WorkspaceStore {
   rewriteFilePathReferences: (oldPath: string, newPath: string) => void;
   setSidebarExpandedDirs: (projectId: string, expandedDirs: Record<string, boolean>) => void;
   setSidebarScrollTop: (projectId: string, scrollTop: number) => void;
+  setTabListScrollTop: (projectId: string, scrollTop: number) => void;
+  getTabListScrollTop: (projectId: string) => number;
   getSidebarState: (projectId: string) => {
     sidebarOpen: boolean;
     openFilePath: string | null;
@@ -1388,7 +1461,7 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     name: tab.name,
     cwd: tab.cwd,
     color: tab.color,
-    isUtility: tab.isUtility,
+    isUtility: false,
     commandType: tab.commandType, // Preserve to prevent auto-rename on resume
     claudeSessionId: tab.claudeSessionId,
     geminiSessionId: tab.geminiSessionId,
@@ -1647,6 +1720,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           openFilePath: isInbox ? null : (projectData?.openFilePath || null),
           sidebarExpandedDirs: isInbox ? null : (projectData?.sidebarExpandedDirs || null),
           sidebarScrollTop: isInbox ? 0 : Math.max(0, Number(projectData?.sidebarScrollTop) || 0),
+          tabListScrollTop: Math.max(0, Number(projectData?.tabListScrollTop) || 0),
           currentView: isInbox && savedTabs.length === 0 ? 'home' : 'terminal',
           viewingSubAgentTabId: null
         };
@@ -1979,6 +2053,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         openFilePath: isInbox ? null : (projectData?.openFilePath || null),
         sidebarExpandedDirs: isInbox ? null : (projectData?.sidebarExpandedDirs || null),
         sidebarScrollTop: isInbox ? 0 : Math.max(0, Number(projectData?.sidebarScrollTop) || 0),
+        tabListScrollTop: Math.max(0, Number(projectData?.tabListScrollTop) || 0),
         currentView: draft || isInbox ? 'home' : 'terminal',
         viewingSubAgentTabId: null
       };
@@ -2202,7 +2277,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       name: tabName,
       cwd: cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath) || process.env.HOME || '~',
       color: options?.color,
-      isUtility: options?.isUtility,
+      isUtility: false,
       commandType: options?.commandType,
       pendingAction: options?.pendingAction,
       claudeSessionId: options?.claudeSessionId,
@@ -2231,8 +2306,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       filePath: (options as any)?.filePath,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
       isCollapsed: (options as any)?.isCollapsed,
-      groupId: options?.isUtility ? undefined : options?.groupId,
-      visualParentTabId: options?.isUtility ? undefined : (options as any)?.visualParentTabId,
+      groupId: options?.groupId,
+      visualParentTabId: (options as any)?.visualParentTabId,
       nameSetManually: (options as any)?.nameSetManually,
       sessionStatus: (options as any)?.sessionStatus,
       completionNotificationPersistent: (options as any)?.completionNotificationPersistent || undefined,
@@ -2327,7 +2402,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return '';
     }
 
-    const tabId = `${projectId}-tab-${workspace.tabCounter}`;
+    const tabId = (options as any)?.restoreId || `${projectId}-tab-${workspace.tabCounter}`;
     workspace.tabCounter++;
 
     // Smart naming: find next available name if not provided
@@ -2335,33 +2410,29 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const tabName = name || getNextAvailableName('tab', existingNames);
 
     const explicitGroupId = resolveExistingTabGroupId(workspace, options?.groupId);
-    const activeGroupId = !options?.isUtility ? resolveExistingTabGroupId(workspace, workspace.activeGroupId) : undefined;
+    const activeGroupId = resolveExistingTabGroupId(workspace, workspace.activeGroupId);
     const referenceTabForGroup = options?.afterTabId || workspace.activeTabId || undefined;
     const referenceTab = referenceTabForGroup ? workspace.tabs.get(referenceTabForGroup) : undefined;
-    const inheritedVisualParentId = !options?.isUtility && !activeGroupId
+    const inheritedVisualParentId = !activeGroupId
       ? referenceTab?.visualParentTabId
       : undefined;
-    const requestedVisualParentId = options?.isUtility
-      ? undefined
-      : (options?.visualParentTabId || inheritedVisualParentId);
+    const requestedVisualParentId = options?.visualParentTabId || inheritedVisualParentId;
     const visualParentTab = requestedVisualParentId ? workspace.tabs.get(requestedVisualParentId) : undefined;
-    const visualParentTabId = visualParentTab && !visualParentTab.isUtility && !visualParentTab.parentTabId
+    const visualParentTabId = visualParentTab && !visualParentTab.parentTabId
       ? requestedVisualParentId
       : undefined;
     const referenceGroupId = referenceTabForGroup
       ? resolveExistingTabGroupId(workspace, referenceTab?.groupId)
       : undefined;
     const visualParentGroupId = resolveExistingTabGroupId(workspace, visualParentTab?.groupId);
-    const targetGroupId = options?.isUtility
-      ? undefined
-      : (explicitGroupId || activeGroupId || referenceGroupId || visualParentGroupId);
+    const targetGroupId = explicitGroupId || activeGroupId || referenceGroupId || visualParentGroupId;
 
     const newTab: Tab = {
       id: tabId,
       name: tabName,
       cwd: cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath) || process.env.HOME || '~',
       color: options?.color,
-      isUtility: options?.isUtility,
+      isUtility: false,
       commandType: options?.commandType,
       pendingAction: options?.pendingAction,
       claudeSessionId: options?.claudeSessionId,
@@ -2432,50 +2503,27 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Insert after specified tab/current tab. When a group-row owns logical focus,
     // Cmd+T/add-new should append inside that group, not after the stale active tab.
     const tabsArray = Array.from(workspace.tabs.entries());
-    const isUtility = options?.isUtility || false;
-    const groupMemberIds = targetGroupId && !isUtility
+    const groupMemberIds = targetGroupId
       ? tabsArray
-        .filter(([, tab]) => !tab.parentTabId && !tab.isUtility && tab.groupId === targetGroupId)
+        .filter(([, tab]) => !tab.parentTabId && tab.groupId === targetGroupId)
         .map(([id]) => id)
       : [];
-    const referenceTabId = !isUtility && targetGroupId && !options?.afterTabId
+    const referenceTabId = targetGroupId && !options?.afterTabId
       ? (groupMemberIds[groupMemberIds.length - 1] || undefined)
       : (options?.afterTabId || workspace.activeTabId);
 
-    // Find position: after reference tab in same zone, or at end of zone
+    // Find position after the logical reference, or at the group's anchor.
     let insertIndex = tabsArray.length;
 
-    if (!isUtility && targetGroupId && !referenceTabId) {
+    if (targetGroupId && !referenceTabId) {
       const targetGroup = workspace.tabGroups.find(group => group.id === targetGroupId);
       const anchorIndex = targetGroup?.anchorTabId
-        ? tabsArray.findIndex(([id, tab]) => id === targetGroup.anchorTabId && !tab.isUtility)
+        ? tabsArray.findIndex(([id]) => id === targetGroup.anchorTabId)
         : -1;
-      if (anchorIndex >= 0) {
-        insertIndex = anchorIndex;
-      } else {
-        const firstUtilityIndex = tabsArray.findIndex(([_, tab]) => tab.isUtility);
-        insertIndex = firstUtilityIndex === -1 ? tabsArray.length : firstUtilityIndex;
-      }
-    } else if (referenceTabId && !isUtility) {
-      // Find reference tab index
+      if (anchorIndex >= 0) insertIndex = anchorIndex;
+    } else if (referenceTabId) {
       const currentIndex = tabsArray.findIndex(([id]) => id === referenceTabId);
-      if (currentIndex !== -1) {
-        // Find the first utility tab to know where main zone ends
-        const firstUtilityIndex = tabsArray.findIndex(([_, tab]) => tab.isUtility);
-        if (firstUtilityIndex === -1) {
-          // No utility tabs, insert right after reference
-          insertIndex = currentIndex + 1;
-        } else if (currentIndex < firstUtilityIndex) {
-          // Reference is in main zone, insert after it but before utility zone
-          insertIndex = Math.min(currentIndex + 1, firstUtilityIndex);
-        }
-      }
-    } else if (referenceTabId && isUtility) {
-      // Insert after reference utility tab
-      const currentIndex = tabsArray.findIndex(([id]) => id === referenceTabId);
-      if (currentIndex !== -1 && tabsArray[currentIndex]?.[1]?.isUtility) {
-        insertIndex = currentIndex + 1;
-      }
+      if (currentIndex !== -1) insertIndex = currentIndex + 1;
     }
 
     // Insert tab at calculated position
@@ -2544,16 +2592,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
       if (!skipProcessCheck && commandState.isRunning) {
         if (isAiTab && (foregroundAiProcess || !runningProcessInfo?.hasProcess)) {
+          // A live agent session is not a reason to ask — only an agent that is
+          // mid-answer is, because closing then discards work in flight. An idle
+          // session means history/Continue, not risk.
           if (aiBusyAtClose) {
-            const confirmed = window.confirm(
-              'AI-сессия сейчас отвечает. Остановить её и закрыть вкладку?'
-            );
+            const confirmed = await confirmDestructiveClose({
+              message: 'Хотите закрыть вкладку? Активный процесс',
+              detail: 'AI-сессия сейчас отвечает. Вкладка закроется, ответ будет прерван.',
+            });
             if (!confirmed) return false;
           }
         } else {
-          const confirmed = window.confirm(
-            `Terminal has a running process: "${runningProcessInfo?.processName || 'unknown'}"\n\nAre you sure you want to close this tab?`
-          );
+          const confirmed = await confirmDestructiveClose({
+            message: 'Хотите закрыть вкладку? Активный процесс',
+            detail: 'В терминале выполняется «' + (runningProcessInfo?.processName || 'неизвестный процесс') + '». Он будет остановлен.',
+          });
           if (!confirmed) return false;
         }
       }
@@ -2563,9 +2616,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (tab.tabType === 'claude-sdk') {
       processWasRunning = aiBusyAtClose;
       if (!skipProcessCheck && aiBusyAtClose) {
-        const confirmed = window.confirm(
-          'Claude SDK сейчас отвечает. Остановить сессию и закрыть вкладку?'
-        );
+        const confirmed = await confirmDestructiveClose({
+          message: 'Хотите закрыть вкладку? Активный процесс',
+          detail: 'Claude SDK сейчас отвечает. Вкладка закроется, ответ будет прерван.',
+        });
         if (!confirmed) return false;
       }
     }
@@ -2573,11 +2627,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const shouldStopAiProcess = isAiTab
       && (aiBusyAtClose || (processWasRunning && (foregroundAiProcess || !runningProcessInfo?.hasProcess)));
 
-    // Compute TabBar position at close time (excluding sub-agent / utility
-    // tabs — they don't take a slot in the bar). Used as a placement hint by
+    // Compute TabBar position at close time (excluding sub-agent tabs, which
+    // don't take a slot in the bar). Used as a placement hint by
     // reopenLastClosedTab.
     const orderedMainTabs = Array.from(workspace.tabs.values())
-      .filter(t => !t.parentTabId && !t.isUtility);
+      .filter(t => !t.parentTabId);
     const closedPosition = orderedMainTabs.findIndex(t => t.id === tabId);
 
     // File tabs are linked document previews, not restorable terminal/AI sessions.
@@ -2638,11 +2692,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Nothing below this point may run until a requested History row is
     // durably committed. On archive failure the live process and tab stay
     // intact, so the user can retry instead of losing the only copy.
-    if (shouldStopAiProcess) {
+    //
+    // Any close that has to terminate something takes measurable time (graceful
+    // Ctrl+C plus flush is up to ~1.2s for a busy agent). Show the shutdown
+    // loader in place of the tab title for the whole of it — a tab that just
+    // sits there after the click reads as "the close did not work", which is
+    // exactly how the broken Codex path was reported.
+    const showsClosingLoader = shouldStopAiProcess || processWasRunning;
+    if (showsClosingLoader) {
       tab.aiClosing = true;
       startTransition(() => {
         set({ openProjects: new Map(openProjects) });
       });
+    }
+    if (shouldStopAiProcess) {
       try {
         if (tab.tabType === 'claude-sdk') {
           await Promise.race([
@@ -2723,19 +2786,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     workspace.tabHistory = workspace.tabHistory.filter(id => id !== tabId);
 
     if (workspace.activeTabId === tabId) {
-      // Find next tab from history (LRU: last visited that still exists and is not utility)
+      // Find next tab from history (LRU: last visited that still exists).
       let nextTabId: string | null = null;
       for (let i = workspace.tabHistory.length - 1; i >= 0; i--) {
         const candidateId = workspace.tabHistory[i];
         const candidate = workspace.tabs.get(candidateId);
-        if (candidate && !candidate.isUtility) {
+        if (candidate) {
           nextTabId = candidateId;
           break;
         }
       }
-      // Fallback: last Main tab if history didn't help
+      // Fallback: last tab if history didn't help.
       if (!nextTabId) {
-        const mainTabs = Array.from(workspace.tabs.values()).filter(t => !t.isUtility);
+        const mainTabs = Array.from(workspace.tabs.values());
         if (mainTabs.length > 0) {
           nextTabId = mainTabs[mainTabs.length - 1].id;
         }
@@ -2796,14 +2859,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     const entry = lease.entry as TabHistoryRestoreEntry;
-    const background = options.background === true;
-    const mainTabIds = Array.from(workspace.tabs.values())
-      .filter(tab => !tab.parentTabId && !tab.isUtility)
-      .map(tab => tab.id);
-    const hintedPosition = typeof entry.position === 'number' ? entry.position : mainTabIds.length;
-    const targetIndex = Math.max(0, Math.min(mainTabIds.length, hintedPosition));
-    const restoredGroupId = resolveExistingTabGroupId(workspace, entry.group_id);
-
     const finishLease = async (commit: boolean) => {
       try {
         return await ipcRenderer.invoke('project:finish-tab-history-restore', {
@@ -2822,8 +2877,48 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         return { ok: false, reason: 'ipc_failed' };
       }
     };
+    const expectedTabId = typeof options.expectedTabId === 'string'
+      ? options.expectedTabId.trim()
+      : '';
+    if (expectedTabId && entry.tab_id !== expectedTabId) {
+      await finishLease(false);
+      return {
+        tabId: null,
+        historyId: entry.id,
+        reason: 'error',
+        message: 'Архивная запись не принадлежит запрошенной вкладке',
+      };
+    }
+    if (expectedTabId && workspace.tabs.has(expectedTabId)) {
+      await finishLease(false);
+      return {
+        tabId: null,
+        historyId: entry.id,
+        reason: 'busy',
+        message: 'Вкладка уже открыта',
+      };
+    }
+    const background = options.background === true;
+    const mainTabIds = Array.from(workspace.tabs.values())
+      .filter(tab => !tab.parentTabId)
+      .map(tab => tab.id);
+    const hintedPosition = typeof entry.position === 'number' ? entry.position : mainTabIds.length;
+    const targetIndex = Math.max(0, Math.min(mainTabIds.length, hintedPosition));
+    const restoredGroupId = resolveExistingTabGroupId(workspace, entry.group_id);
 
     const restoreCwd = await resolveHistoryRestoreCwd(entry, workspace.projectPath);
+    if (options.requireExactCwd === true
+      && normalizeComparablePath(restoreCwd.cwd) !== normalizeComparablePath(entry.cwd)) {
+      await finishLease(false);
+      return {
+        tabId: null,
+        historyId: entry.id,
+        reason: 'error',
+        message: 'Сохранённая рабочая папка вкладки больше недоступна',
+        cwd: restoreCwd.cwd,
+        fallbackFrom: restoreCwd.fallbackFrom,
+      };
+    }
     if (restoreCwd.requiresConfirmation) {
       let confirmed = false;
       if (normalizeComparablePath(restoreCwd.cwd) === '/') {
@@ -2885,6 +2980,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         nameSetManually: entry.name_set_manually === 1,
         groupId: restoredGroupId,
         background,
+        restoreId: expectedTabId || undefined,
       });
       if (!newTabId) throw new Error('create_tab_returned_empty');
     } catch (error) {
@@ -2912,9 +3008,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const newEntryIndex = entries.findIndex(([id]) => id === newTabId);
       if (newEntryIndex !== -1) {
         const [newEntry] = entries.splice(newEntryIndex, 1);
-        const utilityStart = entries.findIndex(([, tab]) => tab.isUtility);
-        const mainEnd = utilityStart === -1 ? entries.length : utilityStart;
-        entries.splice(Math.min(targetIndex, mainEnd), 0, newEntry);
+        entries.splice(Math.min(targetIndex, entries.length), 0, newEntry);
         after.tabs = new Map(entries);
         set({ openProjects: new Map(currentState.openProjects) });
       }
@@ -3589,20 +3683,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return false;
   },
 
-  toggleTabUtility: (projectId, tabId) => {
-    const { openProjects } = get();
-    const workspace = openProjects.get(projectId);
-
-    if (workspace) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab) {
-        tab.isUtility = !tab.isUtility;
-        set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectId, workspace.tabs);
-      }
-    }
-  },
-
   toggleTabCollapsed: (projectId, tabId) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
@@ -3621,96 +3701,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
-    if (!workspace) return;
+    if (!workspace || zone !== 'main') return;
 
-    // Get all tabs
-    const allTabs = Array.from(workspace.tabs.entries());
-    const isUtilityZone = zone === 'utility';
-
-    // Separate tabs by zone
-    const zoneTabs = allTabs.filter(([_, tab]) => !!tab.isUtility === isUtilityZone);
-    const otherTabs = allTabs.filter(([_, tab]) => !!tab.isUtility !== isUtilityZone);
-
-    // Reorder zone tabs according to orderedIds
-    const reorderedZoneTabs = orderedIds
-      .map(id => zoneTabs.find(([tabId]) => tabId === id))
-      .filter(Boolean) as [string, any][];
-
-    // Rebuild Map: utility tabs first, then main tabs (or vice versa based on preference)
-    // We'll keep utility tabs at the end of the Map
-    const newTabs = new Map<string, any>();
-
-    if (isUtilityZone) {
-      // Main tabs first, then reordered utility
-      otherTabs.forEach(([id, tab]) => newTabs.set(id, tab));
-      reorderedZoneTabs.forEach(([id, tab]) => newTabs.set(id, tab));
-    } else {
-      // Reordered main tabs first, then utility
-      reorderedZoneTabs.forEach(([id, tab]) => newTabs.set(id, tab));
-      otherTabs.forEach(([id, tab]) => newTabs.set(id, tab));
+    const orderedSet = new Set(orderedIds);
+    const newTabs = new Map<string, Tab>();
+    for (const id of orderedIds) {
+      const tab = workspace.tabs.get(id);
+      if (tab) newTabs.set(id, tab);
+    }
+    // Preserve non-rendered children and any concurrently-created tabs. A
+    // reorder projection only owns the IDs it explicitly lists.
+    for (const [id, tab] of workspace.tabs) {
+      if (!orderedSet.has(id)) newTabs.set(id, tab);
     }
 
     workspace.tabs = newTabs;
-    set({ openProjects: new Map(openProjects) });
-    saveTabs(workspace.projectId, workspace.tabs);
-  },
-
-  moveTabToZone: (projectId, tabId, toUtility, atIndex, sourceIds) => {
-    const { openProjects } = get();
-    const workspace = openProjects.get(projectId);
-
-    if (!workspace) return;
-
-    const tab = workspace.tabs.get(tabId);
-    if (!tab) return;
-
-    const requestedIds = sourceIds?.length ? sourceIds : [tabId];
-    const movingIds = new Set(requestedIds.filter(id => workspace.tabs.has(id)));
-    const queue = [...movingIds];
-    while (queue.length > 0) {
-      const parentId = queue.shift()!;
-      for (const candidate of workspace.tabs.values()) {
-        if (candidate.visualParentTabId !== parentId || movingIds.has(candidate.id)) continue;
-        movingIds.add(candidate.id);
-        queue.push(candidate.id);
-      }
-    }
-    if (!movingIds.has(tabId)) movingIds.add(tabId);
-
-    const allTabs = Array.from(workspace.tabs.entries());
-    const movingTabs = allTabs.filter(([id]) => movingIds.has(id));
-    for (const [id, movingTab] of movingTabs) {
-      movingTab.isUtility = toUtility;
-      movingTab.groupId = undefined;
-      if (!movingTab.visualParentTabId || movingIds.has(movingTab.visualParentTabId)) continue;
-      movingTab.visualParentTabId = undefined;
-    }
-
-    const stationaryTabs = allTabs.filter(([id]) => !movingIds.has(id));
-    const targetZoneTabs = stationaryTabs.filter(([_, candidate]) => !!candidate.isUtility === toUtility);
-    const otherZoneTabs = stationaryTabs.filter(([_, candidate]) => !!candidate.isUtility !== toUtility);
-    const insertIndex = Math.max(0, Math.min(atIndex, targetZoneTabs.length));
-    targetZoneTabs.splice(insertIndex, 0, ...movingTabs);
-
-    // Rebuild Map
-    const newTabs = new Map<string, any>();
-
-    if (toUtility) {
-      // Main tabs first, then utility (with moved tab)
-      otherZoneTabs.forEach(([id, t]) => newTabs.set(id, t));
-      targetZoneTabs.forEach(([id, t]) => newTabs.set(id, t));
-    } else {
-      // Main tabs (with moved tab) first, then utility
-      targetZoneTabs.forEach(([id, t]) => newTabs.set(id, t));
-      otherZoneTabs.forEach(([id, t]) => newTabs.set(id, t));
-    }
-
-    workspace.tabs = newTabs;
-    console.log(
-      `[TabDnd:zone-apply] project=${dndShortId(projectId)}` +
-      ` source=${dndShortId(tabId)} zone=${toUtility ? 'utility' : 'main'}` +
-      ` insertIndex=${insertIndex} ids=${summarizeDndIds(movingTabs.map(([id]) => id))}`
-    );
     set({ openProjects: new Map(openProjects) });
     saveTabs(workspace.projectId, workspace.tabs);
   },
@@ -4126,7 +4131,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!workspace) return;
 
     const tab = workspace.tabs.get(tabId);
-    if (!tab || tab.parentTabId || tab.isUtility) return;
+    if (!tab || tab.parentTabId) return;
 
     const nextParentId = parentTabId || undefined;
     if (!nextParentId) {
@@ -4138,7 +4143,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     if (nextParentId === tabId) return;
     const parent = workspace.tabs.get(nextParentId);
-    if (!parent || parent.parentTabId || parent.isUtility) return;
+    if (!parent || parent.parentTabId) return;
 
     let cursor: string | undefined = nextParentId;
     const seen = new Set<string>([tabId]);
@@ -4163,11 +4168,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     const existing = workspace.tabs;
     const previousMainOrder = Array.from(existing.values())
-      .filter(tab => !tab.parentTabId && !tab.isUtility)
+      .filter(tab => !tab.parentTabId)
       .map(tab => tab.id);
     const previousMembersByGroup = new Map<string, string[]>();
     for (const tab of existing.values()) {
-      if (tab.parentTabId || tab.isUtility || !tab.groupId) continue;
+      tab.isUtility = false;
+      if (tab.parentTabId || !tab.groupId) continue;
       const members = previousMembersByGroup.get(tab.groupId) || [];
       members.push(tab.id);
       previousMembersByGroup.set(tab.groupId, members);
@@ -4205,7 +4211,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const parentId = tab.visualParentTabId;
       if (!parentId) continue;
       const parent = workspace.tabs.get(parentId);
-      if (!parent || parent === tab || parent.parentTabId || parent.isUtility || parent.groupId !== tab.groupId) {
+      if (!parent || parent === tab || parent.parentTabId || parent.groupId !== tab.groupId) {
         tab.visualParentTabId = undefined;
         continue;
       }
@@ -4222,7 +4228,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
     const nextMembersByGroup = new Map<string, string[]>();
     for (const tab of workspace.tabs.values()) {
-      if (tab.parentTabId || tab.isUtility || !tab.groupId) continue;
+      if (tab.parentTabId || !tab.groupId) continue;
       const members = nextMembersByGroup.get(tab.groupId) || [];
       members.push(tab.id);
       nextMembersByGroup.set(tab.groupId, members);
@@ -4250,7 +4256,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (Object.keys(resolvedGroupAnchorAssignments).length > 0) {
       const mainTabIds = new Set(
         Array.from(workspace.tabs.values())
-          .filter(tab => !tab.parentTabId && !tab.isUtility)
+          .filter(tab => !tab.parentTabId)
           .map(tab => tab.id)
       );
       workspace.tabGroups = workspace.tabGroups.map(group => {
@@ -4265,7 +4271,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       });
     }
     const nextMainOrder = Array.from(workspace.tabs.values())
-      .filter(tab => !tab.parentTabId && !tab.isUtility)
+      .filter(tab => !tab.parentTabId)
       .map(tab => tab.id);
     console.log(
       `[TabDnd:apply] project=${dndShortId(projectId)}` +
@@ -4606,6 +4612,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             tab.codexLiveSettingsSessionId = undefined;
           }
         }
+        if (tab.codexLiveServiceTierSessionId
+          && tab.codexLiveServiceTierSessionId !== sessionId) {
+          if (carriesLiveSettings && tab.codexLiveServiceTierSessionId === prev) {
+            tab.codexLiveServiceTierSessionId = sessionId;
+          } else {
+            tab.codexLiveServiceTier = undefined;
+            tab.codexLiveServiceTierSessionId = undefined;
+            tab.codexLiveServiceTierSource = undefined;
+          }
+        }
         if (carriesLiveSettings && tab.codexSettingsProofAt) {
           // Native Rewind keeps the same live Codex process/settings while its
           // rollout writer moves from the source to the proven child.
@@ -4741,6 +4757,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       tab.codexLiveEffort = state.codexLiveEffort;
       tab.codexLiveSettingsSessionId = state.codexLiveSettingsSessionId;
       // Deliberately no saveTabs: this state describes one live writer only.
+      set({});
+      return;
+    }
+  },
+
+  updateCodexLiveServiceTier: (tabId, state) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+      if (
+        tab.codexLiveServiceTier === state.codexLiveServiceTier
+        && tab.codexLiveServiceTierSessionId === state.codexLiveServiceTierSessionId
+        && tab.codexLiveServiceTierSource === state.codexLiveServiceTierSource
+      ) {
+        return;
+      }
+      tab.codexLiveServiceTier = state.codexLiveServiceTier;
+      tab.codexLiveServiceTierSessionId = state.codexLiveServiceTierSessionId;
+      tab.codexLiveServiceTierSource = state.codexLiveServiceTierSource;
+      // Deliberately no saveTabs: this proof belongs to the current PTY
+      // generation and is rebuilt from Codex's own footer/acknowledgement.
       set({});
       return;
     }
@@ -5206,7 +5244,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (changed) {
         // Save synchronously — saveTabs uses async invoke() which won't complete during pkill
         const tabsArray = Array.from(workspace.tabs.values()).map((tab) => ({
-          name: tab.name, cwd: tab.cwd, color: tab.color, isUtility: tab.isUtility,
+          name: tab.name, cwd: tab.cwd, color: tab.color, isUtility: false,
           commandType: tab.commandType, claudeSessionId: tab.claudeSessionId,
           geminiSessionId: tab.geminiSessionId, codexSessionId: tab.codexSessionId,
           codexModel: tab.codexModel, codexEffort: tab.codexEffort, codexSettingsProofAt: tab.codexSettingsProofAt, codexSettingsProofSessionId: tab.codexSettingsProofSessionId, codexModelMigrationPending: tab.codexModelMigrationPending, codexModelMigrationRestoreDefaultModel: tab.codexModelMigrationRestoreDefaultModel, codexModelMigrationRestoreDefaultEffort: tab.codexModelMigrationRestoreDefaultEffort, codexModelMigrationSourceModel: tab.codexModelMigrationSourceModel, codexModelMigrationSourceEffort: tab.codexModelMigrationSourceEffort, codexModelMigrationTargetModel: tab.codexModelMigrationTargetModel, codexModelMigrationConfigPath: tab.codexModelMigrationConfigPath, codexModelMigrationConfigFingerprint: tab.codexModelMigrationConfigFingerprint, codexModelMigrationConfigAlreadyTarget: tab.codexModelMigrationConfigAlreadyTarget, externalRun: tab.externalRun, sessionStatus: tab.sessionStatus, wasInterrupted: tab.wasInterrupted,
@@ -5295,7 +5333,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         sidebarOpen: open,
         openFilePath: workspace.openFilePath
       });
-      if (!open) flushSidebarScrollSave(projectId);
+      if (!open) flushScrollSave('sidebar', projectId);
     }
   },
 
@@ -5332,6 +5370,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const normalized = Number.isFinite(Number(scrollTop)) ? Math.max(0, Number(scrollTop)) : 0;
     workspace.sidebarScrollTop = normalized;
     scheduleSidebarScrollSave(projectId, normalized);
+  },
+
+  // Tab list scroll follows the file sidebar contract: mutate the workspace in
+  // place (no set() — scrolling must not re-render every subscriber) and let the
+  // throttle write to SQLite. Read back through getTabListScrollTop on mount.
+  setTabListScrollTop: (projectId, scrollTop) => {
+    const workspace = get().openProjects.get(projectId);
+    if (!workspace) return;
+    const normalized = Number.isFinite(Number(scrollTop)) ? Math.max(0, Number(scrollTop)) : 0;
+    if (workspace.tabListScrollTop === normalized) return;
+    workspace.tabListScrollTop = normalized;
+    scheduleScrollSave('tabList', projectId, normalized);
+  },
+
+  getTabListScrollTop: (projectId) => {
+    const workspace = get().openProjects.get(projectId);
+    return Math.max(0, Number(workspace?.tabListScrollTop) || 0);
   },
 
   getSidebarState: (projectId) => {

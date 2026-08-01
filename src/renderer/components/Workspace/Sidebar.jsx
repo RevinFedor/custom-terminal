@@ -22,11 +22,20 @@ import Tooltip from '../UI/Tooltip'
 import ControlHint from '../UI/ControlHint'
 import IconCropper from './IconCropper'
 import { RunAfterTabPicker } from './RunAfterTabPicker'
+import { useWorkspaceStore } from '../../store/useWorkspaceStore'
 import { getValue, setValue } from '../../utils/storage'
+import { linkedFileSessionChipSnapshot } from '../../utils/linkedFileSessionChips.mjs'
 
 const CUSTOM_TERMINAL_ICON_IMPORT_KEY = import.meta.env.DEV
   ? 'customTerminalDevelopment'
   : 'customTerminalProduction'
+
+const SESSION_CHIP_COLORS = {
+  claude: '#DA7756',
+  codex: '#10A37F',
+  gemini: '#4E86F8',
+  default: '#A78BFA',
+}
 
 // --- Sort Comparator ---
 
@@ -372,6 +381,25 @@ function Sidebar({
   linkOwnerProjectId = null,
   onLinkFile,
 }) {
+  const linkedFileSessionSnapshot = useWorkspaceStore(useCallback((state) => {
+    const workspace = linkOwnerProjectId
+      ? state.openProjects.get(linkOwnerProjectId)
+      : null
+    return linkedFileSessionChipSnapshot(workspace?.tabs)
+  }, [linkOwnerProjectId]))
+  const linkedFileSessionsByPath = useMemo(() => {
+    const byPath = new Map()
+    let chips = []
+    try {
+      chips = JSON.parse(linkedFileSessionSnapshot)
+    } catch {}
+    for (const chip of chips) {
+      const existing = byPath.get(chip.filePath) || []
+      existing.push(chip)
+      byPath.set(chip.filePath, existing)
+    }
+    return byPath
+  }, [linkedFileSessionSnapshot])
   const [treeData, setTreeData] = useState([])
   const [contextMenu, setContextMenu] = useState(null)
   const [fileIconProfile, setFileIconProfile] = useState(() => (
@@ -1337,6 +1365,81 @@ function Sidebar({
     // Adapter for legacy select if needed, but we pass onFileSelect directly
   }, [])
 
+  const renderLinkedSessionChips = useCallback(({ row, isFolder }) => {
+    if (isFolder) return null
+    const chips = linkedFileSessionsByPath.get(row.id) || []
+    if (chips.length === 0) return null
+    // Slightly larger than the old half-size: at fontSize/2 the session name
+    // was unreadable next to the file name it annotates.
+    const chipFontSize = Math.max(7, Math.round(fontSize / 2) + 1)
+    return (
+      <div
+        className="file-row-session-chips-wrap"
+        data-no-outline-drag
+        data-outline-dnd-ignore
+        onClick={event => event.stopPropagation()}
+      >
+      <div
+        className="file-row-project-chips file-row-session-chips"
+        data-no-outline-drag
+        data-outline-dnd-ignore
+      >
+        {chips.map(chip => {
+          const accent = SESSION_CHIP_COLORS[chip.sessionKind] || SESSION_CHIP_COLORS.default
+          return (
+            <button
+              key={chip.sessionTabId}
+              type="button"
+              className="file-row-project-chip file-row-session-chip"
+              data-file-session-chip={chip.sessionTabId}
+              data-session-kind={chip.sessionKind}
+              data-no-outline-drag
+              data-outline-dnd-ignore
+              title={`Открыть сессию «${chip.sessionName}»`}
+              // Only typography and the session tint are inline; the tab-like
+              // box (radius, border, padding) and the placement under the file
+              // live in sidebar.css. The alpha steps mirror TAB_COLORS so a
+              // chip reads as the same object as the tab it opens.
+              style={{
+                fontSize: chipFontSize,
+                lineHeight: 1.3,
+                ['--file-session-chip-accent']: `${accent}99`,
+                ['--file-session-chip-bg']: `${accent}33`,
+                ['--file-session-chip-bg-hover']: `${accent}55`,
+              }}
+              onClick={event => {
+                event.stopPropagation()
+                if (!linkOwnerProjectId) return
+                const state = useWorkspaceStore.getState()
+                state.setProjectView(linkOwnerProjectId, 'terminal')
+                state.switchTab(linkOwnerProjectId, chip.sessionTabId)
+              }}
+            >
+              {chip.sessionName}
+            </button>
+          )
+        })}
+      </div>
+      {chips.length > 1 && (
+        // Pinned total, outside the scroller: with the strip scrolled the user
+        // otherwise cannot tell whether one more session is hidden or ten. It
+        // shows the full count (not "+N hidden"), because that number stays
+        // true at every scroll position — a remainder would change as the
+        // strip moves and would have to be recomputed on every scroll frame.
+        <span
+          className="file-row-session-chips-count"
+          data-no-outline-drag
+          data-outline-dnd-ignore
+          title={`${chips.length} сессий у файла:\n${chips.map(c => `• ${c.sessionName}`).join('\n')}`}
+          style={{ fontSize: chipFontSize }}
+        >
+          {chips.length}
+        </span>
+      )}
+      </div>
+    )
+  }, [fontSize, linkOwnerProjectId, linkedFileSessionsByPath])
+
   const handleFileSelect = useCallback((path, isDirectory, modifiers = {}) => {
     // Skip placeholder nodes — they're not real files
     if (path.startsWith('__new__')) {
@@ -1573,6 +1676,7 @@ function Sidebar({
              sidebarLayout={sidebarLayout}
              onApplySidebarLayout={updateSidebarLayout}
              sortMode={sortMode}
+             renderRowEnd={renderLinkedSessionChips}
           />
         )}
       </div>

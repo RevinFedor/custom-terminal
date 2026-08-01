@@ -1,7 +1,7 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { buildCodexRunPayload } from './codexLaunch';
 import {
-  codexSettingsProofMatchesActiveWriter,
+  codexSettingsProofMatchesRuntimeOwner,
   isCompleteCodexSettingsRequest,
   planCodexHistorySettings,
   resolveCodexSettingsRuntimeProof,
@@ -15,6 +15,7 @@ import {
 import { terminalRegistry } from './terminalRegistry';
 import {
   answerClaudeQuestion,
+  copyClaudePtyDraft,
   grabClaudePtyDraft,
   getClaudePendingQuestion,
   getClaudePtyPresence,
@@ -23,6 +24,7 @@ import {
   sendClaudePtyPrompt,
   stopClaudePtyProcess,
   type ClaudePtyDraftGrabResult,
+  type ClaudePtyDraftGrabOptions,
   type ClaudePendingQuestion,
   type ClaudeQuestion,
 } from './claudePtyActions';
@@ -32,6 +34,7 @@ const { ipcRenderer } = window.require('electron');
 export type AgentHistoryTool = 'claude' | 'codex';
 export type AgentPtyStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping' | 'unknown';
 export type AgentDraftGrabResult = ClaudePtyDraftGrabResult;
+export type AgentDraftGrabOptions = ClaudePtyDraftGrabOptions;
 export type AgentPendingQuestion = ClaudePendingQuestion;
 export type AgentQuestion = ClaudeQuestion;
 
@@ -152,8 +155,12 @@ export interface HistoryAgentRuntime {
     tabId: string,
     context?: { busy?: boolean },
   ) => { success: boolean; interrupted?: boolean; error?: string; skipped?: string };
-  stopProcess: (tabId: string) => Promise<any>;
-  grabDraft: (tabId: string) => Promise<AgentDraftGrabResult>;
+  stopProcess: (tabId: string, options?: {
+    reason?: string | null;
+    authority?: Record<string, unknown> | null;
+  }) => Promise<any>;
+  grabDraft: (tabId: string, options?: AgentDraftGrabOptions) => Promise<AgentDraftGrabResult>;
+  copyDraft: (tabId: string, options?: AgentDraftGrabOptions) => Promise<AgentDraftGrabResult>;
   probeDraft?: (tabId: string, reason: string) => Promise<AgentDraftInspection>;
   inspectDraft?: (tabId: string) => AgentDraftInspection;
   getPendingQuestion?: (tabId: string) => Promise<AgentPendingQuestion | null>;
@@ -369,7 +376,12 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
       return null;
     })
     : null;
-  const { activeWriterSessionId } = resolveCodexSettingsRuntimeProof(settingsRuntimeSnapshot);
+  const {
+    activeWriterSessionId,
+    currentSettingsOwnerId,
+    currentSettingsModel,
+    currentSettingsEffort,
+  } = resolveCodexSettingsRuntimeProof(settingsRuntimeSnapshot);
   const effectiveSettings = resolveCodexEffectiveSettings({
     codexSessionId: tabState?.codexSessionId,
     codexModel: tabState?.codexModel,
@@ -431,19 +443,22 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
     tabId,
     reason: 'history-send-preflight',
     timeoutMs: 700,
+    waitFor: false,
+    waitTimeoutMs: 2500,
+    waitOnUnknownOnly: true,
     visualState: visualDraftStateForSend,
   });
   console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=' + (queue ? 'enter-busy' : 'enter') + ' chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=false');
   if (settingsPlan.hasRequestedSettings) {
-    const currentModel = effectiveSettings.model || '';
-    const currentEffort = effectiveSettings.effort || '';
+    const currentModel = currentSettingsModel || effectiveSettings.model || '';
+    const currentEffort = currentSettingsEffort || effectiveSettings.effort || '';
     // Equal strings are not enough after a writer handoff: without matching
     // ownership proof they may describe the resume source, not this process's
     // active conversation. A complete API pair must still reach the picker.
-    const currentPairProvenForWriter = codexSettingsProofMatchesActiveWriter({
-      currentProofSessionId: effectiveSettings.liveOwned
+    const currentPairProvenForWriter = codexSettingsProofMatchesRuntimeOwner({
+      currentProofSessionId: currentSettingsOwnerId || (effectiveSettings.liveOwned
         ? tabState?.codexLiveSettingsSessionId
-        : tabState?.codexSettingsProofSessionId,
+        : tabState?.codexSettingsProofSessionId),
       runtimeSnapshot: settingsRuntimeSnapshot,
     });
     const needsPicker = modelForPicker !== currentModel
@@ -469,7 +484,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
           requestedEffort: options.effort,
         })
           ? undefined
-          : activeWriterSessionId,
+          : currentSettingsOwnerId || activeWriterSessionId,
         allowTurnBusy: false,
         hasDraft: pickerHasDraft,
         draftSource: draftStateForSend.source || 'history-send-preflight',
@@ -591,7 +606,10 @@ function interruptCodexTurn(
   return { success: true, interrupted: true };
 }
 
-async function stopCodexProcess(tabId: string): Promise<any> {
+async function stopCodexProcess(tabId: string, options: {
+  reason?: string | null;
+  authority?: Record<string, unknown> | null;
+} = {}): Promise<any> {
   if (!tabId) return { success: false, error: 'tabId required' };
   const existing = codexStopInflight.get(tabId);
   if (existing) {
@@ -599,7 +617,12 @@ async function stopCodexProcess(tabId: string): Promise<any> {
     return existing;
   }
   console.log('[CodexHistoryActions:stop-process] start tab=' + shortTab(tabId));
-  const work = ipcRenderer.invoke('terminal:stop-ai-process', { tabId, toolType: 'codex' })
+  const work = ipcRenderer.invoke('terminal:stop-ai-process', {
+    tabId,
+    toolType: 'codex',
+    ...(options.reason ? { reason: options.reason } : {}),
+    ...(options.authority ? { authority: options.authority } : {}),
+  })
     .then((result: any) => {
       console.log('[CodexHistoryActions:stop-process] done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' error=' + (result?.error || '-'));
       return result;
@@ -615,28 +638,50 @@ async function stopCodexProcess(tabId: string): Promise<any> {
   return work;
 }
 
-async function grabCodexDraft(tabId: string): Promise<AgentDraftGrabResult> {
+async function captureCodexDraft(
+  tabId: string,
+  mode: 'grab' | 'copy',
+  options: AgentDraftGrabOptions = {},
+): Promise<AgentDraftGrabResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
-  const existing = codexDraftInflight.get(tabId);
+  // Keep ownership-changing `grab` separate from non-destructive `copy`.
+  // The main-process per-tab lock rejects a simultaneous cross-mode Ctrl+G,
+  // which is safer than returning the first operation with the wrong meaning.
+  const captureKey = tabId + ':' + mode;
+  const existing = codexDraftInflight.get(captureKey);
   if (existing) {
-    console.log('[CodexHistoryActions:draft] join-inflight tab=' + shortTab(tabId));
+    console.log('[CodexHistoryActions:draft] ' + mode + ' join-inflight tab=' + shortTab(tabId));
     return existing;
   }
-  console.log('[CodexHistoryActions:draft] grab start tab=' + shortTab(tabId));
-  const work = ipcRenderer.invoke('codex:grab-input', tabId)
+  console.log('[CodexHistoryActions:draft] ' + mode + ' start tab=' + shortTab(tabId));
+  const work = ipcRenderer.invoke('codex:' + mode + '-input', tabId, options)
     .then((result: AgentDraftGrabResult) => {
-      console.log('[CodexHistoryActions:draft] grab done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' chars=' + (result?.text?.length || 0) + ' images=' + (result?.images || 0) + ' error=' + (result?.error || '-'));
+      console.log('[CodexHistoryActions:draft] ' + mode + ' done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' chars=' + (result?.text?.length || 0) + ' images=' + (result?.images || 0) + ' error=' + (result?.error || '-'));
       return result || { success: false, error: 'empty_result' };
     })
     .catch((e: any) => {
-      console.warn('[CodexHistoryActions:draft] grab error tab=' + shortTab(tabId) + ': ' + errorText(e));
+      console.warn('[CodexHistoryActions:draft] ' + mode + ' error tab=' + shortTab(tabId) + ': ' + errorText(e));
       return { success: false, error: errorText(e) };
     })
     .finally(() => {
-      if (codexDraftInflight.get(tabId) === work) codexDraftInflight.delete(tabId);
+      if (codexDraftInflight.get(captureKey) === work) codexDraftInflight.delete(captureKey);
     });
-  codexDraftInflight.set(tabId, work);
+  codexDraftInflight.set(captureKey, work);
   return work;
+}
+
+function grabCodexDraft(
+  tabId: string,
+  options: AgentDraftGrabOptions = {},
+): Promise<AgentDraftGrabResult> {
+  return captureCodexDraft(tabId, 'grab', options);
+}
+
+function copyCodexDraft(
+  tabId: string,
+  options: AgentDraftGrabOptions = {},
+): Promise<AgentDraftGrabResult> {
+  return captureCodexDraft(tabId, 'copy', options);
 }
 
 function inspectCodexDraft(tabId: string): { hasDraft: boolean | null; preview: string; source: string } {
@@ -652,6 +697,9 @@ async function probeCodexDraft(tabId: string, reason: string) {
     tabId,
     reason,
     timeoutMs: 700,
+    waitFor: false,
+    waitTimeoutMs: 2500,
+    waitOnUnknownOnly: true,
     visualState,
   });
   console.warn('[CodexHistoryActions:draft] authoritative-probe tab=' + shortTab(tabId)
@@ -709,6 +757,7 @@ const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   interruptTurn: interruptClaudePtyTurn,
   stopProcess: stopClaudePtyProcess,
   grabDraft: grabClaudePtyDraft,
+  copyDraft: copyClaudePtyDraft,
   probeDraft: probeClaudeDraft,
   getPendingQuestion: getClaudePendingQuestion,
   answerQuestion: answerClaudeQuestion,
@@ -738,6 +787,7 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   interruptTurn: interruptCodexTurn,
   stopProcess: stopCodexProcess,
   grabDraft: grabCodexDraft,
+  copyDraft: copyCodexDraft,
   probeDraft: probeCodexDraft,
   inspectDraft: inspectCodexDraft,
 };

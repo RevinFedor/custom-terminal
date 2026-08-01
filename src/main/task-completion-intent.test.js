@@ -69,6 +69,29 @@ test('stale Codex completion cannot consume a newer exact turn', () => {
   assert.equal(intents.getTurn('tab-a').turnId, 'turn-2');
 });
 
+test('F1: a stale Claude process completion cannot consume a newer process turn', () => {
+  const intents = registry();
+  intents.beginTurn({
+    tabId: 'tab-a', provider: 'claude', sessionId: 'session-a', processId: 'pid-old',
+  });
+  intents.requestCompletion({ tabId: 'tab-a' });
+  intents.beginTurn({
+    tabId: 'tab-a', provider: 'claude', sessionId: 'session-a', processId: 'pid-new',
+  });
+
+  const stale = intents.finishTurn({
+    tabId: 'tab-a',
+    provider: 'claude',
+    sessionId: 'session-a',
+    processId: 'pid-old',
+    success: true,
+  });
+
+  assert.equal(stale.matched, false);
+  assert.equal(intents.getTurn('tab-a').processId, 'pid-new');
+  assert.equal(intents.getTurn('tab-a').intentId, null);
+});
+
 test('request rejects idle and cross-tab registration', () => {
   const intents = registry();
   assert.equal(intents.requestCompletion({ tabId: 'tab-a' }).code, 'no_active_turn');

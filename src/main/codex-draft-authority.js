@@ -3,6 +3,37 @@ function hasDefinitiveDraftState(state) {
     && (state.hasDraft === true || state.hasDraft === false);
 }
 
+function shouldWaitForCodexDraftProof({
+  initialHasDraft,
+  expected,
+  waitOnUnknownOnly = false,
+} = {}) {
+  if (initialHasDraft === expected) return false;
+  if (waitOnUnknownOnly === true) return initialHasDraft === null;
+  return true;
+}
+
+function shouldFinishCodexDraftProofWait({
+  hasDraft,
+  expected,
+  waitOnUnknownOnly = false,
+} = {}) {
+  if (waitOnUnknownOnly === true) {
+    return hasDraft === true || hasDraft === false;
+  }
+  return hasDraft === expected;
+}
+
+function createCodexDraftProofWaitTimeoutOutcome({ source } = {}) {
+  return {
+    success: false,
+    hasDraft: null,
+    preview: '',
+    source: String(source || 'headless-main:unknown') + ':wait-timeout',
+    error: 'codex-draft-proof-wait-timeout',
+  };
+}
+
 function enforceCodexInteractiveSurfaceDraftAuthority(candidate, {
   nativeRewindProven = false,
   activePicker = false,
@@ -77,7 +108,10 @@ function mergeCodexDraftAuthority(headlessState, rendererState, {
 }
 
 module.exports = {
+  createCodexDraftProofWaitTimeoutOutcome,
   enforceCodexInteractiveSurfaceDraftAuthority,
   hasDefinitiveDraftState,
   mergeCodexDraftAuthority,
+  shouldFinishCodexDraftProofWait,
+  shouldWaitForCodexDraftProof,
 };

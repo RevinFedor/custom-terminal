@@ -47,10 +47,11 @@ test('corner badges keep a plain group count separate from source and docs icons
   }), {
     icons: ['loop', 'docs-edit'],
     count: '3',
+    countTone: 'group',
     items: [
       { kind: 'loop', slot: 'top-right' },
-      { kind: 'count', slot: 'bottom-right', text: '3' },
-      { kind: 'docs-edit', slot: 'top-left' },
+      { kind: 'docs-edit', slot: 'middle-right' },
+      { kind: 'count', text: '3', tone: 'group', slot: 'bottom-right' },
     ],
   });
 });
@@ -63,4 +64,21 @@ test('two icons without a group count occupy different right-side corners', () =
     { kind: 'loop', slot: 'top-right' },
     { kind: 'docs-edit', slot: 'bottom-right' },
   ]);
+});
+
+test('compact count shares one right-side axis with edit and search icons', () => {
+  const presentation = buildTimelineCornerBadges({
+    docsEditedCount: 1,
+    docsSearchCount: 1,
+    compactClusterSize: 4,
+  });
+
+  assert.equal(presentation.count, '4');
+  assert.equal(presentation.countTone, 'compact');
+  assert.deepEqual(presentation.items, [
+    { kind: 'docs-edit', slot: 'top-right' },
+    { kind: 'count', text: '4', tone: 'compact', slot: 'middle-right' },
+    { kind: 'docs-search', slot: 'bottom-right' },
+  ]);
+  assert.equal(presentation.items.every(item => item.slot.endsWith('right')), true);
 });

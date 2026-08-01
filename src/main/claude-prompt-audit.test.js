@@ -14,6 +14,7 @@ const {
   readLastClaudeUserRecord,
   selectClaudeLivePromptOwner,
   selectClaudePendingPromptAudit,
+  selectUniqueClaudePromptSubmitAudit,
   shouldStageClaudeUserPromptAudit,
 } = require('./claude-prompt-audit');
 
@@ -216,6 +217,36 @@ function makeAudit(text, boundary, extra = {}) {
     ...extra,
   };
 }
+
+test('UserPromptSubmit binds execution context only to one eligible exact audit', () => {
+  const text = 'same nested delegation prompt';
+  const auditA = makeAudit(text, null, { handoffId: 'A', submitWritten: true });
+  const auditB = makeAudit(text, null, { handoffId: 'B', submitWritten: true });
+
+  const unique = selectUniqueClaudePromptSubmitAudit([auditA], text, { hashText: sha16 });
+  assert.equal(unique.audit, auditA);
+  assert.equal(unique.reason, 'unique-exact-pending-audit');
+  assert.equal(unique.matchingAudits.length, 1);
+
+  const ambiguous = selectUniqueClaudePromptSubmitAudit([auditA, auditB], text, {
+    hashText: sha16,
+  });
+  assert.equal(ambiguous.audit, null);
+  assert.equal(ambiguous.reason, 'ambiguous-identical-pending-audits');
+  assert.deepEqual(ambiguous.matchingAudits, [auditA, auditB]);
+
+  const notSubmitted = selectUniqueClaudePromptSubmitAudit([
+    makeAudit(text, null, { handoffId: 'not-submitted', submitWritten: false }),
+  ], text, { hashText: sha16 });
+  assert.equal(notSubmitted.audit, null);
+  assert.equal(notSubmitted.reason, 'no-exact-pending-audit');
+
+  const missingPrompt = selectUniqueClaudePromptSubmitAudit([auditA], undefined, {
+    hashText: sha16,
+  });
+  assert.equal(missingPrompt.audit, null);
+  assert.equal(missingPrompt.reason, 'hook-prompt-unavailable');
+});
 
 test('live queue claim and its canonical record keep one exact handoff owner', () => {
   const text = 'same prompt';

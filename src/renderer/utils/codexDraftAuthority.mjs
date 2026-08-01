@@ -88,6 +88,9 @@ export async function readCodexDraftAuthority({
   tabId,
   reason,
   timeoutMs = 700,
+  waitFor,
+  waitTimeoutMs,
+  waitOnUnknownOnly = false,
   visualState,
 }) {
   let mainState;
@@ -95,6 +98,11 @@ export async function readCodexDraftAuthority({
     mainState = await invoke('codex:get-draft-state', tabId, {
       reason,
       timeoutMs,
+      ...(typeof waitFor === 'boolean' ? { waitFor } : {}),
+      ...(Number.isFinite(Number(waitTimeoutMs))
+        ? { waitTimeoutMs: Number(waitTimeoutMs) }
+        : {}),
+      ...(waitOnUnknownOnly === true ? { waitOnUnknownOnly: true } : {}),
     });
   } catch (error) {
     mainState = {

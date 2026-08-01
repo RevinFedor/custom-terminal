@@ -181,12 +181,15 @@ class ClaudeStartupTransaction {
     }
 
     if (proof.outcome === PROOF.FOUND) return { ok: true, step, proof };
+    const explicitCommandError = proof.terminal === true
+      ? String(proof.outputPreview || proof.error || proof.reason || '').trim()
+      : '';
     return {
       ok: false,
       step,
       proof,
-      error: step.command + ' was not confirmed (' + proof.outcome
-        + (proof.reason ? '/' + proof.reason : '') + ')',
+      error: explicitCommandError || (step.command + ' was not confirmed (' + proof.outcome
+        + (proof.reason ? '/' + proof.reason : '') + ')'),
       retryable: proof.outcome === PROOF.ABSENT,
     };
   }

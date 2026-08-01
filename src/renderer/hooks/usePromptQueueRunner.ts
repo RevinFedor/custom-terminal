@@ -84,9 +84,16 @@ function workspaceTabBusyNow(tabId: string): boolean {
   return false;
 }
 
-function seedBusySnapshotFromWorkspace(tabId: string): void {
-  if (prevBusyRef.has(tabId)) return;
-  if (!workspaceTabBusyNow(tabId)) return;
+function seedBusySnapshotFromWorkspace(tabId: string, options: { replace?: boolean } = {}): void {
+  const busy = workspaceTabBusyNow(tabId);
+  if (options.replace === true) {
+    prevBusyRef.set(tabId, busy);
+    console.log('[PromptQueueRunner] replace busy snapshot from workspace tab='
+      + tabId.slice(-12) + ' busy=' + (busy ? '1' : '0'));
+    return;
+  }
+  if (!busy) return;
+  if (prevBusyRef.get(tabId) === true) return;
   prevBusyRef.set(tabId, true);
   console.log('[PromptQueueRunner] seed busy snapshot from workspace tab=' + tabId.slice(-12));
 }
@@ -504,6 +511,14 @@ function beginValidatedQueueSend(
     || (kind === 'queue' ? !queueAtStart.autoRun : !isLoopPromptActive(queueAtStart))) {
     return false;
   }
+  if (kind === 'queue'
+    && triggerTabId !== ownerTabId
+    && !pivotTriggerHasFreshCompletion(queueAtStart, triggerTabId)) {
+    console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8)
+      + ' target=' + triggerTabId.slice(-8)
+      + ' has no completed workflow after arm → wait');
+    return false;
+  }
   queueSendInflight.add(ownerTabId);
   const attempt: DeferredOwnerSend = {
     kind,
@@ -917,7 +932,6 @@ const SUCCESSFUL_COMPACT_LOCAL_COMMAND_REASONS = new Set([
   'compact_boundary',
   'compact_summary',
   'compact_stdout',
-  'pty-output-compacted',
 ]);
 
 function isSuccessfulCompactLocalCommandEnd(data: BusyStatePayload): boolean {
@@ -936,6 +950,13 @@ function hasActiveQueueWorkflow(queue: TabQueue): boolean {
 
 function workflowAcceptsNaturalOutcome(queue: TabQueue, outcomeTs: number | null): boolean {
   return isWorkflowOutcomeAtOrAfterArm(queue.workflowArmedAt, outcomeTs);
+}
+
+function pivotTriggerHasFreshCompletion(queue: TabQueue, triggerTabId: string): boolean {
+  const latestOutcome = processedNaturalOutcomes.get(triggerTabId)?.latestTs;
+  return Number.isFinite(latestOutcome)
+    && workflowAcceptsNaturalOutcome(queue, Number(latestOutcome))
+    && !queueOwnerHasPendingContinuation(triggerTabId);
 }
 
 function naturalOutcomeKey(data: BusyStatePayload, outcomeTs: number): string {
@@ -1070,10 +1091,11 @@ export function usePromptQueueRunner() {
       const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
       if (effectiveTrigger === ownerTabId) return ownerTabId;
 
-      // Pivoted queue can only fire when its target has a real idle snapshot.
-      // No busy history means "wait for the first busy→idle edge", not "idle".
+      // Pivoted queue can only fire after a successful target outcome newer than
+      // this arm. An idle snapshot alone never grants readiness.
       if (!prevBusyRef.has(effectiveTrigger)) return null;
       if (isTabWorkflowBlocked(effectiveTrigger)) return null;
+      if (!pivotTriggerHasFreshCompletion(queue, effectiveTrigger)) return null;
       return effectiveTrigger;
     };
 
@@ -1683,15 +1705,10 @@ export function usePromptQueueRunner() {
   // I come back, hit Run after — first prompt must fire immediately, not wait
   // for a never-coming turn-end". Without this, the prompt sits forever.
   //
-  // Pivoted-target behaviour: cold-start ONLY fires if the trigger tab is
-  // currently idle AND has been busy at least once (i.e. there is a "previous"
-  // state to compare against — we know it really is idle, not just unknown).
-  // If trigger has never been busy (user picked a fresh tab they haven't
-  // submitted anything to yet) we wait — the busy-state handler above will
-  // pick up the eventual busy→idle edge whenever the user activates it and
-  // sends a prompt. Without this guard, picking an inactive tab would fire
-  // the queue IMMEDIATELY (trigger is "idle" because never seen busy = false
-  // default) — exact opposite of user intent.
+  // A pivoted target never cold-starts from its current idle snapshot. Picking
+  // another tab means "wait for work that starts now or is already in flight",
+  // not "reuse any historical completion from this renderer lifetime". The
+  // authoritative busy→idle/outcome path below performs the eventual release.
   useEffect(() => {
     const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
     const clearTimer = (tabId: string) => {
@@ -1905,28 +1922,11 @@ export function usePromptQueueRunner() {
         const effectiveTrigger = getEffectiveQueueTrigger(tabId, q, { clearStaleTarget: true });
 
         if (effectiveTrigger !== tabId) {
-          seedBusySnapshotFromWorkspace(effectiveTrigger);
-          // Pivoted: only fire cold-start if the target has been seen busy at
-          // least once AND is currently idle. Otherwise wait for the busy→idle
-          // edge in the IPC handler. The "seen at least once" gate prevents
-          // firing on a target the user hasn't touched yet.
-          if (!prevBusyRef.has(effectiveTrigger)) {
-            console.log('[PromptQueueRunner] cold-start owner=' + tabId.slice(-8) + ' target=' + effectiveTrigger.slice(-8) + ' has no busy history → wait');
-            continue;
-          }
-          if (isTabWorkflowBlocked(tabId) || isTabWorkflowBlocked(effectiveTrigger)) {
-            // Target is busy right now — wait for its idle edge.
-            continue;
-          }
-          if (verifyCodexTriggerIdleThenFire(tabId, effectiveTrigger)) continue;
-          if (queueOwnerHasPendingContinuation(effectiveTrigger)) {
-            console.log('[PromptQueueRunner] cold-start owner=' + tabId.slice(-8) + ' target=' + effectiveTrigger.slice(-8) + ' has pending continuation → wait for chain drain');
-            continue;
-          }
-          // Target is idle and was seen busy before. Cold-start fires.
-          // (No firstDelay support for pivoted — keep it simple; the user
-          // already configured a delay implicitly by picking a target tab.)
-          fireHead(tabId, effectiveTrigger);
+          seedBusySnapshotFromWorkspace(effectiveTrigger, { replace: true });
+          console.log('[PromptQueueRunner] pivot armed owner=' + tabId.slice(-8)
+            + ' target=' + effectiveTrigger.slice(-8)
+            + ' current=' + (isTabWorkflowBlocked(effectiveTrigger) ? 'busy' : 'idle')
+            + ' → wait for next completed workflow');
           continue;
         }
 

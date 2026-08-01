@@ -126,6 +126,14 @@ const {
 const taskCompletionIntents = new TaskCompletionIntentRegistry();
 const { createXtermWritePump } = require(path.join(srcSharedDir, 'xterm-write-pump.cjs'));
 const {
+  createTerminalRedrawTrace,
+  recordTerminalFlush,
+  recordTerminalInput,
+  recordTerminalOutput,
+  recordTerminalResize,
+  snapshotTerminalRedrawTrace,
+} = require(path.join(srcMainDir, 'terminal-redraw-diagnostics'));
+const {
   prebindClaudeHookPid,
   resolveClaudeHookTab,
 } = require(path.join(srcMainDir, 'claude-hook-routing'));
@@ -134,6 +142,7 @@ const {
   findClaudeAgentFile,
   findCodexAgentFile,
   readAgentSteps,
+  isAgentFinishedByOwnTranscript,
 } = require(path.join(srcMainDir, 'subagent-transcript'));
 const {
   parseClaudeComposerCurrentFrame,
@@ -159,6 +168,13 @@ const {
   createClaudePromptStabilityRegistry,
 } = require(path.join(srcMainDir, 'claude-prompt-stability'));
 const {
+  createClaudeStartupProofSession,
+} = require(path.join(srcMainDir, 'claude-startup-proof-session'));
+const {
+  parseClaudeStartupSlashCommand,
+  scanClaudeStartupSlashRecords,
+} = require(path.join(srcMainDir, 'claude-startup-slash-proof'));
+const {
   waitForAgentReadyTransition,
 } = require(path.join(srcMainDir, 'agent-ready-wait'));
 const {
@@ -167,6 +183,26 @@ const {
 const {
   createAgentSendCancellationRegistry,
 } = require(path.join(srcMainDir, 'agent-send-cancellation'));
+const {
+  submitWithClaudeLocalCommandLifecycle,
+} = require(path.join(srcMainDir, 'claude-local-command-submission'));
+const {
+  advanceManualInputLineState,
+} = require(path.join(srcMainDir, 'claude-local-command-input'));
+const {
+  isPromptQueueAutomationSource,
+} = require(path.join(srcMainDir, 'prompt-queue-source'));
+const {
+  classifyClaudeLocalCommandOwner,
+  classifyClaudeCompactWatcherRecord,
+  selectLatestClaudeManualCompactIntent,
+} = require(path.join(srcMainDir, 'claude-local-command-proof'));
+const {
+  claudeCompactOutcomeFromReason,
+  classifyCodexCompactEvidence,
+  codexCompactOutcomeFromReason,
+  createCompactOperationRegistry,
+} = require(path.join(srcMainDir, 'compact-operation-state'));
 const {
   createHistoryPresenceTestGate,
 } = require(path.join(srcMainDir, 'history-presence-test-gate'));
@@ -187,6 +223,7 @@ const {
 const {
   deleteTerminalRuntimeIfOwned,
   ownsTerminalRuntime,
+  terminateCapturedTerminalRuntime,
 } = require(path.join(srcMainDir, 'terminal-runtime-identity.cjs'));
 const {
   createTerminalShellReadinessTracker,
@@ -216,6 +253,7 @@ const {
   readLastClaudeUserRecord,
   selectClaudeLivePromptOwner,
   selectClaudePendingPromptAudit,
+  selectUniqueClaudePromptSubmitAudit,
   shouldStageClaudeUserPromptAudit,
 } = require(path.join(srcMainDir, 'claude-prompt-audit'));
 const {
@@ -230,6 +268,7 @@ const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
 const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
+const { evaluateClaudeFreshStartAdmission } = require(path.join(srcMainDir, 'claude-fresh-start-admission'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
 const {
   getCodexProcessActionGeneration,
@@ -237,6 +276,7 @@ const {
 } = require(path.join(srcMainDir, 'codex-process-action-ownership'));
 const {
   buildCodexRewindMessageProof,
+  classifyCodexStableSourceTranscriptRecovery,
   hashCodexRewindTargetText,
 } = require(path.join(srcMainDir, 'codex-rewind-target-proof'));
 const {
@@ -288,6 +328,7 @@ const {
   advanceOscCommandGeneration,
   attachCodexSettingsProofOwner,
   codexLiveSlashAllowsTurnBusy,
+  classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,
@@ -308,9 +349,12 @@ const {
   verifyCodexNextLaunchSettings,
 } = require(path.join(srcMainDir, 'codex-runtime-contract'));
 const {
+  createCodexDraftProofWaitTimeoutOutcome,
   enforceCodexInteractiveSurfaceDraftAuthority,
   hasDefinitiveDraftState,
   mergeCodexDraftAuthority,
+  shouldFinishCodexDraftProofWait,
+  shouldWaitForCodexDraftProof,
 } = require(path.join(srcMainDir, 'codex-draft-authority'));
 const {
   classifyManualCodexSubmitAfterWriteQueue,
@@ -415,6 +459,11 @@ const {
   selectAiProcessForStop,
 } = require(path.join(srcMainDir, 'ai-process-liveness'));
 const {
+  compareAiLifecycleIdentity,
+  normalizeAgentLaunchSource,
+  normalizeAiLifecycleIdentity,
+} = require(path.join(srcMainDir, 'ai-lifecycle-authority'));
+const {
   clearClaudeQuestionStateOnProcessExit,
 } = require(path.join(srcMainDir, 'claude-question-lifecycle'));
 const {
@@ -429,6 +478,8 @@ const {
 } = require(path.join(srcMainDir, 'ai-shell-launch'));
 const {
   classifyCodexMcpStartupBlockerHandling,
+  decideCodexMcpReplacementHandoff,
+  decideCodexMcpStoppedGenerationSettlement,
   decideCodexMcpStartupDeadline,
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,
@@ -1136,6 +1187,28 @@ if (process.platform === 'darwin') {
 }
 
 let mainWindow;
+const compactOperations = createCompactOperationRegistry({
+  publish: (operation) => {
+    console.log('[CompactOperation] tab=' + String(operation?.tabId || '').slice(-12)
+      + ' provider=' + String(operation?.provider || '-')
+      + ' operation=' + String(operation?.operationId || '-')
+      + ' active=' + (operation?.active === true)
+      + ' phase=' + String(operation?.phase || '-')
+      + ' outcome=' + String(operation?.outcome || '-')
+      + ' reason=' + String(operation?.reason || '-')
+      + ' proof=' + String(operation?.completionProof || '-'));
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('agent:operational-phase', operation);
+    }
+    if (operation?.tabId) {
+      _webBroadcast(operation.tabId, {
+        type: 'operational-phase',
+        operation,
+      });
+      scheduleProjectActivityBroadcast('compact-operation');
+    }
+  },
+});
 const agentSendCancellations = createAgentSendCancellationRegistry();
 const agentLaunchPreparations = createAgentLaunchPreparationRegistry({
   onChange: (state) => {
@@ -1157,6 +1230,7 @@ const agentLaunchPreparations = createAgentLaunchPreparationRegistry({
 });
 let dockBaseIconDataUrlCache = null;
 let dockBaseIconPathCache = null;
+let claudeStartupProofSession = null;
 const transcriptService = createSessionTranscriptService({
   getMainWindow: () => mainWindow,
   webBroadcast: (tabId, payload) => _webBroadcast(tabId, payload),
@@ -1228,6 +1302,7 @@ const transcriptService = createSessionTranscriptService({
     };
   },
   onChanged: (meta) => {
+    claudeStartupProofSession?.handleTranscriptChanged(meta);
     try {
       const notify = require(path.join(srcMainDir, 'web-server')).notifyAgentTranscriptChanged;
       return typeof notify === 'function' ? notify(meta) : null;
@@ -1241,6 +1316,27 @@ const transcriptService = createSessionTranscriptService({
   claudeData: require(path.join(srcMainDir, 'ipc', 'claude-data')),
   codexData: codexDataModule,
   promptPresentationStore: projectManager.db,
+});
+claudeStartupProofSession = createClaudeStartupProofSession({
+  subscribe: (payload) => transcriptService.subscribe(payload),
+  unsubscribe: (payload) => transcriptService.unsubscribe(payload),
+  readProof: (payload) => readClaudeStartupSlashProof(payload),
+  resolveBinding: ({ tabId }) => {
+    const sessionId = resolveClaudeStartupSlashSessionId(tabId);
+    if (!sessionId) return null;
+    let cwd = terminalProjects.get(tabId) || null;
+    if (!cwd) {
+      try {
+        cwd = projectManager?.db?.db?.prepare(
+          'SELECT cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(tabId)?.cwd || null;
+      } catch {}
+    }
+    return { sessionId, cwd };
+  },
+  currentGeneration: (tabId) =>
+    claudeLaunchGenerationByTab.get(tabId)?.generation || null,
+  log: console,
 });
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
@@ -1657,6 +1753,7 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
     ? Number(options.expectedRunSeq)
     : null;
   const allowCurrentLaunchClaim = options.allowCurrentLaunchClaim === true;
+  const allowCurrentStoppingClaim = options.allowCurrentStoppingClaim === true;
 
   const readLocalState = () => {
     const state = terminalCommandState.get(tabId) || null;
@@ -1668,7 +1765,7 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
       commandRunning: state?.isRunning === true
         && !(allowCurrentLaunchClaim && !generationChanged),
       lifecycleClaimed: !allowCurrentLaunchClaim && hasClaimedAiLifecycle(tabId),
-      stopping: aiStoppingTabs.has(tabId),
+      stopping: aiStoppingTabs.has(tabId) && !allowCurrentStoppingClaim,
     };
   };
 
@@ -1797,6 +1894,147 @@ function rollbackClaudeShellLaunchClaims(tabId, {
     + ' reason=' + reason);
 }
 
+function readHeadlessCursorMetrics(state) {
+  const terminal = state?.terminal;
+  const buf = terminal?.buffer?.active;
+  if (!terminal || !buf) return null;
+  return {
+    rows: terminal.rows,
+    cols: terminal.cols,
+    bufferType: buf.type,
+    bufferLength: buf.length,
+    baseY: buf.baseY,
+    viewportY: buf.viewportY,
+    cursorX: buf.cursorX,
+    cursorY: buf.cursorY,
+    cursorRow: buf.baseY + buf.cursorY,
+    cursorVisible: state.redrawTrace?.cursorVisible ?? null,
+  };
+}
+
+function buildHeadlessDraftProofDiagnostic(tabId, proof, reason) {
+  const state = getHeadlessTerminalMirror(tabId);
+  if (!state) return { available: false, reason: 'no-headless-mirror' };
+  const terminal = state.terminal;
+  const buf = terminal?.buffer?.active;
+  if (!terminal || !buf) return { available: false, reason: 'no-headless-buffer' };
+  const cursorRow = Number.isFinite(Number(proof?.cursorRow))
+    ? Number(proof.cursorRow)
+    : buf.baseY + buf.cursorY;
+  const promptRow = Number.isFinite(Number(proof?.promptRow))
+    ? Number(proof.promptRow)
+    : null;
+  const requestedRows = new Set();
+  for (let row = cursorRow - 4; row <= cursorRow + 4; row += 1) requestedRows.add(row);
+  if (promptRow !== null) {
+    for (let row = promptRow - 2; row <= promptRow + 2; row += 1) requestedRows.add(row);
+  }
+  const rows = Array.from(requestedRows)
+    .sort((a, b) => a - b)
+    .filter((row) => row >= 0 && row < buf.length)
+    .slice(0, 16)
+    .map((row) => {
+      const line = buf.getLine(row);
+      const text = String(line?.translateToString?.(true) || '');
+      const styles = summarizeXtermLineStyles(line);
+      return {
+        row,
+        cursor: row === cursorRow,
+        prompt: promptRow !== null && row === promptRow,
+        wrapped: !!line?.isWrapped,
+        text: text.slice(0, 180),
+        firstTextStyle: styles.firstTextStyle,
+        hasInverse: styles.hasInverse,
+        hasNonDefaultBg: styles.hasNonDefaultBg,
+      };
+    });
+  return {
+    available: true,
+    reason,
+    generation: state.generation,
+    generationOrdinal: state.generationOrdinal,
+    complete: state.complete === true,
+    writeSeq: state.writeSeq,
+    flushedSeq: state.flushedSeq,
+    cursor: readHeadlessCursorMetrics(state),
+    proof: {
+      outcome: proof?.proofOutcome ?? null,
+      reason: proof?.proofReason ?? null,
+      source: proof?.source ?? null,
+      promptRow,
+      cursorRow,
+      cursorX: proof?.cursorX ?? buf.cursorX,
+      terminalRunSeq: proof?.terminalRunSeq ?? null,
+      inputRevision: proof?.inputRevision ?? null,
+      terminalLifecycleGeneration: proof?.terminalLifecycleGeneration ?? null,
+      mirrorGeneration: proof?.mirrorGeneration ?? null,
+    },
+    rows,
+    redraw: snapshotTerminalRedrawTrace(state.redrawTrace, 18),
+  };
+}
+
+function decorateAgentDraftProofIdentity(tabId, proof) {
+  const state = getHeadlessTerminalMirror(tabId);
+  return {
+    ...(proof || {}),
+    terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    inputRevision: getTerminalInputRevision(tabId),
+    terminalLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    mirrorGeneration: state?.generation || null,
+    mirrorGenerationOrdinal: state?.generationOrdinal ?? null,
+    mirrorWriteSeq: state?.writeSeq ?? null,
+    mirrorFlushedSeq: state?.flushedSeq ?? null,
+    mirrorSynchronizedOutputOpen: state?.redrawTrace?.synchronizedOutputOpen === true,
+    synchronizedOutputGeneration: Number(
+      state?.redrawTrace?.synchronizedOutputGeneration || 0,
+    ),
+  };
+}
+
+function logAgentDraftProofContradiction(tabId, agent, pending, text) {
+  const proof = pending?.draftProof || null;
+  if (
+    !proof
+    || (
+      proof.hasDraft !== true
+      && proof.proofOutcome !== 'found'
+      && proof.exactCaptureRecommended !== true
+    )
+    || String(text || '').trim()
+    || !['grab', 'copy'].includes(pending?.mode)
+  ) return null;
+  const identityStable = validateAgentInputIdentity(tabId, pending.captureIdentity)
+    && pending.draftProofIdentityAtWrite === true
+    && agentDraftProofMatchesCaptureIdentity(proof, pending.captureIdentity);
+  console.error('[AgentDraftProof:CONTRADICTION] agent=' + agent
+    + ' tab=' + String(tabId).slice(-12)
+    + ' screen=' + (proof.proofOutcome || (proof.hasDraft === true ? 'found' : 'unknown'))
+    + ' ctrlG=absent'
+    + ' identityStable=' + identityStable
+    + ' before=' + JSON.stringify(pending.draftProofDiagnostic || null)
+    + ' after=' + JSON.stringify(buildHeadlessDraftProofDiagnostic(
+      tabId,
+      proof,
+      'ctrl-g-empty-after-screen-found',
+    )));
+  return { proof, before: pending.draftProofDiagnostic || null };
+}
+
+function logAgentDraftProofContradictionAfterReturn(tabId, agent, contradiction, editorReturn, identityStable) {
+  if (!contradiction) return;
+  console.error('[AgentDraftProof:CONTRADICTION_AFTER_RETURN] agent=' + agent
+    + ' tab=' + String(tabId).slice(-12)
+    + ' editorReturn=' + (editorReturn?.ready === true)
+    + ' editorReason=' + (editorReturn?.reason || '-')
+    + ' identityStable=' + (identityStable === true)
+    + ' frame=' + JSON.stringify(buildHeadlessDraftProofDiagnostic(
+      tabId,
+      contradiction.proof,
+      'ctrl-g-editor-return-frame',
+    )));
+}
+
 function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24, options = {}) {
   if (!tabId || !HeadlessXTerminal) return null;
   const existing = terminalHeadlessMirrors.get(tabId);
@@ -1843,6 +2081,8 @@ function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24, options = {})
       incompleteReason: options.complete === false
         ? String(options.incompleteReason || 'unknown-history')
         : null,
+      redrawTrace: createTerminalRedrawTrace(),
+      synchronizedFrameWaiters: new Set(),
       lastErrorAt: 0,
       cols: safeCols,
       rows: safeRows,
@@ -1850,14 +2090,29 @@ function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24, options = {})
     state.writePump = createXtermWritePump(
       (data, done) => state.terminal.write(data, done),
       {
-        onFlushed: (meta) => {
+        onFlushed: (meta, flushInfo) => {
           const seq = Number(meta?.seq);
           if (Number.isFinite(seq)) {
             state.flushedSeq = Math.max(state.flushedSeq || 0, seq);
           }
+          recordTerminalFlush(state.redrawTrace, {
+            seq: Number.isFinite(seq) ? seq : null,
+            chars: flushInfo?.chars,
+            items: flushInfo?.items,
+            after: readHeadlessCursorMetrics(state),
+          });
+          for (const notify of Array.from(state.synchronizedFrameWaiters)) {
+            try { notify(); } catch {}
+          }
+          if (meta?.synchronizedFrameEnd === true) {
+            observeClaudeSynchronizedFrameFlushed(tabId, state, seq);
+          }
         },
         onError: (error) => {
           state.failed = true;
+          for (const notify of Array.from(state.synchronizedFrameWaiters)) {
+            try { notify(); } catch {}
+          }
           logHeadlessTerminalMirrorError(tabId, state, 'write failed', error);
         },
       },
@@ -1876,6 +2131,62 @@ function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24, options = {})
     terminalHeadlessMirrors.delete(tabId);
     return null;
   }
+}
+
+function waitForHeadlessSynchronizedOutputClose(tabId, expectedState, timeoutMs) {
+  const state = expectedState || getHeadlessTerminalMirror(tabId);
+  if (!state) return Promise.resolve({ ready: false, reason: 'no-headless-mirror' });
+  const isReady = () => (
+    getHeadlessTerminalMirror(tabId) === state
+    && state.failed !== true
+    && state.redrawTrace?.synchronizedOutputOpen !== true
+    && Number(state.flushedSeq || 0) === Number(state.writeSeq || 0)
+  );
+  if (isReady()) {
+    return Promise.resolve({
+      ready: true,
+      reason: 'synchronized-frame-closed',
+      writeSeq: state.writeSeq,
+    });
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      state.synchronizedFrameWaiters?.delete(check);
+      resolve(result);
+    };
+    const check = () => {
+      if (getHeadlessTerminalMirror(tabId) !== state) {
+        finish({ ready: false, reason: 'headless-generation-changed' });
+        return;
+      }
+      if (state.failed === true) {
+        finish({ ready: false, reason: 'headless-mirror-failed' });
+        return;
+      }
+      if (isReady()) {
+        finish({
+          ready: true,
+          reason: 'synchronized-frame-closed',
+          writeSeq: state.writeSeq,
+        });
+      }
+    };
+    // The timeout only terminates an unresolved wait. It can never authorize
+    // input; readiness comes exclusively from a parsed+flushed PTY frame.
+    const timer = setTimeout(() => finish({
+      ready: false,
+      reason: state.redrawTrace?.synchronizedOutputOpen === true
+        ? 'synchronized-frame-still-open'
+        : 'synchronized-frame-not-flushed',
+    }), Math.max(50, Number(timeoutMs) || 700));
+    state.synchronizedFrameWaiters.add(check);
+    check();
+  });
 }
 
 function getHeadlessTerminalMirror(tabId) {
@@ -1897,10 +2208,27 @@ function writeHeadlessTerminalMirror(tabId, data) {
   if (!state) return null;
   const seq = ++state.writeSeq;
   try {
+    const redrawEntry = recordTerminalOutput(state.redrawTrace, data, { seq });
+    const redrawKinds = new Set(
+      (redrawEntry?.controls || []).map((control) => control.kind),
+    );
+    const synchronizedFrameBegin = redrawKinds.has('synchronized-output-begin');
+    const synchronizedFrameEnd = redrawKinds.has('synchronized-output-end');
+    if (synchronizedFrameBegin) {
+      const generation = claudeLaunchGenerationByTab.get(tabId)?.generation || null;
+      if (generation) {
+        claudePromptStability.markActivity(
+          tabId,
+          generation,
+          'synchronized-frame-begin:' + seq,
+        );
+      }
+    }
     state.writePump.push(String(data), {
       seq,
       generation: state.generation,
       generationOrdinal: state.generationOrdinal,
+      synchronizedFrameEnd,
     });
   } catch (err) {
     state.failed = true;
@@ -2077,6 +2405,7 @@ function resizeHeadlessTerminalMirror(tabId, cols, rows) {
     state.terminal.resize(safeCols, safeRows);
     state.cols = safeCols;
     state.rows = safeRows;
+    recordTerminalResize(state.redrawTrace, safeCols, safeRows);
   } catch (err) {
     state.failed = true;
     logHeadlessTerminalMirrorError(tabId, state, 'resize failed', err);
@@ -2165,6 +2494,25 @@ function summarizeXtermLineStyles(line) {
     .slice(0, 6)
     .map(([style, count]) => style + ' x' + count);
   return { styles, firstTextStyle, hasInverse, hasNonDefaultBg, hasNonDefaultFg };
+}
+
+function summarizeXtermLineGeometry(line) {
+  if (!line) return { occupiedEndX: 0, promptCellX: null };
+  let occupiedEndX = 0;
+  let promptCellX = null;
+  for (let x = 0; x < line.length; x += 1) {
+    const cell = line.getCell(x);
+    if (!cell || cell.getWidth?.() === 0) continue;
+    const chars = String(cell.getChars?.() || '');
+    if (chars.includes('❯') || chars.includes('›')) promptCellX = x;
+    // Cursor blocks are presentation, not composer text. Spaces intentionally
+    // do not extend the occupied tail: a user may type trailing spaces and the
+    // cursor remains the stronger boundary witness.
+    if (chars.replace(/[▌█]/g, '').trim()) {
+      occupiedEndX = x + Math.max(1, Number(cell.getWidth?.()) || 1);
+    }
+  }
+  return { occupiedEndX, promptCellX };
 }
 
 function getLogicalLineSnapshotAt(buf, row) {
@@ -2428,7 +2776,13 @@ function getHeadlessCodexDraftState(tabId, reason = 'headless-draft') {
   }
 }
 
-async function waitForHeadlessCodexDraftState(tabId, expected, timeoutMs = 900, reason = 'headless-draft-wait') {
+async function waitForHeadlessCodexDraftState(
+  tabId,
+  expected,
+  timeoutMs = 900,
+  reason = 'headless-draft-wait',
+  { waitOnUnknownOnly = false } = {},
+) {
   const state = getHeadlessTerminalMirror(tabId);
   if (!state) {
     return { success: false, hasDraft: null, preview: '', source: 'no-headless-mirror', debug: 'reason=no-headless-mirror:' + reason };
@@ -2447,10 +2801,39 @@ async function waitForHeadlessCodexDraftState(tabId, expected, timeoutMs = 900, 
     checks += 1;
     return getHeadlessCodexDraftState(tabId, reason);
   };
-  const first = read();
-  if (first.hasDraft === expected) {
+  let first = read();
+  if (
+    agentSendTestFaultActive('codex-draft-unknown-once')
+    && !codexDraftUnknownTestFaultConsumed
+    && codexTurnWatchers.get(tabId)?.busy === true
+  ) {
+    codexDraftUnknownTestFaultConsumed = true;
+    first = {
+      ...first,
+      success: true,
+      hasDraft: null,
+      preview: '',
+      source: 'test-fault:codex-draft-unknown-once',
+    };
+    console.warn('[TestFault] codex draft proof forced unknown once tab='
+      + String(tabId).slice(-12)
+      + ' generation=' + String(state.generation || '-').slice(0, 8)
+      + ' reason=' + reason);
+  }
+  if (!shouldWaitForCodexDraftProof({
+    initialHasDraft: first.hasDraft,
+    expected,
+    waitOnUnknownOnly,
+  })) {
     return { ...first, success: true, timedOut: false, checks };
   }
+
+  console.log('[CodexDraftProofWait] start tab=' + String(tabId).slice(-12)
+    + ' generation=' + String(state.generation || '-').slice(0, 8)
+    + ' reason=' + reason
+    + ' initial=' + first.hasDraft
+    + ' expected=' + expected
+    + ' unknownOnly=' + waitOnUnknownOnly);
 
   return await new Promise((resolve) => {
     let settled = false;
@@ -2461,17 +2844,50 @@ async function waitForHeadlessCodexDraftState(tabId, expected, timeoutMs = 900, 
       settled = true;
       if (timer) clearTimeout(timer);
       try { sub?.dispose?.(); } catch {}
-      resolve({ ...draftState, success: true, timedOut, checks });
+      console.log('[CodexDraftProofWait] finish tab=' + String(tabId).slice(-12)
+        + ' generation=' + String(state.generation || '-').slice(0, 8)
+        + ' reason=' + reason
+        + ' hasDraft=' + draftState?.hasDraft
+        + ' timedOut=' + timedOut
+        + ' checks=' + checks
+        + (draftState?.error ? ' error=' + draftState.error : ''));
+      resolve({ ...draftState, timedOut, checks });
     };
     const check = () => {
+      if (getHeadlessTerminalMirror(tabId) !== state || state.disposed === true) {
+        finish({
+          success: false,
+          hasDraft: null,
+          preview: '',
+          source: 'headless-main:generation-changed',
+          error: 'headless-mirror-generation-changed',
+        }, false);
+        return;
+      }
+      if (state.failed === true) {
+        finish({
+          success: false,
+          hasDraft: null,
+          preview: '',
+          source: 'headless-main:error',
+          error: 'headless-mirror-failed',
+        }, false);
+        return;
+      }
       const draftState = read();
-      if (draftState.hasDraft === expected) finish(draftState, false);
+      if (shouldFinishCodexDraftProofWait({
+        hasDraft: draftState.hasDraft,
+        expected,
+        waitOnUnknownOnly,
+      })) finish(draftState, false);
     };
     const onWriteParsed = state.terminal?.onWriteParsed;
     if (typeof onWriteParsed === 'function') {
       sub = onWriteParsed.call(state.terminal, check);
     }
-    timer = setTimeout(() => finish(read(), true), timeoutMs);
+    timer = setTimeout(() => finish(createCodexDraftProofWaitTimeoutOutcome({
+      source: first.source,
+    }), true), timeoutMs);
   });
 }
 
@@ -2500,10 +2916,13 @@ function getHeadlessVisibleBufferSnapshot(tabId, reason) {
       if (!line) continue;
       const text = line.translateToString(true);
       const isPromptLine = hasCodexComposerPromptGlyph(text);
+      const geometry = summarizeXtermLineGeometry(line);
       const row = {
         row: i,
         text,
         wrapped: !!line.isWrapped,
+        occupiedEndX: geometry.occupiedEndX,
+        promptCellX: geometry.promptCellX,
       };
       if (String(text || '').trim()) {
         const summary = summarizeXtermLineStyles(line);
@@ -2555,6 +2974,11 @@ function getHeadlessVisibleBufferSnapshot(tabId, reason) {
       bufferType: buf.type,
       mirrorGeneration: state.generation,
       mirrorGenerationOrdinal: state.generationOrdinal,
+      synchronizedOutputOpen: state.redrawTrace?.synchronizedOutputOpen === true,
+      synchronizedOutputSeq: state.redrawTrace?.synchronizedOutputSeq ?? null,
+      synchronizedOutputGeneration: Number(
+        state.redrawTrace?.synchronizedOutputGeneration || 0,
+      ),
       lines,
       codexActivePrompt,
       writeSeq: state.writeSeq,
@@ -2591,7 +3015,7 @@ async function requestTerminalClaudeDraftState(webContents, tabId, reason, timeo
   const inputRevisionBefore = getTerminalInputRevision(tabId);
   const lifecycleGenerationBefore = getTerminalLifecycleGeneration(tabId);
   const mirrorBefore = getHeadlessTerminalMirror(tabId);
-  const snapshot = await requestTerminalVisibleBufferSnapshot(
+  let snapshot = await requestTerminalVisibleBufferSnapshot(
     webContents,
     tabId,
     typeof reason === 'string' ? reason : 'claude-draft-state',
@@ -2605,6 +3029,31 @@ async function requestTerminalClaudeDraftState(webContents, tabId, reason, timeo
       preview: '',
       source: snapshot?.source || 'visible-buffer',
       error: snapshot?.error || 'snapshot_failed',
+    };
+  }
+  if (snapshot.synchronizedOutputOpen === true && mirrorBefore) {
+    const closed = await waitForHeadlessSynchronizedOutputClose(
+      tabId,
+      mirrorBefore,
+      Math.max(100, Math.min(Number(timeoutMs) || 700, 2500)),
+    );
+    if (closed.ready === true) {
+      snapshot = await requestTerminalVisibleBufferSnapshot(
+        webContents,
+        tabId,
+        (typeof reason === 'string' ? reason : 'claude-draft-state') + ':after-sync-close',
+        Math.max(100, Math.min(Number(timeoutMs) || 700, 2500)),
+      );
+    }
+  }
+  if (!snapshot?.success) {
+    return {
+      success: false,
+      hasDraft: null,
+      text: '',
+      preview: '',
+      source: snapshot?.source || 'headless-main',
+      error: snapshot?.error || 'snapshot_after_frame_close_failed',
     };
   }
   if (
@@ -2622,6 +3071,24 @@ async function requestTerminalClaudeDraftState(webContents, tabId, reason, timeo
       preview: '',
       source: (snapshot?.source || 'visible-buffer') + ':claude-composer:unknown:headless-proof-required',
       proofReason: 'headless-current-frame-proof-required',
+    };
+  }
+  if (snapshot.synchronizedOutputOpen === true) {
+    return {
+      success: true,
+      tabId,
+      proofOutcome: 'unknown',
+      hasDraft: null,
+      text: '',
+      preview: '',
+      source: 'headless-main:claude-composer:unknown:synchronized-frame-open',
+      proofReason: 'synchronized-frame-open',
+      mirrorGeneration: snapshot.mirrorGeneration,
+      mirrorGenerationOrdinal: snapshot.mirrorGenerationOrdinal ?? null,
+      mirrorWriteSeq: snapshot.writeSeq ?? null,
+      mirrorFlushedSeq: snapshot.flushedSeq ?? null,
+      mirrorSynchronizedOutputOpen: true,
+      synchronizedOutputGeneration: snapshot.synchronizedOutputGeneration ?? null,
     };
   }
   const stableGeneration = terminalBefore
@@ -2652,19 +3119,26 @@ async function requestTerminalClaudeDraftState(webContents, tabId, reason, timeo
     mirrorGenerationOrdinal: snapshot.mirrorGenerationOrdinal ?? null,
     mirrorWriteSeq: snapshot.writeSeq ?? null,
     mirrorFlushedSeq: snapshot.flushedSeq ?? null,
+    mirrorSynchronizedOutputOpen: snapshot.synchronizedOutputOpen === true,
+    synchronizedOutputGeneration: snapshot.synchronizedOutputGeneration ?? null,
     ...parseClaudeDraftFromVisibleSnapshot(snapshot),
   };
 }
 
-async function verifyClaudeComposerEmptyAtWriteBoundary(tabId, term, reason) {
-  const proof = await requestTerminalClaudeDraftState(
+async function verifyClaudeComposerEmptyAtWriteBoundary(
+  tabId,
+  term,
+  reason,
+  { exactEmptyEvidence = null } = {},
+) {
+  let proof = await requestTerminalClaudeDraftState(
     mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
     tabId,
     reason,
     900,
   );
   const mirror = getHeadlessTerminalMirror(tabId);
-  const decision = validateClaudeComposerWriteBoundary({
+  let decision = validateClaudeComposerWriteBoundary({
     proof,
     terminalMatches: terminals.get(tabId) === term,
     currentInputRevision: getTerminalInputRevision(tabId),
@@ -2673,7 +3147,40 @@ async function verifyClaudeComposerEmptyAtWriteBoundary(tabId, term, reason) {
     currentMirrorGeneration: mirror?.generation || null,
     currentMirrorWriteSeq: mirror?.writeSeq ?? null,
     currentMirrorFlushedSeq: mirror?.flushedSeq ?? null,
+    currentMirrorSynchronizedOutputOpen: mirror?.redrawTrace?.synchronizedOutputOpen === true,
   });
+  if (
+    !decision.valid
+    && proof?.proofOutcome === 'unknown'
+    && proof?.exactCaptureRecommended === true
+    && exactClaudeEmptyEvidenceStillCurrent(tabId, exactEmptyEvidence)
+  ) {
+    // Ctrl+G already proved the actual Claude input empty on this exact
+    // process/input generation. Keep the current screen geometry as the
+    // surface proof, but replace its residual-cell ambiguity with that exact
+    // empty result. A fresh write-boundary validation below still requires the
+    // current mirror to be closed and caught up.
+    proof = {
+      ...proof,
+      proofOutcome: 'absent',
+      hasDraft: false,
+      text: '',
+      preview: '',
+      source: 'headless-main:claude-composer:empty-exact-editor',
+      proofReason: 'external-editor-empty-current-generation',
+    };
+    decision = validateClaudeComposerWriteBoundary({
+      proof,
+      terminalMatches: terminals.get(tabId) === term,
+      currentInputRevision: getTerminalInputRevision(tabId),
+      currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      currentLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+      currentMirrorGeneration: mirror?.generation || null,
+      currentMirrorWriteSeq: mirror?.writeSeq ?? null,
+      currentMirrorFlushedSeq: mirror?.flushedSeq ?? null,
+      currentMirrorSynchronizedOutputOpen: mirror?.redrawTrace?.synchronizedOutputOpen === true,
+    });
+  }
   console.log('[ClaudeComposerWriteBoundary] tab=' + String(tabId).slice(-12)
     + ' valid=' + decision.valid
     + ' reason=' + decision.reason
@@ -2685,7 +3192,8 @@ async function verifyClaudeComposerEmptyAtWriteBoundary(tabId, term, reason) {
     + ' inputRevision=' + (proof?.inputRevision ?? '-')
     + ' lifecycle=' + (proof?.terminalLifecycleGeneration || '-')
     + ' mirror=' + (proof?.mirrorGeneration || '-')
-    + ' write=' + (proof?.mirrorWriteSeq ?? '-') + '/' + (proof?.mirrorFlushedSeq ?? '-'));
+    + ' write=' + (proof?.mirrorWriteSeq ?? '-') + '/' + (proof?.mirrorFlushedSeq ?? '-')
+    + ' syncOpen=' + (proof?.mirrorSynchronizedOutputOpen === true));
   return { ...decision, proof };
 }
 
@@ -2767,10 +3275,14 @@ const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer }
 const claudeConfirmDialogCooldown = new Map(); // `${tabId}:${dialogType}` -> lastFireTs (ms). Prevents double-Enter on echo re-render.
 const codexStartupAutoEnter = new Map(); // tabId -> one-shot state for Codex startup confirmation prompts
 const codexMcpStartupWatchdogs = new Map(); // tabId -> MCP startup restart watchdog state, independent of prompt TTL
+// One internal, non-IPC capability spanning the watchdog's proven Stop and
+// replacement PTY write. It keeps manual input blocked while allowing only the
+// exact stopped launch generation to inherit the public STARTING lifecycle.
+const codexMcpStartupReplacementHandoffs = new Map(); // tabId -> exact one-shot replacement authority
 const codexStartupNoStateTimeoutTabs = new Set(); // tabIds that already surfaced generic startup timeout
 const codexStartupNoStateTimeoutTimers = new Map(); // tabId -> { timer, launchId, startedAt }
 const codexTuiReadyTabs = new Set();     // tabIds whose current Codex TUI process rendered an input-ready frame
-const codexTuiReadyMeta = new Map();     // tabId -> { at, source, reason, preview } for Rewind/readiness forensics
+const codexTuiReadyMeta = new Map();     // tabId -> readiness metadata + exact service-tier proof for this PTY generation
 const codexTuiReadyBuffers = new Map();  // tabId -> recent startup output for deterministic ready detection
 const codexTuiReadyQuietTimers = new Map(); // tabId -> debounce timer; ready only after TUI output settles
 const codexTuiReadyRejectKeys = new Map(); // tabId -> last logged not-ready reason/preview
@@ -2781,6 +3293,8 @@ const codexPreclaimedCommandGenerations = new Map(); // tabId -> first exact OSC
 const codexPendingSettingsProofHandoffs = new Map(); // tabId -> one exact pre-rollout settings proof for this PTY generation
 const codexPendingModelMigrations = new Map(); // tabId -> post-Enter ack capture bound to one PTY/launch/input generation
 const codexPromptInFlight = new Map(); // tabId -> prompt submit window before rollout task_started
+const codexInputLineBuffers = new Map(); // tabId -> shared manual xterm input-line tracker state
+const codexPromptGeneration = new Map(); // tabId -> current Codex composer generation
 const codexManualActionRequired = new Map(); // tabId -> auth/update state that must be handled by the user
 let codexLaunchSeq = 0;
 let sessionManager; // Initialized after projectManager is ready
@@ -3176,9 +3690,21 @@ function computeActiveLoaders() {
   //    a presence list, so idle-alive Claude must not be returned at all.
   for (const tabId of bridgeKnownSessions.keys()) {
     if (!terminals.has(tabId)) continue; // PTY dead → not blocking (= 'inactive')
-    const isBusy = !!claudeTurnBusy.get(tabId) || !!claudeSpinnerBusy.get(tabId) || claudeLocalCommandWatchers.has(tabId);
+    if (seen.has(tabId)) continue;
+    const compactOperation = compactOperations.getActive(tabId, 'claude');
+    const isBusy = !!claudeTurnBusy.get(tabId)
+      || !!claudeSpinnerBusy.get(tabId)
+      || claudeLocalCommandWatchers.has(tabId)
+      || !!compactOperation;
     if (!isBusy) continue;
-    loaders.push({ tabId, kind: 'claude', status: 'busy', ...labelFor(tabId) });
+    loaders.push({
+      tabId,
+      kind: 'claude',
+      status: 'busy',
+      phase: compactOperation?.phase || null,
+      operation: compactOperation?.kind || null,
+      ...labelFor(tabId),
+    });
     seen.add(tabId);
   }
 
@@ -3199,8 +3725,16 @@ function computeActiveLoaders() {
   // 4) Codex turn watcher. Codex CLI stays alive while idle, so process liveness
   //    is not enough; only rollout task_started→task_complete busy blocks.
   for (const [tabId, state] of codexTurnWatchers) {
-    if (seen.has(tabId) || state?.busy !== true) continue;
-    loaders.push({ tabId, kind: 'codex', status: 'busy', ...labelFor(tabId) });
+    const compactOperation = compactOperations.getActive(tabId, 'codex');
+    if (seen.has(tabId) || (state?.busy !== true && !compactOperation)) continue;
+    loaders.push({
+      tabId,
+      kind: 'codex',
+      status: 'busy',
+      phase: compactOperation?.phase || null,
+      operation: compactOperation?.kind || null,
+      ...labelFor(tabId),
+    });
     seen.add(tabId);
   }
 
@@ -3976,6 +4510,10 @@ function looksLikeClaudeRewindMenuText(text) {
 function armPromptBoundaryForSubmittedCommand(tabId, reason = 'command-submit') {
   if (!tabId) return;
   promptBoundaryState.set(tabId, 'busy');
+  const generation = claudeLaunchGenerationByTab.get(tabId)?.generation || null;
+  if (generation) {
+    claudePromptStability.markActivity(tabId, generation, 'submitted-command:' + reason);
+  }
   console.log('[BoundarySM] Tab ' + String(tabId).slice(-8) + ': forced busy for next prompt reason=' + reason + ' seq=' + (promptBoundarySeq.get(tabId) || 0));
 }
 
@@ -4324,7 +4862,9 @@ const codexLaunchObservationPending = new Map(); // tabId → launchId while obs
 // tabId → launchId from PTY write until authoritative TUI/rollout/lifecycle
 // settlement (or the one-shot startup watchdog). This is not process proof.
 const codexLaunchAcceptancePending = new Map();
-const aiShellLaunchInflight = new Map(); // tabId → cross-agent proven-idle shell launch transaction
+// Start/Resume/Fork and Stop share one FIFO per tab. A launch-only lock let a
+// delayed orchestration Stop race a restored process in either direction.
+const aiLifecycleActionInflight = new Map(); // tabId → main-owned lifecycle action transaction
 const codexLaunchInflight = new Map(); // tabId → serialized launch/resume admission
 const claudeResumePreparationInflight = new Map(); // sessionId → serialized trim/repair transaction
 // A resume source is launch intent, not writer identity, but two live resumes
@@ -4354,6 +4894,326 @@ const claudePromptStability = createClaudePromptStabilityRegistry({
   now: () => Date.now(),
   log: (message) => console.log(message),
 });
+
+function observeClaudeSynchronizedFrameFlushed(tabId, expectedState, writeSeq) {
+  const launch = claudeLaunchGenerationByTab.get(tabId) || null;
+  if (!launch?.generation || getHeadlessTerminalMirror(tabId) !== expectedState) return;
+  if (
+    expectedState.failed === true
+    || expectedState.redrawTrace?.synchronizedOutputOpen === true
+    || Number(expectedState.flushedSeq || 0) !== Number(expectedState.writeSeq || 0)
+    || Number(writeSeq || 0) !== Number(expectedState.flushedSeq || 0)
+  ) return;
+  if (claudeTurnBusy.get(tabId) === true || aiStoppingTabs.has(tabId)) return;
+
+  const snapshot = getHeadlessVisibleBufferSnapshot(tabId, 'claude-prompt-stability');
+  if (!snapshot?.success || snapshot.synchronizedOutputOpen === true) return;
+  const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
+  if (
+    looksLikeClaudeRewindMenuText(visibleText)
+    || /(?:Change effort level|Switch model\?)/i.test(visibleText)
+  ) return;
+  const proof = parseClaudeComposerCurrentFrame(snapshot);
+  if (
+    proof.proofOutcome !== 'found'
+    && proof.proofOutcome !== 'absent'
+    && proof.exactCaptureRecommended !== true
+  ) return;
+  claudePromptStability.markStable(
+    tabId,
+    launch.generation,
+    'current-composer-frame:' + writeSeq,
+  );
+}
+
+function currentClaudeFrameHasStashMarker(tabId) {
+  const snapshot = getHeadlessVisibleBufferSnapshot(tabId, 'startup-stash-marker');
+  if (
+    snapshot?.success !== true
+    || snapshot.source !== 'headless-main'
+    || snapshot.synchronizedOutputOpen === true
+    || Number(snapshot.writeSeq) !== Number(snapshot.flushedSeq)
+  ) return null;
+  const visible = snapshot.lines.map((line) => line?.text || '').join('\n');
+  return STASH_MARKER_RE.test(visible);
+}
+
+function exactClaudeEmptyEvidenceStillCurrent(tabId, evidence) {
+  if (
+    !evidence
+    || evidence.proofOutcome !== 'absent'
+    || evidence.terminalIdentityStable !== true
+    || evidence.editorReturnReady !== true
+    || String(evidence.text || '').trim()
+    || Number(evidence.images || 0) > 0
+  ) return false;
+  const mirror = getHeadlessTerminalMirror(tabId);
+  return Number(evidence.terminalRunSeq) === Number(terminalCommandState.get(tabId)?.runSeq || 0)
+    && Number(evidence.inputRevision) === getTerminalInputRevision(tabId)
+    && evidence.terminalLifecycleGeneration === getTerminalLifecycleGeneration(tabId)
+    && evidence.mirrorGeneration === (mirror?.generation || null);
+}
+
+async function exactClaudeStartupComposerRead(tabId, generation, lease, proof) {
+  const captured = await captureAgentInput(tabId, 'copy', 'claude', {
+    draftProof: proof,
+  });
+  if (captured?.success !== true) {
+    return {
+      ready: false,
+      retryAdmission: false,
+      error: captured?.error || 'claude_startup_exact_input_failed',
+    };
+  }
+
+  // Ctrl+G temporarily leaves the TUI. Its editor-return frame owns a new
+  // lease, so never keep using the frame lease captured before Ctrl+G.
+  const promptStable = await claudePromptStability.wait(tabId, generation);
+  if (promptStable?.ready !== true) {
+    return {
+      ready: false,
+      retryAdmission: false,
+      error: promptStable?.reason || 'claude_startup_editor_return_unresolved',
+    };
+  }
+  const nextLease = promptStable.lease || null;
+  const admission = claudePromptStability.validate(tabId, generation, nextLease);
+  if (!admission.valid) {
+    return {
+      ready: false,
+      retryAdmission: true,
+      error: admission.reason,
+    };
+  }
+  if (String(captured.text || '').trim() || Number(captured.images || 0) > 0) {
+    return {
+      ready: true,
+      hasDraft: true,
+      lease: nextLease,
+      captured,
+    };
+  }
+  if (!exactClaudeEmptyEvidenceStillCurrent(tabId, captured)) {
+    return {
+      ready: false,
+      retryAdmission: false,
+      error: captured?.proofReason || 'claude_startup_exact_empty_unresolved',
+    };
+  }
+  return {
+    ready: true,
+    hasDraft: false,
+    lease: nextLease,
+    exactEmptyEvidence: captured,
+  };
+}
+
+async function prepareClaudeStartupComposer({ tabId, generation, lease, term }) {
+  let currentLease = lease;
+  let proof = await requestTerminalClaudeDraftState(
+    mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    tabId,
+    'startup-command-before-stash',
+    900,
+  );
+  let admission = claudePromptStability.validate(tabId, generation, currentLease);
+  if (!admission.valid) {
+    return { ready: false, retryAdmission: true, error: admission.reason };
+  }
+
+  let exactEmptyEvidence = null;
+  let hasDraft = proof?.proofOutcome === 'found' && proof?.hasDraft === true;
+  if (
+    proof?.proofOutcome === 'unknown'
+    && proof?.exactCaptureRecommended === true
+  ) {
+    const exact = await exactClaudeStartupComposerRead(
+      tabId,
+      generation,
+      currentLease,
+      proof,
+    );
+    if (!exact.ready) return exact;
+    currentLease = exact.lease;
+    hasDraft = exact.hasDraft === true;
+    exactEmptyEvidence = exact.exactEmptyEvidence || null;
+  } else if (proof?.proofOutcome !== 'absent' && !hasDraft) {
+    return {
+      ready: false,
+      retryAdmission: false,
+      error: proof?.proofReason || proof?.error || 'claude_startup_composer_unknown',
+    };
+  }
+
+  if (!hasDraft) {
+    return {
+      ready: true,
+      lease: currentLease,
+      proof,
+      exactEmptyEvidence,
+    };
+  }
+
+  const stashVisible = currentClaudeFrameHasStashMarker(tabId);
+  if (stashVisible !== false) {
+    return {
+      ready: false,
+      retryAdmission: false,
+      error: stashVisible === true
+        ? 'claude_startup_draft_and_existing_stash'
+        : 'claude_startup_stash_state_unknown',
+    };
+  }
+  admission = claudePromptStability.validate(tabId, generation, currentLease);
+  if (!admission.valid || terminals.get(tabId) !== term) {
+    return {
+      ready: false,
+      retryAdmission: true,
+      error: admission.valid ? 'claude_startup_terminal_changed' : admission.reason,
+    };
+  }
+
+  console.log('[StartupTx] stash-native-draft tab=' + String(tabId).slice(-12)
+    + ' gen=' + generation);
+  const editorFrame = waitForNextPtySynchronizedFrame(term, { timeoutMs: 1800 });
+  bumpTerminalInputRevision(tabId);
+  term.write('\x13');
+  const stashedFrame = await editorFrame;
+  if (stashedFrame?.ready !== true) {
+    return {
+      ready: false,
+      retryAdmission: false,
+      error: stashedFrame?.reason || 'claude_startup_stash_frame_unconfirmed',
+    };
+  }
+
+  const promptStable = await claudePromptStability.wait(tabId, generation);
+  if (promptStable?.ready !== true) {
+    return {
+      ready: false,
+      retryAdmission: false,
+      error: promptStable?.reason || 'claude_startup_stash_prompt_unresolved',
+    };
+  }
+  currentLease = promptStable.lease || null;
+  admission = claudePromptStability.validate(tabId, generation, currentLease);
+  if (!admission.valid) {
+    return { ready: false, retryAdmission: true, error: admission.reason };
+  }
+
+  proof = await requestTerminalClaudeDraftState(
+    mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    tabId,
+    'startup-command-after-stash',
+    900,
+  );
+  admission = claudePromptStability.validate(tabId, generation, currentLease);
+  if (!admission.valid) {
+    return { ready: false, retryAdmission: true, error: admission.reason };
+  }
+  if (proof?.proofOutcome === 'absent' && proof?.hasDraft === false) {
+    return { ready: true, lease: currentLease, proof, exactEmptyEvidence: null };
+  }
+  if (proof?.proofOutcome === 'unknown' && proof?.exactCaptureRecommended === true) {
+    const exact = await exactClaudeStartupComposerRead(
+      tabId,
+      generation,
+      currentLease,
+      proof,
+    );
+    if (exact.ready && exact.hasDraft === false) {
+      return {
+        ready: true,
+        lease: exact.lease,
+        proof,
+        exactEmptyEvidence: exact.exactEmptyEvidence,
+      };
+    }
+    return exact.ready
+      ? { ready: false, retryAdmission: false, error: 'claude_startup_stash_did_not_clear' }
+      : exact;
+  }
+  return {
+    ready: false,
+    retryAdmission: false,
+    error: 'claude_startup_stash_did_not_clear',
+  };
+}
+
+async function verifyClaudeStartupCommandAtEnterBoundary({
+  tabId,
+  generation,
+  lease,
+  term,
+  command,
+}) {
+  const admissionBefore = claudePromptStability.validate(
+    tabId,
+    generation,
+    lease,
+    { allowFrameAdvance: true },
+  );
+  if (!admissionBefore.valid) return admissionBefore;
+  if (
+    terminals.get(tabId) !== term
+    || claudeLaunchGenerationByTab.get(tabId)?.generation !== generation
+  ) {
+    return { valid: false, reason: 'claude-startup-generation-changed' };
+  }
+
+  // The paste itself legitimately creates one or more redraw frames, so the
+  // pre-paste lease cannot require an unchanged frame sequence at Enter. Do
+  // not merely waive that check, though: prove from the freshly flushed
+  // current frame that the composer contains exactly the command we pasted.
+  // An unrelated restored notification, menu, partial redraw, or user edit
+  // therefore loses admission before Enter rather than colliding with it.
+  const proof = await requestTerminalClaudeDraftState(
+    mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    tabId,
+    'startup-command-enter-boundary',
+    900,
+  );
+  const admissionAfter = claudePromptStability.validate(
+    tabId,
+    generation,
+    lease,
+    { allowFrameAdvance: true },
+  );
+  if (!admissionAfter.valid) return admissionAfter;
+  if (
+    terminals.get(tabId) !== term
+    || claudeLaunchGenerationByTab.get(tabId)?.generation !== generation
+  ) {
+    return { valid: false, reason: 'claude-startup-generation-changed' };
+  }
+  if (
+    proof?.proofOutcome !== 'found'
+    || proof?.hasDraft !== true
+    || !String(proof?.source || '').startsWith('headless-main:')
+  ) {
+    return {
+      valid: false,
+      reason: 'claude-startup-command-not-proven-at-enter',
+      proof,
+    };
+  }
+  if (
+    normalizeClaudeLocalCommandText(proof.text)
+    !== normalizeClaudeLocalCommandText(command)
+  ) {
+    return {
+      valid: false,
+      reason: 'claude-startup-command-changed-at-enter',
+      proof,
+    };
+  }
+  return {
+    valid: true,
+    reason: 'claude-startup-command-exact-at-enter',
+    proof,
+  };
+}
+
 const claudeStartupMainRuntime = createClaudeStartupMainRuntime({
   now: () => Date.now(),
   log: (message) => console.log(message),
@@ -4361,33 +5221,127 @@ const claudeStartupMainRuntime = createClaudeStartupMainRuntime({
     claudeLaunchGenerationByTab.get(tabId)?.generation || null,
   resolveSettings: (context) => resolveClaudeStartupSettingsInMain(context),
   sendCommand: async ({ tabId, generation, command, source, recovery = null }) => {
-    const promptStable = await claudePromptStability.wait(tabId, generation);
-    console.log('[StartupTx] prompt-stability tab=' + String(tabId).slice(-12)
-      + ' gen=' + String(generation || '-')
-      + ' ready=' + (promptStable?.ready === true)
-      + ' reason=' + String(promptStable?.reason || '-'));
-    if (promptStable?.ready !== true) {
-      return {
-        success: false,
-        submitted: false,
-        error: 'claude_prompt_not_stable',
-        reason: promptStable?.reason || 'prompt-stability-unresolved',
-      };
-    }
-    return recovery?.kind === 'submit-existing-input'
-      ? inspectClaudeExactSettingInput(tabId, command, {
-        submit: true,
-        source,
-      })
-      : sendClaudeCommandInternal(
-        tabId,
-        command,
-        {
+    let admissionAttempt = 0;
+    while (claudeLaunchGenerationByTab.get(tabId)?.generation === generation) {
+      admissionAttempt += 1;
+      const promptStable = await claudePromptStability.wait(tabId, generation);
+      console.log('[StartupTx] prompt-stability tab=' + String(tabId).slice(-12)
+        + ' gen=' + String(generation || '-')
+        + ' attempt=' + admissionAttempt
+        + ' ready=' + (promptStable?.ready === true)
+        + ' reason=' + String(promptStable?.reason || '-'));
+      if (promptStable?.ready !== true) {
+        return {
+          success: false,
+          submitted: false,
+          pasteWritten: false,
+          error: 'claude_prompt_not_stable',
+          reason: promptStable?.reason || 'prompt-stability-unresolved',
+        };
+      }
+      let lease = promptStable.lease || null;
+      const beforeSend = claudePromptStability.validate(tabId, generation, lease);
+      if (!beforeSend.valid) {
+        console.log('[StartupTx] prompt-admission-retry tab=' + String(tabId).slice(-12)
+          + ' gen=' + generation
+          + ' attempt=' + admissionAttempt
+          + ' stage=before-send'
+          + ' reason=' + beforeSend.reason);
+        continue;
+      }
+      let composerAdmission = null;
+      if (recovery?.kind !== 'submit-existing-input') {
+        // Reserve input ownership before the exact composer proof. The shared
+        // command sender normally advances this revision itself; startup does
+        // it here so its empty/exact evidence is not made stale between the
+        // preparation and the eventual paste.
+        bumpTerminalInputRevision(tabId);
+        composerAdmission = await prepareClaudeStartupComposer({
+          tabId,
+          generation,
+          lease,
+          term: terminals.get(tabId),
+        });
+        if (composerAdmission?.ready !== true) {
+          if (composerAdmission?.retryAdmission === true) {
+            console.log('[StartupTx] prompt-admission-retry tab=' + String(tabId).slice(-12)
+              + ' gen=' + generation
+              + ' attempt=' + admissionAttempt
+              + ' stage=composer-prepare'
+              + ' reason=' + String(composerAdmission?.error || '-'));
+            continue;
+          }
+          return {
+            success: false,
+            submitted: false,
+            pasteWritten: false,
+            error: composerAdmission?.error || 'claude_startup_composer_unresolved',
+          };
+        }
+        lease = composerAdmission.lease || lease;
+      }
+      const result = recovery?.kind === 'submit-existing-input'
+        ? await inspectClaudeExactSettingInput(tabId, command, {
+          submit: true,
           source,
-          stashFirst: true,
-          armPromptBoundaryOnSubmit: true,
-        },
-      );
+          generation,
+          startupPromptLease: lease,
+        })
+        : await sendClaudeCommandInternal(
+          tabId,
+          command,
+          {
+            source,
+            // The launch prompt has no user-owned text yet: the pending user
+            // message is held behind this gate. Avoiding Ctrl+S keeps the prompt
+            // lease meaningful up to the actual paste boundary. A real native
+            // draft was already moved into Claude's own stash by the
+            // generation-owned preparation above.
+            stashFirst: false,
+            armPromptBoundaryOnSubmit: true,
+            startupPromptLease: lease,
+            startupExactEmptyEvidence: composerAdmission?.exactEmptyEvidence || null,
+            verifyClaudeVisibleDraftBeforePaste: true,
+            inputRevisionAlreadyReserved: true,
+          },
+        );
+      if (
+        result?.error === 'claude_prompt_not_stable'
+        && result?.pasteWritten !== true
+      ) {
+        // Admission changed before any bytes reached Claude. This is not a
+        // delivery retry and consumes none of the transaction's one safe
+        // retry allowance; wait event-driven for the next exact prompt lease.
+        console.log('[StartupTx] prompt-admission-retry tab=' + String(tabId).slice(-12)
+          + ' gen=' + generation
+          + ' attempt=' + admissionAttempt
+          + ' stage=before-paste'
+          + ' reason=' + String(result.reason || '-'));
+        continue;
+      }
+      if (
+        result?.error === 'claude_prompt_not_stable'
+        && result?.pasteWritten === true
+      ) {
+        // Bytes are present but Enter was withheld. Delivery is not guessed:
+        // the transaction's normal proof step checks the exact current input.
+        // Only that exact ABSENT proof may spend the one automatic retry.
+        return {
+          ...result,
+          success: true,
+          submitted: false,
+          reason: result.reason || 'startup-command-held-before-enter',
+        };
+      }
+      return result;
+    }
+    return {
+      success: false,
+      submitted: false,
+      pasteWritten: false,
+      error: 'claude_prompt_not_stable',
+      reason: 'stale-generation',
+    };
   },
   proveCommand: (context) => waitForClaudeStartupSlashProofInMain(context),
   publishGate: (payload) => publishClaudeStartupDefaultsGate(
@@ -4423,6 +5377,7 @@ function beginClaudeLaunchGeneration(
   } = {},
 ) {
   if (!tabId) return null;
+  const previous = claudeLaunchGenerationByTab.get(tabId) || null;
   claudeLaunchGenerationSeq += 1;
   const generation = 'claude-launch-' + claudeLaunchGenerationSeq;
   claudeLaunchGenerationByTab.set(tabId, {
@@ -4432,6 +5387,13 @@ function beginClaudeLaunchGeneration(
     launchMode,
     sessionIdHint: sessionIdHint || null,
   });
+  if (previous?.generation) {
+    claudeStartupProofSession?.cancel(
+      tabId,
+      previous.generation,
+      'generation-superseded',
+    );
+  }
   claudePendingPromptDispatchers.delete(tabId);
   claudePromptStability.open(tabId, generation, reason);
   console.log('[StartupTx] generation-open tab=' + String(tabId).slice(-12)
@@ -4465,11 +5427,18 @@ function clearClaudeLaunchGeneration(tabId, reason = 'process-exit') {
   const existing = claudeLaunchGenerationByTab.get(tabId);
   claudeStartupIntentUseByTab.delete(tabId);
   claudePendingPromptDispatchers.delete(tabId);
+  clearClaudePtyCompactProofAttempt(
+    tabId,
+    undefined,
+    'launch-generation-clear:' + reason,
+  );
   if (!existing) {
+    claudeStartupProofSession?.cancel(tabId, null, reason);
     claudePromptStability.clear(tabId, null, reason);
     return;
   }
   claudeLaunchGenerationByTab.delete(tabId);
+  claudeStartupProofSession?.cancel(tabId, existing.generation, reason);
   claudePromptStability.clear(tabId, existing.generation, reason);
   claudeStartupMainRuntime.clear(tabId, reason);
   console.log('[StartupTx] generation-clear tab=' + String(tabId).slice(-12)
@@ -5211,6 +6180,25 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
       requiresExactCodexSettingsProof: !!pendingSettingsProof,
     });
   }
+  const carriedFast = pendingSettingsCarry.proof?.fast;
+  if (typeof carriedFast === 'boolean') {
+    publishCodexServiceTierProof(
+      tabId,
+      carriedFast ? 'priority' : 'default',
+      'verified-composer-writer-handoff',
+      sessionId,
+    );
+  } else if (proofRecord.carryCodexSettingsProof) {
+    const existingTierProof = codexTuiReadyMeta.get(tabId)?.serviceTierProof || null;
+    if (existingTierProof?.ownerId === prev) {
+      publishCodexServiceTierProof(
+        tabId,
+        existingTierProof.serviceTier,
+        'live-writer-handoff',
+        sessionId,
+      );
+    }
+  }
   if (proofChanged) {
     console.log('[Codex:Known] set tab=' + String(tabId).slice(-12) +
       ' session=' + String(sessionId).slice(0, 8) +
@@ -5264,6 +6252,52 @@ function getCodexProvisionalSettingsSnapshot(tabId, expectedOwnerId = null) {
     codexProvisionalSettingsProofAt: projected.proofAt,
     codexProvisionalSettingsProofSource: projected.applicationProofSource,
   };
+}
+
+function publishCodexServiceTierProof(
+  tabId,
+  serviceTier,
+  source = 'tui',
+  explicitOwnerId = null,
+  { emit = true } = {},
+) {
+  if (!tabId) return null;
+  const normalizedTier = String(serviceTier || '').trim().toLowerCase();
+  if (normalizedTier !== 'priority' && normalizedTier !== 'default') return null;
+  const writerOwner = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
+  const provisionalOwner = getCodexProvisionalSettingsSnapshot(tabId)
+    ?.codexProvisionalSettingsOwnerId || null;
+  const ownerId = String(explicitOwnerId || writerOwner || provisionalOwner || '').trim();
+  if (!ownerId) return null;
+
+  const previousMeta = codexTuiReadyMeta.get(tabId) || {};
+  const previousProof = previousMeta.serviceTierProof || null;
+  const proof = {
+    ownerId,
+    serviceTier: normalizedTier,
+    fast: normalizedTier === 'priority',
+    proofAt: Date.now(),
+    source: String(source || 'tui'),
+  };
+  codexTuiReadyMeta.set(tabId, {
+    ...previousMeta,
+    serviceTierProof: proof,
+  });
+  const changed = previousProof?.ownerId !== proof.ownerId
+    || previousProof?.serviceTier !== proof.serviceTier;
+  if (changed) {
+    console.log('[CodexServiceTier] proof tab=' + String(tabId).slice(-12)
+      + ' owner=' + ownerId.slice(0, 24)
+      + ' tier=' + normalizedTier
+      + ' source=' + proof.source);
+  }
+  if (emit && changed && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:service-tier-proof', {
+      tabId,
+      ...proof,
+    });
+  }
+  return proof;
 }
 
 function isCodexWriterUsableForMutation(tabId) {
@@ -5947,6 +6981,25 @@ function registerTaskCompletionIntent({ tabId, sourceTabId = null } = {}) {
   if (!liveBusy) return { ok: false, code: 'no_active_turn' };
   return taskCompletionIntents.requestCompletion({ tabId, sourceTabId });
 }
+
+function getActiveAgentExecutionContext(tabId) {
+  const turn = taskCompletionIntents.getTurn(tabId);
+  if (!turn?.active || !turn.provider) return null;
+  const liveBusy = turn.provider === 'codex'
+    ? codexTurnWatchers.get(tabId)?.busy === true
+    : claudeTurnBusy.get(tabId) === true;
+  if (!liveBusy) return null;
+  const turnId = turn.turnId || (turn.generation ? turn.provider + ':' + turn.generation : null);
+  if (!turnId) return null;
+  return {
+    provider: turn.provider,
+    sessionId: turn.sessionId || null,
+    turnId,
+    processId: turn.processId || null,
+    generation: turn.generation || null,
+    startedAt: turn.startedAt || null,
+  };
+}
 const claudeTurnWatchdog = new Map(); // tabId → timeout ID (silent-tool-stop safety)
 const CLAUDE_TURN_WATCHDOG_MS = 60 * 60 * 1000; // 60min — safety net against silent-tool-stop (#29881) and hook-script crashes; only fires when Stop legitimately never arrives
 const CLAUDE_TURN_WATCHDOG_EXTENSION_MS = 15 * 60 * 1000;
@@ -6062,7 +7115,8 @@ const INTERRUPT_TEXTS = new Set([
   '[Request interrupted by user for tool use]',
 ]);
 const claudeLocalCommandWatchers = new Map(); // tabId → { command, watcher, filePath, offset, debounce, timeout, startedAt }
-const claudeInputLineBuffers = new Map(); // tabId → best-effort typed line buffer for manual slash commands
+const claudeInputLineBuffers = new Map(); // tabId → { text, exact terminal/session/launch/prompt owner }
+const claudePtyCompactProofInflight = new Map(); // tabId → exact transcript-proof attempt
 
 let claudeHookServer = null;
 
@@ -6092,34 +7146,6 @@ function normalizeClaudeLocalCommandText(text) {
     .replace(/\u00a0/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-}
-
-function parseClaudeStartupSlashCommand(command) {
-  const text = String(command || '').trim();
-  const match = text.match(/^\/(model|effort)\s+(.+)$/i);
-  if (!match) return null;
-  return {
-    kind: match[1].toLowerCase(),
-    value: match[2].trim().toLowerCase(),
-  };
-}
-
-function claudeStartupSlashRecordKind(rec, target) {
-  const content = rec?.message?.content;
-  if (typeof content !== 'string') return null;
-  const text = normalizeClaudeLocalCommandText(content);
-  const argsMatch = text.match(/<command-args>([\s\S]*?)<\/command-args>/i);
-  const commandArgs = argsMatch ? normalizeClaudeLocalCommandText(argsMatch[1]).toLowerCase() : '';
-  if (target.kind === 'effort') {
-    if (text.startsWith('<command-name>/effort</command-name>') && commandArgs === target.value) return 'wrapper';
-    if (/^<local-command-stdout>Set effort level to\b/i.test(text)
-      && text.toLowerCase().includes('set effort level to ' + target.value)) return 'stdout';
-  }
-  if (target.kind === 'model') {
-    if (text.startsWith('<command-name>/model</command-name>') && commandArgs === target.value) return 'wrapper';
-    if (/^<local-command-stdout>Set model to\b/i.test(text)) return 'stdout';
-  }
-  return null;
 }
 
 function resolveClaudeStartupSlashSessionId(tabId) {
@@ -6166,6 +7192,7 @@ function claudeStartupTestFaultActive(kind) {
 const AGENT_SEND_TEST_FAULT = app.isPackaged
   ? ''
   : String(process.env.NOTED_TEST_SEND_FAULT || '').trim();
+let codexDraftUnknownTestFaultConsumed = false;
 function agentSendTestFaultActive(kind) {
   const active = AGENT_SEND_TEST_FAULT === kind;
   if (active) console.warn('[TestFault] active kind=agent-send-' + kind);
@@ -6182,14 +7209,14 @@ function claudeStartupProofOutcome(result) {
   return CLAUDE_STARTUP_PROOF.UNRESOLVED;
 }
 
-function scanClaudeStartupSlashProof(tabId, command, afterMs) {
+function scanClaudeStartupSlashProof(tabId, command, afterMs, sessionIdOverride = null) {
   const target = parseClaudeStartupSlashCommand(command);
   if (!target) return { success: false, reason: 'unsupported-command' };
   // A local slash command can materialize its JSONL before StatusLine bridge
   // ownership is accepted. The exact tab row is updated by the independent
   // terminal session-id detector, so it is a valid discovery fallback; the
   // timestamp + exact command wrapper below prevents stale-session proof.
-  const sessionId = resolveClaudeStartupSlashSessionId(tabId);
+  const sessionId = sessionIdOverride || resolveClaudeStartupSlashSessionId(tabId);
   const filePath = resolveClaudeSessionFileForTab(tabId, sessionId);
   if (!filePath) {
     return { success: false, reason: 'session-file-missing', sessionId };
@@ -6208,46 +7235,13 @@ function scanClaudeStartupSlashProof(tabId, command, afterMs) {
     const tail = buf.toString('utf8');
     const rawLines = tail.split('\n');
     const lines = startOffset > 0 ? rawLines.slice(1) : rawLines;
-    const minTs = Number(afterMs || 0) > 0 ? Number(afterMs) - 1000 : 0;
-    let wrapperSeen = false;
-    let stdoutSeen = false;
-    let latestTs = 0;
-    let latestKind = null;
-
+    const records = [];
     for (const line of lines) {
       if (!line || line[0] !== '{') continue;
-      let rec;
-      try { rec = JSON.parse(line); } catch { continue; }
-      const ts = Date.parse(rec.timestamp || '');
-      if (minTs > 0 && (!Number.isFinite(ts) || ts < minTs)) continue;
-      const kind = claudeStartupSlashRecordKind(rec, target);
-      if (!kind) continue;
-      latestTs = Number.isFinite(ts) ? ts : latestTs;
-      latestKind = kind;
-      if (kind === 'wrapper') wrapperSeen = true;
-      if (kind === 'stdout') {
-        stdoutSeen = true;
-        if (!wrapperSeen) continue;
-        return {
-          success: true,
-          reason: 'jsonl-stdout',
-          sessionId,
-          timestamp: rec.timestamp || null,
-          wrapperSeen,
-          stdoutSeen,
-          file: filePath.replace(os.homedir(), '~'),
-        };
-      }
+      try { records.push(JSON.parse(line)); } catch { /* partial tail line */ }
     }
-
     return {
-      success: false,
-      reason: stdoutSeen ? 'stdout-unmatched' : 'stdout-not-found',
-      sessionId,
-      wrapperSeen,
-      stdoutSeen,
-      latestTs,
-      latestKind,
+      ...scanClaudeStartupSlashRecords(records, command, { afterMs, sessionId }),
       file: filePath.replace(os.homedir(), '~'),
     };
   } catch (error) {
@@ -6374,6 +7368,7 @@ function readClaudeStartupSlashProof(payload = {}) {
   const tabId = String(payload?.tabId || '');
   const command = String(payload?.command || '');
   const afterMs = Number(payload?.afterMs || 0);
+  const sessionId = String(payload?.sessionId || '').trim() || null;
   const label = String(payload?.label || 'startup-slash-proof');
   if (!tabId || !command) {
     return {
@@ -6391,7 +7386,7 @@ function readClaudeStartupSlashProof(payload = {}) {
       outcome: CLAUDE_STARTUP_PROOF.UNRESOLVED,
     };
   }
-  const result = scanClaudeStartupSlashProof(tabId, command, afterMs);
+  const result = scanClaudeStartupSlashProof(tabId, command, afterMs, sessionId);
   result.outcome = claudeStartupProofOutcome(result);
   console.log('[ClaudeStartupSlashProof] tab=' + tabId.slice(-12)
     + ' label=' + label
@@ -6399,11 +7394,13 @@ function readClaudeStartupSlashProof(payload = {}) {
     + ' afterMs=' + (afterMs || 0)
     + ' success=' + (result.success === true)
     + ' outcome=' + result.outcome
+    + ' terminal=' + (result.terminal === true)
     + ' reason=' + (result.reason || '-')
     + ' wrapperSeen=' + !!result.wrapperSeen
     + ' stdoutSeen=' + !!result.stdoutSeen
     + ' session=' + (result.sessionId ? String(result.sessionId).slice(0, 8) : '-')
     + ' file=' + (result.file || '-')
+    + ' output=' + JSON.stringify(result.outputPreview || '')
     + ' error=' + (result.error || '-'));
   return result;
 }
@@ -6416,74 +7413,80 @@ async function waitForClaudeStartupSlashProofInMain({
   label,
   sendResult = null,
 } = {}) {
-  const deadline = Date.now() + 6500;
-  let last = null;
+  if (claudeLaunchGenerationByTab.get(tabId)?.generation !== generation) {
+    return {
+      outcome: CLAUDE_STARTUP_PROOF.UNRESOLVED,
+      reason: 'stale-generation',
+    };
+  }
+
   const target = parseClaudeStartupSlashCommand(command);
-  while (Date.now() <= deadline) {
-    if (claudeLaunchGenerationByTab.get(tabId)?.generation !== generation) {
-      return {
-        outcome: CLAUDE_STARTUP_PROOF.UNRESOLVED,
-        reason: 'stale-generation',
-      };
-    }
+  if (target) {
+    await confirmClaudeSettingsDialogFromCurrentFrame(
+      tabId,
+      target.kind === 'model' ? 'ModelDialog' : 'EffortDialog',
+      'startup-defaults:' + label,
+    ).catch(() => null);
+  }
 
-    if (target) {
-      await confirmClaudeSettingsDialogFromCurrentFrame(
-        tabId,
-        target.kind === 'model' ? 'ModelDialog' : 'EffortDialog',
-        'startup-defaults:' + label,
-      ).catch(() => null);
-    }
-
-    last = readClaudeStartupSlashProof({
+  // Enter was explicitly withheld: this is the one branch where the current
+  // composer may prove that no submission happened and authorize one safe
+  // retry. Once Enter may have been written, screen state cannot decide the
+  // outcome; only the exact transcript result may advance the transaction.
+  if (sendResult?.submitted === false) {
+    const scan = readClaudeStartupSlashProof({
       tabId,
       command,
       afterMs,
       label,
     });
-    if (last?.outcome === CLAUDE_STARTUP_PROOF.FOUND) return last;
-    if (Date.now() >= deadline) break;
-    await sleep(180);
-  }
-  const finalScan = last || {
-    outcome: CLAUDE_STARTUP_PROOF.UNRESOLVED,
-    reason: 'no-proof-result',
-  };
-  const composer = await inspectClaudeExactSettingInput(tabId, command, {
-    submit: false,
-    source: 'startup-proof:' + label,
-  }).catch((error) => ({
-    success: false,
-    submitted: false,
-    error: error?.message || String(error),
-  }));
+    if (scan?.outcome === CLAUDE_STARTUP_PROOF.FOUND || scan?.terminal === true) {
+      return scan;
+    }
+    const composer = await inspectClaudeExactSettingInput(tabId, command, {
+      submit: false,
+      source: 'startup-proof:' + label,
+    }).catch((error) => ({
+      success: false,
+      submitted: false,
+      error: error?.message || String(error),
+    }));
 
-  const delivery = classifyClaudeStartupDeliveryProof({
-    scan: finalScan,
-    composer,
-    sendResult,
-  });
-  if (delivery.outcome === CLAUDE_STARTUP_PROOF.ABSENT) {
+    const delivery = classifyClaudeStartupDeliveryProof({
+      scan,
+      composer,
+      sendResult,
+    });
+    if (delivery.outcome === CLAUDE_STARTUP_PROOF.ABSENT) {
+      console.warn('[ClaudeStartupDeliveryProof] tab=' + String(tabId).slice(-12)
+        + ' label=' + String(label || '-')
+        + ' command=' + JSON.stringify(command)
+        + ' outcome=absent'
+        + ' reason=exact-input-awaiting-submit'
+        + ' scanReason=' + (scan.reason || '-')
+        + ' submitProof=not-written'
+        + ' recovery=submit-existing-input');
+      return delivery;
+    }
+
     console.warn('[ClaudeStartupDeliveryProof] tab=' + String(tabId).slice(-12)
       + ' label=' + String(label || '-')
       + ' command=' + JSON.stringify(command)
-      + ' outcome=absent'
-      + ' reason=exact-input-awaiting-submit'
-      + ' scanReason=' + (finalScan.reason || '-')
-      + ' submitProof=not-written'
-      + ' recovery=submit-existing-input');
+      + ' outcome=unresolved'
+      + ' scanReason=' + (scan.reason || '-')
+      + ' composer=' + delivery.composerProof
+      + ' submitProof=' + delivery.submitProof
+      + ' error=' + (delivery.composerError || '-'));
     return delivery;
   }
 
-  console.warn('[ClaudeStartupDeliveryProof] tab=' + String(tabId).slice(-12)
-    + ' label=' + String(label || '-')
-    + ' command=' + JSON.stringify(command)
-    + ' outcome=unresolved'
-    + ' scanReason=' + (finalScan.reason || '-')
-    + ' composer=' + delivery.composerProof
-    + ' submitProof=' + delivery.submitProof
-    + ' error=' + (delivery.composerError || '-'));
-  return delivery;
+  return claudeStartupProofSession.wait({
+    tabId,
+    generation,
+    command,
+    afterMs,
+    label,
+  });
 }
 
 function emitClaudeBusyState(tabId, busy, reason, meta = null) {
@@ -6500,17 +7503,6 @@ function emitClaudeBusyState(tabId, busy, reason, meta = null) {
   }
 }
 
-function isCompactDoneRecord(rec) {
-  if (!rec || typeof rec !== 'object') return false;
-  if (rec.type === 'system' && rec.subtype === 'compact_boundary') return true;
-  if (rec.type === 'user' && rec.isCompactSummary === true) return true;
-  const content = rec.message?.content;
-  if (typeof content === 'string') {
-    return content.includes('<local-command-stdout>') && content.includes('Compacted');
-  }
-  return false;
-}
-
 function detectClaudeCompactOutputPhase(text) {
   if (!text) return null;
   const normalized = String(text).toLowerCase().replace(/\s+/g, '');
@@ -6524,14 +7516,38 @@ function detectClaudeCompactOutputPhase(text) {
   return null;
 }
 
+function readClaudeLocalCommandOwner(tabId) {
+  return {
+    terminal: terminals.get(tabId) || null,
+    sessionId: bridgeKnownSessions.get(tabId) || null,
+    generation: claudeLaunchGenerationByTab.get(tabId)?.generation || null,
+    inputRevision: getTerminalInputRevision(tabId),
+  };
+}
+
+function classifyCurrentClaudeLocalCommandOwner(tabId, state) {
+  return classifyClaudeLocalCommandOwner(state?.owner || null, readClaudeLocalCommandOwner(tabId));
+}
+
 function stopClaudeLocalCommandWatcher(tabId, reason = 'stop') {
   const state = claudeLocalCommandWatchers.get(tabId);
-  if (!state) return;
+  if (!state) return null;
   if (state.debounce) clearTimeout(state.debounce);
-  if (state.timeout) clearTimeout(state.timeout);
   if (state.watcher) { try { state.watcher.close(); } catch {} }
   claudeLocalCommandWatchers.delete(tabId);
+  clearClaudePtyCompactProofAttempt(tabId, undefined, 'local-command-stop:' + reason);
+  compactOperations.finish({
+    tabId,
+    provider: 'claude',
+    operationId: state.operationId,
+    sessionId: state.sessionId,
+    generation: state.generation,
+    outcome: claudeCompactOutcomeFromReason(reason),
+    reason,
+    completionProof: reason,
+  });
   console.log('[ClaudeLocalCommand] STOP tab=' + tabId.slice(-12) + ' command=' + state.command + ' reason=' + reason + ' durMs=' + (Date.now() - state.startedAt));
+  return state;
 }
 
 function completeClaudeLocalCommand(tabId, reason) {
@@ -6557,34 +7573,93 @@ function cancelClaudeLocalCommandFromInput(tabId, data) {
   return true;
 }
 
-function startClaudeLocalCommandWatcher(tabId, command, source = 'unknown') {
+function prepareClaudeLocalCommandWatcher(tabId, command, source = 'unknown', metadata = {}) {
   const normalized = String(command || '').trim();
-  if (normalized !== '/compact') return;
+  if (normalized !== '/compact') return null;
 
   const existing = claudeLocalCommandWatchers.get(tabId);
   if (existing) {
-    console.log('[ClaudeLocalCommand] START ignored tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' existingAgeMs=' + (Date.now() - existing.startedAt));
-    return;
+    console.log('[ClaudeLocalCommand] PREPARE ignored tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' existingAgeMs=' + (Date.now() - existing.startedAt));
+    return null;
   }
 
   const sessionId = bridgeKnownSessions.get(tabId) || null;
   const filePath = resolveClaudeSessionFileForTab(tabId, sessionId);
   if (!filePath) {
-    console.warn('[ClaudeLocalCommand] START fallback tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') + ' file=missing - using PTY output completion');
+    console.warn('[ClaudeLocalCommand] PREPARE fallback tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') + ' file=missing - using PTY output completion');
   }
 
   let offset = 0;
   if (filePath) {
     try { offset = fs.statSync(filePath).size; } catch {}
   }
+  const preparation = {
+    tabId,
+    command: normalized,
+    source,
+    sessionId,
+    filePath,
+    offset,
+    owner: readClaudeLocalCommandOwner(tabId),
+    handoffId: typeof metadata?.handoffId === 'string' && metadata.handoffId
+      ? metadata.handoffId
+      : null,
+    preparedAt: Date.now(),
+  };
+  console.log('[ClaudeLocalCommand] PREPARE tab=' + tabId.slice(-12)
+    + ' command=' + normalized
+    + ' source=' + source
+    + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none')
+    + ' file=' + (filePath ? filePath.replace(os.homedir(), '~') : 'missing')
+    + ' offset=' + offset);
+  return preparation;
+}
+
+function discardClaudeLocalCommandWatcherPreparation(preparation, reason = 'discard') {
+  if (!preparation) return false;
+  console.log('[ClaudeLocalCommand] DISCARD tab=' + String(preparation.tabId || '').slice(-12)
+    + ' command=' + preparation.command
+    + ' source=' + preparation.source
+    + ' reason=' + reason
+    + ' preparedAgeMs=' + Math.max(0, Date.now() - preparation.preparedAt));
+  return true;
+}
+
+function activateClaudeLocalCommandWatcher(preparation) {
+  if (!preparation?.tabId || preparation.command !== '/compact') return false;
+  const {
+    tabId,
+    command: normalized,
+    source,
+    sessionId,
+    filePath,
+    offset,
+  } = preparation;
+  const existing = claudeLocalCommandWatchers.get(tabId);
+  if (existing) {
+    console.log('[ClaudeLocalCommand] ACTIVATE ignored tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' existingAgeMs=' + (Date.now() - existing.startedAt));
+    return false;
+  }
+
   const state = {
     command: normalized,
     watcher: null,
     filePath,
     offset,
     debounce: null,
-    timeout: null,
     startedAt: Date.now(),
+    preparedAt: preparation.preparedAt,
+    owner: preparation.owner,
+    sessionId: preparation.sessionId || null,
+    generation: preparation.owner?.generation == null
+      ? null
+      : String(preparation.owner.generation),
+    handoffId: preparation.handoffId || null,
+    operationId: 'claude:'
+      + String(preparation.owner?.generation ?? 'generation-unknown')
+      + ':' + String(preparation.owner?.inputRevision ?? 'input-unknown')
+      + ':' + String(preparation.preparedAt),
+    requestTranscriptScan: null,
   };
 
   const onChange = () => {
@@ -6603,19 +7678,30 @@ function startClaudeLocalCommandWatcher(tabId, command, source = 'unknown') {
       const lines = buf.toString('utf8').split('\n');
       for (const line of lines) {
         if (!line) continue;
-        if (
-          line.indexOf('compact_boundary') === -1 &&
-          line.indexOf('isCompactSummary') === -1 &&
-          line.indexOf('Compacted') === -1
-        ) continue;
         let rec;
         try { rec = JSON.parse(line); } catch { continue; }
-        if (!isCompactDoneRecord(rec)) continue;
-        completeClaudeLocalCommand(tabId, rec.type === 'system' ? 'compact_boundary' : rec.isCompactSummary ? 'compact_summary' : 'compact_stdout');
+        const outcome = classifyClaudeCompactWatcherRecord(rec);
+        if (!outcome.terminal) {
+          if (outcome.reason === 'auto-compact-boundary') {
+            console.warn('[ClaudeLocalCommand] ignored automatic compact boundary tab='
+              + tabId.slice(-12) + ' command=' + normalized);
+          }
+          continue;
+        }
+        const ownership = classifyCurrentClaudeLocalCommandOwner(tabId, state);
+        if (!ownership.matches) {
+          console.warn('[ClaudeLocalCommand] completion owner changed tab='
+            + tabId.slice(-12) + ' command=' + normalized
+            + ' proof=' + outcome.reason + ' owner=' + ownership.reason);
+          completeClaudeLocalCommand(tabId, 'owner-changed:' + ownership.reason);
+          return;
+        }
+        completeClaudeLocalCommand(tabId, outcome.reason);
         return;
       }
     }, 100);
   };
+  state.requestTranscriptScan = onChange;
 
   if (filePath) {
     try {
@@ -6627,12 +7713,17 @@ function startClaudeLocalCommandWatcher(tabId, command, source = 'unknown') {
   }
 
   claudeLocalCommandWatchers.set(tabId, state);
-  state.timeout = setTimeout(() => {
-    if (claudeLocalCommandWatchers.get(tabId) !== state) return;
-    console.warn('[ClaudeLocalCommand] TIMEOUT tab=' + tabId.slice(-12) + ' command=' + normalized + ' afterMs=' + (Date.now() - state.startedAt) + ' — clearing local busy without durable compact marker');
-    completeClaudeLocalCommand(tabId, 'timeout');
-  }, 30 * 60 * 1000);
-  state.timeout.unref?.();
+  compactOperations.begin({
+    tabId,
+    provider: 'claude',
+    command: normalized,
+    operationId: state.operationId,
+    sessionId: state.sessionId,
+    generation: state.generation,
+    handoffId: state.handoffId,
+    source,
+    acceptedAt: state.startedAt,
+  });
   clearTimeout(claudeSpinnerIdleTimer.get(tabId));
   claudeSpinnerIdleTimer.delete(tabId);
   emitClaudeBusyState(tabId, true, 'local-command', {
@@ -6640,54 +7731,390 @@ function startClaudeLocalCommandWatcher(tabId, command, source = 'unknown') {
     localCommandReason: 'start',
     localCommandSource: source,
   });
-  console.log('[ClaudeLocalCommand] START tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') + ' file=' + (filePath ? filePath.replace(os.homedir(), '~') : 'missing') + ' offset=' + offset);
+  console.log('[ClaudeLocalCommand] START tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') + ' file=' + (filePath ? filePath.replace(os.homedir(), '~') : 'missing') + ' offset=' + offset + ' preparedAgeMs=' + Math.max(0, Date.now() - preparation.preparedAt));
+  // fs.watch starts only after Enter is proven. Scan once from the pre-Enter
+  // offset so an exceptionally fast compact marker written in that narrow
+  // gap cannot be missed.
+  if (filePath) onChange();
+  return true;
 }
 
-function trackClaudeInputLineForLocalCommands(tabId, data) {
-  if (!bridgeKnownSessions.has(tabId) || typeof data !== 'string' || data.length === 0) return;
-  let buf = claudeInputLineBuffers.get(tabId) || '';
-  const flush = () => {
-    const command = buf.trim();
-    if (command === '/compact') startClaudeLocalCommandWatcher(tabId, command, 'terminal-input');
-    buf = '';
-  };
+function startClaudeLocalCommandWatcher(tabId, command, source = 'unknown') {
+  const preparation = prepareClaudeLocalCommandWatcher(tabId, command, source);
+  return activateClaudeLocalCommandWatcher(preparation);
+}
 
-  const clean = data
-    .replace(/\x1b\[200~/g, '')
-    .replace(/\x1b\[201~/g, '');
-
-  for (let i = 0; i < clean.length; i++) {
-    const ch = clean[i];
-    const code = clean.charCodeAt(i);
-    if (ch === '\r' || ch === '\n') {
-      flush();
-      continue;
-    }
-    if (ch === '\x7f' || ch === '\x08') {
-      buf = buf.slice(0, -1);
-      continue;
-    }
-    if (ch === '\x15' || ch === '\x03') {
-      buf = '';
-      continue;
-    }
-    if (ch === '\x1b') {
-      if (clean.length === 1) {
-        buf = '';
-        continue;
-      }
-      while (i + 1 < clean.length && !/[A-Za-z~]/.test(clean[i + 1])) i++;
-      if (i + 1 < clean.length) i++;
-      continue;
-    }
-    if (code >= 32 && code !== 127) {
-      buf += ch;
-      if (buf.length > 200) buf = buf.slice(-200);
-    }
+function clearClaudePtyCompactProofAttempt(
+  tabId,
+  attempt = claudePtyCompactProofInflight.get(tabId) || null,
+  reason = 'clear',
+  { discard = true } = {},
+) {
+  if (!attempt) return false;
+  if (attempt.watcher) {
+    try { attempt.watcher.close(); } catch {}
+    attempt.watcher = null;
   }
+  if (claudePtyCompactProofInflight.get(tabId) === attempt) {
+    claudePtyCompactProofInflight.delete(tabId);
+  }
+  if (discard && attempt.activated !== true) {
+    discardClaudeLocalCommandWatcherPreparation(attempt.preparation, reason);
+  }
+  return true;
+}
 
-  if (buf) claudeInputLineBuffers.set(tabId, buf);
+function requestClaudePtyCompactTranscriptProof(tabId, attempt, source = 'unknown') {
+  if (!attempt || claudePtyCompactProofInflight.get(tabId) !== attempt) return;
+  if (attempt.scanInFlight) {
+    attempt.rescanRequested = true;
+    return;
+  }
+  attempt.scanInFlight = true;
+  attempt.rescanRequested = false;
+
+  void readClaudeUserRecords(
+    attempt.preparation.filePath,
+    null,
+    { maxReadBytes: 256 * 1024 },
+  ).then((candidates) => {
+    const proof = selectLatestClaudeManualCompactIntent(candidates, {
+      notBeforeMs: Number(attempt.launchAt || 0),
+    });
+    const stillCurrent = claudePtyCompactProofInflight.get(tabId) === attempt
+      && terminals.get(tabId) === attempt.terminal
+      && (claudeLaunchGenerationByTab.get(tabId)?.generation || null) === attempt.generation
+      && (bridgeKnownSessions.get(tabId) || null) === attempt.sessionId;
+    if (!stillCurrent) {
+      clearClaudePtyCompactProofAttempt(
+        tabId,
+        attempt,
+        'terminal-generation-changed',
+      );
+      return;
+    }
+    if (!proof.proven) {
+      attempt.lastReason = proof.reason;
+      console.log('[ClaudeLocalCommand] PROOF_WAIT tab=' + tabId.slice(-12)
+        + ' command=/compact source=' + source
+        + ' reason=' + proof.reason
+        + ' candidates=' + candidates.length
+        + ' sawCompacted=' + (attempt.sawCompactedOutput === true));
+      const automaticSummary = candidates.find((candidate) => (
+        candidate?.record?.isCompactSummary === true
+        && String(candidate?.record?.compactMetadata?.trigger || '').toLowerCase() === 'auto'
+        && Date.parse(String(candidate?.record?.timestamp || '')) >= attempt.launchAt
+      ));
+      const newerOrdinaryPromptAt = Date.parse(String(proof.candidate?.record?.timestamp || ''));
+      if (automaticSummary) {
+        clearClaudePtyCompactProofAttempt(
+          tabId,
+          attempt,
+          'automatic-compact-transcript',
+        );
+      } else if (
+        Number.isFinite(newerOrdinaryPromptAt)
+        && newerOrdinaryPromptAt >= attempt.preparation.preparedAt
+      ) {
+        clearClaudePtyCompactProofAttempt(
+          tabId,
+          attempt,
+          'newer-noncompact-prompt',
+        );
+      }
+      return;
+    }
+
+    attempt.activated = true;
+    clearClaudePtyCompactProofAttempt(tabId, attempt, 'proof-accepted', { discard: false });
+    attempt.preparation.source = 'pty-output-transcript-proof';
+    console.log('[ClaudeLocalCommand] PROOF_ACCEPT tab=' + tabId.slice(-12)
+      + ' command=/compact source=' + source
+      + ' reason=' + proof.reason
+      + ' candidateOffset=' + (proof.candidate?.byteOffset ?? '-'));
+    activateClaudeLocalCommandWatcher(attempt.preparation);
+  }).catch((error) => {
+    attempt.lastReason = 'transcript-proof-error';
+    console.warn('[ClaudeLocalCommand] PROOF_WAIT tab=' + tabId.slice(-12)
+      + ' command=/compact source=' + source
+      + ' reason=transcript-proof-error'
+      + ' error=' + (error?.message || String(error)));
+  }).finally(() => {
+    attempt.scanInFlight = false;
+    if (
+      claudePtyCompactProofInflight.get(tabId) === attempt
+      && attempt.rescanRequested === true
+    ) {
+      requestClaudePtyCompactTranscriptProof(tabId, attempt, 'coalesced-change');
+    }
+  });
+}
+
+function observeClaudeCompactFromPtyWithTranscriptProof(tabId) {
+  if (claudeLocalCommandWatchers.has(tabId)) return;
+  const existingAttempt = claudePtyCompactProofInflight.get(tabId) || null;
+  if (existingAttempt) {
+    requestClaudePtyCompactTranscriptProof(tabId, existingAttempt, 'additional-pty-output');
+    return;
+  }
+  const preparation = prepareClaudeLocalCommandWatcher(tabId, '/compact', 'pty-output-proof');
+  if (!preparation?.filePath) {
+    discardClaudeLocalCommandWatcherPreparation(preparation, 'transcript-unavailable');
+    return;
+  }
+  const terminal = terminals.get(tabId) || null;
+  const launch = claudeLaunchGenerationByTab.get(tabId) || null;
+  if (!terminal || !launch?.generation || !Number.isFinite(Number(launch.at))) {
+    discardClaudeLocalCommandWatcherPreparation(preparation, 'launch-generation-unavailable');
+    return;
+  }
+  const proofAttempt = {
+    terminal,
+    generation: launch?.generation || null,
+    sessionId: preparation.sessionId || null,
+    launchAt: Number(launch?.at || 0),
+    preparation,
+    watcher: null,
+    scanInFlight: false,
+    rescanRequested: false,
+    sawCompactedOutput: false,
+    activated: false,
+    lastReason: null,
+  };
+  claudePtyCompactProofInflight.set(tabId, proofAttempt);
+  try {
+    proofAttempt.watcher = fs.watch(
+      preparation.filePath,
+      { persistent: false },
+      () => requestClaudePtyCompactTranscriptProof(
+        tabId,
+        proofAttempt,
+        'transcript-change',
+      ),
+    );
+  } catch (error) {
+    console.warn('[ClaudeLocalCommand] proof watcher unavailable tab=' + tabId.slice(-12)
+      + ' command=/compact error=' + (error?.message || String(error))
+      + ' - PTY output will continue event-driven proof attempts');
+  }
+  requestClaudePtyCompactTranscriptProof(tabId, proofAttempt, 'pty-output-initial');
+}
+
+function noteClaudePtyCompactOutputCompletion(tabId) {
+  const attempt = claudePtyCompactProofInflight.get(tabId) || null;
+  if (!attempt) return;
+  attempt.sawCompactedOutput = true;
+  requestClaudePtyCompactTranscriptProof(tabId, attempt, 'pty-output-completed');
+}
+
+function trackClaudeInputLineForLocalCommands(
+  tabId,
+  data,
+  { isTerminalProtocolResponse = false } = {},
+) {
+  if (!bridgeKnownSessions.has(tabId) || typeof data !== 'string' || data.length === 0) return null;
+  const inputOwner = {
+    ...readClaudeLocalCommandOwner(tabId),
+    promptSeq: promptBoundarySeq.get(tabId) || 0,
+  };
+  const observed = advanceManualInputLineState(
+    claudeInputLineBuffers.get(tabId) || null,
+    {
+      data,
+      owner: inputOwner,
+      isTerminalProtocolResponse,
+    },
+  );
+  if (observed.state) claudeInputLineBuffers.set(tabId, observed.state);
   else claudeInputLineBuffers.delete(tabId);
+
+  let preparation = null;
+  for (const command of observed.submittedCommands) {
+    console.log('[ClaudeLocalInput] SUBMIT tab=' + tabId.slice(-12)
+      + ' command=' + JSON.stringify(String(command || '').slice(0, 80))
+      + ' exactCompact=' + (command === '/compact')
+      + ' promptSeq=' + inputOwner.promptSeq
+      + ' reason=' + observed.reason);
+    if (command !== '/compact') continue;
+    const candidate = prepareClaudeLocalCommandWatcher(tabId, command, 'terminal-input');
+    if (!preparation) preparation = candidate;
+    else discardClaudeLocalCommandWatcherPreparation(candidate, 'duplicate-command-in-input-burst');
+  }
+  return preparation;
+}
+
+function isManualXtermInputOrigin(origin) {
+  // Terminal.ts marks real xterm onData as user/unknown. Main-generated
+  // protocol replies and external submit paths must not feed this tracker.
+  return origin === 'user' || origin === 'unknown';
+}
+
+function readCodexManualInputOwner(tabId) {
+  const watcher = codexTurnWatchers.get(tabId) || null;
+  return {
+    terminal: terminals.get(tabId) || null,
+    sessionId: watcher?.sessionId || getCodexRuntimeSessionId(tabId) || null,
+    generation: getTerminalLifecycleGeneration(tabId),
+    promptSeq: codexPromptGeneration.get(tabId) || 0,
+  };
+}
+
+function captureCodexManualCompactBoundary(tabId, owner) {
+  const watcher = codexTurnWatchers.get(tabId) || null;
+  if (!watcher || !owner?.sessionId || !owner?.generation) return null;
+  let sourceByteOffset = Number(watcher.offset);
+  try {
+    sourceByteOffset = fs.statSync(watcher.filePath).size;
+  } catch {}
+  return {
+    tabId,
+    sessionId: owner.sessionId,
+    generation: owner.generation,
+    promptSeq: owner.promptSeq,
+    terminal: owner.terminal,
+    filePath: watcher.filePath,
+    sourceByteOffset: Number.isFinite(sourceByteOffset) ? sourceByteOffset : null,
+    boundaryEventSequence: Number(watcher.eventSequence || 0),
+  };
+}
+
+function sameCodexManualCompactOwner(pending, owner) {
+  return !!pending && !!owner
+    && pending.terminal === owner.terminal
+    && pending.sessionId === owner.sessionId
+    && pending.generation === owner.generation
+    && Number(pending.promptGeneration) === Number(owner.promptSeq);
+}
+
+function cancelCodexManualCompactPending(tabId, reason, operationId = null) {
+  const pending = compactOperations.getPending(tabId, 'codex');
+  if (!pending || (operationId && pending.operationId !== operationId)) return null;
+  const cancelled = compactOperations.cancelPending({
+    tabId,
+    provider: 'codex',
+    operationId: pending.operationId,
+    reason,
+  });
+  if (cancelled) {
+    console.log('[CodexManualInput] pending compact cancelled tab=' + String(tabId).slice(-12)
+      + ' operation=' + pending.operationId
+      + ' reason=' + reason);
+  }
+  return cancelled;
+}
+
+function reconcileCodexManualCompactPendingOwner(tabId) {
+  const pending = compactOperations.getPending(tabId, 'codex');
+  if (!pending) return null;
+  const owner = readCodexManualInputOwner(tabId);
+  if (sameCodexManualCompactOwner(pending, owner)) return pending;
+  cancelCodexManualCompactPending(tabId, 'owner-generation-changed', pending.operationId);
+  return null;
+}
+
+function isCodexRecordAfterManualCompactBoundary(pending, record) {
+  if (!pending || !record) return false;
+  const eventSequence = Number(record.__eventSequence);
+  const boundarySequence = Number(pending.causalBoundaryEventSequence);
+  if (!Number.isFinite(eventSequence)
+    || (Number.isFinite(boundarySequence) && eventSequence <= boundarySequence)) return false;
+  const sourceByteOffset = Number(record.__byteOffset);
+  const boundaryOffset = Number(pending.sourceByteOffset);
+  if (!Number.isFinite(sourceByteOffset)) return false;
+  if (!Number.isFinite(boundaryOffset)) return true;
+  return sourceByteOffset >= boundaryOffset;
+}
+
+function codexManualCompactCancelReasonForInput(data) {
+  if (isPureCodexEscapeBurst(data)) return 'input-escape';
+  if (data === '\x03') return 'input-ctrl-c';
+  return 'manual-content-changed';
+}
+
+function trackCodexInputLineForCompact(
+  tabId,
+  data,
+  { isTerminalProtocolResponse = false, xtermInputOrigin = null } = {},
+) {
+  if (!isManualXtermInputOrigin(xtermInputOrigin)
+    || typeof data !== 'string'
+    || data.length === 0
+    || !hasEstablishedCodexLifecycleIndicators(tabId)) return null;
+  const owner = readCodexManualInputOwner(tabId);
+  const pending = reconcileCodexManualCompactPendingOwner(tabId);
+  // Enter is allowed to repeat: the first one may only accept Codex's slash
+  // suggestion and the second one may be the provider submit. Any other real
+  // user input changes/cancels that exact intent. Terminal protocol replies
+  // are observational noise and cannot take ownership.
+  if (pending
+    && !isTerminalProtocolResponse
+    && !/^[\r\n]+$/.test(data)) {
+    cancelCodexManualCompactPending(
+      tabId,
+      codexManualCompactCancelReasonForInput(data),
+      pending.operationId,
+    );
+  }
+  const observed = advanceManualInputLineState(
+    codexInputLineBuffers.get(tabId) || null,
+    { data, owner, isTerminalProtocolResponse },
+  );
+  if (observed.state) codexInputLineBuffers.set(tabId, observed.state);
+  else codexInputLineBuffers.delete(tabId);
+
+  for (const command of observed.submittedCommands) {
+    console.log('[CodexManualInput] SUBMIT tab=' + String(tabId).slice(-12)
+      + ' command=' + JSON.stringify(String(command).slice(0, 80))
+      + ' exactCompact=' + (command === '/compact')
+      + ' promptSeq=' + owner.promptSeq
+      + ' reason=' + observed.reason);
+    if (command !== '/compact') continue;
+    const boundary = captureCodexManualCompactBoundary(tabId, owner);
+    if (boundary) return { command, boundary };
+  }
+  return null;
+}
+
+function activateCodexManualCompactAfterPtyWrite(preparation) {
+  const boundary = preparation?.boundary || null;
+  if (!boundary) return null;
+  const currentOwner = readCodexManualInputOwner(boundary.tabId);
+  if (
+    currentOwner.terminal !== boundary.terminal
+    || currentOwner.sessionId !== boundary.sessionId
+    || currentOwner.generation !== boundary.generation
+    || currentOwner.promptSeq !== boundary.promptSeq
+  ) {
+    console.warn('[CodexManualInput] exact /compact Enter rejected owner change tab='
+      + String(boundary.tabId).slice(-12));
+    return null;
+  }
+  const operation = compactOperations.armPending({
+    tabId: boundary.tabId,
+    provider: 'codex',
+    command: '/compact',
+    operationId: 'codex:manual:' + boundary.generation
+      + ':' + boundary.promptSeq
+      + ':' + boundary.sourceByteOffset
+      + ':' + boundary.boundaryEventSequence,
+    sessionId: boundary.sessionId,
+    generation: boundary.generation,
+    promptGeneration: boundary.promptSeq,
+    terminal: boundary.terminal,
+    sourceByteOffset: boundary.sourceByteOffset,
+    causalBoundaryEventSequence: boundary.boundaryEventSequence,
+    source: 'manual-xterm-enter',
+    acceptedAt: Date.now(),
+  });
+  if (operation) {
+    console.log('[CodexManualInput] pending compact armed tab=' + String(boundary.tabId).slice(-12)
+      + ' session=' + String(boundary.sessionId).slice(0, 8)
+      + ' generation=' + boundary.generation
+      + ' promptGeneration=' + boundary.promptSeq
+      + ' sourceOffset=' + (boundary.sourceByteOffset ?? '-')
+      + ' eventBoundary=' + boundary.boundaryEventSequence);
+  }
+  return operation;
 }
 
 // ─── JSONL interruption watcher implementation ───────────────────────────
@@ -6887,7 +8314,15 @@ function startClaudeHookServer() {
           console.warn('[ClaudeHook] Bad JSON conn=' + connId + ':', e.message);
           continue;
         }
-        const { event, session_id, last_assistant_message, ts, transcript_path, ppid } = msg;
+        const {
+          event,
+          session_id,
+          last_assistant_message,
+          ts,
+          transcript_path,
+          ppid,
+          prompt: submitted_prompt,
+        } = msg;
         const eventSeq = ++claudeHookEventSeq;
 
         // Send ack back to script so it can distinguish "kernel buffered"
@@ -6921,6 +8356,30 @@ function startClaudeHookServer() {
             if (Array.isArray(pending.pids)) pending.pids.forEach(pid => grabInputPidToTab.delete(pid));
             else if (pending.pid) grabInputPidToTab.delete(pending.pid);
             const images = (text.match(/\[Image(?:\s+#?\d+)?\]/g) || []).length;
+            const identityStableAtHook = validateAgentInputIdentity(tabId, pending.captureIdentity);
+            const exactEmpty = !String(text || '').trim() && images === 0;
+            let contradiction = null;
+            if (exactEmpty) {
+              contradiction = logAgentDraftProofContradiction(tabId, agent, pending, text);
+            }
+            // GrabInput is emitted while the external-editor helper is still
+            // alive. Only the exact screen-found/empty-grab reconciliation
+            // needs to delay its caller until the TUI has returned. Ordinary
+            // grab/copy remains immediate; notably the startup setting retry
+            // owns its own post-copy synchronized-frame wait and must not be
+            // forced to wait for a second frame here.
+            const editorReturnPromise = contradiction
+              && agent === 'claude'
+              && (mode === 'grab' || mode === 'copy')
+              ? waitForNextPtySynchronizedFrame(pending.captureIdentity?.terminalToken, {
+                timeoutMs: 1500,
+              })
+              : Promise.resolve({
+                ready: false,
+                reason: contradiction && agent === 'codex'
+                  ? 'codex-editor-return-proof-not-implemented'
+                  : 'editor-return-proof-not-required',
+              });
             void (async () => {
               let resolvedText = text;
               let sourceRefs = [];
@@ -6964,7 +8423,40 @@ function startClaudeHookServer() {
               const imagePaths = Array.from(availableById.values());
               console.log('[PromptQueueAssets] grab tab=' + tabId.slice(-12)
                 + ' agent=' + agent + ' requested=' + images + ' durable=' + imagePaths.length);
-              pending.resolve({ success: true, text: resolvedText, images, imagePaths, mode });
+              const editorReturn = await editorReturnPromise;
+              const identityStable = identityStableAtHook
+                && validateAgentInputIdentity(tabId, pending.captureIdentity);
+              logAgentDraftProofContradictionAfterReturn(
+                tabId,
+                agent,
+                contradiction,
+                editorReturn,
+                identityStable,
+              );
+              const exactEmptyProven = exactEmpty
+                && !!contradiction
+                && identityStable
+                && editorReturn?.ready === true;
+              pending.resolve({
+                success: true,
+                text: resolvedText,
+                images,
+                imagePaths,
+                mode,
+                proofOutcome: identityStable
+                  ? (exactEmptyProven ? 'absent' : (exactEmpty ? 'unknown' : 'found'))
+                  : 'unknown',
+                proofReason: identityStable
+                  ? (exactEmptyProven
+                    ? 'external-editor-empty-current-frame'
+                    : (exactEmpty
+                      ? (editorReturn?.reason || 'external-editor-return-unconfirmed')
+                      : 'external-editor-draft-found'))
+                  : 'terminal-or-input-generation-changed-during-grab',
+                editorReturnReady: editorReturn?.ready === true,
+                editorReturnReason: editorReturn?.reason || null,
+                ...publicAgentInputIdentity(pending.captureIdentity, identityStable),
+              });
             })().catch((error) => {
               console.error('[PromptQueueAssets] grab materialization failed tab=' + tabId.slice(-12) + ':', error);
               pending.resolve({ success: false, error: 'image_materialization_failed', mode });
@@ -7052,9 +8544,39 @@ function startClaudeHookServer() {
         // Mismatch → [PasteAudit:MISMATCH] log so future paste regressions
         // (TTYHOG truncation, ANSI corruption, single-write data loss) leave
         // detectable evidence instead of "feels wrong".
+        let promptSubmitAudit = null;
         if (event === 'UserPromptSubmit') {
           clearClaudeEditableLastPrompt(tabId, 'user-prompt-submit');
           const auditsAtHook = getPendingClaudePasteAudits(tabId);
+          const promptAuditOwner = selectUniqueClaudePromptSubmitAudit(
+            auditsAtHook,
+            submitted_prompt,
+            { hashText: pasteAuditHash },
+          );
+          promptSubmitAudit = promptAuditOwner.audit;
+          if (promptAuditOwner.reason === 'ambiguous-identical-pending-audits') {
+            for (const audit of promptAuditOwner.matchingAudits) {
+              audit.executionContextDiagnostic ||= promptAuditOwner.reason;
+            }
+            console.warn('[Orchestration] Claude prompt turn left unbound tab='
+              + tabId.slice(-12)
+              + ' reason=' + promptAuditOwner.reason
+              + ' matches=' + promptAuditOwner.matchingAudits.length
+              + ' handoffs=' + promptAuditOwner.matchingAudits
+                .map((audit) => audit.handoffId || '-')
+                .join(','));
+          } else if (auditsAtHook.length > 0 && !promptSubmitAudit) {
+            if (
+              promptAuditOwner.reason === 'hook-prompt-unavailable'
+              && auditsAtHook.length === 1
+            ) {
+              auditsAtHook[0].executionContextDiagnostic ||= promptAuditOwner.reason;
+            }
+            console.warn('[Orchestration] Claude prompt turn left unbound tab='
+              + tabId.slice(-12)
+              + ' reason=' + promptAuditOwner.reason
+              + ' pending=' + auditsAtHook.length);
+          }
           console.log('[PasteAudit] UserPromptSubmit tab=' + tabId.slice(-12) + ' pending=' + auditsAtHook.length + ' handoffs=' + auditsAtHook.map(a => a.handoffId || '-').join(',') + ' transcript=' + (transcript_path || '-'));
           if (auditsAtHook.length > 0 && transcript_path) {
             // Best-effort, never block the hook ack. Read async, log result.
@@ -7198,21 +8720,42 @@ function startClaudeHookServer() {
         const busy = event === 'UserPromptSubmit';
         const prev = claudeTurnBusy.get(tabId);
         claudeTurnBusy.set(tabId, busy);
+        const launchGeneration = claudeLaunchGenerationByTab.get(tabId)?.generation || null;
+        if (launchGeneration) {
+          claudePromptStability.markBusy(
+            tabId,
+            launchGeneration,
+            busy,
+            'claude-hook:' + event,
+          );
+        }
         const taskTurn = busy
           ? taskCompletionIntents.beginTurn({
               tabId,
               provider: 'claude',
               sessionId: session_id,
+              processId: ppid,
             })
           : taskCompletionIntents.finishTurn({
               tabId,
               provider: 'claude',
               sessionId: session_id,
+              processId: ppid,
               success: event === 'Stop',
             });
-        const taskTurnId = taskTurn?.turn
-          ? 'claude:' + taskTurn.turn.generation
-          : (taskTurn?.generation ? 'claude:' + taskTurn.generation : null);
+        const taskTurnSnapshot = taskTurn?.turn || taskTurn;
+        const taskTurnId = taskTurnSnapshot?.generation
+          ? 'claude:' + taskTurnSnapshot.generation
+          : null;
+        if (busy && promptSubmitAudit) {
+          const activeExecutionContext = getActiveAgentExecutionContext(tabId);
+          if (activeExecutionContext) {
+            promptSubmitAudit.executionContext ||= activeExecutionContext;
+          } else {
+            promptSubmitAudit.executionContextDiagnostic ||=
+              'user-prompt-submit-execution-context-unavailable';
+          }
+        }
         const taskCompletionMeta = !busy && taskTurn?.explicitTaskComplete === true
           ? {
               explicitTaskComplete: true,
@@ -7267,6 +8810,12 @@ function startClaudeHookServer() {
         const prevSpinner = claudeSpinnerBusy.get(tabId);
         claudeSpinnerBusy.set(tabId, busy);
         const lifecycleReason = (!busy && event === 'StopFailure') ? 'error' : undefined;
+        if (!busy && event === 'StopFailure' && claudeLocalCommandWatchers.has(tabId)) {
+          completeClaudeLocalCommand(tabId, 'stop-failure');
+        }
+        if (!busy && event === 'StopFailure') {
+          clearClaudePtyCompactProofAttempt(tabId, undefined, 'stop-failure');
+        }
         if (mainWindow && !mainWindow.isDestroyed()) {
           // Hook events are the authoritative turn bracket and must always reach
           // workflow consumers. A spinner heuristic may already have written the
@@ -7292,12 +8841,27 @@ function startClaudeHookServer() {
           + ' busy=' + busy
           + ' src=claude-hook'
           + ' prevSpinner=' + (prevSpinner === undefined ? 'undef' : prevSpinner));
-        _webBroadcast(tabId, { type: 'busy', busy, reason: lifecycleReason });
+        _webBroadcast(tabId, {
+          type: 'busy',
+          busy,
+          reason: lifecycleReason,
+          provider: 'claude',
+          sessionId: session_id || null,
+          turnId: taskTurnId,
+          processId: ppid || null,
+          turnGeneration: taskTurnSnapshot?.generation || null,
+          turnStartedAt: taskTurnSnapshot?.startedAt || null,
+        });
         if (!busy) {
           _webBroadcast(tabId, {
             type: 'done',
             sessionId: session_id,
             reason: lifecycleReason,
+            provider: 'claude',
+            turnId: taskTurnId,
+            processId: ppid || null,
+            turnGeneration: taskTurnSnapshot?.generation || null,
+            turnStartedAt: taskTurnSnapshot?.startedAt || null,
           });
         }
         // Activity tracking — authoritative turn edges (idempotent recorder).
@@ -8460,6 +10024,30 @@ ipcMain.on('show-history-entry-context-menu', (event, { copyText } = {}) => {
   menu.popup({ window: BrowserWindow.fromWebContents(event.sender) });
 });
 
+// Actions for a paste anchor sitting inside the composer text. The marker is
+// painted by a click-through highlight layer, so it cannot host its own
+// buttons; right-click on it opens this menu instead.
+ipcMain.on('show-paste-chip-context-menu', (event, payload = {}) => {
+  const chipId = String(payload.chipId || '');
+  const chars = Number(payload.chars || 0);
+  const preview = String(payload.preview || '');
+  if (!chipId) return;
+  const sender = event.sender;
+  const reply = (action) => {
+    if (!sender.isDestroyed()) sender.send('paste-chip-menu-action', { chipId, action });
+  };
+  const menu = Menu.buildFromTemplate([
+    { label: 'Вставка · ' + chars.toLocaleString('ru-RU') + ' символов', enabled: false },
+    { type: 'separator' },
+    { label: 'Показать содержимое', click: () => reply('preview') },
+    { label: 'Вернуть текстом в поле', click: () => reply('restore') },
+    { label: 'Копировать содержимое', click: () => { if (preview) clipboard.writeText(preview); } },
+    { type: 'separator' },
+    { label: 'Удалить вставку', click: () => reply('discard') },
+  ]);
+  menu.popup({ window: BrowserWindow.fromWebContents(sender) });
+});
+
 ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, tabId, projectId, cwd, focusInsertPrompt }) => {
   // Load dynamic AI prompts from DB
   let aiPrompts = [];
@@ -9278,22 +10866,26 @@ async function _getAgentTurnResultForOrchestration({
   sessionId,
   cwd,
   promptHash,
+  promptUserUuid,
   requestedAt,
   resultAfterAt,
+  resultBeforeAt,
   forceFresh = false,
   maxChars = 100_000,
 }) {
   const latestAfter = Number(resultAfterAt) > 0 ? Number(resultAfterAt) : 0;
-  if (!sessionId || (!promptHash && !latestAfter)) {
-    return { found: false, error: 'sessionId and promptHash or resultAfterAt required' };
+  if (!sessionId || (!promptUserUuid && !promptHash && !latestAfter)) {
+    return { found: false, error: 'sessionId and promptUserUuid, promptHash, or resultAfterAt required' };
   }
   const data = await _loadSessionTurns(sessionId, cwd, { forceFresh });
   const match = findMatchingClaudePromptTurn({
     turns: data.turns,
     recordMap: data.recordMap,
     promptHash,
+    promptUserUuid,
     requestedAt,
     resultAfterAt: latestAfter,
+    resultBeforeAt,
   });
   if (!match) {
     return {
@@ -10667,7 +12259,7 @@ function startMcpHttpServer() {
             targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
             sourceMeta: sourceMeta || null,
           });
-          const result = await stopAiProcessInTab(tabId);
+          const result = await stopAiProcessInTabSerialized(tabId);
           console.log('[MCP:Terminal] POST /terminal/ai-stop tabId=' + tabId + ' success=' + (result?.success === true) + ' process=' + (result?.processName || 'unknown'));
           emitTerminalMcpActivity('stop_ai', {
             id: activityId,
@@ -11472,7 +13064,10 @@ app.whenReady().then(async () => {
   // repair the exact journaled A→B edge before renderer restore/AutoResume can
   // observe and relaunch the stale source A.
   const rewindRecovery = await recoverPendingCodexNativeRewindHandoffs();
-  if (rewindRecovery.recovered || rewindRecovery.unresolved || rewindRecovery.cleared) {
+  if (rewindRecovery.recovered
+    || rewindRecovery.stableSourceRecovered
+    || rewindRecovery.unresolved
+    || rewindRecovery.cleared) {
     console.log('[Startup] Codex rewind recovery:', rewindRecovery);
   }
 
@@ -11586,6 +13181,8 @@ app.whenReady().then(async () => {
         refreshTuiReady: true,
       }),
       getAgentTurnResult: _getAgentTurnResultForOrchestration,
+      getAgentExecutionContext: getActiveAgentExecutionContext,
+      readAgentLifecycleIdentity: readAiLifecycleIdentityForTab,
       readAgentStartReadiness: readMainAgentStartReadinessForTab,
       registerTaskCompletionIntent,
     });
@@ -12460,12 +14057,28 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           // Send each slash command separately, waiting for prompt return after each
           for (var ci = 0; ci < slashCommands.length; ci++) {
             console.log('[Handshake:' + tabId + '] Sending slash command ' + (ci + 1) + '/' + slashCommands.length + ': ' + slashCommands[ci]);
-            startClaudeLocalCommandWatcher(tabId, slashCommands[ci], 'handshake');
-            await safePasteAndSubmit(term, slashCommands[ci], {
-              submit: true,
-              ctrlCFirst: ci > 0,
-              logPrefix: '[Handshake:cmd:' + tabId + ']'
+            const slashResult = await submitWithClaudeLocalCommandLifecycle({
+              command: slashCommands[ci],
+              prepare: (command) => prepareClaudeLocalCommandWatcher(
+                tabId,
+                command,
+                'handshake',
+              ),
+              submit: () => safePasteAndSubmit(term, slashCommands[ci], {
+                submit: true,
+                ctrlCFirst: ci > 0,
+                logPrefix: '[Handshake:cmd:' + tabId + ']'
+              }),
+              activate: (preparation) => activateClaudeLocalCommandWatcher(preparation),
+              discard: (preparation, detail) => discardClaudeLocalCommandWatcherPreparation(
+                preparation,
+                detail?.reason || 'handshake-submit-not-proven',
+              ),
             });
+            if (slashResult?.submitted !== true) {
+              throw new Error('Claude handshake slash command was not submitted: '
+                + (slashResult?.error || 'submit-not-proven'));
+            }
             // Wait for Claude to process the command and show prompt again
             console.log('[Handshake:' + tabId + '] Slash command sent, waiting for prompt return...');
             await waitForPromptReturn(term, tabId, 10000);
@@ -12522,8 +14135,6 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
             + ' reason=no-launch-generation trigger=' + reason);
           return;
         }
-        claudePromptStability.markStable(tabId, generation, reason);
-
         const pendingPrompt = claudePendingPrompt.get(tabId);
         if (!pendingPrompt) {
           console.log('[Claude Handshake] Tab ' + tabId + ': no pending prompt after stable startup frame');
@@ -12855,10 +14466,13 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         var contentStripped = stripVTControlCharacters(dataNoOsc);
         var hasContentSpinner = CONTENT_SPINNER_RE.test(contentStripped);
         var compactOutputPhase = detectClaudeCompactOutputPhase(contentStripped);
+        if (compactOutputPhase === 'compacted') {
+          noteClaudePtyCompactOutputCompletion(tabId);
+        }
 
         if (hasContentSpinner) {
           if (compactOutputPhase === 'compacting') {
-            startClaudeLocalCommandWatcher(tabId, '/compact', 'pty-output');
+            observeClaudeCompactFromPtyWithTranscriptProof(tabId);
           }
           claudeSpinnerLastSeenAt.set(tabId, Date.now());
           // Diagnostic: log what triggered spinner when BoundarySM is already idle.
@@ -12910,8 +14524,26 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
               mainWindow.webContents.send('claude:busy-state', { tabId, busy: true, reason: 'spinner' });
             }
           }
-          if (compactOutputPhase === 'compacted' && claudeLocalCommandWatchers.get(tabId)?.command === '/compact') {
-            completeClaudeLocalCommand(tabId, 'pty-output-compacted');
+          if (compactOutputPhase === 'compacted') {
+            const localCompact = claudeLocalCommandWatchers.get(tabId);
+            if (localCompact?.command === '/compact') {
+              const ownership = classifyCurrentClaudeLocalCommandOwner(tabId, localCompact);
+              if (!ownership.matches) {
+                console.warn('[ClaudeLocalCommand] PTY completion rejected tab='
+                  + tabId.slice(-12) + ' owner=' + ownership.reason);
+                completeClaudeLocalCommand(tabId, 'owner-changed:' + ownership.reason);
+              } else if (localCompact.filePath) {
+                // PTY text is a scan hint, never completion proof. The durable
+                // manual boundary/stdout read from this watcher's exact offset
+                // remains the source of truth.
+                localCompact.requestTranscriptScan?.();
+              } else {
+                // No durable source exists. Preserve the command result as
+                // unknown instead of letting ambiguous screen text advance the
+                // queue or leaving the loader stuck for 30 minutes.
+                completeClaudeLocalCommand(tabId, 'compact-proof-unavailable');
+              }
+            }
           }
         }
         }
@@ -13078,6 +14710,7 @@ function markActivePtySubmit(term, { identityPending = false } = {}) {
 // one, and a bounded caller timeout means "not confirmed yet", never failure.
 const pendingPasteAudit = new Map(); // tabId → Claude audit[] (ordered)
 const pendingCodexPasteAudit = new Map();
+const deferredCodexPromptAuditContexts = new Map(); // tabId → exact audit detail[] awaiting task_started
 const CLAUDE_PASTE_AUDIT_TIMEOUT_MS = 8000;
 const CODEX_PASTE_AUDIT_TIMEOUT_MS = 8000;
 const CLAUDE_PASTE_AUDIT_MAX_AGE_MS = 30 * 60 * 1000;
@@ -13347,9 +14980,95 @@ function pasteAuditPreview(text, start = 0) {
   return String(text || '').substring(start, start + 80).replace(/\s+/g, ' ');
 }
 
+function isOrchestrationTargetPromptAudit(detail) {
+  const handoffId = typeof detail?.handoffId === 'string' ? detail.handoffId : '';
+  return detail?.success === true && handoffId.startsWith('orchestration:');
+}
+
+function compatiblePromptAuditExecutionContext(detail, candidate) {
+  if (!candidate || typeof candidate !== 'object') {
+    return { context: null, reason: 'active-execution-context-unavailable' };
+  }
+  if (candidate.provider !== detail.toolType) {
+    return { context: null, reason: 'active-execution-context-provider-mismatch' };
+  }
+  if (!detail.sessionId || !candidate.sessionId) {
+    return { context: null, reason: 'active-execution-context-session-unproven' };
+  }
+  if (candidate.sessionId !== detail.sessionId) {
+    return { context: null, reason: 'active-execution-context-session-mismatch' };
+  }
+  return { context: candidate, reason: null };
+}
+
+function routeAgentPromptAuditDetail(detail) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('agent-prompt:audit-result', detail);
+  }
+  try {
+    const routeAudit = require(path.join(srcMainDir, 'web-server')).notifyAgentPromptAuditResult;
+    const routed = typeof routeAudit === 'function' ? routeAudit(detail) : null;
+    if (routed && typeof routed.catch === 'function') {
+      void routed.catch((error) => {
+        console.warn('[Orchestration] prompt audit routing failed handoff='
+          + detail.handoffId + ' error=' + (error?.message || String(error)));
+      });
+    }
+  } catch (error) {
+    console.warn('[Orchestration] prompt audit router unavailable handoff='
+      + detail.handoffId + ' error=' + (error?.message || String(error)));
+  }
+}
+
+function deferCodexPromptAuditExecutionContext(detail) {
+  const current = deferredCodexPromptAuditContexts.get(detail.tabId) || [];
+  const existingIndex = current.findIndex((candidate) => candidate.handoffId === detail.handoffId);
+  if (existingIndex >= 0) current[existingIndex] = detail;
+  else current.push(detail);
+  deferredCodexPromptAuditContexts.set(detail.tabId, current);
+  console.warn('[Orchestration] exact Codex prompt audit awaits task_started context handoff='
+    + detail.handoffId + ' tab=' + String(detail.tabId).slice(-12));
+}
+
+function replayDeferredCodexPromptAuditExecutionContext(tabId) {
+  const pending = deferredCodexPromptAuditContexts.get(tabId) || [];
+  if (pending.length === 0) return;
+  const activeContext = getActiveAgentExecutionContext(tabId);
+  const compatible = pending.filter((detail) => (
+    compatiblePromptAuditExecutionContext(detail, activeContext).context
+  ));
+  if (compatible.length !== 1) {
+    console.warn('[Orchestration] Codex prompt audit context replay refused tab='
+      + String(tabId).slice(-12)
+      + ' pending=' + pending.length
+      + ' compatible=' + compatible.length);
+    return;
+  }
+  const selected = compatible[0];
+  const remaining = pending.filter((detail) => detail !== selected);
+  if (remaining.length > 0) deferredCodexPromptAuditContexts.set(tabId, remaining);
+  else deferredCodexPromptAuditContexts.delete(tabId);
+  routeAgentPromptAuditDetail({
+    ...selected,
+    executionContext: activeContext,
+    executionContextSource: 'codex-task-started',
+    executionContextDiagnostic: null,
+  });
+}
+
+function discardDeferredCodexPromptAuditExecutionContexts(tabId, reason) {
+  const pending = deferredCodexPromptAuditContexts.get(tabId) || [];
+  if (pending.length === 0) return;
+  deferredCodexPromptAuditContexts.delete(tabId);
+  console.warn('[Orchestration] Codex prompt audit context remained unbound tab='
+    + String(tabId).slice(-12)
+    + ' pending=' + pending.length
+    + ' reason=' + reason);
+}
+
 function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
   if (!audit?.handoffId) return;
-  const detail = {
+  const baseDetail = {
     tabId,
     handoffId: audit.handoffId,
     toolType,
@@ -13370,21 +15089,27 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
       ? Number(result.expectedLen)
       : (Number.isFinite(audit.expectedLen) ? Number(audit.expectedLen) : null),
   };
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('agent-prompt:audit-result', detail);
-  }
-  try {
-    const routeAudit = require(path.join(srcMainDir, 'web-server')).notifyAgentPromptAuditResult;
-    const routed = typeof routeAudit === 'function' ? routeAudit(detail) : null;
-    if (routed && typeof routed.catch === 'function') {
-      void routed.catch((error) => {
-        console.warn('[Orchestration] prompt audit routing failed handoff='
-          + audit.handoffId + ' error=' + (error?.message || String(error)));
-      });
-    }
-  } catch (error) {
-    console.warn('[Orchestration] prompt audit router unavailable handoff='
-      + audit.handoffId + ' error=' + (error?.message || String(error)));
+  const candidateContext = result?.executionContext
+    || audit.executionContext
+    || null;
+  const contextVerdict = compatiblePromptAuditExecutionContext(baseDetail, candidateContext);
+  const detail = {
+    ...baseDetail,
+    executionContext: contextVerdict.context,
+    executionContextSource: contextVerdict.context
+      ? (result?.executionContext ? 'audit-result' : 'audit-event')
+      : null,
+    executionContextDiagnostic: contextVerdict.context
+      ? null
+      : (result?.executionContextDiagnostic
+        || audit.executionContextDiagnostic
+        || contextVerdict.reason),
+  };
+  routeAgentPromptAuditDetail(detail);
+  if (isOrchestrationTargetPromptAudit(detail)
+    && !detail.executionContext
+    && toolType === 'codex') {
+    deferCodexPromptAuditExecutionContext(detail);
   }
 }
 
@@ -13718,7 +15443,13 @@ async function requestTerminalCodexDraftState(webContents, tabId, reason, timeou
     if (flush.success) {
       headlessState = expected === null
         ? getHeadlessCodexDraftState(tabId, reason)
-        : await waitForHeadlessCodexDraftState(tabId, expected, waitTimeoutMs, reason);
+        : await waitForHeadlessCodexDraftState(
+          tabId,
+          expected,
+          waitTimeoutMs,
+          reason,
+          { waitOnUnknownOnly: options.waitOnUnknownOnly === true },
+        );
       if (hasDefinitiveDraftState(headlessState)) {
         const rendererAvailable = !!webContents
           && !(typeof webContents.isDestroyed === 'function' && webContents.isDestroyed());
@@ -13786,6 +15517,7 @@ async function requestTerminalCodexDraftState(webContents, tabId, reason, timeou
         tabId,
         reason,
         waitFor: typeof options.waitFor === 'boolean' ? options.waitFor : undefined,
+        waitOnUnknownOnly: options.waitOnUnknownOnly === true,
         timeoutMs: Number(options.waitTimeoutMs) || undefined,
       });
     } catch (err) {
@@ -13910,6 +15642,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     requestReceivedAt = null,
     expectedInputRevision = null,
     presentationSnapshot = null,
+    startupPromptLease = null,
+    startupExactEmptyEvidence = null,
   } = options;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
@@ -13942,7 +15676,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // will happen mid-stream.
   const broadcastTabId = findTabIdForTerm(term);
   const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
-  const isPromptQueueSource = typeof source === 'string' && source.includes('prompt-queue');
+  const isPromptQueueSource = isPromptQueueAutomationSource(source);
   const isHistoryComposerSource = typeof source === 'string'
     && (source === 'history-panel' || source === 'codex-history-panel');
   const shouldStageClaudeAudit = shouldStageClaudeUserPromptAudit({
@@ -14012,6 +15746,17 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       handoffId: handoffId || null,
     };
   };
+  const validateStartupPromptLease = (allowFrameAdvance = false) => {
+    if (!startupPromptLease || !broadcastTabId) {
+      return { valid: true, reason: 'startup-prompt-lease-not-required' };
+    }
+    return claudePromptStability.validate(
+      broadcastTabId,
+      startupPromptLease.generation,
+      startupPromptLease,
+      { allowFrameAdvance },
+    );
+  };
   const normalizedPresentationSnapshot = normalizePromptPresentationSnapshot(presentationSnapshot);
   const emitBusy = (busy) => {
     if (pasteBusyPublished === busy) return;
@@ -14029,6 +15774,16 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   try {
   if (exactSendCancellationRequested()) {
     return cancelledSendResult('before-admission');
+  }
+  const startupAdmission = validateStartupPromptLease(false);
+  if (!startupAdmission.valid) {
+    return {
+      success: false,
+      error: 'claude_prompt_not_stable',
+      reason: startupAdmission.reason,
+      submitted: false,
+      pasteWritten: false,
+    };
   }
   if (
     isCodexPasteSource
@@ -14249,7 +16004,12 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       broadcastTabId,
       'codex-pre-submit-before-paste',
       700,
-      { mergeRendererPositive: true },
+      {
+        waitFor: false,
+        waitTimeoutMs: 2500,
+        waitOnUnknownOnly: true,
+        mergeRendererPositive: true,
+      },
     );
     const afterDraftProbeInputRevision = getTerminalInputRevision(broadcastTabId);
     if (
@@ -14411,6 +16171,16 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   if (exactSendCancellationRequested()) {
     return cancelledSendResult('before-paste');
   }
+  const startupPasteBoundary = validateStartupPromptLease(false);
+  if (!startupPasteBoundary.valid) {
+    return {
+      success: false,
+      error: 'claude_prompt_not_stable',
+      reason: startupPasteBoundary.reason,
+      submitted: false,
+      pasteWritten: false,
+    };
+  }
   if (
     verifyClaudeVisibleDraftBeforePaste
     && broadcastTabId
@@ -14423,11 +16193,15 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       broadcastTabId,
       term,
       'claude-write-boundary-before-paste:' + (source || 'unknown'),
+      { exactEmptyEvidence: startupExactEmptyEvidence },
     );
     if (!draftBoundary.valid) {
       return {
         success: false,
-        error: draftBoundary.reason,
+        error: startupPromptLease
+          ? 'claude_prompt_not_stable'
+          : draftBoundary.reason,
+        reason: draftBoundary.reason,
         submitted: false,
         pasteWritten: false,
         claudeDraftGuard: draftBoundary.proof || null,
@@ -14437,6 +16211,16 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     claudeDraftGuardProof = draftBoundary.proof || null;
     if (exactSendCancellationRequested()) {
       return cancelledSendResult('after-claude-proof-before-paste');
+    }
+    const startupAfterComposerProof = validateStartupPromptLease(false);
+    if (!startupAfterComposerProof.valid) {
+      return {
+        success: false,
+        error: 'claude_prompt_not_stable',
+        reason: startupAfterComposerProof.reason,
+        submitted: false,
+        pasteWritten: false,
+      };
     }
   }
   for (let i = 0; i < chunks.length; i++) {
@@ -14762,6 +16546,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           callerTimedOut: false,
           callerTimedOutAt: null,
           finished: false,
+          submitWritten: false,
           result: null,
           presentationSnapshot: normalizedPresentationSnapshot,
           historySessionId: presentationSnapshot?.historySessionId || null,
@@ -14890,6 +16675,30 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         };
       }
     }
+    const startupEnterBoundary = startupPromptLease && broadcastTabId
+      ? await verifyClaudeStartupCommandAtEnterBoundary({
+        tabId: broadcastTabId,
+        generation: startupPromptLease.generation,
+        lease: startupPromptLease,
+        term,
+        command: content,
+      })
+      : validateStartupPromptLease(true);
+    if (!startupEnterBoundary.valid) {
+      console.warn(logPrefix + ' [StartupPromptLease] refusing Enter reason='
+        + startupEnterBoundary.reason
+        + ' proof=' + (startupEnterBoundary.proof?.proofOutcome || '-')
+        + ' preview=' + JSON.stringify(
+          String(startupEnterBoundary.proof?.preview || '').slice(0, 100),
+        ));
+      return {
+        success: false,
+        error: 'claude_prompt_not_stable',
+        reason: startupEnterBoundary.reason,
+        submitted: false,
+        pasteWritten,
+      };
+    }
     if (exactSendCancellationRequested()) {
       return cancelledSendResult('enter-boundary');
     }
@@ -15002,6 +16811,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
 
   return {
     success: true,
+    submitted: submit,
     chunksTotal: chunks.length,
     renderTimeMs: renderTimes,
     submitKey: submit ? resolvedSubmitLabel : null,
@@ -15238,6 +17048,13 @@ async function handleTerminalInput(
   if (!isTerminalProtocolResponse && !deferManualInputRevision) {
     bumpTerminalInputRevision(tabId);
   }
+  const inputMirror = getHeadlessTerminalMirror(tabId);
+  if (inputMirror?.redrawTrace) {
+    recordTerminalInput(inputMirror.redrawTrace, data, {
+      revision: getTerminalInputRevision(tabId),
+      origin: xtermInputOrigin || (isTerminalProtocolResponse ? 'terminal-response' : 'manual'),
+    });
+  }
 
   // A manually adopted startup action must immediately yield ownership back
   // to the user. This also covers input that arrives while the process-tree
@@ -15304,6 +17121,10 @@ async function handleTerminalInput(
   // они не означают interrupt. См. armInterruptIdleProbe выше для подробностей.
   const isPureEscapeBurst = isPureCodexEscapeBurst(data);
   if (isPureEscapeBurst || data === '\x03') {
+    cancelCodexManualCompactPending(
+      tabId,
+      isPureEscapeBurst ? 'input-escape' : 'input-ctrl-c',
+    );
     const codexSid = getCodexRuntimeSessionId(tabId);
     const rewindSource = isPureEscapeBurst
       ? resolveCodexNativeRewindSourceContext(tabId)
@@ -15353,7 +17174,6 @@ async function handleTerminalInput(
   }
 
   trackManualCodexRewindNavigationInput(tabId, data);
-  trackClaudeInputLineForLocalCommands(tabId, data);
 
 // User paste (Cmd+V) — direct passthrough, no chunking needed.
   if (data.length > 1 || data === '\x1b' || data === '\x03') {
@@ -15396,6 +17216,13 @@ async function handleTerminalInput(
         'manual-enter-ui-control-takeover',
       );
       if (pickerEnter.handled) return;
+      const manualCodexCompactPreparation = trackCodexInputLineForCompact(
+        tabId,
+        data,
+        { xtermInputOrigin, isTerminalProtocolResponse },
+      );
+      const manualCompactIntentPending = !!manualCodexCompactPreparation
+        || !!compactOperations.getPending(tabId, 'codex');
       const manualEnterSubmitsPrompt = activeOperation.manualEnterSubmitsPrompt !== false;
       const composerState = getHeadlessCodexDraftState(
         tabId,
@@ -15404,7 +17231,7 @@ async function handleTerminalInput(
       const composerKnown = manualEnterSubmitsPrompt
         && composerState?.success === true
         && (composerState.hasDraft === true || composerState.hasDraft === false);
-      const promptInFlight = composerKnown
+      const promptInFlight = composerKnown && !manualCompactIntentPending
         ? beginCodexPromptInFlight(tabId, 'manual-terminal-enter', {
           source: 'manual-terminal-enter-ui-control-takeover',
         })
@@ -15418,6 +17245,7 @@ async function handleTerminalInput(
         if (promptInFlight) {
           markCodexPromptSubmitted(tabId, promptInFlight, 'manual-enter-written');
         }
+        activateCodexManualCompactAfterPtyWrite(manualCodexCompactPreparation);
       } catch (error) {
         if (promptInFlight) clearCodexPromptInFlight(tabId, 'manual-write-failed');
         throw error;
@@ -15490,9 +17318,22 @@ async function handleTerminalInput(
       );
       if (pickerEnter.handled) return;
 
-      const promptInFlight = beginCodexPromptInFlight(tabId, 'manual-terminal-enter', {
-        source: 'manual-terminal-enter',
-      });
+      const manualCodexCompactPreparation = trackCodexInputLineForCompact(
+        tabId,
+        data,
+        { xtermInputOrigin, isTerminalProtocolResponse },
+      );
+
+      // Exact manual /compact owns a separate invisible intent until rollout
+      // task_started. Do not manufacture generic prompt/SENT activity while
+      // the first Enter may merely be choosing the slash suggestion.
+      const manualCompactIntentPending = !!manualCodexCompactPreparation
+        || !!compactOperations.getPending(tabId, 'codex');
+      const promptInFlight = manualCompactIntentPending
+        ? null
+        : beginCodexPromptInFlight(tabId, 'manual-terminal-enter', {
+          source: 'manual-terminal-enter',
+        });
 
       queueTerminalCommandMeta(tabId, meta);
       captureTerminalInputForLastCommand(tabId, data);
@@ -15507,7 +17348,10 @@ async function handleTerminalInput(
       try {
         term.write(data);
         markActivePtySubmit(term, { identityPending: manualOperation.identityPending });
-        markCodexPromptSubmitted(tabId, promptInFlight, 'manual-enter-written');
+        if (promptInFlight) {
+          markCodexPromptSubmitted(tabId, promptInFlight, 'manual-enter-written');
+        }
+        activateCodexManualCompactAfterPtyWrite(manualCodexCompactPreparation);
       } catch (error) {
         clearCodexPromptInFlight(tabId, 'manual-write-failed');
         throw error;
@@ -15576,6 +17420,21 @@ async function handleTerminalInput(
   } catch (e) {
     console.warn('[terminal:input] pre-resume startup slash trim failed (non-fatal): ' + (e?.message || String(e)));
   }
+
+  // Capture the transcript boundary before Enter, but keep the observation
+  // inert until this exact input burst has crossed the PTY write boundary.
+  // This mirrors programmatic /compact submission and prevents an intercepted
+  // or failed Enter from publishing a command that never started.
+  const manualClaudeLocalCommandPreparation = trackClaudeInputLineForLocalCommands(
+    tabId,
+    data,
+    { isTerminalProtocolResponse },
+  );
+  trackCodexInputLineForCompact(
+    tabId,
+    data,
+    { xtermInputOrigin, isTerminalProtocolResponse },
+  );
 
   queueTerminalCommandMeta(tabId, meta);
   captureTerminalInputForLastCommand(tabId, data);
@@ -15667,7 +17526,16 @@ async function handleTerminalInput(
     console.log('[CodexImageBinding] tab=' + String(tabId).slice(-12)
       + ' begin=' + began + ' token=' + codexImageStageToken.slice(-12));
   }
-  term.write(data);
+  try {
+    term.write(data);
+    activateClaudeLocalCommandWatcher(manualClaudeLocalCommandPreparation);
+  } catch (error) {
+    discardClaudeLocalCommandWatcherPreparation(
+      manualClaudeLocalCommandPreparation,
+      'terminal-input-write-failed',
+    );
+    throw error;
+  }
   codexImageBindings.handleTerminalInput(tabId, data);
 }
 
@@ -16054,6 +17922,15 @@ ipcMain.handle('claude:get-presence', async (event, tabIdArg, requestContext = n
     generation: context?.generation,
   });
   return presence;
+});
+
+// Operational phases are runtime facts, not transcript fields. History asks
+// main on every mount so tab switches and renderer reloads see the current
+// operation, while a full app restart naturally starts with an empty registry.
+ipcMain.handle('agent:get-operational-phase', (_event, request = {}) => {
+  const tabId = typeof request === 'string' ? request : request?.tabId;
+  const provider = typeof request === 'object' ? request?.provider : null;
+  return compactOperations.snapshot(tabId, provider || null);
 });
 
 ipcMain.handle('claude:startup-slash-proof', (event, payload = {}) => {
@@ -16720,6 +18597,54 @@ async function resolveAgentInputProcess(tabId, agent, logPrefix) {
   return { success: true, candidates, cliPid, lockPids };
 }
 
+function captureAgentInputIdentity(tabId, term) {
+  const mirror = getHeadlessTerminalMirror(tabId);
+  return {
+    terminalToken: term,
+    mirrorToken: mirror || null,
+    terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    inputRevision: getTerminalInputRevision(tabId),
+    terminalLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    mirrorGeneration: mirror?.generation || null,
+  };
+}
+
+function validateAgentInputIdentity(tabId, identity) {
+  if (!identity) return false;
+  const mirror = getHeadlessTerminalMirror(tabId);
+  return terminals.get(tabId) === identity.terminalToken
+    && mirror === identity.mirrorToken
+    && Number(terminalCommandState.get(tabId)?.runSeq || 0) === identity.terminalRunSeq
+    && getTerminalInputRevision(tabId) === identity.inputRevision
+    && getTerminalLifecycleGeneration(tabId) === identity.terminalLifecycleGeneration
+    && (mirror?.generation || null) === identity.mirrorGeneration;
+}
+
+function agentDraftProofMatchesCaptureIdentity(proof, identity) {
+  if (!proof || !identity) return false;
+  const fields = [
+    'terminalRunSeq',
+    'inputRevision',
+    'terminalLifecycleGeneration',
+    'mirrorGeneration',
+  ];
+  return fields.every((field) => (
+    proof[field] !== null
+    && proof[field] !== undefined
+    && proof[field] === identity[field]
+  ));
+}
+
+function publicAgentInputIdentity(identity, stable) {
+  return {
+    terminalIdentityStable: stable === true,
+    terminalRunSeq: identity?.terminalRunSeq ?? null,
+    inputRevision: identity?.inputRevision ?? null,
+    terminalLifecycleGeneration: identity?.terminalLifecycleGeneration ?? null,
+    mirrorGeneration: identity?.mirrorGeneration ?? null,
+  };
+}
+
 // Shared by claude/codex grab/copy/restore input operations. All fire Ctrl+G
 // after writing a lock-file telling noted-code-grab.js which mode to run in.
 async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
@@ -16736,6 +18661,18 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
   if (!processResolution.success) return processResolution;
   cliPid = processResolution.cliPid;
   lockPids = processResolution.lockPids;
+
+  const captureIdentity = captureAgentInputIdentity(tabId, term);
+  const draftProof = options?.draftProof && typeof options.draftProof === 'object'
+    ? options.draftProof
+    : null;
+  const draftProofMatchesAtCapture = draftProof
+    ? agentDraftProofMatchesCaptureIdentity(draftProof, captureIdentity)
+    : null;
+  if (draftProof && !draftProofMatchesAtCapture) {
+    console.warn(logPrefix + ' Tab ' + tabId.slice(-12)
+      + ': screen proof identity changed before Ctrl+G; grab may preserve a real draft but cannot authorize empty');
+  }
 
   if (cliPid) {
     // Verify the cached PID still maps to a live process. If user restarted Claude in shell
@@ -16756,6 +18693,13 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
   }
 
   if (grabInputPending.has(tabId)) return { success: false, error: 'already_in_progress' };
+  const draftProofMatchesAtWrite = draftProof
+    ? draftProofMatchesAtCapture === true && validateAgentInputIdentity(tabId, captureIdentity)
+    : null;
+  if (draftProof && !draftProofMatchesAtWrite) {
+    console.warn(logPrefix + ' Tab ' + tabId.slice(-12)
+      + ': terminal identity changed before Ctrl+G write; exact-empty override disabled');
+  }
   // Intentionally do NOT pre-block on claudeSpinnerBusy: Claude's Ctrl+G
   // binding works mid-stream as long as there is a draft in the input box —
   // that's the whole point of the queue (grab + queue while Claude is still
@@ -16831,7 +18775,20 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
       console.warn(logPrefix + ' Tab ' + tabId.slice(-12) + ': timeout (3000ms) → ' + error + ' (helperRan=' + helperRan + ' logBefore=' + helperLogSizeBefore + ' logAfter=' + helperLogSizeAfter + ' mtime=' + helperLogMtime + ') turnBusy=' + claudeTurnBusy.get(tabId) + ' spinnerBusy=' + claudeSpinnerBusy.get(tabId) + ' pid=' + cliPid + ' lockPids=' + lockPids.join(','));
       resolve({ success: false, error });
     }, 3000);
-    grabInputPending.set(tabId, { resolve, timer, mode, agent, pid: cliPid, pids: lockPids });
+    grabInputPending.set(tabId, {
+      resolve,
+      timer,
+      mode,
+      agent,
+      pid: cliPid,
+      pids: lockPids,
+      captureIdentity,
+      draftProof,
+      draftProofIdentityAtWrite: draftProofMatchesAtWrite,
+      draftProofDiagnostic: draftProof
+        ? buildHeadlessDraftProofDiagnostic(tabId, draftProof, 'before-exact-empty-grab')
+        : null,
+    });
     console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': sending Ctrl+G pid=' + cliPid + ' lockPids=' + lockPids.join(',') + ' helperLogBefore=' + helperLogSizeBefore);
     term.write('\x07'); // Ctrl+G → chat:externalEditor
   });
@@ -16846,11 +18803,19 @@ async function restoreAgentInput(tabId, text, agent = 'claude') {
   return captureAgentInput(tabId, 'restore', agent, { text });
 }
 
-ipcMain.handle('claude:grab-input', async (event, tabId) => captureClaudeInput(tabId, 'grab'));
-ipcMain.handle('claude:copy-input', async (event, tabId) => captureClaudeInput(tabId, 'copy'));
+ipcMain.handle('claude:grab-input', async (event, tabId, options = {}) => (
+  captureAgentInput(tabId, 'grab', 'claude', options)
+));
+ipcMain.handle('claude:copy-input', async (event, tabId, options = {}) => (
+  captureAgentInput(tabId, 'copy', 'claude', options)
+));
 ipcMain.handle('claude:restore-input', async (_event, tabId, text) => restoreAgentInput(tabId, text, 'claude'));
-ipcMain.handle('codex:grab-input', async (event, tabId) => captureAgentInput(tabId, 'grab', 'codex'));
-ipcMain.handle('codex:copy-input', async (event, tabId) => captureAgentInput(tabId, 'copy', 'codex'));
+ipcMain.handle('codex:grab-input', async (event, tabId, options = {}) => (
+  captureAgentInput(tabId, 'grab', 'codex', options)
+));
+ipcMain.handle('codex:copy-input', async (event, tabId, options = {}) => (
+  captureAgentInput(tabId, 'copy', 'codex', options)
+));
 ipcMain.handle('codex:restore-input', async (_event, tabId, text) => restoreAgentInput(tabId, text, 'codex'));
 
 async function inspectClaudeExactSettingInput(
@@ -16859,6 +18824,8 @@ async function inspectClaudeExactSettingInput(
   {
     submit = false,
     source = 'exact-setting-input',
+    generation = null,
+    startupPromptLease = null,
   } = {},
 ) {
   const tabId = String(rawTabId || '');
@@ -16933,6 +18900,22 @@ async function inspectClaudeExactSettingInput(
       exact: true,
       empty: false,
     };
+  }
+  if (startupPromptLease && generation) {
+    const admission = claudePromptStability.validate(
+      tabId,
+      generation,
+      startupPromptLease,
+      { allowFrameAdvance: true },
+    );
+    if (!admission.valid) {
+      return {
+        success: false,
+        submitted: false,
+        error: 'claude_prompt_not_stable',
+        reason: admission.reason,
+      };
+    }
   }
   bumpTerminalInputRevision(tabId);
   console.warn('[ClaudeSettingRetry] tab=' + tabId.slice(-12)
@@ -17111,7 +19094,7 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
     ? sendOptions.source.trim()
     : 'send-command';
   const handoffId = typeof sendOptions.handoffId === 'string' ? sendOptions.handoffId : null;
-  const isPromptQueueSend = source.includes('prompt-queue');
+  const isPromptQueueSend = isPromptQueueAutomationSource(source);
   const stashFirst = sendOptions.stashFirst === false ? false : true;
   const armPromptBoundaryOnSubmit = sendOptions.armPromptBoundaryOnSubmit === true || source.startsWith('startup-defaults:');
   const isSlashCommand = String(command || '').trimStart().startsWith('/');
@@ -17172,8 +19155,9 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
       };
     }
   }
-  startClaudeLocalCommandWatcher(tabId, command, 'send-command');
-  bumpTerminalInputRevision(tabId);
+  if (sendOptions.inputRevisionAlreadyReserved !== true) {
+    bumpTerminalInputRevision(tabId);
+  }
   // Dev-only fault: paste the exact effort command but deliberately withhold
   // Enter. This creates the one production-observable ABSENT state: a
   // current-frame copy still contains this exact command, so retrying only
@@ -17193,6 +19177,10 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
       dismissAutocomplete: shouldDismissAutocomplete,
       handoffId,
       source: source + ':test-hold-before-enter',
+      startupPromptLease: sendOptions.startupPromptLease || null,
+      startupExactEmptyEvidence: sendOptions.startupExactEmptyEvidence || null,
+      verifyClaudeVisibleDraftBeforePaste:
+        sendOptions.verifyClaudeVisibleDraftBeforePaste === true,
       presentationSnapshot: sendOptions.presentationSnapshot || null,
       logPrefix: '[send-command:' + tabId + ':' + source + ':test-hold-before-enter]',
     });
@@ -17203,22 +19191,37 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
       testFaultMode: 'hold-before-enter',
     };
   }
-  const result = await safePasteAndSubmit(term, command, {
-    submit: true,
-    stashFirst,
-    armPromptBoundaryOnSubmit,
-    promptBoundaryReason: source + ':' + command,
-    awaitClaudeUserMessageAudit,
-    claudeAuditTimeoutMs: CLAUDE_PASTE_AUDIT_TIMEOUT_MS,
-    dismissAutocomplete: shouldDismissAutocomplete,
-    handoffId,
-    source,
-    presentationSnapshot: sendOptions.presentationSnapshot || null,
-    logPrefix: '[send-command:' + tabId + (source !== 'send-command' ? ':' + source : '') + ']'
+  const result = await submitWithClaudeLocalCommandLifecycle({
+    command,
+    prepare: () => prepareClaudeLocalCommandWatcher(
+      tabId,
+      command,
+      'send-command:' + source,
+      { handoffId },
+    ),
+    submit: () => safePasteAndSubmit(term, command, {
+      submit: true,
+      stashFirst,
+      armPromptBoundaryOnSubmit,
+      promptBoundaryReason: source + ':' + command,
+      awaitClaudeUserMessageAudit,
+      claudeAuditTimeoutMs: CLAUDE_PASTE_AUDIT_TIMEOUT_MS,
+      dismissAutocomplete: shouldDismissAutocomplete,
+      handoffId,
+      source,
+      startupPromptLease: sendOptions.startupPromptLease || null,
+      startupExactEmptyEvidence: sendOptions.startupExactEmptyEvidence || null,
+      verifyClaudeVisibleDraftBeforePaste:
+        sendOptions.verifyClaudeVisibleDraftBeforePaste === true,
+      presentationSnapshot: sendOptions.presentationSnapshot || null,
+      logPrefix: '[send-command:' + tabId + (source !== 'send-command' ? ':' + source : '') + ']'
+    }),
+    activate: (preparation) => activateClaudeLocalCommandWatcher(preparation),
+    discard: (preparation, detail) => discardClaudeLocalCommandWatcherPreparation(
+      preparation,
+      detail?.reason || 'submit-not-proven',
+    ),
   });
-  if (isPromptQueueSend && result?.deferred === true) {
-    stopClaudeLocalCommandWatcher(tabId, 'prompt-queue-admission-deferred');
-  }
   return result;
 }
 
@@ -20121,17 +22124,33 @@ ipcMain.on('terminal:resize', (event, requestOrTabId, legacyCols, legacyRows) =>
 ipcMain.on('terminal:kill', async (event, tabId) => {
   const startedAt = Date.now();
   const term = terminals.get(tabId);
+  cancelCodexManualCompactPending(tabId, 'terminal-kill');
   clearClaudeEditableLastPrompt(tabId, 'terminal-kill');
   const bridgeSessionId = bridgeKnownSessions.get(tabId) || null;
   const turnBusyAtKill = claudeTurnBusy.get(tabId) === true;
   const spinnerBusyAtKill = claudeSpinnerBusy.get(tabId) === true;
   const localBusyAtKill = claudeLocalCommandWatchers.has(tabId);
+  // Codex has no bridge file and never appears in the claude|gemini scan below,
+  // so the graceful flush was structurally unreachable for it: a busy Codex turn
+  // went straight to SIGHUP and lost its in-flight rollout write. Its liveness
+  // proof is the rollout watcher, which is the same source the loader reads.
+  const codexTurnStateAtKill = codexTurnWatchers.get(tabId) || null;
+  const codexBusyAtKill = codexTurnStateAtKill?.busy === true;
+  const codexSessionAtKill = codexBusyAtKill ? getCodexRuntimeSessionId(tabId) : null;
+  const gracefulOwner = (bridgeSessionId && (turnBusyAtKill || localBusyAtKill))
+    ? 'claude'
+    : codexBusyAtKill
+      ? 'codex'
+      : null;
   console.log('[TerminalKill] start tab=' + String(tabId).slice(-12) +
     ' hasTerm=' + !!term +
     ' bridge=' + (bridgeSessionId ? bridgeSessionId.slice(0, 8) : 'none') +
     ' turnBusy=' + turnBusyAtKill +
     ' spinnerBusy=' + spinnerBusyAtKill +
-    ' localBusy=' + localBusyAtKill);
+    ' localBusy=' + localBusyAtKill +
+    ' codexBusy=' + codexBusyAtKill +
+    ' codexSession=' + (codexSessionAtKill ? String(codexSessionAtKill).slice(0, 8) : 'none') +
+    ' graceful=' + (gracefulOwner || 'none'));
   if (term) {
     // Graceful Ctrl+C to live claude before SIGHUP via term.kill().
     // Same reasoning as before-quit and terminal:stop-ai-process: term.kill()
@@ -20143,21 +22162,28 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
     // Ctrl+C opens Claude's danger-zone instead of exiting, so the old logic
     // burned the full 1200ms on nearly every close-tab despite no JSONL write
     // being in flight.
-    if (bridgeSessionId && (turnBusyAtKill || localBusyAtKill)) {
+    if (gracefulOwner) {
+      // One shared process-tree observation for every agent. The old inline
+      // `ps | grep -E " (claude|gemini)( |$)"` could not match Codex at all:
+      // its wrapper shows up as `node /opt/homebrew/bin/codex` or under
+      // `@openai/codex`, and it often sits one level below the shell. The
+      // shared lookup already encodes those shapes and the depth fallback.
       let childPid = null;
       try {
-        const psOut = await execAsync('ps -eo pid,ppid,command | grep -E " (claude|gemini)( |$)" | grep -v grep', 1500);
-        for (const line of (psOut || '').split('\n').filter(Boolean)) {
-          const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
-          if (!m) continue;
-          const [, pid, ppid, cmd] = m;
-          if (cmd.includes('Electron') || cmd.includes('electron')) continue;
-          if (Number(ppid) === term.pid) { childPid = Number(pid); break; }
-        }
-      } catch {}
+        const lookup = await inspectAiDescendantProcessesByTab(tabId, null, { forceFresh: true });
+        const candidate = lookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND
+          ? selectAiProcessForStop(lookup.matches)
+          : null;
+        if (candidate) childPid = Number(candidate.pid);
+      } catch (err) {
+        console.log('[TerminalKill:GracefulCtrlC] lookup failed tab=' + String(tabId).slice(-12)
+          + ': ' + (err?.message || err));
+      }
       if (childPid) {
-        const sid = bridgeKnownSessions.get(tabId);
-        console.log('[TerminalKill:GracefulCtrlC] tabId=' + tabId.slice(-12) + ' childPid=' + childPid + ' sessionId=' + (sid ? sid.substring(0, 8) : 'none') + ' — \\x03 → waiting for graceful exit');
+        const sid = gracefulOwner === 'codex'
+          ? codexSessionAtKill
+          : bridgeKnownSessions.get(tabId);
+        console.log('[TerminalKill:GracefulCtrlC] tabId=' + tabId.slice(-12) + ' owner=' + gracefulOwner + ' childPid=' + childPid + ' sessionId=' + (sid ? String(sid).substring(0, 8) : 'none') + ' — \\x03 → waiting for graceful exit');
         try { term.write('\x03'); } catch (err) { console.log('[TerminalKill:GracefulCtrlC] write failed: ' + err.message); }
         await new Promise((resolve) => {
           const start = Date.now();
@@ -20178,25 +22204,28 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
         });
       } else {
         console.log('[TerminalKill:GracefulCtrlC] tabId=' + tabId.slice(-12) +
-          ' busy turn but no direct child found; skipping wait and killing PTY');
+          ' owner=' + gracefulOwner +
+          ' busy turn but no AI child found; skipping wait and killing PTY');
       }
-    } else if (bridgeSessionId) {
+    } else if (bridgeSessionId || codexSessionAtKill) {
         console.log('[TerminalKill:FastClose] tabId=' + tabId.slice(-12) +
-        ' idle Claude bridge=' + bridgeSessionId.slice(0, 8) +
+        ' idle agent bridge=' + (bridgeSessionId ? bridgeSessionId.slice(0, 8) : 'none') +
         ' turnBusy=' + turnBusyAtKill +
         ' spinnerBusy=' + spinnerBusyAtKill +
         ' localBusy=' + localBusyAtKill +
+        ' codexBusy=' + codexBusyAtKill +
         ' — skip 1200ms Ctrl+C wait');
     }
-    if (!ownsTerminalRuntime(terminals, tabId, term)) {
+    const termination = terminateCapturedTerminalRuntime(terminals, tabId, term);
+    if (!termination.released) {
       console.warn('[TerminalKill] ownership changed while stopping; preserving replacement tab='
         + String(tabId).slice(-12)
         + ' oldPid=' + term.pid
-        + ' currentPid=' + (terminals.get(tabId)?.pid || '-'));
+        + ' currentPid=' + (terminals.get(tabId)?.pid || '-')
+        + ' oldKilled=' + termination.killed);
+      terminalShellReadiness.remove(tabId, term);
       return;
     }
-    term.kill();
-    deleteTerminalRuntimeIfOwned(terminals, tabId, term);
     console.log('[TerminalKill] term.kill sent tab=' + String(tabId).slice(-12) +
       ' durMs=' + (Date.now() - startedAt));
   }
@@ -20908,6 +22937,53 @@ ipcMain.handle('prompt-queue:materialize-image-refs', async (_event, { refs } = 
   }
 });
 
+ipcMain.handle('prompt-queue:get-image-preview-data-url', async (_event, ref = {}) => {
+  try {
+    // Preview bytes are exposed only for files already owned by the durable
+    // prompt-queue asset store.  In particular this must not become a generic
+    // renderer primitive for reading arbitrary absolute paths.
+    const managed = await promptQueueAssetStore.existingManagedRef(ref);
+    if (!managed) {
+      return { success: false, error: 'managed_image_missing' };
+    }
+    const source = nativeImage.createFromPath(managed.path);
+    if (!source || source.isEmpty()) {
+      return { success: false, assetId: managed.assetId, error: 'image_decode_failed' };
+    }
+    const variant = ref?.variant === 'detail' ? 'detail' : 'thumbnail';
+    const maxSide = variant === 'detail' ? 1024 : 64;
+    const size = source.getSize();
+    const longestSide = Math.max(size.width, size.height);
+    const scale = longestSide > maxSide ? maxSide / longestSide : 1;
+    const preview = scale < 1
+      ? source.resize({
+          width: Math.max(1, Math.round(size.width * scale)),
+          height: Math.max(1, Math.round(size.height * scale)),
+          quality: 'best',
+        })
+      : source;
+    const dataUrl = preview.toDataURL();
+    if (!dataUrl.startsWith('data:image/')) {
+      return { success: false, assetId: managed.assetId, error: 'preview_encode_failed' };
+    }
+    console.log('[PromptQueueAssets:Preview] ready asset=' + managed.assetId
+      + ' variant=' + variant
+      + ' source=' + size.width + 'x' + size.height
+      + ' preview=' + preview.getSize().width + 'x' + preview.getSize().height);
+    return {
+      success: true,
+      assetId: managed.assetId,
+      variant,
+      width: preview.getSize().width,
+      height: preview.getSize().height,
+      dataUrl,
+    };
+  } catch (error) {
+    console.warn('[PromptQueueAssets:Preview] failed:', error?.message || error);
+    return { success: false, error: error?.code || error?.message || 'preview_failed' };
+  }
+});
+
 // Point-write for the Claude session id, mirroring the Codex path. Without it
 // the only writer was a full `saveTabs` carrying a possibly stale tab array,
 // which could roll another tab's freshly-detected id back to its previous
@@ -21413,6 +23489,25 @@ ipcMain.handle('project:save-sidebar-expanded-dirs', (event, { projectId, expand
 ipcMain.handle('project:save-sidebar-scroll-top', (event, { projectId, scrollTop }) => {
   projectManager.db.updateProjectSidebarScrollTop(projectId, scrollTop);
   return { success: true };
+});
+
+ipcMain.handle('project:save-tab-list-scroll-top', (event, { projectId, scrollTop }) => {
+  projectManager.db.updateProjectTabListScrollTop(projectId, scrollTop);
+  return { success: true };
+});
+
+// Synchronous variant for beforeunload: async invoke() never lands during quit,
+// so the last throttled scroll offset would be lost and the sidebar would
+// reopen at a stale position after restart.
+ipcMain.on('project:save-scroll-top-sync', (event, { surface, projectId, scrollTop }) => {
+  try {
+    if (surface === 'sidebar') projectManager.db.updateProjectSidebarScrollTop(projectId, scrollTop);
+    else if (surface === 'tabList') projectManager.db.updateProjectTabListScrollTop(projectId, scrollTop);
+    event.returnValue = { success: true };
+  } catch (error) {
+    console.error('[Project] save-scroll-top-sync failed:', surface, error.message);
+    event.returnValue = { success: false, error: error.message };
+  }
 });
 
 ipcMain.handle('project:delete', (event, projectId) => {
@@ -23504,13 +25599,101 @@ async function waitForAiStopScopeExit(scope, timeoutMs, intervalMs) {
   }
 }
 
+function currentAiLifecycleIdentity(tabId, {
+  processStatus = 'unknown',
+  processPid = null,
+  processName = null,
+} = {}) {
+  const resolvedProcessName = processName || resolveAiToolTypeForTab(tabId, null);
+  const activityIdentity = resolveActivityIdentity(tabId, resolvedProcessName);
+  return normalizeAiLifecycleIdentity({
+    terminalLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    inputRevision: getTerminalInputRevision(tabId),
+    processStatus,
+    processPid,
+    processName: resolvedProcessName,
+    sessionId: activityIdentity.sessionId
+      || bridgeKnownSessions.get(tabId)
+      || codexKnownSessions.get(tabId)
+      || null,
+  });
+}
+
+async function readAiLifecycleIdentityForTab(tabId, requestedToolType = null) {
+  const lookup = await inspectAiDescendantProcessesByTab(tabId, null, { forceFresh: true });
+  const candidate = lookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND
+    ? selectAiProcessForStop(lookup.matches)
+    : null;
+  const processStatus = lookup.status === AI_PROCESS_LOOKUP_STATUS.ABSENT
+    ? 'absent'
+    : candidate
+      ? 'found'
+      : 'unknown';
+  return currentAiLifecycleIdentity(tabId, {
+    processStatus,
+    processPid: candidate ? Number(candidate.pid) : null,
+    processName: candidate?.processName || requestedToolType || null,
+  });
+}
+
+async function admitAiLifecycleLaunch(tabId, payload = {}) {
+  const launchSource = normalizeAgentLaunchSource(payload?.launchSource);
+  try {
+    const webServer = require(path.join(srcMainDir, 'web-server'));
+    if (typeof webServer.admitAgentLifecycleLaunch !== 'function') {
+      return { allowed: true, source: launchSource, reason: null };
+    }
+    return await webServer.admitAgentLifecycleLaunch(tabId, { launchSource });
+  } catch (error) {
+    console.warn('[AILifecycle] launch admission failed tab=' + String(tabId).slice(-12)
+      + ' source=' + launchSource
+      + ' error=' + (error?.message || String(error)));
+    return {
+      allowed: false,
+      source: launchSource,
+      suppressed: false,
+      reason: 'orchestration-launch-admission-failed',
+      error: error?.message || String(error),
+    };
+  }
+}
+
+function validateOrchestrationAutoStopGuard(authority, observedIdentity) {
+  if (authority?.kind !== 'orchestration-auto-stop') {
+    return { allowed: false, reason: 'stop-authority-invalid' };
+  }
+  try {
+    const webServer = require(path.join(srcMainDir, 'web-server'));
+    const validation = webServer.validateOrchestrationAutoStopAuthority?.(authority);
+    if (!validation?.valid) {
+      return { allowed: false, reason: validation?.reason || 'auto-stop-claim-invalid' };
+    }
+    const comparison = compareAiLifecycleIdentity(
+      validation.expectedTargetIdentity,
+      observedIdentity,
+    );
+    return {
+      allowed: comparison.matches === true,
+      reason: comparison.reason,
+    };
+  } catch (error) {
+    return {
+      allowed: false,
+      reason: 'auto-stop-authority-check-failed:' + (error?.message || String(error)),
+    };
+  }
+}
+
 async function stopAiProcessInTab(tabId, options = {}) {
   const stopReason = options?.reason || 'manual-stop';
   const preserveCodexLaunchPayload = options?.preserveCodexLaunchPayload === true;
   const preservePublicLifecycle = options?.preservePublicLifecycle === true;
+  const retainStoppingState = options?.retainStoppingState === true;
   const preSignalGuard = typeof options?.preSignalGuard === 'function'
     ? options.preSignalGuard
     : null;
+  cancelCodexManualCompactPending(tabId, stopReason);
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'tab not found' };
   const requestedToolType = resolveAiToolTypeForTab(tabId, options?.toolType || null);
@@ -23520,14 +25703,35 @@ async function stopAiProcessInTab(tabId, options = {}) {
       tabId,
       result?.processName || requestedToolType,
     );
-    clearAiStopping(tabId, result?.success === false ? 'stop-failed' : stopReason, {
-      broadcastInactive,
-      toolType: resolvedToolType,
-    });
+    if (!(retainStoppingState && result?.success === true)) {
+      clearAiStopping(tabId, result?.success === false ? 'stop-failed' : stopReason, {
+        broadcastInactive,
+        toolType: resolvedToolType,
+      });
+    }
     if (result?.success === false && result?.runtimeStopped !== true) {
       restoreAiRuntimeStatusAfterFailedStop(tabId, resolvedToolType, 'stop-failed:' + stopReason);
     }
     return result;
+  };
+  const evaluatePreSignalGuard = (observedIdentity) => {
+    if (!preSignalGuard) return { allowed: true, reason: null };
+    try {
+      const value = preSignalGuard(observedIdentity);
+      if (value === true) return { allowed: true, reason: null };
+      if (value && typeof value === 'object') {
+        return {
+          allowed: value.allowed === true,
+          reason: value.reason || null,
+        };
+      }
+      return { allowed: false, reason: 'stop-guard-rejected' };
+    } catch (err) {
+      console.warn('[StopAI] pre-signal guard threw tab=' + String(tabId).slice(-12)
+        + ' reason=' + stopReason
+        + ' error=' + (err?.message || String(err)));
+      return { allowed: false, reason: 'stop-guard-threw' };
+    }
   };
 
   // Stop is destructive, so every caller joins one current process-tree
@@ -23675,6 +25879,26 @@ async function stopAiProcessInTab(tabId, options = {}) {
         lookupUnknown: false,
         detail,
       }, false);
+    }
+    if (preSignalGuard) {
+      const guardDecision = evaluatePreSignalGuard(currentAiLifecycleIdentity(tabId, {
+        processStatus: 'absent',
+        processPid: null,
+        processName: requestedToolType,
+      }));
+      if (!guardDecision.allowed) {
+        console.warn('[StopAI] no-process guard rejected tab=' + String(tabId).slice(-12)
+          + ' reason=' + stopReason
+          + ' guard=' + (guardDecision.reason || 'unknown')
+          + ' action=preserve-runtime-state');
+        return finishStop({
+          success: false,
+          processName: requestedToolType || null,
+          error: 'stop_guard_rejected',
+          guardRejected: true,
+          guardReason: guardDecision.reason || null,
+        }, false);
+      }
     }
     if (isCodexRuntime && !preserveCodexLaunchPayload) {
       invalidateCodexExitObservers(tabId, 'stop-no-process:' + stopReason);
@@ -23827,24 +26051,23 @@ async function stopAiProcessInTab(tabId, options = {}) {
   // Sequence: write \x03 → poll kill(0) up to 300ms → if dead, done. Otherwise
   // fall through to the existing SIGTERM→800ms→SIGKILL escalation.
   if (preSignalGuard) {
-    let signalAllowed = false;
-    try {
-      signalAllowed = preSignalGuard() === true;
-    } catch (err) {
-      console.warn('[StopAI] pre-signal guard threw tab=' + String(tabId).slice(-12)
-        + ' reason=' + stopReason
-        + ' error=' + (err?.message || String(err)));
-    }
-    if (!signalAllowed) {
+    const guardDecision = evaluatePreSignalGuard(currentAiLifecycleIdentity(tabId, {
+      processStatus: 'found',
+      processPid: childPid,
+      processName,
+    }));
+    if (!guardDecision.allowed) {
       console.warn('[StopAI] pre-signal guard rejected tab=' + String(tabId).slice(-12)
         + ' reason=' + stopReason
         + ' pid=' + childPid
+        + ' guard=' + (guardDecision.reason || 'unknown')
         + ' action=preserve-process');
       return finishStop({
         success: false,
         processName,
         error: 'stop_guard_rejected',
         guardRejected: true,
+        guardReason: guardDecision.reason || null,
       }, false);
     }
     markAiStopping(tabId, processName, stopReason, {
@@ -23918,12 +26141,63 @@ async function stopAiProcessInTab(tabId, options = {}) {
   }, !rootAlive && !preservePublicLifecycle);
 }
 
+async function stopAiProcessInTabSerialized(tabId, options = {}) {
+  if (!tabId) return { success: false, error: 'tabId required' };
+  return runKeyedExclusive(aiLifecycleActionInflight, tabId, () => (
+    stopAiProcessInTab(tabId, options)
+  ));
+}
+
 ipcMain.handle('terminal:stop-ai-process', async (_event, request) => {
   const payload = request && typeof request === 'object' ? request : { tabId: request };
-  return stopAiProcessInTab(payload.tabId, {
+  const authority = payload.authority && typeof payload.authority === 'object'
+    ? payload.authority
+    : null;
+  return stopAiProcessInTabSerialized(payload.tabId, {
     toolType: payload.toolType || null,
     reason: payload.reason || 'manual-stop',
+    preSignalGuard: authority?.kind === 'orchestration-auto-stop'
+      ? (observedIdentity) => validateOrchestrationAutoStopGuard(authority, observedIdentity)
+      : undefined,
   });
+});
+
+// Native macOS confirmation. `window.confirm` in the renderer blocks the whole
+// renderer thread while it is open, so terminal output, loaders and the tab
+// title all freeze behind it — visible as a hung app during close. A sheet
+// attached to the window keeps the UI alive and looks like the OS dialog the
+// user expects for a destructive action.
+ipcMain.handle('ui:confirm-destructive', async (event, request) => {
+  const payload = request && typeof request === 'object' ? request : {};
+  const message = String(payload.message || 'Продолжить?');
+  const detail = payload.detail ? String(payload.detail) : undefined;
+  const confirmLabel = String(payload.confirmLabel || 'Закрыть');
+  const cancelLabel = String(payload.cancelLabel || 'Отмена');
+  const parent = BrowserWindow.fromWebContents(event.sender) || mainWindow || null;
+  try {
+    const options = {
+      type: 'warning',
+      buttons: [confirmLabel, cancelLabel],
+      // Enter confirms, Escape cancels — the same reflexes as the old confirm().
+      defaultId: 0,
+      cancelId: 1,
+      message,
+      detail,
+      noLink: true,
+    };
+    const result = parent
+      ? await dialog.showMessageBox(parent, options)
+      : await dialog.showMessageBox(options);
+    const confirmed = result?.response === 0;
+    console.log('[UIConfirm] message=' + JSON.stringify(message.slice(0, 80))
+      + ' confirmed=' + confirmed);
+    return { confirmed };
+  } catch (err) {
+    // A dialog that cannot be shown must not silently authorize a destructive
+    // action: fail closed and let the caller keep the tab.
+    console.warn('[UIConfirm] dialog failed: ' + (err?.message || err));
+    return { confirmed: false, error: err?.message || String(err) };
+  }
 });
 
 // Execute quick action command in terminal (fire-and-forget version)
@@ -23936,11 +26210,27 @@ ipcMain.on('terminal:executeCommand', (event, tabId, command) => {
   const term = terminals.get(tabId);
   if (term) {
     console.log('[main] ✅ Terminal found, PID:', term.pid);
-    startClaudeLocalCommandWatcher(tabId, command, 'execute-command');
-    term.write(command);
+    const preparation = prepareClaudeLocalCommandWatcher(tabId, command, 'execute-command');
+    try {
+      term.write(command);
+    } catch (error) {
+      discardClaudeLocalCommandWatcherPreparation(preparation, 'execute-command-write-failed');
+      console.error('[main] ❌ Command write failed:', error?.message || error);
+      return;
+    }
     setTimeout(() => {
-      term.write('\r');
-      console.log('[main] ✅ Enter (\r) sent!');
+      if (!ownsTerminalRuntime(terminals, tabId, term)) {
+        discardClaudeLocalCommandWatcherPreparation(preparation, 'execute-command-owner-changed');
+        return;
+      }
+      try {
+        term.write('\r');
+        activateClaudeLocalCommandWatcher(preparation);
+        console.log('[main] ✅ Enter (\r) sent!');
+      } catch (error) {
+        discardClaudeLocalCommandWatcherPreparation(preparation, 'execute-command-enter-failed');
+        console.error('[main] ❌ Enter write failed:', error?.message || error);
+      }
     }, 150);
   } else {
     console.error('[main] ❌ Terminal NOT FOUND for tabId:', tabId);
@@ -23964,23 +26254,39 @@ ipcMain.handle('terminal:executeCommandAsync', async (event, tabId, command) => 
 
   console.log('[main] ✅ Terminal found, PID:', term.pid);
 
-  // Write command text
-  startClaudeLocalCommandWatcher(tabId, command, 'execute-command-async');
+  // Capture observation state before the command, but do not publish a loader
+  // until the exact Enter below crosses the still-owned PTY boundary.
+  const preparation = prepareClaudeLocalCommandWatcher(tabId, command, 'execute-command-async');
   console.log('[main] 📝 Writing command text...');
-  term.write(command);
+  try {
+    term.write(command);
+  } catch (error) {
+    discardClaudeLocalCommandWatcherPreparation(preparation, 'execute-command-async-write-failed');
+    return { success: false, submitted: false, error: error?.message || String(error) };
+  }
   console.log('[main] 📝 Command text written at', Date.now() - startTime, 'ms');
 
   // Wait 150ms then send Enter
   await new Promise(resolve => setTimeout(resolve, 150));
   console.log('[main] ⏰ 150ms passed, sending Enter...');
-  term.write('\r');
+  if (!ownsTerminalRuntime(terminals, tabId, term)) {
+    discardClaudeLocalCommandWatcherPreparation(preparation, 'execute-command-async-owner-changed');
+    return { success: false, submitted: false, error: 'terminal_ownership_changed' };
+  }
+  try {
+    term.write('\r');
+    activateClaudeLocalCommandWatcher(preparation);
+  } catch (error) {
+    discardClaudeLocalCommandWatcherPreparation(preparation, 'execute-command-async-enter-failed');
+    return { success: false, submitted: false, error: error?.message || String(error) };
+  }
   console.log('[main] ✅ Enter (\r) sent at', Date.now() - startTime, 'ms');
 
   // Wait a bit more for command to start processing
   await new Promise(resolve => setTimeout(resolve, 100));
   console.log('[main] ⏰ 100ms after Enter, returning at', Date.now() - startTime, 'ms');
 
-  return { success: true };
+  return { success: true, submitted: true };
 });
 
 // List .sh scripts in directory
@@ -24542,6 +26848,7 @@ const codexPickerQueue = new Map();
 const codexSettingsMutationQueue = createCodexSettingsMutationQueue();
 const codexTuiReadyProcessProbeTabs = new Set();
 const codexTuiReadyCurrentFrameProbeTabs = new Set();
+const codexServiceTierCurrentFrameProbeTabs = new Set();
 const codexStartupPromptAdoptionProbeTabs = new Set();
 const codexStartupPromptManualOwnershipTabs = new Set();
 const CODEX_WATCHER_TTL_MS = 10 * 60 * 1000;
@@ -24826,7 +27133,10 @@ function hasCodexPromptOrTurnInFlight(tabId) {
       return true;
     }
   }
-  return turnState?.busy === true || activityOpenIntervals.has(tabId) || hasAwaitingAudit;
+  return turnState?.busy === true
+    || !!compactOperations.getPending(tabId, 'codex')
+    || activityOpenIntervals.has(tabId)
+    || hasAwaitingAudit;
 }
 
 function isOnlyCodexMcpStartupBlocker(blockers) {
@@ -25157,6 +27467,9 @@ async function inspectCurrentCodexMcpStartupScreen(tabId, reason = 'mcp-watchdog
     mcpInfo,
     writeSeq: Number.isFinite(writeSeq) ? writeSeq : null,
     inputRevision: getTerminalInputRevision(tabId),
+    terminalToken: terminals.get(tabId) || null,
+    terminalLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
     destructiveProofAvailable: source === 'headless-main' && Number.isFinite(writeSeq),
   };
 }
@@ -25191,6 +27504,170 @@ function scheduleCodexMcpStartupProofRetry(tabId, state, reason) {
         + ' ' + (err?.message || String(err)));
     });
   }, CODEX_MCP_STARTUP_PROOF_RETRY_MS);
+}
+
+function createCodexMcpStartupReplacementHandoff(tabId, state, payload, currentScreen) {
+  const handoff = {
+    tabId,
+    watchdog: state,
+    phase: 'stopping',
+    oldLaunchId: payload?.launchId || null,
+    terminalToken: currentScreen?.terminalToken || terminals.get(tabId) || null,
+    terminalLifecycleGeneration: currentScreen?.terminalLifecycleGeneration
+      || getTerminalLifecycleGeneration(tabId),
+    oldRunSeq: Number(currentScreen?.terminalRunSeq),
+    inputRevision: Number(currentScreen?.inputRevision),
+    newLaunchId: null,
+    newRunSeq: null,
+    stoppingState: null,
+    stopAbsenceProven: false,
+    createdAt: Date.now(),
+  };
+  codexMcpStartupReplacementHandoffs.set(tabId, handoff);
+  return handoff;
+}
+
+function validateStoppedCodexMcpStartupReplacementHandoff(
+  tabId,
+  handoff,
+  processStatus = 'unknown',
+) {
+  if (!handoff || codexMcpStartupReplacementHandoffs.get(tabId) !== handoff) {
+    return { allowed: false, reason: 'replacement-handoff-not-owned' };
+  }
+  if (handoff.phase !== 'stopped') {
+    return { allowed: false, reason: 'replacement-handoff-not-stopped' };
+  }
+  const currentWatchdog = codexMcpStartupWatchdogs.get(tabId) || null;
+  return decideCodexMcpReplacementHandoff({
+    stopSucceeded: true,
+    sameTerminal: terminals.get(tabId) === handoff.terminalToken,
+    expectedTerminalGeneration: handoff.terminalLifecycleGeneration,
+    currentTerminalGeneration: getTerminalLifecycleGeneration(tabId),
+    expectedRunSeq: handoff.oldRunSeq,
+    currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    expectedInputRevision: handoff.inputRevision,
+    currentInputRevision: getTerminalInputRevision(tabId),
+    expectedLaunchId: handoff.oldLaunchId,
+    currentLaunchId: codexLastRunCommandPayload.get(tabId)?.launchId || null,
+    processStatus,
+    watchdogSuperseded: !!currentWatchdog && currentWatchdog !== handoff.watchdog,
+  });
+}
+
+function validateClaimedCodexMcpStartupReplacementHandoff(
+  tabId,
+  handoff,
+  processStatus = 'unknown',
+) {
+  if (!handoff || codexMcpStartupReplacementHandoffs.get(tabId) !== handoff) {
+    return { allowed: false, reason: 'replacement-handoff-not-owned' };
+  }
+  if (handoff.phase !== 'claimed') {
+    return { allowed: false, reason: 'replacement-handoff-not-claimed' };
+  }
+  if (terminals.get(tabId) !== handoff.terminalToken) {
+    return { allowed: false, reason: 'terminal-instance-changed' };
+  }
+  if (getTerminalLifecycleGeneration(tabId) !== handoff.terminalLifecycleGeneration) {
+    return { allowed: false, reason: 'terminal-generation-changed' };
+  }
+  if (Number(terminalCommandState.get(tabId)?.runSeq || 0) !== handoff.newRunSeq) {
+    return { allowed: false, reason: 'terminal-run-changed' };
+  }
+  if (getTerminalInputRevision(tabId) !== handoff.inputRevision) {
+    return { allowed: false, reason: 'terminal-input-changed' };
+  }
+  if (codexLastRunCommandPayload.get(tabId)?.launchId !== handoff.newLaunchId) {
+    return { allowed: false, reason: 'launch-generation-changed' };
+  }
+  if (processStatus !== AI_PROCESS_LOOKUP_STATUS.ABSENT) {
+    return {
+      allowed: false,
+      reason: processStatus === AI_PROCESS_LOOKUP_STATUS.FOUND
+        ? 'replacement-process-already-present'
+        : 'replacement-process-state-unknown',
+    };
+  }
+  if (aiStoppingTabs.get(tabId) !== handoff.stoppingState) {
+    return { allowed: false, reason: 'replacement-input-barrier-changed' };
+  }
+  return { allowed: true, reason: 'exact-claimed-replacement-handoff' };
+}
+
+function releaseCodexMcpStartupReplacementHandoff(tabId, handoff, reason) {
+  if (!handoff || codexMcpStartupReplacementHandoffs.get(tabId) !== handoff) return false;
+  codexMcpStartupReplacementHandoffs.delete(tabId);
+  if (handoff.stoppingState && aiStoppingTabs.get(tabId) === handoff.stoppingState) {
+    clearAiStopping(tabId, reason || 'mcp-startup-replacement-handoff', {
+      toolType: 'codex',
+    });
+  }
+  console.log('[CodexMcpStartupWatchdog] replacement handoff released tab='
+    + String(tabId).slice(-12)
+    + ' phase=' + handoff.phase
+    + ' oldLaunch=' + (handoff.oldLaunchId || '-')
+    + ' newLaunch=' + (handoff.newLaunchId || '-')
+    + ' reason=' + (reason || '-'));
+  return true;
+}
+
+function settleStoppedCodexMcpStartupReplacement(
+  tabId,
+  handoff,
+  processStatus,
+  reason,
+  { startupFailed = true } = {},
+) {
+  if (!handoff || codexMcpStartupReplacementHandoffs.get(tabId) !== handoff) return false;
+  const settlement = handoff.phase === 'stopped'
+    ? decideCodexMcpStoppedGenerationSettlement({
+      stopAbsenceProven: handoff.stopAbsenceProven === true,
+      sameTerminal: terminals.get(tabId) === handoff.terminalToken,
+      expectedTerminalGeneration: handoff.terminalLifecycleGeneration,
+      currentTerminalGeneration: getTerminalLifecycleGeneration(tabId),
+      expectedRunSeq: handoff.oldRunSeq,
+      currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      expectedInputRevision: handoff.inputRevision,
+      currentInputRevision: getTerminalInputRevision(tabId),
+      expectedLaunchId: handoff.oldLaunchId,
+      currentLaunchId: codexLastRunCommandPayload.get(tabId)?.launchId || null,
+      replacementInputBarrierOwned: !!handoff.stoppingState
+        && aiStoppingTabs.get(tabId) === handoff.stoppingState,
+      processStatus,
+    })
+    : { allowed: false, reason: 'replacement-handoff-not-stopped' };
+  if (!settlement.allowed) {
+    releaseCodexMcpStartupReplacementHandoff(tabId, handoff, reason);
+    return false;
+  }
+  console.warn('[CodexMcpStartupWatchdog] settle stopped generation tab='
+    + String(tabId).slice(-12)
+    + ' process=' + processStatus
+    + ' proof=' + settlement.reason
+    + ' reason=' + reason);
+  clearCodexLaunchPayload(tabId, reason, handoff.oldLaunchId);
+  finalizeStoppedAiCommandState(tabId, reason, {
+    processName: 'codex',
+    exitCode: startupFailed ? 1 : 0,
+    forceEvent: true,
+  });
+  releaseCodexMcpStartupReplacementHandoff(tabId, handoff, reason);
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: null,
+    busy: false,
+    sessionStatus: 'inactive',
+    starting: false,
+    stopping: false,
+    inputReady: false,
+    toolType: 'codex',
+    commandType: 'codex',
+    startupFailed,
+    startupError: startupFailed ? reason : null,
+    reason,
+  });
+  return true;
 }
 
 async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
@@ -25304,71 +27781,158 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
     + ' proofWriteSeq=' + currentScreen.writeSeq
     + ' proofInputRevision=' + currentScreen.inputRevision
     + ' preview=' + JSON.stringify(currentScreen.mcpInfo?.preview || state.mcpStartupPreview || ''));
-  let stopResult = null;
+  let handoff = null;
+  let transaction = null;
   try {
-    stopResult = await stopAiProcessInTab(tabId, {
-      reason: 'mcp-startup-watchdog',
-      preserveCodexLaunchPayload: true,
-      preservePublicLifecycle: true,
-      preSignalGuard: () => {
-        const latestState = codexMcpStartupWatchdogs.get(tabId);
-        const latestPayload = codexLastRunCommandPayload.get(tabId);
-        const mirror = getHeadlessTerminalMirror(tabId);
-        const authoritativeMirror = mirror?.complete === true ? mirror : null;
-        return isCodexMcpRestartSignalSafe({
-          expectedWatchdog: state,
-          currentWatchdog: latestState,
-          expectedLaunchId: payload.launchId,
-          currentLaunchId: latestPayload?.launchId,
-          expectedWriteSeq: currentScreen.writeSeq,
-          currentWriteSeq: authoritativeMirror?.writeSeq,
-          expectedInputRevision: currentScreen.inputRevision,
-          currentInputRevision: getTerminalInputRevision(tabId),
-          inputReady: codexTuiReadyTabs.has(tabId),
-          promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
-          mirrorAvailable: !!authoritativeMirror,
+    transaction = await runKeyedExclusive(codexLaunchInflight, tabId, async () => (
+      runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+        if (codexMcpStartupWatchdogs.get(tabId) !== state) {
+          return { stage: 'stale-before-stop', reason: 'watchdog-generation-changed' };
+        }
+        if (codexLastRunCommandPayload.get(tabId)?.launchId !== payload.launchId) {
+          return { stage: 'stale-before-stop', reason: 'launch-generation-changed' };
+        }
+
+        handoff = createCodexMcpStartupReplacementHandoff(
+          tabId,
+          state,
+          payload,
+          currentScreen,
+        );
+        const stopResult = await stopAiProcessInTab(tabId, {
+          reason: 'mcp-startup-watchdog',
+          preserveCodexLaunchPayload: true,
+          preservePublicLifecycle: true,
+          retainStoppingState: true,
+          preSignalGuard: () => {
+            const latestState = codexMcpStartupWatchdogs.get(tabId);
+            const latestPayload = codexLastRunCommandPayload.get(tabId);
+            const mirror = getHeadlessTerminalMirror(tabId);
+            const authoritativeMirror = mirror?.complete === true ? mirror : null;
+            return isCodexMcpRestartSignalSafe({
+              expectedWatchdog: state,
+              currentWatchdog: latestState,
+              expectedTerminal: currentScreen.terminalToken,
+              currentTerminal: terminals.get(tabId) || null,
+              expectedTerminalGeneration: currentScreen.terminalLifecycleGeneration,
+              currentTerminalGeneration: getTerminalLifecycleGeneration(tabId),
+              expectedRunSeq: currentScreen.terminalRunSeq,
+              currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+              expectedLaunchId: payload.launchId,
+              currentLaunchId: latestPayload?.launchId,
+              expectedWriteSeq: currentScreen.writeSeq,
+              currentWriteSeq: authoritativeMirror?.writeSeq,
+              expectedInputRevision: currentScreen.inputRevision,
+              currentInputRevision: getTerminalInputRevision(tabId),
+              inputReady: codexTuiReadyTabs.has(tabId),
+              promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+              mirrorAvailable: !!authoritativeMirror,
+            });
+          },
         });
-      },
-    });
-    console.warn('[CodexMcpStartupWatchdog] stop done tab=' + String(tabId).slice(-12)
-      + ' attempt=' + attempt
-      + ' success=' + !!stopResult?.success
-      + ' error=' + (stopResult?.error || '-'));
+        console.warn('[CodexMcpStartupWatchdog] stop done tab=' + String(tabId).slice(-12)
+          + ' attempt=' + attempt
+          + ' success=' + !!stopResult?.success
+          + ' error=' + (stopResult?.error || '-'));
+        if (!shouldLaunchCodexMcpReplacement(stopResult)) {
+          releaseCodexMcpStartupReplacementHandoff(
+            tabId,
+            handoff,
+            'stop-not-confirmed',
+          );
+          clearCodexMcpStartupWatchdog(tabId, 'stop-not-confirmed');
+          return { stage: 'stop', stopResult };
+        }
+
+        handoff.stoppingState = aiStoppingTabs.get(tabId) || null;
+        handoff.stopAbsenceProven = true;
+        handoff.phase = 'stopped';
+        const stoppedIdentity = await readAiLifecycleIdentityForTab(tabId, 'codex');
+        const handoffAdmission = validateStoppedCodexMcpStartupReplacementHandoff(
+          tabId,
+          handoff,
+          stoppedIdentity?.processStatus || 'unknown',
+        );
+        if (!handoffAdmission.allowed) {
+          settleStoppedCodexMcpStartupReplacement(
+            tabId,
+            handoff,
+            stoppedIdentity?.processStatus || 'unknown',
+            'mcp-replacement-' + handoffAdmission.reason,
+          );
+          return {
+            stage: 'handoff',
+            reason: handoffAdmission.reason,
+            stoppedIdentity,
+          };
+        }
+
+        const latestPayload = codexLastRunCommandPayload.get(tabId);
+        if (!latestPayload || latestPayload.launchId !== payload.launchId) {
+          settleStoppedCodexMcpStartupReplacement(
+            tabId,
+            handoff,
+            stoppedIdentity.processStatus,
+            'mcp-replacement-launch-payload-cancelled',
+          );
+          return { stage: 'handoff', reason: 'launch-payload-cancelled', stoppedIdentity };
+        }
+
+        const sender = mainWindow && !mainWindow.isDestroyed()
+          ? mainWindow.webContents
+          : payload.sender;
+        const restartResult = await runCodexCommandWithinLifecycle(sender, {
+          ...payload,
+          launchId: undefined,
+          mcpStartupRestartAttempts: attempt,
+          restartReason: 'mcp-startup-watchdog',
+          _mcpStartupRecoveryHandoff: handoff,
+        });
+        const replacementAccepted = restartResult?.success !== false
+          && restartResult?.accepted !== false;
+        if (!replacementAccepted && codexMcpStartupReplacementHandoffs.get(tabId) === handoff) {
+          settleStoppedCodexMcpStartupReplacement(
+            tabId,
+            handoff,
+            stoppedIdentity.processStatus,
+            'mcp-replacement-' + (restartResult?.reason || restartResult?.error || 'launch-failed'),
+            { startupFailed: restartResult?.suppressed !== true },
+          );
+        }
+        return { stage: 'replacement', stopResult, restartResult, stoppedIdentity };
+      })
+    ));
   } catch (err) {
-    console.warn('[CodexMcpStartupWatchdog] stop error tab=' + String(tabId).slice(-12)
+    console.warn('[CodexMcpStartupWatchdog] replacement transaction error tab='
+      + String(tabId).slice(-12)
       + ' attempt=' + attempt + ' ' + (err?.message || String(err)));
-    clearCodexMcpStartupWatchdog(tabId, 'stop-threw');
-    return;
-  }
-  if (!shouldLaunchCodexMcpReplacement(stopResult)) {
-    console.warn('[CodexMcpStartupWatchdog] replacement aborted tab=' + String(tabId).slice(-12)
-      + ' attempt=' + attempt
-      + ' reason=stop-not-confirmed'
-      + ' error=' + (stopResult?.error || 'unknown-stop-failure'));
-    clearCodexMcpStartupWatchdog(tabId, 'stop-not-confirmed');
-    return;
-  }
-
-  const latestPayload = codexLastRunCommandPayload.get(tabId);
-  if (!latestPayload || latestPayload.launchId !== payload.launchId) {
-    console.warn('[CodexMcpStartupWatchdog] restart aborted tab=' + String(tabId).slice(-12)
-      + ' attempt=' + attempt
-      + ' reason=launch-payload-cancelled'
-      + ' expected=' + (payload.launchId || '-')
-      + ' actual=' + (latestPayload?.launchId || 'none'));
+    if (handoff && codexMcpStartupReplacementHandoffs.get(tabId) === handoff) {
+      const processStatus = handoff.phase === 'stopped'
+        ? AI_PROCESS_LOOKUP_STATUS.ABSENT
+        : AI_PROCESS_LOOKUP_STATUS.UNKNOWN;
+      settleStoppedCodexMcpStartupReplacement(
+        tabId,
+        handoff,
+        processStatus,
+        'mcp-replacement-transaction-error',
+      );
+    }
+    clearCodexMcpStartupWatchdog(tabId, 'replacement-transaction-threw');
     return;
   }
 
-  const sender = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : payload.sender;
-  const restartResult = await runCodexCommandFromPayload(sender, {
-    ...payload,
-    mcpStartupRestartAttempts: attempt,
-    restartReason: 'mcp-startup-watchdog',
-  });
-  if (!restartResult?.success) {
-    console.warn('[CodexMcpStartupWatchdog] replacement launch failed tab=' + String(tabId).slice(-12)
+  if (transaction?.stage !== 'replacement'
+    || transaction?.restartResult?.success === false
+    || transaction?.restartResult?.accepted === false) {
+    console.warn('[CodexMcpStartupWatchdog] replacement launch did not commit tab='
+      + String(tabId).slice(-12)
       + ' attempt=' + attempt
-      + ' error=' + (restartResult?.error || restartResult?.reason || 'unknown-launch-failure'));
+      + ' stage=' + (transaction?.stage || 'unknown')
+      + ' error=' + (transaction?.restartResult?.error
+        || transaction?.restartResult?.reason
+        || transaction?.stopResult?.error
+        || transaction?.reason
+        || 'replacement-not-committed'));
   }
 }
 
@@ -25711,6 +28275,47 @@ async function tryEmitCodexTuiReady(tabId, data) {
   }
   codexTuiReadyBuffers.set(tabId, raw);
   const clean = cleanCodexTuiFrame(raw);
+  const serviceTierFeedback = parseCodexServiceTierFeedback(clean);
+  if (serviceTierFeedback?.serviceTier) {
+    publishCodexServiceTierProof(
+      tabId,
+      serviceTierFeedback.serviceTier,
+      'tui-service-tier-feedback',
+    );
+  }
+  if (codexTuiReadyTabs.has(tabId)
+    && !codexTuiReadyMeta.get(tabId)?.serviceTierProof
+    && !codexServiceTierCurrentFrameProbeTabs.has(tabId)) {
+    // Readiness and the status footer can arrive in adjacent PTY frames. The
+    // next real output edge is the deterministic opportunity to complete the
+    // proof; no timer or config fallback is needed.
+    codexServiceTierCurrentFrameProbeTabs.add(tabId);
+    try {
+      const currentScreen = await inspectCurrentCodexMcpStartupScreen(
+        tabId,
+        'service-tier-current-frame',
+      );
+      const currentBlockers = Array.isArray(currentScreen?.inspected?.blockers)
+        ? currentScreen.inspected.blockers
+        : [];
+      if (currentScreen?.success
+        && currentScreen.inspected?.ready
+        && currentBlockers.length === 0) {
+        const composerSettings = parseCodexVerifiedComposerFooter(
+          currentScreen.currentFrameText || '',
+        );
+        if (composerSettings && typeof composerSettings.fast === 'boolean') {
+          publishCodexServiceTierProof(
+            tabId,
+            composerSettings.fast ? 'priority' : 'default',
+            composerSettings.proof || 'verified-composer-footer',
+          );
+        }
+      }
+    } finally {
+      codexServiceTierCurrentFrameProbeTabs.delete(tabId);
+    }
+  }
   const inspected = normalizeCodexMcpStartupInspection(tabId, inspectCodexInputReadyFrame(clean, raw), 'stream');
   const rawMcpCandidate = (
     Array.isArray(inspected?.blockers) && inspected.blockers.includes('mcp-startup')
@@ -26138,6 +28743,11 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
         turnId: exactTurnId,
         success: reason === 'task_complete' && outcomeDetails?.outcome?.hasFinalResult === true,
       });
+  const taskTurnSnapshot = taskTurn?.turn || taskTurn;
+  const lifecycleTurnId = taskTurnSnapshot?.turnId
+    || (taskTurnSnapshot?.generation ? 'codex:' + taskTurnSnapshot.generation : exactTurnId);
+  if (busy) replayDeferredCodexPromptAuditExecutionContext(tabId);
+  else discardDeferredCodexPromptAuditExecutionContexts(tabId, reason || 'turn-ended');
   const taskCompletionMeta = !busy && taskTurn?.explicitTaskComplete === true
     ? {
         explicitTaskComplete: true,
@@ -26187,6 +28797,10 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
     sessionStatus: runtimeProjection.sessionStatus,
     inputReady: runtimeProjection.inputReady,
     lifecycleGeneration,
+    provider: 'codex',
+    turnId: lifecycleTurnId,
+    turnGeneration: taskTurnSnapshot?.generation || null,
+    turnStartedAt: taskTurnSnapshot?.startedAt || null,
     ...getCodexPublicWriterFields(tabId),
   });
   if (!busy) {
@@ -26197,6 +28811,10 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
       commandType: 'codex',
       sessionId,
       lifecycleGeneration,
+      provider: 'codex',
+      turnId: lifecycleTurnId,
+      turnGeneration: taskTurnSnapshot?.generation || null,
+      turnStartedAt: taskTurnSnapshot?.startedAt || null,
     });
   }
 }
@@ -26244,6 +28862,10 @@ function emitCodexContextPct(tabId, info) {
 }
 
 function closeCodexTurnWatcher(tabId, reason = 'close', options = {}) {
+  // A watcher close is a deterministic owner/lifecycle boundary. Pending
+  // manual Enter has never become a public operation, so discard it privately
+  // instead of publishing a fake abort/completion receipt.
+  cancelCodexManualCompactPending(tabId, reason);
   const state = codexTurnWatchers.get(tabId);
   if (!state) return;
   const audits = getPendingCodexPasteAudits(tabId)
@@ -26281,7 +28903,24 @@ function closeCodexTurnWatcher(tabId, reason = 'close', options = {}) {
   if (options.preservePromptInFlight !== true) {
     clearCodexPromptInFlight(tabId, 'watcher-closed:' + reason);
   }
+  if (reason !== 'replace' || options.suppressBusyClear !== true) {
+    const activeCompact = compactOperations.getActive(tabId, 'codex');
+    if (activeCompact) {
+      compactOperations.finish({
+        tabId,
+        provider: 'codex',
+        operationId: activeCompact.operationId,
+        sessionId: state.sessionId || null,
+        generation: String(state.processGeneration || ''),
+        outcome: codexCompactOutcomeFromReason(reason),
+        reason,
+        completionProof: 'rollout-watcher-close',
+      });
+    }
+  }
   if (state.busy && options.suppressBusyClear !== true) emitCodexBusy(tabId, false, reason);
+  codexInputLineBuffers.delete(tabId);
+  codexPromptGeneration.delete(tabId);
   codexTurnWatchers.delete(tabId);
   console.log('[CodexTurn] watcher closed tab=' + String(tabId).slice(-12)
     + ' session=' + (state.sessionId || 'unknown')
@@ -26369,25 +29008,30 @@ ipcMain.handle('codex:get-tui-ready', async (_event, tabId) => {
 });
 
 ipcMain.handle('codex:get-draft-state', async (_event, tabId, options = {}) => {
-  return requestTerminalCodexDraftState(
+  const reason = typeof options?.reason === 'string' ? options.reason : 'codex-get-draft-state';
+  const result = await requestTerminalCodexDraftState(
     mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
     tabId,
-    typeof options?.reason === 'string' ? options.reason : 'codex-get-draft-state',
+    reason,
     Number(options?.timeoutMs) || 700,
     {
       waitFor: typeof options?.waitFor === 'boolean' ? options.waitFor : undefined,
       waitTimeoutMs: Number(options?.waitTimeoutMs) || undefined,
-    }
+      waitOnUnknownOnly: options?.waitOnUnknownOnly === true,
+    },
   );
+  return decorateAgentDraftProofIdentity(tabId, result);
 });
 
 ipcMain.handle('claude:get-draft-state', async (_event, tabId, options = {}) => {
-  return requestTerminalClaudeDraftState(
+  const reason = typeof options?.reason === 'string' ? options.reason : 'claude-get-draft-state';
+  const result = await requestTerminalClaudeDraftState(
     mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
     tabId,
-    typeof options?.reason === 'string' ? options.reason : 'claude-get-draft-state',
-    Number(options?.timeoutMs) || 700
+    reason,
+    Number(options?.timeoutMs) || 700,
   );
+  return decorateAgentDraftProofIdentity(tabId, result);
 });
 
 async function getCodexTuiReadyState(tabId) {
@@ -26435,6 +29079,20 @@ async function getCodexTuiReadyState(tabId) {
         currentScreen.currentFrameText || currentScreen.visibleText || '',
         'get-state-authoritative-current-frame',
       );
+      // Input readiness can be proven a frame before Codex paints its status
+      // footer. Re-read the current verified composer frame on this explicit
+      // state request so remounts/tab switches recover the exact service tier
+      // without consulting the mutable global config or polling the terminal.
+      const composerSettings = parseCodexVerifiedComposerFooter(
+        currentScreen.currentFrameText || '',
+      );
+      if (composerSettings && typeof composerSettings.fast === 'boolean') {
+        publishCodexServiceTierProof(
+          tabId,
+          composerSettings.fast ? 'priority' : 'default',
+          composerSettings.proof || 'verified-composer-footer',
+        );
+      }
     }
   }
   if (textReady && readyMeta?.preview) {
@@ -26697,6 +29355,13 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
     reason: commitScreen.inspected.reason || reason,
     preview: String(commitScreen.currentFrameText || '').replace(/\s+/g, ' ').trim().slice(0, 220),
   });
+  if (composerSettings && typeof composerSettings.fast === 'boolean') {
+    publishCodexServiceTierProof(
+      tabId,
+      composerSettings.fast ? 'priority' : 'default',
+      composerSettings.proof || 'verified-composer-footer',
+    );
+  }
   console.log('[CodexTuiReady] tab=' + String(tabId).slice(-12)
     + ' input ready via verified composer reason=' + reason
     + ' hadReady=' + hadReady
@@ -27588,6 +30253,13 @@ function processCodexUserMessagePasteAudit(state, record) {
       || matchedAudit.historySessionId;
     const auditTimestamp = record.timestamp || new Date(matchedAudit.sentAt).toISOString();
     const sourceIdentity = codexLiveSourceIdentity(state, record, 'codex-user');
+    const activeExecutionContext = state.busy === true
+      ? getActiveAgentExecutionContext(state.tabId)
+      : null;
+    const executionContextVerdict = compatiblePromptAuditExecutionContext({
+      toolType: 'codex',
+      sessionId: auditSessionId,
+    }, activeExecutionContext);
     let presentationSaved = false;
     try {
       presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
@@ -27624,11 +30296,21 @@ function processCodexUserMessagePasteAudit(state, record) {
       sessionId: auditSessionId,
       auditTimestamp,
       sourceIdentity,
+      executionContext: executionContextVerdict.context,
+      executionContextDiagnostic: executionContextVerdict.context
+        ? null
+        : executionContextVerdict.reason,
       presentationSaved,
       expectedLen: matchedAudit.expectedLen,
       expectedHash: matchedAudit.expectedHash,
     });
-    return true;
+    return {
+      matched: true,
+      handoffId: matchedAudit.handoffId || null,
+      sessionId: auditSessionId || null,
+      auditTimestamp,
+      sourceIdentity,
+    };
   } catch (e) {
     console.warn('[CodexPasteAudit] compare failed tab=' + String(state.tabId).slice(-12) + ': ' + (e?.message || String(e)));
     // An internal comparison/storage error is not evidence that the PTY
@@ -27878,6 +30560,7 @@ function recordCodexLiveSubagentOwnership(state, record) {
 function rearmCodexProcessActionBoundary(tabId, reason) {
   const state = codexTurnWatchers.get(tabId);
   if (!state) return false;
+  cancelCodexManualCompactPending(tabId, 'lifecycle-generation-changed');
   state.processGeneration = getTerminalLifecycleGeneration(tabId);
   state.processGenerationBoundaryOffset = Number(state.offset || 0);
   console.log('[CodexSubagentOwnership] boundary tab=' + String(tabId).slice(-12)
@@ -28038,8 +30721,24 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
   if (Number.isFinite(sourceByteOffset)) {
     record.__byteOffset = Number(sourceByteOffset);
   }
+  state.eventSequence = Number(state.eventSequence || 0) + 1;
+  record.__eventSequence = state.eventSequence;
   recordCodexLiveSubagentOwnership(state, record);
-  trackCodexTabSubagentActivity(state, record);
+  // Subagent bookkeeping is DECORATION on top of the turn. It reads other
+  // agents' files, so it can fail for reasons that have nothing to do with
+  // this turn (missing file, unreadable transcript, a bad import). Letting it
+  // throw here aborts the whole line-processing path — no task_complete is
+  // ever seen, the turn stays busy forever, and the tab spins with no
+  // subagents shown. Scar 2026-07-29 (production tab-1005): a helper that was
+  // exported but never imported threw on EVERY rollout line for 9 minutes;
+  // the visible symptom was "the loader never stops", nothing pointing at
+  // subagents at all.
+  try {
+    trackCodexTabSubagentActivity(state, record);
+  } catch (error) {
+    console.error('[CodexTurn] subagent tracking failed tab=' + String(state.tabId).slice(-12)
+      + ' error=' + (error?.message || error));
+  }
   const event = codexEventType(record);
   if (event === 'user_message' && state.manualBindingConflict) {
     promoteCodexManualWriterBindingAfterUserMessage(state, record);
@@ -28073,10 +30772,187 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     emitCodexHistoryLiveTurnBoundary(state, record, event);
   }
   const turnOutcome = classifyCodexTurnRecord(state, record);
-  if (!event) return;
-  if (event === 'user_message') {
-    processCodexUserMessagePasteAudit(state, record);
+  const compactEvidence = classifyCodexCompactEvidence(record);
+  let pendingManualCompact = reconcileCodexManualCompactPendingOwner(state.tabId);
+  if (event === 'task_complete') {
+    // A copied/pre-boundary completion cannot advance the composer generation
+    // that was captured after it. A genuinely newer completion is a prompt
+    // boundary and deterministically invalidates an intent that never started.
+    const predatesPending = pendingManualCompact
+      && !isCodexRecordAfterManualCompactBoundary(
+        pendingManualCompact,
+        record,
+      );
+    if (!predatesPending) {
+      codexPromptGeneration.set(
+        state.tabId,
+        (codexPromptGeneration.get(state.tabId) || 0) + 1,
+      );
+      if (pendingManualCompact) {
+        cancelCodexManualCompactPending(
+          state.tabId,
+          'prompt-generation-changed',
+          pendingManualCompact.operationId,
+        );
+        pendingManualCompact = null;
+      }
+    }
   }
+  let userMessageAudit = null;
+  if (event === 'user_message') {
+    userMessageAudit = processCodexUserMessagePasteAudit(state, record);
+    const command = record.payload?.message
+      || extractCodexLiveText(record.payload?.content)
+      || '';
+    const sourceByteOffset = Number(record.__byteOffset);
+    const processBoundary = Number(state.processGenerationBoundaryOffset);
+    const generation = String(state.processGeneration || '');
+    const currentGeneration = getTerminalLifecycleGeneration(state.tabId);
+    const ownedByCurrentProcess = Number.isFinite(sourceByteOffset)
+      && Number.isFinite(processBoundary)
+      && sourceByteOffset >= processBoundary
+      && !!generation
+      && generation === currentGeneration;
+    if (pendingManualCompact
+      && compactEvidence.kind !== 'start'
+      && isCodexRecordAfterManualCompactBoundary(pendingManualCompact, record)) {
+      cancelCodexManualCompactPending(
+        state.tabId,
+        'different-user-message',
+        pendingManualCompact.operationId,
+      );
+      pendingManualCompact = null;
+    }
+    if (pendingManualCompact
+      && compactEvidence.kind === 'start'
+      && userMessageAudit?.matched === true
+      && isCodexRecordAfterManualCompactBoundary(pendingManualCompact, record)) {
+      // A separately audited exact /compact belongs to the external submit,
+      // not to an older manual Enter that never started. Cancel the invisible
+      // manual owner and preserve the public user_message contract below.
+      cancelCodexManualCompactPending(
+        state.tabId,
+        'different-submit',
+        pendingManualCompact.operationId,
+      );
+      pendingManualCompact = null;
+    }
+    if (!suppressPublications && ownedByCurrentProcess && compactEvidence.kind === 'start') {
+      // Public/History submit keeps its rollout user_message audit. For a
+      // matching manual xterm intent, user_message is useful telemetry but is
+      // not provider-start proof; only task_started below may make it visible.
+      if (!pendingManualCompact) {
+        compactOperations.begin({
+          tabId: state.tabId,
+          provider: 'codex',
+          command,
+          operationId: 'codex:' + generation + ':'
+            + String(state.sessionId || 'session-unknown') + ':' + sourceByteOffset,
+          sessionId: state.sessionId || null,
+          generation,
+          turnId: record.payload?.turn_id || null,
+          handoffId: userMessageAudit?.handoffId || null,
+          sourceByteOffset,
+          source: userMessageAudit?.matched ? 'rollout-user-message-audit' : 'rollout-user-message',
+          acceptedAt: Date.parse(record.timestamp || '') || Date.now(),
+          causalStartRequired: false,
+        });
+      }
+    }
+  }
+  if (!suppressPublications && event === 'task_started') {
+    pendingManualCompact = reconcileCodexManualCompactPendingOwner(state.tabId);
+    if (pendingManualCompact?.source === 'manual-xterm-enter') {
+      const owner = readCodexManualInputOwner(state.tabId);
+      const confirmed = compactOperations.confirmStart({
+        tabId: state.tabId,
+        provider: 'codex',
+        operationId: pendingManualCompact.operationId,
+        sessionId: state.sessionId || null,
+        generation: String(state.processGeneration || ''),
+        promptGeneration: owner.promptSeq,
+        terminal: owner.terminal,
+        eventSequence: record.__eventSequence,
+        sourceByteOffset: Number(record.__byteOffset),
+        proof: 'task_started-after-manual-enter',
+        startedAt: Date.parse(record.timestamp || '') || Date.now(),
+      });
+      if (confirmed) {
+        console.log('[CodexManualInput] pending compact started tab='
+          + String(state.tabId).slice(-12)
+          + ' operation=' + confirmed.operationId
+          + ' sourceOffset=' + (record.__byteOffset ?? '-')
+          + ' eventSequence=' + record.__eventSequence);
+        pendingManualCompact = null;
+      }
+    }
+  }
+  if (compactEvidence.kind === 'terminal') {
+    // Non-deferred lifecycle outcomes still use compactOperations.finish;
+    // task_complete is routed through the causal catch-up below.
+    const activeCompact = compactOperations.getActive(state.tabId, 'codex');
+    const terminalGeneration = String(state.processGeneration || '');
+    const currentTerminalGeneration = String(getTerminalLifecycleGeneration(state.tabId) || '');
+    const completionByteOffset = Number(record.__byteOffset);
+    const causalRecord = !!activeCompact
+      && activeCompact.sessionId === (state.sessionId || null)
+      && activeCompact.generation === terminalGeneration
+      && terminalGeneration === currentTerminalGeneration
+      && (!Number.isFinite(activeCompact.sourceByteOffset)
+        || (Number.isFinite(completionByteOffset)
+          && completionByteOffset > activeCompact.sourceByteOffset));
+    const ownedRolloutRecord = !!activeCompact
+      && activeCompact.sessionId === (state.sessionId || null)
+      && activeCompact.generation === terminalGeneration
+      && Number.isFinite(completionByteOffset)
+      && (!Number.isFinite(activeCompact.sourceByteOffset)
+        || completionByteOffset > activeCompact.sourceByteOffset);
+    if (ownedRolloutRecord && compactEvidence.reason === 'compacted') {
+      compactOperations.observeCodexEvidence({
+        tabId: state.tabId,
+        provider: 'codex',
+        operationId: activeCompact.operationId,
+        sessionId: state.sessionId || null,
+        generation: String(state.processGeneration || ''),
+        kind: 'compacted',
+        rolloutOffset: completionByteOffset,
+        eventSequence: record.__eventSequence,
+        proof: codexLiveSourceIdentity(state, record, 'codex-compacted'),
+      });
+        } else if (causalRecord && compactEvidence.reason === 'task_complete'
+          && activeCompact.source === 'manual-xterm-enter') {
+      // Do not let the generic lifecycle callback decide before the canonical
+      // rollout consumer has caught up to this exact byte boundary. A
+      // preceding provider `compacted` record is authoritative.
+      compactOperations.observeCodexEvidence({
+        tabId: state.tabId,
+        provider: 'codex',
+        operationId: activeCompact.operationId,
+        sessionId: state.sessionId || null,
+        generation: String(state.processGeneration || ''),
+        kind: 'task_complete',
+        rolloutOffset: completionByteOffset,
+        eventSequence: record.__eventSequence,
+        proof: codexLiveSourceIdentity(state, record, 'codex-task-complete'),
+      });
+    } else if (causalRecord) {
+      // Abort/provider-error outcomes remain immediate terminal proofs; only
+      // the generic task_complete fallback needs causal catch-up.
+      compactOperations.finish({
+        tabId: state.tabId,
+        provider: 'codex',
+        operationId: activeCompact.operationId,
+        sessionId: state.sessionId || null,
+        generation: String(state.processGeneration || ''),
+        outcome: compactEvidence.outcome,
+        reason: compactEvidence.reason,
+        completionProof: codexLiveSourceIdentity(state, record, 'codex-lifecycle'),
+        completionByteOffset,
+      });
+    }
+    if (compactEvidence.reason === 'compacted') return;
+  }
+  if (!event) return;
   if (event === 'thread_rolled_back') {
     // Native Rewind is a control event. It does not start a task and must not
     // inherit a generic Enter's prompt-in-flight loader if an older build or a
@@ -28353,6 +31229,21 @@ function processCodexTurnText(state, text, incomingStartOffset) {
   const remaining = combined.subarray(lineStart);
   state.partial = remaining.toString('utf8');
   state.partialStartOffset = combinedStartOffset + lineStart;
+  // The canonical consumer has now processed every complete record in this
+  // append. Only here may task_complete become the deterministic failure
+  // fallback; no timer or polling is involved.
+  const activeCompact = compactOperations.getActive(state.tabId, 'codex');
+  if (activeCompact?.source === 'manual-xterm-enter'
+    && Number.isFinite(activeCompact.codexTaskCompleteOffset)) {
+    compactOperations.finalizeCodexTaskComplete({
+      tabId: state.tabId,
+      provider: 'codex',
+      operationId: activeCompact.operationId,
+      sessionId: state.sessionId || null,
+      generation: String(state.processGeneration || ''),
+      proof: 'canonical-rollout-catch-up',
+    });
+  }
 }
 
 async function scanCodexTurnAppend(tabId, reason = 'scan') {
@@ -28543,6 +31434,7 @@ function startCodexTurnWatcher({
     processGenerationBoundaryOffset: offset,
     partial: '',
     partialStartOffset: offset,
+    eventSequence: 0,
     busy: inheritedBusy,
     handoffBusyInherited: inheritedBusy,
     lastEventType: null,
@@ -28669,6 +31561,7 @@ function activateDeferredCodexTurnWatcher(tabId, reason = 'composer-ready') {
     ? state.deferredInitialOffset
     : state.offset;
   const deferredAt = state.deferredAt;
+  cancelCodexManualCompactPending(tabId, 'lifecycle-generation-changed');
   state.offset = fileSize;
   state.processGeneration = getTerminalLifecycleGeneration(tabId);
   state.processGenerationBoundaryOffset = fileSize;
@@ -29081,6 +31974,115 @@ function projectCodexVisibleUserMessagesForRewindProof(records, sessionId = null
   return projected;
 }
 
+function projectCodexSourceTranscriptForRewindRecovery(records, sessionId = null) {
+  const sourceMessages = [];
+  const sourceLifecycleEvents = [];
+  for (const record of records || []) {
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg') continue;
+    const sourceLine = Number(record.__line);
+    const timestampMs = Date.parse(String(record.timestamp || ''));
+    if (payload.type === 'user_message') {
+      const text = String(
+        payload.message
+        || codexDataModule._api.extractTextContent(payload.content)
+        || '',
+      ).trim();
+      sourceMessages.push({
+        uuid: 'codex-user-' + (sessionId || 'unknown') + '-' + sourceLine,
+        sourceLine,
+        textHash: hashCodexRewindTargetText(text),
+        timestampMs,
+      });
+      continue;
+    }
+    if (payload.type === 'task_started') {
+      sourceLifecycleEvents.push({
+        type: payload.type,
+        sourceLine,
+        timestampMs,
+      });
+    }
+  }
+  return { sourceMessages, sourceLifecycleEvents };
+}
+
+async function recoverPendingCodexStableSourceFromTranscript({
+  key,
+  journal,
+  currentSessionId,
+  discoveryComplete,
+  descendants,
+} = {}) {
+  if (!journal || discoveryComplete !== true || (descendants || []).length > 0) {
+    return { success: false, reason: 'stable-source-preconditions-missing' };
+  }
+  const found = await codexDataModule._api.findCodexSessionFile(
+    journal.sourceSessionId,
+    journal.cwd,
+  );
+  if (!found?.filePath) {
+    return {
+      success: false,
+      reason: 'stable-source-transcript-read-failed',
+      error: 'codex_source_session_file_not_found',
+    };
+  }
+  const scanned = await codexDataModule._api.scanCodexStableSourceRewindProof(
+    found.filePath,
+    {
+      targetSourceLine: journal.targetSourceLine,
+      actionStartedAtMs: journal.actionStartedAtMs,
+    },
+  );
+  if (scanned?.complete !== true) {
+    return {
+      success: false,
+      reason: 'stable-source-transcript-scan-incomplete',
+      error: scanned?.error || null,
+    };
+  }
+  const transcript = projectCodexSourceTranscriptForRewindRecovery(
+    [
+      scanned.targetRecord,
+      scanned.taskStartedRecord,
+      scanned.userMessageRecord,
+    ].filter(Boolean),
+    journal.sourceSessionId,
+  );
+  const proof = classifyCodexStableSourceTranscriptRecovery({
+    journal,
+    currentSessionId,
+    discoveryComplete,
+    descendants,
+    ...transcript,
+  });
+  if (proof.proven !== true) return { success: false, reason: proof.reason, proof };
+  const taskStarted = transcript.sourceLifecycleEvents.find((event) => (
+    Number(event.sourceLine) === Number(proof.taskStartedSourceLine)
+  ));
+  const resolved = projectManager.db.resolvePendingCodexStableSourceFromTranscript({
+    journalKey: key,
+    projectId: journal.projectId,
+    tabId: journal.tabId,
+    sourceSessionId: journal.sourceSessionId,
+    actionGeneration: journal.actionGeneration,
+    targetSourceLine: proof.targetSourceLine,
+    targetTextHash: journal.targetTextHash,
+    taskStartedSourceLine: proof.taskStartedSourceLine,
+    taskStartedAtMs: taskStarted?.timestampMs,
+    userMessageSourceLine: proof.userMessageSourceLine,
+    userMessageTimestampMs: proof.userMessageTimestampMs,
+  });
+  return {
+    ...resolved,
+    reason: resolved?.success === true
+      ? proof.reason
+      : (resolved?.error || 'stable-source-transcript-commit-failed'),
+    proof,
+  };
+}
+
 async function proveCodexRecoveredRewindDescendantMatchesTarget(journal, descendantSessionId, {
   allowPostActionSuffix = false,
   candidateCreatedAtMs = null,
@@ -29200,6 +32202,7 @@ async function recoverPendingCodexNativeRewindHandoffs() {
     return { recovered: 0, unresolved: 0, cleared: 0, scanStatus: 'unknown' };
   }
   let recovered = 0;
+  let stableSourceRecovered = 0;
   let unresolved = 0;
   let cleared = 0;
   for (const [key, raw] of Object.entries(rawRows || {})) {
@@ -29239,6 +32242,8 @@ async function recoverPendingCodexNativeRewindHandoffs() {
       continue;
     }
     let evaluatedDescendants;
+    let discoveryComplete = false;
+    let discoveredDescendants = [];
     const recordedReplacement = journal.replacementCandidateProof || null;
     if (recordedReplacement) {
       const computedReplacementProof = await proveCodexRecoveredRewindDescendantMatchesTarget(
@@ -29276,6 +32281,8 @@ async function recoverPendingCodexNativeRewindHandoffs() {
         continue;
       }
       const descendants = discovery.descendants || [];
+      discoveryComplete = true;
+      discoveredDescendants = descendants;
       evaluatedDescendants = await Promise.all(descendants.map(async (descendant) => ({
         ...descendant,
         targetProof: await proveCodexRecoveredRewindDescendantMatchesTarget(
@@ -29287,11 +32294,30 @@ async function recoverPendingCodexNativeRewindHandoffs() {
     const recoverySelection = codexDataModule._api
       .selectSingleProvenCodexRewindRecoveryCandidate(evaluatedDescendants);
     if (recoverySelection.status !== 'selected') {
+      const stableSource = await recoverPendingCodexStableSourceFromTranscript({
+        key,
+        journal,
+        currentSessionId,
+        discoveryComplete,
+        descendants: discoveredDescendants,
+      });
+      if (stableSource?.success === true) {
+        stableSourceRecovered += 1;
+        console.log('[CodexWriterHandoff:Recovery] stable source reconciled tab='
+          + String(tabId).slice(-12)
+          + ' source=' + String(sourceSessionId).slice(0, 8)
+          + ' generation=' + journal.actionGeneration
+          + ' taskLine=' + stableSource.proof.taskStartedSourceLine
+          + ' userLine=' + stableSource.proof.userMessageSourceLine
+          + ' proof=' + stableSource.reason);
+        continue;
+      }
       unresolved += 1;
       console.warn('[CodexWriterHandoff:Recovery] descendant proof unresolved; preserving journal tab='
         + String(tabId).slice(-12)
         + ' source=' + String(sourceSessionId).slice(0, 8)
         + ' reason=' + recoverySelection.reason
+        + ' stableSource=' + (stableSource?.reason || 'unavailable')
         + ' candidates=' + JSON.stringify(evaluatedDescendants.map(descendant => ({
           sessionId: descendant.sessionId,
           depth: descendant.lineageDepth,
@@ -29345,6 +32371,7 @@ async function recoverPendingCodexNativeRewindHandoffs() {
   }
   return {
     recovered,
+    stableSourceRecovered,
     unresolved,
     cleared,
     scanStatus: codexRewindRecoveryScanStatus,
@@ -30818,6 +33845,7 @@ async function ensureCodexTurnWatcher(tabId, sessionId, cwd, options = {}) {
     // new launch generation; otherwise append-in-place starts correctly but
     // linked-child discovery remains armed and can adopt a later unrelated fork.
     if (options.sourceObservationLaunchId) {
+      cancelCodexManualCompactPending(tabId, 'lifecycle-generation-changed');
       existing.sourceObservationLaunchId = options.sourceObservationLaunchId;
       configureCodexCatchUpSuppression(existing, {
         suppressBusy: options.suppressBusyCatchUp === true,
@@ -33839,7 +36867,10 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
 }
 
 function parseCodexServiceTierFeedback(text) {
-  const match = String(text || '').replace(/\s+/g, ' ').match(/Service tier set to\s+(priority|default)/i);
+  const matches = Array.from(
+    String(text || '').replace(/\s+/g, ' ').matchAll(/Service tier set to\s+(priority|default)/gi),
+  );
+  const match = matches[matches.length - 1] || null;
   if (!match) return null;
   const serviceTier = match[1].toLowerCase();
   return {
@@ -35698,37 +38729,66 @@ ipcMain.on('gemini:send-command', (event, tabId, command) => {
 
 // ========== CODEX INPUT INTERCEPTION ==========
 
+async function runCodexCommandAfterLifecycleAdmission(sender, payload = {}) {
+  const tabId = payload?.tabId;
+  if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
+  const preparation = agentLaunchPreparations.begin({
+    tabId,
+    toolType: 'codex',
+    sessionId: payload?.sessionId || null,
+    command: payload?.command || null,
+    phase: 'proving-shell',
+    reason: payload?.sessionId ? 'resume-requested' : 'launch-requested',
+  });
+  let result = null;
+  try {
+    result = await runCodexCommandFromPayloadInner(sender, payload);
+    return result;
+  } catch (error) {
+    result = {
+      success: false,
+      accepted: false,
+      error: error?.message || String(error),
+    };
+    throw error;
+  } finally {
+    agentLaunchPreparations.finish(
+      tabId,
+      preparation.token,
+      classifyCodexLaunchPreparationResult(result),
+    );
+  }
+}
+
+async function runCodexCommandWithinLifecycle(sender, payload = {}) {
+  const tabId = payload?.tabId;
+  if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
+  const lifecycleAdmission = await admitAiLifecycleLaunch(tabId, payload);
+  if (lifecycleAdmission?.allowed !== true) {
+    console.warn('[AILifecycle] Codex launch suppressed tab=' + String(tabId).slice(-12)
+      + ' source=' + (lifecycleAdmission?.source || '-')
+      + ' reason=' + (lifecycleAdmission?.reason || 'launch-not-admitted')
+      + ' run=' + (lifecycleAdmission?.runId || '-'));
+    return {
+      success: lifecycleAdmission?.suppressed === true,
+      accepted: false,
+      suppressed: lifecycleAdmission?.suppressed === true,
+      reason: lifecycleAdmission?.reason || 'launch-not-admitted',
+      error: lifecycleAdmission?.suppressed === true
+        ? null
+        : (lifecycleAdmission?.error || lifecycleAdmission?.reason || 'launch-not-admitted'),
+      tabId,
+    };
+  }
+  return await runCodexCommandAfterLifecycleAdmission(sender, payload);
+}
+
 async function runCodexCommandFromPayload(sender, payload = {}) {
   const tabId = payload?.tabId;
   if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
   return await runKeyedExclusive(codexLaunchInflight, tabId, async () => {
-    return await runKeyedExclusive(aiShellLaunchInflight, tabId, async () => {
-      const preparation = agentLaunchPreparations.begin({
-        tabId,
-        toolType: 'codex',
-        sessionId: payload?.sessionId || null,
-        command: payload?.command || null,
-        phase: 'proving-shell',
-        reason: payload?.sessionId ? 'resume-requested' : 'launch-requested',
-      });
-      let result = null;
-      try {
-        result = await runCodexCommandFromPayloadInner(sender, payload);
-        return result;
-      } catch (error) {
-        result = {
-          success: false,
-          accepted: false,
-          error: error?.message || String(error),
-        };
-        throw error;
-      } finally {
-        agentLaunchPreparations.finish(tabId, preparation.token, {
-          accepted: result?.accepted === true,
-          reason: result?.accepted === true ? 'launch-accepted' : 'launch-rejected',
-          error: result?.accepted === true ? null : (result?.error || result?.reason || null),
-        });
-      }
+    return await runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+      return await runCodexCommandWithinLifecycle(sender, payload);
     });
   });
 }
@@ -35746,6 +38806,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     settingsIntent,
     modelMigrationPending: rendererModelMigrationPending,
     developerInstructions,
+    _mcpStartupRecoveryHandoff: mcpStartupRecoveryHandoff,
   } = payload;
   if (codexRewindRecoveryScanStatus !== 'complete') {
     // Retry the startup scan once at the launch boundary. A failed DB scan is
@@ -35763,7 +38824,15 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       tabId,
     };
   }
-  const pendingRewindHandoff = readPendingCodexNativeRewindHandoff(tabId);
+  let pendingRewindHandoff = readPendingCodexNativeRewindHandoff(tabId);
+  if (pendingRewindHandoff && pendingRewindHandoff.invalid !== true) {
+    // The exact same-source proof may have landed after startup recovery (for
+    // example the user submitted the restored Rewind draft and then stopped
+    // Codex). Re-run the deterministic journal reconciliation at the launch
+    // boundary instead of making this tab permanently unrecoverable.
+    await recoverPendingCodexNativeRewindHandoffs();
+    pendingRewindHandoff = readPendingCodexNativeRewindHandoff(tabId);
+  }
   if (pendingRewindHandoff) {
     console.warn('[Codex Runner] launch blocked by unresolved native Rewind tab='
       + String(tabId).slice(-12)
@@ -35787,6 +38856,10 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     return { success: false, error: 'terminal_not_found' };
   }
 
+  const ownsMcpStartupRecoveryHandoff = !!mcpStartupRecoveryHandoff
+    && codexMcpStartupReplacementHandoffs.get(tabId) === mcpStartupRecoveryHandoff
+    && mcpStartupRecoveryHandoff.phase === 'stopped';
+
   // A launch command now begins with Ctrl+C so it cannot concatenate with a
   // dirty raw-shell line. That byte is destructive in any live TUI, therefore
   // the permission boundary is stricter than renderer presence: the shell must
@@ -35795,7 +38868,28 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   const preLaunchAdmission = await proveIdleShellForAgentLaunch(tabId, 'codex', {
     expectedTerm: term,
     expectedRunSeq: shellRunSeqBeforeLaunch,
+    allowCurrentLaunchClaim: ownsMcpStartupRecoveryHandoff,
+    allowCurrentStoppingClaim: ownsMcpStartupRecoveryHandoff,
   });
+  const recoveryAdmission = ownsMcpStartupRecoveryHandoff
+    ? validateStoppedCodexMcpStartupReplacementHandoff(
+      tabId,
+      mcpStartupRecoveryHandoff,
+      preLaunchAdmission.lookup?.status || AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
+    )
+    : null;
+  if (ownsMcpStartupRecoveryHandoff && recoveryAdmission?.allowed !== true) {
+    console.warn('[CodexMcpStartupWatchdog] replacement admission expired tab='
+      + String(tabId).slice(-12)
+      + ' reason=' + (recoveryAdmission?.reason || 'unknown'));
+    return {
+      success: false,
+      accepted: false,
+      error: 'shell_not_idle',
+      reason: recoveryAdmission?.reason || 'replacement-handoff-expired',
+      tabId,
+    };
+  }
   if (!preLaunchAdmission.allowed) {
     const lookupUnknown = preLaunchAdmission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN;
     const processFound = preLaunchAdmission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.FOUND;
@@ -36008,14 +39102,46 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       + ' source=' + String(sessionId).slice(0, 8)
       + ' launch=' + launchId);
   }
+  cancelCodexManualCompactPending(tabId, 'lifecycle-generation-changed');
   invalidateCodexWriterProof(tabId, 'launch-started:' + launchId);
   if (codexPendingSettingsProofHandoffs.delete(tabId)) {
     console.log('[CodexSettingsProof] stale pre-rollout proof cleared at launch tab='
       + String(tabId).slice(-12)
       + ' launch=' + launchId);
   }
+  if (ownsMcpStartupRecoveryHandoff) {
+    const handoffAdmission = validateStoppedCodexMcpStartupReplacementHandoff(
+      tabId,
+      mcpStartupRecoveryHandoff,
+      AI_PROCESS_LOOKUP_STATUS.ABSENT,
+    );
+    if (!handoffAdmission.allowed) {
+      console.warn('[CodexMcpStartupWatchdog] replacement handoff expired before claim tab='
+        + String(tabId).slice(-12)
+        + ' reason=' + handoffAdmission.reason);
+      return {
+        success: false,
+        accepted: false,
+        error: 'shell_not_idle',
+        reason: handoffAdmission.reason,
+        tabId,
+      };
+    }
+    mcpStartupRecoveryHandoff.phase = 'claiming';
+    clearCodexLaunchPayload(
+      tabId,
+      'mcp-startup-replacement-handoff',
+      mcpStartupRecoveryHandoff.oldLaunchId,
+    );
+    const inheritedState = terminalCommandState.get(tabId)
+      || { isRunning: false, lastExitCode: 0 };
+    inheritedState.isRunning = false;
+    clearTerminalCommandOrigin(tabId, inheritedState, 'mcp-startup-replacement-handoff');
+    terminalCommandState.set(tabId, inheritedState);
+  }
   codexLastRunCommandPayload.set(tabId, {
     launchId,
+    launchSource: normalizeAgentLaunchSource(payload.launchSource),
     tabId,
     command: normalizedCommand,
     sessionId,
@@ -36042,6 +39168,14 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   if (shellStateBeforeClaim.isRunning === true
     || Number(shellStateBeforeClaim.runSeq || 0) !== shellRunSeqBeforeLaunch) {
     releaseCodexResumeSourceLeaseForTab(tabId, 'shell-changed-before-launch-claim', sessionId || null, launchId);
+    if (ownsMcpStartupRecoveryHandoff) {
+      clearCodexLaunchPayload(tabId, 'replacement-shell-changed-before-claim', launchId);
+      releaseCodexMcpStartupReplacementHandoff(
+        tabId,
+        mcpStartupRecoveryHandoff,
+        'replacement-shell-changed-before-claim',
+      );
+    }
     return {
       success: false,
       accepted: false,
@@ -36064,6 +39198,11 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   }
   clearTerminalCommandOrigin(tabId, commandState, 'codex-run-command');
   terminalCommandState.set(tabId, commandState);
+  if (ownsMcpStartupRecoveryHandoff) {
+    mcpStartupRecoveryHandoff.phase = 'claimed';
+    mcpStartupRecoveryHandoff.newLaunchId = launchId;
+    mcpStartupRecoveryHandoff.newRunSeq = launchRunSeq;
+  }
   rearmCodexProcessActionBoundary(tabId, 'codex-run-command');
   codexPreclaimedCommandGenerations.set(tabId, {
     terminalToken: term,
@@ -36179,6 +39318,13 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     });
   } catch (error) {
     rollbackLaunchSetup('launch-observation-error', error);
+    if (ownsMcpStartupRecoveryHandoff) {
+      releaseCodexMcpStartupReplacementHandoff(
+        tabId,
+        mcpStartupRecoveryHandoff,
+        'replacement-launch-observation-error',
+      );
+    }
     throw error;
   } finally {
     if (codexLaunchObservationPending.get(tabId) === launchId) {
@@ -36219,8 +39365,34 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
         expectedTerm: term,
         expectedRunSeq: launchRunSeq,
         allowCurrentLaunchClaim: true,
+        allowCurrentStoppingClaim: ownsMcpStartupRecoveryHandoff,
       });
       if (!admission.allowed) return { written: false, admission };
+      if (ownsMcpStartupRecoveryHandoff) {
+        const handoffAdmission = validateClaimedCodexMcpStartupReplacementHandoff(
+          tabId,
+          mcpStartupRecoveryHandoff,
+          admission.lookup?.status || AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
+        );
+        if (!handoffAdmission.allowed) {
+          return {
+            written: false,
+            admission: {
+              ...admission,
+              allowed: false,
+              reason: handoffAdmission.reason,
+            },
+          };
+        }
+        // No await is permitted between releasing the input barrier and the
+        // replacement write. A manual key therefore cannot land in the shell
+        // between the exact handoff proof and Ctrl+C + command.
+        releaseCodexMcpStartupReplacementHandoff(
+          tabId,
+          mcpStartupRecoveryHandoff,
+          'replacement-write-accepted',
+        );
+      }
       writeAgentLaunchCommandToIdleShell(term, {
         tabId,
         toolType: 'codex',
@@ -36232,6 +39404,13 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     if (!boundary.written) {
       const error = new Error(boundary.admission.reason || 'shell_launch_boundary_rejected');
       rollbackLaunchSetup('shell-launch-boundary-rejected', error);
+      if (ownsMcpStartupRecoveryHandoff) {
+        releaseCodexMcpStartupReplacementHandoff(
+          tabId,
+          mcpStartupRecoveryHandoff,
+          'replacement-write-rejected',
+        );
+      }
       return {
         success: false,
         accepted: false,
@@ -36246,6 +39425,13 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     }
   } catch (error) {
     rollbackLaunchSetup('launch-write-error', error);
+    if (ownsMcpStartupRecoveryHandoff) {
+      releaseCodexMcpStartupReplacementHandoff(
+        tabId,
+        mcpStartupRecoveryHandoff,
+        'replacement-launch-write-error',
+      );
+    }
     throw error;
   }
   // The PTY write is the only synchronous admission point. Codex has no
@@ -36281,7 +39467,7 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
   const shouldQueue = !!(options && (options.queue === true || statusAtSend === 'busy'));
   const handoffId = options && typeof options.handoffId === 'string' ? options.handoffId : null;
   const source = options && typeof options.source === 'string' ? options.source : null;
-  const isPromptQueueSend = typeof source === 'string' && source.includes('prompt-queue');
+  const isPromptQueueSend = isPromptQueueAutomationSource(source);
   const codexSource = source
     ? (source.startsWith('codex-') ? source : 'codex-' + source)
     : (shouldQueue ? 'codex-history-queue' : 'codex-history-send');
@@ -36811,7 +39997,7 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
           return admission;
         };
 
-        return sendCodexLiveSlashCommand(term, {
+        const result = await sendCodexLiveSlashCommand(term, {
           tabId,
           command,
           hasDraft: freshHasDraft,
@@ -36834,6 +40020,17 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
             },
           ),
         });
+        if (result?.success === true && typeof result?.serviceTier === 'string') {
+          const serviceTierProof = publishCodexServiceTierProof(
+            tabId,
+            result.serviceTier,
+            result.serviceTierSource || 'tui-service-tier-feedback',
+          );
+          if (serviceTierProof) {
+            return { ...result, serviceTierProof };
+          }
+        }
+        return result;
       }, slashOperation);
     } catch (error) {
       console.error('[codex:send-live-slash-command] Error:', error);
@@ -37244,6 +40441,60 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
     return { success: false, accepted: false, error: 'terminal_cwd_not_found', tabId };
   }
 
+  if (command === 'claude' && payload?.allowNewOverExisting !== true) {
+    let persisted = null;
+    try {
+      persisted = projectManager?.db?.db?.prepare(
+        'SELECT claude_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+      ).get(tabId) || null;
+    } catch (error) {
+      console.warn('[Claude Runner] fresh-start binding lookup failed tab='
+        + String(tabId).slice(-12) + ' error=' + (error?.message || String(error)));
+      return {
+        success: false,
+        accepted: false,
+        error: 'claude_session_materialization_unknown',
+        reason: 'tab-binding-read-failed',
+        tabId,
+      };
+    }
+    const boundSessionId = persisted?.claude_session_id || bridgeKnownSessions.get(tabId) || null;
+    let materialization = null;
+    if (boundSessionId) {
+      try {
+        materialization = getSessionMaterialization(
+          boundSessionId,
+          persisted?.cwd || cwd || process.cwd(),
+        );
+      } catch (error) {
+        materialization = {
+          success: false,
+          reason: 'materialization-check-failed',
+          error: error?.message || String(error),
+        };
+      }
+    }
+    const admission = evaluateClaudeFreshStartAdmission({
+      command,
+      allowNewOverExisting: payload?.allowNewOverExisting === true,
+      boundSessionId,
+      materialization,
+    });
+    if (!admission.allowed) {
+      console.warn('[Claude Runner] blocked plain start over durable session tab='
+        + String(tabId).slice(-12)
+        + ' session=' + String(admission.sessionId || '-').slice(0, 8)
+        + ' reason=' + admission.reason);
+      return {
+        success: false,
+        accepted: false,
+        tabId,
+        command,
+        ...admission,
+      };
+    }
+  }
+
   const shellRunSeqBeforeLaunch = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   const preLaunchAdmission = await proveIdleShellForAgentLaunch(tabId, 'claude', {
     expectedTerm: term,
@@ -37610,7 +40861,24 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
 async function runClaudeCommandSerialized(event, payload = {}) {
   const tabId = payload?.tabId;
   if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
-  return await runKeyedExclusive(aiShellLaunchInflight, tabId, async () => {
+  return await runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+    const lifecycleAdmission = await admitAiLifecycleLaunch(tabId, payload);
+    if (lifecycleAdmission?.allowed !== true) {
+      console.warn('[AILifecycle] Claude launch suppressed tab=' + String(tabId).slice(-12)
+        + ' source=' + (lifecycleAdmission?.source || '-')
+        + ' reason=' + (lifecycleAdmission?.reason || 'launch-not-admitted')
+        + ' run=' + (lifecycleAdmission?.runId || '-'));
+      return {
+        success: lifecycleAdmission?.suppressed === true,
+        accepted: false,
+        suppressed: lifecycleAdmission?.suppressed === true,
+        reason: lifecycleAdmission?.reason || 'launch-not-admitted',
+        error: lifecycleAdmission?.suppressed === true
+          ? null
+          : (lifecycleAdmission?.error || lifecycleAdmission?.reason || 'launch-not-admitted'),
+        tabId,
+      };
+    }
     const command = String(payload?.command || '');
     const sessionId = command === 'claude-c' ? String(payload?.sessionId || '') : '';
     const preparation = agentLaunchPreparations.begin({
@@ -37890,6 +41158,11 @@ function _webBroadcast(tabId, payload) {
 // "waiting for sessionId" → live fs.watch — no polling required.
 function _notifyClaudeSession(tabId, sessionId) {
   if (!tabId || !sessionId) return;
+  claudeStartupProofSession?.handleBindingChanged(tabId, {
+    sessionId,
+    generation: claudeLaunchGenerationByTab.get(tabId)?.generation || null,
+    cwd: terminalProjects.get(tabId) || null,
+  });
   try {
     require(path.join(srcMainDir, 'web-server')).notifyClaudeSessionAvailable(tabId);
   } catch {}

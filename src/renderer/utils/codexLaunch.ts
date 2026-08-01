@@ -8,6 +8,7 @@ export interface CodexRunPayloadBase {
   sessionId?: string;
   cwd?: string;
   developerInstructions?: string;
+  launchSource?: 'auto-resume' | 'explicit';
 }
 
 export interface CodexRunPayload extends CodexRunPayloadBase {

@@ -343,7 +343,7 @@ interface UIStore {
 
   terminalFontSize: number;
 
-  tabsFontSize: number;        // Main + Utils tabs in TabBar
+  tabsFontSize: number;        // Working tabs in TabSidebar
 
   projectTabsFontSize: number; // Project chips in Title Bar
 
@@ -693,6 +693,9 @@ interface UIStore {
   setHistoryPinned: (v: boolean) => void;
   timelinePinned: boolean;
   setTimelinePinned: (v: boolean) => void;
+  // Center-surface owner for Claude/Codex PTY tabs. See loader comment above.
+  terminalIsPrimary: boolean;
+  setTerminalIsPrimary: (v: boolean) => void;
 
   // Free-ports toggle. When ON, every npm-script start / restart / stop from a
   // devServer-tab first calls `system:free-project-ports` for the tab's cwd —
@@ -1505,6 +1508,39 @@ const initialHistoryPinned = loadHistoryPinned();
       if (useUIStore.getState().historyPinned !== bool) {
         useUIStore.setState({ historyPinned: bool });
         try { localStorage.setItem('noted-terminal-history-pinned', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// terminalIsPrimary — which surface owns the center of a Claude/Codex PTY tab.
+// false (default) keeps History primary with the terminal in its floating
+// window; true swaps them: the SAME terminal fills the center and the SAME
+// History moves to the side panel. Global for the whole app (not per tab) and
+// persisted, so the chosen workspace shape survives a restart.
+const APP_STATE_KEY_TERMINAL_PRIMARY = 'terminalIsPrimary';
+const loadTerminalIsPrimary = (): boolean => {
+  try {
+    return localStorage.getItem('noted-terminal-terminal-primary') === 'true';
+  } catch { return false; }
+};
+const saveTerminalIsPrimary = (v: boolean) => {
+  try { localStorage.setItem('noted-terminal-terminal-primary', String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_TERMINAL_PRIMARY, value: v }).catch(() => {});
+  } catch {}
+};
+const initialTerminalIsPrimary = loadTerminalIsPrimary();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_TERMINAL_PRIMARY);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().terminalIsPrimary !== bool) {
+        useUIStore.setState({ terminalIsPrimary: bool });
+        try { localStorage.setItem('noted-terminal-terminal-primary', String(bool)); } catch {}
       }
     }
   } catch {}
@@ -2940,6 +2976,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setHistoryPinned: (v) => { set({ historyPinned: v }); saveHistoryPinned(v); },
   timelinePinned: initialTimelinePinned,
   setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
+  terminalIsPrimary: initialTerminalIsPrimary,
+  setTerminalIsPrimary: (v) => { set({ terminalIsPrimary: v }); saveTerminalIsPrimary(v); },
 
   freePortsBeforeStart: initialFreePortsBeforeStart,
   setFreePortsBeforeStart: (v) => { set({ freePortsBeforeStart: v }); saveFreePortsBeforeStart(v); },

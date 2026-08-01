@@ -74,9 +74,13 @@ export function buildTimelineCornerBadges({
   docsEditedCount = 0,
   docsSearchCount = 0,
   collapsedGroupSize = 0,
+  compactClusterSize = 0,
 } = {}) {
-  const count = collapsedGroupSize > 1 ? String(collapsedGroupSize) : null;
-  const cacheKey = `${isLoop ? 1 : 0}${docsEditedCount > 0 ? 1 : 0}${docsSearchCount > 0 ? 1 : 0}:${count || ''}`;
+  const compactCount = compactClusterSize > 1 ? String(compactClusterSize) : null;
+  const groupCount = collapsedGroupSize > 1 ? String(collapsedGroupSize) : null;
+  const count = compactCount || groupCount;
+  const countTone = compactCount ? 'compact' : count ? 'group' : null;
+  const cacheKey = `${isLoop ? 1 : 0}${docsEditedCount > 0 ? 1 : 0}${docsSearchCount > 0 ? 1 : 0}:${countTone || ''}:${count || ''}`;
   const cached = cornerBadgeCache.get(cacheKey);
   if (cached) return cached;
 
@@ -85,22 +89,29 @@ export function buildTimelineCornerBadges({
   if (docsEditedCount > 0) icons.push('docs-edit');
   if (docsSearchCount > 0) icons.push('docs-search');
 
-  const items = [];
-  if (icons[0]) items.push({ kind: icons[0], slot: 'top-right' });
+  const ordered = icons.map(kind => ({ kind }));
   if (count) {
-    items.push({ kind: 'count', slot: 'bottom-right', text: count });
-  } else if (icons[1]) {
-    items.push({ kind: icons[1], slot: 'bottom-right' });
+    const countItem = { kind: 'count', text: count, tone: countTone };
+    if (countTone === 'compact' && ordered.length > 0) ordered.splice(1, 0, countItem);
+    else ordered.push(countItem);
   }
-  const remainingIcons = icons.slice(count ? 1 : 2);
-  const remainingSlots = ['top-left', 'bottom-left'];
-  remainingIcons.forEach((kind, index) => {
-    if (remainingSlots[index]) items.push({ kind, slot: remainingSlots[index] });
-  });
+
+  const slots = ordered.length === 1 && countTone === 'group'
+    ? ['bottom-right']
+    : ordered.length === 1
+      ? ['top-right']
+      : ordered.length === 2
+        ? ['top-right', 'bottom-right']
+        : ['top-right', 'middle-right', 'bottom-right', 'middle-inner'];
+  const items = ordered.slice(0, slots.length).map((item, index) => ({
+    ...item,
+    slot: slots[index],
+  }));
 
   const result = {
     icons,
     count,
+    countTone,
     items,
   };
   cornerBadgeCache.set(cacheKey, result);

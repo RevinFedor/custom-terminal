@@ -23,6 +23,13 @@ export interface ComposerFrameProps
   actions?: React.ReactNode;
   overlay?: React.ReactNode;
   footer?: React.ReactNode;
+  /**
+   * Keep the top line's height reserved while it is empty. Without it the whole
+   * composer grows the moment a prompt chip appears and shrinks back when it is
+   * removed, so the input jumps under the caret mid-typing. The row is a fixed
+   * slot of the composer, not content that pushes layout around.
+   */
+  reserveTopBar?: boolean;
 }
 
 export const ComposerFrame: React.FC<ComposerFrameProps> = ({
@@ -33,6 +40,7 @@ export const ComposerFrame: React.FC<ComposerFrameProps> = ({
   actions,
   overlay,
   footer,
+  reserveTopBar = false,
   className,
   ...props
 }) => (
@@ -46,7 +54,17 @@ export const ComposerFrame: React.FC<ComposerFrameProps> = ({
     data-composer-density={density}
   >
     {overlay != null && <div className="cb-composer-overlay">{overlay}</div>}
-    {topBar != null && <div className="cb-composer-topbar">{topBar}</div>}
+    {(topBar != null || reserveTopBar) && (
+      <div
+        className={joinClasses(
+          'cb-composer-topbar',
+          reserveTopBar && 'cb-composer-topbar--reserved',
+        )}
+        data-composer-topbar-empty={topBar == null ? '' : undefined}
+      >
+        {topBar}
+      </div>
+    )}
     {chips != null && <div className="cb-composer-chips">{chips}</div>}
     <div className="cb-composer-main">
       <div className="cb-composer-input-slot">{input}</div>

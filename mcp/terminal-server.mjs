@@ -815,7 +815,7 @@ const TOOLS = [
   },
   {
     name: 'send_prompt',
-    description: 'Send text to a live AI tab (Claude or Codex) through the Project API scenario layer. Default `submit=true` sends the prompt immediately and handles busy/readiness/draft preflight. Pass `submit=false` only to paste an editable draft into the agent input without pressing Enter. Use this for AI tabs; use run_command for generic shells.',
+    description: 'Send text to a Claude/Codex tab through the Project API scenario layer. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns only after delivery is accepted. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use run_command for generic shells.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1279,6 +1279,7 @@ async function callTool(name, args) {
         placement: args.placement || 'child',
         parentTabId: args.parentTabId || undefined,
         parentRunId: args.parentRunId || undefined,
+        sourceMeta: buildSourceMeta(),
         waitForDescendants: args.waitForDescendants !== false,
         notifySource: args.notifySource !== false,
         queue: args.queue !== false,

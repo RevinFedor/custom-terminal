@@ -101,3 +101,37 @@ test('reader asks main even when renderer terminal is absent', async () => {
   assert.equal(resolved.hasDraft, false);
   assert.equal(resolved.authority, 'main');
 });
+
+test('reader forwards event-driven unknown-frame wait without polling', async () => {
+  const calls = [];
+  await readCodexDraftAuthority({
+    invoke: async (...args) => {
+      calls.push(args);
+      return {
+        success: true,
+        hasDraft: false,
+        preview: '',
+        source: 'headless-main:cursor:42:dim-hint',
+      };
+    },
+    tabId: 'tab-redraw',
+    reason: 'send-during-redraw',
+    timeoutMs: 700,
+    waitFor: false,
+    waitTimeoutMs: 2500,
+    waitOnUnknownOnly: true,
+    visualState: { hasDraft: null, source: 'no-terminal' },
+  });
+
+  assert.deepEqual(calls, [[
+    'codex:get-draft-state',
+    'tab-redraw',
+    {
+      reason: 'send-during-redraw',
+      timeoutMs: 700,
+      waitFor: false,
+      waitTimeoutMs: 2500,
+      waitOnUnknownOnly: true,
+    },
+  ]]);
+});

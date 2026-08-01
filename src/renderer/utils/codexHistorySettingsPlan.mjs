@@ -21,7 +21,29 @@ export function resolveCodexSettingsRuntimeProof(runtimeSnapshot) {
   const activeWriterSessionId = runtimeSnapshot?.writerConfirmed === true
     ? normalizeSessionId(runtimeSnapshot?.provenWriterSessionId)
     : '';
-  return { runtimeState, activeWriterSessionId };
+  const provisionalOwner = normalizeSessionId(
+    runtimeSnapshot?.codexProvisionalSettingsOwnerId,
+  );
+  const provisionalModel = normalizeCurrentSetting(
+    runtimeSnapshot?.codexProvisionalModel,
+  );
+  const provisionalEffort = normalizeCurrentSetting(
+    runtimeSnapshot?.codexProvisionalEffort,
+  );
+  const provisionalSettingsProven = runtimeState === 'live'
+    && !activeWriterSessionId
+    && provisionalOwner.startsWith('launch:')
+    && !!provisionalModel
+    && !!provisionalEffort;
+  return {
+    runtimeState,
+    activeWriterSessionId,
+    currentSettingsOwnerId: activeWriterSessionId
+      || (provisionalSettingsProven ? provisionalOwner : ''),
+    currentSettingsModel: provisionalSettingsProven ? provisionalModel : '',
+    currentSettingsEffort: provisionalSettingsProven ? provisionalEffort : '',
+    provisionalSettingsProven,
+  };
 }
 
 export function codexSettingsProofMatchesActiveWriter({
@@ -32,6 +54,24 @@ export function codexSettingsProofMatchesActiveWriter({
   return runtimeState === 'live'
     && !!activeWriterSessionId
     && normalizeSessionId(currentProofSessionId) === activeWriterSessionId;
+}
+
+/**
+ * Before the first rollout user_message exists, a verified launch composer is
+ * the exact settings owner for that PTY generation. It is not yet a writer
+ * session, but it is sufficient to inherit the other half of a partial
+ * model/effort request without falling back to stale renderer/global state.
+ */
+export function codexSettingsProofMatchesRuntimeOwner({
+  currentProofSessionId,
+  runtimeSnapshot,
+} = {}) {
+  const { runtimeState, currentSettingsOwnerId } = resolveCodexSettingsRuntimeProof(
+    runtimeSnapshot,
+  );
+  return runtimeState === 'live'
+    && !!currentSettingsOwnerId
+    && normalizeSessionId(currentProofSessionId) === currentSettingsOwnerId;
 }
 
 export function isCompleteCodexSettingsRequest({
@@ -63,8 +103,13 @@ export function planCodexHistorySettings({
   const modelRequested = normalizeRequestedSetting(requestedModel);
   const effortRequested = normalizeRequestedSetting(requestedEffort);
   const hasRequestedSettings = !!(modelRequested || effortRequested);
-  const effectiveModel = normalizeCurrentSetting(currentModel);
-  const effectiveEffort = normalizeCurrentSetting(currentEffort);
+  const runtimeProof = resolveCodexSettingsRuntimeProof(runtimeSnapshot);
+  const effectiveModel = runtimeProof.provisionalSettingsProven
+    ? runtimeProof.currentSettingsModel
+    : normalizeCurrentSetting(currentModel);
+  const effectiveEffort = runtimeProof.provisionalSettingsProven
+    ? runtimeProof.currentSettingsEffort
+    : normalizeCurrentSetting(currentEffort);
   const willQueue = queue === true || statusAtSend === 'busy';
   const completeRequest = isCompleteCodexSettingsRequest({
     requestedModel,
@@ -92,13 +137,24 @@ export function planCodexHistorySettings({
   }
 
   if (!completeRequest) {
-    const { runtimeState, activeWriterSessionId } = resolveCodexSettingsRuntimeProof(runtimeSnapshot);
+    const {
+      runtimeState,
+      activeWriterSessionId,
+      currentSettingsOwnerId,
+      provisionalSettingsProven,
+    } = runtimeProof;
     const proofSessionId = normalizeSessionId(currentProofSessionId);
     const proofMatchesActiveWriter = codexSettingsProofMatchesActiveWriter({
       currentProofSessionId: proofSessionId,
       runtimeSnapshot,
     });
-    if (runtimeState !== 'stopped' && !proofMatchesActiveWriter) {
+    const proofMatchesProvisionalLaunch = provisionalSettingsProven
+      && currentSettingsOwnerId.startsWith('launch:');
+    if (
+      runtimeState !== 'stopped'
+      && !proofMatchesActiveWriter
+      && !proofMatchesProvisionalLaunch
+    ) {
       const proofReason = runtimeState !== 'live'
         ? 'runtime-owner-unknown'
         : !activeWriterSessionId

@@ -1,5 +1,11 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const {
+  decideAutomaticRestoreAdmission,
+  normalizeAgentLaunchSource,
+  normalizeAiLifecycleIdentity,
+} = require('./ai-lifecycle-authority');
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const ACTIVE_STATUSES = new Set([
@@ -11,6 +17,14 @@ const ACTIVE_STATUSES = new Set([
   'running',
   'waiting_descendants',
   'waiting_recovery',
+]);
+const TARGET_EXECUTION_STATUSES = new Set([
+  'creating',
+  'starting',
+  'sending',
+  'sent',
+  'queued',
+  'running',
 ]);
 const SOURCE_FOLLOWUP_DELIVERY_STATUSES = new Set(['pending', 'sending', 'sent', 'queued']);
 const SOURCE_FOLLOWUP_RECONCILABLE_STATUSES = new Set([
@@ -40,6 +54,153 @@ function isActiveStatus(status) {
   return ACTIVE_STATUSES.has(status);
 }
 
+function isResultProofPending(run) {
+  return run?.status === 'completed' && run.resultComplete === false;
+}
+
+function isPausedRun(run) {
+  return run?.status === 'waiting_recovery' && run.outcome === 'paused';
+}
+
+function ownsTargetExecution(run) {
+  return TARGET_EXECUTION_STATUSES.has(run?.status);
+}
+
+function normalizeExecutionContext(value) {
+  if (!value || typeof value !== 'object') return null;
+  const provider = typeof value.provider === 'string' ? value.provider.trim() : '';
+  const sessionId = typeof value.sessionId === 'string' ? value.sessionId.trim() : '';
+  const turnId = typeof value.turnId === 'string' ? value.turnId.trim() : '';
+  const processId = value.processId == null ? '' : String(value.processId).trim();
+  if (!provider || (!turnId && !processId)) return null;
+  return {
+    provider,
+    sessionId: sessionId || null,
+    turnId: turnId || null,
+    processId: processId || null,
+    generation: value.generation != null && Number.isFinite(Number(value.generation))
+      ? Number(value.generation)
+      : null,
+    startedAt: value.startedAt != null && Number.isFinite(Number(value.startedAt))
+      ? Number(value.startedAt)
+      : null,
+  };
+}
+
+function normalizeTargetActivity(value = {}) {
+  const revision = Number(value.revision);
+  const at = Number(value.at);
+  return {
+    revision: Number.isInteger(revision) && revision >= 0 ? revision : 0,
+    at: Number.isFinite(at) && at > 0 ? at : null,
+    source: typeof value.source === 'string' && value.source.trim()
+      ? value.source.trim()
+      : null,
+    // A restored store never assumes that the old process is still inside the
+    // same busy edge. The first exact busy event after restart is new evidence.
+    busy: false,
+  };
+}
+
+function executionContextsMatch(left, right) {
+  const a = normalizeExecutionContext(left);
+  const b = normalizeExecutionContext(right);
+  return Boolean(a && b
+    && a.provider === b.provider
+    && a.sessionId === b.sessionId
+    && a.turnId === b.turnId
+    && a.processId === b.processId);
+}
+
+function promptProofExecutionContext(run, proof = {}) {
+  if (proof.executionContext == null) {
+    return { context: null, reason: 'target-execution-context-unavailable' };
+  }
+  const context = normalizeExecutionContext(proof.executionContext);
+  if (!context) {
+    return { context: null, reason: 'target-execution-context-invalid' };
+  }
+  const proofProvider = typeof proof.toolType === 'string' ? proof.toolType.trim() : '';
+  const targetProvider = typeof run?.targetToolType === 'string' ? run.targetToolType.trim() : '';
+  const expectedProvider = proofProvider || targetProvider;
+  if (!expectedProvider || context.provider !== expectedProvider) {
+    return { context: null, reason: 'target-execution-context-provider-mismatch' };
+  }
+  const proofSessionId = typeof proof.sessionId === 'string' ? proof.sessionId.trim() : '';
+  if (!proofSessionId || !context.sessionId) {
+    return { context: null, reason: 'target-execution-context-session-unproven' };
+  }
+  if (context.sessionId !== proofSessionId) {
+    return { context: null, reason: 'target-execution-context-session-mismatch' };
+  }
+  return { context, reason: null };
+}
+
+function bindPromptProofExecutionContext(run, proof = {}) {
+  const existing = normalizeExecutionContext(run?.targetExecutionContext);
+  if (proof.executionContext == null) {
+    return {
+      changed: false,
+      contextBound: Boolean(existing),
+      contextReason: existing ? null : 'target-execution-context-unavailable',
+    };
+  }
+  const verdict = promptProofExecutionContext(run, proof);
+  if (!verdict.context) {
+    return {
+      changed: false,
+      contextBound: Boolean(existing),
+      contextReason: verdict.reason,
+    };
+  }
+  if (existing) {
+    return {
+      changed: false,
+      contextBound: true,
+      contextReason: executionContextsMatch(existing, verdict.context)
+        ? null
+        : 'target-execution-context-conflict',
+    };
+  }
+  run.targetExecutionContext = verdict.context;
+  return { changed: true, contextBound: true, contextReason: null };
+}
+
+function lifecycleExecutionContext(payload = {}) {
+  return normalizeExecutionContext(payload.executionContext || {
+    provider: payload.provider || payload.toolType || payload.commandType,
+    sessionId: payload.sessionId,
+    turnId: payload.turnId,
+    processId: payload.processId,
+    generation: payload.turnGeneration,
+    startedAt: payload.turnStartedAt,
+  });
+}
+
+function resolveCausalSourceExecutionContext({ sourceTabId, sourceMeta, getExecutionContext }) {
+  if (sourceMeta?.server !== 'terminal'
+    || sourceMeta.mode !== 'internal'
+    || sourceMeta.tabId !== sourceTabId
+    || typeof getExecutionContext !== 'function') return null;
+  return normalizeExecutionContext(getExecutionContext(sourceTabId));
+}
+
+function buildOrchestrationResultLookup(run) {
+  const continuationByPrompt = Boolean(run?.resultPromptHash);
+  const continuationByTime = !continuationByPrompt && Number(run?.resultAfterAt) > 0;
+  return {
+    promptHash: continuationByPrompt
+      ? run.resultPromptHash
+      : (continuationByTime ? undefined : run?.promptHash),
+    promptUserUuid: continuationByPrompt
+      ? (run.resultPromptProofUserUuid || undefined)
+      : (continuationByTime ? undefined : (run?.targetPromptProofUserUuid || undefined)),
+    requestedAt: run?.resultPromptRequestedAt || run?.createdAt,
+    resultAfterAt: continuationByPrompt ? undefined : run?.resultAfterAt,
+    resultBeforeAt: run?.ownCompletedAt || run?.completedAt || undefined,
+  };
+}
+
 function canNotifySource(run) {
   return run?.notifySource !== false
     && !!run?.sourceTabId
@@ -67,7 +228,9 @@ function shouldMarkSourceFollowupUnconfirmed(run, reconciliation) {
     && canNotifySource(run)
     && run.sourceFollowupPending === true
     && !run.sourceFollowupStartedAt
-    && (run.notificationStatus === 'sent' || run.notificationStatus === 'queued');
+    && (run.notificationStatus === 'sending'
+      || run.notificationStatus === 'sent'
+      || run.notificationStatus === 'queued');
 }
 
 function isTrackedOrchestrationRun(run) {
@@ -75,7 +238,7 @@ function isTrackedOrchestrationRun(run) {
     // A Stop edge can beat the final JSONL append. Keep the durable run in
     // startup reconciliation even when it has no separate source notification;
     // otherwise a restart removes the only owner capable of proving the result.
-    || (run?.status === 'completed' && run.resultComplete === false)
+    || isResultProofPending(run)
     || isSourceFollowupPending(run)
     || isSourceNotificationBlocked(run);
 }
@@ -86,6 +249,7 @@ function isCompleteOrchestrationResult(result) {
 
 function shouldScheduleCreatedTargetAutoStop(run) {
   return run?.status === 'completed'
+    && run.resultComplete === true
     && run.targetCreatedByOrchestration === true
     && run.autoStopCreatedTargets !== false
     && Number(run.successAutoStopMs) > 0
@@ -163,13 +327,50 @@ function orchestrationInstallBlockers(run) {
     && run.notifySource !== false
     && run.notificationSuppressed !== true,
   );
+  const resultProofPending = isResultProofPending(run);
   const active = isActiveStatus(run.status);
+  const waitingForResumedTurn = run.resumeAwaitingNewTurn === true;
+  const attentionOnly = run.status === 'waiting_recovery' || waitingForResumedTurn;
+
+  if (resultProofPending) {
+    if (separateSource) {
+      blockers.push({
+        tabId: run.sourceTabId,
+        kind: 'orchestration',
+        status: 'result-proof',
+        role: 'source',
+        runId: run.runId,
+        orchestrationStatus: run.status,
+        notificationStatus: run.notificationStatus || null,
+        projectId: run.sourceProjectId || null,
+        project: run.sourceProjectName || null,
+        name: run.sourceTabName || ('tab ' + String(run.sourceTabId).slice(-6)),
+        cwd: run.sourceProjectPath || null,
+      });
+    }
+    if (run.targetTabId) {
+      blockers.push({
+        tabId: run.targetTabId,
+        kind: 'orchestration',
+        status: 'result-proof',
+        role: 'target',
+        runId: run.runId,
+        orchestrationStatus: run.status,
+        notificationStatus: run.notificationStatus || null,
+        projectId: run.targetProjectId || null,
+        project: run.targetProjectName || null,
+        name: run.targetTabName || ('tab ' + String(run.targetTabId).slice(-6)),
+        cwd: run.targetCwd || run.targetProjectPath || null,
+      });
+    }
+    return blockers;
+  }
 
   if (active && separateSource) {
     blockers.push({
       tabId: run.sourceTabId,
       kind: 'orchestration',
-      status: run.status === 'waiting_recovery' ? 'recovery' : 'inherited-busy',
+      status: attentionOnly ? 'recovery' : 'inherited-busy',
       role: 'source',
       runId: run.runId,
       orchestrationStatus: run.status,
@@ -185,7 +386,7 @@ function orchestrationInstallBlockers(run) {
     blockers.push({
       tabId: run.targetTabId,
       kind: 'orchestration',
-      status: run.status === 'waiting_recovery' ? 'recovery' : run.status,
+      status: attentionOnly ? 'recovery' : run.status,
       role: 'target',
       runId: run.runId,
       orchestrationStatus: run.status,
@@ -294,9 +495,14 @@ function normalizeSettings(value = {}) {
 function publicRun(run) {
   if (!run) return null;
   const {
+    // The unsent prompt is persisted only so a queued orchestration survives
+    // an app restart.  It must never leak through Project API/status payloads.
+    deliveryIntent: _deliveryIntent,
+    requestFingerprint: _requestFingerprint,
     promptHash: _promptHash,
     resultPromptHash: _resultPromptHash,
     notificationPromptHash: _notificationPromptHash,
+    notificationPromptAuditHash: _notificationPromptAuditHash,
     targetPromptProofHash: _targetPromptProofHash,
     targetPromptProofExpectedHash: _targetPromptProofExpectedHash,
     targetPromptAuditHash: _targetPromptAuditHash,
@@ -312,10 +518,12 @@ class OrchestrationRunStore {
     this.filePath = filePath;
     this.runs = new Map();
     this.createdTargetTabIds = new Set();
+    this.targetActivityByTab = new Map();
     this.settings = { ...DEFAULT_ORCHESTRATION_SETTINGS };
     this.initialized = false;
     this.initializePromise = null;
     this.persistChain = Promise.resolve();
+    this.reservationChain = Promise.resolve();
   }
 
   async initialize() {
@@ -329,6 +537,14 @@ class OrchestrationRunStore {
         const storedRuns = Array.isArray(parsed?.runs) ? parsed.runs : [];
         for (const tabId of Array.isArray(parsed?.createdTargetTabIds) ? parsed.createdTargetTabIds : []) {
           if (typeof tabId === 'string' && tabId) this.createdTargetTabIds.add(tabId);
+        }
+        const storedTargetActivity = parsed?.targetActivityByTab && typeof parsed.targetActivityByTab === 'object'
+          ? parsed.targetActivityByTab
+          : {};
+        for (const [tabId, activity] of Object.entries(storedTargetActivity)) {
+          if (typeof tabId === 'string' && tabId) {
+            this.targetActivityByTab.set(tabId, normalizeTargetActivity(activity));
+          }
         }
         // Backfill ownership from v2 stores before settled-run pruning removes
         // the original run which physically created the executor tab.
@@ -358,6 +574,18 @@ class OrchestrationRunStore {
           if (isSourceNotificationBlocked(run) && !run.attentionRequiredAt) {
             run.attentionRequiredAt = run.notificationAttemptedAt || run.updatedAt || run.completedAt || Date.now();
           }
+          // Exact transcript identity proves that the prompt crossed Enter.
+          // A stale private queue payload must not survive that proof and be
+          // replayed after restart.
+          if (run.targetPromptProofAt && run.deliveryIntent) {
+            run.deliveryIntent = null;
+            migrationNeeded = true;
+          }
+          if (run.autoStopAt && !run.autoStopFinishedAt
+            && !Number.isInteger(Number(run.autoStopActivityRevision))) {
+            run.autoStopActivityRevision = this._activityForTarget(run.targetTabId).revision;
+            migrationNeeded = true;
+          }
           this.runs.set(run.runId, run);
         }
         migrationNeeded = this._backfillCreatedTargetAutoStops() || migrationNeeded;
@@ -373,12 +601,15 @@ class OrchestrationRunStore {
     return this.initializePromise;
   }
 
-  async create(input) {
+  async create(input, options = {}) {
     await this.initialize();
     if (!input?.runId) throw new Error('runId required');
     if (this.runs.has(input.runId)) throw new Error('runId already exists');
-    const predecessor = this._activeForTarget(input.targetTabId).at(-1) || null;
-    const parentRunId = input.parentRunId || this._inferParentRunId(input.sourceTabId);
+    const predecessor = this._deliveryPredecessorsForTarget(input.targetTabId).at(-1) || null;
+    const explicitParentRunId = typeof input.parentRunId === 'string' ? input.parentRunId.trim() : '';
+    const sourceExecutionContext = normalizeExecutionContext(input.sourceExecutionContext);
+    const parentRunId = explicitParentRunId
+      || this._inferParentRunId(input.sourceTabId, sourceExecutionContext);
     if (parentRunId) this._validateParent(parentRunId, input);
     if (input.targetCreated === true && input.targetTabId) {
       this.createdTargetTabIds.add(input.targetTabId);
@@ -410,6 +641,7 @@ class OrchestrationRunStore {
       outcome: null,
       ownCompletedAt: null,
       resultPromptHash: null,
+      resultPromptProofUserUuid: null,
       resultAfterAt: null,
       resultPromptRequestedAt: null,
       recoveryDeadlineAt: null,
@@ -418,10 +650,60 @@ class OrchestrationRunStore {
       sourceFollowupPending: false,
       sourceFollowupStartedAt: null,
       sourceFollowupProofKind: null,
+      sourceExecutionContext,
+      targetExecutionContext: normalizeExecutionContext(input.targetExecutionContext),
     };
     this.runs.set(run.runId, run);
-    this._schedulePersist();
+    if (options.persistStrict === true) {
+      try {
+        await this.persistStrict();
+      } catch (error) {
+        this.runs.delete(run.runId);
+        if (input.targetCreated === true
+          && !Array.from(this.runs.values()).some((candidate) => (
+            candidate.targetTabId === input.targetTabId
+            && candidate.targetCreatedByOrchestration === true
+          ))) {
+          this.createdTargetTabIds.delete(input.targetTabId);
+        }
+        error.code ||= 'orchestration_persist_failed';
+        error.statusCode ||= 503;
+        throw error;
+      }
+    } else this._schedulePersist();
     return publicRun(run);
+  }
+
+  async reserveOrGet(input) {
+    const work = this.reservationChain
+      .catch(() => undefined)
+      .then(async () => {
+        await this.initialize();
+        const existing = this.runs.get(input?.runId);
+        if (existing) {
+          if (!existing.requestFingerprint) {
+            return {
+              created: false,
+              conflict: true,
+              reason: 'request-identity-unavailable',
+              run: publicRun(existing),
+            };
+          }
+          if (existing.requestFingerprint !== input.requestFingerprint) {
+            return {
+              created: false,
+              conflict: true,
+              reason: 'idempotency-key-reused',
+              run: publicRun(existing),
+            };
+          }
+          return { created: false, conflict: false, reason: null, run: publicRun(existing) };
+        }
+        const run = await this.create(input, { persistStrict: true });
+        return { created: true, conflict: false, reason: null, run };
+      });
+    this.reservationChain = work.then(() => undefined, () => undefined);
+    return work;
   }
 
   async patch(runId, patch) {
@@ -429,8 +711,276 @@ class OrchestrationRunStore {
     const run = this.runs.get(runId);
     if (!run) return null;
     Object.assign(run, patch, { updatedAt: Date.now() });
+    if (patch?.autoStopStatus === 'scheduled' && patch?.autoStopAt) {
+      const activity = this._activityForTarget(run.targetTabId);
+      run.autoStopActivityRevision = activity.revision;
+      run.autoStopClaimId = null;
+      run.autoStopClaimedAt = null;
+      run.autoStopExpectedTargetIdentity = null;
+    }
+    this._syncSourceFollowupState(run);
     this._schedulePersist();
     return publicRun(run);
+  }
+
+  _activityForTarget(tabId) {
+    const existing = this.targetActivityByTab.get(tabId);
+    if (existing) return existing;
+    const created = normalizeTargetActivity();
+    this.targetActivityByTab.set(tabId, created);
+    return created;
+  }
+
+  _recordTargetActivity(tabId, {
+    source = 'unknown',
+    at = Date.now(),
+    busy = false,
+    force = false,
+  } = {}) {
+    if (!tabId) return { changed: false, activity: normalizeTargetActivity() };
+    const activity = this._activityForTarget(tabId);
+    const nextBusy = busy === true;
+    const beginsNewActivity = force === true || (nextBusy && activity.busy !== true);
+    let changed = false;
+    if (beginsNewActivity) {
+      activity.revision += 1;
+      activity.at = Number.isFinite(Number(at)) ? Number(at) : Date.now();
+      activity.source = typeof source === 'string' && source ? source : 'unknown';
+      changed = true;
+    }
+    if (activity.busy !== nextBusy) {
+      activity.busy = nextBusy;
+      changed = true;
+    }
+    return { changed, activity: { ...activity } };
+  }
+
+  _pendingAutoStopsForTarget(tabId, { dueOnly = false, now = Date.now() } = {}) {
+    return Array.from(this.runs.values())
+      .filter((run) => run.targetTabId === tabId
+        && run.status === 'completed'
+        && run.resultComplete === true
+        && run.autoStopAt
+        && !run.autoStopFinishedAt
+        && (run.autoStopStatus === 'scheduled' || run.autoStopStatus === 'claimed')
+        && (!dueOnly || run.autoStopStatus === 'claimed' || Number(run.autoStopAt) <= Number(now)))
+      .sort((a, b) => Number(a.autoStopAt || 0) - Number(b.autoStopAt || 0));
+  }
+
+  async admitAgentLaunch(tabId, {
+    launchSource = 'explicit',
+    now = Date.now(),
+  } = {}) {
+    const work = this.reservationChain
+      .catch(() => undefined)
+      .then(async () => {
+        await this.initialize();
+        const source = normalizeAgentLaunchSource(launchSource);
+        const due = this._pendingAutoStopsForTarget(tabId, { dueOnly: true, now });
+        const decision = decideAutomaticRestoreAdmission({
+          launchSource: source,
+          pendingAutoStop: due.length > 0
+            ? { authoritative: true, runId: due[0].runId }
+            : null,
+        });
+        if (!decision.allowed) return decision;
+        if (source === 'auto-resume') {
+          return {
+            allowed: true,
+            source,
+            reason: null,
+            activityRevision: this._activityForTarget(tabId).revision,
+            supersededRunIds: [],
+          };
+        }
+
+        const activityResult = this._recordTargetActivity(tabId, {
+          source: 'launch:' + source,
+          at: now,
+          force: true,
+        });
+        const supersededRunIds = [];
+        for (const run of this._pendingAutoStopsForTarget(tabId, { now })) {
+          run.autoStopFinishedAt = Number(now);
+          run.autoStopStatus = 'skipped-target-changed';
+          run.autoStopError = null;
+          run.autoStopSupersededAt = Number(now);
+          run.autoStopSupersededBy = source;
+          run.updatedAt = Number(now);
+          supersededRunIds.push(run.runId);
+        }
+        if (activityResult.changed || supersededRunIds.length > 0) {
+          await this.persistStrict();
+        }
+        return {
+          allowed: true,
+          source,
+          reason: null,
+          activityRevision: activityResult.activity.revision,
+          supersededRunIds,
+        };
+      });
+    this.reservationChain = work.then(() => undefined, () => undefined);
+    return work;
+  }
+
+  async claimDueAutoStop(runId, {
+    now = Date.now(),
+    expectedTargetIdentity = null,
+    observedBusy = false,
+  } = {}) {
+    const work = this.reservationChain
+      .catch(() => undefined)
+      .then(async () => {
+        await this.initialize();
+        const run = this.runs.get(runId);
+        if (!run) return { claimed: false, reason: 'run-not-found', run: null };
+        if (run.autoStopFinishedAt) {
+          return { claimed: false, reason: 'auto-stop-already-finished', run: publicRun(run) };
+        }
+        if (run.status !== 'completed' || run.resultComplete !== true || !run.autoStopAt) {
+          return { claimed: false, reason: 'auto-stop-not-eligible', run: publicRun(run) };
+        }
+        if (Number(run.autoStopAt) > Number(now) && run.autoStopStatus !== 'claimed') {
+          return { claimed: false, reason: 'auto-stop-not-due', run: publicRun(run) };
+        }
+
+        const activity = this._activityForTarget(run.targetTabId);
+        const baselineRevision = Number.isInteger(Number(run.autoStopActivityRevision))
+          ? Number(run.autoStopActivityRevision)
+          : activity.revision;
+        const superseded = observedBusy === true
+          || activity.revision > baselineRevision
+          || hasNewerTargetRun(Array.from(this.runs.values()), run);
+        if (superseded) {
+          run.autoStopFinishedAt = Number(now);
+          run.autoStopStatus = observedBusy === true ? 'skipped-busy' : 'skipped-target-changed';
+          run.autoStopError = null;
+          run.updatedAt = Number(now);
+          await this.persistStrict();
+          return { claimed: false, reason: run.autoStopStatus, run: publicRun(run) };
+        }
+
+        const normalizedIdentity = normalizeAiLifecycleIdentity(expectedTargetIdentity);
+        if (run.autoStopStatus === 'claimed' && run.autoStopClaimId) {
+          // A process that was already stopped before a crash legitimately
+          // reappears as ABSENT after restart. Refresh only that safe boundary;
+          // a live replacement process is never adopted by an old claim.
+          if (normalizedIdentity?.processStatus === 'absent') {
+            run.autoStopExpectedTargetIdentity = normalizedIdentity;
+            run.autoStopClaimActivityRevision = activity.revision;
+            run.updatedAt = Number(now);
+            await this.persistStrict();
+          }
+          return {
+            claimed: true,
+            idempotent: true,
+            claimId: run.autoStopClaimId,
+            run: publicRun(run),
+          };
+        }
+
+        run.autoStopStatus = 'claimed';
+        run.autoStopClaimId = crypto.randomUUID();
+        run.autoStopClaimedAt = Number(now);
+        run.autoStopActivityRevision = baselineRevision;
+        run.autoStopClaimActivityRevision = activity.revision;
+        run.autoStopExpectedTargetIdentity = normalizedIdentity;
+        run.updatedAt = Number(now);
+        await this.persistStrict();
+        return {
+          claimed: true,
+          idempotent: false,
+          claimId: run.autoStopClaimId,
+          run: publicRun(run),
+        };
+      });
+    this.reservationChain = work.then(() => undefined, () => undefined);
+    return work;
+  }
+
+  validateAutoStopClaim(runId, claimId) {
+    if (!this.initialized) {
+      return { valid: false, reason: 'orchestration-store-not-ready', run: null };
+    }
+    const run = this.runs.get(runId);
+    if (!run) return { valid: false, reason: 'run-not-found', run: null };
+    if (run.autoStopFinishedAt) {
+      return { valid: false, reason: 'auto-stop-already-finished', run: publicRun(run) };
+    }
+    if (run.autoStopStatus !== 'claimed' || !claimId || run.autoStopClaimId !== claimId) {
+      return { valid: false, reason: 'auto-stop-claim-changed', run: publicRun(run) };
+    }
+    const activity = this._activityForTarget(run.targetTabId);
+    if (activity.revision !== Number(run.autoStopClaimActivityRevision)) {
+      return { valid: false, reason: 'target-activity-changed', run: publicRun(run) };
+    }
+    return {
+      valid: true,
+      reason: null,
+      expectedTargetIdentity: normalizeAiLifecycleIdentity(run.autoStopExpectedTargetIdentity),
+      run: publicRun(run),
+    };
+  }
+
+  async settleAutoStopClaim(runId, claimId, {
+    status,
+    error = null,
+    now = Date.now(),
+  } = {}) {
+    const work = this.reservationChain
+      .catch(() => undefined)
+      .then(async () => {
+        await this.initialize();
+        const run = this.runs.get(runId);
+        if (!run) return { settled: false, reason: 'run-not-found', run: null };
+        if (run.autoStopFinishedAt) {
+          return { settled: false, reason: 'auto-stop-already-finished', run: publicRun(run) };
+        }
+        if (run.autoStopStatus !== 'claimed' || run.autoStopClaimId !== claimId) {
+          return { settled: false, reason: 'auto-stop-claim-changed', run: publicRun(run) };
+        }
+        const allowedStatuses = new Set([
+          'stopped',
+          'stopped-no-process',
+          'skipped-target-changed',
+          'failed',
+        ]);
+        run.autoStopStatus = allowedStatuses.has(status) ? status : 'failed';
+        run.autoStopFinishedAt = Number(now);
+        run.autoStopError = error ? String(error) : null;
+        run.updatedAt = Number(now);
+        await this.persistStrict();
+        return { settled: true, reason: null, run: publicRun(run) };
+      });
+    this.reservationChain = work.then(() => undefined, () => undefined);
+    return work;
+  }
+
+  async cancelAutoStop(runId, {
+    reason = 'detached-by-user',
+    now = Date.now(),
+  } = {}) {
+    const work = this.reservationChain
+      .catch(() => undefined)
+      .then(async () => {
+        await this.initialize();
+        const run = this.runs.get(runId);
+        if (!run) return { cancelled: false, reason: 'run-not-found', run: null };
+        if (!run.autoStopAt || run.autoStopFinishedAt) {
+          return { cancelled: false, reason: 'auto-stop-not-pending', run: publicRun(run) };
+        }
+        run.autoStopStatus = 'cancelled';
+        run.autoStopFinishedAt = Number(now);
+        run.autoStopError = null;
+        run.autoStopCancelledAt = Number(now);
+        run.autoStopCancelledReason = String(reason || 'cancelled');
+        run.updatedAt = Number(now);
+        await this.persistStrict();
+        return { cancelled: true, reason: null, run: publicRun(run) };
+      });
+    this.reservationChain = work.then(() => undefined, () => undefined);
+    return work;
   }
 
   async markDelivery(runId, {
@@ -442,12 +992,24 @@ class OrchestrationRunStore {
     const run = this.runs.get(runId);
     if (!run || isTerminalStatus(run.status)) return publicRun(run);
     const predecessor = run.predecessorRunId ? this.runs.get(run.predecessorRunId) : null;
-    const waitingForPredecessor = Boolean(predecessor && !isTerminalStatus(predecessor.status));
+    const waitingForPredecessor = Boolean(predecessor && ownsTargetExecution(predecessor));
+    if (isPausedRun(run)) {
+      run.sessionId = sessionId || run.sessionId || null;
+      run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
+      run.deliveryAcceptedAt ||= Date.now();
+      run.deliveryIntent = null;
+      run.deliveryDispatchFinishedAt = run.deliveryAcceptedAt;
+      run.updatedAt = Date.now();
+      this._schedulePersist();
+      return publicRun(run);
+    }
     run.waitingForPriorTurn = !waitingForPredecessor && baselineBusy;
     run.status = (waitingForPredecessor || run.waitingForPriorTurn) ? 'queued' : 'sent';
     run.sessionId = sessionId || run.sessionId || null;
     run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
     run.deliveryAcceptedAt = Date.now();
+    run.deliveryIntent = null;
+    run.deliveryDispatchFinishedAt = run.deliveryAcceptedAt;
     if (run.targetPromptProofAt && !waitingForPredecessor) {
       run.waitingForPriorTurn = false;
       run.targetBusySeen = true;
@@ -464,21 +1026,6 @@ class OrchestrationRunStore {
     const run = this.runs.get(runId);
     const changed = [];
     if (!run) return { confirmed: false, reason: 'run-not-found', changed };
-    if (run.targetPromptProofAt) {
-      const sameProof = proof.actualHash === run.targetPromptProofHash
-        && proof.expectedHash === run.targetPromptProofExpectedHash
-        && (!proof.userUuid || !run.targetPromptProofUserUuid || proof.userUuid === run.targetPromptProofUserUuid);
-      return {
-        confirmed: sameProof,
-        idempotent: sameProof,
-        reason: sameProof ? null : 'target-prompt-proof-conflict',
-        run: publicRun(run),
-        changed,
-      };
-    }
-    if (isTerminalStatus(run.status)) {
-      return { confirmed: false, reason: 'run-already-settled', run: publicRun(run), changed };
-    }
     if (proof.targetTabId !== run.targetTabId) {
       return { confirmed: false, reason: 'target-tab-mismatch', run: publicRun(run), changed };
     }
@@ -497,6 +1044,44 @@ class OrchestrationRunStore {
     if (proof.toolType && run.targetToolType && proof.toolType !== run.targetToolType) {
       return { confirmed: false, reason: 'target-tool-mismatch', run: publicRun(run), changed };
     }
+    if (run.targetPromptProofAt) {
+      const sameProof = proof.actualHash === run.targetPromptProofHash
+        && proof.expectedHash === run.targetPromptProofExpectedHash
+        && (!proof.userUuid || !run.targetPromptProofUserUuid || proof.userUuid === run.targetPromptProofUserUuid);
+      if (!sameProof) {
+        return {
+          confirmed: false,
+          idempotent: false,
+          reason: 'target-prompt-proof-conflict',
+          run: publicRun(run),
+          changed,
+        };
+      }
+      const contextBinding = run.resumeAwaitingNewTurn === true
+        ? {
+            changed: false,
+            contextBound: false,
+            contextReason: 'resumed-turn-not-started',
+          }
+        : bindPromptProofExecutionContext(run, proof);
+      if (contextBinding.changed) {
+        run.updatedAt = Date.now();
+        this._pushChanged(changed, run);
+        this._schedulePersist();
+      }
+      return {
+        confirmed: true,
+        idempotent: true,
+        reason: null,
+        contextBound: contextBinding.contextBound,
+        contextReason: contextBinding.contextReason,
+        run: publicRun(run),
+        changed,
+      };
+    }
+    if (isTerminalStatus(run.status)) {
+      return { confirmed: false, reason: 'run-already-settled', run: publicRun(run), changed };
+    }
 
     const parsedAuditAt = Date.parse(String(proof.auditTimestamp || ''));
     const requestedNow = Number(options.now);
@@ -512,10 +1097,25 @@ class OrchestrationRunStore {
     run.targetPromptProofExpectedLen = Number.isFinite(proof.expectedLen) ? Number(proof.expectedLen) : null;
     run.targetPromptProofSessionId = proof.sessionId || null;
     run.targetPromptProofUserUuid = proof.userUuid || null;
+    // The exact prompt carrier is stronger than the transport return.  Clear
+    // the durable unsent payload here as well, because the audit can arrive
+    // before markDelivery() resolves.
+    run.deliveryIntent = null;
+    run.deliveryDispatchFinishedAt ||= now;
     run.sessionId = proof.sessionId || run.sessionId || null;
+    const contextBinding = run.resumeAwaitingNewTurn === true
+      ? {
+          changed: false,
+          contextBound: false,
+          contextReason: 'resumed-turn-not-started',
+        }
+      : bindPromptProofExecutionContext(run, proof);
 
     const predecessor = run.predecessorRunId ? this.runs.get(run.predecessorRunId) : null;
-    if (run.deliveryAcceptedAt && (!predecessor || isTerminalStatus(predecessor.status))) {
+    if (!isPausedRun(run)
+      && run.resumeAwaitingNewTurn !== true
+      && run.deliveryAcceptedAt
+      && (!predecessor || !ownsTargetExecution(predecessor))) {
       run.waitingForPriorTurn = false;
       run.targetBusySeen = true;
       run.status = 'running';
@@ -524,7 +1124,92 @@ class OrchestrationRunStore {
     run.updatedAt = now;
     this._pushChanged(changed, run);
     this._schedulePersist();
-    return { confirmed: true, run: publicRun(run), changed };
+    return {
+      confirmed: true,
+      contextBound: contextBinding.contextBound,
+      contextReason: contextBinding.contextReason,
+      run: publicRun(run),
+      changed,
+    };
+  }
+
+  async deferDelivery(runId, {
+    reason = 'target-busy',
+    sessionId = null,
+    lifecycleGeneration = null,
+  } = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run || isTerminalStatus(run.status)) return publicRun(run);
+    if (!run.deliveryIntent) return publicRun(run);
+    const now = Date.now();
+    run.status = 'queued';
+    run.waitingForPriorTurn = true;
+    run.deliveryDeferredAt ||= now;
+    run.deliveryDeferredReason = reason;
+    run.sessionId = sessionId || run.sessionId || null;
+    run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
+    run.updatedAt = now;
+    this._schedulePersist();
+    return publicRun(run);
+  }
+
+  async claimDeferredDelivery(runId, {
+    sessionId = null,
+    lifecycleGeneration = null,
+  } = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run) return { claimed: false, reason: 'run-not-found', run: null, intent: null };
+    if (isTerminalStatus(run.status)) {
+      return { claimed: false, reason: 'run-settled', run: publicRun(run), intent: null };
+    }
+    if (!run.deliveryIntent) {
+      return { claimed: false, reason: 'delivery-already-crossed-enter', run: publicRun(run), intent: null };
+    }
+    const predecessor = run.predecessorRunId ? this.runs.get(run.predecessorRunId) : null;
+    if (predecessor && (ownsTargetExecution(predecessor) || isResultProofPending(predecessor))) {
+      return { claimed: false, reason: 'predecessor-not-materialized', run: publicRun(run), intent: null };
+    }
+    // A previous process died after the send attempt began but before an exact
+    // prompt audit landed.  Replaying automatically could apply the same user
+    // intent twice, so restart reconciliation must surface recovery instead.
+    if (run.deliveryDispatchStartedAt && !run.targetPromptProofAt) {
+      return { claimed: false, reason: 'delivery-outcome-unknown', run: publicRun(run), intent: null };
+    }
+    const now = Date.now();
+    run.status = 'sending';
+    run.waitingForPriorTurn = false;
+    run.deliveryDispatchStartedAt = now;
+    run.deliveryDispatchAttempt = Number(run.deliveryDispatchAttempt || 0) + 1;
+    run.deliveryDeferredReason = null;
+    run.sessionId = sessionId || run.sessionId || null;
+    run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
+    run.updatedAt = now;
+    // The durable claim is the boundary before PTY Enter. If persistence
+    // fails, the caller must not press Enter; a best-effort write would make a
+    // restart unable to distinguish "not sent" from "sent once".
+    await this.persistStrict();
+    return {
+      claimed: true,
+      reason: null,
+      run: publicRun(run),
+      intent: { ...run.deliveryIntent },
+    };
+  }
+
+  async resetDeferredDelivery(runId, reason = 'delivery-not-sent') {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run || isTerminalStatus(run.status) || !run.deliveryIntent) return publicRun(run);
+    run.status = 'queued';
+    run.waitingForPriorTurn = true;
+    run.deliveryDispatchStartedAt = null;
+    run.deliveryDeferredAt ||= Date.now();
+    run.deliveryDeferredReason = reason;
+    run.updatedAt = Date.now();
+    this._schedulePersist();
+    return publicRun(run);
   }
 
   async markNotification(runId, status, patch = {}) {
@@ -559,12 +1244,61 @@ class OrchestrationRunStore {
 
   async applyLifecycle(tabId, payload = {}) {
     await this.initialize();
-    const head = this._headForTarget(tabId);
+    const activityResult = payload.type === 'busy' && payload.busy === true
+      ? this._recordTargetActivity(tabId, {
+          source: 'lifecycle-busy',
+          at: payload.startedAt || Date.now(),
+          busy: true,
+        })
+      : payload.type === 'done' || (payload.type === 'busy' && payload.busy === false)
+        ? this._recordTargetActivity(tabId, {
+            source: 'lifecycle-idle',
+            at: payload.completedAt || Date.now(),
+            busy: false,
+          })
+        : { changed: false };
+    if (activityResult.changed) this._schedulePersist();
+    const executionContext = lifecycleExecutionContext(payload);
+    let head = this._headForTarget(tabId, executionContext, payload.type);
     const changed = [];
     const settled = [];
     const now = Date.now();
 
+    if (!head) {
+      const recoveryContinuation = this._interruptedRecoveryForTarget(
+        tabId,
+        executionContext,
+        payload,
+      );
+      if (recoveryContinuation.run) {
+        head = recoveryContinuation.run;
+        this._adoptInterruptedRecovery(head, executionContext, payload, changed, now);
+      }
+    }
+
+    if (!head && this._activeForTarget(tabId).some((run) => run.status === 'waiting_recovery')) {
+      return {
+        changed,
+        settled,
+        completed: [],
+        ignored: true,
+        ignoreReason: 'recovery-continuation-unproven',
+      };
+    }
+
     if (head?.deliveryAcceptedAt) {
+      const resumedExactStart = head.resumeAwaitingNewTurn === true
+        && payload.type === 'busy'
+        && payload.busy === true
+        && executionContext?.startedAt
+        && executionContext.startedAt >= Number(head.resumeAfterAt || head.resumedAt);
+      if (resumedExactStart && payload.lifecycleGeneration) {
+        // Resume explicitly arms the next future turn. Its exact start may
+        // legitimately belong to a process generation created after Resume;
+        // only this start edge may replace the old generation. A done edge can
+        // never do so, preserving stale-generation recovery safety.
+        head.targetLifecycleGeneration = payload.lifecycleGeneration;
+      }
       const generationCheck = lifecycleGenerationCheck(head, payload.lifecycleGeneration);
       if (generationCheck.verdict === 'changed' || generationCheck.verdict === 'unknown') {
         return {
@@ -589,8 +1323,8 @@ class OrchestrationRunStore {
           }
           // A generic busy edge proves only that the tab is working again. It
           // does not prove that this turn continues the interrupted delegation.
-          // The explicit recovery action arms the next causal turn by moving
-          // the run back to queued and recording its result boundary.
+          // Automatic continuation is handled earlier from an exact new-turn
+          // execution context; explicit recovery can also re-arm the run.
           if (head.status === 'waiting_recovery' || head.outcome) {
             return {
               changed,
@@ -602,8 +1336,11 @@ class OrchestrationRunStore {
           }
           head.targetBusySeen = true;
           head.status = 'running';
+          head.resumeAwaitingNewTurn = false;
+          head.resumedTurnStartedAt = executionContext?.startedAt || now;
           head.startedAt ||= now;
           head.sessionId = sessionId;
+          head.targetExecutionContext = executionContext || head.targetExecutionContext || null;
           head.updatedAt = now;
           this._pushChanged(changed, head);
         }
@@ -667,6 +1404,11 @@ class OrchestrationRunStore {
         || canonicalPromptAuditSource(proof.source) !== expectedSource) {
         return { confirmed: false, reason: 'notification-identity-mismatch', run: publicRun(run), changed, settled };
       }
+      if (!run.notificationPromptAuditHash
+        || proof.expectedHash !== run.notificationPromptAuditHash
+        || proof.actualHash !== run.notificationPromptAuditHash) {
+        return { confirmed: false, reason: 'notification-prompt-audit-hash-mismatch', run: publicRun(run), changed, settled };
+      }
     } else if (!run.notificationPromptHash
       || proof.notificationPromptHash !== run.notificationPromptHash) {
       return { confirmed: false, reason: 'notification-prompt-hash-mismatch', run: publicRun(run), changed, settled };
@@ -699,12 +1441,15 @@ class OrchestrationRunStore {
     if (parent && parent.targetTabId === run.sourceTabId) {
       run.parentConsumedAt = now;
       run.parentFollowupPending = false;
-      parent.resultPromptHash = run.notificationPromptHash || parent.resultPromptHash || null;
-      parent.resultAfterAt = null;
-      parent.resultPromptRequestedAt = run.notificationAttemptedAt
-        || run.notificationDeliveredAt
-        || now;
-      if (!isTerminalStatus(parent.status)) {
+      if (!isPausedRun(parent)) {
+        parent.resultPromptHash = run.notificationPromptHash || parent.resultPromptHash || null;
+        parent.resultPromptProofUserUuid = proof.userUuid || parent.resultPromptProofUserUuid || null;
+        parent.resultAfterAt = null;
+        parent.resultPromptRequestedAt = run.notificationAttemptedAt
+          || run.notificationDeliveredAt
+          || now;
+      }
+      if (!isTerminalStatus(parent.status) && !isPausedRun(parent)) {
         parent.outcome = null;
         parent.ownCompletedAt = null;
         parent.completedAt = null;
@@ -716,6 +1461,7 @@ class OrchestrationRunStore {
         parent.status = 'running';
         parent.startedAt ||= now;
         parent.sessionId = proof.sessionId || parent.sessionId || null;
+        parent.targetExecutionContext = normalizeExecutionContext(proof.executionContext);
         parent.updatedAt = now;
         this._pushChanged(changed, parent);
       }
@@ -736,6 +1482,16 @@ class OrchestrationRunStore {
     const busy = observation.busy === true;
     const now = Date.now();
     const generationCheck = lifecycleGenerationCheck(run, observation.lifecycleGeneration);
+
+    if (isPausedRun(run) || run.resumeAwaitingNewTurn === true) {
+      return {
+        changed: null,
+        completed: false,
+        settled,
+        ignored: true,
+        ignoreReason: isPausedRun(run) ? 'orchestration-paused' : 'resumed-turn-not-started',
+      };
+    }
 
     if (resultFound && resultComplete) {
       run.waitingForPriorTurn = false;
@@ -798,6 +1554,48 @@ class OrchestrationRunStore {
       completed: settled.some((item) => item.runId === run.runId && item.status === 'completed'),
       settled,
       generationVerdict: generationCheck.verdict,
+    };
+  }
+
+  async markResultProofUnavailable(runId, reason = 'exact result proof is unavailable', options = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run || !isResultProofPending(run)) {
+      return {
+        run: publicRun(run),
+        changed: [],
+        settled: [],
+        resolved: false,
+      };
+    }
+
+    const now = Number(options.now) || Date.now();
+    const changed = [];
+    const settled = [];
+    run.status = 'failed';
+    run.outcome = 'result_unavailable';
+    run.error = reason;
+    run.resultProofStatus = 'unavailable';
+    run.resultProofUnavailableAt = now;
+    run.resultError ||= reason;
+    run.deliveryIntent = null;
+    run.recoveryDeadlineAt = null;
+    if (canNotifySource(run)) {
+      run.notificationStatus = 'pending';
+      run.notificationError = null;
+    } else if (run.notificationSuppressed) {
+      run.notificationStatus = 'suppressed';
+    }
+    run.updatedAt = now;
+    this._pushChanged(changed, run);
+    settled.push(publicRun(run));
+    this._refreshAncestors(run.parentRunId, changed, settled, now);
+    this._schedulePersist();
+    return {
+      run: publicRun(run),
+      changed,
+      settled,
+      resolved: true,
     };
   }
 
@@ -872,6 +1670,7 @@ class OrchestrationRunStore {
     const settled = [];
     if (action === 'dismiss') {
       run.status = 'cancelled';
+      run.deliveryIntent = null;
       run.completedAt = now;
       run.recoveryDeadlineAt = null;
       run.notificationStatus = 'suppressed';
@@ -883,6 +1682,7 @@ class OrchestrationRunStore {
       settled.push(publicRun(run));
     } else if (action === 'report') {
       run.status = 'failed';
+      run.deliveryIntent = null;
       run.completedAt = now;
       run.recoveryDeadlineAt = null;
       run.notificationStatus = 'pending';
@@ -890,25 +1690,50 @@ class OrchestrationRunStore {
       run.updatedAt = now;
       this._pushChanged(changed, run);
       settled.push(publicRun(run));
-    } else if (action === 'reopen') {
-      const continuationAfterAt = run.ownCompletedAt || now;
+    } else if (action === 'reopen' || action === 'resume') {
+      const resumingPause = action === 'resume' && run.outcome === 'paused';
+      if (action === 'resume' && !resumingPause) {
+        throw new Error('run is not paused');
+      }
+      const continuationAfterAt = resumingPause ? now : (run.ownCompletedAt || now);
+      const retryingUndeliveredIntent = Boolean(run.deliveryIntent);
       run.status = 'queued';
       run.resultPromptHash = null;
-      run.resultAfterAt = continuationAfterAt;
-      run.resultPromptRequestedAt = continuationAfterAt;
+      run.resultPromptProofUserUuid = null;
+      run.resultAfterAt = retryingUndeliveredIntent ? null : continuationAfterAt;
+      run.resultPromptRequestedAt = retryingUndeliveredIntent ? null : continuationAfterAt;
+      run.resultComplete = false;
+      run.resultAvailable = false;
+      run.resultTurnIndex = null;
+      run.resultUserUuid = null;
+      run.resultError = null;
+      run.resultProofStatus = resumingPause ? 'awaiting-resumed-turn' : run.resultProofStatus;
       run.outcome = null;
       run.ownCompletedAt = null;
       run.completedAt = null;
+      run.completionReason = null;
       run.recoveryDeadlineAt = null;
       run.error = null;
       run.targetBusySeen = false;
       run.waitingForPriorTurn = false;
+      run.resumeAwaitingNewTurn = resumingPause;
+      run.resumeAfterAt = resumingPause ? now : null;
+      run.resumedAt = resumingPause ? now : run.resumedAt;
+      run.resumedTurnStartedAt = null;
+      run.lastPausedAt = resumingPause ? run.pausedAt : run.lastPausedAt;
+      run.pausedAt = null;
       run.sessionId = proof.sessionId || run.sessionId || null;
       run.targetLifecycleGeneration = proof.lifecycleGeneration
         || run.targetLifecycleGeneration
         || null;
+      run.targetExecutionContext = normalizeExecutionContext(proof.executionContext);
       run.recoveryAttempt = (run.recoveryAttempt || 0) + 1;
       run.recoveryReopenedAt = now;
+      run.updatedAt = now;
+      this._pushChanged(changed, run);
+    } else if (action === 'wait') {
+      run.recoveryDeadlineAt = null;
+      run.recoveryWaitStartedAt = now;
       run.updatedAt = now;
       this._pushChanged(changed, run);
     } else {
@@ -919,17 +1744,66 @@ class OrchestrationRunStore {
     return { run: publicRun(run), changed, settled };
   }
 
-  async cancel(runId, { reason = 'cancelled-by-api', suppressNotification = true } = {}) {
+  async pause(runId) {
     await this.initialize();
     const run = this.runs.get(runId);
-    if (!run || isTerminalStatus(run.status)) {
+    if (!run) return { run: null, changed: [], settled: [], paused: false };
+    if (isPausedRun(run)) {
+      return { run: publicRun(run), changed: [], settled: [], paused: true, idempotent: true };
+    }
+    const established = Boolean(run.deliveryAcceptedAt || run.targetPromptProofAt);
+    const pausableRecovery = run.status === 'waiting_recovery' && run.outcome === 'interrupted';
+    const pausableExecution = isActiveStatus(run.status)
+      && run.status !== 'waiting_recovery'
+      && established;
+    if (!pausableRecovery && !pausableExecution && !isResultProofPending(run)) {
+      return { run: publicRun(run), changed: [], settled: [], paused: false };
+    }
+    if (run.sourceFollowupStartedAt || run.sourceFollowupPending === true) {
+      return { run: publicRun(run), changed: [], settled: [], paused: false };
+    }
+
+    const now = Date.now();
+    const changed = [];
+    const settled = [];
+    run.pausePreviousStatus = run.status;
+    run.status = 'waiting_recovery';
+    run.outcome = 'paused';
+    run.pausedAt = now;
+    run.resumeAwaitingNewTurn = false;
+    run.resumeAfterAt = null;
+    run.completedAt = null;
+    run.recoveryDeadlineAt = null;
+    run.error = null;
+    run.resultError = null;
+    run.resultProofStatus = 'paused';
+    run.targetBusySeen = false;
+    run.waitingForPriorTurn = false;
+    run.notificationStatus = 'pending';
+    run.notificationSuppressed = false;
+    run.updatedAt = now;
+    this._pushChanged(changed, run);
+    this._refreshAncestors(run.parentRunId, changed, settled, now);
+    this._schedulePersist();
+    return { run: publicRun(run), changed, settled, paused: true };
+  }
+
+  async cancel(runId, {
+    reason = 'cancelled-by-api',
+    suppressNotification = true,
+    outcome = 'interrupted',
+  } = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run || (isTerminalStatus(run.status) && !isResultProofPending(run))) {
       return { run: publicRun(run), changed: [], settled: [] };
     }
     const now = Date.now();
     const changed = [];
     const settled = [];
     run.status = 'cancelled';
-    run.outcome = 'interrupted';
+    run.deliveryIntent = null;
+    run.outcome = outcome;
     run.completedAt = now;
     run.completionReason = reason;
     run.recoveryDeadlineAt = null;
@@ -1082,24 +1956,141 @@ class OrchestrationRunStore {
     await this.persistChain;
   }
 
+  async persistStrict() {
+    await this._enqueuePersist(true);
+  }
+
   _activeForTarget(tabId) {
     return Array.from(this.runs.values())
       .filter((run) => run.targetTabId === tabId && isActiveStatus(run.status))
       .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   }
 
-  _headForTarget(tabId) {
-    for (const run of this._activeForTarget(tabId)) {
-      if (!run.predecessorRunId) return run;
+  _executionsForTarget(tabId) {
+    return Array.from(this.runs.values())
+      .filter((run) => run.targetTabId === tabId && ownsTargetExecution(run))
+      .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  }
+
+  _deliveryPredecessorsForTarget(tabId) {
+    return Array.from(this.runs.values())
+      .filter((run) => run.targetTabId === tabId
+        && (ownsTargetExecution(run) || isResultProofPending(run)))
+      .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  }
+
+  _headForTarget(tabId, executionContext = null, lifecycleType = null) {
+    const executions = this._executionsForTarget(tabId);
+    const eligible = executions.filter((run) => {
+      if (!run.predecessorRunId) return true;
       const predecessor = this.runs.get(run.predecessorRunId);
-      if (!predecessor || isTerminalStatus(predecessor.status)) return run;
+      return !predecessor || !ownsTargetExecution(predecessor);
+    }).filter((run) => {
+      if (run.resumeAwaitingNewTurn !== true) return true;
+      if (lifecycleType !== 'busy') return false;
+      const exactContext = normalizeExecutionContext(executionContext);
+      const resumeAfterAt = Number(run.resumeAfterAt || run.resumedAt);
+      return Boolean(exactContext?.startedAt
+        && Number.isFinite(resumeAfterAt)
+        && exactContext.startedAt >= resumeAfterAt);
+    });
+    if (executionContext) {
+      const exact = eligible.filter((run) => (
+        executionContextsMatch(run.targetExecutionContext, executionContext)
+      ));
+      if (exact.length === 1) return exact[0];
+      if (exact.length > 1) return null;
+
+      // A busy edge starts/binds a previously unbound target execution. A done
+      // edge never does: it can belong to an older process generation and must
+      // not settle a newer run merely because both reused the same tabId.
+      if (lifecycleType !== 'busy') return null;
+    }
+    const candidates = executionContext
+      ? eligible.filter((run) => (
+          !normalizeExecutionContext(run.targetExecutionContext)
+          && lifecycleType === 'busy'
+        ))
+      : eligible;
+    for (const run of candidates) {
+      return run;
     }
     return null;
   }
 
-  _inferParentRunId(sourceTabId) {
-    if (!sourceTabId) return null;
-    return this._headForTarget(sourceTabId)?.runId || null;
+  _interruptedRecoveryForTarget(tabId, executionContext, payload = {}) {
+    if (payload.type !== 'busy' || payload.busy !== true) {
+      return { run: null, reason: 'recovery-continuation-not-a-start' };
+    }
+    const exactContext = normalizeExecutionContext(executionContext);
+    if (!exactContext?.sessionId) {
+      return { run: null, reason: 'recovery-continuation-context-unproven' };
+    }
+    const candidates = this._activeForTarget(tabId).filter((run) => {
+      if (run.status !== 'waiting_recovery'
+        || run.outcome !== 'interrupted'
+        || !run.deliveryAcceptedAt
+        || run.deliveryIntent) return false;
+      if (run.targetToolType && run.targetToolType !== exactContext.provider) return false;
+      const previousContext = normalizeExecutionContext(run.targetExecutionContext);
+      if (previousContext && executionContextsMatch(previousContext, exactContext)) return false;
+      const expectedSessionId = previousContext?.sessionId
+        || run.sessionId
+        || run.targetPromptProofSessionId
+        || null;
+      if (expectedSessionId && expectedSessionId !== exactContext.sessionId) return false;
+      const generationCheck = lifecycleGenerationCheck(run, payload.lifecycleGeneration);
+      return generationCheck.verdict === 'match'
+        || generationCheck.verdict === 'not-required';
+    });
+    if (candidates.length !== 1) {
+      return {
+        run: null,
+        reason: candidates.length > 1
+          ? 'recovery-continuation-ambiguous'
+          : 'recovery-continuation-unproven',
+      };
+    }
+    return { run: candidates[0], reason: null };
+  }
+
+  _adoptInterruptedRecovery(run, executionContext, payload, changed, now) {
+    const continuationAfterAt = run.ownCompletedAt || run.updatedAt || now;
+    run.status = 'running';
+    run.resultPromptHash = null;
+    run.resultPromptProofUserUuid = null;
+    run.resultAfterAt = continuationAfterAt;
+    run.resultPromptRequestedAt = continuationAfterAt;
+    run.outcome = null;
+    run.ownCompletedAt = null;
+    run.completedAt = null;
+    run.completionReason = null;
+    run.recoveryDeadlineAt = null;
+    run.error = null;
+    run.targetBusySeen = true;
+    run.waitingForPriorTurn = false;
+    run.sessionId = executionContext.sessionId || payload.sessionId || run.sessionId || null;
+    run.targetLifecycleGeneration = payload.lifecycleGeneration
+      || run.targetLifecycleGeneration
+      || null;
+    run.targetExecutionContext = normalizeExecutionContext(executionContext);
+    run.recoveryAttempt = Number(run.recoveryAttempt || 0) + 1;
+    run.recoveryReopenedAt = now;
+    run.recoveryContinuedAutomatically = true;
+    run.updatedAt = now;
+    this._pushChanged(changed, run);
+  }
+
+  _inferParentRunId(sourceTabId, sourceExecutionContext) {
+    if (!sourceTabId || !sourceExecutionContext) return null;
+    const matches = Array.from(this.runs.values()).filter((run) => (
+      run.targetTabId === sourceTabId
+      && !isTerminalStatus(run.status)
+      && !isPausedRun(run)
+      && run.resumeAwaitingNewTurn !== true
+      && executionContextsMatch(run.targetExecutionContext, sourceExecutionContext)
+    ));
+    return matches.length === 1 ? matches[0].runId : null;
   }
 
   _validateParent(parentRunId, input) {
@@ -1107,6 +2098,9 @@ class OrchestrationRunStore {
     if (!parent) throw new Error('parent run not found');
     if (parent.runId === input.runId) throw new Error('run cannot parent itself');
     if (isTerminalStatus(parent.status)) throw new Error('parent run is already settled');
+    if (isPausedRun(parent) || parent.resumeAwaitingNewTurn === true) {
+      throw new Error('parent run is paused');
+    }
     if (parent.targetTabId !== input.sourceTabId) {
       throw new Error('parent target must be the child source tab');
     }
@@ -1157,6 +2151,12 @@ class OrchestrationRunStore {
     run.completedAt = null;
     run.recoveryDeadlineAt = manualIgnored ? null : now + graceMs;
     run.waitingOnRunIds = [];
+    // The process/run generation that owned the interrupted turn is retained as
+    // evidence, but recovery itself no longer owns target lifecycle. A late
+    // generic done edge must not complete it. A manual interruption can be
+    // adopted by an exact later turn; other recovery requires exact proof or an
+    // explicit reopen.
+    run.targetBusySeen = false;
     run.updatedAt = now;
     if (!manualIgnored && graceMs === 0) {
       run.status = 'failed';
@@ -1194,6 +2194,7 @@ class OrchestrationRunStore {
 
   _syncSourceFollowupState(run) {
     if (!isTerminalStatus(run?.status)
+      || isResultProofPending(run)
       || !canNotifySource(run)
       || run.sourceFollowupStartedAt
       || !SOURCE_FOLLOWUP_RECONCILABLE_STATUSES.has(run.notificationStatus)) {
@@ -1206,13 +2207,17 @@ class OrchestrationRunStore {
   _pruneInMemory() {
     const now = Date.now();
     const settled = Array.from(this.runs.values())
-      .filter((run) => isTerminalStatus(run.status))
+      .filter((run) => isTerminalStatus(run.status) && !isTrackedOrchestrationRun(run))
       .sort((a, b) => (b.completedAt || b.updatedAt || 0) - (a.completedAt || a.updatedAt || 0));
     const keepSettled = new Set(settled
       .filter((run, index) => index < MAX_SETTLED_RUNS && now - (run.completedAt || run.updatedAt || now) <= SETTLED_RETENTION_MS)
       .map((run) => run.runId));
     for (const [runId, run] of this.runs) {
-      if (isTerminalStatus(run.status) && !keepSettled.has(runId)) this.runs.delete(runId);
+      if (isTerminalStatus(run.status)
+        && !isTrackedOrchestrationRun(run)
+        && !keepSettled.has(runId)) {
+        this.runs.delete(runId);
+      }
     }
   }
 
@@ -1231,30 +2236,37 @@ class OrchestrationRunStore {
       if (!shouldScheduleCreatedTargetAutoStop(run)) continue;
       run.autoStopAt = Number(run.completedAt || Date.now()) + run.successAutoStopMs;
       run.autoStopStatus = 'scheduled';
+      run.autoStopActivityRevision = this._activityForTarget(run.targetTabId).revision;
       changed = true;
     }
     return changed;
   }
 
   _schedulePersist() {
+    void this._enqueuePersist(false);
+  }
+
+  _enqueuePersist(strict) {
     this._pruneInMemory();
     const snapshot = JSON.stringify({
-      version: 3,
+      version: 4,
       settings: this.settings,
       createdTargetTabIds: Array.from(this.createdTargetTabIds),
+      targetActivityByTab: Object.fromEntries(this.targetActivityByTab),
       runs: Array.from(this.runs.values()),
     }, null, 2);
-    this.persistChain = this.persistChain
+    const write = this.persistChain
       .catch(() => {})
       .then(async () => {
         await fs.promises.mkdir(path.dirname(this.filePath), { recursive: true });
         const tempPath = this.filePath + '.tmp-' + process.pid;
         await fs.promises.writeFile(tempPath, snapshot, 'utf8');
         await fs.promises.rename(tempPath, this.filePath);
-      })
-      .catch((error) => {
+      });
+    this.persistChain = write.catch((error) => {
         console.warn('[OrchestrationRuns] persist failed:', error?.message || error);
       });
+    return strict ? write : this.persistChain;
   }
 }
 
@@ -1263,6 +2275,8 @@ module.exports = {
   DEFAULT_ORCHESTRATION_SETTINGS,
   isActiveStatus,
   isTerminalStatus,
+  isResultProofPending,
+  isPausedRun,
   isCompleteOrchestrationResult,
   shouldScheduleCreatedTargetAutoStop,
   shouldRetryWaitingNotificationForSourceLifecycle,
@@ -1274,4 +2288,6 @@ module.exports = {
   hasNewerTargetRun,
   isAbortedReason,
   outcomeForReason,
+  buildOrchestrationResultLookup,
+  resolveCausalSourceExecutionContext,
 };

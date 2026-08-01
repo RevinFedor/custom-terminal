@@ -634,3 +634,128 @@
 .icon-cropper-btn.apply:hover {
   background: #4b95ff;
 }
+
+/* ── Linked session chips under the file row ──────────────────────────────
+   Chips name the agent sessions a file is attached to. They used to sit at the
+   far right of the row, where a long file name pushed them off-screen. Now they
+   hang directly under their file as a second line.
+
+   Alignment: the row is `padding-left: 12 + depth*16`, then chevron 12px, gap
+   6px, icon 16px, gap 6px. So the file NAME starts 40px after the row padding
+   — that is the indent a chip needs to line up under the text, not under the
+   icon. It is applied as padding on the container because the row's own
+   padding-left already carries the depth.
+
+   Look: same visual language as a tab in the sidebar — rounded block, tinted
+   background of the session colour, coloured border, WHITE text; hover
+   brightens the fill the way an unselected tab does. A bare coloured label
+   read as body text, not as "this file belongs to that session".            */
+/* The shared package pins every DnD row to `height: 28px`, so a wrapped second
+   line had nowhere to go and the chip spilled over the row below — which is
+   exactly the overlap seen with linked files. Only rows that actually carry
+   chips are released to auto height; every other row keeps the fixed pitch.
+   Safe for drag: the outline resolves boundaries from measured row `top`
+   values, not from a constant row height (see fact-tabs.md::Structured outline
+   DnD). Height must be released on BOTH selectors — `.arborist-node` sets the
+   min, `.outline-dnd-row` sets the fixed height. */
+.arborist-node.outline-dnd-row:has(> .file-row-session-chips-wrap) {
+  height: auto;
+  min-height: 28px;
+  flex-wrap: wrap;
+  align-content: center;
+  row-gap: 0;
+  padding-top: 3px;
+  padding-bottom: 4px;
+}
+
+/* The wrapper owns the second line; the strip inside it scrolls, and the count
+   sits outside the scroller so it stays visible at every scroll position. */
+.arborist-node .file-row-session-chips-wrap {
+  /* Rows are all `position: relative` on one layer, so a later row paints over
+     an earlier one. The chips must stay readable even if a neighbouring row's
+     hover/selection background reaches them. */
+  position: relative;
+  z-index: 3;
+  /* `flex-basis: 100%` alone forces a line break but freezes the width at the
+     row's content box, so the negative right margin gained nothing. `width:
+     auto` + `flex-grow` lets the wrapper actually extend into the reclaimed
+     gap. */
+  flex-basis: 100%;
+  flex-grow: 1;
+  width: auto;
+  margin-top: 2px;
+  padding-left: 40px;
+  /* The row reserves 8px on the right for itself. On the chips line that gap is
+     dead space, so pull the wrapper back into it and leave only a hairline —
+     a long session name gains ~7px of readable width. */
+  margin-right: -7px;
+  padding-right: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.arborist-node .file-row-session-chips {
+  flex: 1 1 auto;
+  margin-left: 0;
+  margin-top: 0;
+  padding-left: 0;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+}
+
+.arborist-node .file-row-session-chips::-webkit-scrollbar {
+  display: none;
+}
+
+.arborist-node .file-row-session-chip.file-row-project-chip {
+  display: inline-flex;
+  align-items: center;
+  height: auto;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--file-session-chip-accent, #A78BFA);
+  background: var(--file-session-chip-bg, rgba(167, 139, 250, 0.2));
+  color: #fff;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  max-width: 168px;
+  flex: 0 0 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background 0.12s ease-out;
+}
+
+.arborist-node .file-row-session-chip.file-row-project-chip:hover {
+  background: var(--file-session-chip-bg-hover, rgba(167, 139, 250, 0.34));
+  color: #fff;
+}
+
+/* Neutral, not tinted: it counts sessions of mixed colours, so borrowing any
+   one session's accent would misread as "that session". Quieter than the chips
+   themselves — it is a hint about hidden content, not a target. */
+.arborist-node .file-row-session-chips-count {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.07);
+  color: rgba(228, 228, 231, 0.82);
+  font-weight: 600;
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+}

@@ -3,8 +3,8 @@ import test from 'node:test';
 
 import {
   buildTabOutline,
-  resolveEmptyUtilityDropTarget,
   tabOutlineHorizontalPolicy,
+  tabOutlineSubtreeTabIds,
   tabOutlineToLayout,
   tabOutlineVerticalSlotPolicy,
 } from './tabOutlineModel.mjs';
@@ -44,6 +44,57 @@ test('tab commit serializes the complete moved subtree atomically', () => {
   assert.equal(layout.groupAssignments.parent, 'g');
   assert.equal(layout.groupAssignments.child, 'g');
   assert.equal(layout.visualParentAssignments.child, 'parent');
+});
+
+test('root group can move past another group as one ordered block', () => {
+  const outline = buildTabOutline([
+    tab('a-root', { groupId: 'a' }),
+    tab('a-child', { groupId: 'a', visualParentTabId: 'a-root' }),
+    tab('b-root', { groupId: 'b' }),
+    tab('b-child', { groupId: 'b', visualParentTabId: 'b-root' }),
+  ], [group('a'), group('b')]);
+  const layout = tabOutlineToLayout([outline[1], outline[0]]);
+
+  assert.equal(layout.ok, true);
+  assert.deepEqual(layout.orderedIds, ['b-root', 'b-child', 'a-root', 'a-child']);
+  assert.deepEqual(layout.groupAssignments, {
+    'b-root': 'b',
+    'b-child': 'b',
+    'a-root': 'a',
+    'a-child': 'a',
+  });
+});
+
+test('moving a tab subtree out of a group clears every descendant assignment', () => {
+  const outline = buildTabOutline([
+    tab('parent', { groupId: 'g' }),
+    tab('child', { groupId: 'g', visualParentTabId: 'parent' }),
+    tab('remaining', { groupId: 'g' }),
+  ], [group('g')]);
+  const groupNode = outline[0];
+  const source = groupNode.children[0];
+  const preview = [source, { ...groupNode, children: groupNode.children.slice(1) }];
+  const layout = tabOutlineToLayout(preview);
+
+  assert.equal(layout.ok, true);
+  assert.deepEqual(layout.orderedIds, ['parent', 'child', 'remaining']);
+  assert.equal(layout.groupAssignments.parent, null);
+  assert.equal(layout.groupAssignments.child, null);
+  assert.equal(layout.groupAssignments.remaining, 'g');
+  assert.equal(layout.visualParentAssignments.child, 'parent');
+});
+
+test('cross-project source ids include the selected tab and its complete visual subtree', () => {
+  const outline = buildTabOutline([
+    tab('root'),
+    tab('child', { visualParentTabId: 'root' }),
+    tab('grandchild', { visualParentTabId: 'child' }),
+    tab('sibling'),
+  ]);
+
+  assert.deepEqual(tabOutlineSubtreeTabIds(outline, 'root'), ['root', 'child', 'grandchild']);
+  assert.deepEqual(tabOutlineSubtreeTabIds(outline, 'child'), ['child', 'grandchild']);
+  assert.deepEqual(tabOutlineSubtreeTabIds(outline, 'missing'), []);
 });
 
 test('empty group anchor follows the next top-level block', () => {
@@ -88,30 +139,10 @@ test('vertical host policy keeps groups at root and does not count the group as 
   }), true);
 });
 
-test('empty utility target requires an intentional downward gesture without changing tree geometry', () => {
-  const containerRect = { left: 0, right: 200, top: 60, bottom: 900 };
-  assert.equal(resolveEmptyUtilityDropTarget({
-    clientX: 100,
-    clientY: 859,
-    startY: 860,
-    containerRect,
-  }), null);
-  assert.equal(resolveEmptyUtilityDropTarget({
-    clientX: 100,
-    clientY: 860,
-    startY: 860,
-    containerRect,
-  }), null);
-  assert.deepEqual(resolveEmptyUtilityDropTarget({
-    clientX: 100,
-    clientY: 861,
-    startY: 860,
-    containerRect,
-  }), { id: 'utility', zone: 'utility', insertIndex: 0 });
-  assert.equal(resolveEmptyUtilityDropTarget({
-    clientX: 100,
-    clientY: 820,
-    startY: 700,
-    containerRect,
-  }), null);
+test('legacy utility tabs participate in the only remaining main outline', () => {
+  const outline = buildTabOutline([
+    tab('legacy-utility', { isUtility: true }),
+    tab('main'),
+  ]);
+  assert.deepEqual(outline.map(node => node.tabId), ['legacy-utility', 'main']);
 });

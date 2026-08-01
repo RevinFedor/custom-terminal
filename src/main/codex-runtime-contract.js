@@ -54,6 +54,23 @@ function createCodexLaunchPendingResult({
   };
 }
 
+function classifyCodexLaunchPreparationResult(result) {
+  const explicitlyAccepted = result?.accepted === true;
+  const admittedPending = result?.success === true
+    && result?.accepted == null
+    && result?.acceptancePending === true;
+  const accepted = explicitlyAccepted || admittedPending;
+  return {
+    accepted,
+    reason: explicitlyAccepted
+      ? 'launch-accepted'
+      : admittedPending
+        ? 'launch-pending'
+        : 'launch-rejected',
+    error: accepted ? null : (result?.error || result?.reason || null),
+  };
+}
+
 function planCodexLaunchSettings({
   requestedModel = null,
   requestedEffort = null,
@@ -477,7 +494,7 @@ function createPendingCodexSettingsProofHandoff({
     proofAt,
     model,
     effort,
-    ...(result?.fast === true ? { fast: true } : {}),
+    ...(typeof result?.fast === 'boolean' ? { fast: result.fast } : {}),
     applicationProofSource: proofSource,
   };
 }
@@ -500,7 +517,7 @@ function projectPendingCodexSettingsProofOwner(pending, {
     launchId: pending.launchId,
     model: pending.model,
     effort: pending.effort,
-    fast: pending.fast === true,
+    ...(typeof pending.fast === 'boolean' ? { fast: pending.fast } : {}),
     proofAt: pending.proofAt,
     applicationProofSource: pending.applicationProofSource,
   };
@@ -534,7 +551,12 @@ function consumePendingCodexSettingsProofHandoff(pending, {
     carry: reason === null,
     reason: reason || 'same-live-generation-first-writer',
     proof: reason === null
-      ? { model: pending.model, effort: pending.effort, proofAt: pending.proofAt }
+      ? {
+        model: pending.model,
+        effort: pending.effort,
+        proofAt: pending.proofAt,
+        ...(typeof pending.fast === 'boolean' ? { fast: pending.fast } : {}),
+      }
       : null,
     // Every first-writer admission consumes or invalidates the one-shot proof.
     nextPending: null,
@@ -617,6 +639,7 @@ module.exports = {
   attachCodexSettingsProofOwner,
   codexLiveSlashAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
+  classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,

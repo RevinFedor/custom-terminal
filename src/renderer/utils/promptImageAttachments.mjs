@@ -220,3 +220,62 @@ export function normalizePromptImageIdentity(text) {
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+/**
+ * Classifies a clipboard selection that overlaps image markers.
+ *
+ * Copying is per-character, so a user can easily grab `[Image #1` without its
+ * closing bracket. Such a fragment looks like an attachment but references
+ * nothing: pasted back it either does nothing or, worse, collides with an
+ * unrelated ref id. Whole markers are kept verbatim (the paste target can
+ * re-attach them); partial ones are replaced by an explicit error marker so the
+ * damage is visible in the pasted text instead of silently traveling as prose.
+ *
+ * @returns {{ text: string, partial: number, whole: number }}
+ */
+export function buildImageAwareClipboardText(text = '', selectionStart = 0, selectionEnd = 0) {
+  const value = String(text || '');
+  const start = Math.max(0, Math.min(Number(selectionStart) || 0, value.length));
+  const end = Math.max(start, Math.min(Number(selectionEnd) || 0, value.length));
+  const selected = value.slice(start, end);
+  if (!selected) return { text: '', partial: 0, whole: 0 };
+
+  // Markers fully inside the selection are fine as-is.
+  const wholeInSelection = [];
+  const re = createValidImageMarkerRegex();
+  let match;
+  while ((match = re.exec(value)) !== null) {
+    const from = match.index;
+    const to = from + match[0].length;
+    if (from >= start && to <= end) {
+      wholeInSelection.push({ from, to });
+      continue;
+    }
+    // Any other overlap means the selection cut through this marker.
+    if (from < end && to > start) {
+      wholeInSelection.push({ from, to, partial: true });
+    }
+  }
+
+  const partials = wholeInSelection.filter((entry) => entry.partial);
+  if (partials.length === 0) {
+    return { text: selected, partial: 0, whole: wholeInSelection.length };
+  }
+
+  // Rebuild the selection, replacing every cut fragment with an error marker.
+  let out = '';
+  let cursor = start;
+  for (const entry of partials) {
+    const clippedFrom = Math.max(entry.from, start);
+    const clippedTo = Math.min(entry.to, end);
+    if (clippedFrom > cursor) out += value.slice(cursor, clippedFrom);
+    out += '[imageError]';
+    cursor = clippedTo;
+  }
+  if (cursor < end) out += value.slice(cursor, end);
+  return {
+    text: out,
+    partial: partials.length,
+    whole: wholeInSelection.length - partials.length,
+  };
+}

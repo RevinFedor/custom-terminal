@@ -1,7 +1,13 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, RotateCcw, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, RotateCcw, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+import {
+  ComposerEditor,
+  type ComposerEditorHandle,
+  type ComposerInlineToken,
+} from '@gt-editor/markdown-editor';
+import '@gt-editor/markdown-editor/styles.css';
 import {
   HISTORY_PANEL_DEFAULT_WIDTH,
   useUIStore,
@@ -30,6 +36,11 @@ import {
 } from '../../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario, stopAgentProcessScenario } from '../../utils/agentScenarios';
 import {
+  buildExactDraftCaptureProof,
+  classifyAgentDraftPreflight,
+  resolveAgentDraftConflict,
+} from '../../utils/agentDraftPreflight.mjs';
+import {
   beginCoordinatedAgentSend,
   bindCoordinatedAgentSendHandoff,
   getCoordinatedAgentAction,
@@ -38,6 +49,7 @@ import {
   subscribeCoordinatedAgentActions,
 } from '../../utils/agentActionCoordinator.mjs';
 import { isHistoryTaskBackgroundLive } from '../../utils/historyBackgroundLiveness.mjs';
+import { foldHistoryAgentProcessLiveness } from '../../utils/historyProcessLiveness.mjs';
 import {
   estimateHistoryEntriesBytesFast,
   historySnapshotCache,
@@ -79,15 +91,31 @@ import {
   retainPromptImageRefsForText,
 } from '../../utils/promptImageAttachments.mjs';
 import {
+  buildComposerClipboardText,
+  buildPortableImageImportSnapshot,
+  collapsePortableImageImportSnapshot,
+  collectPortableImagePathMarkers,
+} from '../../utils/composerClipboard.mjs';
+import {
+  composerImageUrl,
+  useComposerImagePreview,
+  useComposerImagePreviews,
+} from '../../utils/composerImagePreview';
+import {
+  buildPasteChipMarker,
+  getPasteMarkerHighlightRanges,
   haveSameComposerChips,
+  insertComposerSnapshotAtSelection,
   insertComposerTextAtSelection,
   isPlainTextPasteShortcut,
   isTerminalOnlyComposerDraft,
   normalizeComposerChips,
   parsePastedContentParts,
   restoreComposerChipToText,
+  retainPasteChipsForText,
   serializeComposerDraft,
   shouldCreatePasteChip,
+  isDictationClipboardPayload,
   splitPromptChipPresentation,
   upsertComposerChip,
 } from '../../utils/composerChips.mjs';
@@ -158,6 +186,7 @@ import {
   ToolCallPart as CBToolCallPart,
 } from '@noted/claude-blocks';
 import {
+  AIComposerImagePreview,
   AIComposerSurface,
   type AIComposerSurfaceChip,
 } from './AIConversation/AIComposerSurface';
@@ -292,6 +321,22 @@ interface HistoryActivityTiming {
   durationMs: number | null;
 }
 
+interface CompactOperationalPhase {
+  kind: 'compact';
+  phase: 'compacting' | null;
+  active: boolean;
+  tabId: string;
+  provider: AgentHistoryTool;
+  operationId: string;
+  sessionId?: string | null;
+  generation?: string | null;
+  handoffId?: string | null;
+  outcome?: 'completed' | 'aborted' | 'failed' | 'unknown';
+  reason?: string | null;
+  startedAt: number;
+  endedAt?: number;
+}
+
 const reconcileCodexEffectiveSettings = (
   tabId: string,
   sessionId: string,
@@ -361,6 +406,18 @@ interface HistoryPanelProps {
   embeddedFill?: boolean;
   previewMode?: boolean;
   mainSurface?: boolean;
+  // Terminal-primary layout: the SAME History runs as the side panel and stays
+  // the tab's live input surface. Geometry differs from mainSurface, ownership
+  // does not — draft, availability and Escape-interrupt still belong here.
+  agentSidePanel?: boolean;
+  // Terminal-primary keeps ONE composer, always docked below the terminal, so
+  // the user can type and watch the effect in the same glance. It renders into
+  // this workspace-level host instead of inside the panel; the side History is
+  // then a pure transcript. Same component, same draft — only the DOM location
+  // moves, because two mounted composers would mean two drafts.
+  composerPortalHostId?: string;
+  onSwapPrimarySurface?: () => void;
+  terminalIsPrimary?: boolean;
   projectId?: string;
   terminalOpen?: boolean;
   onToggleTerminal?: () => void;
@@ -401,6 +458,8 @@ interface HistoryLiveToolResult {
 const EMPTY_HISTORY_LIVE_TOOL_RESULTS = new Map<string, HistoryLiveToolResult>();
 // Stable identity so a "no live rows" render never invalidates chip memos.
 const EMPTY_HISTORY_ENTRIES: FullHistoryEntry[] = [];
+// Stable identity so an in-flight owner handoff does not churn dependent memos.
+const EMPTY_HISTORY_CHIPS: HistoryBackgroundChip[] = [];
 
 const LOCAL_PROMPT_PREFIX = 'local-prompt-';
 const LOCAL_REWIND_PREFIX = 'local-rewind-';
@@ -475,17 +534,37 @@ const historyDraftImageWarning = (
   return null;
 };
 
+type PromptHighlightDecoration = {
+  start: number;
+  end: number;
+  color: string;
+  fontWeight: number;
+  block?: boolean;
+};
+
 const renderHistoryPromptHighlight = (
   text: string,
   ranges: Array<{ start: number; end: number; id: number }>,
   preserveCaretMetrics = false,
+  pasteRanges: Array<{ start: number; end: number; id: string }> = [],
 ) => {
-  const decorated = ranges.map((range) => ({
+  const decorated: PromptHighlightDecoration[] = ranges.map((range) => ({
     start: range.start,
     end: range.end,
     color: '#60a5fa',
     fontWeight: 650,
   }));
+  // A paste anchor reads as a foreign body inside the sentence, so unlike an
+  // image marker it gets a background box, not just a colour.
+  for (const range of pasteRanges) {
+    decorated.push({
+      start: range.start,
+      end: range.end,
+      color: '#c7d2fe',
+      fontWeight: 650,
+      block: true,
+    });
+  }
   const addMatches = (re: RegExp, color: string, fontWeight = 650) => {
     let match: RegExpExecArray | null;
     while ((match = re.exec(text)) !== null) {
@@ -513,6 +592,15 @@ const renderHistoryPromptHighlight = (
         style={{
           color: range.color,
           fontWeight: preserveCaretMetrics ? undefined : range.fontWeight,
+          // Padding/border are deliberately omitted: this layer must stay
+          // glyph-for-glyph aligned with the textarea underneath, and any box
+          // metric here would shift every following character away from the
+          // real caret. Background and radius do not affect layout.
+          ...(range.block ? {
+            background: 'rgba(129,140,248,0.16)',
+            borderRadius: 3,
+            boxShadow: '0 0 0 1px rgba(129,140,248,0.34)',
+          } : undefined),
         }}
       >
         {text.slice(range.start, range.end)}
@@ -1366,6 +1454,7 @@ const collectHistoryBackgroundChips = (
   agentProcessAlive: boolean,
   currentSessionId: string,
   currentProcessGeneration: string | null,
+  chipToolType: string = 'claude',
 ): HistoryBackgroundChip[] => {
   // A chip is the LIVE face of work. Two liveness models:
   //
@@ -1428,6 +1517,9 @@ const collectHistoryBackgroundChips = (
       // Explicit rollout status (Codex) is process-scoped truth; a Claude
       // Task without one is turn-scoped and needs the busy gate.
       const running = isHistoryTaskBackgroundLive({
+        // Provider decides which proof of liveness applies: Codex must match a
+        // process generation, Claude never has one to match.
+        toolType: chipToolType,
         subagentStatus: action.subagentStatus,
         actionProcessGeneration: action.processGeneration,
         currentProcessGeneration,
@@ -1460,6 +1552,7 @@ const collectHistoryBackgroundChips = (
 // «РАБОТАЕТ В ФОНЕ» badge follows chip liveness: a background card whose
 // process died with the turn (no notification ever) must not pulse forever.
 const HistoryBackgroundLiveContext = React.createContext<ReadonlySet<string>>(new Set());
+
 
 const HistoryBackgroundDot = () => (
   <span
@@ -2511,19 +2604,15 @@ const historyPanelStyleText = `@keyframes hp-flash {
   from { stroke-dashoffset: 0; }
   to { stroke-dashoffset: -100; }
 }
-@keyframes hp-owner-transition-forward {
-  0%, 100% { transform: translateX(-1px); opacity: 0.35; }
-  50% { transform: translateX(1px); opacity: 1; }
+/* Owner handoff loader. Two opposed arrows used to live here, but that shape
+   now means "swap the primary surface" on its own button right next to this
+   slot — a spinning ring keeps the transient loading state unambiguous. */
+@keyframes hp-owner-transition-spin {
+  to { transform: rotate(360deg); }
 }
-@keyframes hp-owner-transition-backward {
-  0%, 100% { transform: translateX(1px); opacity: 1; }
-  50% { transform: translateX(-1px); opacity: 0.35; }
-}
-.hp-owner-transition-forward {
-  animation: hp-owner-transition-forward 0.8s ease-in-out infinite;
-}
-.hp-owner-transition-backward {
-  animation: hp-owner-transition-backward 0.8s ease-in-out infinite;
+.hp-owner-transition-spin {
+  transform-origin: 50% 50%;
+  animation: hp-owner-transition-spin 0.85s linear infinite;
 }
 .hp-terminal-perimeter-loader {
   animation: hp-terminal-perimeter 0.9s linear infinite;
@@ -2534,8 +2623,7 @@ const historyPanelStyleText = `@keyframes hp-flash {
     stroke-dasharray: 100 0;
     stroke-dashoffset: 0;
   }
-  .hp-owner-transition-forward,
-  .hp-owner-transition-backward {
+  .hp-owner-transition-spin {
     animation: none;
   }
 }
@@ -2777,16 +2865,22 @@ function HistorySpinner({ size = 14, flexShrink = 0 }: { size?: number; flexShri
   );
 }
 
+// One affordance for "the other surface". The frame and the busy perimeter are
+// identical in both layouts — only the glyph inside says WHICH surface the click
+// reveals: a shell prompt for the terminal, transcript lines for History. Same
+// place, same size, same loader, so the control stays recognisable after a swap.
 function HistoryTerminalActivityIcon({
   size = 19,
   busy = false,
   active = false,
   color,
+  surface = 'terminal',
 }: {
   size?: number;
   busy?: boolean;
   active?: boolean;
   color?: string;
+  surface?: 'terminal' | 'history';
 }) {
   return (
     <svg
@@ -2810,8 +2904,18 @@ function HistoryTerminalActivityIcon({
       }}
     >
       <rect x="1" y="2" width="18" height="16" rx="2" opacity={busy ? 0.32 : 1} />
-      <path d="m5 7 2.5 2L5 11" />
-      <path d="M10 12h5" />
+      {surface === 'history' ? (
+        <>
+          <path d="M5 6.5h10" />
+          <path d="M5 10h10" />
+          <path d="M5 13.5h6" />
+        </>
+      ) : (
+        <>
+          <path d="m5 7 2.5 2L5 11" />
+          <path d="M10 12h5" />
+        </>
+      )}
       {busy && (
         <rect
           className="hp-terminal-perimeter-loader"
@@ -2844,8 +2948,8 @@ function HistoryOwnerTransitionIcon({ size = 20 }: { size?: number }) {
       data-history-owner-transition="true"
       style={{ display: 'block', flexShrink: 0, color: '#818cf8' }}
     >
-      <path className="hp-owner-transition-forward" d="M3 6.5h11m0 0-3-3m3 3-3 3" />
-      <path className="hp-owner-transition-backward" d="M17 13.5H6m0 0 3-3m-3 3 3 3" />
+      <circle cx="10" cy="10" r="6.5" opacity={0.25} />
+      <path className="hp-owner-transition-spin" d="M16.5 10a6.5 6.5 0 0 0-6.5-6.5" />
     </svg>
   );
 }
@@ -3469,9 +3573,13 @@ function AgentHistoryControls({
   rewindPreviewHiddenCount,
   terminalOpen,
   onToggleTerminal,
+  onSwapPrimarySurface,
+  terminalIsPrimary = false,
   lifecycleStatus,
+  operationalPhase,
   onHeightChange,
   overlayComposer = false,
+  agentInputSurface: agentInputSurfaceProp,
 }: {
   tabId: string;
   sessionId: string;
@@ -3516,10 +3624,18 @@ function AgentHistoryControls({
   rewindPreviewHiddenCount: number;
   terminalOpen?: boolean;
   onToggleTerminal?: () => void;
+  onSwapPrimarySurface?: () => void;
+  terminalIsPrimary?: boolean;
   lifecycleStatus?: AgentLifecycleSummary | null;
+  operationalPhase?: CompactOperationalPhase | null;
   onHeightChange?: (height: number) => void;
   overlayComposer?: boolean;
+  agentInputSurface?: boolean;
 }) {
+  // Owning the tab's input is not the same as being the centered surface: the
+  // terminal-primary layout keeps this composer live in the side panel. Fall
+  // back to the centered flag so preview/legacy hosts keep prior behavior.
+  const agentInputSurface = agentInputSurfaceProp ?? overlayComposer;
   const runtime = useMemo(() => getHistoryAgentRuntime(toolType), [toolType]);
   const [status, setStatus] = useState<AgentPtyStatus>('inactive');
   const [processLifecycleGeneration, setProcessLifecycleGeneration] = useState<string | null>(null);
@@ -3568,8 +3684,7 @@ function AgentHistoryControls({
   const [activityClock, setActivityClock] = useState(() => Date.now());
   const controlsRef = useRef<HTMLDivElement | null>(null);
   const statusCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const promptHighlightRef = useRef<HTMLDivElement | null>(null);
+  const promptTextareaRef = useRef<ComposerEditorHandle | null>(null);
   const promptCaretRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
   const tabIdRef = useRef(tabId);
   const activityTimingOwnerKeyRef = useRef(tabId + ':' + toolType);
@@ -3596,12 +3711,6 @@ function AgentHistoryControls({
   }, [prompt, syncPromptTextareaHeight]);
 
   useEffect(() => {
-    if (previewChipId && !draftChips.some((chip) => chip.id === previewChipId)) {
-      setPreviewChipId(null);
-    }
-  }, [draftChips, previewChipId]);
-
-  useEffect(() => {
     const element = promptTextareaRef.current;
     if (!element || typeof ResizeObserver === 'undefined') return;
     let lastWidth = element.getBoundingClientRect().width;
@@ -3611,7 +3720,8 @@ function AgentHistoryControls({
       lastWidth = nextWidth;
       syncPromptTextareaHeight();
     });
-    observer.observe(element);
+    if (!element.dom) return;
+    observer.observe(element.dom);
     return () => observer.disconnect();
   }, [syncPromptTextareaHeight]);
 
@@ -4142,15 +4252,18 @@ function AgentHistoryControls({
       : runtime.inspectDraft?.(tabId);
     if (draftState) {
       console.log('[' + runtime.logPrefix + ':draft] preflight tab=' + tabId.slice(-12) + ' reason=' + reason + ' hasDraft=' + draftState.hasDraft + ' source=' + draftState.source);
-      if (draftState.hasDraft === false) {
+      const draftDecision = classifyAgentDraftPreflight(draftState);
+      if (draftDecision.decision === 'clear') {
         return { stale: false, text: '', images: 0, imagePaths: [] as HistoryPromptDraftImageRef[] };
       }
-      if (draftState.hasDraft === null) {
+      if (draftDecision.decision === 'unknown' && draftState.exactCaptureRecommended !== true) {
         throw new Error(runtime.label + ' terminal draft state is unknown; send stopped before touching terminal input.');
       }
     }
     console.log('[' + runtime.logPrefix + ':draft] grab-request tab=' + tabId.slice(-12) + ' reason=' + reason);
-    const result = await runtime.grabDraft(tabId);
+    const result = await runtime.grabDraft(tabId, draftState ? {
+      draftProof: buildExactDraftCaptureProof(draftState),
+    } : undefined);
     if (tabIdRef.current !== requestTabId) return { stale: true, text: '', images: 0, imagePaths: [] as HistoryPromptDraftImageRef[] };
     if (!result?.success) {
       const message = draftGrabErrorText(result);
@@ -4160,6 +4273,16 @@ function AgentHistoryControls({
     const text = typeof result.text === 'string' ? result.text.trim() : '';
     const images = Number(result.images || 0);
     const imagePaths = Array.isArray(result.imagePaths) ? result.imagePaths : [];
+    if (draftState && !text && images === 0) {
+      const conflict = resolveAgentDraftConflict(draftState, result, {
+        attemptedCapture: true,
+      });
+      if (conflict.decision !== 'clear') {
+        throw new Error(runtime.label + ' terminal draft state is still unknown; send stopped before touching terminal input.');
+      }
+      console.warn('[' + runtime.logPrefix + ':draft] ambiguous screen tail resolved as empty tab='
+        + tabId.slice(-12) + ' reason=' + (conflict.reason || '-'));
+    }
     console.log('[' + runtime.logPrefix + ':draft] grab-ok tab=' + tabId.slice(-12) + ' reason=' + reason + ' chars=' + text.length + ' images=' + images);
     return { stale: false, text, images, imagePaths };
   }, [runtime, tabId]);
@@ -4439,21 +4562,43 @@ function AgentHistoryControls({
         return;
       }
       const current = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
-      const nextText = prependPromptText(current, draft.text);
+      const pulledImages = Array.isArray(draft.imagePaths) ? draft.imagePaths : [];
+      // A blue [Image #N] means "the file is here". Any marker whose file did
+      // not come across must NOT keep that look — it would promise an
+      // attachment the send has no way to deliver. Unresolved markers become a
+      // red [imageError: …], the same shape Run after already uses.
+      const resolvedIds = new Set(pulledImages.map((ref: any) => Number(ref?.id)));
+      let unresolvedMarkers = 0;
+      const pulledText = String(draft.text || '').replace(
+        /\[Image\s+#?(\d+)\]/g,
+        (marker, rawId) => {
+          if (resolvedIds.has(Number(rawId))) return marker;
+          unresolvedMarkers += 1;
+          return '[imageError: файл изображения #' + rawId + ' не найден]';
+        },
+      );
+      const nextText = prependPromptText(current, pulledText);
       const mergedImages = retainHistoryDraftImages(nextText, [
         ...(useUIStore.getState().historyPromptDraftImages[actionTabId] || []),
-        ...(Array.isArray(draft.imagePaths) ? draft.imagePaths : []),
+        ...pulledImages,
       ]);
       setHistoryPromptDraft(actionTabId, nextText, mergedImages.length > 0
         ? { images: mergedImages, preserveChips: true }
         : { preserveImages: true, preserveChips: true });
-      if (draft.images > 0) {
+      // Only failure is worth a warning. A fully carried-over image is a normal
+      // successful transfer, and warning about it trained the user to ignore
+      // the row that also reports real problems.
+      if (unresolvedMarkers > 0) {
         setDraftWarning(
-          mergedImages.length > 0
-            ? 'Pulled text contains ' + draft.images + ' image placeholder' + (draft.images === 1 ? '' : 's') + '; History will keep the marker but will not send it as plain text.'
-            : 'Pulled text contains ' + draft.images + ' image placeholder' + (draft.images === 1 ? '' : 's') + '; images are not attached in this History input.'
+          unresolvedMarkers === 1
+            ? 'Картинка осталась в терминале: файл не найден. В тексте вместо неё — пометка ошибки, удалите её или вставьте картинку заново.'
+            : 'Не перенеслись картинки: ' + unresolvedMarkers + '. В тексте вместо них — пометки ошибки, удалите их или вставьте картинки заново.',
         );
       }
+      console.log('[' + runtime.logPrefix + ':draft] pull-images tab=' + actionTabId.slice(-12)
+        + ' markers=' + draft.images
+        + ' carried=' + pulledImages.length
+        + ' unresolved=' + unresolvedMarkers);
       requestAnimationFrame(() => promptTextareaRef.current?.focus());
     } catch (e: any) {
       if (isCurrentAction()) {
@@ -4466,7 +4611,7 @@ function AgentHistoryControls({
         setBusyAction(null);
       }
     }
-  }, [readTerminalDraft, refreshPresence, runtime.label, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
+  }, [readTerminalDraft, refreshPresence, runtime.label, runtime.logPrefix, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
 
   const prepareHistoryPromptForSend = useCallback(async (
     text: string,
@@ -5241,6 +5386,10 @@ function AgentHistoryControls({
   const isTurnBusy = status === 'busy';
   const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion || rewindLocked || effectiveStopping;
   const isCancellingTurn = busyAction === 'interrupt' || interruptAwaiting;
+  const isCompacting = operationalPhase?.tabId === tabId
+    && operationalPhase.provider === toolType
+    && operationalPhase.active === true
+    && operationalPhase.phase === 'compacting';
   const rewindStatusMeta = useMemo(() => {
     if (!rewindLocked) return null;
     switch (rewindPhase) {
@@ -5295,9 +5444,66 @@ function AgentHistoryControls({
     () => getPromptImageMarkerHighlightRanges(prompt, draftImages) as Array<{ start: number; end: number; id: number }>,
     [draftImages, prompt],
   );
-  const hasPromptImageMarkup = promptImageMarkerRanges.length > 0
-    || historyImagePastePending
-    || /\[(?:imagePath|imageError):/i.test(prompt);
+  const promptPasteMarkerRanges = useMemo(
+    () => getPasteMarkerHighlightRanges(prompt, draftChips) as Array<{ start: number; end: number; id: string }>,
+    [draftChips, prompt],
+  );
+  const draftImagePreviewUrls = useComposerImagePreviews(draftImages);
+  const promptComposerTokens = useMemo<ComposerInlineToken[]>(() => {
+    const refsById = new Map(draftImages.map((ref) => [Number(ref.id), ref]));
+    const result: ComposerInlineToken[] = [
+      ...promptImageMarkerRanges.map((range) => ({
+        id: `image:${range.id}:${range.start}`,
+        from: range.start,
+        to: range.end,
+        kind: 'image' as const,
+        label: 'image',
+        thumbnailUrl: composerImageUrl(refsById.get(range.id), draftImagePreviewUrls),
+      })),
+      ...promptPasteMarkerRanges.map((range) => ({
+        id: `paste:${range.id}`,
+        from: range.start,
+        to: range.end,
+        kind: 'paste' as const,
+        label: prompt.slice(range.start + 1, Math.max(range.start + 1, range.end - 1)),
+      })),
+    ];
+    const statusPattern = /\[Image saving…\]|\[(?:imagePath|imageError):[^\]\r\n]+\]/gi;
+    let match: RegExpExecArray | null;
+    while ((match = statusPattern.exec(prompt)) !== null) {
+      result.push({
+        id: `status:${match.index}`,
+        from: match.index,
+        to: match.index + match[0].length,
+        kind: match[0] === HISTORY_IMAGE_PENDING_MARKER ? 'pending' : 'error',
+        label: match[0],
+        replace: false,
+      });
+    }
+    return result;
+  }, [draftImagePreviewUrls, draftImages, prompt, promptImageMarkerRanges, promptPasteMarkerRanges]);
+  const previewedDraftImageRange = useMemo(() => (
+    previewChipId
+      ? promptImageMarkerRanges.find((range) => (
+          `image:${range.id}:${range.start}` === previewChipId
+        ))
+      : undefined
+  ), [previewChipId, promptImageMarkerRanges]);
+  const previewedDraftImageRef = useMemo(() => (
+    previewedDraftImageRange
+      ? draftImages.find((ref) => Number(ref.id) === Number(previewedDraftImageRange.id))
+      : undefined
+  ), [draftImages, previewedDraftImageRange]);
+  const draftImageDetailPreview = useComposerImagePreview(previewedDraftImageRef, 'detail');
+
+  useEffect(() => {
+    if (!previewChipId) return;
+    const hasChip = draftChips.some((chip) => chip.id === previewChipId);
+    const hasImage = promptImageMarkerRanges.some((range) => (
+      `image:${range.id}:${range.start}` === previewChipId
+    ));
+    if (!hasChip && !hasImage) setPreviewChipId(null);
+  }, [draftChips, previewChipId, promptImageMarkerRanges]);
   const canStartFresh = status === 'inactive' && !effectiveStopping && !sessionId && !!runtime.startFresh && !busyAction;
   const canResume = status === 'inactive' && !effectiveStopping && !!sessionId && (runtime.toolType !== 'claude' || resumeMaterialized === true) && !busyAction;
   const canStartOrResume = canStartFresh || canResume;
@@ -5321,10 +5527,36 @@ function AgentHistoryControls({
       && !busyAction);
   const visibleDraftWarning = draftWarning || derivedDraftWarning;
   const draftNoticeMeta = visibleDraftWarning ? getDraftNoticeMeta(visibleDraftWarning) : null;
+  // Attachment problems are NOT terminal status. Sitting next to the terminal
+  // icon and the agent lifecycle, an image warning reads as "the terminal
+  // broke"; it also stayed pinned there long after the user moved on. Image
+  // notices are announced once as a toast instead, and the status row keeps
+  // only agent state. Non-image draft notices (locked input, restored prompt)
+  // remain inline — they describe the field the user is looking at.
+  const isImageDraftNotice = draftNoticeMeta?.label === 'Image needs attention'
+    || draftNoticeMeta?.label === 'Attaching image';
+  // "Saving image attachment…" is PROGRESS, not a problem: it appears for the
+  // fraction of a second between the paste and the file landing on disk, and it
+  // clears itself. Announcing it as a warning toast put an orange ⚠ in the
+  // corner of a perfectly normal paste — the exact false alarm the user hit.
+  const isImageProgressNotice = draftNoticeMeta?.label === 'Attaching image';
+  const inlineDraftNoticeMeta = isImageDraftNotice ? null : draftNoticeMeta;
+  const announcedImageNoticeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!isImageDraftNotice || isImageProgressNotice || !visibleDraftWarning) {
+      announcedImageNoticeRef.current = null;
+      return;
+    }
+    // One toast per distinct message: the derived warning recomputes on every
+    // keystroke, and re-announcing it would spam the corner while typing.
+    if (announcedImageNoticeRef.current === visibleDraftWarning) return;
+    announcedImageNoticeRef.current = visibleDraftWarning;
+    useUIStore.getState().showToast(visibleDraftWarning, 'warning', 5000);
+  }, [isImageDraftNotice, isImageProgressNotice, visibleDraftWarning]);
 
   useLayoutEffect(() => {
     const ownerId = availabilityOwnerRef.current;
-    if (!overlayComposer) {
+    if (!agentInputSurface) {
       setHistoryComposerAvailability(tabId, null, ownerId);
       return;
     }
@@ -5350,7 +5582,7 @@ function AgentHistoryControls({
     canInterruptTurn,
     canSend,
     canStopProcess,
-    overlayComposer,
+    agentInputSurface,
     processLifecycleGeneration,
     setHistoryComposerAvailability,
     status,
@@ -5363,7 +5595,12 @@ function AgentHistoryControls({
   }, [setHistoryComposerAvailability, tabId]);
 
   useEffect(() => {
-    if (!overlayComposer || terminalOpen || pendingQuestion || !canInterruptTurn) return;
+    // A shown terminal owns Escape only while it is the surface the user types
+    // into. In terminal-primary it is always shown, yet the typing happens in
+    // this side panel — gating on terminalOpen alone would kill Escape there
+    // for good.
+    const terminalOwnsEscape = terminalOpen && !terminalIsPrimary;
+    if (!agentInputSurface || terminalOwnsEscape || pendingQuestion || !canInterruptTurn) return;
     const interruptOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
       // Menus/search/modals own Escape first. Their capture handlers normally
@@ -5388,7 +5625,7 @@ function AgentHistoryControls({
     // surface claimed it.
     window.addEventListener('keydown', interruptOnEscape);
     return () => window.removeEventListener('keydown', interruptOnEscape);
-  }, [canInterruptTurn, overlayComposer, pendingQuestion, runAction, tabId, terminalOpen]);
+  }, [canInterruptTurn, agentInputSurface, pendingQuestion, runAction, tabId, terminalOpen, terminalIsPrimary]);
 
   useEffect(() => {
     const insertIntoComposer = (event: Event) => {
@@ -5462,11 +5699,202 @@ function AgentHistoryControls({
     return () => window.removeEventListener('history-panel:composer-insert', insertIntoComposer);
   }, [effectiveStopping, isCancellingTurn, rewindLocked, setHistoryPromptDraft, setPrompt, tabId]);
 
+  // Clipboard export is one authoring-level operation for both attachment
+  // families. Images leave as portable absolute paths; a complete Pasted
+  // Content anchor expands to its exact hidden body. Doing both in one source-
+  // range pass prevents a literal `[Image #1]` inside the hidden paste body
+  // from accidentally consuming a visible attachment.
+  const handleComposerImageAwareCopy = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const element = event.currentTarget;
+    const start = element.selectionStart ?? 0;
+    const end = element.selectionEnd ?? 0;
+    if (start === end) return;
+    const result = buildComposerClipboardText({
+      text: element.value,
+      selectionStart: start,
+      selectionEnd: end,
+      chips: draftChips,
+      imagePaths: draftImages,
+    });
+    if (!result.handled) return;
+    event.preventDefault();
+    if (event.type === 'cut' && !(isCancellingTurn || rewindLocked || effectiveStopping)) {
+      const nextText = element.value.slice(0, start) + element.value.slice(end);
+      setPrompt(nextText, {
+        images: retainHistoryDraftImages(
+          nextText,
+          useUIStore.getState().historyPromptDraftImages[tabId] || [],
+        ),
+        chips: retainPasteChipsForText(
+          nextText,
+          useUIStore.getState().historyPromptDraftChips[tabId] || [],
+        ) as HistoryPromptDraftChip[],
+      });
+      promptCaretRef.current = { start, end: start };
+    }
+    clipboard.writeText(result.text);
+    if (result.imagePartial > 0 || result.imageMissing > 0) {
+      setDraftWarning('Image marker is damaged or has no matching attachment. An imageError marker was copied instead.');
+    } else if (result.pasteMissing > 0) {
+      setDraftWarning('Pasted Content marker has no matching stored text. A pasteError marker was copied instead.');
+    }
+    console.log('[' + runtime.logPrefix + ':clipboard] composer-export tab=' + tabId.slice(-12)
+      + ' type=' + event.type
+      + ' images=' + result.imageResolved
+      + ' imageMissing=' + result.imageMissing
+      + ' imagePartial=' + result.imagePartial
+      + ' pastes=' + result.pasteExpanded
+      + ' pasteMissing=' + result.pasteMissing);
+  }, [draftChips, draftImages, effectiveStopping, isCancellingTurn, rewindLocked, runtime.logPrefix, setPrompt, tabId]);
+
   const handleComposerImagePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const hasImageItem = Array.from(event.clipboardData?.items || [])
       .some((item) => item.kind === 'file' && item.type.toLowerCase().startsWith('image/'));
     if (!hasImageItem) {
       const pastedText = event.clipboardData?.getData('text/plain') || '';
+      const portableMarkers = collectPortableImagePathMarkers(pastedText);
+      if (portableMarkers.length > 0) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (isCancellingTurn || rewindLocked || effectiveStopping) {
+          setDraftWarning('History input is temporarily locked');
+          return;
+        }
+
+        const actionTabId = tabId;
+        const element = event.currentTarget;
+        const current = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
+        if (current.includes(HISTORY_IMAGE_PENDING_MARKER)) {
+          setDraftWarning('Wait for the current image to finish saving.');
+          return;
+        }
+        const start = Math.max(0, Math.min(element.selectionStart ?? current.length, current.length));
+        const end = Math.max(start, Math.min(element.selectionEnd ?? start, current.length));
+        const currentImages = useUIStore.getState().historyPromptDraftImages[actionTabId] || [];
+        const currentChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
+        const pendingText = current.slice(0, start) + HISTORY_IMAGE_PENDING_MARKER + current.slice(end);
+        const pendingChips = retainPasteChipsForText(pendingText, currentChips) as HistoryPromptDraftChip[];
+        setHistoryPromptDraft(actionTabId, pendingText, {
+          images: retainHistoryDraftImages(pendingText, currentImages),
+          chips: pendingChips,
+        });
+        const pendingCaret = start + HISTORY_IMAGE_PENDING_MARKER.length;
+        promptCaretRef.current = { start: pendingCaret, end: pendingCaret };
+        requestAnimationFrame(() => {
+          const textarea = promptTextareaRef.current;
+          if (!textarea || textarea.getAttribute('data-history-composer-tab-id') !== actionTabId) return;
+          textarea.focus();
+          textarea.setSelectionRange(pendingCaret, pendingCaret);
+        });
+
+        console.log('[' + runtime.logPrefix + ':images] path-import start tab=' + actionTabId.slice(-12)
+          + ' markers=' + portableMarkers.length);
+        void ipcRenderer.invoke('prompt-queue:materialize-image-refs', {
+          refs: portableMarkers.map((marker) => ({
+            id: marker.id,
+            path: marker.path,
+            size: 0,
+          })),
+        }).then((materialized: { refs?: HistoryPromptDraftImageRef[] }) => {
+          const latest = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
+          const tokenStart = latest.indexOf(HISTORY_IMAGE_PENDING_MARKER);
+          if (tokenStart < 0) {
+            console.log('[' + runtime.logPrefix + ':images] path-import dropped tab=' + actionTabId.slice(-12)
+              + ' reason=pending-marker-removed');
+            return;
+          }
+          const sourceSnapshot = buildPortableImageImportSnapshot(pastedText, materialized?.refs || []);
+          const snapshot = collapsePortableImageImportSnapshot({
+            ...sourceSnapshot,
+            threshold: aiComposerChipThreshold,
+            createChipId: () => createComposerChipId('paste'),
+          });
+          const currentRefs = useUIStore.getState().historyPromptDraftImages[actionTabId] || [];
+          const imageInsertion = insertPromptImageAttachments({
+            text: latest,
+            imagePaths: currentRefs,
+            start: tokenStart,
+            end: tokenStart + HISTORY_IMAGE_PENDING_MARKER.length,
+            insertedText: snapshot.text,
+            insertedImagePaths: snapshot.imagePaths,
+          });
+          if (imageInsertion.missingSourceIds.length > 0) {
+            throw new Error('portable_image_identity_missing');
+          }
+          const remappedInsertedText = imageInsertion.text.slice(tokenStart, imageInsertion.caret);
+          const composerInsertion = insertComposerSnapshotAtSelection({
+            text: latest,
+            chips: useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
+            insertedText: remappedInsertedText,
+            insertedChips: snapshot.chips,
+            selectionStart: tokenStart,
+            selectionEnd: tokenStart + HISTORY_IMAGE_PENDING_MARKER.length,
+          });
+          setHistoryPromptDraft(actionTabId, composerInsertion.text, {
+            images: retainHistoryDraftImages(composerInsertion.text, imageInsertion.imagePaths),
+            chips: composerInsertion.chips,
+          });
+          if (tabIdRef.current === actionTabId) {
+            setDraftWarning(sourceSnapshot.missing > 0
+              ? 'One or more image files are unavailable. Missing paths were replaced with imageError.'
+              : null);
+          }
+          console.log('[' + runtime.logPrefix + ':images] path-import ready tab=' + actionTabId.slice(-12)
+            + ' imported=' + sourceSnapshot.imported
+            + ' missing=' + sourceSnapshot.missing
+            + ' pasteChips=' + snapshot.chips.length);
+
+          const textarea = promptTextareaRef.current;
+          const preserveSelection = textarea?.isFocused() === true
+            && textarea?.getAttribute('data-history-composer-tab-id') === actionTabId;
+          if (preserveSelection) {
+            const selectionStart = textarea?.selectionStart ?? pendingCaret;
+            const selectionEnd = textarea?.selectionEnd ?? selectionStart;
+            const remappedSelection = remapPromptImageSelectionAfterReplacement({
+              selectionStart,
+              selectionEnd,
+              replacedStart: tokenStart,
+              replacedEnd: tokenStart + HISTORY_IMAGE_PENDING_MARKER.length,
+              insertionCaret: composerInsertion.caret,
+            });
+            promptCaretRef.current = remappedSelection;
+            requestAnimationFrame(() => {
+              const currentTextarea = promptTextareaRef.current;
+              if (!currentTextarea?.isFocused()) return;
+              currentTextarea.setSelectionRange(remappedSelection.start, remappedSelection.end);
+            });
+          }
+        }).catch((cause: any) => {
+          const latest = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
+          if (!latest.includes(HISTORY_IMAGE_PENDING_MARKER)) return;
+          const failedText = latest.replace(
+            HISTORY_IMAGE_PENDING_MARKER,
+            '[imageError: portable_image_import_failed]',
+          );
+          setHistoryPromptDraft(actionTabId, failedText, {
+            images: retainHistoryDraftImages(
+              failedText,
+              useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
+            ),
+            chips: retainPasteChipsForText(
+              failedText,
+              useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
+            ) as HistoryPromptDraftChip[],
+          });
+          if (tabIdRef.current === actionTabId) {
+            setDraftWarning('Could not import the image paths. Missing paths were replaced with imageError.');
+          }
+          console.warn('[' + runtime.logPrefix + ':images] path-import failed tab=' + actionTabId.slice(-12)
+            + ' error=' + String(cause?.message || cause));
+        });
+        return;
+      }
+      // Dictated speech is not an attachment. It is what the user just said and
+      // wants to keep editing, so collapsing it into a chip hides their own
+      // words behind a click — length is the wrong signal here. Voice Record
+      // marks its clipboard payload, and a marked paste always goes in as plain
+      // text regardless of size.
+      if (isDictationClipboardPayload(event.clipboardData)) return;
       if (!shouldCreatePasteChip(pastedText, aiComposerChipThreshold)) return;
       event.preventDefault();
       event.stopPropagation();
@@ -5478,7 +5906,6 @@ function AgentHistoryControls({
       const currentText = useUIStore.getState().historyPromptDrafts[tabId] || '';
       const start = Math.max(0, Math.min(element.selectionStart ?? currentText.length, currentText.length));
       const end = Math.max(start, Math.min(element.selectionEnd ?? start, currentText.length));
-      const nextText = currentText.slice(0, start) + currentText.slice(end);
       const currentChips = useUIStore.getState().historyPromptDraftChips[tabId] || [];
       const chip: HistoryPromptDraftChip = {
         id: createComposerChipId('paste'),
@@ -5487,19 +5914,33 @@ function AgentHistoryControls({
         label: 'Вставка',
         createdAt: Date.now(),
       };
-      setHistoryPromptDraft(tabId, nextText, {
+      // The blob lands AT THE CARET as an inline marker, so the sentence keeps
+      // reading `текст [Pasted Content N chars] ещё текст`. Previously the text
+      // was only cut and the chip appeared on a strip above the field, which
+      // detached it from the place the user pasted into.
+      const marker = buildPasteChipMarker(chip);
+      const insertion = insertComposerSnapshotAtSelection({
+        text: currentText,
+        chips: currentChips,
+        insertedText: marker,
+        insertedChips: [chip],
+        selectionStart: start,
+        selectionEnd: end,
+      });
+      setHistoryPromptDraft(tabId, insertion.text, {
         images: retainHistoryDraftImages(
-          nextText,
+          insertion.text,
           useUIStore.getState().historyPromptDraftImages[tabId] || [],
         ),
-        chips: [...currentChips, chip],
+        chips: insertion.chips,
       });
-      promptCaretRef.current = { start, end: start };
+      const caretAfterMarker = insertion.caret;
+      promptCaretRef.current = { start: caretAfterMarker, end: caretAfterMarker };
       requestAnimationFrame(() => {
         const textarea = promptTextareaRef.current;
         if (!textarea) return;
         textarea.focus();
-        textarea.setSelectionRange(start, start);
+        textarea.setSelectionRange(caretAfterMarker, caretAfterMarker);
       });
       return;
     }
@@ -5522,11 +5963,15 @@ function AgentHistoryControls({
     const end = Math.max(start, Math.min(element.selectionEnd ?? start, current.length));
     const pendingText = current.slice(0, start) + HISTORY_IMAGE_PENDING_MARKER + current.slice(end);
     const currentImages = useUIStore.getState().historyPromptDraftImages[actionTabId] || [];
+    const currentChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
+    const pendingChips = retainPasteChipsForText(pendingText, currentChips) as HistoryPromptDraftChip[];
     setHistoryPromptDraft(actionTabId, pendingText, {
       images: retainHistoryDraftImages(pendingText, currentImages),
-      preserveChips: true,
+      chips: pendingChips,
     });
-    setDraftWarning('Saving image attachment…');
+    // Saving normally takes a fraction of a second. Do not turn that normal
+    // progress into a warning-looking status; only actual failures surface.
+    setDraftWarning(null);
     const pendingCaret = start + HISTORY_IMAGE_PENDING_MARKER.length;
     promptCaretRef.current = { start: pendingCaret, end: pendingCaret };
     requestAnimationFrame(() => {
@@ -5546,7 +5991,7 @@ function AgentHistoryControls({
           return;
         }
         const textarea = promptTextareaRef.current;
-        const preserveSelection = document.activeElement === textarea
+        const preserveSelection = textarea?.isFocused() === true
           && textarea?.getAttribute('data-history-composer-tab-id') === actionTabId;
         const selectionStart = preserveSelection ? (textarea?.selectionStart ?? 0) : 0;
         const selectionEnd = preserveSelection ? (textarea?.selectionEnd ?? selectionStart) : 0;
@@ -5561,7 +6006,10 @@ function AgentHistoryControls({
               failedText,
               useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
             ),
-            preserveChips: true,
+            chips: retainPasteChipsForText(
+              failedText,
+              useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
+            ) as HistoryPromptDraftChip[],
           });
           if (tabIdRef.current === actionTabId) {
             setDraftWarning('Could not save the clipboard image. Copy it again and retry.');
@@ -5584,7 +6032,10 @@ function AgentHistoryControls({
         }
         setHistoryPromptDraft(actionTabId, insertion.text, {
           images: insertion.imagePaths,
-          preserveChips: true,
+          chips: retainPasteChipsForText(
+            insertion.text,
+            useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
+          ) as HistoryPromptDraftChip[],
         });
         if (tabIdRef.current === actionTabId) setDraftWarning(null);
         console.log('[' + runtime.logPrefix + ':images] clipboard-save ready tab=' + actionTabId.slice(-12)
@@ -5604,7 +6055,7 @@ function AgentHistoryControls({
           promptCaretRef.current = remappedSelection;
           requestAnimationFrame(() => {
             const currentTextarea = promptTextareaRef.current;
-            if (!currentTextarea || document.activeElement !== currentTextarea) return;
+            if (!currentTextarea?.isFocused()) return;
             currentTextarea.setSelectionRange(remappedSelection.start, remappedSelection.end);
           });
         }
@@ -5622,7 +6073,10 @@ function AgentHistoryControls({
             failedText,
             useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
           ),
-          preserveChips: true,
+          chips: retainPasteChipsForText(
+            failedText,
+            useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
+          ) as HistoryPromptDraftChip[],
         });
         if (tabIdRef.current === actionTabId) {
           setDraftWarning('Could not save the clipboard image. Copy it again and retry.');
@@ -5640,10 +6094,10 @@ function AgentHistoryControls({
     const currentText = useUIStore.getState().historyPromptDrafts[tabId] || '';
     const textarea = promptTextareaRef.current;
     const saved = promptCaretRef.current;
-    const selectionStart = document.activeElement === textarea
+    const selectionStart = textarea?.isFocused()
       ? (textarea?.selectionStart ?? saved.start)
       : saved.start;
-    const selectionEnd = document.activeElement === textarea
+    const selectionEnd = textarea?.isFocused()
       ? (textarea?.selectionEnd ?? saved.end)
       : saved.end;
     const restored = restoreComposerChipToText({
@@ -5677,16 +6131,130 @@ function AgentHistoryControls({
     requestAnimationFrame(() => promptTextareaRef.current?.focus());
   }, [removeHistoryPromptDraftChip, tabId]);
 
+  // Anchor-scoped operations. Unlike the old strip actions these replace the
+  // marker WHERE IT SITS, so the paste returns to (or disappears from) the exact
+  // spot in the sentence the user put it in.
+  const replacePasteAnchor = useCallback((
+    chip: HistoryPromptDraftChip,
+    replacement: string,
+  ) => {
+    if (isCancellingTurn || rewindLocked || effectiveStopping) {
+      setDraftWarning('History input is temporarily locked');
+      return;
+    }
+    const currentText = useUIStore.getState().historyPromptDrafts[tabId] || '';
+    const currentChips = useUIStore.getState().historyPromptDraftChips[tabId] || [];
+    const range = (getPasteMarkerHighlightRanges(currentText, currentChips) as Array<{
+      start: number; end: number; id: string;
+    }>).find((item) => item.id === chip.id);
+    if (!range) return;
+    const nextText = currentText.slice(0, range.start) + replacement + currentText.slice(range.end);
+    setHistoryPromptDraft(tabId, nextText, {
+      images: retainHistoryDraftImages(
+        nextText,
+        useUIStore.getState().historyPromptDraftImages[tabId] || [],
+      ),
+      chips: currentChips.filter((item) => item.id !== chip.id),
+    });
+    setPreviewChipId((current) => current === chip.id ? null : current);
+    const caret = range.start + replacement.length;
+    promptCaretRef.current = { start: caret, end: caret };
+    requestAnimationFrame(() => {
+      const textarea = promptTextareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(caret, caret);
+    });
+  }, [effectiveStopping, isCancellingTurn, rewindLocked, setHistoryPromptDraft, tabId]);
+
+  const openPasteChipContextMenu = useCallback((
+    chip: HistoryPromptDraftChip,
+    _range: { start: number; end: number; id: string },
+  ) => {
+    ipcRenderer.send('show-paste-chip-context-menu', {
+      chipId: chip.id,
+      chars: (chip.text || '').length,
+      preview: chip.text || '',
+    });
+  }, []);
+
+  useEffect(() => {
+    const onMenuAction = (_event: unknown, payload: { chipId?: string; action?: string }) => {
+      const chip = (useUIStore.getState().historyPromptDraftChips[tabId] || [])
+        .find((item) => item.id === payload?.chipId);
+      if (!chip) return;
+      if (payload.action === 'preview') {
+        setPreviewChipId((current) => current === chip.id ? null : chip.id);
+        return;
+      }
+      if (payload.action === 'restore') {
+        replacePasteAnchor(chip, chip.text || '');
+        return;
+      }
+      if (payload.action === 'discard') replacePasteAnchor(chip, '');
+    };
+    ipcRenderer.on('paste-chip-menu-action', onMenuAction);
+    return () => { ipcRenderer.removeListener('paste-chip-menu-action', onMenuAction); };
+  }, [replacePasteAnchor, tabId]);
+
+  // The top line above the input carries PROMPTS only. A pasted blob is part of
+  // what you are writing, not a saved prompt you picked — its place is inline in
+  // the field, the way a terminal shows `[Pasted Content N chars]`. Mixing both
+  // kinds in one strip made the row read as "attachments" and pushed the actual
+  // prompt labels out of view on narrow widths.
   const composerSurfaceChips = useMemo<AIComposerSurfaceChip[]>(
-    () => draftChips.map((chip) => ({
+    () => draftChips
+      .filter((chip) => chip.kind === 'prompt')
+      .map((chip) => ({
+        id: chip.id,
+        kind: chip.kind,
+        label: chip.label || 'PROMPT',
+        text: chip.text,
+        onRestore: () => restoreChipToComposer(chip),
+        onDiscard: () => discardComposerChip(chip.id),
+      })),
+    [discardComposerChip, draftChips, restoreChipToComposer],
+  );
+  const composerInlinePasteChips = useMemo(
+    () => draftChips.filter((chip) => chip.kind === 'paste'),
+    [draftChips],
+  );
+  // Same chips, in the shape the surface needs to host their expanded preview.
+  const composerInlinePasteChipsForPreview = useMemo<AIComposerSurfaceChip[]>(
+    () => composerInlinePasteChips.map((chip) => ({
       id: chip.id,
       kind: chip.kind,
-      label: chip.kind === 'prompt' ? (chip.label || 'PROMPT') : 'ВСТАВКА',
+      label: 'ВСТАВКА',
       text: chip.text,
-      onRestore: () => restoreChipToComposer(chip),
-      onDiscard: () => discardComposerChip(chip.id),
     })),
-    [discardComposerChip, draftChips, restoreChipToComposer],
+    [composerInlinePasteChips],
+  );
+  const composerInlineImageChipsForPreview = useMemo<AIComposerSurfaceChip[]>(() => {
+    const refsById = new Map(draftImages.map((ref) => [Number(ref.id), ref]));
+    return promptImageMarkerRanges.map((range) => {
+      const id = `image:${range.id}:${range.start}`;
+      const ref = refsById.get(Number(range.id));
+      const selected = previewChipId === id;
+      const fileName = ref?.path?.split('/').filter(Boolean).pop() || `Image #${range.id}`;
+      return {
+        id,
+        kind: 'image',
+        label: `IMAGE #${range.id}`,
+        previewMeta: fileName,
+        expandedPreview: (
+          <AIComposerImagePreview
+            src={selected ? draftImageDetailPreview.url : undefined}
+            loading={selected && draftImageDetailPreview.loading}
+            error={selected ? draftImageDetailPreview.error : null}
+            alt={`Image attachment #${range.id}`}
+          />
+        ),
+      };
+    });
+  }, [draftImageDetailPreview, draftImages, previewChipId, promptImageMarkerRanges]);
+  const composerInlineChipsForPreview = useMemo(
+    () => [...composerInlinePasteChipsForPreview, ...composerInlineImageChipsForPreview],
+    [composerInlineImageChipsForPreview, composerInlinePasteChipsForPreview],
   );
 
   const basicStatusDescription: Record<AgentPtyStatus, string> = {
@@ -5709,6 +6277,12 @@ function AgentHistoryControls({
           description: rewindStatusMeta.description,
           accent: '#a78bfa',
         }
+      : isCompacting
+        ? {
+            title: 'COMPACTING',
+            description: runtime.label + ' is compacting the conversation context',
+            accent: '#a78bfa',
+          }
       : showUpdatingChip
         ? {
             title: 'UPDATING',
@@ -5788,6 +6362,10 @@ function AgentHistoryControls({
   // History owns PTY state, but the top line follows the SDK presentation:
   // one compact terminal/status affordance plus transient authoring notices.
   // Start/Resume/Send/Stop stay in the workspace control bar below the surface.
+  // The toggle always points at the SECONDARY surface, so its wording follows
+  // the layout: History-primary hides/opens the terminal, terminal-primary
+  // hides/opens the transcript. Same control, same "show me the other one".
+  const secondarySurfaceLabel = terminalIsPrimary ? 'History' : 'terminal';
   const historyComposerTopBar = (
     <div className="hp-history-composer-toolbar">
       <Tooltip
@@ -5798,7 +6376,7 @@ function AgentHistoryControls({
           statusDescription,
           statusDetail,
           onToggleTerminal
-            ? (terminalOpen ? 'Click to hide terminal' : 'Click to open terminal')
+            ? ((terminalOpen ? 'Click to hide ' : 'Click to open ') + secondarySurfaceLabel)
             : 'Click to copy status details',
           'Right-click to copy status details',
         ].filter(Boolean).join('\n')}
@@ -5806,8 +6384,11 @@ function AgentHistoryControls({
         <button
           type="button"
           data-agent-status-row
+          data-agent-operational-phase={isCompacting ? 'compacting' : undefined}
           data-terminal-toggle={onToggleTerminal ? 'status' : undefined}
-          aria-label={onToggleTerminal ? (terminalOpen ? 'Hide terminal' : 'Open terminal') : 'Copy agent status details'}
+          aria-label={onToggleTerminal
+            ? ((terminalOpen ? 'Hide ' : 'Open ') + secondarySurfaceLabel)
+            : 'Copy agent status details'}
           aria-pressed={onToggleTerminal ? !!terminalOpen : undefined}
           onClick={activateUnifiedStatus}
           onContextMenu={(event) => {
@@ -5839,9 +6420,10 @@ function AgentHistoryControls({
           ) : (
             <HistoryTerminalActivityIcon
               size={20}
-              busy={showBusyLoader}
+              busy={showBusyLoader || isCompacting}
               active={!!(terminalOpen && onToggleTerminal)}
               color={statusAccent}
+              surface={terminalIsPrimary ? 'history' : 'terminal'}
             />
           )}
           {showStatusText && (
@@ -5977,7 +6559,7 @@ function AgentHistoryControls({
         </span>
       )}
 
-      {visibleDraftWarning && !error && draftNoticeMeta && (
+      {visibleDraftWarning && !error && inlineDraftNoticeMeta && (
         <Tooltip content={visibleDraftWarning}>
           <div
             style={{
@@ -5989,18 +6571,18 @@ function AgentHistoryControls({
               height: 20,
               padding: '0 7px',
               borderRadius: 5,
-              border: '1px solid ' + (draftNoticeMeta.tone === 'info' ? 'rgba(113, 113, 122, 0.55)' : 'rgba(251, 191, 36, 0.45)'),
-              backgroundColor: draftNoticeMeta.tone === 'info' ? 'rgba(82, 82, 91, 0.18)' : 'rgba(217, 119, 6, 0.16)',
-              color: draftNoticeMeta.tone === 'info' ? '#d4d4d8' : '#fbbf24',
+              border: '1px solid ' + (inlineDraftNoticeMeta.tone === 'info' ? 'rgba(113, 113, 122, 0.55)' : 'rgba(251, 191, 36, 0.45)'),
+              backgroundColor: inlineDraftNoticeMeta.tone === 'info' ? 'rgba(82, 82, 91, 0.18)' : 'rgba(217, 119, 6, 0.16)',
+              color: inlineDraftNoticeMeta.tone === 'info' ? '#d4d4d8' : '#fbbf24',
               fontSize: aiSecondaryFontSize,
               fontWeight: 650,
               letterSpacing: 0,
               flexShrink: 1,
             }}
           >
-            {draftNoticeMeta.tone !== 'info' && <AlertTriangle size={12} style={{ flexShrink: 0 }} />}
+            {inlineDraftNoticeMeta.tone !== 'info' && <AlertTriangle size={12} style={{ flexShrink: 0 }} />}
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {draftNoticeMeta.label}
+              {inlineDraftNoticeMeta.label}
             </span>
           </div>
         </Tooltip>
@@ -6034,8 +6616,57 @@ function AgentHistoryControls({
           </div>
         </Tooltip>
       )}
+
     </div>
   );
+
+  // Swap sits at the FAR end of the composer top line, opposite the terminal
+  // control, so the two never read as one cluster: the left icon shows and
+  // hides the terminal, this one changes which surface owns the center. Amber
+  // when active — the pin controls already own violet.
+  const historyComposerTopBarTrailing = onSwapPrimarySurface ? (
+    <ControlHint
+      label={terminalIsPrimary
+        ? 'Вернуть историю как основную поверхность'
+        : 'Сделать терминал основной поверхностью'}
+      shortcut="⌘["
+      side="top"
+    >
+      <button
+        type="button"
+        data-history-swap-primary
+        data-active={terminalIsPrimary ? '1' : '0'}
+        aria-label={terminalIsPrimary ? 'Make History the main surface' : 'Make terminal the main surface'}
+        aria-pressed={terminalIsPrimary}
+        onMouseDown={(event) => {
+          // Keep the caret and selection in the composer while the surrounding
+          // layout changes shape.
+          event.preventDefault();
+        }}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onSwapPrimarySurface();
+        }}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 22,
+          height: 20,
+          padding: 0,
+          borderRadius: 5,
+          border: terminalIsPrimary ? '1px solid rgba(217, 119, 6, 0.45)' : '1px solid transparent',
+          background: terminalIsPrimary ? 'rgba(217, 119, 6, 0.16)' : 'transparent',
+          color: terminalIsPrimary ? '#fbbf24' : '#8b8b92',
+          cursor: 'pointer',
+          flexShrink: 0,
+        }}
+      >
+        <ArrowLeftRight size={14} strokeWidth={2} />
+      </button>
+    </ControlHint>
+  ) : undefined;
 
   return (
     <div
@@ -6075,7 +6706,9 @@ function AgentHistoryControls({
           density="comfortable"
           className="hp-history-composer-frame"
           topBar={historyComposerTopBar}
+          topBarTrailing={historyComposerTopBarTrailing}
           chips={composerSurfaceChips}
+          externalExpandableChips={composerInlineChipsForPreview}
           expandedChipId={previewChipId}
           onExpandedChipChange={setPreviewChipId}
           secondaryFontSize={aiSecondaryFontSize}
@@ -6089,34 +6722,7 @@ function AgentHistoryControls({
                 backgroundColor: isCancellingTurn || rewindLocked || effectiveStopping ? '#130f0a' : '#0f0f0f',
               }}
             >
-              {hasPromptImageMarkup && (
-                <div
-                  ref={promptHighlightRef}
-                  className="hp-agent-prompt-highlight"
-                  aria-hidden="true"
-                  style={{
-                    position: 'absolute',
-                    inset: 0,
-                    zIndex: 0,
-                    overflowX: 'hidden',
-                    overflowY: 'scroll',
-                    scrollbarGutter: 'stable',
-                    pointerEvents: 'none',
-                    boxSizing: 'border-box',
-                    padding: '7px 8px',
-                    color: isCancellingTurn || rewindLocked || effectiveStopping ? '#c7c7c7' : '#e5e5e5',
-                    fontSize: historyComposerFontSize,
-                    lineHeight: 1.35,
-                    fontFamily: 'inherit',
-                    whiteSpace: 'pre-wrap',
-                    overflowWrap: 'break-word',
-                    wordBreak: 'break-word',
-                  }}
-                >
-                  {renderHistoryPromptHighlight(prompt, promptImageMarkerRanges, true)}
-                </div>
-              )}
-              <textarea
+              <ComposerEditor
                 ref={promptTextareaRef}
                 className="hp-agent-prompt"
                 data-history-composer-tab-id={tabId}
@@ -6125,30 +6731,33 @@ function AgentHistoryControls({
                   ? 'history-terminal-only-hint-' + tabId
                   : undefined}
                 value={prompt}
-                onChange={(e) => {
+                tokens={promptComposerTokens}
+                fontSize={historyComposerFontSize}
+                onChange={(nextText, selection) => {
                   if (isCancellingTurn || rewindLocked) return;
-                  const nextText = e.target.value;
                   promptCaretRef.current = {
-                    start: e.target.selectionStart ?? nextText.length,
-                    end: e.target.selectionEnd ?? nextText.length,
+                    start: selection.start,
+                    end: selection.end,
                   };
                   setPrompt(nextText, {
                     images: retainHistoryDraftImages(
                       nextText,
                       useUIStore.getState().historyPromptDraftImages[tabId] || [],
                     ),
-                    preserveChips: true,
+                    // Deleting the anchor deletes the blob. Backspace over the
+                    // marker is the natural way to drop a paste, and keeping the
+                    // chip would smuggle its body into the sent prompt.
+                    chips: retainPasteChipsForText(
+                      nextText,
+                      useUIStore.getState().historyPromptDraftChips[tabId] || [],
+                    ) as HistoryPromptDraftChip[],
                   });
                   if (draftWarning) setDraftWarning(null);
                   if (error) setError(null);
                 }}
+                onCopy={handleComposerImageAwareCopy}
+                onCut={handleComposerImageAwareCopy}
                 onPaste={handleComposerImagePaste}
-                onScroll={(e) => {
-                  const highlight = promptHighlightRef.current;
-                  if (!highlight) return;
-                  highlight.scrollTop = e.currentTarget.scrollTop;
-                  highlight.scrollLeft = e.currentTarget.scrollLeft;
-                }}
                 onKeyDown={(e) => {
                   if (isPlainTextPasteShortcut(e)) {
                     e.preventDefault();
@@ -6222,15 +6831,50 @@ function AgentHistoryControls({
                   e.preventDefault();
                   if (canSend) runAction('send');
                 }}
-                onSelect={(event) => {
+                onSelectionChange={(selection) => {
                   promptCaretRef.current = {
-                    start: event.currentTarget.selectionStart ?? 0,
-                    end: event.currentTarget.selectionEnd ?? 0,
+                    start: selection.start,
+                    end: selection.end,
                   };
+                }}
+                onTokenClick={(token) => {
+                  if (token.kind === 'image') {
+                    setPreviewChipId((current) => current === token.id ? null : token.id);
+                    return true;
+                  }
+                  if (token.kind === 'paste') {
+                    const chipId = token.id.slice('paste:'.length);
+                    setPreviewChipId((current) => current === chipId ? null : chipId);
+                    return true;
+                  }
+                  return false;
+                }}
+                onTokenContextMenu={(token) => {
+                  if (token.kind !== 'paste') return false;
+                  const chipId = token.id.slice('paste:'.length);
+                  const range = promptPasteMarkerRanges.find((item) => item.id === chipId);
+                  const chip = draftChips.find((item) => item.id === chipId);
+                  if (!range || !chip) return false;
+                  openPasteChipContextMenu(chip, range);
+                  return true;
                 }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                  // Raw/revealed paste source still uses the field menu; a
+                  // rendered chip handles the same action through
+                  // onTokenContextMenu above.
+                  const caret = e.currentTarget.selectionStart ?? -1;
+                  const hitRange = caret >= 0
+                    ? promptPasteMarkerRanges.find((range) => caret >= range.start && caret <= range.end)
+                    : undefined;
+                  const hitChip = hitRange
+                    ? draftChips.find((chip) => chip.id === hitRange.id)
+                    : undefined;
+                  if (hitChip) {
+                    openPasteChipContextMenu(hitChip, hitRange!);
+                    return;
+                  }
                   window.dispatchEvent(new CustomEvent('history-panel:open-insert-menu', {
                     detail: {
                       tabId,
@@ -6242,7 +6886,6 @@ function AgentHistoryControls({
                 }}
                 placeholder={rewindLocked ? rewindStatusMeta?.placeholder || 'Rewinding... input is locked' : isCancellingTurn || effectiveStopping ? 'Stopping...' : status === 'inactive' ? 'Enter запускает ' + runtime.label + ' и отправляет' : status === 'starting' ? 'Запускаю терминал…' : 'Send a prompt...'}
                 readOnly={isCancellingTurn || rewindLocked || effectiveStopping}
-                rows={1}
                 style={{
                   position: 'relative',
                   zIndex: 1,
@@ -6250,7 +6893,6 @@ function AgentHistoryControls({
                   width: '100%',
                   minWidth: 0,
                   boxSizing: 'border-box',
-                  resize: 'none',
                   overflowY: 'hidden',
                   scrollbarGutter: 'stable',
                   maxHeight: historyComposerMaxHeight,
@@ -6258,30 +6900,27 @@ function AgentHistoryControls({
                   backgroundColor: 'transparent',
                   border: 0,
                   borderRadius: 8,
-                  color: hasPromptImageMarkup
-                    ? 'transparent'
-                    : (isCancellingTurn || rewindLocked || effectiveStopping ? '#c7c7c7' : '#e5e5e5'),
-                  WebkitTextFillColor: hasPromptImageMarkup ? 'transparent' : undefined,
+                  color: isCancellingTurn || rewindLocked || effectiveStopping ? '#c7c7c7' : '#e5e5e5',
                   caretColor: isCancellingTurn || rewindLocked || effectiveStopping ? '#c7c7c7' : '#e5e5e5',
                   outline: 'none',
-                  padding: '7px 8px',
-                  fontSize: historyComposerFontSize,
                   lineHeight: 1.35,
                   fontFamily: 'inherit',
                   overflowWrap: 'break-word',
                   wordBreak: 'break-word',
                 }}
-                onFocus={(e) => {
+                onFocus={() => {
                   setPromptQueueInputSurface(tabId, 'history');
+                  const editor = promptTextareaRef.current;
                   promptCaretRef.current = {
-                    start: e.currentTarget.selectionStart ?? 0,
-                    end: e.currentTarget.selectionEnd ?? 0,
+                    start: editor?.selectionStart ?? 0,
+                    end: editor?.selectionEnd ?? 0,
                   };
                 }}
-                onBlur={(e) => {
+                onBlur={() => {
+                  const editor = promptTextareaRef.current;
                   promptCaretRef.current = {
-                    start: e.currentTarget.selectionStart ?? 0,
-                    end: e.currentTarget.selectionEnd ?? 0,
+                    start: editor?.selectionStart ?? 0,
+                    end: editor?.selectionEnd ?? 0,
                   };
                 }}
               />
@@ -6316,12 +6955,31 @@ function HistoryPanel({
   embeddedFill = false,
   previewMode = false,
   mainSurface = false,
+  agentSidePanel = false,
+  composerPortalHostId,
+  onSwapPrimarySurface,
+  terminalIsPrimary = false,
   projectId,
   terminalOpen = false,
   onToggleTerminal,
   lifecycleStatus,
   onControlsHeightChange,
 }: HistoryPanelProps) {
+  // Live input surface of the tab in BOTH agent layouts. Everything that makes
+  // History the place the user types into — availability published to grab /
+  // dictation / task plan, Escape-interrupt — keys off this, not off geometry.
+  const agentInputSurface = mainSurface || agentSidePanel;
+  // Docked-composer host. Looked up from the DOM because the host belongs to the
+  // workspace column, not to this subtree; state (not a ref) so the portal
+  // renders as soon as the host exists.
+  const [composerHostEl, setComposerHostEl] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!composerPortalHostId) {
+      setComposerHostEl(null);
+      return;
+    }
+    setComposerHostEl(document.getElementById(composerPortalHostId));
+  }, [composerPortalHostId]);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
   const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
@@ -6450,7 +7108,14 @@ function HistoryPanel({
     () => new Map(),
   );
   const [loading, setLoading] = useState(() => !firstRenderSnapshot);
+  const [compactOperationalPhase, setCompactOperationalPhase] = useState<CompactOperationalPhase | null>(null);
   const [presentedOwnerKey, setPresentedOwnerKey] = useState(historyOwnerKey);
+  // Owner whose rows have been read from disk at least once in this mount.
+  // Distinct from `presentedOwnerKey`, which only means "this owner is on
+  // screen" and is satisfied by a cache hit. Liveness claims (background
+  // chips) need the stronger fact, because a cache written while an agent was
+  // still running keeps describing it as running after it finished.
+  const [chipsFreshOwnerKey, setChipsFreshOwnerKey] = useState('');
   // Nobody is "already presented" before a frame exists — including a first
   // render seeded from the snapshot cache. Marking the warm owner ready here
   // pre-answered the paint proof and reopened the blank-frame hole from the
@@ -6680,15 +7345,37 @@ function HistoryPanel({
   // availability the controls already publish (status: active/busy/starting
   // = agent process alive) — Codex in-process subagents outlive their spawn
   // turn but never their host process.
+  // NO RECORD ≠ DEAD PROCESS. The availability record is deleted on every
+  // rebind of the composer to a tab, so defaulting the missing case to
+  // `inactive` asserted "the process ended" at the exact moment we knew
+  // nothing at all. Falling back to `unknown` keeps the last established
+  // answer instead (see the fold below); a genuine `inactive` still arrives
+  // as a real status and still clears.
   const agentProcessStatus = useUIStore(
-    (s) => s.historyComposerAvailability[tabId]?.status || 'inactive',
+    (s) => s.historyComposerAvailability[tabId]?.status || 'unknown',
   );
   const agentProcessGeneration = useUIStore(
     (s) => s.historyComposerAvailability[tabId]?.lifecycleGeneration || null,
   );
-  const agentProcessAlive = agentProcessStatus === 'active'
-    || agentProcessStatus === 'busy'
-    || agentProcessStatus === 'starting';
+  // `unknown` is "not established yet", NOT "dead". It appears on every
+  // tab-bind, before presence re-confirms the process a few hundred ms later.
+  // Folding it into "dead" made a running agent's chip blink out and back on
+  // each switch to the tab (E2E 2026-07-29 caught the flip:
+  // active→unknown→active gave count=1 → 0 → 1 with the agent working the
+  // whole time). Liveness lookup is three-valued — found / absent / unknown —
+  // and only a POSITIVE absence may clear confirmed state; uncertainty holds
+  // the last answer. `inactive` is a real negative and still clears.
+  // Last ESTABLISHED answer per tab. Keyed by tab because the panel is
+  // persistent-mounted and shared by every tab — a single slot would carry
+  // one tab's liveness onto the next one on switch.
+  const agentProcessAliveByTabRef = useRef<Map<string, boolean>>(new Map());
+  const agentProcessAlive = useMemo(() => {
+    const known = agentProcessAliveByTabRef.current;
+    const previous = known.get(tabId) ?? false;
+    const alive = foldHistoryAgentProcessLiveness(agentProcessStatus, previous);
+    if (agentProcessStatus !== 'unknown') known.set(tabId, alive);
+    return alive;
+  }, [agentProcessStatus, tabId]);
   // Chips must see the SAME rows the transcript shows, durable + live. A Codex
   // subagent is durable only after the rollout is re-read, but its spawn is
   // already on screen through the live stream — computing chips from durable
@@ -6706,15 +7393,54 @@ function HistoryPanel({
       : buildHistoryLivePresentation(entries, chipLiveEntries) as FullHistoryEntry[]),
     [entries, chipLiveEntries],
   );
+  // Chips belong to the tab whose rows they were computed from.
+  //
+  // `entries` is component state and deliberately survives a tab switch until
+  // the new owner's rows are loaded and handed off. During that window the
+  // panel is already bound to tab B while still holding tab A's rows — so
+  // computing chips unconditionally publishes A's running agent under B's
+  // tabId. E2E 2026-07-29 caught exactly that: `tab=g-tab-900372 count=1
+  // keys=subagent:task:toolu_01QdKj…`, the SAME spawn id that belonged to
+  // tab-900371, ~112 ms long. Short enough to miss on screenshots, long
+  // enough to light the loader on a tab that has no agent at all.
+  //
+  // The owner handoff is already tracked for the transcript; the chip strip
+  // must respect the same boundary rather than race it. Until the presented
+  // owner catches up, this tab has no proven rows and therefore no chips —
+  // "not established yet", never a claim about another tab's work.
+  //
+  // Returning to a tab adds a second, subtler stale window: the cached rows
+  // paint instantly while the fresh read is still in flight, and a cache
+  // written BEFORE the agent finished still describes it as running. E2E
+  // 2026-07-29 measured that blip 8 seconds after the agent had actually
+  // completed — count=0 → 1 → 0 across a single LOAD_APPLY, i.e. the strip
+  // briefly resurrected finished work. A stale cache may paint the
+  // transcript (rows are rows), but it must not assert that something is
+  // ALIVE: liveness claims wait for rows this owner has actually loaded.
+  //
+  // But "wait for the disk read" is only the right answer for CACHED rows.
+  // Production 2026-07-31 05:01: switching to a tab with three working agents
+  // showed an empty strip for 1930 ms — the whole duration of the refresh read
+  // — because the gate also suppressed rows arriving on the LIVE stream. Those
+  // rows cannot be stale by construction: they were produced after this owner
+  // was bound, describe work happening right now, and are exactly what the
+  // durable read will later confirm. Live rows therefore establish this owner
+  // for liveness on their own; only the cached-rows path keeps waiting.
+  const chipsLiveOwnerProven = chipLiveEntries.length > 0;
+  const chipsOwnerSettled = presentedOwnerKey === historyOwnerKey
+    && (chipsFreshOwnerKey === historyOwnerKey || chipsLiveOwnerProven);
   const backgroundHistoryChips = useMemo(
-    () => collectHistoryBackgroundChips(
-      chipSourceEntries,
-      isTurnBusy,
-      agentProcessAlive,
-      sessionId || '',
-      agentProcessGeneration,
-    ),
-    [chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration],
+    () => (chipsOwnerSettled
+      ? collectHistoryBackgroundChips(
+        chipSourceEntries,
+        isTurnBusy,
+        agentProcessAlive,
+        sessionId || '',
+        agentProcessGeneration,
+        toolType,
+      )
+      : EMPTY_HISTORY_CHIPS),
+    [chipsOwnerSettled, chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration, toolType],
   );
   const liveBackgroundUuids = useMemo(
     () => new Set(backgroundHistoryChips.map((chip) => chip.entryUuid)),
@@ -6728,29 +7454,58 @@ function HistoryPanel({
   const backgroundChipsDigest = backgroundHistoryChips
     .map((chip) => chip.kind + ':' + chip.key)
     .join(',');
+  // The TAB LOADER means "an agent is working here", not "something is
+  // running here". A `run_in_background` Bash command stays visible in the
+  // strip above the composer — the user can still see and open it — but it
+  // must not spin the tab, or a long-running shell reads as an active agent
+  // from the tab list. Only subagent chips are broadcast outward.
+  const backgroundAgentChipCount = useMemo(
+    () => backgroundHistoryChips.filter((chip) => chip.kind === 'subagent').length,
+    [backgroundHistoryChips],
+  );
   useEffect(() => {
+    // `count` is the STRIP (subagents + background Bash). `agents` is what
+    // actually drives the tab loader. Printing only the first number made two
+    // E2E runs read a visible Bash chip as "the loader is spinning", and a
+    // handoff-empty strip as "the agent died" — both wrong, and both because
+    // the trace conflated two different questions. `owner` says whether this
+    // tab is allowed to make liveness claims at all right now.
     historyDiag('BACKGROUND_CHIPS tab=' + tabId.slice(-12)
       + ' count=' + backgroundHistoryChips.length
+      + ' agents=' + backgroundAgentChipCount
+      + ' owner=' + (chipsOwnerSettled ? 'settled' : 'handoff')
+      // Which fact established the owner: rows read from disk, or the live
+      // stream while that read is still in flight.
+      + ' ownerVia=' + (chipsFreshOwnerKey === historyOwnerKey
+        ? 'durable'
+        : chipsLiveOwnerProven ? 'live' : 'none')
       + ' turnBusy=' + (isTurnBusy ? '1' : '0')
       + ' processAlive=' + (agentProcessAlive ? '1' : '0')
       + ' processGeneration=' + (agentProcessGeneration || '-')
       + ' keys=' + (backgroundChipsDigest || '-'));
-  }, [tabId, backgroundChipsDigest, backgroundHistoryChips.length, isTurnBusy, agentProcessAlive, agentProcessGeneration]);
+  }, [tabId, backgroundChipsDigest, backgroundHistoryChips.length, backgroundAgentChipCount, chipsOwnerSettled, chipsFreshOwnerKey, chipsLiveOwnerProven, historyOwnerKey, isTurnBusy, agentProcessAlive, agentProcessGeneration]);
   // Tab-level loader inheritance: a Codex subagent can outlive its spawn
   // turn, so the tab must keep spinning while any background chip is live
   // even though the parent turn's busy flag is already false. Broadcast the
   // live count; TabBar folds it into the shimmer (display-only — lifecycle
   // busy ownership stays with the runtime signals).
   useEffect(() => {
+    // Publish only what this tab actually owns. While the owner handoff is in
+    // flight the strip is empty by construction (see chipsOwnerSettled), and
+    // broadcasting that emptiness would read as "the agent stopped" — the
+    // loader would blink off on every switch. Silence during the handoff means
+    // "no new answer"; TabBar keeps the last one until this tab can speak for
+    // itself again.
+    if (!chipsOwnerSettled) return;
     window.dispatchEvent(new CustomEvent('history-panel:background-work', {
-      detail: { tabId, count: backgroundHistoryChips.length },
+      detail: { tabId, count: backgroundAgentChipCount },
     }));
     // No zeroing on unmount: the count is now owned by the main-process
     // watcher (`tab:background-work`), which sees every tab whether or not its
     // History is open. Publishing 0 here used to erase a still-running agent
     // the moment the user switched away — the tab looked idle until clicked
     // back, which is exactly how a live agent stayed invisible.
-  }, [tabId, backgroundHistoryChips.length]);
+  }, [chipsOwnerSettled, tabId, backgroundAgentChipCount]);
   const [expandedBackgroundChipKey, setExpandedBackgroundChipKey] = useState<string | null>(null);
   // Auto-close the pane when its chip finishes (mirrors the SDK bar).
   useEffect(() => {
@@ -7176,6 +7931,11 @@ function HistoryPanel({
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!isOpen) return;
       if (e.metaKey && e.key === 'f') {
+        // Cmd+F follows the CENTER surface: whichever one the user is looking
+        // at owns find. In terminal-primary that is the terminal, so this
+        // panel keeps its own search behind the header button instead of
+        // stealing the shortcut from the surface filling the window.
+        if (terminalIsPrimary) return;
         if (mainSurface && terminalOpen) return;
         e.preventDefault();
         e.stopPropagation();
@@ -7191,7 +7951,7 @@ function HistoryPanel({
     };
     window.addEventListener('keydown', handleKeyDown, true); // capture phase
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [isOpen, mainSurface, searchOpen, terminalOpen]);
+  }, [isOpen, mainSurface, searchOpen, terminalOpen, terminalIsPrimary]);
 
   const openSearch = useCallback(() => {
     setSearchOpen(true);
@@ -7205,8 +7965,11 @@ function HistoryPanel({
   }, []);
 
   useEffect(() => {
-    if (mainSurface && terminalOpen && searchOpen) closeSearch();
-  }, [closeSearch, mainSurface, searchOpen, terminalOpen]);
+    // Opening the floating terminal hands find over to it — but in
+    // terminal-primary the terminal is permanently shown, and closing this
+    // panel's search on that basis would make it impossible to keep open.
+    if (mainSurface && terminalOpen && !terminalIsPrimary && searchOpen) closeSearch();
+  }, [closeSearch, mainSurface, searchOpen, terminalOpen, terminalIsPrimary]);
 
   // Explicit jump-to-bottom helper. First let Virtuoso materialize/measure the
   // final transcript row, then include the composer spacer in the final pixel
@@ -7563,6 +8326,61 @@ function HistoryPanel({
     toolType,
     updateLocalPromptEntry,
   ]);
+
+  useEffect(() => {
+    let disposed = false;
+    let eventRevision = 0;
+    const settleOperationHandoff = (operation: CompactOperationalPhase) => {
+      if (!operation.handoffId) return;
+      removeLocalPromptEntry(
+        operation.handoffId,
+        'compact-' + (operation.outcome || 'unknown'),
+      );
+      consumeHistoryPromptHandoff(tabId, operation.handoffId);
+    };
+    const applyOperation = (operation: CompactOperationalPhase | null | undefined) => {
+      if (!operation || operation.tabId !== tabId || operation.provider !== toolType) return;
+      if (operation.active && operation.phase === 'compacting') {
+        setCompactOperationalPhase(operation);
+        return;
+      }
+      settleOperationHandoff(operation);
+      setCompactOperationalPhase((current) => (
+        !current || current.operationId === operation.operationId ? null : current
+      ));
+    };
+    const handleOperationalPhase = (_event: unknown, operation: CompactOperationalPhase) => {
+      eventRevision += 1;
+      applyOperation(operation);
+    };
+
+    setCompactOperationalPhase(null);
+    ipcRenderer.on('agent:operational-phase', handleOperationalPhase);
+    const revisionAtRequest = eventRevision;
+    void ipcRenderer.invoke('agent:get-operational-phase', {
+      tabId,
+      provider: toolType,
+    }).then((snapshot: {
+      active?: CompactOperationalPhase | null;
+      settled?: CompactOperationalPhase[];
+    }) => {
+      if (disposed) return;
+      for (const operation of snapshot?.settled || []) settleOperationHandoff(operation);
+      // An event delivered while the snapshot request was in flight is newer
+      // than that snapshot and must not be overwritten by its late response.
+      if (eventRevision === revisionAtRequest) {
+        setCompactOperationalPhase(snapshot?.active || null);
+      }
+    }).catch((error: unknown) => {
+      console.warn('[HistoryCompactPhase] snapshot failed tab=' + tabId.slice(-12)
+        + ' provider=' + toolType
+        + ' error=' + (error instanceof Error ? error.message : String(error)));
+    });
+    return () => {
+      disposed = true;
+      ipcRenderer.removeListener('agent:operational-phase', handleOperationalPhase);
+    };
+  }, [removeLocalPromptEntry, tabId, toolType]);
 
   const hasDurablePrompt = useCallback((text: string, submittedAt: number) => (
     serverHasPromptEntry(
@@ -8036,6 +8854,9 @@ function HistoryPanel({
             ' rawEntries=' + rawServerEntries.length +
             ' visibleEntries=' + newEntries.length +
             ' cacheStored=' + (cacheResult.stored ? '1' : '0'));
+          // These rows came from disk, so liveness claims about them are now
+          // allowed for this owner (see chipsOwnerSettled).
+          setChipsFreshOwnerKey(historyOwnerKey);
           // startTransition: React 19 yields to browser between chunks,
           // keeping spinner animation smooth during heavy DOM renders
           startTransition(() => {
@@ -8086,6 +8907,7 @@ function HistoryPanel({
             ' rawEntries=' + rawServerEntries.length +
             ' visibleEntries=' + serverEntries.length +
             ' cacheStored=' + (cacheResult.stored ? '1' : '0'));
+          setChipsFreshOwnerKey(historyOwnerKey);
         }
         return true;
       }
@@ -9636,10 +10458,74 @@ function HistoryPanel({
     closePanel();
   }, [closePanel]);
 
+  // Single composer for the tab, rendered either inside the panel (History
+  // primary) or into the docked host below the terminal (terminal primary).
+  // Built once as a node so both placements share identical props — two
+  // separately mounted composers would split the draft in half.
+  const composerNode = enableClaudePtyControls && (toolType === 'claude' || toolType === 'codex') ? (
+    <AgentHistoryControls
+      tabId={tabId}
+      sessionId={sessionId}
+      cwd={cwd}
+      projectId={projectId}
+      toolType={toolType as AgentHistoryTool}
+      onHistoryRefresh={(reason) => {
+        const settlesTurn = reason?.startsWith('busy-false:')
+          || reason === 'command-finished';
+        if (settlesTurn) {
+          return flushLiveHistoryToDurable(
+            'history-controls:' + reason,
+            historyOwnerKey,
+          );
+        }
+        return loadHistory(true);
+      }}
+      onPromptSubmitted={appendLocalPromptEntry}
+      onPromptStatusChange={updateLocalPromptEntry}
+      hasDurablePrompt={hasDurablePrompt}
+      rewindLocked={rewindLocked}
+      rewindPhase={activeRewindOperation?.phase}
+      rewindMessage={activeRewindOperation?.message}
+      rewindPreviewActive={!!rewindPreview}
+      rewindPreviewHiddenCount={rewindPreviewHiddenCount}
+      terminalOpen={terminalOpen}
+      onToggleTerminal={onToggleTerminal}
+      onSwapPrimarySurface={onSwapPrimarySurface}
+      terminalIsPrimary={terminalIsPrimary}
+      lifecycleStatus={lifecycleStatus}
+      operationalPhase={compactOperationalPhase}
+      onHeightChange={handleControlsHeightChange}
+      // Overlay geometry belongs to the centered layout only; docked below the
+      // terminal the composer is a normal bottom row of the workspace column.
+      overlayComposer={mainSurface}
+      agentInputSurface={agentInputSurface}
+    />
+  ) : null;
+
+  // No session id can mean three different things. Only one of them is real
+  // waiting: the agent process is currently starting. A stopped fresh tab is
+  // waiting for the USER to choose an agent, while a ready process with no id
+  // is waiting for the first prompt to materialize its history file. Showing
+  // the same spinner for all three made an idle screen look stuck.
+  const unboundAgentName = toolType === 'codex' ? 'Codex' : 'Claude';
+  const unboundAgentStarting = !sessionId && (
+    agentProcessStatus === 'starting'
+    || (lifecycleStatus?.tabId === tabId && lifecycleStatus.kind === 'starting')
+  );
+  const unboundAgentStopped = !sessionId
+    && !unboundAgentStarting
+    && agentProcessStatus === 'inactive';
+
   const panel = (
     <div
       ref={panelRef}
       data-history-main={mainSurface ? '1' : undefined}
+      // Observable open/geometry state: "the panel is off-screen" and "the
+      // panel was never told to open" look identical in a screenshot, and the
+      // side-panel layout has two independent inputs (per-tab open flag and
+      // the slide animation). Both are published so a test can tell them apart.
+      data-history-open={isOpen ? '1' : '0'}
+      data-history-slide={slideIn ? '1' : '0'}
       data-history-owner={historyOwnerDomId}
       data-history-session={sessionId || undefined}
       data-history-viewport-ready={
@@ -9837,20 +10723,32 @@ function HistoryPanel({
           </div>
         ) : transcriptEntries.length === 0 ? (
           !sessionId && (toolType === 'claude' || toolType === 'codex') ? (
-            // The tab has an agent but no confirmed history file yet
-            // (session binding lost across a restart, or writer proof still
-            // pending). The old bare "No history entries" here read as a
-            // silent gray screen — the loader hides on reason=no-session and
-            // nothing explained the wait.
-            <div style={{
+            <div
+              data-history-empty-state={unboundAgentStarting
+                ? 'starting-agent'
+                : unboundAgentStopped
+                  ? 'awaiting-agent-start'
+                  : 'awaiting-first-message'}
+              style={{
               display: 'flex', flexDirection: 'column', alignItems: 'center',
               justifyContent: 'center', height: '100%', color: '#777',
               fontSize: 13, gap: 8, textAlign: 'center', padding: '0 24px',
-            }}>
-              <HistorySpinner size={14} />
-              <div>Файл истории ещё не подтверждён</div>
+              }}
+            >
+              {unboundAgentStarting && <HistorySpinner size={14} />}
+              <div>
+                {unboundAgentStarting
+                  ? `Запускаем ${unboundAgentName}…`
+                  : unboundAgentStopped
+                    ? 'Запустите Claude или Codex'
+                    : 'История пока пуста'}
+              </div>
               <div style={{ fontSize: 11, color: '#555' }}>
-                История появится, когда приложение свяжет вкладку с сессией — обычно после первого сообщения или Resume.
+                {unboundAgentStarting
+                  ? 'История появится после первого сообщения.'
+                  : unboundAgentStopped
+                    ? 'Выберите агента внизу, чтобы начать новую сессию.'
+                    : 'Отправьте первое сообщение — после него появится история сессии.'}
               </div>
             </div>
           ) : (
@@ -10217,60 +11115,27 @@ function HistoryPanel({
         </ControlHint>
       </div>
 
-      {enableClaudePtyControls && (toolType === 'claude' || toolType === 'codex') && (
-        <AgentHistoryControls
-          tabId={tabId}
-          sessionId={sessionId}
-          cwd={cwd}
-          projectId={projectId}
-          toolType={toolType as AgentHistoryTool}
-          onHistoryRefresh={(reason) => {
-            const settlesTurn = reason?.startsWith('busy-false:')
-              || reason === 'command-finished';
-            if (settlesTurn) {
-              return flushLiveHistoryToDurable(
-                'history-controls:' + reason,
-                historyOwnerKey,
-              );
-            }
-            return loadHistory(true);
-          }}
-          onPromptSubmitted={appendLocalPromptEntry}
-          onPromptStatusChange={updateLocalPromptEntry}
-          hasDurablePrompt={hasDurablePrompt}
-          rewindLocked={rewindLocked}
-          rewindPhase={activeRewindOperation?.phase}
-          rewindMessage={activeRewindOperation?.message}
-          rewindPreviewActive={!!rewindPreview}
-          rewindPreviewHiddenCount={rewindPreviewHiddenCount}
-          terminalOpen={terminalOpen}
-          onToggleTerminal={onToggleTerminal}
-          lifecycleStatus={lifecycleStatus}
-          onHeightChange={handleControlsHeightChange}
-          overlayComposer={mainSurface}
-        />
-      )}
+      {composerNode && !composerPortalHostId && composerNode}
     </div>
   );
 
-  if (embedded) return panel;
+  // Docked below the terminal in terminal-primary. The host is a workspace-level
+  // element, so the composer keeps its identity (one mount, one draft) while the
+  // transcript above it moves to the side panel.
+  const dockedComposer = composerNode && composerPortalHostId && composerHostEl
+    ? createPortal(composerNode, composerHostEl)
+    : null;
 
+  if (embedded) return <>{panel}{dockedComposer}</>;
+
+  // Unpinned History floats above the terminal WITHOUT a backdrop and without
+  // click-outside close: it is a parallel working surface, not a modal. Dimming
+  // the terminal and dismissing the panel on the next click made every glance
+  // at the terminal cost a reopen. Closing stays explicit — Cmd+] or the ×.
   return (
     <>
-      {/* Backdrop overlay — covers terminal area only, click to close */}
-      <div
-        onClick={closePanel}
-        style={{
-          position: 'absolute',
-          top: 0, left: 0, bottom: 0,
-          right: width,
-          backgroundColor: 'rgba(0, 0, 0, 0.3)',
-          opacity: slideIn ? 1 : 0,
-          transition: 'opacity 50ms ease-out',
-          zIndex: 100,
-        }}
-      />
       {panel}
+      {dockedComposer}
     </>
   );
 }

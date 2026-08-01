@@ -22,7 +22,33 @@ function extractQueuedCommandPromptText(prompt) {
   return '';
 }
 
+function isClaudeTaskNotificationCarrier(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+
+  if (entry.type === 'attachment' && entry?.attachment?.type === 'queued_command') {
+    const text = extractQueuedCommandPromptText(entry.attachment.prompt).trimStart();
+    return entry.attachment.commandMode === 'task-notification'
+      || text.startsWith('<task-notification>');
+  }
+
+  if (entry.type !== 'user') return false;
+  const content = entry.message?.content;
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.find((item) => item?.type === 'text' && typeof item.text === 'string')?.text
+      : '';
+  return String(text || '').trimStart().startsWith('<task-notification>');
+}
+
 function extractClaudePromptCarrier(entry) {
+  // Claude's own async Agent/Task completion is persisted in the same
+  // queued_command envelope as a real user message, but it is not a new user
+  // intent.  The assistant records that follow it continue the turn which
+  // launched that exact tool.  Treating this service carrier as a prompt
+  // splits one orchestration result into several fake turns and leaves the
+  // originating run permanently "incomplete" even after end_turn.
+  if (isClaudeTaskNotificationCarrier(entry)) return null;
   if (entry?.type === 'attachment' && entry?.attachment?.type === 'queued_command') {
     const text = extractQueuedCommandPromptText(entry.attachment.prompt).trim();
     if (!text) return null;
@@ -95,34 +121,55 @@ function findMatchingClaudePromptTurn({
   turns,
   recordMap,
   promptHash,
+  promptUserUuid,
   requestedAt,
   resultAfterAt,
+  resultBeforeAt,
 }) {
   const latestAfter = Number(resultAfterAt) > 0 ? Number(resultAfterAt) : 0;
+  const upperBound = Number(resultBeforeAt) > 0 ? Number(resultBeforeAt) : 0;
   const lowerBound = latestAfter
     || (Number(requestedAt) > 0 ? Number(requestedAt) - 5 * 60 * 1000 : 0);
   const rows = Array.isArray(turns) ? turns : [];
+
+  // A prompt audit UUID is the durable identity of the exact external turn.
+  // Never fall back to same-text matching when that proof exists: a missing UUID
+  // means the exact turn has not materialized in this snapshot yet.
+  if (promptUserUuid) {
+    const turnIndex = rows.findIndex((turn) => (
+      (turn?.kind === 'user' || turn?.kind === 'queued_command')
+      && turn.userUuid === promptUserUuid
+    ));
+    return turnIndex >= 0 ? { turn: rows[turnIndex], turnIndex } : null;
+  }
+
+  const hashMatches = [];
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const turn = rows[index];
     if ((turn?.kind !== 'user' && turn?.kind !== 'queued_command') || !turn.userUuid) continue;
     const timestampMs = Date.parse(turn.userTimestamp || '');
+    if ((lowerBound || upperBound) && !Number.isFinite(timestampMs)) continue;
     if (lowerBound && Number.isFinite(timestampMs) && timestampMs < lowerBound) continue;
+    if (upperBound && Number.isFinite(timestampMs) && timestampMs > upperBound) continue;
     if (latestAfter) {
       if (!Array.isArray(turn.assistantUuids) || turn.assistantUuids.length === 0) continue;
     } else {
       const record = recordMap?.get?.(turn.userUuid);
       const carrier = extractClaudePromptCarrier(record);
       if (!carrier?.text || promptFingerprint(carrier.text) !== promptHash) continue;
+      hashMatches.push({ turn, turnIndex: index });
+      continue;
     }
     return { turn, turnIndex: index };
   }
-  return null;
+  return hashMatches.length === 1 ? hashMatches[0] : null;
 }
 
 module.exports = {
   extractClaudePromptCarrier,
   extractQueuedCommandPromptText,
   findMatchingClaudePromptTurn,
+  isClaudeTaskNotificationCarrier,
   promptFingerprint,
   selectClaudeQueuedPromptIndex,
 };

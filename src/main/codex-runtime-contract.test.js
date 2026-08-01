@@ -7,6 +7,7 @@ const {
   attachCodexSettingsProofOwner,
   codexLiveSlashAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
+  classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,
@@ -234,6 +235,35 @@ test('Codex launch admission returns pending instead of inventing process accept
     sessionId: null,
     resumeSourceSessionId: 'source-session',
     writerConfirmed: false,
+  });
+});
+
+test('pending Codex launch admission clears preparation without inventing rejection', () => {
+  assert.deepEqual(classifyCodexLaunchPreparationResult({
+    success: true,
+    accepted: null,
+    acceptancePending: true,
+  }), {
+    accepted: true,
+    reason: 'launch-pending',
+    error: null,
+  });
+  assert.deepEqual(classifyCodexLaunchPreparationResult({
+    success: true,
+    accepted: true,
+  }), {
+    accepted: true,
+    reason: 'launch-accepted',
+    error: null,
+  });
+  assert.deepEqual(classifyCodexLaunchPreparationResult({
+    success: false,
+    accepted: false,
+    error: 'shell_busy',
+  }), {
+    accepted: false,
+    reason: 'launch-rejected',
+    error: 'shell_busy',
   });
 });
 
@@ -637,6 +667,7 @@ test('verified fresh-composer settings become owned by the first writer of that 
       model: 'gpt-5.6-sol',
       effort: 'max',
       proofAt: 1234,
+      fast: true,
     },
     nextPending: null,
   });
@@ -726,6 +757,35 @@ test('Resume/Fork source settings proof transfers only to the first exact launch
     launchId: 'different-launch',
     writerSessionId: 'different-child-writer',
   }).carry, false);
+});
+
+test('projected launch settings keep Fast unknown when source proof has no service tier', () => {
+  const terminalToken = {};
+  const pending = createPendingCodexSettingsProofHandoff({
+    result: {
+      success: true,
+      applied: true,
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      applicationProofSource: 'resume-source-jsonl',
+      codexSettingsProofSessionId: null,
+    },
+    terminalToken,
+    runSeq: 21,
+    launchId: 'resume-launch-21',
+  });
+
+  assert.deepEqual(projectPendingCodexSettingsProofOwner(pending, {
+    terminalToken,
+    runSeq: 21,
+  }), {
+    ownerId: 'launch:resume-launch-21',
+    launchId: 'resume-launch-21',
+    model: 'gpt-5.6-sol',
+    effort: 'high',
+    proofAt: pending.proofAt,
+    applicationProofSource: 'resume-source-jsonl',
+  });
 });
 
 test('fresh picker proof is one-generation only and never comes from an unproven picker result', () => {

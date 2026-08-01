@@ -68,3 +68,122 @@ test('duplicate open joins the same generation gate', () => {
   const second = registry.open('tab-a', 'launch-1');
   assert.equal(second, first);
 });
+
+test('a redraw after the prompt invalidates its lease and requires a fresh prompt frame', async () => {
+  const registry = createClaudePromptStabilityRegistry();
+  registry.open('tab-a', 'launch-1');
+  registry.markStable('tab-a', 'launch-1', 'first-prompt');
+  const first = await registry.wait('tab-a', 'launch-1');
+  assert.equal(registry.validate('tab-a', 'launch-1', first.lease).valid, true);
+
+  registry.markActivity('tab-a', 'launch-1', 'restored-notification-redraw');
+  assert.deepEqual(
+    registry.validate('tab-a', 'launch-1', first.lease),
+    { valid: false, reason: 'claude-prompt-frame-changed' },
+  );
+
+  let released = false;
+  const nextWait = registry.wait('tab-a', 'launch-1').then((value) => {
+    released = true;
+    return value;
+  });
+  await Promise.resolve();
+  assert.equal(released, false);
+
+  registry.markStable('tab-a', 'launch-1', 'prompt-after-restoration');
+  const second = await nextWait;
+  assert.equal(second.ready, true);
+  assert.equal(second.reason, 'prompt-after-restoration');
+  assert.equal(registry.validate('tab-a', 'launch-1', second.lease).valid, true);
+  assert.notEqual(second.lease.promptEpoch, first.lease.promptEpoch);
+});
+
+test('busy start invalidates the lease and busy end alone never authorizes startup input', async () => {
+  const registry = createClaudePromptStabilityRegistry();
+  registry.open('tab-a', 'launch-1');
+  registry.markStable('tab-a', 'launch-1', 'first-prompt');
+  const first = await registry.wait('tab-a', 'launch-1');
+
+  registry.markBusy('tab-a', 'launch-1', true, 'restored-user-turn');
+  assert.deepEqual(
+    registry.validate('tab-a', 'launch-1', first.lease, { allowFrameAdvance: true }),
+    { valid: false, reason: 'claude-turn-busy' },
+  );
+  registry.markBusy('tab-a', 'launch-1', false, 'restored-turn-stop');
+  assert.deepEqual(
+    registry.validate('tab-a', 'launch-1', first.lease, { allowFrameAdvance: true }),
+    { valid: false, reason: 'claude-busy-generation-changed' },
+  );
+
+  let released = false;
+  const nextWait = registry.wait('tab-a', 'launch-1').then((value) => {
+    released = true;
+    return value;
+  });
+  await Promise.resolve();
+  assert.equal(released, false);
+  registry.markStable('tab-a', 'launch-1', 'fresh-prompt-after-stop');
+  const next = await nextWait;
+  assert.equal(registry.validate('tab-a', 'launch-1', next.lease).valid, true);
+});
+
+test('a prompt rendered while Claude is busy is observed but cannot release waiters', async () => {
+  const registry = createClaudePromptStabilityRegistry();
+  registry.open('tab-a', 'launch-1');
+  registry.markBusy('tab-a', 'launch-1', true, 'notification-start');
+  assert.equal(registry.markStable('tab-a', 'launch-1', 'busy-frame'), false);
+
+  let released = false;
+  const waiting = registry.wait('tab-a', 'launch-1').then((value) => {
+    released = true;
+    return value;
+  });
+  await Promise.resolve();
+  assert.equal(released, false);
+
+  registry.markBusy('tab-a', 'launch-1', false, 'notification-stop');
+  await Promise.resolve();
+  assert.equal(released, false);
+  registry.markStable('tab-a', 'launch-1', 'idle-current-prompt');
+  assert.equal((await waiting).ready, true);
+});
+
+test('multiple restored turns cannot reuse or shift an older prompt lease', async () => {
+  const registry = createClaudePromptStabilityRegistry();
+  registry.open('tab-a', 'launch-1');
+  registry.markStable('tab-a', 'launch-1', 'prompt-0');
+  const lease0 = (await registry.wait('tab-a', 'launch-1')).lease;
+
+  for (const suffix of ['a', 'b']) {
+    registry.markBusy('tab-a', 'launch-1', true, 'notification-' + suffix);
+    registry.markBusy('tab-a', 'launch-1', false, 'stop-' + suffix);
+    registry.markStable('tab-a', 'launch-1', 'prompt-' + suffix);
+  }
+  const latest = await registry.wait('tab-a', 'launch-1');
+  assert.equal(latest.reason, 'prompt-b');
+  assert.deepEqual(
+    registry.validate('tab-a', 'launch-1', lease0, { allowFrameAdvance: true }),
+    { valid: false, reason: 'claude-busy-generation-changed' },
+  );
+  assert.equal(
+    registry.validate('tab-a', 'launch-1', latest.lease, { allowFrameAdvance: true }).valid,
+    true,
+  );
+});
+
+test('frame advance can be admitted only by the caller that separately proves its pasted command', async () => {
+  const registry = createClaudePromptStabilityRegistry();
+  registry.open('tab-a', 'launch-1');
+  registry.markStable('tab-a', 'launch-1', 'idle-prompt');
+  const lease = (await registry.wait('tab-a', 'launch-1')).lease;
+
+  registry.markActivity('tab-a', 'launch-1', 'paste-redraw');
+  assert.deepEqual(
+    registry.validate('tab-a', 'launch-1', lease),
+    { valid: false, reason: 'claude-prompt-frame-changed' },
+  );
+  assert.deepEqual(
+    registry.validate('tab-a', 'launch-1', lease, { allowFrameAdvance: true }),
+    { valid: true, reason: 'claude-prompt-lease-current' },
+  );
+});

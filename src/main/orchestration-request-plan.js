@@ -64,6 +64,51 @@ function resolveOrchestrationSendOptions({
   };
 }
 
+function resolveOrchestrationDeliveryAdmission(status = {}) {
+  const lifecycle = status?.status || status?.sessionStatus || 'unknown';
+  const busy = status?.busy === true
+    || status?.turnBusy === true
+    || status?.isBusy === true
+    || lifecycle === 'busy';
+
+  if (busy) {
+    return {
+      canDispatch: false,
+      statusAtSend: lifecycle,
+      requiresRuntimeLaunch: false,
+      reason: 'target-not-idle:' + lifecycle,
+    };
+  }
+
+  if (lifecycle === 'inactive') {
+    return {
+      canDispatch: true,
+      statusAtSend: 'inactive',
+      requiresRuntimeLaunch: true,
+      reason: null,
+    };
+  }
+
+  if (lifecycle === 'active'
+    && status?.inputReady === true
+    && status?.starting !== true
+    && status?.stopping !== true) {
+    return {
+      canDispatch: true,
+      statusAtSend: 'active',
+      requiresRuntimeLaunch: false,
+      reason: null,
+    };
+  }
+
+  return {
+    canDispatch: false,
+    statusAtSend: lifecycle,
+    requiresRuntimeLaunch: false,
+    reason: 'target-not-idle:' + lifecycle,
+  };
+}
+
 function isAgentStatusBusyForClose(status) {
   const lifecycle = status?.status || status?.sessionStatus || 'unknown';
   return status?.busy === true
@@ -87,6 +132,7 @@ module.exports = {
   buildDelegationResultTarget,
   isAgentStatusBusyForClose,
   normalizePlacement,
+  resolveOrchestrationDeliveryAdmission,
   resolveNewAgentTabPlacement,
   resolveOrchestrationSendOptions,
 };

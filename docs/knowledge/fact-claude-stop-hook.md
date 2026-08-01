@@ -84,6 +84,10 @@ Headless test через `claude -p "Read 3 files and summarize"`:
 
 Минимальный node-скрипт: читает JSON со stdin, отправляет envelope в socket, exits с timeout 200ms. Fail-silent — если main не запущен (socket файла нет), всё равно exit 0 (Claude должен продолжить).
 
+Канонический исходник живёт в repo: `scripts/claude-hooks/noted-turn-event.js`; домашний файл — только runtime-копия. Установка выполняется `npm run install:claude-hook`: скрипт побайтно и атомарно синхронизирует runtime, сохраняет неизвестные поля `~/.claude/settings.json`, не дублирует регистрации и ничего не пишет в `/Applications`. Обычный `build:install` вызывает тот же установщик до замены app-копии. Hook запускается новым Node-процессом на каждое событие, поэтому замена уже зарегистрированного файла действует со следующего события; перезапуск Claude нужен только если менялась сама регистрация в settings.
+
+Только `UserPromptSubmit` переносит в локальном envelope точный `prompt`; `Stop` и tool-события этого поля не получают, а диагностический mirror никогда не пишет его содержимое. Main использует текст не как готовый result-proof, а чтобы найти ровно один уже отправленный pending audit и закрепить за ним identity начавшегося turn. Если одновременно ожидаются два одинаковых prompt с тем же hash+length, связь не угадывается: оба остаются без execution context с явным diagnostic. Последующий JSONL audit по-прежнему независимо распределяет durable user-записи oldest-first; его порядок нельзя использовать задним числом как доказательство владельца hook-события.
+
 ## Re-entrancy guard `stop_hook_active`
 
 В payload приходит `stop_hook_active: true` когда Stop hook уже исполняется. Наш скрипт не возвращает `{"decision": "block"}` — то есть никогда не заставляет Claude continue, поэтому re-entrancy не происходит. Поле просто пропускается в envelope.

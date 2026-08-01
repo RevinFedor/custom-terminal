@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
-import { useWorkspaceStore, isTabInterrupted } from './store/useWorkspaceStore';
+import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
 import { usePromptsStore } from './store/usePromptsStore';
@@ -592,6 +592,7 @@ const ProjectTabItem = memo(({
     <button
       ref={ref}
       data-workspace-navigation
+      data-project-navigation
       data-structured-project-drop-target
       data-project-id={projectId}
       className={`relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${
@@ -1075,6 +1076,29 @@ function App() {
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
   const [busyTabs, setBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> isBusy (Claude/Gemini thinking)
   const [pasteBusyTabs, setPasteBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> safePasteAndSubmit in flight
+  // Live turn-busy snapshot for close paths. Kept in a ref because the hotkey
+  // listener is registered once: reading the state directly would capture the
+  // map from the render that installed it and go stale mid-session.
+  const liveTurnBusyRef = useRef<{ busy: Map<string, boolean>; paste: Map<string, boolean> }>({
+    busy: new Map(),
+    paste: new Map(),
+  });
+  liveTurnBusyRef.current.busy = busyTabs;
+  liveTurnBusyRef.current.paste = pasteBusyTabs;
+  // One definition of "this tab is mid-answer" for Cmd+W and the context menu.
+  // Covers Claude/Gemini/Codex/SDK streaming plus an in-flight paste handoff;
+  // the tab's own stored fields miss the latter.
+  const readLiveTabTurnBusy = useCallback((tabId: string): boolean => {
+    const { busy, paste } = liveTurnBusyRef.current;
+    if (busy.get(tabId) === true || paste.get(tabId) === true) return true;
+    for (const workspace of useWorkspaceStore.getState().openProjects.values()) {
+      const tab: any = workspace.tabs.get(tabId);
+      if (!tab) continue;
+      return !!(tab.aiBusy || tab.claudeBusy
+        || tab.sdkState === 'fetching' || tab.sdkState === 'thinking' || tab.sdkState === 'tool_use');
+    }
+    return false;
+  }, []);
   const claudeSpinnerVisualIdleTimersRef = useRef<Map<string, number>>(new Map());
   // tabId -> awaiting (Claude blocked on AskUserQuestion, waiting for human answer).
   // Feeds the project-tab purple glow. Bracketed by claude:awaiting-input (main.js).
@@ -1484,15 +1508,41 @@ function App() {
           codexLiveEffort: undefined,
           codexLiveSettingsSessionId: undefined,
         });
+        useWorkspaceStore.getState().updateCodexLiveServiceTier(tabId, {
+          codexLiveServiceTier: undefined,
+          codexLiveServiceTierSessionId: undefined,
+          codexLiveServiceTierSource: undefined,
+        });
       }
     };
 
-    const handleCommandFinished = (_: any, { tabId }: { tabId: string }) => {
+    const handleCommandFinished = (
+      _: any,
+      { tabId, commandType }: { tabId: string; commandType?: string },
+    ) => {
       setProcessStatus(prev => {
         const next = new Map(prev);
         next.set(tabId, false);
         return next;
       });
+      const workspaceState = useWorkspaceStore.getState();
+      let codexTabFinished = commandType === 'codex';
+      if (!codexTabFinished) {
+        for (const [, workspace] of workspaceState.openProjects) {
+          const tab = workspace.tabs.get(tabId);
+          if (tab) {
+            codexTabFinished = tab.commandType === 'codex';
+            break;
+          }
+        }
+      }
+      if (codexTabFinished) {
+        workspaceState.updateCodexLiveState(tabId, {
+          codexLiveModel: undefined,
+          codexLiveEffort: undefined,
+          codexLiveSettingsSessionId: undefined,
+        });
+      }
     };
 
     // PTY exit → Claude CLI is dead
@@ -1686,7 +1736,7 @@ function App() {
       } as any);
     };
 
-    const handleMcpAiTab = (_: any, data: { tabId: string; engine: 'claude' | 'codex' | 'gemini'; sessionId?: string; reason?: string; writerProven?: boolean; writerProof?: string; previousSessionId?: string | null; writerGeneration?: string | null; carryCodexSettingsProof?: boolean; requiresExactCodexSettingsProof?: boolean; codexSettingsProof?: { model?: string; effort?: string; proofAt?: number } | null }) => {
+    const handleMcpAiTab = (_: any, data: { tabId: string; engine: 'claude' | 'codex' | 'gemini'; sessionId?: string; reason?: string; writerProven?: boolean; writerProof?: string; previousSessionId?: string | null; writerGeneration?: string | null; carryCodexSettingsProof?: boolean; requiresExactCodexSettingsProof?: boolean; codexSettingsProof?: { model?: string; effort?: string; proofAt?: number; fast?: boolean } | null }) => {
       if (!data?.tabId || !data?.engine) return;
       const store = useWorkspaceStore.getState();
       if (data.engine === 'codex') {
@@ -2435,7 +2485,7 @@ function App() {
           return reply(true, { projectId });
         }
         if (action === 'getSDKParams') {
-          const { tabId } = payload || {};
+          const { tabId, reason, authority } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           for (const ws of state.openProjects.values()) {
             const t = ws.tabs.get(tabId);
@@ -3125,6 +3175,34 @@ function App() {
           const tab = ws.tabs.get(tabId);
           return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
         }
+        if (action === 'restoreClosedAgentTab') {
+          const { projectId, historyId, expectedTabId } = payload || {};
+          if (!projectId || !Number.isFinite(Number(historyId)) || !expectedTabId) {
+            return reply(false, null, 'projectId+historyId+expectedTabId required');
+          }
+          const ws = await ensureProjectWorkspace(projectId);
+          if (!ws) return reply(false, null, 'project not open');
+          if (ws.tabs.has(expectedTabId)) {
+            return reply(true, { tabId: expectedTabId, projectId, alreadyOpen: true });
+          }
+          const restored = await useWorkspaceStore.getState().restoreTabHistoryEntry(
+            projectId,
+            Number(historyId),
+            {
+              background: true,
+              restorePosition: true,
+              // The shared send scenario owns resume/start. Auto-running a
+              // pending action here would create a second launch path.
+              resumePolicy: 'never',
+              expectedTabId,
+              requireExactCwd: true,
+            },
+          );
+          if (!restored.tabId || restored.tabId !== expectedTabId) {
+            return reply(false, restored, restored.message || restored.reason || 'closed tab restore failed');
+          }
+          return reply(true, { ...restored, projectId, restored: true });
+        }
         if (action === 'createAgentTab') {
           const {
             projectId,
@@ -3138,6 +3216,7 @@ function App() {
             background,
             visualParentTabId,
             afterTabId,
+            reservedTabId,
           } = payload || {};
           if (!projectId) return reply(false, null, 'projectId required');
           const agent: AgentHistoryTool = toolType === 'codex' ? 'codex' : 'claude';
@@ -3148,6 +3227,12 @@ function App() {
             : undefined;
           if (requestedVisualParentId && !ws.tabs.has(requestedVisualParentId)) {
             return reply(false, null, 'visual parent tab is not open in target project');
+          }
+          const requestedReservedTabId = typeof reservedTabId === 'string' && reservedTabId.trim()
+            ? reservedTabId.trim()
+            : undefined;
+          if (requestedReservedTabId && ws.tabs.has(requestedReservedTabId)) {
+            return reply(false, null, 'reserved target tab already exists');
           }
           const cwd = ws.projectPath && !ws.projectPath.startsWith('__unset__') ? ws.projectPath : undefined;
           const pendingAction: any = { type: agent === 'codex' ? 'codex-new' : 'claude-new' };
@@ -3166,6 +3251,7 @@ function App() {
             codexEffort: typeof codexEffort === 'string' ? codexEffort : undefined,
             externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
             background: background === true,
+            restoreId: requestedReservedTabId,
             ...(requestedVisualParentId
               ? {
                 afterTabId: typeof afterTabId === 'string' && afterTabId.trim()
@@ -3359,6 +3445,28 @@ function App() {
               error: 'tab_has_resumable_session',
             }, 'tab_has_resumable_session');
           }
+          if (toolType === 'claude' && sessionId) {
+            const materialization = await readClaudeMaterialization(tab);
+            if (materialization.conversationMaterialized === true) {
+              console.warn('[MobStart:Bridge] blocked resumable Claude tab=' + String(tabId).slice(-12)
+                + ' oldSession=' + String(sessionId).slice(0, 8));
+              return reply(false, {
+                tabId,
+                toolType,
+                sessionId,
+                success: false,
+                ok: false,
+                status: 'inactive',
+                inputReady: false,
+                conversationMaterialized: true,
+                canResume: true,
+                canCopySessionId: true,
+                timelineCount: materialization.timelineCount ?? null,
+                materializationReason: materialization.materializationReason || materialization.reason || 'timeline-has-entries',
+                error: 'tab_has_resumable_session',
+              }, 'tab_has_resumable_session');
+            }
+          }
           console.log('[MobStart:Bridge] startAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' oldSession=' + (sessionId ? String(sessionId).slice(0, 8) : 'none'));
           try {
             state.setTabCommandType(tabId, toolType);
@@ -3431,7 +3539,13 @@ function App() {
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           console.log('[MobStop:Bridge] stopAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
-            const r = await stopAgentProcessScenario({ tabId, toolType, runtime });
+            const r = await stopAgentProcessScenario({
+              tabId,
+              toolType,
+              runtime,
+              reason: typeof reason === 'string' ? reason : null,
+              authority: authority && typeof authority === 'object' ? authority : null,
+            });
             console.log('[MobStop:Bridge] stopAgentTab done tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(r));
             // The renderer/main transport succeeded even when process lookup
             // could not prove FOUND or ABSENT. Preserve that structured domain
@@ -3905,14 +4019,33 @@ function App() {
       const effort = String(data?.codexProvisionalEffort || '').trim().toLowerCase();
       if (!data?.tabId || !owner.startsWith('launch:') || !model || !effort) return;
       const state = useWorkspaceStore.getState();
-      if (state.getCodexSessionId(data.tabId)) return;
       state.updateCodexLiveState(data.tabId, {
         codexLiveModel: model,
         codexLiveEffort: effort,
         codexLiveSettingsSessionId: owner,
       });
+      if (typeof data?.codexProvisionalFast === 'boolean') {
+        state.updateCodexLiveServiceTier(data.tabId, {
+          codexLiveServiceTier: data.codexProvisionalFast ? 'priority' : 'default',
+          codexLiveServiceTierSessionId: owner,
+          codexLiveServiceTierSource: data.codexProvisionalSettingsProofSource
+            || 'verified-composer-footer',
+        });
+      }
+    };
+    const handleCodexServiceTierProof = (_: any, data: any) => {
+      const tabId = String(data?.tabId || '').trim();
+      const ownerId = String(data?.ownerId || '').trim();
+      const serviceTier = String(data?.serviceTier || '').trim().toLowerCase();
+      if (!tabId || !ownerId || !['priority', 'default'].includes(serviceTier)) return;
+      useWorkspaceStore.getState().updateCodexLiveServiceTier(tabId, {
+        codexLiveServiceTier: serviceTier,
+        codexLiveServiceTierSessionId: ownerId,
+        codexLiveServiceTierSource: String(data?.source || 'tui'),
+      });
     };
     ipcRenderer.on('codex:tui-ready', handleCodexTuiReady);
+    ipcRenderer.on('codex:service-tier-proof', handleCodexServiceTierProof);
 
     // safePasteAndSubmit emits a short pre-turn loader before the agent's own
     // busy-state edge. Mirror it at project level whenever a tab strip shows it.
@@ -3940,13 +4073,19 @@ function App() {
     };
     ipcRenderer.on('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
 
-    const handleTerminalCodexDraftStateRequest = async (_: any, payload: { requestId?: string; tabId?: string; reason?: string; waitFor?: boolean; timeoutMs?: number }) => {
+    const handleTerminalCodexDraftStateRequest = async (_: any, payload: { requestId?: string; tabId?: string; reason?: string; waitFor?: boolean; waitOnUnknownOnly?: boolean; timeoutMs?: number }) => {
       const requestId = payload?.requestId;
       const tabId = payload?.tabId;
       if (!requestId || !tabId) return;
-      const state = typeof payload?.waitFor === 'boolean'
-        ? await terminalRegistry.waitForCodexDraftState(tabId, payload.waitFor, Math.max(100, Math.min(Number(payload.timeoutMs) || 900, 2500)))
-        : terminalRegistry.getCodexDraftState(tabId);
+      const immediateState = terminalRegistry.getCodexDraftState(tabId);
+      const shouldWait = typeof payload?.waitFor === 'boolean'
+        && !(
+          payload.waitOnUnknownOnly === true
+          && (immediateState.hasDraft === true || immediateState.hasDraft === false)
+        );
+      const state = shouldWait
+        ? await terminalRegistry.waitForCodexDraftState(tabId, payload.waitFor!, Math.max(100, Math.min(Number(payload.timeoutMs) || 900, 2500)))
+        : immediateState;
       ipcRenderer.send('terminal:codex-draft-state-response', {
         requestId,
         tabId,
@@ -4009,6 +4148,7 @@ function App() {
       claudeSpinnerVisualIdleTimersRef.current.clear();
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
       ipcRenderer.removeListener('codex:tui-ready', handleCodexTuiReady);
+      ipcRenderer.removeListener('codex:service-tier-proof', handleCodexServiceTierProof);
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
       ipcRenderer.removeListener('terminal:codex-draft-state-request', handleTerminalCodexDraftStateRequest);
@@ -4026,6 +4166,7 @@ function App() {
       // NOTE: interrupted state is NOT managed here — main process will-quit handler
       // sets wasInterrupted AFTER this save completes, avoiding race conditions.
       state.saveSessionImmediate();
+      flushScrollSavesSync();
       flushPromptQueueStoreSync();
     };
 
@@ -4081,7 +4222,14 @@ function App() {
                     command: 'codex-c',
                     sessionId,
                     cwd,
+                    launchSource: 'auto-resume',
                   })).catch((err: any) => ({ success: false, accepted: false, error: String(err?.message || err) }));
+                  if (runResult?.suppressed === true) {
+                    s.clearInterruptedState(tabId);
+                    console.warn('[AutoResume] Codex intentionally not restored tab=' + tabId.slice(-12)
+                      + ' reason=' + (runResult?.reason || 'orchestration-auto-stop-pending'));
+                    return { ok: true, suppressed: true, item };
+                  }
                   if (runResult?.success === false || runResult?.accepted === false) {
                     console.warn('[AutoResume] Codex launch rejected tab=' + tabId.slice(-12)
                       + ' sid=' + sessionId.substring(0, 8)
@@ -4102,8 +4250,16 @@ function App() {
                   tabId,
                   command: 'claude-c',
                   sessionId,
+                  launchSource: 'auto-resume',
                   ...(cwd ? { cdTo: cwd } : {}),
                 });
+                if (runResult?.suppressed === true) {
+                  clearPendingResume(tabId);
+                  s.clearInterruptedState(tabId);
+                  console.warn('[AutoResume] Claude intentionally not restored tab=' + tabId.slice(-12)
+                    + ' reason=' + (runResult?.reason || 'orchestration-auto-stop-pending'));
+                  return { ok: true, suppressed: true, item };
+                }
                 if (runResult?.success === false || runResult?.accepted === false) {
                   clearPendingResume(tabId);
                   return { ok: false, item, error: runResult.error || runResult.reason || 'Claude start failed' };
@@ -4447,7 +4603,9 @@ function App() {
           if (activeProject?.viewingSubAgentTabId) {
             const subTabId = activeProject.viewingSubAgentTabId;
             useWorkspaceStore.getState().setViewingSubAgent(null);
-            closeTab(activeProjectId!, subTabId);
+            closeTab(activeProjectId!, subTabId, {
+              aiBusyOverride: readLiveTabTurnBusy(subTabId),
+            });
           } else if (activeProject && activeProject.activeTabId) {
             const selected = activeProject.selectedTabIds;
             if (selected.length > 1) {
@@ -4459,8 +4617,7 @@ function App() {
                 for (const id of selected) {
                   const tab = activeProject.tabs.get(id) as any;
                   const isAiTab = tab?.tabType === 'claude-sdk' || tab?.commandType === 'claude' || tab?.commandType === 'gemini' || tab?.commandType === 'codex';
-                  const isSdkBusy = tab?.sdkState === 'fetching' || tab?.sdkState === 'thinking' || tab?.sdkState === 'tool_use';
-                  const aiBusy = !!(tab?.aiBusy || tab?.claudeBusy || isSdkBusy);
+                  const aiBusy = readLiveTabTurnBusy(id);
                   if (isAiTab && aiBusy) {
                     busyAi.push({ id, name: tab?.name || 'AI' });
                     continue;
@@ -4484,22 +4641,31 @@ function App() {
 
                 const confirmed = warnings.length === 0
                   ? true
-                  : window.confirm(`${warnings.join('\n\n')}\n\nОстановить и закрыть ${selected.length} вкладк(и)?`);
+                  : (await ipcRenderer.invoke('ui:confirm-destructive', {
+                      message: 'Хотите закрыть ' + selected.length + ' вкладк(и)? Активный процесс',
+                      detail: warnings.join('\n\n'),
+                      confirmLabel: 'Закрыть вкладки',
+                      cancelLabel: 'Отмена',
+                    }).catch(() => ({ confirmed: false })))?.confirmed === true;
 
                 if (confirmed) {
                   for (const id of selected) {
-                    const tab = activeProject.tabs.get(id) as any;
-                    const isSdkBusy = tab?.sdkState === 'fetching' || tab?.sdkState === 'thinking' || tab?.sdkState === 'tool_use';
                     await closeTab(activeProjectId!, id, {
                       skipProcessCheck: true,
                       forceCleanup: true,
-                      aiBusyOverride: !!(tab?.aiBusy || tab?.claudeBusy || isSdkBusy),
+                      aiBusyOverride: readLiveTabTurnBusy(id),
                     });
                   }
                 }
               })();
             } else {
-              closeTab(activeProjectId!, activeProject.activeTabId);
+              // Same close path as the context menu item, including the live
+              // busy snapshot: without it Cmd+W closed a mid-answer Codex tab
+              // with no confirmation while the menu asked, because the store's
+              // own tab fields miss paste/background-work activity.
+              closeTab(activeProjectId!, activeProject.activeTabId, {
+                aiBusyOverride: readLiveTabTurnBusy(activeProject.activeTabId),
+              });
             }
           }
         } else {
@@ -4843,6 +5009,7 @@ function App() {
             <ControlHint label={view === 'dashboard' ? 'Вернуться в рабочий проект' : 'Открыть Dashboard'} side="bottom">
               <button
                 data-workspace-navigation
+                data-project-navigation
                 className="relative px-4 py-1.5 text-sm font-bold cursor-pointer transition-colors"
                 style={{
                   fontSize: `${projectTabsFontSize}px`,
@@ -4862,6 +5029,7 @@ function App() {
             <ControlHint label={view === 'dashboard' ? 'Вернуться в рабочий проект' : 'Открыть Dashboard'} side="bottom">
               <button
                 data-workspace-navigation
+                data-project-navigation
                 className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
                   view === 'dashboard'
                     ? 'text-black'

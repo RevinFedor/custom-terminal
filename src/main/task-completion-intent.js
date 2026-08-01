@@ -12,11 +12,19 @@ class TaskCompletionIntentRegistry {
     this.createId = options.createId || crypto.randomUUID;
   }
 
-  beginTurn({ tabId, provider, sessionId = null, turnId = null, reuseExactTurn = false }) {
+  beginTurn({
+    tabId,
+    provider,
+    sessionId = null,
+    turnId = null,
+    processId = null,
+    reuseExactTurn = false,
+  }) {
     const normalizedTabId = normalize(tabId);
     const normalizedProvider = normalize(provider);
     const normalizedSessionId = normalize(sessionId) || null;
     const normalizedTurnId = normalize(turnId) || null;
+    const normalizedProcessId = normalize(processId) || null;
     if (!normalizedTabId) throw new Error('tabId required');
     if (!normalizedProvider) throw new Error('provider required');
 
@@ -25,7 +33,8 @@ class TaskCompletionIntentRegistry {
       && current?.active === true
       && current.provider === normalizedProvider
       && current.sessionId === normalizedSessionId
-      && current.externalTurnId === normalizedTurnId) {
+      && current.externalTurnId === normalizedTurnId
+      && current.processId === normalizedProcessId) {
       return this.snapshot(current);
     }
 
@@ -34,6 +43,7 @@ class TaskCompletionIntentRegistry {
       provider: normalizedProvider,
       sessionId: normalizedSessionId,
       externalTurnId: normalizedTurnId,
+      processId: normalizedProcessId,
       generation: ++this.nextGeneration,
       active: true,
       startedAt: this.now(),
@@ -63,7 +73,14 @@ class TaskCompletionIntentRegistry {
     return { ok: true, idempotent: false, turn: this.snapshot(state) };
   }
 
-  finishTurn({ tabId, provider = null, sessionId = null, turnId = null, success = false }) {
+  finishTurn({
+    tabId,
+    provider = null,
+    sessionId = null,
+    turnId = null,
+    processId = null,
+    success = false,
+  }) {
     const normalizedTabId = normalize(tabId);
     const state = this.turns.get(normalizedTabId);
     if (!state?.active) return { matched: false, explicitTaskComplete: false };
@@ -71,6 +88,7 @@ class TaskCompletionIntentRegistry {
     const normalizedProvider = normalize(provider);
     const normalizedSessionId = normalize(sessionId);
     const normalizedTurnId = normalize(turnId);
+    const normalizedProcessId = normalize(processId);
     if (normalizedProvider && state.provider !== normalizedProvider) {
       return { matched: false, explicitTaskComplete: false };
     }
@@ -78,6 +96,9 @@ class TaskCompletionIntentRegistry {
       return { matched: false, explicitTaskComplete: false };
     }
     if (normalizedTurnId && state.externalTurnId && state.externalTurnId !== normalizedTurnId) {
+      return { matched: false, explicitTaskComplete: false };
+    }
+    if (normalizedProcessId && state.processId && state.processId !== normalizedProcessId) {
       return { matched: false, explicitTaskComplete: false };
     }
 
@@ -111,6 +132,7 @@ class TaskCompletionIntentRegistry {
       provider: state.provider,
       sessionId: state.sessionId,
       turnId: state.externalTurnId,
+      ...(state.processId ? { processId: state.processId } : {}),
       generation: state.generation,
       active: state.active,
       startedAt: state.startedAt,

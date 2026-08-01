@@ -16,7 +16,13 @@ import {
   createCoordinatedAgentSendCancellationWait,
   isCoordinatedAgentSendCancellationRequested,
 } from './agentActionCoordinator.mjs';
-import { classifyAgentDraftPreflight } from './agentDraftPreflight.mjs';
+import {
+  applyAgentDraftCaptureResolution,
+  buildExactDraftCaptureProof,
+  classifyAgentDraftPreflight,
+  resolveAgentDraftConflict,
+} from './agentDraftPreflight.mjs';
+import { enqueueAgentSendScenario } from './agentSendSequencer.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -68,7 +74,7 @@ const normalizeStatus = (value: unknown): AgentPtyStatus | undefined => {
     : undefined;
 };
 
-export async function sendAgentPromptScenario({
+async function runAgentPromptScenario({
   tabId,
   toolType,
   runtime,
@@ -117,41 +123,73 @@ export async function sendAgentPromptScenario({
       ? await runtime.probeDraft(tabId, 'agent-send-preflight:' + (source || 'unknown'))
       : runtime.inspectDraft!(tabId);
     assertSendNotCancelled();
-    const draftDecision = classifyAgentDraftPreflight(visual);
-    if (draftDecision.decision === 'conflict') {
-      let draftText = '';
-      let draftImages = 0;
+    let draftDecision = classifyAgentDraftPreflight(visual);
+    if (
+      draftDecision.decision === 'conflict'
+      || (draftDecision.decision === 'unknown' && visual.exactCaptureRecommended === true)
+    ) {
+      const captureMode = returnDraftOnConflict === true ? 'grab' : 'copy';
+      let captured: any = null;
       if (returnDraftOnConflict === true) {
-        const grabbed = await runtime.grabDraft(tabId);
-        if (grabbed?.success === false) {
+        captured = await runtime.grabDraft(tabId, {
+          draftProof: buildExactDraftCaptureProof(visual),
+        });
+      } else {
+        captured = await runtime.copyDraft(tabId, {
+          draftProof: buildExactDraftCaptureProof(visual),
+        });
+      }
+      const conflict = resolveAgentDraftConflict(visual, captured, {
+        attemptedCapture: true,
+      });
+      if (conflict.decision === 'capture-failed' && captureMode === 'grab') {
+        return {
+          tabId,
+          toolType,
+          success: false,
+          ok: false,
+          code: 'terminal_draft_grab_failed',
+          error: conflict.error,
+          draftPreview: visual.preview || '',
+          draftSource: visual.source || '',
+          originalPrompt: prompt,
+        };
+      }
+      if (conflict.decision === 'clear') {
+        draftDecision = applyAgentDraftCaptureResolution(draftDecision, conflict);
+        console.warn('[AgentScenario:send] screen draft false-positive resolved by exact empty Ctrl+G'
+          + ' tool=' + toolType
+          + ' tab=' + String(tabId).slice(-12)
+          + ' mode=' + captureMode
+          + ' reason=' + conflict.reason);
+      } else {
+        if (!String(conflict.draftText || '').trim() && Number(conflict.draftImages || 0) === 0) {
           return {
             tabId,
             toolType,
             success: false,
             ok: false,
-            code: 'terminal_draft_grab_failed',
-            error: grabbed.error || 'terminal draft exists, but could not be returned',
+            code: 'terminal_draft_state_unknown',
+            error: conflict.reason || 'Terminal draft state could not be proven',
             draftPreview: visual.preview || '',
             draftSource: visual.source || '',
             originalPrompt: prompt,
           };
         }
-        draftText = typeof grabbed?.text === 'string' ? grabbed.text : '';
-        draftImages = Number(grabbed?.images || 0);
+        return {
+          tabId,
+          toolType,
+          success: false,
+          ok: false,
+          code: 'terminal_draft_conflict',
+          error: 'Terminal has an unsent draft',
+          draftText: captureMode === 'grab' ? conflict.draftText : '',
+          draftPreview: visual.preview || '',
+          draftSource: visual.source || '',
+          draftImages: captureMode === 'grab' ? conflict.draftImages : 0,
+          originalPrompt: prompt,
+        };
       }
-      return {
-        tabId,
-        toolType,
-        success: false,
-        ok: false,
-        code: 'terminal_draft_conflict',
-        error: 'Terminal has an unsent draft',
-        draftText,
-        draftPreview: visual.preview || '',
-        draftSource: visual.source || '',
-        draftImages,
-        originalPrompt: prompt,
-      };
     }
     if (draftDecision.decision === 'unknown') {
       return {
@@ -188,16 +226,30 @@ export async function sendAgentPromptScenario({
   };
 }
 
+export function sendAgentPromptScenario(
+  args: SendAgentPromptScenarioArgs,
+): Promise<any> {
+  return enqueueAgentSendScenario({
+    tabId: args.tabId,
+    handoffId: args.handoffId,
+    run: () => runAgentPromptScenario(args),
+  });
+}
+
 export async function stopAgentProcessScenario({
   tabId,
   toolType,
   runtime,
+  reason,
+  authority,
 }: {
   tabId: string;
   toolType: AgentHistoryTool;
   runtime: HistoryAgentRuntime;
+  reason?: string | null;
+  authority?: Record<string, unknown> | null;
 }): Promise<any> {
-  const r = await runtime.stopProcess(tabId);
+  const r = await runtime.stopProcess(tabId, { reason, authority });
   return { tabId, toolType, stopped: !!r?.success, ...(r || {}) };
 }
 

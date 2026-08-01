@@ -174,6 +174,7 @@ class DatabaseManager {
         open_file_path TEXT DEFAULT NULL,
         sidebar_expanded_dirs TEXT DEFAULT NULL,
         sidebar_scroll_top REAL DEFAULT 0,
+        tab_list_scroll_top REAL DEFAULT 0,
         created_at INTEGER DEFAULT (strftime('%s', 'now')),
         updated_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
@@ -337,6 +338,9 @@ class DatabaseManager {
       this.db.exec(`ALTER TABLE projects ADD COLUMN sidebar_scroll_top REAL DEFAULT 0`);
     } catch (e) { /* column already exists */ }
     try {
+      this.db.exec(`ALTER TABLE projects ADD COLUMN tab_list_scroll_top REAL DEFAULT 0`);
+    } catch (e) { /* column already exists */ }
+    try {
       this.db.exec(`ALTER TABLE projects ADD COLUMN tab_groups TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
     try {
@@ -412,6 +416,7 @@ class DatabaseManager {
       CREATE TABLE IF NOT EXISTS tab_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id TEXT NOT NULL,
+        tab_id TEXT DEFAULT NULL,
         name TEXT NOT NULL,
         name_set_manually INTEGER DEFAULT 0,
         cwd TEXT NOT NULL,
@@ -436,6 +441,10 @@ class DatabaseManager {
     // Migration: add created_at to tabs
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN created_at INTEGER DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN name_set_manually INTEGER DEFAULT 0`); } catch (e) {}
+    // Exact closed-tab identity is required for an explicit Project API send
+    // to restore the requested tab instead of guessing from name/session.
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN tab_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tab_history_tab_id ON tab_history(tab_id) WHERE tab_id IS NOT NULL`); } catch (e) {}
 
     // Migration: add parent_tab_id for MCP sub-agent tabs
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN parent_tab_id TEXT DEFAULT NULL`); } catch (e) {}
@@ -749,6 +758,7 @@ class DatabaseManager {
         session_id TEXT NOT NULL,
         tab_id TEXT NOT NULL,
         content TEXT NOT NULL DEFAULT '',
+        position TEXT DEFAULT 'before',
         created_at INTEGER DEFAULT (strftime('%s', 'now')),
         updated_at INTEGER DEFAULT (strftime('%s', 'now')),
         UNIQUE(entry_uuid, session_id)
@@ -1289,7 +1299,14 @@ class DatabaseManager {
     const project = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
     if (!project) return null;
 
-    const tabs = this.db.prepare('SELECT * FROM tabs WHERE project_id = ? ORDER BY position').all(project.id);
+    // The removed Utils surface had its own position namespace. During the
+    // one-way migration, preserve the old visible order: main tabs first,
+    // then utility tabs, with a deterministic row-id tie-break.
+    const tabs = this.db.prepare(`
+      SELECT * FROM tabs
+      WHERE project_id = ?
+      ORDER BY is_utility ASC, position ASC, id ASC
+    `).all(project.id);
     const globalCommands = this.getGlobalCommands();
 
     return {
@@ -1314,6 +1331,9 @@ class DatabaseManager {
       sidebarExpandedDirs: project.sidebar_expanded_dirs ? JSON.parse(project.sidebar_expanded_dirs) : null,
       sidebarScrollTop: Number.isFinite(Number(project.sidebar_scroll_top))
         ? Math.max(0, Number(project.sidebar_scroll_top))
+        : 0,
+      tabListScrollTop: Number.isFinite(Number(project.tab_list_scroll_top))
+        ? Math.max(0, Number(project.tab_list_scroll_top))
         : 0,
       createdAt: project.created_at,
       updatedAt: project.updated_at,
@@ -2324,6 +2344,105 @@ class DatabaseManager {
     }
   }
 
+  resolvePendingCodexStableSourceFromTranscript({
+    journalKey,
+    projectId,
+    tabId,
+    sourceSessionId,
+    actionGeneration,
+    targetSourceLine,
+    targetTextHash,
+    taskStartedSourceLine,
+    taskStartedAtMs,
+    userMessageSourceLine,
+    userMessageTimestampMs,
+  } = {}) {
+    const targetLine = Number(targetSourceLine);
+    const taskLine = Number(taskStartedSourceLine);
+    const taskAt = Number(taskStartedAtMs);
+    const messageLine = Number(userMessageSourceLine);
+    const messageAt = Number(userMessageTimestampMs);
+    if (!journalKey
+      || !projectId
+      || !tabId
+      || !sourceSessionId
+      || !actionGeneration
+      || !Number.isInteger(targetLine)
+      || !targetTextHash
+      || !Number.isInteger(taskLine)
+      || !Number.isFinite(taskAt)
+      || !Number.isInteger(messageLine)
+      || !Number.isFinite(messageAt)
+      || !(targetLine < taskLine && taskLine < messageLine)
+      || taskAt > messageAt) {
+      return { success: false, error: 'codex_stable_source_transcript_proof_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const inspection = this.inspectPendingCodexWriterHandoff(journalKey);
+      if (inspection.status !== 'present') {
+        return {
+          success: false,
+          error: inspection.error || 'codex_handoff_journal_missing',
+          retryable: inspection.status === 'absent',
+        };
+      }
+      const journal = inspection.journal;
+      const expectedBinding = journal.expectedBindingSessionId || journal.sourceSessionId;
+      if (journal.version !== 2
+        || journal.phase !== 'confirm-enter-boundary'
+        || journal.projectId !== projectId
+        || journal.tabId !== tabId
+        || journal.sourceSessionId !== sourceSessionId
+        || expectedBinding !== sourceSessionId
+        || journal.actionGeneration !== actionGeneration
+        || Number(journal.targetSourceLine) !== targetLine
+        || journal.targetTextHash !== targetTextHash
+        || taskAt < Number(journal.actionStartedAtMs)
+        || messageAt < Number(journal.actionStartedAtMs)) {
+        return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
+      }
+      const tabRow = this.db.prepare(
+        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      ).get(projectId, tabId);
+      if (!tabRow) {
+        return { success: false, error: 'codex_tab_row_missing', retryable: true };
+      }
+      if ((tabRow.codex_session_id || null) !== sourceSessionId) {
+        return {
+          success: false,
+          error: 'codex_handoff_binding_changed',
+          retryable: false,
+          currentSessionId: tabRow.codex_session_id || null,
+        };
+      }
+      const removed = this.db.prepare(
+        'DELETE FROM app_state WHERE key = ? AND value = ?'
+      ).run(journalKey, inspection.rawValue);
+      if (removed.changes !== 1) {
+        return {
+          success: false,
+          error: 'codex_stable_source_transcript_compare_and_delete_failed',
+          retryable: true,
+        };
+      }
+      return {
+        success: true,
+        updated: false,
+        currentSessionId: sourceSessionId,
+        journalCleared: true,
+      };
+    });
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
+
   releasePendingCodexStableSourceSubmit({
     journalKey,
     projectId,
@@ -2791,6 +2910,11 @@ class DatabaseManager {
   updateProjectSidebarScrollTop(projectId, scrollTop) {
     const normalized = Number.isFinite(Number(scrollTop)) ? Math.max(0, Number(scrollTop)) : 0;
     this.db.prepare('UPDATE projects SET sidebar_scroll_top = ? WHERE id = ?').run(normalized, projectId);
+  }
+
+  updateProjectTabListScrollTop(projectId, scrollTop) {
+    const normalized = Number.isFinite(Number(scrollTop)) ? Math.max(0, Number(scrollTop)) : 0;
+    this.db.prepare('UPDATE projects SET tab_list_scroll_top = ? WHERE id = ?').run(normalized, projectId);
   }
 
   updateProjectTabGroups(projectId, groups) {
@@ -3433,13 +3557,17 @@ class DatabaseManager {
       };
     }
     const now = Math.floor(Date.now() / 1000);
+    const archivedTabId = typeof (sourceTabId || archivedTab?.tabId || archivedTab?.id) === 'string'
+      ? String(sourceTabId || archivedTab.tabId || archivedTab.id).trim() || null
+      : null;
     const insert = this.db.prepare(`
-      INSERT INTO tab_history (project_id, name, name_set_manually, cwd, color, notes, task_plan, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, message_count, position, process_was_running, session_status, group_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tab_history (project_id, tab_id, name, name_set_manually, cwd, color, notes, task_plan, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, message_count, position, process_was_running, session_status, group_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const archive = this.db.transaction(() => {
       const info = insert.run(
         projectId,
+        archivedTabId,
         archivedTab.name,
         archivedTab.nameSetManually ? 1 : 0,
         archivedTab.cwd,
@@ -3492,6 +3620,15 @@ class DatabaseManager {
     return this.db.prepare(
       "SELECT * FROM tab_history WHERE id = ? AND project_id = ? AND (tab_type IS NULL OR tab_type != 'file') LIMIT 1"
     ).get(id, projectId);
+  }
+
+  getTabHistoryEntriesByTabId(tabId, limit = 2) {
+    const cleanTabId = typeof tabId === 'string' ? tabId.trim() : '';
+    if (!cleanTabId) return [];
+    const safeLimit = Math.max(1, Math.min(10, Number(limit) || 2));
+    return this.db.prepare(
+      "SELECT * FROM tab_history WHERE tab_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT ?"
+    ).all(cleanTabId, safeLimit);
   }
 
   getTabHistory(projectId, limit = 0) {

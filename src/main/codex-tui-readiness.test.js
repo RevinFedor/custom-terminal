@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 
 const {
   classifyCodexMcpStartupBlockerHandling,
+  decideCodexMcpReplacementHandoff,
+  decideCodexMcpStoppedGenerationSettlement,
   decideCodexMcpStartupDeadline,
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,
@@ -180,9 +182,16 @@ test('current interactive frame retains a blocker rendered after an old composer
 
 test('MCP watchdog refuses a signal after lifecycle or screen sequence changes', () => {
   const watchdog = {};
+  const terminal = {};
   const base = {
     expectedWatchdog: watchdog,
     currentWatchdog: watchdog,
+    expectedTerminal: terminal,
+    currentTerminal: terminal,
+    expectedTerminalGeneration: 'terminal-a:4',
+    currentTerminalGeneration: 'terminal-a:4',
+    expectedRunSeq: 4,
+    currentRunSeq: 4,
     expectedLaunchId: 'launch-1',
     currentLaunchId: 'launch-1',
     expectedWriteSeq: 41,
@@ -193,6 +202,9 @@ test('MCP watchdog refuses a signal after lifecycle or screen sequence changes',
   assert.equal(isCodexMcpRestartSignalSafe(base), true);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentWriteSeq: 42 }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentInputRevision: 10 }), false);
+  assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentRunSeq: 5 }), false);
+  assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentTerminal: {} }), false);
+  assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentTerminalGeneration: 'terminal-b:4' }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentLaunchId: 'launch-2' }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, inputReady: true }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, promptOrTurnInFlight: true }), false);
@@ -202,4 +214,81 @@ test('a replacement launch requires a confirmed successful stop', () => {
   assert.equal(shouldLaunchCodexMcpReplacement({ success: true }), true);
   assert.equal(shouldLaunchCodexMcpReplacement({ success: false }), false);
   assert.equal(shouldLaunchCodexMcpReplacement(null), false);
+});
+
+test('MCP replacement inherits only the exact stopped launch generation', () => {
+  const base = {
+    stopSucceeded: true,
+    sameTerminal: true,
+    expectedTerminalGeneration: 'terminal-a:4',
+    currentTerminalGeneration: 'terminal-a:4',
+    expectedRunSeq: 4,
+    currentRunSeq: 4,
+    expectedInputRevision: 9,
+    currentInputRevision: 9,
+    expectedLaunchId: 'launch-old',
+    currentLaunchId: 'launch-old',
+    processStatus: 'absent',
+  };
+  assert.deepEqual(decideCodexMcpReplacementHandoff(base), {
+    allowed: true,
+    reason: 'exact-stopped-launch-handoff',
+  });
+  assert.equal(decideCodexMcpReplacementHandoff({
+    ...base,
+    currentRunSeq: 5,
+  }).reason, 'terminal-run-changed');
+  assert.equal(decideCodexMcpReplacementHandoff({
+    ...base,
+    currentInputRevision: 10,
+  }).reason, 'terminal-input-changed');
+  assert.equal(decideCodexMcpReplacementHandoff({
+    ...base,
+    currentLaunchId: 'manual-launch',
+  }).reason, 'launch-generation-changed');
+  assert.equal(decideCodexMcpReplacementHandoff({
+    ...base,
+    processStatus: 'found',
+  }).reason, 'replacement-process-already-present');
+  assert.equal(decideCodexMcpReplacementHandoff({
+    ...base,
+    processStatus: 'unknown',
+  }).reason, 'replacement-process-state-unknown');
+  assert.equal(decideCodexMcpReplacementHandoff({
+    ...base,
+    watchdogSuperseded: true,
+  }).reason, 'watchdog-generation-changed');
+});
+
+test('a stopped watchdog generation settles from its exact stop proof when refresh is unknown', () => {
+  const base = {
+    stopAbsenceProven: true,
+    sameTerminal: true,
+    expectedTerminalGeneration: 'terminal-a:4',
+    currentTerminalGeneration: 'terminal-a:4',
+    expectedRunSeq: 4,
+    currentRunSeq: 4,
+    expectedInputRevision: 9,
+    currentInputRevision: 9,
+    expectedLaunchId: 'launch-old',
+    currentLaunchId: 'launch-old',
+    replacementInputBarrierOwned: true,
+    processStatus: 'unknown',
+  };
+  assert.deepEqual(decideCodexMcpStoppedGenerationSettlement(base), {
+    allowed: true,
+    reason: 'exact-stopped-generation-settlement-from-stop-proof',
+  });
+  assert.equal(decideCodexMcpStoppedGenerationSettlement({
+    ...base,
+    processStatus: 'found',
+  }).reason, 'replacement-process-already-present');
+  assert.equal(decideCodexMcpStoppedGenerationSettlement({
+    ...base,
+    replacementInputBarrierOwned: false,
+  }).reason, 'replacement-input-barrier-changed');
+  assert.equal(decideCodexMcpStoppedGenerationSettlement({
+    ...base,
+    currentInputRevision: 10,
+  }).reason, 'terminal-input-changed');
 });

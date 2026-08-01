@@ -31,6 +31,92 @@ export function shouldCreatePasteChip(text, threshold) {
   return String(text || '').length > normalizeComposerChipThreshold(threshold);
 }
 
+/**
+ * Inline anchor a paste chip leaves in the draft text, at the caret position it
+ * was pasted into: `[Pasted Content 1 692 chars]`.
+ *
+ * A pasted blob is part of the sentence being written, so it must sit INSIDE
+ * the line — `текст [Pasted Content 1 692 chars] ещё текст` — not on a strip
+ * above the field. A textarea cannot host DOM inside its value, so the anchor
+ * lives in the text and the styled block is painted by the highlight layer
+ * over it, exactly like `[Image #1]`.
+ *
+ * The blob itself stays in the chip store: putting 50 KB into the visible
+ * draft would make the field unusable. Marker → chip is matched by id, and a
+ * chip whose marker is gone is dropped, so no orphaned bodies accumulate.
+ */
+const PASTE_MARKER_SOURCE = String.raw`\[Pasted Content ([0-9   ]+) chars\]`;
+
+const createPasteMarkerRegex = () => new RegExp(PASTE_MARKER_SOURCE, 'g');
+
+const formatPasteMarkerCount = (chars) => Number(chars || 0).toLocaleString('ru-RU');
+
+export function buildPasteChipMarker(chip) {
+  return '[Pasted Content ' + formatPasteMarkerCount((chip?.text || '').length) + ' chars]';
+}
+
+/** Byte ranges of every paste marker that still has a matching chip. */
+export function getPasteMarkerHighlightRanges(text, chips = []) {
+  const markers = normalizeComposerChips(chips)
+    .filter((chip) => chip.kind === 'paste')
+    .map((chip) => ({ id: chip.id, marker: buildPasteChipMarker(chip) }));
+  if (markers.length === 0) return [];
+  const value = String(text || '');
+  const ranges = [];
+  const re = createPasteMarkerRegex();
+  // Markers with the same char count are indistinguishable in the text, so a
+  // repeated paste of equal-length blobs is matched positionally: the Nth
+  // occurrence belongs to the Nth chip with that marker.
+  const usedByMarker = new Map();
+  let match;
+  while ((match = re.exec(value)) !== null) {
+    const found = match[0];
+    const seen = usedByMarker.get(found) || 0;
+    const candidates = markers.filter((entry) => entry.marker === found);
+    const chip = candidates[seen];
+    usedByMarker.set(found, seen + 1);
+    if (!chip) continue;
+    ranges.push({ start: match.index, end: match.index + found.length, id: chip.id });
+  }
+  return ranges;
+}
+
+/**
+ * Drops chips whose marker no longer appears in the text. Deleting the marker
+ * with Backspace is the natural way to remove the blob, and without this the
+ * body would silently ride along into the sent prompt.
+ */
+export function retainPasteChipsForText(text, chips = []) {
+  const current = normalizeComposerChips(chips);
+  const pasteChips = current.filter((chip) => chip.kind === 'paste');
+  if (pasteChips.length === 0) return current;
+  const liveIds = new Set(getPasteMarkerHighlightRanges(text, current).map((range) => range.id));
+  return current.filter((chip) => chip.kind !== 'paste' || liveIds.has(chip.id));
+}
+
+/**
+ * Clipboard flavor Voice Record sets alongside the plain text when the payload
+ * is dictated speech. Its presence — not the text length — decides that the
+ * paste must land as ordinary editable text.
+ *
+ * Custom clipboard types survive an Electron→Electron copy/paste, so this is a
+ * one-line change on the Voice Record side (add the flavor next to the text it
+ * already writes) and needs nothing from the OS. Until that ships this check is
+ * simply always false, so behavior is unchanged.
+ */
+export const DICTATION_CLIPBOARD_FLAVOR = 'application/x-voice-record-dictation';
+
+export function isDictationClipboardPayload(clipboardData) {
+  if (!clipboardData) return false;
+  const types = clipboardData.types;
+  if (!types) return false;
+  // DataTransfer.types is a DOMStringList in some engines — no .includes().
+  for (let i = 0; i < types.length; i += 1) {
+    if (types[i] === DICTATION_CLIPBOARD_FLAVOR) return true;
+  }
+  return false;
+}
+
 export function isTerminalOnlyComposerDraft(text) {
   return String(text || '').trimStart().startsWith('/');
 }
@@ -225,15 +311,35 @@ export function serializeComposerDraft({ text = '', chips = [] } = {}) {
   const promptParts = normalized
     .filter((chip) => chip.kind === 'prompt')
     .map((chip) => chip.text);
-  const pasteParts = normalized
-    .filter((chip) => chip.kind === 'paste')
-    .map((chip) => `${PASTED_CONTENT_OPEN}\n${chip.text}\n${PASTED_CONTENT_CLOSE}`);
   const editableText = String(text || '');
+
+  // An anchored paste expands IN PLACE, because the user put it at a specific
+  // point of the sentence and the agent must read it there. Ranges are applied
+  // back-to-front so earlier offsets stay valid.
+  const anchored = getPasteMarkerHighlightRanges(editableText, normalized);
+  const chipById = new Map(normalized.map((chip) => [chip.id, chip]));
+  const anchoredIds = new Set(anchored.map((range) => range.id));
+  let inlinedText = editableText;
+  for (let i = anchored.length - 1; i >= 0; i -= 1) {
+    const range = anchored[i];
+    const chip = chipById.get(range.id);
+    if (!chip) continue;
+    inlinedText = inlinedText.slice(0, range.start)
+      + `${PASTED_CONTENT_OPEN}\n${chip.text}\n${PASTED_CONTENT_CLOSE}`
+      + inlinedText.slice(range.end);
+  }
+
+  // Chips without a marker keep the historical prefix placement: drafts
+  // created before anchors existed, and any path that adds a chip without
+  // touching the text, must still send their content.
+  const pasteParts = normalized
+    .filter((chip) => chip.kind === 'paste' && !anchoredIds.has(chip.id))
+    .map((chip) => `${PASTED_CONTENT_OPEN}\n${chip.text}\n${PASTED_CONTENT_CLOSE}`);
 
   return [
     ...promptParts,
     ...pasteParts,
-    ...(editableText ? [editableText] : []),
+    ...(inlinedText ? [inlinedText] : []),
   ].join('\n\n');
 }
 
@@ -343,6 +449,108 @@ export function insertComposerTextAtSelection({
   const caret = start + insertion.length;
   return {
     text: nextText,
+    caret,
+    selectionStart: caret,
+    selectionEnd: caret,
+  };
+}
+
+/**
+ * Inserts one complete authoring snapshot (text + chips) at a selection.
+ *
+ * Paste markers encode only the body length, so two equal-length blobs are
+ * indistinguishable in the textarea. Their durable identity therefore lives
+ * in chip order. Text and chips must be spliced atomically: appending the new
+ * chip while inserting its marker before an older marker swaps the bodies on
+ * serialization.
+ */
+export function insertComposerSnapshotAtSelection({
+  text = '',
+  chips = [],
+  insertedText = '',
+  insertedChips = [],
+  selectionStart,
+  selectionEnd,
+  createChipId = (chip, index) => (
+    `composer-inserted-${chip.kind}-${Date.now().toString(36)}-${index}`
+  ),
+} = {}) {
+  const currentText = String(text || '');
+  const insertionText = String(insertedText || '');
+  const start = Math.max(
+    0,
+    Math.min(
+      Number.isFinite(Number(selectionStart)) ? Math.round(Number(selectionStart)) : currentText.length,
+      currentText.length,
+    ),
+  );
+  const end = Math.max(
+    start,
+    Math.min(
+      Number.isFinite(Number(selectionEnd)) ? Math.round(Number(selectionEnd)) : start,
+      currentText.length,
+    ),
+  );
+
+  const current = normalizeComposerChips(chips);
+  const usedIds = new Set(current.map((chip) => chip.id));
+  const inserted = normalizeComposerChips(insertedChips).map((chip, index) => {
+    if (!usedIds.has(chip.id)) {
+      usedIds.add(chip.id);
+      return chip;
+    }
+    const requested = String(createChipId(chip, index) || '').trim()
+      || `composer-inserted-${chip.kind}-${Date.now().toString(36)}-${index}`;
+    let id = requested;
+    let collision = 1;
+    while (usedIds.has(id)) id = `${requested}-${collision++}`;
+    usedIds.add(id);
+    return { ...chip, id };
+  });
+
+  const currentRanges = getPasteMarkerHighlightRanges(currentText, current);
+  const insertedRanges = getPasteMarkerHighlightRanges(insertionText, inserted);
+  const currentAnchoredIds = new Set(currentRanges.map((range) => range.id));
+  const insertedAnchoredIds = new Set(insertedRanges.map((range) => range.id));
+  const chipById = new Map([...current, ...inserted].map((chip) => [chip.id, chip]));
+
+  // A marker touched by the replaced selection no longer has a complete
+  // textual anchor and must not survive as a hidden prefix attachment.
+  const beforeIds = currentRanges
+    .filter((range) => range.end <= start)
+    .map((range) => range.id);
+  const afterIds = currentRanges
+    .filter((range) => range.start >= end)
+    .map((range) => range.id);
+  const anchoredOrder = [
+    ...beforeIds,
+    ...insertedRanges.map((range) => range.id),
+    ...afterIds,
+  ];
+  const anchored = anchoredOrder.map((id) => chipById.get(id)).filter(Boolean);
+  const currentUnanchored = current.filter((chip) => (
+    chip.kind === 'paste' && !currentAnchoredIds.has(chip.id)
+  ));
+  const insertedUnanchored = inserted.filter((chip) => (
+    chip.kind === 'paste' && !insertedAnchoredIds.has(chip.id)
+  ));
+  const promptChips = normalizeComposerChips([
+    ...current.filter((chip) => chip.kind === 'prompt'),
+    ...inserted.filter((chip) => chip.kind === 'prompt'),
+  ]);
+
+  const nextText = currentText.slice(0, start) + insertionText + currentText.slice(end);
+  const caret = start + insertionText.length;
+  return {
+    text: nextText,
+    chips: normalizeComposerChips([
+      ...promptChips,
+      // Anchored chips go first so legacy unanchored blobs of the same length
+      // cannot steal a positional marker match.
+      ...anchored,
+      ...currentUnanchored,
+      ...insertedUnanchored,
+    ]),
     caret,
     selectionStart: caret,
     selectionEnd: caret,

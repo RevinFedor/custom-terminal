@@ -72,3 +72,16 @@ Terminal MCP stdio → HTTP к main (`/overseer/*` остаются внутре
 ## Code Map (неочевидные связи)
 - `_api` объект в `ipc/claude-data.js` — `forkSessionFile`/`editRange`/`deleteRange` вынесены из IPC-handler'ов в named-функции, handler стал тонким шимом `(e,payload)=>_api.editRange(payload)`. main.js импортирует `_api` как `claudeDataApi`, history endpoints зовут его напрямую. Edit-логика живёт в одном месте, два входа (IPC от Timeline + внутренний HTTP).
 - `_computeEditRangePlan` (main.js) — read-only зеркало forward-expand логики edit-range для `propose_edit`, считает removeUuids без записи.
+
+## Main-owned bounded History
+
+Claude и Codex History читаются одним main-owned сервисом. Ограничения `last`,
+`before`, `after` и `around` применяются на этой границе, до передачи в HTTP/MCP;
+доступность renderer и произвольный UI-timeout не участвуют в результате.
+Persisted tab/session binding является первичным для остановленной фоновой
+вкладки, поэтому открывать History ради чтения не требуется.
+
+Для обычного Claude `last=N` rich-проекция удерживает только хвост N записей уже
+во время прохода по transcript. Полный parentUuid/backtrace всё ещё строится там,
+где он нужен для edit/fork, но bounded read не создаёт второй полный массив и не
+маскирует тяжёлую работу пятитисекундным отказом.

@@ -3,6 +3,7 @@ const test = require('node:test');
 const {
   buildDelegationResultTarget,
   isAgentStatusBusyForClose,
+  resolveOrchestrationDeliveryAdmission,
   resolveNewAgentTabPlacement,
   resolveOrchestrationSendOptions,
 } = require('./orchestration-request-plan');
@@ -88,6 +89,48 @@ test('busy target preserves explicit queue capability', () => {
     baselineStatus: 'busy',
     queueRequested: true,
   }).queue, true);
+});
+
+test('stopped orchestration target enters the shared launch-and-send scenario', () => {
+  assert.deepEqual(resolveOrchestrationDeliveryAdmission({
+    status: 'inactive',
+    inputReady: false,
+    busy: false,
+  }), {
+    canDispatch: true,
+    statusAtSend: 'inactive',
+    requiresRuntimeLaunch: true,
+    reason: null,
+  });
+});
+
+test('orchestration delivery waits for busy and transitional targets', () => {
+  for (const status of [
+    { status: 'busy', inputReady: false },
+    { status: 'starting', inputReady: false },
+    { status: 'stopping', inputReady: false },
+    { status: 'active', inputReady: false },
+    { status: 'unknown', inputReady: false },
+  ]) {
+    const result = resolveOrchestrationDeliveryAdmission(status);
+    assert.equal(result.canDispatch, false, status.status);
+    assert.equal(result.reason, 'target-not-idle:' + status.status, status.status);
+  }
+});
+
+test('ready idle target enters delivery without another launch', () => {
+  assert.deepEqual(resolveOrchestrationDeliveryAdmission({
+    status: 'active',
+    inputReady: true,
+    busy: false,
+    starting: false,
+    stopping: false,
+  }), {
+    canDispatch: true,
+    statusAtSend: 'active',
+    requiresRuntimeLaunch: false,
+    reason: null,
+  });
 });
 
 test('close guard treats active as idle and lifecycle transitions as busy', () => {

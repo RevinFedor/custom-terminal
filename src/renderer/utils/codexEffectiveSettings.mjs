@@ -190,7 +190,10 @@ export function resolveCodexEffectiveSettings({
   const liveOwner = typeof codexLiveSettingsSessionId === 'string'
     ? codexLiveSettingsSessionId.trim()
     : '';
-  const launchOwned = !sessionId && /^launch:.+/.test(liveOwner);
+  // A Resume/Fork keeps the saved source session visible until the first new
+  // rollout user_message proves the child writer. The exact launch-generation
+  // settings must still outrank that historical binding during this window.
+  const launchOwned = /^launch:.+/.test(liveOwner);
   const liveOwned = (!!sessionId && liveOwner === sessionId) || launchOwned;
   return {
     model: liveOwned && codexLiveModel ? codexLiveModel : codexModel,
