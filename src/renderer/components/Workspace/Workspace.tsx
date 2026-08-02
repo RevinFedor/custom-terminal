@@ -19,6 +19,12 @@ import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from '../../constants/systemProjects';
 import { linkFileTab } from '../../utils/linkFileTab';
+import { buildCodexRunPayload } from '../../utils/codexLaunch';
+import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
+import {
+  directoryChangeEventNames,
+  planWorkingDirectoryChange,
+} from '../../utils/workingDirectoryChange.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -43,6 +49,61 @@ const path = window.require('path');
 // the pushed History panel downgrades to an overlay instead of squeezing the
 // terminal into an unreadable strip.
 const MIN_TERMINAL_COLUMN_WIDTH = 620;
+
+type DirectoryChangePhase = 'idle' | 'selecting' | 'waiting' | 'stopping' | 'switching' | 'restarting';
+
+const directoryChangeErrorText = (error: unknown): string => {
+  const code = String((error as any)?.message || error || 'unknown');
+  if (code.includes('terminal_has_unsent_input')) return 'В терминале есть неотправленный текст. Сначала отправьте или очистите его.';
+  if (code.includes('shell_not_idle')) return 'Терминал сейчас занят другой командой. Дождитесь её завершения и повторите.';
+  if (code.includes('process_lookup_failed')) return 'Не удалось безопасно подтвердить состояние терминала.';
+  if (code.includes('cwd_change_proof_timeout')) return 'Терминал не подтвердил переход в выбранную папку.';
+  if (code.includes('working_directory_unavailable')) return 'Выбранная папка больше недоступна.';
+  return code;
+};
+
+const waitForAgentTurnToSettle = ({
+  runtime,
+  tabId,
+  projectId,
+}: {
+  runtime: ReturnType<typeof getHistoryAgentRuntime>;
+  tabId: string;
+  projectId: string;
+}) => new Promise<any>((resolve, reject) => {
+  let settled = false;
+  let checking = false;
+  const events = directoryChangeEventNames(runtime.toolType);
+  const cleanup = () => {
+    for (const eventName of events) ipcRenderer.removeListener(eventName, onLifecycleEvent);
+  };
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    callback();
+  };
+  const verify = async () => {
+    if (settled || checking) return;
+    checking = true;
+    try {
+      const presence = await runtime.getPresence(tabId, projectId);
+      if (presence.status !== 'busy') finish(() => resolve(presence));
+    } catch (error) {
+      finish(() => reject(error));
+    } finally {
+      checking = false;
+    }
+  };
+  function onLifecycleEvent(_event: unknown, payload: any) {
+    const eventTabId = typeof payload === 'string' ? payload : payload?.tabId;
+    if (eventTabId !== tabId) return;
+    void verify();
+  }
+  for (const eventName of events) ipcRenderer.on(eventName, onLifecycleEvent);
+  // Close the edge between the initial caller snapshot and listener install.
+  void verify();
+});
 
 export default function Workspace() {
   // DEBUG: Track Workspace mount/unmount
@@ -151,6 +212,8 @@ export default function Workspace() {
   const [floatingTerminalOpenTabs, setFloatingTerminalOpenTabs] = useState<Record<string, boolean>>({});
   const [historyControlsHeight, setHistoryControlsHeight] = useState(0);
   const [agentLifecycleStatus, setAgentLifecycleStatus] = useState<AgentLifecycleSummary | null>(null);
+  const [directoryChangePhase, setDirectoryChangePhase] = useState<DirectoryChangePhase>('idle');
+  const directoryChangeOperationRef = useRef(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
   // Viewport width guard for the pushed side panel. A TUI agent draws to the
   // size it was told, so squeezing the terminal below a workable column makes
@@ -495,26 +558,36 @@ export default function Workspace() {
   }, [activeProjectId, activeFileTabPath, activeFileTab?.id, currentView, closeFilePreview, openFilePreview]);
 
   // Sync file preview with sidebar state (project switch + sidebar open/close)
+  const previewSyncProjectIdRef = useRef<string | null>(null);
   useEffect(() => {
     if (!activeProjectId) return;
 
     const { openFilePath } = getSidebarState(activeProjectId);
     const { sidebarPersistFile } = useUIStore.getState();
+    // Arriving in a project is not the same event as the user closing something
+    // inside it. The distinction decides both whether the remembered file may be
+    // dropped and whether it should be restored.
+    const projectChanged = previewSyncProjectIdRef.current !== activeProjectId;
+    previewSyncProjectIdRef.current = activeProjectId;
 
     if (!sidebarOpenForRender) {
       // Sidebar closed — hide file preview. When persist=false, also drop the saved
       // path so the next sidebar open starts clean (just the tree, no file).
       if (filePreview && filePreview.source !== 'tab') closeFilePreview();
-      if (!sidebarPersistFile && openFilePath) {
+      // ...but only when the user actually closed it. Landing in a project whose
+      // sidebar happens to be closed would otherwise erase the file that project
+      // had open, exactly like the sidebar-open flag used to be erased.
+      if (!sidebarPersistFile && openFilePath && !projectChanged) {
         setOpenFilePath(activeProjectId, null);
       }
       return;
     }
 
-    // Sidebar open — persist=false only disables automatic restore on reopen.
-    // A direct file click must still keep its preview; otherwise the click opens
-    // successfully and this sync effect closes it in the next render.
-    if (!sidebarPersistFile) {
+    // Sidebar open. `sidebarPersistFile` governs the close→reopen cycle: with it
+    // off, closing the sidebar already cleared the path above, so there is
+    // nothing left to restore. Returning to a project never cleared anything, so
+    // a file that survived there is restored regardless of the setting.
+    if (!sidebarPersistFile && !projectChanged) {
       if (filePreview) {
         console.warn('[SidebarPreviewSync] persist-off-keep-current', {
           previewPath: filePreview.path,
@@ -782,11 +855,16 @@ export default function Workspace() {
       // Guard: don't fire when Workspace is hidden behind Dashboard
       if (workspaceView !== 'workspace') return;
       if (e.metaKey && e.key === 'f') {
+        if (e.defaultPrevented) return;
+        const target = e.target as HTMLElement | null;
+        // The shared composer owns its own compact find panel. Opening the
+        // terminal search on top of it made one shortcut control two surfaces.
+        if (target?.closest('.gt-composer-editor')) return;
         if (historyIsPrimary && !floatingTerminalOpen) return;
         e.preventDefault();
         setShowSearch(true);
         // Focus input after render
-        setTimeout(() => searchInputRef.current?.focus(), 50);
+        requestAnimationFrame(() => searchInputRef.current?.focus());
       }
       // Escape to close search
       if (e.key === 'Escape' && showSearch) {
@@ -1021,13 +1099,206 @@ export default function Workspace() {
   );
   const deferredHistoryOwner = useDeferredValue(historyOwnerIdentity);
 
+  const handleChangeWorkingDirectory = useCallback(async () => {
+    if (directoryChangeOperationRef.current !== 0) return;
+    const projectId = activeProjectId;
+    const visibleTabId = effectiveTab?.id || null;
+    if (!projectId || !visibleTabId) return;
+
+    const initialStore = useWorkspaceStore.getState();
+    const initialWorkspace = initialStore.openProjects.get(projectId);
+    const visibleTab = initialWorkspace?.tabs.get(visibleTabId);
+    const ownerTab = visibleTab?.tabType === 'file' && visibleTab.visualParentTabId
+      ? initialWorkspace?.tabs.get(visibleTab.visualParentTabId)
+      : visibleTab;
+    if (!ownerTab?.id) return;
+
+    const operationId = Date.now() || 1;
+    directoryChangeOperationRef.current = operationId;
+    const isCurrentOperation = () => directoryChangeOperationRef.current === operationId;
+    const setPhase = (phase: DirectoryChangePhase) => {
+      if (isCurrentOperation()) setDirectoryChangePhase(phase);
+    };
+    const tabId = ownerTab.id;
+    const currentCwd = ownerTab.cwd || rawExplorerPath || projectRootPath;
+    let cwdChanged = false;
+
+    try {
+      setPhase('selecting');
+      const selectedPath = await ipcRenderer.invoke('app:select-directory', {
+        defaultPath: currentCwd || undefined,
+      });
+      if (!isCurrentOperation() || !selectedPath) return;
+
+      const targetCwd = path.resolve(String(selectedPath));
+      if (currentCwd && path.resolve(currentCwd) === targetCwd) return;
+
+      const claudeSessionId = ownerTab.claudeSessionId || null;
+      const codexSessionId = ownerTab.codexSessionId || null;
+      const toolType = ownerTab.commandType === 'codex'
+        || (codexSessionId && !claudeSessionId)
+        ? 'codex'
+        : ownerTab.commandType === 'claude' || claudeSessionId
+          ? 'claude'
+          : null;
+      const sessionId = toolType === 'codex' ? codexSessionId : toolType === 'claude' ? claudeSessionId : null;
+      const runtime = toolType ? getHistoryAgentRuntime(toolType) : null;
+      let presence = runtime
+        ? await runtime.getPresence(tabId, projectId)
+        : { status: 'inactive', conversationMaterialized: false };
+      if (presence.status === 'unknown') {
+        throw new Error('Не удалось определить состояние AI-сессии безопасно.');
+      }
+
+      let plan = planWorkingDirectoryChange({
+        toolType,
+        sessionId,
+        presenceStatus: presence.status,
+        conversationMaterialized: presence.conversationMaterialized === true,
+      });
+      if (plan.requiresConfirmation) {
+        const response = await ipcRenderer.invoke('ui:confirm-destructive', {
+          message: 'Сменить рабочую папку этой вкладки?',
+          detail: plan.waitForTurn
+            ? 'Текущий ответ сначала завершится. Затем сессия остановится и продолжится в выбранной папке отдельной веткой.'
+            : 'Сессия будет перезапущена в выбранной папке отдельной веткой. Остальные вкладки не изменятся.',
+          confirmLabel: 'Сменить и продолжить',
+          cancelLabel: 'Отмена',
+        });
+        if (!response?.confirmed || !isCurrentOperation()) return;
+      }
+
+      if (plan.waitForTurn && runtime) {
+        setPhase('waiting');
+        useUIStore.getState().showToast(
+          'Папка изменится после завершения текущего ответа',
+          'info',
+          3500,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          tabId,
+        );
+        presence = await waitForAgentTurnToSettle({ runtime, tabId, projectId });
+        if (!isCurrentOperation()) return;
+        plan = planWorkingDirectoryChange({
+          toolType,
+          sessionId,
+          presenceStatus: presence.status,
+          conversationMaterialized: presence.conversationMaterialized === true,
+        });
+      }
+
+      if (plan.stopProcess && runtime) {
+        setPhase('stopping');
+        const stopped = await runtime.stopProcess(tabId, { reason: 'working-directory-change' });
+        if (stopped?.success === false) {
+          throw new Error(stopped.error || 'AI-сессию не удалось остановить');
+        }
+      }
+
+      setPhase('switching');
+      const changed = await ipcRenderer.invoke('terminal:change-working-directory', {
+        tabId,
+        targetCwd,
+      });
+      if (changed?.success !== true || changed?.accepted !== true || !changed?.cwd) {
+        throw new Error(changed?.error || changed?.reason || 'Рабочая папка не изменилась');
+      }
+      cwdChanged = true;
+
+      const latestStore = useWorkspaceStore.getState();
+      let ownerProjectId: string | null = null;
+      for (const [candidateProjectId, workspace] of latestStore.openProjects) {
+        if (workspace.tabs.has(tabId)) {
+          ownerProjectId = candidateProjectId;
+          break;
+        }
+      }
+      if (!ownerProjectId) throw new Error('Вкладка была закрыта во время смены папки');
+      const rendererSaved = await latestStore.updateTabCwd(ownerProjectId, tabId, changed.cwd);
+      if (!rendererSaved && changed.persisted !== true) {
+        throw new Error('Новую папку не удалось сохранить для следующего запуска.');
+      }
+
+      if (plan.restartMode !== 'none' && runtime) {
+        setPhase('restarting');
+        let launchResult: any;
+        if (plan.restartMode === 'fork' && sessionId) {
+          launchResult = toolType === 'claude'
+            ? await ipcRenderer.invoke('claude:run-command', {
+                tabId,
+                command: 'claude-f',
+                forkSessionId: sessionId,
+                targetCwd: changed.cwd,
+                relocateWorkingDirectory: true,
+                launchSource: 'explicit',
+              })
+            : await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+                tabId,
+                command: 'codex-f',
+                sessionId,
+                cwd: changed.cwd,
+                launchSource: 'explicit',
+              }));
+        } else {
+          launchResult = await runtime.startFresh?.({ tabId, cwd: changed.cwd });
+        }
+        if (!launchResult || launchResult.success === false || launchResult.accepted === false) {
+          throw new Error(launchResult?.error || launchResult?.reason || 'AI-сессия не перезапустилась');
+        }
+      }
+
+      useUIStore.getState().showToast(
+        `Рабочая папка вкладки: ${path.basename(changed.cwd) || changed.cwd}`,
+        'success',
+        2800,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        tabId,
+      );
+    } catch (error) {
+      const reason = directoryChangeErrorText(error);
+      useUIStore.getState().showToast(
+        cwdChanged
+          ? `Папка изменена, но сессию не удалось продолжить: ${reason}`
+          : `Папка не изменена: ${reason}`,
+        'error',
+        6500,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        tabId,
+      );
+    } finally {
+      if (isCurrentOperation()) {
+        directoryChangeOperationRef.current = 0;
+        setDirectoryChangePhase('idle');
+      }
+    }
+  }, [activeProjectId, effectiveTab?.id, projectRootPath, rawExplorerPath]);
+
   if (!activeProject || !activeProjectId || !currentProject) {
     console.warn('[Workspace:EARLY_RETURN] Empty workspace!', { activeProject: !!activeProject, activeProjectId, currentProject: !!currentProject });
     return <div className="flex-1 bg-bg-main" />;
   }
 
   // Get current tab's cwd for FileExplorer (fallback to project path).
-  const explorerPath = resolvedExplorerPath || rawExplorerPath || projectRootPath;
+  // The resolved path is produced asynchronously, so after a project switch it
+  // still holds the PREVIOUS project's folder for a frame. Letting that win
+  // would hand the file tree a foreign root (Inbox resolves to the home dir),
+  // and the tree treats a root change as "forget which folders were expanded".
+  // Accept the resolved value only while it still belongs to this project.
+  const explorerPath = (
+    resolvedExplorerPath
+    && (resolvedExplorerPath === rawExplorerPath || resolvedExplorerPath === projectRootPath)
+  )
+    ? resolvedExplorerPath
+    : (rawExplorerPath || projectRootPath);
 
   const historyPanelNode = deferredHistoryOwner ? (
     <HistoryPanel
@@ -1318,6 +1589,8 @@ export default function Workspace() {
             <Sidebar
               key={activeProjectId}
               folderPath={explorerPath}
+              onChangeDirectory={handleChangeWorkingDirectory}
+              directoryChangeState={directoryChangePhase}
               width={effectiveSidebarWidth}
               fontSize={sidebarFontSize || 13}
               onFocus={() => {}}

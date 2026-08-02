@@ -5,6 +5,7 @@ import {
   getPromptImageAttachmentState,
   getPromptImageMarkerHighlightRanges,
   hasMalformedPromptImageMarker,
+  inspectPromptImageAttachments,
   retainPromptImageRefsForText,
 } from '../utils/promptImageAttachments.mjs';
 import {
@@ -850,9 +851,9 @@ export function queueSendTransferredOwnership(result: unknown): boolean {
 function getInitialQueuedPromptAttachmentState(
   text: string,
   imagePaths?: QueuedImageRef[],
-  imagesHint = 0,
+  _imagesHint = 0,
 ): QueuedPromptAttachmentState {
-  if (imagesHint > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(text)) return 'missing';
+  if (/\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/i.test(text)) return 'missing';
   if (hasMalformedQueuedImageMarker(text, imagePaths)) return 'missing';
   if (/\[Image\s*\]/i.test(text)) return 'missing';
   const ids = collectClaudeImageRefIds(text);
@@ -1063,7 +1064,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
                 countImages(text),
                 normalized.imagePaths?.length ?? 0,
                 hasMalformedQueuedImageMarker(text, normalized.imagePaths) ? p.images : 0,
-                p.attachmentState === 'missing' && /\[imageError:\s*[^\]\r\n]+\]/i.test(text) ? p.images : 0,
+                p.attachmentState === 'missing' && /\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/i.test(text) ? p.images : 0,
               )
             : p.images;
           const imagePaths = normalized.imagePaths;
@@ -1146,7 +1147,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             countImages(normalized.text),
             normalized.imagePaths?.length ?? 0,
             hasMalformedQueuedImageMarker(normalized.text, normalized.imagePaths) ? p.images : 0,
-            p.attachmentState === 'missing' && /\[imageError:\s*[^\]\r\n]+\]/i.test(normalized.text) ? p.images : 0,
+            p.attachmentState === 'missing' && /\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/i.test(normalized.text) ? p.images : 0,
           );
           return {
             ...p,
@@ -1186,7 +1187,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             images: Math.max(
               countImages(item.text),
               imagePaths?.length ?? 0,
-              attachmentState === 'missing' && /\[imageError:\s*[^\]\r\n]+\]/i.test(item.text) ? item.images : 0,
+              attachmentState === 'missing' && /\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/i.test(item.text) ? item.images : 0,
             ),
             attachmentState,
           };
@@ -1650,13 +1651,15 @@ const promptImageMaterializationInflight = new Map<string, Promise<{
   ready: boolean;
   state: QueuedPromptAttachmentState;
   item: QueuedPrompt | null;
+  degraded?: boolean;
 }>>();
 
 async function materializeQueuedPromptRecord(item: QueuedPrompt): Promise<QueuedPrompt> {
   const normalized = normalizeQueuedPrompt(item);
   if (getQueuedPromptAttachmentState(normalized) === 'missing'
     && normalized.images > 0
-    && /\[imageError:\s*[^\]\r\n]+\]/i.test(normalized.text)) {
+    && /\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/i.test(normalized.text)
+    && collectClaudeImageRefIds(normalized.text).size === 0) {
     return { ...normalized, attachmentState: 'missing' };
   }
   const ids = collectClaudeImageRefIds(normalized.text);
@@ -1698,7 +1701,12 @@ async function materializeQueuedPromptRecord(item: QueuedPrompt): Promise<Queued
 export function ensureQueuedPromptImagesReady(
   tabId: string,
   itemId: string,
-): Promise<{ ready: boolean; state: QueuedPromptAttachmentState; item: QueuedPrompt | null }> {
+): Promise<{
+  ready: boolean;
+  state: QueuedPromptAttachmentState;
+  item: QueuedPrompt | null;
+  degraded?: boolean;
+}> {
   const key = tabId + ':' + itemId;
   const existing = promptImageMaterializationInflight.get(key);
   if (existing) return existing;
@@ -1706,12 +1714,17 @@ export function ensureQueuedPromptImagesReady(
   const work = (async () => {
     const before = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === itemId) || null;
     if (!before) return { ready: false, state: 'missing' as const, item: null };
-    if (hasMalformedQueuedImageMarker(before.text, before.imagePaths)) {
+    const beforeInspection = inspectPromptImageAttachments(before.text, before.imagePaths || []);
+    if (beforeInspection.blocking) {
       return { ready: false, state: 'missing' as const, item: before };
     }
-    if (collectClaudeImageRefIds(before.text).size === 0
-      && !(before.images > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(before.text))) {
-      return { ready: true, state: 'ready' as const, item: before };
+    if (collectClaudeImageRefIds(before.text).size === 0) {
+      return {
+        ready: true,
+        state: beforeInspection.unavailable ? 'missing' as const : 'ready' as const,
+        item: before,
+        degraded: beforeInspection.unavailable,
+      };
     }
     const immediateState = getQueuedPromptAttachmentState(before);
     if (immediateState === 'ready' && before.imagePaths?.every((ref) => ref.assetId && ref.availability === 'available')) {
@@ -1742,7 +1755,15 @@ export function ensureQueuedPromptImagesReady(
       return ensureQueuedPromptImagesReady(tabId, itemId);
     }
     const state = current ? getQueuedPromptAttachmentState(current) : 'missing';
-    return { ready: state === 'ready', state, item: current };
+    const currentInspection = current
+      ? inspectPromptImageAttachments(current.text, current.imagePaths || [])
+      : null;
+    return {
+      ready: !!current && currentInspection?.blocking !== true,
+      state,
+      item: current,
+      degraded: currentInspection?.unavailable === true,
+    };
   })().finally(() => {
     if (promptImageMaterializationInflight.get(key) === work) {
       promptImageMaterializationInflight.delete(key);

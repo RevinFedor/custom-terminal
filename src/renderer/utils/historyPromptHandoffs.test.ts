@@ -34,6 +34,11 @@ const begin = (
     label: 'PROMPT',
     text: `chip text ${handoffId}`,
   }],
+  imagePaths: [{
+    id: 1,
+    path: `/tmp/${handoffId}.png`,
+    availability: 'available',
+  }],
   submittedAt: 100,
   source: 'prompt-queue',
   statusAtSend: 'active',
@@ -105,6 +110,8 @@ test('settle preserves exact handoff identity and immutable audit proof', () => 
   assert.equal(Object.isFrozen(settled), true);
   assert.equal(Object.isFrozen(settled?.auditProof), true);
   assert.equal(Object.isFrozen(settled?.promptChips), true);
+  assert.equal(Object.isFrozen(settled?.imagePaths), true);
+  assert.equal(Object.isFrozen(settled?.imagePaths[0]), true);
 });
 
 test('duplicate begin is idempotent and cannot regress a settled handoff', () => {

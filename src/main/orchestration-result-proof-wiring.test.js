@@ -4,6 +4,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
+const mainSource = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 
 function block(start, end) {
   const from = source.indexOf(start);
@@ -41,4 +42,39 @@ test('closing a target resolves completed incomplete proofs instead of leaving a
   );
   assert.match(close, /pendingResultRuns/);
   assert.match(close, /finalizeClosedTargetResultProof\(run\.runId,[\s\S]*knownTargetClosed: true/);
+});
+
+test('Codex orchestration result uses persisted execution identity before legacy turn grouping', () => {
+  const start = mainSource.indexOf('async function _getAgentTurnResultForOrchestration');
+  const end = mainSource.indexOf('\nasync function handleOverseerRequest', start);
+  assert.ok(start >= 0 && end > start, 'could not isolate orchestration result reader');
+  const reader = mainSource.slice(start, end);
+  const exactAt = reader.indexOf('buildCodexProviderTurnAssistantResult(');
+  const legacyAt = reader.indexOf('findMatchingClaudePromptTurn({');
+
+  assert.match(reader, /targetExecutionContext/);
+  assert.match(reader, /promptUserUuid \|\| promptHash/);
+  assert.ok(exactAt >= 0 && exactAt < legacyAt, 'exact provider turn proof must precede legacy grouping');
+  assert.match(reader, /\[OrchestrationResultProof\]/);
+});
+
+test('result probing reads the persisted target session instead of a replaced live session', () => {
+  const probe = block(
+    'async function probeOrchestrationResult',
+    '\nfunction emitOrchestrationChanges',
+  );
+  assert.match(probe, /buildOrchestrationResultLookup\(run\)/);
+  assert.match(probe, /lookup\.targetExecutionContext\?\.sessionId \|\| info\?\.sessionId/);
+});
+
+test('only explicit submitted false bypasses orchestration recovery grace', () => {
+  const dispatch = block(
+    'async function dispatchDeferredOrchestrationRun',
+    '\nasync function dispatchNextDeferredOrchestrationForTarget',
+  );
+  assert.match(dispatch, /orchestrationSendFailureRecoveryPolicy\(sendResult\)/);
+  assert.match(dispatch, /resetDeferredDelivery\(runId, 'send-refused-before-submit'\)/);
+  assert.match(dispatch, /failureGraceMs: recoveryPolicy\.failureGraceMs/);
+  assert.match(dispatch, /finalizeSettledOrchestrations\(failed\.settled, reason \+ '-send-failed'\)/);
+  assert.match(dispatch, /\[OrchestrationRecovery\] immediate pre-submit failure/);
 });

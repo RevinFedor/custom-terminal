@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync } from './store/useWorkspaceStore';
+import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
 import { usePromptsStore } from './store/usePromptsStore';
@@ -37,7 +38,11 @@ import {
 import { hydratePromptQueueStore, usePromptQueueStore, serializePromptQueueCore, flushPromptQueueStoreSync } from './store/usePromptQueueStore';
 import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
-import { initializeOrchestrationStore, useOrchestrationStore } from './store/useOrchestrationStore';
+import {
+  initializeOrchestrationStore,
+  subscribeOrchestrationRunChanges,
+  useOrchestrationStore,
+} from './store/useOrchestrationStore';
 import { buildCodexRunPayload } from './utils/codexLaunch';
 import {
   getCodexDisplaySessionId,
@@ -74,6 +79,7 @@ import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProje
 import { generateTabTitleFromSession } from './utils/generateTabTitle';
 import { linkFileTab } from './utils/linkFileTab';
 import { resolveDockBusyBadgeState } from './utils/dockBusyBadgeState.mjs';
+import { shouldNavigateProjectsWithArrow } from './utils/projectArrowNavigation.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -237,11 +243,8 @@ async function getDockBusyIconDataUrl(count: number, kind: 'active' | 'inherited
   return promise;
 }
 
-function isAiForegroundProcess(info?: { hasProcess?: boolean; processName?: string; command?: string } | null) {
-  if (!info?.hasProcess) return false;
-  const text = `${info.processName || ''} ${info.command || ''}`.toLowerCase();
-  return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
-}
+// Shared predicate — see utils/aiForegroundProcess.mjs for why the match must
+// tolerate a path prefix (`node /opt/homebrew/bin/codex`).
 
 function isAiRuntimeTabLike(tab?: { commandType?: string; tabType?: string } | null): boolean {
   return !!tab && (tab.tabType === 'claude-sdk' || tab.commandType === 'claude' || tab.commandType === 'gemini' || tab.commandType === 'codex');
@@ -861,7 +864,20 @@ function App() {
   // runner above tolerates queue items appearing after mount (subscribes to
   // store deltas), so this doesn't need to block render.
   useEffect(() => { hydratePromptQueueStore(); }, []);
-  useEffect(() => { void initializeOrchestrationStore(); }, []);
+  useEffect(() => {
+    const unsubscribe = subscribeOrchestrationRunChanges((change) => {
+      const workspace = useWorkspaceStore.getState();
+      if (!change.wasCompletionBlocked && change.completionBlocked) {
+        workspace.applyTabCompletionOrchestrationState(change.sourceTabId, 'active');
+      } else if (change.releaseKind === 'success') {
+        workspace.applyTabCompletionOrchestrationState(change.sourceTabId, 'success');
+      } else if (change.releaseKind === 'abnormal') {
+        workspace.applyTabCompletionOrchestrationState(change.sourceTabId, 'abnormal');
+      }
+    });
+    void initializeOrchestrationStore();
+    return unsubscribe;
+  }, []);
 
   // Individual selectors — only re-render when specific values change (not on every store mutation)
   const view = useWorkspaceStore((s) => s.view);
@@ -902,6 +918,15 @@ function App() {
     () => new Set(inheritedBusyTabKey ? inheritedBusyTabKey.split('\u0000') : []),
     [inheritedBusyTabKey],
   );
+  const notificationInheritedBusyRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const previous = notificationInheritedBusyRef.current;
+    const workspace = useWorkspaceStore.getState();
+    for (const tabId of inheritedBusyTabIds) {
+      if (!previous.has(tabId)) workspace.applyTabCompletionOrchestrationState(tabId, 'active');
+    }
+    notificationInheritedBusyRef.current = new Set(inheritedBusyTabIds);
+  }, [inheritedBusyTabKey, inheritedBusyTabIds]);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -3662,6 +3687,8 @@ function App() {
               toolType,
               sessionIdHint: sessionId,
               text: prompt,
+              promptChips: presentationSnapshot?.promptChips || [],
+              imagePaths: presentationSnapshot?.imagePaths || [],
               handoffId,
               source: promptSource,
               statusAtSend,
@@ -3683,6 +3710,7 @@ function App() {
                 presentationSnapshot: {
                   historySessionId: sessionId,
                   promptChips: presentationSnapshot?.promptChips || [],
+                  imagePaths: presentationSnapshot?.imagePaths || [],
                   semanticTags: presentationSnapshot?.semanticTags || [],
                 },
               }),
@@ -4570,8 +4598,9 @@ function App() {
       // Arrow keys for project navigation (only when projects area is focused)
       if (activeArea === 'projects') {
         if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
-          // Skip navigation if currently editing a project name (Bug #307)
-          if (editingProjectId) return;
+          // activeArea is remembered navigation state, not proof that this
+          // keystroke came from the project rail.
+          if (!shouldNavigateProjectsWithArrow(e, activeArea, editingProjectId)) return;
 
           e.preventDefault();
           const projectIds = Array.from(openProjects.keys());

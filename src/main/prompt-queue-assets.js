@@ -64,6 +64,23 @@ function collectReferencedAssetIds(queueState) {
   return out;
 }
 
+function collectComposerDraftAssetIds(draftState) {
+  let parsed = draftState;
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed); } catch { return new Set(); }
+  }
+  const out = new Set();
+  if (!parsed || typeof parsed !== 'object') return out;
+  for (const draft of Object.values(parsed)) {
+    if (!draft || !Array.isArray(draft.images)) continue;
+    for (const ref of draft.images) {
+      const assetId = normalizeAssetId(ref?.assetId) || normalizeAssetId(ref?.path);
+      if (assetId) out.add(assetId);
+    }
+  }
+  return out;
+}
+
 async function hashFile(filePath) {
   const hash = crypto.createHash('sha256');
   await new Promise((resolve, reject) => {
@@ -237,6 +254,7 @@ class PromptQueueAssetStore {
 
 module.exports = {
   PromptQueueAssetStore,
+  collectComposerDraftAssetIds,
   collectReferencedAssetIds,
   isPathInside,
   mediaTypeFromExtension,

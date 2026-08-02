@@ -25,19 +25,39 @@ reconciliation наследует lineage из settled proof, а не перез
 source/action. Направленный A→B→C подтвердил два последовательных Rewind без
 `writer not ready`.
 
-Позднее живой прогон обнаружил обратный порядок успешного handoff. Observer успевал
+Позднее живые прогоны обнаружили обратный порядок успешного handoff. Observer успевал
 durably привязать exact child и потребить journal до того, как основной сценарий
 забирал восстановленный prompt из TUI. Откат уже был применён, но post-grab шаг
-ошибочно требовал перевести исчезнувший journal в `rollback-applied` и показывал
+пытался заново доказать commit по исчезнувшему одноразовому состоянию и показывал
 failure после фактического успеха.
 
+Первый ремонт принимал exact replay по оставшимся watcher/intent. Production-инцидент
+2026-08-02 доказал, что этого всё ещё недостаточно: source
+`019fbcbe-0dbe-7bf3-88f8-0011d0b556d5` имел 189 turns, committed child
+`019fc039-fd7a-7371-b531-4ee70b194ec0` — 187 при `rollbackTurns=2`, prompt с
+картинкой уже вернулся в input, но observer и intent штатно закрылись до позднего
+callback. UI поэтому ложно показал `codex_rewind_stable_source_proof_invalid`.
+
 После grab допустимы только два взаимоисключающих proof: source остался writer и
-journal durably перешёл в `rollback-applied`, либо exact child уже committed с
-совпадающими source/child, action generation, PTY token, run generation, intent и
-SQLite binding. Само отсутствие journal успеха не доказывает. Два последовательных
-живых перехода `019f949d → 019f94a6 → 019f94a7` подтвердили committed-child путь:
-оба target вернулись в History input, исчезли из откатанной истории и не дали
-ложного error после post-grab.
+journal durably перешёл в `rollback-applied`, либо exact child уже committed и в
+той же SQLite-транзакции оставил commit-квитанцию. Квитанция связывает renderer
+operation, внутренний request, action generation, исходный и текущий project,
+tab, source+child, PTY lifecycle/run и точную цель/depth. Поздний callback не
+требует watcher/intent, но повторно проверяет все эти поля и текущую SQLite-
+привязку. Чужой child, callback другой операции, stale generation или новая
+привязка fail-closed. После успешного ответа квитанция закрывается идемпотентно;
+restart и перенос вкладки между проектами сохраняют исходную identity операции.
+Само отсутствие journal или появление любого нового writer успеха не доказывает.
+
+Статус физической проверки 2026-08-02 нужно читать отдельно от результата
+ремонта. Exact unit/integration regression проходит, включая удалённые до
+callback watcher/intent и отрицательные operation/generation/child/CAS cases.
+Изолированный DEV E2E остался `PRECONDITION / INCONCLUSIVE`: после реального
+History Enter fresh Codex не получил durable writer proof
+(`codex_writer_settings_not_committed`), поэтому B/C и native Rewind вообще не
+запускались. Отсутствие красной Rewind-ошибки в таком прогоне не является PASS;
+физический child/receipt path остаётся `needs-observability` до среды, где fresh
+writer успешно материализуется.
 
 Ошибка до подтверждающего `Enter` закрывает только доказанно открытый native
 backtrack через `q`. Слепой cleanup через `Escape` запрещён: на idle composer
@@ -50,6 +70,15 @@ protocol-state. После возможного `Enter` автоматика в�
 Этот файл описывает safety/fallback-логику навигации, а не основной путь Timeline Rewind. Текущий default action в Timeline отправляет Claude slash-команду `/rewind`, выбирает target в родном picker'е, затем переносит восстановленный prompt из terminal composer в History textarea через тот же `grab-input` path, которым пользуется `+ clear`; terminal composer после этого должен остаться пустым. AI compact-варианты включаются только отдельными кнопками. Visual Search Strategy ниже остаётся защитой для ситуаций, когда позиционное сопоставление меню не сработало, но не должна снова становиться primary-моделью и не должна автоматически нажимать Enter при не найденной цели.
 
 ## Claude native `/rewind`: slash-команды в picker и малый viewport
+
+Дополнение 2026-08-02: полный transport-текст и строка native picker — разные
+проекции одного хода. Для сообщения вида
+`<pasted_content>…</pasted_content>\n\nобычный текст` History хранит полное тело и
+рисует из него chip, а Claude `/rewind` показывает строку с обычного текста.
+Сценарий теперь строит обе проекции одним parser'ом: `targetMenuText` используется
+только для поиска и подсчёта видимых дублей, `targetFullText` остаётся точным
+proof для post-Enter grab/hash. Paste-only ход без наблюдённой native-проекции
+не угадывается и остаётся fail-closed.
 
 Открытый шрам 2026-06-17: Claude native picker показывает не только user prompts, но и slash-command wrappers из TUI/JSONL (`/effort max`, `/model ...`). Наш Timeline эти записи скрывает tag-filter'ом, поэтому `rewindableCount`/`targetIndex` из Timeline не обязаны совпадать с числом строк в picker. На маленькой высоте терминала picker может показывать только несколько строк и строку `↑ N more above`; пользовательский симптом — после запуска обычного Rewind виден список почти из одних `/effort max`, target prompt не попадает в видимый фрейм, автоматика уходит в самый верх и висит.
 

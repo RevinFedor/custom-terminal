@@ -100,8 +100,24 @@ export interface AgentSendPromptOptions {
   model?: string;
   effort?: string;
   thinking?: string;
+  claudeExactEmptyEvidence?: Record<string, unknown> | null;
+  refreshClaudeExactEmptyEvidence?: () => Promise<{
+    success: boolean;
+    evidence?: Record<string, unknown> | null;
+    code?: string;
+    error?: string;
+  }>;
   presentationSnapshot?: {
     historySessionId?: string | null;
+    imagePaths?: Array<{
+      id: number;
+      path: string;
+      assetId?: string;
+      mediaType?: string | null;
+      size?: number;
+      availability?: 'available' | 'missing';
+      error?: string;
+    }>;
     promptChips?: Array<{
       id?: string;
       kind: 'prompt';
@@ -563,7 +579,14 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
       console.log('[CodexHistoryActions:send] done tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' success=' + (auditTimeoutAfterSubmit || result?.success !== false) + ' queued=' + (result?.queued ? 'true' : 'false') + ' submitKey=' + (result?.submitKey || '-') + ' auditSoft=' + auditTimeoutAfterSubmit);
       if (auditTimeoutAfterSubmit) {
         console.warn('[CodexHistoryActions:send] audit timeout after submitted Enter tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' - keeping local prompt as sent/queued; watcher logs remain authoritative for diagnosis');
-        return { ...result, success: true, auditWarning: result.error, userMessageAuditPending: true };
+        return {
+          ...result,
+          success: true,
+          status: 'audit-pending',
+          auditPending: true,
+          auditWarning: result.error,
+          userMessageAuditPending: true,
+        };
       }
       return result;
     })

@@ -5,6 +5,7 @@ const { once } = require('events');
 
 const DEFAULT_MAX_EXPORT_BYTES = 16 * 1024 * 1024;
 const HEADER_RESERVE_BYTES = 32 * 1024;
+const MAX_PROBLEM_DESCRIPTION_CHARS = 8000;
 const LOG_TIMESTAMP_RE = /^(\d{2}:\d{2}:\d{2}\.\d{3}) date=(\d{4}-\d{2}-\d{2})\b/;
 
 const TEXT_FIELD_NAMES = [
@@ -129,6 +130,24 @@ function createDiagnosticSanitizer({ includeMessageText = false } = {}) {
   };
 }
 
+function sanitizeProblemDescription(value) {
+  const description = typeof value === 'string'
+    ? value.trim().slice(0, MAX_PROBLEM_DESCRIPTION_CHARS)
+    : '';
+  const sanitizer = createDiagnosticSanitizer({ includeMessageText: true });
+  const lines = [];
+
+  for (const line of description.split(/\r?\n/)) {
+    const sanitized = sanitizer.sanitizeLine(line);
+    if (sanitized !== null) lines.push(sanitized);
+  }
+
+  return {
+    text: lines.join('\n').trim(),
+    stats: sanitizer.getStats(),
+  };
+}
+
 class BoundedLogBuffer {
   constructor(maxBytes) {
     this.maxBytes = Math.max(1024, maxBytes);
@@ -235,6 +254,7 @@ function buildHeader({
   environment,
   fromMs,
   toMs,
+  problemDescription,
   includeMessageText,
   sources,
   selectedLines,
@@ -243,6 +263,11 @@ function buildHeader({
 }) {
   return [
     'Noted Terminal diagnostics',
+    '',
+    '--- USER REPORT ---',
+    problemDescription || '[Not provided]',
+    '',
+    '--- DIAGNOSTIC METADATA ---',
     `Generated: ${generatedAt}`,
     `Application version: ${appVersion || 'unknown'}`,
     `Environment: ${environment}`,
@@ -266,6 +291,7 @@ async function exportDiagnosticLog({
   destinationPath,
   fromMs,
   toMs = Date.now(),
+  problemDescription = '',
   includeMessageText = false,
   appVersion = 'unknown',
   environment = 'production',
@@ -304,7 +330,13 @@ async function exportDiagnosticLog({
 
   if (selectedLines === 0) buffer.push('[No log lines found in the selected time range]');
 
-  const sanitizerStats = sanitizer.getStats();
+  const logSanitizerStats = sanitizer.getStats();
+  const sanitizedProblemDescription = sanitizeProblemDescription(problemDescription);
+  const sanitizerStats = {
+    redactions: logSanitizerStats.redactions + sanitizedProblemDescription.stats.redactions,
+    textRedactions: logSanitizerStats.textRedactions + sanitizedProblemDescription.stats.textRedactions,
+    secretRedactions: logSanitizerStats.secretRedactions + sanitizedProblemDescription.stats.secretRedactions,
+  };
   const generatedAt = new Date().toISOString();
   const header = buildHeader({
     generatedAt,
@@ -312,6 +344,7 @@ async function exportDiagnosticLog({
     environment,
     fromMs,
     toMs,
+    problemDescription: sanitizedProblemDescription.text,
     includeMessageText,
     sources: existingSources.map((sourcePath) => path.basename(sourcePath)),
     selectedLines,

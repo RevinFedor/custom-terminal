@@ -81,10 +81,11 @@ import {
 import {
   buildPromptImagePayload,
   collectPromptImageRefIds,
-  getPromptImageAttachmentState,
   getPromptImageMarkerHighlightRanges,
+  getPromptImageStatusTokenRanges,
   hasMalformedPromptImageMarker,
   haveSamePromptImageRefs,
+  inspectPromptImageAttachments,
   insertPromptImageAttachments,
   normalizePromptImageIdentity,
   remapPromptImageSelectionAfterReplacement,
@@ -96,13 +97,21 @@ import {
   collapsePortableImageImportSnapshot,
   collectPortableImagePathMarkers,
 } from '../../utils/composerClipboard.mjs';
+import { electronComposerClipboardAdapter } from '../../utils/electronComposerClipboardAdapter';
+import { shouldRecordComposerViewEvent } from '../../utils/composerViewState.mjs';
+import {
+  isComposerKeyboardTarget,
+  shouldOpenHistorySearchFromKeydown,
+} from '../../utils/composerShortcutRouting.mjs';
 import {
   composerImageUrl,
   useComposerImagePreview,
   useComposerImagePreviews,
 } from '../../utils/composerImagePreview';
+import { applyMarkerAwareWordMotion, type ComposerWordMotionEvent } from '../../utils/composerWordMotion';
 import {
   buildPasteChipMarker,
+  buildHistoryComposerPresentationParts,
   getPasteMarkerHighlightRanges,
   haveSameComposerChips,
   insertComposerSnapshotAtSelection,
@@ -110,7 +119,6 @@ import {
   isPlainTextPasteShortcut,
   isTerminalOnlyComposerDraft,
   normalizeComposerChips,
-  parsePastedContentParts,
   restoreComposerChipToText,
   retainPasteChipsForText,
   serializeComposerDraft,
@@ -295,6 +303,7 @@ interface FullHistoryEntry {
   compactSummaryRef?: HistoryPayloadRef;
   preTokens?: number;
   promptChips?: HistoryPromptDraftChip[];
+  imagePaths?: HistoryPromptDraftImageRef[];
   requiresAuditIdentity?: boolean;
   auditTimestamp?: string;
   auditHash?: string;
@@ -436,6 +445,29 @@ interface PromptHandoffMeta {
   sourceIdentity?: string;
 }
 
+interface DurablePromptIdentity {
+  requiresAuditIdentity?: boolean;
+  auditTimestamp?: string;
+  auditHash?: string;
+  auditSessionId?: string;
+  auditEntryUuid?: string;
+  sourceIdentity?: string;
+  sessionId?: string;
+}
+
+interface MidstreamPromptRecovery {
+  serializedText: string;
+  transportText: string;
+  rawText: string;
+  chips: HistoryPromptDraftChip[];
+  images: HistoryPromptDraftImageRef[];
+  at: number;
+  submittedAt: number;
+  handoffId: string;
+  statusAtSend: AgentPtyStatus;
+  durableIdentity: DurablePromptIdentity;
+}
+
 interface SuppressedPrompt {
   handoffId: string;
   text: string;
@@ -499,8 +531,18 @@ const promptPreview = (text: string, max = 80) =>
 
 const HISTORY_IMAGE_PENDING_MARKER = '[Image saving…]';
 
-const hasHistoryDraftImageError = (text: string) =>
-  /\[imageError:\s*[^\]\r\n]+?\]/i.test(String(text || ''));
+type HistoryComposerAggregate = {
+  images: HistoryPromptDraftImageRef[];
+  chips: HistoryPromptDraftChip[];
+};
+
+const historyComposerAggregateEqual = (left: unknown, right: unknown) => {
+  const a = left as HistoryComposerAggregate | null;
+  const b = right as HistoryComposerAggregate | null;
+  if (!a || !b) return a === b;
+  return JSON.stringify(a.images) === JSON.stringify(b.images)
+    && haveSameComposerChips(a.chips, b.chips);
+};
 
 const retainHistoryDraftImages = (
   text: string,
@@ -509,29 +551,73 @@ const retainHistoryDraftImages = (
   return retainPromptImageRefsForText(text, images || []) as HistoryPromptDraftImageRef[];
 };
 
-const historyDraftImageWarning = (
-  _toolType: AgentHistoryTool,
+type HistoryDraftImageNotice = {
+  message: string;
+  blocking: boolean;
+  progress: boolean;
+};
+
+const historyDraftImageNotice = (
   text: string,
   images?: HistoryPromptDraftImageRef[]
-): string | null => {
+): HistoryDraftImageNotice | null => {
   if (String(text || '').includes(HISTORY_IMAGE_PENDING_MARKER)) {
-    return 'Saving image attachment…';
+    return {
+      message: 'Saving image attachment…',
+      blocking: true,
+      progress: true,
+    };
   }
-  if (hasHistoryDraftImageError(text)) {
-    return 'Image attachment is unavailable. Remove imageError or paste the image again before sending.';
+  const inspection = inspectPromptImageAttachments(text, images || []);
+  if (inspection.firstBlocking) {
+    const issue = inspection.firstBlocking as {
+      id?: number | null;
+      marker?: string;
+      excerpt?: string;
+    };
+    const marker = issue.id ? `[Image #${issue.id}]` : (issue.marker || '[Image marker]');
+    return {
+      message: `${marker} is damaged or has no exact attachment. Near “${issue.excerpt || marker}”. Restore the complete marker or remove it before sending.`,
+      blocking: true,
+      progress: false,
+    };
   }
-  if (hasMalformedPromptImageMarker(text, images || [])) {
-    return 'Image marker is damaged or has no matching attachment. Restore the complete [Image #N] marker or remove it.';
-  }
-  const imageIds = collectPromptImageRefIds(text);
-  if (imageIds.size > 0 && getPromptImageAttachmentState({
-    text,
-    images: imageIds.size,
-    imagePaths: images || [],
-  }) !== 'ready') {
-    return 'Image file is unavailable. Paste the image again before sending.';
+  if (inspection.firstUnavailable) {
+    const issue = inspection.firstUnavailable as {
+      id?: number | null;
+      marker?: string;
+      path?: string | null;
+      excerpt?: string;
+    };
+    const marker = issue.id ? `Image #${issue.id}` : (issue.marker || 'Image attachment');
+    const pathPart = issue.path ? ` File: ${issue.path}.` : '';
+    return {
+      message: `${marker} is unavailable.${pathPart} Send remains available; this slot will be sent as an explicit imageError. Near “${issue.excerpt || marker}”.`,
+      blocking: false,
+      progress: false,
+    };
   }
   return null;
+};
+
+const historyDraftImagePreflightKey = (
+  tabId: string,
+  text: string,
+  images: HistoryPromptDraftImageRef[],
+) => {
+  const ids = Array.from(collectPromptImageRefIds(text)).sort((a, b) => a - b);
+  if (ids.length === 0 || images.length === 0) return '';
+  const refs = images
+    .filter((ref) => ids.includes(Number(ref.id)))
+    .map((ref) => [
+      Number(ref.id),
+      String(ref.assetId || ''),
+      String(ref.path || ''),
+      String(ref.availability || ''),
+      String(ref.error || ''),
+    ])
+    .sort((left, right) => Number(left[0]) - Number(right[0]));
+  return `${tabId}\u0000${ids.join(',')}\u0000${JSON.stringify(refs)}`;
 };
 
 type PromptHighlightDecoration = {
@@ -713,6 +799,7 @@ const mergeServerAndLocalEntries = (serverEntries: FullHistoryEntry[], currentEn
   const now = Date.now();
   const consumedServerUuids = new Set<string>();
   const promptChipsByServerUuid = new Map<string, HistoryPromptDraftChip[]>();
+  const imagePathsByServerUuid = new Map<string, HistoryPromptDraftImageRef[]>();
   const locals: FullHistoryEntry[] = [];
   for (const entry of currentEntries) {
     if (isLocalRewindEntry(entry)) {
@@ -741,6 +828,9 @@ const mergeServerAndLocalEntries = (serverEntries: FullHistoryEntry[], currentEn
       if ((entry.promptChips?.length || 0) > 0 && !(matched.promptChips?.length || 0)) {
         promptChipsByServerUuid.set(matched.uuid, entry.promptChips || []);
       }
+      if ((entry.imagePaths?.length || 0) > 0 && !(matched.imagePaths?.length || 0)) {
+        imagePathsByServerUuid.set(matched.uuid, entry.imagePaths || []);
+      }
       continue;
     }
     const ageMs = now - (
@@ -757,10 +847,17 @@ const mergeServerAndLocalEntries = (serverEntries: FullHistoryEntry[], currentEn
     }
     locals.push(entry);
   }
-  const decoratedServerEntries = promptChipsByServerUuid.size > 0
+  const decoratedServerEntries = promptChipsByServerUuid.size > 0 || imagePathsByServerUuid.size > 0
     ? serverEntries.map((entry) => {
         const chips = promptChipsByServerUuid.get(entry.uuid);
-        return chips ? { ...entry, promptChips: chips } : entry;
+        const imagePaths = imagePathsByServerUuid.get(entry.uuid);
+        return chips || imagePaths
+          ? {
+              ...entry,
+              ...(chips ? { promptChips: chips } : {}),
+              ...(imagePaths ? { imagePaths } : {}),
+            }
+          : entry;
       })
     : serverEntries;
   return locals.length > 0 ? [...decoratedServerEntries, ...locals] : decoratedServerEntries;
@@ -825,7 +922,8 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.compactSummary !== right.compactSummary ||
     left.compactSummaryRef?.payloadId !== right.compactSummaryRef?.payloadId ||
     left.preTokens !== right.preTokens ||
-    !haveSameComposerChips(left.promptChips || [], right.promptChips || [])
+    !haveSameComposerChips(left.promptChips || [], right.promptChips || []) ||
+    !haveSamePromptImageRefs(left.imagePaths || [], right.imagePaths || [])
   ) return false;
   const leftActions = left.actions || [];
   const rightActions = right.actions || [];
@@ -2088,13 +2186,111 @@ const HistoryChipPopover = ({
   );
 };
 
+const HistoryInlineTextPart = ({
+  text,
+  forceExpanded = false,
+}: {
+  text: string;
+  forceExpanded?: boolean;
+}) => {
+  const [expanded, setExpanded] = useState(false);
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  const needsCollapse = text.length > HISTORY_USER_TEXT_COLLAPSE_THRESHOLD;
+  const open = forceExpanded || expanded;
+  const toggleExpanded = useHistoryRevealToggle(anchorRef, expanded, setExpanded);
+  if (!needsCollapse || forceExpanded) return <>{text}</>;
+  const preview = text.slice(0, HISTORY_USER_TEXT_COLLAPSED_CHARS).trimEnd();
+  return (
+    <span ref={anchorRef}>
+      {open ? text : preview + '…'}
+      {' '}
+      <button
+        type="button"
+        className="cb-collapse-btn"
+        style={{ display: 'inline-block' }}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          toggleExpanded();
+        }}
+      >
+        {open ? 'Свернуть' : `Раскрыть полностью (${text.split('\n').length.toLocaleString()} строк)`}
+      </button>
+    </span>
+  );
+};
+
+const HistoryImageTokenThumbnail = ({ src }: { src?: string }) => {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [src]);
+  const showImage = !!src && !failed;
+  return (
+    <span className="cm-composer-token-thumbnail" aria-hidden="true">
+      {showImage && (
+        <img
+          src={src}
+          alt=""
+          draggable={false}
+          onError={() => setFailed(true)}
+        />
+      )}
+      <span
+        className="cm-composer-token-thumbnail-fallback"
+        style={{ display: showImage ? 'none' : undefined }}
+      >
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <rect x="2.5" y="3" width="15" height="14" rx="2" />
+          <circle cx="7" cy="8" r="1.5" />
+          <path d="m4.5 15 4-4 2.5 2.5 2-2 2.5 3.5" />
+        </svg>
+      </span>
+    </span>
+  );
+};
+
+const HistoryComposerToken = ({
+  kind,
+  label,
+  thumbnailUrl,
+  onClick,
+  buttonRef,
+}: {
+  kind: 'image' | 'paste';
+  label: string;
+  thumbnailUrl?: string;
+  onClick: () => void;
+  buttonRef: (node: HTMLButtonElement | null) => void;
+}) => (
+  <button
+    ref={buttonRef}
+    type="button"
+    className={`cm-composer-token cm-composer-token--${kind}`}
+    data-history-composer-token={kind}
+    style={{ margin: 0, font: 'inherit', appearance: 'none' }}
+    onClick={(event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      onClick();
+    }}
+  >
+    {kind === 'paste' && (
+      <span className="cm-composer-token-arrow" aria-hidden="true">▸</span>
+    )}
+    {kind === 'image' && <HistoryImageTokenThumbnail src={thumbnailUrl} />}
+    <span className="cm-composer-token-label">{label}</span>
+  </button>
+);
+
 const HistoryUserPromptContent = ({
   text,
   promptChips = [],
+  imagePaths = [],
   forceExpanded = false,
 }: {
   text: string;
   promptChips?: HistoryPromptDraftChip[];
+  imagePaths?: HistoryPromptDraftImageRef[];
   forceExpanded?: boolean;
 }) => {
   const [expandedPart, setExpandedPart] = useState<string | null>(null);
@@ -2103,129 +2299,156 @@ const HistoryUserPromptContent = ({
     if (node) revealAnchorsRef.current.set(partKey, node);
     else revealAnchorsRef.current.delete(partKey);
   }, []);
-  const togglePopoverPart = useCallback((partKey: string, open: boolean) => {
+  const togglePopoverPart = useCallback((partKey: string) => {
     if (forceExpanded) return;
-    setExpandedPart(open ? null : partKey);
+    setExpandedPart((current) => current === partKey ? null : partKey);
   }, [forceExpanded]);
   const closePopover = useCallback(() => setExpandedPart(null), []);
-  const promptPresentation = useMemo(
-    () => splitPromptChipPresentation({ text, chips: promptChips }),
-    [promptChips, text],
+  const presentation = useMemo(
+    () => buildHistoryComposerPresentationParts({ text, chips: promptChips, imagePaths }),
+    [imagePaths, promptChips, text],
   );
-  const parts = useMemo(
-    () => parsePastedContentParts(promptPresentation.text),
-    [promptPresentation.text],
-  );
-  if (
-    promptPresentation.chips.length === 0
-    && !parts.some((part: { kind: string }) => part.kind === 'paste')
-  ) {
+  const parts = presentation.parts as Array<any>;
+  const hasOpaquePart = parts.some((part) => part.kind !== 'text');
+  const imagePreviewUrls = useComposerImagePreviews(imagePaths);
+  const expandedImagePart = useMemo(() => {
+    if (!expandedPart?.startsWith('image:')) return null;
+    const index = Number(expandedPart.split(':')[1]);
+    const part = parts[index];
+    return part?.kind === 'image' ? part : null;
+  }, [expandedPart, parts]);
+  const expandedImageRef = expandedImagePart?.ref as HistoryPromptDraftImageRef | undefined;
+  const imageDetailPreview = useComposerImagePreview(expandedImageRef, 'detail');
+
+  if (!hasOpaquePart) {
     return <HistoryCollapsiblePrompt text={text} forceExpanded={forceExpanded} />;
   }
+
   return (
-    <div className="cb-user-parts">
-      {promptPresentation.chips.length > 0 && (
-        <div
-          data-history-user-prompt-chips
-          style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}
-        >
-          {promptPresentation.chips.map((chip: HistoryPromptDraftChip, index: number) => {
-            const partKey = `prompt:${chip.id || index}`;
-            const open = forceExpanded || expandedPart === partKey;
-            return (
-              <div
-                key={partKey}
-                style={{ maxWidth: '100%' }}
+    <div
+      className="cb-msg-text"
+      data-history-user-composer-flow
+      style={{ display: 'block' }}
+    >
+      {parts.map((part, index) => {
+        if (part.kind === 'text') {
+          return (
+            <HistoryInlineTextPart
+              key={`text:${index}`}
+              text={part.text}
+              forceExpanded={forceExpanded}
+            />
+          );
+        }
+        if (part.kind === 'prompt') {
+          const chip = part.chip as HistoryPromptDraftChip;
+          const partKey = `prompt:${index}:${chip.id || index}`;
+          const open = expandedPart === partKey;
+          return (
+            <React.Fragment key={partKey}>
+              <span
+                ref={(node) => setRevealAnchor(partKey, node)}
+                style={{ display: 'inline-flex', verticalAlign: 'middle' }}
               >
-                <span
-                  ref={(node) => setRevealAnchor(partKey, node)}
-                  style={{ display: 'inline-flex' }}
+                <ComposerChip
+                  kind="prompt"
+                  label={chip.label || 'PROMPT'}
+                  onClick={() => togglePopoverPart(partKey)}
+                />
+              </span>
+              {forceExpanded && (
+                <div className="cb-paste-chip-body">
+                  <div style={{ marginBottom: 5, color: '#777', fontSize: '0.82em' }}>
+                    {chip.text.length.toLocaleString()} символов
+                  </div>
+                  <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{chip.text}</pre>
+                </div>
+              )}
+              {!forceExpanded && open && (
+                <HistoryChipPopover
+                  anchor={revealAnchorsRef.current.get(partKey) || null}
+                  onClose={closePopover}
                 >
-                  <ComposerChip
-                    kind="prompt"
-                    label={chip.label || 'PROMPT'}
-                    onClick={() => togglePopoverPart(partKey, open)}
-                  />
-                </span>
-                {forceExpanded && (
-                  <div className="cb-paste-chip-body">
+                  <div
+                    className="cb-paste-chip-body"
+                    style={{ width: '100%', margin: 0, maxHeight: 'min(360px, calc(100vh - 32px))' }}
+                  >
                     <div style={{ marginBottom: 5, color: '#777', fontSize: '0.82em' }}>
                       {chip.text.length.toLocaleString()} символов
                     </div>
                     <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{chip.text}</pre>
                   </div>
-                )}
-                {!forceExpanded && open && (
-                  <HistoryChipPopover
-                    anchor={revealAnchorsRef.current.get(partKey) || null}
-                    onClose={closePopover}
-                  >
-                    <div
-                      className="cb-paste-chip-body"
-                      style={{
-                        width: '100%',
-                        margin: 0,
-                        maxHeight: 'min(360px, calc(100vh - 32px))',
-                      }}
-                    >
-                      <div style={{ marginBottom: 5, color: '#777', fontSize: '0.82em' }}>
-                        {chip.text.length.toLocaleString()} символов
-                      </div>
-                      <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{chip.text}</pre>
-                    </div>
-                  </HistoryChipPopover>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-      {parts.map((part: { kind: 'text' | 'paste'; text: string }, index: number) => {
-        if (part.kind === 'text') {
-          const content = part.text.trim();
-          return content
-            ? <HistoryCollapsiblePrompt key={'text:' + index} text={content} forceExpanded={forceExpanded} />
-            : null;
+                </HistoryChipPopover>
+              )}
+            </React.Fragment>
+          );
         }
-        const partKey = `paste:${index}`;
-        const open = forceExpanded || expandedPart === partKey;
-        const preview = part.text.slice(0, 60).replace(/\s+/g, ' ')
-          + (part.text.length > 60 ? '…' : '');
+        if (part.kind === 'paste') {
+          const partKey = `paste:${index}`;
+          const open = expandedPart === partKey;
+          return (
+            <React.Fragment key={partKey}>
+              <HistoryComposerToken
+                kind="paste"
+                label={`Pasted Content ${part.text.length.toLocaleString('ru-RU')} chars`}
+                buttonRef={(node) => setRevealAnchor(partKey, node)}
+                onClick={() => togglePopoverPart(partKey)}
+              />
+              {forceExpanded && <pre className="cb-paste-chip-body">{part.text}</pre>}
+              {!forceExpanded && open && (
+                <HistoryChipPopover
+                  anchor={revealAnchorsRef.current.get(partKey) || null}
+                  onClose={closePopover}
+                >
+                  <pre
+                    className="cb-paste-chip-body"
+                    style={{ width: '100%', margin: 0, maxHeight: 'min(360px, calc(100vh - 32px))' }}
+                  >
+                    {part.text}
+                  </pre>
+                </HistoryChipPopover>
+              )}
+            </React.Fragment>
+          );
+        }
+
+        const partKey = `image:${index}:${part.id}`;
+        const ref = part.ref as HistoryPromptDraftImageRef | undefined;
+        const open = expandedPart === partKey;
+        const fileName = ref?.path?.split('/').filter(Boolean).pop() || `Image #${part.id}`;
         return (
-          <div key={partKey}>
-            <button
-              ref={(node) => setRevealAnchor(partKey, node)}
-              type="button"
-              className="cb-paste-chip"
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                togglePopoverPart(partKey, open);
-              }}
-            >
-              <span className="cb-paste-chip-preview">{preview}</span>
-              <span className="cb-paste-chip-len">{part.text.length.toLocaleString()}</span>
-            </button>
-            {forceExpanded && <pre className="cb-paste-chip-body">{part.text}</pre>}
+          <React.Fragment key={partKey}>
+            <HistoryComposerToken
+              kind="image"
+              label={`image #${part.id}`}
+              thumbnailUrl={composerImageUrl(ref, imagePreviewUrls)}
+              buttonRef={(node) => setRevealAnchor(partKey, node)}
+              onClick={() => togglePopoverPart(partKey)}
+            />
             {!forceExpanded && open && (
               <HistoryChipPopover
                 anchor={revealAnchorsRef.current.get(partKey) || null}
                 onClose={closePopover}
               >
-                <pre
+                <div
                   className="cb-paste-chip-body"
-                  style={{
-                    width: '100%',
-                    margin: 0,
-                    maxHeight: 'min(360px, calc(100vh - 32px))',
-                  }}
+                  style={{ width: '100%', margin: 0, maxHeight: 'min(360px, calc(100vh - 32px))' }}
                 >
-                  {part.text}
-                </pre>
+                  <div style={{ marginBottom: 5, color: '#777', fontSize: '0.82em' }}>
+                    IMAGE #{part.id} · {fileName}
+                  </div>
+                  <AIComposerImagePreview
+                    src={expandedImagePart === part ? imageDetailPreview.url : undefined}
+                    loading={expandedImagePart === part && imageDetailPreview.loading}
+                    error={expandedImagePart === part
+                      ? imageDetailPreview.error || (!ref ? 'Image reference is unavailable in this History entry.' : null)
+                      : null}
+                    alt={`Image attachment #${part.id}`}
+                  />
+                </div>
               </HistoryChipPopover>
             )}
-          </div>
+          </React.Fragment>
         );
       })}
     </div>
@@ -2379,6 +2602,7 @@ const HistoryUserEntry = memo(({
       <HistoryUserPromptContent
         text={entry.content}
         promptChips={entry.promptChips}
+        imagePaths={entry.imagePaths}
         forceExpanded={forceExpanded}
       />
     </ConversationMessage>
@@ -2979,7 +3203,7 @@ const getDraftNoticeMeta = (message: string) => {
       tone: 'info' as const,
     };
   }
-  if (/image placeholder|imageError|image attachment|image marker|image file|картинк|вложени/i.test(message)) {
+  if (/\bimage(?:\s+#?\d+)?\b|imageError|image attachment|image marker|image file|картинк|вложени/i.test(message)) {
     return {
       label: 'Image needs attention',
       tone: 'warning' as const,
@@ -3595,6 +3819,7 @@ function AgentHistoryControls({
       statusAtSend: AgentPtyStatus;
       submittedAt: number;
       promptChips?: HistoryPromptDraftChip[];
+      imagePaths?: HistoryPromptDraftImageRef[];
       requiresAuditIdentity?: boolean;
       auditTimestamp?: string;
       auditHash?: string;
@@ -3616,7 +3841,11 @@ function AgentHistoryControls({
       sourceIdentity?: string;
     },
   ) => void;
-  hasDurablePrompt: (text: string, submittedAt: number) => boolean;
+  hasDurablePrompt: (
+    text: string,
+    submittedAt: number,
+    identity?: DurablePromptIdentity,
+  ) => boolean;
   rewindLocked: boolean;
   rewindPhase?: RewindOperationPhase;
   rewindMessage?: string;
@@ -3654,10 +3883,23 @@ function AgentHistoryControls({
   // can crash History with React #185 when AgentHistoryControls mounts.
   const draftImages = useUIStore(useCallback((s) => s.historyPromptDraftImages[tabId] || EMPTY_HISTORY_DRAFT_IMAGES, [tabId]));
   const draftChips = useUIStore(useCallback((s) => s.historyPromptDraftChips[tabId] || EMPTY_HISTORY_DRAFT_CHIPS, [tabId]));
+  const composerHistoryPayload = useMemo<HistoryComposerAggregate>(() => ({
+    images: draftImages,
+    chips: draftChips,
+  }), [draftChips, draftImages]);
+  const deriveComposerHistoryPayload = useCallback((nextText: string, previous: unknown) => {
+    const aggregate = previous as HistoryComposerAggregate | null;
+    return {
+      images: retainHistoryDraftImages(nextText, aggregate?.images || []),
+      chips: retainPasteChipsForText(nextText, aggregate?.chips || []) as HistoryPromptDraftChip[],
+    } satisfies HistoryComposerAggregate;
+  }, []);
   const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
+  const setHistoryComposerView = useUIStore((s) => s.setHistoryComposerView);
+  const flushHistoryComposerDrafts = useUIStore((s) => s.flushHistoryComposerDrafts);
+  const flushHistoryComposerView = useUIStore((s) => s.flushHistoryComposerView);
   const setHistoryComposerAvailability = useUIStore((s) => s.setHistoryComposerAvailability);
   const setPromptQueueInputSurface = useUIStore((s) => s.setPromptQueueInputSurface);
-  const removeHistoryPromptDraftChip = useUIStore((s) => s.removeHistoryPromptDraftChip);
   const setPrompt = useCallback((
     next: string | ((prev: string) => string),
     options: HistoryPromptDraftWriteOptions = { preserveImages: true, preserveChips: true }
@@ -3685,8 +3927,59 @@ function AgentHistoryControls({
   const controlsRef = useRef<HTMLDivElement | null>(null);
   const statusCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const promptTextareaRef = useRef<ComposerEditorHandle | null>(null);
-  const promptCaretRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
+  const initialComposerView = useUIStore.getState().historyComposerViewByTab[tabId];
+  const promptCaretRef = useRef<{ start: number; end: number }>({
+    start: initialComposerView?.selectionStart || 0,
+    end: initialComposerView?.selectionEnd || 0,
+  });
   const tabIdRef = useRef(tabId);
+  tabIdRef.current = tabId;
+  const composerViewRenderedTabRef = useRef(tabId);
+  const composerViewRestoringTabRef = useRef<string | null>(tabId);
+  if (composerViewRenderedTabRef.current !== tabId) {
+    composerViewRenderedTabRef.current = tabId;
+    composerViewRestoringTabRef.current = tabId;
+  }
+  const applyHistoryComposerSnapshot = useCallback(({
+    ownerTabId,
+    text,
+    images,
+    chips,
+    selectionStart,
+    selectionEnd = selectionStart,
+    history = 'add',
+    userEvent = 'input',
+  }: {
+    ownerTabId: string;
+    text: string;
+    images: HistoryPromptDraftImageRef[];
+    chips: HistoryPromptDraftChip[];
+    selectionStart: number;
+    selectionEnd?: number;
+    history?: 'add' | 'replace' | 'external';
+    userEvent?: string;
+  }) => {
+    const editor = promptTextareaRef.current;
+    const ownsMountedEditor = tabIdRef.current === ownerTabId
+      && editor?.getAttribute('data-history-composer-tab-id') === ownerTabId;
+    if (ownsMountedEditor) {
+      editor.applySnapshot({
+        value: text,
+        selectionStart,
+        selectionEnd,
+        history,
+        historyPayload: { images, chips } satisfies HistoryComposerAggregate,
+        userEvent,
+      });
+    }
+    // Programmatic async completion must not depend on the current keyboard
+    // lock callback accepting a user edit. Keep the durable host draft exact;
+    // the editor callback is normally a no-op duplicate of this write.
+    setHistoryPromptDraft(ownerTabId, text, { images, chips });
+    if (tabIdRef.current === ownerTabId) {
+      promptCaretRef.current = { start: selectionStart, end: selectionEnd };
+    }
+  }, [setHistoryPromptDraft]);
   const activityTimingOwnerKeyRef = useRef(tabId + ':' + toolType);
   const activityTimingRequestSeqRef = useRef(0);
   const statusRef = useRef<AgentPtyStatus>('inactive');
@@ -3706,9 +3999,81 @@ function AgentHistoryControls({
     element.style.overflowY = contentHeight > historyComposerMaxHeight ? 'auto' : 'hidden';
   }, [historyComposerMaxHeight, historyComposerMinHeight]);
 
+  const captureHistoryComposerViewFor = useCallback((
+    ownerTabId: string,
+    persist: boolean,
+    reason: 'blur' | 'owner-cleanup' | 'beforeunload',
+  ) => {
+    const editor = promptTextareaRef.current;
+    if (editor?.getAttribute('data-history-composer-tab-id') === ownerTabId) {
+      const snapshot = {
+        selectionStart: editor.selectionStart,
+        selectionEnd: editor.selectionEnd,
+        scrollTop: editor.scrollTop,
+      };
+      setHistoryComposerView(ownerTabId, snapshot);
+      console.log('[HistoryComposerView] capture tab=' + ownerTabId.slice(-12)
+        + ' reason=' + reason
+        + ' selection=' + snapshot.selectionStart + ':' + snapshot.selectionEnd
+        + ' scrollTop=' + snapshot.scrollTop.toFixed(3));
+    }
+    if (persist) {
+      flushHistoryComposerDrafts();
+      flushHistoryComposerView();
+    }
+  }, [flushHistoryComposerDrafts, flushHistoryComposerView, setHistoryComposerView]);
+
+  const captureHistoryComposerView = useCallback((
+    persist: boolean,
+    reason: 'blur' | 'owner-cleanup' | 'beforeunload',
+  ) => {
+    captureHistoryComposerViewFor(tabId, persist, reason);
+  }, [captureHistoryComposerViewFor, tabId]);
+
   useLayoutEffect(() => {
     syncPromptTextareaHeight();
   }, [prompt, syncPromptTextareaHeight]);
+
+  useLayoutEffect(() => {
+    const ownerTabId = tabId;
+    const editor = promptTextareaRef.current;
+    composerViewRestoringTabRef.current = ownerTabId;
+    const saved = useUIStore.getState().historyComposerViewByTab[ownerTabId] || {
+      selectionStart: 0,
+      selectionEnd: 0,
+      scrollTop: 0,
+    };
+    if (editor && editor.getAttribute('data-history-composer-tab-id') === ownerTabId) {
+      editor.restoreViewState(saved, (applied) => {
+        if (tabIdRef.current !== ownerTabId
+            || promptTextareaRef.current !== editor
+            || editor.getAttribute('data-history-composer-tab-id') !== ownerTabId) return;
+        promptCaretRef.current = {
+          start: applied.selectionStart,
+          end: applied.selectionEnd,
+        };
+        composerViewRestoringTabRef.current = null;
+        console.log('[HistoryComposerView] restore tab=' + ownerTabId.slice(-12)
+          + ' selection=' + applied.selectionStart + ':' + applied.selectionEnd
+          + ' scrollTop=' + applied.scrollTop.toFixed(3));
+      });
+    } else if (tabIdRef.current === ownerTabId) {
+      // A child ref is assigned before parent layout effects. This branch is a
+      // defensive fail-open for a surface that vanished in the same commit.
+      composerViewRestoringTabRef.current = null;
+    }
+    return () => {
+      // Capture the live editor synchronously before its owner DOM disappears.
+      // This covers keyboard/tab switches that do not emit a final scroll event.
+      captureHistoryComposerViewFor(ownerTabId, true, 'owner-cleanup');
+    };
+  }, [captureHistoryComposerViewFor, tabId]);
+
+  useEffect(() => {
+    const persistBeforeClose = () => captureHistoryComposerView(true, 'beforeunload');
+    window.addEventListener('beforeunload', persistBeforeClose);
+    return () => window.removeEventListener('beforeunload', persistBeforeClose);
+  }, [captureHistoryComposerView]);
 
   useEffect(() => {
     const element = promptTextareaRef.current;
@@ -3727,9 +4092,25 @@ function AgentHistoryControls({
 
   useEffect(() => {
     const focusComposer = (event: Event) => {
-      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        selectionStart?: number;
+        selectionEnd?: number;
+      }>).detail;
       if (detail?.tabId !== tabId) return;
-      requestAnimationFrame(() => promptTextareaRef.current?.focus());
+      requestAnimationFrame(() => {
+        const editor = promptTextareaRef.current;
+        if (!editor) return;
+        editor.focus();
+        if (!Number.isFinite(detail.selectionStart)) return;
+        const start = Math.max(0, Math.min(detail.selectionStart!, editor.value.length));
+        const requestedEnd = Number.isFinite(detail.selectionEnd)
+          ? detail.selectionEnd!
+          : start;
+        const end = Math.max(start, Math.min(requestedEnd, editor.value.length));
+        editor.setSelectionRange(start, end);
+        promptCaretRef.current = { start, end };
+      });
     };
     window.addEventListener('history-panel:focus-composer', focusComposer);
     return () => window.removeEventListener('history-panel:focus-composer', focusComposer);
@@ -3742,17 +4123,7 @@ function AgentHistoryControls({
   const pasteBusyRef = useRef(false);
   const pendingQuestionRef = useRef<AgentPendingQuestion | null>(null);
   const answeringQuestionRef = useRef(false);
-  const midstreamPromptRecoveryRef = useRef<{
-    serializedText: string;
-    transportText: string;
-    rawText: string;
-    chips: HistoryPromptDraftChip[];
-    images: HistoryPromptDraftImageRef[];
-    at: number;
-    submittedAt: number;
-    handoffId: string;
-    statusAtSend: AgentPtyStatus;
-  } | null>(null);
+  const midstreamPromptRecoveryRef = useRef<MidstreamPromptRecovery | null>(null);
   const interruptRecoveryInFlightRef = useRef(false);
   const interruptAwaitRef = useRef<{ tabId: string; seq: number; at: number } | null>(null);
   const emptyDraftNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -3992,12 +4363,35 @@ function AgentHistoryControls({
       });
   }, [onHistoryRefresh, refreshActivityTiming, runtime.logPrefix, tabId]);
 
+  const durableIdentityForPending = useCallback((pending: MidstreamPromptRecovery) => {
+    const handoff = getHistoryPromptHandoffsSnapshot(tabId)
+      .find((candidate) => candidate.handoffId === pending.handoffId);
+    const proof = handoff?.auditProof || null;
+    return {
+      ...pending.durableIdentity,
+      requiresAuditIdentity: true,
+      auditTimestamp: proof?.auditTimestamp || pending.durableIdentity.auditTimestamp,
+      auditHash: proof?.actualHash || pending.durableIdentity.auditHash,
+      auditSessionId: proof?.sessionId || pending.durableIdentity.auditSessionId,
+      auditEntryUuid: proof?.entryUuid || pending.durableIdentity.auditEntryUuid,
+      sourceIdentity: proof?.sourceIdentity || pending.durableIdentity.sourceIdentity,
+      sessionId: proof?.sessionId || pending.durableIdentity.sessionId,
+    } satisfies DurablePromptIdentity;
+  }, [tabId]);
+
+  const hasDurablePendingPrompt = useCallback((pending: MidstreamPromptRecovery) => (
+    hasDurablePrompt(
+      pending.serializedText,
+      pending.submittedAt,
+      durableIdentityForPending(pending),
+    )
+  ), [durableIdentityForPending, hasDurablePrompt]);
+
   const refreshDurablePromptProof = useCallback(async (
-    text: string,
-    submittedAt: number,
+    pending: MidstreamPromptRecovery,
     reason: string,
   ) => {
-    if (hasDurablePrompt(text, submittedAt)) return true;
+    if (hasDurablePendingPrompt(pending)) return true;
     try {
       await onHistoryRefresh(reason);
     } catch (e: any) {
@@ -4006,8 +4400,8 @@ function AgentHistoryControls({
         + ' reason=' + reason
         + ' error=' + String(e?.message || e));
     }
-    return hasDurablePrompt(text, submittedAt);
-  }, [hasDurablePrompt, onHistoryRefresh, runtime.logPrefix, tabId]);
+    return hasDurablePendingPrompt(pending);
+  }, [hasDurablePendingPrompt, onHistoryRefresh, runtime.logPrefix, tabId]);
 
   useEffect(() => {
     tabIdRef.current = tabId;
@@ -4254,7 +4648,13 @@ function AgentHistoryControls({
       console.log('[' + runtime.logPrefix + ':draft] preflight tab=' + tabId.slice(-12) + ' reason=' + reason + ' hasDraft=' + draftState.hasDraft + ' source=' + draftState.source);
       const draftDecision = classifyAgentDraftPreflight(draftState);
       if (draftDecision.decision === 'clear') {
-        return { stale: false, text: '', images: 0, imagePaths: [] as HistoryPromptDraftImageRef[] };
+        return {
+          stale: false,
+          text: '',
+          images: 0,
+          imagePaths: [] as HistoryPromptDraftImageRef[],
+          claudeExactEmptyEvidence: null,
+        };
       }
       if (draftDecision.decision === 'unknown' && draftState.exactCaptureRecommended !== true) {
         throw new Error(runtime.label + ' terminal draft state is unknown; send stopped before touching terminal input.');
@@ -4264,7 +4664,13 @@ function AgentHistoryControls({
     const result = await runtime.grabDraft(tabId, draftState ? {
       draftProof: buildExactDraftCaptureProof(draftState),
     } : undefined);
-    if (tabIdRef.current !== requestTabId) return { stale: true, text: '', images: 0, imagePaths: [] as HistoryPromptDraftImageRef[] };
+    if (tabIdRef.current !== requestTabId) return {
+      stale: true,
+      text: '',
+      images: 0,
+      imagePaths: [] as HistoryPromptDraftImageRef[],
+      claudeExactEmptyEvidence: null,
+    };
     if (!result?.success) {
       const message = draftGrabErrorText(result);
       console.warn('[' + runtime.logPrefix + ':draft] grab-failed tab=' + tabId.slice(-12) + ' reason=' + reason + ' error=' + (result?.error || 'unknown'));
@@ -4284,7 +4690,21 @@ function AgentHistoryControls({
         + tabId.slice(-12) + ' reason=' + (conflict.reason || '-'));
     }
     console.log('[' + runtime.logPrefix + ':draft] grab-ok tab=' + tabId.slice(-12) + ' reason=' + reason + ' chars=' + text.length + ' images=' + images);
-    return { stale: false, text, images, imagePaths };
+    return {
+      stale: false,
+      text,
+      images,
+      imagePaths,
+      claudeExactEmptyEvidence: runtime.toolType === 'claude'
+        && draftState
+        && !text
+        && images === 0
+        && result?.proofOutcome === 'absent'
+        && result?.terminalIdentityStable === true
+        && result?.editorReturnReady === true
+        ? result as Record<string, unknown>
+        : null,
+    };
   }, [runtime, tabId]);
 
   useEffect(() => {
@@ -4347,7 +4767,7 @@ function AgentHistoryControls({
       (async () => {
         const attempt = 1;
         if (tabIdRef.current !== requestTabId) return;
-        if (hasDurablePrompt(pending.serializedText, pending.submittedAt)) {
+        if (hasDurablePendingPrompt(pending)) {
           console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery accepted tab=' + tabId.slice(-12)
             + ' attempt=' + attempt
             + ' handoff=' + pending.handoffId
@@ -4368,7 +4788,7 @@ function AgentHistoryControls({
               console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + attempt);
             } else {
               const ownership = resolveInterruptedPromptOwnership({
-                durablePromptExists: hasDurablePrompt(pending.serializedText, pending.submittedAt),
+                durablePromptExists: hasDurablePendingPrompt(pending),
                 returnedDraftExists: true,
                 returnedDraftMatchesHandoff: false,
               });
@@ -4392,12 +4812,8 @@ function AgentHistoryControls({
                 || terminalIdentity === normalizeHistoryPromptIdentityText(pending.transportText);
               const confirmedOwnership = resolveInterruptedPromptOwnership({
                 durablePromptExists: authoringProof
-                  ? await refreshDurablePromptProof(
-                      pending.serializedText,
-                      pending.submittedAt,
-                      'interrupt-exact-draft',
-                    )
-                  : hasDurablePrompt(pending.serializedText, pending.submittedAt),
+                  ? await refreshDurablePromptProof(pending, 'interrupt-exact-draft')
+                  : hasDurablePendingPrompt(pending),
                 returnedDraftExists: true,
                 returnedDraftMatchesHandoff: authoringProof,
               });
@@ -4470,8 +4886,7 @@ function AgentHistoryControls({
         if (tabIdRef.current !== requestTabId) return;
         const ownership = resolveInterruptedPromptOwnership({
           durablePromptExists: await refreshDurablePromptProof(
-            pending.serializedText,
-            pending.submittedAt,
+            pending,
             'interrupt-empty-draft',
           ),
           returnedDraftExists: false,
@@ -4506,7 +4921,7 @@ function AgentHistoryControls({
     return () => {
       ipcRenderer.removeListener(runtime.busyEvent, handleInterruptRecovery);
     };
-  }, [hasDurablePrompt, isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshDurablePromptProof, refreshPresence, runtime, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
+  }, [hasDurablePendingPrompt, isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshDurablePromptProof, refreshPresence, runtime, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
 
   useEffect(() => {
     if (!interruptAwaiting || status === 'busy') return;
@@ -4621,16 +5036,28 @@ function AgentHistoryControls({
     payload: string;
     images: HistoryPromptDraftImageRef[];
     warning?: string;
+    degraded?: boolean;
   }> => {
     const retainedImages = retainHistoryDraftImages(text, images);
-    const immediateWarning = historyDraftImageWarning(runtime.toolType, text, retainedImages);
-    if (immediateWarning) {
-      return { success: false, payload: text, images: retainedImages, warning: immediateWarning };
+    const immediateNotice = historyDraftImageNotice(text, retainedImages);
+    if (immediateNotice?.blocking) {
+      return {
+        success: false,
+        payload: text,
+        images: retainedImages,
+        warning: immediateNotice.message,
+      };
     }
 
     const imageIds = collectPromptImageRefIds(text);
     if (imageIds.size === 0) {
-      return { success: true, payload: text, images: [] };
+      return {
+        success: true,
+        payload: text,
+        images: [],
+        warning: immediateNotice?.message,
+        degraded: immediateNotice?.blocking === false,
+      };
     }
 
     try {
@@ -4654,25 +5081,25 @@ function AgentHistoryControls({
         text,
         returnedRefs,
       );
-      const state = getPromptImageAttachmentState({
-        text,
-        images: imageIds.size,
-        imagePaths: materializedImages,
-      });
-      if (state !== 'ready') {
+      const materializedInspection = inspectPromptImageAttachments(text, materializedImages);
+      if (materializedInspection.blocking) {
         return {
           success: false,
           payload: text,
           images: materializedImages,
-          warning: 'Image file is unavailable. The draft was kept; paste the image again before sending.',
+          warning: historyDraftImageNotice(text, materializedImages)?.message
+            || 'Image attachment identity is incomplete. The draft was kept.',
         };
       }
+      const materializedNotice = historyDraftImageNotice(text, materializedImages);
       return {
         success: true,
         payload: buildPromptImagePayload(text, materializedImages, {
           missingCode: 'history_image_path_unavailable',
         }),
         images: materializedImages,
+        warning: materializedNotice?.message,
+        degraded: materializedInspection.unavailable,
       };
     } catch (cause: any) {
       console.warn('[' + runtime.logPrefix + ':images] materialize failed tab=' + tabId.slice(-12)
@@ -4684,7 +5111,7 @@ function AgentHistoryControls({
         warning: 'Could not verify the image file. The draft was kept; try pasting the image again.',
       };
     }
-  }, [runtime.logPrefix, runtime.toolType, tabId]);
+  }, [runtime.logPrefix, tabId]);
 
   const runAction = useCallback(async (kind: 'resume' | 'send' | 'interrupt' | 'stop') => {
     if (kind === 'send') {
@@ -4877,6 +5304,7 @@ function AgentHistoryControls({
         if (!presentationText) return;
         if (pendingQuestionRef.current) throw new Error(runtime.label + ' is waiting for a question answer');
         const statusAtSend = statusRef.current;
+        let claudeExactEmptyEvidence: Record<string, unknown> | null = null;
         const acceptsBusyPrompt = statusAtSend === 'busy' && runtime.allowSendWhileBusy;
         const canLaunchBeforeSend = statusAtSend === 'inactive' && (
           sessionId
@@ -4889,6 +5317,7 @@ function AgentHistoryControls({
         if (statusAtSend === 'active') {
           const terminalDraft = await readTerminalDraft('send-preflight');
           if (terminalDraft.stale || !isCurrentAction()) return;
+          claudeExactEmptyEvidence = terminalDraft.claudeExactEmptyEvidence || null;
           if (terminalDraft.text) {
             const nextEditableText = prependPromptText(rawDraftSnapshot, terminalDraft.text);
             const mergedImages = retainHistoryDraftImages(nextEditableText, [
@@ -4945,6 +5374,15 @@ function AgentHistoryControls({
           requestAnimationFrame(() => promptTextareaRef.current?.focus());
           return;
         }
+        if (preparedPrompt.degraded) {
+          const degradedInspection = inspectPromptImageAttachments(
+            rawDraftSnapshot,
+            preparedPrompt.images,
+          );
+          console.warn('[' + runtime.logPrefix + ':images] send degraded tab=' + actionTabId.slice(-12)
+            + ' unavailable=' + degradedInspection.issues.filter((issue: any) => !issue.blocking).length
+            + ' action=replace-with-imageError');
+        }
         const sendDraftImages = preparedPrompt.images;
         const sendPayload = serializeComposerDraft({
           text: preparedPrompt.payload,
@@ -4991,6 +5429,7 @@ function AgentHistoryControls({
           sessionIdHint: sessionId || null,
           text: presentationText,
           promptChips: promptChipsForHistory,
+          imagePaths: sendDraftImages,
           submittedAt,
           source: 'history-panel',
           statusAtSend,
@@ -5001,6 +5440,7 @@ function AgentHistoryControls({
           statusAtSend,
           submittedAt,
           promptChips: promptChipsForHistory,
+          imagePaths: sendDraftImages,
           requiresAuditIdentity: true,
         });
         const latestText = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
@@ -5044,10 +5484,12 @@ function AgentHistoryControls({
           statusAtSend,
           queue: statusAtSend === 'busy',
           returnDraftOnConflict: true,
+          claudeExactEmptyEvidence,
           coordinatedSendToken,
           presentationSnapshot: {
             historySessionId: sessionId || null,
             promptChips: promptChipsForHistory,
+            imagePaths: sendDraftImages,
           },
         });
         const resultOwnershipTransferred = queueSendTransferredOwnership(result);
@@ -5126,6 +5568,15 @@ function AgentHistoryControls({
           statusAtSend: (effectiveStatusAtSend === 'active' || effectiveStatusAtSend === 'busy')
             ? effectiveStatusAtSend
             : statusAtSend,
+          durableIdentity: {
+            requiresAuditIdentity: true,
+            auditTimestamp: sendAuditIdentity.auditTimestamp,
+            auditHash: sendAuditIdentity.auditHash,
+            auditSessionId: sendAuditIdentity.auditSessionId,
+            auditEntryUuid: sendAuditIdentity.auditEntryUuid,
+            sourceIdentity: sendAuditIdentity.sourceIdentity,
+            sessionId: sendAuditIdentity.auditSessionId || sessionId || undefined,
+          },
         };
         console.log('[' + runtime.logPrefix + ':draft] send tracked tab=' + tabId.slice(-12) + ' handoff=' + handoffId + ' statusAtSend=' + statusAtSend + ' chars=' + presentationText.length + ' chips=' + sourceDraftChips.length);
         const coordinatedAfterSend = getCoordinatedAgentAction(actionTabId);
@@ -5435,11 +5886,66 @@ function AgentHistoryControls({
     && !isCancellingTurn
     && !pendingQuestion
     && !rewindLocked;
-  const derivedDraftWarning = useMemo(
-    () => historyDraftImageWarning(toolType, prompt, draftImages),
-    [draftImages, prompt, toolType]
+  const derivedDraftImageNotice = useMemo(
+    () => historyDraftImageNotice(prompt, draftImages),
+    [draftImages, prompt]
   );
+  const derivedDraftWarning = derivedDraftImageNotice?.message || null;
   const historyImagePastePending = prompt.includes(HISTORY_IMAGE_PENDING_MARKER);
+  const draftImagePreflightKey = useMemo(
+    () => historyDraftImagePreflightKey(tabId, prompt, draftImages),
+    [draftImages, prompt, tabId],
+  );
+  const lastDraftImagePreflightRef = useRef('');
+  useEffect(() => {
+    if (!draftImagePreflightKey || historyImagePastePending) return;
+    if (draftImages.every((ref) => ref.availability === 'missing')) return;
+    if (lastDraftImagePreflightRef.current === draftImagePreflightKey) return;
+    lastDraftImagePreflightRef.current = draftImagePreflightKey;
+    const expectedText = prompt;
+    const expectedImages = draftImages.map((ref) => ({ ...ref }));
+    let cancelled = false;
+    void ipcRenderer.invoke('prompt-queue:materialize-image-refs', {
+      refs: expectedImages,
+    }).then((result: any) => {
+      if (cancelled || tabIdRef.current !== tabId) return;
+      const returnedRefs = Array.isArray(result?.refs)
+        ? result.refs as HistoryPromptDraftImageRef[]
+        : [];
+      const expectedIds = collectPromptImageRefIds(expectedText);
+      const returnedIds = new Set(returnedRefs.map((ref) => Number(ref.id)));
+      if (Array.from(expectedIds).some((id) => !returnedIds.has(id))) {
+        console.warn('[HistoryImages:Preflight] incomplete result tab=' + tabId.slice(-12)
+          + ' expected=' + expectedIds.size + ' returned=' + returnedIds.size);
+        return;
+      }
+      const state = useUIStore.getState();
+      const currentText = state.historyPromptDrafts[tabId] || '';
+      const currentImages = state.historyPromptDraftImages[tabId] || [];
+      const currentKey = historyDraftImagePreflightKey(tabId, currentText, currentImages);
+      if (currentKey !== draftImagePreflightKey) {
+        console.log('[HistoryImages:Preflight] stale result ignored tab=' + tabId.slice(-12));
+        return;
+      }
+      const nextImages = retainHistoryDraftImages(currentText, returnedRefs);
+      const nextKey = historyDraftImagePreflightKey(tabId, currentText, nextImages);
+      lastDraftImagePreflightRef.current = nextKey;
+      if (nextKey === currentKey) return;
+      setHistoryPromptDraft(tabId, currentText, {
+        images: nextImages,
+        preserveChips: true,
+      });
+      const inspection = inspectPromptImageAttachments(currentText, nextImages);
+      console.warn('[HistoryImages:Preflight] availability changed tab=' + tabId.slice(-12)
+        + ' unavailable=' + inspection.issues.filter((issue: any) => !issue.blocking).length
+        + ' blocking=' + inspection.issues.filter((issue: any) => issue.blocking).length);
+    }).catch((cause: any) => {
+      if (cancelled) return;
+      console.warn('[HistoryImages:Preflight] check failed tab=' + tabId.slice(-12)
+        + ' error=' + String(cause?.message || cause));
+    });
+    return () => { cancelled = true; };
+  }, [draftImagePreflightKey, draftImages, historyImagePastePending, prompt, setHistoryPromptDraft, tabId]);
   const promptImageMarkerRanges = useMemo(
     () => getPromptImageMarkerHighlightRanges(prompt, draftImages) as Array<{ start: number; end: number; id: number }>,
     [draftImages, prompt],
@@ -5448,6 +5954,16 @@ function AgentHistoryControls({
     () => getPasteMarkerHighlightRanges(prompt, draftChips) as Array<{ start: number; end: number; id: string }>,
     [draftChips, prompt],
   );
+  // Opt+Arrow crosses an opaque marker in ONE step (see composerWordMotion).
+  // Both marker families reuse the spans already computed for the highlight
+  // layer, so motion can never disagree with what is painted.
+  const handleComposerWordMotion = useCallback((
+    event: ComposerWordMotionEvent,
+  ): boolean => applyMarkerAwareWordMotion(
+    event,
+    [...promptImageMarkerRanges, ...promptPasteMarkerRanges],
+    (selection) => { promptCaretRef.current = selection; },
+  ), [promptImageMarkerRanges, promptPasteMarkerRanges]);
   const draftImagePreviewUrls = useComposerImagePreviews(draftImages);
   const promptComposerTokens = useMemo<ComposerInlineToken[]>(() => {
     const refsById = new Map(draftImages.map((ref) => [Number(ref.id), ref]));
@@ -5457,7 +5973,7 @@ function AgentHistoryControls({
         from: range.start,
         to: range.end,
         kind: 'image' as const,
-        label: 'image',
+        label: `image #${range.id}`,
         thumbnailUrl: composerImageUrl(refsById.get(range.id), draftImagePreviewUrls),
       })),
       ...promptPasteMarkerRanges.map((range) => ({
@@ -5468,18 +5984,14 @@ function AgentHistoryControls({
         label: prompt.slice(range.start + 1, Math.max(range.start + 1, range.end - 1)),
       })),
     ];
-    const statusPattern = /\[Image saving…\]|\[(?:imagePath|imageError):[^\]\r\n]+\]/gi;
-    let match: RegExpExecArray | null;
-    while ((match = statusPattern.exec(prompt)) !== null) {
-      result.push({
-        id: `status:${match.index}`,
-        from: match.index,
-        to: match.index + match[0].length,
-        kind: match[0] === HISTORY_IMAGE_PENDING_MARKER ? 'pending' : 'error',
-        label: match[0],
-        replace: false,
-      });
-    }
+    result.push(...getPromptImageStatusTokenRanges(prompt).map((range) => ({
+      id: `status:${range.start}`,
+      from: range.start,
+      to: range.end,
+      kind: range.kind,
+      label: range.label,
+      replace: range.replace,
+    })));
     return result;
   }, [draftImagePreviewUrls, draftImages, prompt, promptImageMarkerRanges, promptPasteMarkerRanges]);
   const previewedDraftImageRange = useMemo(() => (
@@ -5514,7 +6026,7 @@ function AgentHistoryControls({
     && !pendingQuestion
     && !controlsLocked
     && !historyImagePastePending
-    && !derivedDraftWarning;
+    && !derivedDraftImageNotice?.blocking;
   const terminalOnlySlashDraft = isTerminalOnlyComposerDraft(prompt);
   const canSend = canAcceptSubmitIntent
     && !terminalOnlySlashDraft
@@ -5527,12 +6039,9 @@ function AgentHistoryControls({
       && !busyAction);
   const visibleDraftWarning = draftWarning || derivedDraftWarning;
   const draftNoticeMeta = visibleDraftWarning ? getDraftNoticeMeta(visibleDraftWarning) : null;
-  // Attachment problems are NOT terminal status. Sitting next to the terminal
-  // icon and the agent lifecycle, an image warning reads as "the terminal
-  // broke"; it also stayed pinned there long after the user moved on. Image
-  // notices are announced once as a toast instead, and the status row keeps
-  // only agent state. Non-image draft notices (locked input, restored prompt)
-  // remain inline — they describe the field the user is looking at.
+  // Attachment problems are authoring state, not terminal status. Keep them
+  // out of the lifecycle row, but persist them immediately above the input so
+  // the user sees the exact slot/path before choosing Send.
   const isImageDraftNotice = draftNoticeMeta?.label === 'Image needs attention'
     || draftNoticeMeta?.label === 'Attaching image';
   // "Saving image attachment…" is PROGRESS, not a problem: it appears for the
@@ -5541,18 +6050,42 @@ function AgentHistoryControls({
   // corner of a perfectly normal paste — the exact false alarm the user hit.
   const isImageProgressNotice = draftNoticeMeta?.label === 'Attaching image';
   const inlineDraftNoticeMeta = isImageDraftNotice ? null : draftNoticeMeta;
-  const announcedImageNoticeRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!isImageDraftNotice || isImageProgressNotice || !visibleDraftWarning) {
-      announcedImageNoticeRef.current = null;
-      return;
-    }
-    // One toast per distinct message: the derived warning recomputes on every
-    // keystroke, and re-announcing it would spam the corner while typing.
-    if (announcedImageNoticeRef.current === visibleDraftWarning) return;
-    announcedImageNoticeRef.current = visibleDraftWarning;
-    useUIStore.getState().showToast(visibleDraftWarning, 'warning', 5000);
-  }, [isImageDraftNotice, isImageProgressNotice, visibleDraftWarning]);
+  const persistentImageDraftNotice = derivedDraftImageNotice && !derivedDraftImageNotice.progress
+    ? derivedDraftImageNotice
+    : (isImageDraftNotice && !isImageProgressNotice && visibleDraftWarning
+      ? { message: visibleDraftWarning, blocking: true, progress: false }
+      : null);
+  const historyImageNoticeBanner = persistentImageDraftNotice ? (
+    <div
+      role={persistentImageDraftNotice.blocking ? 'alert' : 'status'}
+      data-history-image-notice
+      data-blocking={persistentImageDraftNotice.blocking ? 'true' : 'false'}
+      style={{
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: 7,
+        width: '100%',
+        minWidth: 0,
+        padding: '6px 8px',
+        border: '1px solid ' + (persistentImageDraftNotice.blocking
+          ? 'rgba(248, 113, 113, 0.48)'
+          : 'rgba(251, 191, 36, 0.42)'),
+        borderRadius: 7,
+        background: persistentImageDraftNotice.blocking
+          ? 'rgba(127, 29, 29, 0.18)'
+          : 'rgba(217, 119, 6, 0.14)',
+        color: persistentImageDraftNotice.blocking ? '#fecaca' : '#fcd34d',
+        fontSize: aiSecondaryFontSize,
+        lineHeight: 1.35,
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        overflowWrap: 'anywhere',
+        boxSizing: 'border-box',
+      }}
+    >
+      <AlertTriangle size={13} style={{ flex: '0 0 auto', marginTop: 1 }} />
+      <span>{persistentImageDraftNotice.message}</span>
+    </div>
+  ) : undefined;
 
   useLayoutEffect(() => {
     const ownerId = availabilityOwnerRef.current;
@@ -5663,9 +6196,16 @@ function AgentHistoryControls({
           createdAt: Date.now(),
         };
         const nextChips = upsertComposerChip(currentChips, chip) as HistoryPromptDraftChip[];
-        setHistoryPromptDraft(tabId, currentText, {
-          preserveImages: true,
+        const currentView = promptCaretRef.current;
+        applyHistoryComposerSnapshot({
+          ownerTabId: tabId,
+          text: currentText,
+          images: useUIStore.getState().historyPromptDraftImages[tabId] || [],
           chips: nextChips,
+          selectionStart: currentView.start,
+          selectionEnd: currentView.end,
+          history: 'add',
+          userEvent: 'input',
         });
         requestAnimationFrame(() => promptTextareaRef.current?.focus());
         return;
@@ -5680,14 +6220,19 @@ function AgentHistoryControls({
         ? Math.max(start, Math.min(element.selectionEnd ?? start, current.length))
         : start;
       const next = current.slice(0, start) + text + current.slice(end);
-      setPrompt(next, {
+      const caret = start + text.length;
+      applyHistoryComposerSnapshot({
+        ownerTabId: tabId,
+        text: next,
         images: retainHistoryDraftImages(
           next,
           useUIStore.getState().historyPromptDraftImages[tabId] || [],
         ),
-        preserveChips: true,
+        chips: useUIStore.getState().historyPromptDraftChips[tabId] || [],
+        selectionStart: caret,
+        history: 'add',
+        userEvent: 'input',
       });
-      const caret = start + text.length;
       requestAnimationFrame(() => {
         const currentElement = promptTextareaRef.current;
         if (!currentElement) return;
@@ -5697,7 +6242,7 @@ function AgentHistoryControls({
     };
     window.addEventListener('history-panel:composer-insert', insertIntoComposer);
     return () => window.removeEventListener('history-panel:composer-insert', insertIntoComposer);
-  }, [effectiveStopping, isCancellingTurn, rewindLocked, setHistoryPromptDraft, setPrompt, tabId]);
+  }, [applyHistoryComposerSnapshot, effectiveStopping, isCancellingTurn, rewindLocked, tabId]);
 
   // Clipboard export is one authoring-level operation for both attachment
   // families. Images leave as portable absolute paths; a complete Pasted
@@ -5720,7 +6265,9 @@ function AgentHistoryControls({
     event.preventDefault();
     if (event.type === 'cut' && !(isCancellingTurn || rewindLocked || effectiveStopping)) {
       const nextText = element.value.slice(0, start) + element.value.slice(end);
-      setPrompt(nextText, {
+      applyHistoryComposerSnapshot({
+        ownerTabId: tabId,
+        text: nextText,
         images: retainHistoryDraftImages(
           nextText,
           useUIStore.getState().historyPromptDraftImages[tabId] || [],
@@ -5729,8 +6276,10 @@ function AgentHistoryControls({
           nextText,
           useUIStore.getState().historyPromptDraftChips[tabId] || [],
         ) as HistoryPromptDraftChip[],
+        selectionStart: start,
+        history: 'add',
+        userEvent: 'delete.cut',
       });
-      promptCaretRef.current = { start, end: start };
     }
     clipboard.writeText(result.text);
     if (result.imagePartial > 0 || result.imageMissing > 0) {
@@ -5745,7 +6294,7 @@ function AgentHistoryControls({
       + ' imagePartial=' + result.imagePartial
       + ' pastes=' + result.pasteExpanded
       + ' pasteMissing=' + result.pasteMissing);
-  }, [draftChips, draftImages, effectiveStopping, isCancellingTurn, rewindLocked, runtime.logPrefix, setPrompt, tabId]);
+  }, [applyHistoryComposerSnapshot, draftChips, draftImages, effectiveStopping, isCancellingTurn, rewindLocked, runtime.logPrefix, tabId]);
 
   const handleComposerImagePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const hasImageItem = Array.from(event.clipboardData?.items || [])
@@ -5774,12 +6323,16 @@ function AgentHistoryControls({
         const currentChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
         const pendingText = current.slice(0, start) + HISTORY_IMAGE_PENDING_MARKER + current.slice(end);
         const pendingChips = retainPasteChipsForText(pendingText, currentChips) as HistoryPromptDraftChip[];
-        setHistoryPromptDraft(actionTabId, pendingText, {
+        const pendingCaret = start + HISTORY_IMAGE_PENDING_MARKER.length;
+        applyHistoryComposerSnapshot({
+          ownerTabId: actionTabId,
+          text: pendingText,
           images: retainHistoryDraftImages(pendingText, currentImages),
           chips: pendingChips,
+          selectionStart: pendingCaret,
+          history: 'add',
+          userEvent: 'input.paste',
         });
-        const pendingCaret = start + HISTORY_IMAGE_PENDING_MARKER.length;
-        promptCaretRef.current = { start: pendingCaret, end: pendingCaret };
         requestAnimationFrame(() => {
           const textarea = promptTextareaRef.current;
           if (!textarea || textarea.getAttribute('data-history-composer-tab-id') !== actionTabId) return;
@@ -5830,9 +6383,27 @@ function AgentHistoryControls({
             selectionStart: tokenStart,
             selectionEnd: tokenStart + HISTORY_IMAGE_PENDING_MARKER.length,
           });
-          setHistoryPromptDraft(actionTabId, composerInsertion.text, {
+          const textarea = promptTextareaRef.current;
+          const preserveSelection = textarea?.isFocused() === true
+            && textarea?.getAttribute('data-history-composer-tab-id') === actionTabId;
+          const selectionStart = preserveSelection ? (textarea?.selectionStart ?? pendingCaret) : pendingCaret;
+          const selectionEnd = preserveSelection ? (textarea?.selectionEnd ?? selectionStart) : selectionStart;
+          const remappedSelection = remapPromptImageSelectionAfterReplacement({
+            selectionStart,
+            selectionEnd,
+            replacedStart: tokenStart,
+            replacedEnd: tokenStart + HISTORY_IMAGE_PENDING_MARKER.length,
+            insertionCaret: composerInsertion.caret,
+          });
+          applyHistoryComposerSnapshot({
+            ownerTabId: actionTabId,
+            text: composerInsertion.text,
             images: retainHistoryDraftImages(composerInsertion.text, imageInsertion.imagePaths),
-            chips: composerInsertion.chips,
+            chips: composerInsertion.chips as HistoryPromptDraftChip[],
+            selectionStart: remappedSelection.start,
+            selectionEnd: remappedSelection.end,
+            history: 'replace',
+            userEvent: 'input.complete',
           });
           if (tabIdRef.current === actionTabId) {
             setDraftWarning(sourceSnapshot.missing > 0
@@ -5844,20 +6415,7 @@ function AgentHistoryControls({
             + ' missing=' + sourceSnapshot.missing
             + ' pasteChips=' + snapshot.chips.length);
 
-          const textarea = promptTextareaRef.current;
-          const preserveSelection = textarea?.isFocused() === true
-            && textarea?.getAttribute('data-history-composer-tab-id') === actionTabId;
           if (preserveSelection) {
-            const selectionStart = textarea?.selectionStart ?? pendingCaret;
-            const selectionEnd = textarea?.selectionEnd ?? selectionStart;
-            const remappedSelection = remapPromptImageSelectionAfterReplacement({
-              selectionStart,
-              selectionEnd,
-              replacedStart: tokenStart,
-              replacedEnd: tokenStart + HISTORY_IMAGE_PENDING_MARKER.length,
-              insertionCaret: composerInsertion.caret,
-            });
-            promptCaretRef.current = remappedSelection;
             requestAnimationFrame(() => {
               const currentTextarea = promptTextareaRef.current;
               if (!currentTextarea?.isFocused()) return;
@@ -5871,15 +6429,22 @@ function AgentHistoryControls({
             HISTORY_IMAGE_PENDING_MARKER,
             '[imageError: portable_image_import_failed]',
           );
-          setHistoryPromptDraft(actionTabId, failedText, {
-            images: retainHistoryDraftImages(
+          const failedImages = retainHistoryDraftImages(
               failedText,
               useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
-            ),
-            chips: retainPasteChipsForText(
+            );
+          const failedChips = retainPasteChipsForText(
               failedText,
               useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
-            ) as HistoryPromptDraftChip[],
+            ) as HistoryPromptDraftChip[];
+          applyHistoryComposerSnapshot({
+            ownerTabId: actionTabId,
+            text: failedText,
+            images: failedImages,
+            chips: failedChips,
+            selectionStart: failedText.length,
+            history: 'replace',
+            userEvent: 'input.complete',
           });
           if (tabIdRef.current === actionTabId) {
             setDraftWarning('Could not import the image paths. Missing paths were replaced with imageError.');
@@ -5927,15 +6492,20 @@ function AgentHistoryControls({
         selectionStart: start,
         selectionEnd: end,
       });
-      setHistoryPromptDraft(tabId, insertion.text, {
-        images: retainHistoryDraftImages(
+      const nextImages = retainHistoryDraftImages(
           insertion.text,
           useUIStore.getState().historyPromptDraftImages[tabId] || [],
-        ),
-        chips: insertion.chips,
-      });
+        );
       const caretAfterMarker = insertion.caret;
-      promptCaretRef.current = { start: caretAfterMarker, end: caretAfterMarker };
+      applyHistoryComposerSnapshot({
+        ownerTabId: tabId,
+        text: insertion.text,
+        images: nextImages,
+        chips: insertion.chips as HistoryPromptDraftChip[],
+        selectionStart: caretAfterMarker,
+        history: 'add',
+        userEvent: 'input.paste',
+      });
       requestAnimationFrame(() => {
         const textarea = promptTextareaRef.current;
         if (!textarea) return;
@@ -5965,15 +6535,19 @@ function AgentHistoryControls({
     const currentImages = useUIStore.getState().historyPromptDraftImages[actionTabId] || [];
     const currentChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
     const pendingChips = retainPasteChipsForText(pendingText, currentChips) as HistoryPromptDraftChip[];
-    setHistoryPromptDraft(actionTabId, pendingText, {
+    const pendingCaret = start + HISTORY_IMAGE_PENDING_MARKER.length;
+    applyHistoryComposerSnapshot({
+      ownerTabId: actionTabId,
+      text: pendingText,
       images: retainHistoryDraftImages(pendingText, currentImages),
       chips: pendingChips,
+      selectionStart: pendingCaret,
+      history: 'add',
+      userEvent: 'input.paste',
     });
     // Saving normally takes a fraction of a second. Do not turn that normal
     // progress into a warning-looking status; only actual failures surface.
     setDraftWarning(null);
-    const pendingCaret = start + HISTORY_IMAGE_PENDING_MARKER.length;
-    promptCaretRef.current = { start: pendingCaret, end: pendingCaret };
     requestAnimationFrame(() => {
       const textarea = promptTextareaRef.current;
       if (!textarea || textarea.getAttribute('data-history-composer-tab-id') !== actionTabId) return;
@@ -6001,7 +6575,9 @@ function AgentHistoryControls({
           const failedText = latest.slice(0, tokenStart)
             + errorMarker
             + latest.slice(tokenStart + HISTORY_IMAGE_PENDING_MARKER.length);
-          setHistoryPromptDraft(actionTabId, failedText, {
+          applyHistoryComposerSnapshot({
+            ownerTabId: actionTabId,
+            text: failedText,
             images: retainHistoryDraftImages(
               failedText,
               useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
@@ -6010,6 +6586,9 @@ function AgentHistoryControls({
               failedText,
               useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
             ) as HistoryPromptDraftChip[],
+            selectionStart: tokenStart + errorMarker.length,
+            history: 'replace',
+            userEvent: 'input.complete',
           });
           if (tabIdRef.current === actionTabId) {
             setDraftWarning('Could not save the clipboard image. Copy it again and retry.');
@@ -6030,12 +6609,26 @@ function AgentHistoryControls({
         if (insertion.missingSourceIds.length > 0) {
           throw new Error('saved_image_identity_missing');
         }
-        setHistoryPromptDraft(actionTabId, insertion.text, {
-          images: insertion.imagePaths,
+        const tokenEnd = tokenStart + HISTORY_IMAGE_PENDING_MARKER.length;
+        const remappedSelection = remapPromptImageSelectionAfterReplacement({
+          selectionStart,
+          selectionEnd,
+          replacedStart: tokenStart,
+          replacedEnd: tokenEnd,
+          insertionCaret: insertion.caret,
+        });
+        applyHistoryComposerSnapshot({
+          ownerTabId: actionTabId,
+          text: insertion.text,
+          images: insertion.imagePaths as HistoryPromptDraftImageRef[],
           chips: retainPasteChipsForText(
             insertion.text,
             useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
           ) as HistoryPromptDraftChip[],
+          selectionStart: remappedSelection.start,
+          selectionEnd: remappedSelection.end,
+          history: 'replace',
+          userEvent: 'input.complete',
         });
         if (tabIdRef.current === actionTabId) setDraftWarning(null);
         console.log('[' + runtime.logPrefix + ':images] clipboard-save ready tab=' + actionTabId.slice(-12)
@@ -6044,15 +6637,6 @@ function AgentHistoryControls({
           + ' bytes=' + (saved.size || 0));
 
         if (preserveSelection) {
-          const tokenEnd = tokenStart + HISTORY_IMAGE_PENDING_MARKER.length;
-          const remappedSelection = remapPromptImageSelectionAfterReplacement({
-            selectionStart,
-            selectionEnd,
-            replacedStart: tokenStart,
-            replacedEnd: tokenEnd,
-            insertionCaret: insertion.caret,
-          });
-          promptCaretRef.current = remappedSelection;
           requestAnimationFrame(() => {
             const currentTextarea = promptTextareaRef.current;
             if (!currentTextarea?.isFocused()) return;
@@ -6068,7 +6652,9 @@ function AgentHistoryControls({
           return;
         }
         const failedText = latest.replace(HISTORY_IMAGE_PENDING_MARKER, '[imageError: clipboard_image_save_failed]');
-        setHistoryPromptDraft(actionTabId, failedText, {
+        applyHistoryComposerSnapshot({
+          ownerTabId: actionTabId,
+          text: failedText,
           images: retainHistoryDraftImages(
             failedText,
             useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
@@ -6077,6 +6663,9 @@ function AgentHistoryControls({
             failedText,
             useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
           ) as HistoryPromptDraftChip[],
+          selectionStart: failedText.length,
+          history: 'replace',
+          userEvent: 'input.complete',
         });
         if (tabIdRef.current === actionTabId) {
           setDraftWarning('Could not save the clipboard image. Copy it again and retry.');
@@ -6084,7 +6673,7 @@ function AgentHistoryControls({
         console.warn('[' + runtime.logPrefix + ':images] clipboard-save exception tab=' + actionTabId.slice(-12)
           + ' error=' + String(cause?.message || cause));
       });
-  }, [aiComposerChipThreshold, effectiveStopping, isCancellingTurn, rewindLocked, runtime.logPrefix, setHistoryPromptDraft, tabId]);
+  }, [aiComposerChipThreshold, applyHistoryComposerSnapshot, effectiveStopping, isCancellingTurn, rewindLocked, runtime.logPrefix, tabId]);
 
   const restoreChipToComposer = useCallback((chip: HistoryPromptDraftChip) => {
     if (isCancellingTurn || rewindLocked || effectiveStopping) {
@@ -6108,28 +6697,44 @@ function AgentHistoryControls({
     });
     const remainingChips = (useUIStore.getState().historyPromptDraftChips[tabId] || [])
       .filter((item) => item.id !== chip.id);
-    setHistoryPromptDraft(tabId, restored.text, {
+    applyHistoryComposerSnapshot({
+      ownerTabId: tabId,
+      text: restored.text,
       images: retainHistoryDraftImages(
         restored.text,
         useUIStore.getState().historyPromptDraftImages[tabId] || [],
       ),
       chips: remainingChips,
+      selectionStart: restored.caret,
+      history: 'add',
+      userEvent: 'input',
     });
     setPreviewChipId(null);
-    promptCaretRef.current = { start: restored.caret, end: restored.caret };
     requestAnimationFrame(() => {
       const currentTextarea = promptTextareaRef.current;
       if (!currentTextarea) return;
       currentTextarea.focus();
       currentTextarea.setSelectionRange(restored.caret, restored.caret);
     });
-  }, [effectiveStopping, isCancellingTurn, rewindLocked, setHistoryPromptDraft, tabId]);
+  }, [applyHistoryComposerSnapshot, effectiveStopping, isCancellingTurn, rewindLocked, tabId]);
 
   const discardComposerChip = useCallback((chipId: string) => {
-    removeHistoryPromptDraftChip(tabId, chipId);
+    const state = useUIStore.getState();
+    const currentText = state.historyPromptDrafts[tabId] || '';
+    const selection = promptCaretRef.current;
+    applyHistoryComposerSnapshot({
+      ownerTabId: tabId,
+      text: currentText,
+      images: state.historyPromptDraftImages[tabId] || [],
+      chips: (state.historyPromptDraftChips[tabId] || []).filter((chip) => chip.id !== chipId),
+      selectionStart: selection.start,
+      selectionEnd: selection.end,
+      history: 'add',
+      userEvent: 'delete',
+    });
     setPreviewChipId((current) => current === chipId ? null : current);
     requestAnimationFrame(() => promptTextareaRef.current?.focus());
-  }, [removeHistoryPromptDraftChip, tabId]);
+  }, [applyHistoryComposerSnapshot, tabId]);
 
   // Anchor-scoped operations. Unlike the old strip actions these replace the
   // marker WHERE IT SITS, so the paste returns to (or disappears from) the exact
@@ -6149,23 +6754,27 @@ function AgentHistoryControls({
     }>).find((item) => item.id === chip.id);
     if (!range) return;
     const nextText = currentText.slice(0, range.start) + replacement + currentText.slice(range.end);
-    setHistoryPromptDraft(tabId, nextText, {
+    const caret = range.start + replacement.length;
+    applyHistoryComposerSnapshot({
+      ownerTabId: tabId,
+      text: nextText,
       images: retainHistoryDraftImages(
         nextText,
         useUIStore.getState().historyPromptDraftImages[tabId] || [],
       ),
       chips: currentChips.filter((item) => item.id !== chip.id),
+      selectionStart: caret,
+      history: 'add',
+      userEvent: replacement ? 'input' : 'delete',
     });
     setPreviewChipId((current) => current === chip.id ? null : current);
-    const caret = range.start + replacement.length;
-    promptCaretRef.current = { start: caret, end: caret };
     requestAnimationFrame(() => {
       const textarea = promptTextareaRef.current;
       if (!textarea) return;
       textarea.focus();
       textarea.setSelectionRange(caret, caret);
     });
-  }, [effectiveStopping, isCancellingTurn, rewindLocked, setHistoryPromptDraft, tabId]);
+  }, [applyHistoryComposerSnapshot, effectiveStopping, isCancellingTurn, rewindLocked, tabId]);
 
   const openPasteChipContextMenu = useCallback((
     chip: HistoryPromptDraftChip,
@@ -6711,6 +7320,7 @@ function AgentHistoryControls({
           externalExpandableChips={composerInlineChipsForPreview}
           expandedChipId={previewChipId}
           onExpandedChipChange={setPreviewChipId}
+          notice={historyImageNoticeBanner}
           secondaryFontSize={aiSecondaryFontSize}
           input={(
             <div
@@ -6732,22 +7342,28 @@ function AgentHistoryControls({
                   : undefined}
                 value={prompt}
                 tokens={promptComposerTokens}
+                historyPayload={composerHistoryPayload}
+                historyOwnerKey={`history:${tabId}`}
+                deriveHistoryPayload={deriveComposerHistoryPayload}
+                historyPayloadEqual={historyComposerAggregateEqual}
                 fontSize={historyComposerFontSize}
-                onChange={(nextText, selection) => {
+                clipboard={electronComposerClipboardAdapter}
+                onChange={(nextText, selection, historyPayload) => {
                   if (isCancellingTurn || rewindLocked) return;
+                  const aggregate = historyPayload as HistoryComposerAggregate | null;
                   promptCaretRef.current = {
                     start: selection.start,
                     end: selection.end,
                   };
                   setPrompt(nextText, {
-                    images: retainHistoryDraftImages(
+                    images: aggregate?.images || retainHistoryDraftImages(
                       nextText,
                       useUIStore.getState().historyPromptDraftImages[tabId] || [],
                     ),
                     // Deleting the anchor deletes the blob. Backspace over the
                     // marker is the natural way to drop a paste, and keeping the
                     // chip would smuggle its body into the sent prompt.
-                    chips: retainPasteChipsForText(
+                    chips: aggregate?.chips || retainPasteChipsForText(
                       nextText,
                       useUIStore.getState().historyPromptDraftChips[tabId] || [],
                     ) as HistoryPromptDraftChip[],
@@ -6759,6 +7375,10 @@ function AgentHistoryControls({
                 onCut={handleComposerImageAwareCopy}
                 onPaste={handleComposerImagePaste}
                 onKeyDown={(e) => {
+                  // Marker-aware Opt+Arrow runs first: it either handles the
+                  // move across an opaque marker or reports "not my case" and
+                  // lets native word-wise motion proceed untouched.
+                  if (handleComposerWordMotion(e)) return;
                   if (isPlainTextPasteShortcut(e)) {
                     e.preventDefault();
                     e.stopPropagation();
@@ -6776,17 +7396,19 @@ function AgentHistoryControls({
                       selectionStart: e.currentTarget.selectionStart,
                       selectionEnd: e.currentTarget.selectionEnd,
                     });
-                    setHistoryPromptDraft(tabId, insertion.text, {
+                    applyHistoryComposerSnapshot({
+                      ownerTabId: tabId,
+                      text: insertion.text,
                       images: retainHistoryDraftImages(
                         insertion.text,
                         useUIStore.getState().historyPromptDraftImages[tabId] || [],
                       ),
-                      preserveChips: true,
+                      chips: useUIStore.getState().historyPromptDraftChips[tabId] || [],
+                      selectionStart: insertion.selectionStart,
+                      selectionEnd: insertion.selectionEnd,
+                      history: 'add',
+                      userEvent: 'input.paste',
                     });
-                    promptCaretRef.current = {
-                      start: insertion.selectionStart,
-                      end: insertion.selectionEnd,
-                    };
                     if (draftWarning) setDraftWarning(null);
                     if (error) setError(null);
                     requestAnimationFrame(() => {
@@ -6816,9 +7438,16 @@ function AgentHistoryControls({
                     e.stopPropagation();
                     e.nativeEvent.stopImmediatePropagation();
                     if (hasAuthoringState) {
-                      setHistoryPromptDraft(tabId, '', { images: [], chips: [] });
+                      applyHistoryComposerSnapshot({
+                        ownerTabId: tabId,
+                        text: '',
+                        images: [],
+                        chips: [],
+                        selectionStart: 0,
+                        history: 'add',
+                        userEvent: 'delete',
+                      });
                       setDraftWarning(null);
-                      promptCaretRef.current = { start: 0, end: 0 };
                       requestAnimationFrame(() => promptTextareaRef.current?.focus());
                     } else if (canInterruptTurn) {
                       void runAction('interrupt');
@@ -6832,10 +7461,27 @@ function AgentHistoryControls({
                   if (canSend) runAction('send');
                 }}
                 onSelectionChange={(selection) => {
+                  if (!shouldRecordComposerViewEvent(
+                    tabId,
+                    tabIdRef.current,
+                    composerViewRestoringTabRef.current,
+                  )) return;
                   promptCaretRef.current = {
                     start: selection.start,
                     end: selection.end,
                   };
+                  setHistoryComposerView(tabId, {
+                    selectionStart: selection.start,
+                    selectionEnd: selection.end,
+                  });
+                }}
+                onScrollChange={(scrollTop) => {
+                  if (!shouldRecordComposerViewEvent(
+                    tabId,
+                    tabIdRef.current,
+                    composerViewRestoringTabRef.current,
+                  )) return;
+                  setHistoryComposerView(tabId, { scrollTop });
                 }}
                 onTokenClick={(token) => {
                   if (token.kind === 'image') {
@@ -6922,6 +7568,7 @@ function AgentHistoryControls({
                     start: editor?.selectionStart ?? 0,
                     end: editor?.selectionEnd ?? 0,
                   };
+                  captureHistoryComposerView(true, 'blur');
                 }}
               />
             </div>
@@ -7930,7 +8577,12 @@ function HistoryPanel({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!isOpen) return;
-      if (e.metaKey && e.key === 'f') {
+      if (shouldOpenHistorySearchFromKeydown(e, {
+        isOpen,
+        mainSurface,
+        terminalOpen,
+        terminalIsPrimary,
+      })) {
         // Cmd+F follows the CENTER surface: whichever one the user is looking
         // at owns find. In terminal-primary that is the terminal, so this
         // panel keeps its own search behind the header button instead of
@@ -7943,6 +8595,9 @@ function HistoryPanel({
         setTimeout(() => searchInputRef.current?.focus(), 50);
       }
       if (e.key === 'Escape' && searchOpen) {
+        // A local composer search owns Escape as well. Run after is rendered
+        // through a portal, so React ancestry cannot establish ownership.
+        if (isComposerKeyboardTarget(e.target)) return;
         e.stopPropagation();
         setSearchOpen(false);
         setSearchQuery('');
@@ -8028,6 +8683,7 @@ function HistoryPanel({
       statusAtSend: AgentPtyStatus;
       submittedAt: number;
       promptChips?: HistoryPromptDraftChip[];
+      imagePaths?: HistoryPromptDraftImageRef[];
       requiresAuditIdentity?: boolean;
       auditTimestamp?: string;
       auditHash?: string;
@@ -8059,6 +8715,7 @@ function HistoryPanel({
       statusChangedAt: now,
       promptChips: normalizeComposerChips(meta.promptChips || [])
         .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
+      imagePaths: retainHistoryDraftImages(cleanContent, meta.imagePaths || []),
       requiresAuditIdentity: meta.requiresAuditIdentity === true,
       auditTimestamp: meta.auditTimestamp,
       auditHash: meta.auditHash,
@@ -8097,6 +8754,7 @@ function HistoryPanel({
               statusReason: entry.statusReason,
               statusChangedAt: now,
               promptChips: entry.promptChips,
+              imagePaths: entry.imagePaths,
               requiresAuditIdentity: entry.requiresAuditIdentity,
               auditTimestamp: entry.auditTimestamp,
               auditHash: entry.auditHash,
@@ -8276,6 +8934,7 @@ function HistoryPanel({
         label: chip.label,
         sourceKey: chip.sourceKey,
       }));
+      const imagePaths = record.imagePaths.map((ref) => ({ ...ref })) as HistoryPromptDraftImageRef[];
       const identity = {
         requiresAuditIdentity: record.requiresAuditIdentity,
         auditTimestamp: record.auditProof?.auditTimestamp,
@@ -8294,6 +8953,7 @@ function HistoryPanel({
           statusAtSend: record.statusAtSend,
           submittedAt: record.submittedAt,
           promptChips,
+          imagePaths,
           sessionId: sessionRoute.presentationSessionId,
           ...identity,
         });
@@ -8306,6 +8966,7 @@ function HistoryPanel({
           statusAtSend: record.statusAtSend,
           submittedAt: record.submittedAt,
           promptChips,
+          imagePaths,
           sessionId: sessionRoute.presentationSessionId,
           ...identity,
         });
@@ -8382,7 +9043,11 @@ function HistoryPanel({
     };
   }, [removeLocalPromptEntry, tabId, toolType]);
 
-  const hasDurablePrompt = useCallback((text: string, submittedAt: number) => (
+  const hasDurablePrompt = useCallback((
+    text: string,
+    submittedAt: number,
+    identity: DurablePromptIdentity = {},
+  ) => (
     serverHasPromptEntry(
       rawServerEntriesRef.current,
       {
@@ -8391,6 +9056,13 @@ function HistoryPanel({
         content: text,
         timestamp: new Date(submittedAt).toISOString(),
         optimisticAt: submittedAt,
+        requiresAuditIdentity: true,
+        auditTimestamp: identity.auditTimestamp,
+        auditHash: identity.auditHash,
+        auditSessionId: identity.auditSessionId || identity.sessionId,
+        auditEntryUuid: identity.auditEntryUuid,
+        sourceIdentity: identity.sourceIdentity,
+        sessionId: identity.auditSessionId || identity.sessionId,
       } as FullHistoryEntry,
     )
   ), []);

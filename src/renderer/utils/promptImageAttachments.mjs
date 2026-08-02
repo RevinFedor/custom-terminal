@@ -1,4 +1,5 @@
 const VALID_IMAGE_MARKER_SOURCE = String.raw`(?<!\\)\[Image\s+#?(\d+)\]`;
+const IMAGE_ERROR_MARKER_SOURCE = String.raw`\[imageError(?:\s*:\s*[^\]\r\n]+)?\]`;
 
 /**
  * Common structural shape shared by History and Run After. Individual stores
@@ -17,6 +18,171 @@ const VALID_IMAGE_MARKER_SOURCE = String.raw`(?<!\\)\[Image\s+#?(\d+)\]`;
 
 function createValidImageMarkerRegex() {
   return new RegExp(VALID_IMAGE_MARKER_SOURCE, 'gi');
+}
+
+function createImageErrorMarkerRegex() {
+  return new RegExp(IMAGE_ERROR_MARKER_SOURCE, 'gi');
+}
+
+export function getPromptImageErrorTokenLabel(marker = '') {
+  const value = String(marker || '');
+  if (!/^\[imageError\b/i.test(value)) return value;
+  const rawId = /#(\d+)/.exec(value);
+  return rawId ? `imageError #${rawId[1]}` : 'imageError';
+}
+
+/**
+ * Presentation ranges for transient/import failures shared by History and
+ * Run After. The full serialized imageError remains in the document so copy,
+ * diagnostics, undo and transport keep the exact reason/path. Only its idle
+ * presentation is replaced by a compact atomic token; clicking that token
+ * lets ComposerEditor reveal the original source for explicit editing.
+ */
+export function getPromptImageStatusTokenRanges(text = '') {
+  const value = String(text || '');
+  const statusPattern = /\[Image saving…\]|\[imagePath:\s*[^\]\r\n]+\]|\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/gi;
+  const result = [];
+  let match;
+  while ((match = statusPattern.exec(value)) !== null) {
+    const marker = match[0];
+    const explicitError = /^\[imageError\b/i.test(marker);
+    result.push({
+      start: match.index,
+      end: match.index + marker.length,
+      kind: marker === '[Image saving…]' ? 'pending' : 'error',
+      label: explicitError ? getPromptImageErrorTokenLabel(marker) : marker,
+      replace: explicitError,
+    });
+  }
+  return result;
+}
+
+function promptImageIssueExcerpt(value, start, end, radius = 36) {
+  const text = String(value || '');
+  const from = Math.max(0, Number(start) || 0);
+  const to = Math.max(from, Number(end) || from);
+  const excerptStart = Math.max(0, from - radius);
+  const excerptEnd = Math.min(text.length, to + radius);
+  return (excerptStart > 0 ? '…' : '')
+    + text.slice(excerptStart, excerptEnd).replace(/\s+/g, ' ').trim()
+    + (excerptEnd < text.length ? '…' : '');
+}
+
+/**
+ * Separates a known attachment whose bytes are unavailable from an ambiguous
+ * authoring marker. The former can travel as an explicit imageError segment;
+ * the latter must remain fail-closed because no exact attachment identity can
+ * be proven.
+ *
+ * @returns {{
+ *   issues: Array<{
+ *     kind: 'unavailable' | 'error-marker' | 'unbound' | 'malformed',
+ *     blocking: boolean,
+ *     id: number | null,
+ *     marker: string,
+ *     path: string | null,
+ *     error: string | null,
+ *     start: number,
+ *     end: number,
+ *     excerpt: string,
+ *   }>,
+ *   blocking: boolean,
+ *   unavailable: boolean,
+ *   firstBlocking: object | null,
+ *   firstUnavailable: object | null,
+ * }}
+ */
+export function inspectPromptImageAttachments(text = '', imagePaths = []) {
+  const value = String(text || '');
+  const refsById = new Map((imagePaths || []).map((ref) => [Number(ref?.id), ref]));
+  const issues = [];
+  const unknownIds = new Set();
+
+  const markerRe = createValidImageMarkerRegex();
+  let match;
+  while ((match = markerRe.exec(value)) !== null) {
+    const id = Number(match[1]);
+    const ref = refsById.get(id);
+    if (!ref) {
+      unknownIds.add(id);
+      issues.push({
+        kind: 'unbound',
+        blocking: true,
+        id,
+        marker: match[0],
+        path: null,
+        error: 'attachment_identity_missing',
+        start: match.index,
+        end: match.index + match[0].length,
+        excerpt: promptImageIssueExcerpt(value, match.index, match.index + match[0].length),
+      });
+      continue;
+    }
+    if (!ref.path || ref.availability === 'missing') {
+      issues.push({
+        kind: 'unavailable',
+        blocking: false,
+        id,
+        marker: match[0],
+        path: typeof ref.path === 'string' && ref.path.trim() ? ref.path.trim() : null,
+        error: ref.error || (!ref.path ? 'image_path_missing' : 'image_unavailable'),
+        start: match.index,
+        end: match.index + match[0].length,
+        excerpt: promptImageIssueExcerpt(value, match.index, match.index + match[0].length),
+      });
+    }
+  }
+
+  const errorRe = createImageErrorMarkerRegex();
+  while ((match = errorRe.exec(value)) !== null) {
+    const rawId = /#(\d+)/.exec(match[0]);
+    const rawPath = /\bpath=([^\]\r\n]+?)\s*\]$/i.exec(match[0]);
+    issues.push({
+      kind: 'error-marker',
+      blocking: false,
+      id: rawId ? Number(rawId[1]) : null,
+      marker: match[0],
+      path: rawPath?.[1]?.trim() || null,
+      error: 'explicit_image_error',
+      start: match.index,
+      end: match.index + match[0].length,
+      excerpt: promptImageIssueExcerpt(value, match.index, match.index + match[0].length),
+    });
+  }
+
+  // Unknown complete markers were already reported precisely above. A second
+  // generic issue would only duplicate the warning. Any remaining malformed
+  // shape is a cut/missing bracket or an unnumbered authoring marker.
+  if (hasMalformedPromptImageMarker(value, imagePaths) && unknownIds.size === 0) {
+    const masked = value
+      .replace(createValidImageMarkerRegex(), (marker) => ' '.repeat(marker.length))
+      .replace(createImageErrorMarkerRegex(), (marker) => ' '.repeat(marker.length));
+    const malformedMatch = /\[\s*Image\b[^\r\n]*?(?:\]|$)|(?:^|[^\[])\bImage\s+#?\d+\s*\]/i.exec(masked);
+    const start = malformedMatch?.index ?? Math.max(0, masked.search(/\bImage\b/i));
+    const marker = malformedMatch?.[0]?.trim() || '[Image marker]';
+    const end = Math.min(value.length, start + Math.max(1, malformedMatch?.[0]?.length || marker.length));
+    issues.push({
+      kind: 'malformed',
+      blocking: true,
+      id: null,
+      marker,
+      path: null,
+      error: 'image_marker_malformed',
+      start,
+      end,
+      excerpt: promptImageIssueExcerpt(value, start, end),
+    });
+  }
+
+  const firstBlocking = issues.find((issue) => issue.blocking) || null;
+  const firstUnavailable = issues.find((issue) => !issue.blocking) || null;
+  return {
+    issues,
+    blocking: !!firstBlocking,
+    unavailable: !!firstUnavailable,
+    firstBlocking,
+    firstUnavailable,
+  };
 }
 
 export function collectPromptImageRefIds(text) {
@@ -110,7 +276,7 @@ export function getPromptImageAttachmentState({
 } = {}) {
   if (attachmentState === 'materializing') return 'materializing';
   if (attachmentState === 'missing') return 'missing';
-  if (images > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(String(text || ''))) return 'missing';
+  if (/\[imageError(?:\s*:\s*[^\]\r\n]+)?\]/i.test(String(text || ''))) return 'missing';
   if (hasMalformedPromptImageMarker(text, imagePaths)) return 'missing';
   if (/\[Image\s*\]/i.test(String(text || ''))) return 'missing';
   const ids = collectPromptImageRefIds(text);

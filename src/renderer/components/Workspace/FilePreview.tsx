@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ExternalLink, Loader2 } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
@@ -15,6 +15,140 @@ export default function FilePreview() {
   const { sidebarOpen } = activeProjectId ? getSidebarState(activeProjectId) : { sidebarOpen: false };
   const [copied, setCopied] = useState(false);
   const [openingSublime, setOpeningSublime] = useState(false);
+
+  // Reading position. The preview unmounts on every project switch, so the
+  // offset has to leave this component to survive — it lives in the store,
+  // keyed by file path, and is restored on the way back in.
+  const previewPath = filePreview?.path || '';
+  const scrollerRef = useRef<HTMLElement | null>(null);
+  const detachScrollRef = useRef<(() => void) | null>(null);
+  const restoredForPathRef = useRef<string | null>(null);
+  const pendingScrollRef = useRef<{ path: string; top: number } | null>(null);
+  const scrollSaveTimerRef = useRef<number | null>(null);
+  // While this is set, the offset is being restored, not chosen by the user.
+  // The editor renders long documents lazily, so the first attempt lands short
+  // of the target and the resulting scroll event would save that short value
+  // over the real one — the position visibly creeps toward the top.
+  const restoreTargetRef = useRef<{ path: string; top: number } | null>(null);
+  const restoreTimersRef = useRef<number[]>([]);
+
+  const cancelRestore = useCallback(() => {
+    restoreTimersRef.current.forEach((id) => window.clearTimeout(id));
+    restoreTimersRef.current = [];
+    restoreTargetRef.current = null;
+  }, []);
+
+  // Persisting on every scroll event would mean a synchronous write per frame
+  // (the store mirrors to SQLite), so writes are coalesced and flushed when the
+  // file or the whole preview goes away.
+  const flushScrollSave = useCallback(() => {
+    if (scrollSaveTimerRef.current !== null) {
+      window.clearTimeout(scrollSaveTimerRef.current);
+      scrollSaveTimerRef.current = null;
+    }
+    const pending = pendingScrollRef.current;
+    pendingScrollRef.current = null;
+    if (pending?.path) useUIStore.getState().setFilePreviewScrollTop(pending.path, pending.top);
+  }, []);
+
+  // Re-applies the target while the document grows: the editor renders long
+  // files lazily, so the first assignment lands short of the target. The window
+  // always closes on a fixed deadline — nothing may leave it open, or scrolling
+  // would stop being saved for the rest of the session.
+  const restoreScrollTop = useCallback((scroller: HTMLElement, path: string, top: number) => {
+    cancelRestore();
+    if (top <= 0) return;
+    restoreTargetRef.current = { path, top };
+    scroller.scrollTop = top;
+    [0, 40, 120, 260, 500].forEach((delay) => {
+      const id = window.setTimeout(() => {
+        const target = restoreTargetRef.current;
+        if (!target || target.path !== path) return;
+        if (Math.abs(scroller.scrollTop - top) > 1) scroller.scrollTop = top;
+      }, delay);
+      restoreTimersRef.current.push(id);
+    });
+    const done = window.setTimeout(() => {
+      restoreTargetRef.current = null;
+      restoreTimersRef.current = [];
+    }, 700);
+    restoreTimersRef.current.push(done);
+  }, [cancelRestore]);
+
+  // The editor accepts onEditorView/initialScrollTop in its type definitions but
+  // the shipped build never calls the first and ignores the second, so the
+  // scroll container is located in the DOM instead. Attaching is retried while
+  // the editor mounts asynchronously.
+  const attachScroller = useCallback((scroller: HTMLElement) => {
+    detachScrollRef.current?.();
+    detachScrollRef.current = null;
+    flushScrollSave();
+    scrollerRef.current = scroller;
+
+    const path = useUIStore.getState().filePreview?.path || '';
+    if (path && restoredForPathRef.current !== path) {
+      restoredForPathRef.current = path;
+      restoreScrollTop(scroller, path, useUIStore.getState().getFilePreviewScrollTop(path));
+    }
+
+    const onScroll = () => {
+      const current = useUIStore.getState().filePreview?.path || '';
+      if (!current) return;
+      // Scroll events fired by an in-flight restore are echoes of a value we
+      // already hold — saving them is what corrupted the stored position.
+      const restoring = restoreTargetRef.current;
+      if (restoring && restoring.path === current) return;
+      pendingScrollRef.current = { path: current, top: scroller.scrollTop };
+      if (scrollSaveTimerRef.current !== null) return;
+      scrollSaveTimerRef.current = window.setTimeout(() => {
+        scrollSaveTimerRef.current = null;
+        const pending = pendingScrollRef.current;
+        pendingScrollRef.current = null;
+        if (pending?.path) useUIStore.getState().setFilePreviewScrollTop(pending.path, pending.top);
+      }, 200);
+    };
+    scroller.addEventListener('scroll', onScroll, { passive: true });
+    detachScrollRef.current = () => scroller.removeEventListener('scroll', onScroll);
+  }, [flushScrollSave, restoreScrollTop]);
+
+  // Locate the editor's scroll container once it exists. Mounting is async and
+  // a project switch remounts the whole preview, so this polls briefly rather
+  // than assuming the element is there on the first pass.
+  const previewHostRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!previewPath) return;
+    let cancelled = false;
+    let attempts = 0;
+    const tryAttach = () => {
+      if (cancelled) return;
+      const scroller = previewHostRef.current?.querySelector('.cm-scroller') as HTMLElement | null;
+      if (scroller) {
+        if (scrollerRef.current !== scroller) attachScroller(scroller);
+        return;
+      }
+      if (attempts++ < 40) window.setTimeout(tryAttach, 25);
+      else console.warn('[FilePreviewScroll] scroll container not found', { path: previewPath });
+    };
+    tryAttach();
+    return () => { cancelled = true; };
+  }, [attachScroller, previewPath]);
+
+  useEffect(() => () => {
+    detachScrollRef.current?.();
+    cancelRestore();
+    flushScrollSave();
+  }, [cancelRestore, flushScrollSave]);
+
+  // A different file in the same mounted preview needs its own restore pass,
+  // and the outgoing file must not lose its pending offset on the way out.
+  useEffect(() => {
+    flushScrollSave();
+    if (!previewPath) { cancelRestore(); restoredForPathRef.current = null; return; }
+    const scroller = scrollerRef.current;
+    if (!scroller || restoredForPathRef.current === previewPath) return;
+    restoredForPathRef.current = previewPath;
+    restoreScrollTop(scroller, previewPath, useUIStore.getState().getFilePreviewScrollTop(previewPath));
+  }, [cancelRestore, flushScrollSave, previewPath, restoreScrollTop]);
 
   const handleCopyContent = async () => {
     if (filePreview) {
@@ -168,8 +302,9 @@ export default function FilePreview() {
       </div>
 
       {/* Content — MarkdownEditor in readOnly mode for all files */}
-      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', backgroundColor: '#1e1e2e' }}>
+      <div ref={previewHostRef} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', backgroundColor: '#1e1e2e' }}>
         <MarkdownEditor
+          key={filePreview.path}
           content={filePreview.content}
           onChange={() => {}}
           readOnly

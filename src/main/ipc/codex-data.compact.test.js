@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { _api } = require('./codex-data');
+const { promptFingerprint } = require('../claude-prompt-carriers');
 
 function compactFixture() {
   return [
@@ -134,6 +135,209 @@ test('F2: subagent notification does not split one external Codex result turn', 
   assert.equal(result.assistantMessageCount, 2);
   assert.match(result.assistantText, /Partial result before child completion/);
   assert.match(result.assistantText, /Final result after child completion/);
+});
+
+test('Codex provider turn proof crosses clarification and repeated compaction inside one task', () => {
+  const sessionId = 'codex-provider-turn-session';
+  const turnId = 'provider-turn-x';
+  const prompt = 'run the complete physical task';
+  const records = [
+    { __line: 1, type: 'event_msg', timestamp: '2026-08-01T04:59:39.249Z', payload: { type: 'task_started', turn_id: turnId } },
+    { __line: 2, type: 'turn_context', payload: { turn_id: turnId, model: 'gpt-5' } },
+    { __line: 3, type: 'event_msg', timestamp: '2026-08-01T04:59:39.600Z', payload: { type: 'user_message', message: prompt } },
+    { __line: 4, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'First result block.' }] } },
+    { __line: 5, type: 'compacted', payload: { replacement_history: [] } },
+    { __line: 6, type: 'event_msg', payload: { type: 'context_compacted' } },
+    { __line: 7, type: 'event_msg', timestamp: '2026-08-01T05:17:11.188Z', payload: { type: 'user_message', message: 'also verify notification delivery' } },
+    { __line: 8, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Result after clarification.' }] } },
+    { __line: 9, type: 'compacted', payload: { replacement_history: [] } },
+    { __line: 10, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'FINAL RESULT.' }] } },
+    { __line: 11, type: 'event_msg', timestamp: '2026-08-01T05:29:52.611Z', payload: { type: 'task_complete', turn_id: turnId } },
+  ];
+  const result = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptHash: promptFingerprint(prompt),
+    targetExecutionContext: {
+      provider: 'codex',
+      sessionId,
+      turnId,
+      generation: 9,
+    },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.complete, true);
+  assert.equal(result.terminalEvent, 'task_complete');
+  assert.equal(result.assistantBlockCount, 3);
+  assert.match(result.assistantText, /First result block/);
+  assert.match(result.assistantText, /Result after clarification/);
+  assert.match(result.assistantText, /FINAL RESULT/);
+});
+
+test('a new Codex task_started is a hard result boundary for the previous provider turn', () => {
+  const sessionId = 'codex-provider-boundary-session';
+  const prompt = 'run X';
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-x' } },
+    { __line: 2, type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+    { __line: 3, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'X partial.' }] } },
+    { __line: 4, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-y' } },
+    { __line: 5, type: 'event_msg', payload: { type: 'user_message', message: 'run Y' } },
+    { __line: 6, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Y answer must not leak.' }] } },
+    { __line: 7, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-y' } },
+    { __line: 8, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-x' } },
+  ];
+  const result = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptHash: promptFingerprint(prompt),
+    targetExecutionContext: {
+      provider: 'codex', sessionId, turnId: 'turn-x', generation: 1,
+    },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.complete, false);
+  assert.equal(result.boundaryReason, 'next-task-started');
+  assert.match(result.assistantText, /X partial/);
+  assert.doesNotMatch(result.assistantText, /Y answer/);
+});
+
+test('identical prompt text is isolated by exact Codex provider turn identity', () => {
+  const sessionId = 'codex-identical-provider-turns';
+  const prompt = 'same orchestration prompt';
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } },
+    { __line: 2, type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+    { __line: 3, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer one' }] } },
+    { __line: 4, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } },
+    { __line: 5, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-2' } },
+    { __line: 6, type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+    { __line: 7, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer two' }] } },
+    { __line: 8, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-2' } },
+  ];
+  const build = (turnId, generation) => _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptHash: promptFingerprint(prompt),
+    targetExecutionContext: { provider: 'codex', sessionId, turnId, generation },
+  });
+  const first = build('turn-1', 1);
+  const second = build('turn-2', 2);
+
+  assert.equal(first.complete, true);
+  assert.match(first.assistantText, /answer one/);
+  assert.doesNotMatch(first.assistantText, /answer two/);
+  assert.equal(second.complete, true);
+  assert.match(second.assistantText, /answer two/);
+  assert.doesNotMatch(second.assistantText, /answer one/);
+});
+
+test('Codex provider turn without a matching terminal event remains incomplete', () => {
+  const sessionId = 'codex-provider-turn-incomplete';
+  const prompt = 'keep working';
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-open' } },
+    { __line: 2, type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+    { __line: 3, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'partial only' }] } },
+  ];
+  const result = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptHash: promptFingerprint(prompt),
+    targetExecutionContext: {
+      provider: 'codex', sessionId, turnId: 'turn-open', generation: 3,
+    },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.complete, false);
+  assert.equal(result.boundaryReason, 'transcript-end');
+});
+
+test('Codex provider turn proof rejects an execution identity without process generation', () => {
+  const sessionId = 'codex-provider-generation-missing';
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-x' } },
+    { __line: 2, type: 'event_msg', payload: { type: 'user_message', message: 'prompt' } },
+    { __line: 3, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] } },
+    { __line: 4, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-x' } },
+  ];
+  const result = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptHash: promptFingerprint('prompt'),
+    targetExecutionContext: {
+      provider: 'codex', sessionId, turnId: 'turn-x', generation: null,
+    },
+  });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /identity is incomplete/);
+});
+
+test('ambiguous same-text prompts inside one provider turn require the exact prompt UUID', () => {
+  const sessionId = 'codex-provider-prompt-ambiguity';
+  const prompt = 'repeat this exact text';
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-x' } },
+    { __line: 2, type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+    { __line: 3, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first block' }] } },
+    { __line: 4, type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+    { __line: 5, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'second block' }] } },
+    { __line: 6, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-x' } },
+  ];
+  const context = {
+    provider: 'codex', sessionId, turnId: 'turn-x', generation: 4,
+  };
+  const ambiguous = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptHash: promptFingerprint(prompt),
+    targetExecutionContext: context,
+  });
+  const firstPromptUuid = _api.buildCodexTimeline(records, sessionId)
+    .find((entry) => entry.content === prompt).uuid;
+  const exact = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptUserUuid: firstPromptUuid,
+    targetExecutionContext: context,
+  });
+
+  assert.equal(ambiguous.success, false);
+  assert.match(ambiguous.error, /ambiguous/);
+  assert.equal(exact.success, true);
+  assert.equal(exact.complete, true);
+  assert.match(exact.assistantText, /first block/);
+  assert.match(exact.assistantText, /second block/);
+});
+
+test('matching Codex turn_aborted closes only its exact provider turn envelope', () => {
+  const sessionId = 'codex-provider-turn-aborted';
+  const prompt = 'run until abort';
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-abort' } },
+    { __line: 2, type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+    { __line: 3, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'partial before abort' }] } },
+    { __line: 4, type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn-abort' } },
+  ];
+  const result = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptHash: promptFingerprint(prompt),
+    targetExecutionContext: {
+      provider: 'codex', sessionId, turnId: 'turn-abort', generation: 5,
+    },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.complete, true);
+  assert.equal(result.terminalEvent, 'turn_aborted');
+});
+
+test('legacy Codex result without provider turn identity keeps the bounded turn fallback', () => {
+  const sessionId = 'codex-legacy-result';
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'user_message', message: 'legacy prompt' } },
+    { __line: 2, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'legacy answer' }] } },
+    { __line: 3, type: 'event_msg', payload: { type: 'task_complete' } },
+    { __line: 4, type: 'event_msg', payload: { type: 'user_message', message: 'next prompt' } },
+    { __line: 5, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'next answer' }] } },
+  ];
+  const target = _api.buildCodexTimeline(records, sessionId)
+    .find((entry) => entry.content === 'legacy prompt');
+  const result = _api.buildCodexTurnAssistantResult(records, sessionId, target.uuid);
+
+  assert.equal(result.success, true);
+  assert.equal(result.complete, true);
+  assert.match(result.assistantText, /legacy answer/);
+  assert.doesNotMatch(result.assistantText, /next answer/);
 });
 
 test('orchestration result bounds a long compacted turn while preserving its final tail', () => {

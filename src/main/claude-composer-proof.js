@@ -226,6 +226,43 @@ function validateClaudeComposerWriteBoundary({
 }
 
 /**
+ * Move an exact empty-composer proof across the one input-revision increment
+ * owned by this paste request. The caller must invoke this before any async
+ * work: a user key, process replacement, or mirror replacement makes the
+ * original proof ineligible instead of being silently adopted.
+ */
+function reserveClaudeExactEmptyEvidence({
+  evidence,
+  currentInputRevision,
+  reservedInputRevision,
+  currentRunSeq,
+  currentLifecycleGeneration,
+  currentMirrorGeneration,
+}) {
+  if (
+    !evidence
+    || evidence.proofOutcome !== 'absent'
+    || evidence.terminalIdentityStable !== true
+    || evidence.editorReturnReady !== true
+    || String(evidence.text || '').trim()
+    || Number(evidence.images || 0) > 0
+  ) return null;
+  if (
+    Number(evidence.inputRevision) !== Number(currentInputRevision)
+    || Number(evidence.terminalRunSeq) !== Number(currentRunSeq)
+    || !evidence.terminalLifecycleGeneration
+    || evidence.terminalLifecycleGeneration !== currentLifecycleGeneration
+    || !evidence.mirrorGeneration
+    || evidence.mirrorGeneration !== currentMirrorGeneration
+  ) return null;
+  if (Number(reservedInputRevision) !== Number(currentInputRevision) + 1) return null;
+  return {
+    ...evidence,
+    inputRevision: Number(reservedInputRevision),
+  };
+}
+
+/**
  * After our own bracketed paste the mirror write sequence is expected to move,
  * but the physical PTY/input/lifecycle generation must still be the one which
  * owned the empty-composer proof. This is checked again at the final Enter
@@ -268,6 +305,7 @@ module.exports = {
   cleanClaudeComposerText,
   isClaudeComposerStopLine,
   parseClaudeComposerCurrentFrame,
+  reserveClaudeExactEmptyEvidence,
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 };

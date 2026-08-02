@@ -535,6 +535,19 @@ wasEnabled  = |checkIdx - enabledIdx| < |checkIdx - disabledIdx|
 ### UI отображение
 Кнопка "toggle" в InfoPanel. После переключения показывает "think on" / "think off" фиолетовым цветом (#b4b9f9) на 3 секунды.
 
+**Per-send настройки предшествуют proof пользовательского prompt.** Если один
+send запросил model, effort или Think, scenario сначала полностью заканчивает
+эти действия и лишь затем заново проверяет composer. Финальный prompt получает
+свежий exact-empty proof после последней мутации; proof, снятый до slash-команды
+или picker-а, использовать нельзя. Think считается завершённым только когда
+runtime вернул успешное и совпадающее с запросом конечное состояние.
+Незавершённый picker, отсутствие boolean-результата или mismatch остаются
+`unknown`: пользовательский prompt не пишется и состояние не угадывается. Если
+per-send caller ещё не знает состояние вкладки, он передаёт желаемое значение в
+main: тот читает галочку настоящего picker-а и либо меняет выбор, либо закрывает
+уже совпавший picker. Отсутствующие `Enabled`/`Disabled`/`✔` — ошибка
+`think_picker_state_unknown`, а не прежний default `enabled`.
+
 ## Per-provider behavior: Model, Effort, Think
 
 InfoPanel содержит **две зависимые строки** — Provider row и Model row — плюс Effort и Think. Принцип двухуровневого селектора (Provider → Model) описан в `methodology/переносимый-дизайн.md::Two-tier hierarchical selectors`. Здесь — конкретика поведения и **разные backend'ы для одинаковых UI-контролов** в зависимости от выбранного провайдера.

@@ -3,11 +3,14 @@ import assert from 'node:assert/strict';
 import {
   buildImageAwareClipboardText,
   buildPromptImagePayload,
+  getPromptImageErrorTokenLabel,
+  getPromptImageStatusTokenRanges,
   getPromptImageMarkerHighlightRanges as markerRanges,
   getPromptImageAttachmentState,
   getPromptImageMarkerHighlightRanges,
   hasMalformedPromptImageMarker,
   haveSamePromptImageRefs,
+  inspectPromptImageAttachments,
   insertPromptImageAttachments,
   normalizePromptImageIdentity,
   remapPromptImageSelectionAfterReplacement,
@@ -131,6 +134,71 @@ test('unknown or unavailable attachment blocks instead of silently degrading', (
     buildPromptImagePayload('[Image #2]', [ref(1)]),
     '[imageError: queued_image_path_unavailable #2]',
   );
+});
+
+test('attachment inspection separates unavailable bytes from ambiguous identity', () => {
+  const unavailable = inspectPromptImageAttachments(
+    'before [Image #2] after',
+    [{ ...ref(2, '/missing/two.png'), availability: 'missing', error: 'image_path_missing' }],
+  );
+  assert.equal(unavailable.blocking, false);
+  assert.equal(unavailable.unavailable, true);
+  assert.equal(unavailable.firstUnavailable.id, 2);
+  assert.equal(unavailable.firstUnavailable.path, '/missing/two.png');
+  assert.match(unavailable.firstUnavailable.excerpt, /before \[Image #2\] after/);
+
+  const unbound = inspectPromptImageAttachments('before [Image #3] after', [ref(2)]);
+  assert.equal(unbound.blocking, true);
+  assert.equal(unbound.firstBlocking.kind, 'unbound');
+  assert.equal(unbound.firstBlocking.id, 3);
+
+  const malformed = inspectPromptImageAttachments('before [Image #2 after', [ref(2)]);
+  assert.equal(malformed.blocking, true);
+  assert.equal(malformed.firstBlocking.kind, 'malformed');
+});
+
+test('explicit imageError is transferable warning text and paste markers stay unrelated', () => {
+  const explicit = inspectPromptImageAttachments(
+    'start [imageError: history_image_path_unavailable #4 path=/tmp/missing image.png] end',
+    [],
+  );
+  assert.equal(explicit.blocking, false);
+  assert.equal(explicit.unavailable, true);
+  assert.equal(explicit.firstUnavailable.kind, 'error-marker');
+  assert.equal(explicit.firstUnavailable.id, 4);
+  assert.equal(explicit.firstUnavailable.path, '/tmp/missing image.png');
+  assert.equal(getPromptImageErrorTokenLabel(explicit.firstUnavailable.marker), 'imageError #4');
+
+  const short = inspectPromptImageAttachments('[imageError]', []);
+  assert.equal(short.blocking, false);
+  assert.equal(short.unavailable, true);
+
+  const pasteOnly = inspectPromptImageAttachments('[Pasted Content 123 chars]', []);
+  assert.deepEqual(pasteOnly.issues, []);
+  assert.equal(pasteOnly.blocking, false);
+  assert.equal(pasteOnly.unavailable, false);
+});
+
+test('imageError keeps its full serialized value but renders as a compact atomic token', () => {
+  const marker = '[imageError: portable_image_path_unavailable #2 path=/tmp/missing image.png]';
+  const text = `before ${marker} after`;
+  const ranges = getPromptImageStatusTokenRanges(text);
+
+  assert.equal(ranges.length, 1);
+  assert.equal(text.slice(ranges[0].start, ranges[0].end), marker);
+  assert.equal(ranges[0].label, 'imageError #2');
+  assert.equal(ranges[0].kind, 'error');
+  assert.equal(ranges[0].replace, true);
+});
+
+test('transient image statuses remain visible source instead of pretending to be attachments', () => {
+  const text = 'a [Image saving…] b [imagePath: /tmp/example.png] c';
+  const ranges = getPromptImageStatusTokenRanges(text);
+
+  assert.deepEqual(ranges.map(({ kind, label, replace }) => ({ kind, label, replace })), [
+    { kind: 'pending', label: '[Image saving…]', replace: false },
+    { kind: 'error', label: '[imagePath: /tmp/example.png]', replace: false },
+  ]);
 });
 
 test('image identity treats authoring marker and transport path as one slot', () => {

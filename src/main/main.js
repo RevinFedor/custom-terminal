@@ -146,6 +146,7 @@ const {
 } = require(path.join(srcMainDir, 'subagent-transcript'));
 const {
   parseClaudeComposerCurrentFrame,
+  reserveClaudeExactEmptyEvidence,
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 } = require(path.join(srcMainDir, 'claude-composer-proof'));
@@ -267,7 +268,7 @@ const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
-const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
+const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, writeClaudeForkJsonlExclusive, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
 const { evaluateClaudeFreshStartAdmission } = require(path.join(srcMainDir, 'claude-fresh-start-admission'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
 const {
@@ -292,6 +293,7 @@ const {
   createCodexSettingsMutationQueue,
 } = require(path.join(srcMainDir, 'codex-settings-mutation-queue'));
 const CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:';
+const CODEX_NATIVE_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-receipt.v1:';
 const CODEX_NATIVE_REWIND_CHILD_WINDOW_MS = 2 * 60 * 1000;
 const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
 const {
@@ -305,9 +307,19 @@ const {
   resolveActivitySessionIdForEngine,
   shouldCreateHistoryResponseTiming,
 } = require(path.join(srcMainDir, 'history-response-timings'));
-const { PromptQueueAssetStore, collectReferencedAssetIds, normalizeAssetId } = require(path.join(srcMainDir, 'prompt-queue-assets'));
+const {
+  PromptQueueAssetStore,
+  collectComposerDraftAssetIds,
+  collectReferencedAssetIds,
+  normalizeAssetId,
+} = require(path.join(srcMainDir, 'prompt-queue-assets'));
 const { CodexImageBindingRegistry } = require(path.join(srcMainDir, 'codex-image-bindings'));
-const { CodexImageTransport, buildCodexImagePastePlan } = require(path.join(srcMainDir, 'codex-image-transport'));
+const {
+  CodexImageTransport,
+  buildCodexImagePastePlan,
+  isPortableImagePath,
+  replaceUnavailableImagePathMarkers,
+} = require(path.join(srcMainDir, 'codex-image-transport'));
 const {
   armCodexSuppressedCatchUpRelease,
   classifyCodexTurnRecord,
@@ -372,6 +384,7 @@ const {
   isCommittedCodexNativeRewindReplay,
   classifyCodexWriterHandoffObserverAdoption,
   resolveCodexRewindCompletionProof,
+  classifyCodexRewindCommitReceiptRuntime,
   shouldCloseCodexRewindProtocolUi,
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
@@ -386,6 +399,10 @@ const {
   runKeyedSingleFlight,
 } = require(path.join(srcMainDir, 'codex-writer-ownership'));
 const { validateTerminalCwdCandidate } = require(path.join(srcMainDir, 'terminal-cwd-proof'));
+const {
+  normalizeDirectoryTarget,
+  TerminalCwdChangeProofRegistry,
+} = require(path.join(srcMainDir, 'terminal-cwd-change'));
 const { TabHistoryRestoreLeases } = require(path.join(srcMainDir, 'tab-history-restore-leases'));
 const { runSaveTabsWithAck } = require(path.join(srcMainDir, 'save-tabs-ack'));
 const {
@@ -481,6 +498,7 @@ const {
   decideCodexMcpReplacementHandoff,
   decideCodexMcpStoppedGenerationSettlement,
   decideCodexMcpStartupDeadline,
+  decideCodexMcpWatchdogReconcile,
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,
   inspectCodexInputReadyTextCore,
@@ -1340,6 +1358,7 @@ claudeStartupProofSession = createClaudeStartupProofSession({
 });
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
+const terminalCwdChangeProofs = new TerminalCwdChangeProofRegistry();
 const PROCESS_TREE_SNAPSHOT_TTL_MS = 750;
 let processTreeSnapshotCache = null;
 const processTreeSnapshotSingleFlight = createProcessTreeSnapshotSingleFlight({
@@ -2082,6 +2101,8 @@ function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24, options = {})
         ? String(options.incompleteReason || 'unknown-history')
         : null,
       redrawTrace: createTerminalRedrawTrace(),
+      lastCommittedVisibleSnapshot: null,
+      committedFrameGeneration: 0,
       synchronizedFrameWaiters: new Set(),
       lastErrorAt: 0,
       cols: safeCols,
@@ -2101,6 +2122,7 @@ function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24, options = {})
             items: flushInfo?.items,
             after: readHeadlessCursorMetrics(state),
           });
+          commitHeadlessVisibleBufferSnapshot(tabId, state, seq);
           for (const notify of Array.from(state.synchronizedFrameWaiters)) {
             try { notify(); } catch {}
           }
@@ -2402,10 +2424,14 @@ function resizeHeadlessTerminalMirror(tabId, cols, rows) {
   const safeRows = Math.max(2, Number(rows) || state.rows || 24);
   if (state.cols === safeCols && state.rows === safeRows) return;
   try {
+    // Geometry is part of a frame proof. Never replay a snapshot captured for
+    // the previous grid after xterm has reflowed its buffer.
+    state.lastCommittedVisibleSnapshot = null;
     state.terminal.resize(safeCols, safeRows);
     state.cols = safeCols;
     state.rows = safeRows;
     recordTerminalResize(state.redrawTrace, safeCols, safeRows);
+    commitHeadlessVisibleBufferSnapshot(tabId, state, state.flushedSeq);
   } catch (err) {
     state.failed = true;
     logHeadlessTerminalMirrorError(tabId, state, 'resize failed', err);
@@ -2891,7 +2917,7 @@ async function waitForHeadlessCodexDraftState(
   });
 }
 
-function getHeadlessVisibleBufferSnapshot(tabId, reason) {
+function getHeadlessVisibleBufferSnapshot(tabId, reason, { preferCommitted = true } = {}) {
   const state = getHeadlessTerminalMirror(tabId);
   if (!state) return { success: false, error: 'no-headless-mirror', tabId, reason, source: 'headless-main' };
   if (state.complete !== true) {
@@ -2902,6 +2928,21 @@ function getHeadlessVisibleBufferSnapshot(tabId, reason) {
       tabId,
       reason,
       source: 'headless-main',
+    };
+  }
+  if (preferCommitted
+    && state.redrawTrace?.synchronizedOutputOpen === true
+    && state.lastCommittedVisibleSnapshot) {
+    return {
+      ...state.lastCommittedVisibleSnapshot,
+      reason,
+      committedFrameReplay: true,
+      liveSynchronizedOutputOpen: true,
+      liveSynchronizedOutputGeneration: Number(
+        state.redrawTrace?.synchronizedOutputGeneration || 0,
+      ),
+      liveWriteSeq: state.writeSeq,
+      liveFlushedSeq: state.flushedSeq,
     };
   }
   try {
@@ -2979,6 +3020,14 @@ function getHeadlessVisibleBufferSnapshot(tabId, reason) {
       synchronizedOutputGeneration: Number(
         state.redrawTrace?.synchronizedOutputGeneration || 0,
       ),
+      authoritativeFrameCommitted: state.redrawTrace?.synchronizedOutputOpen !== true
+        && Number(state.writeSeq || 0) === Number(state.flushedSeq || 0),
+      committedFrameGeneration: state.lastCommittedVisibleSnapshot?.writeSeq === state.writeSeq
+        ? Number(state.lastCommittedVisibleSnapshot.committedFrameGeneration || 0)
+        : null,
+      committedWriteSeq: state.lastCommittedVisibleSnapshot?.writeSeq === state.writeSeq
+        ? state.lastCommittedVisibleSnapshot.writeSeq
+        : null,
       lines,
       codexActivePrompt,
       writeSeq: state.writeSeq,
@@ -2989,6 +3038,37 @@ function getHeadlessVisibleBufferSnapshot(tabId, reason) {
     logHeadlessTerminalMirrorError(tabId, state, 'snapshot failed', err);
     return { success: false, error: err?.message || String(err), tabId, reason, source: 'headless-main' };
   }
+}
+
+function commitHeadlessVisibleBufferSnapshot(tabId, state, flushedSeq) {
+  if (!state
+    || getHeadlessTerminalMirror(tabId) !== state
+    || state.failed === true
+    || state.complete !== true
+    || state.redrawTrace?.synchronizedOutputOpen === true
+    || Number(state.flushedSeq || 0) !== Number(state.writeSeq || 0)
+    || Number(flushedSeq || 0) !== Number(state.writeSeq || 0)) {
+    return null;
+  }
+  const snapshot = getHeadlessVisibleBufferSnapshot(
+    tabId,
+    'committed-frame:' + String(flushedSeq),
+    { preferCommitted: false },
+  );
+  if (!snapshot?.success) return null;
+  const previous = state.lastCommittedVisibleSnapshot;
+  if (previous?.writeSeq === snapshot.writeSeq) return previous;
+  const committedFrameGeneration = ++state.committedFrameGeneration;
+  const committed = {
+    ...snapshot,
+    authoritativeFrameCommitted: true,
+    committedFrameGeneration,
+    committedWriteSeq: snapshot.writeSeq,
+    committedFrameReplay: false,
+    liveSynchronizedOutputOpen: false,
+  };
+  state.lastCommittedVisibleSnapshot = committed;
+  return committed;
 }
 
 function parseClaudeDraftFromVisibleSnapshot(snapshot) {
@@ -10870,6 +10950,7 @@ async function _getAgentTurnResultForOrchestration({
   requestedAt,
   resultAfterAt,
   resultBeforeAt,
+  targetExecutionContext,
   forceFresh = false,
   maxChars = 100_000,
 }) {
@@ -10878,6 +10959,62 @@ async function _getAgentTurnResultForOrchestration({
     return { found: false, error: 'sessionId and promptUserUuid, promptHash, or resultAfterAt required' };
   }
   const data = await _loadSessionTurns(sessionId, cwd, { forceFresh });
+  const exactCodexResultProof = data.engine === 'codex'
+    && targetExecutionContext?.turnId
+    && (promptUserUuid || promptHash)
+    && codexDataModule?._api?.loadSessionRecords
+    && codexDataModule?._api?.buildCodexProviderTurnAssistantResult;
+  if (exactCodexResultProof) {
+    const loaded = await codexDataModule._api.loadSessionRecords(sessionId, cwd);
+    if (!loaded?.success) {
+      return {
+        found: false,
+        error: loaded?.error || 'Codex provider turn transcript unavailable',
+        sourceSnapshot: data.sourceSnapshot || loaded?.sourceSnapshot || null,
+      };
+    }
+    const codexResult = codexDataModule._api.buildCodexProviderTurnAssistantResult(
+      loaded.records,
+      sessionId,
+      {
+        promptHash,
+        promptUserUuid,
+        requestedAt,
+        resultAfterAt: latestAfter,
+        resultBeforeAt,
+        targetExecutionContext,
+      },
+      maxChars,
+    );
+    const logDetails = ' session=' + String(sessionId).slice(0, 12)
+      + ' turn=' + String(targetExecutionContext.turnId).slice(0, 24)
+      + ' generation=' + (targetExecutionContext.generation ?? '-')
+      + ' boundary=' + (codexResult?.boundaryReason || '-')
+      + ' complete=' + (codexResult?.complete === true)
+      + ' blocks=' + (codexResult?.assistantBlockCount ?? 0);
+    if (!codexResult?.success) {
+      console.warn('[OrchestrationResultProof] Codex provider turn unproven' + logDetails
+        + ' error=' + (codexResult?.error || 'unknown'));
+      return {
+        found: false,
+        error: codexResult?.error || 'Codex provider turn result unproven',
+        sourceSnapshot: data.sourceSnapshot || loaded.sourceSnapshot || null,
+      };
+    }
+    console.log('[OrchestrationResultProof] Codex provider turn materialized' + logDetails);
+    return {
+      found: true,
+      complete: codexResult.complete === true,
+      turnIndex: codexResult.turnIndex,
+      userUuid: codexResult.userUuid,
+      promptCarrierKind: 'user',
+      assistantText: codexResult.assistantText,
+      assistantChars: codexResult.assistantChars,
+      truncated: codexResult.truncated,
+      assistantBlockCount: codexResult.assistantBlockCount,
+      sourceSnapshot: data.sourceSnapshot || loaded.sourceSnapshot || null,
+    };
+  }
   const match = findMatchingClaudePromptTurn({
     turns: data.turns,
     recordMap: data.recordMap,
@@ -13947,6 +14084,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     console.timeEnd(`[PERF:main] pty.spawn ${tabId}`);
     console.log(`[PTY:CREATED] tabId=${tabId} pid=${ptyProcess.pid} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)} initialCommand=${initialCommand ? JSON.stringify(initialCommand) : 'none'}`);
 
+    terminalCwdChangeProofs.cancel(tabId, null, 'terminal_generation_changed');
     terminals.set(tabId, ptyProcess);
     terminalShellReadiness.reset(tabId, ptyProcess, ptyProcess.pid);
     terminalProjects.set(tabId, workingDir);
@@ -14598,6 +14736,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         mainWindow.webContents.send('terminal:exit', tabId, exitCode);
       }
       deleteTerminalRuntimeIfOwned(terminals, tabId, ptyProcess);
+      terminalCwdChangeProofs.cancel(tabId, null, 'terminal_generation_changed');
       terminalShellReadiness.remove(tabId, ptyProcess);
       terminalProjects.delete(tabId);
       terminalProjectIds.delete(tabId);
@@ -15571,15 +15710,12 @@ async function validatePromptQueueImageMarkers(text) {
   const input = String(text || '');
   const paths = [];
   input.replace(/\[imagePath:\s*([^\]\r\n]+?)\s*\]/gi, (_match, rawPath) => {
-    paths.push(String(rawPath || '').trim());
+    const imagePath = String(rawPath || '').trim();
+    if (isPortableImagePath(imagePath)) paths.push(imagePath);
     return _match;
   });
   const missing = [];
   for (const imagePath of paths) {
-    if (!imagePath || !path.isAbsolute(imagePath)) {
-      missing.push({ path: imagePath, error: 'invalid_image_path' });
-      continue;
-    }
     const stat = await fs.promises.stat(imagePath).catch(() => null);
     if (!stat?.isFile()) missing.push({ path: imagePath, error: 'image_path_missing' });
   }
@@ -15603,15 +15739,45 @@ async function safePasteAndSubmit(term, content, options = {}) {
     queuedAt: Date.now(),
   };
   const operationTabId = findTabIdForTerm(term);
-  const expectedInputRevision = operationTabId
+  const requestedInputRevision = operationTabId
     ? getTerminalInputRevision(operationTabId)
     : null;
   return await withPtyWriteLock(
     term,
-    () => _safePasteAndSubmitInner(term, content, {
-      ...options,
-      expectedInputRevision,
-    }),
+    () => {
+      let expectedInputRevision = requestedInputRevision;
+      let claudeExactEmptyEvidence = options.claudeExactEmptyEvidence || null;
+      if (operationTabId) {
+        if (options.inputRevisionAlreadyReserved === true) {
+          if (getTerminalInputRevision(operationTabId) !== requestedInputRevision) {
+            return {
+              success: false,
+              submitted: false,
+              error: 'terminal_input_ownership_changed_before_write',
+              manualTakeover: true,
+            };
+          }
+        } else {
+          const inputRevisionBeforeReservation = getTerminalInputRevision(operationTabId);
+          expectedInputRevision = bumpTerminalInputRevision(operationTabId);
+          claudeExactEmptyEvidence = reserveClaudeExactEmptyEvidence({
+            evidence: claudeExactEmptyEvidence,
+            currentInputRevision: inputRevisionBeforeReservation,
+            reservedInputRevision: expectedInputRevision,
+            currentRunSeq: Number(terminalCommandState.get(operationTabId)?.runSeq || 0),
+            currentLifecycleGeneration: getTerminalLifecycleGeneration(operationTabId),
+            currentMirrorGeneration: getHeadlessTerminalMirror(operationTabId)?.generation || null,
+          });
+          operation.inputRevisionBeforeReservation = inputRevisionBeforeReservation;
+          operation.inputRevision = expectedInputRevision;
+        }
+      }
+      return _safePasteAndSubmitInner(term, content, {
+        ...options,
+        expectedInputRevision,
+        claudeExactEmptyEvidence,
+      });
+    },
     operation,
   );
 }
@@ -15644,6 +15810,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     presentationSnapshot = null,
     startupPromptLease = null,
     startupExactEmptyEvidence = null,
+    claudeExactEmptyEvidence = null,
   } = options;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
@@ -15859,14 +16026,13 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   if (requiresImagePathValidation) {
     const queueImages = await validatePromptQueueImageMarkers(content);
     if (!queueImages.success) {
-      console.warn(logPrefix + ' [PromptQueueAssets] refusing transfer source=' + (source || '-')
-        + ' missing=' + queueImages.missing.length);
-      return {
-        success: false,
-        error: 'queue_image_path_unavailable',
-        submitted: false,
-        imagePathErrors: queueImages.missing,
-      };
+      content = replaceUnavailableImagePathMarkers(
+        content,
+        queueImages.missing,
+      );
+      console.warn(logPrefix + ' [PromptQueueAssets] degraded transfer source=' + (source || '-')
+        + ' missing=' + queueImages.missing.length
+        + ' action=replace-with-imageError');
     }
   }
   if (isCodexPasteSource) {
@@ -15878,12 +16044,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         + ' source=' + (source || '-'));
     }
     if (prepared.missing.length > 0) {
-      return {
-        success: false,
-        error: 'codex_image_path_unavailable',
-        submitted: false,
-        imagePathErrors: prepared.missing,
-      };
+      console.warn(logPrefix + ' [CodexImagePathPaste] degraded missing paths source=' + (source || '-')
+        + ' missing=' + prepared.missing.length
+        + ' action=replace-with-imageError');
     }
     content = prepared.text;
     stagedCodexImageRefs = prepared.staged;
@@ -16193,7 +16356,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       broadcastTabId,
       term,
       'claude-write-boundary-before-paste:' + (source || 'unknown'),
-      { exactEmptyEvidence: startupExactEmptyEvidence },
+      { exactEmptyEvidence: claudeExactEmptyEvidence || startupExactEmptyEvidence },
     );
     if (!draftBoundary.valid) {
       return {
@@ -17566,6 +17729,8 @@ ipcMain.handle('terminal:paste', async (event, {
   handoffId = null,
   source = null,
   verifyClaudeVisibleDraftBeforePaste = false,
+  claudeExactEmptyEvidence = null,
+  awaitClaudeUserMessageAudit = false,
   presentationSnapshot = null,
 } = {}) => {
   const term = terminals.get(tabId);
@@ -17579,8 +17744,6 @@ ipcMain.handle('terminal:paste', async (event, {
       + ' source=' + (source || '-'));
     return { success: false, error: 'agent_stopping' };
   }
-  bumpTerminalInputRevision(tabId);
-
   console.log('[terminal:paste] Pasting ' + content.length + ' chars to tab ' + tabId + ' (submit=' + submit + ', fast=' + fast + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ')');
   
   try {
@@ -17591,6 +17754,8 @@ ipcMain.handle('terminal:paste', async (event, {
       handoffId,
       source,
       verifyClaudeVisibleDraftBeforePaste,
+      claudeExactEmptyEvidence,
+      awaitClaudeUserMessageAudit,
       presentationSnapshot,
       fast // Enable fast mode by default for general paste
     });
@@ -19147,16 +19312,16 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
   if (isPromptQueueSend) {
     const queueImages = await validatePromptQueueImageMarkers(command);
     if (!queueImages.success) {
-      return {
-        success: false,
-        error: 'queue_image_path_unavailable',
-        submitted: false,
-        imagePathErrors: queueImages.missing,
-      };
+      command = replaceUnavailableImagePathMarkers(
+        command,
+        queueImages.missing,
+      );
+      console.warn('[send-command] [PromptQueueAssets] degraded Claude command tab='
+        + String(tabId).slice(-12)
+        + ' source=' + source
+        + ' missing=' + queueImages.missing.length
+        + ' action=replace-with-imageError');
     }
-  }
-  if (sendOptions.inputRevisionAlreadyReserved !== true) {
-    bumpTerminalInputRevision(tabId);
   }
   // Dev-only fault: paste the exact effort command but deliberately withhold
   // Enter. This creates the one production-observable ABSENT state: a
@@ -19177,6 +19342,7 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
       dismissAutocomplete: shouldDismissAutocomplete,
       handoffId,
       source: source + ':test-hold-before-enter',
+      inputRevisionAlreadyReserved: sendOptions.inputRevisionAlreadyReserved === true,
       startupPromptLease: sendOptions.startupPromptLease || null,
       startupExactEmptyEvidence: sendOptions.startupExactEmptyEvidence || null,
       verifyClaudeVisibleDraftBeforePaste:
@@ -19209,6 +19375,7 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
       dismissAutocomplete: shouldDismissAutocomplete,
       handoffId,
       source,
+      inputRevisionAlreadyReserved: sendOptions.inputRevisionAlreadyReserved === true,
       startupPromptLease: sendOptions.startupPromptLease || null,
       startupExactEmptyEvidence: sendOptions.startupExactEmptyEvidence || null,
       verifyClaudeVisibleDraftBeforePaste:
@@ -19285,7 +19452,7 @@ ipcMain.handle('claude:append-input', async (event, tabId, text, options = {}) =
     source,
   });
   if (result && typeof result === 'object') {
-    result.submitted = shouldSubmit;
+    if (typeof result.submitted !== 'boolean') result.submitted = shouldSubmit;
     result.handoffId = handoffId || null;
   }
   return result;
@@ -19413,8 +19580,8 @@ ipcMain.handle('provider:set-options', (event, opts) => {
 });
 
 // Toggle thinking mode reactively: open picker → detect state → navigate → confirm
-ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
-  const term = terminals.get(tabId);
+ipcMain.handle('claude:toggle-thinking', async (event, tabId, desiredThinking = null) => {
+  let term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
 
   // Wait for danger zone to clear (event-driven: resolves when prompt returns)
@@ -19425,102 +19592,141 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
     console.log('[Think] ✅ Prompt returned, proceeding');
   }
 
+  // The PTY may have been replaced while the prior turn was settling.
+  term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no terminal' };
+
   const stripped = require('node:util').stripVTControlCharacters;
+  const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const expectedLifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  const requestedInputRevision = getTerminalInputRevision(tabId);
+  const pickerOperation = {
+    kind: 'claude-thinking-picker',
+    source: 'claude-toggle-thinking',
+    tabId,
+    submitted: false,
+    identityPending: false,
+    manualInputYields: true,
+    manualEnterSubmitsPrompt: true,
+    phase: 'queued',
+    queuedAt: Date.now(),
+  };
 
-  return new Promise((resolve) => {
-    let buffer = '';
+  return await withPtyWriteLock(term, async () => {
+    if (
+      terminals.get(tabId) !== term
+      || Number(terminalCommandState.get(tabId)?.runSeq || 0) !== expectedRunSeq
+      || getTerminalLifecycleGeneration(tabId) !== expectedLifecycleGeneration
+      || getTerminalInputRevision(tabId) !== requestedInputRevision
+    ) {
+      return { success: false, error: 'think_input_ownership_changed' };
+    }
 
-    const sub = term.onData((data) => {
-      buffer += data;
-
-      // Picker ready when synchronized output ends
-      if (!buffer.includes('\x1b[?2026l')) return;
-      sub.dispose();
-
-      const clean = stripped(buffer);
-      const enabledIdx = clean.indexOf('Enabled');
-      const disabledIdx = clean.indexOf('Disabled');
-      const checkIdx = clean.indexOf('\u2714'); // ✓
-
-      let wasEnabled = true;
-      if (checkIdx >= 0 && enabledIdx >= 0 && disabledIdx >= 0) {
-        wasEnabled = Math.abs(checkIdx - enabledIdx) < Math.abs(checkIdx - disabledIdx);
-      }
-
-      const newState = !wasEnabled;
-      console.log('[Think] clean text:', JSON.stringify(clean).substring(0, 400));
-      console.log('[Think] enabledIdx:', enabledIdx, 'disabledIdx:', disabledIdx, 'checkIdx:', checkIdx);
-      console.log('[Think] Was:', wasEnabled ? 'Enabled' : 'Disabled', '-> Toggling to:', newState ? 'Enabled' : 'Disabled');
-
-      // Navigate to the other option
-      const arrow = wasEnabled ? '\x1b[B' : '\x1b[A';
-      console.log('[Think] Sending arrow:', wasEnabled ? 'DOWN' : 'UP');
-      term.write(arrow);
-
-      // Confirm with Enter after Ink processes the arrow
-      let confirmResolved = false;
-      const confirmSub = term.onData((confirmData) => {
-        if (confirmResolved) return;
-        console.log('[Think] Arrow response RAW (' + confirmData.length + ' bytes):', JSON.stringify(confirmData).substring(0, 300));
-        confirmSub.dispose();
-        confirmResolved = true;
-        console.log('[Think] Sending Enter to confirm selection');
-        term.write('\r');
-
-        // Claude may show "Do you want to proceed?" confirmation dialog
-        // Listen for it and auto-confirm
-        let proceedResolved = false;
-        let sawPostConfirmFrame = false;
-        let proceedBuffer = '';
-        const proceedSub = term.onData((proceedData) => {
-          sawPostConfirmFrame = true;
-          proceedBuffer += proceedData;
-          console.log('[Think] Post-confirm RAW (' + proceedData.length + ' bytes):', JSON.stringify(proceedData).substring(0, 300));
-
-          if (proceedBuffer.includes('proceed') || proceedBuffer.includes('Proceed')) {
-            if (proceedResolved) return;
-            proceedResolved = true;
-            proceedSub.dispose();
-            console.log('[Think] Detected "proceed" confirmation, sending Enter');
-            term.write('\r');
-            resolve({ success: true, thinking: newState });
-          }
-        });
-
-        // Safety: resolve even if no confirmation dialog appears
-        setTimeout(() => {
-          proceedSub.dispose();
-          if (!proceedResolved) {
-            if (sawPostConfirmFrame) {
-              console.log('[Think] No proceed dialog, but post-confirm frame arrived');
-              resolve({ success: true, thinking: newState });
-            } else {
-              console.log('[Think] No post-confirm frame after Enter');
-              resolve({ success: false, error: 'think_post_confirm_timeout' });
-            }
-          }
-        }, 2000);
+    const ownedInputRevision = bumpTerminalInputRevision(tabId);
+    const stillOwnsPicker = () => (
+      terminals.get(tabId) === term
+      && Number(terminalCommandState.get(tabId)?.runSeq || 0) === expectedRunSeq
+      && getTerminalLifecycleGeneration(tabId) === expectedLifecycleGeneration
+      && getTerminalInputRevision(tabId) === ownedInputRevision
+    );
+    const captureFrameAfterWrite = (data, phase, timeoutMs) => new Promise((resolve) => {
+      let buffer = '';
+      let finished = false;
+      const finish = (result) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        sub.dispose();
+        resolve(result);
+      };
+      const sub = term.onData((chunk) => {
+        buffer += chunk;
+        if (!buffer.includes('\x1b[?2026l')) return;
+        finish({ success: true, buffer });
       });
-
-      // If the arrow does not produce a frame, selection state is unknown.
-      setTimeout(() => {
-        if (confirmResolved) return;
-        confirmSub.dispose();
-        confirmResolved = true;
-        console.log('[Think] No arrow response, aborting');
-        resolve({ success: false, error: 'think_arrow_timeout' });
-      }, 300);
+      const timer = setTimeout(() => {
+        finish({ success: false, error: phase + '_timeout', buffer });
+      }, timeoutMs);
+      if (!stillOwnsPicker()) {
+        finish({ success: false, error: 'think_input_ownership_changed', buffer });
+        return;
+      }
+      pickerOperation.phase = phase;
+      pickerOperation.manualEnterSubmitsPrompt = false;
+      term.write(data);
     });
 
-    // Safety timeout
-    setTimeout(() => {
-      sub.dispose();
-      resolve({ success: false, error: 'timeout' });
-    }, 5000);
+    const pickerFrame = await captureFrameAfterWrite('\x1bt', 'think_picker_open', 5000);
+    if (!pickerFrame.success || !stillOwnsPicker()) {
+      return {
+        success: false,
+        error: pickerFrame.error || 'think_input_ownership_changed',
+      };
+    }
 
-    // Open the picker
-    term.write('\x1bt');
-  });
+    const clean = stripped(pickerFrame.buffer);
+    const enabledIdx = clean.indexOf('Enabled');
+    const disabledIdx = clean.indexOf('Disabled');
+    const checkIdx = clean.indexOf('\u2714'); // ✓
+    if (checkIdx < 0 || enabledIdx < 0 || disabledIdx < 0) {
+      console.warn('[Think] Picker state is incomplete; refusing to guess');
+      return { success: false, error: 'think_picker_state_unknown' };
+    }
+
+    const wasEnabled = Math.abs(checkIdx - enabledIdx) < Math.abs(checkIdx - disabledIdx);
+    const hasDesiredState = typeof desiredThinking === 'boolean';
+    const newState = hasDesiredState ? desiredThinking : !wasEnabled;
+    console.log('[Think] clean text:', JSON.stringify(clean).substring(0, 400));
+    console.log('[Think] enabledIdx:', enabledIdx, 'disabledIdx:', disabledIdx, 'checkIdx:', checkIdx);
+    console.log('[Think] Was:', wasEnabled ? 'Enabled' : 'Disabled', '-> Requested:', newState ? 'Enabled' : 'Disabled');
+
+    if (newState === wasEnabled) {
+      // The picker itself is the authoritative read. A synchronized frame
+      // after Escape proves that this exact operation returned control to the
+      // composer; the following send will still take a fresh draft proof.
+      const closed = await captureFrameAfterWrite('\x1b', 'think_picker_close', 2500);
+      if (!closed.success || !stillOwnsPicker()) {
+        return {
+          success: false,
+          error: closed.error || 'think_input_ownership_changed',
+        };
+      }
+      return { success: true, thinking: wasEnabled, changed: false };
+    }
+
+    const arrow = wasEnabled ? '\x1b[B' : '\x1b[A';
+    console.log('[Think] Sending arrow:', wasEnabled ? 'DOWN' : 'UP');
+    const arrowFrame = await captureFrameAfterWrite(arrow, 'think_arrow', 2500);
+    if (!arrowFrame.success || !stillOwnsPicker()) {
+      return {
+        success: false,
+        error: arrowFrame.error || 'think_input_ownership_changed',
+      };
+    }
+
+    console.log('[Think] Sending Enter to confirm selection');
+    let finalFrame = await captureFrameAfterWrite('\r', 'think_confirm', 2500);
+    if (!finalFrame.success || !stillOwnsPicker()) {
+      return {
+        success: false,
+        error: finalFrame.error || 'think_input_ownership_changed',
+      };
+    }
+
+    const confirmationText = stripped(finalFrame.buffer);
+    if (/\bproceed\b/i.test(confirmationText)) {
+      console.log('[Think] Detected "proceed" confirmation, sending Enter');
+      finalFrame = await captureFrameAfterWrite('\r', 'think_proceed', 2500);
+      if (!finalFrame.success || !stillOwnsPicker()) {
+        return {
+          success: false,
+          error: finalFrame.error || 'think_input_ownership_changed',
+        };
+      }
+    }
+
+    return { success: true, thinking: newState, changed: true };
+  }, pickerOperation);
 });
 
 // Claude rewind through the native `/rewind` slash command.
@@ -19608,7 +19814,7 @@ function makeRewindCancelledError(stage) {
   return err;
 }
 
-ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIndex, targetText, targetFullText, targetUuid, rewindableCount, skipDuplicates = 0, pasteAfter, deadlineMs }) => {
+ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIndex, targetText, targetMenuText, targetFullText, targetUuid, rewindableCount, skipDuplicates = 0, pasteAfter, deadlineMs }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
   if (!hasLiveClaudeInTab(tabId)) return { success: false, error: 'no_claude_session' };
@@ -20008,12 +20214,15 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
       }
 
       const targetInputText = String(targetFullText || targetText || '').trim();
-      const targetPrefix = normalizeCandidate(targetInputText || targetText);
+      const targetMatchText = String(targetMenuText || targetText || targetInputText).trim();
+      const targetPrefix = normalizeCandidate(targetMatchText);
       if (!targetPrefix) return { success: false, error: 'empty_target' };
       console.log('[Claude:Rewind] Target match key chars=' + targetPrefix.length
         + ' fullChars=' + targetInputText.length
-        + ' hash=' + pasteAuditHash(targetInputText)
-        + ' head="' + pasteAuditPreview(targetInputText) + '"');
+        + ' matchHash=' + pasteAuditHash(targetMatchText)
+        + ' fullHash=' + pasteAuditHash(targetInputText)
+        + ' matchHead="' + pasteAuditPreview(targetMatchText) + '"'
+        + ' fullHead="' + pasteAuditPreview(targetInputText) + '"');
 
       async function readRendererSelection(reason) {
         const snapshot = await requestTerminalVisibleBufferSnapshot(event.sender, tabId, reason, 700);
@@ -21331,6 +21540,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
   let handoffMutationStarted = false;
   let handoffSettlementResult = null;
   let codexRewindOperationResult = null;
+  let rewindCommitExpectation = null;
+  let durableCommittedChildProof = null;
   const settleAppliedCodexRewindWriter = async (stage) => {
     if (!handoffObservationArmed || !handoffMutationStarted) {
       return {
@@ -21371,6 +21582,21 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     };
   };
   const inspectCommittedCodexRewindChild = (actionGeneration) => {
+    const receiptProof = rewindCommitExpectation
+      ? inspectCodexNativeRewindCommitReceipt(tabId, rewindCommitExpectation)
+      : { available: false, committed: false };
+    if (receiptProof.committed) {
+      durableCommittedChildProof = receiptProof;
+      return receiptProof;
+    }
+    if (receiptProof.available) {
+      return {
+        committed: false,
+        sourceSessionId: null,
+        childSessionId: null,
+        error: receiptProof.error || 'codex_rewind_commit_receipt_unproven',
+      };
+    }
     const intent = codexSessionDiscoveryIntents.get(tabId) || null;
     const boundSessionId = codexSessionIdFromDb(tabId);
     const committed = isCommittedCodexNativeRewindReplay({
@@ -21791,10 +22017,13 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         || codexDataModule._api.extractTextContent(targetPayload?.content)
         || '',
       ).trim();
+      const authoritativeTargetTextHash = hashCodexRewindTargetText(authoritativeTargetText);
       if (!markCodexWriterHandoffActionBoundary(tabId, handoffActionStartedAtMs, {
+        operationId: String(opId || rewindRequestId),
+        requestId: rewindRequestId,
         targetUuid,
         targetSourceLine: targetPayloadContext?.sourceLine,
-        targetTextHash: hashCodexRewindTargetText(authoritativeTargetText),
+        targetTextHash: authoritativeTargetTextHash,
         rollbackTurns,
       })) {
         return {
@@ -21803,6 +22032,21 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           rollbackMayHaveApplied: false,
         };
       }
+      rewindCommitExpectation = {
+        projectId: resolveAuthoritativeTabProjectId(tabId),
+        tabId,
+        operationId: String(opId || rewindRequestId),
+        requestId: rewindRequestId,
+        actionGeneration: handoffActionGeneration,
+        sourceSessionId: handoffObserver?.sourceSessionId || writer?.sessionId || null,
+        sourceLifecycleGeneration: handoffObserver?.sourceLifecycleGeneration || null,
+        sourceRunSeq: Number(handoffObserver?.sourceRunSeq || 0),
+        terminalToken: term,
+        targetUuid,
+        targetSourceLine: targetPayloadContext?.sourceLine,
+        targetTextHash: authoritativeTargetTextHash,
+        rollbackTurns,
+      };
       handoffMutationStarted = true;
       markActiveRewindMutationStarted(activeRewindOperation, _event.sender);
       const targetNeedle = normalizeCandidate(targetInputText).slice(0, 40);
@@ -21926,7 +22170,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       if (!committedChildBeforeStableProof.committed) {
         stableSourceProof = markCodexWriterHandoffRollbackApplied(tabId, {
           actionGeneration: handoffActionGeneration,
-          restoredTextHash: hashCodexRewindTargetText(authoritativeTargetText),
+          restoredTextHash: authoritativeTargetTextHash,
         });
         if (stableSourceProof?.success !== true) {
           // The exact child may atomically commit and consume the journal
@@ -21953,6 +22197,18 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const committedChildProof = committedChildBeforeStableProof.committed
         ? committedChildBeforeStableProof
         : committedChildAfterStableProof;
+      if (committedChildProof?.receiptId) {
+        handoffSettlementResult = {
+          status: 'adopted',
+          sourceSessionId: committedChildProof.sourceSessionId,
+          activeSessionId: committedChildProof.childSessionId,
+          bindingCommitted: true,
+          handoffStatus: 'adopted-child',
+          handoffGeneration: handoffActionGeneration,
+          proofMode: 'durable-commit-receipt',
+          receiptId: committedChildProof.receiptId,
+        };
+      }
       console.log('[CodexWriterHandoff] post-grab completion proof tab='
         + String(tabId).slice(-12)
         + ' mode=' + completionProof.proofMode
@@ -21961,7 +22217,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           committedChildProof.sourceSessionId || handoffObserver?.sourceSessionId || 'none',
         ).slice(0, 8)
         + ' child=' + String(committedChildProof.childSessionId || 'none').slice(0, 8)
-        + ' generation=' + handoffActionGeneration);
+        + ' generation=' + handoffActionGeneration
+        + ' receipt=' + (committedChildProof.receiptId || 'none'));
       const writerHandoff = await settleAppliedCodexRewindWriter('programmatic-rewind-applied');
       if (!writerHandoff.success) {
         return {
@@ -22062,6 +22319,33 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
               rollbackMayHaveApplied: true,
             });
           }
+        }
+      }
+      if (codexRewindOperationResult?.success === true
+        && rewindCommitExpectation
+        && durableCommittedChildProof?.committed === true) {
+        const finalizedReceipt = finalizeCodexNativeRewindCommitReceipt(
+          tabId,
+          rewindCommitExpectation,
+          durableCommittedChildProof,
+        );
+        codexRewindOperationResult.commitReceiptFinalized = finalizedReceipt?.success === true;
+        codexRewindOperationResult.commitReceiptId = durableCommittedChildProof.receiptId;
+        if (finalizedReceipt?.success === true) {
+          console.log('[CodexWriterHandoff] final callback consumed commit receipt tab='
+            + String(tabId).slice(-12)
+            + ' source=' + String(durableCommittedChildProof.sourceSessionId || 'none').slice(0, 8)
+            + ' child=' + String(durableCommittedChildProof.childSessionId || 'none').slice(0, 8)
+            + ' generation=' + rewindCommitExpectation.actionGeneration
+            + ' updated=' + (finalizedReceipt.updated === true));
+        } else {
+          // The exact result is already proven and must not be downgraded just
+          // because audit closure could not be persisted. A later exact retry
+          // or restart can still consume the unchanged committed receipt.
+          console.warn('[CodexWriterHandoff] commit receipt finalization deferred tab='
+            + String(tabId).slice(-12)
+            + ' generation=' + rewindCommitExpectation.actionGeneration
+            + ' error=' + (finalizedReceipt?.error || 'unknown'));
         }
       }
     } finally {
@@ -22508,6 +22792,12 @@ ipcMain.handle('terminal:updateCwd', async (event, { tabId, cwd } = {}) => {
     }));
   }
   terminalProjects.set(tabId, result.cwd);
+  const cwdChangeProof = terminalCwdChangeProofs.observe({
+    tabId,
+    terminalToken: terminals.get(tabId),
+    cwd: result.cwd,
+    persisted,
+  });
   console.log('[TerminalCwdProof] accepted ' + JSON.stringify({
     tabId,
     candidate: cwd,
@@ -22516,8 +22806,117 @@ ipcMain.handle('terminal:updateCwd', async (event, { tabId, cwd } = {}) => {
     lookupPid: liveObservation?.pid || null,
     lookupRootCwd: liveObservation?.rootCwd || null,
     persisted,
+    cwdChangeOperationId: cwdChangeProof.matched ? cwdChangeProof.operationId : null,
   }));
   return { ...result, persisted };
+});
+
+// Change only this tab's working directory. The command is written at the same
+// proven-idle shell boundary as an AI launch, then completion is tied to the
+// exact OSC 7 value that main validates against the live PTY process. A timer
+// can surface missing observability, but it never commits cwd by itself.
+ipcMain.handle('terminal:change-working-directory', async (_event, request = {}) => {
+  const tabId = String(request?.tabId || '');
+  const requestedTarget = normalizeDirectoryTarget(request?.targetCwd);
+  if (!tabId || !requestedTarget) {
+    return { success: false, accepted: false, error: 'invalid_directory_change_request' };
+  }
+
+  let targetCwd;
+  try {
+    const stat = await fs.promises.stat(requestedTarget);
+    if (!stat.isDirectory()) {
+      return { success: false, accepted: false, error: 'working_directory_not_directory' };
+    }
+    targetCwd = await fs.promises.realpath(requestedTarget);
+  } catch (error) {
+    return {
+      success: false,
+      accepted: false,
+      error: 'working_directory_unavailable',
+      detail: error?.message || String(error),
+    };
+  }
+
+  return runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+    const term = terminals.get(tabId);
+    if (!term) {
+      return { success: false, accepted: false, error: 'terminal_not_found' };
+    }
+    const fromCwd = terminalProjects.get(tabId) || null;
+    if (normalizeDirectoryTarget(fromCwd) === targetCwd) {
+      return {
+        success: true,
+        accepted: true,
+        unchanged: true,
+        cwd: targetCwd,
+        fromCwd,
+        proof: 'already-current-live-cwd',
+      };
+    }
+    const shellDraft = String(terminalInputLineBuffers.get(tabId) || '');
+    if (shellDraft) {
+      return {
+        success: false,
+        accepted: false,
+        error: 'terminal_has_unsent_input',
+        draftChars: shellDraft.length,
+      };
+    }
+
+    const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+    const admission = await proveIdleShellForAgentLaunch(tabId, 'cwd-change', {
+      expectedTerm: term,
+      expectedRunSeq,
+    });
+    if (!admission.allowed) {
+      return {
+        success: false,
+        accepted: false,
+        error: admission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN
+          ? 'process_lookup_failed'
+          : 'shell_not_idle',
+        reason: admission.reason,
+        lookupStatus: admission.lookup?.status || null,
+      };
+    }
+
+    const pending = terminalCwdChangeProofs.begin({
+      tabId,
+      terminalToken: term,
+      fromCwd,
+      targetCwd,
+      timeoutMs: 10_000,
+    });
+    if (!pending.success) return pending;
+
+    try {
+      writeAgentLaunchCommandToIdleShell(term, {
+        tabId,
+        toolType: 'cwd-change',
+        command: `cd -- ${shellQuote(targetCwd)}`,
+        launchId: pending.operationId,
+      });
+    } catch (error) {
+      terminalCwdChangeProofs.cancel(
+        tabId,
+        pending.operationId,
+        error?.message || 'cwd_change_write_failed',
+      );
+    }
+
+    const proof = await pending.promise;
+    console.log('[TerminalCwdChange] settled ' + JSON.stringify({
+      tabId,
+      operationId: pending.operationId,
+      fromCwd,
+      targetCwd,
+      success: proof.success === true,
+      error: proof.error || null,
+      waitedMs: proof.waitedMs,
+    }));
+    return proof;
+  });
 });
 
 // Renderer components can mount after the shell already emitted its first
@@ -22798,11 +23197,20 @@ ipcMain.handle('project:get', (event, identifier) => {
 });
 
 // Get current working directory
-ipcMain.handle('app:select-directory', async () => {
+ipcMain.handle('app:select-directory', async (event, request = {}) => {
   const { dialog } = require('electron');
-  const result = await dialog.showOpenDialog({
-    properties: ['openDirectory']
-  });
+  const requestedDefault = typeof request === 'string'
+    ? request
+    : request?.defaultPath;
+  const defaultPath = normalizeDirectoryTarget(requestedDefault);
+  const parent = BrowserWindow.fromWebContents(event.sender) || mainWindow || null;
+  const options = {
+    properties: ['openDirectory'],
+    ...(defaultPath ? { defaultPath } : {}),
+  };
+  const result = parent
+    ? await dialog.showOpenDialog(parent, options)
+    : await dialog.showOpenDialog(options);
   if (result.canceled) return null;
   return result.filePaths[0];
 });
@@ -22901,6 +23309,12 @@ let promptQueueAssetGcTimer = null;
 async function garbageCollectPromptQueueAssets(queueState, reason = 'state-save') {
   try {
     const referenced = collectReferencedAssetIds(queueState);
+    const composerDraftAssets = collectComposerDraftAssetIds(
+      projectManager.db.getAppState('noted-terminal-history-composer-drafts'),
+    );
+    for (const assetId of composerDraftAssets) referenced.add(assetId);
+    const historyPresentationAssets = projectManager.db.getHistoryPromptPresentationAssetIds?.() || [];
+    for (const assetId of historyPresentationAssets) referenced.add(assetId);
     for (const assetId of promptQueueAssetSessionLeases) referenced.add(assetId);
     const result = await promptQueueAssetStore.garbageCollect(referenced);
     if (result.removed.length > 0) {
@@ -27466,20 +27880,70 @@ async function inspectCurrentCodexMcpStartupScreen(tabId, reason = 'mcp-watchdog
     inspected,
     mcpInfo,
     writeSeq: Number.isFinite(writeSeq) ? writeSeq : null,
+    flushedSeq: Number.isFinite(Number(snapshot.flushedSeq))
+      ? Number(snapshot.flushedSeq)
+      : null,
+    committedWriteSeq: Number.isFinite(Number(snapshot.committedWriteSeq))
+      ? Number(snapshot.committedWriteSeq)
+      : null,
+    committedFrameGeneration: Number.isInteger(Number(snapshot.committedFrameGeneration))
+      ? Number(snapshot.committedFrameGeneration)
+      : null,
+    authoritativeFrameCommitted: snapshot.authoritativeFrameCommitted === true,
+    committedFrameReplay: snapshot.committedFrameReplay === true,
+    synchronizedOutputOpen: snapshot.synchronizedOutputOpen === true,
+    liveSynchronizedOutputOpen: snapshot.liveSynchronizedOutputOpen === true,
+    mirrorGeneration: snapshot.mirrorGeneration || null,
     inputRevision: getTerminalInputRevision(tabId),
     terminalToken: terminals.get(tabId) || null,
     terminalLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
     terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
-    destructiveProofAvailable: source === 'headless-main' && Number.isFinite(writeSeq),
+    destructiveProofAvailable: source === 'headless-main'
+      && snapshot.authoritativeFrameCommitted === true
+      && Number.isFinite(writeSeq)
+      && Number(snapshot.writeSeq) === Number(snapshot.flushedSeq)
+      && Number.isInteger(Number(snapshot.committedFrameGeneration)),
   };
 }
 
-function reconcileCodexMcpStartupWatchdogFromCurrentScreen(tabId, inspected, visibleText, phase) {
+function reconcileCodexMcpStartupWatchdogFromCurrentScreen(
+  tabId,
+  inspected,
+  visibleText,
+  phase,
+  observation = null,
+) {
   const state = codexMcpStartupWatchdogs.get(tabId);
   if (!state) return;
   const currentMcp = getCodexMcpStartupWatchdogState(tabId, inspected, visibleText);
-  if (currentMcp?.visible) return;
-  clearCodexMcpStartupWatchdog(tabId, 'current-screen-blocker-gone:' + (phase || 'probe'));
+  const decision = decideCodexMcpWatchdogReconcile({
+    inspected,
+    mcpVisible: currentMcp?.visible === true,
+    synchronizedOutputOpen: observation?.synchronizedOutputOpen === true,
+    authoritativeFrameCommitted: observation
+      ? observation.authoritativeFrameCommitted === true
+      : true,
+  });
+  if (decision.action !== 'clear') {
+    if (decision.reason === 'current-frame-transitional'
+      && state.mcpStartupRedrawGapLogged !== true) {
+      state.mcpStartupRedrawGapLogged = true;
+      console.log('[CodexMcpStartupWatchdog] preserve through redraw gap tab='
+        + String(tabId).slice(-12)
+        + ' phase=' + (phase || 'probe')
+        + ' inspected=' + (inspected?.reason || 'unknown')
+        + ' frame=' + (observation?.committedFrameGeneration ?? '-')
+        + ' write=' + (observation?.writeSeq ?? '-')
+        + '/' + (observation?.flushedSeq ?? '-')
+        + ' syncOpen=' + (observation?.synchronizedOutputOpen === true)
+        + ' committedReplay=' + (observation?.committedFrameReplay === true));
+    }
+    return;
+  }
+  clearCodexMcpStartupWatchdog(
+    tabId,
+    decision.reason + ':' + (phase || 'probe'),
+  );
 }
 
 function scheduleCodexMcpStartupProofRetry(tabId, state, reason) {
@@ -27809,6 +28273,37 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
             const latestPayload = codexLastRunCommandPayload.get(tabId);
             const mirror = getHeadlessTerminalMirror(tabId);
             const authoritativeMirror = mirror?.complete === true ? mirror : null;
+            const currentCommittedFrame = authoritativeMirror
+              ? getHeadlessVisibleBufferSnapshot(
+                tabId,
+                'mcp-watchdog-pre-signal-current-frame',
+              )
+              : null;
+            const currentCommittedText = currentCommittedFrame?.success
+              && Array.isArray(currentCommittedFrame.lines)
+              ? selectCodexCurrentInteractiveFrameText(
+                currentCommittedFrame.lines,
+                currentCommittedFrame.codexActivePrompt?.row,
+              )
+              : '';
+            const currentCommittedInspection = currentCommittedText
+              ? normalizeCodexMcpStartupInspection(
+                tabId,
+                inspectCodexInputReadyVisibleText(
+                  currentCommittedText,
+                  currentCommittedFrame.source || 'headless-main',
+                ),
+                'mcp-watchdog-pre-signal-current-frame',
+                { authoritativeCurrentFrame: true },
+              )
+              : null;
+            const currentCommittedMcp = currentCommittedInspection
+              ? getCodexMcpStartupWatchdogState(
+                tabId,
+                currentCommittedInspection,
+                currentCommittedText,
+              )
+              : null;
             return isCodexMcpRestartSignalSafe({
               expectedWatchdog: state,
               currentWatchdog: latestState,
@@ -27820,13 +28315,19 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
               currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
               expectedLaunchId: payload.launchId,
               currentLaunchId: latestPayload?.launchId,
-              expectedWriteSeq: currentScreen.writeSeq,
-              currentWriteSeq: authoritativeMirror?.writeSeq,
+              expectedMirrorGeneration: currentScreen.mirrorGeneration,
+              currentMirrorGeneration: currentCommittedFrame?.mirrorGeneration,
+              expectedWriteSeq: currentScreen.committedWriteSeq,
+              currentWriteSeq: currentCommittedFrame?.committedWriteSeq,
+              expectedCommittedFrameGeneration: currentScreen.committedFrameGeneration,
+              currentCommittedFrameGeneration: currentCommittedFrame?.committedFrameGeneration,
               expectedInputRevision: currentScreen.inputRevision,
               currentInputRevision: getTerminalInputRevision(tabId),
               inputReady: codexTuiReadyTabs.has(tabId),
               promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
               mirrorAvailable: !!authoritativeMirror,
+              mcpStartupBlockerCurrent: currentCommittedFrame?.authoritativeFrameCommitted === true
+                && currentCommittedMcp?.visible === true,
             });
           },
         });
@@ -27840,7 +28341,12 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
             handoff,
             'stop-not-confirmed',
           );
-          clearCodexMcpStartupWatchdog(tabId, 'stop-not-confirmed');
+          state.mcpStartupRestarting = false;
+          scheduleCodexMcpStartupProofRetry(
+            tabId,
+            state,
+            stopResult?.guardReason || stopResult?.error || 'stop-not-confirmed',
+          );
           return { stage: 'stop', stopResult };
         }
 
@@ -28046,6 +28552,7 @@ function maybeArmCodexMcpStartupWatchdog(tabId, inspected, clean, phase) {
       mcpStartupRestartExhausted: false,
       mcpStartupProofRetries: 0,
       mcpStartupProofExhausted: false,
+      mcpStartupRedrawGapLogged: false,
     };
     codexMcpStartupWatchdogs.set(tabId, state);
   }
@@ -28211,7 +28718,13 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
         'quiet-visible',
         { authoritativeCurrentFrame: true },
       );
-      reconcileCodexMcpStartupWatchdogFromCurrentScreen(tabId, visibleInspect, visibleText, 'quiet-visible');
+      reconcileCodexMcpStartupWatchdogFromCurrentScreen(
+        tabId,
+        visibleInspect,
+        visibleText,
+        'quiet-visible',
+        snapshot,
+      );
       if (!visibleInspect.ready) {
         const visibleBlockers = Array.isArray(visibleInspect.blockers) ? visibleInspect.blockers : [];
         if (visibleBlockers.length > 0) {
@@ -29078,6 +29591,7 @@ async function getCodexTuiReadyState(tabId) {
         currentScreen.inspected,
         currentScreen.currentFrameText || currentScreen.visibleText || '',
         'get-state-authoritative-current-frame',
+        currentScreen,
       );
       // Input readiness can be proven a frame before Codex paints its status
       // footer. Re-read the current verified composer frame on this explicit
@@ -29408,7 +29922,13 @@ async function pokeCodexStartupPromptFromVisibleBuffer(tabId, reason = 'external
     'startup-visible-' + reason,
     { authoritativeCurrentFrame: true },
   );
-  reconcileCodexMcpStartupWatchdogFromCurrentScreen(tabId, inspected, visibleText, 'startup-visible-' + reason);
+  reconcileCodexMcpStartupWatchdogFromCurrentScreen(
+    tabId,
+    inspected,
+    visibleText,
+    'startup-visible-' + reason,
+    snapshot,
+  );
   return {
     success: true,
     ready: inspected.ready,
@@ -29445,7 +29965,13 @@ async function probeCodexReadyFromVisibleBuffer(tabId, reason = 'visible-probe')
     'visible-probe-' + reason,
     { authoritativeCurrentFrame: true },
   );
-  reconcileCodexMcpStartupWatchdogFromCurrentScreen(tabId, inspected, visibleText, 'visible-probe-' + reason);
+  reconcileCodexMcpStartupWatchdogFromCurrentScreen(
+    tabId,
+    inspected,
+    visibleText,
+    'visible-probe-' + reason,
+    snapshot,
+  );
   if (!inspected.ready) {
     logCodexTuiReadyNotReady(tabId, inspected, '', visibleText, 'visible-probe-' + reason);
     maybeArmCodexMcpStartupWatchdog(tabId, inspected, visibleText, 'visible-probe-' + reason);
@@ -29481,7 +30007,13 @@ async function markCodexTuiReadyFromVisibleProbe(tabId, reason = 'visible-probe'
     'visible-probe-' + reason,
     { authoritativeCurrentFrame: true },
   );
-  reconcileCodexMcpStartupWatchdogFromCurrentScreen(tabId, inspected, visibleText, 'visible-mark-' + reason);
+  reconcileCodexMcpStartupWatchdogFromCurrentScreen(
+    tabId,
+    inspected,
+    visibleText,
+    'visible-mark-' + reason,
+    snapshot,
+  );
   if (!inspected.ready) return false;
   const expectedLaunchId = codexLastRunCommandPayload.get(tabId)?.launchId || null;
   return markCodexTuiReadyAfterVerifiedComposer(tabId, reason, { expectedLaunchId });
@@ -31639,6 +32171,10 @@ function codexNativeRewindHandoffJournalKey(tabId) {
   return CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX + String(tabId || '');
 }
 
+function codexNativeRewindCommitReceiptKey(tabId) {
+  return CODEX_NATIVE_REWIND_COMMIT_RECEIPT_KEY_PREFIX + String(tabId || '');
+}
+
 function readPendingCodexNativeRewindHandoff(tabId) {
   if (!tabId) return null;
   try {
@@ -31669,6 +32205,8 @@ function persistPendingCodexNativeRewindHandoff(tabId, {
   sourceBindingMode = 'confirmed-writer',
   sourceLifecycleGeneration = null,
   sourceRunSeq = null,
+  operationId = null,
+  requestId = null,
   actionGeneration,
   actionStartedAtMs,
   targetUuid = null,
@@ -31691,6 +32229,8 @@ function persistPendingCodexNativeRewindHandoff(tabId, {
     || !sourceSessionId
     || !expectedBindingSessionId
     || !actionGeneration
+    || !operationId
+    || !requestId
     || !path.isAbsolute(String(cwd || ''))
     || !Number.isFinite(Number(actionStartedAtMs))
     || typeof targetUuid !== 'string'
@@ -31706,6 +32246,9 @@ function persistPendingCodexNativeRewindHandoff(tabId, {
   const journal = {
     version: 2,
     projectId,
+    // This never changes when the tab is moved. `projectId` follows the tab so
+    // the SQLite writer CAS remains scoped to its current project.
+    originProjectId: projectId,
     tabId,
     cwd: path.resolve(cwd),
     sourceSessionId,
@@ -31713,6 +32256,8 @@ function persistPendingCodexNativeRewindHandoff(tabId, {
     sourceBindingMode,
     sourceLifecycleGeneration,
     sourceRunSeq: Number(sourceRunSeq),
+    operationId: String(operationId),
+    requestId: String(requestId),
     actionGeneration,
     actionStartedAtMs: Number(actionStartedAtMs),
     targetUuid: targetUuid.trim(),
@@ -31727,10 +32272,13 @@ function persistPendingCodexNativeRewindHandoff(tabId, {
     const confirmed = projectManager.db.getAppState(key);
     if (!confirmed
       || confirmed.actionGeneration !== actionGeneration
+      || confirmed.originProjectId !== projectId
       || confirmed.sourceSessionId !== sourceSessionId
       || confirmed.expectedBindingSessionId !== expectedBindingSessionId
       || confirmed.sourceLifecycleGeneration !== sourceLifecycleGeneration
-      || Number(confirmed.sourceRunSeq) !== Number(sourceRunSeq)) {
+      || Number(confirmed.sourceRunSeq) !== Number(sourceRunSeq)
+      || confirmed.operationId !== String(operationId)
+      || confirmed.requestId !== String(requestId)) {
       return { success: false, error: 'codex_handoff_journal_not_durable' };
     }
     return { success: true, journal, key };
@@ -31761,11 +32309,145 @@ function commitPendingCodexNativeRewindHandoff(tabId, {
   }
   return projectManager.db.commitPendingCodexWriterHandoff({
     journalKey: codexNativeRewindHandoffJournalKey(tabId),
+    receiptKey: codexNativeRewindCommitReceiptKey(tabId),
     projectId: journal.projectId,
     tabId,
     sourceSessionId,
     nextSessionId,
     actionGeneration,
+  });
+}
+
+function inspectCodexNativeRewindCommitReceipt(tabId, expectation = {}) {
+  const receiptKey = codexNativeRewindCommitReceiptKey(tabId);
+  const inspection = projectManager.db.inspectCodexNativeRewindCommitReceipt(receiptKey);
+  if (inspection?.status === 'absent') {
+    return { available: false, committed: false, error: 'codex_rewind_commit_receipt_missing' };
+  }
+  if (inspection?.status !== 'present') {
+    return {
+      available: true,
+      committed: false,
+      error: inspection?.error || 'codex_rewind_commit_receipt_invalid',
+    };
+  }
+  const terminalToken = terminals.get(tabId) || null;
+  const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  if (!expectation.terminalToken
+    || terminalToken !== expectation.terminalToken
+    || lifecycleGeneration !== expectation.sourceLifecycleGeneration
+    || !Number.isInteger(runSeq)
+    || runSeq <= 0
+    || runSeq !== Number(expectation.sourceRunSeq)) {
+    return {
+      available: true,
+      committed: false,
+      error: 'codex_rewind_commit_receipt_runtime_scope_changed',
+    };
+  }
+  const pendingJournal = readPendingCodexNativeRewindHandoff(tabId);
+  if (pendingJournal
+    && pendingJournal.invalid !== true
+    && pendingJournal.actionGeneration !== expectation.actionGeneration) {
+    return {
+      available: true,
+      committed: false,
+      error: 'codex_rewind_commit_receipt_superseded',
+    };
+  }
+  const projectId = resolveAuthoritativeTabProjectId(tabId);
+  if (!projectId) {
+    return {
+      available: true,
+      committed: false,
+      error: 'codex_rewind_commit_receipt_project_unresolved',
+    };
+  }
+  const verified = projectManager.db.verifyCodexNativeRewindCommitReceipt({
+    receiptKey,
+    projectId,
+    originProjectId: expectation.projectId,
+    tabId,
+    operationId: expectation.operationId,
+    requestId: expectation.requestId,
+    actionGeneration: expectation.actionGeneration,
+    sourceSessionId: expectation.sourceSessionId,
+    sourceLifecycleGeneration: expectation.sourceLifecycleGeneration,
+    sourceRunSeq: expectation.sourceRunSeq,
+    targetUuid: expectation.targetUuid,
+    targetSourceLine: expectation.targetSourceLine,
+    targetTextHash: expectation.targetTextHash,
+    rollbackTurns: expectation.rollbackTurns,
+  });
+  if (verified?.success !== true) {
+    return {
+      available: true,
+      committed: false,
+      error: verified?.error || 'codex_rewind_commit_receipt_unproven',
+      mismatch: verified?.mismatch || null,
+    };
+  }
+  const childSessionId = verified.childSessionId;
+  const knownSessionId = codexKnownSessions.get(tabId) || null;
+  const liveProof = getCodexWriterProofSnapshot(tabId);
+  const runtimeScope = classifyCodexRewindCommitReceiptRuntime({
+    receipt: verified.receipt,
+    expectedTerminalToken: expectation.terminalToken,
+    currentTerminalToken: terminalToken,
+    expectedLifecycleGeneration: expectation.sourceLifecycleGeneration,
+    currentLifecycleGeneration: lifecycleGeneration,
+    expectedRunSeq: expectation.sourceRunSeq,
+    currentRunSeq: runSeq,
+    pendingActionGeneration: pendingJournal?.invalid === true
+      ? '__invalid_pending_rewind_journal__'
+      : pendingJournal?.actionGeneration || null,
+    knownSessionId,
+    liveProof,
+  });
+  if (runtimeScope.accepted !== true) {
+    return {
+      available: true,
+      committed: false,
+      error: 'codex_rewind_' + (runtimeScope.reason || 'commit-receipt-runtime-unproven')
+        .replace(/-/g, '_'),
+    };
+  }
+  return {
+    available: true,
+    committed: true,
+    receiptId: verified.receipt.receiptId,
+    receiptPhase: verified.receipt.phase,
+    projectId: verified.receipt.projectId,
+    originProjectId: verified.receipt.originProjectId,
+    sourceSessionId: verified.receipt.sourceSessionId,
+    childSessionId,
+    actionGeneration: verified.receipt.actionGeneration,
+    verification: verified,
+  };
+}
+
+function finalizeCodexNativeRewindCommitReceipt(tabId, expectation, receiptProof) {
+  if (!receiptProof?.committed || !receiptProof.receiptId) {
+    return { success: false, error: 'codex_rewind_commit_receipt_not_proven' };
+  }
+  return projectManager.db.finalizeCodexNativeRewindCommitReceipt({
+    receiptKey: codexNativeRewindCommitReceiptKey(tabId),
+    projectId: receiptProof.projectId,
+    originProjectId: expectation.projectId,
+    tabId,
+    operationId: expectation.operationId,
+    requestId: expectation.requestId,
+    actionGeneration: expectation.actionGeneration,
+    sourceSessionId: expectation.sourceSessionId,
+    sourceLifecycleGeneration: expectation.sourceLifecycleGeneration,
+    sourceRunSeq: expectation.sourceRunSeq,
+    targetUuid: expectation.targetUuid,
+    targetSourceLine: expectation.targetSourceLine,
+    targetTextHash: expectation.targetTextHash,
+    rollbackTurns: expectation.rollbackTurns,
+    expectedChildSessionId: receiptProof.childSessionId,
+    receiptId: receiptProof.receiptId,
   });
 }
 
@@ -32340,6 +33022,7 @@ async function recoverPendingCodexNativeRewindHandoffs() {
     }
     const committed = projectManager.db.commitPendingCodexWriterHandoff({
       journalKey: key,
+      receiptKey: codexNativeRewindCommitReceiptKey(tabId),
       projectId: journal.projectId,
       tabId,
       sourceSessionId,
@@ -34613,6 +35296,8 @@ async function handleManualCodexRewindConfirmationEnter(tabId, term, data) {
 }
 
 function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.now(), {
+  operationId = null,
+  requestId = null,
   targetUuid = null,
   targetSourceLine = null,
   targetTextHash = null,
@@ -34646,6 +35331,8 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
     sourceBindingMode: observer.sourceBindingMode,
     sourceLifecycleGeneration: observer.sourceLifecycleGeneration,
     sourceRunSeq: observer.sourceRunSeq,
+    operationId: String(operationId || observer.launchId),
+    requestId: String(requestId || observer.launchId),
     actionGeneration: observer.launchId,
     actionStartedAtMs: boundaryAt,
     targetUuid,
@@ -40425,7 +41112,16 @@ function readClaudeSessionCwdFromFile(filePath) {
 }
 
 async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
-  const { tabId, command, sessionId, forkSessionId, prompt, cdTo } = payload;
+  const {
+    tabId,
+    command,
+    sessionId,
+    forkSessionId,
+    prompt,
+    cdTo,
+    targetCwd,
+    relocateWorkingDirectory,
+  } = payload;
   console.log('[Claude Runner] Command:', command, 'Tab:', tabId, 'Prompt:', prompt ? `${prompt.slice(0, 50)}...` : 'none');
 
   const term = terminals.get(tabId);
@@ -40652,6 +41348,27 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
       if (forkSessionId) {
         console.log('[Claude Runner] Forking session:', forkSessionId);
 
+        let requestedForkCwd = null;
+        if (relocateWorkingDirectory === true) {
+          requestedForkCwd = normalizeDirectoryTarget(targetCwd);
+          try {
+            if (!requestedForkCwd || !fs.statSync(requestedForkCwd).isDirectory()) {
+              throw new Error('target is not a directory');
+            }
+            requestedForkCwd = fs.realpathSync(requestedForkCwd);
+          } catch (error) {
+            launchResult = {
+              success: false,
+              accepted: false,
+              error: 'working_directory_unavailable',
+              detail: error?.message || String(error),
+              tabId,
+              command,
+            };
+            break;
+          }
+        }
+
         const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
         const forkProjectSlug = cwd.replace(/\//g, '-');
         const primaryDir = path.join(claudeProjectsDir, forkProjectSlug);
@@ -40686,7 +41403,8 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
         }
 
         if (sourcePath && sourceDir) {
-          const sessionCwd = readClaudeSessionCwdFromFile(sourcePath) || cwd;
+          const sourceSessionCwd = readClaudeSessionCwdFromFile(sourcePath) || cwd;
+          const sessionCwd = requestedForkCwd || sourceSessionCwd;
           const destProjectSlug = sessionCwd.replace(/\//g, '-');
           const destDir = path.join(claudeProjectsDir, destProjectSlug);
           const newSessionId = crypto.randomUUID();
@@ -40723,19 +41441,18 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           const entryUuids = await parseTimelineUuids(sourcePath);
           console.log('[Claude Runner] Timeline entries:', entryUuids.length);
 
-          let rewritten;
+          let written;
           try {
-            fs.copyFileSync(sourcePath, destPath);
-            const rawLines = fs.readFileSync(destPath, 'utf-8').split('\n');
-            rewritten = rawLines.map(line => {
-              if (!line.trim()) return line;
-              try {
-                const rec = JSON.parse(line);
-                if (rec.sessionId) rec.sessionId = newSessionId;
-                return JSON.stringify(rec);
-              } catch { return line; }
+            written = await writeClaudeForkJsonlExclusive({
+              sourcePath,
+              destPath,
+              newSessionId,
+              // A relocated fork is a new conversation rooted in the chosen
+              // folder. Keep its historical content, but make every record's
+              // project identity agree with the destination so later Resume
+              // cannot jump back to the old slug.
+              rewriteCwd: requestedForkCwd ? sessionCwd : null,
             });
-            fs.writeFileSync(destPath, rewritten.join('\n'));
             forkFilePrepared = true;
           } catch (forkPreparationError) {
             rollbackForkPreparation('fork-file-preparation-failed');
@@ -40745,6 +41462,9 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           console.log('[Claude Runner] From:', sourcePath);
           console.log('[Claude Runner] To:', destPath);
           console.log('[Claude Runner] Session cwd:', sessionCwd);
+          if (requestedForkCwd) {
+            console.log('[Claude Runner] Relocated fork cwd:', sourceSessionCwd, '->', sessionCwd);
+          }
 
           // Run claude --resume in CURRENT terminal (not new tab!)
           // This is for claude-f <uuid> - resuming external session.
@@ -40791,15 +41511,11 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           // Notes/markers are keyed on (entry_uuid, session_id); fork creates a new
           // session_id for the same UUIDs, so we explicitly rebind them.
           try {
-            const allUuids = [];
-            for (const line of rewritten) {
-              if (!line.trim()) continue;
-              try {
-                const r = JSON.parse(line);
-                if (r.uuid) allUuids.push(r.uuid);
-              } catch {}
-            }
-            const copied = projectManager.db.copyTimelineMetadataForFork(newSessionId, allUuids, tabId);
+            const copied = projectManager.db.copyTimelineMetadataForFork(
+              newSessionId,
+              written.retainedUuids,
+              tabId,
+            );
             if (copied.notes > 0 || copied.rewindMarkers > 0) {
               console.log('[Claude Runner] Copied timeline metadata: notes=' + copied.notes + ' rewindMarkers=' + copied.rewindMarkers);
             }
@@ -40823,7 +41539,16 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           event.sender.send('claude:session-detected', { tabId, sessionId: newSessionId });
           _notifyClaudeSession(tabId, newSessionId);
           console.log('[Claude Runner] Started claude --resume in current terminal');
-          launchResult = { success: true, accepted: true, tabId, command, sessionId: newSessionId };
+          launchResult = {
+            success: true,
+            accepted: true,
+            tabId,
+            command,
+            sessionId: newSessionId,
+            cwd: sessionCwd,
+            relocated: !!requestedForkCwd,
+            sourceCwd: sourceSessionCwd,
+          };
         } else {
           console.error('[Claude Runner] Source session not found in ANY project');
           console.error('[Claude Runner] Searched for:', forkSessionId);

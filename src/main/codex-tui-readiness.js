@@ -188,12 +188,41 @@ function decideCodexMcpStartupDeadline({
   }
   const blockers = Array.isArray(inspected.blockers) ? inspected.blockers : [];
   if (!mcpVisible && !blockers.includes('mcp-startup')) {
-    return { action: 'cancel', reason: 'mcp-startup-not-current' };
+    return blockers.length > 0
+      ? { action: 'cancel', reason: 'different-current-blocker' }
+      : { action: 'retry', reason: 'current-frame-transitional' };
   }
   if (!destructiveProofAvailable) {
     return { action: 'retry', reason: 'destructive-proof-unavailable' };
   }
   return { action: 'restart', reason: 'mcp-startup-current' };
+}
+
+function decideCodexMcpWatchdogReconcile({
+  inspected,
+  mcpVisible = false,
+  synchronizedOutputOpen = false,
+  authoritativeFrameCommitted = true,
+} = {}) {
+  if (!inspected) return { action: 'keep', reason: 'current-state-unavailable' };
+  if (synchronizedOutputOpen || !authoritativeFrameCommitted) {
+    return { action: 'keep', reason: 'current-frame-transitional' };
+  }
+  const blockers = Array.isArray(inspected.blockers) ? inspected.blockers : [];
+  if (mcpVisible || blockers.includes('mcp-startup')) {
+    return { action: 'keep', reason: 'mcp-startup-current' };
+  }
+  if (inspected.ready) {
+    return { action: 'clear', reason: 'current-composer-ready' };
+  }
+  if (blockers.length > 0) {
+    return { action: 'clear', reason: 'different-current-blocker' };
+  }
+  // Codex redraws the animated MCP row through synchronized-output frames.
+  // A headless snapshot can observe a short frame where that row is erased but
+  // the replacement glyphs have not landed yet. Absence in an otherwise
+  // unclassified frame is therefore not proof that the blocker ended.
+  return { action: 'keep', reason: 'current-frame-transitional' };
 }
 
 function isCodexMcpRestartSignalSafe({
@@ -207,13 +236,18 @@ function isCodexMcpRestartSignalSafe({
   currentRunSeq,
   expectedLaunchId,
   currentLaunchId,
+  expectedMirrorGeneration,
+  currentMirrorGeneration,
   expectedWriteSeq,
   currentWriteSeq,
+  expectedCommittedFrameGeneration,
+  currentCommittedFrameGeneration,
   expectedInputRevision,
   currentInputRevision,
   inputReady = false,
   promptOrTurnInFlight = false,
   mirrorAvailable = true,
+  mcpStartupBlockerCurrent = false,
 } = {}) {
   return !!expectedWatchdog
     && currentWatchdog === expectedWatchdog
@@ -225,11 +259,16 @@ function isCodexMcpRestartSignalSafe({
     && Number(currentRunSeq) === Number(expectedRunSeq)
     && !!expectedLaunchId
     && currentLaunchId === expectedLaunchId
+    && !!expectedMirrorGeneration
+    && currentMirrorGeneration === expectedMirrorGeneration
     && Number.isFinite(expectedWriteSeq)
-    && currentWriteSeq === expectedWriteSeq
+    && Number(currentWriteSeq) >= Number(expectedWriteSeq)
+    && Number.isInteger(Number(expectedCommittedFrameGeneration))
+    && Number(currentCommittedFrameGeneration) >= Number(expectedCommittedFrameGeneration)
     && Number.isFinite(expectedInputRevision)
     && currentInputRevision === expectedInputRevision
     && mirrorAvailable
+    && mcpStartupBlockerCurrent
     && !inputReady
     && !promptOrTurnInFlight;
 }
@@ -334,6 +373,7 @@ module.exports = {
   decideCodexMcpReplacementHandoff,
   decideCodexMcpStoppedGenerationSettlement,
   decideCodexMcpStartupDeadline,
+  decideCodexMcpWatchdogReconcile,
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,
   inspectCodexInputReadyTextCore,

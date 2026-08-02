@@ -61,16 +61,18 @@ bridge. Поэтому холодный/reloading renderer не оставляе
 
 Входящий run получает этот контекст не от generic `busy` по `tabId`, а вместе с exact post-Enter proof собственного prompt. Это закрывает порядок, где `UserPromptSubmit` уже создал новый ход, а Project API ещё не успел отметить transport acceptance. Совпадение provider/session обязательно; повтор одного proof идемпотентно дополняет отсутствующий контекст и никогда не заменяет уже доказанный соседним turn. У Codex audit и `task_started` допустимы в обоих порядках: ранний audit дожидается start-события, а ранний start прикрепляется к следующей exact `user_message` записи того же хода. Polling и угадывание по `tabId` не используются; неоднозначность остаётся root с diagnostic.
 
-У Codex один provider-turn может пройти через context compaction или внутренний
-`subagent_notification` без второго внешнего пользовательского сообщения.
-History и rollout могут показать эти события отдельными служебными строками,
-но `get_delegation_result` собирает все assistant-блоки исходного реального turn
-до следующего настоящего user message. Иначе длинный E2E-run возвращал только
-вводные комментарии до compact/уведомления, хотя финальный ответ уже был записан
-перед `task_complete`.
+У Codex один физический provider-turn может пройти через несколько compaction,
+внутренние `subagent_notification` и обычные пользовательские уточнения без нового
+`task_started`. Поэтому пользовательское сообщение само по себе не разрывает
+результат orchestration-run. Точный UUID/hash сначала доказывает исходный prompt,
+после чего сохранённые provider, session, process generation и `turnId` ограничивают
+одну физическую задачу: результат собирается от её `task_started` до
+`task_complete` либо `turn_aborted` с тем же `turnId`. Новый `task_started` —
+жёсткая граница; конфликт или несколько подходящих prompt остаются неподтверждёнными.
+Для старых run без точного `turnId` сохраняется прежний bounded UUID/hash fallback.
 
 Наличие хотя бы одного assistant-блока не является готовым результатом. Для
-Codex нужен `task_complete` того же turn, для Claude — конечный `stop_reason`;
+Codex нужен `task_complete` или `turn_aborted` того же точного provider-turn, для Claude — конечный `stop_reason`;
 до этого `/result` остаётся `ready:false`, run остаётся видимым как проверка
 результата и блокирует completion/install. Read-back сначала пинится к точному
 UUID target-prompt; текстовый hash используется только для legacy run без UUID,
@@ -87,7 +89,41 @@ UUID target-prompt; текстовый hash используется тольк�
 
 `/terminal/ai-prompt` с `submit=true` для Claude **и Codex** не пишет в PTY напрямую: main пересылает запрос в renderer scenario layer (`sendAgentPromptScenario`) — тот же путь, что History Enter / Project API / Inbox. Это даёт MCP-отправке готовность/queue/audit-проверки и статус-паритет: `submitted_unverified` возвращается как HTTP 202 (доставлено в TUI, durable-подтверждение ещё не пришло), а не теряется. Прямой `safePasteAndSubmit` остался только для paste-без-submit (`submit=false`) и Gemini, у которого нет scenario runtime. Следствие: если renderer недоступен (окно перезагружается), Claude/Codex submit вернёт ошибку bridge, а не молча вставит байты в PTY.
 
-Два fail-closed edge этого маршрута. (1) Bridge-timeout (60с) ≠ ошибка доставки: renderer-сценарий может законно жить дольше (launch-if-needed + readiness + paste) и всё ещё доставить prompt — ответ в этом случае HTTP 202 `delivery_unknown` с предупреждением не повторять тот же prompt вслепую; повтор в живую AI-сессию хуже неизвестного статуса (тот же принцип, что completion prompt после rebuild выше). (2) Если renderer ещё не гидрировал workspace store (запрос сразу после старта приложения), сценарий не сваливается в Claude SDK fallback — для MCP-источников это была бы отправка НЕ тем агентом в Codex-вкладку; возвращается явная ошибка «tab not resolved yet, retry after load».
+**Одна квитанция для Project API, Inbox, Terminal MCP и orchestration.**
+Если нижний слой вернул `submitted:false`, Enter не пересечён: HTTP 409 разрешает
+осмысленный retry. Если `submitted:true`, но exact JSONL/rollout audit ещё не
+пришёл, ответ — HTTP 202 `audit-pending` с исходным `handoffId`; Terminal MCP
+объясняет, что повторять prompt нельзя. Только exact audit того же handoff даёт
+HTTP 200 `sent`. Target-run и completion notification сохраняют этот handoff до
+поздней сверки; транспортный callback не может откатить уже найденный exact
+proof, а Retry в `audit-pending` не выполняет второй physical send. Inbox
+привязывает поздний audit ещё и к provider/session/prompt hash, поэтому
+одинаковый текст соседней операции не является подтверждением.
+
+Если renderer получил сценарий, но его ответ не вернулся, это отдельное HTTP
+202 `delivery-unknown`: Enter мог как пересечься, так и не пересечься. Сервер
+сохраняет handoff для позднего exact audit, не делает автоматический replay и не
+выдаёт неизвестный исход ни за `submitted:false`, ни за `sent`. Это состояние
+одинаково проходит через прямую отправку, Inbox, target-run и completion.
+
+Критическая wiring-граница этого контракта находится до HTTP-классификации.
+Общий Claude runtime обязан передать требование дождаться `UserPromptSubmit`
+через `terminal:paste` до физического владельца Enter; иначе успешная запись
+байта выглядит как точный `200`, хотя audit ещё только поставлен в очередь.
+Codex History может смягчить post-Enter timeout для локального интерфейса, но
+обязан сохранить `audit-pending` в результате: `success:true` без этой пометки
+так же ошибочно превращается во внешний `200`. Серверный тест, который
+подменяет renderer готовым receipt, не доказывает эти два живых caller-path.
+
+Per-send Think является таким же writer-ом поля ввода, как prompt. Открытие и
+закрытие picker происходит внутри общей PTY-очереди, меняет identity ввода и
+считает переход завершённым только после полного синхронизированного кадра.
+Поэтому proof, снятый до picker, не может разрешить последующую отправку, а
+таймер или часть перерисовки не считаются успехом.
+
+Portable image marker является намерением вложить файл только когда внутри указан абсолютный filesystem path. Относительный путь или prose-пример проходит в prompt дословно, не занимает image-slot и не запускает staging; документация с буквальным `[imagePath: example only]` не должна приводить к `codex_image_path_unavailable`. Доступный абсолютный путь сохраняет обычный attachment-flow. Если абсолютный файл исчез между подготовкой и отправкой, это не отменяет весь prompt: marker становится позиционным `imageError`, а окружающий текст и остальные вложения отправляются. В UI известная недоступность показывается постоянным предупреждением до Send; после явного Send повторный отказ всего сообщения уже не является допустимым способом сообщить о ней. Direct plan и preflight replacement обязаны проверять одну и ту же границу абсолютности.
+
+Два fail-closed edge этого маршрута. (1) Bridge-timeout (60с) ≠ ошибка доставки: renderer-сценарий может законно жить дольше (launch-if-needed + readiness + paste) и всё ещё доставить prompt — ответ в этом случае HTTP 202 `delivery-unknown` с предупреждением не повторять тот же prompt вслепую; повтор в живую AI-сессию хуже неизвестного статуса (тот же принцип, что completion prompt после rebuild выше). (2) Если renderer ещё не гидрировал workspace store (запрос сразу после старта приложения), сценарий не сваливается в Claude SDK fallback — для MCP-источников это была бы отправка НЕ тем агентом в Codex-вкладку; возвращается явная ошибка «tab not resolved yet, retry after load».
 
 `build_install_noted_terminal` — исключение из обычных terminal-actions: это fire-and-forget
 handoff в Voice Record, а не команда в текущей PTY. Использовать его, когда агент внутри

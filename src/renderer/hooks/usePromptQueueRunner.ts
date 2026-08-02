@@ -144,6 +144,7 @@ function sendQueueCommand(
     handoffId: string;
     presentationSnapshot: {
       historySessionId: string | null;
+      imagePaths?: NonNullable<QueuedPrompt['imagePaths']>;
       promptChips: Array<{
         id?: string;
         kind: 'prompt';
@@ -663,6 +664,11 @@ function beginValidatedQueueSend(
       clearDeferredOwnerAttempt(ownerTabId, attempt, 'validation-became-stale');
       return;
     }
+    if (validation.degraded) {
+      console.warn('[PromptQueueRunner] ' + label + ' attachment unavailable but transferable owner='
+        + ownerTabId.slice(-8) + ' item=' + head.id.slice(-8)
+        + ' action=replace-with-imageError');
+    }
     const latestQueue = usePromptQueueStore.getState().getQueue(ownerTabId);
     const latestHead = getContinuationPrompt(latestQueue, kind);
     if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) {
@@ -716,6 +722,7 @@ function beginValidatedQueueSend(
       sessionIdHint,
       text: presentationText,
       promptChips,
+      imagePaths: validation.item.imagePaths || [],
       submittedAt: Date.now(),
       source: kind === 'loop' ? 'prompt-loop' : 'prompt-queue',
       statusAtSend: 'active',
@@ -726,6 +733,7 @@ function beginValidatedQueueSend(
       presentationSnapshot: {
         historySessionId: sessionIdHint,
         promptChips,
+        imagePaths: validation.item.imagePaths || [],
         ...(kind === 'loop'
           ? { semanticTags: [{ kind: 'prompt-origin' as const, source: 'loop' as const }] }
           : {}),

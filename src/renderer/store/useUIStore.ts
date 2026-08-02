@@ -1,4 +1,18 @@
 import { create } from 'zustand';
+import {
+  forgetScrollTop,
+  getRememberedScrollTop,
+  readScrollMemory,
+  rememberScrollTop,
+} from '../utils/filePreviewScrollMemory.mjs';
+import {
+  readComposerViewMemory,
+  rememberComposerView,
+} from '../utils/composerViewState.mjs';
+import {
+  buildComposerDraftMemory,
+  splitComposerDraftMemory,
+} from '../utils/composerDraftPersistence.mjs';
 import type { GeminiModelId } from '../constants/geminiModels';
 import { isGeminiModelId } from '../constants/geminiModels';
 
@@ -24,6 +38,9 @@ interface FilePreview {
   source?: 'sidebar' | 'terminal-link' | 'tab';
   sourceTabId?: string;
 }
+
+/** Reading position per absolute file path. See utils/filePreviewScrollMemory. */
+type FilePreviewScrollMemory = Record<string, { top: number; at: number }>;
 
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
@@ -101,6 +118,13 @@ export interface HistoryPromptDraftWriteOptions {
   preserveImages?: boolean;
   chips?: HistoryPromptDraftChip[] | null;
   preserveChips?: boolean;
+}
+
+export interface HistoryComposerViewState {
+  selectionStart: number;
+  selectionEnd: number;
+  scrollTop: number;
+  updatedAt: number;
 }
 
 export interface HistoryComposerAvailability {
@@ -529,6 +553,14 @@ interface UIStore {
 
   closeFilePreview: () => void;
 
+  filePreviewScroll: FilePreviewScrollMemory;
+
+  getFilePreviewScrollTop: (path: string) => number;
+
+  setFilePreviewScrollTop: (path: string, scrollTop: number) => void;
+
+  clearFilePreviewScrollTop: (path: string) => void;
+
 
 
   // Toast Notifications
@@ -563,6 +595,8 @@ interface UIStore {
   historyPromptDrafts: Record<string, string>;
   historyPromptDraftImages: Record<string, HistoryPromptDraftImageRef[]>;
   historyPromptDraftChips: Record<string, HistoryPromptDraftChip[]>;
+  historyPromptDraftUpdatedAt: Record<string, number>;
+  historyComposerViewByTab: Record<string, HistoryComposerViewState>;
   historyComposerAvailability: Record<string, HistoryComposerAvailability>;
   historyRewindPreviews: Record<string, HistoryRewindPreview>;
   promptQueueInputSurfaceTabs: Record<string, PromptQueueInputSurface>;
@@ -576,6 +610,12 @@ interface UIStore {
   addHistoryPromptDraftChip: (tabId: string, chip: HistoryPromptDraftChip) => void;
   removeHistoryPromptDraftChip: (tabId: string, chipId: string) => void;
   appendHistoryPromptDraft: (tabId: string, text: string) => void;
+  flushHistoryComposerDrafts: () => void;
+  setHistoryComposerView: (
+    tabId: string,
+    patch: Partial<Pick<HistoryComposerViewState, 'selectionStart' | 'selectionEnd' | 'scrollTop'>>,
+  ) => void;
+  flushHistoryComposerView: () => void;
   setHistoryComposerAvailability: (
     tabId: string,
     availability: HistoryComposerAvailability | null,
@@ -1048,6 +1088,20 @@ const loadFilePreviewFontSize = (): number => {
     if (v) return Math.max(10, Math.min(24, Number(v) || 13));
   } catch {}
   return 13;
+};
+
+const FILE_PREVIEW_SCROLL_KEY = 'noted-terminal-file-preview-scroll';
+
+const loadFilePreviewScrollMemory = (): FilePreviewScrollMemory => {
+  try {
+    const raw = localStorage.getItem(FILE_PREVIEW_SCROLL_KEY);
+    if (raw) return readScrollMemory(JSON.parse(raw));
+  } catch {}
+  return {};
+};
+
+const saveFilePreviewScrollMemory = (memory: FilePreviewScrollMemory) => {
+  try { localStorage.setItem(FILE_PREVIEW_SCROLL_KEY, JSON.stringify(memory)); } catch {}
 };
 
 const loadPromptPickerFontSize = (): number => {
@@ -2073,6 +2127,16 @@ const saveApiSettings = (settings: ApiSettings) => {
 
 const initialApiSettings = loadApiSettings();
 
+const HISTORY_COMPOSER_DRAFTS_STORAGE_KEY = 'noted-terminal-history-composer-drafts';
+const initialHistoryComposerDraftState = (() => {
+  try {
+    const raw = localStorage.getItem(HISTORY_COMPOSER_DRAFTS_STORAGE_KEY);
+    return splitComposerDraftMemory(raw ? JSON.parse(raw) : {});
+  } catch {
+    return splitComposerDraftMemory({});
+  }
+})();
+
 export const useUIStore = create<UIStore>((set, get) => ({
   // Font Settings
   terminalFontSize: initialFontSettings.terminalFontSize,
@@ -2520,6 +2584,27 @@ export const useUIStore = create<UIStore>((set, get) => ({
   openFilePreview: (preview) => set({ filePreview: preview }),
   closeFilePreview: () => set({ filePreview: null }),
 
+  // Reading position per file. Deliberately keyed by path rather than by tab:
+  // the sidebar opens previews without a tab at all, and the user expects the
+  // same file to resume where they left it regardless of how it was opened.
+  filePreviewScroll: loadFilePreviewScrollMemory(),
+  getFilePreviewScrollTop: (path) => getRememberedScrollTop(get().filePreviewScroll, path),
+  setFilePreviewScrollTop: (path, scrollTop) => {
+    const current = get().filePreviewScroll;
+    const next = rememberScrollTop(current, path, scrollTop, Date.now());
+    // Identity means nothing changed — skip the write and the re-render.
+    if (next === current) return;
+    saveFilePreviewScrollMemory(next);
+    set({ filePreviewScroll: next });
+  },
+  clearFilePreviewScrollTop: (path) => {
+    const current = get().filePreviewScroll;
+    const next = forgetScrollTop(current, path);
+    if (next === current) return;
+    saveFilePreviewScrollMemory(next);
+    set({ filePreviewScroll: next });
+  },
+
   // Toast Notifications
   toasts: [],
   showToast: (message, type = 'success', duration = 2500, persistent = false, copyText, actionLabel, onAction, tabId, actionIcon, details) => {
@@ -2570,9 +2655,16 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyScrollToUuid: null,
   historyVisibleUuids: {},
   historyScrollPositions: {},
-  historyPromptDrafts: {},
-  historyPromptDraftImages: {},
-  historyPromptDraftChips: {},
+  historyPromptDrafts: initialHistoryComposerDraftState.drafts,
+  historyPromptDraftImages: initialHistoryComposerDraftState.images,
+  historyPromptDraftChips: initialHistoryComposerDraftState.chips,
+  historyPromptDraftUpdatedAt: initialHistoryComposerDraftState.updatedAtByTab,
+  historyComposerViewByTab: (() => {
+    try {
+      const raw = localStorage.getItem('noted-terminal-history-composer-view');
+      return raw ? readComposerViewMemory(JSON.parse(raw)) : {};
+    } catch { return {}; }
+  })(),
   historyComposerAvailability: {},
   historyRewindPreviews: {},
   promptQueueInputSurfaceTabs: {},
@@ -2631,6 +2723,15 @@ export const useUIStore = create<UIStore>((set, get) => ({
       patch.historyPromptDraftChips = nextChips;
     }
 
+    const nextImages = patch.historyPromptDraftImages || state.historyPromptDraftImages;
+    const nextChips = patch.historyPromptDraftChips || state.historyPromptDraftChips;
+    const nextUpdatedAt = { ...state.historyPromptDraftUpdatedAt };
+    if (draft || (nextImages[tabId]?.length || 0) > 0 || (nextChips[tabId]?.length || 0) > 0) {
+      nextUpdatedAt[tabId] = Date.now();
+    } else {
+      delete nextUpdatedAt[tabId];
+    }
+    patch.historyPromptDraftUpdatedAt = nextUpdatedAt;
     return patch;
   }),
   setHistoryPromptDraftChips: (tabId, chips) => set(state => {
@@ -2638,7 +2739,15 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const normalized = normalizeComposerChips(chips) as HistoryPromptDraftChip[];
     if (normalized.length > 0) next[tabId] = normalized;
     else delete next[tabId];
-    return { historyPromptDraftChips: next };
+    const nextUpdatedAt = { ...state.historyPromptDraftUpdatedAt };
+    if (normalized.length > 0
+        || !!state.historyPromptDrafts[tabId]
+        || (state.historyPromptDraftImages[tabId]?.length || 0) > 0) {
+      nextUpdatedAt[tabId] = Date.now();
+    } else {
+      delete nextUpdatedAt[tabId];
+    }
+    return { historyPromptDraftChips: next, historyPromptDraftUpdatedAt: nextUpdatedAt };
   }),
   addHistoryPromptDraftChip: (tabId, chip) => set(state => {
     const next = { ...state.historyPromptDraftChips };
@@ -2646,7 +2755,13 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const normalized = upsertComposerChip(current, chip) as HistoryPromptDraftChip[];
     if (normalized.length > 0) next[tabId] = normalized;
     else delete next[tabId];
-    return { historyPromptDraftChips: next };
+    return {
+      historyPromptDraftChips: next,
+      historyPromptDraftUpdatedAt: {
+        ...state.historyPromptDraftUpdatedAt,
+        [tabId]: Date.now(),
+      },
+    };
   }),
   removeHistoryPromptDraftChip: (tabId, chipId) => set(state => {
     const next = { ...state.historyPromptDraftChips };
@@ -2656,7 +2771,15 @@ export const useUIStore = create<UIStore>((set, get) => ({
     ) as HistoryPromptDraftChip[];
     if (normalized.length > 0) next[tabId] = normalized;
     else delete next[tabId];
-    return { historyPromptDraftChips: next };
+    const nextUpdatedAt = { ...state.historyPromptDraftUpdatedAt };
+    if (normalized.length > 0
+        || !!state.historyPromptDrafts[tabId]
+        || (state.historyPromptDraftImages[tabId]?.length || 0) > 0) {
+      nextUpdatedAt[tabId] = Date.now();
+    } else {
+      delete nextUpdatedAt[tabId];
+    }
+    return { historyPromptDraftChips: next, historyPromptDraftUpdatedAt: nextUpdatedAt };
   }),
   appendHistoryPromptDraft: (tabId, text) => set(state => {
     const addition = String(text || '');
@@ -2674,8 +2797,40 @@ export const useUIStore = create<UIStore>((set, get) => ({
         ...state.historyPromptDrafts,
         [tabId]: current + separator + addition,
       },
+      historyPromptDraftUpdatedAt: {
+        ...state.historyPromptDraftUpdatedAt,
+        [tabId]: Date.now(),
+      },
     };
   }),
+  flushHistoryComposerDrafts: () => {
+    const state = get();
+    const memory = buildComposerDraftMemory({
+      drafts: state.historyPromptDrafts,
+      images: state.historyPromptDraftImages,
+      chips: state.historyPromptDraftChips,
+      updatedAtByTab: state.historyPromptDraftUpdatedAt,
+    });
+    try {
+      // persistedStorage mirrors every noted-terminal-* key to SQLite
+      // synchronously, so a clean window close cannot outrun this write.
+      localStorage.setItem(HISTORY_COMPOSER_DRAFTS_STORAGE_KEY, JSON.stringify(memory));
+    } catch (cause) {
+      console.warn('[HistoryComposerPersistence] save failed:', cause);
+    }
+  },
+  setHistoryComposerView: (tabId, patch) => set(state => {
+    const next = rememberComposerView(state.historyComposerViewByTab, tabId, patch);
+    return next === state.historyComposerViewByTab ? {} : { historyComposerViewByTab: next };
+  }),
+  flushHistoryComposerView: () => {
+    try {
+      localStorage.setItem(
+        'noted-terminal-history-composer-view',
+        JSON.stringify(get().historyComposerViewByTab),
+      );
+    } catch {}
+  },
   setHistoryComposerAvailability: (tabId, availability, ownerId) => set(state => {
     const current = state.historyComposerAvailability[tabId];
     if (!availability) {

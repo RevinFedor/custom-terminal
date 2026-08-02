@@ -27,6 +27,7 @@ const {
   isCommittedCodexNativeRewindReplay,
   classifyCodexWriterHandoffObserverAdoption,
   resolveCodexRewindCompletionProof,
+  classifyCodexRewindCommitReceiptRuntime,
   shouldCloseCodexRewindProtocolUi,
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
@@ -1413,6 +1414,67 @@ test('Rewind completion accepts either stable source or the exact child commit t
     proofMode: 'unresolved',
     error: 'codex_rewind_stable_source_proof_invalid',
   }, 'missing journal without an exact child proof remains a hard failure');
+});
+
+test('a durable Rewind receipt survives transient handoff cleanup but not a foreign runtime scope', () => {
+  const terminalToken = {};
+  const receipt = {
+    receiptId: 'receipt-a-b',
+    sourceSessionId: 'source-a',
+    childSessionId: 'child-b',
+    actionGeneration: 'rewind-a-b',
+  };
+  const base = {
+    receipt,
+    expectedTerminalToken: terminalToken,
+    currentTerminalToken: terminalToken,
+    expectedLifecycleGeneration: 'pty-generation:41',
+    currentLifecycleGeneration: 'pty-generation:41',
+    expectedRunSeq: 41,
+    currentRunSeq: 41,
+    pendingActionGeneration: null,
+    knownSessionId: 'child-b',
+    liveProof: null,
+  };
+  assert.deepEqual(classifyCodexRewindCommitReceiptRuntime(base), {
+    accepted: true,
+    reason: 'exact-committed-rewind-child',
+    sourceSessionId: 'source-a',
+    childSessionId: 'child-b',
+    actionGeneration: 'rewind-a-b',
+    receiptId: 'receipt-a-b',
+  }, 'no watcher or discovery intent is needed after the exact commit');
+  assert.equal(classifyCodexRewindCommitReceiptRuntime({
+    ...base,
+    currentTerminalToken: {},
+  }).accepted, false);
+  assert.equal(classifyCodexRewindCommitReceiptRuntime({
+    ...base,
+    currentLifecycleGeneration: 'pty-generation:42',
+  }).accepted, false);
+  assert.equal(classifyCodexRewindCommitReceiptRuntime({
+    ...base,
+    currentRunSeq: 42,
+  }).accepted, false);
+  assert.equal(classifyCodexRewindCommitReceiptRuntime({
+    ...base,
+    pendingActionGeneration: 'rewind-b-c',
+  }).reason, 'commit-receipt-superseded');
+  assert.equal(classifyCodexRewindCommitReceiptRuntime({
+    ...base,
+    knownSessionId: 'foreign-child',
+  }).reason, 'commit-receipt-known-writer-changed');
+  assert.equal(classifyCodexRewindCommitReceiptRuntime({
+    ...base,
+    liveProof: {
+      valid: true,
+      sessionId: 'foreign-child',
+      sourceSessionId: 'source-a',
+      actionGeneration: 'rewind-a-b',
+      terminalToken,
+      runSeq: 41,
+    },
+  }).reason, 'commit-receipt-live-writer-changed');
 });
 
 test('writer observation becomes stale before it may invalidate a newer proof', () => {

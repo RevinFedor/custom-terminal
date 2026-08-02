@@ -300,7 +300,14 @@ export default function FloatingTerminalFrame({
         data-floating-terminal
         data-floating-terminal-open={isPresented ? '1' : '0'}
         data-floating-terminal-selected={terminalSelected ? '1' : '0'}
-        onPointerDownCapture={() => {
+        onPointerDownCapture={(event) => {
+          // PromptQueueOverlay is rendered through a portal but remains a
+          // React child of this frame. React therefore bubbles its pointer
+          // events through this handler even though the button is not inside
+          // the terminal DOM. Only a physical hit inside the frame proves the
+          // user selected the terminal input surface.
+          const target = event.target;
+          if (!(target instanceof Node) || !frameRef.current?.contains(target)) return;
           if (floating && open && tabId) setPromptQueueInputSurface(tabId, 'terminal');
         }}
         style={{

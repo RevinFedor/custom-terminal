@@ -47,6 +47,8 @@ interface AIComposerSurfaceProps {
   externalExpandableChips?: AIComposerSurfaceChip[];
   expandedChipId?: string | null;
   onExpandedChipChange?: (chipId: string | null) => void;
+  /** Persistent authoring notice rendered directly above the input. */
+  notice?: React.ReactNode;
   input: React.ReactNode;
   actions?: React.ReactNode;
   footer?: React.ReactNode;
@@ -124,6 +126,7 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
   externalExpandableChips = [],
   expandedChipId = null,
   onExpandedChipChange,
+  notice,
   input,
   actions,
   footer,
@@ -363,6 +366,7 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
       style={secondaryStyle}
       data-ai-composer-surface
       topBar={topLine}
+      chips={notice}
       overlay={(
         <>
           {overlay}

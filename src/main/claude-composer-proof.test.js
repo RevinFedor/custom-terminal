@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   parseClaudeComposerCurrentFrame,
+  reserveClaudeExactEmptyEvidence,
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 } = require('./claude-composer-proof');
@@ -186,6 +187,57 @@ test('renderer or unresolved proof never authorizes a background paste', () => {
     ...base,
     proof: emptyWriteProof({ proofOutcome: 'unknown', hasDraft: null }),
   }).valid, false);
+});
+
+test('exact empty capture can cross only the revision reserved by the same paste', () => {
+  const evidence = {
+    success: true,
+    text: '',
+    images: 0,
+    proofOutcome: 'absent',
+    terminalIdentityStable: true,
+    editorReturnReady: true,
+    inputRevision: 7,
+    terminalRunSeq: 3,
+    terminalLifecycleGeneration: 'pty-a:3',
+    mirrorGeneration: 'mirror-a',
+  };
+  const reserved = reserveClaudeExactEmptyEvidence({
+    evidence,
+    currentInputRevision: 7,
+    reservedInputRevision: 8,
+    currentRunSeq: 3,
+    currentLifecycleGeneration: 'pty-a:3',
+    currentMirrorGeneration: 'mirror-a',
+  });
+  assert.equal(reserved.inputRevision, 8);
+  assert.equal(evidence.inputRevision, 7, 'the caller-owned capture stays immutable');
+
+  for (const stale of [
+    { currentInputRevision: 8, reservedInputRevision: 9 },
+    { currentRunSeq: 4 },
+    { currentLifecycleGeneration: 'pty-a:4' },
+    { currentMirrorGeneration: 'mirror-b' },
+    { reservedInputRevision: 9 },
+  ]) {
+    assert.equal(reserveClaudeExactEmptyEvidence({
+      evidence,
+      currentInputRevision: 7,
+      reservedInputRevision: 8,
+      currentRunSeq: 3,
+      currentLifecycleGeneration: 'pty-a:3',
+      currentMirrorGeneration: 'mirror-a',
+      ...stale,
+    }), null);
+  }
+  assert.equal(reserveClaudeExactEmptyEvidence({
+    evidence: { ...evidence, text: 'real draft', proofOutcome: 'found' },
+    currentInputRevision: 7,
+    reservedInputRevision: 8,
+    currentRunSeq: 3,
+    currentLifecycleGeneration: 'pty-a:3',
+    currentMirrorGeneration: 'mirror-a',
+  }), null);
 });
 
 test('submit generation may advance mirror bytes but not input or process identity', () => {

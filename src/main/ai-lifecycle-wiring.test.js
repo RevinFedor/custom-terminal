@@ -44,7 +44,32 @@ test('Codex MCP recovery keeps Stop and replacement in one lifecycle transaction
   assert.match(recovery, /runKeyedExclusive\(aiLifecycleActionInflight, tabId/);
   assert.match(recovery, /stopAiProcessInTab\(tabId/);
   assert.match(recovery, /retainStoppingState: true/);
+  assert.match(recovery, /handoff\.stopAbsenceProven = true/);
   assert.match(recovery, /runCodexCommandWithinLifecycle/);
+  assert.match(recovery, /launchId: undefined/);
   assert.doesNotMatch(recovery, /stopAiProcessInTabSerialized/);
   assert.doesNotMatch(recovery, /runCodexCommandFromPayload\(sender/);
+
+  const launchBoundary = main.slice(
+    main.indexOf('const boundary = await withPtyWriteLock(term'),
+    main.indexOf("rollbackLaunchSetup('shell-launch-boundary-rejected'"),
+  );
+  assert.match(launchBoundary, /validateClaimedCodexMcpStartupReplacementHandoff/);
+  assert.match(
+    launchBoundary,
+    /releaseCodexMcpStartupReplacementHandoff\([\s\S]*?writeAgentLaunchCommandToIdleShell/,
+  );
+  assert.doesNotMatch(
+    launchBoundary.slice(
+      launchBoundary.indexOf('releaseCodexMcpStartupReplacementHandoff'),
+      launchBoundary.indexOf('writeAgentLaunchCommandToIdleShell'),
+    ),
+    /await\s/,
+  );
+  assert.match(recovery, /getHeadlessVisibleBufferSnapshot\([\s\S]*?mcp-watchdog-pre-signal-current-frame/);
+  assert.match(recovery, /expectedCommittedFrameGeneration: currentScreen\.committedFrameGeneration/);
+  assert.match(recovery, /currentCommittedFrameGeneration: currentCommittedFrame\?\.committedFrameGeneration/);
+  assert.match(main, /destructiveProofAvailable:[\s\S]*?authoritativeFrameCommitted === true[\s\S]*?committedFrameGeneration/);
+  assert.match(main, /onFlushed:[\s\S]*?commitHeadlessVisibleBufferSnapshot/);
+  assert.match(main, /synchronizedOutputOpen === true[\s\S]*?lastCommittedVisibleSnapshot[\s\S]*?committedFrameReplay: true/);
 });

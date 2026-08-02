@@ -21,9 +21,21 @@
 //
 // Backend: provider usage limits plus one shared activity summary.
 
-import { useEffect, useLayoutEffect, useRef, useState, useCallback, useId } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, useId, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { RefreshCw, ChevronRight } from 'lucide-react';
+import {
+  RefreshCw,
+  ChevronRight,
+  Plus,
+  LogIn,
+  LogOut,
+  X,
+  Copy,
+  Check,
+  ExternalLink,
+  Loader2,
+  Trash2,
+} from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import {
   buildCodexAdditionalLimitRows,
@@ -32,7 +44,7 @@ import {
 } from '../../utils/codexUsagePresentation.mjs';
 import { ClaudeSparkle } from './CopySessionButton';
 
-const { ipcRenderer } = (window as any).require('electron');
+const { ipcRenderer, shell, clipboard } = (window as any).require('electron');
 
 interface UsageBucket {
   utilization?: number | null;
@@ -189,13 +201,35 @@ interface CodexUsageAccount {
   warning?: string | null;
   lastAttemptAt?: number | null;
   reset_credits?: CodexResetCredits | null;
+  profileId?: string | null;
+  connected?: boolean;
+  authStatus?: string | null;
+  isDefaultProfile?: boolean;
   usage: CodexUsageData;
+}
+interface CodexAccountProfile {
+  profileId: string;
+  label: string;
+  accountHint?: string | null;
+  accountKey?: string | null;
+  planType?: string | null;
+  status: 'connected' | 'signed_out' | 'signing_in' | 'error';
+  isDefault: boolean;
+  canRemove: boolean;
+  lastError?: string | null;
+  lastCheckedAt?: number | null;
+  login?: {
+    verificationUrl: string;
+    userCode: string;
+    expiresAt: number;
+  } | null;
 }
 interface CodexUsageResponse {
   success?: boolean;
   error?: string;
   data?: CodexUsageData | null;
   accounts?: CodexUsageAccount[];
+  profiles?: CodexAccountProfile[];
   selectedAccountKey?: string | null;
   currentAccountKey?: string | null;
   source?: string | null;
@@ -287,6 +321,26 @@ function invokeCodexUsage(payload: Record<string, unknown>): Promise<CodexUsageR
   );
 }
 
+interface CodexProfileActionResponse {
+  success?: boolean;
+  error?: string;
+  profiles?: CodexAccountProfile[];
+  profile?: CodexAccountProfile;
+  login?: CodexAccountProfile['login'];
+}
+
+function invokeCodexProfileAction(
+  channel: string,
+  payload: Record<string, unknown> = {}
+): Promise<CodexProfileActionResponse> {
+  return invokeIpcWithDeadline<CodexProfileActionResponse>(
+    channel,
+    payload,
+    'Codex account action timed out',
+    15_000
+  );
+}
+
 function invokeClaudeUsage(payload: Record<string, unknown>): Promise<ClaudeUsageIpcResponse> {
   return invokeIpcWithDeadline<ClaudeUsageIpcResponse>(
     'claude-usage:get',
@@ -298,6 +352,7 @@ function invokeClaudeUsage(payload: Record<string, unknown>): Promise<ClaudeUsag
 
 function codexUsageSourceLabel(source: string | null | undefined): string {
   if (source === 'openai-usage-api') return 'OpenAI';
+  if (source === 'codex-app-server') return 'Codex';
   if (source === 'active-session-rollout') return 'Codex session';
   if (source === 'codex-log' || source === 'account-log') return 'Local Codex cache';
   if (source === 'latest-rollout-unverified') return 'Unverified local cache';
@@ -390,6 +445,7 @@ interface UsageAccountOption {
   title: string;
   selected: boolean;
   current: boolean;
+  connected?: boolean;
   onSelect: () => void;
 }
 
@@ -464,10 +520,12 @@ function UsagePopoverTopRow({
   provider,
   onProviderChange,
   accounts,
+  trailingAction,
 }: {
   provider: UsageProvider;
   onProviderChange: (provider: UsageProvider) => void;
   accounts: UsageAccountOption[];
+  trailingAction?: ReactNode;
 }) {
   const visibleAccountRef = useRef<HTMLButtonElement | null>(null);
   const visibleAccountKey = accounts.find((account) => account.selected)?.key
@@ -494,73 +552,82 @@ function UsagePopoverTopRow({
       <UsageProviderToggle provider={provider} onChange={onProviderChange} />
       <div style={{
         minWidth: 0,
+        flex: 1,
         display: 'flex',
+        alignItems: 'center',
         justifyContent: 'flex-start',
-        overflowX: 'auto',
+        gap: 6,
       }}>
-        {accounts.length > 0 && (
-          <div style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 2,
-            padding: 2,
-            background: 'rgba(255,255,255,0.05)',
-            border: '1px solid rgba(255,255,255,0.08)',
-            borderRadius: 999,
-            flexShrink: 0,
-            marginLeft: 'auto',
-          }}>
-            {accounts.map((account) => (
-              <button
-                key={account.key}
-                ref={(node) => {
-                  if (account.key === visibleAccountKey) visibleAccountRef.current = node;
-                }}
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  account.onSelect();
-                }}
-                title={account.title}
-                aria-label={account.title}
-                aria-pressed={account.selected}
-                aria-current={account.current ? 'true' : undefined}
-                style={{
-                  height: 20,
-                  maxWidth: 132,
-                  minWidth: 0,
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 5,
-                  padding: '0 8px',
-                  borderRadius: 999,
-                  border: account.selected ? '1px solid rgba(255,255,255,0.28)' : '1px solid transparent',
-                  background: account.selected ? 'rgba(255,255,255,0.12)' : 'transparent',
-                  color: account.selected ? '#f3f4f6' : '#8a8a8a',
-                  fontSize: 10,
-                  fontWeight: account.selected ? 700 : 500,
-                  cursor: 'pointer',
-                  fontVariantNumeric: 'tabular-nums',
-                }}
-              >
-                <span style={{
-                  width: 6,
-                  height: 6,
-                  borderRadius: 999,
-                  background: account.current ? '#4ade80' : '#555',
-                  boxShadow: account.current ? '0 0 8px #4ade8066' : 'none',
-                  flexShrink: 0,
-                }} />
-                <span style={{
-                  minWidth: 0,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}>
-                  {account.label}
-                </span>
-              </button>
-            ))}
+        <div style={{ minWidth: 0, flex: 1, display: 'flex', justifyContent: 'flex-end', overflowX: 'auto' }}>
+          {accounts.length > 0 && (
+            <div style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 2,
+              padding: 2,
+              background: 'rgba(255,255,255,0.05)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              borderRadius: 999,
+              flexShrink: 0,
+              marginLeft: 'auto',
+            }}>
+              {accounts.map((account) => (
+                <button
+                  key={account.key}
+                  ref={(node) => {
+                    if (account.key === visibleAccountKey) visibleAccountRef.current = node;
+                  }}
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    account.onSelect();
+                  }}
+                  title={account.title}
+                  aria-label={account.title}
+                  aria-pressed={account.selected}
+                  aria-current={account.current ? 'true' : undefined}
+                  style={{
+                    height: 20,
+                    maxWidth: 132,
+                    minWidth: 0,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 5,
+                    padding: '0 8px',
+                    borderRadius: 999,
+                    border: account.selected ? '1px solid rgba(255,255,255,0.28)' : '1px solid transparent',
+                    background: account.selected ? 'rgba(255,255,255,0.12)' : 'transparent',
+                    color: account.selected ? '#f3f4f6' : '#8a8a8a',
+                    fontSize: 10,
+                    fontWeight: account.selected ? 700 : 500,
+                    cursor: 'pointer',
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                >
+                  <span style={{
+                    width: 6,
+                    height: 6,
+                    borderRadius: 999,
+                    background: account.connected || account.current ? '#4ade80' : '#555',
+                    boxShadow: account.connected || account.current ? '0 0 8px #4ade8066' : 'none',
+                    flexShrink: 0,
+                  }} />
+                  <span style={{
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {account.label}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        {trailingAction && (
+          <div style={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0 }}>
+            {trailingAction}
           </div>
         )}
       </div>
@@ -574,12 +641,14 @@ function UsageSourceRefreshRow({
   refreshDisabled,
   refreshTitle,
   onRefresh,
+  actions,
 }: {
   sourceText: string;
   loading: boolean;
   refreshDisabled: boolean;
   refreshTitle: string;
   onRefresh: () => void;
+  actions?: ReactNode;
 }) {
   return (
     <div style={{
@@ -602,30 +671,33 @@ function UsageSourceRefreshRow({
       }}>
         {sourceText}
       </span>
-      <button
-        type="button"
-        onClick={(event) => {
-          event.stopPropagation();
-          onRefresh();
-        }}
-        disabled={refreshDisabled}
-        title={refreshTitle}
-        style={{
-          background: 'transparent',
-          border: 'none',
-          color: refreshDisabled ? '#555' : '#888',
-          cursor: refreshDisabled ? 'default' : 'pointer',
-          padding: 2,
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 4,
-          fontSize: 10,
-          flexShrink: 0,
-        }}
-      >
-        <RefreshCw size={11} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
-        {loading ? 'updating' : 'refresh'}
-      </button>
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
+        {actions}
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onRefresh();
+          }}
+          disabled={refreshDisabled}
+          title={refreshTitle}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: refreshDisabled ? '#555' : '#888',
+            cursor: refreshDisabled ? 'default' : 'pointer',
+            padding: 2,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+            fontSize: 10,
+            flexShrink: 0,
+          }}
+        >
+          <RefreshCw size={11} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
+          {loading ? 'updating' : 'refresh'}
+        </button>
+      </div>
     </div>
   );
 }
@@ -790,9 +862,18 @@ function CodexCreditBalanceRow({ credits }: { credits: CodexUsageData['credits']
   );
 }
 
-function CodexResetCreditsSection({ snapshot }: { snapshot: CodexResetCredits | null | undefined }) {
+function CodexResetCreditsSection({
+  snapshot,
+  connected,
+}: {
+  snapshot: CodexResetCredits | null | undefined;
+  connected: boolean;
+}) {
   const credits = visibleCodexResetCredits(snapshot, Date.now());
-  if (credits.length === 0) return null;
+  if (!connected && !snapshot) return null;
+  const availableLabel = snapshot
+    ? `${credits.length} available`
+    : 'unavailable';
   return (
     <div style={{
       padding: '8px 12px',
@@ -805,23 +886,25 @@ function CodexResetCreditsSection({ snapshot }: { snapshot: CodexResetCredits | 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
         <span style={{ color: '#ddd' }}>Usage resets</span>
         <span style={{ color: '#aaa', fontVariantNumeric: 'tabular-nums' }}>
-          {credits.length} available
+          {availableLabel}
         </span>
       </div>
-      <div role="list" aria-label="Available Codex usage resets" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        {credits.map((credit, index) => (
-          <div
-            role="listitem"
-            key={`${credit.expires_at}-${index}`}
-            style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 }}
-          >
-            <span style={{ color: '#888' }}>{credit.title || 'Full reset'}</span>
-            <span style={{ color: '#bbb', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
-              expires {formatCodexResetCreditExpiry(credit.expires_at)}
-            </span>
-          </div>
-        ))}
-      </div>
+      {credits.length > 0 && (
+        <div role="list" aria-label="Available Codex usage resets" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {credits.map((credit, index) => (
+            <div
+              role="listitem"
+              key={`${credit.expires_at}-${index}`}
+              style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 }}
+            >
+              <span style={{ color: '#888' }}>{credit.title || 'Full reset'}</span>
+              <span style={{ color: '#bbb', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                expires {formatCodexResetCreditExpiry(credit.expires_at)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1493,6 +1576,223 @@ function ClaudeUsageChip({
   );
 }
 
+function codexProfileStatusView(profile: CodexAccountProfile) {
+  if (profile.status === 'connected') return { label: 'Connected', color: '#4ade80' };
+  if (profile.status === 'signing_in') return { label: 'Waiting for browser', color: '#facc15' };
+  if (profile.status === 'error') return { label: 'Needs attention', color: '#f87171' };
+  return { label: 'Sign in required', color: '#777' };
+}
+
+function CodexDeviceLoginSection({
+  profiles,
+  busyProfileId,
+  actionError,
+  nowMs,
+  onCancelLogin,
+}: {
+  profiles: CodexAccountProfile[];
+  busyProfileId: string | null;
+  actionError: string | null;
+  nowMs: number;
+  onCancelLogin: (profileId: string) => void;
+}) {
+  const [copiedControl, setCopiedControl] = useState<string | null>(null);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingProfiles = profiles.filter((profile) => profile.login);
+
+  useEffect(() => () => {
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+  }, []);
+
+  const copyText = async (value: string, control: string) => {
+    try {
+      if (clipboard?.writeText) clipboard.writeText(value);
+      else await navigator.clipboard?.writeText?.(value);
+      setCopiedControl(control);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => setCopiedControl(null), 1400);
+    } catch (copyError: any) {
+      console.warn(`[CodexUsage] clipboard write failed error=${copyError?.message || String(copyError)}`);
+    }
+  };
+
+  if (pendingProfiles.length === 0 && !actionError) return null;
+
+  return (
+    <div data-codex-device-login-section style={{ borderBottom: '1px solid rgba(255,255,255,0.07)' }}>
+      {pendingProfiles.map((profile) => {
+        const status = codexProfileStatusView(profile);
+        const login = profile.login || null;
+        const remainingMinutes = login
+          ? Math.max(0, Math.ceil((login.expiresAt - nowMs) / 60_000))
+          : 0;
+        return (
+          <div
+            key={profile.profileId}
+            data-codex-account-profile={profile.profileId}
+            data-codex-account-status={profile.status}
+            style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}
+          >
+            <div style={{
+              minHeight: 40,
+              padding: '6px 12px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+            }}>
+              <span style={{
+                width: 7,
+                height: 7,
+                borderRadius: 999,
+                background: status.color,
+                boxShadow: profile.status === 'connected' ? `0 0 8px ${status.color}66` : 'none',
+                flexShrink: 0,
+              }} />
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  color: '#ddd',
+                  fontSize: 11,
+                }}>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {profile.label}
+                  </span>
+                  {profile.isDefault && (
+                    <span style={{ color: '#777', fontSize: 9, flexShrink: 0 }}>default</span>
+                  )}
+                </div>
+                <div style={{ color: status.color, fontSize: 9, marginTop: 1 }}>
+                  {status.label}{profile.planType ? ` · ${profile.planType}` : ''}
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onCancelLogin(profile.profileId);
+                }}
+                disabled={busyProfileId === profile.profileId}
+                title="Cancel sign in"
+                aria-label="Cancel Codex sign in"
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: busyProfileId === profile.profileId ? '#555' : '#888',
+                  padding: 4,
+                  cursor: busyProfileId === profile.profileId ? 'default' : 'pointer',
+                }}
+              >
+                {busyProfileId === profile.profileId
+                  ? <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} />
+                  : <X size={13} />}
+              </button>
+            </div>
+
+            {login && (
+              <div
+                data-codex-device-login
+                style={{
+                  padding: '7px 12px 9px 27px',
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(0, 1fr) auto auto',
+                  alignItems: 'center',
+                  gap: 6,
+                  background: 'rgba(250,204,21,0.035)',
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ color: '#f5f5f5', fontSize: 12, fontFamily: 'ui-monospace, monospace', fontWeight: 700 }}>
+                    {login.userCode}
+                  </div>
+                  <div style={{ color: '#777', fontSize: 9, marginTop: 2 }}>
+                    expires in {remainingMinutes}m
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void copyText(login.userCode, `${profile.profileId}:code`);
+                  }}
+                  title="Copy one-time code"
+                  aria-label="Copy one-time Codex code"
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    color: copiedControl === `${profile.profileId}:code` ? '#4ade80' : '#999',
+                    padding: 4,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {copiedControl === `${profile.profileId}:code` ? <Check size={13} /> : <Copy size={13} />}
+                </button>
+                <div style={{ display: 'inline-flex', alignItems: 'stretch' }}>
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void shell.openExternal(login.verificationUrl);
+                    }}
+                    title="Open OpenAI sign in"
+                    style={{
+                      height: 24,
+                      padding: '0 7px',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      border: '1px solid rgba(250,204,21,0.24)',
+                      borderRadius: '4px 0 0 4px',
+                      background: 'rgba(250,204,21,0.06)',
+                      color: '#d8c36d',
+                      fontSize: 10,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <ExternalLink size={11} />
+                    Open browser
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void copyText(login.verificationUrl, `${profile.profileId}:link`);
+                    }}
+                    title="Copy OpenAI sign-in link"
+                    aria-label="Copy OpenAI sign-in link"
+                    style={{
+                      width: 25,
+                      height: 24,
+                      display: 'grid',
+                      placeItems: 'center',
+                      border: '1px solid rgba(250,204,21,0.24)',
+                      borderLeft: 'none',
+                      borderRadius: '0 4px 4px 0',
+                      background: 'rgba(250,204,21,0.06)',
+                      color: copiedControl === `${profile.profileId}:link` ? '#4ade80' : '#d8c36d',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {copiedControl === `${profile.profileId}:link` ? <Check size={12} /> : <Copy size={12} />}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      {actionError && (
+        <div style={{ padding: '7px 12px', color: '#f87171', fontSize: 10 }}>
+          {actionError}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CodexUsageChip({
   showPopover,
   sticky,
@@ -1504,6 +1804,7 @@ function CodexUsageChip({
 }: UsageProviderChipProps) {
   const [data, setData] = useState<CodexUsageData | null>(null);
   const [accounts, setAccounts] = useState<CodexUsageAccount[]>([]);
+  const [profiles, setProfiles] = useState<CodexAccountProfile[]>([]);
   const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(() => loadStoredCodexUsageAccountKey());
   const [error, setError] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
@@ -1512,6 +1813,8 @@ function CodexUsageChip({
   const [stale, setStale] = useState(false);
   const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
   const [currentAccountKey, setCurrentAccountKey] = useState<string | null>(null);
+  const [profileAction, setProfileAction] = useState<string | null>(null);
+  const [profileActionError, setProfileActionError] = useState<string | null>(null);
   const refreshSeqRef = useRef(0);
   const refreshContextRef = useRef('');
 
@@ -1551,6 +1854,7 @@ function CodexUsageChip({
       if (res?.success) {
         const nextAccounts = Array.isArray(res.accounts) ? res.accounts : [];
         setAccounts(nextAccounts);
+        setProfiles(Array.isArray(res.profiles) ? res.profiles : []);
         setData(res.data || null);
         setError(res.error || null);
         setWarning(res.warning || null);
@@ -1618,13 +1922,81 @@ function CodexUsageChip({
     return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
   }, [refresh]);
 
-  const [, setNowTick] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => setNowTick((n) => n + 1), 60_000);
+    const onProfilesUpdated = (_event: unknown, payload: any) => {
+      if (Array.isArray(payload?.profiles)) setProfiles(payload.profiles);
+      if (payload?.event?.error) setProfileActionError(payload.event.error);
+      if (['login-completed', 'logout-completed', 'profile-removed'].includes(payload?.event?.type)) {
+        void refresh(true);
+      }
+    };
+    ipcRenderer.on('codex:account-profiles-updated', onProfilesUpdated);
+    return () => ipcRenderer.removeListener('codex:account-profiles-updated', onProfilesUpdated);
+  }, [refresh]);
+
+  const runProfileAction = useCallback(async (
+    channel: string,
+    payload: Record<string, unknown>,
+    actionKey: string,
+    refreshAfter = false
+  ) => {
+    setProfileAction(actionKey);
+    setProfileActionError(null);
+    try {
+      const result = await invokeCodexProfileAction(channel, payload);
+      if (Array.isArray(result.profiles)) setProfiles(result.profiles);
+      if (!result.success) {
+        setProfileActionError(result.error || 'Codex account action failed');
+        return false;
+      }
+      if (refreshAfter) await refresh(true);
+      return true;
+    } catch (profileError: any) {
+      setProfileActionError(profileError?.message || String(profileError));
+      return false;
+    } finally {
+      setProfileAction(null);
+    }
+  }, [refresh]);
+
+  const startProfileLogin = useCallback((profileId?: string) => {
+    void runProfileAction(
+      'codex:start-account-login',
+      profileId ? { profileId } : {},
+      profileId || 'new'
+    );
+  }, [runProfileAction]);
+
+  const cancelProfileLogin = useCallback((profileId: string) => {
+    void runProfileAction('codex:cancel-account-login', { profileId }, profileId);
+  }, [runProfileAction]);
+
+  const logoutProfile = useCallback((profile: CodexAccountProfile) => {
+    const warningText = profile.isDefault
+      ? `Sign out ${profile.label}? New ordinary Codex launches will also be signed out.`
+      : `Sign out ${profile.label}?`;
+    if (!window.confirm(warningText)) return;
+    void runProfileAction('codex:logout-account-profile', { profileId: profile.profileId }, profile.profileId, true);
+  }, [runProfileAction]);
+
+  const removeProfile = useCallback((profile: CodexAccountProfile) => {
+    if (!window.confirm(`Remove ${profile.label} from Noted Terminal?`)) return;
+    void runProfileAction('codex:remove-account-profile', { profileId: profile.profileId }, profile.profileId, true);
+  }, [runProfileAction]);
+
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(Date.now()), 60_000);
     return () => clearInterval(id);
   }, []);
 
   const selectedAccount = accounts.find((account) => account.accountKey === selectedAccountKey) || accounts[0] || null;
+  const selectedProfile = selectedAccount
+    ? profiles.find((profile) => (
+      (selectedAccount.profileId && profile.profileId === selectedAccount.profileId)
+      || (profile.accountKey && profile.accountKey === selectedAccount.accountKey)
+    )) || null
+    : profiles.find((profile) => profile.isDefault) || null;
   const usageData = selectedAccount?.usage || data;
   const weekly = usageData?.seven_day || null;
   const fiveHour = usageData?.five_hour || null;
@@ -1645,7 +2017,8 @@ function CodexUsageChip({
   const selectedStale = selectedAccount?.stale ?? stale;
   const selectedIsCurrent = !!selectedAccount?.accountKey
     && (selectedAccount.isCurrent || selectedAccount.accountKey === currentAccountKey);
-  const resetCredits = selectedIsCurrent ? selectedAccount?.reset_credits : null;
+  const selectedIsConnected = selectedAccount?.connected === true || selectedIsCurrent;
+  const resetCredits = selectedIsConnected ? selectedAccount?.reset_credits : null;
   const additionalRateLimits = Array.isArray(usageData?.additional_rate_limits)
     ? usageData.additional_rate_limits
     : [];
@@ -1654,7 +2027,7 @@ function CodexUsageChip({
     && accounts.some((account) => account.accountKey === currentAccountKey);
   const canRetryMissingCurrentAccount = !!currentAccountKey && !hasCurrentAccount;
   const refreshDisabled = loading
-    || (!!selectedAccount && !selectedIsCurrent && !canRetryMissingCurrentAccount);
+    || (!!selectedAccount && !selectedIsConnected && !canRetryMissingCurrentAccount);
   const snapshotTimestamp = selectedAccount?.timestamp || lastSuccessAt || usageData?.timestamp || null;
   const refreshVisualLoading = loading;
   const ariaMetrics = [
@@ -1684,9 +2057,10 @@ function CodexUsageChip({
     setLastSuccessAt(account.timestamp || account.usage?.timestamp || null);
     const accountIsCurrent = !!account.accountKey
       && (account.isCurrent || account.accountKey === currentAccountKey);
-    setWarning(!accountIsCurrent && account.stale
-      ? 'Selected account is not the current Codex login. Showing its last known value.'
-      : (accountIsCurrent ? (account.warning || null) : null));
+    const accountIsConnected = account.connected === true || accountIsCurrent;
+    setWarning(!accountIsConnected && account.stale
+      ? 'This Codex account is not connected. Showing its last known value.'
+      : (accountIsConnected ? (account.warning || null) : null));
     const accountWeekly = account.usage?.seven_day?.utilization ?? null;
     const accountFiveHour = account.usage?.five_hour?.utilization ?? null;
     console.log(
@@ -1711,11 +2085,133 @@ function CodexUsageChip({
       label: account.label,
       selected: account.accountKey === (selectedAccount?.accountKey || selectedAccountKey),
       current: accountCurrent,
+      connected: account.connected === true || accountCurrent,
       onSelect: () => selectAccount(account),
-      title: `${account.label}${accountMetrics ? ` • ${accountMetrics}` : ''}${account.plan_type ? ` • ${account.plan_type}` : ''}${accountCurrent ? ' • current Codex login' : ''}${account.stale ? ' • stale' : ''}`,
+      title: `${account.label}${accountMetrics ? ` • ${accountMetrics}` : ''}${account.plan_type ? ` • ${account.plan_type}` : ''}${accountCurrent ? ' • default Codex login' : ''}${account.connected ? ' • connected' : ''}${account.stale ? ' • stale' : ''}`,
     };
   });
   const codexSourceText = `${codexUsageSourceLabel(selectedSource)} · ${formatSnapshotAge(snapshotTimestamp)}${selectedStale ? ' · stale' : ''}${selectedIsCurrent ? ' · current' : ''}`;
+  const selectedProfileStatus = selectedProfile
+    ? codexProfileStatusView(selectedProfile)
+    : (selectedIsConnected
+      ? { label: 'Connected', color: '#4ade80' }
+      : { label: 'Sign in required', color: '#777' });
+  const selectedProfileBusy = !!selectedProfile && profileAction === selectedProfile.profileId;
+  const hasPendingLogin = profiles.some((profile) => profile.status === 'signing_in' && profile.login);
+  const addAccountDisabled = profileAction !== null || hasPendingLogin;
+  const sourceAccountActions = (
+    <>
+      <span style={{ color: selectedProfileStatus.color, fontSize: 9, whiteSpace: 'nowrap' }}>
+        {selectedProfileStatus.label}{selectedProfile?.planType ? ` · ${selectedProfile.planType}` : ''}
+      </span>
+      {selectedProfile?.status === 'connected' ? (
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            logoutProfile(selectedProfile);
+          }}
+          disabled={selectedProfileBusy}
+          title={`Sign out ${selectedProfile.label}`}
+          aria-label={`Sign out ${selectedProfile.label}`}
+          style={{
+            width: 20,
+            height: 20,
+            display: 'grid',
+            placeItems: 'center',
+            background: 'transparent',
+            border: 'none',
+            color: selectedProfileBusy ? '#555' : '#888',
+            padding: 0,
+            cursor: selectedProfileBusy ? 'default' : 'pointer',
+          }}
+        >
+          {selectedProfileBusy
+            ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
+            : <LogOut size={12} />}
+        </button>
+      ) : selectedProfile?.status === 'signing_in' ? (
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            cancelProfileLogin(selectedProfile.profileId);
+          }}
+          disabled={selectedProfileBusy}
+          title="Cancel sign in"
+          aria-label="Cancel Codex sign in"
+          style={{
+            width: 20,
+            height: 20,
+            display: 'grid',
+            placeItems: 'center',
+            background: 'transparent',
+            border: 'none',
+            color: selectedProfileBusy ? '#555' : '#888',
+            padding: 0,
+            cursor: selectedProfileBusy ? 'default' : 'pointer',
+          }}
+        >
+          {selectedProfileBusy
+            ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
+            : <X size={12} />}
+        </button>
+      ) : (
+        <>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              startProfileLogin(selectedProfile?.profileId);
+            }}
+            disabled={selectedProfileBusy || profileAction !== null}
+            title="Sign in to Codex"
+            aria-label="Sign in to Codex"
+            style={{
+              width: 20,
+              height: 20,
+              display: 'grid',
+              placeItems: 'center',
+              background: 'transparent',
+              border: 'none',
+              color: selectedProfileBusy || profileAction !== null ? '#555' : '#aaa',
+              padding: 0,
+              cursor: selectedProfileBusy || profileAction !== null ? 'default' : 'pointer',
+            }}
+          >
+            {selectedProfileBusy
+              ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
+              : <LogIn size={12} />}
+          </button>
+          {selectedProfile?.canRemove && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                removeProfile(selectedProfile);
+              }}
+              disabled={selectedProfileBusy || profileAction !== null}
+              title={`Remove ${selectedProfile.label}`}
+              aria-label={`Remove ${selectedProfile.label}`}
+              style={{
+                width: 20,
+                height: 20,
+                display: 'grid',
+                placeItems: 'center',
+                background: 'transparent',
+                border: 'none',
+                color: selectedProfileBusy || profileAction !== null ? '#555' : '#777',
+                padding: 0,
+                cursor: selectedProfileBusy || profileAction !== null ? 'default' : 'pointer',
+              }}
+            >
+              <Trash2 size={11} />
+            </button>
+          )}
+        </>
+      )}
+    </>
+  );
 
   return (
     <div style={{ position: 'static', display: 'inline-flex', minWidth: 0, flexShrink: 0 }}>
@@ -1791,17 +2287,54 @@ function CodexUsageChip({
             provider="codex"
             onProviderChange={onProviderChange}
             accounts={accountOptions}
+            trailingAction={(
+              <button
+                type="button"
+                data-codex-add-account
+                onClick={(event) => {
+                  event.stopPropagation();
+                  startProfileLogin();
+                }}
+                disabled={addAccountDisabled}
+                title={hasPendingLogin ? 'Finish the current Codex sign in first' : 'Connect another Codex account'}
+                aria-label="Connect another Codex account"
+                style={{
+                  width: 24,
+                  height: 24,
+                  display: 'grid',
+                  placeItems: 'center',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: 4,
+                  background: 'rgba(255,255,255,0.04)',
+                  color: addAccountDisabled ? '#555' : '#aaa',
+                  padding: 0,
+                  cursor: addAccountDisabled ? 'default' : 'pointer',
+                }}
+              >
+                {profileAction === 'new'
+                  ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
+                  : <Plus size={13} />}
+              </button>
+            )}
           />
           <UsageSourceRefreshRow
             sourceText={codexSourceText}
             loading={refreshVisualLoading}
             refreshDisabled={refreshDisabled}
-            refreshTitle={selectedAccount && !selectedIsCurrent
+            refreshTitle={selectedAccount && !selectedIsConnected
               ? (canRetryMissingCurrentAccount
                 ? 'Retry current Codex login usage'
-                : 'Sign in to this Codex account to refresh it')
+                : 'Connect this Codex account to refresh it')
               : 'Refresh Codex usage'}
             onRefresh={() => refresh(true)}
+            actions={sourceAccountActions}
+          />
+          <CodexDeviceLoginSection
+            profiles={profiles}
+            busyProfileId={profileAction}
+            actionError={profileActionError}
+            nowMs={nowTick}
+            onCancelLogin={cancelProfileLogin}
           />
 
           {(error || warning) && (
@@ -1848,7 +2381,7 @@ function CodexUsageChip({
             </div>
           ) : null}
 
-          <CodexResetCreditsSection snapshot={resetCredits} />
+          <CodexResetCreditsSection snapshot={resetCredits} connected={selectedIsConnected} />
 
         </>,
         popoverHost

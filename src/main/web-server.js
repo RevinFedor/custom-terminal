@@ -67,6 +67,7 @@ const {
   isResultProofPending,
   isPausedRun,
   isCompleteOrchestrationResult,
+  classifyAgentSendReceipt,
   shouldScheduleCreatedTargetAutoStop,
   shouldRetryWaitingNotificationForSourceLifecycle,
   shouldMarkSourceFollowupUnconfirmed,
@@ -74,6 +75,7 @@ const {
   orchestrationCompletionRunIdFromAudit,
   mergeActiveLoadersWithOrchestrations,
   buildOrchestrationResultLookup,
+  orchestrationSendFailureRecoveryPolicy,
   resolveCausalSourceExecutionContext,
 } = require('./orchestration-runs');
 const {
@@ -1286,19 +1288,49 @@ function sendTerminalBridgeError(res, error) {
   return sendJson(res, 500, { ok: false, error: message });
 }
 
-function isSendFailure(data) {
-  return data && (data.success === false || data.ok === false);
+function sendAuditPending(res, data, extra = {}) {
+  return sendJson(res, 202, {
+    ...(data || {}),
+    ...extra,
+    ok: true,
+    success: true,
+    accepted: true,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+    exactAuditConfirmed: false,
+    pendingReason: data?.error || data?.message || 'exact delivery confirmation pending',
+    error: undefined,
+  });
+}
+
+function sendDeliveryUnknown(res, data, extra = {}) {
+  return sendJson(res, 202, {
+    ...(data || {}),
+    ...extra,
+    ok: true,
+    success: null,
+    accepted: true,
+    submitted: null,
+    status: 'delivery-unknown',
+    deliveryUnknown: true,
+    exactAuditConfirmed: false,
+    pendingReason: data?.error || data?.message
+      || 'the renderer did not return a delivery receipt; do not retry blindly',
+    error: undefined,
+  });
 }
 
 function sendSendFailure(res, data, extra = {}) {
   const code = data && typeof data.code === 'string' ? data.code : 'send_failed';
   return sendJson(res, 409, {
+    ...(data || {}),
+    ...extra,
     ok: false,
     success: false,
+    submitted: false,
     code,
     error: (data && (data.error || data.message)) || 'send failed',
-    ...extra,
-    ...(data || {}),
   });
 }
 
@@ -1317,23 +1349,49 @@ async function runAgentSendScenario({
   presentationSnapshot,
   timeoutMs = 60_000,
 }) {
-  return await bridgeRequest('sendAgentPromptScenario', {
-    tabId,
-    prompt,
-    model,
-    effort,
-    thinking,
-    cwd,
-    handoffId,
-    source,
-    statusAtSend,
-    queue: queue === true,
-    presentationSnapshot: presentationSnapshot || null,
-    // Project/History/iOS controls the terminal tab directly: leave a found
-    // terminal draft untouched and report conflict. External Inbox owns its
-    // own chat composer: atomically pull terminal draft out for caller rollback.
-    returnDraftOnConflict: ownership === 'external',
-  }, timeoutMs);
+  try {
+    return await bridgeRequest('sendAgentPromptScenario', {
+      tabId,
+      prompt,
+      model,
+      effort,
+      thinking,
+      cwd,
+      handoffId,
+      source,
+      statusAtSend,
+      queue: queue === true,
+      presentationSnapshot: presentationSnapshot || null,
+      // Project/History/iOS controls the terminal tab directly: leave a found
+      // terminal draft untouched and report conflict. External Inbox owns its
+      // own chat composer: atomically pull terminal draft out for caller rollback.
+      returnDraftOnConflict: ownership === 'external',
+    }, timeoutMs);
+  } catch (error) {
+    if (error?.code !== 'bridge_timeout') throw error;
+    // BrowserWindow.send crossed the main -> renderer boundary, but the
+    // renderer did not return its receipt before the caller deadline. The
+    // scenario may still be launching, proving readiness, or waiting for the
+    // post-Enter transcript audit. Treating this as "not sent" invites a
+    // duplicate; treating it as "sent" fabricates delivery. Preserve the
+    // exact handoff for a later audit and surface an explicit unknown state.
+    console.warn('[AgentScenario] renderer receipt timeout tab=' + shortId(tabId, 12)
+      + ' handoff=' + (handoffId || '-')
+      + ' source=' + (source || '-')
+      + ' timeoutMs=' + timeoutMs
+      + ' -> delivery-unknown');
+    return {
+      success: null,
+      accepted: true,
+      submitted: null,
+      status: 'delivery-unknown',
+      deliveryUnknown: true,
+      code: 'bridge_timeout_delivery_unknown',
+      warning: 'The send scenario may still complete; do not retry this handoff blindly.',
+      handoffId: handoffId || null,
+      tabId,
+    };
+  }
 }
 
 async function dispatchDeferredOrchestrationRun(runId, {
@@ -1403,14 +1461,15 @@ async function dispatchDeferredOrchestrationRun(runId, {
       effort: intent.effort || undefined,
       thinking: intent.thinking || undefined,
     });
-    const sendResult = await runAgentSendScenario({
+    const targetHandoffId = 'orchestration:' + current.runId;
+    const rawSendResult = await runAgentSendScenario({
       tabId: current.targetTabId,
       prompt: intent.prompt,
       model: sendOptions.model,
       effort: sendOptions.effort,
       thinking: sendOptions.thinking,
       cwd: current.targetCwd,
-      handoffId: 'orchestration:' + current.runId,
+      handoffId: targetHandoffId,
       source: 'orchestration:' + current.sourceTabId,
       statusAtSend: deliveryAdmission.statusAtSend,
       // Independent orchestration runs must be distinct provider turns.  The
@@ -1420,20 +1479,55 @@ async function dispatchDeferredOrchestrationRun(runId, {
       presentationSnapshot: orchestrationPresentationSnapshot(current, 'request'),
       timeoutMs: 60_000,
     });
-    if (isSendFailure(sendResult)) {
-      const provenNotSent = sendResult?.submitted === false
-        || (sendResult?.accepted === false && sendResult?.submitted !== true);
-      if (provenNotSent) {
+    const sendResult = {
+      ...(rawSendResult && typeof rawSendResult === 'object' ? rawSendResult : {}),
+      handoffId: targetHandoffId,
+    };
+    const sendReceipt = classifyAgentSendReceipt(sendResult);
+    if (sendReceipt.state === 'not-submitted') {
+      const recoveryPolicy = orchestrationSendFailureRecoveryPolicy(sendResult);
+      if (recoveryPolicy.provenNotSent) {
         await store.resetDeferredDelivery(runId, 'send-refused-before-submit');
+        console.warn('[OrchestrationRecovery] immediate pre-submit failure run=' + runId
+          + ' target=' + String(current.targetTabId || '').slice(-12)
+          + ' error=' + (sendResult?.error || sendResult?.message || 'send failed'));
+      } else {
+        console.warn('[OrchestrationRecovery] send failure keeps recovery grace run=' + runId
+          + ' target=' + String(current.targetTabId || '').slice(-12)
+          + ' submitted=' + String(sendResult?.submitted)
+          + ' accepted=' + String(sendResult?.accepted)
+          + ' error=' + (sendResult?.error || sendResult?.message || 'send failed'));
       }
       const failed = await store.beginRecovery(
         runId,
         current.targetCreated ? 'startup_failed' : 'failed',
         sendResult?.error || sendResult?.message || 'send failed',
+        { failureGraceMs: recoveryPolicy.failureGraceMs },
       );
       emitOrchestrationChanges(failed.changed, reason + '-send-failed');
       await finalizeSettledOrchestrations(failed.settled, reason + '-send-failed');
       return { dispatched: false, deferred: false, reason: 'send-failed', sendResult, run: await store.get(runId) };
+    }
+
+    if (sendReceipt.state === 'delivery-unknown') {
+      // The bridge request reached the renderer, but no receipt came back.
+      // Keep the durable intent and its exact handoff: a later prompt audit
+      // can prove delivery, while automatic replay remains forbidden by the
+      // already-persisted dispatch boundary.
+      const unknown = await store.patch(runId, {
+        status: 'sending',
+        deliveryTransportUnknownAt: Date.now(),
+        deliveryTransportError: sendResult?.code || 'bridge_timeout_delivery_unknown',
+      });
+      emitOrchestrationRun(unknown, reason + '-delivery-unknown');
+      return {
+        dispatched: true,
+        deferred: false,
+        reason: 'delivery-unknown',
+        receiptState: sendReceipt.state,
+        sendResult,
+        run: unknown,
+      };
     }
 
     const acceptedRuntime = await resolveAgentSessionInfo(current.targetTabId, 2000).catch(() => null);
@@ -1441,10 +1535,18 @@ async function dispatchDeferredOrchestrationRun(runId, {
       baselineBusy: false,
       sessionId: sendResult?.sessionId || acceptedRuntime?.sessionId || status?.sessionId || null,
       lifecycleGeneration: acceptedRuntime?.lifecycleGeneration || status?.lifecycleGeneration || null,
+      auditPending: sendReceipt.state === 'audit-pending',
     });
     emitOrchestrationRun(accepted, reason + '-delivery-accepted');
     const reconciled = await reconcileOrchestrationRun(runId, reason + '-delivery-reconcile');
-    return { dispatched: true, deferred: false, reason: null, sendResult, run: reconciled || accepted };
+    return {
+      dispatched: true,
+      deferred: false,
+      reason: null,
+      receiptState: sendReceipt.state,
+      sendResult,
+      run: reconciled || accepted,
+    };
   } finally {
     orchestrationDeliveryInflight.delete(runId);
   }
@@ -1690,12 +1792,12 @@ async function probeOrchestrationResult(run, {
   if (!run || typeof getAgentTurnResult !== 'function') {
     return { found: false, resultAvailable: false, error: 'result reader unavailable' };
   }
+  const lookup = buildOrchestrationResultLookup(run);
   const info = sessionInfo || await resolveAgentSessionInfo(run.targetTabId, 2000).catch(() => null);
-  const sessionId = info?.sessionId || run.sessionId || null;
+  const sessionId = lookup.targetExecutionContext?.sessionId || info?.sessionId || run.sessionId || null;
   const cwd = info?.cwd || run.targetCwd || run.targetProjectPath || null;
   if (!sessionId) return { found: false, resultAvailable: false, sessionId: null };
   try {
-    const lookup = buildOrchestrationResultLookup(run);
     const result = await getAgentTurnResult({
       sessionId,
       cwd,
@@ -1756,7 +1858,7 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
   if (!current || !isTerminalStatus(current.status)) return;
   if (current.status === 'completed' && current.resultComplete !== true) return;
   if (current.notifySource === false || current.notificationSuppressed) return;
-  if (['sent', 'queued', 'suppressed', 'source-closed'].includes(current.notificationStatus)) return;
+  if (['audit-pending', 'sent', 'queued', 'suppressed', 'source-closed'].includes(current.notificationStatus)) return;
   if (current.notificationStatus === 'unconfirmed' && options.force !== true) return;
   if (current.notificationCancelRequestedAt && !current.sourceFollowupStartedAt) {
     const suppressed = await store.markNotification(current.runId, 'suppressed', {
@@ -1820,7 +1922,8 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       ),
       timeoutMs: 60_000,
     });
-    if (isSendFailure(result)) {
+    const sendReceipt = classifyAgentSendReceipt(result);
+    if (sendReceipt.state === 'not-submitted') {
       await releaseOrchestrationSourceProof(current.runId, 'notification-send-failed');
       const latest = await store.getInternal(current.runId);
       if (result?.error === 'agent_send_cancelled' || latest?.notificationCancelRequestedAt) {
@@ -1841,6 +1944,20 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
         notificationError: result?.error || result?.message || 'notification send failed',
       });
       emitOrchestrationChanges(failed?.changed, 'notification-finished');
+    } else if (sendReceipt.state === 'delivery-unknown') {
+      const unknown = await store.markNotification(current.runId, 'unconfirmed', {
+        notificationAuditPendingAt: null,
+        notificationError: result?.code || 'bridge_timeout_delivery_unknown',
+        notificationCancelRequestedAt: null,
+      });
+      emitOrchestrationChanges(unknown?.changed, 'notification-delivery-unknown');
+    } else if (sendReceipt.state === 'audit-pending') {
+      const pending = await store.markNotification(current.runId, 'audit-pending', {
+        notificationAuditPendingAt: Date.now(),
+        notificationError: null,
+        notificationCancelRequestedAt: null,
+      });
+      emitOrchestrationChanges(pending?.changed, 'notification-audit-pending');
     } else {
       const delivered = await store.markNotification(current.runId, result?.queued ? 'queued' : 'sent', {
         notificationDeliveredAt: Date.now(),
@@ -1903,6 +2020,46 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
 }
 
 async function notifyAgentPromptAuditResult(detail = {}) {
+  const externalHandoffId = typeof detail?.handoffId === 'string' ? detail.handoffId : '';
+  if (detail?.success === true && externalHandoffId.startsWith('external-run:')) {
+    const externalRunId = externalHandoffId.slice('external-run:'.length);
+    const externalRun = externalRuns.get(externalRunId);
+    const exactProvider = typeof detail?.toolType === 'string'
+      && detail.toolType === externalRun?.provider;
+    const exactSession = typeof detail?.sessionId === 'string'
+      && detail.sessionId.length > 0
+      && (!externalRun?.sessionId || detail.sessionId === externalRun.sessionId);
+    const confirmed = Boolean(
+      externalRun
+      && externalRun.tabId === detail.tabId
+      && externalRun.handoffId === externalHandoffId
+      && exactProvider
+      && exactSession
+      && externalRun.promptAuditHash
+      && externalRun.promptAuditHash === detail.expectedHash
+      && externalRun.promptAuditHash === detail.actualHash
+    );
+    if (!confirmed) {
+      return {
+        matched: Boolean(externalRun),
+        confirmed: false,
+        reason: externalRun ? 'external-prompt-identity-mismatch' : 'external-run-not-found',
+      };
+    }
+    externalRun.status = 'running';
+    externalRun.auditPendingAt = null;
+    externalRun.auditConfirmedAt = Date.now();
+    externalRun.sessionId ||= detail.sessionId;
+    externalRun.auditSessionId = detail.sessionId;
+    externalRun.auditEntryUuid = detail.entryUuid || null;
+    setExternalRunMeta(externalRun.tabId, {
+      status: 'running',
+      sessionId: externalRun.auditSessionId,
+      handoffId: externalRun.handoffId,
+      auditConfirmedAt: externalRun.auditConfirmedAt,
+    });
+    return { matched: true, confirmed: true, kind: 'external-delivery', runId: externalRunId };
+  }
   const store = getOrchestrationRunStore();
   const targetRunId = orchestrationTargetRunIdFromAudit(detail);
   if (targetRunId) {
@@ -2585,9 +2742,19 @@ async function performOrchestrationAction(runId, action, options = {}) {
       return { ok: false, error: 'paused run must be resumed explicitly', run: withOrchestrationUrls(current) };
     }
     const actionTabId = cleanOptionalString(options.tabId, '');
+    const sourceNotificationAwaitingProof = current.sourceTabId === actionTabId
+      && isTerminalStatus(current.status)
+      && ['audit-pending', 'unconfirmed'].includes(current.notificationStatus);
+    if (sourceNotificationAwaitingProof) {
+      return {
+        ok: false,
+        error: 'completion Enter already crossed; exact delivery confirmation is still pending',
+        run: withOrchestrationUrls(current),
+      };
+    }
     const canRetrySourceNotification = current.sourceTabId === actionTabId
       && isTerminalStatus(current.status)
-      && ['waiting-for-input', 'failed', 'unconfirmed'].includes(current.notificationStatus);
+      && ['waiting-for-input', 'failed'].includes(current.notificationStatus);
     if (canRetrySourceNotification) {
       await sendOrchestrationCompletionNotification(current, { force: true });
       const retried = await store.get(runId);
@@ -3703,6 +3870,15 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ok: true,
         accepted: true,
         queued: delivery.deferred === true,
+        submitted: delivery.sendResult?.submitted,
+        handoffId: delivery.sendResult?.handoffId || null,
+        status: delivery.receiptState === 'delivery-unknown'
+          ? 'delivery-unknown'
+          : delivery.receiptState === 'audit-pending'
+            ? 'audit-pending'
+            : 'accepted',
+        deliveryUnknown: delivery.receiptState === 'delivery-unknown',
+        auditPending: delivery.receiptState === 'audit-pending',
         run: withOrchestrationUrls(reconciled),
       });
     } catch (error) {
@@ -4427,6 +4603,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const body = await readBody(req);
       const { prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue, attachments } = body;
       if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
+      const operationHandoffId = cleanOptionalString(handoffId, '')
+        || 'project-send:' + crypto.randomUUID();
       const sendPayload = appendAttachmentsToPrompt(prompt, attachments);
       // This request is the user's explicit authorization to reopen a closed
       // archived AI tab. Passive lifecycle/reconcile paths never call this.
@@ -4436,16 +4614,34 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // ~50ms per phone send on top of the actual PTY paste latency.
       const data = await runAgentSendScenario({
         tabId, prompt: sendPayload.prompt, model, effort, thinking, cwd,
-        handoffId, source, statusAtSend, queue: queue === true,
+        handoffId: operationHandoffId, source, statusAtSend, queue: queue === true,
         ownership: 'project',
       });
-      if (isSendFailure(data)) return sendSendFailure(res, data, { tabId });
+      const sendReceipt = classifyAgentSendReceipt(data);
+      if (sendReceipt.state === 'not-submitted') {
+        return sendSendFailure(res, data, { tabId, handoffId: operationHandoffId });
+      }
+      if (sendReceipt.state === 'delivery-unknown') {
+        return sendDeliveryUnknown(res, data, {
+          tabId,
+          handoffId: operationHandoffId,
+          attachments: sendPayload.attachments,
+        });
+      }
+      if (sendReceipt.state === 'audit-pending') {
+        return sendAuditPending(res, data, {
+          tabId,
+          handoffId: operationHandoffId,
+          attachments: sendPayload.attachments,
+        });
+      }
       return sendJson(res, 200, {
         ok: true,
         success: data?.success !== false,
         status: data?.queued ? 'queued' : 'sent',
         attachments: sendPayload.attachments,
         ...(data || {}),
+        handoffId: operationHandoffId,
       });
     } catch (e) {
       return sendJson(res, Number(e?.statusCode) || 500, {
@@ -4549,6 +4745,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         runId,
         provider,
         source,
+        handoffId: 'external-run:' + runId,
+        promptAuditHash: promptAuditFingerprint(prompt),
         conversationKey: conversationKey || undefined,
         status: 'starting',
         startedAt,
@@ -4620,17 +4818,94 @@ async function handleApi(req, res, parsed, sdkSessions) {
         prompt,
         model: sendOptions.model,
         effort: sendOptions.effort,
+        handoffId: run.handoffId,
         source: 'external:' + source,
         statusAtSend: status?.status || 'active',
         queue: sendOptions.queue,
         ownership: 'external',
         timeoutMs: 60_000,
       });
-      if (isSendFailure(sendResult)) {
+      const sendReceipt = classifyAgentSendReceipt(sendResult);
+      if (sendReceipt.state === 'not-submitted') {
         const failureCode = sendResult?.code || 'send_failed';
         run.status = failureCode === 'terminal_draft_conflict' ? 'draft_conflict' : 'send_failed';
         setExternalRunMeta(tabId, { status: run.status, error: sendResult.error || 'send failed' });
         return sendSendFailure(res, sendResult, { runId, tabId, sessionId });
+      }
+      if (sendReceipt.state === 'delivery-unknown') {
+        run.status = 'delivery_unknown';
+        run.auditPendingAt = null;
+        run.deliveryUnknownAt = Date.now();
+        setExternalRunMeta(tabId, {
+          status: 'delivery_unknown',
+          sessionId,
+          handoffId: run.handoffId,
+          deliveryUnknownAt: run.deliveryUnknownAt,
+          autoStopAt: null,
+          autoCloseAt: null,
+        });
+        return sendDeliveryUnknown(res, sendResult, {
+          runId,
+          provider,
+          tabId,
+          sessionId,
+          source,
+          handoffId: run.handoffId,
+          conversationKey: conversationKey || null,
+          eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
+          stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
+          autoStopMs,
+          autoCloseMs,
+          reused,
+        });
+      }
+      if (sendReceipt.state === 'audit-pending') {
+        if (run.auditConfirmedAt) {
+          run.status = 'running';
+          return sendJson(res, 200, {
+            ok: true,
+            success: true,
+            accepted: true,
+            submitted: true,
+            status: 'sent',
+            exactAuditConfirmed: true,
+            runId,
+            provider,
+            tabId,
+            sessionId: run.auditSessionId || sessionId,
+            source,
+            handoffId: run.handoffId,
+            conversationKey: conversationKey || null,
+            eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
+            stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
+            autoStopMs,
+            autoCloseMs,
+            reused,
+          });
+        }
+        run.status = 'audit_pending';
+        run.auditPendingAt = Date.now();
+        setExternalRunMeta(tabId, {
+          status: 'audit_pending',
+          sessionId,
+          handoffId: run.handoffId,
+          autoStopAt: null,
+          autoCloseAt: null,
+        });
+        return sendAuditPending(res, sendResult, {
+          runId,
+          provider,
+          tabId,
+          sessionId,
+          source,
+          handoffId: run.handoffId,
+          conversationKey: conversationKey || null,
+          eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
+          stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
+          autoStopMs,
+          autoCloseMs,
+          reused,
+        });
       }
       run.status = 'running';
       setExternalRunMeta(tabId, { status: 'running', sessionId, autoStopAt: null, autoStopMs, autoCloseAt: null, autoCloseMs });

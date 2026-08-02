@@ -3,12 +3,15 @@ import assert from 'node:assert/strict';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
+  buildPromptReferenceText,
   captureHistoryMenuAnchor,
   chooseContextMenuOpenLeft,
   clampFloatingPanelTop,
+  formatPromptFileReference,
   isCurrentPickerGeneration,
   joinPromptInsertionText,
   placePointAnchoredMenu,
+  promptHasFileReferences,
   resolveHistoryScriptCwd,
 } from './promptInsertMenuModel.mjs';
 
@@ -31,6 +34,33 @@ test('joinPromptInsertionText keeps prompt and file order with readable gaps', (
     joinPromptInsertionText('Review this', ['first file', '', 'second file']),
     'Review this\n\nfirst file\n\nsecond file',
   );
+});
+
+test('a path with spaces stays one Claude reference, other agents get it bare', () => {
+  const spaced = '/Users/fedor/Global-Templates/🧩 Code-Patterns/docs-rules.prompt.md';
+  assert.equal(formatPromptFileReference(spaced, 'claude'), `@"${spaced}"`);
+  assert.equal(formatPromptFileReference(spaced, 'codex'), spaced);
+  assert.equal(formatPromptFileReference('   ', 'claude'), '');
+});
+
+test('reference insertion keeps prompt text and never inlines the file', () => {
+  const text = buildPromptReferenceText('Review this', ['/tmp/a.md', '/tmp/b.md'], 'claude');
+  assert.equal(text, 'Review this\n\n@"/tmp/a.md" @"/tmp/b.md" ');
+  // Trailing space closes Claude's file typeahead so the next Enter submits.
+  assert.equal(text.endsWith(' '), true);
+});
+
+test('file-only prompt inserts just its references', () => {
+  assert.equal(buildPromptReferenceText('', ['/tmp/a.md'], 'claude'), '@"/tmp/a.md" ');
+  assert.equal(buildPromptReferenceText('', ['/tmp/a.md', '/tmp/b.md'], 'codex'), '/tmp/a.md\n/tmp/b.md');
+});
+
+test('a prompt without files has nothing to reference', () => {
+  assert.equal(promptHasFileReferences({ file_paths: [] }), false);
+  assert.equal(promptHasFileReferences({ file_paths: ['  '] }), false);
+  assert.equal(promptHasFileReferences({}), false);
+  assert.equal(promptHasFileReferences({ file_paths: ['/tmp/a.md'] }), true);
+  assert.equal(buildPromptReferenceText('Only text', [], 'claude'), 'Only text');
 });
 
 test('malformed package json does not hide shell scripts', () => {

@@ -6,6 +6,11 @@ const ASSET_ID_RE = /^[a-f0-9]{64}\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i;
 const DEFAULT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const IMAGE_PATH_MARKER_RE = /\[imagePath:\s*([^\]\r\n]+?)\s*\]/gi;
 
+function isPortableImagePath(rawPath) {
+  const candidate = String(rawPath || '').trim();
+  return candidate.length > 0 && path.isAbsolute(candidate);
+}
+
 function safeExtension(filePath) {
   const extension = path.extname(String(filePath || '')).toLowerCase();
   return /^\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/.test(extension) ? extension : '.png';
@@ -18,7 +23,9 @@ function aliasNameForRef(ref, sourcePath, stat) {
   return crypto.createHash('sha256').update(fingerprint).digest('hex') + safeExtension(sourcePath);
 }
 
-function buildCodexImagePastePlan(text, stageImagePath) {
+function buildCodexImagePastePlan(text, stageImagePath, {
+  missingCode = 'codex_image_path_unavailable',
+} = {}) {
   if (typeof stageImagePath !== 'function') {
     throw new TypeError('stageImagePath must be a function');
   }
@@ -43,9 +50,18 @@ function buildCodexImagePastePlan(text, stageImagePath) {
   for (const match of input.matchAll(IMAGE_PATH_MARKER_RE)) {
     const index = match.index ?? 0;
     pushText(input.slice(cursor, index));
-    replaced += 1;
-
     const rawPath = match[1];
+    if (!isPortableImagePath(rawPath)) {
+      // The renderer/import contract intentionally leaves relative paths and
+      // prose examples untouched: their filesystem base cannot be proven at
+      // the destination. Terminal MCP must use the same boundary instead of
+      // silently turning documentation into an attachment/error slot.
+      pushText(match[0]);
+      cursor = index + match[0].length;
+      continue;
+    }
+
+    replaced += 1;
     const result = stageImagePath(rawPath);
     if (result?.success && typeof result.inputPath === 'string' && result.inputPath) {
       staged.push(result);
@@ -59,7 +75,7 @@ function buildCodexImagePastePlan(text, stageImagePath) {
         path: result?.path || String(rawPath || '').trim(),
         error: result?.error || 'stage_failed',
       });
-      pushText(match[0]);
+      pushText(`[imageError: ${missingCode} #${replaced}]`);
     }
     cursor = index + match[0].length;
   }
@@ -74,6 +90,25 @@ function buildCodexImagePastePlan(text, stageImagePath) {
     staged,
     missing,
   };
+}
+
+function replaceUnavailableImagePathMarkers(
+  text,
+  missing = [],
+  missingCode = 'queue_image_path_unavailable',
+) {
+  const unavailablePaths = new Set(
+    (Array.isArray(missing) ? missing : [])
+      .map((item) => String(item?.path || '').trim()),
+  );
+  let slot = 0;
+  return String(text || '').replace(IMAGE_PATH_MARKER_RE, (marker, rawPath) => {
+    if (!isPortableImagePath(rawPath)) return marker;
+    slot += 1;
+    return unavailablePaths.has(String(rawPath || '').trim())
+      ? `[imageError: ${missingCode} #${slot}]`
+      : marker;
+  });
 }
 
 class CodexImageTransport {
@@ -174,4 +209,6 @@ module.exports = {
   CodexImageTransport,
   aliasNameForRef,
   buildCodexImagePastePlan,
+  isPortableImagePath,
+  replaceUnavailableImagePathMarkers,
 };

@@ -22,6 +22,7 @@ import {
   classifyAgentDraftPreflight,
   resolveAgentDraftConflict,
 } from './agentDraftPreflight.mjs';
+import { buildClaudeRewindPromptProjection } from './composerChips.mjs';
 import { enqueueAgentSendScenario } from './agentSendSequencer.mjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -41,9 +42,11 @@ export interface SendAgentPromptScenarioArgs {
   effort?: string;
   thinking?: string;
   returnDraftOnConflict?: boolean;
+  claudeExactEmptyEvidence?: Record<string, unknown> | null;
   coordinatedSendToken?: number | null;
   presentationSnapshot?: {
     historySessionId?: string | null;
+    imagePaths?: HistoryPromptDraftImageRef[];
     promptChips?: Array<{
       id?: string;
       kind: 'prompt';
@@ -89,6 +92,7 @@ async function runAgentPromptScenario({
   effort,
   thinking,
   returnDraftOnConflict,
+  claudeExactEmptyEvidence,
   coordinatedSendToken,
   presentationSnapshot,
 }: SendAgentPromptScenarioArgs): Promise<any> {
@@ -118,6 +122,9 @@ async function runAgentPromptScenario({
   }
 
   const canInspectDraft = !!runtime.probeDraft || !!runtime.inspectDraft;
+  let exactEmptyEvidenceForSend = toolType === 'claude'
+    ? (claudeExactEmptyEvidence || null)
+    : null;
   if ((statusForSend === 'active' || statusForSend === 'busy') && canInspectDraft) {
     const visual = runtime.probeDraft
       ? await runtime.probeDraft(tabId, 'agent-send-preflight:' + (source || 'unknown'))
@@ -157,6 +164,7 @@ async function runAgentPromptScenario({
       }
       if (conflict.decision === 'clear') {
         draftDecision = applyAgentDraftCaptureResolution(draftDecision, conflict);
+        if (toolType === 'claude') exactEmptyEvidenceForSend = captured;
         console.warn('[AgentScenario:send] screen draft false-positive resolved by exact empty Ctrl+G'
           + ' tool=' + toolType
           + ' tab=' + String(tabId).slice(-12)
@@ -208,6 +216,55 @@ async function runAgentPromptScenario({
     }
   }
 
+  const refreshClaudeExactEmptyEvidence = toolType === 'claude' && canInspectDraft
+    ? async () => {
+        const visual = runtime.probeDraft
+          ? await runtime.probeDraft(
+              tabId,
+              'agent-send-post-settings-proof:' + (source || 'unknown'),
+            )
+          : runtime.inspectDraft!(tabId);
+        assertSendNotCancelled();
+        let draftDecision = classifyAgentDraftPreflight(visual);
+        if (
+          draftDecision.decision === 'conflict'
+          || (draftDecision.decision === 'unknown' && visual.exactCaptureRecommended === true)
+        ) {
+          const captured = await runtime.copyDraft(tabId, {
+            draftProof: buildExactDraftCaptureProof(visual),
+          });
+          assertSendNotCancelled();
+          const conflict = resolveAgentDraftConflict(visual, captured, {
+            attemptedCapture: true,
+          });
+          if (conflict.decision === 'clear') {
+            draftDecision = applyAgentDraftCaptureResolution(draftDecision, conflict);
+            return { success: true, evidence: captured };
+          }
+          if (String(conflict.draftText || '').trim() || Number(conflict.draftImages || 0) > 0) {
+            return {
+              success: false,
+              code: 'terminal_draft_conflict',
+              error: 'Terminal has an unsent draft after Claude settings changed',
+            };
+          }
+          return {
+            success: false,
+            code: 'terminal_draft_state_unknown',
+            error: conflict.error || conflict.reason || 'Claude composer state is unknown after settings changed',
+          };
+        }
+        if (draftDecision.decision === 'unknown') {
+          return {
+            success: false,
+            code: 'terminal_draft_state_unknown',
+            error: 'Claude composer state is unknown after settings changed',
+          };
+        }
+        return { success: true, evidence: null };
+      }
+    : undefined;
+
   assertSendNotCancelled();
   const result = await runtime.sendPrompt(tabId, prompt, {
     handoffId: typeof handoffId === 'string' ? handoffId : undefined,
@@ -217,6 +274,8 @@ async function runAgentPromptScenario({
     model: typeof model === 'string' ? model : undefined,
     effort: typeof effort === 'string' ? effort : undefined,
     thinking: typeof thinking === 'string' ? thinking : undefined,
+    claudeExactEmptyEvidence: exactEmptyEvidenceForSend,
+    refreshClaudeExactEmptyEvidence,
     presentationSnapshot,
   });
   return {
@@ -911,6 +970,9 @@ export async function rewindAgentTimelineScenario({
     ? startUuid.trim()
     : 'timeline-index:' + String(normalizedTargetIndex);
   const normalizedTargetText = String(targetFullText || targetText || '').trim();
+  const targetMenuText = toolType === 'claude'
+    ? buildClaudeRewindPromptProjection(normalizedTargetText).menuText
+    : String(targetText || normalizedTargetText).trim();
   const opId = 'scenario-' + Date.now().toString(36)
     + '-' + normalizedTargetUuid.slice(0, 8)
     + '-' + Math.random().toString(36).slice(2, 8);
@@ -1108,7 +1170,8 @@ export async function rewindAgentTimelineScenario({
       tabId,
       opId,
       targetIndex,
-      targetText,
+      targetText: targetMenuText,
+      targetMenuText,
       targetFullText,
       targetUuid: runtimeTargetUuid,
       writerSessionId: preparedCodex?.writerSessionId || null,

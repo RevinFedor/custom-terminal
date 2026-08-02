@@ -117,4 +117,19 @@ test('Codex prompt sidecars clone to exact child UUIDs idempotently and conflict
     manager.getHistoryPromptPresentations('codex', 'conflicting-child')[0].chips[0].label,
     'Different',
   );
+
+  const referencedAssetId = 'b'.repeat(64) + '.png';
+  manager.saveHistoryPromptPresentation({
+    toolType: 'codex',
+    sessionId: 'image-history',
+    auditTimestamp: '2026-08-02T12:00:00.000Z',
+    transportHash: promptTransportHash('[Image #1]'),
+    schemaVersion: 3,
+    chips: [
+      { kind: 'image-ref', id: 1, assetId: referencedAssetId },
+      { kind: 'image-ref', id: 2, path: `/tmp/${referencedAssetId}` },
+      { kind: 'image-ref', id: 3, assetId: '../../not-an-asset' },
+    ],
+  });
+  assert.deepEqual(manager.getHistoryPromptPresentationAssetIds(), [referencedAssetId]);
 });

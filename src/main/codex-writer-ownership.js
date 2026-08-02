@@ -1119,6 +1119,69 @@ function resolveCodexRewindCompletionProof({
   };
 }
 
+/**
+ * Validate the live scope around an already durable native-Rewind commit.
+ * The database receipt owns operation/source/child identity; this layer only
+ * prevents a late callback from crossing a PTY/run boundary or a newer writer.
+ * Missing transient watcher/intent state is intentionally not an input.
+ */
+function classifyCodexRewindCommitReceiptRuntime({
+  receipt = null,
+  expectedTerminalToken = null,
+  currentTerminalToken = null,
+  expectedLifecycleGeneration = null,
+  currentLifecycleGeneration = null,
+  expectedRunSeq = null,
+  currentRunSeq = null,
+  pendingActionGeneration = null,
+  knownSessionId = null,
+  liveProof = null,
+} = {}) {
+  if (!receipt?.receiptId
+    || !receipt?.sourceSessionId
+    || !receipt?.childSessionId
+    || !receipt?.actionGeneration) {
+    return { accepted: false, reason: 'commit-receipt-missing' };
+  }
+  if (!expectedTerminalToken
+    || currentTerminalToken !== expectedTerminalToken
+    || !expectedLifecycleGeneration
+    || currentLifecycleGeneration !== expectedLifecycleGeneration
+    || !Number.isInteger(Number(expectedRunSeq))
+    || Number(expectedRunSeq) <= 0
+    || Number(currentRunSeq) !== Number(expectedRunSeq)) {
+    return { accepted: false, reason: 'commit-receipt-runtime-scope-changed' };
+  }
+  if (pendingActionGeneration
+    && pendingActionGeneration !== receipt.actionGeneration) {
+    return { accepted: false, reason: 'commit-receipt-superseded' };
+  }
+  if (knownSessionId && knownSessionId !== receipt.childSessionId) {
+    return { accepted: false, reason: 'commit-receipt-known-writer-changed' };
+  }
+  if (liveProof?.valid === true && (
+    liveProof.sessionId !== receipt.childSessionId
+    || (liveProof.sourceSessionId
+      && liveProof.sourceSessionId !== receipt.sourceSessionId)
+    || (liveProof.actionGeneration
+      && liveProof.actionGeneration !== receipt.actionGeneration)
+    || (liveProof.terminalToken
+      && liveProof.terminalToken !== currentTerminalToken)
+    || (liveProof.runSeq
+      && Number(liveProof.runSeq) !== Number(currentRunSeq))
+  )) {
+    return { accepted: false, reason: 'commit-receipt-live-writer-changed' };
+  }
+  return {
+    accepted: true,
+    reason: 'exact-committed-rewind-child',
+    sourceSessionId: receipt.sourceSessionId,
+    childSessionId: receipt.childSessionId,
+    actionGeneration: receipt.actionGeneration,
+    receiptId: receipt.receiptId,
+  };
+}
+
 function shouldCloseCodexRewindProtocolUi({
   protocolUiOpen = false,
   handoffMutationStarted = false,
@@ -1703,6 +1766,7 @@ module.exports = {
   isCommittedCodexNativeRewindReplay,
   classifyCodexWriterHandoffObserverAdoption,
   resolveCodexRewindCompletionProof,
+  classifyCodexRewindCommitReceiptRuntime,
   shouldCloseCodexRewindProtocolUi,
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,

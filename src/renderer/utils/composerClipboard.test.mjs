@@ -153,7 +153,7 @@ test('portable import preserves text, multiple images, and visible missing error
   ]);
   assert.equal(
     snapshot.text,
-    'before [Image #1] middle [imageError: portable_image_path_unavailable #2] after',
+    'before [Image #1] middle [imageError: portable_image_path_unavailable #2 path=/tmp/missing.png] after',
   );
   assert.deepEqual(snapshot.imagePaths.map(({ id, path }) => ({ id, path })), [
     { id: 1, path: '/assets/a.png' },

@@ -15,6 +15,7 @@ import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { refreshGeneratedTabTitle, type RefreshTabTitleReason } from '../../utils/generateTabTitle';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { isNaturalAgentTurnEndReason } from '../../utils/agentCompletionOutcome.mjs';
+import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 // Removed: framer-motion import - was causing lag on project switch
@@ -754,11 +755,7 @@ const isAiRuntimeTab = (tab?: { commandType?: string; tabType?: string } | null)
   return !!tab && (tab.tabType === 'claude-sdk' || AI_COMMAND_TYPES.has(tab.commandType || ''));
 };
 
-const isAiForegroundProcess = (info?: { hasProcess?: boolean; processName?: string; command?: string } | null): boolean => {
-  if (!info?.hasProcess) return false;
-  const text = `${info.processName || ''} ${info.command || ''}`.toLowerCase();
-  return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
-};
+// Shared predicate — see utils/aiForegroundProcess.mjs.
 
 
 // Drop Indicator Line - absolute overlay (doesn't affect layout)

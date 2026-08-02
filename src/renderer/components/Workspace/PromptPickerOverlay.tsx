@@ -5,12 +5,14 @@ import { useUIStore } from '../../store/useUIStore';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
+  buildPromptReferenceText,
   captureHistoryMenuAnchor,
   chooseContextMenuOpenLeft,
   clampFloatingPanelTop,
   isCurrentPickerGeneration,
   joinPromptInsertionText,
   placePointAnchoredMenu,
+  promptHasFileReferences,
   resolveHistoryScriptCwd,
 } from '../../utils/promptInsertMenuModel.mjs';
 
@@ -41,10 +43,14 @@ interface ScriptRow {
   text: string;
 }
 
+// `agent` only picks the reference syntax for Cmd-insertion: Claude resolves
+// `@"path"` natively, everything else reads a bare absolute path.
+type InsertAgent = 'claude' | 'other';
+
 type InsertTarget =
-  | { surface: 'history'; tabId: string }
-  | { surface: 'sdk'; tabId: string }
-  | { surface: 'terminal'; tabId: string };
+  | { surface: 'history'; tabId: string; agent: InsertAgent }
+  | { surface: 'sdk'; tabId: string; agent: InsertAgent }
+  | { surface: 'terminal'; tabId: string; agent: InsertAgent };
 
 type HistoryMenuAnchor =
   { mode: 'point'; x: number; y: number };
@@ -63,7 +69,17 @@ interface HistoryInsertMenuRequest {
   x: number;
   y: number;
   anchor: HistoryMenuAnchor;
+  agent: InsertAgent;
   requestId: number;
+}
+
+function resolveTabAgent(tabId: string): InsertAgent {
+  for (const [, ws] of useWorkspaceStore.getState().openProjects) {
+    const tab = ws.tabs.get(tabId);
+    if (!tab) continue;
+    return (tab.tabType === 'claude-sdk' || tab.commandType === 'claude') ? 'claude' : 'other';
+  }
+  return 'other';
 }
 
 function isVisibleElement(element: Element | null): element is HTMLElement {
@@ -178,37 +194,48 @@ function dispatchHistoryComposerInsert(
 // One delivery contract for the shortcut picker and History's context picker.
 // Context-menu requests pass a captured target; normal Opt+V captures its
 // effective target when the picker opens. Selection never re-reads active tab.
-async function deliverPrompt(prompt: PromptRow, target: InsertTarget) {
+// `asReference` (Cmd-pick) sends the file as a path the agent resolves itself
+// instead of inlining its contents. The two modes intentionally differ in what
+// the agent reads: inlined content is sanitised on the way out (@include
+// expanded, @ai blocks stripped), a reference is whatever is on disk.
+async function deliverPrompt(prompt: PromptRow, target: InsertTarget, asReference = false) {
   const text = prompt.content || '';
   if (!text && (!prompt.file_paths || prompt.file_paths.length === 0)) return;
+  const useReference = asReference && promptHasFileReferences(prompt);
+  const sourceKey = 'prompt:' + String(prompt.id ?? prompt.title)
+    + (useReference ? ':ref' : '');
 
-  if (target.surface === 'history') {
-    const fileContents = await readPromptFileContents(prompt.file_paths);
-    const sourceKey = 'prompt:' + String(prompt.id ?? prompt.title);
-    dispatchHistoryComposerInsert(
-      target.tabId,
-      joinPromptInsertionText(text, fileContents),
-      'prompt-picker',
-      { label: prompt.title, sourceKey },
-    );
+  if (target.surface === 'history' || target.surface === 'sdk') {
+    const chipText = useReference
+      ? buildPromptReferenceText(text, prompt.file_paths, target.agent)
+      : joinPromptInsertionText(text, await readPromptFileContents(prompt.file_paths));
+    if (!chipText) return;
+    const label = useReference ? `${prompt.title} ↗` : prompt.title;
+    if (target.surface === 'history') {
+      dispatchHistoryComposerInsert(target.tabId, chipText, 'prompt-picker', { label, sourceKey });
+      return;
+    }
+    window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
+      detail: {
+        tabId: target.tabId,
+        text: chipText,
+        source: 'prompt-picker',
+        kind: 'prompt',
+        label,
+        sourceKey,
+      },
+    }));
     return;
   }
 
-  if (target.surface === 'sdk') {
-    const fileContents = await readPromptFileContents(prompt.file_paths);
-    const chipText = joinPromptInsertionText(text, fileContents);
-    if (chipText) {
-      window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
-        detail: {
-          tabId: target.tabId,
-          text: chipText,
-          source: 'prompt-picker',
-          kind: 'prompt',
-          label: prompt.title,
-          sourceKey: 'prompt:' + String(prompt.id ?? prompt.title),
-        },
-      }));
-    }
+  if (useReference) {
+    // One paste, not typed input: a typed `@` opens Claude's file typeahead
+    // character by character and the ref would end up inside its filter.
+    await ipcRenderer.invoke('terminal:paste', {
+      tabId: target.tabId,
+      content: buildPromptReferenceText(text, prompt.file_paths, target.agent),
+      submit: false,
+    });
     return;
   }
 
@@ -349,6 +376,27 @@ const PromptPickerOverlay: React.FC = () => {
   const [selectedScriptIdx, setSelectedScriptIdx] = useState(0);
   const [contextGeometryRevision, setContextGeometryRevision] = useState(0);
 
+  // Cmd is the reference-insert modifier. Rows must react while the pointer
+  // sits still — hover events don't fire again when the user presses or
+  // releases Cmd — so this is derived from key state, not from mouse movement.
+  // The blur reset is required: Cmd+Tab away and back would otherwise leave
+  // the picker convinced Cmd is still held.
+  const [cmdHeld, setCmdHeld] = useState(false);
+  useEffect(() => {
+    if (!open) { setCmdHeld(false); return; }
+    const sync = (event: KeyboardEvent) => setCmdHeld(event.metaKey);
+    const clear = () => setCmdHeld(false);
+    window.addEventListener('keydown', sync, true);
+    window.addEventListener('keyup', sync, true);
+    window.addEventListener('blur', clear);
+    return () => {
+      window.removeEventListener('keydown', sync, true);
+      window.removeEventListener('keyup', sync, true);
+      window.removeEventListener('blur', clear);
+      setCmdHeld(false);
+    };
+  }, [open]);
+
   // Keyboard events carry no pointer coordinates. Keep the latest real mouse
   // position in a ref, then snapshot it when Opt+V opens. The picker remains
   // stationary after opening; moving the pointer only affects the next open.
@@ -408,6 +456,7 @@ const PromptPickerOverlay: React.FC = () => {
         x: detail.x,
         y: detail.y,
         anchor: capturedAnchor,
+        agent: resolveTabAgent(detail.tabId),
         requestId,
       });
       setSelectedKey(null);
@@ -534,19 +583,23 @@ const PromptPickerOverlay: React.FC = () => {
     const state = useWorkspaceStore.getState();
     const effectiveId = state.getEffectiveTabId();
     if (!effectiveId) return null;
-    if (findVisibleHistoryComposer(effectiveId)) {
-      return { tabId: effectiveId, surface: 'history' };
-    }
+    let agent: InsertAgent = 'other';
+    let tabType: string | undefined;
     for (const [, ws] of state.openProjects) {
       const tab = ws.tabs.get(effectiveId);
-      if (tab) {
-        return {
-          tabId: effectiveId,
-          surface: tab.tabType === 'claude-sdk' ? 'sdk' : 'terminal',
-        };
-      }
+      if (!tab) continue;
+      tabType = tab.tabType;
+      if (tab.tabType === 'claude-sdk' || tab.commandType === 'claude') agent = 'claude';
+      break;
     }
-    return { tabId: effectiveId, surface: 'terminal' };
+    if (findVisibleHistoryComposer(effectiveId)) {
+      return { tabId: effectiveId, surface: 'history', agent };
+    }
+    return {
+      tabId: effectiveId,
+      surface: tabType === 'claude-sdk' ? 'sdk' : 'terminal',
+      agent,
+    };
   }, []);
 
   // Capture Opt+V target once per opening. Context mode already captured its
@@ -593,7 +646,7 @@ const PromptPickerOverlay: React.FC = () => {
     const closeSequence = ++requestSeqRef.current;
     activePickerGenerationRef.current = 0;
     const target: InsertTarget | null = contextRequest
-      ? { surface: 'history', tabId: contextRequest.tabId }
+      ? { surface: 'history', tabId: contextRequest.tabId, agent: contextRequest.agent }
       : shortcutTarget;
     if (contextRequest) setContextRequest(null);
     else setOpen(false);
@@ -650,17 +703,17 @@ const PromptPickerOverlay: React.FC = () => {
     }
   }, [selectedLeftItem, pickerLevel]);
 
-  const handleSelectPrompt = useCallback(async (prompt: PromptRow) => {
+  const handleSelectPrompt = useCallback(async (prompt: PromptRow, asReference = false) => {
     const generation = contextRequest?.requestId || activePickerGenerationRef.current;
     const target: InsertTarget | null = contextRequest
-      ? { surface: 'history', tabId: contextRequest.tabId }
+      ? { surface: 'history', tabId: contextRequest.tabId, agent: contextRequest.agent }
       : shortcutTarget;
     if (!target) {
       showToast('No active tab', 'error');
       closePicker();
       return;
     }
-    await deliverPrompt(prompt, target);
+    await deliverPrompt(prompt, target, asReference);
     closePicker(generation);
   }, [closePicker, contextRequest, shortcutTarget, showToast]);
 
@@ -681,6 +734,10 @@ const PromptPickerOverlay: React.FC = () => {
       const navKey = k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft'
         || k === 'ArrowRight' || k === 'Enter' || k === 'Escape';
       if (!navKey) return;
+      // Cmd+Enter inserts the file as a reference. Read the modifier off this
+      // very event: the keydown that carries Cmd arrives before any state
+      // update from the tracker above could land.
+      const wantsReference = k === 'Enter' && e.metaKey;
 
       e.preventDefault();
       e.stopPropagation();
@@ -772,7 +829,7 @@ const PromptPickerOverlay: React.FC = () => {
         }
         if (k === 'Enter') {
           if (selectedLeftItem?.kind === 'prompt') {
-            void handleSelectPrompt(selectedLeftItem.prompt);
+            void handleSelectPrompt(selectedLeftItem.prompt, wantsReference);
           } else if (selectedLeftItem?.kind === 'group' && rightPrompts.length > 0) {
             setPickerLevel('prompt');
             setSelectedPromptIdx(0);
@@ -793,7 +850,7 @@ const PromptPickerOverlay: React.FC = () => {
         if (k === 'ArrowLeft') { setPickerLevel('group'); return; }
         if (k === 'Enter' || k === 'ArrowRight') {
           const p = rightPrompts[selectedPromptIdx];
-          if (p) void handleSelectPrompt(p);
+          if (p) void handleSelectPrompt(p, wantsReference);
           return;
         }
       }
@@ -1121,12 +1178,20 @@ const PromptPickerOverlay: React.FC = () => {
     ? { maxHeight: Math.max(1, Math.min(MAX_H, pos.pointAvailableHeight)) }
     : {};
 
-  const rowStyle = (selected: boolean, dimSelected = false): React.CSSProperties => ({
+  const rowStyle = (
+    selected: boolean,
+    dimSelected = false,
+    referenceArmed = false,
+  ): React.CSSProperties => ({
     padding: `${ROW_PAD_Y}px ${ROW_PAD_X}px`,
     borderRadius: 4,
     cursor: 'pointer',
     color: selected || dimSelected ? '#fff' : '#ddd',
-    background: selected ? '#9333ea' : dimSelected ? '#3a1f4a' : 'transparent',
+    background: selected
+      // Cmd over a row with files: a distinct colour, because the same click
+      // now inserts something else than it did a moment ago.
+      ? (referenceArmed ? '#0e7490' : '#9333ea')
+      : dimSelected ? '#3a1f4a' : 'transparent',
     fontSize,
     lineHeight: 1.3,
     whiteSpace: 'nowrap',
@@ -1137,6 +1202,35 @@ const PromptPickerOverlay: React.FC = () => {
     alignItems: 'center',
     justifyContent: 'space-between',
   });
+
+  // The slot is always rendered for prompts that carry files, so pressing Cmd
+  // only changes the icon's opacity — never the width available to the title.
+  // A slot that appears and disappears would re-truncate every name mid-gesture.
+  const referenceIconSlotStyle: React.CSSProperties = {
+    flexShrink: 0,
+    marginLeft: 6,
+    width: Math.round(fontSize * 1.05),
+    textAlign: 'center',
+    lineHeight: 1,
+    transition: 'opacity 90ms ease-out',
+  };
+  const renderReferenceIcon = (prompt: PromptRow) => {
+    if (!promptHasFileReferences(prompt)) return null;
+    return (
+      <span
+        aria-hidden
+        data-prompt-reference-icon={cmdHeld ? 'armed' : 'idle'}
+        style={{
+          ...referenceIconSlotStyle,
+          opacity: cmdHeld ? 1 : 0.42,
+          color: cmdHeld ? '#67e8f9' : '#8b8b8b',
+          fontSize: Math.round(fontSize * 0.95),
+        }}
+      >
+        🔗
+      </span>
+    );
+  };
 
   const placeholderStyle: React.CSSProperties = {
     padding: `${ROW_PAD_Y}px ${ROW_PAD_X}px`,
@@ -1296,12 +1390,17 @@ const PromptPickerOverlay: React.FC = () => {
                   setPickerLevel('group');
                   setSelectedPromptIdx(0);
                 }}
-                onClick={() => { void handleSelectPrompt(item.prompt); }}
-                style={rowStyle(isSelected)}
+                onClick={(event) => { void handleSelectPrompt(item.prompt, event.metaKey); }}
+                style={rowStyle(
+                  isSelected,
+                  false,
+                  isSelected && cmdHeld && promptHasFileReferences(item.prompt),
+                )}
               >
                 <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                   {item.prompt.title}
                 </span>
+                {renderReferenceIcon(item.prompt)}
               </div>
             );
           })}
@@ -1355,12 +1454,13 @@ const PromptPickerOverlay: React.FC = () => {
                     setPickerLevel('prompt');
                     setSelectedPromptIdx(i);
                   }}
-                  onClick={() => { void handleSelectPrompt(p); }}
-                  style={rowStyle(isSelected)}
+                  onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
+                  style={rowStyle(isSelected, false, isSelected && cmdHeld && promptHasFileReferences(p))}
                 >
                   <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {p.title}
                   </span>
+                  {renderReferenceIcon(p)}
                 </div>
               );
             })}
@@ -1386,12 +1486,13 @@ const PromptPickerOverlay: React.FC = () => {
                       setPickerLevel('prompt');
                       setSelectedPromptIdx(i);
                     }}
-                    onClick={() => { void handleSelectPrompt(p); }}
-                    style={rowStyle(isSelected)}
+                    onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
+                    style={rowStyle(isSelected, false, isSelected && cmdHeld && promptHasFileReferences(p))}
                   >
                     <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {p.title}
                     </span>
+                    {renderReferenceIcon(p)}
                   </div>
                 );
               })}

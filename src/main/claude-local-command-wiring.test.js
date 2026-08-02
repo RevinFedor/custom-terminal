@@ -40,6 +40,25 @@ test('Claude send-command wires /compact observer after the PTY submit boundary'
   );
 });
 
+test('Claude Run after degrades unavailable image paths instead of refusing the send', () => {
+  const body = functionBody(
+    'sendClaudeCommandUnclaimed',
+    "ipcMain.handle('claude:send-command'",
+  );
+  const validation = body.indexOf('validatePromptQueueImageMarkers(command)');
+  const replacement = body.indexOf('replaceUnavailableImagePathMarkers(', validation);
+  const lifecycle = body.indexOf('submitWithClaudeLocalCommandLifecycle({', replacement);
+
+  assert.ok(validation >= 0, 'Claude queue send must validate portable image paths');
+  assert.ok(replacement > validation, 'known missing paths must become explicit imageError text');
+  assert.ok(lifecycle > replacement, 'the degraded command must continue to the physical submit');
+  assert.doesNotMatch(
+    body.slice(validation, lifecycle),
+    /error:\s*'queue_image_path_unavailable'/,
+    'known missing bytes must not cancel a user-confirmed Claude send',
+  );
+});
+
 test('safe paste returns explicit physical-submit proof to its caller', () => {
   const start = mainSource.indexOf('async function _safePasteAndSubmitInner(');
   const end = mainSource.indexOf('\n// Send input to terminal', start);

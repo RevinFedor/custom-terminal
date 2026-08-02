@@ -82,3 +82,32 @@ test('export filters by time, merges rotated logs, and keeps the newest bounded 
 
   await fs.promises.rm(dir, { recursive: true, force: true });
 });
+
+test('export writes the free-form problem description first and removes secrets from it', async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'noted-diagnostic-report-test-'));
+  const logPath = path.join(dir, 'dev.log');
+  const outputPath = path.join(dir, 'diagnostics.txt');
+
+  await fs.promises.writeFile(
+    logPath,
+    '10:00:01.000 date=2026-07-22 seq=1 boot=a [Current] tabId=tab-42 ready=true',
+  );
+
+  await exportDiagnosticLog({
+    sourcePaths: [logPath],
+    destinationPath: outputPath,
+    fromMs: Date.parse('2026-07-22T10:00:00.000Z'),
+    toMs: Date.parse('2026-07-22T10:00:02.000Z'),
+    problemDescription: 'Около 13:00 вкладка tab-42 не восстановилась. token=super-secret-token',
+    appVersion: 'test',
+    environment: 'development',
+  });
+
+  const output = await fs.promises.readFile(outputPath, 'utf8');
+  assert.match(output, /--- USER REPORT ---\nОколо 13:00 вкладка tab-42 не восстановилась\./);
+  assert.doesNotMatch(output, /super-secret-token/);
+  assert.match(output, /token=<redacted>/);
+  assert.ok(output.indexOf('--- USER REPORT ---') < output.indexOf('--- LOG ---'));
+
+  await fs.promises.rm(dir, { recursive: true, force: true });
+});

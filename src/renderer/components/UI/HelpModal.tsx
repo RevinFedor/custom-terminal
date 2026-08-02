@@ -86,6 +86,7 @@ const COMPLEX_HELP_TOPICS = [
 
 function DiagnosticExportDialog({ onClose }: { onClose: () => void }) {
   const [rangeMinutes, setRangeMinutes] = useState(60);
+  const [problemDescription, setProblemDescription] = useState('');
   const [includeMessageText, setIncludeMessageText] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [result, setResult] = useState<DiagnosticExportResult | null>(null);
@@ -107,6 +108,7 @@ function DiagnosticExportDialog({ onClose }: { onClose: () => void }) {
     try {
       const response = await ipcRenderer.invoke('diagnostics:export-log', {
         rangeMinutes,
+        problemDescription,
         includeMessageText,
       });
       if (!response?.cancelled) setResult(response);
@@ -168,7 +170,7 @@ function DiagnosticExportDialog({ onClose }: { onClose: () => void }) {
               Создать TXT с логами
             </h2>
             <div style={{ color: COLORS.muted, fontSize: 11.5, lineHeight: 1.5, marginTop: 5 }}>
-              Выберите период, в котором возникла ошибка.
+              Описание добавится в начало файла вместе с техническими логами.
             </div>
           </div>
           <button
@@ -194,7 +196,39 @@ function DiagnosticExportDialog({ onClose }: { onClose: () => void }) {
         </div>
 
         <div style={{ padding: 20 }}>
-          <div style={{ color: COLORS.dim, fontSize: 10.5, fontWeight: 650, textTransform: 'uppercase', marginBottom: 8 }}>
+          <label style={{ display: 'block' }}>
+            <span style={{ display: 'block', color: COLORS.text, fontSize: 12.5, fontWeight: 600 }}>
+              Описание проблемы
+            </span>
+            <textarea
+              value={problemDescription}
+              onChange={(event) => setProblemDescription(event.target.value)}
+              placeholder="Что произошло?"
+              maxLength={8000}
+              autoFocus
+              style={{
+                width: '100%',
+                minHeight: 92,
+                marginTop: 8,
+                padding: '9px 10px',
+                boxSizing: 'border-box',
+                resize: 'vertical',
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 7,
+                outline: 'none',
+                background: COLORS.surface,
+                color: COLORS.text,
+                font: 'inherit',
+                fontSize: 12,
+                lineHeight: 1.5,
+              }}
+            />
+            <span style={{ display: 'block', color: COLORS.muted, fontSize: 11.5, lineHeight: 1.5, marginTop: 5 }}>
+              Желательно указать примерное время ошибки и ID вкладки. ID копируется через ПКМ по вкладке → «Копировать ID».
+            </span>
+          </label>
+
+          <div style={{ color: COLORS.dim, fontSize: 10.5, fontWeight: 650, textTransform: 'uppercase', marginTop: 18, marginBottom: 8 }}>
             Период
           </div>
           <div role="radiogroup" aria-label="Период логов" style={{

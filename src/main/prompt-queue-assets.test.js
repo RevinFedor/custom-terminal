@@ -6,6 +6,7 @@ const path = require('node:path');
 
 const {
   PromptQueueAssetStore,
+  collectComposerDraftAssetIds,
   collectReferencedAssetIds,
 } = require('./prompt-queue-assets');
 
@@ -109,4 +110,21 @@ test('queue snapshot reference collector reads nested item assets', () => {
     },
   });
   assert.deepEqual([...ids], ['a'.repeat(64) + '.png']);
+});
+
+test('History composer draft reference collector protects persisted image assets', () => {
+  const available = 'b'.repeat(64) + '.png';
+  const fallbackPath = '/tmp/prompt-queue-assets/' + 'c'.repeat(64) + '.webp';
+  const ids = collectComposerDraftAssetIds(JSON.stringify({
+    'tab-a': {
+      text: '[Image #1] [Image #2]',
+      images: [
+        { id: 1, assetId: available, path: '/old/path.png' },
+        { id: 2, path: fallbackPath },
+      ],
+      chips: [],
+      updatedAt: 10,
+    },
+  }));
+  assert.deepEqual([...ids], [available, 'c'.repeat(64) + '.webp']);
 });

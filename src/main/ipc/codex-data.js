@@ -20,12 +20,16 @@ const {
 const {
   getCodexProcessActionGeneration,
 } = require('../codex-process-action-ownership');
+const { promptFingerprint } = require('../claude-prompt-carriers');
+const {
+  CodexAccountProfileManager,
+  DEFAULT_PROFILE_ID,
+} = require('../codex-account-profiles');
 const { execFile } = require('child_process');
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
 const CODEX_LOGS_DB = path.join(CODEX_HOME, 'logs_2.sqlite');
-const CODEX_AUTH_JSON = path.join(CODEX_HOME, 'auth.json');
 const CODEX_USAGE_API_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const CODEX_RESET_CREDITS_API_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -70,6 +74,8 @@ let usageAccountsLastError = null;
 let usageAccountsLastErrorAt = 0;
 let codexUsageStateStore = null;
 let codexUsageStateHydrated = false;
+let codexAccountProfileManager = null;
+let codexAccountProfileCleanupBound = false;
 const codexRemoteUsageByAccount = new Map();
 const codexRemoteUsageInflight = new Map();
 const codexActiveUsageOverrides = new Map();
@@ -4176,6 +4182,181 @@ function collectCodexTurnAssistantBlocks(records, sessionId, entryUuid) {
   return { success: true, target, assistantBlocks };
 }
 
+function codexProviderTurnId(record) {
+  const value = record?.payload?.turn_id ?? record?.turn_id;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function buildCodexProviderTurnAssistantResult(
+  records,
+  sessionId,
+  proof = {},
+  maxChars = 100000,
+) {
+  const executionContext = proof?.targetExecutionContext;
+  const expectedTurnId = typeof executionContext?.turnId === 'string'
+    ? executionContext.turnId.trim()
+    : '';
+  const expectedSessionId = typeof executionContext?.sessionId === 'string'
+    ? executionContext.sessionId.trim()
+    : '';
+  const hasExpectedGeneration = executionContext?.generation != null
+    && Number.isFinite(Number(executionContext.generation));
+  const expectedGeneration = hasExpectedGeneration ? Number(executionContext.generation) : null;
+  if (executionContext?.provider !== 'codex') {
+    return { success: false, error: 'Codex provider turn proof has a provider mismatch' };
+  }
+  if (!expectedSessionId || expectedSessionId !== sessionId) {
+    return { success: false, error: 'Codex provider turn proof has a session mismatch' };
+  }
+  if (!expectedTurnId || !hasExpectedGeneration) {
+    return { success: false, error: 'Codex provider turn identity is incomplete' };
+  }
+
+  const rows = Array.isArray(records) ? records : [];
+  const starts = [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const record = rows[index];
+    if (record?.type === 'event_msg'
+      && record?.payload?.type === 'task_started'
+      && codexProviderTurnId(record) === expectedTurnId) {
+      starts.push(index);
+    }
+  }
+  if (starts.length !== 1) {
+    return {
+      success: false,
+      error: starts.length === 0
+        ? 'matching Codex task_started not found'
+        : 'matching Codex task_started is ambiguous',
+      proofMode: 'provider-turn-id',
+      providerTurnId: expectedTurnId,
+    };
+  }
+
+  const startIndex = starts[0];
+  let boundaryIndex = rows.length;
+  let boundaryReason = 'transcript-end';
+  let terminalIndex = -1;
+  let terminalEvent = null;
+  for (let index = startIndex + 1; index < rows.length; index += 1) {
+    const record = rows[index];
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg') continue;
+    if (payload.type === 'task_started') {
+      boundaryIndex = index;
+      boundaryReason = codexProviderTurnId(record) === expectedTurnId
+        ? 'duplicate-task-started'
+        : 'next-task-started';
+      break;
+    }
+    if (payload.type !== 'task_complete' && payload.type !== 'turn_aborted') continue;
+    const terminalTurnId = codexProviderTurnId(record);
+    if (terminalTurnId === expectedTurnId) {
+      terminalIndex = index;
+      terminalEvent = payload.type;
+      boundaryIndex = index;
+      boundaryReason = payload.type;
+      break;
+    }
+    boundaryIndex = index;
+    boundaryReason = terminalTurnId ? 'mismatched-terminal-turn' : 'terminal-turn-id-missing';
+    break;
+  }
+
+  const lowerBound = Number(proof?.resultAfterAt) > 0
+    ? Number(proof.resultAfterAt)
+    : (Number(proof?.requestedAt) > 0 ? Number(proof.requestedAt) - 5 * 60 * 1000 : 0);
+  const upperBound = Number(proof?.resultBeforeAt) > 0 ? Number(proof.resultBeforeAt) : 0;
+  const exactUuid = typeof proof?.promptUserUuid === 'string' && proof.promptUserUuid.trim()
+    ? proof.promptUserUuid.trim()
+    : null;
+  const expectedPromptHash = typeof proof?.promptHash === 'string' && proof.promptHash.trim()
+    ? proof.promptHash.trim()
+    : null;
+  if (!exactUuid && !expectedPromptHash) {
+    return {
+      success: false,
+      error: 'Codex provider turn proof requires an exact prompt UUID or hash',
+      proofMode: 'provider-turn-id',
+      providerTurnId: expectedTurnId,
+    };
+  }
+
+  const promptCandidates = [];
+  for (let index = startIndex + 1; index < boundaryIndex; index += 1) {
+    const record = rows[index];
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg'
+      || payload.type !== 'user_message'
+      || isCodexSubagentNotification(payload)) continue;
+    const userUuid = stableUuid(sessionId, record.__line, 'codex-user');
+    if (exactUuid) {
+      if (userUuid === exactUuid) promptCandidates.push({ index, record, userUuid });
+      continue;
+    }
+    const timestampMs = Date.parse(recordTimestamp(record) || '');
+    if ((lowerBound || upperBound) && !Number.isFinite(timestampMs)) continue;
+    if (lowerBound && timestampMs < lowerBound) continue;
+    if (upperBound && timestampMs > upperBound) continue;
+    const text = payload.message || extractTextContent(payload.content) || '';
+    if (promptFingerprint(text) === expectedPromptHash) {
+      promptCandidates.push({ index, record, userUuid });
+    }
+  }
+  if (promptCandidates.length !== 1) {
+    return {
+      success: false,
+      error: promptCandidates.length === 0
+        ? 'matching prompt is outside the exact Codex provider turn'
+        : 'matching prompt is ambiguous inside the exact Codex provider turn',
+      proofMode: 'provider-turn-id',
+      providerTurnId: expectedTurnId,
+      boundaryReason,
+    };
+  }
+
+  const prompt = promptCandidates[0];
+  const assistantBlocks = [];
+  for (let index = prompt.index + 1; index < boundaryIndex; index += 1) {
+    const payload = rows[index]?.payload || {};
+    if (rows[index]?.type !== 'response_item'
+      || payload.type !== 'message'
+      || payload.role !== 'assistant') continue;
+    const text = extractTextContent(payload.content).trim();
+    if (text) assistantBlocks.push(text);
+  }
+  const projected = projectCodexAssistantContext(assistantBlocks, maxChars, 250000);
+  if (!projected.assistantText) {
+    return {
+      success: false,
+      error: 'No assistant response found inside the exact Codex provider turn',
+      proofMode: 'provider-turn-id',
+      providerTurnId: expectedTurnId,
+      userUuid: prompt.userUuid,
+      boundaryReason,
+    };
+  }
+  const target = buildCodexTimeline(rows, sessionId)
+    .find((entry) => entry.uuid === prompt.userUuid && typeof entry.turnIndex === 'number');
+  return {
+    success: true,
+    complete: terminalIndex >= 0,
+    assistantText: projected.assistantText,
+    assistantChars: projected.assistantChars,
+    truncated: projected.truncated,
+    assistantMessageCount: assistantBlocks.length,
+    assistantBlockCount: assistantBlocks.length,
+    turnIndex: target?.turnIndex ?? null,
+    userUuid: prompt.userUuid,
+    proofMode: 'provider-turn-id',
+    providerTurnId: expectedTurnId,
+    providerGeneration: expectedGeneration,
+    terminalEvent,
+    boundaryReason,
+  };
+}
+
 // Orchestration completion is one provider turn, even when Codex compacts its
 // context in the middle of that turn. The normal History projection exposes
 // the post-compact continuation as a synthetic row for navigation, while the
@@ -4237,7 +4418,9 @@ function normalizeCodexReset(value) {
 function normalizeCodexLimitBucket(bucket) {
   if (!bucket || typeof bucket !== 'object') return null;
   const used = parseCodexNumber(bucket.used_percent ?? bucket.utilization ?? bucket.usedPercent);
-  const windowMinutes = parseCodexNumber(bucket.window_minutes ?? bucket.windowMinutes);
+  const windowMinutes = parseCodexNumber(
+    bucket.window_minutes ?? bucket.windowMinutes ?? bucket.windowDurationMins
+  );
   return {
     utilization: used != null && used >= 0 && used <= 100 ? used : null,
     resets_at: normalizeCodexReset(bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt),
@@ -4272,6 +4455,91 @@ function buildCodexUsageFromRateLimits(rateLimits, timestamp = null, filePath = 
     rate_limit_reached_type: rateLimits.rate_limit_reached_type || null,
     timestamp,
     filePath,
+  };
+}
+
+function normalizeCodexAppServerCredits(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  return normalizeCodexCreditBalance({
+    has_credits: raw.hasCredits,
+    unlimited: raw.unlimited,
+    overage_limit_reached: raw.overageLimitReached ?? raw.spendControlReached,
+    balance: raw.balance,
+  });
+}
+
+function buildCodexResetCreditsFromAppServer(raw, receivedAtMs = Date.now()) {
+  if (!raw || typeof raw !== 'object') return null;
+  const availableCount = parseCodexNumber(raw.availableCount);
+  const credits = (Array.isArray(raw.credits) ? raw.credits : [])
+    .map((credit) => {
+      if (!credit || typeof credit !== 'object') return null;
+      if (credit.status && credit.status !== 'available') return null;
+      const expiresAt = normalizeCodexReset(credit.expiresAt);
+      if (!expiresAt || Date.parse(expiresAt) <= receivedAtMs) return null;
+      return {
+        title: typeof credit.title === 'string' && credit.title.trim()
+          ? credit.title.trim().slice(0, 80)
+          : 'Full reset',
+        expires_at: expiresAt,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => Date.parse(left.expires_at) - Date.parse(right.expires_at));
+  if (availableCount == null && credits.length === 0) return null;
+  return {
+    available_count: availableCount != null ? Math.max(0, Math.floor(availableCount)) : credits.length,
+    credits,
+    timestamp: new Date(receivedAtMs).toISOString(),
+  };
+}
+
+function buildCodexUsageFromAppServerRateLimits(payload, receivedAtMs = Date.now()) {
+  if (!payload || typeof payload !== 'object') return null;
+  const rows = Object.values(payload.rateLimitsByLimitId || {})
+    .filter((row) => row && typeof row === 'object');
+  const core = payload.rateLimits
+    || rows.find((row) => row.limitId === 'codex')
+    || rows[0]
+    || null;
+  if (!core) return null;
+
+  const mapRow = (row) => buildCodexUsageFromRateLimits({
+    primary: row?.primary || null,
+    secondary: row?.secondary || null,
+    limit_id: row?.limitId || null,
+    limit_name: row?.limitName || null,
+    plan_type: row?.planType || null,
+    credits: normalizeCodexAppServerCredits(row?.credits),
+    individual_limit: row?.individualLimit || null,
+    rate_limit_reached_type: row?.rateLimitReachedType || null,
+  }, new Date(receivedAtMs).toISOString(), null);
+
+  const usage = mapRow(core);
+  if (!usage) return null;
+  const coreLimitId = core.limitId || null;
+  const additional = rows
+    .filter((row) => !coreLimitId || row.limitId !== coreLimitId)
+    .map((row) => {
+      const rowUsage = mapRow(row);
+      if (!rowUsage?.five_hour && !rowUsage?.seven_day) return null;
+      return {
+        key: String(row.limitId || row.limitName || '').slice(0, 120),
+        label: String(row.limitName || 'Additional Codex limit').slice(0, 120),
+        five_hour: rowUsage.five_hour,
+        seven_day: rowUsage.seven_day,
+      };
+    })
+    .filter((row) => row?.key);
+
+  return {
+    usage: {
+      ...usage,
+      authoritative_windows: true,
+      additional_rate_limits_observed: rows.length > 0,
+      additional_rate_limits: additional,
+    },
+    resetCredits: buildCodexResetCreditsFromAppServer(payload.rateLimitResetCredits, receivedAtMs),
   };
 }
 
@@ -4564,9 +4832,10 @@ function compareCodexUsageFreshness(nextUsage, prevUsage) {
   );
 }
 
-function readCurrentCodexAuthSession() {
-  if (!fs.existsSync(CODEX_AUTH_JSON)) return null;
-  const raw = safeJsonParse(fs.readFileSync(CODEX_AUTH_JSON, 'utf8'), null);
+function readCodexAuthSession(codexHome = CODEX_HOME) {
+  const authPath = path.join(codexHome, 'auth.json');
+  if (!fs.existsSync(authPath)) return null;
+  const raw = safeJsonParse(fs.readFileSync(authPath, 'utf8'), null);
   const tokens = raw?.tokens || {};
   const accessToken = typeof tokens.access_token === 'string' ? tokens.access_token.trim() : '';
   const accessPayload = decodeBase64UrlJson(accessToken.split('.')[1]);
@@ -4594,6 +4863,10 @@ function readCurrentCodexAuthSession() {
       : null,
     refreshedAtMs: parseTimestampMs(raw?.last_refresh),
   };
+}
+
+function readCurrentCodexAuthSession() {
+  return readCodexAuthSession(CODEX_HOME);
 }
 
 function closestCodexIdentity(rate, identities) {
@@ -4987,6 +5260,20 @@ function reconcileCodexUsageSnapshot(previousEntry, candidateResult, nowMs = Dat
       },
       status: 'obsolete',
       accepted: false,
+    };
+  }
+
+  if (candidateResult?.usageConsensusVerified === true) {
+    return {
+      entry: {
+        ...previousEntry,
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        pending: null,
+        warning: null,
+      },
+      status: 'verified',
+      accepted: true,
     };
   }
 
@@ -5387,7 +5674,13 @@ async function getCodexRemoteUsage({
       try {
         result = await fetchCodexUsageFromOpenAI(attemptAuth, { fetchImpl });
         const acceptedEntry = codexRemoteUsageByAccount.get(attemptAuth.accountKey);
-        if (verifyInitial && !acceptedEntry?.account?.usage) {
+        const acceptedUsage = acceptedEntry?.account?.usage || null;
+        const needsInitialVerification = verifyInitial && !acceptedUsage;
+        const needsManualBranchVerification = verifyInitial
+          && force
+          && acceptedUsage
+          && classifyCodexUsageSnapshot(acceptedUsage, result.account?.usage, Date.now()) === 'suspicious';
+        if (needsInitialVerification || needsManualBranchVerification) {
           const confirmations = await Promise.allSettled([
             fetchCodexUsageFromOpenAI(attemptAuth, {
               fetchImpl,
@@ -5405,9 +5698,17 @@ async function getCodexRemoteUsage({
               .map((confirmation) => confirmation.value),
           ]);
           if (!consensus) {
-            throw new CodexUsageFetchError('inconsistent_response', 'Initial OpenAI usage responses did not agree');
+            throw new CodexUsageFetchError(
+              'inconsistent_response',
+              needsInitialVerification
+                ? 'Initial OpenAI usage responses did not agree'
+                : 'Manual OpenAI usage verification did not agree'
+            );
           }
-          result = consensus;
+          result = {
+            ...consensus,
+            usageConsensusVerified: needsManualBranchVerification,
+          };
         }
         const resetCreditsResult = await resetCreditsRequest;
         result = {
@@ -5541,6 +5842,115 @@ function mergeCodexPreferredAccounts(accounts, preferredAccounts) {
     if (!!a.isCurrent !== !!b.isCurrent) return a.isCurrent ? -1 : 1;
     return codexAccountTimestampMs(b) - codexAccountTimestampMs(a);
   });
+}
+
+function decorateCodexProfileAccount(account, profile, overrides = {}) {
+  if (!account?.accountKey || !account?.usage || !profile) return null;
+  return {
+    ...account,
+    profileId: profile.profileId,
+    connected: profile.status === 'connected',
+    authStatus: profile.status,
+    isDefaultProfile: !!profile.isDefault,
+    ...overrides,
+  };
+}
+
+function codexProfileFallbackAccount(result, receivedAtMs = Date.now()) {
+  const profile = result?.profile;
+  if (!profile?.accountKey || profile.status !== 'connected') return null;
+  const mapped = buildCodexUsageFromAppServerRateLimits(result.rateLimits, receivedAtMs);
+  if (!mapped?.usage) return null;
+  return decorateCodexProfileAccount({
+    accountKey: profile.accountKey,
+    label: profile.label,
+    accountHint: profile.accountHint,
+    accountIdHint: null,
+    plan_type: mapped.usage.plan_type || profile.planType || null,
+    timestamp: mapped.usage.timestamp,
+    sourceThreadId: null,
+    source: 'codex-app-server',
+    usage: mapped.usage,
+    reset_credits: mapped.resetCredits,
+    stale: false,
+    lastError: null,
+  }, profile, { stale: false });
+}
+
+async function refreshCodexManagedProfileAccounts({ force = false } = {}) {
+  if (!codexAccountProfileManager) return { accounts: [], results: [] };
+  const initialResults = await codexAccountProfileManager.refreshManagedProfiles({ force });
+  const accounts = [];
+  const results = [];
+
+  for (let result of initialResults) {
+    let profile = result?.profile;
+    if (!profile || profile.isDefault) {
+      results.push(result);
+      continue;
+    }
+
+    let auth = readCodexAuthSession(profile.homePath);
+    if (profile.status !== 'connected' && !(auth?.accessToken && auth?.accountId && auth?.accountKey)) {
+      results.push(result);
+      continue;
+    }
+    let refreshedToken = false;
+    if (auth?.accessExpiresAtMs && auth.accessExpiresAtMs <= Date.now() + 30_000) {
+      result = await codexAccountProfileManager.probeProfile(profile, {
+        refreshToken: true,
+        includeRateLimits: true,
+      });
+      profile = result.profile;
+      auth = readCodexAuthSession(profile.homePath);
+      refreshedToken = true;
+    }
+
+    let remoteResult = null;
+    if (auth?.accessToken && auth?.accountId && auth?.accountKey) {
+      remoteResult = await getCodexRemoteUsage({
+        force,
+        verifyInitial: true,
+        authReader: () => readCodexAuthSession(profile.homePath),
+      });
+      if (!refreshedToken && remoteResult.error === 'Codex login expired. Sign in to Codex again.') {
+        result = await codexAccountProfileManager.probeProfile(profile, {
+          refreshToken: true,
+          includeRateLimits: true,
+        });
+        profile = result.profile;
+        auth = readCodexAuthSession(profile.homePath);
+        if (auth?.accessToken && auth?.accountId && auth?.accountKey) {
+          remoteResult = await getCodexRemoteUsage({
+            force: true,
+            verifyInitial: true,
+            authReader: () => readCodexAuthSession(profile.homePath),
+          });
+        }
+      }
+    }
+
+    const remoteAccount = auth?.accountKey
+      ? remoteResult?.accounts?.find((account) => account.accountKey === auth.accountKey)
+      : null;
+    const decorated = remoteAccount?.usage && !remoteResult?.error
+      ? decorateCodexProfileAccount(remoteAccount, profile, { isCurrent: false, stale: false })
+      : codexProfileFallbackAccount(result);
+    if (decorated) {
+      if (profile.status !== 'connected') {
+        profile = codexAccountProfileManager.markProfileConnected(profile.profileId, {
+          accountKey: decorated.accountKey,
+          label: decorated.label,
+          accountHint: decorated.accountHint,
+          planType: decorated.plan_type,
+        }) || profile;
+      }
+      accounts.push(decorateCodexProfileAccount(decorated, profile, { isCurrent: false, stale: false }));
+    }
+    results.push(result);
+  }
+
+  return { accounts, results };
 }
 
 function resetCodexUsageStateForTests() {
@@ -6110,6 +6520,78 @@ function register({ projectManager, transcriptService } = {}) {
   codexUsageStateStore = projectManager?.db || null;
   codexUsageStateHydrated = false;
   hydrateCodexUsageState();
+  codexAccountProfileManager?.shutdown?.();
+  codexAccountProfileManager = new CodexAccountProfileManager({
+    store: codexUsageStateStore,
+    defaultCodexHome: CODEX_HOME,
+    onChange: (payload) => {
+      try {
+        const { BrowserWindow } = require('electron');
+        for (const window of BrowserWindow.getAllWindows()) {
+          if (!window.isDestroyed()) {
+            window.webContents.send('codex:account-profiles-updated', payload);
+          }
+        }
+      } catch {}
+    },
+  });
+  if (!codexAccountProfileCleanupBound) {
+    codexAccountProfileCleanupBound = true;
+    try {
+      const { app } = require('electron');
+      app.once('before-quit', () => codexAccountProfileManager?.shutdown?.());
+    } catch {}
+  }
+
+  ipcMain.handle('codex:get-account-profiles', async () => ({
+    success: true,
+    profiles: codexAccountProfileManager?.listPublicProfiles() || [],
+  }));
+
+  ipcMain.handle('codex:start-account-login', async (_event, payload = {}) => {
+    try {
+      const result = await codexAccountProfileManager.startLogin(payload.profileId || null);
+      return {
+        success: true,
+        ...result,
+        profiles: codexAccountProfileManager.listPublicProfiles(),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        profiles: codexAccountProfileManager?.listPublicProfiles() || [],
+      };
+    }
+  });
+
+  ipcMain.handle('codex:cancel-account-login', async (_event, payload = {}) => {
+    try {
+      await codexAccountProfileManager.cancelLogin(payload.profileId);
+      return { success: true, profiles: codexAccountProfileManager.listPublicProfiles() };
+    } catch (error) {
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
+
+  ipcMain.handle('codex:logout-account-profile', async (_event, payload = {}) => {
+    try {
+      await codexAccountProfileManager.logout(payload.profileId);
+      return { success: true, profiles: codexAccountProfileManager.listPublicProfiles() };
+    } catch (error) {
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
+
+  ipcMain.handle('codex:remove-account-profile', async (_event, payload = {}) => {
+    try {
+      await codexAccountProfileManager.removeProfile(payload.profileId);
+      return { success: true, profiles: codexAccountProfileManager.listPublicProfiles() };
+    } catch (error) {
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
+
   ipcMain.handle('codex:get-timeline', async (_event, { sessionId, cwd }) => {
     try {
       const loaded = await loadSessionRecords(sessionId, cwd);
@@ -6259,9 +6741,23 @@ function register({ projectManager, transcriptService } = {}) {
 
   ipcMain.handle('codex:get-usage', async (_event, opts = {}) => {
     try {
-      const remoteResult = await getCodexRemoteUsage({
-        force: !!opts?.force,
-        verifyInitial: true,
+      const [remoteResult, managedProfileResult] = await Promise.all([
+        getCodexRemoteUsage({
+          force: !!opts?.force,
+          verifyInitial: true,
+        }),
+        refreshCodexManagedProfileAccounts({ force: !!opts?.force }),
+      ]);
+      const currentRemoteAccount = remoteResult.currentAccountKey
+        ? remoteResult.accounts?.find((account) => account.accountKey === remoteResult.currentAccountKey)
+        : null;
+      codexAccountProfileManager?.syncDefaultProfile({
+        accountKey: remoteResult.currentAccountKey || null,
+        label: currentRemoteAccount?.label || null,
+        accountHint: currentRemoteAccount?.accountHint || null,
+        planType: currentRemoteAccount?.plan_type || null,
+        connected: !!remoteResult.currentAccountKey,
+        error: remoteResult.currentAccountKey ? remoteResult.error : null,
       });
       // The local log is discovery/fallback only. A healthy OpenAI response
       // must not start or wait for a multi-gigabyte log scan.
@@ -6271,7 +6767,10 @@ function register({ projectManager, transcriptService } = {}) {
         : getCodexUsageAccountsSnapshot('ipc-server-primary');
       let accountUsages = mergeCodexPreferredAccounts(
         accountResult.accounts || [],
-        remoteResult.accounts || []
+        [
+          ...(remoteResult.accounts || []),
+          ...(managedProfileResult.accounts || []),
+        ]
       );
 
       let activeUsage = null;
@@ -6307,10 +6806,27 @@ function register({ projectManager, transcriptService } = {}) {
       }
       accountUsages = mergeCodexPreferredAccounts(
         accountUsages,
-        (remoteResult.accounts || []).filter((account) => account.isCurrent && !account.stale)
+        [
+          ...(remoteResult.accounts || []).filter((account) => account.isCurrent && !account.stale),
+          ...(managedProfileResult.accounts || []),
+        ]
+      );
+      const accountProfiles = codexAccountProfileManager?.listPublicProfiles() || [];
+      const profileByAccountKey = new Map(
+        accountProfiles
+          .filter((profile) => profile.accountKey)
+          .map((profile) => [profile.accountKey, profile])
       );
       accountUsages = accountUsages.map((account) => ({
         ...account,
+        profileId: account.profileId || profileByAccountKey.get(account.accountKey)?.profileId || null,
+        connected: account.connected === true
+          || profileByAccountKey.get(account.accountKey)?.status === 'connected',
+        authStatus: account.authStatus
+          || profileByAccountKey.get(account.accountKey)?.status
+          || 'historical',
+        isDefaultProfile: account.isDefaultProfile === true
+          || profileByAccountKey.get(account.accountKey)?.isDefault === true,
         isCurrent: account.accountKey === remoteResult.currentAccountKey,
         stale: codexUsageAccountIsStale(account),
       }));
@@ -6359,15 +6875,16 @@ function register({ projectManager, transcriptService } = {}) {
       if (selectedAccount?.source) source = selectedAccount.source;
       const selectedIsCurrent = !!selectedAccountKey
         && selectedAccountKey === remoteResult.currentAccountKey;
+      const selectedIsConnected = selectedAccount?.connected === true;
       const stale = selectedAccount
         ? codexUsageAccountIsStale(selectedAccount)
         : !!usage;
-      const warning = selectedAccount && !selectedIsCurrent && stale
-        ? 'Selected account is not the current Codex login. Showing its last known value.'
-        : (selectedIsCurrent ? (remoteResult.warning || selectedAccount?.warning || null) : null);
+      const warning = selectedAccount && !selectedIsConnected && stale
+        ? 'This Codex account is not connected. Showing its last known value.'
+        : (selectedIsCurrent ? (remoteResult.warning || selectedAccount?.warning || null) : selectedAccount?.warning || null);
       const relevantError = selectedIsCurrent
         ? remoteResult.error
-        : (!usage ? (accountResult.error || remoteResult.error) : null);
+        : (selectedAccount?.lastError || (!usage ? (accountResult.error || remoteResult.error) : null));
 
       const weekly = usage?.seven_day?.utilization ?? null;
       const fiveHour = usage?.five_hour?.utilization ?? null;
@@ -6387,6 +6904,7 @@ function register({ projectManager, transcriptService } = {}) {
         success: true,
         data: usage,
         accounts: accountUsages,
+        profiles: accountProfiles,
         selectedAccountKey,
         currentAccountKey: remoteResult.currentAccountKey,
         source,
@@ -6453,6 +6971,7 @@ module.exports = {
     buildCodexRangeExport,
     buildCodexTurnAssistantContext,
     buildCodexTurnAssistantResult,
+    buildCodexProviderTurnAssistantResult,
     buildCodexVisibleRecordWrappers,
     planCodexRangeRewrite,
     planCodexForkFromLatestCompact,
@@ -6482,6 +7001,7 @@ module.exports = {
     buildCodexUsageFromWhamResponse,
     buildCodexResetCreditsFromResponse,
     buildCodexUsageFromRateLimits,
+    buildCodexUsageFromAppServerRateLimits,
     canonicalizeCodexUsage,
     codexUsageSnapshotsMatch,
     classifyCodexUsageSnapshot,
@@ -6492,6 +7012,7 @@ module.exports = {
     fetchCodexUsageFromOpenAI,
     fetchCodexResetCreditsFromOpenAI,
     getCodexRemoteUsage,
+    readCodexAuthSession,
     readCurrentCodexAuthSession,
     mergeCodexPreferredAccounts,
     codexUsageAccountIsStale,

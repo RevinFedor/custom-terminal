@@ -204,7 +204,10 @@ export function buildPortableImageImportSnapshot(text = '', materializedRefs = [
       output += `[Image #${marker.id}]`;
     } else {
       missing += 1;
-      output += `[imageError: portable_image_path_unavailable #${marker.id}]`;
+      // Keep the source path inside the explicit error segment. The missing
+      // file has no usable attachment ref, but authoring UI still needs to
+      // identify the exact portable path before Send.
+      output += `[imageError: portable_image_path_unavailable #${marker.id} path=${marker.path}]`;
     }
     cursor = marker.end;
   }

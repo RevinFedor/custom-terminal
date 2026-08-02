@@ -4,7 +4,11 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { CodexImageTransport, buildCodexImagePastePlan } = require('./codex-image-transport');
+const {
+  CodexImageTransport,
+  buildCodexImagePastePlan,
+  replaceUnavailableImagePathMarkers,
+} = require('./codex-image-transport');
 
 test('stages a durable image through a whitespace-free alias without copying bytes', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-image-transport-'));
@@ -79,14 +83,60 @@ test('preserves text and multiple image positions as separate paste segments', (
   assert.deepEqual(plan.staged.map(result => result.path), [first, second]);
 });
 
-test('reports a missing image without silently dropping its marker', () => {
+test('degrades a missing image to an explicit ordered error segment', () => {
   const marker = '[imagePath: /missing/image.png]';
   const plan = buildCodexImagePastePlan(
     marker + ' question',
     () => ({ success: false, path: '/missing/image.png', error: 'image_path_missing' }),
   );
 
-  assert.equal(plan.text, marker + ' question');
-  assert.deepEqual(plan.segments, [{ kind: 'text', text: marker + ' question' }]);
+  assert.equal(plan.text, '[imageError: codex_image_path_unavailable #1] question');
+  assert.deepEqual(plan.segments, [{
+    kind: 'text',
+    text: '[imageError: codex_image_path_unavailable #1] question',
+  }]);
   assert.deepEqual(plan.missing, [{ path: '/missing/image.png', error: 'image_path_missing' }]);
+});
+
+test('keeps relative paths and prose examples as literal text', () => {
+  let stageCalls = 0;
+  const input = 'docs [imagePath: absolute path] and [imagePath: images/example.png]';
+  const plan = buildCodexImagePastePlan(input, () => {
+    stageCalls += 1;
+    return { success: false, error: 'must_not_run' };
+  });
+
+  assert.equal(plan.text, input);
+  assert.deepEqual(plan.segments, [{ kind: 'text', text: input }]);
+  assert.equal(plan.replaced, 0);
+  assert.equal(stageCalls, 0);
+  assert.deepEqual(plan.missing, []);
+});
+
+test('keeps surrounding text and available images when one middle image disappears', () => {
+  const plan = buildCodexImagePastePlan(
+    'before [imagePath: /ok.png] middle [imagePath: /gone.png] after',
+    (rawPath) => rawPath.trim() === '/ok.png'
+      ? { success: true, path: '/ok.png', inputPath: '/tmp/ok.png' }
+      : { success: false, path: '/gone.png', error: 'image_path_missing' },
+  );
+
+  assert.deepEqual(plan.segments, [
+    { kind: 'text', text: 'before ' },
+    { kind: 'image', text: '/tmp/ok.png', sourcePath: '/ok.png' },
+    { kind: 'text', text: ' middle [imageError: codex_image_path_unavailable #2] after' },
+  ]);
+  assert.equal(plan.staged.length, 1);
+  assert.equal(plan.missing.length, 1);
+});
+
+test('preflight replacement changes only unavailable path slots and preserves order', () => {
+  const result = replaceUnavailableImagePathMarkers(
+    'example [imagePath: path] A [imagePath: /ok.png] B [imagePath: /gone.png] C',
+    [{ path: '/gone.png', error: 'image_path_missing' }],
+  );
+  assert.equal(
+    result,
+    'example [imagePath: path] A [imagePath: /ok.png] B [imageError: queue_image_path_unavailable #2] C',
+  );
 });

@@ -1507,7 +1507,14 @@ async function callTool(name, args) {
             queue: args.queue === true,
           },
         );
-        return 'Prompt sent to tab ' + args.tabId + ' through Project API scenario layer. Status: ' + (result.status || 'sent') + (result.queued ? ' (queued)' : '');
+        if (result.status === 'audit-pending' || result.auditPending === true) {
+          return 'Prompt Enter crossed in tab ' + args.tabId
+            + ' through Project API scenario layer. Exact delivery confirmation is pending; do not retry this handoff.'
+            + (result.handoffId ? ' Handoff: ' + result.handoffId + '.' : '');
+        }
+        return 'Prompt sent to tab ' + args.tabId + ' through Project API scenario layer. Status: ' + (result.status || 'sent')
+          + (result.queued ? ' (queued)' : '')
+          + (result.handoffId ? '. Handoff: ' + result.handoffId : '');
       }
 
       const body = {

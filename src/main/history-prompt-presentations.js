@@ -1,4 +1,7 @@
 const crypto = require('crypto');
+const path = require('path');
+
+const PRESENTATION_IMAGE_ASSET_RE = /^[a-f0-9]{64}\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i;
 
 function promptTransportHash(text) {
   return crypto
@@ -278,8 +281,43 @@ function normalizePromptPresentationSnapshot(snapshot) {
       ...(optionalString(tag.outcome) ? { outcome: optionalString(tag.outcome) } : {}),
     }];
   });
-  return promptChips.length > 0 || semanticTags.length > 0
-    ? { version: 2, promptChips, semanticTags }
+  const imageRefs = [];
+  const seenImageIds = new Set();
+  for (const [index, ref] of (Array.isArray(snapshot?.imagePaths) ? snapshot.imagePaths : []).entries()) {
+    const id = Number(ref?.id);
+    if (!Number.isInteger(id) || id <= 0 || seenImageIds.has(id)) continue;
+    const filePath = typeof ref?.path === 'string' && path.isAbsolute(ref.path.trim())
+      ? ref.path.trim()
+      : '';
+    const rawAssetId = typeof ref?.assetId === 'string' ? path.basename(ref.assetId.trim()) : '';
+    const assetId = PRESENTATION_IMAGE_ASSET_RE.test(rawAssetId) ? rawAssetId.toLowerCase() : '';
+    if (!filePath && !assetId) continue;
+    const mediaType = typeof ref?.mediaType === 'string' && /^image\//i.test(ref.mediaType.trim())
+      ? ref.mediaType.trim()
+      : '';
+    const size = Number(ref?.size);
+    const availability = ref?.availability === 'missing' ? 'missing' : 'available';
+    const error = typeof ref?.error === 'string' && ref.error.trim() ? ref.error.trim() : '';
+    seenImageIds.add(id);
+    imageRefs.push({
+      kind: 'image-ref',
+      id,
+      ...(filePath ? { path: filePath } : {}),
+      ...(assetId ? { assetId } : {}),
+      ...(mediaType ? { mediaType } : {}),
+      ...(Number.isFinite(size) && size >= 0 ? { size } : {}),
+      availability,
+      ...(error ? { error } : {}),
+      presentationIndex: index,
+    });
+  }
+  return promptChips.length > 0 || semanticTags.length > 0 || imageRefs.length > 0
+    ? {
+        version: imageRefs.length > 0 ? 3 : 2,
+        promptChips,
+        semanticTags,
+        imagePaths: imageRefs,
+      }
     : null;
 }
 
@@ -306,7 +344,11 @@ function saveAuditedPromptPresentation(db, {
     // The legacy column is named chips_json, but schema v2 also stores
     // presentation-neutral semantic tags. Readers split the two kinds before
     // exposing them to History/Timeline.
-    chips: [...normalized.promptChips, ...normalized.semanticTags],
+    chips: [
+      ...normalized.promptChips,
+      ...normalized.semanticTags,
+      ...normalized.imagePaths,
+    ],
   });
 }
 
@@ -360,12 +402,16 @@ function decorateHistoryPromptPresentations(db, {
     const semanticTags = row.chips.filter(item => (
       item?.kind === 'orchestration' || item?.kind === 'prompt-origin'
     ));
-    if (promptChips.length === 0 && semanticTags.length === 0) return entry;
+    const imagePaths = row.chips
+      .filter(item => item?.kind === 'image-ref')
+      .map(({ kind: _kind, presentationIndex: _presentationIndex, ...ref }) => ref);
+    if (promptChips.length === 0 && semanticTags.length === 0 && imagePaths.length === 0) return entry;
     changed = true;
     return {
       ...entry,
       ...(promptChips.length > 0 ? { promptChips } : {}),
       ...(semanticTags.length > 0 ? { semanticTags } : {}),
+      ...(imagePaths.length > 0 ? { imagePaths } : {}),
     };
   });
   return changed ? decorated : source;

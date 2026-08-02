@@ -21,6 +21,7 @@ const INBOX_PROJECT_NAME = 'Inbox';
 const INBOX_PROJECT_DESCRIPTION = 'System workspace for API-created and unassigned agent tabs.';
 const getInboxProjectPath = () => process.env.NOTED_INBOX_CWD || process.env.HOME || os.homedir() || '/';
 const CODEX_PENDING_WRITER_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:';
+const CODEX_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-receipt.v1:';
 
 function inspectCodexWriterHandoffValue(journalKey, rawValue) {
   if (rawValue === undefined || rawValue === null) {
@@ -82,6 +83,15 @@ function inspectCodexWriterHandoffValue(journalKey, rawValue) {
       && Number(journal.sourceRunSeq) > 0
     )
   );
+  const optionalOperationIdentityValid = (
+    journal?.operationId === undefined
+    || (typeof journal.operationId === 'string' && journal.operationId.trim())
+  ) && (
+    journal?.requestId === undefined
+    || (typeof journal.requestId === 'string' && journal.requestId.trim())
+  );
+  const optionalOriginProjectValid = journal?.originProjectId === undefined
+    || (typeof journal.originProjectId === 'string' && journal.originProjectId.trim());
   const hasSeparatedBinding = typeof journal?.expectedBindingSessionId === 'string'
     && journal.expectedBindingSessionId.trim()
     && journal.expectedBindingSessionId.trim() !== String(journal?.sourceSessionId || '').trim();
@@ -119,6 +129,8 @@ function inspectCodexWriterHandoffValue(journalKey, rawValue) {
     && versionValid
     && optionalBindingValid
     && optionalRuntimeGenerationValid
+    && optionalOperationIdentityValid
+    && optionalOriginProjectValid
     && separatedBindingValid
     && optionalReplacementCandidateValid;
   if (!valid) {
@@ -132,6 +144,78 @@ function inspectCodexWriterHandoffValue(journalKey, rawValue) {
     };
   }
   return { status: 'present', journalKey, journal, rawValue };
+}
+
+function inspectCodexNativeRewindCommitReceiptValue(receiptKey, rawValue) {
+  if (rawValue === undefined || rawValue === null) {
+    return { status: 'absent', receiptKey, receipt: null };
+  }
+  let receipt;
+  try {
+    receipt = JSON.parse(rawValue);
+  } catch (error) {
+    return {
+      status: 'invalid',
+      receiptKey,
+      receipt: null,
+      error: 'codex_rewind_commit_receipt_corrupt',
+      reason: error?.message || 'invalid_json',
+      rawValue,
+    };
+  }
+  const valid = receipt
+    && typeof receipt === 'object'
+    && !Array.isArray(receipt)
+    && receipt.version === 1
+    && receipt.kind === 'codex-native-rewind-commit'
+    && (receipt.phase === 'committed' || receipt.phase === 'finalized')
+    && typeof receipt.receiptId === 'string'
+    && receipt.receiptId.trim()
+    && typeof receipt.projectId === 'string'
+    && receipt.projectId.trim()
+    && typeof receipt.originProjectId === 'string'
+    && receipt.originProjectId.trim()
+    && typeof receipt.tabId === 'string'
+    && receipt.tabId.trim()
+    && receiptKey === CODEX_REWIND_COMMIT_RECEIPT_KEY_PREFIX + receipt.tabId
+    && typeof receipt.operationId === 'string'
+    && receipt.operationId.trim()
+    && typeof receipt.requestId === 'string'
+    && receipt.requestId.trim()
+    && typeof receipt.actionGeneration === 'string'
+    && receipt.actionGeneration.trim()
+    && typeof receipt.sourceSessionId === 'string'
+    && receipt.sourceSessionId.trim()
+    && typeof receipt.childSessionId === 'string'
+    && receipt.childSessionId.trim()
+    && receipt.childSessionId !== receipt.sourceSessionId
+    && typeof receipt.sourceLifecycleGeneration === 'string'
+    && receipt.sourceLifecycleGeneration.trim()
+    && Number.isInteger(Number(receipt.sourceRunSeq))
+    && Number(receipt.sourceRunSeq) > 0
+    && typeof receipt.targetUuid === 'string'
+    && receipt.targetUuid.trim()
+    && Number.isInteger(Number(receipt.targetSourceLine))
+    && Number(receipt.targetSourceLine) >= 1
+    && typeof receipt.targetTextHash === 'string'
+    && /^[a-f0-9]{64}$/i.test(receipt.targetTextHash)
+    && Number.isInteger(Number(receipt.rollbackTurns))
+    && Number(receipt.rollbackTurns) >= 1
+    && Number.isFinite(Number(receipt.committedAtMs))
+    && Number(receipt.committedAtMs) > 0
+    && Number.isFinite(Number(receipt.actionStartedAtMs))
+    && Number(receipt.actionStartedAtMs) > 0;
+  if (!valid) {
+    return {
+      status: 'invalid',
+      receiptKey,
+      receipt: null,
+      error: 'codex_rewind_commit_receipt_invalid',
+      reason: 'invalid_shape',
+      rawValue,
+    };
+  }
+  return { status: 'present', receiptKey, receipt, rawValue };
 }
 
 class DatabaseManager {
@@ -1197,6 +1281,173 @@ class DatabaseManager {
     return inspectCodexWriterHandoffValue(journalKey, row?.value);
   }
 
+  inspectCodexNativeRewindCommitReceipt(receiptKey) {
+    if (typeof receiptKey !== 'string' || !receiptKey.trim()) {
+      return {
+        status: 'invalid',
+        receiptKey: receiptKey || null,
+        receipt: null,
+        error: 'codex_rewind_commit_receipt_key_invalid',
+        reason: 'receipt_key_required',
+      };
+    }
+    const row = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(receiptKey);
+    return inspectCodexNativeRewindCommitReceiptValue(receiptKey, row?.value);
+  }
+
+  verifyCodexNativeRewindCommitReceipt({
+    receiptKey,
+    projectId,
+    originProjectId = projectId,
+    tabId,
+    operationId,
+    requestId,
+    actionGeneration,
+    sourceSessionId,
+    sourceLifecycleGeneration,
+    sourceRunSeq,
+    targetUuid,
+    targetSourceLine,
+    targetTextHash,
+    rollbackTurns,
+    expectedChildSessionId = null,
+    receiptId = null,
+  } = {}) {
+    const inspection = this.inspectCodexNativeRewindCommitReceipt(receiptKey);
+    if (inspection.status !== 'present') {
+      return {
+        success: false,
+        error: inspection.error || 'codex_rewind_commit_receipt_missing',
+        reason: inspection.reason || inspection.status,
+        retryable: inspection.status === 'absent',
+      };
+    }
+    const receipt = inspection.receipt;
+    const expected = {
+      projectId,
+      tabId,
+      operationId,
+      requestId,
+      actionGeneration,
+      sourceSessionId,
+      sourceLifecycleGeneration,
+      targetUuid,
+      targetTextHash,
+    };
+    for (const [field, value] of Object.entries(expected)) {
+      if (!value || String(receipt[field] || '') !== String(value)) {
+        return {
+          success: false,
+          error: 'codex_rewind_commit_receipt_stale',
+          mismatch: field,
+          retryable: false,
+        };
+      }
+    }
+    if (!originProjectId || receipt.originProjectId !== originProjectId) {
+      return {
+        success: false,
+        error: 'codex_rewind_commit_receipt_stale',
+        mismatch: 'originProjectId',
+        retryable: false,
+      };
+    }
+    if (!Number.isInteger(Number(sourceRunSeq))
+      || Number(receipt.sourceRunSeq) !== Number(sourceRunSeq)
+      || !Number.isInteger(Number(targetSourceLine))
+      || Number(receipt.targetSourceLine) !== Number(targetSourceLine)
+      || !Number.isInteger(Number(rollbackTurns))
+      || Number(receipt.rollbackTurns) !== Number(rollbackTurns)
+      || (expectedChildSessionId
+        && String(receipt.childSessionId) !== String(expectedChildSessionId))
+      || (receiptId && String(receipt.receiptId) !== String(receiptId))) {
+      return {
+        success: false,
+        error: 'codex_rewind_commit_receipt_stale',
+        mismatch: Number(receipt.sourceRunSeq) !== Number(sourceRunSeq)
+          ? 'sourceRunSeq'
+          : Number(receipt.targetSourceLine) !== Number(targetSourceLine)
+            ? 'targetSourceLine'
+            : Number(receipt.rollbackTurns) !== Number(rollbackTurns)
+              ? 'rollbackTurns'
+              : expectedChildSessionId && String(receipt.childSessionId) !== String(expectedChildSessionId)
+                ? 'childSessionId'
+                : 'receiptId',
+        retryable: false,
+      };
+    }
+    const tabRow = this.db.prepare(
+      'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+    ).get(projectId, tabId);
+    if (!tabRow) {
+      return { success: false, error: 'codex_tab_row_missing', retryable: true };
+    }
+    const currentSessionId = tabRow.codex_session_id || null;
+    if (currentSessionId !== receipt.childSessionId) {
+      return {
+        success: false,
+        error: 'codex_rewind_commit_receipt_binding_changed',
+        currentSessionId,
+        receiptChildSessionId: receipt.childSessionId,
+        retryable: false,
+      };
+    }
+    return {
+      success: true,
+      receipt,
+      rawValue: inspection.rawValue,
+      childSessionId: receipt.childSessionId,
+      currentSessionId,
+      alreadyFinalized: receipt.phase === 'finalized',
+    };
+  }
+
+  finalizeCodexNativeRewindCommitReceipt(expectation = {}) {
+    const transaction = this.db.transaction(() => {
+      const verified = this.verifyCodexNativeRewindCommitReceipt(expectation);
+      if (verified.success !== true) return verified;
+      if (verified.receipt.phase === 'finalized') {
+        return { ...verified, updated: false };
+      }
+      const nextReceipt = {
+        ...verified.receipt,
+        phase: 'finalized',
+        finalizedAtMs: Date.now(),
+      };
+      const updated = this.db.prepare(`
+        UPDATE app_state
+        SET value = ?, updated_at = strftime('%s', 'now')
+        WHERE key = ? AND value = ?
+      `).run(
+        JSON.stringify(nextReceipt),
+        expectation.receiptKey,
+        verified.rawValue,
+      );
+      return updated.changes === 1
+        ? {
+            success: true,
+            updated: true,
+            receipt: nextReceipt,
+            childSessionId: nextReceipt.childSessionId,
+            currentSessionId: nextReceipt.childSessionId,
+          }
+        : {
+            success: false,
+            error: 'codex_rewind_commit_receipt_finalize_compare_and_set_failed',
+            retryable: true,
+          };
+    });
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
+
   _migratePendingCodexWriterHandoffsInTransaction({
     sourceProjectId,
     targetProjectId,
@@ -1207,7 +1458,6 @@ class DatabaseManager {
       const journalKey = CODEX_PENDING_WRITER_HANDOFF_KEY_PREFIX + tabId;
       const row = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(journalKey);
       const inspection = inspectCodexWriterHandoffValue(journalKey, row?.value);
-      if (inspection.status === 'absent') continue;
       if (inspection.status === 'invalid') {
         return {
           success: false,
@@ -1217,24 +1467,61 @@ class DatabaseManager {
           reason: inspection.reason,
         };
       }
-      const journal = inspection.journal;
-      if (journal.tabId !== tabId || journal.projectId !== sourceProjectId) {
+      if (inspection.status === 'present') {
+        const journal = inspection.journal;
+        if (journal.tabId !== tabId || journal.projectId !== sourceProjectId) {
+          return {
+            success: false,
+            error: 'codex_handoff_journal_owner_mismatch',
+            tabId,
+            journalKey,
+            journalTabId: journal.tabId,
+            journalProjectId: journal.projectId,
+            expectedProjectId: sourceProjectId,
+          };
+        }
+        plans.push({
+          tabId,
+          key: journalKey,
+          previousRaw: inspection.rawValue,
+          nextRaw: JSON.stringify({ ...journal, projectId: targetProjectId }),
+        });
+      }
+
+      const receiptKey = CODEX_REWIND_COMMIT_RECEIPT_KEY_PREFIX + tabId;
+      const receiptRow = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(receiptKey);
+      const receiptInspection = inspectCodexNativeRewindCommitReceiptValue(
+        receiptKey,
+        receiptRow?.value,
+      );
+      if (receiptInspection.status === 'invalid') {
         return {
           success: false,
-          error: 'codex_handoff_journal_owner_mismatch',
+          error: receiptInspection.error,
           tabId,
-          journalKey,
-          journalTabId: journal.tabId,
-          journalProjectId: journal.projectId,
-          expectedProjectId: sourceProjectId,
+          receiptKey,
+          reason: receiptInspection.reason,
         };
       }
-      plans.push({
-        tabId,
-        journalKey,
-        previousRaw: inspection.rawValue,
-        nextRaw: JSON.stringify({ ...journal, projectId: targetProjectId }),
-      });
+      if (receiptInspection.status === 'present') {
+        const receipt = receiptInspection.receipt;
+        if (receipt.tabId !== tabId || receipt.projectId !== sourceProjectId) {
+          return {
+            success: false,
+            error: 'codex_rewind_commit_receipt_owner_mismatch',
+            tabId,
+            receiptKey,
+            receiptProjectId: receipt.projectId,
+            expectedProjectId: sourceProjectId,
+          };
+        }
+        plans.push({
+          tabId,
+          key: receiptKey,
+          previousRaw: receiptInspection.rawValue,
+          nextRaw: JSON.stringify({ ...receipt, projectId: targetProjectId }),
+        });
+      }
     }
 
     for (const plan of plans) {
@@ -1242,15 +1529,15 @@ class DatabaseManager {
         UPDATE app_state
         SET value = ?, updated_at = strftime('%s', 'now')
         WHERE key = ? AND value = ?
-      `).run(plan.nextRaw, plan.journalKey, plan.previousRaw);
+      `).run(plan.nextRaw, plan.key, plan.previousRaw);
       if (updated.changes !== 1) {
         const error = new Error('codex_handoff_journal_compare_and_set_failed');
         error.tabId = plan.tabId;
-        error.journalKey = plan.journalKey;
+        error.journalKey = plan.key;
         throw error;
       }
     }
-    return { success: true, migrated: plans.map((plan) => plan.tabId) };
+    return { success: true, migrated: [...new Set(plans.map((plan) => plan.tabId))] };
   }
 
   // ========== PROJECTS ========== 
@@ -2514,6 +2801,7 @@ class DatabaseManager {
 
   commitPendingCodexWriterHandoff({
     journalKey,
+    receiptKey = null,
     projectId,
     tabId,
     sourceSessionId,
@@ -2529,6 +2817,9 @@ class DatabaseManager {
         error: 'codex_handoff_stable_source_requires_settlement',
         retryable: false,
       };
+    }
+    if (receiptKey && receiptKey !== CODEX_REWIND_COMMIT_RECEIPT_KEY_PREFIX + tabId) {
+      return { success: false, error: 'codex_rewind_commit_receipt_key_invalid' };
     }
     const transaction = this.db.transaction(() => {
       const journalInspection = this.inspectPendingCodexWriterHandoff(journalKey);
@@ -2566,6 +2857,35 @@ class DatabaseManager {
           replacementCandidateSessionId,
         };
       }
+      let receiptContext = null;
+      if (receiptKey) {
+        const operationId = String(journal.operationId || actionGeneration || '').trim();
+        const requestId = String(journal.requestId || actionGeneration || '').trim();
+        const sourceLifecycleGeneration = String(journal.sourceLifecycleGeneration || '').trim();
+        const sourceRunSeq = Number(journal.sourceRunSeq);
+        if (!operationId
+          || !requestId
+          || !sourceLifecycleGeneration
+          || !Number.isInteger(sourceRunSeq)
+          || sourceRunSeq <= 0
+          || journal.version !== 2
+          || !journal.targetUuid
+          || !Number.isInteger(Number(journal.targetSourceLine))
+          || !journal.targetTextHash
+          || !Number.isInteger(Number(journal.rollbackTurns))) {
+          return {
+            success: false,
+            error: 'codex_rewind_commit_receipt_context_invalid',
+            retryable: false,
+          };
+        }
+        receiptContext = {
+          operationId,
+          requestId,
+          sourceLifecycleGeneration,
+          sourceRunSeq,
+        };
+      }
 
       const tabRow = this.db.prepare(
         'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
@@ -2590,6 +2910,39 @@ class DatabaseManager {
           return { success: false, error: 'codex_handoff_compare_and_set_failed', retryable: true };
         }
       }
+      let commitReceipt = null;
+      if (receiptKey && receiptContext) {
+        const committedAtMs = Date.now();
+        commitReceipt = {
+          version: 1,
+          kind: 'codex-native-rewind-commit',
+          phase: 'committed',
+          receiptId: crypto.randomUUID(),
+          projectId,
+          originProjectId: journal.originProjectId || projectId,
+          tabId,
+          operationId: receiptContext.operationId,
+          requestId: receiptContext.requestId,
+          actionGeneration,
+          sourceSessionId,
+          childSessionId: nextSessionId,
+          expectedBindingSessionId,
+          sourceLifecycleGeneration: receiptContext.sourceLifecycleGeneration,
+          sourceRunSeq: receiptContext.sourceRunSeq,
+          targetUuid: journal.targetUuid,
+          targetSourceLine: Number(journal.targetSourceLine),
+          targetTextHash: journal.targetTextHash,
+          rollbackTurns: Number(journal.rollbackTurns),
+          actionStartedAtMs: Number(journal.actionStartedAtMs),
+          committedAtMs,
+        };
+        this.db.prepare(`
+          INSERT INTO app_state (key, value, updated_at)
+          VALUES (?, ?, strftime('%s', 'now'))
+          ON CONFLICT(key) DO UPDATE
+          SET value = excluded.value, updated_at = excluded.updated_at
+        `).run(receiptKey, JSON.stringify(commitReceipt));
+      }
       this.db.prepare('DELETE FROM app_state WHERE key = ?').run(journalKey);
       return {
         success: true,
@@ -2597,6 +2950,8 @@ class DatabaseManager {
         currentSessionId,
         expectedBindingSessionId,
         journalCleared: true,
+        receiptWritten: !!commitReceipt,
+        commitReceipt,
       };
     });
 
@@ -4186,6 +4541,41 @@ class DatabaseManager {
       .update(JSON.stringify(rows))
       .digest('hex')
       .slice(0, 24);
+  }
+
+  getHistoryPromptPresentationAssetIds() {
+    const assetIdPattern = /^[a-f0-9]{64}\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i;
+    const assetIds = new Set();
+    const rows = this.db.prepare(`
+      SELECT chips_json
+      FROM history_prompt_presentations
+      WHERE schema_version >= 3
+    `).all();
+    for (const row of rows) {
+      let items;
+      try {
+        items = JSON.parse(row.chips_json || '[]');
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(items)) continue;
+      for (const item of items) {
+        if (item?.kind !== 'image-ref') continue;
+        const explicit = typeof item.assetId === 'string'
+          ? path.basename(item.assetId.trim())
+          : '';
+        const fromPath = typeof item.path === 'string'
+          ? path.basename(item.path.trim())
+          : '';
+        const assetId = assetIdPattern.test(explicit)
+          ? explicit.toLowerCase()
+          : assetIdPattern.test(fromPath)
+            ? fromPath.toLowerCase()
+            : '';
+        if (assetId) assetIds.add(assetId);
+      }
+    }
+    return [...assetIds];
   }
 
   saveHistoryPromptPresentation(presentation) {

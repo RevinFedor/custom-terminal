@@ -180,14 +180,50 @@ test('cross-project row transfer is atomic and preserves Codex binding', (t) => 
   manager.updateProjectTabGroups(source.id, [{ id: 'source-group', name: 'Source', anchorTabId: tabA }]);
   const handoffKey = `codex.pending-writer-handoff.v1:${tabA}`;
   manager.setAppState(handoffKey, {
-    version: 1,
+    version: 2,
     projectId: source.id,
+    originProjectId: source.id,
     tabId: tabA,
     cwd: tempRoot,
     sourceSessionId: 'writer-a',
+    expectedBindingSessionId: 'writer-a',
+    sourceBindingMode: 'confirmed-writer',
+    sourceLifecycleGeneration: 'move-pending-pty:4',
+    sourceRunSeq: 4,
+    operationId: 'move-pending-operation',
+    requestId: 'move-pending-request',
     actionGeneration: 'move-generation',
     actionStartedAtMs: Date.now(),
+    targetUuid: 'move-pending-target',
+    targetSourceLine: 14,
+    targetTextHash: 'b'.repeat(64),
+    rollbackTurns: 1,
+    phase: 'confirm-enter-boundary',
   });
+  const receiptKey = `codex.rewind-commit-receipt.v1:${tabA}`;
+  const receipt = {
+    version: 1,
+    kind: 'codex-native-rewind-commit',
+    phase: 'committed',
+    receiptId: 'move-receipt',
+    projectId: source.id,
+    originProjectId: source.id,
+    tabId: tabA,
+    operationId: 'move-operation',
+    requestId: 'move-request',
+    actionGeneration: 'move-receipt-generation',
+    sourceSessionId: 'writer-before-a',
+    childSessionId: 'writer-a',
+    sourceLifecycleGeneration: 'move-pty:3',
+    sourceRunSeq: 3,
+    targetUuid: 'move-target',
+    targetSourceLine: 12,
+    targetTextHash: 'a'.repeat(64),
+    rollbackTurns: 2,
+    actionStartedAtMs: Date.now(),
+    committedAtMs: Date.now(),
+  };
+  manager.setAppState(receiptKey, receipt);
 
   const rejected = manager.transferTabsToProject(source.id, target.id, [tabA, 'missing-tab']);
   assert.equal(rejected.success, false);
@@ -206,8 +242,62 @@ test('cross-project row transfer is atomic and preserves Codex binding', (t) => 
   const migratedHandoff = manager.inspectPendingCodexWriterHandoff(handoffKey);
   assert.equal(migratedHandoff.status, 'present');
   assert.equal(migratedHandoff.journal.projectId, target.id);
+  assert.equal(migratedHandoff.journal.originProjectId, source.id);
   assert.equal(migratedHandoff.journal.sourceSessionId, 'writer-a');
   assert.equal(migratedHandoff.journal.actionGeneration, 'move-generation');
+  const migratedReceipt = manager.inspectCodexNativeRewindCommitReceipt(receiptKey);
+  assert.equal(migratedReceipt.status, 'present');
+  assert.equal(migratedReceipt.receipt.projectId, target.id);
+  assert.equal(migratedReceipt.receipt.originProjectId, source.id);
+  assert.equal(manager.verifyCodexNativeRewindCommitReceipt({
+    receiptKey,
+    projectId: target.id,
+    originProjectId: source.id,
+    tabId: tabA,
+    operationId: receipt.operationId,
+    requestId: receipt.requestId,
+    actionGeneration: receipt.actionGeneration,
+    sourceSessionId: receipt.sourceSessionId,
+    sourceLifecycleGeneration: receipt.sourceLifecycleGeneration,
+    sourceRunSeq: receipt.sourceRunSeq,
+    targetUuid: receipt.targetUuid,
+    targetSourceLine: receipt.targetSourceLine,
+    targetTextHash: receipt.targetTextHash,
+    rollbackTurns: receipt.rollbackTurns,
+  }).success, true, 'a late exact callback survives the same committed project transfer');
+
+  const postMoveCommit = manager.commitPendingCodexWriterHandoff({
+    journalKey: handoffKey,
+    receiptKey,
+    projectId: target.id,
+    tabId: tabA,
+    sourceSessionId: migratedHandoff.journal.sourceSessionId,
+    nextSessionId: 'writer-after-pending-move',
+    actionGeneration: migratedHandoff.journal.actionGeneration,
+  });
+  assert.equal(postMoveCommit.success, true);
+  assert.equal(postMoveCommit.commitReceipt.projectId, target.id);
+  assert.equal(
+    postMoveCommit.commitReceipt.originProjectId,
+    source.id,
+    'a move between Enter and child commit keeps the operation origin immutable',
+  );
+  assert.equal(manager.verifyCodexNativeRewindCommitReceipt({
+    receiptKey,
+    projectId: target.id,
+    originProjectId: source.id,
+    tabId: tabA,
+    operationId: migratedHandoff.journal.operationId,
+    requestId: migratedHandoff.journal.requestId,
+    actionGeneration: migratedHandoff.journal.actionGeneration,
+    sourceSessionId: migratedHandoff.journal.sourceSessionId,
+    sourceLifecycleGeneration: migratedHandoff.journal.sourceLifecycleGeneration,
+    sourceRunSeq: migratedHandoff.journal.sourceRunSeq,
+    targetUuid: migratedHandoff.journal.targetUuid,
+    targetSourceLine: migratedHandoff.journal.targetSourceLine,
+    targetTextHash: migratedHandoff.journal.targetTextHash,
+    rollbackTurns: migratedHandoff.journal.rollbackTurns,
+  }).success, true, 'the original late callback still owns the post-move child commit');
 
   const rendererFollowUp = manager.getProjectById(target.id).tabs.map((tab) => (
     tab.tabId === tabA ? { ...tab, codexSessionId: 'stale-renderer-source' } : tab
@@ -216,7 +306,7 @@ test('cross-project row transfer is atomic and preserves Codex binding', (t) => 
   assert.deepEqual(manager.saveTabs(target.id, rendererFollowUp), { success: true });
   assert.equal(
     manager.getTabCodexSessionId(target.id, tabA),
-    'writer-a',
+    'writer-after-pending-move',
     'the normal renderer follow-up save cannot roll the transferred main-owned binding back',
   );
 });

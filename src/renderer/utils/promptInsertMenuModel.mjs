@@ -34,6 +34,42 @@ export function buildProjectScriptRows(packageJsonContent, shFiles) {
   return rows;
 }
 
+export function promptHasFileReferences(prompt) {
+  const paths = prompt && Array.isArray(prompt.file_paths) ? prompt.file_paths : [];
+  return paths.some((path) => String(path || '').trim().length > 0);
+}
+
+/**
+ * Reference form of one attached file. Claude resolves `@path` natively and
+ * attaches the file itself; the quotes are mandatory because unquoted refs are
+ * truncated at the first space, which breaks every path with a space or emoji
+ * in it. Other agents get the bare absolute path — `@"…"` is Claude syntax and
+ * would reach them as literal decoration around the path.
+ */
+export function formatPromptFileReference(filePath, agent) {
+  const raw = String(filePath || '').trim();
+  if (!raw) return '';
+  return agent === 'claude' ? `@"${raw}"` : raw;
+}
+
+/**
+ * Cmd-pick payload: the prompt's own text verbatim, then its files as
+ * references instead of inlined content. The trailing space after a Claude
+ * `@"…"` ref is load-bearing — without it the file typeahead stays open on the
+ * unterminated token and eats the next Enter instead of submitting.
+ */
+export function buildPromptReferenceText(promptContent, filePaths, agent) {
+  const refs = (Array.isArray(filePaths) ? filePaths : [])
+    .map((path) => formatPromptFileReference(path, agent))
+    .filter((ref) => ref.length > 0);
+  const content = String(promptContent || '');
+  if (refs.length === 0) return content;
+  const body = [content, refs.join(agent === 'claude' ? ' ' : '\n')]
+    .filter((part) => part.length > 0)
+    .join('\n\n');
+  return agent === 'claude' ? `${body} ` : body;
+}
+
 export function joinPromptInsertionText(promptContent, fileContents) {
   return [promptContent, ...(Array.isArray(fileContents) ? fileContents : [])]
     .map((part) => String(part || ''))

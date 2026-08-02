@@ -69,8 +69,24 @@ export interface ClaudePtySendOptions {
   model?: string;
   effort?: string;
   thinking?: string;
+  claudeExactEmptyEvidence?: Record<string, unknown> | null;
+  refreshClaudeExactEmptyEvidence?: () => Promise<{
+    success: boolean;
+    evidence?: Record<string, unknown> | null;
+    code?: string;
+    error?: string;
+  }>;
   presentationSnapshot?: {
     historySessionId?: string | null;
+    imagePaths?: Array<{
+      id: number;
+      path: string;
+      assetId?: string;
+      mediaType?: string | null;
+      size?: number;
+      availability?: 'available' | 'missing';
+      error?: string;
+    }>;
     promptChips?: Array<{
       id?: string;
       kind: 'prompt';
@@ -501,6 +517,8 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
   const work = (async () => {
     const requestedModel = String(options.model || '').trim();
     const requestedEffort = String(options.effort || '').trim();
+    let composerMutated = false;
+    let exactEmptyEvidence = options.claudeExactEmptyEvidence || null;
     if (requestedModel && requestedModel !== 'none') {
       await applyClaudePtySetting({
         tabId,
@@ -508,6 +526,7 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
         value: requestedModel,
         source: (options.source || 'claude-pty-action') + ':model',
       });
+      composerMutated = true;
     }
     if (requestedEffort && requestedEffort !== 'none') {
       await applyClaudePtySetting({
@@ -516,29 +535,75 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
         value: requestedEffort,
         source: (options.source || 'claude-pty-action') + ':effort',
       });
+      composerMutated = true;
     }
     if (typeof options.thinking === 'string' && options.thinking.trim()) {
       const wantThinking = options.thinking !== 'disabled';
       const thinkMap: Map<string, boolean> = (window as any).__thinkStateForTab
         || ((window as any).__thinkStateForTab = new Map());
-      const currentThinking = thinkMap.has(tabId) ? thinkMap.get(tabId)! : true;
-      if (currentThinking !== wantThinking) {
-        const toggle = await ipcRenderer.invoke('claude:toggle-thinking', tabId);
-        if (toggle?.success === false) {
-          throw new Error(toggle?.error || 'Claude thinking mode was not applied');
+      const currentThinkingKnown = thinkMap.has(tabId);
+      const currentThinking = currentThinkingKnown ? thinkMap.get(tabId)! : null;
+      if (!currentThinkingKnown || currentThinking !== wantThinking) {
+        const toggle = await ipcRenderer.invoke('claude:toggle-thinking', tabId, wantThinking);
+        if (
+          toggle?.success !== true
+          || typeof toggle?.thinking !== 'boolean'
+          || toggle.thinking !== wantThinking
+        ) {
+          return {
+            success: false,
+            submitted: false,
+            code: 'claude_thinking_state_unknown',
+            error: toggle?.error || 'Claude thinking picker did not prove its final state',
+          };
         }
-        thinkMap.set(tabId, typeof toggle?.thinking === 'boolean' ? toggle.thinking : wantThinking);
+        thinkMap.set(tabId, toggle.thinking);
+        composerMutated = true;
       }
     }
-    return ipcRenderer.invoke('terminal:paste', {
+    if (composerMutated) {
+      if (!options.refreshClaudeExactEmptyEvidence) {
+        return {
+          success: false,
+          submitted: false,
+          code: 'terminal_draft_state_unknown',
+          error: 'Claude settings changed but no fresh composer proof is available',
+        };
+      }
+      const refreshed = await options.refreshClaudeExactEmptyEvidence();
+      if (refreshed?.success !== true) {
+        return {
+          success: false,
+          submitted: false,
+          code: refreshed?.code || 'terminal_draft_state_unknown',
+          error: refreshed?.error || 'Claude composer state is unknown after settings changed',
+        };
+      }
+      exactEmptyEvidence = refreshed.evidence || null;
+    }
+    const pasteRequest = {
       tabId,
       content: prompt,
       submit: true,
       fast: false,
+      // Project API / Terminal MCP / Inbox distinguish an Enter that crossed
+      // from the exact UserPromptSubmit record.  Do not let this shared
+      // runtime collapse both states into an immediate success receipt.
+      awaitClaudeUserMessageAudit: true,
       handoffId: options.handoffId || null,
       source: options.source || 'claude-pty-action',
       verifyClaudeVisibleDraftBeforePaste: true,
       presentationSnapshot: options.presentationSnapshot || null,
+    };
+    if (!composerMutated) {
+      return ipcRenderer.invoke('terminal:paste', {
+        ...pasteRequest,
+        claudeExactEmptyEvidence: options.claudeExactEmptyEvidence,
+      });
+    }
+    return ipcRenderer.invoke('terminal:paste', {
+      ...pasteRequest,
+      claudeExactEmptyEvidence: exactEmptyEvidence,
     });
   })()
     .then((result: any) => {

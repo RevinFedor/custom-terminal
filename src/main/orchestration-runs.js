@@ -26,7 +26,13 @@ const TARGET_EXECUTION_STATUSES = new Set([
   'queued',
   'running',
 ]);
-const SOURCE_FOLLOWUP_DELIVERY_STATUSES = new Set(['pending', 'sending', 'sent', 'queued']);
+const SOURCE_FOLLOWUP_DELIVERY_STATUSES = new Set([
+  'pending',
+  'sending',
+  'audit-pending',
+  'sent',
+  'queued',
+]);
 const SOURCE_FOLLOWUP_RECONCILABLE_STATUSES = new Set([
   ...SOURCE_FOLLOWUP_DELIVERY_STATUSES,
   'unconfirmed',
@@ -188,7 +194,7 @@ function resolveCausalSourceExecutionContext({ sourceTabId, sourceMeta, getExecu
 function buildOrchestrationResultLookup(run) {
   const continuationByPrompt = Boolean(run?.resultPromptHash);
   const continuationByTime = !continuationByPrompt && Number(run?.resultAfterAt) > 0;
-  return {
+  const lookup = {
     promptHash: continuationByPrompt
       ? run.resultPromptHash
       : (continuationByTime ? undefined : run?.promptHash),
@@ -198,6 +204,54 @@ function buildOrchestrationResultLookup(run) {
     requestedAt: run?.resultPromptRequestedAt || run?.createdAt,
     resultAfterAt: continuationByPrompt ? undefined : run?.resultAfterAt,
     resultBeforeAt: run?.ownCompletedAt || run?.completedAt || undefined,
+  };
+  const targetExecutionContext = normalizeExecutionContext(run?.targetExecutionContext);
+  if (targetExecutionContext) lookup.targetExecutionContext = targetExecutionContext;
+  return lookup;
+}
+
+function orchestrationSendFailureRecoveryPolicy(sendResult = {}) {
+  const provenNotSent = sendResult?.submitted === false;
+  return {
+    provenNotSent,
+    failureGraceMs: provenNotSent ? 0 : undefined,
+  };
+}
+
+function classifyAgentSendReceipt(sendResult = {}) {
+  if (
+    sendResult?.deliveryUnknown === true
+    || sendResult?.status === 'delivery-unknown'
+    || sendResult?.status === 'delivery_unknown'
+  ) {
+    return {
+      state: 'delivery-unknown',
+      submitted: null,
+      accepted: true,
+    };
+  }
+  const failed = sendResult?.success === false || sendResult?.ok === false;
+  if (sendResult?.submitted === true) {
+    const auditPending = sendResult?.auditPending === true
+      || sendResult?.status === 'audit-pending'
+      || sendResult?.status === 'submitted_unverified';
+    return {
+      state: failed || auditPending ? 'audit-pending' : 'confirmed',
+      submitted: true,
+      accepted: true,
+    };
+  }
+  if (failed || sendResult?.submitted === false) {
+    return {
+      state: 'not-submitted',
+      submitted: false,
+      accepted: false,
+    };
+  }
+  return {
+    state: 'confirmed',
+    submitted: sendResult?.submitted,
+    accepted: true,
   };
 }
 
@@ -987,6 +1041,7 @@ class OrchestrationRunStore {
     baselineBusy = false,
     sessionId = null,
     lifecycleGeneration = null,
+    auditPending = false,
   } = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
@@ -997,6 +1052,7 @@ class OrchestrationRunStore {
       run.sessionId = sessionId || run.sessionId || null;
       run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
       run.deliveryAcceptedAt ||= Date.now();
+      run.deliveryAuditPendingAt = auditPending ? (run.deliveryAuditPendingAt || Date.now()) : null;
       run.deliveryIntent = null;
       run.deliveryDispatchFinishedAt = run.deliveryAcceptedAt;
       run.updatedAt = Date.now();
@@ -1008,6 +1064,7 @@ class OrchestrationRunStore {
     run.sessionId = sessionId || run.sessionId || null;
     run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
     run.deliveryAcceptedAt = Date.now();
+    run.deliveryAuditPendingAt = auditPending ? run.deliveryAcceptedAt : null;
     run.deliveryIntent = null;
     run.deliveryDispatchFinishedAt = run.deliveryAcceptedAt;
     if (run.targetPromptProofAt && !waitingForPredecessor) {
@@ -1097,6 +1154,12 @@ class OrchestrationRunStore {
     run.targetPromptProofExpectedLen = Number.isFinite(proof.expectedLen) ? Number(proof.expectedLen) : null;
     run.targetPromptProofSessionId = proof.sessionId || null;
     run.targetPromptProofUserUuid = proof.userUuid || null;
+    run.deliveryAuditPendingAt = null;
+    // A prompt-audit record is itself stronger than the renderer transport
+    // reply. In particular it may arrive after that reply timed out, so let
+    // the exact record establish the delivery boundary instead of leaving the
+    // run forever in `sending` with no accepted timestamp.
+    run.deliveryAcceptedAt ||= now;
     // The exact prompt carrier is stronger than the transport return.  Clear
     // the durable unsent payload here as well, because the audit can arrive
     // before markDelivery() resolves.
@@ -1120,6 +1183,8 @@ class OrchestrationRunStore {
       run.targetBusySeen = true;
       run.status = 'running';
       run.startedAt ||= now;
+      run.deliveryTransportUnknownAt = null;
+      run.deliveryTransportError = null;
     }
     run.updatedAt = now;
     this._pushChanged(changed, run);
@@ -1220,11 +1285,11 @@ class OrchestrationRunStore {
     // `queued` reply. The reply can resolve after the audit event, so never
     // regress an already materialized source notification back to queued.
     run.notificationStatus = run.sourceFollowupStartedAt
-      && (status === 'sent' || status === 'queued')
+      && ['sending', 'audit-pending', 'sent', 'queued', 'unconfirmed', 'failed', 'waiting-for-input'].includes(status)
       ? 'sent'
       : status;
     Object.assign(run, patch);
-    if (status === 'sent' || status === 'queued') {
+    if (status === 'sent' || status === 'queued' || status === 'audit-pending') {
       run.notificationDeliveredAt ||= Date.now();
       run.parentFollowupPending = Boolean(run.parentRunId && run.notifySource !== false);
     } else if (status === 'suppressed') {
@@ -2289,5 +2354,7 @@ module.exports = {
   isAbortedReason,
   outcomeForReason,
   buildOrchestrationResultLookup,
+  classifyAgentSendReceipt,
+  orchestrationSendFailureRecoveryPolicy,
   resolveCausalSourceExecutionContext,
 };

@@ -412,6 +412,118 @@ export function parsePastedContentParts(value) {
 }
 
 /**
+ * One Claude turn has two deliberate text projections during native Rewind:
+ * - `fullText` is the durable transport text restored after Enter;
+ * - `menuText` is the ordinary user text Claude shows in its /rewind row.
+ *
+ * Claude collapses <pasted_content> bodies in the native picker. Matching the
+ * picker against the expanded body makes a logically present turn impossible
+ * to find, so the scenario layer removes only proven paste wrappers and keeps
+ * the surrounding text in its original order. A paste-only turn stays on the
+ * old full-text fallback until its native picker representation is observed;
+ * that is fail-closed rather than guessing from an opaque body.
+ */
+export function buildClaudeRewindPromptProjection(value) {
+  const fullText = String(value || '').trim();
+  const parts = parsePastedContentParts(fullText);
+  const pastePartCount = parts.filter((part) => part.kind === 'paste').length;
+  const ordinaryParts = parts
+    .filter((part) => part.kind === 'text')
+    .map((part) => part.text);
+  const ordinaryText = ordinaryParts.join(' ').replace(/\s+/g, ' ').trim();
+  const normalizedFullText = fullText.replace(/\s+/g, ' ').trim();
+
+  return {
+    fullText,
+    menuText: pastePartCount > 0 && ordinaryText
+      ? ordinaryText
+      : normalizedFullText,
+    menuSource: pastePartCount > 0 && ordinaryText
+      ? 'ordinary-text-outside-paste'
+      : 'full-text',
+    pastePartCount,
+    ordinaryPartCount: ordinaryParts.length,
+  };
+}
+
+const createHistoryImageMarkerRegex = () => new RegExp(
+  String.raw`(?<!\\)(?:\[Image\s+#?(\d+)\]|\[imagePath:\s*([^\]\r\n]+?)\s*\])`,
+  'gi',
+);
+
+function splitHistoryImageParts(text, imagePaths = []) {
+  const value = String(text || '');
+  const refs = Array.isArray(imagePaths) ? imagePaths : [];
+  const refsById = new Map(refs.map((ref) => [Number(ref?.id), ref]));
+  const refsByPath = new Map(refs.flatMap((ref) => {
+    const filePath = typeof ref?.path === 'string' ? ref.path.trim() : '';
+    return filePath ? [[filePath, ref]] : [];
+  }));
+  const parts = [];
+  const re = createHistoryImageMarkerRegex();
+  let cursor = 0;
+  let match;
+  while ((match = re.exec(value)) !== null) {
+    const markerId = match[1] ? Number(match[1]) : null;
+    const portablePath = match[2] ? match[2].trim() : '';
+    const ref = markerId !== null
+      ? refsById.get(markerId)
+      : refsByPath.get(portablePath);
+    // A History image chip is proof-bearing UI: the exact slot must still own
+    // an available ref. The marker alone is not enough (old transcripts and
+    // pasted documentation can contain identical text).
+    if (!ref?.path || ref.availability === 'missing') continue;
+    if (match.index > cursor) {
+      parts.push({ kind: 'text', text: value.slice(cursor, match.index) });
+    }
+    parts.push({
+      kind: 'image',
+      id: (markerId ?? Number(ref?.id)) || 0,
+      marker: match[0],
+      ...(ref ? { ref } : {}),
+    });
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < value.length) parts.push({ kind: 'text', text: value.slice(cursor) });
+  return parts;
+}
+
+/**
+ * Builds the History-only visual projection of a sent composer snapshot.
+ * The canonical transport text remains untouched; this function merely
+ * replaces proven opaque regions with ordered presentation parts.
+ *
+ * Image-looking text inside <pasted_content> is intentionally never parsed:
+ * the pasted blob owns those bytes and may contain logs or documentation.
+ */
+export function buildHistoryComposerPresentationParts({
+  text = '',
+  chips = [],
+  imagePaths = [],
+} = {}) {
+  const promptPresentation = splitPromptChipPresentation({ text, chips });
+  const parts = [];
+  promptPresentation.chips.forEach((chip, index) => {
+    if (index > 0) parts.push({ kind: 'text', text: '\n\n' });
+    parts.push({ kind: 'prompt', chip });
+  });
+  if (promptPresentation.chips.length > 0 && promptPresentation.text) {
+    parts.push({ kind: 'text', text: '\n\n' });
+  }
+  for (const part of parsePastedContentParts(promptPresentation.text)) {
+    if (part.kind === 'paste') {
+      parts.push(part);
+      continue;
+    }
+    parts.push(...splitHistoryImageParts(part.text, imagePaths));
+  }
+  return {
+    matchedPromptChips: promptPresentation.matched,
+    parts,
+  };
+}
+
+/**
  * Restores a chip into the exact saved/current textarea selection. No spacing
  * is invented: the chip body replaces the selection byte-for-byte and the
  * caret lands immediately after it.
@@ -569,4 +681,54 @@ export function restoreComposerChipToText({
     selectionStart,
     selectionEnd,
   });
+}
+
+/**
+ * Caret position after a word-wise move (Opt+Arrow) that must treat an opaque
+ * marker as ONE object.
+ *
+ * A marker like `[Pasted Content 1 500 chars]` or `[Image #1]` is a single
+ * thing to the user — it either is in the text or it is not. Word-wise motion,
+ * however, sees ordinary words and brackets, so it stopped between `[` and
+ * `Pasted`, then between `Pasted` and `Content`, and so on: five presses to
+ * cross what reads as one token, each landing the caret in a place where
+ * typing would corrupt the marker. Marker-aware motion collapses the whole
+ * span into one step in either direction.
+ *
+ * `ranges` are the already-computed marker spans (paste anchors + image refs);
+ * this helper deliberately does not re-parse text, so both marker families
+ * share one rule and neither can drift from its own highlight layer.
+ *
+ * Returns null when the move is an ordinary one and the browser should handle
+ * it — that keeps native word-wise semantics (locale, punctuation) intact
+ * everywhere except across a marker.
+ */
+export function resolveMarkerAwareWordCaret({
+  text = '',
+  caret = 0,
+  direction = 'forward',
+  ranges = [],
+} = {}) {
+  const value = String(text || '');
+  const position = Math.max(0, Math.min(Number(caret) || 0, value.length));
+  const spans = (Array.isArray(ranges) ? ranges : [])
+    .filter((range) => range
+      && Number.isFinite(Number(range.start))
+      && Number.isFinite(Number(range.end))
+      && Number(range.end) > Number(range.start))
+    .map((range) => ({ start: Number(range.start), end: Number(range.end) }))
+    .sort((left, right) => left.start - right.start);
+  if (spans.length === 0) return null;
+
+  if (direction === 'forward') {
+    // Inside a marker, or sitting right at its opening bracket → jump past its
+    // closing bracket in one move.
+    const inside = spans.find((span) => position >= span.start && position < span.end);
+    return inside ? inside.end : null;
+  }
+
+  // Backward: inside a marker, or right after its closing bracket → jump to
+  // the opening bracket.
+  const inside = spans.find((span) => position > span.start && position <= span.end);
+  return inside ? inside.start : null;
 }

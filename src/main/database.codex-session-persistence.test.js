@@ -772,6 +772,104 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
   assert.equal(manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId), 'project-b-child-v2');
   assert.equal(manager.getAppState(v2HandoffKey), null);
 
+  const receiptKey = `codex.rewind-commit-receipt.v1:${projectBTabId}`;
+  const receiptJournal = {
+    ...v2HandoffJournal,
+    sourceSessionId: 'project-b-child-v2',
+    expectedBindingSessionId: 'project-b-child-v2',
+    sourceLifecycleGeneration: 'pty-generation-receipt:17',
+    sourceRunSeq: 17,
+    operationId: 'renderer-rewind-operation-17',
+    requestId: 'main-rewind-request-17',
+    actionGeneration: 'rewind-generation-receipt-17',
+    actionStartedAtMs: Date.now(),
+    targetUuid: 'receipt-target-message',
+    targetSourceLine: 77,
+    targetTextHash: hashCodexRewindTargetText('receipt target prompt'),
+    rollbackTurns: 2,
+  };
+  manager.setAppState(v2HandoffKey, receiptJournal);
+  const receiptCommit = manager.commitPendingCodexWriterHandoff({
+    journalKey: v2HandoffKey,
+    receiptKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: receiptJournal.sourceSessionId,
+    nextSessionId: 'project-b-receipt-child',
+    actionGeneration: receiptJournal.actionGeneration,
+  });
+  assert.equal(receiptCommit.success, true);
+  assert.equal(receiptCommit.receiptWritten, true);
+  assert.equal(
+    manager.getAppState(v2HandoffKey),
+    null,
+    'the transient handoff journal is already gone when the late callback runs',
+  );
+  const receiptExpectation = {
+    receiptKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    operationId: receiptJournal.operationId,
+    requestId: receiptJournal.requestId,
+    actionGeneration: receiptJournal.actionGeneration,
+    sourceSessionId: receiptJournal.sourceSessionId,
+    sourceLifecycleGeneration: receiptJournal.sourceLifecycleGeneration,
+    sourceRunSeq: receiptJournal.sourceRunSeq,
+    targetUuid: receiptJournal.targetUuid,
+    targetSourceLine: receiptJournal.targetSourceLine,
+    targetTextHash: receiptJournal.targetTextHash,
+    rollbackTurns: receiptJournal.rollbackTurns,
+  };
+  const verifiedReceipt = manager.verifyCodexNativeRewindCommitReceipt(receiptExpectation);
+  assert.equal(verifiedReceipt.success, true, 'the committed child survives transient handoff cleanup');
+  assert.equal(verifiedReceipt.childSessionId, 'project-b-receipt-child');
+  assert.equal(manager.verifyCodexNativeRewindCommitReceipt({
+    ...receiptExpectation,
+    expectedChildSessionId: 'foreign-child',
+  }).mismatch, 'childSessionId');
+  assert.equal(manager.verifyCodexNativeRewindCommitReceipt({
+    ...receiptExpectation,
+    operationId: 'other-renderer-operation',
+  }).mismatch, 'operationId', 'another callback cannot borrow the receipt');
+  assert.equal(manager.verifyCodexNativeRewindCommitReceipt({
+    ...receiptExpectation,
+    requestId: 'stale-main-request',
+  }).mismatch, 'requestId', 'a repeated request token cannot cross operation boundaries');
+  assert.equal(manager.verifyCodexNativeRewindCommitReceipt({
+    ...receiptExpectation,
+    actionGeneration: 'rewind-generation-receipt-18',
+  }).mismatch, 'actionGeneration');
+  assert.equal(manager.verifyCodexNativeRewindCommitReceipt({
+    ...receiptExpectation,
+    sourceLifecycleGeneration: 'pty-generation-receipt:18',
+  }).mismatch, 'sourceLifecycleGeneration');
+  assert.equal(manager.verifyCodexNativeRewindCommitReceipt({
+    ...receiptExpectation,
+    sourceRunSeq: 18,
+  }).mismatch, 'sourceRunSeq');
+  manager.updateTabCodexSessionId(scopedProjectB.id, projectBTabId, 'foreign-concurrent-writer');
+  assert.equal(
+    manager.verifyCodexNativeRewindCommitReceipt(receiptExpectation).error,
+    'codex_rewind_commit_receipt_binding_changed',
+    'a concurrent durable writer change cannot be reported as this Rewind child',
+  );
+  manager.updateTabCodexSessionId(scopedProjectB.id, projectBTabId, 'project-b-receipt-child');
+  const finalizedReceipt = manager.finalizeCodexNativeRewindCommitReceipt({
+    ...receiptExpectation,
+    expectedChildSessionId: 'project-b-receipt-child',
+    receiptId: verifiedReceipt.receipt.receiptId,
+  });
+  assert.equal(finalizedReceipt.success, true);
+  assert.equal(finalizedReceipt.updated, true);
+  const restartVisibleReceipt = manager.verifyCodexNativeRewindCommitReceipt(receiptExpectation);
+  assert.equal(restartVisibleReceipt.success, true);
+  assert.equal(
+    restartVisibleReceipt.alreadyFinalized,
+    true,
+    'restart/retry can recognize the exact completed operation without transient state',
+  );
+  manager.updateTabCodexSessionId(scopedProjectB.id, projectBTabId, 'project-b-child-v2');
+
   const transcriptRecoveryGeneration = 'rewind-generation-v2-transcript-recovery';
   const transcriptRecoveryStartedAtMs = Date.now();
   const transcriptRecoveryJournal = {

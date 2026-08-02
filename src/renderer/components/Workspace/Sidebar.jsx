@@ -354,6 +354,8 @@ function Sidebar({
   onAddDirectory,
   onRemoveDirectory,
   onSwitchDirectory,
+  onChangeDirectory,
+  directoryChangeState = 'idle',
   onFileSelect,
   selectedPaths = [],
   setSelectedPaths,
@@ -633,18 +635,35 @@ function Sidebar({
     loadDirSettings()
   }, [folderPath])
 
-  // 0.5. Save/restore expanded state when folderPath changes
+  // 0.5. Save/restore expanded state when folderPath changes.
+  // Two memories hold the expanded folders: the durable one from the project
+  // record (survives restart, arrives as initialExpandedDirs) and a per-path
+  // in-memory map that keeps state while the user hops between tab folders.
+  // The durable one is NOT a first-mount privilege: re-entering a project
+  // remounts this component, and treating that as "no saved state" collapsed
+  // every folder — and then wrote the empty result back over the saved one.
   const prevFolderPathRef = useRef(null)
+  // Read through a ref, never a dependency: the durable state arrives as a new
+  // object on every save, and depending on it would blank and reload the whole
+  // tree twice a second while the user expands folders.
+  const initialExpandedDirsRef = useRef(initialExpandedDirs)
+  initialExpandedDirsRef.current = initialExpandedDirs
   useEffect(() => {
     if (prevFolderPathRef.current) {
       openStatesMapRef.current[prevFolderPathRef.current] = { ...openStateRef.current }
     }
     setTreeData([])
-    // On first mount, use initialExpandedDirs if available and no in-memory state
-    if (!prevFolderPathRef.current && initialExpandedDirs && !openStatesMapRef.current[folderPath]) {
-      openStateRef.current = { ...initialExpandedDirs }
+    const remembered = openStatesMapRef.current[folderPath]
+    const durable = initialExpandedDirsRef.current
+    // Prefer whatever the user expanded during this component's lifetime, and
+    // fall back to the durable state. An empty in-memory entry must never win
+    // over saved folders — that is the collapse the user sees on return.
+    if (remembered && Object.keys(remembered).length > 0) {
+      openStateRef.current = remembered
+    } else if (durable && Object.keys(durable).length > 0) {
+      openStateRef.current = { ...durable }
     } else {
-      openStateRef.current = openStatesMapRef.current[folderPath] || {}
+      openStateRef.current = remembered || {}
     }
     prevFolderPathRef.current = folderPath
   }, [folderPath]);
@@ -758,6 +777,7 @@ function Sidebar({
           }
         }
         collectDirs(nodes)
+        const knownBefore = Object.keys(openStateRef.current).length
         let cleaned = false
         for (const key of Object.keys(openStateRef.current)) {
           if (!allDirPaths.has(key)) {
@@ -765,7 +785,17 @@ function Sidebar({
             cleaned = true
           }
         }
-        if (cleaned) saveExpandedDirs(openStateRef.current)
+        // Losing EVERY remembered folder at once means this tree is rooted
+        // somewhere else, not that the user deleted all of them — persisting it
+        // would overwrite the project's saved folders with nothing. Dropping
+        // them from this render is fine; writing that emptiness back is not.
+        const wipedEverything = cleaned
+          && knownBefore > 0
+          && Object.keys(openStateRef.current).length === 0
+        if (cleaned && !wipedEverything) saveExpandedDirs(openStateRef.current)
+        if (wipedEverything) {
+          console.log('[sidebar]','Skipped saving cleared expand-state — root mismatch', { folderPath, knownBefore })
+        }
         setTreeData(nodes)
         setExpandedSnapshot({ ...openStateRef.current })
       } catch (err) {
@@ -1548,6 +1578,16 @@ function Sidebar({
     await saveDirSetting('autoReveal', next)
   }, [autoReveal, saveDirSetting])
 
+  const directoryChangeBusy = directoryChangeState !== 'idle'
+  const handleDirectoryTitleClick = useCallback(() => {
+    if (directoryChangeBusy) return
+    if (onChangeDirectory) {
+      onChangeDirectory()
+      return
+    }
+    setDirDropdownOpen(current => !current)
+  }, [directoryChangeBusy, onChangeDirectory])
+
   // New file/folder from toolbar: use focused folder or selected item's parent
   const getTargetParentNode = useCallback(() => {
     const targetPath = focusedId || (selectedPaths && selectedPaths[0])
@@ -1580,13 +1620,29 @@ function Sidebar({
 
       <div className="sidebar-header">
         <div
-          className={`sidebar-title ${dirDropdownOpen ? 'open' : ''}`}
-          onClick={() => { setDirDropdownOpen(!dirDropdownOpen) }}
+          className={`sidebar-title ${dirDropdownOpen && !onChangeDirectory ? 'open' : ''} ${directoryChangeBusy ? 'changing-directory' : ''}`}
+          onClick={handleDirectoryTitleClick}
+          onKeyDown={(event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault()
+            handleDirectoryTitleClick()
+          }}
+          role="button"
+          tabIndex={0}
+          aria-busy={directoryChangeBusy}
+          aria-disabled={directoryChangeBusy}
+          data-directory-change-trigger
+          data-directory-change-state={directoryChangeState}
+          title={folderPath || ''}
         >
           <span>{folderPath?.split('/').pop()}</span>
-          <svg width="10" height="10" viewBox="0 0 10 10" className="sidebar-title-chevron">
-            <path d={dirDropdownOpen ? "M2 6L5 3L8 6" : "M2 4L5 7L8 4"} stroke="currentColor" strokeWidth="1.5" fill="none" />
-          </svg>
+          {directoryChangeBusy ? (
+            <span className="sidebar-title-directory-spinner" aria-hidden="true" />
+          ) : (
+            <svg width="10" height="10" viewBox="0 0 10 10" className="sidebar-title-chevron">
+              <path d={dirDropdownOpen && !onChangeDirectory ? "M2 6L5 3L8 6" : "M2 4L5 7L8 4"} stroke="currentColor" strokeWidth="1.5" fill="none" />
+            </svg>
+          )}
         </div>
         {/* New File */}
         <ControlHint label="Создать файл" side="bottom">
@@ -1602,13 +1658,13 @@ function Sidebar({
         </ControlHint>
         {/* Add directory */}
         <ControlHint label="Добавить директорию" side="bottom">
-        <button className="sidebar-toolbar-btn" onClick={onAddDirectory}>
+        <button className="sidebar-toolbar-btn" onClick={onAddDirectory} disabled={directoryChangeBusy || !onAddDirectory}>
           <svg width="16" height="16" viewBox="0 0 16 16">
             <path d="M8 2v12M2 8h12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
           </svg>
         </button>
         </ControlHint>
-        {dirDropdownOpen && (
+        {dirDropdownOpen && !onChangeDirectory && (
           <div className="directory-dropdown">
             {directories.map(dir => (
               <div

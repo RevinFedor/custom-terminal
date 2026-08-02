@@ -15,6 +15,7 @@ const {
   shouldRetryWaitingNotificationForSourceLifecycle,
   shouldMarkSourceFollowupUnconfirmed,
   buildOrchestrationResultLookup,
+  orchestrationSendFailureRecoveryPolicy,
   resolveCausalSourceExecutionContext,
 } = require('./orchestration-runs');
 
@@ -768,7 +769,7 @@ test('target prompt proof is order-independent and rejects neighboring identitie
       source: 'codex-orchestration:source-1',
     });
     assert.equal(early.confirmed, true);
-    assert.equal((await store.get('run-a')).status, 'creating');
+    assert.equal((await store.get('run-a')).status, 'running');
 
     await store.markDelivery('run-a', { sessionId: 'session-target-1' });
     const run = await store.get('run-a');
@@ -1900,6 +1901,98 @@ test('F3: result lookup carries exact prompt UUID and a completed-turn upper bou
     resultPromptRequestedAt: 300,
     completedAt: 400,
   }).promptUserUuid, 'notification-user');
+});
+
+test('result lookup carries the persisted target execution identity when it is exact', () => {
+  assert.deepEqual(buildOrchestrationResultLookup({
+    promptHash: 'prompt-hash',
+    createdAt: 100,
+    ownCompletedAt: 200,
+    targetExecutionContext: {
+      provider: 'codex',
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      processId: null,
+      generation: 7,
+      startedAt: 123,
+    },
+  }), {
+    promptHash: 'prompt-hash',
+    promptUserUuid: undefined,
+    requestedAt: 100,
+    resultAfterAt: undefined,
+    resultBeforeAt: 200,
+    targetExecutionContext: {
+      provider: 'codex',
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      processId: null,
+      generation: 7,
+      startedAt: 123,
+    },
+  });
+});
+
+test('proven pre-submit refusal settles immediately and exposes source notification', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-pre-submit-failure'));
+    const policy = orchestrationSendFailureRecoveryPolicy({
+      success: false,
+      accepted: false,
+      submitted: false,
+      error: 'send-refused-before-submit',
+    });
+    const transition = await store.beginRecovery(
+      'run-pre-submit-failure',
+      'failed',
+      'send-refused-before-submit',
+      { now: 1000, failureGraceMs: policy.failureGraceMs },
+    );
+    const run = await store.get('run-pre-submit-failure');
+
+    assert.equal(policy.provenNotSent, true);
+    assert.equal(policy.failureGraceMs, 0);
+    assert.equal(run.status, 'failed');
+    assert.equal(run.completedAt, 1000);
+    assert.equal(run.recoveryDeadlineAt, null);
+    assert.equal(run.notificationStatus, 'pending');
+    assert.equal(run.sourceFollowupPending, true);
+    assert.equal(transition.settled.length, 1);
+    await store.persistStrict();
+  } finally {
+    await cleanup();
+  }
+});
+
+test('unknown send failure keeps the configured recovery window', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({ ...baseRun('run-unknown-delivery'), failureGraceMs: 5000 });
+    const policy = orchestrationSendFailureRecoveryPolicy({
+      success: false,
+      accepted: false,
+      status: 'delivery_unknown',
+      error: 'bridge_timeout_delivery_unknown',
+    });
+    const transition = await store.beginRecovery(
+      'run-unknown-delivery',
+      'failed',
+      'bridge_timeout_delivery_unknown',
+      { now: 1000, failureGraceMs: policy.failureGraceMs },
+    );
+    const run = await store.get('run-unknown-delivery');
+
+    assert.equal(policy.provenNotSent, false);
+    assert.equal(policy.failureGraceMs, undefined);
+    assert.equal(run.status, 'waiting_recovery');
+    assert.equal(run.recoveryDeadlineAt, 6000);
+    assert.equal(run.sourceFollowupPending, false);
+    assert.equal(transition.settled.length, 0);
+    await store.persistStrict();
+  } finally {
+    await cleanup();
+  }
 });
 
 test('F1: late done cannot settle a run after target close moved it into recovery', async () => {

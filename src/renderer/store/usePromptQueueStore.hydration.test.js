@@ -31,11 +31,14 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
     invoke: async (channel, payload) => {
       if (channel === 'app:getState') return rawState.promise;
       if (channel === 'prompt-queue:materialize-image-refs') {
+        const refs = payload.refs.map((ref) => String(ref.path || '').includes('/missing/')
+          ? { ...ref, availability: 'missing', error: 'image_path_missing' }
+          : { ...ref, availability: 'available' });
         return {
-          success: true,
-          refs: payload.refs.map((ref) => ({ ...ref, availability: 'available' })),
-          available: payload.refs.length,
-          missing: 0,
+          success: refs.every((ref) => ref.availability === 'available'),
+          refs,
+          available: refs.filter((ref) => ref.availability === 'available').length,
+          missing: refs.filter((ref) => ref.availability === 'missing').length,
         };
       }
       if (channel === 'app:setState') return { success: true };
@@ -437,7 +440,42 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   queueModule.usePromptQueueStore.getState().updatePrompt(
     'tab-1',
     'persisted-item',
-    { text: 'compare [Image #2]' },
+    {
+      text: 'before [Image #2] after',
+      imagePaths: [{
+        id: 2,
+        assetId: secondAssetId,
+        path: '/missing/b.png',
+        mediaType: 'image/png',
+        size: 20,
+        availability: 'missing',
+        error: 'image_path_missing',
+      }],
+    },
+  );
+  const unavailable = await queueModule.ensureQueuedPromptImagesReady('tab-1', 'persisted-item');
+  assert.equal(unavailable.ready, true, 'known missing bytes remain transferable as explicit error text');
+  assert.equal(unavailable.degraded, true);
+  assert.equal(unavailable.state, 'missing');
+  const unavailablePayload = queueModule.buildQueuedPromptPayload(unavailable.item);
+  assert.match(unavailablePayload, /updated instruction/);
+  assert.match(unavailablePayload, /<pasted_content>\s*raw paste\s*<\/pasted_content>/);
+  assert.match(unavailablePayload, /before \[imageError: queued_image_path_unavailable #2\] after$/);
+
+  queueModule.usePromptQueueStore.getState().updatePrompt(
+    'tab-1',
+    'persisted-item',
+    {
+      text: 'compare [Image #2]',
+      imagePaths: [{
+        id: 2,
+        assetId: secondAssetId,
+        path: '/durable/b.png',
+        mediaType: 'image/png',
+        size: 20,
+        availability: 'available',
+      }],
+    },
   );
   const removedFirst = queueModule.usePromptQueueStore.getState().getQueue('tab-1').items[0];
   assert.equal(queueModule.getQueuedPromptAttachmentState(removedFirst), 'ready');

@@ -23,6 +23,16 @@ export interface HistoryPromptHandoffChip {
   sourceKey?: string;
 }
 
+export interface HistoryPromptHandoffImageRef {
+  id: number;
+  path: string;
+  assetId?: string;
+  mediaType?: string | null;
+  size?: number;
+  availability?: 'available' | 'missing';
+  error?: string;
+}
+
 export interface HistoryPromptHandoffAuditProof {
   auditTimestamp: string;
   actualHash: string;
@@ -41,6 +51,7 @@ export interface HistoryPromptHandoff {
   sessionIdHint: string | null;
   text: string;
   promptChips: readonly Readonly<HistoryPromptHandoffChip>[];
+  imagePaths: readonly Readonly<HistoryPromptHandoffImageRef>[];
   submittedAt: number;
   source: string;
   statusAtSend: HistoryPromptHandoffAgentStatus;
@@ -58,6 +69,7 @@ export interface BeginHistoryPromptHandoffInput {
   sessionIdHint?: string | null;
   text: string;
   promptChips?: readonly HistoryPromptHandoffChip[];
+  imagePaths?: readonly HistoryPromptHandoffImageRef[];
   submittedAt?: number;
   source?: string;
   statusAtSend?: HistoryPromptHandoffAgentStatus;
@@ -140,6 +152,16 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
       + stringBytes(chip.text)
       + stringBytes(chip.sourceKey);
   }
+  for (const ref of value.imagePaths) {
+    bytes += RECORD_OVERHEAD_BYTES
+      + stringBytes(ref.id)
+      + stringBytes(ref.path)
+      + stringBytes(ref.assetId)
+      + stringBytes(ref.mediaType)
+      + stringBytes(ref.size)
+      + stringBytes(ref.availability)
+      + stringBytes(ref.error);
+  }
   if (value.auditProof) {
     bytes += RECORD_OVERHEAD_BYTES
       + stringBytes(value.auditProof.auditTimestamp)
@@ -172,6 +194,24 @@ function freezeChip(chip: HistoryPromptHandoffChip): Readonly<HistoryPromptHando
   });
 }
 
+function freezeImageRef(
+  ref: HistoryPromptHandoffImageRef,
+): Readonly<HistoryPromptHandoffImageRef> {
+  return Object.freeze({
+    id: Number(ref.id),
+    path: String(ref.path || ''),
+    ...(typeof ref.assetId === 'string' ? { assetId: ref.assetId } : {}),
+    ...(typeof ref.mediaType === 'string' || ref.mediaType === null
+      ? { mediaType: ref.mediaType }
+      : {}),
+    ...(Number.isFinite(ref.size) ? { size: Number(ref.size) } : {}),
+    ...(ref.availability === 'available' || ref.availability === 'missing'
+      ? { availability: ref.availability }
+      : {}),
+    ...(typeof ref.error === 'string' ? { error: ref.error } : {}),
+  });
+}
+
 function freezeProof(
   proof: HistoryPromptHandoffAuditProof | null | undefined,
 ): Readonly<HistoryPromptHandoffAuditProof> | null {
@@ -198,6 +238,7 @@ function freezeHandoff(value: HistoryPromptHandoff): Readonly<HistoryPromptHando
   return Object.freeze({
     ...value,
     promptChips: Object.freeze(value.promptChips.map(freezeChip)),
+    imagePaths: Object.freeze(value.imagePaths.map(freezeImageRef)),
     auditProof: freezeProof(value.auditProof),
   });
 }
@@ -251,6 +292,7 @@ export class HistoryPromptHandoffStore {
       sessionIdHint: typeof input.sessionIdHint === 'string' ? input.sessionIdHint : null,
       text: String(input.text || ''),
       promptChips: input.promptChips || [],
+      imagePaths: input.imagePaths || [],
       submittedAt,
       source: typeof input.source === 'string' ? input.source : '',
       statusAtSend: input.statusAtSend || 'unknown',

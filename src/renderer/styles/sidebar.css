@@ -42,8 +42,32 @@
   color: var(--text-muted);
 }
 
+.sidebar-title:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.sidebar-title.changing-directory {
+  cursor: progress;
+  color: var(--text-muted);
+}
+
 .sidebar-title-chevron {
   opacity: 0.4;
+}
+
+.sidebar-title-directory-spinner {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 11px;
+  border: 1.5px solid rgba(255, 255, 255, 0.22);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: sidebar-directory-spin 700ms linear infinite;
+}
+
+@keyframes sidebar-directory-spin {
+  to { transform: rotate(360deg); }
 }
 
 .sidebar-toolbar {
@@ -68,6 +92,11 @@
 .sidebar-toolbar-btn:hover {
   background: var(--bg-overlay);
   color: var(--text);
+}
+
+.sidebar-toolbar-btn:disabled {
+  opacity: 0.35;
+  cursor: progress;
 }
 
 .sidebar-toolbar-btn.active {

@@ -206,6 +206,46 @@ test('maps five-hour and weekly windows by duration, not response position', () 
   assert.equal(usage.plan_type, 'pro_future');
 });
 
+test('maps official app-server limits, credits, and model-specific buckets', () => {
+  const mapped = _api.buildCodexUsageFromAppServerRateLimits({
+    rateLimits: {
+      limitId: 'codex',
+      limitName: null,
+      planType: 'pro',
+      primary: { usedPercent: 18, windowDurationMins: 7 * 24 * 60, resetsAt: 1_900_600_000 },
+      secondary: { usedPercent: 7, windowDurationMins: 5 * 60, resetsAt: 1_900_000_000 },
+      credits: { hasCredits: true, unlimited: false, balance: '12.5' },
+    },
+    rateLimitsByLimitId: {
+      codex: {
+        limitId: 'codex',
+        planType: 'pro',
+        primary: { usedPercent: 18, windowDurationMins: 7 * 24 * 60, resetsAt: 1_900_600_000 },
+        secondary: { usedPercent: 7, windowDurationMins: 5 * 60, resetsAt: 1_900_000_000 },
+      },
+      codex_model: {
+        limitId: 'codex_model',
+        limitName: 'Codex model',
+        planType: 'pro',
+        primary: { usedPercent: 22, windowDurationMins: 7 * 24 * 60, resetsAt: 1_900_600_000 },
+        secondary: null,
+      },
+    },
+    rateLimitResetCredits: {
+      availableCount: 1,
+      credits: [{ status: 'available', expiresAt: 1_900_700_000, title: 'Full reset' }],
+    },
+  }, 1_800_000_000_000);
+
+  assert.equal(mapped.usage.five_hour.utilization, 7);
+  assert.equal(mapped.usage.seven_day.utilization, 18);
+  assert.equal(mapped.usage.credits.balance, 12.5);
+  assert.equal(mapped.usage.additional_rate_limits[0].key, 'codex_model');
+  assert.equal(mapped.usage.additional_rate_limits[0].seven_day.utilization, 22);
+  assert.equal(mapped.resetCredits.available_count, 1);
+  assert.equal(mapped.resetCredits.credits[0].title, 'Full reset');
+});
+
 test('maps weekly-only main and model-specific limits without reviving a removed five-hour window', () => {
   const payload = whamPayload({
     credits: { has_credits: true, unlimited: false, balance: '12.5' },
@@ -1348,6 +1388,84 @@ test('initial consensus selects the matching normal pair over one outlier', () =
 
   const result = _api.selectCodexInitialUsageConsensus([normalA, outlier, normalB]);
   assert.strictEqual(result, normalB);
+});
+
+test('manual refresh verifies a suspicious usage branch immediately with matching consensus', async () => {
+  _api.resetCodexUsageStateForTests();
+  const auth = authFor('manual-consensus');
+  let responseMode = 'seed';
+  let refreshRequests = 0;
+  const fetchImpl = async () => {
+    if (responseMode === 'seed') {
+      return fetchResponse(whamUsageFor(auth, {
+        five: 88,
+        weekly: 89,
+        fiveReset: 1_900_000_000,
+        weeklyReset: 1_900_600_000,
+      }));
+    }
+    refreshRequests += 1;
+    return fetchResponse(whamUsageFor(auth, {
+      five: 0,
+      weekly: 0,
+      fiveReset: 1_900_000_600,
+      weeklyReset: 1_900_600_600,
+    }));
+  };
+
+  const seeded = await _api.getCodexRemoteUsage({
+    force: true,
+    fetchImpl,
+    authReader: () => auth,
+  });
+  assert.equal(seeded.warning, null);
+  assert.equal(seeded.accounts[0].usage.seven_day.utilization, 89);
+
+  responseMode = 'refresh';
+  const refreshed = await _api.getCodexRemoteUsage({
+    force: true,
+    verifyInitial: true,
+    fetchImpl,
+    authReader: () => auth,
+  });
+
+  assert.equal(refreshRequests, 3);
+  assert.equal(refreshed.error, null);
+  assert.equal(refreshed.warning, null);
+  assert.equal(refreshed.accounts[0].stale, false);
+  assert.equal(refreshed.accounts[0].usage.five_hour.utilization, 0);
+  assert.equal(refreshed.accounts[0].usage.seven_day.utilization, 0);
+  _api.resetCodexUsageStateForTests();
+});
+
+test('manual refresh keeps the verified snapshot when confirmation responses disagree', async () => {
+  _api.resetCodexUsageStateForTests();
+  const auth = authFor('manual-disagreement');
+  let responses = [whamUsageFor(auth, { five: 70, weekly: 80 })];
+  const fetchImpl = async () => fetchResponse(responses.shift());
+
+  await _api.getCodexRemoteUsage({
+    force: true,
+    fetchImpl,
+    authReader: () => auth,
+  });
+  responses = [
+    whamUsageFor(auth, { five: 0, weekly: 0, fiveReset: 1_900_000_600, weeklyReset: 1_900_600_600 }),
+    whamUsageFor(auth, { five: 40, weekly: 40, fiveReset: 1_900_000_600, weeklyReset: 1_900_600_600 }),
+    whamUsageFor(auth, { five: 90, weekly: 90, fiveReset: 1_900_000_600, weeklyReset: 1_900_600_600 }),
+  ];
+
+  const refreshed = await _api.getCodexRemoteUsage({
+    force: true,
+    verifyInitial: true,
+    fetchImpl,
+    authReader: () => auth,
+  });
+
+  assert.match(refreshed.error, /inconsistent/i);
+  assert.equal(refreshed.accounts[0].usage.five_hour.utilization, 70);
+  assert.equal(refreshed.accounts[0].usage.seven_day.utilization, 80);
+  _api.resetCodexUsageStateForTests();
 });
 
 test('persists at most eight sanitized account snapshots and safely ignores corrupt state', () => {

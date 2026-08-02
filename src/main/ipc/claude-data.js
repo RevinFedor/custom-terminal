@@ -1355,6 +1355,7 @@ async function writeClaudeForkJsonlExclusive({
   destPath,
   newSessionId,
   startLine = 0,
+  rewriteCwd = null,
 }) {
   let output = null;
   let created = false;
@@ -1404,6 +1405,7 @@ async function writeClaudeForkJsonlExclusive({
             compactRootRelinked = true;
           }
           if (record.sessionId) record.sessionId = newSessionId;
+          if (rewriteCwd && typeof record.cwd === 'string') record.cwd = rewriteCwd;
           if (record.uuid) retainedUuids.push(record.uuid);
           line = JSON.stringify(record);
         } catch {
@@ -5841,4 +5843,4 @@ async function repairJsonlChainBreaks(sessionId, cwd) {
   }
 }
 
-module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, deleteEffortEntries: _deleteEffortEntries, trimTrailingEffortEntries: _trimTrailingEffortEntries, trimTrailingStartupSlashEntriesFromFile: _trimTrailingStartupSlashEntriesFromFile, repairJsonlChainBreaks, _api };
+module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, writeClaudeForkJsonlExclusive, deleteEffortEntries: _deleteEffortEntries, trimTrailingEffortEntries: _trimTrailingEffortEntries, trimTrailingStartupSlashEntriesFromFile: _trimTrailingStartupSlashEntriesFromFile, repairJsonlChainBreaks, _api };

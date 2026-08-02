@@ -49,6 +49,7 @@ import {
   normalizeForkMarkerEntryUuids,
   normalizeForkMarkers,
 } from '../../utils/forkMarkerSnapshot.mjs';
+import { buildClaudeRewindPromptProjection } from '../../utils/composerChips.mjs';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
@@ -4565,16 +4566,29 @@ function Timeline({
     const { entryIndex, rewindableEntries, targetIndex, lastBoundaryIdx } = targetContext;
 
     const normalizeRewindMatchKey = (text: string) => text.replace(/\s+/g, ' ').trim();
+    const projectRewindMatchKey = (text: string) => {
+      if (isCodex || isGemini) {
+        return {
+          menuText: normalizeRewindMatchKey(text),
+          menuSource: 'full-text',
+        };
+      }
+      return buildClaudeRewindPromptProjection(text);
+    };
 
     // Count duplicate visible keys AFTER the target within rewindable range.
     // Short 40-char prefixes are ambiguous for adjacent prompts with the same opening.
-    const targetPrefix = normalizeRewindMatchKey(entry.content);
+    const targetProjection = projectRewindMatchKey(entry.content);
+    const targetPrefix = targetProjection.menuText;
     let skipDuplicates = 0;
     for (let i = targetIndex + 1; i < rewindableEntries.length; i++) {
-      const ePrefix = normalizeRewindMatchKey(rewindableEntries[i].content);
+      const ePrefix = projectRewindMatchKey(rewindableEntries[i].content).menuText;
       if (ePrefix === targetPrefix) skipDuplicates++;
     }
-    console.warn('[Restore:Rewind] duplicate scan done', 'skipDuplicates=' + skipDuplicates);
+    console.warn('[Restore:Rewind] duplicate scan done',
+      'skipDuplicates=' + skipDuplicates,
+      'menuSource=' + targetProjection.menuSource,
+      'menuHead=' + JSON.stringify(targetPrefix.slice(0, 80)));
 
     console.warn('[Restore:Rewind] Starting rewind to entry', targetIndex, '/', rewindableEntries.length,
       '- uuid:', entry.uuid, 'skipDuplicates:', skipDuplicates, 'boundaryIdx:', lastBoundaryIdx,
@@ -4995,6 +5009,7 @@ function Timeline({
         opId: rewindOpId,
         targetIndex,
         targetText: targetPrefix,
+        targetMenuText: targetPrefix,
         targetFullText: entry.content.trim(),
         targetUuid: preparedCodex?.targetUuid || entry.uuid,
         writerSessionId: preparedCodex?.writerSessionId || null,

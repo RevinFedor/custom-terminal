@@ -6,6 +6,7 @@ const {
   decideCodexMcpReplacementHandoff,
   decideCodexMcpStoppedGenerationSettlement,
   decideCodexMcpStartupDeadline,
+  decideCodexMcpWatchdogReconcile,
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,
   inspectCodexInputReadyTextCore,
@@ -101,7 +102,12 @@ test('MCP watchdog only restarts from current positive blocker evidence', () => 
   assert.deepEqual(decideCodexMcpStartupDeadline({
     observationAvailable: true,
     inspected: { ready: false, blockers: [] },
-  }), { action: 'cancel', reason: 'mcp-startup-not-current' });
+  }), { action: 'retry', reason: 'current-frame-transitional' });
+
+  assert.deepEqual(decideCodexMcpStartupDeadline({
+    observationAvailable: true,
+    inspected: { ready: false, blockers: ['auth-required'] },
+  }), { action: 'cancel', reason: 'different-current-blocker' });
 
   assert.deepEqual(decideCodexMcpStartupDeadline({
     observationAvailable: false,
@@ -121,6 +127,30 @@ test('MCP watchdog only restarts from current positive blocker evidence', () => 
     mcpVisible: true,
     destructiveProofAvailable: true,
   }), { action: 'restart', reason: 'mcp-startup-current' });
+});
+
+test('MCP watchdog survives an animated redraw gap until a decisive frame arrives', () => {
+  assert.deepEqual(decideCodexMcpWatchdogReconcile({
+    inspected: { ready: false, reason: 'blocked:mcp-startup', blockers: ['mcp-startup'] },
+    mcpVisible: true,
+  }), { action: 'keep', reason: 'mcp-startup-current' });
+  assert.deepEqual(decideCodexMcpWatchdogReconcile({
+    inspected: { ready: false, reason: 'no-codex-ui-text', blockers: [] },
+    mcpVisible: false,
+  }), { action: 'keep', reason: 'current-frame-transitional' });
+  assert.deepEqual(decideCodexMcpWatchdogReconcile({
+    inspected: { ready: true, reason: 'ready', blockers: [] },
+    mcpVisible: false,
+    synchronizedOutputOpen: true,
+  }), { action: 'keep', reason: 'current-frame-transitional' });
+  assert.deepEqual(decideCodexMcpWatchdogReconcile({
+    inspected: { ready: true, reason: 'ready', blockers: [] },
+    mcpVisible: false,
+  }), { action: 'clear', reason: 'current-composer-ready' });
+  assert.deepEqual(decideCodexMcpWatchdogReconcile({
+    inspected: { ready: false, reason: 'blocked:auth-required', blockers: ['auth-required'] },
+    mcpVisible: false,
+  }), { action: 'clear', reason: 'different-current-blocker' });
 });
 
 test('current interactive frame excludes an obsolete MCP line above the composer', () => {
@@ -180,7 +210,7 @@ test('current interactive frame retains a blocker rendered after an old composer
   assert.equal(frame.includes('Starting MCP servers'), true);
 });
 
-test('MCP watchdog refuses a signal after lifecycle or screen sequence changes', () => {
+test('MCP watchdog requires an exact lifecycle and a current committed MCP frame', () => {
   const watchdog = {};
   const terminal = {};
   const base = {
@@ -194,18 +224,31 @@ test('MCP watchdog refuses a signal after lifecycle or screen sequence changes',
     currentRunSeq: 4,
     expectedLaunchId: 'launch-1',
     currentLaunchId: 'launch-1',
+    expectedMirrorGeneration: 'mirror-a',
+    currentMirrorGeneration: 'mirror-a',
     expectedWriteSeq: 41,
     currentWriteSeq: 41,
+    expectedCommittedFrameGeneration: 7,
+    currentCommittedFrameGeneration: 7,
     expectedInputRevision: 9,
     currentInputRevision: 9,
+    mcpStartupBlockerCurrent: true,
   };
   assert.equal(isCodexMcpRestartSignalSafe(base), true);
-  assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentWriteSeq: 42 }), false);
+  assert.equal(isCodexMcpRestartSignalSafe({
+    ...base,
+    currentWriteSeq: 42,
+    currentCommittedFrameGeneration: 8,
+  }), true);
+  assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentWriteSeq: 40 }), false);
+  assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentCommittedFrameGeneration: 6 }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentInputRevision: 10 }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentRunSeq: 5 }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentTerminal: {} }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentTerminalGeneration: 'terminal-b:4' }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentLaunchId: 'launch-2' }), false);
+  assert.equal(isCodexMcpRestartSignalSafe({ ...base, currentMirrorGeneration: 'mirror-b' }), false);
+  assert.equal(isCodexMcpRestartSignalSafe({ ...base, mcpStartupBlockerCurrent: false }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, inputReady: true }), false);
   assert.equal(isCodexMcpRestartSignalSafe({ ...base, promptOrTurnInFlight: true }), false);
 });

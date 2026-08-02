@@ -12,6 +12,9 @@ function register({ getMainWindow, getMainLogPath, isDev }) {
   ipcMain.handle('diagnostics:export-log', async (event, request = {}) => {
     const requestedRange = Number(request.rangeMinutes);
     const rangeMinutes = ALLOWED_RANGE_MINUTES.has(requestedRange) ? requestedRange : 60;
+    const problemDescription = typeof request.problemDescription === 'string'
+      ? request.problemDescription.slice(0, 8000)
+      : '';
     const includeMessageText = request.includeMessageText === true;
     const now = new Date();
     const mainLogPath = getMainLogPath?.();
@@ -40,6 +43,7 @@ function register({ getMainWindow, getMainLogPath, isDev }) {
 
     console.log(
       '[DiagnosticExport] start rangeMinutes=' + rangeMinutes +
+      ' problemDescriptionLength=' + problemDescription.length +
       ' includeMessageText=' + includeMessageText +
       ' destination=' + destinationPath,
     );
@@ -50,6 +54,7 @@ function register({ getMainWindow, getMainLogPath, isDev }) {
         destinationPath,
         fromMs,
         toMs,
+        problemDescription,
         includeMessageText,
         appVersion: app.getVersion(),
         environment: isDev ? 'development' : 'production',

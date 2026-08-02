@@ -3,9 +3,11 @@ import { startTransition } from 'react';
 import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
 import { usePromptQueueStore } from './usePromptQueueStore';
+import { isOrchestrationCompletionBlocked } from './useOrchestrationStore';
 import type { HistoryPromptDraftChip } from './useUIStore';
 import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
+import { isAiForegroundProcess } from '../utils/aiForegroundProcess.mjs';
 import {
   commitArchiveBeforeClose,
   isDurableSaveTabsAck,
@@ -1186,7 +1188,16 @@ const makeDefaultSavedTab = (workspace: ProjectWorkspace, cwd?: string | null, t
   commandType: undefined,
 });
 
-const emitTabCompletionNotification = (detail: { projectId: string; tabId: string; tabName: string; fired?: boolean; firedAt?: number; persistent?: boolean }) => {
+type TabCompletionNotificationDetail = {
+  projectId: string;
+  tabId: string;
+  tabName: string;
+  fired?: boolean;
+  firedAt?: number;
+  persistent?: boolean;
+};
+
+const emitTabCompletionNotification = (detail: TabCompletionNotificationDetail) => {
   try {
     ipcRenderer.send('tab-notification:completed', detail);
   } catch {}
@@ -1204,11 +1215,51 @@ const emitTabCompletionNotificationCleared = (detail: { projectId: string; tabId
   } catch {}
 };
 
-const isAiForegroundProcess = (info?: { hasProcess?: boolean; processName?: string; command?: string } | null): boolean => {
-  if (!info?.hasProcess) return false;
-  const text = `${info.processName || ''} ${info.command || ''}`.toLowerCase();
-  return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
+const settleTabCompletionNotification = ({
+  tab,
+  workspace,
+  activeProjectId,
+  tabId,
+  successful,
+}: {
+  tab: Tab;
+  workspace: ProjectWorkspace;
+  activeProjectId: string | null;
+  tabId: string;
+  successful: boolean;
+}): { changed: boolean; detail: TabCompletionNotificationDetail | null } => {
+  if (!tab.completionNotificationArmed && !tab.completionNotificationPersistent) {
+    return { changed: false, detail: null };
+  }
+
+  delete tab.completionNotificationArmed;
+  delete tab.completionNotificationFired;
+  delete tab.completionNotificationFiredAt;
+  if (!successful) return { changed: true, detail: null };
+
+  const isVisibleTarget =
+    activeProjectId === workspace.projectId &&
+    workspace.activeTabId === tabId &&
+    workspace.currentView === 'terminal';
+  const firedAt = Date.now();
+  const detail: TabCompletionNotificationDetail = {
+    projectId: workspace.projectId,
+    tabId,
+    tabName: tab.name || 'Terminal',
+    persistent: !!tab.completionNotificationPersistent,
+    fired: !isVisibleTarget,
+    firedAt,
+  };
+  if (!isVisibleTarget) {
+    tab.completionNotificationFired = true;
+    tab.completionNotificationFiredAt = firedAt;
+  }
+  return { changed: true, detail };
 };
+
+// Shared with App.tsx and TabBar.tsx — three copies of this predicate silently
+// disagreed once and left Codex tabs asking for confirmation while Claude tabs
+// closed cleanly. See utils/aiForegroundProcess.mjs.
 
 interface SessionState {
   openProjects: { projectId: string; projectPath: string; activeTabIndex: number }[];
@@ -1282,6 +1333,7 @@ interface WorkspaceStore {
   setTabCompletionNotificationArmed: (projectId: string, tabId: string, armed: boolean) => void;
   setTabCompletionNotificationPersistent: (projectId: string, tabId: string, persistent: boolean) => void;
   clearTabCompletionNotification: (projectId: string, tabId: string, options?: { keepPersistent?: boolean }) => void;
+  applyTabCompletionOrchestrationState: (tabId: string, phase: 'active' | 'success' | 'abnormal') => void;
   setTabRestartAfterTarget: (projectId: string, tabId: string, triggerTabId: string | null) => void;
   setTabRestartAfterCommand: (projectId: string, tabId: string, command: string | null) => void;
   setTabRestartAfterPaused: (projectId: string, tabId: string, paused: boolean) => void;
@@ -3397,6 +3449,48 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!options?.keepPersistent && hadPersistent) saveTabs(workspace.projectId, workspace.tabs);
   },
 
+  applyTabCompletionOrchestrationState: (tabId, phase) => {
+    const { openProjects, activeProjectId } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+
+      if (phase === 'active') {
+        let changed = false;
+        if (tab.completionNotificationPersistent && !tab.completionNotificationArmed) {
+          tab.completionNotificationArmed = true;
+          changed = true;
+        }
+        if (tab.completionNotificationFired) {
+          delete tab.completionNotificationFired;
+          delete tab.completionNotificationFiredAt;
+          emitTabCompletionNotificationCleared({ projectId: workspace.projectId, tabId });
+          changed = true;
+        }
+        if (changed) set({ openProjects: new Map(openProjects) });
+        return;
+      }
+
+      // A real parent turn owns the final notification once it starts. The
+      // orchestration release only settles a bell while the parent itself is idle.
+      if (tab.aiBusy || isOrchestrationCompletionBlocked(tabId)) return;
+      const settled = settleTabCompletionNotification({
+        tab,
+        workspace,
+        activeProjectId,
+        tabId,
+        successful: phase === 'success',
+      });
+      if (!settled.changed) return;
+      set({ openProjects: new Map(openProjects) });
+      if (settled.detail) emitTabCompletionNotification(settled.detail);
+      console.warn('[TabNotification] orchestration release tab=' + tabId.slice(-12)
+        + ' outcome=' + phase
+        + ' emitted=' + !!settled.detail);
+      return;
+    }
+  },
+
   setTabRestartAfterTarget: (projectId, tabId, triggerTabId) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
@@ -4847,27 +4941,18 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             emitTabCompletionNotificationCleared({ projectId: workspace.projectId, tabId });
           }
         } else if (wasBusy && (tab.completionNotificationArmed || tab.completionNotificationPersistent)) {
-          const isVisibleTarget =
-            activeProjectId === workspace.projectId &&
-            workspace.activeTabId === tabId &&
-            workspace.currentView === 'terminal';
-          delete tab.completionNotificationArmed;
-          delete tab.completionNotificationFired;
-          delete tab.completionNotificationFiredAt;
-          if (isNaturalAgentTurnEndReason(reason)) {
-            const firedAt = Date.now();
-            notificationDetail = {
-              projectId: workspace.projectId,
+          if (isOrchestrationCompletionBlocked(tabId)) {
+            console.warn('[TabNotification] completion deferred tab=' + tabId.slice(-12)
+              + ' reason=orchestration-blocked');
+          } else {
+            const settled = settleTabCompletionNotification({
+              tab,
+              workspace,
+              activeProjectId,
               tabId,
-              tabName: tab.name || 'Terminal',
-              persistent: !!tab.completionNotificationPersistent,
-              fired: !isVisibleTarget,
-              firedAt,
-            };
-            if (!isVisibleTarget) {
-              tab.completionNotificationFired = true;
-              tab.completionNotificationFiredAt = firedAt;
-            }
+              successful: isNaturalAgentTurnEndReason(reason),
+            });
+            notificationDetail = settled.detail;
           }
         }
         set({ openProjects: new Map(openProjects) });

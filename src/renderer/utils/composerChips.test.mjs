@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_AI_COMPOSER_CHIP_THRESHOLD,
   DICTATION_CLIPBOARD_FLAVOR,
+  buildHistoryComposerPresentationParts,
   isDictationClipboardPayload,
   haveSameComposerChips,
   buildPasteChipMarker,
@@ -17,6 +18,7 @@ import {
   normalizeComposerChipThreshold,
   normalizeComposerChips,
   parsePastedContentParts,
+  resolveMarkerAwareWordCaret,
   restoreComposerChipToText,
   retainPasteChipsForText,
   serializeComposerDraft,
@@ -389,4 +391,119 @@ test('prompt chips keep their prefix placement alongside an anchored paste', () 
   const out = serializeComposerDraft({ text, chips: [prompt, paste] });
   assert.ok(out.startsWith('PROMPT\n\n'));
   assert.match(out, /край <pasted_content>\nBLOB\n<\/pasted_content>$/);
+});
+
+test('History presentation keeps text, images, and pasted bodies in exact transport order', () => {
+  const text = 'до [Image #1] между <pasted_content>\nBLOB\n</pasted_content> после';
+  const result = buildHistoryComposerPresentationParts({
+    text,
+    imagePaths: [{ id: 1, path: '/tmp/one.png', availability: 'available' }],
+  });
+  assert.deepEqual(result.parts.map((part) => part.kind), [
+    'text', 'image', 'text', 'paste', 'text',
+  ]);
+  assert.equal(result.parts[0].text, 'до ');
+  assert.equal(result.parts[1].id, 1);
+  assert.equal(result.parts[2].text, ' между ');
+  assert.equal(result.parts[3].text, 'BLOB');
+  assert.equal(result.parts[4].text, ' после');
+});
+
+test('History presentation never treats an image example inside pasted content as an attachment', () => {
+  const result = buildHistoryComposerPresentationParts({
+    text: '<pasted_content>\nexample [Image #1] and [imagePath: /tmp/one.png]\n</pasted_content>',
+    imagePaths: [{ id: 1, path: '/tmp/one.png', availability: 'available' }],
+  });
+  assert.deepEqual(result.parts, [{
+    kind: 'paste',
+    text: 'example [Image #1] and [imagePath: /tmp/one.png]',
+  }]);
+});
+
+test('History presentation renders a portable image path only with a matching audited ref', () => {
+  const proven = buildHistoryComposerPresentationParts({
+    text: 'a [imagePath: /tmp/one.png] b',
+    imagePaths: [{ id: 7, path: '/tmp/one.png', availability: 'available' }],
+  });
+  assert.deepEqual(proven.parts.map((part) => part.kind), ['text', 'image', 'text']);
+  assert.equal(proven.parts[1].id, 7);
+
+  const literal = buildHistoryComposerPresentationParts({
+    text: 'docs [imagePath: /tmp/one.png]',
+  });
+  assert.deepEqual(literal.parts, [{ kind: 'text', text: 'docs [imagePath: /tmp/one.png]' }]);
+
+  const unprovenSlot = buildHistoryComposerPresentationParts({ text: '[Image #1]' });
+  assert.deepEqual(unprovenSlot.parts, [{ kind: 'text', text: '[Image #1]' }]);
+});
+
+test('History presentation replaces an exact prompt prefix without reordering the remaining text', () => {
+  const prompt = chip('prompt-1', 'prompt', 'PROMPT BODY', { label: 'Prompt' });
+  const result = buildHistoryComposerPresentationParts({
+    text: 'PROMPT BODY\n\nleft <pasted_content>\nPASTE\n</pasted_content> right',
+    chips: [prompt],
+  });
+  assert.deepEqual(result.parts.map((part) => part.kind), ['prompt', 'text', 'text', 'paste', 'text']);
+  assert.equal(result.parts[1].text, '\n\n');
+  assert.equal(result.parts[2].text, 'left ');
+  assert.equal(result.parts[3].text, 'PASTE');
+  assert.equal(result.parts[4].text, ' right');
+});
+
+// ── Opt+Arrow across an opaque marker ──────────────────────────────────────
+// The marker is one object to the user; word-wise motion used to stop between
+// its inner words and leave the caret where typing corrupts it.
+const markerText = 'АА [Pasted Content 1 500 chars] ББ';
+const markerSpan = { start: 3, end: 31 };
+const wordCaret = (caret, direction) => resolveMarkerAwareWordCaret({
+  text: markerText,
+  caret,
+  direction,
+  ranges: [markerSpan],
+});
+
+test('marker-aware caret: forward from the opening bracket clears the whole marker', () => {
+  assert.equal(markerText.slice(markerSpan.start, markerSpan.end), '[Pasted Content 1 500 chars]');
+  assert.equal(wordCaret(markerSpan.start, 'forward'), markerSpan.end);
+});
+
+test('marker-aware caret: forward from inside the marker still exits it in one move', () => {
+  // Old behaviour parked the caret right after the "[" — this is that spot.
+  assert.equal(wordCaret(markerSpan.start + 1, 'forward'), markerSpan.end);
+  assert.equal(wordCaret(markerSpan.end - 1, 'forward'), markerSpan.end);
+});
+
+test('marker-aware caret: backward from the closing bracket returns to the opening one', () => {
+  assert.equal(wordCaret(markerSpan.end, 'backward'), markerSpan.start);
+  assert.equal(wordCaret(markerSpan.end - 2, 'backward'), markerSpan.start);
+});
+
+test('marker-aware caret: ordinary text keeps native word-wise behaviour', () => {
+  // null = "not our case, let the browser do it".
+  assert.equal(wordCaret(0, 'forward'), null);
+  assert.equal(wordCaret(markerSpan.end, 'forward'), null);
+  assert.equal(wordCaret(markerSpan.start, 'backward'), null);
+  assert.equal(wordCaret(markerText.length, 'forward'), null);
+});
+
+test('marker-aware caret: no markers means no interference at all', () => {
+  assert.equal(resolveMarkerAwareWordCaret({ text: 'обычный текст', caret: 3, direction: 'forward' }), null);
+  assert.equal(resolveMarkerAwareWordCaret({
+    text: 'обычный текст', caret: 3, direction: 'backward', ranges: [],
+  }), null);
+});
+
+test('marker-aware caret: image and paste markers obey one rule', () => {
+  const mixed = 'до [Image #1] между [Pasted Content 900 chars] после';
+  const image = { start: 3, end: 13 };
+  const paste = { start: 20, end: 46 };
+  assert.equal(mixed.slice(image.start, image.end), '[Image #1]');
+  assert.equal(mixed.slice(paste.start, paste.end), '[Pasted Content 900 chars]');
+  const move = (caret, direction) => resolveMarkerAwareWordCaret({
+    text: mixed, caret, direction, ranges: [paste, image],
+  });
+  assert.equal(move(image.start, 'forward'), image.end);
+  assert.equal(move(paste.start + 4, 'forward'), paste.end);
+  assert.equal(move(image.end, 'backward'), image.start);
+  assert.equal(move(paste.end, 'backward'), paste.start);
 });

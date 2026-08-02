@@ -71,6 +71,72 @@ test('post-Enter sidecar decorates the exact durable prompt without changing its
   assert.equal(store.rows[0].entryUuid, 'codex-user-writer-1-17');
 });
 
+test('audited image refs decorate the exact durable prompt and keep thumbnail identity', () => {
+  const store = createStore();
+  const content = 'before [Image #1] after';
+  const assetId = 'a'.repeat(64) + '.png';
+  assert.equal(saveAuditedPromptPresentation(store, {
+    toolType: 'codex',
+    sessionId: 'writer-images',
+    auditTimestamp: '2026-08-02T10:00:00.000Z',
+    actualText: content,
+    snapshot: {
+      imagePaths: [{
+        id: 1,
+        path: `/tmp/${assetId}`,
+        assetId,
+        mediaType: 'image/png',
+        size: 42,
+        availability: 'available',
+      }],
+    },
+  }), true);
+
+  const decorated = decorateHistoryPromptPresentations(store, {
+    toolType: 'codex',
+    sessionId: 'writer-images',
+    entries: [{
+      uuid: 'codex-user-writer-images-1',
+      role: 'user',
+      timestamp: '2026-08-02T10:00:00.000Z',
+      content,
+    }],
+  });
+
+  assert.equal(store.rows[0].schemaVersion, 3);
+  assert.deepEqual(decorated[0].imagePaths, [{
+    id: 1,
+    path: `/tmp/${assetId}`,
+    assetId,
+    mediaType: 'image/png',
+    size: 42,
+    availability: 'available',
+  }]);
+});
+
+test('image presentation rejects relative paths and duplicate slot guesses', () => {
+  const store = createStore();
+  assert.equal(saveAuditedPromptPresentation(store, {
+    toolType: 'codex',
+    sessionId: 'writer-images',
+    auditTimestamp: '2026-08-02T10:01:00.000Z',
+    actualText: '[Image #1]',
+    snapshot: {
+      imagePaths: [
+        { id: 1, path: 'relative.png' },
+        { id: 1, path: '/tmp/second.png' },
+      ],
+    },
+  }), true);
+  assert.deepEqual(store.rows[0].chips, [{
+    kind: 'image-ref',
+    id: 1,
+    path: '/tmp/second.png',
+    availability: 'available',
+    presentationIndex: 1,
+  }]);
+});
+
 test('a hash or timestamp mismatch never attaches presentation metadata', () => {
   const store = createStore();
   store.rows.push({

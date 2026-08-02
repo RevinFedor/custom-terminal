@@ -17,12 +17,14 @@ import { terminalRegistry } from '../../utils/terminalRegistry';
 import { generateTitleFromPromptWithConfig, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import {
   collectPromptImageRefIds,
-  getPromptImageAttachmentState,
+  getPromptImageStatusTokenRanges,
   hasMalformedPromptImageMarker,
   haveSamePromptImageRefs,
+  inspectPromptImageAttachments,
   insertPromptImageAttachments,
   retainPromptImageRefsForText,
 } from '../../utils/promptImageAttachments.mjs';
+import { applyMarkerAwareWordMotion } from '../../utils/composerWordMotion';
 import {
   buildPasteChipMarker,
   getPasteMarkerHighlightRanges,
@@ -46,6 +48,8 @@ import {
   collapsePortableImageImportSnapshot,
   collectPortableImagePathMarkers,
 } from '../../utils/composerClipboard.mjs';
+import { electronComposerClipboardAdapter } from '../../utils/electronComposerClipboardAdapter';
+import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlacement.mjs';
 import {
   combineFirstDelayParts,
   formatFirstDelayCountdown,
@@ -109,6 +113,19 @@ const OVERLAY_Z_INDEX = 120;           // above HistoryPanel (z:101)
 const FLOATING_OVERLAY_Z_INDEX = 130;  // editor/dropdowns above the rail/panel
 const INSERT_PROMPT_TITLE_MATCH_CHARS = 50;
 
+type RunAfterComposerAggregate = {
+  imagePaths: QueuedImageRef[];
+  chips: QueuedComposerChip[];
+};
+
+const runAfterComposerAggregateEqual = (left: unknown, right: unknown) => {
+  const a = left as RunAfterComposerAggregate | null;
+  const b = right as RunAfterComposerAggregate | null;
+  if (!a || !b) return a === b;
+  return JSON.stringify(a.imagePaths) === JSON.stringify(b.imagePaths)
+    && haveSameComposerChips(a.chips, b.chips);
+};
+
 // Panel width is now FIXED (user-resizable, persisted in useUIStore.promptQueueWidth),
 // NOT `fit-content`. Reason: `fit-content` reflowed the panel every time a +grab
 // chip was added/removed or a button label changed — the user wants a stable width
@@ -145,6 +162,42 @@ const ANCHOR_SIDE: 'left' | 'right' = 'right';
 const RESIZE_MIN_WIDTH = 240;
 const RESIZE_MAX_WIDTH = 600;
 const RUN_AFTER_IMAGE_PENDING_MARKER = '[Image saving…]';
+
+const runAfterImageNotice = (text: string, imagePaths: QueuedImageRef[]) => {
+  if (String(text || '').includes(RUN_AFTER_IMAGE_PENDING_MARKER)) {
+    return { message: 'Saving image attachment…', blocking: true, progress: true };
+  }
+  const inspection = inspectPromptImageAttachments(text, imagePaths || []);
+  if (inspection.firstBlocking) {
+    const issue = inspection.firstBlocking as {
+      id?: number | null;
+      marker?: string;
+      excerpt?: string;
+    };
+    const marker = issue.id ? `[Image #${issue.id}]` : (issue.marker || '[Image marker]');
+    return {
+      message: `${marker} is damaged or has no exact attachment. Near “${issue.excerpt || marker}”. Restore the complete marker or remove it before Run after can send.`,
+      blocking: true,
+      progress: false,
+    };
+  }
+  if (inspection.firstUnavailable) {
+    const issue = inspection.firstUnavailable as {
+      id?: number | null;
+      marker?: string;
+      path?: string | null;
+      excerpt?: string;
+    };
+    const marker = issue.id ? `Image #${issue.id}` : (issue.marker || 'Image attachment');
+    const pathPart = issue.path ? ` File: ${issue.path}.` : '';
+    return {
+      message: `${marker} is unavailable.${pathPart} Run after remains enabled; this slot will be sent as an explicit imageError. Near “${issue.excerpt || marker}”.`,
+      blocking: false,
+      progress: false,
+    };
+  }
+  return null;
+};
 
 const createQueuedComposerChipId = () => (
   'paste-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
@@ -288,6 +341,23 @@ export function PromptQueueOverlay({
   const [editorText, setEditorText] = useState('');
   const [editorChips, setEditorChips] = useState<QueuedComposerChip[]>([]);
   const [editorImagePaths, setEditorImagePaths] = useState<QueuedImageRef[]>([]);
+  const editorHistoryPayload = useMemo<RunAfterComposerAggregate>(() => ({
+    imagePaths: editorImagePaths,
+    chips: editorChips,
+  }), [editorChips, editorImagePaths]);
+  const deriveEditorHistoryPayload = useCallback((nextText: string, previous: unknown) => {
+    const aggregate = previous as RunAfterComposerAggregate | null;
+    return {
+      imagePaths: retainPromptImageRefsForText(
+        nextText,
+        aggregate?.imagePaths || [],
+      ) as QueuedImageRef[],
+      chips: retainPasteChipsForText(
+        nextText,
+        aggregate?.chips || [],
+      ) as QueuedComposerChip[],
+    } satisfies RunAfterComposerAggregate;
+  }, []);
   const [editorChipPreviewId, setEditorChipPreviewId] = useState<string | null>(null);
   const [editorTitle, setEditorTitle] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -370,6 +440,10 @@ export function PromptQueueOverlay({
       : getQueuedImageMarkerHighlightRanges(editorText, editorImagePaths),
     [editorImagePaths, editorText, isSpecialPromptMode],
   );
+  const editorImageNotice = useMemo(
+    () => isSpecialPromptMode ? null : runAfterImageNotice(editorText, editorImagePaths),
+    [editorImagePaths, editorText, isSpecialPromptMode],
+  );
   const editorPasteMarkerRanges = useMemo(
     () => isSpecialPromptMode
       ? []
@@ -388,7 +462,7 @@ export function PromptQueueOverlay({
         from: range.start,
         to: range.end,
         kind: 'image' as const,
-        label: 'image',
+        label: `image #${range.id}`,
         thumbnailUrl: composerImageUrl(refsById.get(range.id), editorImagePreviewUrls),
       })),
       ...editorPasteMarkerRanges.map((range) => ({
@@ -399,18 +473,14 @@ export function PromptQueueOverlay({
         label: editorText.slice(range.start + 1, Math.max(range.start + 1, range.end - 1)),
       })),
     ];
-    const statusPattern = /\[Image saving…\]|\[(?:imagePath|imageError):[^\]\r\n]+\]/gi;
-    let match: RegExpExecArray | null;
-    while ((match = statusPattern.exec(editorText)) !== null) {
-      result.push({
-        id: `status:${match.index}`,
-        from: match.index,
-        to: match.index + match[0].length,
-        kind: match[0] === RUN_AFTER_IMAGE_PENDING_MARKER ? 'pending' : 'error',
-        label: match[0],
-        replace: false,
-      });
-    }
+    result.push(...getPromptImageStatusTokenRanges(editorText).map((range) => ({
+      id: `status:${range.start}`,
+      from: range.start,
+      to: range.end,
+      kind: range.kind,
+      label: range.label,
+      replace: range.replace,
+    })));
     return result;
   }, [editorImageMarkerRanges, editorImagePaths, editorImagePreviewUrls, editorPasteMarkerRanges, editorText, isSpecialPromptMode]);
   const editorPreviewImageRange = useMemo(() => (
@@ -746,6 +816,40 @@ export function PromptQueueOverlay({
     }
     return accepted;
   }, [acquireEditorPayloadLock, setLoopPromptText, setPostPromptText, tabId, updatePrompt]);
+
+  const applyRunAfterComposerSnapshot = useCallback(({
+    text,
+    chips,
+    imagePaths,
+    selectionStart,
+    selectionEnd = selectionStart,
+    history = 'add',
+    userEvent = 'input',
+  }: {
+    text: string;
+    chips: QueuedComposerChip[];
+    imagePaths: QueuedImageRef[];
+    selectionStart: number;
+    selectionEnd?: number;
+    history?: 'add' | 'replace' | 'external';
+    userEvent?: string;
+  }) => {
+    const editor = editorTextareaRef.current;
+    if (editor) {
+      editor.applySnapshot({
+        value: text,
+        selectionStart,
+        selectionEnd,
+        history,
+        historyPayload: { chips, imagePaths } satisfies RunAfterComposerAggregate,
+        userEvent,
+      });
+    }
+    setEditorText(text);
+    setEditorChips(chips);
+    setEditorImagePaths(imagePaths);
+    writeThroughEditorPayload(text, chips, imagePaths);
+  }, [writeThroughEditorPayload]);
 
   const commitEditor = useCallback((opts?: { close?: boolean; wakeAutoRun?: boolean }) => {
     if (!editorOpen || committingRef.current) return false;
@@ -1351,9 +1455,18 @@ export function PromptQueueOverlay({
     });
   }, [tabId]);
 
-  const focusHistoryComposer = useCallback((reason = 'queue') => {
+  const focusHistoryComposer = useCallback((
+    reason = 'queue',
+    selection?: { start: number; end?: number },
+  ) => {
     console.log('[PromptQueue] focus History composer tab=' + tabId.slice(-8) + ' reason=' + reason);
-    window.dispatchEvent(new CustomEvent('history-panel:focus-composer', { detail: { tabId } }));
+    window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
+      detail: {
+        tabId,
+        selectionStart: selection?.start,
+        selectionEnd: selection?.end ?? selection?.start,
+      },
+    }));
   }, [tabId]);
 
   // Replay handler — paste chip's text into the agent's current input WITHOUT
@@ -1407,6 +1520,10 @@ export function PromptQueueOverlay({
         console.warn('[PromptQueue] replay blocked by attachment validation tab=' + tabId.slice(-8) + ' item=' + id.slice(-8));
         return;
       }
+      if (validation.degraded) {
+        console.warn('[PromptQueue] replay attachment unavailable but transferable tab=' + tabId.slice(-8)
+          + ' item=' + id.slice(-8) + ' action=replace-with-imageError');
+      }
       const payload = buildQueuedPromptPayload(validation.item);
       const submitNow = opts?.submit === true;
       console.log('[PromptQueue] replay start tab=' + tabId.slice(-8) + ' item=' + id.slice(-8) + ' agent=' + sessionType + ' submit=' + submitNow);
@@ -1418,25 +1535,13 @@ export function PromptQueueOverlay({
         const currentText = ui.historyPromptDrafts[tabId] || '';
         const currentImages = ui.historyPromptDraftImages[tabId] || [];
         const currentChips = ui.historyPromptDraftChips[tabId] || [];
-        // Land where the user was writing, not at the very end. The caret is
-        // read straight off the live textarea: it is the only source that is
-        // still correct after clicks, arrow keys and selections the store
-        // never sees. An unfocused/absent field falls back to the end.
-        const composerEl = document.querySelector<HTMLTextAreaElement>(
-          'textarea[data-history-composer-tab-id="' + tabId + '"]',
-        );
-        const caretStart = composerEl
-          ? Math.max(0, Math.min(composerEl.selectionStart ?? currentText.length, currentText.length))
-          : currentText.length;
-        const caretEnd = composerEl
-          ? Math.max(caretStart, Math.min(composerEl.selectionEnd ?? caretStart, currentText.length))
-          : caretStart;
-        // No separator: the user asked for a raw insertion at the caret, so a
-        // synthetic blank line would corrupt the sentence being typed. Only an
-        // append to non-empty text keeps a single space so words never fuse.
-        const appendingAtEnd = caretStart === currentText.length && caretStart === caretEnd;
-        const needsSpace = appendingAtEnd
-          && currentText.length > 0
+        // Replay is a return-to-draft operation, not Paste at caret. Always
+        // append the complete snapshot and leave the caret after it. This also
+        // avoids querying the removed textarea surface now that History uses
+        // CodeMirror.
+        const caretStart = currentText.length;
+        const caretEnd = currentText.length;
+        const needsSpace = currentText.length > 0
           && !/\s$/.test(currentText);
         const insertedText = validation.item.text
           ? (needsSpace ? ' ' : '') + validation.item.text
@@ -1470,23 +1575,17 @@ export function PromptQueueOverlay({
           chips: authoringInsertion.chips,
         });
         removePrompt(tabId, id);
-        focusHistoryComposer('replay-after-history-transfer');
-        // Leave the caret right after what was inserted so typing continues
-        // from there; without this the field re-focuses at its old offset and
-        // the next character lands inside the pasted prompt.
         const caretAfterInsert = authoringInsertion.caret;
-        requestAnimationFrame(() => {
-          const el = document.querySelector<HTMLTextAreaElement>(
-            'textarea[data-history-composer-tab-id="' + tabId + '"]',
-          );
-          if (!el) return;
-          const bounded = Math.min(caretAfterInsert, el.value.length);
-          el.setSelectionRange(bounded, bounded);
+        // The History owner applies this to the live CodeMirror handle after
+        // React has committed the appended value.
+        focusHistoryComposer('replay-after-history-transfer', {
+          start: caretAfterInsert,
+          end: caretAfterInsert,
         });
         console.log('[PromptQueue] replay transferred to History composer tab=' + tabId.slice(-8)
           + ' item=' + id.slice(-8)
           + ' caret=' + caretStart + '→' + caretAfterInsert
-          + ' atEnd=' + appendingAtEnd);
+          + ' atEnd=true');
         return;
       }
       if (replaySurface === 'terminal') {
@@ -1588,10 +1687,14 @@ export function PromptQueueOverlay({
       const nextText = element.value.slice(0, start) + element.value.slice(end);
       const nextChips = retainPasteChipsForText(nextText, editorChips) as QueuedComposerChip[];
       const nextImagePaths = retainPromptImageRefsForText(nextText, editorImagePaths) as QueuedImageRef[];
-      setEditorText(nextText);
-      setEditorChips(nextChips);
-      setEditorImagePaths(nextImagePaths);
-      writeThroughEditorPayload(nextText, nextChips, nextImagePaths);
+      applyRunAfterComposerSnapshot({
+        text: nextText,
+        chips: nextChips,
+        imagePaths: nextImagePaths,
+        selectionStart: start,
+        history: 'add',
+        userEvent: 'delete.cut',
+      });
     }
     clipboard.writeText(result.text);
     if (result.imagePartial > 0 || result.imageMissing > 0) {
@@ -1606,7 +1709,7 @@ export function PromptQueueOverlay({
       + ' imagePartial=' + result.imagePartial
       + ' pastes=' + result.pasteExpanded
       + ' pasteMissing=' + result.pasteMissing);
-  }, [editorChips, editorImagePaths, showToast, tabId, writeThroughEditorPayload]);
+  }, [applyRunAfterComposerSnapshot, editorChips, editorImagePaths, showToast, tabId]);
 
   const handleEditorImagePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const imageItem = Array.from(event.clipboardData?.items || [])
@@ -1626,11 +1729,17 @@ export function PromptQueueOverlay({
         const start = element.selectionStart ?? editorText.length;
         const end = element.selectionEnd ?? start;
         const nextText = editorText.slice(0, start) + pastedText + editorText.slice(end);
-        setEditorText(nextText);
-        writeThroughEditorPayload(nextText, []);
+        const caret = start + pastedText.length;
+        applyRunAfterComposerSnapshot({
+          text: nextText,
+          chips: [],
+          imagePaths: [],
+          selectionStart: caret,
+          history: 'add',
+          userEvent: 'input.paste',
+        });
         requestAnimationFrame(() => {
           const textarea = editorTextareaRef.current;
-          const caret = start + pastedText.length;
           textarea?.focus();
           textarea?.setSelectionRange(caret, caret);
         });
@@ -1657,14 +1766,14 @@ export function PromptQueueOverlay({
       ) as QueuedImageRef[];
       editorDirtyFieldsRef.current.text = true;
       editorDirtyFieldsRef.current.chips = true;
-      setEditorText(insertion.text);
-      setEditorChips(insertion.chips as QueuedComposerChip[]);
-      setEditorImagePaths(nextImagePaths);
-      writeThroughEditorPayload(
-        insertion.text,
-        insertion.chips as QueuedComposerChip[],
-        nextImagePaths,
-      );
+      applyRunAfterComposerSnapshot({
+        text: insertion.text,
+        chips: insertion.chips as QueuedComposerChip[],
+        imagePaths: nextImagePaths,
+        selectionStart: insertion.caret,
+        history: 'add',
+        userEvent: 'input.paste',
+      });
       requestAnimationFrame(() => {
         const textarea = editorTextareaRef.current;
         textarea?.focus();
@@ -1697,11 +1806,15 @@ export function PromptQueueOverlay({
     ) as QueuedImageRef[];
     editorDirtyFieldsRef.current.text = true;
     editorDirtyFieldsRef.current.chips = true;
-    setEditorText(pendingText);
-    setEditorChips(pendingChips);
-    setEditorImagePaths(pendingImagePaths);
-    writeThroughEditorPayload(pendingText, pendingChips, pendingImagePaths);
     const pendingCaret = start + RUN_AFTER_IMAGE_PENDING_MARKER.length;
+    applyRunAfterComposerSnapshot({
+      text: pendingText,
+      chips: pendingChips,
+      imagePaths: pendingImagePaths,
+      selectionStart: pendingCaret,
+      history: 'add',
+      userEvent: 'input.paste',
+    });
     requestAnimationFrame(() => {
       const textarea = editorTextareaRef.current;
       textarea?.focus();
@@ -1795,9 +1908,14 @@ export function PromptQueueOverlay({
           : false;
       if (!accepted) throw new Error('run_after_editor_write_rejected');
       if (editorStillOwnsDraft) {
-        setEditorText(composerInsertion.text);
-        setEditorChips(nextChips);
-        setEditorImagePaths(nextImagePaths);
+        applyRunAfterComposerSnapshot({
+          text: composerInsertion.text,
+          chips: nextChips,
+          imagePaths: nextImagePaths,
+          selectionStart: composerInsertion.caret,
+          history: 'replace',
+          userEvent: 'input.complete',
+        });
       }
       if (sourceSnapshot.missing > 0) {
         showToast('One or more image files are unavailable. Inserted imageError instead.', 'warning', 4000);
@@ -1846,16 +1964,21 @@ export function PromptQueueOverlay({
           : false;
       if (!accepted) return;
       if (editorStillOwnsDraft) {
-        setEditorText(failedText);
-        setEditorChips(failedChips);
-        setEditorImagePaths(failedImagePaths);
+        applyRunAfterComposerSnapshot({
+          text: failedText,
+          chips: failedChips,
+          imagePaths: failedImagePaths,
+          selectionStart: failedText.length,
+          history: 'replace',
+          userEvent: 'input.complete',
+        });
       }
       showToast('Could not import the image. Inserted imageError instead.', 'warning', 4000);
       console.warn('[PromptQueue:Images] paste-import failed tab=' + tabId.slice(-8)
         + ' item=' + (initial.id || 'new')
         + ' error=' + String(cause?.message || cause));
     });
-  }, [aiComposerChipThreshold, editorChips, editorImagePaths, editorText, isSpecialPromptMode, showToast, tabId, updatePrompt, writeThroughEditorPayload]);
+  }, [aiComposerChipThreshold, applyRunAfterComposerSnapshot, editorChips, editorImagePaths, editorText, isSpecialPromptMode, showToast, tabId, updatePrompt, writeThroughEditorPayload]);
 
   const replaceEditorPasteAnchor = useCallback((
     chip: QueuedComposerChip,
@@ -1865,18 +1988,24 @@ export function PromptQueueOverlay({
     if (!range) return;
     const nextText = editorText.slice(0, range.start) + replacement + editorText.slice(range.end);
     const nextChips = editorChips.filter((item) => item.id !== chip.id);
+    const nextImagePaths = retainPromptImageRefsForText(nextText, editorImagePaths) as QueuedImageRef[];
     editorDirtyFieldsRef.current.text = true;
     editorDirtyFieldsRef.current.chips = true;
-    setEditorText(nextText);
-    setEditorChips(nextChips);
-    writeThroughEditorPayload(nextText, nextChips);
-    setEditorChipPreviewId((current) => current === chip.id ? null : current);
     const caret = range.start + replacement.length;
+    applyRunAfterComposerSnapshot({
+      text: nextText,
+      chips: nextChips,
+      imagePaths: nextImagePaths,
+      selectionStart: caret,
+      history: 'add',
+      userEvent: replacement ? 'input' : 'delete',
+    });
+    setEditorChipPreviewId((current) => current === chip.id ? null : current);
     requestAnimationFrame(() => {
       editorTextareaRef.current?.focus();
       editorTextareaRef.current?.setSelectionRange(caret, caret);
     });
-  }, [editorChips, editorPasteMarkerRanges, editorText, writeThroughEditorPayload]);
+  }, [applyRunAfterComposerSnapshot, editorChips, editorImagePaths, editorPasteMarkerRanges, editorText]);
 
   const openEditorPasteChipContextMenu = useCallback((chip: QueuedComposerChip) => {
     ipcRenderer.send('show-paste-chip-context-menu', {
@@ -1920,19 +2049,17 @@ export function PromptQueueOverlay({
         }
         const text = raw.trim();
         const historyImages = ui.historyPromptDraftImages[tabId] || [];
-        const historyImageIds = collectPromptImageRefIds(raw);
+        const historyImageInspection = inspectPromptImageAttachments(raw, historyImages);
         const historyAttachmentsBlocked = raw.includes('[Image saving…]')
-          || /\[imageError:\s*[^\]\r\n]+\]/i.test(raw)
-          || hasMalformedPromptImageMarker(raw, historyImages)
-          || getPromptImageAttachmentState({
-            text: raw,
-            images: historyImageIds.size,
-            imagePaths: historyImages,
-          }) !== 'ready';
+          || historyImageInspection.blocking;
         if (historyAttachmentsBlocked) {
           showToast('Wait for the image attachment or repair its marker before moving this prompt', 'warning');
           focusHistoryComposer('grab-history-image-blocked');
           return;
+        }
+        if (historyImageInspection.unavailable) {
+          console.warn('[PromptQueue:Grab] History attachment unavailable but transferable tab='
+            + tabId.slice(-8) + ' action=keep-explicit-imageError');
         }
         const queueImages: QueuedImageRef[] = historyImages.map((ref) => ({
           id: ref.id,
@@ -2141,41 +2268,25 @@ export function PromptQueueOverlay({
     ? `${editorPreviewChip.text.length.toLocaleString()} symbols`
     : editorPreviewFileName;
   const hasEditorPreview = !!editorPreviewLabel;
-  const editorAvailableLeft = editorAnchor
-    ? editorViewport.width
-      - editorAnchor.right
-      - editorSize.width
-      - EDITOR_PREVIEW_GAP
-      - EDITOR_MARGIN
-    : 0;
-  const editorPreviewBeside = editorAvailableLeft >= EDITOR_PREVIEW_MIN_SIDE_WIDTH;
-  const editorPreviewWidth = editorAnchor
-    ? Math.max(
-      180,
-      Math.min(
-        EDITOR_PREVIEW_MAX_WIDTH,
-        editorSize.width,
-        editorPreviewBeside
-          ? editorAvailableLeft
-          : editorViewport.width - editorAnchor.right - EDITOR_MARGIN,
-      ),
-    )
-    : EDITOR_WIDTH;
-  const editorPreviewTop = editorAnchor
-    ? editorPreviewBeside
-      ? editorAnchor.top
-      : editorAnchor.top + editorMeasuredHeight + EDITOR_PREVIEW_GAP
-    : 0;
-  const editorPreviewRight = editorAnchor
-    ? editorPreviewBeside
-      ? editorAnchor.right + editorSize.width + EDITOR_PREVIEW_GAP
-      : editorAnchor.right
-    : 0;
-  const editorPreviewMaxHeight = editorAnchor
-    ? editorPreviewBeside
-      ? editorAnchor.maxHeight
-      : Math.max(80, editorViewport.height - editorPreviewTop - EDITOR_MARGIN)
-    : EDITOR_MIN_HEIGHT;
+  const editorPreviewLayout = editorAnchor
+    ? resolveRunAfterPreviewPlacement({
+      viewport: editorViewport,
+      anchor: editorAnchor,
+      editorWidth: editorSize.width,
+      editorHeight: editorMeasuredHeight,
+      margin: EDITOR_MARGIN,
+      gap: EDITOR_PREVIEW_GAP,
+      maxWidth: EDITOR_PREVIEW_MAX_WIDTH,
+      minSideWidth: EDITOR_PREVIEW_MIN_SIDE_WIDTH,
+      minPreviewWidth: 180,
+      minPreviewHeight: 80,
+    })
+    : null;
+  const editorPreviewBeside = editorPreviewLayout?.placement === 'left';
+  const editorPreviewWidth = editorPreviewLayout?.width ?? EDITOR_WIDTH;
+  const editorPreviewTop = editorPreviewLayout?.top ?? 0;
+  const editorPreviewRight = editorPreviewLayout?.right ?? 0;
+  const editorPreviewMaxHeight = editorPreviewLayout?.maxHeight ?? EDITOR_MIN_HEIGHT;
 
   // ─── render ──────────────────────────────────────────────────────────────
   return (
@@ -2660,6 +2771,7 @@ export function PromptQueueOverlay({
             const isReplaySubmitMode = isReplayHovered && cmdPressed && !replayingIds.has(it.id);
             const attachmentState = getQueuedPromptAttachmentState(it);
             const malformedImageMarker = hasMalformedQueuedImageMarker(it.text, it.imagePaths);
+            const attachmentNotice = runAfterImageNotice(it.text, it.imagePaths || []);
             const chipClass = [
               'pq-chip',
               appearingIds.has(it.id) ? 'pq-chip-enter' : '',
@@ -2835,10 +2947,11 @@ export function PromptQueueOverlay({
                 ) : (
                   <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: promptQueueChipFontSize, lineHeight: `${chipTextLineHeight}px`, color: isEnabled ? '#ddd' : DISABLED_PROMPT_TEXT }}>{title}</span>
                 )}
-                {it.images > 0 && (
+                {(it.images > 0 || attachmentState === 'missing') && (
                   <span
                     title={attachmentState === 'missing'
-                      ? (malformedImageMarker ? 'Image marker is damaged' : 'Image file is unavailable')
+                      ? (attachmentNotice?.message
+                        || (malformedImageMarker ? 'Image marker is damaged' : 'Image file is unavailable'))
                       : (attachmentState === 'materializing' ? 'Saving image…' : `${it.images} image${it.images === 1 ? '' : 's'}`)}
                     style={{
                       color: attachmentState === 'missing' ? DELETE_RED : (attachmentState === 'materializing' ? '#eab308' : TINT),
@@ -3293,13 +3406,17 @@ export function PromptQueueOverlay({
                                 const nextChips = editorChips.filter((item) => item.id !== chip.id);
                                 editorDirtyFieldsRef.current.text = true;
                                 editorDirtyFieldsRef.current.chips = true;
-                                setEditorText(restored.text);
-                                setEditorChips(nextChips);
-                                writeThroughEditorPayload(restored.text, nextChips);
+                                applyRunAfterComposerSnapshot({
+                                  text: restored.text,
+                                  chips: nextChips,
+                                  imagePaths: editorImagePaths,
+                                  selectionStart: restored.caret,
+                                  history: 'add',
+                                  userEvent: 'input',
+                                });
                                 setEditorChipPreviewId((current) => current === chip.id ? null : current);
                                 requestAnimationFrame(() => {
                                   editorTextareaRef.current?.focus();
-                                  editorTextareaRef.current?.setSelectionRange(restored.caret, restored.caret);
                                 });
                               }}
                             >
@@ -3315,9 +3432,19 @@ export function PromptQueueOverlay({
                                 event.preventDefault();
                                 event.stopPropagation();
                                 const nextChips = editorChips.filter((item) => item.id !== chip.id);
+                                const textarea = editorTextareaRef.current;
+                                const selectionStart = textarea?.selectionStart ?? editorText.length;
+                                const selectionEnd = textarea?.selectionEnd ?? selectionStart;
                                 editorDirtyFieldsRef.current.chips = true;
-                                setEditorChips(nextChips);
-                                writeThroughEditorPayload(editorText, nextChips);
+                                applyRunAfterComposerSnapshot({
+                                  text: editorText,
+                                  chips: nextChips,
+                                  imagePaths: editorImagePaths,
+                                  selectionStart,
+                                  selectionEnd,
+                                  history: 'add',
+                                  userEvent: 'delete',
+                                });
                                 setEditorChipPreviewId((current) => current === chip.id ? null : current);
                               }}
                             >
@@ -3331,6 +3458,31 @@ export function PromptQueueOverlay({
                 </div>
               )}
             </>
+          )}
+          {editorImageNotice && !editorImageNotice.progress && (
+            <div
+              role={editorImageNotice.blocking ? 'alert' : 'status'}
+              data-run-after-image-notice
+              data-blocking={editorImageNotice.blocking ? 'true' : 'false'}
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: 7,
+                padding: '6px 8px',
+                borderBottom: `1px solid ${editorImageNotice.blocking ? 'rgba(248, 113, 113, 0.45)' : 'rgba(251, 191, 36, 0.4)'}`,
+                background: editorImageNotice.blocking
+                  ? 'rgba(127, 29, 29, 0.18)'
+                  : 'rgba(217, 119, 6, 0.14)',
+                color: editorImageNotice.blocking ? '#fecaca' : '#fcd34d',
+                fontSize: Math.max(10, promptQueueEditorFontSize - 1),
+                lineHeight: 1.35,
+                overflowWrap: 'anywhere',
+                flexShrink: 0,
+              }}
+            >
+              <TriangleAlert size={13} style={{ flex: '0 0 auto', marginTop: 1 }} />
+              <span>{editorImageNotice.message}</span>
+            </div>
           )}
           <div
             style={{
@@ -3349,21 +3501,35 @@ export function PromptQueueOverlay({
               autoFocus={editorAutoFocus && isSpecialPromptMode}
               value={editorText}
               tokens={editorComposerTokens}
+              historyPayload={editorHistoryPayload}
+              historyOwnerKey={`run-after:${tabId}:${specialPromptMode || editingId || 'new'}`}
+              deriveHistoryPayload={deriveEditorHistoryPayload}
+              historyPayloadEqual={runAfterComposerAggregateEqual}
               fontSize={promptQueueEditorFontSize}
-              onChange={(nextText) => {
+              clipboard={electronComposerClipboardAdapter}
+              onChange={(nextText, _selection, historyPayload) => {
                 if (isSpecialPromptMode) editorDirtyFieldsRef.current.special = true;
                 else editorDirtyFieldsRef.current.text = true;
+                const aggregate = historyPayload as RunAfterComposerAggregate | null;
                 const nextImagePaths = isSpecialPromptMode
                   ? []
-                  : retainPromptImageRefsForText(nextText, editorImagePaths) as QueuedImageRef[];
+                  : (aggregate?.imagePaths || retainPromptImageRefsForText(
+                      nextText,
+                      editorImagePaths,
+                    ) as QueuedImageRef[]);
+                const nextChips = isSpecialPromptMode ? [] : (aggregate?.chips || editorChips);
                 setEditorText(nextText);
+                setEditorChips(nextChips);
                 setEditorImagePaths(nextImagePaths);
-                writeThroughEditorPayload(nextText, editorChips, nextImagePaths);
+                writeThroughEditorPayload(nextText, nextChips, nextImagePaths);
               }}
               onCopy={handleEditorImageAwareCopy}
               onCut={handleEditorImageAwareCopy}
               onPaste={handleEditorImagePaste}
               onKeyDown={(e) => {
+                // Opt+Arrow crosses an opaque marker in one step — same rule
+                // as the History composer, same spans as the highlight layer.
+                if (applyMarkerAwareWordMotion(e, [...editorImageMarkerRanges, ...editorPasteMarkerRanges])) return;
                 if (e.key === 'Escape') resetEditor();
                 if (e.key === 'Enter' && e.metaKey) commitEditor();
               }}
