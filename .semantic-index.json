@@ -1050,6 +1050,46 @@
     "hash": "942cf6e3b7f8bd1107fc0bebcc1d32b37fd8a42f7950374bcaf3f84d863de9e7"
   },
   {
+    "path": "docs/knowledge/fact-control-hints-and-help.md",
+    "hash": "8eb13bf72b290cb5ec5b638f04bd93205081c60a2db7f31033bfd0a2bb11fdc5",
+    "type": "fact",
+    "explicit": [
+      "control hints",
+      "Cmd hover tooltip",
+      "interface help page",
+      "Restart after",
+      "interface hints toggle",
+      "tooltip contract",
+      "non-interactive tooltip",
+      "native title suppression",
+      "diagnostic TXT export"
+    ],
+    "implicit": [
+      "ControlHint",
+      "Tooltip",
+      "interactive=false",
+      "hover bridge",
+      "runtime-store",
+      "modifier key gating",
+      ":hover revalidation",
+      "desktop iOS MCP API session model",
+      "rollout history",
+      "marker state",
+      "help page navigation",
+      "persistent settings reset"
+    ],
+    "symptoms": [
+      "When an icon-only control needs a short explanation without changing its behavior, this file tells you to use a passive ControlHint.",
+      "When a tooltip stays open after the cursor leaves or appears without a real hover, this file describes the stale-popover and hover recheck contract.",
+      "When a control already owns its own modifier action or detailed preview, this file explains why the shared hint must not stack a second popover on top.",
+      "When the interface hints toggle seems to disable Cmd+click, drag, or menu actions, this file clarifies that only the first hint mode is affected.",
+      "When the general help page needs to show the product model, interface hints switch, complex topics, or a diagnostic export, this file describes the expected contents.",
+      "When working on the Restart after flow, this file points you to the user sequence and the supporting runtime contract.",
+      "When a developer needs acceptance criteria for hover, modifier keys, and the help page, this file points to the end-to-end scenario that verifies them."
+    ],
+    "related_components": []
+  },
+  {
     "path": "docs/knowledge/fact-css-layout.md",
     "type": "fact",
     "explicit": [
@@ -3307,86 +3347,70 @@
   },
   {
     "path": "docs/knowledge/fact-timeline.md",
-    "hash": "c10d11ac9dcd63b035484cde94b9a262151a4116fa9774a90895d2d16f74e52b",
+    "hash": "3d394939b853af71a3e0c41706a2d60814f992cf6a98e18ef7af7dffcbb3305b",
     "type": "fact",
     "explicit": [
       "Claude History Timeline",
-      "timeline visibility",
-      "viewport dash",
-      "old history zone",
-      "compact and continued markers",
-      "history tooltip",
-      "context menu geometry",
+      "timeline visibility and reachability",
+      "click-to-scroll navigation",
       "range copy and edit range",
-      "delete range",
-      "rewind",
-      "auto-scroll",
-      "expanded mode",
-      "scroll-to-bottom arrow",
-      "fork and plan mode markers",
-      "smart tooltip",
-      "reachability detection",
-      "docs attribution badges"
+      "rewind and history context menu",
+      "expanded mode and tooltip behavior"
     ],
     "implicit": [
       "Timeline.tsx",
-      "terminalRegistry.scrollToEntry",
-      "terminalRegistry.searchAndScrollToNth",
-      "SessionTranscriptService",
-      "claude:get-timeline",
-      "codex:get-timeline",
-      "gemini:get-timeline",
-      "claude:copy-range",
-      "claude:edit-range",
-      "claude:delete-user-entry",
-      "claude:open-history-menu",
-      "claude:delete-range",
-      "history-panel:scrolled-to",
-      "history-panel:scroll-to-bottom",
-      "claudeSpinnerBusy.has(tabId)",
-      "popupRightPx",
-      "content-visibility:auto",
-      "containIntrinsicSize",
-      "ResizeObserver",
-      "requestAnimationFrame",
-      "OSC 7777",
-      "parentUuid",
-      "compact_boundary",
-      "isCompactSummary",
-      "historyPanelOpenTabs",
-      "noted-terminal-timeline-width",
-      "noted-terminal-history-panel-width"
+      "terminalRegistry.ts",
+      "ipc/claude-data.js",
+      "gemini-data.js",
+      "main.js",
+      "history-panel",
+      "session transcript service",
+      "OSC 7777 markers",
+      "fork markers",
+      "plan mode markers",
+      "compact boundary",
+      "continued entries",
+      "content-visibility",
+      "virtualized history panel",
+      "right-anchored popups",
+      "range selection state"
     ],
     "symptoms": [
-      "When the timeline markers need to explain where the current AI session is and how to jump to a message, this file defines the rules. When a dot should become a dash, fade to gray, or turn red, this file tells you why. When clicking a point opens the wrong menu or the menu overlaps another action, this file covers the geometry and mutual exclusion rules. When rewind, copy, edit, or delete actions behave differently for Claude, Gemini, and Codex, this file explains the runtime-specific contracts. When a developer needs to know why compact or continued entries are clickable only in some views, this file is the source of truth. When auto-scroll, expanded mode, or scroll-to-bottom behavior feels inconsistent after switching tabs or appending entries, this file describes the expected behavior.",
-      "When docs-related search or edit activity should be shown as badges instead of separate timeline entries, this file explains the attribution model."
+      "When the right-side timeline appears but clicks land on the wrong message, this file explains the navigation rules and marker mapping.",
+      "When a message is visible in the terminal but the timeline dot becomes a dash, this file explains the viewport-based active-state logic.",
+      "When compact, continued, or plan-mode entries behave differently from normal prompts, this file explains why they have special reachability and click rules.",
+      "When right-click menus, rewind actions, or range copy/edit flows overlap or close unexpectedly, this file explains the menu geometry and mutual-exclusion contract.",
+      "When switching tabs, resuming a session, or returning to an app and the timeline should stay scrolled to the bottom, this file explains the auto-scroll behavior.",
+      "When expanded timeline previews, tooltips, or history side-panels render inconsistently, this file explains sizing, persistence, and read-only preview constraints."
     ],
     "related_components": [
       "Timeline.tsx",
       "terminalRegistry.ts",
-      "main.js",
       "ipc/claude-data.js",
-      "gemini-data.js"
+      "gemini-data.js",
+      "main.js"
     ]
   },
   {
     "path": "docs/knowledge/fact-transcript-сервис.md",
-    "hash": "a1ce9f04c5af6c14a5bd02eeed4e058329e1c071496fa69315325945cc47bddc",
+    "hash": "8484fc4e9b91031d61b5f6a817031b46e73df6c5a514d764d557bc11ba0a2920",
     "type": "fact",
     "explicit": [
-      "transcript service",
+      "Transcript Service",
       "main-process invalidation",
       "snapshot reading",
-      "Claude transcripts",
-      "Codex rollout transcripts",
+      "durable transcript source",
+      "Claude history",
+      "Codex rollout history",
       "Timeline",
       "HistoryPanel",
       "Project Terminal API",
       "native iOS",
       "display projection",
+      "Codex live chat",
       "incremental cache",
-      "resource model",
-      "resolved path memo"
+      "resolved path memo",
+      "large session memory"
     ],
     "implicit": [
       "SessionTranscriptService",
@@ -3405,30 +3429,24 @@
       "event_msg.user_message",
       "response_item",
       "projection envelope",
-      "tool_use_id",
-      "history-payload-dehydrate.js",
-      "history:get-tool-payload",
-      "Virtuoso",
-      "SSE",
-      "WS",
-      "LRU cache"
+      "parentUuid backtrace",
+      "LRU cache",
+      "watcher ref-count",
+      "inflight promise",
+      "chunked JSONL reader",
+      "rolling leftover buffer",
+      "deduped file watcher"
     ],
     "symptoms": [
-      "Timeline or HistoryPanel appears to do nothing after a click on a long session until a later refresh happens. A developer needs this file when multiple surfaces read the same transcript file with different polling loops or cache assumptions.",
-      "A Codex rollout with a long replacement_history or tool output makes the main process pause for a noticeable time. This file explains why the transcript layer must avoid repeated full parses across Timeline, History, iOS, and hover requests.",
-      "Native iOS and desktop History show duplicate or missing live messages after a reload. This file is needed when live SSE, REST snapshots, and display classification disagree about what is durable history versus ephemeral process noise.",
-      "Right-clicking a tab or switching back to a Codex tab feels slow only sometimes. This file describes the resolved-path cache issue where reopening a session file required a full walk of ~/.codex/sessions.",
-      "History and Timeline diverge after reload because one path treats reasoning or tool output as messages and another does not. This file is needed when snapshot and live projection must use the same server-side classification.",
-      "A developer sees growing memory use or repeated parsing of the same large rollout file. This file covers the incremental cache, bounded LRU, and single-inflight reader behavior that prevent duplicate work."
+      "Timeline opens quickly but History sometimes appears to do nothing on very large sessions.",
+      "A manual scroll right after switching to History can jitter or jump.",
+      "Codex live chat can show duplicate messages if live and snapshot layers both emit rows.",
+      "Reloaded History can show reasoning or tool-output rows that the live view never showed.",
+      "Right-clicking a tab can feel slow because session-file discovery is walking large Codex session folders again.",
+      "A developer needs this file when Claude history migration looks tempting to unify but recovery parity is still unproven.",
+      "A developer needs this file when one surface sees new transcript rows while another surface stays stale or diverges."
     ],
-    "related_components": [
-      "src/main/main.js",
-      "src/main/transcript-service",
-      "src/main/codex-session-file",
-      "src/renderer/components/Timeline.tsx",
-      "src/renderer/components/HistoryPanel.tsx",
-      "src/main/web-server.js"
-    ]
+    "related_components": []
   },
   {
     "path": "docs/knowledge/fact-workspace.md",
@@ -3473,44 +3491,54 @@
   },
   {
     "path": "docs/knowledge/fact-группировка-таймлайна.md",
-    "hash": "16aef590f312498f6449f0ea8fdf290b383d5eb735a994a87ca2c4e357e1c369",
+    "hash": "ff0299831f0512183f0fce5e4df1e6b7e33ce2af297dca1a28771debc8e970f8",
     "type": "fact",
     "explicit": [
-      "semantic timeline grouping",
+      "semantic grouping of Timeline",
       "manual grouping contract",
-      "flat one-level outline",
-      "deterministic AI input preparation",
-      "timeline projection in expanded view",
-      "compact attribution to groups",
-      "single-turn group titles",
+      "AI input preparation for grouping",
+      "Timeline projection in expanded view",
+      "compact assignment to groups",
+      "naming of individual turns",
       "ownership and async boundaries",
-      "non-goals for nested chapters and auto regrouping"
+      "non-goals for current grouping system"
     ],
     "implicit": [
-      "ProjectToolbar groups button",
       "canonical Timeline",
-      "History view",
-      "Claude timeline",
-      "Codex timeline",
-      "sticky group header",
-      "Cmd-hover popup",
-      "stable group id",
-      "session-layer boundary",
+      "HistoryPanel",
+      "JSONL",
+      "UUID mapping",
       "continued boundary",
-      "plan boundary",
-      "rewind marker",
+      "session-layer boundary",
+      "Plan boundary",
+      "Rewind marker",
       "fork boundary",
-      "prompt summary",
-      "action override",
-      "replacement_history",
+      "stable group id",
+      "toolType+sessionId key",
+      "toolType+sessionId+entry UUID key",
+      "Prompt Summary",
+      "Settings template prefix",
+      "META marker",
+      "head+tail prompt slicing",
       "countTokens",
       "nested response schema",
-      "gemini provider validation"
+      "Gemini provider schema",
+      "semantic compact",
+      "replacement_history",
+      "role metadata",
+      "sticky header",
+      "Cmd-hover",
+      "collapse-state"
     ],
     "symptoms": [
-      "When a session has 20 to 60 iterations and the sequence feels too long to scan, this file explains how semantic grouping is supposed to summarize the phases without changing the raw history. When groups do not update after new turns, or a new tail appears outside the saved outline, you need the manual grouping contract and its stale-outline behavior. When a grouping request crosses a continue, plan, note, rewind, or fork boundary, this file explains which boundaries are illegal and why. When a compacted block seems to float between groups or a collapsed group hides the wrong compact rows, this file describes the ownership rules for compact segments. When group labels, hover text, or collapse state behave strangely in Timeline, this file explains the sticky header, stable group id, and state hydration rules. When AI grouping fails on coverage, token limits, or prompt preparation, this file describes the deterministic input shaping and validation constraints."
+      "When a project has 20 to 60 turns and the flow no longer reads as stages, this file explains semantic grouping. When the group button rebuilds the current session but older groups do not rename themselves after new turns arrive, this file is the contract. When a grouped view must stay aligned with raw Timeline and History without rewriting JSONL or UUIDs, this file is needed. When compacts, notes, Rewind markers, or fork boundaries must remain visible and not be hidden by collapse logic, this file defines the behavior. When hover, collapse, or selection state breaks after a transcript refresh even though the group ids did not change, this file describes the stable-id rule."
     ],
-    "related_components": []
+    "related_components": [
+      "docs/knowledge/fact-timeline.md",
+      "docs/knowledge/fact-codex.md",
+      "docs/knowledge/fix-stale-closure-timeline.md",
+      "docs/knowledge/fix-timeline-tooltip-stability.md"
+    ]
   },
   {
     "path": "docs/knowledge/fact-история-как-основная-поверхность.md",
@@ -5807,40 +5835,37 @@
   },
   {
     "path": "docs/knowledge/fix-stale-closure-timeline.md",
-    "hash": "b44dddb6b3620f599d9f543453f0c097910ee73e9fd8796287be3374d27adc7e",
+    "hash": "2a549339936a2bb28546db40e08b8018747fc7d064787a22955d9cd5f284bff4",
     "type": "fix",
     "explicit": [
-      "stale closure in auto-refresh handlers",
-      "State + Ref pattern",
-      "useCallback caveats",
-      "Timeline auto-refresh",
-      "Edit-Range flow",
-      "Prompt Summary owner-race"
+      "stale closure",
+      "state plus ref pattern",
+      "auto-refresh handlers",
+      "Timeline",
+      "Edit-Range fetch",
+      "prompt summary owner race",
+      "late result validation"
     ],
     "implicit": [
-      "useRef",
-      "useState",
-      "useCallback",
-      "polling",
-      "Claude JSONL",
-      "Gemini API",
-      "addEventListener",
-      "IPC handler",
+      "useRef.current",
+      "useState setter parity",
+      "useCallback dependency capture",
+      "IPC handler lifetime",
+      "addEventListener closure retention",
       "React.memo",
-      "React DevTools",
-      "useStore.getState",
-      "sessionIdRef",
-      "_savedEditRangeMap",
-      "canonical UUID set",
+      "Transcript Service reconciliation",
       "immutable owner-snapshot",
-      "session/tool/session/cwd owner tracking"
+      "generation check",
+      "canonical UUID set",
+      "savedEditRangeMap",
+      "sessionIdRef"
     ],
     "symptoms": [
-      "`findIndex` or similar lookup returns `-1` even though the item is present in the latest store state.",
-      "An async handler reads an empty array or an old session long after the component has re-rendered.",
-      "A delayed fetch response is applied to the wrong session after a tab switch or owner change.",
-      "Background polling updates the UI, but a memoized callback still behaves as if the old data never changed.",
-      "An Edit-Range or summary job finishes later and must be guarded against stale session identity before writing results."
+      "A lookup like `array.findIndex(x => x.id === knownId)` returns `-1` even though the item is present in the live store.",
+      "An async handler fires seconds later and reads an empty array or an old session after the UI has already refreshed in the background.",
+      "An Edit-Range or similar delayed fetch resolves after a tab switch and would write into the wrong session unless the current ref is checked.",
+      "Prompt summary generation appears to pair a new session id with stale entries from the previous tab.",
+      "A late result must be deferred or rejected because the owner changed while the request was in flight."
     ],
     "related_components": [
       "Timeline.tsx",

@@ -30,7 +30,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil, Columns2 } from 'lucide-react';
 import {
   normalizeSelectedVisualRootIds,
   orderVisualHierarchyItems,
@@ -61,6 +61,13 @@ import {
   type VerticalResolutionCache,
   type VerticalSemanticBoundary,
 } from './tabVerticalDnd';
+import {
+  TAB_COLORS as SHARED_TAB_COLORS,
+  adjustRgbaAlpha,
+  flattenRgbaOnTabbarPanel,
+  getTabChromeColorConfig,
+} from './tabChrome';
+import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -694,51 +701,10 @@ const findVerticalDragSourceRect = (sourceData: DragData, geometry: VerticalDrag
 // данные в Tab.sessionStatus остаются (если статус вернут — маркер появится снова).
 type SessionStatus = string;
 
-const TAB_COLORS: { color: TabColor; bgColor: string; borderColor: string; label: string }[] = [
-  { color: 'default', bgColor: 'transparent', borderColor: '#666', label: '⚪ Default' },
-  { color: 'red', bgColor: 'rgba(239, 68, 68, 0.2)', borderColor: 'rgb(239, 68, 68)', label: '🔴 Red' },
-  { color: 'yellow', bgColor: 'rgba(234, 179, 8, 0.2)', borderColor: 'rgb(234, 179, 8)', label: '🟡 Yellow' },
-  { color: 'green', bgColor: 'rgba(34, 197, 94, 0.2)', borderColor: 'rgb(34, 197, 94)', label: '🟢 Green' },
-  { color: 'blue', bgColor: 'rgba(59, 130, 246, 0.2)', borderColor: 'rgb(59, 130, 246)', label: '🔵 Blue' },
-  { color: 'purple', bgColor: 'rgba(168, 85, 247, 0.2)', borderColor: 'rgb(168, 85, 247)', label: '🟣 Purple' },
-  { color: 'claude', bgColor: 'rgba(218, 119, 86, 0.2)', borderColor: '#DA7756', label: '🟠 Claude' },
-  { color: 'gemini', bgColor: 'rgba(78, 134, 248, 0.2)', borderColor: '#4E86F8', label: '💎 Gemini' },
-  { color: 'codex', bgColor: 'rgba(16, 163, 127, 0.18)', borderColor: '#10A37F', label: 'Codex' },
-];
-
-const adjustRgbaAlpha = (rgba: string, delta: number): string => {
-  const m = rgba.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
-  if (!m) return rgba;
-  const [, r, g, b, a = '0.2'] = m;
-  const newAlpha = Math.max(0, Math.min(1, parseFloat(a) + delta));
-  return `rgba(${r}, ${g}, ${b}, ${newAlpha})`;
-};
-
-const TABBAR_PANEL_RGB = { r: 37, g: 37, b: 38 };
-const TABBAR_PANEL_BG = `rgb(${TABBAR_PANEL_RGB.r}, ${TABBAR_PANEL_RGB.g}, ${TABBAR_PANEL_RGB.b})`;
-
-const flattenRgbaOnTabbarPanel = (color: string): string => {
-  if (color === 'transparent') return TABBAR_PANEL_BG;
-  const m = color.match(/rgba?\(\s*(\d+),\s*(\d+),\s*(\d+)(?:,?\s*([\d.]+))?\s*\)/);
-  if (!m) return color;
-  const [, rText, gText, bText, aText] = m;
-  const alpha = aText === undefined ? 1 : Math.max(0, Math.min(1, parseFloat(aText)));
-  const r = Number(rText);
-  const g = Number(gText);
-  const b = Number(bText);
-  if (alpha >= 1) return `rgb(${r}, ${g}, ${b})`;
-  const blend = (fg: number, bg: number) => Math.round((fg * alpha) + (bg * (1 - alpha)));
-  return `rgb(${blend(r, TABBAR_PANEL_RGB.r)}, ${blend(g, TABBAR_PANEL_RGB.g)}, ${blend(b, TABBAR_PANEL_RGB.b)})`;
-};
-
-const getTabChromeColorConfig = (tab: Pick<TabData, 'color' | 'tabType'>) => {
-  const base = TAB_COLORS.find(c => c.color === tab.color) || TAB_COLORS[0];
-  return tab.tabType === 'claude-sdk' && tab.color === 'claude'
-    ? { ...base, bgColor: 'rgba(210, 140, 90, 0.30)', borderColor: '#D28C5A' }
-    : tab.tabType === 'file'
-      ? { ...base, bgColor: '#181725', borderColor: '#8b5cf6' }
-    : base;
-};
+// Chrome (colors + blend helpers) is shared with TabSwitcherOverlay and the
+// split-pane attach row — see tabChrome.ts. Local alias narrows `color` back
+// to TabColor for the context-menu palette pickers.
+const TAB_COLORS = SHARED_TAB_COLORS as { color: TabColor; bgColor: string; borderColor: string; label: string }[];
 
 const getVisualConnectorColor = (tab: TabData, isActive: boolean) => {
   const config = getTabChromeColorConfig(tab);
@@ -1530,6 +1496,16 @@ const TabItem = memo(({
   const statusMeta = sessionStatus
     ? sessionStatuses.find((s) => s.id === sessionStatus)
     : null;
+  // Linked file gone from disk → red FileText icon. Shared verdict cache with
+  // the Ctrl+Tab switcher; probe fires on hover/render throttled by TTL.
+  const [missingTick, setMissingTick] = useState(0);
+  useEffect(() => {
+    if (tab.tabType !== 'file' || !tab.filePath) return;
+    probeFiles([tab.filePath]);
+    return subscribeMissingFiles(() => setMissingTick((v) => v + 1));
+  }, [tab.tabType, tab.filePath]);
+  void missingTick;
+  const linkedFileMissing = tab.tabType === 'file' && isFileMissing(tab.filePath);
   // position — left|right (юзер выбирает в Settings). Цвет полоски и shimmer
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
@@ -2275,7 +2251,15 @@ const TabItem = memo(({
               }}
             >
               {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
-              {tab.tabType === 'file' && <FileText size={12} className="flex-shrink-0 text-[#a78bfa] opacity-90" />}
+              {tab.tabType === 'file' && (
+                // Red = the linked file vanished from disk (moved/renamed/
+                // deleted). The tab stays; only the icon reports the state.
+                <FileText
+                  size={12}
+                  className={`flex-shrink-0 opacity-90 ${linkedFileMissing ? 'text-[#f87171]' : 'text-[#a78bfa]'}`}
+                  {...(linkedFileMissing ? { 'data-linked-file-missing': 'true' } : {})}
+                />
+              )}
               {tab.aiClosing && (
                 <span
                   className="flex-shrink-0"
@@ -3836,6 +3820,16 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   };
 
   const handleTabClick = (e: React.MouseEvent, tabId: string) => {
+    // Pick mode: the attach-row "Pick" toggle armed a pane — the next sidebar
+    // click places the tab THERE (or moves focus if it's already visible).
+    {
+      const st = useWorkspaceStore.getState();
+      if (st.splitPickPaneIndex !== null && st.splitPanes.length > 0 && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        st.setSplitPaneTab(st.splitPickPaneIndex, projectId, tabId);
+        return;
+      }
+    }
     if (e.shiftKey) {
       selectTabRange(projectId, tabId);
     } else if (e.metaKey || e.ctrlKey) {
@@ -9904,6 +9898,44 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               {contextFavoriteId ? 'Remove from Favorites' : 'Add to Favorites'}
             </button>
           )}
+
+          {/* Split workspace: add/remove this tab as a side-by-side pane.
+              Reverse-button semantics — the same slot toggles between
+              «Добавить в рабочую область (N)» and «Убрать из рабочей области». */}
+          {!isMultiSelect && contextMenu && (() => {
+            const splitPanes = useWorkspaceStore.getState().splitPanes;
+            const inSplit = splitPanes.some((p) => p.tabId === contextMenu.tabId);
+            // In single mode the pair is (active tab, clicked tab) — clicking
+            // the active tab itself would pair it with itself: no-op.
+            const isActiveSingleTab = splitPanes.length === 0 && workspace.activeTabId === contextMenu.tabId;
+            const splitFull = splitPanes.length >= 3;
+            const disabled = !inSplit && (splitFull || isActiveSingleTab);
+            return (
+              <button
+                className={`w-full text-left px-4 py-1.5 text-[13px] flex items-center gap-2 ${
+                  disabled ? 'text-[#555] cursor-not-allowed' : 'text-[#ccc] hover:bg-white/10 cursor-pointer'
+                }`}
+                title={inSplit
+                  ? 'Убрать эту панель из рабочей области'
+                  : splitFull
+                    ? 'Максимум 3 панели'
+                    : 'Показать вкладку второй панелью рядом с текущей'}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (disabled) return;
+                  const st = useWorkspaceStore.getState();
+                  if (inSplit) st.removeTabFromSplit(contextMenu.tabId);
+                  else st.addTabToSplit(projectId, contextMenu.tabId);
+                  setContextMenu(null);
+                }}
+              >
+                <Columns2 size={12} className={disabled ? 'text-[#555]' : 'text-[#888] flex-shrink-0'} />
+                {inSplit
+                  ? 'Убрать из рабочей области'
+                  : `Добавить в рабочую область${splitPanes.length > 0 ? ` (${splitPanes.length})` : ''}`}
+              </button>
+            );
+          })()}
         </div>
       )}
 

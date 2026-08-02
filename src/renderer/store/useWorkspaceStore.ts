@@ -19,6 +19,19 @@ import {
 import {
   stopAiBeforeTerminalKill,
 } from '../utils/terminalCloseLifecycle.mjs';
+import {
+  dropFromMru,
+  dropProjectFromMru,
+  touchMru,
+} from '../utils/tabSwitcherModel.mjs';
+import {
+  addPane,
+  removePaneByTab,
+  removePanesByProject,
+  resolveSplitActivation,
+  sanitizePanes,
+  setPaneTab,
+} from '../utils/splitPanesModel.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -1267,6 +1280,22 @@ interface SessionState {
   view: 'dashboard' | 'workspace';
 }
 
+// One entry of the cross-project tab MRU (most-recent-first). Powers the
+// Ctrl+Tab / Cmd+P switcher ordering and its initial "previous tab" highlight.
+export interface GlobalTabMruEntry {
+  projectId: string;
+  tabId: string;
+}
+
+// One column of the split workspace. Empty array = single mode. Panes may
+// belong to different projects; the FOCUSED pane's tab is the app's active
+// tab, so activeProjectId/activeTabId always follow focus (approved rule:
+// "фокус панели = обычное переключение проекта").
+export interface SplitPane {
+  projectId: string;
+  tabId: string;
+}
+
 export interface TerminalBufferCheckpoint {
   serialized: string;
   headlessWriteSeq: number | null;
@@ -1282,6 +1311,30 @@ interface WorkspaceStore {
   activeProjectId: string | null;
   openProjects: Map<string, ProjectWorkspace>;
   projectHistory: string[]; // Stack of project IDs in order of activation
+  // Cross-project tab MRU (most-recent-first, cap 60). Written on every tab
+  // activation (switchTab / createTab / openProject focus), pruned on close.
+  // Persisted inside the session state so Ctrl+Tab keeps its order across
+  // restarts.
+  globalTabMru: GlobalTabMruEntry[];
+  touchGlobalTabMru: (projectId: string, tabId: string) => void;
+  // Split workspace (up to 3 side-by-side panes, cross-project). Empty =
+  // single mode. Persisted in the session state. Focused pane index kept in
+  // sync with activeProjectId/activeTabId by activateTabEverywhere.
+  splitPanes: SplitPane[];
+  splitFocusedIndex: number;
+  addTabToSplit: (projectId: string, tabId: string) => boolean;
+  removeTabFromSplit: (tabId: string) => void;
+  setSplitPaneTab: (paneIndex: number, projectId: string, tabId: string) => void;
+  focusSplitPane: (paneIndex: number) => void;
+  syncSplitWithProjectFocus: (projectId: string) => void;
+  // Pane index awaiting a sidebar click ("Pick" toggle in the attach row);
+  // null = off. Runtime-only.
+  splitPickPaneIndex: number | null;
+  setSplitPickPaneIndex: (paneIndex: number | null) => void;
+  // ONE entry point for "user activated tab X of project P" (sidebar click,
+  // switcher commit, project click). Applies the approved split rules, then
+  // falls through to switchTab/showWorkspace.
+  activateTabEverywhere: (projectId: string, tabId: string) => void;
   isRestoring: boolean;
   pendingEditTabId: string | null; // Set after createTab to trigger inline rename; consumed once by TabBar
   tabTitleNamingIds: Set<string>; // Transient UI-only loader while Gemini generates a tab title
@@ -1642,6 +1695,90 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   activeProjectId: null,
   openProjects: new Map(),
   projectHistory: [],
+  globalTabMru: [],
+  touchGlobalTabMru: (projectId, tabId) => {
+    const { globalTabMru, isRestoring } = get();
+    if (isRestoring) return; // restore replays activations; keep the saved order
+    if (globalTabMru[0]?.tabId === tabId) return; // no-op → no re-render
+    set({ globalTabMru: touchMru(globalTabMru, projectId, tabId) });
+  },
+
+  // ── Split workspace ──────────────────────────────────────────────────────
+  splitPanes: [],
+  splitFocusedIndex: 0,
+  splitPickPaneIndex: null,
+  setSplitPickPaneIndex: (paneIndex) => set({ splitPickPaneIndex: paneIndex }),
+
+  addTabToSplit: (projectId, tabId) => {
+    const { splitPanes, splitFocusedIndex, activeProjectId, openProjects } = get();
+    const activeWs = activeProjectId ? openProjects.get(activeProjectId) : null;
+    const current = activeProjectId && activeWs?.activeTabId
+      ? { projectId: activeProjectId, tabId: activeWs.activeTabId }
+      : null;
+    const res = addPane(splitPanes, splitFocusedIndex, current, { projectId, tabId });
+    if (!res) return false;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, splitPickPaneIndex: null });
+    console.log('[Split] addTab tab=' + tabId.slice(-12) + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
+    // Focus follows the newly added pane → its tab becomes the active tab.
+    get().activateTabEverywhere(projectId, tabId);
+    get().saveSession();
+    return true;
+  },
+
+  removeTabFromSplit: (tabId) => {
+    const { splitPanes, splitFocusedIndex } = get();
+    const res = removePaneByTab(splitPanes, splitFocusedIndex, tabId);
+    if (!res) return;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, splitPickPaneIndex: null });
+    console.log('[Split] removeTab tab=' + tabId.slice(-12) + ' panes=' + res.panes.length);
+    // Keep global focus on a still-visible pane's tab.
+    const focused = res.panes[res.focusedIndex];
+    if (focused) get().activateTabEverywhere(focused.projectId, focused.tabId);
+    get().saveSession();
+  },
+
+  setSplitPaneTab: (paneIndex, projectId, tabId) => {
+    const { splitPanes } = get();
+    const res = setPaneTab(splitPanes, paneIndex, projectId, tabId);
+    if (!res) return;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, splitPickPaneIndex: null });
+    get().activateTabEverywhere(projectId, tabId);
+    get().saveSession();
+  },
+
+  focusSplitPane: (paneIndex) => {
+    const { splitPanes } = get();
+    const pane = splitPanes[paneIndex];
+    if (!pane) return;
+    get().activateTabEverywhere(pane.projectId, pane.tabId);
+  },
+
+  // Project click while the split is active: the target is the project's
+  // last active tab — visible pane gets focus, otherwise the focused pane
+  // swaps its tab (approved rule). Called by showWorkspace/openProject after
+  // they set activeProjectId.
+  syncSplitWithProjectFocus: (projectId: string) => {
+    const { splitPanes, splitFocusedIndex, openProjects } = get();
+    if (splitPanes.length === 0) return;
+    const targetTabId = openProjects.get(projectId)?.activeTabId;
+    if (!targetTabId) return;
+    const res = resolveSplitActivation(splitPanes, splitFocusedIndex, projectId, targetTabId);
+    if (res.panes !== splitPanes || res.focusedIndex !== splitFocusedIndex) {
+      set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+      get().saveSession();
+    }
+  },
+
+  activateTabEverywhere: (projectId, tabId) => {
+    // Split rules live inside switchTab (the single activation choke point);
+    // this wrapper adds the cross-project view/focus follow-through.
+    const st = get();
+    st.switchTab(projectId, tabId);
+    st.setProjectView(projectId, 'terminal');
+    if (get().activeProjectId !== projectId || get().view !== 'workspace') {
+      st.showWorkspace(projectId);
+    }
+  },
   isRestoring: false,
   pendingEditTabId: null,
   tabTitleNamingIds: new Set(),
@@ -1662,14 +1799,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   saveSession: () => {
-    const { openProjects, activeProjectId, view, isRestoring, projectHistory } = get();
+    const { openProjects, activeProjectId, view, isRestoring, projectHistory, globalTabMru, splitPanes, splitFocusedIndex } = get();
     if (isRestoring) return; // Don't save while restoring
 
     // Debounce: save after 300ms of inactivity
     if (saveSessionTimer) clearTimeout(saveSessionTimer);
 
     saveSessionTimer = setTimeout(async () => {
-      const sessionState: SessionState & { projectHistory?: string[] } = {
+      const sessionState: SessionState & { projectHistory?: string[]; globalTabMru?: GlobalTabMruEntry[]; splitPanes?: SplitPane[]; splitFocusedIndex?: number } = {
         openProjects: Array.from(openProjects.values()).map((workspace) => {
           const tabsArray = Array.from(workspace.tabs.keys());
           const activeTabIndex = workspace.activeTabId
@@ -1683,7 +1820,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         }),
         activeProjectId,
         view,
-        projectHistory
+        projectHistory,
+        globalTabMru,
+        splitPanes,
+        splitFocusedIndex
       };
 
       // Save to database
@@ -1694,7 +1834,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   restoreSession: async () => {
     // Load from database
-    const sessionState = await ipcRenderer.invoke('app:getState', SESSION_KEY) as (SessionState & { projectHistory?: string[] }) | null;
+    const sessionState = await ipcRenderer.invoke('app:getState', SESSION_KEY) as (SessionState & { projectHistory?: string[]; globalTabMru?: GlobalTabMruEntry[]; splitPanes?: SplitPane[]; splitFocusedIndex?: number }) | null;
     if (!sessionState) {
       console.warn('[RestoreSession] no saved session state');
       return;
@@ -1934,6 +2074,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // SINGLE set() for all projects — one Workspace mount instead of N
       const savedView = sessionState.view || 'dashboard';
       const restoredHistory = sessionState.projectHistory || [];
+      // Keep only MRU entries whose tab actually restored.
+      const restoredGlobalMru = (sessionState.globalTabMru || []).filter((entry) => (
+        entry && openProjects.get(entry.projectId)?.tabs.has(entry.tabId)
+      ));
+      // Split survives restart; panes whose tab failed to restore are dropped,
+      // <2 live panes collapse to single mode.
+      const restoredSplit = sanitizePanes(
+        sessionState.splitPanes || [],
+        sessionState.splitFocusedIndex ?? 0,
+        (projectId: string, tabId: string) => !!openProjects.get(projectId)?.tabs.has(tabId),
+      );
       const restoredActiveId = sessionState.activeProjectId && openProjects.has(sessionState.activeProjectId)
         ? sessionState.activeProjectId
         : null;
@@ -1948,7 +2099,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         view: savedView === 'workspace' && restoredActiveId ? 'workspace' : 'dashboard',
         isRestoring: false,
         openProjects: new Map(openProjects),
-        projectHistory: restoredHistory
+        projectHistory: restoredHistory,
+        globalTabMru: restoredGlobalMru,
+        splitPanes: restoredSplit.panes,
+        splitFocusedIndex: restoredSplit.focusedIndex
       });
       console.warn(
         `[RestoreSession] done durMs=${(performance.now() - restoreStart).toFixed(1)}` +
@@ -2061,12 +2215,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Use startTransition for smooth project switching
     startTransition(() => {
       set({
-        view: 'workspace', 
+        view: 'workspace',
         activeProjectId: projectId,
         projectHistory: newHistory,
         ...(clearedNotification ? { openProjects: new Map(openProjects) } : {})
       });
     });
+    if (workspace?.activeTabId) get().touchGlobalTabMru(projectId, workspace.activeTabId);
+    get().syncSplitWithProjectFocus(projectId);
     get().saveSession();
   },
 
@@ -2203,6 +2359,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         projectHistory: newHistory,
         ...(clearedNotification ? { openProjects: new Map(openProjects) } : {})
       });
+      if (workspace?.activeTabId) get().touchGlobalTabMru(projectId, workspace.activeTabId);
+      get().syncSplitWithProjectFocus(projectId);
       requestAnimationFrame(() => {
         const durMs = (performance.now() - _t0).toFixed(1);
         const tabCount = Array.from(get().openProjects.values())
@@ -2265,10 +2423,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         }
       }
 
+      const splitAfterClose = removePanesByProject(get().splitPanes, get().splitFocusedIndex, projectId);
       startTransition(() => set({
         openProjects: nextOpenProjects,
         activeProjectId: nextActiveId,
         projectHistory: newHistory,
+        globalTabMru: dropProjectFromMru(get().globalTabMru, projectId),
+        ...(splitAfterClose ? { splitPanes: splitAfterClose.panes, splitFocusedIndex: splitAfterClose.focusedIndex, splitPickPaneIndex: null } : {}),
         // If we closed the active project and no projects are left in history -> dashboard
         view: (isClosingActive && !nextActiveId && view === 'workspace') ? 'dashboard' : view
       }));
@@ -2427,6 +2588,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       workspace.viewingSubAgentTabId = null;
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
+      get().touchGlobalTabMru(workspace.projectId, tabId);
     }
 
     console.log('[Store] createTab: Setting state, tabs count:', workspace.tabs.size, 'isRestoring:', isRestoring);
@@ -2587,6 +2749,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       workspace.activeGroupId = targetGroupId || null;
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
+      get().touchGlobalTabMru(workspace.projectId, tabId);
     }
 
     // Only trigger rename for direct user creation without an explicit name.
@@ -2836,6 +2999,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     usePromptQueueStore.getState().cleanupClosedTab(tabId);
     // Remove closed tab from history
     workspace.tabHistory = workspace.tabHistory.filter(id => id !== tabId);
+    set({ globalTabMru: dropFromMru(get().globalTabMru, tabId) });
+    // Closing a tab that occupies a split pane collapses/shrinks the split.
+    // The surviving pane inherits global focus AFTER the workspace cleanup
+    // below (otherwise this project's own LRU fallback would win and the
+    // user would land on a tab that is not even on screen).
+    let splitSurvivor: SplitPane | null = null;
+    {
+      const { splitPanes, splitFocusedIndex } = get();
+      const splitRes = removePaneByTab(splitPanes, splitFocusedIndex, tabId);
+      if (splitRes) {
+        splitSurvivor = splitRes.panes.length > 0
+          ? splitRes.panes[splitRes.focusedIndex] || null
+          : splitPanes.find((p) => p.tabId !== tabId) || null;
+        set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex, splitPickPaneIndex: null });
+        console.log('[Split] pane-closed-with-tab tab=' + tabId.slice(-12) + ' panes=' + splitRes.panes.length);
+      }
+    }
 
     if (workspace.activeTabId === tabId) {
       // Find next tab from history (LRU: last visited that still exists).
@@ -2876,6 +3056,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       ' remaining=' + workspace.tabs.size +
       ' active=' + (workspace.activeTabId ? workspace.activeTabId.slice(-12) : 'none') +
       ' durMs=' + (Date.now() - closeStartedAt));
+    // Split focus follow-through: the surviving pane's tab takes over, even
+    // when it belongs to another project.
+    if (splitSurvivor && get().openProjects.get(splitSurvivor.projectId)?.tabs.has(splitSurvivor.tabId)) {
+      get().activateTabEverywhere(splitSurvivor.projectId, splitSurvivor.tabId);
+    }
     return true;
   },
 
@@ -3185,6 +3370,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       workspace.selectedTabIds = [tabId]; // Update selection on direct switch
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
+      get().touchGlobalTabMru(projectId, tabId);
+      // Split rule at the single activation choke point: visible tab → focus
+      // its pane; hidden tab → replace the focused pane's slot. Runs for every
+      // caller (sidebar click, switcher, project click, pick-mode).
+      {
+        const { splitPanes, splitFocusedIndex } = get();
+        if (splitPanes.length > 0) {
+          const splitRes = resolveSplitActivation(splitPanes, splitFocusedIndex, projectId, tabId);
+          if (splitRes.panes !== splitPanes || splitRes.focusedIndex !== splitFocusedIndex) {
+            set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex });
+          }
+        }
+      }
       // Use startTransition to prevent UI blocking during re-render
       startTransition(() => {
         set({ openProjects: new Map(openProjects) });
@@ -3883,8 +4081,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Make it active in target project
     targetWorkspace.activeTabId = tabId;
 
-    // Update state
-    set({ openProjects: new Map(openProjects) });
+    // Update state (+ keep the cross-project MRU/split pointing at the new owner)
+    set({
+      openProjects: new Map(openProjects),
+      globalTabMru: get().globalTabMru.map((e) => e.tabId === tabId ? { ...e, projectId: targetProjectId } : e),
+      splitPanes: get().splitPanes.map((p) => p.tabId === tabId ? { ...p, projectId: targetProjectId } : p),
+    });
 
     // Save both projects
     saveTabs(sourceWorkspace.projectId, sourceWorkspace.tabs, true);
@@ -3969,7 +4171,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Active in target
     if (lastId) tgt.activeTabId = lastId;
 
-    set({ openProjects: new Map(openProjects) });
+    set({
+      openProjects: new Map(openProjects),
+      globalTabMru: get().globalTabMru.map((e) => movingSet.has(e.tabId) ? { ...e, projectId: targetProjectId } : e),
+      splitPanes: get().splitPanes.map((p) => movingSet.has(p.tabId) ? { ...p, projectId: targetProjectId } : p),
+    });
     saveTabs(src.projectId, src.tabs, true);  // forceCleanup: intentional batch move
     saveTabs(tgt.projectId, tgt.tabs);
     if (sourceGroupsChanged) saveTabGroups(src.projectId, src.tabGroups);
@@ -4088,7 +4294,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     currentTarget.activeGroupId = targetGroupId;
     currentTarget.selectedTabIds = [];
 
-    set({ openProjects: new Map(currentOpenProjects) });
+    set({
+      openProjects: new Map(currentOpenProjects),
+      globalTabMru: get().globalTabMru.map((e) => movingSet.has(e.tabId) ? { ...e, projectId: targetProjectId } : e),
+      splitPanes: get().splitPanes.map((p) => movingSet.has(p.tabId) ? { ...p, projectId: targetProjectId } : p),
+    });
     notifyProjectLayoutChanged(sourceProjectId, 'tab-group-project-transfer');
     notifyProjectLayoutChanged(targetProjectId, 'tab-group-project-transfer');
     log.tabs(

@@ -307,6 +307,15 @@ function isExternalEditableFocused(): boolean {
   return false;
 }
 
+// Split workspace shows several ACTIVE terminals at once; only the one whose
+// tab is the app's globally active tab may grab keyboard focus on activation.
+// Single mode: exactly one active terminal → always true for it.
+function isGloballyActiveTab(tabId: string): boolean {
+  const st = useWorkspaceStore.getState();
+  const ws = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
+  return ws?.activeTabId === tabId;
+}
+
 // Get buffer management functions outside of component to avoid re-renders
 const getBufferActions = () => ({
   save: useWorkspaceStore.getState().saveTerminalBuffer,
@@ -1625,6 +1634,15 @@ function Terminal({
     const frameId = requestAnimationFrame(() => {
       const layers = collectTerminalLayerSnapshots();
       const painted = layers.filter(isPaintedTerminalLayer);
+      // Split workspace legitimately paints one terminal PER PANE; the
+      // invariant then is "painted set == pane set", not "exactly one".
+      const splitPanes = useWorkspaceStore.getState().splitPanes;
+      if (splitPanes.length > 0) {
+        const paneTabIds = new Set(splitPanes.map((p) => p.tabId));
+        const paintedOk = painted.length <= paneTabIds.size
+          && painted.every((l) => paneTabIds.has(l.tabId));
+        if (paintedOk) return;
+      }
       const ok = painted.length === 1 && painted[0]?.tabId === tabId;
       if (ok) return;
 
@@ -1657,6 +1675,9 @@ function Terminal({
   useEffect(() => {
     if (!effectivePresented) return;  // only the currently-presented terminal grabs focus
     const onRefocus = () => {
+      // Split mode presents several terminals; only the globally active one
+      // may take the window-refocus grab.
+      if (!isGloballyActiveTab(tabId)) return;
       const term = terminalRegistry.get(tabId);
       if (term) {
         try { term.focus(); } catch {}
@@ -2452,7 +2473,7 @@ function Terminal({
         term.scrollToBottom();
         isReadyRef.current = true;
         setIsVisible(true); // Reveal after first fit to prevent jitter
-      if (activeRef.current && !isExternalEditableFocused()) {
+      if (activeRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)) {
         term.focus();
       }
 
@@ -2526,6 +2547,16 @@ function Terminal({
         // otherwise emit the literal `T` into Claude TUI input.
         if (event.metaKey && event.shiftKey && !event.altKey && !event.ctrlKey
             && event.type === 'keydown' && event.code === 'KeyT') {
+          return false;
+        }
+        // Ctrl+Tab / Ctrl+Shift+Tab — global tab switcher (TabSwitcherOverlay).
+        // Swallow so xterm doesn't forward \t to the PTY while the modal cycles.
+        if (event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'Tab') {
+          return false;
+        }
+        // Cmd+P — tab search switcher. Layout-agnostic via event.code.
+        if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+            && event.type === 'keydown' && event.code === 'KeyP') {
           return false;
         }
         if (shouldInterceptCodexClipboardImagePaste(event)) {
@@ -3103,6 +3134,15 @@ function Terminal({
               && event.type === 'keydown' && event.code === 'KeyT') {
             return false;
           }
+          // Ctrl+Tab / Ctrl+Shift+Tab — global tab switcher (mirrors primary handler).
+          if (event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'Tab') {
+            return false;
+          }
+          // Cmd+P — tab search switcher. Layout-agnostic via event.code.
+          if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+              && event.type === 'keydown' && event.code === 'KeyP') {
+            return false;
+          }
           if (shouldInterceptCodexClipboardImagePaste(event)) {
             event.preventDefault();
             void pasteCodexClipboardImageFromClipboard();
@@ -3398,7 +3438,7 @@ function Terminal({
           setIsVisible(true);
           // Don't steal focus from an open tab-rename input (Cmd+T / new tab
           // auto-opens it in this same tick). See isExternalEditableFocused.
-          if (activeRef.current && !isExternalEditableFocused()) {
+          if (activeRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)) {
             term.focus();
           }
 
@@ -3481,7 +3521,7 @@ function Terminal({
             console.warn('[Terminal:activate] _renderService.clear() ERROR:', e);
           }
 
-          if (!isExternalEditableFocused()) {
+          if (!isExternalEditableFocused() && isGloballyActiveTab(tabId)) {
             term.focus();
           }
 

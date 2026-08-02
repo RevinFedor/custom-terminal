@@ -19,6 +19,7 @@ import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from '../../constants/systemProjects';
 import { linkFileTab } from '../../utils/linkFileTab';
+import { probeFiles } from '../../utils/missingFileTracker';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import {
@@ -322,10 +323,15 @@ export default function Workspace() {
     && effectiveTabType !== 'file'
     && !filePreview
     && !!primaryHistoryTool;
-  const historyIsPrimary = agentSurfacePairAvailable && !terminalIsPrimary;
+  // Split workspace renders panes inside TerminalArea; the History-primary
+  // layout (floating terminal frame) would swallow that geometry, so the
+  // split forces terminal-primary presentation. History stays reachable as
+  // the side panel of the focused pane's tab.
+  const splitActiveLayout = useWorkspaceStore((s) => s.splitPanes.length > 0);
+  const historyIsPrimary = agentSurfacePairAvailable && !terminalIsPrimary && !splitActiveLayout;
   // Terminal-primary keeps History reachable as the side panel; it is the
   // active input surface there, so grab/dictation/task-plan still target it.
-  const historyIsAgentSidePanel = agentSurfacePairAvailable && terminalIsPrimary;
+  const historyIsAgentSidePanel = agentSurfacePairAvailable && (terminalIsPrimary || splitActiveLayout);
   // Pin is the user's preference; a viewport too narrow for both columns
   // downgrades it to overlay for this render only, without touching the
   // stored setting — widening the window restores the pushed layout.
@@ -510,10 +516,13 @@ export default function Workspace() {
   // Linked file tabs are real tabs in TabSidebar but render through the same
   // FilePreview surface as Sidebar/Cmd-click file opens. The preview belongs to
   // the active file tab only while that tab stays active.
+  // Split mode: a pane hosts its own SplitFilePane — the window-wide overlay
+  // would cover the neighbouring panes, so it must stay closed.
+  const splitActiveForPreview = useWorkspaceStore((s) => s.splitPanes.length > 0);
   useEffect(() => {
     if (!activeProjectId) return;
 
-    if (!activeFileTabPath || !activeFileTab?.id) {
+    if (!activeFileTabPath || !activeFileTab?.id || splitActiveForPreview) {
       const currentPreview = useUIStore.getState().filePreview;
       if (currentPreview?.source === 'tab') {
         closeFilePreview();
@@ -545,7 +554,10 @@ export default function Workspace() {
             sourceTabId: activeFileTab.id,
           });
         } else if (!cancelled) {
-          useUIStore.getState().showToast(`File preview: ${result?.error || 'failed to read file'}`, 'error');
+          // Vanished file: refresh the shared verdict so the sidebar/switcher
+          // icons flip red immediately, and keep the message human.
+          probeFiles([activeFileTabPath], true);
+          useUIStore.getState().showToast('Файл не найден на диске (перемещён или удалён)', 'warning');
         }
       } catch (e: any) {
         if (!cancelled) {
@@ -555,7 +567,7 @@ export default function Workspace() {
     })();
 
     return () => { cancelled = true; };
-  }, [activeProjectId, activeFileTabPath, activeFileTab?.id, currentView, closeFilePreview, openFilePreview]);
+  }, [activeProjectId, activeFileTabPath, activeFileTab?.id, currentView, closeFilePreview, openFilePreview, splitActiveForPreview]);
 
   // Sync file preview with sidebar state (project switch + sidebar open/close)
   const previewSyncProjectIdRef = useRef<string | null>(null);

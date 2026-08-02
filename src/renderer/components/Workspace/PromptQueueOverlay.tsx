@@ -2229,12 +2229,11 @@ export function PromptQueueOverlay({
   // anchor the editor slideout next to the clicked chip.
   const chipRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const panelOpen = !collapsed || panelClosing;
-  // History is now the primary surface, so its rail toggle is hidden there.
-  // Collapse the former two-column top row to the exact width of one 30px
-  // button plus the 1px parent border on each side; no dead inner padding.
-  const collapsedRailWidth = hideHistoryToggle
-    ? COLLAPSED_RAIL_COMPACT_WIDTH
-    : COLLAPSED_RAIL_FULL_WIDTH;
+  // The rail is now a HORIZONTAL row of square buttons ABOVE the panel
+  // (was: vertical column to the panel's right). Width = intrinsic row of
+  // 30px squares; the overlay reserves the max of row and panel widths.
+  const railButtonCount = hideHistoryToggle ? 4 : 5;
+  const collapsedRailWidth = railButtonCount * 21 + (railButtonCount - 1) * 4 + 10;
   const arrowExpanded = !collapsed && !panelClosing;
   const addEditorActive = editorOpen && !isSpecialPromptMode && editingId === null;
   const railRunBg = autoRun
@@ -2303,9 +2302,9 @@ export function PromptQueueOverlay({
           top: 0,
           // Anchored edge — pinned, never moves during resize.
           ...(ANCHOR_SIDE === 'right' ? { right: rightInset } : { left: 0 }),
-          // FIXED width (was `fit-content` clamped [min,max] → reflowed on +grab).
-          // Drag-resizable via the handle on the free edge below.
-          width: panelOpen ? effectiveWidth + COLLAPSED_RAIL_GAP + collapsedRailWidth : collapsedRailWidth,
+          // Rail row on top + panel below it. Width = panel width when open,
+          // rail row width when collapsed.
+          width: panelOpen ? effectiveWidth : collapsedRailWidth,
           background: 'transparent',
           border: 'none',
           borderRadius: 0,
@@ -2314,9 +2313,9 @@ export function PromptQueueOverlay({
           color: '#ddd',
           maxHeight: '100%',
           display: 'flex',
-          alignItems: 'flex-start',
-          justifyContent: ANCHOR_SIDE === 'right' ? 'flex-end' : 'flex-start',
-          gap: panelOpen ? COLLAPSED_RAIL_GAP : 0,
+          flexDirection: 'column',
+          alignItems: ANCHOR_SIDE === 'right' ? 'flex-end' : 'flex-start',
+          gap: COLLAPSED_RAIL_GAP,
           overflow: 'visible',
           pointerEvents: 'auto',
           transition: `width ${PANEL_SLIDE_MS}ms ease-out`,
@@ -2325,7 +2324,7 @@ export function PromptQueueOverlay({
       >
         <OrchestrationStatusChip
           tabId={tabId}
-          rightOffset={panelOpen ? effectiveWidth + COLLAPSED_RAIL_GAP + collapsedRailWidth : collapsedRailWidth}
+          rightOffset={panelOpen ? effectiveWidth : collapsedRailWidth}
         />
         {panelOpen && (
           <div
@@ -3031,16 +3030,19 @@ export function PromptQueueOverlay({
         <div
           className="pq-collapsed-rail"
           style={{
-            width: collapsedRailWidth,
+            // Horizontal row of square buttons ABOVE the panel (order:-1 in
+            // the column flex). Was: vertical pill column to the panel's
+            // right — the row form frees horizontal space for the split.
+            order: -1,
             position: 'relative',
             zIndex: 2,
-            padding: 0,
+            padding: '3px 5px',
             boxSizing: 'border-box',
             background: '#151515',
             border: '1px solid #303030',
-            borderRadius: 16,
+            borderRadius: 8,
             display: 'flex',
-            flexDirection: 'column',
+            flexDirection: 'row',
             alignItems: 'center',
             gap: 4,
             flexShrink: 0,
@@ -3055,8 +3057,8 @@ export function PromptQueueOverlay({
               aria-label="Toggle Timeline"
             >
               {timelineTreeMode
-                ? <PanelRightClose size={17} strokeWidth={2.1} />
-                : <PanelRightOpen size={17} strokeWidth={2.1} />}
+                ? <PanelRightClose size={13} strokeWidth={2.1} />
+                : <PanelRightOpen size={13} strokeWidth={2.1} />}
             </button>
             </ControlHint>
             {!hideHistoryToggle && (
@@ -3067,7 +3069,7 @@ export function PromptQueueOverlay({
                 title="History (Cmd+] / Opt+])"
                 aria-label="Toggle History"
               >
-                <History size={17} strokeWidth={2.1} />
+                <History size={13} strokeWidth={2.1} />
               </button>
               </ControlHint>
             )}
@@ -3087,9 +3089,11 @@ export function PromptQueueOverlay({
           >
             <ChevronLeft
               className="pq-rail-chevron"
-              size={18}
+              size={14}
               strokeWidth={2.1}
-              style={{ transform: arrowExpanded ? 'rotate(180deg)' : 'rotate(0deg)' }}
+              // Rail sits ABOVE the panel now: collapsed → point down (panel
+              // will drop open below), expanded → point up.
+              style={{ transform: arrowExpanded ? 'rotate(90deg)' : 'rotate(-90deg)' }}
             />
           </button>
           </ControlHint>
@@ -3110,7 +3114,7 @@ export function PromptQueueOverlay({
               background: railRunBg,
               borderColor: railRunBorder,
               color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_TEXT : (activeItemCount ? '#e5e5e5' : TINT)),
-              fontSize: activeItemCount > 0 ? 12 : 18,
+              fontSize: activeItemCount > 0 ? 10 : 14,
               fontWeight: activeItemCount > 0 ? 700 : 500,
               cursor: 'pointer',
               lineHeight: 1,
@@ -3123,7 +3127,7 @@ export function PromptQueueOverlay({
                 style={{
                   position: 'absolute',
                   inset: -1,
-                  borderRadius: 999,
+                  borderRadius: 6,
                   pointerEvents: 'none',
                   animation: `pq-hint-blink ${BLINK_CYCLE_MS}ms ease-in-out ${BLINK_ITERATIONS}`,
                 }}
@@ -3139,7 +3143,7 @@ export function PromptQueueOverlay({
             title="+ grab"
             aria-label="Grab current input"
           >
-            <Plus size={18} strokeWidth={2.2} />
+            <Plus size={14} strokeWidth={2.2} />
           </button>
           </ControlHint>
         </div>
@@ -3653,28 +3657,33 @@ export function PromptQueueOverlay({
           animation: pq-spin 1.35s linear infinite;
         }
         .pq-panel-opening {
-          transform-origin: right top;
+          transform-origin: center top;
           animation: pq-panel-open ${PANEL_SLIDE_MS}ms ease-out both;
         }
         .pq-panel-closing {
           pointer-events: none;
-          transform-origin: right top;
+          transform-origin: center top;
           animation: pq-panel-close ${PANEL_SLIDE_MS}ms ease-in both;
         }
         @keyframes pq-panel-open {
+          /* Rail is above the panel now: the panel drops DOWN from under it. */
           0% {
-            transform: translateX(calc(100% + ${COLLAPSED_RAIL_GAP}px));
+            transform: translateY(calc(-100% - ${COLLAPSED_RAIL_GAP}px));
+            opacity: 0;
           }
           100% {
-            transform: translateX(0);
+            transform: translateY(0);
+            opacity: 1;
           }
         }
         @keyframes pq-panel-close {
           0% {
-            transform: translateX(0);
+            transform: translateY(0);
+            opacity: 1;
           }
           100% {
-            transform: translateX(calc(100% + ${COLLAPSED_RAIL_GAP}px));
+            transform: translateY(calc(-100% - ${COLLAPSED_RAIL_GAP}px));
+            opacity: 0;
           }
         }
         .pq-rail-chevron {
@@ -3685,7 +3694,6 @@ export function PromptQueueOverlay({
           align-items: center;
           justify-content: center;
           gap: 4px;
-          width: 100%;
         }
         .pq-rail-button {
           border: 1px solid #8a4a37;
@@ -3696,14 +3704,17 @@ export function PromptQueueOverlay({
           align-items: center;
           justify-content: center;
           box-sizing: border-box;
-          width: 30px;
-          min-width: 30px;
-          max-width: 30px;
-          height: 30px;
-          min-height: 30px;
-          max-height: 30px;
-          flex: 0 0 30px;
-          border-radius: 999px;
+          width: 21px;
+          min-width: 21px;
+          max-width: 21px;
+          height: 21px;
+          min-height: 21px;
+          max-height: 21px;
+          flex: 0 0 21px;
+          /* Squares (was 999px circles): the rail is now a horizontal row
+             above the panel — square buttons read as one compact toolbar.
+             21px ≈ старые 30px −30% по просьбе юзера. */
+          border-radius: 5px;
           padding: 0;
           line-height: 1;
           appearance: none;

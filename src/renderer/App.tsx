@@ -17,6 +17,7 @@ import HelpButton from './components/UI/HelpButton';
 import ControlHint from './components/UI/ControlHint';
 import Tooltip from './components/UI/Tooltip';
 import PromptPickerOverlay from './components/Workspace/PromptPickerOverlay';
+import TabSwitcherOverlay from './components/Workspace/TabSwitcherOverlay';
 // Drag and drop
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -5257,6 +5258,14 @@ function App() {
       />
       <HelpModal isOpen={helpOpen} onClose={() => setHelpOpen(false)} />
       <PromptPickerOverlay />
+      {/* Ctrl+Tab / Cmd+P cross-project tab switcher. Busy/process maps are the
+          same visual-state sources the TabBar reads, so the switcher rows show
+          the exact same loaders. */}
+      <TabSwitcherOverlay
+        processStatus={processStatus}
+        busyTabs={busyTabs}
+        pasteBusyTabs={pasteBusyTabs}
+      />
 
       {/* Project Context Menu */}
       {projectContextMenu && (

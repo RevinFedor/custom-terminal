@@ -73,6 +73,7 @@ export function buildSwitcherRows({ projects, globalMru = [], query = '' }) {
       kind: 'project',
       projectId: block.project.projectId,
       projectName: block.project.projectName,
+      projectIcon: block.project.projectIcon || null,
     });
     for (const { tab } of block.visible) {
       rows.push({
@@ -80,15 +81,19 @@ export function buildSwitcherRows({ projects, globalMru = [], query = '' }) {
         projectId: block.project.projectId,
         projectName: block.project.projectName,
         tab,
+        missing: !!tab.missing,
       });
     }
   }
   return rows;
 }
 
+// Missing linked files (file tab whose file vanished from disk) stay VISIBLE
+// with a red icon but are not selectable — stepping jumps over them, exactly
+// like project headers.
 export function selectableIndices(rows) {
   const out = [];
-  rows.forEach((row, i) => { if (row.kind === 'tab') out.push(i); });
+  rows.forEach((row, i) => { if (row.kind === 'tab' && !row.missing) out.push(i); });
   return out;
 }
 
@@ -97,7 +102,7 @@ export function selectableIndices(rows) {
 // first selectable row that is not the current tab, then the first selectable.
 export function initialCtrlIndex(rows, globalMru, activeTabId) {
   const byTabId = new Map();
-  rows.forEach((row, i) => { if (row.kind === 'tab') byTabId.set(row.tab.id, i); });
+  rows.forEach((row, i) => { if (row.kind === 'tab' && !row.missing) byTabId.set(row.tab.id, i); });
   for (const entry of globalMru) {
     if (!entry || !entry.tabId || entry.tabId === activeTabId) continue;
     const idx = byTabId.get(entry.tabId);

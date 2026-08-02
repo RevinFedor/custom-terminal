@@ -29,12 +29,13 @@ const loadRightColWidth = (): number => {
   } catch { return RIGHT_COL_DEFAULT; }
 };
 import { useUIStore } from '../../store/useUIStore';
+import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
 import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import TabPreviewPopover from './TabPreviewPopover';
 import HistoryPanel from './HistoryPanel';
 import Timeline from './Timeline';
 import { Virtuoso } from 'react-virtuoso';
-import { FolderOpen, Clock, Trash2, Pencil, Search, Database, Loader2, RotateCw, X, Check, ChevronDown } from 'lucide-react';
+import { FolderOpen, Clock, Trash2, Pencil, Search, Database, Loader2, RotateCw, X, Check, ChevronDown, FileText } from 'lucide-react';
 import {
   generateTabTitleFromSession,
   refreshGeneratedTabTitle,
@@ -455,6 +456,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
   const [syncName, setSyncName] = useState<string | null>(null);
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
+  // Re-render history cards when a linked file's existence verdict flips.
+  const [, setMissingFilesTick] = useState(0);
+  useEffect(() => subscribeMissingFiles(() => setMissingFilesTick((v) => v + 1)), []);
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
   const [historyQuery, setHistoryQuery] = useState('');
@@ -943,6 +947,11 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         setFavorites([]);
         setIsLoaded(true);
       });
+      // Existence probe for file-tab cards: vanished files show a red icon.
+      const filePaths = historyRows
+        .filter((e: TabHistoryEntry) => e.tab_type === 'file' && e.file_path)
+        .map((e: TabHistoryEntry) => e.file_path as string);
+      if (filePaths.length > 0) probeFiles(filePaths, true);
     }).catch((err) => {
       console.error('[ProjectHome] Failed to load history/favorites:', err);
       if (cancelled) return;
@@ -2119,6 +2128,15 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                                   backgroundColor: meta.color,
                                   border: '1px solid rgba(0,0,0,0.4)',
                                 }}
+                              />
+                            )}
+                            {entry.tab_type === 'file' && (
+                              // Red = the linked file no longer exists on disk;
+                              // restoring this card would open a dead tab.
+                              <FileText
+                                size={12}
+                                className="flex-shrink-0 opacity-90"
+                                style={{ color: entry.file_path && isFileMissing(entry.file_path) ? '#f87171' : '#a78bfa' }}
                               />
                             )}
                             <div className="min-w-0 flex-1 text-[12px] leading-[16px] text-white break-words">

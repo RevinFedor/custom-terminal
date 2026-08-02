@@ -3480,7 +3480,9 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
     <div
       className="absolute inset-0 flex flex-col"
       data-claude-sdk-tab-id={tabId}
-      style={{ display: isVisible ? 'flex' : 'none', fontSize: `${sdkBaseFontSize}px` }}
+      // pointerEvents explicit: the split-pane wrapper is pointer-events:none,
+      // every tab surface re-enables its own hits (same contract as Terminal).
+      style={{ display: isVisible ? 'flex' : 'none', pointerEvents: isVisible ? 'auto' : 'none', fontSize: `${sdkBaseFontSize}px` }}
       onContextMenu={handleTabContextMenu}
     >
       <AssistantProviderBase runtime={runtime}>

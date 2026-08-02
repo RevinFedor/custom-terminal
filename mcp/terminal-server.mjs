@@ -13,6 +13,7 @@ import { basename, join, resolve } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
 import { buildStartAiRequest } from './terminal-start-ai-request.mjs';
+import { buildPromptCatalog, buildPromptResult, selectPrompt } from './terminal-prompt-catalog.mjs';
 
 const PORT_DIR = join(homedir(), '.noted-terminal');
 const TOKEN_PATH = join(PORT_DIR, 'web-token.txt');
@@ -442,6 +443,33 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {},
+    },
+  },
+  {
+    name: 'list_prompts',
+    description: 'List the saved prompts currently available to the user in Noted Terminal. Returns a compact catalog only: title, group, ids, attached-file count, and text lengths. It never returns all prompt bodies. Use get_prompt to read one selected prompt.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Optional case-insensitive filter by prompt title or group name.' },
+        projectId: { type: 'string', description: 'Optional project id used to select the correct running Noted Terminal instance.' },
+        cwd: { type: 'string', description: 'Optional project path used to select the correct running Noted Terminal instance.' },
+      },
+    },
+  },
+  {
+    name: 'get_prompt',
+    description: 'Read one saved Noted Terminal prompt. Select it by promptId (preferred) or exact title. mode="own" returns only the prompt\'s own short instruction and attached file paths; mode="resolved" returns the live Prompt API\'s assembled inline/mobile text with readable attached-file contents. Reading a prompt does not mean applying it as instructions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        promptId: { type: 'string', description: 'Stable prompt id returned by list_prompts.' },
+        title: { type: 'string', description: 'Exact prompt title. Use promptId when titles are duplicated.' },
+        mode: { type: 'string', enum: ['own', 'resolved'], description: 'Default resolved. own excludes attached-file contents from model output; resolved returns the API-assembled inline/mobile text. Unreadable linked files can be omitted and are listed in filePaths.' },
+        projectId: { type: 'string', description: 'Optional project id used to select the correct running Noted Terminal instance.' },
+        cwd: { type: 'string', description: 'Optional project path used to select the correct running Noted Terminal instance.' },
+      },
+      anyOf: [{ required: ['promptId'] }, { required: ['title'] }],
     },
   },
   {
@@ -1124,6 +1152,19 @@ async function callTool(name, args) {
         text += '\n';
       }
       return text;
+    }
+
+    case 'list_prompts': {
+      const target = projectHint(args);
+      const payload = await httpApiGet(target, '/api/prompts');
+      return JSON.stringify(buildPromptCatalog(payload, args.query), null, 2);
+    }
+
+    case 'get_prompt': {
+      const target = projectHint(args);
+      const payload = await httpApiGet(target, '/api/prompts');
+      const prompt = selectPrompt(payload, args);
+      return JSON.stringify(buildPromptResult(payload, prompt, args.mode), null, 2);
     }
 
     case 'list_tabs': {

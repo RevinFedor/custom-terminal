@@ -8,7 +8,7 @@ import { installTerminalMcp, updateClaudeConfig, updateCodexTerminalSection } fr
 
 const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'mcp');
 const projectDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const runtimeFiles = ['terminal-server.mjs', 'terminal-start-ai-request.mjs'];
+const runtimeFiles = ['terminal-server.mjs', 'terminal-start-ai-request.mjs', 'terminal-prompt-catalog.mjs'];
 
 test('Codex update preserves unrelated sections and installs inherited parent identity', () => {
   const before = '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.terminal]\ncommand = "old"\ncustom = true\n\n[features]\nflag = true\n';

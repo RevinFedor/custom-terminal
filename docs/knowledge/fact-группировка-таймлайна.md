@@ -36,6 +36,8 @@
 
 В Codex пара `compacted → context_compacted` и пустые технические continuation не размножают одно сжатие. Реально соседние semantic compacts показываются как `compact ×N`; единичный — как `compact`, без бесполезного `×1`. В header группы compact-count не выносится. Codex compact не имеет человекочитаемого summary, поэтому Cmd-hover не запрашивает full History и не изобретает «контекст». Явное `Копировать compact` остаётся отдельным capability: оно может развернуть verbatim `replacement_history` с маркером encrypted state. Claude compact остаётся другим классом: у него есть читаемый summary.
 
+В свёрнутом 32px rail соседний compact-кластер остаётся одной оранжевой точкой. Для `N > 1` число показывается маленькой светло-янтарной цифрой справа сверху; она абсолютно расположена в свободном месте с зазором от точки, поэтому не меняет ширину Timeline и координаты остальных маркеров. Для `N = 1` цифры нет.
+
 ## Название отдельного хода
 
 Видимая строка описывает действие или вопрос пользователя, а не жанр сообщения и не выдуманный результат: `Проверить конфликт инструментов с WebODM`, а не `конфликт исправлен` и не `запрос на анализ`. Приоритет источников: ручной action override → Prompt Summary → member-description из outline → bounded raw prompt.
@@ -46,7 +48,7 @@
 
 ## Владение и async-границы
 
-Outline, action overrides и Prompt Summary ключуются по `toolType + sessionId + entry UUID`. Переключение вкладки не имеет права соединить новый session id с массивом entries предыдущей вкладки. Late AI-response применяется только к immutable owner snapshot и canonical UUID set, но не по совпадению `entry.sessionId`: resume-файл законно содержит несколько session IDs.
+Outline хранится отдельно от raw JSONL и `timeline_notes` и ключуется по `toolType + sessionId`; action overrides и Prompt Summary — по `toolType + sessionId + entry UUID`. HistoryPanel остаётся плоской canonical-проекцией, а synthetic group header существует только в Timeline и не становится новым адресом истории. Переключение вкладки не имеет права соединить новый session id с массивом entries предыдущей вкладки. Late AI-response применяется только к immutable owner snapshot и canonical UUID set, но не по совпадению `entry.sessionId`: resume-файл законно содержит несколько session IDs.
 
 Групповой Cmd-hover привязан к stable group id, а не к ссылке на новый `semanticGroups[]`. Обычный transcript refresh создаёт новый array даже при тех же ID. Сброс hover-state по array identity давал точный симптом: popup исчезал под неподвижным курсором и не открывался по новому Cmd, пока курсор не выйдет из Timeline. Правильная hydration сравнивает stable ID-signature и сбрасывает active group только когда исчезла сама сущность или сменился owner.
 

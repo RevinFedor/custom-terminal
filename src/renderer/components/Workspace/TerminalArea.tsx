@@ -4,6 +4,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import BrowserTab from './BrowserTab';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
+import { SPLIT_ATTACH_ROW_H, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle } from './SplitPaneChrome';
 import { motion, AnimatePresence } from 'framer-motion';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { clearPendingResume, markPendingResume } from '../../utils/pendingResume';
@@ -165,7 +166,10 @@ const RestoredTerminalError = memo(({ tabId, ownerProjectId, cwd, error, visible
   const visible = visibleProp ?? visibleFromStore;
   const isMissingCwd = error?.type === 'working_directory_missing';
   return (
-    <div className={`absolute inset-0 ${visible ? 'flex' : 'hidden'} items-center justify-center bg-[#111113] text-[#d4d4d4]`}>
+    <div
+      className={`absolute inset-0 ${visible ? 'flex' : 'hidden'} items-center justify-center bg-[#111113] text-[#d4d4d4]`}
+      style={{ pointerEvents: visible ? 'auto' : 'none' }}
+    >
       <div className="max-w-[720px] rounded-lg border border-red-500/30 bg-red-950/20 px-6 py-5 shadow-2xl">
         <div className="text-sm font-semibold uppercase tracking-wide text-red-300">
           Cannot restore terminal
@@ -1249,8 +1253,28 @@ function TerminalArea({
       workspace?.activeTabId || '',
       workspace?.currentView || '',
       workspace?.viewingSubAgentTabId || '',
+      // Split composition/focus — pane wrappers restyle without remounts.
+      s.splitPanes.map((p) => p.tabId).join('+'),
+      String(s.splitFocusedIndex),
     ].join('|');
   });
+
+  // Split pane click-to-focus. Capture phase: the pane must become the app's
+  // active tab BEFORE the click lands in xterm/composer, so keyboard focus and
+  // toolbar follow-through never lag one click behind.
+  const splitPaneCount = useWorkspaceStore((s) => s.splitPanes.length);
+  useEffect(() => {
+    if (splitPaneCount === 0) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const el = (e.target as HTMLElement)?.closest?.('[data-split-pane-index]');
+      if (!el) return;
+      const idx = Number(el.getAttribute('data-split-pane-index'));
+      const st = useWorkspaceStore.getState();
+      if (Number.isFinite(idx) && idx !== st.splitFocusedIndex) st.focusSplitPane(idx);
+    };
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => window.removeEventListener('pointerdown', onPointerDown, true);
+  }, [splitPaneCount]);
 
   const terminals = useMemo(() => {
     const t0 = Date.now();
@@ -1259,6 +1283,15 @@ function TerminalArea({
     const currentOpenProjects = state.openProjects;
     const activeProjectId = state.activeProjectId;
     const appView = state.view;
+    // Split workspace: pane tabs render side-by-side; every OTHER layer keeps
+    // its normal mount but is forced inactive. Wrapper divs are persistent
+    // (same key/type in both modes) so entering/leaving the split never
+    // remounts xterm.
+    const splitPanes = state.splitPanes;
+    const splitActive = splitPanes.length > 0;
+    const splitFocusedTabId = splitActive ? (splitPanes[state.splitFocusedIndex]?.tabId || null) : null;
+    const paneIndexByTabId = new Map<string, number>();
+    splitPanes.forEach((p, i) => paneIndexByTabId.set(p.tabId, i));
     let sdkCount = 0;
     let totalCount = 0;
 
@@ -1283,12 +1316,22 @@ function TerminalArea({
 
     currentOpenProjects.forEach((workspace, projId) => {
       workspace.tabs.forEach((tab) => {
-        const isActiveProject = isActiveProjectForLayer(projId);
-        const active = isActiveTerminalLayer(projId, tab.id);
+        const paneIndex = splitActive ? (paneIndexByTabId.get(tab.id) ?? -1) : -1;
+        const inPane = paneIndex >= 0;
+        // In split mode ONLY pane tabs are visible; each pane tab renders
+        // regardless of which project is globally active.
+        const isActiveProject = splitActive
+          ? (inPane && appView === 'workspace')
+          : isActiveProjectForLayer(projId);
+        const active = splitActive
+          ? (inPane && appView === 'workspace')
+          : isActiveTerminalLayer(projId, tab.id);
+
+        let inner: React.ReactNode = null;
         if (tab.tabType === 'claude-sdk') {
           sdkCount++;
           totalCount++;
-          result.push(
+          inner = (
             <ClaudeSDKTab
               key={tab.id}
               tabId={tab.id}
@@ -1299,7 +1342,7 @@ function TerminalArea({
             />
           );
         } else if (tab.tabType === 'browser') {
-          result.push(
+          inner = (
             <BrowserTab
               key={tab.id}
               tabId={tab.id}
@@ -1315,12 +1358,22 @@ function TerminalArea({
           );
         } else if (tab.tabType === 'file') {
           totalCount++;
-          // Linked file tabs render through the global FilePreview overlay in Workspace.
-          // They are real tabs for grouping/DnD/status, but they have no PTY layer.
-          return;
+          // Single mode: linked file tabs render through the global
+          // FilePreview overlay in Workspace (no PTY layer, nothing here).
+          // Split mode: the pane hosts its own read-only markdown surface —
+          // the global overlay is a window-wide singleton and would cover
+          // the neighbouring panes.
+          if (!inPane) return;
+          inner = (
+            <SplitFilePane
+              key={tab.id}
+              filePath={tab.filePath || ''}
+              visible={active}
+            />
+          );
         } else if ((tab as any).restoreError) {
           totalCount++;
-          result.push(
+          inner = (
             <RestoredTerminalError
               key={tab.id}
               tabId={tab.id}
@@ -1332,7 +1385,7 @@ function TerminalArea({
           );
         } else {
           totalCount++;
-          result.push(
+          inner = (
             <Terminal
               key={tab.id}
               tabId={tab.id}
@@ -1347,11 +1400,54 @@ function TerminalArea({
             />
           );
         }
+
+        // Persistent wrapper: single mode = full-size transparent layer, split
+        // mode = pane rect with attach row + focus frame. pointerEvents:none —
+        // each tab surface re-enables its own hits when presented, so hidden
+        // full-size wrappers never shadow the panes below them.
+        const focusedPane = inPane && tab.id === splitFocusedTabId;
+        result.push(
+          <div
+            key={`pane:${tab.id}`}
+            data-terminal-pane-wrapper={tab.id}
+            {...(inPane ? { 'data-split-pane-index': paneIndex } : {})}
+            style={{
+              ...(inPane
+                ? splitPaneRectStyle(paneIndex, splitPanes.length)
+                : { position: 'absolute' as const, inset: 0 }),
+              zIndex: inPane ? 2 : (splitActive ? 0 : 1),
+              pointerEvents: 'none',
+            }}
+          >
+            {inPane && (
+              <SplitPaneAttachRow
+                paneIndex={paneIndex}
+                projectId={projId}
+                tabId={tab.id}
+                focused={focusedPane}
+              />
+            )}
+            <div
+              data-terminal-pane-content
+              style={{
+                position: 'absolute',
+                top: inPane ? SPLIT_ATTACH_ROW_H : 0,
+                left: 0,
+                right: 0,
+                bottom: 0,
+                pointerEvents: 'none',
+              }}
+            >
+              {inner}
+            </div>
+            {inPane && <SplitPaneFocusFrame focused={focusedPane} />}
+          </div>
+        );
       });
     });
 
     const durMs = Date.now() - t0;
-    console.warn(`[TerminalArea:useMemo] RECALCULATING projectId=${projectId.slice(-12)} total=${totalCount} sdk=${sdkCount} durMs=${durMs}`);
+    console.warn(`[TerminalArea:useMemo] RECALCULATING projectId=${projectId.slice(-12)} total=${totalCount} sdk=${sdkCount} split=${splitPanes.length} durMs=${durMs}`);
     return result;
   }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface]);
 

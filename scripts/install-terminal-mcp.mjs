@@ -11,7 +11,7 @@ const REQUIRED_ENV_VARS = [
   'NOTED_PARENT_PROJECT_ID',
   'NOTED_PARENT_TAB_ID',
 ];
-const SOURCE_FILES = ['terminal-server.mjs', 'terminal-start-ai-request.mjs'];
+const SOURCE_FILES = ['terminal-server.mjs', 'terminal-start-ai-request.mjs', 'terminal-prompt-catalog.mjs'];
 
 function quoteToml(value) {
   return JSON.stringify(String(value));

@@ -26726,6 +26726,17 @@ ipcMain.handle('file:read', async (event, filePath) => {
   }
 });
 
+// Batch existence probe for linked file tabs (Ctrl+Tab switcher, sidebar,
+// Home history mark missing files red instead of erroring on click).
+ipcMain.handle('file:exists-batch', async (event, filePaths) => {
+  const result = {};
+  for (const p of Array.isArray(filePaths) ? filePaths : []) {
+    if (typeof p !== 'string' || !p) continue;
+    try { result[p] = fs.existsSync(p); } catch { result[p] = false; }
+  }
+  return result;
+});
+
 function buildExternalToolPath() {
   const homeDir = os.homedir();
   const extraPaths = [
