@@ -172,6 +172,46 @@ function bindPromptProofExecutionContext(run, proof = {}) {
   return { changed: true, contextBound: true, contextReason: null };
 }
 
+function sourceFollowupExecutionContext(run, parent, proof = {}) {
+  const context = normalizeExecutionContext(proof.executionContext);
+  if (!context) {
+    return { context: null, reason: 'source-followup-execution-context-unavailable' };
+  }
+  const proofProvider = typeof proof.toolType === 'string' ? proof.toolType.trim() : '';
+  const expectedProvider = typeof parent?.targetToolType === 'string'
+    ? parent.targetToolType.trim()
+    : '';
+  if (!proofProvider) {
+    return { context: null, reason: 'source-followup-execution-context-provider-unproven' };
+  }
+  if (context.provider !== proofProvider
+    || (expectedProvider && context.provider !== expectedProvider)) {
+    return { context: null, reason: 'source-followup-execution-context-provider-mismatch' };
+  }
+  const proofSessionId = typeof proof.sessionId === 'string' ? proof.sessionId.trim() : '';
+  if (!proofSessionId || !context.sessionId) {
+    return { context: null, reason: 'source-followup-execution-context-session-unproven' };
+  }
+  if (context.sessionId !== proofSessionId) {
+    return { context: null, reason: 'source-followup-execution-context-session-mismatch' };
+  }
+  const previous = normalizeExecutionContext(parent?.targetExecutionContext)
+    || normalizeExecutionContext(run?.sourceExecutionContext);
+  if (previous?.provider && previous.provider !== context.provider) {
+    return { context: null, reason: 'source-followup-execution-context-provider-mismatch' };
+  }
+  if (previous?.sessionId && previous.sessionId !== context.sessionId) {
+    return { context: null, reason: 'source-followup-execution-context-session-mismatch' };
+  }
+  if (!context.turnId) {
+    return { context: null, reason: 'source-followup-execution-context-turn-unproven' };
+  }
+  if (previous?.turnId && previous.turnId === context.turnId) {
+    return { context: null, reason: 'source-followup-execution-context-turn-not-advanced' };
+  }
+  return { context, reason: null };
+}
+
 function lifecycleExecutionContext(payload = {}) {
   return normalizeExecutionContext(payload.executionContext || {
     provider: payload.provider || payload.toolType || payload.commandType,
@@ -1479,6 +1519,30 @@ class OrchestrationRunStore {
       return { confirmed: false, reason: 'notification-prompt-hash-mismatch', run: publicRun(run), changed, settled };
     }
 
+    const parent = run.parentRunId ? this.runs.get(run.parentRunId) : null;
+    const causalParent = parent
+      && parent.targetTabId === run.sourceTabId
+      && !isTerminalStatus(parent.status)
+      && !isPausedRun(parent)
+      ? parent
+      : null;
+    const followupContext = causalParent
+      ? sourceFollowupExecutionContext(run, causalParent, proof)
+      : { context: null, reason: null };
+    if (causalParent && !followupContext.context) {
+      // The exact notification record proves only delivery. It cannot consume a
+      // child or reopen its parent by tab identity alone; provider/session/turn
+      // must identify the new source turn before any durable state is mutated.
+      return {
+        confirmed: false,
+        reason: followupContext.reason,
+        contextBound: false,
+        run: publicRun(run),
+        changed,
+        settled,
+      };
+    }
+
     const parsedAuditAt = Date.parse(String(proof.auditTimestamp || ''));
     const requestedNow = Number(options.now);
     const now = Number.isFinite(requestedNow)
@@ -1502,7 +1566,6 @@ class OrchestrationRunStore {
     if (run.status === 'completed') run.attentionRequiredAt = null;
     run.updatedAt = now;
 
-    const parent = run.parentRunId ? this.runs.get(run.parentRunId) : null;
     if (parent && parent.targetTabId === run.sourceTabId) {
       run.parentConsumedAt = now;
       run.parentFollowupPending = false;
@@ -1514,7 +1577,7 @@ class OrchestrationRunStore {
           || run.notificationDeliveredAt
           || now;
       }
-      if (!isTerminalStatus(parent.status) && !isPausedRun(parent)) {
+      if (causalParent) {
         parent.outcome = null;
         parent.ownCompletedAt = null;
         parent.completedAt = null;
@@ -1525,15 +1588,21 @@ class OrchestrationRunStore {
         parent.targetBusySeen = true;
         parent.status = 'running';
         parent.startedAt ||= now;
-        parent.sessionId = proof.sessionId || parent.sessionId || null;
-        parent.targetExecutionContext = normalizeExecutionContext(proof.executionContext);
+        parent.sessionId = followupContext.context.sessionId || parent.sessionId || null;
+        parent.targetExecutionContext = followupContext.context;
         parent.updatedAt = now;
         this._pushChanged(changed, parent);
       }
     }
     this._pushChanged(changed, run);
     this._schedulePersist();
-    return { confirmed: true, run: publicRun(run), changed, settled };
+    return {
+      confirmed: true,
+      contextBound: Boolean(followupContext.context),
+      run: publicRun(run),
+      changed,
+      settled,
+    };
   }
 
   async reconcile(runId, observation = {}) {

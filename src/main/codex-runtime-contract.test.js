@@ -10,6 +10,8 @@ const {
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
+  createCodexReadIdentitySubmitBarrier,
+  createCodexResumeReadIdentityLease,
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,
   createCodexPtySubmitAdmission,
@@ -23,14 +25,69 @@ const {
   projectPendingCodexSettingsProofOwner,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  resolveCodexReadIdentity,
   resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,
+  shouldClearCodexReadIdentitySubmitBarrier,
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require('./codex-runtime-contract');
+
+function provisionalResumeReadIdentity(overrides = {}) {
+  const terminalToken = overrides.terminalToken || { pty: 'resume-terminal-a' };
+  const tabId = overrides.tabId || 'tab-a';
+  const sourceSessionId = overrides.sourceSessionId || 'source-a';
+  const launchId = overrides.launchId || 'launch-a';
+  const terminalRunSeq = overrides.terminalRunSeq || 7;
+  const terminalLifecycleGeneration = overrides.terminalLifecycleGeneration || 'terminal-a:7';
+  const base = {
+    tabId,
+    liveLifecycle: true,
+    savedSessionId: sourceSessionId,
+    persistedSessionId: sourceSessionId,
+    provenWriterSessionId: null,
+    writerConfirmed: false,
+    writerUsableForMutation: false,
+    writerProof: null,
+    writerStatus: 'provisional-source',
+    observedWriterSessionId: sourceSessionId,
+    resumeSourceSessionId: sourceSessionId,
+    launch: {
+      command: 'codex-c',
+      tabId,
+      sessionId: sourceSessionId,
+      launchId,
+      terminalToken,
+      runSeq: terminalRunSeq,
+      lifecycleGeneration: terminalLifecycleGeneration,
+    },
+    intent: {
+      sourceMode: 'resume',
+      sourceSessionId,
+      launchId,
+      sourceRunSeq: terminalRunSeq,
+      sourceLifecycleGeneration: terminalLifecycleGeneration,
+    },
+    resumeLease: { sourceSessionId, tabId, launchId },
+    sourceTurn: {
+      sessionId: sourceSessionId,
+      sourceObservationLaunchId: launchId,
+      processGeneration: terminalLifecycleGeneration,
+    },
+    terminalToken,
+    terminalRunSeq,
+    terminalLifecycleGeneration,
+    processRunning: true,
+    processPids: [101],
+    promptOrTurnInFlight: false,
+    provisionalSubmitReserved: false,
+    submitResolutionPending: null,
+  };
+  return { ...base, ...overrides };
+}
 
 test('same-owner turn completion preserves the exact priority proof byte-for-byte', () => {
   const terminalToken = { pty: 'terminal-a' };
@@ -1130,4 +1187,244 @@ test('only explicit inactive may expose history and live status never falls back
     codexWriterConfirmed: true,
     codexWriterUsableForMutation: true,
   }), 'writer');
+});
+
+test('idle provisional Resume exposes only an exact read identity, never writer authority', () => {
+  assert.deepEqual(resolveCodexReadIdentity(provisionalResumeReadIdentity()), {
+    available: true,
+    sessionId: 'source-a',
+    source: 'resume-source',
+    mutationSafe: false,
+    reason: 'exact-idle-resume-source',
+  });
+});
+
+test('verified composer refresh may clear startup payload without clearing exact Resume copy identity', () => {
+  const beforeRefresh = provisionalResumeReadIdentity();
+  const resumeReadLease = createCodexResumeReadIdentityLease({
+    tabId: beforeRefresh.tabId,
+    sourceSessionId: beforeRefresh.resumeSourceSessionId,
+    launchId: beforeRefresh.launch.launchId,
+    terminalToken: beforeRefresh.terminalToken,
+    terminalRunSeq: beforeRefresh.terminalRunSeq,
+    terminalLifecycleGeneration: beforeRefresh.terminalLifecycleGeneration,
+  });
+  assert.ok(resumeReadLease);
+
+  // finishCodexStartupLifecycle removes the startup-only payload after the
+  // verified composer refresh. The independently captured read lease remains.
+  const afterComposerRefresh = {
+    ...beforeRefresh,
+    launch: null,
+    resumeReadLease,
+    resumeSourceSessionId: null,
+  };
+  assert.deepEqual(resolveCodexReadIdentity(afterComposerRefresh), {
+    available: true,
+    sessionId: 'source-a',
+    source: 'resume-source',
+    mutationSafe: false,
+    reason: 'exact-idle-resume-source',
+  });
+});
+
+test('Enter barrier survives task_started and audit timeout until exact child adoption', () => {
+  const base = provisionalResumeReadIdentity();
+  const resumeReadLease = createCodexResumeReadIdentityLease({
+    tabId: base.tabId,
+    sourceSessionId: base.resumeSourceSessionId,
+    launchId: base.launch.launchId,
+    terminalToken: base.terminalToken,
+    terminalRunSeq: base.terminalRunSeq,
+    terminalLifecycleGeneration: base.terminalLifecycleGeneration,
+  });
+  let barrier = createCodexReadIdentitySubmitBarrier({
+    tabId: base.tabId,
+    resumeReadLease,
+    terminalToken: base.terminalToken,
+    terminalRunSeq: base.terminalRunSeq,
+    terminalLifecycleGeneration: base.terminalLifecycleGeneration,
+  });
+  assert.ok(barrier);
+  barrier.enterWritten = true;
+
+  const applyLifecycleEvent = (event) => {
+    if (shouldClearCodexReadIdentitySubmitBarrier(barrier, event)) barrier = null;
+  };
+  applyLifecycleEvent('task-started');
+  assert.ok(barrier, 'generic task_started must retain the post-Enter barrier');
+  applyLifecycleEvent('audit-timeout');
+  assert.ok(barrier, 'audit timeout must retain causal uncertainty');
+  assert.equal(resolveCodexReadIdentity({
+    ...base,
+    launch: null,
+    resumeReadLease,
+    resumeSourceSessionId: null,
+    promptOrTurnInFlight: false,
+    provisionalSubmitReserved: false,
+    submitResolutionPending: barrier,
+  }).reason, 'submit-resolution-pending');
+
+  applyLifecycleEvent('writer-adopted');
+  assert.equal(barrier, null);
+  const adopted = resolveCodexReadIdentity({
+    ...base,
+    launch: null,
+    resumeReadLease,
+    resumeSourceSessionId: null,
+    persistedSessionId: 'child-b',
+    savedSessionId: 'child-b',
+    writerStatus: 'adopted',
+    provenWriterSessionId: 'child-b',
+    writerConfirmed: true,
+    writerUsableForMutation: true,
+    writerProof: 'resumed-submit-causal-writer',
+    submitResolutionPending: barrier,
+  });
+  assert.equal(adopted.sessionId, 'child-b');
+  assert.equal(adopted.source, 'live-writer');
+  assert.equal(adopted.mutationSafe, true);
+});
+
+test('first submit start and pending audit revoke provisional copy until writer resolution', () => {
+  assert.deepEqual(resolveCodexReadIdentity(provisionalResumeReadIdentity({
+    promptOrTurnInFlight: true,
+  })), {
+    available: false,
+    sessionId: null,
+    source: 'unresolved',
+    mutationSafe: false,
+    reason: 'submit-inflight',
+  });
+  assert.equal(resolveCodexReadIdentity(provisionalResumeReadIdentity({
+    provisionalSubmitReserved: true,
+  })).reason, 'submit-reserved');
+
+  const base = provisionalResumeReadIdentity();
+  const persistentBarrier = {
+    tabId: base.tabId,
+    sourceSessionId: base.resumeSourceSessionId,
+    launchId: base.launch.launchId,
+    terminalToken: base.terminalToken,
+    runSeq: base.terminalRunSeq,
+    lifecycleGeneration: base.terminalLifecycleGeneration,
+    enterWritten: true,
+  };
+  assert.equal(resolveCodexReadIdentity({
+    ...base,
+    promptOrTurnInFlight: false,
+    provisionalSubmitReserved: false,
+    submitResolutionPending: persistentBarrier,
+  }).reason, 'submit-resolution-pending');
+  assert.equal(resolveCodexReadIdentity({
+    ...base,
+    submitResolutionPending: {
+      ...persistentBarrier,
+      terminalToken: { pty: 'foreign-terminal' },
+    },
+  }).reason, 'submit-resolution-generation-mismatch');
+});
+
+test('exact source-in-place and source-to-child adoption restore writer-backed copy', () => {
+  const sourceWriter = resolveCodexReadIdentity(provisionalResumeReadIdentity({
+    writerStatus: 'adopted',
+    provenWriterSessionId: 'source-a',
+    writerConfirmed: true,
+    writerUsableForMutation: true,
+    writerProof: 'resumed-submit-causal-writer',
+  }));
+  assert.deepEqual(sourceWriter, {
+    available: true,
+    sessionId: 'source-a',
+    source: 'live-writer',
+    mutationSafe: true,
+    reason: 'exact-adopted-writer',
+  });
+
+  const childWriter = resolveCodexReadIdentity(provisionalResumeReadIdentity({
+    persistedSessionId: 'child-b',
+    savedSessionId: 'child-b',
+    writerStatus: 'adopted',
+    provenWriterSessionId: 'child-b',
+    writerConfirmed: true,
+    writerUsableForMutation: true,
+    writerProof: 'resumed-submit-causal-writer',
+  }));
+  assert.equal(childWriter.sessionId, 'child-b');
+  assert.equal(childWriter.source, 'live-writer');
+  assert.equal(childWriter.mutationSafe, true);
+});
+
+test('stale, foreign, ambiguous, competing, and replacement generations get no read identity', () => {
+  const base = provisionalResumeReadIdentity();
+  const replacementTerminal = { pty: 'replacement' };
+  const cases = [
+    [
+      { intent: { ...base.intent, launchId: 'launch-stale' } },
+      'intent-launch-mismatch',
+    ],
+    [
+      { writerStatus: 'owned-by-other-tab' },
+      'writer-not-provisional-source',
+    ],
+    [
+      { writerStatus: 'ambiguous' },
+      'writer-not-provisional-source',
+    ],
+    [
+      { resumeLease: { ...base.resumeLease, launchId: 'launch-competing' } },
+      'lease-launch-mismatch',
+    ],
+    [
+      { terminalToken: replacementTerminal },
+      'launch-terminal-replaced',
+    ],
+    [
+      { terminalLifecycleGeneration: 'terminal-a:8' },
+      'launch-lifecycle-mismatch',
+    ],
+    [
+      { persistedSessionId: null },
+      'persisted-source-mismatch',
+    ],
+    [
+      { sourceTurn: null },
+      'source-turn-mismatch',
+    ],
+  ];
+  for (const [patch, reason] of cases) {
+    const result = resolveCodexReadIdentity({ ...base, ...patch });
+    assert.equal(result.available, false, reason);
+    assert.equal(result.sessionId, null, reason);
+    assert.equal(result.reason, reason);
+  }
+});
+
+test('provisional read bindings are isolated per tab and stopped Codex remains readable', () => {
+  const tabA = provisionalResumeReadIdentity();
+  const tabB = provisionalResumeReadIdentity({
+    tabId: 'tab-b',
+    sourceSessionId: 'source-b',
+    launchId: 'launch-b',
+    terminalToken: { pty: 'resume-terminal-b' },
+    terminalRunSeq: 11,
+    terminalLifecycleGeneration: 'terminal-b:11',
+  });
+  assert.equal(resolveCodexReadIdentity(tabA).sessionId, 'source-a');
+  assert.equal(resolveCodexReadIdentity(tabB).sessionId, 'source-b');
+  assert.equal(resolveCodexReadIdentity({
+    ...tabA,
+    resumeLease: tabB.resumeLease,
+  }).available, false);
+
+  assert.deepEqual(resolveCodexReadIdentity({
+    liveLifecycle: false,
+    savedSessionId: 'stopped-session',
+  }), {
+    available: true,
+    sessionId: 'stopped-session',
+    source: 'stopped-history',
+    mutationSafe: false,
+    reason: 'stopped-history',
+  });
 });

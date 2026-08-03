@@ -43,6 +43,14 @@ function baseRun(runId, targetTabId = 'target-1') {
 }
 
 function completionAuditProof(runId, sourceTabId = 'source-1') {
+  const executionContext = {
+    provider: 'claude',
+    sessionId: 'session-' + sourceTabId,
+    turnId: 'claude:completion:' + runId,
+    processId: 'pid-' + sourceTabId,
+    generation: null,
+    startedAt: null,
+  };
   return {
     kind: 'prompt-audit',
     sourceTabId,
@@ -52,6 +60,8 @@ function completionAuditProof(runId, sourceTabId = 'source-1') {
     actualHash: 'notification-audit-hash-' + runId,
     expectedHash: 'notification-audit-hash-' + runId,
     sessionId: 'session-' + sourceTabId,
+    toolType: executionContext.provider,
+    executionContext,
   };
 }
 
@@ -1185,6 +1195,178 @@ test('parent waits until a completed child notification is confirmed by its exac
     const finalDone = await store.applyLifecycle('worker', { type: 'done', reason: 'task_complete' });
     assert.deepEqual(finalDone.settled.map((run) => run.runId), ['parent']);
     assert.equal((await store.get('parent')).status, 'completed');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('a completion turn advances the parent context, links the next nested run, and keeps descendant waiting', async () => {
+  const { store, cleanup } = await makeStore();
+  const initialContext = {
+    provider: 'claude',
+    sessionId: 'session-worker',
+    turnId: 'claude:parent-turn',
+    processId: 'pid-worker',
+    generation: 1,
+    startedAt: 100,
+  };
+  const completionContext = {
+    ...initialContext,
+    turnId: 'claude:completion-turn',
+    generation: 2,
+    startedAt: 300,
+  };
+  try {
+    await store.create({
+      ...baseRun('parent-context', 'worker'),
+      targetToolType: 'claude',
+      targetExecutionContext: initialContext,
+    });
+    await store.markDelivery('parent-context', { sessionId: initialContext.sessionId });
+    await store.applyLifecycle('worker', {
+      type: 'busy',
+      busy: true,
+      sessionId: initialContext.sessionId,
+      executionContext: initialContext,
+    });
+
+    const firstChild = await store.create({
+      ...baseRun('child-completed', 'tester-a'),
+      sourceTabId: 'worker',
+      sourceExecutionContext: initialContext,
+    });
+    assert.equal(firstChild.parentRunId, 'parent-context');
+    await store.markDelivery('child-completed');
+    await store.applyLifecycle('tester-a', { type: 'busy', busy: true });
+    await store.applyLifecycle('tester-a', { type: 'done', reason: 'task_complete' });
+    await store.patch('child-completed', {
+      resultComplete: true,
+      resultProofStatus: 'complete',
+      notificationPromptHash: 'hash-child-completed',
+      notificationPromptAuditHash: 'notification-audit-hash-child-completed',
+      notificationHandoffId: 'orchestration-complete:child-completed',
+      notificationAttemptedAt: 250,
+    });
+    await store.markNotification('child-completed', 'queued');
+    await store.applyLifecycle('worker', {
+      type: 'done',
+      reason: 'task_complete',
+      sessionId: initialContext.sessionId,
+      executionContext: initialContext,
+    });
+    assert.equal((await store.get('parent-context')).status, 'waiting_descendants');
+
+    const confirmed = await store.confirmSourceFollowup('child-completed', {
+      ...completionAuditProof('child-completed', 'worker'),
+      executionContext: completionContext,
+    });
+    assert.equal(confirmed.confirmed, true);
+    assert.equal(confirmed.contextBound, true);
+    assert.deepEqual(
+      (await store.get('parent-context')).targetExecutionContext,
+      completionContext,
+    );
+
+    const nextChild = await store.create({
+      ...baseRun('child-next', 'tester-b'),
+      sourceTabId: 'worker',
+      sourceExecutionContext: completionContext,
+    });
+    assert.equal(nextChild.parentRunId, 'parent-context');
+    await store.markDelivery('child-next');
+    await store.applyLifecycle('worker', {
+      type: 'done',
+      reason: 'task_complete',
+      sessionId: completionContext.sessionId,
+      executionContext: completionContext,
+    });
+    const waitingParent = await store.get('parent-context');
+    assert.equal(waitingParent.status, 'waiting_descendants');
+    assert.deepEqual(waitingParent.waitingOnRunIds, ['child-next']);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('missing or mismatched completion context cannot consume a child or reopen its parent by tab id', async () => {
+  const { store, cleanup } = await makeStore();
+  const initialContext = {
+    provider: 'claude',
+    sessionId: 'session-worker',
+    turnId: 'claude:parent-turn',
+    processId: 'pid-worker',
+    generation: 1,
+    startedAt: 100,
+  };
+  try {
+    await store.create({
+      ...baseRun('parent-guarded', 'worker'),
+      targetToolType: 'claude',
+      targetExecutionContext: initialContext,
+    });
+    await store.markDelivery('parent-guarded', { sessionId: initialContext.sessionId });
+    await store.applyLifecycle('worker', {
+      type: 'busy',
+      busy: true,
+      sessionId: initialContext.sessionId,
+      executionContext: initialContext,
+    });
+    await store.create({
+      ...baseRun('child-guarded', 'tester'),
+      sourceTabId: 'worker',
+      sourceExecutionContext: initialContext,
+    });
+    await store.markDelivery('child-guarded');
+    await store.applyLifecycle('tester', { type: 'busy', busy: true });
+    await store.applyLifecycle('tester', { type: 'done', reason: 'task_complete' });
+    await store.patch('child-guarded', {
+      resultComplete: true,
+      resultProofStatus: 'complete',
+      notificationPromptHash: 'hash-child-guarded',
+      notificationPromptAuditHash: 'notification-audit-hash-child-guarded',
+      notificationHandoffId: 'orchestration-complete:child-guarded',
+      notificationAttemptedAt: 250,
+    });
+    await store.markNotification('child-guarded', 'queued');
+    await store.applyLifecycle('worker', {
+      type: 'done',
+      reason: 'task_complete',
+      sessionId: initialContext.sessionId,
+      executionContext: initialContext,
+    });
+
+    const exactProof = completionAuditProof('child-guarded', 'worker');
+    const missingContext = { ...exactProof };
+    delete missingContext.executionContext;
+    const attempts = [
+      [missingContext, 'source-followup-execution-context-unavailable'],
+      [{
+        ...exactProof,
+        executionContext: { ...exactProof.executionContext, provider: 'codex' },
+      }, 'source-followup-execution-context-provider-mismatch'],
+      [{
+        ...exactProof,
+        executionContext: { ...exactProof.executionContext, sessionId: 'neighbor-session' },
+      }, 'source-followup-execution-context-session-mismatch'],
+      [{
+        ...exactProof,
+        executionContext: { ...initialContext },
+      }, 'source-followup-execution-context-turn-not-advanced'],
+    ];
+    for (const [proof, reason] of attempts) {
+      const rejected = await store.confirmSourceFollowup('child-guarded', proof);
+      assert.equal(rejected.confirmed, false);
+      assert.equal(rejected.reason, reason);
+      const child = await store.get('child-guarded');
+      const parent = await store.get('parent-guarded');
+      assert.equal(child.sourceFollowupPending, true);
+      assert.equal(child.sourceFollowupStartedAt, null);
+      assert.equal(child.parentConsumedAt, undefined);
+      assert.equal(parent.status, 'waiting_descendants');
+      assert.deepEqual(parent.targetExecutionContext, initialContext);
+    }
   } finally {
     await store.flush();
     await cleanup();

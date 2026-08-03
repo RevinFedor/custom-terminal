@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
-import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync } from './store/useWorkspaceStore';
+import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId } from './store/useWorkspaceStore';
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
@@ -52,6 +52,7 @@ import {
   resolveCodexSurfaceSession,
   type CodexRuntimeSessionSnapshot,
 } from './utils/codexWriterIdentity';
+import { getCodexRuntimeReadSessionId } from './utils/codexPtyPresence.mjs';
 import { getHistoryAgentRuntime, type AgentHistoryTool } from './utils/historyAgentRuntimes';
 import {
   isCompleteCodexSettingsRequest,
@@ -883,6 +884,7 @@ function App() {
   // Individual selectors — only re-render when specific values change (not on every store mutation)
   const view = useWorkspaceStore((s) => s.view);
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
+  const focusedProjectId = useWorkspaceStore(selectFocusedProjectId);
   const openProjects = useWorkspaceStore((s) => s.openProjects);
   const isRestoring = useWorkspaceStore((s) => s.isRestoring);
   // Functions are stable references in Zustand — selecting them individually avoids re-renders
@@ -2165,6 +2167,7 @@ function App() {
             let inputReady: boolean | null = null;
             let lastNotReady: any = null;
             let effectiveCodexSessionId = t.codexSessionId;
+            let effectiveCodexReadSessionId: string | null = null;
             let codexWriterConfirmed = false;
             let codexWriterUsableForMutation = false;
             let codexConversationMaterialized = !!t.codexSessionId;
@@ -2194,15 +2197,15 @@ function App() {
 	                  // generation N+1 in one Project API response.
 	                  const runtimeSession = (p as any)?.runtimeSnapshot as CodexRuntimeSessionSnapshot | null;
 	                  const provenWriterSessionId = getConfirmedCodexWriterSessionId(runtimeSession);
+                  effectiveCodexReadSessionId = getCodexRuntimeReadSessionId(runtimeSession);
                   const displaySessionId = getCodexDisplaySessionId(runtimeSession);
                   codexWriterConfirmed = !!provenWriterSessionId;
                   codexWriterUsableForMutation = !!provenWriterSessionId
                     && runtimeSession?.writerUsableForMutation === true;
                   codexConversationMaterialized = !!displaySessionId;
-                  // A stopped tab owns a durable historical target. A live tab
-                  // exposes only the process-proven writer; returning the DB or
-                  // resume source while proof is pending recreates the copy-ID
-                  // bug at the Project API boundary.
+                  // Keep writer/display identity separate from the read-only
+                  // Resume source carried above. A live tab publishes a writer
+                  // here only after main has adopted it.
                   effectiveCodexSessionId = sessionStatus === 'inactive'
                     ? displaySessionId
                     : provenWriterSessionId;
@@ -2212,6 +2215,7 @@ function App() {
                 inputReady = false;
                 if (toolType === 'codex') {
                   effectiveCodexSessionId = null;
+                  effectiveCodexReadSessionId = null;
                   codexWriterConfirmed = false;
                   codexWriterUsableForMutation = false;
                 }
@@ -2253,6 +2257,7 @@ function App() {
               filePath: t.filePath || null,
               claudeSessionId: t.claudeSessionId,
               codexSessionId: effectiveCodexSessionId,
+              codexReadSessionId: effectiveCodexReadSessionId,
               codexWriterConfirmed,
               codexWriterUsableForMutation,
               geminiSessionId: t.geminiSessionId,
@@ -2269,9 +2274,7 @@ function App() {
               canCopySessionId: toolType === 'claude'
                 ? claudeMaterialization?.conversationMaterialized === true
                 : toolType === 'codex'
-                  ? sessionStatus === 'inactive'
-                    ? !!effectiveCodexSessionId
-                    : codexWriterUsableForMutation
+                  ? !!effectiveCodexReadSessionId
                   : !!t.geminiSessionId,
               timelineCount: toolType === 'claude' ? claudeMaterialization?.timelineCount ?? null : null,
               materializationReason: toolType === 'claude'
@@ -2511,7 +2514,7 @@ function App() {
           return reply(true, { projectId });
         }
         if (action === 'getSDKParams') {
-          const { tabId, reason, authority } = payload || {};
+          const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           for (const ws of state.openProjects.values()) {
             const t = ws.tabs.get(tabId);
@@ -3036,7 +3039,6 @@ function App() {
             const codexResolution = toolType === 'codex'
               ? await resolveCodexSurfaceSession({
                 tabId,
-                historicalSessionId: tab.codexSessionId || null,
                 operation: 'Получить информацию о сессии',
               })
               : null;
@@ -3103,7 +3105,6 @@ function App() {
           if (sessionType === 'codex') {
             sessionId = await requireCodexSurfaceSessionId({
               tabId: srcTabId,
-              historicalSessionId: srcTab.codexSessionId || null,
               operation: 'Создать fork',
               requireMutationSafe: true,
             });
@@ -3562,7 +3563,7 @@ function App() {
           }
         }
         if (action === 'stopClaudeTab' || action === 'stopAgentProcessScenario') {
-          const { tabId } = payload || {};
+          const { tabId, reason, authority } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           const { toolType, runtime } = describeAgentTab(tabId);
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
@@ -3781,6 +3782,7 @@ function App() {
 	          const timelineCount: Record<string, number | null> = {};
 	          const canResume: Record<string, boolean> = {};
 	          const canCopySessionId: Record<string, boolean> = {};
+	          const readSessions: Record<string, string | null> = {};
 	          const materializationReason: Record<string, string | null> = {};
 	          const codexWriterConfirmed: Record<string, boolean> = {};
 	          const codexWriterUsableForMutation: Record<string, boolean> = {};
@@ -3834,6 +3836,7 @@ function App() {
                 // impossible combinations such as inactive + live writer ID.
                 const runtimeSession = (p as any)?.runtimeSnapshot as CodexRuntimeSessionSnapshot | null;
                 const provenWriterSessionId = getConfirmedCodexWriterSessionId(runtimeSession);
+                const readSessionId = getCodexRuntimeReadSessionId(runtimeSession);
                 const historicalSessionId = getCodexDisplaySessionId(runtimeSession);
                 codexWriterConfirmed[tid] = !!provenWriterSessionId;
                 codexWriterUsableForMutation[tid] = !!provenWriterSessionId
@@ -3842,11 +3845,10 @@ function App() {
                   ? historicalSessionId
                   : provenWriterSessionId;
                 if (codexSessionId) sessions[tid] = codexSessionId;
+                if (readSessionId) readSessions[tid] = readSessionId;
                 conversationMaterialized[tid] = !!historicalSessionId;
                 canResume[tid] = statuses[tid] === 'inactive' && !!codexSessionId;
-                canCopySessionId[tid] = statuses[tid] === 'inactive'
-                  ? !!codexSessionId
-                  : codexWriterUsableForMutation[tid];
+                canCopySessionId[tid] = !!readSessionId;
                 timelineCount[tid] = null;
                 materializationReason[tid] = historicalSessionId ? 'codex-session-id' : 'no-session-id';
               }
@@ -3858,9 +3860,10 @@ function App() {
               codexWriterUsableForMutation[tid] = false;
               canResume[tid] = false;
               canCopySessionId[tid] = false;
+              delete readSessions[tid];
             }
           }
-          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, codexWriterConfirmed, codexWriterUsableForMutation, startupFailed, startupError, startupDefaultsPending, startupDefaultsReady, startupDefaultsError, manualActionRequired, manualActionType, conversationMaterialized, timelineCount, canResume, canCopySessionId, materializationReason });
+          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, readSessions, codexWriterConfirmed, codexWriterUsableForMutation, startupFailed, startupError, startupDefaultsPending, startupDefaultsReady, startupDefaultsError, manualActionRequired, manualActionType, conversationMaterialized, timelineCount, canResume, canCopySessionId, materializationReason });
         }
         if (action === 'getClaudeTabStatus') {
           const { tabId, projectId = null } = payload || {};
@@ -3881,6 +3884,7 @@ function App() {
 	          let codexConversationMaterialized = !!tab.codexSessionId;
 	          let materialization: any = null;
 	          let codexRuntimeSnapshot: CodexRuntimeSessionSnapshot | null = null;
+          let codexReadSessionId: string | null = null;
 	          if (runtime) {
 	            try {
 	              const p = await runtime.getPresence(tabId, projectId);
@@ -3919,6 +3923,7 @@ function App() {
             const runtimeSession = codexRuntimeSnapshot;
             const displaySessionId = getCodexDisplaySessionId(runtimeSession);
             const provenWriterSessionId = getConfirmedCodexWriterSessionId(runtimeSession);
+            codexReadSessionId = getCodexRuntimeReadSessionId(runtimeSession);
             codexWriterConfirmed = !!provenWriterSessionId;
             codexWriterUsableForMutation = !!provenWriterSessionId
               && runtimeSession?.writerUsableForMutation === true;
@@ -3951,6 +3956,7 @@ function App() {
 	            sessionId: effectiveSessionId,
 	            claudeSessionId: tab.claudeSessionId || null,
 	            codexSessionId: effectiveCodexSessionId,
+            codexReadSessionId,
 	            codexWriterConfirmed,
 	            codexWriterUsableForMutation,
 	            conversationMaterialized: toolType === 'claude'
@@ -3962,9 +3968,7 @@ function App() {
 	            canCopySessionId: toolType === 'claude'
                 ? materialization?.conversationMaterialized === true
                 : toolType === 'codex'
-                  ? status === 'inactive'
-                    ? !!effectiveSessionId
-                    : codexWriterUsableForMutation
+                  ? !!codexReadSessionId
                   : !!effectiveSessionId,
 	            timelineCount: toolType === 'claude' ? materialization?.timelineCount ?? null : null,
 	            materializationReason: toolType === 'claude' ? materialization?.materializationReason || materialization?.reason || null : null,
@@ -4000,7 +4004,6 @@ function App() {
           const sessionId = toolType === 'codex'
             ? await requireCodexSurfaceSessionId({
               tabId,
-              historicalSessionId: storedSessionId || null,
               operation: 'Загрузить полную историю',
             })
             : storedSessionId;
@@ -5095,7 +5098,7 @@ function App() {
             projectName={projects[INBOX_PROJECT_ID]?.name || INBOX_PROJECT_NAME}
             projectIcon={projects[INBOX_PROJECT_ID]?.icon || null}
             index={-1}
-            isActive={view === 'workspace' && activeProjectId === INBOX_PROJECT_ID}
+            isActive={view === 'workspace' && focusedProjectId === INBOX_PROJECT_ID}
             fontSize={projectTabsFontSize}
             activeProcessCount={inboxIndicators.activeCount}
             interruptedCount={inboxIndicators.interruptedCount}
@@ -5138,8 +5141,8 @@ function App() {
             
             // Project is active only if:
             // 1. We are in workspace view (not dashboard)
-            // 2. It matches activeProjectId
-            const isActive = view === 'workspace' && activeProjectId === projectId;
+            // 2. It matches the explicitly focused sidebar project
+            const isActive = view === 'workspace' && focusedProjectId === projectId;
             const isLast = index === openProjectsList.length - 1;
 
             const indicators = getProjectTabIndicators(projectId, workspace);

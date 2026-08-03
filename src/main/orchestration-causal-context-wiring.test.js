@@ -39,3 +39,27 @@ test('OR2: exact prompt audit carries target execution context into the run stor
   assert.match(codexAudit, /executionContextDiagnostic:\s*executionContextVerdict\.context/);
   assert.match(webServer, /confirmTargetPromptDelivery\(targetRunId,[\s\S]{0,700}executionContext:\s*detail\.executionContext\s*\|\|\s*null/);
 });
+
+test('nested completion audit waits for Codex task_started and passes its exact context to the store', () => {
+  const webServer = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
+  const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+  const auditRouting = main.slice(
+    main.indexOf('function isOrchestrationPromptAudit'),
+    main.indexOf('function finishClaudePasteAudit'),
+  );
+  const completionSend = webServer.slice(
+    webServer.indexOf('async function sendOrchestrationCompletionNotification'),
+    webServer.indexOf('async function notifyAgentPromptAuditResult'),
+  );
+  const completionConfirm = webServer.slice(
+    webServer.indexOf('const runId = orchestrationCompletionRunIdFromAudit(detail)'),
+    webServer.indexOf('async function reconcileOrchestrationSourceFollowup'),
+  );
+
+  assert.match(auditRouting, /handoffId\.startsWith\('orchestration:'\)/);
+  assert.match(auditRouting, /handoffId\.startsWith\('orchestration-complete:'\)/);
+  assert.match(auditRouting, /deferCodexPromptAuditExecutionContext\(detail\)/);
+  assert.match(auditRouting, /executionContextSource:\s*'codex-task-started'/);
+  assert.match(completionSend, /notifyAgentPromptAuditResult\(\{[\s\S]*?toolType:[\s\S]*?executionContext:\s*audit\.executionContext\s*\|\|\s*null/);
+  assert.match(completionConfirm, /confirmSourceFollowup\(runId,[\s\S]*?toolType:\s*detail\.toolType\s*\|\|\s*null[\s\S]*?executionContext:\s*detail\.executionContext\s*\|\|\s*null/);
+});

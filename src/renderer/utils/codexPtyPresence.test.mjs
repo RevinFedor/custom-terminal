@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   CODEX_PRESENCE_SNAPSHOT_FIELDS,
+  getCodexRuntimeReadSessionId,
   isCodexRuntimeForkReady,
   isCodexRuntimeWriterUsable,
   projectCodexPtyPresence,
@@ -17,6 +18,8 @@ const completeSnapshot = (overrides = {}) => ({
   inputReady: true,
   liveLifecycle: true,
   sessionId: 'writer-session',
+  readSessionId: 'writer-session',
+  readIdentitySource: 'live-writer',
   savedSessionId: 'saved-session',
   canCopySessionId: true,
   hasTerm: true,
@@ -48,6 +51,8 @@ test('an incomplete legacy snapshot is rejected instead of mixing extra IPC gene
     complete: false,
     missingFields: [
       'projectId',
+      'readSessionId',
+      'readIdentitySource',
       'hasTerm',
       'lastNotReady',
       'startupFailed',
@@ -251,6 +256,45 @@ test('renderer cannot turn an incomplete or main-revoked writer into a mutation 
   assert.equal(isCodexRuntimeWriterUsable({ ...base, writerProof: null }), false);
   assert.equal(isCodexRuntimeWriterUsable({ ...base, provenWriterSessionId: null }), false);
   assert.equal(isCodexRuntimeWriterUsable({ ...base, canCopySessionId: false }, { requireCopy: true }), false);
+});
+
+test('renderer consumes the explicit main read identity without deriving a saved fallback', () => {
+  assert.equal(getCodexRuntimeReadSessionId({
+    canCopySessionId: true,
+    readSessionId: 'resume-source',
+    readIdentitySource: 'resume-source',
+    liveLifecycle: true,
+    sessionId: null,
+    savedSessionId: 'resume-source',
+    writerUsableForMutation: false,
+  }), 'resume-source');
+  assert.equal(getCodexRuntimeReadSessionId({
+    canCopySessionId: false,
+    readSessionId: 'resume-source',
+    readIdentitySource: 'resume-source',
+    liveLifecycle: true,
+    savedSessionId: 'resume-source',
+  }), null);
+  assert.equal(getCodexRuntimeReadSessionId({
+    canCopySessionId: true,
+    readSessionId: null,
+    readIdentitySource: 'live-writer',
+    liveLifecycle: true,
+    sessionId: 'stale-writer',
+    savedSessionId: 'stale-history',
+  }), null);
+  assert.equal(getCodexRuntimeReadSessionId({
+    canCopySessionId: true,
+    readSessionId: 'resume-source',
+    readIdentitySource: 'stopped-history',
+    liveLifecycle: true,
+  }), null);
+  assert.equal(getCodexRuntimeReadSessionId({
+    canCopySessionId: true,
+    readSessionId: 'stopped-session',
+    readIdentitySource: 'stopped-history',
+    liveLifecycle: false,
+  }), 'stopped-session');
 });
 
 test('fork readiness ignores inactive presentation labels without a safe writer', () => {

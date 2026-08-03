@@ -3437,6 +3437,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   // Use individual selectors to minimize re-renders
   const openProjects = useWorkspaceStore((state) => state.openProjects);
   const activeProjectId = useWorkspaceStore((state) => state.activeProjectId);
+  const centerInThisProject = useWorkspaceStore((state) => state.activeProjectId === projectId);
   const pendingEditTabId = useWorkspaceStore((state) => state.pendingEditTabId);
   const createTab = useWorkspaceStore((state) => state.createTab);
   const createTabAfterCurrent = useWorkspaceStore((state) => state.createTabAfterCurrent);
@@ -3820,23 +3821,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   };
 
   const handleTabClick = (e: React.MouseEvent, tabId: string) => {
-    // Pick mode: the attach-row "Pick" toggle armed a pane — the next sidebar
-    // click places the tab THERE (or moves focus if it's already visible).
-    {
-      const st = useWorkspaceStore.getState();
-      if (st.splitPickPaneIndex !== null && st.splitPanes.length > 0 && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
-        e.preventDefault();
-        st.setSplitPaneTab(st.splitPickPaneIndex, projectId, tabId);
-        return;
-      }
-    }
     if (e.shiftKey) {
       selectTabRange(projectId, tabId);
     } else if (e.metaKey || e.ctrlKey) {
       toggleTabSelection(projectId, tabId, true);
     } else {
       const clickedTab = workspace?.tabs.get(tabId);
-      if (clickedTab?.tabType === 'file' && tabId === workspace?.activeTabId) {
+      if (clickedTab?.tabType === 'file' && centerInThisProject && tabId === workspace?.activeTabId) {
         const historyTargetId = [...(workspace.tabHistory || [])]
           .reverse()
           .find((id) => id !== tabId && workspace.tabs.get(id)?.tabType !== 'file');
@@ -3846,8 +3837,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         const returnTargetId = historyTargetId || fallbackParentId;
         if (returnTargetId) {
           console.warn('[TabBar:click] file-tab-toggle-back tabId=' + tabId + ' target=' + returnTargetId + ' ts=' + Date.now());
-          switchTab(projectId, returnTargetId);
-          setProjectView(projectId, 'terminal');
+          useWorkspaceStore.getState().activateCenterTab(projectId, returnTargetId);
           return;
         }
       }
@@ -3859,10 +3849,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       if (tabId === workspace?.activeTabId && viewingSubAgentTabId) {
         useWorkspaceStore.getState().setViewingSubAgent(null);
       }
-      switchTab(projectId, tabId);
-      // Always switch to terminal view when clicking a tab
-      // (fixes: clicking tab from Home view didn't switch currentView from 'home' to 'terminal')
-      setProjectView(projectId, 'terminal');
+      useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
     }
   };
   // OSC 133 Event-driven process status (replaces polling)
@@ -6727,7 +6714,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       try {
         return await requireCodexSurfaceSessionId({
           tabId: tab.id,
-          historicalSessionId: tab.codexSessionId,
           operation,
           requireMutationSafe: true,
         });
@@ -8132,6 +8118,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   ? liveMainTabById.get(parentNode.tabId) || parentNode.rawTab
                   : undefined;
                 const parentIsActive = !!parentTab
+                  && centerInThisProject
                   && currentView === 'terminal'
                   && workspace.activeTabId === parentTab.id;
                 const connectorColor = parentTab
@@ -8249,13 +8236,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                       outlineFeedback={isMultiSelect ? null : feedback}
                       outlineNavigationPaused={outlineNavigationPaused}
                       sessionStatus={tab.sessionStatus as SessionStatus | undefined}
-                      isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
+                      isActive={centerInThisProject && currentView === 'terminal' && workspace.activeTabId === tab.id}
                       isSelected={selectedTabIds.includes(tab.id)}
                       isEditing={editingTabId === tab.id}
                       editValue={editValue}
                       onSwitch={(event) => {
                         handleTabClick(event, tab.id);
-                        if (!event.defaultPrevented) setProjectView(projectId, 'terminal');
                       }}
                       onRenameRequest={() => startTabRename(tab)}
                       onClose={(event) => handleCloseTab(event, tab.id)}
@@ -8363,13 +8349,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     projectId={projectId}
                     orientation="vertical"
                     sessionStatus={tab.sessionStatus as SessionStatus | undefined}
-                    isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
+                    isActive={centerInThisProject && currentView === 'terminal' && workspace.activeTabId === tab.id}
                     isSelected={selectedTabIds.includes(tab.id)}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
                     onSwitch={(e) => {
                       handleTabClick(e, tab.id);
-                      if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
                     }}
                     onRenameRequest={() => startTabRename(tab)}
                     onClose={(e) => handleCloseTab(e, tab.id)}
@@ -8407,7 +8392,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 const parentTab = displayParentId
                   ? projectedTabsForDisplay.find(candidate => candidate.id === displayParentId)
                   : null;
-                const parentIsActive = !!parentTab && currentView === 'terminal' && workspace.activeTabId === parentTab.id;
+                const parentIsActive = !!parentTab && centerInThisProject && currentView === 'terminal' && workspace.activeTabId === parentTab.id;
                 const connectorColor = parentTab
                   ? getVisualConnectorColor(parentTab, parentIsActive)
                   : 'rgba(255,255,255,0.14)';
@@ -8828,13 +8813,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 	                    index={index}
                     zone="main"
                     projectId={projectId}
-                    isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
+                    isActive={centerInThisProject && currentView === 'terminal' && workspace.activeTabId === tab.id}
                     isSelected={selectedTabIds.includes(tab.id)}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
                     onSwitch={(e) => {
                       handleTabClick(e, tab.id);
-                      if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
                     }}
                     onRenameRequest={() => startTabRename(tab)}
                     onClose={(e) => handleCloseTab(e, tab.id)}
@@ -9772,7 +9756,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   const uuid = isCodexSessionTab(tab)
                     ? await requireCodexSurfaceSessionId({
                         tabId: tab.id,
-                        historicalSessionId: tab.codexSessionId,
                         operation: 'скопировать UUID сессии',
                       })
                     : getTabSessionUuid(tab);
@@ -9915,7 +9898,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         try {
                           codexSessionId = await requireCodexSurfaceSessionId({
                             tabId: tab.id,
-                            historicalSessionId: tab.codexSessionId,
                             operation: 'добавить Codex-сессию в избранное',
                             requireMutationSafe: true,
                           });
@@ -9957,7 +9939,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             const inSplit = splitPanes.some((p) => p.tabId === contextMenu.tabId);
             // In single mode the pair is (active tab, clicked tab) — clicking
             // the active tab itself would pair it with itself: no-op.
-            const isActiveSingleTab = splitPanes.length === 0 && workspace.activeTabId === contextMenu.tabId;
+            const centerWorkspace = useWorkspaceStore.getState().openProjects.get(activeProjectId || '');
+            const isActiveSingleTab = splitPanes.length === 0
+              && activeProjectId === projectId
+              && centerWorkspace?.activeTabId === contextMenu.tabId;
             const splitFull = splitPanes.length >= 3;
             const disabled = !inSplit && (splitFull || isActiveSingleTab);
             return (

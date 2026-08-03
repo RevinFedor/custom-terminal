@@ -24,9 +24,14 @@ test('automatic restore is typed and orchestration Stop carries exact authority 
   const claude = read('src/renderer/utils/claudePtyActions.ts');
   const web = read('src/main/web-server.js');
   const main = read('src/main/main.js');
+  const stopHandlerStart = app.indexOf("if (action === 'stopClaudeTab' || action === 'stopAgentProcessScenario')");
+  const stopHandlerEnd = app.indexOf("if (action === 'interruptClaudeTurn'", stopHandlerStart);
+  assert.ok(stopHandlerStart >= 0 && stopHandlerEnd > stopHandlerStart, 'stop bridge handler must be addressable');
+  const stopHandler = app.slice(stopHandlerStart, stopHandlerEnd);
 
   assert.match(app, /launchSource: 'auto-resume'/);
-  assert.match(app, /stopAgentProcessScenario\([\s\S]*?reason:[\s\S]*?authority:/);
+  assert.match(stopHandler, /const \{ tabId, reason, authority \} = payload \|\| \{\}/);
+  assert.match(stopHandler, /stopAgentProcessScenario\(\{[\s\S]*?reason:[\s\S]*?authority:/);
   assert.match(scenarios, /runtime\.stopProcess\(tabId, \{ reason, authority \}\)/);
   assert.match(runtimes, /terminal:stop-ai-process[\s\S]*?authority/);
   assert.match(claude, /terminal:stop-ai-process[\s\S]*?authority/);

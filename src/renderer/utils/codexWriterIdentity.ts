@@ -1,5 +1,8 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { isCodexRuntimeWriterUsable } from './codexPtyPresence.mjs';
+import {
+  getCodexRuntimeReadSessionId,
+  isCodexRuntimeWriterUsable,
+} from './codexPtyPresence.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -8,6 +11,9 @@ export interface CodexRuntimeSessionSnapshot {
   projectId?: string | null;
   sessionId?: string | null;
   displaySessionId?: string | null;
+  readSessionId?: string | null;
+  readIdentitySource?: 'live-writer' | 'resume-source' | 'stopped-history' | 'unresolved' | string;
+  readIdentityReason?: string | null;
   provenWriterSessionId?: string | null;
   writerSessionId?: string | null;
   knownSessionId?: string | null;
@@ -111,38 +117,31 @@ export interface CodexSurfaceSessionResolution {
   sessionId: string | null;
   liveLifecycle: boolean | null;
   writerConfirmed: boolean;
-  source: 'live-writer' | 'stopped-history' | 'unresolved';
+  source: 'live-writer' | 'resume-source' | 'stopped-history' | 'unresolved';
   snapshot: CodexRuntimeSessionSnapshot;
 }
 
 /**
- * Read-only/export surfaces use the proven writer while Codex is live and the
- * persisted historical ID only after main has classified the lifecycle as
- * stopped. An unknown live lookup never falls back to stale renderer state.
+ * Read-only/export surfaces consume only main's explicit read identity. Main
+ * may expose an exact idle Resume source before the first submit; that value
+ * remains read-only and is never written into the renderer's writer state.
  */
 export const resolveCodexSurfaceSession = async ({
   tabId,
-  historicalSessionId,
   operation,
 }: {
   tabId: string;
-  historicalSessionId?: string | null;
   operation: string;
 }): Promise<CodexSurfaceSessionResolution> => {
   const snapshot = await readCodexRuntimeSession(tabId, operation);
   const confirmedWriter = getConfirmedCodexWriterSessionId(snapshot);
+  const readSessionId = getCodexRuntimeReadSessionId(snapshot);
   const liveLifecycle = typeof snapshot.liveLifecycle === 'boolean'
     ? snapshot.liveLifecycle
-    : snapshot.writerStatus === 'adopted'
-      ? true
-      : snapshot.writerStatus === 'stopped'
-        ? false
-        : null;
+    : null;
 
   if (liveLifecycle === true) {
-    const usableWriter = isCodexRuntimeWriterUsable(snapshot, { requireCopy: true })
-      && !!confirmedWriter;
-    if (!usableWriter) {
+    if (!readSessionId) {
       return {
         sessionId: null,
         liveLifecycle,
@@ -151,24 +150,36 @@ export const resolveCodexSurfaceSession = async ({
         snapshot,
       };
     }
-    const current = useWorkspaceStore.getState().getCodexSessionId?.(tabId) || null;
-    if (current !== confirmedWriter) {
-      useWorkspaceStore.getState().setCodexSessionId(tabId, confirmedWriter, 'detected');
+    const liveWriterRead = snapshot.readIdentitySource === 'live-writer'
+      && isCodexRuntimeWriterUsable(snapshot, { requireCopy: true })
+      && confirmedWriter === readSessionId;
+    if (snapshot.readIdentitySource !== 'resume-source' && !liveWriterRead) {
+      return {
+        sessionId: null,
+        liveLifecycle,
+        writerConfirmed: false,
+        source: 'unresolved',
+        snapshot,
+      };
+    }
+    if (liveWriterRead) {
+      const current = useWorkspaceStore.getState().getCodexSessionId?.(tabId) || null;
+      if (current !== confirmedWriter) {
+        useWorkspaceStore.getState().setCodexSessionId(tabId, confirmedWriter, 'detected');
+      }
     }
     return {
-      sessionId: confirmedWriter,
+      sessionId: readSessionId,
       liveLifecycle,
-      writerConfirmed: true,
-      source: 'live-writer',
+      writerConfirmed: liveWriterRead,
+      source: liveWriterRead ? 'live-writer' : 'resume-source',
       snapshot,
     };
   }
 
   if (liveLifecycle === false) {
     return {
-      sessionId: cleanSessionId(snapshot.sessionId)
-        || cleanSessionId(snapshot.dbSessionId)
-        || cleanSessionId(historicalSessionId),
+      sessionId: readSessionId,
       liveLifecycle,
       writerConfirmed: false,
       source: 'stopped-history',
@@ -187,7 +198,6 @@ export const resolveCodexSurfaceSession = async ({
 
 export const requireCodexSurfaceSessionId = async (args: {
   tabId: string;
-  historicalSessionId?: string | null;
   operation: string;
   requireMutationSafe?: boolean;
 }): Promise<string> => {
@@ -195,7 +205,8 @@ export const requireCodexSurfaceSessionId = async (args: {
   if (resolved.sessionId
     && (resolved.liveLifecycle !== true
       || args.requireMutationSafe !== true
-      || resolved.snapshot.writerUsableForMutation === true)) {
+      || (resolved.source === 'live-writer'
+        && isCodexRuntimeWriterUsable(resolved.snapshot)))) {
     return resolved.sessionId;
   }
   throw writerGuardError(

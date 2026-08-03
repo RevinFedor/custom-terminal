@@ -4,7 +4,7 @@ import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
 import { usePromptQueueStore } from './usePromptQueueStore';
 import { isOrchestrationCompletionBlocked } from './useOrchestrationStore';
-import type { HistoryPromptDraftChip } from './useUIStore';
+import { useUIStore, type HistoryPromptDraftChip } from './useUIStore';
 import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { isAiForegroundProcess } from '../utils/aiForegroundProcess.mjs';
@@ -26,12 +26,14 @@ import {
 } from '../utils/tabSwitcherModel.mjs';
 import { resolveTabInsertionIndex } from '../utils/tabInsertionModel.mjs';
 import {
+  addEmptyPane,
   addPane,
+  isEmptyPane,
+  removePaneAt,
   removePaneByTab,
   removePanesByProject,
   resolveSplitActivation,
   sanitizePanes,
-  setPaneTab,
 } from '../utils/splitPanesModel.mjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -1289,9 +1291,17 @@ export interface GlobalTabMruEntry {
 }
 
 // One column of the split workspace. Empty array = single mode. Panes may
-// belong to different projects; the FOCUSED pane's tab is the app's active
-// tab, so activeProjectId/activeTabId always follow focus (approved rule:
-// "фокус панели = обычное переключение проекта").
+// belong to different projects. An empty pane ({projectId:'',tabId:''}) is a
+// placeholder opened by the split button: focusable, waiting for the next tab
+// activation to fill it.
+//
+// TAB ≠ PROJECT: activating a tab (sidebar click, Ctrl+Tab, Cmd+P, pane
+// focus) moves only the CENTER — activeProjectId keeps following the center
+// tab so every tab-owned surface (control bar, History, Timeline, hotkeys)
+// works unchanged. The SIDEBAR/toolbar/titlebar live on focusedProjectId,
+// which moves ONLY on an explicit project click (titlebar chip, dashboard,
+// project chip in the attach row). This is what stops "смена вкладки утащила
+// меня в чужой проект".
 export interface SplitPane {
   projectId: string;
   tabId: string;
@@ -1309,7 +1319,16 @@ export interface TerminalBufferCheckpoint {
 
 interface WorkspaceStore {
   view: 'dashboard' | 'workspace';
+  // Project of the CENTER tab. Follows every tab activation (sidebar click,
+  // Ctrl+Tab, pane focus) so all tab-owned surfaces (control bar, History,
+  // Timeline, hotkeys, effective-tab selectors) keep reading it unchanged.
   activeProjectId: string | null;
+  // Project of the SIDEBAR/toolbar/git/titlebar highlight. Moves ONLY on an
+  // explicit project click (titlebar chip, dashboard, project chip in the
+  // attach row, Cmd+arrows). null → falls back to activeProjectId
+  // (selectFocusedProjectId), so old sessions restore without migration.
+  focusedProjectId: string | null;
+  getFocusedProjectId: () => string | null;
   openProjects: Map<string, ProjectWorkspace>;
   projectHistory: string[]; // Stack of project IDs in order of activation
   // Cross-project tab MRU (most-recent-first, cap 60). Written on every tab
@@ -1320,22 +1339,23 @@ interface WorkspaceStore {
   touchGlobalTabMru: (projectId: string, tabId: string) => void;
   // Split workspace (up to 3 side-by-side panes, cross-project). Empty =
   // single mode. Persisted in the session state. Focused pane index kept in
-  // sync with activeProjectId/activeTabId by activateTabEverywhere.
+  // sync with activeProjectId/activeTabId by activateCenterTab.
   splitPanes: SplitPane[];
   splitFocusedIndex: number;
   addTabToSplit: (projectId: string, tabId: string) => boolean;
   removeTabFromSplit: (tabId: string) => void;
-  setSplitPaneTab: (paneIndex: number, projectId: string, tabId: string) => void;
+  // Split button in the attach row: open an EMPTY pane (focused, waiting for
+  // the next tab activation to fill it). Single mode → [center, empty].
+  addEmptySplitPane: () => boolean;
+  // ✕ / Escape on an empty placeholder pane (real panes close by tabId).
+  removeEmptySplitPane: (paneIndex: number) => void;
   focusSplitPane: (paneIndex: number) => void;
   syncSplitWithProjectFocus: (projectId: string) => void;
-  // Pane index awaiting a sidebar click ("Pick" toggle in the attach row);
-  // null = off. Runtime-only.
-  splitPickPaneIndex: number | null;
-  setSplitPickPaneIndex: (paneIndex: number | null) => void;
   // ONE entry point for "user activated tab X of project P" (sidebar click,
-  // switcher commit, project click). Applies the approved split rules, then
-  // falls through to switchTab/showWorkspace.
-  activateTabEverywhere: (projectId: string, tabId: string) => void;
+  // switcher commit, pane focus, cross-tab jumps). Moves the CENTER only:
+  // activeProjectId follows the tab, focusedProjectId (sidebar/toolbar) stays
+  // — that is the «смена вкладки ≠ смена проекта» rule.
+  activateCenterTab: (projectId: string, tabId: string) => void;
   // Transient "reveal this tab in the sidebar list" request. Set by explicit
   // activations (Ctrl+Tab / Cmd+P commit, split pane focus) so TabBar scrolls
   // the row into view instantly — including right after a cross-project
@@ -1697,9 +1717,35 @@ const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
     });
 };
 
+// Center follows the activated tab's project; the sidebar does not. Before
+// the first cross-project divergence focusedProjectId is null (legacy
+// sessions) — pin it to the previous center so the sidebar visibly stays.
+const centerFollowPatch = (
+  st: { activeProjectId: string | null; focusedProjectId: string | null },
+  projectId: string,
+): Partial<Pick<WorkspaceStore, 'activeProjectId' | 'focusedProjectId'>> => (
+  st.activeProjectId === projectId
+    ? {}
+    : {
+      activeProjectId: projectId,
+      ...(st.focusedProjectId === null && st.activeProjectId
+        ? { focusedProjectId: st.activeProjectId }
+        : {}),
+    }
+);
+
+// Selector helper for project-owned surfaces (sidebar, toolbar, titlebar,
+// git, project home): the explicitly chosen project, falling back to the
+// center's project until the two ever diverge.
+export const selectFocusedProjectId = (
+  s: { focusedProjectId: string | null; activeProjectId: string | null },
+): string | null => s.focusedProjectId || s.activeProjectId;
+
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   view: 'dashboard',
   activeProjectId: null,
+  focusedProjectId: null,
+  getFocusedProjectId: () => get().focusedProjectId || get().activeProjectId,
   openProjects: new Map(),
   projectHistory: [],
   globalTabMru: [],
@@ -1713,9 +1759,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   // ── Split workspace ──────────────────────────────────────────────────────
   splitPanes: [],
   splitFocusedIndex: 0,
-  splitPickPaneIndex: null,
-  setSplitPickPaneIndex: (paneIndex) => set({ splitPickPaneIndex: paneIndex }),
-
   addTabToSplit: (projectId, tabId) => {
     const { splitPanes, splitFocusedIndex, activeProjectId, openProjects } = get();
     const activeWs = activeProjectId ? openProjects.get(activeProjectId) : null;
@@ -1724,10 +1767,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       : null;
     const res = addPane(splitPanes, splitFocusedIndex, current, { projectId, tabId });
     if (!res) return false;
-    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, splitPickPaneIndex: null });
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
     console.log('[Split] addTab tab=' + tabId.slice(-12) + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
-    // Focus follows the newly added pane → its tab becomes the active tab.
-    get().activateTabEverywhere(projectId, tabId);
+    // Focus follows the newly added pane → its tab becomes the center tab.
+    get().activateCenterTab(projectId, tabId);
     get().saveSession();
     return true;
   },
@@ -1736,34 +1779,64 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { splitPanes, splitFocusedIndex } = get();
     const res = removePaneByTab(splitPanes, splitFocusedIndex, tabId);
     if (!res) return;
-    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, splitPickPaneIndex: null });
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
     console.log('[Split] removeTab tab=' + tabId.slice(-12) + ' panes=' + res.panes.length);
-    // Keep global focus on a still-visible pane's tab.
+    // Keep the center on a still-visible pane's tab.
     const focused = res.panes[res.focusedIndex];
-    if (focused) get().activateTabEverywhere(focused.projectId, focused.tabId);
+    if (focused && focused.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
     get().saveSession();
   },
 
-  setSplitPaneTab: (paneIndex, projectId, tabId) => {
-    const { splitPanes } = get();
-    const res = setPaneTab(splitPanes, paneIndex, projectId, tabId);
+  addEmptySplitPane: () => {
+    const st = get();
+    const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
+    // Single mode: the current CENTER tab becomes pane 0. In split mode the
+    // model appends/refuses on its own and ignores `current`.
+    const current = st.activeProjectId && activeWs?.activeTabId
+      ? { projectId: st.activeProjectId, tabId: activeWs.activeTabId }
+      : null;
+    const res = addEmptyPane(st.splitPanes, st.splitFocusedIndex, current);
+    if (!res) return false;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    console.log('[Split] addEmptyPane panes=' + res.panes.length + ' focus=' + res.focusedIndex);
+    // Placeholder is session-transient (sanitizePanes drops it on restore),
+    // but persisting the REAL panes' new geometry keeps restart honest.
+    get().saveSession();
+    return true;
+  },
+
+  removeEmptySplitPane: (paneIndex) => {
+    const { splitPanes, splitFocusedIndex } = get();
+    if (!isEmptyPane(splitPanes[paneIndex])) return; // real panes close by tabId
+    const res = removePaneAt(splitPanes, splitFocusedIndex, paneIndex);
     if (!res) return;
-    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, splitPickPaneIndex: null });
-    get().activateTabEverywhere(projectId, tabId);
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    console.log('[Split] removeEmptyPane panes=' + res.panes.length);
+    const focused = res.panes[res.focusedIndex];
+    if (focused && focused.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
     get().saveSession();
   },
 
   focusSplitPane: (paneIndex) => {
-    const { splitPanes } = get();
+    const { splitPanes, splitFocusedIndex } = get();
     const pane = splitPanes[paneIndex];
     if (!pane) return;
-    get().activateTabEverywhere(pane.projectId, pane.tabId);
+    if (isEmptyPane(pane)) {
+      // Placeholder has no tab — only the focus ring moves; the center keeps
+      // showing the previous pane's tab until an activation fills this slot.
+      if (splitFocusedIndex !== paneIndex) {
+        set({ splitFocusedIndex: paneIndex });
+        get().saveSession();
+      }
+      return;
+    }
+    get().activateCenterTab(pane.projectId, pane.tabId);
   },
 
-  // Project click while the split is active: the target is the project's
-  // last active tab — visible pane gets focus, otherwise the focused pane
-  // swaps its tab (approved rule). Called by showWorkspace/openProject after
-  // they set activeProjectId.
+  // Explicit project click while the split is active: the target is the
+  // project's last active tab — visible pane gets focus, otherwise the
+  // focused pane swaps its tab (approved rule). Called by showWorkspace/
+  // openProject, which are always explicit project navigation.
   syncSplitWithProjectFocus: (projectId: string) => {
     const { splitPanes, splitFocusedIndex, openProjects } = get();
     if (splitPanes.length === 0) return;
@@ -1782,18 +1855,32 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ tabListRevealRequest: { projectId, tabId, seq: (prev?.seq || 0) + 1 } });
   },
 
-  activateTabEverywhere: (projectId, tabId) => {
+  activateCenterTab: (projectId, tabId) => {
     // Split rules live inside switchTab (the single activation choke point);
-    // this wrapper adds the cross-project view/focus follow-through.
+    // this wrapper adds the center follow-through WITHOUT moving the sidebar:
+    // switchTab itself shifts activeProjectId via centerFollowPatch, so
+    // showWorkspace (explicit project navigation) is deliberately NOT called.
     const st = get();
     st.switchTab(projectId, tabId);
     st.setProjectView(projectId, 'terminal');
-    if (get().activeProjectId !== projectId || get().view !== 'workspace') {
-      st.showWorkspace(projectId);
+    // Activating a tab always leaves Home — including the SIDEBAR project's
+    // Home overlay when the tab belongs to another project (the overlay
+    // covers the whole center; leaving it up would hide the tab just shown).
+    const focusedPid = get().getFocusedProjectId();
+    if (focusedPid && focusedPid !== projectId
+      && get().openProjects.get(focusedPid)?.currentView === 'home') {
+      st.setProjectView(focusedPid, 'terminal');
     }
-    // Reveal the row in the sidebar (instant, wins over saved-scroll restore
-    // after a project switch).
-    get().requestTabListReveal(projectId, tabId);
+    if (get().view !== 'workspace') {
+      // Dashboard → workspace is view navigation, not project navigation;
+      // land on the sidebar's project, showing the activated tab.
+      set({ view: 'workspace' });
+    }
+    // Reveal the row in the sidebar when the sidebar shows this project
+    // (instant, wins over saved-scroll restore).
+    if (get().getFocusedProjectId() === projectId) {
+      get().requestTabListReveal(projectId, tabId);
+    }
   },
   isRestoring: false,
   pendingEditTabId: null,
@@ -1815,14 +1902,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   saveSession: () => {
-    const { openProjects, activeProjectId, view, isRestoring, projectHistory, globalTabMru, splitPanes, splitFocusedIndex } = get();
+    const { openProjects, activeProjectId, focusedProjectId, view, isRestoring, projectHistory, globalTabMru, splitPanes, splitFocusedIndex } = get();
     if (isRestoring) return; // Don't save while restoring
 
     // Debounce: save after 300ms of inactivity
     if (saveSessionTimer) clearTimeout(saveSessionTimer);
 
     saveSessionTimer = setTimeout(async () => {
-      const sessionState: SessionState & { projectHistory?: string[]; globalTabMru?: GlobalTabMruEntry[]; splitPanes?: SplitPane[]; splitFocusedIndex?: number } = {
+      const sessionState: SessionState & { projectHistory?: string[]; globalTabMru?: GlobalTabMruEntry[]; splitPanes?: SplitPane[]; splitFocusedIndex?: number; focusedProjectId?: string | null } = {
         openProjects: Array.from(openProjects.values()).map((workspace) => {
           const tabsArray = Array.from(workspace.tabs.keys());
           const activeTabIndex = workspace.activeTabId
@@ -1835,6 +1922,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           };
         }),
         activeProjectId,
+        focusedProjectId,
         view,
         projectHistory,
         globalTabMru,
@@ -2110,8 +2198,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         ` savedView=${savedView}` +
         ` projects=${Array.from(openProjects.values()).map((ws) => `${restoreShortId(ws.projectId)}:${ws.tabs.size}`).join(',') || 'none'}`
       );
+      const restoredFocusedId = (sessionState as any).focusedProjectId
+        && openProjects.has((sessionState as any).focusedProjectId)
+        ? (sessionState as any).focusedProjectId as string
+        : null;
       set({
         activeProjectId: restoredActiveId,
+        focusedProjectId: restoredFocusedId,
         view: savedView === 'workspace' && restoredActiveId ? 'workspace' : 'dashboard',
         isRestoring: false,
         openProjects: new Map(openProjects),
@@ -2232,7 +2325,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     startTransition(() => {
       set({
         view: 'workspace',
+        // Explicit project navigation: BOTH the center and the sidebar move.
         activeProjectId: projectId,
+        focusedProjectId: projectId,
         projectHistory: newHistory,
         ...(clearedNotification ? { openProjects: new Map(openProjects) } : {})
       });
@@ -2347,6 +2442,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         set({
           openProjects: new Map(openProjects),
           activeProjectId: projectId,
+          focusedProjectId: projectId,
           view: 'workspace',
           isRestoring: false,
           projectHistory: newHistory
@@ -2371,6 +2467,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
       set({
         activeProjectId: projectId,
+        focusedProjectId: projectId,
         view: 'workspace',
         projectHistory: newHistory,
         ...(clearedNotification ? { openProjects: new Map(openProjects) } : {})
@@ -2440,12 +2537,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
 
       const splitAfterClose = removePanesByProject(get().splitPanes, get().splitFocusedIndex, projectId);
+      // Sidebar owner: dropped with its project; otherwise untouched (it may
+      // legitimately differ from the center's project).
+      const prevFocusedId = get().focusedProjectId;
       startTransition(() => set({
         openProjects: nextOpenProjects,
         activeProjectId: nextActiveId,
+        focusedProjectId: prevFocusedId === projectId ? nextActiveId : prevFocusedId,
         projectHistory: newHistory,
         globalTabMru: dropProjectFromMru(get().globalTabMru, projectId),
-        ...(splitAfterClose ? { splitPanes: splitAfterClose.panes, splitFocusedIndex: splitAfterClose.focusedIndex, splitPickPaneIndex: null } : {}),
+        ...(splitAfterClose ? { splitPanes: splitAfterClose.panes, splitFocusedIndex: splitAfterClose.focusedIndex } : {}),
         // If we closed the active project and no projects are left in history -> dashboard
         view: (isClosingActive && !nextActiveId && view === 'workspace') ? 'dashboard' : view
       }));
@@ -2495,6 +2596,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const tabId = (options as any)?.restoreId || `${projectId}-tab-${workspace.tabCounter}`;
     log.tabs('createTab: tabId:', tabId, 'counter:', workspace.tabCounter, 'restored:', !!(options as any)?.restoreId);
     workspace.tabCounter++;
+
+    // Materialize the current default onto the tab at creation time. The
+    // resolver still has a fallback for legacy/restored data, but changing the
+    // default later must not reshape tabs that are already open.
+    const uiState = useUIStore.getState();
+    if (uiState.terminalIsPrimaryTabs[tabId] === undefined) {
+      uiState.setTabTerminalIsPrimary(tabId, uiState.newTabPrimarySurface === 'terminal');
+    }
 
     // Smart naming: find next available name if not provided
     const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
@@ -2634,6 +2743,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     const tabId = (options as any)?.restoreId || `${projectId}-tab-${workspace.tabCounter}`;
     workspace.tabCounter++;
+
+    const uiState = useUIStore.getState();
+    if (uiState.terminalIsPrimaryTabs[tabId] === undefined) {
+      uiState.setTabTerminalIsPrimary(tabId, uiState.newTabPrimarySurface === 'terminal');
+    }
 
     // Smart naming: find next available name if not provided
     const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
@@ -3024,7 +3138,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         splitSurvivor = splitRes.panes.length > 0
           ? splitRes.panes[splitRes.focusedIndex] || null
           : splitPanes.find((p) => p.tabId !== tabId) || null;
-        set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex, splitPickPaneIndex: null });
+        set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex });
         console.log('[Split] pane-closed-with-tab tab=' + tabId.slice(-12) + ' panes=' + splitRes.panes.length);
       }
     }
@@ -3071,7 +3185,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Split focus follow-through: the surviving pane's tab takes over, even
     // when it belongs to another project.
     if (splitSurvivor && get().openProjects.get(splitSurvivor.projectId)?.tabs.has(splitSurvivor.tabId)) {
-      get().activateTabEverywhere(splitSurvivor.projectId, splitSurvivor.tabId);
+      get().activateCenterTab(splitSurvivor.projectId, splitSurvivor.tabId);
     }
     return true;
   },
@@ -3384,8 +3498,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
       get().touchGlobalTabMru(projectId, tabId);
       // Split rule at the single activation choke point: visible tab → focus
-      // its pane; hidden tab → replace the focused pane's slot. Runs for every
-      // caller (sidebar click, switcher, project click, pick-mode).
+      // its pane; hidden tab → replace the focused pane's slot (an empty
+      // placeholder pane in focus gets filled the same way). Runs for every
+      // caller (sidebar click, switcher, project click).
       {
         const { splitPanes, splitFocusedIndex } = get();
         if (splitPanes.length > 0) {
@@ -3397,7 +3512,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
       // Use startTransition to prevent UI blocking during re-render
       startTransition(() => {
-        set({ openProjects: new Map(openProjects) });
+        // CENTER follows the activated tab's project so every tab-owned
+        // surface (control bar, History, Timeline, hotkeys) works unchanged.
+        // The SIDEBAR does not: focusedProjectId is pinned to the previous
+        // project on first divergence and moves only on explicit project
+        // clicks. This is the "смена вкладки ≠ смена проекта" rule.
+        set({ openProjects: new Map(openProjects), ...centerFollowPatch(get(), projectId) });
       });
       const syncMs = performance.now() - _t0;
       console.warn(

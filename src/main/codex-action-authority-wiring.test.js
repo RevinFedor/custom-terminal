@@ -12,6 +12,23 @@ const historyRuntimeSource = fs.readFileSync(
   'utf8',
 );
 const webServerSource = fs.readFileSync(path.join(repoDir, 'src/main/web-server.js'), 'utf8');
+const appSource = fs.readFileSync(path.join(repoDir, 'src/renderer/App.tsx'), 'utf8');
+const codexIdentitySource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/utils/codexWriterIdentity.ts'),
+  'utf8',
+);
+const codexPresenceSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/utils/codexPtyPresence.mjs'),
+  'utf8',
+);
+const controlBarSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/components/Workspace/ClaudeControlBar.tsx'),
+  'utf8',
+);
+const copySessionSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/components/Workspace/CopySessionButton.tsx'),
+  'utf8',
+);
 
 test('provisional Resume authorization is the same Rewind lease consumed by arm and write boundary', () => {
   const handlerStart = mainSource.indexOf("ipcMain.handle('codex:open-history-menu'");
@@ -44,6 +61,26 @@ test('resumed-active submit reserves one lease before paste and one causal audit
   const pasteEnd = mainSource.indexOf('// Send input to terminal', pasteStart);
   const paste = mainSource.slice(pasteStart, pasteEnd);
   assert.ok(paste.indexOf('CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT') >= 0);
+  const waitingValidation = paste.indexOf('const authorityVerdict = validateMainCodexActionAuthority');
+  const devHold = paste.indexOf('await waitForCodexActionAuthorityTestRelease(codexSubmitAuthority)');
+  const heldRevalidation = paste.indexOf('const authorityAfterHold = validateMainCodexActionAuthority');
+  const authorityArm = paste.indexOf("'resume-submit-authority-armed'");
+  assert.ok(
+    waitingValidation >= 0
+      && waitingValidation < devHold
+      && devHold < heldRevalidation
+      && heldRevalidation < authorityArm
+      && authorityArm < paste.indexOf("'resume-submit-paste-boundary'"),
+    'the exact waiting authority must be checked, held, rechecked, and only then armed',
+  );
+  assert.match(
+    paste.slice(devHold, authorityArm),
+    /holdResult\?\.released !== true[\s\S]{0,300}error: 'codex_submit_action_authority_revoked'[\s\S]{0,180}submitted: false/,
+  );
+  assert.match(
+    paste.slice(Math.max(0, devHold - 180), devHold),
+    /if \(codexActionAuthorityTestHoldEnabled\(codexSubmitAuthority\.profile\)\)/,
+  );
   assert.ok(
     paste.indexOf("'resume-submit-paste-boundary'") < paste.indexOf('term.write(payload)'),
     'submit authority must be consumed before bracketed paste bytes',
@@ -101,4 +138,97 @@ test('the shared barrier does not gate settings, Fork, or stopped-send scenario 
   );
   assert.match(forkComposerBoundary, /command === 'codex-f'/);
   assert.doesNotMatch(forkComposerBoundary, /CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT/);
+});
+
+test('main publishes one launch-scoped read identity without promoting it to writer authority', () => {
+  const snapshotStart = mainSource.indexOf('async function getCodexRuntimeSessionSnapshot');
+  const snapshotEnd = mainSource.indexOf('function getCodexSessionOwner', snapshotStart);
+  assert.ok(snapshotStart >= 0 && snapshotEnd > snapshotStart);
+  const snapshot = mainSource.slice(snapshotStart, snapshotEnd);
+  assert.match(snapshot, /const readIdentity = resolveCodexReadIdentity\(\{/);
+  assert.match(snapshot, /const currentResumeReadLease = getCodexResumeReadIdentityLeaseForTab\(tabId\)/);
+  assert.match(snapshot, /resumeReadLease: currentResumeReadLease/);
+  assert.match(snapshot, /persistedSessionId: dbSessionId/);
+  assert.match(snapshot, /promptOrTurnInFlight: hasCodexPromptOrTurnInFlight\(tabId\)/);
+  assert.match(snapshot, /submitResolutionPending: codexReadIdentitySubmitPending\.get\(tabId\) \|\| null/);
+  assert.match(snapshot, /readSessionId: readIdentity\.sessionId/);
+  assert.match(snapshot, /canCopySessionId: readIdentity\.available === true/);
+  assert.match(snapshot, /sessionId = liveLifecycle === false \? savedSessionId : provenWriterSessionId/);
+
+  assert.match(mainSource, /launchPayload\.lifecycleGeneration = getTerminalLifecycleGeneration\(tabId\)/);
+  assert.match(mainSource, /sourceTerminalToken: scopedSourceTerminalToken/);
+  assert.match(mainSource, /sourceLifecycleGeneration: scopedSourceLifecycleGeneration/);
+  assert.match(mainSource, /function beginCodexPromptInFlight[\s\S]{0,700}armCodexReadIdentitySubmitBarrier\(tabId, reason\)/);
+  assert.match(mainSource, /function markCodexPromptSubmitted[\s\S]{0,500}markCodexReadIdentitySubmitWritten/);
+  assert.match(mainSource, /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,240}clearCodexReadIdentitySubmitBarrier/);
+});
+
+test('startup completion retains the Resume read lease and post-Enter barrier until adoption', () => {
+  const launchClearStart = mainSource.indexOf('function clearCodexLaunchPayload');
+  const launchClearEnd = mainSource.indexOf('function clearCodexManualActionRequired', launchClearStart);
+  assert.ok(launchClearStart >= 0 && launchClearEnd > launchClearStart);
+  const launchClear = mainSource.slice(launchClearStart, launchClearEnd);
+  assert.doesNotMatch(launchClear, /clearCodexReadIdentitySubmitBarrier/);
+
+  const finishStart = mainSource.indexOf('function finishCodexStartupLifecycle');
+  const finishEnd = mainSource.indexOf('function markCodexTuiReadyFromTurnEnd', finishStart);
+  assert.ok(finishStart >= 0 && finishEnd > finishStart);
+  assert.match(mainSource.slice(finishStart, finishEnd), /clearCodexLaunchPayload\(tabId, reason\)/);
+
+  const barrierStart = mainSource.indexOf('function armCodexReadIdentitySubmitBarrier');
+  const barrierEnd = mainSource.indexOf('function hasCodexPromptOrTurnInFlight', barrierStart);
+  assert.ok(barrierStart >= 0 && barrierEnd > barrierStart);
+  const barrier = mainSource.slice(barrierStart, barrierEnd);
+  assert.match(barrier, /getCodexResumeReadIdentityLeaseForTab\(tabId\)/);
+  assert.match(barrier, /createCodexReadIdentitySubmitBarrier\(\{/);
+  assert.match(barrier, /shouldClearCodexReadIdentitySubmitBarrier\(current, resolution\)/);
+
+  const taskStartedIndex = mainSource.indexOf("clearCodexPromptInFlight(state.tabId, 'task_started')");
+  const taskStartedBoundary = mainSource.slice(taskStartedIndex, taskStartedIndex + 260);
+  assert.ok(taskStartedIndex >= 0);
+  assert.match(taskStartedBoundary, /finishCodexStartupLifecycle\(state\.tabId, 'task_started'\)/);
+  assert.doesNotMatch(taskStartedBoundary, /clearCodexReadIdentitySubmitBarrier/);
+  assert.match(
+    mainSource,
+    /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,260}resolution: 'writer-adopted'/,
+  );
+  assert.match(
+    mainSource,
+    /released\.includes\(pendingBarrier\.sourceSessionId\)[\s\S]{0,300}resolution: 'resume-lease-released'/,
+  );
+});
+
+test('both copy buttons consume the main read contract while mutations keep writer guards', () => {
+  const copyIdStart = controlBarSource.indexOf('const copySessionId = async () =>');
+  const copyIdEnd = controlBarSource.indexOf('// Live bridge data', copyIdStart);
+  assert.ok(copyIdStart >= 0 && copyIdEnd > copyIdStart);
+  const copyId = controlBarSource.slice(copyIdStart, copyIdEnd);
+  assert.match(copyId, /requireCodexActionSessionId\('скопировать ID сессии'\)/);
+  assert.doesNotMatch(copyId, /requireMutationSafe|,\s*true\)/);
+  assert.match(controlBarSource, /requireCodexActionSessionId\('продолжить Codex-сессию', true\)/);
+  assert.match(controlBarSource, /requireCodexActionSessionId\('создать fork Codex-сессии', true\)/);
+
+  const copySessionStart = copySessionSource.indexOf("if (kind === 'codex' && !overrideInput)");
+  const copySessionEnd = copySessionSource.indexOf('if (!targetId) continue;', copySessionStart);
+  assert.ok(copySessionStart >= 0 && copySessionEnd > copySessionStart);
+  const copySession = copySessionSource.slice(copySessionStart, copySessionEnd);
+  assert.match(copySession, /requireCodexSurfaceSessionId\(\{/);
+  assert.doesNotMatch(copySession, /requireMutationSafe/);
+
+  assert.match(codexPresenceSource, /getCodexRuntimeReadSessionId[\s\S]*canCopySessionId !== true[\s\S]*readSessionId/);
+  assert.doesNotMatch(codexIdentitySource, /historicalSessionId/);
+  assert.match(codexIdentitySource, /snapshot\.readIdentitySource === 'live-writer'[\s\S]*isCodexRuntimeWriterUsable/);
+  assert.match(codexIdentitySource, /resolved\.source === 'live-writer'[\s\S]*isCodexRuntimeWriterUsable/);
+  assert.match(codexIdentitySource, /resolveConfirmedCodexWriter[\s\S]*isCodexRuntimeWriterUsable\(snapshot\)/);
+
+  const batchStatusStart = appSource.indexOf("if (action === 'getClaudeTabStatusBatch')");
+  const batchStatusEnd = appSource.indexOf("if (action === 'getClaudeTabStatus')", batchStatusStart);
+  assert.ok(batchStatusStart >= 0 && batchStatusEnd > batchStatusStart);
+  const batchStatus = appSource.slice(batchStatusStart, batchStatusEnd);
+  assert.match(batchStatus, /const readSessionId = getCodexRuntimeReadSessionId\(runtimeSession\)/);
+  assert.match(batchStatus, /canCopySessionId\[tid\] = !!readSessionId/);
+  assert.doesNotMatch(batchStatus, /canCopySessionId\[tid\] = statuses\[tid\] === 'inactive'/);
+
+  assert.match(webServerSource, /const readSessionId = runtime\?\.canCopySessionId === true[\s\S]{0,240}runtime\.readSessionId\.trim\(\)/);
+  assert.match(webServerSource, /codexReadSessionId: isCodex \? runtimeCodexReadSessionId : null/);
 });

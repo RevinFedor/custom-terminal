@@ -21,6 +21,8 @@ import {
   syncSessionStartingWithPresence,
 } from '../../utils/sessionStartingState.mjs';
 import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
+import { isEmptyPane } from '../../utils/splitPanesModel.mjs';
+import SplitPaneSurface from './SplitPaneSurface';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -1263,6 +1265,11 @@ function TerminalArea({
   // active tab BEFORE the click lands in xterm/composer, so keyboard focus and
   // toolbar follow-through never lag one click behind.
   const splitPaneCount = useWorkspaceStore((s) => s.splitPanes.length);
+  const focusedEmptyPaneIndex = useWorkspaceStore((s) => (
+    s.splitPanes.length > 0 && isEmptyPane(s.splitPanes[s.splitFocusedIndex])
+      ? s.splitFocusedIndex
+      : -1
+  ));
   useEffect(() => {
     if (splitPaneCount === 0) return;
     const onPointerDown = (e: PointerEvent) => {
@@ -1275,6 +1282,20 @@ function TerminalArea({
     window.addEventListener('pointerdown', onPointerDown, true);
     return () => window.removeEventListener('pointerdown', onPointerDown, true);
   }, [splitPaneCount]);
+
+  useEffect(() => {
+    if (focusedEmptyPaneIndex < 0) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      const activeElement = document.activeElement;
+      if (activeElement && activeElement !== document.body) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      useWorkspaceStore.getState().removeEmptySplitPane(focusedEmptyPaneIndex);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [focusedEmptyPaneIndex]);
 
   const terminals = useMemo(() => {
     const t0 = Date.now();
@@ -1421,7 +1442,6 @@ function TerminalArea({
           >
             {inPane && (
               <SplitPaneAttachRow
-                paneIndex={paneIndex}
                 projectId={projId}
                 tabId={tab.id}
                 focused={focusedPane}
@@ -1438,12 +1458,110 @@ function TerminalArea({
                 pointerEvents: 'none',
               }}
             >
-              {inner}
+              {inPane && tab.tabType !== 'browser' && tab.tabType !== 'file' ? (
+                <SplitPaneSurface
+                  projectId={projId}
+                  tabId={tab.id}
+                  focused={focusedPane}
+                >
+                  {inner}
+                </SplitPaneSurface>
+              ) : inner}
             </div>
             {inPane && <SplitPaneFocusFrame focused={focusedPane} />}
           </div>
         );
       });
+    });
+
+    splitPanes.forEach((pane, paneIndex) => {
+      if (!isEmptyPane(pane)) return;
+      const focusedPane = paneIndex === state.splitFocusedIndex;
+      result.push(
+        <div
+          key={`pane:empty:${paneIndex}`}
+          data-terminal-pane-wrapper="empty"
+          data-split-pane-index={paneIndex}
+          style={{
+            ...splitPaneRectStyle(paneIndex, splitPanes.length),
+            zIndex: 2,
+            pointerEvents: 'none',
+            background: '#161616',
+          }}
+        >
+          <div
+            data-split-attach-row
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              right: 0,
+              height: SPLIT_ATTACH_ROW_H,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '0 8px',
+              boxSizing: 'border-box',
+              zIndex: 3,
+              pointerEvents: 'auto',
+              color: '#8a8a8f',
+              fontSize: 11,
+              fontWeight: 600,
+              userSelect: 'none',
+            }}
+          >
+            <span>Выберите вкладку</span>
+            <span style={{ flex: 1 }} />
+            <button
+              title="Убрать пустую панель"
+              onClick={(e) => {
+                e.stopPropagation();
+                useWorkspaceStore.getState().removeEmptySplitPane(paneIndex);
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+              style={{
+                width: 18,
+                height: 18,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: 0,
+                border: 'none',
+                borderRadius: 4,
+                background: 'transparent',
+                color: '#8f8f94',
+                cursor: 'pointer',
+                fontSize: 14,
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+          </div>
+          <div
+            style={{
+              position: 'absolute',
+              top: SPLIT_ATTACH_ROW_H,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 16,
+              background: '#161616',
+              color: '#777',
+              fontSize: 12.5,
+              textAlign: 'center',
+              pointerEvents: 'auto',
+              userSelect: 'none',
+            }}
+          >
+            Ctrl+Tab / Cmd+P или клик по вкладке слева
+          </div>
+          <SplitPaneFocusFrame focused={focusedPane} />
+        </div>
+      );
     });
 
     const durMs = Date.now() - t0;

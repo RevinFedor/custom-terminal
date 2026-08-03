@@ -1975,6 +1975,10 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
           handoffId: notificationHandoffId,
           source: 'orchestration-completion:' + current.runId,
           success: true,
+          toolType: audit.executionContext?.provider
+            || status?.commandType
+            || status?.toolType
+            || null,
           auditTimestamp: audit.auditTimestamp || null,
           actualHash: audit.actualHash || null,
           expectedHash: audit.expectedHash || null,
@@ -1982,6 +1986,7 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
           actualLen: Number.isFinite(audit.actualLen) ? Number(audit.actualLen) : null,
           sessionId: audit.sessionId || null,
           entryUuid: audit.entryUuid || null,
+          executionContext: audit.executionContext || null,
         });
       }
       const deliveredRun = await store.getInternal(current.runId);
@@ -2116,8 +2121,10 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     auditTimestamp: detail.auditTimestamp || null,
     actualHash: detail.actualHash || null,
     expectedHash: detail.expectedHash || null,
+    toolType: detail.toolType || null,
     sessionId: detail.sessionId || null,
     userUuid: detail.entryUuid || null,
+    executionContext: detail.executionContext || null,
   });
   if (confirmation.confirmed) {
     console.log('[Orchestration] source follow-up confirmed run=' + runId
@@ -3032,10 +3039,13 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
     // state. Codex is overlaid with main's process/writer snapshot below.
     const status = await resolveAgentSessionInfo(tabId, 1500);
     const sessionStatus = status?.status || status?.sessionStatus || 'unknown';
+    const readSessionId = status?.readSessionId || status?.codexReadSessionId || null;
     sink.send(JSON.stringify({
       type: 'snapshot',
       tabId,
       sessionId: status?.sessionId || null,
+      readSessionId,
+      codexReadSessionId: readSessionId,
       busy: sessionStatus === 'busy',
       sessionStatus,
       starting: sessionStatus === 'starting',
@@ -3166,6 +3176,11 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500) {
     } catch {}
     const sessionStatus = runtime?.sessionStatus || 'unknown';
     const sessionId = runtime?.sessionId || null;
+    const readSessionId = runtime?.canCopySessionId === true
+      && typeof runtime?.readSessionId === 'string'
+      && runtime.readSessionId.trim()
+      ? runtime.readSessionId.trim()
+      : null;
     return {
       ...base,
       tabId,
@@ -3175,12 +3190,14 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500) {
       sessionStatus,
       sessionId,
       codexSessionId: sessionId,
+      readSessionId,
+      codexReadSessionId: readSessionId,
       savedSessionId: runtime?.savedSessionId || historicalSessionId || base?.savedSessionId || null,
       liveLifecycle: runtime ? (runtime.liveLifecycle ?? null) : null,
       inputReady: runtime?.inputReady === true,
       writerConfirmed: runtime?.writerConfirmed === true,
       writerUsableForMutation: runtime?.writerUsableForMutation === true,
-      canCopySessionId: runtime?.canCopySessionId === true,
+      canCopySessionId: !!readSessionId,
       lifecycleGeneration: runtime?.lifecycleGeneration || null,
       canResume: sessionStatus === 'inactive' && !!sessionId,
     };
@@ -4302,6 +4319,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let lastNotReadyMap = new Map();
     let awaitingMap = new Map();
     let runtimeSessionMap = new Map();
+    let runtimeReadSessionMap = new Map();
     let codexWriterConfirmedMap = new Map();
     let codexWriterUsableMap = new Map();
     let canCopySessionIdMap = new Map();
@@ -4332,6 +4350,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (data?.lastNotReady) for (const [id, value] of Object.entries(data.lastNotReady)) lastNotReadyMap.set(id, value);
         if (data?.awaiting) for (const [id, aw] of Object.entries(data.awaiting)) if (aw) awaitingMap.set(id, true);
         if (data?.sessions) for (const [id, sid] of Object.entries(data.sessions)) if (sid) runtimeSessionMap.set(id, sid);
+        if (data?.readSessions) for (const [id, sid] of Object.entries(data.readSessions)) if (sid) runtimeReadSessionMap.set(id, sid);
         if (data?.codexWriterConfirmed) for (const [id, value] of Object.entries(data.codexWriterConfirmed)) codexWriterConfirmedMap.set(id, value === true);
         if (data?.codexWriterUsableForMutation) for (const [id, value] of Object.entries(data.codexWriterUsableForMutation)) codexWriterUsableMap.set(id, value === true);
         if (data?.canCopySessionId) for (const [id, value] of Object.entries(data.canCopySessionId)) canCopySessionIdMap.set(id, value === true);
@@ -4358,6 +4377,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           : null;
       } catch {}
       runtimeSessionMap.delete(t.tabId);
+      runtimeReadSessionMap.delete(t.tabId);
       if (!runtime) {
         statusMap.set(t.tabId, 'unknown');
         inputReadyMap.set(t.tabId, false);
@@ -4370,9 +4390,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
       statusMap.set(t.tabId, runtime.sessionStatus || 'unknown');
       inputReadyMap.set(t.tabId, runtime.inputReady === true);
       if (runtime.sessionId) runtimeSessionMap.set(t.tabId, runtime.sessionId);
+      if (runtime.canCopySessionId === true && runtime.readSessionId) {
+        runtimeReadSessionMap.set(t.tabId, runtime.readSessionId);
+      }
       codexWriterConfirmedMap.set(t.tabId, runtime.writerConfirmed === true);
       codexWriterUsableMap.set(t.tabId, runtime.writerUsableForMutation === true);
-      canCopySessionIdMap.set(t.tabId, runtime.canCopySessionId === true);
+      canCopySessionIdMap.set(t.tabId, runtimeReadSessionMap.has(t.tabId));
       canResumeMap.set(t.tabId, runtime.sessionStatus === 'inactive' && !!runtime.sessionId);
     }
     // Configurable status-marker palette (assigned-category color + shape/size)
@@ -4404,6 +4427,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         : null;
       const runtimeStatus = statusMap.get(t.tabId) || null;
       const runtimeCodexSessionId = runtimeSessionMap.get(t.tabId) || null;
+      const runtimeCodexReadSessionId = runtimeReadSessionMap.get(t.tabId) || null;
       const isCodex = t.commandType === 'codex';
       const isClaude = t.commandType === 'claude';
       const codexWriterConfirmed = codexWriterConfirmedMap.get(t.tabId) === true;
@@ -4439,6 +4463,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         filePath: t.filePath || null,
         claudeSessionId: t.claudeSessionId,
         codexSessionId,
+        codexReadSessionId: isCodex ? runtimeCodexReadSessionId : null,
         codexWriterConfirmed,
         codexWriterUsableForMutation,
         geminiSessionId: t.geminiSessionId,
@@ -4450,9 +4475,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         canCopySessionId: isCodex
           ? (canCopySessionIdMap.has(t.tabId)
             ? canCopySessionIdMap.get(t.tabId)
-            : runtimeStatus === 'inactive'
-              ? !!codexSessionId
-              : !!runtimeStatus && codexWriterUsableForMutation)
+            : !!runtimeCodexReadSessionId)
           : isClaude
             ? conversationMaterialized
             : !!t.geminiSessionId,

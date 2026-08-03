@@ -343,6 +343,8 @@ const {
   codexLiveSlashAllowsTurnBusy,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
+  createCodexReadIdentitySubmitBarrier,
+  createCodexResumeReadIdentityLease,
   createCodexServiceTierProof,
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,
@@ -355,8 +357,10 @@ const {
   projectPendingCodexSettingsProofOwner,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  resolveCodexReadIdentity,
   resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,
+  shouldClearCodexReadIdentitySubmitBarrier,
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
@@ -3386,6 +3390,7 @@ const codexPreclaimedCommandGenerations = new Map(); // tabId -> first exact OSC
 const codexPendingSettingsProofHandoffs = new Map(); // tabId -> one exact pre-rollout settings proof for this PTY generation
 const codexPendingModelMigrations = new Map(); // tabId -> post-Enter ack capture bound to one PTY/launch/input generation
 const codexPromptInFlight = new Map(); // tabId -> prompt submit window before rollout task_started
+const codexReadIdentitySubmitPending = new Map(); // tabId -> first Resume submit awaiting exact source/child adoption
 const codexInputLineBuffers = new Map(); // tabId -> shared manual xterm input-line tracker state
 const codexPromptGeneration = new Map(); // tabId -> current Codex composer generation
 const codexManualActionRequired = new Map(); // tabId -> auth/update state that must be handled by the user
@@ -6580,6 +6585,12 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
     invalidatedReason: null,
   };
   codexWriterProofs.set(tabId, proofRecord);
+  clearCodexReadIdentitySubmitBarrier(
+    tabId,
+    null,
+    'writer-adopted:' + sessionId,
+    { resolution: 'writer-adopted' },
+  );
   const proofChanged = prev !== sessionId
     || prevProof?.kind !== proofRecord.kind
     || prevProof?.filePath !== proofRecord.filePath
@@ -6962,6 +6973,17 @@ function releaseCodexResumeSourceLeaseForTab(
     sourceSessionId,
     launchId,
   });
+  const pendingBarrier = codexReadIdentitySubmitPending.get(tabId) || null;
+  if (pendingBarrier
+    && released.includes(pendingBarrier.sourceSessionId)
+    && (!launchId || pendingBarrier.launchId === launchId)) {
+    clearCodexReadIdentitySubmitBarrier(
+      tabId,
+      pendingBarrier,
+      'resume-lease:' + reason,
+      { resolution: 'resume-lease-released' },
+    );
+  }
   for (const source of released) {
     console.log('[CodexResumeLease] release tab=' + String(tabId).slice(-12)
       + ' source=' + String(source).slice(0, 8)
@@ -6974,6 +6996,43 @@ function getCodexResumeSourceLeaseForTab(tabId) {
     if (lease?.tabId === tabId) return { sourceSessionId, ...lease };
   }
   return null;
+}
+
+function getCodexResumeReadIdentityLeaseForTab(tabId) {
+  const lease = getCodexResumeSourceLeaseForTab(tabId);
+  const readIdentity = lease?.readIdentity || null;
+  if (!readIdentity
+    || readIdentity.tabId !== tabId
+    || readIdentity.sessionId !== lease.sourceSessionId
+    || readIdentity.launchId !== lease.launchId) return null;
+  return readIdentity;
+}
+
+function bindCodexResumeReadIdentityLease({
+  tabId,
+  sourceSessionId,
+  launchId,
+  terminalToken,
+  terminalRunSeq,
+  terminalLifecycleGeneration,
+}) {
+  const lease = codexResumeSourceLeases.get(sourceSessionId) || null;
+  if (!lease || lease.tabId !== tabId || lease.launchId !== launchId) return false;
+  const readIdentity = createCodexResumeReadIdentityLease({
+    tabId,
+    sourceSessionId,
+    launchId,
+    terminalToken,
+    terminalRunSeq,
+    terminalLifecycleGeneration,
+  });
+  if (!readIdentity) return false;
+  lease.readIdentity = readIdentity;
+  console.log('[CodexReadIdentity] Resume read lease bound tab=' + String(tabId).slice(-12)
+    + ' source=' + String(sourceSessionId).slice(0, 8)
+    + ' launch=' + launchId
+    + ' run=' + readIdentity.runSeq);
+  return true;
 }
 
 function markCodexLaunchAcceptancePending(tabId, launchId) {
@@ -15620,9 +15679,11 @@ function pasteAuditPreview(text, start = 0) {
   return String(text || '').substring(start, start + 80).replace(/\s+/g, ' ');
 }
 
-function isOrchestrationTargetPromptAudit(detail) {
+function isOrchestrationPromptAudit(detail) {
   const handoffId = typeof detail?.handoffId === 'string' ? detail.handoffId : '';
-  return detail?.success === true && handoffId.startsWith('orchestration:');
+  return detail?.success === true
+    && (handoffId.startsWith('orchestration:')
+      || handoffId.startsWith('orchestration-complete:'));
 }
 
 function compatiblePromptAuditExecutionContext(detail, candidate) {
@@ -15749,12 +15810,13 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
         || audit.executionContextDiagnostic
         || contextVerdict.reason),
   };
-  if (isOrchestrationTargetPromptAudit(detail)
+  if (isOrchestrationPromptAudit(detail)
     && !detail.executionContext
     && toolType === 'codex') {
-    // History may reconcile the exact local prompt immediately, but the
-    // orchestration result tracker must not start on the saved Resume source.
-    // Route it only after task_started supplies the exact adopted writer.
+    // History may reconcile the exact local prompt immediately, but neither a
+    // target run nor a completion follow-up may inherit the saved Resume source
+    // (or the preceding source turn). Route to orchestration only after the
+    // exact task_started supplies the adopted writer/turn.
     routeAgentPromptAuditDetail(detail, { renderer: true, web: false });
     deferCodexPromptAuditExecutionContext(detail);
     return;
@@ -16620,6 +16682,37 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         authorityReason: authorityVerdict.reason,
         submitted: false,
       };
+    }
+    if (codexActionAuthorityTestHoldEnabled(codexSubmitAuthority.profile)) {
+      const holdResult = await waitForCodexActionAuthorityTestRelease(codexSubmitAuthority);
+      if (holdResult?.released !== true) {
+        return {
+          success: false,
+          error: 'codex_submit_action_authority_revoked',
+          authorityReason: codexSubmitAuthority.reason || holdResult?.reason || 'scope-changed',
+          submitted: false,
+        };
+      }
+      const authorityAfterHold = validateMainCodexActionAuthority(codexSubmitAuthority, {
+        phases: ['waiting'],
+        profile: CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT,
+        launchId: codexSubmissionWatcher.launchId,
+        sourceSessionId: codexSubmissionWatcher.sessionId,
+        target: submitTarget,
+      });
+      if (!authorityAfterHold.valid) {
+        transitionMainCodexActionAuthority(
+          codexSubmitAuthority,
+          'revoked',
+          authorityAfterHold.reason,
+        );
+        return {
+          success: false,
+          error: 'codex_submit_action_authority_revoked',
+          authorityReason: authorityAfterHold.reason,
+          submitted: false,
+        };
+      }
     }
     transitionMainCodexActionAuthority(
       codexSubmitAuthority,
@@ -28397,6 +28490,61 @@ function getCodexMcpStartupStatus(tabId) {
   };
 }
 
+function armCodexReadIdentitySubmitBarrier(tabId, reason = 'submit') {
+  if (!tabId || getCodexWriterProofSnapshot(tabId)) return null;
+  const resumeReadLease = getCodexResumeReadIdentityLeaseForTab(tabId);
+  const terminalToken = terminals.get(tabId) || null;
+  const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  const existing = codexReadIdentitySubmitPending.get(tabId) || null;
+  if (existing?.enterWritten === true) return existing;
+  const created = createCodexReadIdentitySubmitBarrier({
+    tabId,
+    resumeReadLease,
+    terminalToken,
+    terminalRunSeq: runSeq,
+    terminalLifecycleGeneration: lifecycleGeneration,
+  });
+  if (!created) return null;
+  const barrier = {
+    ...created,
+    startedAt: Date.now(),
+    reason,
+  };
+  codexReadIdentitySubmitPending.set(tabId, barrier);
+  console.log('[CodexReadIdentity] first Resume submit pending tab=' + String(tabId).slice(-12)
+    + ' source=' + String(barrier.sourceSessionId).slice(0, 8)
+    + ' launch=' + barrier.launchId
+    + ' run=' + runSeq
+    + ' reason=' + reason);
+  return barrier;
+}
+
+function markCodexReadIdentitySubmitWritten(tabId, barrier, reason = 'submitted') {
+  if (!barrier || codexReadIdentitySubmitPending.get(tabId) !== barrier) return false;
+  barrier.enterWritten = true;
+  barrier.enterWrittenAt = Date.now();
+  barrier.submitReason = reason;
+  return true;
+}
+
+function clearCodexReadIdentitySubmitBarrier(
+  tabId,
+  barrier = null,
+  reason = 'clear',
+  { resolution = 'pre-enter-cancel' } = {},
+) {
+  const current = codexReadIdentitySubmitPending.get(tabId) || null;
+  if (!current || (barrier && current !== barrier)) return false;
+  if (!shouldClearCodexReadIdentitySubmitBarrier(current, resolution)) return false;
+  codexReadIdentitySubmitPending.delete(tabId);
+  console.log('[CodexReadIdentity] Resume submit barrier cleared tab=' + String(tabId).slice(-12)
+    + ' launch=' + (current.launchId || '-')
+    + ' entered=' + (current.enterWritten === true)
+    + ' reason=' + reason);
+  return true;
+}
+
 function hasCodexPromptOrTurnInFlight(tabId) {
   if (!tabId) return false;
   const turnState = codexTurnWatchers.get(tabId);
@@ -28432,6 +28580,7 @@ function beginCodexPromptInFlight(tabId, reason = 'submit', meta = {}) {
     startedAt: Date.now(),
     submitted: false,
     timer: null,
+    readIdentitySubmitBarrier: armCodexReadIdentitySubmitBarrier(tabId, reason),
   };
   state.timer = setTimeout(() => {
     clearCodexPromptInFlight(tabId, 'ttl');
@@ -28449,6 +28598,7 @@ function markCodexPromptSubmitted(tabId, state, reason = 'submitted') {
   state.submitted = true;
   state.submittedAt = Date.now();
   state.submitReason = reason;
+  markCodexReadIdentitySubmitWritten(tabId, state.readIdentitySubmitBarrier, reason);
   console.log('[CodexPromptInFlight] submitted tab=' + String(tabId).slice(-12)
     + ' reason=' + reason
     + ' source=' + (state.source || '-')
@@ -28461,6 +28611,13 @@ function clearCodexPromptInFlight(tabId, reason = 'clear') {
   if (!state) return;
   if (state.timer) clearTimeout(state.timer);
   codexPromptInFlight.delete(tabId);
+  if (state.submitted !== true) {
+    clearCodexReadIdentitySubmitBarrier(
+      tabId,
+      state.readIdentitySubmitBarrier,
+      'prompt-not-submitted:' + reason,
+    );
+  }
   console.log('[CodexPromptInFlight] clear tab=' + String(tabId).slice(-12)
     + ' reason=' + reason
     + ' source=' + (state.source || '-')
@@ -35670,6 +35827,43 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
   const knownSessionId = codexKnownSessions.get(tabId) || null;
   const savedSessionId = dbSessionId || knownSessionId || null;
   const sessionId = liveLifecycle === false ? savedSessionId : provenWriterSessionId;
+  const currentPayload = codexLastRunCommandPayload.get(tabId) || null;
+  const currentIntent = codexSessionDiscoveryIntents.get(tabId) || null;
+  const currentDiscovery = codexWatchers.get(tabId) || null;
+  const currentResumeLease = getCodexResumeSourceLeaseForTab(tabId);
+  const currentResumeReadLease = getCodexResumeReadIdentityLeaseForTab(tabId);
+  const currentReadLaunch = currentPayload?.command === 'codex-c'
+    ? currentPayload
+    : currentResumeReadLease;
+  const currentTerminal = terminals.get(tabId) || null;
+  const currentRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const currentLifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  const readIdentity = resolveCodexReadIdentity({
+    tabId,
+    liveLifecycle,
+    savedSessionId,
+    persistedSessionId: dbSessionId,
+    provenWriterSessionId,
+    writerConfirmed,
+    writerUsableForMutation,
+    writerProof: proof?.kind || null,
+    writerStatus: writerInspection?.status || processInspection?.status || 'unknown',
+    observedWriterSessionId: writerInspection?.sessionId || null,
+    resumeSourceSessionId: currentReadLaunch?.sessionId || null,
+    launch: currentPayload?.command === 'codex-c' ? currentPayload : null,
+    resumeReadLease: currentResumeReadLease,
+    intent: currentIntent,
+    resumeLease: currentResumeLease,
+    sourceTurn: turn,
+    terminalToken: currentTerminal,
+    terminalRunSeq: currentRunSeq,
+    terminalLifecycleGeneration: currentLifecycleGeneration,
+    processRunning: terminalCommandState.get(tabId)?.isRunning === true,
+    processPids: writerInspection?.pids || [],
+    promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+    provisionalSubmitReserved: !!currentDiscovery?.provisionalSubmitReservation,
+    submitResolutionPending: codexReadIdentitySubmitPending.get(tabId) || null,
+  });
   const manualAction = codexManualActionRequired.get(tabId) || null;
   const textReady = codexTuiReadyTabs.has(tabId);
   const startupTimeout = !textReady && !manualAction
@@ -35690,6 +35884,9 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     projectId: scopedProjectId,
     sessionId,
     displaySessionId: sessionId,
+    readSessionId: readIdentity.sessionId,
+    readIdentitySource: readIdentity.source,
+    readIdentityReason: readIdentity.reason,
     sessionStatus,
     busy,
     inputReady,
@@ -35711,7 +35908,7 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     provenWriterSessionId,
     writerConfirmed,
     writerUsableForMutation,
-    canCopySessionId: liveLifecycle === false ? !!savedSessionId : writerUsableForMutation,
+    canCopySessionId: readIdentity.available === true,
     writerProof: writerConfirmed ? proof.kind : null,
     writerFilePath: writerConfirmed ? proof.filePath : null,
     writerPids: writerConfirmed ? proof.pids : [],
@@ -35721,8 +35918,10 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     writerBindingConflictReason: writerInspection?.status === 'manual-binding-conflict'
       ? (writerInspection.reason || 'manual-writer-unrelated-to-bound-session')
       : null,
-    launchSessionId: payload?.sessionId || null,
-    resumeSourceSessionId: payload?.sessionId || null,
+    launchSessionId: currentPayload?.sessionId
+      || currentResumeReadLease?.sessionId
+      || null,
+    resumeSourceSessionId: currentReadLaunch?.sessionId || null,
     dbSessionId,
     savedSessionId,
     writerSourceMatch: writerConfirmed ? proof.sourceMatch : null,
@@ -35730,10 +35929,8 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     writerForkedFromId: writerConfirmed ? proof.forkedFromId : null,
     writerLaunchId: writerConfirmed ? proof.launchId : null,
     liveLifecycle,
-    lifecycleGeneration: liveLifecycle === false
-      ? null
-      : getTerminalLifecycleGeneration(tabId),
-    hasLaunchPayload: !!payload,
+    lifecycleGeneration: liveLifecycle === false ? null : currentLifecycleGeneration,
+    hasLaunchPayload: !!currentPayload,
     ...(provisionalSettings || {}),
   };
 }
@@ -37043,6 +37240,17 @@ function startCodexSessionWatcher(sender, {
   let detectCount = 0;
   const normalizedCwd = cwd || terminalProjects.get(tabId);
   const launchStartedAt = Number(startedAt) || Date.now();
+  const currentLaunch = launchId
+    && codexLastRunCommandPayload.get(tabId)?.launchId === launchId
+    ? codexLastRunCommandPayload.get(tabId)
+    : null;
+  const scopedSourceTerminalToken = sourceTerminalToken || currentLaunch?.terminalToken || null;
+  const scopedSourceRunSeq = sourceRunSeq === null || sourceRunSeq === undefined
+    ? Number(currentLaunch?.runSeq || 0) || null
+    : Number(sourceRunSeq);
+  const scopedSourceLifecycleGeneration = sourceLifecycleGeneration
+    || currentLaunch?.lifecycleGeneration
+    || null;
   const observerState = {
     watcher: null,
     interval: null,
@@ -37052,9 +37260,9 @@ function startCodexSessionWatcher(sender, {
     sourceSessionId: sourceSessionId || null,
     expectedBindingSessionId: expectedBindingSessionId || sourceSessionId || null,
     sourceBindingMode: sourceBindingMode || null,
-    sourceTerminalToken: sourceTerminalToken || null,
-    sourceRunSeq: Number.isInteger(Number(sourceRunSeq)) ? Number(sourceRunSeq) : null,
-    sourceLifecycleGeneration: sourceLifecycleGeneration || null,
+    sourceTerminalToken: scopedSourceTerminalToken,
+    sourceRunSeq: Number.isInteger(scopedSourceRunSeq) ? scopedSourceRunSeq : null,
+    sourceLifecycleGeneration: scopedSourceLifecycleGeneration,
     sourceMode: sourceMode || null,
     launchId: launchId || null,
     handoffBaselineSessionId: sourceMode === 'writer-handoff' ? (sourceSessionId || null) : null,
@@ -37075,8 +37283,8 @@ function startCodexSessionWatcher(sender, {
     sourceSessionId: sourceSessionId || null,
     expectedBindingSessionId: expectedBindingSessionId || sourceSessionId || null,
     sourceBindingMode: sourceBindingMode || null,
-    sourceRunSeq: Number.isInteger(Number(sourceRunSeq)) ? Number(sourceRunSeq) : null,
-    sourceLifecycleGeneration: sourceLifecycleGeneration || null,
+    sourceRunSeq: Number.isInteger(scopedSourceRunSeq) ? scopedSourceRunSeq : null,
+    sourceLifecycleGeneration: scopedSourceLifecycleGeneration,
     sourceMode: sourceMode || null,
     launchId: launchId || null,
   });
@@ -41197,6 +41405,12 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   }
   cancelCodexManualCompactPending(tabId, 'lifecycle-generation-changed');
   invalidateCodexWriterProof(tabId, 'launch-started:' + launchId);
+  clearCodexReadIdentitySubmitBarrier(
+    tabId,
+    null,
+    'launch-started:' + launchId,
+    { resolution: 'lifecycle-replaced' },
+  );
   if (codexPendingSettingsProofHandoffs.delete(tabId)) {
     console.log('[CodexSettingsProof] stale pre-rollout proof cleared at launch tab='
       + String(tabId).slice(-12)
@@ -41291,6 +41505,19 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   }
   clearTerminalCommandOrigin(tabId, commandState, 'codex-run-command');
   terminalCommandState.set(tabId, commandState);
+  if (launchPayload?.launchId === launchId) {
+    launchPayload.lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  }
+  if (normalizedCommand === 'codex-c' && sessionId && launchPayload?.launchId === launchId) {
+    bindCodexResumeReadIdentityLease({
+      tabId,
+      sourceSessionId: sessionId,
+      launchId,
+      terminalToken: term,
+      terminalRunSeq: launchRunSeq,
+      terminalLifecycleGeneration: launchPayload.lifecycleGeneration,
+    });
+  }
   if (ownsMcpStartupRecoveryHandoff) {
     mcpStartupRecoveryHandoff.phase = 'claimed';
     mcpStartupRecoveryHandoff.newLaunchId = launchId;

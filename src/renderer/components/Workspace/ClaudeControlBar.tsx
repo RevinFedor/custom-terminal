@@ -749,7 +749,6 @@ export default function ClaudeControlBar({
     try {
       return await requireCodexSurfaceSessionId({
         tabId,
-        historicalSessionId: codexSessionId,
         operation,
         requireMutationSafe,
       });
@@ -2621,7 +2620,7 @@ export default function ClaudeControlBar({
       return;
     }
     const codexContinueSessionId = sessionType === 'codex'
-      ? await requireCodexActionSessionId('продолжить Codex-сессию')
+      ? await requireCodexActionSessionId('продолжить Codex-сессию', true)
       : null;
     if (sessionType === 'codex' && !codexContinueSessionId) return;
     const actionReason = 'session-continue:' + sessionType;

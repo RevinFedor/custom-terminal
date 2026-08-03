@@ -244,14 +244,12 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
           else if (tab.codexSessionId) { targetId = tab.codexSessionId; kind = 'codex'; }
         }
         // A manually entered UUID is an explicit historical export target. The
-        // regular tab button instead follows the proven live writer, falling
-        // back to persisted history only when main says the Codex process stopped.
+        // regular tab button consumes main's read-only identity: the exact idle
+        // Resume source, an adopted live writer, or stopped persisted history.
         if (kind === 'codex' && !overrideInput) {
           targetId = await requireCodexSurfaceSessionId({
             tabId: tab.id,
-            historicalSessionId: tab.codexSessionId || null,
             operation: 'Копировать сессию',
-            requireMutationSafe: true,
           });
         }
         if (!targetId) continue;

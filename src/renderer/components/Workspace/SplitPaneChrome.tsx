@@ -1,17 +1,17 @@
 import React, { useEffect, useState } from 'react';
-import { Crosshair, X, FileText } from 'lucide-react';
+import { Columns2, FileText, History, SquareTerminal, X } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
+import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
 import { getTabChromeColorConfig, flattenRgbaOnTabbarPanel } from './tabChrome';
+import { isEmptyPane } from '../../utils/splitPanesModel.mjs';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 
 const { ipcRenderer } = window.require('electron');
 
-// Attach row (chips + path) is only rendered while the split is active —
-// approved: «строка привязки только в сплите».
-export const SPLIT_ATTACH_ROW_H = 38;
+export const SPLIT_ATTACH_ROW_H = 26;
 
 // Equal columns, v1 has no draggable divider.
 export function splitPaneRectStyle(paneIndex: number, paneCount: number): React.CSSProperties {
@@ -26,44 +26,45 @@ export function splitPaneRectStyle(paneIndex: number, paneCount: number): React.
 }
 
 interface AttachRowProps {
-  paneIndex: number;
   projectId: string;
   tabId: string;
   focused: boolean;
 }
 
 // Top strip of a split pane: [project chip][tab chip] + tiny full path line
-// tight below, [⌖ Pick][✕] on the right. The tab chip reuses the shared tab
-// chrome so the card language matches the sidebar.
-export function SplitPaneAttachRow({ paneIndex, projectId, tabId, focused }: AttachRowProps) {
-  const projectName = useProjectsStore((s) => s.projects[projectId]?.name)
+// tight below, [✕] on the right. The tab chip reuses the shared tab chrome so
+// the card language matches the sidebar.
+//
+// There is deliberately NO "pick target pane" toggle here: clicking a pane and
+// then clicking a tab already does the same thing in the same two clicks, so a
+// separate armed mode was pure surface for a rare case.
+export function SplitPaneAttachRow({ projectId, tabId, focused }: AttachRowProps) {
+  const projectMeta = useProjectsStore((s) => s.projects[projectId]);
+  const projectName = projectMeta?.name
     || (isInboxProjectId(projectId) ? INBOX_PROJECT_NAME : null);
   const workspacePath = useWorkspaceStore((s) => s.openProjects.get(projectId)?.projectPath || '');
   const tab = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId));
-  const pickArmedHere = useWorkspaceStore((s) => s.splitPickPaneIndex === paneIndex);
+  const splitPanes = useWorkspaceStore((s) => s.splitPanes);
   const displayProjectName = projectName || workspacePath.split('/').filter(Boolean).pop() || 'Project';
-
-  // Esc cancels an armed Pick (window-level: the next click may be anywhere).
-  useEffect(() => {
-    if (!pickArmedHere) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        useWorkspaceStore.getState().setSplitPickPaneIndex(null);
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [pickArmedHere]);
+  const canSplit = splitPanes.length < 3 && !splitPanes.some(isEmptyPane);
+  const inSplit = splitPanes.length > 0;
+  const terminalIsPrimary = useUIStore((s) => resolveTabTerminalPrimary(s, tabId));
+  const setTabTerminalIsPrimary = useUIStore((s) => s.setTabTerminalIsPrimary);
 
   if (!tab) return null;
+  const hasAgentSurfacePair = tab.tabType !== 'claude-sdk'
+    && tab.tabType !== 'browser'
+    && tab.tabType !== 'file'
+    && (tab.commandType === 'claude'
+      || tab.commandType === 'codex'
+      || !!tab.claudeSessionId
+      || !!tab.codexSessionId);
   const chrome = getTabChromeColorConfig(tab as any);
   const tabChipBg = flattenRgbaOnTabbarPanel(chrome.bgColor === 'transparent' ? 'rgba(255,255,255,0.06)' : chrome.bgColor);
-  const fullPath = tab.tabType === 'file' ? (tab.filePath || '') : (tab.cwd || '');
-
   return (
     <div
       data-split-attach-row
+      data-focused={focused ? 'true' : undefined}
       style={{
         position: 'absolute',
         top: 0,
@@ -71,12 +72,10 @@ export function SplitPaneAttachRow({ paneIndex, projectId, tabId, focused }: Att
         right: 0,
         height: SPLIT_ATTACH_ROW_H,
         display: 'flex',
-        flexDirection: 'column',
-        justifyContent: 'center',
-        gap: 1,
+        alignItems: 'center',
+        gap: 6,
         padding: '0 8px',
-        background: focused ? '#232326' : '#1d1d1f',
-        borderBottom: '1px solid #333',
+        background: 'transparent',
         boxSizing: 'border-box',
         zIndex: 3,
         userSelect: 'none',
@@ -85,30 +84,51 @@ export function SplitPaneAttachRow({ paneIndex, projectId, tabId, focused }: Att
         pointerEvents: 'auto',
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-        {/* Project chip */}
+      <button
+        title={workspacePath || displayProjectName}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (workspacePath) useWorkspaceStore.getState().openProject(projectId, workspacePath);
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 5,
+          flexShrink: 1,
+          minWidth: 0,
+          padding: 0,
+          background: 'transparent',
+          border: 'none',
+          fontSize: 11,
+          fontWeight: 600,
+          color: '#8a8a8f',
+          cursor: 'pointer',
+        }}
+        onMouseEnter={(e) => { e.currentTarget.style.color = '#b4b4b8'; }}
+        onMouseLeave={(e) => { e.currentTarget.style.color = '#8a8a8f'; }}
+      >
+        {projectMeta?.icon && (
+          <img
+            src={projectMeta.icon}
+            alt=""
+            draggable={false}
+            style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.65 }}
+          />
+        )}
         <span
           style={{
-            flexShrink: 1,
             minWidth: 0,
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
-            fontSize: 10.5,
-            fontWeight: 600,
-            letterSpacing: 0.4,
-            textTransform: 'uppercase',
-            color: '#9a9aa0',
-            background: 'rgba(255,255,255,0.05)',
-            border: '1px solid rgba(255,255,255,0.09)',
-            borderRadius: 4,
-            padding: '1px 6px',
           }}
         >
           {displayProjectName}
         </span>
-        {/* Tab chip — shared tab chrome tint */}
-        <span
+      </button>
+
+      <span
           style={{
             flexShrink: 1,
             minWidth: 0,
@@ -128,42 +148,69 @@ export function SplitPaneAttachRow({ paneIndex, projectId, tabId, focused }: Att
         >
           {tab.tabType === 'file' && <FileText size={10} style={{ color: '#a78bfa', flexShrink: 0 }} />}
           {tab.name}
-        </span>
+      </span>
 
-        <span style={{ flex: 1 }} />
+      <span style={{ flex: 1 }} />
 
-        {/* Pick — arm this pane, next sidebar click lands here */}
+      {inSplit && hasAgentSurfacePair && (
         <button
-          title={pickArmedHere
-            ? 'Отменить выбор (Esc)'
-            : 'Следующий клик по вкладке в сайдбаре заменит вкладку этой панели'}
+          data-split-pane-surface-toggle
+          title={terminalIsPrimary ? 'Показать транскрипт' : 'Показать терминал'}
+          aria-label={terminalIsPrimary ? 'Показать транскрипт' : 'Показать терминал'}
           onClick={(e) => {
             e.stopPropagation();
-            const st = useWorkspaceStore.getState();
-            st.setSplitPickPaneIndex(pickArmedHere ? null : paneIndex);
+            setTabTerminalIsPrimary(tabId, !terminalIsPrimary);
           }}
           onPointerDown={(e) => e.stopPropagation()}
           style={{
             display: 'inline-flex',
             alignItems: 'center',
-            gap: 4,
-            fontSize: 10.5,
-            fontWeight: 600,
-            letterSpacing: 0.3,
-            padding: '2px 7px',
+            justifyContent: 'center',
+            width: 18,
+            height: 18,
             borderRadius: 4,
             cursor: 'pointer',
-            background: pickArmedHere ? 'rgba(139,92,246,0.28)' : 'transparent',
-            border: `1px solid ${pickArmedHere ? '#8b5cf6' : 'rgba(255,255,255,0.14)'}`,
-            color: pickArmedHere ? '#d6c8ff' : '#b9b9be',
+            background: !terminalIsPrimary ? 'rgba(245,158,11,0.16)' : 'transparent',
+            border: 'none',
+            color: !terminalIsPrimary ? '#f59e0b' : '#8f8f94',
             flexShrink: 0,
           }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.10)'; (e.currentTarget as HTMLElement).style.color = '#eee'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = !terminalIsPrimary ? 'rgba(245,158,11,0.16)' : 'transparent'; (e.currentTarget as HTMLElement).style.color = !terminalIsPrimary ? '#f59e0b' : '#8f8f94'; }}
         >
-          <Crosshair size={11} />
-          Pick
+          {terminalIsPrimary ? <History size={12} /> : <SquareTerminal size={12} />}
         </button>
+      )}
 
-        {/* Close pane (not the tab) */}
+      {canSplit && (
+        <button
+          title="Разделить рабочую область"
+          onClick={(e) => {
+            e.stopPropagation();
+            useWorkspaceStore.getState().addEmptySplitPane();
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 18,
+            height: 18,
+            borderRadius: 4,
+            cursor: 'pointer',
+            background: 'transparent',
+            border: 'none',
+            color: '#8f8f94',
+            flexShrink: 0,
+          }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.10)'; (e.currentTarget as HTMLElement).style.color = '#eee'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; (e.currentTarget as HTMLElement).style.color = '#8f8f94'; }}
+        >
+          <Columns2 size={12} />
+        </button>
+      )}
+
+      {inSplit && (
         <button
           title="Убрать панель из рабочей области"
           onClick={(e) => {
@@ -189,34 +236,9 @@ export function SplitPaneAttachRow({ paneIndex, projectId, tabId, focused }: Att
         >
           <X size={12} />
         </button>
-      </div>
-
-      {/* Full path — secondary info, tight under the chips, never its own
-          highlighted row. Ellipsized first when width runs out. */}
-      <div
-        style={{
-          fontSize: 10,
-          lineHeight: '11px',
-          color: '#6d6d73',
-          whiteSpace: 'nowrap',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-        }}
-        title={fullPath}
-      >
-        {shortPathSafe(fullPath)}
-      </div>
+      )}
     </div>
   );
-}
-
-// Home prefix → ~; ellipsis is handled by CSS (the row is single-line).
-const HOME_DIR = (() => {
-  try { return window.require('os').homedir() as string; } catch { return ''; }
-})();
-function shortPathSafe(p: string): string {
-  if (!p) return '';
-  try { return HOME_DIR && p.startsWith(HOME_DIR) ? '~' + p.slice(HOME_DIR.length) : p; } catch { return p; }
 }
 
 // White focus frame of the focused pane; hairline separator on the others.

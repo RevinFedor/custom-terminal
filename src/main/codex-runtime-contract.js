@@ -747,6 +747,217 @@ function consumePendingCodexSettingsProofHandoff(pending, {
   };
 }
 
+function createCodexResumeReadIdentityLease({
+  tabId = null,
+  sourceSessionId = null,
+  launchId = null,
+  terminalToken = null,
+  terminalRunSeq = 0,
+  terminalLifecycleGeneration = null,
+} = {}) {
+  const clean = (value) => (
+    typeof value === 'string' && value.trim() ? value.trim() : null
+  );
+  const normalizedTabId = clean(tabId);
+  const normalizedSourceSessionId = clean(sourceSessionId);
+  const normalizedLaunchId = clean(launchId);
+  const normalizedLifecycleGeneration = clean(terminalLifecycleGeneration);
+  const runSeq = Number(terminalRunSeq);
+  if (!normalizedTabId
+    || !normalizedSourceSessionId
+    || !normalizedLaunchId
+    || !terminalToken
+    || !Number.isInteger(runSeq)
+    || runSeq <= 0
+    || !normalizedLifecycleGeneration) return null;
+  return {
+    command: 'codex-c',
+    tabId: normalizedTabId,
+    sessionId: normalizedSourceSessionId,
+    launchId: normalizedLaunchId,
+    terminalToken,
+    runSeq,
+    lifecycleGeneration: normalizedLifecycleGeneration,
+  };
+}
+
+function createCodexReadIdentitySubmitBarrier({
+  tabId = null,
+  resumeReadLease = null,
+  terminalToken = null,
+  terminalRunSeq = 0,
+  terminalLifecycleGeneration = null,
+} = {}) {
+  const clean = (value) => (
+    typeof value === 'string' && value.trim() ? value.trim() : null
+  );
+  const normalizedTabId = clean(tabId);
+  const runSeq = Number(terminalRunSeq);
+  const lifecycleGeneration = clean(terminalLifecycleGeneration);
+  if (!normalizedTabId
+    || resumeReadLease?.command !== 'codex-c'
+    || resumeReadLease.tabId !== normalizedTabId
+    || !clean(resumeReadLease.sessionId)
+    || !clean(resumeReadLease.launchId)
+    || resumeReadLease.terminalToken !== terminalToken
+    || Number(resumeReadLease.runSeq) !== runSeq
+    || clean(resumeReadLease.lifecycleGeneration) !== lifecycleGeneration) return null;
+  return {
+    tabId: normalizedTabId,
+    sourceSessionId: clean(resumeReadLease.sessionId),
+    launchId: clean(resumeReadLease.launchId),
+    terminalToken,
+    runSeq,
+    lifecycleGeneration,
+    enterWritten: false,
+  };
+}
+
+function shouldClearCodexReadIdentitySubmitBarrier(
+  barrier,
+  resolution = 'pre-enter-cancel',
+) {
+  if (!barrier) return false;
+  if (resolution === 'pre-enter-cancel') return barrier.enterWritten !== true;
+  return resolution === 'writer-adopted'
+    || resolution === 'lifecycle-replaced'
+    || resolution === 'resume-lease-released'
+    || resolution === 'authority-revoked';
+}
+
+/**
+ * Resolve the one session identity that read-only/copy surfaces may expose.
+ *
+ * This contract is intentionally distinct from writer authority. A resumed
+ * Codex process can prove that it currently has its persisted source rollout
+ * open before the first post-Resume submit decides whether Codex will append
+ * to that source or create a child. That exact, idle launch-scoped source is
+ * safe to read/copy, but it is never mutation authority. Once submit starts,
+ * only a durably adopted writer becomes readable again.
+ */
+function resolveCodexReadIdentity({
+  tabId = null,
+  liveLifecycle = null,
+  savedSessionId = null,
+  persistedSessionId = null,
+  provenWriterSessionId = null,
+  writerConfirmed = false,
+  writerUsableForMutation = false,
+  writerProof = null,
+  writerStatus = null,
+  observedWriterSessionId = null,
+  resumeSourceSessionId = null,
+  launch = null,
+  resumeReadLease = null,
+  intent = null,
+  resumeLease = null,
+  sourceTurn = null,
+  terminalToken = null,
+  terminalRunSeq = 0,
+  terminalLifecycleGeneration = null,
+  processRunning = false,
+  processPids = [],
+  promptOrTurnInFlight = false,
+  provisionalSubmitReserved = false,
+  submitResolutionPending = null,
+} = {}) {
+  const cleanId = (value) => (
+    typeof value === 'string' && value.trim() ? value.trim() : null
+  );
+  const unavailable = (reason) => ({
+    available: false,
+    sessionId: null,
+    source: 'unresolved',
+    mutationSafe: false,
+    reason,
+  });
+  const available = (sessionId, source, mutationSafe, reason) => ({
+    available: true,
+    sessionId,
+    source,
+    mutationSafe,
+    reason,
+  });
+
+  if (liveLifecycle === false) {
+    const stoppedSessionId = cleanId(savedSessionId);
+    return stoppedSessionId
+      ? available(stoppedSessionId, 'stopped-history', false, 'stopped-history')
+      : unavailable('stopped-history-missing');
+  }
+  if (liveLifecycle !== true) return unavailable('lifecycle-unresolved');
+
+  const persisted = cleanId(persistedSessionId);
+  const provenWriter = cleanId(provenWriterSessionId);
+  const exactWriterProof = typeof writerProof === 'string' && writerProof.trim().length > 0;
+  if (writerStatus === 'adopted' || writerConfirmed === true) {
+    if (writerStatus !== 'adopted') return unavailable('writer-not-adopted');
+    if (writerConfirmed !== true) return unavailable('writer-unconfirmed');
+    if (writerUsableForMutation !== true) return unavailable('writer-mutation-proof-unusable');
+    if (!exactWriterProof) return unavailable('writer-proof-missing');
+    if (!provenWriter) return unavailable('writer-session-missing');
+    if (persisted !== provenWriter) return unavailable('writer-persisted-binding-mismatch');
+    return available(provenWriter, 'live-writer', true, 'exact-adopted-writer');
+  }
+
+  if (writerStatus !== 'provisional-source') {
+    return unavailable('writer-not-provisional-source');
+  }
+
+  const readLaunch = launch || resumeReadLease;
+  const sourceSessionId = cleanId(resumeSourceSessionId)
+    || cleanId(readLaunch?.sessionId);
+  const observedWriter = cleanId(observedWriterSessionId);
+  const launchId = cleanId(readLaunch?.launchId);
+  const lifecycleGeneration = cleanId(terminalLifecycleGeneration);
+  const runSeq = Number(terminalRunSeq);
+  if (submitResolutionPending) {
+    const exactPendingGeneration = submitResolutionPending.tabId === tabId
+      && cleanId(submitResolutionPending.sourceSessionId) === sourceSessionId
+      && cleanId(submitResolutionPending.launchId) === launchId
+      && submitResolutionPending.terminalToken === terminalToken
+      && Number(submitResolutionPending.runSeq) === runSeq
+      && cleanId(submitResolutionPending.lifecycleGeneration) === lifecycleGeneration;
+    return unavailable(exactPendingGeneration
+      ? 'submit-resolution-pending'
+      : 'submit-resolution-generation-mismatch');
+  }
+  const checks = [
+    ['tab-missing', !!cleanId(tabId)],
+    ['resume-source-missing', !!sourceSessionId],
+    ['persisted-source-mismatch', persisted === sourceSessionId],
+    ['observed-source-mismatch', observedWriter === sourceSessionId],
+    ['launch-command-mismatch', readLaunch?.command === 'codex-c'],
+    ['launch-tab-mismatch', readLaunch?.tabId === tabId],
+    ['launch-source-mismatch', cleanId(readLaunch?.sessionId) === sourceSessionId],
+    ['launch-generation-missing', !!launchId],
+    ['terminal-missing', !!terminalToken],
+    ['terminal-run-invalid', Number.isInteger(runSeq) && runSeq > 0],
+    ['terminal-lifecycle-missing', !!lifecycleGeneration],
+    ['launch-terminal-replaced', readLaunch?.terminalToken === terminalToken],
+    ['launch-run-mismatch', Number(readLaunch?.runSeq) === runSeq],
+    ['launch-lifecycle-mismatch', cleanId(readLaunch?.lifecycleGeneration) === lifecycleGeneration],
+    ['intent-mode-mismatch', intent?.sourceMode === 'resume'],
+    ['intent-source-mismatch', cleanId(intent?.sourceSessionId) === sourceSessionId],
+    ['intent-launch-mismatch', cleanId(intent?.launchId) === launchId],
+    ['intent-run-mismatch', Number(intent?.sourceRunSeq) === runSeq],
+    ['intent-lifecycle-mismatch', cleanId(intent?.sourceLifecycleGeneration) === lifecycleGeneration],
+    ['lease-source-mismatch', cleanId(resumeLease?.sourceSessionId) === sourceSessionId],
+    ['lease-tab-mismatch', resumeLease?.tabId === tabId],
+    ['lease-launch-mismatch', cleanId(resumeLease?.launchId) === launchId],
+    ['source-turn-mismatch', cleanId(sourceTurn?.sessionId) === sourceSessionId],
+    ['source-turn-launch-mismatch', cleanId(sourceTurn?.sourceObservationLaunchId) === launchId],
+    ['source-turn-lifecycle-mismatch', cleanId(sourceTurn?.processGeneration) === lifecycleGeneration],
+    ['process-not-running', processRunning === true],
+    ['process-writer-not-open', Array.isArray(processPids) && processPids.length > 0],
+    ['submit-inflight', promptOrTurnInFlight !== true],
+    ['submit-reserved', provisionalSubmitReserved !== true],
+  ];
+  const failed = checks.find(([, passed]) => !passed);
+  if (failed) return unavailable(failed[0]);
+  return available(sourceSessionId, 'resume-source', false, 'exact-idle-resume-source');
+}
+
 function projectCodexRuntimeStatus({
   liveLifecycle = null,
   stopping = false,
@@ -826,6 +1037,8 @@ module.exports = {
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
+  createCodexReadIdentitySubmitBarrier,
+  createCodexResumeReadIdentityLease,
   createCodexServiceTierProof,
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,
@@ -840,8 +1053,10 @@ module.exports = {
   projectPendingCodexSettingsProofOwner,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  resolveCodexReadIdentity,
   resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,
+  shouldClearCodexReadIdentitySubmitBarrier,
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,

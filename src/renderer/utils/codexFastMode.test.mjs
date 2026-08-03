@@ -38,6 +38,32 @@ test('shows Fast off for the exact default tier', () => {
   });
 });
 
+test('accepts an exact launch owner before Codex has a session id', () => {
+  assert.deepEqual(resolveCodexFastModeState({
+    currentSessionId: 'launch:L2',
+    serviceTierSessionId: 'launch:L2',
+    serviceTier: 'priority',
+  }), {
+    known: true,
+    active: true,
+    state: 'on',
+    serviceTier: 'priority',
+  });
+});
+
+test('keeps an older launch proof neutral under a replacement launch', () => {
+  assert.deepEqual(resolveCodexFastModeState({
+    currentSessionId: 'launch:L2',
+    serviceTierSessionId: 'launch:L1',
+    serviceTier: 'priority',
+  }), {
+    known: false,
+    active: false,
+    state: 'unknown',
+    serviceTier: null,
+  });
+});
+
 test('does not reuse a proven tier after the tab binds to another session', () => {
   assert.deepEqual(resolveCodexFastModeState({
     currentSessionId: SESSION_ID,

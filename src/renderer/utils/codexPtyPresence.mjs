@@ -6,6 +6,8 @@ export const CODEX_PRESENCE_SNAPSHOT_FIELDS = Object.freeze([
   'inputReady',
   'liveLifecycle',
   'sessionId',
+  'readSessionId',
+  'readIdentitySource',
   'savedSessionId',
   'canCopySessionId',
   'hasTerm',
@@ -30,6 +32,26 @@ const CODEX_PTY_STATUSES = new Set([
 ]);
 
 const hasOwn = (value, field) => Object.prototype.hasOwnProperty.call(value, field);
+
+/**
+ * Renderer consumes one explicit main-owned read/copy verdict. It must not
+ * rebuild that identity from launch, saved-history, or writer fields because
+ * those values can belong to different lifecycle generations.
+ */
+export function getCodexRuntimeReadSessionId(runtimeSnapshot) {
+  if (runtimeSnapshot?.canCopySessionId !== true) return null;
+  const source = runtimeSnapshot?.readIdentitySource;
+  const lifecycleMatches = runtimeSnapshot?.liveLifecycle === true
+    ? source === 'live-writer' || source === 'resume-source'
+    : runtimeSnapshot?.liveLifecycle === false
+      ? source === 'stopped-history'
+      : false;
+  if (!lifecycleMatches) return null;
+  const value = typeof runtimeSnapshot?.readSessionId === 'string'
+    ? runtimeSnapshot.readSessionId.trim()
+    : '';
+  return value || null;
+}
 
 /**
  * Main owns the proof-kind taxonomy. Renderer actions must consume the
@@ -104,6 +126,7 @@ export function projectCodexPtyPresence(runtimeSnapshot, { fallbackBusy = false 
         : runtimeStatus;
   const savedSessionId = runtimeSnapshot.savedSessionId || null;
   const sessionId = runtimeSnapshot.sessionId || null;
+  const readSessionId = getCodexRuntimeReadSessionId(runtimeSnapshot);
   const busyStateResolved = runtimeSnapshot.hasWatcher === true
     && runtimeSnapshot.catchUpPending !== true;
   const isBusy = busyStateResolved
@@ -128,7 +151,7 @@ export function projectCodexPtyPresence(runtimeSnapshot, { fallbackBusy = false 
       sessionId,
       conversationMaterialized: !!savedSessionId,
       canResume: status === 'inactive' && !!sessionId,
-      canCopySessionId: runtimeSnapshot.canCopySessionId === true,
+      canCopySessionId: !!readSessionId,
       materializationReason: savedSessionId ? 'codex-session-id' : 'no-session-id',
       runtimeSnapshot,
     },
