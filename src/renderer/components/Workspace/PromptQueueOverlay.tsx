@@ -145,7 +145,8 @@ const EDITOR_PREVIEW_MAX_WIDTH = 440;
 const EDITOR_PREVIEW_MIN_SIDE_WIDTH = 260;
 const COLLAPSED_RAIL_FULL_WIDTH = 66;
 const COLLAPSED_RAIL_COMPACT_WIDTH = 32;
-const COLLAPSED_RAIL_GAP = 4;
+// Rail row sits flush on top of the Run after panel — no gap between them.
+const COLLAPSED_RAIL_GAP = 0;
 const PANEL_SLIDE_MS = 100;
 
 // Which screen edge the overlay is docked to. The panel is pinned by this edge
@@ -1398,13 +1399,15 @@ export function PromptQueueOverlay({
       editorTextareaMinHeight,
       editorAnchor.maxHeight - chromeHeight
     );
-    textarea.style.height = 'auto';
-    const nextHeight = Math.min(
-      Math.max(textarea.scrollHeight, editorTextareaMinHeight),
-      maxTextareaHeight
-    );
-    textarea.style.height = `${nextHeight}px`;
-    textarea.style.overflowY = textarea.scrollHeight > maxTextareaHeight ? 'auto' : 'hidden';
+    textarea.measureNaturalHeight((measuredHeight) => {
+      if (editorTextareaRef.current !== textarea) return;
+      const nextHeight = Math.min(
+        Math.max(measuredHeight, editorTextareaMinHeight),
+        maxTextareaHeight
+      );
+      textarea.style.height = `${nextHeight}px`;
+      textarea.style.overflowY = measuredHeight > maxTextareaHeight ? 'auto' : 'hidden';
+    });
   }, [editorAnchor, editorOpen, editorSize.width, editorText, editorTextareaMinHeight, editorTitleHeight, isSpecialPromptMode]);
 
   useEffect(() => {
@@ -2334,7 +2337,9 @@ export function PromptQueueOverlay({
               width: effectiveWidth,
               background: PANEL_BG,
               border: `1px solid ${BORDER}`,
-              borderRadius: 6,
+              // Flush under the rail row: square top-right corner where the
+              // rail sits (both are right-anchored), rounded elsewhere.
+              borderRadius: '6px 0 6px 6px',
               backdropFilter: 'blur(8px)',
               maxHeight: '100%',
               display: 'flex',
@@ -3031,8 +3036,9 @@ export function PromptQueueOverlay({
           className="pq-collapsed-rail"
           style={{
             // Horizontal row of square buttons ABOVE the panel (order:-1 in
-            // the column flex). Was: vertical pill column to the panel's
-            // right — the row form frees horizontal space for the split.
+            // the column flex), flush against it: bottom edge loses its
+            // radius/border while the panel is open so the two read as one
+            // block.
             order: -1,
             position: 'relative',
             zIndex: 2,
@@ -3040,7 +3046,8 @@ export function PromptQueueOverlay({
             boxSizing: 'border-box',
             background: '#151515',
             border: '1px solid #303030',
-            borderRadius: 8,
+            borderRadius: panelOpen ? '8px 8px 0 0' : 8,
+            borderBottom: panelOpen ? 'none' : undefined,
             display: 'flex',
             flexDirection: 'row',
             alignItems: 'center',

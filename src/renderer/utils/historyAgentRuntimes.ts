@@ -576,12 +576,13 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   })
     .then((result: any) => {
       const auditTimeoutAfterSubmit = isSubmittedCodexAuditTimeout(result);
-      console.log('[CodexHistoryActions:send] done tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' success=' + (auditTimeoutAfterSubmit || result?.success !== false) + ' queued=' + (result?.queued ? 'true' : 'false') + ' submitKey=' + (result?.submitKey || '-') + ' auditSoft=' + auditTimeoutAfterSubmit);
+      console.log('[CodexHistoryActions:send] done tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' success=' + (auditTimeoutAfterSubmit ? 'unknown' : result?.success !== false) + ' queued=' + (result?.queued ? 'true' : 'false') + ' submitKey=' + (result?.submitKey || '-') + ' auditSoft=' + auditTimeoutAfterSubmit);
       if (auditTimeoutAfterSubmit) {
-        console.warn('[CodexHistoryActions:send] audit timeout after submitted Enter tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' - keeping local prompt as sent/queued; watcher logs remain authoritative for diagnosis');
+        console.warn('[CodexHistoryActions:send] audit timeout after submitted Enter tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' - keeping local prompt while exact delivery remains unresolved');
         return {
           ...result,
-          success: true,
+          success: null,
+          accepted: true,
           status: 'audit-pending',
           auditPending: true,
           auditWarning: result.error,

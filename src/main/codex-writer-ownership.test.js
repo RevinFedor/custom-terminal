@@ -34,6 +34,7 @@ const {
   projectCodexWriterProofKind,
   shouldUseSettledCodexRewindWriterProof,
   selectCodexDelayedStableSourceWriter,
+  selectCodexResumedSubmitWriter,
   selectCodexNativeRewindWriter,
   selectCodexSettledRewindWriter,
   isCodexWriterProofOwnershipQuarantined,
@@ -1795,7 +1796,70 @@ test('automated Resume source waits for exact user_message audit before adoption
     sourceMode: 'resume',
     sourceMatch: 'direct-fork',
     sourceSubmitAuditPending: true,
+  }).status, 'provisional-source');
+
+  assert.equal(classifyCodexWriterAdoption({
+    sourceMode: 'resume',
+    sourceMatch: 'direct-fork',
+    resumeSubmitAuditPending: true,
+    candidateSubmitAuditProven: true,
   }).status, 'commit');
+});
+
+test('production Resume send selects only the exact causal child and rejects ambiguity', () => {
+  const sourceSessionId = '019fc1f7-3c5c-76a1-99af-49b919b412dd';
+  const childSessionId = '019fc276-a21a-71f3-98d0-01d2236e0e45';
+  const launchId = 'resume-launch-production';
+  const authorityId = 'resumed-active-submit-production';
+  const submitId = '6c6d344a-8d7a-4422-8c8b-dbe3495570f0';
+  const causal = {
+    candidate: { filePath: '/rollout-child.jsonl' },
+    proof: {
+      sessionId: childSessionId,
+      sourceSessionId,
+      forkedFromId: sourceSessionId,
+      launchId,
+      authorityId,
+      submitId,
+    },
+  };
+  const selected = selectCodexResumedSubmitWriter([causal], {
+    sourceSessionId,
+    launchId,
+    authorityId,
+    submitId,
+  });
+  assert.equal(selected.status, 'selected');
+  assert.equal(selected.proof.sessionId, childSessionId);
+
+  assert.equal(selectCodexResumedSubmitWriter([{
+    ...causal,
+    proof: { ...causal.proof, forkedFromId: 'foreign-source' },
+  }], {
+    sourceSessionId,
+    launchId,
+    authorityId,
+    submitId,
+  }).status, 'pending');
+  assert.equal(selectCodexResumedSubmitWriter([causal, {
+    ...causal,
+    candidate: { filePath: '/rollout-second-child.jsonl' },
+    proof: { ...causal.proof, sessionId: 'second-causal-child' },
+  }], {
+    sourceSessionId,
+    launchId,
+    authorityId,
+    submitId,
+  }).status, 'ambiguous');
+  assert.equal(selectCodexResumedSubmitWriter([{
+    ...causal,
+    proof: { ...causal.proof, launchId: 'stale-launch' },
+  }], {
+    sourceSessionId,
+    launchId,
+    authorityId,
+    submitId,
+  }).status, 'pending');
 });
 
 test('Resume source audit gate belongs to one exact source and launch', () => {

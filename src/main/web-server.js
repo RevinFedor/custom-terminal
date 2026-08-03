@@ -1293,7 +1293,7 @@ function sendAuditPending(res, data, extra = {}) {
     ...(data || {}),
     ...extra,
     ok: true,
-    success: true,
+    success: null,
     accepted: true,
     submitted: true,
     status: 'audit-pending',

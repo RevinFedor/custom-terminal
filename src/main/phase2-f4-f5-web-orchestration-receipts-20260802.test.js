@@ -18,6 +18,10 @@ const historyAgentRuntimeSource = fs.readFileSync(
   path.join(repoDir, 'src/renderer/utils/historyAgentRuntimes.ts'),
   'utf8',
 );
+const historyPanelSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/components/Workspace/HistoryPanel.tsx'),
+  'utf8',
+);
 const webServerSource = fs.readFileSync(
   path.join(repoDir, 'src/main/web-server.js'),
   'utf8',
@@ -28,6 +32,15 @@ test('F4 real Codex runtime preserves its softened post-Enter state as audit-pen
     historyAgentRuntimeSource,
     /if \(auditTimeoutAfterSubmit\)[\s\S]{0,700}status: 'audit-pending',[\s\S]{0,180}auditPending: true/,
     'the renderer may soften the History error, but it must keep the pending receipt for Project API, MCP, and Inbox',
+  );
+  const pendingStart = historyPanelSource.indexOf('const lateAuditPending =');
+  assert.ok(pendingStart >= 0);
+  const pendingSendBoundary = historyPanelSource.slice(pendingStart, pendingStart + 3_500);
+  assert.match(pendingSendBoundary, /result\?\.auditPending === true/);
+  assert.match(
+    pendingSendBoundary,
+    /sendDeliveryUnconfirmed = result\?\.submitted === true\s*&& \(result\?\.success === false \|\| lateAuditPending\)/,
+    'History must preserve the prompt while rendering a post-Enter soft timeout as unresolved rather than final sent',
   );
 });
 
@@ -449,9 +462,14 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       handoffId: 'phase2-codex-soft-handoff',
       source: 'phase2-test',
     });
-    assert.deepEqual({ status: response.status, submitted: response.body.submitted }, {
+    assert.deepEqual({
+      status: response.status,
+      submitted: response.body.submitted,
+      success: response.body.success,
+    }, {
       status: 202,
       submitted: true,
+      success: null,
     });
   });
 

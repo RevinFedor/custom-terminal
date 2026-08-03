@@ -108,6 +108,13 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   const modeRef = useRef<Mode | null>(null);
   modeRef.current = mode;
 
+  // Probe linked-file existence on every open; a vanished file turns its row
+  // red and unselectable on the probe's next tick (cache → instant on reopen).
+  // Declared before the rows memo that depends on it: a `const` referenced
+  // above its own declaration throws at module evaluation, not at call time.
+  const [missingProbeTick, setMissingProbeTick] = useState(0);
+  useEffect(() => subscribeMissingFiles(() => setMissingProbeTick((v) => v + 1)), []);
+
   // ── rows ────────────────────────────────────────────────────────────────
   // Store subscriptions above keep this memo fresh; the builder itself reads
   // the same live snapshots so the fast-tap fallback shares one code path.
@@ -115,11 +122,6 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     if (!visible) return [];
     return computeRowsFromStores(mode === 'search' ? query : '');
   }, [visible, openProjects, projectHistory, projectsMeta, globalTabMru, query, mode, missingProbeTick]);
-
-  // Probe linked-file existence on every open; a vanished file turns its row
-  // red and unselectable on the probe's next tick (cache → instant on reopen).
-  const [missingProbeTick, setMissingProbeTick] = useState(0);
-  useEffect(() => subscribeMissingFiles(() => setMissingProbeTick((v) => v + 1)), []);
   useEffect(() => {
     if (!visible) return;
     const paths: string[] = [];
@@ -347,17 +349,20 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
           )}
           {rows.map((row, index) => {
             if (row.kind === 'project') {
-              // Same visual language as the titlebar project chip: icon 16px
-              // + name; still a non-clickable header.
+              // TOC separator, not a landmark: the flat list follows global
+              // tab recency, so the same project header can appear several
+              // times per open. Icon deliberately small (12px) and dimmed —
+              // frequent repetition must not shout. Non-clickable.
+              const headerKey = `p:${row.projectId}:${index}`;
               return (
                 <div
-                  key={`p:${row.projectId}`}
+                  key={headerKey}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
-                    gap: 6,
-                    padding: '7px 8px 3px',
-                    fontSize: 11.5,
+                    gap: 5,
+                    padding: '6px 8px 2px',
+                    fontSize: 11,
                     fontWeight: 600,
                     color: '#8a8a8f',
                     pointerEvents: 'none',
@@ -371,7 +376,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                     <img
                       src={row.projectIcon}
                       alt=""
-                      style={{ width: 16, height: 16, borderRadius: 3, objectFit: 'cover', flexShrink: 0 }}
+                      style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.65 }}
                       draggable={false}
                     />
                   )}

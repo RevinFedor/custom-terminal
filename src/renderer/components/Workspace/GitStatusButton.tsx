@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
+  AlertTriangle,
   ArrowLeft,
   Check,
   ChevronDown,
@@ -8,6 +9,7 @@ import {
   Copy,
   ExternalLink,
   GitBranch,
+  GitMerge,
   GripVertical,
   History,
   Home,
@@ -22,6 +24,7 @@ import {
   Sparkles,
   Star,
   Upload,
+  X,
 } from 'lucide-react';
 import {
   gitRunAfterProjectKey,
@@ -72,7 +75,19 @@ type GitStatus = {
   files: GitFile[];
   changedCount: number;
   hasDocsChanges: boolean;
+  merge?: GitMergeState;
   error?: string;
+};
+
+type GitMergeState = {
+  inProgress: boolean;
+  readyToCommit: boolean;
+  mergeHead: string;
+  sourceBranch: string;
+  targetBranch: string;
+  conflictFiles: string[];
+  conflictCount: number;
+  message: string;
 };
 
 type GitRemoteInfo = {
@@ -114,6 +129,26 @@ type GitCommitDetails = {
 type GitBranchInfo = {
   name: string;
   updated: string;
+  updatedUnix?: number;
+  current?: boolean;
+  default?: boolean;
+  remote?: boolean;
+};
+
+type GitMergePreviewState = 'same' | 'dirty' | 'up-to-date' | 'ready' | 'conflicts' | 'merge-in-progress' | 'merged';
+
+type GitMergePreview = {
+  success: boolean;
+  state: GitMergePreviewState;
+  sourceBranch: string;
+  targetBranch: string;
+  conflictFiles: string[];
+  conflictCount: number;
+  commitCount: number;
+  changedFileCount: number;
+  hash?: string;
+  merge?: GitMergeState;
+  error?: string;
 };
 
 type GitRepository = {
@@ -170,7 +205,7 @@ type Props = {
   projectPath?: string;
 };
 
-type GitToolbarAction = GitRunAfterAction | 'commit' | 'push' | 'fetch' | 'undo' | 'checkout';
+type GitToolbarAction = GitRunAfterAction | 'commit' | 'push' | 'fetch' | 'undo' | 'checkout' | 'merge' | 'abort-merge';
 type GitRunAfterStatusPhase = 'idle' | 'waiting' | 'running' | 'success';
 
 function loadDocsOnlySetting() {
@@ -291,7 +326,27 @@ function gitToolbarActionLabel(action: GitToolbarAction) {
   if (action === 'fetch') return 'Fetch';
   if (action === 'undo') return 'Undo commit';
   if (action === 'checkout') return 'Checkout';
+  if (action === 'merge') return 'Merge';
+  if (action === 'abort-merge') return 'Abort merge';
   return gitRunAfterActionLabel(action);
+}
+
+function filterBranchGroups(branches: GitBranchInfo[], search: string) {
+  const q = search.trim().toLowerCase();
+  const matching = branches.filter((branch) => !q || branch.name.toLowerCase().includes(q));
+  if (q) return matching.length ? [{ label: 'Branches', branches: matching }] : [];
+  const defaultBranches = matching.filter((branch) => branch.default);
+  const defaultNames = new Set(defaultBranches.map((branch) => branch.name));
+  const recentBranches = matching
+    .filter((branch) => !branch.remote && !defaultNames.has(branch.name))
+    .slice(0, 5);
+  const recentNames = new Set(recentBranches.map((branch) => branch.name));
+  const otherBranches = matching.filter((branch) => !defaultNames.has(branch.name) && !recentNames.has(branch.name));
+  return [
+    { label: 'Default Branch', branches: defaultBranches },
+    { label: 'Recent Branches', branches: recentBranches },
+    { label: 'Other Branches', branches: otherBranches },
+  ].filter((group) => group.branches.length > 0);
 }
 
 function mergeHistoryCommits(current: GitCommit[], incoming: GitCommit[]) {
@@ -415,6 +470,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [branches, setBranches] = useState<GitBranchInfo[]>([]);
   const [branchesRepoPath, setBranchesRepoPath] = useState('');
   const [branchSwitching, setBranchSwitching] = useState('');
+  const [branchSearch, setBranchSearch] = useState('');
+  const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
+  const [mergeSearch, setMergeSearch] = useState('');
+  const [mergeSelectedBranch, setMergeSelectedBranch] = useState('');
+  const [mergePreview, setMergePreview] = useState<GitMergePreview | null>(null);
+  const [mergePreviewLoading, setMergePreviewLoading] = useState(false);
+  const [mergeBusy, setMergeBusy] = useState<'start' | 'continue' | 'abort' | null>(null);
   const [pushMenuOpen, setPushMenuOpen] = useState(false);
   const [remoteSettingsOpen, setRemoteSettingsOpen] = useState(false);
   const [generationMeta, setGenerationMeta] = useState<any>(null);
@@ -431,6 +493,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const historyListRef = useRef<HTMLDivElement>(null);
   const commitDetailsRequestRef = useRef(0);
   const branchesRequestRef = useRef(0);
+  const mergePreviewRequestRef = useRef(0);
   const statusRef = useRef<GitStatus | null>(null);
   const latestProjectPathRef = useRef(projectPath || '');
   const openRef = useRef(open);
@@ -463,9 +526,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const filteredFiles = useMemo(() => {
     const files = status?.files || [];
     const q = search.trim().toLowerCase();
-    if (!q) return files;
-    return files.filter((file) => `${file.path} ${file.rawPath || ''} ${file.label}`.toLowerCase().includes(q));
-  }, [status?.files, search]);
+    const visible = q
+      ? files.filter((file) => `${file.path} ${file.rawPath || ''} ${file.label}`.toLowerCase().includes(q))
+      : files;
+    if (!status?.merge?.inProgress) return visible;
+    return [...visible].sort((left, right) => Number(right.xy.includes('U')) - Number(left.xy.includes('U')));
+  }, [status?.files, status?.merge?.inProgress, search]);
   const filteredHistoryItems = useMemo(() => {
     const q = historySearch.trim().toLowerCase();
     if (!q) return historyItems;
@@ -783,6 +849,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setBranches([]);
     setBranchesRepoPath('');
     setBranchesLoading(false);
+    setBranchSearch('');
+    setMergeDialogOpen(false);
+    setMergeSearch('');
+    setMergeSelectedBranch('');
+    setMergePreview(null);
+    setMergePreviewLoading(false);
+    setMergeBusy(null);
     setPushMenuOpen(false);
     setRemoteSettingsOpen(false);
     setHistoryContextMenu(null);
@@ -933,6 +1006,57 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [branchesOpen, loadBranches]);
 
   useEffect(() => {
+    if (branchesOpen) return;
+    mergePreviewRequestRef.current += 1;
+    setMergeDialogOpen(false);
+    setMergeSearch('');
+    setMergeSelectedBranch('');
+    setMergePreview(null);
+    setMergePreviewLoading(false);
+  }, [branchesOpen]);
+
+  useEffect(() => {
+    if (!mergeDialogOpen || !effectiveRepoPath || !mergeSelectedBranch) {
+      setMergePreviewLoading(false);
+      if (!mergeDialogOpen || !mergeSelectedBranch) setMergePreview(null);
+      return;
+    }
+    const requestId = ++mergePreviewRequestRef.current;
+    let cancelled = false;
+    setMergePreviewLoading(true);
+    setMergePreview(null);
+    const timer = window.setTimeout(() => {
+      ipcRenderer.invoke('git:merge-preview', {
+        projectPath: effectiveRepoPath,
+        sourceBranch: mergeSelectedBranch,
+      }).then((result: GitMergePreview) => {
+        if (cancelled || mergePreviewRequestRef.current !== requestId) return;
+        if (!result?.success) throw new Error(result?.error || 'git merge preview failed');
+        setMergePreview(result);
+      }).catch((error: any) => {
+        if (cancelled || mergePreviewRequestRef.current !== requestId) return;
+        setMergePreview({
+          success: false,
+          state: 'same',
+          sourceBranch: mergeSelectedBranch,
+          targetBranch: status?.branch || '',
+          conflictFiles: [],
+          conflictCount: 0,
+          commitCount: 0,
+          changedFileCount: 0,
+          error: trimError(error?.message || error),
+        });
+      }).finally(() => {
+        if (!cancelled && mergePreviewRequestRef.current === requestId) setMergePreviewLoading(false);
+      });
+    }, 100);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [effectiveRepoPath, mergeDialogOpen, mergeSelectedBranch, status?.branch]);
+
+  useEffect(() => {
     if (repoSelectorOpen && projectPath && repositoriesProjectPath !== projectPath) loadRepositories();
   }, [repoSelectorOpen, projectPath, repositoriesProjectPath, loadRepositories]);
 
@@ -1050,14 +1174,18 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     if (!open) return;
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        if (remoteSettingsOpen) setRemoteSettingsOpen(false);
+        if (mergeDialogOpen) setMergeDialogOpen(false);
+        else if (branchesOpen) setBranchesOpen(false);
+        else if (repoSelectorOpen) setRepoSelectorOpen(false);
+        else if (pushMenuOpen) setPushMenuOpen(false);
+        else if (remoteSettingsOpen) setRemoteSettingsOpen(false);
         else if (settingsOpen) setSettingsOpen(false);
         else setOpen(false);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, remoteSettingsOpen, settingsOpen]);
+  }, [branchesOpen, mergeDialogOpen, open, pushMenuOpen, remoteSettingsOpen, repoSelectorOpen, settingsOpen]);
 
   const selectedList = useMemo(() => Array.from(selectedPaths), [selectedPaths]);
 
@@ -1106,6 +1234,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setBranches([]);
     setBranchesRepoPath('');
     setBranchesLoading(false);
+    setBranchSearch('');
+    setMergeDialogOpen(false);
+    setMergeSearch('');
+    setMergeSelectedBranch('');
+    setMergePreview(null);
+    setMergePreviewLoading(false);
+    setMergeBusy(null);
     setPushMenuOpen(false);
     setRemoteSettingsOpen(false);
     setActiveFilePath('');
@@ -1518,6 +1653,94 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     });
   };
 
+  const openMergeDialog = () => {
+    const candidate = branches.find((branch) => branch.default && !branch.current)
+      || branches.find((branch) => !branch.current && !branch.remote)
+      || branches.find((branch) => !branch.current)
+      || branches[0];
+    setMergeSearch('');
+    setMergeSelectedBranch(candidate?.name || '');
+    setMergePreview(null);
+    setMergeDialogOpen(true);
+  };
+
+  const handleMergeStart = async () => {
+    if (!effectiveRepoPath || !mergeSelectedBranch || mergeBusy) return;
+    setMergeBusy('start');
+    await runGitToolbarAction('merge', async () => {
+      try {
+        const result = await ipcRenderer.invoke('git:merge-start', {
+          projectPath: effectiveRepoPath,
+          sourceBranch: mergeSelectedBranch,
+        }) as GitMergePreview;
+        if (!result?.success) throw new Error(result?.error || 'git merge failed');
+        if (result.state === 'conflicts' || result.state === 'merge-in-progress') {
+          setMergeDialogOpen(false);
+          setBranchesOpen(false);
+          setPanelTab('changes');
+          await loadStatus(true);
+          setActiveFilePath(result.conflictFiles?.[0] || '');
+          return false;
+        }
+        if (result.state !== 'merged') {
+          setMergePreview(result);
+          return false;
+        }
+        setMergeDialogOpen(false);
+        setBranchesOpen(false);
+        await loadStatus(true);
+        await loadHistory();
+        return true;
+      } catch (error: any) {
+        await loadStatus(false);
+        showToast('Merge: ' + trimError(error?.message || error), 'error', 6000);
+        return false;
+      } finally {
+        setMergeBusy(null);
+      }
+    });
+  };
+
+  const handleMergeContinue = async () => {
+    if (!effectiveRepoPath || mergeBusy) return;
+    setMergeBusy('continue');
+    await runGitToolbarAction('merge', async () => {
+      try {
+        const result = await ipcRenderer.invoke('git:merge-continue', { projectPath: effectiveRepoPath });
+        if (!result?.success) throw new Error(result?.error || 'git merge commit failed');
+        await loadStatus(true);
+        await loadHistory();
+        return true;
+      } catch (error: any) {
+        await loadStatus(false);
+        showToast('Complete merge: ' + trimError(error?.message || error), 'error', 6000);
+        return false;
+      } finally {
+        setMergeBusy(null);
+      }
+    });
+  };
+
+  const handleMergeAbort = async () => {
+    if (!effectiveRepoPath || mergeBusy) return;
+    setMergeBusy('abort');
+    await runGitToolbarAction('abort-merge', async () => {
+      try {
+        const result = await ipcRenderer.invoke('git:merge-abort', { projectPath: effectiveRepoPath });
+        if (!result?.success) throw new Error(result?.error || 'git merge --abort failed');
+        setActiveFilePath('');
+        await loadStatus(true);
+        return true;
+      } catch (error: any) {
+        await loadStatus(false);
+        showToast('Abort merge: ' + trimError(error?.message || error), 'error', 6000);
+        return false;
+      } finally {
+        setMergeBusy(null);
+      }
+    });
+  };
+
   if (!status?.isRepo) {
     if (projectPath && (statusLoading || hydratedStateKey !== panelStateKey)) {
       return (
@@ -1545,7 +1768,11 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     return null;
   }
 
-  const compactText = status.changedCount > 0 ? String(status.changedCount) : 'clean';
+  const mergeState = status.merge || null;
+  const mergeInProgress = Boolean(mergeState?.inProgress);
+  const compactText = mergeInProgress
+    ? (mergeState?.conflictCount ? `${mergeState.conflictCount}!` : 'merge')
+    : status.changedCount > 0 ? String(status.changedCount) : 'clean';
   const remoteHint = status.ahead || status.behind
     ? ` · ${status.ahead ? 'ahead ' + status.ahead : ''}${status.ahead && status.behind ? ', ' : ''}${status.behind ? 'behind ' + status.behind : ''}`
     : '';
@@ -1597,8 +1824,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         ? 'Commit preview'
         : 'Select a commit';
   const runAfterOperationRunning = runAfterTask?.phase === 'running';
-  const generateDisabled = generating || committing || runAfterOperationRunning || selectedCount === 0 || status.changedCount === 0;
-  const commitDisabled = committing || runAfterOperationRunning || selectedCount === 0 || !summary.trim();
+  const generateDisabled = mergeInProgress || generating || committing || runAfterOperationRunning || selectedCount === 0 || status.changedCount === 0;
+  const commitDisabled = mergeInProgress || committing || runAfterOperationRunning || selectedCount === 0 || !summary.trim();
   const gitRunAfterOwnerTabId = `git-panel:${runAfterProjectKey || 'repo'}`;
   const gitRunAfterStatusAction = runAfterAction || runAfterRunningAction || runAfterSuccessAction;
   const gitRunAfterLabel = gitRunAfterStatusAction ? gitRunAfterActionLabel(gitRunAfterStatusAction) : '';
@@ -1646,7 +1873,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       <button
         ref={triggerRef}
         onClick={() => setOpen((value) => !value)}
-        title={`${status.repoName}: ${status.branch} · ${status.changedCount} changed${remoteHint}${gitNavbarPreviewTitle ? ' · ' + gitNavbarPreviewTitle : ''}`}
+        title={`${status.repoName}: ${status.branch} · ${mergeInProgress ? (mergeState?.conflictCount ? `${mergeState.conflictCount} merge conflicts` : 'merge ready to complete') : `${status.changedCount} changed`}${remoteHint}${gitNavbarPreviewTitle ? ' · ' + gitNavbarPreviewTitle : ''}`}
         className="inline-flex items-center gap-1 rounded cursor-pointer hover:opacity-90 transition-colors"
         style={{
           height: '100%',
@@ -1679,8 +1906,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
             display: 'inline-flex',
             alignItems: 'center',
             justifyContent: 'center',
-            background: status.changedCount ? 'rgba(250,204,21,0.16)' : 'rgba(34,197,94,0.14)',
-            color: status.changedCount ? '#fde68a' : '#86efac',
+            background: mergeInProgress
+              ? 'rgba(245,158,11,0.20)'
+              : status.changedCount ? 'rgba(250,204,21,0.16)' : 'rgba(34,197,94,0.14)',
+            color: mergeInProgress ? '#fbbf24' : status.changedCount ? '#fde68a' : '#86efac',
             fontSize: 10,
             fontVariantNumeric: 'tabular-nums',
             flexShrink: 0,
@@ -1863,10 +2092,16 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
 	                  <div style={{ position: 'relative', minWidth: 0, flex: 1 }}>
 	                    <button
 	                      onClick={() => {
+	                        if (mergeInProgress) return;
 	                        setRemoteSettingsOpen(false);
+	                        setPushMenuOpen(false);
+	                        setRepoSelectorOpen(false);
+	                        setBranchSearch('');
 	                        setBranchesOpen((value) => !value);
 	                      }}
-	                      style={branchHeaderButtonStyle}
+	                      disabled={mergeInProgress}
+	                      title={mergeInProgress ? 'Complete or abort the current merge before switching branches' : 'Choose branch'}
+	                      style={{ ...branchHeaderButtonStyle, opacity: mergeInProgress ? 0.58 : 1, cursor: mergeInProgress ? 'default' : 'pointer' }}
 	                    >
                       <GitBranch size={14} style={{ flexShrink: 0 }} />
                       <span style={{ minWidth: 0, flex: 1 }}>
@@ -1879,36 +2114,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                       </span>
                       <ChevronDown size={13} style={{ transform: branchesOpen ? 'rotate(180deg)' : 'none', transition: 'transform 120ms ease' }} />
                     </button>
-                    {branchesOpen && (
-                      <div style={branchMenuStyle}>
-                        {!branchesReadyForRepo || (branchesLoading && !visibleBranches.length) ? (
-                          <div style={emptyLineStyle}><Loader2 size={13} className="animate-spin" /> Loading branches</div>
-                        ) : visibleBranches.length ? visibleBranches.map((branch) => (
-                          <button
-                            key={branch.name}
-                            onClick={() => handleBranchCheckout(branch.name)}
-                            style={branchRowStyle(branch.name === status.branch)}
-                          >
-                            <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center' }}>
-                              {branch.name === status.branch ? <Check size={13} /> : branchSwitching === branch.name ? <Loader2 size={13} className="animate-spin" /> : null}
-                            </span>
-                            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {branch.name}
-                            </span>
-                            {branch.updated && <span style={{ color: '#7d8590', fontSize: 10 }}>{branch.updated}</span>}
-                          </button>
-                        )) : (
-                          <div style={emptyLineStyle}>No branches</div>
-                        )}
-                      </div>
-                    )}
                   </div>
 
 	                  <div style={{ display: 'inline-flex', position: 'relative', height: '100%' }}>
                     <button
                       onClick={() => handleRemote('push')}
-                      disabled={remoteBusy !== null}
-                      style={{ ...remoteHeaderButtonStyle, borderTopRightRadius: 0, borderBottomRightRadius: 0, minWidth: remoteAheadCount ? 174 : 154 }}
+                      disabled={remoteBusy !== null || mergeInProgress}
+                      style={{ ...remoteHeaderButtonStyle, borderTopRightRadius: 0, borderBottomRightRadius: 0, minWidth: remoteAheadCount ? 174 : 154, opacity: mergeInProgress ? 0.58 : 1, cursor: mergeInProgress ? 'default' : 'pointer' }}
                     >
                       {remoteBusy ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
                       <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
@@ -1931,9 +2143,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
 	                        setRemoteSettingsOpen(false);
 	                        setPushMenuOpen((value) => !value);
 	                      }}
-                      disabled={remoteBusy !== null}
+                      disabled={remoteBusy !== null || mergeInProgress}
                       title="More remote actions"
-                      style={{ ...remoteHeaderButtonStyle, borderLeft: '1px solid rgba(255,255,255,0.10)', borderTopLeftRadius: 0, borderBottomLeftRadius: 0, width: 36, padding: 0 }}
+                      style={{ ...remoteHeaderButtonStyle, borderLeft: '1px solid rgba(255,255,255,0.10)', borderTopLeftRadius: 0, borderBottomLeftRadius: 0, width: 36, padding: 0, opacity: mergeInProgress ? 0.58 : 1, cursor: mergeInProgress ? 'default' : 'pointer' }}
                     >
                       <ChevronDown size={13} style={{ transform: pushMenuOpen ? 'rotate(180deg)' : 'none', transition: 'transform 120ms ease' }} />
                     </button>
@@ -1983,6 +2195,48 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                       <div style={emptyStateStyle}><Loader2 size={15} className="animate-spin" /> Loading repository</div>
                     ) : (
                       <>
+                      {mergeInProgress && mergeState ? (
+                        <div style={mergeProgressStyle(mergeState.conflictCount > 0)}>
+                          <div style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 8 }}>
+                            {mergeState.conflictCount > 0
+                              ? <AlertTriangle size={15} style={{ color: '#fbbf24', flexShrink: 0 }} />
+                              : <Check size={15} style={{ color: '#86efac', flexShrink: 0 }} />}
+                            <span style={{ minWidth: 0, flex: 1 }}>
+                              <span style={{ display: 'block', color: '#f8fafc', fontSize: 11.5, fontWeight: 820, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {mergeState.conflictCount > 0
+                                  ? `${mergeState.conflictCount} conflicted file${mergeState.conflictCount === 1 ? '' : 's'}`
+                                  : 'Ready to complete merge'}
+                              </span>
+                              <span style={{ display: 'block', color: '#9ca3af', fontSize: 10.5, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {mergeState.sourceBranch} into {mergeState.targetBranch || status.branch}
+                              </span>
+                            </span>
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                            {mergeState.readyToCommit ? (
+                              <button
+                                type="button"
+                                onClick={handleMergeContinue}
+                                disabled={mergeBusy !== null}
+                                style={{ ...primaryButtonStyle, height: 26, fontSize: 10.5, opacity: mergeBusy ? 0.58 : 1 }}
+                              >
+                                {mergeBusy === 'continue' ? <Loader2 size={12} className="animate-spin" /> : <GitMerge size={12} />}
+                                Create merge commit
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              onClick={handleMergeAbort}
+                              disabled={mergeBusy !== null}
+                              title="Abort merge"
+                              style={mergeAbortButtonStyle(mergeBusy !== null)}
+                            >
+                              {mergeBusy === 'abort' ? <Loader2 size={12} className="animate-spin" /> : <RotateCcw size={12} />}
+                              Abort
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
                       <div style={searchBoxStyle}>
                         <Search size={13} style={{ color: '#7d8590', flexShrink: 0 }} />
                         <input
@@ -1993,15 +2247,19 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                         />
                       </div>
 
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 9, marginBottom: 8 }}>
-                        <button onClick={toggleAll} style={selectAllStyle}>
-                          <span style={checkboxStyle(allSelected)}>{allSelected ? <Check size={11} /> : null}</span>
-                          {selectedCount}/{status.changedCount} selected
-                        </button>
-                        {status.ahead || status.behind ? (
-                          <span style={{ fontSize: 10, color: '#8b949e' }}>{remoteHint.replace(/^ · /, '')}</span>
-                        ) : null}
-                      </div>
+                      {!mergeInProgress ? (
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 9, marginBottom: 8 }}>
+                          <button onClick={toggleAll} style={selectAllStyle}>
+                            <span style={checkboxStyle(allSelected)}>{allSelected ? <Check size={11} /> : null}</span>
+                            {selectedCount}/{status.changedCount} selected
+                          </button>
+                          {status.ahead || status.behind ? (
+                            <span style={{ fontSize: 10, color: '#8b949e' }}>{remoteHint.replace(/^ · /, '')}</span>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <div style={{ height: 8, flexShrink: 0 }} />
+                      )}
 
                       <div style={fileListStyle}>
                         {filteredFiles.length ? filteredFiles.map((file) => {
@@ -2014,15 +2272,23 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                               style={fileRowStyle(checked, active)}
                               title={file.rawPath || file.path}
                             >
-                              <span
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  togglePath(file.path);
-                                }}
-                                style={checkboxStyle(checked)}
-                              >
-                                {checked ? <Check size={11} /> : null}
-                              </span>
+                              {mergeInProgress ? (
+                                <span style={{ width: 15, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                                  {file.xy.includes('U')
+                                    ? <AlertTriangle size={13} style={{ color: '#fbbf24' }} />
+                                    : <Check size={12} style={{ color: '#86efac' }} />}
+                                </span>
+                              ) : (
+                                <span
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    togglePath(file.path);
+                                  }}
+                                  style={checkboxStyle(checked)}
+                                >
+                                  {checked ? <Check size={11} /> : null}
+                                </span>
+                              )}
                               <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>
                                 {shortPath(file.path)}
                               </span>
@@ -2047,7 +2313,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                         </div>
                       )}
 
-                      <div style={commitFormStyle}>
+                      {!mergeInProgress ? <div style={commitFormStyle}>
                         <input
                           value={summary}
                           onChange={(event) => setSummary(event.target.value)}
@@ -2185,7 +2451,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                           closeRequestKey={runAfterPickerCloseKey}
                           modalOverlay
                         />
-                      </div>
+                      </div> : null}
                       </>
                     )}
                   </div>
@@ -2279,6 +2545,36 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                     />
                   )}
                 </div>
+                {branchesOpen && (
+                  <BranchPickerLayer
+                    leftWidth={renderedSplitLeftWidth}
+                    panelWidth={renderedPanelSize.width}
+                    branches={visibleBranches}
+                    loading={!branchesReadyForRepo || (branchesLoading && !visibleBranches.length)}
+                    currentBranch={status.branch}
+                    search={branchSearch}
+                    switchingBranch={branchSwitching}
+                    onSearchChange={setBranchSearch}
+                    onCheckout={handleBranchCheckout}
+                    onClose={() => setBranchesOpen(false)}
+                    onOpenMerge={openMergeDialog}
+                  />
+                )}
+                {branchesOpen && mergeDialogOpen && (
+                  <MergeBranchDialog
+                    branches={visibleBranches}
+                    currentBranch={status.branch}
+                    search={mergeSearch}
+                    selectedBranch={mergeSelectedBranch}
+                    preview={mergePreview}
+                    previewLoading={mergePreviewLoading}
+                    busy={mergeBusy === 'start'}
+                    onSearchChange={setMergeSearch}
+                    onSelectBranch={setMergeSelectedBranch}
+                    onClose={() => setMergeDialogOpen(false)}
+                    onSubmit={handleMergeStart}
+                  />
+                )}
                 {repoSelectorOpen && (
                   <RepositoryMenu
                     leftWidth={renderedSplitLeftWidth}
@@ -2336,6 +2632,272 @@ function TabButton({ active, children, onClick }: { active: boolean; children: R
     >
       {children}
     </button>
+  );
+}
+
+function BranchRow({
+  branch,
+  selected,
+  switching,
+  onClick,
+}: {
+  branch: GitBranchInfo;
+  selected: boolean;
+  switching?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button type="button" onClick={onClick} style={branchPickerRowStyle(selected)}>
+      <span style={branchPickerIconSlotStyle}>
+        {switching ? <Loader2 size={14} className="animate-spin" /> : branch.current ? <Check size={14} /> : <GitBranch size={14} />}
+      </span>
+      <span style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>
+        {branch.name}
+      </span>
+      {branch.updated ? (
+        <span style={{ color: selected ? '#dbeafe' : '#8b949e', fontSize: 10.5, flexShrink: 0 }}>{branch.updated}</span>
+      ) : null}
+    </button>
+  );
+}
+
+function BranchGroups({
+  branches,
+  search,
+  selectedBranch,
+  switchingBranch,
+  onSelect,
+}: {
+  branches: GitBranchInfo[];
+  search: string;
+  selectedBranch: string;
+  switchingBranch?: string;
+  onSelect: (branch: GitBranchInfo) => void;
+}) {
+  const groups = filterBranchGroups(branches, search);
+  if (!groups.length) return <div style={branchPickerEmptyStyle}>No branches match search</div>;
+  return (
+    <>
+      {groups.map((group) => (
+        <div key={group.label}>
+          <div style={branchPickerSectionTitleStyle}>{group.label}</div>
+          {group.branches.map((branch) => (
+            <BranchRow
+              key={branch.name}
+              branch={branch}
+              selected={branch.name === selectedBranch}
+              switching={branch.name === switchingBranch}
+              onClick={() => onSelect(branch)}
+            />
+          ))}
+        </div>
+      ))}
+    </>
+  );
+}
+
+function BranchPickerLayer({
+  leftWidth,
+  panelWidth,
+  branches,
+  loading,
+  currentBranch,
+  search,
+  switchingBranch,
+  onSearchChange,
+  onCheckout,
+  onClose,
+  onOpenMerge,
+}: {
+  leftWidth: number;
+  panelWidth: number;
+  branches: GitBranchInfo[];
+  loading: boolean;
+  currentBranch: string;
+  search: string;
+  switchingBranch: string;
+  onSearchChange: (value: string) => void;
+  onCheckout: (branch: string) => void;
+  onClose: () => void;
+  onOpenMerge: () => void;
+}) {
+  return (
+    <div style={branchLayerBackdropStyle} onMouseDown={onClose}>
+      <div
+        style={branchPickerSheetStyle(leftWidth, panelWidth)}
+        onMouseDown={(event) => event.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div style={branchPickerHeaderStyle}>
+          <div style={{ color: '#f8fafc', fontSize: 13, fontWeight: 850 }}>Branches</div>
+          <div style={branchPickerSearchStyle}>
+            <Search size={15} style={{ color: '#8b949e', flexShrink: 0 }} />
+            <input
+              autoFocus
+              value={search}
+              onChange={(event) => onSearchChange(event.target.value)}
+              placeholder="Filter branches"
+              style={branchPickerSearchInputStyle}
+            />
+          </div>
+        </div>
+        <div style={branchPickerListStyle}>
+          {loading ? (
+            <div style={branchPickerEmptyStyle}><Loader2 size={15} className="animate-spin" /> Loading branches</div>
+          ) : (
+            <BranchGroups
+              branches={branches}
+              search={search}
+              selectedBranch={currentBranch}
+              switchingBranch={switchingBranch}
+              onSelect={(branch) => onCheckout(branch.name)}
+            />
+          )}
+        </div>
+        <div style={branchPickerFooterStyle}>
+          <button
+            type="button"
+            onClick={onOpenMerge}
+            disabled={loading || branches.length < 2}
+            style={branchMergeEntryStyle(loading || branches.length < 2)}
+            title={`Choose a branch to merge into ${currentBranch}`}
+          >
+            <GitMerge size={15} />
+            <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              Choose a branch to merge into {currentBranch}
+            </span>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MergePreviewResult({ preview, loading }: { preview: GitMergePreview | null; loading: boolean }) {
+  if (loading) {
+    return <div style={mergeResultLineStyle('#94a3b8')}><Loader2 size={16} className="animate-spin" /> Checking merge</div>;
+  }
+  if (!preview) return <div style={mergeResultLineStyle('#94a3b8')}>Select a branch to merge</div>;
+  if (preview.error) {
+    return <div style={mergeResultLineStyle('#fda4af')}><AlertTriangle size={16} /> {preview.error}</div>;
+  }
+  if (preview.state === 'dirty') {
+    return (
+      <div style={mergeResultLineStyle('#fbbf24')}>
+        <AlertTriangle size={17} />
+        Commit or discard {preview.changedFileCount} changed file{preview.changedFileCount === 1 ? '' : 's'} before merging
+      </div>
+    );
+  }
+  if (preview.state === 'conflicts') {
+    return (
+      <div style={mergeResultLineStyle('#fbbf24')}>
+        <AlertTriangle size={18} />
+        <span>
+          There will be <strong style={{ color: '#f8fafc' }}>{preview.conflictCount} conflicted file{preview.conflictCount === 1 ? '' : 's'}</strong> when merging{' '}
+          <strong style={{ color: '#f8fafc' }}>{preview.sourceBranch}</strong> into <strong style={{ color: '#f8fafc' }}>{preview.targetBranch}</strong>
+        </span>
+      </div>
+    );
+  }
+  if (preview.state === 'ready') {
+    return (
+      <div style={mergeResultLineStyle('#86efac')}>
+        <Check size={18} />
+        <span>
+          Merge <strong style={{ color: '#f8fafc' }}>{preview.commitCount} commit{preview.commitCount === 1 ? '' : 's'}</strong> from{' '}
+          <strong style={{ color: '#f8fafc' }}>{preview.sourceBranch}</strong> into <strong style={{ color: '#f8fafc' }}>{preview.targetBranch}</strong>
+        </span>
+      </div>
+    );
+  }
+  if (preview.state === 'merge-in-progress') {
+    return <div style={mergeResultLineStyle('#fbbf24')}><AlertTriangle size={17} /> Finish or abort the current merge first</div>;
+  }
+  return (
+    <div style={mergeResultLineStyle('#86efac')}>
+      <Check size={18} />
+      <span><strong style={{ color: '#f8fafc' }}>{preview.targetBranch}</strong> is already up to date with <strong style={{ color: '#f8fafc' }}>{preview.sourceBranch}</strong></span>
+    </div>
+  );
+}
+
+function MergeBranchDialog({
+  branches,
+  currentBranch,
+  search,
+  selectedBranch,
+  preview,
+  previewLoading,
+  busy,
+  onSearchChange,
+  onSelectBranch,
+  onClose,
+  onSubmit,
+}: {
+  branches: GitBranchInfo[];
+  currentBranch: string;
+  search: string;
+  selectedBranch: string;
+  preview: GitMergePreview | null;
+  previewLoading: boolean;
+  busy: boolean;
+  onSearchChange: (value: string) => void;
+  onSelectBranch: (branch: string) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const actionable = preview?.success && (preview.state === 'ready' || preview.state === 'conflicts');
+  const actionLabel = preview?.state === 'conflicts' ? 'Start merge' : 'Create merge commit';
+  return (
+    <div style={mergeDialogBackdropStyle} onMouseDown={onClose}>
+      <div
+        style={mergeDialogStyle}
+        onMouseDown={(event) => event.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div style={mergeDialogHeaderStyle}>
+          <span style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            Merge into {currentBranch}
+          </span>
+          <button type="button" onClick={onClose} title="Close" style={mergeDialogCloseStyle}>
+            <X size={18} />
+          </button>
+        </div>
+        <div style={{ padding: '10px 12px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+          <div style={branchPickerSearchStyle}>
+            <Search size={15} style={{ color: '#8b949e', flexShrink: 0 }} />
+            <input
+              autoFocus
+              value={search}
+              onChange={(event) => onSearchChange(event.target.value)}
+              placeholder="Filter branches"
+              style={branchPickerSearchInputStyle}
+            />
+          </div>
+        </div>
+        <div style={mergeDialogListStyle}>
+          <BranchGroups
+            branches={branches}
+            search={search}
+            selectedBranch={selectedBranch}
+            onSelect={(branch) => onSelectBranch(branch.name)}
+          />
+        </div>
+        <div style={mergeDialogFooterStyle}>
+          <MergePreviewResult preview={preview} loading={previewLoading} />
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!actionable || previewLoading || busy}
+            style={mergeDialogActionStyle(!actionable || previewLoading || busy)}
+          >
+            {busy ? <Loader2 size={15} className="animate-spin" /> : <GitMerge size={15} />}
+            {busy ? 'Merging' : actionLabel}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -3829,36 +4391,266 @@ const commitFileRowStyle = (active: boolean): React.CSSProperties => ({
   fontSize: 11.5,
 });
 
-const branchMenuStyle: React.CSSProperties = {
+const branchLayerBackdropStyle: React.CSSProperties = {
   position: 'absolute',
-  top: 'calc(100% + 4px)',
+  top: 82,
+  right: 0,
+  bottom: 0,
   left: 0,
-  width: 340,
-  maxWidth: 'min(340px, calc(100vw - 32px))',
-  zIndex: 6,
-  maxHeight: 220,
-  overflowY: 'auto',
-  borderRadius: 8,
-  border: '1px solid rgba(255,255,255,0.12)',
-  background: '#111318',
-  boxShadow: '0 12px 28px rgba(0,0,0,0.5)',
-  padding: 4,
+  zIndex: 30,
+  background: 'rgba(3,7,18,0.48)',
+  overflow: 'hidden',
 };
 
-const branchRowStyle = (active: boolean): React.CSSProperties => ({
-  width: '100%',
-  height: 30,
-  borderRadius: 6,
-  border: 'none',
-  background: active ? 'rgba(59,130,246,0.14)' : 'transparent',
-  color: active ? '#bfdbfe' : '#d1d5db',
+const branchPickerSheetStyle = (leftWidth: number, panelWidth: number): React.CSSProperties => ({
+  position: 'absolute',
+  top: 0,
+  bottom: 0,
+  left: leftWidth,
+  width: Math.min(720, Math.max(380, panelWidth - leftWidth)),
+  maxWidth: `calc(100% - ${leftWidth}px)`,
+  display: 'flex',
+  flexDirection: 'column',
+  background: '#20242b',
+  borderLeft: '1px solid rgba(255,255,255,0.10)',
+  borderRight: '1px solid rgba(255,255,255,0.10)',
+  boxShadow: '12px 0 28px rgba(0,0,0,0.36)',
+  overflow: 'hidden',
+});
+
+const branchPickerHeaderStyle: React.CSSProperties = {
+  flexShrink: 0,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 9,
+  padding: '10px 12px',
+  borderBottom: '1px solid rgba(255,255,255,0.08)',
+};
+
+const branchPickerSearchStyle: React.CSSProperties = {
+  height: 34,
+  borderRadius: 7,
+  border: '1px solid rgba(96,165,250,0.72)',
+  background: '#171a20',
   display: 'flex',
   alignItems: 'center',
-  gap: 6,
-  padding: '0 7px',
-  fontSize: 11,
-  fontWeight: active ? 800 : 650,
+  gap: 8,
+  padding: '0 10px',
+  boxShadow: '0 0 0 1px rgba(37,99,235,0.20)',
+};
+
+const branchPickerSearchInputStyle: React.CSSProperties = {
+  width: '100%',
+  minWidth: 0,
+  border: 'none',
+  outline: 'none',
+  background: 'transparent',
+  color: '#f8fafc',
+  fontSize: 12,
+};
+
+const branchPickerListStyle: React.CSSProperties = {
+  minHeight: 0,
+  flex: 1,
+  overflowY: 'auto',
+  padding: '4px 0 8px',
+};
+
+const branchPickerSectionTitleStyle: React.CSSProperties = {
+  minHeight: 30,
+  display: 'flex',
+  alignItems: 'center',
+  padding: '7px 14px 4px',
+  color: '#f8fafc',
+  fontSize: 11.5,
+  fontWeight: 850,
+};
+
+const branchPickerRowStyle = (active: boolean): React.CSSProperties => ({
+  width: '100%',
+  minHeight: 38,
+  border: 'none',
+  borderRadius: 0,
+  background: active ? 'rgba(148,163,184,0.25)' : 'transparent',
+  color: '#f1f5f9',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 9,
+  padding: '0 14px',
+  fontSize: 12,
+  fontWeight: active ? 820 : 680,
   cursor: 'pointer',
+});
+
+const branchPickerIconSlotStyle: React.CSSProperties = {
+  width: 18,
+  minWidth: 18,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  color: '#e2e8f0',
+};
+
+const branchPickerEmptyStyle: React.CSSProperties = {
+  minHeight: 120,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 8,
+  color: '#8b949e',
+  fontSize: 12,
+  padding: 18,
+};
+
+const branchPickerFooterStyle: React.CSSProperties = {
+  flexShrink: 0,
+  padding: '10px 12px',
+  borderTop: '1px solid rgba(255,255,255,0.08)',
+  background: '#20242b',
+};
+
+const branchMergeEntryStyle = (disabled: boolean): React.CSSProperties => ({
+  width: '100%',
+  height: 34,
+  borderRadius: 7,
+  border: '1px solid rgba(148,163,184,0.58)',
+  background: 'rgba(255,255,255,0.035)',
+  color: disabled ? '#6b7280' : '#f1f5f9',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 8,
+  padding: '0 12px',
+  fontSize: 11.5,
+  fontWeight: 760,
+  cursor: disabled ? 'default' : 'pointer',
+});
+
+const mergeDialogBackdropStyle: React.CSSProperties = {
+  position: 'absolute',
+  top: 82,
+  right: 0,
+  bottom: 0,
+  left: 0,
+  zIndex: 40,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  padding: 16,
+  background: 'rgba(3,7,18,0.66)',
+};
+
+const mergeDialogStyle: React.CSSProperties = {
+  width: 'min(720px, calc(100% - 16px))',
+  height: 'min(560px, calc(100% - 8px))',
+  minHeight: 260,
+  display: 'flex',
+  flexDirection: 'column',
+  borderRadius: 8,
+  border: '1px solid rgba(255,255,255,0.13)',
+  background: '#20242b',
+  boxShadow: '0 20px 54px rgba(0,0,0,0.62)',
+  overflow: 'hidden',
+};
+
+const mergeDialogHeaderStyle: React.CSSProperties = {
+  height: 52,
+  flexShrink: 0,
+  display: 'flex',
+  alignItems: 'center',
+  gap: 10,
+  padding: '0 12px 0 16px',
+  borderBottom: '1px solid rgba(255,255,255,0.08)',
+  color: '#f8fafc',
+  fontSize: 14,
+  fontWeight: 820,
+};
+
+const mergeDialogCloseStyle: React.CSSProperties = {
+  width: 30,
+  height: 30,
+  border: 'none',
+  borderRadius: 6,
+  background: 'transparent',
+  color: '#9ca3af',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  cursor: 'pointer',
+  flexShrink: 0,
+};
+
+const mergeDialogListStyle: React.CSSProperties = {
+  minHeight: 0,
+  flex: 1,
+  overflowY: 'auto',
+  padding: '4px 0 8px',
+};
+
+const mergeDialogFooterStyle: React.CSSProperties = {
+  flexShrink: 0,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 10,
+  padding: 12,
+  borderTop: '1px solid rgba(255,255,255,0.08)',
+  background: '#20242b',
+};
+
+const mergeResultLineStyle = (color: string): React.CSSProperties => ({
+  minHeight: 42,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 9,
+  color,
+  fontSize: 11.5,
+  lineHeight: '17px',
+  textAlign: 'center',
+});
+
+const mergeDialogActionStyle = (disabled: boolean): React.CSSProperties => ({
+  width: '100%',
+  height: 36,
+  borderRadius: 7,
+  border: '1px solid rgba(59,130,246,0.48)',
+  background: disabled ? 'rgba(37,99,235,0.34)' : 'rgba(37,99,235,0.88)',
+  color: disabled ? '#94a3b8' : '#fff',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 7,
+  fontSize: 12,
+  fontWeight: 820,
+  cursor: disabled ? 'default' : 'pointer',
+});
+
+const mergeProgressStyle = (conflicted: boolean): React.CSSProperties => ({
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '8px 9px',
+  marginBottom: 8,
+  borderRadius: 7,
+  border: `1px solid ${conflicted ? 'rgba(245,158,11,0.32)' : 'rgba(34,197,94,0.28)'}`,
+  background: conflicted ? 'rgba(245,158,11,0.09)' : 'rgba(34,197,94,0.08)',
+  flexShrink: 0,
+});
+
+const mergeAbortButtonStyle = (disabled: boolean): React.CSSProperties => ({
+  height: 26,
+  borderRadius: 6,
+  border: '1px solid rgba(251,113,133,0.28)',
+  background: 'rgba(127,29,29,0.16)',
+  color: disabled ? '#6b7280' : '#fda4af',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 5,
+  padding: '0 8px',
+  fontSize: 10.5,
+  fontWeight: 760,
+  cursor: disabled ? 'default' : 'pointer',
 });
 
 const emptyLineStyle: React.CSSProperties = {

@@ -104,6 +104,48 @@ test('linked-child catch-up rejects copied history and accepts a post-Enter reco
   }), true);
 });
 
+test('12:51 production Resume send admits the 183-char child turn only after Enter', () => {
+  const sourceSessionId = '019fc1f7-3c5c-76a1-99af-49b919b412dd';
+  const childSessionId = '019fc276-a21a-71f3-98d0-01d2236e0e45';
+  const handoffId = '6c6d344a-8d7a-4422-8c8b-dbe3495570f0';
+  const prompt = 'P'.repeat(183);
+  const assistantAnswer = 'A'.repeat(415);
+  const audit = {
+    handoffId,
+    expectedText: prompt,
+    expectedLen: prompt.length,
+    expectedHash: 'production-prompt-hash',
+    sentAt: Date.parse('2026-08-02T12:51:20.313Z'),
+    preSubmitBoundary: {
+      sessionId: sourceSessionId,
+      filePath: '/rollouts/' + sourceSessionId + '.jsonl',
+      fileSize: 97_000,
+    },
+  };
+  assert.equal(selectCodexPendingPromptAudit([audit], {
+    actualText: prompt,
+    actualHash: audit.expectedHash,
+    actualIdentity: {
+      sessionId: childSessionId,
+      filePath: '/rollouts/' + childSessionId + '.jsonl',
+      byteOffset: 12_000,
+      timestamp: '2026-08-02T12:51:20.200Z',
+    },
+  }), null, 'a copied/pre-Enter child row is not causal');
+  assert.deepEqual(selectCodexPendingPromptAudit([audit], {
+    actualText: prompt,
+    actualHash: audit.expectedHash,
+    actualIdentity: {
+      sessionId: childSessionId,
+      filePath: '/rollouts/' + childSessionId + '.jsonl',
+      byteOffset: 12_400,
+      timestamp: '2026-08-02T12:51:20.504Z',
+    },
+  }), { audit, canonicalMatch: null });
+  assert.equal(prompt.length, 183);
+  assert.equal(assistantAnswer.length, 415);
+});
+
 test('accepts the exact Codex boundary-whitespace normalization seen in production', () => {
   assert.deepEqual(
     codexCanonicalUserMessageMatch(

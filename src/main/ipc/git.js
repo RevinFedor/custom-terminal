@@ -186,13 +186,16 @@ function trimText(text, maxChars) {
 }
 
 async function getStatusForRoot(root) {
-  const statusResult = await runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']);
+  const [statusResult, remoteResult, userNameResult, userEmailResult, credentialHelperResult, merge] = await Promise.all([
+    runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']),
+    runGit(root, ['config', '--get', 'remote.origin.url']),
+    runGit(root, ['config', '--get', 'user.name']),
+    runGit(root, ['config', '--get', 'user.email']),
+    runGit(root, ['config', '--get', 'credential.helper']),
+    getMergeState(root),
+  ]);
   if (!statusResult.success) throw new Error(statusResult.stderr || statusResult.error || 'git status failed');
   const parsed = parseStatus(statusResult.stdout);
-  const remoteResult = await runGit(root, ['config', '--get', 'remote.origin.url']);
-  const userNameResult = await runGit(root, ['config', '--get', 'user.name']);
-  const userEmailResult = await runGit(root, ['config', '--get', 'user.email']);
-  const credentialHelperResult = await runGit(root, ['config', '--get', 'credential.helper']);
   const remote = remoteResult.success ? remoteResult.stdout.trim() : '';
   const repoName = path.basename(root);
   return {
@@ -211,6 +214,7 @@ async function getStatusForRoot(root) {
     files: parsed.files,
     changedCount: parsed.files.length,
     hasDocsChanges: parsed.files.some((file) => isDocsPath(file.path)),
+    merge,
   };
 }
 
@@ -604,15 +608,43 @@ function parseRemoteInfo(remoteUrl) {
 }
 
 async function listBranches(root) {
-  const result = await runGit(root, ['branch', '--all', '--format=%(refname:short)%09%(committerdate:relative)']);
+  const [result, currentResult, originHeadResult] = await Promise.all([
+    runGit(root, [
+      'branch',
+      '--all',
+      '--sort=-committerdate',
+      '--format=%(HEAD)%09%(refname:short)%09%(committerdate:relative)%09%(committerdate:unix)%09%(refname)',
+    ]),
+    runGit(root, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    runGit(root, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']),
+  ]);
   if (!result.success) throw new Error(result.stderr || result.error || 'git branch failed');
+  const current = currentResult.success ? currentResult.stdout.trim() : '';
+  let defaultBranch = originHeadResult.success
+    ? originHeadResult.stdout.trim().replace(/^origin\//, '')
+    : '';
+  if (!defaultBranch) {
+    const mainResult = await runGit(root, ['show-ref', '--verify', '--quiet', 'refs/heads/main']);
+    if (mainResult.success) defaultBranch = 'main';
+    else {
+      const masterResult = await runGit(root, ['show-ref', '--verify', '--quiet', 'refs/heads/master']);
+      defaultBranch = masterResult.success ? 'master' : current;
+    }
+  }
   const seen = new Set();
   return result.stdout.split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
+    .filter((line) => line.trim().length > 0)
     .map((line) => {
-      const [name, updated] = line.split('\t');
-      return { name, updated: updated || '' };
+      const [head, name, updated, updatedUnix, refname] = line.split('\t');
+      const remote = String(refname || '').startsWith('refs/remotes/');
+      return {
+        name,
+        updated: updated || '',
+        updatedUnix: Number(updatedUnix) || 0,
+        current: head === '*' || (!remote && name === current),
+        default: !remote && name === defaultBranch,
+        remote,
+      };
     })
     .filter((branch) => branch.name && branch.name !== 'origin/HEAD')
     .filter((branch) => {
@@ -620,6 +652,246 @@ async function listBranches(root) {
       seen.add(branch.name);
       return true;
     });
+}
+
+function parseNulPaths(stdout) {
+  return String(stdout || '').split('\0').map((item) => item.trim()).filter(Boolean);
+}
+
+function parseMergeTreeConflictFiles(stdout) {
+  const lines = String(stdout || '').replace(/\r\n/g, '\n').split('\n');
+  if (lines.length <= 1) return [];
+  const files = [];
+  const seen = new Set();
+  for (const line of lines.slice(1)) {
+    if (!line.trim()) break;
+    const filePath = line.trim();
+    if (!filePath || seen.has(filePath)) continue;
+    seen.add(filePath);
+    files.push(filePath);
+  }
+  return files;
+}
+
+function mergeMessage(sourceBranch, targetBranch) {
+  const source = String(sourceBranch || '').replace(/[\r\n\0]+/g, ' ').trim();
+  const target = String(targetBranch || '').replace(/[\r\n\0]+/g, ' ').trim();
+  return `Merge ${source || 'branch'} into ${target || 'current branch'}`;
+}
+
+function parseMergeMessageSource(message) {
+  const firstLine = String(message || '').replace(/\r\n/g, '\n').split('\n')[0].trim();
+  const match = firstLine.match(/^Merge (.+) into (.+)$/);
+  return match ? { sourceBranch: match[1], targetBranch: match[2] } : null;
+}
+
+async function readMergeMessage(root) {
+  const mergeMessagePath = await runGit(root, ['rev-parse', '--git-path', 'MERGE_MSG']);
+  if (!mergeMessagePath.success || !mergeMessagePath.stdout.trim()) return '';
+  const candidate = mergeMessagePath.stdout.trim();
+  const absolutePath = path.isAbsolute(candidate) ? candidate : path.resolve(root, candidate);
+  return fs.promises.readFile(absolutePath, 'utf8').catch(() => '');
+}
+
+async function getMergeState(root) {
+  const mergeHeadResult = await runGit(root, ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD']);
+  if (!mergeHeadResult.success || !mergeHeadResult.stdout.trim()) {
+    return {
+      inProgress: false,
+      readyToCommit: false,
+      mergeHead: '',
+      sourceBranch: '',
+      targetBranch: '',
+      conflictFiles: [],
+      conflictCount: 0,
+      message: '',
+    };
+  }
+
+  const [conflictsResult, message, targetBranch] = await Promise.all([
+    runGit(root, ['-c', 'core.quotepath=false', 'diff', '--name-only', '--diff-filter=U', '-z']),
+    readMergeMessage(root),
+    currentBranch(root),
+  ]);
+  const conflictFiles = conflictsResult.success ? parseNulPaths(conflictsResult.stdout) : [];
+  const parsedMessage = parseMergeMessageSource(message);
+  return {
+    inProgress: true,
+    readyToCommit: conflictFiles.length === 0,
+    mergeHead: mergeHeadResult.stdout.trim(),
+    sourceBranch: parsedMessage?.sourceBranch || mergeHeadResult.stdout.trim().slice(0, 12),
+    targetBranch: parsedMessage?.targetBranch || targetBranch,
+    conflictFiles,
+    conflictCount: conflictFiles.length,
+    message: String(message || '').trim(),
+  };
+}
+
+async function resolveMergeSource(root, sourceBranch) {
+  const source = String(sourceBranch || '').trim();
+  if (!source || /[\r\n\0]/.test(source)) throw new Error('Source branch is required');
+  const result = await runGit(root, ['rev-parse', '--verify', '--end-of-options', `${source}^{commit}`]);
+  if (!result.success || !result.stdout.trim()) {
+    throw new Error(result.stderr || result.error || `Branch not found: ${source}`);
+  }
+  return { sourceBranch: source, sourceHash: result.stdout.trim() };
+}
+
+async function previewMergeForRoot(root, sourceBranch) {
+  const merge = await getMergeState(root);
+  const targetBranch = await currentBranch(root);
+  if (merge.inProgress) {
+    return {
+      success: true,
+      state: 'merge-in-progress',
+      sourceBranch: merge.sourceBranch,
+      targetBranch: merge.targetBranch || targetBranch,
+      conflictFiles: merge.conflictFiles,
+      conflictCount: merge.conflictCount,
+      commitCount: 0,
+      changedFileCount: 0,
+      merge,
+    };
+  }
+
+  const source = await resolveMergeSource(root, sourceBranch);
+  const headResult = await runGit(root, ['rev-parse', '--verify', 'HEAD']);
+  if (!headResult.success || !headResult.stdout.trim()) throw new Error('Unable to read HEAD');
+  const headHash = headResult.stdout.trim();
+  if (source.sourceHash === headHash || source.sourceBranch === targetBranch) {
+    return {
+      success: true,
+      state: 'same',
+      sourceBranch: source.sourceBranch,
+      targetBranch,
+      conflictFiles: [],
+      conflictCount: 0,
+      commitCount: 0,
+      changedFileCount: 0,
+    };
+  }
+
+  const statusResult = await runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']);
+  if (!statusResult.success) throw new Error(statusResult.stderr || statusResult.error || 'git status failed');
+  const dirtyFiles = parseStatus(statusResult.stdout).files;
+  if (dirtyFiles.length) {
+    return {
+      success: true,
+      state: 'dirty',
+      sourceBranch: source.sourceBranch,
+      targetBranch,
+      conflictFiles: [],
+      conflictCount: 0,
+      commitCount: 0,
+      changedFileCount: dirtyFiles.length,
+    };
+  }
+
+  const alreadyMerged = await runGit(root, ['merge-base', '--is-ancestor', source.sourceHash, headHash]);
+  if (alreadyMerged.success) {
+    return {
+      success: true,
+      state: 'up-to-date',
+      sourceBranch: source.sourceBranch,
+      targetBranch,
+      conflictFiles: [],
+      conflictCount: 0,
+      commitCount: 0,
+      changedFileCount: 0,
+    };
+  }
+
+  const [commitCountResult, changedFilesResult, mergeTreeResult] = await Promise.all([
+    runGit(root, ['rev-list', '--count', `${headHash}..${source.sourceHash}`]),
+    runGit(root, ['-c', 'core.quotepath=false', 'diff', '--name-only', '-z', `${headHash}...${source.sourceHash}`]),
+    runGit(root, [
+      '-c', 'core.quotepath=false',
+      'merge-tree', '--write-tree', '--name-only', '--messages',
+      headHash, source.sourceHash,
+    ]),
+  ]);
+  const conflictFiles = parseMergeTreeConflictFiles(mergeTreeResult.stdout);
+  if (!mergeTreeResult.success && !conflictFiles.length) {
+    throw new Error(mergeTreeResult.stderr || mergeTreeResult.error || 'Unable to preview merge');
+  }
+  return {
+    success: true,
+    state: conflictFiles.length ? 'conflicts' : 'ready',
+    sourceBranch: source.sourceBranch,
+    sourceHash: source.sourceHash,
+    targetBranch,
+    conflictFiles,
+    conflictCount: conflictFiles.length,
+    commitCount: commitCountResult.success ? Math.max(0, Number(commitCountResult.stdout.trim()) || 0) : 0,
+    changedFileCount: changedFilesResult.success ? parseNulPaths(changedFilesResult.stdout).length : 0,
+  };
+}
+
+async function startMergeForRoot(root, sourceBranch) {
+  const preview = await previewMergeForRoot(root, sourceBranch);
+  if (preview.state !== 'ready' && preview.state !== 'conflicts') return preview;
+
+  const source = await resolveMergeSource(root, preview.sourceBranch);
+  const result = await runGit(root, [
+    'merge', '--no-ff', '--no-commit',
+    '-m', mergeMessage(preview.sourceBranch, preview.targetBranch),
+    source.sourceHash,
+  ]);
+  const merge = await getMergeState(root);
+  if (merge.inProgress && merge.conflictCount > 0) {
+    return {
+      success: true,
+      state: 'conflicts',
+      sourceBranch: preview.sourceBranch,
+      targetBranch: preview.targetBranch,
+      conflictFiles: merge.conflictFiles,
+      conflictCount: merge.conflictCount,
+      commitCount: preview.commitCount,
+      changedFileCount: preview.changedFileCount,
+      merge,
+    };
+  }
+  if (!result.success) {
+    throw new Error(result.stderr || result.error || 'git merge failed');
+  }
+  if (!merge.inProgress) {
+    return { ...preview, success: true, state: 'up-to-date' };
+  }
+
+  const commitResult = await runGit(root, ['commit', '--no-edit']);
+  if (!commitResult.success) throw new Error(commitResult.stderr || commitResult.error || 'git merge commit failed');
+  const hashResult = await runGit(root, ['rev-parse', '--short', 'HEAD']);
+  return {
+    success: true,
+    state: 'merged',
+    sourceBranch: preview.sourceBranch,
+    targetBranch: preview.targetBranch,
+    conflictFiles: [],
+    conflictCount: 0,
+    commitCount: preview.commitCount,
+    changedFileCount: preview.changedFileCount,
+    hash: hashResult.success ? hashResult.stdout.trim() : '',
+  };
+}
+
+async function continueMergeForRoot(root) {
+  const merge = await getMergeState(root);
+  if (!merge.inProgress) throw new Error('No merge is in progress');
+  if (merge.conflictCount > 0) {
+    throw new Error(`${merge.conflictCount} conflicted file${merge.conflictCount === 1 ? '' : 's'} still unresolved`);
+  }
+  const commitResult = await runGit(root, ['commit', '--no-edit']);
+  if (!commitResult.success) throw new Error(commitResult.stderr || commitResult.error || 'git merge commit failed');
+  const hashResult = await runGit(root, ['rev-parse', '--short', 'HEAD']);
+  return { success: true, state: 'merged', hash: hashResult.success ? hashResult.stdout.trim() : '' };
+}
+
+async function abortMergeForRoot(root) {
+  const merge = await getMergeState(root);
+  if (!merge.inProgress) throw new Error('No merge is in progress');
+  const result = await runGit(root, ['merge', '--abort']);
+  if (!result.success) throw new Error(result.stderr || result.error || 'git merge --abort failed');
+  return { success: true, state: 'aborted' };
 }
 
 async function currentBranch(root) {
@@ -654,7 +926,9 @@ function stopGitStatusWatcher(key) {
   const state = gitStatusWatchers.get(key);
   if (!state) return;
   if (state.timer) clearTimeout(state.timer);
-  try { state.watcher?.close?.(); } catch {}
+  for (const watcher of state.watchers || []) {
+    try { watcher?.close?.(); } catch {}
+  }
   gitStatusWatchers.delete(key);
 }
 
@@ -821,10 +1095,10 @@ function register({ projectManager }) {
       }
 
       const state = {
-        watcher: null,
+        watchers: [],
         timer: null,
       };
-      const notify = (eventType, filename) => {
+      const notify = (basePath, eventType, filename) => {
         const rel = String(filename || '');
         if (shouldIgnoreGitWatchPath(rel)) return;
         if (state.timer) clearTimeout(state.timer);
@@ -836,7 +1110,7 @@ function register({ projectManager }) {
           }
           event.sender.send('git:status-changed', {
             eventType,
-            path: rel ? path.join(root, rel) : root,
+            path: rel ? path.join(basePath, rel) : basePath,
             repoRoot: root,
             projectPath: requestPath,
           });
@@ -844,8 +1118,20 @@ function register({ projectManager }) {
       };
 
       try {
-        state.watcher = fs.watch(root, { recursive: true, persistent: false }, notify);
+        state.watchers.push(fs.watch(root, { recursive: true, persistent: false }, (eventType, filename) => {
+          notify(root, eventType, filename);
+        }));
+        const gitDirResult = await runGit(root, ['rev-parse', '--absolute-git-dir']);
+        const gitDir = gitDirResult.success ? gitDirResult.stdout.trim() : '';
+        if (gitDir && path.resolve(gitDir) !== path.resolve(root)) {
+          state.watchers.push(fs.watch(gitDir, { recursive: true, persistent: false }, (eventType, filename) => {
+            notify(gitDir, eventType, filename);
+          }));
+        }
       } catch (error) {
+        for (const watcher of state.watchers) {
+          try { watcher?.close?.(); } catch {}
+        }
         return { success: false, error: error.message };
       }
 
@@ -904,6 +1190,61 @@ function register({ projectManager }) {
         additions: stats.additions,
         deletions: stats.deletions,
       };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('git:merge-preview', async (event, { projectPath, sourceBranch }) => {
+    try {
+      const root = await getRepoRoot(projectPath);
+      if (!root) throw new Error('Not a Git repository');
+      return await previewMergeForRoot(root, sourceBranch);
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('git:merge-start', async (event, { projectPath, sourceBranch }) => {
+    try {
+      const root = await getRepoRoot(projectPath);
+      if (!root) throw new Error('Not a Git repository');
+      const finishGitOperation = startGitOperation('merge', root);
+      try {
+        return await startMergeForRoot(root, sourceBranch);
+      } finally {
+        finishGitOperation();
+      }
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('git:merge-continue', async (event, { projectPath }) => {
+    try {
+      const root = await getRepoRoot(projectPath);
+      if (!root) throw new Error('Not a Git repository');
+      const finishGitOperation = startGitOperation('merge', root);
+      try {
+        return await continueMergeForRoot(root);
+      } finally {
+        finishGitOperation();
+      }
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('git:merge-abort', async (event, { projectPath }) => {
+    try {
+      const root = await getRepoRoot(projectPath);
+      if (!root) throw new Error('Not a Git repository');
+      const finishGitOperation = startGitOperation('abort merge', root);
+      try {
+        return await abortMergeForRoot(root);
+      } finally {
+        finishGitOperation();
+      }
     } catch (error) {
       return { success: false, error: error.message };
     }
@@ -1171,4 +1512,18 @@ function register({ projectManager }) {
   });
 }
 
-module.exports = { register, getActiveOperations };
+module.exports = {
+  register,
+  getActiveOperations,
+  __test: {
+    abortMergeForRoot,
+    continueMergeForRoot,
+    getMergeState,
+    listBranches,
+    mergeMessage,
+    parseMergeMessageSource,
+    parseMergeTreeConflictFiles,
+    previewMergeForRoot,
+    startMergeForRoot,
+  },
+};

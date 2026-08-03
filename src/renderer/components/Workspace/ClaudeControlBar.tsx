@@ -662,7 +662,14 @@ export default function ClaudeControlBar({
       const proof = result?.readyMeta?.serviceTierProof;
       const ownerId = String(proof?.ownerId || '').trim();
       const serviceTier = String(proof?.serviceTier || '').trim().toLowerCase();
-      if (!ownerId || !['priority', 'default'].includes(serviceTier)) return null;
+      if (!ownerId || !['priority', 'default'].includes(serviceTier)) {
+        useWorkspaceStore.getState().updateCodexLiveServiceTier(tabId, {
+          codexLiveServiceTier: undefined,
+          codexLiveServiceTierSessionId: undefined,
+          codexLiveServiceTierSource: undefined,
+        });
+        return null;
+      }
       useWorkspaceStore.getState().updateCodexLiveServiceTier(tabId, {
         codexLiveServiceTier: serviceTier,
         codexLiveServiceTierSessionId: ownerId,

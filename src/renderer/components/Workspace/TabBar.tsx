@@ -7966,6 +7966,56 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     return () => clearTimeout(timer);
   }, [workspace.activeTabId, mainTabs.length]);
 
+  // Explicit reveal request (Ctrl+Tab / Cmd+P commit, split focus): INSTANT
+  // scroll that aligns the row's edge with the list edge when it is out of
+  // view (top-with-top above, bottom-with-bottom below). Unlike the effect
+  // above this one also fires right after a cross-project switch and takes
+  // priority over that project's saved-scroll restore — the user asked for
+  // this tab, not for where the list stood last time.
+  const tabListRevealRequest = useWorkspaceStore((s) => s.tabListRevealRequest);
+  useLayoutEffect(() => {
+    if (!isVerticalLayout) return;
+    if (!tabListRevealRequest || tabListRevealRequest.projectId !== projectId) return;
+    const scroller = scrollContainerRef.current;
+    if (!scroller) return;
+
+    // The reveal owns the scroll from here: cancel a pending per-project
+    // restore so it can't clamp us back after rows finish laying out.
+    tabListPendingRestoreRef.current = null;
+
+    let cancelled = false;
+    let attempts = 0;
+    const tryReveal = () => {
+      if (cancelled) return;
+      const row = scroller.querySelector(`[data-tab-item][data-tab-id="${CSS.escape(tabListRevealRequest.tabId)}"]`) as HTMLElement | null;
+      if (!row) {
+        // Row not committed yet (project just switched) — retry next frame,
+        // bounded so a closed tab can't spin forever.
+        if (++attempts < 20) requestAnimationFrame(tryReveal);
+        return;
+      }
+      const rowTop = row.offsetTop;
+      const rowBottom = rowTop + row.offsetHeight;
+      const viewTop = scroller.scrollTop;
+      const viewBottom = viewTop + scroller.clientHeight;
+      let next: number | null = null;
+      if (rowTop < viewTop) {
+        next = rowTop; // above → align top edges
+      } else if (rowBottom > viewBottom) {
+        next = rowBottom - scroller.clientHeight; // below → align bottom edges
+      }
+      if (next !== null) {
+        scroller.scrollTop = next;
+        // Persist the revealed position (the reveal, not the stale saved
+        // offset, is where the user now is). handleTabListScroll ignores this
+        // event because tabListUserScrolledRef is false.
+        setTabListScrollTop(projectId, scroller.scrollTop);
+      }
+    };
+    tryReveal();
+    return () => { cancelled = true; };
+  }, [isVerticalLayout, projectId, tabListRevealRequest, setTabListScrollTop]);
+
   // Wheel handler. Horizontal layout — конвертирует deltaY в горизонтальный scroll
   // чтобы юзер мог листать табы колесом без зажатия Shift. Vertical layout —
   // NO-op (нативный вертикальный scroll работает сам, форсить scrollLeft на

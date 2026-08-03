@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   advanceOscCommandGeneration,
   attachCodexSettingsProofOwner,
+  authorizeCodexServiceTierProofOwnerHandoff,
   codexLiveSlashAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
@@ -12,11 +13,13 @@ const {
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,
   createCodexPtySubmitAdmission,
+  createCodexServiceTierProof,
   isCodexComposerReadyForGuardedSend,
   liveLifecycleFromCodexWriterStatus,
   planCodexCommandLaunchSettings,
   planCodexLaunchSettings,
   planCodexPickerMovement,
+  preserveCodexServiceTierProofForTurnEnd,
   projectPendingCodexSettingsProofOwner,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
@@ -28,6 +31,186 @@ const {
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require('./codex-runtime-contract');
+
+test('same-owner turn completion preserves the exact priority proof byte-for-byte', () => {
+  const terminalToken = { pty: 'terminal-a' };
+  const identity = {
+    ownerId: 'session-a',
+    terminalToken,
+    terminalLifecycleGeneration: 'terminal-epoch-a:7',
+    terminalRunSeq: 7,
+    launchId: 'launch-a',
+  };
+  const proof = createCodexServiceTierProof({
+    ...identity,
+    serviceTier: 'priority',
+    proofAt: 1785681000123,
+    source: 'tui-service-tier-feedback',
+  });
+  const serializedBefore = JSON.stringify(proof);
+  const result = preserveCodexServiceTierProofForTurnEnd(proof, identity);
+
+  assert.equal(result.preserved, true);
+  assert.equal(result.reason, 'same-live-owner-generation');
+  assert.strictEqual(result.proof, proof);
+  assert.equal(JSON.stringify(result.proof), serializedBefore);
+  assert.equal(result.proof.fast, true);
+  assert.equal(serializedBefore.includes('terminal-a'), false);
+});
+
+test('turn completion drops a service-tier proof on terminal, lifecycle, run, launch, or owner change', () => {
+  const terminalToken = { pty: 'terminal-a' };
+  const identity = {
+    ownerId: 'session-a',
+    terminalToken,
+    terminalLifecycleGeneration: 'terminal-epoch-a:7',
+    terminalRunSeq: 7,
+    launchId: 'launch-a',
+  };
+  const proof = createCodexServiceTierProof({
+    ...identity,
+    serviceTier: 'priority',
+    proofAt: 1785681000123,
+  });
+  const mismatches = [
+    [{ terminalToken: { pty: 'terminal-b' } }, 'terminal-object-changed'],
+    [{ terminalLifecycleGeneration: 'terminal-epoch-b:7' }, 'terminal-lifecycle-changed'],
+    [{ terminalRunSeq: 8 }, 'terminal-run-changed'],
+    [{ launchId: 'launch-b' }, 'launch-generation-changed'],
+    [{ ownerId: 'session-b' }, 'proof-owner-changed'],
+  ];
+  for (const [patch, reason] of mismatches) {
+    const result = preserveCodexServiceTierProofForTurnEnd(proof, {
+      ...identity,
+      ...patch,
+    });
+    assert.deepEqual(result, { preserved: false, proof: null, reason });
+  }
+});
+
+test('an explicit default or priority observation replaces the exact live tier without inference', () => {
+  const identity = {
+    ownerId: 'session-a',
+    terminalToken: { pty: 'terminal-a' },
+    terminalLifecycleGeneration: 'terminal-epoch-a:7',
+    terminalRunSeq: 7,
+    launchId: 'launch-a',
+  };
+  const priority = createCodexServiceTierProof({
+    ...identity,
+    serviceTier: 'priority',
+    proofAt: 1785681000123,
+    source: 'first-feedback',
+  });
+  const defaultTier = createCodexServiceTierProof({
+    ...identity,
+    serviceTier: 'default',
+    proofAt: 1785681000456,
+    source: 'replacement-feedback',
+  });
+
+  assert.notStrictEqual(defaultTier, priority);
+  assert.deepEqual(
+    { tier: priority.serviceTier, fast: priority.fast },
+    { tier: 'priority', fast: true },
+  );
+  assert.deepEqual(
+    { tier: defaultTier.serviceTier, fast: defaultTier.fast },
+    { tier: 'default', fast: false },
+  );
+  assert.strictEqual(
+    preserveCodexServiceTierProofForTurnEnd(defaultTier, identity).proof,
+    defaultTier,
+  );
+});
+
+test('a provisional launch tier follows only its exact first writer in the same live generation', () => {
+  const terminalToken = { pty: 'terminal-a' };
+  const generation = {
+    terminalToken,
+    terminalLifecycleGeneration: 'terminal-epoch-a:7',
+    terminalRunSeq: 7,
+    launchId: 'launch-a',
+  };
+  const proof = createCodexServiceTierProof({
+    ...generation,
+    ownerId: 'launch:launch-a',
+    serviceTier: 'priority',
+    proofAt: 1785681000123,
+  });
+  const admitted = authorizeCodexServiceTierProofOwnerHandoff(proof, {
+    ...generation,
+    sourceOwnerId: 'launch:launch-a',
+    targetOwnerId: 'writer-a',
+  });
+  assert.equal(admitted.allowed, true);
+  assert.strictEqual(admitted.proof, proof);
+  assert.equal(admitted.serviceTier, 'priority');
+  assert.equal(admitted.targetOwnerId, 'writer-a');
+
+  for (const patch of [
+    { terminalToken: { pty: 'terminal-b' } },
+    { terminalLifecycleGeneration: 'terminal-epoch-b:7' },
+    { terminalRunSeq: 8 },
+    { launchId: 'launch-b' },
+    { sourceOwnerId: 'launch:foreign' },
+    { targetOwnerId: 'launch:launch-a' },
+  ]) {
+    assert.equal(authorizeCodexServiceTierProofOwnerHandoff(proof, {
+      ...generation,
+      sourceOwnerId: 'launch:launch-a',
+      targetOwnerId: 'writer-a',
+      ...patch,
+    }).allowed, false);
+  }
+});
+
+test('a launchless live Codex run uses exact terminal-run ownership and hands it to only that writer', () => {
+  const terminalToken = { pty: 'manual-terminal' };
+  const generation = {
+    terminalToken,
+    terminalLifecycleGeneration: 'manual-terminal-epoch:3',
+    terminalRunSeq: 3,
+    launchId: null,
+    generationMode: 'terminal-run',
+    generationId: 'manual-terminal-epoch:3',
+  };
+  const proof = createCodexServiceTierProof({
+    ...generation,
+    ownerId: 'terminal-run:manual-terminal-epoch:3',
+    serviceTier: 'priority',
+    proofAt: 1785681000999,
+  });
+  assert.equal(proof.launchId, null);
+  assert.equal(proof.generationMode, 'terminal-run');
+  assert.strictEqual(
+    preserveCodexServiceTierProofForTurnEnd(proof, {
+      ...generation,
+      ownerId: proof.ownerId,
+    }).proof,
+    proof,
+  );
+  const handoff = authorizeCodexServiceTierProofOwnerHandoff(proof, {
+    ...generation,
+    sourceOwnerId: proof.ownerId,
+    targetOwnerId: 'manual-writer',
+  });
+  assert.equal(handoff.allowed, true);
+  assert.equal(handoff.targetOwnerId, 'manual-writer');
+  assert.equal(authorizeCodexServiceTierProofOwnerHandoff(proof, {
+    ...generation,
+    terminalRunSeq: 4,
+    sourceOwnerId: proof.ownerId,
+    targetOwnerId: 'manual-writer',
+  }).allowed, false);
+  assert.equal(authorizeCodexServiceTierProofOwnerHandoff(proof, {
+    ...generation,
+    terminalLifecycleGeneration: 'replacement-terminal:3',
+    generationId: 'replacement-terminal:3',
+    sourceOwnerId: proof.ownerId,
+    targetOwnerId: 'manual-writer',
+  }).allowed, false);
+});
 
 test('only the native FAST service-tier command is admitted during an active turn', () => {
   assert.equal(codexLiveSlashAllowsTurnBusy('/fast'), true);

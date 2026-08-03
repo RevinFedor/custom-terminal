@@ -3278,6 +3278,9 @@ function App() {
             externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
             background: background === true,
             restoreId: requestedReservedTabId,
+            // Project API sessions keep their visual parent, but must not
+            // displace tabs the user has already ordered near that parent.
+            appendToEnd: true,
             ...(requestedVisualParentId
               ? {
                 afterTabId: typeof afterTabId === 'string' && afterTabId.trim()
@@ -4064,9 +4067,18 @@ function App() {
     };
     const handleCodexServiceTierProof = (_: any, data: any) => {
       const tabId = String(data?.tabId || '').trim();
+      if (!tabId) return;
+      if (data?.cleared === true) {
+        useWorkspaceStore.getState().updateCodexLiveServiceTier(tabId, {
+          codexLiveServiceTier: undefined,
+          codexLiveServiceTierSessionId: undefined,
+          codexLiveServiceTierSource: undefined,
+        });
+        return;
+      }
       const ownerId = String(data?.ownerId || '').trim();
       const serviceTier = String(data?.serviceTier || '').trim().toLowerCase();
-      if (!tabId || !ownerId || !['priority', 'default'].includes(serviceTier)) return;
+      if (!ownerId || !['priority', 'default'].includes(serviceTier)) return;
       useWorkspaceStore.getState().updateCodexLiveServiceTier(tabId, {
         codexLiveServiceTier: serviceTier,
         codexLiveServiceTierSessionId: ownerId,

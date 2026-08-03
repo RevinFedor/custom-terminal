@@ -1,5 +1,189 @@
 'use strict';
 
+const CODEX_SERVICE_TIER_PROOF_TERMINAL_TOKEN = Symbol(
+  'codex-service-tier-proof-terminal-token',
+);
+
+function normalizeCodexServiceTier(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return normalized === 'priority' || normalized === 'default'
+    ? normalized
+    : null;
+}
+
+function createCodexServiceTierProof({
+  ownerId = null,
+  serviceTier = null,
+  proofAt = Date.now(),
+  source = 'tui',
+  terminalToken = null,
+  terminalLifecycleGeneration = null,
+  terminalRunSeq = 0,
+  launchId = null,
+  generationMode = null,
+  generationId = null,
+} = {}) {
+  const normalizedOwnerId = typeof ownerId === 'string' ? ownerId.trim() : '';
+  const normalizedTier = normalizeCodexServiceTier(serviceTier);
+  const normalizedLifecycle = typeof terminalLifecycleGeneration === 'string'
+    ? terminalLifecycleGeneration.trim()
+    : '';
+  const normalizedRunSeq = Number(terminalRunSeq);
+  const normalizedLaunchId = typeof launchId === 'string' ? launchId.trim() : '';
+  const normalizedGenerationMode = generationMode === 'terminal-run'
+    ? 'terminal-run'
+    : 'launch';
+  const normalizedGenerationId = typeof generationId === 'string' && generationId.trim()
+    ? generationId.trim()
+    : normalizedGenerationMode === 'launch'
+      ? normalizedLaunchId
+      : normalizedLifecycle;
+  const normalizedProofAt = Number(proofAt);
+  if (!normalizedOwnerId
+    || !normalizedTier
+    || !terminalToken
+    || !normalizedLifecycle
+    || !Number.isInteger(normalizedRunSeq)
+    || normalizedRunSeq <= 0
+    || !normalizedGenerationId
+    || (normalizedGenerationMode === 'launch'
+      && (!normalizedLaunchId || normalizedGenerationId !== normalizedLaunchId))
+    || (normalizedGenerationMode === 'terminal-run' && normalizedLaunchId)
+    || !Number.isFinite(normalizedProofAt)
+    || normalizedProofAt <= 0) {
+    return null;
+  }
+  const proof = {
+    ownerId: normalizedOwnerId,
+    serviceTier: normalizedTier,
+    fast: normalizedTier === 'priority',
+    proofAt: normalizedProofAt,
+    source: String(source || 'tui'),
+    terminalLifecycleGeneration: normalizedLifecycle,
+    terminalRunSeq: normalizedRunSeq,
+    generationMode: normalizedGenerationMode,
+    generationId: normalizedGenerationId,
+    launchId: normalizedLaunchId || null,
+  };
+  // The PTY object is the strongest part of the identity, but it must never be
+  // sent through Electron IPC. Keep it on the proof itself as non-enumerable
+  // main-process identity rather than introducing a second cache.
+  Object.defineProperty(proof, CODEX_SERVICE_TIER_PROOF_TERMINAL_TOKEN, {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: terminalToken,
+  });
+  return Object.freeze(proof);
+}
+
+function preserveCodexServiceTierProofForTurnEnd(proof, {
+  ownerId = null,
+  terminalToken = null,
+  terminalLifecycleGeneration = null,
+  terminalRunSeq = 0,
+  launchId = null,
+  generationMode = null,
+  generationId = null,
+} = {}) {
+  if (!proof || typeof proof !== 'object') {
+    return { preserved: false, proof: null, reason: 'proof-missing' };
+  }
+  if (!normalizeCodexServiceTier(proof.serviceTier)
+    || !proof.ownerId
+    || !proof.terminalLifecycleGeneration
+    || !Number.isInteger(Number(proof.terminalRunSeq))
+    || !['launch', 'terminal-run'].includes(proof.generationMode)
+    || !proof.generationId
+    || (proof.generationMode === 'launch' && !proof.launchId)
+    || (proof.generationMode === 'terminal-run' && proof.launchId)
+    || !proof[CODEX_SERVICE_TIER_PROOF_TERMINAL_TOKEN]) {
+    return { preserved: false, proof: null, reason: 'proof-identity-incomplete' };
+  }
+  if (!terminalToken
+    || proof[CODEX_SERVICE_TIER_PROOF_TERMINAL_TOKEN] !== terminalToken) {
+    return { preserved: false, proof: null, reason: 'terminal-object-changed' };
+  }
+  if (!terminalLifecycleGeneration
+    || proof.terminalLifecycleGeneration !== terminalLifecycleGeneration) {
+    return { preserved: false, proof: null, reason: 'terminal-lifecycle-changed' };
+  }
+  if (!Number.isInteger(Number(terminalRunSeq))
+    || Number(proof.terminalRunSeq) !== Number(terminalRunSeq)) {
+    return { preserved: false, proof: null, reason: 'terminal-run-changed' };
+  }
+  const observedLaunchId = typeof launchId === 'string' ? launchId.trim() : '';
+  const observedGenerationMode = generationMode === 'terminal-run'
+    ? 'terminal-run'
+    : 'launch';
+  const observedGenerationId = typeof generationId === 'string' && generationId.trim()
+    ? generationId.trim()
+    : observedGenerationMode === 'launch'
+      ? observedLaunchId
+      : terminalLifecycleGeneration;
+  if (proof.generationMode !== observedGenerationMode) {
+    return { preserved: false, proof: null, reason: 'generation-mode-changed' };
+  }
+  if (observedGenerationMode === 'launch'
+    && (!observedLaunchId || proof.launchId !== observedLaunchId)) {
+    return { preserved: false, proof: null, reason: 'launch-generation-changed' };
+  }
+  if (!observedGenerationId || proof.generationId !== observedGenerationId) {
+    return { preserved: false, proof: null, reason: 'action-generation-changed' };
+  }
+  if (!ownerId || proof.ownerId !== ownerId) {
+    return { preserved: false, proof: null, reason: 'proof-owner-changed' };
+  }
+  return {
+    preserved: true,
+    proof,
+    reason: 'same-live-owner-generation',
+  };
+}
+
+function authorizeCodexServiceTierProofOwnerHandoff(proof, {
+  sourceOwnerId = null,
+  targetOwnerId = null,
+  terminalToken = null,
+  terminalLifecycleGeneration = null,
+  terminalRunSeq = 0,
+  launchId = null,
+  generationMode = null,
+  generationId = null,
+} = {}) {
+  const normalizedSourceOwnerId = typeof sourceOwnerId === 'string'
+    ? sourceOwnerId.trim()
+    : '';
+  const normalizedTargetOwnerId = typeof targetOwnerId === 'string'
+    ? targetOwnerId.trim()
+    : '';
+  if (!normalizedSourceOwnerId
+    || !normalizedTargetOwnerId
+    || normalizedSourceOwnerId === normalizedTargetOwnerId) {
+    return { allowed: false, proof: null, reason: 'owner-handoff-invalid' };
+  }
+  const preserved = preserveCodexServiceTierProofForTurnEnd(proof, {
+    ownerId: normalizedSourceOwnerId,
+    terminalToken,
+    terminalLifecycleGeneration,
+    terminalRunSeq,
+    launchId,
+    generationMode,
+    generationId,
+  });
+  if (!preserved.preserved) {
+    return { allowed: false, proof: null, reason: preserved.reason };
+  }
+  return {
+    allowed: true,
+    proof: preserved.proof,
+    sourceOwnerId: normalizedSourceOwnerId,
+    targetOwnerId: normalizedTargetOwnerId,
+    serviceTier: preserved.proof.serviceTier,
+    reason: 'exact-live-generation-owner-handoff',
+  };
+}
+
 function shouldHoldCodexStartingOnAbsent({
   launchObservationPending = false,
   launchAcceptancePending = false,
@@ -636,11 +820,13 @@ function isCodexComposerReadyForGuardedSend(status) {
 
 module.exports = {
   advanceOscCommandGeneration,
+  authorizeCodexServiceTierProofOwnerHandoff,
   attachCodexSettingsProofOwner,
   codexLiveSlashAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
+  createCodexServiceTierProof,
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,
   createCodexPtySubmitAdmission,
@@ -650,6 +836,7 @@ module.exports = {
   planCodexCommandLaunchSettings,
   planCodexLaunchSettings,
   planCodexPickerMovement,
+  preserveCodexServiceTierProofForTurnEnd,
   projectPendingCodexSettingsProofOwner,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,

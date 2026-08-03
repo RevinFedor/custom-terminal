@@ -955,11 +955,12 @@ const shouldCarryAfterRewindTarget = (entry: FullHistoryEntry, preview: HistoryR
 };
 
 const buildRewindPreviewEntries = (rawEntries: FullHistoryEntry[], preview: HistoryRewindPreview | null) => {
-  if (!preview) return { entries: rawEntries, hiddenCount: 0 };
+  if (!preview) return { entries: rawEntries, hiddenCount: 0, hiddenTurnCount: 0 };
   return projectNativeRewindPreview(
     rawEntries,
     preview.targetUuid,
     (entry) => shouldCarryAfterRewindTarget(entry, preview),
+    (entry) => entry.role === 'user' && !isLocalPromptEntry(entry),
   );
 };
 
@@ -3794,7 +3795,7 @@ function AgentHistoryControls({
   rewindPhase,
   rewindMessage,
   rewindPreviewActive,
-  rewindPreviewHiddenCount,
+  rewindPreviewHiddenTurnCount,
   terminalOpen,
   onToggleTerminal,
   onSwapPrimarySurface,
@@ -3850,7 +3851,7 @@ function AgentHistoryControls({
   rewindPhase?: RewindOperationPhase;
   rewindMessage?: string;
   rewindPreviewActive: boolean;
-  rewindPreviewHiddenCount: number;
+  rewindPreviewHiddenTurnCount: number;
   terminalOpen?: boolean;
   onToggleTerminal?: () => void;
   onSwapPrimarySurface?: () => void;
@@ -3989,14 +3990,16 @@ function AgentHistoryControls({
   const syncPromptTextareaHeight = useCallback(() => {
     const element = promptTextareaRef.current;
     if (!element) return;
-    element.style.height = 'auto';
-    const contentHeight = element.scrollHeight + 2;
-    const nextHeight = Math.min(
-      Math.max(contentHeight, historyComposerMinHeight),
-      historyComposerMaxHeight,
-    );
-    element.style.height = nextHeight + 'px';
-    element.style.overflowY = contentHeight > historyComposerMaxHeight ? 'auto' : 'hidden';
+    element.measureNaturalHeight((measuredHeight) => {
+      if (promptTextareaRef.current !== element) return;
+      const contentHeight = measuredHeight + 2;
+      const nextHeight = Math.min(
+        Math.max(contentHeight, historyComposerMinHeight),
+        historyComposerMaxHeight,
+      );
+      element.style.height = nextHeight + 'px';
+      element.style.overflowY = contentHeight > historyComposerMaxHeight ? 'auto' : 'hidden';
+    });
   }, [historyComposerMaxHeight, historyComposerMinHeight]);
 
   const captureHistoryComposerViewFor = useCallback((
@@ -5494,7 +5497,9 @@ function AgentHistoryControls({
         });
         const resultOwnershipTransferred = queueSendTransferredOwnership(result);
         const auditProof = historyPromptHandoffAuditProofFromSendResult(result);
-        const lateAuditPending = result?.codexAudit?.lateReconciliationPending === true
+        const lateAuditPending = result?.auditPending === true
+          || result?.userMessageAuditPending === true
+          || result?.codexAudit?.lateReconciliationPending === true
           || result?.pasteAudit?.lateReconciliationPending === true;
         const finalAuditFailure = result?.success === false
           && result?.submitted === true
@@ -5527,12 +5532,13 @@ function AgentHistoryControls({
         }
         historyDiag('SEND_RESULT tab=' + tabId.slice(-12) +
           ' handoff=' + handoffId +
-          ' success=' + (result?.success !== false) +
+          ' success=' + (result?.success === null ? 'unknown' : result?.success !== false) +
           ' submitted=' + !!result?.submitted +
           ' chunks=' + (result?.chunksTotal ?? 'na') +
           ' error=' + (result?.error || '-'));
         sendOwnershipTransferred = resultOwnershipTransferred;
-        sendDeliveryUnconfirmed = result?.success === false && result?.submitted === true;
+        sendDeliveryUnconfirmed = result?.submitted === true
+          && (result?.success === false || lateAuditPending);
         sendRefusalPasteWritten = result?.pasteWritten === true;
         sendTransferredQueueStatus = resultQueueStatus;
         historyDiag('SEND_OWNERSHIP tab=' + tabId.slice(-12) +
@@ -5540,7 +5546,7 @@ function AgentHistoryControls({
           ' transferred=' + sendOwnershipTransferred +
           ' deliveryUnconfirmed=' + sendDeliveryUnconfirmed +
           ' submitted=' + !!result?.submitted +
-          ' success=' + (result?.success !== false));
+          ' success=' + (result?.success === null ? 'unknown' : result?.success !== false));
         if (!sendOwnershipTransferred) throw new Error(result?.error || 'Send failed before submit');
         if (!isCurrentAction()) return;
         onPromptStatusChange(
@@ -7220,7 +7226,9 @@ function AgentHistoryControls({
           >
             <span style={{ whiteSpace: 'nowrap' }}>REWIND PREVIEW</span>
             <span style={{ color: '#a1a1aa', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {rewindPreviewHiddenCount > 0 ? rewindPreviewHiddenCount + ' hidden' : 'unsaved'}
+              {rewindPreviewHiddenTurnCount > 0
+                ? rewindPreviewHiddenTurnCount + (rewindPreviewHiddenTurnCount === 1 ? ' turn hidden' : ' turns hidden')
+                : 'unsaved'}
             </span>
           </div>
         </Tooltip>
@@ -8294,7 +8302,7 @@ function HistoryPanel({
     // reuse the FIRST visit's snapshot forever.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyOwnerKey, historyOwnerVisit]);
-  const rewindPreviewHiddenCount = rewindPreviewResult.hiddenCount;
+  const rewindPreviewHiddenTurnCount = rewindPreviewResult.hiddenTurnCount;
   // Last entry uuid Claude's own backtrace reaches before stopping at the first
   // orphan. Any entry at index <= boundary is part of the chain-break zone:
   // visible in HistoryPanel through recovery, but unreachable by Claude's
@@ -11159,7 +11167,7 @@ function HistoryPanel({
       rewindPhase={activeRewindOperation?.phase}
       rewindMessage={activeRewindOperation?.message}
       rewindPreviewActive={!!rewindPreview}
-      rewindPreviewHiddenCount={rewindPreviewHiddenCount}
+      rewindPreviewHiddenTurnCount={rewindPreviewHiddenTurnCount}
       terminalOpen={terminalOpen}
       onToggleTerminal={onToggleTerminal}
       onSwapPrimarySurface={onSwapPrimarySurface}

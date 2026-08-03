@@ -27,7 +27,7 @@ const projects = [
   },
 ];
 
-test('projects appear once as headers, tabs ordered by global MRU', () => {
+test('rows follow strict global recency; project headers are TOC separators', () => {
   const rows = buildSwitcherRows({
     projects,
     globalMru: [
@@ -36,10 +36,38 @@ test('projects appear once as headers, tabs ordered by global MRU', () => {
       { projectId: 'p1', tabId: 'a' },
     ],
   });
+  // d(p2) → b,a(p1) by recency; unranked keep project order: c(p1) then e(p2).
+  // p2 header appears TWICE — headers split runs, they don't merge projects.
   assert.deepEqual(rows.map(r => r.kind === 'project' ? `P:${r.projectId}` : `t:${r.tab.id}`), [
-    'P:p2', 't:d', 't:e',
+    'P:p2', 't:d',
     'P:p1', 't:b', 't:a', 't:c',
+    'P:p2', 't:e',
   ]);
+});
+
+test('one hop reaches the previous project tab regardless of current project size', () => {
+  // User on p2/d; p1/a was previous. p2 has more tabs but the FIRST step from
+  // the top must land on a (the globally previous tab), not walk p2's tabs.
+  const manyTabsP2 = {
+    projectId: 'p2',
+    projectName: 'gt-editor',
+    tabs: [tab('d'), tab('e'), tab('f'), tab('g'), tab('h')],
+  };
+  const rows = buildSwitcherRows({
+    projects: [projects[0], manyTabsP2],
+    globalMru: [
+      { projectId: 'p2', tabId: 'd' }, // current
+      { projectId: 'p1', tabId: 'a' }, // previous
+      { projectId: 'p2', tabId: 'e' },
+    ],
+  });
+  const flat = rows.filter(r => r.kind === 'tab').map(r => r.tab.id);
+  assert.deepEqual(flat.slice(0, 3), ['d', 'a', 'e']);
+  const idx = initialCtrlIndex(rows, [
+    { projectId: 'p2', tabId: 'd' },
+    { projectId: 'p1', tabId: 'a' },
+  ], 'd');
+  assert.equal(rows[idx].tab.id, 'a');
 });
 
 test('selection skips project headers and wraps', () => {

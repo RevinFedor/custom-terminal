@@ -4,11 +4,13 @@
 // (most-recent-first). Output: flat rows where projects are non-selectable
 // headers and tabs are selectable entries grouped under their project.
 //
-// Rules (approved):
-//  • each project appears exactly once, projects ordered by the recency of
-//    their most recent tab (global MRU), then by projectHistory fallback;
-//  • tabs inside a project ordered by global MRU, unseen tabs keep natural
-//    tab order after the recent ones;
+// Rules (approved, revised 2026-08-02):
+//  • rows follow STRICT global tab recency (MRU) — the sequence never walks
+//    the current project's remaining tabs before reaching the previous tab
+//    of another project; unranked tabs go after all ranked ones in
+//    project/natural order;
+//  • project headers are pure TOC separators inserted at every project
+//    change in that flat sequence — the same project may head several runs;
 //  • selection skips project headers entirely (pos 1 → pos 3 jump);
 //  • initial selection in ctrl-mode = globally previous tab, even when it
 //    lives in another project;
@@ -42,48 +44,50 @@ export function buildSwitcherRows({ projects, globalMru = [], query = '' }) {
 
   const variants = query ? getLayoutVariants(query) : null;
 
-  const projectBlocks = projects
-    .map((project, projectIndex) => {
-      const tabs = (project.tabs || []).slice();
-      // Order: MRU-ranked first (ascending rank = most recent first), then
-      // the rest in natural order.
-      const ranked = tabs
-        .map((tab, naturalIndex) => ({ tab, naturalIndex, rank: mruRank.has(tab.id) ? mruRank.get(tab.id) : Infinity }))
-        .sort((a, b) => (a.rank - b.rank) || (a.naturalIndex - b.naturalIndex));
-
-      const projectNameLower = String(project.projectName || '').toLowerCase();
-      const projectMatches = variants ? variants.some(v => v && projectNameLower.includes(v)) : true;
-
-      const visible = ranked.filter(({ tab }) => {
-        if (!variants) return true;
-        if (projectMatches) return true;
+  // One flat pool across ALL projects, sorted by pure global recency. A
+  // project switch in the middle of the sequence just inserts a TOC header —
+  // it never pulls the rest of that project's tabs forward.
+  const pool = [];
+  projects.forEach((project, projectIndex) => {
+    const projectNameLower = String(project.projectName || '').toLowerCase();
+    const projectMatches = variants ? variants.some(v => v && projectNameLower.includes(v)) : true;
+    (project.tabs || []).forEach((tab, naturalIndex) => {
+      if (variants && !projectMatches) {
         const nameLower = String(tab.name || '').toLowerCase();
-        return variants.some(v => v && nameLower.includes(v));
+        if (!variants.some(v => v && nameLower.includes(v))) return;
+      }
+      pool.push({
+        project,
+        projectIndex,
+        naturalIndex,
+        tab,
+        rank: mruRank.has(tab.id) ? mruRank.get(tab.id) : Infinity,
       });
-
-      const bestRank = visible.reduce((min, { rank }) => Math.min(min, rank), Infinity);
-      return { project, projectIndex, visible, bestRank };
-    })
-    .filter(block => block.visible.length > 0)
-    .sort((a, b) => (a.bestRank - b.bestRank) || (a.projectIndex - b.projectIndex));
+    });
+  });
+  pool.sort((a, b) => (a.rank - b.rank)
+    || (a.projectIndex - b.projectIndex)
+    || (a.naturalIndex - b.naturalIndex));
 
   const rows = [];
-  for (const block of projectBlocks) {
-    rows.push({
-      kind: 'project',
-      projectId: block.project.projectId,
-      projectName: block.project.projectName,
-      projectIcon: block.project.projectIcon || null,
-    });
-    for (const { tab } of block.visible) {
+  let lastProjectId = null;
+  for (const entry of pool) {
+    if (entry.project.projectId !== lastProjectId) {
       rows.push({
-        kind: 'tab',
-        projectId: block.project.projectId,
-        projectName: block.project.projectName,
-        tab,
-        missing: !!tab.missing,
+        kind: 'project',
+        projectId: entry.project.projectId,
+        projectName: entry.project.projectName,
+        projectIcon: entry.project.projectIcon || null,
       });
+      lastProjectId = entry.project.projectId;
     }
+    rows.push({
+      kind: 'tab',
+      projectId: entry.project.projectId,
+      projectName: entry.project.projectName,
+      tab: entry.tab,
+      missing: !!entry.tab.missing,
+    });
   }
   return rows;
 }

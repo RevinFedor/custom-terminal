@@ -20,10 +20,12 @@ test('native Rewind moves the target prompt out of History and into draft owners
     source,
     'target',
     (entry) => entry.uuid === 'local-status',
+    (entry) => entry.role === 'user',
   );
 
   assert.deepEqual(projected.entries.map((entry) => entry.uuid), ['before', 'local-status']);
   assert.equal(projected.hiddenCount, 2, 'the restored target and old future are no longer sent History rows');
+  assert.equal(projected.hiddenTurnCount, 1, 'the target is one user turn');
   assert.deepEqual(source.map((entry) => entry.uuid), ['before', 'target', 'old-future', 'local-status']);
 });
 
@@ -32,6 +34,29 @@ test('native Rewind preview is a no-op when its exact target is absent', () => {
   const projected = projectNativeRewindPreview(source, 'missing', () => false);
   assert.strictEqual(projected.entries, source);
   assert.equal(projected.hiddenCount, 0);
+  assert.equal(projected.hiddenTurnCount, 0);
+});
+
+test('rewind preview counts user turns instead of raw assistant records', () => {
+  const assistantRecords = Array.from({ length: 300 }, (_, index) => ({
+    uuid: 'assistant-' + index,
+    role: 'assistant',
+  }));
+  const source = [
+    { uuid: 'before', role: 'assistant' },
+    { uuid: 'target', role: 'user' },
+    ...assistantRecords,
+  ];
+
+  const projected = projectNativeRewindPreview(
+    source,
+    'target',
+    () => false,
+    (entry) => entry.role === 'user',
+  );
+
+  assert.equal(projected.hiddenCount, 301);
+  assert.equal(projected.hiddenTurnCount, 1);
 });
 
 test('switching tabs preserves the independently owned rewind previews', () => {

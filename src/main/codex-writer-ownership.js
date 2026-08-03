@@ -1467,6 +1467,8 @@ function classifyCodexWriterAdoption({
   linkedBoundaryFound = false,
   sourceAppendObserved = false,
   sourceSubmitAuditPending = false,
+  resumeSubmitAuditPending = sourceSubmitAuditPending,
+  candidateSubmitAuditProven = false,
 } = {}) {
   // A process-owned source rollout plus task_started proves where Codex began
   // writing, but it does not prove that an automated paste supplied that turn's
@@ -1475,8 +1477,8 @@ function classifyCodexWriterAdoption({
   // continues to settle from the normal append/task boundary.
   if (
     sourceMode === 'resume'
-    && sourceMatch === 'source-in-place'
-    && sourceSubmitAuditPending === true
+    && resumeSubmitAuditPending === true
+    && candidateSubmitAuditProven !== true
   ) {
     return {
       status: 'provisional-source',
@@ -1491,6 +1493,40 @@ function classifyCodexWriterAdoption({
     return { status: 'provisional-source', sourceSettled: false };
   }
   return { status: 'commit', sourceSettled };
+}
+
+function selectCodexResumedSubmitWriter(matches, {
+  sourceSessionId = null,
+  launchId = null,
+  authorityId = null,
+  submitId = null,
+} = {}) {
+  const exact = (Array.isArray(matches) ? matches : []).filter((match) => {
+    const proof = match?.proof || match || null;
+    if (!proof?.sessionId
+      || proof.sourceSessionId !== sourceSessionId
+      || proof.launchId !== launchId
+      || proof.authorityId !== authorityId
+      || proof.submitId !== submitId) return false;
+    return proof.sessionId === sourceSessionId
+      || proof.forkedFromId === sourceSessionId;
+  });
+  if (exact.length === 0) {
+    return { status: 'pending', reason: 'causal-user-message-not-observed' };
+  }
+  if (exact.length !== 1) {
+    return {
+      status: 'ambiguous',
+      reason: 'multiple-causal-resume-writers',
+      matches: exact,
+    };
+  }
+  return {
+    status: 'selected',
+    match: exact[0],
+    candidate: exact[0]?.candidate || null,
+    proof: exact[0]?.proof || exact[0],
+  };
 }
 
 function isCodexResumeSourceAuditPending({
@@ -1747,6 +1783,7 @@ module.exports = {
   classifyManualCodexSubmitAfterWriteQueue,
   classifyCodexBranchWriterHandoffSettlement,
   classifyCodexWriterAdoption,
+  selectCodexResumedSubmitWriter,
   isCodexResumeSourceAuditPending,
   classifyCodexProvisionalActionAuthorization,
   classifyCodexWriterHandoffSettlement,

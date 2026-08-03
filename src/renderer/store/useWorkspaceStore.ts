@@ -24,6 +24,7 @@ import {
   dropProjectFromMru,
   touchMru,
 } from '../utils/tabSwitcherModel.mjs';
+import { resolveTabInsertionIndex } from '../utils/tabInsertionModel.mjs';
 import {
   addPane,
   removePaneByTab,
@@ -1335,6 +1336,12 @@ interface WorkspaceStore {
   // switcher commit, project click). Applies the approved split rules, then
   // falls through to switchTab/showWorkspace.
   activateTabEverywhere: (projectId: string, tabId: string) => void;
+  // Transient "reveal this tab in the sidebar list" request. Set by explicit
+  // activations (Ctrl+Tab / Cmd+P commit, split pane focus) so TabBar scrolls
+  // the row into view instantly — including right after a cross-project
+  // switch, where it wins over the per-project saved-scroll restore.
+  tabListRevealRequest: { projectId: string; tabId: string; seq: number } | null;
+  requestTabListReveal: (projectId: string, tabId: string) => void;
   isRestoring: boolean;
   pendingEditTabId: string | null; // Set after createTab to trigger inline rename; consumed once by TabBar
   tabTitleNamingIds: Set<string>; // Transient UI-only loader while Gemini generates a tab title
@@ -1359,7 +1366,7 @@ interface WorkspaceStore {
 
   // Tab management
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string) => Promise<TabHistoryRestoreResult>;
@@ -1769,6 +1776,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
+  tabListRevealRequest: null,
+  requestTabListReveal: (projectId, tabId) => {
+    const prev = get().tabListRevealRequest;
+    set({ tabListRevealRequest: { projectId, tabId, seq: (prev?.seq || 0) + 1 } });
+  },
+
   activateTabEverywhere: (projectId, tabId) => {
     // Split rules live inside switchTab (the single activation choke point);
     // this wrapper adds the cross-project view/focus follow-through.
@@ -1778,6 +1791,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (get().activeProjectId !== projectId || get().view !== 'workspace') {
       st.showWorkspace(projectId);
     }
+    // Reveal the row in the sidebar (instant, wins over saved-scroll restore
+    // after a project switch).
+    get().requestTabListReveal(projectId, tabId);
   },
   isRestoring: false,
   pendingEditTabId: null,
@@ -2726,19 +2742,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       ? (groupMemberIds[groupMemberIds.length - 1] || undefined)
       : (options?.afterTabId || workspace.activeTabId);
 
-    // Find position after the logical reference, or at the group's anchor.
-    let insertIndex = tabsArray.length;
-
-    if (targetGroupId && !referenceTabId) {
-      const targetGroup = workspace.tabGroups.find(group => group.id === targetGroupId);
-      const anchorIndex = targetGroup?.anchorTabId
-        ? tabsArray.findIndex(([id]) => id === targetGroup.anchorTabId)
-        : -1;
-      if (anchorIndex >= 0) insertIndex = anchorIndex;
-    } else if (referenceTabId) {
-      const currentIndex = tabsArray.findIndex(([id]) => id === referenceTabId);
-      if (currentIndex !== -1) insertIndex = currentIndex + 1;
-    }
+    const targetGroup = targetGroupId
+      ? workspace.tabGroups.find(group => group.id === targetGroupId)
+      : undefined;
+    const insertIndex = resolveTabInsertionIndex({
+      tabIds: tabsArray.map(([id]) => id),
+      appendToEnd: options?.appendToEnd === true,
+      referenceTabId,
+      groupAnchorTabId: targetGroup?.anchorTabId,
+    });
 
     // Insert tab at calculated position
     tabsArray.splice(insertIndex, 0, [tabId, newTab]);

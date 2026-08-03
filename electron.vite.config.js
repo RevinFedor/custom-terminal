@@ -48,6 +48,7 @@ renderer: {
     server: {
       // Isolated Electron E2E leases can run beside a developer's normal
       // :5182 instance without attaching to or restarting the wrong renderer.
+      host: process.env.NOTED_RENDERER_HOST || 'localhost',
       port: Number(process.env.NOTED_RENDERER_PORT || 5182),
       fs: { allow: ['.', SHARED_ROOT] }
     },

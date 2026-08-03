@@ -339,9 +339,11 @@ const {
 const {
   advanceOscCommandGeneration,
   attachCodexSettingsProofOwner,
+  authorizeCodexServiceTierProofOwnerHandoff,
   codexLiveSlashAllowsTurnBusy,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
+  createCodexServiceTierProof,
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,
   createCodexPtySubmitAdmission,
@@ -349,6 +351,7 @@ const {
   planCodexCommandLaunchSettings,
   planCodexLaunchSettings,
   planCodexPickerMovement,
+  preserveCodexServiceTierProofForTurnEnd,
   projectPendingCodexSettingsProofOwner,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
@@ -368,6 +371,15 @@ const {
   shouldFinishCodexDraftProofWait,
   shouldWaitForCodexDraftProof,
 } = require(path.join(srcMainDir, 'codex-draft-authority'));
+const {
+  CODEX_ACTION_PROFILE_NATIVE_REWIND,
+  CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT,
+  bindCodexActionAuthorityGeneration,
+  bindCodexActionAuthorityTarget,
+  createCodexActionAuthority,
+  transitionCodexActionAuthority,
+  validateCodexActionAuthority,
+} = require(path.join(srcMainDir, 'codex-action-authority'));
 const {
   classifyManualCodexSubmitAfterWriteQueue,
   classifyCodexBranchWriterHandoffSettlement,
@@ -392,6 +404,7 @@ const {
   isCodexResumeSourceAuditPending,
   shouldUseSettledCodexRewindWriterProof,
   selectCodexDelayedStableSourceWriter,
+  selectCodexResumedSubmitWriter,
   isCodexWriterProofOwnershipQuarantined,
   isRetryableCodexDescriptorProbeTimeout,
   runCodexDescriptorProbeWithSingleRetry,
@@ -4933,6 +4946,299 @@ const codexWriterReconcileInflight = new Map(); // tab/observer key → shared a
 const codexWriterSessionInflight = new Map(); // rollout sessionId → cross-tab ownership transaction
 const codexRewindReservations = new Map(); // tabId → the one destructive native Rewind currently authorized
 let codexRewindReservationSeq = 0;
+const codexActionAuthorities = new Map(); // `${profile}:${tabId}` → last exact action lease (including terminal states)
+const codexActionAuthorityTestWaiters = new Map(); // authorityId → DEV-only deterministic proof hold
+let codexActionAuthoritySeq = 0;
+
+function codexActionAuthorityKey(profile, tabId) {
+  return String(profile || '') + ':' + String(tabId || '');
+}
+
+function currentCodexActionAuthorityIdentity(tabId, authority, {
+  launchId = authority?.identity?.launchId || null,
+  sourceSessionId = authority?.identity?.sourceSessionId || null,
+  operationId = authority?.identity?.operationId || null,
+  requestId = authority?.identity?.requestId || null,
+} = {}) {
+  return {
+    terminalToken: terminals.get(tabId) || null,
+    projectId: resolveAuthoritativeTabProjectId(tabId),
+    tabId,
+    lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    launchId,
+    sourceSessionId,
+    persistedSessionId: codexSessionIdFromDb(tabId),
+    inputRevision: getTerminalInputRevision(tabId),
+    operationId,
+    requestId,
+  };
+}
+
+function publishCodexActionAuthorityState(authority, reason = null) {
+  if (!authority) return;
+  const detail = {
+    authorityId: authority.authorityId,
+    profile: authority.profile,
+    phase: authority.phase,
+    reason: reason || authority.reason || null,
+    tabId: authority.identity?.tabId || null,
+    projectId: authority.identity?.projectId || null,
+    lifecycleGeneration: authority.identity?.lifecycleGeneration || null,
+    runSeq: authority.identity?.runSeq ?? null,
+    launchId: authority.identity?.launchId || null,
+    actionGeneration: authority.actionGeneration || null,
+    sourceSessionId: authority.identity?.sourceSessionId || null,
+    persistedSessionId: authority.identity?.persistedSessionId || null,
+    inputRevision: authority.identity?.inputRevision ?? null,
+    operationId: authority.identity?.operationId || null,
+    requestId: authority.identity?.requestId || null,
+    target: authority.target ? { ...authority.target } : null,
+    at: authority.updatedAt || Date.now(),
+  };
+  console.warn('[CodexActionAuthority] profile=' + detail.profile
+    + ' state=' + detail.phase
+    + ' id=' + String(detail.authorityId || '').slice(-16)
+    + ' tab=' + String(detail.tabId || '').slice(-12)
+    + ' project=' + String(detail.projectId || '').slice(-12)
+    + ' source=' + String(detail.sourceSessionId || '').slice(0, 8)
+    + ' launch=' + (detail.launchId || '-')
+    + ' action=' + (detail.actionGeneration || '-')
+    + ' run=' + (detail.runSeq ?? '-')
+    + ' input=' + (detail.inputRevision ?? '-')
+    + (detail.reason ? ' reason=' + detail.reason : ''));
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:action-authority-state', detail);
+  }
+}
+
+function createMainCodexActionAuthority({
+  profile,
+  tabId,
+  launchId,
+  sourceSessionId,
+  operationId,
+  requestId,
+  target = null,
+}) {
+  const authorityId = profile + '-' + Date.now() + '-' + (++codexActionAuthoritySeq);
+  const created = createCodexActionAuthority({
+    authorityId,
+    profile,
+    identity: currentCodexActionAuthorityIdentity(tabId, null, {
+      launchId,
+      sourceSessionId,
+      operationId,
+      requestId,
+    }),
+    target,
+  });
+  if (!created.success) return created;
+  const key = codexActionAuthorityKey(profile, tabId);
+  const previous = codexActionAuthorities.get(key) || null;
+  if (previous && previous.phase !== 'revoked' && previous.phase !== 'committed') {
+    transitionMainCodexActionAuthority(previous, 'revoked', 'replaced-by-new-action');
+  }
+  codexActionAuthorities.set(key, created.authority);
+  publishCodexActionAuthorityState(created.authority);
+  return created;
+}
+
+function transitionMainCodexActionAuthority(authority, phase, reason = null) {
+  const result = transitionCodexActionAuthority(authority, phase, { reason });
+  if (result.success) {
+    publishCodexActionAuthorityState(authority, reason);
+    if (phase === 'revoked' || phase === 'committed') {
+      const waiter = codexActionAuthorityTestWaiters.get(authority.authorityId) || null;
+      if (waiter) {
+        codexActionAuthorityTestWaiters.delete(authority.authorityId);
+        waiter.resolve({ released: false, terminal: true, phase, reason });
+      }
+    }
+  }
+  return result;
+}
+
+function validateMainCodexActionAuthority(authority, options = {}) {
+  if (!authority) return { valid: false, reason: 'action-authority-missing' };
+  const tabId = authority.identity?.tabId || null;
+  return validateCodexActionAuthority(
+    authority,
+    currentCodexActionAuthorityIdentity(tabId, authority, options),
+    options,
+  );
+}
+
+function validateConsumedCodexResumedSubmitAuthority(authority, reservation, {
+  allowPersistedWriterAdoption = false,
+} = {}) {
+  if (!authority || !reservation) {
+    return { valid: false, reason: 'action-authority-missing' };
+  }
+  const currentIdentity = currentCodexActionAuthorityIdentity(
+    authority.identity?.tabId || null,
+    authority,
+    {
+      launchId: reservation.launchId,
+      sourceSessionId: reservation.sourceSessionId,
+    },
+  );
+  // Input ownership is consumed at the paste/Enter boundary. Later manual
+  // keystrokes cannot unsend that Enter and must not prevent its exact rollout
+  // record from reconciling. Every process/terminal/project/run/launch owner is
+  // still checked against the original lease.
+  currentIdentity.inputRevision = authority.identity.inputRevision;
+  if (allowPersistedWriterAdoption) {
+    currentIdentity.persistedSessionId = authority.identity.persistedSessionId;
+  }
+  return validateCodexActionAuthority(authority, currentIdentity, {
+    phases: ['consumed'],
+    profile: CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT,
+    target: authority.target,
+  });
+}
+
+function revokeCodexActionAuthoritiesForTab(tabId, reason, {
+  exceptAuthority = null,
+  profile = null,
+} = {}) {
+  let revoked = 0;
+  for (const authority of codexActionAuthorities.values()) {
+    if (authority?.identity?.tabId !== tabId
+      || authority === exceptAuthority
+      || (profile && authority.profile !== profile)
+      || authority.phase === 'revoked'
+      || authority.phase === 'committed') continue;
+    if (transitionMainCodexActionAuthority(authority, 'revoked', reason).success) revoked += 1;
+  }
+  return revoked;
+}
+
+function revokeCodexActionAuthoritiesForManualInput(tabId) {
+  const observer = codexWatchers.get(tabId) || null;
+  const manualRewindAuthority = observer?.manualRewind
+    ? observer.actionAuthority || null
+    : null;
+  const submittedAuthority = observer?.provisionalSubmitReservation?.enterWritten === true
+    ? observer.provisionalSubmitReservation.actionAuthority || null
+    : null;
+  let revoked = 0;
+  for (const authority of codexActionAuthorities.values()) {
+    if (authority?.identity?.tabId !== tabId
+      || authority === manualRewindAuthority
+      || authority === submittedAuthority
+      || authority.phase === 'revoked'
+      || authority.phase === 'committed') continue;
+    if (transitionMainCodexActionAuthority(authority, 'revoked', 'manual-input').success) {
+      revoked += 1;
+    }
+  }
+  return revoked;
+}
+
+function revokeCodexActionAuthoritiesForWriterAdoption(tabId, sessionId) {
+  const observer = codexWatchers.get(tabId) || null;
+  const rewindAuthority = observer?.sourceMode === 'writer-handoff'
+    ? observer.actionAuthority || null
+    : null;
+  const submitReservation = observer?.provisionalSubmitReservation || null;
+  const submitAuthority = submitReservation?.actionAuthority || null;
+  const causalSessionId = submitReservation?.causalWriterProof?.sessionId || null;
+  let revoked = 0;
+  for (const authority of codexActionAuthorities.values()) {
+    if (authority?.identity?.tabId !== tabId
+      || authority.phase === 'revoked'
+      || authority.phase === 'committed') continue;
+    const exactRewindHandoff = authority === rewindAuthority;
+    const exactSubmitHandoff = authority === submitAuthority
+      && (
+        sessionId === submitReservation.sourceSessionId
+        || sessionId === causalSessionId
+      );
+    if (exactRewindHandoff || exactSubmitHandoff) continue;
+    if (transitionMainCodexActionAuthority(authority, 'revoked', 'competing-writer-adopted').success) {
+      revoked += 1;
+    }
+  }
+  return revoked;
+}
+
+function codexActionAuthorityTestHoldEnabled(profile) {
+  if (!isDev || process.env.NOTED_E2E_TEST !== 'true') return false;
+  const configured = String(process.env.NOTED_E2E_CODEX_ACTION_AUTHORITY_HOLD || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return configured.includes('*') || configured.includes(profile);
+}
+
+async function waitForCodexActionAuthorityTestRelease(authority) {
+  if (!authority || !codexActionAuthorityTestHoldEnabled(authority.profile)) {
+    return { released: true, held: false };
+  }
+  let resolveWaiter;
+  const promise = new Promise((resolve) => { resolveWaiter = resolve; });
+  codexActionAuthorityTestWaiters.set(authority.authorityId, {
+    authority,
+    resolve: resolveWaiter,
+  });
+  console.warn('[CodexActionAuthority] DEV hold armed profile=' + authority.profile
+    + ' id=' + authority.authorityId
+    + ' tab=' + String(authority.identity?.tabId || '').slice(-12));
+  return promise;
+}
+
+ipcMain.handle('__test:codex-action-authority', (_event, payload = {}) => {
+  if (!isDev || process.env.NOTED_E2E_TEST !== 'true') {
+    return { success: false, error: 'test_hook_disabled' };
+  }
+  const action = String(payload.action || 'snapshot');
+  const profile = String(payload.profile || '');
+  const tabId = String(payload.tabId || '');
+  if (action === 'snapshot') {
+    const authorities = [...codexActionAuthorities.values()]
+      .filter((authority) => (!profile || authority.profile === profile)
+        && (!tabId || authority.identity?.tabId === tabId))
+      .map((authority) => ({
+        authorityId: authority.authorityId,
+        profile: authority.profile,
+        phase: authority.phase,
+        reason: authority.reason || null,
+        tabId: authority.identity?.tabId || null,
+        projectId: authority.identity?.projectId || null,
+        lifecycleGeneration: authority.identity?.lifecycleGeneration || null,
+        runSeq: authority.identity?.runSeq ?? null,
+        launchId: authority.identity?.launchId || null,
+        actionGeneration: authority.actionGeneration || null,
+        sourceSessionId: authority.identity?.sourceSessionId || null,
+        persistedSessionId: authority.identity?.persistedSessionId || null,
+        inputRevision: authority.identity?.inputRevision ?? null,
+        operationId: authority.identity?.operationId || null,
+        requestId: authority.identity?.requestId || null,
+        target: authority.target ? { ...authority.target } : null,
+        held: codexActionAuthorityTestWaiters.has(authority.authorityId),
+      }));
+    return { success: true, authorities };
+  }
+  if (action === 'release') {
+    const authority = codexActionAuthorities.get(codexActionAuthorityKey(profile, tabId)) || null;
+    const waiter = authority
+      ? codexActionAuthorityTestWaiters.get(authority.authorityId) || null
+      : null;
+    if (!waiter) return { success: false, error: 'test_hold_not_found' };
+    codexActionAuthorityTestWaiters.delete(authority.authorityId);
+    waiter.resolve({ released: true, held: true });
+    return { success: true, authorityId: authority.authorityId };
+  }
+  if (action === 'clear') {
+    for (const [authorityId, waiter] of codexActionAuthorityTestWaiters.entries()) {
+      codexActionAuthorityTestWaiters.delete(authorityId);
+      waiter.resolve({ released: false, terminal: true, reason: 'test-clear' });
+    }
+    return { success: true };
+  }
+  return { success: false, error: 'test_action_unknown' };
+});
 // Rewind UI can outlive a renderer mount and cancellation can race the final
 // Enter. Keep operation ownership in main so a stale component cannot cancel a
 // newer rewind, and so cancellation never types `q` after mutation began.
@@ -6178,6 +6484,28 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
   if (!tabId || !sessionId) {
     return { success: false, error: 'codex_writer_identity_invalid', retryable: false };
   }
+  const existingTierProof = codexTuiReadyMeta.get(tabId)?.serviceTierProof || null;
+  const incomingLaunchId = String(proof?.launchId || '').trim();
+  const currentTierLifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  const serviceTierGenerationMode = incomingLaunchId ? 'launch' : 'terminal-run';
+  const serviceTierGenerationId = incomingLaunchId || currentTierLifecycleGeneration;
+  const serviceTierOwnerHandoff = authorizeCodexServiceTierProofOwnerHandoff(
+    existingTierProof,
+    {
+      sourceOwnerId: incomingLaunchId
+        ? 'launch:' + incomingLaunchId
+        : currentTierLifecycleGeneration
+          ? 'terminal-run:' + currentTierLifecycleGeneration
+          : null,
+      targetOwnerId: sessionId,
+      terminalToken: terminals.get(tabId) || null,
+      terminalLifecycleGeneration: currentTierLifecycleGeneration,
+      terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      launchId: incomingLaunchId || null,
+      generationMode: serviceTierGenerationMode,
+      generationId: serviceTierGenerationId,
+    },
+  );
   const pendingSettingsProof = codexPendingSettingsProofHandoffs.get(tabId) || null;
   const pendingSettingsCarry = consumePendingCodexSettingsProofHandoff(
     pendingSettingsProof,
@@ -6188,12 +6516,20 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
       writerSessionId: sessionId,
     },
   );
+  const exactSettingsProofToPersist = pendingSettingsCarry.carry
+    ? {
+      ...pendingSettingsCarry.proof,
+      ...(serviceTierOwnerHandoff.allowed
+        ? { fast: serviceTierOwnerHandoff.proof.fast }
+        : {}),
+    }
+    : null;
   const persisted = durableBinding?.success === true
     ? durableBinding
     : persistCodexKnownSessionBinding(
       tabId,
       sessionId,
-      pendingSettingsCarry.carry ? pendingSettingsCarry.proof : null,
+      exactSettingsProofToPersist,
     );
   if (persisted?.success !== true) {
     console.warn('[Codex:Known] persist pending tab=' + String(tabId).slice(-12)
@@ -6217,6 +6553,9 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
   }
   const prev = codexKnownSessions.get(tabId) || null;
   const prevProof = codexWriterProofs.get(tabId) || null;
+  if (prev !== sessionId) {
+    revokeCodexActionAuthoritiesForWriterAdoption(tabId, sessionId);
+  }
   codexKnownSessions.set(tabId, sessionId);
   const proofRecord = {
     sessionId,
@@ -6235,7 +6574,7 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
     sourceSessionId: proof?.sourceSessionId || null,
     carryCodexSettingsProof: proof?.carryCodexSettingsProof === true
       || pendingSettingsCarry.carry === true,
-    codexSettingsProof: pendingSettingsCarry.proof || null,
+    codexSettingsProof: exactSettingsProofToPersist,
     valid: true,
     invalidatedAt: null,
     invalidatedReason: null,
@@ -6260,8 +6599,15 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
       requiresExactCodexSettingsProof: !!pendingSettingsProof,
     });
   }
-  const carriedFast = pendingSettingsCarry.proof?.fast;
-  if (typeof carriedFast === 'boolean') {
+  const carriedFast = exactSettingsProofToPersist?.fast;
+  if (serviceTierOwnerHandoff.allowed) {
+    publishCodexServiceTierProof(
+      tabId,
+      serviceTierOwnerHandoff.serviceTier,
+      'exact-first-writer-service-tier-handoff',
+      sessionId,
+    );
+  } else if (typeof carriedFast === 'boolean') {
     publishCodexServiceTierProof(
       tabId,
       carriedFast ? 'priority' : 'default',
@@ -6269,7 +6615,6 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
       sessionId,
     );
   } else if (proofRecord.carryCodexSettingsProof) {
-    const existingTierProof = codexTuiReadyMeta.get(tabId)?.serviceTierProof || null;
     if (existingTierProof?.ownerId === prev) {
       publishCodexServiceTierProof(
         tabId,
@@ -6279,6 +6624,7 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
       );
     }
   }
+  reconcileCodexServiceTierProofIdentity(tabId, 'writer-adoption');
   if (proofChanged) {
     console.log('[Codex:Known] set tab=' + String(tabId).slice(-12) +
       ' session=' + String(sessionId).slice(0, 8) +
@@ -6334,6 +6680,133 @@ function getCodexProvisionalSettingsSnapshot(tabId, expectedOwnerId = null) {
   };
 }
 
+function getCurrentCodexServiceTierProofIdentity(tabId, explicitOwnerId = null) {
+  if (!tabId) return { success: false, reason: 'tab-missing' };
+  const terminalToken = terminals.get(tabId) || null;
+  const terminalLifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  const terminalRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  if (!terminalToken
+    || !terminalLifecycleGeneration
+    || !Number.isInteger(terminalRunSeq)
+    || terminalRunSeq <= 0) {
+    return { success: false, reason: 'terminal-generation-unproven' };
+  }
+
+  const writerProof = getCodexWriterProofSnapshot(tabId);
+  const provisional = writerProof ? null : getCodexProvisionalSettingsSnapshot(tabId);
+  const writerOwnerId = String(writerProof?.sessionId || '').trim();
+  const provisionalOwnerId = String(provisional?.codexProvisionalSettingsOwnerId || '').trim();
+  const terminalRunOwnerId = !writerOwnerId
+    && !provisionalOwnerId
+    && terminalCommandState.get(tabId)?.isRunning === true
+    && codexTuiReadyTabs.has(tabId)
+    ? 'terminal-run:' + terminalLifecycleGeneration
+    : '';
+  const requestedOwnerId = String(explicitOwnerId || '').trim();
+  if (requestedOwnerId
+    && requestedOwnerId !== writerOwnerId
+    && requestedOwnerId !== provisionalOwnerId
+    && requestedOwnerId !== terminalRunOwnerId) {
+    return { success: false, reason: 'proof-owner-not-current' };
+  }
+  const ownerId = requestedOwnerId || writerOwnerId || provisionalOwnerId || terminalRunOwnerId;
+  if (!ownerId) return { success: false, reason: 'proof-owner-unproven' };
+
+  const launchId = ownerId === writerOwnerId
+    ? String(writerProof?.launchId || '').trim()
+    : ownerId === provisionalOwnerId
+      ? String(provisional?.codexProvisionalSettingsLaunchId || '').trim()
+      : '';
+  const generationMode = launchId ? 'launch' : 'terminal-run';
+  const generationId = launchId || terminalLifecycleGeneration;
+
+  return {
+    success: true,
+    ownerId,
+    terminalToken,
+    terminalLifecycleGeneration,
+    terminalRunSeq,
+    generationMode,
+    generationId,
+    launchId: launchId || null,
+  };
+}
+
+function clearCodexServiceTierProof(
+  tabId,
+  reason = 'ownership-unknown',
+  expectedOwnerId = null,
+  { emit = true } = {},
+) {
+  if (!tabId) return false;
+  const previousMeta = codexTuiReadyMeta.get(tabId) || null;
+  const previousProof = previousMeta?.serviceTierProof || null;
+  if (!previousProof) return false;
+  if (expectedOwnerId && previousProof.ownerId !== expectedOwnerId) return false;
+  const { serviceTierProof: _discardedProof, ...remainingMeta } = previousMeta;
+  codexTuiReadyMeta.set(tabId, remainingMeta);
+  console.warn('[CodexServiceTier] proof cleared tab=' + String(tabId).slice(-12)
+    + ' owner=' + String(previousProof.ownerId || 'none').slice(0, 24)
+    + ' reason=' + reason);
+  if (emit && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:service-tier-proof', {
+      tabId,
+      ownerId: previousProof.ownerId || null,
+      serviceTier: null,
+      cleared: true,
+      reason,
+    });
+  }
+  return true;
+}
+
+function reconcileCodexServiceTierProofIdentity(tabId, reason = 'identity-refresh') {
+  const proof = codexTuiReadyMeta.get(tabId)?.serviceTierProof || null;
+  if (!proof) return { preserved: false, proof: null, reason: 'proof-missing' };
+  const identity = getCurrentCodexServiceTierProofIdentity(tabId);
+  const result = identity.success === true
+    ? preserveCodexServiceTierProofForTurnEnd(proof, identity)
+    : { preserved: false, proof: null, reason: identity.reason };
+  if (!result.preserved) {
+    clearCodexServiceTierProof(tabId, reason + ':' + result.reason);
+  }
+  return result;
+}
+
+function syncPendingCodexServiceTierProof(tabId, proof, identity) {
+  const pending = codexPendingSettingsProofHandoffs.get(tabId) || null;
+  const expectedMode = pending?.generationMode === 'terminal-run'
+    ? 'terminal-run'
+    : 'launch';
+  const expectedOwnerId = expectedMode === 'launch'
+    ? 'launch:' + String(pending?.launchId || '')
+    : 'terminal-run:' + String(identity?.terminalLifecycleGeneration || '');
+  if (!pending
+    || !['launch', 'terminal-run'].includes(pending.generationMode)
+    || (expectedMode === 'launch' && !pending.launchId)
+    || identity?.ownerId !== expectedOwnerId
+    || identity?.terminalToken !== pending.terminalToken
+    || Number(identity?.terminalRunSeq) !== Number(pending.runSeq)
+    || identity?.generationMode !== expectedMode
+    || (expectedMode === 'launch' && identity?.launchId !== pending.launchId)
+    || (expectedMode === 'terminal-run'
+      && identity?.generationId !== identity?.terminalLifecycleGeneration)
+    || typeof proof?.fast !== 'boolean') {
+    return false;
+  }
+  if (pending.fast === proof.fast) return true;
+  codexPendingSettingsProofHandoffs.set(tabId, {
+    ...pending,
+    fast: proof.fast,
+  });
+  console.log('[CodexSettingsProof] provisional FAST proof refreshed tab='
+    + String(tabId).slice(-12)
+    + ' generation=' + (pending.launchId || identity.generationId || '-')
+    + ' fast=' + proof.fast
+    + ' source=' + (proof.source || '-'));
+  return true;
+}
+
 function publishCodexServiceTierProof(
   tabId,
   serviceTier,
@@ -6344,32 +6817,51 @@ function publishCodexServiceTierProof(
   if (!tabId) return null;
   const normalizedTier = String(serviceTier || '').trim().toLowerCase();
   if (normalizedTier !== 'priority' && normalizedTier !== 'default') return null;
-  const writerOwner = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
-  const provisionalOwner = getCodexProvisionalSettingsSnapshot(tabId)
-    ?.codexProvisionalSettingsOwnerId || null;
-  const ownerId = String(explicitOwnerId || writerOwner || provisionalOwner || '').trim();
-  if (!ownerId) return null;
+  const identity = getCurrentCodexServiceTierProofIdentity(tabId, explicitOwnerId);
+  if (identity.success !== true) {
+    console.warn('[CodexServiceTier] proof rejected tab=' + String(tabId).slice(-12)
+      + ' tier=' + normalizedTier
+      + ' source=' + String(source || 'tui')
+      + ' reason=' + identity.reason);
+    return null;
+  }
 
   const previousMeta = codexTuiReadyMeta.get(tabId) || {};
   const previousProof = previousMeta.serviceTierProof || null;
-  const proof = {
-    ownerId,
+  const reusableProof = previousProof?.serviceTier === normalizedTier
+    ? preserveCodexServiceTierProofForTurnEnd(previousProof, identity)
+    : { preserved: false, proof: null };
+  if (reusableProof.preserved) {
+    // Repeated footer frames are observations of the same fact, not a new
+    // service-tier transition. Keep the exact proof timestamp/source/object so
+    // an ordinary prompt + task_complete cannot appear to have replaced it.
+    syncPendingCodexServiceTierProof(tabId, reusableProof.proof, identity);
+    return reusableProof.proof;
+  }
+  const proof = createCodexServiceTierProof({
+    ...identity,
     serviceTier: normalizedTier,
-    fast: normalizedTier === 'priority',
     proofAt: Date.now(),
     source: String(source || 'tui'),
-  };
+  });
+  if (!proof) return null;
   codexTuiReadyMeta.set(tabId, {
     ...previousMeta,
     serviceTierProof: proof,
   });
+  syncPendingCodexServiceTierProof(tabId, proof, identity);
   const changed = previousProof?.ownerId !== proof.ownerId
-    || previousProof?.serviceTier !== proof.serviceTier;
+    || previousProof?.serviceTier !== proof.serviceTier
+    || previousProof?.terminalLifecycleGeneration !== proof.terminalLifecycleGeneration
+    || Number(previousProof?.terminalRunSeq) !== proof.terminalRunSeq
+    || previousProof?.launchId !== proof.launchId;
   if (changed) {
     console.log('[CodexServiceTier] proof tab=' + String(tabId).slice(-12)
-      + ' owner=' + ownerId.slice(0, 24)
+      + ' owner=' + proof.ownerId.slice(0, 24)
       + ' tier=' + normalizedTier
-      + ' source=' + proof.source);
+      + ' source=' + proof.source
+      + ' launch=' + proof.launchId
+      + ' run=' + proof.terminalRunSeq);
   }
   if (emit && changed && mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('codex:service-tier-proof', {
@@ -6420,6 +6912,7 @@ function invalidateCodexWriterProof(tabId, reason = 'unproven') {
     console.warn('[CodexWriterProof] invalidate tab=' + String(tabId).slice(-12)
       + ' session=' + String(proof.sessionId || 'none').slice(0, 8)
       + ' reason=' + reason);
+    clearCodexServiceTierProof(tabId, 'writer-proof-invalidated:' + reason);
   }
   return changed;
 }
@@ -6427,6 +6920,7 @@ function invalidateCodexWriterProof(tabId, reason = 'unproven') {
 function clearCodexKnownSession(tabId, reason = 'clear') {
   closeCodexDelayedWriterObserver(tabId, reason);
   const sid = codexKnownSessions.get(tabId) || null;
+  clearCodexServiceTierProof(tabId, 'known-writer-cleared:' + reason);
   if (codexPreclaimedCommandGenerations.delete(tabId)) {
     console.log('[CodexGeneration] preclaimed launch generation cleared tab='
       + String(tabId).slice(-12)
@@ -6618,6 +7112,7 @@ function markCodexManualActionRequired(tabId, type, inspected = {}, clean = '', 
   codexTuiReadyQuietTimers.delete(tabId);
   codexTuiReadyBuffers.delete(tabId);
   codexTuiReadyRejectKeys.delete(tabId);
+  clearCodexServiceTierProof(tabId, 'manual-action-required:' + type);
   codexTuiReadyMeta.delete(tabId);
   codexStartupNoStateTimeoutTabs.delete(tabId);
   codexTuiReadyTabs.delete(tabId);
@@ -6982,6 +7477,7 @@ function markAiStopping(tabId, toolType, reason = 'manual-stop', options = {}) {
   };
   aiStoppingTabs.set(tabId, state);
   if (resolvedTool === 'codex') {
+    revokeCodexActionAuthoritiesForTab(tabId, 'stop-start:' + reason);
     invalidateCodexExitObservers(tabId, 'stop-start:' + reason);
   }
   console.log('[AgentStopping] start tab=' + String(tabId).slice(-12) +
@@ -9897,7 +10393,7 @@ function createWindow() {
   const windowOptions = {
     width: 1900,
     height: 1000,
-    show: false, // Don't show until ready-to-show
+    show: process.env.NOTED_E2E_TEST === 'true', // E2E renderers must not wait on first-paint visibility.
     backgroundColor: '#1a1a1a', // Dark background instead of white flash
     titleBarStyle: 'hidden',
     titleBarOverlay: {
@@ -9959,15 +10455,19 @@ function createWindow() {
     }
   }
 
-  // Load from Vite dev server in dev mode, or from built files in production
-  if (process.env.ELECTRON_RENDERER_URL) {
+  // Load from Vite dev server in dev mode, or from built files in production.
+  // Isolated E2E launches can use the freshly built renderer to avoid sharing
+  // a developer's Vite navigation and DevTools target.
+  const useBuiltRendererForE2E = process.env.NOTED_E2E_TEST === 'true'
+    && process.env.NOTED_E2E_USE_BUILT_RENDERER === 'true';
+  if (process.env.ELECTRON_RENDERER_URL && !useBuiltRendererForE2E) {
     console.log('[Window] Loading URL:', process.env.ELECTRON_RENDERER_URL);
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
-    mainWindow.webContents.openDevTools();
-  } else if (isDev) {
+    if (process.env.NOTED_E2E_TEST !== 'true') mainWindow.webContents.openDevTools();
+  } else if (isDev && !useBuiltRendererForE2E) {
     console.log('[Window] Loading fallback URL: http://localhost:5182');
     mainWindow.loadURL('http://localhost:5182');
-    mainWindow.webContents.openDevTools();
+    if (process.env.NOTED_E2E_TEST !== 'true') mainWindow.webContents.openDevTools();
   } else {
     const filePath = path.join(__dirname, '..', 'renderer', 'index.html');
     console.log('[Window] Loading file:', filePath);
@@ -14085,6 +14585,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     console.log(`[PTY:CREATED] tabId=${tabId} pid=${ptyProcess.pid} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)} initialCommand=${initialCommand ? JSON.stringify(initialCommand) : 'none'}`);
 
     terminalCwdChangeProofs.cancel(tabId, null, 'terminal_generation_changed');
+    revokeCodexActionAuthoritiesForTab(tabId, 'terminal-replaced');
     terminals.set(tabId, ptyProcess);
     terminalShellReadiness.reset(tabId, ptyProcess, ptyProcess.pid);
     terminalProjects.set(tabId, workingDir);
@@ -15140,10 +15641,14 @@ function compatiblePromptAuditExecutionContext(detail, candidate) {
   return { context: candidate, reason: null };
 }
 
-function routeAgentPromptAuditDetail(detail) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
+function routeAgentPromptAuditDetail(detail, {
+  renderer = true,
+  web = true,
+} = {}) {
+  if (renderer && mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('agent-prompt:audit-result', detail);
   }
+  if (!web) return;
   try {
     const routeAudit = require(path.join(srcMainDir, 'web-server')).notifyAgentPromptAuditResult;
     const routed = typeof routeAudit === 'function' ? routeAudit(detail) : null;
@@ -15192,7 +15697,7 @@ function replayDeferredCodexPromptAuditExecutionContext(tabId) {
     executionContext: activeContext,
     executionContextSource: 'codex-task-started',
     executionContextDiagnostic: null,
-  });
+  }, { renderer: false, web: true });
 }
 
 function discardDeferredCodexPromptAuditExecutionContexts(tabId, reason) {
@@ -15244,12 +15749,17 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
         || audit.executionContextDiagnostic
         || contextVerdict.reason),
   };
-  routeAgentPromptAuditDetail(detail);
   if (isOrchestrationTargetPromptAudit(detail)
     && !detail.executionContext
     && toolType === 'codex') {
+    // History may reconcile the exact local prompt immediately, but the
+    // orchestration result tracker must not start on the saved Resume source.
+    // Route it only after task_started supplies the exact adopted writer.
+    routeAgentPromptAuditDetail(detail, { renderer: true, web: false });
     deferCodexPromptAuditExecutionContext(detail);
+    return;
   }
+  routeAgentPromptAuditDetail(detail);
 }
 
 function finishClaudePasteAudit(tabId, audit, result) {
@@ -15877,6 +16387,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   let awaitCodexUserMessageAudit = requestedCodexUserMessageAudit;
   let codexPromptInFlightState = null;
   let codexSubmissionWatcher = null;
+  let codexSubmitAuthority = null;
+  let codexSubmitId = null;
   let codexPtyAdmission = null;
   let claudePromptQueuePtyAdmission = null;
   let stagedCodexImageRefs = [];
@@ -16051,6 +16563,69 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     content = prepared.text;
     stagedCodexImageRefs = prepared.staged;
     codexImagePasteSegments = prepared.replaced > 0 ? prepared.segments : null;
+  }
+  if (codexSubmissionWatcher?.reservation) {
+    const expectedHash = pasteAuditHash(content);
+    codexSubmitId = handoffId
+      || ('codex-submit-' + Date.now() + '-' + crypto.randomBytes(6).toString('hex'));
+    const submitTarget = {
+      handoffId: handoffId || null,
+      expectedHash,
+      expectedLen: content.length,
+    };
+    const createdAuthority = createMainCodexActionAuthority({
+      profile: CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT,
+      tabId: broadcastTabId,
+      launchId: codexSubmissionWatcher.launchId,
+      sourceSessionId: codexSubmissionWatcher.sessionId,
+      operationId: codexSubmitId,
+      requestId: codexSubmitId,
+      target: submitTarget,
+    });
+    if (!createdAuthority.success) {
+      return {
+        success: false,
+        error: 'codex_submit_action_authority_unavailable',
+        authorityError: createdAuthority.error,
+        submitted: false,
+      };
+    }
+    codexSubmitAuthority = createdAuthority.authority;
+    codexSubmissionWatcher.reservation.actionAuthority = codexSubmitAuthority;
+    codexSubmissionWatcher.reservation.submitId = codexSubmitId;
+    codexSubmissionWatcher.reservation.expectedHash = expectedHash;
+    codexSubmissionWatcher.reservation.expectedLen = content.length;
+    codexSubmissionWatcher.reservation.handoffId = handoffId || null;
+    transitionMainCodexActionAuthority(
+      codexSubmitAuthority,
+      'waiting',
+      'awaiting-resume-submit-arm',
+    );
+    const authorityVerdict = validateMainCodexActionAuthority(codexSubmitAuthority, {
+      phases: ['waiting'],
+      profile: CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT,
+      launchId: codexSubmissionWatcher.launchId,
+      sourceSessionId: codexSubmissionWatcher.sessionId,
+      target: submitTarget,
+    });
+    if (!authorityVerdict.valid) {
+      transitionMainCodexActionAuthority(
+        codexSubmitAuthority,
+        'revoked',
+        authorityVerdict.reason,
+      );
+      return {
+        success: false,
+        error: 'codex_submit_action_authority_revoked',
+        authorityReason: authorityVerdict.reason,
+        submitted: false,
+      };
+    }
+    transitionMainCodexActionAuthority(
+      codexSubmitAuthority,
+      'armed',
+      'resume-submit-authority-armed',
+    );
   }
   if (
     submit
@@ -16386,6 +16961,51 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       };
     }
   }
+  if (codexSubmitAuthority) {
+    const exactReservation = codexSubmissionWatcher?.reservation || null;
+    const currentDiscovery = codexWatchers.get(broadcastTabId) || null;
+    const authorityAtPaste = validateMainCodexActionAuthority(codexSubmitAuthority, {
+      phases: ['armed'],
+      profile: CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT,
+      launchId: codexSubmissionWatcher.launchId,
+      sourceSessionId: codexSubmissionWatcher.sessionId,
+      target: codexSubmitAuthority.target,
+    });
+    const exactObserverAtPaste = !!currentDiscovery
+      && currentDiscovery.provisionalSubmitReservation === exactReservation
+      && exactReservation?.actionAuthority === codexSubmitAuthority
+      && currentDiscovery.launchId === codexSubmissionWatcher.launchId
+      && currentDiscovery.sourceSessionId === codexSubmissionWatcher.sessionId;
+    if (!authorityAtPaste.valid || !exactObserverAtPaste) {
+      if (codexSubmitAuthority.phase !== 'revoked') {
+        transitionMainCodexActionAuthority(
+          codexSubmitAuthority,
+          'revoked',
+          authorityAtPaste.reason || 'resume-submit-observer-changed-before-paste',
+        );
+      }
+      return {
+        success: false,
+        error: 'codex_submit_action_authority_revoked',
+        authorityReason: authorityAtPaste.reason || 'resume-submit-observer-changed-before-paste',
+        submitted: false,
+        pasteWritten: false,
+      };
+    }
+    const consumed = transitionMainCodexActionAuthority(
+      codexSubmitAuthority,
+      'consumed',
+      'resume-submit-paste-boundary',
+    );
+    if (!consumed.success) {
+      return {
+        success: false,
+        error: 'codex_submit_action_authority_not_consumed',
+        submitted: false,
+        pasteWritten: false,
+      };
+    }
+  }
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     let payload = chunk.text;
@@ -16619,7 +17239,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         const expectedHash = pasteAuditHash(content);
         const sentAt = Date.now();
         stagedCodexAudit = {
-          submitId: handoffId
+          submitId: codexSubmitId
+            || handoffId
             || ('codex-submit-' + sentAt + '-' + crypto.randomBytes(6).toString('hex')),
           handoffId: handoffId || null,
           source: source || null,
@@ -16641,6 +17262,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           preSubmitBoundary: captureCodexPromptAuditBoundary(broadcastTabId, sentAt),
           submitWritten: false,
           delayedStableSourceSubmit: null,
+          actionAuthority: codexSubmitAuthority,
+          actionAuthorityId: codexSubmitAuthority?.authorityId || null,
         };
         enqueueCodexPasteAudit(broadcastTabId, stagedCodexAudit);
         const delayedStableSourceSubmit = armPendingCodexNativeRewindStableSourceSubmit(
@@ -16784,6 +17407,42 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         };
       }
     }
+    if (codexSubmitAuthority) {
+      const exactReservation = codexSubmissionWatcher?.reservation || null;
+      const currentDiscovery = codexWatchers.get(broadcastTabId) || null;
+      const authorityAtEnter = validateMainCodexActionAuthority(codexSubmitAuthority, {
+        phases: ['consumed'],
+        profile: CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT,
+        launchId: codexSubmissionWatcher.launchId,
+        sourceSessionId: codexSubmissionWatcher.sessionId,
+        target: codexSubmitAuthority.target,
+      });
+      if (!authorityAtEnter.valid
+        || !currentDiscovery
+        || currentDiscovery.provisionalSubmitReservation !== exactReservation
+        || currentDiscovery.launchId !== codexSubmissionWatcher.launchId
+        || currentDiscovery.sourceSessionId !== codexSubmissionWatcher.sessionId
+        || exactReservation?.actionAuthority !== codexSubmitAuthority
+        || stagedCodexAudit?.actionAuthority !== codexSubmitAuthority
+        || stagedCodexAudit?.submitId !== exactReservation?.submitId
+        || stagedCodexAudit?.expectedHash !== exactReservation?.expectedHash
+        || Number(stagedCodexAudit?.expectedLen) !== Number(exactReservation?.expectedLen)) {
+        if (codexSubmitAuthority.phase !== 'revoked') {
+          transitionMainCodexActionAuthority(
+            codexSubmitAuthority,
+            'revoked',
+            authorityAtEnter.reason || 'resume-submit-observer-or-audit-changed-before-enter',
+          );
+        }
+        return {
+          success: false,
+          error: 'codex_submit_action_authority_revoked',
+          authorityReason: authorityAtEnter.reason || 'resume-submit-observer-or-audit-changed-before-enter',
+          submitted: false,
+          pasteWritten,
+        };
+      }
+    }
     if (stagedCodexAudit?.delayedStableSourceSubmit) {
       const written = markPendingCodexNativeRewindStableSourceSubmitWritten(
         broadcastTabId,
@@ -16865,6 +17524,12 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     if (exactSendCancellationRequested()) {
       return cancelledSendResult('enter-boundary');
     }
+    if (codexSubmissionWatcher?.reservation) {
+      codexSubmissionWatcher.reservation.requiresUserMessageAudit = true;
+      codexSubmissionWatcher.reservation.submitted = true;
+      codexSubmissionWatcher.reservation.submittedAt = Date.now();
+      codexSubmissionWatcher.reservation.enterWritten = false;
+    }
     term.write(submitSequence);
     if (stagedCodexAudit) stagedCodexAudit.submitWritten = true;
     if (stagedClaudeAudit) stagedClaudeAudit.submitWritten = true;
@@ -16880,11 +17545,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       markCodexPromptSubmitted(broadcastTabId, codexPromptInFlightState, resolvedSubmitLabel);
     }
     if (codexSubmissionWatcher?.reservation) {
-      codexSubmissionWatcher.reservation.submitId = stagedCodexAudit?.submitId || null;
-      codexSubmissionWatcher.reservation.expectedHash = stagedCodexAudit?.expectedHash || null;
-      codexSubmissionWatcher.reservation.requiresUserMessageAudit = true;
-      codexSubmissionWatcher.reservation.submitted = true;
-      codexSubmissionWatcher.reservation.submittedAt = Date.now();
+      codexSubmissionWatcher.reservation.enterWritten = true;
+      codexSubmissionWatcher.reservation.enterWrittenAt = Date.now();
     }
     if (armPromptBoundaryOnSubmit && broadcastTabId) {
       armPromptBoundaryForSubmittedCommand(broadcastTabId, promptBoundaryReason || logPrefix);
@@ -17021,10 +17683,21 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     if (codexPromptInFlightState && broadcastTabId && !codexPromptInFlightState.submitted) {
       clearCodexPromptInFlight(broadcastTabId, 'submit-not-sent');
     }
-    if (codexSubmissionWatcher?.reservation && !codexSubmissionWatcher.reservation.submitted) {
+    if (codexSubmissionWatcher?.reservation
+      && codexSubmissionWatcher.reservation.enterWritten !== true) {
       releaseCodexProvisionalSubmitReservation(
         broadcastTabId,
         codexSubmissionWatcher.reservation,
+        'safe-paste-submit-not-sent',
+      );
+    }
+    if (codexSubmitAuthority
+      && codexSubmitAuthority.phase !== 'committed'
+      && codexSubmitAuthority.phase !== 'revoked'
+      && codexSubmissionWatcher?.reservation?.enterWritten !== true) {
+      transitionMainCodexActionAuthority(
+        codexSubmitAuthority,
+        'revoked',
         'safe-paste-submit-not-sent',
       );
     }
@@ -17210,6 +17883,7 @@ async function handleTerminalInput(
     && activeWriteOperation?.manualInputYields !== true;
   if (!isTerminalProtocolResponse && !deferManualInputRevision) {
     bumpTerminalInputRevision(tabId);
+    revokeCodexActionAuthoritiesForManualInput(tabId);
   }
   const inputMirror = getHeadlessTerminalMirror(tabId);
   if (inputMirror?.redrawTrace) {
@@ -19786,6 +20460,11 @@ ipcMain.handle('rewind:cancel', async (_event, { tabId, toolType, opId } = {}) =
     return cancelDecision.response;
   }
   rewindCancelTabs.add(tabId);
+  if (operation.toolType === 'codex') {
+    revokeCodexActionAuthoritiesForTab(tabId, 'rewind-cancelled', {
+      profile: CODEX_ACTION_PROFILE_NATIVE_REWIND,
+    });
+  }
   const term = terminals.get(tabId);
   if (term) {
     try {
@@ -20816,6 +21495,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
   let writer = null;
   let provisionalResumeRewind = false;
+  let rewindActionAuthority = null;
 
   async function authorizeCodexRewindAtWriteBoundary(stage) {
     if (terminals.get(tabId) !== term) {
@@ -20851,6 +21531,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       sender: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
     });
     let provisional = false;
+    let provisionalAuthorization = null;
     if (authorizedWriter?.status === 'provisional-source') {
       const authorization = await ensureCodexSubmissionWatcher(
         tabId,
@@ -20863,7 +21544,10 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         && writerAuthorization === 'provisional-resume-source'
         && writerSessionId === authorizedWriter.sessionId
         && writerLaunchId === authorization.launchId;
+      if (provisional) provisionalAuthorization = authorization;
     }
+    let exactSourceContext = null;
+    let actionLaunchId = null;
     if (authorizedWriter?.status === 'adopted') {
       const proof = getCodexWriterProofSnapshot(tabId);
       if (writerAuthorization !== 'confirmed-writer'
@@ -20872,6 +21556,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         || !isCodexWriterUsableForMutation(tabId)) {
         return { success: false, error: 'codex_writer_changed_before_rewind' };
       }
+      exactSourceContext = resolveCodexNativeRewindSourceContext(tabId);
+      actionLaunchId = proof?.actionGeneration || proof?.launchId || writerLaunchId || null;
     } else if (!provisional) {
       console.warn('[Codex:Rewind] writer proof unavailable stage=' + stage
         + ' tab=' + String(tabId).slice(-12)
@@ -20882,6 +21568,37 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         error: 'codex_writer_unproven',
         writerStatus: authorizedWriter?.status || 'unknown',
         writerError: authorizedWriter?.error || null,
+      };
+    } else {
+      const persistedSessionId = codexSessionIdFromDb(tabId);
+      const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+      const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+      exactSourceContext = {
+        allowed: persistedSessionId === authorizedWriter.sessionId
+          && terminals.get(tabId) === term
+          && !!lifecycleGeneration
+          && Number.isInteger(runSeq)
+          && runSeq > 0,
+        reason: persistedSessionId === authorizedWriter.sessionId
+          ? null
+          : 'persisted-source-mismatch',
+        mode: 'provisional-resume-source',
+        runtimeSourceSessionId: authorizedWriter.sessionId,
+        expectedPersistedSessionId: persistedSessionId,
+        terminalToken: term,
+        runSeq,
+        lifecycleGeneration,
+      };
+      actionLaunchId = provisionalAuthorization?.launchId || writerLaunchId || null;
+    }
+    if (exactSourceContext?.allowed !== true
+      || exactSourceContext.runtimeSourceSessionId !== authorizedWriter.sessionId
+      || !actionLaunchId) {
+      return {
+        success: false,
+        error: 'codex_rewind_action_source_unproven',
+        writerStatus: authorizedWriter?.status || 'unknown',
+        sourceReason: exactSourceContext?.reason || 'launch-generation-unproven',
       };
     }
     if (!provisional) {
@@ -20899,6 +21616,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       success: true,
       writer: authorizedWriter,
       provisionalResumeRewind: provisional,
+      sourceContext: exactSourceContext,
+      launchId: actionLaunchId,
     };
   }
 
@@ -21675,7 +22394,13 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const writeAuthorization = await authorizeCodexRewindAtWriteBoundary('locked-before-first-write');
       if (!writeAuthorization.success) return writeAuthorization;
       if (writeAuthorization.writer?.sessionId !== writer?.sessionId
-        || writeAuthorization.provisionalResumeRewind !== provisionalResumeRewind) {
+        || writeAuthorization.provisionalResumeRewind !== provisionalResumeRewind
+        || writeAuthorization.launchId !== targetAuthorization.launchId
+        || writeAuthorization.sourceContext?.terminalToken !== targetAuthorization.sourceContext?.terminalToken
+        || writeAuthorization.sourceContext?.lifecycleGeneration !== targetAuthorization.sourceContext?.lifecycleGeneration
+        || Number(writeAuthorization.sourceContext?.runSeq) !== Number(targetAuthorization.sourceContext?.runSeq)
+        || writeAuthorization.sourceContext?.expectedPersistedSessionId
+          !== targetAuthorization.sourceContext?.expectedPersistedSessionId) {
         return {
           success: false,
           error: 'codex_writer_changed_before_rewind',
@@ -21684,10 +22409,83 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       }
       writer = writeAuthorization.writer;
       provisionalResumeRewind = writeAuthorization.provisionalResumeRewind;
+      const authoritativeTargetText = String(
+        targetPayload?.message
+        || codexDataModule._api.extractTextContent(targetPayload?.content)
+        || '',
+      ).trim();
+      const actionTarget = {
+        targetUuid,
+        targetSourceLine: targetPayloadContext.sourceLine,
+        targetTextHash: hashCodexRewindTargetText(authoritativeTargetText),
+      };
+      const createdAuthority = createMainCodexActionAuthority({
+        profile: CODEX_ACTION_PROFILE_NATIVE_REWIND,
+        tabId,
+        launchId: writeAuthorization.launchId,
+        sourceSessionId: writer.sessionId,
+        operationId: String(opId || rewindRequestId),
+        requestId: rewindRequestId,
+        target: actionTarget,
+      });
+      if (!createdAuthority.success) {
+        return {
+          success: false,
+          error: 'codex_rewind_action_authority_unavailable',
+          authorityError: createdAuthority.error,
+        };
+      }
+      rewindActionAuthority = createdAuthority.authority;
+      rewindReservation.actionAuthority = rewindActionAuthority;
+      transitionMainCodexActionAuthority(rewindActionAuthority, 'waiting', 'awaiting-exact-rewind-arm');
+      const holdResult = await waitForCodexActionAuthorityTestRelease(rewindActionAuthority);
+      if (holdResult?.released !== true) {
+        return {
+          success: false,
+          error: 'codex_rewind_action_authority_revoked',
+          authorityReason: rewindActionAuthority.reason || holdResult?.reason || 'scope-changed',
+        };
+      }
+      if (holdResult.held === true) {
+        const heldAuthorization = await authorizeCodexRewindAtWriteBoundary('held-before-rewind-arm');
+        if (!heldAuthorization.success) return heldAuthorization;
+        if (heldAuthorization.writer?.sessionId !== writer.sessionId
+          || heldAuthorization.launchId !== writeAuthorization.launchId
+          || heldAuthorization.sourceContext?.terminalToken !== writeAuthorization.sourceContext?.terminalToken
+          || heldAuthorization.sourceContext?.lifecycleGeneration
+            !== writeAuthorization.sourceContext?.lifecycleGeneration
+          || Number(heldAuthorization.sourceContext?.runSeq)
+            !== Number(writeAuthorization.sourceContext?.runSeq)) {
+          return { success: false, error: 'codex_writer_changed_while_rewind_waited' };
+        }
+      }
+      const authorityBeforeArm = validateMainCodexActionAuthority(rewindActionAuthority, {
+        phases: ['waiting'],
+        profile: CODEX_ACTION_PROFILE_NATIVE_REWIND,
+        launchId: writeAuthorization.launchId,
+        sourceSessionId: writer.sessionId,
+        target: actionTarget,
+      });
+      if (!authorityBeforeArm.valid) {
+        transitionMainCodexActionAuthority(
+          rewindActionAuthority,
+          'revoked',
+          authorityBeforeArm.reason,
+        );
+        return {
+          success: false,
+          error: 'codex_rewind_action_authority_revoked',
+          authorityReason: authorityBeforeArm.reason,
+        };
+      }
       handoffObservationArmed = armCodexWriterHandoffObservation(
         tabId,
         'programmatic-rewind',
-        { blockMutations: true },
+        {
+          blockMutations: true,
+          sourceContext: writeAuthorization.sourceContext,
+          actionAuthority: rewindActionAuthority,
+        },
       );
       handoffObserver = codexWatchers.get(tabId) || null;
       if (!handoffObservationArmed || handoffObserver?.sourceMode !== 'writer-handoff') {
@@ -21734,6 +22532,35 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         + ' olderSteps=' + olderSteps
         + ' rollbackTurns=' + rollbackTurns
         + ' target=' + JSON.stringify(String(targetText || targetInputText).slice(0, 80)));
+
+      const authorityAtFirstWrite = validateMainCodexActionAuthority(rewindActionAuthority, {
+        phases: ['armed'],
+        profile: CODEX_ACTION_PROFILE_NATIVE_REWIND,
+        launchId: writeAuthorization.launchId,
+        sourceSessionId: writer.sessionId,
+        actionGeneration: handoffObserver.launchId,
+        target: actionTarget,
+      });
+      if (!authorityAtFirstWrite.valid) {
+        transitionMainCodexActionAuthority(
+          rewindActionAuthority,
+          'revoked',
+          authorityAtFirstWrite.reason,
+        );
+        return {
+          success: false,
+          error: 'codex_rewind_action_authority_revoked',
+          authorityReason: authorityAtFirstWrite.reason,
+        };
+      }
+      const consumedAuthority = transitionMainCodexActionAuthority(
+        rewindActionAuthority,
+        'consumed',
+        'first-rewind-control-write',
+      );
+      if (!consumedAuthority.success) {
+        return { success: false, error: 'codex_rewind_action_authority_not_consumed' };
+      }
 
       const initialStartState = await ensureCodexRewindCleanStart('before-prime');
       if (!initialStartState.success) return initialStartState;
@@ -22012,12 +22839,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       throwIfCodexRewindCancelled('before-confirm');
       const handoffActionStartedAtMs = Date.now();
       const handoffActionGeneration = codexWatchers.get(tabId)?.launchId || null;
-      const authoritativeTargetText = String(
-        targetPayload?.message
-        || codexDataModule._api.extractTextContent(targetPayload?.content)
-        || '',
-      ).trim();
-      const authoritativeTargetTextHash = hashCodexRewindTargetText(authoritativeTargetText);
+      const authoritativeTargetTextHash = actionTarget.targetTextHash;
       if (!markCodexWriterHandoffActionBoundary(tabId, handoffActionStartedAtMs, {
         operationId: String(opId || rewindRequestId),
         requestId: rewindRequestId,
@@ -22025,6 +22847,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         targetSourceLine: targetPayloadContext?.sourceLine,
         targetTextHash: authoritativeTargetTextHash,
         rollbackTurns,
+        actionAuthority: rewindActionAuthority,
       })) {
         return {
           success: false,
@@ -22072,6 +22895,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const surfaceConfirmStartupFrameIfUnrecovered = (reason = 'codex-rewind-confirm-startup-frame-unrecovered') => {
         if (!confirmExposedStartupFrame) return false;
         const hadReady = codexTuiReadyTabs.delete(tabId);
+        clearCodexServiceTierProof(tabId, reason);
         codexTuiReadyMeta.delete(tabId);
         codexTuiReadyBuffers.set(tabId, String(confirmFrame.raw || '').slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT));
         console.warn('[Codex:Rewind] confirm startup frame unrecovered; cleared input-ready tab=' + String(tabId).slice(-12)
@@ -22348,6 +23172,25 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
             + ' error=' + (finalizedReceipt?.error || 'unknown'));
         }
       }
+      if (rewindActionAuthority
+        && rewindActionAuthority.phase !== 'committed'
+        && rewindActionAuthority.phase !== 'revoked') {
+        if (codexRewindOperationResult?.success === true
+          && codexRewindOperationResult?.bindingCommitted === true
+          && rewindActionAuthority.phase === 'consumed') {
+          transitionMainCodexActionAuthority(
+            rewindActionAuthority,
+            'committed',
+            'rewind-result-committed',
+          );
+        } else {
+          transitionMainCodexActionAuthority(
+            rewindActionAuthority,
+            'revoked',
+            codexRewindOperationResult?.error || 'rewind-not-committed',
+          );
+        }
+      }
     } finally {
       releaseExclusiveActionReservation(codexRewindReservations, rewindReservation);
       rewindCancelTabs.delete(tabId);
@@ -22408,6 +23251,7 @@ ipcMain.on('terminal:resize', (event, requestOrTabId, legacyCols, legacyRows) =>
 ipcMain.on('terminal:kill', async (event, tabId) => {
   const startedAt = Date.now();
   const term = terminals.get(tabId);
+  revokeCodexActionAuthoritiesForTab(tabId, 'terminal-kill');
   cancelCodexManualCompactPending(tabId, 'terminal-kill');
   clearClaudeEditableLastPrompt(tabId, 'terminal-kill');
   const bridgeSessionId = bridgeKnownSessions.get(tabId) || null;
@@ -23725,6 +24569,9 @@ ipcMain.on('terminal:transfer-project-ownership-sync', (event, {
       + ' tabs=' + (Array.isArray(tabIds) ? tabIds.length : 0)
       + ' error=' + (result.error || 'unknown'));
   } else {
+    for (const transferredTabId of result.transferred || []) {
+      revokeCodexActionAuthoritiesForTab(transferredTabId, 'project-owner-moved');
+    }
     console.log('[TabProjectTransfer] committed source=' + String(sourceProjectId).slice(-12)
       + ' target=' + String(targetProjectId).slice(-12)
       + ' tabs=' + result.transferred.length
@@ -23769,6 +24616,9 @@ ipcMain.on('terminal:transfer-tab-group-ownership-sync', (event, {
       + ' tabs=' + (Array.isArray(tabIds) ? tabIds.length : 0)
       + ' error=' + (result.error || 'unknown'));
   } else {
+    for (const transferredTabId of result.transferred || []) {
+      revokeCodexActionAuthoritiesForTab(transferredTabId, 'project-group-owner-moved');
+    }
     console.log('[TabGroupProjectTransfer] committed source=' + String(sourceProjectId).slice(-12)
       + ' target=' + String(targetProjectId).slice(-12)
       + ' group=' + String(groupId).slice(-12)
@@ -27307,6 +28157,7 @@ function clearCodexTuiReady(tabId, reason = 'clear') {
   codexTuiReadyBuffers.delete(tabId);
   codexTuiReadyRejectKeys.delete(tabId);
   codexTuiReadyLastNotReady.delete(tabId);
+  clearCodexServiceTierProof(tabId, 'tui-ready-cleared:' + reason);
   codexTuiReadyMeta.delete(tabId);
   codexStartupNoStateTimeoutTabs.delete(tabId);
   clearCodexMcpStartupWatchdog(tabId, reason);
@@ -27330,6 +28181,7 @@ function resetCodexTuiReadyDetection(tabId, reason = 'reset') {
   codexTuiReadyBuffers.delete(tabId);
   codexTuiReadyRejectKeys.delete(tabId);
   codexTuiReadyLastNotReady.delete(tabId);
+  clearCodexServiceTierProof(tabId, 'tui-ready-reset:' + reason);
   codexTuiReadyMeta.delete(tabId);
   codexStartupNoStateTimeoutTabs.delete(tabId);
   if (codexTuiReadyTabs.delete(tabId)) {
@@ -27407,6 +28259,7 @@ function invalidateCodexTuiReadyForStartupBlocker(
     return false;
   }
   const hadReady = codexTuiReadyTabs.delete(tabId);
+  clearCodexServiceTierProof(tabId, 'startup-blocker:' + blockers.join('+'));
   codexTuiReadyMeta.delete(tabId);
   const previewTail = String(preview || '').replace(/\s+/g, ' ').trim().slice(-260);
   const previousNotReady = codexTuiReadyLastNotReady.get(tabId) || null;
@@ -28504,6 +29357,23 @@ function markCodexTuiReadyFromTurnEnd(tabId, reason = 'turn-end') {
     return false;
   }
   const hadReady = codexTuiReadyTabs.has(tabId);
+  const previousTierProof = codexTuiReadyMeta.get(tabId)?.serviceTierProof || null;
+  const currentTierIdentity = getCurrentCodexServiceTierProofIdentity(tabId);
+  const tierPreservation = previousTierProof && currentTierIdentity.success === true
+    ? preserveCodexServiceTierProofForTurnEnd(previousTierProof, currentTierIdentity)
+    : {
+      preserved: false,
+      proof: null,
+      reason: previousTierProof
+        ? currentTierIdentity.reason
+        : 'proof-missing',
+    };
+  if (previousTierProof && !tierPreservation.preserved) {
+    clearCodexServiceTierProof(
+      tabId,
+      'turn-end-readiness-refresh:' + tierPreservation.reason,
+    );
+  }
   codexTuiReadyTabs.add(tabId);
   codexTuiReadyBuffers.delete(tabId);
   codexTuiReadyRejectKeys.delete(tabId);
@@ -28512,7 +29382,16 @@ function markCodexTuiReadyFromTurnEnd(tabId, reason = 'turn-end') {
     source: 'turn-lifecycle',
     reason,
     preview: '',
+    ...(tierPreservation.preserved
+      ? { serviceTierProof: tierPreservation.proof }
+      : {}),
   });
+  if (previousTierProof) {
+    console.log('[CodexServiceTier] turn-end refresh tab=' + String(tabId).slice(-12)
+      + ' owner=' + String(previousTierProof.ownerId || 'none').slice(0, 24)
+      + ' outcome=' + (tierPreservation.preserved ? 'preserved' : 'cleared')
+      + ' reason=' + tierPreservation.reason);
+  }
   finishCodexStartupLifecycle(tabId, reason);
   agentLaunchPreparations.clearRejected(tabId, {
     toolType: 'codex',
@@ -30695,18 +31574,49 @@ function requestCodexSourceWriterProof(state) {
 function releaseCodexProvisionalSourceAfterMatchedAudit(tabId, audit, result) {
   const discovery = codexWatchers.get(tabId) || null;
   const reservation = discovery?.provisionalSubmitReservation || null;
+  const authority = reservation?.actionAuthority || null;
+  const causalProof = reservation?.causalWriterProof || null;
+  const resultSessionId = String(result?.sessionId || '');
+  const sourceSessionId = String(reservation?.sourceSessionId || '');
+  const causalSessionId = String(causalProof?.sessionId || '');
+  const sourceInPlace = !!resultSessionId && resultSessionId === sourceSessionId;
+  const causalChild = !!resultSessionId
+    && !!causalSessionId
+    && resultSessionId === causalSessionId
+    && causalSessionId !== sourceSessionId;
+  let authorityVerdict = { valid: false, reason: 'action-authority-missing' };
+  if (authority) {
+    authorityVerdict = validateConsumedCodexResumedSubmitAuthority(
+      authority,
+      reservation,
+      { allowPersistedWriterAdoption: causalChild },
+    );
+  }
   if (
     !discovery
     || discovery.sourceMode !== 'resume'
     || !reservation
     || reservation.submitted !== true
+    || reservation.enterWritten !== true
     || reservation.requiresUserMessageAudit !== true
     || reservation.auditMatched === true
     || !reservation.submitId
     || reservation.submitId !== audit?.submitId
+    || audit?.actionAuthority !== authority
+    || audit?.actionAuthorityId !== authority?.authorityId
     || reservation.launchId !== discovery.launchId
     || reservation.sourceSessionId !== discovery.sourceSessionId
-    || String(result?.sessionId || '') !== String(reservation.sourceSessionId || '')
+    || !authorityVerdict.valid
+    || (!sourceInPlace && !causalChild)
+    || (causalChild && (
+      reservation.writerAdopted !== true
+      || reservation.adoptedSessionId !== resultSessionId
+      || causalProof.authorityId !== authority.authorityId
+      || causalProof.submitId !== reservation.submitId
+      || causalProof.sourceSessionId !== reservation.sourceSessionId
+      || codexSessionIdFromDb(tabId) !== resultSessionId
+      || codexKnownSessions.get(tabId) !== resultSessionId
+    ))
   ) {
     return false;
   }
@@ -30718,11 +31628,23 @@ function releaseCodexProvisionalSourceAfterMatchedAudit(tabId, audit, result) {
   reservation.auditMatched = true;
   reservation.auditMatchedAt = Date.now();
   reservation.auditSessionId = result.sessionId;
-  console.log('[CodexLaunchObservation] provisional source audit matched tab='
+  console.log('[CodexLaunchObservation] provisional Resume audit matched tab='
     + String(tabId).slice(-12)
     + ' source=' + String(reservation.sourceSessionId).slice(0, 8)
+    + ' writer=' + String(result.sessionId).slice(0, 8)
     + ' launch=' + reservation.launchId
     + ' submit=' + reservation.submitId);
+
+  if (causalChild) {
+    discovery.provisionalSubmitReservation = null;
+    transitionMainCodexActionAuthority(
+      authority,
+      'committed',
+      'causal-child-user-message-committed',
+    );
+    closeCodexWatcher(tabId, 'resumed-submit-audit-committed');
+    return true;
+  }
 
   const previousReconcile = codexWriterReconcileInflight.get(discovery) || null;
   Promise.resolve(previousReconcile)
@@ -30742,7 +31664,24 @@ function releaseCodexProvisionalSourceAfterMatchedAudit(tabId, audit, result) {
       });
     })
     .then((adoption) => {
-      if (adoption && adoption.status !== 'adopted') {
+      if (adoption?.status === 'adopted'
+        && adoption.sessionId === reservation.sourceSessionId
+        && codexSessionIdFromDb(tabId) === reservation.sourceSessionId) {
+        if (codexWatchers.get(tabId) === discovery
+          && discovery.provisionalSubmitReservation === reservation) {
+          discovery.provisionalSubmitReservation = null;
+        }
+        if (authority.phase === 'consumed') {
+          transitionMainCodexActionAuthority(
+            authority,
+            'committed',
+            'resume-source-user-message-committed',
+          );
+        }
+        if (codexWatchers.get(tabId) === discovery) {
+          closeCodexWatcher(tabId, 'resumed-submit-audit-committed');
+        }
+      } else if (adoption && adoption.status !== 'adopted') {
         console.warn('[CodexLaunchObservation] matched audit writer adoption pending tab='
           + String(tabId).slice(-12)
           + ' source=' + String(reservation.sourceSessionId).slice(0, 8)
@@ -31101,6 +32040,7 @@ function recordCodexLiveSubagentOwnership(state, record) {
 }
 
 function rearmCodexProcessActionBoundary(tabId, reason) {
+  revokeCodexActionAuthoritiesForTab(tabId, 'process-boundary:' + reason);
   const state = codexTurnWatchers.get(tabId);
   if (!state) return false;
   cancelCodexManualCompactPending(tabId, 'lifecycle-generation-changed');
@@ -33446,6 +34386,153 @@ async function buildCodexDelayedStableSourceProofContext(tabId, userCandidates) 
   };
 }
 
+async function buildCodexResumedSubmitCandidateProof(tabId, userCandidates, intent) {
+  const discovery = codexWatchers.get(tabId) || null;
+  const reservation = discovery?.provisionalSubmitReservation || null;
+  const active = isCodexResumeSourceAuditPending({
+    sourceMode: intent?.sourceMode || null,
+    sourceSessionId: intent?.sourceSessionId || null,
+    launchId: intent?.launchId || null,
+    discovery,
+  });
+  if (!active) return { active: false, selection: null };
+  const authority = reservation?.actionAuthority || null;
+  const audit = getPendingCodexPasteAudits(tabId).find((candidateAudit) => (
+    candidateAudit?.submitWritten === true
+    && candidateAudit?.submitId === reservation?.submitId
+    && candidateAudit?.actionAuthority === authority
+    && candidateAudit?.actionAuthorityId === authority?.authorityId
+    && candidateAudit?.expectedHash === reservation?.expectedHash
+    && Number(candidateAudit?.expectedLen) === Number(reservation?.expectedLen)
+  )) || null;
+  const authorityVerdict = authority
+    ? validateConsumedCodexResumedSubmitAuthority(authority, reservation)
+    : { valid: false, reason: 'action-authority-missing' };
+  if (reservation?.submitted !== true
+    || reservation?.enterWritten !== true
+    || !audit
+    || !authorityVerdict.valid
+    || reservation.launchId !== intent?.launchId
+    || reservation.sourceSessionId !== intent?.sourceSessionId) {
+    return {
+      active: true,
+      selection: { status: 'pending', reason: authorityVerdict.reason || 'submit-audit-not-armed' },
+    };
+  }
+
+  const matches = [];
+  for (const candidate of Array.isArray(userCandidates) ? userCandidates : []) {
+    const meta = candidate?.meta || candidate?.metadata?.meta || {};
+    const sessionId = meta.id ? String(meta.id) : '';
+    const directResumeLineage = sessionId === reservation.sourceSessionId
+      || String(meta.forked_from_id || '') === String(reservation.sourceSessionId);
+    if (!sessionId || !directResumeLineage || !candidate?.filePath) continue;
+    let stat;
+    let parsed;
+    try {
+      stat = await fs.promises.stat(candidate.filePath);
+      parsed = await codexDataModule._api.readJsonlRange(
+        candidate.filePath,
+        0,
+        Math.max(-1, Number(stat.size) - 1),
+      );
+    } catch (error) {
+      return {
+        active: true,
+        proofError: 'resume_submit_candidate_read_failed:' + (error?.message || String(error)),
+      };
+    }
+    if (Number(parsed?.errors || 0) > 0) {
+      return { active: true, proofError: 'resume_submit_candidate_parse_incomplete' };
+    }
+    for (const record of parsed?.records || []) {
+      const payload = record?.payload || {};
+      if (record?.type !== 'event_msg' || payload.type !== 'user_message') continue;
+      const actualText = payload.message
+        || codexDataModule._api.extractTextContent(payload.content)
+        || '';
+      const actualHash = pasteAuditHash(actualText);
+      const matched = selectCodexPendingPromptAudit([audit], {
+        actualText,
+        actualHash,
+        actualPayload: payload,
+        actualIdentity: {
+          sessionId,
+          filePath: candidate.filePath,
+          byteOffset: record.__byteOffset,
+          timestamp: record.timestamp,
+        },
+      });
+      if (matched?.audit !== audit) continue;
+      matches.push({
+        candidate,
+        proof: {
+          kind: 'resumed-active-submit-user-message',
+          authorityId: authority.authorityId,
+          launchId: reservation.launchId,
+          sourceSessionId: reservation.sourceSessionId,
+          sessionId,
+          filePath: candidate.filePath,
+          forkedFromId: meta.forked_from_id || null,
+          submitId: audit.submitId,
+          handoffId: audit.handoffId || null,
+          expectedHash: audit.expectedHash,
+          expectedLen: audit.expectedLen,
+          actualHash,
+          recordByteOffset: record.__byteOffset,
+          recordTimestamp: record.timestamp || null,
+          observedAt: Date.now(),
+        },
+      });
+      break;
+    }
+  }
+
+  const currentDiscovery = codexWatchers.get(tabId) || null;
+  const currentReservation = currentDiscovery?.provisionalSubmitReservation || null;
+  const currentAuthority = currentReservation?.actionAuthority || null;
+  const currentAuthorityVerdict = currentAuthority
+    ? validateConsumedCodexResumedSubmitAuthority(currentAuthority, currentReservation)
+    : { valid: false, reason: 'action-authority-missing' };
+  if (currentDiscovery !== discovery
+    || currentReservation !== reservation
+    || currentAuthority !== authority
+    || !currentAuthorityVerdict.valid) {
+    return {
+      active: true,
+      proofError: 'resume_submit_scope_changed:' + (currentAuthorityVerdict.reason || 'observer-changed'),
+    };
+  }
+  const selection = selectCodexResumedSubmitWriter(matches, {
+    sourceSessionId: reservation.sourceSessionId,
+    launchId: reservation.launchId,
+    authorityId: authority.authorityId,
+    submitId: audit.submitId,
+  });
+  if (selection.status !== 'selected') {
+    return {
+      active: true,
+      selection,
+    };
+  }
+  reservation.causalWriterProof = selection.proof;
+  console.warn('[CodexActionAuthority] causal Resume writer proven tab='
+    + String(tabId).slice(-12)
+    + ' source=' + String(reservation.sourceSessionId).slice(0, 8)
+    + ' child=' + String(selection.proof.sessionId).slice(0, 8)
+    + ' launch=' + reservation.launchId
+    + ' authority=' + authority.authorityId
+    + ' submit=' + audit.submitId);
+  return {
+    active: true,
+    selection: {
+      status: 'selected',
+      candidate: selection.candidate,
+      proof: selection.proof,
+    },
+  };
+}
+
 async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null) {
   const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
   if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
@@ -33533,6 +34620,58 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
     handoff,
     settledWriter,
   });
+  const resumedSubmit = await buildCodexResumedSubmitCandidateProof(
+    tabId,
+    proof.candidates || (proof.status === 'owned' ? [proof] : []),
+    intentOverride || codexSessionDiscoveryIntents.get(tabId) || null,
+  );
+  if (resumedSubmit?.proofError) {
+    return {
+      status: 'unknown',
+      error: resumedSubmit.proofError,
+      candidates: proof.candidates || [],
+      processMatches: lookup.matches,
+      failures,
+      preserveWriterProof: true,
+      resumedSubmitProof: resumedSubmit,
+    };
+  }
+  if (resumedSubmit?.selection?.status === 'selected') {
+    const selected = resumedSubmit.selection.candidate;
+    const selectedSessionId = selected?.meta?.id || selected?.metadata?.meta?.id || null;
+    const proofSessionId = proof?.meta?.id || proof?.metadata?.meta?.id || null;
+    if (proof.status === 'ambiguous'
+      || (proof.status === 'owned' && selectedSessionId === proofSessionId)) {
+      return {
+        status: 'owned',
+        filePath: selected.filePath,
+        pids: selected.pids || proof.pids || [],
+        fds: selected.fds || proof.fds || [],
+        metadata: selected.metadata || proof.metadata,
+        meta: selected.meta || proof.meta,
+        candidates: proof.candidates || [selected],
+        ignoredCandidates: proof.ignoredCandidates || [],
+        allCandidates: proof.allCandidates || [],
+        processMatches: lookup.matches,
+        resumedSubmitProof: resumedSubmit.selection.proof,
+      };
+    }
+  }
+  if (resumedSubmit?.active && proof.status === 'ambiguous') {
+    return {
+      ...proof,
+      status: 'resume-submit-pending',
+      reason: resumedSubmit.selection?.reason || 'causal-user-message-not-observed',
+      processMatches: lookup.matches,
+      preserveWriterProof: true,
+      resumedSubmitProof: resumedSubmit,
+    };
+  }
+  if (resumedSubmit?.active && proof.status === 'owned') {
+    proof.resumedSubmitProof = resumedSubmit.selection?.status === 'selected'
+      ? resumedSubmit.selection.proof
+      : resumedSubmit;
+  }
   if (proof.status === 'ambiguous') {
     const delayed = await buildCodexDelayedStableSourceProofContext(
       tabId,
@@ -33745,8 +34884,72 @@ async function inspectCodexOwnedWriter(tabId, intentOverride = undefined) {
     handoffProof: processProof.handoffProof || null,
     settledWriterProof: processProof.settledWriterProof || null,
     delayedRewindProof: processProof.delayedRewindProof || null,
+    resumedSubmitProof: processProof.resumedSubmitProof || null,
     metadata,
   };
+}
+
+function commitCodexResumedSubmitWriterBinding(tabId, owned, intent, reservation, proof) {
+  const discovery = codexWatchers.get(tabId) || null;
+  const projectId = resolveAuthoritativeTabProjectId(tabId);
+  const authority = reservation?.actionAuthority || null;
+  const authorityVerdict = authority
+    ? validateConsumedCodexResumedSubmitAuthority(authority, reservation)
+    : { valid: false, reason: 'action-authority-missing' };
+  if (!projectId
+    || discovery?.provisionalSubmitReservation !== reservation
+    || discovery?.launchId !== intent?.launchId
+    || discovery?.sourceSessionId !== intent?.sourceSessionId
+    || reservation?.enterWritten !== true
+    || !authorityVerdict.valid
+    || proof?.authorityId !== authority?.authorityId
+    || proof?.submitId !== reservation?.submitId
+    || proof?.sessionId !== owned?.sessionId
+    || proof?.sourceSessionId !== intent?.sourceSessionId
+    || (
+      owned?.sessionId !== intent?.sourceSessionId
+      && owned?.forkedFromId !== intent?.sourceSessionId
+    )) {
+    return {
+      success: false,
+      error: authorityVerdict.reason || 'codex_resume_submit_binding_scope_changed',
+      retryable: true,
+    };
+  }
+  const currentSessionId = codexSessionIdFromDb(tabId, projectId);
+  if (currentSessionId !== intent.sourceSessionId) {
+    return {
+      success: false,
+      error: 'codex_resume_submit_persisted_source_changed',
+      retryable: false,
+      currentSessionId,
+    };
+  }
+  if (owned.sessionId === intent.sourceSessionId) {
+    return { success: true, updated: false, currentSessionId };
+  }
+  try {
+    const updated = projectManager.db.compareAndSetTabCodexSessionId(
+      projectId,
+      tabId,
+      intent.sourceSessionId,
+      owned.sessionId,
+    );
+    return updated === true
+      ? { success: true, updated: true, currentSessionId }
+      : {
+          success: false,
+          error: 'codex_resume_submit_binding_compare_and_set_conflict',
+          retryable: false,
+          currentSessionId: codexSessionIdFromDb(tabId, projectId),
+        };
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error),
+      retryable: true,
+    };
+  }
 }
 
 async function reconcileCodexWriterFromProcessInner(tabId, {
@@ -33923,19 +35126,37 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
   if (!exitObserverCurrent()) return staleExitObserverResult(owned);
 
   const discoveryAtAdoption = codexWatchers.get(tabId) || null;
-  const sourceSubmitAuditPending = owned.sourceMatch === 'source-in-place'
-    && isCodexResumeSourceAuditPending({
-      sourceMode: intent?.sourceMode || null,
-      sourceSessionId: owned.sessionId,
-      launchId: intent?.launchId || null,
-      discovery: discoveryAtAdoption,
-    });
+  const submitReservationAtAdoption = discoveryAtAdoption?.provisionalSubmitReservation || null;
+  const resumeSubmitAuditPending = isCodexResumeSourceAuditPending({
+    sourceMode: intent?.sourceMode || null,
+    sourceSessionId: intent?.sourceSessionId || null,
+    launchId: intent?.launchId || null,
+    discovery: discoveryAtAdoption,
+  });
+  const resumedSubmitProof = owned?.resumedSubmitProof?.kind === 'resumed-active-submit-user-message'
+    ? owned.resumedSubmitProof
+    : null;
+  const candidateSubmitAuditProven = !!resumedSubmitProof
+    && resumeSubmitAuditPending
+    && submitReservationAtAdoption?.enterWritten === true
+    && submitReservationAtAdoption?.actionAuthority?.phase === 'consumed'
+    && resumedSubmitProof.authorityId
+      === submitReservationAtAdoption.actionAuthority.authorityId
+    && resumedSubmitProof.submitId === submitReservationAtAdoption.submitId
+    && resumedSubmitProof.launchId === intent?.launchId
+    && resumedSubmitProof.sourceSessionId === intent?.sourceSessionId
+    && resumedSubmitProof.sessionId === owned.sessionId
+    && (
+      owned.sessionId === intent?.sourceSessionId
+      || owned.forkedFromId === intent?.sourceSessionId
+    );
   const adoptionDecision = classifyCodexWriterAdoption({
     sourceMode: intent?.sourceMode || null,
     sourceMatch: owned.sourceMatch,
     linkedBoundaryFound: linkedBoundary?.found === true,
     sourceAppendObserved: reason === 'source-rollout-appended',
-    sourceSubmitAuditPending,
+    resumeSubmitAuditPending,
+    candidateSubmitAuditProven,
   });
   const sourceAppendLiveProven = adoptionDecision.sourceSettled;
   if (adoptionDecision.status === 'provisional-source') {
@@ -34095,7 +35316,15 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
       writerSessionId: owned.sessionId,
     },
   );
-  const durableBinding = delayedRewindWriterProven
+  const durableBinding = candidateSubmitAuditProven
+    ? commitCodexResumedSubmitWriterBinding(
+      tabId,
+      owned,
+      intent,
+      submitReservationAtAdoption,
+      resumedSubmitProof,
+    )
+    : delayedRewindWriterProven
     ? commitPendingCodexNativeRewindHandoff(tabId, {
       sourceSessionId: owned.delayedRewindProof.sourceSessionId,
       nextSessionId: owned.sessionId,
@@ -34145,17 +35374,21 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     intent,
     settledWriterProof: owned.settledWriterProof,
   });
-  const settledActionGeneration = delayedRewindWriterProven
+  const settledActionGeneration = candidateSubmitAuditProven
+    ? resumedSubmitProof.launchId
+    : delayedRewindWriterProven
     ? owned.delayedRewindProof.actionGeneration
     : settledProofScope.actionGeneration;
-  const writerProofKind = projectCodexWriterProofKind({
+  const writerProofKind = candidateSubmitAuditProven
+    ? 'resumed-submit-causal-writer'
+    : projectCodexWriterProofKind({
     delayedRewindWriterProven,
     settledDelayedRewindWriterProven,
     nativeRewindReplacementProven,
     settledReplacementWriterProven,
     nativeRewindHandoffProven,
     settledRewindWriterProven,
-  });
+    });
   const adoption = setCodexKnownSession(tabId, owned.sessionId, reason, {
     kind: writerProofKind,
     filePath: owned.filePath,
@@ -34172,7 +35405,9 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     // Preserve the settled proof's A→B source instead of overwriting it with
     // null; otherwise the next proof sees both open rollouts but loses the
     // lineage needed to select B.
-    sourceSessionId: delayedRewindWriterProven
+    sourceSessionId: candidateSubmitAuditProven
+      ? resumedSubmitProof.sourceSessionId
+      : delayedRewindWriterProven
       ? owned.delayedRewindProof.sourceSessionId
       : settledProofScope.sourceSessionId || owned.sourceSessionId,
     // Native Rewind is the only existing-writer A→B transition allowed to
@@ -34189,6 +35424,19 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
       retryable: adoption?.retryable !== false,
       linkedBoundary,
     };
+  }
+  if (candidateSubmitAuditProven
+    && discoveryAtAdoption?.provisionalSubmitReservation === submitReservationAtAdoption) {
+    submitReservationAtAdoption.writerAdopted = true;
+    submitReservationAtAdoption.writerAdoptedAt = Date.now();
+    submitReservationAtAdoption.adoptedSessionId = owned.sessionId;
+    submitReservationAtAdoption.adoptedFilePath = owned.filePath;
+    console.warn('[CodexActionAuthority] causal Resume writer committed tab='
+      + String(tabId).slice(-12)
+      + ' source=' + String(intent?.sourceSessionId || '').slice(0, 8)
+      + ' writer=' + String(owned.sessionId || '').slice(0, 8)
+      + ' launch=' + (intent?.launchId || '-')
+      + ' authority=' + (submitReservationAtAdoption.actionAuthority?.authorityId || '-'));
   }
   if (delayedRewindWriterProven) {
     closeCodexDelayedWriterObserver(tabId, 'binding-committed');
@@ -34680,8 +35928,10 @@ function armCodexSubmissionObservationWithoutProof(tabId, cwd, reason = 'submit'
       reason,
       at: Date.now(),
       submitted: false,
+      enterWritten: false,
       requiresUserMessageAudit: true,
       auditMatched: false,
+      actionAuthority: null,
     };
     discovery.provisionalSubmitReservation = reservation;
   }
@@ -34788,8 +36038,10 @@ async function ensureCodexSubmissionWatcher(tabId, cwd, reason = 'submit', {
         reason,
         at: Date.now(),
         submitted: false,
+        enterWritten: false,
         requiresUserMessageAudit: true,
         auditMatched: false,
+        actionAuthority: null,
       };
       discovery.provisionalSubmitReservation = reservation;
       console.log('[CodexLaunchObservation] provisional first submit reserved tab=' + String(tabId).slice(-12)
@@ -34909,7 +36161,14 @@ async function ensureCodexSubmissionWatcher(tabId, cwd, reason = 'submit', {
 function releaseCodexProvisionalSubmitReservation(tabId, reservation, reason = 'not-submitted') {
   if (!tabId || !reservation) return false;
   const discovery = codexWatchers.get(tabId) || null;
-  if (discovery?.provisionalSubmitReservation !== reservation || reservation.submitted === true) return false;
+  if (discovery?.provisionalSubmitReservation !== reservation
+    || reservation.enterWritten === true) return false;
+  if (reservation.actionAuthority
+    && reservation.actionAuthority.phase !== 'revoked'
+    && reservation.actionAuthority.phase !== 'committed') {
+    transitionMainCodexActionAuthority(reservation.actionAuthority, 'revoked', reason);
+  }
+  reservation.submitted = false;
   discovery.provisionalSubmitReservation = null;
   console.log('[CodexLaunchObservation] provisional first submit released tab=' + String(tabId).slice(-12)
     + ' source=' + String(reservation.sourceSessionId || '').slice(0, 8)
@@ -34960,15 +36219,38 @@ function prepareManualCodexRewindObserver(tabId, observer) {
 function armCodexWriterHandoffObservation(tabId, reason = 'native-rewind', {
   blockMutations = false,
   manualPhysicalRewind = false,
+  sourceContext: providedSourceContext = null,
+  actionAuthority: providedActionAuthority = null,
 } = {}) {
   if (!tabId) return false;
   closeCodexDelayedWriterObserver(tabId, 'new-rewind:' + reason);
-  const sourceContext = resolveCodexNativeRewindSourceContext(tabId);
+  const sourceContext = providedSourceContext || resolveCodexNativeRewindSourceContext(tabId);
   if (sourceContext?.allowed !== true) {
     console.warn('[CodexWriterHandoff] arm blocked tab=' + String(tabId).slice(-12)
       + ' reason=' + reason
       + ' proof=' + (sourceContext?.reason || 'rewind-runtime-source-unproven'));
     return false;
+  }
+  let actionAuthority = providedActionAuthority;
+  if (actionAuthority) {
+    const authorityVerdict = validateMainCodexActionAuthority(actionAuthority, {
+      phases: ['waiting'],
+      profile: CODEX_ACTION_PROFILE_NATIVE_REWIND,
+      launchId: actionAuthority.identity.launchId,
+      sourceSessionId: sourceContext.runtimeSourceSessionId,
+    });
+    if (!authorityVerdict.valid
+      || actionAuthority.identity.terminalToken !== sourceContext.terminalToken
+      || actionAuthority.identity.lifecycleGeneration !== sourceContext.lifecycleGeneration
+      || Number(actionAuthority.identity.runSeq) !== Number(sourceContext.runSeq)
+      || actionAuthority.identity.persistedSessionId !== sourceContext.expectedPersistedSessionId) {
+      transitionMainCodexActionAuthority(
+        actionAuthority,
+        'revoked',
+        authorityVerdict.reason || 'rewind-source-context-changed',
+      );
+      return false;
+    }
   }
   const existing = codexWatchers.get(tabId) || null;
   if (existing?.sourceMode === 'writer-handoff') {
@@ -34988,6 +36270,25 @@ function armCodexWriterHandoffObservation(tabId, reason = 'native-rewind', {
     closeCodexWatcher(tabId, sameSource
       ? 'replace-with-programmatic-handoff'
       : 'replace-stale-handoff-source');
+  }
+  if (!actionAuthority && manualPhysicalRewind) {
+    const proof = getCodexWriterProofSnapshot(tabId);
+    const sourceLaunchId = proof?.actionGeneration
+      || proof?.launchId
+      || codexSessionDiscoveryIntents.get(tabId)?.launchId
+      || ('live-run:' + sourceContext.lifecycleGeneration);
+    const manualRequestId = 'manual-codex-rewind-' + Date.now() + '-' + (++codexActionAuthoritySeq);
+    const createdAuthority = createMainCodexActionAuthority({
+      profile: CODEX_ACTION_PROFILE_NATIVE_REWIND,
+      tabId,
+      launchId: sourceLaunchId,
+      sourceSessionId: sourceContext.runtimeSourceSessionId,
+      operationId: manualRequestId,
+      requestId: manualRequestId,
+    });
+    if (!createdAuthority.success) return false;
+    actionAuthority = createdAuthority.authority;
+    transitionMainCodexActionAuthority(actionAuthority, 'waiting', 'manual-rewind-target-pending');
   }
   const sourceSessionId = sourceContext.runtimeSourceSessionId;
   const startedAt = Date.now();
@@ -35011,6 +36312,24 @@ function armCodexWriterHandoffObservation(tabId, reason = 'native-rewind', {
   );
   const armed = codexWatchers.has(tabId);
   const observer = codexWatchers.get(tabId) || null;
+  if (armed && actionAuthority && observer?.sourceMode === 'writer-handoff') {
+    const generationBound = bindCodexActionAuthorityGeneration(actionAuthority, launchId);
+    if (!generationBound.success) {
+      transitionMainCodexActionAuthority(actionAuthority, 'revoked', generationBound.error);
+      closeCodexWatcher(tabId, 'rewind-action-generation-bind-failed');
+      return false;
+    }
+    observer.actionAuthority = actionAuthority;
+    const armedAuthority = transitionMainCodexActionAuthority(
+      actionAuthority,
+      'armed',
+      manualPhysicalRewind ? 'manual-rewind-observer-armed' : 'rewind-observer-armed',
+    );
+    if (!armedAuthority.success) {
+      closeCodexWatcher(tabId, 'rewind-action-authority-arm-failed');
+      return false;
+    }
+  }
   if (armed && manualPhysicalRewind && observer?.sourceMode === 'writer-handoff') {
     prepareManualCodexRewindObserver(tabId, observer);
   }
@@ -35020,7 +36339,8 @@ function armCodexWriterHandoffObservation(tabId, reason = 'native-rewind', {
     + ' expectedBinding=' + String(sourceContext.expectedPersistedSessionId || 'none').slice(0, 8)
     + ' sourceMode=' + (sourceContext.mode || '-')
     + ' armed=' + armed
-    + ' manual=' + manualPhysicalRewind);
+    + ' manual=' + manualPhysicalRewind
+    + ' authority=' + (actionAuthority?.authorityId || '-'));
   return armed;
 }
 
@@ -35313,6 +36633,7 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
   targetSourceLine = null,
   targetTextHash = null,
   rollbackTurns = null,
+  actionAuthority: providedActionAuthority = null,
 } = {}) {
   const observer = codexWatchers.get(tabId) || null;
   if (observer?.sourceMode !== 'writer-handoff' || !observer.launchId) return false;
@@ -35323,17 +36644,64 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
   const terminalToken = terminals.get(tabId) || null;
   const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   if (!terminalToken || !Number.isInteger(runSeq) || runSeq <= 0) return false;
-  const sourceContext = resolveCodexNativeRewindSourceContext(tabId);
-  if (sourceContext?.allowed !== true
-    || sourceContext.runtimeSourceSessionId !== observer.sourceSessionId
-    || sourceContext.expectedPersistedSessionId !== observer.expectedBindingSessionId
-    || sourceContext.terminalToken !== observer.sourceTerminalToken
-    || Number(sourceContext.runSeq) !== Number(observer.sourceRunSeq)
-    || sourceContext.lifecycleGeneration !== observer.sourceLifecycleGeneration) {
+  const actionAuthority = providedActionAuthority || observer.actionAuthority || null;
+  const actionTarget = {
+    targetUuid,
+    targetSourceLine,
+    targetTextHash,
+  };
+  if (!actionAuthority) {
     console.warn('[CodexWriterHandoff] action boundary source changed tab='
       + String(tabId).slice(-12)
       + ' generation=' + observer.launchId
-      + ' reason=' + (sourceContext?.reason || 'source-scope-mismatch'));
+      + ' reason=action-authority-missing');
+    return false;
+  }
+  if (!actionAuthority.target) {
+    const targetBound = bindCodexActionAuthorityTarget(actionAuthority, actionTarget);
+    if (!targetBound.success) {
+      transitionMainCodexActionAuthority(actionAuthority, 'revoked', targetBound.error);
+      return false;
+    }
+    publishCodexActionAuthorityState(actionAuthority, 'rewind-target-bound');
+  }
+  const authorityVerdict = validateMainCodexActionAuthority(actionAuthority, {
+    phases: ['armed', 'consumed'],
+    profile: CODEX_ACTION_PROFILE_NATIVE_REWIND,
+    launchId: actionAuthority.identity.launchId,
+    sourceSessionId: observer.sourceSessionId,
+    actionGeneration: observer.launchId,
+    target: actionTarget,
+  });
+  const sameSourceScope = actionAuthority.identity.terminalToken === observer.sourceTerminalToken
+    && actionAuthority.identity.lifecycleGeneration === observer.sourceLifecycleGeneration
+    && Number(actionAuthority.identity.runSeq) === Number(observer.sourceRunSeq)
+    && actionAuthority.identity.persistedSessionId === observer.expectedBindingSessionId;
+  if (!authorityVerdict.valid || !sameSourceScope || observer.actionAuthority !== actionAuthority) {
+    transitionMainCodexActionAuthority(
+      actionAuthority,
+      'revoked',
+      authorityVerdict.reason || 'source-scope-mismatch',
+    );
+    console.warn('[CodexWriterHandoff] action boundary source changed tab='
+      + String(tabId).slice(-12)
+      + ' generation=' + observer.launchId
+      + ' reason=' + (authorityVerdict.reason || 'source-scope-mismatch'));
+    return false;
+  }
+  if (actionAuthority.phase === 'armed') {
+    const consumed = transitionMainCodexActionAuthority(
+      actionAuthority,
+      'consumed',
+      'rewind-confirm-boundary',
+    );
+    if (!consumed.success) return false;
+  }
+  const exactOperationId = operationId || actionAuthority.identity.operationId;
+  const exactRequestId = requestId || actionAuthority.identity.requestId;
+  if (String(exactOperationId || '') !== actionAuthority.identity.operationId
+    || String(exactRequestId || '') !== actionAuthority.identity.requestId) {
+    transitionMainCodexActionAuthority(actionAuthority, 'revoked', 'action-request-changed');
     return false;
   }
   const journal = persistPendingCodexNativeRewindHandoff(tabId, {
@@ -35342,8 +36710,8 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
     sourceBindingMode: observer.sourceBindingMode,
     sourceLifecycleGeneration: observer.sourceLifecycleGeneration,
     sourceRunSeq: observer.sourceRunSeq,
-    operationId: String(operationId || observer.launchId),
-    requestId: String(requestId || observer.launchId),
+    operationId: String(exactOperationId),
+    requestId: String(exactRequestId),
     actionGeneration: observer.launchId,
     actionStartedAtMs: boundaryAt,
     targetUuid,
@@ -35484,6 +36852,11 @@ function cancelCodexWriterHandoffBeforeAction(tabId, reason = 'cancelled-before-
   const observer = codexWatchers.get(tabId) || null;
   if (observer?.sourceMode !== 'writer-handoff') return false;
   if (Number.isFinite(Number(observer.handoffActionStartedAtMs))) return false;
+  if (observer.actionAuthority
+    && observer.actionAuthority.phase !== 'revoked'
+    && observer.actionAuthority.phase !== 'committed') {
+    transitionMainCodexActionAuthority(observer.actionAuthority, 'revoked', reason);
+  }
   observer.handoffPending = false;
   clearPendingCodexNativeRewindHandoff(tabId, observer.launchId, reason);
   closeCodexWatcher(tabId, reason);
@@ -35507,6 +36880,11 @@ function cancelCodexWriterHandoffAfterRejectedAction(tabId, reason = 'action-rej
   const observer = codexWatchers.get(tabId) || null;
   if (observer?.sourceMode !== 'writer-handoff') return false;
   if (!Number.isFinite(Number(observer.handoffActionStartedAtMs))) return false;
+  if (observer.actionAuthority
+    && observer.actionAuthority.phase !== 'revoked'
+    && observer.actionAuthority.phase !== 'committed') {
+    transitionMainCodexActionAuthority(observer.actionAuthority, 'revoked', reason);
+  }
   clearPendingCodexNativeRewindHandoff(tabId, observer.launchId, reason);
   observer.handoffPending = false;
   closeCodexWatcher(tabId, reason);
@@ -35629,6 +37007,13 @@ async function settleCodexWriterHandoffObservation(tabId, reason = 'rewind-finis
     handoffSettlement: settlement,
   };
   if (settlement.writerHandoffProven && codexWatchers.get(tabId) === observer) {
+    if (observer.actionAuthority?.phase === 'consumed') {
+      transitionMainCodexActionAuthority(
+        observer.actionAuthority,
+        'committed',
+        settlement.stableWriterProven ? 'rewind-stable-source-committed' : 'rewind-child-committed',
+      );
+    }
     // This observer owns one A→B mutation only. Reusing it would give a later
     // B→C native Rewind stale lineage and generation.
     closeCodexWatcher(tabId, 'writer-handoff-committed');
@@ -35766,6 +37151,16 @@ function startCodexSessionWatcher(sender, {
           // Native rewind may change writers only after the user confirms the
           // selected history point. Keep observing through the whole overlay
           // interaction instead of closing on the currently-open source.
+          return;
+        }
+        if (sourceMode === 'resume'
+          && observerState.provisionalSubmitReservation?.writerAdopted === true
+          && observerState.provisionalSubmitReservation?.auditMatched !== true) {
+          console.log('[Codex Watcher] causal Resume writer adopted; keeping exact submit observer through audit:'
+            + ' session=' + adoption.sessionId
+            + ' tab=' + tabId
+            + ' launch=' + (launchId || 'n/a')
+            + ' submit=' + (observerState.provisionalSubmitReservation.submitId || '-'));
           return;
         }
         if (
