@@ -54,6 +54,14 @@ test('Codex MCP recovery keeps Stop and replacement in one lifecycle transaction
   assert.match(recovery, /launchId: undefined/);
   assert.doesNotMatch(recovery, /stopAiProcessInTabSerialized/);
   assert.doesNotMatch(recovery, /runCodexCommandFromPayload\(sender/);
+  assert.match(main, /mcpStartupRecoveryHandoff\.newTerminalLifecycleGeneration = getTerminalLifecycleGeneration\(tabId\)/);
+
+  const claimedHandoff = main.slice(
+    main.indexOf('function validateClaimedCodexMcpStartupReplacementHandoff'),
+    main.indexOf('function releaseCodexMcpStartupReplacementHandoff'),
+  );
+  assert.match(claimedHandoff, /expectedTerminalGeneration: handoff\.newTerminalLifecycleGeneration/);
+  assert.doesNotMatch(claimedHandoff, /currentTerminalGeneration\) !== handoff\.terminalLifecycleGeneration/);
 
   const launchBoundary = main.slice(
     main.indexOf('const boundary = await withPtyWriteLock(term'),
@@ -77,4 +85,124 @@ test('Codex MCP recovery keeps Stop and replacement in one lifecycle transaction
   assert.match(main, /destructiveProofAvailable:[\s\S]*?authoritativeFrameCommitted === true[\s\S]*?committedFrameGeneration/);
   assert.match(main, /onFlushed:[\s\S]*?commitHeadlessVisibleBufferSnapshot/);
   assert.match(main, /synchronizedOutputOpen === true[\s\S]*?lastCommittedVisibleSnapshot[\s\S]*?committedFrameReplay: true/);
+
+  const armWatchdog = main.slice(
+    main.indexOf('function maybeArmCodexMcpStartupWatchdog'),
+    main.indexOf('function inspectCodexInputReadyVisibleText'),
+  );
+  assert.match(armWatchdog, /codexMcpStartupReplacementHandoffs\.get\(tabId\)/);
+  assert.match(armWatchdog, /shouldSuppressCodexMcpWatchdogArmForReplacementHandoff/);
+  assert.ok(
+    armWatchdog.indexOf('shouldSuppressCodexMcpWatchdogArmForReplacementHandoff')
+      < armWatchdog.indexOf('getCodexMcpStartupWatchdogState'),
+    'a residual stopped frame must be rejected before it can create a new watchdog generation',
+  );
+});
+
+test('late Codex MCP output is gated until the same headless frame commits', () => {
+  const main = read('src/main/main.js');
+  const identity = main.slice(
+    main.indexOf('function getCodexLateMcpRecoveryIdentity'),
+    main.indexOf('function clearCodexLateMcpProofPending'),
+  );
+  assert.match(identity, /validateCodexLateMcpRecoveryIdentity/);
+  assert.match(identity, /terminalLifecycleGeneration/);
+  assert.match(identity, /terminalRunSeq/);
+  assert.match(identity, /inputRevision/);
+  assert.match(identity, /launchId/);
+  assert.match(identity, /currentProcessRunning/);
+  assert.match(identity, /currentStopping/);
+  const headlessCreate = main.slice(
+    main.indexOf('function createHeadlessTerminalMirror'),
+    main.indexOf('function waitForHeadlessSynchronizedOutputClose'),
+  );
+  assert.match(
+    headlessCreate,
+    /commitHeadlessVisibleBufferSnapshot[\s\S]*observeCodexLateMcpProofAfterHeadlessFlush/,
+  );
+
+  const arm = main.slice(
+    main.indexOf('function armCodexLateMcpProofPending'),
+    main.indexOf('function observeCodexLateMcpProofAfterHeadlessFlush'),
+  );
+  assert.match(arm, /getCodexLateMcpRecoveryIdentity/);
+  assert.match(arm, /candidateWriteSeq: Number\(writeIdentity\.writeSeq\)/);
+  assert.match(arm, /mirrorGeneration: writeIdentity\.generation/);
+  assert.match(arm, /emitAgentReadinessChanged/);
+
+  const observer = main.slice(
+    main.indexOf('function observeCodexLateMcpProofAfterHeadlessFlush'),
+    main.indexOf('function clearCodexTuiReady'),
+  );
+  assert.match(observer, /decideCodexLateMcpCommittedFrame/);
+  assert.match(observer, /committedSnapshot\?\.committedWriteSeq/);
+  assert.match(observer, /invalidateCodexTuiReadyForStartupBlocker/);
+  assert.match(observer, /maybeArmCodexMcpStartupWatchdog/);
+
+  const dataHandler = main.slice(
+    main.indexOf('ptyProcess.onData((data) =>'),
+    main.indexOf('ptyProcess.onExit', main.indexOf('ptyProcess.onData((data) =>')),
+  );
+  assert.match(dataHandler, /prepareCodexTuiReadyFrame\(tabId, data\)/);
+  assert.match(dataHandler, /onHeadlessWriteReserved:[\s\S]*armCodexLateMcpProofPending/);
+  assert.match(dataHandler, /headlessPresentationWrite[\s\S]*mcp-startup-proof-unavailable/);
+
+  const streamObserver = main.slice(
+    main.indexOf('async function tryEmitCodexTuiReady'),
+    main.indexOf('function closeCodexWatcher'),
+  );
+  assert.match(streamObserver, /shouldDeferCodexLateMcpCandidateToCommittedFrame/);
+  assert.ok(
+    streamObserver.indexOf('shouldDeferCodexLateMcpCandidateToCommittedFrame')
+      < streamObserver.indexOf('invalidateCodexTuiReadyForStartupBlocker'),
+    'the raw candidate must defer before any readiness invalidation',
+  );
+
+  const readyCommit = main.slice(
+    main.indexOf('async function markCodexTuiReadyAfterVerifiedComposer'),
+    main.indexOf('async function pokeCodexStartupPromptFromVisibleBuffer'),
+  );
+  assert.match(
+    readyCommit,
+    /finishCodexStartupLifecycle\(tabId, reason, \{[\s\S]*preserveLateMcpRecovery: true/,
+  );
+  const taskStarted = main.slice(
+    main.indexOf("clearCodexPromptInFlight(state.tabId, 'task_started')"),
+    main.indexOf("clearCodexPromptInFlight(state.tabId, 'task_started')") + 300,
+  );
+  assert.match(taskStarted, /finishCodexStartupLifecycle\(state\.tabId, 'task_started'\)/);
+  assert.doesNotMatch(taskStarted, /preserveLateMcpRecovery/);
+
+  const submitRevalidation = main.slice(
+    main.indexOf('function revalidateCodexPtySubmitAdmission'),
+    main.indexOf('function captureClaudePromptQueuePtyAdmission'),
+  );
+  assert.match(
+    submitRevalidation,
+    /inputReadinessProofPending: codexLateMcpProofPending\.has\(token\.tabId\)/,
+  );
+
+  const getState = main.slice(
+    main.indexOf('async function getCodexTuiReadyState'),
+    main.indexOf('async function markCodexTuiReadyAfterVerifiedComposer'),
+  );
+  assert.match(
+    getState,
+    /if \(codexTuiReadyTabs\.has\(tabId\)\) \{[\s\S]*inspectAiDescendantProcessesByTabCached/,
+  );
+  assert.match(getState, /inputReady: textReady && processReady/);
+
+  const publicRuntime = main.slice(
+    main.indexOf('function getCodexPublicRuntimeProjection'),
+    main.indexOf('function broadcastCodexPublicRuntimeSnapshot'),
+  );
+  assert.match(publicRuntime, /tuiInputReady: isCodexTuiEffectivelyReady\(tabId\)/);
+  assert.match(publicRuntime, /tuiLifecycleEstablished: codexTuiReadyTabs\.has\(tabId\)/);
+  assert.match(publicRuntime, /inputProofPending: proofPending/);
+
+  const reset = main.slice(
+    main.indexOf('function resetCodexTuiReadyDetection'),
+    main.indexOf('function inspectCodexStartupBlockersText'),
+  );
+  assert.match(reset, /clearCodexLateMcpProofPending[\s\S]*notifyReady: false/);
 });
