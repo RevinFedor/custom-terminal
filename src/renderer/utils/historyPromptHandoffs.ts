@@ -3,9 +3,22 @@ export type HistoryPromptHandoffTool = 'claude' | 'codex';
 export type HistoryPromptHandoffStatus =
   | 'sending'
   | 'queued'
+  | 'audit-pending'
+  | 'delivery-unknown'
   | 'sent'
   | 'cancelled'
   | 'failed';
+
+export type HistoryPromptHandoffUnconfirmedStatus =
+  | 'audit-pending'
+  | 'delivery-unknown';
+
+export interface HistoryPromptHandoffStatusPresentation {
+  label: string;
+  tone: 'info' | 'accent' | 'success' | 'warning' | 'danger';
+  pending: boolean;
+  title: string;
+}
 
 export type HistoryPromptHandoffAgentStatus =
   | 'active'
@@ -47,6 +60,8 @@ export interface HistoryPromptHandoffAuditProof {
 export interface HistoryPromptHandoff {
   tabId: string;
   handoffId: string;
+  sendAttemptId: string | null;
+  sendOperationKey: string | null;
   toolType: HistoryPromptHandoffTool;
   sessionIdHint: string | null;
   text: string;
@@ -65,6 +80,8 @@ export interface HistoryPromptHandoff {
 export interface BeginHistoryPromptHandoffInput {
   tabId: string;
   handoffId: string;
+  sendAttemptId?: string | null;
+  sendOperationKey?: string | null;
   toolType: HistoryPromptHandoffTool;
   sessionIdHint?: string | null;
   text: string;
@@ -115,6 +132,22 @@ export interface HistoryPromptHandoffStoreStats {
   approxBytes: number;
 }
 
+export function historyPromptHandoffAcceptsAuditIdentity(
+  handoff: Pick<HistoryPromptHandoff, 'sendAttemptId' | 'sendOperationKey'> | null | undefined,
+  audit: { sendAttemptId?: unknown; sendOperationKey?: unknown } | null | undefined,
+): boolean {
+  if (!handoff) return false;
+  if (handoff.sendAttemptId
+    && handoff.sendAttemptId !== String(audit?.sendAttemptId || '')) {
+    return false;
+  }
+  if (handoff.sendOperationKey
+    && handoff.sendOperationKey !== String(audit?.sendOperationKey || '')) {
+    return false;
+  }
+  return true;
+}
+
 export const DEFAULT_HISTORY_PROMPT_HANDOFF_LIMITS:
   Readonly<HistoryPromptHandoffStoreLimits> = Object.freeze({
     maxTabs: 16,
@@ -137,6 +170,8 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
   let bytes = RECORD_OVERHEAD_BYTES
     + stringBytes(value.tabId)
     + stringBytes(value.handoffId)
+    + stringBytes(value.sendAttemptId)
+    + stringBytes(value.sendOperationKey)
     + stringBytes(value.toolType)
     + stringBytes(value.sessionIdHint)
     + stringBytes(value.text)
@@ -280,6 +315,31 @@ export class HistoryPromptHandoffStore {
     const existing = this.tabs.get(tabId)?.get(handoffId);
     if (existing) {
       this.promoteTab(tabId);
+      const nextAttemptId = typeof input.sendAttemptId === 'string'
+        ? input.sendAttemptId.trim()
+        : '';
+      const currentAttemptId = existing.value.sendAttemptId || '';
+      const retryable = existing.value.queueStatus === 'failed'
+        || existing.value.queueStatus === 'cancelled';
+      if (nextAttemptId && nextAttemptId !== currentAttemptId && retryable) {
+        const next = freezeHandoff({
+          ...existing.value,
+          sendAttemptId: nextAttemptId,
+          sendOperationKey: typeof input.sendOperationKey === 'string'
+            ? input.sendOperationKey.trim() || null
+            : existing.value.sendOperationKey,
+          submittedAt: finiteTimestamp(input.submittedAt, Date.now()),
+          queueStatus: 'sending',
+          statusReason: 'send-retry-start',
+          statusChangedAt: finiteTimestamp(input.submittedAt, Date.now()),
+          auditProof: null,
+        });
+        const nextBytes = estimateHandoffBytes(next);
+        this.approxBytes += nextBytes - existing.approxBytes;
+        this.tabs.get(tabId)?.set(handoffId, { value: next, approxBytes: nextBytes });
+        this.notify(tabId, { type: 'begin', handoffId });
+        return next;
+      }
       return existing.value;
     }
 
@@ -288,6 +348,12 @@ export class HistoryPromptHandoffStore {
     const value = freezeHandoff({
       tabId,
       handoffId,
+      sendAttemptId: typeof input.sendAttemptId === 'string'
+        ? input.sendAttemptId.trim() || null
+        : null,
+      sendOperationKey: typeof input.sendOperationKey === 'string'
+        ? input.sendOperationKey.trim() || null
+        : null,
       toolType: input.toolType,
       sessionIdHint: typeof input.sessionIdHint === 'string' ? input.sessionIdHint : null,
       text: String(input.text || ''),
@@ -543,6 +609,87 @@ export function historyPromptHandoffAuditProofFromSendResult(
 }
 
 /**
+ * Maps only an explicit transport receipt to a presentation state. This is a
+ * renderer projection, not permission to send or retry the prompt.
+ */
+export function historyPromptHandoffUnconfirmedStatusFromSendResult(
+  result: any,
+): HistoryPromptHandoffUnconfirmedStatus | null {
+  if (!result || typeof result !== 'object') return null;
+  if (result.deliveryUnknown === true || result.status === 'delivery-unknown') {
+    return 'delivery-unknown';
+  }
+  if (
+    result.auditPending === true
+    || result.userMessageAuditPending === true
+    || result.status === 'audit-pending'
+    || result.codexAudit?.lateReconciliationPending === true
+    || result.pasteAudit?.lateReconciliationPending === true
+  ) {
+    return 'audit-pending';
+  }
+  return null;
+}
+
+export function historyPromptHandoffStatusPresentation(
+  status: HistoryPromptHandoffStatus | null | undefined,
+): HistoryPromptHandoffStatusPresentation | null {
+  switch (status) {
+    case 'sending':
+      return {
+        label: 'SENDING',
+        tone: 'info',
+        pending: true,
+        title: 'Сообщение отправляется',
+      };
+    case 'queued':
+      return {
+        label: 'QUEUED',
+        tone: 'accent',
+        pending: true,
+        title: 'Сообщение ждёт завершения текущего ответа',
+      };
+    case 'audit-pending':
+      return {
+        label: 'CONFIRMING',
+        tone: 'accent',
+        pending: true,
+        title: 'Команда отправлена; приложение ждёт точного подтверждения в истории',
+      };
+    case 'delivery-unknown':
+      return {
+        label: 'UNCONFIRMED',
+        tone: 'warning',
+        pending: false,
+        title: 'Доставка не подтверждена. Не отправляйте текст повторно как новую команду',
+      };
+    case 'sent':
+      return {
+        label: 'SENT',
+        tone: 'success',
+        pending: false,
+        title: 'Сообщение передано агенту и ожидает появления в сохранённой истории',
+      };
+    case 'cancelled':
+      return {
+        label: 'CANCELLED',
+        tone: 'warning',
+        pending: false,
+        title: 'Отправка отменена до появления сообщения в сохранённой истории',
+      };
+    case 'failed':
+      return {
+        label: 'SEND FAILED',
+        tone: 'danger',
+        pending: false,
+        title: 'Сообщение не удалось отправить',
+      };
+    default:
+      return null;
+  }
+}
+
+/**
  * Starts the renderer-owned History projection before an external transport
  * touches the PTY, then settles that exact row from the shared send result.
  */
@@ -565,23 +712,23 @@ export async function runHistoryPromptHandoff(
       || typeof result !== 'object'
       || result.success !== false
       || result.submitted === true;
-    const lateAuditPending = result?.codexAudit?.lateReconciliationPending === true
-      || result?.pasteAudit?.lateReconciliationPending === true;
+    const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(result);
     const proof = historyPromptHandoffAuditProofFromSendResult(result);
     const queueStatus: Exclude<HistoryPromptHandoffStatus, 'sending'> = !transferred
-      || (result?.success === false && result?.submitted === true && !lateAuditPending)
+      || (result?.success === false && result?.submitted === true && !unconfirmedStatus)
       ? 'failed'
-      : result?.queued === true
-        ? 'queued'
-        : 'sent';
+      : unconfirmedStatus
+        || (result?.queued === true ? 'queued' : 'sent');
     store.settle(input.tabId, handoffId, {
       queueStatus,
       reason: !transferred
         ? 'send-refused-before-submit'
         : queueStatus === 'failed'
           ? 'send-submitted-audit-failed'
-          : lateAuditPending
+          : queueStatus === 'audit-pending'
             ? 'send-submitted-audit-pending'
+            : queueStatus === 'delivery-unknown'
+              ? 'send-delivery-unknown'
             : 'send-result',
       ...(proof ? { proof } : {}),
       requiresAuditIdentity: transferred,

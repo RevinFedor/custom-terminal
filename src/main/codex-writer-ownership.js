@@ -821,6 +821,110 @@ function selectCodexSettledRewindWriter(candidates, {
 }
 
 /**
+ * Preserve the exact source writer only for the short interval after native
+ * Rewind Enter and before its successor rollout is materialized. This proof is
+ * intentionally read-only: it can keep the existing writer proof alive, but
+ * can never select the source as the Rewind child or complete the handoff.
+ */
+function selectCodexNativeRewindSourceIncumbent(candidates, {
+  kind = null,
+  valid = false,
+  sessionId = null,
+  filePath = null,
+  actionGeneration = null,
+  observerGeneration = null,
+  terminalToken = null,
+  observerTerminalToken = null,
+  lifecycleGeneration = null,
+  observerLifecycleGeneration = null,
+  runSeq = null,
+  observerRunSeq = null,
+  expectedBindingSessionId = null,
+  boundSessionId = null,
+  actionAuthorityId = null,
+} = {}) {
+  const allCandidates = Array.isArray(candidates) ? candidates : [];
+  if (kind !== 'native-rewind-source-incumbent' || valid !== true) {
+    return {
+      status: 'unresolved',
+      reason: kind === 'native-rewind-source-incumbent'
+        ? 'source-incumbent-proof-invalid'
+        : 'not-native-rewind-source-incumbent',
+      candidates: allCandidates,
+    };
+  }
+  if (!sessionId
+    || !filePath
+    || !actionGeneration
+    || !observerGeneration
+    || !terminalToken
+    || !observerTerminalToken
+    || !lifecycleGeneration
+    || !observerLifecycleGeneration
+    || !Number.isInteger(runSeq)
+    || runSeq <= 0
+    || !Number.isInteger(observerRunSeq)
+    || observerRunSeq <= 0
+    || !expectedBindingSessionId
+    || !boundSessionId
+    || !actionAuthorityId) {
+    return {
+      status: 'unresolved',
+      reason: 'source-incumbent-context-missing',
+      candidates: allCandidates,
+    };
+  }
+  if (actionGeneration !== observerGeneration) {
+    return { status: 'unresolved', reason: 'stale-source-incumbent-generation', candidates: allCandidates };
+  }
+  if (terminalToken !== observerTerminalToken) {
+    return { status: 'unresolved', reason: 'stale-source-incumbent-terminal', candidates: allCandidates };
+  }
+  if (lifecycleGeneration !== observerLifecycleGeneration) {
+    return { status: 'unresolved', reason: 'stale-source-incumbent-lifecycle', candidates: allCandidates };
+  }
+  if (runSeq !== observerRunSeq) {
+    return { status: 'unresolved', reason: 'stale-source-incumbent-run', candidates: allCandidates };
+  }
+  if (String(expectedBindingSessionId) !== String(boundSessionId)) {
+    return { status: 'unresolved', reason: 'source-incumbent-binding-mismatch', candidates: allCandidates };
+  }
+
+  const canonicalProofPath = canonicalizeExistingPath(filePath);
+  const exactCandidates = allCandidates.filter((candidate) => {
+    const meta = candidateSessionMeta(candidate);
+    return String(meta.id || '') === String(sessionId)
+      && canonicalizeExistingPath(candidate.filePath) === canonicalProofPath;
+  });
+  if (exactCandidates.length !== 1) {
+    return {
+      status: 'unresolved',
+      reason: exactCandidates.length > 1
+        ? 'duplicate-source-incumbent-candidate'
+        : 'source-incumbent-candidate-missing',
+      candidates: allCandidates,
+    };
+  }
+  if (allCandidates.length !== 1) {
+    return {
+      status: 'unresolved',
+      reason: 'source-incumbent-competitor-present',
+      candidates: allCandidates,
+    };
+  }
+  return {
+    status: 'selected',
+    candidate: exactCandidates[0],
+    sessionId: String(sessionId),
+    sourceSessionId: String(sessionId),
+    actionGeneration,
+    lineageDepth: 0,
+    lineageRelation: 'source-incumbent',
+    candidates: allCandidates,
+  };
+}
+
+/**
  * Select the writer that Codex materializes on the first Enter after a
  * stable-source native Rewind.
  *
@@ -998,6 +1102,45 @@ function selectCodexDelayedStableSourceWriter(candidates, {
     candidates: allCandidates,
     rejected,
   };
+}
+
+function selectCodexDelayedWriterWatchTargets(candidates, {
+  sourceSessionId = null,
+  cwd = null,
+  sessionsDir = null,
+} = {}) {
+  if (!sourceSessionId
+    || !cwd
+    || !sessionsDir
+    || !path.isAbsolute(String(cwd))
+    || !path.isAbsolute(String(sessionsDir))) {
+    return [];
+  }
+  const expectedCwd = path.resolve(String(cwd));
+  const root = canonicalizeExistingPath(String(sessionsDir));
+  const byPath = new Map();
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const meta = candidateSessionMeta(candidate);
+    const sessionId = meta.id ? String(meta.id) : '';
+    const filePath = typeof candidate?.filePath === 'string'
+      ? candidate.filePath
+      : '';
+    if (!sessionId
+      || sessionId === String(sourceSessionId)
+      || !filePath
+      || !path.isAbsolute(filePath)
+      || path.extname(filePath) !== '.jsonl'
+      || !meta.cwd
+      || path.resolve(String(meta.cwd)) !== expectedCwd) {
+      continue;
+    }
+    const canonicalPath = canonicalizeExistingPath(filePath);
+    if (!isPathInside(canonicalPath, root) || byPath.has(canonicalPath)) continue;
+    byPath.set(canonicalPath, { sessionId, filePath: canonicalPath });
+  }
+  return Array.from(byPath.values()).sort((a, b) => (
+    a.filePath.localeCompare(b.filePath)
+  ));
 }
 
 /**
@@ -1263,14 +1406,25 @@ function projectCodexWriterProofKind({
   return 'process-open-rollout';
 }
 
+function hasCodexWriterHandoffActionBoundary(value) {
+  if (value === null || value === undefined || value === '') return false;
+  const timestamp = Number(value);
+  return Number.isFinite(timestamp) && timestamp > 0;
+}
+
+function normalizeCodexPositiveRunSeq(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const runSeq = Number(value);
+  return Number.isInteger(runSeq) && runSeq > 0 ? runSeq : null;
+}
+
 function shouldUseSettledCodexRewindWriterProof({
   sourceMode = null,
   handoffActionStartedAtMs = null,
 } = {}) {
-  const hasActionBoundary = handoffActionStartedAtMs !== null
-    && handoffActionStartedAtMs !== undefined
-    && handoffActionStartedAtMs !== ''
-    && Number.isFinite(Number(handoffActionStartedAtMs));
+  const hasActionBoundary = hasCodexWriterHandoffActionBoundary(
+    handoffActionStartedAtMs,
+  );
   return sourceMode !== 'writer-handoff'
     || !hasActionBoundary;
 }
@@ -1280,6 +1434,7 @@ async function resolveCodexUserWriterProof(proof, {
   isUserSession,
   handoff = null,
   settledWriter = null,
+  sourceIncumbent = null,
 } = {}) {
   if (!proof || proof.status === 'unknown' || proof.status === 'pending') return proof;
   if (typeof readMetadata !== 'function' || typeof isUserSession !== 'function') {
@@ -1317,14 +1472,33 @@ async function resolveCodexUserWriterProof(proof, {
     const handoffSelection = handoff
       ? selectCodexNativeRewindWriter(userCandidates, handoff)
       : null;
-    const settledSelection = !handoff && settledWriter
+    const settledSelection = settledWriter
       ? selectCodexSettledRewindWriter(userCandidates, settledWriter)
+      : null;
+    const sourceIncumbentSelection = sourceIncumbent
+      ? selectCodexNativeRewindSourceIncumbent(userCandidates, sourceIncumbent)
       : null;
     // Once the native-Rewind action boundary has been crossed, even a single
     // open rollout is not automatically the new writer. It may simply be the
     // still-open source. Require the same ancestry + exact-generation live
     // proof used for the two-open-rollout case.
     if (handoff && handoffSelection?.status !== 'selected') {
+      const exactIncumbentSelection = sourceIncumbentSelection?.status === 'selected'
+        ? sourceIncumbentSelection
+        : settledWriter?.incumbentOnly === true && settledSelection?.status === 'selected'
+          ? settledSelection
+          : null;
+      if (exactIncumbentSelection) {
+        return {
+          status: 'incumbent-overlap-pending',
+          reason: 'active-handoff-awaiting-successor',
+          candidates: userCandidates,
+          ignoredCandidates,
+          allCandidates: classified,
+          handoffProof: handoffSelection,
+          incumbentWriterProof: exactIncumbentSelection,
+        };
+      }
       return {
         status: 'ambiguous',
         reason: 'handoff-branch-unresolved',
@@ -1354,7 +1528,7 @@ async function resolveCodexUserWriterProof(proof, {
       ignoredCandidates,
       allCandidates: classified,
       ...(handoffSelection ? { handoffProof: handoffSelection } : {}),
-      ...(settledSelection ? { settledWriterProof: settledSelection } : {}),
+      ...(!handoff && settledSelection ? { settledWriterProof: settledSelection } : {}),
     };
   }
   if (userCandidates.length > 1) {
@@ -1377,11 +1551,34 @@ async function resolveCodexUserWriterProof(proof, {
     }
     // A currently active handoff always wins over an incumbent settlement.
     // If the new handoff is unresolved, remain ambiguous instead of falling
-    // back to the writer from the previous Rewind.
-    const settledSelection = !handoff && settledWriter
+    // back to the writer from the previous Rewind. The one exception is an
+    // exact incumbent plus only its ancestors: retain that old writer as a
+    // read-only proof while waiting for the current handoff's exact child.
+    const settledSelection = settledWriter
       ? selectCodexSettledRewindWriter(userCandidates, settledWriter)
       : null;
-    if (settledSelection?.status === 'selected') {
+    const sourceIncumbentSelection = sourceIncumbent
+      ? selectCodexNativeRewindSourceIncumbent(userCandidates, sourceIncumbent)
+      : null;
+    if (handoff
+      && (
+        sourceIncumbentSelection?.status === 'selected'
+        || (settledWriter?.incumbentOnly === true
+          && settledSelection?.status === 'selected')
+      )) {
+      return {
+        status: 'incumbent-overlap-pending',
+        reason: 'active-handoff-awaiting-successor',
+        candidates: userCandidates,
+        ignoredCandidates,
+        allCandidates: classified,
+        handoffProof: handoffSelection,
+        incumbentWriterProof: sourceIncumbentSelection?.status === 'selected'
+          ? sourceIncumbentSelection
+          : settledSelection,
+      };
+    }
+    if (!handoff && settledSelection?.status === 'selected') {
       const selected = settledSelection.candidate;
       return {
         status: 'owned',
@@ -1808,9 +2005,13 @@ module.exports = {
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
   projectCodexWriterProofKind,
+  hasCodexWriterHandoffActionBoundary,
+  normalizeCodexPositiveRunSeq,
   shouldUseSettledCodexRewindWriterProof,
   selectCodexNativeRewindWriter,
+  selectCodexNativeRewindSourceIncumbent,
   selectCodexDelayedStableSourceWriter,
+  selectCodexDelayedWriterWatchTargets,
   selectCodexSettledRewindWriter,
   runKeyedExclusive,
   runKeyedSingleFlight,

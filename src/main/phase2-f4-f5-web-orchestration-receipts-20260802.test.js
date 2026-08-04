@@ -9,9 +9,12 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const test = require('node:test');
+const Database = require('better-sqlite3');
 
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { classifyAgentSendReceipt } = require('./orchestration-runs');
+const { createAgentSendReceiptStore, STORE_STATES } = require('./agent-send-receipt-store');
+const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
 
 const repoDir = path.join(__dirname, '../..');
 const historyAgentRuntimeSource = fs.readFileSync(
@@ -20,6 +23,10 @@ const historyAgentRuntimeSource = fs.readFileSync(
 );
 const historyPanelSource = fs.readFileSync(
   path.join(repoDir, 'src/renderer/components/Workspace/HistoryPanel.tsx'),
+  'utf8',
+);
+const historyPromptHandoffSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/utils/historyPromptHandoffs.ts'),
   'utf8',
 );
 const webServerSource = fs.readFileSync(
@@ -33,14 +40,20 @@ test('F4 real Codex runtime preserves its softened post-Enter state as audit-pen
     /if \(auditTimeoutAfterSubmit\)[\s\S]{0,700}status: 'audit-pending',[\s\S]{0,180}auditPending: true/,
     'the renderer may soften the History error, but it must keep the pending receipt for Project API, MCP, and Inbox',
   );
-  const pendingStart = historyPanelSource.indexOf('const lateAuditPending =');
+  const pendingStart = historyPanelSource.indexOf(
+    'const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(result)',
+  );
   assert.ok(pendingStart >= 0);
   const pendingSendBoundary = historyPanelSource.slice(pendingStart, pendingStart + 3_500);
-  assert.match(pendingSendBoundary, /result\?\.auditPending === true/);
   assert.match(
     pendingSendBoundary,
-    /sendDeliveryUnconfirmed = result\?\.submitted === true\s*&& \(result\?\.success === false \|\| lateAuditPending\)/,
+    /sendDeliveryUnconfirmed = unconfirmedStatus !== null/,
     'History must preserve the prompt while rendering a post-Enter soft timeout as unresolved rather than final sent',
+  );
+  assert.match(
+    historyPromptHandoffSource,
+    /result\.auditPending === true[\s\S]{0,500}return 'audit-pending'/,
+    'the shared renderer classifier must preserve audit-pending as a distinct UI receipt',
   );
 });
 
@@ -57,9 +70,22 @@ test('F4 renderer bridge timeout remains delivery-unknown instead of fabricated 
   });
   assert.match(
     webServerSource,
-    /error\?\.code !== 'bridge_timeout'[\s\S]{0,1200}status: 'delivery-unknown'[\s\S]{0,200}deliveryUnknown: true/,
+    /BrowserWindow\.send crossed the main -> renderer boundary[\s\S]{0,1600}status: 'delivery-unknown'[\s\S]{0,200}deliveryUnknown: true/,
     'the live renderer bridge timeout must produce an explicit unknown receipt',
   );
+  assert.deepEqual(classifyAgentSendReceipt({ success: true }), {
+    state: 'delivery-unknown',
+    submitted: null,
+    accepted: true,
+  }, 'an incomplete success-shaped adapter response must not fabricate physical Enter proof');
+  assert.deepEqual(classifyAgentSendReceipt({
+    success: true,
+    receiptState: 'delivery-unknown',
+  }), {
+    state: 'delivery-unknown',
+    submitted: null,
+    accepted: true,
+  }, 'the exact registry state must win over a legacy success-shaped field');
 });
 
 async function freePort() {
@@ -88,7 +114,7 @@ async function waitFor(predicate, message, timeoutMs = 3_000) {
   throw new Error(message + (last instanceof Error ? ': ' + last.message : ''));
 }
 
-async function callMcpSendPrompt({ homeDir, tabId, prompt }) {
+async function callMcpSendPrompt({ homeDir, tabId, prompt, handoffId }) {
   const child = spawn(process.execPath, [
     path.join(repoDir, 'mcp/terminal-server.mjs'),
     '--project',
@@ -124,7 +150,7 @@ async function callMcpSendPrompt({ homeDir, tabId, prompt }) {
     method: 'tools/call',
     params: {
       name: 'send_prompt',
-      arguments: { tabId, prompt, submit: true },
+      arguments: { tabId, prompt, submit: true, ...(handoffId ? { handoffId } : {}) },
     },
   }) + '\n');
   try {
@@ -142,6 +168,8 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
   const tempHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'noted-phase2-f4-f5-'));
   const userDataDir = path.join(tempHome, 'user-data');
   await fs.promises.mkdir(userDataDir, { recursive: true });
+  const receiptDb = new Database(path.join(userDataDir, 'agent-send-receipts.sqlite'));
+  const receiptStore = createAgentSendReceiptStore(receiptDb);
   const port = await freePort();
   const oldHome = process.env.HOME;
   const oldPort = process.env.NOTED_WEB_PORT;
@@ -195,11 +223,22 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     path: '/tmp/noted-phase2-inbox',
     tabs: [],
   }];
+  const archivedClosedTarget = {
+    id: 902,
+    project_id: 'phase2-project',
+    tab_id: 'phase2-closed-target',
+    name: 'Closed target',
+    cwd: '/tmp/noted-phase2-project',
+    command_type: 'claude',
+    claude_session_id: 'phase2-closed-session',
+  };
   const projectManager = {
     db: {
       getAllProjects: () => projects,
       getProjectById: (id) => projects.find((project) => project.id === id) || null,
-      getTabHistoryEntriesByTabId: () => [],
+      getTabHistoryEntriesByTabId: (tabId) => (
+        tabId === archivedClosedTarget.tab_id ? [archivedClosedTarget] : []
+      ),
     },
   };
 
@@ -209,6 +248,10 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     completionPrompt: '',
     completionSendCount: 0,
     inboxCounter: 0,
+    createAgentTabCalls: 0,
+    failNextCreateAgentTab: false,
+    closedRestoreCount: 0,
+    bridgeAvailable: true,
     sendResponder: async () => ({ success: true, submitted: true }),
     turnResult: {
       found: false,
@@ -217,22 +260,24 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       error: 'not materialized',
     },
   };
+  const isInboxTab = (tabId) => tabId.startsWith('phase2-inbox')
+    || tabId.startsWith('__noted_inbox__-tab-external-');
   const readyStatus = (tabId) => ({
     tabId,
-    toolType: tabId.startsWith('phase2-inbox') ? 'codex' : 'claude',
-    commandType: tabId.startsWith('phase2-inbox') ? 'codex' : 'claude',
+    toolType: isInboxTab(tabId) ? 'codex' : 'claude',
+    commandType: isInboxTab(tabId) ? 'codex' : 'claude',
     status: 'active',
     sessionStatus: 'active',
     inputReady: true,
     busy: false,
     sessionId: tabId === 'phase2-source-tab'
       ? 'phase2-source-session'
-      : tabId.startsWith('phase2-inbox')
+      : isInboxTab(tabId)
         ? 'phase2-inbox-session'
         : 'phase2-target-session',
     lifecycleGeneration: 'phase2-life:' + tabId,
-    writerConfirmed: tabId.startsWith('phase2-inbox'),
-    writerUsableForMutation: tabId.startsWith('phase2-inbox'),
+    writerConfirmed: isInboxTab(tabId),
+    writerUsableForMutation: isInboxTab(tabId),
     cwd: '/tmp/noted-phase2-project',
   });
   const resolveBridge = async (action, payload) => {
@@ -246,7 +291,27 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     }
     if (action === 'getClaudeTabStatus') return readyStatus(payload.tabId);
     if (action === 'ensureInboxProject') return { success: true };
+    if (action === 'restoreClosedAgentTab') {
+      controller.closedRestoreCount += 1;
+      const project = projects.find((item) => item.id === payload.projectId);
+      if (!project) throw new Error('restore project missing');
+      if (!project.tabs.some((tab) => tab.tabId === payload.expectedTabId)) {
+        project.tabs.push({
+          tabId: payload.expectedTabId,
+          name: archivedClosedTarget.name,
+          commandType: 'claude',
+          claudeSessionId: archivedClosedTarget.claude_session_id,
+          cwd: archivedClosedTarget.cwd,
+        });
+      }
+      return { success: true, tabId: payload.expectedTabId };
+    }
     if (action === 'createAgentTab') {
+      controller.createAgentTabCalls += 1;
+      if (controller.failNextCreateAgentTab) {
+        controller.failNextCreateAgentTab = false;
+        throw new Error('synthetic create failure before tab exists');
+      }
       controller.inboxCounter += 1;
       return {
         success: true,
@@ -284,7 +349,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       isPackaged: false,
       getPath: () => userDataDir,
     },
-    BrowserWindow: { getAllWindows: () => [fakeWindow] },
+    BrowserWindow: { getAllWindows: () => (controller.bridgeAvailable ? [fakeWindow] : []) },
     ipcMain,
   };
 
@@ -301,21 +366,23 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
   };
 
   let webServer;
+  const startOptions = {
+    sdkSessions: new Map(),
+    agentSendReceiptStore: receiptStore,
+    readAgentStartReadiness: async (tabId) => readyStatus(tabId),
+    getAgentTurnResult: async () => controller.turnResult,
+    getAgentExecutionContext: () => ({
+      provider: 'claude',
+      sessionId: 'phase2-source-session',
+      turnId: 'phase2-source-turn',
+      generation: 1,
+      startedAt: Date.now(),
+    }),
+  };
   try {
     delete require.cache[require.resolve('./web-server')];
     webServer = require('./web-server');
-    webServer.start({
-      sdkSessions: new Map(),
-      readAgentStartReadiness: async (tabId) => readyStatus(tabId),
-      getAgentTurnResult: async () => controller.turnResult,
-      getAgentExecutionContext: () => ({
-        provider: 'claude',
-        sessionId: 'phase2-source-session',
-        turnId: 'phase2-source-turn',
-        generation: 1,
-        startedAt: Date.now(),
-      }),
-    });
+    webServer.start(startOptions);
   } catch (error) {
     Module._load = originalLoad;
     throw error;
@@ -323,6 +390,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
 
   t.after(async () => {
     try { webServer?.stop(); } catch {}
+    try { receiptDb.close(); } catch {}
     Module._load = originalLoad;
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
@@ -362,6 +430,13 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       return false;
     }
   }, 'mock Project API was not reachable');
+  const scenarioSendCount = (handoffId) => controller.calls.filter((call) => (
+    call.action === 'sendAgentPromptScenario'
+      && (!handoffId || call.payload?.handoffId === handoffId)
+  )).length;
+  const scenarioPayload = (handoffId) => controller.calls.findLast((call) => (
+    call.action === 'sendAgentPromptScenario' && call.payload?.handoffId === handoffId
+  ))?.payload || null;
 
   await t.test('F4 strongest counterexample: submitted:false remains a retryable HTTP 409', async () => {
     controller.sendResponder = async () => ({
@@ -376,6 +451,68 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     });
     assert.equal(response.status, 409);
     assert.equal(response.body.submitted, false);
+  });
+
+  await t.test('F4 a missing archived target preserves its exact HTTP 404 before any send', async () => {
+    const before = scenarioSendCount();
+    const response = await api('/api/terminal-tabs/phase2-missing-target/send', {
+      prompt: 'missing target must fail before submit',
+      handoffId: 'phase2-missing-target-handoff',
+      source: 'phase2-test',
+    });
+    assert.deepEqual({
+      status: response.status,
+      submitted: response.body.submitted,
+      code: response.body.code,
+      sends: scenarioSendCount() - before,
+    }, {
+      status: 404,
+      submitted: false,
+      code: 'target_tab_not_restorable',
+      sends: 0,
+    });
+  });
+
+  await t.test('F4 bridge unavailable is proven pre-dispatch and remains retryable HTTP 503', async () => {
+    controller.bridgeAvailable = false;
+    try {
+      const response = await api('/api/terminal-tabs/phase2-target-tab/send', {
+        prompt: 'bridge unavailable before renderer dispatch',
+        handoffId: 'phase2-bridge-unavailable-handoff',
+        source: 'phase2-test',
+      });
+      assert.deepEqual({
+        status: response.status,
+        submitted: response.body.submitted,
+        code: response.body.code,
+      }, {
+        status: 503,
+        submitted: false,
+        code: 'bridge_unavailable',
+      });
+    } finally {
+      controller.bridgeAvailable = true;
+    }
+  });
+
+  await t.test('F4 incomplete success-shaped renderer result remains HTTP 202 unknown', async () => {
+    controller.sendResponder = async () => ({ success: true });
+    const response = await api('/api/terminal-tabs/phase2-target-tab/send', {
+      prompt: 'incomplete renderer receipt must not become sent',
+      handoffId: 'phase2-incomplete-success-handoff',
+      source: 'phase2-test',
+    });
+    assert.deepEqual({
+      status: response.status,
+      deliveryStatus: response.body.status,
+      submitted: response.body.submitted,
+      success: response.body.success,
+    }, {
+      status: 202,
+      deliveryStatus: 'delivery-unknown',
+      submitted: null,
+      success: null,
+    });
   });
 
   await t.test('F4 exact audited delivery remains an HTTP 200 success', async () => {
@@ -473,6 +610,235 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     });
   });
 
+  await t.test('G09 same Project API handoff replays pending receipt and exact late audit promotes it', async () => {
+    const handoffId = 'g09-project-idempotent-handoff';
+    const prompt = 'G09 exact one physical Project API prompt';
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: true,
+      accepted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      handoffId: payload.handoffId,
+    });
+    const request = {
+      prompt,
+      handoffId,
+      source: 'phase2-test',
+      queue: false,
+    };
+    const first = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    const durablePayload = scenarioPayload(handoffId);
+    assert.ok(durablePayload?.sendOperationKey);
+    assert.ok(durablePayload?.sendAttemptId);
+    const replay = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    const changed = await api('/api/terminal-tabs/phase2-target-tab/send', {
+      ...request,
+      prompt: prompt + ' changed',
+    });
+    assert.deepEqual({
+      first: first.status,
+      replay: replay.status,
+      replayed: replay.body.replayed,
+      changed: changed.status,
+      changedCode: changed.body.code,
+      sends: scenarioSendCount(handoffId),
+    }, {
+      first: 202,
+      replay: 202,
+      replayed: true,
+      changed: 409,
+      changedCode: 'agent_send_handoff_conflict',
+      sends: 1,
+    });
+
+    const hash = promptAuditFingerprint(prompt);
+    const wrongAudit = await webServer.notifyAgentPromptAuditResult({
+      success: true,
+      tabId: 'phase2-target-tab',
+      toolType: 'claude',
+      handoffId,
+      expectedHash: hash,
+      actualHash: promptAuditFingerprint(prompt + ' wrong'),
+      sessionId: 'phase2-target-session',
+      entryUuid: 'g09-wrong-entry',
+      sendOperationKey: durablePayload.sendOperationKey,
+      sendAttemptId: durablePayload.sendAttemptId,
+    });
+    assert.equal(wrongAudit.confirmed, false);
+    assert.equal((await api('/api/terminal-tabs/phase2-target-tab/send', request)).status, 202);
+
+    const exactAudit = await webServer.notifyAgentPromptAuditResult({
+      success: true,
+      tabId: 'phase2-target-tab',
+      toolType: 'claude',
+      handoffId,
+      expectedHash: hash,
+      actualHash: hash,
+      sessionId: 'phase2-target-session',
+      entryUuid: 'g09-exact-entry',
+      sendOperationKey: durablePayload.sendOperationKey,
+      sendAttemptId: durablePayload.sendAttemptId,
+    });
+    const confirmedReplay = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    assert.deepEqual({
+      auditConfirmed: exactAudit.confirmed,
+      status: confirmedReplay.status,
+      exactAuditConfirmed: confirmedReplay.body.exactAuditConfirmed,
+      sends: scenarioSendCount(handoffId),
+    }, {
+      auditConfirmed: true,
+      status: 200,
+      exactAuditConfirmed: true,
+      sends: 1,
+    });
+  });
+
+  await t.test('G09 audit without the durable operation and attempt cannot confirm only memory', async () => {
+    const handoffId = 'g09-missing-durable-audit-identity';
+    const prompt = 'G09 missing durable audit identity must stay pending';
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: true,
+      accepted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      handoffId: payload.handoffId,
+    });
+    const request = { prompt, handoffId, source: 'phase2-test' };
+    assert.equal((await api('/api/terminal-tabs/phase2-target-tab/send', request)).status, 202);
+    const durablePayload = scenarioPayload(handoffId);
+    assert.ok(durablePayload?.sendOperationKey);
+    assert.ok(durablePayload?.sendAttemptId);
+    const hash = promptAuditFingerprint(prompt);
+    const auditBase = {
+      success: true,
+      tabId: 'phase2-target-tab',
+      toolType: 'claude',
+      handoffId,
+      expectedHash: hash,
+      actualHash: hash,
+      sessionId: 'phase2-target-session',
+      entryUuid: 'g09-missing-durable-identity-entry',
+    };
+
+    const missing = await webServer.notifyAgentPromptAuditResult(auditBase);
+    const partial = await webServer.notifyAgentPromptAuditResult({
+      ...auditBase,
+      sendOperationKey: durablePayload.sendOperationKey,
+    });
+    const stillPending = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    assert.deepEqual({
+      missingConfirmed: missing.confirmed,
+      missingReason: missing.reason,
+      partialConfirmed: partial.confirmed,
+      partialReason: partial.reason,
+      replayStatus: stillPending.status,
+      durableState: receiptStore.get(durablePayload.sendOperationKey)?.state,
+      sends: scenarioSendCount(handoffId),
+    }, {
+      missingConfirmed: false,
+      missingReason: 'durable-audit-identity-missing',
+      partialConfirmed: false,
+      partialReason: 'durable-audit-identity-missing',
+      replayStatus: 202,
+      durableState: STORE_STATES.AUDIT_PENDING,
+      sends: 1,
+    });
+
+    const exact = await webServer.notifyAgentPromptAuditResult({
+      ...auditBase,
+      sendOperationKey: durablePayload.sendOperationKey,
+      sendAttemptId: durablePayload.sendAttemptId,
+    });
+    assert.equal(exact.confirmed, true);
+    assert.equal((await api('/api/terminal-tabs/phase2-target-tab/send', request)).status, 200);
+  });
+
+  await t.test('G09 delivery-unknown replay cannot cross the renderer bridge twice', async () => {
+    const handoffId = 'g09-project-unknown-handoff';
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: null,
+      accepted: true,
+      status: 'delivery-unknown',
+      deliveryUnknown: true,
+      handoffId: payload.handoffId,
+    });
+    const request = {
+      prompt: 'G09 delivery unknown one physical attempt',
+      handoffId,
+      source: 'phase2-test',
+    };
+    const first = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    const replay = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    assert.deepEqual({
+      first: first.status,
+      replay: replay.status,
+      replayed: replay.body.replayed,
+      sends: scenarioSendCount(handoffId),
+    }, { first: 202, replay: 202, replayed: true, sends: 1 });
+  });
+
+  await t.test('G09 pending receipt replay cannot reopen a closed target or submit twice', async () => {
+    const handoffId = 'g09-closed-target-handoff';
+    const prompt = 'G09 closed target has one physical delivery attempt';
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: true,
+      accepted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      handoffId: payload.handoffId,
+    });
+    const request = { prompt, handoffId, source: 'phase2-test' };
+    const first = await api('/api/terminal-tabs/phase2-closed-target/send', request);
+    assert.equal(first.status, 202);
+    assert.equal(controller.closedRestoreCount, 1);
+    assert.equal(scenarioSendCount(handoffId), 1);
+
+    const project = projects.find((item) => item.id === 'phase2-project');
+    project.tabs = project.tabs.filter((tab) => tab.tabId !== 'phase2-closed-target');
+
+    const replay = await api('/api/terminal-tabs/phase2-closed-target/send', request);
+    assert.deepEqual({
+      status: replay.status,
+      replayed: replay.body.replayed,
+      restores: controller.closedRestoreCount,
+      sends: scenarioSendCount(handoffId),
+      reopened: project.tabs.some((tab) => tab.tabId === 'phase2-closed-target'),
+    }, {
+      status: 202,
+      replayed: true,
+      restores: 1,
+      sends: 1,
+      reopened: false,
+    });
+  });
+
+  await t.test('G09 proven pre-submit refusal remains retryable for the same exact handoff', async () => {
+    const handoffId = 'g09-project-retryable-handoff';
+    let attempt = 0;
+    controller.sendResponder = async (payload) => {
+      attempt += 1;
+      return attempt === 1
+        ? { success: false, submitted: false, accepted: false, code: 'refused_before_submit' }
+        : { success: true, submitted: true, accepted: true, handoffId: payload.handoffId };
+    };
+    const request = {
+      prompt: 'G09 retry only after proven not submitted',
+      handoffId,
+      source: 'phase2-test',
+    };
+    const first = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    const retry = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    assert.deepEqual({
+      first: first.status,
+      retry: retry.status,
+      sends: scenarioSendCount(handoffId),
+    }, { first: 409, retry: 200, sends: 2 });
+  });
+
   await t.test('F4 Terminal MCP preserves the same post-Enter pending receipt', async () => {
     controller.sendResponder = async (payload) => ({
       success: false,
@@ -491,6 +857,31 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       'User-visible invariant violated: Terminal MCP must not report an error that invites retry after Enter already crossed.');
     assert.match(text, /pending|unverified|confirmation/i,
       'Terminal MCP must tell the caller that exact delivery confirmation is pending.');
+  });
+
+  await t.test('G09 Terminal MCP can reuse one exact pending handoff without a second send', async () => {
+    const handoffId = 'g09-terminal-mcp-handoff';
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: true,
+      accepted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      handoffId: payload.handoffId,
+    });
+    const request = {
+      homeDir: tempHome,
+      tabId: 'phase2-target-tab',
+      prompt: 'G09 Terminal MCP exact pending prompt',
+      handoffId,
+    };
+    const first = await callMcpSendPrompt(request);
+    const replay = await callMcpSendPrompt(request);
+    const firstText = first?.result?.content?.[0]?.text || '';
+    const replayText = replay?.result?.content?.[0]?.text || '';
+    assert.match(firstText, /pending|confirmation/i);
+    assert.match(replayText, /pending|confirmation/i);
+    assert.equal(scenarioSendCount(handoffId), 1);
   });
 
   await t.test('F4 Inbox keeps a post-Enter run alive until exact audit', async () => {
@@ -514,6 +905,9 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     }, 'User-visible invariant violated: Inbox must retain a post-Enter run as audit-pending instead of marking send_failed and inviting a duplicate.');
 
     const exactHash = promptAuditFingerprint('post-enter Inbox prompt');
+    const durablePayload = scenarioPayload('external-run:phase2-inbox-run');
+    assert.ok(durablePayload?.sendOperationKey);
+    assert.ok(durablePayload?.sendAttemptId);
     const wrongProvider = await webServer.notifyAgentPromptAuditResult({
       success: true,
       tabId: response.body.tabId,
@@ -523,6 +917,8 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       actualHash: exactHash,
       sessionId: 'phase2-inbox-session',
       entryUuid: 'phase2-inbox-wrong-provider',
+      sendOperationKey: durablePayload.sendOperationKey,
+      sendAttemptId: durablePayload.sendAttemptId,
     });
     const wrongSession = await webServer.notifyAgentPromptAuditResult({
       success: true,
@@ -533,6 +929,8 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       actualHash: exactHash,
       sessionId: 'phase2-foreign-session',
       entryUuid: 'phase2-inbox-wrong-session',
+      sendOperationKey: durablePayload.sendOperationKey,
+      sendAttemptId: durablePayload.sendAttemptId,
     });
     const exact = await webServer.notifyAgentPromptAuditResult({
       success: true,
@@ -543,6 +941,8 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       actualHash: exactHash,
       sessionId: 'phase2-inbox-session',
       entryUuid: 'phase2-inbox-exact-entry',
+      sendOperationKey: durablePayload.sendOperationKey,
+      sendAttemptId: durablePayload.sendAttemptId,
     });
     assert.deepEqual({
       wrongProvider: wrongProvider.confirmed,
@@ -580,6 +980,145 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       deliveryStatus: 'delivery-unknown',
       submitted: null,
     });
+  });
+
+  await t.test('G09 Inbox reserves runId before tab creation and replays one exact receipt', async () => {
+    const runId = 'g09-inbox-idempotent-run';
+    const handoffId = 'external-run:' + runId;
+    const prompt = 'G09 Inbox exact one physical prompt';
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: true,
+      accepted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      handoffId: payload.handoffId,
+    });
+    const request = {
+      provider: 'codex',
+      prompt,
+      runId,
+      source: 'phase2-test',
+      autoStopMs: 0,
+    };
+    const tabsBefore = controller.inboxCounter;
+    const first = await api('/api/inbox/runs', request);
+    const replay = await api('/api/inbox/runs', request);
+    const conflict = await api('/api/inbox/runs', { ...request, prompt: prompt + ' changed' });
+    assert.deepEqual({
+      first: first.status,
+      replay: replay.status,
+      replayed: replay.body.idempotent,
+      conflict: conflict.status,
+      conflictCode: conflict.body.code,
+      createdTabs: controller.inboxCounter - tabsBefore,
+      sends: scenarioSendCount(handoffId),
+    }, {
+      first: 202,
+      replay: 202,
+      replayed: true,
+      conflict: 409,
+      conflictCode: 'external_run_identity_conflict',
+      createdTabs: 1,
+      sends: 1,
+    });
+
+    const hash = promptAuditFingerprint(prompt);
+    const durablePayload = scenarioPayload(handoffId);
+    assert.ok(durablePayload?.sendOperationKey);
+    assert.ok(durablePayload?.sendAttemptId);
+    const exact = await webServer.notifyAgentPromptAuditResult({
+      success: true,
+      tabId: first.body.tabId,
+      toolType: 'codex',
+      handoffId,
+      expectedHash: hash,
+      actualHash: hash,
+      sessionId: 'phase2-inbox-session',
+      entryUuid: 'g09-inbox-exact-entry',
+      sendOperationKey: durablePayload.sendOperationKey,
+      sendAttemptId: durablePayload.sendAttemptId,
+    });
+    const confirmedReplay = await api('/api/inbox/runs', request);
+    assert.deepEqual({
+      auditConfirmed: exact.confirmed,
+      status: confirmedReplay.status,
+      exactAuditConfirmed: confirmedReplay.body.exactAuditConfirmed,
+      createdTabs: controller.inboxCounter - tabsBefore,
+      sends: scenarioSendCount(handoffId),
+    }, {
+      auditConfirmed: true,
+      status: 200,
+      exactAuditConfirmed: true,
+      createdTabs: 1,
+      sends: 1,
+    });
+  });
+
+  await t.test('G09 concurrent Inbox duplicates join the early run reservation', async () => {
+    const runId = 'g09-inbox-concurrent-run';
+    const handoffId = 'external-run:' + runId;
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: true,
+      accepted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      handoffId: payload.handoffId,
+    });
+    const request = {
+      provider: 'codex',
+      prompt: 'G09 concurrent Inbox request',
+      runId,
+      source: 'phase2-test',
+      autoStopMs: 0,
+    };
+    const tabsBefore = controller.inboxCounter;
+    const [first, joined] = await Promise.all([
+      api('/api/inbox/runs', request),
+      api('/api/inbox/runs', request),
+    ]);
+    assert.equal(first.status, 202);
+    assert.equal(joined.status, 202);
+    assert.equal(controller.inboxCounter - tabsBefore, 1);
+    assert.equal(scenarioSendCount(handoffId), 1);
+  });
+
+  await t.test('G09 concurrent retry after setup failure owns one new tab and one send', async () => {
+    const runId = 'g09-inbox-setup-retry-run';
+    const handoffId = 'external-run:' + runId;
+    const request = {
+      provider: 'codex',
+      prompt: 'G09 retry one reservation after setup failure',
+      runId,
+      source: 'phase2-test',
+      autoStopMs: 0,
+    };
+    const callsBefore = controller.createAgentTabCalls;
+    const tabsBefore = controller.inboxCounter;
+    controller.failNextCreateAgentTab = true;
+    const failed = await api('/api/inbox/runs', request);
+    assert.equal(failed.status, 500);
+    assert.equal(controller.createAgentTabCalls - callsBefore, 1);
+    assert.equal(controller.inboxCounter - tabsBefore, 0);
+
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: true,
+      accepted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      handoffId: payload.handoffId,
+    });
+    const [retry, joined] = await Promise.all([
+      api('/api/inbox/runs', request),
+      api('/api/inbox/runs', request),
+    ]);
+    assert.equal(retry.status, 202);
+    assert.equal(joined.status, 202);
+    assert.equal(controller.createAgentTabCalls - callsBefore, 2);
+    assert.equal(controller.inboxCounter - tabsBefore, 1);
+    assert.equal(scenarioSendCount(handoffId), 1);
   });
 
   await t.test('F5 target delivery-unknown is completed only by its late exact audit', async () => {
@@ -864,5 +1403,263 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       retryAccepted: false,
       physicalNotificationSends: 1,
     }, 'User-visible invariant violated: a completion message whose Enter crossed must keep its handoff for late audit and must never expose a duplicate Retry send.');
+  });
+
+  const restartWebServer = async () => {
+    await webServer.stop();
+    webServer.start(startOptions);
+    await waitFor(async () => {
+      try {
+        const response = await api('/api/me');
+        return response.status === 200;
+      } catch {
+        return false;
+      }
+    }, 'mock Project API did not restart');
+  };
+
+  await t.test('G09 durable Project handoff survives server restart without another bridge send', async () => {
+    const handoffId = 'g09-project-restart-handoff';
+    const prompt = 'G09 Project API restart must replay one pending receipt';
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: true,
+      accepted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      handoffId: payload.handoffId,
+    });
+    const request = { prompt, handoffId, source: 'phase2-test' };
+    const first = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    assert.equal(first.status, 202);
+    const durablePayload = scenarioPayload(handoffId);
+    assert.ok(durablePayload?.sendOperationKey);
+    assert.ok(durablePayload?.sendAttemptId);
+    const sendsBeforeRestart = scenarioSendCount(handoffId);
+
+    await restartWebServer();
+    const replay = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    const conflict = await api('/api/terminal-tabs/phase2-target-tab/send', {
+      ...request,
+      prompt: prompt + ' changed',
+    });
+    const hash = promptAuditFingerprint(prompt);
+    const audit = await webServer.notifyAgentPromptAuditResult({
+      success: true,
+      tabId: 'phase2-target-tab',
+      toolType: 'claude',
+      handoffId,
+      expectedHash: hash,
+      actualHash: hash,
+      sessionId: 'phase2-target-session',
+      entryUuid: 'g09-project-restart-exact-entry',
+      sendOperationKey: durablePayload.sendOperationKey,
+      sendAttemptId: durablePayload.sendAttemptId,
+    });
+    const confirmed = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    assert.deepEqual({
+      replayStatus: replay.status,
+      replayed: replay.body.replayed,
+      conflictStatus: conflict.status,
+      conflictCode: conflict.body.code,
+      auditConfirmed: audit.confirmed,
+      confirmedStatus: confirmed.status,
+      sends: scenarioSendCount(handoffId),
+    }, {
+      replayStatus: 202,
+      replayed: true,
+      conflictStatus: 409,
+      conflictCode: 'agent_send_handoff_conflict',
+      auditConfirmed: true,
+      confirmedStatus: 200,
+      sends: sendsBeforeRestart,
+    });
+  });
+
+  await t.test('G09 durable Inbox runId survives restart with one deterministic tab and one send', async () => {
+    const runId = 'g09-inbox-restart-run';
+    const handoffId = 'external-run:' + runId;
+    const prompt = 'G09 Inbox restart must not create or submit twice';
+    controller.sendResponder = async (payload) => ({
+      success: null,
+      submitted: true,
+      accepted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      handoffId: payload.handoffId,
+    });
+    const request = {
+      provider: 'codex',
+      prompt,
+      runId,
+      source: 'phase2-test',
+      autoStopMs: 0,
+    };
+    const tabsBefore = controller.createAgentTabCalls;
+    const first = await api('/api/inbox/runs', request);
+    assert.equal(first.status, 202);
+    const durablePayload = scenarioPayload(handoffId);
+    assert.ok(durablePayload?.sendOperationKey);
+    assert.ok(durablePayload?.sendAttemptId);
+    const createsAfterFirst = controller.createAgentTabCalls;
+    const sendsAfterFirst = scenarioSendCount(handoffId);
+
+    await restartWebServer();
+    const replay = await api('/api/inbox/runs', request);
+    const conflict = await api('/api/inbox/runs', { ...request, prompt: prompt + ' changed' });
+    const hash = promptAuditFingerprint(prompt);
+    const audit = await webServer.notifyAgentPromptAuditResult({
+      success: true,
+      tabId: first.body.tabId,
+      toolType: 'codex',
+      handoffId,
+      expectedHash: hash,
+      actualHash: hash,
+      sessionId: 'phase2-inbox-session',
+      entryUuid: 'g09-inbox-restart-exact-entry',
+      sendOperationKey: durablePayload.sendOperationKey,
+      sendAttemptId: durablePayload.sendAttemptId,
+    });
+    const confirmed = await api('/api/inbox/runs', request);
+    assert.deepEqual({
+      replayStatus: replay.status,
+      replayTabId: replay.body.tabId,
+      firstTabId: first.body.tabId,
+      conflictStatus: conflict.status,
+      conflictCode: conflict.body.code,
+      auditConfirmed: audit.confirmed,
+      confirmedStatus: confirmed.status,
+      createdTabs: controller.createAgentTabCalls - tabsBefore,
+      createsAfterFirst: createsAfterFirst - tabsBefore,
+      sends: scenarioSendCount(handoffId),
+    }, {
+      replayStatus: 202,
+      replayTabId: first.body.tabId,
+      firstTabId: first.body.tabId,
+      conflictStatus: 409,
+      conflictCode: 'external_run_identity_conflict',
+      auditConfirmed: true,
+      confirmedStatus: 200,
+      createdTabs: 1,
+      createsAfterFirst: 1,
+      sends: sendsAfterFirst,
+    });
+  });
+
+  await t.test('G09 restart reconciles an Enter-armed Project attempt to unknown without sending', async () => {
+    const tabId = 'phase2-target-tab';
+    const handoffId = 'g09-enter-armed-restart-handoff';
+    const prompt = 'G09 Enter armed restart stays unknown';
+    const source = 'phase2-test';
+    const operationKey = `project:${tabId}:${handoffId}`;
+    const requestFingerprint = fingerprintAgentSendRequest({
+      prompt,
+      model: null,
+      effort: null,
+      thinking: null,
+      cwd: null,
+      source,
+      queue: false,
+      ownership: 'project',
+    });
+    const attempt = receiptStore.beginAttempt({
+      operationKey,
+      surface: 'project-api',
+      runId: null,
+      tabId,
+      handoffId,
+      requestFingerprint,
+      provider: 'claude',
+      sessionId: null,
+      promptHash: promptAuditFingerprint(prompt),
+      promptLength: prompt.length,
+    });
+    assert.equal(attempt.action, 'attempt-started');
+    receiptStore.markAttemptState(operationKey, attempt.attemptId, STORE_STATES.ENTER_ARMED);
+    const sendsBeforeRestart = scenarioSendCount(handoffId);
+
+    await restartWebServer();
+    const replay = await api(`/api/terminal-tabs/${tabId}/send`, {
+      prompt,
+      handoffId,
+      source,
+    });
+    assert.deepEqual({
+      status: replay.status,
+      deliveryStatus: replay.body.status,
+      submitted: replay.body.submitted,
+      sends: scenarioSendCount(handoffId),
+      durableState: receiptStore.get(operationKey)?.state,
+    }, {
+      status: 202,
+      deliveryStatus: 'delivery-unknown',
+      submitted: null,
+      sends: sendsBeforeRestart,
+      durableState: STORE_STATES.DELIVERY_UNKNOWN,
+    });
+  });
+
+  await t.test('G09 stale attempt callback cannot overwrite the current durable receipt exposed by API', async () => {
+    const tabId = 'phase2-target-tab';
+    const handoffId = 'g09-stale-attempt-handoff';
+    const prompt = 'G09 stale callback is rejected';
+    const source = 'phase2-test';
+    const operationKey = `project:${tabId}:${handoffId}`;
+    const identity = {
+      operationKey,
+      surface: 'project-api',
+      runId: null,
+      tabId,
+      handoffId,
+      requestFingerprint: fingerprintAgentSendRequest({
+        prompt,
+        model: null,
+        effort: null,
+        thinking: null,
+        cwd: null,
+        source,
+        queue: false,
+        ownership: 'project',
+      }),
+      provider: 'claude',
+      sessionId: null,
+      promptHash: promptAuditFingerprint(prompt),
+      promptLength: prompt.length,
+    };
+    const first = receiptStore.beginAttempt(identity);
+    receiptStore.settleAttempt(operationKey, first.attemptId, {
+      success: false,
+      submitted: false,
+    });
+    const second = receiptStore.beginAttempt(identity);
+    receiptStore.settleAttempt(operationKey, second.attemptId, {
+      success: null,
+      submitted: true,
+      status: 'audit-pending',
+      auditPending: true,
+    });
+    const stale = receiptStore.settleAttempt(operationKey, first.attemptId, {
+      success: true,
+      submitted: true,
+      status: 'sent',
+    });
+    assert.equal(stale.stale, true);
+    const sendsBeforeReplay = scenarioSendCount(handoffId);
+    const replay = await api(`/api/terminal-tabs/${tabId}/send`, {
+      prompt,
+      handoffId,
+      source,
+    });
+    assert.deepEqual({
+      status: replay.status,
+      receiptState: replay.body.receiptState,
+      sends: scenarioSendCount(handoffId),
+      attemptId: replay.body.attemptId,
+    }, {
+      status: 202,
+      receiptState: 'audit-pending',
+      sends: sendsBeforeReplay,
+      attemptId: second.attemptId,
+    });
   });
 });

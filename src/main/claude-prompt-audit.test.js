@@ -9,14 +9,176 @@ const path = require('node:path');
 const {
   buildClaudeLivePromptAuditConfirmation,
   captureClaudePromptAuditBoundary,
+  classifyClaudePromptAuditAdmission,
   classifyClaudeAuditRecordAfterBoundary,
+  classifyClaudePromptSubmitRouteAdmission,
   readClaudeUserRecords,
   readLastClaudeUserRecord,
   selectClaudeLivePromptOwner,
   selectClaudePendingPromptAudit,
   selectUniqueClaudePromptSubmitAudit,
   shouldStageClaudeUserPromptAudit,
+  waitForClaudeTranscriptMaterialization,
 } = require('./claude-prompt-audit');
+
+test('audit admission allows only an exact hook route for a fresh unmaterialized Claude transcript', () => {
+  const expectedTabId = 'fresh-tab';
+  const unresolved = {
+    available: false,
+    reason: 'transcript-unresolved',
+    transcriptPath: null,
+  };
+
+  assert.deepEqual(classifyClaudePromptAuditAdmission({
+    boundary: unresolved,
+    expectedTabId,
+    hookRoute: { bound: true, tabId: expectedTabId, pid: 4242 },
+  }), {
+    allowed: true,
+    mode: 'fresh-hook-route',
+    reason: 'first-prompt-awaits-exact-user-prompt-submit',
+  });
+
+  assert.equal(classifyClaudePromptAuditAdmission({
+    boundary: unresolved,
+    expectedTabId,
+    hookRoute: { bound: true, tabId: 'foreign-tab', pid: 4242 },
+  }).allowed, false, 'a foreign tab route cannot authorize the first prompt');
+  assert.equal(classifyClaudePromptAuditAdmission({
+    boundary: unresolved,
+    expectedTabId,
+    hookRoute: { bound: false, tabId: expectedTabId, pid: null },
+  }).allowed, false, 'an unproven process route remains fail-closed');
+});
+
+test('audit admission never lets a hook route override a known transcript read failure', () => {
+  const verdict = classifyClaudePromptAuditAdmission({
+    boundary: {
+      available: false,
+      reason: 'transcript-read-failed',
+      transcriptPath: '/tmp/known-session.jsonl',
+    },
+    expectedTabId: 'known-tab',
+    hookRoute: { bound: true, tabId: 'known-tab', pid: 4242 },
+  });
+  assert.deepEqual(verdict, {
+    allowed: false,
+    mode: 'unavailable',
+    reason: 'transcript-read-failed',
+  });
+});
+
+test('fresh transcript materialization follows the exact file creation event', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-fresh-materialize-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const transcriptPath = path.join(dir, 'fresh.jsonl');
+  const pending = waitForClaudeTranscriptMaterialization(transcriptPath, { timeoutMs: 1000 });
+  await fs.promises.writeFile(transcriptPath, '{}\n');
+  assert.deepEqual(await pending, {
+    materialized: true,
+    reason: 'file-created',
+    transcriptPath,
+  });
+
+  assert.equal((await waitForClaudeTranscriptMaterialization(
+    transcriptPath,
+    { timeoutMs: 1000 },
+  )).reason, 'already-present');
+});
+
+test('fresh transcript materialization follows creation of a previously missing project directory', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-fresh-project-dir-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const transcriptPath = path.join(root, 'projects', '-new-workspace', 'fresh.jsonl');
+  const pending = waitForClaudeTranscriptMaterialization(transcriptPath, { timeoutMs: 1000 });
+
+  await fs.promises.mkdir(path.dirname(transcriptPath), { recursive: true });
+  await fs.promises.writeFile(transcriptPath, '{}\n');
+
+  assert.deepEqual(await pending, {
+    materialized: true,
+    reason: 'file-created',
+    transcriptPath,
+  });
+});
+
+test('activity in a sibling directory cannot prove the exact fresh transcript', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-fresh-exact-path-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const transcriptPath = path.join(root, 'projects', '-target-workspace', 'fresh.jsonl');
+  const pending = waitForClaudeTranscriptMaterialization(transcriptPath, { timeoutMs: 40 });
+
+  await fs.promises.mkdir(path.join(root, 'projects', '-other-workspace'), { recursive: true });
+  await fs.promises.writeFile(path.join(root, 'projects', '-other-workspace', 'fresh.jsonl'), '{}\n');
+
+  assert.deepEqual(await pending, {
+    materialized: false,
+    reason: 'materialization-timeout',
+    transcriptPath,
+  });
+});
+
+test('materialization timeout cannot reopen a watcher after a delayed disk check', async () => {
+  let accessCalls = 0;
+  let releasePostWatchAccess;
+  let opened = 0;
+  let closed = 0;
+  const fakeWatcher = {
+    on() { return this; },
+    close() {
+      if (closed === 0) closed += 1;
+    },
+  };
+  const fileSystem = {
+    constants: fs.constants,
+    promises: {
+      async access() {
+        accessCalls += 1;
+        if (accessCalls === 3) {
+          await new Promise((resolve) => { releasePostWatchAccess = resolve; });
+        }
+        const error = new Error('missing');
+        error.code = 'ENOENT';
+        throw error;
+      },
+      async stat() {
+        return { isDirectory: () => true };
+      },
+    },
+    watch() {
+      opened += 1;
+      return fakeWatcher;
+    },
+  };
+
+  const result = await waitForClaudeTranscriptMaterialization(
+    '/tmp/claude-delayed-project/fresh.jsonl',
+    { timeoutMs: 10, fileSystem },
+  );
+  assert.equal(result.materialized, false);
+  assert.equal(result.reason, 'materialization-timeout');
+  assert.equal(opened, 1);
+  assert.equal(closed, 1);
+
+  releasePostWatchAccess();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(opened, 1);
+  assert.equal(closed, 1);
+});
+
+test('missing fresh transcript remains unknown at the observation ceiling', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-fresh-missing-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const transcriptPath = path.join(dir, 'missing.jsonl');
+  assert.deepEqual(await waitForClaudeTranscriptMaterialization(
+    transcriptPath,
+    { timeoutMs: 5 },
+  ), {
+    materialized: false,
+    reason: 'materialization-timeout',
+    transcriptPath,
+  });
+});
 
 function userRecord(uuid, text, timestamp = '2026-07-24T10:00:00.000Z') {
   return {
@@ -246,6 +408,104 @@ test('UserPromptSubmit binds execution context only to one eligible exact audit'
   });
   assert.equal(missingPrompt.audit, null);
   assert.equal(missingPrompt.reason, 'hook-prompt-unavailable');
+});
+
+test('fresh UserPromptSubmit requires the exact pre-submit tab and PID proof', () => {
+  const boundary = {
+    available: false,
+    reason: 'transcript-unresolved',
+    transcriptPath: null,
+  };
+  const audit = makeAudit('first prompt', boundary, {
+    handoffId: 'fresh',
+    submitWritten: true,
+    preSubmitRouteProof: { tabId: 'tab-source', pid: 4242 },
+  });
+
+  assert.equal(classifyClaudePromptSubmitRouteAdmission(audit, {
+    hookTabId: 'tab-source',
+    hookPpid: 4242,
+    hookPidTabId: 'tab-source',
+  }).allowed, true);
+  assert.equal(classifyClaudePromptSubmitRouteAdmission(audit, {
+    hookTabId: 'tab-foreign',
+    hookPpid: 4242,
+    hookPidTabId: 'tab-source',
+  }).allowed, false);
+  assert.equal(classifyClaudePromptSubmitRouteAdmission(audit, {
+    hookTabId: 'tab-source',
+    hookPpid: 4243,
+    hookPidTabId: 'tab-source',
+  }).allowed, false);
+
+  const rejected = selectUniqueClaudePromptSubmitAudit([audit], 'first prompt', {
+    hashText: sha16,
+    hookTabId: 'tab-source',
+    hookPpid: 4243,
+    hookPidTabId: 'tab-source',
+  });
+  assert.equal(rejected.audit, null);
+  assert.equal(rejected.reason, 'fresh-hook-route-mismatch');
+
+  const accepted = selectUniqueClaudePromptSubmitAudit([audit], 'first prompt', {
+    hashText: sha16,
+    hookTabId: 'tab-source',
+    hookPpid: 4242,
+    hookPidTabId: 'tab-source',
+  });
+  assert.equal(accepted.audit, audit);
+  assert.equal(accepted.routeAdmission.mode, 'fresh-exact-hook-route');
+});
+
+test('exact hook PID disambiguates identical fresh pending prompts', () => {
+  const boundary = {
+    available: false,
+    reason: 'transcript-unresolved',
+    transcriptPath: null,
+  };
+  const first = makeAudit('same prompt', boundary, {
+    handoffId: 'first',
+    submitWritten: true,
+    preSubmitRouteProof: { tabId: 'tab-source', pid: 4242 },
+  });
+  const second = makeAudit('same prompt', boundary, {
+    handoffId: 'second',
+    submitWritten: true,
+    preSubmitRouteProof: { tabId: 'tab-source', pid: 4243 },
+  });
+
+  const selection = selectUniqueClaudePromptSubmitAudit(
+    [first, second],
+    'same prompt',
+    {
+      hashText: sha16,
+      hookTabId: 'tab-source',
+      hookPpid: 4243,
+      hookPidTabId: 'tab-source',
+    },
+  );
+  assert.equal(selection.audit, second);
+});
+
+test('session-first route conflict cannot reuse a PID owned by another tab', () => {
+  const boundary = {
+    available: false,
+    reason: 'transcript-unresolved',
+    transcriptPath: null,
+  };
+  const audit = makeAudit('same prompt', boundary, {
+    handoffId: 'tab-b-proof',
+    submitWritten: true,
+    preSubmitRouteProof: { tabId: 'tab-b', pid: 4242 },
+  });
+  const selection = selectUniqueClaudePromptSubmitAudit([audit], 'same prompt', {
+    hashText: sha16,
+    hookTabId: 'tab-b',
+    hookPpid: 4242,
+    hookPidTabId: 'tab-a',
+  });
+  assert.equal(selection.audit, null);
+  assert.equal(selection.reason, 'fresh-hook-route-mismatch');
 });
 
 test('live queue claim and its canonical record keep one exact handoff owner', () => {
@@ -492,15 +752,25 @@ test('the first prompt of a fresh Claude transcript uses its staged send time as
     reason: 'transcript-unresolved',
     transcriptPath: null,
   };
-  const audit = makeAudit(text, boundary, { handoffId: 'fresh', sentAt });
+  const audit = makeAudit(text, boundary, {
+    handoffId: 'fresh',
+    sentAt,
+    freshHookRouteConfirmed: true,
+    freshHookSessionId: 'session-fresh',
+    freshHookTranscriptPath: '/tmp/fresh-session.jsonl',
+  });
   const candidate = {
-    record: userRecord(
-      'fresh-uuid',
-      text,
-      '2026-07-26T03:48:08.321Z',
-    ),
+    record: {
+      ...userRecord(
+        'fresh-uuid',
+        text,
+        '2026-07-26T03:48:08.321Z',
+      ),
+      sessionId: 'session-fresh',
+    },
     text,
     byteOffset: 0,
+    transcriptPath: '/tmp/fresh-session.jsonl',
   };
 
   const selection = selectClaudePendingPromptAudit([audit], [candidate], {
@@ -513,6 +783,58 @@ test('the first prompt of a fresh Claude transcript uses its staged send time as
     selection?.causality?.reason,
     'record-after-send-with-unresolved-transcript',
   );
+});
+
+test('fresh hook proof cannot confirm an identical record from another transcript or session', () => {
+  const text = 'fresh first prompt';
+  const sentAt = Date.parse('2026-07-26T03:48:08.259Z');
+  const boundary = {
+    available: false,
+    reason: 'transcript-unresolved',
+    transcriptPath: null,
+  };
+  const audit = makeAudit(text, boundary, {
+    handoffId: 'fresh',
+    sentAt,
+    freshHookRouteConfirmed: true,
+    freshHookSessionId: 'session-fresh',
+    freshHookTranscriptPath: '/tmp/fresh-session.jsonl',
+  });
+  const baseCandidate = {
+    record: userRecord('fresh-uuid', text, '2026-07-26T03:48:08.321Z'),
+    text,
+    byteOffset: 0,
+  };
+
+  assert.equal(selectClaudePendingPromptAudit([audit], [{
+    ...baseCandidate,
+    transcriptPath: '/tmp/foreign-session.jsonl',
+  }], { hashText: sha16 }), null);
+  assert.equal(selectClaudePendingPromptAudit([audit], [{
+    ...baseCandidate,
+    record: { ...baseCandidate.record, sessionId: 'session-foreign' },
+    transcriptPath: '/tmp/fresh-session.jsonl',
+  }], { hashText: sha16 }), null);
+});
+
+test('a fresh JSONL record cannot confirm before the exact UserPromptSubmit hook route', () => {
+  const text = 'fresh first prompt';
+  const sentAt = Date.parse('2026-07-26T03:48:08.259Z');
+  const boundary = {
+    available: false,
+    reason: 'transcript-unresolved',
+    transcriptPath: null,
+  };
+  const audit = makeAudit(text, boundary, { handoffId: 'fresh', sentAt });
+  const candidate = {
+    record: userRecord('fresh-uuid', text, '2026-07-26T03:48:08.321Z'),
+    text,
+    byteOffset: 0,
+  };
+
+  assert.equal(selectClaudePendingPromptAudit([audit], [candidate], {
+    hashText: sha16,
+  }), null);
 });
 
 test('an old identical prompt cannot satisfy an unresolved fresh-transcript audit', () => {

@@ -32,7 +32,12 @@ import {
   revalidatePreparedCodexRewindRuntime,
   type PreparedCodexRewindRuntime,
 } from '../../utils/agentScenarios';
-import { getHistoryAgentRuntime, type AgentHistoryTool, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
+import {
+  getHistoryAgentRuntime,
+  type AgentHistoryTool,
+  type AgentPtyPresence,
+  type AgentPtyStatus,
+} from '../../utils/historyAgentRuntimes';
 import type { HistoryDurableRevision } from '../../utils/historySnapshotCache';
 import { shouldClearRewindPreviewForOwnerTransition } from '../../utils/historyRewindPreviewOwner';
 import {
@@ -873,7 +878,8 @@ function Timeline({
     useCallback((state) => selectActiveRewindOperation(state, tabId), [tabId])
   );
   const [rewindLoadingMenu, setRewindLoadingMenu] = useState<{ x: number; y: number } | null>(null);
-  const [rewindAgentStatus, setRewindAgentStatus] = useState<AgentPtyStatus | null>(null);
+  const [rewindAgentPresence, setRewindAgentPresence] = useState<AgentPtyPresence | null>(null);
+  const rewindAgentStatus: AgentPtyStatus | null = rewindAgentPresence?.status || null;
 
   const createAgentReadyWait = useCallback((runtime: ReturnType<typeof getHistoryAgentRuntime>, timeoutMs = 30000) => {
     let cleanup = () => {};
@@ -910,23 +916,23 @@ function Timeline({
   }, [tabId]);
 
   useEffect(() => {
-    if (!contextMenu || (toolType !== 'claude' && toolType !== 'codex')) {
-      setRewindAgentStatus(null);
+    if (toolType !== 'claude' && toolType !== 'codex') {
+      setRewindAgentPresence(null);
       return;
     }
     let cancelled = false;
     const runtime = getHistoryAgentRuntime(toolType as AgentHistoryTool);
     runtime.getPresence(tabId)
       .then((presence) => {
-        if (!cancelled) setRewindAgentStatus(presence?.status || null);
+        if (!cancelled) setRewindAgentPresence(presence || null);
       })
       .catch(() => {
-        if (!cancelled) setRewindAgentStatus(null);
+        if (!cancelled) setRewindAgentPresence(null);
       });
     return () => {
       cancelled = true;
     };
-  }, [contextMenu?.entry.uuid, tabId, toolType]);
+  }, [contextMenu?.entry.uuid, isTurnBusy, sessionId, tabId, toolType]);
 
   // Edit Range state
   const [editRangeState, _setEditRangeState] = useState<{
@@ -1581,6 +1587,27 @@ function Timeline({
     }
     return false;
   });
+  const historyActionSnapshot = isCodex
+    ? rewindAgentPresence?.runtimeSnapshot || null
+    : null;
+  const lifecycleBlocksHistoryAction = rewindAgentStatus === 'busy'
+    || rewindAgentStatus === 'starting'
+    || rewindAgentStatus === 'stopping';
+  const historyActionInFlight = isTabAiBusy || isTurnBusy || lifecycleBlocksHistoryAction;
+  const historyRewriteUiBlocked = historyActionInFlight
+    || (isCodex && historyActionSnapshot?.canRewriteHistory !== true);
+  const historyDeleteUiBlocked = historyActionInFlight
+    || (isCodex && historyActionSnapshot?.canDeleteHistory !== true);
+  const historyMutationBlockedMessage = historyActionInFlight
+    ? 'Дождись завершения текущей отправки или ответа'
+    : isCodex
+      ? 'Текущая Codex-сессия ещё не подтверждена для изменения истории'
+      : 'Изменение истории сейчас недоступно';
+  const rejectBlockedHistoryMutation = useCallback((blocked: boolean) => {
+    if (!blocked) return false;
+    useUIStore.getState().showToast(historyMutationBlockedMessage, 'warning', 2600);
+    return true;
+  }, [historyMutationBlockedMessage]);
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const innerWrapperRef = useRef<HTMLDivElement>(null);
@@ -4240,6 +4267,7 @@ function Timeline({
     startUuid: string,
     endUuid: string,
   ) => {
+    if (rejectBlockedHistoryMutation(historyRewriteUiBlocked)) return;
     if (!sessionId) return;
     const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
     const hasCompact = rangeEntries.some((en) => en.type === 'compact' || en.isCompactSummary);
@@ -4276,6 +4304,7 @@ function Timeline({
 
   const executeRangeAction = async (mode: 'copy' | 'edit', range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string, additionalPrompt?: string) => {
     if (!sessionId) return;
+    if (mode === 'edit' && rejectBlockedHistoryMutation(historyRewriteUiBlocked)) return;
 
     // Clear selection
     selectionStartIdRef.current = null;
@@ -4362,6 +4391,7 @@ function Timeline({
   const executeDeleteRange = async (range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string) => {
     if (!sessionId) return;
     if (!supportsDeleteRangeActions) return;
+    if (rejectBlockedHistoryMutation(historyDeleteUiBlocked)) return;
 
     // Очистка selection и popup
     selectionStartIdRef.current = null;
@@ -5144,7 +5174,8 @@ function Timeline({
   const getRewindRequestState = (entry: TimelineEntry) => {
     const hasTarget = !!getRewindTargetContext(entry);
     const starting = rewindAgentStatus === 'starting';
-    const runtimeBlocked = isTabAiBusy || starting;
+    const codexProofBlocked = isCodex && historyActionSnapshot?.canNativeRewind !== true;
+    const runtimeBlocked = isTabAiBusy || isTurnBusy || lifecycleBlocksHistoryAction || codexProofBlocked;
     const canStart = !!sessionId && !rewindState && !runtimeBlocked && hasTarget && !readOnly;
     const reason = !sessionId
       ? 'Rewind недоступен: у вкладки ещё нет сохранённой сессии'
@@ -5153,7 +5184,9 @@ function Timeline({
         : rewindState
           ? 'Rewind уже выполняется'
           : runtimeBlocked
-            ? 'Дождись завершения текущей загрузки или ответа перед Rewind'
+            ? (historyActionSnapshot?.historyActionReason === 'runtime-identity-unknown'
+              ? 'Проверяю текущую Codex-сессию'
+              : 'Дождись завершения текущей отправки, загрузки или ответа перед Rewind')
             : !hasTarget
               ? 'Этот prompt находится за недоступной границей Rewind'
               : null;
@@ -5207,6 +5240,7 @@ function Timeline({
     entry: TimelineEntry,
     options?: { additionalPrompt?: string; openEmptyWindow?: boolean },
   ) => {
+    if (rejectBlockedHistoryMutation(historyRewriteUiBlocked)) return false;
     if (!supportsEditRangeActions || !sessionId) return false;
     const startIndex = entries.findIndex((candidate) => candidate.uuid === entry.uuid);
     if (startIndex < 0 || entries.length === 0) return false;
@@ -5228,7 +5262,7 @@ function Timeline({
     }
     void executeRangeAction('edit', range, startUuid, endUuid, options?.additionalPrompt);
     return true;
-  }, [entries, sessionId, supportsEditRangeActions]);
+  }, [entries, historyRewriteUiBlocked, rejectBlockedHistoryMutation, sessionId, supportsEditRangeActions]);
 
   const requestRewindRef = useRef(requestRewind);
   requestRewindRef.current = requestRewind;
@@ -5298,6 +5332,7 @@ function Timeline({
   // on the primary half of the single-entry delete control.
   const handleDeleteClaudeUserEntry = async (entry: TimelineEntry) => {
     if (!sessionId || isGemini || isCodex) return;
+    if (rejectBlockedHistoryMutation(historyDeleteUiBlocked)) return;
     setContextMenu(null);
     setDeleteEntryConfirmMode(false);
     try {
@@ -8196,7 +8231,7 @@ function Timeline({
                     <StickyNote size={12} />
                     {notes[contextMenu.entry.uuid] ? 'Редактировать заметку' : 'Добавить заметку'}
                   </button>
-                  {supportsDeleteRangeActions && (contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact') && (
+                  {supportsDeleteRangeActions && !historyDeleteUiBlocked && (contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact') && (
                     <>
                       <div className="border-t border-white/10 my-1" />
                       {!deleteEntryConfirmMode ? (
@@ -8323,6 +8358,7 @@ function Timeline({
                     // Rewriting history needs a user entry it can actually cut
                     // at; boundary rows are handled by the delete flow above.
                     const canRewriteHistory = supportsEditRangeActions
+                      && !historyRewriteUiBlocked
                       && !!sessionId
                       && contextMenu.entry.type === 'user'
                       && !contextMenu.entry.isCompactSummary;
@@ -8544,7 +8580,7 @@ function Timeline({
                   >
                     Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
                   </button>
-                  {supportsEditRangeActions && (
+                  {supportsEditRangeActions && !historyRewriteUiBlocked && (
                     // Same action as the single-point violet Rewind — history is
                     // rewritten and the removed range is replaced by one summary.
                     // Only the boundaries differ (selection instead of one click),
@@ -8588,7 +8624,7 @@ function Timeline({
                       </Tooltip>
                     </div>
                   )}
-                  {supportsDeleteRangeActions && (
+                  {supportsDeleteRangeActions && !historyDeleteUiBlocked && (
                     <div className="flex rounded overflow-hidden" data-testid="timeline-delete-split-range">
                       <button
                         className="flex-1 text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 transition-colors cursor-pointer flex items-center gap-2"

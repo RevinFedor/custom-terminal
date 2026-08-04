@@ -4,7 +4,7 @@ import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
 import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
-import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore, isTabInterrupted, selectFocusedProjectId } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { compressLogs } from '../../utils/compressLogs';
 import { clearPendingResume, markPendingResume } from '../../utils/pendingResume';
@@ -42,14 +42,15 @@ type ToolbarExternalRunMeta = {
 export default function ProjectToolbar({ isSystemProject = false }: { isSystemProject?: boolean }) {
   const showToast = useUIStore((state) => state.showToast);
   const [isResumingAll, setIsResumingAll] = useState(false);
-  const activeProjectId = useWorkspaceStore((state) => state.activeProjectId);
+  const focusedProjectId = useWorkspaceStore(selectFocusedProjectId);
+  const centerProjectId = useWorkspaceStore((state) => state.activeProjectId);
   const currentView = useWorkspaceStore((state) => {
-    const projectId = state.activeProjectId;
+    const projectId = selectFocusedProjectId(state);
     if (!projectId) return 'terminal';
     return state.openProjects.get(projectId)?.currentView || 'terminal';
   });
   const interruptedTabsKey = useWorkspaceStore((state) => {
-    const projectId = state.activeProjectId;
+    const projectId = selectFocusedProjectId(state);
     if (!projectId) return '';
     const workspace = state.openProjects.get(projectId);
     if (!workspace) return '';
@@ -68,22 +69,33 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
   const setSidebarOpen = useWorkspaceStore((state) => state.setSidebarOpen);
   const sidebarOpenForRender = useWorkspaceStore((state) => {
-    const projectId = state.activeProjectId;
+    const projectId = selectFocusedProjectId(state);
     if (!projectId || isInboxProjectId(projectId)) return false;
     return state.openProjects.get(projectId)?.sidebarOpen ?? false;
   });
   const currentProjectMetaPath = useProjectsStore((state) => (
-    activeProjectId ? state.projects[activeProjectId]?.path : undefined
+    focusedProjectId ? state.projects[focusedProjectId]?.path : undefined
   ));
   const currentProjectName = useProjectsStore((state) => (
-    activeProjectId ? state.projects[activeProjectId]?.name : undefined
+    focusedProjectId ? state.projects[focusedProjectId]?.name : undefined
   ));
   const currentWorkspaceProjectPath = useWorkspaceStore((state) => {
-    const projectId = state.activeProjectId;
+    const projectId = selectFocusedProjectId(state);
     if (!projectId) return undefined;
     return state.openProjects.get(projectId)?.projectPath;
   });
   const currentProjectPath = currentProjectMetaPath || currentWorkspaceProjectPath;
+  const centerProjectMetaPath = useProjectsStore((state) => (
+    centerProjectId ? state.projects[centerProjectId]?.path : undefined
+  ));
+  const centerProjectName = useProjectsStore((state) => (
+    centerProjectId ? state.projects[centerProjectId]?.name : undefined
+  ));
+  const centerWorkspaceProjectPath = useWorkspaceStore((state) => {
+    const projectId = state.activeProjectId;
+    return projectId ? state.openProjects.get(projectId)?.projectPath : undefined;
+  });
+  const centerProjectPath = centerProjectMetaPath || centerWorkspaceProjectPath;
   const activeExternalRunKey = useWorkspaceStore((state) => {
     const projectId = state.activeProjectId;
     if (!projectId) return '';
@@ -336,7 +348,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
     if (!outlineTarget || outlineGenerating) return;
     const record = await generateTimelineOutline({
       ...outlineTarget,
-      projectName: currentProjectName || null,
+      projectName: centerProjectName || null,
     });
     if (!record) {
       const message = useTimelineOutlineStore.getState().errorsByKey[
@@ -351,14 +363,14 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       `${count} ${count === 1 ? 'группа' : count < 5 ? 'группы' : 'групп'}${tokens > 0 ? ` · ${tokens.toLocaleString('ru-RU')} входных токенов` : ''}`,
       'success'
     );
-  }, [outlineTarget, outlineGenerating, generateTimelineOutline, currentProjectName, outlineError, showToast]);
+  }, [outlineTarget, outlineGenerating, generateTimelineOutline, centerProjectName, outlineError, showToast]);
 
   // Get interrupted tabs for CURRENT project only
   const interruptedTabs = useMemo(() => {
-    if (!activeProjectId) return [];
+    if (!focusedProjectId) return [];
 
     const { openProjects } = useWorkspaceStore.getState();
-    const workspace = openProjects.get(activeProjectId);
+    const workspace = openProjects.get(focusedProjectId);
     if (!workspace) return [];
 
     const tabs: Array<{
@@ -384,7 +396,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
     });
 
     return tabs;
-  }, [interruptedTabsKey, activeProjectId]);
+  }, [interruptedTabsKey, focusedProjectId]);
 
   // Resume all interrupted sessions
   const handleResumeAll = async () => {
@@ -455,13 +467,13 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
   };
 
   const resolveProjectCwd = useCallback(() => {
-    if (!activeProjectId) return;
+    if (!centerProjectId) return;
     const state = useWorkspaceStore.getState();
-    const workspace = state.openProjects.get(activeProjectId);
+    const workspace = state.openProjects.get(centerProjectId);
     const effectiveId = state.getEffectiveTabId();
     const currentTab = effectiveId && workspace ? workspace.tabs.get(effectiveId) : null;
-    return currentTab?.cwd || currentProjectPath;
-  }, [activeProjectId, currentProjectPath]);
+    return currentTab?.cwd || centerProjectPath;
+  }, [centerProjectId, centerProjectPath]);
 
   const handleOpenVSCode = useCallback(() => {
     if (isSystemProject) return;
@@ -588,8 +600,8 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           data-sidebar-toggle-trigger
           aria-pressed={sidebarOpenForRender}
           onClick={() => {
-            if (!activeProjectId) return;
-            setSidebarOpen(activeProjectId, !sidebarOpenForRender);
+            if (!focusedProjectId) return;
+            setSidebarOpen(focusedProjectId, !sidebarOpenForRender);
           }}
           className="h-full flex items-center px-3 text-[#666] hover:text-white hover:bg-[rgba(255,255,255,0.05)] transition-all duration-150"
           style={{
@@ -606,7 +618,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       <ControlHint label={isHomeActive ? 'Вернуться в терминал' : 'Открыть Home проекта'}>
       <button
         data-workspace-navigation
-        onClick={() => activeProjectId && setProjectView(activeProjectId, isHomeActive ? 'terminal' : 'home')}
+        onClick={() => focusedProjectId && setProjectView(focusedProjectId, isHomeActive ? 'terminal' : 'home')}
         style={buttonStyle(isHomeActive)}
         onMouseEnter={(e) => handleMouseEnter(e, isHomeActive)}
         onMouseLeave={(e) => handleMouseLeave(e, isHomeActive)}
@@ -634,9 +646,9 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           <ControlHint label="Открыть browser-вкладку">
           <button
             onClick={() => {
-              if (activeProjectId) {
-                createBrowserTab(activeProjectId);
-                setProjectView(activeProjectId, 'terminal');
+              if (focusedProjectId) {
+                createBrowserTab(focusedProjectId);
+                setProjectView(focusedProjectId, 'terminal');
               }
             }}
             style={buttonStyle(false)}
@@ -941,7 +953,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       {!isSystemProject && currentProjectPath && (
         <div className="flex items-stretch h-full">
           <GitStatusButton
-            projectId={activeProjectId}
+            projectId={focusedProjectId}
             projectName={currentProjectName}
             projectPath={currentProjectPath}
           />

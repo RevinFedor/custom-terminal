@@ -3681,7 +3681,7 @@ function App() {
           // Single dispatch entry for agent send. `sendMessageAuto` is the old
           // bridge name kept for route compatibility; the implementation is now
           // the shared scenario used by Project API and Inbox API.
-          const { tabId, prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue, returnDraftOnConflict, presentationSnapshot } = payload || {};
+          const { tabId, prompt, model, effort, thinking, cwd, handoffId, sendAttemptId, sendOperationKey, source, statusAtSend, queue, returnDraftOnConflict, presentationSnapshot } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
           const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
           if (runtime && toolType) {
@@ -3695,6 +3695,8 @@ function App() {
               promptChips: presentationSnapshot?.promptChips || [],
               imagePaths: presentationSnapshot?.imagePaths || [],
               handoffId,
+              sendAttemptId,
+              sendOperationKey,
               source: promptSource,
               statusAtSend,
               send: (resolvedHandoffId) => sendAgentPromptScenario({
@@ -3705,6 +3707,8 @@ function App() {
                 cwd: cwd || tab?.cwd,
                 prompt,
                 handoffId: resolvedHandoffId,
+                sendAttemptId,
+                sendOperationKey,
                 source: promptSource,
                 statusAtSend,
                 queue,

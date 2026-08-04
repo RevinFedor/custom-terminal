@@ -29,12 +29,12 @@ test('manual recovery exposes automatic continuation, timer hold, report, and de
   assert.match(source, /run\.outcome === 'interrupted' \? 'Восстановить связь вручную'/);
   assert.match(source, /actionButton\(run, 'wait', 'Продолжить ожидание без таймера'/);
   assert.match(source, /actionButton\(run, 'report', 'Передать ошибку родителю'/);
-  assert.match(source, /actionButton\(run, 'dismiss', 'Закрыть без сообщения'/);
+  assert.match(source, /actionButton\(run, paused \? 'detach' : 'dismiss', paused \? 'Отвязать запрос' : 'Закрыть без сообщения'/);
 });
 
 test('incomplete result proof can be detached from the tooltip and compact status row', () => {
   assert.match(source, /const canDetachResultProof = isOrchestrationResultProofPending\(run\)/);
   assert.match(source, /canCancelActiveRun \|\| canCancelHandoff \|\| canDetachResultProof/);
   assert.match(source, /canDismissAttention \|\| canDismissRecovery \|\| canDetachResultProof/);
-  assert.match(source, /canDetachResultProof\s*\? 'detach'/);
+  assert.match(source, /canDetachResultProof \|\| paused\s*\? 'detach'/);
 });

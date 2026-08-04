@@ -207,9 +207,35 @@ function sourceFollowupExecutionContext(run, parent, proof = {}) {
     return { context: null, reason: 'source-followup-execution-context-turn-unproven' };
   }
   if (previous?.turnId && previous.turnId === context.turnId) {
+    const exactSameTurn = executionContextsMatch(previous, context)
+      && (previous.generation == null || context.generation === previous.generation)
+      && (previous.startedAt == null || context.startedAt === previous.startedAt);
+    if (!exactSameTurn) {
+      return { context: null, reason: 'source-followup-execution-context-same-turn-mismatch' };
+    }
+    const sameActiveTurn = proof.kind !== 'transcript'
+      && proof.queuedAtSubmit === true
+      && parent.status === 'running'
+      && parent.targetBusySeen === true
+      && parent.outcome == null
+      && !parent.ownCompletedAt
+      && !parent.completedAt;
+    if (sameActiveTurn) {
+      return { context, reason: null, disposition: 'same-active-turn' };
+    }
+    const sameSettledTurn = proof.kind === 'transcript'
+      && proof.sameTurnComplete === true
+      && parent.status === 'waiting_descendants'
+      && parent.targetBusySeen !== true
+      && parent.outcome === 'success'
+      && !!parent.ownCompletedAt
+      && !parent.completedAt;
+    if (sameSettledTurn) {
+      return { context, reason: null, disposition: 'same-settled-turn' };
+    }
     return { context: null, reason: 'source-followup-execution-context-turn-not-advanced' };
   }
-  return { context, reason: null };
+  return { context, reason: null, disposition: 'advanced-turn' };
 }
 
 function lifecycleExecutionContext(payload = {}) {
@@ -259,14 +285,42 @@ function orchestrationSendFailureRecoveryPolicy(sendResult = {}) {
 }
 
 function classifyAgentSendReceipt(sendResult = {}) {
+  const registryState = typeof sendResult?.receiptState === 'string'
+    ? sendResult.receiptState
+    : null;
   if (
-    sendResult?.deliveryUnknown === true
+    registryState === 'delivery-unknown'
+    || registryState === 'evicted-unknown'
+    || sendResult?.deliveryUnknown === true
     || sendResult?.status === 'delivery-unknown'
     || sendResult?.status === 'delivery_unknown'
   ) {
     return {
       state: 'delivery-unknown',
       submitted: null,
+      accepted: true,
+    };
+  }
+  if (registryState === 'audit-pending') {
+    return {
+      state: 'audit-pending',
+      submitted: true,
+      accepted: true,
+    };
+  }
+  if (registryState === 'not-submitted'
+    || registryState === 'capacity'
+    || registryState === 'conflict') {
+    return {
+      state: 'not-submitted',
+      submitted: false,
+      accepted: false,
+    };
+  }
+  if (registryState === 'confirmed') {
+    return {
+      state: 'confirmed',
+      submitted: true,
       accepted: true,
     };
   }
@@ -288,9 +342,12 @@ function classifyAgentSendReceipt(sendResult = {}) {
       accepted: false,
     };
   }
+  // A generic success flag is not physical proof that Enter crossed. Older
+  // adapters can omit submitted/audit fields; keep that outcome explicit so a
+  // caller cannot turn an incomplete renderer receipt into green success.
   return {
-    state: 'confirmed',
-    submitted: sendResult?.submitted,
+    state: 'delivery-unknown',
+    submitted: null,
     accepted: true,
   };
 }
@@ -566,9 +623,18 @@ function outcomeForReason(reason) {
   if (value.includes('target_closed') || value.includes('target-closed') || value === 'close') return 'target_closed';
   if (value.includes('startup')) return 'startup_failed';
   if (value.includes('process') && (value.includes('exit') || value.includes('killed'))) return 'process_exited';
+  if (value.includes('no-final-result')) return 'failed';
   if (value.includes('abort') || value.includes('interrupt') || value.includes('manual-stop')) return 'interrupted';
   if (value.includes('failed') || value.includes('error')) return 'failed';
   return isAbortedReason(value) ? 'unknown' : 'success';
+}
+
+function canExactResultResolveRecovery(run) {
+  if (run?.status !== 'waiting_recovery') return true;
+  if (['target_closed', 'process_exited', 'process_replaced'].includes(run.outcome)) return true;
+  const error = String(run.error || '').toLowerCase();
+  return error.includes('delivery outcome is unknown')
+    || error.includes('bridge_timeout_delivery_unknown');
 }
 
 function clampDelay(value, fallback) {
@@ -1569,7 +1635,9 @@ class OrchestrationRunStore {
     if (parent && parent.targetTabId === run.sourceTabId) {
       run.parentConsumedAt = now;
       run.parentFollowupPending = false;
-      if (!isPausedRun(parent)) {
+      const sameParentTurn = followupContext.disposition === 'same-active-turn'
+        || followupContext.disposition === 'same-settled-turn';
+      if (!isPausedRun(parent) && !sameParentTurn) {
         parent.resultPromptHash = run.notificationPromptHash || parent.resultPromptHash || null;
         parent.resultPromptProofUserUuid = proof.userUuid || parent.resultPromptProofUserUuid || null;
         parent.resultAfterAt = null;
@@ -1577,7 +1645,7 @@ class OrchestrationRunStore {
           || run.notificationDeliveredAt
           || now;
       }
-      if (causalParent) {
+      if (causalParent && !sameParentTurn) {
         parent.outcome = null;
         parent.ownCompletedAt = null;
         parent.completedAt = null;
@@ -1593,12 +1661,20 @@ class OrchestrationRunStore {
         parent.updatedAt = now;
         this._pushChanged(changed, parent);
       }
+      if (causalParent && followupContext.disposition === 'same-settled-turn') {
+        // The exact notification and the parent's final response already live
+        // inside the same completed provider turn. Consume only the child, then
+        // let the ordinary descendant settlement close the parent; reopening
+        // would wait for a second task_complete that can never arrive.
+        this._refreshAncestors(parent.runId, changed, settled, now);
+      }
     }
     this._pushChanged(changed, run);
     this._schedulePersist();
     return {
       confirmed: true,
       contextBound: Boolean(followupContext.context),
+      contextDisposition: followupContext.disposition || null,
       run: publicRun(run),
       changed,
       settled,
@@ -1613,6 +1689,20 @@ class OrchestrationRunStore {
     const settled = [];
     const resultFound = observation.resultFound === true;
     const resultComplete = observation.resultComplete === true;
+    const resultTerminalEvent = typeof observation.resultTerminalEvent === 'string'
+      ? observation.resultTerminalEvent.trim()
+      : '';
+    const resultTerminalReason = typeof observation.resultTerminalReason === 'string'
+      ? observation.resultTerminalReason.trim()
+      : '';
+    const resultHasFinalResult = observation.resultHasFinalResult === true;
+    const terminalFailureReason = resultFound && resultTerminalEvent === 'turn_aborted'
+      ? (resultTerminalReason || 'turn_aborted')
+      : resultFound
+        && resultTerminalEvent === 'task_complete'
+        && resultHasFinalResult !== true
+        ? (resultTerminalReason || 'codex-no-final-result')
+        : '';
     const busy = observation.busy === true;
     const now = Date.now();
     const generationCheck = lifecycleGenerationCheck(run, observation.lifecycleGeneration);
@@ -1627,7 +1717,41 @@ class OrchestrationRunStore {
       };
     }
 
-    if (resultFound && resultComplete) {
+    if (terminalFailureReason) {
+      // Exact transcript proof of an aborted provider turn closes the identity
+      // question, but it is never success proof. Preserve a stronger recovery
+      // outcome already observed (provider_error/process exit/etc.); otherwise
+      // recover as an interrupted turn even if the volatile lifecycle edge was
+      // missed before restart.
+      if (run.status !== 'waiting_recovery') {
+        run.resultAvailable = observation.resultAvailable !== false;
+        run.resultTurnIndex = Number.isInteger(observation.turnIndex)
+          ? observation.turnIndex
+          : run.resultTurnIndex;
+        this._beginRecovery(
+          run,
+          outcomeForReason(terminalFailureReason),
+          terminalFailureReason,
+          changed,
+          settled,
+          now,
+        );
+        this._refreshAncestors(run.parentRunId, changed, settled, now);
+      }
+    } else if (resultFound && resultComplete && !canExactResultResolveRecovery(run)) {
+      // Provider failure, explicit interruption and startup failure are durable
+      // recovery decisions. A later result from the same still-running process
+      // cannot silently rewrite them as success; only an explicit recovery can
+      // arm a new turn. Ownership-only recovery (closed/replaced/exited target)
+      // and an unknown transport remain repairable by exact transcript proof.
+      return {
+        changed: publicRun(run),
+        completed: false,
+        settled,
+        ignored: true,
+        ignoreReason: 'recovery-requires-explicit-resolution',
+      };
+    } else if (resultFound && resultComplete) {
       run.waitingForPriorTurn = false;
       run.targetBusySeen = true;
       run.resultAvailable = observation.resultAvailable !== false;
@@ -1675,7 +1799,8 @@ class OrchestrationRunStore {
       run.startedAt ||= now;
       this._pushChanged(changed, run);
     }
-    const canAdoptObservedSession = (resultFound && resultComplete)
+    const canAdoptObservedSession = (resultFound
+        && (resultComplete || terminalFailureReason))
       || generationCheck.verdict === 'match'
       || generationCheck.verdict === 'not-required';
     if (observation.sessionId && canAdoptObservedSession) {
@@ -1712,6 +1837,54 @@ class OrchestrationRunStore {
     run.resultProofStatus = 'unavailable';
     run.resultProofUnavailableAt = now;
     run.resultError ||= reason;
+    run.deliveryIntent = null;
+    run.recoveryDeadlineAt = null;
+    if (canNotifySource(run)) {
+      run.notificationStatus = 'pending';
+      run.notificationError = null;
+    } else if (run.notificationSuppressed) {
+      run.notificationStatus = 'suppressed';
+    }
+    run.updatedAt = now;
+    this._pushChanged(changed, run);
+    settled.push(publicRun(run));
+    this._refreshAncestors(run.parentRunId, changed, settled, now);
+    this._schedulePersist();
+    return {
+      run: publicRun(run),
+      changed,
+      settled,
+      resolved: true,
+    };
+  }
+
+  async markResultProofTerminalFailure(runId, reason, options = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run || !isResultProofPending(run)) {
+      return {
+        run: publicRun(run),
+        changed: [],
+        settled: [],
+        resolved: false,
+      };
+    }
+
+    const failureReason = String(reason || 'exact provider turn ended without a final result');
+    const now = Number(options.now) || Date.now();
+    const changed = [];
+    const settled = [];
+    run.status = 'failed';
+    run.outcome = outcomeForReason(failureReason);
+    run.error = failureReason;
+    run.resultComplete = false;
+    run.resultAvailable = options.resultAvailable === true;
+    run.resultTurnIndex = Number.isInteger(options.turnIndex)
+      ? options.turnIndex
+      : run.resultTurnIndex;
+    run.resultUserUuid = options.userUuid || run.resultUserUuid || null;
+    run.resultProofStatus = 'failed';
+    run.resultError = failureReason;
     run.deliveryIntent = null;
     run.recoveryDeadlineAt = null;
     if (canNotifySource(run)) {

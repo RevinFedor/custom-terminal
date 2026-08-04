@@ -94,6 +94,8 @@ export interface AgentResumeResult {
 
 export interface AgentSendPromptOptions {
   handoffId?: string;
+  sendAttemptId?: string;
+  sendOperationKey?: string;
   source?: string;
   statusAtSend?: AgentPtyStatus;
   queue?: boolean;
@@ -569,6 +571,8 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   const work = ipcRenderer.invoke('codex:send-command', tabId, prompt, {
     queue,
     handoffId: options.handoffId || null,
+    sendAttemptId: options.sendAttemptId || null,
+    sendOperationKey: options.sendOperationKey || null,
     source: options.source || null,
     statusAtSend: options.statusAtSend || null,
     skipVisibleDraftGuard: false,

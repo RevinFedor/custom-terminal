@@ -43,3 +43,29 @@ test('an exact waiter wakes on cancellation and ignores another handoff', async 
   assert.equal(result.cancelled, true);
   assert.equal(result.handoffId, 'handoff-a');
 });
+
+test('a cancellation for attempt A cannot poison retry attempt B', () => {
+  const registry = createAgentSendCancellationRegistry();
+  registry.cancel('tab-a', 'handoff-a', { attemptId: 'attempt-a', now: 100 });
+
+  assert.equal(registry.isCancelled('tab-a', 'handoff-a', 'attempt-a'), true);
+  assert.equal(registry.isCancelled('tab-a', 'handoff-a', 'attempt-b'), false);
+  assert.equal(registry.clear('tab-a', 'handoff-a'), true);
+  assert.equal(registry.isCancelled('tab-a', 'handoff-a', 'attempt-a'), false);
+});
+
+test('a physical waiter for retry B ignores a late cancellation from attempt A', async () => {
+  const registry = createAgentSendCancellationRegistry();
+  const waiter = registry.wait('tab-a', 'handoff-a', 'attempt-b');
+  registry.cancel('tab-a', 'handoff-a', { attemptId: 'attempt-a', now: 100 });
+
+  let settled = false;
+  waiter.promise.then(() => { settled = true; });
+  await Promise.resolve();
+  assert.equal(settled, false);
+
+  registry.cancel('tab-a', 'handoff-a', { attemptId: 'attempt-b', now: 101 });
+  const result = await waiter.promise;
+  assert.equal(result.cancelled, true);
+  assert.equal(result.attemptId, 'attempt-b');
+});

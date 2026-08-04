@@ -1,7 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowDown, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, Square, Trash2, TriangleAlert, X } from 'lucide-react';
+import { ArrowDown, ArrowRight, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, Square, Terminal, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import {
   ComposerEditor,
@@ -160,7 +160,7 @@ const PANEL_SLIDE_MS = 100;
 // style to `left: 8`) — the handle auto-moves to the right, no other change.
 const ANCHOR_SIDE: 'left' | 'right' = 'right';
 // Resize bounds — must match useUIStore's PROMPT_QUEUE_WIDTH_MIN/MAX clamp.
-const RESIZE_MIN_WIDTH = 240;
+const RESIZE_MIN_WIDTH = 120;
 const RESIZE_MAX_WIDTH = 600;
 const RUN_AFTER_IMAGE_PENDING_MARKER = '[Image saving…]';
 
@@ -305,7 +305,8 @@ export function PromptQueueOverlay({
   const pinnedPreviewId = queue?.previewId ?? null;
   const {
     addPrompt, removePrompt, updatePrompt, reorderPrompt,
-    setAutoRun, setStopAfter, setCloseAfter, setRunAfterTab: setRunAfterTabInStore,
+    setPromptTrigger,
+    setAutoRun, setStopAfter, setCloseAfter,
     setPostPromptEnabled, setPostPromptText,
     setLoopPromptEnabled, setLoopPromptText,
     setPanelCollapsed, setPreviewId,
@@ -390,6 +391,8 @@ export function PromptQueueOverlay({
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
   const [removeHoverId, setRemoveHoverId] = useState<string | null>(null);
   const [chipContextMenu, setChipContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const [onTabTriggerDraftIds, setOnTabTriggerDraftIds] = useState<Set<string>>(() => new Set());
+  const [timerTriggerDraftIds, setTimerTriggerDraftIds] = useState<Set<string>>(() => new Set());
   const panelRef = useRef<HTMLDivElement>(null);
   const chipListRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
@@ -557,11 +560,6 @@ export function PromptQueueOverlay({
   // Toast handle — single getState() at top so both grabCurrent and the auto-runner share it
   // without re-declaring (which TS catches as duplicate identifier).
   const showToast = useUIStore.getState().showToast;
-  const handleSetRunAfterTab = useCallback((ownerTabId: string, targetTabId: string | null) => {
-    if (setRunAfterTabInStore(ownerTabId, targetTabId)) return;
-    showToast('Run after не изменён: цепочка замкнётся сама на себя', 'warning', 3500);
-  }, [setRunAfterTabInStore, showToast]);
-
   // ─── first-chip blink ────────────────────────────────────────────────────
   // When firstChipArmedHint flips false → true (user added the first chip
   // into an empty queue while Run after was off), we play one red blink to draw
@@ -2232,11 +2230,6 @@ export function PromptQueueOverlay({
   // anchor the editor slideout next to the clicked chip.
   const chipRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const panelOpen = !collapsed || panelClosing;
-  // The rail is now a HORIZONTAL row of square buttons ABOVE the panel
-  // (was: vertical column to the panel's right). Width = intrinsic row of
-  // 30px squares; the overlay reserves the max of row and panel widths.
-  const railButtonCount = hideHistoryToggle ? 4 : 5;
-  const collapsedRailWidth = railButtonCount * 21 + (railButtonCount - 1) * 4 + 10;
   const arrowExpanded = !collapsed && !panelClosing;
   const addEditorActive = editorOpen && !isSpecialPromptMode && editingId === null;
   const railRunBg = autoRun
@@ -2305,9 +2298,6 @@ export function PromptQueueOverlay({
           top: 0,
           // Anchored edge — pinned, never moves during resize.
           ...(ANCHOR_SIDE === 'right' ? { right: rightInset } : { left: 0 }),
-          // Rail row on top + panel below it. Width = panel width when open,
-          // rail row width when collapsed.
-          width: panelOpen ? effectiveWidth : collapsedRailWidth,
           background: 'transparent',
           border: 'none',
           borderRadius: 0,
@@ -2321,14 +2311,9 @@ export function PromptQueueOverlay({
           gap: COLLAPSED_RAIL_GAP,
           overflow: 'visible',
           pointerEvents: 'auto',
-          transition: `width ${PANEL_SLIDE_MS}ms ease-out`,
           boxSizing: 'border-box',
         }}
       >
-        <OrchestrationStatusChip
-          tabId={tabId}
-          rightOffset={panelOpen ? effectiveWidth : collapsedRailWidth}
-        />
         {panelOpen && (
           <div
             className={panelClosing ? 'pq-panel-closing' : (panelOpening ? 'pq-panel-opening' : undefined)}
@@ -2379,41 +2364,14 @@ export function PromptQueueOverlay({
             "Run after" toggles autoRun. Arming with delay > 0 starts the countdown.
             Disarming mid-countdown freezes the remaining seconds back into the input.
             "Stop after" — stop the agent after the next turn ends (independent). */}
-        {/* Two-column header layout — both columns ~120px to match the user's
-            spec ("колонки одинаковой ширины, узкие — как раньше Stop after").
-            Old `grid 90px 1fr` made the right column 2-3x wider than the
-            left, which is why Run after / Stop after / Post visually felt
-            "huge" vs the trigger on the left.
-            Strict equal columns via `1fr 1fr`; cell padding kept compact
-            (6px outer, 4px row gap). All children of each column are
-            `width:100%` to fill the column — fixed cell width means no
-            layout shift when the trigger flips between «on tab» / selected. */}
         <div style={{
           padding: '6px 8px',
           borderBottom: `1px solid ${BORDER}`,
-          display: 'grid',
-          gridTemplateColumns: '1fr 1fr',
-          columnGap: 6,
-          rowGap: 4,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          minWidth: 0,
         }}>
-          {/* ── LEFT COLUMN ───────────────────────────────────────────────── */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
-            <RunAfterTabPicker
-              tabId={tabId}
-              autoRun={autoRun}
-              runAfterTabId={runAfterTabId}
-              setRunAfterTab={handleSetRunAfterTab}
-              waitingTabIds={pendingQueueTabIds}
-              panelRef={panelRef}
-            />
-            <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
-              <FirstDelayInput tabId={tabId} autoRun={autoRun} />
-            </div>
-          </div>
-
-          {/* ── RIGHT COLUMN ──────────────────────────────────────────────── */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'stretch', minWidth: 0 }}>
-
           {/* Run-after pill — row 1 of right column. Width: 100% of column.
               firstChipArmedHint: red blink + low-red resting state when user
               adds the first chip into an empty queue while Run after is OFF.
@@ -2738,8 +2696,6 @@ export function PromptQueueOverlay({
             </ControlHint>
           </div>
 
-          </div>
-          {/* end right column */}
         </div>
 
         {/* Clear-all row — only when queue has items */}
@@ -2782,10 +2738,14 @@ export function PromptQueueOverlay({
               savedFlashIds.has(it.id) ? 'pq-chip-saved' : '',
               isRemoving ? 'pq-chip-removing' : '',
             ].filter(Boolean).join(' ');
+            const editingOnTabTrigger = onTabTriggerDraftIds.has(it.id);
+            const editingTimerTrigger = timerTriggerDraftIds.has(it.id);
+            const showOnTabTrigger = editingOnTabTrigger || (!editingTimerTrigger && it.trigger?.kind === 'onTab');
+            const showTimerTrigger = editingTimerTrigger || (!editingOnTabTrigger && it.trigger?.kind === 'timer');
             return (
+              <Fragment key={it.id}>
               <div
                 className={chipClass}
-                key={it.id}
                 ref={(el) => { if (el) chipRefs.current.set(it.id, el); else chipRefs.current.delete(it.id); }}
                 draggable
                 onDragStart={onDragStart(it.id)}
@@ -3000,25 +2960,101 @@ export function PromptQueueOverlay({
                 ><Trash2 size={13} strokeWidth={1.9} /></button>
                 </ControlHint>
               </div>
+              {(showTimerTrigger || showOnTabTrigger) && (
+                <div
+                  data-prompt-trigger-row={it.id}
+                  style={{
+                    minHeight: 21,
+                    margin: '0 5px 3px 19px',
+                    padding: '1px 3px 1px 5px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 3,
+                    borderLeft: `1px solid ${PULSE}66`,
+                    borderBottom: `1px solid ${BORDER}`,
+                    borderRadius: '0 0 5px 5px',
+                    background: 'rgba(167,139,250,0.045)',
+                    fontSize: Math.max(8, Math.round(promptQueueChipFontSize * 0.85)),
+                  }}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  {showTimerTrigger ? (
+                    <PromptTriggerTimerInput
+                      tabId={tabId}
+                      item={it}
+                      autoRun={autoRun}
+                      draft={timerTriggerDraftIds.has(it.id)}
+                      onCommit={() => setTimerTriggerDraftIds((current) => {
+                        const next = new Set(current);
+                        next.delete(it.id);
+                        return next;
+                      })}
+                    />
+                  ) : (
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <RunAfterTabPicker
+                        tabId={tabId}
+                        autoRun={autoRun}
+                        runAfterTabId={it.trigger?.kind === 'onTab' ? it.trigger.tabId : null}
+                        setRunAfterTab={(_ownerTabId, targetTabId) => {
+                          if (targetTabId) setPromptTrigger(tabId, it.id, { kind: 'onTab', tabId: targetTabId });
+                          else setPromptTrigger(tabId, it.id, null);
+                          setOnTabTriggerDraftIds((current) => {
+                            const next = new Set(current);
+                            next.delete(it.id);
+                            return next;
+                          });
+                        }}
+                        waitingTabIds={pendingQueueTabIds}
+                        panelRef={panelRef}
+                        emptyLabel="выбрать вкладку"
+                        title="Запустить это сообщение после вкладки"
+                        menuWidth={252}
+                      />
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    data-chip-action="remove-trigger"
+                    aria-label="Убрать триггер"
+                    title="Убрать триггер"
+                    onClick={() => {
+                      setPromptTrigger(tabId, it.id, null);
+                      setOnTabTriggerDraftIds((current) => {
+                        const next = new Set(current);
+                        next.delete(it.id);
+                        return next;
+                      });
+                      setTimerTriggerDraftIds((current) => {
+                        const next = new Set(current);
+                        next.delete(it.id);
+                        return next;
+                      });
+                    }}
+                    style={{ width: 17, height: 17, flex: '0 0 17px', display: 'grid', placeItems: 'center', padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: TEXT_DIM, cursor: 'pointer' }}
+                  ><X size={10} /></button>
+                </div>
+              )}
+              </Fragment>
             );
           })}
         </div>
 
-        {/* Footer — grab + add. "Copy prompt" lives in InfoPanel next to Copy Session
-            (single canonical location for clipboard ops, avoids duplicate buttons). */}
+        {/* Footer — one split control. The left zone owns the seam. */}
         <div style={{ display: 'flex', borderTop: `1px solid ${BORDER}` }}>
           <ControlHint label={`Забрать текущий prompt из ${agentLabel} в очередь`} side="left">
           <button
             onClick={grabCurrent}
-            style={{ flex: 1, padding: '6px 4px', background: 'transparent', border: 'none', borderRight: `1px solid ${BORDER}`, color: '#aaa', cursor: 'pointer', fontSize: 10 }}
-          >+ grab</button>
+            style={{ flex: '4 1 80%', padding: '6px 4px', background: 'transparent', border: 'none', borderRight: `1px solid ${BORDER}`, color: '#aaa', cursor: 'pointer', fontSize: 10, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 5 }}
+          ><Terminal size={12} /><ArrowRight size={11} /><span>из терминала</span></button>
           </ControlHint>
           <ControlHint label="Добавить новое сообщение в очередь" side="left">
           <button
             data-editor-trigger="add"
             onClick={() => openEditor()}
             style={{
-              flex: 1,
+              flex: '1 1 20%',
               padding: '6px 4px',
               background: addEditorActive ? `${TINT}26` : 'transparent',
               border: 'none',
@@ -3027,7 +3063,7 @@ export function PromptQueueOverlay({
               fontSize: 10,
               transition: 'background 0.12s, color 0.12s',
             }}
-          >+ add</button>
+          ><Plus size={13} /></button>
           </ControlHint>
         </div>
           </div>
@@ -3055,32 +3091,11 @@ export function PromptQueueOverlay({
             flexShrink: 0,
           }}
         >
-          <div className="pq-rail-top-row">
-            <ControlHint label={timelineTreeMode ? 'Скрыть Timeline' : 'Открыть Timeline'} shortcut="⌘\\" side="left">
-            <button
-              className={`pq-rail-button pq-rail-meta${timelineTreeMode ? ' pq-rail-active' : ''}`}
-              onClick={toggleTimelineTree}
-              title="Timeline (Cmd+\\ / Opt+\\)"
-              aria-label="Toggle Timeline"
-            >
-              {timelineTreeMode
-                ? <PanelRightClose size={13} strokeWidth={2.1} />
-                : <PanelRightOpen size={13} strokeWidth={2.1} />}
-            </button>
-            </ControlHint>
-            {!hideHistoryToggle && (
-              <ControlHint label={historyPanelOpen ? 'Скрыть History' : 'Открыть History'} shortcut="⌘]" side="left">
-              <button
-                className={`pq-rail-button pq-rail-meta${historyPanelOpen ? ' pq-rail-active' : ''}`}
-                onClick={toggleHistoryPanel}
-                title="History (Cmd+] / Opt+])"
-                aria-label="Toggle History"
-              >
-                <History size={13} strokeWidth={2.1} />
-              </button>
-              </ControlHint>
-            )}
-          </div>
+          <OrchestrationStatusChip
+            tabId={tabId}
+            panelOpen={panelOpen}
+            effectiveWidth={effectiveWidth}
+          />
           <ControlHint label={(collapsed || panelClosing) ? 'Развернуть Run after' : 'Свернуть Run after'} side="left">
           <button
             className="pq-rail-button"
@@ -3153,13 +3168,37 @@ export function PromptQueueOverlay({
             <Plus size={14} strokeWidth={2.2} />
           </button>
           </ControlHint>
+          <ControlHint label={timelineTreeMode ? 'Скрыть Timeline' : 'Открыть Timeline'} shortcut="⌘\\" side="left">
+          <button
+            className={`pq-rail-button pq-rail-meta${timelineTreeMode ? ' pq-rail-active' : ''}`}
+            onClick={toggleTimelineTree}
+            title="Timeline (Cmd+\\ / Opt+\\)"
+            aria-label="Toggle Timeline"
+          >
+            {timelineTreeMode
+              ? <PanelRightClose size={13} strokeWidth={2.1} />
+              : <PanelRightOpen size={13} strokeWidth={2.1} />}
+          </button>
+          </ControlHint>
+          {!hideHistoryToggle && (
+            <ControlHint label={historyPanelOpen ? 'Скрыть History' : 'Открыть History'} shortcut="⌘]" side="left">
+            <button
+              className={`pq-rail-button pq-rail-meta${historyPanelOpen ? ' pq-rail-active' : ''}`}
+              onClick={toggleHistoryPanel}
+              title="History (Cmd+] / Opt+])"
+              aria-label="Toggle History"
+            >
+              <History size={13} strokeWidth={2.1} />
+            </button>
+            </ControlHint>
+          )}
         </div>
       </div>
 
       {chipContextMenu && chipContextItem && createPortal((() => {
         const enabled = isQueuedPromptEnabled(chipContextItem);
         const menuWidth = 206;
-        const menuHeight = 74;
+        const menuHeight = chipContextItem.trigger ? 164 : 134;
         const left = Math.max(8, Math.min(chipContextMenu.x, window.innerWidth - menuWidth - 8));
         const top = Math.max(8, Math.min(chipContextMenu.y, window.innerHeight - menuHeight - 8));
         const itemBase: CSSProperties = {
@@ -3209,6 +3248,64 @@ export function PromptQueueOverlay({
               {enabled ? <CheckSquare size={14} strokeWidth={1.9} /> : <Square size={14} strokeWidth={1.9} />}
               <span style={{ flex: 1, minWidth: 0 }}>Отправлять из очереди</span>
             </button>
+            <button
+              onClick={() => {
+                setOnTabTriggerDraftIds((current) => {
+                  const next = new Set(current);
+                  next.delete(chipContextItem.id);
+                  return next;
+                });
+                setTimerTriggerDraftIds((current) => new Set(current).add(chipContextItem.id));
+                setChipContextMenu(null);
+              }}
+              style={itemBase}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              <span style={{ width: 14, textAlign: 'center' }}>⏱</span>
+              <span style={{ flex: 1, minWidth: 0 }}>Добавить таймер</span>
+            </button>
+            <button
+              onClick={() => {
+                setTimerTriggerDraftIds((current) => {
+                  const next = new Set(current);
+                  next.delete(chipContextItem.id);
+                  return next;
+                });
+                setOnTabTriggerDraftIds((current) => new Set(current).add(chipContextItem.id));
+                setChipContextMenu(null);
+              }}
+              style={itemBase}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              <span style={{ width: 14, textAlign: 'center' }}>↪</span>
+              <span style={{ flex: 1, minWidth: 0 }}>Добавить on tab</span>
+            </button>
+            {chipContextItem.trigger && (
+              <button
+                onClick={() => {
+                  setPromptTrigger(tabId, chipContextItem.id, null);
+                  setTimerTriggerDraftIds((current) => {
+                    const next = new Set(current);
+                    next.delete(chipContextItem.id);
+                    return next;
+                  });
+                  setOnTabTriggerDraftIds((current) => {
+                    const next = new Set(current);
+                    next.delete(chipContextItem.id);
+                    return next;
+                  });
+                  setChipContextMenu(null);
+                }}
+                style={{ ...itemBase, color: '#fca5a5' }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(239,68,68,0.08)'; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+              >
+                <X size={14} />
+                <span style={{ flex: 1, minWidth: 0 }}>Убрать триггер</span>
+              </button>
+            )}
             <button
               onClick={() => regenerateChipTitle(chipContextItem.id)}
               disabled={titleLoadingIds.has(chipContextItem.id)}
@@ -3856,7 +3953,13 @@ export function PromptQueueOverlay({
 // When countdown reaches 0 the runner pops + fires (we just stop ticking here).
 // Disarming Run while counting freezes "what's left" back into firstDelaySeconds.
 // Natural fire consumes the delay back to 0, rendered as 0 ч / 0 м / 0 с.
-type FirstDelayInputProps = { tabId: string; autoRun: boolean };
+type PromptTriggerTimerInputProps = {
+  tabId: string;
+  item: QueuedPrompt;
+  autoRun: boolean;
+  draft?: boolean;
+  onCommit?: () => void;
+};
 type FirstDelayInputParts = { hours: string; minutes: string; seconds: string };
 const FIRST_DELAY_FIELDS: Array<{
   key: keyof FirstDelayInputParts;
@@ -3887,30 +3990,33 @@ function firstDelayCountdownParts(value: number): FirstDelayInputParts {
   };
 }
 
-function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
-  const cfg = usePromptQueueStore((s) => s.queues.get(tabId)?.firstDelaySeconds ?? 0);
+function PromptTriggerTimerInput({ tabId, item, autoRun, draft = false, onCommit }: PromptTriggerTimerInputProps) {
+  const cfg = item.trigger?.kind === 'timer' ? item.trigger.seconds : 0;
   const countdownAt = usePromptQueueStore((s) => s.queues.get(tabId)?.firstDelayCountdownAt ?? null);
-  const setFirstDelaySeconds = usePromptQueueStore((s) => s.setFirstDelaySeconds);
+  const isHead = usePromptQueueStore((s) => (
+    s.queues.get(tabId)?.items.find(isQueuedPromptEnabled)?.id === item.id
+  ));
+  const setPromptTrigger = usePromptQueueStore((s) => s.setPromptTrigger);
   const [parts, setParts] = useState<FirstDelayInputParts>(() => firstDelayInputParts(cfg));
   const skipNextBlurRef = useRef(false);
 
   // External writes (countdown finished, cancel-edit, etc) → mirror into local
   // input only when we're NOT counting (counting mode renders from `remaining`).
   useEffect(() => {
-    if (countdownAt !== null) return;
+    if (countdownAt !== null && isHead) return;
     setParts(firstDelayInputParts(cfg));
-  }, [cfg, countdownAt]);
+  }, [cfg, countdownAt, isHead]);
 
   // Tick once per second while counting. State is fully derivable from store
   // (firstDelaySeconds + firstDelayCountdownAt), no local timer state needed.
   const [, force] = useState(0);
   useEffect(() => {
-    if (countdownAt === null) return;
+    if (countdownAt === null || !isHead) return;
     const id = setInterval(() => force((n) => n + 1), 250);
     return () => clearInterval(id);
-  }, [countdownAt]);
+  }, [countdownAt, isHead]);
 
-  const remaining = countdownAt !== null
+  const remaining = isHead && countdownAt !== null
     ? getFirstDelayRemainingSeconds(cfg, countdownAt)
     : null;
 
@@ -3994,7 +4100,7 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
   // Disabled while autoRun is on but countdown hasn't started yet (delay=0
   // immediate-fire path) — kept readable, just locked out so the user doesn't
   // race the runner with a mid-arm edit.
-  const disabled = autoRun;
+  const disabled = !draft && autoRun && isHead;
   const resetParts = () => setParts(firstDelayInputParts(cfg));
   const commitParts = () => {
     const parsed = {
@@ -4007,14 +4113,23 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
       return;
     }
     const total = combineFirstDelayParts(parsed.hours, parsed.minutes, parsed.seconds);
-    setFirstDelaySeconds(tabId, total);
+    setPromptTrigger(tabId, item.id, { kind: 'timer', seconds: total });
     setParts(firstDelayInputParts(total));
+    onCommit?.();
   };
   return (
     <ControlHint label="Задержка перед первым сообщением очереди" shortcut="часы · минуты · секунды" side="left">
     <div
       role="group"
       aria-label="Задержка Run after"
+      onBlurCapture={(event) => {
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        if (skipNextBlurRef.current) {
+          skipNextBlurRef.current = false;
+          return;
+        }
+        commitParts();
+      }}
       style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
@@ -4050,13 +4165,6 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
             disabled={disabled}
             onChange={(event) => {
               setParts((current) => ({ ...current, [field.key]: event.target.value }));
-            }}
-            onBlur={() => {
-              if (skipNextBlurRef.current) {
-                skipNextBlurRef.current = false;
-                return;
-              }
-              commitParts();
             }}
             onKeyDown={(event) => {
               if (event.key === 'Enter') (event.target as HTMLInputElement).blur();

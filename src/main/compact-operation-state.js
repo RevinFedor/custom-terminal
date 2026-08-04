@@ -158,16 +158,23 @@ function pendingOwnerMatches(pending, expected = {}) {
  * it missed while unmounted.
  */
 class CompactOperationRegistry {
-  constructor({ now = () => Date.now(), publish = () => {}, maxSettledPerTab = 8 } = {}) {
+  constructor({
+    now = () => Date.now(),
+    publish = () => {},
+    maxSettledPerTab = 8,
+    beforeFinish = null,
+  } = {}) {
     if (!Number.isSafeInteger(maxSettledPerTab) || maxSettledPerTab <= 0) {
       throw new RangeError('maxSettledPerTab must be a positive safe integer');
     }
     this.now = now;
     this.publish = publish;
     this.maxSettledPerTab = maxSettledPerTab;
+    this.beforeFinish = typeof beforeFinish === 'function' ? beforeFinish : null;
     this.pendingByTab = new Map();
     this.activeByTab = new Map();
     this.settledByTab = new Map();
+    this.heldFinishByTab = new Map();
     this.sequence = 0;
   }
 
@@ -368,8 +375,40 @@ class CompactOperationRegistry {
       && active.causalStartConfirmed !== true) {
       return null;
     }
+    const alreadyHeld = this.heldFinishByTab.get(tabId) || null;
+    if (alreadyHeld && sameOperationIdentity(alreadyHeld.active, active)) {
+      return cloneOperation(active);
+    }
+    if (input._e2eBypass !== true && this.beforeFinish) {
+      const boundary = this.beforeFinish({
+        active: cloneOperation(active),
+        input: { ...input },
+      });
+      if (boundary?.hold === true && boundary.released?.then) {
+        const held = {
+          active,
+          input: { ...input },
+          boundary,
+        };
+        this.heldFinishByTab.set(tabId, held);
+        void Promise.resolve(boundary.released).then((release) => {
+          if (this.heldFinishByTab.get(tabId) !== held) return;
+          this.heldFinishByTab.delete(tabId);
+          const settled = this.finish({ ...held.input, _e2eBypass: true });
+          try {
+            boundary.complete?.({
+              release,
+              settled: cloneOperation(settled),
+              stale: settled == null,
+            });
+          } catch {}
+        });
+        return cloneOperation(active);
+      }
+    }
     const outcome = VALID_OUTCOMES.has(input.outcome) ? input.outcome : 'unknown';
     const endedAt = Number.isFinite(input.endedAt) ? Number(input.endedAt) : this.now();
+    this.heldFinishByTab.delete(tabId);
     this.activeByTab.delete(tabId);
     const settled = cloneOperation({
       ...active,

@@ -17,7 +17,10 @@ import {
 } from '../store/useOrchestrationStore';
 import {
   beginHistoryPromptHandoff,
+  getHistoryPromptHandoffsSnapshot,
+  historyPromptHandoffAcceptsAuditIdentity,
   historyPromptHandoffAuditProofFromSendResult,
+  historyPromptHandoffUnconfirmedStatusFromSendResult,
   retractHistoryPromptHandoff,
   settleHistoryPromptHandoff,
 } from '../utils/historyPromptHandoffs';
@@ -185,6 +188,20 @@ function sendQueueCommand(
 
 type EffectiveTriggerOptions = { clearStaleTarget?: boolean };
 type QueueStateSnapshot = { queues: Map<string, TabQueue> };
+const queueDelayStartListeners = new Set<(ownerTabId: string, source: string) => void>();
+
+function enabledQueueHead(queue: TabQueue): QueuedPrompt | null {
+  return queue.items.find(isQueuedPromptEnabled) || null;
+}
+
+function queueDelaySeconds(queue: TabQueue): number {
+  const head = enabledQueueHead(queue);
+  return head?.trigger?.kind === 'timer' ? head.trigger.seconds : queue.firstDelaySeconds;
+}
+
+function queueUsesItemTimer(queue: TabQueue): boolean {
+  return enabledQueueHead(queue)?.trigger?.kind === 'timer';
+}
 
 type ContinuationKind = 'queue' | 'loop';
 
@@ -218,6 +235,22 @@ function getLoopPrompt(queue: TabQueue): QueuedPrompt | null {
 }
 
 function getEffectiveQueueTrigger(ownerTabId: string, queue: TabQueue, options: EffectiveTriggerOptions = {}): string {
+  const head = enabledQueueHead(queue);
+  if (head?.trigger?.kind === 'onTab') {
+    const targetTabId = head.trigger.tabId;
+    if (!canValidateQueueTabs()) return targetTabId;
+    if (tabCanTriggerQueue(ownerTabId, targetTabId)) return targetTabId;
+    if (options.clearStaleTarget) {
+      console.warn('[PromptQueueRunner] item onTab trigger ' + targetTabId.slice(-8)
+        + ' is no longer valid, clearing → owner=' + ownerTabId.slice(-8));
+      usePromptQueueStore.getState().setPromptTrigger(ownerTabId, head.id, null);
+      return getEffectiveQueueTrigger(
+        ownerTabId,
+        usePromptQueueStore.getState().getQueue(ownerTabId),
+        { clearStaleTarget: false },
+      );
+    }
+  }
   if (queue.runAfterTabId && !canValidateQueueTabs()) {
     return queue.runAfterTabId;
   }
@@ -770,22 +803,22 @@ function beginValidatedQueueSend(
       return;
     }
     const auditProof = historyPromptHandoffAuditProofFromSendResult(res);
-    const lateAuditPending = res?.codexAudit?.lateReconciliationPending === true
-      || res?.pasteAudit?.lateReconciliationPending === true;
+    const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(res);
     const finalAuditFailure = res?.success === false
       && res?.submitted === true
-      && !lateAuditPending;
+      && !unconfirmedStatus;
     settleHistoryPromptHandoff(ownerTabId, handoffId, {
       queueStatus: finalAuditFailure
         ? 'failed'
-        : res?.queued === true
-          ? 'queued'
-          : 'sent',
+        : unconfirmedStatus
+          || (res?.queued === true ? 'queued' : 'sent'),
       reason: finalAuditFailure
         ? 'send-submitted-audit-failed'
-        : lateAuditPending
+        : unconfirmedStatus === 'audit-pending'
           ? 'send-submitted-audit-pending'
-        : 'send-result',
+          : unconfirmedStatus === 'delivery-unknown'
+            ? 'send-delivery-unknown'
+            : 'send-result',
       proof: auditProof,
       // Enter transfers delivery ownership, so the queue item is committed,
       // but text/time similarity is never allowed to impersonate audit proof.
@@ -1043,8 +1076,13 @@ export function usePromptQueueRunner() {
         return false;
       }
 
-      const head = queue.items.find(isQueuedPromptEnabled);
+      const head = enabledQueueHead(queue);
       if (!head) return false;
+      if (head.trigger?.kind === 'timer' && head.trigger.seconds > 0) {
+        usePromptQueueStore.getState().startFirstDelayCountdown(ownerTabId);
+        for (const listener of queueDelayStartListeners) listener(ownerTabId, 'head-turn-end');
+        return true;
+      }
       return beginValidatedQueueSend(ownerTabId, triggerTabId, head, 'turn-end');
     };
 
@@ -1129,6 +1167,15 @@ export function usePromptQueueRunner() {
       const auditTabId = typeof detail?.tabId === 'string' ? detail.tabId : '';
       const handoffId = typeof detail?.handoffId === 'string' ? detail.handoffId : '';
       if (!auditTabId || !handoffId) return;
+      const current = getHistoryPromptHandoffsSnapshot(auditTabId)
+        .find((handoff) => handoff.handoffId === handoffId);
+      if (current && !historyPromptHandoffAcceptsAuditIdentity(current, detail)) {
+        console.warn('[PromptQueueRunner] ignore stale prompt audit tab=' + auditTabId.slice(-12)
+          + ' handoff=' + handoffId.slice(0, 24)
+          + ' expectedAttempt=' + String(current.sendAttemptId || '-').slice(0, 12)
+          + ' actualAttempt=' + String(detail?.sendAttemptId || '-').slice(0, 12));
+        return;
+      }
       if (detail.success === true) {
         const proof = historyPromptHandoffAuditProofFromSendResult({
           codexAudit: {
@@ -1466,11 +1513,11 @@ export function usePromptQueueRunner() {
             usePromptQueueStore.getState().cleanupClosedTab(ownerTabId);
             continue;
           }
-          if (queue.stopAfter || queue.closeAfter || queue.runAfterTabId === null) {
+          if (queue.stopAfter || queue.closeAfter) {
             triggers.add(ownerTabId);
           }
           if (isLoopPromptActive(queue)) triggers.add(ownerTabId);
-          if (queue.autoRun && queue.runAfterTabId) {
+          if (queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0) {
             triggers.add(getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true }));
           }
         }
@@ -1760,11 +1807,15 @@ export function usePromptQueueRunner() {
       }
 
       const remainingMs = getFirstDelayRemainingMs(
-        latestQueue.firstDelaySeconds,
+        queueDelaySeconds(latestQueue),
         latestQueue.firstDelayCountdownAt,
       );
       if (remainingMs <= 0) {
-        usePromptQueueStore.getState().consumeFirstDelayCountdown(ownerTabId);
+        if (queueUsesItemTimer(latestQueue)) {
+          usePromptQueueStore.getState().clearFirstDelayCountdown(ownerTabId);
+        } else {
+          usePromptQueueStore.getState().consumeFirstDelayCountdown(ownerTabId);
+        }
         // The deadline is authoritative even if the owner is busy or a stale
         // busy snapshot survived a process stop. The validated send path
         // re-reads runtime presence and waits/launches without bypassing safety.
@@ -1784,7 +1835,7 @@ export function usePromptQueueRunner() {
       const head = queue.items.find(isQueuedPromptEnabled);
       if (!queue.autoRun
         || !head
-        || queue.firstDelaySeconds <= 0
+        || queueDelaySeconds(queue) <= 0
         || queue.firstDelayCountdownAt !== null
         || getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true }) !== ownerTabId) {
         return false;
@@ -1793,7 +1844,7 @@ export function usePromptQueueRunner() {
       clearTimer(ownerTabId);
       scheduleFirstDelayTimer(ownerTabId);
       console.log('[PromptQueueRunner] first-delay countdown started on arm owner='
-        + ownerTabId.slice(-8) + ' seconds=' + queue.firstDelaySeconds
+        + ownerTabId.slice(-8) + ' seconds=' + queueDelaySeconds(queue)
         + ' source=' + source);
       return true;
     };
@@ -1857,7 +1908,7 @@ export function usePromptQueueRunner() {
         }
 
         if (q2.firstDelayCountdownAt !== null) return;
-        if (q2.firstDelaySeconds > 0) {
+        if (queueDelaySeconds(q2) > 0) {
           startFirstDelayCountdown(ownerTabId, 'codex-own-cold-start');
         } else {
           fireHead(ownerTabId, ownerTabId);
@@ -1901,8 +1952,10 @@ export function usePromptQueueRunner() {
         // target-changed-while-armed. Handled via explicit check below.)
         const prevTarget = prevQ?.runAfterTabId ?? null;
         const targetChanged = (prevTarget ?? null) !== (q.runAfterTabId ?? null);
+        const prevHeadTrigger = prevQ ? enabledQueueHead(prevQ)?.trigger : undefined;
+        const headTriggerChanged = JSON.stringify(prevHeadTrigger) !== JSON.stringify(enabledQueueHead(q)?.trigger);
         const automaticTargetClear = targetChanged && consumeAutomaticRunAfterTargetClear(tabId);
-        if (targetChanged && prevQ?.autoRun) {
+        if ((targetChanged || headTriggerChanged) && prevQ?.autoRun) {
           clearTimer(tabId);
           if (q.firstDelayCountdownAt !== null) {
             usePromptQueueStore.getState().clearFirstDelayCountdown(tabId);
@@ -1922,6 +1975,7 @@ export function usePromptQueueRunner() {
         const armEdge = itemsArrived
           || autoRunArmed
           || (targetChanged && q.autoRun && !automaticTargetClear)
+          || (headTriggerChanged && q.autoRun)
           || (options.forceRuntimeArms === true && runtimeArm);
         if (!armEdge) continue;
 
@@ -1939,7 +1993,11 @@ export function usePromptQueueRunner() {
         }
 
         if (q.firstDelayCountdownAt !== null) continue;
-        if (q.firstDelaySeconds > 0) {
+        if (queueDelaySeconds(q) > 0) {
+          // A per-item timer replaces the send that this edge/arm would have
+          // performed. If the owner is still busy, wait for its real idle edge
+          // instead of counting down in parallel with the active turn.
+          if (queueUsesItemTimer(q) && isTabWorkflowBlocked(tabId)) continue;
           startFirstDelayCountdown(tabId, 'own-arm');
           continue;
         }
@@ -1957,6 +2015,11 @@ export function usePromptQueueRunner() {
       pruneDeferredOwnerSends();
       evaluateQueues(state, prevState);
     });
+    const delayStartListener = (ownerTabId: string) => {
+      clearTimer(ownerTabId);
+      scheduleFirstDelayTimer(ownerTabId);
+    };
+    queueDelayStartListeners.add(delayStartListener);
     const unsubscribeReconciliation = subscribeWorkflowRestoreReconciliation(() => {
       const current = usePromptQueueStore.getState();
       // Revisit only workflows explicitly armed in this renderer. Persisted
@@ -1977,6 +2040,7 @@ export function usePromptQueueRunner() {
       unsubscribeQueue();
       unsubscribeReconciliation();
       unsubscribeOrchestration();
+      queueDelayStartListeners.delete(delayStartListener);
       for (const t of pendingTimers.values()) clearTimeout(t);
       pendingTimers.clear();
     };

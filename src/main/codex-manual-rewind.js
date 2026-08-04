@@ -3,6 +3,9 @@
 const {
   stripLeadingCodexComposerPromptGlyph,
 } = require('./codex-tui-readiness');
+const {
+  hashCodexRewindTargetText,
+} = require('./codex-rewind-target-proof');
 
 function normalizeManualRewindText(text) {
   return String(text || '')
@@ -12,15 +15,172 @@ function normalizeManualRewindText(text) {
     .trim();
 }
 
+function readManualCodexComposerText(snapshot) {
+  const active = snapshot?.codexCursorComposer || null;
+  if (active?.cursorOwned !== true
+    || active?.hasDraft !== true
+    || !Number.isFinite(Number(active?.row))) return '';
+  return String(stripLeadingCodexComposerPromptGlyph(active.text || ''))
+    .replace(/\u00a0/g, ' ')
+    .replace(/[▌█]/g, '')
+    .trim();
+}
+
+/**
+ * Prove the first fully committed composer frame produced after native Rewind.
+ *
+ * The prompt text was already visible inside the transcript picker before
+ * Enter, so text equality alone is not causal.  The proof additionally needs
+ * a newer, closed synchronized frame in the same headless-mirror generation,
+ * with the transcript chrome gone and the exact restored prompt active in the
+ * composer.
+ */
+function classifyManualCodexRewindRestoredComposer({
+  snapshot,
+  expectedTextHash,
+  actionWriteSeq,
+  mirrorGeneration,
+} = {}) {
+  if (snapshot?.success !== true) {
+    return { proven: false, terminal: false, reason: 'rewind-restored-screen-unavailable' };
+  }
+  if (!expectedTextHash || !Number.isFinite(Number(actionWriteSeq)) || !mirrorGeneration) {
+    return { proven: false, terminal: true, reason: 'rewind-restored-proof-context-incomplete' };
+  }
+  if (snapshot.mirrorGeneration !== mirrorGeneration) {
+    return { proven: false, terminal: true, reason: 'rewind-restored-mirror-generation-changed' };
+  }
+  if (snapshot.synchronizedOutputOpen === true
+    || snapshot.authoritativeFrameCommitted !== true
+    || Number(snapshot.writeSeq) !== Number(snapshot.flushedSeq)) {
+    return { proven: false, terminal: false, reason: 'rewind-restored-frame-not-committed' };
+  }
+  if (!Number.isFinite(Number(snapshot.writeSeq))
+    || Number(snapshot.writeSeq) <= Number(actionWriteSeq)) {
+    return { proven: false, terminal: false, reason: 'rewind-restored-frame-not-newer' };
+  }
+  if (classifyManualCodexEnterFrame(snapshot).kind === 'native-rewind-confirm') {
+    return { proven: false, terminal: false, reason: 'rewind-picker-still-active' };
+  }
+  const restoredText = readManualCodexComposerText(snapshot);
+  if (!restoredText) {
+    return { proven: false, terminal: false, reason: 'rewind-restored-composer-unproven' };
+  }
+  const restoredTextHash = hashCodexRewindTargetText(restoredText);
+  if (restoredTextHash !== expectedTextHash) {
+    return {
+      proven: false,
+      terminal: false,
+      reason: 'rewind-restored-text-mismatch',
+      restoredTextHash,
+    };
+  }
+  return {
+    proven: true,
+    terminal: true,
+    reason: 'rewind-restored-exact-current-composer',
+    restoredText,
+    restoredTextHash,
+    writeSeq: Number(snapshot.writeSeq),
+    mirrorGeneration,
+  };
+}
+
 function isPureCodexEscapeBurst(data) {
   return typeof data === 'string' && /^\x1b+$/.test(data);
 }
 
+function classifyManualCodexRewindControlInput({
+  data,
+  frame = null,
+  framePending = false,
+  escapePrimeAllowed = false,
+  candidateObserver = false,
+} = {}) {
+  if (candidateObserver !== true) {
+    return { owned: false, kind: 'ordinary-input', reason: 'rewind-observer-unavailable' };
+  }
+  const value = String(data || '');
+  if (value === 'q' || value === '\x03') {
+    return { owned: false, kind: 'cancel', reason: 'rewind-ui-cancelled' };
+  }
+  // The first idle Escape creates the main-owned observer; the following
+  // Escape is Codex's own transition into the transcript picker.  It is part
+  // of the same destructive action even though the picker frame is not yet on
+  // screen when the byte reaches this boundary.
+  if (isPureCodexEscapeBurst(value)) {
+    if (frame?.kind === 'native-rewind-confirm' || escapePrimeAllowed === true) {
+      return { owned: true, kind: 'navigation', reason: 'rewind-escape-control' };
+    }
+    return { owned: false, kind: 'ordinary-input', reason: 'rewind-escape-context-unproven' };
+  }
+  if (value === '\r' || value === '\n') {
+    if (frame?.kind === 'native-rewind-confirm') {
+      return { owned: true, kind: 'confirm', reason: 'rewind-confirm-control' };
+    }
+    if (framePending === true) {
+      return { owned: true, kind: 'confirm-pending', reason: 'rewind-confirm-frame-pending' };
+    }
+    return { owned: false, kind: 'ordinary-input', reason: 'rewind-frame-unproven' };
+  }
+  if (frame?.kind !== 'native-rewind-confirm') {
+    return { owned: false, kind: 'ordinary-input', reason: 'rewind-frame-unproven' };
+  }
+  // Only controls advertised by the exact current Codex transcript frame are
+  // action-owned. Printable text and every unknown escape sequence remain
+  // ordinary user input and revoke the lease.
+  if (/^(?:(?:\x1b\[[ABCDHF])|(?:\x1b\[(?:1|4|5|6)~))+$/.test(value)) {
+    return { owned: true, kind: 'navigation', reason: 'rewind-navigation-control' };
+  }
+  return { owned: false, kind: 'ordinary-input', reason: 'rewind-control-unrecognized' };
+}
+
+function advanceManualCodexRewindOwnedInputRevision({
+  previousOwnedRevision,
+  inputRevisionBefore,
+  inputRevisionAfter,
+  ownedControlCount = 0,
+  controlKind = null,
+} = {}) {
+  const previousOwned = Number(previousOwnedRevision);
+  const revisionBefore = Number(inputRevisionBefore);
+  const revisionAfter = Number(inputRevisionAfter);
+  const controlCount = Number(ownedControlCount);
+  if (![previousOwned, revisionBefore, revisionAfter, controlCount]
+    .every((value) => Number.isInteger(value) && value >= 0)) {
+    return { allowed: false, reason: 'rewind-input-revision-unproven' };
+  }
+  const firstControlCreatedAuthority = controlCount === 0
+    && revisionAfter === revisionBefore + 1
+    && previousOwned === revisionAfter;
+  const continuedOwnedControl = previousOwned === revisionBefore
+    && (
+      revisionAfter === revisionBefore + 1
+      || (String(controlKind || '').startsWith('confirm')
+        && revisionAfter === revisionBefore)
+    );
+  if (!firstControlCreatedAuthority && !continuedOwnedControl) {
+    return { allowed: false, reason: 'rewind-input-revision-gap' };
+  }
+  return {
+    allowed: true,
+    reason: firstControlCreatedAuthority
+      ? 'rewind-authority-created-by-control'
+      : 'rewind-owned-control-contiguous',
+    ownedInputRevision: revisionAfter,
+    ownedControlCount: controlCount + 1,
+  };
+}
+
 function classifyManualCodexEnterFrame(snapshot) {
-  const lines = Array.isArray(snapshot?.lines) ? snapshot.lines : [];
+  const lines = [
+    ...(Array.isArray(snapshot?.preViewportLines) ? snapshot.preViewportLines : []),
+    ...(Array.isArray(snapshot?.lines) ? snapshot.lines : []),
+  ];
   const normalizedRows = lines.map((line) => ({
     row: Number(line?.row),
     text: normalizeManualRewindText(line?.text || ''),
+    occupiedEndX: Number(line?.occupiedEndX),
   }));
   const active = snapshot?.codexActivePrompt || null;
   const activeRow = Number(active?.row);
@@ -38,6 +198,21 @@ function classifyManualCodexEnterFrame(snapshot) {
   ));
   const scrollFooterPattern = /^↑\s*\/\s*↓\s+to\s+scroll\s+pgup\s*\/\s*pgdn\s+to\s+page\s+home\s*\/\s*end\s+to\s+jump$/i;
   const editFooterPattern = /^q\s+to\s+quit\s+esc\s*\/\s*←\s+to\s+edit\s+prev\s+→\s+to\s+edit\s+next\s+enter\s+to\s+edit\s+(?:mess|message)$/i;
+  const responsiveEditFooter = 'q to quit esc/← to edit prev → to edit next enter to edit message';
+  const minimumResponsiveFooter = 'q to quit esc/← to edit prev → to edit next enter';
+  const editFooterMatches = (row) => {
+    if (editFooterPattern.test(row.text)) return true;
+    const cols = Number(snapshot?.cols);
+    const occupiedEndX = Number(row?.occupiedEndX);
+    const isExactResponsivePrefix = row.text.length >= minimumResponsiveFooter.length
+      && responsiveEditFooter.startsWith(row.text);
+    const isNarrowRightEdgeClip = Number.isFinite(cols)
+      && cols > 0
+      && cols < responsiveEditFooter.length
+      && Number.isFinite(occupiedEndX)
+      && occupiedEndX >= cols - 8;
+    return isExactResponsivePrefix && isNarrowRightEdgeClip;
+  };
   const hasTranscriptTitle = titleRows.some(({ row }) => (
     Number.isFinite(row) && Number.isFinite(activeRow) && row < activeRow
   ));
@@ -50,7 +225,7 @@ function classifyManualCodexEnterFrame(snapshot) {
       && Number.isFinite(activeRow)
       && row.row > activeRow
       && next.row === row.row + 1
-      && editFooterPattern.test(next.text);
+      && editFooterMatches(next);
   });
   const hasTranscriptChrome = hasTranscriptTitle && hasTranscriptFooter;
   const activePromptProven = active?.hasInverse === true
@@ -262,12 +437,16 @@ function resolveManualCodexRewindBoundary({
 
 module.exports = {
   advanceManualCodexRewindNavigation,
+  advanceManualCodexRewindOwnedInputRevision,
   assessManualCodexEnterPreflightScreen,
+  classifyManualCodexRewindRestoredComposer,
+  classifyManualCodexRewindControlInput,
   classifyManualCodexEnterFrame,
   decideManualCodexRewindEnterWrite,
   isPureCodexEscapeBurst,
   manualRewindPromptMatches,
   normalizeManualRewindText,
+  readManualCodexComposerText,
   resolveManualCodexRewindBoundary,
   shouldAwaitManualCodexEnterPreflight,
   shouldFlushManualCodexEnterPreflight,

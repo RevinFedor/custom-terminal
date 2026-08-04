@@ -1,6 +1,9 @@
 'use strict';
 
-const { hasCodexComposerPromptGlyph } = require('./codex-tui-readiness');
+const {
+  hasCodexComposerPromptGlyph,
+  parseCodexVerifiedComposerFooter,
+} = require('./codex-tui-readiness');
 
 const CODEX_ALL_MODELS_VALUE = 'all-models';
 const CODEX_MORE_REASONING_VALUE = 'more-reasoning';
@@ -20,7 +23,6 @@ const CODEX_EFFORT_APPLICATION_PERSISTENT = 'persistent-default';
 const CODEX_EFFORT_APPLICATION_CONVERSATION = 'conversation-only';
 const CODEX_PICKER_FOOTER_RE = /Press enter to confirm or esc to go back/i;
 const CODEX_CLIPPED_HEADER_HINT_RE = /\[…\s*\d+\s+lines?\]\s*ctrl\s*\+\s*a\s+view all/i;
-const CODEX_COMPOSER_STATUS_RE = /^([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?\s+·\s+Full Access(?:\s+·\s+Context\s+\d+%(?:\s+used)?)?(?:\s+·\s+weekly\s+\d+%\s+left)?(?:\s+Goal achieved\s+\([0-9hms ]+\))?$/i;
 
 function normalizeCodexPickerValue(value) {
   return String(value || '')
@@ -40,11 +42,14 @@ function normalizeCodexMigrationModelLabel(value) {
 }
 
 /**
- * Read the status owned by the current Codex composer, not launch arguments or
- * scrollback. The footer is the last non-empty row in a verified composer
- * frame; prose/history rows and incomplete `default` states are rejected.
+ * A fresh Codex conversation can paint its concrete model/effort/FAST state in
+ * the bordered launch card before the bottom composer footer becomes
+ * parseable.  This row is accepted only by callers that have already proven
+ * the current launch/generation; it is deliberately separate from the generic
+ * composer-footer parser so an old welcome card can never become a later
+ * conversation proof by itself.
  */
-function parseCodexVerifiedComposerFooter(frameText) {
+function parseCodexVerifiedLaunchCardSettings(frameText) {
   const clean = String(frameText || '')
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
     .replace(/\x1bP[\s\S]*?\x1b\\/g, '')
@@ -52,28 +57,19 @@ function parseCodexVerifiedComposerFooter(frameText) {
     .replace(/\x1b[@-_]/g, '')
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
     .replace(/\u00a0/g, ' ');
-  const lines = clean.split(/\r?\n/);
-  let footer = '';
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const candidate = String(lines[index] || '').trim();
-    if (!candidate) continue;
-    footer = candidate;
-    break;
+  const rowPattern = /^\s*[│|]\s*model:\s+([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?\s+\/model\b.*[│|]\s*$/i;
+  let latest = null;
+  for (const line of clean.split(/\r?\n/)) {
+    const match = String(line || '').match(rowPattern);
+    if (!match) continue;
+    latest = {
+      model: String(match[1] || '').trim(),
+      effort: String(match[2] || '').trim().toLowerCase(),
+      fast: !!match[3],
+      proof: 'verified-launch-card',
+    };
   }
-  if (!footer) return null;
-  const match = footer.match(CODEX_COMPOSER_STATUS_RE);
-  if (!match) return null;
-  const model = String(match[1] || '').trim();
-  const effort = String(match[2] || '').trim().toLowerCase();
-  if (!model || model.toLowerCase() === 'default' || !effort || effort === 'default') {
-    return null;
-  }
-  return {
-    model,
-    effort,
-    fast: !!match[3],
-    proof: 'verified-composer-footer',
-  };
+  return latest;
 }
 
 function inspectCodexModelMigrationPrompt(cleanText) {
@@ -1153,6 +1149,7 @@ module.exports = {
   parseCodexAdvancedEffortPicker,
   parseCodexModelMigrationAcknowledgement,
   parseCodexVerifiedComposerFooter,
+  parseCodexVerifiedLaunchCardSettings,
   parseCodexModelMigrationsConfig,
   parseCodexPlanReasoningScopePicker,
   isCodexPickerFrameComposer,

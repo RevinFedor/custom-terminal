@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  classifyClaudeMissingPromptExactCaptureAdmission,
   parseClaudeComposerCurrentFrame,
   reserveClaudeExactEmptyEvidence,
   validateClaudeComposerSubmitGeneration,
@@ -95,6 +96,95 @@ test('does not mistake an old prompt row in the viewport for a live draft', () =
   assert.equal(proof.proofOutcome, 'unknown');
   assert.equal(proof.hasDraft, null);
   assert.match(proof.proofReason, /active-prompt-not-found|surface/);
+  assert.equal(proof.exactCaptureRecommended, undefined);
+});
+
+function currentClosedHeadlessFrame(overrides = {}) {
+  return {
+    ...snapshot([
+      'assistant response',
+      'status text',
+      '',
+    ], { cursorY: 2, cursorX: 1 }),
+    mirrorGeneration: 'mirror-a',
+    writeSeq: 19,
+    flushedSeq: 19,
+    synchronizedOutputOpen: false,
+    authoritativeFrameCommitted: true,
+    ...overrides,
+  };
+}
+
+function missingActivePromptProof(frame = currentClosedHeadlessFrame()) {
+  const proof = parseClaudeComposerCurrentFrame(frame);
+  assert.equal(proof.proofOutcome, 'unknown');
+  assert.equal(proof.proofReason, 'active-prompt-not-found');
+  assert.equal(proof.exactCaptureRecommended, undefined);
+  return proof;
+}
+
+test('admits exact capture for a current closed idle headless frame with no active prompt', () => {
+  const frame = currentClosedHeadlessFrame();
+  assert.deepEqual(classifyClaudeMissingPromptExactCaptureAdmission({
+    proof: missingActivePromptProof(frame),
+    snapshot: frame,
+    startupGateReady: true,
+  }), {
+    recommended: true,
+    reason: 'closed-idle-frame-exact-copy',
+  });
+});
+
+test('rejects exact capture while Claude lifecycle or PTY ownership is not idle', () => {
+  const frame = currentClosedHeadlessFrame();
+  const proof = missingActivePromptProof(frame);
+  const cases = [
+    ['busy turn', { turnBusy: true }, 'claude-turn-busy'],
+    ['local command', { localCommandActive: true }, 'claude-local-command-active'],
+    ['compact', { compactActive: true }, 'claude-compact-active'],
+    ['awaiting question', { awaitingInput: true }, 'claude-question-active'],
+    ['stopping', { stopping: true }, 'claude-stopping'],
+    ['rewind', { rewindActive: true }, 'claude-rewind-active'],
+    ['active PTY write', { writeOperationActive: true }, 'claude-pty-write-active'],
+    ['queued PTY write', { writeOperationActive: true }, 'claude-pty-write-active'],
+    ['startup gate not ready', { startupGateReady: false }, 'claude-startup-gate-not-ready'],
+    ['control surface', { controlSurfaceActive: true }, 'claude-control-surface-active'],
+  ];
+
+  for (const [label, overrides, reason] of cases) {
+    assert.deepEqual(classifyClaudeMissingPromptExactCaptureAdmission({
+      proof,
+      snapshot: frame,
+      startupGateReady: true,
+      ...overrides,
+    }), { recommended: false, reason }, label);
+  }
+});
+
+test('rejects exact capture without a current closed authoritative headless frame', () => {
+  const proof = missingActivePromptProof();
+  const cases = [
+    ['renderer frame', { source: 'renderer' }],
+    ['open frame', { synchronizedOutputOpen: true }],
+    ['committed replay while a newer frame is open', {
+      committedFrameReplay: true,
+      liveSynchronizedOutputOpen: true,
+    }],
+    ['unflushed frame', { writeSeq: 20, flushedSeq: 19 }],
+    ['non-authoritative frame', { authoritativeFrameCommitted: false }],
+    ['frame without a mirror generation', { mirrorGeneration: null }],
+  ];
+
+  for (const [label, frameOverrides] of cases) {
+    assert.deepEqual(classifyClaudeMissingPromptExactCaptureAdmission({
+      proof,
+      snapshot: currentClosedHeadlessFrame(frameOverrides),
+      startupGateReady: true,
+    }), {
+      recommended: false,
+      reason: 'current-closed-headless-frame-required',
+    }, label);
+  }
 });
 
 test('returns unknown when cursor geometry is unavailable', () => {

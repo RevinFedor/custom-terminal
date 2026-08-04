@@ -1,8 +1,8 @@
 import React, { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
 import ReactDOM from 'react-dom';
-import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { selectFocusedProjectId, useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
-import { useUIStore } from '../../store/useUIStore';
+import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import TabBar from './TabBar';
 import TabSidebar from './TabSidebar';
@@ -14,6 +14,7 @@ import Timeline from './Timeline';
 import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
+import { SPLIT_ATTACH_ROW_H, SplitPaneAttachRow } from './SplitPaneChrome';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
 import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
@@ -117,7 +118,13 @@ export default function Workspace() {
 
   // Use selectors to avoid rerenders on unrelated store changes
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
+  const focusedProjectId = useWorkspaceStore(selectFocusedProjectId);
+  const focusedCurrentView = useWorkspaceStore((s) => {
+    const projectId = selectFocusedProjectId(s);
+    return projectId ? (s.openProjects.get(projectId)?.currentView || 'terminal') : 'terminal';
+  });
   const isInboxProject = isInboxProjectId(activeProjectId);
+  const isFocusedInboxProject = isInboxProjectId(focusedProjectId);
   const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
   const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
   const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
@@ -154,8 +161,7 @@ export default function Workspace() {
   const sidebarFontSize = useUIStore((s) => s.sidebarFontSize);
   const historyPinnedSetting = useUIStore((s) => s.historyPinned);
   const timelinePinned = useUIStore((s) => s.timelinePinned);
-  const terminalIsPrimary = useUIStore((s) => s.terminalIsPrimary);
-  const setTerminalIsPrimary = useUIStore((s) => s.setTerminalIsPrimary);
+  const setTabTerminalIsPrimary = useUIStore((s) => s.setTabTerminalIsPrimary);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.getActiveProject()?.viewingSubAgentTabId ?? null);
   const setViewingSubAgentTabId = useWorkspaceStore((s) => s.setViewingSubAgent);
@@ -209,6 +215,7 @@ export default function Workspace() {
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
   const [commandRunningByTab, setCommandRunningByTab] = useState<Map<string, boolean>>(() => new Map());
+  const [agentPasteBusyByTab, setAgentPasteBusyByTab] = useState<Map<string, boolean>>(() => new Map());
   const commandStateSeqRef = useRef(0);
   const [floatingTerminalOpenTabs, setFloatingTerminalOpenTabs] = useState<Record<string, boolean>>({});
   const [historyControlsHeight, setHistoryControlsHeight] = useState(0);
@@ -216,6 +223,22 @@ export default function Workspace() {
   const [directoryChangePhase, setDirectoryChangePhase] = useState<DirectoryChangePhase>('idle');
   const directoryChangeOperationRef = useRef(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const handlePasteBusy = (_event: unknown, data: { tabId?: string; busy?: boolean } = {}) => {
+      if (!data.tabId) return;
+      setAgentPasteBusyByTab((previous) => {
+        const nextBusy = data.busy === true;
+        if ((previous.get(data.tabId!) === true) === nextBusy) return previous;
+        const next = new Map(previous);
+        if (nextBusy) next.set(data.tabId!, true);
+        else next.delete(data.tabId!);
+        return next;
+      });
+    };
+    ipcRenderer.on('claude:paste-busy', handlePasteBusy);
+    return () => ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
+  }, []);
   // Viewport width guard for the pushed side panel. A TUI agent draws to the
   // size it was told, so squeezing the terminal below a workable column makes
   // its own output unreadable — below the threshold the panel overlays
@@ -299,6 +322,9 @@ export default function Workspace() {
     }
     return activeTab;
   }, [viewingSubAgentTabId, activeProject, activeTab]);
+  const terminalIsPrimary = useUIStore((state) => (
+    effectiveTab?.id ? resolveTabTerminalPrimary(state, effectiveTab.id) : false
+  ));
   // Derived from the per-tab map so switching tabs shows THIS tab's state
   // rather than whatever the previously focused tab last reported.
   const isCommandRunning = effectiveTab?.id
@@ -314,8 +340,8 @@ export default function Workspace() {
           ? 'claude'
           : null;
   // A tab that owns the History ↔ terminal surface pair. Which of the two
-  // holds the center is a user choice (terminalIsPrimary), not a property of
-  // the tab — both layouts render the SAME HistoryPanel and the SAME xterm.
+  // holds the center is this tab's user choice. Both layouts render the SAME
+  // HistoryPanel and the SAME xterm; only their presentation changes.
   const agentSurfacePairAvailable = !!effectiveTab
     && currentView === 'terminal'
     && effectiveTabType !== 'claude-sdk'
@@ -323,15 +349,15 @@ export default function Workspace() {
     && effectiveTabType !== 'file'
     && !filePreview
     && !!primaryHistoryTool;
-  // Split workspace renders panes inside TerminalArea; the History-primary
-  // layout (floating terminal frame) would swallow that geometry, so the
-  // split forces terminal-primary presentation. History stays reachable as
-  // the side panel of the focused pane's tab.
+  // Split workspace owns its History/terminal presentation per pane. Global
+  // History geometry remains disabled here so it cannot cover neighbouring
+  // panes; the focused pane mounts the one live embedded History instance.
   const splitActiveLayout = useWorkspaceStore((s) => s.splitPanes.length > 0);
   const historyIsPrimary = agentSurfacePairAvailable && !terminalIsPrimary && !splitActiveLayout;
   // Terminal-primary keeps History reachable as the side panel; it is the
   // active input surface there, so grab/dictation/task-plan still target it.
-  const historyIsAgentSidePanel = agentSurfacePairAvailable && (terminalIsPrimary || splitActiveLayout);
+  const historyIsAgentSidePanel = agentSurfacePairAvailable && terminalIsPrimary && !splitActiveLayout;
+  const focusedHistorySurfaceVisible = agentSurfacePairAvailable && !terminalIsPrimary;
   // Pin is the user's preference; a viewport too narrow for both columns
   // downgrades it to overlay for this render only, without touching the
   // stored setting — widening the window restores the pushed layout.
@@ -380,17 +406,16 @@ export default function Workspace() {
   const swapPrimarySurface = useCallback(() => {
     const tabId = effectiveTab?.id;
     if (!agentSurfacePairAvailable || !tabId) return;
-    const next = !useUIStore.getState().terminalIsPrimary;
+    const next = !resolveTabTerminalPrimary(useUIStore.getState(), tabId);
     if (next) {
       // Entering terminal-primary: the terminal becomes the center, so the
       // floating window flag must not survive as a second "open" source.
       setFloatingTerminalOpenTabs((current) => (
         current[tabId] ? { ...current, [tabId]: false } : current
       ));
-      // The transcript panel is NOT force-opened here. terminalIsPrimary is a
-      // global preference, while "transcript visible" is per-tab: forcing it
-      // once made EVERY later tab switch reveal a side panel the user never
-      // opened there. Opening it stays the user's action (Cmd+] / the button).
+      // The transcript panel is NOT force-opened here. Center ownership and
+      // "transcript visible" are separate per-tab choices; opening it stays
+      // the user's action (Cmd+] / the button).
     } else {
       // Back to History-primary: search belonged to the terminal, and the
       // terminal returns to its collapsed floating state. The side panel flag
@@ -404,8 +429,8 @@ export default function Workspace() {
     }
     console.warn('[Workspace:Surface] swap terminalIsPrimary → ' + next
       + ' tab=' + tabId.slice(-8));
-    setTerminalIsPrimary(next);
-  }, [agentSurfacePairAvailable, effectiveTab?.id, setHistoryPanelOpen, setTerminalIsPrimary]);
+    setTabTerminalIsPrimary(tabId, next);
+  }, [agentSurfacePairAvailable, effectiveTab?.id, setHistoryPanelOpen, setTabTerminalIsPrimary]);
 
   const handleLifecycleStatusChange = useCallback((next: AgentLifecycleSummary | null) => {
     setAgentLifecycleStatus((current) => {
@@ -1034,9 +1059,9 @@ export default function Workspace() {
   const currentTimelineRuntime = {
     ownerKey: deferredTimelineOwnerKey,
     isActive: isCommandRunning,
-    isTurnBusy: effectiveAiBusy,
+    isTurnBusy: effectiveAiBusy || agentPasteBusyByTab.get(effectiveTab?.id || '') === true,
     isVisible: workspaceView === 'workspace' && currentView === 'terminal',
-    historySurfaceVisible: historyIsPrimary,
+    historySurfaceVisible: focusedHistorySurfaceVisible,
   };
   const timelineRuntimeForRender = timelineOwnerIsCurrent
     ? currentTimelineRuntime
@@ -1058,9 +1083,10 @@ export default function Workspace() {
     deferredTimelineOwnerKey,
     isCommandRunning,
     effectiveAiBusy,
+    agentPasteBusyByTab,
     workspaceView,
     currentView,
-    historyIsPrimary,
+    focusedHistorySurfaceVisible,
   ]);
   // The agent surface pair resolves its own tool/session in BOTH layouts:
   // moving History to the side must not silently hand it the Timeline owner,
@@ -1073,6 +1099,7 @@ export default function Workspace() {
     : timelineSessionId;
   const shouldRenderHistoryPanel = !!effectiveTab
     && currentView === 'terminal'
+    && !splitActiveLayout
     && (historyIsPrimary
       // Terminal-primary mounts History unconditionally: it owns the docked
       // composer below the terminal, which stays usable while the transcript
@@ -1346,6 +1373,7 @@ export default function Workspace() {
       onSwapPrimarySurface={agentSurfacePairAvailable ? swapPrimarySurface : undefined}
       terminalIsPrimary={terminalIsPrimary}
       lifecycleStatus={agentSurfacePairAvailable ? agentLifecycleStatus : null}
+      inputBusy={agentPasteBusyByTab.get(deferredHistoryOwner.tabId) === true}
       onControlsHeightChange={historyIsPrimary ? handleHistoryControlsHeight : undefined}
     />
   ) : null;
@@ -1410,13 +1438,13 @@ export default function Workspace() {
           Divider под тулбаром НЕ здесь — он рендерится внутри TabSidebar, чтобы линия
           обрывалась на границе сайдбара и не уходила в область терминала. */}
       <div className="h-[30px] shrink-0">
-        <ProjectToolbar isSystemProject={isInboxProject} />
+        <ProjectToolbar isSystemProject={isFocusedInboxProject} />
       </div>
 
       {/* MAIN ROW: TabSidebar | Terminal. */}
       <div className="flex-1 flex min-h-0 relative">
       {/* LEFT COLUMN: vertical tab sidebar */}
-      <TabSidebar projectId={activeProjectId} />
+      <TabSidebar projectId={focusedProjectId || activeProjectId} />
 
       {/* CENTER COLUMN: Terminal/Home Area (no more TabBar above it) */}
       <div className="flex-1 flex flex-col min-w-0 relative">
@@ -1428,6 +1456,17 @@ export default function Workspace() {
               the terminal area only, NOT under Timeline (Timeline sits to the right
               of this column and spans the full row height). */}
           <div className="flex-1 flex flex-col min-w-0">
+          {/* Attach row — single mode. A normal flex row ABOVE the center
+              surface (terminal OR History-primary OR pinned pair), so it spans
+              the full center width and everything below shrinks by its height.
+              It cannot live inside TerminalArea: in History-primary the
+              terminal is wrapped in the floating frame and the row would end
+              up inside that window. Split mode renders per-pane rows instead. */}
+          {!splitActiveLayout && effectiveTab && currentView === 'terminal' && (
+            <div className="shrink-0 relative" style={{ height: SPLIT_ATTACH_ROW_H }}>
+              <SplitPaneAttachRow projectId={activeProjectId} tabId={effectiveTab.id} focused />
+            </div>
+          )}
           {/* Row [terminal content | pinned History]. The pinned panel lives
               HERE rather than beside the whole column so it spans the
               terminal's height only: the composer and control bar below keep
@@ -1441,6 +1480,7 @@ export default function Workspace() {
 
             <FloatingTerminalFrame
               tabId={effectiveTab?.id || null}
+              tabName={effectiveTab?.name || 'Terminal'}
               floating={historyIsPrimary}
               open={!historyIsPrimary || floatingTerminalOpen}
               bottomInset={historyIsPrimary ? historyControlsHeight : 0}
@@ -1484,7 +1524,7 @@ export default function Workspace() {
               />
             )}
 
-            {effectiveTab && currentView === 'terminal' && (
+            {!splitActiveLayout && effectiveTab && currentView === 'terminal' && (
               <TabTaskPlanPanel
                 tabId={effectiveTab.id}
                 projectPath={currentProject.path}
@@ -1496,7 +1536,9 @@ export default function Workspace() {
             )}
 
             {/* File Preview Overlay */}
-            {filePreview && <FilePreview />}
+            {filePreview && (
+              <FilePreview topOffset={filePreview.source === 'tab' ? SPLIT_ATTACH_ROW_H : 0} />
+            )}
 
             {/* History Panel — overlay unless History pin mode is enabled. */}
             {!historyIsPrimary && !historyPinned && historyPanelNode}
@@ -1533,7 +1575,7 @@ export default function Workspace() {
               // Both agent layouts author through History, so the lower bar
               // keeps its History-backed Mic/Enter/^C in either one. Only a
               // closed side panel hands authoring back to the raw PTY.
-              historyIsPrimary={historyIsPrimary || (historyIsAgentSidePanel && isHistoryOpen)}
+              historyIsPrimary={focusedHistorySurfaceVisible || (historyIsAgentSidePanel && isHistoryOpen)}
               claudeSessionId={effectiveClaudeSessionId}
               geminiSessionId={effectiveGeminiSessionId}
               codexSessionId={effectiveCodexSessionId}
@@ -1580,9 +1622,9 @@ export default function Workspace() {
 
         {/* Project Home - Overlay AFTER TabBar+TerminalArea to keep children indices stable */}
         {/* Uses absolute positioning so visual order is unaffected */}
-        {currentView === 'home' && (
+        {focusedProjectId && focusedCurrentView === 'home' && (
           <div className="absolute inset-0 z-50 bg-bg-main border-r border-border-main">
-            <ProjectHome projectId={activeProjectId} />
+            <ProjectHome projectId={focusedProjectId} />
           </div>
         )}
       </div>

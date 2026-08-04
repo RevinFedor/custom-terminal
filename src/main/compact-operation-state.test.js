@@ -22,6 +22,10 @@ function makeRegistry(options = {}) {
   return { registry, published };
 }
 
+function nextTurn() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 test('only the exact accepted /compact command starts the phase', () => {
   assert.equal(isExactCompactCommand('/compact'), true);
   assert.equal(isExactCompactCommand('  /compact\r\n'), true);
@@ -93,6 +97,79 @@ test('completion removes live compacting while retaining an exact handoff receip
   assert.equal(registry.snapshot('tab-a').active, null);
   assert.equal(registry.snapshot('tab-a').settled.length, 1);
   assert.equal(published.length, 2);
+});
+
+test('an exact DEV settlement hold keeps compact active until release', async () => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const completions = [];
+  const { registry, published } = makeRegistry({
+    beforeFinish: ({ active }) => active.operationId === 'held-compact'
+      ? {
+          hold: true,
+          released: held,
+          complete: (result) => completions.push(result),
+        }
+      : null,
+  });
+  registry.begin({
+    tabId: 'tab-a', provider: 'claude', command: '/compact', operationId: 'held-compact',
+  });
+
+  const provisional = registry.finish({
+    tabId: 'tab-a', provider: 'claude', operationId: 'held-compact',
+    outcome: 'completed', reason: 'compact_boundary',
+  });
+  assert.equal(provisional.active, true);
+  assert.equal(registry.snapshot('tab-a').active.operationId, 'held-compact');
+  assert.equal(registry.snapshot('tab-a').settled.length, 0);
+  assert.equal(published.length, 1);
+
+  // A duplicate callback while held cannot bypass the exact boundary.
+  registry.finish({
+    tabId: 'tab-a', provider: 'claude', operationId: 'held-compact',
+    outcome: 'completed', reason: 'compact_summary',
+  });
+  assert.equal(registry.snapshot('tab-a').settled.length, 0);
+
+  release({ reason: 'test-release' });
+  await nextTurn();
+  const snapshot = registry.snapshot('tab-a');
+  assert.equal(snapshot.active, null);
+  assert.equal(snapshot.settled.length, 1);
+  assert.equal(snapshot.settled[0].reason, 'compact_boundary');
+  assert.equal(published.length, 2);
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].stale, false);
+});
+
+test('a held stale compact owner cannot settle a replacement operation', async () => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const completions = [];
+  const { registry } = makeRegistry({
+    beforeFinish: ({ active, input }) => (
+      active.operationId === 'old'
+      && input.reason === 'compact_boundary'
+    ) ? {
+        hold: true,
+        released: held,
+        complete: (result) => completions.push(result),
+      } : null,
+  });
+  registry.begin({ tabId: 'tab-a', provider: 'claude', command: '/compact', operationId: 'old' });
+  registry.finish({
+    tabId: 'tab-a', provider: 'claude', operationId: 'old',
+    outcome: 'completed', reason: 'compact_boundary',
+  });
+  registry.begin({ tabId: 'tab-a', provider: 'claude', command: '/compact', operationId: 'new' });
+  assert.equal(registry.snapshot('tab-a').active.operationId, 'new');
+
+  release({ reason: 'late-release' });
+  await nextTurn();
+  assert.equal(registry.snapshot('tab-a').active.operationId, 'new');
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].stale, true);
 });
 
 test('a fresh registry after app restart cannot resurrect historical compacting', () => {

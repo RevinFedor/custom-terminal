@@ -164,6 +164,51 @@ function parseClaudeComposerCurrentFrame(snapshot) {
   );
 }
 
+/**
+ * Decide whether a closed main/headless frame which cannot locate the active
+ * prompt may be resolved through Claude's non-destructive external-editor
+ * copy. The screen parser deliberately does not make this decision: it cannot
+ * see lifecycle, startup, picker, or PTY-writer ownership.
+ */
+function classifyClaudeMissingPromptExactCaptureAdmission({
+  proof,
+  snapshot,
+  turnBusy = false,
+  localCommandActive = false,
+  compactActive = false,
+  awaitingInput = false,
+  stopping = false,
+  rewindActive = false,
+  writeOperationActive = false,
+  startupGateReady = false,
+  controlSurfaceActive = false,
+} = {}) {
+  if (proof?.proofOutcome !== 'unknown' || proof?.proofReason !== 'active-prompt-not-found') {
+    return { recommended: false, reason: 'not-active-prompt-missing' };
+  }
+  if (
+    snapshot?.source !== 'headless-main'
+    || !snapshot?.mirrorGeneration
+    || snapshot?.committedFrameReplay === true
+    || snapshot?.liveSynchronizedOutputOpen === true
+    || snapshot?.synchronizedOutputOpen === true
+    || Number(snapshot?.writeSeq) !== Number(snapshot?.flushedSeq)
+    || snapshot?.authoritativeFrameCommitted !== true
+  ) {
+    return { recommended: false, reason: 'current-closed-headless-frame-required' };
+  }
+  if (turnBusy) return { recommended: false, reason: 'claude-turn-busy' };
+  if (localCommandActive) return { recommended: false, reason: 'claude-local-command-active' };
+  if (compactActive) return { recommended: false, reason: 'claude-compact-active' };
+  if (awaitingInput) return { recommended: false, reason: 'claude-question-active' };
+  if (stopping) return { recommended: false, reason: 'claude-stopping' };
+  if (rewindActive) return { recommended: false, reason: 'claude-rewind-active' };
+  if (writeOperationActive) return { recommended: false, reason: 'claude-pty-write-active' };
+  if (!startupGateReady) return { recommended: false, reason: 'claude-startup-gate-not-ready' };
+  if (controlSurfaceActive) return { recommended: false, reason: 'claude-control-surface-active' };
+  return { recommended: true, reason: 'closed-idle-frame-exact-copy' };
+}
+
 function validateClaudeComposerWriteBoundary({
   proof,
   terminalMatches,
@@ -302,6 +347,7 @@ function validateClaudeComposerSubmitGeneration({
 
 module.exports = {
   CLAUDE_EMPTY_COMPOSER_HINT_RE,
+  classifyClaudeMissingPromptExactCaptureAdmission,
   cleanClaudeComposerText,
   isClaudeComposerStopLine,
   parseClaudeComposerCurrentFrame,

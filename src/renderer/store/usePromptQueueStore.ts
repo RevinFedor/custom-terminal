@@ -265,6 +265,9 @@ export type QueuedPrompt = {
   // false = keep visible in the list, but skip it when Run-after picks the
   // next prompt. Undefined legacy rows are treated as enabled.
   enabled?: boolean;
+  // Optional one-shot scheduling rule for this queue item. Only the enabled
+  // head can consume the queue's single runtime countdown slot.
+  trigger?: { kind: 'timer'; seconds: number } | { kind: 'onTab'; tabId: string };
   // Human-facing label shown in the Run-after menu. The actual payload sent to
   // the agent remains `text`.
   title?: string;
@@ -537,6 +540,7 @@ interface PromptQueueStore {
     expectedText?: string,
   ) => void;
   reorderPrompt: (tabId: string, fromIndex: number, toIndex: number) => void;
+  setPromptTrigger: (tabId: string, promptId: string, trigger: QueuedPrompt['trigger'] | null) => void;
   clearQueue: (tabId: string) => void;
 
   setAutoRun: (tabId: string, value: boolean) => void;
@@ -1178,6 +1182,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const cur = state.queues.get(tabId);
         if (!cur) return state;
         let changed = false;
+        const headId = cur.items.find(isQueuedPromptEnabled)?.id ?? null;
         const items = cur.items.map((item) => {
           if (item.id !== id || (expectedText !== undefined && item.text !== expectedText)) return item;
           changed = true;
@@ -1210,6 +1215,40 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         items.splice(toIndex, 0, removed);
         const next = new Map(state.queues);
         next.set(tabId, { ...cur, items });
+        return { queues: next };
+      });
+    },
+
+    setPromptTrigger: (tabId, promptId, trigger) => {
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId);
+        if (!cur) return state;
+        let changed = false;
+        const normalized = trigger?.kind === 'timer'
+          ? { kind: 'timer' as const, seconds: normalizeFirstDelaySeconds(trigger.seconds) }
+          : trigger?.kind === 'onTab' && trigger.tabId
+            ? { kind: 'onTab' as const, tabId: trigger.tabId }
+            : undefined;
+        const items = cur.items.map((item) => {
+          if (item.id !== promptId) return item;
+          if (JSON.stringify(item.trigger) === JSON.stringify(normalized)) return item;
+          changed = true;
+          return normalized ? { ...item, trigger: normalized } : (() => {
+            const { trigger: _trigger, ...rest } = item;
+            return rest;
+          })();
+        });
+        if (!changed) return state;
+        const changedHead = headId === promptId;
+        const explicitArm = changedHead && cur.autoRun;
+        if (explicitArm) markRuntimeWorkflowArm(tabId);
+        const next = new Map(state.queues);
+        next.set(tabId, {
+          ...cur,
+          items,
+          firstDelayCountdownAt: changedHead ? null : cur.firstDelayCountdownAt,
+          workflowArmedAt: explicitArm ? Date.now() : cur.workflowArmedAt,
+        });
         return { queues: next };
       });
     },
@@ -1563,7 +1602,10 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const next = new Map(state.queues);
         for (const [ownerTabId, cur] of state.queues) {
           const ownsTrigger = ownerTabId === triggerTabId;
-          const waitsOnTrigger = cur.runAfterTabId === triggerTabId;
+          const head = cur.items.find(isQueuedPromptEnabled);
+          const waitsOnTrigger = head?.trigger?.kind === 'onTab'
+            ? head.trigger.tabId === triggerTabId
+            : cur.runAfterTabId === triggerTabId;
           const hasQueuePromise = cur.autoRun || cur.stopAfter || cur.closeAfter || cur.firstDelayCountdownAt !== null;
           const queueMatches = hasQueuePromise
             && (ownsTrigger || (waitsOnTrigger && options.preservePivoted !== true));
@@ -1626,9 +1668,23 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         if (next.delete(closedTabId)) changed = true;
 
         for (const [ownerTabId, queue] of next) {
-          if (queue.runAfterTabId !== closedTabId) continue;
-          automaticRunAfterTargetClearTabs.add(ownerTabId);
-          next.set(ownerTabId, { ...queue, runAfterTabId: null });
+          const hasGlobalTarget = queue.runAfterTabId === closedTabId;
+          const hasItemTarget = queue.items.some((item) => (
+            item.trigger?.kind === 'onTab' && item.trigger.tabId === closedTabId
+          ));
+          if (!hasGlobalTarget && !hasItemTarget) continue;
+          if (hasGlobalTarget) automaticRunAfterTargetClearTabs.add(ownerTabId);
+          next.set(ownerTabId, {
+            ...queue,
+            runAfterTabId: hasGlobalTarget ? null : queue.runAfterTabId,
+            items: hasItemTarget
+              ? queue.items.map((item) => {
+                  if (item.trigger?.kind !== 'onTab' || item.trigger.tabId !== closedTabId) return item;
+                  const { trigger: _trigger, ...rest } = item;
+                  return rest;
+                })
+              : queue.items,
+          });
           changed = true;
         }
 
@@ -1815,9 +1871,15 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
   const attachmentState = item.attachmentState === 'materializing' || item.attachmentState === 'missing' || item.attachmentState === 'ready'
     ? item.attachmentState
     : undefined;
+  const trigger = item.trigger?.kind === 'timer' && Number.isFinite(Number(item.trigger.seconds))
+    ? { kind: 'timer' as const, seconds: normalizeFirstDelaySeconds(Number(item.trigger.seconds)) }
+    : item.trigger?.kind === 'onTab' && typeof item.trigger.tabId === 'string' && item.trigger.tabId.length > 0
+      ? { kind: 'onTab' as const, tabId: item.trigger.tabId }
+      : undefined;
   const normalized = normalizeQueuedPrompt({
     id: typeof item.id === 'string' && item.id ? item.id : nextId(),
     enabled: item.enabled !== false,
+    trigger,
     title: typeof item.title === 'string' ? item.title : undefined,
     titleManual: item.titleManual === true,
     text: item.text,
@@ -1834,15 +1896,28 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
 }
 
 function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
-  const items = Array.isArray(entry.items)
+  let items = Array.isArray(entry.items)
     ? entry.items.map(normalizePersistedQueuedPrompt).filter((item): item is QueuedPrompt => item !== null)
     : [];
-  const firstDelaySeconds = typeof entry.firstDelaySeconds === 'number'
+  let firstDelaySeconds = typeof entry.firstDelaySeconds === 'number'
     ? normalizeFirstDelaySeconds(entry.firstDelaySeconds)
     : 0;
   const previewId = typeof entry.previewId === 'string' && items.some((item) => item.id === entry.previewId)
     ? entry.previewId
     : null;
+  let runAfterTabId = typeof entry.runAfterTabId === 'string' ? entry.runAfterTabId : null;
+  if (items.length > 0 && !items[0].trigger && (runAfterTabId !== null || firstDelaySeconds > 0)) {
+    items = [...items];
+    items[0] = {
+      ...items[0],
+      trigger: runAfterTabId
+        ? { kind: 'onTab', tabId: runAfterTabId }
+        : { kind: 'timer', seconds: firstDelaySeconds },
+    };
+    runAfterTabId = null;
+    firstDelaySeconds = 0;
+    console.log('[PromptQueue] migrated global trigger to first item');
+  }
   return {
     items,
     autoRun: !!entry.autoRun,
@@ -1860,7 +1935,7 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     panelCollapsed: !!entry.panelCollapsed,
     firstChipHintActive: false,
     stopBeforeCloseArm: false,
-    runAfterTabId: typeof entry.runAfterTabId === 'string' ? entry.runAfterTabId : null,
+    runAfterTabId,
     workflowArmedAt: typeof entry.workflowArmedAt === 'number' && Number.isFinite(entry.workflowArmedAt)
       ? Number(entry.workflowArmedAt)
       : null,

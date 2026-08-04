@@ -125,10 +125,17 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
       workflowArmedAt: 777,
     },
     'tab-stale-target': {
-      items: [{ id: 'persisted-stale-item', text: 'wait on missing tab', createdAt: 4 }],
+      items: [{ id: 'persisted-stale-item', text: 'wait on missing tab', trigger: { kind: 'timer', seconds: 0 }, createdAt: 4 }],
       autoRun: true,
       runAfterTabId: 'closed-target',
       workflowArmedAt: 888,
+    },
+    'tab-migrated-trigger': {
+      items: [{ id: 'persisted-migrated-item', text: 'migrate global target', createdAt: 5 }],
+      autoRun: true,
+      runAfterTabId: 'legacy-target',
+      firstDelaySeconds: 25,
+      workflowArmedAt: 999,
     },
     'tab-long-delay': {
       items: [],
@@ -160,6 +167,10 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.equal(queueModule.hasRuntimeWorkflowArm('tab-1'), false);
   assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-persisted-arm').workflowArmedAt, 777);
   assert.equal(queueModule.hasRuntimeWorkflowArm('tab-persisted-arm'), false);
+  const migratedTriggerQueue = queueModule.usePromptQueueStore.getState().getQueue('tab-migrated-trigger');
+  assert.deepEqual(migratedTriggerQueue.items[0].trigger, { kind: 'onTab', tabId: 'legacy-target' });
+  assert.equal(migratedTriggerQueue.runAfterTabId, null);
+  assert.equal(migratedTriggerQueue.firstDelaySeconds, 0);
   assert.equal(
     queueModule.usePromptQueueStore.getState().getQueue('tab-long-delay').firstDelaySeconds,
     90061,
@@ -369,6 +380,9 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
     [['runtime-paste', 'paste', 'runtime paste']],
   );
   assert.equal(saved['tab-persisted-arm'].workflowArmedAt, 777);
+  assert.deepEqual(saved['tab-migrated-trigger'].items[0].trigger, { kind: 'onTab', tabId: 'legacy-target' });
+  assert.equal(saved['tab-migrated-trigger'].runAfterTabId, null);
+  assert.equal(saved['tab-migrated-trigger'].firstDelaySeconds, 0);
   assert.equal(saved['tab-merge-arm'].workflowArmedAt, 5_000);
   assert.equal(saved['tab-enable-edge'].workflowArmedAt, 50_000);
   assert.equal(saved['tab-add-edge'].workflowArmedAt, 70_000);

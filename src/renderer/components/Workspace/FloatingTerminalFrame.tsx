@@ -1,77 +1,15 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ChevronDown, Minus, Plus, SquareTerminal } from 'lucide-react';
+import React, { useCallback, useEffect, useRef } from 'react';
+import { SquareTerminal, X } from 'lucide-react';
 import ControlHint from '../UI/ControlHint';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
-import {
-  DEFAULT_FLOATING_TERMINAL_GEOMETRY,
-  dragFloatingTerminalRect,
-  floatingPixelsToGeometry,
-  normalizeFloatingTerminalGeometry,
-  resizeFloatingTerminalRect,
-} from '../../utils/floatingTerminalGeometry.mjs';
 
-const { ipcRenderer } = window.require('electron');
-const STORAGE_KEY = 'noted-terminal-floating-terminal-geometry';
-const APP_STATE_KEY = 'floatingTerminalGeometry';
-const RESIZE_DIRECTIONS = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'] as const;
-type ResizeDirection = typeof RESIZE_DIRECTIONS[number];
-type Geometry = { x: number; y: number; width: number; height: number };
-
-const readBootGeometry = (): Geometry => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return normalizeFloatingTerminalGeometry(JSON.parse(raw));
-  } catch {}
-  return { ...DEFAULT_FLOATING_TERMINAL_GEOMETRY };
-};
-
-const handleStyle = (direction: ResizeDirection): React.CSSProperties => {
-  const corner = direction.length === 2;
-  const base: React.CSSProperties = {
-    position: 'absolute',
-    zIndex: 6,
-    background: 'transparent',
-    pointerEvents: 'auto',
-  };
-  if (corner) {
-    const north = direction.includes('n');
-    const west = direction.includes('w');
-    return {
-      ...base,
-      width: 14,
-      height: 14,
-      top: north ? -5 : undefined,
-      bottom: north ? undefined : -5,
-      left: west ? -5 : undefined,
-      right: west ? undefined : -5,
-      cursor: direction === 'ne' || direction === 'sw' ? 'nesw-resize' : 'nwse-resize',
-    };
-  }
-  if (direction === 'n' || direction === 's') {
-    return {
-      ...base,
-      left: 10,
-      right: 10,
-      height: 10,
-      top: direction === 'n' ? -5 : undefined,
-      bottom: direction === 's' ? -5 : undefined,
-      cursor: 'ns-resize',
-    };
-  }
-  return {
-    ...base,
-    top: 10,
-    bottom: 10,
-    width: 10,
-    left: direction === 'w' ? -5 : undefined,
-    right: direction === 'e' ? -5 : undefined,
-    cursor: 'ew-resize',
-  };
-};
+const SIDE_TERMINAL_MIN_WIDTH = 360;
+const SIDE_TERMINAL_MAX_WIDTH = 1200;
 
 interface FloatingTerminalFrameProps {
   tabId: string | null;
+  tabName: string;
   floating: boolean;
   open: boolean;
   bottomInset: number;
@@ -82,6 +20,7 @@ interface FloatingTerminalFrameProps {
 
 export default function FloatingTerminalFrame({
   tabId,
+  tabName,
   floating,
   open,
   bottomInset,
@@ -89,63 +28,14 @@ export default function FloatingTerminalFrame({
   searchNode,
   children,
 }: FloatingTerminalFrameProps) {
-  const stageRef = useRef<HTMLDivElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
-  const geometryRef = useRef<Geometry>(readBootGeometry());
-  const [geometry, setGeometryState] = useState<Geometry>(geometryRef.current);
-  const gestureRef = useRef<{
-    kind: 'drag' | 'resize';
-    direction?: ResizeDirection;
-    pointerId: number;
-    startX: number;
-    startY: number;
-    startRect: Geometry;
-    bounds: { width: number; height: number };
-    cursor: string;
-  } | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const pendingGeometryRef = useRef<Geometry | null>(null);
-  const incrementTerminalFontSize = useUIStore((state) => state.incrementTerminalFontSize);
-  const decrementTerminalFontSize = useUIStore((state) => state.decrementTerminalFontSize);
+  const sideTerminalWidth = useUIStore((state) => state.sideTerminalWidth);
+  const setSideTerminalWidth = useUIStore((state) => state.setSideTerminalWidth);
   const selectedInputSurface = useUIStore((state) => (
     tabId ? (state.promptQueueInputSurfaceTabs[tabId] ?? 'history') : 'history'
   ));
   const setPromptQueueInputSurface = useUIStore((state) => state.setPromptQueueInputSurface);
   const terminalSelected = floating && open && selectedInputSurface === 'terminal';
-
-  const setGeometry = useCallback((next: Geometry) => {
-    const normalized = normalizeFloatingTerminalGeometry(next);
-    geometryRef.current = normalized;
-    setGeometryState(normalized);
-  }, []);
-
-  const persistGeometry = useCallback((next: Geometry) => {
-    const normalized = normalizeFloatingTerminalGeometry(next);
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized)); } catch {}
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY, value: normalized }).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    ipcRenderer.invoke('app:getState', APP_STATE_KEY).then((value: unknown) => {
-      if (!cancelled && value && typeof value === 'object' && !gestureRef.current) {
-        const next = normalizeFloatingTerminalGeometry(value);
-        setGeometry(next);
-        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
-      }
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, [setGeometry]);
-
-  useLayoutEffect(() => {
-    const stage = stageRef.current;
-    if (!stage || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => {
-      setGeometry(geometryRef.current);
-    });
-    observer.observe(stage);
-    return () => observer.disconnect();
-  }, [setGeometry]);
 
   useEffect(() => {
     if (!floating || !open || !tabId) return;
@@ -171,119 +61,32 @@ export default function FloatingTerminalFrame({
     setPromptQueueInputSurface(tabId, 'history');
   }, [floating, open, selectedInputSurface, setPromptQueueInputSurface, tabId]);
 
-  const flushPreview = useCallback(() => {
-    rafRef.current = null;
-    if (pendingGeometryRef.current) {
-      setGeometry(pendingGeometryRef.current);
-      pendingGeometryRef.current = null;
-    }
-  }, [setGeometry]);
-
-  const queuePreview = useCallback((next: Geometry) => {
-    pendingGeometryRef.current = next;
-    if (rafRef.current === null) rafRef.current = requestAnimationFrame(flushPreview);
-  }, [flushPreview]);
-
-  useEffect(() => {
-    const onMove = (event: PointerEvent) => {
-      const gesture = gestureRef.current;
-      if (!gesture || event.pointerId !== gesture.pointerId) return;
-      const delta = { x: event.clientX - gesture.startX, y: event.clientY - gesture.startY };
-      const nextRect = gesture.kind === 'drag'
-        ? dragFloatingTerminalRect(gesture.startRect, delta, gesture.bounds)
-        : resizeFloatingTerminalRect(gesture.startRect, gesture.direction || 'se', delta, gesture.bounds);
-      queuePreview(floatingPixelsToGeometry(nextRect, gesture.bounds));
-    };
-    const finish = (event: PointerEvent) => {
-      const gesture = gestureRef.current;
-      if (!gesture || event.pointerId !== gesture.pointerId) return;
-      if (rafRef.current !== null) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-      }
-      if (pendingGeometryRef.current) {
-        setGeometry(pendingGeometryRef.current);
-        pendingGeometryRef.current = null;
-      }
-      gestureRef.current = null;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      persistGeometry(geometryRef.current);
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', finish);
-    window.addEventListener('pointercancel', finish);
-    return () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', finish);
-      window.removeEventListener('pointercancel', finish);
-      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    };
-  }, [persistGeometry, queuePreview, setGeometry]);
-
-  const beginGesture = useCallback((
-    event: React.PointerEvent,
-    kind: 'drag' | 'resize',
-    direction?: ResizeDirection,
-  ) => {
+  const handleResizeMouseDown = useCallback((event: React.MouseEvent) => {
     if (!floating || !open || event.button !== 0) return;
-    if (kind === 'drag' && (event.target as HTMLElement).closest('button')) return;
-    const stage = stageRef.current;
-    const frame = frameRef.current;
-    if (!stage || !frame) return;
-    const rect = stage.getBoundingClientRect();
-    const frameRect = frame.getBoundingClientRect();
-    const bounds = { width: rect.width, height: rect.height };
-    const cursor = kind === 'drag' ? 'grabbing' : String(handleStyle(direction || 'se').cursor || 'default');
     event.preventDefault();
     event.stopPropagation();
-    gestureRef.current = {
-      kind,
-      direction,
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      startRect: {
-        x: frameRect.left - rect.left,
-        y: frameRect.top - rect.top,
-        width: frameRect.width,
-        height: frameRect.height,
-      },
-      bounds,
-      cursor,
+    const startX = event.clientX;
+    const startWidth = sideTerminalWidth;
+    const onMove = (moveEvent: MouseEvent) => {
+      const next = startWidth + startX - moveEvent.clientX;
+      setSideTerminalWidth(Math.max(SIDE_TERMINAL_MIN_WIDTH, Math.min(SIDE_TERMINAL_MAX_WIDTH, next)));
     };
-    document.body.style.cursor = cursor;
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
-  }, [floating, open]);
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }, [floating, open, setSideTerminalWidth, sideTerminalWidth]);
 
   const isPresented = !floating || open;
-  const frameStyle: React.CSSProperties = floating ? {
-    left: `${geometry.x}%`,
-    top: `${geometry.y}%`,
-    width: `${geometry.width}%`,
-    height: `${geometry.height}%`,
-    visibility: open ? 'visible' : 'hidden',
-    opacity: open ? 1 : 0,
-    pointerEvents: open ? 'auto' : 'none',
-    border: terminalSelected
-      ? '1px solid rgba(255,255,255,0.92)'
-      : '1px solid rgba(255,255,255,0.2)',
-    borderRadius: 8,
-    boxShadow: '0 18px 50px rgba(0,0,0,0.55)',
-    background: '#151515',
-  } : {
-    inset: 0,
-    visibility: 'visible',
-    opacity: 1,
-    pointerEvents: 'auto',
-    background: '#1a1a1a',
-  };
 
   return (
     <div
-      ref={stageRef}
       data-floating-terminal-stage
       style={{
         position: 'absolute',
@@ -292,7 +95,10 @@ export default function FloatingTerminalFrame({
         right: 0,
         bottom: floating ? Math.max(0, bottomInset) : 0,
         pointerEvents: 'none',
-        zIndex: floating ? 80 : 0,
+        // Side panel opens ABOVE everything in the center — including the
+        // Run after strip host (z 120) and orchestration chips — matching how
+        // the History side panel covers them in terminal-primary.
+        zIndex: floating ? 130 : 0,
       }}
     >
       <div
@@ -301,110 +107,91 @@ export default function FloatingTerminalFrame({
         data-floating-terminal-open={isPresented ? '1' : '0'}
         data-floating-terminal-selected={terminalSelected ? '1' : '0'}
         onPointerDownCapture={(event) => {
-          // PromptQueueOverlay is rendered through a portal but remains a
-          // React child of this frame. React therefore bubbles its pointer
-          // events through this handler even though the button is not inside
-          // the terminal DOM. Only a physical hit inside the frame proves the
-          // user selected the terminal input surface.
+          // Portalled Run after UI remains a React child, so only a physical
+          // hit inside this panel proves that terminal input was selected.
           const target = event.target;
           if (!(target instanceof Node) || !frameRef.current?.contains(target)) return;
           if (floating && open && tabId) setPromptQueueInputSurface(tabId, 'terminal');
         }}
-        style={{
+        style={floating ? {
           position: 'absolute',
+          top: 0,
+          right: 0,
+          bottom: 0,
+          width: sideTerminalWidth,
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+          pointerEvents: open ? 'auto' : 'none',
+          transform: open ? 'translateX(0)' : 'translateX(100%)',
+          transition: 'transform 50ms ease-out',
+          borderLeft: terminalSelected
+            ? '1px solid rgba(255,255,255,0.92)'
+            : '1px solid #333',
+          boxShadow: '-14px 0 34px rgba(0,0,0,0.48)',
+          background: '#151515',
+        } : {
+          position: 'absolute',
+          inset: 0,
           overflow: 'visible',
-          transition: gestureRef.current ? 'none' : 'opacity 80ms ease-out',
-          ...frameStyle,
+          pointerEvents: 'auto',
+          background: '#1a1a1a',
         }}
       >
         <div
           data-floating-terminal-titlebar
-          onPointerDown={(event) => beginGesture(event, 'drag')}
           style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            right: 0,
             height: floating ? 30 : 0,
             visibility: floating ? 'visible' : 'hidden',
             display: 'flex',
             alignItems: 'center',
             gap: 7,
-            padding: '0 6px 0 9px',
-            borderBottom: '1px solid rgba(255,255,255,0.1)',
-            borderRadius: '8px 8px 0 0',
+            padding: '0 6px 0 12px',
+            borderBottom: floating ? '1px solid #333' : 'none',
             background: '#191919',
-            color: '#9ca3af',
-            cursor: 'grab',
-            zIndex: 5,
+            color: '#8a8a8f',
+            flexShrink: 0,
             boxSizing: 'border-box',
           }}
         >
-          {/* Collapse leads the row: it acts on the window itself, so it reads
-              before the window's own name instead of trailing the font pair. */}
-          <ControlHint label="Свернуть терминал">
+          <SquareTerminal size={13} />
+          <span
+            title={tabName}
+            style={{ fontSize: 11, color: '#8a8a8f', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          >
+            {tabName}
+          </span>
+          <div style={{ flex: 1 }} />
+          <ControlHint label="Закрыть терминал">
             <button
               type="button"
               aria-label="Hide terminal"
-              onPointerDown={(event) => event.stopPropagation()}
               onClick={onClose}
-              style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: '4px 2px', cursor: 'pointer', display: 'flex', marginLeft: -3 }}
-            ><ChevronDown size={15} /></button>
+              style={{
+                width: 24,
+                height: 24,
+                border: 0,
+                background: 'transparent',
+                color: '#8a8a8f',
+                padding: 0,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <X size={14} />
+            </button>
           </ControlHint>
-          <SquareTerminal size={14} />
-          <span style={{ fontSize: 11, fontWeight: 650, letterSpacing: '0.04em' }}>TERMINAL</span>
-          {/* Font size stays next to the title as one labelled pair. Bare −/+
-              at the far edge read as window sizing; "Aa" names what changes. */}
-          <div
-            data-floating-terminal-font-group
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 1,
-              marginLeft: 3,
-              padding: '0 2px',
-              borderRadius: 5,
-              border: '1px solid rgba(255,255,255,0.09)',
-              background: 'rgba(255,255,255,0.04)',
-            }}
-          >
-            <ControlHint label="Уменьшить шрифт терминала">
-              <button
-                type="button"
-                aria-label="Decrease terminal font size"
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={decrementTerminalFontSize}
-                style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: '2px 3px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 1 }}
-              >
-                <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '-0.02em' }}>Aa</span>
-                <Minus size={11} />
-              </button>
-            </ControlHint>
-            <ControlHint label="Увеличить шрифт терминала">
-              <button
-                type="button"
-                aria-label="Increase terminal font size"
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={incrementTerminalFontSize}
-                style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: '2px 3px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 1 }}
-              >
-                <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '-0.02em' }}>Aa</span>
-                <Plus size={11} />
-              </button>
-            </ControlHint>
-          </div>
-          <div style={{ flex: 1 }} />
         </div>
 
         <div
           style={{
-            position: 'absolute',
-            left: 0,
-            right: 0,
-            top: floating ? 30 : 0,
-            bottom: 0,
+            position: floating ? 'relative' : 'absolute',
+            inset: floating ? undefined : 0,
+            flex: floating ? 1 : undefined,
+            minHeight: 0,
             overflow: 'hidden',
-            borderRadius: floating ? '0 0 8px 8px' : 0,
             background: '#1a1a1a',
           }}
         >
@@ -412,14 +199,24 @@ export default function FloatingTerminalFrame({
           {floating && open ? searchNode : null}
         </div>
 
-        {floating && open && RESIZE_DIRECTIONS.map((direction) => (
+        {floating && (
           <div
-            key={direction}
-            data-floating-terminal-resize={direction}
-            onPointerDown={(event) => beginGesture(event, 'resize', direction)}
-            style={handleStyle(direction)}
+            data-floating-terminal-resize="w"
+            onMouseDown={handleResizeMouseDown}
+            style={{
+              position: 'absolute',
+              left: 0,
+              top: 0,
+              bottom: 0,
+              width: 6,
+              cursor: 'col-resize',
+              zIndex: 10,
+              background: 'transparent',
+            }}
+            onMouseEnter={(event) => { event.currentTarget.style.background = '#5b9cf5'; }}
+            onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
           />
-        ))}
+        )}
       </div>
     </div>
   );

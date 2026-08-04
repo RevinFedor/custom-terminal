@@ -158,9 +158,12 @@ import {
   getHistoryPromptHandoffsSnapshot,
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   historyPromptHandoffAuditProofFromSendResult,
+  historyPromptHandoffStatusPresentation,
+  historyPromptHandoffUnconfirmedStatusFromSendResult,
   retractHistoryPromptHandoff,
   settleHistoryPromptHandoff,
   subscribeHistoryPromptHandoffs,
+  type HistoryPromptHandoffStatus,
 } from '../../utils/historyPromptHandoffs';
 import {
   matchesHistoryPromptAdoption,
@@ -287,7 +290,7 @@ interface FullHistoryEntry {
   role: 'user' | 'assistant' | 'compact' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash';
   timestamp: string;
   content: string;
-  queueStatus?: 'sending' | 'queued' | 'sent' | 'cancelled' | 'failed';
+  queueStatus?: HistoryPromptHandoffStatus;
   deliveryStatus?: 'editable-last-prompt';
   handoffId?: string;
   statusReason?: string;
@@ -431,6 +434,7 @@ interface HistoryPanelProps {
   terminalOpen?: boolean;
   onToggleTerminal?: () => void;
   lifecycleStatus?: AgentLifecycleSummary | null;
+  inputBusy?: boolean;
   onControlsHeightChange?: (height: number) => void;
 }
 
@@ -2461,12 +2465,14 @@ const HistoryUserEntry = memo(({
   tabId,
   allowRewind,
   rewindLocked,
+  rewindUnavailableReason,
   forceExpanded,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
   allowRewind: boolean;
   rewindLocked: boolean;
+  rewindUnavailableReason?: string | null;
   forceExpanded?: boolean;
 }) => {
   const [copied, setCopied] = useState(false);
@@ -2474,42 +2480,7 @@ const HistoryUserEntry = memo(({
   const editableLastPrompt = entry.deliveryStatus === 'editable-last-prompt';
   const canRewind = allowRewind && !rewindLocked;
   const queueStatus = entry.queueStatus;
-  const queueStatusPresentation = queueStatus === 'sending'
-    ? {
-        label: 'SENDING',
-        tone: 'info' as const,
-        pending: true,
-        title: 'Сообщение отправляется',
-      }
-    : queueStatus === 'queued'
-      ? {
-          label: 'QUEUED',
-          tone: 'accent' as const,
-          pending: true,
-          title: 'Сообщение ждёт завершения текущего ответа',
-        }
-      : queueStatus === 'sent'
-        ? {
-            label: 'SENT',
-            tone: 'success' as const,
-            pending: false,
-            title: 'Сообщение передано агенту и ожидает появления в сохранённой истории',
-          }
-        : queueStatus === 'cancelled'
-          ? {
-              label: 'CANCELLED',
-              tone: 'warning' as const,
-              pending: false,
-              title: 'Отправка отменена до появления сообщения в сохранённой истории',
-            }
-          : queueStatus === 'failed'
-            ? {
-                label: 'SEND FAILED',
-                tone: 'danger' as const,
-                pending: false,
-                title: 'Сообщение не удалось отправить',
-              }
-            : null;
+  const queueStatusPresentation = historyPromptHandoffStatusPresentation(queueStatus);
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -2581,7 +2552,7 @@ const HistoryUserEntry = memo(({
             </MessageActionButton>
           </Tooltip>
           {allowRewind && (
-            <Tooltip content={rewindLocked ? 'Rewind уже выполняется' : 'Откатиться к этому prompt'}>
+            <Tooltip content={rewindUnavailableReason || (rewindLocked ? 'Rewind уже выполняется' : 'Откатиться к этому prompt')}>
               <MessageActionButton
                 tone="warning"
                 aria-label="Rewind to prompt"
@@ -2738,6 +2709,7 @@ const HistoryEntry = memo(({
   toolType,
   allowRewind,
   rewindLocked,
+  rewindUnavailableReason,
   forceExpanded,
 }: {
   entry: FullHistoryEntry;
@@ -2745,6 +2717,7 @@ const HistoryEntry = memo(({
   toolType?: 'claude' | 'gemini' | 'codex';
   allowRewind: boolean;
   rewindLocked: boolean;
+  rewindUnavailableReason?: string | null;
   forceExpanded?: boolean;
 }) => {
   if (entry.role === 'compact') {
@@ -2778,6 +2751,7 @@ const HistoryEntry = memo(({
         tabId={tabId}
         allowRewind={false}
         rewindLocked={rewindLocked}
+        rewindUnavailableReason={rewindUnavailableReason}
         forceExpanded={forceExpanded}
       />
     );
@@ -2810,6 +2784,7 @@ const HistoryEntry = memo(({
         tabId={tabId}
         allowRewind={allowRewind}
         rewindLocked={rewindLocked}
+        rewindUnavailableReason={rewindUnavailableReason}
         forceExpanded={forceExpanded}
       />
     );
@@ -3803,6 +3778,8 @@ function AgentHistoryControls({
   lifecycleStatus,
   operationalPhase,
   onHeightChange,
+  onRuntimeSnapshotChange,
+  onInputBusyChange,
   overlayComposer = false,
   agentInputSurface: agentInputSurfaceProp,
 }: {
@@ -3814,7 +3791,8 @@ function AgentHistoryControls({
   onHistoryRefresh: (reason?: string) => void | Promise<boolean | void>;
   onPromptSubmitted: (
     text: string,
-    queueStatus: 'sending' | 'queued' | 'sent',
+    queueStatus: Extract<HistoryPromptHandoffStatus,
+      'sending' | 'queued' | 'audit-pending' | 'delivery-unknown' | 'sent'>,
     meta: {
       handoffId: string;
       statusAtSend: AgentPtyStatus;
@@ -3831,7 +3809,7 @@ function AgentHistoryControls({
   ) => void;
   onPromptStatusChange: (
     handoffId: string,
-    queueStatus: 'queued' | 'sent' | 'cancelled' | 'failed',
+    queueStatus: Exclude<HistoryPromptHandoffStatus, 'sending'>,
     reason: string,
     identity?: {
       requiresAuditIdentity?: boolean;
@@ -3859,6 +3837,8 @@ function AgentHistoryControls({
   lifecycleStatus?: AgentLifecycleSummary | null;
   operationalPhase?: CompactOperationalPhase | null;
   onHeightChange?: (height: number) => void;
+  onRuntimeSnapshotChange?: (snapshot: any | null) => void;
+  onInputBusyChange?: (busy: boolean) => void;
   overlayComposer?: boolean;
   agentInputSurface?: boolean;
 }) {
@@ -3911,6 +3891,10 @@ function AgentHistoryControls({
   }, [setHistoryPromptDraft, tabId]);
   const [busyAction, setBusyAction] = useState<'resume' | 'send' | 'interrupt' | 'stop' | 'grab' | null>(null);
   const [isPasteBusy, setIsPasteBusy] = useState(false);
+  useEffect(() => {
+    onInputBusyChange?.(isPasteBusy);
+  }, [isPasteBusy, onInputBusyChange]);
+  useEffect(() => () => onInputBusyChange?.(false), [onInputBusyChange]);
   const [historyUpdating, setHistoryUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draftWarning, setDraftWarning] = useState<string | null>(null);
@@ -4311,6 +4295,7 @@ function AgentHistoryControls({
             continue;
           }
           setStatusFrom(presence.status, 'presence');
+          onRuntimeSnapshotChange?.(presence.runtimeSnapshot || null);
           setProcessLifecycleGeneration(
             runtime.toolType === 'codex'
               ? (presence.runtimeSnapshot?.lifecycleGeneration || null)
@@ -4340,6 +4325,7 @@ function AgentHistoryControls({
           if (presenceGenerationRef.current !== presenceGeneration) continue;
           console.warn('[' + runtime.logPrefix + '] presence failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
           setStatusFrom('inactive', 'presence-error');
+          onRuntimeSnapshotChange?.(null);
           setProcessLifecycleGeneration(null);
         }
       } while (flight.trailing && presenceOwnerKeyRef.current === ownerKey);
@@ -4348,7 +4334,7 @@ function AgentHistoryControls({
     });
     presenceFlightRef.current = flight;
     return flight.promise;
-  }, [presenceOwnerKey, projectId, refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
+  }, [onRuntimeSnapshotChange, presenceOwnerKey, projectId, refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
 
   const refreshHistoryWithUpdating = useCallback((reason: string) => {
     const seq = ++historyUpdateSeqRef.current;
@@ -5194,7 +5180,8 @@ function AgentHistoryControls({
     let sendHandoffId: string | null = null;
     let sendOwnershipTransferred = false;
     let sendDeliveryUnconfirmed = false;
-    let sendTransferredQueueStatus: 'queued' | 'sent' = 'sent';
+    let sendTransferredQueueStatus: Exclude<HistoryPromptHandoffStatus,
+      'sending' | 'cancelled' | 'failed'> = 'sent';
     let sendAuditIdentity: {
       requiresAuditIdentity?: boolean;
       auditTimestamp?: string;
@@ -5497,17 +5484,14 @@ function AgentHistoryControls({
         });
         const resultOwnershipTransferred = queueSendTransferredOwnership(result);
         const auditProof = historyPromptHandoffAuditProofFromSendResult(result);
-        const lateAuditPending = result?.auditPending === true
-          || result?.userMessageAuditPending === true
-          || result?.codexAudit?.lateReconciliationPending === true
-          || result?.pasteAudit?.lateReconciliationPending === true;
+        const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(result);
         const finalAuditFailure = result?.success === false
           && result?.submitted === true
-          && !lateAuditPending;
+          && !unconfirmedStatus;
         const effectiveStatusAtSend = result?.effectiveStatusAtSend || statusAtSend;
-        const resultQueueStatus: 'queued' | 'sent' = effectiveStatusAtSend === 'busy'
-          ? 'queued'
-          : 'sent';
+        const resultQueueStatus: Exclude<HistoryPromptHandoffStatus,
+          'sending' | 'cancelled' | 'failed'> = unconfirmedStatus
+          || (effectiveStatusAtSend === 'busy' ? 'queued' : 'sent');
         sendAuditIdentity = {
           requiresAuditIdentity: resultOwnershipTransferred,
           auditTimestamp: auditProof?.auditTimestamp,
@@ -5521,8 +5505,10 @@ function AgentHistoryControls({
             queueStatus: resultQueueStatus,
             reason: finalAuditFailure
               ? 'send-submitted-audit-unconfirmed'
-              : lateAuditPending
+              : resultQueueStatus === 'audit-pending'
                 ? 'send-submitted-audit-pending'
+                : resultQueueStatus === 'delivery-unknown'
+                  ? 'send-delivery-unknown'
                 : 'send-result',
             proof: auditProof,
             requiresAuditIdentity: true,
@@ -5537,8 +5523,8 @@ function AgentHistoryControls({
           ' chunks=' + (result?.chunksTotal ?? 'na') +
           ' error=' + (result?.error || '-'));
         sendOwnershipTransferred = resultOwnershipTransferred;
-        sendDeliveryUnconfirmed = result?.submitted === true
-          && (result?.success === false || lateAuditPending);
+        sendDeliveryUnconfirmed = unconfirmedStatus !== null
+          || (result?.submitted === true && result?.success === false);
         sendRefusalPasteWritten = result?.pasteWritten === true;
         sendTransferredQueueStatus = resultQueueStatus;
         historyDiag('SEND_OWNERSHIP tab=' + tabId.slice(-12) +
@@ -5556,7 +5542,9 @@ function AgentHistoryControls({
           sendAuditIdentity,
         );
         if (sendDeliveryUnconfirmed) {
-          setDraftWarning('Prompt was submitted, but delivery confirmation is delayed. It will not be sent again automatically.');
+          setDraftWarning(unconfirmedStatus === 'delivery-unknown'
+            ? 'Prompt delivery is unconfirmed. It will not be sent again automatically.'
+            : 'Prompt was submitted, but delivery confirmation is delayed. It will not be sent again automatically.');
           console.warn('[' + runtime.logPrefix + ':draft] send delivery unconfirmed; ownership kept by terminal tab='
             + actionTabId.slice(-12)
             + ' handoff=' + handoffId
@@ -7618,6 +7606,7 @@ function HistoryPanel({
   terminalOpen = false,
   onToggleTerminal,
   lifecycleStatus,
+  inputBusy = false,
   onControlsHeightChange,
 }: HistoryPanelProps) {
   // Live input surface of the tab in BOTH agent layouts. Everything that makes
@@ -7664,6 +7653,50 @@ function HistoryPanel({
     useCallback((state) => selectActiveRewindOperation(state, tabId), [tabId])
   );
   const rewindLocked = isRewindOperationBlocking(activeRewindOperation);
+  const [controlsPasteBusy, setControlsPasteBusy] = useState(false);
+  const [codexHistoryActions, setCodexHistoryActions] = useState<{
+    canNativeRewind: boolean;
+    canRewriteHistory: boolean;
+    canDeleteHistory: boolean;
+    reason: string | null;
+  } | null>(null);
+  const handleRuntimeSnapshotChange = useCallback((snapshot: any | null) => {
+    const next = snapshot && typeof snapshot === 'object'
+      ? {
+          canNativeRewind: snapshot.canNativeRewind === true,
+          canRewriteHistory: snapshot.canRewriteHistory === true,
+          canDeleteHistory: snapshot.canDeleteHistory === true,
+          reason: typeof snapshot.historyActionReason === 'string'
+            ? snapshot.historyActionReason
+            : null,
+        }
+      : null;
+    setCodexHistoryActions((previous) => (
+      previous?.canNativeRewind === next?.canNativeRewind
+      && previous?.canRewriteHistory === next?.canRewriteHistory
+      && previous?.canDeleteHistory === next?.canDeleteHistory
+      && previous?.reason === next?.reason
+        ? previous
+        : next
+    ));
+  }, []);
+  useEffect(() => {
+    setControlsPasteBusy(false);
+    setCodexHistoryActions(null);
+  }, [sessionId, tabId, toolType]);
+  const historyInputBusy = inputBusy || controlsPasteBusy || isTurnBusy;
+  const historyRewindUnavailableReason = rewindLocked
+    ? 'Rewind уже выполняется'
+    : historyInputBusy
+      ? 'Дождись завершения текущей отправки или ответа перед Rewind'
+      : toolType === 'codex' && enableClaudePtyControls && codexHistoryActions?.canNativeRewind !== true
+        ? codexHistoryActions?.reason === 'composer-not-ready'
+          ? 'Codex ещё готовит поле ввода'
+          : codexHistoryActions?.reason === 'runtime-identity-unknown'
+            ? 'Проверяю текущую Codex-сессию'
+            : 'Rewind недоступен для текущего состояния Codex'
+        : null;
+  const historyRewindLocked = historyRewindUnavailableReason !== null;
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
   const resetPanelWidth = useCallback(() => setHistoryPanelWidth(HISTORY_PANEL_DEFAULT_WIDTH), [setHistoryPanelWidth]);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -8685,7 +8718,8 @@ function HistoryPanel({
 
   const appendLocalPromptEntry = useCallback((
     text: string,
-    queueStatus: 'sending' | 'queued' | 'sent',
+    queueStatus: Extract<HistoryPromptHandoffStatus,
+      'sending' | 'queued' | 'audit-pending' | 'delivery-unknown' | 'sent'>,
     meta: {
       handoffId: string;
       statusAtSend: AgentPtyStatus;
@@ -8780,7 +8814,7 @@ function HistoryPanel({
 
   const updateLocalPromptEntry = useCallback((
     handoffId: string,
-    queueStatus: 'queued' | 'sent' | 'cancelled' | 'failed',
+    queueStatus: Exclude<HistoryPromptHandoffStatus, 'sending'>,
     reason: string,
     identity?: {
       requiresAuditIdentity?: boolean;
@@ -8954,6 +8988,8 @@ function HistoryPanel({
       if (
         record.queueStatus === 'sending'
         || record.queueStatus === 'queued'
+        || record.queueStatus === 'audit-pending'
+        || record.queueStatus === 'delivery-unknown'
         || record.queueStatus === 'sent'
       ) {
         appendLocalPromptEntry(record.text, record.queueStatus, {
@@ -11174,6 +11210,8 @@ function HistoryPanel({
       terminalIsPrimary={terminalIsPrimary}
       lifecycleStatus={lifecycleStatus}
       operationalPhase={compactOperationalPhase}
+      onRuntimeSnapshotChange={handleRuntimeSnapshotChange}
+      onInputBusyChange={setControlsPasteBusy}
       onHeightChange={handleControlsHeightChange}
       // Overlay geometry belongs to the centered layout only; docked below the
       // terminal the composer is a normal bottom row of the workspace column.
@@ -11705,7 +11743,8 @@ function HistoryPanel({
                     tabId={tabId}
                     toolType={toolType}
                     allowRewind={!previewMode && toolType !== 'gemini'}
-                    rewindLocked={rewindLocked}
+                    rewindLocked={historyRewindLocked}
+                    rewindUnavailableReason={historyRewindUnavailableReason}
                     forceExpanded={
                       searchQuery.length >= 2
                       && entry.content.toLowerCase().includes(searchQuery.toLowerCase())

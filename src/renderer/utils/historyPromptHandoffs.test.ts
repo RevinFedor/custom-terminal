@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   HistoryPromptHandoffStore,
+  historyPromptHandoffStatusPresentation,
+  historyPromptHandoffAcceptsAuditIdentity,
+  historyPromptHandoffUnconfirmedStatusFromSendResult,
   runHistoryPromptHandoff,
   type HistoryPromptHandoffChange,
   type HistoryPromptHandoffStoreLimits,
@@ -127,6 +131,54 @@ test('duplicate begin is idempotent and cannot regress a settled handoff', () =>
   assert.equal(duplicate?.text, 'same prompt');
   assert.equal(duplicate?.queueStatus, 'sent');
   assert.equal(store.getSnapshot('tab-a').length, 1);
+});
+
+test('a proven pre-Enter failure can begin a new exact attempt without stale attempt ownership', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  store.begin({
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    sendAttemptId: 'attempt-a',
+    sendOperationKey: 'project:tab-a:handoff-a',
+    toolType: 'codex',
+    text: 'prompt',
+  });
+  store.settle('tab-a', 'handoff-a', {
+    queueStatus: 'failed',
+    reason: 'not-submitted',
+  });
+
+  const retried = store.begin({
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    sendAttemptId: 'attempt-b',
+    sendOperationKey: 'project:tab-a:handoff-a',
+    toolType: 'codex',
+    text: 'prompt',
+  });
+
+  assert.equal(retried?.sendAttemptId, 'attempt-b');
+  assert.equal(retried?.queueStatus, 'sending');
+  assert.equal(retried?.auditProof, null);
+});
+
+test('late audit A cannot confirm retry attempt B', () => {
+  const handoff = {
+    sendAttemptId: 'attempt-b',
+    sendOperationKey: 'project:tab-a:handoff-a',
+  };
+  assert.equal(historyPromptHandoffAcceptsAuditIdentity(handoff, {
+    sendAttemptId: 'attempt-a',
+    sendOperationKey: 'project:tab-a:handoff-a',
+  }), false);
+  assert.equal(historyPromptHandoffAcceptsAuditIdentity(handoff, {
+    sendAttemptId: 'attempt-b',
+    sendOperationKey: 'project:tab-a:handoff-a',
+  }), true);
+  assert.equal(historyPromptHandoffAcceptsAuditIdentity(handoff, {
+    sendAttemptId: 'attempt-b',
+    sendOperationKey: 'project:tab-foreign:handoff-a',
+  }), false);
 });
 
 test('an unverified post-Enter result cannot weaken exact audit identity', () => {
@@ -266,4 +318,129 @@ test('external send publishes History handoff before transport and settles the s
     { type: 'begin', handoffId: 'api-handoff' },
     { type: 'settle', handoffId: 'api-handoff' },
   ]);
+});
+
+test('post-Enter receipts remain visibly unconfirmed instead of becoming SENT', async () => {
+  const store = new HistoryPromptHandoffStore(limits());
+
+  await runHistoryPromptHandoff({
+    tabId: 'tab-api',
+    handoffId: 'delivery-unknown-handoff',
+    toolType: 'codex',
+    text: 'receipt missing',
+    source: 'project-api',
+    statusAtSend: 'active',
+    send: async () => ({
+      success: null,
+      submitted: null,
+      status: 'delivery-unknown',
+      deliveryUnknown: true,
+    }),
+  }, store);
+  await runHistoryPromptHandoff({
+    tabId: 'tab-api',
+    handoffId: 'audit-pending-handoff',
+    toolType: 'codex',
+    text: 'waiting for exact audit',
+    source: 'project-api',
+    statusAtSend: 'active',
+    send: async () => ({
+      success: null,
+      submitted: true,
+      status: 'audit-pending',
+      auditPending: true,
+    }),
+  }, store);
+
+  const byId = new Map(store.getSnapshot('tab-api').map(item => [item.handoffId, item]));
+  assert.equal(byId.get('delivery-unknown-handoff')?.queueStatus, 'delivery-unknown');
+  assert.equal(byId.get('delivery-unknown-handoff')?.statusReason, 'send-delivery-unknown');
+  assert.equal(byId.get('audit-pending-handoff')?.queueStatus, 'audit-pending');
+  assert.equal(byId.get('audit-pending-handoff')?.statusReason, 'send-submitted-audit-pending');
+});
+
+test('late exact audit promotes only its handoff to SENT', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  begin(store, 'tab-api', 'handoff-a');
+  begin(store, 'tab-api', 'handoff-b');
+  store.settle('tab-api', 'handoff-a', {
+    queueStatus: 'audit-pending',
+    reason: 'send-submitted-audit-pending',
+  });
+  store.settle('tab-api', 'handoff-b', {
+    queueStatus: 'audit-pending',
+    reason: 'send-submitted-audit-pending',
+  });
+
+  store.settle('tab-api', 'handoff-b', {
+    queueStatus: 'sent',
+    reason: 'late-audit-confirmed',
+    proof: {
+      auditTimestamp: '2026-08-03T14:00:00.000Z',
+      actualHash: 'exact-b-hash',
+      sessionId: 'session-tab-api',
+      entryUuid: 'exact-b-entry',
+    },
+  });
+
+  const byId = new Map(store.getSnapshot('tab-api').map(item => [item.handoffId, item]));
+  assert.equal(byId.get('handoff-a')?.queueStatus, 'audit-pending');
+  assert.equal(byId.get('handoff-a')?.auditProof, null);
+  assert.equal(byId.get('handoff-b')?.queueStatus, 'sent');
+  assert.equal(byId.get('handoff-b')?.auditProof?.entryUuid, 'exact-b-entry');
+});
+
+test('receipt and chip presentation distinguish confirming from unknown delivery', () => {
+  assert.equal(historyPromptHandoffUnconfirmedStatusFromSendResult({
+    status: 'audit-pending',
+    auditPending: true,
+  }), 'audit-pending');
+  assert.equal(historyPromptHandoffUnconfirmedStatusFromSendResult({
+    status: 'delivery-unknown',
+    deliveryUnknown: true,
+    auditPending: true,
+  }), 'delivery-unknown');
+  assert.equal(historyPromptHandoffUnconfirmedStatusFromSendResult({
+    success: true,
+    submitted: true,
+  }), null);
+
+  assert.deepEqual(historyPromptHandoffStatusPresentation('audit-pending'), {
+    label: 'CONFIRMING',
+    tone: 'accent',
+    pending: true,
+    title: 'Команда отправлена; приложение ждёт точного подтверждения в истории',
+  });
+  assert.deepEqual(historyPromptHandoffStatusPresentation('delivery-unknown'), {
+    label: 'UNCONFIRMED',
+    tone: 'warning',
+    pending: false,
+    title: 'Доставка не подтверждена. Не отправляйте текст повторно как новую команду',
+  });
+  assert.notEqual(historyPromptHandoffStatusPresentation('audit-pending')?.tone, 'success');
+  assert.notEqual(historyPromptHandoffStatusPresentation('delivery-unknown')?.tone, 'success');
+});
+
+test('manual History and Run After share the receipt presentation mapping', () => {
+  const historyPanelSource = readFileSync(
+    new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url),
+    'utf8',
+  );
+  const queueRunnerSource = readFileSync(
+    new URL('../hooks/usePromptQueueRunner.ts', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(
+    historyPanelSource,
+    /const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult\(result\)/,
+  );
+  assert.match(
+    queueRunnerSource,
+    /const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult\(res\)/,
+  );
+  assert.match(
+    queueRunnerSource,
+    /settleHistoryPromptHandoff\(auditTabId, handoffId,[\s\S]{0,180}queueStatus: 'sent'/,
+  );
 });

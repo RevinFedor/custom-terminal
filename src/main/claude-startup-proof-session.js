@@ -20,6 +20,7 @@ function createClaudeStartupProofSession({
   readProof,
   resolveBinding,
   currentGeneration,
+  holdSuccessfulProofForTest = null,
   log = console,
 } = {}) {
   if (typeof subscribe !== 'function') throw new TypeError('subscribe is required');
@@ -90,6 +91,33 @@ function createClaudeStartupProofSession({
     }
 
     if (proof?.outcome === 'found') {
+      if (typeof holdSuccessfulProofForTest === 'function') {
+        try {
+          await holdSuccessfulProofForTest({
+            id: entry.id,
+            tabId: entry.tabId,
+            generation: entry.generation,
+            command: entry.request.command,
+            sessionId: entry.binding.sessionId,
+            proof,
+          });
+        } catch (error) {
+          log.warn?.('[ClaudeStartupProofWait] test proof hold failed tab='
+            + String(entry.tabId).slice(-12)
+            + ' gen=' + entry.generation
+            + ' command=' + JSON.stringify(entry.request.command)
+            + ' error=' + (error?.message || error));
+        }
+      }
+      if (entry.settled || pending.get(entry.id) !== entry) return;
+      if (currentGeneration(entry.tabId) !== entry.generation) {
+        settle(entry, {
+          success: false,
+          outcome: 'unresolved',
+          reason: 'stale-generation',
+        }, 'stale-generation');
+        return;
+      }
       settle(entry, proof, 'exact-proof-found');
       return;
     }

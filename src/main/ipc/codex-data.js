@@ -21,6 +21,7 @@ const {
   getCodexProcessActionGeneration,
 } = require('../codex-process-action-ownership');
 const { promptFingerprint } = require('../claude-prompt-carriers');
+const { classifyCodexTurnRecord } = require('../codex-turn-outcome');
 const {
   CodexAccountProfileManager,
   DEFAULT_PROFILE_ID,
@@ -4187,6 +4188,39 @@ function codexProviderTurnId(record) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function findCodexPromptExecutionContext(records, sessionId, entryUuid) {
+  if (!sessionId || !entryUuid) return null;
+  const rows = Array.isArray(records) ? records : [];
+  const promptIndex = rows.findIndex((record) => (
+    record?.type === 'event_msg'
+    && record?.payload?.type === 'user_message'
+    && stableUuid(sessionId, record.__line, 'codex-user') === entryUuid
+  ));
+  if (promptIndex < 0) return null;
+  for (let index = promptIndex - 1; index >= 0; index -= 1) {
+    const record = rows[index];
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg') continue;
+    if (payload.type === 'task_complete' || payload.type === 'turn_aborted') return null;
+    if (payload.type !== 'task_started') continue;
+    const turnId = codexProviderTurnId(record);
+    if (!turnId) return null;
+    const startedAtSeconds = Number(payload.started_at);
+    const startedAt = Number.isFinite(startedAtSeconds)
+      ? Math.round(startedAtSeconds * 1000)
+      : (Date.parse(String(record.timestamp || '')) || null);
+    return {
+      provider: 'codex',
+      sessionId,
+      turnId,
+      processId: null,
+      generation: null,
+      startedAt,
+    };
+  }
+  return null;
+}
+
 function buildCodexProviderTurnAssistantResult(
   records,
   sessionId,
@@ -4264,6 +4298,15 @@ function buildCodexProviderTurnAssistantResult(
     break;
   }
 
+  const terminalTracker = {};
+  let terminalOutcome = null;
+  if (terminalIndex >= 0) {
+    for (let index = startIndex; index <= terminalIndex; index += 1) {
+      const outcome = classifyCodexTurnRecord(terminalTracker, rows[index]);
+      if (outcome && outcome.busy === false) terminalOutcome = outcome;
+    }
+  }
+
   const lowerBound = Number(proof?.resultAfterAt) > 0
     ? Number(proof.resultAfterAt)
     : (Number(proof?.requestedAt) > 0 ? Number(proof.requestedAt) - 5 * 60 * 1000 : 0);
@@ -4326,8 +4369,12 @@ function buildCodexProviderTurnAssistantResult(
     const text = extractTextContent(payload.content).trim();
     if (text) assistantBlocks.push(text);
   }
-  const projected = projectCodexAssistantContext(assistantBlocks, maxChars, 250000);
-  if (!projected.assistantText) {
+  let projected = projectCodexAssistantContext(assistantBlocks, maxChars, 250000);
+  if (!projected.assistantText && terminalOutcome?.hasFinalResult === true) {
+    const terminalText = String(rows[terminalIndex]?.payload?.last_agent_message || '').trim();
+    if (terminalText) projected = projectCodexAssistantContext([terminalText], maxChars, 250000);
+  }
+  if (!projected.assistantText && !terminalOutcome) {
     return {
       success: false,
       error: 'No assistant response found inside the exact Codex provider turn',
@@ -4341,7 +4388,12 @@ function buildCodexProviderTurnAssistantResult(
     .find((entry) => entry.uuid === prompt.userUuid && typeof entry.turnIndex === 'number');
   return {
     success: true,
-    complete: terminalIndex >= 0,
+    // A terminal envelope is not necessarily a successful answer. Codex
+    // writes `turn_aborted` after Stop/close and can leave assistant text
+    // before that record. Treating any terminal event as `complete` lets that
+    // partial text fabricate a successful orchestration result.
+    complete: terminalOutcome?.reason === 'task_complete'
+      && terminalOutcome?.hasFinalResult === true,
     assistantText: projected.assistantText,
     assistantChars: projected.assistantChars,
     truncated: projected.truncated,
@@ -4353,6 +4405,8 @@ function buildCodexProviderTurnAssistantResult(
     providerTurnId: expectedTurnId,
     providerGeneration: expectedGeneration,
     terminalEvent,
+    terminalOutcomeReason: terminalOutcome?.reason || null,
+    hasFinalResult: terminalOutcome?.hasFinalResult === true,
     boundaryReason,
   };
 }
@@ -6972,6 +7026,7 @@ module.exports = {
     buildCodexTurnAssistantContext,
     buildCodexTurnAssistantResult,
     buildCodexProviderTurnAssistantResult,
+    findCodexPromptExecutionContext,
     buildCodexVisibleRecordWrappers,
     planCodexRangeRewrite,
     planCodexForkFromLatestCompact,

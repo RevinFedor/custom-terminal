@@ -56,6 +56,9 @@ test('Codex orchestration result uses persisted execution identity before legacy
   assert.match(reader, /promptUserUuid \|\| promptHash/);
   assert.ok(exactAt >= 0 && exactAt < legacyAt, 'exact provider turn proof must precede legacy grouping');
   assert.match(reader, /\[OrchestrationResultProof\]/);
+  assert.match(reader, /terminalEvent: codexResult\.terminalEvent \|\| null/);
+  assert.match(reader, /terminalOutcomeReason: codexResult\.terminalOutcomeReason \|\| null/);
+  assert.match(reader, /hasFinalResult: codexResult\.hasFinalResult === true/);
 });
 
 test('result probing reads the persisted target session instead of a replaced live session', () => {
@@ -65,6 +68,29 @@ test('result probing reads the persisted target session instead of a replaced li
   );
   assert.match(probe, /buildOrchestrationResultLookup\(run\)/);
   assert.match(probe, /lookup\.targetExecutionContext\?\.sessionId \|\| info\?\.sessionId/);
+  const reconcile = block(
+    'async function reconcileOrchestrationRun',
+    '\nasync function admitAgentLifecycleLaunch',
+  );
+  assert.match(reconcile, /resultTerminalEvent: probe\.terminalEvent \|\| null/);
+  assert.match(reconcile, /resultTerminalReason: probe\.terminalOutcomeReason \|\| null/);
+  assert.match(reconcile, /resultHasFinalResult: probe\.hasFinalResult === true/);
+});
+
+test('settled result proof terminalizes exact abort or no-final-result before arming a watcher', () => {
+  const finalize = block(
+    'async function finalizeSettledOrchestration',
+    '\nasync function finalizeSettledOrchestrations',
+  );
+  assert.match(finalize, /exactOrchestrationTerminalFailure\(probe\)/);
+  assert.ok(
+    finalize.indexOf('if (!terminalFailureReason && !isCompleteOrchestrationResult(probe))')
+      < finalize.indexOf('armOrchestrationResultProof(current, probe)'),
+    'an exact terminal failure must be handled before waiting for more transcript bytes',
+  );
+  assert.match(finalize, /markResultProofTerminalFailure\(/);
+  assert.match(finalize, /releaseOrchestrationResultProof\(current\.runId, 'exact-terminal-result-failure'\)/);
+  assert.match(finalize, /sendOrchestrationCompletionNotification\(finalizedFailure\)/);
 });
 
 test('only explicit submitted false bypasses orchestration recovery grace', () => {

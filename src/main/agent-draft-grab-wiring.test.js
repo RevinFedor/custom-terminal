@@ -48,6 +48,10 @@ test('shared send passes the exact screen proof into the Ctrl+G request', () => 
     'inputRevision',
     'terminalLifecycleGeneration',
     'mirrorGeneration',
+    'mirrorWriteSeq',
+    'mirrorFlushedSeq',
+    'mirrorSynchronizedOutputOpen',
+    'synchronizedOutputGeneration',
   ]) {
     const helperSource = fs.readFileSync(
       path.join(__dirname, '../renderer/utils/agentDraftPreflight.mjs'),
@@ -55,6 +59,27 @@ test('shared send passes the exact screen proof into the Ctrl+G request', () => 
     );
     assert.match(helperSource, new RegExp(field + ':\\s*proof\\?\\.' + field));
   }
+});
+
+test('missing active prompt escalates only from a current idle frame and is rechecked before Ctrl+G', () => {
+  assert.match(
+    mainSource,
+    /classifyClaudeMissingPromptCaptureForTab\([\s\S]{0,1400}exactCaptureRecommended:\s*true/,
+    'main must attach exact-capture authority after lifecycle admission, not in the screen parser',
+  );
+  const captureGuard = mainSource.indexOf('const isClaudeMissingPromptCapture =');
+  const liveSnapshot = mainSource.indexOf("'before-missing-prompt-exact-capture'", captureGuard);
+  const frameGuard = mainSource.indexOf('validateAgentInputFrameIdentity(tabId, captureIdentity)', liveSnapshot);
+  const refusal = mainSource.indexOf("error: 'claude_draft_state_unknown_before_paste'", frameGuard);
+  const ctrlG = mainSource.indexOf("term.write('\\x07')", refusal);
+  assert.ok(
+    captureGuard > 0
+      && liveSnapshot > captureGuard
+      && frameGuard > liveSnapshot
+      && refusal > frameGuard
+      && ctrlG > refusal,
+    'the exact current frame and lifecycle must be revalidated before Ctrl+G can touch Claude',
+  );
 });
 
 test('an exact empty capture replaces the stale screen-unknown decision', () => {

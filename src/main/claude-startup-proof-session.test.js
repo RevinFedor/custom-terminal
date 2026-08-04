@@ -34,6 +34,7 @@ function createHarness(overrides = {}) {
     }),
     resolveBinding: overrides.resolveBinding || (async () => binding),
     currentGeneration: () => generation,
+    holdSuccessfulProofForTest: overrides.holdSuccessfulProofForTest || null,
     log: quietLog,
   });
   return {
@@ -218,5 +219,64 @@ test('new launch generation cancels only its superseded wait', async () => {
   const result = await waiting;
   assert.equal(result.outcome, 'unresolved');
   assert.equal(result.reason, 'generation-superseded');
+  assert.deepEqual(h.owner.snapshot(), []);
+});
+
+test('a real successful proof can be held and released without fabricating its result', async () => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const observed = [];
+  const h = createHarness({
+    holdSuccessfulProofForTest: async (entry) => {
+      observed.push(entry);
+      await held;
+    },
+  });
+  const exactProof = {
+    success: true,
+    outcome: 'found',
+    reason: 'jsonl-stdout',
+    resultUuid: 'result-a',
+  };
+  h.setProof(exactProof);
+  let settled = false;
+  const waiting = h.owner.wait({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    command: '/model opus',
+  }).then((result) => {
+    settled = true;
+    return result;
+  });
+  await nextTurn();
+  await nextTurn();
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].id.startsWith('claude-startup:launch-1:'), true);
+  assert.equal(settled, false);
+  release();
+  assert.deepEqual(await waiting, exactProof);
+});
+
+test('generation cancellation wins while a successful proof is held', async () => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const h = createHarness({
+    holdSuccessfulProofForTest: () => held,
+  });
+  h.setProof({ success: true, outcome: 'found', reason: 'jsonl-stdout' });
+  const waiting = h.owner.wait({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    command: '/effort max',
+  });
+  await nextTurn();
+  await nextTurn();
+  h.setGeneration('launch-2');
+  assert.equal(h.owner.cancel('tab-a', 'launch-1', 'generation-superseded'), 1);
+  const result = await waiting;
+  assert.equal(result.outcome, 'unresolved');
+  assert.equal(result.reason, 'generation-superseded');
+  release();
+  await nextTurn();
   assert.deepEqual(h.owner.snapshot(), []);
 });

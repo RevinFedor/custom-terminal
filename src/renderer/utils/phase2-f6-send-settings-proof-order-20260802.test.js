@@ -63,6 +63,19 @@ async function buildScenarioBundle() {
         },
         probeDraft: async () => {
           state.events.push({ kind: 'composer-proof-screen', inputRevision: state.inputRevision });
+          if (options.screenProof === 'missing') {
+            return {
+              success: true,
+              proofOutcome: 'unknown',
+              proofReason: 'active-prompt-not-found',
+              hasDraft: null,
+              text: '',
+              preview: '',
+              source: 'headless-main:claude-composer:unknown:active-prompt-not-found',
+              exactCaptureRecommended: true,
+              ...identity(),
+            };
+          }
           return {
             success: true,
             proofOutcome: 'found',
@@ -288,6 +301,29 @@ test('F6 complete shared scenario -> Claude runtime -> IPC path reproves after s
     assert.equal(state.events.some((entry) => entry.kind === 'setting-write'), false);
     assert.equal(Boolean(state.lastPaste?.reserved), true);
     assert.equal(result?.submitted, true);
+  });
+
+  await t.test('F6 missing prompt marker uses exact empty capture and still submits once', async () => {
+    const state = resetState();
+    const result = await scenario.runClaudeScenario({
+      handoffId: 'phase2-f6-missing-prompt',
+      screenProof: 'missing',
+    });
+    assert.deepEqual({
+      exactCaptureCount: state.events.filter((entry) => (
+        entry.kind === 'composer-proof-exact'
+      )).length,
+      physicalPasteCount: state.events.filter((entry) => (
+        entry.kind === 'physical-paste-boundary'
+      )).length,
+      proofReservedAtPhysicalPaste: Boolean(state.lastPaste?.reserved),
+      submitted: result?.submitted === true,
+    }, {
+      exactCaptureCount: 1,
+      physicalPasteCount: 1,
+      proofReservedAtPhysicalPaste: true,
+      submitted: true,
+    });
   });
 
   await t.test('F6 Think: successful picker mutation must not reuse the proof captured before the picker', async () => {

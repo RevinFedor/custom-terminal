@@ -1373,6 +1373,240 @@ test('missing or mismatched completion context cannot consume a child or reopen 
   }
 });
 
+test('an exact queued completion inside the active Codex parent turn consumes only its child', async () => {
+  const { store, cleanup } = await makeStore();
+  const parentContext = {
+    provider: 'codex',
+    sessionId: 'session-worker',
+    turnId: 'codex-parent-turn',
+    processId: 'pid-worker',
+    generation: 7,
+    startedAt: 700,
+  };
+  try {
+    await store.create({
+      ...baseRun('parent-same-turn', 'worker'),
+      targetToolType: 'codex',
+      targetExecutionContext: parentContext,
+      targetLifecycleGeneration: 'lifecycle-worker',
+    });
+    await store.markDelivery('parent-same-turn', { sessionId: parentContext.sessionId });
+    await store.applyLifecycle('worker', {
+      type: 'busy',
+      busy: true,
+      sessionId: parentContext.sessionId,
+      executionContext: parentContext,
+      lifecycleGeneration: 'lifecycle-worker',
+    });
+    await store.patch('parent-same-turn', { resultPromptHash: 'original-parent-prompt' });
+
+    const child = await store.create({
+      ...baseRun('child-same-turn', 'tester'),
+      sourceTabId: 'worker',
+      sourceExecutionContext: parentContext,
+    });
+    assert.equal(child.parentRunId, 'parent-same-turn');
+    await store.markDelivery('child-same-turn');
+    await store.applyLifecycle('tester', { type: 'busy', busy: true });
+    await store.applyLifecycle('tester', { type: 'done', reason: 'task_complete' });
+    await store.patch('child-same-turn', {
+      resultComplete: true,
+      resultProofStatus: 'complete',
+      notificationPromptHash: 'hash-child-same-turn',
+      notificationPromptAuditHash: 'notification-audit-hash-child-same-turn',
+      notificationHandoffId: 'orchestration-complete:child-same-turn',
+      notificationAttemptedAt: 750,
+    });
+    await store.markNotification('child-same-turn', 'queued');
+
+    const confirmation = await store.confirmSourceFollowup('child-same-turn', {
+      ...completionAuditProof('child-same-turn', 'worker'),
+      toolType: 'codex',
+      sessionId: parentContext.sessionId,
+      executionContext: parentContext,
+      lifecycleGeneration: 'lifecycle-worker',
+      queuedAtSubmit: true,
+    }, { now: 800 });
+    assert.equal(confirmation.confirmed, true);
+    assert.equal(confirmation.contextDisposition, 'same-active-turn');
+    assert.ok((await store.get('child-same-turn')).parentConsumedAt);
+    const stillActive = await store.getInternal('parent-same-turn');
+    assert.equal(stillActive.status, 'running');
+    assert.equal(stillActive.resultPromptHash, 'original-parent-prompt');
+    assert.deepEqual(stillActive.targetExecutionContext, parentContext);
+
+    const completed = await store.applyLifecycle('worker', {
+      type: 'done',
+      reason: 'task_complete',
+      sessionId: parentContext.sessionId,
+      executionContext: parentContext,
+      lifecycleGeneration: 'lifecycle-worker',
+    });
+    assert.deepEqual(completed.settled.map((run) => run.runId), ['parent-same-turn']);
+    assert.equal((await store.get('parent-same-turn')).status, 'completed');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('same-turn completion proof remains fail-closed for missing queue ownership or foreign lifecycle identity', async () => {
+  const { store, cleanup } = await makeStore();
+  const parentContext = {
+    provider: 'codex',
+    sessionId: 'session-worker',
+    turnId: 'codex-parent-turn',
+    processId: 'pid-worker',
+    generation: 7,
+    startedAt: 700,
+  };
+  try {
+    await store.create({
+      ...baseRun('parent-same-turn-guard', 'worker'),
+      targetToolType: 'codex',
+      targetExecutionContext: parentContext,
+      targetLifecycleGeneration: 'lifecycle-worker',
+    });
+    await store.markDelivery('parent-same-turn-guard', { sessionId: parentContext.sessionId });
+    await store.applyLifecycle('worker', {
+      type: 'busy',
+      busy: true,
+      sessionId: parentContext.sessionId,
+      executionContext: parentContext,
+      lifecycleGeneration: 'lifecycle-worker',
+    });
+    await store.create({
+      ...baseRun('child-same-turn-guard', 'tester'),
+      sourceTabId: 'worker',
+      sourceExecutionContext: parentContext,
+    });
+    await store.markDelivery('child-same-turn-guard');
+    await store.applyLifecycle('tester', { type: 'busy', busy: true });
+    await store.applyLifecycle('tester', { type: 'done', reason: 'task_complete' });
+    await store.patch('child-same-turn-guard', {
+      resultComplete: true,
+      resultProofStatus: 'complete',
+      notificationPromptHash: 'hash-child-same-turn-guard',
+      notificationPromptAuditHash: 'notification-audit-hash-child-same-turn-guard',
+      notificationHandoffId: 'orchestration-complete:child-same-turn-guard',
+      notificationAttemptedAt: 750,
+    });
+    await store.markNotification('child-same-turn-guard', 'queued');
+
+    const baseProof = {
+      ...completionAuditProof('child-same-turn-guard', 'worker'),
+      toolType: 'codex',
+      sessionId: parentContext.sessionId,
+      executionContext: parentContext,
+    };
+    const attempts = [
+      [{ ...baseProof, queuedAtSubmit: false }, 'source-followup-execution-context-turn-not-advanced'],
+      [{
+        ...baseProof,
+        queuedAtSubmit: true,
+        executionContext: { ...parentContext, processId: 'foreign-process' },
+      }, 'source-followup-execution-context-same-turn-mismatch'],
+      [{
+        ...baseProof,
+        queuedAtSubmit: true,
+        executionContext: { ...parentContext, generation: 8 },
+      }, 'source-followup-execution-context-same-turn-mismatch'],
+    ];
+    for (const [proof, reason] of attempts) {
+      const rejected = await store.confirmSourceFollowup('child-same-turn-guard', proof);
+      assert.equal(rejected.confirmed, false);
+      assert.equal(rejected.reason, reason);
+      assert.equal((await store.get('child-same-turn-guard')).parentConsumedAt, undefined);
+      assert.equal((await store.get('parent-same-turn-guard')).status, 'running');
+    }
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('restart reconcile consumes a child from the exact completed parent turn without reopening it', async () => {
+  const { store, cleanup } = await makeStore();
+  const parentContext = {
+    provider: 'codex',
+    sessionId: 'session-worker',
+    turnId: 'codex-parent-turn',
+    processId: 'pid-worker',
+    generation: 7,
+    startedAt: 700,
+  };
+  try {
+    await store.create({
+      ...baseRun('parent-settled-turn', 'worker'),
+      targetToolType: 'codex',
+      targetExecutionContext: parentContext,
+      targetLifecycleGeneration: 'lifecycle-worker',
+    });
+    await store.markDelivery('parent-settled-turn', { sessionId: parentContext.sessionId });
+    await store.applyLifecycle('worker', {
+      type: 'busy',
+      busy: true,
+      sessionId: parentContext.sessionId,
+      executionContext: parentContext,
+      lifecycleGeneration: 'lifecycle-worker',
+    });
+    await store.create({
+      ...baseRun('child-settled-turn', 'tester'),
+      sourceTabId: 'worker',
+      sourceExecutionContext: parentContext,
+    });
+    await store.markDelivery('child-settled-turn');
+    await store.applyLifecycle('tester', { type: 'busy', busy: true });
+    await store.applyLifecycle('tester', { type: 'done', reason: 'task_complete' });
+    await store.patch('child-settled-turn', {
+      resultComplete: true,
+      resultProofStatus: 'complete',
+      notificationPromptHash: 'hash-child-settled-turn',
+      notificationPromptAuditHash: 'notification-audit-hash-child-settled-turn',
+      notificationHandoffId: 'orchestration-complete:child-settled-turn',
+      notificationAttemptedAt: 750,
+    });
+    await store.markNotification('child-settled-turn', 'queued');
+    await store.applyLifecycle('worker', {
+      type: 'done',
+      reason: 'task_complete',
+      sessionId: parentContext.sessionId,
+      executionContext: parentContext,
+      lifecycleGeneration: 'lifecycle-worker',
+    });
+    assert.equal((await store.get('parent-settled-turn')).status, 'waiting_descendants');
+
+    const promptAuditAfterDone = await store.confirmSourceFollowup('child-settled-turn', {
+      ...completionAuditProof('child-settled-turn', 'worker'),
+      toolType: 'codex',
+      sessionId: parentContext.sessionId,
+      executionContext: parentContext,
+      queuedAtSubmit: true,
+    });
+    assert.equal(promptAuditAfterDone.confirmed, false);
+    assert.equal(promptAuditAfterDone.reason, 'source-followup-execution-context-turn-not-advanced');
+
+    const confirmation = await store.confirmSourceFollowup('child-settled-turn', {
+      kind: 'transcript',
+      sourceTabId: 'worker',
+      notificationPromptHash: 'hash-child-settled-turn',
+      sessionId: parentContext.sessionId,
+      toolType: 'codex',
+      executionContext: parentContext,
+      sameTurnComplete: true,
+      userUuid: 'queued-notification-user',
+    }, { now: 900 });
+    assert.equal(confirmation.confirmed, true);
+    assert.equal(confirmation.contextDisposition, 'same-settled-turn');
+    assert.ok((await store.get('child-settled-turn')).parentConsumedAt);
+    assert.equal((await store.get('parent-settled-turn')).status, 'completed');
+    assert.deepEqual(confirmation.settled.map((run) => run.runId), ['parent-settled-turn']);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
 test('parallel child notifications are consumed only by their own exact audits', async () => {
   const { store, cleanup } = await makeStore();
   try {
@@ -1931,7 +2165,6 @@ test('an orchestration-created target keeps auto-stop ownership when later runs 
       targetCreated: false,
     });
     assert.equal(reusedAfterRestart.targetCreatedByOrchestration, true);
-    await restored.flush();
   } finally {
     await cleanup();
   }
@@ -2052,6 +2285,160 @@ test('transcript reconciliation never completes from a partial assistant block',
     const run = await store.get('run-1');
     assert.notEqual(run.status, 'completed');
     assert.equal(run.ownCompletedAt, null);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('exact Codex turn_aborted proof cannot promote provider-error recovery to success', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-provider-error'));
+    await store.markDelivery('run-provider-error');
+    await store.applyLifecycle('target-1', { type: 'busy', busy: true });
+    await store.applyLifecycle('target-1', { type: 'done', reason: 'provider_error' });
+
+    const before = await store.get('run-provider-error');
+    assert.equal(before.status, 'waiting_recovery');
+    assert.equal(before.outcome, 'failed');
+
+    const result = await store.reconcile('run-provider-error', {
+      busy: false,
+      sessionId: 'session-1',
+      resultFound: true,
+      resultComplete: false,
+      resultAvailable: true,
+      resultTerminalEvent: 'turn_aborted',
+      turnIndex: 0,
+    });
+    assert.equal(result.completed, false);
+    const run = await store.get('run-provider-error');
+    assert.equal(run.status, 'waiting_recovery');
+    assert.equal(run.outcome, 'failed');
+    assert.equal(run.error, 'provider_error');
+    assert.equal(run.completionReason, 'provider_error');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('exact final text cannot silently overwrite provider-error recovery, but may repair unknown delivery', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-provider-final'));
+    await store.markDelivery('run-provider-final');
+    await store.applyLifecycle('target-1', { type: 'busy', busy: true });
+    await store.applyLifecycle('target-1', { type: 'done', reason: 'provider_error' });
+
+    const blocked = await store.reconcile('run-provider-final', {
+      busy: false,
+      sessionId: 'session-provider-final',
+      resultFound: true,
+      resultComplete: true,
+      resultAvailable: true,
+      resultTerminalEvent: 'task_complete',
+      resultTerminalReason: 'task_complete',
+      resultHasFinalResult: true,
+      turnIndex: 6,
+    });
+    assert.equal(blocked.completed, false);
+    assert.equal(blocked.ignored, true);
+    assert.equal(blocked.ignoreReason, 'recovery-requires-explicit-resolution');
+    const failed = await store.get('run-provider-final');
+    assert.equal(failed.status, 'waiting_recovery');
+    assert.equal(failed.outcome, 'failed');
+    assert.equal(failed.error, 'provider_error');
+    assert.equal(failed.completionReason, 'provider_error');
+
+    await store.create(baseRun('run-unknown-final', 'target-2'));
+    await store.markDelivery('run-unknown-final');
+    await store.beginRecovery(
+      'run-unknown-final',
+      'failed',
+      'delivery outcome is unknown; retry explicitly to avoid applying the prompt twice',
+    );
+    const repaired = await store.reconcile('run-unknown-final', {
+      busy: false,
+      sessionId: 'session-unknown-final',
+      resultFound: true,
+      resultComplete: true,
+      resultAvailable: true,
+      resultTerminalEvent: 'task_complete',
+      resultTerminalReason: 'task_complete',
+      resultHasFinalResult: true,
+      turnIndex: 8,
+    });
+    assert.equal(repaired.completed, true);
+    assert.equal((await store.get('run-unknown-final')).status, 'completed');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('exact Codex turn_aborted transcript repairs a missed lifecycle edge as interruption', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-missed-abort'));
+    await store.markDelivery('run-missed-abort');
+    await store.applyLifecycle('target-1', { type: 'busy', busy: true });
+
+    const result = await store.reconcile('run-missed-abort', {
+      busy: false,
+      sessionId: 'session-1',
+      resultFound: true,
+      resultComplete: false,
+      resultAvailable: true,
+      resultTerminalEvent: 'turn_aborted',
+      turnIndex: 4,
+    });
+    assert.equal(result.completed, false);
+    const run = await store.get('run-missed-abort');
+    assert.equal(run.status, 'waiting_recovery');
+    assert.equal(run.outcome, 'interrupted');
+    assert.equal(run.error, 'turn_aborted');
+    assert.equal(run.resultAvailable, true);
+    assert.equal(run.resultTurnIndex, 4);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('Codex task_complete without a final result is recovery, never success', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-no-final'));
+    await store.markDelivery('run-no-final');
+    await store.applyLifecycle('target-1', { type: 'busy', busy: true });
+
+    const live = await store.applyLifecycle('target-1', {
+      type: 'done',
+      reason: 'codex-no-final-result',
+    });
+    assert.equal(live.completed.length, 0);
+    let run = await store.get('run-no-final');
+    assert.equal(run.status, 'waiting_recovery');
+    assert.equal(run.outcome, 'failed');
+
+    const reconciled = await store.reconcile('run-no-final', {
+      busy: false,
+      sessionId: 'session-1',
+      resultFound: true,
+      resultComplete: false,
+      resultAvailable: true,
+      resultTerminalEvent: 'task_complete',
+      resultTerminalReason: 'codex-no-final-result',
+      resultHasFinalResult: false,
+      turnIndex: 0,
+    });
+    assert.equal(reconciled.completed, false);
+    run = await store.get('run-no-final');
+    assert.equal(run.status, 'waiting_recovery');
+    assert.equal(run.outcome, 'failed');
+    assert.equal(run.error, 'codex-no-final-result');
   } finally {
     await store.flush();
     await cleanup();
@@ -2598,6 +2985,54 @@ test('unavailable result still delivers one explicit failure when its source is 
   }
 });
 
+test('restart reconciliation terminalizes an exact no-final-result proof instead of leaving a ghost', async () => {
+  const { store, filePath, cleanup } = await makeStore();
+  let restored = null;
+  try {
+    await store.create(baseRun('run-no-final-proof', 'target-no-final'));
+    await store.markDelivery('run-no-final-proof');
+    await store.applyLifecycle('target-no-final', { type: 'busy', busy: true });
+    await store.applyLifecycle('target-no-final', { type: 'done', reason: 'task_complete' });
+    await store.patch('run-no-final-proof', {
+      resultComplete: false,
+      resultProofStatus: 'awaiting-transcript',
+    });
+    await store.flush();
+
+    restored = new OrchestrationRunStore(filePath);
+    const resolution = await restored.markResultProofTerminalFailure(
+      'run-no-final-proof',
+      'codex-no-final-result',
+      {
+        now: 500,
+        resultAvailable: true,
+        turnIndex: 4,
+        userUuid: 'user-no-final',
+      },
+    );
+    assert.equal(resolution.resolved, true);
+    assert.equal(resolution.run.status, 'failed');
+    assert.equal(resolution.run.outcome, 'failed');
+    assert.equal(resolution.run.error, 'codex-no-final-result');
+    assert.equal(resolution.run.resultProofStatus, 'failed');
+    assert.equal(resolution.run.resultComplete, false);
+    assert.equal(resolution.run.resultAvailable, true);
+    assert.equal(resolution.run.resultTurnIndex, 4);
+    assert.equal(resolution.run.resultUserUuid, 'user-no-final');
+    assert.equal(resolution.run.notificationStatus, 'pending');
+    assert.equal(resolution.run.sourceFollowupPending, true);
+    assert.deepEqual(orchestrationInstallBlockers(resolution.run).map((loader) => [
+      loader.tabId,
+      loader.role,
+      loader.status,
+    ]), [['source-1', 'source', 'completion-handoff']]);
+  } finally {
+    if (restored) await restored.flush();
+    await store.flush();
+    await cleanup();
+  }
+});
+
 test('completed newer target work permanently invalidates an older auto-stop', () => {
   const scheduled = {
     runId: 'run-a',
@@ -2722,6 +3157,7 @@ test('automatic restore before the deadline does not cancel the future auto-stop
     assert.equal(run.autoStopStatus, 'scheduled');
     assert.equal(run.autoStopFinishedAt, undefined);
   } finally {
+    await store.flush();
     await cleanup();
   }
 });

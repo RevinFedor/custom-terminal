@@ -32,10 +32,14 @@ const {
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
   projectCodexWriterProofKind,
+  hasCodexWriterHandoffActionBoundary,
+  normalizeCodexPositiveRunSeq,
   shouldUseSettledCodexRewindWriterProof,
   selectCodexDelayedStableSourceWriter,
+  selectCodexDelayedWriterWatchTargets,
   selectCodexResumedSubmitWriter,
   selectCodexNativeRewindWriter,
+  selectCodexNativeRewindSourceIncumbent,
   selectCodexSettledRewindWriter,
   isCodexWriterProofOwnershipQuarantined,
   isCodexResumeSourceAuditPending,
@@ -939,6 +943,14 @@ test('settled native Rewind proof resolves source plus exact child only while ev
 });
 
 test('settled Rewind writer remains authoritative only before the next durable handoff boundary', () => {
+  for (const empty of [null, undefined, '', 0, -1, Number.NaN]) {
+    assert.equal(
+      hasCodexWriterHandoffActionBoundary(empty),
+      false,
+      String(empty),
+    );
+  }
+  assert.equal(hasCodexWriterHandoffActionBoundary(1_724_000_000_000), true);
   assert.equal(shouldUseSettledCodexRewindWriterProof({
     sourceMode: 'writer-handoff',
     handoffActionStartedAtMs: null,
@@ -954,7 +966,7 @@ test('settled Rewind writer remains authoritative only before the next durable h
   assert.equal(shouldUseSettledCodexRewindWriterProof({
     sourceMode: 'writer-handoff',
     handoffActionStartedAtMs: 0,
-  }), false);
+  }), true, 'zero is an unset/invalid timestamp, not a durable action boundary');
   assert.equal(shouldUseSettledCodexRewindWriterProof({
     sourceMode: 'writer-handoff',
     handoffActionStartedAtMs: 1_724_000_000_000,
@@ -1195,6 +1207,40 @@ test('delayed stable-source writer requires one exact post-Enter audit on the cu
   );
   assert.equal(twoMatches.status, 'unresolved');
   assert.equal(twoMatches.reason, 'multiple-delayed-audit-writers');
+});
+
+test('delayed stable-source watch targets stay inside the exact sessions root and cwd', () => {
+  const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-delayed-watch-'));
+  const cwd = path.join(sessionsDir, 'workspace');
+  const sourcePath = path.join(sessionsDir, 'source.jsonl');
+  const childPath = path.join(sessionsDir, 'child.jsonl');
+  const outsidePath = path.join(os.tmpdir(), 'outside-delayed-child.jsonl');
+  fs.writeFileSync(sourcePath, '');
+  fs.writeFileSync(childPath, '');
+  const candidates = [
+    { filePath: sourcePath, meta: { id: 'source', cwd } },
+    { filePath: childPath, meta: { id: 'child', cwd } },
+    { filePath: childPath, meta: { id: 'child-duplicate', cwd } },
+    {
+      filePath: path.join(sessionsDir, 'wrong-cwd.jsonl'),
+      meta: { id: 'wrong-cwd', cwd: '/other' },
+    },
+    { filePath: outsidePath, meta: { id: 'outside', cwd } },
+    {
+      filePath: path.join(sessionsDir, 'not-jsonl.txt'),
+      meta: { id: 'wrong-extension', cwd },
+    },
+  ];
+  assert.deepEqual(selectCodexDelayedWriterWatchTargets(candidates, {
+    sourceSessionId: 'source',
+    cwd,
+    sessionsDir,
+  }), [{ sessionId: 'child', filePath: fs.realpathSync(childPath) }]);
+  assert.deepEqual(selectCodexDelayedWriterWatchTargets(candidates, {
+    sourceSessionId: null,
+    cwd,
+    sessionsDir,
+  }), []);
 });
 
 test('a queued observer accepts only the exact already-committed native Rewind transaction', () => {
@@ -1590,6 +1636,97 @@ test('public revalidation preserves the distinct no-lineage Rewind proof kinds',
   assert.equal(projectCodexWriterProofKind({}), 'process-open-rollout');
 });
 
+test('writer proof run sequence keeps only explicit positive generations', () => {
+  assert.equal(normalizeCodexPositiveRunSeq(null), null);
+  assert.equal(normalizeCodexPositiveRunSeq(undefined), null);
+  assert.equal(normalizeCodexPositiveRunSeq(''), null);
+  assert.equal(normalizeCodexPositiveRunSeq(0), null);
+  assert.equal(normalizeCodexPositiveRunSeq(-1), null);
+  assert.equal(normalizeCodexPositiveRunSeq(1), 1);
+  assert.equal(normalizeCodexPositiveRunSeq('7'), 7);
+});
+
+test('first native Rewind preserves only the exact source as a read-only incumbent', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sourceA = sessionsDir + '/rollout-a.jsonl';
+  const siblingD = sessionsDir + '/rollout-d.jsonl';
+  const terminalToken = {};
+  const sourceIncumbent = {
+    kind: 'native-rewind-source-incumbent',
+    valid: true,
+    sessionId: 'a',
+    filePath: sourceA,
+    actionGeneration: 'rewind-a-b',
+    observerGeneration: 'rewind-a-b',
+    terminalToken,
+    observerTerminalToken: terminalToken,
+    lifecycleGeneration: 'pty-g1',
+    observerLifecycleGeneration: 'pty-g1',
+    runSeq: 1,
+    observerRunSeq: 1,
+    expectedBindingSessionId: 'a',
+    boundSessionId: 'a',
+    actionAuthorityId: 'authority-a-b',
+    incumbentOnly: true,
+  };
+  const candidateA = {
+    filePath: sourceA,
+    metadata: { meta: { id: 'a', source: 'cli' } },
+  };
+  assert.equal(
+    selectCodexNativeRewindSourceIncumbent([candidateA], sourceIncumbent).status,
+    'selected',
+  );
+  for (const [field, value, reason] of [
+    ['observerTerminalToken', {}, 'stale-source-incumbent-terminal'],
+    ['observerLifecycleGeneration', 'pty-g2', 'stale-source-incumbent-lifecycle'],
+    ['observerRunSeq', 2, 'stale-source-incumbent-run'],
+    ['boundSessionId', 'foreign', 'source-incumbent-binding-mismatch'],
+    ['filePath', sessionsDir + '/other-a.jsonl', 'source-incumbent-candidate-missing'],
+  ]) {
+    assert.equal(
+      selectCodexNativeRewindSourceIncumbent(
+        [candidateA],
+        { ...sourceIncumbent, [field]: value },
+      ).reason,
+      reason,
+      field,
+    );
+  }
+
+  const handoff = {
+    kind: 'native-rewind',
+    sourceSessionId: 'a',
+    actionGeneration: 'rewind-a-b',
+    observerGeneration: 'rewind-a-b',
+    actionStartedAtMs: 32_000,
+    liveProofs: [],
+  };
+  const metadata = new Map([
+    [sourceA, { meta: { id: 'a', source: 'cli' } }],
+    [siblingD, { meta: { id: 'd', forked_from_id: 'a', source: 'cli' } }],
+  ]);
+  const resolve = async (output) => resolveCodexUserWriterProof(
+    resolveCodexWriterProof([{ pid: 100, output }], sessionsDir),
+    {
+      readMetadata: async (filePath) => metadata.get(filePath),
+      isUserSession: () => true,
+      handoff,
+      sourceIncumbent,
+    },
+  );
+  const sourceOnly = await resolve(`p100\nf20\nau\nn${sourceA}\n`);
+  assert.equal(sourceOnly.status, 'incumbent-overlap-pending');
+  assert.equal(sourceOnly.incumbentWriterProof.lineageRelation, 'source-incumbent');
+  assert.equal(sourceOnly.handoffProof.reason, 'no-proven-descendant');
+
+  const withSibling = await resolve(
+    `p100\nf20\nau\nn${sourceA}\nf21\nau\nn${siblingD}\n`,
+  );
+  assert.equal(withSibling.status, 'ambiguous');
+  assert.equal(withSibling.incumbentWriterProof, undefined);
+});
+
 test('active native Rewind B to C ignores settled B and selects exact live child C', async () => {
   const sessionsDir = '/Users/fedor/.codex/sessions';
   const sourceA = sessionsDir + '/rollout-a.jsonl';
@@ -1642,6 +1779,108 @@ test('active native Rewind B to C ignores settled B and selects exact live child
   assert.equal(proof.filePath, childC);
   assert.equal(proof.handoffProof.sessionId, 'c');
   assert.equal(proof.settledWriterProof, undefined);
+});
+
+test('active native Rewind preserves the exact incumbent read-only while its successor is pending', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sourceA = sessionsDir + '/rollout-a.jsonl';
+  const settledB = sessionsDir + '/rollout-b.jsonl';
+  const terminalToken = {};
+  const metadata = new Map([
+    [sourceA, { meta: { id: 'a', source: 'cli' } }],
+    [settledB, { meta: { id: 'b', forked_from_id: 'a', source: 'cli' } }],
+  ]);
+  const settledWriter = {
+    kind: 'native-rewind-settled-writer',
+    valid: true,
+    sessionId: 'b',
+    filePath: settledB,
+    sourceSessionId: 'a',
+    actionGeneration: 'rewind-a-b',
+    observerGeneration: 'rewind-a-b',
+    terminalToken,
+    observerTerminalToken: terminalToken,
+    runSeq: 31,
+    observerRunSeq: 31,
+    boundSessionId: 'b',
+    incumbentOnly: true,
+  };
+  const handoff = {
+    kind: 'native-rewind',
+    sourceSessionId: 'b',
+    actionGeneration: 'rewind-b-c',
+    observerGeneration: 'rewind-b-c',
+    actionStartedAtMs: 32_000,
+    liveProofs: [],
+  };
+  const resolve = async (output) => resolveCodexUserWriterProof(
+    resolveCodexWriterProof([{ pid: 100, output }], sessionsDir),
+    {
+      readMetadata: async (filePath) => metadata.get(filePath),
+      isUserSession: () => true,
+      settledWriter,
+      handoff,
+    },
+  );
+
+  const withAncestor = await resolve(
+    `p100\nf20\nau\nn${sourceA}\nf21\nau\nn${settledB}\n`,
+  );
+  assert.equal(withAncestor.status, 'incumbent-overlap-pending');
+  assert.equal(withAncestor.reason, 'active-handoff-awaiting-successor');
+  assert.equal(withAncestor.incumbentWriterProof.sessionId, 'b');
+  assert.equal(withAncestor.handoffProof.reason, 'no-proven-descendant');
+
+  const incumbentOnly = await resolve(`p100\nf21\nau\nn${settledB}\n`);
+  assert.equal(incumbentOnly.status, 'incumbent-overlap-pending');
+  assert.equal(incumbentOnly.incumbentWriterProof.sessionId, 'b');
+});
+
+test('active native Rewind does not preserve an incumbent across a sibling writer', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sourceA = sessionsDir + '/rollout-a.jsonl';
+  const settledB = sessionsDir + '/rollout-b.jsonl';
+  const siblingD = sessionsDir + '/rollout-d.jsonl';
+  const terminalToken = {};
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 100,
+    output: `p100\nf20\nau\nn${sourceA}\nf21\nau\nn${settledB}\nf22\nau\nn${siblingD}\n`,
+  }], sessionsDir);
+  const metadata = new Map([
+    [sourceA, { meta: { id: 'a', source: 'cli' } }],
+    [settledB, { meta: { id: 'b', forked_from_id: 'a', source: 'cli' } }],
+    [siblingD, { meta: { id: 'd', forked_from_id: 'a', source: 'cli' } }],
+  ]);
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: async (filePath) => metadata.get(filePath),
+    isUserSession: () => true,
+    settledWriter: {
+      kind: 'native-rewind-settled-writer',
+      valid: true,
+      sessionId: 'b',
+      filePath: settledB,
+      sourceSessionId: 'a',
+      actionGeneration: 'rewind-a-b',
+      observerGeneration: 'rewind-a-b',
+      terminalToken,
+      observerTerminalToken: terminalToken,
+      runSeq: 31,
+      observerRunSeq: 31,
+      boundSessionId: 'b',
+      incumbentOnly: true,
+    },
+    handoff: {
+      kind: 'native-rewind',
+      sourceSessionId: 'b',
+      actionGeneration: 'rewind-b-c',
+      observerGeneration: 'rewind-b-c',
+      actionStartedAtMs: 32_000,
+      liveProofs: [],
+    },
+  });
+
+  assert.equal(proof.status, 'ambiguous');
+  assert.equal(proof.incumbentWriterProof, undefined);
 });
 
 test('branch handoff settles only when the adopted writer matches the exact proven generation', () => {

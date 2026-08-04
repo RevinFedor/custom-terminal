@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 
 const {
   classifyCodexMcpStartupBlockerHandling,
+  decideCodexLateMcpCommittedFrame,
+  decideClaimedCodexMcpReplacementHandoff,
   decideCodexMcpReplacementHandoff,
   decideCodexMcpStoppedGenerationSettlement,
   decideCodexMcpStartupDeadline,
@@ -11,9 +13,12 @@ const {
   hasCodexComposerPromptGlyph,
   inspectCodexInputReadyTextCore,
   isCodexMcpRestartSignalSafe,
+  parseCodexVerifiedComposerFooter,
   selectCodexCurrentInteractiveFrameText,
   shouldLaunchCodexMcpReplacement,
+  shouldSuppressCodexMcpWatchdogArmForReplacementHandoff,
   stripLeadingCodexComposerPromptGlyph,
+  validateCodexLateMcpRecoveryIdentity,
 } = require('./codex-tui-readiness');
 
 const readyFrame = (glyph) => [
@@ -41,6 +46,48 @@ test('keeps ASCII composer fallback without treating it as a semantic draft mark
   });
   assert.equal(inspected.ready, true);
   assert.equal(hasCodexComposerPromptGlyph(readyFrame('>')), false);
+});
+
+test('recognizes the fresh-conversation cwd footer without depending on placeholder prose', () => {
+  const frame = [
+    '› Write tests for @filename',
+    'gpt-5.6-luna medium fast · /private/tmp/nested-workspace…',
+  ].join('\n');
+  const inspected = inspectCodexInputReadyTextCore(frame, '', {
+    requireSyncMarker: false,
+    source: 'headless-main',
+  });
+  assert.equal(inspected.ready, true);
+  assert.equal(inspected.hasPromptGlyph, true);
+  assert.deepEqual(parseCodexVerifiedComposerFooter(frame), {
+    model: 'gpt-5.6-luna',
+    effort: 'medium',
+    fast: true,
+    proof: 'verified-composer-footer',
+  });
+});
+
+test('cwd footer is not readiness proof without the current composer prompt', () => {
+  const inspected = inspectCodexInputReadyTextCore(
+    'gpt-5.6-luna medium fast · /private/tmp/old-scrollback',
+    '',
+    { requireSyncMarker: false },
+  );
+  assert.equal(inspected.ready, false);
+  assert.equal(inspected.reason, 'no-composer-frame');
+});
+
+test('current startup blocker still wins over a cwd composer footer', () => {
+  const inspected = inspectCodexInputReadyTextCore([
+    'Starting MCP servers (1/2)',
+    '› Write tests for @filename',
+    'gpt-5.6-luna medium fast · /private/tmp/nested-workspace',
+  ].join('\n'), '', {
+    requireSyncMarker: false,
+    blockers: ['mcp-startup'],
+  });
+  assert.equal(inspected.ready, false);
+  assert.equal(inspected.reason, 'blocked:mcp-startup');
 });
 
 test('finds the latest supported composer marker', () => {
@@ -91,6 +138,108 @@ test('historical raw MCP blocker can still be ignored outside the startup lifecy
     ignore: true,
     reason: 'already-ready',
   });
+});
+
+test('late MCP raw hint resolves only on its exact committed current frame', () => {
+  assert.deepEqual(decideCodexLateMcpCommittedFrame({
+    identityCurrent: true,
+    candidateWriteSeq: null,
+    committedWriteSeq: 8,
+    authoritativeFrameCommitted: true,
+    inspected: { ready: true, blockers: [] },
+  }), { action: 'wait', reason: 'candidate-frame-not-committed' });
+  assert.deepEqual(decideCodexLateMcpCommittedFrame({
+    identityCurrent: true,
+    candidateWriteSeq: 8,
+    committedWriteSeq: null,
+    authoritativeFrameCommitted: true,
+    inspected: { ready: true, blockers: [] },
+  }), { action: 'wait', reason: 'candidate-frame-not-committed' });
+  assert.deepEqual(decideCodexLateMcpCommittedFrame({
+    identityCurrent: false,
+    candidateWriteSeq: 12,
+    committedWriteSeq: 12,
+    authoritativeFrameCommitted: true,
+    inspected: { ready: false, blockers: ['mcp-startup'] },
+  }), {
+    action: 'cancel',
+    reason: 'lifecycle-changed',
+  });
+  assert.deepEqual(decideCodexLateMcpCommittedFrame({
+    identityCurrent: true,
+    candidateWriteSeq: 12,
+    committedWriteSeq: 11,
+    authoritativeFrameCommitted: true,
+    inspected: { ready: false, blockers: ['mcp-startup'] },
+  }), {
+    action: 'wait',
+    reason: 'candidate-frame-not-committed',
+  });
+  assert.deepEqual(decideCodexLateMcpCommittedFrame({
+    identityCurrent: true,
+    candidateWriteSeq: 12,
+    committedWriteSeq: 12,
+    authoritativeFrameCommitted: true,
+    inspected: { ready: false, blockers: ['mcp-startup'] },
+  }), {
+    action: 'block',
+    reason: 'current-blocker:mcp-startup',
+  });
+  assert.deepEqual(decideCodexLateMcpCommittedFrame({
+    identityCurrent: true,
+    candidateWriteSeq: 12,
+    committedWriteSeq: 13,
+    authoritativeFrameCommitted: true,
+    inspected: { ready: true, blockers: [] },
+  }), {
+    action: 'clear',
+    reason: 'current-composer-ready',
+  });
+});
+
+test('late MCP recovery authority belongs to one exact launch and input generation', () => {
+  const terminal = {};
+  const base = {
+    expectedTerminal: terminal,
+    currentTerminal: terminal,
+    expectedTerminalGeneration: 'terminal-a:3',
+    currentTerminalGeneration: 'terminal-a:3',
+    expectedRunSeq: 7,
+    currentRunSeq: 7,
+    expectedInputRevision: 4,
+    currentInputRevision: 4,
+    expectedLaunchId: 'launch-7',
+    currentLaunchId: 'launch-7',
+  };
+  assert.deepEqual(validateCodexLateMcpRecoveryIdentity(base), {
+    valid: true,
+    reason: 'exact-late-mcp-recovery-generation',
+  });
+  assert.equal(validateCodexLateMcpRecoveryIdentity({
+    ...base,
+    currentInputRevision: 5,
+  }).reason, 'terminal-input-changed');
+  assert.equal(validateCodexLateMcpRecoveryIdentity({
+    ...base,
+    currentRunSeq: 8,
+  }).reason, 'terminal-run-changed');
+  assert.equal(validateCodexLateMcpRecoveryIdentity({
+    ...base,
+    currentLaunchId: 'launch-8',
+  }).reason, 'launch-generation-changed');
+  assert.equal(validateCodexLateMcpRecoveryIdentity({
+    ...base,
+    currentProcessRunning: false,
+  }).reason, 'terminal-process-stopped');
+  assert.equal(validateCodexLateMcpRecoveryIdentity({
+    ...base,
+    currentStopping: true,
+  }).reason, 'terminal-stopping');
+  assert.equal(validateCodexLateMcpRecoveryIdentity({
+    ...base,
+    expectedRunSeq: 0,
+    currentRunSeq: 0,
+  }).reason, 'terminal-run-changed');
 });
 
 test('MCP watchdog only restarts from current positive blocker evidence', () => {
@@ -301,6 +450,74 @@ test('MCP replacement inherits only the exact stopped launch generation', () => 
     ...base,
     watchdogSuperseded: true,
   }).reason, 'watchdog-generation-changed');
+});
+
+test('claimed MCP replacement advances from the stopped generation to one exact new generation', () => {
+  const base = {
+    sameTerminal: true,
+    expectedTerminalGeneration: 'terminal-a:5',
+    currentTerminalGeneration: 'terminal-a:5',
+    previousRunSeq: 4,
+    expectedRunSeq: 5,
+    currentRunSeq: 5,
+    expectedInputRevision: 9,
+    currentInputRevision: 9,
+    expectedLaunchId: 'launch-new',
+    currentLaunchId: 'launch-new',
+    processStatus: 'absent',
+    replacementInputBarrierOwned: true,
+  };
+  assert.deepEqual(decideClaimedCodexMcpReplacementHandoff(base), {
+    allowed: true,
+    reason: 'exact-claimed-replacement-handoff',
+  });
+  assert.equal(decideClaimedCodexMcpReplacementHandoff({
+    ...base,
+    expectedTerminalGeneration: 'terminal-a:4',
+  }).reason, 'terminal-generation-changed');
+  assert.equal(decideClaimedCodexMcpReplacementHandoff({
+    ...base,
+    expectedRunSeq: 6,
+    currentRunSeq: 6,
+  }).reason, 'replacement-run-transition-invalid');
+  assert.equal(decideClaimedCodexMcpReplacementHandoff({
+    ...base,
+    currentRunSeq: 6,
+  }).reason, 'terminal-run-changed');
+  assert.equal(decideClaimedCodexMcpReplacementHandoff({
+    ...base,
+    currentInputRevision: 10,
+  }).reason, 'terminal-input-changed');
+  assert.equal(decideClaimedCodexMcpReplacementHandoff({
+    ...base,
+    currentLaunchId: 'manual-launch',
+  }).reason, 'launch-generation-changed');
+  assert.equal(decideClaimedCodexMcpReplacementHandoff({
+    ...base,
+    processStatus: 'found',
+  }).reason, 'replacement-process-already-present');
+  assert.equal(decideClaimedCodexMcpReplacementHandoff({
+    ...base,
+    replacementInputBarrierOwned: false,
+  }).reason, 'replacement-input-barrier-changed');
+});
+
+test('an owned Stop-to-replacement handoff suppresses residual watchdog generations only until write', () => {
+  for (const handoffPhase of ['stopping', 'stopped', 'claiming', 'claimed']) {
+    assert.equal(shouldSuppressCodexMcpWatchdogArmForReplacementHandoff({
+      handoffOwned: true,
+      handoffPhase,
+    }), true, handoffPhase);
+  }
+  assert.equal(shouldSuppressCodexMcpWatchdogArmForReplacementHandoff({
+    handoffOwned: false,
+    handoffPhase: 'stopped',
+  }), false);
+  assert.equal(shouldSuppressCodexMcpWatchdogArmForReplacementHandoff({
+    handoffOwned: true,
+    handoffPhase: 'released',
+  }), false);
+  assert.equal(shouldSuppressCodexMcpWatchdogArmForReplacementHandoff(), false);
 });
 
 test('a stopped watchdog generation settles from its exact stop proof when refresh is unknown', () => {

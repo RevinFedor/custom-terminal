@@ -27,6 +27,10 @@ export function buildExactDraftCaptureProof(proof) {
     inputRevision: proof?.inputRevision,
     terminalLifecycleGeneration: proof?.terminalLifecycleGeneration,
     mirrorGeneration: proof?.mirrorGeneration,
+    mirrorWriteSeq: proof?.mirrorWriteSeq,
+    mirrorFlushedSeq: proof?.mirrorFlushedSeq,
+    mirrorSynchronizedOutputOpen: proof?.mirrorSynchronizedOutputOpen,
+    synchronizedOutputGeneration: proof?.synchronizedOutputGeneration,
   };
 }
 

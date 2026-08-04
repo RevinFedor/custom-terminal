@@ -118,10 +118,15 @@ test('only explicit send boundaries may restore a closed agent tab', () => {
   );
 
   assert.doesNotMatch(dispatcher, /ensureExplicitAgentTabOpen/);
-  assert.match(sendRoute, /ensureExplicitAgentTabOpen\(tabId\)/);
+  assert.match(
+    sendRoute,
+    /prepareSend:\s*\(\) => ensureExplicitAgentTabOpen\(tabId, restorable\)/,
+    'direct send must restore only inside the physical send attempt',
+  );
   assert.ok(
-    sendRoute.indexOf('ensureExplicitAgentTabOpen(tabId)') < sendRoute.indexOf('runAgentSendScenario({'),
-    'direct send restores before entering the shared launch-and-send scenario',
+    sendRoute.indexOf('runAgentSendScenario({')
+      < sendRoute.indexOf('prepareSend: () => ensureExplicitAgentTabOpen(tabId, restorable)'),
+    'an idempotent receipt replay must be resolved before any closed-tab restore side effect',
   );
 });
 

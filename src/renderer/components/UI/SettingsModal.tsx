@@ -1531,6 +1531,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setSemanticAutoIndexTitles = useUIStore((s) => s.setSemanticAutoIndexTitles);
   const semanticAutoIndexIterations = useUIStore((s) => s.semanticAutoIndexIterations);
   const setSemanticAutoIndexIterations = useUIStore((s) => s.setSemanticAutoIndexIterations);
+  const newTabPrimarySurface = useUIStore((s) => s.newTabPrimarySurface);
+  const setNewTabPrimarySurface = useUIStore((s) => s.setNewTabPrimarySurface);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
   const setClaudeCodeSettings = useUIStore((s) => s.setClaudeCodeSettings);
   const defaultClaudeEffort = useUIStore((s) => s.defaultClaudeEffort);
@@ -4162,6 +4164,38 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <div style={{ fontSize: '11px', color: '#666', marginTop: '8px', lineHeight: 1.5 }}>
                   Применяется к следующему запуску из ProjectToolbar (иконка с числом).
                   Текущий выполняющийся ребилд не прерывается.
+                </div>
+              </div>
+
+              <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
+                <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '8px', textTransform: 'uppercase' }}>
+                  Режим новых вкладок
+                </div>
+                <div style={{ fontSize: '12px', color: '#999', lineHeight: 1.5, marginBottom: 12 }}>
+                  В каком виде открывается центр новой AI-вкладки: транскрипт (History) или терминал. Уже открытые вкладки не меняются — у каждой свой режим, кнопка Reverse переключает его для конкретной вкладки.
+                </div>
+                <div style={{ display: 'inline-flex', gap: 3, padding: 3, borderRadius: 8, border: '1px solid #333', background: '#181818' }}>
+                  {(['history', 'terminal'] as const).map((surface) => {
+                    const active = newTabPrimarySurface === surface;
+                    return (
+                      <button
+                        key={surface}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => setNewTabPrimarySurface(surface)}
+                        style={{
+                          ...vrSmallBtnStyle(active ? 'accent' : 'neutral'),
+                          height: 26,
+                          minWidth: 78,
+                          borderColor: active ? '#3b82f6' : 'transparent',
+                          background: active ? 'rgba(59,130,246,0.22)' : 'transparent',
+                          color: active ? '#dbeafe' : '#8a8a8f',
+                        }}
+                      >
+                        {surface === 'history' ? 'History' : 'Terminal'}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             </>

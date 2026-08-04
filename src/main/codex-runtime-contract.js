@@ -431,11 +431,20 @@ function createCodexPtySubmitAdmission({
   hasLiveCodexEvidence = false,
   runSeq = 0,
   stopping = false,
+  inputReadinessProofPending = false,
   inputRevision = null,
 } = {}) {
   const revision = inputRevision === null
     ? {}
     : { inputRevision: Number(inputRevision) };
+  if (inputReadinessProofPending === true) {
+    return {
+      available: false,
+      reason: 'codex_input_readiness_proof_pending',
+      runSeq: Number(runSeq) || 0,
+      ...revision,
+    };
+  }
   if (stopping === true) {
     return {
       available: false,
@@ -621,6 +630,69 @@ function isCodexSettingsApplicationProven(result) {
     || (result.applied === true
       && !!(result.applicationProofSource || result.configProofSource))
   );
+}
+
+/**
+ * Keep only the identity needed to attribute a late-painted startup card to the
+ * exact Codex launch. The full launch payload has watchdog/startup semantics
+ * and is intentionally disposable as soon as the composer becomes ready; this
+ * receipt survives that cleanup but contains no requested settings that could
+ * be mistaken for observed settings.
+ */
+function createCodexLaunchSettingsObservationCandidate({
+  launchId = null,
+  terminalToken = null,
+  runSeq = 0,
+  terminalLifecycleGeneration = null,
+  createdAt = Date.now(),
+} = {}) {
+  const normalizedLaunchId = typeof launchId === 'string' ? launchId.trim() : '';
+  const normalizedRunSeq = Number(runSeq);
+  const normalizedLifecycleGeneration = String(terminalLifecycleGeneration || '').trim();
+  const normalizedCreatedAt = Number(createdAt);
+  if (!normalizedLaunchId
+    || !terminalToken
+    || !Number.isInteger(normalizedRunSeq)
+    || normalizedRunSeq <= 0
+    || !normalizedLifecycleGeneration
+    || !Number.isFinite(normalizedCreatedAt)
+    || normalizedCreatedAt <= 0) {
+    return null;
+  }
+  return {
+    launchId: normalizedLaunchId,
+    terminalToken,
+    runSeq: normalizedRunSeq,
+    terminalLifecycleGeneration: normalizedLifecycleGeneration,
+    createdAt: normalizedCreatedAt,
+  };
+}
+
+function validateCodexLaunchSettingsObservationCandidate(candidate, {
+  launchId = null,
+  terminalToken = null,
+  runSeq = 0,
+  terminalLifecycleGeneration = null,
+  writerPresent = false,
+} = {}) {
+  if (!candidate) return { valid: false, reason: 'candidate-missing' };
+  const expectedLaunchId = typeof launchId === 'string' ? launchId.trim() : '';
+  const currentLifecycleGeneration = String(terminalLifecycleGeneration || '').trim();
+  if (writerPresent === true) return { valid: false, reason: 'writer-already-present' };
+  if (expectedLaunchId && candidate.launchId !== expectedLaunchId) {
+    return { valid: false, reason: 'launch-generation-changed' };
+  }
+  if (!terminalToken || candidate.terminalToken !== terminalToken) {
+    return { valid: false, reason: 'terminal-generation-changed' };
+  }
+  if (Number(candidate.runSeq) !== Number(runSeq)) {
+    return { valid: false, reason: 'process-generation-changed' };
+  }
+  if (!currentLifecycleGeneration
+    || candidate.terminalLifecycleGeneration !== currentLifecycleGeneration) {
+    return { valid: false, reason: 'terminal-lifecycle-changed' };
+  }
+  return { valid: true, reason: 'exact-launch-generation', candidate };
 }
 
 /**
@@ -963,6 +1035,8 @@ function projectCodexRuntimeStatus({
   stopping = false,
   busy = false,
   inputReady = false,
+  composerEstablished = false,
+  inputProofPending = false,
   writerUsableForMutation = false,
   writerUiLifecycleEstablished = false,
   hasEstablishedLifecycle = false,
@@ -970,6 +1044,10 @@ function projectCodexRuntimeStatus({
   if (liveLifecycle === false) return 'inactive';
   if (stopping) return 'stopping';
   if (busy) return 'busy';
+  // A short exact proof gate may temporarily close writes after a composer was
+  // already established. It is not a new process launch: keep the visible
+  // lifecycle active while input/action admission remains false.
+  if (inputProofPending === true && composerEstablished === true) return 'active';
   // Readiness and transcript identity are separate axes. A fresh Codex run has
   // no rollout/session id until its first user message, but once the current
   // PTY generation has a real composer it is no longer "starting". Identity-
@@ -982,11 +1060,79 @@ function projectCodexRuntimeStatus({
   return 'unknown';
 }
 
+function projectCodexHistoryActionAvailability({
+  liveLifecycle = null,
+  savedSessionId = null,
+  inputReady = false,
+  busy = false,
+  stopping = false,
+  promptOrTurnInFlight = false,
+  writerUsableForMutation = false,
+  provisionalResumeAvailable = false,
+} = {}) {
+  const hasSavedHistory = typeof savedSessionId === 'string' && savedSessionId.trim().length > 0;
+  if (liveLifecycle === false) {
+    const allowed = hasSavedHistory;
+    return {
+      canNativeRewind: allowed,
+      canRewriteHistory: allowed,
+      canDeleteHistory: allowed,
+      reason: allowed ? null : 'history-session-missing',
+    };
+  }
+  if (liveLifecycle !== true) {
+    return {
+      canNativeRewind: false,
+      canRewriteHistory: false,
+      canDeleteHistory: false,
+      reason: 'runtime-identity-unknown',
+    };
+  }
+  if (stopping) {
+    return {
+      canNativeRewind: false,
+      canRewriteHistory: false,
+      canDeleteHistory: false,
+      reason: 'process-stopping',
+    };
+  }
+  if (busy || promptOrTurnInFlight) {
+    return {
+      canNativeRewind: false,
+      canRewriteHistory: false,
+      canDeleteHistory: false,
+      reason: promptOrTurnInFlight ? 'submit-or-turn-in-flight' : 'turn-busy',
+    };
+  }
+  if (!inputReady) {
+    return {
+      canNativeRewind: false,
+      canRewriteHistory: false,
+      canDeleteHistory: false,
+      reason: 'composer-not-ready',
+    };
+  }
+  const confirmedWriter = writerUsableForMutation === true;
+  const exactIdleResume = provisionalResumeAvailable === true;
+  return {
+    canNativeRewind: confirmedWriter || exactIdleResume,
+    canRewriteHistory: confirmedWriter,
+    canDeleteHistory: confirmedWriter,
+    reason: confirmedWriter
+      ? null
+      : exactIdleResume
+        ? 'provisional-resume-rewind-only'
+        : 'writer-not-mutation-safe',
+  };
+}
+
 function projectCodexPublicRuntimeProjection({
   liveLifecycle = null,
   stopping = false,
   turnBusy = false,
   tuiInputReady = false,
+  tuiLifecycleEstablished = false,
+  inputProofPending = false,
   writerUsableForMutation = false,
   writerUiLifecycleEstablished = false,
   hasEstablishedLifecycle = true,
@@ -1000,6 +1146,8 @@ function projectCodexPublicRuntimeProjection({
     stopping,
     busy: turnBusy,
     inputReady,
+    composerEstablished: tuiLifecycleEstablished,
+    inputProofPending,
     writerUsableForMutation,
     writerUiLifecycleEstablished,
     hasEstablishedLifecycle,
@@ -1037,6 +1185,7 @@ module.exports = {
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
+  createCodexLaunchSettingsObservationCandidate,
   createCodexReadIdentitySubmitBarrier,
   createCodexResumeReadIdentityLease,
   createCodexServiceTierProof,
@@ -1051,6 +1200,7 @@ module.exports = {
   planCodexPickerMovement,
   preserveCodexServiceTierProofForTurnEnd,
   projectPendingCodexSettingsProofOwner,
+  projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
   resolveCodexReadIdentity,
@@ -1060,6 +1210,7 @@ module.exports = {
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
+  validateCodexLaunchSettingsObservationCandidate,
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 };

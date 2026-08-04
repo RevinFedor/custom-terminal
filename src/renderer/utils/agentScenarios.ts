@@ -35,6 +35,8 @@ export interface SendAgentPromptScenarioArgs {
   cwd?: string;
   prompt: string;
   handoffId?: string;
+  sendAttemptId?: string | null;
+  sendOperationKey?: string | null;
   source?: string;
   statusAtSend?: string;
   queue?: boolean;
@@ -85,6 +87,8 @@ async function runAgentPromptScenario({
   cwd,
   prompt,
   handoffId,
+  sendAttemptId,
+  sendOperationKey,
   source,
   statusAtSend,
   queue,
@@ -268,6 +272,8 @@ async function runAgentPromptScenario({
   assertSendNotCancelled();
   const result = await runtime.sendPrompt(tabId, prompt, {
     handoffId: typeof handoffId === 'string' ? handoffId : undefined,
+    sendAttemptId: typeof sendAttemptId === 'string' ? sendAttemptId : undefined,
+    sendOperationKey: typeof sendOperationKey === 'string' ? sendOperationKey : undefined,
     source: typeof source === 'string' ? source : 'mobile-native',
     statusAtSend: statusForSend,
     queue: queue === true,

@@ -7,6 +7,7 @@ interface TooltipProps {
   content: React.ReactNode;
   children: React.ReactElement;
   side?: Side;
+  align?: 'center' | 'start';
   // Optional delay in ms (default 0 = instant — the whole point of this component).
   delay?: number;
   // Allow disabling without removing call sites; falsy content also disables.
@@ -77,6 +78,7 @@ export default function Tooltip({
   content,
   children,
   side = 'top',
+  align = 'center',
   delay = 0,
   disabled = false,
   always = false,
@@ -224,12 +226,12 @@ export default function Tooltip({
             break;
           case 'left':
             left = t.left - p.width - GAP;
-            top = t.top + t.height / 2 - p.height / 2;
+            top = align === 'start' ? t.top : t.top + t.height / 2 - p.height / 2;
             if (left < PADDING) ok = false;
             break;
           case 'right':
             left = t.right + GAP;
-            top = t.top + t.height / 2 - p.height / 2;
+            top = align === 'start' ? t.top : t.top + t.height / 2 - p.height / 2;
             if (left + p.width > vw - PADDING) ok = false;
             break;
           default:
@@ -261,7 +263,7 @@ export default function Tooltip({
       window.removeEventListener('scroll', measure, true);
       window.removeEventListener('resize', measure);
     };
-  }, [visible, side, content]);
+  }, [visible, side, align, content]);
 
   // Compose handlers with the child's existing ones so we don't override them.
   const child = children as React.ReactElement<any>;

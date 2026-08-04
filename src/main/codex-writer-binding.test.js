@@ -9,6 +9,7 @@ const {
   classifyCodexNativeRewindSource,
   classifyCodexWriterBindingAdmission,
   persistCodexWriterBinding,
+  resolveCodexNativeRewindActionGeneration,
 } = require('./codex-writer-binding');
 
 test('writer binding becomes publishable only after scoped durable commit', () => {
@@ -128,6 +129,43 @@ test('manual binding promotion requires a new user message in the same terminal 
     observationByteOffset: 120,
     persistedBindingMatches: false,
   }).reason, 'persisted-binding-changed');
+});
+
+test('confirmed native Rewind derives authority from the exact live run after launch proof is gone', () => {
+  assert.equal(resolveCodexNativeRewindActionGeneration({
+    writerActionGeneration: 'rewind-a-b',
+    writerLaunchId: 'launch-old',
+    lifecycleGeneration: 'lifecycle-4',
+    runSeq: 4,
+    allowLiveRunFallback: true,
+  }), 'rewind-a-b');
+  assert.equal(resolveCodexNativeRewindActionGeneration({
+    writerLaunchId: 'launch-4',
+    lifecycleGeneration: 'lifecycle-4',
+    runSeq: 4,
+    allowLiveRunFallback: true,
+  }), 'launch-4');
+  assert.equal(resolveCodexNativeRewindActionGeneration({
+    lifecycleGeneration: 'lifecycle-4',
+    runSeq: 4,
+    allowLiveRunFallback: true,
+  }), 'live-run:lifecycle-4:run:4');
+});
+
+test('native Rewind never invents a generation without a complete main-owned live run', () => {
+  assert.equal(resolveCodexNativeRewindActionGeneration({
+    lifecycleGeneration: 'lifecycle-4',
+    runSeq: 4,
+  }), null, 'provisional Resume must keep requiring its exact launch lease');
+  assert.equal(resolveCodexNativeRewindActionGeneration({
+    lifecycleGeneration: 'lifecycle-4',
+    runSeq: 0,
+    allowLiveRunFallback: true,
+  }), null);
+  assert.equal(resolveCodexNativeRewindActionGeneration({
+    runSeq: 4,
+    allowLiveRunFallback: true,
+  }), null);
 });
 
 test('native Rewind keeps quarantined runtime C1 separate from durable binding A', () => {

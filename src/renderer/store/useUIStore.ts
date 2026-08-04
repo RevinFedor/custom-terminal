@@ -589,6 +589,7 @@ interface UIStore {
   // History Panel (per-tab state)
   historyPanelOpenTabs: Record<string, boolean>;
   historyPanelWidth: number;
+  sideTerminalWidth: number;
   historyScrollToUuid: string | null;
   historyVisibleUuids: Record<string, string[]>;
   historyScrollPositions: Record<string, number>;
@@ -602,6 +603,7 @@ interface UIStore {
   promptQueueInputSurfaceTabs: Record<string, PromptQueueInputSurface>;
   setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
+  setSideTerminalWidth: (width: number) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
   setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
@@ -736,6 +738,10 @@ interface UIStore {
   // Center-surface owner for Claude/Codex PTY tabs. See loader comment above.
   terminalIsPrimary: boolean;
   setTerminalIsPrimary: (v: boolean) => void;
+  newTabPrimarySurface: 'history' | 'terminal';
+  terminalIsPrimaryTabs: Record<string, boolean>;
+  setNewTabPrimarySurface: (surface: 'history' | 'terminal') => void;
+  setTabTerminalIsPrimary: (tabId: string, v: boolean) => void;
 
   // Free-ports toggle. When ON, every npm-script start / restart / stop from a
   // devServer-tab first calls `system:free-project-ports` for the tab's cwd —
@@ -866,6 +872,12 @@ interface UIStore {
   claudeMdMirrorEnabled: boolean;
   setClaudeMdMirrorEnabled: (on: boolean) => void;
 }
+
+export const resolveTabTerminalPrimary = (
+  state: Pick<UIStore, 'terminalIsPrimaryTabs' | 'newTabPrimarySurface'>,
+  tabId: string,
+): boolean => state.terminalIsPrimaryTabs[tabId]
+  ?? (state.newTabPrimarySurface === 'terminal');
 
 
 
@@ -1240,17 +1252,16 @@ const loadPromptQueueEditorFontSize = (): number => {
   } catch {}
   return 12;
 };
-// Run-after overlay width. Clamp [240, 600] — 240 ≈ the old PANEL_MIN_WIDTH so
-// existing layouts don't shrink; default 300 sits inside the old fit-content
-// [240,360] band so the first render after this change doesn't jump.
-const PROMPT_QUEUE_WIDTH_MIN = 240;
+// Run-after overlay is now a single compact column. Existing user-resized
+// values remain valid, while fresh installs default to half the old width.
+const PROMPT_QUEUE_WIDTH_MIN = 120;
 const PROMPT_QUEUE_WIDTH_MAX = 600;
 const loadPromptQueueWidth = (): number => {
   try {
     const v = localStorage.getItem('noted-terminal-prompt-queue-width');
-    if (v) return Math.max(PROMPT_QUEUE_WIDTH_MIN, Math.min(PROMPT_QUEUE_WIDTH_MAX, Number(v) || 300));
+    if (v) return Math.max(PROMPT_QUEUE_WIDTH_MIN, Math.min(PROMPT_QUEUE_WIDTH_MAX, Number(v) || 150));
   } catch {}
-  return 300;
+  return 150;
 };
 const initialEditorSettings = loadEditorSettings();
 const initialModel = loadSelectedModel();
@@ -1567,11 +1578,8 @@ const initialHistoryPinned = loadHistoryPinned();
   } catch {}
 })();
 
-// terminalIsPrimary — which surface owns the center of a Claude/Codex PTY tab.
-// false (default) keeps History primary with the terminal in its floating
-// window; true swaps them: the SAME terminal fills the center and the SAME
-// History moves to the side panel. Global for the whole app (not per tab) and
-// persisted, so the chosen workspace shape survives a restart.
+// Legacy global center-surface preference. Kept as a migration seed and for
+// older consumers; Workspace resolves the owner from the per-tab map below.
 const APP_STATE_KEY_TERMINAL_PRIMARY = 'terminalIsPrimary';
 const loadTerminalIsPrimary = (): boolean => {
   try {
@@ -1596,6 +1604,124 @@ const initialTerminalIsPrimary = loadTerminalIsPrimary();
         useUIStore.setState({ terminalIsPrimary: bool });
         try { localStorage.setItem('noted-terminal-terminal-primary', String(bool)); } catch {}
       }
+    }
+  } catch {}
+})();
+
+type PrimarySurface = 'history' | 'terminal';
+const APP_STATE_KEY_NEW_TAB_PRIMARY_SURFACE = 'newTabPrimarySurface';
+const APP_STATE_KEY_TERMINAL_PRIMARY_TABS = 'terminalIsPrimaryTabs';
+const APP_STATE_KEY_SIDE_TERMINAL_WIDTH = 'sideTerminalWidth';
+const LS_NEW_TAB_PRIMARY_SURFACE = 'noted-terminal-new-tab-primary-surface';
+const LS_TERMINAL_PRIMARY_TABS = 'noted-terminal-terminal-primary-tabs';
+const LS_SIDE_TERMINAL_WIDTH = 'noted-terminal-side-terminal-width';
+const SIDE_TERMINAL_MIN_WIDTH = 360;
+const SIDE_TERMINAL_MAX_WIDTH = 1200;
+
+const parsePrimarySurface = (value: unknown): PrimarySurface | null => (
+  value === 'history' || value === 'terminal' ? value : null
+);
+const sanitizeTerminalPrimaryTabs = (value: unknown): Record<string, boolean> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, boolean] => (
+    typeof entry[1] === 'boolean'
+  )));
+};
+const clampSideTerminalWidth = (value: unknown): number => {
+  if (value === null || value === undefined || value === '') return 620;
+  const parsed = Number(value);
+  return Number.isFinite(parsed)
+    ? Math.max(SIDE_TERMINAL_MIN_WIDTH, Math.min(SIDE_TERMINAL_MAX_WIDTH, parsed))
+    : 620;
+};
+const readLocalPrimarySurface = (): PrimarySurface | null => {
+  try { return parsePrimarySurface(localStorage.getItem(LS_NEW_TAB_PRIMARY_SURFACE)); }
+  catch { return null; }
+};
+const readLocalTerminalPrimaryTabs = (): Record<string, boolean> => {
+  try {
+    const raw = localStorage.getItem(LS_TERMINAL_PRIMARY_TABS);
+    return raw ? sanitizeTerminalPrimaryTabs(JSON.parse(raw)) : {};
+  } catch { return {}; }
+};
+const readLocalSideTerminalWidth = (): number => {
+  try { return clampSideTerminalWidth(localStorage.getItem(LS_SIDE_TERMINAL_WIDTH)); }
+  catch { return 620; }
+};
+const saveNewTabPrimarySurface = (surface: PrimarySurface) => {
+  try { localStorage.setItem(LS_NEW_TAB_PRIMARY_SURFACE, surface); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_NEW_TAB_PRIMARY_SURFACE, value: surface }).catch(() => {});
+  } catch {}
+};
+const saveTerminalPrimaryTabs = (tabs: Record<string, boolean>) => {
+  try { localStorage.setItem(LS_TERMINAL_PRIMARY_TABS, JSON.stringify(tabs)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_TERMINAL_PRIMARY_TABS, value: tabs }).catch(() => {});
+  } catch {}
+};
+const saveSideTerminalWidth = (width: number) => {
+  try { localStorage.setItem(LS_SIDE_TERMINAL_WIDTH, String(width)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_SIDE_TERMINAL_WIDTH, value: width }).catch(() => {});
+  } catch {}
+};
+
+const localPrimarySurface = readLocalPrimarySurface();
+const initialNewTabPrimarySurface: PrimarySurface = localPrimarySurface
+  ?? (initialTerminalIsPrimary ? 'terminal' : 'history');
+const initialTerminalPrimaryTabs = readLocalTerminalPrimaryTabs();
+const initialSideTerminalWidth = readLocalSideTerminalWidth();
+
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const persisted = parsePrimarySurface(await ipcRenderer.invoke('app:getState', APP_STATE_KEY_NEW_TAB_PRIMARY_SURFACE));
+    if (persisted) {
+      useUIStore.setState({ newTabPrimarySurface: persisted });
+      try { localStorage.setItem(LS_NEW_TAB_PRIMARY_SURFACE, persisted); } catch {}
+      return;
+    }
+    if (localPrimarySurface) {
+      saveNewTabPrimarySurface(localPrimarySurface);
+      return;
+    }
+    const legacy = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_TERMINAL_PRIMARY);
+    const seeded: PrimarySurface = legacy !== null && legacy !== undefined && parsePersistedBool(legacy)
+      ? 'terminal'
+      : 'history';
+    useUIStore.setState({ newTabPrimarySurface: seeded });
+    saveNewTabPrimarySurface(seeded);
+  } catch {}
+})();
+
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const persisted = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_TERMINAL_PRIMARY_TABS);
+    if (persisted !== null && persisted !== undefined) {
+      const tabs = sanitizeTerminalPrimaryTabs(persisted);
+      useUIStore.setState({ terminalIsPrimaryTabs: tabs });
+      try { localStorage.setItem(LS_TERMINAL_PRIMARY_TABS, JSON.stringify(tabs)); } catch {}
+    } else if (Object.keys(initialTerminalPrimaryTabs).length > 0) {
+      saveTerminalPrimaryTabs(initialTerminalPrimaryTabs);
+    }
+  } catch {}
+})();
+
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const persisted = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_SIDE_TERMINAL_WIDTH);
+    if (persisted !== null && persisted !== undefined) {
+      const width = clampSideTerminalWidth(persisted);
+      useUIStore.setState({ sideTerminalWidth: width });
+      try { localStorage.setItem(LS_SIDE_TERMINAL_WIDTH, String(width)); } catch {}
+    } else {
+      saveSideTerminalWidth(initialSideTerminalWidth);
     }
   } catch {}
 })();
@@ -2652,6 +2778,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
 	      return saved ? Math.max(HISTORY_PANEL_MIN_WIDTH, parseInt(saved, 10)) : HISTORY_PANEL_DEFAULT_WIDTH;
 	    } catch { return HISTORY_PANEL_DEFAULT_WIDTH; }
 	  })(),
+  sideTerminalWidth: initialSideTerminalWidth,
   historyScrollToUuid: null,
   historyVisibleUuids: {},
   historyScrollPositions: {},
@@ -2881,6 +3008,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
 	    set({ historyPanelWidth: clamped });
 	    localStorage.setItem('noted-terminal-history-panel-width', String(clamped));
 	  },
+  setSideTerminalWidth: (width) => {
+    const clamped = clampSideTerminalWidth(width);
+    set({ sideTerminalWidth: clamped });
+    saveSideTerminalWidth(clamped);
+  },
 
   // Notes Panel Width
   notesPanelWidth: 300,
@@ -3133,6 +3265,18 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
   terminalIsPrimary: initialTerminalIsPrimary,
   setTerminalIsPrimary: (v) => { set({ terminalIsPrimary: v }); saveTerminalIsPrimary(v); },
+  newTabPrimarySurface: initialNewTabPrimarySurface,
+  terminalIsPrimaryTabs: initialTerminalPrimaryTabs,
+  setNewTabPrimarySurface: (surface) => {
+    set({ newTabPrimarySurface: surface });
+    saveNewTabPrimarySurface(surface);
+  },
+  setTabTerminalIsPrimary: (tabId, v) => set((state) => {
+    if (state.terminalIsPrimaryTabs[tabId] === v) return state;
+    const terminalIsPrimaryTabs = { ...state.terminalIsPrimaryTabs, [tabId]: v };
+    saveTerminalPrimaryTabs(terminalIsPrimaryTabs);
+    return { terminalIsPrimaryTabs };
+  }),
 
   freePortsBeforeStart: initialFreePortsBeforeStart,
   setFreePortsBeforeStart: (v) => { set({ freePortsBeforeStart: v }); saveFreePortsBeforeStart(v); },

@@ -25,6 +25,7 @@ const {
   parseCodexAdvancedEffortPicker,
   parseCodexModelMigrationAcknowledgement,
   parseCodexVerifiedComposerFooter,
+  parseCodexVerifiedLaunchCardSettings,
   parseCodexModelMigrationsConfig,
   parseCodexPlanReasoningScopePicker,
   parseCodexAllModelPicker,
@@ -71,6 +72,18 @@ test('verified composer footer proves exact model, effort, and optional FAST sta
   });
 });
 
+test('verified composer footer accepts the fresh-conversation cwd form', () => {
+  assert.deepEqual(parseCodexVerifiedComposerFooter([
+    '› Write tests for @filename',
+    'gpt-5.6-luna medium fast · /private/tmp/ct-nested-terminal…',
+  ].join('\n')), {
+    model: 'gpt-5.6-luna',
+    effort: 'medium',
+    fast: true,
+    proof: 'verified-composer-footer',
+  });
+});
+
 test('verified composer footer rejects defaults, missing effort, and history-like prose', () => {
   assert.equal(parseCodexVerifiedComposerFooter(
     '› Ask Codex\ngpt-5.6-sol default · Full Access · Context 0%'
@@ -85,6 +98,34 @@ test('verified composer footer rejects defaults, missing effort, and history-lik
     'gpt-5.6-sol max fast · Full Access · Context 0%',
     '› quoted status from history',
   ].join('\n')), null);
+});
+
+test('verified launch card proves the fresh launch settings without accepting prose', () => {
+  assert.deepEqual(parseCodexVerifiedLaunchCardSettings([
+    '╭────────────────────────────────────────────────────────╮',
+    '│ model:       gpt-5.6-luna medium   fast   /model to change │',
+    '│ directory:   ~/Desktop/custom-terminal                 │',
+    '╰────────────────────────────────────────────────────────╯',
+  ].join('\n')), {
+    model: 'gpt-5.6-luna',
+    effort: 'medium',
+    fast: true,
+    proof: 'verified-launch-card',
+  });
+  assert.deepEqual(parseCodexVerifiedLaunchCardSettings(
+    '│ model: gpt-5.6-sol max /model to change │'
+  ), {
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    fast: false,
+    proof: 'verified-launch-card',
+  });
+  assert.equal(parseCodexVerifiedLaunchCardSettings(
+    'assistant: model: gpt-5.6-sol max fast /model to change'
+  ), null);
+  assert.equal(parseCodexVerifiedLaunchCardSettings(
+    '│ model: loading /model to change │'
+  ), null);
 });
 
 test('Codex model migration prompt accepts only the selected Try new model action', () => {

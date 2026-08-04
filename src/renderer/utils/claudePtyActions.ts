@@ -63,6 +63,8 @@ export interface ClaudePtyDraftGrabOptions {
 
 export interface ClaudePtySendOptions {
   handoffId?: string;
+  sendAttemptId?: string;
+  sendOperationKey?: string;
   source?: string;
   statusAtSend?: string;
   queue?: boolean;
@@ -591,6 +593,8 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
       // runtime collapse both states into an immediate success receipt.
       awaitClaudeUserMessageAudit: true,
       handoffId: options.handoffId || null,
+      sendAttemptId: options.sendAttemptId || null,
+      sendOperationKey: options.sendOperationKey || null,
       source: options.source || 'claude-pty-action',
       verifyClaudeVisibleDraftBeforePaste: true,
       presentationSnapshot: options.presentationSnapshot || null,

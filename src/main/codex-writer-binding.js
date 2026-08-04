@@ -103,6 +103,38 @@ function classifyCodexManualBindingPromotion({
 }
 
 /**
+ * Resolve the generation that owns a native Rewind action.
+ *
+ * A confirmed writer can legitimately outlive the launch observer that first
+ * discovered it.  Once that transient launch proof is gone, the exact live
+ * terminal lifecycle + command run remains the authoritative generation.  A
+ * renderer-provided launch id is deliberately not accepted here: destructive
+ * authority must be minted from main-owned state only.
+ *
+ * Provisional Resume callers must not use the live-run fallback. They still
+ * require the exact launch-scoped source lease before the first action.
+ */
+function resolveCodexNativeRewindActionGeneration({
+  writerActionGeneration = null,
+  writerLaunchId = null,
+  lifecycleGeneration = null,
+  runSeq = null,
+  allowLiveRunFallback = false,
+} = {}) {
+  const explicit = String(writerActionGeneration || writerLaunchId || '').trim();
+  if (explicit) return explicit;
+  const lifecycle = String(lifecycleGeneration || '').trim();
+  const run = Number(runSeq);
+  if (allowLiveRunFallback !== true
+    || !lifecycle
+    || !Number.isInteger(run)
+    || run <= 0) {
+    return null;
+  }
+  return 'live-run:' + lifecycle + ':run:' + run;
+}
+
+/**
  * Choose the transcript that a native Rewind is operating on without
  * conflating it with the tab's durable binding.
  *
@@ -237,4 +269,5 @@ module.exports = {
   classifyCodexNativeRewindSource,
   classifyCodexWriterBindingAdmission,
   persistCodexWriterBinding,
+  resolveCodexNativeRewindActionGeneration,
 };

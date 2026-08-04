@@ -33,7 +33,8 @@ type OrchestrationSettings = {
 
 type Props = {
   tabId: string;
-  rightOffset: number;
+  panelOpen: boolean;
+  effectiveWidth: number;
 };
 
 const ACTIVE = new Set<OrchestrationStatus>([
@@ -225,7 +226,7 @@ function minutes(ms: number): number {
   return Math.round(Math.max(0, ms) / 60_000);
 }
 
-export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
+export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Props) {
   const [runs, setRuns] = useState<OrchestrationRun[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(() => new Set());
@@ -501,8 +502,8 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
 
   const panelStyle: CSSProperties = {
     position: 'absolute',
-    top: 30,
-    right: 0,
+    top: 'calc(100% + 4px)',
+    right: panelOpen ? effectiveWidth + 8 : 0,
     width: 310,
     maxHeight: 'min(290px, calc(100vh - 110px))',
     display: 'flex',
@@ -636,10 +637,10 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
     <div
       ref={rootRef}
       data-orchestration-status
-      style={{ position: 'absolute', top: 2, right: rightOffset + 4, zIndex: 3, display: 'flex', alignItems: 'flex-start', gap: 4, pointerEvents: 'auto' }}
+      style={{ display: 'contents', pointerEvents: 'auto' }}
     >
       {statusRuns.length > 0 && (
-        <div data-orchestration-active-list style={{ width: 178, maxHeight: 82, overflowY: 'auto', border: '1px solid #444', borderRadius: 5, background: '#171717', boxShadow: '0 2px 10px rgba(0,0,0,0.22)' }}>
+        <div data-orchestration-active-list style={{ display: 'flex', maxWidth: 534, overflowX: 'auto', border: '1px solid #444', borderRadius: 5, background: '#171717', boxShadow: '0 2px 10px rgba(0,0,0,0.22)' }}>
           {statusRuns.map((run, index) => {
             const isSource = run.sourceTabId === tabId;
             const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
@@ -656,10 +657,11 @@ export function OrchestrationStatusChip({ tabId, rightOffset }: Props) {
                 key={run.runId}
                 content={renderTooltip(run)}
                 actionBar={renderTooltipActions(run)}
-                side="bottom"
+                side="left"
+                align="start"
                 always
               >
-                <div data-orchestration-active-run={run.runId} style={{ width: '100%', height: 26, display: 'flex', alignItems: 'center', borderBottom: index < statusRuns.length - 1 ? '1px solid #303030' : 0, boxSizing: 'border-box' }}>
+                <div data-orchestration-active-run={run.runId} style={{ width: 178, height: 26, display: 'flex', alignItems: 'center', borderRight: index < statusRuns.length - 1 ? '1px solid #303030' : 0, boxSizing: 'border-box', flexShrink: 0 }}>
                   <button
                     type="button"
                     onClick={() => void openLinkedTab(run)}

@@ -43,6 +43,37 @@ test('Codex provisional composer remains ready for one guarded first submit', ()
   }), false);
 });
 
+test('verified Codex composer wakes the exact Project API readiness wait', async () => {
+  const events = new EventEmitter();
+  let status = {
+    toolType: 'codex',
+    status: 'starting',
+    inputReady: false,
+    writerConfirmed: false,
+  };
+  const waiting = waitForAgentReadyTransition({
+    tabId: 'nested-codex-tab',
+    timeoutMs: 2_000,
+    eventBus: events,
+    readStatus: async () => status,
+  });
+
+  status = {
+    toolType: 'codex',
+    status: 'starting',
+    inputReady: true,
+    writerConfirmed: false,
+  };
+  events.emit(READY_EVENT, null, {
+    tabId: 'nested-codex-tab',
+    toolType: 'codex',
+  });
+
+  assert.deepEqual(await waiting, status);
+  assert.equal(events.listenerCount(READY_EVENT), 0);
+  assert.equal(events.listenerCount(READINESS_CHANGED_EVENT), 0);
+});
+
 test('known manual-action readiness failure is a conflict, not a timeout', async () => {
   const events = new EventEmitter();
   await assert.rejects(waitForAgentReadyTransition({

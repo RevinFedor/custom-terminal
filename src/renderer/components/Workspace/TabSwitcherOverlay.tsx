@@ -154,7 +154,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     // replace-focused-pane) and the cross-project view switch. switchTab
     // inside puts the chosen tab at the MRU head FIRST, so showWorkspace's
     // own touch becomes a no-op — the toggle order stays correct.
-    useWorkspaceStore.getState().activateTabEverywhere(row.projectId, row.tab.id);
+    useWorkspaceStore.getState().activateCenterTab(row.projectId, row.tab.id);
   }, [close]);
 
   const openCtrl = useCallback((shiftKey: boolean) => {

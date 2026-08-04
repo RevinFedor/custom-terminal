@@ -10,6 +10,7 @@ const {
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
+  createCodexLaunchSettingsObservationCandidate,
   createCodexReadIdentitySubmitBarrier,
   createCodexResumeReadIdentityLease,
   createCodexLaunchPendingResult,
@@ -23,6 +24,7 @@ const {
   planCodexPickerMovement,
   preserveCodexServiceTierProofForTurnEnd,
   projectPendingCodexSettingsProofOwner,
+  projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
   resolveCodexReadIdentity,
@@ -32,9 +34,59 @@ const {
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
+  validateCodexLaunchSettingsObservationCandidate,
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require('./codex-runtime-contract');
+
+test('history action availability separates stopped history, idle Resume, confirmed writer, and in-flight send', () => {
+  assert.deepEqual(projectCodexHistoryActionAvailability({
+    liveLifecycle: false,
+    savedSessionId: 'stopped-a',
+  }), {
+    canNativeRewind: true,
+    canRewriteHistory: true,
+    canDeleteHistory: true,
+    reason: null,
+  });
+
+  assert.deepEqual(projectCodexHistoryActionAvailability({
+    liveLifecycle: true,
+    savedSessionId: 'resume-a',
+    inputReady: true,
+    provisionalResumeAvailable: true,
+  }), {
+    canNativeRewind: true,
+    canRewriteHistory: false,
+    canDeleteHistory: false,
+    reason: 'provisional-resume-rewind-only',
+  });
+
+  assert.deepEqual(projectCodexHistoryActionAvailability({
+    liveLifecycle: true,
+    savedSessionId: 'writer-a',
+    inputReady: true,
+    writerUsableForMutation: true,
+  }), {
+    canNativeRewind: true,
+    canRewriteHistory: true,
+    canDeleteHistory: true,
+    reason: null,
+  });
+
+  assert.deepEqual(projectCodexHistoryActionAvailability({
+    liveLifecycle: true,
+    savedSessionId: 'resume-a',
+    inputReady: true,
+    provisionalResumeAvailable: true,
+    promptOrTurnInFlight: true,
+  }), {
+    canNativeRewind: false,
+    canRewriteHistory: false,
+    canDeleteHistory: false,
+    reason: 'submit-or-turn-in-flight',
+  });
+});
 
 function provisionalResumeReadIdentity(overrides = {}) {
   const terminalToken = overrides.terminalToken || { pty: 'resume-terminal-a' };
@@ -220,6 +272,63 @@ test('a provisional launch tier follows only its exact first writer in the same 
       ...patch,
     }).allowed, false);
   }
+});
+
+test('a consumed launch tier becomes writer-owned and survives an ordinary completed turn', () => {
+  const terminalToken = { pty: 'terminal-a' };
+  const launchGeneration = {
+    terminalToken,
+    terminalLifecycleGeneration: 'terminal-epoch-a:7',
+    terminalRunSeq: 7,
+    launchId: 'launch-a',
+    generationMode: 'launch',
+    generationId: 'launch-a',
+  };
+  const launchProof = createCodexServiceTierProof({
+    ...launchGeneration,
+    ownerId: 'launch:launch-a',
+    serviceTier: 'priority',
+    proofAt: 1785681000123,
+  });
+  const handoff = authorizeCodexServiceTierProofOwnerHandoff(launchProof, {
+    ...launchGeneration,
+    sourceOwnerId: 'launch:launch-a',
+    targetOwnerId: 'writer-a',
+  });
+  assert.equal(handoff.allowed, true);
+
+  // The launch receipt has now been consumed. From this point the exact live
+  // writer and PTY run own the state, so dropping one-shot launch metadata
+  // during a later process revalidation must not clear FAST.
+  const writerGeneration = {
+    ownerId: handoff.targetOwnerId,
+    terminalToken,
+    terminalLifecycleGeneration: 'terminal-epoch-a:7',
+    terminalRunSeq: 7,
+    launchId: null,
+    generationMode: 'terminal-run',
+    generationId: 'terminal-epoch-a:7',
+  };
+  const writerProof = createCodexServiceTierProof({
+    ...writerGeneration,
+    serviceTier: handoff.serviceTier,
+    proofAt: 1785681000456,
+    source: 'exact-first-writer-service-tier-handoff',
+  });
+  assert.equal(writerProof.ownerId, 'writer-a');
+  assert.equal(writerProof.launchId, null);
+  assert.strictEqual(
+    preserveCodexServiceTierProofForTurnEnd(writerProof, writerGeneration).proof,
+    writerProof,
+  );
+  assert.equal(preserveCodexServiceTierProofForTurnEnd(writerProof, {
+    ...writerGeneration,
+    terminalRunSeq: 8,
+  }).reason, 'terminal-run-changed');
+  assert.equal(preserveCodexServiceTierProofForTurnEnd(writerProof, {
+    ...writerGeneration,
+    ownerId: 'writer-b',
+  }).reason, 'proof-owner-changed');
 });
 
 test('a launchless live Codex run uses exact terminal-run ownership and hands it to only that writer', () => {
@@ -593,6 +702,38 @@ test('PTY submit admission invalidates when manual input changes at the write bo
   });
 });
 
+test('PTY submit admission cannot cross a late readiness-proof boundary', () => {
+  assert.deepEqual(createCodexPtySubmitAdmission({
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    runSeq: 12,
+    inputRevision: 41,
+    inputReadinessProofPending: true,
+  }), {
+    available: false,
+    reason: 'codex_input_readiness_proof_pending',
+    runSeq: 12,
+    inputRevision: 41,
+  });
+
+  const admission = createCodexPtySubmitAdmission({
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    runSeq: 12,
+    inputRevision: 41,
+  });
+  assert.deepEqual(validateCodexPtySubmitAdmission(admission, {
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    runSeq: 12,
+    inputRevision: 41,
+    inputReadinessProofPending: true,
+  }), {
+    valid: false,
+    reason: 'codex_input_readiness_proof_pending',
+  });
+});
+
 test('PTY submit admission is unavailable and current admission becomes invalid while stopping', () => {
   assert.deepEqual(createCodexPtySubmitAdmission({
     processRunning: true,
@@ -880,6 +1021,68 @@ test('fresh picker proof follows only the first writer from the exact PTY genera
   });
 });
 
+test('late launch-card observation keeps only exact launch identity and expires on every generation change', () => {
+  const terminalToken = {};
+  const candidate = createCodexLaunchSettingsObservationCandidate({
+    launchId: 'launch-late-card',
+    terminalToken,
+    runSeq: 17,
+    terminalLifecycleGeneration: 'pty-generation-4',
+    createdAt: 1234,
+  });
+  assert.deepEqual(candidate, {
+    launchId: 'launch-late-card',
+    terminalToken,
+    runSeq: 17,
+    terminalLifecycleGeneration: 'pty-generation-4',
+    createdAt: 1234,
+  });
+  assert.equal(validateCodexLaunchSettingsObservationCandidate(candidate, {
+    launchId: 'launch-late-card',
+    terminalToken,
+    runSeq: 17,
+    terminalLifecycleGeneration: 'pty-generation-4',
+    writerPresent: false,
+  }).valid, true);
+  assert.equal(validateCodexLaunchSettingsObservationCandidate(candidate, {
+    launchId: 'launch-other',
+    terminalToken,
+    runSeq: 17,
+    terminalLifecycleGeneration: 'pty-generation-4',
+  }).reason, 'launch-generation-changed');
+  assert.equal(validateCodexLaunchSettingsObservationCandidate(candidate, {
+    launchId: 'launch-late-card',
+    terminalToken: {},
+    runSeq: 17,
+    terminalLifecycleGeneration: 'pty-generation-4',
+  }).reason, 'terminal-generation-changed');
+  assert.equal(validateCodexLaunchSettingsObservationCandidate(candidate, {
+    launchId: 'launch-late-card',
+    terminalToken,
+    runSeq: 18,
+    terminalLifecycleGeneration: 'pty-generation-4',
+  }).reason, 'process-generation-changed');
+  assert.equal(validateCodexLaunchSettingsObservationCandidate(candidate, {
+    launchId: 'launch-late-card',
+    terminalToken,
+    runSeq: 17,
+    terminalLifecycleGeneration: 'pty-generation-5',
+  }).reason, 'terminal-lifecycle-changed');
+  assert.equal(validateCodexLaunchSettingsObservationCandidate(candidate, {
+    launchId: 'launch-late-card',
+    terminalToken,
+    runSeq: 17,
+    terminalLifecycleGeneration: 'pty-generation-4',
+    writerPresent: true,
+  }).reason, 'writer-already-present');
+  assert.equal(createCodexLaunchSettingsObservationCandidate({
+    launchId: 'launch-without-generation',
+    terminalToken,
+    runSeq: 0,
+    terminalLifecycleGeneration: null,
+  }), null);
+});
+
 test('verified fresh-composer settings become owned by the first writer of that launch', () => {
   const terminalToken = {};
   const pending = createPendingCodexSettingsProofHandoff({
@@ -1126,6 +1329,31 @@ test('ready live composer is active before the first rollout identity exists', (
   });
   assert.equal(status, 'active');
   assert.equal(isCodexComposerReadyForGuardedSend({ toolType: 'codex', status, inputReady: true }), true);
+});
+
+test('late input proof keeps an established Codex lifecycle active while writes stay closed', () => {
+  assert.deepEqual(projectCodexPublicRuntimeProjection({
+    liveLifecycle: null,
+    tuiInputReady: false,
+    tuiLifecycleEstablished: true,
+    inputProofPending: true,
+    writerUsableForMutation: true,
+    writerUiLifecycleEstablished: true,
+    hasEstablishedLifecycle: true,
+  }), {
+    sessionStatus: 'active',
+    busy: false,
+    inputReady: false,
+  });
+  assert.equal(projectCodexRuntimeStatus({
+    liveLifecycle: true,
+    inputReady: false,
+    composerEstablished: true,
+    inputProofPending: true,
+    writerUsableForMutation: true,
+    writerUiLifecycleEstablished: true,
+    hasEstablishedLifecycle: true,
+  }), 'active');
 });
 
 test('failed Stop cannot promote raw TUI readiness without writer lifecycle proof', () => {

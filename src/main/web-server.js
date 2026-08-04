@@ -94,6 +94,11 @@ const {
 const {
   promptAuditFingerprint,
 } = require('./prompt-audit-fingerprint');
+const {
+  RECEIPT_STATES: AGENT_SEND_RECEIPT_STATES,
+  createAgentSendReceiptRegistry,
+  fingerprintAgentSendRequest,
+} = require('./agent-send-receipt-registry');
 const { applyHistoryEntryWindow } = require('./history-entry-window');
 const {
   orchestrationRequestFingerprint,
@@ -200,6 +205,7 @@ let getAgentTurnResult = null;
 let getAgentExecutionContext = null;
 let readAgentLifecycleIdentity = null;
 let registerTaskCompletionIntent = null;
+let e2eBoundaryTestGate = null;
 // Main owns the agent startup/readiness state. The renderer bridge remains a
 // compatibility fallback for isolated module use, but live Project API waits
 // must not depend on a renderer projection arriving before the main-owned wake.
@@ -224,12 +230,25 @@ const externalRunByTabId = new Map(); // tabId -> runId
 const externalRunByConversationKey = new Map(); // conversationKey -> runId
 const DEFAULT_EXTERNAL_AUTO_CLOSE_MS = 15 * 60 * 1000;
 let orchestrationRunStore = null;
+// Injected from main. SQLite is the restart-safe authority for whether one
+// exact Project API / Terminal MCP / Inbox operation may cross Enter. The
+// in-memory registry below only joins concurrent callers and projects the
+// current-process waiter; it must never recreate retry authority after restart.
+let agentSendReceiptStore = null;
 const orchestrationCompletionInflight = new Set();
 const orchestrationCompletionTrailing = new Set();
 const orchestrationNotificationInflight = new Set();
 const orchestrationAutoStopInflight = new Set();
 const orchestrationDeliveryInflight = new Set();
 const closedAgentRestoreInflight = new Map();
+const agentSendReceiptRegistry = createAgentSendReceiptRegistry({
+  onEvict(detail) {
+    console.warn('[AgentSendReceipt] evict tab=' + shortId(detail?.tabId, 12)
+      + ' handoff=' + String(detail?.handoffId || '-').slice(0, 32)
+      + ' state=' + (detail?.state || '-')
+      + ' reason=' + (detail?.reason || '-'));
+  },
+});
 let orchestrationPolicyTimer = null;
 let orchestrationResultProofCoordinator = null;
 let orchestrationSourceProofCoordinator = null;
@@ -1323,7 +1342,13 @@ function sendDeliveryUnknown(res, data, extra = {}) {
 
 function sendSendFailure(res, data, extra = {}) {
   const code = data && typeof data.code === 'string' ? data.code : 'send_failed';
-  return sendJson(res, 409, {
+  const requestedStatus = Number(data?.httpStatus || data?.statusCode);
+  const httpStatus = Number.isInteger(requestedStatus)
+    && requestedStatus >= 400
+    && requestedStatus <= 599
+    ? requestedStatus
+    : 409;
+  return sendJson(res, httpStatus, {
     ...(data || {}),
     ...extra,
     ok: false,
@@ -1332,6 +1357,162 @@ function sendSendFailure(res, data, extra = {}) {
     code,
     error: (data && (data.error || data.message)) || 'send failed',
   });
+}
+
+function externalRunResponseFields(run) {
+  return {
+    runId: run.runId,
+    provider: run.provider,
+    tabId: run.tabId || null,
+    sessionId: run.auditSessionId || run.sessionId || null,
+    source: run.source,
+    handoffId: run.handoffId,
+    conversationKey: run.conversationKey || null,
+    ...(run.tabId ? {
+      eventsUrl: '/api/events?tabId=' + encodeURIComponent(run.tabId),
+      stopUrl: '/api/inbox/runs/' + encodeURIComponent(run.runId) + '/stop',
+    } : {}),
+    autoStopMs: run.autoStopMs,
+    autoCloseMs: run.autoCloseMs,
+    reused: run.reused === true,
+    idempotent: true,
+  };
+}
+
+function replayExternalRunResponse(res, run) {
+  const extra = externalRunResponseFields(run);
+  if (run.status === 'delivery_unknown') {
+    return sendDeliveryUnknown(res, run.lastSendReceipt || {}, extra);
+  }
+  if (run.status === 'audit_pending' || run.status === 'reserving'
+    || run.status === 'starting' || run.status === 'sending') {
+    if (run.status === 'audit_pending') {
+      return sendAuditPending(res, run.lastSendReceipt || {}, extra);
+    }
+    return sendJson(res, 202, {
+      ok: true,
+      success: null,
+      accepted: true,
+      submitted: null,
+      status: run.status,
+      ...extra,
+    });
+  }
+  if (run.status === 'running' || run.status === 'done' || run.status === 'stopped') {
+    return sendJson(res, 200, {
+      ok: true,
+      success: true,
+      submitted: true,
+      status: run.status === 'running' ? 'sent' : run.status,
+      exactAuditConfirmed: run.auditConfirmedAt != null,
+      ...extra,
+    });
+  }
+  return sendSendFailure(res, run.lastSendReceipt || {
+    code: run.errorCode || run.status || 'external_run_failed',
+    error: run.error || 'external run failed before delivery',
+  }, extra);
+}
+
+function reservedInboxTabId(runId, conversationKey = '') {
+  const stableOwner = conversationKey ? `conversation:${conversationKey}` : `run:${runId}`;
+  const suffix = crypto.createHash('sha256').update(stableOwner).digest('hex').slice(0, 24);
+  return `${INBOX_PROJECT_ID}-tab-external-${suffix}`;
+}
+
+function externalRunStatusFromDurableRecord(record) {
+  if (record?.state === 'confirmed') return 'running';
+  if (record?.state === 'audit-pending') return 'audit_pending';
+  if (record?.state === 'delivery-unknown'
+    || record?.state === 'in-flight'
+    || record?.state === 'enter-armed') return 'delivery_unknown';
+  if (record?.state === 'not-submitted') return 'send_failed';
+  return 'reserving';
+}
+
+function durableAgentSendReplay(record, overrides = {}) {
+  const receipt = record?.receipt && typeof record.receipt === 'object'
+    ? record.receipt
+    : {};
+  const state = record?.state || 'delivery-unknown';
+  if (state === 'confirmed') {
+    return {
+      ...receipt,
+      success: true,
+      accepted: true,
+      submitted: true,
+      status: receipt.status || 'sent',
+      exactAuditConfirmed: receipt.exactAuditConfirmed === true,
+      receiptState: 'confirmed',
+      ...overrides,
+      replayed: true,
+    };
+  }
+  if (state === 'audit-pending') {
+    return {
+      ...receipt,
+      success: null,
+      accepted: true,
+      submitted: true,
+      status: 'audit-pending',
+      auditPending: true,
+      receiptState: 'audit-pending',
+      ...overrides,
+      replayed: true,
+    };
+  }
+  if (state === 'not-submitted') {
+    return {
+      ...receipt,
+      success: false,
+      accepted: false,
+      submitted: false,
+      status: 'not-submitted',
+      receiptState: 'not-submitted',
+      ...overrides,
+      replayed: true,
+    };
+  }
+  return {
+    ...receipt,
+    success: null,
+    accepted: true,
+    submitted: null,
+    status: 'delivery-unknown',
+    deliveryUnknown: true,
+    receiptState: 'delivery-unknown',
+    code: receipt.code || 'agent_send_durable_delivery_unknown',
+    warning: receipt.warning
+      || 'The durable send operation is unresolved; do not retry this handoff blindly.',
+    ...overrides,
+    replayed: true,
+  };
+}
+
+function durableAgentSendFailure(verdict, { tabId, handoffId } = {}) {
+  if (verdict?.action === 'conflict') {
+    return {
+      success: false,
+      accepted: false,
+      submitted: false,
+      status: 'conflict',
+      code: 'agent_send_handoff_conflict',
+      error: 'The same durable send operation was already used for a different request.',
+      tabId: tabId || verdict?.record?.tabId || null,
+      handoffId: handoffId || verdict?.record?.handoffId || null,
+      mismatchedFields: verdict?.mismatchedFields || [],
+    };
+  }
+  return {
+    success: false,
+    accepted: false,
+    submitted: false,
+    status: 'not-submitted',
+    code: verdict?.code || 'agent_send_receipt_store_capacity',
+    error: 'The durable send receipt store cannot reserve this operation.',
+    tabId: tabId || null,
+    handoffId: handoffId || null,
+  };
 }
 
 async function runAgentSendScenario({
@@ -1347,10 +1528,102 @@ async function runAgentSendScenario({
   queue,
   ownership,
   presentationSnapshot,
+  provider,
+  sessionId,
+  sendOperationKey,
+  sendSurface = 'project-api',
+  sendRunId = null,
+  sendRequestFingerprint = null,
+  prepareSend,
   timeoutMs = 60_000,
 }) {
-  try {
-    return await bridgeRequest('sendAgentPromptScenario', {
+  const promptHash = promptAuditFingerprint(prompt);
+  const requestFingerprint = sendRequestFingerprint || fingerprintAgentSendRequest({
+    prompt,
+    model: model || null,
+    effort: effort || null,
+    thinking: thinking || null,
+    cwd: cwd || null,
+    source: source || null,
+    queue: queue === true,
+    ownership: ownership || null,
+  });
+  const durableIdentity = handoffId && sendOperationKey && agentSendReceiptStore
+    ? {
+      operationKey: sendOperationKey,
+      surface: sendSurface,
+      runId: sendRunId,
+      tabId,
+      handoffId,
+      requestFingerprint,
+      provider: provider || null,
+      sessionId: sessionId || null,
+      promptHash,
+      promptLength: String(prompt || '').length,
+    }
+    : null;
+
+  if (durableIdentity) {
+    const reservation = agentSendReceiptStore.reserveOrGet(durableIdentity);
+    if (!reservation?.ok) {
+      return durableAgentSendFailure(reservation, { tabId, handoffId });
+    }
+    const currentProcessWaiter = (reservation.record?.state === 'in-flight'
+      || reservation.record?.state === 'enter-armed')
+      && agentSendReceiptRegistry.snapshot(tabId).some((record) => (
+        record.handoffId === handoffId && record.sendPending === true
+      ));
+    if (reservation.action === 'replay' && reservation.retryable !== true && !currentProcessWaiter) {
+      return durableAgentSendReplay(reservation.record, {
+        operationKey: sendOperationKey,
+        attemptId: reservation.record?.attemptId || null,
+        tabId,
+        handoffId,
+      });
+    }
+  }
+
+  const executeSend = async () => {
+    let durableAttemptId = null;
+    let result;
+    if (typeof prepareSend === 'function') {
+      // Restoring/reopening a closed tab is preparation, not a physical send.
+      // Keep the receipt retryable across a crash here; the exact attempt only
+      // starts immediately before the renderer/PTY bridge can be crossed.
+      if (durableIdentity) agentSendReceiptStore.markPreparing(sendOperationKey);
+      try {
+        await prepareSend();
+      } catch (error) {
+        result = {
+          success: false,
+          accepted: false,
+          submitted: false,
+          status: 'not-submitted',
+          code: error?.code || 'agent_send_prepare_failed',
+          error: error?.message || String(error),
+          httpStatus: Number(error?.statusCode) || undefined,
+          handoffId: handoffId || null,
+          tabId,
+        };
+      }
+    }
+    if (!result && durableIdentity) {
+      const begun = agentSendReceiptStore.beginAttempt(durableIdentity);
+      if (!begun?.ok) {
+        return durableAgentSendFailure(begun, { tabId, handoffId });
+      }
+      if (begun.action !== 'attempt-started') {
+        return durableAgentSendReplay(begun.record, {
+          operationKey: sendOperationKey,
+          attemptId: begun.record?.attemptId || null,
+          tabId,
+          handoffId,
+        });
+      }
+      durableAttemptId = begun.attemptId;
+    }
+    if (!result) try {
+      result = await bridgeRequest('sendAgentPromptScenario', {
       tabId,
       prompt,
       model,
@@ -1358,6 +1631,8 @@ async function runAgentSendScenario({
       thinking,
       cwd,
       handoffId,
+      sendOperationKey: sendOperationKey || null,
+      sendAttemptId: durableAttemptId,
       source,
       statusAtSend,
       queue: queue === true,
@@ -1365,33 +1640,139 @@ async function runAgentSendScenario({
       // Project/History/iOS controls the terminal tab directly: leave a found
       // terminal draft untouched and report conflict. External Inbox owns its
       // own chat composer: atomically pull terminal draft out for caller rollback.
-      returnDraftOnConflict: ownership === 'external',
-    }, timeoutMs);
-  } catch (error) {
-    if (error?.code !== 'bridge_timeout') throw error;
-    // BrowserWindow.send crossed the main -> renderer boundary, but the
-    // renderer did not return its receipt before the caller deadline. The
-    // scenario may still be launching, proving readiness, or waiting for the
-    // post-Enter transcript audit. Treating this as "not sent" invites a
-    // duplicate; treating it as "sent" fabricates delivery. Preserve the
-    // exact handoff for a later audit and surface an explicit unknown state.
-    console.warn('[AgentScenario] renderer receipt timeout tab=' + shortId(tabId, 12)
-      + ' handoff=' + (handoffId || '-')
-      + ' source=' + (source || '-')
-      + ' timeoutMs=' + timeoutMs
-      + ' -> delivery-unknown');
+        returnDraftOnConflict: ownership === 'external',
+      }, timeoutMs);
+    } catch (error) {
+      if (error?.dispatched === false || error?.code === 'bridge_unavailable') {
+        result = {
+          success: false,
+          accepted: false,
+          submitted: false,
+          status: 'not-submitted',
+          code: error?.code || 'bridge_unavailable',
+          error: error?.message || String(error),
+          httpStatus: 503,
+          handoffId: handoffId || null,
+          tabId,
+        };
+      } else {
+      // BrowserWindow.send crossed the main -> renderer boundary, but the
+      // renderer did not return its receipt before the caller deadline. The
+      // scenario may still be launching, proving readiness, or waiting for the
+      // post-Enter transcript audit. Treating this as "not sent" invites a
+      // duplicate; treating it as "sent" fabricates delivery. Preserve the
+      // exact handoff for a later audit and surface an explicit unknown state.
+      console.warn('[AgentScenario] renderer receipt timeout tab=' + shortId(tabId, 12)
+        + ' handoff=' + (handoffId || '-')
+        + ' source=' + (source || '-')
+        + ' timeoutMs=' + timeoutMs
+        + ' -> delivery-unknown');
+        result = {
+        success: null,
+        accepted: true,
+        submitted: null,
+        status: 'delivery-unknown',
+        deliveryUnknown: true,
+        code: 'bridge_timeout_delivery_unknown',
+        warning: 'The send scenario may still complete; do not retry this handoff blindly.',
+        handoffId: handoffId || null,
+        tabId,
+        };
+      }
+    }
+
+    if (durableIdentity && durableAttemptId) {
+      const settled = agentSendReceiptStore.settleAttempt(
+        sendOperationKey,
+        durableAttemptId,
+        result,
+      );
+      // An exact audit may win the race while the renderer callback is still
+      // returning. Never let that stale callback overwrite the durable fact.
+      if (settled?.record && (settled.record.state === 'confirmed' || settled.applied !== true)) {
+        return durableAgentSendReplay(settled.record, {
+          operationKey: sendOperationKey,
+          attemptId: durableAttemptId,
+          tabId,
+          handoffId,
+          replayed: settled.applied !== true,
+        });
+      }
+    }
+    return {
+      ...(result || {}),
+      ...(sendOperationKey ? { operationKey: sendOperationKey } : {}),
+      ...(durableAttemptId ? { attemptId: durableAttemptId } : {}),
+    };
+  };
+
+  if (!handoffId) return await executeSend();
+  const registered = await agentSendReceiptRegistry.run({
+    tabId,
+    handoffId,
+    requestFingerprint,
+    provider: provider || null,
+    sessionId: sessionId || null,
+    promptHash,
+  }, executeSend);
+  if (registered.replayed === true || registered.joined === true
+    || registered.state === AGENT_SEND_RECEIPT_STATES.CONFLICT) {
+    console.log('[AgentSendReceipt] reuse tab=' + shortId(tabId, 12)
+      + ' handoff=' + String(handoffId).slice(0, 32)
+      + ' state=' + registered.state
+      + ' replayed=' + (registered.replayed === true)
+      + ' joined=' + (registered.joined === true)
+      + ' attempt=' + (registered.attempt ?? '-'));
+  }
+
+  if (registered.state === AGENT_SEND_RECEIPT_STATES.CONFLICT) {
+    return {
+      success: false,
+      accepted: false,
+      submitted: false,
+      status: 'conflict',
+      code: 'agent_send_handoff_conflict',
+      error: 'The same handoffId was already used for a different send request.',
+      handoffId,
+      tabId,
+      mismatchedFields: registered.mismatchedFields || [],
+    };
+  }
+  if (registered.state === AGENT_SEND_RECEIPT_STATES.CAPACITY) {
+    return {
+      success: false,
+      accepted: false,
+      submitted: false,
+      status: 'not-submitted',
+      code: registered.code,
+      error: 'The exact send receipt registry is full; the prompt was not submitted.',
+      handoffId,
+      tabId,
+    };
+  }
+  if (registered.state === AGENT_SEND_RECEIPT_STATES.EVICTED_UNKNOWN) {
     return {
       success: null,
       accepted: true,
       submitted: null,
       status: 'delivery-unknown',
       deliveryUnknown: true,
-      code: 'bridge_timeout_delivery_unknown',
-      warning: 'The send scenario may still complete; do not retry this handoff blindly.',
-      handoffId: handoffId || null,
+      code: registered.code,
+      warning: 'The unresolved send receipt expired; do not retry this handoff blindly.',
+      handoffId,
       tabId,
+      replayed: true,
     };
   }
+  return {
+    ...(registered.receipt || {}),
+    handoffId,
+    tabId,
+    receiptState: registered.state,
+    replayed: registered.replayed === true,
+    joined: registered.joined === true,
+    sendAttempt: registered.attempt,
+  };
 }
 
 async function dispatchDeferredOrchestrationRun(runId, {
@@ -1477,6 +1858,8 @@ async function dispatchDeferredOrchestrationRun(runId, {
       queue: false,
       ownership: 'project',
       presentationSnapshot: orchestrationPresentationSnapshot(current, 'request'),
+      provider: current.targetToolType || status?.toolType || status?.commandType || null,
+      sessionId: status?.sessionId || current.sessionId || null,
       timeoutMs: 60_000,
     });
     const sendResult = {
@@ -1817,6 +2200,17 @@ async function probeOrchestrationResult(run, {
   }
 }
 
+function exactOrchestrationTerminalFailure(probe) {
+  if (probe?.found !== true) return null;
+  if (probe.terminalEvent === 'turn_aborted') {
+    return probe.terminalOutcomeReason || 'turn_aborted';
+  }
+  if (probe.terminalEvent === 'task_complete' && probe.hasFinalResult !== true) {
+    return probe.terminalOutcomeReason || 'codex-no-final-result';
+  }
+  return null;
+}
+
 function emitOrchestrationChanges(changed, reason) {
   for (const run of Array.isArray(changed) ? changed : []) emitOrchestrationRun(run, reason);
 }
@@ -1920,6 +2314,8 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
         current,
         current.status === 'completed' ? 'completion' : 'failure',
       ),
+      provider: status?.toolType || status?.commandType || null,
+      sessionId: notificationSourceSessionId,
       timeoutMs: 60_000,
     });
     const sendReceipt = classifyAgentSendReceipt(result);
@@ -1987,6 +2383,7 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
           sessionId: audit.sessionId || null,
           entryUuid: audit.entryUuid || null,
           executionContext: audit.executionContext || null,
+          queuedAtSubmit: audit.queuedAtSubmit === true,
         });
       }
       const deliveredRun = await store.getInternal(current.runId);
@@ -2025,17 +2422,111 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
 }
 
 async function notifyAgentPromptAuditResult(detail = {}) {
+  // This main-owned receipt is the send authority for ordinary Project API,
+  // Terminal MCP and Inbox retries. Promote it before the feature-specific
+  // orchestration projections consume the same exact audit.
+  const durableOperationKey = cleanOptionalString(detail?.sendOperationKey, '');
+  const durableAttemptId = cleanOptionalString(detail?.sendAttemptId, '');
+  const durableAuditTabId = cleanOptionalString(detail?.tabId, '');
+  const durableAuditHandoffId = cleanOptionalString(detail?.handoffId, '');
+  const durableCandidates = agentSendReceiptStore
+    && durableAuditTabId
+    && durableAuditHandoffId
+    ? agentSendReceiptStore.list({ tabId: durableAuditTabId })
+      .filter((record) => record.handoffId === durableAuditHandoffId)
+    : [];
+  const durableRecordForAudit = agentSendReceiptStore && durableOperationKey
+    ? agentSendReceiptStore.get(durableOperationKey)
+    : durableCandidates.length === 1
+      ? durableCandidates[0]
+      : null;
+  const durableIdentityRequired = !!agentSendReceiptStore && (
+    !!durableOperationKey
+    || !!durableAttemptId
+    || durableCandidates.length > 0
+  );
+  const durableIdentityComplete = !!durableOperationKey && !!durableAttemptId;
+  let durablePromotion = null;
+  if (durableIdentityRequired && !durableIdentityComplete) {
+    durablePromotion = {
+      ok: false,
+      matched: durableCandidates.length > 0,
+      promoted: false,
+      reason: 'durable-audit-identity-missing',
+      record: durableRecordForAudit,
+    };
+    console.warn('[AgentSendReceipt] reject audit without exact durable identity tab='
+      + shortId(detail?.tabId, 12)
+      + ' handoff=' + String(detail?.handoffId || '-').slice(0, 32)
+      + ' candidates=' + durableCandidates.length);
+  } else if (agentSendReceiptStore && durableIdentityComplete) {
+    durablePromotion = agentSendReceiptStore.promoteFromAudit({
+      ...detail,
+      operationKey: durableOperationKey,
+      attemptId: durableAttemptId,
+      promptHash: detail?.actualHash || detail?.promptHash,
+    });
+    console.log('[AgentSendReceipt] durable audit op=' + durableOperationKey.slice(0, 72)
+      + ' attempt=' + durableAttemptId.slice(0, 24)
+      + ' promoted=' + (durablePromotion?.promoted === true)
+      + ' reason=' + (durablePromotion?.reason || '-'));
+  }
+  const durableAuditAccepted = !durableIdentityRequired || !agentSendReceiptStore
+    || durablePromotion?.promoted === true
+    || (durablePromotion?.idempotent === true && durablePromotion?.record?.state === 'confirmed');
+  const sendReceiptPromotion = durableAuditAccepted
+    ? agentSendReceiptRegistry.promoteFromAudit(detail)
+    : { matched: false, promoted: false, reason: 'durable-audit-rejected' };
+  if (sendReceiptPromotion.matched) {
+    console.log('[AgentSendReceipt] audit tab=' + shortId(detail?.tabId, 12)
+      + ' handoff=' + String(detail?.handoffId || '-').slice(0, 32)
+      + ' promoted=' + (sendReceiptPromotion.promoted === true)
+      + ' state=' + (sendReceiptPromotion.state || '-')
+      + ' reason=' + (sendReceiptPromotion.reason || '-'));
+  }
   const externalHandoffId = typeof detail?.handoffId === 'string' ? detail.handoffId : '';
   if (detail?.success === true && externalHandoffId.startsWith('external-run:')) {
     const externalRunId = externalHandoffId.slice('external-run:'.length);
-    const externalRun = externalRuns.get(externalRunId);
+    const durableRecord = durablePromotion?.record
+      || durableRecordForAudit;
+    let externalRun = externalRuns.get(externalRunId);
+    if (!externalRun && durableRecord?.surface === 'inbox' && durableRecord.runId === externalRunId) {
+      externalRun = {
+        runId: externalRunId,
+        provider: durableRecord.provider,
+        source: 'external-api',
+        handoffId: durableRecord.handoffId,
+        promptAuditHash: durableRecord.promptHash,
+        requestFingerprint: durableRecord.requestFingerprint,
+        status: 'audit_pending',
+        startedAt: durableRecord.createdAt,
+        autoStopMs: 0,
+        autoCloseMs: 0,
+        collapsed: false,
+        tabId: durableRecord.tabId,
+        sessionId: durableRecord.sessionId,
+        stopTimer: null,
+        closeTimer: null,
+        lastSendReceipt: durableRecord.receipt,
+      };
+      externalRuns.set(externalRunId, externalRun);
+      if (externalRun.tabId) externalRunByTabId.set(externalRun.tabId, externalRunId);
+    }
     const exactProvider = typeof detail?.toolType === 'string'
       && detail.toolType === externalRun?.provider;
     const exactSession = typeof detail?.sessionId === 'string'
       && detail.sessionId.length > 0
       && (!externalRun?.sessionId || detail.sessionId === externalRun.sessionId);
+    const exactDurableAttempt = !agentSendReceiptStore || Boolean(
+      durableOperationKey === `inbox:${externalRunId}`
+      && durableAttemptId
+      && durableAuditAccepted
+      && durableRecord?.state === 'confirmed'
+      && durableRecord?.attemptId === durableAttemptId
+    );
     const confirmed = Boolean(
       externalRun
+      && exactDurableAttempt
       && externalRun.tabId === detail.tabId
       && externalRun.handoffId === externalHandoffId
       && exactProvider
@@ -2112,7 +2603,23 @@ async function notifyAgentPromptAuditResult(detail = {}) {
   }
 
   const runId = orchestrationCompletionRunIdFromAudit(detail);
-  if (!runId) return { matched: false, confirmed: false };
+  if (!runId) {
+    if (sendReceiptPromotion.matched) {
+      return {
+        ...sendReceiptPromotion,
+        confirmed: sendReceiptPromotion.state === AGENT_SEND_RECEIPT_STATES.CONFIRMED,
+        kind: 'agent-send-receipt',
+      };
+    }
+    if (durablePromotion?.matched) {
+      return {
+        ...durablePromotion,
+        confirmed: durablePromotion.record?.state === 'confirmed',
+        kind: 'durable-agent-send-receipt',
+      };
+    }
+    return { matched: false, confirmed: false };
+  }
   const confirmation = await store.confirmSourceFollowup(runId, {
     kind: 'prompt-audit',
     sourceTabId: detail.tabId,
@@ -2125,6 +2632,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     sessionId: detail.sessionId || null,
     userUuid: detail.entryUuid || null,
     executionContext: detail.executionContext || null,
+    queuedAtSubmit: detail.queuedAtSubmit === true,
   });
   if (confirmation.confirmed) {
     console.log('[Orchestration] source follow-up confirmed run=' + runId
@@ -2206,12 +2714,36 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
   if (proof?.found !== true) {
     return { confirmed: false, reason: proof?.error || 'source-followup-turn-not-found' };
   }
+  let sourceFollowupExecutionContext = proof.executionContext || null;
+  const persistedParent = current.parentRunId
+    ? await store.getInternal(current.parentRunId)
+    : null;
+  const persistedParentContext = persistedParent?.targetExecutionContext || null;
+  if (sourceFollowupExecutionContext
+    && persistedParentContext
+    && sourceFollowupExecutionContext.provider === persistedParentContext.provider
+    && sourceFollowupExecutionContext.sessionId === persistedParentContext.sessionId
+    && sourceFollowupExecutionContext.turnId === persistedParentContext.turnId) {
+    // A transcript can recover provider/session/turn identity, but process and
+    // lifecycle generation live only in the durable parent run. Reattach those
+    // fields only after the exact provider turn matches; never promote a text
+    // match or a neighbouring turn into runtime ownership proof.
+    sourceFollowupExecutionContext = {
+      ...sourceFollowupExecutionContext,
+      processId: persistedParentContext.processId || null,
+      generation: persistedParentContext.generation ?? null,
+      startedAt: persistedParentContext.startedAt ?? sourceFollowupExecutionContext.startedAt ?? null,
+    };
+  }
   const confirmation = await store.confirmSourceFollowup(current.runId, {
     kind: 'transcript',
     sourceTabId: current.sourceTabId,
     notificationPromptHash: current.notificationPromptHash,
     sessionId,
     userUuid: proof.userUuid || null,
+    toolType: sourceFollowupExecutionContext?.provider || sourceInfo?.toolType || sourceInfo?.commandType || null,
+    executionContext: sourceFollowupExecutionContext,
+    sameTurnComplete: proof.complete === true,
   });
   if (confirmation.confirmed) {
     console.log('[Orchestration] source follow-up reconciled run=' + current.runId
@@ -2234,21 +2766,82 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
     return;
   }
   orchestrationCompletionInflight.add(run.runId);
+  let e2eResultProofBoundary = null;
   try {
     const store = getOrchestrationRunStore();
-    const current = await store.getInternal(run.runId);
+    let current = await store.getInternal(run.runId);
     if (!current) return;
+    const resultProofBoundary = e2eBoundaryTestGate?.enabled === true
+      ? await e2eBoundaryTestGate.waitIfArmed({
+          kind: 'orchestration-result-proof',
+          identity: {
+            runId: current.runId,
+            targetTabId: current.targetTabId,
+            status: current.status,
+            ...(current.sessionId ? { sessionId: current.sessionId } : {}),
+            ...(current.targetLifecycleGeneration
+              ? { lifecycleGeneration: current.targetLifecycleGeneration }
+              : {}),
+          },
+        })
+      : { claimed: false, reason: 'test_hook_disabled' };
+    if (resultProofBoundary?.claimed === true) {
+      if (resultProofBoundary.action === 'hold') {
+        e2eResultProofBoundary = resultProofBoundary;
+        console.warn('[E2E:Boundary] action=hold kind=orchestration-result-proof'
+          + ' run=' + current.runId
+          + ' target=' + shortId(current.targetTabId, 12)
+          + ' status=' + current.status);
+        current = await store.getInternal(run.runId);
+        if (!current) return;
+      } else {
+        e2eBoundaryTestGate.complete({
+          armId: resultProofBoundary.arm.armId,
+          operationId: resultProofBoundary.arm.operationId,
+          reason: 'non-hold-result-proof-boundary-ignored',
+          result: { success: true },
+        });
+      }
+    }
     const patch = {};
     if (current.status === 'completed') {
       let probe = await probeOrchestrationResult(current, { forceFresh: true });
+      let terminalFailureReason = exactOrchestrationTerminalFailure(probe);
       let watcher = null;
-      if (!isCompleteOrchestrationResult(probe)) {
+      if (!terminalFailureReason && !isCompleteOrchestrationResult(probe)) {
         // Subscribe first, then read again. If JSONL changes between the first
         // probe and watcher setup, the second read sees it. If it changes after
         // watcher setup, notifyAgentTranscriptChanged schedules a trailing pass.
         watcher = await armOrchestrationResultProof(current, probe);
         if (watcher?.success === true) {
           probe = await probeOrchestrationResult(current, { forceFresh: true });
+          terminalFailureReason = exactOrchestrationTerminalFailure(probe);
+        }
+      }
+      if (terminalFailureReason) {
+        const failed = await store.markResultProofTerminalFailure(
+          current.runId,
+          terminalFailureReason,
+          {
+            resultAvailable: probe.resultAvailable === true,
+            turnIndex: probe.turnIndex,
+            userUuid: probe.userUuid || null,
+          },
+        );
+        if (failed?.resolved) {
+          await releaseOrchestrationResultProof(current.runId, 'exact-terminal-result-failure');
+          emitOrchestrationChanges(failed.changed, reason + '-terminal-failure');
+          await finalizeSettledOrchestrations(
+            (failed.settled || []).filter((settledRun) => settledRun.runId !== current.runId),
+            reason + '-terminal-failure-settled',
+          );
+          const finalizedFailure = await store.get(current.runId);
+          await dispatchNextDeferredOrchestrationForTarget(
+            current.targetTabId,
+            'predecessor-terminal-result-failure',
+          );
+          await sendOrchestrationCompletionNotification(finalizedFailure);
+          return;
         }
       }
       const resultComplete = isCompleteOrchestrationResult(probe);
@@ -2309,6 +2902,14 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
     );
     await sendOrchestrationCompletionNotification(finalized);
   } finally {
+    if (e2eResultProofBoundary?.state === 'released') {
+      e2eBoundaryTestGate.complete({
+        armId: e2eResultProofBoundary.arm.armId,
+        operationId: e2eResultProofBoundary.arm.operationId,
+        reason: 'result-proof-pass-finished',
+        result: { success: true },
+      });
+    }
     orchestrationCompletionInflight.delete(run.runId);
     const replay = orchestrationCompletionTrailing.delete(run.runId);
     if (replay) {
@@ -2362,6 +2963,97 @@ async function processOrchestrationLifecycle(tabId, payload) {
   }
 }
 
+async function performE2eBoundaryAction(request = {}) {
+  if (e2eBoundaryTestGate?.enabled !== true) {
+    return { success: false, error: 'test_hook_disabled' };
+  }
+  const action = String(request?.action || '').trim();
+  if (action !== 'inject-provider-error') {
+    return { success: false, error: 'unsupported action' };
+  }
+  const runId = String(request?.runId || '').trim();
+  if (!runId) return { success: false, error: 'runId required' };
+  const store = getOrchestrationRunStore();
+  const run = await store.getInternal(runId);
+  if (!run) return { success: false, error: 'run not found' };
+  if (run.status !== 'running'
+    || run.targetBusySeen !== true
+    || !run.targetTabId
+    || !run.targetExecutionContext) {
+    return {
+      success: false,
+      error: 'run_not_in_exact_active_turn',
+      status: run.status,
+    };
+  }
+  const identity = {
+    runId: run.runId,
+    targetTabId: run.targetTabId,
+    status: run.status,
+    ...(run.sessionId ? { sessionId: run.sessionId } : {}),
+    ...(run.targetLifecycleGeneration
+      ? { lifecycleGeneration: run.targetLifecycleGeneration }
+      : {}),
+    provider: String(run.targetExecutionContext.provider || run.targetToolType || 'unknown'),
+    ...(run.targetExecutionContext.turnId
+      ? { turnId: run.targetExecutionContext.turnId }
+      : {}),
+  };
+  const claimed = e2eBoundaryTestGate.claim({
+    kind: 'orchestration-provider-error',
+    identity,
+  });
+  if (claimed.claimed !== true || claimed.action !== 'inject') {
+    if (claimed.claimed === true) {
+      e2eBoundaryTestGate.complete({
+        armId: claimed.arm.armId,
+        operationId: claimed.arm.operationId,
+        reason: 'non-inject-provider-error-boundary-ignored',
+        result: { success: false },
+      });
+    }
+    return {
+      success: false,
+      error: claimed.reason || 'provider_error_hook_not_armed',
+    };
+  }
+  console.warn('[TestFault] inject kind=orchestration-provider-error'
+    + ' run=' + run.runId
+    + ' target=' + shortId(run.targetTabId, 12)
+    + ' provider=' + identity.provider
+    + ' turn=' + String(identity.turnId || '-').slice(0, 16));
+  await processOrchestrationLifecycle(run.targetTabId, {
+    type: 'done',
+    reason: 'provider_error',
+    completedAt: Date.now(),
+    sessionId: run.sessionId || null,
+    lifecycleGeneration: run.targetLifecycleGeneration || null,
+    executionContext: run.targetExecutionContext,
+  });
+  const after = await store.getInternal(run.runId);
+  const injected = !!after
+    && (after.status === 'waiting_recovery' || after.status === 'failed')
+    && after.outcome === 'failed'
+    && String(after.error || '').includes('provider_error');
+  e2eBoundaryTestGate.complete({
+    armId: claimed.arm.armId,
+    operationId: claimed.arm.operationId,
+    reason: injected ? 'provider-error-applied' : 'provider-error-not-applied',
+    result: {
+      success: injected,
+      recovery: after?.status === 'waiting_recovery',
+    },
+  });
+  return {
+    success: injected,
+    error: injected ? null : 'provider_error_not_applied',
+    runId: run.runId,
+    targetTabId: run.targetTabId,
+    status: after?.status || null,
+    outcome: after?.outcome || null,
+  };
+}
+
 async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
   const store = getOrchestrationRunStore();
   const run = await store.getInternal(runId);
@@ -2385,6 +3077,9 @@ async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
     resultFound: probe.found === true,
     resultComplete: probe.resultComplete === true,
     resultAvailable: probe.resultAvailable === true,
+    resultTerminalEvent: probe.terminalEvent || null,
+    resultTerminalReason: probe.terminalOutcomeReason || null,
+    resultHasFinalResult: probe.hasFinalResult === true,
     turnIndex: probe.turnIndex,
   });
   if (reconciled.changed) emitOrchestrationRun(reconciled.changed, reason);
@@ -3141,6 +3836,7 @@ function bridgeRequest(action, payload, timeoutMs = 5000) {
       console.log('[BridgeDiag] NO_WINDOW action=' + action + label + ' wins=' + wins.length);
       const error = new Error('No window');
       error.code = 'bridge_unavailable';
+      error.dispatched = false;
       return reject(error);
     }
     const requestId = crypto.randomBytes(8).toString('hex');
@@ -3153,7 +3849,56 @@ function bridgeRequest(action, payload, timeoutMs = 5000) {
     }, timeoutMs);
     pendingBridge.set(requestId, { resolve, reject, timer, action, label, sentAt: Date.now() });
     console.log('[BridgeDiag] SEND action=' + action + label + ' rid=' + requestId + ' wins=' + wins.length);
-    win.webContents.send('web:bridge-request', { requestId, action, payload });
+    try {
+      win.webContents.send('web:bridge-request', { requestId, action, payload });
+    } catch (sendError) {
+      clearTimeout(timer);
+      pendingBridge.delete(requestId);
+      sendError.code ||= 'bridge_unavailable';
+      sendError.dispatched = false;
+      reject(sendError);
+      return;
+    }
+    if (e2eBoundaryTestGate?.enabled === true && action === 'sendAgentPromptScenario') {
+      const prompt = String(payload?.prompt || '');
+      const identity = {
+        requestId,
+        action,
+        tabId: String(payload?.tabId || ''),
+        source: String(payload?.source || 'unknown'),
+        promptHash: promptAuditFingerprint(prompt),
+        promptLength: prompt.length,
+        ...(payload?.handoffId ? { handoffId: String(payload.handoffId) } : {}),
+      };
+      const claimed = e2eBoundaryTestGate.claim({
+        kind: 'renderer-bridge-receipt',
+        identity,
+      });
+      if (claimed.claimed === true && claimed.action === 'drop') {
+        clearTimeout(timer);
+        pendingBridge.delete(requestId);
+        const error = new Error('Bridge receipt dropped by exact E2E boundary');
+        error.code = 'bridge_timeout';
+        console.warn('[E2E:Boundary] action=drop kind=renderer-receipt'
+          + ' request=' + requestId
+          + ' tab=' + shortId(payload?.tabId, 12)
+          + ' handoff=' + String(payload?.handoffId || '-').slice(0, 24));
+        reject(error);
+        e2eBoundaryTestGate.complete({
+          armId: claimed.arm.armId,
+          operationId: claimed.arm.operationId,
+          reason: 'renderer-receipt-dropped',
+          result: { success: true },
+        });
+      } else if (claimed.claimed === true) {
+        e2eBoundaryTestGate.complete({
+          armId: claimed.arm.armId,
+          operationId: claimed.arm.operationId,
+          reason: 'non-drop-renderer-receipt-boundary-ignored',
+          result: { success: true },
+        });
+      }
+    }
   });
 }
 
@@ -4628,10 +5373,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
       const operationHandoffId = cleanOptionalString(handoffId, '')
         || 'project-send:' + crypto.randomUUID();
+      const sendOperationKey = `project:${tabId}:${operationHandoffId}`;
       const sendPayload = appendAttachmentsToPrompt(prompt, attachments);
       // This request is the user's explicit authorization to reopen a closed
       // archived AI tab. Passive lifecycle/reconcile paths never call this.
-      await ensureExplicitAgentTabOpen(tabId);
+      const openDescriptor = findOrchestrationTabDescriptor(tabId);
+      const restorable = openDescriptor ? null : findRestorableAgentTabDescriptor(tabId);
       // Single bridge round-trip — renderer dispatches by tab.tabType/commandType.
       // Earlier this endpoint did TWO round-trips (status check + send), adding
       // ~50ms per phone send on top of the actual PTY paste latency.
@@ -4639,6 +5386,15 @@ async function handleApi(req, res, parsed, sdkSessions) {
         tabId, prompt: sendPayload.prompt, model, effort, thinking, cwd,
         handoffId: operationHandoffId, source, statusAtSend, queue: queue === true,
         ownership: 'project',
+        sendOperationKey,
+        sendSurface: 'project-api',
+        provider: openDescriptor?.toolType || (restorable?.ok === true ? restorable.toolType : null),
+        // A stopped/new Claude prompt can create a new physical session. The
+        // exact post-Enter audit binds that session to the receipt.
+        sessionId: null,
+        // Restoring a closed tab belongs to a physical send attempt. A replay
+        // of an already pending/confirmed receipt must not reopen UI state.
+        prepareSend: () => ensureExplicitAgentTabOpen(tabId, restorable),
       });
       const sendReceipt = classifyAgentSendReceipt(data);
       if (sendReceipt.state === 'not-submitted') {
@@ -4720,6 +5476,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   if (parsed.pathname === '/api/inbox/runs' && req.method === 'POST') {
+    let inboxRun = null;
     try {
       const body = await readBody(req);
       const provider = body.provider === 'codex' ? 'codex' : null;
@@ -4733,18 +5490,188 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const autoCloseMs = clampAutoCloseMs(body.autoCloseMs);
       const startupTimeoutMs = Math.max(5_000, Math.min(120_000, Number(body.startupTimeoutMs) || 20_000));
       const developerInstructions = cleanOptionalString(body.developerInstructions || body.systemPrompt, '');
+      const requestedModel = cleanOptionalString(body.model, '');
+      const requestedEffort = cleanOptionalString(body.effort, '');
+      const requestFingerprint = fingerprintAgentSendRequest({
+        provider,
+        prompt,
+        source,
+        conversationKey: conversationKey || null,
+        developerInstructions: developerInstructions || null,
+        model: requestedModel || null,
+        effort: requestedEffort || null,
+        queue: body.queue === true,
+        name: cleanOptionalString(body.name, '') || null,
+        autoStopMs,
+        autoCloseMs,
+        startupTimeoutMs,
+        collapsed: body.collapsed === true,
+      });
+      const sendOperationKey = `inbox:${runId}`;
+      const previousConversationRunId = conversationKey
+        ? externalRunByConversationKey.get(conversationKey)
+        : null;
+      const previousConversationTabId = previousConversationRunId
+        ? externalRuns.get(previousConversationRunId)?.tabId || null
+        : null;
+      const inboxReservedTabId = previousConversationTabId
+        || reservedInboxTabId(runId, conversationKey);
+      const durableInboxIdentity = agentSendReceiptStore ? {
+        operationKey: sendOperationKey,
+        surface: 'inbox',
+        runId,
+        tabId: inboxReservedTabId,
+        handoffId: 'external-run:' + runId,
+        requestFingerprint,
+        provider,
+        sessionId: null,
+        promptHash: promptAuditFingerprint(prompt),
+        promptLength: prompt.length,
+      } : null;
+      const durableInboxReservation = durableInboxIdentity
+        ? agentSendReceiptStore.reserveOrGet(durableInboxIdentity)
+        : null;
+      if (durableInboxReservation && !durableInboxReservation.ok) {
+        if (durableInboxReservation.action === 'conflict') {
+          return sendJson(res, 409, {
+            ok: false,
+            success: false,
+            submitted: false,
+            code: 'external_run_identity_conflict',
+            error: 'The same runId was already used for a different Inbox request.',
+            runId,
+            tabId: durableInboxReservation.record?.tabId || inboxReservedTabId,
+            mismatchedFields: durableInboxReservation.mismatchedFields || [],
+          });
+        }
+        return sendJson(res, 503, {
+          ok: false,
+          success: false,
+          submitted: false,
+          code: durableInboxReservation.code || 'agent_send_receipt_store_capacity',
+          error: 'Inbox send could not reserve a durable receipt before creating a tab.',
+          runId,
+          tabId: inboxReservedTabId,
+        });
+      }
       const startedAt = Date.now();
       const autoStopAt = autoStopMs > 0 ? null : null;
       const autoCloseAt = null;
+      let existingRun = externalRuns.get(runId) || null;
+      if (!existingRun && durableInboxReservation?.action === 'replay'
+        && durableInboxReservation.retryable !== true) {
+        const record = durableInboxReservation.record;
+        existingRun = {
+          runId,
+          provider,
+          source,
+          handoffId: 'external-run:' + runId,
+          promptAuditHash: record.promptHash,
+          requestFingerprint,
+          conversationKey: conversationKey || undefined,
+          status: externalRunStatusFromDurableRecord(record),
+          startedAt: record.createdAt || startedAt,
+          autoStopAt: null,
+          autoStopMs,
+          autoCloseAt: null,
+          autoCloseMs,
+          collapsed: body.collapsed === true,
+          reservedTabId: record.tabId || inboxReservedTabId,
+          tabId: record.tabId || inboxReservedTabId,
+          sessionId: record.sessionId || null,
+          stopTimer: null,
+          closeTimer: null,
+          lastSendReceipt: durableAgentSendReplay(record, {
+            operationKey: sendOperationKey,
+            attemptId: record.attemptId || null,
+          }),
+          auditConfirmedAt: record.receipt?.exactAuditConfirmed === true || record.auditIdentity
+            ? record.settledAt || Date.now()
+            : null,
+          auditSessionId: record.auditIdentity?.sessionId || null,
+        };
+        externalRuns.set(runId, existingRun);
+        externalRunByTabId.set(existingRun.tabId, runId);
+        if (conversationKey) externalRunByConversationKey.set(conversationKey, runId);
+        return replayExternalRunResponse(res, existingRun);
+      }
+      if (existingRun) {
+        if (existingRun.requestFingerprint !== requestFingerprint) {
+          return sendJson(res, 409, {
+            ok: false,
+            success: false,
+            submitted: false,
+            code: 'external_run_identity_conflict',
+            error: 'The same runId was already used for a different Inbox request.',
+            runId,
+            tabId: existingRun.tabId || null,
+          });
+        }
+        // The reservation/status transition happens synchronously before the
+        // first await. Treat it as the per-run retry lease: a concurrent
+        // identical request observes the same operation instead of entering a
+        // second setup/create/send attempt after an earlier retryable failure.
+        if (['reserving', 'starting', 'sending'].includes(existingRun.status)) {
+          return replayExternalRunResponse(res, existingRun);
+        }
+        const retryablePreSubmit = existingRun.lastSendReceipt?.submitted === false
+          || ['auth_required', 'start_failed', 'start_timeout', 'setup_failed'].includes(existingRun.status);
+        if (!retryablePreSubmit) return replayExternalRunResponse(res, existingRun);
+        inboxRun = existingRun;
+        clearExternalRunTimer(inboxRun, 'stopTimer');
+        clearExternalRunTimer(inboxRun, 'closeTimer');
+        inboxRun.status = 'starting';
+        inboxRun.error = null;
+        inboxRun.errorCode = null;
+        inboxRun.reservedTabId ||= inboxReservedTabId;
+      } else {
+        inboxRun = {
+          runId,
+          provider,
+          source,
+          handoffId: 'external-run:' + runId,
+          promptAuditHash: promptAuditFingerprint(prompt),
+          requestFingerprint,
+          conversationKey: conversationKey || undefined,
+          status: 'reserving',
+          startedAt,
+          autoStopAt,
+          autoStopMs,
+          autoCloseAt,
+          autoCloseMs,
+          collapsed: body.collapsed === true,
+          reservedTabId: inboxReservedTabId,
+          tabId: null,
+          sessionId: null,
+          stopTimer: null,
+          closeTimer: null,
+          lastSendReceipt: null,
+        };
+        // Reserve before any asynchronous tab creation. A concurrent retry of
+        // the same runId now observes this exact operation instead of creating
+        // another tab and another physical send.
+        externalRuns.set(runId, inboxRun);
+      }
+      if (durableInboxReservation?.record?.state === 'reserved') {
+        agentSendReceiptStore.markPreparing(sendOperationKey);
+      }
       await bridgeRequest('ensureInboxProject', {}, 5000);
-      let tabId = null;
-      let sessionId = null;
-      let reused = false;
+      let tabId = inboxRun.tabId || null;
+      let sessionId = inboxRun.sessionId || null;
+      let reused = !!tabId;
       let targetCreated = false;
-      if (conversationKey && externalRunByConversationKey.has(conversationKey)) {
+      if (!tabId && inboxRun.reservedTabId) {
+        const reservedDescriptor = findOrchestrationTabDescriptor(inboxRun.reservedTabId);
+        if (reservedDescriptor?.toolType === provider) {
+          tabId = inboxRun.reservedTabId;
+          sessionId = reservedDescriptor.sessionId || null;
+          reused = true;
+        }
+      }
+      if (!tabId && conversationKey && externalRunByConversationKey.has(conversationKey)) {
         const prevRunId = externalRunByConversationKey.get(conversationKey);
         const prevRun = externalRuns.get(prevRunId);
-        if (prevRun?.tabId) {
+        if (prevRun?.tabId && prevRun.tabId === inboxRun.reservedTabId) {
           try {
             clearExternalRunTimer(prevRun, 'stopTimer');
             clearExternalRunTimer(prevRun, 'closeTimer');
@@ -4764,52 +5691,59 @@ async function handleApi(req, res, parsed, sdkSessions) {
         }
       }
       const tabName = cleanOptionalString(body.name, conversationKey ? `Codex · ${conversationKey.slice(-8)}` : `Codex · ${source}`);
-      const externalRun = {
-        runId,
-        provider,
-        source,
-        handoffId: 'external-run:' + runId,
-        promptAuditHash: promptAuditFingerprint(prompt),
-        conversationKey: conversationKey || undefined,
-        status: 'starting',
-        startedAt,
-        autoStopAt,
-        autoStopMs,
-        autoCloseAt,
-        autoCloseMs,
-        collapsed: body.collapsed === true,
-      };
+      inboxRun.status = 'starting';
       if (!tabId) {
         const tab = await bridgeRequest('createAgentTab', {
           projectId: INBOX_PROJECT_ID,
           toolType: provider,
           name: tabName,
           startNow: true,
-          externalRun,
+          externalRun: inboxRun,
           codexDeveloperInstructions: developerInstructions || undefined,
-          codexModel: cleanOptionalString(body.model, ''),
-          codexEffort: cleanOptionalString(body.effort, ''),
+          codexModel: requestedModel,
+          codexEffort: requestedEffort,
+          reservedTabId: inboxRun.reservedTabId,
         }, 8000);
         tabId = tab?.tabId;
-        if (!tabId) return sendJson(res, 500, { error: 'failed to create tab' });
+        if (!tabId) {
+          const createError = new Error('failed to create tab');
+          createError.code = 'external_tab_create_failed';
+          throw createError;
+        }
         targetCreated = true;
       }
-      const run = { ...externalRun, tabId, sessionId, stopTimer: null, closeTimer: null };
-      externalRuns.set(runId, run);
+      const run = inboxRun;
+      Object.assign(run, { tabId, sessionId, reused, status: 'starting' });
       externalRunByTabId.set(tabId, runId);
       if (conversationKey) externalRunByConversationKey.set(conversationKey, runId);
-      setExternalRunMeta(tabId, { ...externalRun, tabId });
+      setExternalRunMeta(tabId, { ...run, stopTimer: undefined, closeTimer: undefined });
       let status = null;
       try {
         status = await waitForAgentReady(tabId, startupTimeoutMs);
       } catch (e) {
         if (e?.code === 'codex_auth_required') {
           run.status = 'auth_required';
+          run.errorCode = 'codex_auth_required';
+          run.error = 'codex_auth_required';
+          run.lastSendReceipt = {
+            success: false,
+            submitted: false,
+            code: 'codex_auth_required',
+            error: 'codex_auth_required',
+          };
           setExternalRunMeta(tabId, { status: 'auth_required', error: 'codex_auth_required' });
           return sendJson(res, 409, { ok: false, runId, tabId, error: 'codex_auth_required', status: e.status || null });
         }
         if (e?.code === 'agent_startup_defaults_failed') {
           run.status = 'start_failed';
+          run.errorCode = e.code;
+          run.error = String(e.message || e);
+          run.lastSendReceipt = {
+            success: false,
+            submitted: false,
+            code: e.code,
+            error: run.error,
+          };
           setExternalRunMeta(tabId, { status: 'start_failed', error: String(e.message || e) });
           return sendJson(res, 409, {
             ok: false,
@@ -4821,6 +5755,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
           });
         }
         run.status = 'start_timeout';
+        run.errorCode = 'agent_start_timeout';
+        run.error = String(e.message || e);
+        run.lastSendReceipt = {
+          success: false,
+          submitted: false,
+          code: run.errorCode,
+          error: run.error,
+        };
         setExternalRunMeta(tabId, { status: 'start_timeout', error: String(e.message || e) });
         return sendJson(res, 504, { ok: false, runId, tabId, error: 'agent did not become ready', status: e.status || null });
       }
@@ -4833,8 +5775,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         targetToolType: provider,
         baselineStatus: status?.status || 'active',
         queueRequested: body.queue === true,
-        model: cleanOptionalString(body.model, '') || undefined,
-        effort: cleanOptionalString(body.effort, '') || undefined,
+        model: requestedModel || undefined,
+        effort: requestedEffort || undefined,
       });
       const sendResult = await runAgentSendScenario({
         tabId,
@@ -4846,17 +5788,28 @@ async function handleApi(req, res, parsed, sdkSessions) {
         statusAtSend: status?.status || 'active',
         queue: sendOptions.queue,
         ownership: 'external',
+        provider,
+        sessionId,
+        sendOperationKey,
+        sendSurface: 'inbox',
+        sendRunId: runId,
+        sendRequestFingerprint: requestFingerprint,
         timeoutMs: 60_000,
       });
+      run.lastSendReceipt = sendResult;
       const sendReceipt = classifyAgentSendReceipt(sendResult);
       if (sendReceipt.state === 'not-submitted') {
         const failureCode = sendResult?.code || 'send_failed';
         run.status = failureCode === 'terminal_draft_conflict' ? 'draft_conflict' : 'send_failed';
+        run.errorCode = failureCode;
+        run.error = sendResult.error || 'send failed';
         setExternalRunMeta(tabId, { status: run.status, error: sendResult.error || 'send failed' });
         return sendSendFailure(res, sendResult, { runId, tabId, sessionId });
       }
       if (sendReceipt.state === 'delivery-unknown') {
         run.status = 'delivery_unknown';
+        run.errorCode = null;
+        run.error = null;
         run.auditPendingAt = null;
         run.deliveryUnknownAt = Date.now();
         setExternalRunMeta(tabId, {
@@ -4907,6 +5860,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
           });
         }
         run.status = 'audit_pending';
+        run.errorCode = null;
+        run.error = null;
         run.auditPendingAt = Date.now();
         setExternalRunMeta(tabId, {
           status: 'audit_pending',
@@ -4931,6 +5886,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         });
       }
       run.status = 'running';
+      run.errorCode = null;
+      run.error = null;
       setExternalRunMeta(tabId, { status: 'running', sessionId, autoStopAt: null, autoStopMs, autoCloseAt: null, autoCloseMs });
       return sendJson(res, 200, {
         ok: true,
@@ -4949,6 +5906,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
         reused,
       });
     } catch (e) {
+      if (inboxRun && ['reserving', 'starting'].includes(inboxRun.status)) {
+        inboxRun.status = 'setup_failed';
+        inboxRun.errorCode = e?.code || 'external_run_setup_failed';
+        inboxRun.error = String(e.message || e);
+        inboxRun.lastSendReceipt = {
+          success: false,
+          submitted: false,
+          code: inboxRun.errorCode,
+          error: inboxRun.error,
+        };
+      }
       return sendJson(res, 500, { ok: false, error: String(e.message || e) });
     }
   }
@@ -6631,6 +7599,7 @@ function attachWebSocket(server, sdkSessions) {
 
 function start({
   sdkSessions,
+  agentSendReceiptStore: agentSendReceiptStoreFn,
   computeActiveLoaders: computeFn,
   computeProjectActivity: computeProjectActivityFn,
   answerClaudeQuestion: answerFn,
@@ -6642,12 +7611,20 @@ function start({
   readAgentLifecycleIdentity: readAgentLifecycleIdentityFn,
   readAgentStartReadiness: readAgentStartReadinessFn,
   registerTaskCompletionIntent: registerTaskCompletionIntentFn,
+  e2eBoundaryTestGate: e2eBoundaryTestGateFn,
 }) {
   if (httpServer) {
     console.log('[WebServer] already started');
     return;
   }
   if (!sdkSessions) throw new Error('start({sdkSessions}) — Map of live SDK sessions required');
+  agentSendReceiptStore = agentSendReceiptStoreFn || null;
+  if (agentSendReceiptStore) {
+    const reconciled = agentSendReceiptStore.reconcileStartup();
+    if (reconciled?.changed) {
+      console.warn('[AgentSendReceipt] startup reconciled active attempts=' + reconciled.changed);
+    }
+  }
   computeActiveLoaders = computeFn || null;
   computeProjectActivity = computeProjectActivityFn || null;
   answerClaudeQuestion = answerFn || null;
@@ -6660,6 +7637,7 @@ function start({
   readAgentLifecycleIdentity = readAgentLifecycleIdentityFn || null;
   readAgentStartReadiness = readAgentStartReadinessFn || null;
   registerTaskCompletionIntent = registerTaskCompletionIntentFn || null;
+  e2eBoundaryTestGate = e2eBoundaryTestGateFn || null;
   token = loadOrCreateToken();
   registerBridgeReplyHandler();
   void getOrchestrationRunStore().initialize()
@@ -6719,6 +7697,8 @@ function writeWebServerDiscovery() {
 }
 
 function stop() {
+  const serverToClose = httpServer;
+  let serverClosePromise = Promise.resolve();
   if (orchestrationPolicyTimer) clearTimeout(orchestrationPolicyTimer);
   orchestrationPolicyTimer = null;
   if (orchestrationResultProofCoordinator) {
@@ -6731,7 +7711,16 @@ function stop() {
   }
   orchestrationCompletionTrailing.clear();
   if (wss) try { wss.close(); } catch {}
-  if (httpServer) try { httpServer.close(); } catch {}
+  if (serverToClose) {
+    serverClosePromise = new Promise((resolve) => {
+      try {
+        serverToClose.close(() => resolve());
+        serverToClose.closeIdleConnections?.();
+      } catch {
+        resolve();
+      }
+    });
+  }
   try { fs.unlinkSync(DISCOVERY_FILE); } catch {}
   if (transcriptService) {
     for (const consumerId of webTranscriptSubscriptions.values()) {
@@ -6752,7 +7741,21 @@ function stop() {
   readAgentLifecycleIdentity = null;
   readAgentStartReadiness = null;
   registerTaskCompletionIntent = null;
+  e2eBoundaryTestGate = null;
+  agentSendReceiptRegistry.clear();
+  for (const run of externalRuns.values()) {
+    clearExternalRunTimer(run, 'stopTimer');
+    clearExternalRunTimer(run, 'closeTimer');
+  }
+  externalRuns.clear();
+  externalRunByTabId.clear();
+  externalRunByConversationKey.clear();
+  // The injected SQLite store deliberately remains intact. Clearing this
+  // reference only releases the current server instance; start() receives the
+  // same durable authority again after an app/server restart.
+  agentSendReceiptStore = null;
   subscribers.clear();
+  return serverClosePromise;
 }
 
 function getInfo() {
@@ -6857,6 +7860,7 @@ module.exports = {
   acknowledgeOrchestrationRun,
   getOrchestrationSettings,
   updateOrchestrationSettings,
+  performE2eBoundaryAction,
   performOrchestrationAction,
   handleOrchestrationTabClosed,
   notifyClaudeSessionAvailable,

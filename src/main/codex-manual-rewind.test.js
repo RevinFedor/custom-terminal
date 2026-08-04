@@ -4,7 +4,10 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   advanceManualCodexRewindNavigation,
+  advanceManualCodexRewindOwnedInputRevision,
   assessManualCodexEnterPreflightScreen,
+  classifyManualCodexRewindRestoredComposer,
+  classifyManualCodexRewindControlInput,
   classifyManualCodexEnterFrame,
   decideManualCodexRewindEnterWrite,
   isPureCodexEscapeBurst,
@@ -41,6 +44,112 @@ function sourceMessage(index, text) {
     textHash: hashCodexRewindTargetText(text),
   };
 }
+
+test('only exact native Rewind controls may advance the action-owned input revision', () => {
+  const frame = classifyManualCodexEnterFrame(overlaySnapshot('rewind target'));
+  for (const data of ['\x1b[D', '\x1b[C', '\x1b[A', '\x1b[B', '\x1b[5~', '\x1b[6~', '\x1b[H', '\x1b[F']) {
+    assert.equal(classifyManualCodexRewindControlInput({
+      data,
+      frame,
+      candidateObserver: true,
+    }).owned, true, data);
+  }
+  assert.deepEqual(classifyManualCodexRewindControlInput({
+    data: '\r',
+    frame,
+    candidateObserver: true,
+  }), {
+    owned: true,
+    kind: 'confirm',
+    reason: 'rewind-confirm-control',
+  });
+  assert.deepEqual(classifyManualCodexRewindControlInput({
+    data: '\r',
+    frame: classifyManualCodexEnterFrame({ success: false }),
+    framePending: true,
+    candidateObserver: true,
+  }), {
+    owned: true,
+    kind: 'confirm-pending',
+    reason: 'rewind-confirm-frame-pending',
+  }, 'a pending mirror defers Enter classification to the fail-closed async preflight');
+  assert.equal(classifyManualCodexRewindControlInput({
+    data: '\r',
+    frame: classifyManualCodexEnterFrame({ success: true, lines: [] }),
+    candidateObserver: true,
+  }).owned, false, 'a settled ordinary frame does not borrow the Rewind lease');
+  assert.equal(classifyManualCodexRewindControlInput({
+    data: '\x1b',
+    frame: classifyManualCodexEnterFrame({ success: true, lines: [] }),
+    escapePrimeAllowed: true,
+    candidateObserver: true,
+  }).owned, true, 'the second Escape owns the pre-overlay transition');
+  assert.equal(classifyManualCodexRewindControlInput({
+    data: '\x1b',
+    frame: classifyManualCodexEnterFrame({ success: true, lines: [] }),
+    candidateObserver: true,
+  }).owned, false, 'Escape during an unproven or busy context cannot borrow the old lease');
+  for (const data of ['typed text', 'q', '\x03', '\t', '\x1b[Z']) {
+    assert.equal(classifyManualCodexRewindControlInput({
+      data,
+      frame,
+      candidateObserver: true,
+    }).owned, false, data);
+  }
+  assert.equal(classifyManualCodexRewindControlInput({
+    data: '\x1b[D',
+    frame,
+    candidateObserver: false,
+  }).owned, false, 'an overlay-like key without the main observer is ordinary input');
+  assert.equal(classifyManualCodexRewindControlInput({
+    data: '\x1b[D',
+    frame: classifyManualCodexEnterFrame({ success: true, lines: [] }),
+    candidateObserver: true,
+  }).owned, false, 'navigation outside the exact picker cannot borrow the lease');
+});
+
+test('native Rewind input ownership advances only across a contiguous revision chain', () => {
+  assert.deepEqual(advanceManualCodexRewindOwnedInputRevision({
+    previousOwnedRevision: 8,
+    inputRevisionBefore: 7,
+    inputRevisionAfter: 8,
+    ownedControlCount: 0,
+    controlKind: 'navigation',
+  }), {
+    allowed: true,
+    reason: 'rewind-authority-created-by-control',
+    ownedInputRevision: 8,
+    ownedControlCount: 1,
+  });
+  assert.equal(advanceManualCodexRewindOwnedInputRevision({
+    previousOwnedRevision: 8,
+    inputRevisionBefore: 8,
+    inputRevisionAfter: 9,
+    ownedControlCount: 1,
+    controlKind: 'navigation',
+  }).allowed, true);
+  assert.equal(advanceManualCodexRewindOwnedInputRevision({
+    previousOwnedRevision: 8,
+    inputRevisionBefore: 9,
+    inputRevisionAfter: 10,
+    ownedControlCount: 1,
+    controlKind: 'navigation',
+  }).reason, 'rewind-input-revision-gap', 'an unseen foreign bump cannot be hidden');
+  assert.equal(advanceManualCodexRewindOwnedInputRevision({
+    previousOwnedRevision: 9,
+    inputRevisionBefore: 9,
+    inputRevisionAfter: 9,
+    ownedControlCount: 2,
+    controlKind: 'confirm-pending',
+  }).allowed, true, 'a queued confirming Enter may advance only at its later write boundary');
+  assert.equal(advanceManualCodexRewindOwnedInputRevision({
+    previousOwnedRevision: 9,
+    inputRevisionBefore: 9,
+    inputRevisionAfter: 9,
+    ownedControlCount: 2,
+    controlKind: 'navigation',
+  }).allowed, false, 'non-confirming controls cannot claim a missing revision');
+});
 
 test('physical Enter is classified as native Rewind only for a proven headless overlay', () => {
   assert.deepEqual(
@@ -83,6 +192,47 @@ test('physical Enter is classified as native Rewind only for a proven headless o
     classifyManualCodexEnterFrame(footerWithoutTitle).kind,
     'ordinary-enter',
     'the exact footer without the separate transcript title is insufficient',
+  );
+
+  const titleImmediatelyAboveViewport = structuredClone(footerWithoutTitle);
+  titleImmediatelyAboveViewport.viewportY = 10;
+  titleImmediatelyAboveViewport.cols = 57;
+  titleImmediatelyAboveViewport.preViewportLines = [
+    { row: 9, text: '/ T R A N S C R I P T / / / / / /' },
+  ];
+  assert.equal(
+    classifyManualCodexEnterFrame(titleImmediatelyAboveViewport).kind,
+    'native-rewind-confirm',
+    'same-frame transcript title in the headless viewport guard completes the proof',
+  );
+
+  const exactNarrowFrame = structuredClone(titleImmediatelyAboveViewport);
+  exactNarrowFrame.lines[2] = {
+    row: 13,
+    text: 'q to quit esc/← to edit prev → to edit next enter',
+    occupiedEndX: 51,
+  };
+  assert.equal(
+    classifyManualCodexEnterFrame(exactNarrowFrame).kind,
+    'native-rewind-confirm',
+    'the exact right-edge-clipped footer used by Codex at 57 columns is responsive chrome',
+  );
+
+  const narrowFooterAwayFromRightEdge = structuredClone(exactNarrowFrame);
+  narrowFooterAwayFromRightEdge.lines[2].occupiedEndX = 30;
+  assert.equal(
+    classifyManualCodexEnterFrame(narrowFooterAwayFromRightEdge).kind,
+    'ordinary-enter',
+    'the same words away from the responsive clipping edge are not UI proof',
+  );
+
+  const narrowFooterWithChangedToken = structuredClone(exactNarrowFrame);
+  narrowFooterWithChangedToken.lines[2].text =
+    'q to quit esc/← to edit previous → to edit next enter';
+  assert.equal(
+    classifyManualCodexEnterFrame(narrowFooterWithChangedToken).kind,
+    'ordinary-enter',
+    'a near-match footer remains ordinary text',
   );
 
   const footerOutOfOrder = overlaySnapshot('old prompt reused as draft');
@@ -392,4 +542,109 @@ test('manual Rewind Enter is writable only after the exact target and journal ar
     }),
     { handled: true, writeEnter: true, reason: 'durable-rewind-boundary' },
   );
+});
+
+test('manual Rewind accepts only a newer committed frame with the exact restored composer', () => {
+  const restoredText = 'first prompt restored after zero-prefix rewind';
+  const expectedTextHash = hashCodexRewindTargetText(restoredText);
+  const snapshot = {
+    success: true,
+    mirrorGeneration: 'mirror-g1',
+    synchronizedOutputOpen: false,
+    authoritativeFrameCommitted: true,
+    writeSeq: 42,
+    flushedSeq: 42,
+    lines: [{ row: 11, text: `› ${restoredText}` }],
+    codexCursorComposer: {
+      row: 11,
+      text: restoredText,
+      hasDraft: true,
+      cursorOwned: true,
+    },
+  };
+
+  assert.deepEqual(
+    classifyManualCodexRewindRestoredComposer({
+      snapshot,
+      expectedTextHash,
+      actionWriteSeq: 41,
+      mirrorGeneration: 'mirror-g1',
+    }),
+    {
+      proven: true,
+      terminal: true,
+      reason: 'rewind-restored-exact-current-composer',
+      restoredText,
+      restoredTextHash: expectedTextHash,
+      writeSeq: 42,
+      mirrorGeneration: 'mirror-g1',
+    },
+  );
+
+  assert.equal(classifyManualCodexRewindRestoredComposer({
+    snapshot: { ...snapshot, writeSeq: 41, flushedSeq: 41 },
+    expectedTextHash,
+    actionWriteSeq: 41,
+    mirrorGeneration: 'mirror-g1',
+  }).reason, 'rewind-restored-frame-not-newer');
+
+  assert.equal(classifyManualCodexRewindRestoredComposer({
+    snapshot: { ...snapshot, synchronizedOutputOpen: true },
+    expectedTextHash,
+    actionWriteSeq: 41,
+    mirrorGeneration: 'mirror-g1',
+  }).reason, 'rewind-restored-frame-not-committed');
+
+  assert.equal(classifyManualCodexRewindRestoredComposer({
+    snapshot: {
+      ...snapshot,
+      lines: [{ row: 11, text: '› foreign text' }],
+      codexCursorComposer: {
+        row: 11,
+        text: 'foreign text',
+        hasDraft: true,
+        cursorOwned: true,
+      },
+    },
+    expectedTextHash,
+    actionWriteSeq: 41,
+    mirrorGeneration: 'mirror-g1',
+  }).reason, 'rewind-restored-text-mismatch');
+
+  assert.equal(classifyManualCodexRewindRestoredComposer({
+    snapshot: { ...snapshot, mirrorGeneration: 'mirror-g2' },
+    expectedTextHash,
+    actionWriteSeq: 41,
+    mirrorGeneration: 'mirror-g1',
+  }).reason, 'rewind-restored-mirror-generation-changed');
+
+  assert.equal(classifyManualCodexRewindRestoredComposer({
+    snapshot: {
+      ...snapshot,
+      codexCursorComposer: {
+        row: 11,
+        text: restoredText,
+        hasDraft: true,
+        cursorOwned: false,
+      },
+    },
+    expectedTextHash,
+    actionWriteSeq: 41,
+    mirrorGeneration: 'mirror-g1',
+  }).reason, 'rewind-restored-composer-unproven');
+});
+
+test('the transcript picker cannot masquerade as the restored composer', () => {
+  const picker = overlaySnapshot('target prompt');
+  picker.mirrorGeneration = 'mirror-g1';
+  picker.synchronizedOutputOpen = false;
+  picker.authoritativeFrameCommitted = true;
+  picker.writeSeq = 12;
+  picker.flushedSeq = 12;
+  assert.equal(classifyManualCodexRewindRestoredComposer({
+    snapshot: picker,
+    expectedTextHash: hashCodexRewindTargetText('target prompt'),
+    actionWriteSeq: 11,
+    mirrorGeneration: 'mirror-g1',
+  }).reason, 'rewind-picker-still-active');
 });

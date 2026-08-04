@@ -29,6 +29,18 @@ const copySessionSource = fs.readFileSync(
   path.join(repoDir, 'src/renderer/components/Workspace/CopySessionButton.tsx'),
   'utf8',
 );
+const historyPanelSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/components/Workspace/HistoryPanel.tsx'),
+  'utf8',
+);
+const timelineSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/components/Workspace/Timeline.tsx'),
+  'utf8',
+);
+const workspaceSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/components/Workspace/Workspace.tsx'),
+  'utf8',
+);
 
 test('provisional Resume authorization is the same Rewind lease consumed by arm and write boundary', () => {
   const handlerStart = mainSource.indexOf("ipcMain.handle('codex:open-history-menu'");
@@ -42,6 +54,70 @@ test('provisional Resume authorization is the same Rewind lease consumed by arm 
     handler.indexOf("'first-rewind-control-write'") < handler.indexOf("sendCodexKeyAndCapture(\n          term,\n          '\\x1b'"),
     'the exact lease must be consumed before the first programmatic Escape',
   );
+});
+
+test('confirmed Rewind authority is main-owned even after transient launch proof is gone', () => {
+  const handlerStart = mainSource.indexOf("ipcMain.handle('codex:open-history-menu'");
+  const handlerEnd = mainSource.indexOf("ipcMain.on('claude:prompt-boundary-ack'", handlerStart);
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
+  const handler = mainSource.slice(handlerStart, handlerEnd);
+  const adoptedStart = handler.indexOf("if (authorizedWriter?.status === 'adopted')");
+  const unprovenStart = handler.indexOf("} else if (!provisional)", adoptedStart);
+  assert.ok(adoptedStart >= 0 && unprovenStart > adoptedStart);
+  const adopted = handler.slice(adoptedStart, unprovenStart);
+  assert.match(adopted, /resolveCodexNativeRewindActionGeneration\(\{/);
+  assert.match(adopted, /allowLiveRunFallback: true/);
+  assert.doesNotMatch(adopted, /writerLaunchId\s*\|\|/,
+    'renderer launch data must not mint destructive authority');
+});
+
+test('manual native Rewind may use one exact provisional Resume source without publishing it', () => {
+  const sourceStart = mainSource.indexOf('function resolveCodexNativeRewindSourceContext');
+  const sourceEnd = mainSource.indexOf('function promoteCodexManualWriterBindingAfterUserMessage', sourceStart);
+  assert.ok(sourceStart >= 0 && sourceEnd > sourceStart);
+  const source = mainSource.slice(sourceStart, sourceEnd);
+  assert.match(source, /discovery\?\.provisionalSourceObservation/);
+  assert.match(source, /observation\.terminalToken === terminalToken/);
+  assert.match(source, /Number\(observation\.runSeq\) === runSeq/);
+  assert.match(source, /observation\.lifecycleGeneration === lifecycleGeneration/);
+  assert.match(source, /resolveCodexReadIdentity\(\{/);
+  assert.match(source, /readIdentity\.source === 'resume-source'/);
+  assert.match(source, /mode: 'provisional-resume-source'/);
+  assert.doesNotMatch(source, /setCodexKnownSession|persistCodexWriterBinding|compareAndSetTabCodexSessionId/);
+
+  const watcherStart = mainSource.indexOf('function startCodexSessionWatcher');
+  const watcherEnd = mainSource.indexOf('async function beginCodexLaunchObservation', watcherStart);
+  assert.ok(watcherStart >= 0 && watcherEnd > watcherStart);
+  const watcher = mainSource.slice(watcherStart, watcherEnd);
+  assert.match(watcher, /provisionalSourceObservation: null/);
+  assert.match(watcher, /adoption\?\.status === 'provisional-source'/);
+  assert.match(watcher, /observerState\.provisionalSourceObservation = \{/);
+  assert.match(watcher, /terminalToken: terminals\.get\(tabId\) \|\| null/);
+  assert.match(watcher, /lifecycleGeneration: getTerminalLifecycleGeneration\(tabId\)/);
+});
+
+test('native Rewind controls keep one authority without admitting unrelated manual input', () => {
+  const trackerStart = mainSource.indexOf('function trackManualCodexRewindNavigationInput');
+  const trackerEnd = mainSource.indexOf('async function handleManualCodexRewindConfirmationEnter', trackerStart);
+  assert.ok(trackerStart >= 0 && trackerEnd > trackerStart);
+  const tracker = mainSource.slice(trackerStart, trackerEnd);
+  assert.match(tracker, /classifyManualCodexRewindControlInput\(\{/);
+  assert.match(tracker, /if \(isTerminalProtocolResponse\) return/);
+  assert.match(tracker, /escapePrimeAllowed = commandState\?\.isRunning === true[\s\S]{0,180}codexTurnState\?\.busy !== true[\s\S]{0,180}!hasCodexPromptOrTurnInFlight\(tabId\)/);
+  assert.match(tracker, /advanceManualCodexRewindOwnedInputRevision\(\{/);
+  assert.match(tracker, /cancelCodexWriterHandoffBeforeAction\(tabId, 'manual-rewind-input-gap'\)/);
+  assert.match(tracker, /state\.ownedInputRevision = ownershipAdvance\.ownedInputRevision/);
+  assert.match(tracker, /control\.kind === 'cancel'/);
+  assert.match(tracker, /manual-rewind-protocol-left/);
+
+  const boundaryStart = mainSource.indexOf('function markCodexWriterHandoffActionBoundary');
+  const boundaryEnd = mainSource.indexOf('function notifyCodexWriterHandoffWaiters', boundaryStart);
+  assert.ok(boundaryStart >= 0 && boundaryEnd > boundaryStart);
+  const boundary = mainSource.slice(boundaryStart, boundaryEnd);
+  assert.match(boundary, /manualOwnedInputRevision/);
+  assert.match(boundary, /getTerminalInputRevision\(tabId\) === manualOwnedInputRevision/);
+  assert.match(boundary, /observedAuthorityIdentity\.inputRevision = actionAuthority\.identity\.inputRevision/);
+  assert.match(boundary, /!manualInputScopeCurrent/);
 });
 
 test('manual native Rewind binds its exact target before the journal and Enter', () => {
@@ -149,7 +225,8 @@ test('main publishes one launch-scoped read identity without promoting it to wri
   assert.match(snapshot, /const currentResumeReadLease = getCodexResumeReadIdentityLeaseForTab\(tabId\)/);
   assert.match(snapshot, /resumeReadLease: currentResumeReadLease/);
   assert.match(snapshot, /persistedSessionId: dbSessionId/);
-  assert.match(snapshot, /promptOrTurnInFlight: hasCodexPromptOrTurnInFlight\(tabId\)/);
+  assert.match(snapshot, /const promptOrTurnInFlight = hasCodexPromptOrTurnInFlight\(tabId\)/);
+  assert.match(snapshot, /promptOrTurnInFlight,/);
   assert.match(snapshot, /submitResolutionPending: codexReadIdentitySubmitPending\.get\(tabId\) \|\| null/);
   assert.match(snapshot, /readSessionId: readIdentity\.sessionId/);
   assert.match(snapshot, /canCopySessionId: readIdentity\.available === true/);
@@ -163,6 +240,30 @@ test('main publishes one launch-scoped read identity without promoting it to wri
   assert.match(mainSource, /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,240}clearCodexReadIdentitySubmitBarrier/);
 });
 
+test('history mutation affordances consume one action-specific runtime verdict and paste-busy boundary', () => {
+  const snapshotStart = mainSource.indexOf('async function getCodexRuntimeSessionSnapshot');
+  const snapshotEnd = mainSource.indexOf('function getCodexSessionOwner', snapshotStart);
+  const snapshot = mainSource.slice(snapshotStart, snapshotEnd);
+  assert.match(snapshot, /projectCodexHistoryActionAvailability\(\{/);
+  assert.match(snapshot, /provisionalResumeAvailable: readIdentity\.available === true[\s\S]{0,180}readIdentity\.source === 'resume-source'/);
+  assert.match(snapshot, /canNativeRewind: historyActions\.canNativeRewind/);
+  assert.match(snapshot, /canRewriteHistory: historyActions\.canRewriteHistory/);
+  assert.match(snapshot, /canDeleteHistory: historyActions\.canDeleteHistory/);
+
+  assert.match(workspaceSource, /ipcRenderer\.on\('claude:paste-busy', handlePasteBusy\)/);
+  assert.match(workspaceSource, /isTurnBusy: effectiveAiBusy \|\| agentPasteBusyByTab\.get/);
+  assert.match(workspaceSource, /inputBusy=\{agentPasteBusyByTab\.get\(deferredHistoryOwner\.tabId\) === true\}/);
+
+  assert.match(historyPanelSource, /onRuntimeSnapshotChange\?\.\(presence\.runtimeSnapshot \|\| null\)/);
+  assert.match(historyPanelSource, /codexHistoryActions\?\.canNativeRewind !== true/);
+  assert.match(historyPanelSource, /rewindLocked=\{historyRewindLocked\}/);
+
+  assert.match(timelineSource, /historyActionSnapshot\?\.canNativeRewind !== true/);
+  assert.match(timelineSource, /historyActionSnapshot\?\.canRewriteHistory !== true/);
+  assert.match(timelineSource, /historyActionSnapshot\?\.canDeleteHistory !== true/);
+  assert.match(timelineSource, /isTabAiBusy \|\| isTurnBusy \|\| lifecycleBlocksHistoryAction/);
+});
+
 test('startup completion retains the Resume read lease and post-Enter barrier until adoption', () => {
   const launchClearStart = mainSource.indexOf('function clearCodexLaunchPayload');
   const launchClearEnd = mainSource.indexOf('function clearCodexManualActionRequired', launchClearStart);
@@ -173,7 +274,7 @@ test('startup completion retains the Resume read lease and post-Enter barrier un
   const finishStart = mainSource.indexOf('function finishCodexStartupLifecycle');
   const finishEnd = mainSource.indexOf('function markCodexTuiReadyFromTurnEnd', finishStart);
   assert.ok(finishStart >= 0 && finishEnd > finishStart);
-  assert.match(mainSource.slice(finishStart, finishEnd), /clearCodexLaunchPayload\(tabId, reason\)/);
+  assert.match(mainSource.slice(finishStart, finishEnd), /clearCodexLaunchPayload\(tabId, reason, null, \{[\s\S]{0,120}preserveServiceTierLaunchCandidate: true/);
 
   const barrierStart = mainSource.indexOf('function armCodexReadIdentitySubmitBarrier');
   const barrierEnd = mainSource.indexOf('function hasCodexPromptOrTurnInFlight', barrierStart);

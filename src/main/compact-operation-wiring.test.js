@@ -80,7 +80,7 @@ test('Codex manual xterm compact stays pending until task_started, while public 
   assert.doesNotMatch(activation, /compactOperations\.begin\(/);
   assert.match(activation, /promptGeneration: boundary\.promptSeq/);
   assert.match(activation, /terminal: boundary\.terminal/);
-  assert.match(mainSource, /manualCompactIntentPending[\s\S]{0,260}promptInFlight = manualCompactIntentPending[\s\S]{0,80}\? null/,
+  assert.match(mainSource, /manualCompactIntentPending[\s\S]{0,1200}promptInFlight = manualCompactIntentPending[\s\S]{0,80}\? null/,
     'pending compact must not create the generic pre-task loader window');
   assert.match(mainSource, /\^\[\\r\\n\]\+\$[\s\S]{0,250}cancelCodexManualCompactPending/,
     'Enter-only input preserves pending while other manual content cancels it');

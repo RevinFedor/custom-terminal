@@ -8,6 +8,130 @@ const { extractClaudePromptCarrier } = require('./claude-prompt-carriers');
 
 const DEFAULT_CLAUDE_AUDIT_READ_BYTES = 2 * 1024 * 1024;
 
+async function waitForClaudeTranscriptMaterialization(
+  transcriptPath,
+  { timeoutMs = 8000, fileSystem = fs } = {},
+) {
+  if (typeof transcriptPath !== 'string' || !transcriptPath) {
+    return { materialized: false, reason: 'transcript-path-unavailable' };
+  }
+  const resolvedPath = path.resolve(transcriptPath);
+  const targetDirectory = path.dirname(resolvedPath);
+  const exists = async () => {
+    try {
+      await fileSystem.promises.access(resolvedPath, fileSystem.constants.R_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (await exists()) {
+    return { materialized: true, reason: 'already-present', transcriptPath: resolvedPath };
+  }
+
+  const deepestExistingDirectory = async () => {
+    let candidate = targetDirectory;
+    while (true) {
+      try {
+        const stat = await fileSystem.promises.stat(candidate);
+        if (stat.isDirectory()) return candidate;
+      } catch {}
+      const parent = path.dirname(candidate);
+      if (parent === candidate) return null;
+      candidate = parent;
+    }
+  };
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    let watcher = null;
+    let watchedDirectory = null;
+    let timer = null;
+    let refreshRunning = false;
+    let refreshRequested = false;
+    const finish = (materialized, reason) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try { watcher?.close(); } catch {}
+      resolve({ materialized, reason, transcriptPath: resolvedPath });
+    };
+    const refreshWatch = async () => {
+      if (settled) return;
+      if (refreshRunning) {
+        refreshRequested = true;
+        return;
+      }
+      refreshRunning = true;
+      try {
+        do {
+          refreshRequested = false;
+          if (await exists()) {
+            finish(true, 'file-created');
+            return;
+          }
+          if (settled) return;
+          const nextDirectory = await deepestExistingDirectory();
+          if (settled) return;
+          if (!nextDirectory) {
+            finish(false, 'watch-root-unavailable');
+            return;
+          }
+          if (nextDirectory !== watchedDirectory || !watcher) {
+            try { watcher?.close(); } catch {}
+            watcher = null;
+            watchedDirectory = null;
+            try {
+              const nextWatcher = fileSystem.watch(nextDirectory, { persistent: false }, () => {
+                void refreshWatch().catch(() => finish(false, 'watch-refresh-failed'));
+              });
+              nextWatcher.on('error', () => finish(false, 'watch-error'));
+              watcher = nextWatcher;
+              watchedDirectory = nextDirectory;
+            } catch (error) {
+              finish(false, error?.code || 'watch-start-failed');
+              return;
+            }
+          }
+          // Close both races: the exact file or another directory level may
+          // materialize between discovery and watcher installation.
+          if (await exists()) {
+            finish(true, 'file-created');
+            return;
+          }
+          if (settled) return;
+          const deepestAfterWatch = await deepestExistingDirectory();
+          if (settled) return;
+          if (deepestAfterWatch && deepestAfterWatch !== watchedDirectory) {
+            refreshRequested = true;
+          }
+        } while (!settled && refreshRequested);
+      } finally {
+        refreshRunning = false;
+        if (settled) {
+          try { watcher?.close(); } catch {}
+          watcher = null;
+          watchedDirectory = null;
+          return;
+        }
+        if (!settled && refreshRequested) {
+          void refreshWatch().catch(() => finish(false, 'watch-refresh-failed'));
+        }
+      }
+    };
+
+    timer = setTimeout(
+      () => finish(false, 'materialization-timeout'),
+      Math.max(1, Number(timeoutMs) || 8000),
+    );
+    // A first session in a new cwd may not have its project directory yet.
+    // Start at the nearest existing ancestor and move the exact-path watcher
+    // down as Claude creates each directory level. Unrelated events can only
+    // trigger another exact access check; they never prove materialization.
+    void refreshWatch().catch(() => finish(false, 'watch-start-failed'));
+  });
+}
+
 function shouldStageClaudeUserPromptAudit({
   fast = false,
   broadcastTabId = null,
@@ -22,6 +146,87 @@ function shouldStageClaudeUserPromptAudit({
     && submitSequence !== '\t'
     && !isCodexPasteSource
     && !String(content || '').trimStart().startsWith('/');
+}
+
+/**
+ * A materialized transcript must provide a byte boundary before Enter. The
+ * only supported exception is Claude's very first prompt: no JSONL path exists
+ * until UserPromptSubmit creates it, so causality comes from the exact live
+ * Claude process already bound to this tab and the later hook payload.
+ */
+function classifyClaudePromptAuditAdmission({
+  boundary = null,
+  hookRoute = null,
+  expectedTabId = null,
+} = {}) {
+  if (boundary?.available === true) {
+    return { allowed: true, mode: 'transcript-boundary', reason: null };
+  }
+
+  const routePid = Number(hookRoute?.pid);
+  const freshRouteProven = boundary?.reason === 'transcript-unresolved'
+    && !boundary?.transcriptPath
+    && hookRoute?.bound === true
+    && !!expectedTabId
+    && hookRoute?.tabId === expectedTabId
+    && Number.isSafeInteger(routePid)
+    && routePid > 0;
+  if (freshRouteProven) {
+    return {
+      allowed: true,
+      mode: 'fresh-hook-route',
+      reason: 'first-prompt-awaits-exact-user-prompt-submit',
+    };
+  }
+
+  return {
+    allowed: false,
+    mode: 'unavailable',
+    reason: boundary?.reason || 'audit-boundary-unavailable',
+  };
+}
+
+function isFreshClaudePromptAudit(audit) {
+  const boundary = audit?.preSubmitBoundary;
+  return boundary?.available !== true
+    && boundary?.reason === 'transcript-unresolved'
+    && !boundary?.transcriptPath;
+}
+
+function classifyClaudePromptSubmitRouteAdmission(
+  audit,
+  {
+    hookTabId = null,
+    hookPpid = null,
+    hookPidTabId = null,
+  } = {},
+) {
+  if (!isFreshClaudePromptAudit(audit)) {
+    return { allowed: true, mode: 'route-not-required', reason: null };
+  }
+
+  const proofPid = Number(audit?.preSubmitRouteProof?.pid);
+  const eventPid = Number(hookPpid);
+  const exact = !!hookTabId
+    && audit?.preSubmitRouteProof?.tabId === hookTabId
+    && hookPidTabId === hookTabId
+    && Number.isSafeInteger(proofPid)
+    && proofPid > 0
+    && Number.isSafeInteger(eventPid)
+    && eventPid === proofPid;
+  if (exact) {
+    return {
+      allowed: true,
+      mode: 'fresh-exact-hook-route',
+      reason: 'hook-tab-and-pid-match-pre-submit-proof',
+    };
+  }
+
+  return {
+    allowed: false,
+    mode: 'fresh-hook-route-unproven',
+    reason: 'hook-tab-or-pid-mismatch',
+  };
 }
 
 function extractClaudeUserText(record) {
@@ -186,7 +391,12 @@ async function readLastClaudeUserRecord(
 function selectUniqueClaudePromptSubmitAudit(
   audits,
   submittedPrompt,
-  { hashText = promptAuditFingerprint } = {},
+  {
+    hashText = promptAuditFingerprint,
+    hookTabId = null,
+    hookPpid = null,
+    hookPidTabId = null,
+  } = {},
 ) {
   if (typeof submittedPrompt !== 'string') {
     return {
@@ -197,26 +407,41 @@ function selectUniqueClaudePromptSubmitAudit(
   }
   const submittedHash = hashText(submittedPrompt);
   const submittedLen = submittedPrompt.length;
-  const matchingAudits = (Array.isArray(audits) ? audits : []).filter((audit) => (
+  const textMatchingAudits = (Array.isArray(audits) ? audits : []).filter((audit) => (
     audit
     && audit.finished !== true
     && audit.submitWritten === true
     && Number(audit.expectedLen) === submittedLen
     && String(audit.expectedHash || '') === submittedHash
   ));
+  const routeAdmissions = new Map(textMatchingAudits.map((audit) => [
+    audit,
+    classifyClaudePromptSubmitRouteAdmission(audit, {
+      hookTabId,
+      hookPpid,
+      hookPidTabId,
+    }),
+  ]));
+  const matchingAudits = textMatchingAudits.filter((audit) => (
+    routeAdmissions.get(audit)?.allowed === true
+  ));
   if (matchingAudits.length === 1) {
     return {
       audit: matchingAudits[0],
       matchingAudits,
+      routeAdmission: routeAdmissions.get(matchingAudits[0]),
       reason: 'unique-exact-pending-audit',
     };
   }
   return {
     audit: null,
     matchingAudits,
+    routeAdmission: null,
     reason: matchingAudits.length > 1
       ? 'ambiguous-identical-pending-audits'
-      : 'no-exact-pending-audit',
+      : (textMatchingAudits.length > 0
+        ? 'fresh-hook-route-mismatch'
+        : 'no-exact-pending-audit'),
   };
 }
 
@@ -482,8 +707,20 @@ function classifyClaudeAuditRecordAfterBoundary(candidate, boundary, audit = nul
       && !boundary?.transcriptPath;
     const candidateAt = Date.parse(candidate?.record?.timestamp || '');
     const sentAt = Number(audit?.sentAt);
+    const candidatePath = typeof candidate?.transcriptPath === 'string'
+      ? path.resolve(candidate.transcriptPath)
+      : null;
+    const hookPath = typeof audit?.freshHookTranscriptPath === 'string'
+      ? path.resolve(audit.freshHookTranscriptPath)
+      : null;
+    const hookSessionId = String(audit?.freshHookSessionId || '');
+    const candidateSessionId = String(candidate?.record?.sessionId || '');
     if (
       isFreshTranscriptPending
+      && audit?.freshHookRouteConfirmed === true
+      && !!hookPath
+      && candidatePath === hookPath
+      && (!hookSessionId || candidateSessionId === hookSessionId)
       && Number.isFinite(candidateAt)
       && Number.isFinite(sentAt)
       && candidateAt >= sentAt
@@ -530,7 +767,9 @@ function classifyClaudeAuditRecordAfterBoundary(candidate, boundary, audit = nul
 module.exports = {
   DEFAULT_CLAUDE_AUDIT_READ_BYTES,
   captureClaudePromptAuditBoundary,
+  classifyClaudePromptAuditAdmission,
   classifyClaudeAuditRecordAfterBoundary,
+  classifyClaudePromptSubmitRouteAdmission,
   extractClaudeUserText,
   readClaudeUserRecords,
   readClaudeUserRecordsFromBuffer,
@@ -541,4 +780,5 @@ module.exports = {
   selectClaudePendingPromptAudit,
   selectUniqueClaudePromptSubmitAudit,
   shouldStageClaudeUserPromptAudit,
+  waitForClaudeTranscriptMaterialization,
 };

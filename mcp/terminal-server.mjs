@@ -843,7 +843,7 @@ const TOOLS = [
   },
   {
     name: 'send_prompt',
-    description: 'Send text to a Claude/Codex tab through the Project API scenario layer. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns only after delivery is accepted. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use run_command for generic shells.',
+    description: 'Send text to a Claude/Codex tab through the Project API scenario layer. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns only after delivery is accepted. If a previous response was pending/unknown, pass its exact handoffId to read the same operation safely; never invent a new retry for that prompt. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use run_command for generic shells.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -854,6 +854,7 @@ const TOOLS = [
         effort: { type: 'string', description: 'Optional effort override for scenario send.' },
         thinking: { type: 'string', description: 'Optional thinking mode override for scenario send.' },
         queue: { type: 'boolean', description: 'When true, queue the prompt if the agent is busy instead of failing.' },
+        handoffId: { type: 'string', description: 'Optional exact operation id from a previous pending/unknown response. Reusing it must query the same send without a second paste/Enter.' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
       },
       required: ['tabId', 'prompt'],
@@ -1546,8 +1547,14 @@ async function callTool(name, args) {
             cwd: target.cwd || undefined,
             source: 'terminal-mcp',
             queue: args.queue === true,
+            handoffId: args.handoffId || undefined,
           },
         );
+        if (result.status === 'delivery-unknown' || result.deliveryUnknown === true) {
+          return 'Prompt delivery state is unknown for tab ' + args.tabId
+            + '; do not retry with a new operation.'
+            + (result.handoffId ? ' Recheck only this handoff: ' + result.handoffId + '.' : '');
+        }
         if (result.status === 'audit-pending' || result.auditPending === true) {
           return 'Prompt Enter crossed in tab ' + args.tabId
             + ' through Project API scenario layer. Exact delivery confirmation is pending; do not retry this handoff.'

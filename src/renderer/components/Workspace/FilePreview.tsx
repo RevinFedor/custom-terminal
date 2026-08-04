@@ -7,7 +7,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 
-export default function FilePreview() {
+export default function FilePreview({ topOffset = 0 }: { topOffset?: number }) {
   const { filePreview, closeFilePreview, showToast } = useUIStore();
   const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
   const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
@@ -221,7 +221,7 @@ export default function FilePreview() {
   const previewLeft = filePreview.source === 'tab'
     ? tabPreviewLeft
     : (sidebarOpen ? (useUIStore.getState().sidebarWidth || 280) : 0);
-  const previewTop = filePreview.source === 'tab' ? tabPreviewTop : 36;
+  const previewTop = filePreview.source === 'tab' ? tabPreviewTop + topOffset : 36;
 
   return createPortal(
     <div
