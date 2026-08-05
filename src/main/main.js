@@ -25122,10 +25122,7 @@ ipcMain.handle('terminal:get-shell-prompt-readiness', (_event, request) => {
 });
 
 // Get command state (is command running?) - uses OSC 133 tracking
-ipcMain.handle('terminal:getCommandState', async (event, request) => {
-  const requestOptions = (request && typeof request === 'object')
-    ? request
-    : { tabId: request };
+async function resolveTerminalCommandState(requestOptions = {}) {
   const tabId = requestOptions.tabId;
   const caller = requestOptions.caller || 'legacy';
   const expectedProcess = requestOptions.expectedProcess || 'codex';
@@ -25234,6 +25231,80 @@ ipcMain.handle('terminal:getCommandState', async (event, request) => {
   } finally {
     endPerfOp(opId);
   }
+}
+
+ipcMain.handle('terminal:getCommandState', async (event, request) => {
+  const requestOptions = (request && typeof request === 'object')
+    ? request
+    : { tabId: request };
+  return resolveTerminalCommandState(requestOptions);
+});
+
+/**
+ * Batched tab status for the tab strip.
+ *
+ * The strip used to ask per tab, so showing a project with 44 tabs fired 44
+ * command-state calls plus one turn-state call per Codex tab — 76-90 concurrent
+ * main-process operations that stalled the main loop for up to 1.8s and made
+ * the switch itself feel frozen. The project already learned this lesson once
+ * (see the OSC 133 scar: 2s status polling → events); this restores that rule
+ * for the initial hydrate.
+ *
+ * Semantics are UNCHANGED: each tab resolves through the exact same
+ * resolveTerminalCommandState / codex turn-state path the single call used, so
+ * three-state process lookup (found/absent/unknown) and every liveness class
+ * keep their meaning. What changed is the transport — one request, one shared
+ * process-tree snapshot, sequential resolution instead of a stampede.
+ */
+ipcMain.handle('terminal:getCommandStates', async (_event, request = {}) => {
+  const requested = Array.isArray(request?.tabs) ? request.tabs : [];
+  const caller = request?.caller || 'batch';
+  if (requested.length === 0) return { success: true, states: {} };
+  const startedAt = nodePerformance.now();
+  // Warm the shared process-tree snapshot once for the whole batch: every
+  // per-tab lookup below reads it (single-flight + TTL) instead of racing to
+  // spawn its own `ps`.
+  try {
+    await getProcessTreeSnapshot();
+  } catch {}
+  const states = {};
+  let turnStates = 0;
+  // Sequential on purpose. These resolve from in-memory maps plus the shared
+  // snapshot; running them concurrently is what produced the stampede.
+  for (const entry of requested) {
+    const tabId = typeof entry === 'string' ? entry : entry?.tabId;
+    if (!tabId) continue;
+    const wantsCodex = typeof entry === 'object' && entry?.commandType === 'codex';
+    let commandState = null;
+    try {
+      commandState = await resolveTerminalCommandState({
+        tabId,
+        caller,
+        expectedProcess: 'codex',
+        allowProcessTreeLookup: wantsCodex,
+      });
+    } catch (error) {
+      commandState = { isRunning: false, error: String(error?.message || error) };
+    }
+    let codexTurn = null;
+    if (wantsCodex || (typeof entry === 'object' && entry?.hasCodexSession)) {
+      try {
+        codexTurn = await resolveCodexTurnState(tabId);
+        turnStates += 1;
+      } catch {
+        codexTurn = null;
+      }
+    }
+    states[tabId] = { ...commandState, codexTurn };
+  }
+  const durMs = nodePerformance.now() - startedAt;
+  if (durMs > 50) {
+    console.warn('[Perf:GetCommandStates] caller=' + caller
+      + ' tabs=' + requested.length
+      + ' turnStates=' + turnStates
+      + ' durMs=' + durMs.toFixed(1));
+  }
+  return { success: true, states };
 });
 
 ipcMain.handle('terminal:get-last-project-command', async (event, request = {}) => {
@@ -32073,7 +32144,9 @@ function closeCodexTurnWatcher(tabId, reason = 'close', options = {}) {
     + ' preserveAudit=' + (audits.length > 0 ? '1' : '0'));
 }
 
-ipcMain.handle('codex:get-turn-state', async (_event, tabId) => {
+// Shared by the single-tab handler and the batched tab-strip hydrate, so both
+// see the same classified turn state (never a transient idle-looking false).
+async function resolveCodexTurnState(tabId) {
   let state = codexTurnWatchers.get(tabId);
   // A newly attached watcher starts with an unknown idle-looking boolean until
   // its JSONL tail is classified. Await that concrete read instead of exposing
@@ -32090,7 +32163,9 @@ ipcMain.handle('codex:get-turn-state', async (_event, tabId) => {
     state = current;
   }
   return codexTurnStateSnapshot(state);
-});
+}
+
+ipcMain.handle('codex:get-turn-state', async (_event, tabId) => resolveCodexTurnState(tabId));
 
 ipcMain.handle('codex:get-runtime-session', async (_event, request) => {
   const { tabId, projectId = null } = request && typeof request === 'object'

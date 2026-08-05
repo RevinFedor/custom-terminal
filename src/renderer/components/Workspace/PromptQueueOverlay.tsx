@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowDown, ArrowRight, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, Square, Terminal, Trash2, TriangleAlert, X } from 'lucide-react';
+import { AppWindow, ArrowDown, ArrowRight, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, Square, Terminal, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import {
   ComposerEditor,
@@ -392,6 +392,12 @@ export function PromptQueueOverlay({
   const [removeHoverId, setRemoveHoverId] = useState<string | null>(null);
   const [chipContextMenu, setChipContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const [onTabTriggerDraftIds, setOnTabTriggerDraftIds] = useState<Set<string>>(() => new Set());
+  // Per-element "open the tab list now" pulse. Set once when the user picks
+  // «Добавить on tab» in the context menu, so the picker opens by itself
+  // instead of requiring a second click on the empty row. A monotonic counter
+  // is used because the picker consumes the key by value change.
+  const [onTabTriggerOpenKeys, setOnTabTriggerOpenKeys] = useState<Map<string, number>>(() => new Map());
+  const onTabTriggerOpenSeqRef = useRef(0);
   const [timerTriggerDraftIds, setTimerTriggerDraftIds] = useState<Set<string>>(() => new Set());
   const panelRef = useRef<HTMLDivElement>(null);
   const chipListRef = useRef<HTMLDivElement>(null);
@@ -3011,6 +3017,13 @@ export function PromptQueueOverlay({
                         emptyLabel="выбрать вкладку"
                         title="Запустить это сообщение после вкладки"
                         menuWidth={252}
+                        // «Добавить on tab» из контекстного меню = намерение выбрать
+                        // вкладку прямо сейчас: список открывается сам, без второго
+                        // клика по пустой строке. Ключ ставится один раз на момент
+                        // создания черновика (см. onTabTriggerOpenKeys) — иначе
+                        // список переоткрывался бы на каждом ре-рендере строки.
+                        openRequestKey={onTabTriggerOpenKeys.get(it.id) ?? 0}
+                        showAllTabsOnOpen
                       />
                     </div>
                   )}
@@ -3262,7 +3275,7 @@ export function PromptQueueOverlay({
               onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
             >
-              <span style={{ width: 14, textAlign: 'center' }}>⏱</span>
+              <Timer size={14} strokeWidth={1.9} />
               <span style={{ flex: 1, minWidth: 0 }}>Добавить таймер</span>
             </button>
             <button
@@ -3273,13 +3286,20 @@ export function PromptQueueOverlay({
                   return next;
                 });
                 setOnTabTriggerDraftIds((current) => new Set(current).add(chipContextItem.id));
+                // Same click also opens the tab list: choosing this menu item
+                // IS the intent to pick a tab.
+                onTabTriggerOpenSeqRef.current += 1;
+                const openKey = onTabTriggerOpenSeqRef.current;
+                setOnTabTriggerOpenKeys((current) => new Map(current).set(chipContextItem.id, openKey));
                 setChipContextMenu(null);
               }}
               style={itemBase}
               onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
             >
-              <span style={{ width: 14, textAlign: 'center' }}>↪</span>
+              {/* Триггер «после другой вкладки» — иконка вкладки, а не стрелка:
+                  стрелка уже ничего не различала рядом с таймером. */}
+              <AppWindow size={14} strokeWidth={1.9} />
               <span style={{ flex: 1, minWidth: 0 }}>Добавить on tab</span>
             </button>
             {chipContextItem.trigger && (

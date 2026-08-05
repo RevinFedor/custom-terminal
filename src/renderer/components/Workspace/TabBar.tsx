@@ -68,6 +68,7 @@ import {
   getTabChromeColorConfig,
 } from './tabChrome';
 import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
+import { markRendererActivity } from '../../utils/rendererActivityTrail';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -3466,7 +3467,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const selectTabRange = useWorkspaceStore((state) => state.selectTabRange);
   const clearSelection = useWorkspaceStore((state) => state.clearSelection);
   const showWorkspace = useWorkspaceStore((state) => state.showWorkspace);
-  
+  // Following a moved tab/group is TAB navigation, not project navigation:
+  // the center lands on the moved tab in its new project, the sidebar stays.
+  const followMovedTabs = useCallback((targetProjectId: string) => {
+    const st = useWorkspaceStore.getState();
+    const movedActive = st.openProjects.get(targetProjectId)?.activeTabId;
+    if (movedActive) st.activateCenterTab(targetProjectId, movedActive);
+  }, []);
+
   const { projects } = useProjectsStore();
   const projectMoveTargetIds = useMemo(
     () => Array.from(openProjects.keys()).filter(
@@ -4104,58 +4112,72 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     );
 
     const syncStatus = async () => {
-      await Promise.all(
-        tabIds.map(async (tabId) => {
-          try {
+      // ONE request for the whole strip. Asking per tab meant 44 command-state
+      // calls + a turn-state call per Codex tab on every project switch — the
+      // measured 0.76-1.8s main-loop stall behind the "frozen interface" report.
+      // Main resolves each tab through the same code path as the single call,
+      // so liveness semantics (including three-state process lookup) are
+      // unchanged; only the transport is batched.
+      const endSyncMark = markRendererActivity('tab-status-sync:' + tabIds.length);
+      let states: Record<string, any> = {};
+      try {
+        const result = await ipcRenderer.invoke('terminal:getCommandStates', {
+          caller: 'TabBar.statusSync',
+          tabs: tabIds.map((tabId) => {
             const tab = workspace.tabs.get(tabId);
-            const state = await ipcRenderer.invoke('terminal:getCommandState', {
+            return {
               tabId,
-              caller: 'TabBar.statusSync',
-              expectedProcess: 'codex',
-              allowProcessTreeLookup: tab?.commandType === 'codex',
-            });
-            setProcessStatus(prev => {
-              if (prev.get(tabId) === state.isRunning) return prev;
-              const next = new Map(prev);
-              next.set(tabId, state.isRunning);
-              return next;
-            });
-          } catch {
-            // Only set false if not already tracked
-            setProcessStatus(prev => {
-              if (prev.has(tabId)) return prev;
-              const next = new Map(prev);
-              next.set(tabId, false);
-              return next;
-            });
-          }
-          const tab = workspace?.tabs.get(tabId);
-          if (tab?.commandType === 'codex' || tab?.codexSessionId) {
-            try {
-              const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId);
-              if (turnState?.hasWatcher && !turnState.catchUpPending) {
-                const busy = turnState.busy === true;
-                setCodexBusyMap(prev => {
-                  if (prev.get(tabId) === busy) return prev;
-                  const next = new Map(prev);
-                  next.set(tabId, busy);
-                  return next;
-                });
-              }
-            } catch (e) {
-              console.warn('[TabBar:CodexBusyHydrate] failed tab=' + tabId.slice(-8)
-                + ' error=' + String((e as any)?.message || e));
-            }
-          }
-          setSessionStatus(prev => {
-            const val = !!tab?.claudeSessionId;
-            if (prev.get(tabId) === val) return prev;
+              commandType: tab?.commandType || null,
+              hasCodexSession: !!tab?.codexSessionId,
+            };
+          }),
+        });
+        states = result?.states || {};
+      } catch (e) {
+        console.warn('[TabBar:StatusSync] batch failed error='
+          + String((e as any)?.message || e));
+      }
+
+      for (const tabId of tabIds) {
+        const tab = workspace.tabs.get(tabId);
+        const state = states[tabId];
+        if (state) {
+          setProcessStatus(prev => {
+            if (prev.get(tabId) === state.isRunning) return prev;
             const next = new Map(prev);
-            next.set(tabId, val);
+            next.set(tabId, state.isRunning);
             return next;
           });
-        })
-      );
+        } else {
+          // No answer for this tab (batch failed, or the tab vanished
+          // mid-flight). Only seed false when nothing is tracked yet — never
+          // clobber a state we already know.
+          setProcessStatus(prev => {
+            if (prev.has(tabId)) return prev;
+            const next = new Map(prev);
+            next.set(tabId, false);
+            return next;
+          });
+        }
+        const turnState = state?.codexTurn;
+        if (turnState?.hasWatcher && !turnState.catchUpPending) {
+          const busy = turnState.busy === true;
+          setCodexBusyMap(prev => {
+            if (prev.get(tabId) === busy) return prev;
+            const next = new Map(prev);
+            next.set(tabId, busy);
+            return next;
+          });
+        }
+        setSessionStatus(prev => {
+          const val = !!tab?.claudeSessionId;
+          if (prev.get(tabId) === val) return prev;
+          const next = new Map(prev);
+          next.set(tabId, val);
+          return next;
+        });
+      }
+      endSyncMark();
       console.warn(
         `[Perf:TabBarStatusSync] done project=${projectId.slice(-12)}` +
         ` startAbs=${syncStartAbs.toFixed(1)}` +
@@ -7706,10 +7728,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     }
 
     if (moved) {
-      window.setTimeout(() => showWorkspace(targetProjectId), 0);
+      window.setTimeout(() => followMovedTabs(targetProjectId), 0);
     }
     return moved;
-  }, [moveTabGroupToProject, moveTabsToProject, projectId, showWorkspace]);
+  }, [moveTabGroupToProject, moveTabsToProject, projectId]);
 
   const handleContextTabProjectMove = useCallback(async (tabId: string, targetProjectId: string) => {
     setContextMenu(null);
@@ -7735,8 +7757,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       showToast('Could not move tab to project', 'error');
       return;
     }
-    window.setTimeout(() => showWorkspace(targetProjectId), 0);
-  }, [moveTabsToProject, projectId, showToast, showWorkspace]);
+    window.setTimeout(() => followMovedTabs(targetProjectId), 0);
+  }, [moveTabsToProject, projectId, showToast]);
 
   const tabOutlineDnd = useOutlineDnd<TabOutlineNode>({
     outline: controlledTabOutline,
@@ -7932,25 +7954,38 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     });
   }, [isVerticalLayout]);
 
-  // Auto-scroll to active tab when it changes (e.g. new tab created off-screen)
+  // Auto-scroll to the active tab when it changes (e.g. a new tab was created
+  // off-screen). Scroll position is a restored value, never an animation: a
+  // smooth scroll here rode on top of the per-project restore, so returning to
+  // a project visibly crawled from the saved offset to the active row. Jump.
+  //
+  // It also must not fire on a project switch: the sidebar column is reused,
+  // so switching projects re-runs this effect with the NEW project's active
+  // tab and would drag the list away from the offset the user left. Only a
+  // real change of the active tab INSIDE the visible project counts.
+  const lastAutoScrolledTabRef = useRef<string | null>(null);
   useEffect(() => {
     const scrollContainer = scrollContainerRef.current;
     if (!scrollContainer || !workspace.activeTabId) return;
+    // Project changed → adopt its active tab silently; the saved-scroll
+    // restore owns the position.
+    if (tabListScrollProjectRef.current !== projectId) {
+      lastAutoScrolledTabRef.current = workspace.activeTabId;
+      return;
+    }
+    if (lastAutoScrolledTabRef.current === workspace.activeTabId) return;
+    lastAutoScrolledTabRef.current = workspace.activeTabId;
 
-    // Small delay to let DOM update with the new tab
-    const timer = setTimeout(() => {
-      const activeIndex = mainTabs.findIndex(t => t.id === workspace.activeTabId);
-      if (activeIndex === -1) return;
+    // One frame to let the row commit; no animation.
+    const raf = requestAnimationFrame(() => {
+      const activeEl = scrollContainer.querySelector(
+        `[data-tab-item][data-tab-id="${CSS.escape(workspace.activeTabId!)}"]`
+      ) as HTMLElement | null;
+      if (activeEl) activeEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    });
 
-      const tabElements = scrollContainer.querySelectorAll('[data-tab-item]');
-      const activeEl = tabElements[activeIndex] as HTMLElement | undefined;
-      if (activeEl) {
-        activeEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
-      }
-    }, 50);
-
-    return () => clearTimeout(timer);
-  }, [workspace.activeTabId, mainTabs.length]);
+    return () => cancelAnimationFrame(raf);
+  }, [workspace.activeTabId, mainTabs.length, projectId]);
 
   // Explicit reveal request (Ctrl+Tab / Cmd+P commit, split focus): INSTANT
   // scroll that aligns the row's edge with the list edge when it is out of
@@ -8237,7 +8272,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                       outlineNavigationPaused={outlineNavigationPaused}
                       sessionStatus={tab.sessionStatus as SessionStatus | undefined}
                       isActive={centerInThisProject && currentView === 'terminal' && workspace.activeTabId === tab.id}
-                      isSelected={selectedTabIds.includes(tab.id)}
+                      isSelected={isMultiSelect && selectedTabIds.includes(tab.id)}
                       isEditing={editingTabId === tab.id}
                       editValue={editValue}
                       onSwitch={(event) => {
@@ -8350,7 +8385,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     orientation="vertical"
                     sessionStatus={tab.sessionStatus as SessionStatus | undefined}
                     isActive={centerInThisProject && currentView === 'terminal' && workspace.activeTabId === tab.id}
-                    isSelected={selectedTabIds.includes(tab.id)}
+                    isSelected={isMultiSelect && selectedTabIds.includes(tab.id)}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
                     onSwitch={(e) => {
@@ -8814,7 +8849,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     zone="main"
                     projectId={projectId}
                     isActive={centerInThisProject && currentView === 'terminal' && workspace.activeTabId === tab.id}
-                    isSelected={selectedTabIds.includes(tab.id)}
+                    isSelected={isMultiSelect && selectedTabIds.includes(tab.id)}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
                     onSwitch={(e) => {
@@ -10021,7 +10056,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                           event.stopPropagation();
                           setGroupContextMenu(null);
                           const moved = await moveTabGroupToProject(projectId, group.id, targetProjectId);
-                          if (moved) window.setTimeout(() => showWorkspace(targetProjectId), 0);
+                          if (moved) window.setTimeout(() => followMovedTabs(targetProjectId), 0);
                         }}
                       >
                         <Folder size={12} className="text-[#777] flex-shrink-0" />

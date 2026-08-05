@@ -8,6 +8,7 @@ import { useUIStore, type HistoryPromptDraftChip } from './useUIStore';
 import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { isAiForegroundProcess } from '../utils/aiForegroundProcess.mjs';
+import { markRendererActivity } from '../utils/rendererActivityTrail';
 import {
   commitArchiveBeforeClose,
   isDurableSaveTabsAck,
@@ -1346,11 +1347,10 @@ interface WorkspaceStore {
   removeTabFromSplit: (tabId: string) => void;
   // Split button in the attach row: open an EMPTY pane (focused, waiting for
   // the next tab activation to fill it). Single mode → [center, empty].
-  addEmptySplitPane: () => boolean;
+  addEmptySplitPane: (afterPaneIndex?: number | null) => boolean;
   // ✕ / Escape on an empty placeholder pane (real panes close by tabId).
   removeEmptySplitPane: (paneIndex: number) => void;
   focusSplitPane: (paneIndex: number) => void;
-  syncSplitWithProjectFocus: (projectId: string) => void;
   // ONE entry point for "user activated tab X of project P" (sidebar click,
   // switcher commit, pane focus, cross-tab jumps). Moves the CENTER only:
   // activeProjectId follows the tab, focusedProjectId (sidebar/toolbar) stays
@@ -1787,15 +1787,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
-  addEmptySplitPane: () => {
+  addEmptySplitPane: (afterPaneIndex) => {
     const st = get();
     const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
     // Single mode: the current CENTER tab becomes pane 0. In split mode the
-    // model appends/refuses on its own and ignores `current`.
+    // placeholder opens immediately to the RIGHT of the pane whose split
+    // button was pressed (afterPaneIndex), not at the far end.
     const current = st.activeProjectId && activeWs?.activeTabId
       ? { projectId: st.activeProjectId, tabId: activeWs.activeTabId }
       : null;
-    const res = addEmptyPane(st.splitPanes, st.splitFocusedIndex, current);
+    const res = addEmptyPane(st.splitPanes, st.splitFocusedIndex, current, afterPaneIndex ?? null);
     if (!res) return false;
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
     console.log('[Split] addEmptyPane panes=' + res.panes.length + ' focus=' + res.focusedIndex);
@@ -1831,22 +1832,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return;
     }
     get().activateCenterTab(pane.projectId, pane.tabId);
-  },
-
-  // Explicit project click while the split is active: the target is the
-  // project's last active tab — visible pane gets focus, otherwise the
-  // focused pane swaps its tab (approved rule). Called by showWorkspace/
-  // openProject, which are always explicit project navigation.
-  syncSplitWithProjectFocus: (projectId: string) => {
-    const { splitPanes, splitFocusedIndex, openProjects } = get();
-    if (splitPanes.length === 0) return;
-    const targetTabId = openProjects.get(projectId)?.activeTabId;
-    if (!targetTabId) return;
-    const res = resolveSplitActivation(splitPanes, splitFocusedIndex, projectId, targetTabId);
-    if (res.panes !== splitPanes || res.focusedIndex !== splitFocusedIndex) {
-      set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
-      get().saveSession();
-    }
   },
 
   tabListRevealRequest: null,
@@ -2308,32 +2293,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   showWorkspace: (projectId) => {
-    const { projectHistory, openProjects } = get();
+    const { projectHistory, openProjects, activeProjectId } = get();
     // Move to end of history (max 20)
     const newHistory = [...projectHistory.filter(id => id !== projectId), projectId].slice(-20);
-    const workspace = openProjects.get(projectId);
-    const activeTab = workspace?.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
-    const clearedNotification = !!(activeTab?.completionNotificationArmed || activeTab?.completionNotificationFired);
-    if (activeTab && clearedNotification) {
-      delete activeTab.completionNotificationArmed;
-      delete activeTab.completionNotificationFired;
-      delete activeTab.completionNotificationFiredAt;
-      emitTabCompletionNotificationCleared({ projectId, tabId: activeTab.id });
-    }
 
-    // Use startTransition for smooth project switching
+    // Explicit project navigation moves ONLY the sidebar pointer. The center
+    // keeps showing whatever tab it showed — clicking a project must never
+    // swap the visible tab (approved rule: even with a single tab, "смена
+    // проекта не меняет текущую активную вкладку"). The center follows only
+    // tab activation (switchTab). Sole exception: no live center yet (fresh
+    // start / center's project closed) — then the center has nothing to keep.
+    const centerAlive = !!activeProjectId && openProjects.has(activeProjectId);
     startTransition(() => {
       set({
         view: 'workspace',
-        // Explicit project navigation: BOTH the center and the sidebar move.
-        activeProjectId: projectId,
         focusedProjectId: projectId,
         projectHistory: newHistory,
-        ...(clearedNotification ? { openProjects: new Map(openProjects) } : {})
+        ...(centerAlive ? {} : { activeProjectId: projectId }),
       });
     });
-    if (workspace?.activeTabId) get().touchGlobalTabMru(projectId, workspace.activeTabId);
-    get().syncSplitWithProjectFocus(projectId);
     get().saveSession();
   },
 
@@ -2439,10 +2417,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         });
       } else {
         console.log('[Store] Tabs prepared, switching to workspace view');
+        // Project navigation moves the SIDEBAR pointer only; the center keeps
+        // its tab. The center is claimed only when there is none to keep.
+        const centerAlive = !!get().activeProjectId && openProjects.has(get().activeProjectId!);
         set({
           openProjects: new Map(openProjects),
-          activeProjectId: projectId,
           focusedProjectId: projectId,
+          ...(centerAlive ? {} : { activeProjectId: projectId }),
           view: 'workspace',
           isRestoring: false,
           projectHistory: newHistory
@@ -2456,25 +2437,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Target after the Apr refactor: <50ms. Regression signal: durMs > 200.
       const prevActiveId = get().activeProjectId;
       const _t0 = performance.now();
-      const workspace = openProjects.get(projectId);
-      const activeTab = workspace?.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
-      const clearedNotification = !!(activeTab?.completionNotificationArmed || activeTab?.completionNotificationFired);
-      if (activeTab && clearedNotification) {
-        delete activeTab.completionNotificationArmed;
-        delete activeTab.completionNotificationFired;
-        delete activeTab.completionNotificationFiredAt;
-        emitTabCompletionNotificationCleared({ projectId, tabId: activeTab.id });
-      }
+      // Names any main-thread freeze that overlaps the switch (see
+      // markRendererActivity — the platform's own longtask attribution is
+      // always "unknown" for our own code).
+      const endSwitchMark = markRendererActivity('project-switch:' + projectId.slice(-12));
+      // Same rule as showWorkspace: project navigation moves only the sidebar
+      // pointer; the center keeps its tab unless there is no center to keep.
+      const centerAlive = !!prevActiveId && openProjects.has(prevActiveId);
       set({
-        activeProjectId: projectId,
         focusedProjectId: projectId,
+        ...(centerAlive ? {} : { activeProjectId: projectId }),
         view: 'workspace',
         projectHistory: newHistory,
-        ...(clearedNotification ? { openProjects: new Map(openProjects) } : {})
       });
-      if (workspace?.activeTabId) get().touchGlobalTabMru(projectId, workspace.activeTabId);
-      get().syncSplitWithProjectFocus(projectId);
       requestAnimationFrame(() => {
+        endSwitchMark();
         const durMs = (performance.now() - _t0).toFixed(1);
         const tabCount = Array.from(get().openProjects.values())
           .reduce((acc, ws) => acc + ws.tabs.size, 0);
@@ -3510,6 +3487,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           }
         }
       }
+      // Names any main-thread block overlapping the urgent switch frame — the
+      // 100-134ms "none-marked" tasks right after every tab click are this.
+      const endTabSwitchMark = markRendererActivity('tab-switch:' + tabId.slice(-8));
       // Use startTransition to prevent UI blocking during re-render
       startTransition(() => {
         // CENTER follows the activated tab's project so every tab-owned
@@ -3528,6 +3508,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         ` totalTabs=${totalTabs} syncMs=${syncMs.toFixed(1)}`
       );
       requestAnimationFrame(() => {
+        endTabSwitchMark();
         const durMs = (performance.now() - _t0).toFixed(1);
         console.warn(
           `[Perf:TabSwitch] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)}` +

@@ -49,6 +49,8 @@ import {
   subscribeCoordinatedAgentActions,
 } from '../../utils/agentActionCoordinator.mjs';
 import { isHistoryTaskBackgroundLive } from '../../utils/historyBackgroundLiveness.mjs';
+import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import { recordHistorySurfacePresented } from '../../utils/timelineTranscriptRefresh.mjs';
 import { foldHistoryAgentProcessLiveness } from '../../utils/historyProcessLiveness.mjs';
 import {
   estimateHistoryEntriesBytesFast,
@@ -71,6 +73,8 @@ import {
   saveHistoryMeasuredLayout,
   getHistoryMeasuredLayout,
   dropHistoryMeasuredLayout,
+  updateHistoryMeasuredLayoutScrollTop,
+  estimateHistoryAverageRowHeight,
 } from '../../utils/historyMeasuredLayout';
 import {
   projectNativeRewindPreview,
@@ -436,6 +440,13 @@ interface HistoryPanelProps {
   lifecycleStatus?: AgentLifecycleSummary | null;
   inputBusy?: boolean;
   onControlsHeightChange?: (height: number) => void;
+  // Split workspace: several REAL History instances are mounted (one per
+  // pane), but window-level keyboard shortcuts (Escape-interrupt, Cmd+F) must
+  // have exactly ONE owner — the focused pane. Non-focused panes stay fully
+  // interactive through direct clicks/typing; only their global listeners are
+  // parked. Composer availability is also withheld so grab/dictation resolve
+  // to the focused pane's composer.
+  suppressGlobalHotkeys?: boolean;
 }
 
 interface PromptHandoffMeta {
@@ -521,6 +532,40 @@ const HistoryBottomSpacer = memo(() => (
       pointerEvents: 'none',
     }}
   />
+));
+
+// Cheap stand-in row rendered while the user is scrubbing the scrollbar or
+// flinging the wheel faster than real rows can mount. Fast scrolling through
+// heavy markdown/diff cards mounted and threw away dozens of full rows per
+// frame — the exact jank scrollSeek exists to remove. The placeholder is a
+// single flat div at the row's measured height, so total list height (and the
+// thumb position under the cursor) does not move when it swaps in.
+const HistoryScrollSeekPlaceholder = memo(({ height, index }: {
+  height: number;
+  index: number;
+}) => (
+  <div
+    data-history-seek-placeholder
+    aria-hidden="true"
+    style={{
+      height,
+      boxSizing: 'border-box',
+      padding: '8px 16px',
+      display: 'flex',
+      alignItems: 'flex-start',
+      pointerEvents: 'none',
+    }}
+  >
+    <div
+      style={{
+        width: index % 3 === 0 ? '42%' : index % 3 === 1 ? '68%' : '55%',
+        height: 10,
+        maxHeight: '100%',
+        borderRadius: 4,
+        background: 'rgba(129, 140, 248, 0.10)',
+      }}
+    />
+  </div>
 ));
 
 const normalizeHistoryPromptText = (text: string) => String(text || '')
@@ -3782,6 +3827,7 @@ function AgentHistoryControls({
   onInputBusyChange,
   overlayComposer = false,
   agentInputSurface: agentInputSurfaceProp,
+  suppressWindowEscape = false,
 }: {
   tabId: string;
   sessionId: string;
@@ -3841,6 +3887,8 @@ function AgentHistoryControls({
   onInputBusyChange?: (busy: boolean) => void;
   overlayComposer?: boolean;
   agentInputSurface?: boolean;
+  // Split: only the FOCUSED pane's composer listens to window-level Escape.
+  suppressWindowEscape?: boolean;
 }) {
   // Owning the tab's input is not the same as being the centered surface: the
   // terminal-primary layout keeps this composer live in the side panel. Fall
@@ -6127,7 +6175,7 @@ function AgentHistoryControls({
     // this side panel — gating on terminalOpen alone would kill Escape there
     // for good.
     const terminalOwnsEscape = terminalOpen && !terminalIsPrimary;
-    if (!agentInputSurface || terminalOwnsEscape || pendingQuestion || !canInterruptTurn) return;
+    if (!agentInputSurface || suppressWindowEscape || terminalOwnsEscape || pendingQuestion || !canInterruptTurn) return;
     const interruptOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
       // Menus/search/modals own Escape first. Their capture handlers normally
@@ -6152,7 +6200,7 @@ function AgentHistoryControls({
     // surface claimed it.
     window.addEventListener('keydown', interruptOnEscape);
     return () => window.removeEventListener('keydown', interruptOnEscape);
-  }, [canInterruptTurn, agentInputSurface, pendingQuestion, runAction, tabId, terminalOpen, terminalIsPrimary]);
+  }, [canInterruptTurn, agentInputSurface, pendingQuestion, runAction, suppressWindowEscape, tabId, terminalOpen, terminalIsPrimary]);
 
   useEffect(() => {
     const insertIntoComposer = (event: Event) => {
@@ -7580,7 +7628,164 @@ function AgentHistoryControls({
   );
 }
 
-const HISTORY_VIRTUOSO_COMPONENTS = { Footer: HistoryBottomSpacer };
+const HISTORY_VIRTUOSO_COMPONENTS = {
+  Footer: HistoryBottomSpacer,
+  ScrollSeekPlaceholder: HistoryScrollSeekPlaceholder,
+};
+
+// Velocity gates for swapping real rows for placeholders. Enter must clear
+// ordinary reading-speed wheel ticks (~200-600 px/s) but catch a fling's
+// RAMP-UP frames too: with the gate at 3000 the accelerating pass through
+// 1000-3000 px/s still mounted heavy rows at full price (live 04.08 21:59:
+// 314/327ms tasks BEFORE the first ENTER fired). Exit is low so rows come
+// back the moment the user slows down to look.
+const HISTORY_SCROLL_SEEK_ENTER_PX_PER_S = 2000;
+const HISTORY_SCROLL_SEEK_EXIT_PX_PER_S = 500;
+// Minimum time placeholders stay on once entered. Virtuoso samples velocity
+// per frame, and a heavy frame mid-fling reports velocity=0 on the next
+// sample — without a hold, the gate oscillated at boundary speed (live
+// 04.08 21:59: ENTER velocity=-3021 followed by EXIT velocity=0 within one
+// frame, then the just-unmasked real rows mounted for 314/327ms and the
+// cycle repeated). The hold turns that oscillation into one steady
+// placeholder window; a real stop pays at most this delay before rows
+// return, which is below perception at reading speed.
+const HISTORY_SCROLL_SEEK_MIN_HOLD_MS = 150;
+// Wheel-burst pre-engage. Virtuoso's velocity is measured between scroll
+// SAMPLES, and the first sample after idle divides the jump by seconds of
+// idle time — a violent first tick reads as slow, the new range mounts REAL
+// rows at full price (796ms task before the first ENTER, retest 04.08
+// 22:08), and only the second tick engages the gate. The wheel event itself
+// is dispatched BEFORE the scroll it causes, so a single huge delta arms
+// this window and the very first seek consultation already answers "on".
+// Scrollbar drags have no wheel events and keep the velocity path.
+const HISTORY_WHEEL_BURST_DELTA_PX = 600;
+const HISTORY_WHEEL_BURST_HOLD_MS = 250;
+let historyWheelBurstUntil = 0;
+// The scroller the kick re-asks. Updated on every real scroll tick of
+// whichever panel is scrolling (handleScroll), so it always points at the
+// element whose seek mode could be stuck — including scrollbar drags, which
+// produce no wheel events at all.
+let historySeekScroller: HTMLElement | null = null;
+const armHistoryWheelBurst = (deltaY: number): void => {
+  if (Math.abs(deltaY) >= HISTORY_WHEEL_BURST_DELTA_PX) {
+    historyWheelBurstUntil = performance.now() + HISTORY_WHEEL_BURST_HOLD_MS;
+  }
+};
+// Re-consult kick. Virtuoso consults the exit gate ONLY when its velocity
+// stream emits, and the stream emits only on scroll activity — so REFUSING
+// the last emission of a fling would freeze placeholders on a motionless
+// screen with nothing left to re-ask the gate (the exact 44s-stuck failure
+// mode, just with a different trigger). Any refusal therefore arms a timer
+// that, once the burst window and hold have both expired with no new wheel,
+// nudges the scroller by ONE real pixel (restored next frame). A synthetic
+// scroll event with the SAME scrollTop does NOT work — proven live (retest
+// 04.08 22:27: kick dispatched, no EXIT, 18 placeholders frozen): the
+// list's scroll pipeline dedupes unchanged positions, so only genuine
+// movement is guaranteed to emit. 1px is invisible, fires no wheel/touch
+// handlers (so it cannot cancel restores), and the restore step only runs
+// if nobody else moved the scroller meanwhile.
+let historySeekKickTimer: ReturnType<typeof setTimeout> | null = null;
+const scheduleHistorySeekKick = (): void => {
+  if (historySeekKickTimer) clearTimeout(historySeekKickTimer);
+  const now = performance.now();
+  const wait = Math.max(
+    HISTORY_SCROLL_SEEK_MIN_HOLD_MS,
+    historyWheelBurstUntil - now,
+  ) + 60;
+  historySeekKickTimer = setTimeout(() => {
+    historySeekKickTimer = null;
+    if (!historyScrollSeekActive) return;
+    if (performance.now() < historyWheelBurstUntil) {
+      // A newer wheel re-armed the burst — its own motion re-consults.
+      scheduleHistorySeekKick();
+      return;
+    }
+    const scroller = historySeekScroller;
+    if (!scroller || !scroller.isConnected) {
+      // The seeking list is gone (owner switch remounted it). The new list
+      // starts with placeholders off; keep the diagnostic flag honest.
+      historyScrollSeekActive = false;
+      return;
+    }
+    const original = scroller.scrollTop;
+    const nudged = original > 0 ? original - 1 : original + 1;
+    scroller.scrollTop = nudged;
+    requestAnimationFrame(() => {
+      // Restore only if the nudge is still the last write — a user gesture
+      // or a restore loop that moved the scroller meanwhile owns the
+      // position now.
+      if (scroller.isConnected && Math.abs(scroller.scrollTop - nudged) <= 0.5) {
+        scroller.scrollTop = original;
+      }
+    });
+  }, wait);
+};
+// Programmatic position restores jump via scrollToIndex and read as huge
+// velocity (ENTER velocity=51087 observed) — but produce no further scroll
+// samples, so the seek mode STUCK with placeholders on a motionless screen
+// (EXIT heldMs=44258 in the retest). A tail-pinned reader has the same
+// hazard from followOutput auto-jumps during streaming. The panel registers
+// a suppressor so machine-driven motion never engages placeholders; a real
+// upward gesture un-pins the tail (handleUserScrollIntent) before the wheel
+// burst is consulted, so user flings are unaffected. A Set because the
+// config object is module-level while the panel can have more than one
+// mounted instance (primary + preview).
+const historySeekSuppressors = new Set<() => boolean>();
+// Transition-only diagnostics: Virtuoso consults `enter` while placeholders
+// are off and `exit` while they are on, so flipping the flag inside each gate
+// logs exactly one line per mode change. Without a log line, "placeholders
+// engaged" is unobservable to tests — a silent mechanism cannot be verified
+// (the SCROLL_RESTORE_CANCEL scar).
+let historyScrollSeekActive = false;
+let historyScrollSeekEnteredAt = 0;
+const HISTORY_SCROLL_SEEK_CONFIG = {
+  enter: (velocity: number) => {
+    for (const suppressed of historySeekSuppressors) {
+      if (suppressed()) return false;
+    }
+    const burst = performance.now() < historyWheelBurstUntil;
+    const on = burst || Math.abs(velocity) > HISTORY_SCROLL_SEEK_ENTER_PX_PER_S;
+    if (on && !historyScrollSeekActive) {
+      historyScrollSeekActive = true;
+      historyScrollSeekEnteredAt = performance.now();
+      historyDiag('SCROLL_SEEK_ENTER velocity=' + Math.round(velocity)
+        + ' burst=' + (burst ? '1' : '0'));
+      // The mode may have been entered on the LAST emission of the stream
+      // (single-tick fling); guarantee a future consultation regardless.
+      scheduleHistorySeekKick();
+    }
+    return on;
+  },
+  exit: (velocity: number) => {
+    // A hot burst window means the fling is still being fed — do not flap.
+    if (performance.now() < historyWheelBurstUntil) {
+      scheduleHistorySeekKick();
+      return false;
+    }
+    if (Math.abs(velocity) >= HISTORY_SCROLL_SEEK_EXIT_PX_PER_S) return false;
+    if (
+      historyScrollSeekActive
+      && performance.now() - historyScrollSeekEnteredAt < HISTORY_SCROLL_SEEK_MIN_HOLD_MS
+    ) {
+      // Refusing what may be the stream's final emission — self-schedule the
+      // re-ask that the stream itself will no longer provide.
+      scheduleHistorySeekKick();
+      return false;
+    }
+    if (historyScrollSeekActive) {
+      historyScrollSeekActive = false;
+      historyDiag('SCROLL_SEEK_EXIT velocity=' + Math.round(velocity)
+        + ' heldMs=' + Math.round(performance.now() - historyScrollSeekEnteredAt));
+    }
+    return true;
+  },
+};
+
+// Fallback average row height when no measured geometry exists yet (first
+// ever visit to a session). Roughly a short assistant paragraph; real
+// measurements replace estimates as rows mount, and returns use the stored
+// per-owner average instead.
+const HISTORY_DEFAULT_ROW_HEIGHT_PX = 120;
 const HISTORY_INITIAL_VIEWPORT_BUFFER = { top: 0, bottom: 0 };
 const HISTORY_SETTLED_VIEWPORT_BUFFER = { top: 600, bottom: 600 };
 
@@ -7608,10 +7813,14 @@ function HistoryPanel({
   lifecycleStatus,
   inputBusy = false,
   onControlsHeightChange,
+  suppressGlobalHotkeys = false,
 }: HistoryPanelProps) {
   // Live input surface of the tab in BOTH agent layouts. Everything that makes
   // History the place the user types into — availability published to grab /
   // dictation / task plan, Escape-interrupt — keys off this, not off geometry.
+  // Availability is keyed by tabId, so split panes (different tabs) publish it
+  // independently; only WINDOW-level shortcuts are gated by pane focus via
+  // suppressGlobalHotkeys.
   const agentInputSurface = mainSurface || agentSidePanel;
   // Docked-composer host. Looked up from the DOM because the host belongs to the
   // workspace column, not to this subtree; state (not a ref) so the portal
@@ -8253,18 +8462,23 @@ function HistoryPanel({
     foreignDomRows: number;
     cache: 'hit' | 'miss';
   }) => {
+    const detail = {
+      tabId,
+      sessionId: sessionId || null,
+      toolType,
+      owner: historyOwnerDigest(ownerKey),
+      generation,
+      proof,
+      domRows,
+      foreignDomRows,
+      cache,
+    };
+    // Recorded BEFORE dispatch so a subscriber mounting later (HMR remount,
+    // deferred owner handoff) can replay the proof instead of waiting on a
+    // bus that will stay silent — see readPresentedHistorySurface.
+    recordHistorySurfacePresented(detail);
     window.dispatchEvent(new CustomEvent('history-panel:surface-presented', {
-      detail: {
-        tabId,
-        sessionId: sessionId || null,
-        toolType,
-        owner: historyOwnerDigest(ownerKey),
-        generation,
-        proof,
-        domRows,
-        foreignDomRows,
-        cache,
-      },
+      detail,
     }));
   }, [sessionId, tabId, toolType]);
   const displayEntryIndexByUuid = useMemo(() => {
@@ -8318,23 +8532,79 @@ function HistoryPanel({
   // was silently discarded — the log showed 55846 going in while the screen sat
   // at 0 (e2e24).
   const historyOwnerVisit = historyOwnerVisitState;
-  const restoredMeasuredLayout = useMemo(() => {
-    if (pendingInitialHistoryIndex >= 0) return null;
-    if (displayEntries.length === 0) return null;
-    const layout = getHistoryMeasuredLayout(historyOwnerKey, displayEntries.length);
-    if (layout) {
+  // Restored geometry is LATCHED once per visit, at the first render where the
+  // list is actually eligible to mount with THIS owner's rows. A plain memo on
+  // [owner, visit] resolved at the wrong moment on every cache-miss return:
+  // the visit bump fires while entries are still the freshly seeded empty
+  // array, so the count guard answered null — and with memo deps excluding
+  // entries, the answer was never revisited when the real rows landed. Every
+  // cache-miss return therefore fell back to the anchor hunt (measured 04.08
+  // 20:21: 13 jumps / 1481ms of chopped frames) even when valid geometry
+  // existed. The latch keeps the per-visit stability the memo was after (the
+  // resolved value never changes mid-visit, so the list is not re-anchored
+  // under the user) while moving the resolve to the first render where the
+  // loader is off and rows are present — exactly the render that mounts the
+  // list, which is the only moment `restoreStateFrom` is consumed.
+  //
+  // Gates, each load-bearing:
+  // - !surfaceLoading: the list is not in the tree while the loader shows, so
+  //   nothing consumed here would reach a mount; and on a cache-hit switch the
+  //   render right after the takeover effect is exactly the render that mounts
+  //   the list — the latch must resolve there, with the new owner's cached
+  //   rows already providing the correct count.
+  // - rows > 0: an empty seed cannot be judged against a stored count.
+  //
+  // A follow-bottom anchor deliberately KEEPS the geometry: mounting from real
+  // measured sizes paints the neighborhood instantly, and the restore effect
+  // below runs the tail convergence on top so rows appended while away still
+  // land the viewport at the CURRENT tail, not the tail as of save time.
+  const restoredLayoutLatchRef = useRef<{
+    visitKey: string;
+    resolved: boolean;
+    layout: ReturnType<typeof getHistoryMeasuredLayout>;
+    avgRowHeight: number | null;
+  } | null>(null);
+  const restoredLayoutVisitKey = historyOwnerKey + ':' + historyOwnerVisit;
+  if (restoredLayoutLatchRef.current?.visitKey !== restoredLayoutVisitKey) {
+    restoredLayoutLatchRef.current = {
+      visitKey: restoredLayoutVisitKey,
+      resolved: false,
+      layout: null,
+      avgRowHeight: null,
+    };
+  }
+  // The latch resolves exactly when the list is mountable this render (same
+  // conditions as the render stub below): loader off, rows present, the
+  // takeover effect has published this owner (no transitional commit, no
+  // pre-takeover visit 0). Anything looser resolves during commits that are
+  // discarded before paint and double-logs the restore.
+  if (
+    !restoredLayoutLatchRef.current.resolved
+    && !surfaceLoading
+    && !ownerChangedBeforeLayoutHandoff
+    && historyOwnerVisit > 0
+    && displayEntries.length > 0
+  ) {
+    const latch = restoredLayoutLatchRef.current;
+    latch.resolved = true;
+    const storedLayout = getHistoryMeasuredLayout(historyOwnerKey, displayEntries.length);
+    // The height ESTIMATE is useful even when the position restore is not:
+    // a Timeline jump owns the position, but unmeasured rows around the
+    // target still size from this per-owner average instead of Virtuoso's
+    // first-row guess (a 40px prompt next to a 500px diff card).
+    latch.avgRowHeight = estimateHistoryAverageRowHeight(storedLayout);
+    // An explicit Timeline jump owns the position for this visit.
+    latch.layout = pendingInitialHistoryIndex >= 0 ? null : storedLayout;
+    if (latch.layout) {
       historyDiag('LAYOUT_RESTORE tab=' + tabId.slice(-12)
         + ' owner=' + historyOwnerDigest(historyOwnerKey)
-        + ' ranges=' + layout.ranges.length
-        + ' scrollTop=' + Math.round(layout.scrollTop));
+        + ' ranges=' + latch.layout.ranges.length
+        + ' scrollTop=' + Math.round(latch.layout.scrollTop));
     }
-    return layout;
-    // Scoped to owner+visit, not to entries: re-reading on every entries
-    // change would swap the restore prop mid-life and re-anchor the list under
-    // the user, but scoping to the owner alone made a return to the same tab
-    // reuse the FIRST visit's snapshot forever.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [historyOwnerKey, historyOwnerVisit]);
+  }
+  const restoredMeasuredLayout = restoredLayoutLatchRef.current.layout;
+  const historyDefaultRowHeight =
+    restoredLayoutLatchRef.current.avgRowHeight ?? HISTORY_DEFAULT_ROW_HEIGHT_PX;
   const rewindPreviewHiddenTurnCount = rewindPreviewResult.hiddenTurnCount;
   // Last entry uuid Claude's own backtrace reaches before stopping at the first
   // orphan. Any entry at index <= boundary is part of the chain-break zone:
@@ -8360,6 +8630,15 @@ function HistoryPanel({
   // Bumped by real user scroll intent and by owner change; the scroll-restore
   // convergence loop checks it each frame so it never fights the user.
   const scrollRestoreGenRef = useRef(0);
+  // Non-zero while a restore (convergence loop or geometry application) owns
+  // the scroller. Position/geometry writers must not record the restore's own
+  // transient positions as "where the user is" — leaving the tab mid-hunt
+  // would then restore to a half-converged offset. Token, not boolean: an
+  // abandoned loop's abort callback can fire one frame AFTER the next owner's
+  // loop already started, and a boolean reset there would unsuppress the live
+  // loop. Each restore takes a fresh token and only clears its own.
+  const historyRestoreInFlightRef = useRef(0);
+  const historyRestoreTokenRef = useRef(0);
   const [controlsHeight, setControlsHeight] = useState(0);
   const controlsHeightRef = useRef(0);
   const prevVisibleUuidsRef = useRef('');
@@ -8616,6 +8895,8 @@ function HistoryPanel({
 
   // Ctrl+F handler — scoped to history panel
   useEffect(() => {
+    // Non-focused split pane: window-level Cmd+F belongs to the focused pane.
+    if (suppressGlobalHotkeys) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!isOpen) return;
       if (shouldOpenHistorySearchFromKeydown(e, {
@@ -8647,7 +8928,7 @@ function HistoryPanel({
     };
     window.addEventListener('keydown', handleKeyDown, true); // capture phase
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [isOpen, mainSurface, searchOpen, terminalOpen, terminalIsPrimary]);
+  }, [isOpen, mainSurface, searchOpen, suppressGlobalHotkeys, terminalOpen, terminalIsPrimary]);
 
   const openSearch = useCallback(() => {
     setSearchOpen(true);
@@ -9409,6 +9690,12 @@ function HistoryPanel({
       isRefresh && (!needsRawForPresentation || !!cachedRawSnapshot)
         ? historyRevisionRef.current
         : null;
+    // Names any main-thread freeze overlapping this load (see
+    // markRendererActivity): the platform reports attribution=unknown for our
+    // own work, so the trail is the only way a 4s history read gets blamed.
+    const endLoadMark = markRendererActivity(
+      'history-load:' + tabId.slice(-8) + ':' + (isRefresh ? 'refresh' : 'cold')
+    );
     historyDiag('LOAD_START tab=' + tabId.slice(-12) +
       ' session=' + sessionId.slice(0, 8) +
       ' tool=' + toolType +
@@ -9433,6 +9720,26 @@ function HistoryPanel({
         dehydrate: true,
       });
       if (!isCurrentOwner()) {
+        // The read itself is NOT stale — it answers exactly the owner it was
+        // started for. Discarding it made the A→B→A dance quadratic: the
+        // boot-time cold read of a 59MB session (2.2s of main-process work)
+        // was thrown away because the user left before it landed, so the
+        // return to that tab was cold AGAIN (measured 04.08 20:14: repeat
+        // 525ms cold mount + right-click queued 382ms behind it). Bank the
+        // rows under the owner they belong to; only presentation is skipped.
+        if (Array.isArray(result?.entries) && result.entries.length > 0 && result.unchanged !== true) {
+          const staleCacheResult = historySnapshotCache.set(historySnapshotOwner, {
+            entries: result.entries,
+            claudeMemoryBoundaryUuid: result.claudeMemoryBoundaryUuid || null,
+            revision: result.revision || null,
+            entriesApproxBytesHint: estimateHistoryEntriesBytesFast(result.entries),
+          });
+          historyDiag('LOAD_STALE_BANKED tab=' + tabId.slice(-12) +
+            ' session=' + sessionId.slice(0, 8) +
+            ' seq=' + loadSequence +
+            ' entries=' + result.entries.length +
+            ' stored=' + (staleCacheResult.stored ? '1' : '0'));
+        }
         historyDiag('LOAD_STALE_DROP tab=' + tabId.slice(-12) +
           ' session=' + sessionId.slice(0, 8) +
           ' seq=' + loadSequence +
@@ -9443,6 +9750,26 @@ function HistoryPanel({
       if (result?.success && result.unchanged === true) {
         historyRevisionRef.current = result.revision || historyRevisionRef.current;
         const rawSnapshot = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
+        // Presentation already shows EXACTLY this snapshot (same array ref,
+        // seeded by the owner mount) and no suppression churn is pending:
+        // nothing changed ⇒ nothing to re-present. The old code re-merged and
+        // re-committed all rows anyway — measured as the bulk of a 301ms
+        // main-thread block inside the tab-click frame on a 1093-row session.
+        if (
+          rawSnapshot
+          && rawServerEntriesRef.current === (rawSnapshot.entries as unknown as FullHistoryEntry[])
+          && !needsRawForPresentation
+        ) {
+          historyLoaderReasonRef.current = 'load-unchanged';
+          setLoading(false);
+          historyDiag('LOAD_UNCHANGED tab=' + tabId.slice(-12) +
+            ' session=' + sessionId.slice(0, 8) +
+            ' seq=' + loadSequence +
+            ' elapsedMs=' + (Date.now() - loadStartedAt) +
+            ' cache=hit keptPresentation=1' +
+            ' keptEntries=' + rawSnapshot.entries.length);
+          return true;
+        }
         if (rawSnapshot) {
           const rawEntries = rawSnapshot.entries as unknown as FullHistoryEntry[];
           rawServerEntriesRef.current = rawEntries;
@@ -9475,6 +9802,24 @@ function HistoryPanel({
         return true;
       }
       if (result.success) {
+        // Yield one task boundary before the heavy per-entry passes. The IPC
+        // continuation otherwise reconciles/filters/merges thousands of rows
+        // in the SAME task the response landed in — one unbreakable 693-937ms
+        // chunk (measured 04.08 19:38 on a 2618-row Claude session), and a
+        // right-click that arrived during the IPC wait queued behind all of it
+        // (inputDelay=240ms). The rAF lets the browser paint and dispatch
+        // pending input first; the heavy work then runs one frame later.
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => setTimeout(resolve, 0));
+        });
+        if (!isCurrentOwner()) {
+          historyDiag('LOAD_STALE_DROP tab=' + tabId.slice(-12) +
+            ' session=' + sessionId.slice(0, 8) +
+            ' seq=' + loadSequence +
+            ' phase=apply-yield' +
+            ' elapsedMs=' + (Date.now() - loadStartedAt));
+          return false;
+        }
         const now = Date.now();
         for (const [handoffId, suppressed] of suppressedPromptsRef.current) {
           if ((suppressed.expiresAt || suppressed.until) < now) {
@@ -9633,8 +9978,15 @@ function HistoryPanel({
         if (rewindPrefixOnScreenRef.current === historyOwnerKey) {
           // The rows on screen are still the display-only rewind prefix and
           // the child projection failed to load — say so instead of letting
-          // the prefix stand as if it were the final history.
-          setError('История новой ветки не загрузилась: ' + String(result?.error || 'load failed') + '. Показан общий префикс до отката.');
+          // the prefix stand as if it were the final history. The error banner
+          // lives in the composer component, so the notice travels through the
+          // same tab-scoped channel the rewind failure above already uses.
+          window.dispatchEvent(new CustomEvent('history-panel:agent-error', {
+            detail: {
+              tabId,
+              message: 'История новой ветки не загрузилась: ' + String(result?.error || 'load failed') + '. Показан общий префикс до отката.',
+            },
+          }));
         }
       }
       historyDiag('LOAD_RESULT_FAIL tab=' + tabId.slice(-12) +
@@ -9657,7 +10009,12 @@ function HistoryPanel({
         historyLoaderReasonRef.current = 'load-exception';
         setLoading(false);
         if (rewindPrefixOnScreenRef.current === historyOwnerKey) {
-          setError('История новой ветки не загрузилась: ' + String((e as any)?.message || e) + '. Показан общий префикс до отката.');
+          window.dispatchEvent(new CustomEvent('history-panel:agent-error', {
+            detail: {
+              tabId,
+              message: 'История новой ветки не загрузилась: ' + String((e as any)?.message || e) + '. Показан общий префикс до отката.',
+            },
+          }));
         }
       }
       historyDiag('LOAD_ERROR tab=' + tabId.slice(-12) +
@@ -9667,6 +10024,10 @@ function HistoryPanel({
         ' elapsedMs=' + (Date.now() - loadStartedAt) +
         ' error=' + String((e as any)?.message || e));
       return false;
+    } finally {
+      // Every exit closes the attribution mark — an unclosed mark would be
+      // reported as "(open)" forever and blame this load for later freezes.
+      endLoadMark();
     }
   }, [sessionId, cwd, historyOwnerKey, historySnapshotOwner, persistVolatileOverlay, scrollToBottom, setHistoryRewindPreview, tabId, toolType, reconcileLiveToolResultsAgainstDurable, consumeMaterializedPromptHandoffs]);
 
@@ -9974,7 +10335,18 @@ function HistoryPanel({
 
   // Initial load on mount / session change / tool type switch
   const initialLoadDoneRef = useRef(false);
+  // Cancels a warm-return verify pass that has not fired yet (owner left
+  // before its two-frame delay elapsed).
+  const deferredWarmRefreshCancelRef = useRef<(() => void) | null>(null);
   useLayoutEffect(() => {
+    // Names the owner-takeover commit in freeze attribution. The 04.08 19:38
+    // log showed 693/937ms long tasks whose first ~600-800ms preceded
+    // LOAD_START — i.e. the takeover render+seeding itself, not the IPC load.
+    // This mark closes on the next frame, covering exactly that commit.
+    const endOwnerMountMark = markRendererActivity(
+      'history-owner-mount:' + tabId.slice(-8)
+    );
+    requestAnimationFrame(() => endOwnerMountMark());
     const generation = historyOwnerGenerationRef.current + 1;
     const viewportPaintOwner: HistoryViewportPaintOwner = {
       key: historyOwnerKey,
@@ -10174,8 +10546,35 @@ function HistoryPanel({
     if (currentPreview?.sessionId && currentPreview.sessionId !== sessionId) {
       setHistoryRewindPreview(tabId, null);
     }
-    void loadHistory(!!cachedSnapshot);
+    if (cachedSnapshot) {
+      // Warm return: the cached rows are ALREADY on screen — the verify-
+      // freshness pass is invisible to the user unless the file changed, so it
+      // has no claim on the switch window. Waiting two frames keeps the whole
+      // takeover (highlight, cached rows, restored position) clean of IPC and
+      // heavy merges; a live session's tail events still arrive through the
+      // transcript-changed subscription regardless of this initial check.
+      let refreshRaf2 = 0;
+      const refreshRaf1 = requestAnimationFrame(() => {
+        refreshRaf2 = requestAnimationFrame(() => {
+          if (historyOwnerKeyRef.current !== historyOwnerKey) return;
+          void loadHistory(true);
+        });
+      });
+      // Cancellation lives in the shared cleanup below via the owner guard —
+      // an owner change before the frames fire makes the callback a no-op, and
+      // the rAFs themselves are cancelled explicitly.
+      const cancelDeferredRefresh = () => {
+        cancelAnimationFrame(refreshRaf1);
+        if (refreshRaf2) cancelAnimationFrame(refreshRaf2);
+      };
+      deferredWarmRefreshCancelRef.current = cancelDeferredRefresh;
+    } else {
+      deferredWarmRefreshCancelRef.current = null;
+      void loadHistory(false);
+    }
     return () => {
+      deferredWarmRefreshCancelRef.current?.();
+      deferredWarmRefreshCancelRef.current = null;
       viewportPaintProbeRef.current?.cancel(viewportPaintOwner);
       surfacePresentedProbeRef.current?.cancel(viewportPaintOwner);
       // Geometry is captured continuously while the owner is alive (see the
@@ -10233,6 +10632,13 @@ function HistoryPanel({
   // must not be raced by a competing restore.
   useEffect(() => {
     if (surfaceLoading || initialLoadDoneRef.current) return;
+    // Same mountability gates as the render stub: passive effects of the
+    // TRANSITIONAL commit (owner prop changed, takeover not yet re-rendered)
+    // flush before the commit that actually mounts the list. Running the
+    // restore there would consume initialLoadDoneRef against a null scroller
+    // — the convergence loop would spin over nothing while blocking the real
+    // restore of the mounted list one commit later.
+    if (ownerChangedBeforeLayoutHandoff || historyOwnerVisit === 0) return;
     if (displayEntries.length === 0) return;
     if (useUIStore.getState().historyScrollToUuid) {
       // Timeline navigation wins; mark restore as done so it cannot fire
@@ -10241,7 +10647,24 @@ function HistoryPanel({
       return;
     }
     initialLoadDoneRef.current = true;
-    if (restoredMeasuredLayout) {
+    // Geometry restores the PIXEL position the user left — which is the wrong
+    // target for a tail-pinned reader when rows arrived while they were away:
+    // the old tail offset is now mid-list, and nothing after mount would
+    // correct it (followOutput reacts only to appends that happen POST-mount;
+    // a cold load commits the longer list before the list exists). Let the
+    // geometry paint the neighborhood instantly from real sizes, but hand
+    // position ownership to the tail convergence below. A warm return whose
+    // cache was already at the tail measures drift≈0 and settles on the first
+    // frame, so the common case pays nothing.
+    const frozenRestoreAnchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
+    // Geometry owns the position only for a PROVEN mid-list reading place. No
+    // anchor at all means the user never scrolled this owner — they were at
+    // the tail (the initial position), and the anchor writer simply never ran
+    // (it lives on scroll-idle). Such a return must behave like followBottom,
+    // not like "hold whatever pixel the geometry stored": rows appended while
+    // away would strand the viewport mid-list with followOutput blocked (the
+    // scroller is not tail-pinned, so the append hook refuses to pull).
+    if (restoredMeasuredLayout && frozenRestoreAnchor && !frozenRestoreAnchor.followBottom) {
       // Virtuoso was handed real measured sizes plus this owner's scroll
       // offset, so the list is already where the user left it. Running the
       // anchor loop on top would be two mechanisms steering one viewport —
@@ -10266,11 +10689,29 @@ function HistoryPanel({
       let stableTop: number | null = null;
       let stableFrames = 0;
       const MAX_DRIFT_FRAMES = 30;
+      // Virtuoso adjusts scrollTop for a few frames while applying the
+      // restored geometry. The position writers (live offset patch, idle
+      // anchor save) must not record those transitional offsets as the
+      // user's place — hold the same in-flight token the hunt loops use
+      // until the position stops moving. A real user gesture ends the hold
+      // immediately (their position IS the truth from that moment on).
+      const restoreToken = ++historyRestoreTokenRef.current;
+      historyRestoreInFlightRef.current = restoreToken;
+      const restoreGenAtStart = scrollRestoreGenRef.current;
+      const releaseRestoreToken = () => {
+        if (historyRestoreInFlightRef.current === restoreToken) {
+          historyRestoreInFlightRef.current = 0;
+        }
+      };
       const measureDrift = () => {
         if (
           historyOwnerKeyRef.current !== driftOwner
           || historyOwnerGenerationRef.current !== driftGeneration
-        ) return;
+          || scrollRestoreGenRef.current !== restoreGenAtStart
+        ) {
+          releaseRestoreToken();
+          return;
+        }
         driftFrames += 1;
         const scroller = virtuosoScrollerRef.current;
         const anchor = driftAnchor;
@@ -10300,6 +10741,7 @@ function HistoryPanel({
             return;
           }
         }
+        releaseRestoreToken();
         let driftPx: number | string = 'row-not-mounted';
         if (node && scroller && anchor) {
           driftPx = Math.round(
@@ -10330,6 +10772,32 @@ function HistoryPanel({
       if (historyOwnerGenerationRef.current !== generationAtRestore) return 'owner-change';
       return null;
     };
+    // A settled hunt is the one moment the position is BOTH correct and fully
+    // measured — bank the geometry immediately. Waiting for the next
+    // scroll-idle tick left a converged-then-abandoned tab with a mid-hunt
+    // offset in the store (the presented-proof baseline fires while the hunt
+    // is still running), which is exactly the cold-return this cache exists
+    // to kill. The in-flight flag brackets the whole loop so the live
+    // scrollTop patch ignores the hunt's transient jump positions.
+    const settleRestoreAndBankGeometry = (ownerAtRestore: string, restoreToken: number) => {
+      if (historyRestoreInFlightRef.current === restoreToken) {
+        historyRestoreInFlightRef.current = 0;
+      }
+      const layoutItems = lengthRef.current;
+      try {
+        virtuosoRef.current?.getState((snapshot) => {
+          if (historyOwnerKeyRef.current !== ownerAtRestore) return;
+          const saved = saveHistoryMeasuredLayout(ownerAtRestore, snapshot as any, layoutItems);
+          if (saved) {
+            historyDiag('LAYOUT_SAVE tab=' + tabId.slice(-12)
+              + ' owner=' + historyOwnerDigest(ownerAtRestore)
+              + ' ranges=' + ((snapshot as any)?.ranges?.length ?? 0)
+              + ' items=' + layoutItems
+              + ' at=restore-settled');
+          }
+        });
+      } catch { /* geometry is optional; never break position restore */ }
+    };
     const anchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
     if (anchor && !anchor.followBottom) {
       const index = displayEntryIndexByUuidRef.current.get(anchor.uuid);
@@ -10344,6 +10812,8 @@ function HistoryPanel({
         historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12)
           + ' mode=anchor uuid=' + uuidTag
           + ' idx=' + index + ' offset=' + anchor.offsetPx);
+        const restoreToken = ++historyRestoreTokenRef.current;
+        historyRestoreInFlightRef.current = restoreToken;
         runHistoryScrollConvergence({
           cancelled: () => cancelReasonForRestore(
             ownerAtRestore, generationAtRestore, restoreGenAtStart,
@@ -10369,20 +10839,28 @@ function HistoryPanel({
             });
             return true;
           },
-          onSettled: (o) => historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
-            + ' uuid=' + uuidTag + ' attempts=' + o.attempts
-            + ' settled=' + o.settled
-            + ' driftPx=' + (o.driftPx === null ? 'na' : Math.round(o.driftPx))
-            + ' elapsedMs=' + Math.round(o.elapsedMs)),
-          onAborted: (o) => historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
-            + ' uuid=' + uuidTag + ' attempts=' + o.attempts + ' reason=' + o.reason),
+          onSettled: (o) => {
+            settleRestoreAndBankGeometry(ownerAtRestore, restoreToken);
+            historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
+              + ' uuid=' + uuidTag + ' attempts=' + o.attempts
+              + ' settled=' + o.settled
+              + ' driftPx=' + (o.driftPx === null ? 'na' : Math.round(o.driftPx))
+              + ' elapsedMs=' + Math.round(o.elapsedMs));
+          },
+          onAborted: (o) => {
+            if (historyRestoreInFlightRef.current === restoreToken) {
+              historyRestoreInFlightRef.current = 0;
+            }
+            historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
+              + ' uuid=' + uuidTag + ' attempts=' + o.attempts + ' reason=' + o.reason);
+          },
         });
         return;
       }
       // Anchor row vanished (rewind/edit truncated the branch): fall through
       // to the tail rather than showing an unrelated pixel position.
     }
-    if (anchor?.followBottom) {
+    if (anchor?.followBottom || (!anchor && restoredMeasuredLayout)) {
       // The tail is NOT the trivial case it looks like. "Show the last row" is
       // still executed against ESTIMATED heights, so a bare jump lands short
       // and snaps down once the rows measure — visible in prod (26.07) as the
@@ -10390,10 +10868,20 @@ function HistoryPanel({
       // branch was the last one left doing a single shot, and it was also the
       // only one that logged no outcome, which is exactly why no test caught
       // it: a silent path has nothing to disagree with reality.
+      //
+      // The no-anchor-with-geometry case belongs here too: geometry restored
+      // the pixel tail AS OF SAVE TIME, and with rows appended while away
+      // that pixel is now mid-list with followOutput refusing to pull (the
+      // scroller is not tail-pinned). No anchor means the user never scrolled
+      // this owner — their position is the tail by construction, so converge
+      // to the CURRENT tail. When nothing was appended the first drift
+      // measurement is ≈0 and the loop settles without a single jump.
       const ownerAtRestore = historyOwnerKey;
       const generationAtRestore = historyOwnerGenerationRef.current;
       const restoreGenAtStart = ++scrollRestoreGenRef.current;
       historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12) + ' mode=tail');
+      const restoreToken = ++historyRestoreTokenRef.current;
+      historyRestoreInFlightRef.current = restoreToken;
       runHistoryScrollConvergence({
         cancelled: () => cancelReasonForRestore(
           ownerAtRestore, generationAtRestore, restoreGenAtStart,
@@ -10414,13 +10902,21 @@ function HistoryPanel({
           });
           return true;
         },
-        onSettled: (o) => historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
-          + ' mode=tail attempts=' + o.attempts
-          + ' settled=' + o.settled
-          + ' driftPx=' + (o.driftPx === null ? 'na' : Math.round(o.driftPx))
-          + ' elapsedMs=' + Math.round(o.elapsedMs)),
-        onAborted: (o) => historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
-          + ' mode=tail attempts=' + o.attempts + ' reason=' + o.reason),
+        onSettled: (o) => {
+          settleRestoreAndBankGeometry(ownerAtRestore, restoreToken);
+          historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
+            + ' mode=tail attempts=' + o.attempts
+            + ' settled=' + o.settled
+            + ' driftPx=' + (o.driftPx === null ? 'na' : Math.round(o.driftPx))
+            + ' elapsedMs=' + Math.round(o.elapsedMs));
+        },
+        onAborted: (o) => {
+          if (historyRestoreInFlightRef.current === restoreToken) {
+            historyRestoreInFlightRef.current = 0;
+          }
+          historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
+            + ' mode=tail attempts=' + o.attempts + ' reason=' + o.reason);
+        },
       });
       return;
     }
@@ -10437,6 +10933,8 @@ function HistoryPanel({
         const generationAtRestore = historyOwnerGenerationRef.current;
         const restoreGenAtStart = ++scrollRestoreGenRef.current;
         historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12) + ' mode=legacy-px px=' + Math.round(savedPos));
+        const restoreToken = ++historyRestoreTokenRef.current;
+        historyRestoreInFlightRef.current = restoreToken;
         runHistoryScrollConvergence({
           cancelled: () => cancelReasonForRestore(
             ownerAtRestore, generationAtRestore, restoreGenAtStart,
@@ -10457,19 +10955,32 @@ function HistoryPanel({
             el.scrollTop = Math.min(savedPos, maxTop);
             return true;
           },
-          onSettled: (o) => historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
-            + ' mode=legacy-px attempts=' + o.attempts
-            + ' settled=' + o.settled
-            + ' driftPx=' + (o.driftPx === null ? 'na' : Math.round(o.driftPx))
-            + ' elapsedMs=' + Math.round(o.elapsedMs)),
-          onAborted: (o) => historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
-            + ' mode=legacy-px attempts=' + o.attempts + ' reason=' + o.reason),
+          onSettled: (o) => {
+            settleRestoreAndBankGeometry(ownerAtRestore, restoreToken);
+            historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
+              + ' mode=legacy-px attempts=' + o.attempts
+              + ' settled=' + o.settled
+              + ' driftPx=' + (o.driftPx === null ? 'na' : Math.round(o.driftPx))
+              + ' elapsedMs=' + Math.round(o.elapsedMs));
+          },
+          onAborted: (o) => {
+            if (historyRestoreInFlightRef.current === restoreToken) {
+              historyRestoreInFlightRef.current = 0;
+            }
+            historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
+              + ' mode=legacy-px attempts=' + o.attempts + ' reason=' + o.reason);
+          },
         });
       }
     }
     // `entries` in deps: on a cold owner this effect must re-run when the
     // first projection lands (surfaceLoading flips earlier than rows exist).
-  }, [surfaceLoading, tabId, historyOwnerKey, entries, restoredMeasuredLayout]);
+    // `historyOwnerVisit` in deps: after the takeover publishes the visit the
+    // effect must re-run — the transitional-commit guard above returned early
+    // on the render where `entries` landed, and without this dep nothing
+    // re-triggers the restore for a cache-hit switch (entries don't change
+    // again).
+  }, [surfaceLoading, tabId, historyOwnerKey, historyOwnerVisit, ownerChangedBeforeLayoutHandoff, entries, restoredMeasuredLayout]);
 
   // Both PTY agents expose canonical incremental transcript records. Project
   // that same stream into desktop History while the turn is busy,
@@ -10738,6 +11249,22 @@ function HistoryPanel({
     scrollEventLogged: boolean;
   } | null>(null);
   const historyTouchYRef = useRef<number | null>(null);
+  // Machine-driven motion must not engage scroll-seek placeholders. All three
+  // jump machines read as enormous velocity to Virtuoso but stop producing
+  // samples the moment they land — the retest (04.08 22:08) showed seek mode
+  // stuck on a motionless screen for 44s after a position restore (ENTER
+  // velocity=51087, no further samples to trigger exit). Registered per
+  // mounted panel; any instance's active machine suppresses entry.
+  useEffect(() => {
+    const suppressor = () =>
+      historyRestoreInFlightRef.current !== 0
+      || historyScrollInFlightRef.current !== null
+      || isAtBottomRef.current;
+    historySeekSuppressors.add(suppressor);
+    return () => {
+      historySeekSuppressors.delete(suppressor);
+    };
+  }, []);
   useEffect(() => {
     // React StrictMode and Fast Refresh both run cleanup before installing the
     // same effect again while preserving refs. Re-arm the liveness proof in
@@ -10782,6 +11309,11 @@ function HistoryPanel({
     let isUpwardIntent = false;
     if (event.type === 'wheel') {
       isUpwardIntent = (event as WheelEvent).deltaY < 0;
+      // Pre-engage the seek gate for violent flings: the wheel event carries
+      // the delta BEFORE the scroll sample exists, so the first frame of a
+      // hard fling can already render placeholders instead of paying a full
+      // heavy-row mount (the 796ms pre-ENTER task from the 22:08 retest).
+      armHistoryWheelBurst((event as WheelEvent).deltaY);
     } else if (event.type === 'touchmove') {
       const touch = (event as TouchEvent).touches[0];
       const nextY = touch?.clientY ?? null;
@@ -10976,6 +11508,8 @@ function HistoryPanel({
   const handleScroll = useCallback(() => {
     const el = virtuosoScrollerRef.current;
     if (!el) return;
+    // Keep the seek-kick target on the element that is actually moving.
+    historySeekScroller = el;
     clearHistoryToolScrollFocus('history-scroll');
     const deltaTop = el.scrollTop - lastScrollTopRef.current;
     const lastJump = lastProgrammaticHistoryScrollRef.current;
@@ -11001,6 +11535,22 @@ function HistoryPanel({
     }
     scrollDirectionRef.current = el.scrollTop >= lastScrollTopRef.current ? 'down' : 'up';
     lastScrollTopRef.current = el.scrollTop;
+    // Live O(1) patch of the stored geometry's offset. The FULL geometry save
+    // waits for scroll-idle (150ms), so leaving the tab right after a gesture
+    // restored the position of the PREVIOUS idle tick — one gesture ago. Row
+    // sizes don't change from scrolling, so patching just the offset keeps
+    // the stored snapshot exact without asking Virtuoso for a full state
+    // walk on every wheel tick. No-op until the first full save exists.
+    // Suppressed while a restore loop owns the scroller (its transient jump
+    // positions are not the user's place) and until the viewport proof — the
+    // scroll events Virtuoso fires while APPLYING restored geometry at mount
+    // pass through intermediate offsets that must not overwrite the target.
+    if (
+      !historyRestoreInFlightRef.current
+      && viewportReadyOwnerKeyRef.current === historyOwnerKeyRef.current
+    ) {
+      updateHistoryMeasuredLayoutScrollTop(historyOwnerKeyRef.current, el.scrollTop);
+    }
     if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
     // Capture the owner key NOW, not when the timer fires: the panel is
     // persistently mounted, so 150ms later the tab may already be a
@@ -11013,6 +11563,13 @@ function HistoryPanel({
       // the save — the anchor already stored on the previous idle tick wins.
       if (scrollPositionKeyRef.current !== saveKey) return;
       if (!el.isConnected) return;
+      // A restore hunt re-jumps every frame, but a heavy row mount can hold
+      // a frame past the 150ms debounce — and this callback then recorded a
+      // MID-HUNT position as the user's reading place (anchor, pixels and
+      // geometry alike), corrupting the very target the next return aims
+      // for. The hunt's own settle banks the final position; nothing here is
+      // lost by skipping.
+      if (historyRestoreInFlightRef.current) return;
       setHistoryScrollPosition(saveKey, el.scrollTop);
       // Reading anchor: row identity + in-row offset instead of raw pixels.
       // Virtualized heights are estimates until measured, so scrollTop stops
@@ -11217,6 +11774,7 @@ function HistoryPanel({
       // terminal the composer is a normal bottom row of the workspace column.
       overlayComposer={mainSurface}
       agentInputSurface={agentInputSurface}
+      suppressWindowEscape={suppressGlobalHotkeys}
     />
   ) : null;
 
@@ -11434,7 +11992,17 @@ function HistoryPanel({
       <div data-history-content-stage style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
         <HistoryPayloadContext.Provider value={historyPayloadContextValue}>
         <HistoryBackgroundLiveContext.Provider value={liveBackgroundUuids}>
-        {surfaceLoading ? (
+        {/* The two extra conditions skip mounting the list during commits
+            that are guaranteed to be replaced BEFORE the browser paints:
+            (1) the transitional commit right after the owner prop changed
+            (the takeover layout effect re-renders synchronously), and
+            (2) the pre-takeover commits of a fresh panel (visit is still 0
+            until the first takeover effect publishes a generation). Both
+            used to mount a full Virtuoso + heavy rows under a key that the
+            very next synchronous render discarded — every warm switch paid
+            the list mount TWICE inside one frame. The stub is never visible:
+            no paint happens between these commits. */}
+        {surfaceLoading || ownerChangedBeforeLayoutHandoff || historyOwnerVisit === 0 ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#818cf8', fontSize: 13, gap: 8 }}>
             <HistorySpinner size={16} />
             Loading...
@@ -11652,6 +12220,11 @@ function HistoryPanel({
                     // but not creating it is the actual fix.
                     const layoutItems = lengthRef.current;
                     requestAnimationFrame(() => requestAnimationFrame(() => {
+                    // A restore hunt still owns the scroller two frames after
+                    // presentation on cold tail returns — its jump positions
+                    // are not a baseline worth keeping, and the hunt's own
+                    // settle banks the real one.
+                    if (historyRestoreInFlightRef.current) return;
                     try {
                       virtuosoRef.current?.getState((snapshot) => {
                         if (historyOwnerKeyRef.current !== ownerAtRange) return;
@@ -11679,6 +12252,17 @@ function HistoryPanel({
             // returns, so flash highlights and Cmd+F still include the same
             // neighborhood as before.
             increaseViewportBy={historyViewportBuffer}
+            // Scrollbar scrub / hard fling renders flat placeholders instead
+            // of full markdown rows — mounting-and-discarding dozens of heavy
+            // cards per frame is what made fast scrolling stutter. Real rows
+            // return as soon as velocity drops (see the config's exit gate).
+            scrollSeekConfiguration={HISTORY_SCROLL_SEEK_CONFIG}
+            // Per-owner measured average for rows not yet measured. Without
+            // it Virtuoso sizes the unknown region from the FIRST measured
+            // row — a 40px prompt or a 500px diff card — and the scrollbar
+            // thumb lurches every time a newly mounted row corrects the
+            // estimate mid-scrub.
+            defaultItemHeight={historyDefaultRowHeight}
             // Measured geometry from the previous visit to this same owner.
             // With it Virtuoso places the list from REAL sizes instead of
             // estimating and being corrected frame by frame. Mutually

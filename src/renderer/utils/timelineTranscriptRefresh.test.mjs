@@ -3,6 +3,9 @@ import test from 'node:test';
 import {
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
+  recordHistorySurfacePresented,
+  readPresentedHistorySurface,
+  __resetPresentedHistorySurfacesForTest,
 } from './timelineTranscriptRefresh.mjs';
 
 test('hidden Timeline retains invalidation until Project Home closes', () => {
@@ -88,4 +91,34 @@ test('History presentation gate normalizes an absent session id to null', () => 
       toolType: 'claude',
     },
   }), true);
+});
+
+test('records and replays the last presented surface per tab', () => {
+  __resetPresentedHistorySurfacesForTest();
+  recordHistorySurfacePresented({
+    tabId: 'tab-1', sessionId: 's-1', toolType: 'claude', proof: 'mounted-painted-row',
+  });
+  const hit = readPresentedHistorySurface({ tabId: 'tab-1', sessionId: 's-1', toolType: 'claude' });
+  assert.equal(hit?.proof, 'mounted-painted-row');
+  // Identity mismatch (stale session) must NOT replay.
+  assert.equal(
+    readPresentedHistorySurface({ tabId: 'tab-1', sessionId: 's-2', toolType: 'claude' }),
+    null,
+  );
+  // Unknown tab → nothing.
+  assert.equal(
+    readPresentedHistorySurface({ tabId: 'tab-2', sessionId: 's-1', toolType: 'claude' }),
+    null,
+  );
+});
+
+test('a newer presentation for the same tab overwrites the old record', () => {
+  __resetPresentedHistorySurfacesForTest();
+  recordHistorySurfacePresented({ tabId: 'tab-1', sessionId: 's-1', toolType: 'claude', proof: 'a' });
+  recordHistorySurfacePresented({ tabId: 'tab-1', sessionId: 's-9', toolType: 'codex', proof: 'b' });
+  assert.equal(readPresentedHistorySurface({ tabId: 'tab-1', sessionId: 's-1', toolType: 'claude' }), null);
+  assert.equal(
+    readPresentedHistorySurface({ tabId: 'tab-1', sessionId: 's-9', toolType: 'codex' })?.proof,
+    'b',
+  );
 });

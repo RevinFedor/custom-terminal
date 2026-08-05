@@ -1224,6 +1224,10 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const cur = state.queues.get(tabId);
         if (!cur) return state;
         let changed = false;
+        // Head = the element that would fire next. Changing ITS trigger resets
+        // the pending countdown and re-arms the queue; changing a later
+        // element's trigger must not touch the head's timer.
+        const headId = cur.items.find(isQueuedPromptEnabled)?.id ?? null;
         const normalized = trigger?.kind === 'timer'
           ? { kind: 'timer' as const, seconds: normalizeFirstDelaySeconds(trigger.seconds) }
           : trigger?.kind === 'onTab' && trigger.tabId

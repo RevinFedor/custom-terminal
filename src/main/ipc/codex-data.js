@@ -6794,6 +6794,28 @@ function register({ projectManager, transcriptService } = {}) {
   });
 
   ipcMain.handle('codex:get-usage', async (_event, opts = {}) => {
+    // Stage probes. This handler has shown 620ms-7.7s wall times and once
+    // coincided with a 5002ms main-loop stall at near-zero CPU — i.e. the
+    // process was WAITING synchronously, not computing. The stage log names
+    // which phase ate the time so the blocker is identified by evidence, not
+    // by guess. (5002ms at zero CPU smells like a lock-acquisition timeout;
+    // the probe will say.)
+    const usageStages = [];
+    const usageStartedAt = Date.now();
+    let usageStageStartedAt = usageStartedAt;
+    const markUsageStage = (name) => {
+      const now = Date.now();
+      usageStages.push(name + '=' + (now - usageStageStartedAt));
+      usageStageStartedAt = now;
+    };
+    const logUsageStages = () => {
+      const totalMs = Date.now() - usageStartedAt;
+      if (totalMs > 250) {
+        console.log('[CodexUsage:Stages] totalMs=' + totalMs
+          + ' ' + usageStages.join(' ')
+          + ' force=' + (!!opts?.force));
+      }
+    };
     try {
       const [remoteResult, managedProfileResult] = await Promise.all([
         getCodexRemoteUsage({
@@ -6802,6 +6824,7 @@ function register({ projectManager, transcriptService } = {}) {
         }),
         refreshCodexManagedProfileAccounts({ force: !!opts?.force }),
       ]);
+      markUsageStage('remoteAndProfiles');
       const currentRemoteAccount = remoteResult.currentAccountKey
         ? remoteResult.accounts?.find((account) => account.accountKey === remoteResult.currentAccountKey)
         : null;
@@ -6819,6 +6842,7 @@ function register({ projectManager, transcriptService } = {}) {
       const accountResult = needsFallback
         ? await getCodexUsageAccountsFast({ force: false, reason: 'ipc-fallback' })
         : getCodexUsageAccountsSnapshot('ipc-server-primary');
+      markUsageStage(needsFallback ? 'accountsFallback' : 'accountsSnapshot');
       let accountUsages = mergeCodexPreferredAccounts(
         accountResult.accounts || [],
         [
@@ -6847,6 +6871,7 @@ function register({ projectManager, transcriptService } = {}) {
           }
           activeAccountKey = codexAccountKeyFromIdentity(activeIdentity);
         } catch {}
+        markUsageStage('sessionIdentity');
       }
       if (activeUsage && activeIdentity) {
         rememberCodexActiveUsageOverride(activeIdentity, activeUsage, opts.sessionId);
@@ -6924,6 +6949,7 @@ function register({ projectManager, transcriptService } = {}) {
       if (!usage && !accountResult.refreshing && !opts?.accountKey && accountUsages.length === 0) {
         usage = await findLatestCodexUsage();
         source = usage ? 'latest-rollout-unverified' : source;
+        markUsageStage('latestRolloutScan');
       }
 
       if (selectedAccount?.source) source = selectedAccount.source;
@@ -6975,6 +7001,8 @@ function register({ projectManager, transcriptService } = {}) {
     } catch (error) {
       console.error('[CodexData] get-usage error:', error);
       return { success: false, error: error.message };
+    } finally {
+      logUsageStages();
     }
   });
 }

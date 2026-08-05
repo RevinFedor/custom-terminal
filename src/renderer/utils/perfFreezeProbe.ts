@@ -1,4 +1,5 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import { attributeFreeze } from './rendererActivityTrail';
 
 let installed = false;
 
@@ -31,6 +32,10 @@ function getContext(): string {
 function absNow(): number {
   return performance.timeOrigin + performance.now();
 }
+
+// Freeze attribution lives in its own dependency-free module so hot paths can
+// leave a mark without importing this probe (and, through it, the stores).
+export { markRendererActivity } from './rendererActivityTrail';
 
 type LoopSample = {
   abs: number;
@@ -274,12 +279,18 @@ export function installPerfFreezeProbe() {
           const attribution = Array.isArray(entry.attribution)
             ? entry.attribution.map((a: any) => a?.name || a?.containerType || 'unknown').join(',')
             : '';
+          const taskStartAbs = performance.timeOrigin + entry.startTime;
+          const taskEndAbs = taskStartAbs + entry.duration;
+          // The platform's attribution is always "self"/unknown for same-origin
+          // work; `during=` is ours and names the app activity that overlapped.
+          const during = attributeFreeze(taskStartAbs, taskEndAbs);
           log(
             '[Perf:LongTask] startMs=' + entry.startTime.toFixed(1) +
-            ' startAbs=' + (performance.timeOrigin + entry.startTime).toFixed(1) +
-            ' endAbs=' + (performance.timeOrigin + entry.startTime + entry.duration).toFixed(1) +
+            ' startAbs=' + taskStartAbs.toFixed(1) +
+            ' endAbs=' + taskEndAbs.toFixed(1) +
             ' durationMs=' + entry.duration.toFixed(1) +
             ' name=' + (entry.name || 'unknown') +
+            ' during=' + during +
             (attribution ? ' attribution=' + attribution.slice(0, 120) : '')
           );
           if (entry.duration >= 500) {
@@ -287,10 +298,11 @@ export function installPerfFreezeProbe() {
               '[Perf:FreezeSummary] layer=renderer' +
               ' kind=longTask' +
               ' severity=' + freezeSeverity(entry.duration) +
-              ' startAbs=' + (performance.timeOrigin + entry.startTime).toFixed(1) +
-              ' endAbs=' + (performance.timeOrigin + entry.startTime + entry.duration).toFixed(1) +
+              ' startAbs=' + taskStartAbs.toFixed(1) +
+              ' endAbs=' + taskEndAbs.toFixed(1) +
               ' durationMs=' + entry.duration.toFixed(1) +
               ' name=' + (entry.name || 'unknown') +
+              ' during=' + during +
               (attribution ? ' attribution=' + attribution.slice(0, 120) : '')
             );
           }

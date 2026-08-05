@@ -6,12 +6,12 @@
 // surface (control bar, History, Timeline, task plan) follows.
 //
 // The CENTER is decoupled from the sidebar project: activating a tab changes
-// only what the center shows. activeProjectId (sidebar/toolbar/git) moves
-// ONLY on an explicit project click (titlebar, dashboard, project chip in the
-// attach row) — never as a side effect of a tab switch or pane focus.
+// only what the center shows, and an explicit project click (titlebar,
+// dashboard, project chip in the attach row) moves ONLY the sidebar pointer
+// (focusedProjectId) — it never activates a tab and never touches the panes.
 //
-// Approved navigation rule (one rule for sidebar click / Ctrl+Tab / Cmd+P /
-// project click):
+// Approved navigation rule (one rule for sidebar click / Ctrl+Tab / Cmd+P —
+// i.e. every TAB activation):
 //   • target tab already visible in a pane → focus that pane, composition
 //     unchanged;
 //   • otherwise → the pane in focus replaces its tab with the target.
@@ -77,8 +77,10 @@ export function addPane(panes, focusedIndex, current, added) {
 
 // Split button in the attach row: open a new EMPTY pane and focus it. From
 // single mode the current center tab becomes pane 0. Only one placeholder at
-// a time — a second click while one is open is a no-op.
-export function addEmptyPane(panes, focusedIndex, current) {
+// a time — a second click while one is open is a no-op. `afterIndex` is the
+// pane the button was pressed in: the placeholder opens immediately to its
+// RIGHT (pressing split in pane 0 of [A,B] gives [A,∅,B], not [A,B,∅]).
+export function addEmptyPane(panes, focusedIndex, current, afterIndex = null) {
   if (!Array.isArray(panes)) return null;
   if (panes.length === 0) {
     if (!current || !current.tabId) return null;
@@ -86,7 +88,12 @@ export function addEmptyPane(panes, focusedIndex, current) {
   }
   if (panes.length >= MAX_SPLIT_PANES) return null;
   if (panes.some(isEmptyPane)) return null;
-  return { panes: [...panes, { projectId: '', tabId: '' }], focusedIndex: panes.length };
+  const insertAt = afterIndex === null
+    ? panes.length
+    : Math.max(0, Math.min(panes.length, (afterIndex | 0) + 1));
+  const next = panes.slice();
+  next.splice(insertAt, 0, { projectId: '', tabId: '' });
+  return { panes: next, focusedIndex: insertAt };
 }
 
 // Remove a tab's pane (close tab / ПКМ «Убрать»). A single remaining REAL

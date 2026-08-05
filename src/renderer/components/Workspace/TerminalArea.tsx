@@ -22,7 +22,7 @@ import {
 } from '../../utils/sessionStartingState.mjs';
 import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
 import { isEmptyPane } from '../../utils/splitPanesModel.mjs';
-import SplitPaneSurface from './SplitPaneSurface';
+import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -1406,6 +1406,14 @@ function TerminalArea({
           );
         } else {
           totalCount++;
+          // A pane owns its Run after strip: the overlay portals into the
+          // pane's own host (z-layer of the PANE, not of the terminal), and
+          // agent panes always author through History (docked or inline
+          // composer), same as the single-mode agent layouts.
+          const paneAgentPair = inPane
+            && tab.commandType !== 'gemini'
+            && (tab.commandType === 'claude' || tab.commandType === 'codex'
+              || !!tab.claudeSessionId || !!tab.codexSessionId);
           inner = (
             <Terminal
               key={tab.id}
@@ -1415,9 +1423,11 @@ function TerminalArea({
               active={active}
               isActiveProject={isActiveProject}
               presented={terminalPresented}
-              promptQueuePortalHostId={promptQueuePortalHostId}
-              hidePromptQueueHistoryToggle={hidePromptQueueHistoryToggle}
-              promptQueueInputSurface={promptQueueInputSurface}
+              promptQueuePortalHostId={inPane ? splitPaneQueueHostId(tab.id) : promptQueuePortalHostId}
+              hidePromptQueueHistoryToggle={inPane ? paneAgentPair : hidePromptQueueHistoryToggle}
+              promptQueueInputSurface={inPane
+                ? (paneAgentPair ? 'history' : 'terminal')
+                : promptQueueInputSurface}
             />
           );
         }
@@ -1445,6 +1455,7 @@ function TerminalArea({
                 projectId={projId}
                 tabId={tab.id}
                 focused={focusedPane}
+                paneIndex={paneIndex}
               />
             )}
             <div

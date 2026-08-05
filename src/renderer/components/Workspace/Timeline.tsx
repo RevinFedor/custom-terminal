@@ -4,6 +4,7 @@ import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, Chevron
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { useUIStore, type HistoryPromptDraftImageRef } from '../../store/useUIStore';
 import { useWorkspaceStore, type PendingAutoTabTitle } from '../../store/useWorkspaceStore';
 import { useRewindOperationStore } from '../../store/useRewindOperationStore';
@@ -43,6 +44,7 @@ import { shouldClearRewindPreviewForOwnerTransition } from '../../utils/historyR
 import {
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
+  readPresentedHistorySurface,
 } from '../../utils/timelineTranscriptRefresh.mjs';
 import {
   buildTimelineCornerBadges,
@@ -350,6 +352,14 @@ interface SessionBoundary {
   childSessionId: string;
   parentSessionId: string;
 }
+
+// Progressive expand ("wave") tuning. Expansion lands at the tail, so only
+// the last N rows need full presentation immediately; rows above upgrade in
+// batches across frames until every row is real. Stubs keep entry identity
+// (key/uuid/ref) so the visibility system and jumps stay canonical, and each
+// stub reserves a plausible row height so the scrollbar doesn't collapse.
+const TIMELINE_EXPAND_INITIAL_ROWS = 120;
+const TIMELINE_EXPAND_BATCH_ROWS = 200;
 
 interface TimelineProps {
   tabId: string;
@@ -1427,8 +1437,126 @@ function Timeline({
   const hydratedSemanticSessionKeyRef = useRef<string | null>(null);
   const semanticGroupHeaderRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   // Phase 3: Tree view (per-tab, persisted in UIStore)
-  const treeMode = useUIStore(state => state.timelineTreeModeTabs[tabId] ?? false);
+  const treeModeTarget = useUIStore(state => state.timelineTreeModeTabs[tabId] ?? false);
   const setTimelineTreeMode = useUIStore(state => state.setTimelineTreeMode);
+  // Two-phase expand. The store flag arrives as an URGENT update — flipping
+  // the layout in that same render re-built every entry row (hundreds of
+  // preview chips) synchronously inside the click handler's frame, so the
+  // button that toggled it stayed visually pressed for 1-1.5s on long
+  // sessions and macOS showed the beachball cursor. Same defect class and
+  // same cure as the History owner handoff: the urgent frame paints only the
+  // cheap part (button release, width), and the heavy row re-render follows
+  // one frame later inside startTransition, where React can yield to input.
+  // Collapse keeps the same path for symmetry — unmounting hundreds of rows
+  // is cheaper but still not click-frame material.
+  const [treeMode, setTreeModeRender] = useState(treeModeTarget);
+  // Progressive expansion budget: how many TAIL entries render as full
+  // expanded rows. Expansion jumps to the bottom, so the tail is what the
+  // user actually sees; everything above starts as flat stubs and upgrades
+  // in frame-sized batches. Without this the expand commit rebuilt every row
+  // in one unbreakable chunk — 726ms measured on 2618 entries (during= was
+  // none-marked), which is also why startTransition alone is not enough:
+  // Timeline is a single component, React cannot yield inside one unit.
+  const [expandedRenderBudget, setExpandedRenderBudget] = useState(TIMELINE_EXPAND_INITIAL_ROWS);
+  const expandDiagRef = useRef<{ startedAt: number; entries: number; steps: number } | null>(null);
+  // Owner switch adopts the new tab's mode IN this render (the official
+  // adjust-state-during-render pattern): the deferred handoff must not show
+  // two frames of the previous tab's layout on the new tab's rows. This
+  // path is already inside Workspace's deferred owner lane, so it costs the
+  // click frame nothing.
+  const [treeModePrevTabId, setTreeModePrevTabId] = useState(tabId);
+  if (treeModePrevTabId !== tabId) {
+    setTreeModePrevTabId(tabId);
+    setTreeModeRender(treeModeTarget);
+    setExpandedRenderBudget(TIMELINE_EXPAND_INITIAL_ROWS);
+    expandDiagRef.current = null;
+  }
+  useEffect(() => {
+    if (treeMode === treeModeTarget) return;
+    const endExpandMark = markRendererActivity(
+      'timeline-' + (treeModeTarget ? 'expand' : 'collapse') + ':' + tabId.slice(-8),
+    );
+    if (treeModeTarget) {
+      expandDiagRef.current = { startedAt: performance.now(), entries: 0, steps: 0 };
+    }
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        startTransition(() => setTreeModeRender(treeModeTarget));
+        // The mark closes when the transition commit's frame paints — the
+        // rAF below is queued after the state update, so a long commit
+        // stretches the mark over exactly the work it names.
+        requestAnimationFrame(() => endExpandMark());
+      });
+    });
+    return () => {
+      endExpandMark();
+      cancelAnimationFrame(raf1);
+      if (raf2) cancelAnimationFrame(raf2);
+    };
+  }, [treeMode, treeModeTarget, tabId]);
+  // A collapsed timeline re-arms the light budget so the NEXT expand starts
+  // cheap again.
+  useEffect(() => {
+    if (!treeMode) setExpandedRenderBudget(TIMELINE_EXPAND_INITIAL_ROWS);
+  }, [treeMode]);
+  // The wave: while expanded and rows are still stubs, upgrade one batch per
+  // transition commit until the whole list is real. Each step is its own
+  // interruptible render, so a click/hover between steps dispatches first —
+  // this is what "React cannot yield inside one component" costs us and how
+  // we pay it back in installments. Runs behind the visible tail, so the
+  // user sees a complete timeline immediately and the upgrade is invisible
+  // unless they outrun it scrolling up (then stubs briefly show as thin
+  // 22px rows before filling in).
+  // Rows upgrade ABOVE the visible tail, so each batch grows the content
+  // height above the viewport and would visually drag the tail away. Capture
+  // "was pinned to the bottom" BEFORE each step (after the growth the
+  // measurement is already poisoned) and re-pin in a layout effect right
+  // after the commit, before paint. A user who scrolled up mid-wave fails
+  // the capture and is never yanked.
+  const waveKeepBottomRef = useRef(true);
+  useEffect(() => {
+    if (!treeMode) return;
+    const total = entries.length;
+    if (expandedRenderBudget >= total) {
+      const diag = expandDiagRef.current;
+      if (diag) {
+        expandDiagRef.current = null;
+        console.warn('[Timeline:Expand] WAVE_DONE tab=' + tabId.slice(-8)
+          + ' entries=' + total
+          + ' steps=' + diag.steps
+          + ' elapsedMs=' + Math.round(performance.now() - diag.startedAt));
+      }
+      return;
+    }
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        const diag = expandDiagRef.current;
+        if (diag) {
+          diag.steps += 1;
+          diag.entries = total;
+        }
+        const el = scrollRef.current;
+        waveKeepBottomRef.current = !el
+          || el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+        startTransition(() => {
+          setExpandedRenderBudget((current) => current >= total
+            ? current
+            : Math.min(total, current + TIMELINE_EXPAND_BATCH_ROWS));
+        });
+      });
+    });
+    return () => {
+      cancelAnimationFrame(raf1);
+      if (raf2) cancelAnimationFrame(raf2);
+    };
+  }, [treeMode, expandedRenderBudget, entries.length, tabId]);
+  useLayoutEffect(() => {
+    if (!treeMode || !waveKeepBottomRef.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [expandedRenderBudget, treeMode]);
   const showToast = useUIStore(state => state.showToast);
   // Dedup CHAIN BREAK toast per (session, count): show once when recovery first appears
   // (proxy crash dropped an in-flight assistant response, history auto-recovered).
@@ -1491,6 +1619,29 @@ function Timeline({
 
   useLayoutEffect(() => {
     if (!historySurfaceVisible) return;
+    const releaseGate = (proof: string) => {
+      setHistoryPresentedOwnerKey(timelineOwnerKey);
+      if (import.meta.env.DEV) {
+        console.warn(
+          '[Timeline:HistoryGate] released'
+          + ' tab=' + tabId.slice(-8)
+          + ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none')
+          + ' tool=' + toolType
+          + ' proof=' + proof
+          + ' abs=' + perfAbsNow().toFixed(1)
+        );
+      }
+    };
+    // Replay first: the proof is a one-shot event, and an instance that
+    // mounts AFTER History already presented (HMR remount, deferred owner
+    // handoff) would otherwise wait forever on a bus with nothing left to
+    // say — gate closed, initial load never runs, the expanded panel shows
+    // a permanent "Loading timeline…" with zero rows (live 05.08:
+    // WAVE_DONE entries=0 while History displayed the full session).
+    const replayed = readPresentedHistorySurface({ tabId, sessionId, toolType });
+    if (replayed) {
+      releaseGate('replay:' + String(replayed.proof || 'unknown'));
+    }
     const onHistorySurfacePresented = (event: Event) => {
       const detail = (event as CustomEvent).detail;
       if (!matchesHistorySurfacePresented({
@@ -1499,17 +1650,7 @@ function Timeline({
         sessionId,
         toolType,
       })) return;
-      setHistoryPresentedOwnerKey(timelineOwnerKey);
-      if (import.meta.env.DEV) {
-        console.warn(
-          '[Timeline:HistoryGate] released'
-          + ' tab=' + tabId.slice(-8)
-          + ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none')
-          + ' tool=' + toolType
-          + ' proof=' + String(detail?.proof || 'unknown')
-          + ' abs=' + perfAbsNow().toFixed(1)
-        );
-      }
+      releaseGate(String(detail?.proof || 'unknown'));
     };
     window.addEventListener('history-panel:surface-presented', onHistorySurfacePresented);
     return () => {
@@ -6206,13 +6347,24 @@ function Timeline({
               const prevSelect = document.body.style.userSelect;
               document.body.style.cursor = 'ew-resize';
               document.body.style.userSelect = 'none';
+              // rAF-coalesced: pointermove fires 60-120/s and every store
+              // write re-renders the whole expanded timeline (hundreds of
+              // rows reflow). One write per frame is all a human can see.
+              let dragRaf = 0;
+              let pendingWidth = startW;
               const onMove = (ev: PointerEvent) => {
-                const delta = startX - ev.clientX; // dragging left grows width
-                setTimelineWidth(startW + delta);
+                pendingWidth = startW + (startX - ev.clientX); // dragging left grows width
+                if (dragRaf) return;
+                dragRaf = requestAnimationFrame(() => {
+                  dragRaf = 0;
+                  setTimelineWidth(pendingWidth);
+                });
               };
               const onUp = () => {
                 window.removeEventListener('pointermove', onMove);
                 window.removeEventListener('pointerup', onUp);
+                if (dragRaf) cancelAnimationFrame(dragRaf);
+                setTimelineWidth(pendingWidth);
                 document.body.style.cursor = prevCursor;
                 document.body.style.userSelect = prevSelect;
               };
@@ -6304,6 +6456,27 @@ function Timeline({
           )}
           {/* ──── SEGMENT LOOP (entries.map → per-entry dot, note strips, fork stripes, plan-mode boundaries) ──── */}
           {entries.map((entry, index) => {
+            // Progressive expand: while the budget has not yet covered this
+            // row, render a cheap fixed-height stub instead of the full
+            // preview row. Only rows ABOVE the visible tail stub out (the
+            // expand jump lands at the bottom), and identity/refs stay
+            // canonical so visibility tracking and uuid jumps keep working.
+            // The stub height matches the collapsed-row minimum so the
+            // scroll range is plausible until the real rows replace it.
+            if (
+              isExpandedLayout
+              && expandedRenderBudget < entries.length
+              && index < entries.length - expandedRenderBudget
+            ) {
+              return (
+                <div
+                  key={entry.uuid}
+                  ref={el => segmentRefs.current[index] = el}
+                  data-timeline-expand-stub
+                  style={{ flex: '0 0 auto', minHeight: '22px' }}
+                />
+              );
+            }
             const groupInfo = groupMap.get(index);
             const isGroupExpanded = !!(
               groupInfo?.groupId

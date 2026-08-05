@@ -65,6 +65,16 @@ test('addEmptyPane: single → [current, empty] focused on empty; one placeholde
   assert.equal(addEmptyPane(three, 0, null), null); // full
 });
 
+test('addEmptyPane inserts the placeholder right after the pressed pane', () => {
+  const two = [p('p1', 'a'), p('p2', 'b')];
+  const fromFirst = addEmptyPane(two, 1, null, 0);
+  assert.deepEqual(fromFirst.panes, [p('p1', 'a'), EMPTY, p('p2', 'b')]);
+  assert.equal(fromFirst.focusedIndex, 1);
+  const fromLast = addEmptyPane(two, 0, null, 1);
+  assert.deepEqual(fromLast.panes, [p('p1', 'a'), p('p2', 'b'), EMPTY]);
+  assert.equal(fromLast.focusedIndex, 2);
+});
+
 test('removePaneAt closes an empty placeholder; [real, empty] collapses', () => {
   const panes = [p('p1', 'a'), EMPTY];
   assert.deepEqual(removePaneAt(panes, 1, 1), { panes: [], focusedIndex: 0 });

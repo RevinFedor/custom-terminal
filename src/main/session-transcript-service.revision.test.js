@@ -584,6 +584,9 @@ test('concurrent subscribers share one initialized state and one watcher', async
     webBroadcast: null,
     claudeData: null,
     codexData: null,
+    // This test asserts the sharing/teardown arithmetic, not the warm-idle
+    // window; grace 0 keeps "last consumer leaves → watcher closes" exact.
+    idleGraceMs: 0,
   });
   let releaseResolve;
   const resolveGate = new Promise((resolve) => { releaseResolve = resolve; });
@@ -761,4 +764,139 @@ test('Claude transcript watcher emits appended answer, tool, and exact prompt ca
   assert.equal(ownerProbes.length, 3);
   assert.equal(ownerProbes[0].tabId, 'tab-a');
   assert.equal(Number.isFinite(ownerProbes[0].recordByteOffset), true);
+});
+
+// ── Warm-idle grace window ───────────────────────────────────────────────────
+// Losing the last consumer is a blink (tab switch, split-pane remount), not the
+// end of a session. These tests pin the three properties that make the warm
+// window safe: it keeps the state reclaimable, it stays SILENT while parked,
+// and it catches up exactly once on return.
+
+function makeGraceService({ filePath, onSend, graceMs = 5000, idleStateMax = 8 }) {
+  return new SessionTranscriptService({
+    getMainWindow: () => ({
+      isDestroyed: () => false,
+      webContents: { send: (channel, payload) => onSend?.({ channel, payload }) },
+    }),
+    webBroadcast: null,
+    claudeData: null,
+    codexData: {
+      _api: {
+        findCodexSessionFile: async () => ({ filePath }),
+      },
+    },
+    idleGraceMs: graceMs,
+    idleStateMax,
+  });
+}
+
+test('an unobserved transcript state stays warm and is reclaimed without re-reading the file', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'transcript-grace-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session-grace.jsonl');
+  await fs.promises.writeFile(filePath, '{"type":"session_meta"}\n');
+
+  const service = makeGraceService({ filePath });
+  let resolveCalls = 0;
+  const realResolve = service._resolveFilePath.bind(service);
+  service._resolveFilePath = async (...args) => {
+    resolveCalls += 1;
+    return realResolve(...args);
+  };
+
+  const base = { tabId: 'tab-a', toolType: 'codex', sessionId: 'session-grace', cwd: dir };
+  await service.subscribe({ ...base, consumerId: 'history:tab-a' });
+  const stateAfterSubscribe = service.sessions.values().next().value;
+  assert.equal(service.sessions.size, 1);
+
+  // Leaving the tab: state survives, watcher is NOT closed.
+  await service.unsubscribe({ consumerId: 'history:tab-a' });
+  assert.equal(service.sessions.size, 1);
+  assert.equal(stateAfterSubscribe.idleTimer != null, true);
+  assert.equal(stateAfterSubscribe.watcher != null, true);
+
+  const resolveCallsBeforeReturn = resolveCalls;
+  await service.subscribe({ ...base, consumerId: 'history:tab-a' });
+  const stateAfterReturn = service.sessions.values().next().value;
+
+  assert.equal(stateAfterReturn, stateAfterSubscribe, 'return must reuse the same warm state');
+  assert.equal(stateAfterReturn.idleTimer, null, 'reclaimed state is no longer parked');
+  assert.equal(resolveCalls, resolveCallsBeforeReturn, 'return must not re-walk for the file');
+
+  await service.unsubscribe({ consumerId: 'history:tab-a' });
+  service._closeState(stateAfterReturn, 'test-teardown');
+});
+
+test('a parked transcript state publishes nothing until it is reclaimed', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'transcript-grace-quiet-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session-quiet.jsonl');
+  await fs.promises.writeFile(filePath, '{"type":"session_meta"}\n');
+
+  const sent = [];
+  const service = makeGraceService({ filePath, onSend: (event) => sent.push(event) });
+  const base = { tabId: 'tab-a', toolType: 'codex', sessionId: 'session-quiet', cwd: dir };
+  await service.subscribe({ ...base, consumerId: 'history:tab-a' });
+  await service.unsubscribe({ consumerId: 'history:tab-a' });
+
+  const state = service.sessions.values().next().value;
+  sent.length = 0;
+  // Something lands in the file while nobody is looking.
+  await fs.promises.appendFile(filePath, '{"type":"event_msg"}\n');
+  await service._readChange(state, 'fs.watch');
+  assert.equal(sent.length, 0, 'parked state must not broadcast');
+
+  await service.subscribe({ ...base, consumerId: 'history:tab-a' });
+  // Reclaim schedules exactly one catch-up read (60ms debounce in _scheduleRead).
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const changed = sent.filter((event) => event.channel === 'agent-transcript:changed');
+  assert.equal(changed.length >= 1, true, 'return must deliver the missed tail once');
+  assert.equal(changed[0].payload.reason, 'idle-reclaim');
+
+  await service.unsubscribe({ consumerId: 'history:tab-a' });
+  service._closeState(service.sessions.values().next().value, 'test-teardown');
+});
+
+test('warm idle states are bounded — the oldest is evicted past the cap', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'transcript-grace-cap-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+
+  const files = [];
+  for (let i = 0; i < 4; i += 1) {
+    const filePath = path.join(dir, `session-${i}.jsonl`);
+    await fs.promises.writeFile(filePath, '{"type":"session_meta"}\n');
+    files.push(filePath);
+  }
+  const service = new SessionTranscriptService({
+    getMainWindow: () => null,
+    webBroadcast: null,
+    claudeData: null,
+    codexData: {
+      _api: {
+        findCodexSessionFile: async (sessionId) => ({
+          filePath: path.join(dir, `${sessionId}.jsonl`),
+        }),
+      },
+    },
+    idleGraceMs: 5000,
+    idleStateMax: 2,
+  });
+
+  for (let i = 0; i < 4; i += 1) {
+    await service.subscribe({
+      tabId: `tab-${i}`,
+      toolType: 'codex',
+      sessionId: `session-${i}`,
+      cwd: dir,
+      consumerId: `history:tab-${i}`,
+    });
+    await service.unsubscribe({ consumerId: `history:tab-${i}` });
+    // Distinct park timestamps so eviction order is deterministic.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  assert.equal(service.sessions.size, 2, 'idle states are capped');
+  const survivingSessions = [...service.sessions.values()].map((state) => state.sessionId).sort();
+  assert.deepEqual(survivingSessions, ['session-2', 'session-3'], 'oldest idle states evicted first');
+  for (const state of [...service.sessions.values()]) service._closeState(state, 'test-teardown');
 });

@@ -1817,6 +1817,9 @@ function CodexUsageChip({
   const [profileActionError, setProfileActionError] = useState<string | null>(null);
   const refreshSeqRef = useRef(0);
   const refreshContextRef = useRef('');
+  // Throttles the context-driven refresh (see the effect below). 0 = never
+  // fetched, so the first mount always fetches.
+  const lastRefreshStartedAtRef = useRef(0);
 
   const activeTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
   const activeCodexSessionId = useWorkspaceStore((s) => {
@@ -1842,6 +1845,9 @@ function CodexUsageChip({
   const refresh = useCallback(async (force = false) => {
     const seq = ++refreshSeqRef.current;
     const requestedContext = `${selectedAccountKey || ''}|${activeCodexSessionId || ''}|${activeCodexCwd || ''}`;
+    // Every real fetch stamps the throttle clock (manual, interval, context),
+    // so the context gate below always measures from the LAST fetch.
+    lastRefreshStartedAtRef.current = Date.now();
     setLoading(true);
     try {
       const res = await invokeCodexUsage({
@@ -1900,7 +1906,21 @@ function CodexUsageChip({
   }, []);
 
   useEffect(() => {
-    refresh();
+    // `refresh` identity changes on EVERY active-tab change that lands on a
+    // different Codex session, so this effect re-runs on plain tab switches.
+    // Firing the IPC each time meant a remote usage fetch + profile sweep in
+    // main (measured 620ms+) inside the switch window. Usage numbers are
+    // account-scoped and refreshed by the 3-minute interval anyway; a tab
+    // switch only refines the fallback session identity. Throttle: a
+    // context-driven rerun within 30s of the last fetch skips the immediate
+    // call. Account changes and manual refresh keep their own paths (they
+    // call refresh directly), and the interval keeps ticking regardless.
+    const sinceLastMs = Date.now() - lastRefreshStartedAtRef.current;
+    if (sinceLastMs >= 30_000) {
+      refresh();
+    } else {
+      console.log('[CodexUsage] context-refresh throttled sinceLastMs=' + sinceLastMs);
+    }
     let id: ReturnType<typeof setInterval> | null = null;
     const start = () => {
       if (id) return;
@@ -1911,7 +1931,7 @@ function CodexUsageChip({
     };
     const onVis = () => {
       if (document.visibilityState === 'visible') {
-        refresh(false);
+        if (Date.now() - lastRefreshStartedAtRef.current >= 30_000) refresh(false);
         start();
       } else {
         stop();

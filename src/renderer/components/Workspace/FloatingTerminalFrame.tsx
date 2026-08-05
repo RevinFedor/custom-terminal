@@ -119,6 +119,10 @@ export default function FloatingTerminalFrame({
           right: 0,
           bottom: 0,
           width: sideTerminalWidth,
+          // Split panes host this frame inside a column narrower than the
+          // saved width — the panel then fills the pane instead of bleeding
+          // over the neighbour.
+          maxWidth: '100%',
           overflow: 'hidden',
           display: 'flex',
           flexDirection: 'column',

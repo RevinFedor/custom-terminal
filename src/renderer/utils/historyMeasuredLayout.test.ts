@@ -1,10 +1,21 @@
 import assert from 'node:assert/strict';
 import { test, beforeEach } from 'node:test';
 
+// localStorage shim for the node test runner (the module persists geometry
+// the same way the reading anchor does).
+const backing = new Map<string, string>();
+(globalThis as any).localStorage = {
+  getItem: (k: string) => (backing.has(k) ? backing.get(k)! : null),
+  setItem: (k: string, v: string) => { backing.set(k, String(v)); },
+  removeItem: (k: string) => { backing.delete(k); },
+};
+
 const {
   saveHistoryMeasuredLayout,
   getHistoryMeasuredLayout,
   dropHistoryMeasuredLayout,
+  updateHistoryMeasuredLayoutScrollTop,
+  estimateHistoryAverageRowHeight,
   __resetHistoryMeasuredLayoutForTest,
   __historyMeasuredLayoutSizeForTest,
 } = await import('./historyMeasuredLayout.ts');
@@ -14,7 +25,10 @@ const snap = (n = 3, scrollTop = 100) => ({
   scrollTop,
 });
 
-beforeEach(() => __resetHistoryMeasuredLayoutForTest());
+beforeEach(() => {
+  backing.clear();
+  __resetHistoryMeasuredLayoutForTest();
+});
 
 test('round-trips a snapshot for the same owner', () => {
   saveHistoryMeasuredLayout('tab:a', snap(3, 250), 500);
@@ -45,11 +59,12 @@ test('tolerates rows appended while away', () => {
   assert.ok(getHistoryMeasuredLayout('tab:a', 512));
 });
 
-test('discards geometry after a large shape change (rewind/edit)', () => {
+test('refuses to restore after a large shape change but keeps the entry', () => {
   saveHistoryMeasuredLayout('tab:a', snap(3), 500);
   assert.equal(getHistoryMeasuredLayout('tab:a', 100), null);
-  // and the stale entry is gone, not merely hidden
-  assert.equal(__historyMeasuredLayoutSizeForTest(), 0);
+  // A read with a foreign count is a transient (owner-switch frame renders
+  // the previous tab's rows) — it must not destroy valid stored geometry.
+  assert.ok(getHistoryMeasuredLayout('tab:a', 500), 'correct count still restores');
 });
 
 test('explicit drop clears one owner only', () => {
@@ -97,4 +112,75 @@ test('re-saving the same owner replaces, not duplicates', () => {
   saveHistoryMeasuredLayout('tab:a', snap(5, 999), 500);
   assert.equal(__historyMeasuredLayoutSizeForTest(), 1);
   assert.equal(getHistoryMeasuredLayout('tab:a', 500)?.scrollTop, 999);
+});
+
+test('live scrollTop patch updates the stored offset in place', () => {
+  saveHistoryMeasuredLayout('tab:a', snap(3, 500), 500);
+  updateHistoryMeasuredLayoutScrollTop('tab:a', 1234.6);
+  assert.equal(getHistoryMeasuredLayout('tab:a', 500)?.scrollTop, 1235);
+});
+
+test('live patch refuses a transient zero over a real position', () => {
+  saveHistoryMeasuredLayout('tab:a', snap(3, 500), 500);
+  updateHistoryMeasuredLayoutScrollTop('tab:a', 0);
+  assert.equal(getHistoryMeasuredLayout('tab:a', 500)?.scrollTop, 500);
+});
+
+test('live patch is a no-op without a stored snapshot', () => {
+  updateHistoryMeasuredLayoutScrollTop('tab:none', 700);
+  assert.equal(getHistoryMeasuredLayout('tab:none', 10), null);
+  assert.equal(__historyMeasuredLayoutSizeForTest(), 0);
+});
+
+test('persists to localStorage and survives an in-memory reset', async () => {
+  saveHistoryMeasuredLayout('tab:persist', snap(3, 4321), 500);
+  // Persistence is debounced; wait past it.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  __resetHistoryMeasuredLayoutForTest();
+  // backing intentionally NOT cleared — simulating an app restart.
+  assert.equal(getHistoryMeasuredLayout('tab:persist', 500)?.scrollTop, 4321);
+});
+
+test('average row height weighs ranges by row count', () => {
+  // 10 rows of 40px + 2 rows of 500px → (400+1000)/12 ≈ 117
+  const snapshot = {
+    ranges: [
+      { startIndex: 0, endIndex: 9, size: 40 },
+      { startIndex: 10, endIndex: 11, size: 500 },
+    ],
+    scrollTop: 0,
+  };
+  assert.equal(estimateHistoryAverageRowHeight(snapshot), 117);
+});
+
+test('average row height rejects empty/garbage snapshots', () => {
+  assert.equal(estimateHistoryAverageRowHeight(null), null);
+  assert.equal(estimateHistoryAverageRowHeight({ ranges: [], scrollTop: 0 }), null);
+  assert.equal(
+    estimateHistoryAverageRowHeight({ ranges: [{ nope: 1 }], scrollTop: 0 }),
+    null,
+  );
+});
+
+test('drops malformed and expired persisted entries on load', async () => {
+  const now = Date.now();
+  backing.set('noted-terminal-history-measured-layout-v1', JSON.stringify([
+    ['tab:ok', {
+      snapshot: { ranges: [{ startIndex: 0, endIndex: 4, size: 40 }], scrollTop: 77 },
+      itemCount: 5, savedAt: now,
+    }],
+    ['tab:garbage-ranges', {
+      snapshot: { ranges: [{ nope: true }], scrollTop: 10 }, itemCount: 5, savedAt: now,
+    }],
+    ['tab:expired', {
+      snapshot: { ranges: [{ startIndex: 0, endIndex: 4, size: 40 }], scrollTop: 10 },
+      itemCount: 5, savedAt: now - 15 * 24 * 60 * 60 * 1000,
+    }],
+    'not-an-entry',
+  ]));
+  __resetHistoryMeasuredLayoutForTest();
+  assert.equal(getHistoryMeasuredLayout('tab:ok', 5)?.scrollTop, 77);
+  assert.equal(getHistoryMeasuredLayout('tab:garbage-ranges', 5), null);
+  assert.equal(getHistoryMeasuredLayout('tab:expired', 5), null);
+  assert.equal(__historyMeasuredLayoutSizeForTest(), 1);
 });

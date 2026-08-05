@@ -188,22 +188,22 @@ export default function Dashboard() {
     if (allTabs.length === 0) return;
 
     const initStatus = async () => {
+      // ONE request for every tab of every open project. Asking per tab here
+      // meant the Dashboard alone could fire 100+ concurrent main-process
+      // lookups on open — the same stampede that stalled project switching.
       const newStatus = new Map<string, boolean>();
-      await Promise.all(
-        allTabs.map(async ({ tabId, commandType }) => {
-          try {
-            const state = await ipcRenderer.invoke('terminal:getCommandState', {
-              tabId,
-              caller: 'Dashboard.statusInit',
-              expectedProcess: 'codex',
-              allowProcessTreeLookup: commandType === 'codex',
-            });
-            newStatus.set(tabId, state.isRunning);
-          } catch {
-            newStatus.set(tabId, false);
-          }
-        })
-      );
+      try {
+        const result = await ipcRenderer.invoke('terminal:getCommandStates', {
+          caller: 'Dashboard.statusInit',
+          tabs: allTabs.map(({ tabId, commandType }) => ({ tabId, commandType })),
+        });
+        const states = result?.states || {};
+        for (const { tabId } of allTabs) {
+          newStatus.set(tabId, states[tabId]?.isRunning === true);
+        }
+      } catch {
+        for (const { tabId } of allTabs) newStatus.set(tabId, false);
+      }
       setProcessStatus(newStatus);
     };
     initStatus();

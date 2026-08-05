@@ -590,6 +590,10 @@ interface UIStore {
   historyPanelOpenTabs: Record<string, boolean>;
   historyPanelWidth: number;
   sideTerminalWidth: number;
+  // Per-tab "side terminal is open" (History-primary layouts). Persisted so a
+  // restart brings the side terminal back exactly where it was — single mode
+  // and split panes share this one map.
+  sideTerminalOpenTabs: Record<string, boolean>;
   historyScrollToUuid: string | null;
   historyVisibleUuids: Record<string, string[]>;
   historyScrollPositions: Record<string, number>;
@@ -604,6 +608,7 @@ interface UIStore {
   setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
   setSideTerminalWidth: (width: number) => void;
+  setSideTerminalOpen: (tabId: string, open: boolean) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
   setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
@@ -1612,9 +1617,11 @@ type PrimarySurface = 'history' | 'terminal';
 const APP_STATE_KEY_NEW_TAB_PRIMARY_SURFACE = 'newTabPrimarySurface';
 const APP_STATE_KEY_TERMINAL_PRIMARY_TABS = 'terminalIsPrimaryTabs';
 const APP_STATE_KEY_SIDE_TERMINAL_WIDTH = 'sideTerminalWidth';
+const APP_STATE_KEY_SIDE_TERMINAL_OPEN_TABS = 'sideTerminalOpenTabs';
 const LS_NEW_TAB_PRIMARY_SURFACE = 'noted-terminal-new-tab-primary-surface';
 const LS_TERMINAL_PRIMARY_TABS = 'noted-terminal-terminal-primary-tabs';
 const LS_SIDE_TERMINAL_WIDTH = 'noted-terminal-side-terminal-width';
+const LS_SIDE_TERMINAL_OPEN_TABS = 'noted-terminal-side-terminal-open-tabs';
 const SIDE_TERMINAL_MIN_WIDTH = 360;
 const SIDE_TERMINAL_MAX_WIDTH = 1200;
 
@@ -1648,6 +1655,12 @@ const readLocalSideTerminalWidth = (): number => {
   try { return clampSideTerminalWidth(localStorage.getItem(LS_SIDE_TERMINAL_WIDTH)); }
   catch { return 620; }
 };
+const readLocalSideTerminalOpenTabs = (): Record<string, boolean> => {
+  try {
+    const raw = localStorage.getItem(LS_SIDE_TERMINAL_OPEN_TABS);
+    return raw ? sanitizeTerminalPrimaryTabs(JSON.parse(raw)) : {};
+  } catch { return {}; }
+};
 const saveNewTabPrimarySurface = (surface: PrimarySurface) => {
   try { localStorage.setItem(LS_NEW_TAB_PRIMARY_SURFACE, surface); } catch {}
   try {
@@ -1669,12 +1682,20 @@ const saveSideTerminalWidth = (width: number) => {
     ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_SIDE_TERMINAL_WIDTH, value: width }).catch(() => {});
   } catch {}
 };
+const saveSideTerminalOpenTabs = (tabs: Record<string, boolean>) => {
+  try { localStorage.setItem(LS_SIDE_TERMINAL_OPEN_TABS, JSON.stringify(tabs)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_SIDE_TERMINAL_OPEN_TABS, value: tabs }).catch(() => {});
+  } catch {}
+};
 
 const localPrimarySurface = readLocalPrimarySurface();
 const initialNewTabPrimarySurface: PrimarySurface = localPrimarySurface
   ?? (initialTerminalIsPrimary ? 'terminal' : 'history');
 const initialTerminalPrimaryTabs = readLocalTerminalPrimaryTabs();
 const initialSideTerminalWidth = readLocalSideTerminalWidth();
+const initialSideTerminalOpenTabs = readLocalSideTerminalOpenTabs();
 
 (async () => {
   try {
@@ -1722,6 +1743,20 @@ const initialSideTerminalWidth = readLocalSideTerminalWidth();
       try { localStorage.setItem(LS_SIDE_TERMINAL_WIDTH, String(width)); } catch {}
     } else {
       saveSideTerminalWidth(initialSideTerminalWidth);
+    }
+  } catch {}
+})();
+
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const persisted = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_SIDE_TERMINAL_OPEN_TABS);
+    if (persisted !== null && persisted !== undefined) {
+      const tabs = sanitizeTerminalPrimaryTabs(persisted);
+      useUIStore.setState({ sideTerminalOpenTabs: tabs });
+      try { localStorage.setItem(LS_SIDE_TERMINAL_OPEN_TABS, JSON.stringify(tabs)); } catch {}
+    } else if (Object.keys(initialSideTerminalOpenTabs).length > 0) {
+      saveSideTerminalOpenTabs(initialSideTerminalOpenTabs);
     }
   } catch {}
 })();
@@ -2779,6 +2814,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
 	    } catch { return HISTORY_PANEL_DEFAULT_WIDTH; }
 	  })(),
   sideTerminalWidth: initialSideTerminalWidth,
+  sideTerminalOpenTabs: initialSideTerminalOpenTabs,
   historyScrollToUuid: null,
   historyVisibleUuids: {},
   historyScrollPositions: {},
@@ -2798,6 +2834,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setHistoryPanelOpen: (tabId, open) => set(state => ({
     historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
   })),
+  setSideTerminalOpen: (tabId, open) => set(state => {
+    if ((state.sideTerminalOpenTabs[tabId] ?? false) === open) return state;
+    const sideTerminalOpenTabs = { ...state.sideTerminalOpenTabs, [tabId]: open };
+    saveSideTerminalOpenTabs(sideTerminalOpenTabs);
+    return { sideTerminalOpenTabs };
+  }),
   setPromptQueueInputSurface: (tabId, surface) => set(state => {
     if (state.promptQueueInputSurfaceTabs[tabId] === surface) return state;
     return {

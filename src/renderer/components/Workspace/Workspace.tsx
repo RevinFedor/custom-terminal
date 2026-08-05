@@ -1,4 +1,4 @@
-import React, { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
+import React, { startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
 import ReactDOM from 'react-dom';
 import { selectFocusedProjectId, useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -155,7 +155,11 @@ export default function Workspace() {
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const historyPanelWidth = useUIStore((s) => s.historyPanelWidth);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
-  const timelineTreeModeTabs = useUIStore((s) => s.timelineTreeModeTabs);
+  // Deliberately NOT subscribing to timelineTreeModeTabs here: the two
+  // consumers below read it imperatively (getState) inside event handlers.
+  // A render subscription re-rendered the WHOLE Workspace on every expand/
+  // collapse of the Timeline — inside the same click frame that was already
+  // paying for the Timeline's own expansion.
   const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);
   const sidebarFontSize = useUIStore((s) => s.sidebarFontSize);
@@ -799,6 +803,15 @@ export default function Workspace() {
           return;
         }
         e.preventDefault();
+        // Split pane in transcript mode: the "other surface" beside the
+        // transcript is the pane's SIDE TERMINAL, not the history panel.
+        if (splitActiveLayout && !resolveTabTerminalPrimary(useUIStore.getState(), effectiveTab.id)) {
+          const ui = useUIStore.getState();
+          const currentOpen = ui.sideTerminalOpenTabs[effectiveTab.id] ?? false;
+          console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle side terminal (split): tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
+          ui.setSideTerminalOpen(effectiveTab.id, !currentOpen);
+          return;
+        }
         const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
         console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle history: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
         setHistoryPanelOpen(effectiveTab.id, !currentOpen);
@@ -806,7 +819,7 @@ export default function Workspace() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, historyIsPrimary, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen]);
+  }, [workspaceView, historyIsPrimary, splitActiveLayout, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen]);
 
   // CMD+[ / Option+[ — swap the center surface (History ↔ terminal).
   useEffect(() => {
@@ -1005,7 +1018,10 @@ export default function Workspace() {
   // effectiveCommandType and effective*SessionId come from different
   // Zustand selectors that can temporarily desync (e.g. when viewingSubAgentTabId changes).
   // Requiring cmdType match caused timeline to permanently disappear.
-  const showTimeline = !filePreview && (effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId);
+  // Split mode: each pane renders its OWN Timeline column — the global one
+  // would be a second rail for the focused tab.
+  const showTimeline = !filePreview && !splitActiveLayout
+    && (effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId);
   const timelineSessionId = effectiveCodexSessionId && effectiveCommandType === 'codex'
     ? effectiveCodexSessionId
     : effectiveGeminiSessionId && effectiveCommandType === 'gemini'
@@ -1136,7 +1152,86 @@ export default function Workspace() {
     // reference, otherwise every store tick re-arms the deferred pass.
     [shouldRenderHistoryPanel, historyOwnerTabId, historySessionId, historyOwnerCwd, historyToolType, historyOwnerControls],
   );
-  const deferredHistoryOwner = useDeferredValue(historyOwnerIdentity);
+  // Owner handoff with a REAL task boundary. useDeferredValue was supposed to
+  // keep the heavy History remount out of the click frame, but React can only
+  // yield BETWEEN components — HistoryPanel is one giant component, so its
+  // deferred render ran as one unbreakable chunk inside the same click task
+  // (measured live 04.08: 303ms/249ms long tasks named history-load:cold(open)
+  // whose span exactly equals the tab-click handler; right-click and Ctrl+Tab
+  // immediately after queued behind them). Two animation frames guarantee the
+  // click task ends and the highlight paints before the heavy owner swap
+  // starts; rapid switching naturally coalesces to the last target.
+  const [deferredHistoryOwner, setDeferredHistoryOwner] = useState(historyOwnerIdentity);
+  useEffect(() => {
+    if (deferredHistoryOwner === historyOwnerIdentity) return;
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      // startTransition makes the heavy owner render INTERRUPTIBLE: a
+      // right-click or Ctrl+Tab landing mid-render preempts it at component
+      // boundaries instead of queueing behind the whole chunk. The rAF pair
+      // above already guarantees the click frame painted first.
+      raf2 = requestAnimationFrame(() => {
+        startTransition(() => setDeferredHistoryOwner(historyOwnerIdentity));
+      });
+    });
+    return () => {
+      cancelAnimationFrame(raf1);
+      if (raf2) cancelAnimationFrame(raf2);
+    };
+  }, [historyOwnerIdentity, deferredHistoryOwner]);
+  const historyOwnerIsCurrent = deferredHistoryOwner === historyOwnerIdentity;
+  // Placement freeze — same pattern as committedTimelineRuntimeRef above.
+  // The panel's tree POSITION (primary / overlay / pinned) is chosen by urgent
+  // flags, but its IDENTITY arrives through the deferred lane. When a switch
+  // changes the layout class (agent-primary → browser/file/terminal-primary),
+  // the urgent frame used to move the node to another position while the
+  // deferred owner still pointed at the OLD tab — React unmounted and
+  // remounted the old owner there: a full 1000-row mount, owner effects and a
+  // history load for a panel that dies one beat later (measured live:
+  // SURFACE_OWNER lifetimeMs=739 rendered into an off-screen overlay).
+  // Freezing the placement to the last committed one while the owner is stale
+  // keeps the node in place with identical props, so that beat costs nothing.
+  type HistoryPlacement = {
+    ownerTabId: string;
+    isPrimary: boolean;
+    pinned: boolean;
+    sidePanel: boolean;
+    isOpen: boolean;
+    terminalOpen: boolean;
+  };
+  const committedHistoryPlacementRef = useRef<HistoryPlacement | null>(null);
+  const currentHistoryPlacement: HistoryPlacement = {
+    ownerTabId: historyOwnerTabId,
+    isPrimary: historyIsPrimary,
+    pinned: historyPinned,
+    sidePanel: historyIsAgentSidePanel,
+    isOpen: historyIsPrimary || isHistoryOpen,
+    terminalOpen: historyIsAgentSidePanel
+      ? isHistoryOpen
+      : (historyIsPrimary && floatingTerminalOpen),
+  };
+  const historyPlacementForRender = historyOwnerIsCurrent
+    ? currentHistoryPlacement
+    : committedHistoryPlacementRef.current?.ownerTabId === (deferredHistoryOwner?.tabId || '')
+      ? committedHistoryPlacementRef.current
+      : currentHistoryPlacement;
+  useLayoutEffect(() => {
+    if (historyOwnerIsCurrent) committedHistoryPlacementRef.current = currentHistoryPlacement;
+  });
+  // While the stale owner waits out the deferred beat, the frozen node must
+  // not fight the NEW tab's layout: when the placement class changed (or the
+  // new tab has no history surface at all — browser/file), the old panel would
+  // either flash its rows over an unrelated surface or, kept in flow with
+  // visibility:hidden, still occupy its box and shove the terminal aside for a
+  // frame. display:none keeps the React instance mounted (the whole point —
+  // no teardown, no dead remount) with zero layout footprint. Same-placement
+  // switches (the common agent→agent case) stay visible, as before.
+  const historyPlacementClassChanged =
+    historyPlacementForRender.isPrimary !== currentHistoryPlacement.isPrimary
+    || historyPlacementForRender.pinned !== currentHistoryPlacement.pinned
+    || historyPlacementForRender.sidePanel !== currentHistoryPlacement.sidePanel;
+  const historyStaleHidden = !historyOwnerIsCurrent
+    && (historyPlacementClassChanged || !shouldRenderHistoryPanel);
 
   const handleChangeWorkingDirectory = useCallback(async () => {
     if (directoryChangeOperationRef.current !== 0) return;
@@ -1340,42 +1435,50 @@ export default function Workspace() {
     : (rawExplorerPath || projectRootPath);
 
   const historyPanelNode = deferredHistoryOwner ? (
+    // The stale-owner beat renders with FROZEN placement (historyPlacementForRender):
+    // identical tree position and placement props keep React reconciling the
+    // same instance instead of remounting the dying owner into the new layout.
+    // The visibility wrapper hides frozen rows when the new tab has no history
+    // surface of its own; display:contents keeps the wrapper boxless so the
+    // flex/absolute geometry of all three placements is untouched.
+    <div style={historyStaleHidden ? { display: 'none' } : { display: 'contents' }}>
     <HistoryPanel
       tabId={deferredHistoryOwner.tabId}
       sessionId={deferredHistoryOwner.sessionId}
       cwd={deferredHistoryOwner.cwd}
       width={historyPanelWidth}
       notesPanelWidth={notesPanelWidth}
-      isOpen={historyIsPrimary || isHistoryOpen}
+      isOpen={historyPlacementForRender.isOpen}
       toolType={deferredHistoryOwner.toolType}
       enableClaudePtyControls={deferredHistoryOwner.enableControls}
-      embedded={historyIsPrimary || historyPinned}
-      embeddedFill={historyIsPrimary}
-      mainSurface={historyIsPrimary}
+      embedded={historyPlacementForRender.isPrimary || historyPlacementForRender.pinned}
+      embeddedFill={historyPlacementForRender.isPrimary}
+      mainSurface={historyPlacementForRender.isPrimary}
       // Terminal-primary keeps the same History as the side panel: it stays
       // the tab's live input surface (grab, dictation, task plan, Escape),
       // only its geometry differs from the centered layout.
       // The docked composer is always present in terminal-primary, so History
       // owns the tab's input there whether or not the transcript is open.
-      agentSidePanel={historyIsAgentSidePanel}
+      agentSidePanel={historyPlacementForRender.sidePanel}
       // Terminal-primary docks the one composer below the terminal, so it is
       // reachable even while the transcript panel is closed.
-      composerPortalHostId={historyIsAgentSidePanel ? dockedComposerHostId : undefined}
+      composerPortalHostId={historyPlacementForRender.sidePanel ? dockedComposerHostId : undefined}
       projectId={activeProjectId}
       // One control, one meaning: "show me the OTHER surface". In
       // History-primary the other surface is the terminal, in terminal-primary
       // it is the transcript — so the same button reports and toggles whichever
       // one is currently secondary, and is never a dead control.
-      terminalOpen={historyIsAgentSidePanel ? isHistoryOpen : (historyIsPrimary && floatingTerminalOpen)}
-      onToggleTerminal={historyIsPrimary
+      terminalOpen={historyPlacementForRender.terminalOpen}
+      onToggleTerminal={historyPlacementForRender.isPrimary
         ? toggleFloatingTerminal
-        : historyIsAgentSidePanel ? toggleAgentSideHistory : undefined}
+        : historyPlacementForRender.sidePanel ? toggleAgentSideHistory : undefined}
       onSwapPrimarySurface={agentSurfacePairAvailable ? swapPrimarySurface : undefined}
       terminalIsPrimary={terminalIsPrimary}
       lifecycleStatus={agentSurfacePairAvailable ? agentLifecycleStatus : null}
       inputBusy={agentPasteBusyByTab.get(deferredHistoryOwner.tabId) === true}
-      onControlsHeightChange={historyIsPrimary ? handleHistoryControlsHeight : undefined}
+      onControlsHeightChange={historyPlacementForRender.isPrimary ? handleHistoryControlsHeight : undefined}
     />
+    </div>
   ) : null;
   const terminalSearchNode = currentView === 'terminal' && showSearch ? (
     <div
@@ -1476,7 +1579,10 @@ export default function Workspace() {
           <div className="flex-1 flex min-w-0 relative">
           {/* Terminal content — overflow hidden clips HistoryPanel slide animation */}
           <div className="flex-1 relative min-w-0 overflow-hidden">
-            {historyIsPrimary && historyPanelNode}
+            {/* Placement gates use the FROZEN placement (not the live flags):
+                during the stale deferred beat the node must stay where the
+                dying owner rendered it — see historyPlacementForRender. */}
+            {historyPlacementForRender.isPrimary && historyPanelNode}
 
             <FloatingTerminalFrame
               tabId={effectiveTab?.id || null}
@@ -1541,13 +1647,13 @@ export default function Workspace() {
             )}
 
             {/* History Panel — overlay unless History pin mode is enabled. */}
-            {!historyIsPrimary && !historyPinned && historyPanelNode}
+            {!historyPlacementForRender.isPrimary && !historyPlacementForRender.pinned && historyPanelNode}
           </div>
 
           {/* Pinned History — sibling of the terminal content, inside the same
               row, so it takes width from the terminal and not from the composer
               or control bar underneath. */}
-          {!historyIsPrimary && historyPinned && historyPanelNode}
+          {!historyPlacementForRender.isPrimary && historyPlacementForRender.pinned && historyPanelNode}
           </div>
 
           {/* Docked composer host — terminal-primary only. A normal bottom row
@@ -1568,7 +1674,7 @@ export default function Workspace() {
               column (any tabType except 'browser'). Without a live AI session
               the bar dims the right cluster and shows a Start-capable chip so
               the user can spawn Claude from any terminal. */}
-          {effectiveTab && currentView === 'terminal' && effectiveTabType !== 'browser' && effectiveTabType !== 'file' && (
+          {!splitActiveLayout && effectiveTab && currentView === 'terminal' && effectiveTabType !== 'browser' && effectiveTabType !== 'file' && (
             <ClaudeControlBar
               tabId={effectiveTab.id}
               projectId={activeProjectId}

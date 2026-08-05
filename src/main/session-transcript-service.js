@@ -22,6 +22,20 @@ function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
 }
 
+// Losing the last consumer means "nobody is LOOKING right now", not "this
+// session is over". Tab switches, split-pane remounts and owner-key changes all
+// drop consumers for a few hundred milliseconds and then re-subscribe to the
+// exact same file. Tearing the watch down immediately turned every such blink
+// into a cold re-read of the whole rollout (measured: 80 full reads / 139.5s
+// over two days on a 450MB session). The state is kept warm for a grace window
+// so the return path is a stat, not a parse; a session that truly went away is
+// swept when the window expires.
+const IDLE_STATE_GRACE_MS = 90_000;
+// Warm idle states are cheap (one fs.watch + a 10s stat timer) but not free.
+// Bound how many can wait at once so a long session of tab-hopping cannot
+// accumulate watchers indefinitely — oldest idle state is evicted first.
+const IDLE_STATE_MAX = 8;
+
 function normalizeToolType(toolType) {
   return toolType === 'codex' ? 'codex' : toolType === 'gemini' ? 'gemini' : 'claude';
 }
@@ -135,6 +149,8 @@ class SessionTranscriptService {
     claudeData,
     codexData,
     promptPresentationStore = null,
+    idleGraceMs = IDLE_STATE_GRACE_MS,
+    idleStateMax = IDLE_STATE_MAX,
   }) {
     this.getMainWindow = getMainWindow;
     this.webBroadcast = webBroadcast;
@@ -148,6 +164,10 @@ class SessionTranscriptService {
     this.sessions = new Map();
     this.sessionInitInflight = new Map();
     this.consumerToKey = new Map();
+    // 0 restores the pre-grace behaviour (close on last consumer) — used by
+    // tests that assert immediate teardown.
+    this.idleGraceMs = Number.isFinite(idleGraceMs) ? Math.max(0, idleGraceMs) : IDLE_STATE_GRACE_MS;
+    this.idleStateMax = Number.isFinite(idleStateMax) ? Math.max(1, idleStateMax) : IDLE_STATE_MAX;
     // Resolved transcript paths survive state teardown. Switching away from
     // a tab drops its last consumer and closes the state; without this memo
     // every switch BACK re-walked the whole sessions tree (~400ms of main
@@ -230,7 +250,9 @@ class SessionTranscriptService {
     const prevKey = this.consumerToKey.get(consumerId);
     if (prevKey && prevKey !== key) this._removeConsumer(prevKey, consumerId);
     const ensureStartedAt = Date.now();
+    const wasParked = this.sessions.get(key)?.idleTimer != null;
     const state = await this._ensureState({ key, toolType, sessionId, cwd });
+    const reclaimedFromIdle = wasParked;
     const ensureMs = Date.now() - ensureStartedAt;
     if (ensureMs > 50) {
       // Attribution probe for external IpcSlow reports on this channel: when
@@ -245,6 +267,12 @@ class SessionTranscriptService {
     state.consumers.set(consumerId, { tabId: tabId || null, consumerId });
     this.consumerToKey.set(consumerId, key);
     this._startWatcher(state);
+    if (reclaimedFromIdle) {
+      // Appends that landed during the quiet window were deliberately not
+      // broadcast. Catch up now, once, so the returning surface sees the same
+      // tail a never-parked state would have had.
+      this._scheduleRead(state, 'idle-reclaim');
+    }
     console.log('[TranscriptService:Subscribe] key=' + shortId(sessionId) +
       ' tool=' + toolType +
       ' tab=' + shortId(tabId, 12) +
@@ -527,15 +555,87 @@ class SessionTranscriptService {
     const state = this.sessions.get(key);
     if (!state) return;
     state.consumers.delete(consumerId);
-    if (state.consumers.size === 0) {
-      this._closeState(state, 'no-consumers');
-      this.sessions.delete(key);
+    if (state.consumers.size === 0) this._parkState(state, 'no-consumers');
+  }
+
+  /**
+   * Keeps a consumer-less state alive for the grace window instead of closing
+   * it. The watcher stays armed, so a return within the window skips the file
+   * parse entirely AND the tail read that would otherwise be needed to catch
+   * up on whatever landed while nobody was looking.
+   */
+  _parkState(state, reason) {
+    if (state.idleTimer) return;
+    if (this.idleGraceMs === 0) {
+      this._closeState(state, reason);
+      this.sessions.delete(state.key);
+      return;
+    }
+    state.idleSince = Date.now();
+    state.idleTimer = setTimeout(() => {
+      state.idleTimer = null;
+      // Re-check: a consumer may have returned between the timer firing and
+      // this callback running. Only a state that is STILL unobserved closes.
+      if (state.consumers.size > 0) {
+        state.idleSince = 0;
+        return;
+      }
+      this._closeState(state, 'idle-expired');
+      this.sessions.delete(state.key);
+    }, this.idleGraceMs);
+    if (typeof state.idleTimer.unref === 'function') state.idleTimer.unref();
+    console.log('[TranscriptService:Park] tool=' + state.toolType +
+      ' session=' + shortId(state.sessionId) +
+      ' reason=' + reason +
+      ' graceMs=' + this.idleGraceMs +
+      ' idleStates=' + this._countIdleStates());
+    this._evictExcessIdleStates();
+  }
+
+  _unparkState(state) {
+    if (!state.idleTimer) return false;
+    clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+    const idleMs = state.idleSince ? Date.now() - state.idleSince : 0;
+    state.idleSince = 0;
+    console.log('[TranscriptService:Unpark] tool=' + state.toolType +
+      ' session=' + shortId(state.sessionId) +
+      ' idleMs=' + idleMs);
+    return true;
+  }
+
+  _countIdleStates() {
+    let count = 0;
+    for (const state of this.sessions.values()) {
+      if (state.idleTimer) count += 1;
+    }
+    return count;
+  }
+
+  _evictExcessIdleStates() {
+    const idle = [];
+    for (const state of this.sessions.values()) {
+      if (state.idleTimer) idle.push(state);
+    }
+    if (idle.length <= this.idleStateMax) return;
+    idle.sort((a, b) => (a.idleSince || 0) - (b.idleSince || 0));
+    for (const state of idle.slice(0, idle.length - this.idleStateMax)) {
+      clearTimeout(state.idleTimer);
+      state.idleTimer = null;
+      state.idleSince = 0;
+      this._closeState(state, 'idle-evicted');
+      this.sessions.delete(state.key);
     }
   }
 
   async _ensureState({ key, toolType, sessionId, cwd }) {
     const existing = this.sessions.get(key);
-    if (existing) return existing;
+    if (existing) {
+      // Warm state reclaimed before its grace window expired: the watcher never
+      // stopped, so there is nothing to re-read here.
+      this._unparkState(existing);
+      return existing;
+    }
 
     const inflight = this.sessionInitInflight.get(key);
     if (inflight) return inflight;
@@ -554,6 +654,9 @@ class SessionTranscriptService {
         reconcileTimer: null,
         inflight: false,
         trailingReadReason: null,
+        // Set while the state is warm but unobserved (see _parkState).
+        idleTimer: null,
+        idleSince: 0,
         offset: 0,
         leftover: '',
         version: 0,
@@ -636,6 +739,10 @@ class SessionTranscriptService {
   }
 
   _scheduleRead(state, reason) {
+    // Parked state: the reconcile interval and fs.watch keep firing, but there
+    // is no surface to publish to. Skip the timer entirely; the reclaim path
+    // schedules one explicit catch-up read.
+    if (state.idleTimer) return;
     if (state.timer) return;
     state.timer = setTimeout(() => {
       state.timer = null;
@@ -649,6 +756,12 @@ class SessionTranscriptService {
   }
 
   async _readChange(state, reason) {
+    // Parked (warm but unobserved) state: the watcher stays armed only to keep
+    // the state reclaimable, NOT to keep publishing. Broadcasting here would
+    // feed live-tail events to main-side hooks (startup proof, web clients) for
+    // a session no surface is showing — work that a closed state never did.
+    // Unpark re-syncs from the file, so nothing is lost by staying quiet.
+    if (state.idleTimer) return;
     if (state.inflight) {
       state.trailingReadReason = reason || 'trailing-change';
       return;

@@ -1470,22 +1470,23 @@ function App() {
         });
       });
 
+      // ONE request for every tab of every open project (see the batched
+      // handler in main): the per-tab version fired 100+ concurrent lookups on
+      // boot and on every project set change.
       const newStatus = new Map<string, boolean>();
-      await Promise.all(
-        allTabs.map(async ({ tabId, commandType }) => {
-          try {
-            const state = await ipcRenderer.invoke('terminal:getCommandState', {
-              tabId,
-              caller: 'App.processStatusInit',
-              expectedProcess: 'codex',
-              allowProcessTreeLookup: commandType === 'codex',
-            });
-            newStatus.set(tabId, state?.isRunning || false);
-          } catch {
-            newStatus.set(tabId, false);
-          }
-        })
-      );
+      try {
+        const result = await ipcRenderer.invoke('terminal:getCommandStates', {
+          caller: 'App.processStatusInit',
+          tabs: allTabs.map(({ tabId, commandType }) => ({ tabId, commandType })),
+        });
+        const states = result?.states || {};
+        for (const { tabId } of allTabs) {
+          newStatus.set(tabId, states[tabId]?.isRunning === true);
+        }
+      } catch {
+        for (const { tabId } of allTabs) newStatus.set(tabId, false);
+      }
+      if (disposed) return;
       setProcessStatus(newStatus);
     };
     initProcessStatus();
@@ -1497,10 +1498,19 @@ function App() {
           if (tab?.commandType === 'codex' || tab?.codexSessionId) codexTabIds.push(tabId);
         });
       });
-      await Promise.all(codexTabIds.map(async (tabId) => {
-        const res = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
-        if (disposed || !res?.hasWatcher) return;
-        if (res.catchUpPending) return;
+      if (codexTabIds.length === 0) return;
+      // Batched: the turn state for every Codex tab arrives in one request,
+      // resolved through the same classifier the single call uses.
+      const batch = await ipcRenderer.invoke('terminal:getCommandStates', {
+        caller: 'App.codexTurnBusySync',
+        tabs: codexTabIds.map((tabId) => ({ tabId, commandType: 'codex' })),
+      }).catch(() => null);
+      const batchStates = batch?.states || {};
+      for (const tabId of codexTabIds) {
+        const res = batchStates[tabId]?.codexTurn;
+        if (disposed) return;
+        if (!res?.hasWatcher) continue;
+        if (res.catchUpPending) continue;
         const busy = res.busy === true;
         const reason = busy
           ? 'task_started'
@@ -1514,7 +1524,7 @@ function App() {
           else next.delete(tabId);
           return next;
         });
-      }));
+      }
     };
     syncCodexTurnBusy();
 
