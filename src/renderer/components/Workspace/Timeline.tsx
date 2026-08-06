@@ -730,6 +730,550 @@ function perfAbsNow(): number {
 // ════════════════════════════════════════════════════════════
 // SECTION: COMPONENT SETUP — props, UIStore subscriptions, state, ref declarations
 // ════════════════════════════════════════════════════════════
+// Stable per-render bridge into the parent's live closures. The row component
+// below is memoized; passing the parent's handlers directly would hand every
+// row a fresh function identity each render and defeat the memo entirely. The
+// object identity is created once; the parent overwrites its FIELDS every
+// render, and rows call through it at event time — events always reach the
+// freshest closure while props stay reference-stable.
+interface TimelineRowApi {
+  handleMouseEnterSegment: (index: number) => void;
+  handleMouseLeaveSegment: (e: React.MouseEvent) => void;
+  handleEntryClick: (entry: TimelineEntry, e?: React.MouseEvent) => void;
+  handleEntryDoubleClick: (entry: TimelineEntry) => void;
+  handleRightClick: (e: React.MouseEvent, entry: TimelineEntry) => void;
+  handleNoteStripEnter: (index: number) => void;
+  handleNoteStripLeave: (e: React.MouseEvent) => void;
+  flashStripFailed: (index: number, kind: 'fork' | 'plan' | 'boundary' | 'compact-strip') => void;
+  expandGroup: (groupId: string, groupKind: GroupInfo['groupKind']) => void;
+  collapseGroup: (groupId: string) => void;
+  setSegmentRef: (index: number, el: HTMLDivElement | null) => void;
+  onForkMarkerEnter: (index: number) => void;
+  onForkMarkerLeave: (e: React.MouseEvent, index: number) => void;
+}
+
+interface TimelineSegmentRowProps {
+  entry: TimelineEntry;
+  index: number;
+  api: TimelineRowApi;
+  // Stable-per-load lookups (identity changes only when the data changes).
+  groupInfo: GroupInfo | undefined;
+  groupPresentation: { edited?: string[]; searched?: string[]; isLoop?: boolean } | undefined;
+  compactClusterCount: number;
+  hasSemanticMembership: boolean;
+  metaPromptTitle: string | null;
+  semanticActionText: string | null;
+  semanticActionManual: boolean;
+  summaryText: string;
+  summaryLoading: boolean;
+  // Per-row booleans derived in the parent. Volatile state (hover, click
+  // feedback, selection) arrives ONLY as these primitives, so a hover moving
+  // from dot 5 to dot 6 re-renders exactly two rows, not all 97 — the whole
+  // point of the extraction (CPU profile 05.08: 188ms self in the map body
+  // per Timeline render, re-run on every hover/viewport/notes tick).
+  isGroupExpanded: boolean;
+  active: boolean;
+  forkMarkerVisible: boolean;
+  isPlanModeBoundary: boolean;
+  isInViewport: boolean;
+  isResponseOnly: boolean;
+  isUnreachable: boolean;
+  dotClickState: 'loading' | 'failed' | null;
+  isHovered: boolean;
+  noteHovered: boolean;
+  hasNote: boolean;
+  notePos: 'dot' | 'before' | 'after';
+  isRewindMarked: boolean;
+  isOldHistory: boolean;
+  isChainBreakZone: boolean;
+  isLastBoundary: boolean;
+  failedFlashKind: 'fork' | 'plan' | 'boundary' | 'compact-strip' | null;
+  isForkActive: boolean;
+  isCmdHeld: boolean;
+  // Shared scalars.
+  isExpandedLayout: boolean;
+  treeMode: boolean;
+  isCodex: boolean;
+  isSdkTab: boolean;
+  historyTargetVisible: boolean;
+  timelineFontSize: number;
+  timelineSummaryFontSize: number;
+  timelineLineClamp: number;
+  intrinsicPreviewFontSize: number;
+}
+
+const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
+  entry,
+  index,
+  api,
+  groupInfo,
+  groupPresentation,
+  compactClusterCount,
+  hasSemanticMembership,
+  metaPromptTitle,
+  semanticActionText,
+  semanticActionManual,
+  summaryText,
+  summaryLoading,
+  isGroupExpanded,
+  active,
+  forkMarkerVisible,
+  isPlanModeBoundary,
+  isInViewport,
+  isResponseOnly,
+  isUnreachable,
+  dotClickState,
+  isHovered,
+  noteHovered,
+  hasNote,
+  notePos,
+  isRewindMarked,
+  isOldHistory,
+  isChainBreakZone,
+  isLastBoundary,
+  failedFlashKind,
+  isForkActive,
+  isCmdHeld,
+  isExpandedLayout,
+  treeMode,
+  isCodex,
+  isSdkTab,
+  historyTargetVisible,
+  timelineFontSize,
+  timelineSummaryFontSize,
+  timelineLineClamp,
+  intrinsicPreviewFontSize,
+}: TimelineSegmentRowProps) {
+  const isCompacted = entry.type === 'compact';
+  const isCompactSummaryMarker = !!entry.isCompactSummary;
+  const displaysAsCompact = isCompacted || isCompactSummaryMarker;
+  const isContinued = entry.type === 'continued';
+  const isPlan = !!entry.isPlan;
+  const isDocsEdit = entry.type === 'docs_edit';
+  const isDocsSearch = entry.type === 'docs_search';
+  const entryIsSubAgent = !!(entry.isSubAgent || entry.isSubAgentTimeout);
+  const entryIsTimeout = !!entry.isSubAgentTimeout;
+  const orchestrationTag = getOrchestrationTag(entry);
+  const entryIsOrchestration = !!orchestrationTag;
+  const orchestrationGroup = groupInfo?.groupKind === 'orchestration';
+  const groupAccent = orchestrationGroup ? '#a855f7' : '#818cf8';
+  const groupAccentDim = orchestrationGroup ? '#7e22ce' : '#7c86f0';
+  const groupAccentRgb = orchestrationGroup ? '168, 85, 247' : '129, 140, 248';
+  const isGroupCollapsed = !!(groupInfo?.isGroupHeader && !isGroupExpanded);
+  const isGroupChild = !!(groupInfo?.isGroupChild && isGroupExpanded);
+  const showAsChild = isGroupChild && !(groupInfo?.isGroupHeader && !isGroupExpanded);
+  const isExpandedHeader = !!(groupInfo?.isGroupHeader && isGroupExpanded);
+  const isGroupMeta = isGroupCollapsed || isExpandedHeader;
+  const isPromptVisible = isInViewport && !isResponseOnly;
+
+  const markerEdited = groupPresentation?.edited
+    || entry.docsEdited
+    || (isDocsEdit && entry.content ? [entry.content] : []);
+  const markerSearched = groupPresentation?.searched
+    || entry.docsSearchQueries
+    || (isDocsSearch && entry.content ? [entry.content] : []);
+  const isLoopPrompt = groupPresentation?.isLoop ?? !!getLoopPromptOriginTag(entry);
+  const cornerBadges = buildTimelineCornerBadges({
+    isLoop: isLoopPrompt,
+    docsEditedCount: markerEdited.length,
+    docsSearchCount: markerSearched.length,
+    collapsedGroupSize: isGroupCollapsed ? groupInfo?.groupSize || 0 : 0,
+    compactClusterSize: displaysAsCompact && !treeMode ? compactClusterCount : 0,
+  });
+  const hasDenseCornerBadges = cornerBadges.items
+    .filter((item: TimelineCornerBadgeItem) => item.slot.endsWith('right')).length >= 3;
+
+  // ── Dot color ──
+  let dotColor: string;
+  let dotGlow: string;
+  if (displaysAsCompact) {
+    dotColor = isHovered ? '#f59e0b' : '#a67c1a';
+    dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
+  } else if (isContinued) {
+    dotColor = isHovered ? '#f59e0b' : '#a67c1a';
+    dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
+  } else if (isPlan) {
+    dotColor = isHovered ? '#5eada3' : '#3d7a72';
+    dotGlow = isHovered ? '0 0 10px rgba(94, 173, 163, 0.5)' : 'none';
+  } else if (active) {
+    dotColor = '#60a5fa';
+    dotGlow = '0 0 6px rgba(96, 165, 250, 0.3)';
+  } else if (entryIsTimeout) {
+    dotColor = isHovered ? '#ef4444' : (isPromptVisible ? '#e84040' : '#b33');
+    dotGlow = isHovered ? '0 0 10px rgba(239, 68, 68, 0.5)' : (isPromptVisible ? '0 0 6px rgba(239, 68, 68, 0.2)' : 'none');
+  } else if (entryIsSubAgent) {
+    dotColor = isHovered ? '#818cf8' : (isPromptVisible ? '#7c86f0' : '#5c63b8');
+    dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : (isPromptVisible ? '0 0 6px rgba(129, 140, 248, 0.2)' : 'none');
+  } else if (entryIsOrchestration) {
+    dotColor = isHovered ? '#c084fc' : (isPromptVisible ? '#a855f7' : '#7e22ce');
+    dotGlow = isHovered ? '0 0 10px rgba(168, 85, 247, 0.55)' : (isPromptVisible ? '0 0 6px rgba(168, 85, 247, 0.25)' : 'none');
+  } else {
+    dotColor = isHovered ? '#fff' : (isPromptVisible ? '#ccc' : '#999');
+    dotGlow = isHovered ? '0 0 10px rgba(255, 255, 255, 0.5)' : (isPromptVisible ? '0 0 6px rgba(255, 255, 255, 0.15)' : 'none');
+  }
+  const dotGeometry = timelineMarkerGeometry({
+    isOrchestration: entryIsOrchestration,
+    displaysAsCompact,
+    showAsChild,
+    isHovered,
+    isInViewport,
+  });
+  if (isGroupMeta) {
+    dotColor = isHovered ? groupAccent : groupAccentDim;
+    dotGlow = isHovered ? `0 0 10px rgba(${groupAccentRgb}, 0.5)` : `0 0 6px rgba(${groupAccentRgb}, 0.2)`;
+  }
+  if (hasNote && notePos === 'dot') {
+    dotColor = isHovered ? '#67e8f9' : '#0891b2';
+    dotGlow = isHovered ? '0 0 10px rgba(34, 211, 238, 0.5)' : '0 0 6px rgba(34, 211, 238, 0.25)';
+  }
+  if (isRewindMarked) {
+    dotColor = isHovered ? '#f472b6' : '#ec4899';
+    dotGlow = isHovered ? '0 0 10px rgba(236, 72, 153, 0.5)' : '0 0 6px rgba(236, 72, 153, 0.25)';
+  }
+
+  const noteStrip = (
+    <div
+      className="flex-shrink-0 w-full flex items-center justify-center"
+      style={{ height: '6px', cursor: 'pointer' }}
+      onMouseEnter={() => api.handleNoteStripEnter(index)}
+      onMouseLeave={api.handleNoteStripLeave}
+    >
+      <div
+        style={{
+          width: noteHovered ? '18px' : '14px',
+          height: noteHovered ? '3px' : '2px',
+          borderRadius: '1px',
+          backgroundColor: noteHovered ? '#67e8f9' : '#0891b2',
+          boxShadow: noteHovered ? '0 0 8px rgba(34, 211, 238, 0.5)' : 'none',
+          transition: 'background-color 0.2s, box-shadow 0.2s',
+        }}
+      />
+    </div>
+  );
+
+  return (
+    <React.Fragment>
+      {/* Phase 2: Expanded group toggle bar (collapse control) */}
+      {isExpandedHeader && (
+        <div
+          className="relative w-full flex items-center"
+          style={{ flex: '0 0 auto', height: '14px', cursor: 'pointer', justifyContent: 'center' }}
+          onClick={(e) => {
+            e.stopPropagation();
+            api.collapseGroup(groupInfo!.groupId);
+          }}
+        >
+          <div style={{ flex: 1, height: '1px', backgroundColor: `rgba(${groupAccentRgb}, 0.2)`, marginRight: '3px' }} />
+          <span className="pointer-events-none select-none shrink-0" style={{ fontSize: '9px', lineHeight: '1', color: groupAccent, fontFamily: 'monospace', fontWeight: 600 }}>
+            {groupInfo!.groupSize}
+          </span>
+          <div style={{ flex: 1, height: '1px', backgroundColor: `rgba(${groupAccentRgb}, 0.2)`, marginLeft: '3px' }} />
+        </div>
+      )}
+      {/* Note indicator strip — before dot */}
+      {hasNote && notePos === 'before' && noteStrip}
+      <div
+        ref={(el) => api.setSegmentRef(index, el)}
+        data-segment
+        data-timeline-entry-uuid={entry.uuid}
+        {...(isUnreachable ? { 'data-unreachable': '' } : {})}
+        className="relative w-full flex items-center"
+        onMouseEnter={() => {
+          // Codex compact bodies are not available to the client; the
+          // count marker intentionally has no misleading Cmd tooltip.
+          if (!(isCodex && isCompacted)) api.handleMouseEnterSegment(index);
+        }}
+        onMouseLeave={(e) => api.handleMouseLeaveSegment(e)}
+        onClick={(e) => {
+          // Phase 2: Click on collapsed group header toggles expansion
+          if (groupInfo?.isGroupHeader && !isGroupExpanded) {
+            e.stopPropagation();
+            api.expandGroup(groupInfo.groupId, groupInfo.groupKind);
+          } else {
+            api.handleEntryClick(entry, e);
+          }
+        }}
+        onDoubleClick={() => api.handleEntryDoubleClick(entry)}
+        onContextMenu={(e) => api.handleRightClick(e, entry)}
+        style={{
+          // expanded: height auto-fits content (no overlap with neighbours).
+          // dots-only/tree: original flex-grow distribution.
+          flex: isExpandedLayout
+            ? '0 0 auto'
+            : `1 0 ${hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')}`,
+          minHeight: isExpandedLayout
+            ? undefined
+            : (hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')),
+          alignItems: isExpandedLayout ? 'flex-start' : undefined,
+          justifyContent: isExpandedLayout ? 'flex-start' : (treeMode ? 'flex-start' : 'center'),
+          paddingLeft: isExpandedLayout
+            ? '6px'
+            : (treeMode
+                ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
+                : (showAsChild ? '4px' : undefined)),
+          paddingRight: isExpandedLayout
+            ? (cornerBadges.items.length > 0
+                ? (cornerBadges.items.some((item: TimelineCornerBadgeItem) => item.slot.endsWith('inner')) ? '34px' : '22px')
+                : '8px')
+            : undefined,
+          paddingTop: isExpandedLayout ? '6px' : undefined,
+          paddingBottom: isExpandedLayout ? '6px' : undefined,
+          gap: isExpandedLayout ? '6px' : undefined,
+          boxShadow: isExpandedLayout && hasSemanticMembership
+            ? 'inset 9px 0 0 -8px rgba(192,132,252,0.28)'
+            : undefined,
+          overflow: isExpandedLayout ? 'hidden' : undefined,
+          // Perf: skip rendering off-screen entries; refs/hit-boxes still attach.
+          // intrinsic-size hint ≈ lineHeight(1.3) * lines * fontSize + vertical padding 12.
+          contentVisibility: isExpandedLayout ? 'auto' : undefined,
+          containIntrinsicSize: isExpandedLayout
+            ? `auto ${Math.round(intrinsicPreviewFontSize * 1.3 * timelineLineClamp + 12)}px`
+            : undefined,
+          backgroundColor: active
+            ? 'rgba(59, 130, 246, 0.15)'
+            : isHovered && isExpandedLayout && !isGroupMeta
+              ? 'rgba(255, 255, 255, 0.04)'
+              // Red zones: chain-break (unreachable by Claude's backtrace, all
+              // views) and pre-compact old-history (Claude-only, suppressed
+              // when the full chat renders elsewhere).
+              : (isChainBreakZone && !isGroupMeta && !displaysAsCompact)
+                ? 'rgba(239, 68, 68, 0.06)'
+                : (isOldHistory && !isGroupMeta && !historyTargetVisible && !isSdkTab
+                    ? 'rgba(239, 68, 68, 0.06)'
+                    : 'transparent'),
+          cursor: (isContinued || isDocsEdit || isDocsSearch || (isOldHistory && !historyTargetVisible && !isSdkTab)) ? 'default' : 'pointer',
+        } as React.CSSProperties}
+      >
+        {/* Dot: hollow ring if unreachable, filled otherwise. pointer-events:
+            auto so ПКМ на сам кружок ловится отдельно от полосы. */}
+        {isExpandedLayout ? (
+          (() => {
+            const expSize = displaysAsCompact ? '8px' : (showAsChild ? '6px' : '8px');
+            return (
+              <div className="flex items-center justify-center shrink-0" style={{ width: '14px', alignSelf: 'stretch' }}>
+                <div
+                  className="pointer-events-none shrink-0"
+                  style={{
+                    width: expSize,
+                    height: expSize,
+                    borderRadius: entryIsOrchestration ? '2px' : '50%',
+                    backgroundColor: isUnreachable && !displaysAsCompact ? 'transparent' : dotColor,
+                    border: isUnreachable && !displaysAsCompact ? `1px solid ${isRewindMarked ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
+                    boxShadow: dotGlow,
+                    boxSizing: 'border-box',
+                    transform: entryIsOrchestration ? 'rotate(45deg)' : undefined,
+                    pointerEvents: 'auto',
+                    transition: 'background-color 0.2s, box-shadow 0.2s',
+                  }}
+                />
+              </div>
+            );
+          })()
+        ) : (
+          <div
+            className="pointer-events-none shrink-0"
+            style={{
+              width: dotGeometry.width,
+              height: dotGeometry.height,
+              borderRadius: entryIsOrchestration ? '2px' : dotGeometry.radius,
+              backgroundColor: isUnreachable && !isHovered && !displaysAsCompact ? 'transparent' : dotColor,
+              border: isUnreachable && !isHovered && !displaysAsCompact ? `1px solid ${isRewindMarked ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
+              boxShadow: dotGlow,
+              boxSizing: 'border-box',
+              transform: entryIsOrchestration ? 'rotate(45deg)' : undefined,
+              pointerEvents: 'auto',
+              transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
+            }}
+          />
+        )}
+
+        <TimelineCornerBadges
+          items={cornerBadges.items as TimelineCornerBadgeItem[]}
+          isExpandedLayout={isExpandedLayout}
+          timelineFontSize={timelineFontSize}
+          groupAccent={groupAccent}
+        />
+
+        {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
+        {isExpandedLayout && (() => {
+          const rawEntryContent = entry.content || '';
+          const previewLimit = expandedPreviewCharLimit(timelineLineClamp);
+          let previewText = displaysAsCompact
+            ? (isCodex
+                ? `compact${compactClusterCount > 1 ? ` ×${compactClusterCount}` : ''}`
+                : 'Conversation compacted')
+            : metaPromptTitle
+              ? `META · ${metaPromptTitle}`
+              : rawEntryContent;
+          let previewColor = 'rgba(255, 255, 255, 0.85)';
+          let previewStyle: React.CSSProperties = {};
+          let isSummaryPreview = false;
+          if (metaPromptTitle) {
+            previewColor = 'rgba(232, 180, 254, 0.92)';
+          } else if (!displaysAsCompact && semanticActionManual && semanticActionText) {
+            previewText = semanticActionText;
+            isSummaryPreview = true;
+          } else if (!displaysAsCompact && summaryText) {
+            previewText = summaryText;
+            isSummaryPreview = true;
+          } else if (!displaysAsCompact && semanticActionText) {
+            previewText = semanticActionText;
+            isSummaryPreview = true;
+          } else if (!displaysAsCompact && summaryLoading) {
+            previewText = 'summarizing prompt...';
+            previewColor = 'rgba(125, 211, 252, 0.88)';
+            previewStyle = {
+              background: 'linear-gradient(90deg, rgba(56,189,248,0.28), rgba(255,255,255,0.72), rgba(56,189,248,0.28))',
+              backgroundSize: '180% 100%',
+              WebkitBackgroundClip: 'text',
+              backgroundClip: 'text',
+              color: 'transparent',
+              WebkitTextFillColor: 'transparent',
+              willChange: 'background-position',
+              animation: 'timeline-summary-text-shimmer 1.2s linear infinite',
+            };
+          }
+          previewText = truncateTimelinePreviewText(previewText, previewLimit);
+          if (!previewText) return null;
+          const previewTitle = !displaysAsCompact && previewText !== rawEntryContent
+            ? truncateTimelinePreviewText(rawEntryContent, EXPANDED_PREVIEW_TITLE_MAX_CHARS)
+            : undefined;
+          return (
+            <div
+              className="flex-1 min-w-0 pointer-events-none"
+              style={{
+                fontSize: isSummaryPreview ? `${timelineSummaryFontSize}px` : '1em',
+                lineHeight: 1.3,
+                color: previewColor,
+                display: '-webkit-box',
+                WebkitLineClamp: timelineLineClamp,
+                WebkitBoxOrient: 'vertical',
+                overflow: 'hidden',
+                wordBreak: 'break-word',
+                ...previewStyle,
+              }}
+              title={previewTitle}
+            >
+              {isSummaryPreview ? renderSingleStarHighlights(previewText) : previewText}
+            </div>
+          );
+        })()}
+
+        {/* Loading indicator — mirrors the resting-state Viewport-Dash shape. */}
+        {dotClickState === 'loading' && (
+          isExpandedLayout ? (
+            <div className="absolute top-0 bottom-0 flex items-center justify-center pointer-events-none" style={{ left: 6, width: 14 }}>
+              <div className="animate-glow-white" style={{ width: 10, height: 3, borderRadius: 1 }} />
+            </div>
+          ) : (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <div className="animate-glow-white" style={{ width: 10, height: 3, borderRadius: 1 }} />
+            </div>
+          )
+        )}
+        {/* Failed X — same anchoring rule as loader. */}
+        {dotClickState === 'failed' && (
+          isExpandedLayout ? (
+            <div className="absolute top-0 bottom-0 flex items-center justify-center pointer-events-none" style={{ left: 6, width: 14 }}>
+              <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
+                <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </div>
+          ) : (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
+                <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </div>
+          )
+        )}
+      </div>
+      {/* Note indicator strip — after dot */}
+      {hasNote && notePos === 'after' && noteStrip}
+      {/* Last boundary separator — "session starts below"; click → red X flash. */}
+      {isLastBoundary && (
+        <Tooltip content="Current session starts below">
+        <div
+          className="flex-shrink-0 w-full flex items-center justify-center relative"
+          style={{ height: '8px', cursor: 'default' }}
+          onClick={(e) => { e.stopPropagation(); api.flashStripFailed(index, 'boundary'); }}
+        >
+          <div style={{ width: '100%', height: '1px', backgroundColor: 'rgba(255, 255, 255, 0.2)' }} />
+          {failedFlashKind === 'boundary' && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
+                <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </div>
+          )}
+        </div>
+        </Tooltip>
+      )}
+      {/* Fork marker — not navigable; Cmd+hover opens the fork tooltip. */}
+      {forkMarkerVisible && (
+        <div
+          className="flex-shrink-0 w-full flex items-center justify-center relative"
+          style={{ height: '8px', cursor: isCmdHeld ? 'pointer' : 'default', padding: '6px 0', boxSizing: 'content-box' }}
+          onClick={(e) => { e.stopPropagation(); api.flashStripFailed(index, 'fork'); }}
+          onMouseEnter={() => api.onForkMarkerEnter(index)}
+          onMouseLeave={(e) => api.onForkMarkerLeave(e, index)}
+        >
+          <div
+            style={{
+              width: isForkActive ? '14px' : isInViewport ? '10px' : '12px',
+              height: isForkActive ? '4px' : isInViewport ? '3px' : '2px',
+              borderRadius: '1px',
+              backgroundColor: isForkActive ? '#93c5fd' : isInViewport ? '#60a5fa' : '#3b82f6',
+              boxShadow: isForkActive ? '0 0 8px rgba(59, 130, 246, 0.5)' : isInViewport ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
+              transition: 'all 0.2s',
+            }}
+          />
+          {failedFlashKind === 'fork' && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
+                <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </div>
+          )}
+        </div>
+      )}
+      {/* Plan mode marker — not navigable, click → X. */}
+      {isPlanModeBoundary && (
+        <Tooltip content="Plan mode - context was cleared here">
+        <div
+          className="flex-shrink-0 w-full flex items-center justify-center relative"
+          style={{ height: '8px', cursor: 'default' }}
+          onClick={(e) => { e.stopPropagation(); api.flashStripFailed(index, 'plan'); }}
+        >
+          <div
+            style={{
+              width: isInViewport ? '10px' : '12px',
+              height: isInViewport ? '3px' : '2px',
+              borderRadius: '1px',
+              backgroundColor: isInViewport ? '#5eada3' : '#48968c',
+              boxShadow: isInViewport ? '0 0 6px rgba(72, 150, 140, 0.25)' : 'none',
+              transition: 'background-color 0.2s, box-shadow 0.2s',
+            }}
+          />
+          {failedFlashKind === 'plan' && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
+                <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+                <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </div>
+          )}
+        </div>
+        </Tooltip>
+      )}
+    </React.Fragment>
+  );
+});
+
 function Timeline({
   tabId,
   sessionId,
@@ -2567,11 +3111,17 @@ function Timeline({
           setClaudeMemoryBoundaryUuid(null);
         }
       } else {
-        // Claude: load timeline entries and fork markers in parallel
+        // Claude: load timeline entries and fork markers in parallel.
+        // ifRevision: byte-identical chain files ⇒ identical timeline. The
+        // unchanged fast-path spares main the 250-441ms chain resolve that
+        // every warm tab switch was paying just to receive the same rows
+        // (part of the 15:29 switch-window IPC storm).
+        const cachedClaudeSnapshot = getTimelineSnapshotCache(ownerKeyAtStart);
         const [timelineResult, markersResult] = await Promise.all([
           ipcRenderer.invoke('claude:get-timeline', {
             sessionId,
             cwd,
+            ifRevision: cachedClaudeSnapshot?.revision || null,
             ...callerContext,
           }),
           ipcRenderer.invoke('claude:get-fork-markers', { sessionId, ...callerContext })
@@ -2579,7 +3129,32 @@ function Timeline({
 
         if (!ownsLoad()) return;
 
-        if (timelineResult.success) {
+        if (timelineResult.success && timelineResult.unchanged === true && cachedClaudeSnapshot) {
+          setEntriesSnapshot((current) => (
+            current.ownerKey === ownerKeyAtStart
+            && current.entries === cachedClaudeSnapshot.entries
+              ? current
+              : { ownerKey: ownerKeyAtStart, entries: cachedClaudeSnapshot.entries }
+          ));
+          setCodexSessionMeta(null);
+          const cachedExtras = cachedClaudeSnapshot.sessionMeta as unknown as {
+            claudeSessionBoundaries?: SessionBoundary[];
+            claudeMemoryBoundaryUuid?: string | null;
+          } | null;
+          setSessionBoundaries(cachedExtras?.claudeSessionBoundaries || []);
+          setClaudeMemoryBoundaryUuid(cachedExtras?.claudeMemoryBoundaryUuid || null);
+        } else if (timelineResult.success) {
+          setTimelineSnapshotCache(ownerKeyAtStart, {
+            entries: timelineResult.entries || [],
+            // Claude reuses the codex cache record shape; the meta slot
+            // carries the two claude-only extras the unchanged path must
+            // restore alongside the rows.
+            sessionMeta: {
+              claudeSessionBoundaries: timelineResult.sessionBoundaries || [],
+              claudeMemoryBoundaryUuid: timelineResult.claudeMemoryBoundaryUuid || null,
+            } as unknown as CodexTimelineSessionMeta,
+            revision: timelineResult.revision || null,
+          });
           setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: timelineResult.entries || [] });
           setSessionBoundaries(timelineResult.sessionBoundaries || []);
           setCodexSessionMeta(null);
@@ -2979,6 +3554,14 @@ function Timeline({
   // effect: sessionId changes → save/restore editRangeState via _savedEditRangeMap + reset all overlay/selection/tooltip state; unmount cleanup also saves state
   useEffect(() => {
     if (sessionId !== prevSessionForCleanup.current) {
+      // Freeze attribution: the whole Timeline instance swap (state reset,
+      // rail rebuild in the following commits) used to hide inside the same
+      // long task as History's owner-mount and got billed to it — the 919ms
+      // task of 05.08 08:12 carried ~800ms of surface swap before History
+      // even started. One mark per surface turns during= into a real
+      // breakdown instead of one collective suspect.
+      const endSwapMark = markRendererActivity('timeline-swap:' + tabId.slice(-8));
+      requestAnimationFrame(() => endSwapMark());
       const prevSid = prevSessionForCleanup.current;
       // Always run save/restore — even when prevSid is null (tab without session in between).
       // Without this, switching through a no-session tab (sessionId=null) breaks the chain:
@@ -5759,6 +6342,69 @@ function Timeline({
     }
   };
 
+  // Stable bridge for the memoized segment rows: one object identity for the
+  // component's lifetime, fields refreshed to this render's closures. Rows
+  // receive `api` as a never-changing prop and dispatch through it at event
+  // time — memo stays effective, events stay fresh.
+  const rowApiRef = useRef<TimelineRowApi | null>(null);
+  if (!rowApiRef.current) {
+    rowApiRef.current = {} as TimelineRowApi;
+  }
+  const rowApi = rowApiRef.current;
+  rowApi.handleMouseEnterSegment = handleMouseEnterSegment;
+  rowApi.handleMouseLeaveSegment = handleMouseLeaveSegment;
+  rowApi.handleEntryClick = handleEntryClick;
+  rowApi.handleEntryDoubleClick = handleEntryDoubleClick;
+  rowApi.handleRightClick = handleRightClick;
+  rowApi.handleNoteStripEnter = handleNoteStripEnter;
+  rowApi.handleNoteStripLeave = handleNoteStripLeave;
+  rowApi.flashStripFailed = flashStripFailed;
+  rowApi.expandGroup = (groupId, groupKind) => {
+    if (groupKind === 'orchestration' && !isExpandedLayout) {
+      setTimelineTreeMode(tabId, true);
+    }
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      next.add(groupId);
+      return next;
+    });
+  };
+  rowApi.collapseGroup = (groupId) => {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      next.delete(groupId);
+      return next;
+    });
+  };
+  rowApi.setSegmentRef = (index, el) => { segmentRefs.current[index] = el; };
+  rowApi.onForkMarkerEnter = (index) => {
+    setHoveredForkMarkerIndex(index);
+    if (isCmdHeldRef.current) {
+      setActiveForkMarkerIndex(index);
+      setActiveTooltipIndex(null);
+    }
+  };
+  rowApi.onForkMarkerLeave = (e, index) => {
+    setHoveredForkMarkerIndex(null);
+    if (activeForkMarkerIndex !== index) return;
+    // Same pattern as notes: check if mouse went left toward tooltip
+    if (forkTooltipRef.current && e.relatedTarget instanceof Node && forkTooltipRef.current.contains(e.relatedTarget)) {
+      return;
+    }
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const mouseX = e.clientX;
+    const mouseY = e.clientY;
+    const wentLeft = mouseX <= rect.left + 5;
+    if (wentLeft && forkTooltipRef.current) {
+      const wrapperRect = forkTooltipRef.current.getBoundingClientRect();
+      if (mouseY < wrapperRect.top || mouseY > wrapperRect.bottom) {
+        setActiveForkMarkerIndex(null);
+      }
+    } else if (!wentLeft) {
+      setActiveForkMarkerIndex(null);
+    }
+  };
+
   if (!sessionId) return null;
 
   // ════════════════════════════════════════════════════════════
@@ -6461,8 +7107,6 @@ function Timeline({
             // preview row. Only rows ABOVE the visible tail stub out (the
             // expand jump lands at the bottom), and identity/refs stay
             // canonical so visibility tracking and uuid jumps keep working.
-            // The stub height matches the collapsed-row minimum so the
-            // scroll range is plausible until the real rows replace it.
             if (
               isExpandedLayout
               && expandedRenderBudget < entries.length
@@ -6503,7 +7147,6 @@ function Timeline({
 
             // Phase 2: Hide collapsed group children (but NOT the header)
             if (groupInfo?.isGroupChild && !groupInfo?.isGroupHeader && !isGroupExpanded) {
-              // Still need ref for visibility system — render invisible placeholder
               return <div key={entry.uuid} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
             }
 
@@ -6511,24 +7154,15 @@ function Timeline({
               return <div key={entry.uuid} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
             }
 
-            const active = isSelected(entry, index);
-            const isCompacted = entry.type === 'compact';
             const isLastEntry = index === entries.length - 1;
-            const isHiddenCompactBoundary = hiddenCompactBoundaryIndices.has(index);
-            if (isHiddenCompactBoundary) {
+            if (hiddenCompactBoundaryIndices.has(index)) {
               return <div key={entry.uuid} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
             }
-            const isCompactSummaryMarker = !!entry.isCompactSummary;
-            const displaysAsCompact = isCompacted || isCompactSummaryMarker;
-            const compactClusterCount = codexCompactCluster?.count || 1;
-            // Fork marker at this position — only the SINGLE last snapshot UUID renders
-            // the blue stripe (forkMarkerLastSnapIndex). Previously this used edge
-            // detection (entry ∈ snap, next ∉ snap), which fired on every gap when the
-            // parent's active branch was modified after the fork (rewind / edit-range /
-            // delete-range punch holes through the snapshot) → many false stripes.
+
+            // Fork marker at this position — only the SINGLE last snapshot
+            // UUID renders the blue stripe.
             const markerHitIdx = forkMarkerIndexByLastSnapIndex.get(index) ?? -1;
             const forkMarkerAny = markerHitIdx >= 0 ? forkMarkers[markerHitIdx] : null;
-            // Only non-hidden markers render the blue stripe
             const forkMarker = forkMarkerAny && !forkMarkerAny.hidden ? forkMarkerAny : null;
 
             const isPlanModeBoundary = (() => {
@@ -6536,619 +7170,73 @@ function Timeline({
               const nextEntry = entries[index + 1];
               if (!nextEntry || !entry.sessionId || !nextEntry.sessionId) return false;
               if (entry.sessionId === nextEntry.sessionId) return false;
-              // Suppress inherited session boundaries from parent chains in forked sessions.
-              // If BOTH entries are in a fork snapshot, this boundary is from the parent chain —
-              // not a plan mode transition in the current session.
+              // Suppress inherited session boundaries from parent chains in
+              // forked sessions: a boundary whose BOTH sides live in a fork
+              // snapshot came from the parent chain.
               for (const snap of forkSnapshotSets) {
                 if (snap.has(entry.uuid) && snap.has(nextEntry.uuid)) return false;
               }
               return true;
             })();
 
-            // Phase 2: Group state
             const isGroupCollapsed = !!(groupInfo?.isGroupHeader && !isGroupExpanded);
-            const isGroupChild = !!(groupInfo?.isGroupChild && isGroupExpanded);
-            // When collapsed, header entry is the visible toggle (not a child)
-            // When expanded, header entry renders as a child too
-            const showAsChild = isGroupChild && !(groupInfo?.isGroupHeader && !isGroupExpanded);
             const isInViewport = isGroupCollapsed
               ? Array.from({ length: groupInfo!.groupSize }, (_, offset) => index + offset).some(idx => visibleEntryIndices.has(idx))
               : visibleEntryIndices.has(index);
-            const isResponseOnly = isGroupCollapsed ? false : responseOnlyIndices.has(index);
-            const isUnreachable = unreachableIndices.has(index);
-            const isContinued = entry.type === 'continued';
-            const isPlan = !!entry.isPlan;
-            const isDocsEdit = entry.type === 'docs_edit';
-            const isDocsSearch = entry.type === 'docs_search';
-            const dotClickState = clickedState?.index === index ? clickedState.status : null;
-
-            // Entry type flags
-            const entryIsSubAgent = !!(entry.isSubAgent || entry.isSubAgentTimeout);
-            const entryIsTimeout = !!entry.isSubAgentTimeout;
-            const orchestrationTag = getOrchestrationTag(entry);
-            const entryIsOrchestration = !!orchestrationTag;
-            const orchestrationGroup = groupInfo?.groupKind === 'orchestration';
-            const groupAccent = orchestrationGroup ? '#a855f7' : '#818cf8';
-            const groupAccentDim = orchestrationGroup ? '#7e22ce' : '#7c86f0';
-            const groupAccentRgb = orchestrationGroup ? '168, 85, 247' : '129, 140, 248';
-            const isHovered = hoveredIndex === index || activeTooltipIndex === index;
+            const isOldHistory = !isCodex && lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
             const groupPresentation = isGroupCollapsed && groupInfo
               ? collapsedGroupPresentation.get(groupInfo.groupId)
               : undefined;
-            const markerEdited = groupPresentation?.edited
-              || entry.docsEdited
-              || (isDocsEdit && entry.content ? [entry.content] : []);
-            const markerSearched = groupPresentation?.searched
-              || entry.docsSearchQueries
-              || (isDocsSearch && entry.content ? [entry.content] : []);
-            const isLoopPrompt = groupPresentation?.isLoop ?? !!getLoopPromptOriginTag(entry);
-            const cornerBadges = buildTimelineCornerBadges({
-              isLoop: isLoopPrompt,
-              docsEditedCount: markerEdited.length,
-              docsSearchCount: markerSearched.length,
-              collapsedGroupSize: isGroupCollapsed ? groupInfo?.groupSize || 0 : 0,
-              compactClusterSize: displaysAsCompact && !treeMode ? compactClusterCount : 0,
-            });
-            const hasDenseCornerBadges = cornerBadges.items
-              .filter((item: TimelineCornerBadgeItem) => item.slot.endsWith('right')).length >= 3;
-
-            // ── Dot color ──
-            let dotColor: string;
-            let dotGlow: string;
-
-            // isInViewport && !isResponseOnly = prompt visible in viewport (bright)
-            // isResponseOnly = response visible but prompt above viewport (same as normal)
-            const isPromptVisible = isInViewport && !isResponseOnly;
-            // Old history = before last compact/plan boundary (not part of current dialog)
-            const isOldHistory = !isCodex && lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
-            // Chain-break zone: entries that are visually rendered but invisible
-            // to Claude's own backtrace because a phantom parentUuid breaks the
-            // chain somewhere along the way. claudeMemoryBoundaryIndex marks
-            // the youngest entry of the pre-orphan tail — anything older than
-            // it (including the boundary itself) cannot be reached by live
-            // Claude. Compact is unrelated: orphans can appear with or without
-            // a compact in the session (rebuild/Stop/Esc/SSE crash all produce
-            // them).
-            const isChainBreakZone =
-              claudeMemoryBoundaryIndex >= 0 &&
-              index <= claudeMemoryBoundaryIndex;
-
-            if (displaysAsCompact) {
-              dotColor = isHovered ? '#f59e0b' : '#a67c1a';
-              dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
-            } else if (isContinued) {
-              dotColor = isHovered ? '#f59e0b' : '#a67c1a';
-              dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
-            } else if (isPlan) {
-              dotColor = isHovered ? '#5eada3' : '#3d7a72';
-              dotGlow = isHovered ? '0 0 10px rgba(94, 173, 163, 0.5)' : 'none';
-            } else if (active) {
-              dotColor = '#60a5fa';
-              dotGlow = '0 0 6px rgba(96, 165, 250, 0.3)';
-            } else if (entryIsTimeout) {
-              dotColor = isHovered ? '#ef4444' : (isPromptVisible ? '#e84040' : '#b33');
-              dotGlow = isHovered ? '0 0 10px rgba(239, 68, 68, 0.5)' : (isPromptVisible ? '0 0 6px rgba(239, 68, 68, 0.2)' : 'none');
-            } else if (entryIsSubAgent) {
-              dotColor = isHovered ? '#818cf8' : (isPromptVisible ? '#7c86f0' : '#5c63b8');
-              dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : (isPromptVisible ? '0 0 6px rgba(129, 140, 248, 0.2)' : 'none');
-            } else if (entryIsOrchestration) {
-              dotColor = isHovered ? '#c084fc' : (isPromptVisible ? '#a855f7' : '#7e22ce');
-              dotGlow = isHovered ? '0 0 10px rgba(168, 85, 247, 0.55)' : (isPromptVisible ? '0 0 6px rgba(168, 85, 247, 0.25)' : 'none');
-            } else {
-              dotColor = isHovered ? '#fff' : (isPromptVisible ? '#ccc' : '#999');
-              dotGlow = isHovered ? '0 0 10px rgba(255, 255, 255, 0.5)' : (isPromptVisible ? '0 0 6px rgba(255, 255, 255, 0.15)' : 'none');
-            }
-
-            // ── Dot size ──
-            const dotGeometry = timelineMarkerGeometry({
-              isOrchestration: entryIsOrchestration,
-              displaysAsCompact,
-              showAsChild,
-              isHovered,
-              isInViewport,
-            });
-            const dotWidth = dotGeometry.width;
-            const dotHeight = dotGeometry.height;
-            const dotRadius = dotGeometry.radius;
-
-            // Expanded group header: render toggle bar THEN the entry as child
-            const isExpandedHeader = !!(groupInfo?.isGroupHeader && isGroupExpanded);
-            // Group headers (×N meta markers) — always bright, never dimmed
-            const isGroupMeta = isGroupCollapsed || isExpandedHeader;
-            if (isGroupMeta) {
-              dotColor = isHovered ? groupAccent : groupAccentDim;
-              dotGlow = isHovered ? `0 0 10px rgba(${groupAccentRgb}, 0.5)` : `0 0 6px rgba(${groupAccentRgb}, 0.2)`;
-            }
-
-            // Note position — use editing position when actively editing this entry
             const isEditingThis = activeNoteIndex === index && isNoteEditing;
-            const hasNote = !!notes[entry.uuid] || isEditingThis;
-            const notePos = isEditingThis ? noteEditPosition : (notePositions[entry.uuid] || 'before');
-            // Notes use cyan so durable Terminal MCP calls own the purple
-            // semantic channel in the same rail.
-            if (hasNote && notePos === 'dot') {
-              dotColor = isHovered ? '#67e8f9' : '#0891b2';
-              dotGlow = isHovered ? '0 0 10px rgba(34, 211, 238, 0.5)' : '0 0 6px rgba(34, 211, 238, 0.25)';
-            }
-            // Rewind marker: override color to pink
-            if (rewindMarkers.has(entry.uuid)) {
-              dotColor = isHovered ? '#f472b6' : '#ec4899';
-              dotGlow = isHovered ? '0 0 10px rgba(236, 72, 153, 0.5)' : '0 0 6px rgba(236, 72, 153, 0.25)';
-            }
+            const summaryKey = summaryToolType && sessionId ? timelineSummaryKey(summaryToolType, sessionId, entry.uuid) : '';
+            const summaryEligible = !!summaryKey && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry);
+            const semanticActionMeta = semanticActionByUuid.get(entry.uuid);
 
             return (
               <React.Fragment key={entry.uuid}>
                 {isExpandedLayout && semanticGroup && isSemanticGroupStart && renderSemanticGroupHeader(semanticGroup, true)}
-                {/* Phase 2: Expanded group toggle bar (collapse control) */}
-                {isExpandedHeader && (
-                  <div
-                    className="relative w-full flex items-center"
-                    style={{
-                      flex: '0 0 auto',
-                      height: '14px',
-                      cursor: 'pointer',
-                      justifyContent: 'center',
-                    }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setExpandedGroups(prev => {
-                        const next = new Set(prev);
-                        next.delete(groupInfo!.groupId);
-                        return next;
-                      });
-                    }}
-                  >
-                    {/* Left line */}
-                    <div style={{
-                      flex: 1,
-                      height: '1px',
-                      backgroundColor: `rgba(${groupAccentRgb}, 0.2)`,
-                      marginRight: '3px',
-                    }} />
-                    {/* Badge */}
-                    <span className="pointer-events-none select-none shrink-0" style={{
-                      fontSize: '9px',
-                      lineHeight: '1',
-                      color: groupAccent,
-                      fontFamily: 'monospace',
-                      fontWeight: 600,
-                    }}>
-                      {groupInfo!.groupSize}
-                    </span>
-                    {/* Right line */}
-                    <div style={{
-                      flex: 1,
-                      height: '1px',
-                      backgroundColor: `rgba(${groupAccentRgb}, 0.2)`,
-                      marginLeft: '3px',
-                    }} />
-                  </div>
-                )}
-                {/* Note indicator strip — before dot */}
-                {hasNote && notePos === 'before' && (() => {
-                  const noteHovered = hoveredNoteIndex === index || activeNoteIndex === index;
-                  return (
-                    <div
-                      className="flex-shrink-0 w-full flex items-center justify-center"
-                      style={{ height: '6px', cursor: 'pointer' }}
-                      onMouseEnter={() => handleNoteStripEnter(index)}
-                      onMouseLeave={handleNoteStripLeave}
-                    >
-                      <div
-                        style={{
-                          width: noteHovered ? '18px' : '14px',
-                          height: noteHovered ? '3px' : '2px',
-                          borderRadius: '1px',
-                          backgroundColor: noteHovered ? '#67e8f9' : '#0891b2',
-                          boxShadow: noteHovered ? '0 0 8px rgba(34, 211, 238, 0.5)' : 'none',
-                          transition: 'background-color 0.2s, box-shadow 0.2s',
-                        }}
-                      />
-                    </div>
-                  );
-                })()}
-                <div
-                  ref={el => segmentRefs.current[index] = el}
-                  data-segment
-                  data-timeline-entry-uuid={entry.uuid}
-                  {...(isUnreachable ? { 'data-unreachable': '' } : {})}
-                  className="relative w-full flex items-center"
-                  onMouseEnter={() => {
-                    // Codex compact bodies are not available to the client; the
-                    // count marker intentionally has no misleading Cmd tooltip.
-                    if (!(isCodex && isCompacted)) handleMouseEnterSegment(index);
-                  }}
-                  onMouseLeave={(e) => handleMouseLeaveSegment(e)}
-                  onClick={(e) => {
-                    // Phase 2: Click on collapsed group header toggles expansion
-                    if (groupInfo?.isGroupHeader && !isGroupExpanded) {
-                      e.stopPropagation();
-                      if (groupInfo.groupKind === 'orchestration' && !isExpandedLayout) {
-                        setTimelineTreeMode(tabId, true);
-                      }
-                      setExpandedGroups(prev => {
-                        const next = new Set(prev);
-                        next.add(groupInfo.groupId);
-                        return next;
-                      });
-                    } else {
-                      handleEntryClick(entry, e);
-                    }
-                  }}
-                  onDoubleClick={() => handleEntryDoubleClick(entry)}
-                  onContextMenu={(e) => handleRightClick(e, entry)}
-                  style={{
-                    // expanded: height auto-fits content (no overlap with neighbours).
-                    // dots-only/tree: original flex-grow distribution.
-                    flex: isExpandedLayout
-                      ? '0 0 auto'
-                      : `1 0 ${hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')}`,
-                    minHeight: isExpandedLayout
-                      ? undefined
-                      : (hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')),
-                    alignItems: isExpandedLayout ? 'flex-start' : undefined,
-                    justifyContent: isExpandedLayout ? 'flex-start' : (treeMode ? 'flex-start' : 'center'),
-                    paddingLeft: isExpandedLayout
-                      ? '6px'
-                      : (treeMode
-                          ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
-                          : (showAsChild ? '4px' : undefined)),
-                    paddingRight: isExpandedLayout
-                      ? (cornerBadges.items.length > 0
-                          ? (cornerBadges.items.some((item: TimelineCornerBadgeItem) => item.slot.endsWith('inner')) ? '34px' : '22px')
-                          : '8px')
-                      : undefined,
-                    paddingTop: isExpandedLayout ? '6px' : undefined,
-                    paddingBottom: isExpandedLayout ? '6px' : undefined,
-                    gap: isExpandedLayout ? '6px' : undefined,
-                    boxShadow: isExpandedLayout && semanticMembership
-                      ? 'inset 9px 0 0 -8px rgba(192,132,252,0.28)'
-                      : undefined,
-                    overflow: isExpandedLayout ? 'hidden' : undefined,
-                    // Perf: skip rendering off-screen entries; refs/hit-boxes still attach.
-                    // intrinsic-size hint ≈ lineHeight(1.3) * lines * fontSize + vertical padding 12.
-                    contentVisibility: isExpandedLayout ? 'auto' : undefined,
-                    containIntrinsicSize: isExpandedLayout
-                      ? `auto ${Math.round(intrinsicPreviewFontSize * 1.3 * timelineLineClamp + 12)}px`
-                      : undefined,
-                    backgroundColor: active
-                      ? 'rgba(59, 130, 246, 0.15)'
-                      : isHovered && isExpandedLayout && !isGroupMeta
-                        ? 'rgba(255, 255, 255, 0.04)'
-                        // Red zones:
-                        // - chain-break zone (entries unreachable by Claude's
-                        //   own backtrace due to phantom parentUuid) — shown
-                        //   in ALL views including HistoryPanel/SDK, because
-                        //   even though the renderer can display them via
-                        //   recovery, live Claude cannot see them.
-                        // - pre-compact old-history — Claude-only. Suppressed
-                        //   when HistoryPanel open OR SDK tab (those render
-                        //   full chat themselves so it'd be redundant).
-                        : (isChainBreakZone && !isGroupMeta && !displaysAsCompact)
-                          ? 'rgba(239, 68, 68, 0.06)'
-                          : (isOldHistory && !isGroupMeta && !historyTargetVisible && !isSdkTab
-                              ? 'rgba(239, 68, 68, 0.06)'
-                              : 'transparent'),
-                    cursor: (isContinued || isDocsEdit || isDocsSearch || (isOldHistory && !historyTargetVisible && !isSdkTab)) ? 'default' : 'pointer',
-                  } as React.CSSProperties}
-                >
-                  {/* Dot */}
-                  {/* Dot: hollow ring if not in buffer (current segment), filled otherwise */}
-                  {/* pointer-events: auto so ПКМ на сам кружок ловится отдельно от полосы —
-                      это позволяет показывать "Копировать compact" только когда клик был
-                      именно по кружку (а не по сегменту-полоске). */}
-                  {isExpandedLayout ? (
-                    /* Dot lives in a narrow gutter vertically centred in the entry.
-                       No size growth on hover — row bg changes instead so text doesn't shift. */
-                    (() => {
-                      const expW = displaysAsCompact ? '8px' : (showAsChild ? '6px' : '8px');
-                      const expH = displaysAsCompact ? '8px' : (showAsChild ? '6px' : '8px');
-                      const expR = '50%';
-                      return (
-                        <div
-                          className="flex items-center justify-center shrink-0"
-                          style={{ width: '14px', alignSelf: 'stretch' }}
-                        >
-                          <div
-                            className="pointer-events-none shrink-0"
-                            style={{
-                              width: expW,
-                              height: expH,
-                              borderRadius: entryIsOrchestration ? '2px' : expR,
-                              backgroundColor: isUnreachable && !displaysAsCompact ? 'transparent' : dotColor,
-                              border: isUnreachable && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
-                              boxShadow: dotGlow,
-                              boxSizing: 'border-box',
-                              transform: entryIsOrchestration ? 'rotate(45deg)' : undefined,
-                              pointerEvents: 'auto',
-                              transition: 'background-color 0.2s, box-shadow 0.2s',
-                            }}
-                          />
-                        </div>
-                      );
-                    })()
-                  ) : (
-                    <>
-                      <div
-                        className="pointer-events-none shrink-0"
-                        style={{
-                          width: dotWidth,
-                          height: dotHeight,
-                          borderRadius: entryIsOrchestration ? '2px' : dotRadius,
-                          backgroundColor: isUnreachable && !isHovered && !displaysAsCompact ? 'transparent' : dotColor,
-                          border: isUnreachable && !isHovered && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
-                          boxShadow: dotGlow,
-                          boxSizing: 'border-box',
-                          transform: entryIsOrchestration ? 'rotate(45deg)' : undefined,
-                          pointerEvents: 'auto',
-                          transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
-                        }}
-                      />
-                    </>
-                  )}
-
-                  <TimelineCornerBadges
-                    items={cornerBadges.items as TimelineCornerBadgeItem[]}
-                    isExpandedLayout={isExpandedLayout}
-                    timelineFontSize={timelineFontSize}
-                    groupAccent={groupAccent}
-                  />
-
-                  {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
-                  {isExpandedLayout && (() => {
-                    const rawEntryContent = entry.content || '';
-                    const previewLimit = expandedPreviewCharLimit(timelineLineClamp);
-                    const metaPrompt = semanticMetaPromptByUuid.get(entry.uuid);
-                    const semanticActionMeta = semanticActionByUuid.get(entry.uuid);
-                    const semanticAction = semanticActionMeta?.description;
-                    const promptSummary = summaryToolType && sessionId && !entryIsOrchestration && isEligibleTabTitleEntry(entry)
-                      ? promptSummaries[timelineSummaryKey(summaryToolType, sessionId, entry.uuid)]?.summary?.trim()
-                      : '';
-                    let previewText = displaysAsCompact
-                      ? (isCodex
-                          ? `compact${compactClusterCount > 1 ? ` ×${compactClusterCount}` : ''}`
-                          : 'Conversation compacted')
-                      : metaPrompt
-                        ? `META · ${metaPrompt.title}`
-                        : rawEntryContent;
-                    let previewColor = 'rgba(255, 255, 255, 0.85)';
-                    let previewStyle: React.CSSProperties = {};
-                    let isSummaryPreview = false;
-                    if (metaPrompt) {
-                      previewColor = 'rgba(232, 180, 254, 0.92)';
-                    } else if (!displaysAsCompact && semanticActionMeta?.manual && semanticAction) {
-                      previewText = semanticAction;
-                      isSummaryPreview = true;
-                    } else if (!displaysAsCompact && promptSummary) {
-                      previewText = promptSummary;
-                      isSummaryPreview = true;
-                    } else if (!displaysAsCompact && semanticAction) {
-                      previewText = semanticAction;
-                      isSummaryPreview = true;
-                    } else if (!displaysAsCompact && !entryIsOrchestration && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
-                      const key = timelineSummaryKey(summaryToolType, sessionId, entry.uuid);
-                      const row = promptSummaries[key];
-                      if (row?.summary) {
-                        previewText = row.summary.trim();
-                        isSummaryPreview = true;
-                      } else if (promptSummaryLoadingKeys.has(key)) {
-                        previewText = 'summarizing prompt...';
-                        previewColor = 'rgba(125, 211, 252, 0.88)';
-                        previewStyle = {
-                          background: 'linear-gradient(90deg, rgba(56,189,248,0.28), rgba(255,255,255,0.72), rgba(56,189,248,0.28))',
-                          backgroundSize: '180% 100%',
-                          WebkitBackgroundClip: 'text',
-                          backgroundClip: 'text',
-                          color: 'transparent',
-                          WebkitTextFillColor: 'transparent',
-                          willChange: 'background-position',
-                          animation: 'timeline-summary-text-shimmer 1.2s linear infinite',
-                        };
-                      }
-                    }
-                    previewText = truncateTimelinePreviewText(previewText, previewLimit);
-                    if (!previewText) return null;
-                    const previewTitle = !displaysAsCompact && previewText !== rawEntryContent
-                      ? truncateTimelinePreviewText(rawEntryContent, EXPANDED_PREVIEW_TITLE_MAX_CHARS)
-                      : undefined;
-                    return (
-                      <div
-                        className="flex-1 min-w-0 pointer-events-none"
-                        style={{
-                          fontSize: isSummaryPreview ? `${timelineSummaryFontSize}px` : '1em',
-                          lineHeight: 1.3,
-                          color: previewColor,
-                          display: '-webkit-box',
-                          WebkitLineClamp: timelineLineClamp,
-                          WebkitBoxOrient: 'vertical',
-                          overflow: 'hidden',
-                          wordBreak: 'break-word',
-                          ...previewStyle,
-                        }}
-                        title={previewTitle}
-                      >
-                        {isSummaryPreview ? renderSingleStarHighlights(previewText) : previewText}
-                      </div>
-                    );
-                  })()}
-
-                  {/* Loading indicator — mirrors the resting-state Viewport-Dash
-                      shape (10×3 white strip) so the click→scroll transition is
-                      a pure intensity pulse, not a shape change. Anchored over
-                      the dot column (left 6px / width 14px in expanded mode;
-                      full-inset otherwise). The dash sits visually on top of
-                      the dot/strip beneath via z-index implicit ordering. */}
-                  {dotClickState === 'loading' && (
-                    isExpandedLayout ? (
-                      <div
-                        className="absolute top-0 bottom-0 flex items-center justify-center pointer-events-none"
-                        style={{ left: 6, width: 14 }}
-                      >
-                        <div className="animate-glow-white" style={{ width: 10, height: 3, borderRadius: 1 }} />
-                      </div>
-                    ) : (
-                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                        <div className="animate-glow-white" style={{ width: 10, height: 3, borderRadius: 1 }} />
-                      </div>
-                    )
-                  )}
-                  {/* Failed X — same anchoring rule as loader. */}
-                  {dotClickState === 'failed' && (
-                    isExpandedLayout ? (
-                      <div
-                        className="absolute top-0 bottom-0 flex items-center justify-center pointer-events-none"
-                        style={{ left: 6, width: 14 }}
-                      >
-                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
-                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                        </svg>
-                      </div>
-                    ) : (
-                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
-                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                        </svg>
-                      </div>
-                    )
-                  )}
-                </div>
-                {/* Note indicator strip — after dot */}
-                {hasNote && notePos === 'after' && (() => {
-                  const noteHovered = hoveredNoteIndex === index || activeNoteIndex === index;
-                  return (
-                    <div
-                      className="flex-shrink-0 w-full flex items-center justify-center"
-                      style={{ height: '6px', cursor: 'pointer' }}
-                      onMouseEnter={() => handleNoteStripEnter(index)}
-                      onMouseLeave={handleNoteStripLeave}
-                    >
-                      <div
-                        style={{
-                          width: noteHovered ? '18px' : '14px',
-                          height: noteHovered ? '3px' : '2px',
-                          borderRadius: '1px',
-                          backgroundColor: noteHovered ? '#67e8f9' : '#0891b2',
-                          boxShadow: noteHovered ? '0 0 8px rgba(34, 211, 238, 0.5)' : 'none',
-                          transition: 'background-color 0.2s, box-shadow 0.2s',
-                        }}
-                      />
-                    </div>
-                  );
-                })()}
-                {/* Last boundary separator — full-width unified line between old history and current dialog.
-                    Visually marks "session starts below"; not navigable. Click → red X flash. */}
-                {index === lastBoundaryIndex && (
-                  <Tooltip content="Current session starts below">
-                  <div
-                    className="flex-shrink-0 w-full flex items-center justify-center relative"
-                    style={{ height: '8px', cursor: 'default' }}
-                    onClick={(e) => { e.stopPropagation(); flashStripFailed(index, 'boundary'); }}
-                  >
-                    <div
-                      style={{
-                        width: '100%',
-                        height: '1px',
-                        backgroundColor: 'rgba(255, 255, 255, 0.2)',
-                      }}
-                    />
-                    {failedStripFlash?.index === index && failedStripFlash.kind === 'boundary' && (
-                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
-                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                        </svg>
-                      </div>
-                    )}
-                  </div>
-                  </Tooltip>
-                )}
-                {/* Fork marker (only outside old history zone — inside it's redundant).
-                    Not a navigable entry — left-click shows red X. Cmd+hover still opens
-                    the fork tooltip (see onMouseEnter below); Cmd+click does the same X flash. */}
-                {forkMarker && !isOldHistory && (
-                  <div
-                    className="flex-shrink-0 w-full flex items-center justify-center relative"
-                    style={{ height: '8px', cursor: isCmdHeld ? 'pointer' : 'default', padding: '6px 0', boxSizing: 'content-box' }}
-                    onClick={(e) => { e.stopPropagation(); flashStripFailed(index, 'fork'); }}
-                    onMouseEnter={() => {
-                      setHoveredForkMarkerIndex(index);
-                      if (isCmdHeldRef.current) {
-                        setActiveForkMarkerIndex(index);
-                        setActiveTooltipIndex(null);
-                      }
-                    }}
-                    onMouseLeave={(e) => {
-                      setHoveredForkMarkerIndex(null);
-                      if (activeForkMarkerIndex !== index) return;
-                      // Same pattern as notes: check if mouse went left toward tooltip
-                      if (forkTooltipRef.current && e.relatedTarget instanceof Node && forkTooltipRef.current.contains(e.relatedTarget)) {
-                        return;
-                      }
-                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                      const mouseX = e.clientX;
-                      const mouseY = e.clientY;
-                      const wentLeft = mouseX <= rect.left + 5;
-                      if (wentLeft && forkTooltipRef.current) {
-                        const wrapperRect = forkTooltipRef.current.getBoundingClientRect();
-                        if (mouseY < wrapperRect.top || mouseY > wrapperRect.bottom) {
-                          setActiveForkMarkerIndex(null);
-                        }
-                      } else if (!wentLeft) {
-                        setActiveForkMarkerIndex(null);
-                      }
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: activeForkMarkerIndex === index ? '14px' : isInViewport ? '10px' : '12px',
-                        height: activeForkMarkerIndex === index ? '4px' : isInViewport ? '3px' : '2px',
-                        borderRadius: '1px',
-                        backgroundColor: activeForkMarkerIndex === index ? '#93c5fd' : isInViewport ? '#60a5fa' : '#3b82f6',
-                        boxShadow: activeForkMarkerIndex === index ? '0 0 8px rgba(59, 130, 246, 0.5)' : isInViewport ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
-                        transition: 'all 0.2s',
-                      }}
-                    />
-                    {failedStripFlash?.index === index && failedStripFlash.kind === 'fork' && (
-                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
-                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                        </svg>
-                      </div>
-                    )}
-                  </div>
-                )}
-                {/* Plan mode marker (only outside old history zone) — not navigable, click → X. */}
-                {isPlanModeBoundary && !isOldHistory && (
-                  <Tooltip content="Plan mode - context was cleared here">
-                  <div
-                    className="flex-shrink-0 w-full flex items-center justify-center relative"
-                    style={{ height: '8px', cursor: 'default' }}
-                    onClick={(e) => { e.stopPropagation(); flashStripFailed(index, 'plan'); }}
-                  >
-                    <div
-                      style={{
-                        width: isInViewport ? '10px' : '12px',
-                        height: isInViewport ? '3px' : '2px',
-                        borderRadius: '1px',
-                        backgroundColor: isInViewport ? '#5eada3' : '#48968c',
-                        boxShadow: isInViewport ? '0 0 6px rgba(72, 150, 140, 0.25)' : 'none',
-                        transition: 'background-color 0.2s, box-shadow 0.2s',
-                      }}
-                    />
-                    {failedStripFlash?.index === index && failedStripFlash.kind === 'plan' && (
-                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                        <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
-                          <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                          <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
-                        </svg>
-                      </div>
-                    )}
-                  </div>
-                  </Tooltip>
-                )}
+                <TimelineSegmentRow
+                  entry={entry}
+                  index={index}
+                  api={rowApi}
+                  groupInfo={groupInfo}
+                  groupPresentation={groupPresentation}
+                  compactClusterCount={codexCompactCluster?.count || 1}
+                  hasSemanticMembership={!!semanticMembership}
+                  metaPromptTitle={semanticMetaPromptByUuid.get(entry.uuid)?.title || null}
+                  semanticActionText={semanticActionMeta?.description || null}
+                  semanticActionManual={!!semanticActionMeta?.manual}
+                  summaryText={summaryEligible ? (promptSummaries[summaryKey]?.summary?.trim() || '') : ''}
+                  summaryLoading={summaryEligible && promptSummaryLoadingKeys.has(summaryKey)}
+                  isGroupExpanded={isGroupExpanded}
+                  active={isSelected(entry, index)}
+                  forkMarkerVisible={!!forkMarker && !isOldHistory}
+                  isPlanModeBoundary={isPlanModeBoundary && !isOldHistory}
+                  isInViewport={isInViewport}
+                  isResponseOnly={isGroupCollapsed ? false : responseOnlyIndices.has(index)}
+                  isUnreachable={unreachableIndices.has(index)}
+                  dotClickState={clickedState?.index === index ? clickedState.status : null}
+                  isHovered={hoveredIndex === index || activeTooltipIndex === index}
+                  noteHovered={hoveredNoteIndex === index || activeNoteIndex === index}
+                  hasNote={!!notes[entry.uuid] || isEditingThis}
+                  notePos={isEditingThis ? noteEditPosition : (notePositions[entry.uuid] || 'before')}
+                  isRewindMarked={rewindMarkers.has(entry.uuid)}
+                  isOldHistory={isOldHistory}
+                  isChainBreakZone={claudeMemoryBoundaryIndex >= 0 && index <= claudeMemoryBoundaryIndex}
+                  isLastBoundary={index === lastBoundaryIndex}
+                  failedFlashKind={failedStripFlash?.index === index ? failedStripFlash.kind : null}
+                  isForkActive={activeForkMarkerIndex === index}
+                  isCmdHeld={isCmdHeld}
+                  isExpandedLayout={isExpandedLayout}
+                  treeMode={treeMode}
+                  isCodex={isCodex}
+                  isSdkTab={isSdkTab}
+                  historyTargetVisible={historyTargetVisible}
+                  timelineFontSize={timelineFontSize}
+                  timelineSummaryFontSize={timelineSummaryFontSize}
+                  timelineLineClamp={timelineLineClamp}
+                  intrinsicPreviewFontSize={intrinsicPreviewFontSize}
+                />
               </React.Fragment>
             );
           })}

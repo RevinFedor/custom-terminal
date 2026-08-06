@@ -7963,6 +7963,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   // so switching projects re-runs this effect with the NEW project's active
   // tab and would drag the list away from the offset the user left. Only a
   // real change of the active tab INSIDE the visible project counts.
+  //
+  // And it must stay a no-op whenever the row is ALREADY on screen. This is a
+  // rescue for a row the user cannot see, not a "centre the selection" rule:
+  // clicking a visible tab must never move the list under the cursor. The
+  // check is explicit geometry against THIS scroller, because scrollIntoView
+  // means "make it visible" — it re-aligns a row that is merely near an edge,
+  // and it walks every scrollable ancestor, so it moves the list on clicks
+  // that should have changed nothing.
   const lastAutoScrolledTabRef = useRef<string | null>(null);
   useEffect(() => {
     const scrollContainer = scrollContainerRef.current;
@@ -7981,7 +7989,28 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       const activeEl = scrollContainer.querySelector(
         `[data-tab-item][data-tab-id="${CSS.escape(workspace.activeTabId!)}"]`
       ) as HTMLElement | null;
-      if (activeEl) activeEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      if (!activeEl) return;
+      // Position must be measured against the SCROLLER, never via bare
+      // offsetTop: every row card sits inside its own position:relative
+      // wrapper, so offsetTop ≈ 0 for ALL rows — a naive check then reads
+      // any row as "above the viewport" and slams the list to the top.
+      const rect = measureVerticalRowFlipRect(activeEl, scrollContainer);
+      // Vertical sidebar axis.
+      const rowBottom = rect.top + rect.height;
+      const viewTop = scrollContainer.scrollTop;
+      const viewBottom = viewTop + scrollContainer.clientHeight;
+      if (rect.top < viewTop) scrollContainer.scrollTop = rect.top;
+      else if (rowBottom > viewBottom) {
+        scrollContainer.scrollTop = rowBottom - scrollContainer.clientHeight;
+      }
+      // Horizontal top-bar axis (the old scrollIntoView covered it too).
+      const rowRight = rect.left + rect.width;
+      const viewLeft = scrollContainer.scrollLeft;
+      const viewRight = viewLeft + scrollContainer.clientWidth;
+      if (rect.left < viewLeft) scrollContainer.scrollLeft = rect.left;
+      else if (rowRight > viewRight) {
+        scrollContainer.scrollLeft = rowRight - scrollContainer.clientWidth;
+      }
     });
 
     return () => cancelAnimationFrame(raf);
@@ -8015,8 +8044,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         if (++attempts < 20) requestAnimationFrame(tryReveal);
         return;
       }
-      const rowTop = row.offsetTop;
-      const rowBottom = rowTop + row.offsetHeight;
+      // NOT row.offsetTop: the card's offsetParent is its own
+      // position:relative row wrapper, so offsetTop ≈ 0 for every row. That
+      // read any row as "above the viewport", slammed the list to the top on
+      // every click, and then persisted 0 as the saved offset ("scroll
+      // resets"). Measure against the scroller itself.
+      const rect = measureVerticalRowFlipRect(row, scroller);
+      const rowTop = rect.top;
+      const rowBottom = rowTop + rect.height;
       const viewTop = scroller.scrollTop;
       const viewBottom = viewTop + scroller.clientHeight;
       let next: number | null = null;

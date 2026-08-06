@@ -7,6 +7,10 @@
   color: #ccc;
 }
 
+.sidebar.focused {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.34);
+}
+
 .file-tree {
   flex: 1;
   overflow-y: auto;
@@ -114,8 +118,7 @@
 }
 
 .sidebar.focused .file-tree {
-  outline: 1px solid rgba(255, 255, 255, 0.2);
-  outline-offset: -1px;
+  outline: none;
 }
 
 .file-tree {
@@ -767,6 +770,22 @@
 .arborist-node .file-row-session-chip.file-row-project-chip:hover {
   background: var(--file-session-chip-bg-hover, rgba(167, 139, 250, 0.34));
   color: #fff;
+}
+
+.arborist-node .file-row-prompt-chip.file-row-project-chip {
+  gap: 4px;
+  cursor: default;
+  color: #f5f3ff;
+}
+
+.arborist-node .file-row-prompt-chip svg {
+  flex: 0 0 auto;
+  color: #c4b5fd;
+}
+
+.arborist-node .file-row-prompt-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Neutral, not tinted: it counts sessions of mixed colours, so borrowing any

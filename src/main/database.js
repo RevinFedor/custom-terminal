@@ -304,6 +304,26 @@ class DatabaseManager {
     // Migration: add file_paths to prompts (JSON array of absolute file paths)
     try { this.db.exec(`ALTER TABLE prompts ADD COLUMN file_paths TEXT DEFAULT NULL`); } catch (e) {}
 
+    // Project prompt sources are disk-owned roots. Prompt files themselves are
+    // deliberately not copied into `prompts`: the catalog is derived from
+    // `<root>/docs/**/*.prompt.md` and stays current when files move or change.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS project_prompt_sources (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        root_path TEXT NOT NULL,
+        position INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        UNIQUE(project_id, root_path),
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_project_prompt_sources_project
+      ON project_prompt_sources(project_id, position, id)
+    `);
+
     // Durable identity is separate from the legacy AUTOINCREMENT row id because
     // savePrompts rewrites the table. DnD must keep following the same prompt
     // while array positions change during a preview.
@@ -3249,6 +3269,107 @@ class DatabaseManager {
     return { success: true };
   }
 
+  getProjectPromptSources(projectId) {
+    if (!projectId) return [];
+    return this.db.prepare(`
+      SELECT id, project_id, root_path, position, created_at, updated_at
+      FROM project_prompt_sources
+      WHERE project_id = ?
+      ORDER BY position ASC, id ASC
+    `).all(projectId).map((row) => ({
+      id: row.id,
+      projectId: row.project_id,
+      rootPath: row.root_path,
+      position: row.position,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  getProjectsWithPromptSources() {
+    return this.db.prepare(`
+      SELECT DISTINCT p.id, p.name, p.path, p.icon, p.updated_at
+      FROM projects p
+      INNER JOIN project_prompt_sources s ON s.project_id = p.id
+      ORDER BY p.updated_at DESC, p.id ASC
+    `).all().map((row) => ({
+      id: row.id,
+      name: row.name,
+      path: row.path,
+      icon: row.icon || null,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  saveProjectPromptSources(projectId, roots) {
+    if (!projectId || !Array.isArray(roots)) return [];
+    const projectExists = this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId);
+    if (!projectExists) throw new Error('project_not_found');
+
+    const normalized = [];
+    const seen = new Set();
+    for (const value of roots) {
+      const raw = typeof value === 'string' ? value : value?.rootPath;
+      if (typeof raw !== 'string' || !raw.trim()) continue;
+      const rootPath = path.resolve(raw.trim());
+      if (seen.has(rootPath)) continue;
+      seen.add(rootPath);
+      normalized.push(rootPath);
+    }
+
+    const save = this.db.transaction(() => {
+      this.db.prepare('DELETE FROM project_prompt_sources WHERE project_id = ?').run(projectId);
+      const insert = this.db.prepare(`
+        INSERT INTO project_prompt_sources (project_id, root_path, position)
+        VALUES (?, ?, ?)
+      `);
+      normalized.forEach((rootPath, position) => insert.run(projectId, rootPath, position));
+    });
+    save();
+    return this.getProjectPromptSources(projectId);
+  }
+
+  rewriteFilePathReferences(oldPath, newPath) {
+    if (!oldPath || !newPath || oldPath === newPath) return { changed: 0 };
+    const rewrite = (value) => {
+      if (typeof value !== 'string') return value;
+      if (value === oldPath) return newPath;
+      return value.startsWith(oldPath + path.sep)
+        ? newPath + value.slice(oldPath.length)
+        : value;
+    };
+    let changed = 0;
+    const run = this.db.transaction(() => {
+      for (const table of ['tabs', 'tab_history']) {
+        if (!this._tableColumns(table).has('file_path')) continue;
+        changed += this.db.prepare(`UPDATE ${table} SET file_path = ? WHERE file_path = ?`)
+          .run(newPath, oldPath).changes;
+      }
+      changed += this.db.prepare('UPDATE projects SET open_file_path = ? WHERE open_file_path = ?')
+        .run(newPath, oldPath).changes;
+
+      const rewriteJsonPaths = (table, idColumn = 'id') => {
+        if (!this._tableColumns(table).has('file_paths')) return;
+        const rows = this.db.prepare(`SELECT ${idColumn} AS row_id, file_paths FROM ${table} WHERE file_paths IS NOT NULL`).all();
+        const update = this.db.prepare(`UPDATE ${table} SET file_paths = ? WHERE ${idColumn} = ?`);
+        for (const row of rows) {
+          try {
+            const values = JSON.parse(row.file_paths);
+            if (!Array.isArray(values)) continue;
+            const next = values.map(rewrite);
+            if (JSON.stringify(values) === JSON.stringify(next)) continue;
+            update.run(JSON.stringify(next), row.row_id);
+            changed += 1;
+          } catch { /* preserve malformed legacy JSON */ }
+        }
+      };
+      rewriteJsonPaths('prompts');
+      rewriteJsonPaths('ai_prompts');
+    });
+    run();
+    return { changed };
+  }
+
   updateProjectNotes(projectId, notes) {
     this.db.prepare('UPDATE projects SET notes_global = ?, updated_at = strftime(\'%s\', \'now\') WHERE id = ?').run(notes, projectId);
   }
@@ -3278,6 +3399,7 @@ class DatabaseManager {
   }
 
   deleteProject(projectId) {
+    this.db.prepare('DELETE FROM project_prompt_sources WHERE project_id = ?').run(projectId);
     this.db.prepare('DELETE FROM projects WHERE id = ?').run(projectId);
     return true;
   }

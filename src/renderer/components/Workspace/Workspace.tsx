@@ -292,6 +292,15 @@ export default function Workspace() {
     });
   }, [rewriteFilePathReferences]);
 
+  useEffect(() => {
+    const onTransferred = (_event: unknown, transfer: { oldPath?: string; newPath?: string } = {}) => {
+      if (!transfer.oldPath || !transfer.newPath || transfer.oldPath === transfer.newPath) return;
+      handleSidebarPathChanged(transfer.oldPath, transfer.newPath);
+    };
+    ipcRenderer.on('gt-editor-transfer:committed', onTransferred);
+    return () => ipcRenderer.removeListener('gt-editor-transfer:committed', onTransferred);
+  }, [handleSidebarPathChanged]);
+
   // Get active tab early for process checking
   const activeTab = activeProject?.activeTabId
     ? activeProject.tabs.get(activeProject.activeTabId)
@@ -1434,6 +1443,14 @@ export default function Workspace() {
     ? resolvedExplorerPath
     : (rawExplorerPath || projectRootPath);
 
+  // Stale-owner beat: the tab highlight has already moved, but the heavy
+  // owner identity travels through the deferred lane — for those frames the
+  // panel still SHOWS the previous tab's transcript under the new tab's
+  // highlight. While everything froze together this was invisible; now that
+  // the switch paints promptly the mismatch reads as "clicked tab 2, still
+  // seeing tab 1's history". The panel drops a loader curtain over its own
+  // content stage for exactly these frames (staleOwnerCurtain below).
+  const historyStaleCurtain = !historyOwnerIsCurrent && !historyStaleHidden;
   const historyPanelNode = deferredHistoryOwner ? (
     // The stale-owner beat renders with FROZEN placement (historyPlacementForRender):
     // identical tree position and placement props keep React reconciling the
@@ -1443,6 +1460,7 @@ export default function Workspace() {
     // flex/absolute geometry of all three placements is untouched.
     <div style={historyStaleHidden ? { display: 'none' } : { display: 'contents' }}>
     <HistoryPanel
+      staleOwnerCurtain={historyStaleCurtain}
       tabId={deferredHistoryOwner.tabId}
       sessionId={deferredHistoryOwner.sessionId}
       cwd={deferredHistoryOwner.cwd}

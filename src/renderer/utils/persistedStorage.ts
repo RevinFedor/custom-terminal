@@ -74,8 +74,21 @@ export function hydrateLocalStorageFromSQLite(): void {
 /**
  * Monkey-patch `localStorage.setItem` and `removeItem` so writes to mirrored
  * keys fan out to SQLite. Only patches once; safe to call multiple times.
+ *
+ * Runtime writes go through ASYNC `send`, not `sendSync`. The sync variant
+ * parked the RENDERER until main replied — and during a tab switch main is
+ * busy with the switch's own IPC (plus git:status), so one settings write
+ * inside a cleanup effect blocked the whole UI. Measured live (05.08, CPU
+ * profile of the user's freeze): 746ms of `Storage.setItem → sendSync` inside
+ * the React commit phase — the single largest slice of the 600-900ms
+ * tab-switch long task. Ordering is still guaranteed (same channel, main
+ * drains in arrival order), and durability across a window close is restored
+ * by the pagehide replay below: every key written this session is re-sent
+ * synchronously right before the window goes away — the one moment blocking
+ * is correct.
  */
 let patched = false;
+const dirtyMirrorKeys = new Set<string>();
 export function installLocalStorageMirror(): void {
   if (patched || !ipcRenderer) return;
   patched = true;
@@ -92,8 +105,9 @@ export function installLocalStorageMirror(): void {
     // simplest way without relying on call-site identity.
     if (this !== localStorage) return;
     if (!shouldMirror(key)) return;
+    dirtyMirrorKeys.add(key);
     try {
-      ipcRenderer.sendSync('app:mirrorLocalStorageSync', { key, value: String(value) });
+      ipcRenderer.send('app:mirrorLocalStorageSync', { key, value: String(value) });
     } catch {
       // Swallow — losing one mirror write is preferable to breaking setItem.
     }
@@ -103,10 +117,28 @@ export function installLocalStorageMirror(): void {
     origRemove.call(this, key);
     if (this !== localStorage) return;
     if (!shouldMirror(key)) return;
+    dirtyMirrorKeys.add(key);
     try {
-      ipcRenderer.sendSync('app:mirrorLocalStorageSync', { key, value: null });
+      ipcRenderer.send('app:mirrorLocalStorageSync', { key, value: null });
     } catch {}
   };
+
+  // Shutdown replay: async sends issued moments before destruction may not
+  // survive the renderer going away, so the final state of every key touched
+  // this session is pushed once more, synchronously. `pagehide` fires for
+  // both window close and reload; the handler is idempotent (current values,
+  // last-write-wins on the main side).
+  window.addEventListener('pagehide', () => {
+    for (const key of dirtyMirrorKeys) {
+      try {
+        ipcRenderer.sendSync('app:mirrorLocalStorageSync', {
+          key,
+          value: localStorage.getItem(key),
+        });
+      } catch {}
+    }
+    dirtyMirrorKeys.clear();
+  });
 }
 
 /** Convenience: run both at boot — call from renderer entry before app code. */

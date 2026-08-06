@@ -45,6 +45,7 @@ import {
 } from '../../utils/codexEffectiveSettings.mjs';
 import { planAgentSettingsAvailability } from '../../utils/agentSettingsAvailability.mjs';
 import { applyClaudePtySetting } from '../../utils/claudePtyActions';
+import { markRendererActivity } from '../../utils/rendererActivityTrail';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -476,6 +477,14 @@ export default function ClaudeControlBar({
   // restart, follow native Rewind, and include commands typed in the terminal.
   const [claudeModel, setClaudeModel] = useState<string | null>(null);
   const [effortLocal, setEffortLocal] = useState<string | undefined>(undefined);
+  // Confirmation-in-flight: the JSONL-branch read that proves model/effort.
+  // With the main-side cache a warm answer lands within a frame or two; a
+  // cold heavy session takes visibly long — during that window the cluster
+  // shows the shimmer so the displayed default is readable as "not confirmed
+  // yet", not as the actual session setting. Unlike isLocalBusy this does
+  // NOT block clicks: picking a model while confirmation runs is legal (the
+  // pick wins; the stale response is dropped by the request seq).
+  const [confirmingSettings, setConfirmingSettings] = useState(false);
   const claudeSettingsRequestRef = useRef(0);
   const [claudeMaterialization, setClaudeMaterialization] = useState<{
     sessionId: string | null;
@@ -491,9 +500,11 @@ export default function ClaudeControlBar({
       claudeSettingsRequestRef.current += 1;
       setClaudeModel(null);
       setEffortLocal(undefined);
+      setConfirmingSettings(false);
       return null;
     }
     const requestSeq = ++claudeSettingsRequestRef.current;
+    setConfirmingSettings(true);
     try {
       const result = await ipcRenderer.invoke('claude:get-confirmed-settings', {
         tabId,
@@ -501,6 +512,7 @@ export default function ClaudeControlBar({
         cwd: launchCwd,
       });
       if (requestSeq !== claudeSettingsRequestRef.current) return null;
+      setConfirmingSettings(false);
       if (result?.success !== true || result.sessionId !== claudeSessionId) {
         console.warn(
           '[ClaudeControlBar:ConfirmedSettings] ignored tab=' + tabId.slice(-12)
@@ -517,11 +529,13 @@ export default function ClaudeControlBar({
         + ' sid=' + claudeSessionId.slice(0, 8)
         + ' model=' + (result.model || 'bridge/default')
         + ' effort=' + (result.effort || 'unset')
+        + ' cache=' + (result.cache || 'miss')
         + ' check=' + checkReason
       );
       return result;
     } catch (error: any) {
       if (requestSeq !== claudeSettingsRequestRef.current) return null;
+      setConfirmingSettings(false);
       console.warn(
         '[ClaudeControlBar:ConfirmedSettings] failed tab=' + tabId.slice(-12)
         + ' sid=' + claudeSessionId.slice(0, 8)
@@ -579,10 +593,15 @@ export default function ClaudeControlBar({
   }, [refreshClaudeMaterialization]);
 
   useEffect(() => {
+    // Surface mark for freeze attribution: the control-bar rebind on a tab
+    // switch (settings reset + confirmed-settings kick) participates in the
+    // switch frame and must be nameable in during= separately from History.
+    const endMark = markRendererActivity('controlbar-rebind:' + tabId.slice(-8));
+    requestAnimationFrame(() => endMark());
     setClaudeModel(null);
     setEffortLocal(undefined);
     void refreshClaudeConfirmedSettings('session-change');
-  }, [claudeSessionId, refreshClaudeConfirmedSettings]);
+  }, [claudeSessionId, refreshClaudeConfirmedSettings, tabId]);
 
   useEffect(() => {
     if (!isClaudePtySession || !claudeSessionId) return;
@@ -3953,9 +3972,14 @@ export default function ClaudeControlBar({
         const supportsModelEffortPair = isCodex || isSDKTab || (sessionType === 'claude' && isAnthropicPTY);
         return (
         <div
-          className={isLocalBusy ? 'control-bar-busy-overlay' : undefined}
+          // Same shimmer for two different waits: a local control operation
+          // (blocks clicks via isBusy below) and a confirmed-settings read in
+          // flight (does NOT block — the displayed model/effort just isn't
+          // proven yet; a user pick during the read wins over the response).
+          className={isLocalBusy || confirmingSettings ? 'control-bar-busy-overlay' : undefined}
           data-agent-settings-scope="tab"
           data-session-type={sessionType}
+          data-settings-confirming={confirmingSettings ? '1' : undefined}
           style={{
             position: 'relative',
             display: 'flex',
@@ -3965,7 +3989,7 @@ export default function ClaudeControlBar({
             opacity: !canControl ? 0.4 : 1,
             transition: 'opacity 0.15s',
           }}
-          aria-busy={isLocalBusy}
+          aria-busy={isLocalBusy || confirmingSettings}
         >
           {/* Click-to-reset escape hatch — covers the WHOLE cluster only while a
               local settings/control operation is busy. Parent sets

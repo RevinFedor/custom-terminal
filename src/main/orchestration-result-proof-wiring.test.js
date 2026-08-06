@@ -94,13 +94,13 @@ test('settled result proof terminalizes exact abort or no-final-result before ar
 });
 
 test('only explicit submitted false bypasses orchestration recovery grace', () => {
-  const dispatch = block(
-    'async function dispatchDeferredOrchestrationRun',
-    '\nasync function dispatchNextDeferredOrchestrationForTarget',
+  const applyReceipt = block(
+    'async function applyOrchestrationTargetSendReceipt',
+    '\nasync function dispatchDeferredOrchestrationRun',
   );
-  assert.match(dispatch, /orchestrationSendFailureRecoveryPolicy\(sendResult\)/);
-  assert.match(dispatch, /resetDeferredDelivery\(runId, 'send-refused-before-submit'\)/);
-  assert.match(dispatch, /failureGraceMs: recoveryPolicy\.failureGraceMs/);
-  assert.match(dispatch, /finalizeSettledOrchestrations\(failed\.settled, reason \+ '-send-failed'\)/);
-  assert.match(dispatch, /\[OrchestrationRecovery\] immediate pre-submit failure/);
+  assert.match(applyReceipt, /orchestrationSendFailureRecoveryPolicy\(sendResult\)/);
+  assert.match(applyReceipt, /resetDeferredDelivery\(runId, 'send-refused-before-submit'\)/);
+  assert.match(applyReceipt, /failureGraceMs: recoveryPolicy\.failureGraceMs/);
+  assert.match(applyReceipt, /finalizeSettledOrchestrations\(failed\.settled, reason \+ '-send-failed'\)/);
+  assert.match(applyReceipt, /\[OrchestrationDelivery\] exact pre-submit failure/);
 });

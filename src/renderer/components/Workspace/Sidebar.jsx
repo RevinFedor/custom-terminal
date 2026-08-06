@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { flushSync } from 'react-dom'
+import { MessageSquareQuote } from 'lucide-react'
 import {
   applySidebarLayout,
   DEFAULT_FILE_ICON_PROFILE,
@@ -23,6 +24,7 @@ import ControlHint from '../UI/ControlHint'
 import IconCropper from './IconCropper'
 import { RunAfterTabPicker } from './RunAfterTabPicker'
 import { useWorkspaceStore } from '../../store/useWorkspaceStore'
+import { useUIStore } from '../../store/useUIStore'
 import { getValue, setValue } from '../../utils/storage'
 import { linkedFileSessionChipSnapshot } from '../../utils/linkedFileSessionChips.mjs'
 
@@ -36,6 +38,8 @@ const SESSION_CHIP_COLORS = {
   gemini: '#4E86F8',
   default: '#A78BFA',
 }
+
+const GT_FILE_TRANSFER_CLIPBOARD_FORMAT = 'application/x-gt-editor-file-transfer-v1'
 
 // --- Sort Comparator ---
 
@@ -383,6 +387,7 @@ function Sidebar({
   linkOwnerProjectId = null,
   onLinkFile,
 }) {
+  const showToast = useUIStore((state) => state.showToast)
   const linkedFileSessionSnapshot = useWorkspaceStore(useCallback((state) => {
     const workspace = linkOwnerProjectId
       ? state.openProjects.get(linkOwnerProjectId)
@@ -402,6 +407,7 @@ function Sidebar({
     }
     return byPath
   }, [linkedFileSessionSnapshot])
+  const [projectPromptUsageByPath, setProjectPromptUsageByPath] = useState(() => new Map())
   const [treeData, setTreeData] = useState([])
   const [contextMenu, setContextMenu] = useState(null)
   const [fileIconProfile, setFileIconProfile] = useState(() => (
@@ -428,8 +434,12 @@ function Sidebar({
   const openStatesMapRef = useRef({}) // Per-directory expanded state
   const sortModeRef = useRef('name-asc') // For use in callbacks
   const [focusedId, setFocusedId] = useState(null) // ID of node with focus border (VS Code style)
+  const [localSidebarFocused, setLocalSidebarFocused] = useState(false)
+  const sidebarRef = useRef(null)
+  const effectiveSidebarFocused = sidebarFocused || localSidebarFocused
   const [multiSelected, setMultiSelected] = useState(new Set()) // Multi-selection (Cmd+Click, Shift+Click)
   const lastClickedRef = useRef(null) // Anchor for Shift+Click range selection
+  const transferPasteBusyRef = useRef(false)
   const undoStackRef = useRef([]) // Undo stack for delete operations
   const openStateRef = useRef(initialExpandedDirs || {}) // Store expanded state
   const [expandedSnapshot, setExpandedSnapshot] = useState({}) // Triggers FileOutlineExplorer update
@@ -437,6 +447,37 @@ function Sidebar({
   const sidebarLayoutRef = useRef(sidebarLayout)
   const sidebarLayoutRevisionRef = useRef(0)
   const treeDataRef = useRef([])
+
+  useEffect(() => {
+    if (!folderPath) {
+      setProjectPromptUsageByPath(new Map())
+      return
+    }
+    let cancelled = false
+    const ipc = window.require('electron').ipcRenderer
+    const refresh = async () => {
+      try {
+        const result = await ipc.invoke('project-prompts:usage-for-root', folderPath)
+        if (cancelled || !result?.success) return
+        const next = new Map()
+        for (const usage of result.data || []) {
+          if (usage?.path) next.set(usage.path, Array.isArray(usage.projects) ? usage.projects : [])
+        }
+        setProjectPromptUsageByPath(next)
+      } catch (error) {
+        console.warn('[ProjectPrompts] sidebar usage refresh failed:', error?.message || error)
+      }
+    }
+    const onChanged = () => { void refresh() }
+    void refresh()
+    ipc.on('project-prompts:changed', onChanged)
+    window.addEventListener('focus', refresh)
+    return () => {
+      cancelled = true
+      ipc.removeListener('project-prompts:changed', onChanged)
+      window.removeEventListener('focus', refresh)
+    }
+  }, [folderPath])
 
   const adoptFileIconResult = useCallback((result) => {
     if (!result) return
@@ -473,6 +514,14 @@ function Sidebar({
   useEffect(() => {
     treeDataRef.current = treeData
   }, [treeData])
+
+  useEffect(() => {
+    setLocalSidebarFocused(true)
+    const frame = requestAnimationFrame(() => {
+      try { sidebarRef.current?.focus({ preventScroll: true }) } catch {}
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [])
 
   useEffect(() => {
     sidebarLayoutRef.current = sidebarLayout
@@ -538,8 +587,8 @@ function Sidebar({
 
   // macOS Finder style: Enter on selected file → rename mode
   useEffect(() => {
-    if (!sidebarFocused || editingId) {
-      console.log('[sidebar] Enter-to-rename listener SKIPPED (sidebarFocused:', sidebarFocused, 'editingId:', editingId, ')')
+    if (!effectiveSidebarFocused || editingId) {
+      console.log('[sidebar] Enter-to-rename listener SKIPPED (sidebarFocused:', effectiveSidebarFocused, 'editingId:', editingId, ')')
       return
     }
     console.log('[sidebar] Enter-to-rename listener ATTACHED (activeFilePath:', activeFilePath, ')')
@@ -558,7 +607,7 @@ function Sidebar({
       console.log('[sidebar] Enter-to-rename listener REMOVED')
       document.removeEventListener('keydown', handleKeyDown)
     }
-  }, [sidebarFocused, editingId, activeFilePath])
+  }, [effectiveSidebarFocused, editingId, activeFilePath])
 
   // Shared icon profile. Only the installed app may import its old exact-name
   // overrides; disposable dev state must never seed cross-application data.
@@ -704,6 +753,16 @@ function Sidebar({
     return nodes
   }, [])
 
+  useEffect(() => {
+    const releaseFocusOutside = (event) => {
+      const target = event.target
+      if (sidebarRef.current && target instanceof Node && sidebarRef.current.contains(target)) return
+      setLocalSidebarFocused(false)
+    }
+    document.addEventListener('pointerdown', releaseFocusOutside, true)
+    return () => document.removeEventListener('pointerdown', releaseFocusOutside, true)
+  }, [])
+
   // Cmd+Z: Undo delete in sidebar
   const handleUndo = useCallback(async () => {
     const entry = undoStackRef.current.pop()
@@ -728,7 +787,7 @@ function Sidebar({
   }, [folderPath, loadTreeRecursive, registerPendingOperation])
 
   useEffect(() => {
-    if (!sidebarFocused) return
+    if (!effectiveSidebarFocused) return
     const handleKeyDown = (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
       if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
@@ -742,7 +801,7 @@ function Sidebar({
     }
     document.addEventListener('keydown', handleKeyDown, true)
     return () => document.removeEventListener('keydown', handleKeyDown, true)
-  }, [sidebarFocused, handleUndo])
+  }, [effectiveSidebarFocused, handleUndo])
 
   // Debounced save of expanded dirs to DB
   const saveExpandedTimerRef = useRef(null)
@@ -753,6 +812,58 @@ function Sidebar({
       onExpandedDirsChange(state)
     }, 500)
   }, [onExpandedDirsChange])
+
+  // A GT Editor handoff is intentionally consumed only while the file sidebar
+  // owns focus. Normal Cmd+V keeps flowing to xterm/SDK when the sidebar is not
+  // the active surface.
+  useEffect(() => {
+    if (!effectiveSidebarFocused || !folderPath) return
+    const handleTransferPaste = async (event) => {
+      if (!(event.metaKey || event.ctrlKey) || String(event.key).toLowerCase() !== 'v') return
+      if (editingId || transferPasteBusyRef.current) return
+      const target = event.target
+      if (target instanceof HTMLElement && target.closest('input, textarea, [contenteditable="true"]')) return
+
+      const electron = window.require('electron')
+      let ticketBuffer = null
+      try { ticketBuffer = electron.clipboard.readBuffer(GT_FILE_TRANSFER_CLIPBOARD_FORMAT) } catch {}
+      if (!ticketBuffer || ticketBuffer.length === 0) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      transferPasteBusyRef.current = true
+      const focusedNode = findTreeNodeById(treeDataRef.current, focusedId)
+      const destinationDir = focusedNode?.isDirectory
+        ? focusedNode.id
+        : (focusedNode?.id ? focusedNode.id.substring(0, focusedNode.id.lastIndexOf('/')) : folderPath)
+      try {
+        const result = await electron.ipcRenderer.invoke('gt-editor-transfer:paste', { destinationDir })
+        if (!result?.success) {
+          showToast(result?.error || 'Не удалось перенести файл из GT Editor', 'error')
+          return
+        }
+        if (result.oldPath && result.newPath && result.oldPath !== result.newPath) {
+          onRename?.(result.oldPath, result.newPath)
+        }
+        const parentPath = result.newPath?.substring(0, result.newPath.lastIndexOf('/'))
+        if (parentPath && parentPath !== folderPath) {
+          openStateRef.current[parentPath] = true
+          setExpandedSnapshot({ ...openStateRef.current })
+          saveExpandedDirs(openStateRef.current)
+        }
+        const nodes = await loadTreeRecursive(folderPath, openStateRef.current)
+        setTreeData(nodes)
+        setFocusedId(result.newPath || null)
+        showToast(`Файл перенесён: ${result.displayName || result.newPath?.split('/').pop() || 'готово'}`, 'success')
+      } catch (error) {
+        showToast(`Не удалось перенести файл: ${error?.message || error}`, 'error')
+      } finally {
+        transferPasteBusyRef.current = false
+      }
+    }
+    document.addEventListener('keydown', handleTransferPaste, true)
+    return () => document.removeEventListener('keydown', handleTransferPaste, true)
+  }, [editingId, effectiveSidebarFocused, focusedId, folderPath, loadTreeRecursive, onRename, saveExpandedDirs, showToast])
 
   // 1. Initial Load (when folderPath changes or hard refresh requested)
   useEffect(() => {
@@ -1282,7 +1393,7 @@ function Sidebar({
 
   // Delete/Backspace key handler
   useEffect(() => {
-    if (!sidebarFocused) return
+    if (!effectiveSidebarFocused) return
     const handleKeyDown = (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
       if (e.key === 'Delete' || (e.key === 'Backspace' && e.metaKey)) {
@@ -1296,7 +1407,7 @@ function Sidebar({
     }
     document.addEventListener('keydown', handleKeyDown, true)
     return () => document.removeEventListener('keydown', handleKeyDown, true)
-  }, [sidebarFocused, handleDelete, multiSelected, focusedId])
+  }, [effectiveSidebarFocused, handleDelete, multiSelected, focusedId])
 
   // Helper: clean up any existing __new__ placeholders
   const cleanupPlaceholders = useCallback(() => {
@@ -1398,7 +1509,8 @@ function Sidebar({
   const renderLinkedSessionChips = useCallback(({ row, isFolder }) => {
     if (isFolder) return null
     const chips = linkedFileSessionsByPath.get(row.id) || []
-    if (chips.length === 0) return null
+    const promptProjects = projectPromptUsageByPath.get(row.id) || []
+    if (chips.length === 0 && promptProjects.length === 0) return null
     // Slightly larger than the old half-size: at fontSize/2 the session name
     // was unreadable next to the file name it annotates.
     const chipFontSize = Math.max(7, Math.round(fontSize / 2) + 1)
@@ -1414,6 +1526,26 @@ function Sidebar({
         data-no-outline-drag
         data-outline-dnd-ignore
       >
+        {promptProjects.map(project => (
+          <span
+            key={`prompt-${project.id}`}
+            className="file-row-project-chip file-row-session-chip file-row-prompt-chip"
+            data-project-prompt-chip={project.id}
+            data-no-outline-drag
+            data-outline-dnd-ignore
+            title={`Проектный промпт Custom Terminal · ${project.name}`}
+            style={{
+              fontSize: chipFontSize,
+              lineHeight: 1.3,
+              ['--file-session-chip-accent']: '#a78bfa99',
+              ['--file-session-chip-bg']: '#8b5cf633',
+              ['--file-session-chip-bg-hover']: '#8b5cf633',
+            }}
+          >
+            <MessageSquareQuote size={Math.max(8, chipFontSize + 1)} strokeWidth={2} aria-hidden="true" />
+            <span>{project.name}</span>
+          </span>
+        ))}
         {chips.map(chip => {
           const accent = SESSION_CHIP_COLORS[chip.sessionKind] || SESSION_CHIP_COLORS.default
           return (
@@ -1468,7 +1600,7 @@ function Sidebar({
       )}
       </div>
     )
-  }, [fontSize, linkOwnerProjectId, linkedFileSessionsByPath])
+  }, [fontSize, linkOwnerProjectId, linkedFileSessionsByPath, projectPromptUsageByPath])
 
   const handleFileSelect = useCallback((path, isDirectory, modifiers = {}) => {
     // Skip placeholder nodes — they're not real files
@@ -1611,9 +1743,17 @@ function Sidebar({
 
   return (
     <aside
-      className={`sidebar ${sidebarFocused ? 'focused' : ''}`}
+      ref={sidebarRef}
+      className={`sidebar ${effectiveSidebarFocused ? 'focused' : ''}`}
       style={{ width, '--sidebar-font-size': `${fontSize}px` }}
-      onMouseDown={onFocus}
+      tabIndex={-1}
+      onMouseDown={(event) => {
+        setLocalSidebarFocused(true)
+        onFocus?.(event)
+        if (!(event.target instanceof HTMLElement) || !event.target.closest('input, textarea, [contenteditable="true"]')) {
+          try { event.currentTarget.focus({ preventScroll: true }) } catch {}
+        }
+      }}
     >
       {/* Draggable область для traffic lights - двойной клик разворачивает окно */}
       <div className="sidebar-drag-region" />
@@ -1693,7 +1833,8 @@ function Sidebar({
       <div
         className="file-tree"
         onPointerDown={(e) => {
-          onFocus(e)
+          setLocalSidebarFocused(true)
+          onFocus?.(e)
           if (!e.target.closest('.arborist-node')) {
             setFocusedId(null)
             setMultiSelected(new Set())
@@ -1726,7 +1867,7 @@ function Sidebar({
              onStartRename={node => setEditingId(node.id)}
              onCommitRename={handleCommitRename}
              onCancelRename={handleCancelRename}
-             sidebarFocused={sidebarFocused}
+             sidebarFocused={effectiveSidebarFocused}
              focusedId={focusedId}
              multiSelected={multiSelected}
              sidebarLayout={sidebarLayout}

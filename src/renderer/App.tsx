@@ -905,7 +905,7 @@ function App() {
   const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
   const setOpenFilePath = useWorkspaceStore((s) => s.setOpenFilePath);
   const { projects, loadProjects, updateProject } = useProjectsStore();
-  const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, dragAreaWidth, setDragAreaWidth } = useUIStore();
+  const { closeFilePreview, filePreview, showToast, openEditModal, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, dragAreaWidth, setDragAreaWidth } = useUIStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
   const inheritedBusyProjectKey = useOrchestrationStore((s) => (
     Array.from(s.inheritedBusyProjectIds).sort().join('\u0000')
@@ -5335,12 +5335,12 @@ function App() {
             <button
               className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 cursor-pointer"
               onClick={() => {
+                const project = projects[projectContextMenu.projectId];
                 setProjectContextMenu(null);
-                setSettingsInitialTab('projects');
-                setSettingsOpen(true);
+                if (project) openEditModal(project);
               }}
             >
-              Иконка проекта
+              Настройки проекта…
             </button>
             <button
               className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 cursor-pointer"

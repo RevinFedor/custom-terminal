@@ -75,6 +75,8 @@ import {
   dropHistoryMeasuredLayout,
   updateHistoryMeasuredLayoutScrollTop,
   estimateHistoryAverageRowHeight,
+  createHistoryRowHeightLookup,
+  pickHistoryMountWaveTarget,
 } from '../../utils/historyMeasuredLayout';
 import {
   projectNativeRewindPreview,
@@ -440,6 +442,14 @@ interface HistoryPanelProps {
   lifecycleStatus?: AgentLifecycleSummary | null;
   inputBusy?: boolean;
   onControlsHeightChange?: (height: number) => void;
+  // Deferred owner handoff: the workspace already highlights the NEXT tab
+  // while this panel still renders the PREVIOUS owner's rows (frozen instance,
+  // see Workspace's historyStaleCurtain). During those frames the transcript
+  // on screen belongs to a tab that is no longer selected — cover the content
+  // stage with the panel's own loader so the surface never claims the wrong
+  // owner. Content is hidden, not unmounted: the frozen rows are what makes
+  // the handoff cheap.
+  staleOwnerCurtain?: boolean;
   // Split workspace: several REAL History instances are mounted (one per
   // pane), but window-level keyboard shortcuts (Escape-interrupt, Cmd+F) must
   // have exactly ONE owner — the focused pane. Non-focused panes stay fully
@@ -563,6 +573,36 @@ const HistoryScrollSeekPlaceholder = memo(({ height, index }: {
         maxHeight: '100%',
         borderRadius: 4,
         background: 'rgba(129, 140, 248, 0.10)',
+      }}
+    />
+  </div>
+));
+
+// Mount-wave shell body. The OUTER wrapper (data-uuid, row-owner,
+// onContextMenu, chain-break tint) is the real one — only the heavy card
+// inside is deferred, so a right-click during the wave opens the same context
+// menu with the same entry. Visually a faint bar, like the seek placeholder
+// but dimmer: this state lasts a few frames per row.
+const HistoryMountShellBody = memo(({ index }: { index: number }) => (
+  <div
+    aria-hidden="true"
+    style={{
+      display: 'flex',
+      alignItems: 'flex-start',
+      padding: '4px 16px 0',
+      pointerEvents: 'none',
+      height: '100%',
+      boxSizing: 'border-box',
+      overflow: 'hidden',
+    }}
+  >
+    <div
+      style={{
+        width: index % 3 === 0 ? '38%' : index % 3 === 1 ? '61%' : '49%',
+        height: 10,
+        maxHeight: '100%',
+        borderRadius: 4,
+        background: 'rgba(129, 140, 248, 0.07)',
       }}
     />
   </div>
@@ -7705,6 +7745,7 @@ const scheduleHistorySeekKick = (): void => {
       // The seeking list is gone (owner switch remounted it). The new list
       // starts with placeholders off; keep the diagnostic flag honest.
       historyScrollSeekActive = false;
+      notifyHistorySeekExit();
       return;
     }
     const original = scroller.scrollTop;
@@ -7776,6 +7817,7 @@ const HISTORY_SCROLL_SEEK_CONFIG = {
       historyScrollSeekActive = false;
       historyDiag('SCROLL_SEEK_EXIT velocity=' + Math.round(velocity)
         + ' heldMs=' + Math.round(performance.now() - historyScrollSeekEnteredAt));
+      notifyHistorySeekExit();
     }
     return true;
   },
@@ -7788,6 +7830,69 @@ const HISTORY_SCROLL_SEEK_CONFIG = {
 const HISTORY_DEFAULT_ROW_HEIGHT_PX = 120;
 const HISTORY_INITIAL_VIEWPORT_BUFFER = { top: 0, bottom: 0 };
 const HISTORY_SETTLED_VIEWPORT_BUFFER = { top: 600, bottom: 600 };
+
+// ===== Mount wave =====
+// The owner takeover used to mount every visible heavy card in ONE commit —
+// markdown + diff bodies for the whole viewport, measured live at 650-730ms
+// as a single unbreakable long task (`during=history-owner-mount`, 04.08),
+// with only THREE visible rows in the worst case. React cannot yield inside
+// one commit, so a right-click landing in that window queued behind it: the
+// exact "fast tab switch + immediate right-click freezes" user flow.
+//
+// The wave splits that commit: the mount renders exact-height lightweight
+// shells (geometry from the measured-layout store, so Virtuoso sees the SAME
+// sizes it stored and nothing shifts), then rows upgrade to real cards in
+// separate small commits — one unknown-cost row at a time, growing to three
+// only after a step measured cheap. Each step is granted by this arbiter (at
+// most one panel steps per frame — split panes must not compound into one
+// long task), scheduled only after the PREVIOUS step's commit was observed by
+// a layout effect plus one painted frame (React batches concurrent
+// transitions, so a free-running loop would merge steps back into one big
+// commit — the exact failure this exists to prevent).
+type HistoryMountWaveLane = {
+  wants: boolean;
+  visible: () => boolean;
+  run: () => void;
+};
+const historyMountWaveLanes = new Set<HistoryMountWaveLane>();
+let historyMountWaveArbiterArmed = false;
+const pumpHistoryMountWaveArbiter = (): void => {
+  if (historyMountWaveArbiterArmed) return;
+  let anyWants = false;
+  for (const lane of historyMountWaveLanes) {
+    if (lane.wants) { anyWants = true; break; }
+  }
+  if (!anyWants) return;
+  historyMountWaveArbiterArmed = true;
+  requestAnimationFrame(() => {
+    historyMountWaveArbiterArmed = false;
+    const wanting = [...historyMountWaveLanes].filter((lane) => lane.wants);
+    if (wanting.length === 0) return;
+    const pick = wanting.find((lane) => lane.visible()) ?? wanting[0];
+    pick.wants = false;
+    // Insertion-order rotation keeps concurrent lanes fair.
+    historyMountWaveLanes.delete(pick);
+    historyMountWaveLanes.add(pick);
+    pick.run();
+    pumpHistoryMountWaveArbiter();
+  });
+};
+const requestHistoryMountWaveStep = (lane: HistoryMountWaveLane): void => {
+  lane.wants = true;
+  pumpHistoryMountWaveArbiter();
+};
+// Scroll-seek placeholders replace itemContent wholesale, so during seek the
+// DOM contains no shell rows at all. A wave that consulted that DOM would
+// declare itself drained on nothing — and seek exit would then mount every
+// real card in one giant commit, resurrecting the exact long task the wave
+// removes. Waves pause while seek is on and resume on these exit signals.
+const historySeekExitListeners = new Set<() => void>();
+const notifyHistorySeekExit = (): void => {
+  for (const listener of [...historySeekExitListeners]) {
+    historySeekExitListeners.delete(listener);
+    try { listener(); } catch { /* wave resume is best-effort */ }
+  }
+};
 
 
 function HistoryPanel({
@@ -7814,6 +7919,7 @@ function HistoryPanel({
   inputBusy = false,
   onControlsHeightChange,
   suppressGlobalHotkeys = false,
+  staleOwnerCurtain = false,
 }: HistoryPanelProps) {
   // Live input surface of the tab in BOTH agent layouts. Everything that makes
   // History the place the user types into — availability published to grab /
@@ -8564,6 +8670,46 @@ function HistoryPanel({
     layout: ReturnType<typeof getHistoryMeasuredLayout>;
     avgRowHeight: number | null;
   } | null>(null);
+  // ===== Mount wave (see the module-level arbiter for the why) =====
+  // Render-driving state is REAL state, not a ref: each step's upgrade set is
+  // committed inside startTransition, so an urgent render racing the
+  // transition (a keystroke, a click) still sees the previous committed set
+  // and cannot be tricked into mounting the whole batch at urgent priority —
+  // the exact hazard of mutating a ref and "publishing" it via transition.
+  const [mountWaveRenderState, setMountWaveRenderState] = useState<{
+    visitKey: string;
+    realUuids: Set<string>;
+    done: boolean;
+  }>({ visitKey: '', realUuids: new Set(), done: true });
+  // Non-render mechanics: which rows are wave-eligible (a snapshot of the
+  // rows that existed when the visit mounted — live rows streaming in later
+  // are NEVER shelled, they render real immediately), the per-index height
+  // resolver, and step accounting.
+  const mountWaveMetaRef = useRef<{
+    visitKey: string;
+    shellUuids: Set<string>;
+    heightLookup: (index: number) => number;
+    heightsFrom: 'measured' | 'avg';
+    startedAt: number;
+    steps: number;
+    upgraded: number;
+    maxStepMs: number;
+    batchSize: number;
+    stepStartedAt: number;
+    pendingStepUuids: string[] | null;
+    keepBottom: boolean;
+    loggedStart: boolean;
+    bankedDone: boolean;
+  } | null>(null);
+  const mountWaveLaneRef = useRef<HistoryMountWaveLane | null>(null);
+  const mountWaveStepRef = useRef<() => void>(() => {});
+  if (!mountWaveLaneRef.current) {
+    mountWaveLaneRef.current = {
+      wants: false,
+      visible: () => !!virtuosoScrollerRef.current?.isConnected,
+      run: () => mountWaveStepRef.current(),
+    };
+  }
   const restoredLayoutVisitKey = historyOwnerKey + ':' + historyOwnerVisit;
   if (restoredLayoutLatchRef.current?.visitKey !== restoredLayoutVisitKey) {
     restoredLayoutLatchRef.current = {
@@ -8601,7 +8747,63 @@ function HistoryPanel({
         + ' ranges=' + latch.layout.ranges.length
         + ' scrollTop=' + Math.round(latch.layout.scrollTop));
     }
+    // Seed the mount wave for this visit, in the SAME render that mounts the
+    // list — the first list commit must already render shells, not real
+    // cards, or the whole point (no giant takeover commit) is lost. Only the
+    // rows present at mount are eligible: anything streaming in later has no
+    // stored height and belongs to the live path.
+    const abandonedWave = mountWaveMetaRef.current;
+    if (abandonedWave && abandonedWave.loggedStart && !abandonedWave.bankedDone
+      && abandonedWave.visitKey !== restoredLayoutVisitKey) {
+      // The owner left mid-wave (A→B before A finished hydrating). Nothing
+      // needs cleanup — every stale step is dropped by the visit-key guards —
+      // but the abandonment must be visible in the log, or E2E cannot tell
+      // "wave cancelled correctly" from "wave finished".
+      historyDiag('MOUNT_WAVE_CANCEL tab=' + tabId.slice(-12)
+        + ' visit=' + abandonedWave.visitKey.slice(-14)
+        + ' upgraded=' + abandonedWave.upgraded
+        + ' steps=' + abandonedWave.steps);
+    }
+    mountWaveMetaRef.current = {
+      visitKey: restoredLayoutVisitKey,
+      shellUuids: new Set(displayEntries.map((entry) => entry.uuid)),
+      heightLookup: createHistoryRowHeightLookup(
+        storedLayout,
+        latch.avgRowHeight ?? HISTORY_DEFAULT_ROW_HEIGHT_PX,
+      ),
+      heightsFrom: storedLayout ? 'measured' : 'avg',
+      startedAt: performance.now(),
+      steps: 0,
+      upgraded: 0,
+      maxStepMs: 0,
+      batchSize: 1,
+      stepStartedAt: 0,
+      pendingStepUuids: null,
+      keepBottom: false,
+      loggedStart: false,
+      bankedDone: false,
+    };
   }
+  // Adjust-during-render for the wave's render state: the visit key changed
+  // (new owner or new return), so the previous visit's upgrade set must not
+  // leak real cards into this visit's first commit.
+  if (mountWaveRenderState.visitKey !== restoredLayoutVisitKey) {
+    setMountWaveRenderState({
+      visitKey: restoredLayoutVisitKey,
+      realUuids: new Set(),
+      done: false,
+    });
+  }
+  const mountWaveActive =
+    !mountWaveRenderState.done
+    && mountWaveMetaRef.current?.visitKey === restoredLayoutVisitKey;
+  // Callbacks (geometry savers, seek suppressor) read the live value.
+  const mountWaveActiveRef = useRef(mountWaveActive);
+  mountWaveActiveRef.current = mountWaveActive;
+  const mountWaveRenderStateRef = useRef(mountWaveRenderState);
+  mountWaveRenderStateRef.current = mountWaveRenderState;
+  const restoredLayoutVisitKeyRef = useRef(restoredLayoutVisitKey);
+  restoredLayoutVisitKeyRef.current = restoredLayoutVisitKey;
   const restoredMeasuredLayout = restoredLayoutLatchRef.current.layout;
   const historyDefaultRowHeight =
     restoredLayoutLatchRef.current.avgRowHeight ?? HISTORY_DEFAULT_ROW_HEIGHT_PX;
@@ -8891,7 +9093,11 @@ function HistoryPanel({
       CSS_HL?.delete('hp-search');
       CSS_HL?.delete('hp-search-current');
     };
-  }, [searchQuery, matchPositions, currentMatchIdx, displayEntries]);
+    // mountWaveRenderState: highlights walk DOM text nodes, and a mount-wave
+    // shell has none — each upgrade step must re-walk so matches inside
+    // freshly hydrated rows get painted (the match COUNTER is data-driven and
+    // was always right; only the paint needs the re-run).
+  }, [searchQuery, matchPositions, currentMatchIdx, displayEntries, mountWaveRenderState]);
 
   // Ctrl+F handler — scoped to history panel
   useEffect(() => {
@@ -10553,11 +10759,46 @@ function HistoryPanel({
       // takeover (highlight, cached rows, restored position) clean of IPC and
       // heavy merges; a live session's tail events still arrive through the
       // transcript-changed subscription regardless of this initial check.
+      //
+      // Probe-first: "did anything change?" is a stats-only question, but the
+      // old path asked it through the FULL get-full-history pipeline — main
+      // resolved the whole 59MB chain to answer "unchanged" (821-1292ms wall
+      // per switch under the switch-window IPC storm, live 05.08 15:29, felt
+      // as a train of 150-250ms input stalls while moving the cursor). The
+      // cheap probe answers from file stats; only a real change or a missing
+      // revision escalates to the heavy load. Claude-only: codex's own
+      // unchanged path already answers in ~50ms.
       let refreshRaf2 = 0;
       const refreshRaf1 = requestAnimationFrame(() => {
         refreshRaf2 = requestAnimationFrame(() => {
           if (historyOwnerKeyRef.current !== historyOwnerKey) return;
-          void loadHistory(true);
+          const revisionForProbe = toolType === 'claude' ? historyRevisionRef.current : null;
+          if (!revisionForProbe) {
+            void loadHistory(true);
+            return;
+          }
+          const probeStartedAt = Date.now();
+          void ipcRenderer.invoke('claude:validate-full-history-revision', {
+            sessionId,
+            cwd,
+            tabId,
+            revision: revisionForProbe,
+          }).then((probe: any) => {
+            if (historyOwnerKeyRef.current !== historyOwnerKey) return;
+            if (probe?.success && probe.unchanged === true
+              // A newer revision means a full load landed while the probe ran
+              // — its answer describes a stale question.
+              && historyRevisionRef.current === revisionForProbe) {
+              historyDiag('LOAD_FRESH_PROBE tab=' + tabId.slice(-12)
+                + ' session=' + sessionId.slice(0, 8)
+                + ' unchanged=1 elapsedMs=' + (Date.now() - probeStartedAt));
+              return;
+            }
+            void loadHistory(true);
+          }).catch(() => {
+            if (historyOwnerKeyRef.current !== historyOwnerKey) return;
+            void loadHistory(true);
+          });
         });
       });
       // Cancellation lives in the shared cleanup below via the owner guard —
@@ -10783,6 +11024,13 @@ function HistoryPanel({
       if (historyRestoreInFlightRef.current === restoreToken) {
         historyRestoreInFlightRef.current = 0;
       }
+      // While the mount wave still renders shells, Virtuoso's state would
+      // bank SHELL heights as if they were card measurements — for an
+      // avg-estimated wave that poisons the store the persistence layer then
+      // faithfully keeps across restarts. Whichever of {restore, wave}
+      // finishes LAST does the one full save; the wave-done step checks the
+      // restore token the same way this checks the wave.
+      if (mountWaveActiveRef.current) return;
       const layoutItems = lengthRef.current;
       try {
         virtuosoRef.current?.getState((snapshot) => {
@@ -11265,6 +11513,214 @@ function HistoryPanel({
       historySeekSuppressors.delete(suppressor);
     };
   }, []);
+
+  // ===== Mount wave: step machine =====
+  // One step = pick the topmost mounted shell in (or nearest to) the
+  // viewport, upgrade it to its real card in a startTransition commit, and
+  // only after that commit is OBSERVED (layout effect + the arbiter's next
+  // frame) ask for the next step. The explicit commit-ack is what keeps the
+  // steps as SEPARATE tasks — React batches concurrent transitions, so a
+  // free-running loop of transitions merges back into the single giant
+  // commit this exists to break up.
+  mountWaveStepRef.current = () => {
+    const meta = mountWaveMetaRef.current;
+    const lane = mountWaveLaneRef.current;
+    if (!meta || !lane) { historyDiag('MOUNT_WAVE_SKIP reason=no-meta'); return; }
+    if (meta.visitKey !== restoredLayoutVisitKeyRef.current) {
+      historyDiag('MOUNT_WAVE_SKIP reason=visit meta=' + meta.visitKey.slice(-10)
+        + ' now=' + restoredLayoutVisitKeyRef.current.slice(-10));
+      return;
+    }
+    const renderState = mountWaveRenderStateRef.current;
+    if (renderState.done || renderState.visitKey !== meta.visitKey) {
+      historyDiag('MOUNT_WAVE_SKIP reason=render-state done=' + (renderState.done ? 1 : 0)
+        + ' rs=' + renderState.visitKey.slice(-10));
+      return;
+    }
+    if (meta.pendingStepUuids) return; // a step is already in flight
+    // Scroll-seek replaces every row with its own placeholder — the DOM has
+    // no shells to count, and "no shells" must not read as "wave drained"
+    // (seek exit would then mount the whole viewport in one giant commit).
+    if (historyScrollSeekActive) {
+      historySeekExitListeners.add(() => requestHistoryMountWaveStep(lane));
+      return;
+    }
+    const scroller = virtuosoScrollerRef.current;
+    if (!scroller || !scroller.isConnected) return; // list gone; start effect re-arms
+    const shellNodes = scroller.querySelectorAll(
+      `[data-history-mount-shell][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
+    );
+    if (shellNodes.length === 0) {
+      // Zero shells is only "drained" when rows are actually MOUNTED. The
+      // step's first run races Virtuoso's own multi-frame init: the arm
+      // fires when the scroller attaches, but the row window can still be
+      // empty — and treating that emptiness as done flipped every row to
+      // real before any had mounted, restoring the exact one-giant-commit
+      // this wave exists to prevent (live 05.08 04:38: DONE upgraded=0 on a
+      // 2618-row visit, then all visible rows mounted real at once). An
+      // empty window waits; rangeChanged re-arms when rows land.
+      const anyOwnerRows = scroller.querySelectorAll(
+        `[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
+      ).length;
+      if (anyOwnerRows === 0) return;
+      // Every MOUNTED shell is upgraded. Flip the rest in one commit: they
+      // are unmounted (outside the render window), so the flip costs nothing
+      // now, and rows mounting later render real directly.
+      historyDiag('MOUNT_WAVE_DONE tab=' + tabId.slice(-12)
+        + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current)
+        + ' rows=' + meta.shellUuids.size
+        + ' upgraded=' + meta.upgraded
+        + ' steps=' + meta.steps
+        + ' maxStepMs=' + Math.round(meta.maxStepMs)
+        + ' elapsedMs=' + Math.round(performance.now() - meta.startedAt)
+        + ' heights=' + meta.heightsFrom);
+      startTransition(() => {
+        setMountWaveRenderState((prev) => (
+          prev.visitKey === meta.visitKey ? { ...prev, done: true } : prev
+        ));
+      });
+      return;
+    }
+    const scrollerRect = scroller.getBoundingClientRect();
+    let candidates = Array.from(shellNodes).map((node) => {
+      const rect = (node as HTMLElement).getBoundingClientRect();
+      return {
+        uuid: (node as HTMLElement).getAttribute('data-uuid') || '',
+        top: rect.top,
+        bottom: rect.bottom,
+      };
+    }).filter((row) => row.uuid);
+    const targets: string[] = [];
+    // A Timeline jump aimed at a still-shell row hydrates first: its
+    // convergence loop refuses to declare the jump done on a shell, so the
+    // wave owes it the real card before anything else.
+    const jumpUuid = historyScrollInFlightRef.current?.uuid;
+    if (jumpUuid && candidates.some((row) => row.uuid === jumpUuid)) {
+      targets.push(jumpUuid);
+      candidates = candidates.filter((row) => row.uuid !== jumpUuid);
+    }
+    while (targets.length < meta.batchSize && candidates.length > 0) {
+      const picked = pickHistoryMountWaveTarget(
+        candidates,
+        { top: scrollerRect.top, bottom: scrollerRect.bottom },
+      );
+      if (!picked) break;
+      targets.push(picked);
+      candidates = candidates.filter((row) => row.uuid !== picked);
+    }
+    if (targets.length === 0) return;
+    meta.stepStartedAt = performance.now();
+    meta.pendingStepUuids = targets;
+    // Tail-pin capture BEFORE the commit: an exact-height shell swap should
+    // not move the tail, but sub-pixel rounding across many rows can drift
+    // it — same protection the Timeline expand wave uses.
+    meta.keepBottom = isHistoryTailPinned(scroller);
+    if (!meta.loggedStart) {
+      meta.loggedStart = true;
+      historyDiag('MOUNT_WAVE_START tab=' + tabId.slice(-12)
+        + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current)
+        + ' rows=' + meta.shellUuids.size
+        + ' mountedShells=' + shellNodes.length
+        + ' heights=' + meta.heightsFrom);
+    }
+    const endMark = markRendererActivity('history-mount-wave:' + tabId.slice(-8));
+    requestAnimationFrame(() => endMark());
+    startTransition(() => {
+      setMountWaveRenderState((prev) => {
+        if (prev.visitKey !== meta.visitKey || prev.done) return prev;
+        const nextReal = new Set(prev.realUuids);
+        for (const uuid of targets) nextReal.add(uuid);
+        return { ...prev, realUuids: nextReal };
+      });
+    });
+  };
+
+  // Wave lifecycle: register the lane, start the wave on the commit that
+  // mounts the shell list, acknowledge each step's commit, and bank geometry
+  // once at wave-done (unless a restore hunt still owns the scroller — then
+  // its settle does the one save; see settleRestoreAndBankGeometry).
+  useEffect(() => {
+    const lane = mountWaveLaneRef.current;
+    if (!lane) return;
+    historyMountWaveLanes.add(lane);
+    return () => {
+      historyMountWaveLanes.delete(lane);
+    };
+  }, []);
+  useLayoutEffect(() => {
+    const meta = mountWaveMetaRef.current;
+    const lane = mountWaveLaneRef.current;
+    if (!meta || !lane || meta.visitKey !== mountWaveRenderState.visitKey) return;
+    if (mountWaveRenderState.done) {
+      // Bank geometry exactly once per visit, at the drain commit. Later
+      // re-runs of this effect (live appends change other deps) must not
+      // re-save, and a restore hunt still holding the scroller owns the one
+      // save instead (its settle checks the wave flag symmetrically).
+      if (meta.bankedDone) return;
+      meta.bankedDone = true;
+      meta.pendingStepUuids = null;
+      if (historyRestoreInFlightRef.current) return;
+      const layoutKey = historyOwnerKeyRef.current;
+      const layoutItems = lengthRef.current;
+      try {
+        virtuosoRef.current?.getState((snapshot) => {
+          if (historyOwnerKeyRef.current !== layoutKey) return;
+          const saved = saveHistoryMeasuredLayout(layoutKey, snapshot as any, layoutItems);
+          if (saved) {
+            historyDiag('LAYOUT_SAVE tab=' + tabId.slice(-12)
+              + ' owner=' + historyOwnerDigest(layoutKey)
+              + ' ranges=' + ((snapshot as any)?.ranges?.length ?? 0)
+              + ' items=' + layoutItems
+              + ' at=wave-done');
+          }
+        });
+      } catch { /* geometry is optional */ }
+      return;
+    }
+    if (meta.pendingStepUuids) {
+      // This effect re-runs on unrelated commits too (live appends change
+      // deps). Only the commit that actually CONTAINS the step's upgrade set
+      // acknowledges the step — anything else is not our transition landing.
+      const landed = meta.pendingStepUuids.every(
+        (uuid) => mountWaveRenderState.realUuids.has(uuid),
+      );
+      if (!landed) return;
+      const stepMs = performance.now() - meta.stepStartedAt;
+      meta.steps += 1;
+      meta.upgraded += meta.pendingStepUuids.length;
+      meta.maxStepMs = Math.max(meta.maxStepMs, stepMs);
+      meta.pendingStepUuids = null;
+      // One unknown row first; grow to 3 only while steps stay cheap, drop
+      // back to 1 the moment a step blows the budget (a monster markdown/diff
+      // card) — the audit's hard requirement, since three ordinary visible
+      // rows measured 726ms in one commit.
+      if (stepMs > 50) meta.batchSize = 1;
+      else if (stepMs < 24) meta.batchSize = Math.min(3, meta.batchSize + 1);
+      // Tail re-pin after the step — but never while a restore convergence
+      // loop owns the scroller (it re-jumps every frame itself; two writers
+      // is the exact fight the restore token exists to prevent).
+      if (meta.keepBottom && !historyRestoreInFlightRef.current) {
+        const scroller = virtuosoScrollerRef.current;
+        if (scroller && !isHistoryTailPinned(scroller)) {
+          scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
+        }
+      }
+      requestHistoryMountWaveStep(lane);
+      return;
+    }
+    // No step in flight, wave not done: (re-)arm. Covers the first eligible
+    // commit of the visit (shells just mounted) and any later commit that
+    // finds the wave stalled (seek pause whose exit listener was lost to an
+    // owner switch, HMR replay). Re-arming while idle is harmless — the step
+    // itself no-ops when nothing needs doing.
+    if (virtuosoScrollerRef.current?.isConnected) {
+      historyDiag('MOUNT_WAVE_ARM tab=' + tabId.slice(-12)
+        + ' visit=' + mountWaveRenderState.visitKey.slice(-10));
+      requestHistoryMountWaveStep(lane);
+    } else {
+      historyDiag('MOUNT_WAVE_ARM_SKIP tab=' + tabId.slice(-12) + ' scroller=none');
+    }
+  }, [mountWaveRenderState, mountWaveActive, surfaceLoading, displayEntries.length, tabId]);
   useEffect(() => {
     // React StrictMode and Fast Refresh both run cleanup before installing the
     // same effect again while preserving refs. Re-arm the liveness proof in
@@ -11474,11 +11930,17 @@ function HistoryPanel({
       }
       if (node && scroller) {
         sawNode = true;
+        // A mount-wave shell is a stable wrapper with NO content — declaring
+        // the jump done on it would flash an empty bar and clear Timeline's
+        // pending state against nothing. The wave hydrates the jump target
+        // with top priority (see the step machine); keep converging until
+        // the row is real, the stability check below then passes on it.
+        const isShell = node.hasAttribute('data-history-mount-shell');
         // Offset of the row relative to the scroller's own viewport — immune to
         // the panel's slide-in transform (both translate together), so this only
         // moves when the INTERNAL scroll position is still settling.
         const top = node.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
-        if (lastTop !== null && Math.abs(top - lastTop) < 1) stable++; else stable = 0;
+        if (!isShell && lastTop !== null && Math.abs(top - lastTop) < 1) stable++; else stable = 0;
         lastTop = top;
         // Mounted + position unchanged for 2 consecutive frames, after at least
         // a few scrollToIndex calls → Virtuoso has settled on the target row.
@@ -11602,6 +12064,10 @@ function HistoryPanel({
       // at owner teardown, where the request is dropped silently. Scroll-idle
       // is also the moment the geometry is most complete: whatever the user
       // just scrolled past has been measured for real.
+      // Not during a mount wave: rows the user scrolled past mid-wave are
+      // shells sized from the per-owner AVERAGE, and banking those as
+      // measurements poisons the persisted store. Wave-done saves instead.
+      if (mountWaveActiveRef.current) return;
       const layoutKey = historyOwnerKeyRef.current;
       const layoutItems = lengthRef.current;
       try {
@@ -11990,6 +12456,32 @@ function HistoryPanel({
 
       {/* Content */}
       <div data-history-content-stage style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+        {/* Deferred-handoff curtain: the workspace highlight already moved to
+            the next tab, but this frozen instance still shows the previous
+            owner's rows for a couple of frames. Cover them with the panel's
+            loader so the surface never displays a transcript the selected tab
+            does not own. Above rows and the viewport loader (z 5), below the
+            background chips bar (z 7). */}
+        {staleOwnerCurtain && (
+          <div
+            data-history-stale-curtain
+            style={{
+              position: 'absolute',
+              inset: 0,
+              zIndex: 6,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 8,
+              background: '#151515',
+              color: '#818cf8',
+              fontSize: 13,
+            }}
+          >
+            <HistorySpinner size={16} />
+            Loading...
+          </div>
+        )}
         <HistoryPayloadContext.Provider value={historyPayloadContextValue}>
         <HistoryBackgroundLiveContext.Provider value={liveBackgroundUuids}>
         {/* The two extra conditions skip mounting the list during commits
@@ -12077,6 +12569,14 @@ function HistoryPanel({
                 prev.removeEventListener('wheel', handleHistoryToolWheel, true);
               }
               virtuosoScrollerRef.current = el as HTMLElement | null;
+              if (el && mountWaveActiveRef.current && mountWaveLaneRef.current) {
+                // Virtuoso attaches the scroller AFTER the panel's own layout
+                // effects on a fresh mount, so the effect-driven arm saw
+                // scroller=none and nothing re-armed (live 05.08 04:36: six
+                // shells frozen, zero steps). This callback IS the "scroller
+                // now exists" signal — arm here, event-driven, no timers.
+                requestHistoryMountWaveStep(mountWaveLaneRef.current);
+              }
               if (el) {
                 const scroller = el as HTMLElement;
                 scroller.addEventListener('scroll', handleScroll, { passive: true });
@@ -12091,6 +12591,12 @@ function HistoryPanel({
             }}
             rangeChanged={(range) => {
               visibleRangeRef.current = { start: range.startIndex, end: range.endIndex };
+              if (mountWaveActiveRef.current && mountWaveLaneRef.current) {
+                // Range publications are the other "rows are mounted now"
+                // signal — covers restores/jumps that mount a NEW set of
+                // shells after the initial arm already drained its queue.
+                requestHistoryMountWaveStep(mountWaveLaneRef.current);
+              }
               const viewportPaintOwner: HistoryViewportPaintOwner = {
                 key: historyOwnerKey,
                 generation: historyOwnerGenerationRef.current,
@@ -12103,11 +12609,16 @@ function HistoryPanel({
                 const generationAtRange = historyOwnerGenerationRef.current;
                 viewportPaintProbeRef.current?.start(
                   viewportPaintOwner,
+                  // A mount-wave shell is a real WRAPPER but not real CONTENT
+                  // — declaring the viewport ready on one would drop the
+                  // loader over placeholder bars and (worse) release the
+                  // Timeline gate for a surface that has painted nothing.
+                  // Readiness means at least one REAL card of this owner.
                   () => (
                     historyOwnerKeyRef.current === ownerAtRange
                     && historyOwnerGenerationRef.current === generationAtRange
                     && !!virtuosoScrollerRef.current?.querySelector(
-                      `[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
+                      `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
                     )
                   ),
                   () => {
@@ -12143,8 +12654,12 @@ function HistoryPanel({
                       historyOwnerKeyRef.current !== ownerAtRange
                       || historyOwnerGenerationRef.current !== generationAtRange
                     ) return false;
+                    // Same real-content requirement as the viewport probe: a
+                    // mount-wave shell must not produce SURFACE_PRESENTED —
+                    // Timeline replays this proof and would hydrate against a
+                    // surface of placeholder bars.
                     const row = virtuosoScrollerRef.current?.querySelector(
-                      `[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
+                      `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
                     ) as HTMLElement | null;
                     if (!row) return false;
                     // Being IN the markup is not being ON the screen. Under load
@@ -12225,6 +12740,11 @@ function HistoryPanel({
                     // are not a baseline worth keeping, and the hunt's own
                     // settle banks the real one.
                     if (historyRestoreInFlightRef.current) return;
+                    // Mid-wave the list is mostly shells; their heights are
+                    // real only when they came FROM the store. Snapshotting
+                    // now would bank avg-estimated shells as measurements —
+                    // the wave-done step does the baseline save instead.
+                    if (mountWaveActiveRef.current) return;
                     try {
                       virtuosoRef.current?.getState((snapshot) => {
                         if (historyOwnerKeyRef.current !== ownerAtRange) return;
@@ -12304,10 +12824,46 @@ function HistoryPanel({
               // or without compact (rebuild / Stop / Esc / SSE crash).
               const isChainBreakZone =
                 claudeMemoryBoundaryIndex >= 0 && _idx <= claudeMemoryBoundaryIndex;
+              // Mount wave: rows that existed at visit mount render an
+              // exact-height shell until their upgrade step commits. Rows
+              // NOT in the shell set (streamed in during the wave) render
+              // real immediately. The wrapper stays the real one either way
+              // — context menu, uuid identity and tint are never deferred.
+              const waveMeta = mountWaveMetaRef.current;
+              const asShell =
+                mountWaveActive
+                && waveMeta?.visitKey === restoredLayoutVisitKey
+                && waveMeta.shellUuids.has(presentedEntry.uuid)
+                && !mountWaveRenderState.realUuids.has(presentedEntry.uuid);
+              if (asShell && waveMeta) {
+                return (
+                  <div
+                    data-uuid={presentedEntry.uuid}
+                    data-history-row-owner={historyOwnerDomId}
+                    data-history-mount-shell="1"
+                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType)}
+                    style={{
+                      paddingTop: 4,
+                      paddingBottom: 4,
+                      // The wrapper adds 8px vertical padding around the
+                      // card; the stored size is the WRAPPER's measured
+                      // height, so the inner body gets size minus padding —
+                      // giving the wrapper exactly the stored pixels.
+                      height: waveMeta.heightLookup(_idx),
+                      boxSizing: 'border-box',
+                      overflow: 'hidden',
+                      backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    }}
+                  >
+                    <HistoryMountShellBody index={_idx} />
+                  </div>
+                );
+              }
               return (
                 <div
                   data-uuid={presentedEntry.uuid}
                   data-history-row-owner={historyOwnerDomId}
+                  data-history-row-real="1"
                   data-history-live-entry={presentedEntry.liveProjection ? '1' : undefined}
                   data-history-durable-source={
                     !presentedEntry.liveProjection

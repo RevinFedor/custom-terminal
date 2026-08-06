@@ -216,6 +216,13 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
         claudeSessionId: 'phase2-target-session',
         cwd: '/tmp/noted-phase2-project',
       },
+      {
+        tabId: 'phase2-codex-target-tab',
+        name: 'Codex target',
+        commandType: 'codex',
+        codexSessionId: 'phase2-codex-session',
+        cwd: '/tmp/noted-phase2-project',
+      },
     ],
   }, {
     id: '__noted_inbox__',
@@ -262,10 +269,11 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
   };
   const isInboxTab = (tabId) => tabId.startsWith('phase2-inbox')
     || tabId.startsWith('__noted_inbox__-tab-external-');
+  const isCodexTab = (tabId) => isInboxTab(tabId) || tabId === 'phase2-codex-target-tab';
   const readyStatus = (tabId) => ({
     tabId,
-    toolType: isInboxTab(tabId) ? 'codex' : 'claude',
-    commandType: isInboxTab(tabId) ? 'codex' : 'claude',
+    toolType: isCodexTab(tabId) ? 'codex' : 'claude',
+    commandType: isCodexTab(tabId) ? 'codex' : 'claude',
     status: 'active',
     sessionStatus: 'active',
     inputReady: true,
@@ -274,6 +282,8 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       ? 'phase2-source-session'
       : isInboxTab(tabId)
         ? 'phase2-inbox-session'
+        : tabId === 'phase2-codex-target-tab'
+          ? 'phase2-codex-session'
         : 'phase2-target-session',
     lifecycleGeneration: 'phase2-life:' + tabId,
     writerConfirmed: isInboxTab(tabId),
@@ -378,6 +388,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       generation: 1,
       startedAt: Date.now(),
     }),
+    agentSendBridgeTimeoutMs: 30,
   };
   try {
     delete require.cache[require.resolve('./web-server')];
@@ -437,6 +448,156 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
   const scenarioPayload = (handoffId) => controller.calls.findLast((call) => (
     call.action === 'sendAgentPromptScenario' && call.payload?.handoffId === handoffId
   ))?.payload || null;
+
+  await t.test('provider-model mismatch is rejected before a durable run or empty target exists', async () => {
+    const runId = 'phase2-provider-model-new-target';
+    const createsBefore = controller.createAgentTabCalls;
+    const sendsBefore = scenarioSendCount();
+    const response = await api('/api/orchestrations', {
+      runId,
+      sourceTabId: 'phase2-source-tab',
+      targetProjectId: 'phase2-project',
+      toolType: 'claude',
+      model: 'gpt-5.6-luna',
+      prompt: 'must never create or submit',
+      notifySource: false,
+    });
+    const absentRun = await api('/api/orchestrations/' + runId);
+
+    assert.deepEqual({
+      status: response.status,
+      code: response.body.code,
+      creates: controller.createAgentTabCalls - createsBefore,
+      sends: scenarioSendCount() - sendsBefore,
+      runStatus: absentRun.status,
+    }, {
+      status: 400,
+      code: 'agent_model_provider_mismatch',
+      creates: 0,
+      sends: 0,
+      runStatus: 404,
+    });
+  });
+
+  await t.test('direct tab creation and Inbox reject a foreign model before creating a target', async () => {
+    const createsBefore = controller.createAgentTabCalls;
+    const directCreate = await api('/api/projects/phase2-project/agent-tabs', {
+      toolType: 'claude',
+      model: 'gpt-5.6-luna',
+      name: 'must not exist',
+    });
+    const inbox = await api('/api/inbox/runs', {
+      provider: 'codex',
+      model: 'claude-opus-5[1m]',
+      prompt: 'must not create an Inbox target',
+      runId: 'phase2-provider-model-inbox',
+    });
+    assert.deepEqual({
+      directStatus: directCreate.status,
+      directCode: directCreate.body.code,
+      inboxStatus: inbox.status,
+      inboxCode: inbox.body.code,
+      creates: controller.createAgentTabCalls - createsBefore,
+    }, {
+      directStatus: 400,
+      directCode: 'agent_model_provider_mismatch',
+      inboxStatus: 400,
+      inboxCode: 'agent_model_provider_mismatch',
+      creates: 0,
+    });
+  });
+
+  await t.test('existing target provider cannot be contradicted by orchestration metadata', async () => {
+    const runId = 'phase2-provider-target-conflict';
+    const sendsBefore = scenarioSendCount();
+    const response = await api('/api/orchestrations', {
+      runId,
+      sourceTabId: 'phase2-source-tab',
+      targetTabId: 'phase2-target-tab',
+      provider: 'codex',
+      prompt: 'must not submit to a Claude target',
+      notifySource: false,
+    });
+    const absentRun = await api('/api/orchestrations/' + runId);
+    assert.equal(response.status, 400);
+    assert.equal(response.body.code, 'agent_target_provider_mismatch');
+    assert.equal(absentRun.status, 404);
+    assert.equal(scenarioSendCount(), sendsBefore);
+  });
+
+  await t.test('existing target send rejects a known foreign model before restore or scenario dispatch', async () => {
+    const sendsBefore = scenarioSendCount();
+    const response = await api('/api/terminal-tabs/phase2-target-tab/send', {
+      prompt: 'must not submit',
+      model: 'gpt-5.6-luna',
+      handoffId: 'phase2-provider-model-existing-target',
+    });
+    assert.equal(response.status, 400);
+    assert.equal(response.body.code, 'agent_model_provider_mismatch');
+    assert.equal(scenarioSendCount(), sendsBefore);
+  });
+
+  await t.test('known matching Codex model reaches an existing Codex target', async () => {
+    const handoffId = 'phase2-provider-model-codex-valid';
+    controller.sendResponder = async () => ({
+      success: true,
+      submitted: true,
+      accepted: true,
+    });
+    const response = await api('/api/terminal-tabs/phase2-codex-target-tab/send', {
+      prompt: 'valid Codex request',
+      model: 'gpt-5.6-luna',
+      handoffId,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(scenarioSendCount(handoffId), 1);
+    assert.equal(scenarioPayload(handoffId)?.model, 'gpt-5.6-luna');
+  });
+
+  await t.test('semantic pre-submit failure remains exact before, on, and after the bridge deadline', async () => {
+    const cases = [
+      { suffix: 'before', delayMs: 0, initialStatus: 409 },
+      { suffix: 'boundary', delayMs: 30, initialStatus: null },
+      { suffix: 'after', delayMs: 60, initialStatus: 202 },
+    ];
+    for (const item of cases) {
+      const runId = `phase2-late-semantic-${item.suffix}`;
+      const exactError = `exact-pre-submit-${item.suffix}`;
+      controller.sendResponder = async () => {
+        if (item.delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, item.delayMs));
+        }
+        return {
+          success: false,
+          submitted: false,
+          accepted: false,
+          code: 'agent_model_apply_failed',
+          error: exactError,
+        };
+      };
+      const response = await api('/api/orchestrations', {
+        runId,
+        sourceTabId: 'phase2-source-tab',
+        targetTabId: 'phase2-target-refusal-tab',
+        prompt: `deadline matrix ${item.suffix}`,
+        queue: false,
+        notifySource: false,
+      });
+      if (item.initialStatus === null) {
+        assert.ok(response.status === 202 || response.status === 409,
+          'an exact deadline tie may be observed by either event-loop callback');
+      } else {
+        assert.equal(response.status, item.initialStatus);
+      }
+      const failed = await waitFor(async () => {
+        const state = await api('/api/orchestrations/' + runId);
+        return state.body.run?.status === 'failed' ? state : null;
+      }, `late semantic receipt did not settle ${item.suffix}`);
+      assert.equal(failed.body.run.error, exactError);
+      assert.equal(Boolean(failed.body.run.deliveryAcceptedAt), false);
+      assert.equal(scenarioSendCount('orchestration:' + runId), 1);
+    }
+  });
 
   await t.test('F4 strongest counterexample: submitted:false remains a retryable HTTP 409', async () => {
     controller.sendResponder = async () => ({

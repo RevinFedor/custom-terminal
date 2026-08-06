@@ -123,6 +123,9 @@ const srcSharedDir = path.join(__dirname, '..', '..', 'src', 'shared');
 const {
   TaskCompletionIntentRegistry,
 } = require(path.join(srcMainDir, 'task-completion-intent'));
+const {
+  assertAgentProviderModel,
+} = require(path.join(srcMainDir, 'agent-provider-model-contract'));
 const taskCompletionIntents = new TaskCompletionIntentRegistry();
 const { createXtermWritePump } = require(path.join(srcSharedDir, 'xterm-write-pump.cjs'));
 const {
@@ -278,6 +281,26 @@ const {
   shouldSerializeManualPtyInput,
 } = require(path.join(srcMainDir, 'pty-input-ownership'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
+const { ProjectPromptCatalogService } = require(path.join(srcMainDir, 'project-prompt-catalog'));
+const { buildPromptMenuTemplate } = require(path.join(srcMainDir, 'prompt-menu-template'));
+const projectPromptsIpc = require(path.join(srcMainDir, 'ipc', 'project-prompts'));
+const projectPromptCatalog = new ProjectPromptCatalogService({
+  db: projectManager.db,
+  layoutStore: sharedFileLayoutStore,
+  onChanged: projectPromptsIpc.broadcastProjectPromptsChanged,
+});
+const { GtEditorTransferClient } = require(path.join(srcMainDir, 'gt-editor-transfer-client'));
+const gtEditorTransferClient = new GtEditorTransferClient({
+  clipboard,
+  db: projectManager.db,
+  projectPromptCatalog,
+  broadcast: (transfer) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win || win.isDestroyed() || win.webContents?.isDestroyed()) continue;
+      try { win.webContents.send('gt-editor-transfer:committed', transfer); } catch {}
+    }
+  },
+});
 const agentSendReceiptStore = createAgentSendReceiptStore(projectManager.db.db);
 const agentSendReceiptStartupReconcile = agentSendReceiptStore.reconcileStartup();
 if (agentSendReceiptStartupReconcile.changed > 0) {
@@ -11430,47 +11453,31 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 
   template.push({ type: 'separator' });
 
-  // Add Insert Prompt submenu (with group support)
-  if (prompts && prompts.length > 0) {
-    let promptGroups = [];
-    try { promptGroups = projectManager.getPromptGroups(); } catch (e) {}
-
-    const promptsSubmenu = [];
-
-    // Build flat order: groups and ungrouped prompts interleaved by position
-    const flatItems = [];
-    promptGroups.forEach(g => flatItems.push({ type: 'group', group: g, pos: g.position }));
-    prompts.filter(p => !p.group_id).forEach(p => flatItems.push({ type: 'prompt', prompt: p, pos: p.position }));
-    flatItems.sort((a, b) => a.pos - b.pos);
-
-    const buildInsertData = (p) => {
-      return { content: p.content, filePaths: (p.file_paths && p.file_paths.length > 0) ? p.file_paths : [] };
-    };
-
-    flatItems.forEach(item => {
-      if (item.type === 'group') {
-        const groupPrompts = prompts.filter(p => p.group_id === item.group.id);
-        promptsSubmenu.push({
-          label: item.group.name,
-          submenu: groupPrompts.length > 0
-            ? groupPrompts.map(p => ({
-                label: p.title,
-                click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(p)); }
-              }))
-            : [{ label: '(empty)', enabled: false }]
-        });
-      } else {
-        promptsSubmenu.push({
-          label: item.prompt.title,
-          click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(item.prompt)); }
-        });
-      }
-    });
-
+  // Add Insert Prompt submenu. The synthetic project group and the saved
+  // library share one builder so PTY, SDK and the React picker cannot drift.
+  let promptGroups = [];
+  let projectCatalog = null;
+  try { promptGroups = projectManager.getPromptGroups(); } catch {}
+  try { if (projectId) projectCatalog = projectPromptCatalog.listProject(projectId); } catch (e) {
+    console.warn('[ProjectPrompts] terminal menu load failed:', e.message);
+  }
+  const buildInsertData = (prompt) => ({
+    content: prompt.content || '',
+    filePaths: Array.isArray(prompt.file_paths) ? prompt.file_paths : [],
+  });
+  const promptsSubmenu = buildPromptMenuTemplate({
+    prompts: prompts || [],
+    groups: promptGroups,
+    projectCatalog,
+    onPick: (prompt) => {
+      event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(prompt));
+    },
+  });
+  if (promptsSubmenu.length > 0) {
     template.push({
       label: 'Insert Prompt',
       submenu: promptsSubmenu,
-      _insertPromptAnchor: true, // marker for positioningItem lookup below
+      _insertPromptAnchor: true,
     });
     template.push({ type: 'separator' });
   }
@@ -11576,7 +11583,7 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
 // submenu (same prompt-store data as the terminal menu uses). The "insert-prompt"
 // command travels back through the existing `context-menu-command` channel —
 // ClaudeSDKTab listens and routes the payload into its composer textarea.
-ipcMain.on('show-sdk-context-menu', (event, { tabId, hasSelection, focusInsertPrompt } = {}) => {
+ipcMain.on('show-sdk-context-menu', (event, { tabId, projectId, hasSelection, focusInsertPrompt } = {}) => {
   let prompts = [];
   let promptGroups = [];
   try { prompts = projectManager.getPrompts(); } catch {}
@@ -11586,42 +11593,26 @@ ipcMain.on('show-sdk-context-menu', (event, { tabId, hasSelection, focusInsertPr
   template.push({ role: 'copy', enabled: !!hasSelection });
   template.push({ role: 'paste' });
 
-  if (prompts && prompts.length > 0) {
+  let projectCatalog = null;
+  try { if (projectId) projectCatalog = projectPromptCatalog.listProject(projectId); } catch (e) {
+    console.warn('[ProjectPrompts] SDK menu load failed:', e.message);
+  }
+  const buildInsertData = (prompt) => ({
+    content: prompt.content || '',
+    filePaths: Array.isArray(prompt.file_paths) ? prompt.file_paths : [],
+    tabId,
+    sdk: true,
+  });
+  const promptsSubmenu = buildPromptMenuTemplate({
+    prompts,
+    groups: promptGroups,
+    projectCatalog,
+    onPick: (prompt) => {
+      event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(prompt));
+    },
+  });
+  if (promptsSubmenu.length > 0) {
     template.push({ type: 'separator' });
-
-    const promptsSubmenu = [];
-    const flatItems = [];
-    promptGroups.forEach(g => flatItems.push({ type: 'group', group: g, pos: g.position }));
-    prompts.filter(p => !p.group_id).forEach(p => flatItems.push({ type: 'prompt', prompt: p, pos: p.position }));
-    flatItems.sort((a, b) => a.pos - b.pos);
-
-    const buildInsertData = (p) => ({
-      content: p.content,
-      filePaths: (p.file_paths && p.file_paths.length > 0) ? p.file_paths : [],
-      tabId,
-      sdk: true, // marker so renderer can route to SDK composer instead of PTY
-    });
-
-    flatItems.forEach(item => {
-      if (item.type === 'group') {
-        const groupPrompts = prompts.filter(p => p.group_id === item.group.id);
-        promptsSubmenu.push({
-          label: item.group.name,
-          submenu: groupPrompts.length > 0
-            ? groupPrompts.map(p => ({
-                label: p.title,
-                click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(p)); },
-              }))
-            : [{ label: '(empty)', enabled: false }],
-        });
-      } else {
-        promptsSubmenu.push({
-          label: item.prompt.title,
-          click: () => { event.sender.send('context-menu-command', 'insert-prompt', buildInsertData(item.prompt)); },
-        });
-      }
-    });
-
     template.push({ label: 'Insert Prompt', submenu: promptsSubmenu, _insertPromptAnchor: true });
   }
 
@@ -13728,6 +13719,22 @@ function startMcpHttpServer() {
             res.end(JSON.stringify({ error: 'tabId and agent=claude|codex|gemini are required' }));
             return;
           }
+          if (engine === 'claude' || engine === 'codex') {
+            try {
+              assertAgentProviderModel({ provider: engine, model });
+            } catch (validationError) {
+              res.writeHead(Number(validationError?.statusCode) || 400);
+              res.end(JSON.stringify({
+                success: false,
+                submitted: false,
+                code: validationError?.code || 'agent_model_provider_mismatch',
+                error: String(validationError?.message || validationError),
+                tabId,
+                agent: engine,
+              }));
+              return;
+            }
+          }
           const projectReject = routeRejectsPinnedProject(tabId, parentProjectId, '/terminal/ai-start');
           if (projectReject) {
             res.writeHead(403);
@@ -14616,6 +14623,7 @@ app.whenReady().then(async () => {
       registerTaskCompletionIntent,
       e2eBoundaryTestGate: aiBoundaryTestGate,
       agentSendReceiptStore,
+      projectPromptCatalog,
     });
     console.log('[Startup] Mobile WebServer OK');
 
@@ -14993,6 +15001,9 @@ app.on('will-quit', () => {
     }
   } catch (e) {
     console.error('[Shutdown] will-quit error:', e.message);
+  }
+  try { projectPromptCatalog.close(); } catch (e) {
+    console.warn('[ProjectPrompts] watcher shutdown failed:', e.message);
   }
 });
 
@@ -29231,6 +29242,19 @@ ipcMain.handle('file:unwatch-folder', async () => {
 
 // research:*, commands:*, prompts:*, ai-prompts:* → ipc/settings.js
 require(path.join(srcMainDir, 'ipc', 'settings')).register({ projectManager });
+projectPromptsIpc.register({ service: projectPromptCatalog });
+ipcMain.handle('gt-editor-transfer:paste', async (_event, payload = {}) => {
+  try {
+    return await gtEditorTransferClient.paste(payload);
+  } catch (error) {
+    console.error('[GTTransfer] paste failed:', error?.message || error);
+    return {
+      success: false,
+      error: error?.message || String(error),
+      code: error?.code || 'gt_transfer_failed',
+    };
+  }
+});
 
 // diagnostics:export-log → bounded, sanitized TXT from the active runtime log
 require(path.join(srcMainDir, 'ipc', 'diagnostic-export')).register({

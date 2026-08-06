@@ -16,6 +16,8 @@ const {
   dropHistoryMeasuredLayout,
   updateHistoryMeasuredLayoutScrollTop,
   estimateHistoryAverageRowHeight,
+  createHistoryRowHeightLookup,
+  pickHistoryMountWaveTarget,
   __resetHistoryMeasuredLayoutForTest,
   __historyMeasuredLayoutSizeForTest,
 } = await import('./historyMeasuredLayout.ts');
@@ -183,4 +185,113 @@ test('drops malformed and expired persisted entries on load', async () => {
   assert.equal(getHistoryMeasuredLayout('tab:garbage-ranges', 5), null);
   assert.equal(getHistoryMeasuredLayout('tab:expired', 5), null);
   assert.equal(__historyMeasuredLayoutSizeForTest(), 1);
+});
+
+test('height lookup answers stored size per index, fallback elsewhere', () => {
+  const lookup = createHistoryRowHeightLookup({
+    ranges: [
+      { startIndex: 0, endIndex: 2, size: 40 },
+      { startIndex: 3, endIndex: 3, size: 500 },
+      { startIndex: 4, endIndex: 9, size: 120 },
+    ],
+    scrollTop: 0,
+  }, 111);
+  assert.equal(lookup(0), 40);
+  assert.equal(lookup(2), 40);
+  assert.equal(lookup(3), 500);
+  assert.equal(lookup(7), 120);
+  // Beyond every measured range → fallback (rows never scrolled past).
+  assert.equal(lookup(10), 111);
+});
+
+test('height lookup without a snapshot is a constant fallback', () => {
+  const lookup = createHistoryRowHeightLookup(null, 90);
+  assert.equal(lookup(0), 90);
+  assert.equal(lookup(999), 90);
+});
+
+test('wave target prefers the topmost shell inside the viewport', () => {
+  const picked = pickHistoryMountWaveTarget(
+    [
+      { uuid: 'above', top: -900, bottom: -700 },
+      { uuid: 'second-visible', top: 400, bottom: 600 },
+      { uuid: 'first-visible', top: 100, bottom: 380 },
+      { uuid: 'below', top: 2000, bottom: 2200 },
+    ],
+    { top: 0, bottom: 800 },
+  );
+  assert.equal(picked, 'first-visible');
+});
+
+test('wave target margin catches near-viewport rows before far ones', () => {
+  const picked = pickHistoryMountWaveTarget(
+    [
+      { uuid: 'far-below', top: 3000, bottom: 3100 },
+      { uuid: 'just-above', top: -150, bottom: -60 },
+    ],
+    { top: 0, bottom: 800 },
+    200,
+  );
+  assert.equal(picked, 'just-above');
+});
+
+test('wave target with nothing near the viewport takes the topmost mounted shell', () => {
+  const picked = pickHistoryMountWaveTarget(
+    [
+      { uuid: 'lower', top: 5000, bottom: 5100 },
+      { uuid: 'upper', top: 3000, bottom: 3100 },
+    ],
+    { top: 0, bottom: 800 },
+  );
+  assert.equal(picked, 'upper');
+});
+
+test('wave target on an empty candidate set is null', () => {
+  assert.equal(pickHistoryMountWaveTarget([], { top: 0, bottom: 800 }), null);
+  assert.equal(pickHistoryMountWaveTarget([], null), null);
+});
+
+test('a sparse re-save cannot replace rich coverage; offset still refreshes', () => {
+  saveHistoryMeasuredLayout('tab:rich', {
+    ranges: [{ startIndex: 0, endIndex: 999, size: 100 }],
+    scrollTop: 50000,
+  }, 1000);
+  // A Timeline-jump visit measured only a 30-row neighborhood.
+  const accepted = saveHistoryMeasuredLayout('tab:rich', {
+    ranges: [{ startIndex: 500, endIndex: 529, size: 90 }],
+    scrollTop: 44000,
+  }, 1000);
+  assert.equal(accepted, false);
+  const kept = getHistoryMeasuredLayout('tab:rich', 1000);
+  assert.equal(kept?.ranges.length, 1);
+  assert.equal((kept?.ranges[0] as any).endIndex, 999, 'rich ranges survive');
+  assert.equal(kept?.scrollTop, 44000, 'offset refreshed from the sparse save');
+});
+
+test('a comparable-coverage re-save replaces normally', () => {
+  saveHistoryMeasuredLayout('tab:even', {
+    ranges: [{ startIndex: 0, endIndex: 999, size: 100 }],
+    scrollTop: 100,
+  }, 1000);
+  const accepted = saveHistoryMeasuredLayout('tab:even', {
+    ranges: [{ startIndex: 0, endIndex: 899, size: 110 }],
+    scrollTop: 200,
+  }, 1000);
+  assert.equal(accepted, true);
+  assert.equal((getHistoryMeasuredLayout('tab:even', 1000)?.ranges[0] as any).size, 110);
+});
+
+test('coverage guard does not apply across a shape change', () => {
+  saveHistoryMeasuredLayout('tab:reshaped', {
+    ranges: [{ startIndex: 0, endIndex: 999, size: 100 }],
+    scrollTop: 100,
+  }, 1000);
+  // Rewind truncated the session — small new list, sparse measurements are
+  // the ONLY truth about it now. (Non-zero offset: the transient-zero guard
+  // is a separate, older rule and rewinds drop the geometry anyway.)
+  const accepted = saveHistoryMeasuredLayout('tab:reshaped', {
+    ranges: [{ startIndex: 0, endIndex: 9, size: 80 }],
+    scrollTop: 40,
+  }, 10);
+  assert.equal(accepted, true);
 });

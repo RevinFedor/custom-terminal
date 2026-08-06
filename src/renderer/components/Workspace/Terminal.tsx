@@ -96,6 +96,7 @@ import {
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { log } from '../../utils/logger';
+import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import {
@@ -1243,6 +1244,10 @@ function Terminal({
 
   const hydrateTerminalBuffer = async (term: XTerminal): Promise<boolean> => {
     const endHydration = beginTerminalHydration(hydrationActivity.current);
+    // Freeze attribution: xterm snapshot replay + tail drain runs inside the
+    // tab-switch frame cluster; without its own mark this work was billed to
+    // whatever else (History owner-mount) overlapped the same long task.
+    const endSwapMark = markRendererActivity('terminal-hydrate:' + tabId.slice(-8));
     try {
       let snapshot: any = null;
       try {
@@ -1481,6 +1486,7 @@ function Terminal({
       return true;
     } finally {
       endHydration();
+      endSwapMark();
     }
   };
 

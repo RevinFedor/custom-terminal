@@ -105,6 +105,10 @@ const {
   reservedOrchestrationTargetTabId,
 } = require('./orchestration-request-identity');
 const {
+  assertAgentProviderModel,
+  resolveAgentProvider,
+} = require('./agent-provider-model-contract');
+const {
   findUniqueLegacySourceFollowupProof,
 } = require('./orchestration-source-reconcile');
 const {
@@ -179,8 +183,10 @@ try {
 const PORT_PREFERRED = parseInt(process.env.NOTED_WEB_PORT || '', 10) || 7878;
 const PORT_MAX = PORT_PREFERRED + 20; // 7878..7898 — plenty for parallel runs
 let resolvedPort = PORT_PREFERRED;
-const TOKEN_PATH = path.join(require('os').homedir(), '.noted-terminal', 'web-token.txt');
-const DISCOVERY_DIR = path.join(require('os').homedir(), '.noted-terminal');
+const DISCOVERY_DIR = process.env.NOTED_DISCOVERY_DIR
+  ? path.resolve(process.env.NOTED_DISCOVERY_DIR)
+  : path.join(require('os').homedir(), '.noted-terminal');
+const TOKEN_PATH = path.join(DISCOVERY_DIR, 'web-token.txt');
 const DISCOVERY_FILE = path.join(DISCOVERY_DIR, 'web-server-' + process.pid + '.json');
 const IOS_PUSH_TOKENS_PATH = path.join(DISCOVERY_DIR, 'ios-push-tokens.json');
 
@@ -206,10 +212,14 @@ let getAgentExecutionContext = null;
 let readAgentLifecycleIdentity = null;
 let registerTaskCompletionIntent = null;
 let e2eBoundaryTestGate = null;
+let agentSendBridgeTimeoutMs = 60_000;
 // Main owns the agent startup/readiness state. The renderer bridge remains a
 // compatibility fallback for isolated module use, but live Project API waits
 // must not depend on a renderer projection arriving before the main-owned wake.
 let readAgentStartReadiness = null;
+// Disk-owned project prompt catalog is injected by Electron main so HTTP
+// clients (GT Editor) see the exact same paths/order as the desktop picker.
+let projectPromptCatalog = null;
 // Main-owned Codex process/writer resolver. Renderer state and SQLite are not
 // authoritative for a live rollout, so web routes fall back to this callback
 // when the bridge is unavailable instead of publishing the saved resume ID.
@@ -225,6 +235,7 @@ const subscribers = new Map();
 const PROJECT_ACTIVITY_TOPIC = '__project_activity__';
 // pending bridge requests to renderer: requestId → { resolve, reject, timer }
 const pendingBridge = new Map();
+const LATE_BRIDGE_REPLY_RETENTION_MS = 5 * 60 * 1000;
 const externalRuns = new Map();      // runId -> run metadata
 const externalRunByTabId = new Map(); // tabId -> runId
 const externalRunByConversationKey = new Map(); // conversationKey -> runId
@@ -1284,6 +1295,16 @@ function sendJson(res, status, body) {
 
 function sendTerminalBridgeError(res, error) {
   const message = String(error?.message || error || 'unknown error');
+  const requestedStatus = Number(error?.statusCode || error?.status);
+  if (Number.isInteger(requestedStatus) && requestedStatus >= 400 && requestedStatus <= 599) {
+    return sendJson(res, requestedStatus, {
+      ok: false,
+      success: false,
+      submitted: false,
+      code: error?.code || 'request_rejected',
+      error: message,
+    });
+  }
   const missingPrefix = 'working_directory_missing:';
   const missingIndex = message.indexOf(missingPrefix);
   if (missingIndex !== -1) {
@@ -1535,7 +1556,8 @@ async function runAgentSendScenario({
   sendRunId = null,
   sendRequestFingerprint = null,
   prepareSend,
-  timeoutMs = 60_000,
+  timeoutMs = agentSendBridgeTimeoutMs,
+  onLateReceipt = null,
 }) {
   const promptHash = promptAuditFingerprint(prompt);
   const requestFingerprint = sendRequestFingerprint || fingerprintAgentSendRequest({
@@ -1622,26 +1644,57 @@ async function runAgentSendScenario({
       }
       durableAttemptId = begun.attemptId;
     }
+    const settleLateBridgeReceipt = async ({ ok, data, error }) => {
+      if (!durableIdentity || !durableAttemptId || !data || typeof data !== 'object') return;
+      const lateResult = ok === false
+        ? { ...data, success: false, error: data.error || error || 'renderer scenario failed' }
+        : data;
+      const settled = agentSendReceiptStore.settleAttempt(
+        sendOperationKey,
+        durableAttemptId,
+        lateResult,
+      );
+      const exactRecord = settled?.record;
+      if (!exactRecord || exactRecord.attemptId !== durableAttemptId) return;
+      const exactReceipt = durableAgentSendReplay(exactRecord, {
+        operationKey: sendOperationKey,
+        attemptId: durableAttemptId,
+        tabId,
+        handoffId,
+        lateBridgeReply: true,
+      });
+      console.warn('[AgentSendReceipt] late renderer receipt operation='
+        + String(sendOperationKey).slice(0, 72)
+        + ' attempt=' + String(durableAttemptId).slice(0, 12)
+        + ' state=' + exactRecord.state
+        + ' submitted=' + String(exactReceipt.submitted));
+      if (typeof onLateReceipt === 'function') {
+        await onLateReceipt(exactReceipt, exactRecord);
+      }
+    };
+
     if (!result) try {
       result = await bridgeRequest('sendAgentPromptScenario', {
-      tabId,
-      prompt,
-      model,
-      effort,
-      thinking,
-      cwd,
-      handoffId,
-      sendOperationKey: sendOperationKey || null,
-      sendAttemptId: durableAttemptId,
-      source,
-      statusAtSend,
-      queue: queue === true,
-      presentationSnapshot: presentationSnapshot || null,
-      // Project/History/iOS controls the terminal tab directly: leave a found
-      // terminal draft untouched and report conflict. External Inbox owns its
-      // own chat composer: atomically pull terminal draft out for caller rollback.
+        tabId,
+        prompt,
+        model,
+        effort,
+        thinking,
+        cwd,
+        handoffId,
+        sendOperationKey: sendOperationKey || null,
+        sendAttemptId: durableAttemptId,
+        source,
+        statusAtSend,
+        queue: queue === true,
+        presentationSnapshot: presentationSnapshot || null,
+        // Project/History/iOS controls the terminal tab directly: leave a found
+        // terminal draft untouched and report conflict. External Inbox owns its
+        // own chat composer: atomically pull terminal draft out for caller rollback.
         returnDraftOnConflict: ownership === 'external',
-      }, timeoutMs);
+      }, timeoutMs, {
+        onLateReply: settleLateBridgeReceipt,
+      });
     } catch (error) {
       if (error?.dispatched === false || error?.code === 'bridge_unavailable') {
         result = {
@@ -1656,47 +1709,66 @@ async function runAgentSendScenario({
           tabId,
         };
       } else {
-      // BrowserWindow.send crossed the main -> renderer boundary, but the
-      // renderer did not return its receipt before the caller deadline. The
-      // scenario may still be launching, proving readiness, or waiting for the
-      // post-Enter transcript audit. Treating this as "not sent" invites a
-      // duplicate; treating it as "sent" fabricates delivery. Preserve the
-      // exact handoff for a later audit and surface an explicit unknown state.
-      console.warn('[AgentScenario] renderer receipt timeout tab=' + shortId(tabId, 12)
-        + ' handoff=' + (handoffId || '-')
-        + ' source=' + (source || '-')
-        + ' timeoutMs=' + timeoutMs
-        + ' -> delivery-unknown');
+        // BrowserWindow.send crossed the main -> renderer boundary, but the
+        // renderer did not return its receipt before the caller deadline. The
+        // scenario may still be launching, proving readiness, or waiting for the
+        // post-Enter transcript audit. Treating this as "not sent" invites a
+        // duplicate; treating it as "sent" fabricates delivery. Preserve the
+        // exact handoff for a later audit and surface an explicit unknown state.
+        console.warn('[AgentScenario] renderer receipt timeout tab=' + shortId(tabId, 12)
+          + ' handoff=' + (handoffId || '-')
+          + ' source=' + (source || '-')
+          + ' timeoutMs=' + timeoutMs
+          + ' -> delivery-unknown');
         result = {
-        success: null,
-        accepted: true,
-        submitted: null,
-        status: 'delivery-unknown',
-        deliveryUnknown: true,
-        code: 'bridge_timeout_delivery_unknown',
-        warning: 'The send scenario may still complete; do not retry this handoff blindly.',
-        handoffId: handoffId || null,
-        tabId,
+          success: null,
+          accepted: true,
+          submitted: null,
+          status: 'delivery-unknown',
+          deliveryUnknown: true,
+          code: 'bridge_timeout_delivery_unknown',
+          warning: 'The send scenario may still complete; do not retry this handoff blindly.',
+          handoffId: handoffId || null,
+          tabId,
         };
       }
     }
 
     if (durableIdentity && durableAttemptId) {
-      const settled = agentSendReceiptStore.settleAttempt(
-        sendOperationKey,
-        durableAttemptId,
-        result,
-      );
-      // An exact audit may win the race while the renderer callback is still
-      // returning. Never let that stale callback overwrite the durable fact.
-      if (settled?.record && (settled.record.state === 'confirmed' || settled.applied !== true)) {
-        return durableAgentSendReplay(settled.record, {
-          operationKey: sendOperationKey,
-          attemptId: durableAttemptId,
-          tabId,
-          handoffId,
-          replayed: settled.applied !== true,
-        });
+      const bridgeTimedOut = result?.deliveryUnknown === true
+        && result?.code === 'bridge_timeout_delivery_unknown';
+      if (bridgeTimedOut) {
+        // Keep the exact attempt open so a renderer reply that lost the race
+        // with the caller deadline can still prove submitted:false. A process
+        // restart converts this active attempt to delivery-unknown; neither
+        // path grants retry authority or fabricates success.
+        const exactRecord = agentSendReceiptStore.get(sendOperationKey);
+        if (exactRecord?.attemptId === durableAttemptId
+          && exactRecord.state !== 'in-flight') {
+          return durableAgentSendReplay(exactRecord, {
+            operationKey: sendOperationKey,
+            attemptId: durableAttemptId,
+            tabId,
+            handoffId,
+          });
+        }
+      } else {
+        const settled = agentSendReceiptStore.settleAttempt(
+          sendOperationKey,
+          durableAttemptId,
+          result,
+        );
+        // An exact audit may win the race while the renderer callback is still
+        // returning. Never let that stale callback overwrite the durable fact.
+        if (settled?.record && (settled.record.state === 'confirmed' || settled.applied !== true)) {
+          return durableAgentSendReplay(settled.record, {
+            operationKey: sendOperationKey,
+            attemptId: durableAttemptId,
+            tabId,
+            handoffId,
+            replayed: settled.applied !== true,
+          });
+        }
       }
     }
     return {
@@ -1775,6 +1847,95 @@ async function runAgentSendScenario({
   };
 }
 
+async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
+  reason = 'target-send-receipt',
+  targetStatus = null,
+  late = false,
+} = {}) {
+  const store = getOrchestrationRunStore();
+  const current = await store.getInternal(runId);
+  if (!current || isTerminalStatus(current.status)) {
+    return {
+      kind: 'settled',
+      receiptState: classifyAgentSendReceipt(sendResult).state,
+      run: await store.get(runId),
+    };
+  }
+
+  const sendReceipt = classifyAgentSendReceipt(sendResult);
+  if (sendReceipt.state === 'not-submitted') {
+    // A transcript audit or accepted Enter is stronger than a stale renderer
+    // callback. Only an exact pre-Enter receipt may turn a still-unaccepted
+    // orchestration into failure.
+    if (current.deliveryAcceptedAt || current.targetPromptProofAt) {
+      console.warn('[OrchestrationDelivery] stale not-submitted receipt ignored run=' + runId
+        + ' late=' + late
+        + ' acceptedAt=' + (current.deliveryAcceptedAt || '-')
+        + ' promptProofAt=' + (current.targetPromptProofAt || '-'));
+      const provenReceiptState = current.targetPromptProofAt
+        ? 'confirmed'
+        : current.deliveryAuditPendingAt
+          ? 'audit-pending'
+          : 'confirmed';
+      return { kind: 'accepted', receiptState: provenReceiptState, run: await store.get(runId) };
+    }
+    const recoveryPolicy = orchestrationSendFailureRecoveryPolicy(sendResult);
+    if (recoveryPolicy.provenNotSent) {
+      await store.resetDeferredDelivery(runId, 'send-refused-before-submit');
+      console.warn('[OrchestrationDelivery] exact pre-submit failure run=' + runId
+        + ' late=' + late
+        + ' target=' + String(current.targetTabId || '').slice(-12)
+        + ' code=' + (sendResult?.code || '-')
+        + ' error=' + (sendResult?.error || sendResult?.message || 'send failed'));
+    } else {
+      console.warn('[OrchestrationDelivery] unproven send failure keeps recovery grace run=' + runId
+        + ' late=' + late
+        + ' target=' + String(current.targetTabId || '').slice(-12)
+        + ' submitted=' + String(sendResult?.submitted)
+        + ' accepted=' + String(sendResult?.accepted)
+        + ' error=' + (sendResult?.error || sendResult?.message || 'send failed'));
+    }
+    const failed = await store.beginRecovery(
+      runId,
+      current.targetCreated ? 'startup_failed' : 'failed',
+      sendResult?.error || sendResult?.message || sendResult?.code || 'send failed',
+      { failureGraceMs: recoveryPolicy.failureGraceMs },
+    );
+    emitOrchestrationChanges(failed.changed, reason + '-send-failed');
+    await finalizeSettledOrchestrations(failed.settled, reason + '-send-failed');
+    return {
+      kind: 'send-failed',
+      receiptState: sendReceipt.state,
+      run: await store.get(runId),
+    };
+  }
+
+  if (sendReceipt.state === 'delivery-unknown') {
+    const unknown = await store.patch(runId, {
+      status: 'sending',
+      deliveryTransportUnknownAt: current.deliveryTransportUnknownAt || Date.now(),
+      deliveryTransportError: sendResult?.code || 'bridge_timeout_delivery_unknown',
+    });
+    emitOrchestrationRun(unknown, reason + '-delivery-unknown');
+    return { kind: 'delivery-unknown', receiptState: sendReceipt.state, run: unknown };
+  }
+
+  if (current.deliveryAcceptedAt) {
+    const reconciled = await reconcileOrchestrationRun(runId, reason + '-already-accepted');
+    return { kind: 'accepted', receiptState: sendReceipt.state, run: reconciled };
+  }
+  const acceptedRuntime = await resolveAgentSessionInfo(current.targetTabId, 2000).catch(() => null);
+  const accepted = await store.markDelivery(runId, {
+    baselineBusy: false,
+    sessionId: sendResult?.sessionId || acceptedRuntime?.sessionId || targetStatus?.sessionId || null,
+    lifecycleGeneration: acceptedRuntime?.lifecycleGeneration || targetStatus?.lifecycleGeneration || null,
+    auditPending: sendReceipt.state === 'audit-pending',
+  });
+  emitOrchestrationRun(accepted, reason + '-delivery-accepted');
+  const reconciled = await reconcileOrchestrationRun(runId, reason + '-delivery-reconcile');
+  return { kind: 'accepted', receiptState: sendReceipt.state, run: reconciled || accepted };
+}
+
 async function dispatchDeferredOrchestrationRun(runId, {
   reason = 'delivery-wake',
   targetStatus = null,
@@ -1843,6 +2004,7 @@ async function dispatchDeferredOrchestrationRun(runId, {
       thinking: intent.thinking || undefined,
     });
     const targetHandoffId = 'orchestration:' + current.runId;
+    const targetSendOperationKey = 'orchestration-target:' + current.runId;
     const rawSendResult = await runAgentSendScenario({
       tabId: current.targetTabId,
       prompt: intent.prompt,
@@ -1860,75 +2022,54 @@ async function dispatchDeferredOrchestrationRun(runId, {
       presentationSnapshot: orchestrationPresentationSnapshot(current, 'request'),
       provider: current.targetToolType || status?.toolType || status?.commandType || null,
       sessionId: status?.sessionId || current.sessionId || null,
-      timeoutMs: 60_000,
+      sendOperationKey: targetSendOperationKey,
+      sendSurface: 'orchestration',
+      sendRunId: current.runId,
+      timeoutMs: agentSendBridgeTimeoutMs,
+      onLateReceipt: async (lateReceipt, durableRecord) => {
+        if (durableRecord?.surface !== 'orchestration'
+          || durableRecord?.runId !== current.runId
+          || durableRecord?.tabId !== current.targetTabId
+          || durableRecord?.handoffId !== targetHandoffId) {
+          console.warn('[OrchestrationDelivery] ignored foreign late receipt run=' + current.runId
+            + ' operation=' + String(durableRecord?.operationKey || '-').slice(0, 72));
+          return;
+        }
+        await applyOrchestrationTargetSendReceipt(current.runId, lateReceipt, {
+          reason: reason + '-late-renderer-receipt',
+          late: true,
+        });
+      },
     });
     const sendResult = {
       ...(rawSendResult && typeof rawSendResult === 'object' ? rawSendResult : {}),
       handoffId: targetHandoffId,
     };
-    const sendReceipt = classifyAgentSendReceipt(sendResult);
-    if (sendReceipt.state === 'not-submitted') {
-      const recoveryPolicy = orchestrationSendFailureRecoveryPolicy(sendResult);
-      if (recoveryPolicy.provenNotSent) {
-        await store.resetDeferredDelivery(runId, 'send-refused-before-submit');
-        console.warn('[OrchestrationRecovery] immediate pre-submit failure run=' + runId
-          + ' target=' + String(current.targetTabId || '').slice(-12)
-          + ' error=' + (sendResult?.error || sendResult?.message || 'send failed'));
-      } else {
-        console.warn('[OrchestrationRecovery] send failure keeps recovery grace run=' + runId
-          + ' target=' + String(current.targetTabId || '').slice(-12)
-          + ' submitted=' + String(sendResult?.submitted)
-          + ' accepted=' + String(sendResult?.accepted)
-          + ' error=' + (sendResult?.error || sendResult?.message || 'send failed'));
-      }
-      const failed = await store.beginRecovery(
-        runId,
-        current.targetCreated ? 'startup_failed' : 'failed',
-        sendResult?.error || sendResult?.message || 'send failed',
-        { failureGraceMs: recoveryPolicy.failureGraceMs },
-      );
-      emitOrchestrationChanges(failed.changed, reason + '-send-failed');
-      await finalizeSettledOrchestrations(failed.settled, reason + '-send-failed');
+    const appliedReceipt = await applyOrchestrationTargetSendReceipt(runId, sendResult, {
+      reason,
+      targetStatus: status,
+    });
+    if (appliedReceipt.kind === 'send-failed') {
       return { dispatched: false, deferred: false, reason: 'send-failed', sendResult, run: await store.get(runId) };
     }
 
-    if (sendReceipt.state === 'delivery-unknown') {
-      // The bridge request reached the renderer, but no receipt came back.
-      // Keep the durable intent and its exact handoff: a later prompt audit
-      // can prove delivery, while automatic replay remains forbidden by the
-      // already-persisted dispatch boundary.
-      const unknown = await store.patch(runId, {
-        status: 'sending',
-        deliveryTransportUnknownAt: Date.now(),
-        deliveryTransportError: sendResult?.code || 'bridge_timeout_delivery_unknown',
-      });
-      emitOrchestrationRun(unknown, reason + '-delivery-unknown');
+    if (appliedReceipt.kind === 'delivery-unknown') {
       return {
         dispatched: true,
         deferred: false,
         reason: 'delivery-unknown',
-        receiptState: sendReceipt.state,
+        receiptState: appliedReceipt.receiptState,
         sendResult,
-        run: unknown,
+        run: appliedReceipt.run,
       };
     }
-
-    const acceptedRuntime = await resolveAgentSessionInfo(current.targetTabId, 2000).catch(() => null);
-    const accepted = await store.markDelivery(runId, {
-      baselineBusy: false,
-      sessionId: sendResult?.sessionId || acceptedRuntime?.sessionId || status?.sessionId || null,
-      lifecycleGeneration: acceptedRuntime?.lifecycleGeneration || status?.lifecycleGeneration || null,
-      auditPending: sendReceipt.state === 'audit-pending',
-    });
-    emitOrchestrationRun(accepted, reason + '-delivery-accepted');
-    const reconciled = await reconcileOrchestrationRun(runId, reason + '-delivery-reconcile');
     return {
       dispatched: true,
       deferred: false,
       reason: null,
-      receiptState: sendReceipt.state,
+      receiptState: appliedReceipt.receiptState,
       sendResult,
-      run: reconciled || accepted,
+      run: appliedReceipt.run,
     };
   } finally {
     orchestrationDeliveryInflight.delete(runId);
@@ -3827,7 +3968,10 @@ function readBody(req) {
 // a single reply. The renderer registers `web:bridge-reply` as the response
 // channel; here we just allocate a requestId and time out at 5s. Used for
 // state that only the live UI knows (current openProjects map, tab creation).
-function bridgeRequest(action, payload, timeoutMs = 5000) {
+function bridgeRequest(action, payload, timeoutMs = 5000, {
+  onLateReply = null,
+  lateReplyRetentionMs = LATE_BRIDGE_REPLY_RETENTION_MS,
+} = {}) {
   return new Promise((resolve, reject) => {
     const wins = BrowserWindow.getAllWindows();
     const win = wins[0];
@@ -3841,13 +3985,32 @@ function bridgeRequest(action, payload, timeoutMs = 5000) {
     }
     const requestId = crypto.randomBytes(8).toString('hex');
     const timer = setTimeout(() => {
-      pendingBridge.delete(requestId);
+      const pending = pendingBridge.get(requestId);
+      if (pending && typeof pending.onLateReply === 'function') {
+        pending.timedOut = true;
+        pending.lateCleanupTimer = setTimeout(() => {
+          if (pendingBridge.get(requestId) === pending) pendingBridge.delete(requestId);
+        }, Math.max(1_000, Number(lateReplyRetentionMs) || LATE_BRIDGE_REPLY_RETENTION_MS));
+        pending.lateCleanupTimer.unref?.();
+      } else {
+        pendingBridge.delete(requestId);
+      }
       console.log('[BridgeDiag] TIMEOUT action=' + action + label + ' rid=' + requestId + ' afterMs=' + timeoutMs);
       const error = new Error('Bridge timeout: ' + action);
       error.code = 'bridge_timeout';
       reject(error);
     }, timeoutMs);
-    pendingBridge.set(requestId, { resolve, reject, timer, action, label, sentAt: Date.now() });
+    pendingBridge.set(requestId, {
+      resolve,
+      reject,
+      timer,
+      action,
+      label,
+      sentAt: Date.now(),
+      onLateReply: typeof onLateReply === 'function' ? onLateReply : null,
+      timedOut: false,
+      lateCleanupTimer: null,
+    });
     console.log('[BridgeDiag] SEND action=' + action + label + ' rid=' + requestId + ' wins=' + wins.length);
     try {
       win.webContents.send('web:bridge-request', { requestId, action, payload });
@@ -4011,7 +4174,21 @@ function registerBridgeReplyHandler() {
     const elapsed = Date.now() - pending.sentAt;
     console.log('[BridgeDiag] REPLY action=' + pending.action + (pending.label || '') + ' rid=' + requestId + ' ok=' + ok + ' elapsedMs=' + elapsed + ' err=' + (error || '-'));
     clearTimeout(pending.timer);
+    if (pending.lateCleanupTimer) clearTimeout(pending.lateCleanupTimer);
     pendingBridge.delete(requestId);
+    if (pending.timedOut === true) {
+      console.warn('[BridgeDiag] LATE_REPLY action=' + pending.action
+        + (pending.label || '')
+        + ' rid=' + requestId
+        + ' ok=' + ok
+        + ' elapsedMs=' + elapsed);
+      if (typeof pending.onLateReply === 'function') {
+        void Promise.resolve(pending.onLateReply({ ok, data, error, elapsedMs: elapsed }))
+          .catch((lateError) => console.warn('[BridgeDiag] late reply handler failed action='
+            + pending.action + ' rid=' + requestId + ' error=' + (lateError?.message || lateError)));
+      }
+      return;
+    }
     if (ok) {
       pending.resolve(data);
     } else {
@@ -4316,7 +4493,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const sourceTabId = cleanOptionalString(body.sourceTabId, '');
       let targetTabId = cleanOptionalString(body.targetTabId, '');
       const targetProjectId = cleanOptionalString(body.targetProjectId || body.projectId, '');
-      const targetToolType = body.toolType === 'codex' || body.provider === 'codex' ? 'codex' : 'claude';
+      const requestedTargetToolType = resolveAgentProvider({
+        toolType: body.toolType,
+        provider: body.provider,
+        fallback: 'claude',
+      });
       const notifySource = body.notifySource !== false;
       if (!prompt) return sendJson(res, 400, { ok: false, error: 'prompt required' });
       if (!sourceTabId) return sendJson(res, 400, { ok: false, error: 'sourceTabId required' });
@@ -4396,8 +4577,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
           projectName: targetProject.projectName,
           projectPath: targetProject.projectPath,
           cwd: targetProject.cwd,
-          toolType: targetToolType,
-          commandType: targetToolType,
+          toolType: requestedTargetToolType,
+          commandType: requestedTargetToolType,
         };
       }
       if (targetTabId === sourceTabId) {
@@ -4406,12 +4587,25 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (!target?.toolType) {
         return sendJson(res, 409, { ok: false, error: 'target tab is not a Claude/Codex agent' });
       }
+      const hasExplicitTargetProvider = Boolean(
+        cleanOptionalString(body.toolType, '') || cleanOptionalString(body.provider, ''),
+      );
+      if (requestedTargetTabId && hasExplicitTargetProvider
+        && requestedTargetToolType !== target.toolType) {
+        const mismatch = new Error(
+          `Requested ${requestedTargetToolType} cannot target an existing ${target.toolType} tab.`,
+        );
+        mismatch.code = 'agent_target_provider_mismatch';
+        mismatch.statusCode = 400;
+        throw mismatch;
+      }
+      assertAgentProviderModel({ provider: target.toolType, model: requestedModel });
 
       const requestFingerprint = orchestrationRequestFingerprint({
         sourceTabId,
         targetTabId: requestedTargetTabId,
         targetProjectId,
-        targetToolType: target?.toolType || targetToolType,
+        targetToolType: target?.toolType || requestedTargetToolType,
         name: targetName,
         placement: targetPlacement?.placement || null,
         visualParentTabId: targetPlacement?.visualParentTabId || null,
@@ -4511,7 +4705,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (targetCreated) {
         const created = await bridgeRequest('createAgentTab', {
           projectId: targetProjectId,
-          toolType: targetToolType,
+          toolType: requestedTargetToolType,
           name: targetName,
           reservedTabId: targetTabId,
           startNow: true,
@@ -4859,6 +5053,23 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return (b.updatedAt || 0) - (a.updatedAt || 0);
     });
     return sendJson(res, 200, { projects: all });
+  }
+
+  // Read-only batch used by GT Editor's sidebar. One request per visible root,
+  // never one request per file row. Authentication is the normal Project API
+  // bearer token checked below by the shared request gate.
+  if (parsed.pathname === '/api/project-prompt-usage' && req.method === 'GET') {
+    if (!projectPromptCatalog) return sendJson(res, 503, { ok: false, error: 'project prompt catalog unavailable' });
+    const rootPath = cleanOptionalString(parsed.query.root, '');
+    if (!rootPath || !path.isAbsolute(rootPath)) {
+      return sendJson(res, 400, { ok: false, error: 'absolute root required' });
+    }
+    try {
+      const usages = projectPromptCatalog.usageForRoot(rootPath);
+      return sendJson(res, 200, { ok: true, root: rootPath, usages, updatedAt: Date.now() });
+    } catch (error) {
+      return sendJson(res, 500, { ok: false, error: String(error?.message || error) });
+    }
   }
 
   // Rename a project. Mobile parity with the tab rename below — same shape
@@ -5379,6 +5590,29 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // archived AI tab. Passive lifecycle/reconcile paths never call this.
       const openDescriptor = findOrchestrationTabDescriptor(tabId);
       const restorable = openDescriptor ? null : findRestorableAgentTabDescriptor(tabId);
+      const targetProvider = openDescriptor?.toolType
+        || (restorable?.ok === true ? restorable.toolType : null);
+      if (targetProvider) {
+        const hasExplicitTargetProvider = Boolean(
+          cleanOptionalString(body.toolType, '') || cleanOptionalString(body.provider, ''),
+        );
+        if (hasExplicitTargetProvider) {
+          const requestedProvider = resolveAgentProvider({
+            toolType: body.toolType,
+            provider: body.provider,
+            fallback: targetProvider,
+          });
+          if (requestedProvider !== targetProvider) {
+            const mismatch = new Error(
+              `Requested ${requestedProvider} cannot target an existing ${targetProvider} tab.`,
+            );
+            mismatch.code = 'agent_target_provider_mismatch';
+            mismatch.statusCode = 400;
+            throw mismatch;
+          }
+        }
+        assertAgentProviderModel({ provider: targetProvider, model });
+      }
       // Single bridge round-trip — renderer dispatches by tab.tabType/commandType.
       // Earlier this endpoint did TWO round-trips (status check + send), adding
       // ~50ms per phone send on top of the actual PTY paste latency.
@@ -5388,7 +5622,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ownership: 'project',
         sendOperationKey,
         sendSurface: 'project-api',
-        provider: openDescriptor?.toolType || (restorable?.ok === true ? restorable.toolType : null),
+        provider: targetProvider,
         // A stopped/new Claude prompt can create a new physical session. The
         // exact post-Enter audit binds that session to the receipt.
         sessionId: null,
@@ -5466,7 +5700,15 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (parsed.pathname === '/api/inbox/agent-tabs' && req.method === 'POST') {
     try {
       const body = await readBody(req);
-      const toolType = body.toolType === 'codex' ? 'codex' : 'claude';
+      const toolType = resolveAgentProvider({
+        toolType: body.toolType,
+        provider: body.provider,
+        fallback: 'claude',
+      });
+      assertAgentProviderModel({
+        provider: toolType,
+        model: cleanOptionalString(body.model || body.codexModel, ''),
+      });
       await bridgeRequest('ensureInboxProject', {}, 5000);
       const data = await bridgeRequest('createAgentTab', { projectId: INBOX_PROJECT_ID, toolType, startNow: true }, 12_000);
       return sendJson(res, 200, data);
@@ -5492,6 +5734,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const developerInstructions = cleanOptionalString(body.developerInstructions || body.systemPrompt, '');
       const requestedModel = cleanOptionalString(body.model, '');
       const requestedEffort = cleanOptionalString(body.effort, '');
+      assertAgentProviderModel({ provider, model: requestedModel });
       const requestFingerprint = fingerprintAgentSendRequest({
         provider,
         prompt,
@@ -5917,7 +6160,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           error: inboxRun.error,
         };
       }
-      return sendJson(res, 500, { ok: false, error: String(e.message || e) });
+      return sendTerminalBridgeError(res, e);
     }
   }
 
@@ -5980,7 +6223,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const projectId = decId(m[1]);
     try {
       const body = await readBody(req);
-      const toolType = body.toolType === 'codex' ? 'codex' : 'claude';
+      const toolType = resolveAgentProvider({
+        toolType: body.toolType,
+        provider: body.provider,
+        fallback: 'claude',
+      });
+      const requestedModel = cleanOptionalString(body.model || body.codexModel, '');
+      assertAgentProviderModel({ provider: toolType, model: requestedModel });
       const placement = resolveNewAgentTabPlacement({
         placement: body.placement,
         parentTabId: cleanOptionalString(body.parentTabId, ''),
@@ -5998,14 +6247,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
       console.log('[WebAgentTabs] START project=' + shortId(projectId, 12)
         + ' tool=' + toolType
-        + ' model=' + (cleanOptionalString(body.model || body.codexModel, '') || '-')
+        + ' model=' + (requestedModel || '-')
         + ' effort=' + (cleanOptionalString(body.effort || body.codexEffort, '') || '-'));
       const data = await bridgeRequest('createAgentTab', {
         projectId,
         toolType,
         startNow: true,
         name: cleanOptionalString(body.name, ''),
-        codexModel: cleanOptionalString(body.model || body.codexModel, ''),
+        codexModel: requestedModel,
         codexEffort: cleanOptionalString(body.effort || body.codexEffort, ''),
         visualParentTabId: placement.visualParentTabId,
         afterTabId: placement.afterTabId,
@@ -7612,6 +7861,8 @@ function start({
   readAgentStartReadiness: readAgentStartReadinessFn,
   registerTaskCompletionIntent: registerTaskCompletionIntentFn,
   e2eBoundaryTestGate: e2eBoundaryTestGateFn,
+  agentSendBridgeTimeoutMs: agentSendBridgeTimeoutMsFn,
+  projectPromptCatalog: projectPromptCatalogFn,
 }) {
   if (httpServer) {
     console.log('[WebServer] already started');
@@ -7638,6 +7889,11 @@ function start({
   readAgentStartReadiness = readAgentStartReadinessFn || null;
   registerTaskCompletionIntent = registerTaskCompletionIntentFn || null;
   e2eBoundaryTestGate = e2eBoundaryTestGateFn || null;
+  projectPromptCatalog = projectPromptCatalogFn || null;
+  agentSendBridgeTimeoutMs = Math.max(
+    1,
+    Number(agentSendBridgeTimeoutMsFn) || 60_000,
+  );
   token = loadOrCreateToken();
   registerBridgeReplyHandler();
   void getOrchestrationRunStore().initialize()
@@ -7742,6 +7998,15 @@ function stop() {
   readAgentStartReadiness = null;
   registerTaskCompletionIntent = null;
   e2eBoundaryTestGate = null;
+  agentSendBridgeTimeoutMs = 60_000;
+  for (const pending of pendingBridge.values()) {
+    clearTimeout(pending.timer);
+    if (pending.lateCleanupTimer) clearTimeout(pending.lateCleanupTimer);
+    const error = new Error('Bridge stopped');
+    error.code = 'bridge_unavailable';
+    pending.reject?.(error);
+  }
+  pendingBridge.clear();
   agentSendReceiptRegistry.clear();
   for (const run of externalRuns.values()) {
     clearExternalRunTimer(run, 'stopTimer');
@@ -7754,6 +8019,7 @@ function stop() {
   // reference only releases the current server instance; start() receives the
   // same durable authority again after an app/server restart.
   agentSendReceiptStore = null;
+  projectPromptCatalog = null;
   subscribers.clear();
   return serverClosePromise;
 }

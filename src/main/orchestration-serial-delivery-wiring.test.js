@@ -18,10 +18,16 @@ test('OID-3: durable orchestration delivery never uses the provider busy queue',
     'async function dispatchDeferredOrchestrationRun',
     '\nasync function dispatchNextDeferredOrchestrationForTarget',
   );
+  const receiptProjection = between(
+    source,
+    'async function applyOrchestrationTargetSendReceipt',
+    '\nasync function dispatchDeferredOrchestrationRun',
+  );
 
   assert.match(dispatcher, /claimDeferredDelivery\(runId/);
   assert.match(dispatcher, /queue:\s*false/);
-  assert.match(dispatcher, /reconcileOrchestrationRun\(runId/);
+  assert.match(dispatcher, /applyOrchestrationTargetSendReceipt\(runId/);
+  assert.match(receiptProjection, /reconcileOrchestrationRun\(runId/);
   assert.doesNotMatch(dispatcher, /queue:\s*true/);
 });
 

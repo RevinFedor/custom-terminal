@@ -124,6 +124,17 @@ const schedulePersist = () => {
   }, PERSIST_DEBOUNCE_MS);
 };
 
+/** Rows a snapshot has real measurements for (ranges are inclusive). */
+const measuredRowCoverage = (snapshot: HistoryMeasuredSnapshot): number => {
+  let covered = 0;
+  for (const range of snapshot.ranges) {
+    const r = range as { startIndex?: number; endIndex?: number; size?: number };
+    if (!isValidRange(r)) continue;
+    covered += (r.endIndex as number) - (r.startIndex as number) + 1;
+  }
+  return covered;
+};
+
 export function saveHistoryMeasuredLayout(
   ownerKey: string,
   snapshot: HistoryMeasuredSnapshot | null | undefined,
@@ -145,6 +156,27 @@ export function saveHistoryMeasuredLayout(
   const nextScrollTop = Number(snapshot.scrollTop) || 0;
   if (nextScrollTop === 0 && previous && previous.snapshot.scrollTop > 0) {
     return false;
+  }
+  // Coverage guard. A visit whose list mounted WITHOUT restored geometry
+  // (Timeline jump owns the position; first visit after a store loss) only
+  // measures the rows it actually rendered — a getState there describes a
+  // few dozen rows of a multi-thousand-row session. Storing that over a
+  // rich snapshot trades a full accelerator for a sliver (observed live
+  // 05.08: a 2618-row owner went from full coverage to 7 ranges, and every
+  // later return re-estimated everything outside them). Keep the richer
+  // knowledge and refresh only the offset; the poor save is not lost
+  // knowledge — the rows it measured are a subset of what is kept.
+  if (previous && Math.abs((Number(itemCount) || 0) - previous.itemCount) <= MAX_ITEM_DELTA) {
+    const nextCoverage = measuredRowCoverage(snapshot);
+    const previousCoverage = measuredRowCoverage(previous.snapshot);
+    if (nextCoverage < previousCoverage * 0.5) {
+      if (nextScrollTop > 0 || previous.snapshot.scrollTop === 0) {
+        previous.snapshot.scrollTop = nextScrollTop;
+        previous.savedAt = Date.now();
+        schedulePersist();
+      }
+      return false;
+    }
   }
   map.delete(ownerKey);
   map.set(ownerKey, {
@@ -217,6 +249,31 @@ export function estimateHistoryAverageRowHeight(
 }
 
 /**
+ * Per-index row height resolver from a measured snapshot, for the mount-wave
+ * shells. A shell must occupy EXACTLY the pixels its real card measured at —
+ * that is what makes the shell→card upgrade invisible to Virtuoso (same size
+ * reported, no re-measure cascade, no scroll correction). Rows the snapshot
+ * never measured fall back to the per-owner average.
+ */
+export function createHistoryRowHeightLookup(
+  snapshot: HistoryMeasuredSnapshot | null | undefined,
+  fallbackPx: number,
+): (index: number) => number {
+  const ranges = ((snapshot?.ranges || []) as Array<{
+    startIndex: number; endIndex: number; size: number;
+  }>).filter(isValidRange);
+  if (ranges.length === 0) return () => fallbackPx;
+  return (index: number) => {
+    for (const range of ranges) {
+      if (index >= range.startIndex && index <= range.endIndex && range.size > 0) {
+        return range.size;
+      }
+    }
+    return fallbackPx;
+  };
+}
+
+/**
  * O(1) live patch of the stored scroll offset, without re-asking Virtuoso for
  * a full state snapshot. The full save runs on scroll-idle (150ms debounce),
  * so a switch-away right after a scroll stored the PREVIOUS idle tick and the
@@ -240,6 +297,33 @@ export function updateHistoryMeasuredLayoutScrollTop(
   stored.snapshot.scrollTop = next;
   stored.savedAt = Date.now();
   schedulePersist();
+}
+
+/**
+ * Picks the next shell row the mount wave should upgrade. Only rows that are
+ * actually MOUNTED cost anything to hydrate, and among those the ones the user
+ * can see must come first — a shell in the viewport is visible placeholder
+ * content, a shell in the overscan is not. Candidates are DOM-measured rects
+ * of mounted shell rows; the viewport is the scroller's own rect. Returns the
+ * uuid of the topmost shell intersecting the (margin-expanded) viewport, then
+ * the topmost mounted shell, then null (no mounted shells left — the caller
+ * flips the remaining unmounted ones in one trivial commit).
+ */
+export function pickHistoryMountWaveTarget(
+  candidates: Array<{ uuid: string; top: number; bottom: number }>,
+  viewport: { top: number; bottom: number } | null,
+  marginPx = 200,
+): string | null {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  const sorted = [...candidates].sort((a, b) => a.top - b.top);
+  if (viewport) {
+    const vTop = viewport.top - marginPx;
+    const vBottom = viewport.bottom + marginPx;
+    for (const row of sorted) {
+      if (row.bottom >= vTop && row.top <= vBottom) return row.uuid;
+    }
+  }
+  return sorted[0]?.uuid ?? null;
 }
 
 /**

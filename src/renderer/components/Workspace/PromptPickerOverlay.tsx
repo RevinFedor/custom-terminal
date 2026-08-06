@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
+import { MessageSquareQuote } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -25,6 +26,10 @@ interface PromptRow {
   position: number;
   group_id?: number | string | null;
   file_paths?: string[];
+  path?: string;
+  relativePath?: string;
+  sourceName?: string;
+  sourceRoot?: string;
 }
 
 interface PromptGroupRow {
@@ -34,8 +39,15 @@ interface PromptGroupRow {
 }
 
 type FlatLeftItem =
+  | { kind: 'project'; project: ProjectPromptCatalog['project']; position: number }
   | { kind: 'group'; group: PromptGroupRow; position: number }
   | { kind: 'prompt'; prompt: PromptRow; position: number };
+
+interface ProjectPromptCatalog {
+  project: { id: string; name: string; path?: string; icon?: string | null };
+  sources: Array<{ rootPath: string; sourceName: string; promptCount: number }>;
+  prompts: PromptRow[];
+}
 
 interface ScriptRow {
   id: string;
@@ -48,9 +60,9 @@ interface ScriptRow {
 type InsertAgent = 'claude' | 'other';
 
 type InsertTarget =
-  | { surface: 'history'; tabId: string; agent: InsertAgent }
-  | { surface: 'sdk'; tabId: string; agent: InsertAgent }
-  | { surface: 'terminal'; tabId: string; agent: InsertAgent };
+  | { surface: 'history'; tabId: string; projectId: string | null; agent: InsertAgent }
+  | { surface: 'sdk'; tabId: string; projectId: string | null; agent: InsertAgent }
+  | { surface: 'terminal'; tabId: string; projectId: string | null; agent: InsertAgent };
 
 type HistoryMenuAnchor =
   { mode: 'point'; x: number; y: number };
@@ -65,6 +77,7 @@ const DEFAULT_PICKER_ANCHOR: PickerAnchor = { mode: 'bottom-center' };
 
 interface HistoryInsertMenuRequest {
   tabId: string;
+  projectId: string | null;
   cwd: string;
   x: number;
   y: number;
@@ -73,13 +86,17 @@ interface HistoryInsertMenuRequest {
   requestId: number;
 }
 
-function resolveTabAgent(tabId: string): InsertAgent {
-  for (const [, ws] of useWorkspaceStore.getState().openProjects) {
+function resolveTabOwner(tabId: string): { projectId: string | null; agent: InsertAgent; tabType?: string } {
+  for (const [projectId, ws] of useWorkspaceStore.getState().openProjects) {
     const tab = ws.tabs.get(tabId);
     if (!tab) continue;
-    return (tab.tabType === 'claude-sdk' || tab.commandType === 'claude') ? 'claude' : 'other';
+    return {
+      projectId,
+      agent: (tab.tabType === 'claude-sdk' || tab.commandType === 'claude') ? 'claude' : 'other',
+      tabType: tab.tabType,
+    };
   }
-  return 'other';
+  return { projectId: null, agent: 'other' };
 }
 
 function isVisibleElement(element: Element | null): element is HTMLElement {
@@ -358,6 +375,7 @@ const PromptPickerOverlay: React.FC = () => {
 
   const [groups, setGroups] = useState<PromptGroupRow[]>([]);
   const [prompts, setPrompts] = useState<PromptRow[]>([]);
+  const [projectCatalog, setProjectCatalog] = useState<ProjectPromptCatalog | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [contextRequest, setContextRequest] = useState<HistoryInsertMenuRequest | null>(null);
   const [shortcutTarget, setShortcutTarget] = useState<InsertTarget | null>(null);
@@ -447,16 +465,18 @@ const PromptPickerOverlay: React.FC = () => {
         pointerY: detail.y,
       }) as HistoryMenuAnchor;
       lastPointerRef.current = { x: detail.x, y: detail.y };
+      const owner = resolveTabOwner(detail.tabId);
       setOpen(false);
       setShortcutTarget(null);
       setShortcutAnchor(null);
       setContextRequest({
         tabId: detail.tabId,
+        projectId: owner.projectId,
         cwd: typeof detail.cwd === 'string' ? detail.cwd : '',
         x: detail.x,
         y: detail.y,
         anchor: capturedAnchor,
-        agent: resolveTabAgent(detail.tabId),
+        agent: owner.agent,
         requestId,
       });
       setSelectedKey(null);
@@ -489,6 +509,7 @@ const PromptPickerOverlay: React.FC = () => {
   //                composer DOM); fixed center-bottom of viewport with a
   //                user-controlled offset (Settings → "Picker — отступ снизу").
   const anchor = contextRequest?.anchor || shortcutAnchor || DEFAULT_PICKER_ANCHOR;
+  const pickerProjectId = contextRequest?.projectId || shortcutTarget?.projectId || null;
 
   useEffect(() => {
     if (!open) return;
@@ -496,25 +517,30 @@ const PromptPickerOverlay: React.FC = () => {
     setLoaded(false);
     (async () => {
       try {
-        const [pr, gr] = await Promise.all([
+        const [pr, gr, projectResult] = await Promise.all([
           ipcRenderer.invoke('prompts:get'),
           ipcRenderer.invoke('prompt-groups:get'),
+          pickerProjectId
+            ? ipcRenderer.invoke('project-prompts:list', pickerProjectId)
+            : Promise.resolve(null),
         ]);
         if (cancelled) return;
         const promptsArr: PromptRow[] = pr?.success ? (pr.data || []) : [];
         const groupsArr: PromptGroupRow[] = gr?.success ? (gr.data || []) : [];
         setPrompts(promptsArr);
         setGroups(groupsArr);
+        setProjectCatalog(projectResult?.success ? projectResult.data : null);
         setLoaded(true);
       } catch (err) {
         console.warn('[PromptPicker] load failed:', err);
         setPrompts([]);
         setGroups([]);
+        setProjectCatalog(null);
         setLoaded(true);
       }
     })();
     return () => { cancelled = true; };
-  }, [open, contextRequest?.requestId]);
+  }, [open, contextRequest?.requestId, pickerProjectId]);
 
   useEffect(() => {
     if (!contextRequest) {
@@ -552,17 +578,24 @@ const PromptPickerOverlay: React.FC = () => {
 
   const flatLeft = useMemo<FlatLeftItem[]>(() => {
     const items: FlatLeftItem[] = [];
+    if (projectCatalog?.project && projectCatalog.prompts.length > 0) {
+      items.push({ kind: 'project', project: projectCatalog.project, position: Number.NEGATIVE_INFINITY });
+    }
     groups.forEach(g => items.push({ kind: 'group', group: g, position: g.position }));
     prompts
       .filter(p => p.group_id == null || p.group_id === '' || p.group_id === undefined)
       .forEach(p => items.push({ kind: 'prompt', prompt: p, position: p.position }));
     items.sort((a, b) => a.position - b.position);
     return items;
-  }, [groups, prompts]);
+  }, [groups, projectCatalog, prompts]);
 
   useEffect(() => {
     if (!open || !loaded) return;
     setSelectedKey((current) => {
+      if (current?.startsWith('project:')) {
+        const projectId = current.slice('project:'.length);
+        if (flatLeft.some((item) => item.kind === 'project' && item.project.id === projectId)) return current;
+      }
       if (current?.startsWith('group:')) {
         const groupId = current.slice('group:'.length);
         if (flatLeft.some((item) => item.kind === 'group' && String(item.group.id) === groupId)) {
@@ -575,6 +608,7 @@ const PromptPickerOverlay: React.FC = () => {
       }
       const first = flatLeft[0];
       if (!first) return null;
+      if (first.kind === 'project') return `project:${first.project.id}`;
       return first.kind === 'group' ? `group:${first.group.id}` : 'ungrouped:0';
     });
   }, [open, loaded, flatLeft]);
@@ -583,22 +617,15 @@ const PromptPickerOverlay: React.FC = () => {
     const state = useWorkspaceStore.getState();
     const effectiveId = state.getEffectiveTabId();
     if (!effectiveId) return null;
-    let agent: InsertAgent = 'other';
-    let tabType: string | undefined;
-    for (const [, ws] of state.openProjects) {
-      const tab = ws.tabs.get(effectiveId);
-      if (!tab) continue;
-      tabType = tab.tabType;
-      if (tab.tabType === 'claude-sdk' || tab.commandType === 'claude') agent = 'claude';
-      break;
-    }
+    const owner = resolveTabOwner(effectiveId);
     if (findVisibleHistoryComposer(effectiveId)) {
-      return { tabId: effectiveId, surface: 'history', agent };
+      return { tabId: effectiveId, projectId: owner.projectId, surface: 'history', agent: owner.agent };
     }
     return {
       tabId: effectiveId,
-      surface: tabType === 'claude-sdk' ? 'sdk' : 'terminal',
-      agent,
+      projectId: owner.projectId,
+      surface: owner.tabType === 'claude-sdk' ? 'sdk' : 'terminal',
+      agent: owner.agent,
     };
   }, []);
 
@@ -646,7 +673,7 @@ const PromptPickerOverlay: React.FC = () => {
     const closeSequence = ++requestSeqRef.current;
     activePickerGenerationRef.current = 0;
     const target: InsertTarget | null = contextRequest
-      ? { surface: 'history', tabId: contextRequest.tabId, agent: contextRequest.agent }
+      ? { surface: 'history', tabId: contextRequest.tabId, projectId: contextRequest.projectId, agent: contextRequest.agent }
       : shortcutTarget;
     if (contextRequest) setContextRequest(null);
     else setOpen(false);
@@ -677,6 +704,10 @@ const PromptPickerOverlay: React.FC = () => {
 
   const selectedLeftItem = useMemo<FlatLeftItem | null>(() => {
     if (!selectedKey) return null;
+    if (selectedKey.startsWith('project:')) {
+      const projectId = selectedKey.slice('project:'.length);
+      return flatLeft.find(it => it.kind === 'project' && it.project.id === projectId) ?? null;
+    }
     if (selectedKey.startsWith('group:')) {
       const gid = selectedKey.slice('group:'.length);
       return flatLeft.find(it => it.kind === 'group' && String(it.group.id) === gid) ?? null;
@@ -690,15 +721,17 @@ const PromptPickerOverlay: React.FC = () => {
   }, [selectedKey, flatLeft]);
 
   const rightPrompts = useMemo<PromptRow[]>(() => {
-    if (!selectedLeftItem || selectedLeftItem.kind !== 'group') return [];
+    if (!selectedLeftItem) return [];
+    if (selectedLeftItem.kind === 'project') return projectCatalog?.prompts || [];
+    if (selectedLeftItem.kind !== 'group') return [];
     const gid = selectedLeftItem.group.id;
     return prompts.filter(p => String(p.group_id) === String(gid));
-  }, [selectedLeftItem, prompts]);
+  }, [projectCatalog, selectedLeftItem, prompts]);
 
   // When a non-group left row is selected, snap the prompt child level back.
   // (prompt-level only makes sense over the right panel).
   useEffect(() => {
-    if (selectedLeftItem && selectedLeftItem.kind !== 'group' && pickerLevel === 'prompt') {
+    if (selectedLeftItem && selectedLeftItem.kind === 'prompt' && pickerLevel === 'prompt') {
       setPickerLevel('group');
     }
   }, [selectedLeftItem, pickerLevel]);
@@ -706,7 +739,7 @@ const PromptPickerOverlay: React.FC = () => {
   const handleSelectPrompt = useCallback(async (prompt: PromptRow, asReference = false) => {
     const generation = contextRequest?.requestId || activePickerGenerationRef.current;
     const target: InsertTarget | null = contextRequest
-      ? { surface: 'history', tabId: contextRequest.tabId, agent: contextRequest.agent }
+      ? { surface: 'history', tabId: contextRequest.tabId, projectId: contextRequest.projectId, agent: contextRequest.agent }
       : shortcutTarget;
     if (!target) {
       showToast('No active tab', 'error');
@@ -787,6 +820,9 @@ const PromptPickerOverlay: React.FC = () => {
       if (pickerLevel === 'group') {
         const currentIdx = selectedKey
           ? flatLeft.findIndex(it => {
+              if (it.kind === 'project' && selectedKey.startsWith('project:')) {
+                return it.project.id === selectedKey.slice('project:'.length);
+              }
               if (it.kind === 'group' && selectedKey.startsWith('group:')) {
                 return String(it.group.id) === selectedKey.slice('group:'.length);
               }
@@ -803,7 +839,9 @@ const PromptPickerOverlay: React.FC = () => {
           if (flatLeft.length === 0) return;
           const next = (currentIdx + delta + flatLeft.length) % flatLeft.length;
           const item = flatLeft[next];
-          if (item.kind === 'group') {
+          if (item.kind === 'project') {
+            setSelectedKey(`project:${item.project.id}`);
+          } else if (item.kind === 'group') {
             setSelectedKey(`group:${item.group.id}`);
           } else {
             const ungroupedList = flatLeft.filter(x => x.kind === 'prompt');
@@ -816,7 +854,7 @@ const PromptPickerOverlay: React.FC = () => {
         if (k === 'ArrowDown') return moveSelection(1);
         if (k === 'ArrowUp') return moveSelection(-1);
         if (k === 'ArrowRight') {
-          if (selectedLeftItem?.kind === 'group' && rightPrompts.length > 0) {
+          if ((selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && rightPrompts.length > 0) {
             setPickerLevel('prompt');
             setSelectedPromptIdx(0);
           }
@@ -830,7 +868,7 @@ const PromptPickerOverlay: React.FC = () => {
         if (k === 'Enter') {
           if (selectedLeftItem?.kind === 'prompt') {
             void handleSelectPrompt(selectedLeftItem.prompt, wantsReference);
-          } else if (selectedLeftItem?.kind === 'group' && rightPrompts.length > 0) {
+          } else if ((selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && rightPrompts.length > 0) {
             setPickerLevel('prompt');
             setSelectedPromptIdx(0);
           }
@@ -1046,7 +1084,7 @@ const PromptPickerOverlay: React.FC = () => {
       !contextMode &&
       rightH > 0
       && selectedRoot === 'prompts'
-      && selectedLeftItem?.kind === 'group'
+      && (selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project')
     ) {
       const rightBottomIfDown = top + rightH;
       if (rightBottomIfDown + margin > vh) rightFlipUp = true;
@@ -1075,7 +1113,9 @@ const PromptPickerOverlay: React.FC = () => {
       contextRightTop = rightViewportTop - top;
 
       const descendantWidth = leftW + (
-        selectedRoot === 'prompts' && selectedLeftItem?.kind === 'group' && rightH > 0
+        selectedRoot === 'prompts'
+          && (selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project')
+          && rightH > 0
           ? GAP + rightW
           : 0
       );
@@ -1347,6 +1387,45 @@ const PromptPickerOverlay: React.FC = () => {
             <div style={placeholderStyle}>No prompts</div>
           )}
           {loaded && flatLeft.map((item) => {
+            if (item.kind === 'project') {
+              const key = `project:${item.project.id}`;
+              const isSelectedActive = selectedKey === key && pickerLevel === 'group';
+              const isSelectedDim = selectedKey === key && pickerLevel === 'prompt';
+              return (
+                <div
+                  ref={selectedKey === key ? selectedLeftRowRef : undefined}
+                  key={key}
+                  onMouseEnter={() => {
+                    setSelectedKey(key);
+                    setPickerLevel('group');
+                    setSelectedPromptIdx(0);
+                  }}
+                  onClick={() => {
+                    setSelectedKey(key);
+                    if ((projectCatalog?.prompts.length || 0) > 0) {
+                      setPickerLevel('prompt');
+                      setSelectedPromptIdx(0);
+                    }
+                  }}
+                  style={{
+                    ...rowStyle(isSelectedActive, isSelectedDim),
+                    color: isSelectedActive ? '#f5f3ff' : '#ddd6fe',
+                    borderBottom: '1px solid rgba(167,139,250,0.14)',
+                  }}
+                  data-project-prompt-group={item.project.id}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                    {item.project.icon ? (
+                      <img src={item.project.icon} alt="" style={{ width: 15, height: 15, borderRadius: 4, objectFit: 'cover' }} />
+                    ) : (
+                      <MessageSquareQuote size={15} strokeWidth={1.8} />
+                    )}
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.project.name}</span>
+                  </span>
+                  <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
+                </div>
+              );
+            }
             if (item.kind === 'group') {
               const key = `group:${item.group.id}`;
               const isSelectedActive = selectedKey === key && pickerLevel === 'group';
@@ -1440,7 +1519,7 @@ const PromptPickerOverlay: React.FC = () => {
       )}
 
       {/* Context descendants are independent floating surfaces. */}
-      {promptLibraryVisible && contextMode && selectedLeftItem?.kind === 'group' && (
+      {promptLibraryVisible && contextMode && (selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
           <div
             ref={rightPanelRef}
             style={{ ...panelStyle, width: RIGHT_W, ...contextRightPanelPositionStyle }}
@@ -1448,20 +1527,27 @@ const PromptPickerOverlay: React.FC = () => {
             {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
               const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
               return (
-                <div
-                  key={`rp-${p.id ?? i}`}
-                  onMouseEnter={() => {
-                    setPickerLevel('prompt');
-                    setSelectedPromptIdx(i);
-                  }}
-                  onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
-                  style={rowStyle(isSelected, false, isSelected && cmdHeld && promptHasFileReferences(p))}
-                >
-                  <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {p.title}
-                  </span>
-                  {renderReferenceIcon(p)}
-                </div>
+                <React.Fragment key={`rp-${p.id ?? i}`}>
+                  {p.sourceName && (i === 0 || rightPrompts[i - 1]?.sourceName !== p.sourceName) && (
+                    <div style={{ padding: '4px 8px 2px', fontSize: Math.max(8, fontSize - 3), color: '#a78bfa', opacity: 0.82, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                      {p.sourceName}
+                    </div>
+                  )}
+                  <div
+                    onMouseEnter={() => {
+                      setPickerLevel('prompt');
+                      setSelectedPromptIdx(i);
+                    }}
+                    onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
+                    style={rowStyle(isSelected, false, isSelected && cmdHeld && promptHasFileReferences(p))}
+                    title={p.relativePath || p.path || p.title}
+                  >
+                    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {p.title}
+                    </span>
+                    {renderReferenceIcon(p)}
+                  </div>
+                </React.Fragment>
               );
             })}
             {rightPrompts.length === 0 && (
@@ -1475,25 +1561,32 @@ const PromptPickerOverlay: React.FC = () => {
           and its History/composer anchor do not recenter or teleport. */}
       {promptLibraryVisible && !contextMode && (
         <div style={rightWrapperStyle}>
-          {selectedLeftItem?.kind === 'group' && (
+          {(selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
             <div ref={rightPanelRef} style={{ ...panelStyle, ...rightPanelPositionStyle }}>
               {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
                 const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
                 return (
-                  <div
-                    key={`rp-${p.id ?? i}`}
-                    onMouseEnter={() => {
-                      setPickerLevel('prompt');
-                      setSelectedPromptIdx(i);
-                    }}
-                    onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
-                    style={rowStyle(isSelected, false, isSelected && cmdHeld && promptHasFileReferences(p))}
-                  >
-                    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {p.title}
-                    </span>
-                    {renderReferenceIcon(p)}
-                  </div>
+                  <React.Fragment key={`rp-${p.id ?? i}`}>
+                    {p.sourceName && (i === 0 || rightPrompts[i - 1]?.sourceName !== p.sourceName) && (
+                      <div style={{ padding: '4px 8px 2px', fontSize: Math.max(8, fontSize - 3), color: '#a78bfa', opacity: 0.82, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                        {p.sourceName}
+                      </div>
+                    )}
+                    <div
+                      onMouseEnter={() => {
+                        setPickerLevel('prompt');
+                        setSelectedPromptIdx(i);
+                      }}
+                      onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
+                      style={rowStyle(isSelected, false, isSelected && cmdHeld && promptHasFileReferences(p))}
+                      title={p.relativePath || p.path || p.title}
+                    >
+                      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {p.title}
+                      </span>
+                      {renderReferenceIcon(p)}
+                    </div>
+                  </React.Fragment>
                 );
               })}
               {rightPrompts.length === 0 && (

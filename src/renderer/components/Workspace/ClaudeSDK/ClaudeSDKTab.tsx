@@ -3280,8 +3280,8 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
     e.preventDefault();
     const sel = window.getSelection();
     const hasSelection = !!(sel && sel.toString().length > 0);
-    ipcRenderer.send('show-sdk-context-menu', { tabId, hasSelection });
-  }, [tabId]);
+    ipcRenderer.send('show-sdk-context-menu', { tabId, projectId: ownerProjectId || null, hasSelection });
+  }, [ownerProjectId, tabId]);
 
   // Global keydown → composer. Detached from focus state.
   //

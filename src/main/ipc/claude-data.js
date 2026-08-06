@@ -3519,7 +3519,8 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
     reason = 'unknown',
     tabId = '',
     visible = null,
-    instanceId = ''
+    instanceId = '',
+    ifRevision = null,
   }) => {
     const timelineStartedAt = nodePerformance.now();
     const timelineStartAbs = nodePerformance.timeOrigin + timelineStartedAt;
@@ -3544,9 +3545,58 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
     }
 
     try {
+      // Unchanged fast-path, same witness as full history: if every chain
+      // file is byte-identical the timeline answer is byte-identical too —
+      // there is nothing session-chain resolution could discover. Each warm
+      // tab switch used to re-run the resolve anyway (250-441ms of main time
+      // ×4 loads per switch, live 05.08 15:29) merely to hand back the same
+      // 97 entries. The renderer caches the previous entries against this
+      // revision and keeps them on `unchanged`.
+      // Timeline revision context: schema tag + project-dir mtime. The dir
+      // witness is what catches a NEW chain file appearing (resume/fork child)
+      // — that changes latestSessionId without touching any existing file, so
+      // file stats alone would keep answering "unchanged" and the ChainResolve
+      // session adoption below would never fire.
+      const _timelineRevisionContext = async () => {
+        const found = findSessionFile(sessionId, cwd);
+        let dirMtime = 0;
+        if (found?.projectDir) {
+          try {
+            dirMtime = (await fs.promises.stat(found.projectDir)).mtimeMs;
+          } catch {}
+        }
+        return { context: 'claude-timeline-v1:' + dirMtime, primaryFound: found };
+      };
+      if (ifRevision) {
+        try {
+          const { context: contextNow, primaryFound: primaryForTimeline } =
+            await _timelineRevisionContext();
+          const validation = await validateHistoryRevision(
+            ifRevision,
+            { toolType: 'claude', sessionId, cwd },
+            {
+              context: contextNow,
+              resolvePrimaryFile: async () => primaryForTimeline?.filePath || null,
+              validateTopology: (sources) => _validateClaudeHistoryTopology(sources, cwd),
+            }
+          );
+          if (validation.unchanged) {
+            console.warn(
+              '[Perf:TimelineIPC] outcome=unchanged' +
+              ' source=' + source +
+              ' reason=' + reason +
+              ' tab=' + shortTab +
+              ' session=' + shortSession +
+              ' durMs=' + (nodePerformance.now() - timelineStartedAt).toFixed(1)
+            );
+            _endPerfOp(opId);
+            return { success: true, unchanged: true, revision: ifRevision };
+          }
+        } catch { /* fall through to the full read */ }
+      }
       // Resolve the full session chain (follows bridge entries across "Clear Context" boundaries)
       const resolveStartedAt = nodePerformance.now();
-      let { mergedMap: recordMap, lastRecord, sessionBoundaries } = await resolveSessionChain(sessionId, cwd);
+      let { mergedMap: recordMap, lastRecord, sessionBoundaries, historySources } = await resolveSessionChain(sessionId, cwd);
       const resolveMs = nodePerformance.now() - resolveStartedAt;
 
       if (!lastRecord) {
@@ -4045,7 +4095,15 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         ' totalMs=' + (nodePerformance.now() - timelineStartedAt).toFixed(1)
       );
       _endPerfOp(opId);
-      return { success: true, entries: presentedEntries, latestSessionId, sessionBoundaries, chainBreaks: _chainBreaks, claudeMemoryBoundaryUuid };
+      // Revision over the exact chain files this answer was built from; the
+      // renderer echoes it back as ifRevision on its next load of the same
+      // owner to hit the unchanged fast-path above.
+      const timelineRevision = buildHistoryRevision(
+        { toolType: 'claude', sessionId, cwd },
+        historySources,
+        { context: (await _timelineRevisionContext()).context }
+      );
+      return { success: true, entries: presentedEntries, latestSessionId, sessionBoundaries, chainBreaks: _chainBreaks, claudeMemoryBoundaryUuid, revision: timelineRevision };
 
     } catch (error) {
       console.error('[Claude Timeline] Error:', error);
@@ -4563,6 +4621,51 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
     }
   });
 
+  // Confirmed-settings cache. Every Claude tab switch asks for the current
+  // session's confirmed model/effort, and answering used to re-read the WHOLE
+  // session chain (59MB / 8411 lines measured live 05.08 08:12: 1631ms and
+  // 480ms IpcSlow, main event loop gaps 670-797ms) — the main-side half of the
+  // tab-switch freeze. The answer only changes when some file of the chain
+  // grows, so the cheap witness (primary file identity + mtime + size, plus
+  // the same for every chain file the last resolve touched) makes repeat
+  // switches O(stat count). SQLite-only relinks bump the chain files too
+  // (the child JSONL exists on disk), so the witness covers them.
+  const confirmedSettingsCache = new Map(); // sessionId -> { witness, result }
+  const CONFIRMED_SETTINGS_CACHE_MAX = 24;
+  const confirmedSettingsWitness = (sources, primaryFound) => {
+    const parts = [];
+    if (primaryFound?.filePath) {
+      try {
+        const stat = fs.statSync(primaryFound.filePath);
+        parts.push(primaryFound.filePath + ':' + stat.mtimeMs + ':' + stat.size);
+      } catch {
+        parts.push(primaryFound.filePath + ':gone');
+      }
+    }
+    // A resume/fork CHILD appears as a new file without touching any chain
+    // file — but it changes latestSessionId. The project directory's mtime is
+    // the cheap witness for "a file was added here" (same trick the full
+    // history revision uses).
+    if (primaryFound?.projectDir) {
+      try {
+        const dirStat = fs.statSync(primaryFound.projectDir);
+        parts.push('dir:' + primaryFound.projectDir + ':' + dirStat.mtimeMs);
+      } catch {
+        parts.push('dir:' + primaryFound.projectDir + ':gone');
+      }
+    }
+    for (const source of Array.isArray(sources) ? sources : []) {
+      if (!source?.filePath || source.filePath === primaryFound?.filePath) continue;
+      try {
+        const stat = fs.statSync(source.filePath);
+        parts.push(source.filePath + ':' + stat.mtimeMs + ':' + stat.size);
+      } catch {
+        parts.push(source.filePath + ':gone');
+      }
+    }
+    return parts.join('|');
+  };
+
   _api.getConfirmedSettings = async function ({
     tabId,
     sessionId: requestedSessionId,
@@ -4603,10 +4706,26 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
     }
 
     try {
+      // Cache fast-path: if every file the last resolve touched is unchanged
+      // (identity + mtime + size), the previous answer still describes the
+      // active branch. A live turn appending to the JSONL changes mtime/size
+      // and falls through to the full resolve.
+      const primaryForWitness = findSessionFile(sessionId, cwd);
+      const cached = confirmedSettingsCache.get(sessionId);
+      if (cached && primaryForWitness) {
+        const witnessNow = confirmedSettingsWitness(cached.sources, primaryForWitness);
+        if (witnessNow && witnessNow === cached.witness) {
+          // LRU refresh.
+          confirmedSettingsCache.delete(sessionId);
+          confirmedSettingsCache.set(sessionId, cached);
+          return { ...cached.result, cache: 'hit' };
+        }
+      }
       const {
         mergedMap: recordMap,
         lastRecord,
         sessionBoundaries,
+        historySources,
       } = await resolveSessionChain(sessionId, cwd);
       if (!lastRecord) {
         return {
@@ -4629,7 +4748,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         ),
       });
       const confirmed = deriveConfirmedClaudeSettings(activeBranch);
-      return {
+      const result = {
         success: true,
         sessionId,
         latestSessionId: resolveLatestSessionInChain(sessionId, cwd),
@@ -4641,6 +4760,24 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         effortProofSessionId: confirmed?.effort?.proofSessionId || null,
         proof: 'active-jsonl-branch',
       };
+      // Witness captured AFTER the resolve, over the exact files it read —
+      // a mid-resolve append makes the stored witness already stale, so the
+      // next call re-resolves rather than serving a torn answer.
+      const witness = confirmedSettingsWitness(historySources, primaryForWitness);
+      if (witness) {
+        confirmedSettingsCache.delete(sessionId);
+        confirmedSettingsCache.set(sessionId, {
+          witness,
+          sources: historySources,
+          result,
+        });
+        while (confirmedSettingsCache.size > CONFIRMED_SETTINGS_CACHE_MAX) {
+          const oldest = confirmedSettingsCache.keys().next().value;
+          if (oldest === undefined) break;
+          confirmedSettingsCache.delete(oldest);
+        }
+      }
+      return result;
     } catch (error) {
       return {
         success: false,
@@ -4656,6 +4793,108 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
     (_event, payload = {}) => _api.getConfirmedSettings(payload)
   );
 
+  // Shared revision plumbing for the full-history payload. The context is a
+  // hash of everything that can change the PRESENTED history without the
+  // JSONL files changing (editable prompt, presentations, response timings,
+  // project-dir discovery). Extracted so a standalone cheap "did anything
+  // change?" IPC can answer with stats only — the renderer's warm-return
+  // verify used to go through the FULL get-full-history pipeline for a
+  // "nothing changed" answer, measured 821-1292ms wall per tab switch under
+  // the switch-window IPC storm (live 05.08 15:29).
+  const _buildFullHistoryRevisionParts = async ({ sessionId, cwd, tabId }) => {
+    let editablePromptState = null;
+    let promptStateLookupFailed = false;
+    if (tabId && _getClaudeEditableLastPromptState) {
+      try {
+        editablePromptState = await _getClaudeEditableLastPromptState(
+          tabId,
+          'claude-get-full-history-revision'
+        );
+      } catch (e) {
+        promptStateLookupFailed = true;
+        console.warn('[FullHistory:Revision] prompt state lookup failed tab=' +
+          String(tabId).slice(-12) + ' error=' + (e?.message || e));
+      }
+    }
+    // A resume/fork child can appear without changing the source JSONL. A new
+    // child changes the project directory metadata, so keep that cheap witness
+    // in the revision instead of rescanning every JSONL head on every tab switch.
+    const primaryFound = findSessionFile(sessionId, cwd);
+    let discovery = null;
+    if (primaryFound?.projectDir) {
+      try {
+        const stat = await fs.promises.stat(primaryFound.projectDir);
+        discovery = {
+          projectDir: path.resolve(primaryFound.projectDir),
+          mtimeMs: stat.mtimeMs,
+        };
+      } catch {}
+    }
+    const baseRevisionContext = _claudeHistoryContext(editablePromptState, discovery);
+    const presentationRevision = _projectManager?.db?.getHistoryPromptPresentationRevision
+      ? _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
+      : 'none';
+    const responseTimingRevision = _projectManager?.db?.getHistoryResponseTimingRevision
+      ? _projectManager.db.getHistoryResponseTimingRevision('claude', sessionId, tabId || null)
+      : 'none';
+    const revisionContext = JSON.stringify({
+      base: baseRevisionContext,
+      promptPresentationRevision: presentationRevision,
+      responseTimingRevision,
+    });
+    return {
+      revisionContext,
+      baseRevisionContext,
+      primaryFound,
+      promptStateLookupFailed,
+      presentationRevision,
+      responseTimingRevision,
+      editablePromptState,
+    };
+  };
+
+  const _validateFullHistoryIfRevision = async (ifRevision, { sessionId, cwd, tabId }, parts) => {
+    if (!ifRevision || parts.promptStateLookupFailed) return { unchanged: false };
+    const validation = await validateHistoryRevision(
+      ifRevision,
+      { toolType: 'claude', sessionId, cwd },
+      {
+        context: parts.revisionContext,
+        resolvePrimaryFile: async () => parts.primaryFound?.filePath || null,
+        validateTopology: (sources) => _validateClaudeHistoryTopology(sources, cwd),
+      }
+    );
+    const presentationStillCurrent =
+      !_projectManager?.db?.getHistoryPromptPresentationRevision
+      || _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
+        === parts.presentationRevision;
+    const responseTimingStillCurrent =
+      !_projectManager?.db?.getHistoryResponseTimingRevision
+      || _projectManager.db.getHistoryResponseTimingRevision('claude', sessionId, tabId || null)
+        === parts.responseTimingRevision;
+    return {
+      unchanged: !!(validation.unchanged && presentationStillCurrent && responseTimingStillCurrent),
+    };
+  };
+
+  // Stats-only freshness probe: answers "would get-full-history say unchanged?"
+  // without resolving the session chain or serializing anything. This is what
+  // the warm-return verify calls now; only a real change escalates to the
+  // heavy read.
+  ipcMain.handle('claude:validate-full-history-revision', async (_event, payload = {}) => {
+    const { sessionId, cwd, tabId, revision } = payload;
+    if (!sessionId || !revision) return { success: false, unchanged: false };
+    try {
+      const parts = await _buildFullHistoryRevisionParts({ sessionId, cwd, tabId });
+      const { unchanged } = await _validateFullHistoryIfRevision(
+        revision, { sessionId, cwd, tabId }, parts,
+      );
+      return { success: true, unchanged };
+    } catch (error) {
+      return { success: false, unchanged: false, error: error?.message || String(error) };
+    }
+  });
+
   // Get full chat history for History Panel (structured entries, not markdown)
   _api.getFullHistory = async function getFullHistory(payload = {}, context = {}) {
     const event = { sender: context?.sender || null };
@@ -4665,66 +4904,19 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
     }
 
     try {
-      let editablePromptState = null;
-      let promptStateLookupFailed = false;
-      if (tabId && _getClaudeEditableLastPromptState) {
-        try {
-          editablePromptState = await _getClaudeEditableLastPromptState(
-            tabId,
-            'claude-get-full-history-revision'
-          );
-        } catch (e) {
-          promptStateLookupFailed = true;
-          console.warn('[FullHistory:Revision] prompt state lookup failed tab=' +
-            String(tabId).slice(-12) + ' error=' + (e?.message || e));
-        }
-      }
-      // A resume/fork child can appear without changing the source JSONL. A new
-      // child changes the project directory metadata, so keep that cheap witness
-      // in the revision instead of rescanning every JSONL head on every tab switch.
-      const primaryFound = findSessionFile(sessionId, cwd);
-      let discovery = null;
-      if (primaryFound?.projectDir) {
-        try {
-          const stat = await fs.promises.stat(primaryFound.projectDir);
-          discovery = {
-            projectDir: path.resolve(primaryFound.projectDir),
-            mtimeMs: stat.mtimeMs,
-          };
-        } catch {}
-      }
-      const baseRevisionContext = _claudeHistoryContext(editablePromptState, discovery);
-      const presentationRevision = _projectManager?.db?.getHistoryPromptPresentationRevision
-        ? _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
-        : 'none';
-      const responseTimingRevision = _projectManager?.db?.getHistoryResponseTimingRevision
-        ? _projectManager.db.getHistoryResponseTimingRevision('claude', sessionId, tabId || null)
-        : 'none';
-      const revisionContext = JSON.stringify({
-        base: baseRevisionContext,
-        promptPresentationRevision: presentationRevision,
-        responseTimingRevision,
-      });
+      const revisionParts = await _buildFullHistoryRevisionParts({ sessionId, cwd, tabId });
+      const {
+        revisionContext,
+        baseRevisionContext,
+        primaryFound,
+        editablePromptState,
+      } = revisionParts;
 
-      if (ifRevision && !promptStateLookupFailed) {
-        const validation = await validateHistoryRevision(
-          ifRevision,
-          { toolType: 'claude', sessionId, cwd },
-          {
-            context: revisionContext,
-            resolvePrimaryFile: async () => primaryFound?.filePath || null,
-            validateTopology: (sources) => _validateClaudeHistoryTopology(sources, cwd),
-          }
+      if (ifRevision) {
+        const { unchanged } = await _validateFullHistoryIfRevision(
+          ifRevision, { sessionId, cwd, tabId }, revisionParts,
         );
-        const presentationStillCurrent =
-          !_projectManager?.db?.getHistoryPromptPresentationRevision
-          || _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
-            === presentationRevision;
-        const responseTimingStillCurrent =
-          !_projectManager?.db?.getHistoryResponseTimingRevision
-          || _projectManager.db.getHistoryResponseTimingRevision('claude', sessionId, tabId || null)
-            === responseTimingRevision;
-        if (validation.unchanged && presentationStillCurrent && responseTimingStillCurrent) {
+        if (unchanged) {
           return {
             success: true,
             unchanged: true,
@@ -5685,6 +5877,16 @@ function parseTimelineEntries(sourcePath) {
   }
 }
 
+// Materialization answers stay valid while the file is byte-identical — and
+// the question itself is nearly boolean ("does the timeline have entries?").
+// Without this cache every tab switch SYNCHRONOUSLY re-read and re-parsed the
+// whole session JSONL in main (readFileSync + per-line JSON.parse inside
+// parseTimelineEntries): on a 59MB session that froze the main event loop for
+// ~1s per switch with activeOps=0 (prod 06.08 03:50, gapMs=1046, three
+// 318-335ms get-presence calls in one switch — get-presence calls this on
+// every poll). The user felt it as "only THIS tab hangs on switch".
+const sessionMaterializationCache = new Map(); // sessionId -> { filePath, size, mtimeMs, result }
+const SESSION_MATERIALIZATION_CACHE_MAX = 32;
 function getSessionMaterialization(sessionId, cwd) {
   if (!sessionId) {
     return {
@@ -5710,11 +5912,23 @@ function getSessionMaterialization(sessionId, cwd) {
         reason: 'session-file-not-found',
       };
     }
+    let stat = null;
+    try { stat = fs.statSync(found.filePath); } catch {}
+    const cached = sessionMaterializationCache.get(sessionId);
+    if (
+      cached
+      && stat
+      && cached.filePath === found.filePath
+      && cached.size === stat.size
+      && cached.mtimeMs === stat.mtimeMs
+    ) {
+      sessionMaterializationCache.delete(sessionId);
+      sessionMaterializationCache.set(sessionId, cached);
+      return cached.result;
+    }
     const entries = parseTimelineEntries(found.filePath);
     const timelineCount = Array.isArray(entries) ? entries.length : 0;
-    let fileSize = 0;
-    try { fileSize = fs.statSync(found.filePath).size; } catch {}
-    return {
+    const result = {
       success: true,
       sessionId,
       materialized: timelineCount > 0,
@@ -5722,9 +5936,23 @@ function getSessionMaterialization(sessionId, cwd) {
       timelineCount,
       fileFound: true,
       filePath: found.filePath,
-      fileSize,
+      fileSize: stat?.size || 0,
       reason: timelineCount > 0 ? 'timeline-has-entries' : 'timeline-empty',
     };
+    if (stat) {
+      sessionMaterializationCache.set(sessionId, {
+        filePath: found.filePath,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        result,
+      });
+      while (sessionMaterializationCache.size > SESSION_MATERIALIZATION_CACHE_MAX) {
+        const oldest = sessionMaterializationCache.keys().next().value;
+        if (oldest === undefined) break;
+        sessionMaterializationCache.delete(oldest);
+      }
+    }
+    return result;
   } catch (e) {
     return {
       success: false,
