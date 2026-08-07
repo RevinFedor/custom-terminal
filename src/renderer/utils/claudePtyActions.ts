@@ -71,6 +71,7 @@ export interface ClaudePtySendOptions {
   model?: string;
   effort?: string;
   thinking?: string;
+  assertNotCancelled?: () => void;
   claudeExactEmptyEvidence?: Record<string, unknown> | null;
   refreshClaudeExactEmptyEvidence?: () => Promise<{
     success: boolean;
@@ -172,6 +173,7 @@ async function waitForClaudePtySettingProof({
   afterMs,
   source,
   timeoutMs,
+  assertNotCancelled,
 }: {
   tabId: string;
   kind: ClaudePtySettingKind;
@@ -179,10 +181,12 @@ async function waitForClaudePtySettingProof({
   afterMs: number;
   source: string;
   timeoutMs: number;
+  assertNotCancelled?: () => void;
 }) {
   const deadline = Date.now() + timeoutMs;
   let last: ClaudePtySettingProof | null = null;
   while (Date.now() <= deadline) {
+    assertNotCancelled?.();
     const proof = await ipcRenderer.invoke('claude:startup-slash-proof', {
       tabId,
       command,
@@ -194,6 +198,7 @@ async function waitForClaudePtySettingProof({
       error: errorText(error),
     }));
     last = proof || null;
+    assertNotCancelled?.();
     if (proof?.success === true) {
       return { proof, last };
     }
@@ -216,12 +221,15 @@ async function applyClaudePtySettingInner({
   kind,
   value,
   source,
+  assertNotCancelled,
 }: {
   tabId: string;
   kind: ClaudePtySettingKind;
   value: string;
   source: string;
+  assertNotCancelled?: () => void;
 }): Promise<ClaudePtySettingResult> {
+  assertNotCancelled?.();
   const normalizedValue = String(value || '').trim();
   if (!tabId) throw new Error('tabId required');
   if (!normalizedValue) throw new Error(kind + ' value required');
@@ -264,9 +272,11 @@ async function applyClaudePtySettingInner({
       afterMs,
       source,
       timeoutMs: 6500,
+      assertNotCancelled,
     });
 
     if (!observed.proof) {
+      assertNotCancelled?.();
       // One bounded retry is allowed only when main atomically copied the current
       // composer and it still equals this exact command at the Enter boundary.
       // A changed or unknown draft is never submitted.
@@ -287,6 +297,7 @@ async function applyClaudePtySettingInner({
           afterMs,
           source: source + ':exact-retry',
           timeoutMs: 3500,
+          assertNotCancelled,
         });
       }
     }
@@ -328,16 +339,21 @@ export async function applyClaudePtySetting({
   kind,
   value,
   source = 'claude-pty-setting',
+  assertNotCancelled,
 }: {
   tabId: string;
   kind: ClaudePtySettingKind;
   value: string;
   source?: string;
+  assertNotCancelled?: () => void;
 }): Promise<ClaudePtySettingResult> {
   const previous = claudeSettingQueueTails.get(tabId) || Promise.resolve();
   const work = previous
     .catch(() => undefined)
-    .then(() => applyClaudePtySettingInner({ tabId, kind, value, source }));
+    .then(() => {
+      assertNotCancelled?.();
+      return applyClaudePtySettingInner({ tabId, kind, value, source, assertNotCancelled });
+    });
   claudeSettingQueueTails.set(tabId, work);
   try {
     return await work;
@@ -517,18 +533,22 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
     ' statusAtSend=' + (options.statusAtSend || '-') +
     ' chars=' + prompt.length);
   const work = (async () => {
+    const assertNotCancelled = options.assertNotCancelled || (() => {});
     const requestedModel = String(options.model || '').trim();
     const requestedEffort = String(options.effort || '').trim();
     let composerMutated = false;
     let exactEmptyEvidence = options.claudeExactEmptyEvidence || null;
+    assertNotCancelled();
     if (requestedModel && requestedModel !== 'none') {
       await applyClaudePtySetting({
         tabId,
         kind: 'model',
         value: requestedModel,
         source: (options.source || 'claude-pty-action') + ':model',
+        assertNotCancelled,
       });
       composerMutated = true;
+      assertNotCancelled();
     }
     if (requestedEffort && requestedEffort !== 'none') {
       await applyClaudePtySetting({
@@ -536,10 +556,13 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
         kind: 'effort',
         value: requestedEffort,
         source: (options.source || 'claude-pty-action') + ':effort',
+        assertNotCancelled,
       });
       composerMutated = true;
+      assertNotCancelled();
     }
     if (typeof options.thinking === 'string' && options.thinking.trim()) {
+      assertNotCancelled();
       const wantThinking = options.thinking !== 'disabled';
       const thinkMap: Map<string, boolean> = (window as any).__thinkStateForTab
         || ((window as any).__thinkStateForTab = new Map());
@@ -562,8 +585,10 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
         thinkMap.set(tabId, toggle.thinking);
         composerMutated = true;
       }
+      assertNotCancelled();
     }
     if (composerMutated) {
+      assertNotCancelled();
       if (!options.refreshClaudeExactEmptyEvidence) {
         return {
           success: false,
@@ -573,6 +598,7 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
         };
       }
       const refreshed = await options.refreshClaudeExactEmptyEvidence();
+      assertNotCancelled();
       if (refreshed?.success !== true) {
         return {
           success: false,
@@ -599,6 +625,7 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
       verifyClaudeVisibleDraftBeforePaste: true,
       presentationSnapshot: options.presentationSnapshot || null,
     };
+    assertNotCancelled();
     if (!composerMutated) {
       return ipcRenderer.invoke('terminal:paste', {
         ...pasteRequest,

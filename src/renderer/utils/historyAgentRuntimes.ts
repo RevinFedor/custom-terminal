@@ -102,6 +102,7 @@ export interface AgentSendPromptOptions {
   model?: string;
   effort?: string;
   thinking?: string;
+  assertNotCancelled?: () => void;
   claudeExactEmptyEvidence?: Record<string, unknown> | null;
   refreshClaudeExactEmptyEvidence?: () => Promise<{
     success: boolean;

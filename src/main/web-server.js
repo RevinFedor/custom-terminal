@@ -95,6 +95,9 @@ const {
   promptAuditFingerprint,
 } = require('./prompt-audit-fingerprint');
 const {
+  agentPromptAuditMatchesHash,
+} = require('./agent-prompt-audit-identity');
+const {
   RECEIPT_STATES: AGENT_SEND_RECEIPT_STATES,
   createAgentSendReceiptRegistry,
   fingerprintAgentSendRequest,
@@ -246,6 +249,7 @@ let orchestrationRunStore = null;
 // in-memory registry below only joins concurrent callers and projects the
 // current-process waiter; it must never recreate retry authority after restart.
 let agentSendReceiptStore = null;
+let agentSendReceiptStartupReady = Promise.resolve({ ready: true });
 const orchestrationCompletionInflight = new Set();
 const orchestrationCompletionTrailing = new Set();
 const orchestrationNotificationInflight = new Set();
@@ -1559,6 +1563,10 @@ async function runAgentSendScenario({
   timeoutMs = agentSendBridgeTimeoutMs,
   onLateReceipt = null,
 }) {
+  // A restart may have left an Enter-armed operation whose exact transcript
+  // proof is still being reconciled. Never reserve/replay that operation until
+  // the single bounded startup pass has settled its durable truth.
+  await agentSendReceiptStartupReady;
   const promptHash = promptAuditFingerprint(prompt);
   const requestFingerprint = sendRequestFingerprint || fingerprintAgentSendRequest({
     prompt,
@@ -2605,7 +2613,8 @@ async function notifyAgentPromptAuditResult(detail = {}) {
       ...detail,
       operationKey: durableOperationKey,
       attemptId: durableAttemptId,
-      promptHash: detail?.actualHash || detail?.promptHash,
+      promptHash: detail?.expectedHash || detail?.promptHash || detail?.actualHash,
+      actualHash: detail?.actualHash || detail?.promptHash,
     });
     console.log('[AgentSendReceipt] durable audit op=' + durableOperationKey.slice(0, 72)
       + ' attempt=' + durableAttemptId.slice(0, 24)
@@ -2665,6 +2674,9 @@ async function notifyAgentPromptAuditResult(detail = {}) {
       && durableRecord?.state === 'confirmed'
       && durableRecord?.attemptId === durableAttemptId
     );
+    const externalPromptProof = externalRun?.promptAuditHash
+      ? agentPromptAuditMatchesHash(externalRun.promptAuditHash, detail)
+      : { matches: false };
     const confirmed = Boolean(
       externalRun
       && exactDurableAttempt
@@ -2673,8 +2685,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
       && exactProvider
       && exactSession
       && externalRun.promptAuditHash
-      && externalRun.promptAuditHash === detail.expectedHash
-      && externalRun.promptAuditHash === detail.actualHash
+      && externalPromptProof.matches === true
     );
     if (!confirmed) {
       return {
@@ -5720,6 +5731,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (parsed.pathname === '/api/inbox/runs' && req.method === 'POST') {
     let inboxRun = null;
     try {
+      await agentSendReceiptStartupReady;
       const body = await readBody(req);
       const provider = body.provider === 'codex' ? 'codex' : null;
       if (!provider) return sendJson(res, 400, { error: 'provider must be codex' });
@@ -7849,6 +7861,7 @@ function attachWebSocket(server, sdkSessions) {
 function start({
   sdkSessions,
   agentSendReceiptStore: agentSendReceiptStoreFn,
+  agentSendReceiptStartupReady: agentSendReceiptStartupReadyFn,
   computeActiveLoaders: computeFn,
   computeProjectActivity: computeProjectActivityFn,
   answerClaudeQuestion: answerFn,
@@ -7870,7 +7883,13 @@ function start({
   }
   if (!sdkSessions) throw new Error('start({sdkSessions}) — Map of live SDK sessions required');
   agentSendReceiptStore = agentSendReceiptStoreFn || null;
-  if (agentSendReceiptStore) {
+  agentSendReceiptStartupReady = agentSendReceiptStartupReadyFn
+    ? Promise.resolve(agentSendReceiptStartupReadyFn).catch((error) => ({
+      ready: false,
+      error: error?.message || String(error),
+    }))
+    : Promise.resolve({ ready: true });
+  if (agentSendReceiptStore && !agentSendReceiptStartupReadyFn) {
     const reconciled = agentSendReceiptStore.reconcileStartup();
     if (reconciled?.changed) {
       console.warn('[AgentSendReceipt] startup reconciled active attempts=' + reconciled.changed);
@@ -8019,6 +8038,7 @@ function stop() {
   // reference only releases the current server instance; start() receives the
   // same durable authority again after an app/server restart.
   agentSendReceiptStore = null;
+  agentSendReceiptStartupReady = Promise.resolve({ ready: true });
   projectPromptCatalog = null;
   subscribers.clear();
   return serverClosePromise;

@@ -149,6 +149,52 @@ test('proven not-submitted retries with a new attempt, clears session A, and lat
   assert.deepEqual(promoted.record.transcriptBoundary, { byteOffset: 42, line: 7 });
 });
 
+test('proven Codex canonical audit keeps expected operation hash and records observed hash', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity());
+  store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+
+  const promoted = store.promoteFromAudit(exactAudit(begun.attemptId, {
+    promptHash: 'hash-a',
+    expectedHash: 'hash-a',
+    actualHash: 'provider-hash',
+    canonicalized: true,
+    canonicalReason: 'codex_trimmed_boundary_whitespace',
+  }));
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.record.promptHash, 'hash-a');
+  assert.equal(promoted.record.auditIdentity.promptHash, 'provider-hash');
+  assert.equal(promoted.record.receipt.actualHash, 'provider-hash');
+  assert.equal(promoted.record.receipt.canonicalized, true);
+
+  const foreign = store.beginAttempt(identity({
+    operationKey: 'project:tab-a:handoff-b',
+    handoffId: 'handoff-b',
+    requestFingerprint: 'request-b',
+  }));
+  store.settleAttempt(foreign.record.operationKey, foreign.attemptId, {
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+  const rejected = store.promoteFromAudit(exactAudit(foreign.attemptId, {
+    operationKey: foreign.record.operationKey,
+    actualHash: 'provider-hash',
+    canonicalized: true,
+    canonicalReason: 'unproven-transform',
+  }));
+  assert.equal(rejected.promoted, false);
+  assert.ok(rejected.mismatchedFields.includes('canonicalProof'));
+});
+
 test('settleAttempt is an attempt CAS and a stale callback cannot roll back a retry', (t) => {
   const harness = openMemoryHarness(t);
   if (!harness) return;
@@ -204,7 +250,7 @@ test('enter-armed cannot move backwards to in-flight', (t) => {
   assert.equal(fixture.store.get(request.operationKey).state, STORE_STATES.ENTER_ARMED);
 });
 
-test('restart changes only in-flight and enter-armed attempts to durable delivery-unknown', (t) => {
+test('restart distinguishes proven pre-Enter attempts from enter-armed unknown delivery', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-send-receipts-'));
   const filename = path.join(root, 'receipts.sqlite');
   let db;
@@ -226,7 +272,19 @@ test('restart changes only in-flight and enter-armed attempts to durable deliver
   let uuid = 0;
   let store = createAgentSendReceiptStore(db, { randomUUID: () => `restart-${++uuid}` });
   const active = store.beginAttempt(identity());
+  store.stageAttemptContext(active.record.operationKey, active.attemptId, {
+    promptText: 'recover this draft',
+    transcriptBoundary: { filePath: '/tmp/session.jsonl', fileSize: 12 },
+  });
   store.markAttemptState(active.record.operationKey, active.attemptId, STORE_STATES.ENTER_ARMED);
+  const preEnter = store.beginAttempt(identity({
+    operationKey: 'pre-enter-op',
+    handoffId: 'pre-enter-handoff',
+    requestFingerprint: 'pre-enter-request',
+  }));
+  store.stageAttemptContext(preEnter.record.operationKey, preEnter.attemptId, {
+    promptText: 'restore before Enter',
+  });
   store.reserveOrGet(identity({
     operationKey: 'reserved-op',
     handoffId: 'reserved-handoff',
@@ -243,15 +301,29 @@ test('restart changes only in-flight and enter-armed attempts to durable deliver
   db = new Database(filename);
   store = createAgentSendReceiptStore(db, { randomUUID: () => `restart-${++uuid}` });
   const reconciled = store.reconcileStartup();
-  assert.equal(reconciled.changed, 1);
+  assert.equal(reconciled.changed, 2);
   assert.equal(store.get(active.record.operationKey).state, STORE_STATES.DELIVERY_UNKNOWN);
   assert.equal(store.get(active.record.operationKey).receipt.code, 'agent_send_restart_during_delivery');
+  assert.equal(store.get(active.record.operationKey).receipt.promptText, 'recover this draft');
+  assert.deepEqual(store.get(active.record.operationKey).transcriptBoundary, {
+    filePath: '/tmp/session.jsonl',
+    fileSize: 12,
+  });
+  assert.equal(store.get('pre-enter-op').state, STORE_STATES.NOT_SUBMITTED);
+  assert.equal(store.get('pre-enter-op').receipt.code, 'agent_send_restart_before_enter');
+  assert.equal(store.get('pre-enter-op').receipt.promptText, 'restore before Enter');
   assert.equal(store.get('reserved-op').state, STORE_STATES.RESERVED);
   assert.equal(store.get('preparing-op').state, STORE_STATES.PREPARING);
 
   const replay = store.beginAttempt(identity());
   assert.equal(replay.action, 'replay');
   assert.equal(replay.record.attemptId, active.attemptId, 'restart never authorizes a blind retry');
+  const preEnterRetry = store.beginAttempt(identity({
+    operationKey: 'pre-enter-op',
+    handoffId: 'pre-enter-handoff',
+    requestFingerprint: 'pre-enter-request',
+  }));
+  assert.equal(preEnterRetry.action, 'attempt-started');
   const resumedReservation = store.beginAttempt(identity({
     operationKey: 'preparing-op',
     handoffId: 'preparing-handoff',

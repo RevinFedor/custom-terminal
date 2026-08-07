@@ -1,6 +1,9 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const {
+  classifyAgentPromptAuditIdentity,
+} = require('./agent-prompt-audit-identity');
 
 const DEFAULT_RETENTION_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_PER_TAB = 32;
@@ -137,16 +140,19 @@ function normalizeRequest(request) {
 }
 
 function normalizeAudit(audit) {
-  const actualHash = audit?.actualHash || audit?.promptHash;
+  const identity = classifyAgentPromptAuditIdentity(audit);
   return {
     tabId: requiredString(audit?.tabId, 'tabId'),
     handoffId: requiredString(audit?.handoffId, 'handoffId'),
     provider: requiredString(audit?.provider || audit?.toolType, 'provider'),
     sessionId: requiredString(audit?.sessionId, 'sessionId'),
-    promptHash: requiredString(actualHash, 'promptHash'),
-    expectedHash: typeof audit?.expectedHash === 'string' && audit.expectedHash.trim()
-      ? audit.expectedHash.trim()
-      : null,
+    promptHash: optionalString(identity.identityHash),
+    actualHash: requiredString(identity.actualHash, 'actualHash'),
+    expectedHash: requiredString(identity.expectedHash, 'expectedHash'),
+    identityAccepted: identity.accepted === true,
+    identityReason: identity.reason || null,
+    canonicalized: identity.canonicalized === true,
+    canonicalReason: identity.canonicalReason || null,
     success: audit?.success === true,
     raw: audit,
   };
@@ -524,8 +530,9 @@ function createAgentSendReceiptRegistry(options = {}) {
     const mismatchedFields = [];
     if (record.provider && record.provider !== audit.provider) mismatchedFields.push('provider');
     if (record.sessionId && record.sessionId !== audit.sessionId) mismatchedFields.push('sessionId');
+    if (!audit.identityAccepted) mismatchedFields.push('canonicalProof');
     if (record.promptHash !== audit.promptHash) mismatchedFields.push('promptHash');
-    if (audit.expectedHash && record.promptHash !== audit.expectedHash) {
+    if (record.promptHash !== audit.expectedHash) {
       mismatchedFields.push('expectedHash');
     }
     if (mismatchedFields.length > 0) {
@@ -567,6 +574,10 @@ function createAgentSendReceiptRegistry(options = {}) {
       provider: record.provider,
       sessionId: record.sessionId,
       promptHash: record.promptHash,
+      actualHash: audit.actualHash,
+      expectedHash: audit.expectedHash,
+      canonicalized: audit.canonicalized,
+      canonicalReason: audit.canonicalReason,
       auditTimestamp: audit.raw?.auditTimestamp || timestamp,
       entryUuid: audit.raw?.entryUuid || null,
     });

@@ -69,7 +69,10 @@ test('missing active prompt escalates only from a current idle frame and is rech
   );
   const captureGuard = mainSource.indexOf('const isClaudeMissingPromptCapture =');
   const liveSnapshot = mainSource.indexOf("'before-missing-prompt-exact-capture'", captureGuard);
-  const frameGuard = mainSource.indexOf('validateAgentInputFrameIdentity(tabId, captureIdentity)', liveSnapshot);
+  const frameGuard = mainSource.indexOf(
+    'validateAgentInputFrameIdentity(tabId, draftProofCaptureIdentity)',
+    liveSnapshot,
+  );
   const refusal = mainSource.indexOf("error: 'claude_draft_state_unknown_before_paste'", frameGuard);
   const ctrlG = mainSource.indexOf("term.write('\\x07')", refusal);
   assert.ok(
@@ -144,15 +147,68 @@ test('main forwards grab options and records identity before Ctrl+G', () => {
   );
 });
 
-test('only the exact contradiction waits for Claude editor-return redraw', () => {
+test('Ctrl+G owns the shared PTY write boundary and advances input identity exactly there', () => {
+  const privateCapture = mainSource.indexOf('async function captureAgentInputAtWriteBoundary(');
+  const publicCapture = mainSource.indexOf('async function captureAgentInput(tabId, mode, agent');
+  const lock = mainSource.indexOf('return withPtyWriteLock(', publicCapture);
+  const privateCall = mainSource.indexOf(
+    'captureAgentInputAtWriteBoundary(tabId, mode, agent, options, term)',
+    lock,
+  );
+  assert.ok(
+    privateCapture > 0 && publicCapture > privateCapture && lock > publicCapture && privateCall > lock,
+    'public grab/copy/restore must serialize the whole Ctrl+G roundtrip',
+  );
+
+  const revision = mainSource.indexOf('const ownedInputRevision = bumpTerminalInputRevision(tabId)', privateCapture);
+  const pending = mainSource.indexOf('grabInputPending.set(tabId', revision);
+  const ctrlG = mainSource.indexOf("term.write('\\x07')", pending);
+  assert.ok(
+    revision > privateCapture && pending > revision && ctrlG > pending,
+    'the revision reservation must happen at the locked boundary before Ctrl+G',
+  );
+  const proofIdentity = mainSource.indexOf(
+    'const draftProofCaptureIdentity = captureAgentInputIdentity',
+    privateCapture,
+  );
+  const postReservationIdentity = mainSource.indexOf(
+    'const captureIdentity = captureAgentInputIdentity',
+    proofIdentity + 1,
+  );
+  assert.ok(
+    proofIdentity > privateCapture
+      && postReservationIdentity > proofIdentity
+      && postReservationIdentity < publicCapture,
+    'the pre-Ctrl+G proof identity and post-reservation capture identity must remain separate',
+  );
+});
+
+test('Codex Rewind uses the already-owned capture boundary instead of nesting the PTY lock', () => {
+  const rewindStart = mainSource.indexOf('async function grabRestoredCodexRewindInput(');
+  const rewindEnd = mainSource.indexOf('let codexRewindOverlayOpen', rewindStart);
+  const body = mainSource.slice(rewindStart, rewindEnd);
+  assert.match(body, /captureAgentInputAtWriteBoundary\(/);
+  assert.doesNotMatch(body, /await captureAgentInput\(/);
+});
+
+test('every external-editor capture holds PTY ownership until the agent TUI returns', () => {
   assert.match(
     mainSource,
-    /const editorReturnPromise = contradiction\s*&&\s*agent === 'claude'/,
-    'ordinary empty grab/copy must not consume the one redraw frame owned by its caller',
+    /const editorReturnPromise = agent === 'claude'[\s\S]{0,220}waitForNextPtySynchronizedFrame[\s\S]{0,220}waitForNextPtyOutput/,
+    'Claude must wait for its complete synchronized frame and Codex for its post-helper PTY edge',
   );
+  const waiter = mainSource.indexOf("const editorReturnPromise = agent === 'claude'");
+  const acknowledge = mainSource.indexOf('acknowledgeHookEnvelope();', waiter);
+  assert.ok(waiter > 0 && acknowledge > waiter,
+    'the return waiter must be armed before helper acknowledgement can let the TUI resume');
   assert.match(
     mainSource,
     /exactEmptyProven = exactEmpty\s*&&\s*!!contradiction\s*&&\s*identityStable\s*&&\s*editorReturn\?\.ready === true/,
+  );
+  assert.match(
+    mainSource,
+    /success: editorReturn\?\.ready === true,[\s\S]{0,120}external_editor_return_unconfirmed/,
+    'a timeout is unknown/failure, never permission to continue writing',
   );
 });
 

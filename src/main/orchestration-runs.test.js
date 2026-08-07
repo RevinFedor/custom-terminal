@@ -494,6 +494,14 @@ test('Codex completion audit is canonicalized and cannot regress from sent back 
     const confirmed = await store.confirmSourceFollowup('run-codex-source', {
       ...completionAuditProof('run-codex-source'),
       source: 'codex-orchestration-completion:run-codex-source',
+      toolType: 'codex',
+      executionContext: {
+        ...completionAuditProof('run-codex-source').executionContext,
+        provider: 'codex',
+      },
+      actualHash: 'canonicalized-notification-hash',
+      canonicalized: true,
+      canonicalReason: 'codex_trimmed_boundary_whitespace',
     }, { now: 500 });
     assert.equal(confirmed.confirmed, true);
     assert.equal((await store.get('run-codex-source')).notificationStatus, 'sent');
@@ -792,6 +800,7 @@ test('target prompt proof is order-independent and rejects neighboring identitie
       ...targetAuditProof('run-canonical'),
       toolType: 'codex',
       canonicalized: true,
+      canonicalReason: 'codex_trimmed_boundary_whitespace',
       actualHash: 'canonicalized-actual-hash',
       actualLen: 19,
     });

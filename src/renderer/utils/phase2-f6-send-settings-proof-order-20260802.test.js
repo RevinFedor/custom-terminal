@@ -14,6 +14,7 @@ const {
 const repoDir = path.join(__dirname, '../../..');
 const agentScenariosPath = path.join(__dirname, 'agentScenarios.ts');
 const claudeActionsPath = path.join(__dirname, 'claudePtyActions.ts');
+const agentActionCoordinatorPath = path.join(__dirname, 'agentActionCoordinator.mjs');
 const mainSource = fs.readFileSync(path.join(repoDir, 'src/main/main.js'), 'utf8');
 
 test('F6 physical Think picker owns the shared PTY queue and advances input identity', () => {
@@ -29,14 +30,34 @@ test('F6 physical Think picker owns the shared PTY queue and advances input iden
     'opening the picker must invalidate composer proofs captured before the UI mutation');
   assert.match(handler, /getTerminalInputRevision\(tabId\) === ownedInputRevision/,
     'every later picker write must still belong to the exact input generation');
-  assert.match(handler, /buffer\.includes\('\\x1b\[\?2026l'\)/,
-    'picker success must follow a complete synchronized Claude frame');
+  assert.match(handler, /waitForNextPtySynchronizedFrame\(term/,
+    'picker writes must wait for the next synchronized Claude frame');
+  assert.match(handler, /getHeadlessVisibleBufferSnapshot\(/,
+    'picker state must come from the complete main-owned visible frame');
+  assert.match(handler, /inspectClaudeThinkingPickerSnapshot\(/,
+    'picker state must be classified from the current full frame, not a differential output chunk');
+  assert.match(handler, /think_verify_open/,
+    'a changed setting must be read back before the following prompt is authorized');
 });
 
 async function buildScenarioBundle() {
   const wrapper = `
     import { sendAgentPromptScenario } from ${JSON.stringify(agentScenariosPath)};
     import { sendClaudePtyPrompt } from ${JSON.stringify(claudeActionsPath)};
+    import {
+      beginCoordinatedAgentSend,
+      requestCoordinatedStopAfterSend,
+      resetCoordinatedAgentActionsForTests,
+    } from ${JSON.stringify(agentActionCoordinatorPath)};
+
+    export function beginScenarioSend() {
+      resetCoordinatedAgentActionsForTests();
+      return beginCoordinatedAgentSend('phase2-f6-tab');
+    }
+
+    export function cancelScenarioSend() {
+      return requestCoordinatedStopAfterSend('phase2-f6-tab');
+    }
 
     export async function runClaudeScenario(options = {}) {
       const state = globalThis.__phase2F6State;
@@ -63,6 +84,19 @@ async function buildScenarioBundle() {
         },
         probeDraft: async () => {
           state.events.push({ kind: 'composer-proof-screen', inputRevision: state.inputRevision });
+          if (options.screenProof === 'unknown-no-capture') {
+            return {
+              success: true,
+              proofOutcome: 'unknown',
+              proofReason: 'cursor-before-composer',
+              hasDraft: null,
+              text: '',
+              preview: '',
+              source: 'headless-main:claude-composer:unknown:cursor-before-composer',
+              exactCaptureRecommended: false,
+              ...identity(),
+            };
+          }
           if (options.screenProof === 'missing') {
             return {
               success: true,
@@ -119,6 +153,7 @@ async function buildScenarioBundle() {
         model: options.model,
         effort: options.effort,
         thinking: options.thinking,
+        coordinatedSendToken: options.coordinatedSendToken,
       });
     }
   `;
@@ -216,6 +251,11 @@ test('F6 complete shared scenario -> Claude runtime -> IPC path reproves after s
           }
           if (channel === 'claude:startup-slash-proof') {
             state.events.push({ kind: 'setting-jsonl-proof', inputRevision: state.inputRevision });
+            if (state.cancelOnSettingProof) {
+              const cancel = state.cancelOnSettingProof;
+              state.cancelOnSettingProof = null;
+              cancel();
+            }
             return {
               success: true,
               reason: 'jsonl-proof-found',
@@ -303,6 +343,39 @@ test('F6 complete shared scenario -> Claude runtime -> IPC path reproves after s
     assert.equal(result?.submitted, true);
   });
 
+  await t.test('Stop after /model proof cancels the remaining /effort and user prompt writes', async () => {
+    const state = resetState();
+    const coordinated = scenario.beginScenarioSend();
+    assert.equal(coordinated.started, true);
+    state.cancelOnSettingProof = () => scenario.cancelScenarioSend();
+
+    const result = await scenario.runClaudeScenario({
+      handoffId: 'phase2-f6-cancel-settings-bundle',
+      model: 'opus',
+      effort: 'high',
+      coordinatedSendToken: coordinated.token,
+    });
+    assert.deepEqual({
+      success: result?.success,
+      error: result?.error,
+    }, {
+      success: false,
+      error: 'Send cancelled before terminal submission',
+    });
+
+    assert.deepEqual({
+      settingWrites: state.events
+        .filter((entry) => entry.kind === 'setting-write')
+        .map((entry) => entry.command),
+      physicalPasteCount: state.events.filter((entry) => (
+        entry.kind === 'physical-paste-boundary'
+      )).length,
+    }, {
+      settingWrites: ['/model opus'],
+      physicalPasteCount: 0,
+    }, 'Stop must cancel the rest of the settings transaction before /effort or the user prompt reaches the PTY.');
+  });
+
   await t.test('F6 missing prompt marker uses exact empty capture and still submits once', async () => {
     const state = resetState();
     const result = await scenario.runClaudeScenario({
@@ -324,6 +397,25 @@ test('F6 complete shared scenario -> Claude runtime -> IPC path reproves after s
       proofReservedAtPhysicalPaste: true,
       submitted: true,
     });
+  });
+
+  await t.test('preflight uncertainty is an exact no-Enter receipt', async () => {
+    const state = resetState();
+    const result = await scenario.runClaudeScenario({
+      handoffId: 'phase2-f6-preflight-refusal',
+      screenProof: 'unknown-no-capture',
+    });
+    assert.deepEqual({
+      code: result?.code,
+      submitted: result?.submitted,
+      accepted: result?.accepted,
+      physicalPasteReached: Boolean(state.lastPaste),
+    }, {
+      code: 'terminal_draft_state_unknown',
+      submitted: false,
+      accepted: false,
+      physicalPasteReached: false,
+    }, 'A refusal before the prompt runtime is called must release orchestration serialization safely.');
   });
 
   await t.test('F6 Think: successful picker mutation must not reuse the proof captured before the picker', async () => {

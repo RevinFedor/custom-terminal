@@ -17,6 +17,10 @@ const {
   capPayloadForRender,
 } = require('./history-payload-dehydrate');
 const { applyHistoryEntryWindow } = require('./history-entry-window');
+const {
+  diffHistoryEntriesAgainstDigest,
+  HistoryDeltaDigestStore,
+} = require('./history-delta');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -174,6 +178,10 @@ class SessionTranscriptService {
     // loop per subscribe — the measured right-click delay). A session's file
     // never moves; existence is re-checked on reuse.
     this.resolvedPathCache = new Map(); // `${toolType}:${sessionId}` → filePath
+    // Delta digests: what each (session, tab) renderer last received, as
+    // uuid order + per-row fingerprints. Lets a live refresh return only
+    // changed rows instead of the full projection (see history-delta.js).
+    this.historyDeltaDigests = new HistoryDeltaDigestStore();
   }
 
   registerIpc() {
@@ -495,6 +503,51 @@ class SessionTranscriptService {
           }),
         }
       );
+      // Delta transport. A live session refresh used to reship the ENTIRE
+      // projection (15,352 rows / ~70MB for one appended tool result —
+      // tab-3163, 06.08 11:37, LOAD_APPLY 4733ms during switch+scroll). When
+      // the renderer proves it still holds the digest's exact revision, only
+      // rows whose fingerprint moved travel; the renderer reassembles the
+      // array from its previous object references (see history-delta.js).
+      // Digest maintenance is opt-in (deltaOk) so web/iOS consumers that can
+      // never use a delta don't pay the fingerprint pass, and bounded
+      // requests are excluded — a windowed renderer doesn't hold the full
+      // projection the digest would describe.
+      const deltaEligible = payload.deltaOk === true && !payload.bounds;
+      if (deltaEligible) {
+        const digestStartedAt = Date.now();
+        const prevDigest = payload.ifRevision?.token
+          ? this.historyDeltaDigests.get(toolType, sessionId, payload.tabId || null)
+          : null;
+        const matchedDigest = prevDigest && prevDigest.revisionToken === payload.ifRevision.token
+          ? prevDigest
+          : null;
+        const diff = diffHistoryEntriesAgainstDigest(matchedDigest, timedEntries);
+        this.historyDeltaDigests.set(toolType, sessionId, payload.tabId || null, {
+          revisionToken: revision?.token || '',
+          order: diff.order,
+          fingerprints: diff.fingerprints,
+        });
+        if (matchedDigest && revision?.token) {
+          console.log('[TranscriptService:HistoryDelta] session=' + shortId(sessionId)
+            + ' tab=' + String(payload.tabId || '-').slice(-12)
+            + ' rows=' + timedEntries.length
+            + ' changed=' + diff.changed.length
+            + ' unchanged=' + diff.unchangedCount
+            + ' diffMs=' + (Date.now() - digestStartedAt));
+          return {
+            success: true,
+            unchanged: false,
+            delta: true,
+            changedEntries: diff.changed,
+            order: diff.order,
+            total: timedEntries.length,
+            claudeMemoryBoundaryUuid: null,
+            filePath: loaded.filePath,
+            revision,
+          };
+        }
+      }
       const historyWindow = applyHistoryEntryWindow(timedEntries, payload.bounds);
       return {
         success: true,

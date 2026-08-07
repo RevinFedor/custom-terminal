@@ -160,12 +160,15 @@ import {
 } from '../../utils/historyClaudePromptCarriers.mjs';
 import {
   beginHistoryPromptHandoff,
+  bindHistoryPromptHandoffSendIdentity,
   consumeHistoryPromptHandoff,
   getHistoryPromptHandoffsSnapshot,
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   historyPromptHandoffAuditProofFromSendResult,
   historyPromptHandoffStatusPresentation,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
+  hydrateHistoryPromptHandoffFromDurableReceipt,
+  reconcileHistoryPromptHandoffRows,
   retractHistoryPromptHandoff,
   settleHistoryPromptHandoff,
   subscribeHistoryPromptHandoffs,
@@ -1031,6 +1034,32 @@ const retainStableHistoryEntryReferences = (
   });
 };
 
+// Delta transport reassembly (main's history-delta.js is the other half).
+// The response names the full row order plus only the rows that changed;
+// every other row is REQUIRED to already sit in the previous raw snapshot.
+// Unchanged rows therefore keep their exact old object references — the
+// memoized cards' props never change identity, and the downstream
+// retainStable pass short-circuits on `left === right` instead of deep-
+// comparing 15K rows. A uuid the baseline cannot supply means the digest
+// described rows this renderer never applied — return null and let the
+// caller fall back to a full load.
+const reassembleHistoryDeltaEntries = (
+  baseline: FullHistoryEntry[],
+  order: string[],
+  changedEntries: FullHistoryEntry[],
+): FullHistoryEntry[] | null => {
+  const changedByUuid = new Map(changedEntries.map((entry) => [entry.uuid, entry]));
+  const baselineByUuid = new Map(baseline.map((entry) => [entry.uuid, entry]));
+  const next: FullHistoryEntry[] = new Array(order.length);
+  for (let index = 0; index < order.length; index++) {
+    const uuid = order[index];
+    const entry = changedByUuid.get(uuid) || baselineByUuid.get(uuid);
+    if (!entry) return null;
+    next[index] = entry;
+  }
+  return next;
+};
+
 const entryClockMs = (entry: FullHistoryEntry) => {
   if (entry.optimisticAt && Number.isFinite(entry.optimisticAt)) return entry.optimisticAt;
   const parsed = Date.parse(entry.timestamp || '');
@@ -1572,9 +1601,16 @@ const HistoryToolCallPart = memo(({
   }>;
 }) => {
   const anchorRef = useRef<HTMLDivElement>(null);
-  const [open, setOpen] = useState(() => (
-    toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit'
-  ));
+  // Every card starts collapsed — including Edit/Write/MultiEdit, which used
+  // to be the ONLY default-open type. Open diff bodies meant DiffView rows
+  // (125-221 per card on tab-3163, 06.08) were created inside scroll/mount
+  // commits — 76-238ms tasks during ordinary in-viewport scroll;
+  // `content-visibility` on the rows skips layout/paint but not React work
+  // or DOM creation. Collapsed, the header still carries the verb, the path
+  // and the ±line counts; the hunks enter the DOM only on explicit expand,
+  // exactly like Bash/Read output. Collapsed height is one stable header
+  // line, which also keeps measured-geometry snapshots honest.
+  const [open, setOpen] = useState(false);
   const onToggle = useHistoryRevealToggle(anchorRef, open, setOpen);
   // The full output is fetched when the card is expanded; the preview renders
   // in the collapsed header either way.
@@ -5571,8 +5607,45 @@ function AgentHistoryControls({
           },
         });
         const resultOwnershipTransferred = queueSendTransferredOwnership(result);
-        const auditProof = historyPromptHandoffAuditProofFromSendResult(result);
-        const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(result);
+        const resultSendAttemptId = typeof (result?.sendAttemptId || result?.attemptId) === 'string'
+          ? String(result.sendAttemptId || result.attemptId)
+          : '';
+        const resultSendOperationKey = typeof (result?.sendOperationKey || result?.operationKey) === 'string'
+          ? String(result.sendOperationKey || result.operationKey)
+          : '';
+        let sendIdentityFailure = '';
+        if (resultOwnershipTransferred) {
+          if (!resultSendAttemptId || !resultSendOperationKey) {
+            sendIdentityFailure = 'missing-durable-send-identity';
+          } else {
+            const boundIdentity = bindHistoryPromptHandoffSendIdentity(
+              actionTabId,
+              handoffId,
+              {
+                sendAttemptId: resultSendAttemptId,
+                sendOperationKey: resultSendOperationKey,
+              },
+            );
+            if (!boundIdentity.ok) sendIdentityFailure = boundIdentity.reason;
+          }
+        }
+        if (sendIdentityFailure) {
+          console.error('[' + runtime.logPrefix + ':draft] send identity rejected tab='
+            + actionTabId.slice(-12)
+            + ' handoff=' + handoffId
+            + ' attempt=' + (resultSendAttemptId.slice(0, 12) || '-')
+            + ' operation=' + (resultSendOperationKey.slice(0, 72) || '-')
+            + ' reason=' + sendIdentityFailure);
+        }
+        // A receipt from a different/unknown physical attempt cannot prove
+        // this optimistic row. Keep ownership with the terminal and show an
+        // explicit unconfirmed state; never retry the already-submitted text.
+        const auditProof = sendIdentityFailure
+          ? null
+          : historyPromptHandoffAuditProofFromSendResult(result);
+        const unconfirmedStatus = sendIdentityFailure
+          ? 'delivery-unknown' as const
+          : historyPromptHandoffUnconfirmedStatusFromSendResult(result);
         const finalAuditFailure = result?.success === false
           && result?.submitted === true
           && !unconfirmedStatus;
@@ -5591,7 +5664,9 @@ function AgentHistoryControls({
         if (resultOwnershipTransferred) {
           settleHistoryPromptHandoff(actionTabId, handoffId, {
             queueStatus: resultQueueStatus,
-            reason: finalAuditFailure
+            reason: sendIdentityFailure
+              ? 'send-durable-identity-' + sendIdentityFailure
+              : finalAuditFailure
               ? 'send-submitted-audit-unconfirmed'
               : resultQueueStatus === 'audit-pending'
                 ? 'send-submitted-audit-pending'
@@ -7673,13 +7748,16 @@ const HISTORY_VIRTUOSO_COMPONENTS = {
   ScrollSeekPlaceholder: HistoryScrollSeekPlaceholder,
 };
 
-// Velocity gates for swapping real rows for placeholders. Enter must clear
-// ordinary reading-speed wheel ticks (~200-600 px/s) but catch a fling's
-// RAMP-UP frames too: with the gate at 3000 the accelerating pass through
-// 1000-3000 px/s still mounted heavy rows at full price (live 04.08 21:59:
-// 314/327ms tasks BEFORE the first ENTER fired). Exit is low so rows come
-// back the moment the user slows down to look.
-const HISTORY_SCROLL_SEEK_ENTER_PX_PER_S = 2000;
+// Velocity gates for swapping real rows for placeholders. The economics
+// changed when diff bodies went collapsed-by-default: a mounted row is now a
+// header, not a 200-row diff, so the 04.08 justification for a low gate
+// (314/327ms mounts during ramp-up) no longer holds — and the low gate had a
+// real cost: the user's ordinary vigorous scroll measures 1437-2267 px/s
+// (live 06.08 15:26, eight ENTER/EXIT blink cycles in ~20s of reading
+// scroll, each swapping the viewport rows→skeletons→rows). Enter now
+// demands an unmistakable fling; exit stays low so rows return the moment
+// the user slows down to look.
+const HISTORY_SCROLL_SEEK_ENTER_PX_PER_S = 3000;
 const HISTORY_SCROLL_SEEK_EXIT_PX_PER_S = 500;
 // Minimum time placeholders stay on once entered. Virtuoso samples velocity
 // per frame, and a heavy frame mid-fling reports velocity=0 on the next
@@ -7690,17 +7768,51 @@ const HISTORY_SCROLL_SEEK_EXIT_PX_PER_S = 500;
 // placeholder window; a real stop pays at most this delay before rows
 // return, which is below perception at reading speed.
 const HISTORY_SCROLL_SEEK_MIN_HOLD_MS = 150;
-// Wheel-burst pre-engage. Virtuoso's velocity is measured between scroll
-// SAMPLES, and the first sample after idle divides the jump by seconds of
-// idle time — a violent first tick reads as slow, the new range mounts REAL
-// rows at full price (796ms task before the first ENTER, retest 04.08
-// 22:08), and only the second tick engages the gate. The wheel event itself
-// is dispatched BEFORE the scroll it causes, so a single huge delta arms
-// this window and the very first seek consultation already answers "on".
-// Scrollbar drags have no wheel events and keep the velocity path.
+// Wheel-burst = a LOWERED bar, never a bypass. The original design let a hot
+// burst window answer "on" regardless of measured velocity, because the first
+// velocity sample after idle divides the jump by seconds of idle time and a
+// violent fling read as slow (796ms real-row mount before the first ENTER,
+// retest 04.08 22:08). But ordinary trackpad reading-scroll also emits single
+// ticks ≥600px, and the bypass flipped placeholders at genuine velocities of
+// 670-957 px/s — a third of the enter threshold (tab-3163, 06.08 11:12), then
+// the seek EXIT remounted the whole viewport in one 504ms commit. Ordinary
+// scroll must never flicker into skeletons, so now a violent tick only arms
+// the window, and entry still demands a MEASURED velocity above the confirm
+// tier below. Consequences, frame by frame: a single violent tick from idle
+// mounts its one new range real (its first sample reads bogus-slow, below any
+// tier — acceptable now that diff bodies are collapsed by default and rows
+// are cheap); a sustained fling enters on its first GENUINE sample, one tier
+// earlier than the cold threshold. Scrollbar drags have no wheel events and
+// keep the pure velocity path.
 const HISTORY_WHEEL_BURST_DELTA_PX = 600;
 const HISTORY_WHEEL_BURST_HOLD_MS = 250;
+// Confirm tier: measured px/s required to enter while the burst window is
+// hot. First shipped at 1400 ("between ordinary 670-957 and fling 3021") —
+// live retest same day (15:26 МСК) showed the user's ordinary vigorous
+// reading-scroll measures 1437-2267 px/s, i.e. INSIDE that guess, and every
+// tick ≥600px armed the burst, so the gate blinked rows→skeletons→rows
+// eight times in 20s. Skeletons are for scrubbing, not reading: the tier
+// must sit above any speed at which the user still tracks content. 2600
+// keeps the burst meaningful (a real fling's genuine samples are ≥3000)
+// while everything the user did in that session stays on real rows.
+const HISTORY_SCROLL_SEEK_BURST_CONFIRM_PX_PER_S = 2600;
 let historyWheelBurstUntil = 0;
+// Machine-motion cooldown. The in-flight suppressors cover a restore WHILE
+// it runs, but Virtuoso's velocity sample for the restore's own jump arrives
+// a few frames AFTER the restore releases its token — measured live (06.08
+// 15:26): SCROLL_RESTORE mode=measured-layout settles, and 26ms later the
+// gate saw velocity=464679 (the scrollTop magnitude, physically impossible
+// for a gesture) and flipped the freshly-restored viewport to skeletons for
+// ~350ms on a MOTIONLESS screen — a guaranteed flash on every warm return to
+// a mid-list position, felt as «перешёл на вкладку и сразу всё дёргается».
+// Every jump machine stamps this on completion; enter() refuses while hot.
+// A real fling that starts inside the window just gets its skeletons up to
+// 450ms late — rows are cheap since diffs collapsed, so that is invisible.
+const HISTORY_MACHINE_SCROLL_COOLDOWN_MS = 450;
+let historyMachineScrollCooldownUntil = 0;
+const stampHistoryMachineScrollCooldown = (): void => {
+  historyMachineScrollCooldownUntil = performance.now() + HISTORY_MACHINE_SCROLL_COOLDOWN_MS;
+};
 // The scroller the kick re-asks. Updated on every real scroll tick of
 // whichever panel is scrolling (handleScroll), so it always points at the
 // element whose seek mode could be stuck — including scrollbar drags, which
@@ -7784,8 +7896,16 @@ const HISTORY_SCROLL_SEEK_CONFIG = {
     for (const suppressed of historySeekSuppressors) {
       if (suppressed()) return false;
     }
+    // Trailing echo of a programmatic jump (restore/Timeline-jump released
+    // its token, Virtuoso's sample of that jump lands frames later).
+    if (performance.now() < historyMachineScrollCooldownUntil) return false;
     const burst = performance.now() < historyWheelBurstUntil;
-    const on = burst || Math.abs(velocity) > HISTORY_SCROLL_SEEK_ENTER_PX_PER_S;
+    // Burst lowers the bar; measured velocity must still clear it. The old
+    // `burst || …` short-circuit entered at velocity=670 on ordinary scroll.
+    const threshold = burst
+      ? HISTORY_SCROLL_SEEK_BURST_CONFIRM_PX_PER_S
+      : HISTORY_SCROLL_SEEK_ENTER_PX_PER_S;
+    const on = Math.abs(velocity) > threshold;
     if (on && !historyScrollSeekActive) {
       historyScrollSeekActive = true;
       historyScrollSeekEnteredAt = performance.now();
@@ -9436,8 +9556,46 @@ function HistoryPanel({
     });
   }, [historySnapshotOwner, persistVolatileOverlay, tabId]);
 
+  useEffect(() => {
+    let disposed = false;
+    void ipcRenderer.invoke('agent:list-send-receipts', {
+      tabId,
+      surface: 'desktop-history',
+    }).then((result: any) => {
+      if (disposed || result?.success !== true || !Array.isArray(result.records)) return;
+      let restorableDraft: string | null = null;
+      let restorableAt = -1;
+      let hydrated = 0;
+      for (const record of result.records) {
+        if (record?.provider !== toolType) continue;
+        const outcome = hydrateHistoryPromptHandoffFromDurableReceipt(record);
+        if (outcome.hydrated) hydrated += 1;
+        if (outcome.restorableDraft && Number(record?.updatedAt || 0) >= restorableAt) {
+          restorableDraft = outcome.restorableDraft;
+          restorableAt = Number(record?.updatedAt || 0);
+        }
+      }
+      if (restorableDraft) {
+        const currentDraft = useUIStore.getState().historyPromptDrafts[tabId] || '';
+        if (!currentDraft) {
+          setHistoryPromptDraft(tabId, restorableDraft);
+          historyDiag('DURABLE_DRAFT_RESTORED tab=' + tabId.slice(-12)
+            + ' chars=' + restorableDraft.length);
+        }
+      }
+      if (hydrated > 0) {
+        historyDiag('DURABLE_HANDOFFS_HYDRATED tab=' + tabId.slice(-12)
+          + ' count=' + hydrated);
+      }
+    }).catch((error: any) => {
+      console.warn('[HistoryPanel] durable receipt hydration failed tab=' + tabId.slice(-12)
+        + ': ' + String(error?.message || error));
+    });
+    return () => { disposed = true; };
+  }, [setHistoryPromptDraft, tabId, toolType]);
+
   useEffect(() => subscribeHistoryPromptHandoffs(tabId, (snapshot, change) => {
-    if (change.type === 'consume' || change.type === 'retract' || change.type === 'evict') {
+    if (change.type === 'consume' || change.type === 'retract') {
       removeLocalPromptEntry(change.handoffId, 'handoff-' + change.type);
       return;
     }
@@ -9915,7 +10073,7 @@ function HistoryPanel({
       ' requestRevision=' + (revisionForRequest ? '1' : '0'));
     try {
       const ipcChannel = toolType === 'gemini' ? 'gemini:get-full-history' : toolType === 'codex' ? 'agent-transcript:get-history' : 'claude:get-full-history';
-      const result = await ipcRenderer.invoke(ipcChannel, {
+      const requestPayload = {
         toolType,
         sessionId,
         cwd,
@@ -9924,7 +10082,45 @@ function HistoryPanel({
         // Desktop History rehydrates payloads on card expand; heavy tool
         // outputs/thinking arrive as previews + refs instead of megabytes.
         dehydrate: true,
-      });
+        // This panel holds the full previous projection, so a live refresh
+        // may answer with only the changed rows (result.delta) instead of
+        // re-cloning the whole session over IPC. Codex-only: the Claude
+        // pipeline has its own probe/unchanged economy.
+        deltaOk: toolType === 'codex',
+      };
+      let result = await ipcRenderer.invoke(ipcChannel, requestPayload);
+      if (result?.success && result.delta === true && isCurrentOwner()) {
+        // Reassembly needs the exact baseline the digest described. The raw
+        // ref is owner-scoped and set together with the revision ref, so a
+        // moved revision or an empty baseline means the digest talks about
+        // rows this panel never applied — fall back to one full load.
+        const baseline = rawServerEntriesRef.current;
+        const baselineValid = historyRevisionRef.current === revisionForRequest && baseline.length > 0;
+        const reassembled = baselineValid
+          ? reassembleHistoryDeltaEntries(
+              baseline,
+              Array.isArray(result.order) ? result.order : [],
+              Array.isArray(result.changedEntries) ? result.changedEntries : [],
+            )
+          : null;
+        if (reassembled) {
+          historyDiag('LOAD_DELTA tab=' + tabId.slice(-12) +
+            ' session=' + sessionId.slice(0, 8) +
+            ' seq=' + loadSequence +
+            ' changed=' + (result.changedEntries?.length || 0) +
+            ' total=' + reassembled.length +
+            ' elapsedMs=' + (Date.now() - loadStartedAt));
+          result = { ...result, entries: reassembled };
+        } else {
+          historyDiag('LOAD_DELTA_MISMATCH tab=' + tabId.slice(-12) +
+            ' session=' + sessionId.slice(0, 8) +
+            ' seq=' + loadSequence +
+            ' reason=' + (!baselineValid
+              ? (baseline.length === 0 ? 'no-baseline' : 'revision-moved')
+              : 'missing-row'));
+          result = await ipcRenderer.invoke(ipcChannel, { ...requestPayload, ifRevision: null });
+        }
+      }
       if (!isCurrentOwner()) {
         // The read itself is NOT stale — it answers exactly the owner it was
         // started for. Discarding it made the A→B→A dance quadratic: the
@@ -10642,14 +10838,80 @@ function HistoryPanel({
           SuppressedPrompt
         >(historySnapshotOwner)
       : undefined;
+    // Reconcile only the bounded renderer-local overlay. The full transcript
+    // can contain tens of thousands of rows and remains owned by the durable
+    // history loader below. Exact handoffId is the sole identity here: equal
+    // text/timestamps are never adoption proof.
+    const handoffSessionRoutes = new Map<string, ReturnType<
+      typeof resolveHistoryPromptHandoffPresentationSession
+    >>();
+    const ownerHandoffs = getHistoryPromptHandoffsSnapshot(tabId).filter((handoff) => {
+      if (handoff.toolType !== toolType) return false;
+      const sessionRoute = resolveHistoryPromptHandoffPresentationSession({
+        auditSessionId: handoff.auditProof?.sessionId,
+        sessionIdHint: handoff.sessionIdHint,
+        currentSessionId: sessionId,
+      });
+      if (!sessionRoute.belongsToCurrent) return false;
+      handoffSessionRoutes.set(handoff.handoffId, sessionRoute);
+      return true;
+    });
+    const restoredHandoffMeta = new Map(volatileOverlay?.handoffs || []);
+    for (const handoff of ownerHandoffs) {
+      const cleanContent = normalizeHistoryPromptText(handoff.text);
+      if (!cleanContent) continue;
+      const route = handoffSessionRoutes.get(handoff.handoffId);
+      restoredHandoffMeta.set(handoff.handoffId, {
+        text: cleanContent,
+        submittedAt: handoff.submittedAt,
+        sessionId: handoff.auditProof?.sessionId
+          || route?.presentationSessionId
+          || handoff.sessionIdHint
+          || sessionId,
+        requiresAuditIdentity: handoff.requiresAuditIdentity,
+        auditTimestamp: handoff.auditProof?.auditTimestamp,
+        auditHash: handoff.auditProof?.actualHash,
+        auditEntryUuid: handoff.auditProof?.entryUuid,
+        sourceIdentity: handoff.auditProof?.sourceIdentity,
+      });
+    }
+    const restoredOverlayRows = (
+      volatileOverlay?.entries as unknown as FullHistoryEntry[] | undefined
+    ) || [];
+    const reconciledOverlay = reconcileHistoryPromptHandoffRows({
+      rows: restoredOverlayRows,
+      handoffs: ownerHandoffs,
+      createRow: (handoff): FullHistoryEntry | null => {
+        const cleanContent = normalizeHistoryPromptText(handoff.text);
+        const route = handoffSessionRoutes.get(handoff.handoffId);
+        if (!cleanContent || !route) return null;
+        return {
+          uuid: LOCAL_PROMPT_PREFIX + tabId + '-' + handoff.handoffId,
+          role: 'queued',
+          queueStatus: handoff.queueStatus,
+          statusAtSend: handoff.statusAtSend,
+          handoffId: handoff.handoffId,
+          statusReason: handoff.statusReason,
+          timestamp: new Date(handoff.submittedAt).toISOString(),
+          content: cleanContent,
+          sessionId: route.presentationSessionId,
+          optimisticAt: handoff.submittedAt,
+          statusChangedAt: handoff.statusChangedAt,
+          promptChips: normalizeComposerChips(handoff.promptChips)
+            .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
+          imagePaths: retainHistoryDraftImages(cleanContent, handoff.imagePaths),
+          requiresAuditIdentity: handoff.requiresAuditIdentity,
+        };
+      },
+    });
     const now = Date.now();
     const restoredSuppressions = (volatileOverlay?.suppressions || [])
       .filter(([, suppression]) => suppression.expiresAt > now);
-    promptHandoffMetaRef.current = new Map(volatileOverlay?.handoffs || []);
+    promptHandoffMetaRef.current = restoredHandoffMeta;
     suppressedPromptsRef.current = new Map(restoredSuppressions);
     const restoredLocalEntries = mergeServerAndLocalEntries(
       [],
-      (volatileOverlay?.entries as unknown as FullHistoryEntry[] | undefined) || [],
+      reconciledOverlay.rows as FullHistoryEntry[],
     );
     const cachedSnapshot = sessionId
       ? historySnapshotCache.get<FullHistoryEntry>(historySnapshotOwner)
@@ -10942,6 +11204,9 @@ function HistoryPanel({
       const releaseRestoreToken = () => {
         if (historyRestoreInFlightRef.current === restoreToken) {
           historyRestoreInFlightRef.current = 0;
+          // The gate's velocity sample of this machine jump arrives AFTER
+          // the release — cover the echo window (velocity=464679 flash).
+          stampHistoryMachineScrollCooldown();
         }
       };
       const measureDrift = () => {
@@ -11023,6 +11288,7 @@ function HistoryPanel({
     const settleRestoreAndBankGeometry = (ownerAtRestore: string, restoreToken: number) => {
       if (historyRestoreInFlightRef.current === restoreToken) {
         historyRestoreInFlightRef.current = 0;
+        stampHistoryMachineScrollCooldown();
       }
       // While the mount wave still renders shells, Virtuoso's state would
       // bank SHELL heights as if they were card measurements — for an
@@ -11865,6 +12131,9 @@ function HistoryPanel({
       if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return;
       const scroller = virtuosoScrollerRef.current;
       historyScrollInFlightRef.current = null;
+      // Same echo hazard as position restores: the jump's own velocity
+      // sample lands after the in-flight suppressor clears.
+      stampHistoryMachineScrollCooldown();
       historyDiag('SCROLL_TO_DONE tab=' + tabId.slice(-12) +
         ' uuid=' + targetUuid.slice(0, 8) +
         panelDiagContextRef.current +

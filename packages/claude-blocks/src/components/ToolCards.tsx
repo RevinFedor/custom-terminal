@@ -138,6 +138,10 @@ const EditCard: React.FC<{
   const path: string = args.file_path || args.path || '';
   const lang = detectLanguage(path);
   const fallbackDiff: DiffEntry[] = React.useMemo(() => {
+    // Canonical hunks from the transcript parser make the fallback unused —
+    // skip the lineDiff LCS entirely (it ran on every card mount, collapsed
+    // or not, for nothing).
+    if (Array.isArray(diffHunks) && diffHunks.length > 0) return [];
     if (toolName === 'Write') {
       const content = (args.content || '') as string;
       return content ? content.split('\n').map(line => ({ tag: 'add' as const, line })) : [];
@@ -154,7 +158,7 @@ const EditCard: React.FC<{
       return out;
     }
     return lineDiff(args.old_string || '', args.new_string || '');
-  }, [toolName, args]);
+  }, [toolName, args, diffHunks]);
   const canonicalHunks = Array.isArray(diffHunks) && diffHunks.length > 0
     ? diffHunks
     : null;

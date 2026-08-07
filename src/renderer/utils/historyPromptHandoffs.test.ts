@@ -4,11 +4,18 @@ import test from 'node:test';
 import {
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   HistoryPromptHandoffStore,
+  consumeHistoryPromptHandoff,
+  getHistoryPromptHandoffsSnapshot,
+  hydrateHistoryPromptHandoffFromDurableReceipt,
   historyPromptHandoffStatusPresentation,
   historyPromptHandoffAcceptsAuditIdentity,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
+  reconcileHistoryPromptHandoffRows,
   runHistoryPromptHandoff,
+  subscribeHistoryPromptHandoffs,
+  type HistoryPromptHandoff,
   type HistoryPromptHandoffChange,
+  type HistoryPromptHandoffProjectionRow,
   type HistoryPromptHandoffStoreLimits,
 } from './historyPromptHandoffs.ts';
 
@@ -47,6 +54,38 @@ const begin = (
   source: 'prompt-queue',
   statusAtSend: 'active',
   requiresAuditIdentity: true,
+});
+
+interface TestProjectionRow extends HistoryPromptHandoffProjectionRow {
+  uuid: string;
+  content: string;
+}
+
+const cachedProjectionRow = (
+  handoffId: string,
+  queueStatus: TestProjectionRow['queueStatus'],
+  content = 'same prompt',
+): TestProjectionRow => ({
+  uuid: `local-${handoffId}`,
+  content,
+  handoffId,
+  queueStatus,
+  statusReason: queueStatus === 'sending' ? 'send-start' : 'send-submitted-audit-pending',
+  statusChangedAt: 100,
+  statusAtSend: 'active',
+  timestamp: new Date(100).toISOString(),
+  optimisticAt: 100,
+  requiresAuditIdentity: true,
+  sessionId: 'session-tab-a',
+});
+
+const createProjectionRow = (
+  handoff: Readonly<HistoryPromptHandoff>,
+): TestProjectionRow => ({
+  uuid: `local-${handoff.handoffId}`,
+  content: handoff.text,
+  handoffId: handoff.handoffId,
+  sessionId: handoff.sessionIdHint || undefined,
 });
 
 test('a background begin is replayed when History subscribes later', () => {
@@ -118,6 +157,257 @@ test('settle preserves exact handoff identity and immutable audit proof', () => 
   assert.equal(Object.isFrozen(settled?.imagePaths[0]), true);
 });
 
+test('a late pending receipt cannot regress SENT with exact proof', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  begin(store, 'tab-a', 'handoff-a');
+  const exact = store.settle('tab-a', 'handoff-a', {
+    queueStatus: 'sent',
+    reason: 'late-audit-confirmed',
+    changedAt: 300,
+    proof: {
+      auditTimestamp: '2026-08-06T12:00:00.000Z',
+      actualHash: 'exact-hash',
+      sessionId: 'session-live',
+      entryUuid: 'exact-user-uuid',
+    },
+  });
+
+  const stale = store.settle('tab-a', 'handoff-a', {
+    queueStatus: 'audit-pending',
+    reason: 'late-timeout',
+    changedAt: 400,
+    proof: null,
+  });
+
+  assert.strictEqual(stale, exact);
+  assert.equal(stale?.queueStatus, 'sent');
+  assert.equal(stale?.statusReason, 'late-audit-confirmed');
+  assert.equal(stale?.statusChangedAt, 300);
+  assert.equal(stale?.auditProof?.entryUuid, 'exact-user-uuid');
+});
+
+test('only a genuinely new send attempt can reset an exact receipt', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  store.begin({
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    sendAttemptId: 'attempt-a',
+    sendOperationKey: 'project:tab-a:handoff-a',
+    toolType: 'codex',
+    text: 'prompt',
+    submittedAt: 100,
+  });
+  const exact = store.settle('tab-a', 'handoff-a', {
+    queueStatus: 'sent',
+    reason: 'audit-confirmed',
+    changedAt: 200,
+    proof: {
+      auditTimestamp: '2026-08-06T12:00:00.000Z',
+      actualHash: 'exact-hash',
+      sessionId: 'session-live',
+      entryUuid: 'exact-user-uuid',
+    },
+  });
+
+  const duplicate = store.begin({
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    sendAttemptId: 'attempt-a',
+    sendOperationKey: 'project:tab-a:handoff-a',
+    toolType: 'codex',
+    text: 'prompt',
+    submittedAt: 250,
+  });
+  assert.strictEqual(duplicate, exact);
+
+  const retried = store.begin({
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    sendAttemptId: 'attempt-b',
+    sendOperationKey: 'project:tab-a:handoff-a',
+    toolType: 'codex',
+    text: 'prompt',
+    submittedAt: 300,
+  });
+  assert.equal(retried?.sendAttemptId, 'attempt-b');
+  assert.equal(retried?.queueStatus, 'sending');
+  assert.equal(retried?.statusReason, 'send-retry-start');
+  assert.equal(retried?.statusChangedAt, 300);
+  assert.equal(retried?.auditProof, null);
+});
+
+test('cached SENDING and CONFIRMING rows reconcile from the exact handoff snapshot', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  begin(store, 'tab-a', 'handoff-sending');
+  begin(store, 'tab-a', 'handoff-confirming');
+  begin(store, 'tab-a', 'handoff-missing');
+  store.settle('tab-a', 'handoff-sending', {
+    queueStatus: 'sent',
+    reason: 'audit-confirmed',
+    changedAt: 210,
+    proof: {
+      auditTimestamp: '2026-08-06T12:00:00.000Z',
+      actualHash: 'hash-sending',
+      sessionId: 'session-tab-a',
+      entryUuid: 'durable-sending-uuid',
+    },
+  });
+  store.settle('tab-a', 'handoff-confirming', {
+    queueStatus: 'sent',
+    reason: 'late-audit-confirmed',
+    changedAt: 220,
+    proof: {
+      auditTimestamp: '2026-08-06T12:00:01.000Z',
+      actualHash: 'hash-confirming',
+      sessionId: 'session-tab-a',
+      entryUuid: 'durable-confirming-uuid',
+      sourceIdentity: 'codex-user-session-tab-a-2',
+    },
+  });
+  store.settle('tab-a', 'handoff-missing', {
+    queueStatus: 'audit-pending',
+    reason: 'send-submitted-audit-pending',
+    changedAt: 230,
+  });
+
+  const cachedSending = cachedProjectionRow('handoff-sending', 'sending');
+  const cachedConfirming = cachedProjectionRow('handoff-confirming', 'audit-pending');
+  const result = reconcileHistoryPromptHandoffRows<TestProjectionRow>({
+    rows: [cachedSending, cachedConfirming],
+    handoffs: store.getSnapshot('tab-a'),
+    createRow: createProjectionRow,
+  });
+  const byId = new Map(result.rows.map(row => [row.handoffId, row]));
+
+  assert.equal(result.changed, true);
+  assert.equal(result.updated, 2);
+  assert.equal(result.added, 1);
+  assert.equal(result.removed, 0);
+  assert.equal(byId.get('handoff-sending')?.queueStatus, 'sent');
+  assert.equal(byId.get('handoff-sending')?.statusReason, 'audit-confirmed');
+  assert.equal(byId.get('handoff-sending')?.statusChangedAt, 210);
+  assert.equal(byId.get('handoff-sending')?.auditEntryUuid, 'durable-sending-uuid');
+  assert.equal(byId.get('handoff-confirming')?.queueStatus, 'sent');
+  assert.equal(byId.get('handoff-confirming')?.auditHash, 'hash-confirming');
+  assert.equal(byId.get('handoff-confirming')?.auditEntryUuid, 'durable-confirming-uuid');
+  assert.equal(byId.get('handoff-confirming')?.sourceIdentity, 'codex-user-session-tab-a-2');
+  assert.equal(byId.get('handoff-missing')?.queueStatus, 'audit-pending');
+  assert.equal(byId.get('handoff-missing')?.content, 'same prompt');
+});
+
+test('snapshot absence cannot remove a local SENT row without an exact tombstone', () => {
+  const localSent = {
+    ...cachedProjectionRow('handoff-evicted', 'sent'),
+    statusReason: 'audit-confirmed',
+    auditEntryUuid: 'durable-proof-not-loaded',
+  };
+  const cachedRows = [localSent];
+  const retained = reconcileHistoryPromptHandoffRows<TestProjectionRow>({
+    rows: cachedRows,
+    handoffs: [],
+    createRow: createProjectionRow,
+  });
+
+  assert.strictEqual(retained.rows, cachedRows);
+  assert.strictEqual(retained.rows[0], localSent);
+  assert.equal(retained.changed, false);
+  assert.equal(retained.removed, 0);
+});
+
+test('identical prompts reconcile only by exact handoff id', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  begin(store, 'tab-a', 'handoff-a', 'byte-identical prompt');
+  begin(store, 'tab-a', 'handoff-b', 'byte-identical prompt');
+  store.settle('tab-a', 'handoff-a', {
+    queueStatus: 'sent',
+    reason: 'audit-a',
+    changedAt: 201,
+    proof: {
+      auditTimestamp: '2026-08-06T12:00:00.000Z',
+      actualHash: 'hash-a',
+      sessionId: 'session-tab-a',
+      entryUuid: 'entry-a',
+    },
+  });
+  store.settle('tab-a', 'handoff-b', {
+    queueStatus: 'audit-pending',
+    reason: 'pending-b',
+    changedAt: 202,
+  });
+  const rowB = cachedProjectionRow('handoff-b', 'sending', 'byte-identical prompt');
+  const rowA = cachedProjectionRow('handoff-a', 'audit-pending', 'byte-identical prompt');
+
+  const result = reconcileHistoryPromptHandoffRows<TestProjectionRow>({
+    rows: [rowB, rowA],
+    handoffs: store.getSnapshot('tab-a'),
+    createRow: createProjectionRow,
+  });
+
+  assert.equal(result.rows[0]?.handoffId, 'handoff-b');
+  assert.equal(result.rows[0]?.queueStatus, 'audit-pending');
+  assert.equal(result.rows[0]?.auditEntryUuid, undefined);
+  assert.equal(result.rows[1]?.handoffId, 'handoff-a');
+  assert.equal(result.rows[1]?.queueStatus, 'sent');
+  assert.equal(result.rows[1]?.auditEntryUuid, 'entry-a');
+});
+
+test('only explicit consumed or retracted tombstones remove local rows', () => {
+  const keep = cachedProjectionRow('handoff-keep', 'sent');
+  const consume = cachedProjectionRow('handoff-consume', 'sent');
+  const retract = cachedProjectionRow('handoff-retract', 'audit-pending');
+  const result = reconcileHistoryPromptHandoffRows<TestProjectionRow>({
+    rows: [keep, consume, retract],
+    handoffs: [],
+    tombstones: [
+      { handoffId: 'handoff-consume', state: 'consumed' },
+      { handoffId: 'handoff-retract', state: 'retracted' },
+    ],
+    createRow: createProjectionRow,
+  });
+
+  assert.deepEqual(result.rows.map(row => row.handoffId), ['handoff-keep']);
+  assert.equal(result.removed, 2);
+});
+
+test('reconciliation stays within hard row and snapshot bounds', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  begin(store, 'tab-a', 'handoff-a');
+  begin(store, 'tab-a', 'handoff-b');
+  begin(store, 'tab-a', 'handoff-c');
+  let createCalls = 0;
+  const bounded = reconcileHistoryPromptHandoffRows<TestProjectionRow>({
+    rows: [cachedProjectionRow('existing', 'sent')],
+    handoffs: store.getSnapshot('tab-a'),
+    createRow: (handoff) => {
+      createCalls += 1;
+      return createProjectionRow(handoff);
+    },
+    limits: { maxRows: 2, maxHandoffs: 2, maxTombstones: 1 },
+  });
+
+  assert.equal(bounded.rows.length, 2);
+  assert.equal(bounded.added, 1);
+  assert.equal(createCalls, 1);
+  assert.equal(bounded.truncated, true);
+
+  const oversizedRows = [
+    cachedProjectionRow('one', 'sent'),
+    cachedProjectionRow('two', 'sent'),
+    cachedProjectionRow('three', 'sent'),
+  ];
+  const rejectedTranscriptWalk = reconcileHistoryPromptHandoffRows<TestProjectionRow>({
+    rows: oversizedRows,
+    handoffs: store.getSnapshot('tab-a'),
+    createRow: () => {
+      throw new Error('must not walk or add when local overlay exceeds its bound');
+    },
+    limits: { maxRows: 2 },
+  });
+  assert.strictEqual(rejectedTranscriptWalk.rows, oversizedRows);
+  assert.equal(rejectedTranscriptWalk.changed, false);
+  assert.equal(rejectedTranscriptWalk.truncated, true);
+});
+
 test('duplicate begin is idempotent and cannot regress a settled handoff', () => {
   const store = new HistoryPromptHandoffStore(limits());
   begin(store, 'tab-a', 'handoff-a');
@@ -179,6 +469,105 @@ test('late audit A cannot confirm retry attempt B', () => {
     sendAttemptId: 'attempt-b',
     sendOperationKey: 'project:tab-foreign:handoff-a',
   }), false);
+});
+
+test('send identity binds monotonically onto an existing exact receipt', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  begin(store, 'tab-a', 'handoff-a');
+  const exact = store.settle('tab-a', 'handoff-a', {
+    queueStatus: 'sent',
+    reason: 'audit-confirmed',
+    changedAt: 200,
+    proof: {
+      auditTimestamp: '2026-08-06T12:00:00.000Z',
+      actualHash: 'exact-hash',
+      sessionId: 'session-live',
+      entryUuid: 'exact-user-uuid',
+    },
+  });
+
+  const bound = store.bindSendIdentity('tab-a', 'handoff-a', {
+    sendAttemptId: 'attempt-a',
+    sendOperationKey: 'project:tab-a:handoff-a',
+  });
+
+  assert.equal(bound.ok, true);
+  assert.equal(bound.ok && bound.changed, true);
+  assert.equal(bound.ok && bound.handoff.sendAttemptId, 'attempt-a');
+  assert.equal(bound.ok && bound.handoff.sendOperationKey, 'project:tab-a:handoff-a');
+  assert.equal(bound.ok && bound.handoff.queueStatus, exact?.queueStatus);
+  assert.equal(bound.ok && bound.handoff.statusReason, exact?.statusReason);
+  assert.equal(bound.ok && bound.handoff.statusChangedAt, exact?.statusChangedAt);
+  assert.deepEqual(bound.ok && bound.handoff.auditProof, exact?.auditProof);
+});
+
+test('replaying the same send identity is idempotent', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  begin(store, 'tab-a', 'handoff-a');
+  const first = store.bindSendIdentity('tab-a', 'handoff-a', {
+    sendAttemptId: 'attempt-a',
+    sendOperationKey: 'project:tab-a:handoff-a',
+  });
+  const replay = store.bindSendIdentity('tab-a', 'handoff-a', {
+    sendAttemptId: 'attempt-a',
+    sendOperationKey: 'project:tab-a:handoff-a',
+  });
+
+  assert.equal(first.ok && first.changed, true);
+  assert.equal(replay.ok && replay.changed, false);
+  assert.strictEqual(replay.ok && replay.handoff, first.ok && first.handoff);
+});
+
+test('foreign send identity conflicts are atomic and receipt-neutral', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  store.begin({
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    sendAttemptId: 'attempt-a',
+    toolType: 'codex',
+    text: 'prompt',
+  });
+  const exact = store.settle('tab-a', 'handoff-a', {
+    queueStatus: 'sent',
+    reason: 'audit-confirmed',
+    changedAt: 200,
+    proof: {
+      auditTimestamp: '2026-08-06T12:00:00.000Z',
+      actualHash: 'exact-hash',
+      sessionId: 'session-live',
+      entryUuid: 'exact-user-uuid',
+    },
+  });
+
+  assert.deepEqual(store.bindSendIdentity('tab-a', 'handoff-a', {
+    sendAttemptId: 'attempt-foreign',
+    sendOperationKey: 'foreign-operation-must-not-partially-bind',
+  }), {
+    ok: false,
+    reason: 'send-attempt-id-conflict',
+  });
+  const afterAttemptConflict = store.getSnapshot('tab-a')[0];
+  assert.equal(afterAttemptConflict?.sendAttemptId, 'attempt-a');
+  assert.equal(afterAttemptConflict?.sendOperationKey, null);
+  assert.equal(afterAttemptConflict?.queueStatus, exact?.queueStatus);
+  assert.deepEqual(afterAttemptConflict?.auditProof, exact?.auditProof);
+
+  const boundOperation = store.bindSendIdentity('tab-a', 'handoff-a', {
+    sendAttemptId: 'attempt-a',
+    sendOperationKey: 'operation-a',
+  });
+  assert.equal(boundOperation.ok, true);
+  assert.deepEqual(store.bindSendIdentity('tab-a', 'handoff-a', {
+    sendAttemptId: 'attempt-a',
+    sendOperationKey: 'operation-foreign',
+  }), {
+    ok: false,
+    reason: 'send-operation-key-conflict',
+  });
+  const afterOperationConflict = store.getSnapshot('tab-a')[0];
+  assert.equal(afterOperationConflict?.sendOperationKey, 'operation-a');
+  assert.equal(afterOperationConflict?.queueStatus, exact?.queueStatus);
+  assert.deepEqual(afterOperationConflict?.auditProof, exact?.auditProof);
 });
 
 test('an unverified post-Enter result cannot weaken exact audit identity', () => {
@@ -433,7 +822,11 @@ test('manual History and Run After share the receipt presentation mapping', () =
 
   assert.match(
     historyPanelSource,
-    /const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult\(result\)/,
+    /const unconfirmedStatus = sendIdentityFailure[\s\S]{0,180}historyPromptHandoffUnconfirmedStatusFromSendResult\(result\)/,
+  );
+  assert.match(
+    historyPanelSource,
+    /bindHistoryPromptHandoffSendIdentity\([\s\S]{0,260}sendAttemptId: resultSendAttemptId,[\s\S]{0,120}sendOperationKey: resultSendOperationKey/,
   );
   assert.match(
     queueRunnerSource,
@@ -443,4 +836,87 @@ test('manual History and Run After share the receipt presentation mapping', () =
     queueRunnerSource,
     /settleHistoryPromptHandoff\(auditTabId, handoffId,[\s\S]{0,180}queueStatus: 'sent'/,
   );
+});
+
+test('a durable desktop History receipt rebuilds the exact pending row after renderer reload', () => {
+  const tabId = 'tab-durable-reload';
+  const handoffId = 'handoff-durable-reload';
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey: `history:${tabId}:${handoffId}`,
+    surface: 'desktop-history',
+    tabId,
+    handoffId,
+    provider: 'claude',
+    sessionId: 'session-durable',
+    state: 'audit-pending',
+    attemptId: 'attempt-durable',
+    createdAt: 100,
+    updatedAt: 120,
+    receipt: {
+      source: 'history-panel',
+      promptText: 'durable prompt',
+      presentationSnapshot: { promptChips: [], imagePaths: [] },
+    },
+  });
+  assert.equal(outcome.hydrated, true);
+  const [handoff] = getHistoryPromptHandoffsSnapshot(tabId);
+  assert.equal(handoff.handoffId, handoffId);
+  assert.equal(handoff.sendAttemptId, 'attempt-durable');
+  assert.equal(handoff.queueStatus, 'audit-pending');
+  assert.equal(handoff.text, 'durable prompt');
+  consumeHistoryPromptHandoff(tabId, handoffId);
+});
+
+test('durable confirmation hydrates as one final SENT snapshot without transient SENDING', () => {
+  const tabId = 'tab-durable-confirmed-atomic';
+  const handoffId = 'handoff-durable-confirmed-atomic';
+  const observedStatuses: string[] = [];
+  const unsubscribe = subscribeHistoryPromptHandoffs(tabId, (snapshot, change) => {
+    if (change.type === 'replay') return;
+    const record = snapshot.find(candidate => candidate.handoffId === handoffId);
+    if (record) observedStatuses.push(record.queueStatus);
+  });
+
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey: `history:${tabId}:${handoffId}`,
+    surface: 'desktop-history',
+    tabId,
+    handoffId,
+    provider: 'claude',
+    sessionId: 'session-durable-confirmed',
+    state: 'confirmed',
+    attemptId: 'attempt-durable-confirmed',
+    createdAt: 200,
+    updatedAt: 240,
+    receipt: {
+      source: 'history-panel',
+      promptText: 'confirmed durable prompt',
+      actualHash: 'hash-durable-confirmed',
+      auditTimestamp: '2026-08-06T12:00:00.000Z',
+      entryUuid: 'entry-durable-confirmed',
+      presentationSnapshot: { promptChips: [], imagePaths: [] },
+    },
+  });
+
+  assert.equal(outcome.hydrated, true);
+  assert.deepEqual(observedStatuses, ['sent']);
+  assert.equal(outcome.handoff?.queueStatus, 'sent');
+  unsubscribe();
+  consumeHistoryPromptHandoff(tabId, handoffId);
+});
+
+test('a pre-Enter restart restores draft text instead of inventing a sent row', () => {
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey: 'history:tab-draft:handoff-draft',
+    surface: 'desktop-history',
+    tabId: 'tab-draft',
+    handoffId: 'handoff-draft',
+    provider: 'codex',
+    state: 'not-submitted',
+    attemptId: 'attempt-draft',
+    receipt: { promptText: 'restore me' },
+  });
+  assert.equal(outcome.hydrated, false);
+  assert.equal(outcome.restorableDraft, 'restore me');
+  assert.deepEqual(getHistoryPromptHandoffsSnapshot('tab-draft'), []);
 });

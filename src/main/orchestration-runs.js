@@ -6,6 +6,9 @@ const {
   normalizeAgentLaunchSource,
   normalizeAiLifecycleIdentity,
 } = require('./ai-lifecycle-authority');
+const {
+  agentPromptAuditMatchesHash,
+} = require('./agent-prompt-audit-identity');
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const ACTIVE_STATUSES = new Set([
@@ -1201,7 +1204,13 @@ class OrchestrationRunStore {
     // promptHash is the full transcript lookup identity (SHA-256). PasteAudit
     // emits a separate short transport identity. Comparing those two domains
     // made every real audit fail even though unit fixtures used equal strings.
-    if (!run.targetPromptAuditHash || proof.expectedHash !== run.targetPromptAuditHash) {
+    const targetPromptProof = run.targetPromptAuditHash
+      ? agentPromptAuditMatchesHash(run.targetPromptAuditHash, {
+          ...proof,
+          provider: proof.toolType || run.targetToolType,
+        })
+      : { matches: false };
+    if (!run.targetPromptAuditHash || targetPromptProof.matches !== true) {
       return { confirmed: false, reason: 'target-prompt-hash-mismatch', run: publicRun(run), changed };
     }
     if (proof.toolType && run.targetToolType && proof.toolType !== run.targetToolType) {
@@ -1575,9 +1584,14 @@ class OrchestrationRunStore {
         || canonicalPromptAuditSource(proof.source) !== expectedSource) {
         return { confirmed: false, reason: 'notification-identity-mismatch', run: publicRun(run), changed, settled };
       }
+      const notificationPromptProof = run.notificationPromptAuditHash
+        ? agentPromptAuditMatchesHash(run.notificationPromptAuditHash, {
+            ...proof,
+            provider: proof.toolType || run.sourceToolType,
+          })
+        : { matches: false };
       if (!run.notificationPromptAuditHash
-        || proof.expectedHash !== run.notificationPromptAuditHash
-        || proof.actualHash !== run.notificationPromptAuditHash) {
+        || notificationPromptProof.matches !== true) {
         return { confirmed: false, reason: 'notification-prompt-audit-hash-mismatch', run: publicRun(run), changed, settled };
       }
     } else if (!run.notificationPromptHash

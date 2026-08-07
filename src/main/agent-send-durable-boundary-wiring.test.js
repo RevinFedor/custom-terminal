@@ -20,11 +20,40 @@ test('durable send store is shared with web server and reconciled before serving
   const reconcileIndex = source.indexOf('agentSendReceiptStore.reconcileStartup()');
   const serverIndex = source.indexOf('webServer.start({');
   const injectionIndex = source.indexOf('agentSendReceiptStore,', serverIndex);
+  const startupReadyIndex = source.indexOf('agentSendReceiptStartupReady,', serverIndex);
 
   assert.ok(createIndex >= 0, 'main must create the store from the application SQLite database');
   assert.ok(reconcileIndex > createIndex, 'startup reconciliation must use the created store');
   assert.ok(serverIndex > reconcileIndex, 'startup reconciliation must happen before the HTTP server starts');
   assert.ok(injectionIndex > serverIndex, 'the exact same store must be injected into web-server');
+  assert.ok(startupReadyIndex > injectionIndex,
+    'the bounded transcript reconcile promise must be shared with web-server');
+});
+
+test('startup transcript proof is bounded and gates desktop, Project API, and Inbox replay', () => {
+  const mainSource = read(mainPath);
+  const webSource = read(webServerPath);
+  const start = mainSource.indexOf('const agentSendReceiptStartupReady = (async () => {');
+  const reconcile = mainSource.indexOf('reconcileAgentSendStartupRecords(unresolved)', start);
+  const promotion = mainSource.indexOf('agentSendReceiptStore.promoteFromAudit(result.audit)', reconcile);
+  const ipc = mainSource.indexOf("ipcMain.handle('agent:list-send-receipts'", promotion);
+  const ipcWait = mainSource.indexOf('await agentSendReceiptStartupReady', ipc);
+  assert.ok(start > 0 && reconcile > start && promotion > reconcile,
+    'startup must run one bounded transcript proof pass and promote only found evidence');
+  assert.ok(ipcWait > ipc,
+    'History hydration must wait for the bounded startup proof');
+
+  const scenario = webSource.indexOf('async function runAgentSendScenario({');
+  const scenarioWait = webSource.indexOf('await agentSendReceiptStartupReady', scenario);
+  const scenarioReserve = webSource.indexOf('agentSendReceiptStore.reserveOrGet(durableIdentity)', scenarioWait);
+  assert.ok(scenarioWait > scenario && scenarioReserve > scenarioWait,
+    'Project API must not replay or reserve before startup proof settles');
+
+  const inbox = webSource.indexOf("parsed.pathname === '/api/inbox/runs'");
+  const inboxWait = webSource.indexOf('await agentSendReceiptStartupReady', inbox);
+  const inboxReserve = webSource.indexOf('agentSendReceiptStore.reserveOrGet(durableInboxIdentity)', inboxWait);
+  assert.ok(inboxWait > inbox && inboxReserve > inboxWait,
+    'Inbox must share the same startup proof gate');
 });
 
 test('operation and attempt identity travel from bridge through both provider runtimes', () => {
@@ -140,15 +169,26 @@ test('IPC wrappers preserve an explicit unknown submit outcome', () => {
 
 test('physical cancellation waits are scoped to the exact durable attempt', () => {
   const source = read(mainPath);
+  const resolverStart = source.indexOf('function resolveAgentSendCancellationAttempt(');
+  const resolverEnd = source.indexOf("ipcMain.handle('agent:cancel-send'", resolverStart);
+  const resolverBody = source.slice(resolverStart, resolverEnd);
+  const cancelEnd = source.indexOf("ipcMain.handle('agent:clear-send-cancel'", resolverEnd);
+  const cancelBody = source.slice(resolverEnd, cancelEnd);
   const exactWaits = source.match(
     /agentSendCancellations\.wait\(\s*broadcastTabId,\s*handoffId,\s*sendAttemptId,?\s*\)/g,
   ) || [];
 
   assert.ok(exactWaits.length >= 2,
     'both the render wait and the held-after-paste boundary must wait on the exact attempt');
-  assert.match(source,
-    /durableRecords\.length > 0 && !durableAttemptId[\s\S]{0,500}reason: 'send-attempt-required'/,
-    'a cancellation without attempt identity must not target whichever durable retry is newest');
+  assert.match(resolverBody,
+    /durableRecords\.length === 1[\s\S]{0,180}surface === DESKTOP_HISTORY_SEND_SURFACE[\s\S]{0,180}attemptId: durableRecords\[0\]\.attemptId/,
+    'a fresh desktop handoff may resolve only its sole exact durable attempt');
+  assert.match(resolverBody,
+    /return \{ accepted: false, attemptId: null, durableRecords \};/,
+    'ambiguous durable attempts are not guessed');
+  assert.match(cancelBody,
+    /if \(!resolved\.accepted\)[\s\S]{0,600}reason: 'send-attempt-required'/,
+    'API/orchestration and ambiguous cancellations still require explicit attempt identity');
 });
 
 test('closed-tab preparation stays retryable until the physical send attempt begins', () => {

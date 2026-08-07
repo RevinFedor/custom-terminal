@@ -62,7 +62,12 @@ const CODEX_JSONL_WRITE_CHUNK_BYTES = 4 * 1024 * 1024;
 // substantially more. Keep one oversized active rollout if necessary, but do
 // not retain an unbounded collection of fully parsed sessions forever.
 const CODEX_JSONL_CACHE_MAX_RAW_BYTES = 768 * 1024 * 1024;
-const CODEX_JSONL_CACHE_MAX_FILES = 3;
+// The byte budget is the real memory bound; the file cap only limits entry
+// count. At 3, a workspace with a couple of open codex tabs plus usage/
+// timeline reads of other sessions evicted the ACTIVE 73MB rollout between
+// its own refreshes — every live append then cost a full 3.1s re-parse
+// instead of the incremental range read (tab-3163, 06.08 11:37 loadMs=3147).
+const CODEX_JSONL_CACHE_MAX_FILES = 6;
 const CODEX_SESSION_META_HEAD_MAX_BYTES = 512 * 1024;
 const CODEX_SESSION_META_HEAD_CHUNK_BYTES = 16 * 1024;
 const CODEX_SESSION_META_HEAD_MAX_RECORDS = 32;

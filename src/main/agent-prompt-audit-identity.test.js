@@ -1,0 +1,57 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const {
+  agentPromptAuditMatchesHash,
+  classifyAgentPromptAuditIdentity,
+} = require('./agent-prompt-audit-identity');
+
+test('exact transcript hash remains the operation identity for every provider', () => {
+  const proof = classifyAgentPromptAuditIdentity({
+    provider: 'claude',
+    expectedHash: 'hash-a',
+    actualHash: 'hash-a',
+    canonicalized: true,
+    canonicalReason: 'causal-canonical-claim',
+  });
+  assert.equal(proof.accepted, true);
+  assert.equal(proof.identityHash, 'hash-a');
+  assert.equal(proof.actualHash, 'hash-a');
+});
+
+test('only a declared Codex canonical transformation may differ from the sent hash', () => {
+  const accepted = agentPromptAuditMatchesHash('expected-hash', {
+    provider: 'codex',
+    expectedHash: 'expected-hash',
+    actualHash: 'observed-hash',
+    canonicalized: true,
+    canonicalReason: 'codex_trimmed_boundary_whitespace',
+  });
+  assert.equal(accepted.matches, true);
+  assert.equal(accepted.identityHash, 'expected-hash');
+  assert.equal(accepted.actualHash, 'observed-hash');
+
+  for (const rejected of [
+    { provider: 'codex', canonicalized: false, canonicalReason: 'codex_trimmed_boundary_whitespace' },
+    { provider: 'codex', canonicalized: true, canonicalReason: 'unknown-transform' },
+    { provider: 'claude', canonicalized: true, canonicalReason: 'codex_trimmed_boundary_whitespace' },
+  ]) {
+    assert.equal(agentPromptAuditMatchesHash('expected-hash', {
+      expectedHash: 'expected-hash',
+      actualHash: 'observed-hash',
+      ...rejected,
+    }).matches, false);
+  }
+});
+
+test('a proven transform still cannot adopt a different operation hash', () => {
+  assert.equal(agentPromptAuditMatchesHash('foreign-hash', {
+    provider: 'codex',
+    expectedHash: 'expected-hash',
+    actualHash: 'observed-hash',
+    canonicalized: true,
+    canonicalReason: 'codex_image_placeholder_canonical',
+  }).matches, false);
+});

@@ -152,6 +152,7 @@ const {
   classifyClaudeMissingPromptExactCaptureAdmission,
   parseClaudeComposerCurrentFrame,
   reserveClaudeExactEmptyEvidence,
+  resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence,
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 } = require(path.join(srcMainDir, 'claude-composer-proof'));
@@ -224,13 +225,21 @@ const {
   createProcessMetricsService,
 } = require(path.join(srcMainDir, 'process-metrics-service'));
 const {
+  waitForNextPtyOutput,
   waitForNextPtySynchronizedFrame,
 } = require(path.join(srcMainDir, 'pty-synchronized-frame'));
+const {
+  replaceAgentInputIfUnchangedAtBoundary,
+} = require(path.join(srcMainDir, 'agent-input-compare-and-swap'));
 const {
   authorizeClaudeRewindTargetSelection,
   findClaudeRewindPrimarySelectedLine,
   inspectClaudeRewindMenuScope,
 } = require(path.join(srcMainDir, 'claude-rewind-menu-state'));
+const {
+  inspectClaudeThinkingPickerSnapshot,
+  inspectClaudeThinkingProceedSnapshot,
+} = require(path.join(srcMainDir, 'claude-thinking-picker-state'));
 const {
   deleteTerminalRuntimeIfOwned,
   ownsTerminalRuntime,
@@ -273,13 +282,28 @@ const {
   promptAuditFingerprint,
 } = require(path.join(srcMainDir, 'prompt-audit-fingerprint'));
 const {
+  prepareClaudePromptTransport,
+} = require(path.join(srcMainDir, 'claude-prompt-transport'));
+const {
   STORE_STATES: AGENT_SEND_DURABLE_STATES,
   createAgentSendReceiptStore,
 } = require(path.join(srcMainDir, 'agent-send-receipt-store'));
 const {
+  reconcileAgentSendStartupRecords,
+} = require(path.join(srcMainDir, 'agent-send-startup-reconcile'));
+const {
+  DESKTOP_HISTORY_SEND_SURFACE,
+  buildDesktopHistorySendIdentity,
+  desktopHistorySendReplayResult,
+  isDesktopHistorySendReceiptEligible,
+} = require(path.join(srcMainDir, 'agent-history-send-receipt'));
+const {
   classifyManualPtyInputAtBoundary,
   shouldSerializeManualPtyInput,
 } = require(path.join(srcMainDir, 'pty-input-ownership'));
+const {
+  classifyTerminalPasteProfile,
+} = require(path.join(srcMainDir, 'terminal-paste-profile'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const { ProjectPromptCatalogService } = require(path.join(srcMainDir, 'project-prompt-catalog'));
 const { buildPromptMenuTemplate } = require(path.join(srcMainDir, 'prompt-menu-template'));
@@ -307,6 +331,47 @@ if (agentSendReceiptStartupReconcile.changed > 0) {
   console.warn('[AgentSendReceipt] startup reconciled active attempts to delivery-unknown count='
     + agentSendReceiptStartupReconcile.changed);
 }
+const agentSendReceiptStartupReady = (async () => {
+  const unresolved = agentSendReceiptStartupReconcile.records.filter((record) => (
+    record?.state === AGENT_SEND_DURABLE_STATES.AUDIT_PENDING
+    || record?.state === AGENT_SEND_DURABLE_STATES.DELIVERY_UNKNOWN
+  ));
+  const decisions = await reconcileAgentSendStartupRecords(unresolved);
+  let promoted = 0;
+  let absent = 0;
+  let unknown = 0;
+  for (const result of decisions) {
+    if (result?.decision === 'found' && result.audit) {
+      const promotion = agentSendReceiptStore.promoteFromAudit(result.audit);
+      if (promotion?.promoted === true
+        || (promotion?.idempotent === true
+          && promotion?.record?.state === AGENT_SEND_DURABLE_STATES.CONFIRMED)) {
+        promoted += 1;
+      } else {
+        unknown += 1;
+        console.warn('[AgentSendReceipt] startup transcript proof rejected operation='
+          + String(result.operationKey || '-').slice(0, 72)
+          + ' reason=' + (promotion?.reason || 'unknown'));
+      }
+    } else if (result?.decision === 'absent') {
+      // Absence at startup is not retry authority. A provider may have accepted
+      // Enter without flushing its transcript before process teardown.
+      absent += 1;
+    } else {
+      unknown += 1;
+    }
+  }
+  if (decisions.length > 0) {
+    console.warn('[AgentSendReceipt] startup transcript reconcile records=' + decisions.length
+      + ' promoted=' + promoted
+      + ' absent=' + absent
+      + ' unknown=' + unknown);
+  }
+  return { ready: true, records: decisions.length, promoted, absent, unknown };
+})().catch((error) => {
+  console.warn('[AgentSendReceipt] startup transcript reconcile failed:', error?.message || error);
+  return { ready: false, error: error?.message || String(error) };
+});
 const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
@@ -2169,7 +2234,10 @@ function logAgentDraftProofContradiction(tabId, agent, pending, text) {
   ) return null;
   const identityStable = validateAgentInputIdentity(tabId, pending.captureIdentity)
     && pending.draftProofIdentityAtWrite === true
-    && agentDraftProofMatchesCaptureIdentity(proof, pending.captureIdentity);
+    && agentDraftProofMatchesCaptureIdentity(
+      proof,
+      pending.draftProofCaptureIdentity || pending.captureIdentity,
+    );
   console.error('[AgentDraftProof:CONTRADICTION] agent=' + agent
     + ' tab=' + String(tabId).slice(-12)
     + ' screen=' + (proof.proofOutcome || (proof.hasDraft === true ? 'found' : 'unknown'))
@@ -3643,28 +3711,19 @@ async function verifyClaudeComposerEmptyAtWriteBoundary(
     currentMirrorFlushedSeq: mirror?.flushedSeq ?? null,
     currentMirrorSynchronizedOutputOpen: mirror?.redrawTrace?.synchronizedOutputOpen === true,
   });
-  if (
-    !decision.valid
-    && proof?.proofOutcome === 'unknown'
-    && proof?.exactCaptureRecommended === true
-    && exactClaudeEmptyEvidenceStillCurrent(tabId, exactEmptyEvidence)
-  ) {
-    // Ctrl+G already proved the actual Claude input empty on this exact
-    // process/input generation. Keep the current screen geometry as the
-    // surface proof, but replace its residual-cell ambiguity with that exact
-    // empty result. A fresh write-boundary validation below still requires the
-    // current mirror to be closed and caught up.
-    proof = {
-      ...proof,
-      proofOutcome: 'absent',
-      hasDraft: false,
-      text: '',
-      preview: '',
-      source: 'headless-main:claude-composer:empty-exact-editor',
-      proofReason: 'external-editor-empty-current-generation',
-    };
-    decision = validateClaudeComposerWriteBoundary({
+  if (!decision.valid && exactEmptyEvidence) {
+    const currentSnapshot = getHeadlessVisibleBufferSnapshot(
+      tabId,
+      reason + ':reserved-exact-empty-consume',
+      { preferCommitted: false },
+    );
+    const launch = claudeLaunchGenerationByTab.get(tabId) || null;
+    const startupGate = claudeStartupDefaultsGateByTab.get(tabId) || null;
+    const exactDecision = resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence({
       proof,
+      evidence: exactEmptyEvidence,
+      reservedEvidenceOwnedByCurrentOperation:
+        ptyActiveWriteOperation.get(term)?.claudeExactEmptyEvidence === exactEmptyEvidence,
       terminalMatches: terminals.get(tabId) === term,
       currentInputRevision: getTerminalInputRevision(tabId),
       currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
@@ -3673,7 +3732,29 @@ async function verifyClaudeComposerEmptyAtWriteBoundary(
       currentMirrorWriteSeq: mirror?.writeSeq ?? null,
       currentMirrorFlushedSeq: mirror?.flushedSeq ?? null,
       currentMirrorSynchronizedOutputOpen: mirror?.redrawTrace?.synchronizedOutputOpen === true,
+      currentSynchronizedOutputGeneration: Number(
+        mirror?.redrawTrace?.synchronizedOutputGeneration || 0,
+      ),
+      turnBusy: claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true,
+      localCommandActive: claudeLocalCommandWatchers.has(tabId),
+      compactActive: !!compactOperations.getActive(tabId, 'claude'),
+      awaitingInput: claudeAwaitingInput.get(tabId) === true || claudePendingQuestion.has(tabId),
+      stopping: aiStoppingTabs.get(tabId)?.toolType === 'claude',
+      rewindActive: activeRewindOperations.get(tabId)?.toolType === 'claude',
+      startupGateReady: !!launch?.generation
+        && claudePromptReady.has(tabId)
+        && startupGate?.generation === launch.generation
+        && startupGate?.status === 'ready',
+      pickerActive: currentSnapshot?.success === true
+        && inspectClaudeThinkingPickerSnapshot(currentSnapshot).visible === true,
+      controlSurfaceActive: currentSnapshot?.success !== true
+        || claudeMissingPromptControlSurfaceActive(tabId, currentSnapshot),
+      replacementActive: terminals.get(tabId) !== term,
     });
+    if (exactDecision.valid) {
+      proof = exactDecision.proof;
+      decision = exactDecision;
+    }
   }
   console.log('[ClaudeComposerWriteBoundary] tab=' + String(tabId).slice(-12)
     + ' valid=' + decision.valid
@@ -9664,13 +9745,16 @@ function startClaudeHookServer() {
         } = msg;
         const eventSeq = ++claudeHookEventSeq;
 
-        // Send ack back to script so it can distinguish "kernel buffered"
-        // (outcome=sent) from "server actually parsed it" (outcome=acked).
-        // Silent-dropout case from May 16 prod incident: 56 envelopes had
-        // outcome=sent on script side, but server never logged them — proof
-        // the read path was broken even though TCP/UDS accept was fine.
-        // ack is just "ok\n" — script reads it before exit.
-        try { sock.write('ok\n'); } catch {}
+        // Send ack back to scripts so they can distinguish "kernel buffered"
+        // from "server actually parsed it". GrabInput is the one exception:
+        // its helper exits only after this ack, and the parent TUI cannot redraw
+        // before that exit. We therefore arm the post-editor PTY edge first and
+        // acknowledge inside the GrabInput branch. This closes the race where
+        // Claude/Codex returned and redrew before main subscribed.
+        const acknowledgeHookEnvelope = () => {
+          try { sock.write('ok\n'); } catch {}
+        };
+        if (event !== 'GrabInput') acknowledgeHookEnvelope();
 
         // ─── GrabInput: payload from noted-code-grab.js helper (no session_id, has ppid) ───
         // Helper is invoked by the CLI external-editor flow. Claude maps ppid → tabId via
@@ -9681,6 +9765,7 @@ function startClaudeHookServer() {
             || grabInputPidToTab.get(cliPid)
             || (() => { for (const [pid, tid] of bridgePidCache) { if (pid === cliPid) return tid; } return null; })();
           if (!tabId) {
+            acknowledgeHookEnvelope();
             console.warn('[ClaudeHook] GrabInput ppid=' + cliPid + ' — no tab match (bridgePidCache.size=' + bridgePidCache.size + ' grabPidMap.size=' + grabInputPidToTab.size + ')');
             continue;
           }
@@ -9690,6 +9775,19 @@ function startClaudeHookServer() {
           const mode = msg.mode || pending?.mode || 'grab';
           console.log('[ClaudeHook] #' + eventSeq + ' GrabInput agent=' + agent + ' tab=' + tabId.slice(-12) + ' mode=' + mode + ' bytes=' + text.length + (pending ? '' : ' (no pending — unsolicited?)'));
           if (pending) {
+            // The PTY write lock remains owned until this promise resolves.
+            // Claude exposes a complete synchronized-output frame. Codex does
+            // not expose that marker contract here, so its first post-helper
+            // PTY output is the deterministic parent-resumed edge. The bounded
+            // timeout only produces unknown/failure; it is never success proof.
+            const editorReturnPromise = agent === 'claude'
+              ? waitForNextPtySynchronizedFrame(pending.captureIdentity?.terminalToken, {
+                timeoutMs: 1500,
+              })
+              : waitForNextPtyOutput(pending.captureIdentity?.terminalToken, {
+                timeoutMs: 1500,
+              });
+            acknowledgeHookEnvelope();
             clearTimeout(pending.timer);
             grabInputPending.delete(tabId);
             if (Array.isArray(pending.pids)) pending.pids.forEach(pid => grabInputPidToTab.delete(pid));
@@ -9701,24 +9799,6 @@ function startClaudeHookServer() {
             if (exactEmpty) {
               contradiction = logAgentDraftProofContradiction(tabId, agent, pending, text);
             }
-            // GrabInput is emitted while the external-editor helper is still
-            // alive. Only the exact screen-found/empty-grab reconciliation
-            // needs to delay its caller until the TUI has returned. Ordinary
-            // grab/copy remains immediate; notably the startup setting retry
-            // owns its own post-copy synchronized-frame wait and must not be
-            // forced to wait for a second frame here.
-            const editorReturnPromise = contradiction
-              && agent === 'claude'
-              && (mode === 'grab' || mode === 'copy')
-              ? waitForNextPtySynchronizedFrame(pending.captureIdentity?.terminalToken, {
-                timeoutMs: 1500,
-              })
-              : Promise.resolve({
-                ready: false,
-                reason: contradiction && agent === 'codex'
-                  ? 'codex-editor-return-proof-not-implemented'
-                  : 'editor-return-proof-not-required',
-              });
             void (async () => {
               let resolvedText = text;
               let sourceRefs = [];
@@ -9777,7 +9857,10 @@ function startClaudeHookServer() {
                 && identityStable
                 && editorReturn?.ready === true;
               pending.resolve({
-                success: true,
+                success: editorReturn?.ready === true,
+                ...(editorReturn?.ready === true
+                  ? {}
+                  : { error: 'external_editor_return_unconfirmed' }),
                 text: resolvedText,
                 images,
                 imagePaths,
@@ -9800,6 +9883,8 @@ function startClaudeHookServer() {
               console.error('[PromptQueueAssets] grab materialization failed tab=' + tabId.slice(-12) + ':', error);
               pending.resolve({ success: false, error: 'image_materialization_failed', mode });
             });
+          } else {
+            acknowledgeHookEnvelope();
           }
           continue;
         }
@@ -14623,6 +14708,7 @@ app.whenReady().then(async () => {
       registerTaskCompletionIntent,
       e2eBoundaryTestGate: aiBoundaryTestGate,
       agentSendReceiptStore,
+      agentSendReceiptStartupReady,
       projectPromptCatalog,
     });
     console.log('[Startup] Mobile WebServer OK');
@@ -16558,6 +16644,34 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
         + ' state=' + (durable?.state || 'missing'));
       return;
     }
+    if (result?.success === true) {
+      const durablePromotion = agentSendReceiptStore.promoteFromAudit({
+        success: true,
+        operationKey: audit.sendOperationKey,
+        attemptId: audit.sendAttemptId,
+        provider: toolType,
+        sessionId: result.sessionId,
+        promptHash: result.expectedHash || audit.expectedHash || result.actualHash,
+        actualHash: result.actualHash,
+        expectedHash: result.expectedHash || audit.expectedHash || null,
+        canonicalized: result.canonicalized === true,
+        canonicalReason: result.canonicalReason || null,
+        entryUuid: result.entryUuid || null,
+        transcriptBoundary: result.transcriptBoundary || null,
+        auditTimestamp: result.auditTimestamp || null,
+      });
+      const durableAccepted = durablePromotion?.promoted === true
+        || (durablePromotion?.idempotent === true
+          && durablePromotion?.record?.state === AGENT_SEND_DURABLE_STATES.CONFIRMED);
+      if (!durableAccepted) {
+        console.warn('[AgentSendReceipt] ignore audit rejected by durable identity'
+          + ' operation=' + String(audit.sendOperationKey).slice(0, 72)
+          + ' attempt=' + String(audit.sendAttemptId).slice(0, 12)
+          + ' reason=' + (durablePromotion?.reason || 'unknown')
+          + ' mismatches=' + (durablePromotion?.mismatchedFields || []).join(','));
+        return;
+      }
+    }
   }
   const baseDetail = {
     tabId,
@@ -17168,7 +17282,7 @@ async function safePasteAndSubmit(term, content, options = {}) {
   const requestedInputRevision = operationTabId
     ? getTerminalInputRevision(operationTabId)
     : null;
-  return await withPtyWriteLock(
+  const result = await withPtyWriteLock(
     term,
     () => {
       let expectedInputRevision = requestedInputRevision;
@@ -17198,14 +17312,28 @@ async function safePasteAndSubmit(term, content, options = {}) {
           operation.inputRevision = expectedInputRevision;
         }
       }
+      operation.claudeExactEmptyEvidence = claudeExactEmptyEvidence
+        || options.startupExactEmptyEvidence
+        || null;
       return _safePasteAndSubmitInner(term, content, {
         ...options,
         expectedInputRevision,
         claudeExactEmptyEvidence,
+        sendOperationContext: operation,
       });
     },
     operation,
   );
+  if (result && typeof result === 'object' && operation.sendOperationKey) {
+    return {
+      ...result,
+      operationKey: result.operationKey || operation.sendOperationKey,
+      sendOperationKey: result.sendOperationKey || operation.sendOperationKey,
+      attemptId: result.attemptId || operation.sendAttemptId || null,
+      sendAttemptId: result.sendAttemptId || operation.sendAttemptId || null,
+    };
+  }
+  return result;
 }
 
 async function _safePasteAndSubmitInner(term, content, options = {}) {
@@ -17216,8 +17344,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     dismissAutocomplete = false, // Send Esc after paste to close slash-cmd autocomplete dropdown
     logPrefix = '[safePaste]',
     handoffId = null,
-    sendAttemptId = null,
-    sendOperationKey = null,
+    sendAttemptId: requestedSendAttemptId = null,
+    sendOperationKey: requestedSendOperationKey = null,
     source = null,
     safetyTimeoutMs = 8000,
     fast = false, // Turbo mode for Gemini/Bash (skip render waits)
@@ -17240,7 +17368,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     startupExactEmptyEvidence = null,
     claudeExactEmptyEvidence = null,
     queuedAtSubmit = false,
+    sendOperationContext = null,
   } = options;
+  let sendAttemptId = requestedSendAttemptId;
+  let sendOperationKey = requestedSendOperationKey;
+  const durableRawPrompt = content;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
   // Only used in fast-mode (Gemini/bash) where Ink isn't involved and we don't
@@ -17324,6 +17456,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // staged audit, so the binding must be visible outside the `try` block.
   let stagedClaudeAudit = null;
   let pasteWritten = false;
+  let autoDurableAttempt = null;
+  let durablePreSubmitBoundary = null;
   let claudeDraftGuardInputRevision = null;
   let claudeDraftGuardProof = null;
   const exactSendCancellationRequested = () => !!(
@@ -17357,6 +17491,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     );
   };
   const normalizedPresentationSnapshot = normalizePromptPresentationSnapshot(presentationSnapshot);
+  if (sendOperationContext && sendOperationKey && sendAttemptId) {
+    sendOperationContext.sendOperationKey = sendOperationKey;
+    sendOperationContext.sendAttemptId = sendAttemptId;
+  }
   const emitBusy = (busy) => {
     if (pasteBusyPublished === busy) return;
     pasteBusyPublished = busy;
@@ -17483,6 +17621,79 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     content = prepared.text;
     stagedCodexImageRefs = prepared.staged;
     codexImagePasteSegments = prepared.replaced > 0 ? prepared.segments : null;
+  }
+  if (!fast && !isCodexPasteSource) {
+    try {
+      const preparedClaudePrompt = prepareClaudePromptTransport(content);
+      content = preparedClaudePrompt.transport.text;
+    } catch (error) {
+      return {
+        success: false,
+        accepted: false,
+        submitted: false,
+        pasteWritten: false,
+        error: error?.code || 'claude_prompt_transport_failed',
+      };
+    }
+  }
+  if (isDesktopHistorySendReceiptEligible({
+    submit,
+    tabId: broadcastTabId,
+    handoffId,
+    source,
+    rawPrompt: durableRawPrompt,
+    sendOperationKey,
+    sendAttemptId,
+  })) {
+    let identity;
+    try {
+      identity = buildDesktopHistorySendIdentity({
+        tabId: broadcastTabId,
+        handoffId,
+        provider: isCodexPasteSource ? 'codex' : 'claude',
+        source,
+        sessionId: normalizedPresentationSnapshot?.historySessionId || null,
+        rawPrompt: durableRawPrompt,
+        promptHash: pasteAuditHash(content),
+        promptLength: content.length,
+      });
+    } catch (error) {
+      return {
+        success: false,
+        accepted: false,
+        submitted: false,
+        pasteWritten: false,
+        error: error?.message || 'agent_send_durable_identity_invalid',
+      };
+    }
+    const begun = agentSendReceiptStore.beginAttempt(identity);
+    if (begun?.ok !== true) {
+      return {
+        success: false,
+        accepted: false,
+        submitted: false,
+        pasteWritten: false,
+        error: begun?.code || 'agent_send_durable_attempt_unavailable',
+      };
+    }
+    if (begun.action === 'replay') {
+      return desktopHistorySendReplayResult(begun.record);
+    }
+    sendOperationKey = identity.operationKey;
+    sendAttemptId = begun.attemptId;
+    autoDurableAttempt = {
+      operationKey: sendOperationKey,
+      attemptId: sendAttemptId,
+    };
+    if (sendOperationContext) {
+      sendOperationContext.sendOperationKey = sendOperationKey;
+      sendOperationContext.sendAttemptId = sendAttemptId;
+    }
+    console.log('[AgentSendReceipt] desktop History attempt started'
+      + ' tab=' + String(broadcastTabId).slice(-12)
+      + ' handoff=' + String(handoffId).slice(0, 32)
+      + ' attempt=' + String(sendAttemptId).slice(0, 12)
+      + ' provider=' + (isCodexPasteSource ? 'codex' : 'claude'));
   }
   if (codexSubmissionWatcher?.reservation) {
     const expectedHash = pasteAuditHash(content);
@@ -17968,6 +18179,35 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       };
     }
   }
+  if (sendOperationKey && sendAttemptId) {
+    durablePreSubmitBoundary = isCodexPasteSource
+      ? captureCodexPromptAuditBoundary(broadcastTabId, Date.now())
+      : claudeAuditBoundary;
+    const stagedDurableContext = agentSendReceiptStore.stageAttemptContext(
+      sendOperationKey,
+      sendAttemptId,
+      {
+        source: source || null,
+        promptText: durableRawPrompt,
+        transportText: content,
+        presentationSnapshot: normalizedPresentationSnapshot,
+        transcriptBoundary: durablePreSubmitBoundary || null,
+      },
+    );
+    if (stagedDurableContext?.ok !== true) {
+      console.warn('[AgentSendReceipt] refusing paste without durable pre-Enter context'
+        + ' operation=' + String(sendOperationKey).slice(0, 72)
+        + ' attempt=' + String(sendAttemptId).slice(0, 12)
+        + ' reason=' + (stagedDurableContext?.reason || 'unknown'));
+      return {
+        success: false,
+        accepted: false,
+        submitted: false,
+        pasteWritten: false,
+        error: 'agent_send_context_not_durable',
+      };
+    }
+  }
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     let payload = chunk.text;
@@ -18227,7 +18467,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           finished: false,
           presentationSnapshot: normalizedPresentationSnapshot,
           historySessionId: presentationSnapshot?.historySessionId || null,
-          preSubmitBoundary: captureCodexPromptAuditBoundary(broadcastTabId, sentAt),
+          preSubmitBoundary: durablePreSubmitBoundary
+            || captureCodexPromptAuditBoundary(broadcastTabId, sentAt),
           submitWritten: false,
           delayedStableSourceSubmit: null,
           actionAuthority: codexSubmitAuthority,
@@ -18307,7 +18548,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           result: null,
           presentationSnapshot: normalizedPresentationSnapshot,
           historySessionId: presentationSnapshot?.historySessionId || null,
-          preSubmitBoundary: claudeAuditBoundary,
+          preSubmitBoundary: durablePreSubmitBoundary || claudeAuditBoundary,
           preSubmitRouteProof: claudeHookRouteProof?.bound === true
             ? {
                 tabId: claudeHookRouteProof.tabId,
@@ -18641,6 +18882,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           tabId: broadcastTabId,
           handoffId: handoffId || null,
           promptHash: pasteAuditHash(content),
+          transcriptBoundary: durablePreSubmitBoundary
+            || stagedCodexAudit?.preSubmitBoundary
+            || stagedClaudeAudit?.preSubmitBoundary
+            || null,
         },
       );
       if (submittedReceipt?.ok !== true) {
@@ -18839,6 +19084,29 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       && responseActivityPreflights.get(broadcastTabId) === responsePreflight
     ) {
       responseActivityPreflights.delete(broadcastTabId);
+    }
+    if (autoDurableAttempt) {
+      const durable = agentSendReceiptStore.get(autoDurableAttempt.operationKey);
+      if (
+        durable?.attemptId === autoDurableAttempt.attemptId
+        && durable.state === AGENT_SEND_DURABLE_STATES.IN_FLIGHT
+      ) {
+        agentSendReceiptStore.settleAttempt(
+          autoDurableAttempt.operationKey,
+          autoDurableAttempt.attemptId,
+          {
+            success: false,
+            accepted: false,
+            submitted: false,
+            status: AGENT_SEND_DURABLE_STATES.NOT_SUBMITTED,
+            code: 'agent_send_stopped_before_enter',
+            operationKey: autoDurableAttempt.operationKey,
+            attemptId: autoDurableAttempt.attemptId,
+            tabId: broadcastTabId,
+            handoffId: handoffId || null,
+          },
+        );
+      }
     }
     emitBusy(false);
   }
@@ -19570,14 +19838,40 @@ async function handleTerminalInput(
 
 ipcMain.on('terminal:input', handleTerminalInput);
 
-ipcMain.handle('agent:cancel-send', (_event, { tabId, handoffId, sendAttemptId = null } = {}) => {
+function resolveAgentSendCancellationAttempt(tabId, handoffId, requestedAttemptId) {
+  const requested = typeof requestedAttemptId === 'string' && requestedAttemptId.trim()
+    ? requestedAttemptId.trim()
+    : null;
   const durableRecords = tabId && handoffId
     ? agentSendReceiptStore.list({ tabId }).filter((record) => record.handoffId === handoffId)
     : [];
-  const durableAttemptId = typeof sendAttemptId === 'string' && sendAttemptId.trim()
-    ? sendAttemptId.trim()
-    : null;
-  if (durableRecords.length > 0 && !durableAttemptId) {
+  if (requested || durableRecords.length === 0) {
+    return { accepted: true, attemptId: requested, durableRecords };
+  }
+  // Desktop History creates a fresh handoff UUID for every click. Before the
+  // async send result returns, Stop knows that exact handoff but cannot yet
+  // know the main-generated attempt UUID. Resolving the sole current desktop
+  // receipt is therefore exact; API/orchestration surfaces and ambiguous rows
+  // still require their explicit attempt identity.
+  if (
+    durableRecords.length === 1
+    && durableRecords[0].surface === DESKTOP_HISTORY_SEND_SURFACE
+    && durableRecords[0].attemptId
+  ) {
+    return {
+      accepted: true,
+      attemptId: durableRecords[0].attemptId,
+      durableRecords,
+      resolvedFromDesktopHandoff: true,
+    };
+  }
+  return { accepted: false, attemptId: null, durableRecords };
+}
+
+ipcMain.handle('agent:cancel-send', (_event, { tabId, handoffId, sendAttemptId = null } = {}) => {
+  const resolved = resolveAgentSendCancellationAttempt(tabId, handoffId, sendAttemptId);
+  const durableAttemptId = resolved.attemptId;
+  if (!resolved.accepted) {
     console.warn('[AgentSendCancel] reject ambiguous durable cancellation tab='
       + String(tabId || '').slice(-12)
       + ' handoff=' + String(handoffId || '-')
@@ -19585,7 +19879,7 @@ ipcMain.handle('agent:cancel-send', (_event, { tabId, handoffId, sendAttemptId =
     return {
       cancelled: false,
       reason: 'send-attempt-required',
-      currentAttemptId: durableRecords
+      currentAttemptId: resolved.durableRecords
         .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))[0]?.attemptId
         || null,
     };
@@ -19603,19 +19897,45 @@ ipcMain.handle('agent:cancel-send', (_event, { tabId, handoffId, sendAttemptId =
 });
 
 ipcMain.handle('agent:clear-send-cancel', (_event, { tabId, handoffId, sendAttemptId = null } = {}) => {
-  const durableRecords = tabId && handoffId
-    ? agentSendReceiptStore.list({ tabId }).filter((record) => record.handoffId === handoffId)
-    : [];
-  const durableAttemptId = typeof sendAttemptId === 'string' && sendAttemptId.trim()
-    ? sendAttemptId.trim()
-    : null;
-  if (durableRecords.length > 0 && !durableAttemptId) {
+  const resolved = resolveAgentSendCancellationAttempt(tabId, handoffId, sendAttemptId);
+  const durableAttemptId = resolved.attemptId;
+  if (!resolved.accepted) {
     return { success: false, cleared: false, reason: 'send-attempt-required' };
   }
   return {
     success: true,
     cleared: agentSendCancellations.clear(tabId, handoffId, durableAttemptId),
   };
+});
+
+ipcMain.handle('agent:list-send-receipts', async (_event, { tabId, surface = null } = {}) => {
+  const exactTabId = typeof tabId === 'string' ? tabId.trim() : '';
+  if (!exactTabId) return { success: false, error: 'tab_id_required', records: [] };
+  await agentSendReceiptStartupReady;
+  const exactSurface = typeof surface === 'string' && surface.trim()
+    ? surface.trim()
+    : null;
+  const records = agentSendReceiptStore.list({
+    tabId: exactTabId,
+    ...(exactSurface ? { surface: exactSurface } : {}),
+  }).map((record) => ({
+    operationKey: record.operationKey,
+    surface: record.surface,
+    tabId: record.tabId,
+    handoffId: record.handoffId,
+    provider: record.provider,
+    sessionId: record.sessionId,
+    promptHash: record.promptHash,
+    promptLength: record.promptLength,
+    state: record.state,
+    attemptId: record.attemptId,
+    receipt: record.receipt,
+    transcriptBoundary: record.transcriptBoundary,
+    auditIdentity: record.auditIdentity,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  }));
+  return { success: true, records };
 });
 
 // Programmatic paste (used for automated tools like Update Docs)
@@ -19644,6 +19964,28 @@ ipcMain.handle('terminal:paste', async (event, {
       + ' tool=' + (stoppingState.toolType || 'unknown')
       + ' source=' + (source || '-'));
     return { success: false, error: 'agent_stopping' };
+  }
+  const pasteProfile = classifyTerminalPasteProfile({
+    submit,
+    liveClaude: hasLiveClaudeInTab(tabId),
+    fast,
+    verifyClaudeVisibleDraftBeforePaste,
+    awaitClaudeUserMessageAudit,
+    handoffId,
+    source,
+  });
+  if (!pasteProfile.allowed) {
+    console.warn('[terminal:paste] BLOCKED ambiguous live Claude submit tab='
+      + String(tabId).slice(-12)
+      + ' source=' + (source || '-')
+      + ' fast=' + fast
+      + ' handoff=' + (handoffId || '-'));
+    return {
+      success: false,
+      accepted: false,
+      submitted: false,
+      error: pasteProfile.error,
+    };
   }
   console.log('[terminal:paste] Pasting ' + content.length + ' chars to tab ' + tabId + ' (submit=' + submit + ', fast=' + fast + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ')');
   
@@ -20791,9 +21133,18 @@ function publicAgentInputIdentity(identity, stable) {
 
 // Shared by claude/codex grab/copy/restore input operations. All fire Ctrl+G
 // after writing a lock-file telling noted-code-grab.js which mode to run in.
-async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
-  const term = terminals.get(tabId);
+async function captureAgentInputAtWriteBoundary(
+  tabId,
+  mode,
+  agent = 'claude',
+  options = {},
+  ownedTerm = null,
+) {
+  const term = ownedTerm || terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
+  if (terminals.get(tabId) !== term) {
+    return { success: false, error: 'terminal_generation_changed' };
+  }
 
   const logPrefix = agent === 'claude'
     ? '[capture-input:' + mode + ']'
@@ -20806,12 +21157,15 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
   cliPid = processResolution.cliPid;
   lockPids = processResolution.lockPids;
 
-  const captureIdentity = captureAgentInputIdentity(tabId, term);
+  // This identity belongs to the screen proof that authorized the capture.
+  // Ctrl+G itself is an input mutation, so the identity returned to callers is
+  // captured separately after we reserve the new input revision below.
+  const draftProofCaptureIdentity = captureAgentInputIdentity(tabId, term);
   const draftProof = options?.draftProof && typeof options.draftProof === 'object'
     ? options.draftProof
     : null;
   const draftProofMatchesAtCapture = draftProof
-    ? agentDraftProofMatchesCaptureIdentity(draftProof, captureIdentity)
+    ? agentDraftProofMatchesCaptureIdentity(draftProof, draftProofCaptureIdentity)
     : null;
   if (draftProof && !draftProofMatchesAtCapture) {
     console.warn(logPrefix + ' Tab ' + tabId.slice(-12)
@@ -20858,7 +21212,7 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
       currentProof,
     );
     const exactFrameStillCurrent = draftProofMatchesAtCapture === true
-      && validateAgentInputFrameIdentity(tabId, captureIdentity);
+      && validateAgentInputFrameIdentity(tabId, draftProofCaptureIdentity);
     if (admission.recommended !== true || !exactFrameStillCurrent) {
       const blockedReason = !exactFrameStillCurrent
         ? 'claude-current-frame-changed-before-exact-capture'
@@ -20874,9 +21228,9 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
   }
   const draftProofMatchesAtWrite = draftProof
     ? draftProofMatchesAtCapture === true
-      && validateAgentInputIdentity(tabId, captureIdentity)
+      && validateAgentInputIdentity(tabId, draftProofCaptureIdentity)
       && (!isClaudeMissingPromptCapture
-        || validateAgentInputFrameIdentity(tabId, captureIdentity))
+        || validateAgentInputFrameIdentity(tabId, draftProofCaptureIdentity))
     : null;
   if (draftProof && !draftProofMatchesAtWrite) {
     console.warn(logPrefix + ' Tab ' + tabId.slice(-12)
@@ -20925,6 +21279,17 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
     return { success: false, error: 'no_' + agent + '_pid' };
   }
 
+  // Ctrl+G is a real composer mutation. Reserve its revision only after the
+  // helper contract is armed and immediately before the serialized PTY write:
+  // a capture queued behind a paste must not invalidate that paste before it
+  // submits, while a later paste must never reuse proof captured before this
+  // external-editor roundtrip.
+  const ownedInputRevision = bumpTerminalInputRevision(tabId);
+  const captureIdentity = captureAgentInputIdentity(tabId, term);
+  if (captureIdentity.inputRevision !== ownedInputRevision) {
+    return { success: false, error: 'terminal_input_ownership_changed' };
+  }
+
   // Snapshot helper-log size BEFORE sending Ctrl+G. NOTED_GRAB_DEBUG=1 is
   // always set in PTY env, so helper appends ~3-5 lines whenever it runs.
   // If after the timeout the log size is unchanged → helper did NOT start →
@@ -20965,6 +21330,7 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
       pid: cliPid,
       pids: lockPids,
       captureIdentity,
+      draftProofCaptureIdentity,
       draftProof,
       draftProofIdentityAtWrite: draftProofMatchesAtWrite,
       draftProofDiagnostic: draftProof
@@ -20976,6 +21342,25 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
   });
 }
 
+async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no_terminal' };
+  const operation = {
+    kind: 'agent-input-capture',
+    source: agent + ':' + mode + '-input',
+    tabId,
+    submitted: false,
+    identityPending: false,
+    manualInputYields: false,
+    queuedAt: Date.now(),
+  };
+  return withPtyWriteLock(
+    term,
+    () => captureAgentInputAtWriteBoundary(tabId, mode, agent, options, term),
+    operation,
+  );
+}
+
 async function captureClaudeInput(tabId, mode) {
   return captureAgentInput(tabId, mode, 'claude');
 }
@@ -20983,6 +21368,48 @@ async function captureClaudeInput(tabId, mode) {
 async function restoreAgentInput(tabId, text, agent = 'claude') {
   if (typeof text !== 'string') return { success: false, error: 'invalid_text' };
   return captureAgentInput(tabId, 'restore', agent, { text });
+}
+
+async function replaceAgentInputIfUnchanged(tabIdValue, expectedText, text, agent) {
+  const tabId = String(tabIdValue || '');
+  if (
+    !tabId
+    || (agent !== 'claude' && agent !== 'codex')
+    || typeof expectedText !== 'string'
+    || typeof text !== 'string'
+  ) {
+    return { success: false, replaced: false, error: 'invalid_arguments' };
+  }
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, replaced: false, error: 'no_terminal' };
+  const operation = {
+    kind: 'agent-input-compare-and-swap',
+    source: agent + ':replace-input-if-unchanged',
+    tabId,
+    submitted: false,
+    identityPending: false,
+    manualInputYields: false,
+    queuedAt: Date.now(),
+  };
+  return withPtyWriteLock(term, () => replaceAgentInputIfUnchangedAtBoundary({
+    expectedText,
+    replacementText: text,
+    capture: () => captureAgentInputAtWriteBoundary(
+      tabId,
+      'copy',
+      agent,
+      {},
+      term,
+    ),
+    restore: replacement => captureAgentInputAtWriteBoundary(
+      tabId,
+      'restore',
+      agent,
+      { text: replacement },
+      term,
+    ),
+    isCurrent: () => terminals.get(tabId) === term,
+  }), operation);
 }
 
 ipcMain.handle('claude:grab-input', async (event, tabId, options = {}) => (
@@ -20999,8 +21426,24 @@ ipcMain.handle('codex:copy-input', async (event, tabId, options = {}) => (
   captureAgentInput(tabId, 'copy', 'codex', options)
 ));
 ipcMain.handle('codex:restore-input', async (_event, tabId, text) => restoreAgentInput(tabId, text, 'codex'));
+ipcMain.handle('claude:replace-input-if-unchanged', async (_event, payload = {}) => (
+  replaceAgentInputIfUnchanged(
+    payload?.tabId,
+    payload?.expectedText,
+    payload?.text,
+    'claude',
+  )
+));
+ipcMain.handle('codex:replace-input-if-unchanged', async (_event, payload = {}) => (
+  replaceAgentInputIfUnchanged(
+    payload?.tabId,
+    payload?.expectedText,
+    payload?.text,
+    'codex',
+  )
+));
 
-async function inspectClaudeExactSettingInput(
+async function inspectClaudeExactSettingInputAtWriteBoundary(
   rawTabId,
   rawCommand,
   {
@@ -21009,16 +21452,23 @@ async function inspectClaudeExactSettingInput(
     generation = null,
     startupPromptLease = null,
   } = {},
+  expectedTerm,
 ) {
   const tabId = String(rawTabId || '');
   const expected = normalizeClaudeLocalCommandText(rawCommand);
   if (!tabId || !parseClaudeStartupSlashCommand(expected)) {
     return { success: false, submitted: false, error: 'invalid_arguments' };
   }
-  const expectedTerm = terminals.get(tabId);
-  if (!expectedTerm) return { success: false, submitted: false, error: 'no_terminal' };
-  const inputRevision = getTerminalInputRevision(tabId);
-  const captured = await captureClaudeInput(tabId, 'copy');
+  if (!expectedTerm || terminals.get(tabId) !== expectedTerm) {
+    return { success: false, submitted: false, error: 'no_terminal' };
+  }
+  const captured = await captureAgentInputAtWriteBoundary(
+    tabId,
+    'copy',
+    'claude',
+    {},
+    expectedTerm,
+  );
   const actual = normalizeClaudeLocalCommandText(captured?.text);
   if (captured?.success !== true) {
     return {
@@ -21038,32 +21488,10 @@ async function inspectClaudeExactSettingInput(
     };
   }
 
-  // GrabInput reaches main while the external-editor helper is still alive.
-  // Claude is synchronously waiting for that child process, so an Enter written
-  // in the same tick can land before the composer has been restored and be
-  // discarded during the return-to-TUI transition. Run 2 reproduced exactly
-  // that: the safe retry wrote one Enter, but the exact command was still in
-  // the composer 6.5s later.
-  //
-  // Subscribe only after GrabInput was received. PTY onData does not replay old
-  // chunks, therefore the next synchronized-frame marker proves Claude has
-  // returned from the editor and rendered the restored composer. If that proof
-  // never arrives, fail closed as unresolved rather than guessing that Enter
-  // is safe/effective.
-  const editorReturn = await waitForNextPtySynchronizedFrame(expectedTerm, {
-    timeoutMs: 1500,
-  });
-  console.log('[ClaudeSettingRetry] tab=' + tabId.slice(-12)
-    + ' editor-return ready=' + (editorReturn?.ready === true)
-    + ' reason=' + (editorReturn?.reason || '-')
-    + ' elapsedMs=' + (editorReturn?.elapsedMs ?? '-'));
-  if (editorReturn?.ready !== true) {
-    return {
-      success: false,
-      submitted: false,
-      error: 'external_editor_return_unconfirmed',
-    };
-  }
+  // The internal capture resolves only after Claude has returned from the
+  // external editor and rendered the next complete frame. Its post-Ctrl+G
+  // revision is therefore the boundary this transaction owns.
+  const inputRevision = Number(captured.inputRevision);
   if (
     terminals.get(tabId) !== expectedTerm
     || getTerminalInputRevision(tabId) !== inputRevision
@@ -21115,6 +21543,31 @@ async function inspectClaudeExactSettingInput(
   };
 }
 
+async function inspectClaudeExactSettingInput(rawTabId, rawCommand, options = {}) {
+  const tabId = String(rawTabId || '');
+  const expectedTerm = terminals.get(tabId);
+  if (!expectedTerm) return { success: false, submitted: false, error: 'no_terminal' };
+  const operation = {
+    kind: 'claude-exact-setting-input',
+    source: String(options?.source || 'exact-setting-input'),
+    tabId,
+    submitted: false,
+    identityPending: false,
+    manualInputYields: false,
+    queuedAt: Date.now(),
+  };
+  return withPtyWriteLock(
+    expectedTerm,
+    () => inspectClaudeExactSettingInputAtWriteBoundary(
+      rawTabId,
+      rawCommand,
+      options,
+      expectedTerm,
+    ),
+    operation,
+  );
+}
+
 ipcMain.handle('claude:retry-exact-setting-input', async (_event, payload = {}) => {
   return inspectClaudeExactSettingInput(payload?.tabId, payload?.command, {
     submit: true,
@@ -21122,16 +21575,22 @@ ipcMain.handle('claude:retry-exact-setting-input', async (_event, payload = {}) 
   });
 });
 
-ipcMain.handle('claude:clear-exact-setting-input', async (_event, payload = {}) => {
+async function clearClaudeExactSettingInputAtWriteBoundary(payload, expectedTerm) {
   const tabId = String(payload?.tabId || '');
   const expected = normalizeClaudeLocalCommandText(payload?.command);
   if (!tabId || !parseClaudeStartupSlashCommand(expected)) {
     return { success: false, cleared: false, error: 'invalid_arguments' };
   }
-  const expectedTerm = terminals.get(tabId);
-  if (!expectedTerm) return { success: false, cleared: false, error: 'no_terminal' };
-  const inputRevision = getTerminalInputRevision(tabId);
-  const captured = await captureClaudeInput(tabId, 'copy');
+  if (!expectedTerm || terminals.get(tabId) !== expectedTerm) {
+    return { success: false, cleared: false, error: 'no_terminal' };
+  }
+  const captured = await captureAgentInputAtWriteBoundary(
+    tabId,
+    'copy',
+    'claude',
+    {},
+    expectedTerm,
+  );
   const actual = normalizeClaudeLocalCommandText(captured?.text);
   if (captured?.success !== true) {
     return {
@@ -21148,6 +21607,7 @@ ipcMain.handle('claude:clear-exact-setting-input', async (_event, payload = {}) 
       actualPreview: actual.slice(0, 80),
     };
   }
+  const inputRevision = Number(captured.inputRevision);
   if (
     terminals.get(tabId) !== expectedTerm
     || getTerminalInputRevision(tabId) !== inputRevision
@@ -21159,75 +21619,51 @@ ipcMain.handle('claude:clear-exact-setting-input', async (_event, payload = {}) 
     };
   }
 
-  const processResolution = await resolveAgentInputProcess(
-    tabId,
-    'claude',
-    '[clear-exact-setting-input]',
-  );
-  if (!processResolution.success) {
-    return { ...processResolution, cleared: false };
-  }
-  if (
-    terminals.get(tabId) !== expectedTerm
-    || getTerminalInputRevision(tabId) !== inputRevision
-  ) {
-    return {
-      success: false,
-      cleared: false,
-      error: 'terminal_generation_changed',
-    };
-  }
-
-  try {
-    const lockPayload = JSON.stringify({
-      mode: 'clear',
-      agent: 'claude',
-      tabId,
-      ts: Date.now(),
-      sock: CLAUDE_HOOK_SOCK,
-    });
-    for (const pid of processResolution.lockPids) {
-      fs.writeFileSync('/tmp/noted-grab-' + pid + '.json', lockPayload);
-    }
-  } catch {
-    return { success: false, cleared: false, error: 'lock_write_failed' };
-  }
-  bumpTerminalInputRevision(tabId);
   console.warn('[ClaudeSettingClear] tab=' + tabId.slice(-12)
     + ' exact failed command still present; clearing command='
     + JSON.stringify(expected));
-  expectedTerm.write('\x07');
+  const restored = await captureAgentInputAtWriteBoundary(
+    tabId,
+    'restore',
+    'claude',
+    { text: '' },
+    expectedTerm,
+  );
+  if (restored?.success !== true) {
+    return {
+      success: false,
+      cleared: false,
+      error: restored?.error || 'clear_input_failed',
+    };
+  }
   return { success: true, cleared: true };
+}
+
+ipcMain.handle('claude:clear-exact-setting-input', async (_event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  const expectedTerm = terminals.get(tabId);
+  if (!expectedTerm) return { success: false, cleared: false, error: 'no_terminal' };
+  return withPtyWriteLock(
+    expectedTerm,
+    () => clearClaudeExactSettingInputAtWriteBoundary(payload, expectedTerm),
+    {
+      kind: 'claude-clear-exact-setting-input',
+      source: 'claude-clear-exact-setting-input',
+      tabId,
+      submitted: false,
+      identityPending: false,
+      manualInputYields: false,
+      queuedAt: Date.now(),
+    },
+  );
 });
 
-// Clear current Claude input WITHOUT going through the queue. Same external-editor
-// hijack, but helper truncates the tempfile and exits — no socket callback.
-// Fire-and-forget: we return immediately after sending Ctrl+G; the input clears ~50ms later
-// as Claude re-reads the empty tempfile.
-ipcMain.handle('claude:clear-input', async (event, tabId) => {
-  const term = terminals.get(tabId);
-  if (!term) return { success: false, error: 'no_terminal' };
-  // Same policy as captureClaudeInput: only block on hook-confirmed turn busy.
-  // Spinner-busy mid-stream still accepts Ctrl+G — see fix-claude-hook-silent-dropouts.md
-  if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
-  const processResolution = await resolveAgentInputProcess(tabId, 'claude', '[clear-input]');
-  if (!processResolution.success) return processResolution;
-  const claudePid = processResolution.cliPid;
-  try {
-    fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({
-      mode: 'clear',
-      agent: 'claude',
-      tabId,
-      ts: Date.now(),
-      sock: CLAUDE_HOOK_SOCK,
-    }));
-  } catch (e) {
-    return { success: false, error: 'lock_write_failed' };
-  }
-  console.log('[clear-input] Tab ' + tabId.slice(-12) + ': sending Ctrl+G (mode=clear)');
-  term.write('\x07');
-  return { success: true };
-});
+// Legacy clear now uses the same serialized, acknowledged external-editor
+// roundtrip as every other input mutation. It no longer reports success while
+// Claude may still be inside the helper process.
+ipcMain.handle('claude:clear-input', async (_event, tabId) => (
+  restoreAgentInput(tabId, '', 'claude')
+));
 
 async function sendClaudeCommandInternal(tabId, command, rawOptions = {}) {
   const sendOptions = rawOptions && typeof rawOptions === 'object' ? rawOptions : {};
@@ -21616,7 +22052,6 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId, desiredThinking = 
   term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
 
-  const stripped = require('node:util').stripVTControlCharacters;
   const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   const expectedLifecycleGeneration = getTerminalLifecycleGeneration(tabId);
   const requestedInputRevision = getTerminalInputRevision(tabId);
@@ -21649,100 +22084,185 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId, desiredThinking = 
       && getTerminalLifecycleGeneration(tabId) === expectedLifecycleGeneration
       && getTerminalInputRevision(tabId) === ownedInputRevision
     );
-    const captureFrameAfterWrite = (data, phase, timeoutMs) => new Promise((resolve) => {
-      let buffer = '';
-      let finished = false;
-      const finish = (result) => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        sub.dispose();
-        resolve(result);
-      };
-      const sub = term.onData((chunk) => {
-        buffer += chunk;
-        if (!buffer.includes('\x1b[?2026l')) return;
-        finish({ success: true, buffer });
-      });
-      const timer = setTimeout(() => {
-        finish({ success: false, error: phase + '_timeout', buffer });
-      }, timeoutMs);
-      if (!stillOwnsPicker()) {
-        finish({ success: false, error: 'think_input_ownership_changed', buffer });
-        return;
+    const fail = (error, detail = {}) => ({
+      success: false,
+      submitted: false,
+      error,
+      ...detail,
+    });
+    const readCurrentFrame = async (phase, timeoutMs = 1200) => {
+      const mirrorState = getHeadlessTerminalMirror(tabId);
+      if (!mirrorState) return fail('think_headless_snapshot_unavailable', { phase });
+      const closed = await waitForHeadlessSynchronizedOutputClose(
+        tabId,
+        mirrorState,
+        timeoutMs,
+      );
+      if (!closed.ready) {
+        return fail('think_' + phase + '_' + closed.reason, { phase });
       }
+      if (!stillOwnsPicker()) return fail('think_input_ownership_changed', { phase });
+      const snapshot = getHeadlessVisibleBufferSnapshot(
+        tabId,
+        'claude-thinking-picker:' + phase,
+        { preferCommitted: false },
+      );
+      if (!snapshot?.success || snapshot.authoritativeFrameCommitted !== true) {
+        return fail(snapshot?.error || 'think_frame_not_committed', { phase });
+      }
+      return { success: true, phase, snapshot, writeSeq: snapshot.writeSeq };
+    };
+    const captureFrameAfterWrite = async (data, phase, timeoutMs) => {
+      if (!stillOwnsPicker()) return fail('think_input_ownership_changed', { phase });
+      const mirrorState = getHeadlessTerminalMirror(tabId);
+      if (!mirrorState) return fail('think_headless_snapshot_unavailable', { phase });
+      const beforeWriteSeq = Number(mirrorState.writeSeq || 0);
+      const nextFrame = waitForNextPtySynchronizedFrame(term, { timeoutMs });
       pickerOperation.phase = phase;
       pickerOperation.manualEnterSubmitsPrompt = false;
       term.write(data);
-    });
-
-    const pickerFrame = await captureFrameAfterWrite('\x1bt', 'think_picker_open', 5000);
-    if (!pickerFrame.success || !stillOwnsPicker()) {
+      const edge = await nextFrame;
+      if (!edge.ready) return fail('think_' + phase + '_' + edge.reason, { phase });
+      const current = await readCurrentFrame(phase, timeoutMs);
+      if (!current.success) return current;
+      if (Number(current.writeSeq || 0) <= beforeWriteSeq) {
+        return fail('think_' + phase + '_frame_not_advanced', { phase });
+      }
+      return current;
+    };
+    const provePickerClosed = (frame) => {
+      if (!frame?.success) return false;
+      return inspectClaudeThinkingPickerSnapshot(frame.snapshot).visible !== true
+        && inspectClaudeThinkingProceedSnapshot(frame.snapshot).visible !== true;
+    };
+    const closePicker = async (phase) => {
+      const closed = await captureFrameAfterWrite('\x1b', phase, 2500);
       return {
-        success: false,
-        error: pickerFrame.error || 'think_input_ownership_changed',
+        frame: closed,
+        closed: provePickerClosed(closed),
       };
+    };
+
+    let pickerFrame = await readCurrentFrame('think_picker_preflight');
+    if (!pickerFrame.success) return pickerFrame;
+    let picker = inspectClaudeThinkingPickerSnapshot(pickerFrame.snapshot);
+    if (picker.visible !== true) {
+      const pendingProceed = inspectClaudeThinkingProceedSnapshot(pickerFrame.snapshot);
+      if (pendingProceed.visible === true) {
+        console.warn('[ThinkPickerProof] tab=' + String(tabId).slice(-12)
+          + ' outcome=failed reason=preexisting-proceed-dialog');
+        return fail('think_confirmation_state_unknown', {
+          modalVisible: true,
+          modalKind: 'thinking-proceed',
+        });
+      }
+      pickerFrame = await captureFrameAfterWrite('\x1bt', 'think_picker_open', 5000);
+      if (!pickerFrame.success || !stillOwnsPicker()) {
+        return fail(pickerFrame.error || 'think_input_ownership_changed');
+      }
+      picker = inspectClaudeThinkingPickerSnapshot(pickerFrame.snapshot);
     }
 
-    const clean = stripped(pickerFrame.buffer);
-    const enabledIdx = clean.indexOf('Enabled');
-    const disabledIdx = clean.indexOf('Disabled');
-    const checkIdx = clean.indexOf('\u2714'); // ✓
-    if (checkIdx < 0 || enabledIdx < 0 || disabledIdx < 0) {
-      console.warn('[Think] Picker state is incomplete; refusing to guess');
-      return { success: false, error: 'think_picker_state_unknown' };
+    if (picker.visible !== true || picker.stateKnown !== true) {
+      let cleanup = { closed: false };
+      if (picker.visible === true) cleanup = await closePicker('think_picker_unknown_close');
+      console.warn('[ThinkPickerProof] tab=' + String(tabId).slice(-12)
+        + ' outcome=failed reason=' + picker.reason
+        + ' modalClosed=' + cleanup.closed);
+      return fail('think_picker_state_unknown', {
+        modalVisible: picker.visible === true && cleanup.closed !== true,
+        modalKind: picker.visible === true ? 'thinking-picker' : null,
+        modalClosed: cleanup.closed === true,
+        proofReason: picker.reason,
+      });
     }
 
-    const wasEnabled = Math.abs(checkIdx - enabledIdx) < Math.abs(checkIdx - disabledIdx);
+    const wasEnabled = picker.thinking;
     const hasDesiredState = typeof desiredThinking === 'boolean';
     const newState = hasDesiredState ? desiredThinking : !wasEnabled;
-    console.log('[Think] clean text:', JSON.stringify(clean).substring(0, 400));
-    console.log('[Think] enabledIdx:', enabledIdx, 'disabledIdx:', disabledIdx, 'checkIdx:', checkIdx);
-    console.log('[Think] Was:', wasEnabled ? 'Enabled' : 'Disabled', '-> Requested:', newState ? 'Enabled' : 'Disabled');
+    console.log('[ThinkPickerProof] tab=' + String(tabId).slice(-12)
+      + ' current=' + (wasEnabled ? 'enabled' : 'disabled')
+      + ' requested=' + (newState ? 'enabled' : 'disabled')
+      + ' source=' + (pickerFrame.phase === 'think_picker_preflight' ? 'existing-picker' : 'opened-picker'));
 
     if (newState === wasEnabled) {
-      // The picker itself is the authoritative read. A synchronized frame
-      // after Escape proves that this exact operation returned control to the
-      // composer; the following send will still take a fresh draft proof.
-      const closed = await captureFrameAfterWrite('\x1b', 'think_picker_close', 2500);
-      if (!closed.success || !stillOwnsPicker()) {
-        return {
-          success: false,
-          error: closed.error || 'think_input_ownership_changed',
-        };
+      const cleanup = await closePicker('think_picker_close');
+      if (!cleanup.closed || !stillOwnsPicker()) {
+        return fail(cleanup.frame?.error || 'think_picker_close_unproven', {
+          modalVisible: cleanup.closed !== true,
+          modalKind: 'thinking-picker',
+        });
       }
       return { success: true, thinking: wasEnabled, changed: false };
     }
 
     const arrow = wasEnabled ? '\x1b[B' : '\x1b[A';
-    console.log('[Think] Sending arrow:', wasEnabled ? 'DOWN' : 'UP');
     const arrowFrame = await captureFrameAfterWrite(arrow, 'think_arrow', 2500);
     if (!arrowFrame.success || !stillOwnsPicker()) {
-      return {
-        success: false,
-        error: arrowFrame.error || 'think_input_ownership_changed',
-      };
+      return fail(arrowFrame.error || 'think_input_ownership_changed');
+    }
+    const arrowPicker = inspectClaudeThinkingPickerSnapshot(arrowFrame.snapshot);
+    if (arrowPicker.visible !== true || arrowPicker.selectedThinking !== newState) {
+      const cleanup = arrowPicker.visible === true
+        ? await closePicker('think_arrow_mismatch_close')
+        : { closed: false };
+      return fail('think_picker_selection_unknown', {
+        modalVisible: arrowPicker.visible === true && cleanup.closed !== true,
+        modalKind: arrowPicker.visible === true ? 'thinking-picker' : null,
+        modalClosed: cleanup.closed === true,
+        proofReason: arrowPicker.reason,
+      });
     }
 
-    console.log('[Think] Sending Enter to confirm selection');
     let finalFrame = await captureFrameAfterWrite('\r', 'think_confirm', 2500);
     if (!finalFrame.success || !stillOwnsPicker()) {
-      return {
-        success: false,
-        error: finalFrame.error || 'think_input_ownership_changed',
-      };
+      return fail(finalFrame.error || 'think_input_ownership_changed');
     }
 
-    const confirmationText = stripped(finalFrame.buffer);
-    if (/\bproceed\b/i.test(confirmationText)) {
-      console.log('[Think] Detected "proceed" confirmation, sending Enter');
+    if (inspectClaudeThinkingProceedSnapshot(finalFrame.snapshot).visible === true) {
       finalFrame = await captureFrameAfterWrite('\r', 'think_proceed', 2500);
       if (!finalFrame.success || !stillOwnsPicker()) {
-        return {
-          success: false,
-          error: finalFrame.error || 'think_input_ownership_changed',
-        };
+        return fail(finalFrame.error || 'think_input_ownership_changed');
       }
+    }
+    if (!provePickerClosed(finalFrame)) {
+      const cleanup = inspectClaudeThinkingPickerSnapshot(finalFrame.snapshot).visible === true
+        ? await closePicker('think_confirm_incomplete_close')
+        : { closed: false };
+      return fail('think_confirmation_incomplete', {
+        modalVisible: cleanup.closed !== true,
+        modalKind: 'thinking-confirmation',
+        modalClosed: cleanup.closed === true,
+      });
+    }
+
+    // Re-open the picker once to prove the setting that Claude actually
+    // committed. Action ordering alone is not enough: a dropped Arrow or Enter
+    // must not authorize the following user prompt.
+    const verifyFrame = await captureFrameAfterWrite('\x1bt', 'think_verify_open', 3500);
+    const verified = verifyFrame.success
+      ? inspectClaudeThinkingPickerSnapshot(verifyFrame.snapshot)
+      : null;
+    if (!verifyFrame.success
+      || verified?.visible !== true
+      || verified.stateKnown !== true
+      || verified.thinking !== newState) {
+      const cleanup = verified?.visible === true
+        ? await closePicker('think_verify_failed_close')
+        : { closed: false };
+      return fail(verifyFrame.error || 'think_final_state_mismatch', {
+        modalVisible: verified?.visible === true && cleanup.closed !== true,
+        modalKind: verified?.visible === true ? 'thinking-picker' : null,
+        modalClosed: cleanup.closed === true,
+        proofReason: verified?.reason || null,
+      });
+    }
+    const verificationClose = await closePicker('think_verify_close');
+    if (!verificationClose.closed || !stillOwnsPicker()) {
+      return fail(verificationClose.frame?.error || 'think_verify_close_unproven', {
+        modalVisible: verificationClose.closed !== true,
+        modalKind: 'thinking-picker',
+      });
     }
 
     return { success: true, thinking: newState, changed: true };
@@ -23558,7 +24078,15 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     let lastResult = null;
     for (let attempt = 0; attempt < delays.length; attempt++) {
       if (delays[attempt] > 0) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
-      const result = await captureAgentInput(tabId, 'grab', 'codex');
+      // Native Rewind already owns the shared PTY write boundary. Calling the
+      // public wrapper here would enqueue behind ourselves and deadlock.
+      const result = await captureAgentInputAtWriteBoundary(
+        tabId,
+        'grab',
+        'codex',
+        {},
+        term,
+      );
       lastResult = result;
       const text = typeof result?.text === 'string' ? result.text : '';
       const normalized = normalizeCandidate(text);

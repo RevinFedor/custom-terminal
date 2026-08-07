@@ -307,6 +307,182 @@ function reserveClaudeExactEmptyEvidence({
   };
 }
 
+function isPresentIdentity(value) {
+  return value !== null && value !== undefined && value !== '';
+}
+
+function sameFiniteNumber(left, right) {
+  if (!isPresentIdentity(left) || !isPresentIdentity(right)) return false;
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  return Number.isFinite(leftNumber)
+    && Number.isFinite(rightNumber)
+    && leftNumber === rightNumber;
+}
+
+/**
+ * Resolve a fresh screen ambiguity with the exact empty result already owned
+ * by the queue-head paste operation.
+ *
+ * This is deliberately a different capability from
+ * classifyClaudeMissingPromptExactCaptureAdmission(): an active PTY writer
+ * must prevent a new Ctrl+G capture, but the writer must not veto the exact
+ * evidence which it reserved before entering its final write boundary.
+ *
+ * The caller proves ownership by comparing the evidence object with the one
+ * attached to the active write operation. This helper then rechecks every
+ * physical identity coordinate and the fresh closed headless frame. It never
+ * authorizes a capture and it never applies to Codex.
+ */
+function resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence({
+  proof,
+  evidence,
+  reservedEvidenceOwnedByCurrentOperation = false,
+  terminalMatches = false,
+  currentInputRevision,
+  currentRunSeq,
+  currentLifecycleGeneration,
+  currentMirrorGeneration,
+  currentMirrorWriteSeq,
+  currentMirrorFlushedSeq,
+  currentMirrorSynchronizedOutputOpen,
+  currentSynchronizedOutputGeneration,
+  turnBusy = false,
+  localCommandActive = false,
+  compactActive = false,
+  awaitingInput = false,
+  stopping = false,
+  rewindActive = false,
+  startupGateReady = false,
+  pickerActive = false,
+  controlSurfaceActive = false,
+  replacementActive = false,
+} = {}) {
+  if (
+    !evidence
+    || evidence.success !== true
+    || evidence.proofOutcome !== 'absent'
+    || evidence.terminalIdentityStable !== true
+    || evidence.editorReturnReady !== true
+    || String(evidence.text || '').trim()
+    || Number(evidence.images || 0) > 0
+  ) {
+    return { valid: false, reason: 'claude_reserved_exact_empty_evidence_required' };
+  }
+  if (reservedEvidenceOwnedByCurrentOperation !== true) {
+    return { valid: false, reason: 'claude_reserved_exact_empty_evidence_not_owned' };
+  }
+  if (replacementActive || terminalMatches !== true) {
+    return { valid: false, reason: 'claude_terminal_replacement_active' };
+  }
+  if (turnBusy) return { valid: false, reason: 'claude-turn-busy' };
+  if (localCommandActive) return { valid: false, reason: 'claude-local-command-active' };
+  if (compactActive) return { valid: false, reason: 'claude-compact-active' };
+  if (awaitingInput) return { valid: false, reason: 'claude-question-active' };
+  if (stopping) return { valid: false, reason: 'claude-stopping' };
+  if (rewindActive) return { valid: false, reason: 'claude-rewind-active' };
+  if (!startupGateReady) return { valid: false, reason: 'claude-startup-gate-not-ready' };
+  if (pickerActive) return { valid: false, reason: 'claude-picker-active' };
+  if (controlSurfaceActive) return { valid: false, reason: 'claude-control-surface-active' };
+
+  if (!proof || !['found', 'unknown'].includes(proof.proofOutcome)) {
+    return { valid: false, reason: 'claude_screen_ambiguity_required' };
+  }
+  if (!String(proof.source || '').startsWith('headless-main:')) {
+    return { valid: false, reason: 'claude_headless_draft_proof_required' };
+  }
+
+  const inputIdentityMatches = sameFiniteNumber(evidence.inputRevision, currentInputRevision)
+    && sameFiniteNumber(proof.inputRevision, currentInputRevision);
+  if (!inputIdentityMatches) {
+    return { valid: false, reason: 'claude_input_ownership_changed' };
+  }
+  const runIdentityMatches = sameFiniteNumber(evidence.terminalRunSeq, currentRunSeq)
+    && sameFiniteNumber(proof.terminalRunSeq, currentRunSeq);
+  if (!runIdentityMatches) {
+    return { valid: false, reason: 'claude_terminal_run_changed' };
+  }
+  if (
+    !isPresentIdentity(currentLifecycleGeneration)
+    || evidence.terminalLifecycleGeneration !== currentLifecycleGeneration
+    || proof.terminalLifecycleGeneration !== currentLifecycleGeneration
+  ) {
+    return { valid: false, reason: 'claude_terminal_lifecycle_changed' };
+  }
+  if (
+    !isPresentIdentity(currentMirrorGeneration)
+    || evidence.mirrorGeneration !== currentMirrorGeneration
+    || proof.mirrorGeneration !== currentMirrorGeneration
+  ) {
+    return { valid: false, reason: 'claude_headless_generation_changed' };
+  }
+
+  // The capture frame predates Ctrl+G's editor-return redraw, so its sequence
+  // need not equal the fresh frame. It must still be a real, closed, flushed
+  // frame; terminal/input/mirror generations above carry its exact ownership
+  // across that expected redraw.
+  if (evidence.mirrorSynchronizedOutputOpen === true) {
+    return { valid: false, reason: 'claude_exact_empty_capture_frame_open' };
+  }
+  if (
+    !sameFiniteNumber(evidence.mirrorWriteSeq, evidence.mirrorFlushedSeq)
+    || !isPresentIdentity(evidence.synchronizedOutputGeneration)
+    || !Number.isFinite(Number(evidence.synchronizedOutputGeneration))
+  ) {
+    return { valid: false, reason: 'claude_exact_empty_capture_frame_unflushed' };
+  }
+
+  if (
+    proof.mirrorSynchronizedOutputOpen === true
+    || currentMirrorSynchronizedOutputOpen === true
+  ) {
+    return { valid: false, reason: 'claude_headless_frame_open' };
+  }
+  if (
+    !sameFiniteNumber(currentMirrorWriteSeq, currentMirrorFlushedSeq)
+    || !sameFiniteNumber(proof.mirrorWriteSeq, proof.mirrorFlushedSeq)
+  ) {
+    return { valid: false, reason: 'claude_headless_frame_not_flushed' };
+  }
+  if (
+    !sameFiniteNumber(proof.mirrorWriteSeq, currentMirrorWriteSeq)
+    || !sameFiniteNumber(proof.mirrorFlushedSeq, currentMirrorFlushedSeq)
+    || !sameFiniteNumber(
+      proof.synchronizedOutputGeneration,
+      currentSynchronizedOutputGeneration,
+    )
+  ) {
+    return { valid: false, reason: 'claude_headless_frame_changed' };
+  }
+
+  const resolvedProof = {
+    ...proof,
+    proofOutcome: 'absent',
+    hasDraft: false,
+    text: '',
+    preview: '',
+    source: 'headless-main:claude-composer:empty-exact-editor',
+    proofReason: 'external-editor-empty-current-operation',
+  };
+  const decision = validateClaudeComposerWriteBoundary({
+    proof: resolvedProof,
+    terminalMatches,
+    currentInputRevision,
+    currentRunSeq,
+    currentLifecycleGeneration,
+    currentMirrorGeneration,
+    currentMirrorWriteSeq,
+    currentMirrorFlushedSeq,
+    currentMirrorSynchronizedOutputOpen,
+  });
+  if (!decision.valid) return decision;
+  return {
+    valid: true,
+    reason: 'claude_current_composer_empty_from_reserved_exact_evidence',
+    proof: resolvedProof,
+  };
+}
+
 /**
  * After our own bracketed paste the mirror write sequence is expected to move,
  * but the physical PTY/input/lifecycle generation must still be the one which
@@ -352,6 +528,7 @@ module.exports = {
   isClaudeComposerStopLine,
   parseClaudeComposerCurrentFrame,
   reserveClaudeExactEmptyEvidence,
+  resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence,
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 };

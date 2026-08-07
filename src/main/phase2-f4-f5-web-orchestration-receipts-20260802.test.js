@@ -41,10 +41,15 @@ test('F4 real Codex runtime preserves its softened post-Enter state as audit-pen
     'the renderer may soften the History error, but it must keep the pending receipt for Project API, MCP, and Inbox',
   );
   const pendingStart = historyPanelSource.indexOf(
-    'const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(result)',
+    'const unconfirmedStatus = sendIdentityFailure',
   );
   assert.ok(pendingStart >= 0);
   const pendingSendBoundary = historyPanelSource.slice(pendingStart, pendingStart + 3_500);
+  assert.match(
+    pendingSendBoundary,
+    /historyPromptHandoffUnconfirmedStatusFromSendResult\(result\)/,
+    'an exact bound send keeps using the shared unresolved-receipt classifier',
+  );
   assert.match(
     pendingSendBoundary,
     /sendDeliveryUnconfirmed = unconfirmedStatus !== null/,
@@ -379,6 +384,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
   const startOptions = {
     sdkSessions: new Map(),
     agentSendReceiptStore: receiptStore,
+    computeActiveLoaders: () => ({ idle: true, count: 0, loaders: [], ts: Date.now() }),
     readAgentStartReadiness: async (tabId) => readyStatus(tabId),
     getAgentTurnResult: async () => controller.turnResult,
     getAgentExecutionContext: () => ({
@@ -1417,6 +1423,73 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     const current = await api('/api/orchestrations/' + runId);
     assert.equal(created.status, 409);
     assert.equal(current.body.run?.status, 'failed');
+  });
+
+  await t.test('preflight no-Enter proof releases the target lane for an explicit retry', async () => {
+    const refusedRunId = 'phase2-terminal-draft-unknown-refusal';
+    const retryRunId = 'phase2-terminal-draft-unknown-retry';
+    let attempt = 0;
+    controller.sendResponder = async (payload) => {
+      attempt += 1;
+      if (attempt === 1) {
+        return {
+          success: false,
+          ok: false,
+          submitted: false,
+          accepted: false,
+          code: 'terminal_draft_state_unknown',
+          error: 'Terminal draft state is unknown; send stopped before touching input',
+        };
+      }
+      return {
+        success: true,
+        submitted: true,
+        accepted: true,
+        handoffId: payload.handoffId,
+      };
+    };
+
+    const refused = await api('/api/orchestrations', {
+      runId: refusedRunId,
+      sourceTabId: 'phase2-source-tab',
+      targetTabId: 'phase2-target-refusal-tab',
+      prompt: 'first prompt refused before input',
+      queue: false,
+      notifySource: false,
+    });
+    const refusedState = await api('/api/orchestrations/' + refusedRunId);
+    const loadersAfterRefusal = await api('/api/active-loaders');
+    const retried = await api('/api/orchestrations', {
+      runId: retryRunId,
+      sourceTabId: 'phase2-source-tab',
+      targetTabId: 'phase2-target-refusal-tab',
+      prompt: 'explicitly authorized retry',
+      queue: false,
+      notifySource: false,
+    });
+    const retryState = await api('/api/orchestrations/' + retryRunId);
+
+    assert.deepEqual({
+      refusedHttp: refused.status,
+      refusedStatus: refusedState.body.run?.status,
+      refusedAccepted: Boolean(refusedState.body.run?.deliveryAcceptedAt),
+      refusalLoaderPresent: loadersAfterRefusal.body.loaders?.some((loader) => (
+        loader.runId === refusedRunId
+      )) === true,
+      retryHttp: retried.status,
+      retryStatus: retryState.body.run?.status,
+      retryDeferredReason: retryState.body.run?.deliveryDeferredReason || null,
+      retrySends: scenarioSendCount('orchestration:' + retryRunId),
+    }, {
+      refusedHttp: 409,
+      refusedStatus: 'failed',
+      refusedAccepted: false,
+      refusalLoaderPresent: false,
+      retryHttp: 202,
+      retryStatus: 'sent',
+      retryDeferredReason: null,
+      retrySends: 1,
+    });
   });
 
   await t.test('F5 completion handoff remains reconcilable after post-Enter timeout', async () => {

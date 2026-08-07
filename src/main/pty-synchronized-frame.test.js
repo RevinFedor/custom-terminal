@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   SYNCHRONIZED_OUTPUT_END,
+  waitForNextPtyOutput,
   waitForNextPtySynchronizedFrame,
 } = require('./pty-synchronized-frame');
 
@@ -86,4 +87,36 @@ test('missing PTY subscription fails without pretending readiness', async () => 
   const result = await waitForNextPtySynchronizedFrame(null);
   assert.equal(result.ready, false);
   assert.equal(result.reason, 'pty_subscription_unavailable');
+});
+
+test('generic PTY output edge proves a non-synchronized TUI resumed after subscription', async () => {
+  const pty = fakeTerm();
+  const pending = waitForNextPtyOutput(pty.term, { timeoutMs: 1000 });
+
+  pty.emit('');
+  assert.equal(pty.listenerCount(), 1);
+  pty.emit('\x1b[2J');
+
+  const result = await pending;
+  assert.equal(result.ready, true);
+  assert.equal(result.reason, 'pty-output');
+  assert.equal(pty.listenerCount(), 0);
+});
+
+test('generic PTY output timeout remains unknown', async () => {
+  const pty = fakeTerm();
+  let timeoutCallback = null;
+  const pending = waitForNextPtyOutput(pty.term, {
+    setTimer(callback) {
+      timeoutCallback = callback;
+      return 1;
+    },
+    clearTimer() {},
+  });
+
+  timeoutCallback();
+  const result = await pending;
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, 'pty-output-timeout');
+  assert.equal(pty.listenerCount(), 0);
 });

@@ -24,6 +24,10 @@ import {
   retractHistoryPromptHandoff,
   settleHistoryPromptHandoff,
 } from '../utils/historyPromptHandoffs';
+import {
+  buildPromptQueueReceiptHandoffId,
+  promptQueueReceiptReplayNeedsNoBusyStart,
+} from '../utils/promptQueueReceiptIdentity.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -344,6 +348,7 @@ type DeferredOwnerSend = {
   label: 'turn-end' | 'cold-start';
   workflowArmedAt: number | null;
   attemptId: number;
+  causeKey: string | null;
 };
 // A trigger can be fully satisfied while the queue owner is stopped. Keep that
 // result separate from `queueAwaitingBusyStart` (which means Enter was already
@@ -488,7 +493,14 @@ function retryDeferredOwnerSend(ownerTabId: string, source: string): boolean {
     || isTabWorkflowBlocked(deferred.triggerTabId)) return false;
   console.log('[PromptQueueRunner] retry deferred owner=' + ownerTabId.slice(-8)
     + ' trigger=' + deferred.triggerTabId.slice(-8) + ' source=' + source);
-  return beginValidatedQueueSend(ownerTabId, deferred.triggerTabId, prompt, deferred.label, deferred.kind);
+  return beginValidatedQueueSend(
+    ownerTabId,
+    deferred.triggerTabId,
+    prompt,
+    deferred.label,
+    deferred.kind,
+    deferred.causeKey,
+  );
 }
 
 function pruneDeferredOwnerSends(): void {
@@ -528,6 +540,7 @@ function beginValidatedQueueSend(
   head: QueuedPrompt,
   label: 'turn-end' | 'cold-start',
   kind: ContinuationKind = 'queue',
+  causeKey: string | null = null,
 ): boolean {
   if (queueSendInflight.has(ownerTabId)) return false;
   if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) return false;
@@ -553,6 +566,11 @@ function beginValidatedQueueSend(
       + ' has no completed workflow after arm → wait');
     return false;
   }
+  if (kind === 'loop' && !causeKey) {
+    console.warn('[PromptQueueRunner] Loop send refused without exact causal outcome owner='
+      + ownerTabId.slice(-8));
+    return false;
+  }
   queueSendInflight.add(ownerTabId);
   const attempt: DeferredOwnerSend = {
     kind,
@@ -561,8 +579,10 @@ function beginValidatedQueueSend(
     label,
     workflowArmedAt: continuationArmTimestamp(queueAtStart, kind),
     attemptId: ++queueSendAttemptSequence,
+    causeKey,
   };
   deferredOwnerSends.set(ownerTabId, attempt);
+  let attemptedHandoffId: string | null = null;
   const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
   console.log('[PromptQueueRunner] ' + label + ' validate owner=' + ownerTabId.slice(-8)
     + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8)
@@ -730,7 +750,13 @@ function beginValidatedQueueSend(
         ...(chip.sourceKey ? { sourceKey: chip.sourceKey } : {}),
       }));
     const agent = getPromptQueueAgent(ownerTabId);
-    const handoffId = (kind === 'loop' ? 'prompt-loop-' : 'run-after-') + head.id + '-' + attempt.attemptId;
+    const handoffId = buildPromptQueueReceiptHandoffId({
+      kind,
+      itemId: head.id,
+      payload,
+      causeKey: attempt.causeKey,
+    });
+    attemptedHandoffId = handoffId;
     const sessionIdHint = getPromptQueueSessionId(ownerTabId, agent);
     const beforeCount = countEnabledQueuedPrompts(latestQueue.items);
     if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
@@ -772,6 +798,12 @@ function beginValidatedQueueSend(
           : {}),
       },
     }, kind === 'loop' ? 'prompt-loop' : 'prompt-queue');
+    if (promptQueueReceiptReplayNeedsNoBusyStart(res)) {
+      queueAwaitingBusyStart.delete(ownerTabId);
+      console.log('[PromptQueueRunner] ' + label + ' durable replay owner='
+        + ownerTabId.slice(-8) + ' handoff=' + handoffId + ' state=' + res.status
+        + ' → no new busy edge expected');
+    }
     if (!queueSendTransferredOwnership(res)) {
       queueAwaitingBusyStart.delete(ownerTabId);
       if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
@@ -832,18 +864,25 @@ function beginValidatedQueueSend(
     const committed = kind === 'queue'
       ? usePromptQueueStore.getState().commitSentHead(ownerTabId, head.id, triggerTabId)
       : { removed: false, beforeCount: 1, targetCleared: false };
+    if (kind === 'loop' && latestLoopCauseByOwner.get(ownerTabId) === attempt.causeKey) {
+      latestLoopCauseByOwner.delete(ownerTabId);
+    }
     clearDeferredOwnerSend(ownerTabId, 'committed');
     console.log('[PromptQueueRunner] ' + label + ' commit owner=' + ownerTabId.slice(-8)
       + ' trigger=' + triggerTabId.slice(-8) + ' removed=' + committed.removed
       + ' targetCleared=' + committed.targetCleared + ' before=' + committed.beforeCount);
   })().catch((error: unknown) => {
     queueAwaitingBusyStart.delete(ownerTabId);
-    const failedHandoffId = (kind === 'loop' ? 'prompt-loop-' : 'run-after-') + head.id + '-' + attempt.attemptId;
-    settleHistoryPromptHandoff(ownerTabId, failedHandoffId, {
-      queueStatus: 'failed',
-      reason: 'send-error-before-submit',
-      requiresAuditIdentity: false,
-    });
+    if (attemptedHandoffId) {
+      settleHistoryPromptHandoff(ownerTabId, attemptedHandoffId, {
+        queueStatus: 'failed',
+        reason: 'send-error-before-submit',
+        requiresAuditIdentity: false,
+      });
+    }
+    if (kind === 'loop' && latestLoopCauseByOwner.get(ownerTabId) === attempt.causeKey) {
+      latestLoopCauseByOwner.delete(ownerTabId);
+    }
     const current = deferredOwnerAttemptIsCurrent(ownerTabId, attempt);
     clearDeferredOwnerAttempt(ownerTabId, attempt, 'send-error');
     if (current) {
@@ -905,6 +944,7 @@ const deferredContinuationPivotReleases = new Map<string, {
 }>();
 const continuationReleaseListeners = new Set<(tabId: string, source: string) => void>();
 const processedNaturalOutcomes = new Map<string, { latestTs: number; keys: Set<string> }>();
+const latestLoopCauseByOwner = new Map<string, string>();
 const workflowRestoreReconciliationListeners = new Set<() => void>();
 let workflowRestoreReconciled = false;
 let workflowRestoreReconcilePromise: Promise<void> | null = null;
@@ -1086,12 +1126,15 @@ export function usePromptQueueRunner() {
       return beginValidatedQueueSend(ownerTabId, triggerTabId, head, 'turn-end');
     };
 
-    const fireLoopOwner = (ownerTabId: string): boolean => {
+    const fireLoopOwner = (
+      ownerTabId: string,
+      causeKey: string | null = latestLoopCauseByOwner.get(ownerTabId) || null,
+    ): boolean => {
       const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
       const prompt = getLoopPrompt(queue);
       if (!prompt || queueSendInflight.has(ownerTabId)) return false;
       if (isTabWorkflowBlocked(ownerTabId)) return false;
-      return beginValidatedQueueSend(ownerTabId, ownerTabId, prompt, 'turn-end', 'loop');
+      return beginValidatedQueueSend(ownerTabId, ownerTabId, prompt, 'turn-end', 'loop', causeKey);
     };
 
     const releaseDeferredPivotOwners = (triggerTabId: string, source: string): void => {
@@ -1327,7 +1370,8 @@ export function usePromptQueueRunner() {
           return;
         }
       } else if (continuationKind === 'loop') {
-        fireLoopOwner(tabId);
+        latestLoopCauseByOwner.set(tabId, key);
+        fireLoopOwner(tabId, key);
         if (queueOwnerHasPendingContinuationAt(tabId, outcomeTs)) {
           console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
             + ' Loop claims completion → defer pivoted owners');

@@ -6,6 +6,9 @@ const {
   RECEIPT_STATES,
   classifyAgentSendRegistryReceipt,
 } = require('./agent-send-receipt-registry');
+const {
+  classifyAgentPromptAuditIdentity,
+} = require('./agent-prompt-audit-identity');
 
 const TABLE_NAME = 'agent_send_receipts';
 const DEFAULT_SETTLED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -81,13 +84,19 @@ function normalizeIdentity(identity) {
 }
 
 function normalizeAudit(audit) {
+  const identity = classifyAgentPromptAuditIdentity(audit);
   return {
     operationKey: requiredString(audit?.operationKey, 'operationKey'),
     attemptId: requiredString(audit?.attemptId, 'attemptId'),
     provider: requiredString(audit?.provider || audit?.toolType, 'provider'),
     sessionId: requiredString(audit?.sessionId, 'sessionId'),
-    promptHash: requiredString(audit?.promptHash || audit?.actualHash, 'promptHash'),
-    expectedHash: optionalString(audit?.expectedHash),
+    promptHash: optionalString(identity.identityHash),
+    actualHash: requiredString(identity.actualHash, 'actualHash'),
+    expectedHash: requiredString(identity.expectedHash, 'expectedHash'),
+    identityAccepted: identity.accepted === true,
+    identityReason: identity.reason || null,
+    canonicalized: identity.canonicalized === true,
+    canonicalReason: identity.canonicalReason || null,
     entryUuid: optionalString(audit?.entryUuid),
     transcriptBoundary: audit?.transcriptBoundary ?? null,
     auditTimestamp: Number.isFinite(audit?.auditTimestamp)
@@ -174,6 +183,22 @@ function mergeReceiptForRestart(record, timestamp) {
     deliveryUnknown: true,
     auditPending: false,
     code: 'agent_send_restart_during_delivery',
+    operationKey: record.operationKey,
+    attemptId: record.attemptId,
+    reconciledAt: timestamp,
+  };
+}
+
+function mergeReceiptForPreEnterRestart(record, timestamp) {
+  return {
+    ...(record.receipt || {}),
+    ok: false,
+    success: false,
+    submitted: false,
+    status: STORE_STATES.NOT_SUBMITTED,
+    deliveryUnknown: false,
+    auditPending: false,
+    code: 'agent_send_restart_before_enter',
     operationKey: record.operationKey,
     attemptId: record.attemptId,
     reconciledAt: timestamp,
@@ -294,6 +319,15 @@ class AgentSendReceiptStore {
           AND attempt_id = @attemptId
           AND state IN ('in-flight', 'enter-armed')
       `),
+      stageAttemptContext: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET receipt_json = @receiptJson,
+            transcript_boundary_json = COALESCE(@transcriptBoundaryJson, transcript_boundary_json),
+            updated_at = @updatedAt
+        WHERE operation_key = @operationKey
+          AND attempt_id = @attemptId
+          AND state = 'in-flight'
+      `),
       settle: this.db.prepare(`
         UPDATE ${TABLE_NAME}
         SET state = @state,
@@ -323,17 +357,29 @@ class AgentSendReceiptStore {
           AND attempt_id = @attemptId
           AND state NOT IN ('reserved', 'preparing', 'not-submitted')
       `),
-      startupActive: this.db.prepare(`
+      startupInFlight: this.db.prepare(`
         SELECT * FROM ${TABLE_NAME}
-        WHERE state IN ('in-flight', 'enter-armed')
+        WHERE state = 'in-flight'
       `),
-      reconcileOne: this.db.prepare(`
+      startupEnterArmed: this.db.prepare(`
+        SELECT * FROM ${TABLE_NAME}
+        WHERE state = 'enter-armed'
+      `),
+      reconcileInFlight: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET state = 'not-submitted', receipt_json = @receiptJson, updated_at = @updatedAt,
+            settled_at = @updatedAt
+        WHERE operation_key = @operationKey
+          AND attempt_id = @attemptId
+          AND state = 'in-flight'
+      `),
+      reconcileEnterArmed: this.db.prepare(`
         UPDATE ${TABLE_NAME}
         SET state = 'delivery-unknown', receipt_json = @receiptJson, updated_at = @updatedAt,
             settled_at = NULL
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
-          AND state IN ('in-flight', 'enter-armed')
+          AND state = 'enter-armed'
       `),
       pruneSettled: this.db.prepare(`
         DELETE FROM ${TABLE_NAME}
@@ -574,10 +620,52 @@ class AgentSendReceiptStore {
     })();
   }
 
+  stageAttemptContext(operationKeyInput, attemptIdInput, contextInput = {}) {
+    const operationKey = requiredString(operationKeyInput, 'operationKey');
+    const attemptId = requiredString(attemptIdInput, 'attemptId');
+    const context = contextInput && typeof contextInput === 'object' ? contextInput : {};
+    return this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
+      if (record.attemptId !== attemptId) {
+        return { ok: false, applied: false, stale: true, reason: 'stale-attempt', record };
+      }
+      if (record.state !== STORE_STATES.IN_FLIGHT) {
+        return {
+          ok: false,
+          applied: false,
+          reason: 'attempt-not-pre-enter',
+          record,
+        };
+      }
+      const receipt = {
+        ...(record.receipt || {}),
+        ...context,
+        operationKey,
+        attemptId,
+        status: STORE_STATES.IN_FLIGHT,
+        submitted: false,
+      };
+      const info = this.statements.stageAttemptContext.run({
+        operationKey,
+        attemptId,
+        receiptJson: encodeJson(receipt),
+        transcriptBoundaryJson: encodeJson(context.transcriptBoundary),
+        updatedAt: this.now(),
+      });
+      return {
+        ok: info.changes === 1,
+        applied: info.changes === 1,
+        reason: info.changes === 1 ? null : 'attempt-not-pre-enter',
+        record: this._record(operationKey),
+      };
+    })();
+  }
+
   settleAttempt(operationKeyInput, attemptIdInput, receiptInput) {
     const operationKey = requiredString(operationKeyInput, 'operationKey');
     const attemptId = requiredString(attemptIdInput, 'attemptId');
-    const receipt = receiptInput && typeof receiptInput === 'object'
+    const nextReceipt = receiptInput && typeof receiptInput === 'object'
       ? receiptInput
       : {
         success: null,
@@ -610,6 +698,10 @@ class AgentSendReceiptStore {
           record,
         };
       }
+      const receipt = {
+        ...(record.receipt || {}),
+        ...nextReceipt,
+      };
       const state = classifyAgentSendRegistryReceipt(receipt);
       const updatedAt = this.now();
       const settledAt = SETTLED_PRUNABLE_STATES.has(state) ? updatedAt : null;
@@ -648,8 +740,9 @@ class AgentSendReceiptStore {
       if (record.attemptId !== audit.attemptId) mismatchedFields.push('attemptId');
       if (record.provider && record.provider !== audit.provider) mismatchedFields.push('provider');
       if (record.sessionId && record.sessionId !== audit.sessionId) mismatchedFields.push('sessionId');
+      if (!audit.identityAccepted) mismatchedFields.push('canonicalProof');
       if (record.promptHash !== audit.promptHash) mismatchedFields.push('promptHash');
-      if (audit.expectedHash && record.promptHash !== audit.expectedHash) {
+      if (record.promptHash !== audit.expectedHash) {
         mismatchedFields.push('expectedHash');
       }
       if (mismatchedFields.length > 0) {
@@ -709,6 +802,10 @@ class AgentSendReceiptStore {
         provider: record.provider || audit.provider,
         sessionId: record.sessionId || audit.sessionId,
         promptHash: record.promptHash,
+        actualHash: audit.actualHash,
+        expectedHash: audit.expectedHash,
+        canonicalized: audit.canonicalized,
+        canonicalReason: audit.canonicalReason,
         auditTimestamp,
         entryUuid: audit.entryUuid,
       };
@@ -717,7 +814,7 @@ class AgentSendReceiptStore {
         attemptId: audit.attemptId,
         provider: audit.provider,
         sessionId: audit.sessionId,
-        promptHash: audit.promptHash,
+        promptHash: audit.actualHash,
         entryUuid: audit.entryUuid,
         receiptJson: encodeJson(receipt),
         transcriptBoundaryJson: encodeJson(audit.transcriptBoundary),
@@ -766,12 +863,23 @@ class AgentSendReceiptStore {
 
   reconcileStartup() {
     return this.db.transaction(() => {
-      const rows = this.statements.startupActive.all().map(rowToRecord);
+      const inFlightRows = this.statements.startupInFlight.all().map(rowToRecord);
+      const enterArmedRows = this.statements.startupEnterArmed.all().map(rowToRecord);
       const timestamp = this.now();
       let changed = 0;
-      for (const record of rows) {
+      for (const record of inFlightRows) {
+        const receipt = mergeReceiptForPreEnterRestart(record, timestamp);
+        const info = this.statements.reconcileInFlight.run({
+          operationKey: record.operationKey,
+          attemptId: record.attemptId,
+          receiptJson: encodeJson(receipt),
+          updatedAt: timestamp,
+        });
+        changed += Number(info.changes || 0);
+      }
+      for (const record of enterArmedRows) {
         const receipt = mergeReceiptForRestart(record, timestamp);
-        const info = this.statements.reconcileOne.run({
+        const info = this.statements.reconcileEnterArmed.run({
           operationKey: record.operationKey,
           attemptId: record.attemptId,
           receiptJson: encodeJson(receipt),

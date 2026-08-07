@@ -198,6 +198,44 @@ test('proven not-submitted retry may clear a failed session before exact late bi
   assert.equal(promoted.receipt.sessionId, 'replacement-session');
 });
 
+test('proven Codex canonical audit promotes the expected operation without equating both hashes', async () => {
+  const registry = createAgentSendReceiptRegistry();
+  await registry.run(identity(), async () => ({
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  }));
+  const promoted = registry.promoteFromAudit(exactAudit({
+    actualHash: 'provider-hash',
+    expectedHash: 'hash-a',
+    canonicalized: true,
+    canonicalReason: 'codex_image_placeholder_canonical',
+  }));
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.receipt.promptHash, 'hash-a');
+  assert.equal(promoted.receipt.actualHash, 'provider-hash');
+  assert.equal(promoted.receipt.canonicalized, true);
+});
+
+test('an unproven hash transformation cannot promote a receipt', async () => {
+  const registry = createAgentSendReceiptRegistry();
+  await registry.run(identity(), async () => ({
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  }));
+  const rejected = registry.promoteFromAudit(exactAudit({
+    actualHash: 'provider-hash',
+    expectedHash: 'hash-a',
+    canonicalized: true,
+    canonicalReason: 'unknown-transform',
+  }));
+  assert.equal(rejected.promoted, false);
+  assert.ok(rejected.mismatchedFields.includes('canonicalProof'));
+});
+
 for (const matrix of [
   {
     name: 'delivery-unknown',

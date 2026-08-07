@@ -11,6 +11,7 @@ const {
   reserveClaudeExactEmptyEvidence,
   validateClaudeComposerWriteBoundary,
 } = require('./claude-composer-proof');
+const { classifyTerminalPasteProfile } = require('./terminal-paste-profile');
 
 const mainPath = path.join(__dirname, 'main.js');
 const historyPath = path.join(__dirname, '../renderer/components/Workspace/HistoryPanel.tsx');
@@ -108,6 +109,7 @@ async function buildF1Harness(surfaceMode) {
     Map,
     aiStoppingTabs: new Map(),
     console: { log() {}, warn() {}, error() {} },
+    classifyTerminalPasteProfile,
     getHeadlessTerminalMirror: () => mirror,
     getTerminalLifecycleGeneration: () => 'phase2-lifecycle-generation',
     hasLiveClaudeInTab: () => true,
@@ -261,6 +263,7 @@ async function runQueuedReplayBeforeHistory(surfaceMode) {
     handoffId: 'phase2-f1-history-handoff',
     source: 'history-panel',
     verifyClaudeVisibleDraftBeforePaste: true,
+    awaitClaudeUserMessageAudit: true,
     claudeExactEmptyEvidence: harness.exactEvidence,
   });
   await Promise.resolve();

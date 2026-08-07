@@ -162,11 +162,15 @@ async function readTaskPlanInput(tabId: string, target: TaskPlanInputTarget): Pr
 async function replaceTaskPlanInput(
   tabId: string,
   target: TaskPlanInputTarget,
+  expectedText: string,
   text: string,
   focus: boolean,
-): Promise<void> {
+): Promise<{ replaced: boolean; actualText?: string }> {
   if (target === 'history') {
-    useUIStore.getState().setHistoryPromptDraft(tabId, text, {
+    const state = useUIStore.getState();
+    const actualText = state.historyPromptDrafts[tabId] || '';
+    if (actualText !== expectedText) return { replaced: false, actualText };
+    state.setHistoryPromptDraft(tabId, text, {
       preserveImages: true,
       preserveChips: true,
     });
@@ -179,11 +183,14 @@ async function replaceTaskPlanInput(
         textarea?.setSelectionRange(textarea.value.length, textarea.value.length);
       });
     }
-    return;
+    return { replaced: true };
   }
   if (target === 'sdk') {
     const textarea = getSdkComposerTextarea(tabId);
     if (!textarea) throw new Error('sdk_input_not_available');
+    if (textarea.value !== expectedText) {
+      return { replaced: false, actualText: textarea.value };
+    }
     window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
       detail: { tabId, text, replace: true, skipChip: true },
     }));
@@ -193,13 +200,24 @@ async function replaceTaskPlanInput(
       updated.focus();
       updated.setSelectionRange(updated.value.length, updated.value.length);
     }
-    return;
+    return { replaced: true };
   }
-  const result = await ipcRenderer.invoke(`${target}:restore-input`, tabId, text);
+  const result = await ipcRenderer.invoke(`${target}:replace-input-if-unchanged`, {
+    tabId,
+    expectedText,
+    text,
+  });
   if (result?.success !== true) throw new Error(result?.error || `${target}_input_replace_failed`);
+  if (result?.replaced !== true) {
+    return {
+      replaced: false,
+      ...(typeof result?.actualText === 'string' ? { actualText: result.actualText } : {}),
+    };
+  }
   if (focus) {
     terminalRegistry.get(tabId)?.focus();
   }
+  return { replaced: true };
 }
 
 function isTextEditingElement(target: EventTarget | null): boolean {
@@ -994,7 +1012,17 @@ export default function TabTaskPlanPanel({
     const afterInput = appendTaskPlanTransfer(beforeInput, insertion);
 
     try {
-      await replaceTaskPlanInput(tabId, inputTarget, afterInput, true);
+      const replacement = await replaceTaskPlanInput(
+        tabId,
+        inputTarget,
+        beforeInput,
+        afterInput,
+        true,
+      );
+      if (!replacement.replaced) {
+        showToast('Input изменился во время переноса — новый текст оставлен без изменений', 'warning', 3500);
+        return;
+      }
     } catch (error: any) {
       showToast(`Не удалось изменить input: ${error?.message || String(error)}`, 'error', 3500);
       return;
@@ -1003,8 +1031,23 @@ export default function TabTaskPlanPanel({
     const beforePlan = taskPlanStateFingerprint(plan.items, archivedItems);
     const resultDocument = await apply([{ type: 'replace_plan', tasks: extraction.nextItems }]);
     if (!resultDocument) {
-      try { await replaceTaskPlanInput(tabId, inputTarget, beforeInput, false); } catch {}
-      showToast('План не изменился; input возвращён в исходное состояние', 'error', 3500);
+      let rolledBack = false;
+      try {
+        rolledBack = (await replaceTaskPlanInput(
+          tabId,
+          inputTarget,
+          afterInput,
+          beforeInput,
+          false,
+        )).replaced;
+      } catch {}
+      showToast(
+        rolledBack
+          ? 'План не изменился; input возвращён в исходное состояние'
+          : 'План не изменился; более новый текст в input оставлен без изменений',
+        'error',
+        3500,
+      );
       return;
     }
 
@@ -1071,12 +1114,20 @@ export default function TabTaskPlanPanel({
     const transaction = findUndoInputTransaction();
     let inputBeforeAction: string | null = null;
     let replacedInput = false;
+    let inputChangedDuringAction = false;
     if (transaction) {
       try {
         inputBeforeAction = await readTaskPlanInput(tabId, transaction.inputTarget);
         if (inputBeforeAction === transaction.afterInput) {
-          await replaceTaskPlanInput(tabId, transaction.inputTarget, transaction.beforeInput, false);
-          replacedInput = true;
+          const replacement = await replaceTaskPlanInput(
+            tabId,
+            transaction.inputTarget,
+            transaction.afterInput,
+            transaction.beforeInput,
+            false,
+          );
+          replacedInput = replacement.replaced;
+          inputChangedDuringAction = !replacement.replaced;
         }
       } catch (error: any) {
         showToast(`Отмена остановлена: input недоступен (${error?.message || String(error)})`, 'error', 3500);
@@ -1087,15 +1138,26 @@ export default function TabTaskPlanPanel({
     const result = await undo(tabId);
     if (!result) {
       if (transaction && replacedInput && inputBeforeAction !== null) {
-        try { await replaceTaskPlanInput(tabId, transaction.inputTarget, inputBeforeAction, false); } catch {}
+        try {
+          await replaceTaskPlanInput(
+            tabId,
+            transaction.inputTarget,
+            transaction.beforeInput,
+            inputBeforeAction,
+            false,
+          );
+        } catch {}
       }
       return;
     }
     if (transaction) {
       transaction.undone = true;
       if (
-        inputBeforeAction !== transaction.afterInput
-        && inputBeforeAction !== transaction.beforeInput
+        inputChangedDuringAction
+        || (
+          inputBeforeAction !== transaction.afterInput
+          && inputBeforeAction !== transaction.beforeInput
+        )
       ) {
         showToast('План отменён; более новый текст в input оставлен без изменений', 'warning', 3000);
       }
@@ -1106,12 +1168,20 @@ export default function TabTaskPlanPanel({
     const transaction = findRedoInputTransaction();
     let inputBeforeAction: string | null = null;
     let replacedInput = false;
+    let inputChangedDuringAction = false;
     if (transaction) {
       try {
         inputBeforeAction = await readTaskPlanInput(tabId, transaction.inputTarget);
         if (inputBeforeAction === transaction.beforeInput) {
-          await replaceTaskPlanInput(tabId, transaction.inputTarget, transaction.afterInput, false);
-          replacedInput = true;
+          const replacement = await replaceTaskPlanInput(
+            tabId,
+            transaction.inputTarget,
+            transaction.beforeInput,
+            transaction.afterInput,
+            false,
+          );
+          replacedInput = replacement.replaced;
+          inputChangedDuringAction = !replacement.replaced;
         }
       } catch (error: any) {
         showToast(`Повтор остановлен: input недоступен (${error?.message || String(error)})`, 'error', 3500);
@@ -1122,15 +1192,26 @@ export default function TabTaskPlanPanel({
     const result = await redo(tabId);
     if (!result) {
       if (transaction && replacedInput && inputBeforeAction !== null) {
-        try { await replaceTaskPlanInput(tabId, transaction.inputTarget, inputBeforeAction, false); } catch {}
+        try {
+          await replaceTaskPlanInput(
+            tabId,
+            transaction.inputTarget,
+            transaction.afterInput,
+            inputBeforeAction,
+            false,
+          );
+        } catch {}
       }
       return;
     }
     if (transaction) {
       transaction.undone = false;
       if (
-        inputBeforeAction !== transaction.beforeInput
-        && inputBeforeAction !== transaction.afterInput
+        inputChangedDuringAction
+        || (
+          inputBeforeAction !== transaction.beforeInput
+          && inputBeforeAction !== transaction.afterInput
+        )
       ) {
         showToast('План повторён; более новый текст в input оставлен без изменений', 'warning', 3000);
       }

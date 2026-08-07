@@ -91,6 +91,8 @@ export interface BeginHistoryPromptHandoffInput {
   source?: string;
   statusAtSend?: HistoryPromptHandoffAgentStatus;
   requiresAuditIdentity?: boolean;
+  /** Durable remount only: seed the first observable snapshot at its receipt state. */
+  initialReceipt?: SettleHistoryPromptHandoffInput;
 }
 
 export interface SettleHistoryPromptHandoffInput {
@@ -99,6 +101,104 @@ export interface SettleHistoryPromptHandoffInput {
   proof?: HistoryPromptHandoffAuditProof | null;
   requiresAuditIdentity?: boolean;
   changedAt?: number;
+}
+
+export interface BindHistoryPromptHandoffSendIdentityInput {
+  sendAttemptId?: string | null;
+  sendOperationKey?: string | null;
+}
+
+export interface DurableHistorySendReceiptRecord {
+  operationKey?: string | null;
+  surface?: string | null;
+  tabId?: string | null;
+  handoffId?: string | null;
+  provider?: string | null;
+  sessionId?: string | null;
+  state?: string | null;
+  attemptId?: string | null;
+  receipt?: Record<string, any> | null;
+  createdAt?: number | null;
+  updatedAt?: number | null;
+}
+
+export interface DurableHistorySendHydrationResult {
+  hydrated: boolean;
+  reason: string;
+  restorableDraft?: string;
+  handoff?: Readonly<HistoryPromptHandoff>;
+}
+
+export type BindHistoryPromptHandoffSendIdentityResult =
+  | {
+      ok: true;
+      changed: boolean;
+      handoff: Readonly<HistoryPromptHandoff>;
+    }
+  | {
+      ok: false;
+      reason:
+        | 'handoff-not-found'
+        | 'send-attempt-id-conflict'
+        | 'send-operation-key-conflict'
+        | 'bounds';
+    };
+
+/**
+ * Receipt-shaped fields stored on History's renderer-local prompt rows.
+ *
+ * The durable transcript row is deliberately not part of this contract. This
+ * projection is reconciled only by the exact app-owned handoff id; text and
+ * timestamps are presentation data, never identity fallbacks.
+ */
+export interface HistoryPromptHandoffProjectionRow {
+  handoffId?: string | null;
+  queueStatus?: HistoryPromptHandoffStatus;
+  statusReason?: string;
+  statusChangedAt?: number;
+  statusAtSend?: HistoryPromptHandoffAgentStatus;
+  timestamp?: string;
+  optimisticAt?: number;
+  requiresAuditIdentity?: boolean;
+  auditTimestamp?: string;
+  auditHash?: string;
+  auditSessionId?: string;
+  auditEntryUuid?: string;
+  sourceIdentity?: string;
+  sessionId?: string;
+}
+
+export interface HistoryPromptHandoffProjectionTombstone {
+  handoffId: string;
+  state: 'consumed' | 'retracted';
+}
+
+export interface HistoryPromptHandoffReconcileLimits {
+  maxRows: number;
+  maxHandoffs: number;
+  maxTombstones: number;
+}
+
+export interface ReconcileHistoryPromptHandoffRowsInput<
+  TRow extends HistoryPromptHandoffProjectionRow,
+> {
+  rows: readonly TRow[];
+  handoffs: readonly Readonly<HistoryPromptHandoff>[];
+  tombstones?: readonly Readonly<HistoryPromptHandoffProjectionTombstone>[];
+  createRow: (handoff: Readonly<HistoryPromptHandoff>) => TRow | null | undefined;
+  limits?: Partial<HistoryPromptHandoffReconcileLimits>;
+}
+
+export interface ReconcileHistoryPromptHandoffRowsResult<
+  TRow extends HistoryPromptHandoffProjectionRow,
+> {
+  rows: readonly TRow[];
+  changed: boolean;
+  added: number;
+  updated: number;
+  removed: number;
+  /** At least one input or addition exceeded the caller-visible hard bound. */
+  truncated: boolean;
 }
 
 export interface RunHistoryPromptHandoffInput
@@ -110,6 +210,7 @@ export interface RunHistoryPromptHandoffInput
 export type HistoryPromptHandoffChange =
   | { type: 'replay' }
   | { type: 'begin'; handoffId: string }
+  | { type: 'bind-send-identity'; handoffId: string }
   | { type: 'settle'; handoffId: string }
   | { type: 'retract'; handoffId: string; reason: string }
   | { type: 'consume'; handoffId: string }
@@ -153,6 +254,15 @@ export const DEFAULT_HISTORY_PROMPT_HANDOFF_LIMITS:
     maxTabs: 16,
     maxHandoffs: 128,
     maxBytes: 8 * 1024 * 1024,
+  });
+
+export const DEFAULT_HISTORY_PROMPT_HANDOFF_RECONCILE_LIMITS:
+  Readonly<HistoryPromptHandoffReconcileLimits> = Object.freeze({
+    // Matches HistoryVolatileOverlayCache's global item bound. Reconciliation
+    // must stay a small UI projection, never become a transcript walk.
+    maxRows: 512,
+    maxHandoffs: DEFAULT_HISTORY_PROMPT_HANDOFF_LIMITS.maxHandoffs,
+    maxTombstones: DEFAULT_HISTORY_PROMPT_HANDOFF_LIMITS.maxHandoffs,
   });
 
 export const HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS = 15_000;
@@ -269,6 +379,42 @@ function freezeProof(
   });
 }
 
+function mergeCompatibleAuditProof(
+  current: Readonly<HistoryPromptHandoffAuditProof> | null,
+  incoming: HistoryPromptHandoffAuditProof | null | undefined,
+): Readonly<HistoryPromptHandoffAuditProof> | null {
+  if (!incoming) return current;
+  const frozenIncoming = freezeProof(incoming);
+  if (!current) return frozenIncoming;
+  if (!frozenIncoming) return current;
+
+  // The first exact receipt owns this attempt. A later observation may fill
+  // optional metadata, but a different writer/hash/entry can only belong to a
+  // different attempt and must not rewrite the established identity here.
+  const conflicts = current.actualHash !== frozenIncoming.actualHash
+    || (!!current.entryUuid
+      && !!frozenIncoming.entryUuid
+      && current.entryUuid !== frozenIncoming.entryUuid)
+    || (!!current.sessionId
+      && !!frozenIncoming.sessionId
+      && current.sessionId !== frozenIncoming.sessionId)
+    || (!!current.sourceIdentity
+      && !!frozenIncoming.sourceIdentity
+      && current.sourceIdentity !== frozenIncoming.sourceIdentity);
+  if (conflicts) return current;
+
+  return freezeProof({
+    auditTimestamp: current.auditTimestamp,
+    actualHash: current.actualHash,
+    sessionId: current.sessionId || frozenIncoming.sessionId,
+    entryUuid: current.entryUuid || frozenIncoming.entryUuid,
+    sourceIdentity: current.sourceIdentity || frozenIncoming.sourceIdentity,
+    actualLen: current.actualLen ?? frozenIncoming.actualLen,
+    canonicalized: current.canonicalized === true || frozenIncoming.canonicalized === true,
+    canonicalReason: current.canonicalReason || frozenIncoming.canonicalReason,
+  });
+}
+
 function freezeHandoff(value: HistoryPromptHandoff): Readonly<HistoryPromptHandoff> {
   return Object.freeze({
     ...value,
@@ -276,6 +422,202 @@ function freezeHandoff(value: HistoryPromptHandoff): Readonly<HistoryPromptHando
     imagePaths: Object.freeze(value.imagePaths.map(freezeImageRef)),
     auditProof: freezeProof(value.auditProof),
   });
+}
+
+const reconcileLimit = (
+  value: number | undefined,
+  fallback: number,
+  label: string,
+): number => {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new RangeError(`${label} must be a positive safe integer`);
+  }
+  return value;
+};
+
+const submittedTimestamp = (
+  submittedAt: number,
+  fallback: string | undefined,
+): string | undefined => {
+  if (!Number.isFinite(submittedAt)) return fallback;
+  const date = new Date(submittedAt);
+  return Number.isNaN(date.getTime()) ? fallback : date.toISOString();
+};
+
+function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectionRow>(
+  row: TRow,
+  handoff: Readonly<HistoryPromptHandoff>,
+): TRow {
+  const proof = handoff.auditProof;
+  const timestamp = submittedTimestamp(handoff.submittedAt, row.timestamp);
+  const auditSessionId = proof?.sessionId || undefined;
+  const sessionId = auditSessionId || row.sessionId;
+  const auditTimestamp = proof?.auditTimestamp || undefined;
+  const auditHash = proof?.actualHash || undefined;
+  const auditEntryUuid = proof?.entryUuid || undefined;
+  const sourceIdentity = proof?.sourceIdentity || undefined;
+
+  if (
+    row.handoffId === handoff.handoffId
+    && row.queueStatus === handoff.queueStatus
+    && row.statusReason === handoff.statusReason
+    && row.statusChangedAt === handoff.statusChangedAt
+    && row.statusAtSend === handoff.statusAtSend
+    && row.timestamp === timestamp
+    && row.optimisticAt === handoff.submittedAt
+    && row.requiresAuditIdentity === handoff.requiresAuditIdentity
+    && row.auditTimestamp === auditTimestamp
+    && row.auditHash === auditHash
+    && row.auditSessionId === auditSessionId
+    && row.auditEntryUuid === auditEntryUuid
+    && row.sourceIdentity === sourceIdentity
+    && row.sessionId === sessionId
+  ) {
+    return row;
+  }
+
+  return {
+    ...row,
+    handoffId: handoff.handoffId,
+    queueStatus: handoff.queueStatus,
+    statusReason: handoff.statusReason,
+    statusChangedAt: handoff.statusChangedAt,
+    statusAtSend: handoff.statusAtSend,
+    timestamp,
+    optimisticAt: handoff.submittedAt,
+    requiresAuditIdentity: handoff.requiresAuditIdentity,
+    auditTimestamp,
+    auditHash,
+    auditSessionId,
+    auditEntryUuid,
+    sourceIdentity,
+    sessionId,
+  } as TRow;
+}
+
+/**
+ * Reconciles only the bounded renderer-local prompt projection.
+ *
+ * Snapshot absence is not a deletion proof: a handoff may have been evicted
+ * from the bounded store while its local SENT row is still the only honest UI
+ * state. Removal therefore requires an explicit consumed/retracted tombstone.
+ * Durable adoption stays owned by History's transcript merge and is never
+ * inferred here from equal text or nearby timestamps.
+ */
+export function reconcileHistoryPromptHandoffRows<
+  TRow extends HistoryPromptHandoffProjectionRow,
+>(
+  input: ReconcileHistoryPromptHandoffRowsInput<TRow>,
+): ReconcileHistoryPromptHandoffRowsResult<TRow> {
+  const limits: HistoryPromptHandoffReconcileLimits = {
+    maxRows: reconcileLimit(
+      input.limits?.maxRows,
+      DEFAULT_HISTORY_PROMPT_HANDOFF_RECONCILE_LIMITS.maxRows,
+      'maxRows',
+    ),
+    maxHandoffs: reconcileLimit(
+      input.limits?.maxHandoffs,
+      DEFAULT_HISTORY_PROMPT_HANDOFF_RECONCILE_LIMITS.maxHandoffs,
+      'maxHandoffs',
+    ),
+    maxTombstones: reconcileLimit(
+      input.limits?.maxTombstones,
+      DEFAULT_HISTORY_PROMPT_HANDOFF_RECONCILE_LIMITS.maxTombstones,
+      'maxTombstones',
+    ),
+  };
+
+  // The overlay cache is already bounded. If a caller accidentally passes a
+  // transcript-sized array, preserve it untouched instead of doing an
+  // unbounded walk or dropping rows without proof.
+  if (input.rows.length > limits.maxRows) {
+    return {
+      rows: input.rows,
+      changed: false,
+      added: 0,
+      updated: 0,
+      removed: 0,
+      truncated: true,
+    };
+  }
+
+  let truncated = input.handoffs.length > limits.maxHandoffs
+    || (input.tombstones?.length || 0) > limits.maxTombstones;
+  const tombstoneIds = new Set<string>();
+  for (
+    let index = 0;
+    index < Math.min(input.tombstones?.length || 0, limits.maxTombstones);
+    index += 1
+  ) {
+    const tombstone = input.tombstones?.[index];
+    if (!tombstone || typeof tombstone.handoffId !== 'string' || !tombstone.handoffId) continue;
+    if (tombstone.state !== 'consumed' && tombstone.state !== 'retracted') continue;
+    tombstoneIds.add(tombstone.handoffId);
+  }
+
+  const handoffsById = new Map<string, Readonly<HistoryPromptHandoff>>();
+  for (
+    let index = 0;
+    index < Math.min(input.handoffs.length, limits.maxHandoffs);
+    index += 1
+  ) {
+    const handoff = input.handoffs[index];
+    if (!handoff || typeof handoff.handoffId !== 'string' || !handoff.handoffId) continue;
+    if (tombstoneIds.has(handoff.handoffId)) continue;
+    handoffsById.set(handoff.handoffId, handoff);
+  }
+
+  const seenHandoffIds = new Set<string>();
+  const nextRows: TRow[] = [];
+  let updated = 0;
+  let removed = 0;
+  for (const row of input.rows) {
+    const handoffId = typeof row.handoffId === 'string' ? row.handoffId : '';
+    if (handoffId && tombstoneIds.has(handoffId)) {
+      removed += 1;
+      continue;
+    }
+    if (!handoffId) {
+      nextRows.push(row);
+      continue;
+    }
+
+    seenHandoffIds.add(handoffId);
+    const handoff = handoffsById.get(handoffId);
+    if (!handoff) {
+      // No active record and no tombstone is uncertainty, not consumption.
+      nextRows.push(row);
+      continue;
+    }
+    const projected = projectHandoffReceiptOntoRow(row, handoff);
+    if (projected !== row) updated += 1;
+    nextRows.push(projected);
+  }
+
+  let added = 0;
+  for (const [handoffId, handoff] of handoffsById) {
+    if (seenHandoffIds.has(handoffId)) continue;
+    if (nextRows.length >= limits.maxRows) {
+      truncated = true;
+      continue;
+    }
+    const created = input.createRow(handoff);
+    if (!created) continue;
+    nextRows.push(projectHandoffReceiptOntoRow(created, handoff));
+    seenHandoffIds.add(handoffId);
+    added += 1;
+  }
+
+  const changed = added > 0 || updated > 0 || removed > 0;
+  return {
+    rows: changed ? nextRows : input.rows,
+    changed,
+    added,
+    updated,
+    removed,
+    truncated,
+  };
 }
 
 /**
@@ -319,20 +661,34 @@ export class HistoryPromptHandoffStore {
         ? input.sendAttemptId.trim()
         : '';
       const currentAttemptId = existing.value.sendAttemptId || '';
-      const retryable = existing.value.queueStatus === 'failed'
-        || existing.value.queueStatus === 'cancelled';
-      if (nextAttemptId && nextAttemptId !== currentAttemptId && retryable) {
+      // Permission to retry belongs to the scenario/transport layer. If it did
+      // start a genuinely new physical attempt, the History projection must
+      // follow that exact attempt even when the previous receipt was already
+      // terminal. A duplicate begin without a fresh attempt id stays
+      // idempotent and can never clear an exact receipt.
+      if (nextAttemptId && nextAttemptId !== currentAttemptId) {
+        const submittedAt = finiteTimestamp(input.submittedAt, Date.now());
+        const initialReceipt = input.initialReceipt;
         const next = freezeHandoff({
           ...existing.value,
           sendAttemptId: nextAttemptId,
           sendOperationKey: typeof input.sendOperationKey === 'string'
             ? input.sendOperationKey.trim() || null
             : existing.value.sendOperationKey,
-          submittedAt: finiteTimestamp(input.submittedAt, Date.now()),
-          queueStatus: 'sending',
-          statusReason: 'send-retry-start',
-          statusChangedAt: finiteTimestamp(input.submittedAt, Date.now()),
-          auditProof: null,
+          sessionIdHint: typeof input.sessionIdHint === 'string'
+            ? input.sessionIdHint
+            : existing.value.sessionIdHint,
+          submittedAt,
+          source: typeof input.source === 'string' ? input.source : existing.value.source,
+          statusAtSend: input.statusAtSend || existing.value.statusAtSend,
+          queueStatus: initialReceipt?.queueStatus || 'sending',
+          statusReason: initialReceipt?.reason || 'send-retry-start',
+          statusChangedAt: initialReceipt
+            ? Math.max(submittedAt, finiteTimestamp(initialReceipt.changedAt, submittedAt))
+            : submittedAt,
+          requiresAuditIdentity: existing.value.requiresAuditIdentity
+            || input.requiresAuditIdentity === true,
+          auditProof: freezeProof(initialReceipt?.proof),
         });
         const nextBytes = estimateHandoffBytes(next);
         this.approxBytes += nextBytes - existing.approxBytes;
@@ -340,11 +696,19 @@ export class HistoryPromptHandoffStore {
         this.notify(tabId, { type: 'begin', handoffId });
         return next;
       }
+      if (input.initialReceipt) {
+        this.bindSendIdentity(tabId, handoffId, {
+          sendAttemptId: input.sendAttemptId,
+          sendOperationKey: input.sendOperationKey,
+        });
+        return this.settle(tabId, handoffId, input.initialReceipt);
+      }
       return existing.value;
     }
 
     const now = Date.now();
     const submittedAt = finiteTimestamp(input.submittedAt, now);
+    const initialReceipt = input.initialReceipt;
     const value = freezeHandoff({
       tabId,
       handoffId,
@@ -362,11 +726,13 @@ export class HistoryPromptHandoffStore {
       submittedAt,
       source: typeof input.source === 'string' ? input.source : '',
       statusAtSend: input.statusAtSend || 'unknown',
-      queueStatus: 'sending',
-      statusReason: 'send-start',
-      statusChangedAt: submittedAt,
+      queueStatus: initialReceipt?.queueStatus || 'sending',
+      statusReason: initialReceipt?.reason || 'send-start',
+      statusChangedAt: initialReceipt
+        ? Math.max(submittedAt, finiteTimestamp(initialReceipt.changedAt, submittedAt))
+        : submittedAt,
       requiresAuditIdentity: input.requiresAuditIdentity !== false,
-      auditProof: null,
+      auditProof: freezeProof(initialReceipt?.proof),
     });
     const approxBytes = estimateHandoffBytes(value);
     if (approxBytes > this.limits.maxBytes) return undefined;
@@ -388,6 +754,67 @@ export class HistoryPromptHandoffStore {
     return value;
   }
 
+  bindSendIdentity(
+    tabIdValue: string,
+    handoffIdValue: string,
+    input: BindHistoryPromptHandoffSendIdentityInput,
+  ): BindHistoryPromptHandoffSendIdentityResult {
+    const tabId = requireKey(tabIdValue, 'tabId');
+    const handoffId = requireKey(handoffIdValue, 'handoffId');
+    const tab = this.tabs.get(tabId);
+    const current = tab?.get(handoffId);
+    if (!tab || !current) return { ok: false, reason: 'handoff-not-found' };
+
+    const incomingAttemptId = typeof input.sendAttemptId === 'string'
+      ? input.sendAttemptId.trim() || null
+      : null;
+    const incomingOperationKey = typeof input.sendOperationKey === 'string'
+      ? input.sendOperationKey.trim() || null
+      : null;
+    if (
+      current.value.sendAttemptId
+      && incomingAttemptId
+      && current.value.sendAttemptId !== incomingAttemptId
+    ) {
+      return { ok: false, reason: 'send-attempt-id-conflict' };
+    }
+    if (
+      current.value.sendOperationKey
+      && incomingOperationKey
+      && current.value.sendOperationKey !== incomingOperationKey
+    ) {
+      return { ok: false, reason: 'send-operation-key-conflict' };
+    }
+
+    const sendAttemptId = current.value.sendAttemptId || incomingAttemptId;
+    const sendOperationKey = current.value.sendOperationKey || incomingOperationKey;
+    if (
+      sendAttemptId === current.value.sendAttemptId
+      && sendOperationKey === current.value.sendOperationKey
+    ) {
+      this.promoteTab(tabId);
+      return { ok: true, changed: false, handoff: current.value };
+    }
+
+    // Binding is atomic and intentionally receipt-neutral: it cannot alter a
+    // row's status, timestamps, or proof. That makes a main-side auto receipt
+    // safe to attach after send-result without reopening the send attempt.
+    const next = freezeHandoff({
+      ...current.value,
+      sendAttemptId,
+      sendOperationKey,
+    });
+    const approxBytes = estimateHandoffBytes(next);
+    if (approxBytes > this.limits.maxBytes) return { ok: false, reason: 'bounds' };
+    this.approxBytes += approxBytes - current.approxBytes;
+    tab.set(handoffId, { value: next, approxBytes });
+    this.promoteTab(tabId);
+    this.enforceLimits(tabId, handoffId);
+    if (!this.tabs.get(tabId)?.has(handoffId)) return { ok: false, reason: 'bounds' };
+    this.notify(tabId, { type: 'bind-send-identity', handoffId });
+    return { ok: true, changed: true, handoff: next };
+  }
+
   settle(
     tabIdValue: string,
     handoffIdValue: string,
@@ -399,20 +826,47 @@ export class HistoryPromptHandoffStore {
     const current = tab?.get(handoffId);
     if (!tab || !current) return undefined;
 
+    const nextProof = mergeCompatibleAuditProof(current.value.auditProof, input.proof);
+    const currentHasExactReceipt = current.value.queueStatus === 'sent'
+      && current.value.auditProof !== null;
+    const incomingKeepsExactReceipt = input.queueStatus === 'sent'
+      && nextProof !== null;
+    if (currentHasExactReceipt && !incomingKeepsExactReceipt) {
+      // Same-attempt timeout/failure callbacks can arrive after the exact
+      // audit. They are weaker observations, not permission to resurrect
+      // CONFIRMING or erase the writer UUID. A new begin with a fresh attempt
+      // id is the only reset boundary.
+      return current.value;
+    }
+
+    const statusChangedAt = Math.max(
+      current.value.statusChangedAt,
+      finiteTimestamp(input.changedAt, Date.now()),
+    );
+
     const next = freezeHandoff({
       ...current.value,
       queueStatus: input.queueStatus,
       statusReason: String(input.reason || ''),
-      statusChangedAt: finiteTimestamp(input.changedAt, Date.now()),
+      statusChangedAt,
       // Exact identity is monotonic. Once a sender declares that a local row
       // needs audit proof, a timeout/mismatch cannot downgrade it to text/time
       // similarity and accidentally adopt an older identical prompt.
       requiresAuditIdentity: current.value.requiresAuditIdentity
         || input.requiresAuditIdentity === true,
-      auditProof: input.proof === undefined
-        ? current.value.auditProof
-        : freezeProof(input.proof),
+      // Proof is monotonic inside an attempt. `null` means this particular
+      // observation had no proof; it does not revoke an earlier exact one.
+      auditProof: nextProof,
     });
+    if (
+      next.queueStatus === current.value.queueStatus
+      && next.statusReason === current.value.statusReason
+      && next.statusChangedAt === current.value.statusChangedAt
+      && next.requiresAuditIdentity === current.value.requiresAuditIdentity
+      && next.auditProof === current.value.auditProof
+    ) {
+      return current.value;
+    }
     const approxBytes = estimateHandoffBytes(next);
     if (approxBytes > this.limits.maxBytes) return undefined;
     this.approxBytes += approxBytes - current.approxBytes;
@@ -749,6 +1203,12 @@ export async function runHistoryPromptHandoff(
 export const beginHistoryPromptHandoff = (input: BeginHistoryPromptHandoffInput) =>
   historyPromptHandoffStore.begin(input);
 
+export const bindHistoryPromptHandoffSendIdentity = (
+  tabId: string,
+  handoffId: string,
+  input: BindHistoryPromptHandoffSendIdentityInput,
+) => historyPromptHandoffStore.bindSendIdentity(tabId, handoffId, input);
+
 export const settleHistoryPromptHandoff = (
   tabId: string,
   handoffId: string,
@@ -771,3 +1231,108 @@ export const subscribeHistoryPromptHandoffs = (
 
 export const getHistoryPromptHandoffsSnapshot = (tabId: string) =>
   historyPromptHandoffStore.getSnapshot(tabId);
+
+export function hydrateHistoryPromptHandoffFromDurableReceipt(
+  record: DurableHistorySendReceiptRecord,
+): DurableHistorySendHydrationResult {
+  const tabId = typeof record?.tabId === 'string' ? record.tabId.trim() : '';
+  const handoffId = typeof record?.handoffId === 'string' ? record.handoffId.trim() : '';
+  const operationKey = typeof record?.operationKey === 'string' ? record.operationKey.trim() : '';
+  const attemptId = typeof record?.attemptId === 'string' ? record.attemptId.trim() : '';
+  const toolType = record?.provider === 'claude' || record?.provider === 'codex'
+    ? record.provider
+    : null;
+  const receipt = record?.receipt && typeof record.receipt === 'object'
+    ? record.receipt
+    : {};
+  const promptText = typeof receipt.promptText === 'string' ? receipt.promptText : '';
+  if (record?.surface !== 'desktop-history'
+    || !tabId
+    || !handoffId
+    || !operationKey
+    || !attemptId
+    || !toolType
+    || !promptText) {
+    return { hydrated: false, reason: 'durable-history-receipt-incomplete' };
+  }
+  if (record.state === 'not-submitted') {
+    return {
+      hydrated: false,
+      reason: 'durable-history-send-not-submitted',
+      restorableDraft: promptText,
+    };
+  }
+
+  const presentation = receipt.presentationSnapshot && typeof receipt.presentationSnapshot === 'object'
+    ? receipt.presentationSnapshot
+    : {};
+  let queueStatus: Exclude<HistoryPromptHandoffStatus, 'sending'> | null = null;
+  if (record.state === 'confirmed') queueStatus = 'sent';
+  else if (record.state === 'audit-pending') queueStatus = 'audit-pending';
+  else if (record.state === 'delivery-unknown' || record.state === 'enter-armed') {
+    queueStatus = 'delivery-unknown';
+  }
+  const proof = queueStatus === 'sent'
+    && typeof receipt.actualHash === 'string'
+    && receipt.actualHash
+    && receipt.auditTimestamp
+    ? {
+        auditTimestamp: String(receipt.auditTimestamp),
+        actualHash: receipt.actualHash,
+        sessionId: typeof receipt.sessionId === 'string'
+          ? receipt.sessionId
+          : (typeof record.sessionId === 'string' ? record.sessionId : null),
+        ...(typeof receipt.entryUuid === 'string' && receipt.entryUuid
+          ? { entryUuid: receipt.entryUuid }
+          : {}),
+        ...(receipt.canonicalized === true ? { canonicalized: true } : {}),
+        ...(typeof receipt.canonicalReason === 'string' && receipt.canonicalReason
+          ? { canonicalReason: receipt.canonicalReason }
+          : {}),
+      }
+    : null;
+  const initialReceipt = queueStatus
+    ? {
+        queueStatus,
+        reason: queueStatus === 'sent'
+          ? 'durable-audit-confirmed'
+          : queueStatus === 'audit-pending'
+            ? 'durable-audit-pending'
+            : 'durable-delivery-unknown',
+        proof,
+        requiresAuditIdentity: true,
+        changedAt: Number(record.updatedAt) || Date.now(),
+      }
+    : undefined;
+  const begun = beginHistoryPromptHandoff({
+    tabId,
+    handoffId,
+    sendAttemptId: attemptId,
+    sendOperationKey: operationKey,
+    toolType,
+    sessionIdHint: typeof record.sessionId === 'string' ? record.sessionId : null,
+    text: promptText,
+    promptChips: Array.isArray(presentation.promptChips) ? presentation.promptChips : [],
+    imagePaths: Array.isArray(presentation.imagePaths) ? presentation.imagePaths : [],
+    submittedAt: Number(record.createdAt) || Date.now(),
+    source: typeof receipt.source === 'string' ? receipt.source : 'history-panel',
+    statusAtSend: 'unknown',
+    requiresAuditIdentity: true,
+    ...(initialReceipt ? { initialReceipt } : {}),
+  });
+  if (!begun) return { hydrated: false, reason: 'durable-history-handoff-bounds' };
+  const bound = bindHistoryPromptHandoffSendIdentity(tabId, handoffId, {
+    sendAttemptId: attemptId,
+    sendOperationKey: operationKey,
+  });
+  if (!bound.ok) return { hydrated: false, reason: bound.reason };
+
+  if (!queueStatus) {
+    return { hydrated: true, reason: 'durable-history-send-active', handoff: bound.handoff };
+  }
+  return {
+    hydrated: true,
+    reason: 'durable-history-receipt-hydrated',
+    handoff: bound.handoff,
+  };
+}

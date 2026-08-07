@@ -6,6 +6,7 @@ const {
   classifyClaudeMissingPromptExactCaptureAdmission,
   parseClaudeComposerCurrentFrame,
   reserveClaudeExactEmptyEvidence,
+  resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence,
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 } = require('./claude-composer-proof');
@@ -328,6 +329,278 @@ test('exact empty capture can cross only the revision reserved by the same paste
     currentLifecycleGeneration: 'pty-a:3',
     currentMirrorGeneration: 'mirror-a',
   }), null);
+});
+
+function reservedExactEmptyEvidence(overrides = {}) {
+  return {
+    success: true,
+    proofOutcome: 'absent',
+    hasDraft: false,
+    text: '',
+    images: 0,
+    terminalIdentityStable: true,
+    editorReturnReady: true,
+    inputRevision: 8,
+    terminalRunSeq: 3,
+    terminalLifecycleGeneration: 'pty-a:3',
+    mirrorGeneration: 'mirror-a',
+    // This is the closed capture frame before Ctrl+G returned to Claude. The
+    // fresh write-boundary frame below is expected to be newer.
+    mirrorWriteSeq: 19,
+    mirrorFlushedSeq: 19,
+    mirrorSynchronizedOutputOpen: false,
+    synchronizedOutputGeneration: 4,
+    source: 'headless-main:claude-composer:empty-exact-editor',
+    ...overrides,
+  };
+}
+
+function ambiguousCurrentWriteProof(overrides = {}) {
+  return {
+    success: true,
+    proofOutcome: 'unknown',
+    hasDraft: null,
+    text: '',
+    preview: '',
+    source: 'headless-main:claude-composer:unknown:active-prompt-not-found',
+    proofReason: 'active-prompt-not-found',
+    exactCaptureBlockedReason: 'claude-pty-write-active',
+    inputRevision: 8,
+    terminalRunSeq: 3,
+    terminalLifecycleGeneration: 'pty-a:3',
+    mirrorGeneration: 'mirror-a',
+    mirrorWriteSeq: 24,
+    mirrorFlushedSeq: 24,
+    mirrorSynchronizedOutputOpen: false,
+    synchronizedOutputGeneration: 5,
+    ...overrides,
+  };
+}
+
+function reservedExactResolutionArgs(overrides = {}) {
+  return {
+    proof: ambiguousCurrentWriteProof(),
+    evidence: reservedExactEmptyEvidence(),
+    reservedEvidenceOwnedByCurrentOperation: true,
+    terminalMatches: true,
+    currentInputRevision: 8,
+    currentRunSeq: 3,
+    currentLifecycleGeneration: 'pty-a:3',
+    currentMirrorGeneration: 'mirror-a',
+    currentMirrorWriteSeq: 24,
+    currentMirrorFlushedSeq: 24,
+    currentMirrorSynchronizedOutputOpen: false,
+    currentSynchronizedOutputGeneration: 5,
+    startupGateReady: true,
+    ...overrides,
+  };
+}
+
+test('same queue-head evidence resolves found or unknown screen ambiguity without authorizing another capture', () => {
+  const cases = [
+    ['missing prompt blocked by our active write', ambiguousCurrentWriteProof({
+      exactCaptureRecommended: undefined,
+      exactCaptureBlockedReason: 'claude-pty-write-active',
+    })],
+    ['residual cells classified as a draft', ambiguousCurrentWriteProof({
+      proofOutcome: 'found',
+      hasDraft: true,
+      text: 'stale residual cells',
+      preview: 'stale residual cells',
+      proofReason: 'current-composer-text',
+      exactCaptureRecommended: false,
+    })],
+  ];
+
+  for (const [label, proof] of cases) {
+    const decision = resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence(
+      reservedExactResolutionArgs({ proof }),
+    );
+    assert.equal(decision.valid, true, label);
+    assert.equal(decision.reason, 'claude_current_composer_empty_from_reserved_exact_evidence');
+    assert.equal(decision.proof.proofOutcome, 'absent');
+    assert.equal(decision.proof.hasDraft, false);
+    assert.equal(decision.proof.text, '');
+    assert.equal(proof.proofOutcome, label.startsWith('residual') ? 'found' : 'unknown',
+      'the fresh screen proof stays immutable');
+  }
+});
+
+test('active queue-head write blocks a new Ctrl+G but may consume its own reserved evidence', () => {
+  const frame = currentClosedHeadlessFrame();
+  const captureAdmission = classifyClaudeMissingPromptExactCaptureAdmission({
+    proof: missingActivePromptProof(frame),
+    snapshot: frame,
+    writeOperationActive: true,
+    startupGateReady: true,
+  });
+  assert.deepEqual(captureAdmission, {
+    recommended: false,
+    reason: 'claude-pty-write-active',
+  });
+
+  const consumption = resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence(
+    reservedExactResolutionArgs(),
+  );
+  assert.equal(consumption.valid, true);
+  assert.equal(consumption.proof.proofOutcome, 'absent');
+});
+
+test('reserved exact-empty consumption rejects every stale physical identity coordinate', () => {
+  const cases = [
+    ['foreign queue operation', {
+      reservedEvidenceOwnedByCurrentOperation: false,
+    }, 'claude_reserved_exact_empty_evidence_not_owned'],
+    ['replacement terminal', {
+      terminalMatches: false,
+    }, 'claude_terminal_replacement_active'],
+    ['evidence input revision', {
+      evidence: reservedExactEmptyEvidence({ inputRevision: 7 }),
+    }, 'claude_input_ownership_changed'],
+    ['fresh proof input revision', {
+      proof: ambiguousCurrentWriteProof({ inputRevision: 7 }),
+    }, 'claude_input_ownership_changed'],
+    ['current input revision', {
+      currentInputRevision: 9,
+    }, 'claude_input_ownership_changed'],
+    ['evidence run', {
+      evidence: reservedExactEmptyEvidence({ terminalRunSeq: 2 }),
+    }, 'claude_terminal_run_changed'],
+    ['fresh proof run', {
+      proof: ambiguousCurrentWriteProof({ terminalRunSeq: 2 }),
+    }, 'claude_terminal_run_changed'],
+    ['current run', {
+      currentRunSeq: 4,
+    }, 'claude_terminal_run_changed'],
+    ['evidence lifecycle', {
+      evidence: reservedExactEmptyEvidence({ terminalLifecycleGeneration: 'pty-a:2' }),
+    }, 'claude_terminal_lifecycle_changed'],
+    ['fresh proof lifecycle', {
+      proof: ambiguousCurrentWriteProof({ terminalLifecycleGeneration: 'pty-a:2' }),
+    }, 'claude_terminal_lifecycle_changed'],
+    ['current lifecycle', {
+      currentLifecycleGeneration: 'pty-a:4',
+    }, 'claude_terminal_lifecycle_changed'],
+    ['evidence mirror', {
+      evidence: reservedExactEmptyEvidence({ mirrorGeneration: 'mirror-b' }),
+    }, 'claude_headless_generation_changed'],
+    ['fresh proof mirror', {
+      proof: ambiguousCurrentWriteProof({ mirrorGeneration: 'mirror-b' }),
+    }, 'claude_headless_generation_changed'],
+    ['current mirror', {
+      currentMirrorGeneration: 'mirror-b',
+    }, 'claude_headless_generation_changed'],
+  ];
+
+  for (const [label, mutation, reason] of cases) {
+    assert.deepEqual(
+      resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence(
+        reservedExactResolutionArgs(mutation),
+      ),
+      { valid: false, reason },
+      label,
+    );
+  }
+});
+
+test('reserved exact-empty consumption requires closed flushed capture and current frames', () => {
+  const cases = [
+    ['capture frame open', {
+      evidence: reservedExactEmptyEvidence({ mirrorSynchronizedOutputOpen: true }),
+    }, 'claude_exact_empty_capture_frame_open'],
+    ['capture frame unflushed', {
+      evidence: reservedExactEmptyEvidence({ mirrorWriteSeq: 20 }),
+    }, 'claude_exact_empty_capture_frame_unflushed'],
+    ['capture frame generation unavailable', {
+      evidence: reservedExactEmptyEvidence({ synchronizedOutputGeneration: null }),
+    }, 'claude_exact_empty_capture_frame_unflushed'],
+    ['fresh proof frame open', {
+      proof: ambiguousCurrentWriteProof({ mirrorSynchronizedOutputOpen: true }),
+    }, 'claude_headless_frame_open'],
+    ['current frame open', {
+      currentMirrorSynchronizedOutputOpen: true,
+    }, 'claude_headless_frame_open'],
+    ['fresh proof frame unflushed', {
+      proof: ambiguousCurrentWriteProof({ mirrorFlushedSeq: 23 }),
+    }, 'claude_headless_frame_not_flushed'],
+    ['current frame unflushed', {
+      currentMirrorFlushedSeq: 23,
+    }, 'claude_headless_frame_not_flushed'],
+    ['fresh proof is from an older closed frame', {
+      proof: ambiguousCurrentWriteProof({ mirrorWriteSeq: 23, mirrorFlushedSeq: 23 }),
+    }, 'claude_headless_frame_changed'],
+    ['synchronized-output generation changed', {
+      proof: ambiguousCurrentWriteProof({ synchronizedOutputGeneration: 4 }),
+    }, 'claude_headless_frame_changed'],
+  ];
+
+  for (const [label, mutation, reason] of cases) {
+    assert.deepEqual(
+      resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence(
+        reservedExactResolutionArgs(mutation),
+      ),
+      { valid: false, reason },
+      label,
+    );
+  }
+});
+
+test('reserved exact-empty consumption fails closed for every unsafe Claude surface', () => {
+  const cases = [
+    ['busy turn', { turnBusy: true }, 'claude-turn-busy'],
+    ['local command', { localCommandActive: true }, 'claude-local-command-active'],
+    ['compact', { compactActive: true }, 'claude-compact-active'],
+    ['question', { awaitingInput: true }, 'claude-question-active'],
+    ['stopping', { stopping: true }, 'claude-stopping'],
+    ['rewind control', { rewindActive: true }, 'claude-rewind-active'],
+    ['startup not ready', { startupGateReady: false }, 'claude-startup-gate-not-ready'],
+    ['picker', { pickerActive: true }, 'claude-picker-active'],
+    ['control surface', { controlSurfaceActive: true }, 'claude-control-surface-active'],
+    ['replacement in progress', { replacementActive: true }, 'claude_terminal_replacement_active'],
+  ];
+
+  for (const [label, mutation, reason] of cases) {
+    assert.deepEqual(
+      resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence(
+        reservedExactResolutionArgs(mutation),
+      ),
+      { valid: false, reason },
+      label,
+    );
+  }
+});
+
+test('unreserved, non-empty, or non-headless evidence cannot override the screen', () => {
+  const cases = [
+    ['failed evidence', {
+      evidence: reservedExactEmptyEvidence({ success: false }),
+    }, 'claude_reserved_exact_empty_evidence_required'],
+    ['non-empty evidence', {
+      evidence: reservedExactEmptyEvidence({ text: 'real draft', proofOutcome: 'found' }),
+    }, 'claude_reserved_exact_empty_evidence_required'],
+    ['unstable evidence', {
+      evidence: reservedExactEmptyEvidence({ terminalIdentityStable: false }),
+    }, 'claude_reserved_exact_empty_evidence_required'],
+    ['editor return not proven', {
+      evidence: reservedExactEmptyEvidence({ editorReturnReady: false }),
+    }, 'claude_reserved_exact_empty_evidence_required'],
+    ['already empty screen needs the normal validator', {
+      proof: ambiguousCurrentWriteProof({ proofOutcome: 'absent', hasDraft: false }),
+    }, 'claude_screen_ambiguity_required'],
+    ['renderer screen', {
+      proof: ambiguousCurrentWriteProof({ source: 'renderer:claude-composer:unknown' }),
+    }, 'claude_headless_draft_proof_required'],
+  ];
+
+  for (const [label, mutation, reason] of cases) {
+    assert.deepEqual(
+      resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence(
+        reservedExactResolutionArgs(mutation),
+      ),
+      { valid: false, reason },
+      label,
+    );
+  }
 });
 
 test('submit generation may advance mirror bytes but not input or process identity', () => {

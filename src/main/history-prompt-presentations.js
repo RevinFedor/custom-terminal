@@ -1,14 +1,11 @@
 const crypto = require('crypto');
 const path = require('path');
+const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 
 const PRESENTATION_IMAGE_ASSET_RE = /^[a-f0-9]{64}\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i;
 
 function promptTransportHash(text) {
-  return crypto
-    .createHash('sha1')
-    .update(String(text || ''))
-    .digest('hex')
-    .slice(0, 16);
+  return promptAuditFingerprint(text);
 }
 
 function normalizeCodexPromptIdentityText(text) {
