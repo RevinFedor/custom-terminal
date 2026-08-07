@@ -16657,6 +16657,7 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
         canonicalized: result.canonicalized === true,
         canonicalReason: result.canonicalReason || null,
         entryUuid: result.entryUuid || null,
+        sourceIdentity: result.sourceIdentity || null,
         transcriptBoundary: result.transcriptBoundary || null,
         auditTimestamp: result.auditTimestamp || null,
       });
@@ -19932,10 +19933,40 @@ ipcMain.handle('agent:list-send-receipts', async (_event, { tabId, surface = nul
     receipt: record.receipt,
     transcriptBoundary: record.transcriptBoundary,
     auditIdentity: record.auditIdentity,
+    presentation: record.presentation,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   }));
   return { success: true, records };
+});
+
+ipcMain.handle('agent:acknowledge-send-receipt-presentation', async (_event, input = {}) => {
+  await agentSendReceiptStartupReady;
+  const result = agentSendReceiptStore.acknowledgePresentation({
+    operationKey: input.operationKey,
+    attemptId: input.attemptId,
+    surface: DESKTOP_HISTORY_SEND_SURFACE,
+    tabId: input.tabId,
+    handoffId: input.handoffId,
+    provider: input.provider,
+    sessionId: input.sessionId,
+    entryUuid: input.entryUuid,
+    sourceIdentity: input.sourceIdentity,
+  });
+  if (!result.ok) {
+    console.warn('[AgentSendReceipt] presentation ACK rejected'
+      + ' tab=' + String(input.tabId || '').slice(-12)
+      + ' handoff=' + String(input.handoffId || '-')
+      + ' attempt=' + String(input.attemptId || '-').slice(0, 12)
+      + ' reason=' + (result.reason || 'unknown'));
+  }
+  return {
+    success: result.ok === true,
+    applied: result.applied === true,
+    idempotent: result.idempotent === true,
+    reason: result.reason || null,
+    presentation: result.record?.presentation || null,
+  };
 });
 
 // Programmatic paste (used for automated tools like Update Docs)

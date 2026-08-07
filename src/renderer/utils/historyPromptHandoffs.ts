@@ -118,8 +118,31 @@ export interface DurableHistorySendReceiptRecord {
   state?: string | null;
   attemptId?: string | null;
   receipt?: Record<string, any> | null;
+  auditIdentity?: {
+    attemptId?: string | null;
+    provider?: string | null;
+    sessionId?: string | null;
+    promptHash?: string | null;
+    entryUuid?: string | null;
+    sourceIdentity?: string | null;
+    auditTimestamp?: string | null;
+  } | null;
+  presentation?: {
+    attemptId?: string | null;
+    provider?: string | null;
+    sessionId?: string | null;
+    entryUuid?: string | null;
+    sourceIdentity?: string | null;
+    acknowledgedAt?: number | null;
+  } | null;
   createdAt?: number | null;
   updatedAt?: number | null;
+}
+
+export interface DurableHistoryCanonicalPromptEntry {
+  uuid?: string | null;
+  sessionId?: string | null;
+  sourceIdentity?: string | null;
 }
 
 export interface DurableHistorySendHydrationResult {
@@ -1232,6 +1255,31 @@ export const subscribeHistoryPromptHandoffs = (
 export const getHistoryPromptHandoffsSnapshot = (tabId: string) =>
   historyPromptHandoffStore.getSnapshot(tabId);
 
+export function durableHistorySendReceiptMatchesCanonicalEntry(
+  record: DurableHistorySendReceiptRecord,
+  entry: DurableHistoryCanonicalPromptEntry,
+) {
+  if (record?.state !== 'confirmed' || record?.presentation) return false;
+  const receipt = record?.receipt && typeof record.receipt === 'object'
+    ? record.receipt
+    : {};
+  const auditIdentity = record?.auditIdentity && typeof record.auditIdentity === 'object'
+    ? record.auditIdentity
+    : {};
+  const entryUuid = typeof receipt.entryUuid === 'string' && receipt.entryUuid
+    ? receipt.entryUuid
+    : (typeof auditIdentity.entryUuid === 'string' ? auditIdentity.entryUuid : '');
+  const sourceIdentity = typeof receipt.sourceIdentity === 'string' && receipt.sourceIdentity
+    ? receipt.sourceIdentity
+    : (typeof auditIdentity.sourceIdentity === 'string' ? auditIdentity.sourceIdentity : '');
+  const exactSessionId = typeof receipt.sessionId === 'string' && receipt.sessionId
+    ? receipt.sessionId
+    : (typeof record.sessionId === 'string' ? record.sessionId : '');
+  if (exactSessionId && entry.sessionId && exactSessionId !== entry.sessionId) return false;
+  if (entryUuid) return entry.uuid === entryUuid;
+  return !!sourceIdentity && entry.sourceIdentity === sourceIdentity;
+}
+
 export function hydrateHistoryPromptHandoffFromDurableReceipt(
   record: DurableHistorySendReceiptRecord,
 ): DurableHistorySendHydrationResult {
@@ -1262,6 +1310,9 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
       restorableDraft: promptText,
     };
   }
+  if (record.presentation) {
+    return { hydrated: false, reason: 'durable-history-presentation-already-materialized' };
+  }
 
   const presentation = receipt.presentationSnapshot && typeof receipt.presentationSnapshot === 'object'
     ? receipt.presentationSnapshot
@@ -1272,19 +1323,50 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   else if (record.state === 'delivery-unknown' || record.state === 'enter-armed') {
     queueStatus = 'delivery-unknown';
   }
+  const auditIdentity = record?.auditIdentity && typeof record.auditIdentity === 'object'
+    ? record.auditIdentity
+    : {};
+  const auditTimestamp = typeof receipt.auditTimestamp === 'string' && receipt.auditTimestamp.trim()
+    ? receipt.auditTimestamp.trim()
+    : (typeof auditIdentity.auditTimestamp === 'string' && auditIdentity.auditTimestamp.trim()
+      ? auditIdentity.auditTimestamp.trim()
+      : '');
+  const entryUuid = typeof receipt.entryUuid === 'string' && receipt.entryUuid
+    ? receipt.entryUuid
+    : (typeof auditIdentity.entryUuid === 'string' ? auditIdentity.entryUuid : '');
+  const sourceIdentity = typeof receipt.sourceIdentity === 'string' && receipt.sourceIdentity
+    ? receipt.sourceIdentity
+    : (typeof auditIdentity.sourceIdentity === 'string' ? auditIdentity.sourceIdentity : '');
+  if (queueStatus === 'sent' && !entryUuid && !sourceIdentity) {
+    // Legacy confirmed receipts already prove transcript delivery, but older
+    // builds discarded Codex's exact row identity. Recreating a local SENT row
+    // can only duplicate canonical History and can never be consumed safely.
+    return { hydrated: false, reason: 'durable-history-confirmed-identity-missing' };
+  }
+  if (queueStatus === 'sent' && (
+    typeof receipt.actualHash !== 'string'
+    || !receipt.actualHash
+    || !auditTimestamp
+  )) {
+    // The exact transcript row is known, but an older receipt cannot rebuild
+    // a safe adoption proof. Delivery is already confirmed, so showing a new
+    // local SENT row would only create an unconsumable duplicate.
+    return { hydrated: false, reason: 'durable-history-confirmed-proof-incomplete' };
+  }
   const proof = queueStatus === 'sent'
     && typeof receipt.actualHash === 'string'
     && receipt.actualHash
-    && receipt.auditTimestamp
+    && auditTimestamp
     ? {
-        auditTimestamp: String(receipt.auditTimestamp),
+        auditTimestamp,
         actualHash: receipt.actualHash,
         sessionId: typeof receipt.sessionId === 'string'
           ? receipt.sessionId
           : (typeof record.sessionId === 'string' ? record.sessionId : null),
-        ...(typeof receipt.entryUuid === 'string' && receipt.entryUuid
-          ? { entryUuid: receipt.entryUuid }
+        ...(entryUuid
+          ? { entryUuid }
           : {}),
+        ...(sourceIdentity ? { sourceIdentity } : {}),
         ...(receipt.canonicalized === true ? { canonicalized: true } : {}),
         ...(typeof receipt.canonicalReason === 'string' && receipt.canonicalReason
           ? { canonicalReason: receipt.canonicalReason }

@@ -132,6 +132,7 @@ test('one allowlisted canonical Codex record produces promotable audit data', as
   assert.equal(result.reason, 'codex_trimmed_boundary_whitespace');
   assert.equal(result.audit.canonicalized, true);
   assert.equal(result.audit.canonicalReason, 'codex_trimmed_boundary_whitespace');
+  assert.equal(result.audit.sourceIdentity, 'codex-user-source-codex-session-0');
   assert.notEqual(result.audit.actualHash, result.audit.expectedHash);
   assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
 });

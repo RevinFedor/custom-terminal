@@ -40,6 +40,8 @@ function exactAudit(attemptId, overrides = {}) {
     promptHash: 'hash-a',
     expectedHash: 'hash-a',
     entryUuid: 'entry-a',
+    sourceIdentity: 'codex-user-source-session-a-4242',
+    auditTimestamp: '2026-08-07T06:46:46.000Z',
     transcriptBoundary: { byteOffset: 42, line: 7 },
     ...overrides,
   };
@@ -363,6 +365,133 @@ test('only exact current attempt/provider/session/hash audit promotes and late c
   assert.equal(callback.applied, false);
   assert.equal(callback.reason, 'already-confirmed');
   assert.equal(store.get(attempt.record.operationKey).state, STORE_STATES.CONFIRMED);
+});
+
+test('confirmed delivery is enriched with exact audit identity and presentation ACK is an exact CAS', (t) => {
+  const harness = openMemoryHarness(t, { now: () => 1_786_105_206_500 });
+  if (!harness) return;
+  const { store } = harness;
+  const attempt = store.beginAttempt(identity({ surface: 'desktop-history' }));
+  const settled = store.settleAttempt(attempt.record.operationKey, attempt.attemptId, {
+    success: true,
+    submitted: true,
+    status: 'sent',
+    exactAuditConfirmed: true,
+  });
+  assert.equal(settled.record.state, STORE_STATES.CONFIRMED);
+  assert.equal(settled.record.auditIdentity, null, 'transport settlement is not row identity');
+
+  const enriched = store.promoteFromAudit(exactAudit(attempt.attemptId));
+  assert.equal(enriched.promoted, true);
+  assert.equal(enriched.record.auditIdentity.sourceIdentity, 'codex-user-source-session-a-4242');
+  assert.equal(enriched.record.auditIdentity.auditTimestamp, '2026-08-07T06:46:46.000Z');
+  assert.equal(enriched.record.receipt.auditTimestamp, '2026-08-07T06:46:46.000Z');
+  const duplicateWithoutSecondarySource = store.promoteFromAudit(exactAudit(attempt.attemptId, {
+    sourceIdentity: null,
+  }));
+  assert.equal(duplicateWithoutSecondarySource.ok, true);
+  assert.equal(duplicateWithoutSecondarySource.idempotent, true);
+
+  const baseAck = {
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    entryUuid: 'entry-a',
+    sourceIdentity: 'codex-user-source-session-a-4242',
+  };
+  assert.equal(store.acknowledgePresentation({ ...baseAck, attemptId: 'stale' }).reason, 'stale-attempt');
+  assert.equal(store.acknowledgePresentation({ ...baseAck, entryUuid: 'foreign' }).reason, 'entry-uuid-mismatch');
+  assert.equal(store.acknowledgePresentation({ ...baseAck, sourceIdentity: 'foreign' }).reason, 'source-identity-mismatch');
+  assert.equal(store.acknowledgePresentation({ ...baseAck, tabId: 'foreign-tab' }).reason, 'handoff-identity-mismatch');
+
+  const acknowledged = store.acknowledgePresentation(baseAck);
+  assert.equal(acknowledged.ok, true);
+  assert.equal(acknowledged.applied, true);
+  assert.equal(acknowledged.record.presentation.attemptId, attempt.attemptId);
+  assert.equal(acknowledged.record.presentation.entryUuid, 'entry-a');
+  assert.equal(acknowledged.record.presentation.sourceIdentity, 'codex-user-source-session-a-4242');
+  const replay = store.acknowledgePresentation(baseAck);
+  assert.equal(replay.ok, true);
+  assert.equal(replay.idempotent, true);
+});
+
+test('Codex presentation ACK accepts exact source identity when no audit entry UUID exists', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const attempt = store.beginAttempt(identity({ surface: 'desktop-history' }));
+  const promoted = store.promoteFromAudit(exactAudit(attempt.attemptId, {
+    entryUuid: null,
+  }));
+  assert.equal(promoted.promoted, true);
+  const rejected = store.acknowledgePresentation({
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    entryUuid: 'canonical-row',
+    sourceIdentity: 'foreign-source',
+  });
+  assert.equal(rejected.reason, 'source-identity-mismatch');
+  const accepted = store.acknowledgePresentation({
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    entryUuid: 'canonical-row',
+    sourceIdentity: 'codex-user-source-session-a-4242',
+  });
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.record.presentation.entryUuid, 'canonical-row');
+});
+
+test('existing receipt tables migrate additively before statements are prepared', (t) => {
+  let db;
+  try {
+    db = new Database(':memory:');
+  } catch (error) {
+    if (error?.code === 'ERR_DLOPEN_FAILED' && /NODE_MODULE_VERSION/.test(error?.message || '')) {
+      t.skip('better-sqlite3 uses the Electron ABI; run with ELECTRON_RUN_AS_NODE=1');
+      return;
+    }
+    throw error;
+  }
+  t.after(() => db.close());
+  db.exec(`
+    CREATE TABLE ${TABLE_NAME} (
+      operation_key TEXT PRIMARY KEY, surface TEXT NOT NULL, run_id TEXT,
+      tab_id TEXT, handoff_id TEXT, request_fingerprint TEXT NOT NULL,
+      provider TEXT, session_id TEXT, prompt_hash TEXT NOT NULL,
+      prompt_length INTEGER NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+      attempt_id TEXT, receipt_json TEXT, transcript_boundary_json TEXT,
+      audit_attempt_id TEXT, audit_provider TEXT, audit_session_id TEXT,
+      audit_prompt_hash TEXT, audit_entry_uuid TEXT, created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL, settled_at INTEGER
+    )
+  `);
+  const store = createAgentSendReceiptStore(db);
+  const columns = new Set(db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all().map((row) => row.name));
+  for (const column of [
+    'audit_source_identity',
+    'audit_timestamp',
+    'presentation_attempt_id',
+    'presentation_entry_uuid',
+    'presentation_source_identity',
+    'presentation_at',
+  ]) {
+    assert.equal(columns.has(column), true, `${column} was migrated`);
+  }
+  assert.equal(store.beginAttempt(identity()).action, 'attempt-started');
 });
 
 test('unresolved proof survives prune and reopen while old settled proof is prunable', (t) => {

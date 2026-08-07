@@ -162,6 +162,7 @@ import {
   beginHistoryPromptHandoff,
   bindHistoryPromptHandoffSendIdentity,
   consumeHistoryPromptHandoff,
+  durableHistorySendReceiptMatchesCanonicalEntry,
   getHistoryPromptHandoffsSnapshot,
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   historyPromptHandoffAuditProofFromSendResult,
@@ -7049,6 +7050,12 @@ function AgentHistoryControls({
             description: runtime.label + ' is compacting the conversation context',
             accent: '#a78bfa',
           }
+      : busyAction === 'send'
+        ? {
+            title: 'SENDING',
+            description: 'Sending the prompt from History to ' + runtime.label,
+            accent: '#60a5fa',
+          }
       : showUpdatingChip
         ? {
             title: 'UPDATING',
@@ -7151,6 +7158,7 @@ function AgentHistoryControls({
           type="button"
           data-agent-status-row
           data-agent-operational-phase={isCompacting ? 'compacting' : undefined}
+          data-agent-send-phase={busyAction === 'send' ? 'sending' : undefined}
           data-terminal-toggle={onToggleTerminal ? 'status' : undefined}
           aria-label={onToggleTerminal
             ? ((terminalOpen ? 'Hide ' : 'Open ') + secondarySurfaceLabel)
@@ -9556,20 +9564,120 @@ function HistoryPanel({
     });
   }, [historySnapshotOwner, persistVolatileOverlay, tabId]);
 
+  const acknowledgeMaterializedHistoryReceipt = useCallback(async (input: {
+    operationKey?: string | null;
+    attemptId?: string | null;
+    handoffId?: string | null;
+    provider?: string | null;
+    sessionId?: string | null;
+    auditEntryUuid?: string | null;
+    auditSourceIdentity?: string | null;
+  }, matched: FullHistoryEntry) => {
+    const operationKey = typeof input.operationKey === 'string' ? input.operationKey.trim() : '';
+    const attemptId = typeof input.attemptId === 'string' ? input.attemptId.trim() : '';
+    const handoffId = typeof input.handoffId === 'string' ? input.handoffId.trim() : '';
+    const provider = input.provider === 'claude' || input.provider === 'codex'
+      ? input.provider
+      : null;
+    const exactSessionId = typeof input.sessionId === 'string' && input.sessionId
+      ? input.sessionId
+      : matched.sessionId;
+    const auditEntryUuid = typeof input.auditEntryUuid === 'string'
+      ? input.auditEntryUuid
+      : '';
+    const auditSourceIdentity = typeof input.auditSourceIdentity === 'string'
+      ? input.auditSourceIdentity
+      : '';
+    const exactEntryMatched = !!auditEntryUuid && matched.uuid === auditEntryUuid;
+    const exactSourceMatched = !auditEntryUuid && !!auditSourceIdentity
+      && matched.sourceIdentity === auditSourceIdentity;
+    if (!operationKey
+      || !attemptId
+      || !handoffId
+      || !provider
+      || !exactSessionId
+      || (!exactEntryMatched && !exactSourceMatched)) {
+      return false;
+    }
+    try {
+      const result = await ipcRenderer.invoke('agent:acknowledge-send-receipt-presentation', {
+        operationKey,
+        attemptId,
+        tabId,
+        handoffId,
+        provider,
+        sessionId: exactSessionId,
+        entryUuid: matched.uuid,
+        sourceIdentity: matched.sourceIdentity || null,
+      });
+      historyDiag('DURABLE_PRESENTATION_ACK tab=' + tabId.slice(-12)
+        + ' handoff=' + handoffId
+        + ' success=' + (result?.success === true ? '1' : '0')
+        + ' applied=' + (result?.applied === true ? '1' : '0')
+        + ' reason=' + (result?.reason || '-'));
+      return result?.success === true;
+    } catch (error: any) {
+      console.warn('[HistoryPanel] durable presentation ACK failed tab=' + tabId.slice(-12)
+        + ' handoff=' + handoffId
+        + ': ' + String(error?.message || error));
+      return false;
+    }
+  }, [tabId]);
+
   useEffect(() => {
     let disposed = false;
     void ipcRenderer.invoke('agent:list-send-receipts', {
       tabId,
       surface: 'desktop-history',
-    }).then((result: any) => {
+    }).then(async (result: any) => {
       if (disposed || result?.success !== true || !Array.isArray(result.records)) return;
       let restorableDraft: string | null = null;
       let restorableAt = -1;
       let hydrated = 0;
       for (const record of result.records) {
         if (record?.provider !== toolType) continue;
+        const canonicalProjectionReady = presentedOwnerKey === historyOwnerKey
+          && (rawServerEntriesRef.current.length > 0
+            || chipsFreshOwnerKey === historyOwnerKey);
+        // On a cold owner, the durable transcript has not been read yet. A
+        // confirmed receipt means its canonical row exists, so wait for that
+        // first read instead of briefly appending a duplicate SENT at the end.
+        if (record?.state === 'confirmed'
+          && !record?.presentation
+          && !canonicalProjectionReady) {
+          continue;
+        }
+        const materialized = record?.state === 'confirmed'
+          ? rawServerEntriesRef.current.find((entry) =>
+              durableHistorySendReceiptMatchesCanonicalEntry(record, entry)
+            )
+          : null;
+        if (materialized) {
+          const acknowledged = await acknowledgeMaterializedHistoryReceipt({
+            operationKey: record.operationKey,
+            attemptId: record.attemptId,
+            handoffId: record.handoffId,
+            provider: record.provider,
+            sessionId: record.receipt?.sessionId || record.sessionId,
+            auditEntryUuid: record.receipt?.entryUuid || record.auditIdentity?.entryUuid,
+            auditSourceIdentity: record.receipt?.sourceIdentity
+              || record.auditIdentity?.sourceIdentity,
+          }, materialized);
+          if (!acknowledged || disposed) continue;
+          consumeHistoryPromptHandoff(tabId, record.handoffId);
+          removeLocalPromptEntry(record.handoffId, 'durable-presentation-already-materialized');
+          continue;
+        }
         const outcome = hydrateHistoryPromptHandoffFromDurableReceipt(record);
         if (outcome.hydrated) hydrated += 1;
+        if (!outcome.hydrated && (
+          outcome.reason === 'durable-history-presentation-already-materialized'
+          || outcome.reason === 'durable-history-confirmed-identity-missing'
+          || outcome.reason === 'durable-history-confirmed-proof-incomplete'
+        )) {
+          consumeHistoryPromptHandoff(tabId, record.handoffId);
+          removeLocalPromptEntry(record.handoffId, outcome.reason);
+        }
         if (outcome.restorableDraft && Number(record?.updatedAt || 0) >= restorableAt) {
           restorableDraft = outcome.restorableDraft;
           restorableAt = Number(record?.updatedAt || 0);
@@ -9592,7 +9700,16 @@ function HistoryPanel({
         + ': ' + String(error?.message || error));
     });
     return () => { disposed = true; };
-  }, [setHistoryPromptDraft, tabId, toolType]);
+  }, [
+    acknowledgeMaterializedHistoryReceipt,
+    chipsFreshOwnerKey,
+    historyOwnerKey,
+    presentedOwnerKey,
+    removeLocalPromptEntry,
+    setHistoryPromptDraft,
+    tabId,
+    toolType,
+  ]);
 
   useEffect(() => subscribeHistoryPromptHandoffs(tabId, (snapshot, change) => {
     if (change.type === 'consume' || change.type === 'retract') {
@@ -9996,12 +10113,23 @@ function HistoryPanel({
       );
       if (!matched) continue;
       consumedServerUuids.add(matched.uuid);
-      consumeHistoryPromptHandoff(tabId, handoff.handoffId);
-      historyDiag('HANDOFF_CONSUMED tab=' + tabId.slice(-12) +
-        ' handoff=' + handoff.handoffId +
-        ' proof=' + (handoff.auditProof ? 'audit' : 'fallback'));
+      void acknowledgeMaterializedHistoryReceipt({
+        operationKey: handoff.sendOperationKey,
+        attemptId: handoff.sendAttemptId,
+        handoffId: handoff.handoffId,
+        provider: handoff.toolType,
+        sessionId: handoff.auditProof?.sessionId || handoff.sessionIdHint,
+        auditEntryUuid: handoff.auditProof?.entryUuid,
+        auditSourceIdentity: handoff.auditProof?.sourceIdentity,
+      }, matched).then((acknowledged) => {
+        if (!acknowledged) return;
+        consumeHistoryPromptHandoff(tabId, handoff.handoffId);
+        historyDiag('HANDOFF_CONSUMED tab=' + tabId.slice(-12) +
+          ' handoff=' + handoff.handoffId +
+          ' proof=' + (handoff.auditProof ? 'audit' : 'fallback'));
+      });
     }
-  }, [sessionId, tabId, toolType]);
+  }, [acknowledgeMaterializedHistoryReceipt, sessionId, tabId, toolType]);
 
   // Load full history
   const runHistoryLoad = useCallback(async (isRefresh = false) => {

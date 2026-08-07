@@ -61,6 +61,34 @@ test('late exact audit commits durable receipt before any renderer/web projectio
     ['accepted receipt becomes projection detail', 'const baseDetail = {'],
     ['projection routed', 'routeAgentPromptAuditDetail(detail)'],
   ]);
+  assert.match(publishBody, /sourceIdentity: result\.sourceIdentity \|\| null/);
+});
+
+test('canonical History materialization is durably acknowledged before local SENT is consumed', () => {
+  const consumeBody = between(
+    historySource,
+    'const consumeMaterializedPromptHandoffs = useCallback',
+    '// Load full history',
+  );
+  ordered(consumeBody, [
+    ['exact canonical row matched', 'const matched = findServerPromptEntry('],
+    ['durable presentation acknowledged', 'acknowledgeMaterializedHistoryReceipt({'],
+    ['renderer-local handoff consumed', 'consumeHistoryPromptHandoff(tabId, handoff.handoffId)'],
+  ]);
+
+  const hydrationBody = between(
+    historySource,
+    "void ipcRenderer.invoke('agent:list-send-receipts'",
+    'useEffect(() => subscribeHistoryPromptHandoffs',
+  );
+  ordered(hydrationBody, [
+    ['confirmed receipt waits for a canonical projection', 'canonicalProjectionReady'],
+    ['exact durable identity is checked', 'durableHistorySendReceiptMatchesCanonicalEntry(record, entry)'],
+    ['only unmatched receipts hydrate locally', 'hydrateHistoryPromptHandoffFromDurableReceipt(record)'],
+  ]);
+
+  assert.match(mainSource, /ipcMain\.handle\('agent:acknowledge-send-receipt-presentation'/);
+  assert.match(mainSource, /agentSendReceiptStore\.acknowledgePresentation\(\{/);
 });
 
 test('main returns the generated attempt identity to the exact History handoff', () => {
@@ -104,4 +132,19 @@ test('History remount reconciles only its bounded local overlay before first mer
     historySource,
     /change\.type === 'consume' \|\| change\.type === 'retract' \|\| change\.type === 'evict'/,
   );
+});
+
+test('History projects the existing send action into the terminal status row', () => {
+  const statusBody = between(
+    historySource,
+    'const unifiedTransientStatus = isCancellingTurn',
+    'const statusTitle = statusCopied',
+  );
+  ordered(statusBody, [
+    ['compact keeps priority', "title: 'COMPACTING'"],
+    ['send action is projected', "busyAction === 'send'"],
+    ['visible send title is declared', "title: 'SENDING'"],
+    ['ordinary history refresh stays lower priority', 'showUpdatingChip'],
+  ]);
+  assert.match(historySource, /data-agent-send-phase=\{busyAction === 'send' \? 'sending'/);
 });

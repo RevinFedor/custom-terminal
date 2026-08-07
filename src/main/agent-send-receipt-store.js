@@ -60,6 +60,18 @@ function optionalString(value) {
   return normalized || null;
 }
 
+function optionalAuditTimestamp(value) {
+  if (typeof value === 'string') {
+    const normalized = value.trim();
+    return normalized || null;
+  }
+  if (Number.isFinite(value)) {
+    const timestamp = new Date(Number(value));
+    return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : null;
+  }
+  return null;
+}
+
 function nonNegativeInteger(value, label) {
   const normalized = Number(value);
   if (!Number.isSafeInteger(normalized) || normalized < 0) {
@@ -98,10 +110,9 @@ function normalizeAudit(audit) {
     canonicalized: identity.canonicalized === true,
     canonicalReason: identity.canonicalReason || null,
     entryUuid: optionalString(audit?.entryUuid),
+    sourceIdentity: optionalString(audit?.sourceIdentity),
     transcriptBoundary: audit?.transcriptBoundary ?? null,
-    auditTimestamp: Number.isFinite(audit?.auditTimestamp)
-      ? Number(audit.auditTimestamp)
-      : null,
+    auditTimestamp: optionalAuditTimestamp(audit?.auditTimestamp),
     success: audit?.success === true,
     raw: audit,
   };
@@ -145,6 +156,16 @@ function rowToRecord(row) {
       sessionId: row.audit_session_id,
       promptHash: row.audit_prompt_hash,
       entryUuid: row.audit_entry_uuid,
+      sourceIdentity: row.audit_source_identity,
+      auditTimestamp: row.audit_timestamp,
+    } : null,
+    presentation: row.presentation_at ? {
+      attemptId: row.presentation_attempt_id,
+      provider: row.presentation_provider,
+      sessionId: row.presentation_session_id,
+      entryUuid: row.presentation_entry_uuid,
+      sourceIdentity: row.presentation_source_identity,
+      acknowledgedAt: row.presentation_at,
     } : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -248,6 +269,14 @@ class AgentSendReceiptStore {
         audit_session_id TEXT,
         audit_prompt_hash TEXT,
         audit_entry_uuid TEXT,
+        audit_source_identity TEXT,
+        audit_timestamp TEXT,
+        presentation_attempt_id TEXT,
+        presentation_provider TEXT,
+        presentation_session_id TEXT,
+        presentation_entry_uuid TEXT,
+        presentation_source_identity TEXT,
+        presentation_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         settled_at INTEGER
@@ -260,6 +289,23 @@ class AgentSendReceiptStore {
       CREATE INDEX IF NOT EXISTS idx_agent_send_receipts_tab_handoff
         ON ${TABLE_NAME}(tab_id, handoff_id);
     `);
+    const existingColumns = new Set(
+      this.db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all().map((row) => row.name),
+    );
+    const additiveColumns = [
+      ['audit_source_identity', 'TEXT'],
+      ['audit_timestamp', 'TEXT'],
+      ['presentation_attempt_id', 'TEXT'],
+      ['presentation_provider', 'TEXT'],
+      ['presentation_session_id', 'TEXT'],
+      ['presentation_entry_uuid', 'TEXT'],
+      ['presentation_source_identity', 'TEXT'],
+      ['presentation_at', 'INTEGER'],
+    ];
+    for (const [column, type] of additiveColumns) {
+      if (existingColumns.has(column)) continue;
+      this.db.exec(`ALTER TABLE ${TABLE_NAME} ADD COLUMN ${column} ${type}`);
+    }
   }
 
   _prepareStatements() {
@@ -302,6 +348,14 @@ class AgentSendReceiptStore {
             audit_session_id = NULL,
             audit_prompt_hash = NULL,
             audit_entry_uuid = NULL,
+            audit_source_identity = NULL,
+            audit_timestamp = NULL,
+            presentation_attempt_id = NULL,
+            presentation_provider = NULL,
+            presentation_session_id = NULL,
+            presentation_entry_uuid = NULL,
+            presentation_source_identity = NULL,
+            presentation_at = NULL,
             updated_at = @updatedAt,
             settled_at = NULL
         WHERE operation_key = @operationKey
@@ -351,11 +405,27 @@ class AgentSendReceiptStore {
             audit_session_id = @sessionId,
             audit_prompt_hash = @promptHash,
             audit_entry_uuid = @entryUuid,
+            audit_source_identity = @sourceIdentity,
+            audit_timestamp = @auditTimestamp,
             updated_at = @updatedAt,
             settled_at = @updatedAt
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
           AND state NOT IN ('reserved', 'preparing', 'not-submitted')
+      `),
+      acknowledgePresentation: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET presentation_attempt_id = @attemptId,
+            presentation_provider = @provider,
+            presentation_session_id = @sessionId,
+            presentation_entry_uuid = @entryUuid,
+            presentation_source_identity = @sourceIdentity,
+            presentation_at = @acknowledgedAt
+        WHERE operation_key = @operationKey
+          AND attempt_id = @attemptId
+          AND surface = @surface
+          AND state = 'confirmed'
+          AND presentation_at IS NULL
       `),
       startupInFlight: this.db.prepare(`
         SELECT * FROM ${TABLE_NAME}
@@ -764,13 +834,25 @@ class AgentSendReceiptStore {
           record,
         };
       }
-      if (record.state === STORE_STATES.CONFIRMED) {
+      if (record.state === STORE_STATES.CONFIRMED && record.auditIdentity) {
+        const sameExactRow = record.auditIdentity.entryUuid
+          ? record.auditIdentity.entryUuid === audit.entryUuid
+            && (!record.auditIdentity.sourceIdentity
+              || !audit.sourceIdentity
+              || record.auditIdentity.sourceIdentity === audit.sourceIdentity)
+          : !!record.auditIdentity.sourceIdentity
+            && record.auditIdentity.sourceIdentity === audit.sourceIdentity;
+        const sameAuditIdentity = record.auditIdentity.attemptId === audit.attemptId
+          && record.auditIdentity.provider === audit.provider
+          && record.auditIdentity.sessionId === audit.sessionId
+          && record.auditIdentity.promptHash === audit.actualHash
+          && sameExactRow;
         return {
-          ok: true,
+          ok: sameAuditIdentity,
           matched: true,
           promoted: false,
-          idempotent: true,
-          reason: 'already-confirmed',
+          idempotent: sameAuditIdentity,
+          reason: sameAuditIdentity ? 'already-confirmed' : 'confirmed-audit-identity-conflict',
           record,
         };
       }
@@ -784,7 +866,7 @@ class AgentSendReceiptStore {
         };
       }
       const updatedAt = this.now();
-      const auditTimestamp = audit.auditTimestamp || updatedAt;
+      const auditTimestamp = audit.auditTimestamp || new Date(updatedAt).toISOString();
       const receipt = {
         ...(record.receipt || {}),
         ok: true,
@@ -800,7 +882,10 @@ class AgentSendReceiptStore {
         tabId: record.tabId,
         handoffId: record.handoffId,
         provider: record.provider || audit.provider,
-        sessionId: record.sessionId || audit.sessionId,
+        // The transcript record owns the final writer session. A reservation
+        // can still carry the pre-Resume session while the accepted record is
+        // written by its child.
+        sessionId: audit.sessionId,
         promptHash: record.promptHash,
         actualHash: audit.actualHash,
         expectedHash: audit.expectedHash,
@@ -808,6 +893,7 @@ class AgentSendReceiptStore {
         canonicalReason: audit.canonicalReason,
         auditTimestamp,
         entryUuid: audit.entryUuid,
+        sourceIdentity: audit.sourceIdentity,
       };
       const info = this.statements.promote.run({
         operationKey: record.operationKey,
@@ -816,6 +902,8 @@ class AgentSendReceiptStore {
         sessionId: audit.sessionId,
         promptHash: audit.actualHash,
         entryUuid: audit.entryUuid,
+        sourceIdentity: audit.sourceIdentity,
+        auditTimestamp,
         receiptJson: encodeJson(receipt),
         transcriptBoundaryJson: encodeJson(audit.transcriptBoundary),
         updatedAt,
@@ -826,6 +914,104 @@ class AgentSendReceiptStore {
         promoted: info.changes === 1,
         reason: info.changes === 1 ? null : 'state-changed',
         record: this._record(record.operationKey),
+      };
+    })();
+  }
+
+  acknowledgePresentation(input = {}) {
+    let operationKey;
+    let attemptId;
+    let surface;
+    let tabId;
+    let handoffId;
+    let provider;
+    let sessionId;
+    let entryUuid;
+    let sourceIdentity;
+    try {
+      operationKey = requiredString(input.operationKey, 'operationKey');
+      attemptId = requiredString(input.attemptId, 'attemptId');
+      surface = requiredString(input.surface, 'surface');
+      tabId = requiredString(input.tabId, 'tabId');
+      handoffId = requiredString(input.handoffId, 'handoffId');
+      provider = requiredString(input.provider, 'provider');
+      sessionId = requiredString(input.sessionId, 'sessionId');
+      entryUuid = optionalString(input.entryUuid);
+      sourceIdentity = optionalString(input.sourceIdentity);
+    } catch (error) {
+      return { ok: false, applied: false, reason: 'invalid-presentation-ack', error: error.message };
+    }
+    return this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
+      if (record.attemptId !== attemptId) {
+        return { ok: false, applied: false, stale: true, reason: 'stale-attempt', record };
+      }
+      if (record.surface !== surface) {
+        return { ok: false, applied: false, reason: 'surface-mismatch', record };
+      }
+      if (record.tabId !== tabId || record.handoffId !== handoffId) {
+        return { ok: false, applied: false, reason: 'handoff-identity-mismatch', record };
+      }
+      if (record.state !== STORE_STATES.CONFIRMED) {
+        return { ok: false, applied: false, reason: 'delivery-not-confirmed', record };
+      }
+      if (record.provider && record.provider !== provider) {
+        return { ok: false, applied: false, reason: 'provider-mismatch', record };
+      }
+      const exactAuditSessionId = optionalString(record.auditIdentity?.sessionId)
+        || optionalString(record.sessionId);
+      if (exactAuditSessionId && exactAuditSessionId !== sessionId) {
+        return { ok: false, applied: false, reason: 'session-mismatch', record };
+      }
+
+      const auditEntryUuid = optionalString(record.auditIdentity?.entryUuid);
+      const auditSourceIdentity = optionalString(record.auditIdentity?.sourceIdentity);
+      if (!auditEntryUuid && !auditSourceIdentity) {
+        return { ok: false, applied: false, reason: 'exact-audit-identity-missing', record };
+      }
+      if (auditEntryUuid && entryUuid !== auditEntryUuid) {
+        return { ok: false, applied: false, reason: 'entry-uuid-mismatch', record };
+      }
+      if (!auditEntryUuid && auditSourceIdentity && sourceIdentity !== auditSourceIdentity) {
+        return { ok: false, applied: false, reason: 'source-identity-mismatch', record };
+      }
+      if (auditEntryUuid && auditSourceIdentity && sourceIdentity
+        && sourceIdentity !== auditSourceIdentity) {
+        return { ok: false, applied: false, reason: 'source-identity-mismatch', record };
+      }
+
+      if (record.presentation) {
+        const sameIdentity = record.presentation.attemptId === attemptId
+          && record.presentation.provider === provider
+          && record.presentation.sessionId === sessionId
+          && (record.presentation.entryUuid || null) === (entryUuid || null)
+          && (record.presentation.sourceIdentity || null) === (sourceIdentity || null);
+        return {
+          ok: sameIdentity,
+          applied: false,
+          idempotent: sameIdentity,
+          reason: sameIdentity ? 'already-acknowledged' : 'presentation-identity-conflict',
+          record,
+        };
+      }
+
+      const acknowledgedAt = this.now();
+      const info = this.statements.acknowledgePresentation.run({
+        operationKey,
+        attemptId,
+        surface,
+        provider,
+        sessionId,
+        entryUuid,
+        sourceIdentity,
+        acknowledgedAt,
+      });
+      return {
+        ok: info.changes === 1,
+        applied: info.changes === 1,
+        reason: info.changes === 1 ? null : 'presentation-state-changed',
+        record: this._record(operationKey),
       };
     })();
   }

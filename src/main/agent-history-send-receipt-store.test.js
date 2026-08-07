@@ -91,10 +91,33 @@ test('desktop History exact receipt survives SQLite reopen and never authorizes 
     promptHash: 'transport-hash',
     expectedHash: 'transport-hash',
     entryUuid: 'user-turn-exact',
+    auditTimestamp: '2026-08-07T06:46:46.000Z',
     transcriptBoundary: { byteOffset: 80, line: 4 },
   });
   assert.equal(promoted.promoted, true);
   assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
+  const acknowledged = store.acknowledgePresentation({
+    operationKey: identity.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-history',
+    handoffId: 'handoff-history',
+    provider: 'claude',
+    sessionId: 'session-history',
+    entryUuid: 'user-turn-exact',
+  });
+  assert.equal(acknowledged.applied, true);
+
+  db.close();
+  db = new Database(filename);
+  store = createAgentSendReceiptStore(db, {
+    randomUUID: () => {
+      throw new Error('presentation replay must not allocate another physical attempt');
+    },
+  });
+  const persisted = store.get(identity.operationKey);
+  assert.equal(persisted.presentation.entryUuid, 'user-turn-exact');
+  assert.equal(persisted.presentation.attemptId, attempt.attemptId);
 
   const confirmedReplay = store.beginAttempt(identity);
   assert.equal(confirmedReplay.action, 'replay');

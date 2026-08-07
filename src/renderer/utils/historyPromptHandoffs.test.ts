@@ -5,6 +5,7 @@ import {
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   HistoryPromptHandoffStore,
   consumeHistoryPromptHandoff,
+  durableHistorySendReceiptMatchesCanonicalEntry,
   getHistoryPromptHandoffsSnapshot,
   hydrateHistoryPromptHandoffFromDurableReceipt,
   historyPromptHandoffStatusPresentation,
@@ -902,6 +903,138 @@ test('durable confirmation hydrates as one final SENT snapshot without transient
   assert.deepEqual(observedStatuses, ['sent']);
   assert.equal(outcome.handoff?.queueStatus, 'sent');
   unsubscribe();
+  consumeHistoryPromptHandoff(tabId, handoffId);
+});
+
+test('durable presentation matching uses exact Claude UUID or Codex source identity only', () => {
+  const claudeReceipt = {
+    operationKey: 'history:tab-a:claude-a',
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'claude-a',
+    provider: 'claude',
+    sessionId: 'session-a',
+    state: 'confirmed',
+    attemptId: 'attempt-claude',
+    auditIdentity: {
+      entryUuid: 'claude-user-exact',
+      sourceIdentity: null,
+    },
+  };
+  assert.equal(durableHistorySendReceiptMatchesCanonicalEntry(claudeReceipt, {
+    uuid: 'claude-user-exact',
+    sessionId: 'session-a',
+  }), true);
+  assert.equal(durableHistorySendReceiptMatchesCanonicalEntry(claudeReceipt, {
+    uuid: 'claude-user-foreign',
+    sessionId: 'session-a',
+  }), false);
+
+  const codexReceipt = {
+    ...claudeReceipt,
+    handoffId: 'codex-a',
+    provider: 'codex',
+    attemptId: 'attempt-codex',
+    auditIdentity: {
+      entryUuid: null,
+      sourceIdentity: 'codex-user-source-session-a-4096',
+    },
+  };
+  assert.equal(durableHistorySendReceiptMatchesCanonicalEntry(codexReceipt, {
+    uuid: 'any-canonical-row-id',
+    sessionId: 'session-a',
+    sourceIdentity: 'codex-user-source-session-a-4096',
+  }), true);
+  assert.equal(durableHistorySendReceiptMatchesCanonicalEntry(codexReceipt, {
+    uuid: 'same-text-is-not-proof',
+    sessionId: 'session-a',
+    sourceIdentity: 'codex-user-source-session-a-8192',
+  }), false);
+  assert.equal(durableHistorySendReceiptMatchesCanonicalEntry({
+    ...codexReceipt,
+    presentation: { acknowledgedAt: 1 },
+  }, {
+    sourceIdentity: 'codex-user-source-session-a-4096',
+  }), false);
+});
+
+test('acknowledged and legacy confirmed receipts never recreate an unconsumable SENT row', () => {
+  const base = {
+    operationKey: 'history:tab-legacy:handoff-legacy',
+    surface: 'desktop-history',
+    tabId: 'tab-legacy',
+    handoffId: 'handoff-legacy',
+    provider: 'codex',
+    sessionId: 'session-legacy',
+    state: 'confirmed',
+    attemptId: 'attempt-legacy',
+    updatedAt: 240,
+    receipt: {
+      promptText: 'already delivered',
+      actualHash: 'hash-legacy',
+      auditTimestamp: '2026-08-06T12:00:00.000Z',
+    },
+  };
+  assert.equal(
+    hydrateHistoryPromptHandoffFromDurableReceipt(base).reason,
+    'durable-history-confirmed-identity-missing',
+  );
+  assert.equal(
+    hydrateHistoryPromptHandoffFromDurableReceipt({
+      ...base,
+      receipt: {
+        ...base.receipt,
+        sourceIdentity: 'codex-user-source-session-legacy-4096',
+        auditTimestamp: 1_786_105_206_500,
+      },
+    }).reason,
+    'durable-history-confirmed-proof-incomplete',
+  );
+  assert.equal(
+    hydrateHistoryPromptHandoffFromDurableReceipt({
+      ...base,
+      receipt: {
+        ...base.receipt,
+        sourceIdentity: 'codex-user-source-session-legacy-4096',
+      },
+      presentation: {
+        attemptId: 'attempt-legacy',
+        provider: 'codex',
+        sessionId: 'session-legacy',
+        sourceIdentity: 'codex-user-source-session-legacy-4096',
+        acknowledgedAt: 1,
+      },
+    }).reason,
+    'durable-history-presentation-already-materialized',
+  );
+  assert.deepEqual(getHistoryPromptHandoffsSnapshot('tab-legacy'), []);
+});
+
+test('Codex durable confirmation keeps its restart-stable source identity in the SENT proof', () => {
+  const tabId = 'tab-codex-confirmed';
+  const handoffId = 'handoff-codex-confirmed';
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey: `history:${tabId}:${handoffId}`,
+    surface: 'desktop-history',
+    tabId,
+    handoffId,
+    provider: 'codex',
+    sessionId: 'session-codex',
+    state: 'confirmed',
+    attemptId: 'attempt-codex',
+    updatedAt: 240,
+    receipt: {
+      promptText: 'confirmed Codex prompt',
+      actualHash: 'hash-codex',
+      auditTimestamp: '2026-08-07T06:46:46.000Z',
+      sourceIdentity: 'codex-user-source-session-codex-4096',
+    },
+  });
+  assert.equal(outcome.hydrated, true);
+  assert.equal(
+    outcome.handoff?.auditProof?.sourceIdentity,
+    'codex-user-source-session-codex-4096',
+  );
   consumeHistoryPromptHandoff(tabId, handoffId);
 });
 

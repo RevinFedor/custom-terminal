@@ -335,6 +335,7 @@ function makeAudit(context, {
   actualText,
   actualHash,
   entryUuid = null,
+  sourceIdentity = null,
   timestamp = null,
   canonicalReason = null,
 } = {}) {
@@ -353,6 +354,7 @@ function makeAudit(context, {
     canonicalized: !!canonicalReason,
     canonicalReason,
     entryUuid: cleanString(entryUuid) || null,
+    sourceIdentity: cleanString(sourceIdentity) || null,
     transcriptBoundary: context.boundary,
     auditTimestamp: numericTimestamp(timestamp),
   };
@@ -540,6 +542,7 @@ async function reconcileCodex(context, maxReadBytes) {
     actualText: match.actualText,
     actualHash: match.actualHash,
     entryUuid: match.candidate.record?.uuid || match.candidate.record?.id,
+    sourceIdentity: `codex-user-source-${context.sessionId}-${match.candidate.byteOffset}`,
     timestamp: match.candidate.record?.timestamp,
     canonicalReason: match.canonicalReason,
   });
