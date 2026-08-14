@@ -5,9 +5,23 @@ const test = require('node:test');
 
 const {
   inferAgentModelProvider,
+  resolveConfiguredAgentModel,
   resolveAgentProvider,
   validateAgentProviderModel,
 } = require('./agent-provider-model-contract');
+
+const configuredClaudeModels = [
+  {
+    key: 'opus-200k',
+    id: 'claude-opus-5',
+    label: 'Opus 5 (200K context)',
+  },
+  {
+    key: 'opus',
+    id: 'claude-opus-5[1m]',
+    label: 'Opus 5 (1M context)',
+  },
+];
 
 test('known Claude and Codex model families are identified without a closed model allowlist', () => {
   assert.equal(inferAgentModelProvider('claude-opus-5[1m]'), 'claude');
@@ -58,4 +72,84 @@ test('provider aliases cannot conflict or silently fall back from invalid input'
     () => resolveAgentProvider({ toolType: 'gemini' }),
     (error) => error?.code === 'invalid_agent_provider',
   );
+});
+
+test('exact configured Claude ids preserve the 200K versus 1M variant', () => {
+  assert.equal(resolveConfiguredAgentModel({
+    provider: 'claude',
+    model: 'claude-opus-5',
+    configuredModels: configuredClaudeModels,
+  }).model, 'claude-opus-5');
+  assert.equal(resolveConfiguredAgentModel({
+    provider: 'claude',
+    model: 'claude-opus-5[1m]',
+    configuredModels: configuredClaudeModels,
+  }).model, 'claude-opus-5[1m]');
+});
+
+test('a unique Settings key or display name resolves to its exact model id', () => {
+  assert.deepEqual(resolveConfiguredAgentModel({
+    provider: 'claude',
+    model: 'opus',
+    configuredModels: configuredClaudeModels,
+  }), {
+    ok: true,
+    provider: 'claude',
+    model: 'claude-opus-5[1m]',
+    modelProvider: 'claude',
+    requestedModel: 'opus',
+    resolution: 'settings-alias',
+  });
+  assert.equal(resolveConfiguredAgentModel({
+    provider: 'claude',
+    model: 'Opus 5 (1M context)',
+    configuredModels: configuredClaudeModels,
+  }).model, 'claude-opus-5[1m]');
+});
+
+test('a Settings key is resolved before provider validation of the exact model id', () => {
+  assert.equal(resolveConfiguredAgentModel({
+    provider: 'claude',
+    model: 'gpt-shaped-user-key',
+    configuredModels: [{
+      key: 'gpt-shaped-user-key',
+      id: 'claude-opus-5[1m]',
+      label: 'Private Opus',
+    }],
+  }).model, 'claude-opus-5[1m]');
+});
+
+test('an ambiguous display alias fails instead of choosing a context variant', () => {
+  const sameDisplayName = configuredClaudeModels.map((row) => ({
+    ...row,
+    label: 'Opus 5',
+  }));
+  assert.throws(
+    () => resolveConfiguredAgentModel({
+      provider: 'claude',
+      model: 'Opus 5',
+      configuredModels: sameDisplayName,
+    }),
+    (error) => error?.code === 'agent_model_alias_ambiguous'
+      && error?.statusCode === 400
+      && error?.candidates?.includes('claude-opus-5')
+      && error?.candidates?.includes('claude-opus-5[1m]'),
+  );
+});
+
+test('an exact configured id wins over an alias collision and unknown custom ids remain available', () => {
+  const catalog = [
+    { key: 'native-opus', id: 'opus', label: 'Native alias' },
+    { key: 'opus', id: 'claude-opus-5[1m]', label: 'Opus 5 (1M context)' },
+  ];
+  assert.equal(resolveConfiguredAgentModel({
+    provider: 'claude',
+    model: 'opus',
+    configuredModels: catalog,
+  }).model, 'opus');
+  assert.equal(resolveConfiguredAgentModel({
+    provider: 'claude',
+    model: 'private-router-model',
+    configuredModels: configuredClaudeModels,
+  }).model, 'private-router-model');
 });

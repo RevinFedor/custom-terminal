@@ -16,7 +16,11 @@ const {
   historyPayloadStash,
   capPayloadForRender,
 } = require('./history-payload-dehydrate');
-const { applyHistoryEntryWindow } = require('./history-entry-window');
+const {
+  applyHistoryEntryWindow,
+  applyHistoryRowWindow,
+  normalizeHistoryRowWindowRequest,
+} = require('./history-entry-window');
 const {
   diffHistoryEntriesAgainstDigest,
   HistoryDeltaDigestStore,
@@ -149,6 +153,7 @@ class SessionTranscriptService {
     getMainWindow,
     webBroadcast,
     onChanged = null,
+    onLiveMessage = null,
     resolveClaudePromptOwner = null,
     claudeData,
     codexData,
@@ -159,6 +164,7 @@ class SessionTranscriptService {
     this.getMainWindow = getMainWindow;
     this.webBroadcast = webBroadcast;
     this.onChanged = typeof onChanged === 'function' ? onChanged : null;
+    this.onLiveMessage = typeof onLiveMessage === 'function' ? onLiveMessage : null;
     this.resolveClaudePromptOwner = typeof resolveClaudePromptOwner === 'function'
       ? resolveClaudePromptOwner
       : null;
@@ -192,6 +198,7 @@ class SessionTranscriptService {
     ipcMain.handle('agent-transcript:get-history', async (_event, payload = {}) => this.getHistory(payload));
     ipcMain.handle('agent-transcript:get-messages', async (_event, payload = {}) => this.getMessages(payload));
     ipcMain.handle('history:get-tool-payload', async (_event, payload = {}) => this.getToolPayload(payload));
+    ipcMain.handle('agent-transcript:search-history', async (_event, payload = {}) => this.searchHistory(payload));
   }
 
   /**
@@ -245,6 +252,69 @@ class SessionTranscriptService {
     const capped = capPayloadForRender(rebuilt);
     console.log(`[FullHistory:Rehydrate] session=${String(sessionId).slice(0, 8)} payload=${payloadId.slice(0, 24)} source=rebuild bytes=${rebuilt.length}`);
     return { success: true, source: 'rebuild', payloadId, ...capped };
+  }
+
+  /**
+   * Cmd+F over the FULL projection, in main.
+   *
+   * The panel used to scan `entry.content` of every row it held. With
+   * row-level hydration a far-away row travels as an identity stub, so a
+   * renderer-side scan would silently miss matches — worse than slow: the
+   * user would conclude the text is not there. Main always holds the whole
+   * projection (that is what the file-cursor projector is), so the scan
+   * belongs here.
+   *
+   * Returns row identities + offsets only, never row content: the caller
+   * scrolls to the row, and hydration delivers the text through the normal
+   * window path.
+   */
+  async searchHistory(payload = {}) {
+    const toolType = normalizeToolType(payload.toolType);
+    const sessionId = payload.sessionId;
+    const query = typeof payload.query === 'string' ? payload.query : '';
+    if (!sessionId) return { success: false, error: 'sessionId required', matches: [] };
+    if (query.length < 2) return { success: true, matches: [], total: 0, truncated: false };
+    if (toolType !== 'codex') {
+      // Claude keeps its renderer-side scan: its projections are small enough
+      // to hold whole, and it has no row-window path yet.
+      return { success: false, error: 'search unsupported for this toolType', matches: [] };
+    }
+    const projectFromFile = this.codexData?._api?.projectCodexFullHistoryFromFile;
+    if (typeof projectFromFile !== 'function') {
+      return { success: false, error: 'codex projector unavailable', matches: [] };
+    }
+    const startedAt = Date.now();
+    const projected = await projectFromFile(sessionId, payload.cwd);
+    if (!projected?.success) return { success: false, error: projected?.error || 'projection failed', matches: [] };
+    const limit = Math.max(1, Math.min(5000, Number(payload.limit) || 2000));
+    const needle = query.toLowerCase();
+    const matches = [];
+    let total = 0;
+    const entries = projected.entries || [];
+    for (let index = 0; index < entries.length; index += 1) {
+      const text = String(entries[index]?.content || '').toLowerCase();
+      if (!text) continue;
+      let at = text.indexOf(needle);
+      while (at !== -1) {
+        total += 1;
+        if (matches.length < limit) {
+          matches.push({ entryIndex: index, entryUuid: entries[index].uuid, offset: at });
+        }
+        at = text.indexOf(needle, at + 1);
+      }
+    }
+    console.log('[TranscriptService:HistorySearch] session=' + shortId(sessionId)
+      + ' rows=' + entries.length
+      + ' matches=' + total
+      + ' returned=' + matches.length
+      + ' ms=' + (Date.now() - startedAt));
+    return {
+      success: true,
+      matches,
+      total,
+      truncated: total > matches.length,
+      rows: entries.length,
+    };
   }
 
   async subscribe(payload = {}) {
@@ -341,22 +411,43 @@ class SessionTranscriptService {
         }
       }
       const startedAt = Date.now();
-      const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
-      if (!loaded?.success) return loaded || { success: false, error: 'codex parser unavailable', entries: [] };
+      // Same file-cursor projector family as getHistory: a Timeline refresh
+      // of a live giant reads only the appended bytes. Falls back to
+      // load+one-shot when the incremental API is absent (minimal stubs).
+      const projectTimeline = this.codexData?._api?.projectCodexTimelineFromFile;
+      let entries;
+      let sessionMeta;
+      let timelineFilePath;
+      let timelineSnapshot = null;
+      let loadedRecordCount = -1;
+      if (typeof projectTimeline === 'function') {
+        const projected = await projectTimeline(sessionId, cwd);
+        if (!projected?.success) return projected || { success: false, error: 'codex parser unavailable', entries: [] };
+        entries = projected.entries;
+        sessionMeta = projected.sessionMeta;
+        timelineFilePath = projected.filePath;
+        timelineSnapshot = projected.sourceSnapshot || null;
+      } else {
+        const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
+        if (!loaded?.success) return loaded || { success: false, error: 'codex parser unavailable', entries: [] };
+        entries = this.codexData._api.buildCodexTimeline(loaded.records || [], sessionId);
+        sessionMeta = this.codexData._api.getTimelineSessionMeta(loaded.records || []);
+        timelineFilePath = loaded.filePath;
+        timelineSnapshot = loaded.sourceSnapshot || null;
+        loadedRecordCount = loaded.records?.length || 0;
+      }
       const loadedAt = Date.now();
-      const entries = this.codexData._api.buildCodexTimeline(loaded.records || [], sessionId);
       const presentedEntries = decorateHistoryPromptPresentations(this.promptPresentationStore, {
         toolType,
         sessionId,
         entries,
       });
-      const sessionMeta = this.codexData._api.getTimelineSessionMeta(loaded.records || []);
       const finalPresentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
         : 'none';
       const revision = buildHistoryRevision(
         { toolType, sessionId, cwd },
-        loaded.sourceSnapshot ? [loaded.sourceSnapshot] : [],
+        timelineSnapshot ? [timelineSnapshot] : [],
         {
           context: JSON.stringify({ promptPresentationRevision: finalPresentationRevision }),
         }
@@ -365,7 +456,7 @@ class SessionTranscriptService {
       if (finishedAt - startedAt >= 50) {
         console.log('[TranscriptService:TimelineProjection] tool=codex' +
           ' session=' + shortId(sessionId) +
-          ' records=' + (loaded.records?.length || 0) +
+          (loadedRecordCount >= 0 ? ' records=' + loadedRecordCount : '') +
           ' entries=' + presentedEntries.length +
           ' loadMs=' + (loadedAt - startedAt) +
           ' projectMs=' + (finishedAt - loadedAt) +
@@ -378,7 +469,7 @@ class SessionTranscriptService {
         sessionMeta,
         sessionBoundaries: [],
         claudeMemoryBoundaryUuid: null,
-        filePath: loaded.filePath,
+        filePath: timelineFilePath,
         revision,
       };
     }
@@ -404,6 +495,12 @@ class SessionTranscriptService {
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
     if (toolType === 'codex') {
+      // File identity alone cannot describe a row-window response. The file
+      // may be unchanged while the visible range asks main to turn a different
+      // set of identity stubs into full rows. Bind that projection identity to
+      // the revision so the O(stat) unchanged path remains valid only for the
+      // SAME hydration request.
+      const rowWindowRequest = normalizeHistoryRowWindowRequest(payload.hydrate);
       const presentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
         : 'none';
@@ -413,6 +510,7 @@ class SessionTranscriptService {
       const revisionContext = JSON.stringify({
         promptPresentationRevision: presentationRevision,
         responseTimingRevision,
+        rowWindowRequest,
       });
       if (payload.ifRevision) {
         const validation = await validateHistoryRevision(
@@ -439,9 +537,34 @@ class SessionTranscriptService {
           };
         }
       }
-      const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
-      if (!loaded?.success) return loaded || { success: false, error: 'codex parser unavailable', entries: [] };
-      const entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
+      // Incremental projection: a live-session refresh reads only the bytes
+      // appended since the cached projector's file cursor instead of
+      // re-loading and replaying all 74K records of a giant rollout
+      // (~3.5s → ~ms), and does not require the parsed records array to stay
+      // cached at all. Restricted to dehydrate consumers (the desktop
+      // panel): dehydration mutates the cached projector's shared action
+      // objects into previews+refs, which is stable across dehydrating calls
+      // but would poison a full-payload consumer (web/iOS) — those keep the
+      // fresh one-shot build, as does getToolPayload's stash rebuild below
+      // for the same reason. Falls back to load+one-shot when the
+      // incremental API is absent (minimal test stubs).
+      const projectFromFile = this.codexData?._api?.projectCodexFullHistoryFromFile;
+      let entries;
+      let loadedFilePath;
+      let projectedSnapshot = null;
+      if (payload.dehydrate === true && typeof projectFromFile === 'function') {
+        const projected = await projectFromFile(sessionId, cwd);
+        if (!projected?.success) return projected || { success: false, error: 'codex parser unavailable', entries: [] };
+        entries = projected.entries;
+        loadedFilePath = projected.filePath;
+        projectedSnapshot = projected.sourceSnapshot || null;
+      } else {
+        const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
+        if (!loaded?.success) return loaded || { success: false, error: 'codex parser unavailable', entries: [] };
+        entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
+        loadedFilePath = loaded.filePath;
+        projectedSnapshot = loaded.sourceSnapshot || null;
+      }
       // Heavy payloads (tool outputs, thinking, compact snapshots) leave main
       // as previews + refs; the renderer pulls full text on expand through
       // history:get-tool-payload. OPT-IN per call: web/iOS consumers of this
@@ -495,14 +618,33 @@ class SessionTranscriptService {
         : 'none';
       const revision = buildHistoryRevision(
         { toolType, sessionId, cwd },
-        loaded.sourceSnapshot ? [loaded.sourceSnapshot] : [],
+        projectedSnapshot ? [projectedSnapshot] : [],
         {
           context: JSON.stringify({
             promptPresentationRevision: finalPresentationRevision,
             responseTimingRevision: finalResponseTimingRevision,
+            rowWindowRequest,
           }),
         }
       );
+      // Row-level windowing: the row LIST stays full length (geometry,
+      // anchors, mount wave and Timeline index lookup all address rows by
+      // position), but rows outside the hydrated span travel as identity
+      // stubs. A 15.5K-row giant costs ~150MB of presentation in the
+      // renderer; stubs bring that to ~1.5MB + the hydrated span. Opt-in via
+      // `hydrate` so web/iOS and any consumer without a stub renderer keep
+      // full rows.
+      const rowWindow = applyHistoryRowWindow(timedEntries, rowWindowRequest);
+      if (rowWindow.rowWindowApplied) {
+        console.log('[TranscriptService:HistoryRows] session=' + shortId(sessionId)
+          + ' tab=' + String(payload.tabId || '-').slice(-12)
+          + ' rows=' + rowWindow.total
+          + ' hydrated=' + rowWindow.hydratedCount
+          + ' stubbed=' + rowWindow.stubbedCount
+          + ' span=' + rowWindow.hydratedFrom + '-' + rowWindow.hydratedTo
+          + (rowWindow.centerMissing ? ' centerMissing=1' : ''));
+      }
+      const historyWindow = applyHistoryEntryWindow(rowWindow.entries, payload.bounds);
       // Delta transport. A live session refresh used to reship the ENTIRE
       // projection (15,352 rows / ~70MB for one appended tool result —
       // tab-3163, 06.08 11:37, LOAD_APPLY 4733ms during switch+scroll). When
@@ -510,10 +652,15 @@ class SessionTranscriptService {
       // rows whose fingerprint moved travel; the renderer reassembles the
       // array from its previous object references (see history-delta.js).
       // Digest maintenance is opt-in (deltaOk) so web/iOS consumers that can
-      // never use a delta don't pay the fingerprint pass, and bounded
-      // requests are excluded — a windowed renderer doesn't hold the full
-      // projection the digest would describe.
-      const deltaEligible = payload.deltaOk === true && !payload.bounds;
+      // never use a delta don't pay the fingerprint pass.
+      //
+      // The digest describes the WINDOW the caller received, not the whole
+      // projection — a windowed panel holds exactly those rows, and diffing
+      // against anything else would name rows it cannot supply. A caller that
+      // changes its window bounds gets a full window back (its digest is
+      // keyed to the previous revision AND to that window's row set, so the
+      // order comparison below fails closed).
+      const deltaEligible = payload.deltaOk === true && !historyWindow.anchorMissing;
       if (deltaEligible) {
         const digestStartedAt = Date.now();
         const prevDigest = payload.ifRevision?.token
@@ -522,18 +669,26 @@ class SessionTranscriptService {
         const matchedDigest = prevDigest && prevDigest.revisionToken === payload.ifRevision.token
           ? prevDigest
           : null;
-        const diff = diffHistoryEntriesAgainstDigest(matchedDigest, timedEntries);
+        const diff = diffHistoryEntriesAgainstDigest(matchedDigest, historyWindow.entries);
         this.historyDeltaDigests.set(toolType, sessionId, payload.tabId || null, {
           revisionToken: revision?.token || '',
           order: diff.order,
           fingerprints: diff.fingerprints,
         });
-        if (matchedDigest && revision?.token) {
+        // A window whose first row is NEW to the digest is a different window
+        // (scrolled up, jumped, or the tail slid past what the caller holds):
+        // the caller cannot rebuild it from rows it never received, so send
+        // the whole window instead of a delta.
+        const windowIsContinuation = matchedDigest
+          && diff.order.length > 0
+          && matchedDigest.fingerprints.has(diff.order[0]);
+        if (matchedDigest && revision?.token && windowIsContinuation) {
           console.log('[TranscriptService:HistoryDelta] session=' + shortId(sessionId)
             + ' tab=' + String(payload.tabId || '-').slice(-12)
-            + ' rows=' + timedEntries.length
+            + ' rows=' + historyWindow.entries.length
             + ' changed=' + diff.changed.length
             + ' unchanged=' + diff.unchangedCount
+            + ' windowed=' + (historyWindow.boundsApplied ? '1' : '0')
             + ' diffMs=' + (Date.now() - digestStartedAt));
           return {
             success: true,
@@ -541,26 +696,48 @@ class SessionTranscriptService {
             delta: true,
             changedEntries: diff.changed,
             order: diff.order,
-            total: timedEntries.length,
+            total: historyWindow.total,
+            startIndex: historyWindow.startIndex,
+            boundsApplied: historyWindow.boundsApplied,
+            hasMoreAbove: historyWindow.hasMoreAbove,
+            hasMoreBelow: historyWindow.hasMoreBelow,
             claudeMemoryBoundaryUuid: null,
-            filePath: loaded.filePath,
+            filePath: loadedFilePath,
             revision,
           };
         }
       }
-      const historyWindow = applyHistoryEntryWindow(timedEntries, payload.bounds);
+      if (historyWindow.boundsApplied) {
+        console.log('[TranscriptService:HistoryWindow] session=' + shortId(sessionId)
+          + ' tab=' + String(payload.tabId || '-').slice(-12)
+          + ' rows=' + historyWindow.entries.length
+          + ' total=' + historyWindow.total
+          + ' startIndex=' + historyWindow.startIndex
+          + ' above=' + (historyWindow.hasMoreAbove ? '1' : '0')
+          + ' below=' + (historyWindow.hasMoreBelow ? '1' : '0')
+          + (historyWindow.anchorMissing ? ' anchorMissing=1' : ''));
+      }
       return {
         success: true,
         unchanged: false,
         entries: historyWindow.entries,
         total: historyWindow.total,
+        startIndex: historyWindow.startIndex,
         dropped: historyWindow.dropped,
         truncated: historyWindow.truncated,
         boundsApplied: historyWindow.boundsApplied,
+        hasMoreAbove: historyWindow.hasMoreAbove,
+        hasMoreBelow: historyWindow.hasMoreBelow,
+        anchorMissing: historyWindow.anchorMissing === true,
+        rowWindowApplied: rowWindow.rowWindowApplied,
+        hydratedFrom: rowWindow.hydratedFrom,
+        hydratedTo: rowWindow.hydratedTo,
+        hydratedCount: rowWindow.hydratedCount,
+        stubbedCount: rowWindow.stubbedCount,
         firstUuid: historyWindow.firstUuid,
         lastUuid: historyWindow.lastUuid,
         claudeMemoryBoundaryUuid: null,
-        filePath: loaded.filePath,
+        filePath: loadedFilePath,
         revision,
       };
     }
@@ -930,6 +1107,7 @@ class SessionTranscriptService {
     for (const line of lines) {
       const recordByteOffset = lineByteOffset;
       lineByteOffset += Buffer.byteLength(line) + 1;
+      const recordEndByteOffset = lineByteOffset;
       if (!line.trim()) continue;
       let record;
       try {
@@ -958,7 +1136,6 @@ class SessionTranscriptService {
       if (isClaudePendingThinkingRecord(record)) {
         record.livePendingThinking = true;
       }
-      if (!mainWindow || mainWindow.isDestroyed()) continue;
       // History, Timeline and the control bar can all subscribe to the same
       // session for one tab. A JSONL record is a tab event, not a subscriber
       // event: replaying `dequeue` once per consumer advances multiple queued
@@ -984,16 +1161,28 @@ class SessionTranscriptService {
               + shortId(tabId) + ' error=' + (error?.message || error));
           }
         }
-        mainWindow.webContents.send('agent-transcript:live-message', {
+        const detail = {
           tabId,
           toolType: 'claude',
           sessionId: state.sessionId,
           timestamp: record.timestamp || new Date().toISOString(),
           recordByteOffset,
+          recordEndByteOffset,
           message: record,
           ...(promptOwner ? { promptOwner } : {}),
-        });
-        sent += 1;
+        };
+        if (this.onLiveMessage) {
+          try {
+            this.onLiveMessage(detail);
+          } catch (error) {
+            console.warn('[TranscriptService:ClaudeDelta] live observer failed tab='
+              + shortId(tabId) + ' error=' + (error?.message || error));
+          }
+        }
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('agent-transcript:live-message', detail);
+          sent += 1;
+        }
       }
     }
     console.log('[TranscriptService:ClaudeDelta] session=' + shortId(state.sessionId)

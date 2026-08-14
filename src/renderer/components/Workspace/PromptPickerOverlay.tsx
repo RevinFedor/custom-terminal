@@ -618,6 +618,21 @@ const PromptPickerOverlay: React.FC = () => {
     const effectiveId = state.getEffectiveTabId();
     if (!effectiveId) return null;
     const owner = resolveTabOwner(effectiveId);
+    // WHERE THE CARET IS, not what is on screen.
+    //
+    // In terminal-primary the History composer is docked and permanently
+    // visible by design, so "a composer exists" was true even while the user was
+    // typing in the terminal — and the prompt arrived as an attached chip in the
+    // untouched transcript draft instead of as text in the terminal.
+    //
+    // The app already records which of a tab's two inputs the user last touched
+    // (promptQueueInputSurfaceTabs, written by the terminal's own pointer-down
+    // and by the History composer). Same source as Run after's grab/Replay, so
+    // one gesture cannot mean two different targets on the same tab.
+    const focusedSurface = useUIStore.getState().promptQueueInputSurfaceTabs[effectiveId];
+    if (focusedSurface === 'terminal' && owner.tabType !== 'claude-sdk') {
+      return { tabId: effectiveId, projectId: owner.projectId, surface: 'terminal', agent: owner.agent };
+    }
     if (findVisibleHistoryComposer(effectiveId)) {
       return { tabId: effectiveId, projectId: owner.projectId, surface: 'history', agent: owner.agent };
     }

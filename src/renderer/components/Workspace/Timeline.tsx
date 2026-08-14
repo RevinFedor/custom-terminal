@@ -8492,13 +8492,21 @@ function Timeline({
                     <StickyNote size={12} />
                     {notes[contextMenu.entry.uuid] ? 'Редактировать заметку' : 'Добавить заметку'}
                   </button>
-                  {supportsDeleteRangeActions && !historyDeleteUiBlocked && (contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact') && (
+                  {supportsDeleteRangeActions && (contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact') && (
                     <>
                       <div className="border-t border-white/10 my-1" />
-                      {!deleteEntryConfirmMode ? (
-                        <div className="flex rounded overflow-hidden" data-testid="timeline-delete-split-single">
+                      {!deleteEntryConfirmMode || historyDeleteUiBlocked ? (
+                        <div
+                          className="flex rounded overflow-hidden"
+                          data-testid="timeline-delete-split-single"
+                          aria-disabled={historyDeleteUiBlocked}
+                          title={historyDeleteUiBlocked ? historyMutationBlockedMessage : undefined}
+                        >
                           <button
-                            className="flex-1 text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 transition-colors cursor-pointer flex items-center gap-2"
+                            disabled={historyDeleteUiBlocked}
+                            className={`flex-1 text-left px-3 py-2 text-xs transition-colors flex items-center gap-2 ${historyDeleteUiBlocked
+                              ? 'text-red-400/35 cursor-not-allowed'
+                              : 'text-red-400 hover:bg-red-600/20 cursor-pointer'}`}
                             onClick={(e) => {
                               e.stopPropagation();
                               setDeleteEntryScope('selection');
@@ -8510,12 +8518,15 @@ function Timeline({
                               ? 'Удалить запрос'
                               : 'Удалить запись'}
                           </button>
-                          <Tooltip content="Удалить всё выше, включая выбранное">
+                          <Tooltip content={historyDeleteUiBlocked ? historyMutationBlockedMessage : 'Удалить всё выше, включая выбранное'}>
                             <button
                               type="button"
+                              disabled={historyDeleteUiBlocked}
                               aria-label="Удалить всё выше, включая выбранное"
                               data-testid="timeline-delete-through-start-single"
-                              className="px-2 py-2 text-red-400/70 hover:bg-red-600/30 hover:text-red-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
+                              className={`px-2 py-2 transition-colors border-l border-white/10 flex items-center justify-center ${historyDeleteUiBlocked
+                                ? 'text-red-400/25 cursor-not-allowed'
+                                : 'text-red-400/70 hover:bg-red-600/30 hover:text-red-300 cursor-pointer'}`}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 setDeleteEntryScope('through-start');
@@ -8885,10 +8896,18 @@ function Timeline({
                       </Tooltip>
                     </div>
                   )}
-                  {supportsDeleteRangeActions && !historyDeleteUiBlocked && (
-                    <div className="flex rounded overflow-hidden" data-testid="timeline-delete-split-range">
+                  {supportsDeleteRangeActions && (
+                    <div
+                      className="flex rounded overflow-hidden"
+                      data-testid="timeline-delete-split-range"
+                      aria-disabled={historyDeleteUiBlocked}
+                      title={historyDeleteUiBlocked ? historyMutationBlockedMessage : undefined}
+                    >
                       <button
-                        className="flex-1 text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 transition-colors cursor-pointer flex items-center gap-2"
+                        disabled={historyDeleteUiBlocked}
+                        className={`flex-1 text-left px-3 py-2 text-xs transition-colors flex items-center gap-2 ${historyDeleteUiBlocked
+                          ? 'text-red-400/35 cursor-not-allowed'
+                          : 'text-red-400 hover:bg-red-600/20 cursor-pointer'}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           setDeleteRangeScope('selection');
@@ -8898,12 +8917,15 @@ function Timeline({
                         <Trash2 size={12} />
                         Удалить выбранное ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
                       </button>
-                      <Tooltip content="Удалить всё выше, включая выбранное">
+                      <Tooltip content={historyDeleteUiBlocked ? historyMutationBlockedMessage : 'Удалить всё выше, включая выбранное'}>
                         <button
                           type="button"
+                          disabled={historyDeleteUiBlocked}
                           aria-label="Удалить всё выше, включая выбранное"
                           data-testid="timeline-delete-through-start-range"
-                          className="px-2 py-2 text-red-400/70 hover:bg-red-600/30 hover:text-red-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
+                          className={`px-2 py-2 transition-colors border-l border-white/10 flex items-center justify-center ${historyDeleteUiBlocked
+                            ? 'text-red-400/25 cursor-not-allowed'
+                            : 'text-red-400/70 hover:bg-red-600/30 hover:text-red-300 cursor-pointer'}`}
                           onClick={(e) => {
                             e.stopPropagation();
                             setDeleteRangeScope('through-start');

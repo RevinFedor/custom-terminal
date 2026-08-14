@@ -15,6 +15,7 @@ const { classifyTerminalPasteProfile } = require('./terminal-paste-profile');
 
 const mainPath = path.join(__dirname, 'main.js');
 const historyPath = path.join(__dirname, '../renderer/components/Workspace/HistoryPanel.tsx');
+const historyHandoffsPath = path.join(__dirname, '../renderer/utils/historyPromptHandoffs.ts');
 
 function parse(filePath, scriptKind) {
   const source = fs.readFileSync(filePath, 'utf8');
@@ -300,10 +301,15 @@ test('F1 strongest counterexample: a current visible draft rejects History even 
 
 async function buildHistoryDurabilityCaller(serverEntries) {
   const parsed = parse(historyPath, ts.ScriptKind.TSX);
+  const handoffsParsed = parse(historyHandoffsPath, ts.ScriptKind.TS);
   const snippets = [
     sourceForVariableStatement(parsed, 'LOCAL_PROMPT_PREFIX'),
     sourceForVariableStatement(parsed, 'normalizeHistoryPromptText'),
     sourceForVariableStatement(parsed, 'normalizeHistoryPromptIdentityText'),
+    sourceForVariableStatement(handoffsParsed, 'ORCHESTRATION_COMPLETION_HANDOFF_PREFIX'),
+    sourceForVariableStatement(handoffsParsed, 'ORCHESTRATION_COMPLETION_SOURCE_PREFIX'),
+    sourceForFunction(handoffsParsed, 'legacyOrchestrationCompletionMatchesCanonicalEntry')
+      .replace(/^export\s+/, ''),
     sourceForVariableStatement(parsed, 'findServerPromptEntry'),
     sourceForVariableStatement(parsed, 'serverHasPromptEntry'),
   ];
@@ -392,4 +398,31 @@ test('F3 strongest counterexample: the existing matcher rejects A when the calle
 
   assert.equal(serverHasPromptEntry([serverA], exactLocalB), false);
   assert.equal(serverHasPromptEntry([serverA, serverB], exactLocalB), true);
+});
+
+test('legacy orchestration SENT survives handoff loss but retires only by its exact run tag', async () => {
+  const canonical = {
+    uuid: 'orchestration-run-a-entry',
+    role: 'user',
+    content: 'completion body can be edited without becoming identity',
+    timestamp: '2026-08-13T00:00:00.000Z',
+    sessionId: 'source-session',
+    semanticTags: [{ kind: 'orchestration', runId: 'run-a', phase: 'completion' }],
+  };
+  const { serverHasPromptEntry } = await buildHistoryDurabilityCaller([canonical]);
+  const orphanedLegacySent = {
+    uuid: 'local-prompt-tab-orchestration-complete:run-a',
+    role: 'queued',
+    content: 'an old renderer-only copy',
+    timestamp: '2026-08-12T23:58:09.000Z',
+    sessionId: 'source-session',
+    handoffId: 'orchestration-complete:run-a',
+    queueStatus: 'sent',
+  };
+
+  assert.equal(serverHasPromptEntry([canonical], orphanedLegacySent), true);
+  assert.equal(serverHasPromptEntry([{
+    ...canonical,
+    semanticTags: [{ kind: 'orchestration', runId: 'run-b', phase: 'completion' }],
+  }], orphanedLegacySent), false);
 });

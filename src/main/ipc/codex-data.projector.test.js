@@ -1,0 +1,348 @@
+'use strict';
+
+// The resumable projector must be indistinguishable from the one-shot pass:
+// for ANY split point, feeding a prefix, finalizing (a live read happened),
+// then feeding the rest must produce the same presentation as one fresh pass
+// over the whole array. This is the property the whole windowed-history plan
+// stands on — checkpoints are just persisted split points.
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const { _api } = require('./codex-data');
+const {
+  buildCodexFullHistory,
+  createCodexHistoryProjector,
+  projectCodexFullHistoryFromFile,
+  invalidateCodexHistoryProjectors,
+} = _api;
+
+const recordsToJsonl = (records) => records
+  .map(({ __line, __byteOffset, ...record }) => JSON.stringify(record))
+  .join('\n') + '\n';
+
+async function makeSessionFile(t, name, records) {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-projector-file-'));
+  t.after(async () => {
+    invalidateCodexHistoryProjectors();
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  });
+  const filePath = path.join(dir, `rollout-2026-08-07T10-00-00-${name}.jsonl`);
+  await fs.promises.writeFile(filePath, recordsToJsonl(records));
+  return { dir, filePath };
+}
+
+let lineCounter = 0;
+let byteCounter = 0;
+const rec = (type, payload, extra = {}) => {
+  const line = lineCounter++;
+  const byteOffset = byteCounter;
+  byteCounter += 100 + line;
+  return {
+    type,
+    payload,
+    timestamp: '2026-08-07T10:00:' + String(line % 60).padStart(2, '0') + '.000Z',
+    __line: line,
+    __byteOffset: byteOffset,
+    ...extra,
+  };
+};
+
+/**
+ * A fixture touching every stateful mechanism of the pass: session meta cwd,
+ * model/effort dedupe, thinking accumulation, calls+outputs, background exec
+ * cells (wait), apply_patch canonical events, subagent v1+v2 lifecycle,
+ * compact companion pairing, token counts, rollback, in-flight tail.
+ */
+function buildFixtureRecords() {
+  lineCounter = 0;
+  byteCounter = 0;
+  const records = [];
+  records.push(rec('session_meta', { id: 's-proj', cwd: '/tmp/proj' }));
+  records.push(rec('turn_context', { model: 'gpt-5.6', effort: 'high' }));
+  // Duplicate turn_context — must render nothing new.
+  records.push(rec('turn_context', { model: 'gpt-5.6', effort: 'high' }));
+  records.push(rec('event_msg', { type: 'user_message', message: 'первый промпт' }));
+  records.push(rec('response_item', { type: 'reasoning', summary: [{ text: 'думаю о задаче' }] }));
+  records.push(rec('response_item', {
+    type: 'function_call', call_id: 'call-bash', name: 'exec_command',
+    arguments: JSON.stringify({ command: 'ls -la' }),
+  }));
+  records.push(rec('response_item', {
+    type: 'function_call_output', call_id: 'call-bash',
+    output: 'total 8\nfile.txt',
+  }));
+  records.push(rec('response_item', {
+    type: 'message', role: 'assistant',
+    content: [{ type: 'output_text', text: 'вот список файлов' }],
+  }));
+  // Background exec cell: call announces a cell id, wait completes it later.
+  records.push(rec('response_item', {
+    type: 'function_call', call_id: 'call-bg', name: 'exec_command',
+    arguments: JSON.stringify({ command: 'npm run build' }),
+  }));
+  records.push(rec('response_item', {
+    type: 'function_call_output', call_id: 'call-bg',
+    output: 'Script running with cell ID 42',
+  }));
+  records.push(rec('event_msg', { type: 'token_count', info: { total_token_usage: { total_tokens: 1000 } } }));
+  // Compaction: top-level snapshot + telemetry companion (must render ONCE).
+  records.push(rec('compacted', { message: 'Compact snapshot body' }));
+  records.push(rec('event_msg', { type: 'compact_completed', message: 'companion telemetry' }));
+  records.push(rec('event_msg', { type: 'user_message', message: 'второй промпт' }));
+  // Subagent v1: spawn → output binds id → wait completes it.
+  records.push(rec('response_item', {
+    type: 'function_call', call_id: 'call-spawn', name: 'spawn_agent',
+    namespace: 'multi_agent_v1',
+    arguments: JSON.stringify({ message: 'исследуй репозиторий' }),
+  }));
+  records.push(rec('response_item', {
+    type: 'function_call_output', call_id: 'call-spawn',
+    output: JSON.stringify({ agent_id: 'agent-1', nickname: 'Faraday' }),
+  }));
+  records.push(rec('response_item', {
+    type: 'function_call', call_id: 'call-wait', name: 'wait_agent',
+    namespace: 'multi_agent_v1', arguments: JSON.stringify({}),
+  }));
+  records.push(rec('response_item', {
+    type: 'function_call_output', call_id: 'call-wait',
+    output: JSON.stringify({ status: { 'agent-1': { completed: 'нашёл три файла' } } }),
+  }));
+  // Background wait completes the cell from earlier.
+  records.push(rec('response_item', {
+    type: 'function_call', call_id: 'call-wait-cell', name: 'wait',
+    arguments: JSON.stringify({ cell_id: '42' }),
+  }));
+  records.push(rec('response_item', {
+    type: 'function_call_output', call_id: 'call-wait-cell',
+    output: 'build finished OK',
+  }));
+  records.push(rec('response_item', {
+    type: 'message', role: 'assistant',
+    content: [{ type: 'output_text', text: 'сборка завершена' }],
+  }));
+  // Rollback of the last turn.
+  records.push(rec('event_msg', { type: 'user_message', message: 'отменяемый промпт' }));
+  records.push(rec('response_item', {
+    type: 'message', role: 'assistant',
+    content: [{ type: 'output_text', text: 'ответ который откатят' }],
+  }));
+  records.push(rec('event_msg', { type: 'thread_rolled_back', num_turns: 1 }));
+  records.push(rec('event_msg', { type: 'user_message', message: 'третий промпт' }));
+  // Standalone compact event with no top-level twin — must render (the
+  // companion counter is 0 here: the last `compacted` was already paired and
+  // the window closed at the user turns above).
+  records.push(rec('event_msg', { type: 'compact_boundary', message: 'standalone compact' }));
+  // Heavy output — crosses the 16KB dehydration threshold, so refreshes
+  // interleaved with dehydration exercise the shared-rawTool mutation path.
+  records.push(rec('response_item', {
+    type: 'function_call', call_id: 'call-heavy', name: 'exec_command',
+    arguments: JSON.stringify({ command: 'cat big.log' }),
+  }));
+  records.push(rec('response_item', {
+    type: 'function_call_output', call_id: 'call-heavy',
+    output: 'x'.repeat(20 * 1024),
+  }));
+  // Reasoning directly before an in-flight call: the finalize tail must show
+  // it WITHOUT consuming it, so a later feed still owns it.
+  records.push(rec('response_item', {
+    type: 'reasoning', summary: [{ text: 'думаю над долгой командой' }],
+  }));
+  records.push(rec('response_item', {
+    type: 'function_call', call_id: 'call-open', name: 'exec_command',
+    arguments: JSON.stringify({ command: 'sleep 999' }),
+  }));
+  return records;
+}
+
+const strip = (entries) => JSON.parse(JSON.stringify(entries));
+
+test('projector fed in one pass equals the one-shot builder', () => {
+  const records = buildFixtureRecords();
+  const oneShot = buildCodexFullHistory(records, 's-proj');
+  const projector = createCodexHistoryProjector('s-proj');
+  for (const record of records) projector.feed(record);
+  assert.deepEqual(strip(projector.finalize()), strip(oneShot));
+  // Sanity: the fixture actually exercises the interesting rows.
+  const roles = oneShot.map((entry) => entry.role);
+  assert.ok(roles.includes('compact'), 'fixture renders a compact row');
+  assert.ok(roles.includes('slash'), 'fixture renders model/effort rows');
+  assert.equal(oneShot.filter((entry) => entry.role === 'compact').length, 2,
+    'paired companion suppressed, standalone compact rendered');
+  assert.match(
+    oneShot.find((entry) => entry.role === 'compact')?.sourceIdentity || '',
+    /^codex-compact-source-s-proj-\d+$/,
+    'top-level compact keeps the exact rollout position for live handoff',
+  );
+  const taskCards = oneShot.flatMap((entry) => entry.actions || [])
+    .filter((action) => action.tool === 'Task');
+  assert.equal(taskCards.length, 1);
+  assert.equal(taskCards[0].subagentStatus, 'completed');
+  assert.equal(taskCards[0].result, 'нашёл три файла');
+});
+
+test('every split point with a mid-stream finalize converges to the one-shot result', () => {
+  const records = buildFixtureRecords();
+  const expected = strip(buildCodexFullHistory(records, 's-proj'));
+  for (let split = 0; split <= records.length; split += 1) {
+    const projector = createCodexHistoryProjector('s-proj');
+    for (let index = 0; index < split; index += 1) projector.feed(records[index]);
+    // A live read happened at the split point — must not corrupt state.
+    projector.finalize();
+    for (let index = split; index < records.length; index += 1) projector.feed(records[index]);
+    assert.deepEqual(
+      strip(projector.finalize()),
+      expected,
+      'diverged at split=' + split,
+    );
+  }
+});
+
+test('double finalize with no feeds in between is idempotent', () => {
+  const records = buildFixtureRecords();
+  const projector = createCodexHistoryProjector('s-proj');
+  for (const record of records) projector.feed(record);
+  const first = strip(projector.finalize());
+  const second = strip(projector.finalize());
+  assert.deepEqual(second, first);
+});
+
+// ── File-cursor incremental projection ──────────────────────────────────────
+// The real transport: records live in a rollout file; a refresh must read
+// only appended bytes. Fixtures write records WITHOUT identity fields — the
+// reader assigns __line/__byteOffset, so equality against a one-shot build
+// over parseJsonlFile-loaded records is exact.
+
+test('file-cursor projection: rebuild → append tail → unchanged → rewrite burn', async (t) => {
+  const sessionId = 'sess-cursor-a';
+  const records = buildFixtureRecords();
+  const half = Math.floor(records.length / 2);
+  const { dir, filePath } = await makeSessionFile(t, sessionId, records.slice(0, half));
+  t.after(() => _api.invalidateJsonlCache(filePath));
+  const opts = { sessionsDir: dir };
+  // Reference build reads the file directly — parseJsonlFile(forceFresh)
+  // would burn the projector cursor via invalidateCodexJsonlCache (that
+  // coupling is intentional prod behavior, not a test tool).
+  const oneShot = async () => {
+    const stat = await fs.promises.stat(filePath);
+    const result = await _api.readJsonlRange(filePath, 0, stat.size - 1);
+    return strip(buildCodexFullHistory(result.records, sessionId));
+  };
+
+  // First open: full read.
+  const first = await projectCodexFullHistoryFromFile(sessionId, null, opts);
+  assert.equal(first.success, true);
+  assert.equal(first.mode, 'rebuild');
+  assert.deepEqual(strip(first.entries), await oneShot());
+  assert.equal(first.sourceSnapshot.filePath, filePath);
+
+  // Append the rest, including a PARTIAL last line completed by a second
+  // append — the cursor must carry the straddling fragment.
+  const tailJsonl = recordsToJsonl(records.slice(half));
+  const splitAt = Math.floor(tailJsonl.length * 0.7);
+  await fs.promises.appendFile(filePath, tailJsonl.slice(0, splitAt));
+  const partial = await projectCodexFullHistoryFromFile(sessionId, null, opts);
+  assert.equal(partial.mode, 'append');
+  await fs.promises.appendFile(filePath, tailJsonl.slice(splitAt));
+  const completed = await projectCodexFullHistoryFromFile(sessionId, null, opts);
+  assert.equal(completed.mode, 'append');
+  assert.deepEqual(strip(completed.entries), await oneShot());
+
+  // No file change → unchanged, zero records fed.
+  const unchanged = await projectCodexFullHistoryFromFile(sessionId, null, opts);
+  assert.equal(unchanged.mode, 'unchanged');
+  assert.equal(unchanged.fedRecords, 0);
+  assert.deepEqual(strip(unchanged.entries), strip(completed.entries));
+
+  // Rewrite (shrink): burn and rebuild from the new content.
+  await fs.promises.writeFile(filePath, recordsToJsonl(records.slice(0, 4)));
+  const rewritten = await projectCodexFullHistoryFromFile(sessionId, null, opts);
+  assert.equal(rewritten.mode, 'rebuild');
+  assert.deepEqual(strip(rewritten.entries), await oneShot());
+
+  // Explicit invalidation burns the cursor even with an unchanged file.
+  await projectCodexFullHistoryFromFile(sessionId, null, opts);
+  invalidateCodexHistoryProjectors(filePath);
+  const afterBurn = await projectCodexFullHistoryFromFile(sessionId, null, opts);
+  assert.equal(afterBurn.mode, 'rebuild');
+});
+
+test('projector cache evicts by BYTE budget, keeping the served session', async (t) => {
+  invalidateCodexHistoryProjectors();
+  const previousBudget = _api.getCodexHistoryProjectorStats().budgetBytes;
+  t.after(() => {
+    _api.setCodexHistoryProjectorBudgetMb(Math.round(previousBudget / (1024 * 1024)));
+    invalidateCodexHistoryProjectors();
+  });
+  const records = buildFixtureRecords();
+  const sessions = ['budget-a', 'budget-b', 'budget-c'];
+  const dirs = new Map();
+  for (const name of sessions) {
+    const { dir } = await makeSessionFile(t, name, records);
+    dirs.set(name, { sessionsDir: dir });
+  }
+
+  // Roomy budget: every session stays resident, so returns are free.
+  _api.setCodexHistoryProjectorBudgetMb(512);
+  for (const name of sessions) {
+    await projectCodexFullHistoryFromFile(name, null, dirs.get(name));
+  }
+  for (const name of sessions) {
+    const again = await projectCodexFullHistoryFromFile(name, null, dirs.get(name));
+    assert.equal(again.mode, 'unchanged', name + ' should still be cached');
+  }
+  const roomy = _api.getCodexHistoryProjectorStats();
+  assert.equal(roomy.sessions, 3);
+  assert.ok(roomy.approxBytes > 0, 'cost accounting is live');
+
+  // Squeeze the budget to its floor: the cache sheds the least-recent
+  // sessions but never the one it just served.
+  _api.setCodexHistoryProjectorBudgetMb(64);
+  invalidateCodexHistoryProjectors();
+  for (const name of sessions) {
+    await projectCodexFullHistoryFromFile(name, null, dirs.get(name));
+  }
+  const served = await projectCodexFullHistoryFromFile('budget-c', null, dirs.get('budget-c'));
+  assert.equal(served.mode, 'unchanged', 'the just-served session is never evicted');
+  const squeezed = _api.getCodexHistoryProjectorStats();
+  assert.ok(squeezed.sessions >= 1, 'at least one session stays resident');
+
+  // The count cap is the backstop behind the byte budget: even with a huge
+  // budget the cache cannot grow without bound.
+  _api.setCodexHistoryProjectorBudgetMb(2048);
+  invalidateCodexHistoryProjectors();
+  const many = [];
+  for (let index = 0; index < 15; index += 1) {
+    const name = 'cap-' + index;
+    const { dir } = await makeSessionFile(t, name, records);
+    many.push({ name, opts: { sessionsDir: dir } });
+    await projectCodexFullHistoryFromFile(name, null, { sessionsDir: dir });
+  }
+  const capped = _api.getCodexHistoryProjectorStats();
+  assert.ok(capped.sessions <= 12, 'count cap holds, got ' + capped.sessions);
+  // The most recent session is still warm despite the churn.
+  const newest = many[many.length - 1];
+  const newestAgain = await projectCodexFullHistoryFromFile(newest.name, null, newest.opts);
+  assert.equal(newestAgain.mode, 'unchanged');
+});
+
+test('concurrent refreshes of one session serialize on the projector chain', async (t) => {
+  const sessionId = 'sess-serial';
+  const records = buildFixtureRecords();
+  const { dir, filePath } = await makeSessionFile(t, sessionId, records);
+  t.after(() => _api.invalidateJsonlCache(filePath));
+  const opts = { sessionsDir: dir };
+  const [left, right] = await Promise.all([
+    projectCodexFullHistoryFromFile(sessionId, null, opts),
+    projectCodexFullHistoryFromFile(sessionId, null, opts),
+  ]);
+  assert.equal(left.success, true);
+  assert.equal(right.success, true);
+  // One did the read; the other observed the cursor as unchanged.
+  const modes = [left.mode, right.mode].sort();
+  assert.deepEqual(modes, ['rebuild', 'unchanged']);
+  assert.deepEqual(strip(left.entries), strip(right.entries));
+});

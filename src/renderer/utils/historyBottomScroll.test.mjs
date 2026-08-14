@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   createHistoryTailPinScheduler,
   isHistoryTailPinned,
+  reconcileHistoryTailFollowIntent,
   scheduleHistoryBottomScroll,
 } from './historyBottomScroll.mjs';
 
@@ -73,6 +74,22 @@ test('tail pin predicate is exact instead of treating the 150px arrow zone as pi
     scrollTop: 495,
     clientHeight: 500,
   }), false);
+});
+
+test('content growth preserves tail-follow intent until a real user gesture moves away', () => {
+  assert.equal(reconcileHistoryTailFollowIntent({
+    currentIntent: true,
+    physicalPinned: false,
+  }), true, 'a taller streaming footer is not a user scroll');
+  assert.equal(reconcileHistoryTailFollowIntent({
+    currentIntent: true,
+    physicalPinned: false,
+    userMovedAway: true,
+  }), false);
+  assert.equal(reconcileHistoryTailFollowIntent({
+    currentIntent: false,
+    physicalPinned: true,
+  }), true, 'manually reaching the tail re-enables follow');
 });
 
 test('live tail pin coalesces updates into one direct pixel scroll on one frame', () => {

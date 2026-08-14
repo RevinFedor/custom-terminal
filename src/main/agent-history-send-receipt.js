@@ -18,6 +18,17 @@ const DESKTOP_AUTOMATION_SEND_SOURCES = new Set([
   'prompt-loop',
 ]);
 
+const ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX = 'orchestration-completion:';
+
+function isOwnedDesktopHistorySendSource(source) {
+  const normalized = String(source || '');
+  return DESKTOP_HISTORY_SEND_SOURCES.has(normalized)
+    || (
+      normalized.startsWith(ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX)
+      && normalized.slice(ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX.length).trim().length > 0
+    );
+}
+
 function requiredString(value, label) {
   const normalized = typeof value === 'string' ? value.trim() : '';
   if (!normalized) throw new TypeError(label + ' must be a non-empty string');
@@ -35,7 +46,7 @@ function isDesktopHistorySendReceiptEligible(input = {}) {
   return input.submit === true
     && !!optionalString(input.tabId)
     && !!optionalString(input.handoffId)
-    && DESKTOP_HISTORY_SEND_SOURCES.has(source)
+    && isOwnedDesktopHistorySendSource(source)
     // Local slash commands have a command-specific completion proof rather than
     // a user_message audit. They need their own receipt contract; do not leave a
     // generic prompt receipt permanently pending for them.
@@ -57,7 +68,7 @@ function buildDesktopHistorySendIdentity(input = {}) {
   if (!Number.isSafeInteger(promptLength) || promptLength < 0) {
     throw new TypeError('promptLength must be a non-negative safe integer');
   }
-  if (!DESKTOP_HISTORY_SEND_SOURCES.has(source)) {
+  if (!isOwnedDesktopHistorySendSource(source)) {
     throw new TypeError('source must be an owned desktop History surface');
   }
 
@@ -128,9 +139,11 @@ function desktopHistorySendReplayResult(record) {
 module.exports = {
   DESKTOP_HISTORY_SEND_SOURCES,
   DESKTOP_AUTOMATION_SEND_SOURCES,
+  ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX,
   DESKTOP_HISTORY_SEND_SURFACE,
   DESKTOP_HISTORY_SEND_VERSION,
   buildDesktopHistorySendIdentity,
   desktopHistorySendReplayResult,
   isDesktopHistorySendReceiptEligible,
+  isOwnedDesktopHistorySendSource,
 };

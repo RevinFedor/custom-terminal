@@ -4,10 +4,13 @@ import {
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,
 } from './codexComposerGlyphs.mjs';
+import { measureTerminalViewportIntersection } from './terminalViewportIntersection.mjs';
 
 // Global registry to access terminal instances from anywhere
 interface TerminalRegistryStore {
   terminals: Map<string, XTerminal>;
+  rendererBoundaryStates: Map<string, RendererBoundaryState>;
+  terminalInstanceSequence: number;
   terminalWaiters: Map<string, Set<(terminal: XTerminal | undefined) => void>>;
   searchAddons: Map<string, SearchAddon>;
   searchStates: Map<string, SearchState>;
@@ -38,6 +41,38 @@ interface ViewportState {
   total: number;
 }
 
+interface RendererBoundaryState {
+  terminal: XTerminal;
+  instanceId: string;
+  registeredAt: number;
+  writeSeq: number | null;
+  generation: string | null;
+  generationOrdinal: number | null;
+  flushedAt: number | null;
+}
+
+interface TerminalDomDiagnostic {
+  connected: boolean;
+  display: string | null;
+  visibility: string | null;
+  opacity: string | null;
+  effectiveOpacity: number | null;
+  width: number | null;
+  height: number | null;
+  left: number | null;
+  top: number | null;
+  right: number | null;
+  bottom: number | null;
+  viewportWidth: number | null;
+  viewportHeight: number | null;
+  intersectsViewport: boolean;
+  painted: boolean;
+  hiddenBy: string | null;
+  layerTabId: string | null;
+  layerActive: string | null;
+  layerPresented: string | null;
+}
+
 // Marker tracking for timeline entry navigation
 interface TrackedEntry {
   uuid: string;
@@ -52,6 +87,8 @@ type ViewportCallback = (viewport: ViewportState) => void;
 
 const registryStore = ((globalThis as TerminalRegistryGlobal).__notedTerminalRegistryStore ||= {
   terminals: new Map<string, XTerminal>(),
+  rendererBoundaryStates: new Map<string, RendererBoundaryState>(),
+  terminalInstanceSequence: 0,
   terminalWaiters: new Map<string, Set<(terminal: XTerminal | undefined) => void>>(),
   searchAddons: new Map<string, SearchAddon>(),
   searchStates: new Map<string, SearchState>(),
@@ -66,8 +103,11 @@ const registryStore = ((globalThis as TerminalRegistryGlobal).__notedTerminalReg
 registryStore.terminalWaiters ||= new Map<string, Set<(terminal: XTerminal | undefined) => void>>();
 registryStore.promptBoundaryWaiters ||= new Map<string, Set<(seq: number) => void>>();
 registryStore.promptBoundaryLatestSeq ||= new Map<string, number>();
+registryStore.rendererBoundaryStates ||= new Map<string, RendererBoundaryState>();
+registryStore.terminalInstanceSequence ||= 0;
 
 const terminals = registryStore.terminals;
+const rendererBoundaryStates = registryStore.rendererBoundaryStates;
 const terminalWaiters = registryStore.terminalWaiters;
 const searchAddons = registryStore.searchAddons;
 const searchStates = registryStore.searchStates;
@@ -78,6 +118,100 @@ const promptBoundaryLatestSeq = registryStore.promptBoundaryLatestSeq;
 const promptBoundaryWaiters = registryStore.promptBoundaryWaiters;
 const searchCallbacks = registryStore.searchCallbacks;
 const viewportCallbacks = registryStore.viewportCallbacks;
+
+function ensureRendererBoundaryState(tabId: string, terminal: XTerminal): RendererBoundaryState {
+  const current = rendererBoundaryStates.get(tabId);
+  if (current?.terminal === terminal) return current;
+  registryStore.terminalInstanceSequence += 1;
+  const created: RendererBoundaryState = {
+    terminal,
+    instanceId: `${tabId.slice(-12)}:${registryStore.terminalInstanceSequence}`,
+    registeredAt: Date.now(),
+    writeSeq: null,
+    generation: null,
+    generationOrdinal: null,
+    flushedAt: null,
+  };
+  rendererBoundaryStates.set(tabId, created);
+  return created;
+}
+
+function readTerminalDomDiagnostic(element: HTMLElement | undefined): TerminalDomDiagnostic {
+  const rect = element?.getBoundingClientRect?.();
+  const layer = element?.closest?.('[data-terminal-layer-tab-id]') as HTMLElement | null;
+  let computed: CSSStyleDeclaration | null = null;
+  let effectiveOpacity = 1;
+  let hiddenBy: string | null = null;
+
+  try {
+    computed = element && typeof window !== 'undefined'
+      ? window.getComputedStyle(element)
+      : null;
+    let node: HTMLElement | null = element || null;
+    while (node && typeof window !== 'undefined') {
+      const style = window.getComputedStyle(node);
+      const nodeOpacity = Number.parseFloat(style.opacity || '1');
+      if (Number.isFinite(nodeOpacity)) effectiveOpacity *= nodeOpacity;
+      if (!hiddenBy && style.display === 'none') hiddenBy = 'ancestor-display-none';
+      if (!hiddenBy && style.visibility === 'hidden') hiddenBy = 'ancestor-visibility-hidden';
+      node = node.parentElement;
+    }
+  } catch {
+    effectiveOpacity = Number.NaN;
+  }
+
+  const width = Number.isFinite(rect?.width) ? Number(rect?.width) : null;
+  const height = Number.isFinite(rect?.height) ? Number(rect?.height) : null;
+  const left = Number.isFinite(rect?.left) ? Number(rect?.left) : null;
+  const top = Number.isFinite(rect?.top) ? Number(rect?.top) : null;
+  const viewportWidth = typeof window !== 'undefined' && Number.isFinite(window.innerWidth)
+    ? Number(window.innerWidth)
+    : null;
+  const viewportHeight = typeof window !== 'undefined' && Number.isFinite(window.innerHeight)
+    ? Number(window.innerHeight)
+    : null;
+  const viewportIntersection = measureTerminalViewportIntersection({
+    left,
+    top,
+    width,
+    height,
+    viewportWidth,
+    viewportHeight,
+  });
+  const connected = element?.isConnected === true;
+  if (!hiddenBy && connected !== true) hiddenBy = 'element-disconnected';
+  if (!hiddenBy && (width === null || height === null || width <= 0 || height <= 0)) {
+    hiddenBy = 'zero-geometry';
+  }
+  if (!hiddenBy && Number.isFinite(effectiveOpacity) && effectiveOpacity <= 0.01) {
+    hiddenBy = 'ancestor-opacity-zero';
+  }
+  if (!hiddenBy && viewportIntersection.intersectsViewport !== true) {
+    hiddenBy = 'outside-viewport';
+  }
+
+  return {
+    connected,
+    display: computed?.display || null,
+    visibility: computed?.visibility || null,
+    opacity: computed?.opacity || null,
+    effectiveOpacity: Number.isFinite(effectiveOpacity) ? effectiveOpacity : null,
+    width,
+    height,
+    left,
+    top,
+    right: viewportIntersection.right,
+    bottom: viewportIntersection.bottom,
+    viewportWidth,
+    viewportHeight,
+    intersectsViewport: viewportIntersection.intersectsViewport,
+    painted: hiddenBy === null,
+    hiddenBy,
+    layerTabId: layer?.dataset.terminalLayerTabId || null,
+    layerActive: layer?.dataset.terminalLayerActive || null,
+    layerPresented: layer?.dataset.terminalLayerPresented || null,
+  };
+}
 
 const defaultSearchOptions: ISearchOptions = {
   caseSensitive: false,
@@ -92,7 +226,7 @@ const defaultSearchOptions: ISearchOptions = {
 };
 
 const GEMINI_BRAILLE_RE = /[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/;
-const CODEX_NON_DRAFT_LINE_RE = /(OpenAI Codex|model:|directory:|permissions:|Use \/skills|Full Access|Context \d+%|weekly \d+%|Starting MCP|esc to interrupt|Select Model|Tip:|Model changed|^╭|^╰|^│)/i;
+const CODEX_NON_DRAFT_LINE_RE = /(OpenAI Codex|model:|directory:|permissions:|Use \/skills|Full Access|Context \d+%|weekly \d+%|Starting MCP|esc to interrupt|Select Model|Tip:|Model changed|^\s*[a-z0-9][a-z0-9_.-]*\s+(?:none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+fast)?(?:\s*·|$)|^╭|^╰|^│)/i;
 const CODEX_EMPTY_COMPOSER_HINT_RE = /Use \/skills to list available skills/i;
 
 interface LogicalCell {
@@ -325,6 +459,7 @@ export const terminalRegistry = {
   },
 
   register(tabId: string, terminal: XTerminal, searchAddon?: SearchAddon) {
+    ensureRendererBoundaryState(tabId, terminal);
     terminals.set(tabId, terminal);
     const waiters = terminalWaiters.get(tabId);
     if (waiters) {
@@ -352,6 +487,7 @@ export const terminalRegistry = {
 
   unregister(tabId: string) {
     terminals.delete(tabId);
+    rendererBoundaryStates.delete(tabId);
     searchAddons.delete(tabId);
     searchStates.delete(tabId);
     searchCallbacks.delete(tabId);
@@ -363,6 +499,122 @@ export const terminalRegistry = {
 
   get(tabId: string): XTerminal | undefined {
     return terminals.get(tabId);
+  },
+
+  markRendererWriteFlushed(tabId: string, terminal: XTerminal, meta: {
+    writeSeq?: number | null;
+    generation?: string | null;
+    generationOrdinal?: number | null;
+  }): void {
+    if (!Number.isFinite(meta?.writeSeq)) return;
+    const boundary = ensureRendererBoundaryState(tabId, terminal);
+    boundary.writeSeq = Number(meta.writeSeq);
+    boundary.generation = typeof meta.generation === 'string'
+      ? meta.generation
+      : boundary.generation;
+    boundary.generationOrdinal = Number.isFinite(meta.generationOrdinal)
+      ? Number(meta.generationOrdinal)
+      : boundary.generationOrdinal;
+    boundary.flushedAt = Date.now();
+  },
+
+  getDraftDiagnosticSnapshot(tabId: string, hint?: {
+    promptRow?: number | null;
+    cursorRow?: number | null;
+  }): {
+    success: boolean;
+    error?: string;
+    capturedAt?: number;
+    rendererInstanceId?: string | null;
+    rendererRegisteredAt?: number | null;
+    rendererWriteSeq?: number | null;
+    rendererGeneration?: string | null;
+    rendererGenerationOrdinal?: number | null;
+    rendererFlushedAt?: number | null;
+    rows?: number;
+    cols?: number;
+    bufferLength?: number;
+    baseY?: number;
+    viewportY?: number;
+    cursorX?: number;
+    cursorY?: number;
+    cursorRow?: number;
+    bufferType?: string;
+    dom?: TerminalDomDiagnostic;
+    lines?: Array<{
+      row: number;
+      cursor: boolean;
+      proofCursor: boolean;
+      proofPrompt: boolean;
+      wrapped: boolean;
+      text: string;
+      firstTextStyle: string;
+      hasInverse: boolean;
+      hasNonDefaultBg: boolean;
+    }>;
+  } {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return { success: false, error: 'no-visible-terminal' };
+    const buf = terminal.buffer.active;
+    if (!buf) return { success: false, error: 'no-visible-buffer' };
+    const boundary = rendererBoundaryStates.get(tabId);
+    const cursorRow = buf.baseY + buf.cursorY;
+    const proofCursorRow = Number.isFinite(Number(hint?.cursorRow))
+      ? Number(hint?.cursorRow)
+      : null;
+    const proofPromptRow = Number.isFinite(Number(hint?.promptRow))
+      ? Number(hint?.promptRow)
+      : null;
+    const requestedRows = new Set<number>();
+    for (let row = cursorRow - 4; row <= cursorRow + 4; row += 1) requestedRows.add(row);
+    if (proofCursorRow !== null) {
+      for (let row = proofCursorRow - 2; row <= proofCursorRow + 2; row += 1) requestedRows.add(row);
+    }
+    if (proofPromptRow !== null) {
+      for (let row = proofPromptRow - 2; row <= proofPromptRow + 2; row += 1) requestedRows.add(row);
+    }
+    const lines = Array.from(requestedRows)
+      .sort((a, b) => a - b)
+      .filter((row) => row >= 0 && row < buf.length)
+      .slice(0, 20)
+      .map((row) => {
+        const line = buf.getLine(row);
+        const styles = summarizeXtermLineStyles(line);
+        return {
+          row,
+          cursor: row === cursorRow,
+          proofCursor: proofCursorRow !== null && row === proofCursorRow,
+          proofPrompt: proofPromptRow !== null && row === proofPromptRow,
+          wrapped: !!line?.isWrapped,
+          text: String(line?.translateToString?.(true) || '').slice(0, 180),
+          firstTextStyle: styles.firstTextStyle,
+          hasInverse: styles.hasInverse,
+          hasNonDefaultBg: styles.hasNonDefaultBg,
+        };
+      });
+
+    const element = (terminal as any).element as HTMLElement | undefined;
+    return {
+      success: true,
+      capturedAt: Date.now(),
+      rendererInstanceId: boundary?.instanceId || null,
+      rendererRegisteredAt: boundary?.registeredAt || null,
+      rendererWriteSeq: boundary?.writeSeq ?? null,
+      rendererGeneration: boundary?.generation || null,
+      rendererGenerationOrdinal: boundary?.generationOrdinal ?? null,
+      rendererFlushedAt: boundary?.flushedAt ?? null,
+      rows: terminal.rows,
+      cols: terminal.cols,
+      bufferLength: buf.length,
+      baseY: buf.baseY,
+      viewportY: buf.viewportY,
+      cursorX: buf.cursorX,
+      cursorY: buf.cursorY,
+      cursorRow,
+      bufferType: buf.type,
+      dom: readTerminalDomDiagnostic(element),
+      lines,
+    };
   },
 
   getVisibleSnapshot(tabId: string): {

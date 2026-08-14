@@ -1815,6 +1815,11 @@ async function _parseJsonlFileIncremental(filePath) {
 function invalidateCodexJsonlCache(filePath) {
   if (!filePath) return;
   deleteCodexJsonlCacheEntry(filePath);
+  // Every explicit rewrite path (edit/delete-range/fork, forceFresh reads)
+  // funnels through here — burn the resumable projector too. The projector's
+  // own structural witness also catches rewrites (byte offsets shift), this
+  // is the belt to that suspenders.
+  invalidateCodexHistoryProjectors(filePath);
 }
 
 function getSessionMeta(records) {
@@ -2697,19 +2702,65 @@ function isCodexSubagentNotification(payload = {}) {
   return String(text).includes('<subagent_notification>');
 }
 
-function buildCodexTimeline(records, sessionId) {
+/**
+ * Resumable Timeline projector — same contract as the history projector
+ * below (feed in file order; finalize without consuming state), same reason:
+ * a live giant refreshed its Timeline through a full 74K-record replay, and
+ * with two giants open the records cache thrashed (evict/full parse every
+ * ~10s, live 07.08 09:56). Timeline enrichment mutates the LAST user entry
+ * retroactively (token_count/task_complete arrive after the row was pushed),
+ * which is resumable by construction — the mutated object is the retained
+ * one; finalize hands out shallow copies so callers never alias live state.
+ *
+ * Also tracks the session-meta head and the fork live-start boundary so
+ * getTimelineSessionMeta no longer needs the records array.
+ */
+function createCodexTimelineProjector(sessionId) {
   const entries = [];
-  const compactCompanionLines = codexCompactCompanionLines(records);
   let currentUser = null;
   let currentTurnIndex = -1;
   let latestModel = null;
   let latestEffort = null;
   let latestTokenCountInfo = null;
+  let pendingCompactCompanions = 0;
+  let metaRecord = null;
+  let forkLiveStartLine;
+  let forkStartedAtMs = NaN;
 
-  for (const record of records) {
+  const feed = (record) => {
     const payload = record.payload || {};
 
+    if (record.type === 'session_meta') {
+      if (!metaRecord) {
+        metaRecord = { payload, __line: record.__line };
+        if (payload.forked_from_id) {
+          forkStartedAtMs = parseTimestampMs(payload.timestamp);
+        }
+      }
+      return;
+    }
+
+    // Fork live boundary: first task_started proving the fork's own live run
+    // (mirrors getCodexForkLiveStartLine, evaluated incrementally).
+    if (
+      forkLiveStartLine === undefined
+      && Number.isFinite(forkStartedAtMs)
+      && record.type === 'event_msg'
+      && payload.type === 'task_started'
+    ) {
+      const payloadStartedAt = Number(payload.started_at);
+      if (Number.isFinite(payloadStartedAt) && payloadStartedAt > 0) {
+        if (payloadStartedAt * 1000 >= forkStartedAtMs - 1000) forkLiveStartLine = record.__line;
+      } else {
+        const recordAtMs = parseTimestampMs(record.timestamp);
+        if (Number.isFinite(recordAtMs) && recordAtMs >= forkStartedAtMs + 1000) {
+          forkLiveStartLine = record.__line;
+        }
+      }
+    }
+
     if (record.type === 'compacted') {
+      pendingCompactCompanions += 1;
       const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
       entries.push({
         uuid: stableUuid(sessionId, record.__line, 'codex-compact'),
@@ -2721,24 +2772,27 @@ function buildCodexTimeline(records, sessionId) {
         sessionId,
         turnIndex: currentTurnIndex,
       });
-      continue;
+      return;
     }
 
     if (record.type === 'turn_context') {
       latestModel = payload.model || latestModel;
       latestEffort = payload.effort || latestEffort;
       if (currentUser) currentUser.responseModel = latestModel || currentUser.responseModel;
-      continue;
+      return;
     }
 
     if (record.type === 'event_msg') {
       if (payload.type === 'user_message') {
+        // Companion pairing window closes at the next real user turn (same
+        // counter semantics as the old whole-file pre-pass).
+        pendingCompactCompanions = 0;
         const text = payload.message || extractTextContent(payload.content) || '';
         // Service record, not a user turn: a fire-and-forget subagent
         // announces completion via <subagent_notification> inside a user
         // message. Full history feeds it to the card tracker; Timeline must
         // not mint a phantom dot for it.
-        if (isCodexSubagentNotification(payload)) continue;
+        if (isCodexSubagentNotification(payload)) return;
         currentTurnIndex += 1;
         const entry = {
           uuid: stableUuid(sessionId, record.__line, 'codex-user'),
@@ -2808,8 +2862,9 @@ function buildCodexTimeline(records, sessionId) {
       } else if (payload.type === 'task_complete' && currentUser) {
         currentUser.responseComplete = true;
       } else if (isCompactPayload(payload)) {
-        if (compactCompanionLines.has(record.__line)) {
-          continue;
+        if (pendingCompactCompanions > 0) {
+          pendingCompactCompanions -= 1;
+          return;
         }
         const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
         entries.push({
@@ -2823,7 +2878,7 @@ function buildCodexTimeline(records, sessionId) {
           turnIndex: currentTurnIndex,
         });
       }
-      continue;
+      return;
     }
 
     if (record.type === 'response_item') {
@@ -2836,15 +2891,64 @@ function buildCodexTimeline(records, sessionId) {
         currentUser.responseModel = payload.model || latestModel || currentUser.responseModel;
       }
     }
-  }
+  };
 
-  return entries;
+  const finalize = () => entries.map((entry) => ({ ...entry }));
+
+  const getSessionMeta = () => {
+    const meta = metaRecord?.payload || {};
+    return {
+      id: meta.id,
+      forked_from_id: meta.forked_from_id,
+      timestamp: meta.timestamp,
+      cwd: meta.cwd,
+      sourceLine: metaRecord?.__line,
+      forkLiveStartLine,
+    };
+  };
+
+  return { feed, finalize, getSessionMeta };
 }
 
-function buildCodexFullHistory(records, sessionId) {
+function buildCodexTimeline(records, sessionId) {
+  const projector = createCodexTimelineProjector(sessionId);
+  for (const record of Array.isArray(records) ? records : []) {
+    projector.feed(record);
+  }
+  return projector.finalize();
+}
+
+/**
+ * Resumable full-history projector.
+ *
+ * The one-shot `buildCodexFullHistory(records)` pass made every refresh of a
+ * live session O(whole file): one appended tool result re-projected all 74K
+ * records of a 730MB rollout (~3.5s of main loop, tab-3163/3233 ping-pong,
+ * live 07.08 09:56). The projector keeps the pass's accumulated state —
+ * entries, pending calls, exec cells, subagent tracker, thinking buffer —
+ * so a refresh feeds ONLY the appended records.
+ *
+ * Contract:
+ * - `feed(record)` consumes exactly one parsed rollout record. Records must
+ *   arrive in file order; identity fields (__line/__byteOffset) come from
+ *   the JSONL reader and are stable across incremental re-reads.
+ * - `finalize()` returns the presentation array WITHOUT consuming state: the
+ *   in-flight tail (pending calls materialized as live cards) is built on a
+ *   copy each time, so `feed` may continue afterwards. Calling it twice in a
+ *   row returns equal results.
+ * - The compact-companion pre-pass of the old builder is folded into a
+ *   forward counter (its transitions only ever depended on records already
+ *   seen), so no whole-file pre-scan remains.
+ *
+ * Mutation rules the resumability leans on (same as the one-shot pass):
+ * Task cards are shared by reference between state entries and the tracker
+ * and are mutated in place by later records; background exec cells fill
+ * results into already-pushed action objects. `finalize` mutating a card via
+ * the own-transcript last resort is monotone (completed never reverts except
+ * by an explicit resume record, which arrives through `feed`).
+ */
+function createCodexHistoryProjector(sessionId) {
   const entries = [];
-  const compactCompanionLines = codexCompactCompanionLines(records);
-  const sessionCwd = getSessionMeta(records).cwd || '';
   const pendingCalls = new Map();
   const pendingExecCells = new Map();
   const subagents = createCodexSubagentTracker();
@@ -2858,14 +2962,26 @@ function buildCodexFullHistory(records, sessionId) {
     if (processGeneration) card.processGeneration = processGeneration;
     return card;
   };
+  let sessionCwd = '';
   let currentTurnIndex = -1;
   let pendingThinking = '';
   let latestTokenCountInfo = null;
   let lastDisplayedModel = null;
   let lastDisplayedEffort = null;
+  // Inline companion counter (was codexCompactCompanionLines): a top-level
+  // `compacted` snapshot arms it; the next compact-like event_msg before a
+  // real user turn is that snapshot's telemetry twin and renders nothing.
+  let pendingCompactCompanions = 0;
+  let consumedRecords = 0;
 
-  for (const record of records) {
+  const feed = (record) => {
+    consumedRecords += 1;
     const payload = record.payload || {};
+
+    if (record.type === 'session_meta') {
+      if (!sessionCwd) sessionCwd = payload.cwd || '';
+      return;
+    }
 
     if (record.type === 'turn_context') {
       const model = typeof payload.model === 'string' ? payload.model.trim() : '';
@@ -2893,13 +3009,15 @@ function buildCodexFullHistory(records, sessionId) {
         });
         lastDisplayedEffort = effort;
       }
-      continue;
+      return;
     }
 
     if (record.type === 'compacted') {
+      pendingCompactCompanions += 1;
       const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
       entries.push({
         uuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+        sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-compact'),
         role: 'compact',
         timestamp: recordTimestamp(record),
         content: 'Conversation compacted',
@@ -2908,7 +3026,7 @@ function buildCodexFullHistory(records, sessionId) {
         sessionId,
         turnIndex: currentTurnIndex,
       });
-      continue;
+      return;
     }
 
     if (record.type === 'event_msg') {
@@ -2923,6 +3041,10 @@ function buildCodexFullHistory(records, sessionId) {
       if (payload.type === 'patch_apply_end') {
         attachCodexPatchApplyEvent(pendingCalls, payload, sessionCwd);
       } else if (payload.type === 'user_message') {
+        // The companion pairing window closes at the next real user turn —
+        // reset BEFORE the notification check, mirroring the old pre-pass
+        // which reset on every user_message unconditionally.
+        pendingCompactCompanions = 0;
         const userText = payload.message || extractTextContent(payload.content) || '';
         // Third subagent completion path: a fire-and-forget child announces
         // its outcome via <subagent_notification> INSIDE a user message —
@@ -2932,7 +3054,7 @@ function buildCodexFullHistory(records, sessionId) {
         // <task-notification> filter.
         if (userText.includes('<subagent_notification>')) {
           subagents.onSubagentNotification(userText);
-          continue;
+          return;
         }
         currentTurnIndex += 1;
         entries.push({
@@ -2956,12 +3078,14 @@ function buildCodexFullHistory(records, sessionId) {
         // interrupted. Mutates the already-pushed Task card in place.
         subagents.onSubAgentActivity(payload);
       } else if (isCompactPayload(payload)) {
-        if (compactCompanionLines.has(record.__line)) {
-          continue;
+        if (pendingCompactCompanions > 0) {
+          pendingCompactCompanions -= 1;
+          return;
         }
         const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
         entries.push({
           uuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-compact'),
           role: 'compact',
           timestamp: recordTimestamp(record),
           content: 'Conversation compacted',
@@ -2971,10 +3095,10 @@ function buildCodexFullHistory(records, sessionId) {
           turnIndex: currentTurnIndex,
         });
       }
-      continue;
+      return;
     }
 
-    if (record.type !== 'response_item') continue;
+    if (record.type !== 'response_item') return;
 
     if (payload.type === 'message' && payload.role === 'user') {
       const userText = extractTextContent(payload.content) || '';
@@ -2988,20 +3112,20 @@ function buildCodexFullHistory(records, sessionId) {
       if (userText.includes('<subagent_notification>')) {
         subagents.onSubagentNotification(userText);
       }
-      continue;
+      return;
     }
 
     if (payload.type === 'reasoning') {
       const text = extractReasoning(payload.summary);
       if (text) pendingThinking = pendingThinking ? `${pendingThinking}\n${text}` : text;
-      continue;
+      return;
     }
 
     if (payload.type === 'message' && payload.role === 'assistant') {
       const text = extractTextContent(payload.content);
       pushAssistantEntry(entries, sessionId, record, currentTurnIndex, text, pendingThinking, null);
       pendingThinking = '';
-      continue;
+      return;
     }
 
     if (payload.type === 'agent_message') {
@@ -3010,7 +3134,7 @@ function buildCodexFullHistory(records, sessionId) {
       // and only prove liveness. Never rendered as a normal assistant row —
       // author is the subagent, not this session's assistant.
       subagents.onAgentMessage(payload, extractTextContent);
-      continue;
+      return;
     }
 
     if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
@@ -3044,7 +3168,7 @@ function buildCodexFullHistory(records, sessionId) {
         pendingCall.subagentCard = registerSubagentSpawn(pendingCall);
       }
       pendingCalls.set(callId, pendingCall);
-      continue;
+      return;
     }
 
     if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
@@ -3078,7 +3202,7 @@ function buildCodexFullHistory(records, sessionId) {
         );
         pendingThinking = '';
         pendingCalls.delete(callId);
-        continue;
+        return;
       }
       if (isCodexSubagentControlCall(call)) {
         const absorbed = subagents.absorbControlOutput(call, payload.output);
@@ -3086,7 +3210,7 @@ function buildCodexFullHistory(records, sessionId) {
           pushAssistantEntry(entries, sessionId, record, currentTurnIndex, '', pendingThinking, null);
           pendingThinking = '';
           pendingCalls.delete(callId);
-          continue;
+          return;
         }
       }
       const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
@@ -3116,77 +3240,419 @@ function buildCodexFullHistory(records, sessionId) {
       pendingThinking = '';
       pendingCalls.delete(callId);
     }
-  }
+  };
 
-  // A transcript-changed notification is emitted as soon as Codex appends the
-  // call, before its output exists. Keep that in-flight call in the canonical
-  // history snapshot so a live semantic tool card is not briefly replaced by
-  // an empty REST reload during a long-running command. A pending `wait` for a
-  // known async exec cell is intentionally hidden: the original projected card
-  // is already present in `entries` and owns the eventual result.
-  for (const call of pendingCalls.values()) {
-    const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
-    if (waitCellId && pendingExecCells.has(waitCellId)) continue;
-    // In-flight spawn (no output yet): show a running Task card, not raw JSON.
-    if (isCodexSubagentSpawnCall(call)) {
-      const card = call.subagentCard || registerSubagentSpawn(call);
+  const finalize = () => {
+    // A transcript-changed notification is emitted as soon as Codex appends
+    // the call, before its output exists. Keep that in-flight call in the
+    // canonical history snapshot so a live semantic tool card is not briefly
+    // replaced by an empty REST reload during a long-running command. A
+    // pending `wait` for a known async exec cell is intentionally hidden: the
+    // original projected card is already present in `entries` and owns the
+    // eventual result.
+    //
+    // Built on a COPY: pending calls stay pending and the thinking buffer is
+    // not consumed, so later `feed` calls attach them to their real records
+    // exactly as a fresh one-shot pass at that future moment would.
+    const tail = [];
+    let tailThinking = pendingThinking;
+    for (const call of pendingCalls.values()) {
+      const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
+      if (waitCellId && pendingExecCells.has(waitCellId)) continue;
+      // In-flight spawn (no output yet): show a running Task card, not raw
+      // JSON. The card is cached on the call so repeated finalizes reuse ONE
+      // tracker identity instead of re-registering a fresh card (which would
+      // orphan the accumulated status of the previous one).
+      if (isCodexSubagentSpawnCall(call)) {
+        if (!call.subagentCard) call.subagentCard = registerSubagentSpawn(call);
+        pushAssistantEntry(
+          tail,
+          sessionId,
+          call.record || { __line: call.line, timestamp: call.timestamp },
+          currentTurnIndex,
+          '',
+          tailThinking,
+          [call.subagentCard],
+        );
+        tailThinking = '';
+        continue;
+      }
+      // An in-flight wait_agent while subagent cards exist is control-plane
+      // noise — the cards already carry the live status.
+      if (isCodexSubagentControlCall(call) && call.toolName === 'wait_agent' && subagents.hasCards()) {
+        continue;
+      }
+      const decoded = codexHistoryActionsForCall(call, undefined, false);
       pushAssistantEntry(
-        entries,
+        tail,
         sessionId,
         call.record || { __line: call.line, timestamp: call.timestamp },
         currentTurnIndex,
         '',
-        pendingThinking,
-        [card],
+        tailThinking,
+        decoded.actions
       );
-      pendingThinking = '';
-      continue;
+      tailThinking = '';
     }
-    // An in-flight wait_agent while subagent cards exist is control-plane
-    // noise — the cards already carry the live status.
-    if (isCodexSubagentControlCall(call) && call.toolName === 'wait_agent' && subagents.hasCards()) {
-      continue;
+
+    // Last resort for cards the parent never closed. `wait_agent` is routinely
+    // called with no target, and its "Wait completed" output names nobody — so
+    // an agent that really finished can leave zero terminal trace in this
+    // rollout and keep animating the tab forever (live production tab: 12 of
+    // 36 spawns, 11 of them plainly finished in their own file). Each such
+    // agent is checked against its OWN transcript, which is authoritative
+    // about itself. Card mutation here is monotone — an explicit resume
+    // record arriving later through `feed` reopens it, same as a fresh pass.
+    const stillRunning = subagents.runningCards();
+    if (stillRunning.length > 0) {
+      let resolved = 0;
+      for (const card of stillRunning) {
+        const threadId = card.agentSessionId;
+        if (!threadId) continue;
+        const filePath = findCodexAgentFile({ agentSessionId: threadId });
+        if (!filePath) continue;
+        if (!isAgentFinishedByOwnTranscript({ toolType: 'codex', filePath })) continue;
+        card.subagentStatus = 'completed';
+        card.description = card.baseDescription;
+        if (!card.result) card.result = 'Агент завершил работу (по его собственной истории).';
+        resolved += 1;
+      }
+      if (resolved > 0) {
+        console.log('[CodexSubagents] closed by own transcript: ' + resolved
+          + '/' + stillRunning.length + ' session=' + String(sessionId).slice(0, 8));
+      }
     }
-    const decoded = codexHistoryActionsForCall(call, undefined, false);
-    pushAssistantEntry(
-      entries,
-      sessionId,
-      call.record || { __line: call.line, timestamp: call.timestamp },
-      currentTurnIndex,
-      '',
-      pendingThinking,
-      decoded.actions
-    );
-    pendingThinking = '';
+
+    const presented = new Array(entries.length + tail.length);
+    for (let index = 0; index < entries.length; index += 1) {
+      const { turnIndex, ...entry } = entries[index];
+      presented[index] = entry;
+    }
+    for (let index = 0; index < tail.length; index += 1) {
+      const { turnIndex, ...entry } = tail[index];
+      presented[entries.length + index] = entry;
+    }
+    return presented;
+  };
+
+  return {
+    feed,
+    finalize,
+    getConsumedRecords: () => consumedRecords,
+    // Live view of the accumulated rows, for cost accounting only. Excludes
+    // the in-flight tail (which finalize builds fresh each time) — that is a
+    // handful of rows and never the memory that matters.
+    peekEntries: () => entries,
+  };
+}
+
+function buildCodexFullHistory(records, sessionId) {
+  const projector = createCodexHistoryProjector(sessionId);
+  for (const record of Array.isArray(records) ? records : []) {
+    projector.feed(record);
+  }
+  return projector.finalize();
+}
+
+// ── Per-session projector reuse (file-cursor based) ─────────────────────────
+// The projector cache turns a live-session History refresh from O(file) into
+// O(appended tail) — and, unlike the records cache, it does not need the
+// parsed records array at all after the first build: the cache record keeps a
+// FILE CURSOR (size/mtime consumed + carry-over of a partially written last
+// line, mirroring _parseJsonlFileIncremental's semantics exactly), and a
+// refresh reads only bytes [cursor.size, stat.size) straight from disk. Two
+// 730MB rollouts therefore stop fighting over the 768MB records budget: what
+// survives per giant is the projector state + projected entries (~150MB),
+// bounded by the cap below.
+//
+// Witness rules (same as the records cache): size+mtime equal → unchanged;
+// size grew → append-only tail read; size shrank or same-size-different-mtime
+// → the file was rewritten, burn and rebuild. Explicit rewrite paths
+// (edit/fork/forceFresh) additionally burn through invalidateCodexJsonlCache.
+//
+// The cache is bounded by BYTES, not by session count. Counting sessions was
+// the original bound (cap 2, chosen when a giant's projection cost ~150MB),
+// and it broke the moment row-level hydration made a giant cheap: an 18-row
+// session and a 16K-row session each took one slot, so opening eleven small
+// tabs evicted the giant and the return paid a full 5.5s re-parse (live
+// 07.08 17:45, tab-3163). A byte budget makes the bound describe the thing
+// it protects — main-process memory — instead of a proxy that no longer
+// correlates with it.
+const CODEX_HISTORY_PROJECTOR_BUDGET_DEFAULT_MB = 400;
+// Belt to the byte budget's suspenders: an accounting bug that
+// under-estimates rows must not turn the cache unbounded.
+const CODEX_HISTORY_PROJECTOR_CACHE_MAX = 12;
+let _codexHistoryProjectorBudgetBytes = CODEX_HISTORY_PROJECTOR_BUDGET_DEFAULT_MB * 1024 * 1024;
+let _codexHistoryProjectorBytes = 0;
+const _codexHistoryProjectors = new Map(); // sessionId → cache record
+const _codexProjectorChains = new Map(); // sessionId → serialization tail
+
+/**
+ * Budget is read once at startup from the app settings (see
+ * `historyProjectorBudgetMb` in SettingsModal) — changing it takes effect on
+ * restart, which is what the setting's own hint promises. Applying it live
+ * would mean re-costing every cached projector mid-flight for a knob nobody
+ * turns twice a session.
+ */
+function setCodexHistoryProjectorBudgetMb(valueMb) {
+  const parsed = Math.floor(Number(valueMb));
+  if (!Number.isFinite(parsed) || parsed <= 0) return _codexHistoryProjectorBudgetBytes;
+  // Floor keeps one giant resident whatever the user types; ceiling keeps a
+  // typo from claiming the whole V8 heap of the main process.
+  const clamped = Math.max(64, Math.min(2048, parsed));
+  _codexHistoryProjectorBudgetBytes = clamped * 1024 * 1024;
+  console.log('[CodexHistoryProjector] budget=' + clamped + 'MB'
+    + (clamped !== parsed ? ' requested=' + parsed + ' (clamped)' : ''));
+  return _codexHistoryProjectorBudgetBytes;
+}
+
+/**
+ * Approximate retained bytes of one projector's presentation.
+ *
+ * Sampled, not walked: the array can hold 16K rows and this runs on every
+ * cache insert. Heavy payloads already live in the shared payload stash
+ * (dehydration), so what is measured here is the presentation skeleton —
+ * exactly what the renderer-side estimator measures on its own copy, and its
+ * numbers matched production within the same order (12-30MB per session).
+ */
+const PROJECTOR_COST_SAMPLE_ROWS = 48;
+function estimateProjectorBytes(entries) {
+  const rows = Array.isArray(entries) ? entries.length : 0;
+  if (rows === 0) return 0;
+  let sampledBytes = 0;
+  let sampled = 0;
+  const step = Math.max(1, Math.floor(rows / PROJECTOR_COST_SAMPLE_ROWS));
+  for (let index = 0; index < rows; index += step) {
+    const entry = entries[index];
+    if (!entry) continue;
+    let bytes = 128; // object overhead + fixed identity fields
+    if (typeof entry.content === 'string') bytes += entry.content.length * 2;
+    if (typeof entry.thinking === 'string') bytes += entry.thinking.length * 2;
+    if (typeof entry.compactSummary === 'string') bytes += entry.compactSummary.length * 2;
+    const actions = Array.isArray(entry.actions) ? entry.actions : null;
+    if (actions) {
+      for (const action of actions) {
+        bytes += 96;
+        const raw = action && action.tool === '__raw__' ? action.rawTool : null;
+        if (!raw) continue;
+        if (typeof raw.result === 'string') bytes += raw.result.length * 2;
+        if (raw.args) {
+          // Args hold apply_patch bodies and command text — the biggest
+          // remaining non-dehydrated field.
+          for (const value of Object.values(raw.args)) {
+            if (typeof value === 'string') bytes += value.length * 2;
+            else bytes += 32;
+          }
+        }
+        if (Array.isArray(raw.diffHunks)) {
+          for (const hunk of raw.diffHunks) {
+            const lines = Array.isArray(hunk?.entries) ? hunk.entries.length : 0;
+            bytes += 64 + lines * 96;
+          }
+        }
+      }
+    }
+    sampledBytes += bytes;
+    sampled += 1;
+  }
+  if (sampled === 0) return rows * 128;
+  return Math.round((sampledBytes / sampled) * rows);
+}
+
+function _dropProjectorEntry(sessionId) {
+  const cached = _codexHistoryProjectors.get(sessionId);
+  if (!cached) return false;
+  _codexHistoryProjectors.delete(sessionId);
+  _codexHistoryProjectorBytes = Math.max(0, _codexHistoryProjectorBytes - (cached.approxBytes || 0));
+  return true;
+}
+
+function invalidateCodexHistoryProjectors(filePath = null) {
+  if (!filePath) {
+    _codexHistoryProjectors.clear();
+    _codexHistoryProjectorBytes = 0;
+    return;
+  }
+  for (const [sessionId, cached] of [..._codexHistoryProjectors]) {
+    if (cached.filePath === filePath) _dropProjectorEntry(sessionId);
+  }
+}
+
+function getCodexHistoryProjectorStats() {
+  return {
+    sessions: _codexHistoryProjectors.size,
+    approxBytes: _codexHistoryProjectorBytes,
+    budgetBytes: _codexHistoryProjectorBudgetBytes,
+  };
+}
+
+/**
+ * Serialized per session: overlapping calls (renderer History refresh +
+ * Timeline + web client) must not feed the same projectors concurrently —
+ * later callers wait and then see an unchanged cursor.
+ */
+function _chainCodexProjection(sessionId, task) {
+  const previous = _codexProjectorChains.get(sessionId) || Promise.resolve();
+  const run = previous.catch(() => {}).then(task);
+  _codexProjectorChains.set(sessionId, run);
+  run.finally(() => {
+    if (_codexProjectorChains.get(sessionId) === run) {
+      _codexProjectorChains.delete(sessionId);
+    }
+  }).catch(() => {});
+  return run;
+}
+
+function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
+  return _chainCodexProjection(sessionId, async () => {
+    const advanced = await _advanceCodexProjection(sessionId, cwd, options);
+    if (!advanced.success) return advanced;
+    const entries = advanced.cached.historyProjector.finalize();
+    return { ...advanced.result, entries };
+  });
+}
+
+function projectCodexTimelineFromFile(sessionId, cwd, options = {}) {
+  return _chainCodexProjection(sessionId, async () => {
+    const advanced = await _advanceCodexProjection(sessionId, cwd, options);
+    if (!advanced.success) return advanced;
+    const entries = advanced.cached.timelineProjector.finalize();
+    const sessionMeta = advanced.cached.timelineProjector.getSessionMeta();
+    return { ...advanced.result, entries, sessionMeta };
+  });
+}
+
+async function _advanceCodexProjection(sessionId, cwd, options = {}) {
+  const startedAt = Date.now();
+  const found = await findCodexSessionFile(sessionId, cwd, {
+    ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}),
+  });
+  if (!found) return { success: false, error: 'Codex session file not found' };
+  const filePath = found.filePath;
+  let stat;
+  try {
+    stat = await fs.promises.stat(filePath);
+  } catch (error) {
+    invalidateCodexHistoryProjectors(filePath);
+    return { success: false, error: 'Codex session stat failed: ' + (error?.message || error) };
   }
 
-  // Last resort for cards the parent never closed. `wait_agent` is routinely
-  // called with no target, and its "Wait completed" output names nobody — so an
-  // agent that really finished can leave zero terminal trace in this rollout
-  // and keep animating the tab forever (live production tab: 12 of 36 spawns,
-  // 11 of them plainly finished in their own file). Each such agent is checked
-  // against its OWN transcript, which is authoritative about itself.
-  const stillRunning = subagents.runningCards();
-  if (stillRunning.length > 0) {
-    let resolved = 0;
-    for (const card of stillRunning) {
-      const threadId = card.agentSessionId;
-      if (!threadId) continue;
-      const filePath = findCodexAgentFile({ agentSessionId: threadId });
-      if (!filePath) continue;
-      if (!isAgentFinishedByOwnTranscript({ toolType: 'codex', filePath })) continue;
-      card.subagentStatus = 'completed';
-      card.description = card.baseDescription;
-      if (!card.result) card.result = 'Агент завершил работу (по его собственной истории).';
-      resolved += 1;
-    }
-    if (resolved > 0) {
-      console.log('[CodexSubagents] closed by own transcript: ' + resolved
-        + '/' + stillRunning.length + ' session=' + String(sessionId).slice(0, 8));
-    }
+  let cached = _codexHistoryProjectors.get(sessionId) || null;
+  let mode = 'rebuild';
+  if (cached && cached.filePath === filePath) {
+    if (cached.fileSize === stat.size && cached.fileMtimeMs === stat.mtimeMs) mode = 'unchanged';
+    else if (stat.size > cached.fileSize) mode = 'append';
   }
 
-  return entries.map(({ turnIndex, ...entry }) => entry);
+  let fedRecords = 0;
+  let readBytes = 0;
+  if (mode === 'rebuild') {
+    _dropProjectorEntry(sessionId);
+    // Self-contained read up to OUR stat.size — deliberately not coupled to
+    // parseJsonlFile's records cache. Copying a cursor from that cache is
+    // racy (the file can grow between our stat and the shared parse, and a
+    // straddling last line cannot be reconstructed afterwards), and coupling
+    // would also keep giants pinned in the 768MB records budget for History's
+    // sake. The projector cache makes rebuilds rare (first open / rewrite),
+    // so one direct read is the whole price; the records cache keeps serving
+    // usage/export consumers independently. One read feeds BOTH projections.
+    const result = await readJsonlRange(filePath, 0, stat.size - 1);
+    const historyProjector = createCodexHistoryProjector(sessionId);
+    const timelineProjector = createCodexTimelineProjector(sessionId);
+    for (const record of result.records) {
+      historyProjector.feed(record);
+      timelineProjector.feed(record);
+    }
+    fedRecords = result.records.length;
+    readBytes = stat.size;
+    cached = {
+      historyProjector,
+      timelineProjector,
+      filePath,
+      fileSize: stat.size,
+      fileMtimeMs: stat.mtimeMs,
+      lineCount: result.lineCount,
+      leftoverBuffer: result.leftoverBuffer,
+    };
+  } else if (mode === 'append') {
+    const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {
+      records: [],
+      lineCount: cached.lineCount,
+      leftoverBuffer: cached.leftoverBuffer,
+    });
+    for (const record of result.records) {
+      cached.historyProjector.feed(record);
+      cached.timelineProjector.feed(record);
+    }
+    fedRecords = result.records.length;
+    readBytes = stat.size - cached.fileSize;
+    cached.fileSize = stat.size;
+    cached.fileMtimeMs = stat.mtimeMs;
+    cached.lineCount = result.lineCount;
+    cached.leftoverBuffer = result.leftoverBuffer;
+  }
+
+  // LRU refresh + byte budget. Re-costed on every advance: an append grows
+  // the projection, and a stale cost would let the cache drift past its
+  // budget exactly on the sessions that grow fastest.
+  const previousCost = _codexHistoryProjectors.get(sessionId) === cached
+    ? (cached.approxBytes || 0)
+    : 0;
+  cached.approxBytes = estimateProjectorBytes(cached.historyProjector.peekEntries());
+  _codexHistoryProjectors.delete(sessionId);
+  _codexHistoryProjectorBytes = Math.max(0, _codexHistoryProjectorBytes - previousCost)
+    + cached.approxBytes;
+  _codexHistoryProjectors.set(sessionId, cached);
+  const evicted = [];
+  while (
+    _codexHistoryProjectors.size > CODEX_HISTORY_PROJECTOR_CACHE_MAX
+    || (_codexHistoryProjectorBytes > _codexHistoryProjectorBudgetBytes
+      && _codexHistoryProjectors.size > 1)
+  ) {
+    // Never evict the session we just served (it is the newest key, and the
+    // size>1 guard keeps one giant resident even if it alone exceeds the
+    // budget — the alternative is re-parsing it on every single request).
+    const lruKey = _codexHistoryProjectors.keys().next().value;
+    if (lruKey === undefined || lruKey === sessionId) break;
+    evicted.push(lruKey);
+    _dropProjectorEntry(lruKey);
+  }
+  if (evicted.length > 0) {
+    console.log('[CodexHistoryProjector] evict sessions=' + evicted.map((id) => String(id).slice(0, 8)).join(',')
+      + ' remaining=' + _codexHistoryProjectors.size
+      + ' usedMB=' + Math.round(_codexHistoryProjectorBytes / (1024 * 1024))
+      + ' budgetMB=' + Math.round(_codexHistoryProjectorBudgetBytes / (1024 * 1024)));
+  }
+
+  if (mode !== 'unchanged' || Date.now() - startedAt >= 50) {
+    console.log('[CodexHistoryProjector] session=' + String(sessionId || '').slice(0, 8)
+      + ' mode=' + mode
+      + ' fed=' + fedRecords
+      + ' readKB=' + Math.round(readBytes / 1024)
+      + ' consumed=' + cached.historyProjector.getConsumedRecords()
+      + ' ms=' + (Date.now() - startedAt));
+  }
+  return {
+    success: true,
+    cached,
+    result: {
+      success: true,
+      filePath,
+      mode,
+      fedRecords,
+      // Built from the CURSOR, not a fresh stat: the file may have grown
+      // again while we were reading, and a revision newer than the entries
+      // it labels would make the next ifRevision check falsely answer
+      // "unchanged".
+      sourceSnapshot: {
+        filePath,
+        size: cached.fileSize,
+        mtimeMs: cached.fileMtimeMs,
+        sessionId,
+        linkKind: 'end',
+      },
+    },
+  };
 }
 
 const CODEX_SHELL_TOOLS = new Set([
@@ -6653,15 +7119,19 @@ function register({ projectManager, transcriptService } = {}) {
 
   ipcMain.handle('codex:get-timeline', async (_event, { sessionId, cwd }) => {
     try {
-      const loaded = await loadSessionRecords(sessionId, cwd);
-      if (!loaded.success) return loaded;
+      // Same file-cursor projector as the panel's Timeline: this channel is
+      // also called on ordinary flows (tab-title generation, AI-launch
+      // finalize), and a full re-parse of a giant rollout there is exactly
+      // the storm that evicted the active session from the records cache.
+      const projected = await projectCodexTimelineFromFile(sessionId, cwd);
+      if (!projected.success) return projected;
       return {
         success: true,
-        entries: buildCodexTimeline(loaded.records, sessionId),
-        sessionMeta: getTimelineSessionMeta(loaded.records),
+        entries: projected.entries,
+        sessionMeta: projected.sessionMeta,
         sessionBoundaries: [],
         claudeMemoryBoundaryUuid: null,
-        filePath: loaded.filePath,
+        filePath: projected.filePath,
       };
     } catch (error) {
       console.error('[CodexData] get-timeline error:', error);
@@ -7070,6 +7540,14 @@ module.exports = {
     forkCodexFromLatestCompact,
     loadSessionRecords,
     buildCodexFullHistory,
+    createCodexHistoryProjector,
+    projectCodexFullHistoryFromFile,
+    projectCodexTimelineFromFile,
+    createCodexTimelineProjector,
+    invalidateCodexHistoryProjectors,
+    getCodexHistoryProjectorStats,
+    setCodexHistoryProjectorBudgetMb,
+    estimateProjectorBytes,
     buildCodexTimeline,
     findCodexExecNestedCalls,
     resolveSimpleJsCallValue,

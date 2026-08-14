@@ -6,6 +6,7 @@ import TabTaskPlanPanel from './TabTaskPlanPanel';
 import Timeline from './Timeline';
 import ClaudeControlBar from './ClaudeControlBar';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
+import type { AgentLifecycleSummary } from './agentLifecycleSummary';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -19,6 +20,15 @@ interface SplitPaneSurfaceProps {
   projectId: string;
   tabId: string;
   focused: boolean;
+  /**
+   * Start/stop/interrupted status of the agent in THIS pane, shown inside the
+   * pane's own transcript header. Panes had no such wiring, which is why the
+   * floating status card could not simply be deleted: without this, a pane
+   * would have had no way to say "loading session" at all.
+   */
+  lifecycleStatus?: AgentLifecycleSummary | null;
+  /** This pane shares its column with another, so it is roughly half height. */
+  stacked?: boolean;
   children: ReactNode;
 }
 
@@ -37,8 +47,13 @@ export default function SplitPaneSurface({
   projectId,
   tabId,
   focused,
+  lifecycleStatus = null,
+  stacked = false,
   children,
 }: SplitPaneSurfaceProps) {
+  // Only the pane whose tab the status is ABOUT may show it — panes belong to
+  // different tabs, and a neighbour's "loading session" would be a lie here.
+  const paneLifecycleStatus = lifecycleStatus?.tabId === tabId ? lifecycleStatus : null;
   const tabType = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
   const commandType = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.commandType || null);
   const claudeSessionId = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.claudeSessionId || '');
@@ -125,8 +140,8 @@ export default function SplitPaneSurface({
   const composerHostId = splitPaneComposerHostId(tabId);
   const showControlBar = tabType !== 'browser' && tabType !== 'file';
 
-  // Height of the transcript's docked controls (composer) — the pane's side
-  // terminal stops above them, exactly like the single-mode side terminal.
+  // Height of the transcript's docked controls (composer). The terminal keeps
+  // stable PTY geometry and is shifted/cropped above this overlay.
   const [historyControlsHeight, setHistoryControlsHeight] = useState(0);
   const handleControlsHeight = useCallback((height: number) => {
     setHistoryControlsHeight((current) => (current === height ? current : height));
@@ -172,6 +187,8 @@ export default function SplitPaneSurface({
                 onToggleTerminal={toggleSideTerminal}
                 onControlsHeightChange={handleControlsHeight}
                 suppressGlobalHotkeys={!focused}
+                lifecycleStatus={paneLifecycleStatus}
+                compactComposer={stacked}
               />
             </div>
           )}
@@ -184,14 +201,21 @@ export default function SplitPaneSurface({
             tabName={tabName}
             floating={historySelected}
             open={!historySelected || sideTerminalOpen}
-            bottomInset={historySelected ? historyControlsHeight : 0}
+            bottomInset={historyControlsHeight}
+            // Panes are already narrow, so a pinned column here would leave the
+            // centre unusable; the pane's side panels stay overlays.
+            pinned={false}
             onClose={closeSideTerminal}
           >
             {children}
           </FloatingTerminalFrame>
 
           {/* Terminal mode: side transcript slice at the pane's right edge.
-              Stays mounted while closed — it owns the docked composer below. */}
+              Stays mounted while closed — it owns the docked composer below.
+              `bottom` is the measured height of that composer, so the panel
+              stops ABOVE the input instead of covering it — the side terminal
+              keeps its PTY geometry and shifts by the same measured inset
+              and the same number, so the two cannot disagree. */}
           {isAgentTab && !historySelected && (
             <div
               data-split-pane-side-history
@@ -199,7 +223,7 @@ export default function SplitPaneSurface({
                 position: 'absolute',
                 top: 0,
                 right: 0,
-                bottom: 0,
+                bottom: Math.max(0, historyControlsHeight),
                 width: historyPanelWidth,
                 maxWidth: '100%',
                 zIndex: 130,
@@ -222,20 +246,32 @@ export default function SplitPaneSurface({
                 terminalIsPrimary
                 terminalOpen={sideHistoryOpen}
                 onToggleTerminal={toggleSideHistory}
+                onControlsHeightChange={handleControlsHeight}
                 suppressGlobalHotkeys={!focused}
+                lifecycleStatus={paneLifecycleStatus}
+                compactComposer={stacked}
               />
             </div>
           )}
 
           {/* Run after strip host — the pane's service layer. Above both
               surfaces (z 120), below the pane's side panels (z 130), never
-              dimmed and never hidden by the mode toggle. */}
+              dimmed and never hidden by the mode toggle.
+              `bottom` is the measured height of this pane's docked input, so
+              the strip stops ABOVE the composer instead of overlapping it. The
+              same number moves the pane's terminal upward, so the two cannot
+              disagree. It is a sibling of the terminal stage on purpose: put
+              inside it, the strip would ride that upward shift and drift off
+              the top edge (see FloatingTerminalFrame translateY). */}
           <div
             id={splitPaneQueueHostId(tabId)}
             data-split-pane-queue-host
             style={{
               position: 'absolute',
-              inset: 0,
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: Math.max(0, historyControlsHeight),
               zIndex: 120,
               pointerEvents: 'none',
             }}
@@ -249,22 +285,32 @@ export default function SplitPaneSurface({
               : tabType === 'claude-sdk' ? 'sdk' : 'terminal'}
             commandType={commandType as CommandType | null}
           />
+
+          {/* Keep xterm rows stable while the portalled composer grows. The
+              host overlays the fixed viewport; the inline terminal is shifted
+              upward and clipped instead of being fitted to a shorter box. */}
+          {isAgentTab && !historySelected && (
+            <div
+              id={composerHostId}
+              data-split-pane-composer-host
+              style={{
+                position: 'absolute',
+                left: 0,
+                right: 0,
+                bottom: 0,
+                zIndex: 140,
+                pointerEvents: 'auto',
+              }}
+            />
+          )}
         </div>
 
-        {/* Terminal mode: the ONE composer docks below the terminal (History
-            renders it here through the portal), so the pane types and watches
-            in the same glance — exactly like single mode. */}
-        {isAgentTab && !historySelected && (
-          <div
-            id={composerHostId}
-            data-split-pane-composer-host
-            className="shrink-0"
-            style={{ pointerEvents: 'auto' }}
-          />
-        )}
-
         {showControlBar && (
-          <div style={{ pointerEvents: 'auto', flexShrink: 0, minWidth: 0, overflowX: 'auto', overflowY: 'hidden' }}>
+          // overflowX убран намеренно: он давал горизонтальный скролл вместо
+          // переноса, и в узкой панели бар оставался одной строкой со съехавшими
+          // друг на друга кнопками. Бар теперь сам переносит блоки в две строки
+          // по измеренной ширине (см. ClaudeControlBar / controlBarWrap).
+          <div style={{ pointerEvents: 'auto', flexShrink: 0, minWidth: 0 }}>
             <ClaudeControlBar
               tabId={tabId}
               projectId={projectId}

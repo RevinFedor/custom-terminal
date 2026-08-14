@@ -431,6 +431,8 @@ interface UIStore {
   aiSecondaryFontSize: number; // Secondary AI labels, statuses and composer chips.
   historyComposerMinRows: number; // Empty height for the primary History prompt textarea.
   historyComposerMaxRows: number; // Auto-grow ceiling for the primary History prompt textarea.
+  stackedComposerMaxRows: number; // Same ceiling for a pane stacked in a column (starts at 1 row).
+  setStackedComposerMaxRows: (rows: number) => void;
   aiComposerChipThreshold: number; // Manual paste becomes a chip only above this many characters.
   promptQueueChipFontSize: number; // Run-after chip title font inside the queue list.
   promptQueueEditorFontSize: number; // Run-after chip editor title/body font in the slideout.
@@ -586,6 +588,17 @@ interface UIStore {
   reopenPulseActive: boolean;
   triggerReopenPulse: () => void;
 
+  // "Nothing moved, and here is why": the pane header chip navigates to the
+  // tab's project, so when the sidebar is ALREADY on that project the click has
+  // no visible effect and reads as a dead control. One flash of that project's
+  // card answers where the click went. Holds the project id, not a boolean —
+  // several project cards are on screen at once, and only the one meant may
+  // flash.
+  projectCardPulseId: string | null;
+  /** Bumped on every pulse so a repeat click replays the animation. */
+  projectCardPulseSeq: number;
+  pulseProjectCard: (projectId: string) => void;
+
   // History Panel (per-tab state)
   historyPanelOpenTabs: Record<string, boolean>;
   historyPanelWidth: number;
@@ -732,12 +745,22 @@ interface UIStore {
   // Streaming/privacy mode hides public remote-control hosts/IPs from chrome.
   streamerMode: boolean;
   setStreamerMode: (v: boolean) => void;
+  // Global opt-out for provisional History text read from committed PTY frames.
+  // Canonical JSONL History remains enabled regardless of this preference.
+  terminalHistoryStreamingEnabled: boolean;
+  setTerminalHistoryStreamingEnabled: (v: boolean) => void;
   // Diagnostic toggle: when true, Cmd-popups (tooltip/note/fork) stay open
   // after pointer leaves so user can inspect their inner DOM in devtools.
   freezeCmdPopups: boolean;
   setFreezeCmdPopups: (v: boolean) => void;
   historyPinned: boolean;
   setHistoryPinned: (v: boolean) => void;
+  /** Project selected in the Run after picker. Survives restart; manual only. */
+  runAfterPickerProjectId: string | null;
+  /** Width of the pane header's recent-tabs list, dragged by its right edge. */
+  paneRecentTabsWidth: number;
+  setPaneRecentTabsWidth: (width: number) => void;
+  setRunAfterPickerProjectId: (projectId: string | null) => void;
   timelinePinned: boolean;
   setTimelinePinned: (v: boolean) => void;
   // Center-surface owner for Claude/Codex PTY tabs. See loader comment above.
@@ -1227,6 +1250,15 @@ const loadHistoryComposerMaxRows = (): number => {
   } catch {}
   return 20;
 };
+// Stacked panes are short by construction, so the composer starts at ONE row
+// there and grows to this ceiling instead of the full-height one.
+const loadStackedComposerMaxRows = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-stacked-composer-max-rows');
+    if (v) return Math.max(1, Math.min(20, Math.round(Number(v) || 3)));
+  } catch {}
+  return 3;
+};
 const loadAiComposerChipThreshold = (): number => {
   try {
     const value = localStorage.getItem('noted-terminal-ai-composer-chip-threshold');
@@ -1428,6 +1460,25 @@ const initialStreamerMode = loadStreamerMode();
   } catch {}
 })();
 
+const LOCAL_KEY_TERMINAL_HISTORY_STREAMING = 'noted-terminal-terminal-history-streaming';
+const loadTerminalHistoryStreamingEnabled = (): boolean => {
+  try {
+    const saved = localStorage.getItem(LOCAL_KEY_TERMINAL_HISTORY_STREAMING);
+    return saved === null ? true : saved !== 'false';
+  } catch { return true; }
+};
+const saveTerminalHistoryStreamingEnabled = (enabled: boolean) => {
+  try { localStorage.setItem(LOCAL_KEY_TERMINAL_HISTORY_STREAMING, String(enabled)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('agent-transcript:set-terminal-preview-enabled', {
+      enabled,
+      source: 'ai-composer-toggle',
+    }).catch(() => {});
+  } catch {}
+};
+const initialTerminalHistoryStreamingEnabled = loadTerminalHistoryStreamingEnabled();
+
 // freePortsBeforeStart — SQLite-backed (vite-port-stable). Same migration pattern as
 // defaultClaudeEffort (localStorage initial → async SQLite override).
 const APP_STATE_KEY_FREE_PORTS = 'freePortsBeforeStart';
@@ -1618,10 +1669,29 @@ const APP_STATE_KEY_NEW_TAB_PRIMARY_SURFACE = 'newTabPrimarySurface';
 const APP_STATE_KEY_TERMINAL_PRIMARY_TABS = 'terminalIsPrimaryTabs';
 const APP_STATE_KEY_SIDE_TERMINAL_WIDTH = 'sideTerminalWidth';
 const APP_STATE_KEY_SIDE_TERMINAL_OPEN_TABS = 'sideTerminalOpenTabs';
+// Which project the Run after picker shows. Durable and changed ONLY by a
+// click on a project chip: "I work over here" is a standing context, unlike
+// the show-all toggle next to it, which is a one-off "show me more right now"
+// and therefore never persists.
+const APP_STATE_KEY_RUN_AFTER_PICKER_PROJECT = 'runAfterPickerProjectId';
+// Width of the pane header's recent-tabs list. Durable for the same reason the
+// side panels' widths are: a size the user dragged is a decision, and having
+// to redo it every launch reads as the app forgetting.
+const APP_STATE_KEY_PANE_RECENT_TABS_WIDTH = 'paneRecentTabsWidth';
+// Side TRANSCRIPT open-state, the twin of the side-terminal map above. Both
+// halves of the Cmd+] pair must survive a restart, otherwise the restored
+// layout is only half the one the user left.
+const APP_STATE_KEY_HISTORY_PANEL_OPEN_TABS = 'historyPanelOpenTabs';
 const LS_NEW_TAB_PRIMARY_SURFACE = 'noted-terminal-new-tab-primary-surface';
 const LS_TERMINAL_PRIMARY_TABS = 'noted-terminal-terminal-primary-tabs';
 const LS_SIDE_TERMINAL_WIDTH = 'noted-terminal-side-terminal-width';
 const LS_SIDE_TERMINAL_OPEN_TABS = 'noted-terminal-side-terminal-open-tabs';
+const LS_RUN_AFTER_PICKER_PROJECT = 'noted-terminal-run-after-picker-project';
+const LS_PANE_RECENT_TABS_WIDTH = 'noted-terminal-pane-recent-tabs-width';
+export const PANE_RECENT_TABS_MIN_WIDTH = 180;
+export const PANE_RECENT_TABS_MAX_WIDTH = 640;
+export const PANE_RECENT_TABS_DEFAULT_WIDTH = 260;
+const LS_HISTORY_PANEL_OPEN_TABS = 'noted-terminal-history-panel-open-tabs';
 const SIDE_TERMINAL_MIN_WIDTH = 360;
 const SIDE_TERMINAL_MAX_WIDTH = 1200;
 
@@ -1640,6 +1710,12 @@ const clampSideTerminalWidth = (value: unknown): number => {
   return Number.isFinite(parsed)
     ? Math.max(SIDE_TERMINAL_MIN_WIDTH, Math.min(SIDE_TERMINAL_MAX_WIDTH, parsed))
     : 620;
+};
+const readLocalHistoryPanelOpenTabs = (): Record<string, boolean> => {
+  try {
+    const raw = localStorage.getItem(LS_HISTORY_PANEL_OPEN_TABS);
+    return raw ? sanitizeTerminalPrimaryTabs(JSON.parse(raw)) : {};
+  } catch { return {}; }
 };
 const readLocalPrimarySurface = (): PrimarySurface | null => {
   try { return parsePrimarySurface(localStorage.getItem(LS_NEW_TAB_PRIMARY_SURFACE)); }
@@ -1682,6 +1758,45 @@ const saveSideTerminalWidth = (width: number) => {
     ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_SIDE_TERMINAL_WIDTH, value: width }).catch(() => {});
   } catch {}
 };
+const saveHistoryPanelOpenTabs = (tabs: Record<string, boolean>) => {
+  try { localStorage.setItem(LS_HISTORY_PANEL_OPEN_TABS, JSON.stringify(tabs)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_HISTORY_PANEL_OPEN_TABS, value: tabs }).catch(() => {});
+  } catch {}
+};
+const readLocalRunAfterPickerProject = (): string | null => {
+  try { return localStorage.getItem(LS_RUN_AFTER_PICKER_PROJECT) || null; }
+  catch { return null; }
+};
+const clampPaneRecentTabsWidth = (value: unknown): number => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return PANE_RECENT_TABS_DEFAULT_WIDTH;
+  return Math.max(PANE_RECENT_TABS_MIN_WIDTH, Math.min(PANE_RECENT_TABS_MAX_WIDTH, Math.round(n)));
+};
+const readLocalPaneRecentTabsWidth = (): number => {
+  try {
+    const raw = localStorage.getItem(LS_PANE_RECENT_TABS_WIDTH);
+    return raw === null ? PANE_RECENT_TABS_DEFAULT_WIDTH : clampPaneRecentTabsWidth(raw);
+  } catch { return PANE_RECENT_TABS_DEFAULT_WIDTH; }
+};
+const savePaneRecentTabsWidth = (width: number) => {
+  try { localStorage.setItem(LS_PANE_RECENT_TABS_WIDTH, String(width)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_PANE_RECENT_TABS_WIDTH, value: width }).catch(() => {});
+  } catch {}
+};
+const saveRunAfterPickerProject = (projectId: string | null) => {
+  try {
+    if (projectId) localStorage.setItem(LS_RUN_AFTER_PICKER_PROJECT, projectId);
+    else localStorage.removeItem(LS_RUN_AFTER_PICKER_PROJECT);
+  } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_RUN_AFTER_PICKER_PROJECT, value: projectId }).catch(() => {});
+  } catch {}
+};
 const saveSideTerminalOpenTabs = (tabs: Record<string, boolean>) => {
   try { localStorage.setItem(LS_SIDE_TERMINAL_OPEN_TABS, JSON.stringify(tabs)); } catch {}
   try {
@@ -1696,6 +1811,7 @@ const initialNewTabPrimarySurface: PrimarySurface = localPrimarySurface
 const initialTerminalPrimaryTabs = readLocalTerminalPrimaryTabs();
 const initialSideTerminalWidth = readLocalSideTerminalWidth();
 const initialSideTerminalOpenTabs = readLocalSideTerminalOpenTabs();
+const initialHistoryPanelOpenTabs = readLocalHistoryPanelOpenTabs();
 
 (async () => {
   try {
@@ -1716,6 +1832,29 @@ const initialSideTerminalOpenTabs = readLocalSideTerminalOpenTabs();
       : 'history';
     useUIStore.setState({ newTabPrimarySurface: seeded });
     saveNewTabPrimarySurface(seeded);
+  } catch {}
+})();
+
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const persisted = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_RUN_AFTER_PICKER_PROJECT);
+    if (typeof persisted === 'string' && persisted) {
+      useUIStore.setState({ runAfterPickerProjectId: persisted });
+      try { localStorage.setItem(LS_RUN_AFTER_PICKER_PROJECT, persisted); } catch {}
+    }
+  } catch {}
+})();
+
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const persisted = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_PANE_RECENT_TABS_WIDTH);
+    if (persisted !== null && persisted !== undefined) {
+      const width = clampPaneRecentTabsWidth(persisted);
+      useUIStore.setState({ paneRecentTabsWidth: width });
+      try { localStorage.setItem(LS_PANE_RECENT_TABS_WIDTH, String(width)); } catch {}
+    }
   } catch {}
 })();
 
@@ -1757,6 +1896,20 @@ const initialSideTerminalOpenTabs = readLocalSideTerminalOpenTabs();
       try { localStorage.setItem(LS_SIDE_TERMINAL_OPEN_TABS, JSON.stringify(tabs)); } catch {}
     } else if (Object.keys(initialSideTerminalOpenTabs).length > 0) {
       saveSideTerminalOpenTabs(initialSideTerminalOpenTabs);
+    }
+  } catch {}
+})();
+
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const persisted = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_HISTORY_PANEL_OPEN_TABS);
+    if (persisted && typeof persisted === 'object') {
+      const tabs = sanitizeTerminalPrimaryTabs(persisted);
+      useUIStore.setState({ historyPanelOpenTabs: tabs });
+      try { localStorage.setItem(LS_HISTORY_PANEL_OPEN_TABS, JSON.stringify(tabs)); } catch {}
+    } else if (Object.keys(initialHistoryPanelOpenTabs).length > 0) {
+      saveHistoryPanelOpenTabs(initialHistoryPanelOpenTabs);
     }
   } catch {}
 })();
@@ -2462,6 +2615,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   aiSecondaryFontSize: loadAiSecondaryFontSize(),
   historyComposerMinRows: initialHistoryComposerMinRows,
   historyComposerMaxRows: initialHistoryComposerMaxRows,
+  stackedComposerMaxRows: loadStackedComposerMaxRows(),
   aiComposerChipThreshold: loadAiComposerChipThreshold(),
   promptQueueChipFontSize: loadPromptQueueChipFontSize(),
   promptQueueEditorFontSize: loadPromptQueueEditorFontSize(),
@@ -2561,6 +2715,14 @@ export const useUIStore = create<UIStore>((set, get) => ({
       if (nextMax !== currentMax) {
         localStorage.setItem('noted-terminal-history-composer-max-rows', String(nextMax));
       }
+    } catch {}
+  },
+
+  setStackedComposerMaxRows: (rows: number) => {
+    const clamped = Math.max(1, Math.min(20, Math.round(rows)));
+    set({ stackedComposerMaxRows: clamped });
+    try {
+      localStorage.setItem('noted-terminal-stacked-composer-max-rows', String(clamped));
     } catch {}
   },
 
@@ -2805,8 +2967,36 @@ export const useUIStore = create<UIStore>((set, get) => ({
     }
   },
 
+  projectCardPulseId: null,
+  projectCardPulseSeq: 0,
+  pulseProjectCard: (projectId) => {
+    if (!projectId) return;
+    // Set SYNCHRONOUSLY, in one write. The obvious version — clear, wait a
+    // frame, set again, so the CSS animation restarts from its first keyframe —
+    // never fires in a window that is not on screen: a hidden window paints no
+    // frames, so requestAnimationFrame simply does not run (measured: no frame
+    // after 2.3s). A signal must not depend on a frame.
+    //
+    // The re-arm is carried by a counter instead: the component keys its
+    // animated node on it, so React remounts the node and the animation replays
+    // from the start even when the id has not changed.
+    const seq = (get().projectCardPulseSeq || 0) + 1;
+    set({ projectCardPulseId: projectId, projectCardPulseSeq: seq });
+    if (typeof window === 'undefined') return;
+    const w = window as any;
+    if (w.__projectCardPulseTimer) clearTimeout(w.__projectCardPulseTimer);
+    w.__projectCardPulseTimer = setTimeout(() => {
+      // Only clear OUR pulse: a newer click (on this card or another) bumped the
+      // counter, and its own timer owns the clearing from then on.
+      if (useUIStore.getState().projectCardPulseSeq === seq) {
+        useUIStore.setState({ projectCardPulseId: null });
+      }
+      w.__projectCardPulseTimer = null;
+    }, 600);
+  },
+
   // History Panel (per-tab state)
-	  historyPanelOpenTabs: {},
+	  historyPanelOpenTabs: initialHistoryPanelOpenTabs,
 	  historyPanelWidth: (() => {
 	    try {
 	      const saved = localStorage.getItem('noted-terminal-history-panel-width');
@@ -2831,9 +3021,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyComposerAvailability: {},
   historyRewindPreviews: {},
   promptQueueInputSurfaceTabs: {},
-  setHistoryPanelOpen: (tabId, open) => set(state => ({
-    historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
-  })),
+  setHistoryPanelOpen: (tabId, open) => set(state => {
+    if ((state.historyPanelOpenTabs[tabId] ?? false) === open) return state;
+    const historyPanelOpenTabs = { ...state.historyPanelOpenTabs, [tabId]: open };
+    saveHistoryPanelOpenTabs(historyPanelOpenTabs);
+    return { historyPanelOpenTabs };
+  }),
   setSideTerminalOpen: (tabId, open) => set(state => {
     if ((state.sideTerminalOpenTabs[tabId] ?? false) === open) return state;
     const sideTerminalOpenTabs = { ...state.sideTerminalOpenTabs, [tabId]: open };
@@ -3299,10 +3492,28 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setDebugHoverBridges: (v) => { set({ debugHoverBridges: v }); saveDebugHoverBridges(v); },
   streamerMode: initialStreamerMode,
   setStreamerMode: (v) => { set({ streamerMode: v }); saveStreamerMode(v); },
+  terminalHistoryStreamingEnabled: initialTerminalHistoryStreamingEnabled,
+  setTerminalHistoryStreamingEnabled: (v) => {
+    set({ terminalHistoryStreamingEnabled: v });
+    saveTerminalHistoryStreamingEnabled(v);
+  },
   freezeCmdPopups: initialFreezeCmdPopups,
   setFreezeCmdPopups: (v) => { set({ freezeCmdPopups: v }); saveFreezeCmdPopups(v); },
   historyPinned: initialHistoryPinned,
   setHistoryPinned: (v) => { set({ historyPinned: v }); saveHistoryPinned(v); },
+  runAfterPickerProjectId: readLocalRunAfterPickerProject(),
+  setRunAfterPickerProjectId: (projectId) => {
+    if (get().runAfterPickerProjectId === projectId) return;
+    set({ runAfterPickerProjectId: projectId });
+    saveRunAfterPickerProject(projectId);
+  },
+  paneRecentTabsWidth: readLocalPaneRecentTabsWidth(),
+  setPaneRecentTabsWidth: (width) => {
+    const clamped = clampPaneRecentTabsWidth(width);
+    if (get().paneRecentTabsWidth === clamped) return;
+    set({ paneRecentTabsWidth: clamped });
+    savePaneRecentTabsWidth(clamped);
+  },
   timelinePinned: initialTimelinePinned,
   setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
   terminalIsPrimary: initialTerminalIsPrimary,

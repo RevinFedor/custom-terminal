@@ -12,7 +12,7 @@ export function classifyAgentDraftPreflight(proof) {
   return { decision: 'unknown', reason: proof?.proofReason || 'draft-state-not-proven' };
 }
 
-export function buildExactDraftCaptureProof(proof) {
+export function buildExactDraftCaptureProof(proof, rendererDiagnostic = null) {
   return {
     hasDraft: proof?.hasDraft,
     proofOutcome: proof?.proofOutcome,
@@ -31,6 +31,9 @@ export function buildExactDraftCaptureProof(proof) {
     mirrorFlushedSeq: proof?.mirrorFlushedSeq,
     mirrorSynchronizedOutputOpen: proof?.mirrorSynchronizedOutputOpen,
     synchronizedOutputGeneration: proof?.synchronizedOutputGeneration,
+    rendererDiagnostic: rendererDiagnostic && typeof rendererDiagnostic === 'object'
+      ? rendererDiagnostic
+      : null,
   };
 }
 
@@ -49,7 +52,6 @@ export function classifyExactEmptyDraftGrab(proof, grabbed) {
   }
   const identityFields = [
     'terminalRunSeq',
-    'inputRevision',
     'terminalLifecycleGeneration',
     'mirrorGeneration',
   ];
@@ -61,7 +63,27 @@ export function classifyExactEmptyDraftGrab(proof, grabbed) {
       return { confirmed: false, reason: 'screen-grab-identity-mismatch:' + field };
     }
   }
-  return { confirmed: true, reason: 'exact-empty-grab-same-generation' };
+  if (
+    grabbed?.screenContradiction !== true
+    || grabbed?.inputRevisionTransition !== 'ctrl-g-exact-capture'
+    || grabbed?.inputRevisionTransitionOwned !== true
+  ) {
+    return { confirmed: false, reason: 'screen-grab-input-transition-unproven' };
+  }
+  if (
+    proof?.inputRevision === null
+    || proof?.inputRevision === undefined
+    || grabbed?.screenProofInputRevision !== proof.inputRevision
+  ) {
+    return { confirmed: false, reason: 'screen-grab-identity-mismatch:screenProofInputRevision' };
+  }
+  if (
+    !Number.isFinite(Number(proof.inputRevision))
+    || Number(grabbed?.inputRevision) !== Number(proof.inputRevision) + 1
+  ) {
+    return { confirmed: false, reason: 'screen-grab-identity-mismatch:inputRevision' };
+  }
+  return { confirmed: true, reason: 'exact-empty-grab-owned-input-transition' };
 }
 
 export function resolveAgentDraftConflict(proof, captured, { attemptedCapture = false } = {}) {
@@ -92,7 +114,10 @@ export function resolveAgentDraftConflict(proof, captured, { attemptedCapture = 
  * Carry the exact capture verdict forward into the final send decision.
  *
  * The screen proof may start as `unknown` and then be resolved by an exact,
- * same-generation Claude input capture. Once that capture proves the composer
+ * same-lifecycle exact input capture. Ctrl+G itself owns one input-revision
+ * transition, so the main process must attest that exact causal step rather
+ * than pretending the revision stayed unchanged. Once the capture proves the
+ * composer
  * empty, callers must not fall through to the stale original `unknown` verdict.
  */
 export function applyAgentDraftCaptureResolution(initialDecision, captureResolution) {

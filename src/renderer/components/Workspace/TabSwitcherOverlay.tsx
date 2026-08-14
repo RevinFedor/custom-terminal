@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FileText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -10,12 +9,9 @@ import {
   selectableIndices,
   stepIndex,
 } from '../../utils/tabSwitcherModel.mjs';
-import {
-  adjustRgbaAlpha,
-  flattenRgbaOnTabbarPanel,
-  getTabChromeColorConfig,
-} from './tabChrome';
+import { onScreenTabIds } from '../../utils/tabVisitHistoryRule.mjs';
 import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
+import { TabListProjectHeader, TabListTabRow } from './TabListRows';
 
 // Ctrl+Tab (MRU hold-and-release) + Cmd+P (search) switcher over ALL open
 // projects. Projects render as non-selectable headers; tabs indent under
@@ -25,6 +21,18 @@ import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/mi
 // Self-contained singleton: mounted once in App.tsx, owns its window-level
 // key listeners (capture phase, so xterm/composer never see the keys). See
 // методология "Глобальные события → singleton hook на корне".
+//
+// Mouse entry point: any surface can open the search-mode panel by dispatching
+// TAB_SWITCHER_OPEN_EVENT. A window event, not a store field — the overlay owns
+// its own transient open state (mode/query/selection), and lifting that into
+// the store would make every keystroke in the search box a global update.
+
+export const TAB_SWITCHER_OPEN_EVENT = 'tab-switcher:open';
+
+/** Open the full switcher panel (search mode) from a click anywhere in the UI. */
+export function openTabSwitcherPanel(): void {
+  window.dispatchEvent(new CustomEvent(TAB_SWITCHER_OPEN_EVENT));
+}
 
 type Mode = 'ctrl' | 'search';
 
@@ -48,6 +56,14 @@ type Row = RowProject | RowTab;
 
 const PANEL_BG = '#1d1d1f';
 const PANEL_BORDER = '#3a3a3d';
+// Titlebar (40) + ProjectToolbar (30). The panel's top edge sits flush against
+// the bottom of that strip: it is opened from there, both by the toolbar button
+// and by the keyboard. Keep in sync with App.tsx `title-bar h-[40px]` and
+// ProjectToolbar `h-[30px]`.
+const SWITCHER_DOCK_TOP_PX = 70;
+// Radius: only the bottom corners are rounded — the top edge is glued to the
+// bar above it, and a rounded top would show the seam as a gap.
+const SWITCHER_RADIUS = '0 0 8px 8px';
 // Above FilePreview (z:100000) — the switcher is a top-level navigation
 // surface and must never hide under an open markdown preview.
 const Z_INDEX = 100500;
@@ -96,9 +112,6 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   const globalTabMru = useWorkspaceStore((s) => s.globalTabMru);
   const projectsMeta = useProjectsStore((s) => s.projects);
   const sessionStatuses = useUIStore((s) => s.sessionStatuses);
-  const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
-  const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
-  const processBarPosition = useUIStore((s) => s.processBar.position);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -157,6 +170,17 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     useWorkspaceStore.getState().activateCenterTab(row.projectId, row.tab.id);
   }, [close]);
 
+  // Search mode is reachable from the keyboard (Cmd+P) and from a click on the
+  // toolbar button; both go through this one function so the two entry points
+  // cannot drift apart.
+  const openSearch = useCallback(() => {
+    mouseBlockedRef.current = true;
+    setQuery('');
+    setMode('search');
+    setSelectedIndex(-1);
+    setTimeout(() => inputRef.current?.focus(), 30);
+  }, []);
+
   const openCtrl = useCallback((shiftKey: boolean) => {
     mouseBlockedRef.current = true;
     setQuery('');
@@ -181,7 +205,15 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
         const sel = selectableIndices(rows);
         setSelectedIndex(sel.length > 0 ? sel[sel.length - 1] : -1);
       } else {
-        setSelectedIndex(initialCtrlIndex(rows, globalTabMru, activeTabId));
+        // Highlight the most recent tab that is NOT already on screen: Ctrl+Tab is
+        // for bringing back what you cannot see. In a split every pane's tab is
+        // visible, so without this the highlight landed on the neighbouring pane.
+        setSelectedIndex(initialCtrlIndex(
+          rows,
+          globalTabMru,
+          activeTabId,
+          onScreenTabIds({ panes: st.splitPanes, centerTabId: activeTabId }),
+        ));
       }
     }
   }, [visible, mode, rows, selectedIndex, globalTabMru]);
@@ -210,11 +242,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && e.code === 'KeyP') {
         swallow(e);
         if (cur === 'search') { close(); return; }
-        mouseBlockedRef.current = true;
-        setQuery('');
-        setMode('search');
-        setSelectedIndex(-1);
-        setTimeout(() => inputRef.current?.focus(), 30);
+        openSearch();
         return;
       }
       if (cur === null) return;
@@ -253,7 +281,12 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
           const st = useWorkspaceStore.getState();
           const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
           effectiveRows = computeRowsFromStores('');
-          idx = initialCtrlIndex(effectiveRows, st.globalTabMru, activeWs?.activeTabId || null);
+          idx = initialCtrlIndex(
+            effectiveRows,
+            st.globalTabMru,
+            activeWs?.activeTabId || null,
+            onScreenTabIds({ panes: st.splitPanes, centerTabId: activeWs?.activeTabId || null }),
+          );
         }
         commitRow(effectiveRows[idx]);
       }
@@ -261,15 +294,24 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
 
     const onBlur = () => { if (modeRef.current === 'ctrl') close(); };
 
+    // Mouse entry point (toolbar button). Toggles like Cmd+P so a second click
+    // on the same button closes the panel instead of re-opening it.
+    const onExternalOpen = () => {
+      if (modeRef.current !== null) { close(); return; }
+      openSearch();
+    };
+
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
     window.addEventListener('blur', onBlur);
+    window.addEventListener(TAB_SWITCHER_OPEN_EVENT, onExternalOpen);
     return () => {
       window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('keyup', onKeyUp, true);
       window.removeEventListener('blur', onBlur);
+      window.removeEventListener(TAB_SWITCHER_OPEN_EVENT, onExternalOpen);
     };
-  }, [openCtrl, close, commitRow]);
+  }, [openCtrl, openSearch, close, commitRow]);
 
   // Refs mirroring latest rows/selection for the stable key handlers above.
   const rowsRef = useRef<Row[]>(rows);
@@ -304,16 +346,29 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     <div
       data-tab-switcher-root
       data-tab-switcher-mode={mode || ''}
-      style={{ position: 'fixed', inset: 0, zIndex: Z_INDEX, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', paddingTop: 90 }}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: Z_INDEX,
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'flex-start',
+        // Docked to the bottom edge of the system bars (titlebar 40 + project
+        // toolbar 30) instead of floating at an arbitrary 90px: the panel is
+        // opened FROM that strip, so it should read as hanging off it. Measured
+        // from the real bars — if their height changes, update both constants.
+        paddingTop: SWITCHER_DOCK_TOP_PX,
+      }}
       onPointerDown={(e) => { if (e.target === e.currentTarget) close(); }}
     >
       <div
         style={{
           width: 480,
-          maxHeight: 'min(440px, calc(100vh - 140px))',
+          maxHeight: `min(440px, calc(100vh - ${SWITCHER_DOCK_TOP_PX + 24}px))`,
           background: PANEL_BG,
           border: `1px solid ${PANEL_BORDER}`,
-          borderRadius: 8,
+          borderTop: 'none',
+          borderRadius: SWITCHER_RADIUS,
           boxShadow: '0 12px 34px rgba(0,0,0,0.55)',
           display: 'flex',
           flexDirection: 'column',
@@ -343,7 +398,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
           />
         )}
 
-        <div ref={listRef} style={{ overflowY: 'auto', flex: 1, padding: '4px 6px 6px' }}>
+        <div ref={listRef} className="tab-list-scroll" style={{ overflowY: 'auto', flex: 1, padding: '4px 6px 6px' }}>
           {rows.length === 0 && (
             <div style={{ padding: 14, textAlign: 'center', color: '#777', fontSize: 12.5 }}>No tabs found</div>
           )}
@@ -353,141 +408,47 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
               // tab recency, so the same project header can appear several
               // times per open. Icon deliberately small (12px) and dimmed —
               // frequent repetition must not shout. Non-clickable.
-              const headerKey = `p:${row.projectId}:${index}`;
               return (
-                <div
-                  key={headerKey}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 5,
-                    padding: '6px 8px 2px',
-                    fontSize: 11,
-                    fontWeight: 600,
-                    color: '#8a8a8f',
-                    pointerEvents: 'none',
-                    userSelect: 'none',
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                  }}
-                >
-                  {row.projectIcon && (
-                    <img
-                      src={row.projectIcon}
-                      alt=""
-                      style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.65 }}
-                      draggable={false}
-                    />
-                  )}
-                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{row.projectName}</span>
-                </div>
+                <TabListProjectHeader
+                  key={`p:${row.projectId}:${index}`}
+                  projectName={row.projectName}
+                  projectIcon={row.projectIcon}
+                />
               );
             }
 
             const tab = row.tab;
             const missing = !!row.missing;
             const selected = index === selectedIndex;
-            const chrome = getTabChromeColorConfig(tab);
-            const hasColor = !!tab.color && tab.color !== 'default';
-            const rawBg = selected
-              ? (hasColor || tab.tabType === 'file' ? adjustRgbaAlpha(chrome.bgColor, 0.25) : 'rgba(255,255,255,0.18)')
-              : (hasColor || tab.tabType === 'file' ? chrome.bgColor : 'rgba(255,255,255,0.04)');
-            const bg = flattenRgbaOnTabbarPanel(rawBg === '#181725' ? 'rgba(24,23,37,1)' : rawBg);
-            const statusMeta = tab.sessionStatus ? sessionStatuses.find((s: any) => s.id === tab.sessionStatus) : null;
-            const busy = isBusy(tab.id);
-            const proc = hasProcess(tab);
 
+            // Row visuals live in TabListRows — the pane header's recent-tabs
+            // list renders the same component, so the two lists cannot drift
+            // into looking like different things.
             return (
               <div
                 key={tab.id}
-                data-switcher-index={index}
                 ref={selected ? (el) => { if (el) el.scrollIntoView({ block: 'nearest' }); } : undefined}
-                onPointerEnter={() => { if (!mouseBlockedRef.current && !missing) setSelectedIndex(index); }}
-                onPointerDown={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  if (missing) return; // vanished file — dead row, not a target
-                  commitRow(row);
-                }}
-                title={missing ? 'Файл не найден на диске (перемещён или удалён)' : undefined}
-                style={{
-                  position: 'relative',
-                  marginLeft: 4, // "вкладки внутри проектов с небольшим отступом"
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 7,
-                  padding: '5px 10px',
-                  paddingLeft: 16, // room for strip (3px) + status marker
-                  borderRadius: 5,
-                  cursor: missing ? 'default' : 'pointer',
-                  background: bg,
-                  boxShadow: selected ? 'inset 0 0 0 1px rgba(255,255,255,0.30)' : 'none',
-                  marginBottom: 1,
-                  overflow: 'hidden',
-                  userSelect: 'none',
-                  opacity: missing ? 0.55 : 1,
-                }}
               >
-                {/* Process bar strip — same two independent signals as TabBar:
-                    static colorA while the PTY/SDK runtime is alive, shimmer
-                    overlay while the AI turn streams. */}
-                {(proc || busy) && (
-                  <div
-                    className="tab-process-bar-static"
-                    style={{
-                      position: 'absolute',
-                      ...(processBarPosition === 'right' ? { right: 0 } : { left: 0 }),
-                      top: 0,
-                      bottom: 0,
-                      width: 3,
-                      pointerEvents: 'none',
-                      overflow: 'hidden',
-                      ...(processBarPosition === 'right'
-                        ? { borderTopRightRadius: 5, borderBottomRightRadius: 5 }
-                        : { borderTopLeftRadius: 5, borderBottomLeftRadius: 5 }),
-                    }}
-                  >
-                    {busy && <div className="tab-process-bar-ai-shimmer-overlay" />}
-                  </div>
-                )}
-
-                {/* Session status marker */}
-                {statusMeta && (
-                  <span
-                    title={statusMeta.label}
-                    style={{
-                      position: 'absolute',
-                      left: 6,
-                      top: 'calc(50% + 1px)',
-                      transform: 'translateY(-50%)',
-                      width: statusMarkerSize,
-                      height: statusMarkerSize,
-                      borderRadius: statusMarkerShape === 'square' ? 2 : '50%',
-                      backgroundColor: statusMeta.color,
-                      border: '1px solid rgba(0,0,0,0.4)',
-                      pointerEvents: 'none',
-                    }}
-                  />
-                )}
-
-                {tab.tabType === 'file' && (
-                  // Red icon = the linked file is gone from disk.
-                  <FileText size={12} style={{ color: missing ? '#f87171' : '#a78bfa', flexShrink: 0, opacity: 0.9 }} />
-                )}
-
-                <span
-                  style={{
-                    color: missing ? '#9a9a9e' : '#e6e6e6',
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    flex: 1,
-                    minWidth: 0,
+                <TabListTabRow
+                  tab={tab}
+                  index={index}
+                  selected={selected}
+                  missing={missing}
+                  hasProcess={hasProcess(tab)}
+                  busy={isBusy(tab.id)}
+                  sessionStatuses={sessionStatuses}
+                  // Layout map: which pane this tab is already open in. Same mark
+                  // as the sidebar card, so "this is the side pane's tab" is
+                  // visible while choosing.
+                  paneMapProjectId={row.projectId}
+                  onPointerEnter={() => { if (!mouseBlockedRef.current && !missing) setSelectedIndex(index); }}
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (missing) return; // vanished file — dead row, not a target
+                    commitRow(row);
                   }}
-                >
-                  {tab.name}
-                </span>
+                />
               </div>
             );
           })}

@@ -1,5 +1,8 @@
 import {
   claudeHistoryQueuePresentationIdentity,
+  extractClaudeHistoryPromptCarrierText,
+  hasClaudeHistoryLiveQueuePrompt,
+  isHistoryPromptLocallyOwned,
   reduceClaudeHistoryPromptCarrier,
 } from './historyClaudePromptCarriers.mjs';
 
@@ -216,6 +219,9 @@ const projectUserEntry = (canonical, envelope, blocks) => {
   if (!text) return null;
   return {
     uuid: canonical.uuid,
+    ...(typeof canonical.sourceIdentity === 'string'
+      ? { sourceIdentity: canonical.sourceIdentity }
+      : {}),
     role: 'user',
     timestamp: String(
       canonical.timestamp
@@ -430,10 +436,9 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
   );
   if (unmatchedLive.length === 0) return durable;
 
-  // A local prompt submitted while the current turn is busy represents the
-  // next turn. It belongs after the current live answer. Once the queue
-  // promotes it to `sent`, it becomes the current prompt and belongs before
-  // its own live answer.
+  // A prompt submitted while the current turn is busy remains the final
+  // presentation barrier until it actually crosses Enter. Everything already
+  // streamed belongs before that still-deferred prompt.
   const deferredPromptIndex = durable.findIndex((entry) =>
     entry?.role === 'queued'
     && (
@@ -444,17 +449,84 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
       )
     )
   );
-  if (deferredPromptIndex < 0) return [...durable, ...unmatchedLive];
-  return [
-    ...durable.slice(0, deferredPromptIndex),
-    ...unmatchedLive,
-    ...durable.slice(deferredPromptIndex),
-  ];
+  const causalPrefix = deferredPromptIndex < 0
+    ? durable
+    : durable.slice(0, deferredPromptIndex);
+  const deferredTail = deferredPromptIndex < 0
+    ? []
+    : durable.slice(deferredPromptIndex);
+
+  // Once an optimistic Codex prompt is confirmed, it carries the exact rollout
+  // byte offset of its user_message. The same is true for canonical live rows.
+  // Merge those rows by that physical order instead of by renderer arrival
+  // time. This is what keeps a preceding automatic `compacted` record and the
+  // previous answer before the prompt even though the expensive durable
+  // transcript refresh is deliberately deferred while the turn is busy.
+  const physicalPosition = (entry) => {
+    const sourceIdentity = String(entry?.sourceIdentity || '');
+    const sessionId = String(entry?.sessionId || '');
+    if (!sourceIdentity.startsWith('codex-') || !sessionId) return null;
+    const marker = '-source-' + sessionId + '-';
+    const markerIndex = sourceIdentity.lastIndexOf(marker);
+    if (markerIndex < 0) return null;
+    const rawOffset = sourceIdentity.slice(markerIndex + marker.length);
+    if (!/^\d+$/.test(rawOffset)) return null;
+    const offset = Number(rawOffset);
+    return Number.isSafeInteger(offset) ? { sessionId, offset } : null;
+  };
+
+  const anchorsBySession = new Map();
+  causalPrefix.forEach((entry, index) => {
+    const position = physicalPosition(entry);
+    if (!position) return;
+    const anchors = anchorsBySession.get(position.sessionId) || [];
+    anchors.push({ index, offset: position.offset });
+    anchorsBySession.set(position.sessionId, anchors);
+  });
+  const causalInsertions = new Map();
+  const remainingLive = [];
+  for (const entry of unmatchedLive) {
+    const position = physicalPosition(entry);
+    const anchors = position ? anchorsBySession.get(position.sessionId) : null;
+    if (!position || !anchors?.length) {
+      remainingLive.push(entry);
+      continue;
+    }
+
+    // Find the first durable/local row physically after this live record. The
+    // durable prefix is already in transcript order, so only the small live
+    // delta is inserted; giant histories are never re-sorted on every chunk.
+    let low = 0;
+    let high = anchors.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (anchors[middle].offset > position.offset) high = middle;
+      else low = middle + 1;
+    }
+    const targetIndex = low < anchors.length
+      ? anchors[low].index
+      : causalPrefix.length;
+    const bucket = causalInsertions.get(targetIndex) || [];
+    bucket.push(entry);
+    causalInsertions.set(targetIndex, bucket);
+  }
+
+  if (causalInsertions.size === 0) {
+    return [...causalPrefix, ...remainingLive, ...deferredTail];
+  }
+  const orderedPrefix = [];
+  for (let index = 0; index <= causalPrefix.length; index += 1) {
+    const inserted = causalInsertions.get(index);
+    if (inserted) orderedPrefix.push(...inserted);
+    if (index < causalPrefix.length) orderedPrefix.push(causalPrefix[index]);
+  }
+  return [...orderedPrefix, ...remainingLive, ...deferredTail];
 }
 
 export function historyLivePresentationKey(entry) {
   const sourceIdentity = String(entry?.sourceIdentity || '');
-  // Only assistant rows have a live → durable replacement in this projection.
+  // Assistant and compact rows have a live → durable replacement in this
+  // projection.
   // Local user prompts gain their audit identity after they are already on
   // screen; keying those by source would remount the row merely because its
   // delivery proof arrived.
@@ -462,6 +534,7 @@ export function historyLivePresentationKey(entry) {
     sourceIdentity
     && (
       entry?.role === 'assistant'
+      || entry?.role === 'compact'
       || sourceIdentity.startsWith('claude-queue:')
     )
   ) {
@@ -509,6 +582,37 @@ const clearPendingThinking = (entries, sessionId) => {
 };
 
 /**
+ * Decides who owns a live user row without comparing prompt text. History/API
+ * sends retain their optimistic row only when the canonical record carries an
+ * exact matching handoff. A native Codex xterm Enter has no such owner and is
+ * therefore projected immediately.
+ */
+export function shouldIncludeHistoryLiveUserText({
+  toolType,
+  envelope,
+  localHandoffs,
+  currentEntries,
+} = {}) {
+  const provider = String(toolType || envelope?.toolType || '');
+  const locallyOwned = isHistoryPromptLocallyOwned(envelope, localHandoffs);
+  if (provider === 'codex') return !locallyOwned;
+  if (provider !== 'claude') return false;
+
+  const record = isObject(envelope?.message) ? envelope.message : envelope;
+  const isQueueSettlement = record?.type === 'queue-operation'
+    && (
+      record.operation === 'dequeue'
+      || record.operation === 'remove'
+      || record.operation === 'popAll'
+    );
+  if (isQueueSettlement) {
+    return hasClaudeHistoryLiveQueuePrompt(currentEntries);
+  }
+  const carrierText = extractClaudeHistoryPromptCarrierText(envelope);
+  return !(carrierText && locallyOwned);
+}
+
+/**
  * Projects one canonical live-message envelope into the visible History shape.
  * The reducer is intentionally stateless: replaying an envelope is an upsert by
  * message UUID, while tool results enrich the action identified by toolUseId.
@@ -524,6 +628,19 @@ export function reduceHistoryLiveProjection(
     && TURN_BOUNDARIES_THAT_CLEAR_PENDING_THINKING.has(envelope.boundary)
   ) {
     return clearPendingThinking(entries, String(envelope.sessionId || ''));
+  }
+  if (
+    envelope?.type === 'history_entry'
+    && isObject(envelope.entry)
+    && envelope.entry.role === 'compact'
+    && typeof envelope.entry.uuid === 'string'
+  ) {
+    const entry = {
+      ...envelope.entry,
+      timestamp: String(envelope.entry.timestamp || envelope.timestamp || FALLBACK_TIMESTAMP),
+      sessionId: String(envelope.entry.sessionId || envelope.sessionId || ''),
+    };
+    return upsertEntry(entries, entry);
   }
   const promptCarrier = reduceClaudeHistoryPromptCarrier(entries, envelope, {
     includeUserText,

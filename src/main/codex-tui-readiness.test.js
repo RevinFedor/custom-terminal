@@ -67,6 +67,73 @@ test('recognizes the fresh-conversation cwd footer without depending on placehol
   });
 });
 
+test('recognizes the narrow Codex composer footer captured after Resume', () => {
+  const frame = [
+    '⚠ Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.',
+    '› Write tests for @filename',
+    'gpt-5.6-sol max · Full Acces… Goal achieved (53s)',
+  ].join('\n');
+  const inspected = inspectCodexInputReadyTextCore(frame, '', {
+    requireSyncMarker: false,
+    source: 'production-resume-frame',
+  });
+  assert.equal(inspected.ready, true);
+  assert.equal(inspected.hasPromptGlyph, true);
+  assert.deepEqual(parseCodexVerifiedComposerFooter(frame), {
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    fast: false,
+    proof: 'verified-composer-footer',
+  });
+});
+
+test('recognizes the extra-narrow Codex composer footer captured after reload', () => {
+  const frame = [
+    '› Write tests for @filename',
+    'gpt-5.6-sol max · Ful… Goal achieved (24m)',
+  ].join('\n');
+  const inspected = inspectCodexInputReadyTextCore(frame, '', {
+    requireSyncMarker: false,
+    source: 'production-reload-frame',
+  });
+  assert.equal(inspected.ready, true);
+  assert.equal(inspected.hasPromptGlyph, true);
+  assert.deepEqual(parseCodexVerifiedComposerFooter(frame), {
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    fast: false,
+    proof: 'verified-composer-footer',
+  });
+});
+
+test('ignores the decorative Codex footer tail after the stable model and effort prefix', () => {
+  const frame = [
+    '› Write tests for @filename',
+    'gpt-5.6-sol max fast · a future Codex footer that this app does not know',
+  ].join('\n');
+  assert.deepEqual(parseCodexVerifiedComposerFooter(frame), {
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    fast: true,
+    proof: 'verified-composer-footer',
+  });
+  assert.equal(inspectCodexInputReadyTextCore(frame, '', {
+    requireSyncMarker: false,
+    source: 'future-decorative-footer',
+  }).ready, true);
+});
+
+test('does not accept prose that merely contains a model and effort', () => {
+  for (const footer of [
+    'assistant: gpt-5.6-sol max · Full Access',
+    'gpt-5.6-sol max is what the user selected',
+    'gpt-5.6-sol default · Full Access',
+  ]) {
+    const frame = ['› Write tests for @filename', footer].join('\n');
+    assert.equal(parseCodexVerifiedComposerFooter(frame), null);
+  }
+});
+
 test('cwd footer is not readiness proof without the current composer prompt', () => {
   const inspected = inspectCodexInputReadyTextCore(
     'gpt-5.6-luna medium fast · /private/tmp/old-scrollback',

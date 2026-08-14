@@ -40,6 +40,8 @@ import {
   classifyAgentDraftPreflight,
   resolveAgentDraftConflict,
 } from '../../utils/agentDraftPreflight.mjs';
+import { showAgentDraftScreenContradictionToast } from '../../utils/agentDraftContradictionToast.mjs';
+import { terminalRegistry } from '../../utils/terminalRegistry';
 import {
   beginCoordinatedAgentSend,
   bindCoordinatedAgentSendHandoff,
@@ -138,8 +140,13 @@ import {
   resolveInterruptedPromptOwnership,
 } from '../../utils/historyDraftOwnership.mjs';
 import {
+  getHistoryDraftNoticeMeta,
+  isHistoryDeliveryConfirmationNotice,
+} from '../../utils/historyDraftNoticeMeta.mjs';
+import {
   createHistoryTailPinScheduler,
   isHistoryTailPinned,
+  reconcileHistoryTailFollowIntent,
   scheduleHistoryBottomScroll,
 } from '../../utils/historyBottomScroll.mjs';
 import { flushHistoryDurableWithRetry } from '../../utils/historyDurableFlush.mjs';
@@ -152,13 +159,10 @@ import {
   reconcileCommittedHistoryLiveProjection,
   reconcileHistoryLiveToolResults,
   reduceHistoryLiveProjection,
+  shouldIncludeHistoryLiveUserText,
 } from '../../utils/historyLiveProjection.mjs';
 import {
-  extractClaudeHistoryPromptCarrierText,
-  hasClaudeHistoryLiveQueuePrompt,
-  isClaudeHistoryPromptLocallyOwned,
-} from '../../utils/historyClaudePromptCarriers.mjs';
-import {
+  advanceHistoryPromptHandoffTransportPhase,
   beginHistoryPromptHandoff,
   bindHistoryPromptHandoffSendIdentity,
   consumeHistoryPromptHandoff,
@@ -166,11 +170,14 @@ import {
   getHistoryPromptHandoffsSnapshot,
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   historyPromptHandoffAuditProofFromSendResult,
+  historyPromptHandoffInitialStatus,
   historyPromptHandoffStatusPresentation,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
   hydrateHistoryPromptHandoffFromDurableReceipt,
+  legacyOrchestrationCompletionMatchesCanonicalEntry,
   reconcileHistoryPromptHandoffRows,
   retractHistoryPromptHandoff,
+  selectLatestHistoryPromptInputStatus,
   settleHistoryPromptHandoff,
   subscribeHistoryPromptHandoffs,
   type HistoryPromptHandoffStatus,
@@ -185,6 +192,7 @@ import {
   formatHistoryResponseDuration,
 } from '../../utils/historyResponseTiming.mjs';
 import { queueSendTransferredOwnership } from '../../store/usePromptQueueStore';
+import { resolveCenterRightInset } from '../../utils/surfaceInsets.mjs';
 import {
   deriveCodexEffectiveSettingsFromHistory,
   planCodexHistorySettingsProjection,
@@ -324,6 +332,13 @@ interface FullHistoryEntry {
   auditEntryUuid?: string;
   liveProjection?: boolean;
   sourceIdentity?: string;
+  semanticTags?: Array<{
+    id?: string;
+    kind: 'orchestration' | 'prompt-origin';
+    runId?: string;
+    phase?: 'request' | 'completion' | 'failure';
+    source?: 'loop';
+  }>;
   livePendingThinking?: boolean;
   responseTiming?: {
     intervalId: number;
@@ -341,6 +356,31 @@ interface HistoryActivityTiming {
   startTs: number;
   endTs: number | null;
   durationMs: number | null;
+}
+
+interface TerminalHistoryPreview {
+  previewId: string;
+  tabId: string;
+  toolType: 'claude' | 'codex';
+  sessionId: string | null;
+  turnId: string | null;
+  lifecycleGeneration: string;
+  mirrorGeneration: string;
+  mirrorGenerationOrdinal: number;
+  committedFrameGeneration: number | null;
+  writeSeq: number | null;
+  previewSeq: number;
+  phase: 'streaming' | 'settled';
+  text: string;
+  textHash: string | null;
+  startedAt: number;
+  updatedAt: number;
+  reason: string | null;
+  truncated: boolean;
+}
+
+interface HistoryVirtuosoContext {
+  terminalPreview: TerminalHistoryPreview | null;
 }
 
 interface CompactOperationalPhase {
@@ -438,6 +478,23 @@ interface HistoryPanelProps {
   // then a pure transcript. Same component, same draft — only the DOM location
   // moves, because two mounted composers would mean two drafts.
   composerPortalHostId?: string;
+  // Height of the docked input this panel must stop above, in px.
+  //
+  // The side panel is docked to the right edge of the CENTER box, and in
+  // terminal-primary that box also carries the docked composer at its bottom.
+  // The mirrored side terminal already stops there (FloatingTerminalFrame
+  // bottomInset); this panel used to run to the very bottom instead, so it
+  // covered the input by exactly the input's height — measured live: side
+  // terminal bottom 714 = input top 714 (flush), side transcript bottom 859 vs
+  // input top 714, i.e. 145px of overlap, the full height of the composer.
+  // Same number, same source (the measured controls height), so the two side
+  // panels cannot disagree.
+  bottomInset?: number;
+  // The pane is stacked in a column, so it is short: the composer starts at ONE
+  // row and grows to the stacked ceiling from Settings (default 3) instead of
+  // the full-height one. A tall empty input inside a half-height pane leaves
+  // almost no room for the conversation it belongs to.
+  compactComposer?: boolean;
   onSwapPrimarySurface?: () => void;
   terminalIsPrimary?: boolean;
   projectId?: string;
@@ -547,6 +604,56 @@ const HistoryBottomSpacer = memo(() => (
     }}
   />
 ));
+
+const HistoryTerminalPreviewFooter = memo(({ context }: {
+  context?: HistoryVirtuosoContext;
+}) => {
+  const preview = context?.terminalPreview || null;
+  return (
+    <>
+      {preview && (
+        <ConversationMessage
+          layout="assistant"
+          tone="accent"
+          data-history-terminal-preview
+          data-preview-id={preview.previewId}
+          data-preview-phase={preview.phase}
+          aria-live="polite"
+          status={(
+            <MessageStatusBadge
+              label="Terminal output · not yet saved to JSONL"
+              tone="accent"
+              pending={preview.phase === 'streaming'}
+              meta={preview.truncated ? 'начало скрыто' : undefined}
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 14,
+                zIndex: 2,
+                maxWidth: 'calc(100% - 28px)',
+                margin: 0,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                pointerEvents: 'none',
+                transform: 'translateY(-50%)',
+              }}
+            />
+          )}
+          style={{
+            background: 'rgba(124, 58, 237, 0.045)',
+            boxShadow: 'inset 2px 0 0 rgba(167, 139, 250, 0.42)',
+          }}
+        >
+          <div style={{ fontSize: '1em' }}>
+            <CBMarkdown text={preview.text} />
+          </div>
+        </ConversationMessage>
+      )}
+      <HistoryBottomSpacer />
+    </>
+  );
+});
 
 // Cheap stand-in row rendered while the user is scrubbing the scrollbar or
 // flinging the wheel faster than real rows can mount. Fast scrolling through
@@ -860,6 +967,18 @@ const findServerPromptEntry = (
   const localAt = localEntry.optimisticAt || Date.parse(localEntry.timestamp) || Date.now();
   return serverEntries.find((entry) => {
     if (excludedUuids.has(entry.uuid)) return false;
+    // Old orchestration completion rows can outlive the renderer-local handoff
+    // that created them. Their app-owned run tag is the only durable identity
+    // available after such a restart; never fall back to equal text or time.
+    if (legacyOrchestrationCompletionMatchesCanonicalEntry({
+      handoffId: localEntry.handoffId || '',
+      source: '',
+      queueStatus: localEntry.queueStatus || 'sending',
+      sendOperationKey: null,
+      sendAttemptId: null,
+    }, entry)) {
+      return true;
+    }
     if (localEntry.auditEntryUuid) {
       return entry.uuid === localEntry.auditEntryUuid;
     }
@@ -2993,6 +3112,39 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-agent-prompt-highlight::-webkit-scrollbar-thumb {
   background: transparent;
 }
+/* The transcript's own scrollbar. Without this it falls through to the app's
+   global 8px bar with an opaque #1a1a1a track — a heavy grey column pinned to
+   the right edge of the reading surface, next to the composer, on the one
+   surface where the eye is following text. Same 5px ghost bar the SDK chat and
+   the prompt fields already use, so the reading surfaces agree.
+   Both properties are needed: scrollbar-width is what Firefox and newer
+   Chromium honour, the ::-webkit rules are what this Electron build actually
+   paints. (No backticks in this block — it lives inside a JS template
+   literal, and one would end the string mid-comment.) */
+.hp-history-transcript {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.10) transparent;
+}
+.hp-history-transcript::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+.hp-history-transcript::-webkit-scrollbar-track {
+  background: transparent;
+}
+.hp-history-transcript::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.10);
+  border-radius: 999px;
+  transition: background 0.15s ease;
+}
+/* Brightens when the pointer is anywhere over the transcript, so the position
+   indicator is findable while reading without being a permanent stripe. */
+.hp-history-transcript:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+}
+.hp-history-transcript::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.34);
+}
 .hp-history-transcript .cb-tool {
   margin-top: 4px;
   margin-bottom: 4px;
@@ -3275,43 +3427,6 @@ function HistoryOwnerTransitionIcon({ size = 20 }: { size?: number }) {
     </svg>
   );
 }
-
-const getDraftNoticeMeta = (message: string) => {
-  if (/terminal input is empty/i.test(message)) {
-    return {
-      label: 'Terminal input empty',
-      tone: 'info' as const,
-    };
-  }
-  if (/prompt was not returned/i.test(message)) {
-    return {
-      label: 'Cancel confirmed',
-      tone: 'info' as const,
-    };
-  }
-  if (/interrupted prompt/i.test(message)) {
-    return {
-      label: 'Prompt restored',
-      tone: 'warning' as const,
-    };
-  }
-  if (/saving image attachment/i.test(message)) {
-    return {
-      label: 'Attaching image',
-      tone: 'info' as const,
-    };
-  }
-  if (/\bimage(?:\s+#?\d+)?\b|imageError|image attachment|image marker|image file|картинк|вложени/i.test(message)) {
-    return {
-      label: 'Image needs attention',
-      tone: 'warning' as const,
-    };
-  }
-  return {
-    label: 'Send stopped · draft moved',
-    tone: 'warning' as const,
-  };
-};
 
 const QUESTION_NAV_KEY = {
   up: '\x1b[A',
@@ -3905,6 +4020,7 @@ function AgentHistoryControls({
   overlayComposer = false,
   agentInputSurface: agentInputSurfaceProp,
   suppressWindowEscape = false,
+  compactComposer = false,
 }: {
   tabId: string;
   sessionId: string;
@@ -3915,7 +4031,7 @@ function AgentHistoryControls({
   onPromptSubmitted: (
     text: string,
     queueStatus: Extract<HistoryPromptHandoffStatus,
-      'sending' | 'queued' | 'audit-pending' | 'delivery-unknown' | 'sent'>,
+      'preparing' | 'sending' | 'queued' | 'audit-pending' | 'delivery-unknown' | 'sent'>,
     meta: {
       handoffId: string;
       statusAtSend: AgentPtyStatus;
@@ -3932,7 +4048,7 @@ function AgentHistoryControls({
   ) => void;
   onPromptStatusChange: (
     handoffId: string,
-    queueStatus: Exclude<HistoryPromptHandoffStatus, 'sending'>,
+    queueStatus: Exclude<HistoryPromptHandoffStatus, 'preparing' | 'sending'>,
     reason: string,
     identity?: {
       requiresAuditIdentity?: boolean;
@@ -3966,6 +4082,8 @@ function AgentHistoryControls({
   agentInputSurface?: boolean;
   // Split: only the FOCUSED pane's composer listens to window-level Escape.
   suppressWindowEscape?: boolean;
+  // Pane stacked in a column → short surface, so the input starts at one row.
+  compactComposer?: boolean;
 }) {
   // Owning the tab's input is not the same as being the centered surface: the
   // terminal-primary layout keeps this composer live in the side panel. Fall
@@ -3978,9 +4096,16 @@ function AgentHistoryControls({
   const prompt = useUIStore(useCallback((s) => s.historyPromptDrafts[tabId] || '', [tabId]));
   const historyComposerFontSize = useUIStore((s) => s.historyComposerFontSize);
   const aiSecondaryFontSize = useUIStore((s) => s.aiSecondaryFontSize);
-  const historyComposerMinRows = useUIStore((s) => s.historyComposerMinRows);
-  const historyComposerMaxRows = useUIStore((s) => s.historyComposerMaxRows);
+  const historyComposerMinRowsSetting = useUIStore((s) => s.historyComposerMinRows);
+  const historyComposerMaxRowsSetting = useUIStore((s) => s.historyComposerMaxRows);
+  const stackedComposerMaxRows = useUIStore((s) => s.stackedComposerMaxRows);
   const aiComposerChipThreshold = useUIStore((s) => s.aiComposerChipThreshold);
+  // A stacked pane has roughly half the height, so the composer shrinks to one
+  // row at rest and grows to its own (smaller) ceiling.
+  const historyComposerMinRows = compactComposer ? 1 : historyComposerMinRowsSetting;
+  const historyComposerMaxRows = compactComposer
+    ? Math.max(1, stackedComposerMaxRows)
+    : historyComposerMaxRowsSetting;
   const historyComposerLineHeightPx = historyComposerFontSize * 1.35;
   const historyComposerMinHeight = Math.ceil(historyComposerLineHeightPx * historyComposerMinRows + 16);
   const historyComposerMaxHeight = Math.ceil(historyComposerLineHeightPx * historyComposerMaxRows + 16);
@@ -4015,6 +4140,9 @@ function AgentHistoryControls({
     setHistoryPromptDraft(tabId, value, options);
   }, [setHistoryPromptDraft, tabId]);
   const [busyAction, setBusyAction] = useState<'resume' | 'send' | 'interrupt' | 'stop' | 'grab' | null>(null);
+  const [activeInputStatus, setActiveInputStatus] = useState<HistoryPromptHandoffStatus | null>(() => (
+    selectLatestHistoryPromptInputStatus(getHistoryPromptHandoffsSnapshot(tabId))
+  ));
   const [isPasteBusy, setIsPasteBusy] = useState(false);
   useEffect(() => {
     onInputBusyChange?.(isPasteBusy);
@@ -4023,6 +4151,7 @@ function AgentHistoryControls({
   const [historyUpdating, setHistoryUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draftWarning, setDraftWarning] = useState<string | null>(null);
+  const delayedDeliveryWarningHandoffRef = useRef<string | null>(null);
   const [interruptAwaiting, setInterruptAwaiting] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState<AgentPendingQuestion | null>(null);
   const [answeringQuestion, setAnsweringQuestion] = useState(false);
@@ -4532,6 +4661,7 @@ function AgentHistoryControls({
     pendingQuestionRef.current = null;
     answeringQuestionRef.current = false;
     midstreamPromptRecoveryRef.current = null;
+    delayedDeliveryWarningHandoffRef.current = null;
     interruptRecoveryInFlightRef.current = false;
     interruptAwaitRef.current = null;
     setBusyAction(coordinatedAction ? 'send' : null);
@@ -4567,6 +4697,23 @@ function AgentHistoryControls({
       clearEmptyDraftNoticeTimer();
     };
   }, [clearEmptyDraftNoticeTimer, presenceOwnerKey, refreshActivityTiming, refreshPresence, setStatusFrom, tabId, toolType]);
+
+  useEffect(() => subscribeHistoryPromptHandoffs(tabId, (snapshot, change) => {
+    setActiveInputStatus(selectLatestHistoryPromptInputStatus(snapshot));
+    const handoffId = delayedDeliveryWarningHandoffRef.current;
+    if (!handoffId) return;
+    const exactRecord = snapshot.find((record) => record.handoffId === handoffId);
+    const confirmed = exactRecord?.queueStatus === 'sent'
+      || (change.type === 'consume' && change.handoffId === handoffId);
+    if (!confirmed) return;
+    delayedDeliveryWarningHandoffRef.current = null;
+    setDraftWarning((current) => (
+      current && isHistoryDeliveryConfirmationNotice(current) ? null : current
+    ));
+    historyDiag('DELIVERY_NOTICE_CLEAR tab=' + tabId.slice(-12)
+      + ' handoff=' + handoffId
+      + ' reason=' + (exactRecord?.queueStatus === 'sent' ? 'confirmed' : 'consumed'));
+  }), [tabId]);
 
   useEffect(() => {
     const handleTimingChanged = (_event: any, detail: { tabId?: string }) => {
@@ -4723,8 +4870,16 @@ function AgentHistoryControls({
         setQuestionError(null);
       }
     };
-    const handlePasteBusy = (_: any, data: { tabId?: string; busy?: boolean }) => {
+    const handlePasteBusy = (_: any, data: {
+      tabId?: string;
+      busy?: boolean;
+      phase?: 'sending' | 'confirming' | 'idle';
+      handoffId?: string | null;
+    }) => {
       if (data?.tabId !== tabId) return;
+      if (data.handoffId && (data.phase === 'sending' || data.phase === 'confirming')) {
+        advanceHistoryPromptHandoffTransportPhase(tabId, data.handoffId, data.phase);
+      }
       const nextBusy = !!data.busy;
       if (nextBusy && !pasteBusyRef.current) {
         setPasteActivityStartedAt(Date.now());
@@ -4776,7 +4931,13 @@ function AgentHistoryControls({
     }
     console.log('[' + runtime.logPrefix + ':draft] grab-request tab=' + tabId.slice(-12) + ' reason=' + reason);
     const result = await runtime.grabDraft(tabId, draftState ? {
-      draftProof: buildExactDraftCaptureProof(draftState),
+      draftProof: buildExactDraftCaptureProof(
+        draftState,
+        terminalRegistry.getDraftDiagnosticSnapshot(tabId, {
+          promptRow: (draftState as any)?.promptRow,
+          cursorRow: (draftState as any)?.cursorRow,
+        }),
+      ),
     } : undefined);
     if (tabIdRef.current !== requestTabId) return {
       stale: true,
@@ -4800,6 +4961,10 @@ function AgentHistoryControls({
       if (conflict.decision !== 'clear') {
         throw new Error(runtime.label + ' terminal draft state is still unknown; send stopped before touching terminal input.');
       }
+      showAgentDraftScreenContradictionToast(useUIStore.getState(), {
+        tabId,
+        label: runtime.label,
+      });
       console.warn('[' + runtime.logPrefix + ':draft] ambiguous screen tail resolved as empty tab='
         + tabId.slice(-12) + ' reason=' + (conflict.reason || '-'));
     }
@@ -5243,7 +5408,17 @@ function AgentHistoryControls({
     }
     if (actionInFlightRef.current) {
       const activeKind = activeActionKindRef.current;
-      if (kind === 'stop' && activeKind === 'send') {
+      const sendCanJoinExistingLaunch = kind === 'send'
+        && activeKind === 'resume'
+        && statusRef.current === 'starting';
+      if (sendCanJoinExistingLaunch) {
+        // The already-running Start/Resume call owns process creation. Move
+        // the single action lane to this submit intent; the shared send
+        // scenario waits for that exact launch instead of starting a second
+        // process or requiring a second Enter.
+        historyDiag('JOIN_ACTION tab=' + tabId.slice(-12)
+          + ' kind=send after=resume status=starting');
+      } else if (kind === 'stop' && activeKind === 'send') {
         const queued = requestCoordinatedStopAfterSend(tabId);
         if (queued.queued && !queued.deduped) {
           if (queued.state?.handoffId) {
@@ -5278,10 +5453,11 @@ function AgentHistoryControls({
             + ' kind=stop reason=' + (queued.reason || 'coordinator-missing'));
         }
         return;
+      } else {
+        console.log('[' + runtime.logPrefix + '] drop-action tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight');
+        historyDiag('DROP_ACTION tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight busyAction=' + (busyAction || activeKind || 'none'));
+        return;
       }
-      console.log('[' + runtime.logPrefix + '] drop-action tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight');
-      historyDiag('DROP_ACTION tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight busyAction=' + (busyAction || activeKind || 'none'));
-      return;
     }
     if (kind === 'send' && pasteBusyRef.current) {
       console.log('[' + runtime.logPrefix + '] drop-action tab=' + tabId.slice(-12) + ' kind=send reason=paste-busy');
@@ -5306,7 +5482,7 @@ function AgentHistoryControls({
     let sendOwnershipTransferred = false;
     let sendDeliveryUnconfirmed = false;
     let sendTransferredQueueStatus: Exclude<HistoryPromptHandoffStatus,
-      'sending' | 'cancelled' | 'failed'> = 'sent';
+      'preparing' | 'sending' | 'cancelled' | 'failed'> = 'sent';
     let sendAuditIdentity: {
       requiresAuditIdentity?: boolean;
       auditTimestamp?: string;
@@ -5335,10 +5511,23 @@ function AgentHistoryControls({
       const currentChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
       const hasNewDraft = !!current || currentImages.length > 0 || currentChips.length > 0;
       if (!hasNewDraft) {
-        setHistoryPromptDraft(actionTabId, restorePrompt || '', {
+        const restoredText = restorePrompt || '';
+        applyHistoryComposerSnapshot({
+          ownerTabId: actionTabId,
+          text: restoredText,
           images: clearedPromptImages,
           chips: clearedPromptChips,
+          selectionStart: restoredText.length,
+          history: 'external',
+          userEvent: 'input.complete',
         });
+        setHistoryComposerView(actionTabId, {
+          selectionStart: restoredText.length,
+          selectionEnd: restoredText.length,
+          scrollTop: 0,
+        });
+        flushHistoryComposerDrafts();
+        flushHistoryComposerView();
         historyDiag('SEND_ROLLBACK_RESTORE tab=' + actionTabId.slice(-12)
           + ' handoff=' + (sendHandoffId || '-')
           + ' reason=' + reason
@@ -5357,10 +5546,22 @@ function AgentHistoryControls({
         snapshotChips: clearedPromptChips,
         createChipId: (chip: HistoryPromptDraftChip) => createComposerChipId(chip.kind),
       });
-      setHistoryPromptDraft(actionTabId, merged.text, {
+      applyHistoryComposerSnapshot({
+        ownerTabId: actionTabId,
+        text: merged.text,
         images: merged.images,
         chips: merged.chips,
+        selectionStart: merged.text.length,
+        history: 'external',
+        userEvent: 'input.complete',
       });
+      setHistoryComposerView(actionTabId, {
+        selectionStart: merged.text.length,
+        selectionEnd: merged.text.length,
+        scrollTop: 0,
+      });
+      flushHistoryComposerDrafts();
+      flushHistoryComposerView();
       if (isCurrentAction()) {
         setDraftWarning('Send stopped before Enter. The failed prompt was restored before your newer draft.');
       }
@@ -5421,12 +5622,16 @@ function AgentHistoryControls({
         const statusAtSend = statusRef.current;
         let claudeExactEmptyEvidence: Record<string, unknown> | null = null;
         const acceptsBusyPrompt = statusAtSend === 'busy' && runtime.allowSendWhileBusy;
+        const canWaitForExistingLaunch = statusAtSend === 'starting';
         const canLaunchBeforeSend = statusAtSend === 'inactive' && (
           sessionId
             ? (runtime.toolType !== 'claude' || resumeMaterialized === true)
             : !!runtime.startFresh
         );
-        if (statusAtSend !== 'active' && !acceptsBusyPrompt && !canLaunchBeforeSend) {
+        if (statusAtSend !== 'active'
+          && !acceptsBusyPrompt
+          && !canLaunchBeforeSend
+          && !canWaitForExistingLaunch) {
           throw new Error(runtime.label + ' is not ready (' + statusAtSend + ')');
         }
         if (statusAtSend === 'active') {
@@ -5505,6 +5710,7 @@ function AgentHistoryControls({
         }).trim();
         const handoffId = createPromptHandoffId();
         const submittedAt = Date.now();
+        const initialQueueStatus = historyPromptHandoffInitialStatus(statusAtSend);
         sendHandoffId = handoffId;
         if (coordinatedSendToken) {
           const bound = bindCoordinatedAgentSendHandoff(
@@ -5548,9 +5754,10 @@ function AgentHistoryControls({
           submittedAt,
           source: 'history-panel',
           statusAtSend,
+          initialStatus: initialQueueStatus,
           requiresAuditIdentity: true,
         });
-        onPromptSubmitted(presentationText, 'sending', {
+        onPromptSubmitted(presentationText, initialQueueStatus, {
           handoffId,
           statusAtSend,
           submittedAt,
@@ -5570,7 +5777,36 @@ function AgentHistoryControls({
         if (sourceStillCurrent) {
           clearedPromptImages = sendDraftImages;
           clearedPromptChips = sourceDraftChips;
-          setHistoryPromptDraft(actionTabId, '', { images: [], chips: [] });
+          const editorBeforeClear = promptTextareaRef.current;
+          const editorCharsBefore = editorBeforeClear?.getAttribute('data-history-composer-tab-id') === actionTabId
+            ? editorBeforeClear.value.length
+            : -1;
+          applyHistoryComposerSnapshot({
+            ownerTabId: actionTabId,
+            text: '',
+            images: [],
+            chips: [],
+            selectionStart: 0,
+            history: 'external',
+            userEvent: 'input.complete',
+          });
+          setHistoryComposerView(actionTabId, {
+            selectionStart: 0,
+            selectionEnd: 0,
+            scrollTop: 0,
+          });
+          // The handoff boundary must clear both the live CodeMirror document
+          // and the restart-persistent draft before PTY ownership begins.
+          // Otherwise the sent text can be revived by a stale editor callback
+          // or by the previous persisted snapshot after renderer restart.
+          flushHistoryComposerDrafts();
+          flushHistoryComposerView();
+          historyDiag('COMPOSER_HANDOFF_CLEAR tab=' + actionTabId.slice(-12)
+            + ' handoff=' + handoffId
+            + ' editorBefore=' + editorCharsBefore
+            + ' editorAfter=' + (promptTextareaRef.current?.value.length ?? -1)
+            + ' storeAfter=' + (useUIStore.getState().historyPromptDrafts[actionTabId] || '').length
+            + ' persisted=1');
           clearedPromptText = rawDraftSnapshot;
         } else {
           const mismatch = latestText !== rawDraftSnapshot
@@ -5586,6 +5822,7 @@ function AgentHistoryControls({
             + ' snapshotHash=' + historyOwnerDigest(rawDraftSnapshot)
             + ' latestHash=' + historyOwnerDigest(latestText));
         }
+        delayedDeliveryWarningHandoffRef.current = null;
         setDraftWarning(null);
         const result = await sendAgentPromptScenario({
           tabId,
@@ -5601,6 +5838,13 @@ function AgentHistoryControls({
           returnDraftOnConflict: true,
           claudeExactEmptyEvidence,
           coordinatedSendToken,
+          onReadyForSend: (readyStatus) => {
+            advanceHistoryPromptHandoffTransportPhase(
+              actionTabId,
+              handoffId,
+              readyStatus === 'busy' ? 'queued' : 'sending',
+            );
+          },
           presentationSnapshot: {
             historySessionId: sessionId || null,
             promptChips: promptChipsForHistory,
@@ -5652,7 +5896,7 @@ function AgentHistoryControls({
           && !unconfirmedStatus;
         const effectiveStatusAtSend = result?.effectiveStatusAtSend || statusAtSend;
         const resultQueueStatus: Exclude<HistoryPromptHandoffStatus,
-          'sending' | 'cancelled' | 'failed'> = unconfirmedStatus
+          'preparing' | 'sending' | 'cancelled' | 'failed'> = unconfirmedStatus
           || (effectiveStatusAtSend === 'busy' ? 'queued' : 'sent');
         sendAuditIdentity = {
           requiresAuditIdentity: resultOwnershipTransferred,
@@ -5706,9 +5950,17 @@ function AgentHistoryControls({
           sendAuditIdentity,
         );
         if (sendDeliveryUnconfirmed) {
-          setDraftWarning(unconfirmedStatus === 'delivery-unknown'
-            ? 'Prompt delivery is unconfirmed. It will not be sent again automatically.'
-            : 'Prompt was submitted, but delivery confirmation is delayed. It will not be sent again automatically.');
+          delayedDeliveryWarningHandoffRef.current = handoffId;
+          const alreadyConfirmed = getHistoryPromptHandoffsSnapshot(actionTabId)
+            .some((record) => record.handoffId === handoffId && record.queueStatus === 'sent');
+          if (alreadyConfirmed) {
+            delayedDeliveryWarningHandoffRef.current = null;
+            setDraftWarning(null);
+          } else {
+            setDraftWarning(unconfirmedStatus === 'delivery-unknown'
+              ? 'Prompt delivery is unconfirmed. It will not be sent again automatically.'
+              : 'Prompt was submitted, but delivery confirmation is delayed. It will not be sent again automatically.');
+          }
           console.warn('[' + runtime.logPrefix + ':draft] send delivery unconfirmed; ownership kept by terminal tab='
             + actionTabId.slice(-12)
             + ' handoff=' + handoffId
@@ -5892,7 +6144,7 @@ function AgentHistoryControls({
         }
       }
     }
-  }, [busyAction, cwd, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, resumeMaterialized, runtime, sessionId, setHistoryPromptDraft, setStatusFrom, tabId]);
+  }, [applyHistoryComposerSnapshot, busyAction, cwd, flushHistoryComposerDrafts, flushHistoryComposerView, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, resumeMaterialized, runtime, sessionId, setHistoryComposerView, setHistoryPromptDraft, setStatusFrom, tabId]);
 
   useEffect(() => {
     const submitComposer = (event: Event) => {
@@ -5994,6 +6246,8 @@ function AgentHistoryControls({
     : rawActiveLifecycle;
   const isTurnBusy = status === 'busy';
   const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion || rewindLocked || effectiveStopping;
+  const sendControlsLocked = controlsLocked
+    && !(busyAction === 'resume' && status === 'starting');
   const isCancellingTurn = busyAction === 'interrupt' || interruptAwaiting;
   const isCompacting = operationalPhase?.tabId === tabId
     && operationalPhase.provider === toolType
@@ -6179,10 +6433,11 @@ function AgentHistoryControls({
   const canStartOrResume = canStartFresh || canResume;
   const canAcceptPrompt = status === 'active'
     || (status === 'busy' && runtime.allowSendWhileBusy)
+    || status === 'starting'
     || canStartOrResume;
   const canAcceptSubmitIntent = canAcceptPrompt
     && !pendingQuestion
-    && !controlsLocked
+    && !sendControlsLocked
     && !historyImagePastePending
     && !derivedDraftImageNotice?.blocking;
   const terminalOnlySlashDraft = isTerminalOnlyComposerDraft(prompt);
@@ -6196,7 +6451,7 @@ function AgentHistoryControls({
       && !effectiveStopping
       && !busyAction);
   const visibleDraftWarning = draftWarning || derivedDraftWarning;
-  const draftNoticeMeta = visibleDraftWarning ? getDraftNoticeMeta(visibleDraftWarning) : null;
+  const draftNoticeMeta = visibleDraftWarning ? getHistoryDraftNoticeMeta(visibleDraftWarning) : null;
   // Attachment problems are authoring state, not terminal status. Keep them
   // out of the lifecycle row, but persist them immediately above the input so
   // the user sees the exact slot/path before choosing Send.
@@ -7050,26 +7305,31 @@ function AgentHistoryControls({
             description: runtime.label + ' is compacting the conversation context',
             accent: '#a78bfa',
           }
-      : busyAction === 'send'
-        ? {
-            title: 'SENDING',
-            description: 'Sending the prompt from History to ' + runtime.label,
-            accent: '#60a5fa',
-          }
       : showUpdatingChip
         ? {
             title: 'UPDATING',
             description: runtime.label + ' history is updating',
             accent: '#60a5fa',
-          }
+        }
         : null;
-  const statusTitle = statusCopied
-    ? 'COPIED'
-    : (unifiedTransientStatus?.title || activeLifecycle?.title || meta.label);
-  const statusDescription =
+  // The input phase comes from the exact handoff, never from the generic
+  // button/action flag. This prevents a completed send from briefly
+  // reappearing as SENDING while the async action is unwinding.
+  const displayedInputStatus = activeInputStatus;
+  const inputStatusPresentation = historyPromptHandoffStatusPresentation(displayedInputStatus);
+  const terminalStatusTitle = unifiedTransientStatus?.title || activeLifecycle?.title || meta.label;
+  const terminalStatusDescription =
     unifiedTransientStatus?.description ||
     activeLifecycle?.description ||
     basicStatusDescription[status];
+  const statusTitle = statusCopied
+    ? 'COPIED'
+    : inputStatusPresentation
+      ? terminalStatusTitle + ' / ' + inputStatusPresentation.label
+      : terminalStatusTitle;
+  const statusDescription = inputStatusPresentation
+    ? terminalStatusDescription + '\n' + inputStatusPresentation.title
+    : terminalStatusDescription;
   const statusDetail = activeLifecycle?.detail || null;
   const statusSessionId = sessionId || activeLifecycle?.sessionId || null;
   const statusAccent = unifiedTransientStatus?.accent || (
@@ -7085,11 +7345,12 @@ function AgentHistoryControls({
   );
   const showStatusText = statusCopied
     || !!unifiedTransientStatus
+    || !!inputStatusPresentation
     || !!activeLifecycle
     || status === 'starting'
     || status === 'stopping'
     || (status === 'unknown' && !presenceResolving);
-  const showBusyLoader = (status === 'busy' || isPasteBusy) && !showStatusText;
+  const showBusyLoader = status === 'busy' || isPasteBusy;
   const displayedActivityTiming = activityTiming?.state === 'running'
     ? activityTiming
     : pasteActivityStartedAt !== null
@@ -7158,7 +7419,7 @@ function AgentHistoryControls({
           type="button"
           data-agent-status-row
           data-agent-operational-phase={isCompacting ? 'compacting' : undefined}
-          data-agent-send-phase={busyAction === 'send' ? 'sending' : undefined}
+          data-agent-send-phase={displayedInputStatus || undefined}
           data-terminal-toggle={onToggleTerminal ? 'status' : undefined}
           aria-label={onToggleTerminal
             ? ((terminalOpen ? 'Hide ' : 'Open ') + secondarySurfaceLabel)
@@ -7752,7 +8013,7 @@ function AgentHistoryControls({
 }
 
 const HISTORY_VIRTUOSO_COMPONENTS = {
-  Footer: HistoryBottomSpacer,
+  Footer: HistoryTerminalPreviewFooter,
   ScrollSeekPlaceholder: HistoryScrollSeekPlaceholder,
 };
 
@@ -7951,6 +8212,21 @@ const HISTORY_SCROLL_SEEK_CONFIG = {
   },
 };
 
+// Row-level hydration window. Rows within this radius of what the user is
+// reading arrive with content; the rest arrive as identity stubs (see
+// applyHistoryRowWindow in main). 750 rows each way is far more than a
+// screen — several flings' worth — so ordinary reading never waits for a
+// hydration round-trip, while a 15.5K-row giant still ships ~1.5MB of stubs
+// instead of ~150MB of presentation.
+const HISTORY_HYDRATION_RADIUS_ROWS = 750;
+// The tail is always hydrated whatever the user is looking at: the composer,
+// tail-pin, live projection and background chips all read it.
+const HISTORY_HYDRATION_TAIL_ROWS = 300;
+// Refetch when the viewport comes within this many rows of the hydrated
+// span's edge. Must be well below the radius so the request is issued while
+// there are still hydrated rows to scroll through.
+const HISTORY_HYDRATION_REFETCH_MARGIN_ROWS = 250;
+
 // Fallback average row height when no measured geometry exists yet (first
 // ever visit to a session). Roughly a short assistant paragraph; real
 // measurements replace estimates as rows mount, and returns use the stored
@@ -8038,6 +8314,8 @@ function HistoryPanel({
   mainSurface = false,
   agentSidePanel = false,
   composerPortalHostId,
+  bottomInset = 0,
+  compactComposer = false,
   onSwapPrimarySurface,
   terminalIsPrimary = false,
   projectId,
@@ -8069,6 +8347,34 @@ function HistoryPanel({
   }, [composerPortalHostId]);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
+  // Right-edge obstacles over the CENTER box. Only meaningful while this panel
+  // IS the center (mainSurface) — as a side panel it insets nothing. Same
+  // arithmetic as the Run after strip and the terminal's arrow.
+  const sideTerminalOpenForInset = useUIStore((s) => s.sideTerminalOpenTabs[tabId] ?? false);
+  const sideTerminalWidthForInset = useUIStore((s) => s.sideTerminalWidth);
+  const timelineTreeModeForInset = useUIStore((s) => s.timelineTreeModeTabs[tabId] ?? false);
+  const timelinePinnedForInset = useUIStore((s) => s.timelinePinned);
+  const timelineWidthForInset = useUIStore((s) => s.timelineWidth);
+  const historyPinnedForInset = useUIStore((s) => s.historyPinned);
+  const centerRightInset = resolveCenterRightInset({
+    // As the side panel this transcript IS the obstacle; its own right edge is
+    // clear and its arrow belongs inside it. (mainSurface already gates the
+    // value at the use site, but saying it here keeps the rule in one place
+    // for both surfaces.)
+    isSidePanel: agentSidePanel,
+    treeMode: timelineTreeModeForInset,
+    pinned: timelinePinnedForInset,
+    width: timelineWidthForInset,
+    sideTerminalOpen: sideTerminalOpenForInset,
+    sideTerminalWidth: sideTerminalWidthForInset,
+    // A transcript that is itself the center never has a transcript docked
+    // beside it — the opposite surface there is always the terminal.
+    sideHistoryOpen: false,
+    sideHistoryWidth: 0,
+    // A pinned side terminal is a column, so this surface already ends before
+    // it and must not inset again.
+    sidePanelPinned: historyPinnedForInset,
+  });
   const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
   const setHistoryScrollToUuid = useUIStore((s) => s.setHistoryScrollToUuid);
   const setHistoryVisibleUuids = useUIStore((s) => s.setHistoryVisibleUuids);
@@ -8076,6 +8382,9 @@ function HistoryPanel({
   const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
   const setHistoryRewindPreview = useUIStore((s) => s.setHistoryRewindPreview);
   const historyFontSize = useUIStore((s) => s.historyFontSize);
+  const terminalHistoryStreamingEnabled = useUIStore(
+    (s) => s.terminalHistoryStreamingEnabled,
+  );
   const isTurnBusy = useWorkspaceStore(useCallback((state) => {
     if (projectId) {
       return state.openProjects.get(projectId)?.tabs.get(tabId)?.aiBusy === true;
@@ -8235,6 +8544,9 @@ function HistoryPanel({
     () => (firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined) || [],
   );
   const [liveEntries, setLiveEntries] = useState<FullHistoryEntry[]>([]);
+  const [terminalPreview, setTerminalPreview] = useState<TerminalHistoryPreview | null>(null);
+  const terminalPreviewRef = useRef<TerminalHistoryPreview | null>(null);
+  terminalPreviewRef.current = terminalPreview;
   const [liveToolResults, setLiveToolResults] = useState<Map<string, HistoryLiveToolResult>>(
     () => new Map(),
   );
@@ -8661,6 +8973,15 @@ function HistoryPanel({
     () => buildHistoryLivePresentation(displayEntries, visibleLiveEntries),
     [displayEntries, visibleLiveEntries],
   ) as FullHistoryEntry[];
+  const visibleTerminalPreview = terminalPreview?.tabId === tabId
+    && terminalPreview.toolType === toolType
+    && (!sessionId || !terminalPreview.sessionId || terminalPreview.sessionId === sessionId)
+    ? terminalPreview
+    : null;
+  const historyVirtuosoContext = useMemo<HistoryVirtuosoContext>(
+    () => ({ terminalPreview: visibleTerminalPreview }),
+    [visibleTerminalPreview],
+  );
   const visibleLiveToolResults = liveToolResultsRef.current.ownerKey === historyOwnerKey
     ? liveToolResults
     : EMPTY_HISTORY_LIVE_TOOL_RESULTS;
@@ -8935,6 +9256,15 @@ function HistoryPanel({
   const restoredMeasuredLayout = restoredLayoutLatchRef.current.layout;
   const historyDefaultRowHeight =
     restoredLayoutLatchRef.current.avgRowHeight ?? HISTORY_DEFAULT_ROW_HEIGHT_PX;
+  // Height source for row-window stubs. The mount wave's lookup covers the
+  // visit's own rows; a stub can also appear later (hydration span moved
+  // while the wave was long done), so the lookup is kept independently and
+  // falls back to the owner's average — the same estimate Virtuoso uses for
+  // never-measured rows, which is what keeps the scrollbar from lurching.
+  const historyRowHeightLookup = useMemo(
+    () => createHistoryRowHeightLookup(restoredMeasuredLayout, historyDefaultRowHeight),
+    [restoredMeasuredLayout, historyDefaultRowHeight],
+  );
   const rewindPreviewHiddenTurnCount = rewindPreviewResult.hiddenTurnCount;
   // Last entry uuid Claude's own backtrace reaches before stopping at the first
   // orphan. Any entry at index <= boundary is part of the chain-break zone:
@@ -8956,7 +9286,11 @@ function HistoryPanel({
   const scrollArrowRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const isResizing = useRef(false);
+  // This is user intent, not a sample of current geometry. A streaming footer
+  // temporarily increases scrollHeight before the follow scroll lands; that
+  // must not look like the user scrolled away from the tail.
   const isAtBottomRef = useRef(true);
+  const historyPointerScrollActiveRef = useRef(false);
   // Bumped by real user scroll intent and by owner change; the scroll-restore
   // convergence loop checks it each frame so it never fights the user.
   const scrollRestoreGenRef = useRef(0);
@@ -8991,6 +9325,42 @@ function HistoryPanel({
   // Visible index range from Virtuoso. Drives the visible-uuid set without
   // an IntersectionObserver (cheaper, exact: no threshold guessing).
   const visibleRangeRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
+  // Row-window hydration state. `centerUuid` is what the NEXT request asks
+  // main to hydrate around (null = tail, the cold-open default); the span is
+  // what the last response actually hydrated, in row indices.
+  const hydrationCenterUuidRef = useRef<string | null>(null);
+  const hydrationSpanRef = useRef<{ from: number; to: number; applied: boolean }>({
+    from: 0, to: 0, applied: false,
+  });
+  const hydrationRequestInFlightRef = useRef(false);
+  // `loadHistory` is declared far below (it depends on the whole load
+  // pipeline), but hydration is requested from callbacks defined ABOVE it —
+  // search-match navigation, the Timeline-jump effect. A ref is the only way
+  // to call it from there without a temporal-dead-zone crash; it is assigned
+  // in the same render that creates loadHistory.
+  const loadHistoryRef = useRef<((isRefresh?: boolean) => Promise<boolean>) | null>(null);
+  /** One place that starts a hydration re-centre, for every caller. */
+  const requestHistoryHydrationAt = useCallback((
+    centerUuid: string | null,
+    reason: string,
+    extra = '',
+  ) => {
+    if (!centerUuid) return false;
+    if (!hydrationSpanRef.current.applied) return false;
+    if (hydrationRequestInFlightRef.current) return false;
+    if (hydrationCenterUuidRef.current === centerUuid) return false;
+    const load = loadHistoryRef.current;
+    if (!load) return false;
+    hydrationCenterUuidRef.current = centerUuid;
+    hydrationRequestInFlightRef.current = true;
+    historyDiag('HYDRATION_REQUEST tab=' + tabId.slice(-12) +
+      ' reason=' + reason + extra +
+      ' uuid=' + centerUuid.slice(0, 8));
+    void load(true).finally(() => {
+      hydrationRequestInFlightRef.current = false;
+    });
+    return true;
+  }, [tabId]);
   // Latest entries length — let stable callbacks (scrollToBottom) read it
   // without depending on `entries` (which would invalidate downstream effects
   // on every refresh).
@@ -9095,10 +9465,28 @@ function HistoryPanel({
   const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
   // Build flat list of match positions: { entryIdx, entryUuid, offset }
+  // Matches found by main over the FULL projection (codex row-window path).
+  // Kept keyed by query so a stale response cannot answer a newer query.
+  const [serverMatches, setServerMatches] = useState<{
+    query: string;
+    positions: Array<{ entryUuid: string; offset: number }>;
+  } | null>(null);
   const matchPositions = useMemo(() => {
     if (!searchQuery || searchQuery.length < 2) return [];
-    const q = searchQuery.toLowerCase();
     const positions: Array<{ entryIdx: number; entryUuid: string; offset: number }> = [];
+    // Row-window sessions: a far-away row is a stub with no content locally,
+    // so scanning what the renderer holds would silently miss matches. Main
+    // scanned the whole projection; map its row identities to current
+    // indices (identity is stable, index is what Virtuoso needs).
+    if (serverMatches && serverMatches.query === searchQuery) {
+      for (const match of serverMatches.positions) {
+        const entryIdx = displayEntryIndexByUuid.get(match.entryUuid);
+        if (entryIdx === undefined) continue;
+        positions.push({ entryIdx, entryUuid: match.entryUuid, offset: match.offset });
+      }
+      return positions;
+    }
+    const q = searchQuery.toLowerCase();
     for (let i = 0; i < displayEntries.length; i++) {
       const text = (displayEntries[i].content || '').toLowerCase();
       let idx = text.indexOf(q);
@@ -9108,23 +9496,63 @@ function HistoryPanel({
       }
     }
     return positions;
-  }, [displayEntries, searchQuery]);
+  }, [displayEntries, displayEntryIndexByUuid, searchQuery, serverMatches]);
+
+  // Ask main to search whenever the query changes on a row-windowed session.
+  // Local scanning still runs meanwhile (hydrated rows answer instantly), and
+  // the server answer replaces it when it lands.
+  useEffect(() => {
+    if (toolType !== 'codex' || !sessionId) return;
+    if (!searchOpen || searchQuery.length < 2) {
+      setServerMatches(null);
+      return;
+    }
+    let disposed = false;
+    const queryAtStart = searchQuery;
+    void ipcRenderer.invoke('agent-transcript:search-history', {
+      toolType, sessionId, cwd, query: queryAtStart,
+    }).then((result: any) => {
+      if (disposed || !result?.success) return;
+      setServerMatches({
+        query: queryAtStart,
+        positions: (result.matches || []).map((match: any) => ({
+          entryUuid: match.entryUuid,
+          offset: match.offset,
+        })),
+      });
+      historyDiag('SEARCH_SERVER tab=' + tabId.slice(-12) +
+        ' matches=' + (result.total ?? -1) +
+        ' returned=' + (result.matches?.length ?? 0) +
+        ' truncated=' + (result.truncated ? '1' : '0'));
+    }).catch(() => {});
+    return () => { disposed = true; };
+  }, [cwd, searchOpen, searchQuery, sessionId, tabId, toolType]);
 
   // Reset current match when query changes and scroll to first match
   useEffect(() => {
     if (matchPositions.length > 0) {
       setCurrentMatchIdx(0);
       const match = matchPositions[0];
+      isAtBottomRef.current = false;
+      historyTailPinScheduler.cancel();
       virtuosoRef.current?.scrollToIndex({ index: match.entryIdx, align: 'center', behavior: 'smooth' });
     }
-  }, [searchQuery]);
+  }, [historyTailPinScheduler, searchQuery]);
 
-  // Navigate to current match entry
+  // Navigate to current match entry. A match found by main can live outside
+  // the hydrated span (that is the whole reason the search moved to main), so
+  // re-centre hydration on it — the row is a placeholder until its content
+  // arrives, and the highlight pass runs again when it does.
   const scrollToMatch = useCallback((idx: number) => {
     if (idx < 0 || idx >= matchPositions.length) return;
     const match = matchPositions[idx];
+    isAtBottomRef.current = false;
+    historyTailPinScheduler.cancel();
     virtuosoRef.current?.scrollToIndex({ index: match.entryIdx, align: 'center', behavior: 'smooth' });
-  }, [matchPositions]);
+    if (toolType === 'codex' && (presentationEntriesRef.current[match.entryIdx] as any)?.rowStub) {
+      requestHistoryHydrationAt(match.entryUuid, 'search-match', ' idx=' + match.entryIdx);
+    }
+  }, [historyTailPinScheduler, matchPositions, requestHistoryHydrationAt, toolType]);
 
   const goNextMatch = useCallback(() => {
     if (matchPositions.length === 0) return;
@@ -9334,7 +9762,7 @@ function HistoryPanel({
   const appendLocalPromptEntry = useCallback((
     text: string,
     queueStatus: Extract<HistoryPromptHandoffStatus,
-      'sending' | 'queued' | 'audit-pending' | 'delivery-unknown' | 'sent'>,
+      'preparing' | 'sending' | 'queued' | 'audit-pending' | 'delivery-unknown' | 'sent'>,
     meta: {
       handoffId: string;
       statusAtSend: AgentPtyStatus;
@@ -9364,7 +9792,11 @@ function HistoryPanel({
       queueStatus,
       statusAtSend: meta.statusAtSend,
       handoffId,
-      statusReason: queueStatus === 'sending' ? 'send-start' : 'send-result',
+      statusReason: queueStatus === 'preparing'
+        ? 'send-preparing'
+        : queueStatus === 'sending'
+          ? 'send-start'
+          : 'send-result',
       timestamp: new Date(submittedAt).toISOString(),
       content: cleanContent,
       sessionId: resolvedSessionId,
@@ -9429,7 +9861,7 @@ function HistoryPanel({
 
   const updateLocalPromptEntry = useCallback((
     handoffId: string,
-    queueStatus: Exclude<HistoryPromptHandoffStatus, 'sending'>,
+    queueStatus: Exclude<HistoryPromptHandoffStatus, 'preparing' | 'sending'>,
     reason: string,
     identity?: {
       requiresAuditIdentity?: boolean;
@@ -9748,7 +10180,8 @@ function HistoryPanel({
         sourceIdentity: record.auditProof?.sourceIdentity,
       };
       if (
-        record.queueStatus === 'sending'
+        record.queueStatus === 'preparing'
+        || record.queueStatus === 'sending'
         || record.queueStatus === 'queued'
         || record.queueStatus === 'audit-pending'
         || record.queueStatus === 'delivery-unknown'
@@ -10106,13 +10539,25 @@ function HistoryPanel({
         auditEntryUuid: handoff.auditProof?.entryUuid,
         sourceIdentity: handoff.auditProof?.sourceIdentity,
       };
-      const matched = findServerPromptEntry(
+      const legacyOrchestrationMatch = serverEntries.find((entry) => (
+        !consumedServerUuids.has(entry.uuid)
+        && legacyOrchestrationCompletionMatchesCanonicalEntry(handoff, entry)
+      ));
+      const matched = legacyOrchestrationMatch || findServerPromptEntry(
         serverEntries,
         localIdentity,
         consumedServerUuids,
       );
       if (!matched) continue;
       consumedServerUuids.add(matched.uuid);
+      if (legacyOrchestrationMatch) {
+        consumeHistoryPromptHandoff(tabId, handoff.handoffId);
+        removeLocalPromptEntry(handoff.handoffId, 'legacy-orchestration-materialized');
+        historyDiag('HANDOFF_CONSUMED tab=' + tabId.slice(-12) +
+          ' handoff=' + handoff.handoffId +
+          ' proof=orchestration-run-tag');
+        continue;
+      }
       void acknowledgeMaterializedHistoryReceipt({
         operationKey: handoff.sendOperationKey,
         attemptId: handoff.sendAttemptId,
@@ -10129,7 +10574,7 @@ function HistoryPanel({
           ' proof=' + (handoff.auditProof ? 'audit' : 'fallback'));
       });
     }
-  }, [acknowledgeMaterializedHistoryReceipt, sessionId, tabId, toolType]);
+  }, [acknowledgeMaterializedHistoryReceipt, removeLocalPromptEntry, sessionId, tabId, toolType]);
 
   // Load full history
   const runHistoryLoad = useCallback(async (isRefresh = false) => {
@@ -10215,6 +10660,20 @@ function HistoryPanel({
         // re-cloning the whole session over IPC. Codex-only: the Claude
         // pipeline has its own probe/unchanged economy.
         deltaOk: toolType === 'codex',
+        // Row-level hydration window: the full row LIST always arrives (every
+        // positional mechanism here is indexed against it), but rows far from
+        // what the user is reading arrive as identity stubs and render as
+        // exact-height placeholders. The renderer names the row it wants the
+        // span centred on; main keeps the tail and live-work rows hydrated
+        // regardless. Codex-only for now — Claude sessions are orders of
+        // magnitude smaller and their projection path is separate.
+        hydrate: toolType === 'codex'
+          ? {
+              centerUuid: hydrationCenterUuidRef.current,
+              radius: HISTORY_HYDRATION_RADIUS_ROWS,
+              alwaysHydrateTail: HISTORY_HYDRATION_TAIL_ROWS,
+            }
+          : null,
       };
       let result = await ipcRenderer.invoke(ipcChannel, requestPayload);
       if (result?.success && result.delta === true && isCurrentOwner()) {
@@ -10359,6 +10818,25 @@ function HistoryPanel({
               ' handoff=' + handoffId +
               ' reason=' + suppressed.reason);
           }
+        }
+        // Record which rows main actually hydrated. The watcher below decides
+        // "am I near the edge of readable content?" from this, not from what
+        // was REQUESTED — a request centred on a row that vanished falls back
+        // to the tail, and believing the request would leave the watcher
+        // convinced it holds a span it does not.
+        if (result.rowWindowApplied) {
+          hydrationSpanRef.current = {
+            from: Number(result.hydratedFrom) || 0,
+            to: Number(result.hydratedTo) || 0,
+            applied: true,
+          };
+          historyDiag('HYDRATION_SPAN tab=' + tabId.slice(-12) +
+            ' seq=' + loadSequence +
+            ' span=' + hydrationSpanRef.current.from + '-' + hydrationSpanRef.current.to +
+            ' hydrated=' + (result.hydratedCount ?? -1) +
+            ' stubbed=' + (result.stubbedCount ?? -1));
+        } else {
+          hydrationSpanRef.current = { from: 0, to: 0, applied: false };
         }
         const rawServerEntries: FullHistoryEntry[] = result.entries || [];
         rawServerEntriesRef.current = rawServerEntries;
@@ -10608,6 +11086,52 @@ function HistoryPanel({
     historyLoadFlightRef.current = flight;
     return flight.promise;
   }, [historyOwnerKey, runHistoryLoad, sessionId, tabId]);
+  // Callers defined ABOVE this declaration (search-match navigation, the
+  // Timeline-jump effect) reach the loader through this ref.
+  loadHistoryRef.current = loadHistory;
+
+  // Row-window hydration watcher.
+  //
+  // Called whenever the visible range moves. It answers one question: is the
+  // user reading close enough to the edge of the hydrated span that the next
+  // flings would land on stubs? If so, re-centre the span on the row the user
+  // is looking at and refresh — the response travels as a delta carrying only
+  // the rows whose hydration state changed (proven in
+  // session-transcript-service.projector.test.js).
+  //
+  // Deliberately NOT event-throttled by a timer: the guards are structural —
+  // one request in flight at a time, and a request is only issued when the
+  // measured distance to the span edge crosses the margin. A satisfied
+  // viewport issues nothing at all, so scrolling inside the span is free.
+  const maybeRequestHistoryHydration = useCallback((reason: string) => {
+    if (toolType !== 'codex') return;
+    const span = hydrationSpanRef.current;
+    if (!span.applied) return;
+    if (hydrationRequestInFlightRef.current) return;
+    const total = presentationEntriesRef.current.length;
+    if (total === 0) return;
+    const range = visibleRangeRef.current;
+    const nearTop = range.start - span.from;
+    const nearBottom = span.to - range.end;
+    // The span already reaches the list edge on that side — nothing more to
+    // hydrate there, however close the viewport gets.
+    const topEdgeReached = span.from <= 0;
+    const bottomEdgeReached = span.to >= total - 1;
+    const needsAbove = !topEdgeReached && nearTop < HISTORY_HYDRATION_REFETCH_MARGIN_ROWS;
+    const needsBelow = !bottomEdgeReached && nearBottom < HISTORY_HYDRATION_REFETCH_MARGIN_ROWS;
+    if (!needsAbove && !needsBelow) return;
+    // Centre on the middle of what is on screen: the span then extends
+    // symmetrically, so scrolling back the other way is covered too.
+    const centerIndex = Math.max(0, Math.min(total - 1, Math.round((range.start + range.end) / 2)));
+    const centerEntry = presentationEntriesRef.current[centerIndex];
+    requestHistoryHydrationAt(
+      centerEntry?.uuid || null,
+      reason,
+      ' range=' + range.start + '-' + range.end
+        + ' span=' + span.from + '-' + span.to
+        + ' center=' + centerIndex,
+    );
+  }, [requestHistoryHydrationAt, toolType]);
 
   const flushLiveHistoryToDurable = useCallback(async (
     reason: string,
@@ -11624,6 +12148,126 @@ function HistoryPanel({
     // again).
   }, [surfaceLoading, tabId, historyOwnerKey, historyOwnerVisit, ownerChangedBeforeLayoutHandoff, entries, restoredMeasuredLayout]);
 
+  // Terminal bytes can appear before Claude/Codex has materialized the
+  // corresponding assistant record in JSONL. Main owns that provisional
+  // evidence and publishes it separately from the durable transcript; keeping
+  // it in the Virtuoso footer avoids rebuilding an 80k-row History array on
+  // every terminal frame.
+  useEffect(() => {
+    if (!terminalHistoryStreamingEnabled
+      || (toolType !== 'codex' && toolType !== 'claude')) {
+      terminalPreviewRef.current = null;
+      setTerminalPreview(null);
+      return;
+    }
+    let disposed = false;
+    const acceptPreview = (incoming: any, source: 'event' | 'hydrate') => {
+      if (disposed || !incoming || incoming.tabId !== tabId || incoming.toolType !== toolType) return;
+      if (sessionId && incoming.sessionId && incoming.sessionId !== sessionId) {
+        historyDiag('TERMINAL_PREVIEW_REJECT tab=' + tabId.slice(-12)
+          + ' source=' + source
+          + ' reason=session-mismatch'
+          + ' incoming=' + String(incoming.sessionId).slice(0, 8)
+          + ' owner=' + sessionId.slice(0, 8));
+        return;
+      }
+      if (!String(incoming.text || '').trim()) return;
+      const previous = terminalPreviewRef.current;
+      if (previous?.previewId === incoming.previewId
+        && Number(previous.previewSeq || 0) > Number(incoming.previewSeq || 0)) {
+        historyDiag('TERMINAL_PREVIEW_REJECT tab=' + tabId.slice(-12)
+          + ' source=' + source
+          + ' reason=older-preview-sequence'
+          + ' incomingSeq=' + String(incoming.previewSeq ?? '-')
+          + ' currentSeq=' + previous.previewSeq);
+        return;
+      }
+      if (previous?.previewId !== incoming.previewId
+        && Number(previous?.startedAt || 0) > Number(incoming.startedAt || 0)) {
+        historyDiag('TERMINAL_PREVIEW_REJECT tab=' + tabId.slice(-12)
+          + ' source=' + source
+          + ' reason=older-turn'
+          + ' incoming=' + String(incoming.previewId || '').slice(-18)
+          + ' current=' + String(previous?.previewId || '').slice(-18));
+        return;
+      }
+      terminalPreviewRef.current = incoming as TerminalHistoryPreview;
+      setTerminalPreview(incoming as TerminalHistoryPreview);
+      historyDiag('TERMINAL_PREVIEW_APPLY tab=' + tabId.slice(-12)
+        + ' source=' + source
+        + ' provider=' + toolType
+        + ' preview=' + String(incoming.previewId || '').slice(-18)
+        + ' seq=' + String(incoming.previewSeq ?? '-')
+        + ' frame=' + String(incoming.committedFrameGeneration ?? '-')
+        + ' writeSeq=' + String(incoming.writeSeq ?? '-')
+        + ' phase=' + String(incoming.phase || '-')
+        + ' chars=' + String(incoming.text?.length || 0)
+        + ' hash=' + String(incoming.textHash || '-')
+        + ' followBottom=' + (isAtBottomRef.current ? '1' : '0')
+        + ' physicalPinned=' + (virtuosoScrollerRef.current
+            ? (isHistoryTailPinned(virtuosoScrollerRef.current) ? '1' : '0')
+            : 'na')
+        + ' scrollTop=' + Math.round(virtuosoScrollerRef.current?.scrollTop || 0)
+        + ' scrollHeight=' + Math.round(virtuosoScrollerRef.current?.scrollHeight || 0)
+        + ' reason=' + String(incoming.reason || '-'));
+    };
+    const onTerminalPreview = (_event: any, detail: any) => {
+      if (detail?.tabId !== tabId || detail?.toolType !== toolType) return;
+      if (detail.action === 'clear') {
+        const previous = terminalPreviewRef.current;
+        if (!previous || previous.previewId === detail.previewId) {
+          terminalPreviewRef.current = null;
+          setTerminalPreview(null);
+        }
+        historyDiag('TERMINAL_PREVIEW_CLEAR tab=' + tabId.slice(-12)
+          + ' provider=' + toolType
+          + ' preview=' + String(detail.previewId || '').slice(-18)
+          + ' reason=' + String(detail.reason || '-'));
+        return;
+      }
+      acceptPreview(detail.preview, 'event');
+    };
+    ipcRenderer.on('agent-transcript:terminal-preview', onTerminalPreview);
+    void ipcRenderer.invoke('agent-transcript:get-terminal-preview', {
+      tabId,
+      toolType,
+    }).then((result: any) => {
+      if (!disposed && result?.success === true && result.preview) {
+        acceptPreview(result.preview, 'hydrate');
+      }
+    }).catch((error: any) => {
+      historyDiag('TERMINAL_PREVIEW_HYDRATE_FAILED tab=' + tabId.slice(-12)
+        + ' provider=' + toolType
+        + ' error=' + String(error?.message || error));
+    });
+    return () => {
+      disposed = true;
+      ipcRenderer.removeListener('agent-transcript:terminal-preview', onTerminalPreview);
+      terminalPreviewRef.current = null;
+      setTerminalPreview(null);
+    };
+  }, [sessionId, tabId, terminalHistoryStreamingEnabled, toolType]);
+
+  useLayoutEffect(() => {
+    if (!terminalPreview || !isAtBottomRef.current) return;
+    let secondFrame = 0;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        const scroller = virtuosoScrollerRef.current;
+        if (!scroller || !isAtBottomRef.current) return;
+        scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        historyDiag('TERMINAL_PREVIEW_PIN tab=' + tabId.slice(-12)
+          + ' preview=' + terminalPreview.previewId.slice(-18)
+          + ' seq=' + terminalPreview.previewSeq
+          + ' scrollTop=' + Math.round(scroller.scrollTop));
+      });
+    });
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame) cancelAnimationFrame(secondFrame);
+    };
+  }, [tabId, terminalPreview?.previewId, terminalPreview?.previewSeq]);
+
   // Both PTY agents expose canonical incremental transcript records. Project
   // that same stream into desktop History while the turn is busy,
   // instead of reparsing and cloning the complete rollout after every append.
@@ -11646,32 +12290,21 @@ function HistoryPanel({
       const current = liveProjectionRef.current.ownerKey === ownerKey
         ? liveProjectionRef.current.entries
         : [];
-      const record = detail?.message;
-      const carrierText = toolType === 'claude'
-        ? extractClaudeHistoryPromptCarrierText(detail)
-        : '';
-      const locallyOwnedPrompt = !!carrierText && isClaudeHistoryPromptLocallyOwned(
-        detail,
-        Array.from(promptHandoffMetaRef.current.entries()).map(([handoffId, handoff]) => ({
+      const localHandoffs = Array.from(promptHandoffMetaRef.current.entries())
+        .map(([handoffId, handoff]) => ({
           handoffId,
           auditEntryUuid: handoff.auditEntryUuid,
-        })),
-      );
-      const isQueueSettlement = record?.type === 'queue-operation'
-        && (
-          record.operation === 'dequeue'
-          || record.operation === 'remove'
-          || record.operation === 'popAll'
-        );
+        }));
       // History-originated sends already own an optimistic prompt row. Native
-      // xterm input has no such owner, so its exact Claude queue/user carrier
-      // becomes the live row. Queue settlement remains enabled only when that
-      // native live row actually exists.
-      const includeUserText = toolType === 'claude' && (
-        isQueueSettlement
-          ? hasClaudeHistoryLiveQueuePrompt(current)
-          : !locallyOwnedPrompt
-      );
+      // xterm input has no such owner, so its canonical Claude or Codex user
+      // record becomes the live row. Ownership is exact; equal text alone can
+      // never hide a manual terminal message.
+      const includeUserText = shouldIncludeHistoryLiveUserText({
+        toolType,
+        envelope: detail,
+        localHandoffs,
+        currentEntries: current,
+      });
       const reduced = reduceHistoryLiveProjection(current, detail, {
         includeUserText,
       });
@@ -12204,6 +12837,42 @@ function HistoryPanel({
     historyTouchYRef.current = null;
   }, []);
 
+  const handleHistoryScrollerPointerDown = useCallback((event: PointerEvent) => {
+    const scroller = virtuosoScrollerRef.current;
+    if (!scroller || event.target !== scroller) return;
+    const rect = scroller.getBoundingClientRect();
+    const onVerticalScrollbar = event.clientX >= rect.left + scroller.clientWidth;
+    const onHorizontalScrollbar = event.clientY >= rect.top + scroller.clientHeight;
+    // A click on empty scroller background is not scroll intent. Only a native
+    // scrollbar drag may unpin a concurrently growing preview through scroll.
+    if (onVerticalScrollbar || onHorizontalScrollbar) {
+      historyPointerScrollActiveRef.current = true;
+    }
+  }, []);
+
+  const handleHistoryScrollerPointerEnd = useCallback(() => {
+    historyPointerScrollActiveRef.current = false;
+  }, []);
+
+  const handleHistoryScrollerKeyIntent = useCallback((event: KeyboardEvent) => {
+    const movesUp = event.key === 'ArrowUp'
+      || event.key === 'PageUp'
+      || event.key === 'Home'
+      || (event.key === ' ' && event.shiftKey);
+    if (!movesUp) return;
+    isAtBottomRef.current = false;
+    historyTailPinScheduler.cancel();
+  }, [historyTailPinScheduler]);
+
+  useEffect(() => {
+    window.addEventListener('pointerup', handleHistoryScrollerPointerEnd, true);
+    window.addEventListener('pointercancel', handleHistoryScrollerPointerEnd, true);
+    return () => {
+      window.removeEventListener('pointerup', handleHistoryScrollerPointerEnd, true);
+      window.removeEventListener('pointercancel', handleHistoryScrollerPointerEnd, true);
+    };
+  }, [handleHistoryScrollerPointerEnd]);
+
   useEffect(() => {
     if (!historyScrollToUuid) return;
     if (surfaceLoading || displayEntries.length === 0) return; // wait for entries; uuid stays in store
@@ -12224,6 +12893,18 @@ function HistoryPanel({
         new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: targetUuid, found: false, reason: 'uuid-not-in-display' } }),
       );
       return;
+    }
+
+    // Row-window: a Timeline jump can target a row main shipped as a stub.
+    // Ask for the hydration span to re-centre on it BEFORE converging — the
+    // convergence loop refuses to settle on a placeholder (same rule as the
+    // mount-wave shell), so without this the jump would hunt until its
+    // attempt ceiling. The request is fire-and-forget: the response arrives
+    // as a delta carrying just the newly-hydrated rows, and the loop below
+    // keeps re-issuing scrollToIndex meanwhile — landing exactly when the
+    // real card replaces the placeholder.
+    if (toolType === 'codex' && (displayEntries[idx] as any)?.rowStub) {
+      requestHistoryHydrationAt(targetUuid, 'timeline-jump', ' idx=' + idx);
     }
 
     // Variable-height virtualization race. On the closed→open Cmd+click path
@@ -12388,7 +13069,15 @@ function HistoryPanel({
       }
     }
     const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
-    isAtBottomRef.current = isHistoryTailPinned(el);
+    const physicalPinned = isHistoryTailPinned(el);
+    isAtBottomRef.current = reconcileHistoryTailFollowIntent({
+      currentIntent: isAtBottomRef.current,
+      physicalPinned,
+      userMovedAway: !physicalPinned && (
+        historyPointerScrollActiveRef.current
+        || historyScrollInFlightRef.current !== null
+      ),
+    });
     if (scrollArrowRef.current) {
       scrollArrowRef.current.style.display = distFromBottom > 150 ? '' : 'none';
     }
@@ -12638,6 +13327,7 @@ function HistoryPanel({
       overlayComposer={mainSurface}
       agentInputSurface={agentInputSurface}
       suppressWindowEscape={suppressGlobalHotkeys}
+      compactComposer={compactComposer}
     />
   ) : null;
 
@@ -12673,10 +13363,13 @@ function HistoryPanel({
       style={{
         position: embedded ? 'relative' : 'absolute',
         top: 0,
-        bottom: 0,
+        // Stop above the docked input instead of running under it. Only the
+        // free-floating side panel can do this: the embedded/pinned placements
+        // are laid out by flex, where `bottom`/`height` are not theirs to set.
+        bottom: !embedded && bottomInset > 0 ? bottomInset : 0,
         right: 0,
         width: embedded ? (embeddedFill ? '100%' : (slideIn ? width : 0)) : width,
-        height: '100%',
+        height: !embedded && bottomInset > 0 ? 'auto' : '100%',
         flexShrink: 0,
         overflow: 'hidden',
         backgroundColor: '#1a1a1a',
@@ -12896,7 +13589,7 @@ function HistoryPanel({
             <HistorySpinner size={16} />
             Loading...
           </div>
-        ) : transcriptEntries.length === 0 ? (
+        ) : transcriptEntries.length === 0 && !visibleTerminalPreview ? (
           !sessionId && (toolType === 'claude' || toolType === 'codex') ? (
             <div
               data-history-empty-state={unboundAgentStarting
@@ -12947,6 +13640,7 @@ function HistoryPanel({
             ref={virtuosoRef}
             data={transcriptEntries}
             components={HISTORY_VIRTUOSO_COMPONENTS}
+            context={historyVirtuosoContext}
             // Live and durable versions use one physical identity, so a
             // completed answer updates in place instead of unmounting between
             // the rollout event and the durable History refresh.
@@ -12964,6 +13658,9 @@ function HistoryPanel({
                 prev.removeEventListener('touchcancel', handleHistoryTouchEnd);
                 prev.removeEventListener('pointerdown', handleHistoryToolPointerDown, true);
                 prev.removeEventListener('wheel', handleHistoryToolWheel, true);
+                prev.removeEventListener('pointerdown', handleHistoryScrollerPointerDown);
+                prev.removeEventListener('keydown', handleHistoryScrollerKeyIntent);
+                historyPointerScrollActiveRef.current = false;
               }
               virtuosoScrollerRef.current = el as HTMLElement | null;
               if (el && mountWaveActiveRef.current && mountWaveLaneRef.current) {
@@ -12984,10 +13681,15 @@ function HistoryPanel({
                 scroller.addEventListener('touchcancel', handleHistoryTouchEnd, { passive: true });
                 scroller.addEventListener('pointerdown', handleHistoryToolPointerDown, true);
                 scroller.addEventListener('wheel', handleHistoryToolWheel, { capture: true, passive: false });
+                scroller.addEventListener('pointerdown', handleHistoryScrollerPointerDown, { passive: true });
+                scroller.addEventListener('keydown', handleHistoryScrollerKeyIntent);
               }
             }}
             rangeChanged={(range) => {
               visibleRangeRef.current = { start: range.startIndex, end: range.endIndex };
+              // Row-window: the viewport moved — check whether the readable
+              // span still covers where the user is heading.
+              maybeRequestHistoryHydration('range-changed');
               if (mountWaveActiveRef.current && mountWaveLaneRef.current) {
                 // Range publications are the other "rows are mounted now"
                 // signal — covers restores/jumps that mount a NEW set of
@@ -13189,18 +13891,12 @@ function HistoryPanel({
             {...(restoredMeasuredLayout
               ? { restoreStateFrom: restoredMeasuredLayout as any }
               : { initialTopMostItemIndex })}
-            // Same live-position rule as the composer-resize path: the cached
-            // flag alone is only as fresh as the last scroll event, and rows
-            // append on the agent's schedule, not the reader's. A user
-            // scrolling upward through a streaming session kept being pulled
-            // back to the tail (prod e2e17: four saves at followBottom=0 then
-            // one at 1, with no downward input in between). Intent must be
-            // held AND the scroller must still actually be at the bottom.
+            // Tail following is user intent, not instantaneous geometry. A
+            // growing footer moves the physical bottom before our next frame;
+            // that must keep following. Wheel/touch/keyboard/scrollbar actions
+            // explicitly turn the intent off, and reaching the tail turns it on.
             followOutput={() => {
-              if (!isAtBottomRef.current) return false;
-              const scroller = virtuosoScrollerRef.current;
-              if (scroller && !isHistoryTailPinned(scroller)) return false;
-              return 'auto';
+              return isAtBottomRef.current ? 'auto' : false;
             }}
             className="hp-history-transcript"
             style={{
@@ -13226,6 +13922,36 @@ function HistoryPanel({
               // NOT in the shell set (streamed in during the wave) render
               // real immediately. The wrapper stays the real one either way
               // — context menu, uuid identity and tint are never deferred.
+              // Row-window stub: main shipped this row's identity only (see
+              // applyHistoryRowWindow). It renders exactly like a mount-wave
+              // shell — same wrapper, same stored height — because it is the
+              // same promise to Virtuoso: this row occupies these pixels, its
+              // content arrives later. The difference is who fills it: the
+              // wave upgrades locally, a stub needs main to hydrate it, which
+              // the viewport watcher below requests.
+              if ((presentedEntry as any).rowStub) {
+                const stubHeight = mountWaveMetaRef.current?.heightLookup?.(_idx)
+                  ?? historyRowHeightLookup(_idx);
+                return (
+                  <div
+                    data-uuid={presentedEntry.uuid}
+                    data-history-row-owner={historyOwnerDomId}
+                    data-history-mount-shell="1"
+                    data-history-row-stub="1"
+                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType)}
+                    style={{
+                      paddingTop: 4,
+                      paddingBottom: 4,
+                      height: stubHeight,
+                      boxSizing: 'border-box',
+                      overflow: 'hidden',
+                      backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    }}
+                  >
+                    <HistoryMountShellBody index={_idx} />
+                  </div>
+                );
+              }
               const waveMeta = mountWaveMetaRef.current;
               const asShell =
                 mountWaveActive
@@ -13345,7 +14071,12 @@ function HistoryPanel({
             />
           </div>
         )}
-        {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll */}
+        {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll.
+            When this panel is the CENTER surface it must dodge the right-docked
+            side panel, exactly like the Run after strip and the terminal's own
+            arrow (shared arithmetic in surfaceInsets). As a side panel it insets
+            nothing: its own bottom-right corner is already clear, and shifting
+            it would push the control out of the panel it belongs to. */}
         <ControlHint label="Прокрутить History вниз">
         <div
           ref={scrollArrowRef}
@@ -13355,7 +14086,7 @@ function HistoryPanel({
             display: 'none',
             position: 'absolute',
             bottom: (mainSurface ? controlsHeight : 0) + 12,
-            right: 12,
+            right: (mainSurface ? centerRightInset : 0) + 12,
             width: 28,
             height: 28,
             borderRadius: 6,

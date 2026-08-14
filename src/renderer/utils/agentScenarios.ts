@@ -24,8 +24,19 @@ import {
 } from './agentDraftPreflight.mjs';
 import { buildClaudeRewindPromptProjection } from './composerChips.mjs';
 import { enqueueAgentSendScenario } from './agentSendSequencer.mjs';
+import { showAgentDraftScreenContradictionToast } from './agentDraftContradictionToast.mjs';
 
 const { ipcRenderer } = window.require('electron');
+
+const buildDraftCaptureProof = (tabId: string, proof: AgentDraftInspection) => (
+  buildExactDraftCaptureProof(
+    proof,
+    terminalRegistry.getDraftDiagnosticSnapshot(tabId, {
+      promptRow: (proof as any)?.promptRow,
+      cursorRow: (proof as any)?.cursorRow,
+    }),
+  )
+);
 
 export interface SendAgentPromptScenarioArgs {
   tabId: string;
@@ -46,6 +57,7 @@ export interface SendAgentPromptScenarioArgs {
   returnDraftOnConflict?: boolean;
   claudeExactEmptyEvidence?: Record<string, unknown> | null;
   coordinatedSendToken?: number | null;
+  onReadyForSend?: (status: Extract<AgentPtyStatus, 'active' | 'busy'>) => void;
   presentationSnapshot?: {
     historySessionId?: string | null;
     imagePaths?: HistoryPromptDraftImageRef[];
@@ -79,6 +91,68 @@ const normalizeStatus = (value: unknown): AgentPtyStatus | undefined => {
     : undefined;
 };
 
+const needsExactDraftCapture = (visual: any, decision: any) => (
+  decision?.decision === 'conflict'
+  || (decision?.decision === 'unknown' && visual?.exactCaptureRecommended === true)
+);
+
+const isClaudeFrameChangedBeforeExactCapture = (captured: any) => (
+  captured?.success === false
+  && captured?.error === 'claude_draft_state_unknown_before_paste'
+  && captured?.proofReason === 'claude-current-frame-changed-before-exact-capture'
+);
+
+async function captureDraftWithOneCommittedFrameRefresh({
+  tabId,
+  toolType,
+  runtime,
+  initialVisual,
+  mode,
+  reason,
+  assertSendNotCancelled,
+}: {
+  tabId: string;
+  toolType: AgentHistoryTool;
+  runtime: HistoryAgentRuntime;
+  initialVisual: any;
+  mode: 'copy' | 'grab';
+  reason: string;
+  assertSendNotCancelled: () => void;
+}) {
+  let visual = initialVisual;
+  let decision = classifyAgentDraftPreflight(visual);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!needsExactDraftCapture(visual, decision)) {
+      return { visual, decision, captured: null, attemptedCapture: false };
+    }
+    const captured = mode === 'grab'
+      ? await runtime.grabDraft(tabId, {
+          draftProof: buildDraftCaptureProof(tabId, visual),
+        })
+      : await runtime.copyDraft(tabId, {
+          draftProof: buildDraftCaptureProof(tabId, visual),
+        });
+    assertSendNotCancelled();
+    if (
+      toolType !== 'claude'
+      || !isClaudeFrameChangedBeforeExactCapture(captured)
+      || attempt > 0
+      || !runtime.probeDraft
+    ) {
+      return { visual, decision, captured, attemptedCapture: true };
+    }
+
+    // Process discovery may itself cause Claude to publish a newer complete
+    // TUI frame. Re-prove that exact frame once inside the same serialized send
+    // scenario; no input has been touched yet, so this preserves the original
+    // intent without weakening the empty-composer proof.
+    visual = await runtime.probeDraft(tabId, reason + ':committed-frame-refresh');
+    assertSendNotCancelled();
+    decision = classifyAgentDraftPreflight(visual);
+  }
+  return { visual, decision, captured: null, attemptedCapture: false };
+}
+
 async function runAgentPromptScenario({
   tabId,
   toolType,
@@ -98,6 +172,7 @@ async function runAgentPromptScenario({
   returnDraftOnConflict,
   claudeExactEmptyEvidence,
   coordinatedSendToken,
+  onReadyForSend,
   presentationSnapshot,
 }: SendAgentPromptScenarioArgs): Promise<any> {
   const assertSendNotCancelled = () => {
@@ -116,8 +191,12 @@ async function runAgentPromptScenario({
     sessionId,
     cwd,
     coordinatedSendToken,
+    requestedStatusAtSend: requestedStatusForSend,
   }) || requestedStatusForSend;
   assertSendNotCancelled();
+  if (statusForSend === 'active' || statusForSend === 'busy') {
+    onReadyForSend?.(statusForSend);
+  }
   if (requestedStatusForSend && statusForSend && requestedStatusForSend !== statusForSend) {
     console.log('[AgentScenario:send] status override tool=' + toolType
       + ' tab=' + String(tabId).slice(-12)
@@ -130,54 +209,33 @@ async function runAgentPromptScenario({
     ? (claudeExactEmptyEvidence || null)
     : null;
   if ((statusForSend === 'active' || statusForSend === 'busy') && canInspectDraft) {
-    const visual = runtime.probeDraft
+    let visual = runtime.probeDraft
       ? await runtime.probeDraft(tabId, 'agent-send-preflight:' + (source || 'unknown'))
       : runtime.inspectDraft!(tabId);
     assertSendNotCancelled();
     let draftDecision = classifyAgentDraftPreflight(visual);
-    if (
-      draftDecision.decision === 'conflict'
-      || (draftDecision.decision === 'unknown' && visual.exactCaptureRecommended === true)
-    ) {
+    if (needsExactDraftCapture(visual, draftDecision)) {
       const captureMode = returnDraftOnConflict === true ? 'grab' : 'copy';
-      let captured: any = null;
-      if (returnDraftOnConflict === true) {
-        captured = await runtime.grabDraft(tabId, {
-          draftProof: buildExactDraftCaptureProof(visual),
-        });
-      } else {
-        captured = await runtime.copyDraft(tabId, {
-          draftProof: buildExactDraftCaptureProof(visual),
-        });
-      }
-      const conflict = resolveAgentDraftConflict(visual, captured, {
-        attemptedCapture: true,
+      const capture = await captureDraftWithOneCommittedFrameRefresh({
+        tabId,
+        toolType,
+        runtime,
+        initialVisual: visual,
+        mode: captureMode,
+        reason: 'agent-send-preflight:' + (source || 'unknown'),
+        assertSendNotCancelled,
       });
-      if (conflict.decision === 'capture-failed' && captureMode === 'grab') {
-        return {
-          tabId,
-          toolType,
-          success: false,
-          ok: false,
-          submitted: false,
-          accepted: false,
-          code: 'terminal_draft_grab_failed',
-          error: conflict.error,
-          draftPreview: visual.preview || '',
-          draftSource: visual.source || '',
-          originalPrompt: prompt,
-        };
-      }
-      if (conflict.decision === 'clear') {
-        draftDecision = applyAgentDraftCaptureResolution(draftDecision, conflict);
-        if (toolType === 'claude') exactEmptyEvidenceForSend = captured;
-        console.warn('[AgentScenario:send] screen draft false-positive resolved by exact empty Ctrl+G'
-          + ' tool=' + toolType
-          + ' tab=' + String(tabId).slice(-12)
-          + ' mode=' + captureMode
-          + ' reason=' + conflict.reason);
+      visual = capture.visual;
+      draftDecision = capture.decision;
+      if (!capture.attemptedCapture) {
+        // A refreshed committed frame can itself become an exact clear/unknown
+        // verdict. Let the ordinary decision below consume that newer proof.
       } else {
-        if (!String(conflict.draftText || '').trim() && Number(conflict.draftImages || 0) === 0) {
+        const captured = capture.captured;
+        const conflict = resolveAgentDraftConflict(visual, captured, {
+          attemptedCapture: true,
+        });
+        if (conflict.decision === 'capture-failed' && captureMode === 'grab') {
           return {
             tabId,
             toolType,
@@ -185,28 +243,57 @@ async function runAgentPromptScenario({
             ok: false,
             submitted: false,
             accepted: false,
-            code: 'terminal_draft_state_unknown',
-            error: conflict.reason || 'Terminal draft state could not be proven',
+            code: 'terminal_draft_grab_failed',
+            error: conflict.error,
             draftPreview: visual.preview || '',
             draftSource: visual.source || '',
             originalPrompt: prompt,
           };
         }
-        return {
-          tabId,
-          toolType,
-          success: false,
-          ok: false,
-          submitted: false,
-          accepted: false,
-          code: 'terminal_draft_conflict',
-          error: 'Terminal has an unsent draft',
-          draftText: captureMode === 'grab' ? conflict.draftText : '',
-          draftPreview: visual.preview || '',
-          draftSource: visual.source || '',
-          draftImages: captureMode === 'grab' ? conflict.draftImages : 0,
-          originalPrompt: prompt,
-        };
+        if (conflict.decision === 'clear') {
+          draftDecision = applyAgentDraftCaptureResolution(draftDecision, conflict);
+          if (toolType === 'claude') exactEmptyEvidenceForSend = captured;
+          showAgentDraftScreenContradictionToast(useUIStore.getState(), {
+            tabId,
+            label: runtime.label,
+          });
+          console.warn('[AgentScenario:send] screen draft false-positive resolved by exact empty Ctrl+G'
+            + ' tool=' + toolType
+            + ' tab=' + String(tabId).slice(-12)
+            + ' mode=' + captureMode
+            + ' reason=' + conflict.reason);
+        } else {
+          if (!String(conflict.draftText || '').trim() && Number(conflict.draftImages || 0) === 0) {
+            return {
+              tabId,
+              toolType,
+              success: false,
+              ok: false,
+              submitted: false,
+              accepted: false,
+              code: 'terminal_draft_state_unknown',
+              error: conflict.reason || 'Terminal draft state could not be proven',
+              draftPreview: visual.preview || '',
+              draftSource: visual.source || '',
+              originalPrompt: prompt,
+            };
+          }
+          return {
+            tabId,
+            toolType,
+            success: false,
+            ok: false,
+            submitted: false,
+            accepted: false,
+            code: 'terminal_draft_conflict',
+            error: 'Terminal has an unsent draft',
+            draftText: captureMode === 'grab' ? conflict.draftText : '',
+            draftPreview: visual.preview || '',
+            draftSource: visual.source || '',
+            draftImages: captureMode === 'grab' ? conflict.draftImages : 0,
+            originalPrompt: prompt,
+          };
+        }
       }
     }
     if (draftDecision.decision === 'unknown') {
@@ -230,7 +317,7 @@ async function runAgentPromptScenario({
 
   const refreshClaudeExactEmptyEvidence = toolType === 'claude' && canInspectDraft
     ? async () => {
-        const visual = runtime.probeDraft
+        let visual = runtime.probeDraft
           ? await runtime.probeDraft(
               tabId,
               'agent-send-post-settings-proof:' + (source || 'unknown'),
@@ -238,19 +325,38 @@ async function runAgentPromptScenario({
           : runtime.inspectDraft!(tabId);
         assertSendNotCancelled();
         let draftDecision = classifyAgentDraftPreflight(visual);
-        if (
-          draftDecision.decision === 'conflict'
-          || (draftDecision.decision === 'unknown' && visual.exactCaptureRecommended === true)
-        ) {
-          const captured = await runtime.copyDraft(tabId, {
-            draftProof: buildExactDraftCaptureProof(visual),
+        if (needsExactDraftCapture(visual, draftDecision)) {
+          const capture = await captureDraftWithOneCommittedFrameRefresh({
+            tabId,
+            toolType,
+            runtime,
+            initialVisual: visual,
+            mode: 'copy',
+            reason: 'agent-send-post-settings-proof:' + (source || 'unknown'),
+            assertSendNotCancelled,
           });
-          assertSendNotCancelled();
+          visual = capture.visual;
+          draftDecision = capture.decision;
+          if (!capture.attemptedCapture) {
+            if (draftDecision.decision === 'clear') {
+              return { success: true, evidence: null };
+            }
+            return {
+              success: false,
+              code: 'terminal_draft_state_unknown',
+              error: 'Claude composer state is unknown after settings changed',
+            };
+          }
+          const captured = capture.captured;
           const conflict = resolveAgentDraftConflict(visual, captured, {
             attemptedCapture: true,
           });
           if (conflict.decision === 'clear') {
             draftDecision = applyAgentDraftCaptureResolution(draftDecision, conflict);
+            showAgentDraftScreenContradictionToast(useUIStore.getState(), {
+              tabId,
+              label: runtime.label,
+            });
             return { success: true, evidence: captured };
           }
           if (String(conflict.draftText || '').trim() || Number(conflict.draftImages || 0) > 0) {
@@ -817,6 +923,7 @@ async function ensureAgentReadyForSend({
   sessionId,
   cwd,
   coordinatedSendToken,
+  requestedStatusAtSend,
 }: {
   tabId: string;
   toolType: AgentHistoryTool;
@@ -824,6 +931,7 @@ async function ensureAgentReadyForSend({
   sessionId?: string | null;
   cwd?: string;
   coordinatedSendToken?: number | null;
+  requestedStatusAtSend?: AgentPtyStatus;
 }) {
   const assertSendNotCancelled = () => {
     if (
@@ -866,7 +974,8 @@ async function ensureAgentReadyForSend({
     }
   }
 
-  if (!presence || presence.status === 'inactive') {
+  const launchAlreadyInProgress = requestedStatusAtSend === 'starting';
+  if ((!presence || presence.status === 'inactive') && !launchAlreadyInProgress) {
     const hasSession = typeof sessionId === 'string' && sessionId.length > 0;
     const actionLabel = hasSession ? 'resume' : 'start-fresh';
     if (!hasSession && !runtime.startFresh) {
@@ -880,6 +989,10 @@ async function ensureAgentReadyForSend({
       throw new Error(resumeResult.error || runtime.label + ' ' + actionLabel + ' failed before send');
     }
     assertSendNotCancelled();
+  } else if ((!presence || presence.status === 'inactive') && launchAlreadyInProgress) {
+    console.log('[AgentScenario:send] wait for existing launch tool=' + toolType
+      + ' tab=' + String(tabId).slice(-12)
+      + ' presence=' + (presence?.status || 'unknown'));
   }
 
   // Re-arming readiness loop. Enter is one submit intent: the scenario owns

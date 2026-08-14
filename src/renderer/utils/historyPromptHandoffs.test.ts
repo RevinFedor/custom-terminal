@@ -8,11 +8,14 @@ import {
   durableHistorySendReceiptMatchesCanonicalEntry,
   getHistoryPromptHandoffsSnapshot,
   hydrateHistoryPromptHandoffFromDurableReceipt,
+  historyPromptHandoffInitialStatus,
   historyPromptHandoffStatusPresentation,
   historyPromptHandoffAcceptsAuditIdentity,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
+  legacyOrchestrationCompletionMatchesCanonicalEntry,
   reconcileHistoryPromptHandoffRows,
   runHistoryPromptHandoff,
+  selectLatestHistoryPromptInputStatus,
   subscribeHistoryPromptHandoffs,
   type HistoryPromptHandoff,
   type HistoryPromptHandoffChange,
@@ -110,6 +113,75 @@ test('a background begin is replayed when History subscribes later', () => {
     change: { type: 'replay' },
   }]);
   unsubscribe();
+});
+
+test('a submit made during startup is visible immediately and advances through exact transport phases', () => {
+  assert.equal(historyPromptHandoffInitialStatus('inactive'), 'preparing');
+  assert.equal(historyPromptHandoffInitialStatus('starting'), 'preparing');
+  assert.equal(historyPromptHandoffInitialStatus('active'), 'sending');
+  assert.equal(historyPromptHandoffInitialStatus('busy'), 'queued');
+
+  const tabId = 'tab-starting';
+  const handoffId = 'handoff-starting';
+  const store = new HistoryPromptHandoffStore(limits());
+  const observed: string[] = [];
+  const unsubscribe = store.subscribe(tabId, (snapshot, change) => {
+    if (change.type === 'replay') return;
+    const record = snapshot.find(candidate => candidate.handoffId === handoffId);
+    if (record) observed.push(record.queueStatus);
+  });
+
+  store.begin({
+    tabId,
+    handoffId,
+    toolType: 'codex',
+    text: 'wait for startup',
+    submittedAt: 100,
+    statusAtSend: 'starting',
+    initialStatus: historyPromptHandoffInitialStatus('starting'),
+  });
+  store.advanceTransportPhase(tabId, handoffId, 'sending');
+  store.advanceTransportPhase(tabId, handoffId, 'confirming');
+  store.advanceTransportPhase(tabId, handoffId, 'sending');
+
+  assert.deepEqual(observed, ['preparing', 'sending', 'audit-pending']);
+  assert.equal(store.getSnapshot(tabId)[0]?.queueStatus, 'audit-pending');
+  assert.equal(
+    historyPromptHandoffStatusPresentation('preparing')?.label,
+    'PREPARING',
+  );
+  unsubscribe();
+});
+
+test('the terminal status row selects only the newest active input operation', () => {
+  assert.equal(selectLatestHistoryPromptInputStatus([
+    { submittedAt: 100, statusChangedAt: 120, queueStatus: 'sent' },
+    { submittedAt: 200, statusChangedAt: 210, queueStatus: 'preparing' },
+    { submittedAt: 150, statusChangedAt: 300, queueStatus: 'audit-pending' },
+  ]), 'preparing');
+  assert.equal(selectLatestHistoryPromptInputStatus([
+    { submittedAt: 100, statusChangedAt: 120, queueStatus: 'sent' },
+    { submittedAt: 200, statusChangedAt: 210, queueStatus: 'failed' },
+  ]), null);
+});
+
+test('a queued prompt switches to SENDING only when its exact PTY transfer begins', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  store.begin({
+    tabId: 'tab-busy',
+    handoffId: 'handoff-busy',
+    toolType: 'claude',
+    text: 'wait for current turn',
+    statusAtSend: 'busy',
+    initialStatus: 'queued',
+  });
+  assert.equal(store.getSnapshot('tab-busy')[0]?.queueStatus, 'queued');
+
+  store.advanceTransportPhase('tab-busy', 'handoff-busy', 'sending');
+  assert.equal(store.getSnapshot('tab-busy')[0]?.queueStatus, 'sending');
+
+  store.advanceTransportPhase('tab-busy', 'handoff-busy', 'confirming');
+  assert.equal(store.getSnapshot('tab-busy')[0]?.queueStatus, 'audit-pending');
 });
 
 test('settle preserves exact handoff identity and immutable audit proof', () => {
@@ -956,6 +1028,43 @@ test('durable presentation matching uses exact Claude UUID or Codex source ident
   }, {
     sourceIdentity: 'codex-user-source-session-a-4096',
   }), false);
+});
+
+test('legacy orchestration SENT retires only against the exact durable run tag', () => {
+  const handoff = {
+    handoffId: 'orchestration-complete:run-a',
+    source: 'orchestration-completion:run-a',
+    queueStatus: 'sent' as const,
+    sendOperationKey: null,
+    sendAttemptId: null,
+  };
+  const canonical = {
+    uuid: 'entry-a',
+    sessionId: 'session-a',
+    semanticTags: [{
+      kind: 'orchestration',
+      runId: 'run-a',
+      phase: 'completion',
+    }],
+  };
+
+  assert.equal(legacyOrchestrationCompletionMatchesCanonicalEntry(handoff, canonical), true);
+  assert.equal(legacyOrchestrationCompletionMatchesCanonicalEntry(handoff, {
+    ...canonical,
+    semanticTags: [{ kind: 'orchestration', runId: 'run-b', phase: 'completion' }],
+  }), false);
+  assert.equal(legacyOrchestrationCompletionMatchesCanonicalEntry({
+    ...handoff,
+    source: 'orchestration-completion:run-b',
+  }, canonical), false);
+  assert.equal(legacyOrchestrationCompletionMatchesCanonicalEntry({
+    ...handoff,
+    sendOperationKey: 'history:tab:orchestration-complete:run-a',
+  }, canonical), false);
+  assert.equal(legacyOrchestrationCompletionMatchesCanonicalEntry({
+    ...handoff,
+    queueStatus: 'audit-pending',
+  }, canonical), false);
 });
 
 test('acknowledged and legacy confirmed receipts never recreate an unconsumable SENT row', () => {

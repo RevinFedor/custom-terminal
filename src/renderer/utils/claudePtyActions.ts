@@ -53,6 +53,10 @@ export interface ClaudePtyDraftGrabResult {
   terminalIdentityStable?: boolean;
   terminalRunSeq?: number | null;
   inputRevision?: number | null;
+  screenProofInputRevision?: number | null;
+  inputRevisionTransition?: 'ctrl-g-exact-capture' | string;
+  inputRevisionTransitionOwned?: boolean;
+  screenContradiction?: boolean;
   terminalLifecycleGeneration?: string | null;
   mirrorGeneration?: string | null;
 }

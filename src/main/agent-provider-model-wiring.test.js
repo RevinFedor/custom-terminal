@@ -12,18 +12,42 @@ test('orchestration validates provider and model before durable reservation or t
   const routeStart = webSource.indexOf("if (parsed.pathname === '/api/orchestrations' && req.method === 'POST')");
   const routeEnd = webSource.indexOf('const orchestrationResultMatch =', routeStart);
   const route = webSource.slice(routeStart, routeEnd);
-  const validation = route.indexOf('assertAgentProviderModel({ provider: target.toolType, model: requestedModel })');
+  const validation = route.indexOf('const requestedModel = resolveProjectAgentModel(projectManager, {');
   const reservation = route.indexOf('reserveOrGet({');
   const creation = route.indexOf("bridgeRequest('createAgentTab'");
 
-  assert.ok(validation >= 0, 'orchestration must validate the actual target provider');
+  assert.ok(validation >= 0, 'orchestration must resolve and validate against the actual target provider');
   assert.ok(reservation > validation, 'validation must happen before a durable run is reserved');
   assert.ok(creation > reservation, 'target creation must remain after durable reservation');
 });
 
+test('orchestration persists and dispatches the resolved model rather than the caller alias', () => {
+  const routeStart = webSource.indexOf("if (parsed.pathname === '/api/orchestrations' && req.method === 'POST')");
+  const routeEnd = webSource.indexOf('const orchestrationResultMatch =', routeStart);
+  const route = webSource.slice(routeStart, routeEnd);
+  const resolution = route.indexOf('const requestedModel = resolveProjectAgentModel(projectManager, {');
+  const fingerprint = route.indexOf('model: requestedModel,', resolution);
+  const deliveryIntent = route.indexOf('deliveryIntent:', fingerprint);
+  const persistedModel = route.indexOf('model: requestedModel,', deliveryIntent);
+  const creation = route.indexOf('codexModel: requestedModel,', persistedModel);
+
+  assert.ok(resolution >= 0);
+  assert.ok(fingerprint > resolution, 'idempotency identity must use the exact resolved model');
+  assert.ok(persistedModel > deliveryIntent, 'restart intent must retain the exact resolved model');
+  assert.ok(creation > persistedModel, 'new target launch must receive the exact resolved model');
+});
+
 test('direct create, send, Inbox, and main start use the shared provider-model contract', () => {
-  const webCalls = webSource.match(/assertAgentProviderModel\(/g) || [];
-  assert.ok(webCalls.length >= 4, 'all model-bearing Project API entry points must share validation');
+  const settingsAwareCalls = webSource.match(/resolveProjectAgentModel\(/g) || [];
+  const providerValidationCalls = webSource.match(/assertAgentProviderModel\(/g) || [];
+  assert.ok(
+    settingsAwareCalls.length >= 4,
+    'Settings-aware Project API entry points must resolve aliases to exact model IDs',
+  );
+  assert.ok(
+    providerValidationCalls.length >= 2,
+    'legacy model-bearing entry points must retain provider/model validation',
+  );
 
   const startRoute = mainSource.slice(
     mainSource.indexOf("req.url === '/terminal/ai-start'"),

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -46,6 +46,7 @@ import {
 import { planAgentSettingsAvailability } from '../../utils/agentSettingsAvailability.mjs';
 import { applyClaudePtySetting } from '../../utils/claudePtyActions';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import { shouldWrapControlBar, measureClusterContentWidth, CONTROL_BAR_CLUSTER_MIN_GAP_PX } from '../../utils/controlBarWrap.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -1250,6 +1251,13 @@ export default function ClaudeControlBar({
     setLocalBusy(false, reason);
     endControlAction(reason.replace(/:clear$/, ''));
   };
+  const clearInterruptedAfterAcceptedControlLaunch = () => {
+    // Start/Continue from the bottom control bar is another public entry into
+    // the same resume transaction as the interrupted overlay, AutoResume and
+    // Resume All. Keep the blue recovery state until main accepts the launch;
+    // once accepted, the old interruption no longer describes this tab.
+    useWorkspaceStore.getState().clearInterruptedState(tabId);
+  };
   useEffect(() => {
     if (!ptyTransitionEngine) {
       sessionActionProbeSeqRef.current += 1;
@@ -1287,8 +1295,9 @@ export default function ClaudeControlBar({
       setSessionActionBlockedStatusIfChanged(null, 'codex-ready');
       void refreshSessionActionBlockedStatus('codex-ready');
     };
-    const onAgentBusy = (_: any, data: { tabId?: string; busy?: boolean }) => {
+    const onAgentBusy = (_: any, data: { tabId?: string; busy?: boolean; reason?: string }) => {
       if (data?.tabId !== tabId || data?.busy !== true) return;
+      if (ptyTransitionEngine === 'claude' && data.reason === 'spinner') return;
       setSessionActionBlockedStatusIfChanged(null, ptyTransitionEngine + '-busy');
       if (ptyTransitionEngine === 'codex') {
         void refreshSessionActionBlockedStatus('codex-busy');
@@ -1432,12 +1441,29 @@ export default function ClaudeControlBar({
   // всегда false. Подписываемся на claude:busy-state (main.js forward'ит сюда
   // claude-sdk:busy-state через 10810). Используется чтобы SessionActionChip
   // правильно показывал Stop на hover'е во время живого SDK turn'а.
-  const [sdkBusy, setSdkBusy] = useState(false);
+  //
+  // The broadcast alone is not enough, for the same reason the paste/local
+  // flags right above get a hard reset on every tab bind: this component is
+  // REUSED across tab switches (no `key`), so a flag left at `true` by tab A
+  // is still `true` when tab B is bound — and A's eventual "finished" arrives
+  // tagged with A's id, gets filtered out here, and never clears it. The chip
+  // then reads "работает" on an idle tab forever. The mirror image is just as
+  // bad: bound (or freshly mounted in a split pane) DURING a turn, it starts
+  // at `false`, shows "активен", and Stop does nothing because it is gated on
+  // this flag.
+  //
+  // So the starting value comes from the app-wide per-tab flag — already
+  // selected above as `tabAiBusy`, kept current for every tab whether or not
+  // it is on screen — and the live edges take over from there. The edge state
+  // is cleared on every tab bind so it can never be inherited.
+  const [sdkBusyEdge, setSdkBusyEdge] = useState<boolean | null>(null);
+  const sdkBusy = sdkBusyEdge ?? tabAiBusy;
   useEffect(() => {
     if (!isSDKTab) return;
+    setSdkBusyEdge(null);
     const handler = (_: any, data: { tabId: string; busy: boolean }) => {
       if (data.tabId === tabId) {
-        setSdkBusy(data.busy);
+        setSdkBusyEdge(data.busy);
         if (data.busy) setSdkStopping(false); // new turn started → clear the stopping cue
       }
     };
@@ -1801,10 +1827,102 @@ export default function ClaudeControlBar({
     ?? hoveredPopup;
 
   const rootRef = useRef<HTMLDivElement>(null);
+  // ── Перенос в две строки при нехватке ширины ────────────────────────────
+  // Каждая кнопка в баре — pill фиксированного размера (flexShrink: 0), потому
+  // что её подпись обязана остаться читаемой. Значит при узкой ширине ничего не
+  // сжимается: блоки просто наезжают друг на друга (хуже всего в разделённом
+  // режиме, где два бара делят ширину окна). Лечится переносом, а не сжатием.
+  //
+  // Ширины меряем, а не считаем: они зависят от живого текста подписи
+  // («GPT-5.6-Sol» против «opus»), от размера шрифта в настройках и от того,
+  // какие необязательные чипы сейчас показаны.
+  const leftClusterRef = useRef<HTMLDivElement>(null);
+  const rightClusterRef = useRef<HTMLDivElement>(null);
+  const [clustersWrapped, setClustersWrapped] = useState(false);
   // Refs на каждый trigger + popup для geometric bridge (mousemove hit-test).
   const triggerRefs = useRef<Record<PopupKey, HTMLButtonElement | null>>({ provider: null, model: null, effort: null });
   const popupRefs = useRef<Record<PopupKey, HTMLDivElement | null>>({ provider: null, model: null, effort: null });
   const modelEffortPopupRef = useRef<HTMLDivElement | null>(null);
+
+  // Ловушка, из-за которой наивная версия начинает мигать: после переноса блоки
+  // стоят в столбик, и их «естественная» ширина уже не читается — обе становятся
+  // равны ширине бара, условие переворачивается, строки схлопываются обратно, и
+  // так по кругу. Поэтому меряем scrollWidth (нужная ширина содержимого, а не
+  // выданная раскладкой) — она одинакова в обоих состояниях.
+  // useLayoutEffect, а не useEffect: правый кластер рендерится внутри вызова
+  // функции ниже, поэтому его ref привязывается позже — обычный эффект успевал
+  // прочитать пустую ссылку, сбросить перенос и больше не пересчитаться, потому
+  // что зависимости не менялись. Слой раскладки видит уже привязанные ссылки.
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const left = leftClusterRef.current;
+    const right = rightClusterRef.current;
+    // Правый кластер скрывается целиком на новой вкладке — переносить нечего.
+    if (!root || !left || !right) {
+      setClustersWrapped(false);
+      return undefined;
+    }
+    const measure = () => {
+      const style = window.getComputedStyle(root);
+      const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+      setClustersWrapped(shouldWrapControlBar({
+        availableWidth: root.clientWidth - padding,
+        // Ширина СОДЕРЖИМОГО, а не выданная раскладкой: у левого блока в конце
+        // стоит распорка, прижимающая счётчик контекста к правому краю, поэтому
+        // scrollWidth всегда равен ширине бара (замерено: 600 из 600 при
+        // реальной сумме детей 521). С таким числом сравнение становится
+        // самоссылочным — оно растёт вместе с доступной шириной, и бар уже
+        // никогда не «влезает» обратно в одну строку.
+        leftWidth: measureClusterContentWidth(left, 10),
+        rightWidth: measureClusterContentWidth(right, 6),
+        minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+      }));
+    };
+    measure();
+    // Ширина бара меняется и без ресайза окна: перетаскивание границы боковой
+    // панели, закреп, появление/исчезновение чипов, смена подписи модели.
+    //
+    // ВАЖНО: наблюдатель за размером — не единственный источник. В скрытом окне
+    // он не срабатывает вообще (замерено: ширина реально изменилась, ни одного
+    // вызова), ровно как не наступает кадр отрисовки. Поэтому он здесь только
+    // ускоряет реакцию, а не является условием: тот же расчёт выполняется на
+    // каждом рендере бара (эффект ниже без списка зависимостей), а рендер
+    // случается при любой смене раскладки, подписи или набора чипов.
+    const observer = new ResizeObserver(measure);
+    observer.observe(root);
+    observer.observe(left);
+    observer.observe(right);
+    // Второй источник, потому что первого недостаточно: ширина бара меняется
+    // и БЕЗ рендера этого компонента (перетаскивание границы панели, ресайз
+    // окна, закреп), а в скрытом окне наблюдатель за размером не срабатывает
+    // вообще — замерено: ширина изменилась 1145 → 620, ни одного вызова. Тогда
+    // единственный оставшийся сигнал — событие ресайза окна.
+    window.addEventListener('resize', measure);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [showRightCluster, sessionType, tabId, hasArtifactSession, contextPct > 0, showCacheChip]);
+
+  // Второй, безусловный источник того же расчёта: без списка зависимостей он
+  // выполняется после каждого рендера. Это и есть страховка от скрытого окна и
+  // от смены ширины, о которой наблюдатель не сообщил. Само по себе цикла не
+  // даёт: setClustersWrapped с тем же значением React не считает изменением, а
+  // scrollWidth одинаков в обеих раскладках (в столбик блоки не сжимаются).
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const left = leftClusterRef.current;
+    const right = rightClusterRef.current;
+    if (!root || !left || !right) return;
+    const style = window.getComputedStyle(root);
+    const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+    setClustersWrapped(shouldWrapControlBar({
+      availableWidth: root.clientWidth - padding,
+      leftWidth: left.scrollWidth,
+      rightWidth: right.scrollWidth,
+      minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+    }));
+  });
 
   useEffect(() => {
     if (openPopup === 'model') return;
@@ -2614,16 +2732,21 @@ export default function ClaudeControlBar({
         const runResult = await runCodexCommand({ tabId, command: 'codex', cwd: launchCwd });
         if (runResult?.success === false || runResult?.accepted === false) {
           clearSessionLifecycleAction(actionReason + ':launch-rejected');
+        } else {
+          clearInterruptedAfterAcceptedControlLaunch();
         }
       } else if (sessionType === 'gemini') {
         store.setTabCommandType(tabId, 'gemini');
         ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: launchCwd, yesMode: true });
+        clearInterruptedAfterAcceptedControlLaunch();
       } else {
         store.setTabCommandType(tabId, 'claude');
         store.markAiLaunchAutoTitle(tabId, 'claude');
         const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude' });
-        if (runResult?.success === false) {
+        if (runResult?.success === false || runResult?.accepted === false) {
           clearSessionLifecycleAction(actionReason + ':launch-rejected');
+        } else {
+          clearInterruptedAfterAcceptedControlLaunch();
         }
       }
     } catch (e) {
@@ -2661,17 +2784,19 @@ export default function ClaudeControlBar({
         // вызвать markPendingResume. См. fix-bridge-stale-takeover.md layer 4/5.
         if (claudeSessionId) markPendingResume(tabId, claudeSessionId);
         const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude-c', sessionId: claudeSessionId });
-        if (runResult?.success === false) {
+        if (runResult?.success === false || runResult?.accepted === false) {
           clearPendingResume(tabId);
           clearSessionLifecycleAction(actionReason + ':launch-rejected');
           return;
         }
+        clearInterruptedAfterAcceptedControlLaunch();
       } else if (sessionType === 'gemini') {
         store.setTabCommandType(tabId, 'gemini');
         terminalRegistry.get(tabId)?.scrollToBottom();
         focusTerminal();
         window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
         ipcRenderer.send('gemini:run-command', { tabId, command: 'gemini-c', sessionId: geminiSessionId });
+        clearInterruptedAfterAcceptedControlLaunch();
       } else if (sessionType === 'codex') {
         store.setTabCommandType(tabId, 'codex');
         terminalRegistry.get(tabId)?.scrollToBottom();
@@ -2680,6 +2805,8 @@ export default function ClaudeControlBar({
         const runResult = await runCodexCommand({ tabId, command: 'codex-c', sessionId: codexContinueSessionId || undefined, cwd: launchCwd });
         if (runResult?.success === false || runResult?.accepted === false) {
           clearSessionLifecycleAction(actionReason + ':launch-rejected');
+        } else {
+          clearInterruptedAfterAcceptedControlLaunch();
         }
       }
     } catch (e) {
@@ -3325,17 +3452,35 @@ export default function ClaudeControlBar({
       style={{
         position: 'relative',
         display: 'flex',
-        alignItems: 'center',
-        gap: 12,
+        // Перенос: правый блок остаётся на ПЕРВОЙ строке, левый уходит на вторую
+        // (порядок задан через `order` ниже). Так органы управления, к которым
+        // тянешься чаще, сохраняют своё место относительно поля ввода сверху.
+        flexDirection: clustersWrapped ? 'column' : 'row',
+        alignItems: clustersWrapped ? 'stretch' : 'center',
+        gap: clustersWrapped ? 2 : 12,
         padding: '4px 10px',
-        height: 30,
+        // Высота фиксирована только в одну строку. В две — по содержимому: бар
+        // это обычная строка раскладки, и всё под ним просто сдвигается вниз.
+        ...(clustersWrapped ? null : { height: 30 }),
         borderTop: '1px solid #2a2a2a',
         backgroundColor: '#161616',
         flexShrink: 0,
       }}
     >
       {/* LEFT: session controls + context meter */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 }}>
+      <div
+        ref={leftClusterRef}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          // В одну строку левый блок забирает остаток ширины (внутри есть
+          // распорка, прижимающая счётчик контекста вправо). В две — растягивать
+          // нечего, и flex:1 по вертикали растянул бы его на лишнюю высоту.
+          ...(clustersWrapped ? { order: 2, flex: '0 0 auto' } : { flex: 1 }),
+          minWidth: 0,
+        }}
+      >
         {/* ── [⎘ session-id-copy | SessionActionChip | ↻ refresh-timeline] ──
             Container border видим только при наличии sessionId. Содержимое
             заходит в один rounded-3-pill блок. Copy/Refresh скрыты на
@@ -3972,6 +4117,7 @@ export default function ClaudeControlBar({
         const supportsModelEffortPair = isCodex || isSDKTab || (sessionType === 'claude' && isAnthropicPTY);
         return (
         <div
+          ref={rightClusterRef}
           // Same shimmer for two different waits: a local control operation
           // (blocks clicks via isBusy below) and a confirmed-settings read in
           // flight (does NOT block — the displayed model/effort just isn't
@@ -3985,6 +4131,9 @@ export default function ClaudeControlBar({
             display: 'flex',
             alignItems: 'center',
             gap: 6,
+            // Первая строка при переносе. justifyContent сохраняет прижатие к
+            // правому краю, как в одну строку, — иначе блок «переехал бы» влево.
+            ...(clustersWrapped ? { order: 1, justifyContent: 'flex-end' } : null),
             pointerEvents: isBusy ? 'none' : 'auto',
             opacity: !canControl ? 0.4 : 1,
             transition: 'opacity 0.15s',

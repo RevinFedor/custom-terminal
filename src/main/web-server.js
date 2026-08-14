@@ -109,6 +109,7 @@ const {
 } = require('./orchestration-request-identity');
 const {
   assertAgentProviderModel,
+  resolveConfiguredAgentModel,
   resolveAgentProvider,
 } = require('./agent-provider-model-contract');
 const {
@@ -168,6 +169,36 @@ const CLAUDE_MODELS_FOR_CLIENTS = [
   { id: 'haiku', label: 'haiku' },
   { id: 'fable', label: 'fable' },
 ];
+
+function configuredModelsForProvider(projectManager, provider) {
+  if (provider !== 'claude') return [];
+  try {
+    const settings = projectManager?.db?.getAppState?.('claudeCodeSettings');
+    return Array.isArray(settings?.models) ? settings.models : [];
+  } catch (error) {
+    console.warn('[AgentModelSelection] settings unavailable provider=' + provider
+      + ' error=' + (error?.message || String(error)));
+    return [];
+  }
+}
+
+function resolveProjectAgentModel(projectManager, { provider, model } = {}) {
+  const selection = resolveConfiguredAgentModel({
+    provider,
+    model,
+    configuredModels: configuredModelsForProvider(projectManager, provider),
+  });
+  if (selection.requestedModel && (
+    selection.model !== selection.requestedModel
+    || selection.resolution !== 'settings-exact-id'
+  )) {
+    console.log('[AgentModelSelection] provider=' + provider
+      + ' requested=' + selection.requestedModel
+      + ' resolved=' + selection.model
+      + ' source=' + selection.resolution);
+  }
+  return selection;
+}
 
 let WebSocketServer;
 try {
@@ -4533,7 +4564,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
       const requestedTargetTabId = targetTabId;
       const targetName = cleanOptionalString(body.name || body.targetName, '');
-      const requestedModel = cleanOptionalString(body.model || body.codexModel, '');
+      const requestedModelInput = cleanOptionalString(body.model || body.codexModel, '');
       const requestedEffort = cleanOptionalString(body.effort || body.codexEffort, '');
       const requestedThinking = cleanOptionalString(body.thinking, '');
       let target = targetTabId ? findOrchestrationTabDescriptor(targetTabId) : null;
@@ -4610,7 +4641,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         mismatch.statusCode = 400;
         throw mismatch;
       }
-      assertAgentProviderModel({ provider: target.toolType, model: requestedModel });
+      const requestedModel = resolveProjectAgentModel(projectManager, {
+        provider: target.toolType,
+        model: requestedModelInput,
+      }).model;
 
       const requestFingerprint = orchestrationRequestFingerprint({
         sourceTabId,
@@ -5603,6 +5637,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const restorable = openDescriptor ? null : findRestorableAgentTabDescriptor(tabId);
       const targetProvider = openDescriptor?.toolType
         || (restorable?.ok === true ? restorable.toolType : null);
+      let resolvedModel = model;
       if (targetProvider) {
         const hasExplicitTargetProvider = Boolean(
           cleanOptionalString(body.toolType, '') || cleanOptionalString(body.provider, ''),
@@ -5622,13 +5657,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
             throw mismatch;
           }
         }
-        assertAgentProviderModel({ provider: targetProvider, model });
+        resolvedModel = resolveProjectAgentModel(projectManager, {
+          provider: targetProvider,
+          model,
+        }).model;
       }
       // Single bridge round-trip — renderer dispatches by tab.tabType/commandType.
       // Earlier this endpoint did TWO round-trips (status check + send), adding
       // ~50ms per phone send on top of the actual PTY paste latency.
       const data = await runAgentSendScenario({
-        tabId, prompt: sendPayload.prompt, model, effort, thinking, cwd,
+        tabId, prompt: sendPayload.prompt, model: resolvedModel, effort, thinking, cwd,
         handoffId: operationHandoffId, source, statusAtSend, queue: queue === true,
         ownership: 'project',
         sendOperationKey,
@@ -6240,8 +6278,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         provider: body.provider,
         fallback: 'claude',
       });
-      const requestedModel = cleanOptionalString(body.model || body.codexModel, '');
-      assertAgentProviderModel({ provider: toolType, model: requestedModel });
+      const requestedModel = resolveProjectAgentModel(projectManager, {
+        provider: toolType,
+        model: cleanOptionalString(body.model || body.codexModel, ''),
+      }).model;
       const placement = resolveNewAgentTabPlacement({
         placement: body.placement,
         parentTabId: cleanOptionalString(body.parentTabId, ''),

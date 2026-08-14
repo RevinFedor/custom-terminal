@@ -10,6 +10,7 @@ const historySource = fs.readFileSync(
   path.join(__dirname, '../renderer/components/Workspace/HistoryPanel.tsx'),
   'utf8',
 );
+const webServerSource = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 
 function ordered(source, labels) {
   let cursor = -1;
@@ -41,6 +42,8 @@ test('desktop History transport, durable arm, and physical Enter are strictly or
     ['Claude PTY transport normalized', 'prepareClaudePromptTransport(content)'],
     ['desktop identity built from raw plus transport proof', 'buildDesktopHistorySendIdentity({'],
     ['durable attempt started', 'agentSendReceiptStore.beginAttempt(identity)'],
+    ['exact writer and boundary persisted', 'agentSendReceiptStore.stageAttemptContext('],
+    ['exact pre-Enter writer captured', 'sessionId: durablePreSubmitBoundary?.sessionId || null,'],
     ['exact attempt armed before Enter', 'AGENT_SEND_DURABLE_STATES.ENTER_ARMED'],
     ['physical Enter written', 'term.write(submitSequence)'],
     ['post-Enter state becomes audit pending', 'AGENT_SEND_DURABLE_STATES.AUDIT_PENDING'],
@@ -71,7 +74,10 @@ test('canonical History materialization is durably acknowledged before local SEN
     '// Load full history',
   );
   ordered(consumeBody, [
-    ['exact canonical row matched', 'const matched = findServerPromptEntry('],
+    ['legacy completion is matched only by its exact durable run tag',
+      'legacyOrchestrationCompletionMatchesCanonicalEntry(handoff, entry)'],
+    ['exact canonical row matched',
+      'const matched = legacyOrchestrationMatch || findServerPromptEntry('],
     ['durable presentation acknowledged', 'acknowledgeMaterializedHistoryReceipt({'],
     ['renderer-local handoff consumed', 'consumeHistoryPromptHandoff(tabId, handoff.handoffId)'],
   ]);
@@ -134,17 +140,53 @@ test('History remount reconciles only its bounded local overlay before first mer
   );
 });
 
-test('History projects the existing send action into the terminal status row', () => {
+test('History presents terminal lifecycle and input delivery as two independent statuses', () => {
   const statusBody = between(
     historySource,
     'const unifiedTransientStatus = isCancellingTurn',
-    'const statusTitle = statusCopied',
+    'const statusDetail = activeLifecycle?.detail || null',
   );
   ordered(statusBody, [
     ['compact keeps priority', "title: 'COMPACTING'"],
-    ['send action is projected', "busyAction === 'send'"],
-    ['visible send title is declared', "title: 'SENDING'"],
     ['ordinary history refresh stays lower priority', 'showUpdatingChip'],
+    ['exact handoff status is selected independently', 'const displayedInputStatus = activeInputStatus'],
+    ['terminal and input labels are composed', "terminalStatusTitle + ' / ' + inputStatusPresentation.label"],
   ]);
-  assert.match(historySource, /data-agent-send-phase=\{busyAction === 'send' \? 'sending'/);
+  assert.doesNotMatch(
+    between(historySource, 'const unifiedTransientStatus = isCancellingTurn', 'const displayedInputStatus'),
+    /busyAction === 'send'/,
+  );
+  assert.match(historySource, /data-agent-send-phase=\{displayedInputStatus \|\| undefined\}/);
+  assert.match(historySource, /\|\| status === 'starting'[\s\S]{0,180}const canAcceptSubmitIntent/);
+  assert.match(historySource, /busyAction === 'resume' && status === 'starting'/);
+  assert.match(historySource, /sendCanJoinExistingLaunch[\s\S]{0,220}activeKind === 'resume'/);
+});
+
+test('main publishes exact handoff transport phases around physical Enter', () => {
+  const sendBody = between(
+    mainSource,
+    'async function _safePasteAndSubmitInner(term, content, options = {})',
+    '// Send input to terminal',
+  );
+  ordered(sendBody, [
+    ['paste phase starts', "emitBusy(true, 'sending')"],
+    ['physical Enter is written', 'term.write(submitSequence)'],
+    ['confirmation phase starts after Enter', "emitBusy(false, 'confirming')"],
+  ]);
+  assert.match(sendBody, /handoffId: handoffId \|\| null/);
+});
+
+test('orchestration completion uses the same durable desktop History receipt as a manual send', () => {
+  const completionBody = between(
+    webServerSource,
+    'async function sendOrchestrationCompletionNotification',
+    'async function notifyAgentPromptAuditResult',
+  );
+  assert.match(completionBody, /const notificationHandoffId = 'orchestration-complete:' \+ current\.runId/);
+  assert.match(completionBody, /handoffId:\s*notificationHandoffId/);
+  assert.match(completionBody, /source:\s*'orchestration-completion:' \+ current\.runId/);
+  assert.doesNotMatch(completionBody, /sendOperationKey:/,
+    'main must mint the receipt from the exact History handoff instead of accepting caller identity');
+  assert.match(mainSource, /isDesktopHistorySendReceiptEligible\(\{/);
+  assert.match(mainSource, /buildDesktopHistorySendIdentity\(\{/);
 });

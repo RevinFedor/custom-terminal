@@ -2,10 +2,27 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyAgentDraftCaptureResolution,
+  buildExactDraftCaptureProof,
   classifyAgentDraftPreflight,
   classifyExactEmptyDraftGrab,
   resolveAgentDraftConflict,
 } from './agentDraftPreflight.mjs';
+
+test('exact capture proof carries renderer diagnostics without changing decision fields', () => {
+  const rendererDiagnostic = {
+    success: true,
+    rendererGeneration: 'mirror-a',
+    rendererWriteSeq: 42,
+  };
+  const proof = buildExactDraftCaptureProof({
+    proofOutcome: 'found',
+    inputRevision: 7,
+    mirrorGeneration: 'mirror-a',
+  }, rendererDiagnostic);
+  assert.equal(proof.proofOutcome, 'found');
+  assert.equal(proof.inputRevision, 7);
+  assert.equal(proof.rendererDiagnostic, rendererDiagnostic);
+});
 
 test('current-frame found and absent proofs keep their exact decisions', () => {
   assert.equal(classifyAgentDraftPreflight({
@@ -34,7 +51,7 @@ test('unknown proof never becomes permission to send from source strings or busy
   }).decision, 'unknown');
 });
 
-test('successful empty Ctrl+G overrides a screen false-positive only on the exact same generation', () => {
+test('successful empty Ctrl+G overrides a screen false-positive only through its owned revision transition', () => {
   const identity = {
     terminalRunSeq: 4,
     inputRevision: 9,
@@ -51,10 +68,15 @@ test('successful empty Ctrl+G overrides a screen false-positive only on the exac
       terminalIdentityStable: true,
       editorReturnReady: true,
       ...identity,
+      inputRevision: 10,
+      screenContradiction: true,
+      inputRevisionTransition: 'ctrl-g-exact-capture',
+      inputRevisionTransitionOwned: true,
+      screenProofInputRevision: 9,
     },
   ), {
     confirmed: true,
-    reason: 'exact-empty-grab-same-generation',
+    reason: 'exact-empty-grab-owned-input-transition',
   });
 
   assert.equal(classifyExactEmptyDraftGrab(
@@ -67,9 +89,26 @@ test('successful empty Ctrl+G overrides a screen false-positive only on the exac
       terminalIdentityStable: true,
       editorReturnReady: true,
       ...identity,
-      inputRevision: 10,
     },
   ).confirmed, false);
+
+  assert.equal(classifyExactEmptyDraftGrab(
+    { proofOutcome: 'found', hasDraft: true, ...identity },
+    {
+      success: true,
+      text: '',
+      images: 0,
+      proofOutcome: 'absent',
+      terminalIdentityStable: true,
+      editorReturnReady: true,
+      ...identity,
+      inputRevision: 11,
+      screenContradiction: true,
+      inputRevisionTransition: 'ctrl-g-exact-capture',
+      inputRevisionTransitionOwned: true,
+      screenProofInputRevision: 9,
+    },
+  ).reason, 'screen-grab-identity-mismatch:inputRevision');
 });
 
 test('empty text without an exact successful Ctrl+G proof remains fail-closed', () => {
@@ -84,7 +123,7 @@ test('empty text without an exact successful Ctrl+G proof remains fail-closed', 
   ).confirmed, false);
 });
 
-test('shared send conflict coordinator proceeds only for the exact empty same-generation proof', () => {
+test('shared send conflict coordinator proceeds only for the exact main-owned Ctrl+G transition', () => {
   const identity = {
     terminalRunSeq: 7,
     inputRevision: 12,
@@ -100,6 +139,11 @@ test('shared send conflict coordinator proceeds only for the exact empty same-ge
     terminalIdentityStable: true,
     editorReturnReady: true,
     ...identity,
+    inputRevision: 13,
+    screenContradiction: true,
+    inputRevisionTransition: 'ctrl-g-exact-capture',
+    inputRevisionTransitionOwned: true,
+    screenProofInputRevision: 12,
   }, { attemptedCapture: true }).decision, 'clear');
 
   const realDraft = resolveAgentDraftConflict(proof, {
@@ -127,10 +171,10 @@ test('exact empty capture replaces the stale initial unknown before send continu
   };
   assert.deepEqual(applyAgentDraftCaptureResolution(initial, {
     decision: 'clear',
-    reason: 'exact-empty-grab-same-generation',
+    reason: 'exact-empty-grab-owned-input-transition',
   }), {
     decision: 'clear',
-    reason: 'exact-empty-grab-same-generation',
+    reason: 'exact-empty-grab-owned-input-transition',
   });
   assert.equal(applyAgentDraftCaptureResolution(initial, {
     decision: 'conflict',

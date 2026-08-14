@@ -109,3 +109,25 @@ test('bracketed paste, editing controls and escape sequences stay deterministic'
   });
   assert.deepEqual(submitted.submittedCommands, ['/compact']);
 });
+
+test('long manual input keeps its bounded tail but reports that the submitted proof is partial', () => {
+  const currentOwner = owner();
+  const fullText = 'prefix-' + 'x'.repeat(240) + '-tail';
+  const typed = advanceClaudeLocalCommandInputState(null, {
+    data: fullText,
+    owner: currentOwner,
+  });
+  assert.equal(typed.state.text.length, 200);
+  assert.equal(typed.state.truncated, true);
+  assert.equal(fullText.endsWith(typed.state.text), true);
+
+  const submitted = advanceClaudeLocalCommandInputState(typed.state, {
+    data: '\r',
+    owner: currentOwner,
+  });
+  assert.deepEqual(submitted.submittedCommands, [fullText.slice(-200)]);
+  assert.deepEqual(submitted.submittedCommandDetails, [{
+    text: fullText.slice(-200),
+    truncated: true,
+  }]);
+});

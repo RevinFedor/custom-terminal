@@ -34,11 +34,15 @@ test('startup transcript proof is bounded and gates desktop, Project API, and In
   const mainSource = read(mainPath);
   const webSource = read(webServerPath);
   const start = mainSource.indexOf('const agentSendReceiptStartupReady = (async () => {');
-  const reconcile = mainSource.indexOf('reconcileAgentSendStartupRecords(unresolved)', start);
+  const reconcile = mainSource.indexOf('reconcileAgentSendStartupRecords(unresolved, {', start);
+  const allRecords = mainSource.indexOf(
+    'allRecords: agentSendReceiptStartupReconcile.records',
+    reconcile,
+  );
   const promotion = mainSource.indexOf('agentSendReceiptStore.promoteFromAudit(result.audit)', reconcile);
   const ipc = mainSource.indexOf("ipcMain.handle('agent:list-send-receipts'", promotion);
   const ipcWait = mainSource.indexOf('await agentSendReceiptStartupReady', ipc);
-  assert.ok(start > 0 && reconcile > start && promotion > reconcile,
+  assert.ok(start > 0 && reconcile > start && allRecords > reconcile && promotion > allRecords,
     'startup must run one bounded transcript proof pass and promote only found evidence');
   assert.ok(ipcWait > ipc,
     'History hydration must wait for the bounded startup proof');

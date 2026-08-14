@@ -50,6 +50,7 @@ import {
 } from '../../utils/composerClipboard.mjs';
 import { electronComposerClipboardAdapter } from '../../utils/electronComposerClipboardAdapter';
 import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlacement.mjs';
+import { shouldDisarmAfterTriggerClear } from '../../utils/runAfterTriggerClear.mjs';
 import {
   combineFirstDelayParts,
   formatFirstDelayCountdown,
@@ -3023,17 +3024,33 @@ export function PromptQueueOverlay({
                         // создания черновика (см. onTabTriggerOpenKeys) — иначе
                         // список переоткрывался бы на каждом ре-рендере строки.
                         openRequestKey={onTabTriggerOpenKeys.get(it.id) ?? 0}
-                        showAllTabsOnOpen
+                        // Counter starts OFF on every open: only tabs with a
+                        // loader are listed, and "show all" is a deliberate
+                        // one-off click. It used to open expanded, and the
+                        // expanded state also survived reopening.
+                        persistProjectSelection
                       />
                     </div>
                   )}
                   <button
                     type="button"
                     data-chip-action="remove-trigger"
-                    aria-label="Убрать триггер"
-                    title="Убрать триггер"
+                    aria-label="Clear trigger"
+                    title="Clear trigger"
                     onClick={() => {
                       setPromptTrigger(tabId, it.id, null);
+                      // With ONE item left, removing its condition also removes
+                      // the queue's only answer to "when" — an armed queue would
+                      // then fire on the next plain turn end. With two or more,
+                      // the plan survives and the switch must stay untouched.
+                      const live = usePromptQueueStore.getState().getQueue(tabId);
+                      const runnableCount = live.items.filter(isQueuedPromptEnabled).length;
+                      if (live.autoRun && shouldDisarmAfterTriggerClear({ runnableCount })) {
+                        if (live.firstDelayCountdownAt !== null) {
+                          usePromptQueueStore.getState().cancelFirstDelayCountdown(tabId);
+                        }
+                        setAutoRun(tabId, false);
+                      }
                       setOnTabTriggerDraftIds((current) => {
                         const next = new Set(current);
                         next.delete(it.id);
@@ -3248,36 +3265,8 @@ export function PromptQueueOverlay({
               boxSizing: 'border-box',
             }}
           >
-            <button
-              onClick={() => toggleChipEnabled(chipContextItem.id)}
-              style={{
-                ...itemBase,
-                background: enabled ? 'transparent' : DISABLED_PROMPT_BG,
-                color: enabled ? '#ddd' : DISABLED_PROMPT_TEXT,
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = enabled ? 'rgba(255,255,255,0.06)' : DISABLED_PROMPT_BG_HOVER; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = enabled ? 'transparent' : DISABLED_PROMPT_BG; }}
-            >
-              {enabled ? <CheckSquare size={14} strokeWidth={1.9} /> : <Square size={14} strokeWidth={1.9} />}
-              <span style={{ flex: 1, minWidth: 0 }}>Отправлять из очереди</span>
-            </button>
-            <button
-              onClick={() => {
-                setOnTabTriggerDraftIds((current) => {
-                  const next = new Set(current);
-                  next.delete(chipContextItem.id);
-                  return next;
-                });
-                setTimerTriggerDraftIds((current) => new Set(current).add(chipContextItem.id));
-                setChipContextMenu(null);
-              }}
-              style={itemBase}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
-            >
-              <Timer size={14} strokeWidth={1.9} />
-              <span style={{ flex: 1, minWidth: 0 }}>Добавить таймер</span>
-            </button>
+            {/* Order = frequency of use: the two triggers first, the queue
+                checkbox third. Labels are English across the whole menu. */}
             <button
               onClick={() => {
                 setTimerTriggerDraftIds((current) => {
@@ -3300,7 +3289,41 @@ export function PromptQueueOverlay({
               {/* Триггер «после другой вкладки» — иконка вкладки, а не стрелка:
                   стрелка уже ничего не различала рядом с таймером. */}
               <AppWindow size={14} strokeWidth={1.9} />
-              <span style={{ flex: 1, minWidth: 0 }}>Добавить on tab</span>
+              <span style={{ flex: 1, minWidth: 0 }}>on tab</span>
+            </button>
+            <button
+              onClick={() => {
+                setOnTabTriggerDraftIds((current) => {
+                  const next = new Set(current);
+                  next.delete(chipContextItem.id);
+                  return next;
+                });
+                setTimerTriggerDraftIds((current) => new Set(current).add(chipContextItem.id));
+                setChipContextMenu(null);
+              }}
+              style={itemBase}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              <Timer size={14} strokeWidth={1.9} />
+              <span style={{ flex: 1, minWidth: 0 }}>timer</span>
+            </button>
+            {/* Queue membership. The label reports the RESULTING STATE, not the
+                action, so the row and its checkbox never contradict each other:
+                checked + highlighted + "In queue" ⇄ unchecked + plain +
+                "Not in queue". A new chip starts enabled, hence highlighted. */}
+            <button
+              onClick={() => toggleChipEnabled(chipContextItem.id)}
+              style={{
+                ...itemBase,
+                background: enabled ? 'rgba(255,255,255,0.07)' : DISABLED_PROMPT_BG,
+                color: enabled ? '#f0f0f0' : DISABLED_PROMPT_TEXT,
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = enabled ? 'rgba(255,255,255,0.13)' : DISABLED_PROMPT_BG_HOVER; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = enabled ? 'rgba(255,255,255,0.07)' : DISABLED_PROMPT_BG; }}
+            >
+              {enabled ? <CheckSquare size={14} strokeWidth={1.9} /> : <Square size={14} strokeWidth={1.9} />}
+              <span style={{ flex: 1, minWidth: 0 }}>{enabled ? 'In queue' : 'Not in queue'}</span>
             </button>
             {chipContextItem.trigger && (
               <button
@@ -3323,7 +3346,7 @@ export function PromptQueueOverlay({
                 onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
               >
                 <X size={14} />
-                <span style={{ flex: 1, minWidth: 0 }}>Убрать триггер</span>
+                <span style={{ flex: 1, minWidth: 0 }}>Clear trigger</span>
               </button>
             )}
             <button
@@ -3343,7 +3366,7 @@ export function PromptQueueOverlay({
               {titleLoadingIds.has(chipContextItem.id)
                 ? <span className="pq-spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
                 : <RefreshCw size={14} strokeWidth={1.9} />}
-              <span style={{ flex: 1, minWidth: 0 }}>Обновить название</span>
+              <span style={{ flex: 1, minWidth: 0 }}>Refresh title</span>
             </button>
           </div>
         );

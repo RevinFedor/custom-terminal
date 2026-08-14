@@ -21,6 +21,11 @@ test('owned desktop prompt surfaces receive automatic durable identity, but queu
   assert.equal(isDesktopHistorySendReceiptEligible({ ...base, source: 'codex-history-panel' }), true);
   assert.equal(isDesktopHistorySendReceiptEligible({
     ...base,
+    handoffId: 'orchestration-complete:run-a',
+    source: 'orchestration-completion:run-a',
+  }), true);
+  assert.equal(isDesktopHistorySendReceiptEligible({
+    ...base,
     source: 'prompt-queue',
     rawPrompt: 'continue work',
   }), true);
@@ -37,6 +42,28 @@ test('owned desktop prompt surfaces receive automatic durable identity, but queu
   assert.equal(isDesktopHistorySendReceiptEligible({ ...base, submit: false }), false);
   assert.equal(isDesktopHistorySendReceiptEligible({ ...base, sendOperationKey: 'owned' }), false);
   assert.equal(isDesktopHistorySendReceiptEligible({ ...base, sendAttemptId: 'attempt' }), false);
+  assert.equal(isDesktopHistorySendReceiptEligible({ ...base, source: 'orchestration-request:run-a' }), false);
+  assert.equal(isDesktopHistorySendReceiptEligible({ ...base, source: 'orchestration-completion:' }), false);
+});
+
+test('orchestration completion notification owns an exact durable History identity', () => {
+  const identity = buildDesktopHistorySendIdentity({
+    tabId: 'tab-a',
+    handoffId: 'orchestration-complete:run-a',
+    provider: 'codex',
+    source: 'orchestration-completion:run-a',
+    rawPrompt: '[Orchestration] Request completed',
+    sessionId: 'session-a',
+    promptHash: 'transport-hash',
+    promptLength: 33,
+  });
+
+  assert.equal(
+    identity.operationKey,
+    'history:tab-a:orchestration-complete:run-a',
+  );
+  assert.equal(identity.handoffId, 'orchestration-complete:run-a');
+  assert.equal(identity.surface, DESKTOP_HISTORY_SEND_SURFACE);
 });
 
 test('raw request identity stays distinct while transport identity follows the written prompt', () => {

@@ -27,6 +27,7 @@ test('current full Think picker proves checked and selected states', () => {
   ].join('\n')));
   assert.deepEqual(enabled, {
     visible: true,
+    modalPresent: true,
     stateKnown: true,
     thinking: true,
     selectedThinking: true,
@@ -50,8 +51,64 @@ test('incomplete differential text cannot prove picker state', () => {
     'Enter to confirm · Esc to exit',
   ].join('\n')));
   assert.equal(incomplete.visible, true);
+  assert.equal(incomplete.modalPresent, true);
   assert.equal(incomplete.stateKnown, false);
   assert.equal(incomplete.reason, 'options-incomplete');
+});
+
+test('current picker without its later footer is present but not yet actionable', () => {
+  const partial = inspectClaudeThinkingPickerSnapshot(snapshot([
+    'Toggle thinking mode',
+    'Enable or disable thinking for this session.',
+    '❯ 1. Enabled ✔  Claude will think before',
+    '                responding',
+    '  2. Disabled   Claude will respond without',
+    '                extended thinking',
+  ].join('\n')));
+  assert.equal(partial.visible, false);
+  assert.equal(partial.modalPresent, true);
+  assert.equal(partial.stateKnown, false);
+  assert.equal(partial.reason, 'footer-missing');
+});
+
+test('title-only first paint is treated as an incomplete current modal', () => {
+  const partial = inspectClaudeThinkingPickerSnapshot(snapshot([
+    'Toggle thinking mode',
+    'Enable or disable thinking for this session.',
+  ].join('\n')));
+  assert.equal(partial.visible, false);
+  assert.equal(partial.modalPresent, true);
+  assert.equal(partial.reason, 'footer-missing');
+});
+
+test('old partial picker followed by the current composer is not a live modal', () => {
+  const stale = inspectClaudeThinkingPickerSnapshot(snapshot([
+    'Toggle thinking mode',
+    'Enabled ✔',
+    'Disabled',
+    'ordinary transcript line',
+    '❯ current draft',
+  ].join('\n')));
+  assert.equal(stale.visible, false);
+  assert.equal(stale.modalPresent, false);
+  assert.equal(stale.reason, 'footer-missing');
+});
+
+test('narrow wrapped production picker is fully classified after its footer arrives', () => {
+  const complete = inspectClaudeThinkingPickerSnapshot(snapshot([
+    'Toggle thinking mode',
+    'Enable or disable thinking for this session.',
+    '❯ 1. Enabled ✔  Claude will think before',
+    '                responding',
+    '  2. Disabled   Claude will respond without',
+    '                extended thinking',
+    'Enter to confirm · Esc to cancel',
+  ].join('\n')));
+  assert.equal(complete.visible, true);
+  assert.equal(complete.modalPresent, true);
+  assert.equal(complete.stateKnown, true);
+  assert.equal(complete.thinking, true);
+  assert.equal(complete.selectedThinking, true);
 });
 
 test('old Think picker in scrollback cannot authorize input', () => {
@@ -64,6 +121,7 @@ test('old Think picker in scrollback cannot authorize input', () => {
     '❯',
   ].join('\n')));
   assert.equal(stale.visible, false);
+  assert.equal(stale.modalPresent, false);
   assert.equal(stale.reason, 'footer-not-current');
 });
 

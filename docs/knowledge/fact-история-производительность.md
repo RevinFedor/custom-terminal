@@ -58,9 +58,35 @@
 
 Правило подсистемы: любой ответ «ничего не поменялось» стоит O(stat), не O(чтение). Свидетель — identity+mtime+size каждого файла цепочки (+ mtime папки проекта: resume/fork-ребёнок появляется НОВЫМ файлом, не меняя существующие — без dir-свидетеля latestSessionId «замерзает»). Четыре кэша одного паттерна: probe полной истории, unchanged-путь `claude:get-timeline` (ifRevision), confirmed model/effort (см. `fact-claude-control-bar.md`), материализация сессии в get-presence (см. `fix-performance-lags.md::1e`). Кэши живут в памяти main — после рестарта первый запрос каждой сессии снова полный; это осознанно (persist свидетелей — отдельное решение).
 
+## Codex-гиганты: проектор с файловым курсором вместо перечитывания
+
+Симптом (прод 07.08 09:56): две codex-вкладки грузятся по 4с при каждом переключении, остальные летают. Причина — resume/fork копирует весь родительский транскрипт, поэтому гиганты приходят ПАРОЙ: два файла по ~730МБ не помещаются в бюджет распарсенных записей (768МБ), а две готовые проекции по ~150МБ не помещались в бюджет снапшотов renderer (240МБ). Каждое переключение = взаимное выселение из обоих кэшей: в логах пинг-понг `[CodexJsonlCache] evict … full …` каждые несколько секунд.
+
+Устройство (`codex-data.js`):
+
+- **Проекторы возобновляемые.** `createCodexHistoryProjector` / `createCodexTimelineProjector` — `feed(record)` по одной записи в порядке файла + `finalize()`, который НЕ потребляет состояние: in-flight хвост (карточки незавершённых вызовов) строится на копии, поэтому после finalize можно продолжать feed. Пре-проход спаривания compact-компаньонов свёрнут во встречный счётчик (его переходы всегда зависели только от уже увиденных записей) — предсканирования файла не осталось.
+- **Кэш — файловый курсор, а не массив записей.** На сессию хранится `{projector, filePath, fileSize, fileMtimeMs, lineCount, leftoverBuffer}`; обновление читает только байты `[cursor, stat.size)`. Правила свидетеля те же, что у кэша записей: size+mtime совпали → `unchanged`; размер вырос → `append`; уменьшился или mtime сменился при том же размере → `rebuild`. Недописанная последняя строка переносится в `leftoverBuffer` — дозапись её завершает.
+- **Один курсор кормит обе проекции** (History + Timeline): одно чтение, два `feed`. Поэтому Timeline перестал перечитывать гигант (в т.ч. `codex:get-timeline`, который дёргается при генерации заголовка вкладки и AI-launch-финализации).
+- **Сериализация на сессию** (`_codexProjectorChains`): параллельные вызовы (панель + Timeline + web) не кормят один проектор одновременно — второй ждёт и видит курсор неизменившимся.
+- **Ревизия строится из КУРСОРА, не из свежего stat**: файл мог вырасти, пока мы читали, и ревизия новее отданных строк заставила бы следующий ifRevision ложно ответить unchanged.
+- **Инкрементальный путь только для dehydrate-потребителей** (десктопная панель). Дегидратация мутирует общие action-объекты кэшированного проектора в превью+ссылки — это стабильно между дегидратирующими вызовами, но отравило бы потребителя полных payload'ов (web/iOS); те остаются на разовой сборке, как и `getToolPayload`.
+- Явные пути перезаписи (edit/delete-range/fork, forceFresh) сжигают проектор через `invalidateCodexJsonlCache` → `invalidateCodexHistoryProjectors`.
+
+Бюджеты после правки: файлов распарсенных записей 3 → 6 (активный 73МБ-rollout выселялся между собственными обновлениями); oversized-пул снапшотов renderer 240 → 360МБ (держит пару гигантов, а не одного). Это временный мост: оконная модель уменьшит проекцию до мегабайтов, и запас можно будет вернуть.
+
+Тесты: `codex-data.projector.test.js` (эквивалентность one-shot ≡ по кускам ≡ по одной записи на ЛЮБОЙ точке разреза с finalize посередине; курсор rebuild→append→unchanged→rewrite; LRU; сериализация), `session-transcript-service.projector.test.js` (маршрутизация dehydrate/plain, ревизия из курсора, композиция с дельтой).
+
+## Оконная выдача истории
+
+`applyHistoryEntryWindow` (`history-entry-window.js`) — единый контракт окна для main/HTTP/renderer. Селекторы: `aroundUuid`+`radius` (прыжок по Timeline), `fromUuid` (ВКЛЮЧИТЕЛЬНО — вызывающий называет строку, которую показывает), `afterUuid`/`beforeUuid`/`last` (постраничная прокрутка). Ответ несёт `startIndex`, `hasMoreAbove/Below` — виртуализированный потребитель ставит окно в полную проекцию (Virtuoso `firstItemIndex`) без второго запроса. Названный якорь, которого больше нет (откат/перезапись/чужая ветка), отвечает `anchorMissing=1`, а не молчаливым пустым экраном — иначе устаревший якорь показывает пустоту навсегда.
+
+Дельта и окно КОМПОНУЮТСЯ: дайджест описывает окно, которое получил вызывающий, а не всю проекцию. Смена формы окна отдаёт полное окно (первая строка нового окна отсутствует в дайджесте → `windowIsContinuation=false`), повтор того же окна над дописанной сессией — только изменённые строки. Fail-closed по построению: строки, которых у клиента не было, никогда не «дошиваются» дельтой.
+
 ## Лог-словарь и приёмочный флоу
 
-`MOUNT_WAVE_START/DONE/CANCEL rows= upgraded= steps= maxStepMs= heights=measured|avg` · `SCROLL_SEEK_ENTER velocity= burst=` / `SCROLL_SEEK_EXIT heldMs=` · `LOAD_FRESH_PROBE unchanged=1` · `LOAD_STALE_BANKED` · `[Perf:LongTask] during=` (атрибуция: `history-owner-mount:`, `history-mount-wave:`, `timeline-swap:`, `controlbar-rebind:`, `terminal-hydrate:`, `tab-switch:`) · `inputDelayMs=` на каждом реальном событии.
+`MOUNT_WAVE_START/DONE/CANCEL rows= upgraded= steps= maxStepMs= heights=measured|avg` · `SCROLL_SEEK_ENTER velocity= burst=` / `SCROLL_SEEK_EXIT heldMs=` · `LOAD_FRESH_PROBE unchanged=1` · `LOAD_STALE_BANKED` · `LOAD_DELTA changed= total=` / `LOAD_DELTA_MISMATCH reason=` · `[CodexHistoryProjector] mode=rebuild|append|unchanged fed= readKB= consumed=` · `[TranscriptService:HistoryDelta] changed= unchanged= windowed=` · `[TranscriptService:HistoryWindow] rows= total= startIndex= above= below=` · `[CodexJsonlCache] full|append|evict` · `[Perf:LongTask] during=` (атрибуция: `history-owner-mount:`, `history-mount-wave:`, `timeline-swap:`, `controlbar-rebind:`, `terminal-hydrate:`, `tab-switch:`) · `inputDelayMs=` на каждом реальном событии.
+
+Диагностика гигантов: `[CodexHistoryProjector] mode=append readKB=<десятки>` на живой сессии = инкрементальный путь работает; повторяющийся `mode=rebuild readKB=<сотни тысяч>` при переключениях = курсор сбрасывается (проверить, не жжёт ли кто проектор перезаписью). `[CodexJsonlCache] evict` парой с `full` каждые несколько секунд = кэш записей опять тесен для набора открытых сессий.
 
 Приёмочный флоу (ловит то, что точечные пробы пропускали): цикл — клик вкладка A → 700мс → клик тяжёлая B → правый клик по строке в первые 100мс → сразу непрерывный ховер над A 1.5-2с (событие каждые ~16мс). Критерии: гистограмма `inputDelayMs` без значений > 100-150мс за ВСЁ окно (не только момент пробы); нет LongTask > 250мс; MOUNT_WAVE_DONE без шага > 100мс; drift позиции 0-2px. Точечная проба (один замер через 60мс после клика) попадает в тихую щель между кусками работы и даёт ложный PASS — этот класс ошибки приёмки описан в `methodology/диагностика-логами.flow.md`.
 

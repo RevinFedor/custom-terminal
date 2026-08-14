@@ -95,7 +95,7 @@ export function extractClaudeHistoryPromptCarrierText(envelope) {
  * a user can submit identical text from History and from the native xterm,
  * and both prompts must remain visible as distinct turns.
  */
-export function isClaudeHistoryPromptLocallyOwned(envelope, handoffs) {
+export function isHistoryPromptLocallyOwned(envelope, handoffs) {
   const source = Array.isArray(handoffs)
     ? handoffs
     : handoffs && typeof handoffs.values === 'function'
@@ -114,6 +114,10 @@ export function isClaudeHistoryPromptLocallyOwned(envelope, handoffs) {
   const entryUuid = typeof record?.uuid === 'string' ? record.uuid : '';
   return !!entryUuid && source.some((handoff) => handoff?.auditEntryUuid === entryUuid);
 }
+
+// Compatibility alias for the original Claude-only caller. The ownership
+// proof itself is provider-neutral: an exact handoff id or audited record id.
+export const isClaudeHistoryPromptLocallyOwned = isHistoryPromptLocallyOwned;
 
 const queueIdentityFrom = ({ sessionId, timestamp, text }) => {
   const normalized = promptIdentityText(text);
@@ -308,6 +312,9 @@ export function reduceClaudeHistoryPromptCarrier(
       handled: true,
       entries: upsertByUuidOrSource(queueMatch.entries, {
         uuid: String(record.uuid),
+        ...(typeof record.sourceIdentity === 'string'
+          ? { sourceIdentity: record.sourceIdentity }
+          : {}),
         role: 'user',
         timestamp: recordTimestamp(record, envelope),
         content: attachmentText,
@@ -347,6 +354,9 @@ export function reduceClaudeHistoryPromptCarrier(
       handled: true,
       entries: upsertByUuidOrSource(queueMatch.entries, {
         uuid: String(record.uuid),
+        ...(typeof record.sourceIdentity === 'string'
+          ? { sourceIdentity: record.sourceIdentity }
+          : {}),
         role: 'user',
         timestamp: recordTimestamp(record, envelope),
         content: text,

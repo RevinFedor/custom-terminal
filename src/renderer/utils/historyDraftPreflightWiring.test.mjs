@@ -29,6 +29,29 @@ test('History carries exact empty evidence through the scenario to the physical 
   assert.match(source, /sendAgentPromptScenario\(\{[\s\S]{0,1000}claudeExactEmptyEvidence,/);
 });
 
+test('History send clears the mounted editor and persistent draft at the same handoff boundary', () => {
+  const start = source.indexOf('if (sourceStillCurrent) {', source.indexOf("historyDiag('SEND_CLICK"));
+  const end = source.indexOf('\n        } else {', start);
+  assert.ok(start >= 0 && end > start);
+  const body = source.slice(start, end);
+  assert.match(body, /applyHistoryComposerSnapshot\(\{[\s\S]*text: ''[\s\S]*history: 'external'/);
+  assert.match(body, /flushHistoryComposerDrafts\(\)/);
+  assert.match(body, /flushHistoryComposerView\(\)/);
+  assert.doesNotMatch(body, /setHistoryPromptDraft\(actionTabId, ''/);
+});
+
+test('a late confirmation clears only the notice owned by its exact handoff', () => {
+  const start = source.indexOf('useEffect(() => subscribeHistoryPromptHandoffs(tabId');
+  const end = source.indexOf('\n\n  useEffect(() => {', start);
+  assert.ok(start >= 0 && end > start);
+  const body = source.slice(start, end);
+  assert.match(body, /delayedDeliveryWarningHandoffRef\.current/);
+  assert.match(body, /record\.handoffId === handoffId/);
+  assert.match(body, /exactRecord\?\.queueStatus === 'sent'/);
+  assert.match(body, /change\.type === 'consume' && change\.handoffId === handoffId/);
+  assert.match(body, /isHistoryDeliveryConfirmationNotice\(current\)/);
+});
+
 test('known unavailable image warns persistently without disabling Send', () => {
   const availabilityStart = source.indexOf('const canAcceptSubmitIntent =');
   const availabilityEnd = source.indexOf('\n  const terminalOnlySlashDraft', availabilityStart);

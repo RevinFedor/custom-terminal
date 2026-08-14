@@ -536,7 +536,10 @@ test('bounds fully parsed Codex rollout cache across sessions', async (t) => {
     await fs.promises.rm(dir, { recursive: true, force: true });
   });
 
-  for (let index = 0; index < 4; index += 1) {
+  // One more than the cap (6 since 06.08 — the active 73MB rollout was
+  // being evicted between its own refreshes at 3): the oldest must go, the
+  // newest must stay, and the count must respect the bound.
+  for (let index = 0; index < 7; index += 1) {
     const filePath = path.join(dir, `rollout-${index}.jsonl`);
     filePaths.push(filePath);
     await fs.promises.writeFile(filePath, JSON.stringify({
@@ -547,7 +550,7 @@ test('bounds fully parsed Codex rollout cache across sessions', async (t) => {
   }
 
   const stats = _api.getCodexJsonlCacheStats();
-  assert.ok(stats.files <= 3, `retained ${stats.files} full rollout caches`);
+  assert.ok(stats.files <= 6, `retained ${stats.files} full rollout caches`);
   assert.equal(stats.filePaths.includes(filePaths[0]), false);
-  assert.equal(stats.filePaths.includes(filePaths[3]), true);
+  assert.equal(stats.filePaths.includes(filePaths[6]), true);
 });

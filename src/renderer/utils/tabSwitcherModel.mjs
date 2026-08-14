@@ -101,18 +101,40 @@ export function selectableIndices(rows) {
   return out;
 }
 
-// Initial highlight for ctrl-mode: the globally previous tab — the first MRU
-// entry that is not the current tab and still exists among rows. Fallback:
-// first selectable row that is not the current tab, then the first selectable.
-export function initialCtrlIndex(rows, globalMru, activeTabId) {
+// Initial highlight for ctrl-mode: the most recent tab that is NOT already on
+// screen — Ctrl+Tab exists to bring back what you cannot see. Fallback chain:
+// the most recent visible-but-not-focused tab (in a full split that is the only
+// meaningful target, and the gesture must not become a dead key), then any row
+// that is not the current tab, then the first selectable row.
+//
+// `onScreenTabIds` defaults to just the active tab, which is what single mode is:
+// callers in a split pass every pane's tab. Without that, the highlight landed on
+// the neighbouring pane's tab — i.e. offered to "switch to" something already
+// visible, while the hidden tab the user wanted sat further down the list.
+export function initialCtrlIndex(rows, globalMru, activeTabId, onScreenTabIds) {
   const byTabId = new Map();
   rows.forEach((row, i) => { if (row.kind === 'tab' && !row.missing) byTabId.set(row.tab.id, i); });
+  const onScreen = new Set(
+    Array.isArray(onScreenTabIds) && onScreenTabIds.length > 0
+      ? onScreenTabIds
+      : [activeTabId].filter(Boolean),
+  );
+  // Pass 1 — most recent tab that is not on screen at all.
+  for (const entry of globalMru) {
+    if (!entry || !entry.tabId || onScreen.has(entry.tabId)) continue;
+    const idx = byTabId.get(entry.tabId);
+    if (idx !== undefined) return idx;
+  }
+  // Pass 2 — everything visible (e.g. a two-pane split holding both tabs): the
+  // neighbouring pane is then the only place left to go.
   for (const entry of globalMru) {
     if (!entry || !entry.tabId || entry.tabId === activeTabId) continue;
     const idx = byTabId.get(entry.tabId);
     if (idx !== undefined) return idx;
   }
   const selectable = selectableIndices(rows);
+  const offScreen = selectable.find((i) => !onScreen.has(rows[i].tab.id));
+  if (offScreen !== undefined) return offScreen;
   const nonActive = selectable.find(i => rows[i].tab.id !== activeTabId);
   return nonActive !== undefined ? nonActive : (selectable[0] ?? -1);
 }
@@ -128,7 +150,11 @@ export function stepIndex(rows, currentIndex, direction) {
 }
 
 // MRU maintenance helpers (shared by store writers and tests).
-export function touchMru(globalMru, projectId, tabId, cap = 60) {
+// Cap shared by the live toucher and the restore rebuild, so the two cannot
+// disagree about how much history is kept.
+export const GLOBAL_TAB_MRU_CAP = 60;
+
+export function touchMru(globalMru, projectId, tabId, cap = GLOBAL_TAB_MRU_CAP) {
   const filtered = (globalMru || []).filter(e => e && e.tabId !== tabId);
   return [{ projectId, tabId }, ...filtered].slice(0, cap);
 }
@@ -151,4 +177,46 @@ export function shortPath(cwd, homeDir) {
   if (p.startsWith('~')) return p;
   if (parts.length <= 2) return p;
   return '…/' + parts.slice(-2).join('/');
+}
+
+// Rebuild the global tab-visit order after a restart.
+//
+// The saved array must NOT be the source of truth: restore used to filter it to
+// surviving tabs and write the filtered version back, so every restart shaved it
+// and the loss was permanent (seen live: 6 entries for 10 open projects). Worse,
+// per-project visit lists start empty after a restart, so that shrinking array
+// was the ONLY ranking left — hence "Ctrl+Tab shows just the current project".
+//
+// Now the order is DERIVED from each tab's own durable stamp, newest first, and
+// the saved array only orders tabs that have no stamp yet (written by a build
+// before the column existed). A cache of something durable cannot shrink
+// irreversibly.
+//
+// tabs: Array<{ projectId, tabId, lastActivatedAt? }> — every open tab.
+// savedMru: the persisted array, used only as the fallback order.
+export function rebuildGlobalTabMru(tabs, savedMru = [], cap = GLOBAL_TAB_MRU_CAP) {
+  const savedRank = new Map();
+  (savedMru || []).forEach((entry, index) => {
+    if (entry && entry.tabId && !savedRank.has(entry.tabId)) savedRank.set(entry.tabId, index);
+  });
+
+  const stamped = [];
+  const unstamped = [];
+  for (const tab of (tabs || [])) {
+    if (!tab || !tab.tabId) continue;
+    const at = Number(tab.lastActivatedAt);
+    if (Number.isFinite(at) && at > 0) {
+      stamped.push({ projectId: tab.projectId, tabId: tab.tabId, at });
+    } else if (savedRank.has(tab.tabId)) {
+      unstamped.push({ projectId: tab.projectId, tabId: tab.tabId, savedAt: savedRank.get(tab.tabId) });
+    }
+  }
+  // Newest visit first; ties break by tabId so the result is deterministic.
+  stamped.sort((a, b) => (b.at - a.at) || String(a.tabId).localeCompare(String(b.tabId)));
+  unstamped.sort((a, b) => a.savedAt - b.savedAt);
+
+  return [
+    ...stamped.map(({ projectId, tabId }) => ({ projectId, tabId })),
+    ...unstamped.map(({ projectId, tabId }) => ({ projectId, tabId })),
+  ].slice(0, cap);
 }

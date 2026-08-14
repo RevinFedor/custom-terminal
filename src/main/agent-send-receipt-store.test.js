@@ -117,6 +117,60 @@ test('beginAttempt creates one exact attempt and pending/unknown/confirmed state
   assert.equal(getUuidCount(), 1);
 });
 
+test('pre-Enter context binds the exact writer session and rejects a contradictory boundary', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ sessionId: null }));
+  const boundary = {
+    sessionId: 'writer-session',
+    filePath: '/tmp/writer-session.jsonl',
+    fileSize: 42,
+  };
+
+  const staged = store.stageAttemptContext(begun.record.operationKey, begun.attemptId, {
+    sessionId: 'writer-session',
+    promptText: 'exact writer prompt',
+    transcriptBoundary: boundary,
+  });
+  assert.equal(staged.ok, true);
+  assert.equal(staged.record.sessionId, 'writer-session');
+  assert.equal(staged.record.receipt.sessionId, 'writer-session');
+  assert.deepEqual(staged.record.transcriptBoundary, boundary);
+
+  const contradictory = store.stageAttemptContext(
+    begun.record.operationKey,
+    begun.attemptId,
+    {
+      sessionId: 'foreign-session',
+      promptText: 'must not replace exact context',
+      transcriptBoundary: boundary,
+    },
+  );
+  assert.equal(contradictory.ok, false);
+  assert.equal(contradictory.reason, 'attempt-context-session-boundary-mismatch');
+  assert.equal(contradictory.record.sessionId, 'writer-session');
+  assert.equal(contradictory.record.receipt.promptText, 'exact writer prompt');
+});
+
+test('pre-Enter exact writer replaces a stale pre-Resume session hint', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ sessionId: 'resume-source' }));
+
+  const staged = store.stageAttemptContext(begun.record.operationKey, begun.attemptId, {
+    sessionId: 'resume-child',
+    transcriptBoundary: {
+      sessionId: 'resume-child',
+      filePath: '/tmp/resume-child.jsonl',
+      fileSize: 7,
+    },
+  });
+  assert.equal(staged.ok, true);
+  assert.equal(staged.record.sessionId, 'resume-child');
+});
+
 test('proven not-submitted retries with a new attempt, clears session A, and late audit binds B', (t) => {
   const harness = openMemoryHarness(t);
   if (!harness) return;
@@ -195,6 +249,31 @@ test('proven Codex canonical audit keeps expected operation hash and records obs
   }));
   assert.equal(rejected.promoted, false);
   assert.ok(rejected.mismatchedFields.includes('canonicalProof'));
+});
+
+test('durable receipt accepts the exact Codex CRLF transport proof', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity());
+  store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+
+  const promoted = store.promoteFromAudit(exactAudit(begun.attemptId, {
+    expectedHash: 'hash-a',
+    actualHash: 'rollout-double-lf-hash',
+    canonicalized: true,
+    canonicalReason: 'codex_pty_crlf_materialized_as_double_lf',
+  }));
+
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
+  assert.equal(promoted.record.promptHash, 'hash-a');
+  assert.equal(promoted.record.auditIdentity.promptHash, 'rollout-double-lf-hash');
 });
 
 test('settleAttempt is an attempt CAS and a stale callback cannot roll back a retry', (t) => {

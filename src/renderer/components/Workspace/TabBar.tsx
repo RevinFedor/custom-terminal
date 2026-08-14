@@ -18,6 +18,8 @@ import { isNaturalAgentTurnEndReason } from '../../utils/agentCompletionOutcome.
 import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
+import { PaneMapCells, usePaneMapColumns } from './PaneMap';
+import { TabProcessBar, TabStatusMarker } from './TabSignals';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -72,7 +74,6 @@ import { markRendererActivity } from '../../utils/rendererActivityTrail';
 
 const { ipcRenderer } = window.require('electron');
 
-const CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS = 300;
 const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
 const TABBAR_DRAG_VISUAL_LOCK_ATTR = 'data-tabbar-drag-visual-lock';
 const GROUP_COLLAPSE_FLIP_SUPPRESS_MS = 320;
@@ -82,6 +83,38 @@ const TAB_POST_DROP_REVEAL_PEEK_ROWS = 3;
 const TAB_POST_DROP_REVEAL_MAX_WAIT_FRAMES = 45;
 const TAB_DND_NAVIGATION_DWELL_MS = 500;
 const STRUCTURED_PROJECT_DROP_EVENT = 'structured-tab-project-target';
+
+// Open the sidebar's tab context menu from ANOTHER surface (the split-pane
+// header). A window event rather than a lifted store field: the menu is
+// transient view state of the list that owns it, and there must stay exactly
+// ONE menu implementation — a second copy in the pane header would drift from
+// this one action by action.
+export const TAB_CONTEXT_MENU_EVENT = 'tab-context-menu:open';
+
+/**
+ * Ask the sidebar list of `projectId` to open its context menu for `tabId`.
+ *
+ * Only ONE list is mounted — the sidebar's, for the project the sidebar shows —
+ * and every item in this menu is built from that list's own project (scripts and
+ * favourites of its cwd, "Move to project", the workspace toggle). So the
+ * request can only be served by the list of the tab's own project.
+ *
+ * Panes are cross-project, so the pane header regularly names a tab whose
+ * project is NOT in the sidebar. That request used to be dropped silently: the
+ * user right-clicked the other pane's tab and nothing happened at all, and only
+ * a preceding left click (which moved the sidebar as a side effect) made the
+ * menu work. Pointing the sidebar at the tab's project first is what makes the
+ * gesture land, and it is also the honest thing to show: the menu is about a tab
+ * of that project.
+ *
+ * Deliberately NOT changing the CENTER: a right click asks about a tab, it does
+ * not switch to it.
+ */
+export function openTabContextMenuAt(projectId: string, tabId: string, x: number, y: number): void {
+  window.dispatchEvent(new CustomEvent(TAB_CONTEXT_MENU_EVENT, {
+    detail: { projectId, tabId, x, y },
+  }));
+}
 
 // Маркеры реальных задач под названием вертикальной вкладки. Для ручной
 // визуальной настройки геометрии меняй только эти значения.
@@ -243,6 +276,22 @@ interface TabBarProps {
    * 'vertical' — left sidebar mode. Tab rows span full width.
    */
   layout?: 'horizontal' | 'vertical';
+  /**
+   * Render NO tab list — only serve context-menu requests for this project.
+   *
+   * Every item of the tab menu is built from its own project (scripts and
+   * favourites of the tab's cwd, "Move to project", the workspace toggle), so
+   * only the list of the tab's own project can open it. The sidebar shows one
+   * project, but panes are cross-project — a right click on the other pane's tab
+   * therefore had no listener at all and did nothing.
+   *
+   * A second visible list is not the answer (two lists, two selections). This
+   * mode mounts the same component with its list hidden, purely as the owner of
+   * that project's menu. A right click asks ABOUT a tab; it must not navigate
+   * anywhere, which is why the menu comes to the project instead of the project
+   * moving to the menu.
+   */
+  menuOnlyForProject?: boolean;
 }
 
 interface TabData {
@@ -1233,6 +1282,9 @@ const TabItem = memo(({
   // Поднято в начало TabItem чтобы быть до объявления tabStyle ниже.
   const tabGeo = useUIStore((s) => s.tabGeometry);
 
+  // Shared with the switcher and the recent-tabs list — one mark, one meaning.
+  const paneMapColumns = usePaneMapColumns(projectId, tab.id);
+
   // Get color config
   // SDK tabs share `color: 'claude'` with PTY claude tabs (so existing palette
   // logic — copy buttons, sticky-note tints, etc — keeps working) but the *tab
@@ -1930,31 +1982,20 @@ const TabItem = memo(({
                   Если активен только один сигнал — рисуется только он. Если AI думает
                   без PTY (SDK-таб) — цвет полоски статичный colorA, блик ползёт.
                   overflow:hidden держит shimmer-overlay строго внутри полоски. */}
-              {(verticalHasProcess || verticalIsAiBusy || verticalIsInheritedBusy) && (
-                <div
-                  className="tab-process-bar-static"
-                  style={{
-                    position: 'absolute',
-                    // Слева -2px компенсирует 2px transparent border (резерв под dashed-states).
-                    // Справа такого border нет: right:0 держит полоску на правой границе карточки/меню.
-                    ...(processBarPosition === 'right' ? { right: 0 } : { left: '-2px' }),
-                    top: 0,
-                    bottom: 0,
-                    width: '3px',
-                    pointerEvents: 'none',
-                    zIndex: 5,
-                    overflow: 'hidden',
-                    backgroundColor: verticalIsInheritedBusy ? 'var(--process-bar-inherited-color, #A855F7)' : undefined,
-                    // Закруглённые углы только на «своей» стороне вкладки.
-                    ...(processBarPosition === 'right'
-                      ? { borderTopRightRadius: tabGeo.borderRadius, borderBottomRightRadius: tabGeo.borderRadius }
-                      : { borderTopLeftRadius: tabGeo.borderRadius, borderBottomLeftRadius: tabGeo.borderRadius }),
-                  }}
-                >
-                  {verticalIsAiBusy && <div className="tab-process-bar-ai-shimmer-overlay" />}
-                  {verticalIsInheritedBusy && <div className="tab-process-bar-ai-shimmer-overlay tab-process-bar-inherited-shimmer-overlay" />}
-                </div>
-              )}
+              {/* Shared with the pane header / switcher / Run after picker via
+                  TabSignals — one implementation, so the same signal cannot end
+                  up with different geometry on different surfaces.
+                  `outset` compensates the 2px transparent border this card
+                  reserves for dashed drag states, but only on the left: there is
+                  no such border on the right, where right:0 already lands on the
+                  visible edge. */}
+              <TabProcessBar
+                hasProcess={verticalHasProcess}
+                busy={verticalIsAiBusy}
+                inheritedBusy={verticalIsInheritedBusy}
+                radius={tabGeo.borderRadius}
+                outset={processBarPosition === 'right' ? 0 : 2}
+              />
               {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
                   rendered above). The whole-tab background pulse was removed —
                   the loader is the переливающаяся полоска у края, not a tint of
@@ -1997,31 +2038,20 @@ const TabItem = memo(({
                   aria-hidden
                 />
               )}
-              {/* Status marker — shape (dot|square) + sizePx из Settings.
-                  Левый отступ 5px: после 3px polosky процесса (z:5) + 2px зазор → 5px.
-                  По вертикали top:calc(50% + 1px) компенсирует оптический baseline-шифт
-                  строчных букв ('claude-03' без descender'ов выглядит чуть ниже
-                  геометрического центра карточки).
-                  Если полоска процесса справа — маркер всё равно слева (так лучше читается
-                  рядом с текстом названия таба). */}
-              {statusMeta && (
-                <span
-                  title={statusMeta.label}
-                  style={{
-                    position: 'absolute',
-                    left: '5px',
-                    top: showTaskMarkerLane ? 'calc(50% - 1px)' : 'calc(50% + 1px)',
-                    transform: 'translateY(-50%)',
-                    width: `${showTaskMarkerLane ? TASK_MARKER_PRIMARY_SIZE_PX : statusMarkerSize}px`,
-                    height: `${showTaskMarkerLane ? TASK_MARKER_PRIMARY_SIZE_PX : statusMarkerSize}px`,
-                    borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
-                    backgroundColor: statusMeta.color,
-                    border: '1px solid rgba(0,0,0,0.4)',
-                    pointerEvents: 'none',
-                    zIndex: 6,
-                  }}
-                />
-              )}
+              {/* Status marker — shared with the other tab surfaces (TabSignals).
+                  Левый отступ 5px: после 3px полоски процесса (z:5) + 2px зазор → 5px.
+                  Вертикальный сдвиг компенсирует оптический baseline-шифт строчных
+                  букв ('claude-03' без descender'ов выглядит чуть ниже
+                  геометрического центра карточки); при видимой полосе задач маркер
+                  поднимается, чтобы освободить нижний шов.
+                  Если полоска процесса справа — маркер всё равно слева (так лучше
+                  читается рядом с текстом названия таба). */}
+              <TabStatusMarker
+                color={statusMeta?.color}
+                title={statusMeta?.label}
+                sizePx={showTaskMarkerLane ? TASK_MARKER_PRIMARY_SIZE_PX : undefined}
+                topOffsetPx={showTaskMarkerLane ? -1 : 1}
+              />
               {showTaskMarkerLane && activeTaskPlanItems.length > 0 && (
                 <span
                   data-task-plan-tab-markers
@@ -2363,6 +2393,12 @@ const TabItem = memo(({
               )}
             </span>
           )}
+
+          {/* Layout map — the ONLY answer to "where is this tab open". Sits
+              right of the name and left of the action cluster; the slot keeps
+              its width even when the tab is in no pane, so the name never
+              shifts as the tab enters or leaves the workspace. */}
+          {isVerticalMode && !isCollapsed && <PaneMapCells columns={paneMapColumns} />}
 
           {hasVerticalRightActionCluster && (
             <div
@@ -3433,7 +3469,7 @@ function buildVisualDepthMap(mainTabs: TabData[]): Map<string, number> {
   return cache;
 }
 
-function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
+function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }: TabBarProps) {
   const isVerticalLayout = layout === 'vertical';
   // Use individual selectors to minimize re-renders
   const openProjects = useWorkspaceStore((state) => state.openProjects);
@@ -3603,7 +3639,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       ipcRenderer.removeListener('tab:background-work', onMainBackgroundWork);
     };
   }, []);
-  const claudeSpinnerVisualIdleTimersRef = useRef<Map<string, number>>(new Map());
   // Awaiting-user-input: Claude called AskUserQuestion and is blocked waiting for
   // the human to answer. Deterministic, bracketed by PreToolUse/PostToolUse hooks
   // (main.js → claude:awaiting-input). Distinct from busy: a question is a special
@@ -3622,9 +3657,20 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const isTabTurnBusy = (tab: TabData): boolean => {
     const pasteBusy = pasteBusyMap.get(tab.id) || false;
     const backgroundWork = backgroundWorkMap.get(tab.id) || false;
-    if (tab.commandType === 'gemini') return (geminiBusyMap.get(tab.id) || false) || pasteBusy;
-    if (tab.commandType === 'codex') return (codexBusyMap.get(tab.id) || false) || pasteBusy || backgroundWork;
-    return (claudeBusyMap.get(tab.id) || false) || pasteBusy || backgroundWork;
+    // The three maps below hold only what arrived as a TRANSITION since this
+    // list mounted. The startup sync re-asks the main process for the process
+    // state and for the Codex turn state — but not for Claude or Gemini, so
+    // after a reload (or a restart) in the middle of a Claude turn those tabs
+    // showed no loader here until the turn ended, minutes later, while every
+    // other surface showed one.
+    //
+    // `tab.aiBusy` is the app-wide per-tab flag maintained for every tab
+    // regardless of what is on screen; taking it as the floor closes that gap
+    // without touching how the edges behave afterwards.
+    const known = tab.aiBusy === true;
+    if (tab.commandType === 'gemini') return (geminiBusyMap.get(tab.id) || false) || known || pasteBusy;
+    if (tab.commandType === 'codex') return (codexBusyMap.get(tab.id) || false) || known || pasteBusy || backgroundWork;
+    return (claudeBusyMap.get(tab.id) || false) || known || pasteBusy || backgroundWork;
   };
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -3970,21 +4016,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     const handleClaudeBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
       console.warn('[TabBar:BusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
       applyRestartAfterBusyEdge(tabId, busy, reason);
-      const timers = claudeSpinnerVisualIdleTimersRef.current;
-      const pendingTimer = timers.get(tabId);
-      if (pendingTimer !== undefined) {
-        window.clearTimeout(pendingTimer);
-        timers.delete(tabId);
-      }
-
-      if (!busy && reason === 'spinner') {
-        const timer = window.setTimeout(() => {
-          timers.delete(tabId);
-          applyClaudeVisualBusy(tabId, false);
-        }, CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS);
-        timers.set(tabId, timer);
-        return;
-      }
+      if (reason === 'spinner') return;
 
       applyClaudeVisualBusy(tabId, busy);
     };
@@ -4088,8 +4120,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('terminal:stop-progress', handleStopProgress);
       unsubscribeRestartAfterOrchestration();
-      claudeSpinnerVisualIdleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
-      claudeSpinnerVisualIdleTimersRef.current.clear();
     };
   }, []); // Stable — no re-subscriptions
 
@@ -6993,6 +7023,31 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     })();
   };
 
+  // External opener (split-pane header). Reuses handleContextMenu so the menu
+  // that appears is byte-for-byte the sidebar's menu: same items, same async
+  // enrichment (scripts, favourites, run history), same close rules. The
+  // synthetic event only carries what the handler reads — coordinates and the
+  // two no-ops it calls on a real event.
+  useEffect(() => {
+    const onOpenRequest = (event: Event) => {
+      const detail = (event as CustomEvent).detail as
+        { projectId?: string; tabId?: string; x?: number; y?: number } | undefined;
+      if (!detail?.tabId || detail.projectId !== projectId) return;
+      if (!workspace.tabs.has(detail.tabId)) return;
+      handleContextMenu(
+        {
+          preventDefault: () => {},
+          stopPropagation: () => {},
+          clientX: Number(detail.x) || 0,
+          clientY: Number(detail.y) || 0,
+        } as unknown as React.MouseEvent,
+        detail.tabId,
+      );
+    };
+    window.addEventListener(TAB_CONTEXT_MENU_EVENT, onOpenRequest);
+    return () => window.removeEventListener(TAB_CONTEXT_MENU_EVENT, onOpenRequest);
+  });
+
   const handleCommandHistoryOpen = useCallback((e: React.MouseEvent, tabId: string) => {
     e.preventDefault();
     e.stopPropagation();
@@ -8814,7 +8869,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
   return (
     <>
-      {isVerticalLayout ? verticalBody : (
+      {/* menuOnlyForProject: the LIST is not rendered, the menu below still is.
+          This instance exists only so a right click on a pane header chip whose
+          project the sidebar is not showing has an owner to open — see
+          menuOnlyForProject in TabBarProps. */}
+      {menuOnlyForProject ? null : isVerticalLayout ? verticalBody : (
       /* Single row TabBar */
       <div
         className="h-[30px] bg-panel flex items-stretch relative"
@@ -10035,9 +10094,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 }}
               >
                 <Columns2 size={12} className={disabled ? 'text-[#555]' : 'text-[#888] flex-shrink-0'} />
+                {/* Short labels on purpose: «в рабочую область» wrapped onto a
+                    second line and made the row twice as tall. */}
                 {inSplit
-                  ? 'Убрать из рабочей области'
-                  : `Добавить в рабочую область${splitPanes.length > 0 ? ` (${splitPanes.length})` : ''}`}
+                  ? 'Убрать из области'
+                  : `Добавить в область${splitPanes.length > 0 ? ` (${splitPanes.length})` : ''}`}
               </button>
             );
           })()}

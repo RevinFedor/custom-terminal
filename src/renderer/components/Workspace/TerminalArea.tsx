@@ -21,8 +21,10 @@ import {
   syncSessionStartingWithPresence,
 } from '../../utils/sessionStartingState.mjs';
 import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
-import { isEmptyPane } from '../../utils/splitPanesModel.mjs';
+import { isEmptyPane, paneIsStacked } from '../../utils/splitPanesModel.mjs';
+import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
+import type { AgentLifecycleSummary } from './agentLifecycleSummary';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -294,186 +296,14 @@ const getSessionStartingPresentation = (state: SessionStartingState) => {
   };
 };
 
-type AgentLifecycleTone = 'starting' | 'stopping' | 'error';
-
-const AgentLifecycleStatusCard = memo(({
-  title,
-  subtitle,
-  detail,
-  tone,
-  topOffset = 12,
-  onDismiss,
-  dismissLabel = 'Dismiss agent status',
-  onRetry,
-  retryLabel = 'RETRY',
-}: {
-  title: string;
-  subtitle: string;
-  detail?: string | null;
-  tone: AgentLifecycleTone;
-  topOffset?: number;
-  onDismiss?: () => void;
-  dismissLabel?: string;
-  onRetry?: () => void;
-  retryLabel?: string;
-}) => {
-  const isError = tone === 'error';
-  const isStopping = tone === 'stopping';
-  const accent = isError ? '#ef4444' : (isStopping ? '#d97706' : '#60a5fa');
-  const borderColor = isError
-    ? 'rgba(239,68,68,0.48)'
-    : (isStopping ? 'rgba(217,119,6,0.38)' : 'rgba(255,255,255,0.14)');
-  const background = isError
-    ? 'rgba(45,16,20,0.96)'
-    : (isStopping ? 'rgba(31,24,16,0.96)' : 'rgba(17,17,22,0.94)');
-
-  const keepTerminalFocus = (event: React.MouseEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    event.stopPropagation();
-  };
-
-  const handleDismiss = (event: React.MouseEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    event.stopPropagation();
-    onDismiss?.();
-  };
-
-  return (
-    <div
-      className="absolute left-3 right-3 z-40 pointer-events-none"
-      style={{ top: topOffset }}
-      role={isError ? 'alert' : 'status'}
-      aria-live={isError ? 'assertive' : 'polite'}
-    >
-      <div
-        className="relative flex items-center gap-3 rounded-lg border px-3 py-2.5 shadow-2xl"
-        style={{
-          width: 400,
-          maxWidth: '100%',
-          borderColor,
-          background,
-          boxShadow: isError
-            ? '0 12px 28px rgba(0,0,0,0.42), 0 0 20px rgba(239,68,68,0.12)'
-            : isStopping
-              ? '0 12px 28px rgba(0,0,0,0.42), 0 0 18px rgba(217,119,6,0.10)'
-              : '0 12px 28px rgba(0,0,0,0.42)',
-        }}
-      >
-        {isError ? (
-          <div
-            className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-xs font-black"
-            style={{ borderColor: 'rgba(239,68,68,0.9)', color: '#fecaca', background: 'rgba(239,68,68,0.16)' }}
-          >
-            !
-          </div>
-        ) : (
-          <div
-            className="h-5 w-5 shrink-0 rounded-full border-2 border-white/20 animate-spin"
-            style={{ borderTopColor: accent }}
-          />
-        )}
-
-        <div className="min-w-0 flex-1 text-left" style={{ paddingRight: onDismiss ? 28 : 0 }}>
-          <div
-            className="truncate text-[11px] font-bold tracking-[0.12em]"
-            style={{ color: isError ? '#fecaca' : '#ffffff' }}
-          >
-            {title}
-          </div>
-          <div className="mt-0.5 truncate text-[11px]" style={{ color: isError ? '#fca5a5' : '#a1a1aa' }}>
-            {subtitle}
-          </div>
-          {detail ? (
-            <div className="mt-0.5 truncate text-[10px]" style={{ color: isError ? '#ef4444' : '#6b7280' }}>
-              {detail}
-            </div>
-          ) : null}
-          {onRetry ? (
-            // Explicit retry. Automatic re-send happens only for a provably
-            // undelivered command; when the delivery is unknown the decision is
-            // the user's, so applying the setting twice stays impossible
-            // without an intent.
-            <button
-              type="button"
-              className="pointer-events-auto mt-1.5 cursor-pointer rounded-md border px-2 py-0.5 text-[10px] font-bold tracking-[0.1em]"
-              style={{
-                borderColor: 'rgba(239,68,68,0.5)',
-                background: 'rgba(239,68,68,0.12)',
-                color: '#fecaca',
-              }}
-              onMouseDown={keepTerminalFocus}
-              onClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                onRetry();
-              }}
-            >
-              {retryLabel}
-            </button>
-          ) : null}
-        </div>
-
-        {onDismiss ? (
-          <button
-            type="button"
-            aria-label={dismissLabel}
-            className="pointer-events-auto absolute right-2 top-2 flex h-6 w-6 cursor-pointer items-center justify-center rounded-md border border-white/10 bg-white/[0.04] text-base leading-none text-[#8b8b91] hover:border-white/20 hover:bg-white/[0.08] hover:text-white"
-            onMouseDown={keepTerminalFocus}
-            onClick={handleDismiss}
-          >
-            ×
-          </button>
-        ) : null}
-      </div>
-    </div>
-  );
-});
-
-const SessionStartingOverlay = memo(({
-  state,
-  onDismiss,
-  onRetry,
-  topOffset = 12,
-}: {
-  state: SessionStartingState;
-  onDismiss: () => void;
-  onRetry?: () => void;
-  topOffset?: number;
-}) => {
-  const presentation = getSessionStartingPresentation(state);
-  return (
-    <AgentLifecycleStatusCard
-      title={presentation.title}
-      subtitle={presentation.subtitle}
-      detail={presentation.detail}
-      tone={presentation.isError ? 'error' : 'starting'}
-      topOffset={topOffset}
-      onDismiss={onDismiss}
-      dismissLabel="Dismiss starting status"
-      onRetry={presentation.isError && state.startupUserRetryable ? onRetry : undefined}
-      retryLabel="RETRY SETTINGS"
-    />
-  );
-});
-
-const AgentStoppingOverlay = memo(({
-  state,
-  topOffset = 12,
-}: {
-  state: AgentStoppingState;
-  topOffset?: number;
-}) => {
-  const engineLabel = state.engine === 'codex' ? 'CODEX' : 'CLAUDE';
-  return (
-    <AgentLifecycleStatusCard
-      title={`STOPPING ${engineLabel}...`}
-      subtitle="Waiting for the process to exit safely"
-      detail={state.reason || null}
-      tone="stopping"
-      topOffset={topOffset}
-    />
-  );
-});
+// The floating lifecycle CARD (AgentLifecycleStatusCard + its two wrappers,
+// SessionStartingOverlay and AgentStoppingOverlay) lived here and was removed:
+// the transcript's own status control already says the same thing, in the
+// surface that owns the session. See the note at its former render site below.
+//
+// What is kept is the STATE behind it — sessionStarting / agentStopping and the
+// lifecycleSummary built from them — because that state is what every surface
+// now reads, including panes.
 
 // Overlay for interrupted AI sessions
 const InterruptedSessionOverlay = memo(({ tabId, sessionId, engine, onContinue, onDismiss }: {
@@ -591,19 +421,10 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, engine, onContinue, 
   );
 });
 
-export interface AgentLifecycleSummary {
-  tabId: string;
-  sessionId?: string | null;
-  kind: 'starting' | 'stopping' | 'interrupted' | 'error';
-  title: string;
-  description: string;
-  detail?: string | null;
-  spinner: boolean;
-  dismissLabel?: string;
-  onDismiss?: () => void;
-  retryLabel?: string;
-  onRetry?: () => void;
-}
+// Declared in its own module (./agentLifecycleSummary) because SplitPaneSurface
+// consumes it and this file renders SplitPaneSurface. Re-exported here so the
+// existing importers keep working.
+export type { AgentLifecycleSummary };
 
 interface TerminalAreaProps {
   projectId: string;
@@ -862,8 +683,8 @@ function TerminalArea({
       hideFromEvent(data.tabId, 'claude-tui-ready', true);
     };
     const onCodexReady = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'codex-tui-ready', true);
-    const onClaudeBusy = (_: any, data: { tabId: string; busy: boolean }) => {
-      if (!data.busy) return;
+    const onClaudeBusy = (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
+      if (!data.busy || data.reason === 'spinner') return;
       hideFromEvent(data.tabId, 'claude-busy', true);
     };
     const onCodexBusy = (_: any, data: { tabId: string; busy: boolean }) => {
@@ -1273,6 +1094,19 @@ function TerminalArea({
   useEffect(() => {
     if (splitPaneCount === 0) return;
     const onPointerDown = (e: PointerEvent) => {
+      // LEFT button only. A right-click opens a menu ABOUT something; a middle
+      // click removes something. Neither is "I want to work in this pane", and
+      // moving focus on them yanked the surface out from under the menu the
+      // user had just opened. Same rule as the pane header chip.
+      if (e.button !== 0) return;
+      // An overlay is open → this click belongs to IT: its job is to close the
+      // menu, not to work in whatever is underneath. Checked here because this
+      // listener is on pointerdown in the CAPTURE phase, while every dismiss
+      // handler is on mousedown in the bubble phase — so focus always won the
+      // race and the dismissal looked like a deliberate click into the pane.
+      // (Reported: right-click pane 1's chip from pane 2, then click inside
+      // pane 1 — the menu closed AND pane 1 took focus.)
+      if (notePointerDownForDismissal(document)) return;
       const el = (e.target as HTMLElement)?.closest?.('[data-split-pane-index]');
       if (!el) return;
       const idx = Number(el.getAttribute('data-split-pane-index'));
@@ -1444,7 +1278,7 @@ function TerminalArea({
             {...(inPane ? { 'data-split-pane-index': paneIndex } : {})}
             style={{
               ...(inPane
-                ? splitPaneRectStyle(paneIndex, splitPanes.length)
+                ? splitPaneRectStyle(paneIndex, splitPanes)
                 : { position: 'absolute' as const, inset: 0 }),
               zIndex: inPane ? 2 : (splitActive ? 0 : 1),
               pointerEvents: 'none',
@@ -1458,6 +1292,26 @@ function TerminalArea({
                 paneIndex={paneIndex}
               />
             )}
+            {/* Toast anchor of THIS tab. A toast about this tab is portalled here,
+                so it appears at the top-right of the surface it is about instead
+                of the top-right of the whole window (where a message about the
+                left pane landed over the right one). Empty box, no hit-testing:
+                the toast itself re-enables pointer events. */}
+            <div
+              data-toast-anchor-tab-id={tab.id}
+              style={{
+                position: 'absolute',
+                top: inPane ? SPLIT_ATTACH_ROW_H + 8 : 8,
+                right: 8,
+                zIndex: 210,
+                pointerEvents: 'none',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'flex-end',
+                gap: 8,
+                maxWidth: 'min(420px, calc(100% - 16px))',
+              }}
+            />
             <div
               data-terminal-pane-content
               style={{
@@ -1474,6 +1328,11 @@ function TerminalArea({
                   projectId={projId}
                   tabId={tab.id}
                   focused={focusedPane}
+                  // The pane shows the status inside its own transcript header;
+                  // it filters by tabId, so only the pane the status is about
+                  // displays it.
+                  lifecycleStatus={lifecycleSummary}
+                  stacked={paneIsStacked(splitPanes, paneIndex)}
                 >
                   {inner}
                 </SplitPaneSurface>
@@ -1494,7 +1353,7 @@ function TerminalArea({
           data-terminal-pane-wrapper="empty"
           data-split-pane-index={paneIndex}
           style={{
-            ...splitPaneRectStyle(paneIndex, splitPanes.length),
+            ...splitPaneRectStyle(paneIndex, splitPanes),
             zIndex: 2,
             pointerEvents: 'none',
             background: '#161616',
@@ -1578,7 +1437,10 @@ function TerminalArea({
     const durMs = Date.now() - t0;
     console.warn(`[TerminalArea:useMemo] RECALCULATING projectId=${projectId.slice(-12)} total=${totalCount} sdk=${sdkCount} split=${splitPanes.length} durMs=${durMs}`);
     return result;
-  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface]);
+    // lifecycleSummary is a dependency, not a captured constant: panes read the
+    // agent's start/stop status from it, and without it here a pane would keep
+    // rendering the status from whenever this memo last ran.
+  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, lifecycleSummary]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {
@@ -1652,29 +1514,18 @@ function TerminalArea({
         />
       )}
 
-      {/* Local per-tab resume/start status. It deliberately does not own focus or
-          a full-screen hit area: startup menus remain directly interactive. */}
-      <AnimatePresence>
-        {!suppressLifecycleOverlays && showAgentStoppingOverlay && agentStopping && (
-          <AgentStoppingOverlay
-            key={`${agentStopping.tabId}:${agentStopping.since}`}
-            state={agentStopping}
-            topOffset={activeExternalRun ? 44 : 12}
-          />
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {!suppressLifecycleOverlays && showSessionStartingOverlay && sessionStarting && (
-          <SessionStartingOverlay
-            key={`${sessionStarting.tabId}:${sessionStarting.since}`}
-            state={sessionStarting}
-            onDismiss={handleDismissSessionStarting}
-            onRetry={handleRetryStartupDefaults}
-            topOffset={activeExternalRun ? 44 : 12}
-          />
-        )}
-      </AnimatePresence>
+      {/* The floating "LOADING … SESSION" card used to live here. Removed:
+          the same status is already carried by the transcript's own status
+          control (HistoryPanel → activeLifecycle), which shows the title, the
+          error text and both the dismiss and RETRY buttons — so the card was a
+          second answer to a question already answered, in a place that did not
+          belong to the tab it described.
+          Two concrete costs: it was anchored to the whole window rather than
+          to its pane, so in a split it appeared over a NEIGHBOUR's area; and
+          its 400px box sat across the pane header, swallowing right-clicks on
+          the tab chip underneath. The status now lives inside the surface that
+          owns the session — including in panes, which is what the
+          lifecycleStatus prop on SplitPaneSurface is for. */}
 
       {/* Interrupted session overlay */}
       <AnimatePresence>

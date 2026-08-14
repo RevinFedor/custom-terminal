@@ -86,7 +86,7 @@ const handleLinkActivation = (
 };
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { SearchAddon } from '@xterm/addon-search';
-import { useUIStore } from '../../store/useUIStore';
+import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import {
   useWorkspaceStore,
   type AiLaunchSnapshot,
@@ -95,6 +95,9 @@ import {
 } from '../../store/useWorkspaceStore';
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { resolveCenterRightInset } from '../../utils/surfaceInsets.mjs';
+import { canTerminalClaimFocus } from '../../utils/terminalFocusClaim.mjs';
+import { measureTerminalViewportIntersection } from '../../utils/terminalViewportIntersection.mjs';
 import { log } from '../../utils/logger';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
@@ -116,7 +119,6 @@ import {
   takeTerminalHydrationChunks,
 } from '../../utils/terminalHydrationBuffer';
 
-const TIMELINE_COLLAPSED_SLOT_WIDTH = 32;
 const TERMINAL_THEME = {
   background: '#1a1a1a',
   foreground: '#d4d4d4',
@@ -808,12 +810,21 @@ type TerminalLayerSnapshot = {
   pointerEvents: string;
   display: string;
   rect: string;
+  intersectsViewport: boolean;
 };
 
 const collectTerminalLayerSnapshots = (): TerminalLayerSnapshot[] => {
   return Array.from(document.querySelectorAll<HTMLElement>('[data-terminal-layer-tab-id]')).map((el) => {
     const cs = window.getComputedStyle(el);
     const rect = el.getBoundingClientRect();
+    const viewport = measureTerminalViewportIntersection({
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
     return {
       tabId: el.dataset.terminalLayerTabId || '',
       ownerProjectId: el.dataset.terminalLayerOwnerProject || '',
@@ -824,6 +835,7 @@ const collectTerminalLayerSnapshots = (): TerminalLayerSnapshot[] => {
       pointerEvents: cs.pointerEvents,
       display: cs.display,
       rect: `${Math.round(rect.width)}x${Math.round(rect.height)}@${Math.round(rect.left)},${Math.round(rect.top)}`,
+      intersectsViewport: viewport.intersectsViewport,
     };
   });
 };
@@ -833,7 +845,8 @@ const isPaintedTerminalLayer = (layer: TerminalLayerSnapshot): boolean => {
   return layer.display !== 'none'
     && layer.visibility !== 'hidden'
     && opacity > 0.01
-    && !layer.rect.startsWith('0x0@');
+    && !layer.rect.startsWith('0x0@')
+    && layer.intersectsViewport;
 };
 
 const rememberDetectedShellCommand = (tabId: string, fullLine: string, claudeAlive: boolean) => {
@@ -1119,6 +1132,7 @@ function Terminal({
     writeSeq?: number | null,
     generation?: string | null,
     generationOrdinal?: number | null,
+    rendererTerminal?: XTerminal | null,
   ) => {
     if (!Number.isFinite(writeSeq)) return;
     const seq = Number(writeSeq);
@@ -1132,6 +1146,14 @@ function Terminal({
       rendererFlushedHeadlessGeneration.current = generation || null;
       rendererFlushedHeadlessGenerationOrdinal.current = ordinal;
       rendererFlushedHeadlessWriteSeq.current = seq;
+      const terminalForBoundary = rendererTerminal || xtermInstance.current;
+      if (terminalForBoundary) {
+        terminalRegistry.markRendererWriteFlushed(tabId, terminalForBoundary, {
+          writeSeq: seq,
+          generation: generation || null,
+          generationOrdinal: ordinal,
+        });
+      }
       return;
     }
     if (
@@ -1154,6 +1176,14 @@ function Terminal({
       rendererFlushedHeadlessWriteSeq.current || 0,
       seq,
     );
+    const terminalForBoundary = rendererTerminal || xtermInstance.current;
+    if (terminalForBoundary) {
+      terminalRegistry.markRendererWriteFlushed(tabId, terminalForBoundary, {
+        writeSeq: rendererFlushedHeadlessWriteSeq.current,
+        generation: rendererFlushedHeadlessGeneration.current,
+        generationOrdinal: rendererFlushedHeadlessGenerationOrdinal.current,
+      });
+    }
   };
 
   const ensureTerminalWritePump = (term: XTerminal) => {
@@ -1334,6 +1364,7 @@ function Terminal({
           snapshotWriteSeq,
           snapshotGeneration,
           snapshotGenerationOrdinal,
+          term,
         );
         restoredPromptBoundaries = terminalRegistry.restorePromptBoundaries(
           tabId,
@@ -1383,6 +1414,7 @@ function Terminal({
           snapshotWriteSeq,
           snapshotGeneration,
           snapshotGenerationOrdinal,
+          term,
         );
         restoredPromptBoundaries = terminalRegistry.restorePromptBoundaries(
           tabId,
@@ -1492,6 +1524,12 @@ function Terminal({
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
   const historyPanelOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
+  const historyPinnedSetting = useUIStore((state) => state.historyPinned);
+  // Which of the two surfaces holds the centre for THIS tab. The terminal used
+  // not to know: it always measured its right edge as if it were the centre,
+  // which is wrong exactly when the transcript holds the centre and the
+  // terminal is the panel docked beside it.
+  const isTerminalCentre = useUIStore((state) => resolveTabTerminalPrimary(state, tabId));
   const selectedPromptQueueInputSurface = useUIStore((state) => (
     promptQueueInputSurface === 'history'
       ? (presentedProp ? (state.promptQueueInputSurfaceTabs[tabId] ?? 'history') : 'history')
@@ -1501,12 +1539,71 @@ function Terminal({
   const timelineTreeMode = useUIStore((state) => state.timelineTreeModeTabs[tabId] ?? false);
   const timelineWidth = useUIStore((state) => state.timelineWidth);
   const timelinePinned = useUIStore((state) => state.timelinePinned);
-  const promptQueueRightInset =
-    timelineTreeMode
-      && !timelinePinned
-      && (promptQueueInputSurface === 'history' || !historyPanelOpen)
-      ? Math.max(0, timelineWidth - TIMELINE_COLLAPSED_SLOT_WIDTH)
-      : 0;
+  // Right inset = how far Run after must step LEFT so nothing covers it.
+  //
+  // Both right-edge surfaces push it, and they stack: the expanded Timeline and
+  // the Cmd+] side panel (transcript OR terminal — the same slot, so its width
+  // is whichever one is showing). Run after ALWAYS moves; the pin toggle only
+  // decides whether the CENTER surface also gives up space, which is a separate
+  // question. Previously only the Timeline counted, so opening the side panel
+  // left the strip behind it.
+  const sideTerminalWidth = useUIStore((state) => state.sideTerminalWidth);
+  const historyPanelWidth = useUIStore((state) => state.historyPanelWidth);
+  const sideTerminalOpen = useUIStore((state) => state.sideTerminalOpenTabs[tabId] ?? false);
+  // Which side panel is open depends on the layout: transcript-primary docks
+  // the TERMINAL to the right, terminal-primary docks the TRANSCRIPT. Shared
+  // arithmetic (surfaceInsets) — the Run after strip and BOTH scroll-to-bottom
+  // arrows sit in this same box and must dodge the same obstacles by the same
+  // amount.
+  // WHOSE right edge is this? The inset exists to keep things clear of a panel
+  // docked at the CENTRE's right edge. When this terminal is itself that
+  // panel, it has no such obstacle — its own right edge is the panel's edge.
+  //
+  // Missing this produced the reported bug in both directions: as the side
+  // panel the terminal shifted its arrow left by its OWN width, pushing it out
+  // of the panel entirely (the user saw no arrow in the side terminal, while
+  // the centre showed one); and the shift used the STORED panel width, so
+  // dragging the panel did not move the strip with it.
+  // TWO numbers, because there are two boxes — and conflating them is what made
+  // the strip stop moving.
+  //
+  // The scroll arrow is drawn INSIDE this terminal, so it measures against the
+  // terminal's own right edge. The Run after strip is portalled OUT to a host
+  // that spans the whole centre column (see Workspace: promptQueuePortalHostId),
+  // so it measures against the CENTRE's right edge. In transcript-primary those
+  // edges are different things: the terminal is the docked side panel and has
+  // nothing to dodge, while the strip still has to step left by that same panel's
+  // width. One shared value answered the terminal's question and therefore froze
+  // the strip in place — exactly the reported "Cmd+] and Run after does not move".
+  const sharedInsetArgs = {
+    treeMode: timelineTreeMode,
+    pinned: timelinePinned,
+    width: timelineWidth,
+    sideTerminalOpen: promptQueueInputSurface === 'history' && sideTerminalOpen,
+    sideTerminalWidth,
+    // The transcript is only an OBSTACLE while it is docked BESIDE the centre —
+    // i.e. in terminal-primary. When it holds the centre itself (the terminal is
+    // then the side panel), "open" says nothing about the right edge: the
+    // transcript IS the surface underneath, so there is nothing to dodge.
+    //
+    // Reading the bare open-flag inset the strip by a transcript width in the
+    // exact layout the user reported: transcript centred, side terminal CLOSED,
+    // and Run after nevertheless parked ~580px inside as though a panel were
+    // there. Opening the side terminal then swapped the strip onto the terminal's
+    // own inset and it appeared to vanish.
+    sideHistoryOpen: historyPanelOpen && isTerminalCentre,
+    sideHistoryWidth: historyPanelWidth,
+    // A pinned panel is a column: the centre already ends before it.
+    sidePanelPinned: historyPinnedSetting,
+  };
+  // Anchored to the CENTRE box → always dodges whichever panel is docked over it.
+  const promptQueueRightInset = resolveCenterRightInset(sharedInsetArgs);
+  // Anchored to THIS terminal → when the terminal IS the docked panel, its own
+  // right edge is already clear and insetting would push the arrow out of itself.
+  const terminalArrowRightInset = resolveCenterRightInset({
+    ...sharedInsetArgs,
+    isSidePanel: promptQueueInputSurface === 'history' && sideTerminalOpen && !isTerminalCentre,
+  });
   const workspaceView = useWorkspaceStore((state) => state.view);
 
   // Prompt-queue overlay needs to know two things:
@@ -1624,6 +1721,20 @@ function Terminal({
   // This prevents focus/fit/repaint when terminals are hidden behind Dashboard or ProjectHome
   const effectiveActive = active && projectCurrentView === 'terminal' && workspaceView === 'workspace';
   const effectivePresented = effectiveActive && presentedProp;
+  // "On screen" and "may swallow the keyboard" are different questions. A CLOSED
+  // side terminal stays mounted and active on purpose (PTY, buffer and
+  // scrollback survive so opening it is instant) — but nothing about it is
+  // visible, so a keystroke it takes is a keystroke that disappears. Shared rule
+  // so all four focus-grab sites below answer identically.
+  const mayClaimFocus = canTerminalClaimFocus({
+    active: effectiveActive,
+    presented: presentedProp,
+    terminalIsCentre: isTerminalCentre,
+    sideTerminalOpen,
+    hasSurfacePair: promptQueueInputSurface === 'history',
+  });
+  const mayClaimFocusRef = useRef(mayClaimFocus);
+  useEffect(() => { mayClaimFocusRef.current = mayClaimFocus; }, [mayClaimFocus]);
   const [promptQueuePortalHost, setPromptQueuePortalHost] = useState<HTMLElement | null>(null);
 
   useEffect(() => {
@@ -1684,6 +1795,10 @@ function Terminal({
       // Split mode presents several terminals; only the globally active one
       // may take the window-refocus grab.
       if (!isGloballyActiveTab(tabId)) return;
+      // …and only a terminal the user can actually SEE. This event fires on every
+      // window focus, so a closed side terminal used to grab the keyboard here
+      // and the next paste went into it instead of the transcript composer.
+      if (!mayClaimFocusRef.current) return;
       const term = terminalRegistry.get(tabId);
       if (term) {
         try { term.focus(); } catch {}
@@ -2479,7 +2594,8 @@ function Terminal({
         term.scrollToBottom();
         isReadyRef.current = true;
         setIsVisible(true); // Reveal after first fit to prevent jitter
-      if (activeRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)) {
+      if (activeRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)
+        && mayClaimFocusRef.current) {
         term.focus();
       }
 
@@ -3444,7 +3560,8 @@ function Terminal({
           setIsVisible(true);
           // Don't steal focus from an open tab-rename input (Cmd+T / new tab
           // auto-opens it in this same tick). See isExternalEditableFocused.
-          if (activeRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)) {
+          if (activeRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)
+            && mayClaimFocusRef.current) {
             term.focus();
           }
 
@@ -3527,7 +3644,8 @@ function Terminal({
             console.warn('[Terminal:activate] _renderService.clear() ERROR:', e);
           }
 
-          if (!isExternalEditableFocused() && isGloballyActiveTab(tabId)) {
+          if (!isExternalEditableFocused() && isGloballyActiveTab(tabId)
+            && mayClaimFocusRef.current) {
             term.focus();
           }
 
@@ -3726,8 +3844,12 @@ function Terminal({
 	          style={{
 	            position: 'absolute',
 	            bottom: '16px',
-	            left: promptQueueInputSurface === 'history' ? undefined : (historyPanelOpen ? '16px' : undefined),
-	            right: promptQueueInputSurface === 'history' ? '16px' : (historyPanelOpen ? undefined : '16px'),
+	            // Always at the right edge, shifted left by whatever covers it —
+	            // the same number the Run after strip uses, so the two never end
+	            // up on opposite sides of the same panel. Previously this jumped
+	            // to the LEFT edge when the transcript opened, which read as a
+	            // different button appearing somewhere else.
+	            right: terminalArrowRightInset + 16,
 	            width: '36px',
             height: '36px',
             borderRadius: '8px',

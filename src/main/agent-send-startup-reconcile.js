@@ -105,14 +105,13 @@ function normalizeUnresolvedRecord(record) {
   const operationKey = cleanString(record.operationKey);
   const attemptId = cleanString(record.attemptId);
   const provider = cleanString(record.provider).toLowerCase();
-  const sessionId = cleanString(record.sessionId);
   const promptHash = cleanString(record.promptHash);
   const promptLength = nonNegativeSafeInteger(record.promptLength);
-  if (!operationKey || !attemptId || !sessionId || !promptHash || promptLength === null) {
-    return { ok: false, reason: 'receipt-identity-incomplete' };
-  }
   if (provider !== 'claude' && provider !== 'codex') {
     return { ok: false, reason: 'receipt-provider-unsupported' };
+  }
+  if (!operationKey || !attemptId || !promptHash || promptLength === null) {
+    return { ok: false, reason: 'receipt-identity-incomplete' };
   }
   const prompt = promptTextFromReceipt(record);
   if (!prompt) return { ok: false, reason: 'receipt-prompt-text-missing' };
@@ -125,6 +124,17 @@ function normalizeUnresolvedRecord(record) {
   if (!record.transcriptBoundary || typeof record.transcriptBoundary !== 'object') {
     return { ok: false, reason: 'transcript-boundary-missing' };
   }
+  const storedSessionId = cleanString(record.sessionId);
+  const boundarySessionId = cleanString(record.transcriptBoundary.sessionId);
+  if (provider === 'codex' && storedSessionId && boundarySessionId
+    && storedSessionId !== boundarySessionId) {
+    return { ok: false, reason: 'transcript-boundary-foreign-session' };
+  }
+  // Older desktop History receipts persisted the exact Codex writer only
+  // inside their pre-Enter transcript boundary. That boundary belongs to the
+  // same attempt and is safe to use; the current tab/session is never consulted.
+  const sessionId = storedSessionId || (provider === 'codex' ? boundarySessionId : '');
+  if (!sessionId) return { ok: false, reason: 'receipt-identity-incomplete' };
   return {
     ok: true,
     value: {
@@ -313,6 +323,125 @@ async function readExactPostBoundaryRange(transcriptPath, boundaryOffset, maxRea
   }
 }
 
+async function readBoundedCodexCausalPrefix(
+  transcriptPath,
+  boundaryOffset,
+  maxReadBytes,
+  causalUpperBoundaryOffset = null,
+) {
+  let handle = null;
+  try {
+    handle = await fs.promises.open(transcriptPath, 'r');
+    const before = await handle.stat();
+    if (!before.isFile()) {
+      return { ok: false, reason: 'transcript-not-regular-file' };
+    }
+    const fileSize = nonNegativeSafeInteger(before.size);
+    if (fileSize === null || fileSize < boundaryOffset) {
+      return { ok: false, reason: 'transcript-truncated-before-boundary' };
+    }
+    if (boundaryOffset > 0) {
+      const probe = await readFully(handle, boundaryOffset - 1, 1);
+      if (probe.bytesRead !== 1 || probe.buffer[0] !== 0x0a) {
+        return { ok: false, reason: 'transcript-boundary-not-line-aligned' };
+      }
+    }
+
+    const requestedUpper = causalUpperBoundaryOffset === null
+      || causalUpperBoundaryOffset === undefined
+      ? null
+      : nonNegativeSafeInteger(causalUpperBoundaryOffset);
+    if (requestedUpper !== null && requestedUpper <= boundaryOffset) {
+      return { ok: false, reason: 'transcript-causal-upper-boundary-invalid' };
+    }
+    if (requestedUpper !== null && requestedUpper > fileSize) {
+      return {
+        ok: false,
+        reason: 'transcript-truncated-before-causal-upper-boundary',
+        fileSize,
+        causalUpperBoundaryOffset: requestedUpper,
+      };
+    }
+    const scanEndOffset = requestedUpper ?? fileSize;
+    if (requestedUpper !== null && scanEndOffset > 0) {
+      const probe = await readFully(handle, scanEndOffset - 1, 1);
+      if (probe.bytesRead !== 1 || probe.buffer[0] !== 0x0a) {
+        return {
+          ok: false,
+          reason: 'transcript-causal-upper-boundary-not-line-aligned',
+          causalUpperBoundaryOffset: requestedUpper,
+        };
+      }
+    }
+
+    const causalRangeBytes = scanEndOffset - boundaryOffset;
+    const bytesToRead = Math.min(causalRangeBytes, maxReadBytes);
+    const read = await readFully(handle, boundaryOffset, bytesToRead);
+    if (read.bytesRead !== bytesToRead) {
+      return { ok: false, reason: 'transcript-changed-during-read' };
+    }
+    const rangeComplete = bytesToRead === causalRangeBytes;
+    let completeBuffer = read.buffer;
+    if (rangeComplete) {
+      if (completeBuffer.length > 0 && completeBuffer[completeBuffer.length - 1] !== 0x0a) {
+        return {
+          ok: false,
+          reason: 'transcript-post-boundary-partial-line',
+          fileSize,
+          postBoundaryBytes: fileSize - boundaryOffset,
+        };
+      }
+    } else {
+      const lastNewline = completeBuffer.lastIndexOf(0x0a);
+      completeBuffer = lastNewline >= 0
+        ? completeBuffer.subarray(0, lastNewline + 1)
+        : completeBuffer.subarray(0, 0);
+    }
+
+    let text;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(completeBuffer);
+    } catch {
+      return { ok: false, reason: 'transcript-invalid-utf8' };
+    }
+    const jsonl = validateCompleteJsonl(text);
+    if (!jsonl.ok) return jsonl;
+    const after = await handle.stat();
+    if (
+      Number(after.size) !== fileSize
+      || Number(after.mtimeMs) !== Number(before.mtimeMs)
+      || Number(after.ino) !== Number(before.ino)
+    ) {
+      return { ok: false, reason: 'transcript-changed-during-read' };
+    }
+    return {
+      ok: true,
+      text,
+      buffer: completeBuffer,
+      fileSize,
+      postBoundaryBytes: fileSize - boundaryOffset,
+      causalRangeBytes,
+      bytesRead: read.bytesRead,
+      completeBytesRead: completeBuffer.length,
+      rangeComplete,
+      scanEndOffset,
+      causalUpperBoundaryOffset: requestedUpper,
+      mtimeMs: Number(before.mtimeMs),
+      ino: Number(before.ino),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'transcript-unreadable',
+      errorCode: cleanString(error?.code) || null,
+    };
+  } finally {
+    if (handle) {
+      try { await handle.close(); } catch {}
+    }
+  }
+}
+
 async function transcriptStillMatchesSnapshot(transcriptPath, snapshot) {
   try {
     const stat = await fs.promises.stat(transcriptPath);
@@ -365,7 +494,13 @@ function evidenceFor(boundary, snapshot, candidateCount, matchCount) {
     transcriptPath: boundary.transcriptPath,
     boundaryOffset: boundary.fileSize,
     fileSize: snapshot.fileSize,
-    bytesRead: snapshot.postBoundaryBytes,
+    bytesRead: Number.isFinite(snapshot.bytesRead)
+      ? snapshot.bytesRead
+      : snapshot.postBoundaryBytes,
+    postBoundaryBytes: snapshot.postBoundaryBytes,
+    rangeComplete: snapshot.rangeComplete !== false,
+    scanEndOffset: snapshot.scanEndOffset ?? snapshot.fileSize,
+    causalUpperBoundaryOffset: snapshot.causalUpperBoundaryOffset ?? null,
     candidateCount,
     matchCount,
   };
@@ -471,16 +606,48 @@ function codexUserMessageText(payload) {
   return parts.length > 0 ? parts.join('') : null;
 }
 
-async function reconcileCodex(context, maxReadBytes) {
+function selectCodexStartupCandidate(context, validated, auditExpectation, candidate) {
+  const actualText = codexUserMessageText(candidate.record?.payload);
+  if (actualText === null) {
+    return { ok: false, reason: 'codex-user-message-text-unavailable' };
+  }
+  const actualHash = promptAuditFingerprint(actualText);
+  const selection = selectCodexPendingPromptAudit([auditExpectation], {
+    actualText,
+    actualHash,
+    actualPayload: candidate.record?.payload || null,
+    actualIdentity: {
+      sessionId: context.sessionId,
+      filePath: validated.transcriptPath,
+      byteOffset: candidate.byteOffset,
+      timestamp: candidate.record?.timestamp || null,
+    },
+  });
+  if (!selection) return { ok: true, match: null };
+  const canonicalReason = cleanString(selection.canonicalMatch?.reason) || null;
+  if (canonicalReason && !CODEX_CANONICAL_REASONS.has(canonicalReason)) {
+    return { ok: false, reason: 'codex-canonical-reason-not-allowlisted' };
+  }
+  if (!canonicalReason && actualText !== context.promptText) {
+    return { ok: false, reason: 'transcript-prompt-hash-collision' };
+  }
+  return {
+    ok: true,
+    match: { candidate, actualText, actualHash, canonicalReason },
+  };
+}
+
+async function reconcileCodex(context, maxReadBytes, options = {}) {
   const validated = validateCodexBoundary(context);
   if (!validated.ok) return unknown(context.record, validated.reason, validated);
-  const snapshot = await readExactPostBoundaryRange(
+  const snapshot = await readBoundedCodexCausalPrefix(
     validated.transcriptPath,
     validated.fileSize,
     maxReadBytes,
+    options.codexCausalUpperBoundaryOffset,
   );
   if (!snapshot.ok) return unknown(context.record, snapshot.reason, snapshot);
-  if (snapshot.postBoundaryBytes === 0) {
+  if (snapshot.causalRangeBytes === 0) {
     return absent(context.record, 'no-post-boundary-records', {
       evidence: evidenceFor(validated, snapshot, 0, 0),
     });
@@ -504,40 +671,50 @@ async function reconcileCodex(context, maxReadBytes) {
   };
   const matches = [];
   for (const candidate of consumed.records) {
-    const actualText = codexUserMessageText(candidate.record?.payload);
-    if (actualText === null) {
-      return unknown(context.record, 'codex-user-message-text-unavailable');
-    }
-    const actualHash = promptAuditFingerprint(actualText);
-    const selection = selectCodexPendingPromptAudit([auditExpectation], {
-      actualText,
-      actualHash,
-      actualPayload: candidate.record?.payload || null,
-      actualIdentity: {
-        sessionId: context.sessionId,
-        filePath: validated.transcriptPath,
-        byteOffset: candidate.byteOffset,
-        timestamp: candidate.record?.timestamp || null,
-      },
-    });
-    if (!selection) continue;
-    const canonicalReason = cleanString(selection.canonicalMatch?.reason) || null;
-    if (canonicalReason && !CODEX_CANONICAL_REASONS.has(canonicalReason)) {
-      return unknown(context.record, 'codex-canonical-reason-not-allowlisted');
-    }
-    if (!canonicalReason && actualText !== context.promptText) {
-      return unknown(context.record, 'transcript-prompt-hash-collision');
-    }
-    matches.push({ candidate, actualText, actualHash, canonicalReason });
+    const selected = selectCodexStartupCandidate(
+      context,
+      validated,
+      auditExpectation,
+      candidate,
+    );
+    if (!selected.ok) return unknown(context.record, selected.reason);
+    if (selected.match) matches.push(selected.match);
   }
   const evidence = evidenceFor(validated, snapshot, consumed.records.length, matches.length);
-  if (matches.length === 0) {
-    return absent(context.record, 'no-exact-post-boundary-candidate', { evidence });
+  const hasClosedCausalRange = snapshot.causalUpperBoundaryOffset !== null
+    && snapshot.rangeComplete === true;
+  let match = null;
+  if (hasClosedCausalRange) {
+    if (matches.length === 0) {
+      return absent(context.record, 'no-exact-post-boundary-candidate', { evidence });
+    }
+    if (matches.length > 1) {
+      return unknown(context.record, 'multiple-exact-post-boundary-candidates', { evidence });
+    }
+    [match] = matches;
+  } else {
+    const firstCandidate = consumed.records[0] || null;
+    if (!firstCandidate) {
+      return snapshot.rangeComplete
+        ? absent(context.record, 'no-post-boundary-user-message', { evidence })
+        : unknown(context.record, 'no-user-message-in-bounded-causal-prefix', { evidence });
+    }
+    const selected = selectCodexStartupCandidate(
+      context,
+      validated,
+      auditExpectation,
+      firstCandidate,
+    );
+    if (!selected.ok) return unknown(context.record, selected.reason, { evidence });
+    if (!selected.match) {
+      return unknown(
+        context.record,
+        'first-post-boundary-user-message-mismatch',
+        { evidence },
+      );
+    }
+    match = selected.match;
   }
-  if (matches.length > 1) {
-    return unknown(context.record, 'multiple-exact-post-boundary-candidates', { evidence });
-  }
-  const match = matches[0];
   const audit = makeAudit(context, {
     actualText: match.actualText,
     actualHash: match.actualHash,
@@ -564,11 +741,38 @@ async function reconcileAgentSendStartupRecord(record, options = {}) {
   const maxReadBytes = normalizeReadLimit(options.maxReadBytes);
   return normalized.value.provider === 'claude'
     ? reconcileClaude(normalized.value, maxReadBytes)
-    : reconcileCodex(normalized.value, maxReadBytes);
+    : reconcileCodex(normalized.value, maxReadBytes, options);
+}
+
+function nextCodexBoundaryOffset(record, records) {
+  if (cleanString(record?.provider).toLowerCase() !== 'codex') return null;
+  const boundary = record?.transcriptBoundary;
+  const transcriptPath = resolveExactPath(boundary?.filePath);
+  const sessionId = cleanString(boundary?.sessionId || record?.sessionId);
+  const fileSize = nonNegativeSafeInteger(boundary?.fileSize);
+  if (!transcriptPath || !sessionId || fileSize === null) return null;
+  let next = null;
+  for (const candidate of Array.isArray(records) ? records : []) {
+    if (candidate === record || cleanString(candidate?.provider).toLowerCase() !== 'codex') {
+      continue;
+    }
+    const candidateBoundary = candidate?.transcriptBoundary;
+    if (
+      cleanString(candidateBoundary?.sessionId || candidate?.sessionId) !== sessionId
+      || resolveExactPath(candidateBoundary?.filePath) !== transcriptPath
+    ) {
+      continue;
+    }
+    const candidateOffset = nonNegativeSafeInteger(candidateBoundary?.fileSize);
+    if (candidateOffset === null || candidateOffset <= fileSize) continue;
+    if (next === null || candidateOffset < next) next = candidateOffset;
+  }
+  return next;
 }
 
 async function reconcileAgentSendStartupRecords(records, options = {}) {
   const source = Array.isArray(records) ? records : [];
+  const allRecords = Array.isArray(options.allRecords) ? options.allRecords : source;
   const maxRecords = normalizeRecordLimit(options.maxRecords);
   const decisions = [];
   // Deliberately sequential: startup recovery must not open an unbounded set of
@@ -578,7 +782,11 @@ async function reconcileAgentSendStartupRecords(records, options = {}) {
       decisions.push(unknown(source[index], 'startup-reconcile-record-limit'));
       continue;
     }
-    decisions.push(await reconcileAgentSendStartupRecord(source[index], options));
+    decisions.push(await reconcileAgentSendStartupRecord(source[index], {
+      ...options,
+      codexCausalUpperBoundaryOffset:
+        nextCodexBoundaryOffset(source[index], allRecords),
+    }));
   }
   return decisions;
 }

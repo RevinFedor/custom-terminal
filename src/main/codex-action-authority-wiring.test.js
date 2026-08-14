@@ -262,6 +262,13 @@ test('history mutation affordances consume one action-specific runtime verdict a
   assert.match(timelineSource, /historyActionSnapshot\?\.canRewriteHistory !== true/);
   assert.match(timelineSource, /historyActionSnapshot\?\.canDeleteHistory !== true/);
   assert.match(timelineSource, /isTabAiBusy \|\| isTurnBusy \|\| lifecycleBlocksHistoryAction/);
+  assert.doesNotMatch(
+    timelineSource,
+    /supportsDeleteRangeActions && !historyDeleteUiBlocked/,
+    'busy history mutations stay visible as disabled actions instead of disappearing',
+  );
+  assert.match(timelineSource, /disabled=\{historyDeleteUiBlocked\}/);
+  assert.match(timelineSource, /title=\{historyDeleteUiBlocked \? historyMutationBlockedMessage : undefined\}/);
 });
 
 test('startup completion retains the Resume read lease and post-Enter barrier until adoption', () => {

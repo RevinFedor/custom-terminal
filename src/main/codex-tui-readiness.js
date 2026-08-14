@@ -21,10 +21,11 @@ const CODEX_LEADING_COMPOSER_PROMPT_RE = new RegExp(
   `^[\\t ]*(?:${CODEX_COMPOSER_PROMPT_ALTERNATION})(?=\\s|$)\\s*`,
   'u',
 );
-const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Full Access|Find and fix a bug|Explain this codebase|Ask Codex|Context \d+%|directory:\s*|permissions:\s*|Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed|Try\s+new\s+model|Use\s+existing\s+model/i;
-const CODEX_COMPOSER_STATUS_PREFIX_RE = /^([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?\s+·\s+(.+)$/i;
-const CODEX_COMPOSER_FULL_ACCESS_TAIL_RE = /^Full Access(?:\s+·\s+Context\s+\d+%(?:\s+used)?)?(?:\s+·\s+weekly\s+\d+%\s+left)?(?:\s+Goal achieved\s+\([0-9hms ]+\))?$/i;
-const CODEX_COMPOSER_CWD_TAIL_RE = /^(?:\/?~\/|\/|[a-z]:\\|\\\\)\S.*$/i;
+const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Find and fix a bug|Explain this codebase|Ask Codex|directory:\s*|permissions:\s*|Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed|Try\s+new\s+model|Use\s+existing\s+model/i;
+// Only the stable prefix belongs to the settings contract. Everything after
+// the separator is presentation owned by Codex (`Full Access`, Context, cwd,
+// Goal achieved, or a future replacement) and must not gate readiness.
+const CODEX_COMPOSER_STATUS_PREFIX_RE = /^([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?=\s*(?:·|$))(?:\s*·(?:\s+.*)?)?$/i;
 const CODEX_MCP_STARTUP_STATUS_ANCHOR_RE = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|MCP\s+servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)|servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)/i;
 const CODEX_LIVE_INTERRUPT_FOOTER_RE = /esc\s+to\s+interrupt/i;
 
@@ -49,9 +50,10 @@ function stripLeadingCodexComposerPromptGlyph(text) {
 
 /**
  * Parse the status row owned by the current Codex composer. Codex normally
- * renders the access/context form, but a fresh empty conversation can render
- * the working directory instead. Callers still own current-frame/generation
- * proof; this helper only recognizes the canonical row in that frame.
+ * renders additional access/context/cwd text after the model and effort, but
+ * that tail is decorative and changes with viewport width and TUI versions.
+ * Callers still own current-frame/generation proof; this helper recognizes only
+ * the stable, anchored model + effort (+ optional fast) prefix in that frame.
  */
 function parseCodexVerifiedComposerFooter(frameText) {
   const clean = String(frameText || '')
@@ -72,11 +74,6 @@ function parseCodexVerifiedComposerFooter(frameText) {
   if (!footer) return null;
   const match = footer.match(CODEX_COMPOSER_STATUS_PREFIX_RE);
   if (!match) return null;
-  const tail = String(match[4] || '').trim();
-  if (!CODEX_COMPOSER_FULL_ACCESS_TAIL_RE.test(tail)
-    && !CODEX_COMPOSER_CWD_TAIL_RE.test(tail)) {
-    return null;
-  }
   const model = String(match[1] || '').trim();
   const effort = String(match[2] || '').trim().toLowerCase();
   if (!model || model.toLowerCase() === 'default' || !effort || effort === 'default') {

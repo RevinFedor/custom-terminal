@@ -15,6 +15,7 @@ const {
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const {
   reconcileAgentSendStartupRecord,
+  reconcileAgentSendStartupRecords,
 } = require('./agent-send-startup-reconcile');
 
 function claudeUser(uuid, text, sessionId = 'claude-session') {
@@ -137,6 +138,76 @@ test('one allowlisted canonical Codex record produces promotable audit data', as
   assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
 });
 
+test('startup reconciliation accepts only the declared Codex CRLF to double-LF materialization', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-codex-crlf-');
+  const transcriptPath = path.join(dir, 'codex.jsonl');
+  const expected = 'first line\r\nsecond line';
+  const materialized = 'first line\n\nsecond line';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await codexBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(codexUser(materialized)) + '\n',
+  );
+
+  const source = unresolvedRecord('codex', boundary, expected);
+  const result = await reconcileAgentSendStartupRecord(source);
+  assert.equal(result.decision, 'found');
+  assert.equal(result.reason, 'codex_pty_crlf_materialized_as_double_lf');
+  assert.equal(result.audit.expectedHash, source.promptHash);
+  assert.notEqual(result.audit.actualHash, source.promptHash);
+  assert.equal(result.audit.canonicalReason, 'codex_pty_crlf_materialized_as_double_lf');
+  assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
+});
+
+test('legacy Codex receipt recovers its exact writer session from its own pre-Enter boundary', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-codex-legacy-session-');
+  const transcriptPath = path.join(dir, 'codex.jsonl');
+  const expected = 'legacy first line\r\nlegacy second line';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await codexBoundary(transcriptPath, 'legacy-writer-session');
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(codexUser('legacy first line\n\nlegacy second line')) + '\n',
+  );
+
+  const source = unresolvedRecord('codex', boundary, expected, { sessionId: null });
+  const result = await reconcileAgentSendStartupRecord(source);
+  assert.equal(result.decision, 'found');
+  assert.equal(result.reason, 'codex_pty_crlf_materialized_as_double_lf');
+  assert.equal(result.audit.sessionId, 'legacy-writer-session');
+  assert.equal(result.audit.operationKey, source.operationKey);
+  assert.equal(result.audit.attemptId, source.attemptId);
+});
+
+test('legacy session recovery is Codex-only and conflicting identities fail closed', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-session-conflict-');
+  const transcriptPath = path.join(dir, 'codex.jsonl');
+  const prompt = 'exact session only';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await codexBoundary(transcriptPath, 'boundary-session');
+  await fs.promises.appendFile(transcriptPath, JSON.stringify(codexUser(prompt)) + '\n');
+
+  const conflict = await reconcileAgentSendStartupRecord(
+    unresolvedRecord('codex', boundary, prompt, { sessionId: 'foreign-session' }),
+  );
+  assert.equal(conflict.decision, 'unknown');
+  assert.equal(conflict.reason, 'transcript-boundary-foreign-session');
+
+  const claudeBoundary = {
+    available: true,
+    transcriptPath,
+    fileSize: 0,
+    endedWithNewline: true,
+    sessionId: 'boundary-session',
+  };
+  const claudeWithoutStoredSession = await reconcileAgentSendStartupRecord(
+    unresolvedRecord('claude', claudeBoundary, prompt, { sessionId: null }),
+  );
+  assert.equal(claudeWithoutStoredSession.decision, 'unknown');
+  assert.equal(claudeWithoutStoredSession.reason, 'receipt-identity-incomplete');
+});
+
 test('multiple exact post-boundary candidates remain unknown', async (t) => {
   const dir = await tempDir(t, 'agent-startup-ambiguous-');
   const transcriptPath = path.join(dir, 'claude.jsonl');
@@ -181,8 +252,92 @@ test('a partial post-boundary JSONL line remains unknown', async (t) => {
   assert.equal(result.reason, 'transcript-post-boundary-partial-line');
 });
 
-test('a complete post-boundary range larger than the read ceiling remains unknown', async (t) => {
+test('Codex startup accepts the nearest exact user message without reading hours of later tail', async (t) => {
   const dir = await tempDir(t, 'agent-startup-bounded-');
+  const transcriptPath = path.join(dir, 'codex.jsonl');
+  const prompt = 'bounded prompt';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await codexBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(codexUser(prompt)) + '\n'
+      + Array.from({ length: 8 }, (_, index) => JSON.stringify({
+        type: 'event_msg',
+        timestamp: `2026-08-06T10:01:${String(index).padStart(2, '0')}.000Z`,
+        payload: { type: 'agent_message', message: 'x'.repeat(256) },
+      })).join('\n')
+      + '\n',
+  );
+
+  const result = await reconcileAgentSendStartupRecord(
+    unresolvedRecord('codex', boundary, prompt),
+    { maxReadBytes: 256 },
+  );
+  assert.equal(result.decision, 'found');
+  assert.equal(result.reason, 'exact-post-boundary-candidate');
+  assert.equal(result.evidence.rangeComplete, false);
+  assert.ok(result.evidence.postBoundaryBytes > result.evidence.bytesRead);
+});
+
+test('Codex startup never uses a later identical prompt when the nearest user message differs', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-causal-first-');
+  const transcriptPath = path.join(dir, 'codex.jsonl');
+  const prompt = 'do not steal a later prompt';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await codexBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(codexUser('different earlier operation')) + '\n'
+      + JSON.stringify(codexUser(prompt)) + '\n',
+  );
+
+  const result = await reconcileAgentSendStartupRecord(
+    unresolvedRecord('codex', boundary, prompt),
+  );
+  assert.equal(result.decision, 'unknown');
+  assert.equal(result.reason, 'first-post-boundary-user-message-mismatch');
+});
+
+test('a later durable send boundary closes the exact causal range for an older Codex receipt', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-causal-upper-');
+  const transcriptPath = path.join(dir, 'codex.jsonl');
+  const firstPrompt = 'first durable operation';
+  const secondPrompt = 'second durable operation';
+  await fs.promises.writeFile(transcriptPath, '');
+  const firstBoundary = await codexBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(codexUser('late record from an earlier operation')) + '\n'
+      + JSON.stringify(codexUser(firstPrompt)) + '\n',
+  );
+  const secondBoundary = await codexBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(codexUser(secondPrompt)) + '\n',
+  );
+
+  const first = unresolvedRecord('codex', firstBoundary, firstPrompt, {
+    operationKey: 'history:tab-a:first',
+    attemptId: 'attempt-first',
+  });
+  const second = unresolvedRecord('codex', secondBoundary, secondPrompt, {
+    operationKey: 'history:tab-a:second',
+    attemptId: 'attempt-second',
+    state: 'confirmed',
+  });
+  const [result] = await reconcileAgentSendStartupRecords([first], {
+    allRecords: [first, second],
+  });
+  assert.equal(result.decision, 'found');
+  assert.equal(result.reason, 'exact-post-boundary-candidate');
+  assert.equal(result.evidence.causalUpperBoundaryOffset, secondBoundary.fileSize);
+  assert.equal(result.evidence.rangeComplete, true);
+  assert.equal(result.evidence.candidateCount, 2);
+  assert.equal(result.evidence.matchCount, 1);
+});
+
+test('Codex startup stays unknown when no complete causal record fits the read ceiling', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-bounded-no-line-');
   const transcriptPath = path.join(dir, 'codex.jsonl');
   const prompt = 'bounded prompt';
   await fs.promises.writeFile(transcriptPath, '');
@@ -198,8 +353,8 @@ test('a complete post-boundary range larger than the read ceiling remains unknow
     { maxReadBytes: 64 },
   );
   assert.equal(result.decision, 'unknown');
-  assert.equal(result.reason, 'transcript-post-boundary-range-truncated');
-  assert.ok(result.postBoundaryBytes > result.maxReadBytes);
+  assert.equal(result.reason, 'no-user-message-in-bounded-causal-prefix');
+  assert.equal(result.evidence.rangeComplete, false);
 });
 
 test('an unreadable exact transcript remains unknown', async (t) => {

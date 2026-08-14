@@ -8,6 +8,7 @@ import {
   reconcileCommittedHistoryLiveProjection,
   reconcileHistoryLiveToolResults,
   reduceHistoryLiveProjection,
+  shouldIncludeHistoryLiveUserText,
 } from './historyLiveProjection.mjs';
 
 const envelope = (message, timestamp = '2026-07-24T11:00:00.000Z') => ({
@@ -230,6 +231,107 @@ test('a promoted sent prompt moves before the live answer of its own turn', () =
   );
 });
 
+test('confirmed Codex prompt follows preceding live compact by exact rollout order', () => {
+  const currentPrompt = {
+    uuid: 'durable-current-prompt',
+    role: 'user',
+    sourceIdentity: 'codex-user-source-session-a-100',
+    sessionId: 'session-a',
+  };
+  const sentPrompt = {
+    uuid: 'local-prompt-next',
+    role: 'queued',
+    queueStatus: 'sent',
+    statusAtSend: 'busy',
+    sourceIdentity: 'codex-user-source-session-a-400',
+    sessionId: 'session-a',
+    content: 'Next question',
+  };
+  const queuedAfter = {
+    uuid: 'local-prompt-after',
+    role: 'queued',
+    queueStatus: 'queued',
+    statusAtSend: 'busy',
+    sessionId: 'session-a',
+    content: 'Later question',
+  };
+  const previousAnswer = {
+    uuid: 'live-previous-answer',
+    role: 'assistant',
+    sourceIdentity: 'codex-assistant-source-session-a-200',
+    sessionId: 'session-a',
+  };
+  const compact = {
+    uuid: 'live-compact',
+    role: 'compact',
+    sourceIdentity: 'codex-compact-source-session-a-300',
+    sessionId: 'session-a',
+    content: 'Conversation compacted',
+  };
+  const nextAnswer = {
+    uuid: 'live-next-answer',
+    role: 'assistant',
+    sourceIdentity: 'codex-assistant-source-session-a-500',
+    sessionId: 'session-a',
+  };
+
+  assert.deepEqual(
+    buildHistoryLivePresentation(
+      [currentPrompt, sentPrompt, queuedAfter],
+      [previousAnswer, compact, nextAnswer],
+    ).map((entry) => entry.uuid),
+    [
+      'durable-current-prompt',
+      'live-previous-answer',
+      'live-compact',
+      'local-prompt-next',
+      'live-next-answer',
+      'local-prompt-after',
+    ],
+  );
+});
+
+test('lightweight live compact hands off to the durable compact by exact source', () => {
+  const sourceIdentity = 'codex-compact-source-session-a-300';
+  const detail = {
+    type: 'history_entry',
+    toolType: 'codex',
+    sessionId: 'session-a',
+    timestamp: '2026-08-14T14:28:19.270Z',
+    entry: {
+      uuid: 'codex-live-compact',
+      role: 'compact',
+      sourceIdentity,
+      content: 'Conversation compacted',
+    },
+  };
+  const live = reduceHistoryLiveProjection([], detail);
+  assert.deepEqual(live, [{
+    uuid: 'codex-live-compact',
+    role: 'compact',
+    sourceIdentity,
+    content: 'Conversation compacted',
+    timestamp: '2026-08-14T14:28:19.270Z',
+    sessionId: 'session-a',
+  }]);
+
+  const durable = [{
+    uuid: 'codex-compact-session-a-42',
+    role: 'compact',
+    sourceIdentity,
+    content: 'Conversation compacted',
+    compactSummary: 'large durable summary',
+    timestamp: '2026-08-14T14:28:19.270Z',
+    sessionId: 'session-a',
+  }];
+  assert.strictEqual(buildHistoryLivePresentation(durable, live), durable);
+  assert.deepEqual(reconcileCommittedHistoryLiveProjection(live, durable).entries, []);
+  assert.equal(
+    historyLivePresentationKey(live[0]),
+    historyLivePresentationKey(durable[0]),
+  );
+});
+
 test('ordinary user text is omitted by default and can be explicitly included', () => {
   const input = envelope(canonical('user-1', 'user', [
     { type: 'text', text: 'queued prompt' },
@@ -247,6 +349,70 @@ test('ordinary user text is omitted by default and can be explicitly included', 
       sessionId: 'session-a',
     }],
   );
+});
+
+test('manual Codex xterm user row is included while an exact History handoff keeps local ownership', () => {
+  const liveUser = {
+    tabId: 'tab-codex',
+    toolType: 'codex',
+    sessionId: 'session-a',
+    timestamp: '2026-08-07T16:00:00.000Z',
+    message: canonical('codex-live-user', 'user', [
+      { type: 'text', text: 'SAME TEXT' },
+    ], {
+      sourceIdentity: 'codex-user-source-session-a-2048',
+    }),
+  };
+  const localHandoffs = [{
+    handoffId: 'history-handoff',
+    text: 'SAME TEXT',
+  }];
+
+  assert.equal(shouldIncludeHistoryLiveUserText({
+    toolType: 'codex',
+    envelope: liveUser,
+    localHandoffs,
+  }), true, 'equal text is not an ownership proof');
+  assert.equal(shouldIncludeHistoryLiveUserText({
+    toolType: 'codex',
+    envelope: {
+      ...liveUser,
+      promptOwner: { handoffId: 'history-handoff' },
+    },
+    localHandoffs,
+  }), false, 'exact handoff keeps the optimistic History row');
+});
+
+test('manual Codex live user hands off to its durable row by exact rollout identity', () => {
+  const sourceIdentity = 'codex-user-source-session-a-2048';
+  const live = reduceHistoryLiveProjection([], {
+    tabId: 'tab-codex',
+    toolType: 'codex',
+    sessionId: 'session-a',
+    timestamp: '2026-08-07T16:00:00.000Z',
+    message: canonical('codex-live-user', 'user', [
+      { type: 'text', text: 'Manual terminal prompt' },
+    ], { sourceIdentity }),
+  }, { includeUserText: true });
+  assert.deepEqual(live, [{
+    uuid: 'codex-live-user',
+    sourceIdentity,
+    role: 'user',
+    timestamp: '2026-08-07T16:00:00.000Z',
+    content: 'Manual terminal prompt',
+    sessionId: 'session-a',
+  }]);
+
+  const durable = [{
+    uuid: 'codex-user-session-a-17',
+    sourceIdentity,
+    role: 'user',
+    timestamp: '2026-08-07T16:00:00.000Z',
+    content: 'Manual terminal prompt',
+    sessionId: 'session-a',
+  }];
+  assert.strictEqual(buildHistoryLivePresentation(durable, live), durable);
+  assert.deepEqual(reconcileCommittedHistoryLiveProjection(live, durable).entries, []);
 });
 
 test('assistant text, thinking, and tool calls project to one FullHistory-like entry', () => {

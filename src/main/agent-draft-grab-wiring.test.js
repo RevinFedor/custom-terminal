@@ -31,16 +31,28 @@ const codexRuntimeSource = fs.readFileSync(
   path.join(__dirname, '../renderer/utils/historyAgentRuntimes.ts'),
   'utf8',
 );
+const appSource = fs.readFileSync(
+  path.join(__dirname, '../renderer/App.tsx'),
+  'utf8',
+);
+const terminalRegistrySource = fs.readFileSync(
+  path.join(__dirname, '../renderer/utils/terminalRegistry.ts'),
+  'utf8',
+);
+const contradictionToastSource = fs.readFileSync(
+  path.join(__dirname, '../renderer/utils/agentDraftContradictionToast.mjs'),
+  'utf8',
+);
 
 test('shared send passes the exact screen proof into the Ctrl+G request', () => {
   assert.match(
     scenarioSource,
-    /runtime\.grabDraft\(tabId,\s*\{\s*draftProof:\s*buildExactDraftCaptureProof\(visual\)/,
+    /runtime\.grabDraft\(tabId,\s*\{\s*draftProof:\s*buildDraftCaptureProof\(tabId, visual\)/,
     'the grab must carry the exact proof that it is trying to disprove',
   );
   assert.match(
     scenarioSource,
-    /runtime\.copyDraft\(tabId,\s*\{\s*draftProof:\s*buildExactDraftCaptureProof\(visual\)/,
+    /runtime\.copyDraft\(tabId,\s*\{\s*draftProof:\s*buildDraftCaptureProof\(tabId, visual\)/,
     'project-owned sends must inspect without removing a real terminal draft',
   );
   for (const field of [
@@ -59,6 +71,43 @@ test('shared send passes the exact screen proof into the Ctrl+G request', () => 
     );
     assert.match(helperSource, new RegExp(field + ':\\s*proof\\?\\.' + field));
   }
+  assert.match(
+    scenarioSource,
+    /terminalRegistry\.getDraftDiagnosticSnapshot\(tabId,[\s\S]{0,220}promptRow:[\s\S]{0,120}cursorRow:/,
+    'the proof must carry a bounded snapshot of the renderer xterm from the same pre-grab moment',
+  );
+  assert.match(
+    mainSource,
+    /\[AgentDraftProof:CONTRADICTION\][\s\S]{0,500}parity=[\s\S]{0,500}rendererBefore=[\s\S]{0,500}headlessBefore=/,
+    'a contradiction must log both screens and whether their write boundary is comparable',
+  );
+});
+
+test('a contradiction records painted renderer evidence after visibility and resize settle', () => {
+  assert.match(
+    mainSource,
+    /requestAgentDraftScreenDiagnostic\([\s\S]{0,180}'ctrl-g-empty-after-screen-found'/,
+    'the contradiction must arm a renderer/headless follow-up instead of relying on a hidden preflight frame',
+  );
+  assert.match(
+    appSource,
+    /const handleTerminalDraftScreenDiagnosticRequest[\s\S]{0,2200}waitForPaintedDraftScreenDiagnostic/,
+    'the renderer must wait for a painted, stable boundary before returning its follow-up',
+  );
+  assert.match(
+    terminalRegistrySource,
+    /painted:\s*hiddenBy === null[\s\S]{0,300}layerPresented:/,
+    'renderer evidence must say whether the xterm was actually painted, not merely mounted',
+  );
+  assert.match(
+    mainSource,
+    /\[AgentDraftProof:SCREEN_FOLLOWUP\][\s\S]{0,700}parity=[\s\S]{0,700}renderer=[\s\S]{0,700}headless=/,
+  );
+  assert.match(
+    mainSource,
+    /capturePage\([\s\S]{0,700}\[AgentDraftProof:SCREEN_ARTIFACT\]/,
+    'the stable visible frame must leave a bounded screenshot artifact for pixel-level verification',
+  );
 });
 
 test('missing active prompt escalates only from a current idle frame and is rechecked before Ctrl+G', () => {
@@ -110,7 +159,7 @@ test('an exact empty capture replaces the stale screen-unknown decision', () => 
 test('History composer carries the same exact proof into its ownership-changing grab', () => {
   assert.match(
     historyPanelSource,
-    /runtime\.grabDraft\(tabId, draftState \? \{\s*draftProof:\s*buildExactDraftCaptureProof\(draftState\)/,
+    /runtime\.grabDraft\(tabId, draftState \? \{\s*draftProof:\s*buildExactDraftCaptureProof\([\s\S]{0,220}draftState,[\s\S]{0,220}getDraftDiagnosticSnapshot\(tabId/,
   );
   assert.match(
     historyPanelSource,
@@ -181,6 +230,11 @@ test('Ctrl+G owns the shared PTY write boundary and advances input identity exac
       && postReservationIdentity < publicCapture,
     'the pre-Ctrl+G proof identity and post-reservation capture identity must remain separate',
   );
+  assert.match(
+    mainSource,
+    /const inputRevisionTransitionOwned\s*=\s*validateAgentExactCaptureInputTransition\(pending\)[\s\S]{0,1800}inputRevisionTransition:\s*'ctrl-g-exact-capture'[\s\S]{0,220}screenProofInputRevision:/,
+    'main must attest its own exact pre-proof → Ctrl+G revision transition',
+  );
 });
 
 test('Codex Rewind uses the already-owned capture boundary instead of nesting the PTY lock', () => {
@@ -203,13 +257,36 @@ test('every external-editor capture holds PTY ownership until the agent TUI retu
     'the return waiter must be armed before helper acknowledgement can let the TUI resume');
   assert.match(
     mainSource,
-    /exactEmptyProven = exactEmpty\s*&&\s*!!contradiction\s*&&\s*identityStable\s*&&\s*editorReturn\?\.ready === true/,
+    /exactEmptyProven = exactEmpty\s*&&\s*!!contradiction\s*&&\s*identityStable\s*&&\s*inputRevisionTransitionOwned\s*&&\s*editorReturn\?\.ready === true/,
+  );
+  assert.match(
+    mainSource,
+    /waitForAgentEditorReturnReady[\s\S]{0,900}waitForHeadlessSynchronizedOutputClose/,
+    'Claude return is usable only after the raw frame is parsed and flushed by the headless xterm',
+  );
+  assert.match(
+    mainSource,
+    /waitForAgentEditorReturnReady[\s\S]{0,1400}afterWriteSeq:\s*captureIdentity\?\.mirrorWriteSeq/,
+    'the flushed frame must be newer than the frame captured before Ctrl+G',
   );
   assert.match(
     mainSource,
     /success: editorReturn\?\.ready === true,[\s\S]{0,120}external_editor_return_unconfirmed/,
     'a timeout is unknown/failure, never permission to continue writing',
   );
+});
+
+test('a resolved screen contradiction remains visible as one closeable tab-scoped error', () => {
+  assert.match(
+    scenarioSource,
+    /conflict\.decision === 'clear'[\s\S]{0,300}showAgentDraftScreenContradictionToast\(useUIStore\.getState\(\)/,
+  );
+  assert.match(
+    historyPanelSource,
+    /conflict\.decision !== 'clear'[\s\S]{0,300}showAgentDraftScreenContradictionToast\(useUIStore\.getState\(\)/,
+  );
+  assert.match(contradictionToastSource, /'error'[\s\S]{0,80}true/);
+  assert.match(contradictionToastSource, /toast\?\.tabId === exactTabId/);
 });
 
 test('ownership-changing grab cannot share an in-flight result with non-destructive copy', () => {

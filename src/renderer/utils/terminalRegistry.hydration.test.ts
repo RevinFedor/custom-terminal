@@ -102,3 +102,40 @@ test('an OSC boundary in the live tail is registered while snapshot writes are q
   terminalRegistry.unregister(tabId);
   terminal.dispose();
 });
+
+test('draft diagnostics bind visible rows to the renderer write generation', async () => {
+  (globalThis as any).window = globalThis;
+  const { terminalRegistry } = await import('./terminalRegistry.ts');
+  const tabId = 'terminal-draft-diagnostic-boundary-test';
+  const terminal = new HeadlessTerminal({
+    cols: 40,
+    rows: 4,
+    scrollback: 100,
+    allowProposedApi: true,
+  });
+  await new Promise<void>((resolve) => {
+    terminal.write('old-row\r\n\u276f visible-tail', resolve);
+  });
+  terminalRegistry.register(tabId, terminal as any);
+  terminalRegistry.markRendererWriteFlushed(tabId, terminal as any, {
+    writeSeq: 73,
+    generation: 'generation-73',
+    generationOrdinal: 9,
+  });
+
+  const snapshot = terminalRegistry.getDraftDiagnosticSnapshot(tabId, {
+    cursorRow: terminal.buffer.active.baseY + terminal.buffer.active.cursorY,
+  });
+  assert.equal(snapshot.success, true);
+  assert.equal(snapshot.rendererWriteSeq, 73);
+  assert.equal(snapshot.rendererGeneration, 'generation-73');
+  assert.equal(snapshot.rendererGenerationOrdinal, 9);
+  assert.ok(snapshot.rendererInstanceId);
+  assert.equal(
+    snapshot.lines?.some((line) => line.text.includes('\u276f visible-tail')),
+    true,
+  );
+
+  terminalRegistry.unregister(tabId);
+  terminal.dispose();
+});

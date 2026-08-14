@@ -6,7 +6,9 @@ import { useWorkspaceStore, type TabColor, type TabGroup } from '../../store/use
 import { useUIStore } from '../../store/useUIStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
+import { resolveRunAfterTabStatus } from '../../utils/runAfterTabStatus.mjs';
 import ControlHint from '../UI/ControlHint';
+import { TabProcessBar, TabStatusMarker } from './TabSignals';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -93,6 +95,18 @@ export type RunAfterTabPickerProps = {
   title?: string;
   emptyLabel?: string;
   showAllTabsOnOpen?: boolean;
+  /**
+   * Run after only. Two OPPOSITE contracts for two neighbouring controls:
+   *   • the show-all counter resets to off on every open — it answers "show me
+   *     more right now", a one-off action;
+   *   • the selected project persists in the DB and changes ONLY when a chip is
+   *     clicked — it answers "I work over here", a standing context. It used to
+   *     be re-derived on open, so moving to another project silently changed
+   *     the user's choice.
+   * The same picker serves Link File / Restart after / Git, which must keep
+   * their current behaviour — hence a flag from the caller, not a hardcode.
+   */
+  persistProjectSelection?: boolean;
   triggerVariant?: 'pill' | 'context-row';
   triggerLabel?: string;
   triggerIcon?: ReactNode;
@@ -282,6 +296,7 @@ export function RunAfterTabPicker({
   title = 'Run after - pick a tab',
   emptyLabel = 'on tab',
   showAllTabsOnOpen = false,
+  persistProjectSelection = false,
   triggerVariant = 'pill',
   triggerLabel = 'Run after',
   triggerIcon = null,
@@ -304,9 +319,6 @@ export function RunAfterTabPicker({
 }: RunAfterTabPickerProps) {
   const toggleTabGroupCollapsed = useWorkspaceStore((state) => state.toggleTabGroupCollapsed);
   const sessionStatuses = useUIStore((state) => state.sessionStatuses);
-  const statusMarkerShape = useUIStore((state) => state.statusMarker.shape);
-  const statusMarkerSize = useUIStore((state) => state.statusMarker.sizePx);
-  const processBarPosition = useUIStore((state) => state.processBar.position);
   const tabGeo = useUIStore((state) => state.tabGeometry);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
   const selectedInputIds = useMemo(() => {
@@ -404,19 +416,23 @@ export function RunAfterTabPicker({
   }, [fingerprint, ownerProjectIdProp, tabId, selectedInputKey]);
 
   const [busyMap, setBusyMap] = useState<Map<string, boolean>>(() => getBusyTabsSnapshot());
+  // Which tabs are working right now, app-wide. A STRING, not a Set: a selector
+  // that builds a collection allocates a new one on every store write and would
+  // re-render this menu constantly (the fingerprint rule above does the same).
+  const storeBusyKey = useWorkspaceStore((state) => {
+    const ids: string[] = [];
+    for (const ws of state.openProjects.values()) {
+      for (const t of ws.tabs.values()) if (t.aiBusy) ids.push(t.id);
+    }
+    return ids.join('|');
+  });
+  const storeBusyIds = useMemo(
+    () => new Set(storeBusyKey ? storeBusyKey.split('|') : []),
+    [storeBusyKey],
+  );
   const inheritedBusyTabIds = useOrchestrationStore((state) => state.inheritedBusyTabIds);
   useEffect(() => {
     setBusyMap(getBusyTabsSnapshot());
-
-    const isNonClaudePtyAiTab = (tid: string): boolean => {
-      const state = useWorkspaceStore.getState();
-      for (const ws of state.openProjects.values()) {
-        const tab = ws.tabs.get(tid);
-        if (!tab) continue;
-        return tab.commandType === 'codex' || tab.commandType === 'gemini';
-      }
-      return false;
-    };
 
     const apply = (tid: string, busy: boolean) =>
       setBusyMap((prev) => {
@@ -427,7 +443,7 @@ export function RunAfterTabPicker({
       });
 
     const handleClaudeBusy = (_: unknown, { tabId: tid, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
-      if (reason === 'spinner' && isNonClaudePtyAiTab(tid)) return;
+      if (reason === 'spinner') return;
       apply(tid, busy);
     };
     const handleGeminiBusy = (_: unknown, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
@@ -444,7 +460,14 @@ export function RunAfterTabPicker({
   }, []);
 
   const [open, setOpen] = useState(false);
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const persistedPickerProjectId = useUIStore((state) => state.runAfterPickerProjectId);
+  const setPersistedPickerProjectId = useUIStore((state) => state.setRunAfterPickerProjectId);
+  const [localSelectedProjectId, setLocalSelectedProjectId] = useState<string | null>(null);
+  const selectedProjectId = persistProjectSelection ? persistedPickerProjectId : localSelectedProjectId;
+  const setSelectedProjectId = useCallback((projectId: string | null) => {
+    if (persistProjectSelection) setPersistedPickerProjectId(projectId);
+    else setLocalSelectedProjectId(projectId);
+  }, [persistProjectSelection, setPersistedPickerProjectId]);
   const [showAllTabs, setShowAllTabs] = useState(showAllTabsOnOpen);
   const [countHover, setCountHover] = useState(false);
   const [triggerHover, setTriggerHover] = useState(false);
@@ -471,10 +494,12 @@ export function RunAfterTabPicker({
   }, [portalContainer]);
 
   useEffect(() => {
+    // Only a project that no longer exists may be replaced. A remembered choice
+    // that is still open stays selected — that is the whole contract.
     const exists = selectedProjectId && inventory.groups.some((g) => g.projectId === selectedProjectId);
     if (exists) return;
     setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
-  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, selectedProjectId]);
+  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, selectedProjectId, setSelectedProjectId]);
 
   useEffect(() => {
     if (!open) return;
@@ -539,10 +564,14 @@ export function RunAfterTabPicker({
     setAnchor({
       ...nextAnchor,
     });
-    setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
+    // The counter always reopens off; the project keeps whatever the user
+    // last picked (the effect above still rescues a project that closed).
+    if (!persistProjectSelection) {
+      setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
+    }
     setShowAllTabs(showAllTabsOnOpen);
     setOpen(true);
-  }, [externalTriggerRef, inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, menuWidth, panelRef, showAllTabsOnOpen, side, triggerRef, triggerVariant]);
+  }, [externalTriggerRef, inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, menuWidth, panelRef, persistProjectSelection, setSelectedProjectId, showAllTabsOnOpen, side, triggerRef, triggerVariant]);
 
   useEffect(() => {
     if (!openRequestKey) return;
@@ -569,13 +598,18 @@ export function RunAfterTabPicker({
   }, []);
 
   const selectedIdSet = useMemo(() => new Set(selectedInputIds), [selectedInputKey]);
-  const statusFor = (id: string): TabRuntimeStatus => {
-    if (busyMap.get(id) === true) return 'busy';
-    if (inheritedBusyTabIds.has(id)) return 'inherited';
-    if (waitingTabIds?.has(id)) return 'waiting';
-    if (waitingTabIds && selectedIdSet.has(id) && !busyMap.has(id)) return 'waiting';
-    return 'idle';
-  };
+  // The rule itself lives in utils/runAfterTabStatus.mjs — this menu is a
+  // portal that only exists while open, which made the rule impossible to test
+  // where it stood, and it was wrong in exactly the way that only shows up if
+  // you catch the app mid-turn.
+  const statusFor = (id: string): TabRuntimeStatus => resolveRunAfterTabStatus({
+    tabId: id,
+    queueBusy: busyMap,
+    storeBusy: storeBusyIds,
+    inheritedBusy: inheritedBusyTabIds,
+    waiting: waitingTabIds ?? null,
+    selected: selectedIdSet,
+  }) as TabRuntimeStatus;
 
   const allAiTabs = useMemo(() => inventory.groups.flatMap((g) => g.tabs), [inventory.groups]);
   const selectedTabs = useMemo(() => selectedInputIds
@@ -611,7 +645,10 @@ export function RunAfterTabPicker({
   const isVisibleTab = useCallback((t: AiTab) => {
     if (t.id === tabId) return false;
     return showAllTabs || statusFor(t.id) !== 'idle' || selectedIdSet.has(t.id);
-  }, [showAllTabs, tabId, busyMap, inheritedBusyTabIds, selectedIdSet, waitingTabIds]);
+    // storeBusyIds belongs here too: this filter decides which rows are shown
+    // at all, so a tab that only the store knows to be working would otherwise
+    // stay hidden in the short list until something else re-rendered the menu.
+  }, [showAllTabs, tabId, busyMap, storeBusyIds, inheritedBusyTabIds, selectedIdSet, waitingTabIds]);
   const visibleRows = useMemo(() => {
     if (!selectedProject) return [];
     const rows: PickerRow[] = [];
@@ -787,26 +824,14 @@ export function RunAfterTabPicker({
         overflow: 'hidden',
       }}
     >
-      {(selectedStatus === 'busy' || selectedStatus === 'inherited') && (
-        <span
-          className="tab-process-bar-static"
-          style={{
-            position: 'absolute',
-            ...(processBarPosition === 'right' ? { right: 0 } : { left: 0 }),
-            top: 0,
-            bottom: 0,
-            width: 3,
-            pointerEvents: 'none',
-            zIndex: 1,
-            overflow: 'hidden',
-            backgroundColor: selectedStatus === 'inherited'
-              ? 'var(--process-bar-inherited-color, #A855F7)'
-              : undefined,
-          }}
-        >
-          <span className={`tab-process-bar-ai-shimmer-overlay${selectedStatus === 'inherited' ? ' tab-process-bar-inherited-shimmer-overlay' : ''}`} />
-        </span>
-      )}
+      {/* Shared tab signal (TabSignals) — the trigger mirrors the state of the
+          tab it points at. */}
+      <TabProcessBar
+        hasProcess={false}
+        busy={selectedStatus === 'busy'}
+        inheritedBusy={selectedStatus === 'inherited'}
+        zIndex={1}
+      />
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0, flexShrink: 0 }}>
         {triggerIcon && (
           <span style={{ display: 'inline-flex', color: hasSelectedTarget ? accentColor : '#666', flexShrink: 0 }}>
@@ -991,9 +1016,6 @@ export function RunAfterTabPicker({
                       active={autoRun}
                       status={statusFor(row.tab.id)}
                       sessionStatuses={sessionStatuses}
-                      statusMarkerShape={statusMarkerShape}
-                      statusMarkerSize={statusMarkerSize}
-                      processBarPosition={processBarPosition}
                       tabGeo={tabGeo}
                       fontSize={tabsFontSize}
                       onClick={() => {
@@ -1014,9 +1036,6 @@ export function RunAfterTabPicker({
                     selectedTabIds={selectedIdSet}
                     statusFor={statusFor}
                     sessionStatuses={sessionStatuses}
-                    statusMarkerShape={statusMarkerShape}
-                    statusMarkerSize={statusMarkerSize}
-                    processBarPosition={processBarPosition}
                     tabGeo={tabGeo}
                     fontSize={tabsFontSize}
                     onToggle={() => toggleTabGroupCollapsed(selectedProject.projectId, row.group.id)}
@@ -1101,9 +1120,6 @@ function PickerGroupRow({
   selectedTabIds,
   statusFor,
   sessionStatuses,
-  statusMarkerShape,
-  statusMarkerSize,
-  processBarPosition,
   tabGeo,
   fontSize,
   onToggle,
@@ -1117,9 +1133,6 @@ function PickerGroupRow({
   selectedTabIds?: Set<string>;
   statusFor: (id: string) => TabRuntimeStatus;
   sessionStatuses: SessionStatusLike[];
-  statusMarkerShape: MarkerShape;
-  statusMarkerSize: number;
-  processBarPosition: ProcessBarPosition;
   tabGeo: PickerTabGeometry;
   fontSize: number;
   onToggle: () => void;
@@ -1164,23 +1177,7 @@ function PickerGroupRow({
         }}
         title={collapsed ? 'Expand group' : 'Collapse group'}
       >
-        {statusMeta && (
-          <span
-            title={statusMeta.label}
-            style={{
-              position: 'absolute',
-              left: 5,
-              top: 'calc(50% + 1px)',
-              transform: 'translateY(-50%)',
-              width: statusMarkerSize,
-              height: statusMarkerSize,
-              borderRadius: statusMarkerShape === 'square' ? 2 : '50%',
-              backgroundColor: statusMeta.color,
-              border: '1px solid rgba(0,0,0,0.4)',
-              pointerEvents: 'none',
-            }}
-          />
-        )}
+        <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} />
         <span
           style={{
             position: 'relative',
@@ -1237,9 +1234,6 @@ function PickerGroupRow({
                 active={active}
                 status={statusFor(tab.id)}
                 sessionStatuses={sessionStatuses}
-                statusMarkerShape={statusMarkerShape}
-                statusMarkerSize={statusMarkerSize}
-                processBarPosition={processBarPosition}
                 tabGeo={tabGeo}
                 fontSize={fontSize}
                 onClick={() => onSelect(tab.id, isSelected)}
@@ -1258,9 +1252,6 @@ function PickerTabRow({
   active,
   status,
   sessionStatuses,
-  statusMarkerShape,
-  statusMarkerSize,
-  processBarPosition,
   tabGeo,
   fontSize,
   onClick,
@@ -1270,9 +1261,6 @@ function PickerTabRow({
   active: boolean;
   status: TabRuntimeStatus;
   sessionStatuses: SessionStatusLike[];
-  statusMarkerShape: MarkerShape;
-  statusMarkerSize: number;
-  processBarPosition: ProcessBarPosition;
   tabGeo: PickerTabGeometry;
   fontSize: number;
   onClick: () => void;
@@ -1286,6 +1274,10 @@ function PickerTabRow({
   return (
     <button
       type="button"
+      // Named so a test can ask "is the row for THIS tab showing it as
+      // working" — the exact question this list answered wrongly.
+      data-run-after-tab-row={tab.id}
+      data-run-after-tab-status={status}
       onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
@@ -1311,47 +1303,16 @@ function PickerTabRow({
       }}
       title={status === 'waiting' ? `${tab.name} - waiting for its Run after trigger` : tab.name}
     >
-      {(status === 'busy' || status === 'inherited') && (
-        <span
-          className="tab-process-bar-static"
-          style={{
-            position: 'absolute',
-            ...(processBarPosition === 'right' ? { right: 0 } : { left: 0 }),
-            top: 0,
-            bottom: 0,
-            width: 3,
-            pointerEvents: 'none',
-            zIndex: 2,
-            overflow: 'hidden',
-            backgroundColor: status === 'inherited'
-              ? 'var(--process-bar-inherited-color, #A855F7)'
-              : undefined,
-            ...(processBarPosition === 'right'
-              ? { borderTopRightRadius: tabGeo.borderRadius, borderBottomRightRadius: tabGeo.borderRadius }
-              : { borderTopLeftRadius: tabGeo.borderRadius, borderBottomLeftRadius: tabGeo.borderRadius }),
-          }}
-        >
-          <span className={`tab-process-bar-ai-shimmer-overlay${status === 'inherited' ? ' tab-process-bar-inherited-shimmer-overlay' : ''}`} />
-        </span>
-      )}
-      {statusMeta && (
-        <span
-          title={statusMeta.label}
-          style={{
-            position: 'absolute',
-            left: 5,
-            top: 'calc(50% + 1px)',
-            transform: 'translateY(-50%)',
-            width: statusMarkerSize,
-            height: statusMarkerSize,
-            borderRadius: statusMarkerShape === 'square' ? 2 : '50%',
-            backgroundColor: statusMeta.color,
-            border: '1px solid rgba(0,0,0,0.4)',
-            pointerEvents: 'none',
-            zIndex: 3,
-          }}
-        />
-      )}
+      {/* Shared tab signal (TabSignals) — same bar as the sidebar card. Here
+          'busy' and 'inherited' are two distinct states, never both. */}
+      <TabProcessBar
+        hasProcess={false}
+        busy={status === 'busy'}
+        inheritedBusy={status === 'inherited'}
+        radius={tabGeo.borderRadius}
+        zIndex={2}
+      />
+      <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} zIndex={3} />
       <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {tab.name}
       </span>

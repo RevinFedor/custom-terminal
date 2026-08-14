@@ -427,6 +427,15 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN visual_parent_tab_id TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
+    // When this tab was last ACTIVATED (ms epoch). Recency of tab visits must be
+    // a durable property of the tab itself, not an array in the session blob:
+    // Ctrl+Tab / Cmd+P order is global across projects, and the per-project
+    // visit list was rebuilt empty on every restart, so after a restart the
+    // switcher could only rank tabs of whatever project happened to be saved.
+    // NULL = never activated in a build that records this.
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN last_activated_at INTEGER DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
 
     // Project sidebar state
     try {
@@ -1710,6 +1719,10 @@ class DatabaseManager {
         restartAfterArmed: t.restart_after_armed === 1 || undefined,
         restartAfterPersistent: t.restart_after_persistent === 1 || undefined,
         contextPct: (t.context_pct ?? undefined),
+        // Durable tab-visit time — the switcher orders ALL tabs of ALL projects
+        // by this, so the order survives a restart even for projects whose
+        // per-session visit list is gone.
+        lastActivatedAt: Number(t.last_activated_at) || undefined,
         cacheStats: (() => {
           if (!t.cache_stats) return undefined;
           try { return JSON.parse(t.cache_stats); }
@@ -3482,6 +3495,18 @@ class DatabaseManager {
       for (const r of rows) contextPctSnapshot.set(r.tab_id, r.context_pct);
     }
 
+    // Same snapshot-preserve idea, for the tab-visit timestamp. The renderer
+    // sends `lastActivatedAt` on activation, but every OTHER saveTabs call
+    // (rename, colour, notes, reorder) omits it — without this snapshot a full
+    // reinsert would erase the visit order the switcher depends on.
+    // NEVER-DOWNGRADE: only a strictly newer timestamp may replace the stored
+    // one, so a stale payload cannot move a tab backwards in the MRU.
+    const lastActivatedSnapshot = new Map();
+    {
+      const rows = this.db.prepare('SELECT tab_id, last_activated_at FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL').all(projectId);
+      for (const r of rows) lastActivatedSnapshot.set(r.tab_id, r.last_activated_at);
+    }
+
     // Same snapshot-preserve as context_pct: the renderer's saveTabs payload does
     // not carry cacheStats (written point-wise via updateTabCacheStats), so a full
     // reinsert from an unrelated change must not wipe the cooldown chip's data.
@@ -3578,8 +3603,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats, last_activated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -3661,6 +3686,14 @@ class DatabaseManager {
           configFingerprint: tab.codexModelMigrationConfigFingerprint || null,
           configAlreadyTarget: tab.codexModelMigrationConfigAlreadyTarget === true,
         };
+        // Never-downgrade tab-visit time: keep whichever is newer. A payload
+        // without lastActivatedAt (rename/colour/reorder) keeps the stored one.
+        const incomingActivatedAt = Number(tab.lastActivatedAt);
+        const storedActivatedAt = Number(lastActivatedSnapshot.get(tab.tabId));
+        const lastActivatedAt = Math.max(
+          Number.isFinite(incomingActivatedAt) ? incomingActivatedAt : 0,
+          Number.isFinite(storedActivatedAt) ? storedActivatedAt : 0,
+        ) || null;
         const persistedCodexSettings = codexSettingsSnapshot.get(tab.tabId) || null;
         let codexSettings = persistedCodexSettings
           && (
@@ -3671,7 +3704,7 @@ class DatabaseManager {
           )
           ? persistedCodexSettings
           : incomingCodexSettings;
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, claudeSessionId, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, claudeSessionId, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson, lastActivatedAt);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set

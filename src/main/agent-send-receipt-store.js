@@ -375,7 +375,11 @@ class AgentSendReceiptStore {
       `),
       stageAttemptContext: this.db.prepare(`
         UPDATE ${TABLE_NAME}
-        SET receipt_json = @receiptJson,
+        SET session_id = CASE
+              WHEN @sessionId IS NULL THEN session_id
+              ELSE @sessionId
+            END,
+            receipt_json = @receiptJson,
             transcript_boundary_json = COALESCE(@transcriptBoundaryJson, transcript_boundary_json),
             updated_at = @updatedAt
         WHERE operation_key = @operationKey
@@ -708,17 +712,34 @@ class AgentSendReceiptStore {
           record,
         };
       }
+      const contextSessionId = optionalString(context.sessionId);
+      const boundarySessionId = optionalString(context.transcriptBoundary?.sessionId);
+      if (contextSessionId && boundarySessionId && contextSessionId !== boundarySessionId) {
+        return {
+          ok: false,
+          applied: false,
+          reason: 'attempt-context-session-boundary-mismatch',
+          record,
+        };
+      }
+      // The pre-Enter transcript boundary is the first exact writer identity.
+      // It intentionally replaces an earlier History/session hint (for example
+      // after Resume), while a first-turn send can remain unbound until its
+      // exact post-Enter transcript record is observed.
+      const exactTargetSessionId = boundarySessionId || contextSessionId || null;
       const receipt = {
         ...(record.receipt || {}),
         ...context,
         operationKey,
         attemptId,
+        sessionId: exactTargetSessionId || record.sessionId || null,
         status: STORE_STATES.IN_FLIGHT,
         submitted: false,
       };
       const info = this.statements.stageAttemptContext.run({
         operationKey,
         attemptId,
+        sessionId: exactTargetSessionId,
         receiptJson: encodeJson(receipt),
         transcriptBoundaryJson: encodeJson(context.transcriptBoundary),
         updatedAt: this.now(),

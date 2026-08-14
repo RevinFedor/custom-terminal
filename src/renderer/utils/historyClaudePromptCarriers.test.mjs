@@ -5,6 +5,7 @@ import {
   extractClaudeHistoryPromptCarrierText,
   hasClaudeHistoryLiveQueuePrompt,
   isClaudeHistoryPromptLocallyOwned,
+  isHistoryPromptLocallyOwned,
   reduceClaudeHistoryPromptCarrier,
 } from './historyClaudePromptCarriers.mjs';
 
@@ -201,4 +202,8 @@ test('exact handoff id or audited transcript UUID proves History ownership', () 
     uuid: 'history-user-uuid',
     message: { role: 'user', content: 'SAME TEXT' },
   }), handoffs), true);
+  assert.equal(isHistoryPromptLocallyOwned({
+    ...enqueue('SAME TEXT'),
+    promptOwner: { handoffId: 'history-handoff' },
+  }, handoffs), true);
 });

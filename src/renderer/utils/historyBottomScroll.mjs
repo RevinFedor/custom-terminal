@@ -38,6 +38,22 @@ export function isHistoryTailPinned(
   return distance <= threshold;
 }
 
+/**
+ * Content growth can move the physical bottom away from a tail-pinned reader
+ * before the follow scroll runs. That geometry change is not user intent.
+ * Only an explicit upward/drag gesture may turn following off; reaching the
+ * real bottom turns it back on.
+ */
+export function reconcileHistoryTailFollowIntent({
+  currentIntent,
+  physicalPinned,
+  userMovedAway = false,
+}) {
+  if (userMovedAway) return false;
+  if (physicalPinned) return true;
+  return currentIntent === true;
+}
+
 export function createHistoryTailPinScheduler({
   getScroller,
   requestFrame = globalThis.requestAnimationFrame,

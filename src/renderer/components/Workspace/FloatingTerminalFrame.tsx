@@ -3,6 +3,7 @@ import { SquareTerminal, X } from 'lucide-react';
 import ControlHint from '../UI/ControlHint';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { resolveStableTerminalViewportOffsets } from '../../utils/stableTerminalViewport.mjs';
 
 const SIDE_TERMINAL_MIN_WIDTH = 360;
 const SIDE_TERMINAL_MAX_WIDTH = 1200;
@@ -13,6 +14,15 @@ interface FloatingTerminalFrameProps {
   floating: boolean;
   open: boolean;
   bottomInset: number;
+  /**
+   * Pinned: the side terminal is a COLUMN — it reserves its width and the
+   * centre shrinks. Unpinned: it overlays the centre, which keeps full width.
+   *
+   * Same user-facing switch as the transcript's pin, because it is the same
+   * slot: Cmd+] opens whichever surface is secondary for this tab. Applying it
+   * to only one of them made one gesture behave two ways.
+   */
+  pinned?: boolean;
   onClose: () => void;
   searchNode?: React.ReactNode;
   children: React.ReactNode;
@@ -24,6 +34,7 @@ export default function FloatingTerminalFrame({
   floating,
   open,
   bottomInset,
+  pinned = false,
   onClose,
   searchNode,
   children,
@@ -36,6 +47,10 @@ export default function FloatingTerminalFrame({
   ));
   const setPromptQueueInputSurface = useUIStore((state) => state.setPromptQueueInputSurface);
   const terminalSelected = floating && open && selectedInputSurface === 'terminal';
+  const stageOffsets = resolveStableTerminalViewportOffsets({ floating, bottomInset });
+  // Pinned only means anything while this frame is the SIDE panel (floating)
+  // and actually open — a closed panel reserves nothing.
+  const reservesColumn = floating && open && pinned;
 
   useEffect(() => {
     if (!floating || !open || !tabId) return;
@@ -88,13 +103,21 @@ export default function FloatingTerminalFrame({
   return (
     <div
       data-floating-terminal-stage
+      data-terminal-viewport-shift={stageOffsets.translateY}
       style={{
         position: 'absolute',
-        top: 0,
+        top: stageOffsets.top,
         left: 0,
-        right: 0,
-        bottom: floating ? Math.max(0, bottomInset) : 0,
+        // Pinned → the stage ends where the panel begins, so the centre is
+        // narrower and nothing is covered. Unpinned → full width, panel on top.
+        right: reservesColumn ? sideTerminalWidth : 0,
+        bottom: stageOffsets.bottom,
+        transform: stageOffsets.translateY
+          ? `translateY(${stageOffsets.translateY}px)`
+          : undefined,
         pointerEvents: 'none',
+        // The composer only shifts/crops this stable-size stage. It must not
+        // change xterm rows and trigger a PTY resize/redraw.
         // Side panel opens ABOVE everything in the center — including the
         // Run after strip host (z 120) and orchestration chips — matching how
         // the History side panel covers them in terminal-primary.
@@ -116,7 +139,9 @@ export default function FloatingTerminalFrame({
         style={floating ? {
           position: 'absolute',
           top: 0,
-          right: 0,
+          // Pinned: sits just outside the shortened stage, i.e. in its own
+          // column. Unpinned: overlays the centre's right edge as before.
+          right: reservesColumn ? -sideTerminalWidth : 0,
           bottom: 0,
           width: sideTerminalWidth,
           // Split panes host this frame inside a column narrower than the
@@ -158,13 +183,11 @@ export default function FloatingTerminalFrame({
             boxSizing: 'border-box',
           }}
         >
+          {/* Icon only, no tab name: this titlebar labels a SURFACE ("this is
+              the terminal"), not a tab. The tab is already named in the pane
+              header right above, and repeating it here read as a second,
+              competing tab chip. */}
           <SquareTerminal size={13} />
-          <span
-            title={tabName}
-            style={{ fontSize: 11, color: '#8a8a8f', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-          >
-            {tabName}
-          </span>
           <div style={{ flex: 1 }} />
           <ControlHint label="Закрыть терминал">
             <button

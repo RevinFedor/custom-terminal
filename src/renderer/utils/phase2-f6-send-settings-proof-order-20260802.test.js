@@ -30,8 +30,14 @@ test('F6 physical Think picker owns the shared PTY queue and advances input iden
     'opening the picker must invalidate composer proofs captured before the UI mutation');
   assert.match(handler, /getTerminalInputRevision\(tabId\) === ownedInputRevision/,
     'every later picker write must still belong to the exact input generation');
-  assert.match(handler, /waitForNextPtySynchronizedFrame\(term/,
-    'picker writes must wait for the next synchronized Claude frame');
+  assert.match(handler, /waitForCommittedSemanticFrame\(/,
+    'picker writes must observe committed frames until the Claude surface is semantically complete');
+  assert.match(handler, /mirrorState\.synchronizedFrameWaiters\.add\(listener\)/,
+    'the frame observer must be installed before picker input so later frames cannot be missed');
+  assert.match(handler, /acceptInspection: pickerFrameReady/,
+    'opening the picker must wait for title, both options, one check, and the current footer');
+  assert.match(handler, /think_picker_open_unknown_close/,
+    'an incomplete picker must be closed before the failure is returned');
   assert.match(handler, /getHeadlessVisibleBufferSnapshot\(/,
     'picker state must come from the complete main-owned visible frame');
   assert.match(handler, /inspectClaudeThinkingPickerSnapshot\(/,
@@ -61,6 +67,7 @@ async function buildScenarioBundle() {
 
     export async function runClaudeScenario(options = {}) {
       const state = globalThis.__phase2F6State;
+      state.captureFrameChangeFailures = Number(options.captureFrameChangeFailures || 0);
       const identity = () => ({
         terminalRunSeq: 9,
         inputRevision: state.inputRevision,
@@ -122,6 +129,20 @@ async function buildScenarioBundle() {
           };
         },
         copyDraft: async () => {
+          if (state.captureFrameChangeFailures > 0) {
+            state.captureFrameChangeFailures -= 1;
+            state.events.push({
+              kind: 'composer-proof-frame-changed',
+              inputRevision: state.inputRevision,
+            });
+            return {
+              success: false,
+              error: 'claude_draft_state_unknown_before_paste',
+              proofReason: 'claude-current-frame-changed-before-exact-capture',
+            };
+          }
+          const screenProofInputRevision = state.inputRevision;
+          state.inputRevision += 1;
           state.events.push({ kind: 'composer-proof-exact', inputRevision: state.inputRevision });
           return {
             success: true,
@@ -133,6 +154,10 @@ async function buildScenarioBundle() {
             editorReturnReady: true,
             source: 'headless-main:claude-composer:empty-exact-editor',
             ...identity(),
+            screenContradiction: true,
+            inputRevisionTransition: 'ctrl-g-exact-capture',
+            inputRevisionTransitionOwned: true,
+            screenProofInputRevision,
           };
         },
         grabDraft: async () => ({ success: false, error: 'unexpected grab' }),
@@ -173,7 +198,12 @@ async function buildScenarioBundle() {
           export async function waitForClaudeStartupDefaultsReadyWithVisibleFallback() {}
         `],
         ['./terminalRegistry', `
-          export const terminalRegistry = new Map();
+          const registry = new Map();
+          registry.getDraftDiagnosticSnapshot = () => ({
+            success: false,
+            error: 'renderer-diagnostic-unavailable-in-test',
+          });
+          export const terminalRegistry = registry;
         `],
         ['./codexRewindCommit', `
           export async function requireCommittedCodexRewind() { return true; }
@@ -396,6 +426,64 @@ test('F6 complete shared scenario -> Claude runtime -> IPC path reproves after s
       physicalPasteCount: 1,
       proofReservedAtPhysicalPaste: true,
       submitted: true,
+    });
+  });
+
+  await t.test('Claude exact capture re-proves one newer committed frame before touching input', async () => {
+    const state = resetState();
+    const result = await scenario.runClaudeScenario({
+      handoffId: 'phase2-f6-frame-refresh',
+      screenProof: 'missing',
+      captureFrameChangeFailures: 1,
+    });
+    assert.deepEqual({
+      screenProofCount: state.events.filter((entry) => (
+        entry.kind === 'composer-proof-screen'
+      )).length,
+      frameChangeCount: state.events.filter((entry) => (
+        entry.kind === 'composer-proof-frame-changed'
+      )).length,
+      exactCaptureCount: state.events.filter((entry) => (
+        entry.kind === 'composer-proof-exact'
+      )).length,
+      physicalPasteCount: state.events.filter((entry) => (
+        entry.kind === 'physical-paste-boundary'
+      )).length,
+      submitted: result?.submitted === true,
+    }, {
+      screenProofCount: 2,
+      frameChangeCount: 1,
+      exactCaptureCount: 1,
+      physicalPasteCount: 1,
+      submitted: true,
+    });
+  });
+
+  await t.test('Claude exact capture stops after one newer committed frame without Enter', async () => {
+    const state = resetState();
+    const result = await scenario.runClaudeScenario({
+      handoffId: 'phase2-f6-frame-refresh-bounded',
+      screenProof: 'missing',
+      captureFrameChangeFailures: 2,
+    });
+    assert.deepEqual({
+      code: result?.code,
+      submitted: result?.submitted,
+      screenProofCount: state.events.filter((entry) => (
+        entry.kind === 'composer-proof-screen'
+      )).length,
+      frameChangeCount: state.events.filter((entry) => (
+        entry.kind === 'composer-proof-frame-changed'
+      )).length,
+      physicalPasteCount: state.events.filter((entry) => (
+        entry.kind === 'physical-paste-boundary'
+      )).length,
+    }, {
+      code: 'terminal_draft_state_unknown',
+      submitted: false,
+      screenProofCount: 2,
+      frameChangeCount: 2,
+      physicalPasteCount: 0,
     });
   });
 

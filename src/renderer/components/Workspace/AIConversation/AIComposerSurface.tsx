@@ -7,6 +7,40 @@ import {
   type ComposerChipState,
   type ComposerDensity,
 } from '@noted/claude-blocks';
+import { useUIStore } from '../../../store/useUIStore';
+
+const TerminalHistoryStreamIcon: React.FC<{ active: boolean }> = ({ active }) => (
+  <svg
+    viewBox="0 0 20 20"
+    width={15}
+    height={15}
+    fill="none"
+    aria-hidden="true"
+  >
+    <path
+      d="M2.75 5.25h5.5M2.75 9h7.5M2.75 12.75h5.5"
+      stroke="currentColor"
+      strokeWidth="1.45"
+      strokeLinecap="round"
+    />
+    <path
+      d="M11.2 6.15c1.65.58 2.8 2.06 2.8 3.85s-1.15 3.27-2.8 3.85M13.35 3.7c2.65 1.1 4.4 3.45 4.4 6.3s-1.75 5.2-4.4 6.3"
+      stroke="currentColor"
+      strokeWidth="1.35"
+      strokeLinecap="round"
+      opacity={active ? 1 : 0.42}
+    />
+    <circle cx="10" cy="10" r="1.35" fill="currentColor" />
+    {!active && (
+      <path
+        d="M3.1 3.1l13.8 13.8"
+        stroke="currentColor"
+        strokeWidth="1.55"
+        strokeLinecap="round"
+      />
+    )}
+  </svg>
+);
 
 export interface AIComposerSurfaceChip {
   id: string;
@@ -133,12 +167,18 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
   overlay,
   secondaryFontSize = 11,
 }) => {
+  const terminalHistoryStreamingEnabled = useUIStore(
+    (state) => state.terminalHistoryStreamingEnabled,
+  );
+  const setTerminalHistoryStreamingEnabled = useUIStore(
+    (state) => state.setTerminalHistoryStreamingEnabled,
+  );
   const expandedChip = expandedChipId
     ? [...chips, ...externalExpandableChips].find(
       (chip) => chip.id === expandedChipId && chip.expandable !== false,
     ) || null
     : null;
-  const hasTopLine = topBar != null || topBarTrailing != null || chips.length > 0;
+  const hasTopLine = true;
   const secondaryStyle = {
     ['--ai-composer-secondary-font-size' as any]: `${secondaryFontSize}px`,
     ...style,
@@ -345,17 +385,49 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
           })}
         </div>
       )}
-      {topBarTrailing != null && (
-        <>
-          <span aria-hidden style={{ flex: 1, minWidth: 4 }} />
-          <div
-            data-ai-composer-top-trailing
-            style={{ display: 'flex', alignItems: 'center', gap: 4, flex: '0 0 auto' }}
-          >
-            {topBarTrailing}
-          </div>
-        </>
-      )}
+      <span aria-hidden style={{ flex: 1, minWidth: 4 }} />
+      <div
+        data-ai-composer-top-trailing
+        style={{ display: 'flex', alignItems: 'center', gap: 4, flex: '0 0 auto' }}
+      >
+        <button
+          type="button"
+          data-terminal-history-streaming={terminalHistoryStreamingEnabled ? 'active' : 'inactive'}
+          aria-label={terminalHistoryStreamingEnabled
+            ? 'Отключить streaming из терминала в History'
+            : 'Включить streaming из терминала в History'}
+          aria-pressed={terminalHistoryStreamingEnabled}
+          title={terminalHistoryStreamingEnabled
+            ? 'Terminal streaming → History: включён'
+            : 'Terminal streaming → History: выключен'}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => setTerminalHistoryStreamingEnabled(!terminalHistoryStreamingEnabled)}
+          style={{
+            width: 22,
+            height: 22,
+            padding: 0,
+            borderRadius: 6,
+            border: terminalHistoryStreamingEnabled
+              ? '1px solid rgba(167, 139, 250, 0.48)'
+              : '1px solid rgba(255, 255, 255, 0.12)',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: terminalHistoryStreamingEnabled ? '#c4b5fd' : '#666',
+            background: terminalHistoryStreamingEnabled
+              ? 'rgba(109, 40, 217, 0.18)'
+              : 'rgba(255, 255, 255, 0.025)',
+            boxShadow: terminalHistoryStreamingEnabled
+              ? 'inset 0 0 0 1px rgba(196, 181, 253, 0.05), 0 0 9px rgba(124, 58, 237, 0.16)'
+              : 'none',
+            cursor: 'pointer',
+            flex: '0 0 auto',
+          }}
+        >
+          <TerminalHistoryStreamIcon active={terminalHistoryStreamingEnabled} />
+        </button>
+        {topBarTrailing}
+      </div>
     </div>
   ) : undefined;
 

@@ -25,21 +25,37 @@ function advanceManualInputLineState(
   } = {},
 ) {
   if (typeof data !== 'string' || data.length === 0) {
-    return { state: previous || null, submittedCommands: [], reason: 'empty-data' };
+    return {
+      state: previous || null,
+      submittedCommands: [],
+      submittedCommandDetails: [],
+      reason: 'empty-data',
+    };
   }
   if (isTerminalProtocolResponse) {
-    return { state: previous || null, submittedCommands: [], reason: 'terminal-response' };
+    return {
+      state: previous || null,
+      submittedCommands: [],
+      submittedCommandDetails: [],
+      reason: 'terminal-response',
+    };
   }
 
   const base = sameOwner(previous?.owner, owner)
     ? previous
-    : { text: '', owner };
+    : { text: '', owner, truncated: false };
   let text = String(base.text || '');
+  let truncated = base.truncated === true;
   const submittedCommands = [];
+  const submittedCommandDetails = [];
   const flush = () => {
     const command = text.trim();
-    if (command) submittedCommands.push(command);
+    if (command) {
+      submittedCommands.push(command);
+      submittedCommandDetails.push({ text: command, truncated });
+    }
     text = '';
+    truncated = false;
   };
 
   const clean = data
@@ -59,11 +75,13 @@ function advanceManualInputLineState(
     }
     if (char === '\x15' || char === '\x03') {
       text = '';
+      truncated = false;
       continue;
     }
     if (char === '\x1b') {
       if (clean.length === 1) {
         text = '';
+        truncated = false;
         continue;
       }
       while (
@@ -77,13 +95,17 @@ function advanceManualInputLineState(
     }
     if (code >= 32 && code !== 127) {
       text += char;
-      if (text.length > 200) text = text.slice(-200);
+      if (text.length > 200) {
+        text = text.slice(-200);
+        truncated = true;
+      }
     }
   }
 
   return {
-    state: text ? { text, owner } : null,
+    state: text ? { text, owner, truncated } : null,
     submittedCommands,
+    submittedCommandDetails,
     reason: sameOwner(previous?.owner, owner) ? 'same-owner' : 'owner-reset',
   };
 }

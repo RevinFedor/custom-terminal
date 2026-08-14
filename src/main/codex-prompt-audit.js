@@ -40,6 +40,16 @@ function codexCanonicalUserMessageMatch(audit, actualText) {
   const actual = String(actualText || '');
   if (!expected) return null;
 
+  // The Codex PTY materializes each byte of a Windows CRLF pasted through its
+  // composer as a line break of its own. The rollout therefore contains LF+LF
+  // for every CRLF while preserving the exact string length. This is a narrow,
+  // observed provider transformation: do not generalize it to whitespace
+  // collapsing or to the more common CRLF -> LF normalization.
+  const ptyMaterializedExpected = expected.replace(/\r\n/g, '\n\n');
+  if (ptyMaterializedExpected !== expected && actual === ptyMaterializedExpected) {
+    return { reason: 'codex_pty_crlf_materialized_as_double_lf' };
+  }
+
   // Codex normalizes only boundary whitespace when materializing user_message.
   // Accept that exact transformation, but never collapse or rewrite whitespace
   // inside the prompt: an interior difference remains delivery corruption.

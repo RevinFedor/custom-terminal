@@ -24,10 +24,13 @@ import {
   dropFromMru,
   dropProjectFromMru,
   touchMru,
+  rebuildGlobalTabMru,
 } from '../utils/tabSwitcherModel.mjs';
 import { resolveTabInsertionIndex } from '../utils/tabInsertionModel.mjs';
 import {
   addEmptyPane,
+  addEmptyPaneVertical,
+  restorePanePreviousTab,
   addPane,
   isEmptyPane,
   removePaneAt,
@@ -36,6 +39,8 @@ import {
   resolveSplitActivation,
   sanitizePanes,
 } from '../utils/splitPanesModel.mjs';
+import { isVisitWorthRecording, onScreenTabIds } from '../utils/tabVisitHistoryRule.mjs';
+import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -636,6 +641,13 @@ interface Tab {
   terminalName?: string; // Terminal name for browser tabs
   activeView?: 'browser' | 'terminal'; // Which view is active in the tab
   createdAt?: number; // Timestamp when tab was created
+  /**
+   * When this tab was last ACTIVATED (ms epoch). Durable recency for the
+   * Ctrl+Tab / Cmd+P switcher: that order is global across projects, so it
+   * cannot live in a per-project visit array that restore rebuilds empty.
+   * Persisted in tabs.last_activated_at with never-downgrade semantics.
+   */
+  lastActivatedAt?: number;
   claudeSessionId?: string; // Active Claude Code session UUID (detected from terminal output)
   geminiSessionId?: string; // Active Gemini CLI session ID (detected via Sniper Watcher)
   codexSessionId?: string; // Active Codex CLI session ID (detected from ~/.codex/sessions JSONL)
@@ -965,6 +977,14 @@ const restoreTabOptions = (savedTab: any) => ({
   restartAfterPersistent: savedTab.restartAfterPersistent,
   restartAfterArmed: savedTab.restartAfterArmed,
   nameSetManually: savedTab.nameSetManually,
+  // Carried through restore so the switcher can rebuild the visit order from
+  // the tabs themselves. Dropping it here would leave every restored tab
+  // unstamped and put us straight back to "only the current project is ranked".
+  lastActivatedAt: savedTab.lastActivatedAt,
+  // The tab's session-id history, so "Revert Session" still has something to
+  // offer after a restart. A restart is exactly when it is needed most: a
+  // hijacked session id survives one, and until now the way back did not.
+  claudeSessionHistory: savedTab.claudeSessionHistory,
   restoreId: savedTab.tabId
 } as any);
 
@@ -1306,6 +1326,16 @@ export interface GlobalTabMruEntry {
 export interface SplitPane {
   projectId: string;
   tabId: string;
+  /**
+   * Which COLUMN this pane belongs to; panes in the same column stack
+   * vertically, top to bottom in array order.
+   *
+   * Absent on every purely horizontal layout — including every session saved
+   * before vertical splitting existed — where a pane is simply its own column
+   * at its array position. It is written only once a layout actually stacks,
+   * and then on every pane at once. See splitPanesModel.mjs for the rules.
+   */
+  column?: number;
 }
 
 export interface TerminalBufferCheckpoint {
@@ -1337,7 +1367,13 @@ interface WorkspaceStore {
   // Persisted inside the session state so Ctrl+Tab keeps its order across
   // restarts.
   globalTabMru: GlobalTabMruEntry[];
-  touchGlobalTabMru: (projectId: string, tabId: string) => void;
+  /**
+   * Record a VISIT (tab appeared on screen). `visibleBefore` is the set of tabs
+   * that were on screen BEFORE the caller switched — callers that have already
+   * moved activeTabId must pass it, otherwise the rule inspects the new state and
+   * every switch looks like "it was already visible".
+   */
+  touchGlobalTabMru: (projectId: string, tabId: string, visibleBefore?: string[]) => void;
   // Split workspace (up to 3 side-by-side panes, cross-project). Empty =
   // single mode. Persisted in the session state. Focused pane index kept in
   // sync with activeProjectId/activeTabId by activateCenterTab.
@@ -1348,6 +1384,16 @@ interface WorkspaceStore {
   // Split button in the attach row: open an EMPTY pane (focused, waiting for
   // the next tab activation to fill it). Single mode → [center, empty].
   addEmptySplitPane: (afterPaneIndex?: number | null) => boolean;
+  /** Right-click on the split button: open a placeholder ABOVE/BELOW a pane. */
+  addVerticalSplitPane: (atPaneIndex: number | null, side: 'above' | 'below') => boolean;
+  /** Middle-click on a file pane: bring back what that pane showed before. */
+  restoreSplitPanePreviousTab: (tabId: string) => boolean;
+  /**
+   * Put a tab into ONE pane without focusing it or moving the center.
+   * The second path next to activateCenterTab: "show this here" instead of
+   * "go to this".
+   */
+  setSplitPaneTab: (paneIndex: number, projectId: string, tabId: string) => boolean;
   // ✕ / Escape on an empty placeholder pane (real panes close by tabId).
   removeEmptySplitPane: (paneIndex: number) => void;
   focusSplitPane: (paneIndex: number) => void;
@@ -1356,6 +1402,12 @@ interface WorkspaceStore {
   // activeProjectId follows the tab, focusedProjectId (sidebar/toolbar) stays
   // — that is the «смена вкладки ≠ смена проекта» rule.
   activateCenterTab: (projectId: string, tabId: string) => void;
+  /**
+   * "Go to this tab, and bring the project with it" — activateCenterTab PLUS
+   * the sidebar. For surfaces that name a tab which may belong to a project the
+   * sidebar is not showing (the pane header chip).
+   */
+  activateTabAndProject: (projectId: string, tabId: string) => void;
   // Transient "reveal this tab in the sidebar list" request. Set by explicit
   // activations (Ctrl+Tab / Cmd+P commit, split pane focus) so TabBar scrolls
   // the row into view instantly — including right after a cross-project
@@ -1623,6 +1675,9 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     terminalName: tab.terminalName,
     activeView: tab.activeView,
     createdAt: tab.createdAt,
+    // Durable tab-visit time. Main applies never-downgrade, so payloads that
+    // omit it (rename, colour, reorder — most of them) keep the stored value.
+    lastActivatedAt: tab.lastActivatedAt,
     isCollapsed: tab.isCollapsed,
     sessionStatus: tab.sessionStatus,
     completionNotificationPersistent: tab.completionNotificationPersistent,
@@ -1635,6 +1690,13 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     groupId: tab.groupId,
     visualParentTabId: tab.visualParentTabId,
     nameSetManually: tab.nameSetManually,
+    // Which session ids this tab has carried, and who wrote each one. This is
+    // what the "Revert Session" menu offers — the last line of defence when the
+    // bridge watcher stamps a dead session onto a live tab
+    // (fix-bridge-stale-takeover.md). It was collected in memory and never sent
+    // here, so the database column was NULL on every row and the menu never
+    // appeared: the whole safety net existed only until the next restart.
+    claudeSessionHistory: tab.claudeSessionHistory,
     tabId: tab.id
   }));
   return ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup })
@@ -1749,9 +1811,42 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   openProjects: new Map(),
   projectHistory: [],
   globalTabMru: [],
-  touchGlobalTabMru: (projectId, tabId) => {
-    const { globalTabMru, isRestoring } = get();
+  touchGlobalTabMru: (projectId, tabId, visibleBefore) => {
+    const { globalTabMru, isRestoring, openProjects, splitPanes, activeProjectId } = get();
     if (isRestoring) return; // restore replays activations; keep the saved order
+    // A VISIT is "this tab appeared on screen", not "this tab was clicked".
+    //
+    // With panes those differ: clicking the neighbouring pane moves focus while
+    // both tabs stay visible, so recording it rewrites the history with an event
+    // it does not describe — and Ctrl+Tab then offers the tab you are looking at,
+    // which is the opposite of what the gesture is for. Checked here because this
+    // is the single point every activation path already funnels through.
+    //
+    // `visibleBefore` matters: switchTab sets workspace.activeTabId BEFORE calling
+    // this, so reading the live state here would report the tab as already
+    // visible and nothing would ever be recorded. Callers that have moved the
+    // pointer pass the pre-switch snapshot; the rest (createTab) have not moved
+    // it yet and can be read live.
+    const centerTabId = activeProjectId
+      ? openProjects.get(activeProjectId)?.activeTabId || null
+      : null;
+    const visibleTabIds = visibleBefore
+      ?? onScreenTabIds({ panes: splitPanes, centerTabId });
+    if (!isVisitWorthRecording({ tabId, visibleTabIds })) return;
+    // Durable half of the same event: stamp the tab itself, so the visit order
+    // survives a restart even for projects whose in-session list is empty.
+    // Written here — the one place every activation path already funnels
+    // through — rather than at each call site, which is how the per-project
+    // list and the global list drifted apart in the first place.
+    const workspace = openProjects.get(projectId);
+    const tab = workspace?.tabs.get(tabId);
+    if (tab) {
+      tab.lastActivatedAt = Date.now();
+      // Persist through the normal tab writer. Callers below already re-set
+      // openProjects and call saveSession; this one write is what makes the
+      // stamp durable.
+      saveTabs(projectId, workspace!.tabs);
+    }
     if (globalTabMru[0]?.tabId === tabId) return; // no-op → no re-render
     set({ globalTabMru: touchMru(globalTabMru, projectId, tabId) });
   },
@@ -1781,9 +1876,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!res) return;
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
     console.log('[Split] removeTab tab=' + tabId.slice(-12) + ' panes=' + res.panes.length);
-    // Keep the center on a still-visible pane's tab.
-    const focused = res.panes[res.focusedIndex];
-    if (focused && focused.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
+    // Keep the center on a still-visible pane's tab. When the split COLLAPSES
+    // there is no pane list left to read that from, so the model names the
+    // survivor: single mode shows one tab, and it must be the one that stayed
+    // on screen. Reading res.panes[0] here silently did nothing on collapse and
+    // left the center on the tab that had just been taken off screen.
+    const next = res.panes[res.focusedIndex] || res.survivor;
+    if (next && next.tabId) get().activateCenterTab(next.projectId, next.tabId);
     get().saveSession();
   },
 
@@ -1802,6 +1901,98 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     console.log('[Split] addEmptyPane panes=' + res.panes.length + ' focus=' + res.focusedIndex);
     // Placeholder is session-transient (sanitizePanes drops it on restore),
     // but persisting the REAL panes' new geometry keeps restart honest.
+    get().saveSession();
+    return true;
+  },
+
+  addVerticalSplitPane: (atPaneIndex, side) => {
+    const st = get();
+    const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
+    const current = st.activeProjectId && activeWs?.activeTabId
+      ? { projectId: st.activeProjectId, tabId: activeWs.activeTabId }
+      : null;
+    const res = addEmptyPaneVertical(
+      st.splitPanes,
+      st.splitFocusedIndex,
+      current,
+      atPaneIndex ?? null,
+      side,
+    );
+    if (!res) return false;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    console.log('[Split] addVerticalPane side=' + side
+      + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
+    get().saveSession();
+    return true;
+  },
+
+  setSplitPaneTab: (paneIndex, projectId, tabId) => {
+    const st = get();
+    if (!st.openProjects.get(projectId)?.tabs.get(tabId)) return false;
+
+    // Single mode has no pane list to write into: the header still offers the
+    // control, and choosing there means "make this the center" — the only
+    // surface available. Nothing to keep focus away from.
+    if (st.splitPanes.length === 0) {
+      get().activateCenterTab(projectId, tabId);
+      return true;
+    }
+
+    const target = st.splitPanes[paneIndex];
+    if (!target) return false;
+    if (target.tabId === tabId) return true;
+    // One tab, one pane: a tab visible elsewhere would otherwise appear twice.
+    if (st.splitPanes.some((pane, i) => i !== paneIndex && pane.tabId === tabId)) return false;
+
+    const next = st.splitPanes.slice();
+    next[paneIndex] = {
+      projectId,
+      tabId,
+      ...(target.column !== undefined ? { column: target.column } : null),
+      // Pane-level recency, same as a normal activation — so middle-click can
+      // still step back from whatever is put here.
+      ...(target.tabId && target.tabId !== tabId
+        ? { prevProjectId: target.projectId, prevTabId: target.tabId }
+        : null),
+    };
+    // splitFocusedIndex is deliberately NOT touched: this is the whole point of
+    // the second path. The center follows the FOCUSED pane, so leaving focus
+    // alone also leaves the center where the user left it.
+    set({ splitPanes: next });
+    console.log('[Split] setPaneTab pane=' + paneIndex + ' tab=' + tabId.slice(-12) + ' focus-unchanged');
+    get().saveSession();
+    return true;
+  },
+
+  restoreSplitPanePreviousTab: (tabId) => {
+    const st = get();
+    // Stepping back is the FILE gesture and nothing else: middle-clicking a
+    // file undoes "I opened this file here". On a normal tab the same gesture
+    // means "take this pane off the screen", and the pane must close.
+    //
+    // The distinction was in this method's description from the start but never
+    // in its code, while pane-level recency is recorded on EVERY activation —
+    // so every pane that had ever shown a second tab quietly refused to close
+    // and swapped its content instead. The rule belongs here, next to the only
+    // place that can see what kind of tab a pane is showing.
+    const paneOwner = st.splitPanes.find((pane) => pane.tabId === tabId);
+    if (!paneOwner) return false;
+    const shownTab = st.openProjects.get(paneOwner.projectId)?.tabs.get(tabId);
+    if (shownTab?.tabType !== 'file') return false;
+    const res = restorePanePreviousTab(
+      st.splitPanes,
+      st.splitFocusedIndex,
+      tabId,
+      (projectId, candidateId) => !!st.openProjects.get(projectId)?.tabs.get(candidateId),
+    );
+    if (!res) return false;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    const restored = res.panes[res.restoredIndex];
+    console.log('[Split] restorePrevTab pane=' + res.restoredIndex
+      + ' tab=' + String(restored?.tabId || '').slice(-12));
+    // The pane the user acted on becomes the focused one, and the center
+    // follows it — same rule as clicking that pane.
+    if (restored?.tabId) get().activateCenterTab(restored.projectId, restored.tabId);
     get().saveSession();
     return true;
   },
@@ -1867,6 +2058,33 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       get().requestTabListReveal(projectId, tabId);
     }
   },
+
+  activateTabAndProject: (projectId, tabId) => {
+    // Two navigations, in this order, and the order is the whole point.
+    //
+    // showWorkspace is the ONLY writer of the sidebar pointer, and it keeps the
+    // center deliberately still ("выбор проекта не меняет активную вкладку").
+    // So the project moves first and the tab moves second — the reverse order
+    // would let the project step land last and undo nothing visible, but it
+    // would also make the tab reveal fire before the sidebar was showing this
+    // project, and the row would never scroll into view.
+    //
+    // Kept as its own method rather than a flag on activateCenterTab: the
+    // one-argument version is the rule for tab switching everywhere else
+    // («смена вкладки ≠ смена проекта»), and a boolean would invite callers to
+    // opt out of it one by one.
+    const workspace = get().openProjects.get(projectId);
+    if (!workspace || !workspace.tabs.has(tabId)) return;
+    if (get().getFocusedProjectId() !== projectId) {
+      get().showWorkspace(projectId);
+    } else {
+      // Already there: the navigation half of this click has nothing to do, so
+      // without a signal the control reads as broken. Flash the project's card
+      // once — it names WHERE the click would have taken you.
+      useUIStore.getState().pulseProjectCard(projectId);
+    }
+    get().activateCenterTab(projectId, tabId);
+  },
   isRestoring: false,
   pendingEditTabId: null,
   tabTitleNamingIds: new Set(),
@@ -1887,33 +2105,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   saveSession: () => {
-    const { openProjects, activeProjectId, focusedProjectId, view, isRestoring, projectHistory, globalTabMru, splitPanes, splitFocusedIndex } = get();
-    if (isRestoring) return; // Don't save while restoring
+    if (get().isRestoring) return; // Don't save while restoring
 
     // Debounce: save after 300ms of inactivity
     if (saveSessionTimer) clearTimeout(saveSessionTimer);
 
     saveSessionTimer = setTimeout(async () => {
-      const sessionState: SessionState & { projectHistory?: string[]; globalTabMru?: GlobalTabMruEntry[]; splitPanes?: SplitPane[]; splitFocusedIndex?: number; focusedProjectId?: string | null } = {
-        openProjects: Array.from(openProjects.values()).map((workspace) => {
-          const tabsArray = Array.from(workspace.tabs.keys());
-          const activeTabIndex = workspace.activeTabId
-            ? tabsArray.indexOf(workspace.activeTabId)
-            : 0;
-          return {
-            projectId: workspace.projectId,
-            projectPath: workspace.projectPath,
-            activeTabIndex: Math.max(0, activeTabIndex)
-          };
-        }),
-        activeProjectId,
-        focusedProjectId,
-        view,
-        projectHistory,
-        globalTabMru,
-        splitPanes,
-        splitFocusedIndex
-      };
+      // Read the state AT WRITE TIME, not at schedule time: 300ms of debounce
+      // is exactly the window in which the layout can change again, and the
+      // captured-early version would save the older one.
+      const sessionState = buildSessionSnapshot(get());
 
       // Save to database
       await ipcRenderer.invoke('app:setState', { key: SESSION_KEY, value: sessionState });
@@ -2163,10 +2364,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // SINGLE set() for all projects — one Workspace mount instead of N
       const savedView = sessionState.view || 'dashboard';
       const restoredHistory = sessionState.projectHistory || [];
-      // Keep only MRU entries whose tab actually restored.
-      const restoredGlobalMru = (sessionState.globalTabMru || []).filter((entry) => (
-        entry && openProjects.get(entry.projectId)?.tabs.has(entry.tabId)
-      ));
+      // Tab-visit order is REBUILT from the per-tab durable timestamps, with the
+      // saved array used only for tabs that have none (written before the
+      // column existed). Two bugs die here:
+      //   • the saved array was filtered to surviving tabs and then written back
+      //     filtered, so every restart shaved it a little further and the loss
+      //     was unrecoverable — observed live at 6 entries for 10 projects;
+      //   • per-project visit lists start empty after a restart, so nothing but
+      //     this array ranked tabs, and it ranked almost none of them.
+      // Deriving from the timestamps makes both impossible by construction: the
+      // array is now a cache of something durable, not the source of truth.
+      const restoredGlobalMru = rebuildGlobalTabMru(
+        Array.from(openProjects.entries()).flatMap(([projectId, workspace]) => (
+          Array.from(workspace.tabs.values()).map((tab) => ({
+            projectId,
+            tabId: tab.id,
+            lastActivatedAt: tab.lastActivatedAt,
+          }))
+        )),
+        sessionState.globalTabMru || [],
+      );
       // Split survives restart; panes whose tab failed to restore are dropped,
       // <2 live panes collapse to single mode.
       const restoredSplit = sanitizePanes(
@@ -2620,6 +2837,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       url: options?.url,
       filePath: (options as any)?.filePath,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
+      // Restore carries the durable visit stamp; a brand-new tab has none until
+      // its first activation stamps it.
+      lastActivatedAt: (options as any)?.lastActivatedAt,
+      // Same for the session-id history behind "Revert Session": a restored tab
+      // keeps the way back, a brand-new one has nothing to revert to yet.
+      claudeSessionHistory: (options as any)?.claudeSessionHistory,
       isCollapsed: (options as any)?.isCollapsed,
       groupId: options?.groupId,
       visualParentTabId: (options as any)?.visualParentTabId,
@@ -2783,6 +3006,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       groupId: targetGroupId,
       visualParentTabId,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
+      lastActivatedAt: (options as any)?.lastActivatedAt,
       restartAfterTabId: (options as any)?.restartAfterTabId || undefined,
       restartAfterTabIds: Array.isArray((options as any)?.restartAfterTabIds) ? (options as any).restartAfterTabIds : undefined,
       restartAfterCommand: (options as any)?.restartAfterCommand || undefined,
@@ -3112,9 +3336,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const { splitPanes, splitFocusedIndex } = get();
       const splitRes = removePaneByTab(splitPanes, splitFocusedIndex, tabId);
       if (splitRes) {
-        splitSurvivor = splitRes.panes.length > 0
-          ? splitRes.panes[splitRes.focusedIndex] || null
-          : splitPanes.find((p) => p.tabId !== tabId) || null;
+        // Same question as removeTabFromSplit — "which pane stayed on screen" —
+        // so it reads the same answer. This used to re-derive it locally by
+        // scanning for any pane that is not the closed one, which also matched
+        // an empty placeholder and then quietly activated nothing.
+        splitSurvivor = splitRes.panes[splitRes.focusedIndex] || splitRes.survivor || null;
         set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex });
         console.log('[Split] pane-closed-with-tab tab=' + tabId.slice(-12) + ' panes=' + splitRes.panes.length);
       }
@@ -3457,6 +3683,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const _t0 = performance.now();
       const _startAbs = performance.timeOrigin + _t0;
       const prevActiveId = workspace.activeTabId;
+      // What was on screen BEFORE this switch — captured here because
+      // workspace.activeTabId is overwritten a few lines below, and the visit
+      // rule needs the "before" picture (see touchGlobalTabMru).
+      const visibleBeforeSwitch = onScreenTabIds({
+        panes: get().splitPanes,
+        centerTabId: get().activeProjectId
+          ? openProjects.get(get().activeProjectId!)?.activeTabId || null
+          : null,
+      });
       const currentView = workspace.currentView;
       const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
       const targetTab = workspace.tabs.get(tabId);
@@ -3473,7 +3708,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       workspace.selectedTabIds = [tabId]; // Update selection on direct switch
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
-      get().touchGlobalTabMru(projectId, tabId);
+      get().touchGlobalTabMru(projectId, tabId, visibleBeforeSwitch);
       // Split rule at the single activation choke point: visible tab → focus
       // its pane; hidden tab → replace the focused pane's slot (an empty
       // placeholder pane in focus gets filled the same way). Runs for every
@@ -5676,30 +5911,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (anyChanged) set({});
   },
 
-  // Save session immediately without debounce (for shutdown)
-  // Note: This uses synchronous XHR workaround for beforeunload
+  // Save session immediately without debounce (for shutdown).
+  //
+  // This is the LAST write before the app dies, so whatever it omits is what
+  // the next launch has lost. It used to build its own, shorter record —
+  // projects + active project + view — and thereby erased the split layout,
+  // the focused pane, the tab-visit order, the project order and the sidebar's
+  // project on every single close. Now it saves the SAME record as the normal
+  // save (buildSessionSnapshot), so "closing the app" can no longer mean
+  // "forgetting part of the workspace".
   saveSessionImmediate: () => {
-    const { openProjects, activeProjectId, view } = get();
-
-    const sessionState: SessionState = {
-      openProjects: Array.from(openProjects.values()).map((workspace) => {
-        const tabsArray = Array.from(workspace.tabs.keys());
-        const activeTabIndex = workspace.activeTabId
-          ? tabsArray.indexOf(workspace.activeTabId)
-          : 0;
-        return {
-          projectId: workspace.projectId,
-          projectPath: workspace.projectPath,
-          activeTabIndex: Math.max(0, activeTabIndex)
-        };
-      }),
-      activeProjectId,
-      view
-    };
+    const sessionState = buildSessionSnapshot(get());
 
     // Use sendSync for immediate save during shutdown
     ipcRenderer.sendSync('app:setStateSync', { key: SESSION_KEY, value: sessionState });
-    console.log('[Store] Session saved immediately:', sessionState);
+    console.log('[Store] Session saved immediately:'
+      + ' projects=' + sessionState.openProjects.length
+      + ' panes=' + sessionState.splitPanes.length
+      + ' focusedPane=' + sessionState.splitFocusedIndex
+      + ' view=' + sessionState.view);
   },
 
   // Per-project view (Home vs Terminal)

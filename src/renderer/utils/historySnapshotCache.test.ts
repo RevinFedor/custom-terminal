@@ -43,11 +43,19 @@ test('owner key distinguishes tab, tool, session and cwd without delimiter colli
   assert.equal(keys.size, 7);
 });
 
-test('default oversized pool protects three production-sized terminal owners', () => {
+test('default oversized pool holds a resume/fork PAIR of production giants', () => {
   assert.equal(DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS.maxOversizedSnapshots, 3);
+  // Codex resume/fork duplicates a whole transcript, so the observed worst
+  // case is two ~150MB projections open together (live 07.08 09:56). At the
+  // old 240MB each A↔B switch evicted the other giant and re-applied 15.5K
+  // rows cold.
   assert.equal(
     DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS.maxOversizedBytes,
-    240 * 1024 * 1024,
+    360 * 1024 * 1024,
+  );
+  assert.ok(
+    DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS.maxOversizedBytes! >= 2 * 150 * 1024 * 1024,
+    'a giant pair must fit without mutual eviction',
   );
 });
 

@@ -98,13 +98,47 @@ test('Codex history refresh returns a changed-rows delta to a digest-holding cal
     ifRevision: plain.revision,
     bounds: { last: 2 },
   });
+  // A NEW window shape ships in full: the caller cannot rebuild rows it was
+  // never sent, so the delta path must fail closed here.
   assert.equal(bounded.delta, undefined);
   assert.equal(bounded.entries.length, 2);
   assert.equal(bounded.truncated, true);
+  assert.equal(bounded.startIndex, 1);
+  assert.equal(bounded.hasMoreAbove, true);
+  assert.equal(bounded.hasMoreBelow, false);
 
-  // Unchanged file still answers unchanged without loading anything.
+  // …but a REPEATED window over an appended session is a continuation: the
+  // window's first row is still one the caller holds, so only changed rows
+  // travel. This is the live-tail case a windowed panel runs constantly.
+  await fs.promises.appendFile(filePath, '{"type":"event_msg"}\n');
+  projection = [...projection, row('codex-user-4', 'fourth prompt')];
+  const boundedAgain = await service.getHistory({
+    ...base,
+    deltaOk: true,
+    ifRevision: bounded.revision,
+    bounds: { fromUuid: bounded.firstUuid },
+  });
+  assert.equal(boundedAgain.delta, true);
+  assert.deepEqual(boundedAgain.changedEntries.map((entry) => entry.uuid), ['codex-user-4']);
+  assert.equal(boundedAgain.total, 4);
+  assert.equal(boundedAgain.hasMoreAbove, true);
+
+  // An anchor that no longer exists never answers with a silent empty screen.
+  await fs.promises.appendFile(filePath, '{"type":"event_msg"}\n');
+  const orphaned = await service.getHistory({
+    ...base,
+    deltaOk: true,
+    ifRevision: boundedAgain.revision,
+    bounds: { fromUuid: 'codex-user-gone' },
+  });
+  assert.equal(orphaned.anchorMissing, true);
+  assert.equal(orphaned.delta, undefined);
+  assert.deepEqual(orphaned.entries, []);
+
+  // Unchanged file still answers unchanged without loading anything — asked
+  // with the revision the LAST call returned (every append above moved it).
   const callsBefore = loadCalls;
-  const unchanged = await service.getHistory({ ...base, deltaOk: true, ifRevision: bounded.revision });
+  const unchanged = await service.getHistory({ ...base, deltaOk: true, ifRevision: orphaned.revision });
   assert.equal(unchanged.unchanged, true);
   assert.equal(loadCalls, callsBefore);
 });

@@ -34,6 +34,32 @@ function createCodexDraftProofWaitTimeoutOutcome({ source } = {}) {
   };
 }
 
+function getCodexDraftFrameBlocker({
+  synchronizedOutputOpen = false,
+  writeSeq = null,
+  flushedSeq = null,
+  pendingResizeWriteSeq = null,
+} = {}) {
+  if (synchronizedOutputOpen === true) return 'synchronized-output-open';
+
+  const currentWriteSeq = writeSeq;
+  const currentFlushedSeq = flushedSeq;
+  if (
+    !Number.isFinite(currentWriteSeq)
+    || !Number.isFinite(currentFlushedSeq)
+    || currentWriteSeq !== currentFlushedSeq
+  ) return 'frame-not-flushed';
+
+  if (pendingResizeWriteSeq !== null && pendingResizeWriteSeq !== undefined) {
+    const resizeBoundary = pendingResizeWriteSeq;
+    if (!Number.isFinite(resizeBoundary) || currentWriteSeq <= resizeBoundary) {
+      return 'post-resize-frame-not-observed';
+    }
+  }
+
+  return null;
+}
+
 function enforceCodexInteractiveSurfaceDraftAuthority(candidate, {
   nativeRewindProven = false,
   activePicker = false,
@@ -110,6 +136,7 @@ function mergeCodexDraftAuthority(headlessState, rendererState, {
 module.exports = {
   createCodexDraftProofWaitTimeoutOutcome,
   enforceCodexInteractiveSurfaceDraftAuthority,
+  getCodexDraftFrameBlocker,
   hasDefinitiveDraftState,
   mergeCodexDraftAuthority,
   shouldFinishCodexDraftProofWait,

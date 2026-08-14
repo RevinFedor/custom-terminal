@@ -700,10 +700,77 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
           })}
         </div>
       )}
-      <button type="button" data-orchestration-history-button onClick={() => { setHistoryOpen((open) => !open); setSettingsOpen(false); }} aria-label="Открыть историю запросов" style={{ height: 26, padding: '0 7px', display: 'flex', alignItems: 'center', gap: 5, borderRadius: 5, border: '1px solid #444', background: '#171717', color: '#aaa', cursor: 'pointer', boxSizing: 'border-box', fontSize: 10 }}>
+      {/* A button that opened a panel must LOOK opened: without it the only
+          way to tell which of the two panels is on screen is to read the panel
+          itself. Active state brightens border/background/text together — an
+          opacity-only difference is not reliably visible. Hover matches the
+          neighbouring controls. */}
+      <button
+        type="button"
+        data-orchestration-history-button
+        data-active={historyOpen ? 'true' : undefined}
+        onClick={() => { setHistoryOpen((open) => !open); setSettingsOpen(false); }}
+        aria-label="Открыть историю запросов"
+        aria-expanded={historyOpen}
+        style={{
+          height: 26,
+          padding: '0 7px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 5,
+          borderRadius: 5,
+          border: `1px solid ${historyOpen ? '#6b6b6b' : '#444'}`,
+          background: historyOpen ? '#2c2c2c' : '#171717',
+          color: historyOpen ? '#f0f0f0' : '#aaa',
+          cursor: 'pointer',
+          boxSizing: 'border-box',
+          fontSize: 10,
+          transition: 'background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease',
+        }}
+        onMouseEnter={(e) => {
+          if (historyOpen) return;
+          (e.currentTarget as HTMLElement).style.background = '#232323';
+          (e.currentTarget as HTMLElement).style.color = '#ddd';
+        }}
+        onMouseLeave={(e) => {
+          if (historyOpen) return;
+          (e.currentTarget as HTMLElement).style.background = '#171717';
+          (e.currentTarget as HTMLElement).style.color = '#aaa';
+        }}
+      >
         <HistoryIcon size={13} /><span>History</span>
       </button>
-      <button type="button" data-orchestration-settings-button onClick={() => { setSettingsOpen((open) => !open); setHistoryOpen(false); }} aria-label="Настройки запросов" title="Настройки запросов" style={{ width: 26, height: 26, display: 'grid', placeItems: 'center', borderRadius: 5, border: '1px solid #444', background: '#171717', color: '#888', cursor: 'pointer' }}>
+      <button
+        type="button"
+        data-orchestration-settings-button
+        data-active={settingsOpen ? 'true' : undefined}
+        onClick={() => { setSettingsOpen((open) => !open); setHistoryOpen(false); }}
+        aria-label="Настройки запросов"
+        aria-expanded={settingsOpen}
+        title="Настройки запросов"
+        style={{
+          width: 26,
+          height: 26,
+          display: 'grid',
+          placeItems: 'center',
+          borderRadius: 5,
+          border: `1px solid ${settingsOpen ? '#6b6b6b' : '#444'}`,
+          background: settingsOpen ? '#2c2c2c' : '#171717',
+          color: settingsOpen ? '#f0f0f0' : '#888',
+          cursor: 'pointer',
+          transition: 'background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease',
+        }}
+        onMouseEnter={(e) => {
+          if (settingsOpen) return;
+          (e.currentTarget as HTMLElement).style.background = '#232323';
+          (e.currentTarget as HTMLElement).style.color = '#ccc';
+        }}
+        onMouseLeave={(e) => {
+          if (settingsOpen) return;
+          (e.currentTarget as HTMLElement).style.background = '#171717';
+          (e.currentTarget as HTMLElement).style.color = '#888';
+        }}
+      >
         <Settings2 size={13} />
       </button>
       {historyPanel}

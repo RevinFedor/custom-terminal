@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
-import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles, Settings2, Check, ListTree } from 'lucide-react';
+import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles, Settings2, Check, ListTree, ArrowRightLeft } from 'lucide-react';
 import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
 import ControlHint from '../UI/ControlHint';
@@ -23,6 +23,7 @@ import {
   type TimelineOutlineTarget,
 } from '../../store/useTimelineOutlineStore';
 import { isInboxProjectId } from '../../constants/systemProjects';
+import { openTabSwitcherPanel } from './TabSwitcherOverlay';
 
 const { ipcRenderer } = window.require('electron');
 const DEFAULT_EXTERNAL_AUTO_STOP_MS = 30_000;
@@ -865,8 +866,48 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
         </div>
       )}
 
-      {/* Flex spacer — pushes session-copy cluster to the right edge of the toolbar */}
-      <div style={{ flex: 1 }} />
+      {/* Flex spacer — pushes session-copy cluster to the right edge of the toolbar.
+          The switcher button rides INSIDE this spacer rather than sitting between
+          the two clusters: `margin: auto` centres it in whatever space is left,
+          and when that space runs out the flex box shrinks and the button ends
+          up flush against the right-hand cluster instead of pushing it off. */}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <Tooltip content="Переключить вкладку — список всех вкладок с поиском (⌘P / Ctrl+Tab)">
+          <button
+            data-tab-switcher-toolbar-button
+            onClick={openTabSwitcherPanel}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 5,
+              height: 22,
+              padding: '0 8px',
+              marginRight: 10,
+              borderRadius: 6,
+              border: '1px solid rgba(255,255,255,0.10)',
+              background: 'rgba(255,255,255,0.04)',
+              color: '#9a9aa0',
+              fontSize: 11,
+              fontWeight: 600,
+              whiteSpace: 'nowrap',
+              cursor: 'pointer',
+              flexShrink: 0,
+              transition: 'background-color 0.12s ease, color 0.12s ease',
+            }}
+            onMouseEnter={(e) => {
+              (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.10)';
+              (e.currentTarget as HTMLElement).style.color = '#e4e4e7';
+            }}
+            onMouseLeave={(e) => {
+              (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)';
+              (e.currentTarget as HTMLElement).style.color = '#9a9aa0';
+            }}
+          >
+            <ArrowRightLeft size={12} />
+            <span>⌘P</span>
+          </button>
+        </Tooltip>
+      </div>
 
       {/* One adjoining Codex + Claude usage control. Each half opens the same
           downward popover on its provider; Claude prefers the official

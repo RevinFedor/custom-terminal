@@ -1,6 +1,7 @@
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
 
 export type HistoryPromptHandoffStatus =
+  | 'preparing'
   | 'sending'
   | 'queued'
   | 'audit-pending'
@@ -8,6 +9,11 @@ export type HistoryPromptHandoffStatus =
   | 'sent'
   | 'cancelled'
   | 'failed';
+
+export type SettledHistoryPromptHandoffStatus = Exclude<
+  HistoryPromptHandoffStatus,
+  'preparing' | 'sending'
+>;
 
 export type HistoryPromptHandoffUnconfirmedStatus =
   | 'audit-pending'
@@ -90,13 +96,14 @@ export interface BeginHistoryPromptHandoffInput {
   submittedAt?: number;
   source?: string;
   statusAtSend?: HistoryPromptHandoffAgentStatus;
+  initialStatus?: Extract<HistoryPromptHandoffStatus, 'preparing' | 'sending' | 'queued'>;
   requiresAuditIdentity?: boolean;
   /** Durable remount only: seed the first observable snapshot at its receipt state. */
   initialReceipt?: SettleHistoryPromptHandoffInput;
 }
 
 export interface SettleHistoryPromptHandoffInput {
-  queueStatus: Exclude<HistoryPromptHandoffStatus, 'sending'>;
+  queueStatus: SettledHistoryPromptHandoffStatus;
   reason: string;
   proof?: HistoryPromptHandoffAuditProof | null;
   requiresAuditIdentity?: boolean;
@@ -143,6 +150,11 @@ export interface DurableHistoryCanonicalPromptEntry {
   uuid?: string | null;
   sessionId?: string | null;
   sourceIdentity?: string | null;
+  semanticTags?: Array<{
+    kind?: string | null;
+    runId?: string | null;
+    phase?: string | null;
+  }> | null;
 }
 
 export interface DurableHistorySendHydrationResult {
@@ -233,6 +245,7 @@ export interface RunHistoryPromptHandoffInput
 export type HistoryPromptHandoffChange =
   | { type: 'replay' }
   | { type: 'begin'; handoffId: string }
+  | { type: 'transport-phase'; handoffId: string }
   | { type: 'bind-send-identity'; handoffId: string }
   | { type: 'settle'; handoffId: string }
   | { type: 'retract'; handoffId: string; reason: string }
@@ -254,6 +267,37 @@ export interface HistoryPromptHandoffStoreStats {
   tabs: number;
   handoffs: number;
   approxBytes: number;
+}
+
+export type HistoryPromptHandoffTransportPhase = 'sending' | 'queued' | 'confirming';
+
+export function historyPromptHandoffInitialStatus(
+  statusAtSend: HistoryPromptHandoffAgentStatus | null | undefined,
+): Extract<HistoryPromptHandoffStatus, 'preparing' | 'sending' | 'queued'> {
+  if (statusAtSend === 'inactive' || statusAtSend === 'starting') return 'preparing';
+  if (statusAtSend === 'busy') return 'queued';
+  return 'sending';
+}
+
+export function selectLatestHistoryPromptInputStatus(
+  handoffs: readonly Pick<HistoryPromptHandoff, 'submittedAt' | 'statusChangedAt' | 'queueStatus'>[],
+): HistoryPromptHandoffStatus | null {
+  let latest: Pick<HistoryPromptHandoff, 'submittedAt' | 'statusChangedAt' | 'queueStatus'> | null = null;
+  for (const handoff of handoffs) {
+    if (
+      handoff.queueStatus !== 'preparing'
+      && handoff.queueStatus !== 'sending'
+      && handoff.queueStatus !== 'queued'
+      && handoff.queueStatus !== 'audit-pending'
+    ) continue;
+    if (!latest
+      || handoff.submittedAt > latest.submittedAt
+      || (handoff.submittedAt === latest.submittedAt
+        && handoff.statusChangedAt > latest.statusChangedAt)) {
+      latest = handoff;
+    }
+  }
+  return latest?.queueStatus || null;
 }
 
 export function historyPromptHandoffAcceptsAuditIdentity(
@@ -692,6 +736,7 @@ export class HistoryPromptHandoffStore {
       if (nextAttemptId && nextAttemptId !== currentAttemptId) {
         const submittedAt = finiteTimestamp(input.submittedAt, Date.now());
         const initialReceipt = input.initialReceipt;
+        const initialStatus = initialReceipt?.queueStatus || input.initialStatus || 'sending';
         const next = freezeHandoff({
           ...existing.value,
           sendAttemptId: nextAttemptId,
@@ -704,8 +749,9 @@ export class HistoryPromptHandoffStore {
           submittedAt,
           source: typeof input.source === 'string' ? input.source : existing.value.source,
           statusAtSend: input.statusAtSend || existing.value.statusAtSend,
-          queueStatus: initialReceipt?.queueStatus || 'sending',
-          statusReason: initialReceipt?.reason || 'send-retry-start',
+          queueStatus: initialStatus,
+          statusReason: initialReceipt?.reason
+            || (initialStatus === 'preparing' ? 'send-retry-preparing' : 'send-retry-start'),
           statusChangedAt: initialReceipt
             ? Math.max(submittedAt, finiteTimestamp(initialReceipt.changedAt, submittedAt))
             : submittedAt,
@@ -732,6 +778,7 @@ export class HistoryPromptHandoffStore {
     const now = Date.now();
     const submittedAt = finiteTimestamp(input.submittedAt, now);
     const initialReceipt = input.initialReceipt;
+    const initialStatus = initialReceipt?.queueStatus || input.initialStatus || 'sending';
     const value = freezeHandoff({
       tabId,
       handoffId,
@@ -749,8 +796,13 @@ export class HistoryPromptHandoffStore {
       submittedAt,
       source: typeof input.source === 'string' ? input.source : '',
       statusAtSend: input.statusAtSend || 'unknown',
-      queueStatus: initialReceipt?.queueStatus || 'sending',
-      statusReason: initialReceipt?.reason || 'send-start',
+      queueStatus: initialStatus,
+      statusReason: initialReceipt?.reason
+        || (initialStatus === 'preparing'
+          ? 'send-preparing'
+          : initialStatus === 'queued'
+            ? 'send-queued'
+            : 'send-start'),
       statusChangedAt: initialReceipt
         ? Math.max(submittedAt, finiteTimestamp(initialReceipt.changedAt, submittedAt))
         : submittedAt,
@@ -775,6 +827,58 @@ export class HistoryPromptHandoffStore {
     if (!this.tabs.get(tabId)?.has(handoffId)) return undefined;
     this.notify(tabId, { type: 'begin', handoffId });
     return value;
+  }
+
+  advanceTransportPhase(
+    tabIdValue: string,
+    handoffIdValue: string,
+    phase: HistoryPromptHandoffTransportPhase,
+  ): Readonly<HistoryPromptHandoff> | undefined {
+    const tabId = requireKey(tabIdValue, 'tabId');
+    const handoffId = requireKey(handoffIdValue, 'handoffId');
+    const tab = this.tabs.get(tabId);
+    const current = tab?.get(handoffId);
+    if (!tab || !current) return undefined;
+
+    let queueStatus: HistoryPromptHandoffStatus | null = null;
+    if (phase === 'queued') {
+      if (current.value.queueStatus === 'preparing' || current.value.queueStatus === 'sending') {
+        queueStatus = 'queued';
+      }
+    } else if (phase === 'sending') {
+      if (current.value.queueStatus === 'preparing' || current.value.queueStatus === 'queued') {
+        queueStatus = 'sending';
+      }
+    } else if (phase === 'confirming') {
+      if (
+        current.value.queueStatus === 'preparing'
+        || current.value.queueStatus === 'sending'
+        || current.value.queueStatus === 'queued'
+      ) {
+        queueStatus = 'audit-pending';
+      }
+    }
+    if (!queueStatus) return current.value;
+
+    const next = freezeHandoff({
+      ...current.value,
+      queueStatus,
+      statusReason: phase === 'confirming'
+        ? 'send-enter-written-confirming'
+        : phase === 'queued'
+          ? 'send-ready-queued'
+          : 'send-ready-pasting',
+      statusChangedAt: Math.max(current.value.statusChangedAt, Date.now()),
+    });
+    const approxBytes = estimateHandoffBytes(next);
+    if (approxBytes > this.limits.maxBytes) return undefined;
+    this.approxBytes += approxBytes - current.approxBytes;
+    tab.set(handoffId, { value: next, approxBytes });
+    this.promoteTab(tabId);
+    this.enforceLimits(tabId, handoffId);
+    if (!this.tabs.get(tabId)?.has(handoffId)) return undefined;
+    this.notify(tabId, { type: 'transport-phase', handoffId });
+    return next;
   }
 
   bindSendIdentity(
@@ -1112,6 +1216,13 @@ export function historyPromptHandoffStatusPresentation(
   status: HistoryPromptHandoffStatus | null | undefined,
 ): HistoryPromptHandoffStatusPresentation | null {
   switch (status) {
+    case 'preparing':
+      return {
+        label: 'PREPARING',
+        tone: 'info',
+        pending: true,
+        title: 'Сообщение сохранено и ждёт готовности терминала',
+      };
     case 'sending':
       return {
         label: 'SENDING',
@@ -1191,7 +1302,7 @@ export async function runHistoryPromptHandoff(
       || result.submitted === true;
     const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(result);
     const proof = historyPromptHandoffAuditProofFromSendResult(result);
-    const queueStatus: Exclude<HistoryPromptHandoffStatus, 'sending'> = !transferred
+    const queueStatus: SettledHistoryPromptHandoffStatus = !transferred
       || (result?.success === false && result?.submitted === true && !unconfirmedStatus)
       ? 'failed'
       : unconfirmedStatus
@@ -1232,6 +1343,12 @@ export const bindHistoryPromptHandoffSendIdentity = (
   input: BindHistoryPromptHandoffSendIdentityInput,
 ) => historyPromptHandoffStore.bindSendIdentity(tabId, handoffId, input);
 
+export const advanceHistoryPromptHandoffTransportPhase = (
+  tabId: string,
+  handoffId: string,
+  phase: HistoryPromptHandoffTransportPhase,
+) => historyPromptHandoffStore.advanceTransportPhase(tabId, handoffId, phase);
+
 export const settleHistoryPromptHandoff = (
   tabId: string,
   handoffId: string,
@@ -1254,6 +1371,37 @@ export const subscribeHistoryPromptHandoffs = (
 
 export const getHistoryPromptHandoffsSnapshot = (tabId: string) =>
   historyPromptHandoffStore.getSnapshot(tabId);
+
+const ORCHESTRATION_COMPLETION_HANDOFF_PREFIX = 'orchestration-complete:';
+const ORCHESTRATION_COMPLETION_SOURCE_PREFIX = 'orchestration-completion:';
+
+/**
+ * Legacy completion notifications predate desktop History receipts. Their
+ * durable presentation still carries the exact orchestration run identity, so
+ * that tag can retire the old local SENT projection without falling back to
+ * equal text or timestamps.
+ */
+export function legacyOrchestrationCompletionMatchesCanonicalEntry(
+  handoff: Pick<HistoryPromptHandoff, 'handoffId' | 'source' | 'queueStatus'> & {
+    sendOperationKey?: string | null;
+    sendAttemptId?: string | null;
+  },
+  entry: DurableHistoryCanonicalPromptEntry,
+) {
+  if (handoff?.queueStatus !== 'sent') return false;
+  if (handoff?.sendOperationKey || handoff?.sendAttemptId) return false;
+  const handoffId = String(handoff?.handoffId || '');
+  if (!handoffId.startsWith(ORCHESTRATION_COMPLETION_HANDOFF_PREFIX)) return false;
+  const runId = handoffId.slice(ORCHESTRATION_COMPLETION_HANDOFF_PREFIX.length).trim();
+  if (!runId) return false;
+  const source = String(handoff?.source || '');
+  if (source && source !== ORCHESTRATION_COMPLETION_SOURCE_PREFIX + runId) return false;
+  return (Array.isArray(entry?.semanticTags) ? entry.semanticTags : []).some((tag) => (
+    tag?.kind === 'orchestration'
+    && tag?.runId === runId
+    && (tag?.phase === 'completion' || tag?.phase === 'failure')
+  ));
+}
 
 export function durableHistorySendReceiptMatchesCanonicalEntry(
   record: DurableHistorySendReceiptRecord,
@@ -1317,7 +1465,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   const presentation = receipt.presentationSnapshot && typeof receipt.presentationSnapshot === 'object'
     ? receipt.presentationSnapshot
     : {};
-  let queueStatus: Exclude<HistoryPromptHandoffStatus, 'sending'> | null = null;
+  let queueStatus: SettledHistoryPromptHandoffStatus | null = null;
   if (record.state === 'confirmed') queueStatus = 'sent';
   else if (record.state === 'audit-pending') queueStatus = 'audit-pending';
   else if (record.state === 'delivery-unknown' || record.state === 'enter-armed') {

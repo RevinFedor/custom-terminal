@@ -122,10 +122,13 @@ export const DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS: Readonly<HistorySnapshotCach
   maxBytes: 64 * 1024 * 1024,
   maxEntries: 40_000,
   maxSnapshots: 8,
-  // Production histories observed around 67 MiB each. Keep the three terminal
-  // owners from the concurrency contract with headroom, while retaining a hard
-  // bound against an unbounded chain of large owner graphs.
-  maxOversizedBytes: 240 * 1024 * 1024,
+  // Codex resume/fork copies the whole parent transcript, so giants come in
+  // PAIRS: two ~150MB projections of near-identical sessions open side by
+  // side (live 07.08 09:56 — at 240MB each switch evicted the other giant,
+  // every A↔B switch re-applied 15.5K rows cold). 360MB holds the observed
+  // pair with headroom; the windowed-history model will shrink these to ~MB
+  // and this bridge allowance can then come back down.
+  maxOversizedBytes: 360 * 1024 * 1024,
   maxOversizedSnapshots: 3,
 });
 

@@ -55,3 +55,17 @@ test('a proven transform still cannot adopt a different operation hash', () => {
     canonicalReason: 'codex_image_placeholder_canonical',
   }).matches, false);
 });
+
+test('the exact Codex CRLF to double-LF transport proof keeps the sent operation identity', () => {
+  const proof = agentPromptAuditMatchesHash('windows-prompt-hash', {
+    provider: 'codex',
+    expectedHash: 'windows-prompt-hash',
+    actualHash: 'rollout-double-lf-hash',
+    canonicalized: true,
+    canonicalReason: 'codex_pty_crlf_materialized_as_double_lf',
+  });
+
+  assert.equal(proof.matches, true);
+  assert.equal(proof.identityHash, 'windows-prompt-hash');
+  assert.equal(proof.actualHash, 'rollout-double-lf-hash');
+});

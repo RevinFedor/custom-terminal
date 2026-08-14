@@ -222,6 +222,13 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
         cwd: '/tmp/noted-phase2-project',
       },
       {
+        tabId: 'phase2-model-restart-target',
+        name: 'Model restart target',
+        commandType: 'claude',
+        claudeSessionId: 'phase2-model-restart-session',
+        cwd: '/tmp/noted-phase2-project',
+      },
+      {
         tabId: 'phase2-codex-target-tab',
         name: 'Codex target',
         commandType: 'codex',
@@ -244,13 +251,42 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     command_type: 'claude',
     claude_session_id: 'phase2-closed-session',
   };
+  const archivedModelTarget = {
+    id: 903,
+    project_id: 'phase2-project',
+    tab_id: 'phase2-closed-model-target',
+    name: 'Closed model target',
+    cwd: '/tmp/noted-phase2-project',
+    command_type: 'claude',
+    claude_session_id: 'phase2-closed-model-session',
+  };
+  const appState = {
+    defaultClaudeModel: 'claude-opus-5[1m]',
+    claudeCodeSettings: {
+      models: [
+        {
+          key: 'opus-200k',
+          id: 'claude-opus-5',
+          label: 'Opus 5 (200K context)',
+        },
+        {
+          key: 'opus',
+          id: 'claude-opus-5[1m]',
+          label: 'Opus 5 (1M context)',
+        },
+      ],
+    },
+  };
   const projectManager = {
     db: {
       getAllProjects: () => projects,
       getProjectById: (id) => projects.find((project) => project.id === id) || null,
-      getTabHistoryEntriesByTabId: (tabId) => (
-        tabId === archivedClosedTarget.tab_id ? [archivedClosedTarget] : []
-      ),
+      getAppState: (key) => appState[key] ?? null,
+      getTabHistoryEntriesByTabId: (tabId) => {
+        if (tabId === archivedClosedTarget.tab_id) return [archivedClosedTarget];
+        if (tabId === archivedModelTarget.tab_id) return [archivedModelTarget];
+        return [];
+      },
     },
   };
 
@@ -264,6 +300,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     failNextCreateAgentTab: false,
     closedRestoreCount: 0,
     bridgeAvailable: true,
+    busyTabs: new Set(),
     sendResponder: async () => ({ success: true, submitted: true }),
     turnResult: {
       found: false,
@@ -279,10 +316,10 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     tabId,
     toolType: isCodexTab(tabId) ? 'codex' : 'claude',
     commandType: isCodexTab(tabId) ? 'codex' : 'claude',
-    status: 'active',
-    sessionStatus: 'active',
-    inputReady: true,
-    busy: false,
+    status: controller.busyTabs.has(tabId) ? 'busy' : 'active',
+    sessionStatus: controller.busyTabs.has(tabId) ? 'busy' : 'active',
+    inputReady: !controller.busyTabs.has(tabId),
+    busy: controller.busyTabs.has(tabId),
     sessionId: tabId === 'phase2-source-tab'
       ? 'phase2-source-session'
       : isInboxTab(tabId)
@@ -483,6 +520,94 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       sends: 0,
       runStatus: 404,
     });
+  });
+
+  await t.test('Claude Settings alias resolves to the exact 1M id before target creation and send', async () => {
+    const runId = 'phase2-claude-model-alias-new-target';
+    controller.sendResponder = async () => ({
+      success: true,
+      submitted: true,
+      accepted: true,
+    });
+    const response = await api('/api/orchestrations', {
+      runId,
+      sourceTabId: 'phase2-source-tab',
+      targetProjectId: 'phase2-project',
+      toolType: 'claude',
+      model: 'opus',
+      prompt: 'exact 1M model selection',
+      notifySource: false,
+    });
+    const created = controller.calls.findLast((call) => (
+      call.action === 'createAgentTab' && call.payload?.reservedTabId === response.body.run?.targetTabId
+    ));
+    const sent = scenarioPayload('orchestration:' + runId);
+    assert.deepEqual({
+      status: response.status,
+      launchModel: created?.payload?.codexModel,
+      sendModel: sent?.model,
+    }, {
+      status: 202,
+      launchModel: 'claude-opus-5[1m]',
+      sendModel: 'claude-opus-5[1m]',
+    });
+  });
+
+  await t.test('ambiguous Claude display name fails before reserving or creating a target', async () => {
+    const runId = 'phase2-claude-model-ambiguous';
+    const createsBefore = controller.createAgentTabCalls;
+    const response = await api('/api/orchestrations', {
+      runId,
+      sourceTabId: 'phase2-source-tab',
+      targetProjectId: 'phase2-project',
+      toolType: 'claude',
+      model: 'Opus 5',
+      prompt: 'must not choose a context variant',
+      notifySource: false,
+    });
+    const absentRun = await api('/api/orchestrations/' + runId);
+    assert.deepEqual({
+      status: response.status,
+      code: response.body.code,
+      creates: controller.createAgentTabCalls - createsBefore,
+      runStatus: absentRun.status,
+    }, {
+      status: 400,
+      code: 'agent_model_alias_ambiguous',
+      creates: 0,
+      runStatus: 404,
+    });
+  });
+
+  await t.test('closed target restore keeps the exact Settings model id', async () => {
+    const runId = 'phase2-claude-model-closed-restore';
+    const restoresBefore = controller.closedRestoreCount;
+    try {
+      controller.sendResponder = async () => ({
+        success: true,
+        submitted: true,
+        accepted: true,
+      });
+      const response = await api('/api/orchestrations', {
+        runId,
+        sourceTabId: 'phase2-source-tab',
+        targetTabId: archivedModelTarget.tab_id,
+        model: 'opus',
+        prompt: 'restore with exact 1M model',
+        notifySource: false,
+      });
+      assert.deepEqual({
+        status: response.status,
+        restores: controller.closedRestoreCount - restoresBefore,
+        sendModel: scenarioPayload('orchestration:' + runId)?.model,
+      }, {
+        status: 202,
+        restores: 1,
+        sendModel: 'claude-opus-5[1m]',
+      });
+    } finally {
+      controller.closedRestoreCount = restoresBefore;
+    }
   });
 
   await t.test('direct tab creation and Inbox reject a foreign model before creating a target', async () => {
@@ -1651,6 +1776,46 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       }
     }, 'mock Project API did not restart');
   };
+
+  await t.test('queued orchestration preserves its exact Settings model across server restart', async () => {
+    const runId = 'phase2-claude-model-restart';
+    const tabId = 'phase2-model-restart-target';
+    const handoffId = 'orchestration:' + runId;
+    controller.busyTabs.add(tabId);
+    controller.sendResponder = async () => ({
+      success: true,
+      submitted: true,
+      accepted: true,
+    });
+    const response = await api('/api/orchestrations', {
+      runId,
+      sourceTabId: 'phase2-source-tab',
+      targetTabId: tabId,
+      model: 'opus',
+      prompt: 'restart keeps canonical model',
+      notifySource: false,
+    });
+    assert.equal(response.status, 202);
+    assert.equal(scenarioSendCount(handoffId), 0);
+
+    await restartWebServer();
+    assert.equal(scenarioSendCount(handoffId), 0);
+    controller.busyTabs.delete(tabId);
+    webServer.webBroadcast(tabId, {
+      type: 'snapshot',
+      status: 'active',
+      sessionStatus: 'active',
+      inputReady: true,
+      busy: false,
+      sessionId: 'phase2-model-restart-session',
+      lifecycleGeneration: 'phase2-life:' + tabId,
+    });
+    await waitFor(
+      () => scenarioSendCount(handoffId) === 1,
+      'restarted queued orchestration did not dispatch',
+    );
+    assert.equal(scenarioPayload(handoffId)?.model, 'claude-opus-5[1m]');
+  });
 
   await t.test('G09 durable Project handoff survives server restart without another bridge send', async () => {
     const handoffId = 'g09-project-restart-handoff';

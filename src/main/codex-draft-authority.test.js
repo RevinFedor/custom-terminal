@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   createCodexDraftProofWaitTimeoutOutcome,
   enforceCodexInteractiveSurfaceDraftAuthority,
+  getCodexDraftFrameBlocker,
   mergeCodexDraftAuthority,
   shouldFinishCodexDraftProofWait,
   shouldWaitForCodexDraftProof,
@@ -24,6 +25,29 @@ const admittedRuntime = {
   stopping: false,
   turnBusy: false,
 };
+
+test('Codex draft proof only reads a closed, flushed, post-resize frame', () => {
+  assert.equal(getCodexDraftFrameBlocker(), 'frame-not-flushed');
+  assert.equal(getCodexDraftFrameBlocker({
+    synchronizedOutputOpen: true,
+    writeSeq: 12,
+    flushedSeq: 12,
+  }), 'synchronized-output-open');
+  assert.equal(getCodexDraftFrameBlocker({
+    writeSeq: 12,
+    flushedSeq: 11,
+  }), 'frame-not-flushed');
+  assert.equal(getCodexDraftFrameBlocker({
+    writeSeq: 12,
+    flushedSeq: 12,
+    pendingResizeWriteSeq: 12,
+  }), 'post-resize-frame-not-observed');
+  assert.equal(getCodexDraftFrameBlocker({
+    writeSeq: 13,
+    flushedSeq: 13,
+    pendingResizeWriteSeq: 12,
+  }), null);
+});
 
 test('hidden renderer cannot turn authoritative headless empty into unknown', () => {
   const result = mergeCodexDraftAuthority(

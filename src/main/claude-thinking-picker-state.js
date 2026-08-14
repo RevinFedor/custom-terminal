@@ -51,6 +51,7 @@ function inspectClaudeThinkingPickerSnapshot(snapshot) {
   if (lastIndex < 0) {
     return {
       visible: false,
+      modalPresent: false,
       stateKnown: false,
       thinking: null,
       selectedThinking: null,
@@ -60,9 +61,24 @@ function inspectClaudeThinkingPickerSnapshot(snapshot) {
 
   const footerIndex = lines.findLastIndex((line) => THINK_FOOTER_RE.test(line.normalized));
   const titleIndex = lines.findLastIndex((line) => THINK_TITLE_RE.test(line.normalized));
+  const enabledIndex = lines.findIndex((line, index) => (
+    index > titleIndex && /\bEnabled\b/i.test(line.normalized)
+  ));
+  const disabledIndex = lines.findIndex((line, index) => (
+    index > titleIndex && /\bDisabled\b/i.test(line.normalized)
+  ));
+  const ordinaryPromptAfterTitle = titleIndex >= 0
+    && lines.slice(titleIndex + 1, lastIndex + 1).some((line) => (
+      SELECTED_MARKER_RE.test(String(line?.text || line?.rawText || ''))
+      && optionState(line) === null
+    ));
+  const modalPresent = titleIndex >= 0
+    && ordinaryPromptAfterTitle !== true
+    && (footerIndex < 0 || footerIndex === lastIndex);
   if (footerIndex < 0 || footerIndex !== lastIndex) {
     return {
       visible: false,
+      modalPresent,
       stateKnown: false,
       thinking: null,
       selectedThinking: null,
@@ -70,15 +86,10 @@ function inspectClaudeThinkingPickerSnapshot(snapshot) {
     };
   }
 
-  const enabledIndex = lines.findIndex((line, index) => (
-    index < footerIndex && /\bEnabled\b/i.test(line.normalized)
-  ));
-  const disabledIndex = lines.findIndex((line, index) => (
-    index < footerIndex && /\bDisabled\b/i.test(line.normalized)
-  ));
-  if (titleIndex < 0 && (enabledIndex < 0 || disabledIndex < 0)) {
+  if (titleIndex < 0 || (enabledIndex < 0 && disabledIndex < 0)) {
     return {
       visible: false,
+      modalPresent,
       stateKnown: false,
       thinking: null,
       selectedThinking: null,
@@ -98,6 +109,7 @@ function inspectClaudeThinkingPickerSnapshot(snapshot) {
     : optionLines.filter(isSelectedLine);
   return {
     visible: true,
+    modalPresent: true,
     stateKnown: enabledIndex >= 0 && disabledIndex >= 0 && checked.length === 1,
     thinking: checked.length === 1 ? optionState(checked[0]) : null,
     selectedThinking: selected.length === 1 ? optionState(selected[0]) : null,

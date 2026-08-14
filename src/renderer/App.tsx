@@ -85,9 +85,44 @@ import { shouldNavigateProjectsWithArrow } from './utils/projectArrowNavigation.
 
 const { ipcRenderer } = window.require('electron');
 
-const CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS = 300;
 const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
+const DRAFT_SCREEN_DIAGNOSTIC_SETTLE_TIMEOUT_MS = 60_000;
+const draftScreenDiagnosticWaits = new Map<string, symbol>();
 type AgentRuntimeStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping' | 'unknown';
+
+const waitForPaintedDraftScreenDiagnostic = async (
+  tabId: string,
+  hint: { promptRow?: number | null; cursorRow?: number | null },
+  token: symbol,
+) => {
+  const deadline = Date.now() + DRAFT_SCREEN_DIAGNOSTIC_SETTLE_TIMEOUT_MS;
+  let previousBoundary = '';
+  let lastSnapshot: any = null;
+  while (Date.now() < deadline && draftScreenDiagnosticWaits.get(tabId) === token) {
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 180));
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    const snapshot: any = terminalRegistry.getDraftDiagnosticSnapshot(tabId, hint);
+    lastSnapshot = snapshot;
+    if (snapshot?.success === true && snapshot?.dom?.painted === true) {
+      const boundary = JSON.stringify([
+        snapshot.rendererGeneration,
+        snapshot.rendererGenerationOrdinal,
+        snapshot.rendererWriteSeq,
+        snapshot.rows,
+        snapshot.cols,
+        Math.round(Number(snapshot.dom?.width || 0)),
+        Math.round(Number(snapshot.dom?.height || 0)),
+      ]);
+      if (boundary === previousBoundary) {
+        return { snapshot, settled: true, timedOut: false };
+      }
+      previousBoundary = boundary;
+    } else {
+      previousBoundary = '';
+    }
+  }
+  return { snapshot: lastSnapshot, settled: false, timedOut: true };
+};
 
 function projectClaudeStatusThroughStartupDefaults(
   tabId: string,
@@ -462,6 +497,14 @@ const ProjectTabItem = memo(({
 
   // Settings → Размеры → ТАБЫ → Проекты. Padding x/y чипа проекта в TitleBar.
   const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
+  // Boolean, not the id: subscribing to the id would re-render EVERY project
+  // card on every pulse (Fingerprint Pattern — a selector must answer this
+  // component's own question).
+  const projectCardPulseActive = useUIStore((s) => s.projectCardPulseId === projectId);
+  // Remount key: a second click while the flash is still running must replay it
+  // from the start. Re-keying the node is what does that — the store cannot
+  // "clear then set on the next frame", because a hidden window paints no frames.
+  const projectCardPulseSeq = useUIStore((s) => s.projectCardPulseSeq);
 
   useEffect(() => {
     if (isEditing && inputRef.current) {
@@ -630,6 +673,18 @@ const ProjectTabItem = memo(({
     >
       {isActive && (
         <div className="absolute inset-0 bg-white rounded-sm" />
+      )}
+      {/* One flash when the pane header chip pointed here and the sidebar was
+          already on this project — the click's only visible answer in that case.
+          Above the active-white background so it reads on both states, below the
+          z-10 label, and pointer-events-none so it never eats a click. */}
+      {projectCardPulseActive && (
+        <div
+          key={projectCardPulseSeq}
+          className="animate-project-card-pulse absolute inset-0 rounded-sm pointer-events-none"
+          style={{ zIndex: 7 }}
+          aria-hidden
+        />
       )}
       {/* Awaiting-user-input — project has a tab blocked on AskUserQuestion.
           Purple wash pulses over the whole project tab (above the active-white
@@ -1127,7 +1182,6 @@ function App() {
     }
     return false;
   }, []);
-  const claudeSpinnerVisualIdleTimersRef = useRef<Map<string, number>>(new Map());
   // tabId -> awaiting (Claude blocked on AskUserQuestion, waiting for human answer).
   // Feeds the project-tab purple glow. Bracketed by claude:awaiting-input (main.js).
   const [awaitingTabs, setAwaitingTabs] = useState<Map<string, boolean>>(new Map());
@@ -1596,46 +1650,17 @@ function App() {
       setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
     };
 
-    const isNonClaudePtyAiTab = (tabId: string): boolean => {
-      const state = useWorkspaceStore.getState();
-      for (const ws of state.openProjects.values()) {
-        const tab = ws.tabs.get(tabId);
-        if (!tab) continue;
-        return tab.commandType === 'codex' || tab.commandType === 'gemini';
-      }
-      return false;
-    };
-
-    // Claude CLI spinner busy/idle → track on sub-agent tab + project badge.
-    // reason:'spinner' is a PTY-frame heuristic. Delay its false edge so the
-    // visual shimmer is not unmounted during 30-90ms gaps between spinner frames;
-    // RunAfter still consumes the raw IPC edge and ignores it separately.
+    // Claude's animated TUI glyph is not a lifecycle event. The main process no
+    // longer publishes it, and this guard keeps a hot-reloaded/older main from
+    // mutating the app-wide turn state. Hook/local-command edges are exact.
     const handleClaudeBusyState = (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
       console.warn('[App:BusyState] tabId=' + data.tabId.slice(-8) + ' busy=' + data.busy + (data.reason ? ' reason=' + data.reason : ''));
-      if (data.reason === 'spinner' && isNonClaudePtyAiTab(data.tabId)) {
-        console.warn('[App:BusyState] ignore claude spinner for non-claude AI tabId=' + data.tabId.slice(-8));
-        return;
-      }
-      const timers = claudeSpinnerVisualIdleTimersRef.current;
-      const pendingTimer = timers.get(data.tabId);
-      if (pendingTimer !== undefined) {
-        window.clearTimeout(pendingTimer);
-        timers.delete(data.tabId);
-      }
-
-      if (!data.busy && data.reason === 'spinner') {
-        const timer = window.setTimeout(() => {
-          timers.delete(data.tabId);
-          applyClaudeVisualBusy(data.tabId, false, data.reason);
-        }, CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS);
-        timers.set(data.tabId, timer);
-        return;
-      }
+      if (data.reason === 'spinner') return;
 
       applyClaudeVisualBusy(data.tabId, data.busy, data.reason);
       // Safety net for awaiting ⊆ busy: any turn-end clears a lingering awaiting flag
       // (user pressed Esc to cancel the whole turn instead of answering the question).
-      if (!data.busy && data.reason !== 'spinner') {
+      if (!data.busy) {
         setAwaitingTabs(prev => { if (!prev.get(data.tabId)) return prev; const n = new Map(prev); n.delete(data.tabId); return n; });
       }
     };
@@ -4131,6 +4156,52 @@ function App() {
     };
     ipcRenderer.on('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
 
+    const handleTerminalDraftScreenDiagnosticRequest = (_: any, payload: {
+      requestId?: string;
+      tabId?: string;
+      reason?: string;
+      promptRow?: number | null;
+      cursorRow?: number | null;
+    }) => {
+      const requestId = String(payload?.requestId || '');
+      const tabId = String(payload?.tabId || '');
+      if (!requestId || !tabId) return;
+      const hint = {
+        promptRow: payload?.promptRow,
+        cursorRow: payload?.cursorRow,
+      };
+      const immediate = terminalRegistry.getDraftDiagnosticSnapshot(tabId, hint);
+      ipcRenderer.send('terminal:draft-screen-diagnostic-response', {
+        requestId,
+        tabId,
+        reason: payload?.reason || '',
+        phase: 'immediate',
+        settled: false,
+        timedOut: false,
+        snapshot: immediate,
+      });
+
+      const token = Symbol(requestId);
+      draftScreenDiagnosticWaits.set(tabId, token);
+      void waitForPaintedDraftScreenDiagnostic(tabId, hint, token).then((result) => {
+        if (draftScreenDiagnosticWaits.get(tabId) !== token) return;
+        draftScreenDiagnosticWaits.delete(tabId);
+        ipcRenderer.send('terminal:draft-screen-diagnostic-response', {
+          requestId,
+          tabId,
+          reason: payload?.reason || '',
+          phase: result.settled ? 'painted-settled' : 'painted-timeout',
+          settled: result.settled,
+          timedOut: result.timedOut,
+          snapshot: result.snapshot,
+        });
+      });
+    };
+    ipcRenderer.on(
+      'terminal:draft-screen-diagnostic-request',
+      handleTerminalDraftScreenDiagnosticRequest,
+    );
+
     const handleTerminalCodexDraftStateRequest = async (_: any, payload: { requestId?: string; tabId?: string; reason?: string; waitFor?: boolean; waitOnUnknownOnly?: boolean; timeoutMs?: number }) => {
       const requestId = payload?.requestId;
       const tabId = payload?.tabId;
@@ -4202,13 +4273,15 @@ function App() {
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusyState);
       ipcRenderer.removeListener('claude-sdk:process-state', handleSdkProcessState);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
-      claudeSpinnerVisualIdleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
-      claudeSpinnerVisualIdleTimersRef.current.clear();
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
       ipcRenderer.removeListener('codex:tui-ready', handleCodexTuiReady);
       ipcRenderer.removeListener('codex:service-tier-proof', handleCodexServiceTierProof);
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
+      ipcRenderer.removeListener(
+        'terminal:draft-screen-diagnostic-request',
+        handleTerminalDraftScreenDiagnosticRequest,
+      );
       ipcRenderer.removeListener('terminal:codex-draft-state-request', handleTerminalCodexDraftStateRequest);
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('window:refocus-active', handleWindowRefocus);

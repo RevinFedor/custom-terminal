@@ -194,6 +194,28 @@
 }
 .animate-reopen-pulse { animation: reopen-pulse 0.3s ease-in-out 2; }
 
+/* "Nothing moved, and here is why": the pane header chip navigates to the tab's
+   project, so when the sidebar is already on that project the click has no
+   visible effect. One flash of that project's card says where the click went.
+
+   Two cycles × 300ms, matching the auto-clear in useUIStore::pulseProjectCard.
+   Animates background-color and an inset ring rather than opacity — per the
+   project's AI-Optimized UI rule, opacity-only fades are eaten by H.264/JPEG on
+   screen recordings. The ACTIVE project card is painted solid white underneath,
+   so a white wash would be invisible there: the accent tint is what reads on
+   both the white active card and the dark idle one. */
+@keyframes project-card-pulse {
+  0%, 100% {
+    background-color: rgba(99, 102, 241, 0);
+    box-shadow: inset 0 0 0 0 rgba(99, 102, 241, 0);
+  }
+  50% {
+    background-color: rgba(99, 102, 241, 0.38);
+    box-shadow: inset 0 0 0 1px rgba(129, 140, 248, 0.9);
+  }
+}
+.animate-project-card-pulse { animation: project-card-pulse 0.3s ease-in-out 2; }
+
 @keyframes tab-dot-spin {
   to { transform: rotate(360deg); }
 }
@@ -581,6 +603,25 @@
 .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
 .scrollbar-thin::-webkit-scrollbar-thumb { background: #555; border-radius: 2px; }
 .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #777; }
+
+/* Scrollbar for the tab lists — Ctrl+Tab / Cmd+P and the pane header's recent
+   list. Both are small floating panels where the app-wide 8px bar with its
+   opaque track reads as a second border down the right edge. One class so the
+   two lists cannot end up with different bars, same 5px ghost bar as the
+   reading surfaces. */
+.tab-list-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.10) transparent;
+}
+.tab-list-scroll::-webkit-scrollbar { width: 5px; height: 5px; }
+.tab-list-scroll::-webkit-scrollbar-track { background: transparent; }
+.tab-list-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.10);
+  border-radius: 999px;
+  transition: background 0.15s ease;
+}
+.tab-list-scroll:hover::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.22); }
+.tab-list-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.34); }
 
 /* SDK-tab chat scroll: 5px wide, transparent track, ghost thumb that only
    appears once content overflows. `scrollbar-gutter: stable` reserves the gutter

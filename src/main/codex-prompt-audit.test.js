@@ -167,6 +167,53 @@ test('accepts leading-only and trailing-only boundary normalization', () => {
   );
 });
 
+test('accepts the exact Codex PTY CRLF materialization seen in production', () => {
+  const expectedText = '<pasted_content>\nline one\r\nline two\r\n\r\nline four\n</pasted_content>';
+  const actualText = '<pasted_content>\nline one\n\nline two\n\n\n\nline four\n</pasted_content>';
+  const audit = {
+    handoffId: 'msog2zbr-zebnag',
+    expectedText,
+    expectedLen: expectedText.length,
+    expectedHash: 'a7fd88f93b6ef1e3',
+  };
+
+  assert.equal(actualText.length, expectedText.length, 'CRLF and LF+LF retain the same code-unit length');
+  assert.deepEqual(
+    codexCanonicalUserMessageMatch(audit, actualText),
+    { reason: 'codex_pty_crlf_materialized_as_double_lf' },
+  );
+  assert.deepEqual(
+    selectCodexPendingPromptAudit([audit], {
+      actualText,
+      actualHash: '2d8b890760950e83',
+    }),
+    {
+      audit,
+      canonicalMatch: { reason: 'codex_pty_crlf_materialized_as_double_lf' },
+    },
+  );
+});
+
+test('does not broaden Codex CRLF materialization into fuzzy whitespace matching', () => {
+  const expectedText = '<pasted_content>\nline one\r\nline two\n</pasted_content>';
+  assert.equal(
+    codexCanonicalUserMessageMatch(
+      { expectedText },
+      '<pasted_content>\nline one\nline two\n</pasted_content>',
+    ),
+    null,
+    'ordinary CRLF-to-LF normalization is not the observed Codex PTY edge',
+  );
+  assert.equal(
+    codexCanonicalUserMessageMatch(
+      { expectedText },
+      '<pasted_content>\nline one\n\nline  two\n</pasted_content>',
+    ),
+    null,
+    'an unrelated interior-space mutation remains corruption',
+  );
+});
+
 test('does not hide interior whitespace corruption or truncation', () => {
   assert.equal(
     codexCanonicalUserMessageMatch({ expectedText: ' hello  world ' }, 'hello world'),

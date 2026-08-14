@@ -8,6 +8,7 @@ import { useTimelineSummaryStore } from '../../store/useTimelineSummaryStore';
 import Tooltip from './Tooltip';
 import ControlHint from './ControlHint';
 import ProjectIconsSettings from './ProjectIconsSettings';
+import { TabProcessBar } from '../Workspace/TabSignals';
 import { HexColorPicker } from 'react-colorful';
 import { ChevronDown, ChevronRight, CircleX, Loader2, Pencil, Trash2, Plus } from 'lucide-react';
 import {
@@ -1264,24 +1265,24 @@ function ProcessBarEditor() {
       backgroundColor: '#252526', border: '1px solid #333',
       borderRadius: '6px', overflow: 'hidden',
     }}>
-      <div
-        className="tab-process-bar-static"
-        style={{
-          position: 'absolute',
-          [processBar.position === 'right' ? 'right' : 'left']: 0,
-          top: 0, bottom: 0, width: '3px',
-          overflow: 'hidden',
+      {/* Тот же компонент полоски, что и на всех поверхностях вкладки
+          (TabSignals) — иначе превью показывало бы не то, что получит юзер.
+          Единственное отличие: цвета и грань берутся из ЕЩЁ НЕ сохранённых
+          значений, которые юзер прямо сейчас крутит, поэтому здесь (и только
+          здесь) они передаются напрямую. Блик крутится постоянно; в рантайме
+          он появляется только когда AI стримит/думает. */}
+      <TabProcessBar
+        hasProcess
+        busy
+        positionOverride={processBar.position === 'right' ? 'right' : 'left'}
+        cssVars={{
           ['--process-bar-color-a' as any]: processBar.colorA,
           ['--process-bar-shimmer-rgb' as any]: hexToRgbTriplet(processBar.shimmerColor),
           ['--process-bar-shimmer-spacing' as any]: `${processBar.shimmerSpacingPct}%`,
           ['--process-bar-shimmer-alpha' as any]: previewPeakAlpha,
           ['--process-bar-shimmer-edge-alpha' as any]: Math.max(0.01, previewPeakAlpha * 0.22),
         }}
-      >
-        {/* Блик AI-busy крутится в превью постоянно; в рантайме он появляется
-            только когда AI стримит/думает (isBusy). */}
-        <div className="tab-process-bar-ai-shimmer-overlay" />
-      </div>
+      />
       <div style={{
         position: 'absolute', left: 12, right: 12, top: '50%', transform: 'translateY(-50%)',
         fontSize: '11px', color: '#888', textAlign: 'center',
@@ -1510,6 +1511,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const historyComposerMinRows = useUIStore((s) => s.historyComposerMinRows);
   const setHistoryComposerMinRows = useUIStore((s) => s.setHistoryComposerMinRows);
   const historyComposerMaxRows = useUIStore((s) => s.historyComposerMaxRows);
+  const stackedComposerMaxRows = useUIStore((s) => s.stackedComposerMaxRows);
+  const setStackedComposerMaxRows = useUIStore((s) => s.setStackedComposerMaxRows);
   const setHistoryComposerMaxRows = useUIStore((s) => s.setHistoryComposerMaxRows);
   const aiComposerChipThreshold = useUIStore((s) => s.aiComposerChipThreshold);
   const setAiComposerChipThreshold = useUIStore((s) => s.setAiComposerChipThreshold);
@@ -1608,6 +1611,16 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
   // Claude Default Prompt
   const [claudeDefaultPrompt, setClaudeDefaultPrompt] = useState('');
+  // Main-process memory budget for parsed session histories. Local state +
+  // immediate persist; main reads it once at startup (hence the restart hint
+  // next to the control).
+  const [historyProjectorBudgetMbState, setHistoryProjectorBudgetMbState] = useState(400);
+  const historyProjectorBudgetMb = historyProjectorBudgetMbState;
+  const setHistoryProjectorBudgetMb = useCallback((value: number) => {
+    const clamped = Math.max(64, Math.min(2048, Math.round(value)));
+    setHistoryProjectorBudgetMbState(clamped);
+    ipcRenderer.invoke('app:setState', { key: 'historyProjectorBudgetMb', value: String(clamped) });
+  }, []);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -1695,6 +1708,16 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       // Load Claude default prompt
       ipcRenderer.invoke('app:getState', 'claudeDefaultPrompt').then((value: string | null) => {
         setClaudeDefaultPrompt(value || '');
+      });
+
+      // History projector memory budget (main process reads this at startup).
+      ipcRenderer.invoke('app:getState', 'historyProjectorBudgetMb').then((value: any) => {
+        const parsed = Math.floor(Number(value));
+        // Load must NOT write back — setHistoryProjectorBudgetMb persists, and
+        // persisting on every modal open would rewrite the row for nothing.
+        if (Number.isFinite(parsed) && parsed > 0) {
+          setHistoryProjectorBudgetMbState(Math.max(64, Math.min(2048, parsed)));
+        }
       });
 
       // Load AI prompts from DB
@@ -3888,6 +3911,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Шрифт" description="Размер набираемого текста" value={historyComposerFontSize} onChange={setHistoryComposerFontSize} min={8} max={24} />
                 <FontSizeSlider label="Строк при пустом поле" description="Начальная высота input без текста" value={historyComposerMinRows} onChange={setHistoryComposerMinRows} min={1} max={historyComposerMaxRows} suffix="" />
                 <FontSizeSlider label="Максимум строк" description="После этого предела текст прокручивается внутри input" value={historyComposerMaxRows} onChange={setHistoryComposerMaxRows} min={historyComposerMinRows} max={40} suffix="" />
+                <FontSizeSlider label="Максимум строк в разделённой панели" description="Панель, разделённая по горизонтали, вдвое ниже: там input начинается с одной строки и растёт до этого предела" value={stackedComposerMaxRows} onChange={setStackedComposerMaxRows} min={1} max={20} suffix="" />
                 <FontSizeSlider
                   label="Чип после N символов"
                   description="Длинная ручная вставка; сохранённый prompt всегда становится чипом"
@@ -3959,6 +3983,34 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 status={mirrorStatus}
                 activeProjectId={activeProjectId}
               />
+
+              {/* Память под разобранные истории (главный процесс). Вынесено в
+                  настройки, потому что правильное значение зависит от машины:
+                  на 16GB запас в 400MB щедрый, на 64GB — можно втрое больше и
+                  держать тёплыми десятки вкладок. Применяется при старте —
+                  подпись об этом обязательна, иначе юзер решит, что настройка
+                  не работает. */}
+              <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
+                <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase', marginBottom: '10px' }}>
+                  Память истории
+                </div>
+                <SettingsGrid4>
+                  <FontSizeSlider
+                    label="Кэш разобранных сессий"
+                    description="Больше — реже полная перезагрузка при возврате на вкладку"
+                    value={historyProjectorBudgetMb}
+                    onChange={setHistoryProjectorBudgetMb}
+                    min={64}
+                    max={2048}
+                    suffix=" МБ"
+                  />
+                </SettingsGrid4>
+                <div style={{ fontSize: '10px', color: '#8a6d3b', marginTop: '8px', lineHeight: 1.5 }}>
+                  Применится после перезапуска приложения.
+                  {' '}Сессия занимает примерно 10–30 МБ; при нехватке бюджета самая
+                  давняя выгружается и её история читается заново.
+                </div>
+              </div>
 
               <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: '10px' }}>

@@ -236,6 +236,28 @@ test('an unproven hash transformation cannot promote a receipt', async () => {
   assert.ok(rejected.mismatchedFields.includes('canonicalProof'));
 });
 
+test('runtime receipt accepts the exact Codex CRLF transport proof', async () => {
+  const registry = createAgentSendReceiptRegistry();
+  await registry.run(identity(), async () => ({
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  }));
+
+  const promoted = registry.promoteFromAudit(exactAudit({
+    actualHash: 'rollout-double-lf-hash',
+    expectedHash: 'hash-a',
+    canonicalized: true,
+    canonicalReason: 'codex_pty_crlf_materialized_as_double_lf',
+  }));
+
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.state, RECEIPT_STATES.CONFIRMED);
+  assert.equal(promoted.receipt.promptHash, 'hash-a');
+  assert.equal(promoted.receipt.actualHash, 'rollout-double-lf-hash');
+});
+
 for (const matrix of [
   {
     name: 'delivery-unknown',

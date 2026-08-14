@@ -1,18 +1,44 @@
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { ChevronDown, ChevronRight, Github } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useDictationSnapshot } from '../../utils/dictationManager';
+import { resolveToastHostTabId, visibleToastTabIds } from '../../utils/toastPlacement.mjs';
+
+/** One entry of the toast list — the shape ToastCard renders. */
+type ToastModel = ReturnType<typeof useUIStore.getState>['toasts'][number];
 
 export default function ToastContainer() {
   const { toasts, removeToast } = useUIStore();
   const [expandedToastIds, setExpandedToastIds] = React.useState<Set<string>>(() => new Set());
   const animatedToastIdsRef = React.useRef<Set<string>>(new Set());
-  // Tab-scoped toasts (toast.tabId set) only render while their tab is the
-  // effective active one — switching tabs hides the toast, switching back shows
-  // it again. Global toasts (no tabId) render always.
+  // Toasts about a TAB are shown over that tab's own surface; global ones stay in
+  // the window corner.
+  //
+  // Two things were wrong before, and both only became visible once the
+  // workspace could show several tabs at once:
+  //   • place — the container is fixed to the WINDOW's top-right, so a message
+  //     about the left pane appeared over the right one;
+  //   • visibility — a tab-scoped toast rendered only while its tab was the
+  //     FOCUSED one, so clicking a neighbouring pane made it vanish even though
+  //     its tab is still on screen.
+  // Both now follow one fact: which tabs are VISIBLE, not which holds focus.
   const effectiveTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
-  const visibleToasts = toasts.filter((t) => !t.tabId || t.tabId === effectiveTabId);
+  // Fingerprint Pattern: the selector returns a STRING, never a new array.
+  const paneTabKey = useWorkspaceStore((s) => s.splitPanes.map((p) => p.tabId).join('|'));
+  const visibleTabIds = React.useMemo(
+    () => visibleToastTabIds({
+      panes: paneTabKey ? paneTabKey.split('|').map((tabId) => ({ tabId })) : [],
+      effectiveTabId,
+    }),
+    [paneTabKey, effectiveTabId],
+  );
+  // Everything renders; only the HOST differs. A toast whose tab is not on screen
+  // keeps the window corner rather than disappearing — losing a message about
+  // background work outright is worse than showing it slightly out of context.
+  const windowToasts = toasts.filter((t) => resolveToastHostTabId(t, visibleTabIds) === null);
+  const visibleToasts = windowToasts;
   const liveToastIds = React.useMemo(() => new Set(toasts.map((t) => t.id)), [toasts]);
 
   React.useEffect(() => {
@@ -56,10 +82,217 @@ export default function ToastContainer() {
         maxWidth: '420px'
       }}
     >
-      {visibleToasts.map((toast) => {
+      {visibleToasts.map((toast) => (
+        <ToastCard
+          key={toast.id}
+          toast={toast}
+          removeToast={removeToast}
+          expanded={expandedToastIds.has(toast.id)}
+          toggleToastDetails={toggleToastDetails}
+          animatedToastIdsRef={animatedToastIdsRef}
+        />
+      ))}
+      <DictationBackgroundStatus />
+      {/* Tab-scoped toasts live in their own tab's anchor, not here. Rendered as
+          siblings so this container keeps owning the global ones. */}
+      {visibleTabIds.map((tabId) => (
+        <PaneToasts
+          key={tabId}
+          tabId={tabId}
+          toasts={toasts.filter((t) => resolveToastHostTabId(t, visibleTabIds) === tabId)}
+          removeToast={removeToast}
+          expandedToastIds={expandedToastIds}
+          toggleToastDetails={toggleToastDetails}
+          animatedToastIdsRef={animatedToastIdsRef}
+        />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The toasts of ONE tab, portalled into that tab's anchor inside its pane.
+ *
+ * The anchor is created by TerminalArea next to every tab surface
+ * (`data-toast-anchor-tab-id`), so this only has to find it. It is looked up on
+ * every render rather than cached: panes mount, unmount and swap tabs, and a
+ * cached node would keep pointing at a box that is no longer on screen.
+ */
+function PaneToasts({
+  tabId,
+  toasts,
+  removeToast,
+  expandedToastIds,
+  toggleToastDetails,
+  animatedToastIdsRef,
+}: {
+  tabId: string;
+  toasts: ToastModel[];
+  removeToast: (id: string) => void;
+  expandedToastIds: Set<string>;
+  toggleToastDetails: (id: string) => void;
+  animatedToastIdsRef: React.MutableRefObject<Set<string>>;
+}) {
+  // Re-find the anchor whenever this tab's toasts change: on the very first toast
+  // of a freshly mounted pane the node may not have existed at the previous
+  // render. Cheap (one query), and it cannot go stale.
+  const [anchor, setAnchor] = React.useState<HTMLElement | null>(null);
+  React.useEffect(() => {
+    setAnchor(document.querySelector<HTMLElement>(`[data-toast-anchor-tab-id="${tabId}"]`));
+  }, [tabId, toasts.length]);
+  if (!anchor || toasts.length === 0) return null;
+  return createPortal(
+    <>
+      {toasts.map((toast) => (
+        <ToastCard
+          key={toast.id}
+          toast={toast}
+          removeToast={removeToast}
+          expanded={expandedToastIds.has(toast.id)}
+          toggleToastDetails={toggleToastDetails}
+          animatedToastIdsRef={animatedToastIdsRef}
+        />
+      ))}
+    </>,
+    anchor,
+  );
+}
+
+function DictationBackgroundStatus() {
+  const dictation = useDictationSnapshot();
+  const ownerTabId = dictation.owner?.tabId || null;
+  const appView = useWorkspaceStore((s) => s.view);
+  const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
+  const effectiveTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
+  const ownerProjectId = useWorkspaceStore((s) => {
+    if (!ownerTabId) return null;
+    for (const [projectId, workspace] of s.openProjects) {
+      if (workspace.tabs.has(ownerTabId)) return projectId;
+    }
+    return dictation.owner?.projectId || null;
+  });
+  const ownerTabName = useWorkspaceStore((s) => {
+    if (!ownerTabId) return dictation.owner?.tabName || '';
+    for (const [, workspace] of s.openProjects) {
+      const tab = workspace.tabs.get(ownerTabId);
+      if (tab) return tab.name || dictation.owner?.tabName || 'tab';
+    }
+    return dictation.owner?.tabName || 'tab';
+  });
+  const ownerProjectView = useWorkspaceStore((s) => {
+    if (!ownerProjectId) return 'terminal';
+    return s.openProjects.get(ownerProjectId)?.currentView || 'terminal';
+  });
+
+  const ownerVisible =
+    dictation.recording &&
+    appView === 'workspace' &&
+    activeProjectId === ownerProjectId &&
+    effectiveTabId === ownerTabId &&
+    ownerProjectView === 'terminal';
+
+  if (!dictation.recording || !ownerTabId || ownerVisible) return null;
+
+  const shortName = ownerTabName.length > 15 ? ownerTabName.slice(0, 14) + '…' : ownerTabName;
+
+  const goToOwnerTab = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const store = useWorkspaceStore.getState();
+    let targetProjectId = ownerProjectId;
+    if (!targetProjectId) {
+      for (const [projectId, workspace] of store.openProjects) {
+        if (workspace.tabs.has(ownerTabId)) {
+          targetProjectId = projectId;
+          break;
+        }
+      }
+    }
+    if (!targetProjectId) return;
+    store.showWorkspace(targetProjectId);
+    store.setViewingSubAgent(null);
+    store.switchTab(targetProjectId, ownerTabId);
+    store.setProjectView(targetProjectId, 'terminal');
+  };
+
+  return (
+    <div
+      className="pointer-events-auto flex items-center gap-2 rounded-lg shadow-lg backdrop-blur-sm animate-slide-in"
+      style={{
+        minHeight: 30,
+        padding: '6px 10px',
+        background: 'rgba(20,20,20,0.94)',
+        border: '1px solid rgba(218,119,86,0.45)',
+        color: '#e8e8e8',
+        fontSize: 12,
+      }}
+    >
+      <span
+        aria-hidden
+        style={{
+          width: 12,
+          height: 12,
+          borderRadius: '50%',
+          border: '2px solid rgba(218,119,86,0.25)',
+          borderTopColor: '#DA7756',
+          animation: 'dictation-status-spin 0.9s linear infinite',
+          flexShrink: 0,
+        }}
+      />
+      <span style={{ color: '#FF9466', fontWeight: 700, letterSpacing: 0.4, fontSize: 10 }}>
+        RECORDING
+      </span>
+      <button
+        onClick={goToOwnerTab}
+        title={ownerTabName}
+        style={{
+          maxWidth: 128,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          background: 'transparent',
+          border: 'none',
+          color: '#fff',
+          padding: 0,
+          fontSize: 12,
+          fontWeight: 650,
+          cursor: 'pointer',
+          textDecoration: 'underline',
+          textDecorationColor: 'rgba(255,255,255,0.35)',
+          textUnderlineOffset: 3,
+        }}
+      >
+        {shortName}
+      </button>
+      <style>{`
+        @keyframes dictation-status-spin {
+          to { transform: rotate(360deg); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+/**
+ * ONE toast card. Extracted so the window corner and a pane anchor render the
+ * SAME thing — two copies of this markup would drift apart detail by detail
+ * (that is exactly how five copies of the tab process bar happened).
+ */
+function ToastCard({
+  toast,
+  removeToast,
+  expanded: expandedProp,
+  toggleToastDetails,
+  animatedToastIdsRef,
+}: {
+  toast: ToastModel;
+  removeToast: (id: string) => void;
+  expanded: boolean;
+  toggleToastDetails: (id: string) => void;
+  animatedToastIdsRef: React.MutableRefObject<Set<string>>;
+}) {
         const details = String(toast.details || '').trim();
         const hasDetails = details.length > 0;
-        const expanded = hasDetails && expandedToastIds.has(toast.id);
+        const expanded = hasDetails && expandedProp;
         const shouldAnimate = !animatedToastIdsRef.current.has(toast.id);
         return (
           <div
@@ -209,122 +442,4 @@ export default function ToastContainer() {
             )}
           </div>
         );
-      })}
-      <DictationBackgroundStatus />
-    </div>
-  );
-}
-
-function DictationBackgroundStatus() {
-  const dictation = useDictationSnapshot();
-  const ownerTabId = dictation.owner?.tabId || null;
-  const appView = useWorkspaceStore((s) => s.view);
-  const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
-  const effectiveTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
-  const ownerProjectId = useWorkspaceStore((s) => {
-    if (!ownerTabId) return null;
-    for (const [projectId, workspace] of s.openProjects) {
-      if (workspace.tabs.has(ownerTabId)) return projectId;
-    }
-    return dictation.owner?.projectId || null;
-  });
-  const ownerTabName = useWorkspaceStore((s) => {
-    if (!ownerTabId) return dictation.owner?.tabName || '';
-    for (const [, workspace] of s.openProjects) {
-      const tab = workspace.tabs.get(ownerTabId);
-      if (tab) return tab.name || dictation.owner?.tabName || 'tab';
-    }
-    return dictation.owner?.tabName || 'tab';
-  });
-  const ownerProjectView = useWorkspaceStore((s) => {
-    if (!ownerProjectId) return 'terminal';
-    return s.openProjects.get(ownerProjectId)?.currentView || 'terminal';
-  });
-
-  const ownerVisible =
-    dictation.recording &&
-    appView === 'workspace' &&
-    activeProjectId === ownerProjectId &&
-    effectiveTabId === ownerTabId &&
-    ownerProjectView === 'terminal';
-
-  if (!dictation.recording || !ownerTabId || ownerVisible) return null;
-
-  const shortName = ownerTabName.length > 15 ? ownerTabName.slice(0, 14) + '…' : ownerTabName;
-
-  const goToOwnerTab = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const store = useWorkspaceStore.getState();
-    let targetProjectId = ownerProjectId;
-    if (!targetProjectId) {
-      for (const [projectId, workspace] of store.openProjects) {
-        if (workspace.tabs.has(ownerTabId)) {
-          targetProjectId = projectId;
-          break;
-        }
-      }
-    }
-    if (!targetProjectId) return;
-    store.showWorkspace(targetProjectId);
-    store.setViewingSubAgent(null);
-    store.switchTab(targetProjectId, ownerTabId);
-    store.setProjectView(targetProjectId, 'terminal');
-  };
-
-  return (
-    <div
-      className="pointer-events-auto flex items-center gap-2 rounded-lg shadow-lg backdrop-blur-sm animate-slide-in"
-      style={{
-        minHeight: 30,
-        padding: '6px 10px',
-        background: 'rgba(20,20,20,0.94)',
-        border: '1px solid rgba(218,119,86,0.45)',
-        color: '#e8e8e8',
-        fontSize: 12,
-      }}
-    >
-      <span
-        aria-hidden
-        style={{
-          width: 12,
-          height: 12,
-          borderRadius: '50%',
-          border: '2px solid rgba(218,119,86,0.25)',
-          borderTopColor: '#DA7756',
-          animation: 'dictation-status-spin 0.9s linear infinite',
-          flexShrink: 0,
-        }}
-      />
-      <span style={{ color: '#FF9466', fontWeight: 700, letterSpacing: 0.4, fontSize: 10 }}>
-        RECORDING
-      </span>
-      <button
-        onClick={goToOwnerTab}
-        title={ownerTabName}
-        style={{
-          maxWidth: 128,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-          background: 'transparent',
-          border: 'none',
-          color: '#fff',
-          padding: 0,
-          fontSize: 12,
-          fontWeight: 650,
-          cursor: 'pointer',
-          textDecoration: 'underline',
-          textDecorationColor: 'rgba(255,255,255,0.35)',
-          textUnderlineOffset: 3,
-        }}
-      >
-        {shortName}
-      </button>
-      <style>{`
-        @keyframes dictation-status-spin {
-          to { transform: rotate(360deg); }
-        }
-      `}</style>
-    </div>
-  );
 }

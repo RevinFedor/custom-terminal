@@ -155,6 +155,11 @@ export default function Workspace() {
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const historyPanelWidth = useUIStore((s) => s.historyPanelWidth);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
+  // Side terminal open-state: the SAME per-tab map the split panes use, so a
+  // single-mode side terminal is visible to every consumer (Run after shift,
+  // Terminal, hotkeys) exactly as it is in a split.
+  const sideTerminalOpenTabs = useUIStore((s) => s.sideTerminalOpenTabs);
+  const setSideTerminalOpen = useUIStore((s) => s.setSideTerminalOpen);
   // Deliberately NOT subscribing to timelineTreeModeTabs here: the two
   // consumers below read it imperatively (getState) inside event handlers.
   // A render subscription re-rendered the WHOLE Workspace on every expand/
@@ -164,6 +169,7 @@ export default function Workspace() {
   const sidebarWidth = useUIStore((s) => s.sidebarWidth);
   const sidebarFontSize = useUIStore((s) => s.sidebarFontSize);
   const historyPinnedSetting = useUIStore((s) => s.historyPinned);
+  const sideTerminalWidth = useUIStore((s) => s.sideTerminalWidth);
   const timelinePinned = useUIStore((s) => s.timelinePinned);
   const setTabTerminalIsPrimary = useUIStore((s) => s.setTabTerminalIsPrimary);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
@@ -221,7 +227,6 @@ export default function Workspace() {
   const [commandRunningByTab, setCommandRunningByTab] = useState<Map<string, boolean>>(() => new Map());
   const [agentPasteBusyByTab, setAgentPasteBusyByTab] = useState<Map<string, boolean>>(() => new Map());
   const commandStateSeqRef = useRef(0);
-  const [floatingTerminalOpenTabs, setFloatingTerminalOpenTabs] = useState<Record<string, boolean>>({});
   const [historyControlsHeight, setHistoryControlsHeight] = useState(0);
   const [agentLifecycleStatus, setAgentLifecycleStatus] = useState<AgentLifecycleSummary | null>(null);
   const [directoryChangePhase, setDirectoryChangePhase] = useState<DirectoryChangePhase>('idle');
@@ -366,6 +371,25 @@ export default function Workspace() {
   // History geometry remains disabled here so it cannot cover neighbouring
   // panes; the focused pane mounts the one live embedded History instance.
   const splitActiveLayout = useWorkspaceStore((s) => s.splitPanes.length > 0);
+  // Projects that have a tab in a pane but are NOT the one the sidebar shows.
+  // Each needs its own (hidden) list mounted as the owner of its context menu.
+  // Selector returns a joined STRING, never a new array — an array literal is a
+  // new reference every render and would re-render the whole workspace on any
+  // store write (Fingerprint Pattern, fix-performance-lags.md).
+  const paneMenuOwnerKey = useWorkspaceStore((s) => {
+    const sidebarPid = s.focusedProjectId || s.activeProjectId;
+    const ids = new Set<string>();
+    for (const pane of s.splitPanes) {
+      if (pane.projectId && pane.projectId !== sidebarPid && s.openProjects.has(pane.projectId)) {
+        ids.add(pane.projectId);
+      }
+    }
+    return Array.from(ids).sort().join('|');
+  });
+  const paneMenuOwnerProjectIds = useMemo(
+    () => (paneMenuOwnerKey ? paneMenuOwnerKey.split('|') : []),
+    [paneMenuOwnerKey],
+  );
   const historyIsPrimary = agentSurfacePairAvailable && !terminalIsPrimary && !splitActiveLayout;
   // Terminal-primary keeps History reachable as the side panel; it is the
   // active input surface there, so grab/dictation/task-plan still target it.
@@ -374,10 +398,23 @@ export default function Workspace() {
   // Pin is the user's preference; a viewport too narrow for both columns
   // downgrades it to overlay for this render only, without touching the
   // stored setting — widening the window restores the pushed layout.
+  //
+  // ONE toggle, one meaning: "the side panel opened by Cmd+] is a column, not
+  // an overlay". Which surface is in that slot — transcript or terminal —
+  // depends on the layout and is not the user's question; the pin used to
+  // apply to the transcript only, so the same gesture behaved differently
+  // depending on which way round the tab happened to be.
   const terminalColumnFloor = MIN_TERMINAL_COLUMN_WIDTH + sidebarWidth;
   const historyPinned = historyPinnedSetting
     && viewportWidth - historyPanelWidth >= terminalColumnFloor;
-  const floatingTerminalOpen = !!(effectiveTab?.id && floatingTerminalOpenTabs[effectiveTab.id]);
+  const sideTerminalPinned = historyPinnedSetting
+    && viewportWidth - sideTerminalWidth >= terminalColumnFloor;
+  // Single mode's side terminal is THE SAME per-tab flag the split panes use.
+  // It used to be local component state, so nothing outside Workspace could see
+  // it: Run after computed its shift from the store and therefore never moved in
+  // single mode, while the identical gesture worked in a split. One map, one
+  // meaning, every consumer reads it.
+  const floatingTerminalOpen = !!(effectiveTab?.id && sideTerminalOpenTabs[effectiveTab.id]);
   const promptQueuePortalHostId = 'workspace-prompt-queue-host';
   const dockedComposerHostId = 'workspace-docked-composer-host';
 
@@ -390,8 +427,8 @@ export default function Workspace() {
       setSearchResults({ resultIndex: 0, resultCount: 0 });
       terminalRegistry.clearSearch(tabId);
     }
-    setFloatingTerminalOpenTabs((current) => ({ ...current, [tabId]: !current[tabId] }));
-  }, [effectiveTab?.id, floatingTerminalOpen]);
+    setSideTerminalOpen(tabId, !floatingTerminalOpen);
+  }, [effectiveTab?.id, floatingTerminalOpen, setSideTerminalOpen]);
 
   // Terminal-primary counterpart of the floating-terminal toggle: the same
   // control in the composer's top line, pointing at the other surface.
@@ -405,12 +442,12 @@ export default function Workspace() {
   const closeFloatingTerminal = useCallback(() => {
     const tabId = effectiveTab?.id;
     if (!tabId) return;
-    setFloatingTerminalOpenTabs((current) => current[tabId] ? { ...current, [tabId]: false } : current);
+    setSideTerminalOpen(tabId, false);
     setShowSearch(false);
     setSearchText('');
     setSearchResults({ resultIndex: 0, resultCount: 0 });
     terminalRegistry.clearSearch(tabId);
-  }, [effectiveTab?.id]);
+  }, [effectiveTab?.id, setSideTerminalOpen]);
 
   // Swap which surface owns the center. Presentation only: the xterm keeps its
   // buffer/PTY and History keeps its owner, rows and draft — the frame around
@@ -423,9 +460,7 @@ export default function Workspace() {
     if (next) {
       // Entering terminal-primary: the terminal becomes the center, so the
       // floating window flag must not survive as a second "open" source.
-      setFloatingTerminalOpenTabs((current) => (
-        current[tabId] ? { ...current, [tabId]: false } : current
-      ));
+      setSideTerminalOpen(tabId, false);
       // The transcript panel is NOT force-opened here. Center ownership and
       // "transcript visible" are separate per-tab choices; opening it stays
       // the user's action (Cmd+] / the button).
@@ -804,7 +839,6 @@ export default function Workspace() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
       if ((e.metaKey || e.altKey) && e.code === 'BracketRight') {
-        if (historyIsPrimary) return;
         const shortcut = e.metaKey ? 'CMD+]' : 'OPT+]';
         const hasSession = effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId;
         if (!effectiveTab?.id || !hasSession) {
@@ -812,13 +846,35 @@ export default function Workspace() {
           return;
         }
         e.preventDefault();
-        // Split pane in transcript mode: the "other surface" beside the
-        // transcript is the pane's SIDE TERMINAL, not the history panel.
-        if (splitActiveLayout && !resolveTabTerminalPrimary(useUIStore.getState(), effectiveTab.id)) {
+        // In a split pane the shortcut opens THE OTHER surface of that pane,
+        // whichever it is — symmetric by design, so the key never feels dead:
+        //   transcript-primary → the pane's side TERMINAL,
+        //   terminal-primary   → the pane's side TRANSCRIPT.
+        // Only the first half existed, which is why "history does not work"
+        // in a terminal pane. Both go through the pane's own per-tab flags,
+        // not the single-mode ones.
+        if (splitActiveLayout) {
           const ui = useUIStore.getState();
+          const paneTerminalPrimary = resolveTabTerminalPrimary(ui, effectiveTab.id);
+          if (paneTerminalPrimary) {
+            const currentOpen = ui.historyPanelOpenTabs[effectiveTab.id] ?? false;
+            console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle side history (split): tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
+            setHistoryPanelOpen(effectiveTab.id, !currentOpen);
+            return;
+          }
           const currentOpen = ui.sideTerminalOpenTabs[effectiveTab.id] ?? false;
           console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle side terminal (split): tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
           ui.setSideTerminalOpen(effectiveTab.id, !currentOpen);
+          return;
+        }
+        // Single mode, same symmetry as a pane: the shortcut opens THE OTHER
+        // surface of the current layout.
+        //   transcript-primary → the side TERMINAL (was an early `return`, so
+        //                        the key did nothing at all in chat mode),
+        //   terminal-primary   → the side TRANSCRIPT.
+        if (historyIsPrimary) {
+          console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle floating terminal: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + floatingTerminalOpen + ' → ' + !floatingTerminalOpen);
+          toggleFloatingTerminal();
           return;
         }
         const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
@@ -828,7 +884,7 @@ export default function Workspace() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, historyIsPrimary, splitActiveLayout, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen]);
+  }, [workspaceView, historyIsPrimary, floatingTerminalOpen, toggleFloatingTerminal, splitActiveLayout, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen]);
 
   // CMD+[ / Option+[ — swap the center surface (History ↔ terminal).
   useEffect(() => {
@@ -1481,6 +1537,11 @@ export default function Workspace() {
       // Terminal-primary docks the one composer below the terminal, so it is
       // reachable even while the transcript panel is closed.
       composerPortalHostId={historyPlacementForRender.sidePanel ? dockedComposerHostId : undefined}
+      // Terminal-primary docks the composer at the bottom of the center box,
+      // and this panel hangs off that same box — so it must stop above the
+      // input, exactly as the mirrored side terminal already does. One measured
+      // number feeds both, so they cannot disagree.
+      bottomInset={historyPlacementForRender.sidePanel ? historyControlsHeight : 0}
       projectId={activeProjectId}
       // One control, one meaning: "show me the OTHER surface". In
       // History-primary the other surface is the terminal, in terminal-primary
@@ -1494,7 +1555,11 @@ export default function Workspace() {
       terminalIsPrimary={terminalIsPrimary}
       lifecycleStatus={agentSurfacePairAvailable ? agentLifecycleStatus : null}
       inputBusy={agentPasteBusyByTab.get(deferredHistoryOwner.tabId) === true}
-      onControlsHeightChange={historyPlacementForRender.isPrimary ? handleHistoryControlsHeight : undefined}
+      onControlsHeightChange={
+        historyPlacementForRender.isPrimary || historyPlacementForRender.sidePanel
+          ? handleHistoryControlsHeight
+          : undefined
+      }
     />
     </div>
   ) : null;
@@ -1567,6 +1632,18 @@ export default function Workspace() {
       {/* LEFT COLUMN: vertical tab sidebar */}
       <TabSidebar projectId={focusedProjectId || activeProjectId} />
 
+      {/* Menu owners for the OTHER projects currently visible in panes.
+          Render nothing; each exists only to answer a context-menu request for
+          its own project. The tab menu is built entirely from its project
+          (scripts and favourites of the tab's cwd, "Move to project", the
+          workspace toggle), so only that project's list can open it — and panes
+          are cross-project, so the sidebar's single list cannot serve them all.
+          A right click asks ABOUT a tab and must not navigate: the menu comes to
+          the project, the project does not move to the menu. */}
+      {paneMenuOwnerProjectIds.map((pid) => (
+        <TabBar key={`menu-owner-${pid}`} projectId={pid} layout="vertical" menuOnlyForProject />
+      ))}
+
       {/* CENTER COLUMN: Terminal/Home Area (no more TabBar above it) */}
       <div className="flex-1 flex flex-col min-w-0 relative">
 
@@ -1607,14 +1684,32 @@ export default function Workspace() {
               tabName={effectiveTab?.name || 'Terminal'}
               floating={historyIsPrimary}
               open={!historyIsPrimary || floatingTerminalOpen}
-              bottomInset={historyIsPrimary ? historyControlsHeight : 0}
+              // Same pin switch as the transcript panel: one control for the
+              // Cmd+] slot, whichever surface currently occupies it.
+              pinned={sideTerminalPinned}
+              bottomInset={
+                historyIsPrimary || historyIsAgentSidePanel
+                  ? historyControlsHeight
+                  : 0
+              }
               onClose={closeFloatingTerminal}
               searchNode={terminalSearchNode}
             >
               <TerminalArea
                 projectId={activeProjectId}
                 terminalPresented={!historyIsPrimary || floatingTerminalOpen}
-                promptQueuePortalHostId={historyIsPrimary ? promptQueuePortalHostId : undefined}
+                // ALWAYS portal the Run after strip out of the terminal layer,
+                // in both layouts. Terminal-primary with a docked composer
+                // shifts the whole terminal stage UPWARD by the composer height
+                // (see FloatingTerminalFrame translateY / stableTerminalViewport)
+                // so a growing input never resizes xterm. Anything left inside
+                // that stage rides the shift: the Run after strip drifted up and
+                // off the top with it. The strip belongs to the WORKSPACE, not
+                // to the terminal — its host below is a plain sibling of the
+                // shifted stage, so the terminal can move freely underneath.
+                // (A tab with no agent pair has no docked composer and no host;
+                // the strip then renders inline as before.)
+                promptQueuePortalHostId={agentSurfacePairAvailable ? promptQueuePortalHostId : undefined}
                 // Opening the transcript now lives in the composer's top line,
                 // beside the status — the same physical control that opens the
                 // terminal in the other layout. Keeping a second History button
@@ -1631,7 +1726,13 @@ export default function Workspace() {
               />
             </FloatingTerminalFrame>
 
-            {historyIsPrimary && (
+            {/* Run after host — a plain sibling of the (possibly shifted)
+                terminal stage, present in BOTH layouts. `bottom` is the
+                measured height of the docked input, so the strip stops above
+                the composer instead of running under it. In terminal-primary
+                that same measurement is what shifts the terminal upward, so
+                both surfaces read one number and cannot disagree. */}
+            {(historyIsPrimary || historyIsAgentSidePanel) && (
               <div
                 id={promptQueuePortalHostId}
                 data-history-prompt-queue-host
@@ -1672,20 +1773,26 @@ export default function Workspace() {
               row, so it takes width from the terminal and not from the composer
               or control bar underneath. */}
           {!historyPlacementForRender.isPrimary && historyPlacementForRender.pinned && historyPanelNode}
-          </div>
 
-          {/* Docked composer host — terminal-primary only. A normal bottom row
-              of this column, so the terminal above shrinks by exactly the
-              composer height and the user types here while watching the
-              terminal react. History renders its ONE composer into this host;
-              the side panel is then a pure transcript. */}
+          {/* The terminal keeps a stable xterm geometry. The composer is an
+              overlay at the bottom of this fixed viewport; FloatingTerminalFrame
+              moves the inline terminal upward by the measured height instead
+              of shrinking it and triggering a PTY resize/redraw. */}
           {historyIsAgentSidePanel && (
             <div
               id={dockedComposerHostId}
               data-workspace-docked-composer-host
-              className="shrink-0"
+              style={{
+                position: 'absolute',
+                left: 0,
+                right: 0,
+                bottom: 0,
+                zIndex: 140,
+                pointerEvents: 'auto',
+              }}
             />
           )}
+          </div>
 
           {/* Claude control bar — Provider/Model/Effort/Think + Ctx meter +
               SessionActionChip (Start/Continue/Stop). Visible on every Terminal
