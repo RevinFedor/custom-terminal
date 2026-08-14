@@ -17,12 +17,12 @@ export function resolveHistoryPromptHandoffPresentationSession({
 export function matchesHistoryPromptSuppression(entry, suppression) {
   if (entry.isLocal) return false;
   if (entry.role !== 'user' && entry.role !== 'queued') return false;
-  if (entry.normalizedText !== suppression.normalizedText) return false;
 
   if (suppression.requiresAuditIdentity) {
     if (suppression.sourceIdentity) {
       return entry.sourceIdentity === suppression.sourceIdentity;
     }
+    if (entry.normalizedText !== suppression.normalizedText) return false;
     if (!suppression.auditTimestamp || entry.timestamp !== suppression.auditTimestamp) {
       return false;
     }
@@ -30,6 +30,7 @@ export function matchesHistoryPromptSuppression(entry, suppression) {
       || entry.sessionId === suppression.auditSessionId;
   }
 
+  if (entry.normalizedText !== suppression.normalizedText) return false;
   const entryAt = Date.parse(entry.timestamp || '');
   return !Number.isFinite(entryAt)
     || (entryAt >= suppression.since && entryAt <= suppression.until);
@@ -37,12 +38,12 @@ export function matchesHistoryPromptSuppression(entry, suppression) {
 
 export function matchesHistoryPromptAdoption(entry, localPrompt) {
   if (entry.role !== 'user' && entry.role !== 'queued') return false;
-  if (entry.normalizedText !== localPrompt.normalizedText) return false;
 
   if (localPrompt.requiresAuditIdentity) {
     if (localPrompt.sourceIdentity) {
       return entry.sourceIdentity === localPrompt.sourceIdentity;
     }
+    if (entry.normalizedText !== localPrompt.normalizedText) return false;
     if (!localPrompt.auditTimestamp || entry.timestamp !== localPrompt.auditTimestamp) {
       return false;
     }
@@ -50,6 +51,7 @@ export function matchesHistoryPromptAdoption(entry, localPrompt) {
       || entry.sessionId === localPrompt.auditSessionId;
   }
 
+  if (entry.normalizedText !== localPrompt.normalizedText) return false;
   const entryAt = Date.parse(entry.timestamp || '');
   return !Number.isFinite(entryAt) || entryAt >= localPrompt.localAt - 5000;
 }

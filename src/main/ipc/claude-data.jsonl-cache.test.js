@@ -89,6 +89,44 @@ test('incremental append preserves the existing Map and adds only new records', 
   assert.equal(_api.getJsonlCacheStats().rawBytes, fs.statSync(filePath).size);
 });
 
+test('full and incremental parses preserve exact UTF-8 byte offsets', async () => {
+  const sessionId = 'byte-offset-session';
+  const filePath = path.join(tempDir, sessionId + '.jsonl');
+  const firstLine = JSON.stringify({
+    type: 'user',
+    uuid: 'offset-user-1',
+    sessionId,
+    message: { content: 'привет' },
+  });
+  const secondLine = JSON.stringify({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    sessionId,
+    content: 'дальше',
+  });
+  const thirdLine = JSON.stringify({
+    type: 'assistant',
+    uuid: 'offset-assistant-2',
+    sessionId,
+    message: { content: 'готово' },
+  });
+  fs.writeFileSync(filePath, firstLine + '\n' + secondLine + '\n', 'utf8');
+
+  const first = await loadJsonlRecords(filePath);
+  assert.equal(first.recordMap.get('offset-user-1').__byteOffset, 0);
+  assert.equal(
+    first.queueOperations[0].__byteOffset,
+    Buffer.byteLength(firstLine, 'utf8') + 1,
+  );
+
+  fs.appendFileSync(filePath, thirdLine + '\n', 'utf8');
+  const second = await loadJsonlRecords(filePath);
+  assert.equal(
+    second.recordMap.get('offset-assistant-2').__byteOffset,
+    Buffer.byteLength(firstLine + '\n' + secondLine + '\n', 'utf8'),
+  );
+});
+
 test('explicit invalidation during a yielded parse cannot republish stale data', async () => {
   const sessionId = 'invalidate-session';
   const filePath = path.join(tempDir, sessionId + '.jsonl');

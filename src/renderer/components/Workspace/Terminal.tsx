@@ -2676,8 +2676,11 @@ function Terminal({
         if (event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'Tab') {
           return false;
         }
-        // Cmd+P — tab search switcher. Layout-agnostic via event.code.
-        if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+        // Cmd+P / Ctrl+P — tab search switcher. Layout-agnostic via event.code.
+        // Both modifiers open the same panel, so both must be kept out of the
+        // PTY (Ctrl+P is readline "previous line" — leaking it would edit the
+        // user's command line while the switcher opens).
+        if ((event.metaKey !== event.ctrlKey) && !event.altKey && !event.shiftKey
             && event.type === 'keydown' && event.code === 'KeyP') {
           return false;
         }
@@ -3260,8 +3263,11 @@ function Terminal({
           if (event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'Tab') {
             return false;
           }
-          // Cmd+P — tab search switcher. Layout-agnostic via event.code.
-          if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+          // Cmd+P / Ctrl+P — tab search switcher. Layout-agnostic via event.code.
+          // Both modifiers open the same panel, so both must be kept out of the
+          // PTY (Ctrl+P is readline "previous line" — leaking it would edit the
+          // user's command line while the switcher opens).
+          if ((event.metaKey !== event.ctrlKey) && !event.altKey && !event.shiftKey
               && event.type === 'keydown' && event.code === 'KeyP') {
             return false;
           }

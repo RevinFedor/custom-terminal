@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  extractClaudeQueueOperationPromptText,
   extractClaudePromptCarrier,
   findMatchingClaudePromptTurn,
   isClaudeTaskNotificationCarrier,
@@ -38,6 +39,29 @@ test('extracts exact text from a Claude queued_command attachment', () => {
     text: '[Оркестрация] runId: exact-run',
     uuid: 'q1',
     timestamp: '2026-07-28T02:21:17.000Z',
+  });
+});
+
+test('preserves boundary whitespace in Claude queue carriers for exact delivery identity', () => {
+  const text = '  queued prompt with exact boundary whitespace  \n';
+  assert.equal(extractClaudeQueueOperationPromptText({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    content: text,
+  }), text);
+  assert.deepEqual(extractClaudePromptCarrier({
+    type: 'attachment',
+    uuid: 'q-whitespace',
+    timestamp: '2026-08-15T10:00:00.000Z',
+    attachment: {
+      type: 'queued_command',
+      prompt: [{ type: 'text', text }],
+    },
+  }), {
+    kind: 'queued_command',
+    text,
+    uuid: 'q-whitespace',
+    timestamp: '2026-08-15T10:00:00.000Z',
   });
 });
 

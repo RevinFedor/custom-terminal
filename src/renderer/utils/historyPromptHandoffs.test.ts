@@ -195,6 +195,7 @@ test('settle preserves exact handoff identity and immutable audit proof', () => 
     sessionId: 'session-live',
     entryUuid: 'exact-user-entry',
     sourceIdentity: 'codex-user-source-session-live-258313991',
+    recordByteOffset: 258313991,
     actualLen: 69165,
     canonicalized: true,
     canonicalReason: 'codex_trimmed_boundary_whitespace',
@@ -219,6 +220,7 @@ test('settle preserves exact handoff identity and immutable audit proof', () => 
     sessionId: 'session-live',
     entryUuid: 'exact-user-entry',
     sourceIdentity: 'codex-user-source-session-live-258313991',
+    recordByteOffset: 258313991,
     actualLen: 69165,
     canonicalized: true,
     canonicalReason: 'codex_trimmed_boundary_whitespace',
@@ -335,6 +337,7 @@ test('cached SENDING and CONFIRMING rows reconcile from the exact handoff snapsh
       sessionId: 'session-tab-a',
       entryUuid: 'durable-confirming-uuid',
       sourceIdentity: 'codex-user-session-tab-a-2',
+      recordByteOffset: 4096,
     },
   });
   store.settle('tab-a', 'handoff-missing', {
@@ -364,6 +367,7 @@ test('cached SENDING and CONFIRMING rows reconcile from the exact handoff snapsh
   assert.equal(byId.get('handoff-confirming')?.auditHash, 'hash-confirming');
   assert.equal(byId.get('handoff-confirming')?.auditEntryUuid, 'durable-confirming-uuid');
   assert.equal(byId.get('handoff-confirming')?.sourceIdentity, 'codex-user-session-tab-a-2');
+  assert.equal(byId.get('handoff-confirming')?.recordByteOffset, 4096);
   assert.equal(byId.get('handoff-missing')?.queueStatus, 'audit-pending');
   assert.equal(byId.get('handoff-missing')?.content, 'same prompt');
 });
@@ -967,6 +971,7 @@ test('durable confirmation hydrates as one final SENT snapshot without transient
       actualHash: 'hash-durable-confirmed',
       auditTimestamp: '2026-08-06T12:00:00.000Z',
       entryUuid: 'entry-durable-confirmed',
+      recordByteOffset: 8192,
       presentationSnapshot: { promptChips: [], imagePaths: [] },
     },
   });
@@ -974,6 +979,7 @@ test('durable confirmation hydrates as one final SENT snapshot without transient
   assert.equal(outcome.hydrated, true);
   assert.deepEqual(observedStatuses, ['sent']);
   assert.equal(outcome.handoff?.queueStatus, 'sent');
+  assert.equal(outcome.handoff?.auditProof?.recordByteOffset, 8192);
   unsubscribe();
   consumeHistoryPromptHandoff(tabId, handoffId);
 });

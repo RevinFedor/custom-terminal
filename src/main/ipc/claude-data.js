@@ -673,7 +673,17 @@ function _trimTrailingEffortEntries(sessionId, cwd) {
 // Parse JSONL lines into an existing recordMap (shared logic for full +
 // incremental reads). Large transcripts yield cooperatively between bounded
 // batches so one History read cannot monopolize Electron's main loop.
-async function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, queueOperations, startFileIndex, bridgeSessionIdIn, startQueueIndex = 0) {
+async function _parseJsonlLines(
+  lines,
+  sessionId,
+  recordMap,
+  progressEntries,
+  queueOperations,
+  startFileIndex,
+  bridgeSessionIdIn,
+  startQueueIndex = 0,
+  startByteOffset = 0,
+) {
   let lastRecord = null;
   let bridgeSessionId = bridgeSessionIdIn;
   let fileIndex = startFileIndex;
@@ -681,13 +691,20 @@ async function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, qu
   let linesSinceYield = 0;
   let charsSinceYield = 0;
   let yieldCount = 0;
+  let byteOffset = Number.isSafeInteger(Number(startByteOffset))
+    && Number(startByteOffset) >= 0
+    ? Number(startByteOffset)
+    : 0;
 
   for (const line of lines) {
+    const recordByteOffset = byteOffset;
+    byteOffset += Buffer.byteLength(line, 'utf8') + 1;
     linesSinceYield += 1;
     charsSinceYield += line.length;
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
+      entry.__byteOffset = recordByteOffset;
       if (entry.type === 'progress' && entry.data?.type === 'agent_progress' && entry.parentToolUseID) {
         progressEntries.push(entry);
       }
@@ -724,7 +741,7 @@ async function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, qu
   }
 
   _jsonlParseYieldCount += yieldCount;
-  return { lastRecord, bridgeSessionId, fileIndex, queueIndex, yieldCount };
+  return { lastRecord, bridgeSessionId, fileIndex, queueIndex, yieldCount, byteOffset };
 }
 
 // Load all records from a JSONL file into a Map (uuid → record)
@@ -811,7 +828,8 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
       yieldCount,
     } = await _parseJsonlLines(
       lines, sessionId, deltaRecordMap, deltaProgressEntries, deltaQueueOperations,
-      prevFileIndex, prevBridgeSessionId, prevQueueIndex
+      prevFileIndex, prevBridgeSessionId, prevQueueIndex,
+      Math.max(0, prevSize - Buffer.byteLength(prevLeftover, 'utf8')),
     );
 
     if (
@@ -871,7 +889,7 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
     queueIndex,
     yieldCount,
   } = await _parseJsonlLines(
-    lines, sessionId, recordMap, progressEntries, queueOperations, 0, null, 0
+    lines, sessionId, recordMap, progressEntries, queueOperations, 0, null, 0, 0
   );
 
   if (claudeJsonlEpoch(filePath) !== expectedEpoch) {
@@ -1852,6 +1870,7 @@ function _applyEditableLastPromptStatus(entries, promptState) {
 
 function _claudeHistoryContext(promptState, discovery) {
   return JSON.stringify({
+    schema: 'claude-full-history-v2-record-byte-offset',
     discovery: discovery || null,
     editableLastPrompt: promptState?.status === 'editable-last-prompt'
       ? {
@@ -5126,7 +5145,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       const normalizeQueuedText = (text) => String(text || '')
         .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
         .replace(/\[200~/g, '').replace(/~\]/g, '').trim();
-      const slashCommandEntryFromText = (text, uuid, timestamp, entrySid) => {
+      const slashCommandEntryFromText = (text, uuid, timestamp, entrySid, recordByteOffset) => {
         const slash = slashCommandDisplayFromText(text);
         if (!slash) return null;
         return {
@@ -5134,7 +5153,10 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           role: 'slash',
           timestamp: timestamp || '',
           content: slash.content,
-          sessionId: entrySid
+          sessionId: entrySid,
+          ...(Number.isSafeInteger(recordByteOffset) && recordByteOffset >= 0
+            ? { recordByteOffset }
+            : {}),
         };
       };
       const shouldSkipPromptText = (text) => {
@@ -5192,7 +5214,13 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           const cleanContent = normalizeQueuedText(extractQueuedCommandPromptText(entry.attachment.prompt));
           if (!cleanContent || shouldSkipPromptText(cleanContent)) continue;
           dropMatchingQueuedEntry(cleanContent, entry.timestamp, entrySid);
-          const slashEntry = slashCommandEntryFromText(cleanContent, entry.uuid, entry.timestamp, entrySid);
+          const slashEntry = slashCommandEntryFromText(
+            cleanContent,
+            entry.uuid,
+            entry.timestamp,
+            entrySid,
+            entry.__byteOffset,
+          );
           if (slashEntry) {
             appendProjectedEntry(slashEntry);
           } else {
@@ -5202,7 +5230,8 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
               timestamp: entry.timestamp || '',
               content: cleanContent,
               queueStatus: 'sent',
-              sessionId: entrySid
+              sessionId: entrySid,
+              recordByteOffset: entry.__byteOffset,
             });
           }
           continue;
@@ -5218,7 +5247,8 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
               timestamp: entry.timestamp || '',
               content: cleanContent,
               queueStatus: 'queued',
-              sessionId: entrySid
+              sessionId: entrySid,
+              recordByteOffset: entry.__byteOffset,
             };
             pendingQueueEntries.push(queuedEntry);
             appendProjectedEntry(queuedEntry);
@@ -5302,12 +5332,19 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
               timestamp: entry.timestamp || '',
               content: 'COMPACTED',
               compactSummary: cleanContent,
-              sessionId: entrySid
+              sessionId: entrySid,
+              recordByteOffset: entry.__byteOffset,
             });
             continue;
           }
 
-          const slashEntry = slashCommandEntryFromText(rawContent, entry.uuid, entry.timestamp, entrySid);
+          const slashEntry = slashCommandEntryFromText(
+            rawContent,
+            entry.uuid,
+            entry.timestamp,
+            entrySid,
+            entry.__byteOffset,
+          );
           if (slashEntry) {
             appendProjectedEntry(slashEntry);
             continue;
@@ -5320,7 +5357,8 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
             role: isContinued ? 'continued' : 'user',
             timestamp: entry.timestamp || '',
             content: cleanContent,
-            sessionId: entrySid
+            sessionId: entrySid,
+            recordByteOffset: entry.__byteOffset,
           });
         } else if (entry.type === 'assistant') {
           const msgContent = entry.message?.content;
@@ -5481,7 +5519,8 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
               content: textContent.trim(),
               thinking: thinkingParts.length > 0 ? thinkingParts.join('\n\n---\n\n') : undefined,
               actions: actions.length > 0 ? actions : undefined,
-              sessionId: entrySid
+              sessionId: entrySid,
+              recordByteOffset: entry.__byteOffset,
             });
           }
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
@@ -5517,7 +5556,8 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
             content: 'COMPACTED',
             compactSummary: compactSummary || undefined,
             preTokens: entry.compactMetadata?.preTokens || undefined,
-            sessionId: entrySid
+            sessionId: entrySid,
+            recordByteOffset: entry.__byteOffset,
           });
         }
 

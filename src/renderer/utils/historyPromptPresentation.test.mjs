@@ -127,3 +127,29 @@ test('source identity is the strongest exact adoption proof', () => {
     sourceIdentity: 'codex-user-source-session-a-2048',
   }), false);
 });
+
+test('exact source identity adopts and suppresses the same record despite provider text normalization', () => {
+  const entry = {
+    role: 'user',
+    isLocal: false,
+    normalizedText: 'line one\n\nline two',
+    timestamp: '2026-08-14T12:00:00.000Z',
+    sessionId: 'session-a',
+    sourceIdentity: 'codex-user-source-session-a-4096',
+  };
+  const exactIdentity = {
+    normalizedText: 'line one\nline two',
+    requiresAuditIdentity: true,
+    sourceIdentity: 'codex-user-source-session-a-4096',
+  };
+
+  assert.equal(matchesHistoryPromptAdoption(entry, {
+    ...exactIdentity,
+    localAt: Date.parse(entry.timestamp),
+  }), true);
+  assert.equal(matchesHistoryPromptSuppression(entry, {
+    ...exactIdentity,
+    since: 0,
+    until: Number.MAX_SAFE_INTEGER,
+  }), true);
+});

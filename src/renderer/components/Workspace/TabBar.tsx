@@ -71,6 +71,7 @@ import {
 } from './tabChrome';
 import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -6267,29 +6268,22 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     return () => document.removeEventListener('mousedown', handleClose);
   }, [contextMenu, emptyContextMenu, groupContextMenu, commandHistoryPopover]);
 
-  // Clamp context menu position to viewport (same pattern as Timeline tooltip)
+  // Clamp context menu position to viewport. The rule itself lives in
+  // menuViewportClamp.mjs — it used to be inlined here, and every menu written
+  // afterwards (the pane's split-direction menu) was written without it and
+  // opened outside the window.
   useLayoutEffect(() => {
     const activeMenu = contextMenu || groupContextMenu || emptyContextMenu;
     if (!activeMenu || !contextMenuRef.current) return;
-    const el = contextMenuRef.current;
-    const rect = el.getBoundingClientRect();
-    const pad = 8;
-    let x = activeMenu.x;
-    let y = activeMenu.y;
-
-    // Clamp bottom
-    if (y + rect.height > window.innerHeight - pad) {
-      y = window.innerHeight - rect.height - pad;
-    }
-    // Clamp top
-    if (y < pad) y = pad;
-    // Clamp right
-    if (x + rect.width > window.innerWidth - pad) {
-      x = window.innerWidth - rect.width - pad;
-    }
-    // Clamp left
-    if (x < pad) x = pad;
-
+    const rect = contextMenuRef.current.getBoundingClientRect();
+    const { x, y } = clampMenuToViewport({
+      x: activeMenu.x,
+      y: activeMenu.y,
+      width: rect.width,
+      height: rect.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
     if (x !== contextMenuPos.x || y !== contextMenuPos.y) {
       setContextMenuPos({ x, y });
     }

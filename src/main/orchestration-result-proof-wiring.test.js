@@ -93,7 +93,7 @@ test('settled result proof terminalizes exact abort or no-final-result before ar
   assert.match(finalize, /sendOrchestrationCompletionNotification\(finalizedFailure\)/);
 });
 
-test('only explicit submitted false bypasses orchestration recovery grace', () => {
+test('only exact pre-submit or provider-not-accepted proof bypasses orchestration recovery grace', () => {
   const applyReceipt = block(
     'async function applyOrchestrationTargetSendReceipt',
     '\nasync function dispatchDeferredOrchestrationRun',
@@ -103,4 +103,12 @@ test('only explicit submitted false bypasses orchestration recovery grace', () =
   assert.match(applyReceipt, /failureGraceMs: recoveryPolicy\.failureGraceMs/);
   assert.match(applyReceipt, /finalizeSettledOrchestrations\(failed\.settled, reason \+ '-send-failed'\)/);
   assert.match(applyReceipt, /\[OrchestrationDelivery\] exact pre-submit failure/);
+  assert.match(applyReceipt, /AGENT_SEND_RECEIPT_STATES\.PROVIDER_NOT_ACCEPTED/);
+  assert.match(applyReceipt, /\[OrchestrationDelivery\] exact provider-not-accepted after Enter/);
+  assert.match(applyReceipt, /current\.targetPromptProofAt/);
+  assert.doesNotMatch(
+    applyReceipt,
+    /PROVIDER_NOT_ACCEPTED[\s\S]{0,900}resetDeferredDelivery/,
+    'post-Enter provider refusal must not be rewritten as a pre-Enter retryable refusal',
+  );
 });

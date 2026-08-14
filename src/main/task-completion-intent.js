@@ -4,6 +4,13 @@ function normalize(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function normalizeProcessId(value) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? String(value) : '';
+  }
+  return normalize(value);
+}
+
 class TaskCompletionIntentRegistry {
   constructor(options = {}) {
     this.turns = new Map();
@@ -24,7 +31,7 @@ class TaskCompletionIntentRegistry {
     const normalizedProvider = normalize(provider);
     const normalizedSessionId = normalize(sessionId) || null;
     const normalizedTurnId = normalize(turnId) || null;
-    const normalizedProcessId = normalize(processId) || null;
+    const normalizedProcessId = normalizeProcessId(processId) || null;
     if (!normalizedTabId) throw new Error('tabId required');
     if (!normalizedProvider) throw new Error('provider required');
 
@@ -88,7 +95,7 @@ class TaskCompletionIntentRegistry {
     const normalizedProvider = normalize(provider);
     const normalizedSessionId = normalize(sessionId);
     const normalizedTurnId = normalize(turnId);
-    const normalizedProcessId = normalize(processId);
+    const normalizedProcessId = normalizeProcessId(processId);
     if (normalizedProvider && state.provider !== normalizedProvider) {
       return { matched: false, explicitTaskComplete: false };
     }

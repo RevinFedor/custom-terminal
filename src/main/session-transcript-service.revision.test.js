@@ -857,6 +857,61 @@ test('a parked transcript state publishes nothing until it is reclaimed', async 
   service._closeState(service.sessions.values().next().value, 'test-teardown');
 });
 
+test('a main audit consumer keeps Claude prompt ownership live after History unmounts', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'transcript-audit-owner-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session-audit-owner.jsonl');
+  await fs.promises.writeFile(filePath, '{"type":"system"}\n');
+
+  const ownerProbes = [];
+  const delivered = [];
+  const service = new SessionTranscriptService({
+    getMainWindow: () => ({
+      isDestroyed: () => false,
+      webContents: { send: (channel, payload) => delivered.push({ channel, payload }) },
+    }),
+    webBroadcast: null,
+    resolveClaudePromptOwner: (detail) => {
+      ownerProbes.push(detail);
+      return { handoffId: 'history-handoff', reason: 'exact-test-owner' };
+    },
+    claudeData: {
+      findSessionFile: () => ({ filePath }),
+    },
+    codexData: null,
+    idleGraceMs: 5000,
+  });
+  const base = {
+    tabId: 'tab-a',
+    toolType: 'claude',
+    sessionId: 'session-audit-owner',
+    cwd: dir,
+  };
+  await service.subscribe({ ...base, consumerId: 'history:tab-a' });
+  await service.subscribe({ ...base, consumerId: 'main:claude-prompt-audit:tab-a:attempt-a' });
+  await service.unsubscribe({ consumerId: 'history:tab-a' });
+
+  const state = service.sessions.values().next().value;
+  assert.equal(state.idleTimer, null, 'main audit ownership keeps the watcher authoritative');
+  await fs.promises.appendFile(filePath, JSON.stringify({
+    type: 'attachment',
+    uuid: 'queued-proof',
+    timestamp: '2026-08-15T10:00:00.000Z',
+    attachment: { type: 'queued_command', prompt: 'delivered while History is closed' },
+  }) + '\n');
+  await service._readChange(state, 'test-audit-owner');
+
+  assert.equal(ownerProbes.length, 1);
+  assert.equal(ownerProbes[0].record.uuid, 'queued-proof');
+  assert.equal(delivered.some((event) => (
+    event.channel === 'agent-transcript:live-message'
+      && event.payload.promptOwner?.handoffId === 'history-handoff'
+  )), true);
+
+  await service.unsubscribe({ consumerId: 'main:claude-prompt-audit:tab-a:attempt-a' });
+  service._closeState(state, 'test-teardown');
+});
+
 test('warm idle states are bounded — the oldest is evicted past the cap', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'transcript-grace-cap-'));
   t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));

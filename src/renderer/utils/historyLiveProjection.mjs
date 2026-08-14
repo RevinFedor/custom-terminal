@@ -73,6 +73,11 @@ const unwrapLiveMessage = (envelope) => {
   return null;
 };
 
+const recordByteOffsetFrom = (envelope) => {
+  const value = Number(envelope?.recordByteOffset);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+};
+
 const actionToolUseId = (action) => {
   if (!isObject(action)) return '';
   if (typeof action.toolUseId === 'string') return action.toolUseId;
@@ -196,6 +201,9 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
     ...(canonical.livePendingThinking === true
       ? { livePendingThinking: true }
       : {}),
+    ...(recordByteOffsetFrom(envelope) !== null
+      ? { recordByteOffset: recordByteOffsetFrom(envelope) }
+      : {}),
     role: 'assistant',
     timestamp: String(
       canonical.timestamp
@@ -221,6 +229,9 @@ const projectUserEntry = (canonical, envelope, blocks) => {
     uuid: canonical.uuid,
     ...(typeof canonical.sourceIdentity === 'string'
       ? { sourceIdentity: canonical.sourceIdentity }
+      : {}),
+    ...(recordByteOffsetFrom(envelope) !== null
+      ? { recordByteOffset: recordByteOffsetFrom(envelope) }
       : {}),
     role: 'user',
     timestamp: String(
@@ -449,7 +460,7 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
       )
     )
   );
-  const causalPrefix = deferredPromptIndex < 0
+  let causalPrefix = deferredPromptIndex < 0
     ? durable
     : durable.slice(0, deferredPromptIndex);
   const deferredTail = deferredPromptIndex < 0
@@ -465,7 +476,12 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
   const physicalPosition = (entry) => {
     const sourceIdentity = String(entry?.sourceIdentity || '');
     const sessionId = String(entry?.sessionId || '');
-    if (!sourceIdentity.startsWith('codex-') || !sessionId) return null;
+    if (!sessionId) return null;
+    const recordByteOffset = Number(entry?.recordByteOffset);
+    if (Number.isSafeInteger(recordByteOffset) && recordByteOffset >= 0) {
+      return { sessionId, offset: recordByteOffset };
+    }
+    if (!sourceIdentity.startsWith('codex-')) return null;
     const marker = '-source-' + sessionId + '-';
     const markerIndex = sourceIdentity.lastIndexOf(marker);
     if (markerIndex < 0) return null;
@@ -474,6 +490,43 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
     const offset = Number(rawOffset);
     return Number.isSafeInteger(offset) ? { sessionId, offset } : null;
   };
+
+  // Durable History normally arrives in physical order. A confirmed local row
+  // can briefly make one exact-session run inverted before the durable refresh
+  // catches up. Normalize only that contiguous run. An unknown-position row or
+  // another session is a causal barrier and is never crossed by this repair.
+  let normalizedPrefix = causalPrefix;
+  let cursor = 0;
+  while (cursor < causalPrefix.length) {
+    const firstPosition = physicalPosition(causalPrefix[cursor]);
+    if (!firstPosition) {
+      cursor += 1;
+      continue;
+    }
+    let end = cursor + 1;
+    while (end < causalPrefix.length) {
+      const nextPosition = physicalPosition(causalPrefix[end]);
+      if (!nextPosition || nextPosition.sessionId !== firstPosition.sessionId) break;
+      end += 1;
+    }
+    const run = causalPrefix.slice(cursor, end).map((entry, arrival) => ({
+      entry,
+      arrival,
+      offset: physicalPosition(entry).offset,
+    }));
+    const inverted = run.some((item, index) => (
+      index > 0 && run[index - 1].offset > item.offset
+    ));
+    if (inverted) {
+      if (normalizedPrefix === causalPrefix) normalizedPrefix = causalPrefix.slice();
+      run.sort((left, right) => left.offset - right.offset || left.arrival - right.arrival);
+      run.forEach((item, index) => {
+        normalizedPrefix[cursor + index] = item.entry;
+      });
+    }
+    cursor = end;
+  }
+  causalPrefix = normalizedPrefix;
 
   const anchorsBySession = new Map();
   causalPrefix.forEach((entry, index) => {
@@ -485,7 +538,8 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
   });
   const causalInsertions = new Map();
   const remainingLive = [];
-  for (const entry of unmatchedLive) {
+  for (let arrival = 0; arrival < unmatchedLive.length; arrival += 1) {
+    const entry = unmatchedLive[arrival];
     const position = physicalPosition(entry);
     const anchors = position ? anchorsBySession.get(position.sessionId) : null;
     if (!position || !anchors?.length) {
@@ -507,8 +561,31 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
       ? anchors[low].index
       : causalPrefix.length;
     const bucket = causalInsertions.get(targetIndex) || [];
-    bucket.push(entry);
+    bucket.push({ entry, offset: position.offset, arrival });
     causalInsertions.set(targetIndex, bucket);
+  }
+
+  for (const bucket of causalInsertions.values()) {
+    bucket.sort((left, right) => left.offset - right.offset || left.arrival - right.arrival);
+  }
+
+  // A cold live projection can precede the first durable read. When every row
+  // carries an exact position in the same transcript, that position is already
+  // sufficient to present the rows deterministically. Mixed/unknown rows keep
+  // their causal arrival order rather than being guessed across a barrier.
+  if (causalInsertions.size === 0 && causalPrefix.length === 0 && remainingLive.length > 1) {
+    const positioned = remainingLive.map((entry, arrival) => ({
+      entry,
+      arrival,
+      position: physicalPosition(entry),
+    }));
+    const sessionIds = new Set(positioned.map((item) => item.position?.sessionId).filter(Boolean));
+    if (sessionIds.size === 1 && positioned.every((item) => item.position)) {
+      positioned.sort((left, right) => (
+        left.position.offset - right.position.offset || left.arrival - right.arrival
+      ));
+      return [...positioned.map((item) => item.entry), ...deferredTail];
+    }
   }
 
   if (causalInsertions.size === 0) {
@@ -517,7 +594,7 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
   const orderedPrefix = [];
   for (let index = 0; index <= causalPrefix.length; index += 1) {
     const inserted = causalInsertions.get(index);
-    if (inserted) orderedPrefix.push(...inserted);
+    if (inserted) orderedPrefix.push(...inserted.map((item) => item.entry));
     if (index < causalPrefix.length) orderedPrefix.push(causalPrefix[index]);
   }
   return [...orderedPrefix, ...remainingLive, ...deferredTail];
@@ -639,6 +716,9 @@ export function reduceHistoryLiveProjection(
       ...envelope.entry,
       timestamp: String(envelope.entry.timestamp || envelope.timestamp || FALLBACK_TIMESTAMP),
       sessionId: String(envelope.entry.sessionId || envelope.sessionId || ''),
+      ...(recordByteOffsetFrom(envelope) !== null
+        ? { recordByteOffset: recordByteOffsetFrom(envelope) }
+        : {}),
     };
     return upsertEntry(entries, entry);
   }

@@ -4,6 +4,8 @@ import {
   resolveTabCardBackground,
   resolveTabCardTextColor,
   resolveTabCardMetrics,
+  resolveSplitAttachRowHeight,
+  TAB_CARD_LINE_HEIGHT,
 } from './tabCardVisual.mjs';
 
 // Stand-in for tabChrome's adjustRgbaAlpha: records what was asked of it, so
@@ -95,4 +97,35 @@ test('missing or broken settings degrade to defaults instead of NaN', () => {
   const bad = resolveTabCardMetrics({ paddingX: 'x', gap: null }, { fontSize: 'y' });
   assert.ok(!bad.padding.includes('NaN'));
   assert.equal(bad.fontSize, 14);
+});
+
+// ── attach-row height ──────────────────────────────────────────────────────
+
+// The frozen contract: default Settings land EXACTLY on the classic 26px, so
+// shipping this change moves nothing for anyone who has not touched Размеры.
+test('attach row is exactly the classic 26 at default settings', () => {
+  assert.equal(resolveSplitAttachRowHeight(geo, { fontSize: 14 }), 26);
+  assert.equal(resolveSplitAttachRowHeight(undefined, {}), 26);
+});
+
+// THE BUG: the row was a hard 26 while the chip obeys Settings — a taller chip
+// overflowed the row over the pane separator above, and which of the two drew
+// on top flipped with focus (sibling paint order). The row must always contain
+// the chip it hosts.
+test('a chip made taller by settings grows the row instead of overflowing it', () => {
+  const bigFont = resolveSplitAttachRowHeight(geo, { fontSize: 18 });
+  const chipH = Math.ceil(18 * TAB_CARD_LINE_HEIGHT) + 3 * 2 + 2;
+  assert.ok(bigFont >= chipH, `row ${bigFont} must fit chip ${chipH}`);
+  assert.ok(bigFont > 26);
+
+  const bigPad = resolveSplitAttachRowHeight({ ...geo, paddingY: 8 }, { fontSize: 14 });
+  assert.ok(bigPad >= Math.ceil(14 * TAB_CARD_LINE_HEIGHT) + 8 * 2 + 2);
+});
+
+test('a chip made smaller than the classic row does not shrink the row', () => {
+  assert.equal(resolveSplitAttachRowHeight({ ...geo, paddingY: 0 }, { fontSize: 10 }), 26);
+});
+
+test('broken settings degrade to the default 26, never NaN', () => {
+  assert.equal(resolveSplitAttachRowHeight({ paddingY: 'x' }, { fontSize: 'y' }), 26);
 });

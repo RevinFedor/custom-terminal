@@ -249,7 +249,10 @@ test('an identical pre-submit Claude record cannot satisfy the next audit', asyn
     JSON.stringify(userRecord('old-uuid', 'same prompt')) + '\n',
   );
 
-  const boundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  const boundary = await captureClaudePromptAuditBoundary(transcriptPath, {
+    sessionId: 'claude-session-exact',
+  });
+  assert.equal(boundary.sessionId, 'claude-session-exact');
   const stale = await readLastClaudeUserRecord(transcriptPath, boundary);
   assert.equal(stale, null, 'same-file audit reads only bytes after the boundary');
 
@@ -642,6 +645,7 @@ test('a live queued_command completes only its exact claimed History audit', () 
     expectedHash: sha16(text),
     canonicalized: true,
     canonicalReason: 'canonical-after-exact-queue-claim',
+    recordByteOffset: 140,
   });
   assert.equal(confirmation?.recordByteOffset, 140);
 });

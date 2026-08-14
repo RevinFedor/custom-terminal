@@ -36,6 +36,25 @@ function exactAudit(overrides = {}) {
   };
 }
 
+function exactProviderNotAccepted(overrides = {}) {
+  return {
+    success: false,
+    accepted: false,
+    submitted: true,
+    pasteWritten: true,
+    enterWritten: true,
+    semanticStatus: 'not-submitted',
+    providerAccepted: false,
+    providerTurnCreated: false,
+    composerDraftState: 'exact-original',
+    exactDraftRemained: true,
+    draftPreserved: true,
+    lateReconciliationPending: false,
+    code: 'claude_prompt_not_accepted_exact_draft_remained',
+    ...overrides,
+  };
+}
+
 test('request fingerprints are canonical and preserve meaningful differences', () => {
   const a = fingerprintAgentSendRequest({
     prompt: 'hello',
@@ -56,7 +75,7 @@ test('request fingerprints are canonical and preserve meaningful differences', (
   assert.notEqual(a, changed);
 });
 
-test('receipt classification keeps all four physical delivery outcomes distinct', () => {
+test('receipt classification keeps transport, provider acceptance, and unknown outcomes distinct', () => {
   assert.equal(classifyAgentSendRegistryReceipt({ submitted: false, success: false }), 'not-submitted');
   assert.equal(classifyAgentSendRegistryReceipt({
     submitted: null,
@@ -70,10 +89,52 @@ test('receipt classification keeps all four physical delivery outcomes distinct'
   }), 'audit-pending');
   assert.equal(classifyAgentSendRegistryReceipt({ submitted: true, success: true }), 'confirmed');
   assert.equal(
+    classifyAgentSendRegistryReceipt(exactProviderNotAccepted()),
+    RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
+  );
+  assert.equal(
+    classifyAgentSendRegistryReceipt(exactProviderNotAccepted({ exactDraftRemained: false })),
+    RECEIPT_STATES.AUDIT_PENDING,
+    'an incomplete negative proof must remain unresolved',
+  );
+  assert.equal(
+    classifyAgentSendRegistryReceipt({
+      success: false,
+      submitted: true,
+      status: RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
+      receiptState: RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
+    }),
+    RECEIPT_STATES.AUDIT_PENDING,
+    'a state label without the exact proof fields cannot manufacture a terminal refusal',
+  );
+  assert.equal(
     classifyAgentSendRegistryReceipt({ success: true }),
     'delivery-unknown',
     'success without physical submit proof must remain unknown',
   );
+});
+
+test('exact provider-not-accepted receipt is terminal, replayed, and cannot be audit-promoted', async () => {
+  const registry = createAgentSendReceiptRegistry();
+  let sends = 0;
+  const first = await registry.run(identity({ provider: 'claude' }), async () => {
+    sends += 1;
+    return exactProviderNotAccepted();
+  });
+  const replay = await registry.run(identity({ provider: 'claude' }), async () => {
+    sends += 1;
+    return { success: true, submitted: true };
+  });
+  const promotion = registry.promoteFromAudit(exactAudit({ provider: 'claude' }));
+
+  assert.equal(first.state, RECEIPT_STATES.PROVIDER_NOT_ACCEPTED);
+  assert.equal(first.receipt.submitted, true);
+  assert.equal(first.receipt.auditPending, false);
+  assert.equal(replay.state, RECEIPT_STATES.PROVIDER_NOT_ACCEPTED);
+  assert.equal(replay.replayed, true);
+  assert.equal(sends, 1);
+  assert.equal(promotion.promoted, false);
+  assert.equal(promotion.reason, 'provider-not-accepted-cannot-be-promoted');
 });
 
 test('same exact in-flight handoff joins one Promise and invokes one physical send', async () => {

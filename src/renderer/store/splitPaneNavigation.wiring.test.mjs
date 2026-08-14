@@ -171,3 +171,117 @@ test('tab switching everywhere else still leaves the sidebar alone', () => {
   assert.doesNotMatch(activateCenter, /showWorkspace\(/);
   assert.doesNotMatch(activateCenter, /focusedProjectId:/);
 });
+
+// ── The two pane writers that bypass switchTab still record the visit ─────
+
+test('setSplitPaneTab and addTabToSplit touch the global history themselves', () => {
+  // The visit rule lives in touchGlobalTabMru, and switchTab feeds it. But two
+  // paths write a pane DIRECTLY and never pass through switchTab: the pane
+  // header's hover list (setSplitPaneTab) and "add to workspace" (addTabToSplit).
+  // Both make a tab APPEAR — the definition of a visit — yet the hover list left
+  // no trace in the global history (reported live). Each must touch with its own
+  // PRE-write snapshot: after the pane write the tab is already visible, and a
+  // live read would classify the visit as "nothing new appeared".
+  const setPane = block(store, 'setSplitPaneTab: (paneIndex, projectId, tabId) => {', '\n\n  restoreSplitPanePreviousTab:');
+  {
+    const snapAt = setPane.indexOf('const visibleBefore = onScreenTabIds(');
+    const writeAt = setPane.indexOf('set({ splitPanes: next })');
+    const touchAt = setPane.indexOf('touchGlobalTabMru(projectId, tabId, visibleBefore)');
+    assert.ok(snapAt >= 0, 'setSplitPaneTab must snapshot the screen');
+    assert.ok(writeAt > snapAt, 'the snapshot must be taken BEFORE the pane write');
+    assert.ok(touchAt > writeAt, 'and the touch happens with that pre-write picture');
+  }
+  const addTab = block(store, 'addTabToSplit: (projectId, tabId) => {', '\n\n  removeTabFromSplit:');
+  {
+    const snapAt = addTab.indexOf('const visibleBefore = onScreenTabIds(');
+    const writeAt = addTab.indexOf('set({ splitPanes: res.panes');
+    const touchAt = addTab.indexOf('touchGlobalTabMru(projectId, tabId, visibleBefore)');
+    assert.ok(snapAt >= 0, 'addTabToSplit must snapshot the screen');
+    assert.ok(writeAt > snapAt, 'snapshot BEFORE the pane write');
+    assert.ok(touchAt > writeAt, 'touch with the pre-write picture');
+  }
+});
+
+// ── Per-pane Ctrl+Tab ─────────────────────────────────────────────────────
+
+const switcher = fs.readFileSync(
+  path.join(here, '..', 'components', 'Workspace', 'TabSwitcherOverlay.tsx'),
+  'utf8',
+);
+
+test('the switcher scope is resolved ONCE at open, not read per keystroke', () => {
+  // Scope must not shift under the keys mid-cycle: the rows are already drawn
+  // from one history, and a scope that re-derives on every step would swap the
+  // list out from under the selection.
+  const openCtrl = block(switcher, 'const openCtrl = useCallback(', '}, []);');
+  assert.match(openCtrl, /resolveSwitcherScope\(/);
+  assert.match(openCtrl, /setPaneScope\(/);
+  // The step branch only moves the index.
+  const stepBranch = block(switcher, "if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'Tab')", 'return;');
+  assert.doesNotMatch(stepBranch, /resolveSwitcherScope\(/);
+});
+
+test('the fast tap resolves the pane scope too', () => {
+  // Ctrl can be released before React renders; without this the classic
+  // A-to-B toggle would silently fall back to the GLOBAL history even though
+  // the user was working inside a pane.
+  const keyUp = block(switcher, 'const onKeyUp = (e: KeyboardEvent) => {', '\n    };');
+  const resolveAt = keyUp.indexOf('resolveSwitcherScope(');
+  const globalAt = keyUp.indexOf('initialCtrlIndex(');
+  assert.ok(resolveAt >= 0, 'fast tap must resolve the scope');
+  assert.ok(globalAt > resolveAt, 'the global fallback comes AFTER the pane branch');
+});
+
+test('a pane list is anchored at its pane, never at the window corner', () => {
+  // Same lesson as the toast fix: a surface about one pane must appear at that
+  // pane. Here it also answers "whose history am I walking".
+  assert.match(switcher, /data-terminal-pane-wrapper\]\[data-split-pane-index="\$\{paneScope\.paneIndex\}"/);
+  assert.match(switcher, /data-tab-switcher-scope/);
+});
+
+test('middle click forgets a row and does NOT navigate or close the window', () => {
+  const rowDown = block(switcher, 'onPointerDown={(e) => {\n                    e.preventDefault();', '}}\n                />');
+  const forgetAt = rowDown.indexOf('forgetRow(row)');
+  const commitAt = rowDown.indexOf('commitRow(row)');
+  assert.ok(forgetAt >= 0 && commitAt > forgetAt, 'the middle-click branch must precede the pick');
+  assert.match(rowDown, /if \(e\.button === 1\) \{ forgetRow\(row\); return; \}/);
+  // forgetRow routes by scope: the pane list edits the pane, the global list
+  // edits the global order.
+  const forget = block(switcher, 'const forgetRow = useCallback(', '}, []);');
+  assert.match(forget, /forgetPaneTabVisit\(/);
+  assert.match(forget, /forgetGlobalTabVisit\(/);
+});
+
+test('forgetting a global row clears the durable stamp too', () => {
+  // Restore derives the order from each tab lastActivatedAt and uses the saved
+  // array only for unstamped tabs — clearing just the array would let the
+  // entry come back on the next launch.
+  const forget = block(store, 'forgetGlobalTabVisit: (projectId, tabId) => {', '\n\n  forgetPaneTabVisit:');
+  assert.match(forget, /delete tab\.lastActivatedAt/);
+  assert.match(forget, /dropFromMru\(/);
+});
+
+test('closing a tab purges it from every pane history', () => {
+  assert.match(store, /dropTabFromAllPaneHistories\(get\(\)\.splitPanes, tabId\)/);
+});
+
+test('the pane object is only ever rebuilt through the history carrier', () => {
+  // A pane is rebuilt from scratch on activation, so anything not explicitly
+  // carried is erased — hand-assembling {projectId, tabId} is how the history
+  // would quietly reset on every switch.
+  const setPane = block(store, 'setSplitPaneTab: (paneIndex, projectId, tabId) => {', '\n\n  restoreSplitPanePreviousTab:');
+  assert.match(setPane, /paneWithHistoryFrom\(/);
+  assert.doesNotMatch(setPane, /prevProjectId: target\.projectId/);
+});
+
+test('Ctrl+P opens the same search as Cmd+P, in the overlay AND out of the PTY', () => {
+  assert.match(switcher, /\(e\.metaKey !== e\.ctrlKey\)[\s\S]{0,120}KeyP/);
+  const terminal = fs.readFileSync(
+    path.join(here, '..', 'components', 'Workspace', 'Terminal.tsx'),
+    'utf8',
+  );
+  // Both xterm key handlers must swallow it: Ctrl+P is readline "previous
+  // line", so leaking it would edit the command line while the panel opens.
+  const swallows = terminal.match(/\(event\.metaKey !== event\.ctrlKey\)[\s\S]{0,120}KeyP/g) || [];
+  assert.equal(swallows.length, 2, 'both handlers must swallow Ctrl+P');
+});

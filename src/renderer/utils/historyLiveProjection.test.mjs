@@ -291,6 +291,68 @@ test('confirmed Codex prompt follows preceding live compact by exact rollout ord
   );
 });
 
+test('physical offsets order durable, local, and live rows even when the optimistic anchor was appended late', () => {
+  const durableWithLateLocal = [
+    { uuid: 'prompt', role: 'user', sessionId: 'session-a', recordByteOffset: 100 },
+    { uuid: 'answer-newer', role: 'assistant', sessionId: 'session-a', recordByteOffset: 500 },
+    { uuid: 'local-confirmed', role: 'queued', sessionId: 'session-a', recordByteOffset: 400 },
+  ];
+  const live = [
+    { uuid: 'compact', role: 'compact', sessionId: 'session-a', recordByteOffset: 300 },
+    { uuid: 'answer-older', role: 'assistant', sessionId: 'session-a', recordByteOffset: 200 },
+  ];
+
+  assert.deepEqual(
+    buildHistoryLivePresentation(durableWithLateLocal, live).map((entry) => entry.uuid),
+    ['prompt', 'answer-older', 'compact', 'local-confirmed', 'answer-newer'],
+  );
+});
+
+test('cold Claude live projection uses exact JSONL offsets instead of event arrival order', () => {
+  const later = reduceHistoryLiveProjection([], {
+    ...envelope(canonical('claude-later', 'assistant', [{ type: 'text', text: 'Later' }])),
+    recordByteOffset: 240,
+  });
+  const outOfOrder = reduceHistoryLiveProjection(later, {
+    ...envelope(canonical('claude-earlier', 'assistant', [{ type: 'text', text: 'Earlier' }])),
+    recordByteOffset: 120,
+  });
+
+  assert.equal(outOfOrder[0].recordByteOffset, 240, 'the reducer preserves event arrival order');
+  assert.deepEqual(
+    buildHistoryLivePresentation([], outOfOrder).map((entry) => entry.uuid),
+    ['claude-earlier', 'claude-later'],
+  );
+});
+
+test('unknown-position rows stay at their causal barrier', () => {
+  const unknown = { uuid: 'unknown-local', role: 'queued', sessionId: 'session-a' };
+  const live = [
+    { uuid: 'positioned-later', role: 'assistant', sessionId: 'session-a', recordByteOffset: 200 },
+    unknown,
+    { uuid: 'positioned-earlier', role: 'assistant', sessionId: 'session-a', recordByteOffset: 100 },
+  ];
+
+  assert.deepEqual(
+    buildHistoryLivePresentation([], live).map((entry) => entry.uuid),
+    ['positioned-later', 'unknown-local', 'positioned-earlier'],
+  );
+});
+
+test('an unknown durable row is a barrier for positional normalization', () => {
+  const durable = [
+    { uuid: 'positioned-later', role: 'assistant', sessionId: 'session-a', recordByteOffset: 200 },
+    { uuid: 'unknown-barrier', role: 'system', sessionId: 'session-a' },
+    { uuid: 'positioned-earlier', role: 'assistant', sessionId: 'session-a', recordByteOffset: 100 },
+  ];
+  const live = [{ uuid: 'unknown-live', role: 'queued', sessionId: 'session-a' }];
+
+  assert.deepEqual(
+    buildHistoryLivePresentation(durable, live).map((entry) => entry.uuid),
+    ['positioned-later', 'unknown-barrier', 'positioned-earlier', 'unknown-live'],
+  );
+});
+
 test('lightweight live compact hands off to the durable compact by exact source', () => {
   const sourceIdentity = 'codex-compact-source-session-a-300';
   const detail = {

@@ -303,20 +303,39 @@ test('Codex Working footer is not assistant prose and its TUI bullet is removed'
   assert.equal(result.answerMarkerRemoved, true);
 });
 
-test('Codex Working footer with background-task telemetry is still system chrome', () => {
+test('Codex Working footer accepts provider telemetry without enumerating its nouns', () => {
+  for (const footer of [
+    '• Working (41s • esc to interrupt) · 4 background tasks',
+    '• Working (36s • esc to interrupt) · 1 background terminal running · …',
+    '• Working (2m 04s • esc to interrupt) · future provider telemetry',
+  ]) {
+    const result = extractTerminalHistoryPreviewText({
+      provider: 'codex',
+      physicalLines: [
+        row(footer, {
+          firstTextStyle: 'fg=1:8,bg=0:-1,dim',
+          hasDim: true,
+          allTextDim: true,
+        }),
+        row('› Write tests for @filename'),
+      ],
+    });
+    assert.equal(result.status, 'empty', footer);
+    assert.deepEqual(result.filteredBlockKinds, ['activity'], footer);
+  }
+});
+
+test('ordinary Codex prose quoting activity wording survives without provider evidence', () => {
+  const text = 'Working (36s • esc to interrupt) · это строка из документации, а не статус.';
   const result = extractTerminalHistoryPreviewText({
     provider: 'codex',
     physicalLines: [
-      row('• Working (41s • esc to interrupt) · 4 background tasks', {
-        firstTextStyle: 'fg=1:8,bg=0:-1,dim',
-        hasDim: true,
-        allTextDim: true,
-      }),
+      row(text),
       row('› Write tests for @filename'),
     ],
   });
-  assert.equal(result.status, 'empty');
-  assert.deepEqual(result.filteredBlockKinds, ['activity']);
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, text);
 });
 
 test('Codex queued-message card and its submitted text stay outside assistant preview', () => {

@@ -23,6 +23,7 @@ const MAX_STARTUP_AUDIT_READ_BYTES = 8 * 1024 * 1024;
 const DEFAULT_STARTUP_RECONCILE_RECORDS = 256;
 const MAX_STARTUP_RECONCILE_RECORDS = 2_048;
 const UNRESOLVED_STATES = new Set(['audit-pending', 'delivery-unknown']);
+const CLAUDE_SESSION_FILE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function cleanString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -95,6 +96,13 @@ function promptTextFromReceipt(record) {
   return null;
 }
 
+function claudeSessionIdFromTranscriptPath(value) {
+  const exactPath = resolveExactPath(value);
+  if (!exactPath) return '';
+  const basename = path.basename(exactPath, path.extname(exactPath));
+  return CLAUDE_SESSION_FILE_RE.test(basename) ? basename : '';
+}
+
 function normalizeUnresolvedRecord(record) {
   if (!record || typeof record !== 'object') {
     return { ok: false, reason: 'receipt-record-missing' };
@@ -126,14 +134,28 @@ function normalizeUnresolvedRecord(record) {
   }
   const storedSessionId = cleanString(record.sessionId);
   const boundarySessionId = cleanString(record.transcriptBoundary.sessionId);
-  if (provider === 'codex' && storedSessionId && boundarySessionId
-    && storedSessionId !== boundarySessionId) {
+  const claudePathSessionId = provider === 'claude'
+    ? claudeSessionIdFromTranscriptPath(record.transcriptBoundary.transcriptPath)
+    : '';
+  if (storedSessionId && boundarySessionId && storedSessionId !== boundarySessionId) {
     return { ok: false, reason: 'transcript-boundary-foreign-session' };
   }
+  if (provider === 'claude' && claudePathSessionId) {
+    if (storedSessionId && storedSessionId !== claudePathSessionId) {
+      return { ok: false, reason: 'transcript-boundary-foreign-session' };
+    }
+    if (boundarySessionId && boundarySessionId !== claudePathSessionId) {
+      return { ok: false, reason: 'transcript-boundary-foreign-session' };
+    }
+  }
   // Older desktop History receipts persisted the exact Codex writer only
-  // inside their pre-Enter transcript boundary. That boundary belongs to the
-  // same attempt and is safe to use; the current tab/session is never consulted.
-  const sessionId = storedSessionId || (provider === 'codex' ? boundarySessionId : '');
+  // inside their pre-Enter transcript boundary. Older Claude receipts kept
+  // only the exact transcript path; Claude names that file with the session
+  // UUID. Both belong to the same attempt, so the current tab/session is never
+  // consulted during recovery.
+  const sessionId = storedSessionId
+    || boundarySessionId
+    || claudePathSessionId;
   if (!sessionId) return { ok: false, reason: 'receipt-identity-incomplete' };
   return {
     ok: true,
@@ -465,6 +487,7 @@ function makeAudit(context, {
   actualHash,
   entryUuid = null,
   sourceIdentity = null,
+  recordByteOffset = null,
   timestamp = null,
   canonicalReason = null,
 } = {}) {
@@ -484,6 +507,10 @@ function makeAudit(context, {
     canonicalReason,
     entryUuid: cleanString(entryUuid) || null,
     sourceIdentity: cleanString(sourceIdentity) || null,
+    recordByteOffset: Number.isSafeInteger(Number(recordByteOffset))
+      && Number(recordByteOffset) >= 0
+      ? Number(recordByteOffset)
+      : null,
     transcriptBoundary: context.boundary,
     auditTimestamp: numericTimestamp(timestamp),
   };
@@ -585,6 +612,7 @@ async function reconcileClaude(context, maxReadBytes) {
     actualText: candidate.text,
     actualHash,
     entryUuid: candidate.record?.uuid,
+    recordByteOffset: candidate.byteOffset,
     timestamp: candidate.record?.timestamp,
   });
   const identity = agentPromptAuditMatchesHash(context.promptHash, audit);
@@ -720,6 +748,7 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     actualHash: match.actualHash,
     entryUuid: match.candidate.record?.uuid || match.candidate.record?.id,
     sourceIdentity: `codex-user-source-${context.sessionId}-${match.candidate.byteOffset}`,
+    recordByteOffset: match.candidate.byteOffset,
     timestamp: match.candidate.record?.timestamp,
     canonicalReason: match.canonicalReason,
   });

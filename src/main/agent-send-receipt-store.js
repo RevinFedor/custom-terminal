@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const {
   RECEIPT_STATES,
   classifyAgentSendRegistryReceipt,
+  isExactProviderNotAcceptedReceipt,
 } = require('./agent-send-receipt-registry');
 const {
   classifyAgentPromptAuditIdentity,
@@ -20,6 +21,7 @@ const STORE_STATES = Object.freeze({
   IN_FLIGHT: RECEIPT_STATES.IN_FLIGHT,
   ENTER_ARMED: 'enter-armed',
   NOT_SUBMITTED: RECEIPT_STATES.NOT_SUBMITTED,
+  PROVIDER_NOT_ACCEPTED: RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
   DELIVERY_UNKNOWN: RECEIPT_STATES.DELIVERY_UNKNOWN,
   AUDIT_PENDING: RECEIPT_STATES.AUDIT_PENDING,
   CONFIRMED: RECEIPT_STATES.CONFIRMED,
@@ -41,12 +43,14 @@ const REPLAY_STATES = new Set([
   STORE_STATES.ENTER_ARMED,
   STORE_STATES.DELIVERY_UNKNOWN,
   STORE_STATES.AUDIT_PENDING,
+  STORE_STATES.PROVIDER_NOT_ACCEPTED,
   STORE_STATES.CONFIRMED,
 ]);
 
 const SETTLED_PRUNABLE_STATES = new Set([
   STORE_STATES.CONFIRMED,
   STORE_STATES.NOT_SUBMITTED,
+  STORE_STATES.PROVIDER_NOT_ACCEPTED,
 ]);
 
 function requiredString(value, label) {
@@ -111,6 +115,10 @@ function normalizeAudit(audit) {
     canonicalReason: identity.canonicalReason || null,
     entryUuid: optionalString(audit?.entryUuid),
     sourceIdentity: optionalString(audit?.sourceIdentity),
+    recordByteOffset: Number.isSafeInteger(Number(audit?.recordByteOffset))
+      && Number(audit.recordByteOffset) >= 0
+      ? Number(audit.recordByteOffset)
+      : null,
     transcriptBoundary: audit?.transcriptBoundary ?? null,
     auditTimestamp: optionalAuditTimestamp(audit?.auditTimestamp),
     success: audit?.success === true,
@@ -397,6 +405,17 @@ class AgentSendReceiptStore {
           AND attempt_id = @attemptId
           AND state IN ('in-flight', 'enter-armed')
       `),
+      settleAuditPendingFinal: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET state = @state,
+            receipt_json = @receiptJson,
+            transcript_boundary_json = COALESCE(@transcriptBoundaryJson, transcript_boundary_json),
+            updated_at = @updatedAt,
+            settled_at = @settledAt
+        WHERE operation_key = @operationKey
+          AND attempt_id = @attemptId
+          AND state = 'audit-pending'
+      `),
       promote: this.db.prepare(`
         UPDATE ${TABLE_NAME}
         SET provider = COALESCE(provider, @provider),
@@ -415,7 +434,7 @@ class AgentSendReceiptStore {
             settled_at = @updatedAt
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
-          AND state NOT IN ('reserved', 'preparing', 'not-submitted')
+          AND state NOT IN ('reserved', 'preparing', 'not-submitted', 'provider-not-accepted')
       `),
       acknowledgePresentation: this.db.prepare(`
         UPDATE ${TABLE_NAME}
@@ -457,7 +476,7 @@ class AgentSendReceiptStore {
       `),
       pruneSettled: this.db.prepare(`
         DELETE FROM ${TABLE_NAME}
-        WHERE state IN ('confirmed', 'not-submitted')
+        WHERE state IN ('confirmed', 'not-submitted', 'provider-not-accepted')
           AND settled_at IS NOT NULL
           AND settled_at <= ?
       `),
@@ -780,6 +799,42 @@ class AgentSendReceiptStore {
           record,
         };
       }
+      const mergedReceipt = {
+        ...(record.receipt || {}),
+        ...nextReceipt,
+      };
+      const nextState = classifyAgentSendRegistryReceipt(mergedReceipt);
+      if (
+        record.state === STORE_STATES.AUDIT_PENDING
+        && nextState === STORE_STATES.PROVIDER_NOT_ACCEPTED
+        && isExactProviderNotAcceptedReceipt(mergedReceipt)
+      ) {
+        const updatedAt = this.now();
+        const receipt = {
+          ...mergedReceipt,
+          accepted: false,
+          submitted: true,
+          status: STORE_STATES.PROVIDER_NOT_ACCEPTED,
+          receiptState: STORE_STATES.PROVIDER_NOT_ACCEPTED,
+          auditPending: false,
+          deliveryUnknown: false,
+        };
+        const info = this.statements.settleAuditPendingFinal.run({
+          operationKey,
+          attemptId,
+          state: STORE_STATES.PROVIDER_NOT_ACCEPTED,
+          receiptJson: encodeJson(receipt),
+          transcriptBoundaryJson: encodeJson(receipt.transcriptBoundary),
+          updatedAt,
+          settledAt: updatedAt,
+        });
+        return {
+          ok: info.changes === 1,
+          applied: info.changes === 1,
+          state: this._record(operationKey)?.state || null,
+          record: this._record(operationKey),
+        };
+      }
       if (!ACTIVE_ATTEMPT_STATES.has(record.state)) {
         return {
           ok: true,
@@ -789,11 +844,18 @@ class AgentSendReceiptStore {
           record,
         };
       }
-      const receipt = {
-        ...(record.receipt || {}),
-        ...nextReceipt,
-      };
-      const state = classifyAgentSendRegistryReceipt(receipt);
+      const state = nextState;
+      const receipt = state === STORE_STATES.PROVIDER_NOT_ACCEPTED
+        ? {
+            ...mergedReceipt,
+            accepted: false,
+            submitted: true,
+            status: STORE_STATES.PROVIDER_NOT_ACCEPTED,
+            receiptState: STORE_STATES.PROVIDER_NOT_ACCEPTED,
+            auditPending: false,
+            deliveryUnknown: false,
+          }
+        : mergedReceipt;
       const updatedAt = this.now();
       const settledAt = SETTLED_PRUNABLE_STATES.has(state) ? updatedAt : null;
       const info = this.statements.settle.run({
@@ -855,6 +917,15 @@ class AgentSendReceiptStore {
           record,
         };
       }
+      if (record.state === STORE_STATES.PROVIDER_NOT_ACCEPTED) {
+        return {
+          ok: false,
+          matched: true,
+          promoted: false,
+          reason: 'provider-not-accepted-cannot-be-promoted',
+          record,
+        };
+      }
       if (record.state === STORE_STATES.CONFIRMED && record.auditIdentity) {
         const sameExactRow = record.auditIdentity.entryUuid
           ? record.auditIdentity.entryUuid === audit.entryUuid
@@ -867,6 +938,9 @@ class AgentSendReceiptStore {
           && record.auditIdentity.provider === audit.provider
           && record.auditIdentity.sessionId === audit.sessionId
           && record.auditIdentity.promptHash === audit.actualHash
+          && (record.receipt?.recordByteOffset == null
+            || audit.recordByteOffset == null
+            || Number(record.receipt.recordByteOffset) === audit.recordByteOffset)
           && sameExactRow;
         return {
           ok: sameAuditIdentity,
@@ -915,6 +989,7 @@ class AgentSendReceiptStore {
         auditTimestamp,
         entryUuid: audit.entryUuid,
         sourceIdentity: audit.sourceIdentity,
+        recordByteOffset: audit.recordByteOffset,
       };
       const info = this.statements.promote.run({
         operationKey: record.operationKey,

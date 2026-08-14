@@ -223,7 +223,13 @@ const FRAME_ONLY_LINE_RES = [
 // before the composer. This preserves ordinary answer text and avoids keeping
 // an ever-growing catalogue of Claude's strings.
 const CLAUDE_ACTIVITY_ANCHOR_RE = /^\s*(?:⏺|●)?\s*[✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❈❉❊❋·*]\s*[A-Z][\p{L}\p{M}-]{2,64}(?:ing|ed)(?:…|\.\.\.)?(?:\s*(?:\([^)]*\)|for\s+\d+\w*(?:\s+\d+\w*)*))?\s*$/iu;
-const CODEX_ACTIVITY_ANCHOR_RE = /^\s*(?:•|●)?\s*[A-Z][\p{L}-]{2,64}(?:ing|ed)\s*\([^)]*(?:esc to (?:interrupt|cancel))[^)]*\)(?:\s*[·•]\s*\d+\s+background(?:\s+(?:tasks?|commands?|agents?))?)?\s*$/iu;
+// Codex owns the whole activity footer. Its stable grammar ends at the
+// keyboard affordance inside `(...)`; telemetry after that is deliberately
+// free-form and has already changed from `background tasks` to `background
+// terminal running`. Do not enumerate those words. The root bullet or xterm
+// system tint is still required so ordinary prose quoting this UI stays prose.
+const CODEX_ACTIVITY_ANCHOR_RE = /^\s*(?:•|●)?\s*[A-Z][\p{L}\p{M}-]{2,64}(?:ing|ed)\s*\([^\n)]{0,240}(?:esc to (?:interrupt|cancel))[^\n)]{0,240}\)(?:\s*[·•]\s*[^\n]{1,320})?\s*$/iu;
+const CODEX_ACTIVITY_ROOT_RE = /^\s*(?:•|●)\s+/u;
 const TERMINAL_BLOCK_CONTINUATION_RE = /^(?:⎿|└|├|│|╰)\s*|^Tip\s*:/iu;
 const CLAUDE_SYSTEM_CARD_ANCHOR_RE = /^\s*※\s*/u;
 const CLAUDE_BRANCH_STATUS_ANCHOR_RE = /^\s*⎿\s*/u;
@@ -302,7 +308,9 @@ function classifyTrailingTerminalBlockAnchor(line, provider) {
   if (provider === 'claude' && CLAUDE_ACTIVITY_ANCHOR_RE.test(raw)) {
     return { kind: 'activity', styleEvidence: style.hasSystemTint };
   }
-  if (provider === 'codex' && CODEX_ACTIVITY_ANCHOR_RE.test(raw)) {
+  if (provider === 'codex'
+    && CODEX_ACTIVITY_ANCHOR_RE.test(raw)
+    && (CODEX_ACTIVITY_ROOT_RE.test(raw) || style.hasSystemTint)) {
     return { kind: 'activity', styleEvidence: style.hasSystemTint };
   }
   if (provider === 'claude' && CLAUDE_SYSTEM_CARD_ANCHOR_RE.test(raw)) {

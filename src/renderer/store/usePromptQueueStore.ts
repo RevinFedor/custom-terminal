@@ -17,6 +17,12 @@ import {
   getFirstDelayRemainingSeconds,
   normalizeFirstDelaySeconds,
 } from '../utils/promptQueueDelay';
+import {
+  DEFAULT_RUN_AFTER_PANEL_COLLAPSED,
+  panelCollapsedIsWorthPersisting,
+  resolvePersistedPanelCollapsed,
+} from '../utils/promptQueuePanelDefault.mjs';
+import { shouldArmQueueForTrigger } from '../utils/promptTriggerArm.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -162,7 +168,10 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       !q.postPromptText &&
       !q.loopPromptEnabled &&
       !q.runAfterTabId &&
-      !q.panelCollapsed &&
+      // NOT `!q.panelCollapsed`: the panel now defaults to collapsed, so the
+      // deliberate choice worth keeping is the OPPOSITE one. Both sides of this
+      // pair live in promptQueuePanelDefault.mjs precisely so they cannot drift.
+      !panelCollapsedIsWorthPersisting(q.panelCollapsed) &&
       !q.previewId
     ) continue;
     out[tabId] = {
@@ -444,9 +453,10 @@ export type TabQueue = {
   loopPromptArmedAt: number | null;
 
   // ── Overlay collapsed/expanded state ─────────────────────────────────────
-  // Per-tab UI state for the Run-after panel. Default is expanded (false);
-  // if the user collapses a specific tab, that choice persists across tab
-  // navigation and app restart until they manually expand it again.
+  // Per-tab UI state for the Run-after panel. Default is COLLAPSED (see
+  // utils/promptQueuePanelDefault.mjs) — a new tab shows only the rail. If the
+  // user expands a specific tab, that choice persists across tab navigation and
+  // app restart until they collapse it again.
   // Persisted even for empty queues, because the user's layout preference is
   // independent from whether queued prompts currently exist.
   panelCollapsed: boolean;
@@ -616,7 +626,7 @@ const EMPTY: TabQueue = {
   loopPromptEnabled: false,
   loopPromptText: DEFAULT_SHARED_LOOP_PROMPT,
   loopPromptArmedAt: null,
-  panelCollapsed: false,
+  panelCollapsed: DEFAULT_RUN_AFTER_PANEL_COLLAPSED,
   firstChipHintActive: false,
   stopBeforeCloseArm: false,
   runAfterTabId: null,
@@ -1244,12 +1254,24 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         });
         if (!changed) return state;
         const changedHead = headId === promptId;
-        const explicitArm = changedHead && cur.autoRun;
+        // Picking a TAB as this card's condition is the whole promise, not a
+        // parameter edit — the queue arms itself, exactly like picking a target
+        // at queue level does. It must not matter whether that tab is running
+        // right now: an idle target means "wait for its next run", which is the
+        // very thing being asked for. See utils/promptTriggerArm.mjs for why a
+        // timer and a non-head card deliberately do NOT arm.
+        const armsQueue = shouldArmQueueForTrigger({ trigger: normalized, isHead: changedHead });
+        const autoRun = armsQueue ? true : cur.autoRun;
+        const explicitArm = changedHead && (cur.autoRun || armsQueue);
         if (explicitArm) markRuntimeWorkflowArm(tabId);
         const next = new Map(state.queues);
         next.set(tabId, {
           ...cur,
           items,
+          autoRun,
+          // Same acknowledgement as any other Run after interaction: the red
+          // "queued but not armed" nudge has been answered by arming.
+          firstChipHintActive: armsQueue ? false : cur.firstChipHintActive,
           firstDelayCountdownAt: changedHead ? null : cur.firstDelayCountdownAt,
           workflowArmedAt: explicitArm ? Date.now() : cur.workflowArmedAt,
         });
@@ -1936,7 +1958,9 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     loopPromptArmedAt: typeof entry.loopPromptArmedAt === 'number' && Number.isFinite(entry.loopPromptArmedAt)
       ? Number(entry.loopPromptArmedAt)
       : null,
-    panelCollapsed: !!entry.panelCollapsed,
+    // Not `!!entry.panelCollapsed`: a row saved before this field existed has
+    // no flag, and coercing "absent" to false would expand every restored tab.
+    panelCollapsed: resolvePersistedPanelCollapsed(entry.panelCollapsed),
     firstChipHintActive: false,
     stopBeforeCloseArm: false,
     runAfterTabId,

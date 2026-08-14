@@ -22,6 +22,12 @@ function extractQueuedCommandPromptText(prompt) {
   return '';
 }
 
+function extractClaudeQueueOperationPromptText(entry) {
+  if (entry?.type !== 'queue-operation' || entry?.operation !== 'enqueue') return null;
+  const text = typeof entry.content === 'string' ? entry.content : '';
+  return text.trim() ? text : null;
+}
+
 function isClaudeTaskNotificationCarrier(entry) {
   if (!entry || typeof entry !== 'object') return false;
 
@@ -50,8 +56,8 @@ function extractClaudePromptCarrier(entry) {
   // originating run permanently "incomplete" even after end_turn.
   if (isClaudeTaskNotificationCarrier(entry)) return null;
   if (entry?.type === 'attachment' && entry?.attachment?.type === 'queued_command') {
-    const text = extractQueuedCommandPromptText(entry.attachment.prompt).trim();
-    if (!text) return null;
+    const text = extractQueuedCommandPromptText(entry.attachment.prompt);
+    if (!text.trim()) return null;
     return {
       kind: 'queued_command',
       text,
@@ -166,6 +172,7 @@ function findMatchingClaudePromptTurn({
 }
 
 module.exports = {
+  extractClaudeQueueOperationPromptText,
   extractClaudePromptCarrier,
   extractQueuedCommandPromptText,
   findMatchingClaudePromptTurn,

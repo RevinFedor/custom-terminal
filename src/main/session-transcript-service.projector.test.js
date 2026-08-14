@@ -187,6 +187,14 @@ test('hydration span travels through the delta as changed rows', async (t) => {
   });
   assert.equal(scrolled.unchanged, false, 'a new hydration window is not an unchanged response');
   assert.equal(scrolled.delta, true, 'a hydration move is a delta, not a full reload');
+  // Row-window identity must ride the DELTA shape too. Its absence is what
+  // shut down the renderer's hydration machinery on 14.08 (the panel
+  // concluded "session not windowed" from a delta without these fields and
+  // Timeline jumps into stubs stopped requesting hydration forever).
+  assert.equal(scrolled.rowWindowApplied, true, 'delta response names the row-window state');
+  assert.equal(typeof scrolled.hydratedFrom, 'number');
+  assert.equal(typeof scrolled.hydratedTo, 'number');
+  assert.equal(scrolled.centerMissing, false);
   assert.equal(projectorCalls, 2, 'a changed hydration window rebuilds the requested projection');
   const changedUuids = scrolled.changedEntries.map((entry) => entry.uuid).sort();
   // r15..r25 became hydrated; r50..r54 (old span, outside the new one and

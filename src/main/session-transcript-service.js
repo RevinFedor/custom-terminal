@@ -701,6 +701,17 @@ class SessionTranscriptService {
             boundsApplied: historyWindow.boundsApplied,
             hasMoreAbove: historyWindow.hasMoreAbove,
             hasMoreBelow: historyWindow.hasMoreBelow,
+            // Row-window identity travels on EVERY response shape. The
+            // renderer used to infer "session not windowed" from these
+            // fields' absence on a delta, which shut its hydration
+            // machinery down for the rest of the session (prod 14.08 17:10:
+            // Timeline jumps into stubs issued zero hydration requests).
+            rowWindowApplied: rowWindow.rowWindowApplied,
+            hydratedFrom: rowWindow.hydratedFrom,
+            hydratedTo: rowWindow.hydratedTo,
+            hydratedCount: rowWindow.hydratedCount,
+            stubbedCount: rowWindow.stubbedCount,
+            centerMissing: rowWindow.centerMissing === true,
             claudeMemoryBoundaryUuid: null,
             filePath: loadedFilePath,
             revision,
@@ -734,6 +745,7 @@ class SessionTranscriptService {
         hydratedTo: rowWindow.hydratedTo,
         hydratedCount: rowWindow.hydratedCount,
         stubbedCount: rowWindow.stubbedCount,
+        centerMissing: rowWindow.centerMissing === true,
         firstUuid: historyWindow.firstUuid,
         lastUuid: historyWindow.lastUuid,
         claudeMemoryBoundaryUuid: null,

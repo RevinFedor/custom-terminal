@@ -4,7 +4,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import BrowserTab from './BrowserTab';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
-import { SPLIT_ATTACH_ROW_H, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle } from './SplitPaneChrome';
+import { useSplitAttachRowHeight, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
 import { motion, AnimatePresence } from 'framer-motion';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { clearPendingResume, markPendingResume } from '../../utils/pendingResume';
@@ -1131,6 +1131,11 @@ function TerminalArea({
     return () => window.removeEventListener('keydown', onKeyDown, true);
   }, [focusedEmptyPaneIndex]);
 
+  // Header row height follows the chip's Settings-driven size. Read OUTSIDE
+  // the memo and listed in its deps: a header that grew while the memo held a
+  // stale 26 is exactly the chip-over-the-separator bug.
+  const attachRowH = useSplitAttachRowHeight();
+
   const terminals = useMemo(() => {
     const t0 = Date.now();
     const result: React.ReactNode[] = [];
@@ -1301,7 +1306,7 @@ function TerminalArea({
               data-toast-anchor-tab-id={tab.id}
               style={{
                 position: 'absolute',
-                top: inPane ? SPLIT_ATTACH_ROW_H + 8 : 8,
+                top: inPane ? attachRowH + 8 : 8,
                 right: 8,
                 zIndex: 210,
                 pointerEvents: 'none',
@@ -1316,9 +1321,17 @@ function TerminalArea({
               data-terminal-pane-content
               style={{
                 position: 'absolute',
-                top: inPane ? SPLIT_ATTACH_ROW_H : 0,
-                left: 0,
-                right: 0,
+                top: inPane ? attachRowH : 0,
+                // A pane's content stops 2px short of the frame. The frame is a
+                // 1px line drawn ON the pane's edge; content that reaches the
+                // same pixel column touches it, and anything light there — a
+                // scrollbar thumb, the Timeline's rail — visually fuses with the
+                // line, so the frame reads as noticeably thicker on that side
+                // than on the other three. (Reported: "the white frame looks
+                // thicker on the left where the scroll is".) Two pixels is
+                // enough to separate them and small enough to cost no layout.
+                left: inPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
+                right: inPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
                 bottom: 0,
                 pointerEvents: 'none',
               }}
@@ -1366,7 +1379,7 @@ function TerminalArea({
               top: 0,
               left: 0,
               right: 0,
-              height: SPLIT_ATTACH_ROW_H,
+              height: attachRowH,
               display: 'flex',
               alignItems: 'center',
               gap: 6,
@@ -1411,7 +1424,7 @@ function TerminalArea({
           <div
             style={{
               position: 'absolute',
-              top: SPLIT_ATTACH_ROW_H,
+              top: attachRowH,
               left: 0,
               right: 0,
               bottom: 0,
@@ -1440,7 +1453,7 @@ function TerminalArea({
     // lifecycleSummary is a dependency, not a captured constant: panes read the
     // agent's start/stop status from it, and without it here a pane would keep
     // rendering the status from whenever this memo last ran.
-  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, lifecycleSummary]);
+  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, lifecycleSummary, attachRowH]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {

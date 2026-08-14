@@ -22,11 +22,38 @@ test('tab completion bell waits when own loader ends before orchestration comple
     'setAiBusy: (tabId, busy, reason) => {',
     '\n\n  setSdkProcessAlive:',
   );
-  const blockedAt = setAiBusy.indexOf('isOrchestrationCompletionBlocked(tabId)');
+  const blockedAt = setAiBusy.indexOf('tabCompletionDeferralReason(tabId, successful)');
   const settleAt = setAiBusy.indexOf('settleTabCompletionNotification({');
 
   assert.ok(blockedAt >= 0 && settleAt > blockedAt);
-  assert.match(setAiBusy, /reason=orchestration-blocked/);
+  assert.match(
+    workspaceStore,
+    /orchestrationBlocked: isOrchestrationCompletionBlocked\(tabId\)/,
+  );
+});
+
+test('an armed Run after silences the bell until the queue owes nothing', () => {
+  // The bell must not ring once per queue item. Both completion paths ask the
+  // SAME predicate the runner uses, so "queue is done" cannot mean two things.
+  assert.match(
+    workspaceStore,
+    /queueContinuationPending: tabHasPendingQueueContinuation\(tabId\)/,
+  );
+  assert.match(
+    workspaceStore,
+    /hasPendingPromptQueueContinuation\(usePromptQueueStore\.getState\(\)\.getQueue\(tabId\)\)/,
+  );
+
+  const setAiBusy = block(
+    workspaceStore,
+    'setAiBusy: (tabId, busy, reason) => {',
+    '\n\n  setSdkProcessAlive:',
+  );
+  // Deferring must return early WITHOUT settling — settling would delete the
+  // armed flag and no later turn could ever ring.
+  const deferBranch = block(setAiBusy, 'if (deferReason) {', '} else {');
+  assert.doesNotMatch(deferBranch, /settleTabCompletionNotification/);
+  assert.doesNotMatch(deferBranch, /delete tab\.completionNotification/);
 });
 
 test('purple inherited activity rearms persistent bells and clears stale fired state', () => {
@@ -53,4 +80,9 @@ test('only a successful orchestration release emits the existing completion noti
   assert.match(app, /releaseKind === 'abnormal'[\s\S]*applyTabCompletionOrchestrationState\(change\.sourceTabId, 'abnormal'\)/);
   assert.match(orchestrationState, /successful: phase === 'success'/);
   assert.match(orchestrationState, /if \(settled\.detail\) emitTabCompletionNotification\(settled\.detail\)/);
+  // Same gate as the own-turn path: an armed queue defers this release too.
+  assert.match(
+    orchestrationState,
+    /tabCompletionDeferralReason\(tabId, phase === 'success'\)/,
+  );
 });

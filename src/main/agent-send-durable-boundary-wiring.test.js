@@ -97,6 +97,37 @@ test('both Claude and Codex audit records retain operation and attempt identity'
   assert.ok(source.indexOf('ignore stale/foreign prompt audit before projections', publish) > publish);
 });
 
+test('a pending Claude audit keeps its main transcript observer until exact completion', () => {
+  const source = read(mainPath);
+  const boundaryCapture = source.indexOf(
+    'claudeAuditBoundary = await captureClaudePromptAuditBoundary',
+  );
+  const boundarySession = source.indexOf('sessionId: auditSessionId', boundaryCapture);
+  const stagedClaude = source.indexOf('stagedClaudeAudit = {');
+  const enqueue = source.indexOf('enqueueClaudePasteAudit(broadcastTabId, stagedClaudeAudit)', stagedClaude);
+  const retain = source.indexOf('await retainClaudePasteAuditTranscriptObserver(', enqueue);
+  const enter = source.indexOf('term.write(submitSequence);', retain);
+  const finish = source.indexOf('function finishClaudePasteAudit');
+  const releaseOnFinish = source.indexOf(
+    "releaseClaudePasteAuditTranscriptObserver(tabId, audit, 'finished')",
+    finish,
+  );
+  const drop = source.indexOf('function dropClaudePasteAuditUnconfirmed');
+  const releaseOnDrop = source.indexOf(
+    "releaseClaudePasteAuditTranscriptObserver(tabId, audit, 'evicted:' + reason)",
+    drop,
+  );
+
+  assert.ok(boundarySession > boundaryCapture,
+    'the pre-Enter Claude boundary must persist its exact writer session');
+  assert.ok(retain > enqueue && enter > retain,
+    'main must retain the exact Claude transcript before physical Enter');
+  assert.ok(releaseOnFinish > finish,
+    'exact completion must release the main transcript consumer');
+  assert.ok(releaseOnDrop > drop,
+    'bounded unknown eviction must also release the main transcript consumer');
+});
+
 test('fresh Claude first prompt uses exact hook routing when no transcript exists yet', () => {
   const source = read(mainPath);
   const boundaryIndex = source.indexOf(

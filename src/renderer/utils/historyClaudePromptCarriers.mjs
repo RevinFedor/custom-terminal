@@ -67,6 +67,11 @@ const recordTimestamp = (record, envelope) => String(
   || '1970-01-01T00:00:00.000Z',
 );
 
+const recordByteOffsetFrom = (envelope) => {
+  const value = Number(envelope?.recordByteOffset);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+};
+
 const queuedCommandText = (record) => {
   if (record?.type !== 'attachment' || record?.attachment?.type !== 'queued_command') return '';
   return normalizeClaudeHistoryPromptCarrierText(record.attachment.prompt);
@@ -261,6 +266,9 @@ export function reduceClaudeHistoryPromptCarrier(
         content: text,
         queueStatus: 'queued',
         sessionId,
+        ...(recordByteOffsetFrom(envelope) !== null
+          ? { recordByteOffset: recordByteOffsetFrom(envelope) }
+          : {}),
       };
       return {
         handled: true,
@@ -320,6 +328,9 @@ export function reduceClaudeHistoryPromptCarrier(
         content: attachmentText,
         queueStatus: 'sent',
         sessionId: recordSessionId(record, envelope),
+        ...(recordByteOffsetFrom(envelope) !== null
+          ? { recordByteOffset: recordByteOffsetFrom(envelope) }
+          : {}),
         ...inheritedSettlements,
       }),
       projectedUser: true,
@@ -361,6 +372,9 @@ export function reduceClaudeHistoryPromptCarrier(
         timestamp: recordTimestamp(record, envelope),
         content: text,
         sessionId: recordSessionId(record, envelope),
+        ...(recordByteOffsetFrom(envelope) !== null
+          ? { recordByteOffset: recordByteOffsetFrom(envelope) }
+          : {}),
         ...inheritedSettlements,
       }),
       projectedUser: true,

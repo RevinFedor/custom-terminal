@@ -47,6 +47,25 @@ function exactAudit(attemptId, overrides = {}) {
   };
 }
 
+function exactProviderNotAccepted(overrides = {}) {
+  return {
+    success: false,
+    accepted: false,
+    submitted: true,
+    pasteWritten: true,
+    enterWritten: true,
+    semanticStatus: 'not-submitted',
+    providerAccepted: false,
+    providerTurnCreated: false,
+    composerDraftState: 'exact-original',
+    exactDraftRemained: true,
+    draftPreserved: true,
+    lateReconciliationPending: false,
+    code: 'claude_prompt_not_accepted_exact_draft_remained',
+    ...overrides,
+  };
+}
+
 function openMemoryHarness(t, options = {}) {
   let db;
   try {
@@ -115,6 +134,68 @@ test('beginAttempt creates one exact attempt and pending/unknown/confirmed state
   assert.equal(replay.action, 'replay');
   assert.equal(replay.record.attempt, 1);
   assert.equal(getUuidCount(), 1);
+});
+
+test('exact post-Enter provider refusal terminalizes the same audit-pending attempt', (t) => {
+  let time = 100;
+  const harness = openMemoryHarness(t, { now: () => time });
+  if (!harness) return;
+  const { store, getUuidCount } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'claude' }));
+  const pending = store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    accepted: true,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+    transcriptBoundary: { fileSize: 42 },
+  });
+  assert.equal(pending.record.state, STORE_STATES.AUDIT_PENDING);
+
+  time = 125;
+  const terminal = store.settleAttempt(
+    begun.record.operationKey,
+    begun.attemptId,
+    exactProviderNotAccepted(),
+  );
+  assert.equal(terminal.applied, true);
+  assert.equal(terminal.record.state, STORE_STATES.PROVIDER_NOT_ACCEPTED);
+  assert.equal(terminal.record.settledAt, 125);
+  assert.equal(terminal.record.receipt.submitted, true);
+  assert.equal(terminal.record.receipt.auditPending, false);
+  assert.deepEqual(terminal.record.transcriptBoundary, { fileSize: 42 });
+
+  const replay = store.beginAttempt(identity({ provider: 'claude' }));
+  assert.equal(replay.action, 'replay');
+  assert.equal(replay.retryable, false);
+  assert.equal(replay.record.attemptId, begun.attemptId);
+  assert.equal(getUuidCount(), 1);
+
+  const promoted = store.promoteFromAudit(exactAudit(begun.attemptId, {
+    provider: 'claude',
+  }));
+  assert.equal(promoted.promoted, false);
+  assert.equal(promoted.reason, 'provider-not-accepted-cannot-be-promoted');
+});
+
+test('incomplete post-Enter negative proof remains audit-pending', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'claude' }));
+  store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+  const ambiguous = store.settleAttempt(
+    begun.record.operationKey,
+    begun.attemptId,
+    exactProviderNotAccepted({ exactDraftRemained: false }),
+  );
+  assert.equal(ambiguous.applied, false);
+  assert.equal(ambiguous.record.state, STORE_STATES.AUDIT_PENDING);
 });
 
 test('pre-Enter context binds the exact writer session and rejects a contradictory boundary', (t) => {
@@ -223,12 +304,14 @@ test('proven Codex canonical audit keeps expected operation hash and records obs
     actualHash: 'provider-hash',
     canonicalized: true,
     canonicalReason: 'codex_trimmed_boundary_whitespace',
+    recordByteOffset: 4242,
   }));
   assert.equal(promoted.promoted, true);
   assert.equal(promoted.record.promptHash, 'hash-a');
   assert.equal(promoted.record.auditIdentity.promptHash, 'provider-hash');
   assert.equal(promoted.record.receipt.actualHash, 'provider-hash');
   assert.equal(promoted.record.receipt.canonicalized, true);
+  assert.equal(promoted.record.receipt.recordByteOffset, 4242);
 
   const foreign = store.beginAttempt(identity({
     operationKey: 'project:tab-a:handoff-b',

@@ -14,12 +14,13 @@ import Timeline from './Timeline';
 import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
-import { SPLIT_ATTACH_ROW_H, SplitPaneAttachRow } from './SplitPaneChrome';
+import { useSplitAttachRowHeight, SplitPaneAttachRow } from './SplitPaneChrome';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
 import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from '../../constants/systemProjects';
 import { linkFileTab } from '../../utils/linkFileTab';
+import { resolvePaneSurfaceHotkeyTabId } from '../../utils/paneSurfaceHotkeyTarget.mjs';
 import { probeFiles } from '../../utils/missingFileTracker';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
@@ -115,6 +116,10 @@ export default function Workspace() {
       console.warn('[Workspace:UNMOUNT]');
     };
   }, []);
+
+  // Header row height follows the chip's Settings-driven size — same number
+  // the per-pane rows use, or the single-mode slot clips its own chip.
+  const attachRowH = useSplitAttachRowHeight();
 
   // Use selectors to avoid rerenders on unrelated store changes
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
@@ -453,8 +458,12 @@ export default function Workspace() {
   // buffer/PTY and History keeps its owner, rows and draft — the frame around
   // them changes shape. Terminal-primary always shows History as the side
   // panel, so the user never lands in a layout with no conversation surface.
-  const swapPrimarySurface = useCallback(() => {
-    const tabId = effectiveTab?.id;
+  const swapPrimarySurface = useCallback((explicitTabId?: string) => {
+    // Same rule as Cmd+]: the surface pair belongs to a PANE, and the focused
+    // pane's tab is not always the active one (a tab can be put into a pane
+    // without taking focus). Callers that already know the tab pass it in; the
+    // keyboard path resolves it from the focused pane.
+    const tabId = explicitTabId || effectiveTab?.id;
     if (!agentSurfacePairAvailable || !tabId) return;
     const next = !resolveTabTerminalPrimary(useUIStore.getState(), tabId);
     if (next) {
@@ -840,11 +849,31 @@ export default function Workspace() {
       if (workspaceView !== 'workspace') return;
       if ((e.metaKey || e.altKey) && e.code === 'BracketRight') {
         const shortcut = e.metaKey ? 'CMD+]' : 'OPT+]';
-        const hasSession = effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId;
-        if (!effectiveTab?.id || !hasSession) {
-          console.warn('[Workspace:Hotkey] ' + shortcut + ' BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null') + ' codexSession=' + (effectiveCodexSessionId ? effectiveCodexSessionId.substring(0, 8) : 'null'));
+        // The shortcut belongs to the FOCUSED PANE, and its tab is not always
+        // the active one: the pane header's recent-tabs list puts a tab into a
+        // pane WITHOUT moving focus or the centre. Measured on the report
+        // (21:43 UTC): every press toggled the neighbouring pane's tab while
+        // the pane in front of the user did nothing.
+        const paneTabId = resolvePaneSurfaceHotkeyTabId({
+          panes: useWorkspaceStore.getState().splitPanes,
+          focusedIndex: useWorkspaceStore.getState().splitFocusedIndex,
+          activeTabId: effectiveTab?.id || null,
+        });
+        const paneTab = paneTabId
+          ? useWorkspaceStore.getState().openProjects.get(
+            useWorkspaceStore.getState().splitPanes.find((p) => p.tabId === paneTabId)?.projectId
+            || activeProjectId || '',
+          )?.tabs.get(paneTabId)
+          : null;
+        const target = paneTab || effectiveTab;
+        const hasSession = target
+          ? (target.claudeSessionId || target.geminiSessionId || target.codexSessionId)
+          : null;
+        if (!target?.id || !hasSession) {
+          console.warn('[Workspace:Hotkey] ' + shortcut + ' BLOCKED: target=' + (target?.id || 'null') + ' activeTab=' + (effectiveTab?.id || 'null') + ' claudeSession=' + (target?.claudeSessionId ? String(target.claudeSessionId).substring(0, 8) : 'null') + ' geminiSession=' + (target?.geminiSessionId ? String(target.geminiSessionId).substring(0, 8) : 'null') + ' codexSession=' + (target?.codexSessionId ? String(target.codexSessionId).substring(0, 8) : 'null'));
           return;
         }
+        const targetId = target.id;
         e.preventDefault();
         // In a split pane the shortcut opens THE OTHER surface of that pane,
         // whichever it is — symmetric by design, so the key never feels dead:
@@ -855,16 +884,16 @@ export default function Workspace() {
         // not the single-mode ones.
         if (splitActiveLayout) {
           const ui = useUIStore.getState();
-          const paneTerminalPrimary = resolveTabTerminalPrimary(ui, effectiveTab.id);
+          const paneTerminalPrimary = resolveTabTerminalPrimary(ui, targetId);
           if (paneTerminalPrimary) {
-            const currentOpen = ui.historyPanelOpenTabs[effectiveTab.id] ?? false;
-            console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle side history (split): tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
-            setHistoryPanelOpen(effectiveTab.id, !currentOpen);
+            const currentOpen = ui.historyPanelOpenTabs[targetId] ?? false;
+            console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle side history (split): tabId=' + targetId.substring(targetId.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
+            setHistoryPanelOpen(targetId, !currentOpen);
             return;
           }
-          const currentOpen = ui.sideTerminalOpenTabs[effectiveTab.id] ?? false;
-          console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle side terminal (split): tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
-          ui.setSideTerminalOpen(effectiveTab.id, !currentOpen);
+          const currentOpen = ui.sideTerminalOpenTabs[targetId] ?? false;
+          console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle side terminal (split): tabId=' + targetId.substring(targetId.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
+          ui.setSideTerminalOpen(targetId, !currentOpen);
           return;
         }
         // Single mode, same symmetry as a pane: the shortcut opens THE OTHER
@@ -873,13 +902,13 @@ export default function Workspace() {
         //                        the key did nothing at all in chat mode),
         //   terminal-primary   → the side TRANSCRIPT.
         if (historyIsPrimary) {
-          console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle floating terminal: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + floatingTerminalOpen + ' → ' + !floatingTerminalOpen);
+          console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle floating terminal: tabId=' + targetId.substring(targetId.length - 8) + ' ' + floatingTerminalOpen + ' → ' + !floatingTerminalOpen);
           toggleFloatingTerminal();
           return;
         }
-        const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
-        console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle history: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
-        setHistoryPanelOpen(effectiveTab.id, !currentOpen);
+        const currentOpen = useUIStore.getState().historyPanelOpenTabs[targetId] ?? false;
+        console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle history: tabId=' + targetId.substring(targetId.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
+        setHistoryPanelOpen(targetId, !currentOpen);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -893,12 +922,18 @@ export default function Workspace() {
       if ((e.metaKey || e.altKey) && e.code === 'BracketLeft') {
         if (!agentSurfacePairAvailable) return;
         e.preventDefault();
-        swapPrimarySurface();
+        // The focused pane's tab, for the same reason as Cmd+] above.
+        const ws = useWorkspaceStore.getState();
+        swapPrimarySurface(resolvePaneSurfaceHotkeyTabId({
+          panes: ws.splitPanes,
+          focusedIndex: ws.splitFocusedIndex,
+          activeTabId: effectiveTab?.id || null,
+        }) || undefined);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, agentSurfacePairAvailable, swapPrimarySurface]);
+  }, [workspaceView, agentSurfacePairAvailable, swapPrimarySurface, effectiveTab?.id]);
 
   // Double-tap ArrowDown — jump BOTH surfaces to their newest content, from
   // anywhere in the app. Aiming at the small floating arrow button is the
@@ -1645,7 +1680,10 @@ export default function Workspace() {
       ))}
 
       {/* CENTER COLUMN: Terminal/Home Area (no more TabBar above it) */}
-      <div className="flex-1 flex flex-col min-w-0 relative">
+      {/* data-workspace-center: keyboard-owner marker (keyboardOwnerGesture.mjs).
+          The whole column IS the work — terminal, History, composer, control
+          bar — so one marker on the column beats chasing every inner surface. */}
+      <div data-workspace-center className="flex-1 flex flex-col min-w-0 relative">
 
         <div className="flex-1 flex flex-col min-w-0 relative">
           {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}
@@ -1661,7 +1699,7 @@ export default function Workspace() {
               terminal is wrapped in the floating frame and the row would end
               up inside that window. Split mode renders per-pane rows instead. */}
           {!splitActiveLayout && effectiveTab && currentView === 'terminal' && (
-            <div className="shrink-0 relative" style={{ height: SPLIT_ATTACH_ROW_H }}>
+            <div className="shrink-0 relative" style={{ height: attachRowH }}>
               <SplitPaneAttachRow projectId={activeProjectId} tabId={effectiveTab.id} focused />
             </div>
           )}
@@ -1762,7 +1800,7 @@ export default function Workspace() {
 
             {/* File Preview Overlay */}
             {filePreview && (
-              <FilePreview topOffset={filePreview.source === 'tab' ? SPLIT_ATTACH_ROW_H : 0} />
+              <FilePreview topOffset={filePreview.source === 'tab' ? attachRowH : 0} />
             )}
 
             {/* History Panel — overlay unless History pin mode is enabled. */}

@@ -111,6 +111,7 @@ test('one exact post-boundary Claude record produces promotable audit data', asy
   assert.equal(result.audit.operationKey, source.operationKey);
   assert.equal(result.audit.attemptId, source.attemptId);
   assert.equal(result.audit.entryUuid, 'new-uuid');
+  assert.equal(result.audit.recordByteOffset, boundary.fileSize);
   assert.equal(result.audit.expectedHash, source.promptHash);
   assert.equal(result.audit.actualHash, source.promptHash);
   assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
@@ -134,6 +135,7 @@ test('one allowlisted canonical Codex record produces promotable audit data', as
   assert.equal(result.audit.canonicalized, true);
   assert.equal(result.audit.canonicalReason, 'codex_trimmed_boundary_whitespace');
   assert.equal(result.audit.sourceIdentity, 'codex-user-source-codex-session-0');
+  assert.equal(result.audit.recordByteOffset, 0);
   assert.notEqual(result.audit.actualHash, result.audit.expectedHash);
   assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
 });
@@ -180,7 +182,7 @@ test('legacy Codex receipt recovers its exact writer session from its own pre-En
   assert.equal(result.audit.attemptId, source.attemptId);
 });
 
-test('legacy session recovery is Codex-only and conflicting identities fail closed', async (t) => {
+test('legacy session recovery uses only the exact provider boundary and conflicts fail closed', async (t) => {
   const dir = await tempDir(t, 'agent-startup-session-conflict-');
   const transcriptPath = path.join(dir, 'codex.jsonl');
   const prompt = 'exact session only';
@@ -194,18 +196,29 @@ test('legacy session recovery is Codex-only and conflicting identities fail clos
   assert.equal(conflict.decision, 'unknown');
   assert.equal(conflict.reason, 'transcript-boundary-foreign-session');
 
+  const claudeSessionId = '2531a2eb-c6c4-49b2-911f-760d7b39801e';
+  const claudePath = path.join(dir, `${claudeSessionId}.jsonl`);
+  await fs.promises.writeFile(
+    claudePath,
+    JSON.stringify(claudeUser('claude-legacy-user', prompt, claudeSessionId)) + '\n',
+  );
   const claudeBoundary = {
     available: true,
-    transcriptPath,
+    transcriptPath: claudePath,
     fileSize: 0,
     endedWithNewline: true,
-    sessionId: 'boundary-session',
   };
   const claudeWithoutStoredSession = await reconcileAgentSendStartupRecord(
     unresolvedRecord('claude', claudeBoundary, prompt, { sessionId: null }),
   );
-  assert.equal(claudeWithoutStoredSession.decision, 'unknown');
-  assert.equal(claudeWithoutStoredSession.reason, 'receipt-identity-incomplete');
+  assert.equal(claudeWithoutStoredSession.decision, 'found');
+  assert.equal(claudeWithoutStoredSession.audit.sessionId, claudeSessionId);
+
+  const claudeConflict = await reconcileAgentSendStartupRecord(
+    unresolvedRecord('claude', claudeBoundary, prompt, { sessionId: 'foreign-session' }),
+  );
+  assert.equal(claudeConflict.decision, 'unknown');
+  assert.equal(claudeConflict.reason, 'transcript-boundary-foreign-session');
 });
 
 test('multiple exact post-boundary candidates remain unknown', async (t) => {

@@ -11,6 +11,7 @@ const DEFAULT_MAX_PER_TAB = 32;
 const RECEIPT_STATES = Object.freeze({
   IN_FLIGHT: 'in-flight',
   NOT_SUBMITTED: 'not-submitted',
+  PROVIDER_NOT_ACCEPTED: 'provider-not-accepted',
   DELIVERY_UNKNOWN: 'delivery-unknown',
   AUDIT_PENDING: 'audit-pending',
   CONFIRMED: 'confirmed',
@@ -94,7 +95,24 @@ function immutableCopy(value) {
   return deepFreeze(cloneValue(value));
 }
 
+function isExactProviderNotAcceptedReceipt(receipt = {}) {
+  return receipt?.success === false
+    && receipt?.submitted === true
+    && receipt?.pasteWritten === true
+    && receipt?.enterWritten === true
+    && receipt?.semanticStatus === 'not-submitted'
+    && receipt?.providerAccepted === false
+    && receipt?.providerTurnCreated === false
+    && receipt?.composerDraftState === 'exact-original'
+    && receipt?.exactDraftRemained === true
+    && receipt?.draftPreserved === true
+    && receipt?.lateReconciliationPending === false;
+}
+
 function classifyAgentSendRegistryReceipt(receipt = {}) {
+  if (isExactProviderNotAcceptedReceipt(receipt)) {
+    return RECEIPT_STATES.PROVIDER_NOT_ACCEPTED;
+  }
   if (
     receipt?.deliveryUnknown === true
     || receipt?.status === 'delivery-unknown'
@@ -385,6 +403,16 @@ function createAgentSendReceiptRegistry(options = {}) {
       record.receipt = immutableCopy({
         ...(receipt || {}),
         attemptId: receipt?.attemptId || record.attemptId || null,
+        ...(record.state === RECEIPT_STATES.PROVIDER_NOT_ACCEPTED
+          ? {
+              accepted: false,
+              submitted: true,
+              status: RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
+              receiptState: RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
+              auditPending: false,
+              deliveryUnknown: false,
+            }
+          : {}),
       });
     }
     const result = publicResult(record);
@@ -541,6 +569,9 @@ function createAgentSendReceiptRegistry(options = {}) {
     if (record.state === RECEIPT_STATES.NOT_SUBMITTED) {
       return auditMismatch(record, audit, 'not-submitted-cannot-be-promoted');
     }
+    if (record.state === RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) {
+      return auditMismatch(record, audit, 'provider-not-accepted-cannot-be-promoted');
+    }
     if (record.state === RECEIPT_STATES.CONFIRMED) {
       return immutableCopy({
         matched: true,
@@ -649,4 +680,5 @@ module.exports = {
   classifyAgentSendRegistryReceipt,
   createAgentSendReceiptRegistry,
   fingerprintAgentSendRequest,
+  isExactProviderNotAcceptedReceipt,
 };

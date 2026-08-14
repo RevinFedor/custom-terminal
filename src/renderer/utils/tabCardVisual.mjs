@@ -89,6 +89,37 @@ export function resolveTabCardMetrics(geo, { fontSize, showTaskLane = false, has
   };
 }
 
+// Explicit, because the row-height math below has to PREDICT the chip's
+// rendered height. With the browser default ('normal') the text box height is
+// font-dependent and the prediction drifts; the chip sets this value on itself
+// so the two cannot disagree.
+export const TAB_CARD_LINE_HEIGHT = 1.2;
+
+// The pane header was a hard 26px while the chip inside it obeys the user's
+// Settings → Размеры. Any setting that makes the chip taller than 26 made it
+// overflow the row symmetrically — poking past the PANE'S TOP EDGE, i.e. over
+// the separator line of the stacked pane above. Which of the two painted on
+// top then depended on sibling DOM order, so the symptom flipped with focus:
+// chip over the line, or line through the chip. The row must be sized FROM the
+// chip, not the chip squeezed into the row.
+export const SPLIT_ATTACH_ROW_MIN_H = 26;
+
+/**
+ * Height of a pane's attach row: the chip's own height plus 1px of air, never
+ * below the classic 26 (at default settings the math lands exactly on 26, so
+ * nothing moves for anyone who has not touched Размеры).
+ *
+ * Only fontSize and paddingY matter: the task-lane variant shifts padding
+ * between top and bottom but keeps the sum, and the status marker only widens
+ * the left inset.
+ */
+export function resolveSplitAttachRowHeight(geo, { fontSize } = {}) {
+  const paddingY = num(geo?.paddingY, 3);
+  const fs = num(fontSize, 14);
+  const chipH = Math.ceil(fs * TAB_CARD_LINE_HEIGHT) + paddingY * 2 + 2; // +2 — chip borders
+  return Math.max(SPLIT_ATTACH_ROW_MIN_H, chipH + 1);
+}
+
 const num = (value, fallback) => {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;

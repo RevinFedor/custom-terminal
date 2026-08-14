@@ -614,6 +614,9 @@ function buildClaudeLivePromptAuditConfirmation(
       sessionId: auditSessionId,
       entryUuid,
       auditTimestamp: record.timestamp || new Date(audit.sentAt).toISOString(),
+      ...(Number.isFinite(Number(candidate.byteOffset))
+        ? { recordByteOffset: Number(candidate.byteOffset) }
+        : {}),
       expectedLen: audit.expectedLen,
       expectedHash: audit.expectedHash,
       canonicalized: true,
@@ -628,12 +631,19 @@ function buildClaudeLivePromptAuditConfirmation(
 
 async function captureClaudePromptAuditBoundary(
   transcriptPath,
-  { maxReadBytes = DEFAULT_CLAUDE_AUDIT_READ_BYTES } = {},
+  {
+    maxReadBytes = DEFAULT_CLAUDE_AUDIT_READ_BYTES,
+    sessionId = null,
+  } = {},
 ) {
+  const exactSessionId = typeof sessionId === 'string' && sessionId.trim()
+    ? sessionId.trim()
+    : null;
   if (!transcriptPath) {
     return {
       available: false,
       reason: 'transcript-unresolved',
+      sessionId: exactSessionId,
       transcriptPath: null,
       fileSize: null,
       lastUserUuid: null,
@@ -664,6 +674,7 @@ async function captureClaudePromptAuditBoundary(
     return {
       available: true,
       reason: null,
+      sessionId: exactSessionId,
       transcriptPath: resolvedPath,
       fileSize,
       lastUserUuid: lastUser?.record?.uuid || null,
@@ -675,6 +686,7 @@ async function captureClaudePromptAuditBoundary(
       return {
         available: true,
         reason: null,
+        sessionId: exactSessionId,
         transcriptPath: resolvedPath,
         fileSize: 0,
         lastUserUuid: null,
@@ -685,6 +697,7 @@ async function captureClaudePromptAuditBoundary(
     return {
       available: false,
       reason: error?.code || error?.message || 'transcript-read-failed',
+      sessionId: exactSessionId,
       transcriptPath: resolvedPath,
       fileSize: null,
       lastUserUuid: null,

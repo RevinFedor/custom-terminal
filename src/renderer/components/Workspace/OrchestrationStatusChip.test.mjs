@@ -38,3 +38,10 @@ test('incomplete result proof can be detached from the tooltip and compact statu
   assert.match(source, /canDismissAttention \|\| canDismissRecovery \|\| canDetachResultProof/);
   assert.match(source, /canDetachResultProof \|\| paused\s*\? 'detach'/);
 });
+
+test('active orchestration runs stack vertically and open top-aligned details on the left', () => {
+  assert.match(source, /data-orchestration-active-list[\s\S]*?flexDirection: 'column'/);
+  assert.match(source, /data-orchestration-active-list[\s\S]*?overflowY: 'auto'/);
+  assert.match(source, /data-orchestration-active-run=\{run\.runId\}[\s\S]*?borderBottom:/);
+  assert.match(source, /<Tooltip[\s\S]*?side="left"[\s\S]*?align="start"/);
+});

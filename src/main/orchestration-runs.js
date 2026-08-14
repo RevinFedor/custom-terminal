@@ -9,6 +9,10 @@ const {
 const {
   agentPromptAuditMatchesHash,
 } = require('./agent-prompt-audit-identity');
+const {
+  RECEIPT_STATES: AGENT_SEND_RECEIPT_STATES,
+  isExactProviderNotAcceptedReceipt,
+} = require('./agent-send-receipt-registry');
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const ACTIVE_STATUSES = new Set([
@@ -281,9 +285,11 @@ function buildOrchestrationResultLookup(run) {
 
 function orchestrationSendFailureRecoveryPolicy(sendResult = {}) {
   const provenNotSent = sendResult?.submitted === false;
+  const provenProviderNotAccepted = isExactProviderNotAcceptedReceipt(sendResult);
   return {
     provenNotSent,
-    failureGraceMs: provenNotSent ? 0 : undefined,
+    provenProviderNotAccepted,
+    failureGraceMs: provenNotSent || provenProviderNotAccepted ? 0 : undefined,
   };
 }
 
@@ -291,6 +297,13 @@ function classifyAgentSendReceipt(sendResult = {}) {
   const registryState = typeof sendResult?.receiptState === 'string'
     ? sendResult.receiptState
     : null;
+  if (isExactProviderNotAcceptedReceipt(sendResult)) {
+    return {
+      state: AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
+      submitted: true,
+      accepted: false,
+    };
+  }
   if (
     registryState === 'delivery-unknown'
     || registryState === 'evicted-unknown'

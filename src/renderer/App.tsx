@@ -3,6 +3,7 @@ import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocuse
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
+import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG } from './utils/projectCardPresence.mjs';
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
@@ -505,6 +506,16 @@ const ProjectTabItem = memo(({
   // from the start. Re-keying the node is what does that — the store cannot
   // "clear then set on the next frame", because a hidden window paints no frames.
   const projectCardPulseSeq = useUIStore((s) => s.projectCardPulseSeq);
+  // Is THIS project on screen (a pane shows one of its tabs) without being the
+  // selected one? Computed inside the selector so what leaves the store is a
+  // short string, never an array — a selector returning panes would re-render
+  // every card on every pane write (Fingerprint Pattern).
+  const cardPresence = useWorkspaceStore((s) => projectCardPresence({
+    projectId,
+    focusedProjectId: s.focusedProjectId || s.activeProjectId,
+    panes: s.splitPanes,
+    centerProjectId: s.activeProjectId,
+  }));
 
   useEffect(() => {
     if (isEditing && inputRef.current) {
@@ -673,6 +684,19 @@ const ProjectTabItem = memo(({
     >
       {isActive && (
         <div className="absolute inset-0 bg-white rounded-sm" />
+      )}
+      {/* "This project is on screen but is not the one selected" — a tab of it
+          sits in one of the panes (or is the centre tab). Without this the card
+          looked exactly as idle as a project not opened in a week, even while
+          the user was working in it. A faint wash, because the card's edges are
+          taken by the drop outline and the focus ring, and its inside by the
+          completion flash, the awaiting pulse and the process counter. */}
+      {!isActive && cardPresence === 'on-screen' && (
+        <div
+          className="absolute inset-0 rounded-sm pointer-events-none"
+          style={{ background: PROJECT_CARD_ON_SCREEN_BG, zIndex: 6 }}
+          aria-hidden
+        />
       )}
       {/* One flash when the pane header chip pointed here and the sidebar was
           already on this project — the click's only visible answer in that case.

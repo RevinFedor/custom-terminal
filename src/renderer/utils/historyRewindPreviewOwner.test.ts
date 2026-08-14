@@ -7,6 +7,7 @@ import {
   shouldClearRewindPreviewForOwnerTransition,
   type HistoryRewindPreviewOwner,
 } from './historyRewindPreviewOwner.ts';
+import { buildHistoryLivePresentation } from './historyLiveProjection.mjs';
 
 test('native Rewind moves the target prompt out of History and into draft ownership', () => {
   const source = [
@@ -35,6 +36,30 @@ test('native Rewind preview is a no-op when its exact target is absent', () => {
   assert.strictEqual(projected.entries, source);
   assert.equal(projected.hiddenCount, 0);
   assert.equal(projected.hiddenTurnCount, 0);
+});
+
+test('native Rewind filters the final durable plus live projection', () => {
+  const durable = [
+    { uuid: 'before', role: 'assistant', sessionId: 'session-a', recordByteOffset: 100 },
+    { uuid: 'target', role: 'user', sessionId: 'session-a', recordByteOffset: 200 },
+  ];
+  const liveOldFuture = [{
+    uuid: 'live-old-future',
+    role: 'assistant',
+    sessionId: 'session-a',
+    recordByteOffset: 300,
+  }];
+
+  const merged = buildHistoryLivePresentation(durable, liveOldFuture);
+  const projected = projectNativeRewindPreview(
+    merged,
+    'target',
+    () => false,
+    (entry) => entry.role === 'user',
+  );
+
+  assert.deepEqual(projected.entries.map((entry) => entry.uuid), ['before']);
+  assert.equal(projected.hiddenCount, 2);
 });
 
 test('rewind preview counts user turns instead of raw assistant records', () => {

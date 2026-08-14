@@ -640,7 +640,21 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
       style={{ display: 'contents', pointerEvents: 'auto' }}
     >
       {statusRuns.length > 0 && (
-        <div data-orchestration-active-list style={{ display: 'flex', maxWidth: 534, overflowX: 'auto', border: '1px solid #444', borderRadius: 5, background: '#171717', boxShadow: '0 2px 10px rgba(0,0,0,0.22)' }}>
+        <div
+          data-orchestration-active-list
+          style={{
+            width: 178,
+            maxHeight: 'min(208px, calc(100vh - 110px))',
+            display: 'flex',
+            flexDirection: 'column',
+            overflowX: 'hidden',
+            overflowY: 'auto',
+            border: '1px solid #444',
+            borderRadius: 5,
+            background: '#171717',
+            boxShadow: '0 2px 10px rgba(0,0,0,0.22)',
+          }}
+        >
           {statusRuns.map((run, index) => {
             const isSource = run.sourceTabId === tabId;
             const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
@@ -661,7 +675,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
                 align="start"
                 always
               >
-                <div data-orchestration-active-run={run.runId} style={{ width: 178, height: 26, display: 'flex', alignItems: 'center', borderRight: index < statusRuns.length - 1 ? '1px solid #303030' : 0, boxSizing: 'border-box', flexShrink: 0 }}>
+                <div data-orchestration-active-run={run.runId} style={{ width: '100%', height: 26, display: 'flex', alignItems: 'center', borderBottom: index < statusRuns.length - 1 ? '1px solid #303030' : 0, boxSizing: 'border-box', flexShrink: 0 }}>
                   <button
                     type="button"
                     onClick={() => void openLinkedTab(run)}

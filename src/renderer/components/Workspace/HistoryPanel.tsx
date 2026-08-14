@@ -332,6 +332,7 @@ interface FullHistoryEntry {
   auditEntryUuid?: string;
   liveProjection?: boolean;
   sourceIdentity?: string;
+  recordByteOffset?: number;
   semanticTags?: Array<{
     id?: string;
     kind: 'orchestration' | 'prompt-origin';
@@ -529,6 +530,7 @@ interface PromptHandoffMeta {
   auditHash?: string;
   auditEntryUuid?: string;
   sourceIdentity?: string;
+  recordByteOffset?: number;
 }
 
 interface DurablePromptIdentity {
@@ -538,6 +540,7 @@ interface DurablePromptIdentity {
   auditSessionId?: string;
   auditEntryUuid?: string;
   sourceIdentity?: string;
+  recordByteOffset?: number;
   sessionId?: string;
 }
 
@@ -1072,7 +1075,12 @@ const mergeServerAndLocalEntries = (serverEntries: FullHistoryEntry[], currentEn
           : entry;
       })
     : serverEntries;
-  return locals.length > 0 ? [...decoratedServerEntries, ...locals] : decoratedServerEntries;
+  // Confirmed local rows already carry the exact transcript position. Feed
+  // them through the same ordered projection used by live rows instead of
+  // appending them after a newer durable answer.
+  return locals.length > 0
+    ? buildHistoryLivePresentation(decoratedServerEntries, locals) as FullHistoryEntry[]
+    : decoratedServerEntries;
 };
 
 const historyActionPresentationEqual = (left: Action, right: Action) => {
@@ -1123,6 +1131,7 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.auditSessionId !== right.auditSessionId ||
     left.liveProjection !== right.liveProjection ||
     left.sourceIdentity !== right.sourceIdentity ||
+    left.recordByteOffset !== right.recordByteOffset ||
     left.livePendingThinking !== right.livePendingThinking ||
     left.responseTiming?.intervalId !== right.responseTiming?.intervalId ||
     left.responseTiming?.startTs !== right.responseTiming?.startTs ||
@@ -4044,6 +4053,7 @@ function AgentHistoryControls({
       auditSessionId?: string;
       auditEntryUuid?: string;
       sourceIdentity?: string;
+      recordByteOffset?: number;
     }
   ) => void;
   onPromptStatusChange: (
@@ -4057,6 +4067,7 @@ function AgentHistoryControls({
       auditSessionId?: string;
       auditEntryUuid?: string;
       sourceIdentity?: string;
+      recordByteOffset?: number;
     },
   ) => void;
   hasDurablePrompt: (
@@ -4618,6 +4629,7 @@ function AgentHistoryControls({
       auditSessionId: proof?.sessionId || pending.durableIdentity.auditSessionId,
       auditEntryUuid: proof?.entryUuid || pending.durableIdentity.auditEntryUuid,
       sourceIdentity: proof?.sourceIdentity || pending.durableIdentity.sourceIdentity,
+      recordByteOffset: proof?.recordByteOffset ?? pending.durableIdentity.recordByteOffset,
       sessionId: proof?.sessionId || pending.durableIdentity.sessionId,
     } satisfies DurablePromptIdentity;
   }, [tabId]);
@@ -5490,6 +5502,7 @@ function AgentHistoryControls({
       auditSessionId?: string;
       auditEntryUuid?: string;
       sourceIdentity?: string;
+      recordByteOffset?: number;
     } | undefined;
     let clearedPromptText: string | null = null;
     let clearedPromptImages: HistoryPromptDraftImageRef[] = [];
@@ -5905,6 +5918,7 @@ function AgentHistoryControls({
           auditSessionId: auditProof?.sessionId || undefined,
           auditEntryUuid: auditProof?.entryUuid,
           sourceIdentity: auditProof?.sourceIdentity,
+          recordByteOffset: auditProof?.recordByteOffset,
         };
         if (resultOwnershipTransferred) {
           settleHistoryPromptHandoff(actionTabId, handoffId, {
@@ -5985,6 +5999,7 @@ function AgentHistoryControls({
             auditSessionId: sendAuditIdentity.auditSessionId,
             auditEntryUuid: sendAuditIdentity.auditEntryUuid,
             sourceIdentity: sendAuditIdentity.sourceIdentity,
+            recordByteOffset: sendAuditIdentity.recordByteOffset,
             sessionId: sendAuditIdentity.auditSessionId || sessionId || undefined,
           },
         };
@@ -8226,6 +8241,16 @@ const HISTORY_HYDRATION_TAIL_ROWS = 300;
 // span's edge. Must be well below the radius so the request is issued while
 // there are still hydrated rows to scroll through.
 const HISTORY_HYDRATION_REFETCH_MARGIN_ROWS = 250;
+// A Timeline jump that lands on a stub row waits for its hydration under this
+// absolute ceiling instead of the rAF attempt cap alone: a cold giant rebuild
+// in main is seconds, and reporting found=false right before the rows arrive
+// is exactly the "крестики + вечный скелетон" failure of 14.08.
+const JUMP_STUB_HYDRATION_WAIT_MS = 20_000;
+// Re-asking main to hydrate around the SAME row is refused inside this
+// window. Success makes a repeat pointless (the span already covers the
+// row); failure gets a bounded retry cadence instead of one request per
+// animation frame from the jump loop.
+const HYDRATION_REISSUE_COOLDOWN_MS = 1_200;
 
 // Fallback average row height when no measured geometry exists yet (first
 // ever visit to a session). Roughly a short assistant paragraph; real
@@ -8957,11 +8982,6 @@ function HistoryPanel({
       setExpandedBackgroundChipKey(null);
     }
   }, [backgroundHistoryChips, expandedBackgroundChipKey]);
-  const rewindPreviewResult = useMemo(
-    () => buildRewindPreviewEntries(renderEntries, rewindPreview),
-    [renderEntries, rewindPreview],
-  );
-  const displayEntries = rewindPreviewResult.entries;
   const visibleLiveEntries = liveProjectionRef.current.ownerKey === historyOwnerKey
     ? liveEntries
     : [];
@@ -8969,10 +8989,18 @@ function HistoryPanel({
   // The durable version wins by source identity, while computeItemKey keeps
   // the same DOM row across the handoff. This removes the old footer/indexed
   // dual presentation and its materialization race.
-  const transcriptEntries = useMemo(
-    () => buildHistoryLivePresentation(displayEntries, visibleLiveEntries),
-    [displayEntries, visibleLiveEntries],
+  const mergedTranscriptEntries = useMemo(
+    () => buildHistoryLivePresentation(renderEntries, visibleLiveEntries),
+    [renderEntries, visibleLiveEntries],
   ) as FullHistoryEntry[];
+  // Rewind owns the final presentation boundary. Applying it before the live
+  // merge allowed an old live row beyond the target to reappear afterwards.
+  const rewindPreviewResult = useMemo(
+    () => buildRewindPreviewEntries(mergedTranscriptEntries, rewindPreview),
+    [mergedTranscriptEntries, rewindPreview],
+  );
+  const displayEntries = rewindPreviewResult.entries;
+  const transcriptEntries = displayEntries;
   const visibleTerminalPreview = terminalPreview?.tabId === tabId
     && terminalPreview.toolType === toolType
     && (!sessionId || !terminalPreview.sessionId || terminalPreview.sessionId === sessionId)
@@ -9326,13 +9354,43 @@ function HistoryPanel({
   // an IntersectionObserver (cheaper, exact: no threshold guessing).
   const visibleRangeRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
   // Row-window hydration state. `centerUuid` is what the NEXT request asks
-  // main to hydrate around (null = tail, the cold-open default); the span is
-  // what the last response actually hydrated, in row indices.
+  // main to hydrate around (null = tail, the cold-open default). There is
+  // deliberately NO mirrored "hydrated span" bookkeeping here any more: the
+  // 14.08 17:10 deadlock came exactly from that derived state rotting (a
+  // delta response without row-window fields flipped it to "not windowed",
+  // an owner switch inherited another tab's span) while the per-row
+  // `rowStub` flags — main's ground truth — stayed correct. Every decision
+  // now reads the rows themselves.
   const hydrationCenterUuidRef = useRef<string | null>(null);
-  const hydrationSpanRef = useRef<{ from: number; to: number; applied: boolean }>({
-    from: 0, to: 0, applied: false,
-  });
   const hydrationRequestInFlightRef = useRef(false);
+  // Orphans a stale request's completion callback after an owner switch: the
+  // old `.finally` must not clear the in-flight flag (or fire the pending
+  // follow-up) of the NEXT owner's request.
+  const hydrationRequestSeqRef = useRef(0);
+  // A targeted request (Timeline jump, search match) that arrives while a
+  // request is in flight is queued — not silently dropped — and issued when
+  // the flight settles. Silent refusal is how a jump starved forever.
+  const hydrationPendingRef = useRef<{
+    centerUuid: string;
+    reason: string;
+    extra: string;
+  } | null>(null);
+  // Retry stopper: when main answers "that centre row does not exist in my
+  // projection" (centerMissing), re-asking for the same uuid is a request
+  // storm, not persistence. The jump loop's timeout handles the UX.
+  const hydrationLastResultRef = useRef<{
+    centerUuid: string | null;
+    centerMissing: boolean;
+  } | null>(null);
+  // Same-uuid re-issue cooldown. The jump loop calls in every frame while
+  // its target is a stub; without this, the gap between a response landing
+  // and React committing the hydrated rows would fire a duplicate load.
+  const hydrationLastIssuedRef = useRef<{ centerUuid: string; at: number } | null>(null);
+  // While a Timeline jump is converging, IT owns the hydration centre. The
+  // viewport watcher fires on every intermediate range the hunt passes
+  // through; letting it re-centre mid-jump can pull the span away from the
+  // target right after the target hydrated (ping-pong until the deadline).
+  const historyJumpHydrationActiveRef = useRef(false);
   // `loadHistory` is declared far below (it depends on the whole load
   // pipeline), but hydration is requested from callbacks defined ABOVE it —
   // search-match navigation, the Timeline-jump effect. A ref is the only way
@@ -9340,27 +9398,64 @@ function HistoryPanel({
   // in the same render that creates loadHistory.
   const loadHistoryRef = useRef<((isRefresh?: boolean) => Promise<boolean>) | null>(null);
   /** One place that starts a hydration re-centre, for every caller. */
-  const requestHistoryHydrationAt = useCallback((
+  const requestHistoryHydrationAtRef = useRef<(
+    centerUuid: string | null,
+    reason: string,
+    extra?: string,
+  ) => boolean>(() => false);
+  requestHistoryHydrationAtRef.current = (
     centerUuid: string | null,
     reason: string,
     extra = '',
   ) => {
     if (!centerUuid) return false;
-    if (!hydrationSpanRef.current.applied) return false;
-    if (hydrationRequestInFlightRef.current) return false;
-    if (hydrationCenterUuidRef.current === centerUuid) return false;
+    const last = hydrationLastResultRef.current;
+    if (last && last.centerMissing && last.centerUuid === centerUuid) return false;
+    const lastIssued = hydrationLastIssuedRef.current;
+    if (
+      lastIssued
+      && lastIssued.centerUuid === centerUuid
+      && performance.now() - lastIssued.at < HYDRATION_REISSUE_COOLDOWN_MS
+    ) return false;
+    if (hydrationRequestInFlightRef.current) {
+      if (hydrationCenterUuidRef.current !== centerUuid) {
+        const firstQueue = hydrationPendingRef.current?.centerUuid !== centerUuid;
+        hydrationPendingRef.current = { centerUuid, reason, extra };
+        if (firstQueue) {
+          historyDiag('HYDRATION_QUEUED tab=' + tabId.slice(-12) +
+            ' reason=' + reason + extra +
+            ' uuid=' + centerUuid.slice(0, 8));
+        }
+      }
+      return false;
+    }
     const load = loadHistoryRef.current;
     if (!load) return false;
+    const seq = ++hydrationRequestSeqRef.current;
     hydrationCenterUuidRef.current = centerUuid;
     hydrationRequestInFlightRef.current = true;
+    hydrationLastIssuedRef.current = { centerUuid, at: performance.now() };
     historyDiag('HYDRATION_REQUEST tab=' + tabId.slice(-12) +
       ' reason=' + reason + extra +
       ' uuid=' + centerUuid.slice(0, 8));
     void load(true).finally(() => {
+      if (hydrationRequestSeqRef.current !== seq) return;
       hydrationRequestInFlightRef.current = false;
+      const pending = hydrationPendingRef.current;
+      hydrationPendingRef.current = null;
+      if (pending && pending.centerUuid !== centerUuid) {
+        requestHistoryHydrationAtRef.current(
+          pending.centerUuid, pending.reason, pending.extra,
+        );
+      }
     });
     return true;
-  }, [tabId]);
+  };
+  const requestHistoryHydrationAt = useCallback((
+    centerUuid: string | null,
+    reason: string,
+    extra = '',
+  ) => requestHistoryHydrationAtRef.current(centerUuid, reason, extra), []);
   // Latest entries length — let stable callbacks (scrollToBottom) read it
   // without depending on `entries` (which would invalidate downstream effects
   // on every refresh).
@@ -9775,6 +9870,7 @@ function HistoryPanel({
       auditSessionId?: string;
       auditEntryUuid?: string;
       sourceIdentity?: string;
+      recordByteOffset?: number;
       sessionId?: string;
     }
   ) => {
@@ -9811,6 +9907,7 @@ function HistoryPanel({
       auditSessionId: meta.auditSessionId,
       auditEntryUuid: meta.auditEntryUuid,
       sourceIdentity: meta.sourceIdentity,
+      recordByteOffset: meta.recordByteOffset,
     };
     promptHandoffMetaRef.current.set(handoffId, {
       text: cleanContent,
@@ -9821,6 +9918,7 @@ function HistoryPanel({
       auditHash: meta.auditHash,
       auditEntryUuid: meta.auditEntryUuid,
       sourceIdentity: meta.sourceIdentity,
+      recordByteOffset: meta.recordByteOffset,
     });
     historyDiag('LOCAL_APPEND tab=' + tabId.slice(-12) +
       ' handoff=' + handoffId +
@@ -9850,6 +9948,7 @@ function HistoryPanel({
               auditSessionId: entry.auditSessionId,
               auditEntryUuid: entry.auditEntryUuid,
               sourceIdentity: entry.sourceIdentity,
+              recordByteOffset: entry.recordByteOffset,
               sessionId: entry.sessionId,
             }
           : candidate);
@@ -9870,6 +9969,7 @@ function HistoryPanel({
       auditSessionId?: string;
       auditEntryUuid?: string;
       sourceIdentity?: string;
+      recordByteOffset?: number;
     },
     changedAtOverride?: number,
   ) => {
@@ -9886,6 +9986,7 @@ function HistoryPanel({
         auditHash: identity.auditHash,
         auditEntryUuid: identity.auditEntryUuid,
         sourceIdentity: identity.sourceIdentity,
+        recordByteOffset: identity.recordByteOffset,
         sessionId: identity.auditSessionId || handoffMeta.sessionId,
       });
     }
@@ -9904,6 +10005,7 @@ function HistoryPanel({
         auditSessionId: identity?.auditSessionId || handoffMeta.sessionId,
         auditEntryUuid: identity?.auditEntryUuid || handoffMeta.auditEntryUuid,
         sourceIdentity: identity?.sourceIdentity || handoffMeta.sourceIdentity,
+        recordByteOffset: identity?.recordByteOffset ?? handoffMeta.recordByteOffset,
         sessionId: identity?.auditSessionId || handoffMeta.sessionId || sessionId,
       } as FullHistoryEntry,
     );
@@ -9967,6 +10069,7 @@ function HistoryPanel({
                 auditSessionId: identity.auditSessionId,
                 auditEntryUuid: identity.auditEntryUuid,
                 sourceIdentity: identity.sourceIdentity,
+                recordByteOffset: identity.recordByteOffset,
                 sessionId: identity.auditSessionId || entry.sessionId,
               }
             : {}),
@@ -10178,6 +10281,7 @@ function HistoryPanel({
         auditSessionId,
         auditEntryUuid: record.auditProof?.entryUuid,
         sourceIdentity: record.auditProof?.sourceIdentity,
+        recordByteOffset: record.auditProof?.recordByteOffset,
       };
       if (
         record.queueStatus === 'preparing'
@@ -10301,6 +10405,7 @@ function HistoryPanel({
         auditSessionId: identity.auditSessionId || identity.sessionId,
         auditEntryUuid: identity.auditEntryUuid,
         sourceIdentity: identity.sourceIdentity,
+        recordByteOffset: identity.recordByteOffset,
         sessionId: identity.auditSessionId || identity.sessionId,
       } as FullHistoryEntry,
     )
@@ -10538,6 +10643,7 @@ function HistoryPanel({
         auditSessionId: handoff.auditProof?.sessionId || undefined,
         auditEntryUuid: handoff.auditProof?.entryUuid,
         sourceIdentity: handoff.auditProof?.sourceIdentity,
+        recordByteOffset: handoff.auditProof?.recordByteOffset,
       };
       const legacyOrchestrationMatch = serverEntries.find((entry) => (
         !consumedServerUuids.has(entry.uuid)
@@ -10819,24 +10925,22 @@ function HistoryPanel({
               ' reason=' + suppressed.reason);
           }
         }
-        // Record which rows main actually hydrated. The watcher below decides
-        // "am I near the edge of readable content?" from this, not from what
-        // was REQUESTED — a request centred on a row that vanished falls back
-        // to the tail, and believing the request would leave the watcher
-        // convinced it holds a span it does not.
+        // The hydrated span is NOT mirrored into renderer state: the rows
+        // themselves (rowStub flags) are the single source of truth for
+        // every "do I need to hydrate?" decision. This log is diagnosis
+        // only. `centerMissing` is remembered per-uuid so the panel does
+        // not re-ask main for a row main just said it cannot find.
         if (result.rowWindowApplied) {
-          hydrationSpanRef.current = {
-            from: Number(result.hydratedFrom) || 0,
-            to: Number(result.hydratedTo) || 0,
-            applied: true,
+          hydrationLastResultRef.current = {
+            centerUuid: hydrationCenterUuidRef.current,
+            centerMissing: result.centerMissing === true,
           };
           historyDiag('HYDRATION_SPAN tab=' + tabId.slice(-12) +
             ' seq=' + loadSequence +
-            ' span=' + hydrationSpanRef.current.from + '-' + hydrationSpanRef.current.to +
+            ' span=' + (Number(result.hydratedFrom) || 0) + '-' + (Number(result.hydratedTo) || 0) +
             ' hydrated=' + (result.hydratedCount ?? -1) +
-            ' stubbed=' + (result.stubbedCount ?? -1));
-        } else {
-          hydrationSpanRef.current = { from: 0, to: 0, applied: false };
+            ' stubbed=' + (result.stubbedCount ?? -1) +
+            (result.centerMissing === true ? ' centerMissing=1' : ''));
         }
         const rawServerEntries: FullHistoryEntry[] = result.entries || [];
         rawServerEntriesRef.current = rawServerEntries;
@@ -11092,43 +11196,50 @@ function HistoryPanel({
 
   // Row-window hydration watcher.
   //
-  // Called whenever the visible range moves. It answers one question: is the
-  // user reading close enough to the edge of the hydrated span that the next
-  // flings would land on stubs? If so, re-centre the span on the row the user
-  // is looking at and refresh — the response travels as a delta carrying only
-  // the rows whose hydration state changed (proven in
-  // session-transcript-service.projector.test.js).
+  // Called whenever the visible range moves. Stateless by design: it scans
+  // the rows around the viewport for identity stubs instead of consulting a
+  // mirrored "hydrated span" — derived span state is exactly what deadlocked
+  // the 14.08 Timeline jumps (a delta response without row-window fields
+  // flipped it to "not windowed", and an owner switch inherited another
+  // tab's span). The rows main shipped cannot drift from themselves.
   //
-  // Deliberately NOT event-throttled by a timer: the guards are structural —
-  // one request in flight at a time, and a request is only issued when the
-  // measured distance to the span edge crosses the margin. A satisfied
-  // viewport issues nothing at all, so scrolling inside the span is free.
+  // Deliberately NOT event-throttled by a timer: one request in flight at a
+  // time, and a request is only issued when a stub sits within the margin. A
+  // fully hydrated neighbourhood issues nothing at all, so scrolling inside
+  // the span is free; the scan itself is O(margin) property reads.
   const maybeRequestHistoryHydration = useCallback((reason: string) => {
     if (toolType !== 'codex') return;
-    const span = hydrationSpanRef.current;
-    if (!span.applied) return;
     if (hydrationRequestInFlightRef.current) return;
-    const total = presentationEntriesRef.current.length;
+    // A converging Timeline jump owns the centre; ranges published while it
+    // hunts are transit, not reading positions.
+    if (historyJumpHydrationActiveRef.current) return;
+    const rows = presentationEntriesRef.current;
+    const total = rows.length;
     if (total === 0) return;
     const range = visibleRangeRef.current;
-    const nearTop = range.start - span.from;
-    const nearBottom = span.to - range.end;
-    // The span already reaches the list edge on that side — nothing more to
-    // hydrate there, however close the viewport gets.
-    const topEdgeReached = span.from <= 0;
-    const bottomEdgeReached = span.to >= total - 1;
-    const needsAbove = !topEdgeReached && nearTop < HISTORY_HYDRATION_REFETCH_MARGIN_ROWS;
-    const needsBelow = !bottomEdgeReached && nearBottom < HISTORY_HYDRATION_REFETCH_MARGIN_ROWS;
-    if (!needsAbove && !needsBelow) return;
+    const scanFrom = Math.max(0, range.start - HISTORY_HYDRATION_REFETCH_MARGIN_ROWS);
+    const scanTo = Math.min(total - 1, range.end + HISTORY_HYDRATION_REFETCH_MARGIN_ROWS);
+    let stubIndex = -1;
+    for (let index = scanFrom; index <= scanTo; index += 1) {
+      if ((rows[index] as any)?.rowStub) { stubIndex = index; break; }
+    }
+    if (stubIndex < 0) return;
     // Centre on the middle of what is on screen: the span then extends
-    // symmetrically, so scrolling back the other way is covered too.
+    // symmetrically, so scrolling back the other way is covered too. A stub
+    // still carries its uuid, so centring works even mid-stub-zone. A row
+    // main does not know (an optimistic local prompt) cannot anchor a span —
+    // fall back to the stub itself, which is a durable server row by
+    // construction.
     const centerIndex = Math.max(0, Math.min(total - 1, Math.round((range.start + range.end) / 2)));
-    const centerEntry = presentationEntriesRef.current[centerIndex];
+    let centerEntry = rows[centerIndex];
+    if (!centerEntry?.uuid || !lastServerEntryUuidsRef.current.has(centerEntry.uuid)) {
+      centerEntry = rows[stubIndex];
+    }
     requestHistoryHydrationAt(
       centerEntry?.uuid || null,
       reason,
       ' range=' + range.start + '-' + range.end
-        + ' span=' + span.from + '-' + span.to
+        + ' stubAt=' + stubIndex
         + ' center=' + centerIndex,
     );
   }, [requestHistoryHydrationAt, toolType]);
@@ -11414,6 +11525,15 @@ function HistoryPanel({
     setHistoryOwnerVisitState(generation);
     historyOwnerKeyRef.current = historyOwnerKey;
     deferredTranscriptRefreshRef.current = false;
+    // Hydration machinery is owner-local. The seq bump orphans a previous
+    // owner's in-flight completion callback so it can neither clear the new
+    // owner's in-flight flag nor fire a queued request against it. Observed
+    // 14.08 07:02: tab-2482's watcher read a span that tab-2546's load wrote.
+    hydrationRequestSeqRef.current += 1;
+    hydrationRequestInFlightRef.current = false;
+    hydrationCenterUuidRef.current = null;
+    hydrationPendingRef.current = null;
+    hydrationLastResultRef.current = null;
     liveProjectionRef.current = { ownerKey: historyOwnerKey, entries: [] };
     liveToolResultsRef.current = { ownerKey: historyOwnerKey, results: new Map() };
     durableSourceIdentitiesRef.current = new Set();
@@ -11525,6 +11645,7 @@ function HistoryPanel({
         auditHash: handoff.auditProof?.actualHash,
         auditEntryUuid: handoff.auditProof?.entryUuid,
         sourceIdentity: handoff.auditProof?.sourceIdentity,
+        recordByteOffset: handoff.auditProof?.recordByteOffset,
       });
     }
     const restoredOverlayRows = (
@@ -12896,16 +13017,11 @@ function HistoryPanel({
     }
 
     // Row-window: a Timeline jump can target a row main shipped as a stub.
-    // Ask for the hydration span to re-centre on it BEFORE converging — the
-    // convergence loop refuses to settle on a placeholder (same rule as the
-    // mount-wave shell), so without this the jump would hunt until its
-    // attempt ceiling. The request is fire-and-forget: the response arrives
-    // as a delta carrying just the newly-hydrated rows, and the loop below
-    // keeps re-issuing scrollToIndex meanwhile — landing exactly when the
-    // real card replaces the placeholder.
-    if (toolType === 'codex' && (displayEntries[idx] as any)?.rowStub) {
-      requestHistoryHydrationAt(targetUuid, 'timeline-jump', ' idx=' + idx);
-    }
+    // The convergence loop below owns that case — it drives the hydration
+    // request itself (retrying if a load fails), holds its deadline open
+    // while the placeholder awaits content, and only then converges. A
+    // single fire-and-forget request here proved fatal on 14.08: it was
+    // silently refused by a stale guard and nothing ever retried.
 
     // Variable-height virtualization race. On the closed→open Cmd+click path
     // the list now mounts at the target index when possible, but rows above the
@@ -12940,6 +13056,7 @@ function HistoryPanel({
       if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return;
       const scroller = virtuosoScrollerRef.current;
       historyScrollInFlightRef.current = null;
+      historyJumpHydrationActiveRef.current = false;
       // Same echo hazard as position restores: the jump's own velocity
       // sample lands after the in-flight suppressor clears.
       stampHistoryMachineScrollCooldown();
@@ -12976,6 +13093,16 @@ function HistoryPanel({
     };
 
     let capSuspectLogged = false;
+    // Row-window: the loop OWNS hydration of a stub target. It re-requests
+    // through the deduped/cooled-down request fn every frame (a failed load
+    // retries after its cooldown), pauses the attempt budget while the
+    // placeholder waits for content, and restarts convergence measurement
+    // when the real card lands. A single fire-and-forget request before the
+    // loop proved fatal on 14.08 — silently refused, never retried, 240
+    // attempts hunting a placeholder the convergence rule rightly refuses.
+    let lastTargetWasStub = false;
+    let stubWaitStartedAt: number | null = null;
+    let stubWaitTotalMs = 0;
     const step = () => {
       if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return; // superseded / unmounted
       const currentIdx = displayEntryIndexByUuidRef.current.get(targetUuid) ?? -1;
@@ -12983,6 +13110,38 @@ function HistoryPanel({
         finish(false, 'target-disappeared');
         return;
       }
+      const now = performance.now();
+      const targetIsStub = toolType === 'codex'
+        && !!(entriesRef.current[currentIdx] as any)?.rowStub;
+      if (targetIsStub) {
+        if (stubWaitStartedAt === null) stubWaitStartedAt = now;
+        historyJumpHydrationActiveRef.current = true;
+        requestHistoryHydrationAt(targetUuid, 'timeline-jump', ' idx=' + currentIdx);
+        // Main just answered that this row does not exist in its projection
+        // (file rewritten under us): waiting will not materialize it.
+        const lastResult = hydrationLastResultRef.current;
+        if (lastResult?.centerMissing && lastResult.centerUuid === targetUuid) {
+          finish(false, 'target-not-in-projection');
+          return;
+        }
+        if (now - startedAt > JUMP_STUB_HYDRATION_WAIT_MS) {
+          finish(false, 'target-stub-hydration-timeout');
+          return;
+        }
+      } else if (lastTargetWasStub) {
+        // Content just landed: heights re-measure from scratch around the
+        // target, so convergence gets its full budget against the real card.
+        stubWaitTotalMs += stubWaitStartedAt === null ? 0 : now - stubWaitStartedAt;
+        stubWaitStartedAt = null;
+        attempts = 0;
+        stable = 0;
+        lastTop = null;
+        historyDiag('SCROLL_TO_HYDRATED tab=' + tabId.slice(-12) +
+          ' uuid=' + targetUuid.slice(0, 8) +
+          ' idx=' + currentIdx +
+          ' stubWaitMs=' + Math.round(stubWaitTotalMs));
+      }
+      lastTargetWasStub = targetIsStub;
       virtuosoRef.current?.scrollToIndex({ index: currentIdx, align: 'center', behavior: 'auto' });
       attempts++;
       if (historyScrollInFlightRef.current?.gen === myGen) {
@@ -13008,10 +13167,9 @@ function HistoryPanel({
       }
       if (node && scroller) {
         sawNode = true;
-        // A mount-wave shell is a stable wrapper with NO content — declaring
-        // the jump done on it would flash an empty bar and clear Timeline's
-        // pending state against nothing. The wave hydrates the jump target
-        // with top priority (see the step machine); keep converging until
+        // A mount-wave shell / row stub is a stable wrapper with NO content —
+        // declaring the jump done on it would flash an empty bar and clear
+        // Timeline's pending state against nothing. Keep converging until
         // the row is real, the stability check below then passes on it.
         const isShell = node.hasAttribute('data-history-mount-shell');
         // Offset of the row relative to the scroller's own viewport — immune to
@@ -13024,18 +13182,19 @@ function HistoryPanel({
         // a few scrollToIndex calls → Virtuoso has settled on the target row.
         if (stable >= 2 && attempts >= 3) { finish(true, 'stable-mounted'); return; }
       }
-      if (attempts >= MAX_ATTEMPTS) {
+      if (attempts >= MAX_ATTEMPTS && !targetIsStub) {
         // A row seen on an earlier frame is not proof that the final target is
         // still mounted or settled. Report failure unless the normal stable
         // branch above completed; Timeline must not clear its pending jump on
-        // a historical sighting.
+        // a historical sighting. A stub target never trips this cap — its
+        // bound is the wall-clock hydration deadline above.
         finish(false, node ? 'max-attempts-unstable-mounted' : 'max-attempts-unmounted');
         return;
       }
       requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-  }, [displayEntryIndexByUuid, displayEntries, historyScrollToUuid, pendingInitialHistoryIndex, setHistoryScrollToUuid, surfaceLoading, tabId]);
+  }, [displayEntryIndexByUuid, displayEntries, historyScrollToUuid, pendingInitialHistoryIndex, requestHistoryHydrationAt, setHistoryScrollToUuid, surfaceLoading, tabId, toolType]);
 
   // Native scroll handler — runs on the Virtuoso scroller element via a
   // direct addEventListener (Virtuoso doesn't pass an onScroll prop through

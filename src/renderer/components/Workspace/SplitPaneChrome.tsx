@@ -6,8 +6,15 @@ import { useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
 import { getTabChromeColorConfig, flattenRgbaOnTabbarPanel, adjustRgbaAlpha } from './tabChrome';
-import { resolveTabCardBackground, resolveTabCardMetrics } from '../../utils/tabCardVisual.mjs';
+import {
+  resolveTabCardBackground,
+  resolveTabCardMetrics,
+  resolveSplitAttachRowHeight,
+  TAB_CARD_LINE_HEIGHT,
+} from '../../utils/tabCardVisual.mjs';
 import { isEmptyPane, paneGridRects } from '../../utils/splitPanesModel.mjs';
+import { paneFrameState } from '../../utils/paneSwitcherScope.mjs';
+import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { openTabContextMenuAt } from './TabBar';
 import {
   TabProcessBar,
@@ -25,7 +32,24 @@ import '@gt-editor/markdown-editor/styles.css';
 
 const { ipcRenderer } = window.require('electron');
 
+// Fallback height only (empty-pane header, restore paths that render before
+// settings are read). Real rows size themselves from the chip via
+// useSplitAttachRowHeight — a 26px constant under a Settings-sized chip is
+// exactly the bug where the chip poked over the pane separator above it.
 export const SPLIT_ATTACH_ROW_H = 26;
+
+/**
+ * Live height of the pane header row, derived from the same Settings → Размеры
+ * values the chip inside it obeys. Every surface that positions content BELOW
+ * the row (pane content top, toast anchor, single-mode header slot, file
+ * preview offset) must use this hook, not the constant — one of them reading a
+ * different number is how the chip and the separator ended up crossing.
+ */
+export function useSplitAttachRowHeight(): number {
+  const tabGeo = useUIStore((s) => s.tabGeometry);
+  const tabsFontSize = useUIStore((s) => s.tabsFontSize);
+  return resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize });
+}
 
 // Equal columns, equal rows inside a column; v1 has no draggable divider.
 // Geometry comes from the pure model so the rectangles and the layout rules can
@@ -91,6 +115,9 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   // can be renamed from whichever surface the user is already looking at.
   const [renaming, setRenaming] = useState(false);
   const [renameDraft, setRenameDraft] = useState('');
+  // Measured position of the split-direction menu, clamped into the window.
+  const splitMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const [splitMenuPos, setSplitMenuPos] = useState<{ x: number; y: number } | null>(null);
   const taskPlan = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.taskPlan);
   const taskStatuses = useUIStore((s) => s.taskStatuses);
   const taskStatusShape = useUIStore((s) => s.taskStatusMarker.shape);
@@ -110,6 +137,26 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
     useWorkspaceStore.getState().renameTab(projectId, tabId, next);
   };
 
+  // Clamp the split-direction menu into the window once it has a measurable
+  // box. useLayoutEffect, not useEffect: the corrected position must land in
+  // the same frame, or the menu is visibly drawn outside the app and then
+  // jumps. Declared ABOVE the early return below — hooks cannot be conditional.
+  React.useLayoutEffect(() => {
+    if (!splitMenu) { setSplitMenuPos(null); return; }
+    const el = splitMenuRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const next = clampMenuToViewport({
+      x: splitMenu.x,
+      y: splitMenu.y + 4,
+      width: rect.width,
+      height: rect.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    setSplitMenuPos((prev) => (prev && prev.x === next.x && prev.y === next.y ? prev : next));
+  }, [splitMenu]);
+
   if (!tabExists) return null;
   const chrome = getTabChromeColorConfig({ color: tabColor, tabType });
   const hasColor = !!tabColor && tabColor !== 'default';
@@ -127,6 +174,10 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
     { bgColor: chrome.bgColor, hasColor, hovered: tabChipHovered },
     adjustRgbaAlpha,
   ));
+  // Derived from the SAME settings as the chip, so the row always fits it.
+  // The wrapper that reserves this slot uses the same hook — see
+  // useSplitAttachRowHeight.
+  const rowH = resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize });
   return (
     <div
       data-split-attach-row
@@ -136,7 +187,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         top: 0,
         left: 0,
         right: 0,
-        height: SPLIT_ATTACH_ROW_H,
+        height: rowH,
         display: 'flex',
         alignItems: 'center',
         gap: 6,
@@ -302,6 +353,10 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
             alignItems: 'center',
             gap: 4,
             fontSize: cardMetrics.fontSize,
+            // Pinned, not browser-default: the row height PREDICTS the chip's
+            // height from this number (resolveSplitAttachRowHeight), and the
+            // default 'normal' is font-dependent — the prediction would drift.
+            lineHeight: TAB_CARD_LINE_HEIGHT,
             color: '#e8e8e8',
             cursor: 'pointer',
             // Hover brightens the tab's OWN colour (shared rule), it does not
@@ -459,11 +514,18 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
             style={{ position: 'fixed', inset: 0, zIndex: 9998 }}
           />
           <div
+            ref={splitMenuRef}
             data-split-direction-menu
             style={{
               position: 'fixed',
-              top: splitMenu.y + 4,
-              left: splitMenu.x,
+              // Clamped to the window: this menu is opened from the RIGHT-most
+              // control of a pane header, so raw cursor coordinates put its body
+              // outside the app — a DOM menu, unlike an OS one, is not moved back
+              // by anyone. Measured after the first paint (see the effect above);
+              // until then it renders at the cursor, which is already correct
+              // everywhere except the edges.
+              top: splitMenuPos ? splitMenuPos.y : splitMenu.y + 4,
+              left: splitMenuPos ? splitMenuPos.x : splitMenu.x,
               zIndex: 9999,
               minWidth: 190,
               padding: '4px 0',
@@ -506,12 +568,37 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
 /** Above every surface a pane can host, so the frame is never interrupted. */
 export const SPLIT_PANE_FOCUS_FRAME_Z = 200;
 
+/**
+ * Gap between a pane's content and its frame.
+ *
+ * The frame is a 1px line drawn ON the pane's edge. Content flush against that
+ * column touches it, and anything light there — a scrollbar thumb, the
+ * Timeline's rail — fuses with the line, making the frame look thicker on that
+ * side than on the other three. Two pixels separate them without costing any
+ * visible layout.
+ */
+export const SPLIT_PANE_CONTENT_INSET_PX = 2;
+
 // White focus frame of the focused pane; hairline separator on the others.
 export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
+  // The frame now answers TWO questions with one mark: which pane is active,
+  // and whose history Ctrl+Tab will walk. They are the same pane whenever the
+  // workspace holds the keyboard — which is nearly always, so that is the
+  // NORMAL state and must stay the quiet one. The exception (keyboard moved to
+  // the sidebar / a top bar / the dashboard) dims the contour to say "the
+  // gesture is global now"; the tab underneath is still active and every
+  // tab-owned surface still follows it.
+  //
+  // Brightness, not colour: tabs carry their own colours and a coloured
+  // contour would fight them, and violet already means "drag me" on the
+  // resize handles.
+  const keyboardHere = useWorkspaceStore((s) => s.workspaceOwnsKeyboard);
+  const state = paneFrameState({ isFocusedPane: focused, keyboardInPane: keyboardHere });
   return (
     <div
       aria-hidden
       data-split-pane-focus-frame={focused ? '1' : '0'}
+      data-split-pane-frame-state={state}
       style={{
         position: 'absolute',
         inset: 0,
@@ -522,12 +609,16 @@ export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
         // the line visibly broke where they met. A boundary with a gap in it
         // reads as "this pane ends here", which is exactly wrong.
         zIndex: SPLIT_PANE_FOCUS_FRAME_Z,
-        // 1px, same thickness as the inter-pane separators below — focus is
-        // carried by brightness, not by weight. Alpha raised from 0.55 to
-        // compensate the halved line so it stays as readable as the old 2px.
-        boxShadow: focused
+        // 1px everywhere, same thickness as the inter-pane separators — focus
+        // is carried by brightness, not by weight. 0.75 → 0.30 is a fourfold
+        // drop and still a full contour against the neighbours' two 0.08 side
+        // lines, so all three states stay distinguishable.
+        boxShadow: state === 'owns-keyboard'
           ? 'inset 0 0 0 1px rgba(255,255,255,0.75)'
-          : 'inset -1px 0 0 rgba(255,255,255,0.08), inset 1px 0 0 rgba(255,255,255,0.08)',
+          : state === 'active-only'
+            ? 'inset 0 0 0 1px rgba(255,255,255,0.30)'
+            : 'inset -1px 0 0 rgba(255,255,255,0.08), inset 1px 0 0 rgba(255,255,255,0.08)',
+        transition: 'box-shadow 0.12s ease',
       }}
     />
   );

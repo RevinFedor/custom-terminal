@@ -88,11 +88,13 @@ function PaneRecentTabRow({
   index,
   sessionStatuses,
   onPick,
+  onForget,
 }: {
   row: any;
   index: number;
   sessionStatuses: any[];
   onPick: () => void;
+  onForget: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const { hasProcess, busy } = useTabActivitySignals(row.tab.id);
@@ -116,6 +118,11 @@ function PaneRecentTabRow({
         onPointerDown={(e) => {
           e.preventDefault();
           e.stopPropagation();
+          // MIDDLE click forgets the row instead of opening it — same gesture,
+          // same meaning, as in the Ctrl+Tab and Cmd+P lists. The list stays
+          // open: the user is editing what it offers.
+          if (e.button === 1) { onForget(); return; }
+          if (e.button !== 0) return;
           onPick();
         }}
       />
@@ -417,6 +424,12 @@ export function PaneRecentTabsButton({ paneIndex, currentTabId }: Props) {
                   onPick={() => {
                     setOpen(false);
                     useWorkspaceStore.getState().setSplitPaneTab(paneIndex, row.projectId, row.tab.id);
+                  }}
+                  // This list is the GLOBAL order (it offers every tab, not just
+                  // this pane's past), so forgetting here edits the global
+                  // history — the same list Ctrl+Tab and Cmd+P show.
+                  onForget={() => {
+                    useWorkspaceStore.getState().forgetGlobalTabVisit(row.projectId, row.tab.id);
                   }}
                 />
               )

@@ -185,6 +185,31 @@ test('Claude activity repaint cannot poison the first assistant frame', () => {
   assert.equal(h.emitted.at(-1).preview.text, 'Настоящий ответ уже печатается.');
 });
 
+test('Codex activity telemetry cannot become a provisional assistant message', () => {
+  const h = createHarness();
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+  });
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    {
+      row: 11,
+      text: '• Working (36s • esc to interrupt) · 1 background terminal running · …',
+      wrapped: false,
+      firstTextStyle: 'fg=1:8,bg=0:-1,dim',
+      hasDim: true,
+      allTextDim: true,
+    },
+    { row: 12, text: '› Write tests for @filename', wrapped: false },
+  ])), false);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 0);
+  assert.match(h.logs.join('\n'), /WAIT .*reason=only-composer-or-status/);
+  assert.match(h.logs.join('\n'), /systemBlocks=activity/);
+});
+
 test('Claude non-trailing activity frame waits instead of freezing the later answer', () => {
   const h = createHarness();
   h.controller.begin({

@@ -58,6 +58,7 @@ export interface HistoryPromptHandoffAuditProof {
   sessionId: string | null;
   entryUuid?: string;
   sourceIdentity?: string;
+  recordByteOffset?: number;
   actualLen?: number;
   canonicalized?: boolean;
   canonicalReason?: string;
@@ -200,6 +201,7 @@ export interface HistoryPromptHandoffProjectionRow {
   auditSessionId?: string;
   auditEntryUuid?: string;
   sourceIdentity?: string;
+  recordByteOffset?: number;
   sessionId?: string;
 }
 
@@ -381,6 +383,7 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
       + stringBytes(value.auditProof.sessionId)
       + stringBytes(value.auditProof.entryUuid)
       + stringBytes(value.auditProof.sourceIdentity)
+      + stringBytes(value.auditProof.recordByteOffset)
       + stringBytes(value.auditProof.canonicalReason);
   }
   return bytes;
@@ -438,6 +441,10 @@ function freezeProof(
     ...(typeof proof.sourceIdentity === 'string' && proof.sourceIdentity
       ? { sourceIdentity: proof.sourceIdentity }
       : {}),
+    ...(Number.isSafeInteger(Number(proof.recordByteOffset))
+      && Number(proof.recordByteOffset) >= 0
+      ? { recordByteOffset: Number(proof.recordByteOffset) }
+      : {}),
     ...(Number.isFinite(proof.actualLen) ? { actualLen: Number(proof.actualLen) } : {}),
     ...(proof.canonicalized === true ? { canonicalized: true } : {}),
     ...(typeof proof.canonicalReason === 'string'
@@ -467,7 +474,10 @@ function mergeCompatibleAuditProof(
       && current.sessionId !== frozenIncoming.sessionId)
     || (!!current.sourceIdentity
       && !!frozenIncoming.sourceIdentity
-      && current.sourceIdentity !== frozenIncoming.sourceIdentity);
+      && current.sourceIdentity !== frozenIncoming.sourceIdentity)
+    || (current.recordByteOffset !== undefined
+      && frozenIncoming.recordByteOffset !== undefined
+      && current.recordByteOffset !== frozenIncoming.recordByteOffset);
   if (conflicts) return current;
 
   return freezeProof({
@@ -476,6 +486,7 @@ function mergeCompatibleAuditProof(
     sessionId: current.sessionId || frozenIncoming.sessionId,
     entryUuid: current.entryUuid || frozenIncoming.entryUuid,
     sourceIdentity: current.sourceIdentity || frozenIncoming.sourceIdentity,
+    recordByteOffset: current.recordByteOffset ?? frozenIncoming.recordByteOffset,
     actualLen: current.actualLen ?? frozenIncoming.actualLen,
     canonicalized: current.canonicalized === true || frozenIncoming.canonicalized === true,
     canonicalReason: current.canonicalReason || frozenIncoming.canonicalReason,
@@ -524,6 +535,7 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
   const auditHash = proof?.actualHash || undefined;
   const auditEntryUuid = proof?.entryUuid || undefined;
   const sourceIdentity = proof?.sourceIdentity || undefined;
+  const recordByteOffset = proof?.recordByteOffset;
 
   if (
     row.handoffId === handoff.handoffId
@@ -539,6 +551,7 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
     && row.auditSessionId === auditSessionId
     && row.auditEntryUuid === auditEntryUuid
     && row.sourceIdentity === sourceIdentity
+    && row.recordByteOffset === recordByteOffset
     && row.sessionId === sessionId
   ) {
     return row;
@@ -559,6 +572,7 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
     auditSessionId,
     auditEntryUuid,
     sourceIdentity,
+    recordByteOffset,
     sessionId,
   } as TRow;
 }
@@ -1181,6 +1195,10 @@ export function historyPromptHandoffAuditProofFromSendResult(
     ...(typeof audit.sourceIdentity === 'string' && audit.sourceIdentity
       ? { sourceIdentity: audit.sourceIdentity }
       : {}),
+    ...(Number.isSafeInteger(Number(audit.recordByteOffset))
+      && Number(audit.recordByteOffset) >= 0
+      ? { recordByteOffset: Number(audit.recordByteOffset) }
+      : {}),
     ...(Number.isFinite(audit.actualLen) ? { actualLen: Number(audit.actualLen) } : {}),
     ...(audit.canonicalized === true ? { canonicalized: true } : {}),
     ...(typeof audit.canonicalReason === 'string'
@@ -1485,6 +1503,10 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   const sourceIdentity = typeof receipt.sourceIdentity === 'string' && receipt.sourceIdentity
     ? receipt.sourceIdentity
     : (typeof auditIdentity.sourceIdentity === 'string' ? auditIdentity.sourceIdentity : '');
+  const recordByteOffset = Number.isSafeInteger(Number(receipt.recordByteOffset))
+    && Number(receipt.recordByteOffset) >= 0
+    ? Number(receipt.recordByteOffset)
+    : null;
   if (queueStatus === 'sent' && !entryUuid && !sourceIdentity) {
     // Legacy confirmed receipts already prove transcript delivery, but older
     // builds discarded Codex's exact row identity. Recreating a local SENT row
@@ -1515,6 +1537,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
           ? { entryUuid }
           : {}),
         ...(sourceIdentity ? { sourceIdentity } : {}),
+        ...(recordByteOffset !== null ? { recordByteOffset } : {}),
         ...(receipt.canonicalized === true ? { canonicalized: true } : {}),
         ...(typeof receipt.canonicalReason === 'string' && receipt.canonicalReason
           ? { canonicalReason: receipt.canonicalReason }

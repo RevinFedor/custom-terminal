@@ -19,6 +19,11 @@ import {
   paneIsStacked,
   paneMapGrid,
   restorePanePreviousTab,
+  paneHistory,
+  restorablePaneHistory,
+  dropFromPaneHistory,
+  dropTabFromAllPaneHistories,
+  PANE_HISTORY_CAP,
 } from './splitPanesModel.mjs';
 
 const p = (projectId, tabId) => ({ projectId, tabId });
@@ -423,8 +428,92 @@ test('opening a tab in a pane records what that pane showed before', () => {
   const panes = [p('p1', 'a'), p('p1', 'b')];
   const res = resolveSplitActivation(panes, 1, 'p1', 'file');
   assert.equal(res.panes[1].tabId, 'file');
-  assert.equal(res.panes[1].prevTabId, 'b', 'pane remembers its own previous tab');
-  assert.equal(res.panes[0].prevTabId, undefined, 'other panes are untouched');
+  assert.deepEqual(paneHistory(res.panes[1]), [p('p1', 'b')], 'pane remembers its own previous tab');
+  assert.deepEqual(paneHistory(res.panes[0]), [], 'other panes are untouched');
+});
+
+// ── Per-pane visit history (the per-pane Ctrl+Tab switcher) ───────────────
+
+test('the history is a LIST: every replaced tab stacks, most recent first', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  for (const tab of ['c', 'd', 'e']) {
+    panes = resolveSplitActivation(panes, 1, 'p1', tab).panes;
+  }
+  assert.deepEqual(paneHistory(panes[1]).map((e) => e.tabId), ['d', 'c', 'b']);
+});
+
+test('revisiting a tab moves it to the head instead of duplicating', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  panes = resolveSplitActivation(panes, 1, 'p1', 'c').panes;   // history: b
+  panes = resolveSplitActivation(panes, 1, 'p1', 'b').panes;   // history: c (b removed — it is current)
+  panes = resolveSplitActivation(panes, 1, 'p1', 'd').panes;   // history: b, c
+  assert.deepEqual(paneHistory(panes[1]).map((e) => e.tabId), ['b', 'c']);
+});
+
+test('the legacy one-step prev fields read as a one-entry history', () => {
+  // Sessions saved before the list existed must restore with their memory.
+  const legacy = { projectId: 'p1', tabId: 'file', prevProjectId: 'p1', prevTabId: 'b' };
+  assert.deepEqual(paneHistory(legacy), [p('p1', 'b')]);
+  const back = restorePanePreviousTab([p('p1', 'a'), legacy], 1, 'file');
+  assert.equal(back.panes[1].tabId, 'b');
+});
+
+test('the history is capped', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  for (let i = 0; i < PANE_HISTORY_CAP + 10; i += 1) {
+    panes = resolveSplitActivation(panes, 1, 'p1', 't' + i).panes;
+  }
+  assert.equal(paneHistory(panes[1]).length, PANE_HISTORY_CAP);
+});
+
+test('restorablePaneHistory hides dead tabs and tabs visible in any pane', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  panes = resolveSplitActivation(panes, 1, 'p1', 'c').panes;   // history: b
+  panes = resolveSplitActivation(panes, 1, 'p1', 'd').panes;   // history: c, b
+  panes = resolveSplitActivation(panes, 1, 'p1', 'e').panes;   // history: d, c, b
+  // 'c' was closed; 'a' shows in pane 0 but is not in this history anyway.
+  const alive = (projectId, tabId) => tabId !== 'c';
+  assert.deepEqual(
+    restorablePaneHistory(panes, 1, alive).map((e) => e.tabId),
+    ['d', 'b'],
+  );
+  // …and stepping back lands on the first RESTORABLE entry, not a dead head.
+  const deadHead = resolveSplitActivation(panes, 1, 'p1', 'f').panes; // history: e, d, c, b
+  const back = restorePanePreviousTab(deadHead, 1, 'f', (pid, tid) => tid !== 'e');
+  assert.equal(back.panes[1].tabId, 'd', 'skips the closed head entry');
+});
+
+test('middle-click on a history row forgets the entry without closing the tab', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  panes = resolveSplitActivation(panes, 1, 'p1', 'c').panes;
+  panes = resolveSplitActivation(panes, 1, 'p1', 'd').panes;   // history: c, b
+  const res = dropFromPaneHistory(panes, 1, 'c');
+  assert.deepEqual(paneHistory(res.panes[1]).map((e) => e.tabId), ['b']);
+  assert.equal(dropFromPaneHistory(res.panes, 1, 'nope'), null, 'no change → null, no store write');
+});
+
+test('closing a tab purges it from every pane history', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  panes = resolveSplitActivation(panes, 0, 'p1', 'x').panes;   // pane0 history: a
+  panes = resolveSplitActivation(panes, 1, 'p1', 'y').panes;   // pane1 history: b
+  panes = resolveSplitActivation(panes, 1, 'p1', 'z').panes;   // pane1 history: y, b
+  // suppose 'b' is closed — wait, 'b' sits in pane1 history AND pane0? Build a shared one:
+  panes = resolveSplitActivation(panes, 0, 'p1', 'b').panes;   // pane0 history: x, a
+  panes = resolveSplitActivation(panes, 0, 'p1', 'w').panes;   // pane0 history: b, x, a
+  const res = dropTabFromAllPaneHistories(panes, 'b');
+  assert.ok(res);
+  assert.ok(!paneHistory(res.panes[0]).some((e) => e.tabId === 'b'));
+  assert.ok(!paneHistory(res.panes[1]).some((e) => e.tabId === 'b'));
+  assert.equal(dropTabFromAllPaneHistories(res.panes, 'b'), null, 'idempotent');
+});
+
+test('sanitizePanes scrubs dead tabs out of surviving histories', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  panes = resolveSplitActivation(panes, 1, 'p1', 'c').panes;
+  panes = resolveSplitActivation(panes, 1, 'p1', 'd').panes;   // history: c, b
+  const alive = (pid, tid) => tid !== 'c';
+  const res = sanitizePanes(panes, 1, alive);
+  assert.deepEqual(paneHistory(res.panes[1]).map((e) => e.tabId), ['b']);
 });
 
 test('middle-click on a file pane steps back instead of removing the pane', () => {

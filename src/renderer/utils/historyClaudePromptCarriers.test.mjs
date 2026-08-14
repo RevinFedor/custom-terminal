@@ -173,6 +173,24 @@ test('tool results and unrelated provider records remain delegated to the live r
   assert.equal(reduceClaudeHistoryPromptCarrier([], wrap({ type: 'assistant' })).handled, false);
 });
 
+test('Claude prompt carriers preserve their exact JSONL byte position', () => {
+  const queued = reduceClaudeHistoryPromptCarrier([], {
+    ...enqueue('queued with position'),
+    recordByteOffset: 321,
+  }, { includeUserText: true });
+  assert.equal(queued.entries[0].recordByteOffset, 321);
+
+  const canonical = reduceClaudeHistoryPromptCarrier([], {
+    ...wrap({
+      type: 'user',
+      uuid: 'positioned-user',
+      message: { role: 'user', content: 'canonical with position' },
+    }),
+    recordByteOffset: 654,
+  }, { includeUserText: true });
+  assert.equal(canonical.entries[0].recordByteOffset, 654);
+});
+
 test('internal task notifications are never projected as user prompts', () => {
   const result = reduceClaudeHistoryPromptCarrier([], enqueue('<task-notification>hidden</task-notification>'), {
     includeUserText: true,

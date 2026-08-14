@@ -34,6 +34,26 @@ const webServerSource = fs.readFileSync(
   'utf8',
 );
 
+function exactProviderNotAccepted(overrides = {}) {
+  return {
+    success: false,
+    accepted: false,
+    submitted: true,
+    pasteWritten: true,
+    enterWritten: true,
+    semanticStatus: 'not-submitted',
+    providerAccepted: false,
+    providerTurnCreated: false,
+    composerDraftState: 'exact-original',
+    exactDraftRemained: true,
+    draftPreserved: true,
+    lateReconciliationPending: false,
+    code: 'claude_prompt_not_accepted_exact_draft_remained',
+    error: 'claude_prompt_not_accepted_exact_draft_remained',
+    ...overrides,
+  };
+}
+
 test('F4 real Codex runtime preserves its softened post-Enter state as audit-pending', () => {
   assert.match(
     historyAgentRuntimeSource,
@@ -91,6 +111,32 @@ test('F4 renderer bridge timeout remains delivery-unknown instead of fabricated 
     submitted: null,
     accepted: true,
   }, 'the exact registry state must win over a legacy success-shaped field');
+});
+
+test('F4 exact post-Enter provider refusal is terminal while ambiguous refusal stays pending', () => {
+  assert.deepEqual(classifyAgentSendReceipt(exactProviderNotAccepted()), {
+    state: 'provider-not-accepted',
+    submitted: true,
+    accepted: false,
+  });
+  assert.deepEqual(
+    classifyAgentSendReceipt(exactProviderNotAccepted({ exactDraftRemained: false })),
+    {
+      state: 'audit-pending',
+      submitted: true,
+      accepted: true,
+    },
+  );
+  assert.deepEqual(classifyAgentSendReceipt({
+    success: false,
+    submitted: true,
+    status: 'provider-not-accepted',
+    receiptState: 'provider-not-accepted',
+  }), {
+    state: 'audit-pending',
+    submitted: true,
+    accepted: true,
+  }, 'a renderer cannot manufacture terminal proof by returning only the state label');
 });
 
 async function freePort() {
@@ -730,6 +776,36 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     }
   });
 
+  await t.test('exact provider-not-accepted terminalizes orchestration without recovery grace', async () => {
+    const runId = 'phase2-provider-not-accepted-orchestration';
+    const handoffId = 'orchestration:' + runId;
+    controller.sendResponder = async () => exactProviderNotAccepted({ handoffId });
+    const response = await api('/api/orchestrations', {
+      runId,
+      sourceTabId: 'phase2-source-tab',
+      targetTabId: 'phase2-target-tab',
+      prompt: 'orchestration exact draft remained',
+      queue: false,
+      notifySource: false,
+    });
+    const state = await api('/api/orchestrations/' + runId);
+    assert.deepEqual({
+      httpStatus: response.status,
+      submitted: response.body.submitted,
+      receiptState: response.body.receiptState,
+      runStatus: state.body.run?.status,
+      recoveryDeadlineAt: state.body.run?.recoveryDeadlineAt,
+      sends: scenarioSendCount(handoffId),
+    }, {
+      httpStatus: 409,
+      submitted: true,
+      receiptState: 'provider-not-accepted',
+      runStatus: 'failed',
+      recoveryDeadlineAt: null,
+      sends: 1,
+    });
+  });
+
   await t.test('F4 strongest counterexample: submitted:false remains a retryable HTTP 409', async () => {
     controller.sendResponder = async () => ({
       success: false,
@@ -847,6 +923,35 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       status: 202,
       submitted: true,
     }, 'User-visible invariant violated: Project API must return accepted/pending after Enter, not a retryable 409 that can duplicate the prompt.');
+  });
+
+  await t.test('exact Claude provider refusal returns an actionable 409 without replaying Enter', async () => {
+    const handoffId = 'phase2-provider-not-accepted-project';
+    controller.sendResponder = async () => exactProviderNotAccepted({ handoffId });
+    const request = {
+      prompt: 'exact original draft remains after Enter',
+      handoffId,
+      source: 'phase2-test',
+    };
+    const first = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    const replay = await api('/api/terminal-tabs/phase2-target-tab/send', request);
+    assert.deepEqual({
+      firstStatus: first.status,
+      replayStatus: replay.status,
+      submitted: first.body.submitted,
+      receiptState: first.body.receiptState,
+      providerAccepted: first.body.providerAccepted,
+      draftPreserved: first.body.draftPreserved,
+      sends: scenarioSendCount(handoffId),
+    }, {
+      firstStatus: 409,
+      replayStatus: 409,
+      submitted: true,
+      receiptState: 'provider-not-accepted',
+      providerAccepted: false,
+      draftPreserved: true,
+      sends: 1,
+    });
   });
 
   await t.test('F4 Project API keeps a missing renderer receipt as delivery-unknown', async () => {
@@ -1149,6 +1254,26 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       'User-visible invariant violated: Terminal MCP must not report an error that invites retry after Enter already crossed.');
     assert.match(text, /pending|unverified|confirmation/i,
       'Terminal MCP must tell the caller that exact delivery confirmation is pending.');
+  });
+
+  await t.test('Terminal MCP surfaces exact provider-not-accepted without a blind retry', async () => {
+    const handoffId = 'phase2-provider-not-accepted-mcp';
+    controller.sendResponder = async () => exactProviderNotAccepted({ handoffId });
+    const request = {
+      homeDir: tempHome,
+      tabId: 'phase2-target-tab',
+      prompt: 'MCP exact draft remained',
+      handoffId,
+    };
+    const first = await callMcpSendPrompt(request);
+    const replay = await callMcpSendPrompt(request);
+    const firstText = first?.result?.content?.[0]?.text || '';
+    const replayText = replay?.result?.content?.[0]?.text || '';
+    assert.equal(first?.result?.isError, true);
+    assert.equal(replay?.result?.isError, true);
+    assert.match(firstText, /not.accepted|exact.draft|409/i);
+    assert.match(replayText, /not.accepted|exact.draft|409/i);
+    assert.equal(scenarioSendCount(handoffId), 1);
   });
 
   await t.test('G09 Terminal MCP can reuse one exact pending handoff without a second send', async () => {

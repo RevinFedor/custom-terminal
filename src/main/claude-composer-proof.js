@@ -22,6 +22,18 @@ function isClaudeComposerStopLine(text) {
   return false;
 }
 
+function summarizeClaudePromptSuffixStyle(cells) {
+  const contentCells = Array.isArray(cells)
+    ? cells.filter((cell) => String(cell?.ch || '').trim())
+    : [];
+  return {
+    allDim: contentCells.length > 0
+      && contentCells.every((cell) => cell?.dim === true),
+    hasInverse: contentCells.some((cell) => cell?.inverse === true),
+    hasNonDefaultBg: contentCells.some((cell) => cell?.nonDefaultBg === true),
+  };
+}
+
 function unknown(snapshot, reason, extra = null) {
   return {
     success: true,
@@ -35,7 +47,7 @@ function unknown(snapshot, reason, extra = null) {
   };
 }
 
-function proven(snapshot, hasDraft, text, promptRow, cursorRow, cursorX) {
+function proven(snapshot, hasDraft, text, promptRow, cursorRow, cursorX, proofReason = null) {
   const normalized = String(text || '').trim();
   const state = hasDraft ? 'found' : 'absent';
   return {
@@ -46,7 +58,7 @@ function proven(snapshot, hasDraft, text, promptRow, cursorRow, cursorX) {
     preview: hasDraft ? normalized.replace(/\s+/g, ' ').slice(0, 160) : '',
     source: (snapshot?.source || 'visible-buffer') + ':claude-composer:'
       + (hasDraft ? 'prompt' : 'empty') + '-cursor-row-' + cursorRow,
-    proofReason: hasDraft ? 'current-composer-text' : 'current-composer-empty',
+    proofReason: proofReason || (hasDraft ? 'current-composer-text' : 'current-composer-empty'),
     promptRow,
     cursorRow,
     cursorX,
@@ -117,6 +129,25 @@ function parseClaudeComposerCurrentFrame(snapshot) {
     ? Number(cursorLine.occupiedEndX)
     : cleanClaudeComposerText(cursorLine.text || '').length;
   const logicalLineContinuesAfterCursor = lines[cursorIndex + 1]?.wrapped === true;
+  const strictDimGhostSuggestion = first
+    && promptIndex === cursorIndex
+    && cursorX === promptCellX + 2
+    && logicalLineContinuesAfterCursor !== true
+    && promptLine.promptSuffixAllDim === true
+    && promptLine.promptSuffixHasInverse === false
+    && promptLine.promptSuffixHasNonDefaultBg === false
+    && promptLine.promptSuffixWrapped === false;
+  if (strictDimGhostSuggestion) {
+    return proven(
+      snapshot,
+      false,
+      '',
+      Number(lines[promptIndex]?.row ?? promptIndex),
+      cursorRow,
+      cursorX,
+      'current-composer-dim-ghost-suggestion',
+    );
+  }
   if (!placeholderWithStyleProof && (
     occupiedEndX > cursorX
     || logicalLineContinuesAfterCursor
@@ -529,6 +560,7 @@ module.exports = {
   parseClaudeComposerCurrentFrame,
   reserveClaudeExactEmptyEvidence,
   resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence,
+  summarizeClaudePromptSuffixStyle,
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 };

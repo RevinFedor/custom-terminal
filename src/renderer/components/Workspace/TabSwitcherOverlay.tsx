@@ -10,6 +10,15 @@ import {
   stepIndex,
 } from '../../utils/tabSwitcherModel.mjs';
 import { onScreenTabIds } from '../../utils/tabVisitHistoryRule.mjs';
+import { restorablePaneHistory } from '../../utils/splitPanesModel.mjs';
+import {
+  resolveSwitcherScope,
+  filterProjectsToPaneHistory,
+} from '../../utils/paneSwitcherScope.mjs';
+import {
+  keyboardOwnerFromPress,
+  pressCanMoveKeyboardOwner,
+} from '../../utils/keyboardOwnerGesture.mjs';
 import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
 import { TabListProjectHeader, TabListTabRow } from './TabListRows';
 
@@ -35,6 +44,29 @@ export function openTabSwitcherPanel(): void {
 }
 
 type Mode = 'ctrl' | 'search';
+
+// Ctrl+Tab's SCOPE. Global = the classic centered panel over everything.
+// Pane = the same rows in a small panel anchored at that pane's header — the
+// window the hover button opens, reached from the keyboard. `null` scope in
+// state means global.
+interface PaneScope { paneIndex: number }
+
+/** Live pane history entries, shaped for the row builder. */
+function readPaneHistory(paneIndex: number): Array<{ projectId: string; tabId: string }> {
+  const st = useWorkspaceStore.getState();
+  return restorablePaneHistory(
+    st.splitPanes,
+    paneIndex,
+    (pid: string, tid: string) => !!st.openProjects.get(pid)?.tabs.get(tid),
+  );
+}
+
+/** Which pane owns the keyboard right now, or -1. */
+function keyboardPaneIndex(): number {
+  const st = useWorkspaceStore.getState();
+  if (!st.workspaceOwnsKeyboard || st.splitPanes.length === 0) return -1;
+  return st.splitFocusedIndex;
+}
 
 interface SwitcherTab {
   id: string;
@@ -77,7 +109,13 @@ interface TabSwitcherOverlayProps {
 // Build switcher rows straight from store snapshots. Used by the fast-tap
 // fallback: Ctrl can be released before React renders the first frame of the
 // overlay, and the classic "toggle to previous tab" gesture must still land.
-function computeRowsFromStores(query: string): Row[] {
+//
+// `paneIndex >= 0` scopes the rows to that pane's own history: same builder,
+// same row shape, but the project pool is filtered to the pane's past and the
+// RANKING is the pane history instead of the global MRU — so the pane window
+// and the global window cannot disagree about what a row looks like, only
+// about which rows exist and in what order.
+function computeRowsFromStores(query: string, paneIndex = -1): Row[] {
   const ws = useWorkspaceStore.getState();
   const projectsMeta = useProjectsStore.getState().projects as Record<string, { name?: string; icon?: string | null }>;
   const recentFirst = [...ws.projectHistory].reverse();
@@ -85,7 +123,7 @@ function computeRowsFromStores(query: string): Row[] {
     ...recentFirst.filter((id) => ws.openProjects.has(id)),
     ...Array.from(ws.openProjects.keys()).filter((id) => !recentFirst.includes(id)),
   ];
-  const blocks = orderedIds.map((projectId) => {
+  let blocks = orderedIds.map((projectId) => {
     const workspace = ws.openProjects.get(projectId)!;
     const projectName = projectsMeta[projectId]?.name
       || (isInboxProjectId(projectId) ? INBOX_PROJECT_NAME : (workspace.projectPath?.split('/').filter(Boolean).pop() || 'Project'));
@@ -98,13 +136,23 @@ function computeRowsFromStores(query: string): Row[] {
       )) as SwitcherTab[];
     return { projectId, projectName, projectIcon: projectsMeta[projectId]?.icon || null, tabs };
   }).filter((b) => b.tabs.length > 0);
-  return buildSwitcherRows({ projects: blocks, globalMru: ws.globalTabMru, query }) as Row[];
+  let ranking = ws.globalTabMru;
+  if (paneIndex >= 0) {
+    const history = readPaneHistory(paneIndex);
+    blocks = filterProjectsToPaneHistory(blocks, history) as typeof blocks;
+    ranking = history;
+  }
+  return buildSwitcherRows({ projects: blocks, globalMru: ranking, query }) as Row[];
 }
 
 export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyTabs }: TabSwitcherOverlayProps) {
   const [mode, setMode] = useState<Mode | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [query, setQuery] = useState('');
+  // Ctrl-mode scope: null = the classic global panel; a pane = that pane's own
+  // history, anchored at the pane. Resolved ONCE at open (resolveSwitcherScope)
+  // and held — the scope must not shift under the keys mid-cycle.
+  const [paneScope, setPaneScope] = useState<PaneScope | null>(null);
   const visible = mode !== null;
 
   const openProjects = useWorkspaceStore((s) => s.openProjects);
@@ -131,10 +179,15 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   // ── rows ────────────────────────────────────────────────────────────────
   // Store subscriptions above keep this memo fresh; the builder itself reads
   // the same live snapshots so the fast-tap fallback shares one code path.
+  const splitPanesKey = useWorkspaceStore((s) => s.splitPanes
+    .map((p) => p.tabId + ':' + (p.history?.length || 0)).join('|'));
   const rows: Row[] = useMemo(() => {
     if (!visible) return [];
-    return computeRowsFromStores(mode === 'search' ? query : '');
-  }, [visible, openProjects, projectHistory, projectsMeta, globalTabMru, query, mode, missingProbeTick]);
+    return computeRowsFromStores(
+      mode === 'search' ? query : '',
+      mode === 'ctrl' && paneScope ? paneScope.paneIndex : -1,
+    );
+  }, [visible, openProjects, projectHistory, projectsMeta, globalTabMru, query, mode, missingProbeTick, paneScope, splitPanesKey]);
   useEffect(() => {
     if (!visible) return;
     const paths: string[] = [];
@@ -158,6 +211,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     setMode(null);
     setQuery('');
     setSelectedIndex(-1);
+    setPaneScope(null);
   }, []);
 
   const commitRow = useCallback((row: Row | undefined) => {
@@ -167,8 +221,26 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     // replace-focused-pane) and the cross-project view switch. switchTab
     // inside puts the chosen tab at the MRU head FIRST, so showWorkspace's
     // own touch becomes a no-op — the toggle order stays correct.
+    //
+    // Same call for BOTH scopes on purpose: in pane scope the chosen tab is
+    // never visible elsewhere (restorablePaneHistory filters those out), so
+    // the standard rule — replace the focused pane's slot — puts it exactly
+    // into the pane whose history was walked. The pane keeps focus, so this
+    // is "bring my tab back here", not a navigation elsewhere.
     useWorkspaceStore.getState().activateCenterTab(row.projectId, row.tab.id);
   }, [close]);
+
+  // Middle-click on a row: FORGET the entry, keep the window open. Not a
+  // navigation and not a close — the user is editing the list they look at.
+  const forgetRow = useCallback((row: Row | undefined) => {
+    if (!row || row.kind !== 'tab') return;
+    const st = useWorkspaceStore.getState();
+    if (modeRef.current === 'ctrl' && paneScopeRef.current) {
+      st.forgetPaneTabVisit(paneScopeRef.current.paneIndex, row.tab.id);
+    } else {
+      st.forgetGlobalTabVisit(row.projectId, row.tab.id);
+    }
+  }, []);
 
   // Search mode is reachable from the keyboard (Cmd+P) and from a click on the
   // toolbar button; both go through this one function so the two entry points
@@ -184,6 +256,18 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   const openCtrl = useCallback((shiftKey: boolean) => {
     mouseBlockedRef.current = true;
     setQuery('');
+    // Scope is decided HERE, once per open: the pane that owns the keyboard
+    // walks its OWN history; no owner / no history → the classic global panel.
+    // (An empty pane history falling through to global is the approved answer
+    // to "what does Ctrl+Tab do in a fresh pane" — never an empty box.)
+    const st = useWorkspaceStore.getState();
+    const kbdPane = keyboardPaneIndex();
+    const scope = resolveSwitcherScope({
+      keyboardPaneIndex: kbdPane,
+      panes: st.splitPanes,
+      paneHistoryCount: kbdPane >= 0 ? readPaneHistory(kbdPane).length : 0,
+    });
+    setPaneScope(scope.scope === 'pane' ? { paneIndex: scope.paneIndex } : null);
     setMode('ctrl');
     // rows are computed on next render; compute here from the same inputs to
     // pick the initial index synchronously (previous tab across projects).
@@ -204,6 +288,13 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
         // Shift+Ctrl+Tab opening: start from the LAST selectable row.
         const sel = selectableIndices(rows);
         setSelectedIndex(sel.length > 0 ? sel[sel.length - 1] : -1);
+      } else if (paneScope) {
+        // Pane scope: the rows ARE the pane's past, most recent first, and
+        // every one of them is off-screen by construction (the restorable
+        // filter removed visible tabs). The first selectable row is exactly
+        // "what this pane showed last" — the A↔B toggle target.
+        const sel = selectableIndices(rows);
+        setSelectedIndex(sel.length > 0 ? sel[0] : -1);
       } else {
         // Highlight the most recent tab that is NOT already on screen: Ctrl+Tab is
         // for bringing back what you cannot see. In a split every pane's tab is
@@ -238,8 +329,10 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
         }
         return;
       }
-      // Cmd+P — open search mode (toggle). e.code → works on RU layout.
-      if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && e.code === 'KeyP') {
+      // Cmd+P / Ctrl+P — open search mode (toggle). e.code → works on RU
+      // layout. Ctrl+P is a synonym so the hand that just used Ctrl+Tab does
+      // not have to change modifiers to reach the search.
+      if ((e.metaKey !== e.ctrlKey) && !e.altKey && !e.shiftKey && e.code === 'KeyP') {
         swallow(e);
         if (cur === 'search') { close(); return; }
         openSearch();
@@ -277,9 +370,24 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
         if (idx < 0) {
           // Fast tap: Ctrl released before React rendered the first frame.
           // Rebuild rows from the live stores and resolve the "previous tab"
-          // target inline so the classic toggle still fires.
+          // target inline so the classic toggle still fires — INCLUDING the
+          // pane scope: a fast tap in a pane must toggle that PANE's A↔B, not
+          // the global one. The state may not have committed yet, so the scope
+          // is re-derived from the same inputs openCtrl used.
           const st = useWorkspaceStore.getState();
           const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
+          const kbdPane = keyboardPaneIndex();
+          const scope = resolveSwitcherScope({
+            keyboardPaneIndex: kbdPane,
+            panes: st.splitPanes,
+            paneHistoryCount: kbdPane >= 0 ? readPaneHistory(kbdPane).length : 0,
+          });
+          if (scope.scope === 'pane') {
+            effectiveRows = computeRowsFromStores('', scope.paneIndex);
+            idx = selectableIndices(effectiveRows)[0] ?? -1;
+            commitRow(effectiveRows[idx]);
+            return;
+          }
           effectiveRows = computeRowsFromStores('');
           idx = initialCtrlIndex(
             effectiveRows,
@@ -318,6 +426,26 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   rowsRef.current = rows;
   const selectedIndexRef = useRef(selectedIndex);
   selectedIndexRef.current = selectedIndex;
+  const paneScopeRef = useRef<PaneScope | null>(paneScope);
+  paneScopeRef.current = paneScope;
+
+  // ── keyboard ownership ──────────────────────────────────────────────────
+  // The single writer of "where do keystrokes go". Lives here because this
+  // component is the singleton consumer (Ctrl+Tab's scope) — but the rule
+  // itself is keyboardOwnerGesture.mjs, tested without a DOM. Capture phase,
+  // like pane focus: the answer must be updated before anything else reacts
+  // to the same press. Presses on overlays and unmarked surfaces return null
+  // and change nothing.
+  useEffect(() => {
+    const onPointerDown = (e: PointerEvent) => {
+      if (!pressCanMoveKeyboardOwner(e.button)) return;
+      const owner = keyboardOwnerFromPress(e.target as Element | null);
+      if (owner === null) return;
+      useWorkspaceStore.getState().setWorkspaceOwnsKeyboard(owner === 'workspace');
+    };
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => window.removeEventListener('pointerdown', onPointerDown, true);
+  }, []);
 
   // Unblock phantom hover on the first REAL mouse move; immediately select
   // the row under the cursor (GT pattern, see fix-tab-switcher-mru.md).
@@ -342,33 +470,60 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   const isBusy = (tabId: string) => !!(busyTabs.get(tabId) || pasteBusyTabs.get(tabId));
   const hasProcess = (tab: SwitcherTab) => !!(processStatus.get(tab.id) || tab.sdkProcessAlive);
 
+  // Where the panel hangs. Global scope keeps the classic centred dock under
+  // the system bars. Pane scope anchors it to THAT PANE's header — the same
+  // place the hover button opens its list, so "whose history am I walking" is
+  // answered by where the window is, not by memory. (Same lesson as the toast
+  // fix: a message about one pane must not appear at the window's corner.)
+  const paneRect = paneScope
+    ? document
+      .querySelector(`[data-terminal-pane-wrapper][data-split-pane-index="${paneScope.paneIndex}"]`)
+      ?.getBoundingClientRect()
+    : null;
+  const anchored = !!paneRect;
+
   return (
     <div
       data-tab-switcher-root
       data-tab-switcher-mode={mode || ''}
+      data-tab-switcher-scope={paneScope ? 'pane' : 'global'}
       style={{
         position: 'fixed',
         inset: 0,
         zIndex: Z_INDEX,
-        display: 'flex',
+        display: anchored ? 'block' : 'flex',
         justifyContent: 'center',
         alignItems: 'flex-start',
         // Docked to the bottom edge of the system bars (titlebar 40 + project
         // toolbar 30) instead of floating at an arbitrary 90px: the panel is
         // opened FROM that strip, so it should read as hanging off it. Measured
         // from the real bars — if their height changes, update both constants.
-        paddingTop: SWITCHER_DOCK_TOP_PX,
+        paddingTop: anchored ? 0 : SWITCHER_DOCK_TOP_PX,
       }}
       onPointerDown={(e) => { if (e.target === e.currentTarget) close(); }}
     >
       <div
         style={{
-          width: 480,
-          maxHeight: `min(440px, calc(100vh - ${SWITCHER_DOCK_TOP_PX + 24}px))`,
+          // Anchored: sized and placed against the pane, never wider than it,
+          // clamped so a narrow pane at the screen edge still shows the panel.
+          ...(paneRect
+            ? {
+              position: 'fixed' as const,
+              top: Math.round(paneRect.top + 30),
+              left: Math.round(Math.max(8, Math.min(window.innerWidth - 8 - Math.min(420, Math.max(240, paneRect.width - 16)), paneRect.left + 8))),
+              width: Math.min(420, Math.max(240, paneRect.width - 16)),
+              maxHeight: `min(420px, ${Math.max(160, Math.round(paneRect.height - 48))}px)`,
+              borderRadius: 8,
+              border: `1px solid ${PANEL_BORDER}`,
+            }
+            : {
+              width: 480,
+              maxHeight: `min(440px, calc(100vh - ${SWITCHER_DOCK_TOP_PX + 24}px))`,
+              border: `1px solid ${PANEL_BORDER}`,
+              borderTop: 'none',
+              borderRadius: SWITCHER_RADIUS,
+            }),
           background: PANEL_BG,
-          border: `1px solid ${PANEL_BORDER}`,
-          borderTop: 'none',
-          borderRadius: SWITCHER_RADIUS,
           boxShadow: '0 12px 34px rgba(0,0,0,0.55)',
           display: 'flex',
           flexDirection: 'column',
@@ -400,7 +555,12 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
 
         <div ref={listRef} className="tab-list-scroll" style={{ overflowY: 'auto', flex: 1, padding: '4px 6px 6px' }}>
           {rows.length === 0 && (
-            <div style={{ padding: 14, textAlign: 'center', color: '#777', fontSize: 12.5 }}>No tabs found</div>
+            <div style={{ padding: 14, textAlign: 'center', color: '#777', fontSize: 12.5 }}>
+              {/* A pane list can only be empty if every remembered tab was
+                  closed or is showing elsewhere — the "no past at all" case
+                  never opens in pane scope (openCtrl falls through to global). */}
+              {paneScope ? 'В этой панели больше нечего вернуть' : 'No tabs found'}
+            </div>
           )}
           {rows.map((row, index) => {
             if (row.kind === 'project') {
@@ -445,6 +605,13 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                   onPointerDown={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
+                    // MIDDLE click = forget this row, and the window stays open:
+                    // the user is editing the list, not navigating. Works on a
+                    // missing-file row too — a dead row is exactly what one
+                    // wants to clear out. Handled on pointerdown like the pick,
+                    // so both gestures are answered by one handler.
+                    if (e.button === 1) { forgetRow(row); return; }
+                    if (e.button !== 0) return;
                     if (missing) return; // vanished file — dead row, not a target
                     commitRow(row);
                   }}

@@ -1409,7 +1409,8 @@ function sendSendFailure(res, data, extra = {}) {
     ...extra,
     ok: false,
     success: false,
-    submitted: false,
+    accepted: false,
+    submitted: data?.submitted === true,
     code,
     error: (data && (data.error || data.message)) || 'send failed',
   });
@@ -1482,7 +1483,8 @@ function externalRunStatusFromDurableRecord(record) {
   if (record?.state === 'delivery-unknown'
     || record?.state === 'in-flight'
     || record?.state === 'enter-armed') return 'delivery_unknown';
-  if (record?.state === 'not-submitted') return 'send_failed';
+  if (record?.state === 'not-submitted'
+    || record?.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) return 'send_failed';
   return 'reserving';
 }
 
@@ -1513,6 +1515,21 @@ function durableAgentSendReplay(record, overrides = {}) {
       status: 'audit-pending',
       auditPending: true,
       receiptState: 'audit-pending',
+      ...overrides,
+      replayed: true,
+    };
+  }
+  if (state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) {
+    return {
+      ...receipt,
+      success: false,
+      accepted: false,
+      submitted: true,
+      status: AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
+      providerAccepted: false,
+      auditPending: false,
+      deliveryUnknown: false,
+      receiptState: AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
       ...overrides,
       replayed: true,
     };
@@ -1902,6 +1919,38 @@ async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
   }
 
   const sendReceipt = classifyAgentSendReceipt(sendResult);
+  if (sendReceipt.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) {
+    // Physical Enter is only a transport fact. An exact post-Enter composer
+    // proof may still show that Claude never created the provider turn. A
+    // positive transcript proof wins a race; transport acceptance alone does
+    // not turn this terminal negative receipt back into audit-pending.
+    if (current.targetPromptProofAt) {
+      console.warn('[OrchestrationDelivery] stale provider-not-accepted receipt ignored run=' + runId
+        + ' late=' + late
+        + ' promptProofAt=' + current.targetPromptProofAt);
+      return { kind: 'accepted', receiptState: 'confirmed', run: await store.get(runId) };
+    }
+    const recoveryPolicy = orchestrationSendFailureRecoveryPolicy(sendResult);
+    console.warn('[OrchestrationDelivery] exact provider-not-accepted after Enter run=' + runId
+      + ' late=' + late
+      + ' target=' + String(current.targetTabId || '').slice(-12)
+      + ' code=' + (sendResult?.code || '-')
+      + ' draftPreserved=' + (sendResult?.draftPreserved === true));
+    const failed = await store.beginRecovery(
+      runId,
+      current.targetCreated ? 'startup_failed' : 'failed',
+      sendResult?.error || sendResult?.message || sendResult?.code
+        || 'provider did not accept the submitted prompt',
+      { failureGraceMs: recoveryPolicy.failureGraceMs },
+    );
+    emitOrchestrationChanges(failed.changed, reason + '-provider-not-accepted');
+    await finalizeSettledOrchestrations(failed.settled, reason + '-provider-not-accepted');
+    return {
+      kind: 'send-failed',
+      receiptState: sendReceipt.state,
+      run: await store.get(runId),
+    };
+  }
   if (sendReceipt.state === 'not-submitted') {
     // A transcript audit or accepted Enter is stronger than a stale renderer
     // callback. Only an exact pre-Enter receipt may turn a still-unaccepted
@@ -2499,7 +2548,8 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       timeoutMs: 60_000,
     });
     const sendReceipt = classifyAgentSendReceipt(result);
-    if (sendReceipt.state === 'not-submitted') {
+    if (sendReceipt.state === 'not-submitted'
+      || sendReceipt.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) {
       await releaseOrchestrationSourceProof(current.runId, 'notification-send-failed');
       const latest = await store.getInternal(current.runId);
       if (result?.error === 'agent_send_cancelled' || latest?.notificationCancelRequestedAt) {
@@ -2513,7 +2563,10 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
         }
         return;
       }
-      const notificationStatus = result?.code === 'terminal_draft_conflict'
+      const notificationStatus = (
+        result?.code === 'terminal_draft_conflict'
+        || sendReceipt.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED
+      )
         ? 'waiting-for-input'
         : 'failed';
       const failed = await store.markNotification(current.runId, notificationStatus, {
@@ -5680,7 +5733,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         prepareSend: () => ensureExplicitAgentTabOpen(tabId, restorable),
       });
       const sendReceipt = classifyAgentSendReceipt(data);
-      if (sendReceipt.state === 'not-submitted') {
+      if (sendReceipt.state === 'not-submitted'
+        || sendReceipt.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) {
         return sendSendFailure(res, data, { tabId, handoffId: operationHandoffId });
       }
       if (sendReceipt.state === 'delivery-unknown') {
@@ -6091,7 +6145,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
       });
       run.lastSendReceipt = sendResult;
       const sendReceipt = classifyAgentSendReceipt(sendResult);
-      if (sendReceipt.state === 'not-submitted') {
+      if (sendReceipt.state === 'not-submitted'
+        || sendReceipt.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) {
         const failureCode = sendResult?.code || 'send_failed';
         run.status = failureCode === 'terminal_draft_conflict' ? 'draft_conflict' : 'send_failed';
         run.errorCode = failureCode;

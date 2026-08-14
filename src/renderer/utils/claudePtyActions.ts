@@ -1,5 +1,6 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { clearPendingResume, markPendingResume } from './pendingResume';
+import { planClaudePtySettings } from './claudePtySettingPlan.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -540,30 +541,63 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
     const assertNotCancelled = options.assertNotCancelled || (() => {});
     const requestedModel = String(options.model || '').trim();
     const requestedEffort = String(options.effort || '').trim();
+    const workspaceState = useWorkspaceStore.getState() as any;
+    const currentSessionId = typeof workspaceState.getClaudeSessionId === 'function'
+      ? (workspaceState.getClaudeSessionId(tabId) || null)
+      : null;
+    let confirmedSettings: any = null;
+    if (
+      currentSessionId
+      && (
+        (requestedModel && requestedModel !== 'none')
+        || (requestedEffort && requestedEffort !== 'none')
+      )
+    ) {
+      assertNotCancelled();
+      confirmedSettings = await ipcRenderer.invoke('claude:get-confirmed-settings', {
+        tabId,
+        sessionId: currentSessionId,
+      }).catch(() => null);
+      assertNotCancelled();
+    }
+    const settingPlan = planClaudePtySettings({
+      requestedModel,
+      requestedEffort,
+      confirmed: confirmedSettings,
+      currentSessionId,
+    });
     let composerMutated = false;
     let exactEmptyEvidence = options.claudeExactEmptyEvidence || null;
     assertNotCancelled();
-    if (requestedModel && requestedModel !== 'none') {
+    if (settingPlan.applyModel) {
       await applyClaudePtySetting({
         tabId,
         kind: 'model',
-        value: requestedModel,
+        value: settingPlan.model,
         source: (options.source || 'claude-pty-action') + ':model',
         assertNotCancelled,
       });
       composerMutated = true;
       assertNotCancelled();
+    } else if (settingPlan.model && settingPlan.model !== 'none') {
+      console.log('[ClaudePtyActions:send] skip-confirmed-setting tab=' + shortTab(tabId)
+        + ' kind=model value=' + JSON.stringify(settingPlan.model)
+        + ' session=' + shortSid(currentSessionId || undefined));
     }
-    if (requestedEffort && requestedEffort !== 'none') {
+    if (settingPlan.applyEffort) {
       await applyClaudePtySetting({
         tabId,
         kind: 'effort',
-        value: requestedEffort,
+        value: settingPlan.effort,
         source: (options.source || 'claude-pty-action') + ':effort',
         assertNotCancelled,
       });
       composerMutated = true;
       assertNotCancelled();
+    } else if (settingPlan.effort && settingPlan.effort !== 'none') {
+      console.log('[ClaudePtyActions:send] skip-confirmed-setting tab=' + shortTab(tabId)
+        + ' kind=effort value=' + JSON.stringify(settingPlan.effort)
+        + ' session=' + shortSid(currentSessionId || undefined));
     }
     if (typeof options.thinking === 'string' && options.thinking.trim()) {
       assertNotCancelled();
@@ -627,6 +661,7 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
       sendOperationKey: options.sendOperationKey || null,
       source: options.source || 'claude-pty-action',
       verifyClaudeVisibleDraftBeforePaste: true,
+      requireFreshClaudeExactEmptyBeforePaste: composerMutated,
       presentationSnapshot: options.presentationSnapshot || null,
     };
     assertNotCancelled();

@@ -2,15 +2,16 @@ import { create } from 'zustand';
 import { startTransition } from 'react';
 import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
-import { usePromptQueueStore } from './usePromptQueueStore';
+import { hasPendingPromptQueueContinuation, usePromptQueueStore } from './usePromptQueueStore';
 import { isOrchestrationCompletionBlocked } from './useOrchestrationStore';
+import { shouldDeferTabCompletionNotification } from '../utils/tabCompletionDeferral.mjs';
 import { useUIStore, type HistoryPromptDraftChip } from './useUIStore';
 import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { isAiForegroundProcess } from '../utils/aiForegroundProcess.mjs';
 import { markRendererActivity } from '../utils/rendererActivityTrail';
 import {
-  commitArchiveBeforeClose,
+  commitArchiveWithStopRetry,
   isDurableSaveTabsAck,
 } from '../utils/tabPersistenceTransactions.mjs';
 import {
@@ -38,6 +39,9 @@ import {
   removePanesByProject,
   resolveSplitActivation,
   sanitizePanes,
+  paneWithHistoryFrom,
+  dropFromPaneHistory,
+  dropTabFromAllPaneHistories,
 } from '../utils/splitPanesModel.mjs';
 import { isVisitWorthRecording, onScreenTabIds } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
@@ -1252,6 +1256,26 @@ const emitTabCompletionNotificationCleared = (detail: { projectId: string; tabId
   } catch {}
 };
 
+// Does this tab still owe the user queued work? Reads the SAME predicate the
+// runner and the queue UI use, so "the bell thinks the job is done" and "the
+// queue thinks the job is done" cannot drift apart.
+const tabHasPendingQueueContinuation = (tabId: string): boolean => {
+  try {
+    return hasPendingPromptQueueContinuation(usePromptQueueStore.getState().getQueue(tabId));
+  } catch {
+    return false;
+  }
+};
+
+// One gate for both completion paths (own turn end + orchestration release).
+// Returns a defer reason, or null when the bell may settle now.
+const tabCompletionDeferralReason = (tabId: string, successful: boolean): string | null =>
+  shouldDeferTabCompletionNotification({
+    successful,
+    orchestrationBlocked: isOrchestrationCompletionBlocked(tabId),
+    queueContinuationPending: tabHasPendingQueueContinuation(tabId),
+  });
+
 const settleTabCompletionNotification = ({
   tab,
   workspace,
@@ -1336,6 +1360,20 @@ export interface SplitPane {
    * and then on every pane at once. See splitPanesModel.mjs for the rules.
    */
   column?: number;
+  /**
+   * What THIS pane showed before its current tab, most recent first. Feeds the
+   * per-pane Ctrl+Tab list and the file middle-click step-back — "what was in
+   * this slot" is a different question from the global "which tab did I visit".
+   *
+   * Absent when the pane has no past. Sessions saved before the list existed
+   * carry the one-step `prevProjectId`/`prevTabId` pair instead; paneHistory()
+   * reads both shapes, so restore keeps its memory.
+   */
+  history?: Array<{ projectId: string; tabId: string }>;
+  /** @deprecated one-step predecessor of `history`; read-only via paneHistory(). */
+  prevProjectId?: string;
+  /** @deprecated see prevProjectId */
+  prevTabId?: string;
 }
 
 export interface TerminalBufferCheckpoint {
@@ -1374,11 +1412,39 @@ interface WorkspaceStore {
    * every switch looks like "it was already visible".
    */
   touchGlobalTabMru: (projectId: string, tabId: string, visibleBefore?: string[]) => void;
+  /**
+   * "Forget this row" — middle-click in a tab list. Removes the tab from the
+   * GLOBAL visit order without touching the tab itself: it stays open, it just
+   * stops being offered as somewhere to go back to.
+   *
+   * The durable per-tab stamp is cleared too, or the next restart would rebuild
+   * the order from it and the entry would come back.
+   */
+  forgetGlobalTabVisit: (projectId: string, tabId: string) => void;
+  /** Same gesture in a PANE's own list: forget this row for that pane only. */
+  forgetPaneTabVisit: (paneIndex: number, tabId: string) => void;
   // Split workspace (up to 3 side-by-side panes, cross-project). Empty =
   // single mode. Persisted in the session state. Focused pane index kept in
   // sync with activeProjectId/activeTabId by activateCenterTab.
   splitPanes: SplitPane[];
   splitFocusedIndex: number;
+  /**
+   * Does the workspace own the keyboard, or does the surrounding interface?
+   *
+   * NOT a second focus and NOT a second active tab: the active tab always
+   * exists and every tab-owned surface keeps following it. This answers only
+   * "where do keystrokes go", which is what decides whether Ctrl+Tab walks the
+   * focused PANE's own history or the global one.
+   *
+   * true — the focused pane (or, in single mode, the centre) has the keyboard;
+   * false — the user clicked the sidebar / a top bar / the dashboard, so the
+   * gesture is global while the tab stays exactly as active as before.
+   *
+   * Session-transient on purpose: after a restart the keyboard belongs to the
+   * workspace, same as it did before any of this existed.
+   */
+  workspaceOwnsKeyboard: boolean;
+  setWorkspaceOwnsKeyboard: (owns: boolean) => void;
   addTabToSplit: (projectId: string, tabId: string) => boolean;
   removeTabFromSplit: (tabId: string) => void;
   // Split button in the attach row: open an EMPTY pane (focused, waiting for
@@ -1851,19 +1917,65 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ globalTabMru: touchMru(globalTabMru, projectId, tabId) });
   },
 
+  forgetGlobalTabVisit: (projectId, tabId) => {
+    if (!tabId) return;
+    const { globalTabMru, openProjects } = get();
+    // BOTH halves, or the removal does not survive a restart: restore derives
+    // the order from each tab's durable stamp and uses the saved array only for
+    // unstamped tabs, so clearing the array alone would let the entry come back
+    // on the next launch (the same asymmetry that once made the saved list
+    // shrink irreversibly — see rebuildGlobalTabMru).
+    const workspace = openProjects.get(projectId);
+    const tab = workspace?.tabs.get(tabId);
+    if (tab && tab.lastActivatedAt) {
+      delete tab.lastActivatedAt;
+      saveTabs(projectId, workspace!.tabs);
+    }
+    const next = dropFromMru(globalTabMru, tabId);
+    if (next.length !== globalTabMru.length) set({ globalTabMru: next });
+    console.log('[TabHistory] forget-global tab=' + tabId.slice(-12));
+    get().saveSession();
+  },
+
+  forgetPaneTabVisit: (paneIndex, tabId) => {
+    const res = dropFromPaneHistory(get().splitPanes, paneIndex, tabId);
+    if (!res) return;
+    set({ splitPanes: res.panes });
+    console.log('[TabHistory] forget-pane pane=' + paneIndex + ' tab=' + tabId.slice(-12));
+    get().saveSession();
+  },
+
   // ── Split workspace ──────────────────────────────────────────────────────
   splitPanes: [],
   splitFocusedIndex: 0,
+  // Starts true: on launch the workspace is where the user works, and this is
+  // the pre-existing behaviour for every gesture that reads it.
+  workspaceOwnsKeyboard: true,
+  setWorkspaceOwnsKeyboard: (owns) => {
+    if (get().workspaceOwnsKeyboard === !!owns) return; // no-op → no re-render
+    set({ workspaceOwnsKeyboard: !!owns });
+  },
   addTabToSplit: (projectId, tabId) => {
     const { splitPanes, splitFocusedIndex, activeProjectId, openProjects } = get();
     const activeWs = activeProjectId ? openProjects.get(activeProjectId) : null;
     const current = activeProjectId && activeWs?.activeTabId
       ? { projectId: activeProjectId, tabId: activeWs.activeTabId }
       : null;
+    // BEFORE the pane write: adding a tab to the workspace makes it APPEAR, so
+    // this is a visit. switchTab (via activateCenterTab below) snapshots the
+    // screen AFTER the pane list already contains the tab, sees "already
+    // visible" and correctly skips — so the appearance must be recorded here,
+    // with the pre-write picture. (Reported live: navigating through the pane
+    // header's hover list never reached the global history.)
+    const visibleBefore = onScreenTabIds({
+      panes: splitPanes,
+      centerTabId: activeWs?.activeTabId || null,
+    });
     const res = addPane(splitPanes, splitFocusedIndex, current, { projectId, tabId });
     if (!res) return false;
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
     console.log('[Split] addTab tab=' + tabId.slice(-12) + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
+    get().touchGlobalTabMru(projectId, tabId, visibleBefore);
     // Focus follows the newly added pane → its tab becomes the center tab.
     get().activateCenterTab(projectId, tabId);
     get().saveSession();
@@ -1944,21 +2056,32 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // One tab, one pane: a tab visible elsewhere would otherwise appear twice.
     if (st.splitPanes.some((pane, i) => i !== paneIndex && pane.tabId === tabId)) return false;
 
+    // The pre-write picture, for the visit rule below.
+    const visibleBefore = onScreenTabIds({ panes: st.splitPanes, centerTabId: null });
+
     const next = st.splitPanes.slice();
-    next[paneIndex] = {
-      projectId,
-      tabId,
-      ...(target.column !== undefined ? { column: target.column } : null),
-      // Pane-level recency, same as a normal activation — so middle-click can
-      // still step back from whatever is put here.
-      ...(target.tabId && target.tabId !== tabId
-        ? { prevProjectId: target.projectId, prevTabId: target.tabId }
-        : null),
-    };
+    // Pane-level recency through the ONE carrier (paneWithHistoryFrom): the
+    // pane object is rebuilt here, and anything not explicitly carried is
+    // silently erased — hand-assembling the object is how the history would
+    // quietly reset on every pick from the hover list.
+    next[paneIndex] = paneWithHistoryFrom(
+      {
+        projectId,
+        tabId,
+        ...(target.column !== undefined ? { column: target.column } : null),
+      },
+      target,
+    );
     // splitFocusedIndex is deliberately NOT touched: this is the whole point of
     // the second path. The center follows the FOCUSED pane, so leaving focus
     // alone also leaves the center where the user left it.
     set({ splitPanes: next });
+    // A VISIT: the picked tab just APPEARED in this pane. This path writes the
+    // pane itself and never goes through switchTab, so without an explicit
+    // touch here the hover-list navigation left no trace in the global history
+    // (reported live). Focus staying put does not matter — the rule is about
+    // visibility, not focus.
+    get().touchGlobalTabMru(projectId, tabId, visibleBefore);
     console.log('[Split] setPaneTab pane=' + paneIndex + ' tab=' + tabId.slice(-12) + ' focus-unchanged');
     get().saveSession();
     return true;
@@ -3178,8 +3301,36 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // File tabs are linked document previews, not restorable terminal/AI sessions.
     const shouldArchiveToHistory = tab.tabType !== 'file' && options?.archive !== false;
-    const archiveCommit = await commitArchiveBeforeClose({
+    // Loader BEFORE the archive, not after it. The Codex path can legitimately
+    // spend time here (writer proof + a possible stop-and-retry below), and a
+    // click that visibly does nothing for that long was reported as "middle
+    // click does not work". Cleared on every return-false path below.
+    const showsPreArchiveLoader = isAiTab || processWasRunning;
+    if (showsPreArchiveLoader) {
+      tab.aiClosing = true;
+      startTransition(() => {
+        set({ openProjects: new Map(openProjects) });
+      });
+    }
+    const clearClosingLoader = () => {
+      if (!tab.aiClosing) return;
+      tab.aiClosing = false;
+      startTransition(() => {
+        set({ openProjects: new Map(openProjects) });
+      });
+    };
+    const archiveCommit = await commitArchiveWithStopRetry({
       shouldArchive: shouldArchiveToHistory,
+      commandType: tab.commandType,
+      // The unproven-writer refusal only: stop the live Codex first, then
+      // retry the History write — the exact sequence the user performed by
+      // hand (right-click → Стоп → close). Confirmation stays as-is: it was
+      // already asked above when the agent is mid-answer.
+      stopProcess: () => ipcRenderer.invoke('terminal:stop-ai-process', {
+        tabId,
+        toolType: tab.commandType,
+        reason: 'close-tab-archive-retry',
+      }),
       archive: () => ipcRenderer.invoke('project:archive-tab', {
         projectId,
         tab: {
@@ -3218,14 +3369,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }),
     });
     if (!archiveCommit.ok) {
+      clearClosingLoader();
       console.warn('[CloseTab] archive not committed; keeping tab and process tab=' + tabId.slice(-12)
         + ' reason=' + (archiveCommit.reason || 'unknown')
+        + ' stoppedForRetry=' + (archiveCommit.stoppedForRetry === true)
         + ' error=' + (archiveCommit.error instanceof Error ? archiveCommit.error.message : 'none'));
+      // A silent no-op click is the bug this whole path fixes — if the close
+      // still cannot proceed, SAY why instead of leaving the tab to just sit
+      // there. (The stop-and-retry already resolved the common Codex case; what
+      // remains is genuinely unknown state worth a message.)
+      useUIStore.getState().showToast(
+        'Вкладка не закрыта: не удалось записать её в историю (' + (archiveCommit.reason || 'unknown') + ')',
+        'error',
+        5000,
+      );
       return false;
     }
     if (!archiveCommit.skipped) {
       console.log('[CloseTab] archive committed tab=' + tabId.slice(-12) +
         ' historyId=' + (archiveCommit.result?.historyId ?? 'none') +
+        ' stoppedForRetry=' + (archiveCommit.stoppedForRetry === true) +
         ' durMs=' + (Date.now() - closeStartedAt));
     } else if (tab.tabType === 'file') {
       console.log('[CloseTab] archive skipped file tab=' + tabId.slice(-12));
@@ -3239,9 +3402,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Ctrl+C plus flush is up to ~1.2s for a busy agent). Show the shutdown
     // loader in place of the tab title for the whole of it — a tab that just
     // sits there after the click reads as "the close did not work", which is
-    // exactly how the broken Codex path was reported.
+    // exactly how the broken Codex path was reported. (The loader may already
+    // be up from the pre-archive block; this only widens it to the stop phase.)
     const showsClosingLoader = shouldStopAiProcess || processWasRunning;
-    if (showsClosingLoader) {
+    if (showsClosingLoader && !tab.aiClosing) {
       tab.aiClosing = true;
       startTransition(() => {
         set({ openProjects: new Map(openProjects) });
@@ -3327,6 +3491,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Remove closed tab from history
     workspace.tabHistory = workspace.tabHistory.filter(id => id !== tabId);
     set({ globalTabMru: dropFromMru(get().globalTabMru, tabId) });
+    // …and from every pane's own visit history: a closed tab must not be
+    // offered as a step-back target, and a dead entry would survive into the
+    // saved session wasting the cap.
+    {
+      const purge = dropTabFromAllPaneHistories(get().splitPanes, tabId);
+      if (purge) set({ splitPanes: purge.panes });
+    }
     // Closing a tab that occupies a split pane collapses/shrinks the split.
     // The surviving pane inherits global focus AFTER the workspace cleanup
     // below (otherwise this project's own LRU fallback would win and the
@@ -4018,8 +4189,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
 
       // A real parent turn owns the final notification once it starts. The
-      // orchestration release only settles a bell while the parent itself is idle.
-      if (tab.aiBusy || isOrchestrationCompletionBlocked(tabId)) return;
+      // orchestration release only settles a bell while the parent itself is idle
+      // and owes no queued work — an armed Run after will end its own last turn.
+      if (tab.aiBusy) return;
+      const deferReason = tabCompletionDeferralReason(tabId, phase === 'success');
+      if (deferReason) {
+        console.warn('[TabNotification] orchestration release deferred tab=' + tabId.slice(-12)
+          + ' outcome=' + phase + ' reason=' + deferReason);
+        return;
+      }
       const settled = settleTabCompletionNotification({
         tab,
         workspace,
@@ -5499,16 +5677,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             emitTabCompletionNotificationCleared({ projectId: workspace.projectId, tabId });
           }
         } else if (wasBusy && (tab.completionNotificationArmed || tab.completionNotificationPersistent)) {
-          if (isOrchestrationCompletionBlocked(tabId)) {
+          const successful = isNaturalAgentTurnEndReason(reason);
+          // Deferring leaves the bell ARMED: the queue's own last item ends a
+          // turn with nothing pending, and that turn rings once for the whole
+          // Run after run instead of once per item.
+          const deferReason = tabCompletionDeferralReason(tabId, successful);
+          if (deferReason) {
             console.warn('[TabNotification] completion deferred tab=' + tabId.slice(-12)
-              + ' reason=orchestration-blocked');
+              + ' reason=' + deferReason);
           } else {
             const settled = settleTabCompletionNotification({
               tab,
               workspace,
               activeProjectId,
               tabId,
-              successful: isNaturalAgentTurnEndReason(reason),
+              successful,
             });
             notificationDetail = settled.detail;
           }

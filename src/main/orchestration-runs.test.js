@@ -2543,6 +2543,47 @@ test('proven pre-submit refusal settles immediately and exposes source notificat
   }
 });
 
+test('exact provider-not-accepted after Enter settles immediately and exposes source notification', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-provider-not-accepted'));
+    const policy = orchestrationSendFailureRecoveryPolicy({
+      success: false,
+      accepted: false,
+      submitted: true,
+      pasteWritten: true,
+      enterWritten: true,
+      semanticStatus: 'not-submitted',
+      providerAccepted: false,
+      providerTurnCreated: false,
+      composerDraftState: 'exact-original',
+      exactDraftRemained: true,
+      draftPreserved: true,
+      lateReconciliationPending: false,
+    });
+    const transition = await store.beginRecovery(
+      'run-provider-not-accepted',
+      'failed',
+      'claude_prompt_not_accepted_exact_draft_remained',
+      { now: 1000, failureGraceMs: policy.failureGraceMs },
+    );
+    const run = await store.get('run-provider-not-accepted');
+
+    assert.equal(policy.provenNotSent, false);
+    assert.equal(policy.provenProviderNotAccepted, true);
+    assert.equal(policy.failureGraceMs, 0);
+    assert.equal(run.status, 'failed');
+    assert.equal(run.completedAt, 1000);
+    assert.equal(run.recoveryDeadlineAt, null);
+    assert.equal(run.notificationStatus, 'pending');
+    assert.equal(run.sourceFollowupPending, true);
+    assert.equal(transition.settled.length, 1);
+    await store.persistStrict();
+  } finally {
+    await cleanup();
+  }
+});
+
 test('unknown send failure keeps the configured recovery window', async () => {
   const { store, cleanup } = await makeStore();
   try {

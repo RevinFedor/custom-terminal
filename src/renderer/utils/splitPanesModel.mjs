@@ -143,7 +143,7 @@ export function resolveSplitActivation(panes, focusedIndex, projectId, tabId) {
   // lower row of a split column turned two stacked 409px rows into two 623px
   // side-by-side columns.
   const slot = panes[at];
-  next[at] = withPrevTab(
+  next[at] = paneWithHistoryFrom(
     slot && slot.column !== undefined
       ? { projectId, tabId, column: slot.column }
       : { projectId, tabId },
@@ -156,20 +156,73 @@ export function resolveSplitActivation(panes, focusedIndex, projectId, tabId) {
 //
 // Recency at PANE level, which the global tab history cannot answer: "what was
 // in THIS slot before the current tab" is a different question from "which tab
-// did the user visit before". Middle-clicking a file pane restores the pane's
-// own previous tab, so the pane keeps existing and only its content steps back.
+// did the user visit before". Started as a single prev slot (one step back for
+// the file middle-click); now a LIST, because the per-pane Ctrl+Tab switcher
+// navigates the pane's own past — same mechanism, deeper.
 //
-// One step is enough for the gesture (file → back to the agent that opened it)
-// and one step cannot grow stale the way a list would.
-const withPrevTab = (nextPane, previousPane) => {
-  if (!previousPane || !previousPane.tabId) return nextPane;
-  if (previousPane.tabId === nextPane.tabId) return nextPane;
-  return { ...nextPane, prevProjectId: previousPane.projectId, prevTabId: previousPane.tabId };
+// The list holds what the pane showed BEFORE its current tab, most recent
+// first, deduped, capped. It rides on the pane object itself, so it persists
+// with the layout and dies with the pane — a pane's history has no meaning
+// once the pane is gone.
+export const PANE_HISTORY_CAP = 60; // = GLOBAL_TAB_MRU_CAP; both lists answer "where was I"
+
+/**
+ * The pane's visit list. Reads the legacy one-step `prevProjectId/prevTabId`
+ * shape as a one-entry history, so sessions saved before the list existed
+ * restore with their memory intact.
+ */
+export function paneHistory(pane) {
+  if (!pane) return [];
+  if (Array.isArray(pane.history)) return pane.history;
+  if (pane.prevTabId) return [{ projectId: pane.prevProjectId, tabId: pane.prevTabId }];
+  return [];
+}
+
+const pushHistoryEntry = (history, outgoing) => {
+  if (!outgoing || !outgoing.tabId) return history.slice(0, PANE_HISTORY_CAP);
+  const filtered = history.filter((e) => e && e.tabId !== outgoing.tabId);
+  return [{ projectId: outgoing.projectId, tabId: outgoing.tabId }, ...filtered]
+    .slice(0, PANE_HISTORY_CAP);
 };
 
 /**
+ * Build the pane object that replaces `previousPane` with `nextPane`, carrying
+ * the history forward with the outgoing tab pushed on top.
+ *
+ * EVERY writer that swaps a pane's tab must go through this. The pane object is
+ * rebuilt from scratch on activation, so anything not explicitly carried is
+ * silently erased — that is exactly how the one-step prev field would have
+ * vanished, and how the history would quietly reset on every switch.
+ */
+export function paneWithHistoryFrom(nextPane, previousPane) {
+  const prior = paneHistory(previousPane).filter((e) => e && e.tabId !== nextPane.tabId);
+  if (!previousPane || !previousPane.tabId || previousPane.tabId === nextPane.tabId) {
+    return prior.length > 0 ? { ...nextPane, history: prior } : nextPane;
+  }
+  return { ...nextPane, history: pushHistoryEntry(prior, previousPane) };
+}
+
+/**
+ * The pane's history filtered down to what can actually be SHOWN here now:
+ * entries whose tab still exists and is not currently visible in any pane
+ * (including this pane's own current tab). This is the row source for the
+ * per-pane switcher and the step-back target list — one filter, two consumers.
+ */
+export function restorablePaneHistory(panes, paneIndex, tabExists = () => true) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane) return [];
+  const visible = new Set(list.map((p) => p && p.tabId).filter(Boolean));
+  return paneHistory(pane).filter((e) => (
+    e && e.tabId && !visible.has(e.tabId) && tabExists(e.projectId, e.tabId)
+  ));
+}
+
+/**
  * Middle-click on a pane showing a FILE: put the pane's previous tab back
- * instead of removing the pane.
+ * instead of removing the pane. Steps to the first RESTORABLE entry — a dead
+ * or elsewhere-visible head does not kill the gesture when an older entry is
+ * still valid.
  *
  * Returns null when there is nothing to step back to — the caller then falls
  * back to the normal "remove this pane" behaviour, so the gesture never becomes
@@ -179,18 +232,64 @@ export function restorePanePreviousTab(panes, focusedIndex, tabId, tabExists = (
   const list = Array.isArray(panes) ? panes : [];
   const idx = list.findIndex((p) => p && p.tabId === tabId);
   if (idx === -1) return null;
+  const candidates = restorablePaneHistory(list, idx, tabExists);
+  if (candidates.length === 0) return null;
+  const target = candidates[0];
   const pane = list[idx];
-  if (!pane.prevTabId) return null;
-  // A tab closed while the file was open must not resurrect as a dead pane.
-  if (!tabExists(pane.prevProjectId, pane.prevTabId)) return null;
-  if (list.some((p, i) => i !== idx && p.tabId === pane.prevTabId)) return null;
   const next = list.slice();
-  const restored = { projectId: pane.prevProjectId, tabId: pane.prevTabId };
+  const restored = { projectId: target.projectId, tabId: target.tabId };
   if (pane.column !== undefined) restored.column = pane.column;
-  // The file becomes the pane's "previous" in turn, so the gesture toggles.
-  next[idx] = { ...restored, prevProjectId: pane.projectId, prevTabId: pane.tabId };
+  // The outgoing tab becomes the newest history entry, so the gesture toggles;
+  // everything older survives underneath.
+  next[idx] = paneWithHistoryFrom(restored, pane);
   return { panes: next, focusedIndex: clampIndex(next, focusedIndex), restoredIndex: idx };
 }
+
+/**
+ * Drop one tab from ONE pane's history (middle-click on a row of the pane's
+ * switcher list — "forget this", not "close this"). Returns null when nothing
+ * changed, so callers can skip the store write.
+ */
+export function dropFromPaneHistory(panes, paneIndex, tabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane || !tabId) return null;
+  const history = paneHistory(pane);
+  const filtered = history.filter((e) => e && e.tabId !== tabId);
+  const hadLegacy = !Array.isArray(pane.history) && !!pane.prevTabId;
+  if (filtered.length === history.length && !hadLegacy) return null;
+  const next = list.slice();
+  // Normalise to the list shape while dropping the legacy prev fields — after a
+  // removal they would resurrect the entry on the next paneHistory read.
+  const { prevProjectId, prevTabId, ...rest } = pane;
+  next[paneIndex] = filtered.length > 0 ? { ...rest, history: filtered } : stripHistory(rest);
+  return { panes: next };
+}
+
+/**
+ * A tab was CLOSED: purge it from every pane's history. A closed tab must not
+ * be offered as a step-back target anywhere (restorablePaneHistory would skip
+ * it anyway, but a dead entry also wastes the cap and survives into the saved
+ * session).
+ */
+export function dropTabFromAllPaneHistories(panes, tabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (!tabId) return null;
+  let changed = false;
+  const next = list.map((pane, i) => {
+    const res = dropFromPaneHistory(list, i, tabId);
+    if (!res) return pane;
+    changed = true;
+    return res.panes[i];
+  });
+  return changed ? { panes: next } : null;
+}
+
+const stripHistory = (pane) => {
+  if (!pane || !('history' in pane)) return pane;
+  const { history, ...rest } = pane;
+  return rest;
+};
 
 // ПКМ «Добавить в рабочую область». From single mode the current center tab
 // becomes pane 0 and the added tab pane 1. An existing empty placeholder is
@@ -333,12 +432,20 @@ export function removePanesByProject(panes, focusedIndex, projectId) {
 
 // Restore-time validation: keep only panes whose tab still exists (this also
 // drops empty placeholders — they are session-transient); a split needs at
-// least two live panes to survive.
+// least two live panes to survive. Each surviving pane's HISTORY is scrubbed
+// of dead tabs too — entries for tabs deleted while the app was closed would
+// otherwise sit in the saved layout forever.
 export function sanitizePanes(panes, focusedIndex, tabExists) {
-  const valid = (Array.isArray(panes) ? panes : []).filter((p) => (
-    p && typeof p.projectId === 'string' && typeof p.tabId === 'string'
-    && p.tabId && tabExists(p.projectId, p.tabId)
-  ));
+  const valid = (Array.isArray(panes) ? panes : [])
+    .filter((p) => (
+      p && typeof p.projectId === 'string' && typeof p.tabId === 'string'
+      && p.tabId && tabExists(p.projectId, p.tabId)
+    ))
+    .map((p) => {
+      const history = paneHistory(p).filter((e) => e && e.tabId && tabExists(e.projectId, e.tabId));
+      const { prevProjectId, prevTabId, ...rest } = p;
+      return history.length > 0 ? { ...rest, history } : stripHistory(rest);
+    });
   if (valid.length < 2) return { panes: [], focusedIndex: 0 };
   return { panes: valid.slice(0, MAX_SPLIT_PANES), focusedIndex: clampIndex(valid, focusedIndex) };
 }

@@ -7,9 +7,30 @@ const {
   parseClaudeComposerCurrentFrame,
   reserveClaudeExactEmptyEvidence,
   resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence,
+  summarizeClaudePromptSuffixStyle,
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 } = require('./claude-composer-proof');
+
+test('summarizes only semantic xterm attributes for a Claude prompt suffix', () => {
+  assert.deepEqual(summarizeClaudePromptSuffixStyle([
+    { ch: ' ', dim: false, inverse: false, nonDefaultBg: false },
+    { ch: 'g', dim: true, inverse: false, nonDefaultBg: false },
+    { ch: 'h', dim: true, inverse: false, nonDefaultBg: false },
+  ]), {
+    allDim: true,
+    hasInverse: false,
+    hasNonDefaultBg: false,
+  });
+  assert.deepEqual(summarizeClaudePromptSuffixStyle([
+    { ch: 'g', dim: true, inverse: false, nonDefaultBg: false },
+    { ch: 'h', dim: true, inverse: true, nonDefaultBg: true },
+  ]), {
+    allDim: true,
+    hasInverse: true,
+    hasNonDefaultBg: true,
+  });
+});
 
 function snapshot(lines, { baseY = 100, cursorY = 3, cursorX = 8 } = {}) {
   return {
@@ -63,6 +84,76 @@ test('text beyond the cursor is ambiguous and asks for an exact Claude read', ()
   assert.equal(proof.hasDraft, null);
   assert.equal(proof.proofReason, 'composer-content-after-cursor');
   assert.equal(proof.exactCaptureRecommended, true);
+});
+
+test('proves an arbitrary Claude dim ghost suggestion is not a user draft', () => {
+  const proof = parseClaudeComposerCurrentFrame(snapshot([
+    'old answer',
+    '────────────',
+    {
+      text: '❯ останови процесс потом архивируй',
+      wrapped: false,
+      promptSuffixAllDim: true,
+      promptSuffixHasInverse: false,
+      promptSuffixHasNonDefaultBg: false,
+      promptSuffixWrapped: false,
+    },
+    '',
+  ], { cursorY: 2, cursorX: 2 }));
+  assert.equal(proof.proofOutcome, 'absent');
+  assert.equal(proof.hasDraft, false);
+  assert.equal(proof.proofReason, 'current-composer-dim-ghost-suggestion');
+});
+
+test('keeps non-dim, mixed, modal, and displaced-cursor suffixes ambiguous', () => {
+  const cases = [
+    ['normal text', {
+      promptSuffixAllDim: false,
+      promptSuffixHasInverse: false,
+      promptSuffixHasNonDefaultBg: false,
+      promptSuffixWrapped: false,
+    }, 2],
+    ['inverse surface', {
+      promptSuffixAllDim: true,
+      promptSuffixHasInverse: true,
+      promptSuffixHasNonDefaultBg: false,
+      promptSuffixWrapped: false,
+    }, 2],
+    ['background surface', {
+      promptSuffixAllDim: true,
+      promptSuffixHasInverse: false,
+      promptSuffixHasNonDefaultBg: true,
+      promptSuffixWrapped: false,
+    }, 2],
+    ['cursor inside text', {
+      promptSuffixAllDim: true,
+      promptSuffixHasInverse: false,
+      promptSuffixHasNonDefaultBg: false,
+      promptSuffixWrapped: false,
+    }, 5],
+    ['wrapped suffix', {
+      promptSuffixAllDim: true,
+      promptSuffixHasInverse: false,
+      promptSuffixHasNonDefaultBg: false,
+      promptSuffixWrapped: true,
+    }, 2],
+  ];
+
+  for (const [label, style, cursorX] of cases) {
+    const proof = parseClaudeComposerCurrentFrame(snapshot([
+      'old answer',
+      '────────────',
+      {
+        text: '❯ пользовательский текст',
+        wrapped: false,
+        ...style,
+      },
+      '',
+    ], { cursorY: 2, cursorX }));
+    assert.equal(proof.proofOutcome, 'unknown', label);
+    assert.equal(proof.proofReason, 'composer-content-after-cursor', label);
+    assert.equal(proof.exactCaptureRecommended, true, label);
+  }
 });
 
 test('does not treat real user text shaped like the placeholder as empty', () => {

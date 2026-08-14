@@ -13,6 +13,7 @@ import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQue
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { generateTitleFromPromptWithConfig, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import {
@@ -300,7 +301,9 @@ export function PromptQueueOverlay({
   const postPromptText = queue?.postPromptText ?? '';
   const loopPromptEnabled = queue?.loopPromptEnabled ?? false;
   const loopPromptText = usePromptQueueStore((s) => s.sharedLoopPromptText);
-  const collapsed = queue?.panelCollapsed ?? false;
+  // Вкладка без своей записи в очереди = новая вкладка → свёрнуто. Локальный
+  // `?? false` здесь раньше означал «развёрнуто» и переспорил бы дефолт стора.
+  const collapsed = queue?.panelCollapsed ?? DEFAULT_RUN_AFTER_PANEL_COLLAPSED;
   const firstChipArmedHint = queue?.firstChipHintActive ?? false;
   const runAfterTabId = queue?.runAfterTabId ?? null;
   const pinnedPreviewId = queue?.previewId ?? null;
@@ -3165,8 +3168,14 @@ export function PromptQueueOverlay({
               position: 'relative',
               background: railRunBg,
               borderColor: railRunBorder,
-              color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_TEXT : (activeItemCount ? '#e5e5e5' : TINT)),
-              fontSize: activeItemCount > 0 ? 10 : 14,
+              // Пустая очередь = приглушённый ноль, а не яркая точка: точка
+              // не отвечала на вопрос «сколько сообщений ждёт», её читали как
+              // непонятный маркер. Ноль — это ответ, поэтому он и тусклее:
+              // счётчик светлый только когда есть что считать.
+              color: autoRun
+                ? PULSE
+                : (firstChipArmedHint ? HINT_RED_TEXT : (activeItemCount ? '#e5e5e5' : '#6f6f6f')),
+              fontSize: 10,
               fontWeight: activeItemCount > 0 ? 700 : 500,
               cursor: 'pointer',
               lineHeight: 1,
@@ -3185,17 +3194,22 @@ export function PromptQueueOverlay({
                 }}
               />
             )}
-            {activeItemCount > 0 ? (activeItemCount > 99 ? '99' : activeItemCount) : '•'}
+            {activeItemCount > 99 ? '99' : activeItemCount}
           </button>
           </ControlHint>
           <ControlHint label={`Забрать текущий prompt из ${agentLabel} в очередь`} side="left">
+          {/* Главное действие рейла. Плюсик читался как «добавить что-то»
+              вообще — теперь та же пара иконок, что в развёрнутой панели
+              («из терминала»): терминал → стрелка. Кнопка шире остальных
+              (pq-rail-wide), потому что несёт две иконки и является primary. */}
           <button
-            className="pq-rail-button pq-rail-primary"
+            className="pq-rail-button pq-rail-primary pq-rail-wide"
             onClick={grabCurrent}
-            title="+ grab"
+            title="Забрать prompt из терминала в очередь"
             aria-label="Grab current input"
           >
-            <Plus size={14} strokeWidth={2.2} />
+            <Terminal size={12} strokeWidth={2.2} />
+            <ArrowRight size={11} strokeWidth={2.4} />
           </button>
           </ControlHint>
           <ControlHint label={timelineTreeMode ? 'Скрыть Timeline' : 'Открыть Timeline'} shortcut="⌘\\" side="left">
@@ -3900,6 +3914,17 @@ export function PromptQueueOverlay({
         .pq-rail-primary {
           background: #3a2018;
           border-color: #a85840;
+        }
+        /* Единственная кнопка рейла, которая шире квадрата: она несёт две
+           иконки (терминал → стрелка) и является главным действием. Все
+           три ширины переопределяются вместе — базовый .pq-rail-button
+           фиксирует min/max, иначе flex сожмёт её обратно в 21px. */
+        .pq-rail-button.pq-rail-wide {
+          width: 34px;
+          min-width: 34px;
+          max-width: 34px;
+          flex: 0 0 34px;
+          gap: 1px;
         }
         .pq-rail-primary:hover {
           background: #4a281d;
