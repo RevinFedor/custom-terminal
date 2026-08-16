@@ -22,6 +22,7 @@ const {
 } = require('../codex-process-action-ownership');
 const { promptFingerprint } = require('../claude-prompt-carriers');
 const { classifyCodexTurnRecord } = require('../codex-turn-outcome');
+const { classifyHistoryAction } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
 const {
   CodexAccountProfileManager,
   DEFAULT_PROFILE_ID,
@@ -1063,10 +1064,20 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
     return actions.length > 0 ? actions : [{ toolName: 'Edit', args: { file_path: '(patch)' } }];
   }
   if (qualifiedName === 'exec_command' || qualifiedName === 'run_command' || qualifiedName === 'restart_process' || qualifiedName === 'kill_process' || qualifiedName === 'run_chain') {
+    let command = input.cmd || input.command || input.input || '';
+    // Unparsed nested arguments arrive as the RAW `{cmd,workdir:"…"}` source
+    // (shorthand/variable args defeat the literal parser). That junk must
+    // never become the command: recover the cmd string by regex, else drop.
+    if (typeof command === 'string' && command.trim().startsWith('{')) {
+      const recovered = command.match(/cmd\s*:\s*"((?:[^"\\]|\\.)+)"/)
+        || command.match(/cmd\s*:\s*'((?:[^'\\]|\\.)+)'/)
+        || command.match(/cmd\s*:\s*`((?:[^`\\]|\\.)+)`/);
+      command = recovered ? recovered[1].replace(/\\n/g, '\n') : '';
+    }
     return [{
       toolName: 'Bash',
       args: {
-        command: input.cmd || input.command || input.input || humanizeCodexToolName(qualifiedName),
+        command: command || humanizeCodexToolName(qualifiedName),
         description: input.justification || '',
       },
     }];
@@ -1093,7 +1104,17 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
     const parts = qualifiedName.replace(/^mcp__/, '').split('__');
     const action = parts.length > 1 ? `${parts[0]} · ${parts.slice(1).join(' ')}` : humanizeCodexToolName(qualifiedName);
     const detail = firstCodexToolDetail(input);
-    return [{ toolName: 'MCP', args: { summary: detail ? `${action} — ${detail}` : action, ...input } }];
+    // Parsed transport identity for the renderer: the visual dictionary
+    // forbids surfacing `mcp__server__tool` as the row label, and the display
+    // grouping collapses MCP series per SERVER — both need these fields.
+    const mcpServer = parts.length > 1 ? parts[0] : (parts[0] || 'mcp');
+    const mcpMethod = parts.length > 1 ? parts.slice(1).join('__') : '';
+    return [{
+      toolName: 'MCP',
+      mcpServer,
+      mcpMethod,
+      args: { summary: detail ? `${action} — ${detail}` : action, ...input },
+    }];
   }
   if (qualifiedName === 'update_plan') {
     const active = Array.isArray(input.plan) ? input.plan.find((item) => item?.status === 'in_progress')?.step : '';
@@ -1206,12 +1227,26 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
         ...(action.result === undefined ? {} : { result: action.result }),
       };
     }
+    // Grouping identity, stamped at normalization time so the renderer's
+    // series-collapsing works identically for Claude and Codex — and so
+    // row-window stubs can carry the same fields without content.
+    const classified = classifyHistoryAction({
+      toolName: action.toolName,
+      args: action.args,
+      mcpServer: action.mcpServer,
+      mcpMethod: action.mcpMethod,
+    });
     return {
       tool: '__raw__',
       rawTool: {
         ...(callId ? { toolUseId: `${callId}:canonical:${index}` } : {}),
         toolName: action.toolName,
         args: action.args || {},
+        family: classified.family,
+        bashWord: classified.bashWord,
+        bashDetail: classified.bashDetail,
+        mcpServer: classified.mcpServer,
+        mcpMethod: classified.mcpMethod,
         result: action.result,
         isError: action.isError,
         diffHunks: action.diffHunks,
@@ -2613,6 +2648,7 @@ function pushAssistantEntry(
   actions,
   identityLine = record.__line,
   identityByteOffset = record.__byteOffset,
+  textPhase = undefined,
 ) {
   if (!content && !thinking && (!actions || actions.length === 0)) return;
   const identityRecord = {
@@ -2629,6 +2665,12 @@ function pushAssistantEntry(
     actions: actions && actions.length > 0 ? actions : undefined,
     sessionId,
     turnIndex,
+    // Codex marks every assistant text with `phase`: 'commentary' (interim
+    // remark — the natural caption for the calls that follow) or
+    // 'final_answer' (the turn's real answer, 99.7% the last text of the
+    // turn). Claude has no equivalent; its caption linkage runs on
+    // messageId instead. The display grammar uses whichever exists.
+    textPhase: textPhase || undefined,
   });
 }
 
@@ -3123,7 +3165,13 @@ function createCodexHistoryProjector(sessionId) {
 
     if (payload.type === 'message' && payload.role === 'assistant') {
       const text = extractTextContent(payload.content);
-      pushAssistantEntry(entries, sessionId, record, currentTurnIndex, text, pendingThinking, null);
+      const textPhase = payload.phase === 'final_answer' || payload.phase === 'commentary'
+        ? payload.phase
+        : undefined;
+      pushAssistantEntry(
+        entries, sessionId, record, currentTurnIndex, text, pendingThinking, null,
+        record.__line, record.__byteOffset, textPhase,
+      );
       pendingThinking = '';
       return;
     }

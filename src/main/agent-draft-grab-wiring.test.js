@@ -201,7 +201,7 @@ test('Ctrl+G owns the shared PTY write boundary and advances input identity exac
   const publicCapture = mainSource.indexOf('async function captureAgentInput(tabId, mode, agent');
   const lock = mainSource.indexOf('return withPtyWriteLock(', publicCapture);
   const privateCall = mainSource.indexOf(
-    'captureAgentInputAtWriteBoundary(tabId, mode, agent, options, term)',
+    'captureAgentInputAtWriteBoundary(',
     lock,
   );
   assert.ok(
@@ -234,6 +234,17 @@ test('Ctrl+G owns the shared PTY write boundary and advances input identity exac
     mainSource,
     /const inputRevisionTransitionOwned\s*=\s*validateAgentExactCaptureInputTransition\(pending\)[\s\S]{0,1800}inputRevisionTransition:\s*'ctrl-g-exact-capture'[\s\S]{0,220}screenProofInputRevision:/,
     'main must attest its own exact pre-proof → Ctrl+G revision transition',
+  );
+});
+
+test('missing-prompt fallback excludes the capture operation itself from PTY contention', () => {
+  const publicCapture = mainSource.indexOf('async function captureAgentInput(tabId, mode, agent');
+  const nextFunction = mainSource.indexOf('async function captureClaudeInput(', publicCapture);
+  const body = mainSource.slice(publicCapture, nextFunction);
+  assert.match(body, /ownedWriteOperation:\s*operation/);
+  assert.match(
+    mainSource,
+    /hasConflictingPtyWriteOperation\(\{[\s\S]{0,260}ownedOperation:\s*ownedWriteOperation/,
   );
 });
 

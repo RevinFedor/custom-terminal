@@ -240,6 +240,23 @@ function classifyClaudeMissingPromptExactCaptureAdmission({
   return { recommended: true, reason: 'closed-idle-frame-exact-copy' };
 }
 
+/**
+ * A Ctrl+G capture is itself serialized through the PTY writer. Its own lock
+ * is ownership, not contention; only a different active or queued operation
+ * may veto the exact-capture fallback.
+ */
+function hasConflictingPtyWriteOperation({
+  activeOperation = null,
+  lastQueuedOperation = null,
+  ownedOperation = null,
+} = {}) {
+  // Once the capture owns the active writer boundary, a later queued write is
+  // behind it and cannot mutate the composer until this capture releases the
+  // lock. Only the operation that currently owns the PTY can conflict here.
+  if (activeOperation) return activeOperation !== ownedOperation;
+  return !!lastQueuedOperation && lastQueuedOperation !== ownedOperation;
+}
+
 function validateClaudeComposerWriteBoundary({
   proof,
   terminalMatches,
@@ -556,6 +573,7 @@ module.exports = {
   CLAUDE_EMPTY_COMPOSER_HINT_RE,
   classifyClaudeMissingPromptExactCaptureAdmission,
   cleanClaudeComposerText,
+  hasConflictingPtyWriteOperation,
   isClaudeComposerStopLine,
   parseClaudeComposerCurrentFrame,
   reserveClaudeExactEmptyEvidence,

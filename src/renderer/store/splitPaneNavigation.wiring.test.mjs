@@ -53,11 +53,26 @@ test('stepping back is gated on the pane showing a FILE', () => {
   assert.match(restore, /if \(shownTab\?\.tabType !== 'file'\) return false;/);
 });
 
-test('the chip still falls through to removal, so the gesture is never dead', () => {
+test('middle-click on the chip CLEARS the window, it does not close it', () => {
+  // The pane is a window the user built: a stray middle-click must not be able
+  // to destroy it. The tab leaves the window (and keeps living in the sidebar);
+  // closing the window itself is the placeholder's own ✕.
   const aux = block(chrome, 'onAuxClick={(e) => {', 'style={{');
   const restoreAt = aux.indexOf('restoreSplitPanePreviousTab(tabId)');
-  const removeAt = aux.indexOf('removeTabFromSplit(tabId)');
-  assert.ok(restoreAt >= 0 && removeAt > restoreAt);
+  const clearAt = aux.indexOf('clearTabFromSplitPane(tabId)');
+  // Step-back first (a file pane returns to what it showed before), then clear
+  // — so the gesture is never dead.
+  assert.ok(restoreAt >= 0 && clearAt > restoreAt);
+  assert.ok(!aux.includes('removeTabFromSplit'), 'the chip must not remove the pane');
+});
+
+test('clearing a pane empties it and never leaves the centre on a hidden tab', () => {
+  const clear = block(store, 'clearTabFromSplitPane: (tabId) => {', '\n\n  removeTabFromSplit:');
+  assert.match(clear, /emptyPaneByClosedTab\(splitPanes, splitFocusedIndex, tabId\)/);
+  // A pane that just became a placeholder holds no tab, so it cannot answer
+  // "what is on screen" — naming it would leave the centre on nothing.
+  assert.match(clear, /focusedAfter && focusedAfter\.tabId \? focusedAfter : null/);
+  assert.match(clear, /activateCenterTab\(next\.projectId, next\.tabId\)/);
 });
 
 test('collapsing to single mode moves the center to the SURVIVING tab', () => {
@@ -72,13 +87,32 @@ test('collapsing to single mode moves the center to the SURVIVING tab', () => {
   assert.match(remove, /activateCenterTab\(next\.projectId, next\.tabId\)/);
 });
 
-test('closing a tab reads the survivor from the model, not a private copy', () => {
-  // The same question ("which pane stayed on screen"), so the same answer. The
-  // local re-derivation here matched an empty placeholder too, and activating a
-  // placeholder does nothing at all.
+test('closing a tab reads the survivor from the model, and never names a placeholder', () => {
+  // The same question ("which pane stayed on screen"), so the same answer —
+  // the local re-derivation this replaced matched an empty placeholder too,
+  // and activating a placeholder does nothing at all.
+  //
+  // Since closing a tab now EMPTIES its pane instead of removing it, the
+  // focused pane itself can be the placeholder that was just emptied: it must
+  // be skipped by the same rule, not merely by the model's own answer.
   const close = block(store, 'let splitSurvivor: SplitPane | null = null;', 'if (workspace.activeTabId === tabId)');
-  assert.match(close, /splitRes\.panes\[splitRes\.focusedIndex\] \|\| splitRes\.survivor/);
-  assert.doesNotMatch(close, /splitPanes\.find\(/);
+  assert.match(close, /focusedAfter && focusedAfter\.tabId \? focusedAfter : null/);
+  assert.match(close, /\.survivor/);
+  // The fallback scans the RESULT of the model call, never the pre-close list.
+  assert.match(close, /splitRes\.panes\.find\(\(p\) => p\.tabId\)/);
+  assert.doesNotMatch(close, /\bsplitPanes\.find\(/);
+});
+
+test('closing a TAB empties its pane; only "remove from workspace" deletes the pane', () => {
+  // Reported live: a tab open in the second column was closed from the sidebar
+  // and the whole pane went with it — the layout collapsed as a side effect of
+  // deleting something else.
+  const close = block(store, 'let splitSurvivor: SplitPane | null = null;', 'if (workspace.activeTabId === tabId)');
+  assert.match(close, /emptyPaneByClosedTab\(splitPanes, splitFocusedIndex, tabId\)/);
+  assert.doesNotMatch(close, /removePaneByTab\(/, 'closing a tab must not remove the pane');
+  // …while the explicit gesture still removes it.
+  const removeFromSplit = block(store, 'removeTabFromSplit: (tabId) => {', '\n  },');
+  assert.match(removeFromSplit, /removePaneByTab\(splitPanes, splitFocusedIndex, tabId\)/);
 });
 
 // ── Left click brings the project along ───────────────────────────────────

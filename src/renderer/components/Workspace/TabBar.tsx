@@ -19,6 +19,7 @@ import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { PaneMapCells, usePaneMapColumns } from './PaneMap';
+import { splitAvailability } from '../../utils/splitPanesModel.mjs';
 import { TabProcessBar, TabStatusMarker } from './TabSignals';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
@@ -72,6 +73,7 @@ import {
 import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
+import { acceptTabBackgroundWorkRecord } from '../../utils/tabBackgroundWorkState.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -3599,44 +3601,34 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const restartAfterScriptRunsRef = useRef<Map<string, RestartAfterScriptRunState>>(new Map());
   const [pasteBusyMap, setPasteBusyMap] = useState<Map<string, boolean>>(new Map());
   // Live background work (in-process subagents / background Bash chips)
-  // published by HistoryPanel; keeps the tab shimmer on when a Codex agent
-  // outlives its spawn turn. Display-only.
+  // published by the main-process transcript observers. Display-only.
   const [backgroundWorkMap, setBackgroundWorkMap] = useState<Map<string, boolean>>(new Map());
+  const backgroundWorkRevisionRef = useRef<Map<string, number>>(new Map());
   useEffect(() => {
-    const onBackgroundWork = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tabId?: string; count?: number } | undefined;
-      if (!detail?.tabId) return;
-      const active = (detail.count || 0) > 0;
+    // One authoritative producer: main tails provider transcripts whether or
+    // not History is mounted. A monotonically increasing revision prevents a
+    // slower startup snapshot from overwriting a newer live transition.
+    const onMainBackgroundWork = (_event: unknown, detail: {
+      tabId?: string;
+      count?: number;
+      revision?: number;
+    }) => {
+      const accepted = acceptTabBackgroundWorkRecord(
+        backgroundWorkRevisionRef.current,
+        detail,
+      );
+      if (!accepted) return;
+      const { tabId, active } = accepted;
       setBackgroundWorkMap((prev) => {
-        if ((prev.get(detail.tabId!) || false) === active) return prev;
+        if ((prev.get(tabId) || false) === active) return prev;
         const next = new Map(prev);
-        if (active) next.set(detail.tabId!, true);
-        else next.delete(detail.tabId!);
+        if (active) next.set(tabId, true);
+        else next.delete(tabId);
         return next;
       });
     };
-    // Two producers, one map:
-    //   `tab:background-work` — main-process rollout watcher, alive for every
-    //     tab regardless of which one is open. This is the real source.
-    //   `history-panel:background-work` — the open History surface. Kept as a
-    //     faster local echo for the visible tab, but it can no longer be the
-    //     only witness: a tab whose History was never opened used to show no
-    //     activity at all, and closing History zeroed a still-running agent.
-    const onMainBackgroundWork = (_event: unknown, detail: { tabId?: string; count?: number }) => {
-      if (!detail?.tabId) return;
-      const active = (Number(detail.count) || 0) > 0;
-      setBackgroundWorkMap((prev) => {
-        if ((prev.get(detail.tabId!) || false) === active) return prev;
-        const next = new Map(prev);
-        if (active) next.set(detail.tabId!, true);
-        else next.delete(detail.tabId!);
-        return next;
-      });
-    };
-    window.addEventListener('history-panel:background-work', onBackgroundWork);
     ipcRenderer.on('tab:background-work', onMainBackgroundWork);
     return () => {
-      window.removeEventListener('history-panel:background-work', onBackgroundWork);
       ipcRenderer.removeListener('tab:background-work', onMainBackgroundWork);
     };
   }, []);
@@ -4166,6 +4158,41 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
         states = result?.states || {};
       } catch (e) {
         console.warn('[TabBar:StatusSync] batch failed error='
+          + String((e as any)?.message || e));
+      }
+
+      try {
+        const background = await ipcRenderer.invoke('agent:list-background-work', { tabIds });
+        if (background?.success === true
+          && Array.isArray(background.records)) {
+          const activeByTab = new Map<string, boolean>();
+          for (const record of background.records as Array<{
+            tabId?: string;
+            count?: number;
+            revision?: number;
+          }>) {
+            const accepted = acceptTabBackgroundWorkRecord(
+              backgroundWorkRevisionRef.current,
+              record,
+            );
+            if (accepted) activeByTab.set(accepted.tabId, accepted.active);
+          }
+          setBackgroundWorkMap((prev) => {
+            const next = new Map(prev);
+            let changed = false;
+            for (const tabId of tabIds) {
+              if (!activeByTab.has(tabId)) continue;
+              const active = activeByTab.get(tabId) === true;
+              if ((next.get(tabId) || false) === active) continue;
+              changed = true;
+              if (active) next.set(tabId, true);
+              else next.delete(tabId);
+            }
+            return changed ? next : prev;
+          });
+        }
+      } catch (e) {
+        console.warn('[TabBar:BackgroundWorkSync] failed error='
           + String((e as any)?.message || e));
       }
 
@@ -10066,7 +10093,12 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
             const isActiveSingleTab = splitPanes.length === 0
               && activeProjectId === projectId
               && centerWorkspace?.activeTabId === contextMenu.tabId;
-            const splitFull = splitPanes.length >= 3;
+            // "Add to the workspace" appends a COLUMN, so the column cap
+            // decides — not the total pane count, which refused while the
+            // screen still had a free column (a stacked pair counts as two
+            // panes but occupies one column).
+            const splitFull = !splitAvailability(splitPanes, null).horizontal
+              && !splitPanes.some((p) => !p.tabId);
             const disabled = !inSplit && (splitFull || isActiveSingleTab);
             return (
               <button
@@ -10076,7 +10108,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                 title={inSplit
                   ? 'Убрать эту панель из рабочей области'
                   : splitFull
-                    ? 'Максимум 3 панели'
+                    ? 'Максимум 3 колонки. Разделить колонку по горизонтали можно из шапки панели'
                     : 'Показать вкладку второй панелью рядом с текущей'}
                 onClick={(e) => {
                   e.stopPropagation();

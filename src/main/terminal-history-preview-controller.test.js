@@ -50,6 +50,10 @@ function createHarness() {
       return {
         status: 'ready',
         reason: 'test-frame',
+        leadingPhysicalLines: snapshot.lines.filter((line) => (
+          line.row <= Number(state.marker?.line ?? 10)
+          && line.row >= Number(state.marker?.line ?? 10) - 24
+        )),
         physicalLines: snapshot.lines.filter((line) => (
           line.row > Number(state.marker?.line ?? 10)
         )),
@@ -185,6 +189,30 @@ test('Claude activity repaint cannot poison the first assistant frame', () => {
   assert.equal(h.emitted.at(-1).preview.text, 'Настоящий ответ уже печатается.');
 });
 
+test('a provider-owned block begun before the marker cannot poison the first frame', () => {
+  const h = createHarness();
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'claude',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+  });
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 9, text: '· Puzzling…', wrapped: false, hasNonDefaultFg: true },
+    {
+      row: 10,
+      text: '  ⎿ Tip: Use /permissions to pre-approve bash, edit, and',
+      wrapped: false,
+      hasNonDefaultFg: true,
+    },
+    { row: 11, text: '     MCP tools', wrapped: false, hasNonDefaultFg: true },
+    { row: 12, text: '❯ ', wrapped: false },
+  ])), false);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 0);
+  assert.match(h.logs.join('\n'), /systemBlocks=boundary-system-continuation/);
+});
+
 test('Codex activity telemetry cannot become a provisional assistant message', () => {
   const h = createHarness();
   h.controller.begin({
@@ -308,6 +336,51 @@ test('Codex search, call and compaction chrome cannot poison the first answer fr
     { row: 14, text: 'Context compacted', wrapped: false },
     { row: 15, text: '• Настоящий ответ уже печатается.', wrapped: false },
     { row: 16, text: '› ', wrapped: false },
+  ], { committedFrameGeneration: 8, writeSeq: 10 })), true);
+  h.flushTimers();
+  assert.equal(h.emitted.at(-1).preview.text, 'Настоящий ответ уже печатается.');
+});
+
+test('clipped Codex tool output and an explicitly wrapped queue card wait for real prose', () => {
+  const h = createHarness();
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+  });
+  const systemStyle = {
+    firstTextStyle: 'fg=1:8,bg=0:-1,dim',
+    hasDim: true,
+    allTextDim: true,
+    hasNonDefaultFg: true,
+  };
+  const chrome = [
+    { row: 11, text: '└ Search mixed-or-image-draft exact-original', wrapped: false, ...systemStyle },
+    { row: 12, text: '  Read main.js', wrapped: false, ...systemStyle },
+    { row: 13, text: '• Messages to be submitted after next', wrapped: false, ...systemStyle },
+    { row: 14, text: 'tool call (press esc to interrupt and', wrapped: false, ...systemStyle },
+    { row: 15, text: 'send immediately)', wrapped: false, ...systemStyle },
+    { row: 16, text: '↳ [Image #1] queued prompt', wrapped: false, ...systemStyle },
+  ];
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    ...chrome,
+    { row: 17, text: '› Implement {feature}', wrapped: false },
+  ])), false);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 0);
+  assert.match(h.logs.join('\n'), /WAIT .*systemBlocks=queue-status,tool-card/);
+
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    chrome[0],
+    chrome[1],
+    { row: 13, text: '', wrapped: false },
+    { row: 14, text: '• Настоящий ответ уже печатается.', wrapped: false },
+    { ...chrome[2], row: 15 },
+    { ...chrome[3], row: 16 },
+    { ...chrome[4], row: 17 },
+    { ...chrome[5], row: 18 },
+    { row: 19, text: '› Implement {feature}', wrapped: false },
   ], { committedFrameGeneration: 8, writeSeq: 10 })), true);
   h.flushTimers();
   assert.equal(h.emitted.at(-1).preview.text, 'Настоящий ответ уже печатается.');
@@ -730,6 +803,7 @@ test('a redraw cannot prepend a historical Codex prompt to materialized assistan
     provider: 'codex',
     sessionId: 'session-a',
     turnId: 'turn-a',
+    promptText: '[Image #1] и как это понимать',
     sourceSequence: 50,
   });
   assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
@@ -746,6 +820,11 @@ test('a redraw cannot prepend a historical Codex prompt to materialized assistan
     identity: 'assistant-51',
     canonicalText: canonical,
   }), true);
+  assert.equal(h.controller._turns.get('tab-a').promptText, '');
+  assert.equal(
+    h.controller._turns.get('tab-a').submittedPromptText,
+    '[Image #1] и как это понимать',
+  );
   h.setMarkerLine(30);
   assert.equal(h.controller.observeBoundary({
     tabId: 'tab-a',
@@ -759,9 +838,11 @@ test('a redraw cannot prepend a historical Codex prompt to materialized assistan
   state.marker.isDisposed = true;
 
   assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
-    { row: 20, text: '› [Image #1] и как это понимать', ...promptStyle },
-    { row: 21, text: '• ' + canonical, wrapped: false },
-    { row: 22, text: '› Use /skills to list available skills', wrapped: false },
+    { row: 20, text: '• Ran rg', wrapped: false },
+    { row: 21, text: '  └ old output', wrapped: false, hasDim: true, allTextDim: true },
+    { row: 22, text: '› [Image #1] и как это понимать', ...promptStyle },
+    { row: 23, text: '• ' + canonical, wrapped: false },
+    { row: 24, text: '› Use /skills to list available skills', wrapped: false },
   ], {
     committedFrameGeneration: 8,
     writeSeq: 10,
@@ -776,11 +857,13 @@ test('a redraw cannot prepend a historical Codex prompt to materialized assistan
   assert.match(h.logs.join('\n'), /WAIT .*promptRowsRemoved=1/);
 
   assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
-    { row: 20, text: '› [Image #1] и как это понимать', ...promptStyle },
-    { row: 21, text: '• ' + canonical, wrapped: false },
-    { row: 22, text: '', wrapped: false },
-    { row: 23, text: '• Новый ответ после Bash ещё не сохранён.', wrapped: false },
-    { row: 24, text: '› Use /skills to list available skills', wrapped: false },
+    { row: 20, text: '• Ran rg', wrapped: false },
+    { row: 21, text: '  └ old output', wrapped: false, hasDim: true, allTextDim: true },
+    { row: 22, text: '› [Image #1] и как это понимать', ...promptStyle },
+    { row: 23, text: '• ' + canonical, wrapped: false },
+    { row: 24, text: '', wrapped: false },
+    { row: 25, text: '• Новый ответ после Bash ещё не сохранён.', wrapped: false },
+    { row: 26, text: '› Use /skills to list available skills', wrapped: false },
   ], {
     committedFrameGeneration: 9,
     writeSeq: 11,
@@ -927,6 +1010,182 @@ test('a structured boundary never discards provisional text that is not canonica
   }), true);
   assert.equal(h.controller.get('tab-a', 'codex').text, 'answer waiting for JSONL');
   assert.match(h.logs.join('\n'), /BOUNDARY_HELD .*reason=provisional-text-not-yet-materialized/);
+});
+
+test('an exact boundary clears a raced rendered Markdown tail already saved to JSONL', () => {
+  const h = createHarness();
+  const canonical = [
+    'Три причины теперь закрыты отдельно.',
+    'Запускаю полный узкий пакет и зафиксирую причины в `terminal-history-streaming.md`.',
+  ].join('\n');
+  const renderedTail = 'Запускаю полный узкий пакет и зафиксирую причины в terminal-history-streaming.md.';
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+    sourceSequence: 50,
+  });
+  assert.equal(h.controller.observeCanonical({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    sourceSequence: 51,
+    identity: 'assistant-51',
+    canonicalText: canonical,
+  }), true);
+
+  // Model the narrow race from production: the rendered tail was published
+  // between the canonical receipt and the next exact tool receipt.
+  const state = h.controller._turns.get('tab-a');
+  state.text = renderedTail;
+  state.previewSeq = 1;
+
+  assert.equal(h.controller.observeBoundary({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    sourceSequence: 52,
+    identity: 'tool-use-52',
+    kind: 'tool-use',
+  }), true);
+  assert.equal(state.text, '');
+  assert.equal(h.emitted.at(-1).action, 'clear');
+  assert.match(
+    h.logs.join('\n'),
+    /CANONICAL_SUPPRESS .*proofAt=tool-use .*projection=terminal-inline-code/,
+  );
+});
+
+test('exact tool receipt clears a semantic Codex search projection already published from a torn frame', () => {
+  const h = createHarness();
+  const command = 'rg -n "classify|branch-status|scrolled-character-overlap|'
+    + 'provisional-text-not-yet-materialized|BOUNDARY_HELD|tool-use" '
+    + 'src/main/terminal-history-preview.js';
+  const projectedRows = [
+    { row: 11, text: 'classify|branch-status|scrol', wrapped: false },
+    { row: 12, text: 'led-', wrapped: false },
+    { row: 13, text: '           character-overlap|provisiona', wrapped: false },
+    { row: 14, text: 'l-', wrapped: false },
+    { row: 15, text: '           text-not-yet-materialized|', wrapped: false },
+    { row: 16, text: '           BOUNDARY_HELD|tool-use in', wrapped: false },
+    { row: 17, text: '           terminal-history-preview.js', wrapped: false },
+  ];
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+    sourceSequence: 30,
+  });
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame(projectedRows)), true);
+  h.flushTimers();
+  assert.equal(h.emitted.at(-1).action, 'update');
+
+  assert.equal(h.controller.observeBoundary({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    sourceSequence: 31,
+    identity: 'rg-tool-use',
+    kind: 'tool-use',
+    structuredTexts: [command],
+  }), true);
+  assert.equal(h.controller._turns.get('tab-a').text, '');
+  assert.equal(h.emitted.at(-1).action, 'clear');
+  assert.match(
+    h.logs.join('\n'),
+    /STRUCTURED_SUPPRESS .*reason=structured-projection-only .*kind=tool-use/,
+  );
+});
+
+test('exact tool receipt prevents a later torn Codex search projection from publishing', () => {
+  const h = createHarness();
+  const command = 'rg -n "classify|branch-status|scrolled-character-overlap|'
+    + 'provisional-text-not-yet-materialized|BOUNDARY_HELD|tool-use" '
+    + 'src/main/terminal-history-preview.js';
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+    sourceSequence: 30,
+  });
+  assert.equal(h.controller.observeBoundary({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    sourceSequence: 31,
+    identity: 'rg-tool-use',
+    kind: 'tool-use',
+    structuredTexts: [command],
+  }), true);
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 11, text: 'classify|branch-status|scrol', wrapped: false },
+    { row: 12, text: 'led-character-overlap|provisiona', wrapped: false },
+    { row: 13, text: 'l-text-not-yet-materialized|', wrapped: false },
+    { row: 14, text: 'BOUNDARY_HELD|tool-use in terminal-history-preview.js', wrapped: false },
+  ], {
+    committedFrameGeneration: 8,
+    writeSeq: 10,
+  })), false);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 0);
+  assert.match(
+    h.logs.join('\n'),
+    /STRUCTURED_SUPPRESS .*reason=structured-projection-only .*kind=committed-frame/,
+  );
+});
+
+test('separate Claude thinking and tool receipts clear their short-prefix projection chain', () => {
+  const h = createHarness();
+  const thinking = 'I should check the existing parser in the project and consider '
+    + 'whether to use parallel subagents for the scripting work.';
+  const command = "cd /tmp/vh-research && cat > shape.js <<'EOF'\n"
+    + "const fs=require('fs');\nconsole.log(fs.readdirSync('.'));\nEOF";
+  const projectedRows = [
+    { row: 11, text: 'the scripting work.', wrapped: false },
+    { row: 12, text: '', wrapped: false },
+    { row: 13, text: "Bash(cd /tmp/vh-research && cat > shape.js <<'EOF'", wrapped: false },
+    { row: 14, text: "      const fs=require('fs');…)", wrapped: false },
+  ];
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'claude',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+    sourceSequence: 30,
+  });
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame(projectedRows)), true);
+  h.flushTimers();
+  assert.equal(h.emitted.at(-1).action, 'update');
+
+  assert.equal(h.controller.observeBoundary({
+    tabId: 'tab-a',
+    provider: 'claude',
+    sessionId: 'session-a',
+    sourceSequence: 31,
+    identity: 'thinking-before-tool',
+    kind: 'thinking',
+    structuredTexts: [thinking],
+  }), true);
+  assert.notEqual(h.controller._turns.get('tab-a').text, '');
+
+  assert.equal(h.controller.observeBoundary({
+    tabId: 'tab-a',
+    provider: 'claude',
+    sessionId: 'session-a',
+    sourceSequence: 32,
+    identity: 'bash-after-thinking',
+    kind: 'tool-use',
+    structuredTexts: [`Bash(${command})`],
+  }), true);
+  assert.equal(h.controller._turns.get('tab-a').text, '');
+  assert.equal(h.emitted.at(-1).action, 'clear');
+  assert.match(
+    h.logs.join('\n'),
+    /STRUCTURED_SUPPRESS .*reason=structured-projection-chain-only .*kind=tool-use/,
+  );
 });
 
 test('global disable clears every provisional turn and blocks new starts', () => {

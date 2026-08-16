@@ -6,6 +6,51 @@ function imageCount(capture) {
   return Array.isArray(capture?.imagePaths) ? capture.imagePaths.length : 0;
 }
 
+const CLAUDE_IMAGE_MARKER_RE = /\[Image\s+#?(\d+)\]/g;
+const STANDALONE_LOCAL_IMAGE_PATH_RE = /^(\s*(?:[-*+]\s+)?)(?:file:\/\/)?\/.+\.(?:png|jpe?g|gif|webp|bmp|tiff?)(\s*)$/i;
+
+function expectedClaudeImageTransform(text) {
+  let imagePathCount = 0;
+  const body = String(text || '')
+    .split('\n')
+    .map((line) => {
+      const match = line.match(STANDALONE_LOCAL_IMAGE_PATH_RE);
+      if (!match) return line;
+      imagePathCount += 1;
+      return match[1].trimEnd();
+    })
+    .join('\n');
+  return { body, imagePathCount };
+}
+
+function capturedClaudeImageTransform(text) {
+  const value = String(text || '');
+  const markerPrefix = value.match(/^(?:(?:\[Image\s+#?\d+\])[ \t]*)+/)?.[0] || '';
+  const imageMarkerCount = (markerPrefix.match(CLAUDE_IMAGE_MARKER_RE) || []).length;
+  return { body: value.slice(markerPrefix.length), imageMarkerCount };
+}
+
+function exactClaudeProviderImageTransform(expectedText, capture) {
+  const images = imageCount(capture);
+  if (images <= 0) return null;
+  const durableImageCount = Array.isArray(capture?.imagePaths) ? capture.imagePaths.length : 0;
+  if (durableImageCount !== images) return null;
+  const expected = expectedClaudeImageTransform(expectedText);
+  const captured = capturedClaudeImageTransform(capture?.text);
+  if (
+    expected.imagePathCount <= 0
+    || expected.imagePathCount !== images
+    || captured.imageMarkerCount !== images
+    || expected.body !== captured.body
+  ) {
+    return null;
+  }
+  return {
+    expectedImagePathCount: expected.imagePathCount,
+    capturedImageCount: images,
+  };
+}
+
 function exactCaptureIdentityIsUsable(capture) {
   return capture?.success === true
     && capture?.editorReturnReady === true
@@ -117,9 +162,13 @@ function classifyClaudePostEnterOutcome({
   const actual = String(capture.text);
   const images = imageCount(capture);
   const exactOriginal = !!expected && images === 0 && actual === expected;
+  const providerImageTransform = exactClaudeProviderImageTransform(expected, capture);
+  const exactOwnedDraft = exactOriginal || !!providerImageTransform;
   const containsOriginal = !!expected && actual.includes(expected);
   const composerDraftState = images > 0
-    ? 'mixed-or-image-draft'
+    ? providerImageTransform
+      ? 'exact-provider-image-transform'
+      : 'mixed-or-image-draft'
     : exactOriginal
       ? 'exact-original'
       : !actual
@@ -135,21 +184,21 @@ function classifyClaudePostEnterOutcome({
       providerAccepted: null,
       providerTurnCreated: null,
       composerDraftState,
-      pasteObservedInComposer: exactOriginal || containsOriginal ? true : null,
+      pasteObservedInComposer: exactOwnedDraft || containsOriginal ? true : null,
       lateReconciliationPending: true,
       reason: transcriptRead?.error || 'claude_post_enter_transcript_unproven',
     };
   }
 
   const userRecordCount = Number(transcriptRead.userRecordCount || 0);
-  if (userRecordCount > 0 || !exactOriginal) {
+  if (userRecordCount > 0 || !exactOwnedDraft) {
     return {
       final: false,
       semanticStatus: 'unknown',
       providerAccepted: null,
       providerTurnCreated: userRecordCount > 0 ? null : false,
       composerDraftState,
-      pasteObservedInComposer: exactOriginal || containsOriginal ? true : null,
+      pasteObservedInComposer: exactOwnedDraft || containsOriginal ? true : null,
       lateReconciliationPending: true,
       reason: userRecordCount > 0
         ? 'claude_other_user_turn_after_boundary'
@@ -165,11 +214,17 @@ function classifyClaudePostEnterOutcome({
     semanticStatus: 'not-submitted',
     providerAccepted: false,
     providerTurnCreated: false,
-    composerDraftState: 'exact-original',
+    composerDraftState,
     pasteObservedInComposer: true,
     exactDraftRemained: true,
     draftPreserved: true,
     lateReconciliationPending: false,
+    ...(providerImageTransform
+      ? {
+          providerImageTransform: true,
+          ...providerImageTransform,
+        }
+      : {}),
   };
 }
 

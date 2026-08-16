@@ -7,7 +7,7 @@
    внутренний useState (для голого потребителя).
    ============================================================ */
 import React, { useState, useRef } from 'react';
-import { BrainIcon } from '../icons';
+import { BrainIcon, ChevronRightIcon } from '../icons';
 
 export interface ThinkBlockProps {
   text: string;
@@ -36,9 +36,13 @@ export const ThinkBlock: React.FC<ThinkBlockProps> = ({ text, label = 'thinking'
         onClick={toggle}
         onMouseDown={(e) => e.preventDefault()}
         className="cb-think-btn"
+        aria-expanded={isOpen}
       >
         <BrainIcon size={13} className="cb-think-ic" />
         <span className="cb-think-label">{label}</span>
+        {/* Same second-level affordance as ordinary cards: chevron appears on
+            hover, rotates open — thinking follows the one feed grammar. */}
+        <ChevronRightIcon size={11} className="cb-tool-chevron" />
       </button>
       {isOpen && (
         <div className="cb-tool-body">

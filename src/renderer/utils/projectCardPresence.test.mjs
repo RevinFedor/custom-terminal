@@ -68,3 +68,43 @@ test('missing input degrades to idle', () => {
   assert.equal(projectCardPresence({}), 'idle');
   assert.equal(projectCardPresence({ projectId: 'p1', panes: null }), 'idle');
 });
+
+
+// ── the 'working' tier ────────────────────────────────────────────────────
+
+test('the ACTIVE tab makes its project working, one step above on-screen', () => {
+  assert.equal(projectCardPresence({
+    projectId: 'p2',
+    focusedProjectId: 'p1',
+    activeProjectId: 'p2',
+    panes: [pane('p1', 'a'), pane('p2', 'b')],
+  }), 'working');
+  // The neighbouring pane's project stays plain on-screen.
+  assert.equal(projectCardPresence({
+    projectId: 'p1',
+    focusedProjectId: 'p3',
+    activeProjectId: 'p2',
+    panes: [pane('p1', 'a'), pane('p2', 'b')],
+  }), 'on-screen');
+});
+
+test('focused beats working: the explicit choice stays the loudest', () => {
+  // «Смена вкладки ≠ смена проекта»: if the working card outshone the focused
+  // one, switching a tab would READ as switching the project.
+  assert.equal(projectCardPresence({
+    projectId: 'p1',
+    focusedProjectId: 'p1',
+    activeProjectId: 'p1',
+    panes: [pane('p1', 'a')],
+  }), 'focused');
+});
+
+test('single mode: the centre tab of another project is working, not merely on-screen', () => {
+  assert.equal(projectCardPresence({
+    projectId: 'p2',
+    focusedProjectId: 'p1',
+    activeProjectId: 'p2',
+    panes: [],
+    centerProjectId: 'p2',
+  }), 'working');
+});

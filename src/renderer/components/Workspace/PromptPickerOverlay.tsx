@@ -1,19 +1,21 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { MessageSquareQuote } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Link2, MessageSquareQuote } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
-  buildPromptReferenceText,
+  buildPromptFilePathText,
   captureHistoryMenuAnchor,
   chooseContextMenuOpenLeft,
   clampFloatingPanelTop,
   isCurrentPickerGeneration,
   joinPromptInsertionText,
   placePointAnchoredMenu,
+  protectLeadingMacUsersPath,
   promptHasFileReferences,
+  resolveCascadingMenuDirection,
   resolveHistoryScriptCwd,
 } from '../../utils/promptInsertMenuModel.mjs';
 
@@ -55,8 +57,6 @@ interface ScriptRow {
   text: string;
 }
 
-// `agent` only picks the reference syntax for Cmd-insertion: Claude resolves
-// `@"path"` natively, everything else reads a bare absolute path.
 type InsertAgent = 'claude' | 'other';
 
 type InsertTarget =
@@ -120,6 +120,30 @@ function findVisibleHistoryComposerFrame(tabId: string): HTMLElement | null {
   if (!composer) return null;
   const frame = composer.closest('.hp-history-composer-frame');
   return isVisibleElement(frame) ? frame : composer;
+}
+
+function prepareFilePathInsertion(pathText: string, target: InsertTarget): string {
+  if (!pathText.startsWith('/Users/')) return pathText;
+
+  if (target.surface === 'history') {
+    const composer = findVisibleHistoryComposer(target.tabId) as HTMLTextAreaElement | null;
+    const storedDraft = useUIStore.getState().historyPromptDrafts[target.tabId] || '';
+    const current = typeof composer?.value === 'string' ? composer.value : storedDraft;
+    const selectionStart = typeof composer?.selectionStart === 'number'
+      ? Math.max(0, Math.min(composer.selectionStart, current.length))
+      : current.length;
+    return protectLeadingMacUsersPath(pathText, current.slice(0, selectionStart));
+  }
+
+  if (target.surface === 'sdk') {
+    // SDK insertion appends to the current value. Only an empty/whitespace-only
+    // composer therefore places this path at the first visible position.
+    return protectLeadingMacUsersPath(pathText, findSDKTextarea()?.value || '');
+  }
+
+  // The raw PTY owns its own cursor/input buffer, which is not represented by
+  // the renderer composer. Do not guess its insertion position here.
+  return pathText;
 }
 
 function captureShortcutMenuAnchor(
@@ -211,25 +235,49 @@ function dispatchHistoryComposerInsert(
 // One delivery contract for the shortcut picker and History's context picker.
 // Context-menu requests pass a captured target; normal Opt+V captures its
 // effective target when the picker opens. Selection never re-reads active tab.
-// `asReference` (Cmd-pick) sends the file as a path the agent resolves itself
-// instead of inlining its contents. The two modes intentionally differ in what
-// the agent reads: inlined content is sanitised on the way out (@include
-// expanded, @ai blocks stripped), a reference is whatever is on disk.
+// `asReference` (Cmd-pick) inserts only the attached file paths as ordinary,
+// editable composer text. It does not create a saved-prompt chip or use an
+// agent-specific @mention. Normal selection keeps the existing prompt flow:
+// attached files are read, sanitised and inlined into one saved prompt.
 async function deliverPrompt(prompt: PromptRow, target: InsertTarget, asReference = false) {
   const text = prompt.content || '';
   if (!text && (!prompt.file_paths || prompt.file_paths.length === 0)) return;
   const useReference = asReference && promptHasFileReferences(prompt);
-  const sourceKey = 'prompt:' + String(prompt.id ?? prompt.title)
-    + (useReference ? ':ref' : '');
+  const sourceKey = 'prompt:' + String(prompt.id ?? prompt.title);
+
+  if (useReference) {
+    const pathText = prepareFilePathInsertion(
+      buildPromptFilePathText(prompt.file_paths),
+      target,
+    );
+    if (!pathText) return;
+    if (target.surface === 'history') {
+      dispatchHistoryComposerInsert(target.tabId, pathText, 'prompt-picker-file-path');
+      return;
+    }
+    if (target.surface === 'sdk') {
+      window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
+        detail: {
+          tabId: target.tabId,
+          text: pathText,
+          source: 'prompt-picker-file-path',
+        },
+      }));
+      return;
+    }
+    await ipcRenderer.invoke('terminal:paste', {
+      tabId: target.tabId,
+      content: pathText,
+      submit: false,
+    });
+    return;
+  }
 
   if (target.surface === 'history' || target.surface === 'sdk') {
-    const chipText = useReference
-      ? buildPromptReferenceText(text, prompt.file_paths, target.agent)
-      : joinPromptInsertionText(text, await readPromptFileContents(prompt.file_paths));
+    const chipText = joinPromptInsertionText(text, await readPromptFileContents(prompt.file_paths));
     if (!chipText) return;
-    const label = useReference ? `${prompt.title} ↗` : prompt.title;
     if (target.surface === 'history') {
-      dispatchHistoryComposerInsert(target.tabId, chipText, 'prompt-picker', { label, sourceKey });
+      dispatchHistoryComposerInsert(target.tabId, chipText, 'prompt-picker', { label: prompt.title, sourceKey });
       return;
     }
     window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
@@ -238,21 +286,10 @@ async function deliverPrompt(prompt: PromptRow, target: InsertTarget, asReferenc
         text: chipText,
         source: 'prompt-picker',
         kind: 'prompt',
-        label,
+        label: prompt.title,
         sourceKey,
       },
     }));
-    return;
-  }
-
-  if (useReference) {
-    // One paste, not typed input: a typed `@` opens Claude's file typeahead
-    // character by character and the ref would end up inside its filter.
-    await ipcRenderer.invoke('terminal:paste', {
-      tabId: target.tabId,
-      content: buildPromptReferenceText(text, prompt.file_paths, target.agent),
-      submit: false,
-    });
     return;
   }
 
@@ -510,6 +547,11 @@ const PromptPickerOverlay: React.FC = () => {
   //                user-controlled offset (Settings → "Picker — отступ снизу").
   const anchor = contextRequest?.anchor || shortcutAnchor || DEFAULT_PICKER_ANCHOR;
   const pickerProjectId = contextRequest?.projectId || shortcutTarget?.projectId || null;
+  const cascadeOpensLeft = anchor.mode === 'point' && openLeftRef.current;
+  const cascadeDirection = useMemo(
+    () => resolveCascadingMenuDirection(cascadeOpensLeft),
+    [cascadeOpensLeft],
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -795,6 +837,8 @@ const PromptPickerOverlay: React.FC = () => {
 
       if (k === 'Escape') { closePicker(); return; }
 
+      const { forwardKey, backKey } = cascadeDirection;
+
       if (contextMode && pickerLevel === 'root') {
         const moveRoot = (next: 'prompts' | 'scripts') => {
           setSelectedRoot(next);
@@ -805,8 +849,8 @@ const PromptPickerOverlay: React.FC = () => {
           moveRoot(selectedRoot === 'prompts' ? 'scripts' : 'prompts');
           return;
         }
-        if (k === 'ArrowLeft') { closePicker(); return; }
-        if (k === 'ArrowRight' || k === 'Enter') {
+        if (k === backKey) { closePicker(); return; }
+        if (k === forwardKey || k === 'Enter') {
           setPickerLevel(selectedRoot === 'prompts' ? 'group' : 'scripts');
           return;
         }
@@ -821,11 +865,11 @@ const PromptPickerOverlay: React.FC = () => {
           if (scripts.length > 0) setSelectedScriptIdx((idx) => (idx - 1 + scripts.length) % scripts.length);
           return;
         }
-        if (k === 'ArrowLeft') {
+        if (k === backKey) {
           setPickerLevel('root');
           return;
         }
-        if (k === 'ArrowRight' || k === 'Enter') {
+        if (k === forwardKey || k === 'Enter') {
           const script = scripts[selectedScriptIdx];
           if (script) handleSelectScript(script);
           return;
@@ -868,14 +912,14 @@ const PromptPickerOverlay: React.FC = () => {
 
         if (k === 'ArrowDown') return moveSelection(1);
         if (k === 'ArrowUp') return moveSelection(-1);
-        if (k === 'ArrowRight') {
+        if (k === forwardKey) {
           if ((selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && rightPrompts.length > 0) {
             setPickerLevel('prompt');
             setSelectedPromptIdx(0);
           }
           return;
         }
-        if (k === 'ArrowLeft') {
+        if (k === backKey) {
           if (contextMode) setPickerLevel('root');
           else closePicker();
           return;
@@ -900,8 +944,8 @@ const PromptPickerOverlay: React.FC = () => {
           setSelectedPromptIdx(idx => (idx - 1 + rightPrompts.length) % rightPrompts.length);
           return;
         }
-        if (k === 'ArrowLeft') { setPickerLevel('group'); return; }
-        if (k === 'Enter' || k === 'ArrowRight') {
+        if (k === backKey) { setPickerLevel('group'); return; }
+        if (k === 'Enter' || k === forwardKey) {
           const p = rightPrompts[selectedPromptIdx];
           if (p) void handleSelectPrompt(p, wantsReference);
           return;
@@ -913,6 +957,7 @@ const PromptPickerOverlay: React.FC = () => {
     return () => window.removeEventListener('keydown', onKey, true);
   }, [
     closePicker,
+    cascadeDirection,
     contextMode,
     flatLeft,
     handleSelectPrompt,
@@ -1193,7 +1238,24 @@ const PromptPickerOverlay: React.FC = () => {
   const readyForPaint = contextMode || (
     loaded && pos?.measuredWithLoadedContent === true
   );
-  const opensLeftFromPoint = anchor.mode === 'point' && openLeftRef.current;
+  const opensLeftFromPoint = cascadeOpensLeft;
+  const CascadeChevron = cascadeDirection.chevron === 'left' ? ChevronLeft : ChevronRight;
+  const renderCascadeChevron = () => (
+    <span
+      aria-hidden
+      style={{
+        opacity: 0.55,
+        marginLeft: 8,
+        width: Math.max(12, Math.round(fontSize * 0.9)),
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flexShrink: 0,
+      }}
+    >
+      <CascadeChevron size={Math.max(12, Math.round(fontSize * 0.9))} strokeWidth={2} />
+    </span>
+  );
   const overlayStyle: React.CSSProperties = {
     position: 'fixed',
     left: pos ? pos.left : -9999,
@@ -1236,17 +1298,12 @@ const PromptPickerOverlay: React.FC = () => {
   const rowStyle = (
     selected: boolean,
     dimSelected = false,
-    referenceArmed = false,
   ): React.CSSProperties => ({
     padding: `${ROW_PAD_Y}px ${ROW_PAD_X}px`,
     borderRadius: 4,
     cursor: 'pointer',
     color: selected || dimSelected ? '#fff' : '#ddd',
-    background: selected
-      // Cmd over a row with files: a distinct colour, because the same click
-      // now inserts something else than it did a moment ago.
-      ? (referenceArmed ? '#0e7490' : '#9333ea')
-      : dimSelected ? '#3a1f4a' : 'transparent',
+    background: selected ? '#9333ea' : dimSelected ? '#3a1f4a' : 'transparent',
     fontSize,
     lineHeight: 1.3,
     whiteSpace: 'nowrap',
@@ -1259,15 +1316,16 @@ const PromptPickerOverlay: React.FC = () => {
   });
 
   // The slot is always rendered for prompts that carry files, so pressing Cmd
-  // only changes the icon's opacity — never the width available to the title.
+  // only changes the icon's colour/opacity — never the row background or the
+  // width available to the title.
   // A slot that appears and disappears would re-truncate every name mid-gesture.
   const referenceIconSlotStyle: React.CSSProperties = {
     flexShrink: 0,
     marginLeft: 6,
-    width: Math.round(fontSize * 1.05),
+    width: Math.round(fontSize * 1.2),
     textAlign: 'center',
     lineHeight: 1,
-    transition: 'opacity 90ms ease-out',
+    transition: 'opacity 90ms ease-out, color 90ms ease-out',
   };
   const renderReferenceIcon = (prompt: PromptRow) => {
     if (!promptHasFileReferences(prompt)) return null;
@@ -1278,11 +1336,15 @@ const PromptPickerOverlay: React.FC = () => {
         style={{
           ...referenceIconSlotStyle,
           opacity: cmdHeld ? 1 : 0.42,
-          color: cmdHeld ? '#67e8f9' : '#8b8b8b',
-          fontSize: Math.round(fontSize * 0.95),
+          color: cmdHeld ? '#3b82f6' : '#8b8b8b',
         }}
       >
-        🔗
+        <Link2
+          aria-hidden
+          size={Math.round(fontSize * 1.15)}
+          strokeWidth={2}
+          style={{ display: 'block', margin: '0 auto' }}
+        />
       </span>
     );
   };
@@ -1358,7 +1420,7 @@ const PromptPickerOverlay: React.FC = () => {
             data-history-insert-menu-root="prompts"
           >
             <span>Insert Prompt</span>
-            <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
+            {renderCascadeChevron()}
           </div>
           <div
             ref={rootScriptsRowRef}
@@ -1379,7 +1441,7 @@ const PromptPickerOverlay: React.FC = () => {
             data-history-insert-menu-root="scripts"
           >
             <span>Scripts</span>
-            <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
+            {renderCascadeChevron()}
           </div>
         </div>
       )}
@@ -1437,7 +1499,7 @@ const PromptPickerOverlay: React.FC = () => {
                     )}
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.project.name}</span>
                   </span>
-                  <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
+                  {renderCascadeChevron()}
                 </div>
               );
             }
@@ -1467,7 +1529,7 @@ const PromptPickerOverlay: React.FC = () => {
                   <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {item.group.name}
                   </span>
-                  <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
+                  {renderCascadeChevron()}
                 </div>
               );
             }
@@ -1485,11 +1547,7 @@ const PromptPickerOverlay: React.FC = () => {
                   setSelectedPromptIdx(0);
                 }}
                 onClick={(event) => { void handleSelectPrompt(item.prompt, event.metaKey); }}
-                style={rowStyle(
-                  isSelected,
-                  false,
-                  isSelected && cmdHeld && promptHasFileReferences(item.prompt),
-                )}
+                style={rowStyle(isSelected)}
               >
                 <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                   {item.prompt.title}
@@ -1554,7 +1612,7 @@ const PromptPickerOverlay: React.FC = () => {
                       setSelectedPromptIdx(i);
                     }}
                     onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
-                    style={rowStyle(isSelected, false, isSelected && cmdHeld && promptHasFileReferences(p))}
+                    style={rowStyle(isSelected)}
                     title={p.relativePath || p.path || p.title}
                   >
                     <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
@@ -1593,7 +1651,7 @@ const PromptPickerOverlay: React.FC = () => {
                         setSelectedPromptIdx(i);
                       }}
                       onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
-                      style={rowStyle(isSelected, false, isSelected && cmdHeld && promptHasFileReferences(p))}
+                      style={rowStyle(isSelected)}
                       title={p.relativePath || p.path || p.title}
                     >
                       <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>

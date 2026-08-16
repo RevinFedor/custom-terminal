@@ -12,7 +12,14 @@ import {
   resolveSplitAttachRowHeight,
   TAB_CARD_LINE_HEIGHT,
 } from '../../utils/tabCardVisual.mjs';
-import { isEmptyPane, paneGridRects } from '../../utils/splitPanesModel.mjs';
+import {
+  isEmptyPane,
+  paneGridRects,
+  normalizeSplitSizes,
+  resizeFractions,
+  splitAvailability,
+  splitDividerDescriptors,
+} from '../../utils/splitPanesModel.mjs';
 import { paneFrameState } from '../../utils/paneSwitcherScope.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { openTabContextMenuAt } from './TabBar';
@@ -51,14 +58,15 @@ export function useSplitAttachRowHeight(): number {
   return resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize });
 }
 
-// Equal columns, equal rows inside a column; v1 has no draggable divider.
-// Geometry comes from the pure model so the rectangles and the layout rules can
-// never disagree — see splitPanesModel::paneGridRects.
+// Fractional columns, fractional rows inside a column (equal when sizes are
+// absent). Geometry comes from the pure model so the rectangles and the layout
+// rules can never disagree — see splitPanesModel::paneGridRects.
 export function splitPaneRectStyle(
   paneIndex: number,
   panes: Array<{ projectId: string; tabId: string; column?: number }>,
+  sizes: { cols: number[]; rows: number[][] } | null = null,
 ): React.CSSProperties {
-  const rect = paneGridRects(panes)[paneIndex];
+  const rect = paneGridRects(panes, sizes)[paneIndex];
   if (!rect) return { position: 'absolute', inset: 0 };
   return {
     position: 'absolute',
@@ -127,7 +135,11 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
   const taskItems = taskPlan?.items || [];
   const displayProjectName = projectName || workspacePath.split('/').filter(Boolean).pop() || 'Project';
-  const canSplit = splitPanes.length < 3 && !splitPanes.some(isEmptyPane);
+  // The button STAYS and greys out at the limit instead of disappearing: a
+  // control that vanishes reads as a bug ("кнопка пропала"), a greyed one with
+  // a tooltip states the rule. Each direction is asked about separately —
+  // three columns full does not mean this column cannot still be stacked.
+  const splitCan = splitAvailability(splitPanes, paneIndex ?? null);
   const inSplit = splitPanes.length > 0;
 
   const commitRename = () => {
@@ -269,7 +281,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           data-split-pane-tab-chip
           data-tab-id={tabId}
           title={inSplit
-            ? 'Клик — перейти на вкладку. Средний клик — убрать из рабочей области'
+            ? 'Клик — перейти на вкладку. Средний клик — убрать вкладку из этого окна (окно останется)'
             : 'Клик — перейти на вкладку'}
           onMouseEnter={() => setTabChipHovered(true)}
           onMouseLeave={() => setTabChipHovered(false)}
@@ -317,26 +329,29 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
             openTabContextMenuAt(projectId, tabId, e.clientX, e.clientY);
           }}
           onAuxClick={(e) => {
-            // Middle-click removes THIS pane from the split — same gesture as
-            // closing a tab in the sidebar list. No ✕ button needed.
+            // Middle-click takes this tab OUT OF THE WINDOW: the pane stays and
+            // becomes an empty placeholder, and the tab keeps living in the
+            // sidebar list — it is not closed. Closing the window itself is the
+            // placeholder's own ✕, so a stray middle-click can never destroy a
+            // layout the user built.
             //
             // It acts on the tab NAMED IN THIS CHIP and on nothing else. The
             // guard below is not defensive noise: the row is also rendered in
             // single mode from the CENTER tab, so a stale/foreign tabId here
-            // would silently remove a pane the user is not even looking at.
+            // would silently empty a pane the user is not even looking at.
             if (e.button !== 1 || !inSplit) return;
             const paneOfThisTab = useWorkspaceStore.getState().splitPanes
               .some((p) => p.projectId === projectId && p.tabId === tabId);
             if (!paneOfThisTab) return;
             e.preventDefault();
             e.stopPropagation();
-            // A file pane steps BACK to whatever this pane showed before it —
-            // the pane stays, only its content changes. Opening a file from an
-            // agent and middle-clicking it is "undo that", not "close this
-            // pane". Falls through to removal when there is nothing to step
-            // back to, so the gesture is never a dead click.
+            // A file pane steps BACK to whatever this pane showed before it.
+            // Opening a file from an agent and middle-clicking it is "undo
+            // that", not "clear this window" — the pane returns to its previous
+            // tab instead of going empty. Falls through to clearing when there
+            // is nothing to step back to, so the gesture is never dead.
             if (useWorkspaceStore.getState().restoreSplitPanePreviousTab(tabId)) return;
-            useWorkspaceStore.getState().removeTabFromSplit(tabId);
+            useWorkspaceStore.getState().clearTabFromSplitPane(tabId);
           }}
           style={{
             // The signals below are absolutely positioned against THIS chip.
@@ -463,46 +478,72 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
 
       <span style={{ flex: 1 }} />
 
-      {canSplit && (
-        <button
-          title="Разделить рабочую область. Правый клик — разделить по горизонтали"
-          onClick={(e) => {
-            e.stopPropagation();
+      <button
+        data-split-button
+        data-split-horizontal={splitCan.horizontal ? '1' : '0'}
+        data-split-vertical={splitCan.vertical ? '1' : '0'}
+        title={splitCan.horizontal
+          ? 'Разделить рабочую область. Правый клик — разделить по горизонтали'
+          : splitCan.vertical
+            ? 'Три колонки уже открыты. Правый клик — разделить эту колонку по горизонтали'
+            : splitCan.reason === 'placeholder'
+              ? 'Сначала выберите вкладку для пустой панели'
+              : 'Рабочая область заполнена: три колонки, в этой уже две строки'}
+        onClick={(e) => {
+          e.stopPropagation();
+          // Left click means "split sideways". When only the vertical
+          // direction is left, the click OPENS THE MENU instead of doing
+          // nothing: the gesture keeps leading somewhere, and the menu is the
+          // place that names the remaining direction.
+          if (splitCan.horizontal) {
             useWorkspaceStore.getState().addEmptySplitPane(paneIndex ?? null);
-          }}
-          // Right-click offers the OTHER direction. Two commands rather than a
-          // modifier: "above" and "below" are not one action with a flag, and a
-          // menu can say which pane it will act on.
-          onContextMenu={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            setSplitMenu({ x: e.clientX, y: e.clientY });
-          }}
-          onPointerDown={(e) => {
-            e.stopPropagation();
-            // Left press may focus; a right press opens a menu ABOUT this pane
-            // and must not move focus out from under it.
-            if (e.button !== 0) e.preventDefault();
-          }}
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            width: 18,
-            height: 18,
-            borderRadius: 4,
-            cursor: 'pointer',
-            background: 'transparent',
-            border: 'none',
-            color: '#8f8f94',
-            flexShrink: 0,
-          }}
-          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.10)'; (e.currentTarget as HTMLElement).style.color = '#eee'; }}
-          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; (e.currentTarget as HTMLElement).style.color = '#8f8f94'; }}
-        >
-          <Columns2 size={12} />
-        </button>
-      )}
+          } else if (splitCan.vertical) {
+            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            setSplitMenu({ x: r.left, y: r.bottom });
+          }
+        }}
+        // Right-click offers the OTHER direction. Two commands rather than a
+        // modifier: "above" and "below" are not one action with a flag, and a
+        // menu can say which pane it will act on.
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (!splitCan.vertical) return;
+          setSplitMenu({ x: e.clientX, y: e.clientY });
+        }}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          // Left press may focus; a right press opens a menu ABOUT this pane
+          // and must not move focus out from under it.
+          if (e.button !== 0) e.preventDefault();
+        }}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 18,
+          height: 18,
+          borderRadius: 4,
+          cursor: (splitCan.horizontal || splitCan.vertical) ? 'pointer' : 'not-allowed',
+          background: 'transparent',
+          border: 'none',
+          // Dimmed, not gone: the control keeps its place in the row so the
+          // header layout never shifts when the last slot is taken.
+          color: (splitCan.horizontal || splitCan.vertical) ? '#8f8f94' : '#4a4a4e',
+          flexShrink: 0,
+        }}
+        onMouseEnter={(e) => {
+          if (!splitCan.horizontal && !splitCan.vertical) return;
+          (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.10)';
+          (e.currentTarget as HTMLElement).style.color = '#eee';
+        }}
+        onMouseLeave={(e) => {
+          (e.currentTarget as HTMLElement).style.background = 'transparent';
+          (e.currentTarget as HTMLElement).style.color = (splitCan.horizontal || splitCan.vertical) ? '#8f8f94' : '#4a4a4e';
+        }}
+      >
+        <Columns2 size={12} />
+      </button>
 
       {/* Rendered through a portal: the header is 26px tall with overflow
           clipping, so an inline menu would be cut off at the first row. */}
@@ -579,6 +620,19 @@ export const SPLIT_PANE_FOCUS_FRAME_Z = 200;
  */
 export const SPLIT_PANE_CONTENT_INSET_PX = 2;
 
+/**
+ * Contour shown while the cursor is over an UNFOCUSED pane.
+ *
+ * Its job is to explain the swallowed first click BEFORE it happens: the
+ * pane lights up under the cursor, so "this click will select this pane"
+ * is visible in advance instead of felt afterwards as a dead click.
+ *
+ * Between the two neighbour states (0.08 side lines) and the active-but-no-
+ * keyboard state (0.30 full contour): loud enough to notice, quiet enough not
+ * to be mistaken for focus itself.
+ */
+export const SPLIT_PANE_HOVER_RING = 'inset 0 0 0 1px rgba(255,255,255,0.20)';
+
 // White focus frame of the focused pane; hairline separator on the others.
 export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
   // The frame now answers TWO questions with one mark: which pane is active,
@@ -613,14 +667,207 @@ export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
         // is carried by brightness, not by weight. 0.75 → 0.30 is a fourfold
         // drop and still a full contour against the neighbours' two 0.08 side
         // lines, so all three states stay distinguishable.
-        boxShadow: state === 'owns-keyboard'
-          ? 'inset 0 0 0 1px rgba(255,255,255,0.75)'
+        // The idle frame leaves its box-shadow to the STYLESHEET (see
+        // globals.css: `[data-split-pane-frame-state="idle"]`), because that is
+        // the only state with a :hover variant — and an inline box-shadow here
+        // would win over any :hover rule, which is exactly why the first
+        // CSS-only attempt rendered nothing at all.
+        ...(state === 'owns-keyboard'
+          ? { boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.75)' }
           : state === 'active-only'
-            ? 'inset 0 0 0 1px rgba(255,255,255,0.30)'
-            : 'inset -1px 0 0 rgba(255,255,255,0.08), inset 1px 0 0 rgba(255,255,255,0.08)',
+            ? { boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.30)' }
+            : null),
         transition: 'box-shadow 0.12s ease',
       }}
     />
+  );
+}
+
+// ── Resizable dividers ────────────────────────────────────────────────────
+
+/** 6px grab strip centred on the 1px boundary — same feel as the TabSidebar
+ *  handle, and the same violet: violet already means "drag me" here. */
+const SPLIT_DIVIDER_HIT_PX = 6;
+const SPLIT_DIVIDER_HOVER_BG = 'rgba(99,102,241,0.4)';
+
+type LiveSizes = { cols: number[]; rows: number[][] };
+
+/**
+ * One layer over the whole split, hosting every divider strip.
+ *
+ * The live drag does NOT write the store: pane wrappers are positioned
+ * directly in the DOM from the in-flight fractions, and the store learns the
+ * result once, on mouseup (commitSplitSizes). A store write per mousemove
+ * would rebuild the terminals memo — every pane of every project — at
+ * pointer speed. The strips themselves follow via this component's local
+ * state, which re-renders only this thin layer.
+ */
+export function SplitDividerLayer() {
+  const panes = useWorkspaceStore((s) => s.splitPanes);
+  const committedSizes = useWorkspaceStore((s) => s.splitSizes);
+  const [liveSizes, setLiveSizes] = useState<LiveSizes | null>(null);
+  const layerRef = React.useRef<HTMLDivElement | null>(null);
+  const liveRef = React.useRef<LiveSizes | null>(null);
+  // The strip's violet is managed by HAND (mouseenter/leave + drag), never by
+  // the style prop: this layer re-renders on every drag move to keep the strip
+  // under the pointer, and a React-managed background would be wiped by each
+  // of those renders the moment the prop reads undefined.
+  const draggingIdRef = React.useRef<string | null>(null);
+  const cancelDragRef = React.useRef<(() => void) | null>(null);
+
+  // A pane write mid-drag (tab closed elsewhere, project closed — pane
+  // HISTORY purges rewrite the array too) invalidates both the in-flight
+  // fractions and the grab-time baseline: cancel, and put the wrappers back
+  // on the COMMITTED geometry ourselves. The memo cannot be relied on for
+  // that — a same-tabIds write (history purge) changes neither its key nor
+  // the sizes fingerprint, so nothing else would ever repaint the wrappers
+  // out of their mid-drag positions.
+  useEffect(() => {
+    if (!cancelDragRef.current && !liveRef.current) return;
+    cancelDragRef.current?.();
+    liveRef.current = null;
+    setLiveSizes(null);
+    const host = layerRef.current?.parentElement;
+    if (!host || panes.length < 2) return;
+    const rects = paneGridRects(panes, useWorkspaceStore.getState().splitSizes);
+    host.querySelectorAll<HTMLElement>('[data-terminal-pane-wrapper][data-split-pane-index]').forEach((el) => {
+      const idx = Number(el.getAttribute('data-split-pane-index'));
+      const rect = rects[idx];
+      if (!rect) return;
+      el.style.left = `${rect.leftPct}%`;
+      el.style.width = `${rect.widthPct}%`;
+      el.style.top = `${rect.topPct}%`;
+      el.style.height = `${rect.heightPct}%`;
+    });
+  }, [panes]);
+
+  if (panes.length < 2) return null;
+  const sizes = liveSizes ?? committedSizes;
+  const dividers = splitDividerDescriptors(panes, sizes);
+  if (dividers.length === 0) return null;
+
+  // Reposition the pane wrappers straight in the DOM — the exact styles the
+  // memo would write, minus the memo. Wrapper lookup by the pane-index attr
+  // works because the wrappers are SIBLINGS of this layer in the same host.
+  const applyLiveGeometry = (next: LiveSizes) => {
+    const host = layerRef.current?.parentElement;
+    if (!host) return;
+    const rects = paneGridRects(panes, next);
+    host.querySelectorAll<HTMLElement>('[data-terminal-pane-wrapper][data-split-pane-index]').forEach((el) => {
+      const idx = Number(el.getAttribute('data-split-pane-index'));
+      const rect = rects[idx];
+      if (!rect) return;
+      el.style.left = `${rect.leftPct}%`;
+      el.style.width = `${rect.widthPct}%`;
+      el.style.top = `${rect.topPct}%`;
+      el.style.height = `${rect.heightPct}%`;
+    });
+  };
+
+  const startDrag = (
+    e: React.MouseEvent,
+    divider: ReturnType<typeof splitDividerDescriptors>[number],
+  ) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const layer = layerRef.current;
+    const strip = e.currentTarget as HTMLElement;
+    if (!layer) return;
+    const hostRect = layer.getBoundingClientRect();
+    if (hostRect.width === 0 || hostRect.height === 0) return;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    // Drag math runs against the sizes AT GRAB TIME (normalized to the current
+    // structure), so the min-size clamp never accumulates across moves.
+    const base = normalizeSplitSizes(panes, sizes) as LiveSizes;
+    draggingIdRef.current = divider.id;
+    strip.style.background = SPLIT_DIVIDER_HOVER_BG;
+    const onMove = (ev: MouseEvent) => {
+      let next: LiveSizes;
+      if (divider.kind === 'col') {
+        const deltaFr = (ev.clientX - startX) / hostRect.width;
+        next = { cols: resizeFractions(base.cols, divider.dividerIndex, deltaFr), rows: base.rows };
+      } else {
+        // Columns are full height, so a row's fraction is of the host height.
+        const deltaFr = (ev.clientY - startY) / hostRect.height;
+        const rows = base.rows.map((r, c) => (
+          c === divider.columnIndex ? resizeFractions(r, divider.dividerIndex, deltaFr) : r
+        ));
+        next = { cols: base.cols, rows };
+      }
+      liveRef.current = next;
+      setLiveSizes(next); // repositions the strips (this thin layer only)
+      applyLiveGeometry(next); // repositions the pane wrappers, no store write
+    };
+    const stopListening = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      draggingIdRef.current = null;
+      cancelDragRef.current = null;
+      if (!strip.matches(':hover')) strip.style.background = '';
+    };
+    const onUp = () => {
+      stopListening();
+      const finalSizes = liveRef.current;
+      liveRef.current = null;
+      setLiveSizes(null);
+      // ONE store write per finished drag. The memo then repaints the wrappers
+      // from the same fractions the DOM already shows — no visual jump. A
+      // clean click (no move) commits nothing, which is what lets dblclick
+      // below mean "reset" without the two mousedowns fighting it.
+      if (finalSizes) useWorkspaceStore.getState().commitSplitSizes(finalSizes);
+    };
+    cancelDragRef.current = stopListening;
+    document.body.style.cursor = divider.kind === 'col' ? 'col-resize' : 'row-resize';
+    document.body.style.userSelect = 'none';
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
+
+  return (
+    <div
+      ref={layerRef}
+      data-split-divider-layer
+      aria-hidden
+      style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 5 }}
+    >
+      {dividers.map((d) => (
+        <div
+          key={d.id}
+          data-split-divider={d.id}
+          onMouseDown={(e) => startDrag(e, d)}
+          // Double-click = back to the equal split, all dividers at once.
+          // (Micro-jitter between the two clicks is harmless: a near-equal
+          // drag packs to null anyway — see EQUAL_EPS in the model.)
+          onDoubleClick={() => useWorkspaceStore.getState().commitSplitSizes(null)}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = SPLIT_DIVIDER_HOVER_BG; }}
+          onMouseLeave={(e) => {
+            if (draggingIdRef.current !== d.id) (e.currentTarget as HTMLElement).style.background = '';
+          }}
+          style={{
+            position: 'absolute',
+            pointerEvents: 'auto',
+            ...(d.kind === 'col'
+              ? {
+                left: `calc(${d.xPct}% - ${SPLIT_DIVIDER_HIT_PX / 2}px)`,
+                top: 0,
+                bottom: 0,
+                width: SPLIT_DIVIDER_HIT_PX,
+                cursor: 'col-resize',
+              }
+              : {
+                top: `calc(${d.yPct}% - ${SPLIT_DIVIDER_HIT_PX / 2}px)`,
+                left: `${d.leftPct}%`,
+                width: `${d.widthPct}%`,
+                height: SPLIT_DIVIDER_HIT_PX,
+                cursor: 'row-resize',
+              }),
+          }}
+        />
+      ))}
+    </div>
   );
 }
 

@@ -45,6 +45,15 @@ test('paste, Enter, manual input, and Ctrl+G leave causal input boundaries', () 
     programmaticEnter > 0 && submitWrite > programmaticEnter && submitWrite - programmaticEnter < 900,
     'the final safe-paste submit boundary must record its exact input before writing it',
   );
+  const submitTraceStart = main.lastIndexOf(
+    'const forensicSubmitInput = recordComposerForensicPtyInput',
+    programmaticEnter,
+  );
+  const submitBoundary = main.slice(submitTraceStart, submitWrite);
+  assert.ok(submitTraceStart > 0 && submitTraceStart < programmaticEnter);
+  assert.match(submitBoundary, /const forensicSubmitInput = recordComposerForensicPtyInput/);
+  assert.match(submitBoundary, /stagedClaudeAudit\.forensicEnterInputId = forensicSubmitInput\.id/);
+  assert.match(submitBoundary, /stagedClaudeAudit\.forensicEnterAt = forensicSubmitInput\.at/);
   assert.match(main, /phase:\s*'renderer-received'[\s\S]{0,280}source:\s*'terminal:input'/);
   assert.match(main, /source:\s*'manual-terminal-enter'[\s\S]{0,300}term\.write\(data\)/);
   const ctrlGTrace = main.indexOf("kind: 'ctrl-g'");
@@ -68,4 +77,40 @@ test('a screen-versus-exact-input contradiction persists one latest JSON artifac
   assert.match(artifact, /agent-draft-forensics-\$\{safeTab\}-latest\.json/);
   assert.match(artifact, /fs\.promises\.rename\(temporaryPath, artifactPath\)/);
   assert.match(artifact, /\[AgentDraftProof:FORENSIC_ARTIFACT\]/);
+});
+
+test('an unresolved Claude post-Enter proof persists one scoped attempt artifact', () => {
+  assert.match(main, /snapshotTerminalComposerForensicWindow/);
+  assert.match(main, /persistTerminalSendForensicArtifact/);
+
+  const inspectStart = main.indexOf('async function inspectClaudePostEnterTimeoutAtWriteBoundary(');
+  const inspectEnd = main.indexOf('function waitForClaudePasteAudit(', inspectStart);
+  const inspect = main.slice(inspectStart, inspectEnd);
+  const successBeforeCapture = inspect.indexOf('audit?.finished === true && audit.result?.success === true');
+  const persistence = inspect.indexOf('persistClaudePostEnterForensicArtifact({');
+  assert.ok(successBeforeCapture >= 0 && persistence > successBeforeCapture);
+  assert.match(inspect, /diagnosticArtifactPath/);
+
+  const helperStart = main.indexOf('async function persistClaudePostEnterForensicArtifact(');
+  const helperEnd = main.indexOf("ipcMain.on('terminal:draft-screen-diagnostic-response'", helperStart);
+  const helper = main.slice(helperStart, helperEnd);
+  assert.match(helper, /inputId: audit\.forensicEnterInputId/);
+  assert.match(helper, /sendAttemptId: audit\.sendAttemptId/);
+  assert.match(helper, /postEnterForensicDiscardRequested/);
+  assert.match(helper, /\[ClaudePostEnterForensics\] saved/);
+});
+
+test('late exact Claude delivery removes a provisional post-Enter incident artifact', () => {
+  const finishStart = main.indexOf('function finishClaudePasteAudit(');
+  const finishEnd = main.indexOf('function settleClaudePasteAuditWithoutProjection(', finishStart);
+  const finish = main.slice(finishStart, finishEnd);
+  assert.match(finish, /result\?\.success === true/);
+  assert.match(finish, /discardClaudePostEnterForensicArtifact\(audit, 'exact-user-turn-confirmed'\)/);
+
+  const discardStart = main.indexOf('function discardClaudePostEnterForensicArtifact(');
+  const discardEnd = main.indexOf('async function persistClaudePostEnterForensicArtifact(', discardStart);
+  const discard = main.slice(discardStart, discardEnd);
+  assert.match(discard, /postEnterForensicDiscardRequested = true/);
+  assert.match(discard, /postEnterForensicArtifactPromise\.then/);
+  assert.match(discard, /removeClaudePostEnterForensicArtifact/);
 });

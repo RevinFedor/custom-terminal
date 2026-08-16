@@ -96,6 +96,10 @@ function immutableCopy(value) {
 }
 
 function isExactProviderNotAcceptedReceipt(receipt = {}) {
+  const exactProviderImageTransform = receipt?.composerDraftState === 'exact-provider-image-transform'
+    && receipt?.providerImageTransform === true
+    && Number(receipt?.expectedImagePathCount) > 0
+    && Number(receipt?.expectedImagePathCount) === Number(receipt?.capturedImageCount);
   return receipt?.success === false
     && receipt?.submitted === true
     && receipt?.pasteWritten === true
@@ -103,7 +107,7 @@ function isExactProviderNotAcceptedReceipt(receipt = {}) {
     && receipt?.semanticStatus === 'not-submitted'
     && receipt?.providerAccepted === false
     && receipt?.providerTurnCreated === false
-    && receipt?.composerDraftState === 'exact-original'
+    && (receipt?.composerDraftState === 'exact-original' || exactProviderImageTransform)
     && receipt?.exactDraftRemained === true
     && receipt?.draftPreserved === true
     && receipt?.lateReconciliationPending === false;

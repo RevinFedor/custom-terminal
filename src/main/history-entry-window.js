@@ -1,5 +1,8 @@
 'use strict';
 
+const path = require('path');
+const { historyActionHeadline } = require(path.join(__dirname, '..', 'shared', 'history-action-grammar.cjs'));
+
 function normalizePositiveInt(value, fallback = null, max = 20_000) {
   if (value == null || value === '') return fallback;
   const parsed = Math.floor(Number(value));
@@ -133,7 +136,70 @@ function applyHistoryEntryWindow(entries, bounds = null) {
  *   - the last `alwaysHydrateTail` rows (the composer, tail-pin, live
  *     projection and "what just happened" all read the tail).
  */
-const HISTORY_ROW_STUB_FIELDS = ['uuid', 'role', 'timestamp', 'sessionId'];
+const HISTORY_ROW_STUB_FIELDS = ['uuid', 'role', 'timestamp', 'sessionId', 'messageId', 'textPhase'];
+
+/**
+ * Grouping metadata a stub must keep. The display-side series collapsing
+ * groups rows into families (read/search/git/run/edit/mcp/…); if stubs lost
+ * that identity, moving the hydration window would change group composition —
+ * display-list length would change from mere scrolling, and the position
+ * would jump. The invariant the owner demands: grouping(any window position)
+ * is structurally identical to grouping(fully hydrated rows). So the stub
+ * carries exactly the fields grouping reads, and grouping may read ONLY
+ * fields that exist on both stubs and full rows.
+ */
+function stubActionSummary(actions) {
+  if (!Array.isArray(actions) || actions.length === 0) return undefined;
+  const summary = [];
+  for (const action of actions) {
+    if (!action || typeof action !== 'object') continue;
+    if (action.tool === '__raw__' && action.rawTool) {
+      const raw = action.rawTool;
+      summary.push({
+        toolUseId: raw.toolUseId,
+        toolName: raw.toolName,
+        family: raw.family,
+        bashWord: raw.bashWord,
+        bashDetail: raw.bashDetail,
+        mcpServer: raw.mcpServer,
+        mcpMethod: raw.mcpMethod,
+        // Subject of the call, so a collapsed group's digest can name the
+        // FILES it touched even while the rows are still stubs (the args that
+        // would yield it are exactly what a stub omits). Kept to the last two
+        // path segments — the digest never shows a full path.
+        subject: stubActionSubject(raw),
+        isError: raw.isError === true ? true : undefined,
+      });
+    } else if (action.tool === 'Task') {
+      summary.push({ toolUseId: action.toolUseId, toolName: 'Task', family: 'task' });
+    }
+  }
+  return summary.length > 0 ? summary : undefined;
+}
+
+/** Short human subject for the group digest: a file name, a pattern, a git subcommand. */
+function stubActionSubject(raw) {
+  try {
+    const headline = historyActionHeadline({
+      toolName: raw.toolName,
+      args: raw.args,
+      family: raw.family,
+      bashWord: raw.bashWord,
+      bashDetail: raw.bashDetail,
+      mcpServer: raw.mcpServer,
+      mcpMethod: raw.mcpMethod,
+    });
+    const subject = String(headline.subject || '');
+    if (!subject) return undefined;
+    if (subject.includes('/')) {
+      const parts = subject.split('/').filter(Boolean);
+      return parts[parts.length - 1] || undefined;
+    }
+    return subject.length > 60 ? subject.slice(0, 60) : subject;
+  } catch {
+    return undefined;
+  }
+}
 
 function makeHistoryRowStub(entry) {
   const stub = { rowStub: true };
@@ -143,6 +209,11 @@ function makeHistoryRowStub(entry) {
   // sourceIdentity is how live rows and durable rows recognise each other;
   // dropping it would make a live row duplicate its own durable twin.
   if (entry.sourceIdentity !== undefined) stub.sourceIdentity = entry.sourceIdentity;
+  // Whether the row has visible text matters to grouping (text ends a series);
+  // ship the fact without the content.
+  if (typeof entry.content === 'string' && entry.content.trim()) stub.hasContent = true;
+  const actionSummary = stubActionSummary(entry.actions);
+  if (actionSummary) stub.actionSummary = actionSummary;
   return stub;
 }
 

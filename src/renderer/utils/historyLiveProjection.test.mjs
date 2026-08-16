@@ -505,6 +505,11 @@ test('assistant text, thinking, and tool calls project to one FullHistory-like e
         toolUseId: 'tool-1',
         toolName: 'Read',
         args: { file_path: '/tmp/state.json' },
+        // Grouping identity stamped for live rows (same as durable parser).
+        family: 'read',
+        bashWord: undefined,
+        mcpServer: undefined,
+        mcpMethod: undefined,
       },
     }],
     sessionId: 'session-a',
@@ -670,6 +675,10 @@ test('tool result enriches its existing action and never creates a user row', ()
     toolUseId: 'tool-1',
     toolName: 'Bash',
     args: { command: 'pwd' },
+    family: 'run',
+    bashWord: 'pwd',
+    mcpServer: undefined,
+    mcpMethod: undefined,
     result: '/Users/fedor',
     isError: false,
   });

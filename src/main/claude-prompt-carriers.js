@@ -22,6 +22,36 @@ function extractQueuedCommandPromptText(prompt) {
   return '';
 }
 
+function claudeInternalAgentContinuationKind(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text) return null;
+  if (text.startsWith('<task-notification>') && text.endsWith('</task-notification>')) {
+    return 'task-notification';
+  }
+  if (/^<agent-message(?:\s[^>]*)?>[\s\S]*<\/agent-message>$/.test(text)) {
+    return 'agent-message';
+  }
+  return null;
+}
+
+function claudeInternalAgentContinuationKindFromEntry(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  if (entry.type === 'attachment' && entry?.attachment?.type === 'queued_command') {
+    if (entry.attachment.commandMode === 'task-notification') return 'task-notification';
+    return claudeInternalAgentContinuationKind(
+      extractQueuedCommandPromptText(entry.attachment.prompt),
+    );
+  }
+  if (entry.type !== 'user') return null;
+  const content = entry.message?.content;
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.find((item) => item?.type === 'text' && typeof item.text === 'string')?.text
+      : '';
+  return claudeInternalAgentContinuationKind(text);
+}
+
 function extractClaudeQueueOperationPromptText(entry) {
   if (entry?.type !== 'queue-operation' || entry?.operation !== 'enqueue') return null;
   const text = typeof entry.content === 'string' ? entry.content : '';
@@ -29,22 +59,17 @@ function extractClaudeQueueOperationPromptText(entry) {
 }
 
 function isClaudeTaskNotificationCarrier(entry) {
-  if (!entry || typeof entry !== 'object') return false;
+  if (entry?.type === 'attachment'
+    && entry?.attachment?.type === 'queued_command'
+    && entry.attachment.commandMode === 'task-notification') return true;
+  return claudeInternalAgentContinuationKindFromEntry(entry) === 'task-notification';
+}
 
-  if (entry.type === 'attachment' && entry?.attachment?.type === 'queued_command') {
-    const text = extractQueuedCommandPromptText(entry.attachment.prompt).trimStart();
-    return entry.attachment.commandMode === 'task-notification'
-      || text.startsWith('<task-notification>');
-  }
-
-  if (entry.type !== 'user') return false;
-  const content = entry.message?.content;
-  const text = typeof content === 'string'
-    ? content
-    : Array.isArray(content)
-      ? content.find((item) => item?.type === 'text' && typeof item.text === 'string')?.text
-      : '';
-  return String(text || '').trimStart().startsWith('<task-notification>');
+function isClaudeInternalAgentContinuationCarrier(entry) {
+  if (entry?.type === 'attachment'
+    && entry?.attachment?.type === 'queued_command'
+    && entry.attachment.commandMode === 'task-notification') return true;
+  return claudeInternalAgentContinuationKindFromEntry(entry) !== null;
 }
 
 function extractClaudePromptCarrier(entry) {
@@ -54,7 +79,7 @@ function extractClaudePromptCarrier(entry) {
   // launched that exact tool.  Treating this service carrier as a prompt
   // splits one orchestration result into several fake turns and leaves the
   // originating run permanently "incomplete" even after end_turn.
-  if (isClaudeTaskNotificationCarrier(entry)) return null;
+  if (isClaudeInternalAgentContinuationCarrier(entry)) return null;
   if (entry?.type === 'attachment' && entry?.attachment?.type === 'queued_command') {
     const text = extractQueuedCommandPromptText(entry.attachment.prompt);
     if (!text.trim()) return null;
@@ -172,10 +197,13 @@ function findMatchingClaudePromptTurn({
 }
 
 module.exports = {
+  claudeInternalAgentContinuationKind,
+  claudeInternalAgentContinuationKindFromEntry,
   extractClaudeQueueOperationPromptText,
   extractClaudePromptCarrier,
   extractQueuedCommandPromptText,
   findMatchingClaudePromptTurn,
+  isClaudeInternalAgentContinuationCarrier,
   isClaudeTaskNotificationCarrier,
   promptFingerprint,
   selectClaudeQueuedPromptIndex,

@@ -83,7 +83,12 @@ function warnTimelineTextSearchDiag(message: string) {
 }
 
 const REWIND_BUSY_GUARD_RE = /\bis busy; wait for the current turn before rewind\b/i;
-const HISTORY_SCROLL_SAFETY_TIMEOUT_MS = 8000;
+// Must exceed HistoryPanel's JUMP_STUB_HYDRATION_WAIT_MS (20s): a jump into a
+// row-window stub legitimately waits for main to hydrate a cold giant before
+// converging, and clearing the dot spinner earlier would silently ignore the
+// real found/failed ack that follows. This timer only covers "the panel never
+// answered at all" (e.g. no session).
+const HISTORY_SCROLL_SAFETY_TIMEOUT_MS = 22000;
 const EXPANDED_PREVIEW_CHARS_PER_LINE = 180;
 const EXPANDED_PREVIEW_MIN_CHARS = 240;
 const EXPANDED_PREVIEW_MAX_CHARS = 1800;

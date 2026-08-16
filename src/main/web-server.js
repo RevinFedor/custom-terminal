@@ -3088,6 +3088,10 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
         resultTurnIndex: Number.isInteger(probe.turnIndex) ? probe.turnIndex : null,
         resultUserUuid: probe.userUuid || null,
         resultPromptCarrierKind: probe.promptCarrierKind || null,
+        resultInternalContinuationCount: Math.max(
+          0,
+          Number(probe.internalContinuationCount) || 0,
+        ),
         resultProofStatus: resultComplete ? 'complete' : 'awaiting-transcript',
         resultProofObservedSize: Number.isFinite(Number(sourceSnapshot?.size))
           ? Number(sourceSnapshot.size)
@@ -3177,6 +3181,18 @@ async function processOrchestrationLifecycle(tabId, payload) {
     const store = getOrchestrationRunStore();
     if (payload.type === 'busy' || payload.type === 'done') {
       const result = await store.applyLifecycle(tabId, payload);
+      const internal = (result.changed || []).find((run) => (
+        run.waitingForInternalDescendants === true
+        || payload.internalAgentContinuation
+      ));
+      if (internal) {
+        console.log('[OrchestrationInternalWork] run=' + internal.runId
+          + ' tab=' + shortId(tabId, 12)
+          + ' event=' + payload.type
+          + ' continuation=' + String(payload.internalAgentContinuation || '-')
+          + ' background=' + (payload.backgroundWorkCount ?? '-')
+          + ' waiting=' + (internal.waitingForInternalDescendants === true));
+      }
       emitOrchestrationChanges(result.changed, 'target-lifecycle');
       await finalizeSettledOrchestrations(result.settled, 'target-settled');
     }
@@ -3316,6 +3332,7 @@ async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
     resultTerminalEvent: probe.terminalEvent || null,
     resultTerminalReason: probe.terminalOutcomeReason || null,
     resultHasFinalResult: probe.hasFinalResult === true,
+    internalContinuationCount: Math.max(0, Number(probe.internalContinuationCount) || 0),
     turnIndex: probe.turnIndex,
   });
   if (reconciled.changed) emitOrchestrationRun(reconciled.changed, reason);

@@ -21,7 +21,7 @@ const CODEX_LEADING_COMPOSER_PROMPT_RE = new RegExp(
   `^[\\t ]*(?:${CODEX_COMPOSER_PROMPT_ALTERNATION})(?=\\s|$)\\s*`,
   'u',
 );
-const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Find and fix a bug|Explain this codebase|Ask Codex|directory:\s*|permissions:\s*|Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed|Try\s+new\s+model|Use\s+existing\s+model/i;
+const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Find and fix a bug|Explain this codebase|Ask Codex|directory:\s*|permissions:\s*|Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed|Try\s+new\s+model|Use\s+existing\s+model|Resume paused goal\?/i;
 // Only the stable prefix belongs to the settings contract. Everything after
 // the separator is presentation owned by Codex (`Full Access`, Context, cwd,
 // Goal achieved, or a future replacement) and must not gate readiness.

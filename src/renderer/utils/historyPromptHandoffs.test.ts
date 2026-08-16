@@ -184,6 +184,90 @@ test('a queued prompt switches to SENDING only when its exact PTY transfer begin
   assert.equal(store.getSnapshot('tab-busy')[0]?.queueStatus, 'audit-pending');
 });
 
+test('exact Claude provider queue evidence replaces CONFIRMING and resists the later caller timeout', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  store.begin({
+    tabId: 'tab-provider-queue',
+    handoffId: 'handoff-provider-queue',
+    sendAttemptId: 'attempt-provider-queue',
+    sendOperationKey: 'history:tab-provider-queue:handoff-provider-queue',
+    toolType: 'claude',
+    text: 'run after the current Claude response',
+    statusAtSend: 'busy',
+    initialStatus: 'queued',
+    submittedAt: 100,
+  });
+  store.advanceTransportPhase('tab-provider-queue', 'handoff-provider-queue', 'sending');
+  store.advanceTransportPhase('tab-provider-queue', 'handoff-provider-queue', 'confirming');
+  assert.equal(
+    store.getSnapshot('tab-provider-queue')[0]?.queueStatus,
+    'audit-pending',
+  );
+
+  const accepted = store.acceptProviderQueue(
+    'tab-provider-queue',
+    'handoff-provider-queue',
+    {
+      sendAttemptId: 'attempt-provider-queue',
+      sendOperationKey: 'history:tab-provider-queue:handoff-provider-queue',
+      changedAt: 200,
+    },
+  );
+  assert.equal(accepted?.queueStatus, 'queued');
+  assert.equal(accepted?.statusReason, 'provider-queue-accepted');
+
+  const timedOut = store.settle('tab-provider-queue', 'handoff-provider-queue', {
+    queueStatus: 'audit-pending',
+    reason: 'send-submitted-audit-pending',
+    changedAt: 300,
+  });
+  assert.strictEqual(timedOut, accepted,
+    'a weaker timeout cannot erase exact native queue acceptance');
+
+  const confirmed = store.settle('tab-provider-queue', 'handoff-provider-queue', {
+    queueStatus: 'sent',
+    reason: 'late-audit-confirmed',
+    changedAt: 400,
+    proof: {
+      auditTimestamp: '2026-08-16T02:04:48.014Z',
+      actualHash: 'confirmed-hash',
+      sessionId: 'session-provider-queue',
+      entryUuid: 'queued-command-provider-queue',
+    },
+  });
+  assert.equal(confirmed?.queueStatus, 'sent');
+});
+
+test('provider queue evidence with a foreign durable attempt cannot change the History row', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  store.begin({
+    tabId: 'tab-provider-queue-foreign',
+    handoffId: 'handoff-provider-queue-foreign',
+    sendAttemptId: 'attempt-current',
+    sendOperationKey: 'history:current',
+    toolType: 'claude',
+    text: 'same text is not identity',
+    statusAtSend: 'active',
+  });
+  store.advanceTransportPhase(
+    'tab-provider-queue-foreign',
+    'handoff-provider-queue-foreign',
+    'confirming',
+  );
+  const before = store.getSnapshot('tab-provider-queue-foreign')[0];
+  const after = store.acceptProviderQueue(
+    'tab-provider-queue-foreign',
+    'handoff-provider-queue-foreign',
+    {
+      sendAttemptId: 'attempt-foreign',
+      sendOperationKey: 'history:foreign',
+      changedAt: 300,
+    },
+  );
+  assert.strictEqual(after, before);
+  assert.equal(after?.queueStatus, 'audit-pending');
+});
+
 test('settle preserves exact handoff identity and immutable audit proof', () => {
   const store = new HistoryPromptHandoffStore(limits());
   begin(store, 'tab-a', 'handoff-a');
@@ -942,6 +1026,100 @@ test('a durable desktop History receipt rebuilds the exact pending row after ren
   assert.equal(handoff.queueStatus, 'audit-pending');
   assert.equal(handoff.text, 'durable prompt');
   consumeHistoryPromptHandoff(tabId, handoffId);
+});
+
+test('a durable exact Claude queue receipt remounts as QUEUED instead of CONFIRMING', () => {
+  const tabId = 'tab-durable-provider-queue';
+  const handoffId = 'handoff-durable-provider-queue';
+  const operationKey = `history:${tabId}:${handoffId}`;
+  const attemptId = 'attempt-durable-provider-queue';
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey,
+    surface: 'desktop-history',
+    tabId,
+    handoffId,
+    provider: 'claude',
+    sessionId: 'session-durable-provider-queue',
+    state: 'audit-pending',
+    attemptId,
+    createdAt: 100,
+    updatedAt: 160,
+    receipt: {
+      source: 'history-panel',
+      promptText: 'already accepted into the native Claude queue',
+      presentationSnapshot: { promptChips: [], imagePaths: [] },
+      providerQueue: {
+        accepted: true,
+        provider: 'claude',
+        operationKey,
+        attemptId,
+        acceptedAt: '2026-08-16T01:58:27.200Z',
+        entryUuid: 'queue-operation-durable',
+        recordByteOffset: 84,
+      },
+    },
+  });
+  assert.equal(outcome.hydrated, true);
+  assert.equal(outcome.handoff?.queueStatus, 'queued');
+  assert.equal(outcome.handoff?.statusReason, 'durable-provider-queue-accepted');
+  consumeHistoryPromptHandoff(tabId, handoffId);
+});
+
+test('stale queue metadata cannot mask an unconfirmed restart receipt', () => {
+  const tabId = 'tab-stale-provider-queue';
+  const handoffId = 'handoff-stale-provider-queue';
+  const operationKey = `history:${tabId}:${handoffId}`;
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey,
+    surface: 'desktop-history',
+    tabId,
+    handoffId,
+    provider: 'claude',
+    sessionId: 'session-stale-provider-queue',
+    state: 'delivery-unknown',
+    attemptId: 'attempt-stale-provider-queue',
+    createdAt: 100,
+    updatedAt: 200,
+    receipt: {
+      source: 'history-panel',
+      promptText: 'restart made the final delivery outcome unknown',
+      providerQueue: {
+        accepted: true,
+        provider: 'claude',
+        operationKey,
+        attemptId: 'attempt-stale-provider-queue',
+      },
+    },
+  });
+  assert.equal(outcome.hydrated, true);
+  assert.equal(outcome.handoff?.queueStatus, 'delivery-unknown');
+  consumeHistoryPromptHandoff(tabId, handoffId);
+});
+
+test('a dismissed unconfirmed receipt stays hidden after renderer reload', () => {
+  const tabId = 'tab-durable-dismissed';
+  const handoffId = 'handoff-durable-dismissed';
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey: `history:${tabId}:${handoffId}`,
+    surface: 'desktop-history',
+    tabId,
+    handoffId,
+    provider: 'claude',
+    sessionId: 'session-durable-dismissed',
+    state: 'delivery-unknown',
+    attemptId: 'attempt-durable-dismissed',
+    createdAt: 100,
+    updatedAt: 140,
+    receipt: {
+      source: 'history-panel',
+      promptText: 'do not show this warning again',
+      presentationDismissedAt: 130,
+      presentationDismissedSurface: 'desktop-history',
+    },
+  });
+  assert.equal(outcome.hydrated, false);
+  assert.equal(outcome.reason, 'durable-history-presentation-dismissed');
+  assert.deepEqual(getHistoryPromptHandoffsSnapshot(tabId), []);
 });
 
 test('durable confirmation hydrates as one final SENT snapshot without transient SENDING', () => {

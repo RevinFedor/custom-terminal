@@ -64,14 +64,17 @@ async function loadExactQueueOwnershipClassifier() {
   return loaded.exports.queueSendTransferredOwnership;
 }
 
-function buildAppendInputCaller(safePasteResult) {
+function buildAppendInputCaller(safePasteResult, onSafePaste = null) {
   const callbackSource = extractIpcHandler(mainPath, 'claude:append-input');
   const term = { write() {} };
   const context = vm.createContext({
     CLAUDE_PASTE_AUDIT_TIMEOUT_MS: 8_000,
     console: { log() {}, warn() {}, error() {} },
     hasLiveClaudeInTab: () => true,
-    safePasteAndSubmit: async () => ({ ...safePasteResult }),
+    safePasteAndSubmit: async (_term, _text, options) => {
+      onSafePaste?.(options);
+      return { ...safePasteResult };
+    },
     terminals: new Map([['tab-replay', term]]),
   });
   return new vm.Script(`(${callbackSource})`, {
@@ -122,4 +125,34 @@ test('F2 strongest counterexample: post-Enter audit timeout still transfers Repl
 
   assert.equal(receipt.submitted, true);
   assert.equal(queueSendTransferredOwnership(receipt), true);
+});
+
+test('Cmd+Replay forwards the image presentation snapshot into the audited submit path', async () => {
+  let safePasteOptions = null;
+  const appendInput = buildAppendInputCaller({
+    success: true,
+    submitted: true,
+    pasteWritten: true,
+  }, (options) => {
+    safePasteOptions = options;
+  });
+  const presentationSnapshot = {
+    promptChips: [{ id: 'prompt-1', kind: 'prompt', label: 'Saved', text: 'saved' }],
+    imagePaths: [{
+      id: 1,
+      path: '/managed/' + 'e'.repeat(64) + '.png',
+      assetId: 'e'.repeat(64) + '.png',
+      mediaType: 'image/png',
+      size: 10,
+      availability: 'available',
+    }],
+  };
+
+  await appendInput({}, 'tab-replay', '[imagePath: /managed/image.png] body', {
+    submit: true,
+    source: 'prompt-queue-replay',
+    presentationSnapshot,
+  });
+
+  assert.deepEqual(safePasteOptions.presentationSnapshot, presentationSnapshot);
 });

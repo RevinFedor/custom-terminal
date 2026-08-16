@@ -116,6 +116,11 @@ export interface BindHistoryPromptHandoffSendIdentityInput {
   sendOperationKey?: string | null;
 }
 
+export interface AcceptHistoryPromptHandoffProviderQueueInput
+  extends BindHistoryPromptHandoffSendIdentityInput {
+  changedAt?: number;
+}
+
 export interface DurableHistorySendReceiptRecord {
   operationKey?: string | null;
   surface?: string | null;
@@ -137,6 +142,7 @@ export interface DurableHistorySendReceiptRecord {
   } | null;
   presentation?: {
     attemptId?: string | null;
+    surface?: string | null;
     provider?: string | null;
     sessionId?: string | null;
     entryUuid?: string | null;
@@ -248,6 +254,7 @@ export type HistoryPromptHandoffChange =
   | { type: 'replay' }
   | { type: 'begin'; handoffId: string }
   | { type: 'transport-phase'; handoffId: string }
+  | { type: 'provider-queue-accepted'; handoffId: string }
   | { type: 'bind-send-identity'; handoffId: string }
   | { type: 'settle'; handoffId: string }
   | { type: 'retract'; handoffId: string; reason: string }
@@ -895,6 +902,55 @@ export class HistoryPromptHandoffStore {
     return next;
   }
 
+  acceptProviderQueue(
+    tabIdValue: string,
+    handoffIdValue: string,
+    input: AcceptHistoryPromptHandoffProviderQueueInput = {},
+  ): Readonly<HistoryPromptHandoff> | undefined {
+    const tabId = requireKey(tabIdValue, 'tabId');
+    const handoffId = requireKey(handoffIdValue, 'handoffId');
+    const tab = this.tabs.get(tabId);
+    const current = tab?.get(handoffId);
+    if (!tab || !current) return undefined;
+    if (!historyPromptHandoffAcceptsAuditIdentity(current.value, input)) {
+      return current.value;
+    }
+    if (
+      current.value.queueStatus === 'sent'
+      || current.value.queueStatus === 'cancelled'
+      || current.value.queueStatus === 'failed'
+    ) {
+      return current.value;
+    }
+
+    const statusChangedAt = Math.max(
+      current.value.statusChangedAt,
+      finiteTimestamp(input.changedAt, Date.now()),
+    );
+    if (
+      current.value.queueStatus === 'queued'
+      && current.value.statusReason === 'provider-queue-accepted'
+      && current.value.statusChangedAt === statusChangedAt
+    ) {
+      return current.value;
+    }
+    const next = freezeHandoff({
+      ...current.value,
+      queueStatus: 'queued',
+      statusReason: 'provider-queue-accepted',
+      statusChangedAt,
+    });
+    const approxBytes = estimateHandoffBytes(next);
+    if (approxBytes > this.limits.maxBytes) return undefined;
+    this.approxBytes += approxBytes - current.approxBytes;
+    tab.set(handoffId, { value: next, approxBytes });
+    this.promoteTab(tabId);
+    this.enforceLimits(tabId, handoffId);
+    if (!this.tabs.get(tabId)?.has(handoffId)) return undefined;
+    this.notify(tabId, { type: 'provider-queue-accepted', handoffId });
+    return next;
+  }
+
   bindSendIdentity(
     tabIdValue: string,
     handoffIdValue: string,
@@ -977,6 +1033,18 @@ export class HistoryPromptHandoffStore {
       // audit. They are weaker observations, not permission to resurrect
       // CONFIRMING or erase the writer UUID. A new begin with a fresh attempt
       // id is the only reset boundary.
+      return current.value;
+    }
+    const currentHasProviderQueueReceipt = current.value.queueStatus === 'queued'
+      && current.value.statusReason === 'provider-queue-accepted';
+    if (
+      currentHasProviderQueueReceipt
+      && (input.queueStatus === 'audit-pending' || input.queueStatus === 'delivery-unknown')
+    ) {
+      // Claude's exact queue-operation is stronger than the caller timeout
+      // that follows it. The timeout still leaves the final transcript audit
+      // pending, but it cannot turn an accepted provider queue item back into
+      // CONFIRMING/UNCONFIRMED.
       return current.value;
     }
 
@@ -1367,6 +1435,12 @@ export const advanceHistoryPromptHandoffTransportPhase = (
   phase: HistoryPromptHandoffTransportPhase,
 ) => historyPromptHandoffStore.advanceTransportPhase(tabId, handoffId, phase);
 
+export const acceptHistoryPromptHandoffProviderQueue = (
+  tabId: string,
+  handoffId: string,
+  input: AcceptHistoryPromptHandoffProviderQueueInput = {},
+) => historyPromptHandoffStore.acceptProviderQueue(tabId, handoffId, input);
+
 export const settleHistoryPromptHandoff = (
   tabId: string,
   handoffId: string,
@@ -1476,6 +1550,12 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
       restorableDraft: promptText,
     };
   }
+  if (
+    Number.isFinite(Number(receipt.presentationDismissedAt))
+    && receipt.presentationDismissedSurface === 'desktop-history'
+  ) {
+    return { hydrated: false, reason: 'durable-history-presentation-dismissed' };
+  }
   if (record.presentation) {
     return { hydrated: false, reason: 'durable-history-presentation-already-materialized' };
   }
@@ -1483,8 +1563,20 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   const presentation = receipt.presentationSnapshot && typeof receipt.presentationSnapshot === 'object'
     ? receipt.presentationSnapshot
     : {};
+  const providerQueue = receipt.providerQueue && typeof receipt.providerQueue === 'object'
+    ? receipt.providerQueue
+    : {};
+  const exactProviderQueueAccepted = (
+    record.state === 'audit-pending'
+    || record.state === 'enter-armed'
+  )
+    && providerQueue.accepted === true
+    && providerQueue.provider === 'claude'
+    && providerQueue.operationKey === operationKey
+    && providerQueue.attemptId === attemptId;
   let queueStatus: SettledHistoryPromptHandoffStatus | null = null;
   if (record.state === 'confirmed') queueStatus = 'sent';
+  else if (exactProviderQueueAccepted) queueStatus = 'queued';
   else if (record.state === 'audit-pending') queueStatus = 'audit-pending';
   else if (record.state === 'delivery-unknown' || record.state === 'enter-armed') {
     queueStatus = 'delivery-unknown';
@@ -1549,6 +1641,8 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
         queueStatus,
         reason: queueStatus === 'sent'
           ? 'durable-audit-confirmed'
+          : queueStatus === 'queued'
+            ? 'durable-provider-queue-accepted'
           : queueStatus === 'audit-pending'
             ? 'durable-audit-pending'
             : 'durable-delivery-unknown',

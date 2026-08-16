@@ -289,10 +289,113 @@ function snapshotTerminalComposerForensics(trace, options = {}) {
   };
 }
 
+function sameTerminalIdentity(candidate, anchor) {
+  if (!candidate || !anchor) return false;
+  for (const field of ['terminalRunSeq', 'lifecycleGeneration', 'mirrorGeneration']) {
+    const expected = anchor[field];
+    if (expected === null || expected === undefined || expected === '') continue;
+    if (candidate[field] !== expected) return false;
+  }
+  return true;
+}
+
+function resolveForensicInputAnchor(inputs, options = {}) {
+  const inputId = finiteOrNull(options.inputId);
+  if (inputId !== null) {
+    const exact = inputs.find((entry) => Number(entry?.id) === inputId);
+    if (exact) return exact;
+  }
+
+  const handoffId = options.handoffId || null;
+  const sendAttemptId = options.sendAttemptId || null;
+  const sendOperationKey = options.sendOperationKey || null;
+  const candidates = inputs.filter((entry) => {
+    if (!['programmatic-enter', 'programmatic-submit'].includes(entry?.kind)) return false;
+    if (sendAttemptId && entry?.sendAttemptId !== sendAttemptId) return false;
+    if (sendOperationKey && entry?.sendOperationKey !== sendOperationKey) return false;
+    if (handoffId && entry?.handoffId !== handoffId) return false;
+    return !!(sendAttemptId || sendOperationKey || handoffId);
+  });
+  return candidates.at(-1) || null;
+}
+
+function snapshotTerminalComposerForensicWindow(trace, options = {}) {
+  const snapshot = snapshotTerminalComposerForensics(trace, options);
+  if (!snapshot) return null;
+
+  const anchor = resolveForensicInputAnchor(snapshot.inputs, options);
+  if (!anchor) {
+    return {
+      ...snapshot,
+      window: {
+        anchorFound: false,
+        requestedInputId: finiteOrNull(options.inputId),
+        reason: 'exact-enter-checkpoint-not-found',
+      },
+      transitions: snapshot.transitions.slice(-Math.max(1, Number(options.fallbackTransitions) || 8)),
+      inputs: snapshot.inputs.slice(-Math.max(1, Number(options.fallbackInputs) || 16)),
+    };
+  }
+
+  const matchingTransitions = snapshot.transitions.filter((entry) => sameTerminalIdentity(
+    entry?.frame,
+    anchor,
+  ));
+  let lastBeforeIndex = -1;
+  for (let index = 0; index < matchingTransitions.length; index += 1) {
+    if (Number(matchingTransitions[index]?.at) <= Number(anchor.at)) lastBeforeIndex = index;
+  }
+  const beforeTransitions = Math.max(1, Number(options.beforeTransitions) || 4);
+  const startIndex = lastBeforeIndex >= 0
+    ? Math.max(0, lastBeforeIndex - beforeTransitions + 1)
+    : 0;
+  const selectedTransitions = matchingTransitions.slice(startIndex);
+
+  const attemptInputs = snapshot.inputs.filter((entry) => {
+    if (!sameTerminalIdentity(entry, anchor)) return false;
+    if (anchor.sendAttemptId && entry?.sendAttemptId === anchor.sendAttemptId) return true;
+    if (anchor.sendOperationKey && entry?.sendOperationKey === anchor.sendOperationKey) return true;
+    if (anchor.handoffId && entry?.handoffId === anchor.handoffId) return true;
+    return Number(entry?.id) === Number(anchor.id);
+  });
+  const attemptStartAt = attemptInputs.reduce((earliest, entry) => (
+    Math.min(earliest, Number(entry?.at) || Number(anchor.at))
+  ), Number(anchor.at));
+  const transitionStartAt = selectedTransitions.length > 0
+    ? Number(selectedTransitions[0]?.at) || Number(anchor.at)
+    : Number(anchor.at);
+  const windowStartAt = Math.min(attemptStartAt, transitionStartAt, Number(anchor.at));
+  const selectedInputs = snapshot.inputs.filter((entry) => (
+    sameTerminalIdentity(entry, anchor)
+    && Number(entry?.at) >= windowStartAt
+    && Number(entry?.at) <= Number(snapshot.capturedAt)
+  ));
+
+  return {
+    ...snapshot,
+    window: {
+      anchorFound: true,
+      anchorInputId: anchor.id,
+      anchorAt: anchor.at,
+      startAt: windowStartAt,
+      endAt: snapshot.capturedAt,
+      terminalRunSeq: anchor.terminalRunSeq,
+      lifecycleGeneration: anchor.lifecycleGeneration,
+      mirrorGeneration: anchor.mirrorGeneration,
+      handoffId: anchor.handoffId,
+      sendAttemptId: anchor.sendAttemptId,
+      sendOperationKey: anchor.sendOperationKey,
+    },
+    transitions: selectedTransitions,
+    inputs: selectedInputs,
+  };
+}
+
 module.exports = {
   createTerminalComposerForensics,
   observeTerminalComposerFrame,
   recordTerminalComposerInput,
   recordTerminalComposerOutput,
+  snapshotTerminalComposerForensicWindow,
   snapshotTerminalComposerForensics,
 };

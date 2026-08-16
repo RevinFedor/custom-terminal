@@ -131,6 +131,33 @@ class PromptQueueAssetStore {
     };
   }
 
+  existingManagedRefSync(ref) {
+    const explicitAssetId = normalizeAssetId(ref?.assetId);
+    const pathAssetId = isPathInside(this.rootDir, ref?.path) ? normalizeAssetId(ref?.path) : null;
+    const assetId = explicitAssetId || pathAssetId;
+    if (!assetId) return null;
+    const filePath = this.assetPath(assetId);
+    let stat = null;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      return null;
+    }
+    if (!stat.isFile()) return null;
+    const touchedAt = new Date(this.now());
+    fs.utimes(filePath, touchedAt, touchedAt, () => {});
+    const extension = path.extname(assetId).slice(1);
+    return {
+      ...ref,
+      assetId,
+      path: filePath,
+      mediaType: ref?.mediaType || mediaTypeFromExtension(extension),
+      size: stat.size,
+      availability: 'available',
+      error: undefined,
+    };
+  }
+
   async finalizeTemporaryFile(tempPath, ref = {}) {
     const digest = await hashFile(tempPath);
     const extension = normalizeExtension(ref.path, ref.mediaType);

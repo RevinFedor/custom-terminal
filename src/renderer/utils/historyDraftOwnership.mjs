@@ -21,6 +21,34 @@ export function resolveInterruptedPromptOwnership({
   return 'pending';
 }
 
+const normalizeInterruptedPromptDraftProof = (value) => String(value || '')
+  .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+  .replace(/\[200~/g, '')
+  .replace(/~\]/g, '')
+  .replace(/\r\n?/g, '\n')
+  .replace(/\[imagePath:\s*[^\]\r\n]+?\s*\]/gi, '[Image]')
+  .replace(/\[imageError:\s*[^\]\r\n]+?\s*\]/gi, '[Image]')
+  .replace(/\[Image(?:\s+#?\d+)?\]/gi, '[Image]')
+  .trim();
+
+/**
+ * Interrupt recovery may accept only the transformations already performed by
+ * the terminal transport: CRLF canonicalization, paste control fragments and
+ * image placeholder aliases. Interior whitespace remains identity-bearing — a
+ * tab, an extra space or a newline cannot prove ownership of another draft.
+ */
+export function interruptedPromptDraftMatchesHandoff({
+  returnedDraft = '',
+  presentationText = '',
+  transportText = '',
+} = {}) {
+  const returned = normalizeInterruptedPromptDraftProof(returnedDraft);
+  if (!returned) return false;
+  return [presentationText, transportText].some((candidate) => (
+    normalizeInterruptedPromptDraftProof(candidate) === returned
+  ));
+}
+
 function separatorBetween(left, right) {
   if (!left || !right) return '';
   const trailingNewlines = left.match(/\n+$/)?.[0].length || 0;

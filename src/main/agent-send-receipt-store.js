@@ -38,6 +38,17 @@ const ACTIVE_ATTEMPT_STATES = new Set([
   STORE_STATES.ENTER_ARMED,
 ]);
 
+const STARTUP_UNCONFIRMED_STATES = new Set([
+  STORE_STATES.DELIVERY_UNKNOWN,
+  STORE_STATES.AUDIT_PENDING,
+]);
+
+const DISMISSIBLE_PRESENTATION_STATES = new Set([
+  STORE_STATES.ENTER_ARMED,
+  STORE_STATES.DELIVERY_UNKNOWN,
+  STORE_STATES.AUDIT_PENDING,
+]);
+
 const REPLAY_STATES = new Set([
   STORE_STATES.IN_FLIGHT,
   STORE_STATES.ENTER_ARMED,
@@ -169,6 +180,7 @@ function rowToRecord(row) {
     } : null,
     presentation: row.presentation_at ? {
       attemptId: row.presentation_attempt_id,
+      surface: row.presentation_surface,
       provider: row.presentation_provider,
       sessionId: row.presentation_session_id,
       entryUuid: row.presentation_entry_uuid,
@@ -280,6 +292,7 @@ class AgentSendReceiptStore {
         audit_source_identity TEXT,
         audit_timestamp TEXT,
         presentation_attempt_id TEXT,
+        presentation_surface TEXT,
         presentation_provider TEXT,
         presentation_session_id TEXT,
         presentation_entry_uuid TEXT,
@@ -304,6 +317,7 @@ class AgentSendReceiptStore {
       ['audit_source_identity', 'TEXT'],
       ['audit_timestamp', 'TEXT'],
       ['presentation_attempt_id', 'TEXT'],
+      ['presentation_surface', 'TEXT'],
       ['presentation_provider', 'TEXT'],
       ['presentation_session_id', 'TEXT'],
       ['presentation_entry_uuid', 'TEXT'],
@@ -359,6 +373,7 @@ class AgentSendReceiptStore {
             audit_source_identity = NULL,
             audit_timestamp = NULL,
             presentation_attempt_id = NULL,
+            presentation_surface = NULL,
             presentation_provider = NULL,
             presentation_session_id = NULL,
             presentation_entry_uuid = NULL,
@@ -393,6 +408,14 @@ class AgentSendReceiptStore {
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
           AND state = 'in-flight'
+      `),
+      markProviderQueueAccepted: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET receipt_json = @receiptJson,
+            updated_at = @updatedAt
+        WHERE operation_key = @operationKey
+          AND attempt_id = @attemptId
+          AND state IN ('enter-armed', 'audit-pending')
       `),
       settle: this.db.prepare(`
         UPDATE ${TABLE_NAME}
@@ -439,6 +462,7 @@ class AgentSendReceiptStore {
       acknowledgePresentation: this.db.prepare(`
         UPDATE ${TABLE_NAME}
         SET presentation_attempt_id = @attemptId,
+            presentation_surface = @surface,
             presentation_provider = @provider,
             presentation_session_id = @sessionId,
             presentation_entry_uuid = @entryUuid,
@@ -446,9 +470,16 @@ class AgentSendReceiptStore {
             presentation_at = @acknowledgedAt
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
-          AND surface = @surface
           AND state = 'confirmed'
           AND presentation_at IS NULL
+      `),
+      dismissPresentation: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET receipt_json = @receiptJson,
+            updated_at = @dismissedAt
+        WHERE operation_key = @operationKey
+          AND attempt_id = @attemptId
+          AND state IN ('enter-armed', 'delivery-unknown', 'audit-pending')
       `),
       startupInFlight: this.db.prepare(`
         SELECT * FROM ${TABLE_NAME}
@@ -473,6 +504,14 @@ class AgentSendReceiptStore {
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
           AND state = 'enter-armed'
+      `),
+      markStartupUnconfirmed: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET state = 'delivery-unknown', receipt_json = @receiptJson, updated_at = @updatedAt,
+            settled_at = NULL
+        WHERE operation_key = @operationKey
+          AND attempt_id = @attemptId
+          AND state IN ('audit-pending', 'delivery-unknown')
       `),
       pruneSettled: this.db.prepare(`
         DELETE FROM ${TABLE_NAME}
@@ -772,6 +811,128 @@ class AgentSendReceiptStore {
     })();
   }
 
+  markProviderQueueAccepted(operationKeyInput, attemptIdInput, evidenceInput = {}) {
+    const operationKey = requiredString(operationKeyInput, 'operationKey');
+    const attemptId = requiredString(attemptIdInput, 'attemptId');
+    const evidence = evidenceInput && typeof evidenceInput === 'object'
+      ? evidenceInput
+      : {};
+    const provider = requiredString(evidence.provider, 'provider');
+    return this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
+      if (record.attemptId !== attemptId) {
+        return { ok: false, applied: false, stale: true, reason: 'stale-attempt', record };
+      }
+      if (record.provider && record.provider !== provider) {
+        return { ok: false, applied: false, reason: 'provider-mismatch', record };
+      }
+      if (record.state === STORE_STATES.CONFIRMED) {
+        return {
+          ok: true,
+          applied: false,
+          idempotent: true,
+          reason: 'already-confirmed',
+          record,
+        };
+      }
+
+      const updatedAt = this.now();
+      const acceptedAt = optionalAuditTimestamp(evidence.acceptedAt)
+        || new Date(updatedAt).toISOString();
+      const sessionId = optionalString(evidence.sessionId);
+      const entryUuid = optionalString(evidence.entryUuid);
+      const recordByteOffset = evidence.recordByteOffset !== null
+        && evidence.recordByteOffset !== undefined
+        && Number.isSafeInteger(Number(evidence.recordByteOffset))
+        && Number(evidence.recordByteOffset) >= 0
+        ? Number(evidence.recordByteOffset)
+        : null;
+      const previousReceipt = record.receipt && typeof record.receipt === 'object'
+        ? record.receipt
+        : {};
+      const previousQueue = previousReceipt.providerQueue
+        && typeof previousReceipt.providerQueue === 'object'
+        ? previousReceipt.providerQueue
+        : null;
+      if (previousQueue?.accepted === true) {
+        const conflicts = [];
+        if (previousQueue.provider && previousQueue.provider !== provider) conflicts.push('provider');
+        if (previousQueue.sessionId && sessionId && previousQueue.sessionId !== sessionId) {
+          conflicts.push('sessionId');
+        }
+        if (previousQueue.entryUuid && entryUuid && previousQueue.entryUuid !== entryUuid) {
+          conflicts.push('entryUuid');
+        }
+        if (
+          previousQueue.recordByteOffset !== null
+          && previousQueue.recordByteOffset !== undefined
+          && Number.isSafeInteger(Number(previousQueue.recordByteOffset))
+          && recordByteOffset !== null
+          && Number(previousQueue.recordByteOffset) !== recordByteOffset
+        ) {
+          conflicts.push('recordByteOffset');
+        }
+        if (conflicts.length > 0) {
+          return {
+            ok: false,
+            applied: false,
+            reason: 'provider-queue-identity-conflict',
+            mismatchedFields: conflicts,
+            record,
+          };
+        }
+        return {
+          ok: true,
+          applied: false,
+          idempotent: true,
+          reason: 'provider-queue-already-recorded',
+          record,
+        };
+      }
+      if (
+        record.state !== STORE_STATES.ENTER_ARMED
+        && record.state !== STORE_STATES.AUDIT_PENDING
+      ) {
+        return {
+          ok: false,
+          applied: false,
+          reason: 'attempt-not-awaiting-provider-proof',
+          record,
+        };
+      }
+
+      const providerQueue = {
+        accepted: true,
+        provider,
+        operationKey,
+        attemptId,
+        promptHash: record.promptHash,
+        acceptedAt,
+        observedAt: updatedAt,
+        ...(sessionId ? { sessionId } : {}),
+        ...(entryUuid ? { entryUuid } : {}),
+        ...(recordByteOffset !== null ? { recordByteOffset } : {}),
+      };
+      const receipt = {
+        ...previousReceipt,
+        providerQueue,
+      };
+      const info = this.statements.markProviderQueueAccepted.run({
+        operationKey,
+        attemptId,
+        receiptJson: encodeJson(receipt),
+        updatedAt,
+      });
+      return {
+        ok: info.changes === 1,
+        applied: info.changes === 1,
+        reason: info.changes === 1 ? null : 'attempt-state-changed',
+        record: this._record(operationKey),
+      };
+    })();
+  }
+
   settleAttempt(operationKeyInput, attemptIdInput, receiptInput) {
     const operationKey = requiredString(operationKeyInput, 'operationKey');
     const attemptId = requiredString(attemptIdInput, 'attemptId');
@@ -866,6 +1027,78 @@ class AgentSendReceiptStore {
         transcriptBoundaryJson: encodeJson(receipt.transcriptBoundary),
         updatedAt,
         settledAt,
+      });
+      return {
+        ok: info.changes === 1,
+        applied: info.changes === 1,
+        state: this._record(operationKey)?.state || null,
+        record: this._record(operationKey),
+      };
+    })();
+  }
+
+  markStartupUnconfirmed(operationKeyInput, attemptIdInput, reconciliationInput = {}) {
+    const operationKey = requiredString(operationKeyInput, 'operationKey');
+    const attemptId = requiredString(attemptIdInput, 'attemptId');
+    const reconciliation = reconciliationInput && typeof reconciliationInput === 'object'
+      ? reconciliationInput
+      : {};
+    return this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
+      if (record.attemptId !== attemptId) {
+        return { ok: false, applied: false, stale: true, reason: 'stale-attempt', record };
+      }
+      if (record.state === STORE_STATES.CONFIRMED) {
+        return {
+          ok: true,
+          applied: false,
+          idempotent: true,
+          reason: 'already-confirmed',
+          record,
+        };
+      }
+      if (!STARTUP_UNCONFIRMED_STATES.has(record.state)) {
+        return {
+          ok: true,
+          applied: false,
+          idempotent: true,
+          reason: 'attempt-already-final',
+          record,
+        };
+      }
+      const reconciledAt = this.now();
+      const previousReceipt = record.receipt && typeof record.receipt === 'object'
+        ? record.receipt
+        : {};
+      const receipt = {
+        ...previousReceipt,
+        ok: false,
+        success: null,
+        accepted: null,
+        submitted: typeof previousReceipt.submitted === 'boolean'
+          ? previousReceipt.submitted
+          : null,
+        status: STORE_STATES.DELIVERY_UNKNOWN,
+        receiptState: STORE_STATES.DELIVERY_UNKNOWN,
+        deliveryUnknown: true,
+        auditPending: false,
+        exactAuditConfirmed: false,
+        code: 'agent_send_startup_reconciliation_unconfirmed',
+        startupReconciliation: {
+          decision: optionalString(reconciliation.decision) || 'unknown',
+          reason: optionalString(reconciliation.reason) || 'unspecified',
+          evidence: reconciliation.evidence && typeof reconciliation.evidence === 'object'
+            ? reconciliation.evidence
+            : null,
+          reconciledAt,
+        },
+      };
+      const info = this.statements.markStartupUnconfirmed.run({
+        operationKey,
+        attemptId,
+        receiptJson: encodeJson(receipt),
+        updatedAt: reconciledAt,
       });
       return {
         ok: info.changes === 1,
@@ -1037,14 +1270,15 @@ class AgentSendReceiptStore {
     } catch (error) {
       return { ok: false, applied: false, reason: 'invalid-presentation-ack', error: error.message };
     }
+    // `record.surface` is immutable send provenance (Project API, Inbox,
+    // orchestration, desktop History). `surface` here is the canonical
+    // presentation that consumed the optimistic row. They intentionally may
+    // differ; exact attempt/transcript identity below is the safety boundary.
     return this.db.transaction(() => {
       const record = this._record(operationKey);
       if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
       if (record.attemptId !== attemptId) {
         return { ok: false, applied: false, stale: true, reason: 'stale-attempt', record };
-      }
-      if (record.surface !== surface) {
-        return { ok: false, applied: false, reason: 'surface-mismatch', record };
       }
       if (record.tabId !== tabId || record.handoffId !== handoffId) {
         return { ok: false, applied: false, reason: 'handoff-identity-mismatch', record };
@@ -1079,6 +1313,7 @@ class AgentSendReceiptStore {
 
       if (record.presentation) {
         const sameIdentity = record.presentation.attemptId === attemptId
+          && (!record.presentation.surface || record.presentation.surface === surface)
           && record.presentation.provider === provider
           && record.presentation.sessionId === sessionId
           && (record.presentation.entryUuid || null) === (entryUuid || null)
@@ -1102,6 +1337,69 @@ class AgentSendReceiptStore {
         entryUuid,
         sourceIdentity,
         acknowledgedAt,
+      });
+      return {
+        ok: info.changes === 1,
+        applied: info.changes === 1,
+        reason: info.changes === 1 ? null : 'presentation-state-changed',
+        record: this._record(operationKey),
+      };
+    })();
+  }
+
+  dismissPresentation(input = {}) {
+    let operationKey;
+    let attemptId;
+    let surface;
+    let tabId;
+    let handoffId;
+    try {
+      operationKey = requiredString(input.operationKey, 'operationKey');
+      attemptId = requiredString(input.attemptId, 'attemptId');
+      surface = requiredString(input.surface, 'surface');
+      tabId = requiredString(input.tabId, 'tabId');
+      handoffId = requiredString(input.handoffId, 'handoffId');
+    } catch (error) {
+      return { ok: false, applied: false, reason: 'invalid-presentation-dismiss', error: error.message };
+    }
+    return this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
+      if (record.attemptId !== attemptId) {
+        return { ok: false, applied: false, stale: true, reason: 'stale-attempt', record };
+      }
+      if (record.tabId !== tabId || record.handoffId !== handoffId) {
+        return { ok: false, applied: false, reason: 'presentation-identity-mismatch', record };
+      }
+      const previousReceipt = record.receipt && typeof record.receipt === 'object'
+        ? record.receipt
+        : {};
+      if (
+        Number.isFinite(Number(previousReceipt.presentationDismissedAt))
+        && previousReceipt.presentationDismissedSurface === surface
+      ) {
+        return {
+          ok: true,
+          applied: false,
+          idempotent: true,
+          reason: 'already-dismissed',
+          record,
+        };
+      }
+      if (!DISMISSIBLE_PRESENTATION_STATES.has(record.state)) {
+        return { ok: false, applied: false, reason: 'presentation-not-dismissible', record };
+      }
+      const dismissedAt = this.now();
+      const receipt = {
+        ...previousReceipt,
+        presentationDismissedAt: dismissedAt,
+        presentationDismissedSurface: surface,
+      };
+      const info = this.statements.dismissPresentation.run({
+        operationKey,
+        attemptId,
+        receiptJson: encodeJson(receipt),
+        dismissedAt,
       });
       return {
         ok: info.changes === 1,

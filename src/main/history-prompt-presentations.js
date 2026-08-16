@@ -3,6 +3,9 @@ const path = require('path');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 
 const PRESENTATION_IMAGE_ASSET_RE = /^[a-f0-9]{64}\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i;
+const HISTORY_IMAGE_PATH_RE_SOURCE = String.raw`(?<!\\)\[imagePath:\s*([^\]\r\n]+?)\s*\]`;
+const PASTED_CONTENT_OPEN = '<pasted_content>';
+const PASTED_CONTENT_CLOSE = '</pasted_content>';
 
 function promptTransportHash(text) {
   return promptAuditFingerprint(text);
@@ -349,28 +352,138 @@ function saveAuditedPromptPresentation(db, {
   });
 }
 
+function collectHistoryImagePathMarkersOutsidePastedContent(value) {
+  const text = String(value || '');
+  const paths = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const openAt = text.indexOf(PASTED_CONTENT_OPEN, cursor);
+    const segmentEnd = openAt < 0 ? text.length : openAt;
+    const segment = text.slice(cursor, segmentEnd);
+    const markerRe = new RegExp(HISTORY_IMAGE_PATH_RE_SOURCE, 'gi');
+    let match;
+    while ((match = markerRe.exec(segment)) !== null) {
+      const filePath = String(match[1] || '').trim();
+      if (filePath) paths.push(filePath);
+    }
+    if (openAt < 0) break;
+    const closeAt = text.indexOf(
+      PASTED_CONTENT_CLOSE,
+      openAt + PASTED_CONTENT_OPEN.length,
+    );
+    // An incomplete pasted-content wrapper is ambiguous. Do not reinterpret
+    // anything after it as an attachment marker.
+    if (closeAt < 0) break;
+    cursor = closeAt + PASTED_CONTENT_CLOSE.length;
+  }
+  return paths;
+}
+
+function splitPromptPresentationRow(row) {
+  const chips = Array.isArray(row?.chips) ? row.chips : [];
+  return {
+    promptChips: chips.filter(item => item?.kind === 'prompt'),
+    semanticTags: chips.filter(item => (
+      item?.kind === 'orchestration' || item?.kind === 'prompt-origin'
+    )),
+    imagePaths: chips
+      .filter(item => item?.kind === 'image-ref')
+      .map(({ kind: _kind, presentationIndex: _presentationIndex, ...ref }) => ref),
+  };
+}
+
+function recoverManagedHistoryImageRefs({
+  entry,
+  imagePaths,
+  resolveManagedImageRef,
+} = {}) {
+  if (typeof resolveManagedImageRef !== 'function') {
+    return { imagePaths, recovered: 0 };
+  }
+  const markerPaths = collectHistoryImagePathMarkersOutsidePastedContent(entry?.content);
+  if (markerPaths.length === 0) return { imagePaths, recovered: 0 };
+
+  const refs = Array.isArray(imagePaths) ? imagePaths.map(ref => ({ ...ref })) : [];
+  const indexesByPath = new Map();
+  const usedIds = new Set();
+  for (const [index, ref] of refs.entries()) {
+    const filePath = typeof ref?.path === 'string' ? ref.path.trim() : '';
+    if (filePath) indexesByPath.set(filePath, index);
+    const id = Number(ref?.id);
+    if (Number.isInteger(id) && id > 0) usedIds.add(id);
+  }
+  let nextId = 1;
+  const allocateId = () => {
+    while (usedIds.has(nextId)) nextId += 1;
+    const id = nextId;
+    usedIds.add(id);
+    nextId += 1;
+    return id;
+  };
+
+  let recovered = 0;
+  for (const markerPath of markerPaths) {
+    const existingIndex = indexesByPath.get(markerPath);
+    const existing = existingIndex === undefined ? null : refs[existingIndex];
+    if (existing?.path && existing.availability !== 'missing') continue;
+    let resolved = null;
+    try {
+      resolved = resolveManagedImageRef({ path: markerPath });
+    } catch {
+      resolved = null;
+    }
+    const resolvedPath = typeof resolved?.path === 'string' && path.isAbsolute(resolved.path.trim())
+      ? resolved.path.trim()
+      : '';
+    if (!resolvedPath || resolved?.availability === 'missing') continue;
+    const id = Number(existing?.id);
+    const recoveredRef = {
+      ...resolved,
+      id: Number.isInteger(id) && id > 0 ? id : allocateId(),
+      path: resolvedPath,
+      availability: 'available',
+      error: undefined,
+    };
+    if (existingIndex === undefined) {
+      indexesByPath.set(markerPath, refs.length);
+      indexesByPath.set(resolvedPath, refs.length);
+      refs.push(recoveredRef);
+    } else {
+      refs[existingIndex] = recoveredRef;
+      indexesByPath.set(resolvedPath, existingIndex);
+    }
+    recovered += 1;
+  }
+  return { imagePaths: refs, recovered };
+}
+
 function decorateHistoryPromptPresentations(db, {
   toolType,
   sessionId,
   entries,
+  recoverManagedImageRef = null,
+  logger = console,
 } = {}) {
   const source = Array.isArray(entries) ? entries : [];
-  if (!db?.getHistoryPromptPresentations || !toolType || !sessionId || source.length === 0) {
+  if (!toolType || !sessionId || source.length === 0) {
     return source;
   }
-  const sessionRows = db.getHistoryPromptPresentations(toolType, sessionId);
-  const exactRows = db.getHistoryPromptPresentationsForEntries
+  const canReadRows = !!db?.getHistoryPromptPresentations;
+  if (!canReadRows && typeof recoverManagedImageRef !== 'function') return source;
+  const sessionRows = canReadRows
+    ? db.getHistoryPromptPresentations(toolType, sessionId)
+    : [];
+  const exactRows = canReadRows && db.getHistoryPromptPresentationsForEntries
     ? db.getHistoryPromptPresentationsForEntries(
         toolType,
         source.map(entry => entry?.uuid).filter(Boolean),
       )
     : [];
   const rows = [...exactRows, ...sessionRows];
-  if (!Array.isArray(rows) || rows.length === 0) return source;
 
   const exact = new Map();
   const pending = new Map();
-  for (const row of rows) {
+  for (const row of Array.isArray(rows) ? rows : []) {
     if (row.entryUuid) exact.set(row.entryUuid, row);
     pending.set(`${row.auditTimestamp}\u0000${row.transportHash}`, row);
   }
@@ -394,14 +507,37 @@ function decorateHistoryPromptPresentations(db, {
         });
       }
     }
-    if (!row || !Array.isArray(row.chips) || row.chips.length === 0) return entry;
-    const promptChips = row.chips.filter(item => item?.kind === 'prompt');
-    const semanticTags = row.chips.filter(item => (
-      item?.kind === 'orchestration' || item?.kind === 'prompt-origin'
-    ));
-    const imagePaths = row.chips
-      .filter(item => item?.kind === 'image-ref')
-      .map(({ kind: _kind, presentationIndex: _presentationIndex, ...ref }) => ref);
+    const presentation = splitPromptPresentationRow(row);
+    const recovery = recoverManagedHistoryImageRefs({
+      entry,
+      imagePaths: presentation.imagePaths,
+      resolveManagedImageRef: recoverManagedImageRef,
+    });
+    const { promptChips, semanticTags } = presentation;
+    const imagePaths = recovery.imagePaths;
+    if (recovery.recovered > 0) {
+      const recoverySessionId = row?.sessionId || sessionId;
+      const auditTimestamp = row?.auditTimestamp || String(entry.timestamp || '');
+      const transportHash = row?.transportHash || promptTransportHash(entry.content || '');
+      const presentationSaved = saveAuditedPromptPresentation(db, {
+        toolType,
+        sessionId: recoverySessionId,
+        entryUuid: entry.uuid,
+        auditTimestamp,
+        actualText: entry.content || '',
+        actualHash: transportHash,
+        snapshot: {
+          promptChips,
+          semanticTags,
+          imagePaths,
+        },
+      });
+      logger?.info?.('[HistoryPromptPresentation:ImageRecovery] tool=' + toolType
+        + ' session=' + String(recoverySessionId).slice(0, 8)
+        + ' entry=' + String(entry.uuid).slice(0, 8)
+        + ' images=' + recovery.recovered
+        + ' saved=' + presentationSaved);
+    }
     if (promptChips.length === 0 && semanticTags.length === 0 && imagePaths.length === 0) return entry;
     changed = true;
     return {
@@ -418,6 +554,7 @@ module.exports = {
   buildCodexPromptPresentationRemap,
   cloneCodexPromptPresentationsForProvenChild,
   codexPromptIdentityHash,
+  collectHistoryImagePathMarkersOutsidePastedContent,
   decorateHistoryPromptPresentations,
   normalizePromptPresentationSnapshot,
   promptTransportHash,

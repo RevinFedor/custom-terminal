@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  interruptedPromptDraftMatchesHandoff,
   mergeFailedHistoryAuthoringSnapshot,
   resolveInterruptedPromptOwnership,
 } from './historyDraftOwnership.mjs';
@@ -36,6 +37,25 @@ test('interrupt ownership never treats an empty terminal draft as cancellation p
     returnedDraftExists: true,
     returnedDraftMatchesHandoff: true,
   }), 'durable');
+});
+
+test('interrupt draft ownership accepts only declared terminal transformations', () => {
+  assert.equal(interruptedPromptDraftMatchesHandoff({
+    returnedDraft: 'line 1\nline 2 [Image #1]',
+    presentationText: 'line 1\r\nline 2 [imagePath: /tmp/a.png]',
+  }), true);
+  assert.equal(interruptedPromptDraftMatchesHandoff({
+    returnedDraft: 'line 1 line 2',
+    presentationText: 'line 1\tline 2',
+  }), false);
+  assert.equal(interruptedPromptDraftMatchesHandoff({
+    returnedDraft: 'line 1\nline 2',
+    presentationText: 'line 1 line 2',
+  }), false);
+  assert.equal(interruptedPromptDraftMatchesHandoff({
+    returnedDraft: '',
+    presentationText: '',
+  }), false);
 });
 
 test('failed snapshot is prepended without overwriting a newer draft and image ids are remapped', () => {

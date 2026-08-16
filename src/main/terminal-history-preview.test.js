@@ -4,12 +4,14 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   clampPreviewRegionLines,
+  createTerminalHistoryStructuredProof,
   deriveTerminalHistoryPreviewTextAfterBaseline,
   extractTerminalHistoryPreviewText,
   findTerminalHistorySubmittedPromptBoundary,
   logicalTerminalLines,
   mergeTerminalHistoryPreviewText,
   subtractTerminalHistoryMaterializedText,
+  subtractTerminalHistoryStructuredProjection,
 } = require('./terminal-history-preview');
 
 const row = (text, extra = {}) => ({ text, wrapped: false, ...extra });
@@ -68,6 +70,96 @@ test('Claude activity block may include an assistant bullet and changing multi-l
   assert.equal(result.status, 'empty');
 });
 
+test('a Claude Tip continuation stays system chrome when its root is above the owned boundary', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    leadingPhysicalLines: [
+      row('· Puzzling… (25m 43s · ↓ 118.3k tokens)', {
+        row: 838,
+        hasNonDefaultFg: true,
+      }),
+      row('  ⎿ Tip: Use /permissions to pre-approve and pre-deny bash, edit, and', {
+        row: 839,
+        hasNonDefaultFg: true,
+      }),
+    ],
+    physicalLines: [
+      row('     MCP tools', { row: 840, hasNonDefaultFg: true }),
+      row('', { row: 841 }),
+      row('❯ ', { row: 843 }),
+    ],
+  });
+  assert.equal(result.status, 'empty');
+  assert.equal(result.leadingContextLinesRemoved, 2);
+  assert.ok(result.filteredBlockKinds.includes('boundary-system-continuation'));
+});
+
+test('a Codex plan continuation stays system chrome when Updated Plan is above the boundary', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    leadingPhysicalLines: [
+      row('• Updated Plan', { row: 986, hasDim: true }),
+      row('  └ □ Разобрать границу baseline', { row: 987, hasDim: true }),
+      row('    □ Добавить регрессионные тесты', { row: 989, hasDim: true }),
+    ],
+    physicalLines: [
+      row('      continuation', { row: 990, hasDim: true, allTextDim: true }),
+      row('    □ Внести capability-preserving исправление', { row: 991, hasDim: true }),
+      row('    □ Запустить unit/integration проверки', { row: 993, hasDim: true }),
+      row('› ', { row: 1016 }),
+    ],
+  });
+  assert.equal(result.status, 'empty');
+  assert.equal(result.leadingContextLinesRemoved, 3);
+  assert.ok(result.filteredBlockKinds.includes('boundary-system-continuation'));
+});
+
+test('a viewport-clipped Codex Explored child stays inside its tool card', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    leadingPhysicalLines: [
+      row('• Explored', { row: 1423, hasDim: true }),
+      row('  └ Read terminal-history-preview.js, terminal-history-preview-', {
+        row: 1424,
+        hasDim: true,
+      }),
+    ],
+    physicalLines: [
+      row('         controller.js, terminal-history-preview.test.js, terminal-', {
+        row: 1425,
+        hasDim: true,
+      }),
+      row('         history-preview-controller.test.js', {
+        row: 1426,
+        hasDim: true,
+      }),
+      row('', { row: 1427 }),
+      row('• Настоящий ответ уже печатается.', { row: 1428 }),
+      row('› ', { row: 1430 }),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ уже печатается.');
+  assert.ok(result.leadingContextLinesRemoved >= 2);
+  assert.ok(result.filteredBlockKinds.includes('boundary-system-continuation'));
+});
+
+test('leading system context cannot consume a new unindented assistant answer', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    leadingPhysicalLines: [
+      row('· Puzzling…', { row: 20, hasNonDefaultFg: true }),
+      row('  ⎿ Tip: Provider-owned hint', { row: 21, hasNonDefaultFg: true }),
+    ],
+    physicalLines: [
+      row('Настоящий ответ начался.', { row: 22 }),
+      row('❯ ', { row: 23 }),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ начался.');
+});
+
 test('Claude activity chrome is removed even when later TUI footer rows make it non-trailing', () => {
   const result = extractTerminalHistoryPreviewText({
     provider: 'claude',
@@ -80,6 +172,51 @@ test('Claude activity chrome is removed even when later TUI footer rows make it 
   });
   assert.equal(result.status, 'empty');
   assert.deepEqual(result.filteredBlockKinds, ['activity']);
+});
+
+test('Codex service-tier confirmation is lifecycle chrome, not assistant prose', () => {
+  const statusOnly = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('• Service tier set to priority', { hasDim: true }),
+      row('• Working (9s • esc to interrupt)', { hasDim: true }),
+      row('› '),
+    ],
+  });
+  assert.equal(statusOnly.status, 'empty');
+  assert.ok(statusOnly.filteredBlockKinds.includes('lifecycle-status'));
+
+  const ordinaryProse = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('Service tier set to priority is the exact status text.'),
+      row('› '),
+    ],
+  });
+  assert.equal(ordinaryProse.status, 'text');
+  assert.equal(ordinaryProse.text, 'Service tier set to priority is the exact status text.');
+});
+
+test('Codex dim queue footer is composer chrome even when the composer is above the boundary', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('tab to queue message                              52% context left', {
+        hasDim: true,
+        allTextDim: true,
+      }),
+    ],
+  });
+  assert.equal(result.status, 'empty');
+  assert.ok(result.filteredBlockKinds.includes('composer-footer'));
+
+  const unstyledQuote = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('tab to queue message                              52% context left'),
+    ],
+  });
+  assert.equal(unstyledQuote.status, 'text');
 });
 
 test('Claude answer after an earlier activity block becomes the first provisional text', () => {
@@ -214,6 +351,30 @@ test('Claude bare expandable thinking card cannot become the first streamed answ
   assert.equal(withAnswer.status, 'text');
   assert.equal(withAnswer.text, 'Проверил код — теперь могу ответить предметно.');
   assert.deepEqual(withAnswer.filteredBlockKinds, ['structured-summary']);
+});
+
+test('Claude bare expandable read summary cannot become the first streamed answer', () => {
+  // Production PTY frame 2197 (incident 393909f5-…): Claude deliberately
+  // repainted the gray expandable title without either `⏺` or `●`.
+  const systemStyle = {
+    firstTextStyle: 'fg=50331648:10066329,bg=0:-1',
+    styles: ['fg=50331648:10066329,bg=0:-1 x34'],
+    hasNonDefaultFg: true,
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row(' Reading 1 file… (ctrl+o to expand)', systemStyle),
+      row('✢ Wandering… (1m 15s · ↓ 3.3k tokens)', {
+        ...systemStyle,
+        firstTextStyle: 'fg=1:3,bg=0:-1',
+      }),
+      row('❯ '),
+    ],
+  });
+  assert.equal(result.status, 'empty');
+  assert.deepEqual(result.filteredBlockKinds, ['structured-summary', 'activity']);
+  assert.equal(result.styleEvidenceUsed, true);
 });
 
 test('Thinking for text without Claude card proof remains ordinary prose', () => {
@@ -366,6 +527,32 @@ test('Codex queued-message card and its submitted text stay outside assistant pr
   assert.deepEqual(clipped.filteredBlockKinds, ['queue-status']);
 });
 
+test('Codex queued-message card is reconstructed across explicit narrow-pane rows', () => {
+  const statusStyle = {
+    firstTextStyle: 'fg=1:8,bg=0:-1,dim',
+    hasDim: true,
+    allTextDim: true,
+    hasNonDefaultFg: true,
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('• Messages to be submitted after next', statusStyle),
+      row('tool call (press esc to interrupt and', statusStyle),
+      row('send immediately)', statusStyle),
+      row('↳ [Image #1] queued user prompt', statusStyle),
+      row('  that continues on another explicit row', statusStyle),
+      row(''),
+      row('• Настоящий ответ уже печатается.'),
+      row('› Use /skills to list available skills'),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ уже печатается.');
+  assert.deepEqual(result.filteredBlockKinds, ['queue-status']);
+  assert.equal(result.styleEvidenceUsed, true);
+});
+
 test('Codex transport fallback warning stays outside assistant preview', () => {
   const result = extractTerminalHistoryPreviewText({
     provider: 'codex',
@@ -373,6 +560,28 @@ test('Codex transport fallback warning stays outside assistant preview', () => {
       row('⚠ Falling back from WebSockets to HTTPS transport.'),
       row('  stream disconnected before completion: websocket'),
       row('    closed by server before response.completed'),
+      row(''),
+      row('• Настоящий ответ после переподключения.'),
+      row('› Use /skills to list available skills'),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ после переподключения.');
+  assert.deepEqual(result.filteredBlockKinds, ['transport-status']);
+});
+
+test('Codex transport warning is reconstructed across explicit narrow-pane rows', () => {
+  const warningStyle = {
+    hasNonDefaultFg: true,
+    firstTextStyle: 'fg=3:3,bg=0:-1',
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('⚠ Falling back from WebSockets to HTTPS', warningStyle),
+      row('  transport. stream disconnected before', warningStyle),
+      row('  completion: websocket closed by', warningStyle),
+      row('  server before response.completed', warningStyle),
       row(''),
       row('• Настоящий ответ после переподключения.'),
       row('› Use /skills to list available skills'),
@@ -419,6 +628,36 @@ test('a provider-styled historical Codex prompt is removed after a full-screen r
     'Обычная цитата внутри ответа:\n› этот символ не является пользовательским блоком',
   );
   assert.equal(ordinaryQuote.residualPromptLinesRemoved, 0);
+});
+
+test('a provider-styled Codex prompt embedded below old tool rows is removed as one card', () => {
+  const promptStyle = {
+    activeByInverse: true,
+    hasInverse: true,
+    hasNonDefaultBg: true,
+  };
+  const toolChildStyle = {
+    hasDim: true,
+    allTextDim: true,
+    hasNonDefaultFg: true,
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('• Ran rg'),
+      row('  └ old output', toolChildStyle),
+      row(''),
+      row('› Окей, если нам необходимо продолжить', promptStyle),
+      row('  то этот текст принадлежит вопросу', promptStyle),
+      row(''),
+      row('• Настоящий новый ответ.'),
+      row('› Use /skills to list available skills'),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий новый ответ.');
+  assert.equal(result.residualPromptLinesRemoved, 2);
+  assert.equal(result.residualPromptBlocksRemoved, 1);
 });
 
 test('a clipped exact prompt suffix is removed after its boundary was already proven', () => {
@@ -524,6 +763,48 @@ test('Codex long Ran command remains a tool card across explicit root wraps', ()
   assert.equal(result.styleEvidenceUsed, true);
 });
 
+test('a viewport-clipped styled Codex tool child cannot become assistant prose', () => {
+  const dim = {
+    firstTextStyle: 'fg=1:8,bg=0:-1,dim',
+    hasDim: true,
+    allTextDim: true,
+    hasNonDefaultFg: true,
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('└ Search mixed-or-image-draft exact-original', dim),
+      row('  PromptQueueAssets durable GrabImages LoaderCircle', dim),
+      row('  inspectClaudePostEnterTimeout', {
+        ...dim,
+        hasNonDefaultBg: true,
+      }),
+      row('  Read main.js', dim),
+      row(''),
+      row('• Настоящий ответ после инструмента.'),
+      row('› Implement {feature}'),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ после инструмента.');
+  assert.deepEqual(result.filteredBlockKinds, ['tool-card']);
+  assert.equal(result.styleEvidenceUsed, true);
+});
+
+test('an unstyled clipped tree prefix remains ordinary Codex prose', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('└ это обычная схема ответа'),
+      row('  продолжение схемы'),
+      row('› Find and fix a bug'),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, '└ это обычная схема ответа\n  продолжение схемы');
+  assert.deepEqual(result.filteredBlockKinds, []);
+});
+
 test('an ordinary Codex answer with an unstyled tree glyph is not a tool card', () => {
   const result = extractTerminalHistoryPreviewText({
     provider: 'codex',
@@ -558,6 +839,21 @@ test('Claude tool result cards do not become provisional assistant text', () => 
   assert.deepEqual(result.filteredBlockKinds, ['tool-card']);
 });
 
+test('Claude bare tool invocation is chrome before its result child appears', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row("⏺ Bash(python3 - <<'PY'…)", {
+        hasNonDefaultFg: true,
+        firstTextStyle: 'fg=1:2,bg=0:-1',
+      }),
+      row('❯ '),
+    ],
+  });
+  assert.equal(result.status, 'empty');
+  assert.deepEqual(result.filteredBlockKinds, ['tool-card']);
+});
+
 test('Claude keyboard-affordance tools, activity Tip and image attachment chrome stay out of prose', () => {
   const result = extractTerminalHistoryPreviewText({
     provider: 'claude',
@@ -579,6 +875,69 @@ test('Claude keyboard-affordance tools, activity Tip and image attachment chrome
   assert.equal(result.status, 'empty');
   assert.equal(result.text, '');
   assert.deepEqual(result.filteredBlockKinds, ['activity', 'tool-card']);
+});
+
+test('Claude multi-line Bash cards stay chrome when explicit cursor moves break wrapping', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row('⏺ Bash(grep -n "itemContent"', {
+        hasNonDefaultFg: true,
+        firstTextStyle: 'fg=1:2,bg=0:-1',
+      }),
+      row('      src/renderer/components/Workspace/HistoryPanel.tsx | head -5;'),
+      row("      sed -n '14040,14200p'"),
+      row('      src/renderer/components/Workspace/HistoryPanel.tsx)'),
+      row('  ⎿  8335:// Scroll-seek placeholders replace itemContent', {
+        hasNonDefaultFg: true,
+        firstTextStyle: 'fg=1:8,bg=0:-1',
+      }),
+      row('     … +160 lines (ctrl+o to expand)', {
+        hasDim: true,
+        allTextDim: true,
+      }),
+      row(''),
+      row('⏺ Настоящий ответ после инструмента.'),
+      row('❯ '),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ после инструмента.');
+  assert.deepEqual(result.filteredBlockKinds, ['tool-card']);
+});
+
+test('a clipped Claude Bash continuation inherits its tool root across the preview boundary', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    leadingPhysicalLines: [
+      row("⏺ Bash(sed -n '1360,1400p'", {
+        row: 4995,
+        hasNonDefaultFg: true,
+        firstTextStyle: 'fg=1:2,bg=0:-1',
+      }),
+      row('      src/renderer/components/Workspace/HistoryPanel.tsx; sed -n', {
+        row: 4996,
+      }),
+    ],
+    physicalLines: [
+      row("      '1399,1440p' src/renderer/components/Workspace/HistoryPanel.tsx;", {
+        row: 4997,
+      }),
+      row('      echo "=== History…)', { row: 4998 }),
+      row('  ⎿  return;', {
+        row: 4999,
+        hasNonDefaultFg: true,
+        firstTextStyle: 'fg=1:8,bg=0:-1',
+      }),
+      row('', { row: 5000 }),
+      row('⏺ Настоящий ответ после инструмента.', { row: 5001 }),
+      row('❯ ', { row: 5002 }),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ после инструмента.');
+  assert.ok(result.filteredBlockKinds.includes('boundary-system-continuation'));
+  assert.ok(result.filteredBlockKinds.includes('tool-card'));
 });
 
 test('Claude expandable thinking summary and its wrapped children stay out of prose', () => {
@@ -654,6 +1013,171 @@ test('does not delete the same words when they occur in the assistant body', () 
   assert.equal(result.promptLinesRemoved, 0);
 });
 
+test('exact structured JSONL proof suppresses an explicitly reflowed tool command tail', () => {
+  const command = [
+    'rg -n "classify|branch-status|scrolled-character-overlap|',
+    'provisional-text-not-yet-materialized|BOUNDARY_HELD|tool-use"',
+    ' src/main/terminal-history-preview.js',
+  ].join('');
+  const proof = createTerminalHistoryStructuredProof([command]);
+  const projected = [
+    'classify|branch-status|scrol',
+    'led-',
+    'character-overlap|provisiona',
+    'l-',
+    'text-not-yet-materialized|',
+    'BOUNDARY_HELD|tool-use in terminal-history-preview.js',
+  ].join('\n');
+  const result = subtractTerminalHistoryStructuredProjection(proof, projected);
+  assert.equal(result.status, 'empty');
+  assert.equal(result.reason, 'structured-projection-only');
+});
+
+test('Codex JSON-string arguments derive the same exact semantic tool projection', () => {
+  const command = 'rg -n "classify|branch-status|scrolled-character-overlap|'
+    + 'provisional-text-not-yet-materialized|BOUNDARY_HELD|tool-use" '
+    + 'src/main/terminal-history-preview.js';
+  const proof = createTerminalHistoryStructuredProof([
+    JSON.stringify({ cmd: command, workdir: '/Users/fedor/Desktop/custom-terminal' }),
+  ]);
+  const projected = [
+    'classify|branch-status|scrol',
+    'led-character-overlap|provisiona',
+    'l-text-not-yet-materialized|',
+    'BOUNDARY_HELD|tool-use in terminal-history-preview.js',
+  ].join('\n');
+  const result = subtractTerminalHistoryStructuredProjection(proof, projected);
+  assert.equal(result.status, 'empty');
+  assert.equal(result.reason, 'structured-projection-only');
+});
+
+test('structured JSONL proof removes only the tool prefix and preserves later prose', () => {
+  const toolOutput = 'Searching the web for a bounded exact query';
+  const proof = createTerminalHistoryStructuredProof([toolOutput]);
+  const result = subtractTerminalHistoryStructuredProjection(
+    proof,
+    toolOutput + '\nНастоящий ответ после инструмента.',
+  );
+  assert.equal(result.status, 'text');
+  assert.equal(result.reason, 'structured-projection-prefix-removed');
+  assert.equal(result.text, 'Настоящий ответ после инструмента.');
+});
+
+test('exact structured tool proof removes its numbered diff tail', () => {
+  const header = 'Updated docs/tmp/terminal-history-streaming.md (+22 -0)';
+  const proof = createTerminalHistoryStructuredProof([header]);
+  const result = subtractTerminalHistoryStructuredProjection(
+    proof,
+    header + '\n'
+      + '64 +\n'
+      + '    65 +### E37 — нативная очередь Claude\n'
+      + '        является отдельным доказанным состоянием\n'
+      + '    66 +\n'
+      + '    67 +- Production handoff не завис\n'
+      + '    68 +  точная операция сохранена\n'
+      + '    69',
+  );
+  assert.equal(result.status, 'empty');
+  assert.equal(result.reason, 'structured-projections-only');
+});
+
+test('numbered diff tail removal preserves a later unindented assistant answer', () => {
+  const header = 'Updated docs/tmp/terminal-history-streaming.md (+4 -0)';
+  const proof = createTerminalHistoryStructuredProof([header]);
+  const result = subtractTerminalHistoryStructuredProjection(
+    proof,
+    header + '\n'
+      + '41 +### Изменения\n'
+      + '    42 +- Первый пункт\n'
+      + '    43 +  продолжение строки\n'
+      + '    44\n\n'
+      + 'Настоящий ответ после tool-карточки.',
+  );
+  assert.equal(result.status, 'text');
+  assert.equal(result.reason, 'structured-projection-prefix-removed');
+  assert.equal(result.text, 'Настоящий ответ после tool-карточки.');
+});
+
+test('structured JSONL proof never consumes unrelated assistant prose', () => {
+  const proof = createTerminalHistoryStructuredProof([
+    'jq .diagnostic.composerTrace.transitions[] incident.json',
+  ]);
+  const text = 'Проверка закончена: причина найдена и исправлена.';
+  const result = subtractTerminalHistoryStructuredProjection(proof, text);
+  assert.equal(result.status, 'text');
+  assert.equal(result.reason, 'candidate-not-structured-projection');
+  assert.equal(result.text, text);
+});
+
+test('exact Claude receipts suppress a short thinking tail followed by a clipped Bash card', () => {
+  const thinking = 'I should check the existing parser in the project and consider '
+    + 'whether to use parallel subagents for the scripting work.';
+  const command = "cd /tmp/vh-research && cat > shape.js <<'EOF'\n"
+    + "const fs=require('fs');\nconsole.log(fs.readdirSync('.'));\nEOF";
+  const proof = createTerminalHistoryStructuredProof([
+    thinking,
+    `Bash(${command})`,
+  ]);
+  const result = subtractTerminalHistoryStructuredProjection(
+    proof,
+    "the scripting work.\n\nBash(cd /tmp/vh-research && cat > shape.js <<'EOF'\n"
+      + "      const fs=require('fs');…)",
+  );
+  assert.equal(result.status, 'empty');
+  assert.equal(result.reason, 'structured-projection-chain-only');
+});
+
+test('an exact long Claude thinking receipt accepts a terminal ellipsis at the end', () => {
+  const thinking = 'pattern of commentary appearing between actions, confirm whether '
+    + 'codex exec really lacks a description field, and look closer at how reliable '
+    + 'the final-answer signal actually is. A few more probes like this and I will '
+    + 'be ready to write up the report.';
+  const proof = createTerminalHistoryStructuredProof([thinking]);
+  const result = subtractTerminalHistoryStructuredProjection(
+    proof,
+    'pattern of commentary appearing between actions, confirm whether\n'
+      + 'codex exec really lacks a description field, and look closer at how reliable\n'
+      + 'the final-answer signal actually is. A few more probes like this and I…',
+  );
+  assert.equal(result.status, 'empty');
+  assert.equal(result.reason, 'structured-projection-only');
+});
+
+test('exact Codex receipts suppress a short Read child followed by a Search child', () => {
+  const command = "sed -n '2070,2145p' src/main/main.js && "
+    + "rg -n 'function terminalHistoryStructuredProofTexts|"
+    + "terminalHistoryStructuredProofTexts' src/main/main.js";
+  const proof = createTerminalHistoryStructuredProof([command]);
+  const result = subtractTerminalHistoryStructuredProjection(
+    proof,
+    'Read main.js\n'
+      + '    Search function terminalHistoryStructuredProofTexts|\n'
+      + '           terminalHistoryStructuredProofTexts in main.js',
+  );
+  assert.equal(result.status, 'empty');
+  assert.equal(result.reason, 'structured-projection-chain-only');
+});
+
+test('a short coincidental prose prefix is preserved without an exact structured receipt', () => {
+  const command = "rg -n 'exact-pattern-that-is-long-enough-for-proof' src/main/main.js";
+  const proof = createTerminalHistoryStructuredProof([command]);
+  const text = 'Короткий ответ.\nSearch exact-pattern-that-is-long-enough-for-proof in main.js';
+  const result = subtractTerminalHistoryStructuredProjection(proof, text);
+  assert.equal(result.status, 'text');
+  assert.equal(result.reason, 'candidate-not-structured-projection');
+  assert.equal(result.text, text);
+});
+
+test('an exact short structured label alone has no authority to suppress text', () => {
+  const proof = createTerminalHistoryStructuredProof([
+    "sed -n '1,40p' src/main/main.js",
+  ]);
+  const result = subtractTerminalHistoryStructuredProjection(proof, 'Read main.js');
+  assert.equal(result.status, 'text');
+  assert.equal(result.reason, 'candidate-not-structured-projection');
+  assert.equal(result.text, 'Read main.js');
+});
+
 test('growing frame replaces the current preview instead of appending duplicates', () => {
   const merged = mergeTerminalHistoryPreviewText(
     'Первая часть',
@@ -723,6 +1247,31 @@ test('a clipped canonical tail is removed before genuinely new terminal prose', 
   assert.equal(result.status, 'text');
   assert.equal(result.reason, 'materialized-record-clipped-tail-removed');
   assert.equal(result.text, 'Новый вывод.');
+});
+
+test('inline-code Markdown already saved to JSONL matches its rendered terminal projection', () => {
+  const canonical = [
+    'Запускаю полный узкий пакет parser/controller/wiring/diagnostics,',
+    'затем зафиксирую причины в `terminal-history-streaming.md`.',
+  ].join('\n');
+  const rendered = [
+    'Запускаю полный узкий пакет parser/controller/wiring/diagnostics,',
+    'затем зафиксирую причины в terminal-history-streaming.md.',
+  ].join('\n');
+
+  const exactProjection = subtractTerminalHistoryMaterializedText(canonical, rendered);
+  assert.equal(exactProjection.status, 'empty');
+  assert.equal(exactProjection.reason, 'materialized-record-only');
+  assert.equal(exactProjection.projection, 'terminal-inline-code');
+
+  const clippedProjection = subtractTerminalHistoryMaterializedText(
+    canonical,
+    'затем зафиксирую причины в terminal-history-streaming.md.\nНовый вывод.',
+  );
+  assert.equal(clippedProjection.status, 'text');
+  assert.equal(clippedProjection.reason, 'materialized-record-clipped-tail-removed');
+  assert.equal(clippedProjection.text, 'Новый вывод.');
+  assert.equal(clippedProjection.projection, 'terminal-inline-code');
 });
 
 test('unrelated text after a canonical record remains eligible for preview', () => {

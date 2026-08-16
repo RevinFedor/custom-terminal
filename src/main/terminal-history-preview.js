@@ -243,19 +243,29 @@ const TERMINAL_TOOL_CHILD_RE = /^\s{2,}(?:⎿|└|├|╰)\s*/u;
 // keyboard affordance in the root itself (`ctrl+o to expand`). That suffix is
 // structural UI proof; the verb/title before it is intentionally unrestricted.
 const CLAUDE_TOOL_ROOT_UI_AFFORDANCE_RE = /\(\s*(?:ctrl|control|cmd)\+[^)]{1,24}\s+to\s+(?:expand|collapse|open|view)[^)]*\)\s*$/i;
+// A Claude tool invocation can be visible before its result child is painted.
+// The provider bullet plus a function-call-shaped root is structural proof;
+// the tool name itself is deliberately unrestricted so new tools do not need
+// another phrase catalogue.
+const CLAUDE_BARE_TOOL_INVOCATION_RE = /^\s*⏺\s+[A-Z][A-Za-z0-9_.:-]{1,64}\s*\([\s\S]*(?:\)|…)\s*$/u;
+// Explicit cursor moves can paint a long Claude invocation over several
+// physical rows without setting xterm's wrapped bit. In that shape the first
+// row is only the opening `⏺ Tool(` and the closing parenthesis lives above
+// the later styled `⎿` result child.
+const CLAUDE_OPEN_TOOL_INVOCATION_RE = /^\s*⏺\s+[A-Z][A-Za-z0-9_.:-]{1,64}\s*\(/u;
 // Newer Claude builds render the compact summary of an expandable thinking or
 // tool group with a gray `●` instead of the ordinary assistant/tool `⏺`.
 // The title and counters are intentionally free-form; the bullet plus the
 // keyboard affordance are the stable structural evidence. Wrapped physical
 // rows are joined before this classifier runs.
 const CLAUDE_EXPANDABLE_SUMMARY_ANCHOR_RE = /^\s*●\s+.+\(\s*(?:ctrl|control|cmd)\+[^)]{1,24}\s+to\s+(?:expand|collapse|open|view)[^)]*\)\s*$/iu;
-// The same expandable thinking card is sometimes repainted without its `●`
-// root glyph. In that frame the title is still provider-owned chrome and the
-// indented rows below it are hidden thinking, not assistant prose. The title
-// alone is not enough proof because an ordinary answer may mention
-// "Thinking for ...". Require both Claude's keyboard affordance and the
-// system tint carried by the committed headless-xterm frame.
-const CLAUDE_BARE_EXPANDABLE_THINKING_ANCHOR_RE = /^\s*(?:Thought|Thinking)\s+for\b.{0,180}\(\s*(?:ctrl|control|cmd)\+[^)]{1,24}\s+to\s+(?:expand|collapse|open|view)[^)]*\)\s*$/iu;
+// Claude sometimes repaints an expandable summary without either provider
+// root glyph (`⏺` / `●`). This is not limited to thinking: production frame
+// 2197 rendered `Reading 1 file… (ctrl+o to expand)` the same way. Do not
+// enumerate titles. The provider-owned keyboard affordance plus the committed
+// headless-xterm system tint is the structural proof; either one alone remains
+// ordinary assistant prose.
+const CLAUDE_BARE_EXPANDABLE_SUMMARY_ANCHOR_RE = /^(?!\s*(?:⏺|●)(?:\s|$))(?=\s*\S)[^\n]{1,240}\(\s*(?:ctrl|control|cmd)\+[^)]{1,24}\s+to\s+(?:expand|collapse|open|view)[^)]*\)\s*$/iu;
 const CLAUDE_CLIPPED_EXPANDABLE_SUMMARY_ANCHOR_RE = /^\s*(?:…|\.\.\.)\s*\+\d+\s+lines?\s*\(\s*(?:ctrl|control|cmd)\+[^)]{1,24}\s+to\s+(?:expand|collapse|open|view)[^)]*\)/iu;
 // Codex renders provider-owned progress rows with the same `•` root glyph as
 // assistant prose. Tool-card geometry alone therefore cannot distinguish a
@@ -265,10 +275,82 @@ const CLAUDE_CLIPPED_EXPANDABLE_SUMMARY_ANCHOR_RE = /^\s*(?:…|\.\.\.)\s*\+\d+\
 const CODEX_WEB_SEARCH_STATUS_RE = /^\s*(?:•\s+)?(?:Searching|Searched)\s+the web(?:\s+for\b.*)?\s*$/iu;
 const CODEX_TOOL_CALL_STATUS_RE = /^\s*(?:•\s+)?Calling\s+[A-Za-z0-9_.:-]+\s*\([\s\S]*\)\s*$/u;
 const CODEX_CONTEXT_COMPACTED_RE = /^\s*(?:•\s+)?Context compacted\s*$/iu;
+// `/fast` writes this provider-owned confirmation into the transcript pane.
+// Require the Codex root bullet and the complete sentence so ordinary prose
+// discussing service tiers remains eligible for preview.
+const CODEX_SERVICE_TIER_STATUS_RE = /^\s*•\s+Service tier set to [A-Za-z0-9_.:-]+\s*$/u;
+const CODEX_QUEUE_FOOTER_RE = /^\s*tab to queue message\s+\d+%\s+context left\s*$/iu;
 const CODEX_QUEUED_MESSAGE_STATUS_RE = /^\s*(?:•\s+)?Messages to be submitted after next tool call(?:\s+\(press esc to interrupt and send immediately\))?(?:\s+↳(?:\s+.*)?)?\s*$/iu;
 const CODEX_QUEUED_MESSAGE_CONTINUATION_RE = /^\s*\(press esc to interrupt and send immediately\)(?:\s+↳(?:\s+.*)?)?\s*$/iu;
+const CODEX_QUEUED_MESSAGE_BRANCH_RE = /^\s*↳(?:\s+.*)?$/u;
 const CODEX_TRANSPORT_STATUS_RE = /^\s*⚠\s*Falling back from WebSockets to HTTPS transport\.?(?:\s+stream disconnected before completion:\s*websocket)?(?:\s+closed by server before response\.completed)?\s*$/iu;
 const CODEX_TRANSPORT_CONTINUATION_RE = /^\s*(?:stream disconnected before completion:\s*websocket(?:\s+closed by server before response\.completed)?|closed by server before response\.completed)\s*$/iu;
+
+// Codex often redraws narrow panes with explicit cursor moves rather than
+// xterm soft-wraps. Reassemble only the exact queue-card sentence over a small
+// adjacent window; arbitrary prose never becomes a status from style alone.
+function classifySplitCodexQueueAnchor(lines, start) {
+  const source = Array.isArray(lines) ? lines : [];
+  let combined = '';
+  let matchedEnd = -1;
+  let styleEvidence = false;
+  const limit = Math.min(source.length, start + 6);
+  for (let end = start; end < limit; end += 1) {
+    const raw = String(source[end]?.text || '');
+    if (!raw.trim()) break;
+    if (end > start && (STRONG_COMPOSER_RE.test(raw)
+      || TERMINAL_ROOT_BLOCK_MARKER.codex.test(raw)
+      || CODEX_QUEUED_MESSAGE_BRANCH_RE.test(raw))) break;
+    combined = compactText(combined + ' ' + raw);
+    styleEvidence = styleEvidence
+      || terminalLineStyleEvidence(source[end]).hasSystemTint;
+    if (CODEX_QUEUED_MESSAGE_STATUS_RE.test(combined)
+      || CODEX_QUEUED_MESSAGE_CONTINUATION_RE.test(combined)) {
+      matchedEnd = end;
+    }
+  }
+  return matchedEnd >= start
+    ? { kind: 'queue-status', styleEvidence, endIndex: matchedEnd }
+    : null;
+}
+
+// The transport warning is also repainted as independent physical rows in a
+// narrow pane. Reassemble only its complete provider sentence; colour alone
+// never turns arbitrary prose into transport chrome.
+function classifySplitCodexTransportAnchor(lines, start) {
+  const source = Array.isArray(lines) ? lines : [];
+  let combined = '';
+  let matchedEnd = -1;
+  let styleEvidence = false;
+  const limit = Math.min(source.length, start + 6);
+  for (let end = start; end < limit; end += 1) {
+    const raw = String(source[end]?.text || '');
+    if (!raw.trim()) break;
+    if (end > start && (STRONG_COMPOSER_RE.test(raw)
+      || TERMINAL_ROOT_BLOCK_MARKER.codex.test(raw))) break;
+    combined = compactText(combined + ' ' + raw);
+    styleEvidence = styleEvidence
+      || terminalLineStyleEvidence(source[end]).hasSystemTint;
+    if (CODEX_TRANSPORT_STATUS_RE.test(combined)
+      || CODEX_TRANSPORT_CONTINUATION_RE.test(combined)) {
+      matchedEnd = end;
+    }
+  }
+  return matchedEnd >= start
+    ? { kind: 'transport-status', styleEvidence, endIndex: matchedEnd }
+    : null;
+}
+
+function classifyTerminalSystemBlockAt(lines, index, provider) {
+  if (provider === 'codex') {
+    const transport = classifySplitCodexTransportAnchor(lines, index);
+    if (transport) return transport;
+    const queue = classifySplitCodexQueueAnchor(lines, index);
+    if (queue) return queue;
+  }
+  const direct = classifyTrailingTerminalBlockAnchor(lines[index], provider);
+  return direct ? { ...direct, endIndex: index } : null;
+}
 
 function classifyTrailingTerminalBlockAnchor(line, provider) {
   const raw = String(line?.text || '');
@@ -292,12 +374,20 @@ function classifyTrailingTerminalBlockAnchor(line, provider) {
   if (provider === 'codex' && CODEX_CONTEXT_COMPACTED_RE.test(raw)) {
     return { kind: 'lifecycle-status', styleEvidence: style.hasSystemTint };
   }
+  if (provider === 'codex' && CODEX_SERVICE_TIER_STATUS_RE.test(raw)) {
+    return { kind: 'lifecycle-status', styleEvidence: style.hasSystemTint };
+  }
+  if (provider === 'codex'
+    && style.hasSystemTint
+    && CODEX_QUEUE_FOOTER_RE.test(raw)) {
+    return { kind: 'composer-footer', styleEvidence: true };
+  }
   if (provider === 'claude' && CLAUDE_EXPANDABLE_SUMMARY_ANCHOR_RE.test(raw)) {
     return { kind: 'structured-summary', styleEvidence: style.hasSystemTint };
   }
   if (provider === 'claude'
     && style.hasSystemTint
-    && CLAUDE_BARE_EXPANDABLE_THINKING_ANCHOR_RE.test(raw)) {
+    && CLAUDE_BARE_EXPANDABLE_SUMMARY_ANCHOR_RE.test(raw)) {
     return { kind: 'structured-summary', styleEvidence: true };
   }
   if (provider === 'claude'
@@ -338,18 +428,33 @@ function filterTerminalSystemBlocks(lines, provider) {
   const kinds = [];
   let styleEvidence = false;
   for (let index = 0; index < source.length; index += 1) {
-    const anchor = classifyTrailingTerminalBlockAnchor(source[index], provider);
+    const anchor = classifyTerminalSystemBlockAt(source, index, provider);
     if (!anchor) continue;
     if (!kinds.includes(anchor.kind)) kinds.push(anchor.kind);
     styleEvidence = styleEvidence || anchor.styleEvidence === true;
-    excluded.add(index);
-    let next = index + 1;
-    while (next < source.length && isTrailingTerminalBlockContinuation(source[next], provider)) {
-      const nestedAnchor = classifyTrailingTerminalBlockAnchor(source[next], provider);
+    for (let covered = index; covered <= anchor.endIndex; covered += 1) {
+      excluded.add(covered);
+    }
+    let next = anchor.endIndex + 1;
+    while (next < source.length) {
+      const nestedAnchor = classifyTerminalSystemBlockAt(source, next, provider);
       if (nestedAnchor) {
         if (!kinds.includes(nestedAnchor.kind)) kinds.push(nestedAnchor.kind);
         styleEvidence = styleEvidence || nestedAnchor.styleEvidence === true;
+        for (let covered = next; covered <= nestedAnchor.endIndex; covered += 1) {
+          excluded.add(covered);
+        }
+        next = nestedAnchor.endIndex + 1;
+        continue;
       }
+      const raw = String(source[next]?.text || '');
+      const queueContinuation = anchor.kind === 'queue-status'
+        && (CODEX_QUEUED_MESSAGE_BRANCH_RE.test(raw)
+          || (terminalLineStyleEvidence(source[next]).hasSystemTint
+            && !STRONG_COMPOSER_RE.test(raw)
+            && !TERMINAL_ROOT_BLOCK_MARKER.codex.test(raw)));
+      if (!isTrailingTerminalBlockContinuation(source[next], provider)
+        && !queueContinuation) break;
       excluded.add(next);
       next += 1;
     }
@@ -363,6 +468,46 @@ function filterTerminalSystemBlocks(lines, provider) {
     filtered: excluded.size,
     kinds,
     styleEvidence,
+  };
+}
+
+function filterClippedCodexToolCardPrefix(lines, provider) {
+  const source = Array.isArray(lines) ? lines : [];
+  if (provider !== 'codex' || source.length === 0) {
+    return { lines: source, filtered: 0, styleEvidence: false };
+  }
+  let start = 0;
+  while (start < source.length && !String(source[start]?.text || '').trim()) start += 1;
+  if (start >= source.length) {
+    return { lines: source, filtered: 0, styleEvidence: false };
+  }
+  const firstText = String(source[start]?.text || '');
+  const firstStyle = terminalLineStyleEvidence(source[start]);
+  // The root `• Ran/Search/...` can have scrolled above the owned viewport.
+  // A child glyph plus provider styling is the remaining structural proof;
+  // an unstyled tree at the start of an answer must remain ordinary prose.
+  const clippedChild = /^(?:\s*)(?:⎿|└|├|│|╰)\s*/u.test(firstText);
+  if (!clippedChild || !(firstStyle.hasDim || firstStyle.allTextDim
+    || firstStyle.hasNonDefaultFg || firstStyle.hasNonDefaultBg)) {
+    return { lines: source, filtered: 0, styleEvidence: false };
+  }
+
+  let end = start + 1;
+  for (; end < source.length; end += 1) {
+    const raw = String(source[end]?.text || '');
+    if (!raw.trim()) continue;
+    if (STRONG_COMPOSER_RE.test(raw)
+      || TERMINAL_ROOT_BLOCK_MARKER.codex.test(raw)
+      || classifyTerminalSystemBlockAt(source, end, provider)) break;
+    const style = terminalLineStyleEvidence(source[end]);
+    if (!(style.hasSystemTint
+      || TERMINAL_BLOCK_CONTINUATION_RE.test(raw.trimStart())
+      || /^\s{2,}\S/u.test(raw))) break;
+  }
+  return {
+    lines: source.slice(0, start).concat(source.slice(end)),
+    filtered: end - start,
+    styleEvidence: true,
   };
 }
 
@@ -387,13 +532,20 @@ function filterInlineTerminalToolCards(lines, provider) {
     // first non-blank logical line. Search only inside the same `•` block and
     // require dim styling for this fallback; an ordinary answer containing a
     // literal tree glyph must remain prose.
-    if (provider === 'codex'
+    const rootStyle = terminalLineStyleEvidence(source[start]);
+    const mayHaveExplicitPhysicalWraps = provider === 'codex'
+      || (provider === 'claude'
+        && CLAUDE_OPEN_TOOL_INVOCATION_RE.test(rootText)
+        && rootStyle.hasSystemTint);
+    if (mayHaveExplicitPhysicalWraps
       && (child >= end || !TERMINAL_TOOL_CHILD_RE.test(childText))) {
       for (let candidate = start + 1; candidate < end; candidate += 1) {
         const candidateText = String(source[candidate]?.text || '');
         const candidateStyle = terminalLineStyleEvidence(source[candidate]);
         if (TERMINAL_TOOL_CHILD_RE.test(candidateText)
-          && (candidateStyle.hasDim || candidateStyle.allTextDim)) {
+          && (provider === 'codex'
+            ? (candidateStyle.hasDim || candidateStyle.allTextDim)
+            : candidateStyle.hasSystemTint)) {
           child = candidate;
           childText = candidateText;
           break;
@@ -401,7 +553,9 @@ function filterInlineTerminalToolCards(lines, provider) {
       }
     }
     if (child >= end || !TERMINAL_TOOL_CHILD_RE.test(childText)) {
-      if (provider === 'claude' && CLAUDE_TOOL_ROOT_UI_AFFORDANCE_RE.test(rootText)) {
+      if (provider === 'claude'
+        && (CLAUDE_TOOL_ROOT_UI_AFFORDANCE_RE.test(rootText)
+          || CLAUDE_BARE_TOOL_INVOCATION_RE.test(rootText))) {
         excluded.add(start);
         styleEvidence = styleEvidence
           || terminalLineStyleEvidence(source[start]).hasSystemTint;
@@ -409,11 +563,19 @@ function filterInlineTerminalToolCards(lines, provider) {
       start = end - 1;
       continue;
     }
-    // `⏺ short answer` followed by Claude's own interruption branch is still
-    // assistant prose plus lifecycle chrome, not a tool invocation.
-    if (provider === 'claude' && CLAUDE_KNOWN_BRANCH_STATUS_RE.test(childText)) {
-      start = end - 1;
-      continue;
+    // `⏺ short answer` followed by Claude's tinted branch/status card is still
+    // assistant prose plus lifecycle chrome, not a tool invocation. Keep the
+    // answer root and let the system-block pass remove the child. A function-
+    // shaped tool root remains authoritative even if its result happens to be
+    // dimmed.
+    if (provider === 'claude') {
+      const childStyle = terminalLineStyleEvidence(source[child]);
+      const tintedBranch = (childStyle.hasDim || childStyle.allTextDim)
+        && !CLAUDE_OPEN_TOOL_INVOCATION_RE.test(rootText);
+      if (CLAUDE_KNOWN_BRANCH_STATUS_RE.test(childText) || tintedBranch) {
+        start = end - 1;
+        continue;
+      }
     }
     for (let index = start; index < end; index += 1) excluded.add(index);
     styleEvidence = styleEvidence
@@ -426,6 +588,111 @@ function filterInlineTerminalToolCards(lines, provider) {
     lines: source.filter((_, index) => !excluded.has(index)),
     filtered: excluded.size,
     styleEvidence,
+  };
+}
+
+/**
+ * Carries provider-owned block identity across the exact preview boundary.
+ *
+ * A marker/baseline can land inside a multi-line TUI card. The owned region
+ * then starts with an innocent-looking tail (`MCP tools`, a plan checkbox,
+ * etc.) while the structural root remains a few rows above it. The context is
+ * read-only: it can prove that the first owned rows continue an already-open
+ * provider block, but it is never returned as assistant text.
+ */
+function filterBoundarySpanningProviderBlock({
+  leadingPhysicalLines,
+  physicalLines,
+  provider,
+} = {}) {
+  const ownedLogical = logicalTerminalLines(physicalLines);
+  const leading = Array.isArray(leadingPhysicalLines) ? leadingPhysicalLines : [];
+  if (leading.length === 0 || ownedLogical.length === 0) {
+    return {
+      lines: ownedLogical,
+      filtered: 0,
+      kinds: [],
+      styleEvidence: false,
+    };
+  }
+  const ownedRows = (Array.isArray(physicalLines) ? physicalLines : [])
+    .map((line) => Number(line?.row))
+    .filter(Number.isFinite);
+  if (ownedRows.length === 0) {
+    return {
+      lines: ownedLogical,
+      filtered: 0,
+      kinds: [],
+      styleEvidence: false,
+    };
+  }
+  const firstOwnedRow = Math.min(...ownedRows);
+  const context = leading.filter((line) => {
+    const row = Number(line?.row);
+    return Number.isFinite(row) && row < firstOwnedRow;
+  });
+  if (context.length === 0) {
+    return {
+      lines: ownedLogical,
+      filtered: 0,
+      kinds: [],
+      styleEvidence: false,
+    };
+  }
+
+  const combined = logicalTerminalLines([...context, ...physicalLines]);
+  const composerIndex = findComposerIndex(combined, provider);
+  const candidate = composerIndex >= 0 ? combined.slice(0, composerIndex) : combined;
+  // Preserve the root/child relationship before the generic system filter
+  // removes a styled `⎿` child on its own. Long Claude commands can occupy
+  // several explicit physical rows, so losing that child makes the remaining
+  // `⏺ Bash(...)` rows look like prose.
+  const toolCards = filterInlineTerminalToolCards(candidate, provider);
+  const systemBlocks = filterTerminalSystemBlocks(toolCards.lines, provider);
+  const kept = new Set(systemBlocks.lines);
+  let contextTail = -1;
+  let firstOwned = -1;
+  for (let index = 0; index < candidate.length; index += 1) {
+    if (candidate[index].endRow < firstOwnedRow) contextTail = index;
+    else if (firstOwned < 0) firstOwned = index;
+  }
+  // Context is authority only when the provider-owned block reaches the exact
+  // boundary and also consumes the first owned logical row. An earlier card
+  // cannot suppress a later independent assistant paragraph.
+  if (contextTail < 0
+    || firstOwned < 0
+    || kept.has(candidate[contextTail])
+    || kept.has(candidate[firstOwned])) {
+    return {
+      lines: ownedLogical,
+      filtered: 0,
+      kinds: [],
+      styleEvidence: false,
+    };
+  }
+
+  const excludedRanges = candidate
+    .filter((line) => line.endRow >= firstOwnedRow && !kept.has(line))
+    .map((line) => [line.startRow, line.endRow]);
+  const lines = ownedLogical.filter((line) => !excludedRanges.some(([start, end]) => (
+    line.endRow >= start && line.startRow <= end
+  )));
+  const filtered = ownedLogical.length - lines.length;
+  if (filtered <= 0) {
+    return {
+      lines: ownedLogical,
+      filtered: 0,
+      kinds: [],
+      styleEvidence: false,
+    };
+  }
+  const kinds = ['boundary-system-continuation', ...systemBlocks.kinds];
+  if (toolCards.filtered > 0 && !kinds.includes('tool-card')) kinds.push('tool-card');
+  return {
+    lines,
+    filtered,
+    kinds,
+    styleEvidence: systemBlocks.styleEvidence === true || toolCards.styleEvidence === true,
   };
 }
 
@@ -505,30 +772,39 @@ function removeResidualCodexSubmittedPromptBlocks(lines, provider) {
     return { lines: source, removed: 0, blocks: 0 };
   }
   const excluded = new Set();
-  const index = source.findIndex((line) => String(line?.text || '').trim());
-  if (index < 0) return { lines: source, removed: 0, blocks: 0 };
-  const line = source[index];
-  const text = String(line?.text || '');
-  const style = terminalLineStyleEvidence(line);
-  if (!STRONG_COMPOSER_RE.test(text)
-    || !(style.activeByInverse || style.hasInverse || style.hasNonDefaultBg)) {
-    return { lines: source, removed: 0, blocks: 0 };
-  }
-  excluded.add(index);
-  let next = index + 1;
-  while (next < source.length) {
-    const continuation = terminalLineStyleEvidence(source[next]);
-    if (!(continuation.activeByInverse
-      || continuation.hasInverse
-      || continuation.hasNonDefaultBg)) break;
-    excluded.add(next);
-    next += 1;
+  let blocks = 0;
+  let index = 0;
+  while (index < source.length) {
+    const line = source[index];
+    const text = String(line?.text || '');
+    const style = terminalLineStyleEvidence(line);
+    if (!STRONG_COMPOSER_RE.test(text)
+      || !(style.activeByInverse || style.hasInverse || style.hasNonDefaultBg)) {
+      index += 1;
+      continue;
+    }
+
+    // A full-screen redraw can repaint the submitted prompt below older
+    // history, so it is not necessarily the first non-empty owned row. The
+    // provider-owned background/inverse card is the structural proof; an
+    // ordinary `›` in assistant prose still has no such style and is kept.
+    blocks += 1;
+    excluded.add(index);
+    index += 1;
+    while (index < source.length) {
+      const continuation = terminalLineStyleEvidence(source[index]);
+      if (!(continuation.activeByInverse
+        || continuation.hasInverse
+        || continuation.hasNonDefaultBg)) break;
+      excluded.add(index);
+      index += 1;
+    }
   }
   if (excluded.size === 0) return { lines: source, removed: 0, blocks: 0 };
   return {
     lines: source.filter((_, index) => !excluded.has(index)),
     removed: excluded.size,
-    blocks: 1,
+    blocks,
   };
 }
 
@@ -577,6 +853,7 @@ function removeProviderAnswerMarker(lines, provider) {
 
 function extractTerminalHistoryPreviewText({
   provider,
+  leadingPhysicalLines = [],
   physicalLines,
   promptText = '',
   promptPrefixClipped = false,
@@ -586,7 +863,12 @@ function extractTerminalHistoryPreviewText({
   if (!normalizedProvider) {
     return { status: 'unknown', reason: 'provider-unsupported', text: '' };
   }
-  const logical = logicalTerminalLines(physicalLines);
+  const boundaryContext = filterBoundarySpanningProviderBlock({
+    leadingPhysicalLines,
+    physicalLines,
+    provider: normalizedProvider,
+  });
+  const logical = boundaryContext.lines;
   if (logical.length === 0) {
     return { status: 'empty', reason: 'owned-region-empty', text: '', logicalLines: 0 };
   }
@@ -606,20 +888,32 @@ function extractTerminalHistoryPreviewText({
     normalizedProvider,
   );
   owned = residualPromptBlocks.lines;
-  const systemBlocks = filterTerminalSystemBlocks(owned, normalizedProvider);
-  const withoutFrameChrome = systemBlocks.lines.filter((line) => !isFrameOnlyLine(line.text));
+  const withoutFrameChrome = owned.filter((line) => !isFrameOnlyLine(line.text));
+  // Tool cards are atomic provider records. Classify them before their styled
+  // result child is consumed as a standalone branch/status row.
   const toolCards = filterInlineTerminalToolCards(withoutFrameChrome, normalizedProvider);
-  const kept = toolCards.lines;
+  const systemBlocks = filterTerminalSystemBlocks(toolCards.lines, normalizedProvider);
+  const clippedToolCard = filterClippedCodexToolCardPrefix(
+    systemBlocks.lines,
+    normalizedProvider,
+  );
+  const kept = clippedToolCard.lines;
   const markerRemoval = removeProviderAnswerMarker(kept, normalizedProvider);
   const textLines = collapseBlankLines(markerRemoval.lines);
   let text = textLines.join('\n').trim();
   let truncated = regionTruncated === true;
-  const filteredBlockKinds = [...systemBlocks.kinds];
-  if (toolCards.filtered > 0 && !filteredBlockKinds.includes('tool-card')) {
+  const filteredBlockKinds = Array.from(new Set([
+    ...boundaryContext.kinds,
+    ...systemBlocks.kinds,
+  ]));
+  if ((toolCards.filtered > 0 || clippedToolCard.filtered > 0)
+    && !filteredBlockKinds.includes('tool-card')) {
     filteredBlockKinds.push('tool-card');
   }
-  const styleEvidenceUsed = systemBlocks.styleEvidence === true
-    || toolCards.styleEvidence === true;
+  const styleEvidenceUsed = boundaryContext.styleEvidence === true
+    || systemBlocks.styleEvidence === true
+    || toolCards.styleEvidence === true
+    || clippedToolCard.styleEvidence === true;
   if (text.length > MAX_PREVIEW_CHARS) {
     text = text.slice(text.length - MAX_PREVIEW_CHARS);
     truncated = true;
@@ -636,6 +930,7 @@ function extractTerminalHistoryPreviewText({
       promptLinesRemoved: promptRemoval.removed,
       residualPromptLinesRemoved: residualPromptBlocks.removed,
       residualPromptBlocksRemoved: residualPromptBlocks.blocks,
+      leadingContextLinesRemoved: boundaryContext.filtered,
       answerMarkerRemoved: markerRemoval.removed,
       filteredBlockKinds,
       styleEvidenceUsed,
@@ -654,6 +949,7 @@ function extractTerminalHistoryPreviewText({
     promptLinesRemoved: promptRemoval.removed,
     residualPromptLinesRemoved: residualPromptBlocks.removed,
     residualPromptBlocksRemoved: residualPromptBlocks.blocks,
+    leadingContextLinesRemoved: boundaryContext.filtered,
     answerMarkerRemoved: markerRemoval.removed,
     filteredBlockKinds,
     styleEvidenceUsed,
@@ -695,6 +991,511 @@ function normalizedTextWithOffsets(value) {
     endOffsets.push(index);
   }
   return { text, endOffsets };
+}
+
+const MAX_STRUCTURED_PROOF_FRAGMENTS = 32;
+const MAX_STRUCTURED_PROOF_FRAGMENT_CHARS = 128 * 1024;
+const MAX_STRUCTURED_PROOF_TOTAL_CHARS = 256 * 1024;
+const MIN_STRUCTURED_PROJECTION_MATCH = 32;
+const MIN_STRUCTURED_CHAIN_SEGMENT_MATCH = 8;
+
+// Terminal wrapping can split a word without marking the row as xterm-wrap.
+// Exact JSONL proof therefore compares a whitespace-free representation while
+// retaining offsets into the original candidate for safe prefix removal.
+function structuredProjectionTextWithOffsets(value) {
+  const source = String(value || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[\u200b\u200c\u200d\ufeff]/g, '');
+  let text = '';
+  const endOffsets = [];
+  for (let index = 0; index < source.length; index += 1) {
+    if (/\s/u.test(source[index])) continue;
+    text += source[index];
+    endOffsets.push(index);
+  }
+  return { source, text, endOffsets };
+}
+
+function tokenizeStructuredShellCommands(value) {
+  const source = String(value || '');
+  const commands = [];
+  let command = [];
+  let token = '';
+  let quote = null;
+  let escaped = false;
+
+  const flushToken = () => {
+    if (!token) return;
+    command.push(token);
+    token = '';
+  };
+  const flushCommand = () => {
+    flushToken();
+    if (command.length > 0) commands.push(command);
+    command = [];
+  };
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (escaped) {
+      token += char;
+      escaped = false;
+      continue;
+    }
+    if (char === '\\' && quote !== "'") {
+      // Keep the slash: it can be meaningful inside an rg expression. It only
+      // changes how the following shell character is tokenized here.
+      token += char;
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else token += char;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (/\s/u.test(char)) {
+      flushToken();
+      if (char === '\n' || char === '\r') flushCommand();
+      continue;
+    }
+    if (char === ';' || char === '|' || char === '&') {
+      flushCommand();
+      continue;
+    }
+    token += char;
+  }
+  flushCommand();
+  return commands;
+}
+
+const STRUCTURED_SEARCH_NO_VALUE_FLAGS = new Set([
+  '-n', '--line-number', '-i', '--ignore-case', '-S', '--smart-case',
+  '-F', '--fixed-strings', '-l', '--files-with-matches', '--hidden',
+  '--no-heading', '--heading', '--trim', '-w', '--word-regexp',
+  '-x', '--line-regexp', '-U', '--multiline', '--pcre2', '-r', '-R',
+]);
+const STRUCTURED_SEARCH_VALUE_FLAGS = new Set([
+  '-C', '--context', '-A', '--after-context', '-B', '--before-context',
+  '-g', '--glob', '-t', '--type', '-T', '--type-not', '-m', '--max-count',
+]);
+
+function structuredShellSearchProjectionVariants(value) {
+  const variants = [];
+  for (const tokens of tokenizeStructuredShellCommands(value)) {
+    let commandIndex = 0;
+    if (tokens[commandIndex] === 'command' || tokens[commandIndex] === 'env') {
+      commandIndex += 1;
+    }
+    const executable = String(tokens[commandIndex] || '').split('/').pop();
+    if (executable !== 'rg' && executable !== 'grep') continue;
+
+    let pattern = null;
+    const paths = [];
+    let optionsEnded = false;
+    let supported = true;
+    for (let index = commandIndex + 1; index < tokens.length; index += 1) {
+      const current = tokens[index];
+      if (!optionsEnded && current === '--') {
+        optionsEnded = true;
+        continue;
+      }
+      if (!optionsEnded && current.startsWith('-') && current !== '-') {
+        if (current.includes('=') || STRUCTURED_SEARCH_NO_VALUE_FLAGS.has(current)) {
+          continue;
+        }
+        if (STRUCTURED_SEARCH_VALUE_FLAGS.has(current)) {
+          index += 1;
+          if (index >= tokens.length) supported = false;
+          continue;
+        }
+        // Unknown options can consume a following value. Refuse to derive a
+        // semantic projection instead of guessing which token is the pattern.
+        supported = false;
+        break;
+      }
+      if (pattern === null) pattern = current;
+      else paths.push(current);
+    }
+    if (!supported || !pattern || paths.length === 0) continue;
+
+    for (const filePath of paths) {
+      const basename = String(filePath || '').replace(/[\\/]+$/u, '').split(/[\\/]/u).pop();
+      if (!basename || basename === '.' || basename === '..') continue;
+      // Codex renders an exact rg/grep invocation as `Search <pattern> in
+      // <basename>`. Keep both the full card text and the clipped form seen
+      // when the root/verb was already painted into the committed baseline.
+      variants.push(`Search ${pattern} in ${basename}`);
+      variants.push(`${pattern} in ${basename}`);
+    }
+  }
+  return variants;
+}
+
+function structuredShellReadProjectionVariants(value) {
+  const variants = [];
+  for (const tokens of tokenizeStructuredShellCommands(value)) {
+    let commandIndex = 0;
+    if (tokens[commandIndex] === 'command' || tokens[commandIndex] === 'env') {
+      commandIndex += 1;
+    }
+    const executable = String(tokens[commandIndex] || '').split('/').pop();
+    const paths = [];
+
+    if (executable === 'sed') {
+      let scriptConsumed = false;
+      for (let index = commandIndex + 1; index < tokens.length; index += 1) {
+        const current = tokens[index];
+        if (current === '--') continue;
+        if (current === '-n' || current === '--quiet' || current === '--silent') continue;
+        if (current === '-e' || current === '--expression'
+          || current === '-f' || current === '--file') {
+          index += 1;
+          scriptConsumed = true;
+          continue;
+        }
+        if (current.startsWith('-') && current !== '-') continue;
+        if (!scriptConsumed) {
+          scriptConsumed = true;
+          continue;
+        }
+        paths.push(current);
+      }
+    } else if (executable === 'cat' || executable === 'head' || executable === 'tail') {
+      for (let index = commandIndex + 1; index < tokens.length; index += 1) {
+        const current = tokens[index];
+        if (current === '-n' || current === '-c' || current === '--lines'
+          || current === '--bytes') {
+          index += 1;
+          continue;
+        }
+        if (current === '--' || (current.startsWith('-') && current !== '-')) continue;
+        paths.push(current);
+      }
+    } else {
+      continue;
+    }
+
+    for (const filePath of paths) {
+      const basename = String(filePath || '').replace(/[\\/]+$/u, '').split(/[\\/]/u).pop();
+      if (!basename || basename === '.' || basename === '..' || basename === '-') continue;
+      variants.push(`Read ${basename}`);
+    }
+  }
+  return variants;
+}
+
+function structuredJsonLeafStrings(value) {
+  const source = String(value || '').trim();
+  if (!source || !(
+    (source.startsWith('{') && source.endsWith('}'))
+    || (source.startsWith('[') && source.endsWith(']'))
+  )) return [];
+
+  let parsed;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    return [];
+  }
+
+  const strings = [];
+  const visit = (current, depth = 0) => {
+    if (strings.length >= 64 || depth > 8 || current == null) return;
+    if (typeof current === 'string') {
+      const text = current.trim();
+      if (text) strings.push(text);
+      return;
+    }
+    if (Array.isArray(current)) {
+      for (const item of current) visit(item, depth + 1);
+      return;
+    }
+    if (typeof current !== 'object') return;
+    for (const nested of Object.values(current)) {
+      visit(nested, depth + 1);
+      if (strings.length >= 64) break;
+    }
+  };
+  visit(parsed);
+  return strings;
+}
+
+function structuredProofValueVariants(value) {
+  const exactValues = [value, ...structuredJsonLeafStrings(value)];
+  const variants = [];
+  for (const exactValue of exactValues) {
+    variants.push(
+      exactValue,
+      ...structuredShellSearchProjectionVariants(exactValue),
+      ...structuredShellReadProjectionVariants(exactValue),
+    );
+  }
+  return [...new Set(variants)];
+}
+
+function boundedStructuredProofParts(value) {
+  const normalized = structuredProjectionTextWithOffsets(value).text;
+  if (normalized.length < MIN_STRUCTURED_CHAIN_SEGMENT_MATCH) return [];
+  if (normalized.length <= MAX_STRUCTURED_PROOF_FRAGMENT_CHARS) return [normalized];
+  const half = Math.floor(MAX_STRUCTURED_PROOF_FRAGMENT_CHARS / 2);
+  return [normalized.slice(0, half), normalized.slice(-half)];
+}
+
+/**
+ * Builds a bounded, in-memory receipt of exact thinking/tool JSONL payloads.
+ * Raw strings are not logged or persisted here; they are retained only for
+ * the active turn and are discarded with its controller state.
+ */
+function createTerminalHistoryStructuredProof(values, previousProof = null) {
+  const fragments = Array.isArray(previousProof?.fragments)
+    ? previousProof.fragments.slice()
+    : [];
+  for (const value of Array.isArray(values) ? values : [values]) {
+    if (typeof value !== 'string' || !value.trim()) continue;
+    for (const variant of structuredProofValueVariants(value)) {
+      for (const text of boundedStructuredProofParts(variant)) {
+        if (fragments.some((fragment) => fragment === text)) continue;
+        fragments.push(text);
+      }
+    }
+  }
+  while (fragments.length > MAX_STRUCTURED_PROOF_FRAGMENTS
+    || fragments.reduce((sum, fragment) => sum + fragment.length, 0)
+      > MAX_STRUCTURED_PROOF_TOTAL_CHARS) {
+    fragments.shift();
+  }
+  return {
+    fragments,
+    chars: fragments.reduce((sum, fragment) => sum + fragment.length, 0),
+  };
+}
+
+function longestStructuredProjectionPrefix(candidateText, fragments) {
+  if (candidateText.length < MIN_STRUCTURED_PROJECTION_MATCH) return 0;
+  const seed = candidateText.slice(0, MIN_STRUCTURED_PROJECTION_MATCH);
+  let best = 0;
+  for (const fragment of fragments) {
+    let position = fragment.indexOf(seed);
+    let inspected = 0;
+    while (position >= 0 && inspected < 32) {
+      let length = MIN_STRUCTURED_PROJECTION_MATCH;
+      const limit = Math.min(candidateText.length, fragment.length - position);
+      while (length < limit && candidateText[length] === fragment[position + length]) {
+        length += 1;
+      }
+      if (length > best) best = length;
+      if (best === candidateText.length) return best;
+      position = fragment.indexOf(seed, position + 1);
+      inspected += 1;
+    }
+  }
+  return best;
+}
+
+function completeStructuredProjectionMatch(candidateValue, fragments, allowShort = false) {
+  const normalized = structuredProjectionTextWithOffsets(candidateValue).text;
+  if (!normalized) return { matched: false, strong: false };
+  if (normalized.length >= MIN_STRUCTURED_PROJECTION_MATCH) {
+    const matched = longestStructuredProjectionPrefix(normalized, fragments);
+    if (matched >= normalized.length) return { matched: true, strong: true };
+
+    // Claude/Codex abbreviate a tool card with a terminal ellipsis even though
+    // the exact structured payload continues. The ellipsis is presentation,
+    // not part of the command receipt.
+    const unclipped = normalized.replace(/(?:…|\.\.\.)(?:\))?$/u, '');
+    if (unclipped.length >= MIN_STRUCTURED_PROJECTION_MATCH
+      && unclipped.length < normalized.length
+      && longestStructuredProjectionPrefix(unclipped, fragments) >= unclipped.length) {
+      return { matched: true, strong: true };
+    }
+  }
+  if (!allowShort
+    || normalized.length < MIN_STRUCTURED_CHAIN_SEGMENT_MATCH
+    || normalized.length >= MIN_STRUCTURED_PROJECTION_MATCH) {
+    return { matched: false, strong: false };
+  }
+  return {
+    matched: fragments.some((fragment) => fragment === normalized || fragment.endsWith(normalized)),
+    strong: false,
+  };
+}
+
+function isStructuredProjectionShortPrefixChain(candidate, fragments) {
+  let inspected = 0;
+  for (let index = candidate.indexOf('\n'); index >= 0 && inspected < 16;
+    index = candidate.indexOf('\n', index + 1)) {
+    inspected += 1;
+    const prefix = candidate.slice(0, index).trim();
+    const suffix = candidate.slice(index + 1).trim();
+    const prefixLength = structuredProjectionTextWithOffsets(prefix).text.length;
+    if (prefixLength >= MIN_STRUCTURED_PROJECTION_MATCH) break;
+    if (prefixLength < MIN_STRUCTURED_CHAIN_SEGMENT_MATCH || !suffix) continue;
+    const prefixMatch = completeStructuredProjectionMatch(prefix, fragments, true);
+    if (!prefixMatch.matched) continue;
+    const suffixMatch = completeStructuredProjectionMatch(suffix, fragments, false);
+    if (suffixMatch.matched && suffixMatch.strong) return true;
+  }
+  return false;
+}
+
+const STRUCTURED_DIFF_GUTTER_RE = /^\s*\d+\s+[+-]{1,2}/u;
+const STRUCTURED_DIFF_END_RE = /^\s*\d+\s*$/u;
+
+function subtractStructuredProjectionDiffTail(value) {
+  const source = String(value || '');
+  const lines = source.split('\n');
+  let start = 0;
+  while (start < lines.length && !lines[start].trim()) start += 1;
+  if (start >= lines.length || !STRUCTURED_DIFF_GUTTER_RE.test(lines[start])) {
+    return { matched: false, text: source, removedChars: 0 };
+  }
+
+  let end = start;
+  let gutterCount = 0;
+  let sawEndRow = false;
+  while (end < lines.length) {
+    const raw = lines[end];
+    if (STRUCTURED_DIFF_GUTTER_RE.test(raw)) {
+      gutterCount += 1;
+      end += 1;
+      continue;
+    }
+    if (gutterCount > 0 && STRUCTURED_DIFF_END_RE.test(raw)) {
+      sawEndRow = true;
+      end += 1;
+      continue;
+    }
+    if (!raw.trim()) {
+      end += 1;
+      continue;
+    }
+    // Narrow panes explicitly repaint continuation cells instead of setting
+    // xterm's wrapped bit. They remain deeply indented under the diff gutter.
+    if (gutterCount > 0 && /^\s{4,}\S/u.test(raw)) {
+      end += 1;
+      continue;
+    }
+    break;
+  }
+
+  // One line such as `64 + is a formula` may be legitimate prose. Require a
+  // real multi-row diff or its provider-rendered terminal row sentinel.
+  if (gutterCount < 2 && !sawEndRow) {
+    return { matched: false, text: source, removedChars: 0 };
+  }
+  const text = lines.slice(end).join('\n').trim();
+  return {
+    matched: true,
+    text,
+    removedChars: Math.max(0, source.length - text.length),
+  };
+}
+
+/**
+ * Removes only a prefix/current frame which is byte-content-equivalent to an
+ * exact structured JSONL payload. An unrelated provisional assistant answer
+ * is returned untouched. A matched prefix is trimmed only at a line boundary,
+ * so a partial same-line coincidence cannot consume following prose.
+ */
+function subtractTerminalHistoryStructuredProjection(proof, candidateValue) {
+  const candidate = String(candidateValue || '').trim();
+  const fragments = Array.isArray(proof?.fragments) ? proof.fragments : [];
+  if (!candidate) return { status: 'empty', reason: 'candidate-empty', text: '' };
+  if (fragments.length === 0) {
+    return { status: 'text', reason: 'structured-proof-unavailable', text: candidate };
+  }
+
+  // The provider can abbreviate the last visible cells of a long exact
+  // thinking/tool record with `…`. That glyph belongs to terminal
+  // presentation; a strong match of every preceding character is sufficient
+  // to identify the whole candidate as the already-materialized record.
+  const complete = completeStructuredProjectionMatch(candidate, fragments, false);
+  if (complete.matched && complete.strong) {
+    return {
+      status: 'empty',
+      reason: 'structured-projection-only',
+      text: '',
+      removedChars: candidate.length,
+    };
+  }
+
+  // A viewport/baseline boundary can split two adjacent provider-owned
+  // records so the first visible fragment is shorter than the normal 32-char
+  // collision guard (`the scripting work.` + Bash, or `Read main.js` +
+  // Search). A short fragment has no authority by itself. Suppress only when
+  // it is an exact suffix/derived label from the receipt and the entire
+  // following block has an independent strong receipt.
+  if (isStructuredProjectionShortPrefixChain(candidate, fragments)) {
+    return {
+      status: 'empty',
+      reason: 'structured-projection-chain-only',
+      text: '',
+      removedChars: candidate.length,
+    };
+  }
+
+  let remaining = candidate;
+  let removedChars = 0;
+  for (let pass = 0; pass < 8 && remaining; pass += 1) {
+    const normalized = structuredProjectionTextWithOffsets(remaining);
+    const matched = longestStructuredProjectionPrefix(normalized.text, fragments);
+    if (matched < MIN_STRUCTURED_PROJECTION_MATCH) break;
+    if (matched >= normalized.text.length) {
+      return {
+        status: 'empty',
+        reason: removedChars > 0
+          ? 'structured-projections-only'
+          : 'structured-projection-only',
+        text: '',
+        removedChars: candidate.length,
+      };
+    }
+    const originalEnd = normalized.endOffsets[matched - 1];
+    if (!Number.isFinite(originalEnd)) break;
+    const tail = remaining.slice(originalEnd + 1);
+    // A proof fragment ending in the middle of a rendered line is not enough
+    // authority to remove anything. Exact tool/result blocks transition to a
+    // following semantic block on a physical line boundary.
+    if (!/^\s*\n/u.test(tail)) break;
+    removedChars += originalEnd + 1;
+    remaining = tail.replace(/^\s+/u, '');
+  }
+
+  // Codex renders an Update/MultiEdit result as a header followed by a
+  // numbered diff gutter. The exact JSONL fragment proves the header, but the
+  // presentation-only line numbers, +/- columns and explicit-wrap indentation
+  // cannot byte-match that fragment. Once the header has been removed, consume
+  // only a structurally complete multi-line diff tail. A later unindented line
+  // is preserved as genuine assistant prose.
+  if (removedChars > 0 && remaining) {
+    const diffTail = subtractStructuredProjectionDiffTail(remaining);
+    if (diffTail.matched) {
+      removedChars += diffTail.removedChars;
+      remaining = diffTail.text;
+    }
+  }
+
+  if (remaining !== candidate) {
+    return {
+      status: remaining ? 'text' : 'empty',
+      reason: remaining
+        ? 'structured-projection-prefix-removed'
+        : 'structured-projections-only',
+      text: remaining,
+      removedChars,
+      hash: remaining ? previewTextHash(remaining) : null,
+    };
+  }
+  return {
+    status: 'text',
+    reason: 'candidate-not-structured-projection',
+    text: candidate,
+  };
 }
 
 function characterOverlap(previous, next, maxChars = 8192) {
@@ -824,6 +1625,22 @@ function deriveTerminalHistoryPreviewTextAfterBaseline(baselineValue, currentVal
  * viewport may expose only a contiguous part or the tail of the canonical
  * record, so those shapes remain empty until genuinely new text follows it.
  */
+function terminalMaterializedProjectionVariants(value) {
+  const raw = String(value || '').trim();
+  const variants = [{ value: raw, projection: 'exact-jsonl' }];
+  // Codex stores Markdown delimiters in JSONL but paints inline-code spans by
+  // ANSI style, without the backticks. The rendered characters are still an
+  // exact projection of the same record; compare both deterministic shapes.
+  const withoutInlineCodeDelimiters = raw.replace(/(?<!`)`([^`\r\n]+)`(?!`)/gu, '$1');
+  if (withoutInlineCodeDelimiters !== raw) {
+    variants.push({
+      value: withoutInlineCodeDelimiters,
+      projection: 'terminal-inline-code',
+    });
+  }
+  return variants;
+}
+
 function subtractTerminalHistoryMaterializedText(materializedValue, candidateValue) {
   const materialized = String(materializedValue || '').trim();
   const candidate = String(candidateValue || '').trim();
@@ -834,50 +1651,69 @@ function subtractTerminalHistoryMaterializedText(materializedValue, candidateVal
     return { status: 'text', reason: 'materialized-text-unavailable', text: candidate };
   }
 
-  const expected = normalizedTextWithOffsets(materialized);
   const actual = normalizedTextWithOffsets(candidate);
-  if (!expected.text || !actual.text) {
+  const variants = terminalMaterializedProjectionVariants(materialized)
+    .map((variant) => ({ ...variant, normalized: normalizedTextWithOffsets(variant.value) }))
+    .filter((variant) => variant.normalized.text);
+  if (variants.length === 0 || !actual.text) {
     return { status: 'text', reason: 'materialized-text-unavailable', text: candidate };
   }
 
-  const isPartialMaterializedFrame = expected.text.startsWith(actual.text)
-    || (actual.text.length >= 32 && expected.text.includes(actual.text));
-  if (expected.text === actual.text || isPartialMaterializedFrame) {
-    return {
-      status: 'empty',
-      reason: expected.text === actual.text
-        ? 'materialized-record-only'
-        : 'materialized-record-partial-frame',
-      text: '',
-    };
-  }
-
-  if (actual.text.startsWith(expected.text)) {
-    const originalEnd = actual.endOffsets[expected.text.length - 1];
-    const suffix = Number.isFinite(originalEnd)
-      ? candidate.slice(originalEnd + 1).replace(/^\s+/u, '')
-      : '';
-    if (!suffix) {
-      return { status: 'empty', reason: 'materialized-record-only', text: '' };
+  for (const variant of variants) {
+    const expected = variant.normalized;
+    const isPartialMaterializedFrame = expected.text.startsWith(actual.text)
+      || (actual.text.length >= 32 && expected.text.includes(actual.text));
+    if (expected.text === actual.text || isPartialMaterializedFrame) {
+      return {
+        status: 'empty',
+        reason: expected.text === actual.text
+          ? 'materialized-record-only'
+          : 'materialized-record-partial-frame',
+        text: '',
+        projection: variant.projection,
+      };
     }
-    return {
-      status: 'text',
-      reason: 'materialized-record-prefix-removed',
-      text: suffix,
-      hash: previewTextHash(suffix),
-    };
+
+    if (actual.text.startsWith(expected.text)) {
+      const originalEnd = actual.endOffsets[expected.text.length - 1];
+      const suffix = Number.isFinite(originalEnd)
+        ? candidate.slice(originalEnd + 1).replace(/^\s+/u, '')
+        : '';
+      if (!suffix) {
+        return {
+          status: 'empty',
+          reason: 'materialized-record-only',
+          text: '',
+          projection: variant.projection,
+        };
+      }
+      return {
+        status: 'text',
+        reason: 'materialized-record-prefix-removed',
+        text: suffix,
+        hash: previewTextHash(suffix),
+        projection: variant.projection,
+      };
+    }
   }
 
-  const clippedTail = characterOverlap(materialized, candidate);
-  if (clippedTail) {
+  for (const variant of variants) {
+    const clippedTail = characterOverlap(variant.value, candidate);
+    if (!clippedTail) continue;
     if (!clippedTail.remainder) {
-      return { status: 'empty', reason: 'materialized-record-clipped-tail', text: '' };
+      return {
+        status: 'empty',
+        reason: 'materialized-record-clipped-tail',
+        text: '',
+        projection: variant.projection,
+      };
     }
     return {
       status: 'text',
       reason: 'materialized-record-clipped-tail-removed',
       text: clippedTail.remainder,
       hash: previewTextHash(clippedTail.remainder),
+      projection: variant.projection,
     };
   }
 
@@ -913,4 +1749,6 @@ module.exports = {
   normalizeTerminalHistoryPromptText,
   previewTextHash,
   subtractTerminalHistoryMaterializedText,
+  createTerminalHistoryStructuredProof,
+  subtractTerminalHistoryStructuredProjection,
 };

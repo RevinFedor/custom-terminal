@@ -3,7 +3,7 @@ import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocuse
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
-import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG } from './utils/projectCardPresence.mjs';
+import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG, PROJECT_CARD_WORKING_RING } from './utils/projectCardPresence.mjs';
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
@@ -513,6 +513,10 @@ const ProjectTabItem = memo(({
   const cardPresence = useWorkspaceStore((s) => projectCardPresence({
     projectId,
     focusedProjectId: s.focusedProjectId || s.activeProjectId,
+    // The ACTIVE tab's project — one tier above merely visible. Follows the
+    // active tab, not the keyboard owner: a click into the sidebar must not
+    // flicker the titlebar.
+    activeProjectId: s.activeProjectId,
     panes: s.splitPanes,
     centerProjectId: s.activeProjectId,
   }));
@@ -691,10 +695,21 @@ const ProjectTabItem = memo(({
           the user was working in it. A faint wash, because the card's edges are
           taken by the drop outline and the focus ring, and its inside by the
           completion flash, the awaiting pulse and the process counter. */}
-      {!isActive && cardPresence === 'on-screen' && (
+      {!isActive && (cardPresence === 'on-screen' || cardPresence === 'working') && (
         <div
           className="absolute inset-0 rounded-sm pointer-events-none"
-          style={{ background: PROJECT_CARD_ON_SCREEN_BG, zIndex: 6 }}
+          style={{
+            background: PROJECT_CARD_ON_SCREEN_BG,
+            // 'working' — the ACTIVE tab belongs to this project: the wash gains
+            // a 1px contour, the same language as the pane frame (contour =
+            // "work happens here"). Deliberately NOT a brighter wash: two alphas
+            // a few percent apart cannot be told apart on a small card, while
+            // "has an edge" reads instantly. The focused white plate stays the
+            // loudest — a working card outshining it would read as "switching
+            // the tab switched the project".
+            boxShadow: cardPresence === 'working' ? PROJECT_CARD_WORKING_RING : undefined,
+            zIndex: 6,
+          }}
           aria-hidden
         />
       )}

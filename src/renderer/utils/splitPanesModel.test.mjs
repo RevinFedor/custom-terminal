@@ -23,6 +23,8 @@ import {
   restorablePaneHistory,
   dropFromPaneHistory,
   dropTabFromAllPaneHistories,
+  splitAvailability,
+  emptyPaneByClosedTab,
   PANE_HISTORY_CAP,
 } from './splitPanesModel.mjs';
 
@@ -148,7 +150,7 @@ test('removePanesByProject keeps focus on the surviving focused tab', () => {
   assert.equal(res2.focusedIndex, 0);
 });
 
-test('sanitizePanes drops dead tabs and empty placeholders, collapses <2', () => {
+test('sanitizePanes drops dead tabs, collapses <2', () => {
   const alive = new Set(['p1:a', 'p2:b']);
   const exists = (pr, t) => alive.has(`${pr}:${t}`);
   const res = sanitizePanes([p('p1', 'a'), p('p2', 'b'), p('p3', 'dead')], 2, exists);
@@ -156,8 +158,19 @@ test('sanitizePanes drops dead tabs and empty placeholders, collapses <2', () =>
   assert.equal(res.focusedIndex, 1);
   const collapsed = sanitizePanes([p('p1', 'a'), p('p3', 'dead')], 0, exists);
   assert.deepEqual(collapsed, { panes: [], focusedIndex: 0 });
+});
+
+test('окно, оставленное пустым, переживает перезапуск', () => {
+  // Пока пустая панель существовала только как «нажал деление, ещё не выбрал
+  // вкладку», терять её на рестарте было бесплатно. С того момента, как
+  // очистка окна стала обычным жестом, это перестало быть правдой: окно,
+  // которое пользователь намеренно оставил пустым, — часть его раскладки.
+  const exists = (pr, t) => t === 'a';
   const withEmpty = sanitizePanes([p('p1', 'a'), EMPTY], 1, exists);
-  assert.deepEqual(withEmpty, { panes: [], focusedIndex: 0 });
+  assert.equal(withEmpty.panes.length, 2, 'оба окна вернулись');
+  assert.equal(withEmpty.panes[1].tabId, '');
+  // …но раскладка из одних пустых окон — не раскладка.
+  assert.deepEqual(sanitizePanes([EMPTY, EMPTY], 0, exists), { panes: [], focusedIndex: 0 });
 });
 
 test('paneRects splits width evenly', () => {
@@ -245,11 +258,61 @@ test('addEmptyPaneVertical stacks the new pane INSIDE the anchor column', () => 
   assert.equal(cols[1].length, 2, 'second column now has two rows');
 });
 
-test('addEmptyPaneVertical refuses a second placeholder and a 4th pane', () => {
+test('addEmptyPaneVertical refuses a second placeholder', () => {
   const withEmpty = [p('p1', 'a'), EMPTY];
   assert.equal(addEmptyPaneVertical(withEmpty, 0, null, 0, 'below'), null);
+});
+
+// THE BUG THIS REPLACES: the cap used to be a flat "at most 3 panes", written
+// when a pane and a column were the same thing. After vertical splitting
+// arrived that number silently stopped capping COLUMNS and started capping the
+// whole grid — so with three columns open, stacking any of them was refused
+// even though the layout is only three columns wide. Reported live: «кнопка,
+// отвечающая за разделение, тупо пропала» (it also VANISHED rather than
+// greying out, which is why it read as a missing button rather than a limit).
+test('stacking is capped per COLUMN, not by the total pane count', () => {
   const three = [p('p1', 'a'), p('p2', 'b'), p('p3', 'c')];
-  assert.equal(addEmptyPaneVertical(three, 0, null, 0, 'below'), null);
+  const res = addEmptyPaneVertical(three, 0, null, 0, 'below');
+  assert.ok(res, 'three columns still allow stacking one of them');
+  assert.equal(paneColumns(res.panes).length, 3, 'still three columns');
+  assert.equal(paneColumns(res.panes)[0].length, 2, 'the first column now has two rows');
+  // …and a column that already holds two rows refuses a third.
+  assert.equal(addEmptyPaneVertical(res.panes, 0, null, 0, 'below'), null,
+    'the placeholder blocks it now');
+  const filled = resolveSplitActivation(res.panes, 1, 'p1', 'd').panes;
+  assert.equal(addEmptyPaneVertical(filled, 0, null, 0, 'below'), null,
+    'and a full column refuses a third row');
+  // A full column must not block its NEIGHBOUR, which is still one row deep.
+  const neighbourIndex = filled.findIndex((pane, i) => pane.tabId === 'b');
+  assert.ok(addEmptyPaneVertical(filled, 0, null, neighbourIndex, 'below'),
+    'the neighbouring column can still be stacked');
+});
+
+test('a new COLUMN is capped at three, whatever the rows hold', () => {
+  const three = [p('p1', 'a'), p('p2', 'b'), p('p3', 'c')];
+  assert.equal(addEmptyPane(three, 0, null, 0), null, 'no fourth column');
+  assert.equal(addPane(three, 0, null, p('p4', 'd')), null, 'and none by "add to workspace"');
+  // Two columns, one of them stacked = 3 panes — a third column is still free.
+  const stacked = addEmptyPaneVertical([p('p1', 'a'), p('p2', 'b')], 0, null, 0, 'below').panes;
+  const filled = resolveSplitActivation(stacked, 1, 'p1', 'c').panes;
+  assert.equal(filled.length, 3, 'three panes');
+  assert.ok(addPane(filled, 0, null, p('p4', 'd')), 'but only two columns, so one more fits');
+});
+
+test('splitAvailability answers each direction separately', () => {
+  const three = [p('p1', 'a'), p('p2', 'b'), p('p3', 'c')];
+  assert.deepEqual(splitAvailability(three, 0), { horizontal: false, vertical: true, reason: null });
+  const stackedFirst = addEmptyPaneVertical(three, 0, null, 0, 'below').panes;
+  // A placeholder blocks everything until it is filled.
+  assert.deepEqual(splitAvailability(stackedFirst, 0),
+    { horizontal: false, vertical: false, reason: 'placeholder' });
+  const filled = resolveSplitActivation(stackedFirst, 1, 'p1', 'd').panes;
+  assert.deepEqual(splitAvailability(filled, 0),
+    { horizontal: false, vertical: false, reason: 'columns-full' }, 'this column is full too');
+  assert.deepEqual(splitAvailability(filled, 2), { horizontal: false, vertical: true, reason: null },
+    'the neighbour still has room below');
+  // Single mode: both directions are open.
+  assert.deepEqual(splitAvailability([], 0), { horizontal: true, vertical: true, reason: null });
 });
 
 test('addEmptyPane (horizontal) opens a NEW column, shifting later columns right', () => {
@@ -554,4 +617,47 @@ test('stepping back keeps the pane in its column', () => {
   const back = restorePanePreviousTab(withFile, 1, 'file');
   assert.equal(paneColumns(back.panes).length, 1, 'still one column');
   assert.equal(paneGridRects(back.panes)[1].topPct, 50, 'still the lower row');
+});
+
+// ── Закрытие ВКЛАДКИ ≠ удаление панели ────────────────────────────────────
+
+test('закрытая вкладка оставляет свою панель пустой, а не уносит её', () => {
+  // Шрам: вкладку, открытую во второй колонке, закрывали из бокового списка —
+  // и вместе с ней пропадала вся панель. Раскладка схлопывалась как побочный
+  // эффект удаления совсем другой сущности.
+  const three = [p('p1', 'a'), p('p2', 'b'), p('p3', 'c')];
+  const res = emptyPaneByClosedTab(three, 0, 'b');
+  assert.equal(res.panes.length, 3, 'панель осталась на месте');
+  assert.equal(res.panes[1].tabId, '', 'и стала пустой');
+  assert.equal(res.emptiedIndex, 1);
+  assert.ok(isEmptyPane(res.panes[1]));
+});
+
+test('пустеющая панель сохраняет свою колонку', () => {
+  // Геометрия — это то, что построил пользователь; удалял он вкладку.
+  const stacked = addEmptyPaneVertical([p('p1', 'a'), p('p2', 'b')], 0, null, 0, 'below').panes;
+  const filled = resolveSplitActivation(stacked, 1, 'p1', 'c').panes;
+  const res = emptyPaneByClosedTab(filled, 0, 'c');
+  assert.equal(res.panes.length, 3);
+  const emptied = res.panes[res.emptiedIndex];
+  assert.equal(emptied.tabId, '');
+  assert.equal(emptied.column, 0, 'осталась в своей колонке');
+});
+
+test('ДВА окна ведут себя так же, как три: второе остаётся пустым', () => {
+  // Шрам: первая версия здесь схлопывала сплит из двух в одиночный режим,
+  // рассуждая «одна живая панель плюс заглушка — это сплит из одного». Но это
+  // вопрос про РАСКЛАДКУ, а жест вообще не про неё. Два окна — самый частый
+  // случай, и правило схлопывания съедало именно его: пользователь убирал
+  // вкладку, а второе окно закрывалось.
+  const res = emptyPaneByClosedTab([p('p1', 'a'), p('p2', 'b')], 1, 'b');
+  assert.equal(res.panes.length, 2, 'оба окна на месте');
+  assert.equal(res.panes[0].tabId, 'a');
+  assert.equal(res.panes[1].tabId, '', 'второе окно просто опустело');
+  assert.equal(res.emptiedIndex, 1);
+});
+
+test('вкладка не из панели ничего не меняет', () => {
+  assert.equal(emptyPaneByClosedTab([p('p1', 'a'), p('p2', 'b')], 0, 'zzz'), null);
+  assert.equal(emptyPaneByClosedTab([], 0, 'a'), null);
 });

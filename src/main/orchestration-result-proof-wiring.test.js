@@ -75,6 +75,17 @@ test('result probing reads the persisted target session instead of a replaced li
   assert.match(reconcile, /resultTerminalEvent: probe\.terminalEvent \|\| null/);
   assert.match(reconcile, /resultTerminalReason: probe\.terminalOutcomeReason \|\| null/);
   assert.match(reconcile, /resultHasFinalResult: probe\.hasFinalResult === true/);
+  assert.match(reconcile, /internalContinuationCount: Math\.max\(0, Number\(probe\.internalContinuationCount\) \|\| 0\)/);
+});
+
+test('Claude internal-work lifecycle is routed through the same durable store', () => {
+  const lifecycle = block(
+    'async function processOrchestrationLifecycle',
+    '\nasync function performE2eBoundaryAction',
+  );
+  assert.match(lifecycle, /store\.applyLifecycle\(tabId, payload\)/);
+  assert.match(lifecycle, /waitingForInternalDescendants/);
+  assert.match(lifecycle, /\[OrchestrationInternalWork\]/);
 });
 
 test('settled result proof terminalizes exact abort or no-final-result before arming a watcher', () => {

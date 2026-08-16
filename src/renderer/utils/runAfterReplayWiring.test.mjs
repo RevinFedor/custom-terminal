@@ -39,3 +39,13 @@ test('History Replay appends and restores the CodeMirror caret through its owner
   assert.match(focusHandler, /editor\.setSelectionRange\(start, end\)/);
   assert.match(focusHandler, /promptCaretRef\.current = \{ start, end \}/);
 });
+
+test('terminal Replay carries prompt and image presentation metadata into append-input', () => {
+  const start = overlaySource.indexOf("ipcRenderer.invoke(sessionType + ':append-input'");
+  const end = overlaySource.indexOf('const replayTransferred =', start);
+  assert.ok(start >= 0 && end > start);
+  const invocation = overlaySource.slice(start, end);
+  assert.match(invocation, /presentationSnapshot:\s*\{/);
+  assert.match(invocation, /promptChips:\s*validation\.item\.chips \|\| \[\]/);
+  assert.match(invocation, /imagePaths:\s*validation\.item\.imagePaths \|\| \[\]/);
+});

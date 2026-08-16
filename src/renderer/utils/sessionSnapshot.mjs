@@ -43,6 +43,9 @@ export function buildSessionSnapshot(state) {
     globalTabMru: state.globalTabMru || [],
     splitPanes: state.splitPanes || [],
     splitFocusedIndex: state.splitFocusedIndex ?? 0,
+    // Divider positions; null = equal split (the stored default is absent,
+    // same as a pane's `column`).
+    splitSizes: state.splitSizes ?? null,
   };
 }
 
@@ -62,4 +65,5 @@ export const SESSION_SNAPSHOT_FIELDS = Object.freeze([
   'globalTabMru',
   'splitPanes',
   'splitFocusedIndex',
+  'splitSizes',
 ]);

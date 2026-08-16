@@ -10,6 +10,10 @@ const controllerSource = fs.readFileSync(
   path.join(__dirname, 'terminal-history-preview-controller.js'),
   'utf8',
 );
+const diagnosticSource = fs.readFileSync(
+  path.join(__dirname, 'terminal-history-preview-diagnostic.js'),
+  'utf8',
+);
 const serviceSource = fs.readFileSync(path.join(__dirname, 'session-transcript-service.js'), 'utf8');
 const historySource = fs.readFileSync(path.join(
   __dirname,
@@ -42,6 +46,9 @@ test('terminal preview consumes only committed headless frames', () => {
     /const committedSnapshot = commitHeadlessVisibleBufferSnapshot[\s\S]{0,240}terminalHistoryPreviewController\.observeFrame\(tabId, state, committedSnapshot\)/,
   );
   assert.match(mainSource, /function readTerminalHistoryPreviewFrame\(/);
+  assert.match(mainSource, /const preViewportLines = Array\.isArray\(snapshot\?\.preViewportLines\)/);
+  assert.match(mainSource, /const leadingPhysicalLines = \[\.\.\.preViewportLines, \.\.\.lines\]\.filter/);
+  assert.match(controllerSource, /leadingPhysicalLines: frame\.leadingPhysicalLines/);
   assert.match(controllerSource, /committedSnapshot\?\.authoritativeFrameCommitted/);
 });
 
@@ -70,7 +77,11 @@ test('canonical transcript records are observed before provisional text is retir
   assert.match(mainSource, /sourceEndOffset: detail\.recordEndByteOffset/);
   assert.match(mainSource, /canonicalText: text/);
   assert.match(mainSource, /terminalHistoryStructuredBoundaryKind/);
+  assert.match(mainSource, /terminalHistoryStructuredProofTexts/);
+  assert.match(mainSource, /structuredTexts/);
   assert.match(mainSource, /terminalHistoryPreviewController\.observeBoundary/);
+  assert.match(controllerSource, /createTerminalHistoryStructuredProof/);
+  assert.match(controllerSource, /STRUCTURED_SUPPRESS/);
   assert.match(mainSource, /promptTruncated:\s*commandDetail\?\.truncated === true/);
   assert.match(mainSource, /\? 'provisional-tail'/);
   assert.match(mainSource, /promptAuthority: 'exact-transcript'/);
@@ -83,7 +94,9 @@ test('History renders terminal preview as an O(1) footer, outside durable rows',
   assert.match(historySource, /data-history-terminal-preview/);
   assert.match(historySource, /Footer: HistoryTerminalPreviewFooter/);
   assert.match(historySource, /context=\{historyVirtuosoContext\}/);
-  assert.match(historySource, /data=\{transcriptEntries\}/);
+  // The list renders display UNITS (series collapsing) built from
+  // transcriptEntries — the projection stays presentation-only.
+  assert.match(historySource, /data=\{displayUnits\}/);
   assert.doesNotMatch(
     historySource,
     /buildHistoryLivePresentation\([^)]*terminalPreview/,
@@ -94,6 +107,28 @@ test('History renders terminal preview as an O(1) footer, outside durable rows',
   assert.match(footerSource, /position: 'absolute'/);
   assert.match(footerSource, /transform: 'translateY\(-50%\)'/);
   assert.doesNotMatch(footerSource, /margin: '2px 0 4px'/);
+});
+
+test('preview context menu saves bounded main diagnostics before copying a reference', () => {
+  assert.match(historySource, /onContextMenu=\{\(event\) => openTerminalHistoryPreviewContextMenu/);
+  assert.match(historySource, /show-terminal-history-preview-context-menu/);
+  assert.match(historySource, /selectionInside[\s\S]{0,500}selectionText:/);
+  assert.match(mainSource, /ipcMain\.on\('show-terminal-history-preview-context-menu'/);
+  assert.match(mainSource, /label: 'Save & copy diagnostic reference'/);
+  assert.match(mainSource, /snapshotTerminalComposerForensics\(mirror\.composerForensics/);
+  assert.match(mainSource, /snapshotTerminalRedrawTrace\(mirror\?\.redrawTrace, 48\)/);
+  assert.match(mainSource, /committedSnapshot: mirror\?\.lastCommittedVisibleSnapshot/);
+  assert.match(
+    historySource,
+    /removeListener\(\s*'agent-transcript:terminal-preview-diagnostic-result'/,
+  );
+  const saveAt = mainSource.indexOf('await captureTerminalHistoryPreviewDiagnostic(payload)');
+  const copyAt = mainSource.indexOf('clipboard.writeText(result.reference)', saveAt);
+  assert.notEqual(saveAt, -1);
+  assert.ok(copyAt > saveAt, 'clipboard acknowledgement must follow durable persistence');
+  assert.match(historySource, /Diagnostics saved · reference copied/);
+  assert.match(diagnosticSource, /mode: 0o600/);
+  assert.match(diagnosticSource, /pruneTerminalHistoryPreviewDiagnostics/);
 });
 
 test('diagnostics expose frame, write, identity, canonical handoff and renderer apply', () => {

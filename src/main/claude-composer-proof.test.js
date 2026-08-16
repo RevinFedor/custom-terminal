@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   classifyClaudeMissingPromptExactCaptureAdmission,
+  hasConflictingPtyWriteOperation,
   parseClaudeComposerCurrentFrame,
   reserveClaudeExactEmptyEvidence,
   resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence,
@@ -11,6 +12,32 @@ const {
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 } = require('./claude-composer-proof');
+
+test('exact capture ignores its own PTY lock but not a foreign writer', () => {
+  const owned = { kind: 'agent-input-capture' };
+  const foreign = { kind: 'safe-paste' };
+
+  assert.equal(hasConflictingPtyWriteOperation({
+    activeOperation: owned,
+    lastQueuedOperation: owned,
+    ownedOperation: owned,
+  }), false);
+  assert.equal(hasConflictingPtyWriteOperation({
+    activeOperation: owned,
+    lastQueuedOperation: foreign,
+    ownedOperation: owned,
+  }), false, 'a later queued write cannot overtake the active capture owner');
+  assert.equal(hasConflictingPtyWriteOperation({
+    activeOperation: foreign,
+    lastQueuedOperation: owned,
+    ownedOperation: owned,
+  }), true);
+  assert.equal(hasConflictingPtyWriteOperation({
+    activeOperation: null,
+    lastQueuedOperation: foreign,
+    ownedOperation: owned,
+  }), true);
+});
 
 test('summarizes only semantic xterm attributes for a Claude prompt suffix', () => {
   assert.deepEqual(summarizeClaudePromptSuffixStyle([

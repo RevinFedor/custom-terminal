@@ -5,7 +5,7 @@ const path = require('node:path');
 const { TextDecoder } = require('node:util');
 
 const {
-  readClaudeUserRecords,
+  readClaudeUserRecordsFromBuffer,
   selectClaudePendingPromptAudit,
 } = require('./claude-prompt-audit');
 const {
@@ -267,85 +267,7 @@ function validateCompleteJsonl(text) {
   return { ok: true };
 }
 
-async function readExactPostBoundaryRange(transcriptPath, boundaryOffset, maxReadBytes) {
-  let handle = null;
-  try {
-    handle = await fs.promises.open(transcriptPath, 'r');
-    const before = await handle.stat();
-    if (!before.isFile()) {
-      return { ok: false, reason: 'transcript-not-regular-file' };
-    }
-    const fileSize = nonNegativeSafeInteger(before.size);
-    if (fileSize === null || fileSize < boundaryOffset) {
-      return { ok: false, reason: 'transcript-truncated-before-boundary' };
-    }
-    const postBoundaryBytes = fileSize - boundaryOffset;
-    if (postBoundaryBytes > maxReadBytes) {
-      return {
-        ok: false,
-        reason: 'transcript-post-boundary-range-truncated',
-        fileSize,
-        postBoundaryBytes,
-        maxReadBytes,
-      };
-    }
-    if (boundaryOffset > 0) {
-      const probe = await readFully(handle, boundaryOffset - 1, 1);
-      if (probe.bytesRead !== 1 || probe.buffer[0] !== 0x0a) {
-        return { ok: false, reason: 'transcript-boundary-not-line-aligned' };
-      }
-    }
-    const read = await readFully(handle, boundaryOffset, postBoundaryBytes);
-    if (read.bytesRead !== postBoundaryBytes) {
-      return { ok: false, reason: 'transcript-changed-during-read' };
-    }
-    if (read.buffer.length > 0 && read.buffer[read.buffer.length - 1] !== 0x0a) {
-      return {
-        ok: false,
-        reason: 'transcript-post-boundary-partial-line',
-        fileSize,
-        postBoundaryBytes,
-      };
-    }
-    let text;
-    try {
-      text = new TextDecoder('utf-8', { fatal: true }).decode(read.buffer);
-    } catch {
-      return { ok: false, reason: 'transcript-invalid-utf8' };
-    }
-    const jsonl = validateCompleteJsonl(text);
-    if (!jsonl.ok) return jsonl;
-    const after = await handle.stat();
-    if (
-      Number(after.size) !== fileSize
-      || Number(after.mtimeMs) !== Number(before.mtimeMs)
-      || Number(after.ino) !== Number(before.ino)
-    ) {
-      return { ok: false, reason: 'transcript-changed-during-read' };
-    }
-    return {
-      ok: true,
-      text,
-      buffer: read.buffer,
-      fileSize,
-      postBoundaryBytes,
-      mtimeMs: Number(before.mtimeMs),
-      ino: Number(before.ino),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      reason: 'transcript-unreadable',
-      errorCode: cleanString(error?.code) || null,
-    };
-  } finally {
-    if (handle) {
-      try { await handle.close(); } catch {}
-    }
-  }
-}
-
-async function readBoundedCodexCausalPrefix(
+async function readBoundedCausalPrefix(
   transcriptPath,
   boundaryOffset,
   maxReadBytes,
@@ -464,18 +386,6 @@ async function readBoundedCodexCausalPrefix(
   }
 }
 
-async function transcriptStillMatchesSnapshot(transcriptPath, snapshot) {
-  try {
-    const stat = await fs.promises.stat(transcriptPath);
-    return stat.isFile()
-      && Number(stat.size) === snapshot.fileSize
-      && Number(stat.mtimeMs) === snapshot.mtimeMs
-      && Number(stat.ino) === snapshot.ino;
-  } catch {
-    return false;
-  }
-}
-
 function numericTimestamp(value) {
   if (Number.isFinite(value)) return Number(value);
   const parsed = Date.parse(String(value || ''));
@@ -533,36 +443,32 @@ function evidenceFor(boundary, snapshot, candidateCount, matchCount) {
   };
 }
 
-async function reconcileClaude(context, maxReadBytes) {
+async function reconcileClaude(context, maxReadBytes, options = {}) {
   const validated = validateClaudeBoundary(context);
   if (!validated.ok) return unknown(context.record, validated.reason, validated);
-  const snapshot = await readExactPostBoundaryRange(
+  const snapshot = await readBoundedCausalPrefix(
     validated.transcriptPath,
     validated.fileSize,
     maxReadBytes,
+    options.causalUpperBoundaryOffset,
   );
   if (!snapshot.ok) return unknown(context.record, snapshot.reason, snapshot);
-  if (snapshot.postBoundaryBytes === 0) {
+  if (snapshot.causalRangeBytes === 0) {
     return absent(context.record, 'no-post-boundary-records', {
       evidence: evidenceFor(validated, snapshot, 0, 0),
     });
   }
 
-  let candidates;
-  try {
-    candidates = await readClaudeUserRecords(
-      validated.transcriptPath,
-      context.boundary,
-      { maxReadBytes },
-    );
-  } catch (error) {
-    return unknown(context.record, 'transcript-unreadable', {
-      errorCode: cleanString(error?.code) || null,
-    });
-  }
-  if (!await transcriptStillMatchesSnapshot(validated.transcriptPath, snapshot)) {
-    return unknown(context.record, 'transcript-changed-during-read');
-  }
+  const candidates = readClaudeUserRecordsFromBuffer(
+    snapshot.buffer,
+    validated.transcriptPath,
+    {
+      baseOffset: validated.fileSize,
+      skipLeadingPartial: false,
+      bytesRead: snapshot.bytesRead,
+      readMode: 'startup-causal-prefix',
+    },
+  );
 
   const auditExpectation = {
     expectedText: context.promptText,
@@ -580,7 +486,7 @@ async function reconcileClaude(context, maxReadBytes) {
       resolveExactPath(candidate?.transcriptPath) !== validated.transcriptPath
       || !Number.isFinite(Number(candidate?.byteOffset))
       || Number(candidate.byteOffset) < validated.fileSize
-      || Number(candidate.byteOffset) >= snapshot.fileSize
+      || Number(candidate.byteOffset) >= snapshot.scanEndOffset
     ) {
       return unknown(context.record, 'transcript-candidate-foreign-boundary');
     }
@@ -596,6 +502,34 @@ async function reconcileClaude(context, maxReadBytes) {
     matches.push(selection);
   }
   const evidence = evidenceFor(validated, snapshot, candidates.length, matches.length);
+  const hasClosedCausalRange = snapshot.causalUpperBoundaryOffset !== null
+    && snapshot.rangeComplete === true;
+  if (!hasClosedCausalRange) {
+    const firstCandidate = candidates[0] || null;
+    if (!firstCandidate) {
+      return snapshot.rangeComplete
+        ? absent(context.record, 'no-post-boundary-user-message', { evidence })
+        : unknown(context.record, 'no-user-message-in-bounded-causal-prefix', { evidence });
+    }
+    const firstSelection = selectClaudePendingPromptAudit(
+      [auditExpectation],
+      [firstCandidate],
+      { hashText: promptAuditFingerprint },
+    );
+    if (!firstSelection) {
+      if (snapshot.rangeComplete === true && matches.length === 0) {
+        return absent(context.record, 'no-exact-post-boundary-candidate', { evidence });
+      }
+      return unknown(context.record, 'first-post-boundary-user-message-mismatch', { evidence });
+    }
+    if (firstCandidate.text !== context.promptText) {
+      return unknown(context.record, 'transcript-prompt-hash-collision', { evidence });
+    }
+    if (snapshot.rangeComplete !== true) {
+      matches.length = 0;
+      matches.push(firstSelection);
+    }
+  }
   if (matches.length === 0) {
     return absent(context.record, 'no-exact-post-boundary-candidate', { evidence });
   }
@@ -668,11 +602,11 @@ function selectCodexStartupCandidate(context, validated, auditExpectation, candi
 async function reconcileCodex(context, maxReadBytes, options = {}) {
   const validated = validateCodexBoundary(context);
   if (!validated.ok) return unknown(context.record, validated.reason, validated);
-  const snapshot = await readBoundedCodexCausalPrefix(
+  const snapshot = await readBoundedCausalPrefix(
     validated.transcriptPath,
     validated.fileSize,
     maxReadBytes,
-    options.codexCausalUpperBoundaryOffset,
+    options.causalUpperBoundaryOffset,
   );
   if (!snapshot.ok) return unknown(context.record, snapshot.reason, snapshot);
   if (snapshot.causalRangeBytes === 0) {
@@ -769,31 +703,41 @@ async function reconcileAgentSendStartupRecord(record, options = {}) {
   if (!normalized.ok) return unknown(record, normalized.reason);
   const maxReadBytes = normalizeReadLimit(options.maxReadBytes);
   return normalized.value.provider === 'claude'
-    ? reconcileClaude(normalized.value, maxReadBytes)
+    ? reconcileClaude(normalized.value, maxReadBytes, options)
     : reconcileCodex(normalized.value, maxReadBytes, options);
 }
 
-function nextCodexBoundaryOffset(record, records) {
-  if (cleanString(record?.provider).toLowerCase() !== 'codex') return null;
+function providerBoundaryIdentity(record) {
+  const provider = cleanString(record?.provider).toLowerCase();
+  if (provider !== 'claude' && provider !== 'codex') return null;
   const boundary = record?.transcriptBoundary;
-  const transcriptPath = resolveExactPath(boundary?.filePath);
-  const sessionId = cleanString(boundary?.sessionId || record?.sessionId);
+  const transcriptPath = resolveExactPath(
+    provider === 'claude' ? boundary?.transcriptPath : boundary?.filePath,
+  );
+  const sessionId = cleanString(boundary?.sessionId || record?.sessionId)
+    || (provider === 'claude' ? claudeSessionIdFromTranscriptPath(transcriptPath) : '');
   const fileSize = nonNegativeSafeInteger(boundary?.fileSize);
   if (!transcriptPath || !sessionId || fileSize === null) return null;
+  return { provider, transcriptPath, sessionId, fileSize };
+}
+
+function nextProviderBoundaryOffset(record, records) {
+  const current = providerBoundaryIdentity(record);
+  if (!current) return null;
   let next = null;
   for (const candidate of Array.isArray(records) ? records : []) {
-    if (candidate === record || cleanString(candidate?.provider).toLowerCase() !== 'codex') {
-      continue;
-    }
-    const candidateBoundary = candidate?.transcriptBoundary;
+    if (candidate === record) continue;
+    const other = providerBoundaryIdentity(candidate);
     if (
-      cleanString(candidateBoundary?.sessionId || candidate?.sessionId) !== sessionId
-      || resolveExactPath(candidateBoundary?.filePath) !== transcriptPath
+      !other
+      || other.provider !== current.provider
+      || other.sessionId !== current.sessionId
+      || other.transcriptPath !== current.transcriptPath
     ) {
       continue;
     }
-    const candidateOffset = nonNegativeSafeInteger(candidateBoundary?.fileSize);
-    if (candidateOffset === null || candidateOffset <= fileSize) continue;
+    const candidateOffset = other.fileSize;
+    if (candidateOffset <= current.fileSize) continue;
     if (next === null || candidateOffset < next) next = candidateOffset;
   }
   return next;
@@ -813,8 +757,8 @@ async function reconcileAgentSendStartupRecords(records, options = {}) {
     }
     decisions.push(await reconcileAgentSendStartupRecord(source[index], {
       ...options,
-      codexCausalUpperBoundaryOffset:
-        nextCodexBoundaryOffset(source[index], allRecords),
+      causalUpperBoundaryOffset:
+        nextProviderBoundaryOffset(source[index], allRecords),
     }));
   }
   return decisions;

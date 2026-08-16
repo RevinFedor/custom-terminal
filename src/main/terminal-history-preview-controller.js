@@ -2,12 +2,14 @@
 
 const {
   MAX_PREVIEW_CHARS,
+  createTerminalHistoryStructuredProof,
   deriveTerminalHistoryPreviewTextAfterBaseline,
   extractTerminalHistoryPreviewText,
   mergeTerminalHistoryPreviewText,
   normalizeTerminalHistoryPromptText,
   previewTextHash,
   subtractTerminalHistoryMaterializedText,
+  subtractTerminalHistoryStructuredProjection,
 } = require('./terminal-history-preview');
 
 const DEFAULT_EMIT_COALESCE_MS = 64;
@@ -148,6 +150,52 @@ function createTerminalHistoryPreviewController({
     }, Math.max(0, Number(emitCoalesceMs) || 0));
   };
 
+  const applyStructuredProjectionProof = (state, text, detail = {}) => {
+    const result = subtractTerminalHistoryStructuredProjection(
+      state.structuredProof,
+      text,
+    );
+    if (result.reason === 'structured-proof-unavailable'
+      || result.reason === 'candidate-not-structured-projection') return result;
+    writeLog('log', 'STRUCTURED_SUPPRESS', state, {
+      reason: result.reason,
+      kind: detail.kind || '-',
+      identity: short(detail.identity, 20),
+      candidateChars: String(text || '').length,
+      candidateHash: text ? previewTextHash(text) : '-',
+      remainingChars: result.text.length,
+      remainingHash: result.text ? previewTextHash(result.text) : '-',
+      proofFragments: state.structuredProof?.fragments?.length || 0,
+      proofChars: state.structuredProof?.chars || 0,
+      frame: state.committedFrameGeneration ?? '-',
+      writeSeq: state.writeSeq ?? '-',
+    });
+    return result;
+  };
+
+  const applyCanonicalMaterializationProof = (state, text, detail = {}) => {
+    const result = subtractTerminalHistoryMaterializedText(
+      state.rebaseCanonicalText,
+      text,
+    );
+    if (result.reason === 'candidate-after-materialized-record'
+      || result.reason === 'materialized-text-unavailable') return result;
+    writeLog('log', 'CANONICAL_SUPPRESS', state, {
+      reason: result.reason,
+      proofAt: detail.proofAt || 'committed-frame',
+      projection: result.projection || 'exact-jsonl',
+      canonicalChars: state.rebaseCanonicalText.length,
+      canonicalHash: previewTextHash(state.rebaseCanonicalText),
+      candidateChars: String(text || '').length,
+      candidateHash: text ? previewTextHash(text) : '-',
+      remainingChars: result.text.length,
+      remainingHash: result.text ? previewTextHash(result.text) : '-',
+      frame: state.committedFrameGeneration ?? '-',
+      writeSeq: state.writeSeq ?? '-',
+    });
+    return result;
+  };
+
   const disposeMarker = (state) => {
     try { state?.marker?.dispose?.(); } catch {}
     state.marker = null;
@@ -267,6 +315,14 @@ function createTerminalHistoryPreviewController({
       promptSource: promptSource || null,
       promptAuthority: promptAuthority
         || (promptText ? PROMPT_AUTHORITY_EXACT_TRANSCRIPT : 'none'),
+      // The active segment may clear its prompt fields after an exact JSONL
+      // boundary, but a later full-screen redraw can repaint the submitted
+      // user card anywhere in the viewport. Keep the exact turn prompt until
+      // the whole turn ends so that repaint can never become assistant text.
+      submittedPromptText: String(promptText || ''),
+      submittedPromptSource: promptSource || null,
+      submittedPromptAuthority: promptAuthority
+        || (promptText ? PROMPT_AUTHORITY_EXACT_TRANSCRIPT : 'none'),
       processId: processId || null,
       sourceSequence: finiteNumberOrNull(sourceSequence),
       sourceBoundary: finiteNumberOrNull(sourceBoundary),
@@ -300,6 +356,7 @@ function createTerminalHistoryPreviewController({
       rebaseBaselineSnapshot: null,
       rebaseBaselineKind: null,
       rebaseCanonicalText: '',
+      structuredProof: createTerminalHistoryStructuredProof([]),
       canonicalMaterialized: false,
       baselineAdvanceCount: 0,
       baselineAdvanceLogged: false,
@@ -348,14 +405,17 @@ function createTerminalHistoryPreviewController({
     if ((!state.marker || state.marker.isDisposed || Number(state.marker.line) < 0)
       && !state.markerLossLogged) {
       state.markerLossLogged = true;
+      const submittedPrompt = state.submittedPromptText || state.promptText;
       writeLog('warn', 'ANCHOR_LOST', state, {
         reason: state.marker ? 'xterm-marker-disposed-by-redraw' : 'xterm-marker-unavailable',
-        action: state.promptText
+        action: submittedPrompt
           ? 'recover-from-exact-prompt'
           : state.rebaseBaselineSnapshot
             ? 'recover-from-exact-jsonl-baseline'
             : 'freeze-until-proof',
-        promptHash: state.promptText ? previewTextHash(normalizeTerminalHistoryPromptText(state.promptText)) : '-',
+        promptHash: submittedPrompt
+          ? previewTextHash(normalizeTerminalHistoryPromptText(submittedPrompt))
+          : '-',
       });
     }
     if (!committedSnapshot?.authoritativeFrameCommitted
@@ -406,10 +466,12 @@ function createTerminalHistoryPreviewController({
         writeSeq: state.writeSeq ?? '-',
       });
     }
+    const submittedPrompt = state.submittedPromptText || state.promptText;
     let extracted = extractTerminalHistoryPreviewText({
       provider: state.provider,
+      leadingPhysicalLines: frame.leadingPhysicalLines,
       physicalLines: frame.physicalLines,
-      promptText: state.promptText,
+      promptText: submittedPrompt,
       promptPrefixClipped: frame.promptPrefixClipped === true,
       regionTruncated: frame.truncated === true,
     });
@@ -441,6 +503,7 @@ function createTerminalHistoryPreviewController({
       const baselineExtracted = extractTerminalHistoryPreviewText({
         provider: state.provider,
         physicalLines: frame.baselinePhysicalLines,
+        promptText: submittedPrompt,
         regionTruncated: frame.baselineTruncated === true,
       });
       if (baselineExtracted.status === 'unknown') {
@@ -501,24 +564,7 @@ function createTerminalHistoryPreviewController({
       }
     }
     if (extracted.status === 'text' && state.rebaseCanonicalText) {
-      const materialized = subtractTerminalHistoryMaterializedText(
-        state.rebaseCanonicalText,
-        extracted.text,
-      );
-      if (materialized.reason !== 'candidate-after-materialized-record'
-        && materialized.reason !== 'materialized-text-unavailable') {
-        writeLog('log', 'CANONICAL_SUPPRESS', state, {
-          reason: materialized.reason,
-          canonicalChars: state.rebaseCanonicalText.length,
-          canonicalHash: previewTextHash(state.rebaseCanonicalText),
-          candidateChars: extracted.text.length,
-          candidateHash: previewTextHash(extracted.text),
-          remainingChars: materialized.text.length,
-          remainingHash: materialized.text ? previewTextHash(materialized.text) : '-',
-          frame: state.committedFrameGeneration ?? '-',
-          writeSeq: state.writeSeq ?? '-',
-        });
-      }
+      const materialized = applyCanonicalMaterializationProof(state, extracted.text);
       if (materialized.status === 'empty') {
         extracted = { ...extracted, status: 'empty', reason: materialized.reason, text: '' };
       } else if (materialized.reason !== 'candidate-after-materialized-record'
@@ -528,6 +574,21 @@ function createTerminalHistoryPreviewController({
           status: 'text',
           reason: materialized.reason,
           text: materialized.text,
+        };
+      }
+    }
+    if (extracted.status === 'text' && state.structuredProof?.fragments?.length > 0) {
+      const structured = applyStructuredProjectionProof(state, extracted.text, {
+        kind: 'committed-frame',
+      });
+      if (structured.status === 'empty') {
+        extracted = { ...extracted, status: 'empty', reason: structured.reason, text: '' };
+      } else if (structured.reason === 'structured-projection-prefix-removed') {
+        extracted = {
+          ...extracted,
+          status: 'text',
+          reason: structured.reason,
+          text: structured.text,
         };
       }
     }
@@ -675,6 +736,9 @@ function createTerminalHistoryPreviewController({
     state.promptText = String(promptText || '');
     state.promptSource = promptSource || null;
     state.promptAuthority = promptAuthority || PROMPT_AUTHORITY_EXACT_TRANSCRIPT;
+    state.submittedPromptText = String(promptText || '');
+    state.submittedPromptSource = promptSource || null;
+    state.submittedPromptAuthority = promptAuthority || PROMPT_AUTHORITY_EXACT_TRANSCRIPT;
     if (sequence !== null) state.sourceSequence = sequence;
     if (boundary !== null) state.sourceBoundary = boundary;
     state.lastUnknownKey = null;
@@ -836,6 +900,7 @@ function createTerminalHistoryPreviewController({
     sourceEndOffset = null,
     identity = null,
     kind = 'structured-record',
+    structuredTexts = [],
   } = {}) => {
     const state = turns.get(tabId);
     if (!state || state.provider !== provider || state.phase !== 'streaming') return false;
@@ -873,11 +938,63 @@ function createTerminalHistoryPreviewController({
     }
     if (sequence !== null) state.sourceSequence = sequence;
     if (endOffset !== null) state.sourceBoundary = endOffset;
+    state.structuredProof = createTerminalHistoryStructuredProof(
+      structuredTexts,
+      state.structuredProof,
+    );
     // An exact thinking/tool boundary opens a new semantic segment. A prior
     // assistant record proves only the segment before this boundary; it must
     // not make task completion close the observer before a final post-tool
     // terminal repaint has had a chance to materialize.
     state.canonicalMaterialized = false;
+    // Reconcile once more at every exact JSONL boundary. A repaint can race
+    // immediately after observeCanonical and briefly republish a rendered
+    // tail of that already-saved Markdown. The next tool/thinking receipt is
+    // a deterministic second chance to clear it instead of letting the stale
+    // preview block all later baseline advances.
+    if (state.text && state.rebaseCanonicalText) {
+      const materialized = applyCanonicalMaterializationProof(state, state.text, {
+        proofAt: kind,
+      });
+      if (materialized.status === 'empty') {
+        const wasPublished = state.previewSeq > 0;
+        cancelPendingEmission(state);
+        state.text = '';
+        state.lastMergeReason = materialized.reason;
+        state.lastUnknownKey = null;
+        if (wasPublished) emitAction(state, 'clear', materialized.reason);
+      } else if (materialized.reason !== 'candidate-after-materialized-record'
+        && materialized.reason !== 'materialized-text-unavailable'
+        && materialized.text !== state.text) {
+        cancelPendingEmission(state);
+        state.text = materialized.text;
+        state.lastMergeReason = materialized.reason;
+        state.lastUnknownKey = null;
+        if (state.previewSeq > 0) publishFrame(state, 'update');
+        else scheduleFramePublication(state);
+      }
+    }
+    if (state.text) {
+      const structured = applyStructuredProjectionProof(state, state.text, {
+        kind,
+        identity,
+      });
+      if (structured.status === 'empty') {
+        const wasPublished = state.previewSeq > 0;
+        cancelPendingEmission(state);
+        state.text = '';
+        state.lastMergeReason = structured.reason;
+        state.lastUnknownKey = null;
+        if (wasPublished) emitAction(state, 'clear', structured.reason);
+      } else if (structured.reason === 'structured-projection-prefix-removed') {
+        cancelPendingEmission(state);
+        state.text = structured.text;
+        state.lastMergeReason = structured.reason;
+        state.lastUnknownKey = null;
+        if (state.previewSeq > 0) publishFrame(state, 'update');
+        else scheduleFramePublication(state);
+      }
+    }
     if (state.text) {
       writeLog('warn', 'BOUNDARY_HELD', state, {
         kind,

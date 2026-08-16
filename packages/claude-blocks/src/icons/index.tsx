@@ -131,9 +131,81 @@ export const XIcon: React.FC<IconProps> = ({ size = 11, strokeWidth = 2, classNa
   </svg>
 );
 
+/* Plug — the MCP glyph. External tool servers get their own icon so an MCP
+   row never borrows the terminal icon (which made two thirds of the feed
+   visually identical). Geometry from lucide `plug`. */
+export const PlugIcon: React.FC<IconProps> = ({ size = 13, strokeWidth = 2, className, style }) => (
+  <svg {...base(size, strokeWidth)} className={className} style={style}>
+    <path d="M12 22v-5" />
+    <path d="M9 8V2" />
+    <path d="M15 8V2" />
+    <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" />
+  </svg>
+);
+
+/* Git branch — the git-family glyph. Version-control commands are their own
+   entity in the feed grammar (user decision: "git отдельно от прочего bash").
+   Geometry from lucide `git-branch`. */
+export const GitBranchIcon: React.FC<IconProps> = ({ size = 13, strokeWidth = 2, className, style }) => (
+  <svg {...base(size, strokeWidth)} className={className} style={style}>
+    <line x1="6" y1="3" x2="6" y2="15" />
+    <circle cx="18" cy="6" r="3" />
+    <circle cx="6" cy="18" r="3" />
+    <path d="M18 9a9 9 0 0 1-9 9" />
+  </svg>
+);
+
+/* Stack — the single, memorable mark of a COLLAPSED GROUP of work: several
+   sheets seen edge-on. Deliberately unlike every family glyph (file, search,
+   git branch, terminal, plug) so a group never reads as one of the cards it
+   contains; the families themselves are named in words next to it. */
+export const StackIcon: React.FC<IconProps> = ({ size = 13, strokeWidth = 2, className, style }) => (
+  <svg {...base(size, strokeWidth)} className={className} style={style}>
+    {/* Top sheet FILLED: a container reads "heavier" than the outline glyphs
+        of atomic cards at a glance — same size, same column, zero layout
+        shift. The two lower sheets stay strokes so the shape still reads as
+        a stack, not a blob. */}
+    <path d="M12 3 3 7.5l9 4.5 9-4.5L12 3z" fill="currentColor" stroke="none" />
+    <path d="M3 12.5 12 17l9-4.5" />
+    <path d="M3 17.5 12 22l9-4.5" />
+  </svg>
+);
+
+/* Compress — the context-compaction glyph: two chevrons folding toward the
+   middle line (history squeezed into a summary). A real mark in the shared
+   icon column — the row used to wear a bare disclosure chevron, which is a
+   control, not an identity. */
+export const CompressIcon: React.FC<IconProps> = ({ size = 13, strokeWidth = 2, className, style }) => (
+  <svg {...base(size, strokeWidth)} className={className} style={style}>
+    <path d="m7 2 5 5 5-5" />
+    <line x1="4" y1="12" x2="20" y2="12" />
+    <path d="m7 22 5-5 5 5" />
+  </svg>
+);
+
+/* Checklist — the Plan/task-plan glyph. Plan is not a shell command; wearing
+   the terminal icon lied about what the row is. */
+export const ChecklistIcon: React.FC<IconProps> = ({ size = 13, strokeWidth = 2, className, style }) => (
+  <svg {...base(size, strokeWidth)} className={className} style={style}>
+    <path d="m3 5 2 2 3.5-3.5" />
+    <path d="m3 12 2 2 3.5-3.5" />
+    <line x1="12" y1="6" x2="21" y2="6" />
+    <line x1="12" y1="13" x2="21" y2="13" />
+    <line x1="12" y1="20" x2="21" y2="20" />
+    <path d="M4 19h.01" />
+  </svg>
+);
+
 /* Sparkles — the "applied prompt / AI instruction" glyph. Same geometry as the
    desktop prompt-chip (voice-record prompt.tsx ChipIcon kind='prompt') so a
    prompt chip looks identical on desktop and mobile. */
+/* Chevron — expand affordance (rotates 90° via CSS when open). */
+export const ChevronRightIcon: React.FC<IconProps> = ({ size = 11, strokeWidth = 2, className, style }) => (
+  <svg {...base(size, strokeWidth)} className={className} style={style}>
+    <polyline points="9 18 15 12 9 6" />
+  </svg>
+);
+
 export const SparklesIcon: React.FC<IconProps> = ({ size = 14, strokeWidth = 2, className, style }) => (
   <svg {...base(size, strokeWidth)} className={className} style={style}>
     <path d="M12 3l1.9 4.6L18.5 9.5 13.9 11.4 12 16l-1.9-4.6L5.5 9.5l4.6-1.9z" />
@@ -142,8 +214,38 @@ export const SparklesIcon: React.FC<IconProps> = ({ size = 14, strokeWidth = 2, 
 );
 
 /* Per-tool icon resolver — имя tool'а → React-нода. Цвет/размер
-   переопределяются обёрткой ColoredToolIcon (clone в blocks). */
-export function toolIcon(name: string, size = 13): React.ReactNode {
+   переопределяются обёрткой ColoredToolIcon (clone в blocks).
+
+   `family` (optional) is the parser-stamped grouping family — it refines the
+   icon beyond the tool name: a Bash that actually reads gets the file icon,
+   a searching Bash the magnifier, git its branch glyph, MCP the plug. The
+   shape carries the MEANING of the action; color stays the status channel. */
+export function toolIcon(name: string, size = 13, family?: string): React.ReactNode {
+  if (name.startsWith('mcp__') || name === 'MCP' || family === 'mcp') {
+    return <PlugIcon size={size} />;
+  }
+  switch (family) {
+    case 'plan':
+      return <ChecklistIcon size={size} />;
+    case 'group':
+    case 'mixed':
+      // Every collapsed run of work wears this one glyph, whatever families
+      // are inside: the row's identity is "a group you can open", and the
+      // families are already spelled out in words beside it.
+      return <StackIcon size={size} />;
+    case 'read':
+      return <FileTextIcon size={size} />;
+    case 'search':
+      return <SearchIcon size={size} />;
+    case 'git':
+      return <GitBranchIcon size={size} />;
+    case 'edit':
+      return <FileEditIcon size={size} />;
+    case 'web':
+      return <GlobeIcon size={size} />;
+    default:
+      break;
+  }
   switch (name) {
     case 'Edit':
     case 'Write':

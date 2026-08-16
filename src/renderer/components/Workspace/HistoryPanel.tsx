@@ -16,6 +16,7 @@ import {
   type HistoryPromptDraftWriteOptions,
   type HistoryRewindPreview,
 } from '../../store/useUIStore';
+import { historyActionHeadline } from '../../../shared/history-action-grammar.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useRewindOperationStore } from '../../store/useRewindOperationStore';
 import {
@@ -136,6 +137,7 @@ import {
   upsertComposerChip,
 } from '../../utils/composerChips.mjs';
 import {
+  interruptedPromptDraftMatchesHandoff,
   mergeFailedHistoryAuthoringSnapshot,
   resolveInterruptedPromptOwnership,
 } from '../../utils/historyDraftOwnership.mjs';
@@ -145,6 +147,7 @@ import {
 } from '../../utils/historyDraftNoticeMeta.mjs';
 import {
   createHistoryTailPinScheduler,
+  HISTORY_TAIL_PIN_THRESHOLD_PX,
   isHistoryTailPinned,
   reconcileHistoryTailFollowIntent,
   scheduleHistoryBottomScroll,
@@ -162,6 +165,14 @@ import {
   shouldIncludeHistoryLiveUserText,
 } from '../../utils/historyLiveProjection.mjs';
 import {
+  buildHistoryDisplayUnits,
+  groupFamilyBreakdown,
+  historyDisplayUnitUuid,
+  resolveHistoryDisplayTarget,
+} from '../../utils/historyDisplayUnits.mjs';
+import { createHistoryTailSpacer } from '../../utils/historyTailSpacer.mjs';
+import {
+  acceptHistoryPromptHandoffProviderQueue,
   advanceHistoryPromptHandoffTransportPhase,
   beginHistoryPromptHandoff,
   bindHistoryPromptHandoffSendIdentity,
@@ -204,6 +215,7 @@ import type { AgentLifecycleSummary } from './TerminalArea';
 // so its style matches the rest of the app. Subagents (Task) are intentionally
 // left on the legacy SubAgentBlock path ("субагентов пока не трогаем").
 import {
+  ColoredToolIcon,
   ConversationMessage,
   ComposerChip,
   Markdown as CBMarkdown,
@@ -213,6 +225,8 @@ import {
   MessageStatusBadge,
   ThinkBlock as CBThinkBlock,
   ToolCallPart as CBToolCallPart,
+  toolIcon as cbToolIcon,
+  CompressIcon as CBCompressIcon,
 } from '@noted/claude-blocks';
 import {
   AIComposerImagePreview,
@@ -282,6 +296,12 @@ interface RawAction {
     // Background Bash lifecycle (run_in_background): 'running' while only
     // the acceptance result exists; the task-notification outcome otherwise.
     backgroundStatus?: string;
+    // Grouping identity stamped by the parser (shared/history-action-grammar):
+    // family read/search/git/run/edit/mcp/plan/web + parsed MCP server·method.
+    family?: string;
+    bashWord?: string;
+    mcpServer?: string;
+    mcpMethod?: string;
     diffHunks?: Array<{
       oldStart: number;
       newStart: number;
@@ -318,6 +338,7 @@ interface FullHistoryEntry {
   optimisticAt?: number;
   thinking?: string;
   thinkingRef?: HistoryPayloadRef;
+  thinkingSeconds?: number;
   actions?: Action[];
   sessionId: string;
   compactSummary?: string;
@@ -347,6 +368,24 @@ interface FullHistoryEntry {
     endTs: number;
     durationMs: number;
   };
+  // Grouping identity (display-units projection). Claude: one model response
+  // spans several records with one message id — text sharing it with tool
+  // calls is a CAPTION, not a standalone reply. Codex: `textPhase` marks
+  // commentary (caption) vs final_answer (turn boundary).
+  messageId?: string;
+  textPhase?: 'commentary' | 'final_answer';
+  // Row-window stub metadata (main ships identity + grouping facts only).
+  rowStub?: boolean;
+  hasContent?: boolean;
+  actionSummary?: Array<{
+    toolUseId?: string;
+    toolName?: string;
+    family?: string;
+    bashWord?: string;
+    mcpServer?: string;
+    mcpMethod?: string;
+    isError?: boolean;
+  }>;
 }
 
 interface HistoryActivityTiming {
@@ -382,6 +421,10 @@ interface TerminalHistoryPreview {
 
 interface HistoryVirtuosoContext {
   terminalPreview: TerminalHistoryPreview | null;
+  // Transient tail reserve (fake scroll) armed by a near-bottom collapse.
+  // Rendered as Footer height so the frame does not jump; burns on upward
+  // scroll. Presentation-only — never part of saved positions.
+  tailSpacerPx: number;
 }
 
 interface CompactOperationalPhase {
@@ -608,6 +651,27 @@ const HistoryBottomSpacer = memo(() => (
   />
 ));
 
+const openTerminalHistoryPreviewContextMenu = (
+  event: React.MouseEvent<HTMLDivElement>,
+  preview: TerminalHistoryPreview,
+) => {
+  event.preventDefault();
+  event.stopPropagation();
+  const selection = window.getSelection();
+  const selectionInside = !!selection
+    && !selection.isCollapsed
+    && (
+      (!!selection.anchorNode && event.currentTarget.contains(selection.anchorNode))
+      || (!!selection.focusNode && event.currentTarget.contains(selection.focusNode))
+    );
+  ipcRenderer.send('show-terminal-history-preview-context-menu', {
+    tabId: preview.tabId,
+    toolType: preview.toolType,
+    preview,
+    selectionText: selectionInside ? selection?.toString() || '' : '',
+  });
+};
+
 const HistoryTerminalPreviewFooter = memo(({ context }: {
   context?: HistoryVirtuosoContext;
 }) => {
@@ -622,6 +686,7 @@ const HistoryTerminalPreviewFooter = memo(({ context }: {
           data-preview-id={preview.previewId}
           data-preview-phase={preview.phase}
           aria-live="polite"
+          onContextMenu={(event) => openTerminalHistoryPreviewContextMenu(event, preview)}
           status={(
             <MessageStatusBadge
               label="Terminal output · not yet saved to JSONL"
@@ -652,6 +717,15 @@ const HistoryTerminalPreviewFooter = memo(({ context }: {
             <CBMarkdown text={preview.text} />
           </div>
         </ConversationMessage>
+      )}
+      {(context?.tailSpacerPx ?? 0) > 0 && (
+        // Fake scroll reserve from a near-bottom collapse: holds the frame
+        // still, burns away on upward scroll (see historyTailSpacer.mjs).
+        <div
+          data-history-tail-spacer
+          aria-hidden="true"
+          style={{ height: context!.tailSpacerPx, pointerEvents: 'none' }}
+        />
       )}
       <HistoryBottomSpacer />
     </>
@@ -1280,7 +1354,19 @@ function applyHistoryRevealUpdate(
       ) || 0;
       const visibleBottom = scrollerRect.bottom - overlayHeight - 8;
       const overflow = anchorRect.bottom - visibleBottom;
-      if (overflow > 0.5) scroller.scrollTop += overflow;
+      if (overflow <= 0.5) return;
+      // Never push the row's own HEADER off the top.
+      //
+      // Pulling the whole overflow into view is right for a short body, but a
+      // tall one is taller than the viewport: the scroll then runs past the
+      // header and the user loses the thing they just opened («менюшка уходит
+      // вверх — она не должна двигаться, я сам проскроллю», 16.08). The
+      // header's distance to the top of the viewport is therefore the hard
+      // budget: spend what is available, leave the rest to the user's own
+      // scroll, and stop at 0 when the header already sits at the top.
+      const headroom = Math.max(0, anchorRect.top - scrollerRect.top - 8);
+      const shift = Math.min(overflow, headroom);
+      if (shift > 0.5) scroller.scrollTop += shift;
     });
   });
 }
@@ -1572,33 +1658,55 @@ const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
   }, [hasSummary]);
 
   return (
-    <div ref={anchorRef} style={{ padding: '4px 0' }}>
+    // Compact marker, minimal form (user decision): a thin left-aligned
+    // service line — icon-weight, not a full-width banner. The Codex compact
+    // body holds only copied user prompts, so it earns no card; the summary
+    // opens on click, left-aligned, not centered.
+    <div ref={anchorRef} style={{ padding: '2px 12px' }}>
       <div
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          gap: 6, cursor: hasSummary ? 'pointer' : 'default',
+          // Same -4/+4 margin/padding pair as .cb-tool-head, so the glyph
+          // lands exactly on the shared icon column (12px rail).
+          display: 'inline-flex', alignItems: 'center',
+          gap: 8, cursor: hasSummary ? 'pointer' : 'default',
+          minHeight: 22, padding: 4, margin: '0 -4px', borderRadius: 4,
+          userSelect: 'none',
+          background: hovered && hasSummary ? 'rgba(255, 255, 255, 0.03)' : undefined,
         }}
         onClick={hasSummary ? toggleOpen : undefined}
       >
-        <div style={{ flex: 1, height: 1, backgroundColor: '#f59e0b', opacity: 0.3 }} />
-        {hasSummary && (
-          visible ? <ChevronDown size={10} style={{ color: '#f59e0b', flexShrink: 0 }} />
-                  : <ChevronRight size={10} style={{ color: '#f59e0b', flexShrink: 0 }} />
-        )}
-        <span style={{ color: '#f59e0b', fontSize: '0.85em', letterSpacing: 1, flexShrink: 0, opacity: 0.8 }}>
-          COMPACTED{tokensLabel ? ` (${tokensLabel})` : ''}
+        {/* Same voice as every other feed row: a REAL identity glyph in the
+            shared icon column (compress arrows, amber = compaction), words in
+            the ordinary 0.9em UI type, and the disclosure chevron TRAILING on
+            hover exactly like every collapsible row — the chevron is a
+            control, not the row's face. */}
+        <CBCompressIcon
+          size={14}
+          strokeWidth={2.75}
+          style={{ color: '#b58a3e', flexShrink: 0 }}
+        />
+        <span style={{ color: '#b8b6b1', fontSize: '0.9em', flexShrink: 0 }}>
+          context compacted{tokensLabel ? ` · ${tokensLabel}` : ''}
         </span>
-        <div style={{ flex: 1, height: 1, backgroundColor: '#f59e0b', opacity: 0.3 }} />
+        {hasSummary && (
+          <ChevronRight
+            size={11}
+            style={{
+              color: '#6f6d68', flexShrink: 0,
+              opacity: visible || hovered ? 1 : 0,
+              transform: visible ? 'rotate(90deg)' : undefined,
+              transition: 'opacity 0.12s, transform 0.12s',
+            }}
+          />
+        )}
       </div>
       {visible && entry.compactSummary && (
         <div style={{
-          marginTop: 6, padding: '8px 12px',
-          backgroundColor: 'rgba(245, 158, 11, 0.04)',
-          borderLeft: '2px solid rgba(245, 158, 11, 0.3)',
-          borderRadius: 4,
-          fontSize: '0.92em', color: '#999',
+          margin: '4px 12px 0 34px', padding: '6px 10px',
+          borderLeft: '2px solid rgba(181, 138, 62, 0.35)',
+          fontSize: '0.88em', color: '#999',
           whiteSpace: 'pre-wrap', wordBreak: 'break-word',
           maxHeight: 300, overflowY: 'auto',
         }}>
@@ -1609,15 +1717,20 @@ const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
   );
 });
 
-const HistoryThinkBlock = memo(({ text, payloadRef }: {
+const HistoryThinkBlock = memo(({ text, payloadRef, seconds }: {
   text: string;
   payloadRef?: HistoryPayloadRef;
+  seconds?: number;
 }) => {
   const anchorRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const onToggle = useHistoryRevealToggle(anchorRef, open, setOpen);
   const { text: presented } = useRehydratedPayload(text, payloadRef, open);
-  return <CBThinkBlock text={presented || text} open={open} onToggle={onToggle} anchorRef={anchorRef} />;
+  // «thinking · 2m 40s» — duration derived from record timestamps (parser).
+  const label = typeof seconds === 'number' && seconds > 0
+    ? 'thinking · ' + (seconds >= 60 ? Math.floor(seconds / 60) + 'm ' + (seconds % 60 ? (seconds % 60) + 's' : '').trim() : seconds + 's')
+    : 'thinking';
+  return <CBThinkBlock text={presented || text} label={label} open={open} onToggle={onToggle} anchorRef={anchorRef} />;
 });
 
 // Session-scoped fetch context for dehydrated payloads. Card components sit
@@ -1717,6 +1830,11 @@ const HistoryToolCallPart = memo(({
   resultRef,
   isError,
   diffHunks,
+  family,
+  bashWord,
+  bashDetail,
+  mcpServer,
+  mcpMethod,
 }: {
   toolName: string;
   args: Record<string, any>;
@@ -1728,6 +1846,14 @@ const HistoryToolCallPart = memo(({
     newStart: number;
     entries: Array<{ tag: 'eq' | 'add' | 'del'; line: string }>;
   }>;
+  // Parser-stamped grouping identity (see history-action-grammar.cjs):
+  // refines the icon/verb (reading Bash → Read, git → Git) and turns raw
+  // `mcp__server__method` labels into `server · method`.
+  family?: string;
+  bashWord?: string;
+  bashDetail?: string;
+  mcpServer?: string;
+  mcpMethod?: string;
 }) => {
   const anchorRef = useRef<HTMLDivElement>(null);
   // Every card starts collapsed — including Edit/Write/MultiEdit, which used
@@ -1756,6 +1882,14 @@ const HistoryToolCallPart = memo(({
         result={presentedResult}
         isError={isError}
         diffHunks={diffHunks}
+        family={family}
+        // The row label must say WHAT was touched, not the literal command
+        // that touched it. Computed here (the package stays portable and
+        // cannot import app-side modules) with the same grammar the parsers
+        // and the grouping projection use.
+        headline={historyActionHeadline({ toolName, args, family, bashWord, bashDetail, mcpServer, mcpMethod })}
+        mcpServer={mcpServer}
+        mcpMethod={mcpMethod}
         collapse={{ open, onToggle, anchorRef }}
       />
       {open && pending && (
@@ -2717,6 +2851,7 @@ const HistoryUserEntry = memo(({
   rewindLocked,
   rewindUnavailableReason,
   forceExpanded,
+  onDismissUnconfirmed,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
@@ -2724,6 +2859,7 @@ const HistoryUserEntry = memo(({
   rewindLocked: boolean;
   rewindUnavailableReason?: string | null;
   forceExpanded?: boolean;
+  onDismissUnconfirmed?: (entry: FullHistoryEntry) => void;
 }) => {
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2818,6 +2954,26 @@ const HistoryUserEntry = memo(({
               </MessageActionButton>
             </Tooltip>
           )}
+          {queueStatus === 'delivery-unknown' && entry.handoffId && onDismissUnconfirmed && (
+            <Tooltip content="Скрыть это предупреждение">
+              <MessageActionButton
+                tone="warning"
+                aria-label="Dismiss unconfirmed prompt"
+                onMouseDown={stopActionPropagation}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onDismissUnconfirmed(entry);
+                }}
+              >
+                <X size={11} />
+              </MessageActionButton>
+            </Tooltip>
+          )}
         </MessageActionRail>
       )}
     >
@@ -2841,7 +2997,13 @@ const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
 
   const hasAssistantContent = !!entry.content;
   const hasAssistantActions = !!entry.actions?.length;
-  const isStandaloneToolRow = !hasAssistantContent && !entry.thinking && hasAssistantActions;
+  const isStandaloneToolRow = !hasAssistantContent
+    && ((hasAssistantActions && !entry.thinking)
+      // A thinking-only row is service chrome exactly like a tool-only row:
+      // without this it kept the fat text-row padding ABOVE while the row
+      // below sat at tool spacing — the «отступ сверху больше, чем снизу»
+      // asymmetry on the screenshot.
+      || (!hasAssistantActions && !!entry.thinking));
   const copyAnswer = () => {
     if (!entry.content) return;
     clipboard.writeText(entry.content);
@@ -2868,7 +3030,7 @@ const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
       ) : undefined}
       className={isStandaloneToolRow ? 'hp-assistant-tool-only' : undefined}
     >
-      {entry.thinking && <HistoryThinkBlock text={entry.thinking} payloadRef={entry.thinkingRef} />}
+      {entry.thinking && <HistoryThinkBlock text={entry.thinking} payloadRef={entry.thinkingRef} seconds={(entry as any).thinkingSeconds} />}
 
       {entry.content && (
         <div style={{ fontSize: '1em' }}>
@@ -2894,6 +3056,11 @@ const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
                 resultRef={action.rawTool.resultRef}
                 isError={action.rawTool.isError}
                 diffHunks={action.rawTool.diffHunks}
+                family={action.rawTool.family}
+                bashWord={action.rawTool.bashWord}
+                bashDetail={action.rawTool.bashDetail}
+                mcpServer={action.rawTool.mcpServer}
+                mcpMethod={action.rawTool.mcpMethod}
               />
               {backgroundRunning && (
                 // The card holds only the acceptance text; the live face of
@@ -2934,21 +3101,234 @@ const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
       })}
 
       {entry.responseTiming && (
+        // Turn separator, Codex-TUI style: a full-width hairline closes the
+        // worked turn. The duration label is inscribed only when the turn ran
+        // longer than 60s (a fast turn does not brag); the value is the same
+        // loader-based activity timing that always drove this slot — no new
+        // time source. Constant one-line geometry either way (tail contract).
         <div
           data-history-response-duration
           title="Время работы приложения от начала ответа до завершения loader"
           style={{
-            marginTop: 6,
-            color: '#71717a',
+            marginTop: 8,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            color: '#5b5b60',
             fontSize: '0.72em',
             fontVariantNumeric: 'tabular-nums',
-            letterSpacing: '0.015em',
+            letterSpacing: '0.02em',
+            userSelect: 'none',
+            minHeight: 14,
           }}
         >
-          Время работы: {formatHistoryResponseDuration(entry.responseTiming.durationMs)}
+          <span aria-hidden style={{ flex: '0 0 24px', borderTop: '1px solid #2c2c2c' }} />
+          {entry.responseTiming.durationMs > 60_000 && (
+            <span style={{ flexShrink: 0 }}>
+              worked {formatHistoryResponseDuration(entry.responseTiming.durationMs)}
+            </span>
+          )}
+          <span aria-hidden style={{ flex: '1 1 auto', borderTop: '1px solid #2c2c2c' }} />
         </div>
       )}
     </ConversationMessage>
+  );
+});
+
+// ---- Collapsed series group row (display-units projection) ----
+// Fixed two-line geometry: header (icon + caption/verb + count + status) and
+// a detail line that NEVER disappears — while the series is live it shows the
+// current operation, afterwards the member digest (owner contract: constant
+// tail geometry; a vanishing second line would break tail pinning).
+const HISTORY_GROUP_FAMILY_META: Record<string, { label: string; active: string; unit: [string, string] }> = {
+  read: { label: 'Read', active: 'Reading', unit: ['file', 'files'] },
+  search: { label: 'Searched', active: 'Searching', unit: ['query', 'queries'] },
+  git: { label: 'Ran git', active: 'Running git', unit: ['command', 'commands'] },
+  run: { label: 'Ran', active: 'Running', unit: ['command', 'commands'] },
+  web: { label: 'Searched web', active: 'Searching web', unit: ['query', 'queries'] },
+  edit: { label: 'Edited', active: 'Editing', unit: ['file', 'files'] },
+};
+
+/**
+ * Header text of a collapsed group.
+ *
+ * A group is now a CLASS (noise / edit), not a single family, so the header is
+ * built from the per-family breakdown:
+ *   - one family  → its own honest phrase: «Read 3 files», «Ran git 3 commands»;
+ *   - many        → those same phrases joined: «Read 3 files · Ran git 3
+ *     commands · npm». No synthetic «6 steps» — the phrases ARE the digest,
+ *     which is why a mixed group prints no second line.
+ * The digest line (single-family only) names the distinct SUBJECTS — files
+ * read, git subcommands — never the word already in the verb.
+ */
+const historyGroupHeaderData = (group: {
+  familyKey: string;
+  facts: Array<{ toolUseId?: string; toolName?: string; family?: string; bashWord?: string; bashDetail?: string; mcpServer?: string; mcpMethod?: string; subject?: string; isError?: boolean }>;
+  entries: FullHistoryEntry[];
+  captionEntry?: FullHistoryEntry | null;
+  errorCount: number;
+}, live: boolean) => {
+  const breakdown = groupFamilyBreakdown(group.facts);
+  const phrase = (bucket: { family: string; count: number; words: Map<string, number> }) => {
+    if (bucket.family === 'mcp') {
+      // «Called <server> ×N»: the verb says it is an MCP call, the noun is
+      // the SERVER, the count is per server. Never the method — «Called
+      // evaluate» read as a mystery verb (user), and methods are visible on
+      // every member row anyway.
+      const verb = live ? 'Calling' : 'Called';
+      const parts = Array.from(bucket.words.entries())
+        .map(([server, n]) => (n > 1 ? `${server} ×${n}` : server));
+      return parts.length ? `${verb} ${parts.join(', ')}` : `${verb} MCP`;
+    }
+    if (bucket.family === 'toolsearch') {
+      // «Tool search ×2» — counting the always-identical call as "2 calls"
+      // would dress pure noise up as work.
+      return bucket.count > 1 ? `Tool search ×${bucket.count}` : 'Tool search';
+    }
+    const meta = HISTORY_GROUP_FAMILY_META[bucket.family] || HISTORY_GROUP_FAMILY_META.run;
+    const unit = bucket.count === 1 ? meta.unit[0] : meta.unit[1];
+    return `${live ? meta.active : meta.label} ${bucket.count} ${unit}`;
+  };
+  if (breakdown.length === 0) return { verb: live ? 'Working' : 'Done', digest: '' };
+  if (breakdown.length === 1) {
+    const bucket = breakdown[0];
+    // Single family: the second line lists WHAT was touched. Files where we
+    // have them (read/edit), otherwise the distinguishing command word.
+    const parts = bucket.subjects.length > 0
+      ? bucket.subjects
+      : Array.from(bucket.words.entries())
+        .map(([word, n]) => (n > 1 ? `${word} ×${n}` : word));
+    return { verb: phrase(bucket), digest: parts.join(', ') };
+  }
+  // Mixed: EVERY family phrase, none hidden. «· 1 more» hid information the
+  // header exists to show while the named families sat right there — a
+  // riddle, not a summary (user). Long headers WRAP to a second line
+  // (same no-truncation law as card subjects).
+  return { verb: breakdown.map(phrase).join(' · '), digest: '' };
+};
+
+/** Total ± lines across an edit group — the fact the user actually scans. */
+const historyEditGroupStats = (entries: FullHistoryEntry[]) => {
+  let added = 0;
+  let removed = 0;
+  for (const entry of entries) {
+    for (const action of (entry.actions || []) as any[]) {
+      const hunks = action?.rawTool?.diffHunks;
+      if (!Array.isArray(hunks)) continue;
+      for (const hunk of hunks) {
+        for (const row of (hunk?.entries || [])) {
+          if (row?.tag === 'add') added += 1;
+          else if (row?.tag === 'del') removed += 1;
+        }
+      }
+    }
+  }
+  return { added, removed };
+};
+
+const HistoryCollapsedGroupRow = memo(({
+  group,
+  expanded,
+  liveBackgroundUuids,
+  isTurnBusy,
+  isLastUnit,
+  onToggle,
+}: {
+  group: {
+    key: string;
+    familyKey: string;
+    entries: FullHistoryEntry[];
+    captionEntry?: FullHistoryEntry | null;
+    facts: Array<{ toolUseId?: string; toolName?: string; family?: string; bashWord?: string; bashDetail?: string; mcpServer?: string; mcpMethod?: string; isError?: boolean }>;
+    errorCount: number;
+  };
+  expanded: boolean;
+  liveBackgroundUuids: ReadonlySet<string>;
+  isTurnBusy: boolean;
+  isLastUnit: boolean;
+  onToggle: () => void;
+}) => {
+  // Liveness = a member call is GENUINELY awaiting its result during a busy
+  // turn, or a member carries live background work. Never "the turn is busy
+  // and we are the tail": that rule made the spinner a function of display
+  // position — expanding the group demoted the header from last-unit and the
+  // spinner vanished while nothing else changed (user: «в свёрнутом роллер
+  // есть, в развёрнутом нет — какого хуя»), and it also burned the spinner
+  // through think-gaps when nothing inside the group was running.
+  const live = (isTurnBusy && group.facts.some((fact) => (fact as any).inFlight === true))
+    || group.entries.some((entry) => liveBackgroundUuids.has(entry.uuid));
+  const { verb, digest } = historyGroupHeaderData(group, live);
+  const caption = group.captionEntry && typeof group.captionEntry.content === 'string'
+    ? group.captionEntry.content.trim()
+    : '';
+  // ONE glyph for every collapsed group, whatever is inside it.
+  //
+  // Earlier the icon followed the dominant family, so two rows that are the
+  // same THING — a collapsed, expandable run of work — wore different glyphs
+  // (a file-edit sheet here, three strokes there) and the row's real identity
+  // stopped being legible at a glance. The family is already spelled out in
+  // words right next to it («Ran 2 commands · Searched 1 query»); the glyph's
+  // job is to say "this is a group, click to open", which is one fact and
+  // therefore one symbol. Individual cards keep their own family glyphs, so
+  // group and card never look alike.
+  const editStats = group.familyKey === 'edit' ? historyEditGroupStats(group.entries) : null;
+  return (
+    <div className="hp-history-group" data-history-group-live={live ? '1' : undefined}>
+      <div className="hp-history-group-head">
+      <div
+        className="hp-history-group-head-inner"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={onToggle}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            onToggle();
+          }
+        }}
+      >
+        <ColoredToolIcon
+          icon={cbToolIcon('Bash', 13, 'group')}
+          // Collapsed: the group INHERITS the running child's spinner. Expanded:
+          // the spinner lives on that child card itself (its status is already
+          // 'running'), the header goes back to the static stack — one loader
+          // per fact, never two for the same call.
+          //
+          // The header never turns red for member errors: successes are not
+          // marked either, so flagging only failures is dishonest asymmetry
+          // (user decision) — and one failed probe painting a 7-call group's
+          // whole identity red overstates it. The failing card is red itself
+          // on expand.
+          status={live && !expanded ? 'running' : 'done'}
+        />
+        {/* WHAT HAPPENED comes first, right after the glyph: «Ran 2 commands ·
+            Searched 1 query». The model's own sentence is narration and moves
+            below — a long caption used to push the counts off the right edge,
+            leaving the row with no readable meta at all. */}
+        <span className="hp-history-group-count">{verb}</span>
+        {editStats && (editStats.added > 0 || editStats.removed > 0) && (
+          <span className="hp-history-group-stats cb-diff-stats">
+            {editStats.added > 0 && <span className="cb-c-add">+{editStats.added}</span>}
+            {editStats.added > 0 && editStats.removed > 0 && ' '}
+            {editStats.removed > 0 && <span className="cb-c-del">−{editStats.removed}</span>}
+          </span>
+        )}
+        {expanded
+          ? <ChevronDown size={11} style={{ color: '#6f6d68', flexShrink: 0 }} />
+          : <ChevronRight size={11} style={{ color: '#6f6d68', flexShrink: 0 }} />}
+      </div>
+      </div>
+      {/* Second line while collapsed: the model's caption if it wrote one,
+          otherwise the digest of subjects. Never both — the row stays two
+          lines tall. */}
+      {!expanded && (caption || digest) && (
+        <div className="hp-history-group-detail">
+          <span aria-hidden style={{ flexShrink: 0 }}>└</span>
+          <span>{caption || digest}</span>
+        </div>
+      )}
+    </div>
   );
 });
 
@@ -2961,6 +3341,7 @@ const HistoryEntry = memo(({
   rewindLocked,
   rewindUnavailableReason,
   forceExpanded,
+  onDismissUnconfirmed,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
@@ -2969,6 +3350,7 @@ const HistoryEntry = memo(({
   rewindLocked: boolean;
   rewindUnavailableReason?: string | null;
   forceExpanded?: boolean;
+  onDismissUnconfirmed?: (entry: FullHistoryEntry) => void;
 }) => {
   if (entry.role === 'compact') {
     return <CompactBlock entry={entry} />;
@@ -3003,6 +3385,7 @@ const HistoryEntry = memo(({
         rewindLocked={rewindLocked}
         rewindUnavailableReason={rewindUnavailableReason}
         forceExpanded={forceExpanded}
+        onDismissUnconfirmed={onDismissUnconfirmed}
       />
     );
   }
@@ -3036,6 +3419,7 @@ const HistoryEntry = memo(({
         rewindLocked={rewindLocked}
         rewindUnavailableReason={rewindUnavailableReason}
         forceExpanded={forceExpanded}
+        onDismissUnconfirmed={onDismissUnconfirmed}
       />
     );
   }
@@ -3155,19 +3539,150 @@ const historyPanelStyleText = `@keyframes hp-flash {
   background: rgba(255, 255, 255, 0.34);
 }
 .hp-history-transcript .cb-tool {
-  margin-top: 4px;
-  margin-bottom: 4px;
+  margin-top: 2px;
+  margin-bottom: 2px;
+}
+/* Action rows are service lines under the prose, not competing blocks: one
+   compact line (~22px), secondary type size, tight paddings. The expanded
+   body keeps full size — density applies to the HEADER line only. */
+.hp-history-transcript .cb-tool-head {
+  padding-top: 2px;
+  padding-bottom: 2px;
+  font-size: 0.95em;
 }
 .hp-history-transcript .hp-assistant-tool-only {
   padding-top: 0;
   padding-bottom: 0;
 }
-.hp-history-transcript .hp-tool-scroll-scope .cb-tool-body > .cb-rail {
-  transition: border-left-color 90ms ease, filter 90ms ease;
+/* Collapsed group unit: fixed two-line geometry (header + detail line). The
+   detail line NEVER disappears on completion — its content changes from the
+   live operation to the member digest (owner contract: constant tail
+   geometry). */
+.hp-history-group {
+  /* A container opens a "chapter" of work — extra air ABOVE separates
+     chapters while atoms in between stay dense. */
+  margin: 8px 0 2px;
+  border-radius: 4px;
+  /* Align the header icon with regular tool-card icons: a card's icon sits at
+     12px (.cb-row-block padding; the head's -4px margin and 4px padding
+     cancel). The group head has the same -4/+4 pair, so the group's own
+     padding must be exactly 12px too — 14px put the glyph 2px right of the
+     card icon column (measured live). */
+  padding: 0 12px;
 }
-.hp-history-transcript .hp-tool-scroll-scope .cb-tool-body[data-hp-scroll-focus="true"] > .cb-rail {
-  border-left-color: rgba(255, 255, 255, 0.88);
-  filter: drop-shadow(0 0 4px rgba(255, 255, 255, 0.22));
+.hp-history-group-head {
+  /* Block-level flex with an INTEGRAL min-height: a virtualized feed measures
+     every row, so a fractional inline-level height makes the whole list
+     jitter during scroll. The interactive surface is narrowed to the content
+     by the inner box below, not by making this one inline. */
+  display: flex;
+  align-items: center;
+  min-height: 22px;
+  border-radius: 4px;
+  user-select: none;
+}
+.hp-history-group-head-inner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 4px;
+  margin: 0 -4px;
+  border-radius: 4px;
+  cursor: pointer;
+  overflow: hidden;
+}
+.hp-history-group-head-inner:hover { background: rgba(255, 255, 255, 0.03); }
+.hp-history-group-count {
+  /* WRAPS instead of hiding: the header lists every family phrase (no «N
+     more»), so a long mixed run takes a second line — the same no-truncation
+     law as card subjects. */
+  flex-shrink: 1;
+  min-width: 0;
+  color: #b8b6b1;
+  font-size: 0.9em; /* same size as card labels — one type voice per feed */
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+/* ± totals of a collapsed edit run — the fact the user scans, kept ON the
+   header line rather than a second row per file. */
+.hp-history-group-stats {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+/* ± digits everywhere: quieter than the words around them (user: числа не
+   читаю — как размер «N lines»/line-range qualifiers), grey at rest and
+   coloured only under the pointer. Shared with single edit cards via
+   .cb-diff-stats. */
+.hp-history-group-head-inner .cb-diff-stats .cb-c-add,
+.hp-history-group-head-inner .cb-diff-stats .cb-c-del {
+  color: #8f8d88;
+  transition: color 0.12s;
+}
+.hp-history-group-head-inner:hover .cb-diff-stats .cb-c-add { color: #4ade80; }
+.hp-history-group-head-inner:hover .cb-diff-stats .cb-c-del { color: #ef4444; }
+.hp-history-group-detail {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  min-height: 18px;
+  padding: 0 4px 0 26px;
+  color: #8f8d88;
+  font-size: 0.82em;
+  /* Full subject list, wrapped — never «file.md, file2.md · 3 more». */
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+/* Expanded members: shared left rail marks the group extent; contents are the
+   ordinary cards (heavy bodies mount only here). */
+.hp-history-group-member {
+  border-left: 1px solid rgba(255, 255, 255, 0.10);
+  /* The rail hangs from the CENTER of the group glyph (icon column starts at
+     12px, glyph is 14px wide → center 19px), the way a tree's child-line
+     descends from its parent icon. A rail in the far-left gutter (tried at
+     2px) belongs to nothing; flush against the header pill it reads as a
+     border. Members indent one clear step right of it. */
+  margin-left: 19px;
+  /* 5px keeps the member card's hover pill (inner box bleeds 4px left) from
+     touching the rail line. */
+  padding-left: 5px;
+  /* flow-root = a BFC: the member CONTAINS its card's 12px vertical margins
+     instead of letting them collapse out. Without this the border-left only
+     spanned the card itself, so the group rail rendered as short segments
+     with 24px holes between members (user: «полоска прерывается»). */
+  display: flow-root;
+}
+/* A SINGLE-family group already names the family in its header («Ran git…»,
+   «Read 3 files»), so repeating that same word on every member doubles it
+   (user feedback). A MIXED group is the opposite case: the verb is the only
+   thing telling one member from the next, so it stays. */
+.hp-history-group-member[data-history-group-uniform="1"] .cb-tool-label { display: none; }
+/* Group open/close motion — GPU-only (opacity/transform). Height is NOT
+   animated here on purpose: member rows are virtualized list items, and
+   animating their height would make the list remeasure every frame (the
+   scroll-jitter class of bug). Opening plays on mount; closing plays on the
+   still-mounted nodes for one beat before the state change removes them. */
+@keyframes hp-group-reveal {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes hp-group-fold {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(-4px); }
+}
+.hp-history-group-member,
+.hp-history-group-collapsed-appear {
+  animation: hp-group-reveal 140ms ease-out;
+}
+.hp-history-group-member--closing {
+  animation: hp-group-fold 110ms ease-in forwards;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hp-history-group-member,
+  .hp-history-group-member--closing,
+  .hp-history-group-collapsed-appear { animation: none; }
 }
 .hp-history-composer-frame {
   border-color: #333;
@@ -4645,8 +5160,9 @@ function AgentHistoryControls({
   const refreshDurablePromptProof = useCallback(async (
     pending: MidstreamPromptRecovery,
     reason: string,
+    options: { forceRefresh?: boolean } = {},
   ) => {
-    if (hasDurablePendingPrompt(pending)) return true;
+    if (!options.forceRefresh && hasDurablePendingPrompt(pending)) return true;
     try {
       await onHistoryRefresh(reason);
     } catch (e: any) {
@@ -5058,17 +5574,6 @@ function AgentHistoryControls({
       (async () => {
         const attempt = 1;
         if (tabIdRef.current !== requestTabId) return;
-        if (hasDurablePendingPrompt(pending)) {
-          console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery accepted tab=' + tabId.slice(-12)
-            + ' attempt=' + attempt
-            + ' handoff=' + pending.handoffId
-            + ' disposition=durable');
-          historyDiag('INTERRUPT_RECOVERY_ACCEPTED tab=' + tabId.slice(-12) +
-            ' handoff=' + pending.handoffId +
-            ' attempt=' + attempt +
-            ' disposition=durable');
-          return;
-        }
         console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery probe tab=' + tabId.slice(-12)
           + ' attempt=' + attempt
           + ' source=authoritative-stop-event');
@@ -5078,32 +5583,24 @@ function AgentHistoryControls({
             if (!draft.text) {
               console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + attempt);
             } else {
-              const ownership = resolveInterruptedPromptOwnership({
-                durablePromptExists: hasDurablePendingPrompt(pending),
-                returnedDraftExists: true,
-                returnedDraftMatchesHandoff: false,
-              });
-              if (ownership === 'durable') {
-                console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery accepted tab=' + tabId.slice(-12)
-                  + ' attempt=' + attempt
-                  + ' handoff=' + pending.handoffId
-                  + ' disposition=durable-after-probe');
-                historyDiag('INTERRUPT_RECOVERY_ACCEPTED tab=' + tabId.slice(-12) +
-                  ' handoff=' + pending.handoffId +
-                  ' attempt=' + attempt +
-                  ' disposition=durable-after-probe');
-                return;
-              }
               const ui = useUIStore.getState();
               const current = ui.historyPromptDrafts[requestTabId] || '';
               const currentChips = ui.historyPromptDraftChips[requestTabId] || [];
               const currentImages = ui.historyPromptDraftImages[requestTabId] || [];
-              const terminalIdentity = normalizeHistoryPromptIdentityText(draft.text);
-              const authoringProof = terminalIdentity === normalizeHistoryPromptIdentityText(pending.serializedText)
-                || terminalIdentity === normalizeHistoryPromptIdentityText(pending.transportText);
+              const authoringProof = interruptedPromptDraftMatchesHandoff({
+                returnedDraft: draft.text,
+                presentationText: pending.serializedText,
+                transportText: pending.transportText,
+              });
               const confirmedOwnership = resolveInterruptedPromptOwnership({
                 durablePromptExists: authoringProof
-                  ? await refreshDurablePromptProof(pending, 'interrupt-exact-draft')
+                  ? await refreshDurablePromptProof(pending, 'interrupt-exact-draft', {
+                      // The prompt can disappear from Claude's active branch on
+                      // interrupt after an older History snapshot already saw
+                      // it. A returned exact draft therefore forces one fresh
+                      // branch read before durable ownership is allowed to win.
+                      forceRefresh: true,
+                    })
                   : hasDurablePendingPrompt(pending),
                 returnedDraftExists: true,
                 returnedDraftMatchesHandoff: authoringProof,
@@ -8251,6 +8748,20 @@ const JUMP_STUB_HYDRATION_WAIT_MS = 20_000;
 // row); failure gets a bounded retry cadence instead of one request per
 // animation frame from the jump loop.
 const HYDRATION_REISSUE_COOLDOWN_MS = 1_200;
+/**
+ * Circuit breaker for hydration oscillation.
+ *
+ * The uuid cooldown above only stops a request repeating for the SAME centre.
+ * A feedback loop that alternates between two centres slips through it — and
+ * one did: grouping changed the unit count, the midpoint anchor moved to a
+ * different row each pass, and the panel rebuilt ~8×/s while the user was not
+ * scrolling at all (production 16.08, tab-3314). The anchor fix removes that
+ * cause; this breaker makes the CLASS of failure survivable — if this many
+ * viewport-driven requests land inside the window without the visible range
+ * settling, viewport hydration stops until the next real user scroll.
+ */
+const HYDRATION_BURST_WINDOW_MS = 3_000;
+const HYDRATION_BURST_MAX_REQUESTS = 12;
 
 // Fallback average row height when no measured geometry exists yet (first
 // ever visit to a session). Roughly a short assistant paragraph; real
@@ -8952,28 +9463,10 @@ function HistoryPanel({
       + ' processGeneration=' + (agentProcessGeneration || '-')
       + ' keys=' + (backgroundChipsDigest || '-'));
   }, [tabId, backgroundChipsDigest, backgroundHistoryChips.length, backgroundAgentChipCount, chipsOwnerSettled, chipsFreshOwnerKey, chipsLiveOwnerProven, historyOwnerKey, isTurnBusy, agentProcessAlive, agentProcessGeneration]);
-  // Tab-level loader inheritance: a Codex subagent can outlive its spawn
-  // turn, so the tab must keep spinning while any background chip is live
-  // even though the parent turn's busy flag is already false. Broadcast the
-  // live count; TabBar folds it into the shimmer (display-only — lifecycle
-  // busy ownership stays with the runtime signals).
-  useEffect(() => {
-    // Publish only what this tab actually owns. While the owner handoff is in
-    // flight the strip is empty by construction (see chipsOwnerSettled), and
-    // broadcasting that emptiness would read as "the agent stopped" — the
-    // loader would blink off on every switch. Silence during the handoff means
-    // "no new answer"; TabBar keeps the last one until this tab can speak for
-    // itself again.
-    if (!chipsOwnerSettled) return;
-    window.dispatchEvent(new CustomEvent('history-panel:background-work', {
-      detail: { tabId, count: backgroundAgentChipCount },
-    }));
-    // No zeroing on unmount: the count is now owned by the main-process
-    // watcher (`tab:background-work`), which sees every tab whether or not its
-    // History is open. Publishing 0 here used to erase a still-running agent
-    // the moment the user switched away — the tab looked idle until clicked
-    // back, which is exactly how a live agent stayed invisible.
-  }, [chipsOwnerSettled, tabId, backgroundAgentChipCount]);
+  // The strip stays a History presentation, but tab-loader ownership lives in
+  // main's provider transcript observers. History must never publish process
+  // liveness: mounting, switching or closing this surface is not a lifecycle
+  // event and used to erase or resurrect real background work.
   const [expandedBackgroundChipKey, setExpandedBackgroundChipKey] = useState<string | null>(null);
   // Auto-close the pane when its chip finishes (mirrors the SDK bar).
   useEffect(() => {
@@ -9001,14 +9494,213 @@ function HistoryPanel({
   );
   const displayEntries = rewindPreviewResult.entries;
   const transcriptEntries = displayEntries;
+  // ===== Display units: series collapsing (последняя ступень проекции) =====
+  // Approved contract (docs/tmp/визуал-history.md::Вердикт): the unit list is
+  // presentation-only; group keys are internal; everything that crosses this
+  // boundary (anchors, hydration, jumps, search) speaks entry uuids and gets
+  // translated to unit indices HERE. Kill switch: historyGroupActionsEnabled.
+  const historyGroupActionsEnabled = useUIStore((s) => (s as any).historyGroupActionsEnabled !== false);
+  const [expandedGroupKeys, setExpandedGroupKeys] = useState<ReadonlySet<string>>(() => new Set());
+  // Expansion state belongs to the owner (scar: state surviving an owner
+  // switch was read by the wrong tab). Reset on owner change.
+  const expandedGroupOwnerRef = useRef(historyOwnerKey);
+  const tailSpacerOwnerResetRef = useRef<(() => void) | null>(null);
+  if (expandedGroupOwnerRef.current !== historyOwnerKey) {
+    expandedGroupOwnerRef.current = historyOwnerKey;
+    if (expandedGroupKeys.size > 0) setExpandedGroupKeys(new Set());
+    // Owner guard 4: the tail reserve never crosses an owner switch. The
+    // spacer ref is created later in the component; route through a ref set
+    // after creation so render order stays legal.
+    tailSpacerOwnerResetRef.current?.();
+  }
+  const displayUnits = useMemo(
+    () => buildHistoryDisplayUnits(displayEntries, {
+      enabled: historyGroupActionsEnabled,
+      threshold: 2,
+      expandedKeys: expandedGroupKeys,
+    }),
+    [displayEntries, expandedGroupKeys, historyGroupActionsEnabled],
+  );
+  const displayUnitsRef = useRef(displayUnits);
+  displayUnitsRef.current = displayUnits;
+  // uuid → unit index for every entry uuid (members of collapsed groups map
+  // to their group's unit). THE translation layer: no uuid-consumer below may
+  // scan units itself.
+  const unitIndexByUuid = useMemo(() => {
+    const map = new Map<string, number>();
+    for (let index = 0; index < displayUnits.length; index += 1) {
+      const unit = displayUnits[index] as any;
+      if (unit.kind === 'entry') {
+        if (unit.entry?.uuid) map.set(unit.entry.uuid, index);
+        // A caption merged into its call's row stays addressable there.
+      } else {
+        for (const member of unit.entries) {
+          if (member?.uuid) map.set(member.uuid, index);
+        }
+      }
+    }
+    return map;
+  }, [displayUnits]);
+  const unitIndexByUuidRef = useRef(unitIndexByUuid);
+  unitIndexByUuidRef.current = unitIndexByUuid;
+  // Expand the group containing `uuid` (no-op when visible already). Returns
+  // true when an expansion actually happened — jump loops then re-resolve on
+  // the next frame against the new unit list.
+  const expandGroupForUuid = useCallback((uuid: string, reason: string) => {
+    const target = resolveHistoryDisplayTarget(displayUnitsRef.current, uuid);
+    if (!target || !(target as any).groupKey) return false;
+    const groupKey = (target as any).groupKey as string;
+    historyDiag('JUMP_EXPAND tab=' + tabId.slice(-12)
+      + ' uuid=' + uuid.slice(0, 8)
+      + ' group=' + groupKey.slice(0, 24)
+      + ' reason=' + reason);
+    setExpandedGroupKeys((previous) => {
+      if (previous.has(groupKey)) return previous;
+      const next = new Set(previous);
+      next.add(groupKey);
+      return next;
+    });
+    return true;
+  }, [tabId]);
+  // ---- Tail spacer: fake scroll reserve for near-bottom collapses ----
+  // One value source (owner guard 1): everything that does bottom math reads
+  // historyTailSpacerRef.current.get(). The reserve renders inside the
+  // Footer (historyTailSpacerPx), burns on upward scroll, zeroes on restore
+  // start / owner change / tail growth. Never persisted.
+  const [historyTailSpacerPx, setHistoryTailSpacerPx] = useState(0);
+  const historyTailSpacerRef = useRef(createHistoryTailSpacer({
+    onChange: (px: number) => setHistoryTailSpacerPx(px),
+    diag: (line: string) => historyDiag(line + ' tab=' + tabId.slice(-12)),
+  }));
+  tailSpacerOwnerResetRef.current = () => historyTailSpacerRef.current.reset('owner-change');
+  // New rows at the tail make the reserve meaningless (real content now fills
+  // the space) — zero it, but only when zeroing cannot clamp the position:
+  // growth added at least the reserve's height below the viewport.
+  const tailSpacerEntryCountRef = useRef(displayEntries.length);
+  if (displayEntries.length > tailSpacerEntryCountRef.current
+    && historyTailSpacerRef.current.get() > 0) {
+    historyTailSpacerRef.current.reset('new-rows');
+  }
+  tailSpacerEntryCountRef.current = displayEntries.length;
+  // Expand a group WITHOUT moving what the user is reading: when the group
+  // header sits ABOVE the viewport, the inserted member heights land above
+  // the reading position — compensate scrollTop by the measured growth on
+  // the next frame (owner condition 4: toggles are index-space edits the
+  // "rows above must not move" law does not cover by itself).
+  const expandGroupPreservingViewport = useCallback((groupKey: string, reason: string) => {
+    const scroller = virtuosoScrollerRef.current;
+    const headBefore = scroller?.querySelector(
+      `[data-history-group="${CSS.escape(groupKey)}"]`,
+    ) as HTMLElement | null;
+    const scrollerTop = scroller?.getBoundingClientRect().top ?? 0;
+    const headAbove = headBefore
+      ? headBefore.getBoundingClientRect().top - scrollerTop < 0
+      : false;
+    const scrollHeightBefore = scroller?.scrollHeight ?? 0;
+    historyDiag('GROUP_EXPAND tab=' + tabId.slice(-12)
+      + ' key=' + groupKey.slice(0, 24)
+      + ' reason=' + reason);
+    setExpandedGroupKeys((previous) => {
+      if (previous.has(groupKey)) return previous;
+      const next = new Set(previous);
+      next.add(groupKey);
+      return next;
+    });
+    if (headAbove && scroller) {
+      requestAnimationFrame(() => {
+        const grownBy = scroller.scrollHeight - scrollHeightBefore;
+        if (grownBy > 0) scroller.scrollTop += grownBy;
+      });
+    }
+  }, [tabId]);
+  // Collapse a group WITHOUT moving what the user is reading. Above the
+  // viewport → compensate scrollTop by the removed height (toggle law:
+  // "rows above must not move" does not cover index-space edits — owner
+  // condition 4). Near the bottom with nothing below → arm the tail reserve
+  // so the frame stays put and the reserve burns on the way up.
+  const collapseGroupPreservingViewport = useCallback((groupKey: string) => {
+    const scroller = virtuosoScrollerRef.current;
+    const groupHead = scroller?.querySelector(
+      `[data-history-group="${CSS.escape(groupKey)}"]`,
+    ) as HTMLElement | null;
+    // Closing animation for group members.
+    //
+    // Member rows are Virtuoso items: React removes them from the list, so
+    // there is nothing left to transition — the only way to show the collapse
+    // is to play it on the CURRENT nodes before the state change lands. They
+    // fade and slide up for one short beat while the rows are still mounted;
+    // the state update below then removes them mid-fade, which reads as the
+    // block folding away rather than blinking out. Deliberately GPU-only
+    // (opacity/transform): touching height here would make Virtuoso remeasure
+    // every frame — the jitter class of bug we just fixed.
+    const closingNodes = scroller
+      ? Array.from(scroller.querySelectorAll(
+        `[data-history-group-member="${CSS.escape(groupKey)}"]`,
+      )) as HTMLElement[]
+      : [];
+    const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    if (!reducedMotion) {
+      for (const node of closingNodes) node.classList.add('hp-history-group-member--closing');
+    }
+    const scrollerRect = scroller?.getBoundingClientRect() || null;
+    const memberNodes = scroller
+      ? Array.from(scroller.querySelectorAll(`[data-history-group-member="${CSS.escape(groupKey)}"]`))
+      : [];
+    // Height the collapse will remove ≈ mounted members' extent minus the
+    // detail line the collapsed header gains back (~18px). The header row
+    // itself exists in both states. Unmounted members are outside the
+    // viewport by definition and do not affect the visible frame.
+    let removedPx = 0;
+    for (const node of memberNodes) {
+      removedPx += (node as HTMLElement).getBoundingClientRect().height;
+    }
+    removedPx = Math.max(0, removedPx - 18);
+    const headTop = groupHead && scrollerRect
+      ? groupHead.getBoundingClientRect().top - scrollerRect.top
+      : 0;
+    const aboveViewport = groupHead && headTop < 0;
+    const commitCollapse = () => {
+      setExpandedGroupKeys((previous) => {
+        if (!previous.has(groupKey)) return previous;
+        const next = new Set(previous);
+        next.delete(groupKey);
+        return next;
+      });
+    };
+    if (closingNodes.length > 0 && !reducedMotion) {
+      // One beat of the closing animation, then remove. Shorter than the
+      // 140ms keyframe on purpose: the rows should still be visibly moving
+      // when they go, otherwise the fold reads as a pause followed by a jump.
+      window.setTimeout(commitCollapse, 90);
+    } else {
+      commitCollapse();
+    }
+    if (!scroller || removedPx <= 0) return;
+    if (aboveViewport) {
+      // Removed height is entirely above the reading position: pull
+      // scrollTop up by the same amount in the same frame.
+      requestAnimationFrame(() => {
+        scroller.scrollTop = Math.max(0, scroller.scrollTop - removedPx);
+      });
+      return;
+    }
+    const distFromBottom = scroller.scrollHeight
+      - (scroller.scrollTop + scroller.clientHeight)
+      - historyTailSpacerRef.current.get();
+    if (distFromBottom <= removedPx + 60) {
+      // Nothing (or not enough) below to absorb the removal — the scroller
+      // would clamp and yank the frame. Reserve the removed height instead.
+      historyTailSpacerRef.current.arm(removedPx, 'collapse-near-bottom');
+    }
+  }, []);
   const visibleTerminalPreview = terminalPreview?.tabId === tabId
     && terminalPreview.toolType === toolType
     && (!sessionId || !terminalPreview.sessionId || terminalPreview.sessionId === sessionId)
     ? terminalPreview
     : null;
   const historyVirtuosoContext = useMemo<HistoryVirtuosoContext>(
-    () => ({ terminalPreview: visibleTerminalPreview }),
-    [visibleTerminalPreview],
+    () => ({ terminalPreview: visibleTerminalPreview, tailSpacerPx: historyTailSpacerPx }),
+    [visibleTerminalPreview, historyTailSpacerPx],
   );
   const visibleLiveToolResults = liveToolResultsRef.current.ownerKey === historyOwnerKey
     ? liveToolResults
@@ -9064,13 +9756,11 @@ function HistoryPanel({
       detail,
     }));
   }, [sessionId, tabId, toolType]);
-  const displayEntryIndexByUuid = useMemo(() => {
-    const index = new Map<string, number>();
-    for (let i = 0; i < displayEntries.length; i += 1) {
-      index.set(displayEntries[i].uuid, i);
-    }
-    return index;
-  }, [displayEntries]);
+  // Virtuoso now renders display UNITS. Every uuid-to-index consumer (anchor
+  // restore, Timeline jump, search, hydration seeding) must receive UNIT
+  // indices — this map is the single translation and already resolves a uuid
+  // hidden inside a collapsed group to the group's own row.
+  const displayEntryIndexByUuid = unitIndexByUuid;
   const displayEntryIndexByUuidRef = useRef(displayEntryIndexByUuid);
   displayEntryIndexByUuidRef.current = displayEntryIndexByUuid;
   const pendingInitialHistoryIndex = useMemo(() => {
@@ -9098,7 +9788,7 @@ function HistoryPanel({
   const initialTopMostItemIndex = pendingInitialHistoryIndex >= 0
     ? { index: pendingInitialHistoryIndex, align: 'center' as const, behavior: 'auto' as const }
     : initialAnchorLocation
-      ?? (displayEntries.length > 0 ? displayEntries.length - 1 : 0);
+      ?? (displayUnits.length > 0 ? displayUnits.length - 1 : 0);
   // Measured geometry of THIS owner from its previous visit, resolved once per
   // owner (the list is keyed by owner, so it is read exactly at mount). An
   // explicit Timeline jump owns the position and must not be overridden by a
@@ -9210,7 +9900,9 @@ function HistoryPanel({
   ) {
     const latch = restoredLayoutLatchRef.current;
     latch.resolved = true;
-    const storedLayout = getHistoryMeasuredLayout(historyOwnerKey, displayEntries.length);
+    // Geometry is measured against DISPLAY UNITS (groups collapse rows), so
+    // the stored item count must be compared in the same space.
+    const storedLayout = getHistoryMeasuredLayout(historyOwnerKey, displayUnits.length);
     // The height ESTIMATE is useful even when the position restore is not:
     // a Timeline jump owns the position, but unmeasured rows around the
     // target still size from this per-owner average instead of Virtuoso's
@@ -9243,7 +9935,9 @@ function HistoryPanel({
     }
     mountWaveMetaRef.current = {
       visitKey: restoredLayoutVisitKey,
-      shellUuids: new Set(displayEntries.map((entry) => entry.uuid)),
+      // Wave shells are per display UNIT: a collapsed group is one shell
+      // (keyed by its first member's uuid, which is also its data-uuid).
+      shellUuids: new Set(displayUnits.map((unit) => historyDisplayUnitUuid(unit)).filter(Boolean)),
       heightLookup: createHistoryRowHeightLookup(
         storedLayout,
         latch.avgRowHeight ?? HISTORY_DEFAULT_ROW_HEIGHT_PX,
@@ -9391,6 +10085,11 @@ function HistoryPanel({
   // through; letting it re-centre mid-jump can pull the span away from the
   // target right after the target hydrated (ping-pong until the deadline).
   const historyJumpHydrationActiveRef = useRef(false);
+  // Burst accounting for the hydration oscillation breaker; reset by a real
+  // user scroll (see the scroll handler) and by the window rolling over.
+  const hydrationBurstRef = useRef<{ since: number; count: number; tripped: boolean }>({
+    since: 0, count: 0, tripped: false,
+  });
   // `loadHistory` is declared far below (it depends on the whole load
   // pipeline), but hydration is requested from callbacks defined ABOVE it —
   // search-match navigation, the Timeline-jump effect. A ref is the only way
@@ -9461,98 +10160,45 @@ function HistoryPanel({
   // on every refresh).
   const lengthRef = useRef(0);
   const panelDiagContextRef = useRef('');
-  const activeHistoryToolScrollBodyRef = useRef<HTMLElement | null>(null);
   panelDiagContextRef.current = ' open=' + (isOpen ? 1 : 0) +
     ' embedded=' + (embedded ? 1 : 0) +
     ' tool=' + toolType;
-
-  const clearHistoryToolScrollFocus = useCallback((reason: string) => {
-    const activeBody = activeHistoryToolScrollBodyRef.current;
-    if (!activeBody) return;
-    activeBody.removeAttribute('data-hp-scroll-focus');
-    const toolName = activeBody.closest('.hp-tool-scroll-scope')
-      ?.getAttribute('data-history-tool-name') || 'unknown';
-    activeHistoryToolScrollBodyRef.current = null;
-    historyDiag('TOOL_SCROLL_FOCUS tab=' + tabId.slice(-12) +
-      ' tool=' + toolName +
-      ' active=0' +
-      ' reason=' + reason);
-  }, [tabId]);
-
-  const activateHistoryToolScrollFocus = useCallback((body: HTMLElement) => {
-    if (activeHistoryToolScrollBodyRef.current === body) return;
-    clearHistoryToolScrollFocus('focus-switch');
-    activeHistoryToolScrollBodyRef.current = body;
-    body.setAttribute('data-hp-scroll-focus', 'true');
-    const toolName = body.closest('.hp-tool-scroll-scope')
-      ?.getAttribute('data-history-tool-name') || 'unknown';
-    historyDiag('TOOL_SCROLL_FOCUS tab=' + tabId.slice(-12) +
-      ' tool=' + toolName +
-      ' active=1' +
-      ' reason=block-click');
-  }, [clearHistoryToolScrollFocus, tabId]);
-
-  const handleHistoryToolPointerDown = useCallback((event: PointerEvent) => {
-    const outerScroller = virtuosoScrollerRef.current;
-    if (!outerScroller) return;
-    const body = historyToolScrollBodyFromTarget(event.target, outerScroller);
-    if (!body || !findHistoryToolInnerScroller(body, event.target)) return;
-    activateHistoryToolScrollFocus(body);
-  }, [activateHistoryToolScrollFocus]);
 
   const handleHistoryToolWheel = useCallback((event: WheelEvent) => {
     if (event.deltaY === 0) return;
     const outerScroller = virtuosoScrollerRef.current;
     if (!outerScroller) return;
-    const activeBody = activeHistoryToolScrollBodyRef.current;
     const body = historyToolScrollBodyFromTarget(event.target, outerScroller);
-
-    // A clicked tool body owns the wheel while the pointer remains inside it.
-    // Reaching its top/bottom is a clamp, not permission to chain-scroll the
-    // History viewport. Ownership ends only after an explicit wheel/click
-    // outside, so extra ticks at the edge cannot unexpectedly move the chat.
-    if (activeBody && body === activeBody && activeBody.contains(event.target as Node)) {
-      const innerScroller = findHistoryToolInnerScroller(activeBody, event.target);
-      if (event.cancelable) event.preventDefault();
-      event.stopPropagation();
-      if (!innerScroller) return;
-      const scale = event.deltaMode === 1
-        ? 16
-        : event.deltaMode === 2
-          ? innerScroller.clientHeight
-          : 1;
-      innerScroller.scrollTop += event.deltaY * scale;
-      return;
-    }
-    if (activeBody) {
-      clearHistoryToolScrollFocus('outside-wheel');
-    }
-
     if (!body) return;
     const innerScroller = findHistoryToolInnerScroller(body, event.target);
     if (!innerScroller) return;
-    if (event.cancelable) event.preventDefault();
     const scale = event.deltaMode === 1
       ? 16
       : event.deltaMode === 2
-        ? outerScroller.clientHeight
+        ? innerScroller.clientHeight
         : 1;
-    outerScroller.scrollTop += event.deltaY * scale;
-  }, [clearHistoryToolScrollFocus]);
-
-  useEffect(() => {
-    const handleOutsidePointer = (event: PointerEvent) => {
-      const activeBody = activeHistoryToolScrollBodyRef.current;
-      if (activeBody && !activeBody.contains(event.target as Node)) {
-        clearHistoryToolScrollFocus('outside-click');
-      }
-    };
-    document.addEventListener('pointerdown', handleOutsidePointer, true);
-    return () => {
-      document.removeEventListener('pointerdown', handleOutsidePointer, true);
-      clearHistoryToolScrollFocus('unmount');
-    };
-  }, [clearHistoryToolScrollFocus]);
+    const delta = event.deltaY * scale;
+    // Pointer inside an expanded body scrolls THAT body — no click needed.
+    //
+    // The old contract demanded a click first (which also painted the rail
+    // as a focus state) because everything used to be expanded by default and
+    // a stray wheel could hijack the feed. With collapsed-by-default rows an
+    // expanded body is always deliberate, so requiring a click was pure
+    // friction (user decision 16.08). At the body's own edge the wheel chains
+    // out to the feed, the way nested scrollers normally behave.
+    const atTop = innerScroller.scrollTop <= 0;
+    const atBottom = innerScroller.scrollTop + innerScroller.clientHeight
+      >= innerScroller.scrollHeight - 1;
+    const wantsOut = (delta < 0 && atTop) || (delta > 0 && atBottom);
+    if (wantsOut) {
+      if (event.cancelable) event.preventDefault();
+      outerScroller.scrollTop += delta;
+      return;
+    }
+    if (event.cancelable) event.preventDefault();
+    event.stopPropagation();
+    innerScroller.scrollTop += delta;
+  }, []);
 
   // ========== SEARCH ==========
   const [searchOpen, setSearchOpen] = useState(false);
@@ -9586,7 +10232,13 @@ function HistoryPanel({
       const text = (displayEntries[i].content || '').toLowerCase();
       let idx = text.indexOf(q);
       while (idx !== -1) {
-        positions.push({ entryIdx: i, entryUuid: displayEntries[i].uuid, offset: idx });
+        // entryIdx must address the display-UNIT list (what Virtuoso renders),
+        // not the raw entry array — a match inside a collapsed group resolves
+        // to the group's own row.
+        const unitIdx = displayEntryIndexByUuid.get(displayEntries[i].uuid);
+        if (unitIdx !== undefined) {
+          positions.push({ entryIdx: unitIdx, entryUuid: displayEntries[i].uuid, offset: idx });
+        }
         idx = text.indexOf(q, idx + 1);
       }
     }
@@ -9643,11 +10295,30 @@ function HistoryPanel({
     const match = matchPositions[idx];
     isAtBottomRef.current = false;
     historyTailPinScheduler.cancel();
-    virtuosoRef.current?.scrollToIndex({ index: match.entryIdx, align: 'center', behavior: 'smooth' });
-    if (toolType === 'codex' && (presentationEntriesRef.current[match.entryIdx] as any)?.rowStub) {
-      requestHistoryHydrationAt(match.entryUuid, 'search-match', ' idx=' + match.entryIdx);
+    // A match inside a collapsed series: expand its group first so the
+    // highlight pass has real text to walk. The unit index shifts after the
+    // expansion commit — jump on the next frame via the uuid map.
+    if (expandGroupForUuid(match.entryUuid, 'search-match')) {
+      requestAnimationFrame(() => {
+        const liveIdx = unitIndexByUuidRef.current.get(match.entryUuid);
+        if (liveIdx !== undefined) {
+          virtuosoRef.current?.scrollToIndex({ index: liveIdx, align: 'center', behavior: 'smooth' });
+        }
+      });
+      return;
     }
-  }, [historyTailPinScheduler, matchPositions, requestHistoryHydrationAt, toolType]);
+    virtuosoRef.current?.scrollToIndex({ index: match.entryIdx, align: 'center', behavior: 'smooth' });
+    // rowStub check runs by uuid over the ENTRY array (match.entryIdx is a
+    // display-unit index and must not address the server-entry array).
+    if (toolType === 'codex') {
+      const serverEntry = presentationEntriesRef.current.find(
+        (row) => row.uuid === match.entryUuid,
+      );
+      if ((serverEntry as any)?.rowStub) {
+        requestHistoryHydrationAt(match.entryUuid, 'search-match', ' idx=' + match.entryIdx);
+      }
+    }
+  }, [expandGroupForUuid, historyTailPinScheduler, matchPositions, requestHistoryHydrationAt, toolType]);
 
   const goNextMatch = useCallback(() => {
     if (matchPositions.length === 0) return;
@@ -9812,6 +10483,8 @@ function HistoryPanel({
   // Reads the latest length via ref so consumer effects don't need to depend
   // on `entries` (the callback identity stays stable).
   const scrollToBottom = useCallback((smooth = false) => {
+    // Reaching the real bottom is a terminal state for the tail reserve.
+    historyTailSpacerRef.current.reset('scroll-to-bottom');
     scheduleHistoryBottomScroll({
       virtuoso: virtuosoRef.current,
       itemCount: lengthRef.current,
@@ -10099,6 +10772,41 @@ function HistoryPanel({
     });
   }, [historySnapshotOwner, persistVolatileOverlay, tabId]);
 
+  const dismissUnconfirmedPromptEntry = useCallback(async (entry: FullHistoryEntry) => {
+    const handoffId = typeof entry.handoffId === 'string' ? entry.handoffId.trim() : '';
+    if (!handoffId || entry.queueStatus !== 'delivery-unknown') return;
+    try {
+      const result = await ipcRenderer.invoke('agent:dismiss-send-receipt-presentation', {
+        tabId,
+        handoffId,
+      });
+      historyDiag('DURABLE_PRESENTATION_DISMISS tab=' + tabId.slice(-12)
+        + ' handoff=' + handoffId
+        + ' success=' + (result?.success === true ? '1' : '0')
+        + ' dismissed=' + (result?.dismissed === true ? '1' : '0')
+        + ' reason=' + (result?.reason || '-'));
+      if (result?.success !== true || result?.dismissed !== true) {
+        useUIStore.getState().showToast(
+          'Не удалось скрыть неподтверждённое сообщение',
+          'error',
+          3200,
+        );
+        return;
+      }
+      consumeHistoryPromptHandoff(tabId, handoffId);
+      removeLocalPromptEntry(handoffId, 'user-dismissed-unconfirmed');
+    } catch (error: any) {
+      console.warn('[HistoryPanel] durable presentation dismiss failed tab=' + tabId.slice(-12)
+        + ' handoff=' + handoffId
+        + ': ' + String(error?.message || error));
+      useUIStore.getState().showToast(
+        'Не удалось скрыть неподтверждённое сообщение',
+        'error',
+        3200,
+      );
+    }
+  }, [removeLocalPromptEntry, tabId]);
+
   const acknowledgeMaterializedHistoryReceipt = useCallback(async (input: {
     operationKey?: string | null;
     attemptId?: string | null;
@@ -10163,7 +10871,6 @@ function HistoryPanel({
     let disposed = false;
     void ipcRenderer.invoke('agent:list-send-receipts', {
       tabId,
-      surface: 'desktop-history',
     }).then(async (result: any) => {
       if (disposed || result?.success !== true || !Array.isArray(result.records)) return;
       let restorableDraft: string | null = null;
@@ -10203,10 +10910,17 @@ function HistoryPanel({
           removeLocalPromptEntry(record.handoffId, 'durable-presentation-already-materialized');
           continue;
         }
+        // Project API/iOS/Terminal MCP own their external composer and retry
+        // projection, so History must not recreate their optimistic cards
+        // after restart. It still lists their confirmed receipts above so an
+        // exact canonical transcript row can retire a local card that was
+        // already projected while the renderer was alive.
+        if (record?.surface !== 'desktop-history') continue;
         const outcome = hydrateHistoryPromptHandoffFromDurableReceipt(record);
         if (outcome.hydrated) hydrated += 1;
         if (!outcome.hydrated && (
           outcome.reason === 'durable-history-presentation-already-materialized'
+          || outcome.reason === 'durable-history-presentation-dismissed'
           || outcome.reason === 'durable-history-confirmed-identity-missing'
           || outcome.reason === 'durable-history-confirmed-proof-incomplete'
         )) {
@@ -11210,20 +11924,62 @@ function HistoryPanel({
   const maybeRequestHistoryHydration = useCallback((reason: string) => {
     if (toolType !== 'codex') return;
     if (hydrationRequestInFlightRef.current) return;
+    // Oscillation breaker (see HYDRATION_BURST_*): viewport-driven hydration
+    // must converge. A burst that does not is a loop, and a loop makes the
+    // whole app stutter — stop asking until the user scrolls again.
+    if (reason === 'range-changed') {
+      const now = performance.now();
+      const burst = hydrationBurstRef.current;
+      if (now - burst.since > HYDRATION_BURST_WINDOW_MS) {
+        burst.since = now;
+        burst.count = 0;
+        burst.tripped = false;
+      }
+      if (burst.tripped) return;
+      burst.count += 1;
+      if (burst.count > HYDRATION_BURST_MAX_REQUESTS) {
+        burst.tripped = true;
+        historyDiag('HYDRATION_BURST_STOP tab=' + tabId.slice(-12)
+          + ' count=' + burst.count
+          + ' windowMs=' + Math.round(now - burst.since));
+        return;
+      }
+    }
     // A converging Timeline jump owns the centre; ranges published while it
     // hunts are transit, not reading positions.
     if (historyJumpHydrationActiveRef.current) return;
-    const rows = presentationEntriesRef.current;
-    const total = rows.length;
+    // The visible range indexes display UNITS (groups collapse rows) — scan
+    // the unit list for stub-carrying rows and speak uuids over the boundary
+    // (owner contract: main only ever receives entry uuids).
+    const units = displayUnitsRef.current;
+    const total = units.length;
     if (total === 0) return;
+    const unitHasStub = (unit: any): FullHistoryEntry | null => {
+      if (!unit) return null;
+      if (unit.kind === 'group') {
+        for (const member of unit.entries as FullHistoryEntry[]) {
+          if ((member as any)?.rowStub) return member;
+        }
+        return null;
+      }
+      return (unit.entry as any)?.rowStub ? unit.entry as FullHistoryEntry : null;
+    };
+    const unitAnchorEntry = (unit: any): FullHistoryEntry | null => {
+      if (!unit) return null;
+      return unit.kind === 'group'
+        ? (unit.entries[0] as FullHistoryEntry) || null
+        : (unit.entry as FullHistoryEntry) || null;
+    };
     const range = visibleRangeRef.current;
     const scanFrom = Math.max(0, range.start - HISTORY_HYDRATION_REFETCH_MARGIN_ROWS);
     const scanTo = Math.min(total - 1, range.end + HISTORY_HYDRATION_REFETCH_MARGIN_ROWS);
+    let stubEntry: FullHistoryEntry | null = null;
     let stubIndex = -1;
     for (let index = scanFrom; index <= scanTo; index += 1) {
-      if ((rows[index] as any)?.rowStub) { stubIndex = index; break; }
+      const found = unitHasStub(units[index]);
+      if (found) { stubEntry = found; stubIndex = index; break; }
     }
-    if (stubIndex < 0) return;
+    if (!stubEntry) return;
     // Centre on the middle of what is on screen: the span then extends
     // symmetrically, so scrolling back the other way is covered too. A stub
     // still carries its uuid, so centring works even mid-stub-zone. A row
@@ -11231,12 +11987,28 @@ function HistoryPanel({
     // fall back to the stub itself, which is a durable server row by
     // construction.
     const centerIndex = Math.max(0, Math.min(total - 1, Math.round((range.start + range.end) / 2)));
-    let centerEntry = rows[centerIndex];
+    let centerEntry = unitAnchorEntry(units[centerIndex]);
     if (!centerEntry?.uuid || !lastServerEntryUuidsRef.current.has(centerEntry.uuid)) {
-      centerEntry = rows[stubIndex];
+      centerEntry = stubEntry;
     }
+    // Anchor on the STUB, never on the viewport midpoint.
+    //
+    // Two failures made the midpoint anchor loop forever (production 16.08,
+    // ~8 rebuilds/s with the user not scrolling at all — 31 requests for
+    // `range=926-933` alternating with 30 for `range=920-939`):
+    //   1. grouping changes how many UNITS the same rows occupy, so after
+    //      every hydration the midpoint index lands on a different entry and
+    //      the same-uuid cooldown never matches (`uuid=codex-us` ↔
+    //      `uuid=codex-co`);
+    //   2. that entry is often one main cannot resolve as a server row, so
+    //      the response falls back to the TAIL window (`span=1474-2229`) and
+    //      the visible stubs — around unit 670-930 — stay stubs. The request
+    //      therefore never made progress, which is what let it repeat.
+    // A stub is a durable server row by construction, so centring on it both
+    // resolves and covers the rows that actually need data: it hydrates, the
+    // next scan finds the next stub (progress) or none (silence).
     requestHistoryHydrationAt(
-      centerEntry?.uuid || null,
+      stubEntry.uuid || centerEntry?.uuid || null,
       reason,
       ' range=' + range.start + '-' + range.end
         + ' stubAt=' + stubIndex
@@ -11531,9 +12303,20 @@ function HistoryPanel({
     // 14.08 07:02: tab-2482's watcher read a span that tab-2546's load wrote.
     hydrationRequestSeqRef.current += 1;
     hydrationRequestInFlightRef.current = false;
-    hydrationCenterUuidRef.current = null;
     hydrationPendingRef.current = null;
     hydrationLastResultRef.current = null;
+    hydrationLastIssuedRef.current = null;
+    historyJumpHydrationActiveRef.current = false;
+    // Seed the FIRST request's hydration centre from where this owner will
+    // actually land: a pending Timeline jump wins, then the saved reading
+    // anchor (a mid-history reader returns to hydrated rows instead of a
+    // skeleton flash + second round-trip), tail otherwise (null).
+    {
+      const pendingJumpUuid = useUIStore.getState().historyScrollToUuid;
+      const savedAnchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
+      hydrationCenterUuidRef.current = pendingJumpUuid
+        || (savedAnchor && !savedAnchor.followBottom ? savedAnchor.uuid : null);
+    }
     liveProjectionRef.current = { ownerKey: historyOwnerKey, entries: [] };
     liveToolResultsRef.current = { ownerKey: historyOwnerKey, results: new Map() };
     durableSourceIdentitiesRef.current = new Set();
@@ -11923,6 +12706,9 @@ function HistoryPanel({
       return;
     }
     initialLoadDoneRef.current = true;
+    // Owner guard 2: any restore/convergence starts from a zero tail reserve —
+    // the tail branches measure distance to the REAL bottom.
+    historyTailSpacerRef.current.mustBeZero('restore-start');
     // Geometry restores the PIXEL position the user left — which is the wrong
     // target for a tail-pinned reader when rows arrived while they were away:
     // the old tail offset is now mid-list, and nothing after mount would
@@ -12369,6 +13155,45 @@ function HistoryPanel({
     };
   }, [sessionId, tabId, terminalHistoryStreamingEnabled, toolType]);
 
+  useEffect(() => {
+    const onTerminalPreviewDiagnosticResult = (_event: any, detail: any) => {
+      if (detail?.tabId !== tabId || detail?.toolType !== toolType) return;
+      if (detail?.success === true) {
+        useUIStore.getState().showToast(
+          'Diagnostics saved · reference copied',
+          'success',
+          2600,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          tabId,
+        );
+        return;
+      }
+      useUIStore.getState().showToast(
+        'Could not save terminal diagnostics: ' + String(detail?.error || 'unknown error'),
+        'error',
+        5000,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        tabId,
+      );
+    };
+    ipcRenderer.on(
+      'agent-transcript:terminal-preview-diagnostic-result',
+      onTerminalPreviewDiagnosticResult,
+    );
+    return () => {
+      ipcRenderer.removeListener(
+        'agent-transcript:terminal-preview-diagnostic-result',
+        onTerminalPreviewDiagnosticResult,
+      );
+    };
+  }, [tabId, toolType]);
+
   useLayoutEffect(() => {
     if (!terminalPreview || !isAtBottomRef.current) return;
     let secondFrame = 0;
@@ -12408,6 +13233,26 @@ function HistoryPanel({
       if (detail?.tabId !== tabId || detail?.toolType !== toolType) return;
       if (detail?.sessionId !== sessionId) return;
       if (historyOwnerKeyRef.current !== ownerKey) return;
+      const promptOwner = detail?.promptOwner && typeof detail.promptOwner === 'object'
+        ? detail.promptOwner
+        : null;
+      if (
+        toolType === 'claude'
+        && promptOwner?.deliveryStage === 'provider-queued'
+        && typeof promptOwner.handoffId === 'string'
+        && promptOwner.handoffId
+      ) {
+        const acceptedAt = Date.parse(String(detail?.timestamp || ''));
+        acceptHistoryPromptHandoffProviderQueue(tabId, promptOwner.handoffId, {
+          sendAttemptId: typeof promptOwner.sendAttemptId === 'string'
+            ? promptOwner.sendAttemptId
+            : null,
+          sendOperationKey: typeof promptOwner.sendOperationKey === 'string'
+            ? promptOwner.sendOperationKey
+            : null,
+          changedAt: Number.isFinite(acceptedAt) ? acceptedAt : Date.now(),
+        });
+      }
       const current = liveProjectionRef.current.ownerKey === ownerKey
         ? liveProjectionRef.current.entries
         : [];
@@ -12878,6 +13723,7 @@ function HistoryPanel({
     return () => {
       scrollMountedRef.current = false;
       historyScrollInFlightRef.current = null;
+      historyJumpHydrationActiveRef.current = false;
       scrollGenRef.current++;
     };
   }, []);
@@ -12887,10 +13733,12 @@ function HistoryPanel({
     if (!inFlight) return false;
     if (!scrollMountedRef.current || scrollGenRef.current !== inFlight.gen) {
       historyScrollInFlightRef.current = null;
+      historyJumpHydrationActiveRef.current = false;
       return false;
     }
     scrollGenRef.current++;
     historyScrollInFlightRef.current = null;
+    historyJumpHydrationActiveRef.current = false;
     setFlashUuid(null);
     const scroller = virtuosoScrollerRef.current;
     historyDiag('SCROLL_TO_CANCEL tab=' + tabId.slice(-12) +
@@ -12998,6 +13846,10 @@ function HistoryPanel({
     if (!historyScrollToUuid) return;
     if (surfaceLoading || displayEntries.length === 0) return; // wait for entries; uuid stays in store
     const targetUuid = historyScrollToUuid;
+    // Target hidden inside a collapsed series: expand SYNCHRONOUSLY first.
+    // The state update re-runs this effect on the next commit against the
+    // unrolled unit list; the store key is intentionally NOT consumed yet.
+    if (expandGroupForUuid(targetUuid, 'timeline-jump')) return;
     const idx = displayEntryIndexByUuid.get(targetUuid) ?? -1;
     // Consume the store key immediately. The convergence loop is driven by the
     // ref-generation guard, NOT by this effect's cleanup, so clearing the key
@@ -13194,7 +14046,7 @@ function HistoryPanel({
       requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-  }, [displayEntryIndexByUuid, displayEntries, historyScrollToUuid, pendingInitialHistoryIndex, requestHistoryHydrationAt, setHistoryScrollToUuid, surfaceLoading, tabId, toolType]);
+  }, [displayEntryIndexByUuid, displayEntries, expandGroupForUuid, historyScrollToUuid, pendingInitialHistoryIndex, requestHistoryHydrationAt, setHistoryScrollToUuid, surfaceLoading, tabId, toolType]);
 
   // Native scroll handler — runs on the Virtuoso scroller element via a
   // direct addEventListener (Virtuoso doesn't pass an onScroll prop through
@@ -13209,8 +14061,16 @@ function HistoryPanel({
     if (!el) return;
     // Keep the seek-kick target on the element that is actually moving.
     historySeekScroller = el;
-    clearHistoryToolScrollFocus('history-scroll');
     const deltaTop = el.scrollTop - lastScrollTopRef.current;
+    // A real scroll means new rows are genuinely wanted: re-arm the hydration
+    // oscillation breaker so a burst that tripped earlier does not leave the
+    // panel permanently un-hydrating.
+    if (deltaTop !== 0) {
+      const burst = hydrationBurstRef.current;
+      burst.since = performance.now();
+      burst.count = 0;
+      burst.tripped = false;
+    }
     const lastJump = lastProgrammaticHistoryScrollRef.current;
     if (lastJump && !lastJump.scrollEventLogged) {
       const ageMs = performance.now() - lastJump.doneAt;
@@ -13227,8 +14087,21 @@ function HistoryPanel({
           ' jumpScrollTop=' + Math.round(lastJump.scrollTop));
       }
     }
-    const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
-    const physicalPinned = isHistoryTailPinned(el);
+    // Tail-spacer burn: scrolling AWAY from the bottom consumes the reserve
+    // by the distance travelled, so the fake bottom shrinks toward the real
+    // one and disappears by the time the user is back in the content.
+    const spacer = historyTailSpacerRef.current;
+    if (spacer.get() > 0 && deltaTop < 0) {
+      spacer.burn(-deltaTop);
+    }
+    const spacerPx = spacer.get();
+    // Bottom math is against the CONTENT bottom (reserve subtracted) — guard 1
+    // of the approved contract: with a reserve armed, standing at the visual
+    // bottom must still read as "at the tail", or follow-output silently dies.
+    const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) - spacerPx;
+    const physicalPinned = spacerPx > 0
+      ? distFromBottom <= HISTORY_TAIL_PIN_THRESHOLD_PX
+      : isHistoryTailPinned(el);
     isAtBottomRef.current = reconcileHistoryTailFollowIntent({
       currentIntent: isAtBottomRef.current,
       physicalPinned,
@@ -13322,7 +14195,7 @@ function HistoryPanel({
         });
       } catch { /* geometry is optional; never break position saving */ }
     }, 150);
-  }, [clearHistoryToolScrollFocus, tabId, setHistoryScrollPosition]);
+  }, [tabId, setHistoryScrollPosition]);
 
   // Keep entries ref fresh for observer closure (avoids stale data if entries update with same length)
   const entriesRef = useRef(displayEntries);
@@ -13352,21 +14225,28 @@ function HistoryPanel({
   // endIndex})` on every scroll/resize; we recompute the visible UUID set
   // from that index range directly. Cheaper than IO, exact.
   const recomputeVisibleUuids = useCallback(() => {
-    const all = entriesRef.current;
-    if (all.length === 0) {
+    // The visible range indexes display UNITS; a collapsed group contributes
+    // every member uuid (Timeline dots for those rows count as visible).
+    const units = displayUnitsRef.current;
+    if (units.length === 0) {
       setHistoryVisibleUuids(tabId, []);
       return;
     }
     const { start, end } = visibleRangeRef.current;
-    const clampedStart = Math.max(0, Math.min(start, all.length - 1));
-    const clampedEnd = Math.max(clampedStart, Math.min(end, all.length - 1));
+    const clampedStart = Math.max(0, Math.min(start, units.length - 1));
+    const clampedEnd = Math.max(clampedStart, Math.min(end, units.length - 1));
     const visibleSet = new Set<string>();
     const directlyVisibleUsers: string[] = [];
     for (let i = clampedStart; i <= clampedEnd; i++) {
-      const e = all[i];
-      if (!e?.uuid) continue;
-      visibleSet.add(e.uuid);
-      if (e.role === 'user') directlyVisibleUsers.push(e.uuid);
+      const unit = units[i] as any;
+      const unitEntries: FullHistoryEntry[] = unit.kind === 'group'
+        ? unit.entries
+        : [unit.entry];
+      for (const e of unitEntries) {
+        if (!e?.uuid) continue;
+        visibleSet.add(e.uuid);
+        if (e.role === 'user') directlyVisibleUsers.push(e.uuid);
+      }
     }
     const resolvedSet = new Set<string>();
     for (const uuid of visibleSet) {
@@ -13401,9 +14281,11 @@ function HistoryPanel({
 
   // Recompute when entries change (incremental refresh adds rows → bottom range may shift)
   useEffect(() => {
-    lengthRef.current = transcriptEntries.length;
+    // Everything positional (scrollToIndex targets, geometry item counts)
+    // lives in display-UNIT space now.
+    lengthRef.current = displayUnits.length;
     recomputeVisibleUuids();
-  }, [recomputeVisibleUuids, transcriptEntries.length]);
+  }, [recomputeVisibleUuids, displayUnits.length]);
 
   // Resize handle
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
@@ -13797,13 +14679,18 @@ function HistoryPanel({
             // for cross-tab switches.
             key={historyOwnerKey + ':' + historyOwnerVisit}
             ref={virtuosoRef}
-            data={transcriptEntries}
+            data={displayUnits}
             components={HISTORY_VIRTUOSO_COMPONENTS}
             context={historyVirtuosoContext}
             // Live and durable versions use one physical identity, so a
             // completed answer updates in place instead of unmounting between
-            // the rollout event and the durable History refresh.
-            computeItemKey={(_idx, item) => historyLivePresentationKey(item)}
+            // the rollout event and the durable History refresh. A collapsed
+            // group keys by its own stable group key (first call id).
+            computeItemKey={(_idx, unit) => (
+              (unit as any).kind === 'group'
+                ? (unit as any).key
+                : historyLivePresentationKey((unit as any).entry)
+            )}
             // Mount the scroller against our handleScroll so the per-scroll
             // FAB toggle / position-save stays identical to pre-virtuoso behavior.
             scrollerRef={(el) => {
@@ -13815,7 +14702,6 @@ function HistoryPanel({
                 prev.removeEventListener('touchmove', handleUserScrollIntent);
                 prev.removeEventListener('touchend', handleHistoryTouchEnd);
                 prev.removeEventListener('touchcancel', handleHistoryTouchEnd);
-                prev.removeEventListener('pointerdown', handleHistoryToolPointerDown, true);
                 prev.removeEventListener('wheel', handleHistoryToolWheel, true);
                 prev.removeEventListener('pointerdown', handleHistoryScrollerPointerDown);
                 prev.removeEventListener('keydown', handleHistoryScrollerKeyIntent);
@@ -13838,7 +14724,6 @@ function HistoryPanel({
                 scroller.addEventListener('touchmove', handleUserScrollIntent, { passive: true });
                 scroller.addEventListener('touchend', handleHistoryTouchEnd, { passive: true });
                 scroller.addEventListener('touchcancel', handleHistoryTouchEnd, { passive: true });
-                scroller.addEventListener('pointerdown', handleHistoryToolPointerDown, true);
                 scroller.addEventListener('wheel', handleHistoryToolWheel, { capture: true, passive: false });
                 scroller.addEventListener('pointerdown', handleHistoryScrollerPointerDown, { passive: true });
                 scroller.addEventListener('keydown', handleHistoryScrollerKeyIntent);
@@ -14064,7 +14949,55 @@ function HistoryPanel({
               ['--cb-fs-base' as any]: '1em',
               ['--hp-composer-overlay-height' as any]: mainSurface ? controlsHeight + 'px' : '0px',
             }}
-            itemContent={(_idx, entry) => {
+            itemContent={(_idx, unit) => {
+              // ---- Group header unit (collapsed OR expanded) ----
+              if ((unit as any).kind === 'group') {
+                const group = unit as any;
+                const groupExpanded = group.expanded === true;
+                const groupAnchorUuid = group.entries[0]?.uuid || '';
+                const groupChainBreak =
+                  claudeMemoryBoundaryIndex >= 0 && _idx <= claudeMemoryBoundaryIndex;
+                return (
+                  <div
+                    // When expanded, the first MEMBER row carries the anchor
+                    // uuid as data-uuid; the header must not duplicate it or
+                    // uuid-driven DOM lookups (restore, search highlight)
+                    // would find two nodes.
+                    data-uuid={groupExpanded ? undefined : groupAnchorUuid}
+                    data-history-row-owner={historyOwnerDomId}
+                    data-history-row-real="1"
+                    data-history-group={group.key}
+                    style={{
+                      paddingTop: 2,
+                      paddingBottom: 2,
+                      backgroundColor: groupChainBreak ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    }}
+                  >
+                    <HistoryCollapsedGroupRow
+                      group={group}
+                      expanded={groupExpanded}
+                      liveBackgroundUuids={liveBackgroundUuids}
+                      isTurnBusy={isTurnBusy}
+                      isLastUnit={_idx === displayUnits.length - 1}
+                      onToggle={() => {
+                        if (groupExpanded) {
+                          historyDiag('GROUP_COLLAPSE tab=' + tabId.slice(-12)
+                            + ' key=' + group.key.slice(0, 24)
+                            + ' reason=click');
+                          collapseGroupPreservingViewport(group.key);
+                        } else {
+                          expandGroupPreservingViewport(group.key, 'click');
+                        }
+                      }}
+                    />
+                  </div>
+                );
+              }
+              const entryUnit = unit as any;
+              const entry = entryUnit.entry as FullHistoryEntry;
+              const expandedGroup = entryUnit.expandedGroup as
+                | { key: string; familyKey: string; uniform?: boolean; first: boolean; last: boolean }
+                | undefined;
               const presentedEntry = applyHistoryLiveToolResultsToEntry(
                 entry,
                 visibleLiveToolResultValues,
@@ -14141,6 +15074,23 @@ function HistoryPanel({
                   </div>
                 );
               }
+              const entryBody = (
+                <>
+                  <HistoryEntry
+                    entry={presentedEntry}
+                    tabId={tabId}
+                    toolType={toolType}
+                    allowRewind={!previewMode && toolType !== 'gemini'}
+                    rewindLocked={historyRewindLocked}
+                    rewindUnavailableReason={historyRewindUnavailableReason}
+                    onDismissUnconfirmed={dismissUnconfirmedPromptEntry}
+                    forceExpanded={
+                      searchQuery.length >= 2
+                      && entry.content.toLowerCase().includes(searchQuery.toLowerCase())
+                    }
+                  />
+                </>
+              );
               return (
                 <div
                   data-uuid={presentedEntry.uuid}
@@ -14154,24 +15104,27 @@ function HistoryPanel({
                   }
                   onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType)}
                   style={{
-                    paddingTop: 4,
-                    paddingBottom: 4,
+                    // Member rows tile FLUSH: any wrapper padding would cut
+                    // the group rail into segments (the member's border-left
+                    // cannot reach across it).
+                    paddingTop: expandedGroup ? 0 : 4,
+                    paddingBottom: expandedGroup ? 0 : 4,
                     backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
                     ...(flashUuid === presentedEntry.uuid ? { animation: 'hp-flash 500ms ease-in-out' } : undefined),
                   }}
                 >
-                  <HistoryEntry
-                    entry={presentedEntry}
-                    tabId={tabId}
-                    toolType={toolType}
-                    allowRewind={!previewMode && toolType !== 'gemini'}
-                    rewindLocked={historyRewindLocked}
-                    rewindUnavailableReason={historyRewindUnavailableReason}
-                    forceExpanded={
-                      searchQuery.length >= 2
-                      && entry.content.toLowerCase().includes(searchQuery.toLowerCase())
-                    }
-                  />
+                  {expandedGroup ? (
+                    // Member of an expanded group: indented under the rail;
+                    // collapsing happens on the group HEADER above (its own
+                    // unit row), not on a floating button here.
+                    <div
+                      className="hp-history-group-member"
+                      data-history-group-member={expandedGroup.key}
+                      data-history-group-uniform={expandedGroup.uniform ? '1' : undefined}
+                    >
+                      {entryBody}
+                    </div>
+                  ) : entryBody}
                 </div>
               );
             }}

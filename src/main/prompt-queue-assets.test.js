@@ -85,6 +85,28 @@ test('missing source remains explicit and is never reported available', async (t
   assert.equal(ref.error, 'image_path_missing');
 });
 
+test('synchronous History recovery accepts only an existing content-addressed managed asset', async (t) => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  const store = new PromptQueueAssetStore({ rootDir: f.rootDir });
+  const materialized = await store.materializeRef({
+    id: 7,
+    path: f.sourcePath,
+    mediaType: 'image/png',
+    size: 0,
+  });
+
+  const recovered = store.existingManagedRefSync({ path: materialized.path });
+  assert.equal(recovered.path, materialized.path);
+  assert.equal(recovered.assetId, materialized.assetId);
+  assert.equal(recovered.availability, 'available');
+  assert.equal(recovered.size, Buffer.byteLength('stable-image-bytes'));
+  assert.equal(store.existingManagedRefSync({ path: f.sourcePath }), null);
+  assert.equal(store.existingManagedRefSync({
+    path: path.join(f.rootDir, 'not-content-addressed.png'),
+  }), null);
+});
+
 test('garbage collection keeps referenced assets and removes only old unreferenced assets', async (t) => {
   const f = await fixture();
   t.after(f.cleanup);

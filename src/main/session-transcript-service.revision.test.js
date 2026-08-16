@@ -674,7 +674,12 @@ test('Claude transcript watcher emits appended answer, tool, and exact prompt ca
     resolveClaudePromptOwner: (probe) => {
       ownerProbes.push(probe);
       return probe.record?.uuid === 'queue-noise'
-        ? { handoffId: 'history-handoff' }
+        ? {
+            handoffId: 'history-handoff',
+            deliveryStage: 'provider-queued',
+            sendAttemptId: 'attempt-history',
+            sendOperationKey: 'history:tab-a:history-handoff',
+          }
         : null;
     },
     claudeData: null,
@@ -760,6 +765,12 @@ test('Claude transcript watcher emits appended answer, tool, and exact prompt ca
   assert.equal(sent[0].payload.toolType, 'claude');
   assert.equal(sent[0].payload.tabId, 'tab-a');
   assert.equal(sent[2].payload.promptOwner.handoffId, 'history-handoff');
+  assert.equal(sent[2].payload.promptOwner.deliveryStage, 'provider-queued');
+  assert.equal(sent[2].payload.promptOwner.sendAttemptId, 'attempt-history');
+  assert.equal(
+    sent[2].payload.promptOwner.sendOperationKey,
+    'history:tab-a:history-handoff',
+  );
   assert.equal(Number.isFinite(sent[2].payload.recordByteOffset), true);
   assert.equal(ownerProbes.length, 3);
   assert.equal(ownerProbes[0].tabId, 'tab-a');

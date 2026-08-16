@@ -4,7 +4,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import BrowserTab from './BrowserTab';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
-import { useSplitAttachRowHeight, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
+import { useSplitAttachRowHeight, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
 import { motion, AnimatePresence } from 'framer-motion';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { clearPendingResume, markPendingResume } from '../../utils/pendingResume';
@@ -21,7 +21,8 @@ import {
   syncSessionStartingWithPresence,
 } from '../../utils/sessionStartingState.mjs';
 import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
-import { isEmptyPane, paneIsStacked } from '../../utils/splitPanesModel.mjs';
+import { isEmptyPane, paneIsStacked, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
+import { shouldSwallowFirstPaneClick } from '../../utils/paneFirstClickGuard.mjs';
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
@@ -1079,6 +1080,11 @@ function TerminalArea({
       // Split composition/focus — pane wrappers restyle without remounts.
       s.splitPanes.map((p) => p.tabId).join('+'),
       String(s.splitFocusedIndex),
+      // Divider positions: committed once per finished drag (the live drag
+      // moves the DOM directly), so this rebuild runs once per drag, and a
+      // LATER rebuild repaints the wrappers at the dragged sizes instead of
+      // snapping them back to the equal split.
+      splitSizesFingerprint(s.splitSizes),
     ].join('|');
   });
 
@@ -1091,6 +1097,8 @@ function TerminalArea({
       ? s.splitFocusedIndex
       : -1
   ));
+  // Armed by a swallowed first press, consumed by the click that follows it.
+  const swallowNextClickRef = useRef(false);
   useEffect(() => {
     if (splitPaneCount === 0) return;
     const onPointerDown = (e: PointerEvent) => {
@@ -1111,10 +1119,68 @@ function TerminalArea({
       if (!el) return;
       const idx = Number(el.getAttribute('data-split-pane-index'));
       const st = useWorkspaceStore.getState();
+      // The first click into an UNFOCUSED pane selects it and stops there: the
+      // transcript is full of things that catch a click (a thinking block, a
+      // bash output, any expandable card), and expanding one as a side effect
+      // of "go here" changes content the user never asked to change.
+      //
+      // Two surfaces still receive that first click, because their target is
+      // unambiguous by itself: the TERMINAL (a click there places the cursor /
+      // selects text, in a pane or in the side frame alike) and the INPUT
+      // (swallowing it would demand two clicks before typing).
+      //
+      // Swallowing happens on pointerdown in the CAPTURE phase — before the
+      // transcript's own handlers see it, which is the only place where "the
+      // click never reached the card" is true rather than "the card already
+      // reacted".
+      if (shouldSwallowFirstPaneClick({
+        target: e.target as Element | null,
+        paneIndex: idx,
+        focusedIndex: st.splitFocusedIndex,
+        button: e.button,
+      })) {
+        e.preventDefault();
+        e.stopPropagation();
+        // `click` is a SEPARATE event: stopping pointerdown does not stop it,
+        // and the expanders listen on click. So the swallow is armed here and
+        // executed by the click/mouse listeners below — stopping only
+        // pointerdown would have looked like a fix while every card still
+        // expanded.
+        swallowNextClickRef.current = true;
+        if (Number.isFinite(idx)) st.focusSplitPane(idx);
+        return;
+      }
+      swallowNextClickRef.current = false;
       if (Number.isFinite(idx) && idx !== st.splitFocusedIndex) st.focusSplitPane(idx);
     };
+    // The armed swallow consumes exactly ONE gesture, on window in the capture
+    // phase — before any transcript handler runs.
+    const swallowIfArmed = (e: Event) => {
+      if (!swallowNextClickRef.current) return;
+      if ((e as MouseEvent).button !== undefined && (e as MouseEvent).button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.type === 'click') swallowNextClickRef.current = false;
+    };
+    // A press that never became a click (drag out of the pane, right-click
+    // after, focus lost) must not leave the guard armed for a later, unrelated
+    // click — that would look like a random dead click minutes later.
+    const disarm = () => { swallowNextClickRef.current = false; };
     window.addEventListener('pointerdown', onPointerDown, true);
-    return () => window.removeEventListener('pointerdown', onPointerDown, true);
+    window.addEventListener('mousedown', swallowIfArmed, true);
+    window.addEventListener('mouseup', swallowIfArmed, true);
+    window.addEventListener('click', swallowIfArmed, true);
+    window.addEventListener('pointercancel', disarm, true);
+    window.addEventListener('blur', disarm);
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown, true);
+      window.removeEventListener('mousedown', swallowIfArmed, true);
+      window.removeEventListener('mouseup', swallowIfArmed, true);
+      window.removeEventListener('click', swallowIfArmed, true);
+      window.removeEventListener('pointercancel', disarm, true);
+      window.removeEventListener('blur', disarm);
+      swallowNextClickRef.current = false;
+    };
   }, [splitPaneCount]);
 
   useEffect(() => {
@@ -1148,6 +1214,7 @@ function TerminalArea({
     // (same key/type in both modes) so entering/leaving the split never
     // remounts xterm.
     const splitPanes = state.splitPanes;
+    const splitSizes = state.splitSizes;
     const splitActive = splitPanes.length > 0;
     const splitFocusedTabId = splitActive ? (splitPanes[state.splitFocusedIndex]?.tabId || null) : null;
     const paneIndexByTabId = new Map<string, number>();
@@ -1283,7 +1350,7 @@ function TerminalArea({
             {...(inPane ? { 'data-split-pane-index': paneIndex } : {})}
             style={{
               ...(inPane
-                ? splitPaneRectStyle(paneIndex, splitPanes)
+                ? splitPaneRectStyle(paneIndex, splitPanes, splitSizes)
                 : { position: 'absolute' as const, inset: 0 }),
               zIndex: inPane ? 2 : (splitActive ? 0 : 1),
               pointerEvents: 'none',
@@ -1366,7 +1433,7 @@ function TerminalArea({
           data-terminal-pane-wrapper="empty"
           data-split-pane-index={paneIndex}
           style={{
-            ...splitPaneRectStyle(paneIndex, splitPanes),
+            ...splitPaneRectStyle(paneIndex, splitPanes, splitSizes),
             zIndex: 2,
             pointerEvents: 'none',
             background: '#161616',
@@ -1510,6 +1577,11 @@ function TerminalArea({
     >
       {/* Render all terminals from all projects */}
       {terminals}
+
+      {/* Divider grab strips OVER the pane boundaries. Sibling of the pane
+          wrappers on purpose: the live drag walks parentElement to reposition
+          them without a store write per mousemove. */}
+      <SplitDividerLayer />
 
       {currentView === 'terminal' && activeExternalRun && (
         <ExternalRunBadge meta={activeExternalRun} />

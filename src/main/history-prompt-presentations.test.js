@@ -114,6 +114,122 @@ test('audited image refs decorate the exact durable prompt and keep thumbnail id
   }]);
 });
 
+test('a proven managed imagePath marker repairs a missing sidecar and decorates the same entry', () => {
+  const store = createStore();
+  const assetId = 'b'.repeat(64) + '.png';
+  const managedPath = `/Users/test/Library/Application Support/noted-terminal/prompt-queue-assets/${assetId}`;
+  const content = `[imagePath: ${managedPath}]  explain this screenshot`;
+  const source = [{
+    uuid: 'claude-user-managed-image',
+    role: 'user',
+    timestamp: '2026-08-16T01:20:03.247Z',
+    content,
+  }];
+  const logs = [];
+
+  const decorated = decorateHistoryPromptPresentations(store, {
+    toolType: 'claude',
+    sessionId: 'claude-images',
+    entries: source,
+    recoverManagedImageRef: ({ path: candidate }) => candidate === managedPath
+      ? {
+          path: managedPath,
+          assetId,
+          mediaType: 'image/png',
+          size: 128,
+          availability: 'available',
+        }
+      : null,
+    logger: { info: (message) => logs.push(message) },
+  });
+
+  assert.equal(decorated[0].content, content);
+  assert.deepEqual(decorated[0].imagePaths, [{
+    id: 1,
+    path: managedPath,
+    assetId,
+    mediaType: 'image/png',
+    size: 128,
+    availability: 'available',
+    error: undefined,
+  }]);
+  assert.equal(store.rows.length, 1);
+  assert.equal(store.rows[0].entryUuid, 'claude-user-managed-image');
+  assert.equal(store.rows[0].schemaVersion, 3);
+  assert.match(logs[0], /HistoryPromptPresentation:ImageRecovery/);
+});
+
+test('imagePath-looking text in pasted content, escaped text, or an unmanaged path stays literal', () => {
+  const store = createStore();
+  const managedPath = '/managed/' + 'c'.repeat(64) + '.png';
+  const source = [{
+    uuid: 'claude-user-literal-image-markers',
+    role: 'user',
+    timestamp: '2026-08-16T01:21:00.000Z',
+    content: [
+      `<pasted_content>\n[imagePath: ${managedPath}]\n</pasted_content>`,
+      `\\[imagePath: ${managedPath}]`,
+      '[imagePath: /tmp/not-managed.png]',
+    ].join('\n'),
+  }];
+  let resolverCalls = 0;
+
+  const decorated = decorateHistoryPromptPresentations(store, {
+    toolType: 'claude',
+    sessionId: 'claude-images',
+    entries: source,
+    recoverManagedImageRef: () => {
+      resolverCalls += 1;
+      return null;
+    },
+  });
+
+  assert.equal(decorated, source);
+  assert.equal(resolverCalls, 1, 'only the ordinary unescaped marker is eligible for validation');
+  assert.equal(store.rows.length, 0);
+});
+
+test('managed image recovery preserves an existing prompt-chip presentation', () => {
+  const store = createStore();
+  const assetId = 'd'.repeat(64) + '.webp';
+  const managedPath = `/managed/${assetId}`;
+  const content = `saved prompt\n\n[imagePath: ${managedPath}] note`;
+  assert.equal(saveAuditedPromptPresentation(store, {
+    toolType: 'claude',
+    sessionId: 'mixed-presentation',
+    auditTimestamp: '2026-08-16T01:22:00.000Z',
+    actualText: content,
+    snapshot: {
+      promptChips: [{ id: 'chip-1', kind: 'prompt', label: 'Saved', text: 'saved prompt' }],
+    },
+  }), true);
+
+  const decorated = decorateHistoryPromptPresentations(store, {
+    toolType: 'claude',
+    sessionId: 'mixed-presentation',
+    entries: [{
+      uuid: 'claude-user-mixed-presentation',
+      role: 'user',
+      timestamp: '2026-08-16T01:22:00.000Z',
+      content,
+    }],
+    recoverManagedImageRef: () => ({
+      path: managedPath,
+      assetId,
+      mediaType: 'image/webp',
+      size: 64,
+      availability: 'available',
+    }),
+    logger: { info() {} },
+  });
+
+  assert.equal(decorated[0].promptChips[0].label, 'Saved');
+  assert.equal(decorated[0].imagePaths[0].path, managedPath);
+  const repaired = store.rows.at(-1);
+  assert.ok(repaired.chips.some(item => item.kind === 'prompt'));
+  assert.ok(repaired.chips.some(item => item.kind === 'image-ref'));
+});
+
 test('image presentation rejects relative paths and duplicate slot guesses', () => {
   const store = createStore();
   assert.equal(saveAuditedPromptPresentation(store, {

@@ -90,11 +90,40 @@ test('canonical History materialization is durably acknowledged before local SEN
   ordered(hydrationBody, [
     ['confirmed receipt waits for a canonical projection', 'canonicalProjectionReady'],
     ['exact durable identity is checked', 'durableHistorySendReceiptMatchesCanonicalEntry(record, entry)'],
+    ['external receipts are consumed but never rehydrated as History-owned drafts',
+      "if (record?.surface !== 'desktop-history') continue;"],
     ['only unmatched receipts hydrate locally', 'hydrateHistoryPromptHandoffFromDurableReceipt(record)'],
   ]);
+  assert.doesNotMatch(hydrationBody, /surface:\s*'desktop-history'/,
+    'History must list all tab receipts so exact iOS/Project API cards can be retired');
 
   assert.match(mainSource, /ipcMain\.handle\('agent:acknowledge-send-receipt-presentation'/);
   assert.match(mainSource, /agentSendReceiptStore\.acknowledgePresentation\(\{/);
+});
+
+test('UNCONFIRMED History rows have a durable presentation-only dismiss action', () => {
+  assert.match(mainSource, /ipcMain\.handle\('agent:dismiss-send-receipt-presentation'/);
+  assert.match(mainSource, /agentSendReceiptStore\.dismissPresentation\(\{/);
+  const mainDismissBody = between(
+    mainSource,
+    "ipcMain.handle('agent:dismiss-send-receipt-presentation'",
+    '// Programmatic paste',
+  );
+  assert.match(mainDismissBody, /agentSendReceiptStore\.list\(\{ tabId \}\)/,
+    'desktop History dismissal must resolve the exact handoff across every send origin');
+  assert.doesNotMatch(mainDismissBody, /list\(\{[\s\S]{0,100}surface:/,
+    'the immutable send origin must not be mistaken for the presentation surface');
+  assert.match(historySource, /queueStatus === 'delivery-unknown'[\s\S]{0,260}onDismissUnconfirmed/);
+  const dismissBody = between(
+    historySource,
+    'const dismissUnconfirmedPromptEntry = useCallback',
+    'const acknowledgeMaterializedHistoryReceipt = useCallback',
+  );
+  ordered(dismissBody, [
+    ['durable dismissal requested', "ipcRenderer.invoke('agent:dismiss-send-receipt-presentation'"],
+    ['renderer handoff consumed', 'consumeHistoryPromptHandoff(tabId, handoffId)'],
+    ['local row removed', "removeLocalPromptEntry(handoffId, 'user-dismissed-unconfirmed')"],
+  ]);
 });
 
 test('main returns the generated attempt identity to the exact History handoff', () => {

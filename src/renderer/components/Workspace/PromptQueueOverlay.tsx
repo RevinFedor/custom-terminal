@@ -1605,6 +1605,10 @@ export function PromptQueueOverlay({
       const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, payload, {
         submit: submitNow,
         source: 'prompt-queue-replay',
+        presentationSnapshot: {
+          promptChips: validation.item.chips || [],
+          imagePaths: validation.item.imagePaths || [],
+        },
       });
       const replayTransferred = submitNow
         ? res?.submitted === true && queueSendTransferredOwnership(res)

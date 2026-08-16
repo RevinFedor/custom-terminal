@@ -40,10 +40,16 @@ test('startup transcript proof is bounded and gates desktop, Project API, and In
     reconcile,
   );
   const promotion = mainSource.indexOf('agentSendReceiptStore.promoteFromAudit(result.audit)', reconcile);
+  const unconfirmed = mainSource.indexOf(
+    'agentSendReceiptStore.markStartupUnconfirmed(',
+    promotion,
+  );
   const ipc = mainSource.indexOf("ipcMain.handle('agent:list-send-receipts'", promotion);
   const ipcWait = mainSource.indexOf('await agentSendReceiptStartupReady', ipc);
   assert.ok(start > 0 && reconcile > start && allRecords > reconcile && promotion > allRecords,
     'startup must run one bounded transcript proof pass and promote only found evidence');
+  assert.ok(unconfirmed > promotion && unconfirmed < ipc,
+    'negative startup proof must replace an endless CONFIRMING spinner with replay-safe UNCONFIRMED');
   assert.ok(ipcWait > ipc,
     'History hydration must wait for the bounded startup proof');
 

@@ -3083,6 +3083,127 @@ test('restart reconciliation terminalizes an exact no-final-result proof instead
   }
 });
 
+test('Claude intermediate Stop waits for background agents and adopts only a structural continuation', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({
+      ...baseRun('run-internal-agent', 'claude-target'),
+      targetToolType: 'claude',
+    });
+    await store.markDelivery('run-internal-agent');
+    const original = {
+      provider: 'claude',
+      sessionId: 'claude-session',
+      turnId: 'claude:7',
+      processId: 'pid-1',
+    };
+    const continuation = {
+      ...original,
+      turnId: 'claude:8',
+    };
+    await store.applyLifecycle('claude-target', {
+      type: 'busy', busy: true, executionContext: original,
+    });
+    const intermediate = await store.applyLifecycle('claude-target', {
+      type: 'done',
+      reason: 'task_complete',
+      executionContext: original,
+      backgroundWorkCount: 2,
+    });
+    assert.deepEqual(intermediate.settled, []);
+    assert.equal((await store.get('run-internal-agent')).status, 'running');
+    assert.equal((await store.get('run-internal-agent')).waitingForInternalDescendants, true);
+
+    await store.applyLifecycle('claude-target', {
+      type: 'busy',
+      busy: true,
+      executionContext: continuation,
+      backgroundWorkCount: 1,
+    });
+    assert.equal(
+      (await store.get('run-internal-agent')).waitingForInternalDescendants,
+      true,
+      'an ordinary later user turn cannot claim the waiting orchestration',
+    );
+
+    await store.applyLifecycle('claude-target', {
+      type: 'busy',
+      busy: true,
+      executionContext: continuation,
+      internalAgentContinuation: 'agent-message',
+      backgroundWorkCount: 0,
+    });
+    const adopted = await store.get('run-internal-agent');
+    assert.equal(adopted.waitingForInternalDescendants, false);
+    assert.equal(adopted.targetExecutionContext.turnId, 'claude:7');
+    assert.equal(adopted.targetContinuationExecutionContext.turnId, 'claude:8');
+
+    const final = await store.applyLifecycle('claude-target', {
+      type: 'done',
+      reason: 'task_complete',
+      executionContext: continuation,
+      backgroundWorkCount: 0,
+    });
+    assert.equal((await store.get('run-internal-agent')).status, 'completed');
+    assert.deepEqual(final.settled.map((run) => run.runId), ['run-internal-agent']);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('restart result proof cannot close internal work until a later service carrier exists', async () => {
+  const { store, filePath, cleanup } = await makeStore();
+  let restored = null;
+  try {
+    await store.create({
+      ...baseRun('run-internal-restart', 'claude-target'),
+      targetToolType: 'claude',
+    });
+    await store.markDelivery('run-internal-restart');
+    await store.applyLifecycle('claude-target', {
+      type: 'busy',
+      busy: true,
+      executionContext: {
+        provider: 'claude', sessionId: 'claude-session', turnId: 'claude:1',
+      },
+    });
+    await store.applyLifecycle('claude-target', {
+      type: 'done',
+      reason: 'task_complete',
+      executionContext: {
+        provider: 'claude', sessionId: 'claude-session', turnId: 'claude:1',
+      },
+      backgroundWorkCount: 1,
+    });
+    await store.flush();
+
+    restored = new OrchestrationRunStore(filePath);
+    await restored.reconcile('run-internal-restart', {
+      busy: false,
+      resultFound: true,
+      resultComplete: true,
+      resultAvailable: true,
+      internalContinuationCount: 0,
+    });
+    assert.equal((await restored.get('run-internal-restart')).status, 'running');
+
+    const completed = await restored.reconcile('run-internal-restart', {
+      busy: false,
+      resultFound: true,
+      resultComplete: true,
+      resultAvailable: true,
+      internalContinuationCount: 1,
+    });
+    assert.equal((await restored.get('run-internal-restart')).status, 'completed');
+    assert.deepEqual(completed.settled.map((run) => run.runId), ['run-internal-restart']);
+  } finally {
+    if (restored) await restored.flush();
+    await store.flush();
+    await cleanup();
+  }
+});
+
 test('completed newer target work permanently invalidates an older auto-stop', () => {
   const scheduled = {
     runId: 'run-a',

@@ -130,50 +130,108 @@
    ============================================================ */
 .cb-tool { margin: 12px 60px 12px 0; }
 .cb-tool-head {
+  /* BLOCK flex, deliberately — an inline-level flex box is sized by the
+     inline formatting context (line-height, baselines, font metrics), which
+     produces FRACTIONAL, scroll-dependent heights; inside a virtualized feed
+     every such row re-measures and the whole list jitters while scrolling
+     (measured live in production 16.08). The row's hover/click surface is
+     narrowed to its content by an inner wrapper instead — see
+     .cb-tool-head-inner. */
+  display: flex;
+  align-items: center;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+/* The actual interactive surface: shrink-to-fit, so hovering or clicking the
+   empty space to the right of a short row does nothing (user decision). */
+.cb-tool-head-inner {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+  max-width: 100%;
   margin: 0 -4px;
   padding: 4px;
   border-radius: 4px;
   overflow: hidden;
   transition: background 0.15s;
 }
-.cb-tool-head--clickable { cursor: pointer; }
-.cb-tool-head--clickable:hover { background: var(--cb-hover); }
+.cb-tool-head--clickable .cb-tool-head-inner { cursor: pointer; user-select: none; }
+.cb-tool-head--clickable .cb-tool-head-inner:hover { background: var(--cb-hover); }
 .cb-tool-ic { flex-shrink: 0; display: inline-flex; }
+/* The single flowing line after the icon. Inline children + natural word
+   wrap: a second line starts under the LABEL (continuation of the same
+   sentence), never under the icon and never in a separate right column.
+   Spacing between the parts is normal inter-word spacing. */
+.cb-tool-line {
+  min-width: 0;
+  flex: 1 1 auto;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.cb-tool-line > * { margin-right: 8px; }
+.cb-tool-line > *:last-child { margin-right: 0; }
+.cb-tool-line .cb-tool-badges,
+.cb-tool-line .cb-tool-chevron { vertical-align: baseline; }
+/* Tailwind's preflight sets `svg { display: block }` — a block box inside the
+   inline flow is forced onto its OWN line (seen live: the chevron dropped
+   under «electron · evaluate» and doubled the row height). Inline-block
+   restores text behaviour while keeping the box for the rotate transform. */
+.cb-tool-line .cb-tool-chevron { display: inline-block; vertical-align: -1px; }
+/* ONE type voice for every feed row. The card label used to be uppercase
+   mono («EDIT», «TOOL SEARCH») while group headers spoke sentence-case UI
+   type («Ran 2 commands») — two typographic worlds side by side (user:
+   «почему что-то заглавными, а что-то обычными»). Now the label reads
+   exactly like a group header word: same case, same family, same size.
+   Mono survives only INSIDE expanded bodies (commands, output, diffs). */
 .cb-tool-label {
-  flex-shrink: 0;
-  font-size: var(--cb-fs-label);
+  display: inline;
+  font-size: 0.9em;
   font-weight: 500;
   color: var(--cb-label);
-  text-transform: uppercase;
-  letter-spacing: 0.025em;
 }
-.cb-tool-badges { flex-shrink: 0; display: inline-flex; align-items: center; gap: 4px; }
+.cb-tool-badges { display: inline-flex; align-items: center; gap: 4px; }
+/* Trailing expand chevron on ordinary (second-level) cards: hidden at rest,
+   fades in under the pointer. Groups (first level) always show theirs — the
+   hierarchy reads from which rows carry a visible chevron. */
+.cb-tool-chevron {
+  flex-shrink: 0;
+  color: var(--cb-muted);
+  opacity: 0;
+  transition: opacity 0.12s, transform 0.12s;
+}
+.cb-tool-head--clickable .cb-tool-head-inner:hover .cb-tool-chevron { opacity: 1; }
+.cb-tool-head[aria-expanded="true"] .cb-tool-chevron { opacity: 1; transform: rotate(90deg); }
 /* description (the LLM's parenthetical, e.g. Bash) must SHRINK with ellipsis, not
    hold full width and push the command preview off-screen on narrow viewports
    (mobile). Capped so the command always gets room; the full text is shown in the
    expanded body. */
 .cb-tool-desc {
-  flex-shrink: 1;
-  min-width: 0;
-  max-width: 45%;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  display: inline;
   font-size: var(--cb-fs-label);
   color: var(--cb-muted);
 }
 .cb-tool-preview {
-  min-width: 0;
-  flex: 1 1 0;
-  font-size: var(--cb-fs-content);
-  font-family: var(--cb-font-mono);
+  display: inline;
+  font-size: 0.9em;
   color: var(--cb-text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+}
+/* The head is one flowing line (see .cb-tool-line), so every subject wraps
+   by default — no per-subject wrap variant needed. The icon pins to the
+   FIRST line: top-align both boxes and give the glyph a small optical
+   offset that centers it against a single 1.45-line of 0.9em text. */
+.cb-tool-head,
+.cb-tool-head .cb-tool-head-inner { align-items: flex-start; }
+.cb-tool-head .cb-tool-ic { margin-top: 3px; }
+.cb-tool-subject { overflow-wrap: anywhere; }
+.cb-tool-subject--wrap { display: inline; }
+/* The qualifier (search scope, line range) obeys the SAME no-truncation rule
+   as the subject: a long scope path wraps to the next line instead of being
+   cut at the right edge (seen live: «· /Users/…/Logs/noted-terminal/‹cut›»).
+   Short qualifiers («· 1–45») naturally stay on one line. */
+.cb-tool-qualifier {
+  color: var(--cb-muted);
+  overflow-wrap: anywhere;
 }
 .cb-tool-sub {
   margin: -2px -4px 0;
@@ -185,6 +243,19 @@
   font-variant-numeric: tabular-nums;
 }
 /* раскрытое тело — вертикальная линия слева вместо карточки */
+/* Height animation wrapper: 0fr → 1fr on a single grid row is the one way to
+   transition to CONTENT height without measuring it in JS, and unlike a
+   conditional mount it also plays when closing. */
+.cb-tool-reveal {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 160ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.cb-tool-reveal[data-open="true"] { grid-template-rows: 1fr; }
+.cb-tool-reveal-inner { overflow: hidden; min-height: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .cb-tool-reveal { transition: none; }
+}
 .cb-tool-body { margin-left: 8px; margin-top: 6px; padding-left: 12px; position: relative; }
 .cb-rail {
   position: absolute;
@@ -228,6 +299,46 @@
   word-break: break-all;
   line-height: 1.375;
 }
+/* The invocation line: what was RUN, visually one step below what came BACK.
+   A `$` sigil in the accent colour plus a dim command; the result below it is
+   ordinary output. Without this separation an expanded git-diff card read as
+   one blob where the call and its answer looked like the same text. */
+.cb-invocation { padding: 2px 0 6px; }
+.cb-invocation-cmd {
+  display: flex;
+  gap: 7px;
+  font-size: var(--cb-fs-content);
+  font-family: var(--cb-font-mono);
+  color: var(--cb-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.375;
+}
+.cb-invocation-sigil {
+  flex-shrink: 0;
+  color: var(--cb-running);
+  user-select: none;
+}
+
+/* Full path of an edited file, shown inside the expanded body (the header
+   carries only the file NAME — Codex reference). */
+.cb-edit-path {
+  padding: 2px 0 6px;
+  font-size: var(--cb-fs-label);
+  font-family: var(--cb-font-mono);
+  color: var(--cb-muted);
+  word-break: break-all;
+}
+/* Codex-reference rest/hover states for the edit row: counts sit muted until
+   the pointer is on the row, then take their diff colours; the chevron is
+   the package's collapse affordance and needs no change here. */
+.cb-tool-head .cb-diff-stats .cb-c-add,
+.cb-tool-head .cb-diff-stats .cb-c-del {
+  color: var(--cb-muted);
+  transition: color 0.12s;
+}
+.cb-tool-head:hover .cb-diff-stats .cb-c-add { color: var(--cb-diff-add); }
+.cb-tool-head:hover .cb-diff-stats .cb-c-del { color: var(--cb-diff-del); }
 
 /* ============================================================
    READ — badge «N lines»
@@ -242,6 +353,22 @@
 /* ============================================================
    GENERIC TOOL — текстовый вывод
    ============================================================ */
+/* MCP expanded body: arguments and result are TWO labeled sections divided by
+   a rule — not two anonymous scrollboxes reading as one blob under one
+   unbroken rail (user: «почему два блока и оба со скроллом, где разделитель»). */
+.cb-mcp-body { padding: 4px 0; }
+.cb-mcp-section-label {
+  font-size: var(--cb-fs-small);
+  color: var(--cb-dim);
+  text-transform: none;
+  padding-bottom: 2px;
+  user-select: none;
+}
+.cb-mcp-result {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--cb-tool-border);
+}
 .cb-generic-out {
   margin: 0;
   padding: 4px 0;
@@ -320,20 +447,28 @@
 }
 .cb-diff-mark { user-select: none; width: 16px; flex-shrink: 0; text-align: center; }
 .cb-diff-code { white-space: pre-wrap; word-break: break-all; flex: 1; padding-right: 12px; }
-.cb-diff-stats { font-family: var(--cb-font-mono); font-variant-numeric: tabular-nums; }
+.cb-diff-stats {
+  font-family: var(--cb-font-mono);
+  font-variant-numeric: tabular-nums;
+  /* Digits are secondary (user: «числа всё равно особо не читаю») — same
+     quiet size as the read badge / line-range qualifier. */
+  font-size: var(--cb-fs-small);
+}
 
 /* ============================================================
    THINKING / REASONING
    ============================================================ */
 .cb-think { margin: 12px 60px 12px 0; }
 .cb-think-btn {
-  display: flex;
-  width: 100%;
+  /* Same content-width hit area rule as .cb-tool-head: the hover/click
+     surface ends where the label ends, not at the feed's right edge. */
+  display: inline-flex;
+  max-width: 100%;
   align-items: center;
   gap: 8px;
   margin: 0 -4px;
   padding: 4px;
-  font-size: var(--cb-fs-content);
+  font-size: 0.9em;
   color: var(--cb-label);
   background: transparent;
   border: none;
@@ -343,6 +478,8 @@
   transition: color 0.15s, background 0.15s;
   text-align: left;
 }
+.cb-think-btn:hover .cb-tool-chevron { opacity: 1; }
+.cb-think-btn[aria-expanded="true"] .cb-tool-chevron { opacity: 1; transform: rotate(90deg); }
 .cb-think-btn:hover { color: #fff; background: var(--cb-hover); }
 .cb-think-ic { flex-shrink: 0; color: var(--cb-think); display: inline-flex; }
 .cb-think-label { font-weight: 500; }

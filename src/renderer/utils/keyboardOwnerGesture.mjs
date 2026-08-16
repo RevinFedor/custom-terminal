@@ -58,6 +58,11 @@ export const OWNERSHIP_NEUTRAL_SELECTORS = Object.freeze([
   '[data-split-direction-menu]',
   '[data-run-after-picker-menu]',
   '[data-command-history-popover]',
+  // Not an overlay, but the same logic: dragging a divider is about GEOMETRY,
+  // not "I want to type here" — same reasoning that excludes the right and
+  // middle buttons. Without this, grabbing a divider while the keyboard was in
+  // the sidebar would flip ownership and flash the pane frame mid-drag.
+  '[data-split-divider]',
 ]);
 
 const matches = (el, selectors) => (

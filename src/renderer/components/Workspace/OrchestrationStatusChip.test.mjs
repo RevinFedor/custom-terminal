@@ -24,6 +24,16 @@ test('manual recovery shows a stable yellow loader and warning together', () => 
   assert.match(statusIcon, /width: 26, height: 14/);
 });
 
+test('sent delivery awaiting exact audit keeps the yellow loader spinning', () => {
+  const presentationStart = source.indexOf('function runPresentation');
+  const presentationEnd = source.indexOf('function StatusIcon', presentationStart);
+  const presentation = source.slice(presentationStart, presentationEnd);
+
+  assert.match(presentation, /run\.status === 'sent' && run\.deliveryAuditPendingAt && !run\.targetPromptProofAt/);
+  assert.match(presentation, /label: 'Проверка доставки'/);
+  assert.match(presentation, /color: '#fbbf24'[\s\S]*?spinning: true/);
+});
+
 test('manual recovery exposes automatic continuation, timer hold, report, and detach actions', () => {
   assert.match(source, /Следующее сообщение в этой вкладке/);
   assert.match(source, /run\.outcome === 'interrupted' \? 'Восстановить связь вручную'/);

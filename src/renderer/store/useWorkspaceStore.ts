@@ -42,6 +42,8 @@ import {
   paneWithHistoryFrom,
   dropFromPaneHistory,
   dropTabFromAllPaneHistories,
+  emptyPaneByClosedTab,
+  packSplitSizes,
 } from '../utils/splitPanesModel.mjs';
 import { isVisitWorthRecording, onScreenTabIds } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
@@ -1376,6 +1378,18 @@ export interface SplitPane {
   prevTabId?: string;
 }
 
+// Divider positions of the split workspace, as FRACTIONS: cols[c] is column
+// c's share of the width, rows[c][j] is row j's share of column c's height.
+// Lives BESIDE the panes, not on them: a column's width belongs to the column,
+// and pane objects are rebuilt wholesale on every activation. null = every
+// dimension is an equal split (the default is absent, same as `column`).
+// Readers normalize against the CURRENT pane structure at read time, so no
+// pane writer needs to know this field exists. See splitPanesModel.mjs.
+export interface SplitSizes {
+  cols: number[];
+  rows: number[][];
+}
+
 export interface TerminalBufferCheckpoint {
   serialized: string;
   headlessWriteSeq: number | null;
@@ -1429,6 +1443,20 @@ interface WorkspaceStore {
   splitPanes: SplitPane[];
   splitFocusedIndex: number;
   /**
+   * Divider positions as fractions; null = equal split everywhere. Persisted
+   * with the layout. Readers normalize against the current pane structure, so
+   * pane add/remove needs no bookkeeping here — a dimension whose stored count
+   * no longer matches simply reads as equal.
+   */
+  splitSizes: SplitSizes | null;
+  /**
+   * ONE write per finished drag (mouseup / divider double-click), not one per
+   * mousemove: the live drag repositions the pane wrappers directly in the
+   * DOM, and a store write per move would rebuild the whole terminals memo at
+   * pointer speed. Packs against the current panes (equal split stores null).
+   */
+  commitSplitSizes: (sizes: SplitSizes | null) => void;
+  /**
    * Does the workspace own the keyboard, or does the surrounding interface?
    *
    * NOT a second focus and NOT a second active tab: the active tab always
@@ -1446,6 +1474,12 @@ interface WorkspaceStore {
   workspaceOwnsKeyboard: boolean;
   setWorkspaceOwnsKeyboard: (owns: boolean) => void;
   addTabToSplit: (projectId: string, tabId: string) => boolean;
+  /**
+   * «Убрать вкладку из окна»: the pane STAYS and becomes an empty placeholder.
+   * The tab is not closed — it keeps living in the sidebar list. Closing the
+   * pane itself is a separate gesture (the placeholder's ✕).
+   */
+  clearTabFromSplitPane: (tabId: string) => boolean;
   removeTabFromSplit: (tabId: string) => void;
   // Split button in the attach row: open an EMPTY pane (focused, waiting for
   // the next tab activation to fill it). Single mode → [center, empty].
@@ -1948,6 +1982,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   // ── Split workspace ──────────────────────────────────────────────────────
   splitPanes: [],
   splitFocusedIndex: 0,
+  splitSizes: null,
+  commitSplitSizes: (sizes) => {
+    // Pack at the write: an equal split stores null, and sizes for a structure
+    // that no longer matches self-clean instead of shadowing the next layout.
+    const packed = packSplitSizes(get().splitPanes, sizes);
+    const prev = get().splitSizes;
+    if (packed === null && prev === null) return;
+    set({ splitSizes: packed });
+    console.log('[Split] sizes ' + (packed
+      ? 'cols=' + packed.cols.map((f) => f.toFixed(3)).join('/')
+      : 'reset-to-equal'));
+    get().saveSession();
+  },
   // Starts true: on launch the workspace is where the user works, and this is
   // the pre-existing behaviour for every gesture that reads it.
   workspaceOwnsKeyboard: true,
@@ -1973,11 +2020,42 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     });
     const res = addPane(splitPanes, splitFocusedIndex, current, { projectId, tabId });
     if (!res) return false;
-    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    // A split STARTED from single mode is a NEW layout and opens equal. The
+    // read-time drift rule cannot catch this case: sizes of a dead 2-column
+    // layout still COUNT-match a fresh 2-column one, so without the explicit
+    // clear, closing a 65/35 split and later splitting two unrelated tabs
+    // would reopen at 65/35. (Add/remove within a living split stays covered
+    // by the drift rule — a brief third pane comes and goes, and the stored
+    // 2-column fractions correctly return when the shape returns.)
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, ...(splitPanes.length === 0 ? { splitSizes: null } : {}) });
     console.log('[Split] addTab tab=' + tabId.slice(-12) + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
     get().touchGlobalTabMru(projectId, tabId, visibleBefore);
     // Focus follows the newly added pane → its tab becomes the center tab.
     get().activateCenterTab(projectId, tabId);
+    get().saveSession();
+    return true;
+  },
+
+  clearTabFromSplitPane: (tabId) => {
+    // «Убрать вкладку из окна», не «закрыть окно» и не «закрыть вкладку»: the
+    // tab keeps living in the sidebar, the pane keeps its place and waits for
+    // the next tab. Closing the pane is the placeholder's own ✕.
+    const { splitPanes, splitFocusedIndex } = get();
+    const res = emptyPaneByClosedTab(splitPanes, splitFocusedIndex, tabId);
+    if (!res) return false;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    console.log('[Split] clearPane tab=' + tabId.slice(-12)
+      + (res.emptiedIndex !== undefined ? ' emptied=' + res.emptiedIndex : ' collapsed')
+      + ' panes=' + res.panes.length);
+    // The centre must not stay on a tab that is no longer shown anywhere. A
+    // pane that just became a placeholder cannot answer "what is on screen" —
+    // it holds no tab — so the focused slot only counts while it still has one.
+    const focusedAfter = res.panes[res.focusedIndex];
+    const next = (focusedAfter && focusedAfter.tabId ? focusedAfter : null)
+      || res.survivor
+      || res.panes.find((p) => p.tabId)
+      || null;
+    if (next && next.tabId) get().activateCenterTab(next.projectId, next.tabId);
     get().saveSession();
     return true;
   },
@@ -2009,7 +2087,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       : null;
     const res = addEmptyPane(st.splitPanes, st.splitFocusedIndex, current, afterPaneIndex ?? null);
     if (!res) return false;
-    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    // New layout from single mode opens equal — see addTabToSplit.
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, ...(st.splitPanes.length === 0 ? { splitSizes: null } : {}) });
     console.log('[Split] addEmptyPane panes=' + res.panes.length + ' focus=' + res.focusedIndex);
     // Placeholder is session-transient (sanitizePanes drops it on restore),
     // but persisting the REAL panes' new geometry keeps restart honest.
@@ -2031,7 +2110,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       side,
     );
     if (!res) return false;
-    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    // New layout from single mode opens equal — see addTabToSplit.
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, ...(st.splitPanes.length === 0 ? { splitSizes: null } : {}) });
     console.log('[Split] addVerticalPane side=' + side
       + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
     get().saveSession();
@@ -2536,7 +2616,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         projectHistory: restoredHistory,
         globalTabMru: restoredGlobalMru,
         splitPanes: restoredSplit.panes,
-        splitFocusedIndex: restoredSplit.focusedIndex
+        splitFocusedIndex: restoredSplit.focusedIndex,
+        // Divider positions ride along; packing against the SANITIZED panes
+        // drops sizes whose structure did not survive (a pane's tab is gone →
+        // that dimension reads as equal anyway, so store nothing for it).
+        splitSizes: packSplitSizes(restoredSplit.panes, (sessionState as any).splitSizes ?? null),
       });
       console.warn(
         `[RestoreSession] done durMs=${(performance.now() - restoreStart).toFixed(1)}` +
@@ -3498,22 +3582,33 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const purge = dropTabFromAllPaneHistories(get().splitPanes, tabId);
       if (purge) set({ splitPanes: purge.panes });
     }
-    // Closing a tab that occupies a split pane collapses/shrinks the split.
+    // Closing a TAB is not "remove this pane from the workspace": the slot the
+    // user built is not part of what they deleted. The pane stays and becomes
+    // an empty placeholder; only a two-pane split collapses, because a split of
+    // one is single mode with extra steps. (Reported live: closing a tab from
+    // the sidebar took its whole column with it.)
     // The surviving pane inherits global focus AFTER the workspace cleanup
     // below (otherwise this project's own LRU fallback would win and the
     // user would land on a tab that is not even on screen).
     let splitSurvivor: SplitPane | null = null;
     {
       const { splitPanes, splitFocusedIndex } = get();
-      const splitRes = removePaneByTab(splitPanes, splitFocusedIndex, tabId);
+      const splitRes = emptyPaneByClosedTab(splitPanes, splitFocusedIndex, tabId);
       if (splitRes) {
         // Same question as removeTabFromSplit — "which pane stayed on screen" —
         // so it reads the same answer. This used to re-derive it locally by
         // scanning for any pane that is not the closed one, which also matched
         // an empty placeholder and then quietly activated nothing.
-        splitSurvivor = splitRes.panes[splitRes.focusedIndex] || splitRes.survivor || null;
+        // A pane that just became a PLACEHOLDER is not a survivor: it has no
+        // tab to activate, and naming it would leave the centre on nothing.
+        const focusedAfter = splitRes.panes[splitRes.focusedIndex];
+        splitSurvivor = (focusedAfter && focusedAfter.tabId ? focusedAfter : null)
+          || (splitRes as { survivor?: SplitPane | null }).survivor
+          || splitRes.panes.find((p) => p.tabId) || null;
         set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex });
-        console.log('[Split] pane-closed-with-tab tab=' + tabId.slice(-12) + ' panes=' + splitRes.panes.length);
+        console.log('[Split] tab-closed tab=' + tabId.slice(-12)
+          + ' panes=' + splitRes.panes.length
+          + (splitRes.emptiedIndex !== undefined ? ' emptied=' + splitRes.emptiedIndex : ' collapsed'));
       }
     }
 

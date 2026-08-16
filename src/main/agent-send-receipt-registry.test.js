@@ -93,6 +93,25 @@ test('receipt classification keeps transport, provider acceptance, and unknown o
     RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
   );
   assert.equal(
+    classifyAgentSendRegistryReceipt(exactProviderNotAccepted({
+      composerDraftState: 'exact-provider-image-transform',
+      providerImageTransform: true,
+      expectedImagePathCount: 5,
+      capturedImageCount: 5,
+    })),
+    RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
+  );
+  assert.equal(
+    classifyAgentSendRegistryReceipt(exactProviderNotAccepted({
+      composerDraftState: 'exact-provider-image-transform',
+      providerImageTransform: true,
+      expectedImagePathCount: 5,
+      capturedImageCount: 4,
+    })),
+    RECEIPT_STATES.AUDIT_PENDING,
+    'provider image conversion needs matching exact attachment counts',
+  );
+  assert.equal(
     classifyAgentSendRegistryReceipt(exactProviderNotAccepted({ exactDraftRemained: false })),
     RECEIPT_STATES.AUDIT_PENDING,
     'an incomplete negative proof must remain unresolved',

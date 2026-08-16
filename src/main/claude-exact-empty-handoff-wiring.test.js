@@ -116,7 +116,7 @@ test('post-Enter timeout gets a non-destructive exact composer and transcript re
   );
   assert.match(
     main,
-    /semanticStatus === 'not-submitted'[\s\S]{0,500}settleClaudePasteAuditWithoutProjection/,
+    /semanticStatus === 'not-submitted'[\s\S]{0,1800}settleClaudePasteAuditWithoutProjection/,
     'only the exact final semantic failure may stop the local audit',
   );
   assert.match(

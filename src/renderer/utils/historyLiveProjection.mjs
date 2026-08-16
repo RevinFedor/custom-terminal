@@ -5,6 +5,7 @@ import {
   isHistoryPromptLocallyOwned,
   reduceClaudeHistoryPromptCarrier,
 } from './historyClaudePromptCarriers.mjs';
+import { classifyHistoryAction } from '../../shared/history-action-grammar.mjs';
 
 const FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 
@@ -182,12 +183,22 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
       // because every durable re-read was deferred with reason=turn-busy.
       const claudeSpawn = claudeSubagentSpawnCard(block, toolUseId);
       if (claudeSpawn) return claudeSpawn;
+      const toolName = String(block.name || block.tool_name || 'Tool');
+      const args = normalizeArgs(block.input ?? block.arguments);
+      // Same grouping identity the durable parser stamps: a live row must
+      // group exactly like its durable twin, or the series count would change
+      // at the live→durable handoff.
+      const classified = classifyHistoryAction({ toolName, args });
       return {
         tool: '__raw__',
         rawTool: {
           toolUseId,
-          toolName: String(block.name || block.tool_name || 'Tool'),
-          args: normalizeArgs(block.input ?? block.arguments),
+          toolName,
+          args,
+          family: classified.family,
+          bashWord: classified.bashWord,
+          mcpServer: classified.mcpServer,
+          mcpMethod: classified.mcpMethod,
         },
       };
     });

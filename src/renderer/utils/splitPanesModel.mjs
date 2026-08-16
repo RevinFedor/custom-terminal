@@ -16,7 +16,23 @@
 //     unchanged;
 //   • otherwise → the pane in focus replaces its tab with the target.
 
-export const MAX_SPLIT_PANES = 3;
+// ── How much the workspace holds ──────────────────────────────────────────
+//
+// The limit is stated in the dimension it is actually about: SCREEN COLUMNS.
+// Width is the scarce resource — a terminal squeezed under ~300px stops being
+// usable — so at most three columns stand side by side. Height is cheaper, so a
+// column may be split once into two rows.
+//
+// It used to be a single flat "at most 3 panes", written when a pane and a
+// column were the same thing. Vertical splitting arrived later and silently
+// changed what that number meant: it stopped capping the columns on screen and
+// started capping the whole GRID, which forbids a 2×2 layout even though that
+// is only two columns wide. Reported live: three panes (one column + a stacked
+// pair), and splitting the single column was impossible.
+export const MAX_SPLIT_COLUMNS = 3;
+export const MAX_ROWS_PER_COLUMN = 2;
+/** Total cap, derived — used for restore-time truncation, not for decisions. */
+export const MAX_SPLIT_PANES = MAX_SPLIT_COLUMNS * MAX_ROWS_PER_COLUMN;
 
 // ── Two dimensions ────────────────────────────────────────────────────────
 //
@@ -313,8 +329,36 @@ export function addPane(panes, focusedIndex, current, added) {
       : added;
     return { panes: next, focusedIndex: emptyIdx };
   }
-  if (panes.length >= MAX_SPLIT_PANES) return null;
+  // Appending puts the tab in a NEW column, so the column cap decides.
+  if (paneColumns(panes).length >= MAX_SPLIT_COLUMNS) return null;
   return { panes: [...panes, added], focusedIndex: panes.length };
+}
+
+/**
+ * Can this pane still be split, and in which direction?
+ *
+ * ONE answer for the button, its menu and the model, so the control can be
+ * DISABLED with a reason instead of vanishing — a control that disappears at
+ * the limit reads as a bug ("кнопка пропала"), while a greyed one with a
+ * tooltip states the rule.
+ */
+export function splitAvailability(panes, paneIndex) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (list.length === 0) return { horizontal: true, vertical: true, reason: null };
+  if (list.some(isEmptyPane)) {
+    return { horizontal: false, vertical: false, reason: 'placeholder' };
+  }
+  const columns = paneColumns(list);
+  const horizontal = columns.length < MAX_SPLIT_COLUMNS;
+  const idx = clampIndex(list, paneIndex === null || paneIndex === undefined ? 0 : paneIndex);
+  const column = paneColumn(list[idx], idx);
+  const rowsHere = list.filter((pane, i) => paneColumn(pane, i) === column).length;
+  const vertical = rowsHere < MAX_ROWS_PER_COLUMN;
+  return {
+    horizontal,
+    vertical,
+    reason: horizontal || vertical ? null : (columns.length >= MAX_SPLIT_COLUMNS ? 'columns-full' : 'rows-full'),
+  };
 }
 
 // Split button in the attach row: open a new EMPTY pane and focus it. From
@@ -328,7 +372,9 @@ export function addEmptyPane(panes, focusedIndex, current, afterIndex = null) {
     if (!current || !current.tabId) return null;
     return { panes: [stripColumn(current), { projectId: '', tabId: '' }], focusedIndex: 1 };
   }
-  if (panes.length >= MAX_SPLIT_PANES) return null;
+  // This gesture opens a NEW COLUMN, so it is capped by columns — not by the
+  // total pane count, which would refuse while the screen still has room.
+  if (paneColumns(panes).length >= MAX_SPLIT_COLUMNS) return null;
   if (panes.some(isEmptyPane)) return null;
 
   // A horizontal split opens a NEW COLUMN right of the pressed pane's column,
@@ -384,7 +430,6 @@ export function addEmptyPaneVertical(panes, focusedIndex, current, atIndex, side
       : { panes: [first, added], focusedIndex: 1 };
   }
 
-  if (panes.length >= MAX_SPLIT_PANES) return null;
   if (panes.some(isEmptyPane)) return null;
 
   const anchorIndex = clampIndex(panes, atIndex === null || atIndex === undefined ? focusedIndex : atIndex);
@@ -392,6 +437,10 @@ export function addEmptyPaneVertical(panes, focusedIndex, current, atIndex, side
   if (!anchor) return null;
 
   const column = paneColumn(anchor, anchorIndex);
+  // This gesture stacks INSIDE one column, so only that column's height is at
+  // stake: a full neighbouring column must not block it.
+  const rowsHere = panes.filter((pane, index) => paneColumn(pane, index) === column).length;
+  if (rowsHere >= MAX_ROWS_PER_COLUMN) return null;
   // Every column becomes explicit BEFORE splicing: with implicit columns an
   // insertion shifts array positions and therefore silently re-columns every
   // pane after it. This call always stacks, so the explicit form is the
@@ -413,6 +462,50 @@ export function removePaneByTab(panes, focusedIndex, tabId) {
   return finalizeRemoval(panes, focusedIndex, idx);
 }
 
+/**
+ * Take a tab OUT OF ITS PANE, leaving the pane itself in place and empty.
+ *
+ * Two intentions used to run the same code, and both of them destroyed the
+ * slot the user had built:
+ *   • «закрыть вкладку» (sidebar list, ✕) — the tab is deleted, but the layout
+ *     is not part of what was deleted;
+ *   • «убрать вкладку из окна» (middle-click on the pane's chip) — the tab goes
+ *     on living in the sidebar, it simply stops being SHOWN here.
+ * Both end the same way: the pane stays and becomes a placeholder waiting for
+ * the next tab. Closing the pane itself is a separate gesture (the ✕ that a
+ * placeholder shows) — a window is not something you dismiss by accident while
+ * clearing what is inside it.
+ *
+ * Reported live, twice: a tab open in the second column was closed from the
+ * sidebar and the whole pane vanished with it; and the middle-click on the
+ * chip removed the pane instead of just emptying it.
+ *
+ * TWO panes count exactly like three: the second window STAYS and goes empty.
+ * The first version collapsed a two-pane split to single mode here, reasoning
+ * that "one live pane plus a placeholder is a split of one" — but that is the
+ * layout question, and this gesture is not about the layout at all. Reported
+ * live: with two windows open, clearing one closed it, because two is the
+ * common case and the collapse rule swallowed it. Only the placeholder's own ✕
+ * closes a window.
+ *
+ * Returns null when the tab has no pane.
+ */
+export function emptyPaneByClosedTab(panes, focusedIndex, tabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (!tabId) return null;
+  const idx = list.findIndex((p) => p && p.tabId === tabId);
+  if (idx === -1) return null;
+  const pane = list[idx];
+  const next = list.slice();
+  // The slot keeps its COLUMN — the geometry the user built is what stays.
+  // History goes with the tab: it named tabs shown in this slot, and the entry
+  // for a closed tab is purged anyway (dropTabFromAllPaneHistories).
+  next[idx] = pane.column !== undefined
+    ? { projectId: '', tabId: '', column: pane.column }
+    : { projectId: '', tabId: '' };
+  return { panes: next, focusedIndex: clampIndex(next, focusedIndex), emptiedIndex: idx };
+}
+
 // Remove a pane by position — the only way to close an EMPTY placeholder
 // (✕ in its row or Escape while it is focused).
 export function removePaneAt(panes, focusedIndex, index) {
@@ -430,24 +523,41 @@ export function removePanesByProject(panes, focusedIndex, projectId) {
   return { panes: next, focusedIndex: keptFocus >= 0 ? keptFocus : 0 };
 }
 
-// Restore-time validation: keep only panes whose tab still exists (this also
-// drops empty placeholders — they are session-transient); a split needs at
-// least two live panes to survive. Each surviving pane's HISTORY is scrubbed
-// of dead tabs too — entries for tabs deleted while the app was closed would
-// otherwise sit in the saved layout forever.
+// Restore-time validation: keep panes whose tab still exists, PLUS windows the
+// user deliberately left empty. A split needs at least two panes to survive.
+// Each surviving pane's HISTORY is scrubbed of dead tabs too — entries for tabs
+// deleted while the app was closed would otherwise sit in the saved layout
+// forever.
+//
+// An empty pane used to be purely session-transient (the split button opens one
+// and the next activation fills it, so losing it on restart cost nothing). Once
+// clearing a window became a normal gesture, that stopped being true: a window
+// the user emptied on purpose is part of the layout, and dropping it on restart
+// silently closed a window they had chosen to keep.
 export function sanitizePanes(panes, focusedIndex, tabExists) {
   const valid = (Array.isArray(panes) ? panes : [])
     .filter((p) => (
       p && typeof p.projectId === 'string' && typeof p.tabId === 'string'
-      && p.tabId && tabExists(p.projectId, p.tabId)
+      && (!p.tabId || tabExists(p.projectId, p.tabId))
     ))
     .map((p) => {
       const history = paneHistory(p).filter((e) => e && e.tabId && tabExists(e.projectId, e.tabId));
       const { prevProjectId, prevTabId, ...rest } = p;
       return history.length > 0 ? { ...rest, history } : stripHistory(rest);
     });
-  if (valid.length < 2) return { panes: [], focusedIndex: 0 };
-  return { panes: valid.slice(0, MAX_SPLIT_PANES), focusedIndex: clampIndex(valid, focusedIndex) };
+  // An all-empty layout is not a layout — nothing to come back to.
+  if (valid.length < 2 || !valid.some((p) => p.tabId)) return { panes: [], focusedIndex: 0 };
+  // Truncation keeps whole COLUMNS: a flat slice can cut a stacked column in
+  // half and leave a lone row where the user had a pair. Restores are already
+  // within the caps in practice — this is the backstop for a hand-edited or
+  // future-version session.
+  const kept = [];
+  paneColumns(valid).slice(0, MAX_SPLIT_COLUMNS).forEach((rows) => {
+    rows.slice(0, MAX_ROWS_PER_COLUMN).forEach(({ pane }) => kept.push(pane));
+  });
+  const next = normalizeColumns(kept);
+  if (next.length < 2) return { panes: [], focusedIndex: 0 };
+  return { panes: next, focusedIndex: clampIndex(next, focusedIndex) };
 }
 
 // Geometry: equal columns, no draggable divider (v1). Returns percent rects.
@@ -457,26 +567,189 @@ export function paneRects(count) {
   return Array.from({ length: n }, (_, i) => ({ leftPct: i * w, widthPct: w }));
 }
 
+// ── Resizable dividers ────────────────────────────────────────────────────
+//
+// Sizes are FRACTIONS, not pixels: `cols[c]` is column c's share of the full
+// width (summing to 1), `rows[c][j]` is row j's share of column c's height.
+// Fractions survive window resizes and monitor moves unchanged, which is what
+// a saved layout must do.
+//
+// The sizes object lives BESIDE the panes (its own store/session field), not
+// on the pane objects: a column's width belongs to the column, not to any one
+// pane in it — and pane objects are rebuilt wholesale on every activation, so
+// geometry riding on them would need carrying through every writer (the
+// paneWithHistoryFrom lesson, for a field no tab writer cares about).
+//
+// DRIFT RULE: panes change without the sizes knowing (pane added or removed,
+// whole project closed). Every reader therefore normalizes AT READ TIME
+// against the current structure — a dimension whose stored count still
+// matches keeps its fractions, a dimension that no longer matches resets to
+// equal. No pane writer needs to know sizes exist, which is the whole reason
+// none of them had to change for this feature.
+
+export const SPLIT_MIN_FRACTION = 0.15;
+
+const equalFractions = (n) => {
+  const count = Math.max(1, n | 0);
+  return Array.from({ length: count }, () => 1 / count);
+};
+
+const validFractionList = (list, count) => (
+  Array.isArray(list) && list.length === count
+  && list.every((f) => Number.isFinite(f) && f > 0)
+);
+
+// Stored fractions may carry float drift from earlier resizes; readers always
+// see an exact sum of 1.
+const renormalizeFractions = (list) => {
+  const sum = list.reduce((a, b) => a + b, 0);
+  return sum > 0 ? list.map((f) => f / sum) : equalFractions(list.length);
+};
+
 /**
- * Full 2-D geometry: equal columns across the width, equal rows inside each
- * column. Returns one rect per pane, in the SAME order as the panes array, so
- * callers index it directly.
+ * Materialize sizes for the CURRENT pane structure: kept where the stored
+ * count matches, equal where it does not (or where nothing is stored).
  */
-export function paneGridRects(panes) {
+export function normalizeSplitSizes(panes, sizes) {
   const columns = paneColumns(panes);
-  const colCount = Math.max(1, columns.length);
-  const colW = 100 / colCount;
-  const rects = new Array(Array.isArray(panes) ? panes.length : 0);
-  columns.forEach((rows, columnIndex) => {
-    const rowH = 100 / Math.max(1, rows.length);
-    rows.forEach(({ index }, rowIndex) => {
-      rects[index] = {
-        leftPct: columnIndex * colW,
-        widthPct: colW,
-        topPct: rowIndex * rowH,
-        heightPct: rowH,
-      };
+  if (columns.length === 0) return { cols: [], rows: [] };
+  const cols = validFractionList(sizes && sizes.cols, columns.length)
+    ? renormalizeFractions(sizes.cols)
+    : equalFractions(columns.length);
+  const rows = columns.map((rowsOfCol, c) => (
+    validFractionList(sizes && sizes.rows && sizes.rows[c], rowsOfCol.length)
+      ? renormalizeFractions(sizes.rows[c])
+      : equalFractions(rowsOfCol.length)
+  ));
+  return { cols, rows };
+}
+
+const EQUAL_EPS = 1e-3;
+const isEqualSplit = (list) => list.every((f) => Math.abs(f - 1 / list.length) < EQUAL_EPS);
+
+/**
+ * The STORED form: null when every dimension is an equal split. An untouched
+ * layout stores no sizes at all — same storage philosophy as `column`: the
+ * default is absent, so legacy sessions and equality checks stay byte-stable,
+ * and stale sizes from a dead layout self-clean on the next pack.
+ */
+export function packSplitSizes(panes, sizes) {
+  const norm = normalizeSplitSizes(panes, sizes);
+  if (norm.cols.length === 0) return null;
+  if (isEqualSplit(norm.cols) && norm.rows.every(isEqualSplit)) return null;
+  return norm;
+}
+
+/**
+ * Drag math for ONE divider in a fraction list: move `deltaFr` from the right
+ * neighbour to the left one (negative = the other way), clamped so neither
+ * drops below `minFr`. Total is preserved by construction. Returns the input
+ * list unchanged when the divider index is invalid or there is no room.
+ */
+export function resizeFractions(fractions, dividerIndex, deltaFr, minFr = SPLIT_MIN_FRACTION) {
+  const list = Array.isArray(fractions) ? fractions : [];
+  const k = dividerIndex | 0;
+  if (k < 0 || k >= list.length - 1 || !Number.isFinite(deltaFr)) return list;
+  const a = list[k];
+  const b = list[k + 1];
+  const low = minFr - a;
+  const high = b - minFr;
+  if (low > high) return list; // both neighbours already at the minimum
+  const d = Math.max(low, Math.min(high, deltaFr));
+  if (d === 0) return list;
+  const next = list.slice();
+  next[k] = a + d;
+  next[k + 1] = b - d;
+  return next;
+}
+
+/** Short stable string for memo/selector keys; '' when sizes are absent. */
+export function splitSizesFingerprint(sizes) {
+  if (!sizes) return '';
+  const f = (x) => Math.round(x * 1000);
+  return (sizes.cols || []).map(f).join(',')
+    + '|' + (sizes.rows || []).map((r) => r.map(f).join(',')).join(';');
+}
+
+/**
+ * The dividers to render, with their line positions in percent:
+ *   {kind:'col', dividerIndex, xPct}                       — between columns
+ *   {kind:'row', columnIndex, dividerIndex, yPct, leftPct, widthPct}
+ *                                                          — between rows
+ * `id` is stable across drags ('col:0', 'row:1:0') for React keys and DOM
+ * lookup during the live drag.
+ */
+export function splitDividerDescriptors(panes, sizes = null) {
+  const columns = paneColumns(panes);
+  if (columns.length === 0) return [];
+  const norm = normalizeSplitSizes(panes, sizes);
+  const out = [];
+  let left = 0;
+  columns.forEach((rows, c) => {
+    const widthPct = norm.cols[c] * 100;
+    if (c < columns.length - 1) {
+      out.push({ id: `col:${c}`, kind: 'col', dividerIndex: c, xPct: left + widthPct });
+    }
+    let top = 0;
+    rows.forEach((_, j) => {
+      const heightPct = norm.rows[c][j] * 100;
+      if (j < rows.length - 1) {
+        out.push({
+          id: `row:${c}:${j}`,
+          kind: 'row',
+          columnIndex: c,
+          dividerIndex: j,
+          yPct: top + heightPct,
+          leftPct: left,
+          widthPct,
+        });
+      }
+      top += heightPct;
     });
+    left += widthPct;
+  });
+  return out;
+}
+
+/**
+ * Full 2-D geometry: fractional columns across the width, fractional rows
+ * inside each column — equal splits when `sizes` is absent. Returns one rect
+ * per pane, in the SAME order as the panes array, so callers index it
+ * directly.
+ */
+export function paneGridRects(panes, sizes = null) {
+  const columns = paneColumns(panes);
+  const rects = new Array(Array.isArray(panes) ? panes.length : 0);
+  if (!sizes) {
+    // The exact pre-resize arithmetic (i * 100/n, not cumsum of 1/n): the two
+    // differ in the last float digit, and every consumer of the default
+    // geometry — tests included — is pinned to this form.
+    const colCount = Math.max(1, columns.length);
+    const colW = 100 / colCount;
+    columns.forEach((rows, columnIndex) => {
+      const rowH = 100 / Math.max(1, rows.length);
+      rows.forEach(({ index }, rowIndex) => {
+        rects[index] = {
+          leftPct: columnIndex * colW,
+          widthPct: colW,
+          topPct: rowIndex * rowH,
+          heightPct: rowH,
+        };
+      });
+    });
+    return rects;
+  }
+  const norm = normalizeSplitSizes(panes, sizes);
+  let left = 0;
+  columns.forEach((rows, columnIndex) => {
+    const widthPct = norm.cols[columnIndex] * 100;
+    let top = 0;
+    rows.forEach(({ index }, rowIndex) => {
+      const heightPct = norm.rows[columnIndex][rowIndex] * 100;
+      rects[index] = { leftPct: left, widthPct, topPct: top, heightPct };
+      top += heightPct;
+    });
+    left += widthPct;
   });
   return rects;
 }

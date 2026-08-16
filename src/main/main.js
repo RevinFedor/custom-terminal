@@ -141,14 +141,23 @@ const {
   observeTerminalComposerFrame,
   recordTerminalComposerInput,
   recordTerminalComposerOutput,
+  snapshotTerminalComposerForensicWindow,
   snapshotTerminalComposerForensics,
 } = require(path.join(srcMainDir, 'terminal-composer-forensics'));
+const {
+  persistTerminalSendForensicArtifact,
+  removeTerminalSendForensicArtifact,
+} = require(path.join(srcMainDir, 'terminal-send-forensic-artifact'));
 const {
   compareAgentDraftScreenParity,
 } = require(path.join(srcMainDir, 'agent-draft-screen-parity'));
 const {
   createTerminalHistoryPreviewController,
 } = require(path.join(srcMainDir, 'terminal-history-preview-controller'));
+const {
+  buildTerminalHistoryPreviewDiagnosticReference,
+  persistTerminalHistoryPreviewDiagnostic,
+} = require(path.join(srcMainDir, 'terminal-history-preview-diagnostic'));
 const {
   findTerminalHistorySubmittedPromptBoundary,
 } = require(path.join(srcMainDir, 'terminal-history-preview'));
@@ -166,6 +175,7 @@ const {
 } = require(path.join(srcMainDir, 'subagent-transcript'));
 const {
   classifyClaudeMissingPromptExactCaptureAdmission,
+  hasConflictingPtyWriteOperation,
   parseClaudeComposerCurrentFrame,
   reserveClaudeExactEmptyEvidence,
   resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence,
@@ -177,10 +187,15 @@ const {
   inspectClaudeProviderFatalFrame,
 } = require(path.join(srcMainDir, 'claude-provider-fatal-state'));
 const {
+  claudeInternalAgentContinuationKind,
+  claudeInternalAgentContinuationKindFromEntry,
   extractClaudeQueueOperationPromptText,
   extractClaudePromptCarrier,
   findMatchingClaudePromptTurn,
 } = require(path.join(srcMainDir, 'claude-prompt-carriers'));
+const {
+  materializeClaudeOrchestrationTurn,
+} = require(path.join(srcMainDir, 'claude-orchestration-result'));
 const {
   PROOF: CLAUDE_STARTUP_PROOF,
 } = require(path.join(srcMainDir, 'claude-startup-transaction'));
@@ -374,6 +389,7 @@ const agentSendReceiptStartupReady = (async () => {
   let promoted = 0;
   let absent = 0;
   let unknown = 0;
+  let markedUnconfirmed = 0;
   for (const result of decisions) {
     if (result?.decision === 'found' && result.audit) {
       const promotion = agentSendReceiptStore.promoteFromAudit(result.audit);
@@ -387,12 +403,28 @@ const agentSendReceiptStartupReady = (async () => {
           + String(result.operationKey || '-').slice(0, 72)
           + ' reason=' + (promotion?.reason || 'unknown'));
       }
-    } else if (result?.decision === 'absent') {
-      // Absence at startup is not retry authority. A provider may have accepted
-      // Enter without flushing its transcript before process teardown.
-      absent += 1;
     } else {
-      unknown += 1;
+      if (result?.decision === 'absent') absent += 1;
+      else unknown += 1;
+      // A negative or incomplete startup scan is never retry authority: Enter
+      // may have crossed the PTY boundary. It is, however, enough to stop
+      // presenting an active CONFIRMING spinner after the app has restarted.
+      // Keep the same immutable attempt replay-blocked and promotable by a
+      // later exact transcript audit, but project it as finite UNCONFIRMED.
+      if (result?.operationKey && result?.attemptId) {
+        const transition = agentSendReceiptStore.markStartupUnconfirmed(
+          result.operationKey,
+          result.attemptId,
+          result,
+        );
+        if (transition?.record?.state === AGENT_SEND_DURABLE_STATES.DELIVERY_UNKNOWN) {
+          markedUnconfirmed += 1;
+        } else if (transition?.reason !== 'already-confirmed') {
+          console.warn('[AgentSendReceipt] startup unconfirmed transition rejected operation='
+            + String(result.operationKey || '-').slice(0, 72)
+            + ' reason=' + (transition?.reason || 'unknown'));
+        }
+      }
     }
   }
   if (decisions.length > 0) {
@@ -406,9 +438,17 @@ const agentSendReceiptStartupReady = (async () => {
       + ' promoted=' + promoted
       + ' absent=' + absent
       + ' unknown=' + unknown
+      + ' markedUnconfirmed=' + markedUnconfirmed
       + ' reasons=' + JSON.stringify(Object.fromEntries(reasons)));
   }
-  return { ready: true, records: decisions.length, promoted, absent, unknown };
+  return {
+    ready: true,
+    records: decisions.length,
+    promoted,
+    absent,
+    unknown,
+    markedUnconfirmed,
+  };
 })().catch((error) => {
   console.warn('[AgentSendReceipt] startup transcript reconcile failed:', error?.message || error);
   return { ready: false, error: error?.message || String(error) };
@@ -417,6 +457,9 @@ const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
 const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, writeClaudeForkJsonlExclusive, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
+const {
+  createClaudeBackgroundAgentActivityTracker,
+} = require(path.join(srcMainDir, 'claude-background-agent-activity'));
 const { evaluateClaudeFreshStartAdmission } = require(path.join(srcMainDir, 'claude-fresh-start-admission'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
 const {
@@ -638,6 +681,10 @@ const {
   planCodexEffortSelection,
   unionCodexEffortOptions,
 } = require(path.join(srcMainDir, 'codex-model-picker'));
+const {
+  decideCodexResumeGoalAutoEnter,
+  inspectCodexResumeGoalPrompt,
+} = require(path.join(srcMainDir, 'codex-resume-goal-prompt'));
 const {
   claimRewindOperation,
   classifyRewindCancel,
@@ -1494,6 +1541,246 @@ const agentLaunchPreparations = createAgentLaunchPreparationRegistry({
 let dockBaseIconDataUrlCache = null;
 let dockBaseIconPathCache = null;
 let claudeStartupProofSession = null;
+let tabBackgroundWorkRevision = 0;
+const tabBackgroundWorkRevisionByTab = new Map();
+const claudeBackgroundTranscriptBindings = new Map();
+const claudeBackgroundSidecarTimers = new Map();
+
+function getCombinedTabBackgroundWorkCount(tabId) {
+  const claudeCount = claudeBackgroundAgentActivity.snapshot(tabId).count;
+  const codexCount = codexTabLiveSubagents.get(tabId)?.size || 0;
+  return claudeCount + codexCount;
+}
+
+function publishTabBackgroundWork(tabId, reason = 'changed') {
+  if (!tabId) return;
+  const count = getCombinedTabBackgroundWorkCount(tabId);
+  tabBackgroundWorkRevision += 1;
+  tabBackgroundWorkRevisionByTab.set(tabId, tabBackgroundWorkRevision);
+  const payload = {
+    tabId,
+    count,
+    revision: tabBackgroundWorkRevision,
+    reason,
+  };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('tab:background-work', payload);
+  }
+  console.log('[BackgroundWork] tab=' + String(tabId).slice(-12)
+    + ' count=' + count
+    + ' revision=' + tabBackgroundWorkRevision
+    + ' reason=' + reason);
+}
+
+function clearClaudeBackgroundSidecarTimer(tabId) {
+  const timer = claudeBackgroundSidecarTimers.get(tabId);
+  if (timer) clearTimeout(timer);
+  claudeBackgroundSidecarTimers.delete(tabId);
+}
+
+function scheduleClaudeBackgroundSidecarCheck(tabId) {
+  clearClaudeBackgroundSidecarTimer(tabId);
+  const snapshot = claudeBackgroundAgentActivity.snapshot(tabId);
+  if (snapshot.count <= 0) return;
+  const binding = claudeBackgroundTranscriptBindings.get(tabId);
+  if (!binding || binding.sessionId !== snapshot.sessionId || !binding.projectDir) return;
+  const timer = setTimeout(async () => {
+    claudeBackgroundSidecarTimers.delete(tabId);
+    const current = claudeBackgroundTranscriptBindings.get(tabId);
+    if (current !== binding) return;
+    const live = claudeBackgroundAgentActivity.snapshot(tabId);
+    for (const agent of live.agents) {
+      if (!agent.agentId || !/^[A-Za-z0-9_-]+$/.test(agent.agentId)) continue;
+      const metaPath = path.join(
+        binding.projectDir,
+        binding.sessionId,
+        'subagents',
+        'agent-' + agent.agentId + '.meta.json',
+      );
+      try {
+        const raw = await fs.promises.readFile(metaPath, 'utf8');
+        const meta = JSON.parse(raw);
+        if (meta?.stoppedByUser === true
+          && String(meta.toolUseId || '') === agent.toolUseId) {
+          claudeBackgroundAgentActivity.markStopped({
+            tabId,
+            sessionId: binding.sessionId,
+            toolUseId: agent.toolUseId,
+          });
+        }
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          console.warn('[ClaudeBackgroundWork] sidecar read failed tab='
+            + String(tabId).slice(-12)
+            + ' agent=' + String(agent.agentId).slice(0, 16)
+            + ' error=' + (error?.message || error));
+        }
+      }
+    }
+    scheduleClaudeBackgroundSidecarCheck(tabId);
+  }, 2000);
+  timer.unref?.();
+  claudeBackgroundSidecarTimers.set(tabId, timer);
+}
+
+const claudeBackgroundAgentActivity = createClaudeBackgroundAgentActivityTracker({
+  onChange: (snapshot) => {
+    publishTabBackgroundWork(snapshot.tabId, 'claude:' + (snapshot.reason || 'changed'));
+    if (snapshot.count > 0) scheduleClaudeBackgroundSidecarCheck(snapshot.tabId);
+    else clearClaudeBackgroundSidecarTimer(snapshot.tabId);
+  },
+});
+
+function observeClaudeBackgroundRawRecord(detail) {
+  if (detail?.toolType !== 'claude' || !detail?.tabId || !detail?.sessionId) return;
+  const record = detail.message;
+  const notifications = [];
+  for (const text of claudeDataApi.extractClaudeTaskNotificationTexts?.(record) || []) {
+    const parsed = claudeDataApi.parseClaudeTaskNotification?.(text, record?.timestamp);
+    if (parsed) notifications.push(parsed);
+  }
+  claudeBackgroundAgentActivity.observe({
+    tabId: detail.tabId,
+    sessionId: detail.sessionId,
+    record,
+    recordByteOffset: detail.recordByteOffset,
+    notifications,
+  });
+}
+
+async function catchUpClaudeBackgroundActivity(binding) {
+  if (!binding?.filePath || !Number.isSafeInteger(binding.boundaryOffset)) return;
+  let stat;
+  try {
+    stat = await fs.promises.stat(binding.filePath);
+  } catch {
+    return;
+  }
+  if (stat.size <= binding.boundaryOffset) return;
+  const byteCount = stat.size - binding.boundaryOffset;
+  const fd = await fs.promises.open(binding.filePath, 'r');
+  let text = '';
+  try {
+    const buffer = Buffer.allocUnsafe(byteCount);
+    await fd.read(buffer, 0, byteCount, binding.boundaryOffset);
+    text = buffer.toString('utf8');
+  } finally {
+    await fd.close();
+  }
+  const lines = text.split('\n');
+  lines.pop(); // a partial trailing record remains owned by the live watcher
+  let offset = binding.boundaryOffset;
+  let parsed = 0;
+  for (const line of lines) {
+    const recordByteOffset = offset;
+    offset += Buffer.byteLength(line) + 1;
+    if (!line.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    parsed += 1;
+    observeClaudeBackgroundRawRecord({
+      tabId: binding.tabId,
+      toolType: 'claude',
+      sessionId: binding.sessionId,
+      recordByteOffset,
+      recordEndByteOffset: offset,
+      message: record,
+    });
+  }
+  if (parsed > 0) {
+    console.log('[ClaudeBackgroundWork] catch-up tab=' + binding.tabId.slice(-12)
+      + ' session=' + binding.sessionId.slice(0, 8)
+      + ' records=' + parsed
+      + ' bytes=' + byteCount);
+  }
+}
+
+async function ensureClaudeBackgroundActivityObserver(tabId, sessionId, cwd = null) {
+  const exactTabId = String(tabId || '').trim();
+  const exactSessionId = String(sessionId || '').trim();
+  if (!exactTabId || !exactSessionId) return false;
+  const generation = getTerminalLifecycleGeneration(exactTabId) || null;
+  const previous = claudeBackgroundTranscriptBindings.get(exactTabId);
+  if (previous
+    && previous.sessionId === exactSessionId
+    && previous.generation === generation) return true;
+
+  if (previous) {
+    claudeBackgroundTranscriptBindings.delete(exactTabId);
+    void transcriptService.unsubscribe({ consumerId: previous.consumerId }).catch(() => {});
+  }
+  clearClaudeBackgroundSidecarTimer(exactTabId);
+  claudeBackgroundAgentActivity.bind({
+    tabId: exactTabId,
+    sessionId: exactSessionId,
+    generation,
+  });
+  const found = findSessionFile(exactSessionId, cwd || undefined);
+  let boundaryOffset = 0;
+  if (found?.filePath) {
+    try {
+      boundaryOffset = (await fs.promises.stat(found.filePath)).size;
+    } catch {}
+  }
+  const binding = {
+    tabId: exactTabId,
+    sessionId: exactSessionId,
+    generation,
+    cwd: cwd || null,
+    projectDir: found?.projectDir || null,
+    filePath: found?.filePath || null,
+    boundaryOffset,
+    consumerId: 'main:claude-background-work:' + exactTabId + ':' + exactSessionId,
+  };
+  claudeBackgroundTranscriptBindings.set(exactTabId, binding);
+  try {
+    const result = await transcriptService.subscribe({
+      toolType: 'claude',
+      tabId: exactTabId,
+      sessionId: exactSessionId,
+      cwd: cwd || null,
+      consumerId: binding.consumerId,
+    });
+    if (claudeBackgroundTranscriptBindings.get(exactTabId) !== binding) {
+      void transcriptService.unsubscribe({ consumerId: binding.consumerId }).catch(() => {});
+      return false;
+    }
+    if (result?.success !== true) {
+      claudeBackgroundTranscriptBindings.delete(exactTabId);
+      claudeBackgroundAgentActivity.clear(exactTabId, 'observer-subscribe-failed');
+      console.warn('[ClaudeBackgroundWork] subscribe failed tab='
+        + exactTabId.slice(-12) + ' session=' + exactSessionId.slice(0, 8)
+        + ' error=' + (result?.error || 'unknown'));
+      return false;
+    }
+    await catchUpClaudeBackgroundActivity(binding);
+    return true;
+  } catch (error) {
+    if (claudeBackgroundTranscriptBindings.get(exactTabId) === binding) {
+      claudeBackgroundTranscriptBindings.delete(exactTabId);
+      claudeBackgroundAgentActivity.clear(exactTabId, 'observer-subscribe-error');
+    }
+    console.warn('[ClaudeBackgroundWork] subscribe error tab='
+      + exactTabId.slice(-12) + ' session=' + exactSessionId.slice(0, 8)
+      + ' error=' + (error?.message || error));
+    return false;
+  }
+}
+
+function clearClaudeBackgroundActivityObserver(tabId, reason = 'process-ended') {
+  const binding = claudeBackgroundTranscriptBindings.get(tabId);
+  claudeBackgroundTranscriptBindings.delete(tabId);
+  clearClaudeBackgroundSidecarTimer(tabId);
+  claudeBackgroundAgentActivity.clear(tabId, reason);
+  if (binding) {
+    void transcriptService.unsubscribe({ consumerId: binding.consumerId }).catch(() => {});
+  }
+}
+
 const transcriptService = createSessionTranscriptService({
   getMainWindow: () => mainWindow,
   webBroadcast: (tabId, payload) => _webBroadcast(tabId, payload),
@@ -1532,6 +1819,38 @@ const transcriptService = createSessionTranscriptService({
       },
       { sessionId, hashText: pasteAuditHash },
     );
+    const providerQueueAccepted = carrier.kind === 'queue-operation';
+    if (
+      providerQueueAccepted
+      && selection.audit.sendOperationKey
+      && selection.audit.sendAttemptId
+    ) {
+      const queueReceipt = agentSendReceiptStore.markProviderQueueAccepted(
+        selection.audit.sendOperationKey,
+        selection.audit.sendAttemptId,
+        {
+          provider: 'claude',
+          sessionId,
+          entryUuid: record?.uuid || null,
+          recordByteOffset,
+          acceptedAt: record?.timestamp || null,
+        },
+      );
+      if (queueReceipt?.ok === true) {
+        console.log('[AgentSendReceipt] Claude provider queue accepted'
+          + ' operation=' + String(selection.audit.sendOperationKey).slice(0, 72)
+          + ' attempt=' + String(selection.audit.sendAttemptId).slice(0, 12)
+          + ' handoff=' + selection.audit.handoffId
+          + ' offset=' + String(recordByteOffset ?? '-')
+          + ' idempotent=' + (queueReceipt.idempotent === true));
+      } else {
+        console.warn('[AgentSendReceipt] Claude provider queue evidence not persisted'
+          + ' operation=' + String(selection.audit.sendOperationKey).slice(0, 72)
+          + ' attempt=' + String(selection.audit.sendAttemptId).slice(0, 12)
+          + ' handoff=' + selection.audit.handoffId
+          + ' reason=' + (queueReceipt?.reason || 'unknown'));
+      }
+    }
     if (confirmation) {
       const presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
         toolType: 'claude',
@@ -1558,12 +1877,18 @@ const transcriptService = createSessionTranscriptService({
       handoffId: selection.audit.handoffId,
       source: selection.audit.source || null,
       reason: selection.reason || selection.causality?.reason || null,
+      ...(providerQueueAccepted ? { deliveryStage: 'provider-queued' } : {}),
+      sendAttemptId: selection.audit.sendAttemptId || null,
+      sendOperationKey: selection.audit.sendOperationKey || null,
       sessionId,
       entryUuid: record?.uuid || null,
     };
   },
   onLiveMessage: (detail) => {
     observeTerminalHistoryCanonicalLiveMessage(detail);
+  },
+  onRawRecord: (detail) => {
+    observeClaudeBackgroundRawRecord(detail);
   },
   onChanged: (meta) => {
     claudeStartupProofSession?.handleTranscriptChanged(meta);
@@ -1580,6 +1905,7 @@ const transcriptService = createSessionTranscriptService({
   claudeData: require(path.join(srcMainDir, 'ipc', 'claude-data')),
   codexData: codexDataModule,
   promptPresentationStore: projectManager.db,
+  recoverManagedHistoryImageRef: (ref) => promptQueueAssetStore.existingManagedRefSync(ref),
 });
 // History projector memory budget (main process). Read ONCE at startup —
 // the setting's own UI says changes apply after a restart, and re-costing
@@ -1791,6 +2117,62 @@ function terminalHistoryStructuredBoundaryKind(message) {
   return null;
 }
 
+function collectTerminalHistoryStructuredProofStrings(value, output, depth = 0) {
+  if (output.length >= 64 || depth > 8 || value == null) return;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (text) output.push(text);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectTerminalHistoryStructuredProofStrings(
+      item,
+      output,
+      depth + 1,
+    );
+    return;
+  }
+  if (typeof value !== 'object') return;
+  for (const nested of Object.values(value)) {
+    collectTerminalHistoryStructuredProofStrings(nested, output, depth + 1);
+    if (output.length >= 64) break;
+  }
+}
+
+// Exact structured JSONL is not only a boundary: its payload is a receipt for
+// the tool/thinking projection which the TUI may paint later or leave behind
+// after scrolling. The controller keeps this bounded and in memory for the
+// active turn; it is never used to manufacture assistant text.
+function terminalHistoryStructuredProofTexts(message, kind) {
+  const content = message?.message?.content;
+  if (!Array.isArray(content) || !kind) return [];
+  const result = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    if (kind === 'tool-use' && block.type === 'tool_use') {
+      const inputStrings = [];
+      collectTerminalHistoryStructuredProofStrings(block.input, inputStrings);
+      result.push(...inputStrings);
+      const name = typeof block.name === 'string' ? block.name.trim() : '';
+      if (name && inputStrings.length > 0) {
+        result.push(name + '(' + inputStrings.join('\n') + ')');
+      }
+      try {
+        if (name && block.input && typeof block.input === 'object') {
+          result.push(name + '(' + JSON.stringify(block.input) + ')');
+        }
+      } catch {}
+    } else if (kind === 'tool-result' && block.type === 'tool_result') {
+      collectTerminalHistoryStructuredProofStrings(block.content, result);
+      collectTerminalHistoryStructuredProofStrings(block.result, result);
+    } else if (kind === 'thinking' && block.type === 'thinking') {
+      collectTerminalHistoryStructuredProofStrings(block.thinking, result);
+    }
+    if (result.length >= 64) break;
+  }
+  return result.slice(0, 64);
+}
+
 function observeTerminalHistoryCanonicalLiveMessage(detail) {
   const provider = detail?.toolType;
   if (provider !== 'claude' && provider !== 'codex') return false;
@@ -1803,16 +2185,33 @@ function observeTerminalHistoryCanonicalLiveMessage(detail) {
     sourceEndOffset: detail.recordEndByteOffset ?? detail.recordByteOffset,
     identity: message?.sourceIdentity || message?.uuid || message?.message?.id || null,
   };
+  const kind = terminalHistoryStructuredBoundaryKind(message);
+  const structuredTexts = terminalHistoryStructuredProofTexts(message, kind);
   const text = terminalHistoryAssistantText(message);
   if (text) {
-    return terminalHistoryPreviewController.observeCanonical({
+    const canonicalObserved = terminalHistoryPreviewController.observeCanonical({
       ...shared,
       canonicalText: text,
     });
+    if (!kind) return canonicalObserved;
+    // A Claude assistant record may contain prose and tool_use in one JSONL
+    // object. Canonicalize the prose first, then open the next structured
+    // segment using the same exact record without pretending it is a newer
+    // transcript sequence.
+    return terminalHistoryPreviewController.observeBoundary({
+      ...shared,
+      sourceSequence: null,
+      sourceEndOffset: null,
+      kind,
+      structuredTexts,
+    }) || canonicalObserved;
   }
-  const kind = terminalHistoryStructuredBoundaryKind(message);
   if (!kind) return false;
-  return terminalHistoryPreviewController.observeBoundary({ ...shared, kind });
+  return terminalHistoryPreviewController.observeBoundary({
+    ...shared,
+    kind,
+    structuredTexts,
+  });
 }
 
 function findTerminalPreviewCursorComposerRow(snapshot) {
@@ -1850,6 +2249,9 @@ function findTerminalHistoryPreviewComposerRow(snapshot, provider) {
 function readTerminalHistoryPreviewFrame({ state, snapshot }) {
   const viewportY = Number(snapshot?.viewportY);
   const lines = Array.isArray(snapshot?.lines) ? snapshot.lines : [];
+  const preViewportLines = Array.isArray(snapshot?.preViewportLines)
+    ? snapshot.preViewportLines
+    : [];
   if (!Number.isFinite(viewportY) || lines.length === 0) {
     return { status: 'ready', reason: 'committed-frame-empty', physicalLines: [] };
   }
@@ -1931,6 +2333,14 @@ function readTerminalHistoryPreviewFrame({ state, snapshot }) {
     const row = Number(line?.row);
     return row >= firstOwnedRow && (composerRow === null || row < composerRow);
   });
+  // Preserve a small read-only slice immediately before the exact boundary.
+  // It never becomes candidate output; the parser uses it only to prove that
+  // the first owned rows continue a provider-owned card whose root is above
+  // the marker/baseline (Claude Tip, Codex Updated Plan, tool child, etc.).
+  const leadingPhysicalLines = [...preViewportLines, ...lines].filter((line) => {
+    const row = Number(line?.row);
+    return row >= firstOwnedRow - 24 && row < firstOwnedRow;
+  });
   return {
     status: 'ready',
     reason: (boundaryKind === 'proven-output-continuation'
@@ -1938,6 +2348,7 @@ function readTerminalHistoryPreviewFrame({ state, snapshot }) {
       : 'owned-output-after-' + boundaryKind)
       + (composerRow === null ? '-composer-fallback' : '-cursor-composer-bound'),
     physicalLines,
+    leadingPhysicalLines,
     composerRow,
     boundaryKind,
     boundaryRow,
@@ -2019,6 +2430,175 @@ ipcMain.handle('agent-transcript:get-terminal-preview', (_event, payload = {}) =
     preview: preview?.phase === 'streaming' ? preview : null,
   };
 });
+
+function terminalHistoryPreviewDiagnosticNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeTerminalHistoryPreviewDiagnosticPreview(value) {
+  if (!value || typeof value !== 'object') return null;
+  const text = typeof value.text === 'string' ? value.text : '';
+  const maxTextChars = 256 * 1024;
+  const normalizedText = text.length <= maxTextChars
+    ? { text, chars: text.length, truncatedForDiagnostic: false }
+    : {
+      head: text.slice(0, maxTextChars / 2),
+      tail: text.slice(-maxTextChars / 2),
+      chars: text.length,
+      truncatedForDiagnostic: true,
+    };
+  return {
+    previewId: typeof value.previewId === 'string' ? value.previewId : null,
+    tabId: typeof value.tabId === 'string' ? value.tabId : null,
+    toolType: value.toolType === 'claude' || value.toolType === 'codex'
+      ? value.toolType
+      : null,
+    sessionId: typeof value.sessionId === 'string' ? value.sessionId : null,
+    turnId: typeof value.turnId === 'string' ? value.turnId : null,
+    lifecycleGeneration: typeof value.lifecycleGeneration === 'string'
+      ? value.lifecycleGeneration
+      : null,
+    mirrorGeneration: typeof value.mirrorGeneration === 'string'
+      ? value.mirrorGeneration
+      : null,
+    mirrorGenerationOrdinal: terminalHistoryPreviewDiagnosticNumber(
+      value.mirrorGenerationOrdinal,
+    ),
+    committedFrameGeneration: terminalHistoryPreviewDiagnosticNumber(
+      value.committedFrameGeneration,
+    ),
+    writeSeq: terminalHistoryPreviewDiagnosticNumber(value.writeSeq),
+    previewSeq: terminalHistoryPreviewDiagnosticNumber(value.previewSeq),
+    phase: value.phase === 'streaming' || value.phase === 'settled' ? value.phase : null,
+    textHash: typeof value.textHash === 'string' ? value.textHash : null,
+    startedAt: terminalHistoryPreviewDiagnosticNumber(value.startedAt),
+    updatedAt: terminalHistoryPreviewDiagnosticNumber(value.updatedAt),
+    reason: typeof value.reason === 'string' ? value.reason : null,
+    boundaryKind: typeof value.boundaryKind === 'string' ? value.boundaryKind : null,
+    boundaryRow: terminalHistoryPreviewDiagnosticNumber(value.boundaryRow),
+    truncated: value.truncated === true,
+    promptAuthority: typeof value.promptAuthority === 'string' ? value.promptAuthority : null,
+    ...normalizedText,
+  };
+}
+
+function terminalHistoryPreviewDiagnosticCommandState(tabId) {
+  const state = terminalCommandState.get(tabId) || null;
+  if (!state) return null;
+  return {
+    isRunning: state.isRunning === true,
+    runSeq: terminalHistoryPreviewDiagnosticNumber(state.runSeq),
+    lastExitCode: terminalHistoryPreviewDiagnosticNumber(state.lastExitCode),
+    lastCommand: typeof state.lastCommand === 'string' ? state.lastCommand.slice(0, 4096) : null,
+    lastCommandAt: terminalHistoryPreviewDiagnosticNumber(state.lastCommandAt),
+    activeCommandSource: typeof state.activeCommandSource === 'string'
+      ? state.activeCommandSource
+      : null,
+    activeCommand: typeof state.activeCommand === 'string'
+      ? state.activeCommand.slice(0, 4096)
+      : null,
+  };
+}
+
+async function captureTerminalHistoryPreviewDiagnostic(payload = {}) {
+  const tabId = String(payload?.tabId || '');
+  const toolType = payload?.toolType === 'claude' || payload?.toolType === 'codex'
+    ? payload.toolType
+    : null;
+  if (!tabId || !toolType) throw new TypeError('tabId and toolType are required');
+
+  const capturedAt = Date.now();
+  const incidentId = crypto.randomUUID();
+  const mirror = getHeadlessTerminalMirror(tabId);
+  const terminal = terminals.get(tabId) || null;
+  const presentedPreview = normalizeTerminalHistoryPreviewDiagnosticPreview(payload?.preview);
+  const currentPreview = normalizeTerminalHistoryPreviewDiagnosticPreview(
+    terminalHistoryPreviewController.get(tabId, toolType),
+  );
+  const identity = {
+    presentedPreviewId: presentedPreview?.previewId || null,
+    currentPreviewId: currentPreview?.previewId || null,
+    previewIdMatched: !!presentedPreview?.previewId
+      && presentedPreview.previewId === currentPreview?.previewId,
+    textHashMatched: !!presentedPreview?.textHash
+      && presentedPreview.textHash === currentPreview?.textHash,
+    lifecycleMatched: !!presentedPreview?.lifecycleGeneration
+      && presentedPreview.lifecycleGeneration === getTerminalLifecycleGeneration(tabId),
+    mirrorMatched: !!presentedPreview?.mirrorGeneration
+      && presentedPreview.mirrorGeneration === mirror?.generation,
+  };
+  const incident = {
+    reason: 'manual-preview-context-menu',
+    identity,
+    presentedPreview,
+    currentPreview,
+  };
+  const composerTrace = mirror?.composerForensics
+    ? snapshotTerminalComposerForensics(mirror.composerForensics, {
+      capturedAt,
+      incident,
+    })
+    : null;
+  const liveSnapshot = mirror
+    ? getHeadlessVisibleBufferSnapshot(tabId, 'manual-terminal-history-preview-diagnostic')
+    : null;
+  const diagnostic = {
+    incident,
+    terminal: {
+      exists: !!terminal,
+      pid: terminalHistoryPreviewDiagnosticNumber(terminal?.pid),
+      lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+      command: terminalHistoryPreviewDiagnosticCommandState(tabId),
+    },
+    mirror: mirror ? {
+      exists: true,
+      failed: mirror.failed === true,
+      disposed: mirror.disposed === true,
+      complete: mirror.complete === true,
+      incompleteReason: mirror.incompleteReason || null,
+      generation: mirror.generation || null,
+      generationOrdinal: terminalHistoryPreviewDiagnosticNumber(mirror.generationOrdinal),
+      writeSeq: terminalHistoryPreviewDiagnosticNumber(mirror.writeSeq),
+      flushedSeq: terminalHistoryPreviewDiagnosticNumber(mirror.flushedSeq),
+      committedFrameGeneration: terminalHistoryPreviewDiagnosticNumber(
+        mirror.committedFrameGeneration,
+      ),
+      pendingResizeWriteSeq: terminalHistoryPreviewDiagnosticNumber(
+        mirror.pendingResizeWriteSeq,
+      ),
+    } : { exists: false },
+    committedSnapshot: mirror?.lastCommittedVisibleSnapshot || null,
+    liveSnapshot,
+    redrawTrace: snapshotTerminalRedrawTrace(mirror?.redrawTrace, 48),
+    composerTrace,
+  };
+  const persisted = await persistTerminalHistoryPreviewDiagnostic({
+    logsDir: app.getPath('logs'),
+    tabId,
+    toolType,
+    incidentId,
+    capturedAt,
+    diagnostic,
+  });
+  const reference = buildTerminalHistoryPreviewDiagnosticReference({
+    ...persisted,
+    tabId,
+    toolType,
+    sessionId: presentedPreview?.sessionId || currentPreview?.sessionId || null,
+    turnId: presentedPreview?.turnId || currentPreview?.turnId || null,
+    previewId: presentedPreview?.previewId || currentPreview?.previewId || null,
+  });
+  console.log('[TerminalHistoryPreview] DIAGNOSTIC_SAVED'
+    + ' tab=' + tabId.slice(-12)
+    + ' provider=' + toolType
+    + ' preview=' + String(presentedPreview?.previewId || '-').slice(-18)
+    + ' currentMatched=' + identity.previewIdMatched
+    + ' transitions=' + String(composerTrace?.transitions?.length || 0)
+    + ' path=' + JSON.stringify(persisted.artifactPath));
+  return { ...persisted, reference };
+}
 
 function getTerminalLifecycleGeneration(tabId) {
   const terminal = terminals.get(tabId) || null;
@@ -2953,6 +3533,172 @@ async function captureAgentDraftForensicArtifact(
       + ' error=' + (error?.message || String(error)));
     return null;
   }
+}
+
+function sampleTerminalSendForensicText(value, maxChars = 64 * 1024) {
+  if (typeof value !== 'string') return null;
+  const sample = {
+    chars: value.length,
+    hash: pasteAuditHash(value),
+    truncated: value.length > maxChars,
+  };
+  if (value.length <= maxChars) return { ...sample, text: value };
+  const half = Math.floor(maxChars / 2);
+  return {
+    ...sample,
+    head: value.slice(0, half),
+    tail: value.slice(-half),
+  };
+}
+
+async function removeClaudePostEnterForensicArtifact(audit, artifactPath, reason) {
+  if (!artifactPath) return false;
+  try {
+    const removed = await removeTerminalSendForensicArtifact(artifactPath);
+    if (removed) {
+      console.log('[ClaudePostEnterForensics] removed-after-proof'
+        + ' handoff=' + (audit?.handoffId || '-')
+        + ' reason=' + reason
+        + ' path=' + JSON.stringify(artifactPath));
+    }
+    if (audit?.postEnterForensicArtifactPath === artifactPath) {
+      audit.postEnterForensicArtifactPath = null;
+    }
+    return removed;
+  } catch (error) {
+    console.warn('[ClaudePostEnterForensics] remove-failed'
+      + ' handoff=' + (audit?.handoffId || '-')
+      + ' reason=' + reason
+      + ' path=' + JSON.stringify(artifactPath)
+      + ' error=' + (error?.message || String(error)));
+    return false;
+  }
+}
+
+function discardClaudePostEnterForensicArtifact(audit, reason = 'delivery-confirmed') {
+  if (!audit) return;
+  audit.postEnterForensicDiscardRequested = true;
+  if (audit.postEnterForensicArtifactPath) {
+    void removeClaudePostEnterForensicArtifact(
+      audit,
+      audit.postEnterForensicArtifactPath,
+      reason,
+    );
+  }
+  if (audit.postEnterForensicArtifactPromise) {
+    void audit.postEnterForensicArtifactPromise.then((artifactPath) => (
+      removeClaudePostEnterForensicArtifact(audit, artifactPath, reason)
+    ));
+  }
+}
+
+async function persistClaudePostEnterForensicArtifact({
+  tabId,
+  audit,
+  result,
+  capture,
+  transcriptRead,
+}) {
+  if (!audit || audit.result?.success === true || audit.postEnterForensicDiscardRequested === true) {
+    return null;
+  }
+  if (audit.postEnterForensicArtifactPromise) {
+    return audit.postEnterForensicArtifactPromise;
+  }
+
+  audit.postEnterForensicArtifactPromise = (async () => {
+    const state = getHeadlessTerminalMirror(tabId);
+    if (!state?.composerForensics) return null;
+    const capturedAt = Date.now();
+    const incident = {
+      error: result?.error || null,
+      code: result?.code || null,
+      semanticStatus: result?.semanticStatus || null,
+      final: result?.final === true,
+      composerDraftState: result?.composerDraftState || null,
+      expectedLen: audit.expectedLen ?? null,
+      expectedHash: audit.expectedHash || null,
+      expectedImagePathCount: result?.expectedImagePathCount ?? null,
+      capturedImageCount: result?.capturedImageCount ?? null,
+      capture: {
+        success: capture?.success === true,
+        proofOutcome: capture?.proofOutcome || null,
+        terminalIdentityStable: capture?.terminalIdentityStable === true,
+        editorReturnReady: capture?.editorReturnReady === true,
+        images: Number(capture?.images || 0),
+        error: capture?.error || null,
+        text: sampleTerminalSendForensicText(capture?.text),
+      },
+      transcript: {
+        success: transcriptRead?.success === true,
+        userRecordCount: Number(transcriptRead?.userRecordCount || 0),
+        transcriptPath: transcriptRead?.transcriptPath || null,
+        error: transcriptRead?.error || null,
+      },
+      headlessAtIncident: buildHeadlessDraftProofDiagnostic(
+        tabId,
+        capture,
+        'claude-post-enter-unconfirmed',
+      ),
+    };
+    const trace = snapshotTerminalComposerForensicWindow(state.composerForensics, {
+      capturedAt,
+      inputId: audit.forensicEnterInputId,
+      handoffId: audit.handoffId,
+      sendAttemptId: audit.sendAttemptId,
+      sendOperationKey: audit.sendOperationKey,
+      incident,
+    });
+    if (!trace) return null;
+    try {
+      const artifactPath = await persistTerminalSendForensicArtifact({
+        logsDir: app.getPath('logs'),
+        tabId,
+        provider: 'claude',
+        attempt: {
+          enterInputId: audit.forensicEnterInputId,
+          handoffId: audit.handoffId,
+          sendAttemptId: audit.sendAttemptId,
+          sendOperationKey: audit.sendOperationKey,
+          sentAt: audit.sentAt,
+        },
+        incident,
+        trace,
+        capturedAt,
+      });
+      audit.postEnterForensicArtifactPath = artifactPath;
+      if (audit.postEnterForensicDiscardRequested === true || audit.result?.success === true) {
+        await removeClaudePostEnterForensicArtifact(
+          audit,
+          artifactPath,
+          'late-delivery-confirmed',
+        );
+        return null;
+      }
+      console.error('[ClaudePostEnterForensics] saved'
+        + ' tab=' + String(tabId).slice(-12)
+        + ' handoff=' + (audit.handoffId || '-')
+        + ' enterInput=' + (audit.forensicEnterInputId ?? '-')
+        + ' transitions=' + trace.transitions.length
+        + ' inputs=' + trace.inputs.length
+        + ' path=' + JSON.stringify(artifactPath));
+      return artifactPath;
+    } catch (error) {
+      console.error('[ClaudePostEnterForensics] save-failed'
+        + ' tab=' + String(tabId).slice(-12)
+        + ' handoff=' + (audit.handoffId || '-')
+        + ' error=' + (error?.message || String(error)));
+      return null;
+    }
+  })().catch((error) => {
+    console.error('[ClaudePostEnterForensics] snapshot-failed'
+      + ' tab=' + String(tabId).slice(-12)
+      + ' handoff=' + (audit.handoffId || '-')
+      + ' error=' + (error?.message || String(error)));
+    return null;
+  });
+
+  return audit.postEnterForensicArtifactPromise;
 }
 
 ipcMain.on('terminal:draft-screen-diagnostic-response', (event, payload = {}) => {
@@ -4199,11 +4945,24 @@ function getHeadlessVisibleBufferSnapshot(tabId, reason, { preferCommitted = tru
     for (let i = Math.max(0, startLine - 2); i < startLine; i++) {
       const line = buf.getLine(i);
       if (!line) continue;
-      preViewportLines.push({
+      const text = line.translateToString(true);
+      const row = {
         row: i,
-        text: line.translateToString(true),
+        text,
         wrapped: !!line.isWrapped,
-      });
+      };
+      if (String(text || '').trim()) {
+        const summary = summarizeXtermLineStyles(line);
+        row.firstTextStyle = summary.firstTextStyle;
+        row.styles = summary.styles;
+        row.hasInverse = summary.hasInverse;
+        row.hasNonDefaultBg = summary.hasNonDefaultBg;
+        row.hasNonDefaultFg = summary.hasNonDefaultFg;
+        row.hasDim = summary.hasDim;
+        row.allTextDim = summary.allTextDim;
+        row.styleCellCount = summary.textCellCount;
+      }
+      preViewportLines.push(row);
     }
     const lines = [];
     let codexActivePrompt = null;
@@ -4394,7 +5153,12 @@ function claudeMissingPromptControlSurfaceActive(tabId, snapshot) {
     || inspectClaudeAutoModeDefaultPromptSnapshot(snapshot).visible === true;
 }
 
-function classifyClaudeMissingPromptCaptureForTab(tabId, snapshot, proof) {
+function classifyClaudeMissingPromptCaptureForTab(
+  tabId,
+  snapshot,
+  proof,
+  ownedWriteOperation = null,
+) {
   const term = terminals.get(tabId) || null;
   const launch = claudeLaunchGenerationByTab.get(tabId) || null;
   const startupGate = claudeStartupDefaultsGateByTab.get(tabId) || null;
@@ -4409,10 +5173,11 @@ function classifyClaudeMissingPromptCaptureForTab(tabId, snapshot, proof) {
       || claudePendingQuestion.has(tabId),
     stopping: aiStoppingTabs.get(tabId)?.toolType === 'claude',
     rewindActive: rewind?.toolType === 'claude',
-    writeOperationActive: !!term && (
-      !!ptyActiveWriteOperation.get(term)
-      || !!ptyLastQueuedWriteOperation.get(term)
-    ),
+    writeOperationActive: !!term && hasConflictingPtyWriteOperation({
+      activeOperation: ptyActiveWriteOperation.get(term) || null,
+      lastQueuedOperation: ptyLastQueuedWriteOperation.get(term) || null,
+      ownedOperation: ownedWriteOperation,
+    }),
     startupGateReady: !!launch?.generation
       && claudePromptReady.has(tabId)
       && startupGate?.generation === launch.generation
@@ -7934,10 +8699,23 @@ function startSessionBridge() {
       const oldSessionId = bridgeKnownSessions.get(tabId);
       if (oldSessionId === data.session_id) {
         claudeStartupIntents.delete(tabId);
+        // The observer is main-owned and idempotent. Reasserting it on the
+        // bridge heartbeat repairs a missed initial subscription without
+        // making History visibility part of background-agent liveness.
+        void ensureClaudeBackgroundActivityObserver(
+          tabId,
+          data.session_id,
+          terminalProjects.get(tabId) || data.cwd || null,
+        );
         return;
       }
 
       bridgeKnownSessions.set(tabId, data.session_id);
+      void ensureClaudeBackgroundActivityObserver(
+        tabId,
+        data.session_id,
+        terminalProjects.get(tabId) || data.cwd || null,
+      );
       claudeStartupIntents.delete(tabId);
       clearClaudePendingJsonlOwner(data.session_id, tabId, 'bridge-detected');
       console.log('[Bridge] Tab', tabId, '-> session:', data.session_id.substring(0, 8) + '...', '(model:', data.model + ', ctx:', data.context_pct + '%)');
@@ -8018,6 +8796,7 @@ function clearBridgeTab(tabId) {
       + ' pending=' + questionExit.hadPendingQuestion);
   }
   bridgeKnownSessions.delete(tabId);
+  clearClaudeBackgroundActivityObserver(tabId, 'bridge-clear');
   claudeStartupIntents.delete(tabId);
   claudeStartupDefaultsGateByTab.delete(tabId);
   clearClaudePendingJsonlOwnersForTab(tabId, 'bridge-clear');
@@ -8866,6 +9645,7 @@ function invalidateCodexWriterProof(tabId, reason = 'unproven') {
 
 function clearCodexKnownSession(tabId, reason = 'clear') {
   closeCodexDelayedWriterObserver(tabId, reason);
+  clearCodexTabSubagentActivity(tabId, 'known-session-clear:' + reason);
   const sid = codexKnownSessions.get(tabId) || null;
   clearCodexServiceTierLaunchCandidate(tabId, 'known-writer-cleared:' + reason);
   clearCodexServiceTierProof(tabId, 'known-writer-cleared:' + reason);
@@ -11686,6 +12466,9 @@ function startClaudeHookServer() {
         }
 
         const busy = event === 'UserPromptSubmit';
+        const internalAgentContinuationKind = busy
+          ? claudeInternalAgentContinuationKind(submitted_prompt)
+          : null;
         const prev = claudeTurnBusy.get(tabId);
         claudeTurnBusy.set(tabId, busy);
         if (!busy) {
@@ -11811,6 +12594,13 @@ function startClaudeHookServer() {
         // we can spot "UserPromptSubmit while prev=true" (Claude's submit-interrupt
         // path which skips stopHooks) without re-parsing line context.
         console.log('[ClaudeHook] #' + eventSeq + ' ' + event + ' tab=' + tabId.slice(-12) + ' session=' + session_id.slice(0, 8) + ' prev=' + (prev === undefined ? 'undef' : prev) + ' busy=' + busy + (prev === busy ? ' (no change)' : '') + (latency !== null ? ' latency=' + latency + 'ms' : ''));
+        if (internalAgentContinuationKind) {
+          console.log('[OrchestrationInternalWork] exact Claude continuation tab='
+            + tabId.slice(-12)
+            + ' session=' + session_id.slice(0, 8)
+            + ' kind=' + internalAgentContinuationKind
+            + ' turn=' + String(taskTurnId || '-'));
+        }
 
         // ----- Reuse existing claude:busy-state pipeline -----
         // Stop/StopFailure must force loader off, even if spinner glyph still pulses one last frame.
@@ -11862,6 +12652,8 @@ function startClaudeHookServer() {
           processId: ppid || null,
           turnGeneration: taskTurnSnapshot?.generation || null,
           turnStartedAt: taskTurnSnapshot?.startedAt || null,
+          internalAgentContinuation: internalAgentContinuationKind || null,
+          backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId),
         });
         if (!busy) {
           _webBroadcast(tabId, {
@@ -11873,6 +12665,7 @@ function startClaudeHookServer() {
             processId: ppid || null,
             turnGeneration: taskTurnSnapshot?.generation || null,
             turnStartedAt: taskTurnSnapshot?.startedAt || null,
+            backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId),
           });
         }
         // Activity tracking — authoritative turn edges (idempotent recorder).
@@ -13042,6 +13835,58 @@ ipcMain.on('show-history-entry-context-menu', (event, { copyText } = {}) => {
   menu.popup({ window: BrowserWindow.fromWebContents(event.sender) });
 });
 
+ipcMain.on('show-terminal-history-preview-context-menu', (event, payload = {}) => {
+  const sender = event.sender;
+  const tabId = String(payload?.tabId || '');
+  const toolType = payload?.toolType === 'claude' || payload?.toolType === 'codex'
+    ? payload.toolType
+    : null;
+  if (!tabId || !toolType) return;
+  const selectionText = typeof payload?.selectionText === 'string'
+    ? payload.selectionText.slice(0, 1024 * 1024)
+    : '';
+  const reply = (detail) => {
+    if (!sender.isDestroyed()) {
+      sender.send('agent-transcript:terminal-preview-diagnostic-result', {
+        tabId,
+        toolType,
+        ...detail,
+      });
+    }
+  };
+  const template = [];
+  if (selectionText) {
+    template.push({
+      label: 'Copy selected text',
+      click: () => clipboard.writeText(selectionText),
+    });
+    template.push({ type: 'separator' });
+  }
+  template.push({
+    label: 'Save & copy diagnostic reference',
+    click: async () => {
+      try {
+        const result = await captureTerminalHistoryPreviewDiagnostic(payload);
+        // The clipboard is the acknowledgement boundary: never publish a
+        // reference to an artifact which failed to reach disk.
+        clipboard.writeText(result.reference);
+        reply({ success: true, ...result });
+      } catch (error) {
+        console.error('[TerminalHistoryPreview] DIAGNOSTIC_SAVE_FAILED'
+          + ' tab=' + tabId.slice(-12)
+          + ' provider=' + toolType
+          + ' error=' + (error?.message || String(error)));
+        reply({
+          success: false,
+          error: error?.message || String(error),
+        });
+      }
+    },
+  });
+  const menu = Menu.buildFromTemplate(template);
+  menu.popup({ window: BrowserWindow.fromWebContents(sender) });
+});
+
 // Actions for a paste anchor sitting inside the composer text. The marker is
 // painted by a click-through highlight layer, so it cannot host its own
 // buttons; right-click on it opens this menu instead.
@@ -13397,7 +14242,18 @@ function _groupIntoTurns(branch) {
         continue;
       }
       const carrier = extractClaudePromptCarrier(entry);
-      if (!carrier) continue;
+      if (!carrier) {
+        const internalKind = claudeInternalAgentContinuationKindFromEntry(entry);
+        if (current && internalKind) {
+          current.internalContinuationCount += 1;
+          current.internalContinuationKinds.push(internalKind);
+          // An end_turn before a background-agent notification is only the end
+          // of that slice. Completion must be proven again after the newest
+          // structural continuation carrier.
+          current.completionAssistantUuids = [];
+        }
+        continue;
+      }
       const text = carrier.text;
       flush();
       const isCompactSummary = carrier.kind === 'compact_summary';
@@ -13414,6 +14270,9 @@ function _groupIntoTurns(branch) {
         textBlocks: [],       // {idx, chars, preview}
         toolUses: [],         // {idx, name}
         assistantUuids: [],
+        completionAssistantUuids: [],
+        internalContinuationCount: 0,
+        internalContinuationKinds: [],
         assistantModel: null,
       };
     } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
@@ -13435,6 +14294,7 @@ function _groupIntoTurns(branch) {
     } else if (entry.type === 'assistant') {
       if (!current) continue;
       current.assistantUuids.push(entry.uuid);
+      current.completionAssistantUuids.push(entry.uuid);
       if (entry.message?.model && !current.assistantModel) {
         current.assistantModel = entry.message.model;
       }
@@ -13978,25 +14838,22 @@ async function _getAgentTurnResultForOrchestration({
       }
     }
   }
-  const blocks = _collectAssistantBlocks(match.turn, data.recordMap).text
-    .map((text) => String(text || '').trim())
-    .filter(Boolean);
-  const joined = blocks.join('\n\n');
-  const limit = Math.max(500, Math.min(250_000, Number(maxChars) || 100_000));
-  const truncated = joined.length > limit;
-  const assistantText = joined.length <= limit
-    ? joined
-    : joined.slice(0, Math.floor(limit * 0.4)).trimEnd() + '\n…\n' + joined.slice(-(limit - Math.floor(limit * 0.4) - 3)).trimStart();
+  const claudeResult = materializeClaudeOrchestrationTurn(
+    match.turn,
+    data.recordMap,
+    maxChars,
+  );
   return {
     found: true,
-    complete: _claudeTurnHasCompletionProof(match.turn, data.recordMap),
+    complete: claudeResult.complete,
     turnIndex: match.turnIndex,
     userUuid: match.turn.userUuid,
     promptCarrierKind: match.turn.promptCarrierKind || match.turn.kind,
-    assistantText,
-    assistantChars: joined.length,
-    truncated,
-    assistantBlockCount: blocks.length,
+    assistantText: claudeResult.assistantText,
+    assistantChars: claudeResult.assistantChars,
+    truncated: claudeResult.truncated,
+    assistantBlockCount: claudeResult.assistantBlockCount,
+    internalContinuationCount: claudeResult.internalContinuationCount,
     sourceSnapshot: data.sourceSnapshot || null,
   };
 }
@@ -18443,6 +19300,9 @@ function finishClaudePasteAudit(tabId, audit, result, e2eBypass = false) {
   )) return;
   audit.finished = true;
   audit.result = result;
+  if (result?.success === true) {
+    discardClaudePostEnterForensicArtifact(audit, 'exact-user-turn-confirmed');
+  }
   wakeClaudePostEnterResolutionWaiter(audit, 'audit-finished');
   if (audit.timer) clearTimeout(audit.timer);
   audit.timer = null;
@@ -18611,7 +19471,7 @@ async function inspectClaudePostEnterTimeoutAtWriteBoundary({
     acceptedResult: audit?.finished === true ? audit.result : null,
     turnBusy: claudeTurnBusy.get(tabId) === true,
   });
-  const result = {
+  let result = {
     ...timeoutResult,
     ...outcome,
     pasteWritten: true,
@@ -18629,12 +19489,33 @@ async function inspectClaudePostEnterTimeoutAtWriteBoundary({
       error: capture?.error || null,
     },
   };
+  const diagnosticArtifactPath = await persistClaudePostEnterForensicArtifact({
+    tabId,
+    audit,
+    result,
+    capture,
+    transcriptRead,
+  });
+  if (audit?.finished === true && audit.result?.success === true) return audit.result;
+  if (diagnosticArtifactPath) {
+    result = {
+      ...result,
+      diagnosticArtifactPath,
+    };
+  }
   if (outcome.final === true && outcome.semanticStatus === 'not-submitted') {
+    const settlementReason = outcome.composerDraftState === 'exact-provider-image-transform'
+      ? 'exact-provider-image-transform-remained-without-user-turn'
+      : 'exact-original-draft-remained-without-user-turn';
+    console.warn('[ClaudePostEnterOutcome] final-not-submitted tab=' + String(tabId).slice(-12)
+      + ' state=' + outcome.composerDraftState
+      + ' expectedImages=' + (outcome.expectedImagePathCount || 0)
+      + ' capturedImages=' + (outcome.capturedImageCount || 0));
     settleClaudePasteAuditWithoutProjection(
       tabId,
       audit,
       result,
-      'exact-original-draft-remained-without-user-turn',
+      settlementReason,
     );
   }
   return result;
@@ -20521,6 +21402,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
               }
             : null,
           freshHookRouteConfirmed: false,
+          forensicEnterInputId: null,
+          forensicEnterAt: null,
+          postEnterForensicArtifactPromise: null,
+          postEnterForensicArtifactPath: null,
+          postEnterForensicDiscardRequested: false,
         };
         enqueueClaudePasteAudit(broadcastTabId, stagedClaudeAudit);
         const observer = await retainClaudePasteAuditTranscriptObserver(
@@ -20816,19 +21702,27 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       }
     }
     if (broadcastTabId) {
-      recordComposerForensicPtyInput(broadcastTabId, submitSequence, {
-        kind: submitSequence === '\r' || submitSequence === '\n'
-          ? 'programmatic-enter'
-          : 'programmatic-submit',
-        phase: 'pty-write-attempt',
-        origin: 'safe-paste',
-        source,
-        operationKind: sendOperationContext?.kind || 'safe-paste',
-        handoffId,
-        sendAttemptId,
-        sendOperationKey,
-        checkpoint: true,
-      });
+      const forensicSubmitInput = recordComposerForensicPtyInput(
+        broadcastTabId,
+        submitSequence,
+        {
+          kind: submitSequence === '\r' || submitSequence === '\n'
+            ? 'programmatic-enter'
+            : 'programmatic-submit',
+          phase: 'pty-write-attempt',
+          origin: 'safe-paste',
+          source,
+          operationKind: sendOperationContext?.kind || 'safe-paste',
+          handoffId,
+          sendAttemptId,
+          sendOperationKey,
+          checkpoint: true,
+        },
+      );
+      if (stagedClaudeAudit && forensicSubmitInput) {
+        stagedClaudeAudit.forensicEnterInputId = forensicSubmitInput.id;
+        stagedClaudeAudit.forensicEnterAt = forensicSubmitInput.at;
+      }
     }
     try {
       term.write(submitSequence);
@@ -22006,6 +22900,52 @@ ipcMain.handle('agent:acknowledge-send-receipt-presentation', async (_event, inp
     idempotent: result.idempotent === true,
     reason: result.reason || null,
     presentation: result.record?.presentation || null,
+  };
+});
+
+ipcMain.handle('agent:dismiss-send-receipt-presentation', async (_event, input = {}) => {
+  await agentSendReceiptStartupReady;
+  const tabId = typeof input.tabId === 'string' ? input.tabId.trim() : '';
+  const handoffId = typeof input.handoffId === 'string' ? input.handoffId.trim() : '';
+  if (!tabId || !handoffId) {
+    return { success: false, dismissed: false, reason: 'handoff-identity-required' };
+  }
+  // The immutable receipt surface describes where the send originated
+  // (History, Project API, iOS, Inbox). Dismissal belongs to the desktop
+  // History presentation and therefore must resolve the same handoff across
+  // every origin without rewriting that origin.
+  const matches = agentSendReceiptStore.list({ tabId })
+    .filter((record) => record.handoffId === handoffId);
+  if (matches.length !== 1) {
+    console.warn('[AgentSendReceipt] presentation dismiss rejected'
+      + ' tab=' + tabId.slice(-12)
+      + ' handoff=' + handoffId
+      + ' reason=' + (matches.length === 0 ? 'receipt-not-found' : 'receipt-ambiguous'));
+    return {
+      success: false,
+      dismissed: false,
+      reason: matches.length === 0 ? 'receipt-not-found' : 'receipt-ambiguous',
+    };
+  }
+  const record = matches[0];
+  const result = agentSendReceiptStore.dismissPresentation({
+    operationKey: record.operationKey,
+    attemptId: record.attemptId,
+    surface: DESKTOP_HISTORY_SEND_SURFACE,
+    tabId,
+    handoffId,
+  });
+  console.warn('[AgentSendReceipt] presentation dismiss'
+    + ' tab=' + tabId.slice(-12)
+    + ' handoff=' + handoffId
+    + ' applied=' + (result.applied === true ? '1' : '0')
+    + ' idempotent=' + (result.idempotent === true ? '1' : '0')
+    + ' reason=' + (result.reason || '-'));
+  return {
+    success: result.ok === true,
+    dismissed: result.applied === true || result.idempotent === true,
+    idempotent: result.idempotent === true,
+    reason: result.reason || null,
   };
 });
 
@@ -23301,6 +24241,7 @@ async function captureAgentInputAtWriteBoundary(
       tabId,
       currentSnapshot,
       currentProof,
+      options?.ownedWriteOperation || null,
     );
     const exactFrameStillCurrent = draftProofMatchesAtCapture === true
       && validateAgentInputFrameIdentity(tabId, draftProofCaptureIdentity);
@@ -23455,7 +24396,13 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
   };
   return withPtyWriteLock(
     term,
-    () => captureAgentInputAtWriteBoundary(tabId, mode, agent, options, term),
+    () => captureAgentInputAtWriteBoundary(
+      tabId,
+      mode,
+      agent,
+      { ...options, ownedWriteOperation: operation },
+      term,
+    ),
     operation,
   );
 }
@@ -24002,6 +24949,7 @@ ipcMain.handle('claude:append-input', async (event, tabId, text, options = {}) =
     logPrefix: '[append-input:' + tabId + (handoffId ? ':' + handoffId : '') + ']',
     handoffId,
     source,
+    presentationSnapshot: options?.presentationSnapshot || null,
   });
   if (result && typeof result === 'object') {
     if (!Object.prototype.hasOwnProperty.call(result, 'submitted')) {
@@ -24043,6 +24991,7 @@ ipcMain.handle('codex:append-input', async (_event, tabId, text, options = {}) =
     codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
     verifyCodexVisibleDraftBeforeSubmit: shouldSubmit,
     requestReceivedAt,
+    presentationSnapshot: options?.presentationSnapshot || null,
     logPrefix: '[codex:append-input:' + tabId + ']',
   });
   if (result && typeof result === 'object'
@@ -32104,6 +33053,7 @@ require(path.join(srcMainDir, 'ipc', 'claude-data')).register({
   formatToolAction,
   getClaudeEditableLastPromptState: (tabId, reason) =>
     getClaudeEditableLastPromptState(tabId, reason || 'claude-full-history-editable-last-prompt'),
+  recoverManagedHistoryImageRef: (ref) => promptQueueAssetStore.existingManagedRefSync(ref),
 });
 codexDataModule.register({ projectManager, transcriptService });
 transcriptService.registerIpc();
@@ -32678,6 +33628,10 @@ function inspectCodexStartupBlockersText(cleanText) {
   const modelMigrationPrompt = inspectCodexModelMigrationPrompt(text);
   if (modelMigrationPrompt.visible) {
     blockers.push('model-migration');
+  }
+  const resumeGoalPrompt = inspectCodexResumeGoalPrompt(text);
+  if (resumeGoalPrompt.interactiveVisible) {
+    blockers.push('resume-goal');
   }
   if (has(/Do\s+you\s+trust\s+the\s+contents|Working\s+with\s+untrusted\s+contents|Yes\s*,?\s*continue|No\s*,?\s*quit/i)) {
     blockers.push('trust-directory');
@@ -34113,7 +35067,7 @@ function isCodexTuiReadyRelevantFrame(clean, raw) {
   const text = String(clean || '').replace(/\u00a0/g, ' ');
   return String(raw || '').includes(CODEX_SYNC_MARKER)
     || (hasCodexComposerPromptGlyph(text) && !!parseCodexVerifiedComposerFooter(text))
-    || /OpenAI Codex|Sign in with ChatGPT|Sign in with Device Code|Provide your own API key|Press enter to continue|Use \/skills|Find and fix a bug|Explain this codebase|Ask Codex|directory:\s*|permissions:\s*|Update available|Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed|Try\s+new\s+model|Use\s+existing\s+model|Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt|Do you trust the contents|directory to resume this session|directory to fork this session/i.test(text);
+    || /OpenAI Codex|Sign in with ChatGPT|Sign in with Device Code|Provide your own API key|Press enter to continue|Use \/skills|Find and fix a bug|Explain this codebase|Ask Codex|directory:\s*|permissions:\s*|Update available|Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed|Try\s+new\s+model|Use\s+existing\s+model|Resume paused goal\?|Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt|Do you trust the contents|directory to resume this session|directory to fork this session/i.test(text);
 }
 
 function logCodexTuiReadyNotReady(tabId, inspected, raw, clean, phase) {
@@ -36817,6 +37771,7 @@ function recordCodexLiveSubagentOwnership(state, record) {
 
 function rearmCodexProcessActionBoundary(tabId, reason) {
   revokeCodexActionAuthoritiesForTab(tabId, 'process-boundary:' + reason);
+  clearCodexTabSubagentActivity(tabId, 'process-boundary:' + reason);
   const state = codexTurnWatchers.get(tabId);
   if (!state) return false;
   cancelCodexManualCompactPending(tabId, 'lifecycle-generation-changed');
@@ -36845,11 +37800,12 @@ function rearmCodexProcessActionBoundary(tabId, reason) {
 const codexTabLiveSubagents = new Map(); // tabId → Map<agentKey, {threadId}>
 
 function publishCodexSubagentActivity(tabId) {
-  const live = codexTabLiveSubagents.get(tabId);
-  const count = live ? live.size : 0;
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('tab:background-work', { tabId, count });
-  }
+  publishTabBackgroundWork(tabId, 'codex:rollout');
+}
+
+function clearCodexTabSubagentActivity(tabId, reason = 'process-ended') {
+  const had = codexTabLiveSubagents.delete(tabId);
+  if (had) publishTabBackgroundWork(tabId, 'codex:' + reason);
 }
 
 /**
@@ -36884,6 +37840,21 @@ function resolveCodexLiveAgentThreadId(tabId, callId) {
 ipcMain.handle('subagent:resolve-codex-thread', async (_event, { tabId, callId } = {}) => {
   if (!tabId) return { success: false, threadId: '' };
   return { success: true, threadId: resolveCodexLiveAgentThreadId(tabId, callId) };
+});
+
+ipcMain.handle('agent:list-background-work', async (_event, { tabIds = [] } = {}) => {
+  const requested = Array.isArray(tabIds)
+    ? [...new Set(tabIds.map((value) => String(value || '').trim()).filter(Boolean))]
+    : [];
+  return {
+    success: true,
+    revision: tabBackgroundWorkRevision,
+    records: requested.map((tabId) => ({
+      tabId,
+      count: getCombinedTabBackgroundWorkCount(tabId),
+      revision: tabBackgroundWorkRevisionByTab.get(tabId) || 0,
+    })),
+  };
 });
 
 function trackCodexTabSubagentActivity(state, record) {
@@ -43002,14 +43973,15 @@ function armCodexStartupAutoEnter(tabId, {
       'model-migration',
       'trust-directory',
       'cwd-chooser',
+      'resume-goal',
     ].includes(type)))
-    : new Set(['update-available', 'model-migration', 'trust-directory']);
+    : new Set(['update-available', 'model-migration', 'trust-directory', 'resume-goal']);
   if (!Array.isArray(requestedPromptTypes)
     && (normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f')
     && sessionId) {
     allowedPromptTypes.add('cwd-chooser');
   }
-  const ttlMs = allowedPromptTypes.has('cwd-chooser')
+  const ttlMs = allowedPromptTypes.has('cwd-chooser') || allowedPromptTypes.has('resume-goal')
     ? CODEX_STARTUP_AUTO_ENTER_TTL_MS
     : CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS;
   const state = {
@@ -43641,6 +44613,15 @@ async function maybeAdoptCodexStartupAutoEnterFromLivePrompt(tabId, inspected, s
         };
       }
     }
+    if (frameBlockers.includes('resume-goal')) {
+      const resumeGoalPrompt = inspectCodexResumeGoalPrompt(frameText);
+      if (resumeGoalPrompt.canAutoEnter) {
+        return {
+          promptType: 'resume-goal',
+          reason: resumeGoalPrompt.skipReason,
+        };
+      }
+    }
     return null;
   };
 
@@ -43764,6 +44745,10 @@ function detectCodexStartupAutoEnterPrompt(cleanText, state) {
   if (allowed.has('cwd-chooser') && !fired.has('cwd-chooser') && isCodexCwdChooser(cleanText)) {
     return 'cwd-chooser';
   }
+  if (allowed.has('resume-goal') && !fired.has('resume-goal')) {
+    const resumeGoalPrompt = inspectCodexResumeGoalPrompt(cleanText);
+    if (resumeGoalPrompt.canAutoEnter) return 'resume-goal';
+  }
   return null;
 }
 
@@ -43861,6 +44846,28 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
           ' target=' + (migrationPrompt.targetModel || 'unknown') +
           ' existing=' + (migrationPrompt.existingModel || 'unknown') +
           ' reason=' + (migrationPrompt.skipReason || 'unknown') +
+          ' preview=' + JSON.stringify(preview));
+      }
+    }
+  }
+  if (!promptType && state.allowedPromptTypes?.has('resume-goal') && !state.firedTypes?.has('resume-goal')) {
+    const resumeGoalPrompt = inspectCodexResumeGoalPrompt(clean);
+    if (resumeGoalPrompt.visible) {
+      const rejectKey = [
+        resumeGoalPrompt.firstOptionSelected ? 'first' : 'first0',
+        resumeGoalPrompt.secondOptionSelected ? 'second' : 'second0',
+        resumeGoalPrompt.skipReason || 'unknown',
+      ].join(':');
+      if (state.lastResumeGoalRejectKey !== rejectKey) {
+        state.lastResumeGoalRejectKey = rejectKey;
+        const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 260);
+        console.log('[CodexStartupPrompt] resume goal visible but not auto-confirmed tab=' + String(tabId).slice(-12) +
+          ' command=' + (state.command || 'unknown') +
+          ' source=' + source +
+          ' ageMs=' + ageMs +
+          ' firstSelected=' + resumeGoalPrompt.firstOptionSelected +
+          ' secondSelected=' + resumeGoalPrompt.secondOptionSelected +
+          ' reason=' + (resumeGoalPrompt.skipReason || 'unknown') +
           ' preview=' + JSON.stringify(preview));
       }
     }
@@ -43969,6 +44976,37 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
         }
         console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
         term.write('\r');
+      } else if (promptType === 'resume-goal') {
+        let currentScreen;
+        try {
+          currentScreen = await readCodexAuthoritativeScreen(
+            tabId,
+            'startup-resume-goal-action',
+          );
+        } catch (error) {
+          currentScreen = {
+            success: false,
+            error: error?.message || String(error),
+          };
+        }
+        if (codexStartupAutoEnter.get(tabId) !== state) return;
+        term = terminals.get(tabId);
+        const admission = decideCodexResumeGoalAutoEnter({
+          sameTerminal: !!expectedTerm && term === expectedTerm,
+          sameRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0) === expectedRunSeq,
+          sameInputRevision: getTerminalInputRevision(tabId) === expectedInputRevision,
+          screenAvailable: currentScreen?.success === true,
+          cleanText: currentScreen?.clean || '',
+        });
+        if (!admission.allowed) {
+          console.log('[CodexStartupPrompt] resume goal action cancelled after final revalidation tab=' + String(tabId).slice(-12)
+            + ' reason=' + admission.reason
+            + (currentScreen?.error ? ' screenError=' + currentScreen.error : ''));
+          clearCodexStartupAutoEnter(tabId, 'resume-goal-' + admission.reason);
+          return;
+        }
+        console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
+        term.write('\r');
       } else {
         console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
         term.write('\r');
@@ -43987,9 +45025,11 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
     if (remainingPromptTypes.length > 0) {
       state.raw = '';
       state.armedAt = Date.now();
-      const nextTtl = remainingPromptTypes.length === 1 && remainingPromptTypes[0] === 'cwd-chooser'
-        ? CODEX_POST_TRUST_AUTO_ENTER_TTL_MS
-        : CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS;
+      const nextTtl = remainingPromptTypes.includes('resume-goal')
+        ? CODEX_STARTUP_AUTO_ENTER_TTL_MS
+        : remainingPromptTypes.length === 1 && remainingPromptTypes[0] === 'cwd-chooser'
+          ? CODEX_POST_TRUST_AUTO_ENTER_TTL_MS
+          : CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS;
       scheduleCodexStartupAutoEnterTimeout(tabId, state, nextTtl);
       console.log('[CodexStartupPrompt] keep armed tab=' + String(tabId).slice(-12) + ' reason=await-' + remainingPromptTypes.join(',') + ' ttlMs=' + nextTtl);
       return;

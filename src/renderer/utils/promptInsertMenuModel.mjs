@@ -40,34 +40,27 @@ export function promptHasFileReferences(prompt) {
 }
 
 /**
- * Reference form of one attached file. Claude resolves `@path` natively and
- * attaches the file itself; the quotes are mandatory because unquoted refs are
- * truncated at the first space, which breaks every path with a space or emoji
- * in it. Other agents get the bare absolute path — `@"…"` is Claude syntax and
- * would reach them as literal decoration around the path.
+ * Cmd-pick is deliberately a plain-text path insertion, not a saved prompt
+ * attachment and not an agent-specific @mention. Keep each file on its own
+ * line so multiple attached files remain individually readable and editable.
  */
-export function formatPromptFileReference(filePath, agent) {
-  const raw = String(filePath || '').trim();
-  if (!raw) return '';
-  return agent === 'claude' ? `@"${raw}"` : raw;
+export function buildPromptFilePathText(filePaths) {
+  return (Array.isArray(filePaths) ? filePaths : [])
+    .map((path) => String(path || ''))
+    .filter((path) => path.trim().length > 0)
+    .join('\n');
 }
 
 /**
- * Cmd-pick payload: the prompt's own text verbatim, then its files as
- * references instead of inlined content. The trailing space after a Claude
- * `@"…"` ref is load-bearing — without it the file typeahead stays open on the
- * unterminated token and eats the next Enter instead of submitting.
+ * A macOS `/Users/...` path at the first visible composer position looks like
+ * a slash command to the shared composer guard. Prefix only that exact,
+ * case-sensitive path shape with `~`; paths inserted after real text must stay
+ * byte-for-byte unchanged.
  */
-export function buildPromptReferenceText(promptContent, filePaths, agent) {
-  const refs = (Array.isArray(filePaths) ? filePaths : [])
-    .map((path) => formatPromptFileReference(path, agent))
-    .filter((ref) => ref.length > 0);
-  const content = String(promptContent || '');
-  if (refs.length === 0) return content;
-  const body = [content, refs.join(agent === 'claude' ? ' ' : '\n')]
-    .filter((part) => part.length > 0)
-    .join('\n\n');
-  return agent === 'claude' ? `${body} ` : body;
+export function protectLeadingMacUsersPath(pathText, precedingText = '') {
+  const text = String(pathText || '');
+  if (!text.startsWith('/Users/')) return text;
+  return String(precedingText || '').trim().length === 0 ? `~${text}` : text;
 }
 
 export function joinPromptInsertionText(promptContent, fileContents) {
@@ -192,4 +185,15 @@ export function chooseContextMenuOpenLeft({
   const spaceRight = safeViewport - (rootLeft + safeRoot) - safeMargin;
   const spaceLeft = rootLeft - safeMargin;
   return spaceRight < safeDescendants && spaceLeft > spaceRight;
+}
+
+/**
+ * Keyboard movement and the visible chevron must follow the side where the
+ * child panel actually opens. The row layout does not mirror: the chevron
+ * remains in the trailing slot and only changes direction.
+ */
+export function resolveCascadingMenuDirection(opensLeft) {
+  return opensLeft
+    ? { forwardKey: 'ArrowLeft', backKey: 'ArrowRight', chevron: 'left' }
+    : { forwardKey: 'ArrowRight', backKey: 'ArrowLeft', chevron: 'right' };
 }

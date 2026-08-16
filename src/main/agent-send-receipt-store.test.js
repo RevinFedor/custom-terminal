@@ -136,6 +136,111 @@ test('beginAttempt creates one exact attempt and pending/unknown/confirmed state
   assert.equal(getUuidCount(), 1);
 });
 
+test('exact Claude queue acceptance survives the caller timeout without becoming final delivery proof', (t) => {
+  let time = 100;
+  const harness = openMemoryHarness(t, { now: () => time });
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'claude' }));
+  store.stageAttemptContext(begun.record.operationKey, begun.attemptId, {
+    promptText: 'wait behind the active Claude turn',
+    transcriptBoundary: { sessionId: 'session-a', fileSize: 42 },
+  });
+  store.markAttemptState(
+    begun.record.operationKey,
+    begun.attemptId,
+    STORE_STATES.ENTER_ARMED,
+  );
+
+  time = 110;
+  const accepted = store.markProviderQueueAccepted(
+    begun.record.operationKey,
+    begun.attemptId,
+    {
+      provider: 'claude',
+      sessionId: 'session-a',
+      entryUuid: 'queue-operation-a',
+      recordByteOffset: 84,
+      acceptedAt: '2026-08-16T01:58:27.200Z',
+    },
+  );
+  assert.equal(accepted.applied, true);
+  assert.equal(accepted.record.state, STORE_STATES.ENTER_ARMED);
+  assert.deepEqual(accepted.record.receipt.providerQueue, {
+    accepted: true,
+    provider: 'claude',
+    operationKey: begun.record.operationKey,
+    attemptId: begun.attemptId,
+    promptHash: 'hash-a',
+    acceptedAt: '2026-08-16T01:58:27.200Z',
+    observedAt: 110,
+    sessionId: 'session-a',
+    entryUuid: 'queue-operation-a',
+    recordByteOffset: 84,
+  });
+
+  time = 120;
+  const pending = store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+  assert.equal(pending.record.state, STORE_STATES.AUDIT_PENDING);
+  assert.equal(pending.record.receipt.providerQueue.entryUuid, 'queue-operation-a');
+  assert.equal(pending.record.receipt.auditPending, true,
+    'provider queue acceptance does not replace the canonical transcript audit');
+
+  const replay = store.markProviderQueueAccepted(
+    begun.record.operationKey,
+    begun.attemptId,
+    {
+      provider: 'claude',
+      sessionId: 'session-a',
+      entryUuid: 'queue-operation-a',
+      recordByteOffset: 84,
+    },
+  );
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.record.state, STORE_STATES.AUDIT_PENDING);
+
+  const conflict = store.markProviderQueueAccepted(
+    begun.record.operationKey,
+    begun.attemptId,
+    {
+      provider: 'claude',
+      sessionId: 'session-a',
+      entryUuid: 'foreign-queue-operation',
+      recordByteOffset: 96,
+    },
+  );
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.reason, 'provider-queue-identity-conflict');
+  assert.deepEqual(conflict.mismatchedFields, ['entryUuid', 'recordByteOffset']);
+});
+
+test('provider queue evidence cannot attach to another attempt or a non-Claude receipt', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'claude' }));
+
+  const stale = store.markProviderQueueAccepted(
+    begun.record.operationKey,
+    'foreign-attempt',
+    { provider: 'claude' },
+  );
+  assert.equal(stale.reason, 'stale-attempt');
+
+  const wrongProvider = store.markProviderQueueAccepted(
+    begun.record.operationKey,
+    begun.attemptId,
+    { provider: 'codex' },
+  );
+  assert.equal(wrongProvider.reason, 'provider-mismatch');
+  assert.equal(store.get(begun.record.operationKey).receipt, null);
+});
+
 test('exact post-Enter provider refusal terminalizes the same audit-pending attempt', (t) => {
   let time = 100;
   const harness = openMemoryHarness(t, { now: () => time });
@@ -196,6 +301,90 @@ test('incomplete post-Enter negative proof remains audit-pending', (t) => {
   );
   assert.equal(ambiguous.applied, false);
   assert.equal(ambiguous.record.state, STORE_STATES.AUDIT_PENDING);
+});
+
+test('startup reconciliation replaces an endless audit spinner with replay-safe unconfirmed state', (t) => {
+  let time = 100;
+  const harness = openMemoryHarness(t, { now: () => time });
+  if (!harness) return;
+  const { store, getUuidCount } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'claude' }));
+  store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    accepted: true,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+    promptText: 'exact original prompt',
+  });
+
+  time = 125;
+  const unconfirmed = store.markStartupUnconfirmed(
+    begun.record.operationKey,
+    begun.attemptId,
+    {
+      decision: 'absent',
+      reason: 'no-exact-post-boundary-candidate',
+      evidence: { boundaryOffset: 42, scanEndOffset: 84 },
+    },
+  );
+  assert.equal(unconfirmed.applied, true);
+  assert.equal(unconfirmed.record.state, STORE_STATES.DELIVERY_UNKNOWN);
+  assert.equal(unconfirmed.record.settledAt, null);
+  assert.equal(unconfirmed.record.receipt.submitted, true);
+  assert.equal(unconfirmed.record.receipt.auditPending, false);
+  assert.equal(unconfirmed.record.receipt.deliveryUnknown, true);
+  assert.equal(unconfirmed.record.receipt.accepted, null);
+  assert.equal(
+    unconfirmed.record.receipt.startupReconciliation.reason,
+    'no-exact-post-boundary-candidate',
+  );
+
+  const replay = store.beginAttempt(identity({ provider: 'claude' }));
+  assert.equal(replay.action, 'replay');
+  assert.equal(replay.retryable, false);
+  assert.equal(replay.record.attemptId, begun.attemptId);
+  assert.equal(getUuidCount(), 1, 'unconfirmed recovery must never create a retry attempt');
+
+  const promoted = store.promoteFromAudit(exactAudit(begun.attemptId, {
+    provider: 'claude',
+  }));
+  assert.equal(promoted.promoted, true, 'a later exact record may still resolve the receipt');
+  assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
+});
+
+test('startup unconfirmed transition cannot overwrite a settled receipt or a newer attempt', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'claude' }));
+  store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+  const stale = store.markStartupUnconfirmed(
+    begun.record.operationKey,
+    'foreign-attempt',
+    { decision: 'unknown', reason: 'test' },
+  );
+  assert.equal(stale.applied, false);
+  assert.equal(stale.reason, 'stale-attempt');
+  assert.equal(stale.record.state, STORE_STATES.AUDIT_PENDING);
+
+  const promoted = store.promoteFromAudit(exactAudit(begun.attemptId, {
+    provider: 'claude',
+  }));
+  assert.equal(promoted.promoted, true);
+  const afterConfirmed = store.markStartupUnconfirmed(
+    begun.record.operationKey,
+    begun.attemptId,
+    { decision: 'unknown', reason: 'late-startup-result' },
+  );
+  assert.equal(afterConfirmed.applied, false);
+  assert.equal(afterConfirmed.reason, 'already-confirmed');
+  assert.equal(afterConfirmed.record.state, STORE_STATES.CONFIRMED);
 });
 
 test('pre-Enter context binds the exact writer session and rejects a contradictory boundary', (t) => {
@@ -574,9 +763,102 @@ test('confirmed delivery is enriched with exact audit identity and presentation 
   assert.equal(acknowledged.ok, true);
   assert.equal(acknowledged.applied, true);
   assert.equal(acknowledged.record.presentation.attemptId, attempt.attemptId);
+  assert.equal(acknowledged.record.presentation.surface, 'desktop-history');
   assert.equal(acknowledged.record.presentation.entryUuid, 'entry-a');
   assert.equal(acknowledged.record.presentation.sourceIdentity, 'codex-user-source-session-a-4242');
   const replay = store.acknowledgePresentation(baseAck);
+  assert.equal(replay.ok, true);
+  assert.equal(replay.idempotent, true);
+});
+
+test('History dismissal is durable without changing delivery truth or external send ownership', (t) => {
+  let time = 100;
+  const harness = openMemoryHarness(t, { now: () => time });
+  if (!harness) return;
+  const { store, getUuidCount } = harness;
+  const attempt = store.beginAttempt(identity({
+    surface: 'project-api',
+    provider: 'claude',
+  }));
+  const settled = store.settleAttempt(attempt.record.operationKey, attempt.attemptId, {
+    success: null,
+    submitted: true,
+    status: 'delivery-unknown',
+    deliveryUnknown: true,
+    promptText: 'possibly delivered',
+  });
+  assert.equal(settled.record.state, STORE_STATES.DELIVERY_UNKNOWN);
+
+  time = 125;
+  const dismissed = store.dismissPresentation({
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+  });
+  assert.equal(dismissed.ok, true);
+  assert.equal(dismissed.applied, true);
+  assert.equal(dismissed.record.surface, 'project-api', 'the send origin remains unchanged');
+  assert.equal(dismissed.record.state, STORE_STATES.DELIVERY_UNKNOWN);
+  assert.equal(dismissed.record.receipt.presentationDismissedAt, 125);
+  assert.equal(dismissed.record.receipt.presentationDismissedSurface, 'desktop-history');
+
+  const replay = store.dismissPresentation({
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+  });
+  assert.equal(replay.ok, true);
+  assert.equal(replay.idempotent, true);
+  const retry = store.beginAttempt(identity({ surface: 'project-api', provider: 'claude' }));
+  assert.equal(retry.action, 'replay');
+  assert.equal(retry.retryable, false, 'hiding a warning must not authorize a blind resend');
+  assert.equal(getUuidCount(), 1);
+});
+
+test('canonical desktop History can acknowledge an exact Project API delivery', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const attempt = store.beginAttempt(identity({ surface: 'project-api', provider: 'claude' }));
+  const promoted = store.promoteFromAudit(exactAudit(attempt.attemptId, {
+    provider: 'claude',
+    sourceIdentity: null,
+  }));
+  assert.equal(promoted.promoted, true);
+
+  const acknowledged = store.acknowledgePresentation({
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    provider: 'claude',
+    sessionId: 'session-a',
+    entryUuid: 'entry-a',
+    sourceIdentity: null,
+  });
+
+  assert.equal(acknowledged.ok, true);
+  assert.equal(acknowledged.applied, true);
+  assert.equal(acknowledged.record.surface, 'project-api',
+    'the immutable send origin remains Project API');
+  assert.equal(acknowledged.record.presentation.surface, 'desktop-history',
+    'the canonical presentation surface is tracked separately');
+  const replay = store.acknowledgePresentation({
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+    provider: 'claude',
+    sessionId: 'session-a',
+    entryUuid: 'entry-a',
+    sourceIdentity: null,
+  });
   assert.equal(replay.ok, true);
   assert.equal(replay.idempotent, true);
 });
@@ -647,6 +929,7 @@ test('existing receipt tables migrate additively before statements are prepared'
     'audit_source_identity',
     'audit_timestamp',
     'presentation_attempt_id',
+    'presentation_surface',
     'presentation_entry_uuid',
     'presentation_source_identity',
     'presentation_at',

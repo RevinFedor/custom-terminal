@@ -43,7 +43,7 @@ test('exact original draft plus no post-boundary user turn is final not-submitte
   assert.equal(result.lateReconciliationPending, false);
 });
 
-test('changed or image-mixed composer remains unknown and preserved', () => {
+test('changed or unrelated image-mixed composer remains unknown and preserved', () => {
   const changed = classifyClaudePostEnterOutcome({
     expectedText: 'task body',
     capture: capture('someone else typed here'),
@@ -61,6 +61,66 @@ test('changed or image-mixed composer remains unknown and preserved', () => {
   assert.equal(mixed.final, false);
   assert.equal(mixed.composerDraftState, 'mixed-or-image-draft');
   assert.equal(mixed.pasteObservedInComposer, true);
+});
+
+test('Claude image-path conversion remains exact not-submitted proof', () => {
+  const expectedText = [
+    'Review these references:',
+    '- /tmp/noted-terminal-codex-image-input/first.png',
+    '- /tmp/noted-terminal-codex-image-input/second image.jpg',
+    'Return one report.',
+  ].join('\n');
+  const transformedDraft = [
+    '[Image #1] [Image #2]Review these references:',
+    '-',
+    '-',
+    'Return one report.',
+  ].join('\n');
+  const result = classifyClaudePostEnterOutcome({
+    expectedText,
+    capture: capture(transformedDraft, {
+      images: 2,
+      imagePaths: [
+        { id: 1, availability: 'available' },
+        { id: 2, availability: 'available' },
+      ],
+    }),
+    transcriptRead: { success: true, userRecordCount: 0 },
+  });
+
+  assert.equal(result.final, true);
+  assert.equal(result.semanticStatus, 'not-submitted');
+  assert.equal(result.composerDraftState, 'exact-provider-image-transform');
+  assert.equal(result.providerImageTransform, true);
+  assert.equal(result.expectedImagePathCount, 2);
+  assert.equal(result.capturedImageCount, 2);
+  assert.equal(result.draftPreserved, true);
+});
+
+test('extra or changed Claude images cannot manufacture exact draft proof', () => {
+  const expectedText = 'Review:\n- /tmp/first.png\nDone';
+  const result = classifyClaudePostEnterOutcome({
+    expectedText,
+    capture: capture('[Image #1] [Image #2]Review:\n-\nDone', { images: 2 }),
+    transcriptRead: { success: true, userRecordCount: 0 },
+  });
+
+  assert.equal(result.final, false);
+  assert.equal(result.semanticStatus, 'unknown');
+  assert.equal(result.composerDraftState, 'mixed-or-image-draft');
+});
+
+test('unresolved Claude image refs cannot terminalize the delivery proof', () => {
+  const expectedText = 'Review:\n- /tmp/first.png\nDone';
+  const result = classifyClaudePostEnterOutcome({
+    expectedText,
+    capture: capture('[Image #1]Review:\n-\nDone', { images: 1, imagePaths: [] }),
+    transcriptRead: { success: true, userRecordCount: 0 },
+  });
+
+  assert.equal(result.final, false);
+  assert.equal(result.semanticStatus, 'unknown');
+  assert.equal(result.composerDraftState, 'mixed-or-image-draft');
 });
 
 test('an empty composer cannot prove whether paste was missed or acceptance is merely late', () => {

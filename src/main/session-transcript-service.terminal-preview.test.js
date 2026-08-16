@@ -62,3 +62,49 @@ test('Claude live observer receives exact byte boundary before renderer fan-out'
   assert.equal(observed.message.uuid, 'assistant-a');
   assert.deepEqual(rendered, observed);
 });
+
+test('Claude raw observer receives hidden task notifications once per tab', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-raw-notification-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session-a.jsonl');
+  const record = {
+    type: 'attachment',
+    uuid: 'notification-a',
+    sessionId: 'session-a',
+    attachment: {
+      type: 'task_notification',
+      prompt: '<task-notification><tool-use-id>toolu_a</tool-use-id><status>completed</status></task-notification>',
+    },
+  };
+  const line = JSON.stringify(record) + '\n';
+  await fs.promises.writeFile(filePath, line);
+  const raw = [];
+  const rendered = [];
+  const service = new SessionTranscriptService({
+    getMainWindow: () => ({
+      isDestroyed: () => false,
+      webContents: { send: (...args) => rendered.push(args) },
+    }),
+    onRawRecord: (detail) => raw.push(detail),
+    claudeData: null,
+    codexData: null,
+  });
+
+  await service._broadcastClaudeDelta({
+    filePath,
+    size: Buffer.byteLength(line),
+    offset: 0,
+    leftover: '',
+    sessionId: 'session-a',
+    consumers: new Map([
+      ['history:tab-a', { tabId: 'tab-a' }],
+      ['timeline:tab-a', { tabId: 'tab-a' }],
+    ]),
+  }, 0);
+
+  assert.equal(raw.length, 1);
+  assert.equal(raw[0].tabId, 'tab-a');
+  assert.equal(raw[0].message.uuid, 'notification-a');
+  assert.equal(raw[0].recordByteOffset, 0);
+  assert.deepEqual(rendered, [], 'service-only notification stays hidden from renderer live rows');
+});

@@ -292,6 +292,36 @@ test('Codex startup accepts the nearest exact user message without reading hours
   assert.ok(result.evidence.postBoundaryBytes > result.evidence.bytesRead);
 });
 
+test('Claude startup accepts the nearest exact user message without reading hours of later tail', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-claude-bounded-');
+  const transcriptPath = path.join(dir, 'claude.jsonl');
+  const prompt = 'bounded Claude prompt';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(claudeUser('bounded-uuid', prompt)) + '\n'
+      + Array.from({ length: 8 }, (_, index) => JSON.stringify({
+        type: 'assistant',
+        uuid: `assistant-${index}`,
+        sessionId: 'claude-session',
+        timestamp: `2026-08-06T10:01:${String(index).padStart(2, '0')}.000Z`,
+        message: { role: 'assistant', content: 'x'.repeat(256) },
+      })).join('\n')
+      + '\n',
+  );
+
+  const result = await reconcileAgentSendStartupRecord(
+    unresolvedRecord('claude', boundary, prompt),
+    { maxReadBytes: 256 },
+  );
+  assert.equal(result.decision, 'found');
+  assert.equal(result.reason, 'exact-post-boundary-candidate');
+  assert.equal(result.audit.entryUuid, 'bounded-uuid');
+  assert.equal(result.evidence.rangeComplete, false);
+  assert.ok(result.evidence.postBoundaryBytes > result.evidence.bytesRead);
+});
+
 test('Codex startup never uses a later identical prompt when the nearest user message differs', async (t) => {
   const dir = await tempDir(t, 'agent-startup-causal-first-');
   const transcriptPath = path.join(dir, 'codex.jsonl');
@@ -306,6 +336,25 @@ test('Codex startup never uses a later identical prompt when the nearest user me
 
   const result = await reconcileAgentSendStartupRecord(
     unresolvedRecord('codex', boundary, prompt),
+  );
+  assert.equal(result.decision, 'unknown');
+  assert.equal(result.reason, 'first-post-boundary-user-message-mismatch');
+});
+
+test('Claude startup never uses a later identical prompt when the nearest user message differs', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-claude-causal-first-');
+  const transcriptPath = path.join(dir, 'claude.jsonl');
+  const prompt = 'do not steal a later Claude prompt';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(claudeUser('different-first', 'different earlier Claude operation')) + '\n'
+      + JSON.stringify(claudeUser('matching-later', prompt)) + '\n',
+  );
+
+  const result = await reconcileAgentSendStartupRecord(
+    unresolvedRecord('claude', boundary, prompt),
   );
   assert.equal(result.decision, 'unknown');
   assert.equal(result.reason, 'first-post-boundary-user-message-mismatch');
@@ -347,6 +396,75 @@ test('a later durable send boundary closes the exact causal range for an older C
   assert.equal(result.evidence.rangeComplete, true);
   assert.equal(result.evidence.candidateCount, 2);
   assert.equal(result.evidence.matchCount, 1);
+});
+
+test('a later durable send boundary closes the exact causal range for an older Claude receipt', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-claude-causal-upper-');
+  const transcriptPath = path.join(dir, 'claude.jsonl');
+  const firstPrompt = 'missing first Claude operation';
+  const secondPrompt = 'second Claude operation';
+  await fs.promises.writeFile(transcriptPath, '');
+  const firstBoundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(claudeUser('different-uuid', 'different earlier operation')) + '\n',
+  );
+  const secondBoundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(claudeUser('second-uuid', secondPrompt)) + '\n'
+      + JSON.stringify(claudeUser('late-first-uuid', firstPrompt)) + '\n',
+  );
+
+  const first = unresolvedRecord('claude', firstBoundary, firstPrompt, {
+    operationKey: 'history:tab-a:first-claude',
+    attemptId: 'attempt-first-claude',
+  });
+  const second = unresolvedRecord('claude', secondBoundary, secondPrompt, {
+    operationKey: 'history:tab-a:second-claude',
+    attemptId: 'attempt-second-claude',
+    state: 'confirmed',
+  });
+  const [result] = await reconcileAgentSendStartupRecords([first], {
+    allRecords: [first, second],
+  });
+  assert.equal(result.decision, 'absent');
+  assert.equal(result.reason, 'no-exact-post-boundary-candidate');
+  assert.equal(result.evidence.causalUpperBoundaryOffset, secondBoundary.fileSize);
+  assert.equal(result.evidence.scanEndOffset, secondBoundary.fileSize);
+  assert.equal(result.evidence.rangeComplete, true);
+  assert.equal(result.evidence.candidateCount, 1);
+  assert.equal(result.evidence.matchCount, 0);
+});
+
+test('a foreign Claude session boundary cannot close another receipt causal range', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-claude-foreign-upper-');
+  const transcriptPath = path.join(dir, 'claude.jsonl');
+  const prompt = 'first Claude operation';
+  await fs.promises.writeFile(transcriptPath, '');
+  const firstBoundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(claudeUser('different-uuid', 'different operation')) + '\n',
+  );
+  const foreignBoundary = {
+    ...(await captureClaudePromptAuditBoundary(transcriptPath)),
+    sessionId: 'foreign-claude-session',
+  };
+  const first = unresolvedRecord('claude', firstBoundary, prompt, {
+    operationKey: 'history:tab-a:first-claude-foreign-test',
+    attemptId: 'attempt-first-claude-foreign-test',
+  });
+  const foreign = unresolvedRecord('claude', foreignBoundary, 'foreign prompt', {
+    operationKey: 'history:tab-a:foreign-claude',
+    attemptId: 'attempt-foreign-claude',
+    sessionId: 'foreign-claude-session',
+    state: 'confirmed',
+  });
+  const [result] = await reconcileAgentSendStartupRecords([first], {
+    allRecords: [first, foreign],
+  });
+  assert.equal(result.evidence.causalUpperBoundaryOffset, null);
 });
 
 test('Codex startup stays unknown when no complete causal record fits the read ceiling', async (t) => {

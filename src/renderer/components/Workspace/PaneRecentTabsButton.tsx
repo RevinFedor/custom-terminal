@@ -161,7 +161,14 @@ export function PaneRecentTabsButton({ paneIndex, currentTabId }: Props) {
     const state = useWorkspaceStore.getState();
     const projects = Array.from(state.openProjects.entries()).map(([projectId, workspace]) => ({
       projectId,
-      projectName: projectsMeta[projectId]?.name || workspace.projectPath.split('/').filter(Boolean).pop() || 'Project',
+      // projectPath can be missing on a workspace that is being torn down (the
+      // project was just closed, or its record went away while its tabs were
+      // still mounted): reading `.split` off undefined crashed the whole
+      // window through the error boundary — a list of tabs must never be able
+      // to take the app down.
+      projectName: projectsMeta[projectId]?.name
+        || (workspace.projectPath || '').split('/').filter(Boolean).pop()
+        || 'Project',
       projectIcon: projectsMeta[projectId]?.icon || null,
       tabs: Array.from(workspace.tabs.values()).map((tab) => ({
         id: tab.id,

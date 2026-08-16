@@ -4,6 +4,7 @@ const {
   hasCodexComposerPromptGlyph,
   parseCodexVerifiedComposerFooter,
 } = require('./codex-tui-readiness');
+const { inspectCodexResumeGoalPrompt } = require('./codex-resume-goal-prompt');
 
 const CODEX_ALL_MODELS_VALUE = 'all-models';
 const CODEX_MORE_REASONING_VALUE = 'more-reasoning';
@@ -547,6 +548,13 @@ function isCodexActivePickerFrame(cleanText) {
 
 function classifyCodexManualEnterFrame(cleanText) {
   const text = String(cleanText || '');
+  if (inspectCodexResumeGoalPrompt(text).interactiveVisible) {
+    return {
+      action: 'picker-control',
+      kind: 'resume-goal',
+      reason: 'resume-goal-picker',
+    };
+  }
   if (inspectCodexModelMigrationPrompt(text).visible) {
     return {
       action: 'specialized-control',

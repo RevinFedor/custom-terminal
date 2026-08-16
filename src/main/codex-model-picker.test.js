@@ -447,6 +447,23 @@ test('manual Enter leaves migration and Rewind pickers to their specialized cont
   assert.equal(classifyCodexManualEnterFrame(rewindFrame).kind, 'native-rewind');
 });
 
+test('manual Enter on Resume paused goal remains a UI control, not a prompt submit', () => {
+  const resumeGoalFrame = [
+    'Resume paused goal?',
+    'Goal: Finish the lifecycle repair',
+    '',
+    '› 1. Resume goal  Mark it active and continue when idle',
+    '  2. Leave paused Keep it paused; use /goal resume later',
+    '',
+    'Press enter to confirm or esc to go back',
+  ].join('\n');
+  assert.deepEqual(classifyCodexManualEnterFrame(resumeGoalFrame), {
+    action: 'picker-control',
+    kind: 'resume-goal',
+    reason: 'resume-goal-picker',
+  });
+});
+
 test('optional quick-auto gate accepts selected All models without inventing a row from wrapped current model', () => {
   const frame = [
     'Select Model',

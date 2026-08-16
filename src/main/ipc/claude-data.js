@@ -33,9 +33,11 @@ const {
   promoteQueuedCompactEntry,
 } = require('../claude-compact-queue-projection');
 const { applyHistoryEntryWindow } = require('../history-entry-window');
+const { classifyHistoryAction } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
 
 let _projectManager = null;
 let _getClaudeEditableLastPromptState = null;
+let _recoverManagedHistoryImageRef = null;
 
 let _localPerfOpSeq = 0;
 function _beginPerfOp(kind, detail = {}) {
@@ -1754,6 +1756,7 @@ const _api = {
   deriveClaudeAsyncAgentStatus,
   buildClaudeTaskNotificationIndex,
   extractClaudeTaskNotificationTexts,
+  parseClaudeTaskNotification,
   readClaudeStoppedAgentToolUseIds,
   invalidateJsonlCache: invalidateClaudeJsonlCache,
   clearJsonlCache: clearClaudeJsonlCache,
@@ -1915,9 +1918,17 @@ async function _validateClaudeHistoryTopology(sources, cwd) {
   return true;
 }
 
-function register({ projectManager, formatToolAction, getClaudeEditableLastPromptState }) {
+function register({
+  projectManager,
+  formatToolAction,
+  getClaudeEditableLastPromptState,
+  recoverManagedHistoryImageRef,
+}) {
   _projectManager = projectManager;
   _getClaudeEditableLastPromptState = typeof getClaudeEditableLastPromptState === 'function' ? getClaudeEditableLastPromptState : null;
+  _recoverManagedHistoryImageRef = typeof recoverManagedHistoryImageRef === 'function'
+    ? recoverManagedHistoryImageRef
+    : null;
 
   // Export a range of messages from Claude session
   ipcMain.handle('claude:copy-range', async (event, {
@@ -4083,6 +4094,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         toolType: 'claude',
         sessionId,
         entries,
+        recoverManagedImageRef: _recoverManagedHistoryImageRef,
       });
 
       // Claude's own backtrace stops at the first orphan — everything before
@@ -5367,6 +5379,19 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           let textContent = '';
           const thinkingParts = [];
           const actions = [];
+          // Thinking duration ≈ gap from the PREVIOUS record's timestamp to
+          // this one: Claude writes the thinking record when the block
+          // finishes, so the gap covers the reasoning time (median 10.7s,
+          // p90 160s over the probe session). Rounded, floor 1s; shown as
+          // «thinking · 12s» in the feed header.
+          let thinkingSeconds;
+          if (i > 0) {
+            const prevTs = Date.parse(historyBranch[i - 1]?.timestamp || '');
+            const ownTs = Date.parse(entry.timestamp || '');
+            if (Number.isFinite(prevTs) && Number.isFinite(ownTs) && ownTs > prevTs) {
+              thinkingSeconds = Math.max(1, Math.round((ownTs - prevTs) / 1000));
+            }
+          }
 
           if (typeof msgContent === 'string') {
             textContent = msgContent;
@@ -5490,6 +5515,12 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                   // MCP…) renders as a real card with the proper LCS diff / Prism
                   // output, mirroring the SDK tab.
                   const rr = findToolResult();
+                  // Grouping identity for the display projection: family
+                  // (read/search/git/run/edit/mcp/plan/web) + the parsed
+                  // MCP server·method. Stamped by the parser because the
+                  // renderer must be able to group stub rows that carry no
+                  // args at all (row-window contract).
+                  const classified = classifyHistoryAction({ toolName: name, args: input });
                   actions.push({
                     tool: '__raw__',
                     rawTool: {
@@ -5499,6 +5530,11 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                       toolUseId: block.id,
                       toolName: name,
                       args: input,
+                      family: classified.family,
+                      bashWord: classified.bashWord,
+                      bashDetail: classified.bashDetail,
+                      mcpServer: classified.mcpServer,
+                      mcpMethod: classified.mcpMethod,
                       result: rr ? rr.text : undefined,
                       isError: rr ? rr.isError : undefined,
                       diffHunks: rr ? rr.diffHunks : undefined,
@@ -5511,16 +5547,30 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
             textContent = textParts.join('\n\n');
           }
 
-          if (textContent.trim() || actions.length > 0) {
+          if (textContent.trim() || actions.length > 0 || thinkingParts.length > 0) {
             appendProjectedEntry({
               uuid: entry.uuid,
               role: 'assistant',
               timestamp: entry.timestamp || '',
               content: textContent.trim(),
+              // Thinking lives in its OWN JSONL record on modern Claude (343
+              // of 343 records in the probe session are thinking-only, tied
+              // to the response's text/tool records by message.id). Dropping
+              // rows with neither text nor calls therefore dropped almost all
+              // reasoning; a thinking-only record now projects as its own
+              // assistant row.
               thinking: thinkingParts.length > 0 ? thinkingParts.join('\n\n---\n\n') : undefined,
+              thinkingSeconds: thinkingParts.length > 0 ? thinkingSeconds : undefined,
               actions: actions.length > 0 ? actions : undefined,
               sessionId: entrySid,
               recordByteOffset: entry.__byteOffset,
+              // One model response spans several JSONL records (thinking /
+              // text / tool_use each in its own record, same message.id).
+              // The display projection needs this to tell a CAPTION — text
+              // in the same response as its tool calls, i.e. "now I'll do X"
+              // — from a standalone reply (a message id with no tool_use).
+              // Corpus: 4 698 captions vs 26 standalone replies.
+              messageId: entry.message?.id || undefined,
             });
           }
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
@@ -5608,6 +5658,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         toolType: 'claude',
         sessionId,
         entries: historyWindow.entries,
+        recoverManagedImageRef: _recoverManagedHistoryImageRef,
       });
       let responseTimingBound = false;
       const timedEntries = decorateHistoryResponseTimings(_projectManager?.db, {

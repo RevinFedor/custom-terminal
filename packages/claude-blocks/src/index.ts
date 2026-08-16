@@ -14,8 +14,8 @@ export { ToolCard, ColoredToolIcon, type ToolCardProps } from './components/Tool
 export { DiffView } from './components/DiffView';
 export {
   ToolCallPart,
-  BashCard, ReadCard, EditCard, GenericToolCard,
-  type ToolCallProps, type CollapseInjection,
+  BashCard, ReadCard, EditCard, GenericToolCard, McpToolCard,
+  type ToolCallProps, type CollapseInjection, type ActionHeadline,
 } from './components/ToolCards';
 export {
   ConversationMessage,
@@ -53,7 +53,9 @@ export type {
 export {
   TerminalIcon, FileEditIcon, FileTextIcon, FolderSearchIcon, SearchIcon,
   GlobeIcon, BrainIcon, Loader2Icon, AlertTriangleIcon, CopyIcon, CheckIcon,
-  RefreshCwIcon, PencilIcon, XIcon, SparklesIcon, toolIcon,
+  RefreshCwIcon, PencilIcon, XIcon, SparklesIcon, PlugIcon, GitBranchIcon,
+  StackIcon, ChecklistIcon, ChevronRightIcon, CompressIcon,
+  toolIcon,
   type IconProps,
 } from './icons';
 

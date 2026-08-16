@@ -3,9 +3,11 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  claudeInternalAgentContinuationKind,
   extractClaudeQueueOperationPromptText,
   extractClaudePromptCarrier,
   findMatchingClaudePromptTurn,
+  isClaudeInternalAgentContinuationCarrier,
   isClaudeTaskNotificationCarrier,
   promptFingerprint,
   selectClaudeQueuedPromptIndex,
@@ -105,6 +107,38 @@ test('recognizes historical task-notification carriers even without commandMode'
   assert.equal(isClaudeTaskNotificationCarrier(standalone), true);
   assert.equal(extractClaudePromptCarrier(queued), null);
   assert.equal(extractClaudePromptCarrier(standalone), null);
+});
+
+test('a queued Claude agent-message continues the current orchestration turn', () => {
+  const record = {
+    type: 'attachment',
+    uuid: 'agent-message',
+    attachment: {
+      type: 'queued_command',
+      prompt: '<agent-message from="general-purpose">\nfinal report\n</agent-message>',
+    },
+  };
+
+  assert.equal(
+    claudeInternalAgentContinuationKind(record.attachment.prompt),
+    'agent-message',
+  );
+  assert.equal(isClaudeInternalAgentContinuationCarrier(record), true);
+  assert.equal(isClaudeTaskNotificationCarrier(record), false);
+  assert.equal(extractClaudePromptCarrier(record), null);
+});
+
+test('agent-message lookalikes remain ordinary queued user prompts', () => {
+  const record = {
+    type: 'attachment',
+    uuid: 'literal-example',
+    attachment: {
+      type: 'queued_command',
+      prompt: 'Example: <agent-message from="x">not a complete carrier',
+    },
+  };
+  assert.equal(isClaudeInternalAgentContinuationCarrier(record), false);
+  assert.equal(extractClaudePromptCarrier(record)?.kind, 'queued_command');
 });
 
 test('does not treat tool results as prompt carriers', () => {

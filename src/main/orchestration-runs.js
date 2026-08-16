@@ -125,6 +125,19 @@ function executionContextsMatch(left, right) {
     && a.processId === b.processId);
 }
 
+function executionContextOwnersMatch(left, right) {
+  const a = normalizeExecutionContext(left);
+  const b = normalizeExecutionContext(right);
+  if (!a || !b || a.provider !== b.provider || a.sessionId !== b.sessionId) return false;
+  if (a.processId && b.processId && a.processId !== b.processId) return false;
+  return true;
+}
+
+function runExecutionContextMatches(run, executionContext) {
+  return executionContextsMatch(run?.targetExecutionContext, executionContext)
+    || executionContextsMatch(run?.targetContinuationExecutionContext, executionContext);
+}
+
 function promptProofExecutionContext(run, proof = {}) {
   if (proof.executionContext == null) {
     return { context: null, reason: 'target-execution-context-unavailable' };
@@ -814,6 +827,10 @@ class OrchestrationRunStore {
         : this.settings.autoStopCreatedTargets,
       targetBusySeen: false,
       waitingForPriorTurn: false,
+      waitingForInternalDescendants: false,
+      internalBackgroundWorkCount: 0,
+      internalContinuationCountSeen: 0,
+      internalContinuationBaseline: 0,
       outcome: null,
       ownCompletedAt: null,
       resultPromptHash: null,
@@ -828,6 +845,7 @@ class OrchestrationRunStore {
       sourceFollowupProofKind: null,
       sourceExecutionContext,
       targetExecutionContext: normalizeExecutionContext(input.targetExecutionContext),
+      targetContinuationExecutionContext: null,
     };
     this.runs.set(run.runId, run);
     if (options.persistStrict === true) {
@@ -1452,10 +1470,29 @@ class OrchestrationRunStore {
         : { changed: false };
     if (activityResult.changed) this._schedulePersist();
     const executionContext = lifecycleExecutionContext(payload);
-    let head = this._headForTarget(tabId, executionContext, payload.type);
+    const internalContinuation = this._internalContinuationForTarget(
+      tabId,
+      executionContext,
+      payload,
+    );
+    let head = internalContinuation
+      || this._headForTarget(tabId, executionContext, payload.type);
     const changed = [];
     const settled = [];
     const now = Date.now();
+    const internalContinuationAdopted = Boolean(internalContinuation);
+
+    if (internalContinuation) {
+      head.targetContinuationExecutionContext = executionContext;
+      head.waitingForInternalDescendants = false;
+      head.internalBackgroundWorkCount = Math.max(
+        0,
+        Number(payload.backgroundWorkCount) || 0,
+      );
+      head.internalContinuationCountSeen = Number(head.internalContinuationCountSeen || 0) + 1;
+      head.updatedAt = now;
+      this._pushChanged(changed, head);
+    }
 
     if (!head) {
       const recoveryContinuation = this._interruptedRecoveryForTarget(
@@ -1533,7 +1570,11 @@ class OrchestrationRunStore {
           head.resumedTurnStartedAt = executionContext?.startedAt || now;
           head.startedAt ||= now;
           head.sessionId = sessionId;
-          head.targetExecutionContext = executionContext || head.targetExecutionContext || null;
+          if (!head.targetExecutionContext) {
+            head.targetExecutionContext = executionContext || null;
+          } else if (internalContinuationAdopted) {
+            head.targetContinuationExecutionContext = executionContext;
+          }
           head.updatedAt = now;
           this._pushChanged(changed, head);
         }
@@ -1547,12 +1588,34 @@ class OrchestrationRunStore {
           const outcome = outcomeForReason(payload.reason);
           head.targetBusySeen = false;
           head.sessionId = sessionId;
-          head.ownCompletedAt = now;
-          head.completionReason = payload.reason || 'turn-complete';
-          if (outcome === 'success') {
+          const backgroundWorkCount = Math.max(0, Number(payload.backgroundWorkCount) || 0);
+          const provider = head.targetToolType
+            || executionContext?.provider
+            || normalizeExecutionContext(head.targetExecutionContext)?.provider
+            || null;
+          if (outcome === 'success' && provider === 'claude' && backgroundWorkCount > 0) {
+            head.status = 'running';
+            head.outcome = null;
+            head.ownCompletedAt = null;
+            head.completionReason = null;
+            head.waitingForInternalDescendants = true;
+            head.internalBackgroundWorkCount = backgroundWorkCount;
+            head.internalContinuationBaseline = Number(head.internalContinuationCountSeen || 0);
+            head.internalTurnStoppedAt = now;
+            head.updatedAt = now;
+            this._pushChanged(changed, head);
+          } else if (outcome === 'success') {
+            head.waitingForInternalDescendants = false;
+            head.internalBackgroundWorkCount = backgroundWorkCount;
+            head.ownCompletedAt = now;
+            head.completionReason = payload.reason || 'turn-complete';
             head.outcome = 'success';
             this._settleSuccessfulRun(head, changed, settled, now);
           } else {
+            head.waitingForInternalDescendants = false;
+            head.internalBackgroundWorkCount = backgroundWorkCount;
+            head.ownCompletedAt = now;
+            head.completionReason = payload.reason || 'turn-complete';
             this._beginRecovery(head, outcome, payload.reason || 'target turn aborted', changed, settled, now);
           }
           this._refreshAncestors(head.parentRunId, changed, settled, now);
@@ -1716,6 +1779,16 @@ class OrchestrationRunStore {
     const settled = [];
     const resultFound = observation.resultFound === true;
     const resultComplete = observation.resultComplete === true;
+    const resultInternalContinuationCount = Math.max(
+      0,
+      Number(observation.internalContinuationCount) || 0,
+    );
+    const internalContinuationAdvanced = resultInternalContinuationCount
+      > Number(run?.internalContinuationBaseline || 0);
+    const resultCompletionBlockedByInternalWork = run?.waitingForInternalDescendants === true
+      && !internalContinuationAdvanced;
+    const effectiveResultComplete = resultComplete
+      && !resultCompletionBlockedByInternalWork;
     const resultTerminalEvent = typeof observation.resultTerminalEvent === 'string'
       ? observation.resultTerminalEvent.trim()
       : '';
@@ -1765,7 +1838,7 @@ class OrchestrationRunStore {
         );
         this._refreshAncestors(run.parentRunId, changed, settled, now);
       }
-    } else if (resultFound && resultComplete && !canExactResultResolveRecovery(run)) {
+    } else if (resultFound && effectiveResultComplete && !canExactResultResolveRecovery(run)) {
       // Provider failure, explicit interruption and startup failure are durable
       // recovery decisions. A later result from the same still-running process
       // cannot silently rewrite them as success; only an explicit recovery can
@@ -1778,8 +1851,14 @@ class OrchestrationRunStore {
         ignored: true,
         ignoreReason: 'recovery-requires-explicit-resolution',
       };
-    } else if (resultFound && resultComplete) {
+    } else if (resultFound && effectiveResultComplete) {
       run.waitingForPriorTurn = false;
+      run.waitingForInternalDescendants = false;
+      run.internalBackgroundWorkCount = 0;
+      run.internalContinuationCountSeen = Math.max(
+        Number(run.internalContinuationCountSeen || 0),
+        resultInternalContinuationCount,
+      );
       run.targetBusySeen = true;
       run.resultAvailable = observation.resultAvailable !== false;
       run.resultTurnIndex = Number.isInteger(observation.turnIndex) ? observation.turnIndex : run.resultTurnIndex;
@@ -1827,7 +1906,7 @@ class OrchestrationRunStore {
       this._pushChanged(changed, run);
     }
     const canAdoptObservedSession = (resultFound
-        && (resultComplete || terminalFailureReason))
+        && (effectiveResultComplete || terminalFailureReason))
       || generationCheck.verdict === 'match'
       || generationCheck.verdict === 'not-required';
     if (observation.sessionId && canAdoptObservedSession) {
@@ -2330,7 +2409,7 @@ class OrchestrationRunStore {
     });
     if (executionContext) {
       const exact = eligible.filter((run) => (
-        executionContextsMatch(run.targetExecutionContext, executionContext)
+        runExecutionContextMatches(run, executionContext)
       ));
       if (exact.length === 1) return exact[0];
       if (exact.length > 1) return null;
@@ -2350,6 +2429,23 @@ class OrchestrationRunStore {
       return run;
     }
     return null;
+  }
+
+  _internalContinuationForTarget(tabId, executionContext, payload = {}) {
+    if (payload.type !== 'busy'
+      || payload.busy !== true
+      || !payload.internalAgentContinuation) return null;
+    const exactContext = normalizeExecutionContext(executionContext);
+    if (!exactContext?.sessionId) return null;
+    const candidates = this._executionsForTarget(tabId).filter((run) => {
+      if (run.waitingForInternalDescendants !== true || run.targetBusySeen === true) return false;
+      if (run.targetToolType && run.targetToolType !== exactContext.provider) return false;
+      if (!executionContextOwnersMatch(run.targetExecutionContext, exactContext)) return false;
+      const generationCheck = lifecycleGenerationCheck(run, payload.lifecycleGeneration);
+      return generationCheck.verdict === 'match'
+        || generationCheck.verdict === 'not-required';
+    });
+    return candidates.length === 1 ? candidates[0] : null;
   }
 
   _interruptedRecoveryForTarget(tabId, executionContext, payload = {}) {

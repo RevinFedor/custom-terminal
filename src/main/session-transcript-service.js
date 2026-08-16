@@ -154,10 +154,12 @@ class SessionTranscriptService {
     webBroadcast,
     onChanged = null,
     onLiveMessage = null,
+    onRawRecord = null,
     resolveClaudePromptOwner = null,
     claudeData,
     codexData,
     promptPresentationStore = null,
+    recoverManagedHistoryImageRef = null,
     idleGraceMs = IDLE_STATE_GRACE_MS,
     idleStateMax = IDLE_STATE_MAX,
   }) {
@@ -165,12 +167,16 @@ class SessionTranscriptService {
     this.webBroadcast = webBroadcast;
     this.onChanged = typeof onChanged === 'function' ? onChanged : null;
     this.onLiveMessage = typeof onLiveMessage === 'function' ? onLiveMessage : null;
+    this.onRawRecord = typeof onRawRecord === 'function' ? onRawRecord : null;
     this.resolveClaudePromptOwner = typeof resolveClaudePromptOwner === 'function'
       ? resolveClaudePromptOwner
       : null;
     this.claudeData = claudeData;
     this.codexData = codexData;
     this.promptPresentationStore = promptPresentationStore;
+    this.recoverManagedHistoryImageRef = typeof recoverManagedHistoryImageRef === 'function'
+      ? recoverManagedHistoryImageRef
+      : null;
     this.sessions = new Map();
     this.sessionInitInflight = new Map();
     this.consumerToKey = new Map();
@@ -441,6 +447,7 @@ class SessionTranscriptService {
         toolType,
         sessionId,
         entries,
+        recoverManagedImageRef: this.recoverManagedHistoryImageRef,
       });
       const finalPresentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
@@ -482,6 +489,7 @@ class SessionTranscriptService {
         toolType,
         sessionId,
         entries,
+        recoverManagedImageRef: this.recoverManagedHistoryImageRef,
       }),
       sessionId,
       toolType,
@@ -586,6 +594,7 @@ class SessionTranscriptService {
         toolType,
         sessionId,
         entries,
+        recoverManagedImageRef: this.recoverManagedHistoryImageRef,
       });
       let responseTimingBound = false;
       const timedEntries = decorateHistoryResponseTimings(this.promptPresentationStore, {
@@ -1128,6 +1137,33 @@ class SessionTranscriptService {
       } catch {
         continue;
       }
+      // Main-owned lifecycle observers need service records that History
+      // intentionally hides (notably task-notification attachments). Publish
+      // the raw record once per distinct tab before the renderer projection
+      // filter; renderer fan-out below remains unchanged.
+      const tabIds = new Set(
+        Array.from(state.consumers.values())
+          .map((consumer) => String(consumer?.tabId || ''))
+          .filter(Boolean),
+      );
+      if (this.onRawRecord) {
+        for (const tabId of tabIds) {
+          try {
+            this.onRawRecord({
+              tabId,
+              toolType: 'claude',
+              sessionId: state.sessionId,
+              timestamp: record.timestamp || new Date().toISOString(),
+              recordByteOffset,
+              recordEndByteOffset,
+              message: record,
+            });
+          } catch (error) {
+            console.warn('[TranscriptService:ClaudeDelta] raw observer failed tab='
+              + shortId(tabId) + ' error=' + (error?.message || error));
+          }
+        }
+      }
       const content = record?.message?.content;
       const hasToolResult = record?.type === 'user'
         && Array.isArray(content)
@@ -1152,11 +1188,6 @@ class SessionTranscriptService {
       // session for one tab. A JSONL record is a tab event, not a subscriber
       // event: replaying `dequeue` once per consumer advances multiple queued
       // prompts. Fan out once per distinct tab instead.
-      const tabIds = new Set(
-        Array.from(state.consumers.values())
-          .map((consumer) => String(consumer?.tabId || ''))
-          .filter(Boolean),
-      );
       for (const tabId of tabIds) {
         let promptOwner = null;
         if (this.resolveClaudePromptOwner && (isOrdinaryUser || isQueueOperation || isQueuedCommand)) {

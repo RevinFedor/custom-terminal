@@ -14,9 +14,20 @@ test('Claude orchestration turn grouping uses the shared prompt-carrier classifi
   const grouping = mainSource.slice(start, end);
 
   assert.match(grouping, /const carrier = extractClaudePromptCarrier\(entry\);/);
-  assert.match(grouping, /if \(!carrier\) continue;/);
+  assert.match(grouping, /claudeInternalAgentContinuationKindFromEntry\(entry\)/);
+  assert.match(grouping, /current\.completionAssistantUuids = \[\];/);
   assert.ok(
-    grouping.indexOf('if (!carrier) continue;') < grouping.indexOf('flush();'),
-    'service carriers must be rejected before the current turn is flushed',
+    grouping.indexOf('if (!carrier) {') < grouping.indexOf('flush();'),
+    'service carriers must be handled before the current turn is flushed',
   );
+});
+
+test('Claude result proof materializes the continuation-aware turn projection', () => {
+  const start = mainSource.indexOf('async function _getAgentTurnResultForOrchestration');
+  const end = mainSource.indexOf('\nasync function handleOverseerRequest', start);
+  assert.ok(start >= 0 && end > start, 'could not isolate orchestration result reader');
+  const reader = mainSource.slice(start, end);
+
+  assert.match(reader, /materializeClaudeOrchestrationTurn\(/);
+  assert.match(reader, /internalContinuationCount: claudeResult\.internalContinuationCount/);
 });

@@ -135,6 +135,14 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
       spinning: true,
     };
   }
+  if (run.status === 'sent' && run.deliveryAuditPendingAt && !run.targetPromptProofAt) {
+    return {
+      color: '#fbbf24',
+      icon: 'loading',
+      label: 'Проверка доставки',
+      spinning: true,
+    };
+  }
   if (hasSourceNotificationError(run, tabId)) {
     const unconfirmed = run.notificationStatus === 'unconfirmed';
     return {

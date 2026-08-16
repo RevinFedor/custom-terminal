@@ -3,15 +3,16 @@ import assert from 'node:assert/strict';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
-  buildPromptReferenceText,
+  buildPromptFilePathText,
   captureHistoryMenuAnchor,
   chooseContextMenuOpenLeft,
   clampFloatingPanelTop,
-  formatPromptFileReference,
   isCurrentPickerGeneration,
   joinPromptInsertionText,
   placePointAnchoredMenu,
+  protectLeadingMacUsersPath,
   promptHasFileReferences,
+  resolveCascadingMenuDirection,
   resolveHistoryScriptCwd,
 } from './promptInsertMenuModel.mjs';
 
@@ -36,23 +37,21 @@ test('joinPromptInsertionText keeps prompt and file order with readable gaps', (
   );
 });
 
-test('a path with spaces stays one Claude reference, other agents get it bare', () => {
+test('Cmd insertion keeps a path with spaces as plain editable text', () => {
   const spaced = '/Users/fedor/Global-Templates/🧩 Code-Patterns/docs-rules.prompt.md';
-  assert.equal(formatPromptFileReference(spaced, 'claude'), `@"${spaced}"`);
-  assert.equal(formatPromptFileReference(spaced, 'codex'), spaced);
-  assert.equal(formatPromptFileReference('   ', 'claude'), '');
+  assert.equal(buildPromptFilePathText([spaced]), spaced);
 });
 
-test('reference insertion keeps prompt text and never inlines the file', () => {
-  const text = buildPromptReferenceText('Review this', ['/tmp/a.md', '/tmp/b.md'], 'claude');
-  assert.equal(text, 'Review this\n\n@"/tmp/a.md" @"/tmp/b.md" ');
-  // Trailing space closes Claude's file typeahead so the next Enter submits.
-  assert.equal(text.endsWith(' '), true);
+test('Cmd insertion contains only file paths, never prompt text or Claude syntax', () => {
+  const text = buildPromptFilePathText(['/tmp/a.md', '/tmp/b.md']);
+  assert.equal(text, '/tmp/a.md\n/tmp/b.md');
+  assert.equal(text.includes('@"'), false);
+  assert.equal(text.includes('Review this'), false);
 });
 
-test('file-only prompt inserts just its references', () => {
-  assert.equal(buildPromptReferenceText('', ['/tmp/a.md'], 'claude'), '@"/tmp/a.md" ');
-  assert.equal(buildPromptReferenceText('', ['/tmp/a.md', '/tmp/b.md'], 'codex'), '/tmp/a.md\n/tmp/b.md');
+test('empty file entries do not create blank path rows', () => {
+  assert.equal(buildPromptFilePathText(['', '   ', '/tmp/a.md']), '/tmp/a.md');
+  assert.equal(buildPromptFilePathText([]), '');
 });
 
 test('a prompt without files has nothing to reference', () => {
@@ -60,7 +59,20 @@ test('a prompt without files has nothing to reference', () => {
   assert.equal(promptHasFileReferences({ file_paths: ['  '] }), false);
   assert.equal(promptHasFileReferences({}), false);
   assert.equal(promptHasFileReferences({ file_paths: ['/tmp/a.md'] }), true);
-  assert.equal(buildPromptReferenceText('Only text', [], 'claude'), 'Only text');
+  assert.equal(buildPromptFilePathText([]), '');
+});
+
+test('a leading macOS Users path gets a tilde only at the first visible position', () => {
+  const path = '/Users/fedor/Desktop/example.md';
+  assert.equal(protectLeadingMacUsersPath(path), `~${path}`);
+  assert.equal(protectLeadingMacUsersPath(path, '  \n'), `~${path}`);
+  assert.equal(protectLeadingMacUsersPath(path, 'before '), path);
+});
+
+test('leading Users path protection is case-sensitive and requires the directory boundary', () => {
+  assert.equal(protectLeadingMacUsersPath('/users/fedor/file.md'), '/users/fedor/file.md');
+  assert.equal(protectLeadingMacUsersPath('/User/fedor/file.md'), '/User/fedor/file.md');
+  assert.equal(protectLeadingMacUsersPath('/Users'), '/Users');
 });
 
 test('malformed package json does not hide shell scripts', () => {
@@ -200,4 +212,17 @@ test('context menu chooses one side from maximum chain width', () => {
     rootWidth: 130,
     descendantWidth: 360,
   }), false);
+});
+
+test('cascading menu navigation mirrors with its real opening side', () => {
+  assert.deepEqual(resolveCascadingMenuDirection(false), {
+    forwardKey: 'ArrowRight',
+    backKey: 'ArrowLeft',
+    chevron: 'right',
+  });
+  assert.deepEqual(resolveCascadingMenuDirection(true), {
+    forwardKey: 'ArrowLeft',
+    backKey: 'ArrowRight',
+    chevron: 'left',
+  });
 });
