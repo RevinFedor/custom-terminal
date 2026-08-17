@@ -15,7 +15,9 @@ const path = require('node:path');
 const { _api } = require('./codex-data');
 const {
   buildCodexFullHistory,
+  buildCodexVisibleRecordWrappers,
   createCodexHistoryProjector,
+  createCodexTimelineProjector,
   projectCodexFullHistoryFromFile,
   invalidateCodexHistoryProjectors,
 } = _api;
@@ -208,6 +210,284 @@ test('double finalize with no feeds in between is idempotent', () => {
   const first = strip(projector.finalize());
   const second = strip(projector.finalize());
   assert.deepEqual(second, first);
+});
+
+test('an old call with no output stays at its physical call position, not after later answers', () => {
+  lineCounter = 0;
+  byteCounter = 0;
+  const records = [
+    rec('event_msg', { type: 'user_message', message: 'first prompt' }),
+    rec('response_item', {
+      type: 'function_call', call_id: 'orphan-search', name: 'exec_command',
+      arguments: JSON.stringify({ command: 'rg old.log' }),
+    }),
+    rec('response_item', {
+      type: 'message', role: 'assistant', phase: 'final_answer',
+      content: [{ type: 'output_text', text: 'later final answer' }],
+    }),
+  ];
+  const history = buildCodexFullHistory(records, 's-orphan');
+  assert.deepEqual(
+    history.map((entry) => entry.role === 'assistant' && entry.actions?.length
+      ? 'pending-call'
+      : entry.content),
+    ['first prompt', 'pending-call', 'later final answer'],
+  );
+  assert.match(history[1].sourceIdentity, /-source-s-orphan-\d+$/);
+});
+
+test('a genuinely current in-flight call still renders at the tail', () => {
+  lineCounter = 0;
+  byteCounter = 0;
+  const records = [
+    rec('event_msg', { type: 'user_message', message: 'prompt' }),
+    rec('response_item', {
+      type: 'message', role: 'assistant', phase: 'commentary',
+      content: [{ type: 'output_text', text: 'checking' }],
+    }),
+    rec('response_item', {
+      type: 'function_call', call_id: 'current-search', name: 'exec_command',
+      arguments: JSON.stringify({ command: 'rg current.log' }),
+    }),
+  ];
+  const history = buildCodexFullHistory(records, 's-current');
+  assert.equal(history.at(-1).actions?.[0]?.rawTool?.toolName, 'Bash');
+  assert.deepEqual(history.slice(0, 2).map((entry) => entry.content), ['prompt', 'checking']);
+});
+
+test('response_item-only user turn is visible in both History and Timeline', () => {
+  const records = [
+    {
+      __line: 0,
+      __byteOffset: 0,
+      timestamp: '2026-08-17T10:24:26.604Z',
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'turn-response-only' },
+    },
+    {
+      __line: 1,
+      __byteOffset: 200,
+      timestamp: '2026-08-17T10:24:26.671Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: 'data:image/png;base64,image' },
+          { type: 'input_text', text: 'response-only prompt' },
+        ],
+      },
+    },
+    {
+      __line: 2,
+      __byteOffset: 500,
+      timestamp: '2026-08-17T10:25:21.890Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'turn-response-only', last_agent_message: 'done' },
+    },
+  ];
+  const history = createCodexHistoryProjector('response-only-session');
+  const timeline = createCodexTimelineProjector('response-only-session');
+  for (const record of records) {
+    history.feed(record);
+    timeline.feed(record);
+  }
+
+  const historyUsers = history.finalize().filter((entry) => entry.role === 'user');
+  const timelineUsers = timeline.finalize().filter((entry) => entry.type === 'user');
+  assert.equal(historyUsers.length, 1);
+  assert.equal(timelineUsers.length, 1);
+  assert.equal(historyUsers[0].content, ' [Image] response-only prompt');
+  assert.equal(timelineUsers[0].content, ' [Image] response-only prompt');
+  assert.equal(timelineUsers[0].hasImage, true);
+  assert.equal(historyUsers[0].sourceIdentity, 'codex-user-source-response-only-session-200');
+  assert.equal(timelineUsers[0].responseComplete, true);
+  const wrappers = buildCodexVisibleRecordWrappers(records, 'response-only-session');
+  const wrapperUsers = wrappers.filter((wrapper) => wrapper.kind === 'user');
+  assert.equal(wrapperUsers.length, 1);
+  assert.equal(wrapperUsers[0].sourceUuid, 'codex-user-response-only-session-1');
+  assert.equal(wrapperUsers[0].turnIndex, 0);
+});
+
+test('paired response_item upgrades to one canonical event_msg user row', () => {
+  const response = {
+    __line: 10,
+    __byteOffset: 1000,
+    timestamp: '2026-08-17T10:30:00.100Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'paired prompt' }],
+    },
+  };
+  const event = {
+    __line: 11,
+    __byteOffset: 1200,
+    timestamp: '2026-08-17T10:30:00.200Z',
+    type: 'event_msg',
+    payload: { type: 'user_message', message: 'paired prompt' },
+  };
+  for (const projector of [
+    createCodexHistoryProjector('paired-session'),
+    createCodexTimelineProjector('paired-session'),
+  ]) {
+    projector.feed(response);
+    assert.equal(projector.finalize().filter((entry) => entry.role === 'user' || entry.type === 'user').length, 1);
+    projector.feed(event);
+    const users = projector.finalize().filter((entry) => entry.role === 'user' || entry.type === 'user');
+    assert.equal(users.length, 1);
+    assert.equal(users[0].uuid, 'codex-user-paired-session-11');
+    assert.equal(users[0].sourceIdentity, 'codex-user-source-paired-session-1200');
+    assert.deepEqual(users[0].sourceIdentityAliases, [
+      'codex-user-source-paired-session-1000',
+    ]);
+  }
+});
+
+test('event_msg remains canonical when its paired response_item arrives later', () => {
+  const event = {
+    __line: 20,
+    __byteOffset: 2000,
+    timestamp: '2026-08-17T10:31:00.100Z',
+    type: 'event_msg',
+    payload: { type: 'user_message', message: 'event-first prompt' },
+  };
+  const response = {
+    __line: 21,
+    __byteOffset: 2200,
+    timestamp: '2026-08-17T10:31:00.200Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'event-first prompt' }],
+    },
+  };
+  for (const projector of [
+    createCodexHistoryProjector('event-first-session'),
+    createCodexTimelineProjector('event-first-session'),
+  ]) {
+    projector.feed(event);
+    projector.feed(response);
+    const users = projector.finalize().filter((entry) => entry.role === 'user' || entry.type === 'user');
+    assert.equal(users.length, 1);
+    assert.equal(users[0].uuid, 'codex-user-event-first-session-20');
+    assert.equal(users[0].sourceIdentity, 'codex-user-source-event-first-session-2000');
+    assert.deepEqual(users[0].sourceIdentityAliases, [
+      'codex-user-source-event-first-session-2200',
+    ]);
+  }
+});
+
+test('image response carrier aliases the canonical event row without creating a second turn', () => {
+  const response = {
+    __line: 30,
+    __byteOffset: 3000,
+    timestamp: '2026-08-17T10:32:00.100Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,image' },
+        { type: 'input_text', text: 'image prompt' },
+      ],
+    },
+  };
+  const event = {
+    __line: 31,
+    __byteOffset: 3200,
+    timestamp: '2026-08-17T10:32:00.200Z',
+    type: 'event_msg',
+    payload: {
+      type: 'user_message',
+      message: '[Image #1] image prompt',
+      images: ['/tmp/image.png'],
+    },
+  };
+  for (const projector of [
+    createCodexHistoryProjector('paired-image-session'),
+    createCodexTimelineProjector('paired-image-session'),
+  ]) {
+    projector.feed(response);
+    projector.feed(event);
+    const users = projector.finalize().filter((entry) => entry.role === 'user' || entry.type === 'user');
+    assert.equal(users.length, 1);
+    assert.equal(users[0].uuid, 'codex-user-paired-image-session-31');
+    assert.equal(users[0].sourceIdentity, 'codex-user-source-paired-image-session-3200');
+    assert.deepEqual(users[0].sourceIdentityAliases, [
+      'codex-user-source-paired-image-session-3000',
+    ]);
+  }
+});
+
+test('two byte-identical paired sends keep separate canonical events and FIFO response aliases', () => {
+  const records = [
+    {
+      __line: 40,
+      __byteOffset: 4000,
+      timestamp: '2026-08-17T10:33:00.100Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'identical prompt' }],
+      },
+    },
+    {
+      __line: 41,
+      __byteOffset: 4200,
+      timestamp: '2026-08-17T10:33:00.200Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'identical prompt' }],
+      },
+    },
+    {
+      __line: 42,
+      __byteOffset: 4400,
+      timestamp: '2026-08-17T10:33:00.300Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'identical prompt' },
+    },
+    {
+      __line: 43,
+      __byteOffset: 4600,
+      timestamp: '2026-08-17T10:33:00.400Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'identical prompt' },
+    },
+  ];
+
+  for (const projector of [
+    createCodexHistoryProjector('identical-paired-session'),
+    createCodexTimelineProjector('identical-paired-session'),
+  ]) {
+    records.forEach((record) => projector.feed(record));
+    const users = projector.finalize().filter((entry) => entry.role === 'user' || entry.type === 'user');
+    assert.deepEqual(
+      users.map((entry) => ({
+        uuid: entry.uuid,
+        sourceIdentity: entry.sourceIdentity,
+        sourceIdentityAliases: entry.sourceIdentityAliases,
+      })),
+      [
+        {
+          uuid: 'codex-user-identical-paired-session-42',
+          sourceIdentity: 'codex-user-source-identical-paired-session-4400',
+          sourceIdentityAliases: ['codex-user-source-identical-paired-session-4000'],
+        },
+        {
+          uuid: 'codex-user-identical-paired-session-43',
+          sourceIdentity: 'codex-user-source-identical-paired-session-4600',
+          sourceIdentityAliases: ['codex-user-source-identical-paired-session-4200'],
+        },
+      ],
+    );
+  }
 });
 
 // ── File-cursor incremental projection ──────────────────────────────────────

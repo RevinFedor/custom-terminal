@@ -206,34 +206,24 @@ test('activateCenterTab delegates the sidebar move to switchTab, not showWorkspa
   assert.doesNotMatch(activateCenter, /focusedProjectId:/);
 });
 
-// ── The two pane writers that bypass switchTab still record the visit ─────
+// ── Пишущий панель в обход switchTab всё равно отмечает посещение ─────────
 
-test('setSplitPaneTab and addTabToSplit touch the global history themselves', () => {
-  // The visit rule lives in touchGlobalTabMru, and switchTab feeds it. But two
-  // paths write a pane DIRECTLY and never pass through switchTab: the pane
-  // header's hover list (setSplitPaneTab) and "add to workspace" (addTabToSplit).
-  // Both make a tab APPEAR — the definition of a visit — yet the hover list left
-  // no trace in the global history (reported live). Each must touch with its own
-  // PRE-write snapshot: after the pane write the tab is already visible, and a
-  // live read would classify the visit as "nothing new appeared".
-  const setPane = block(store, 'setSplitPaneTab: (paneIndex, projectId, tabId) => {', '\n\n  restoreSplitPanePreviousTab:');
-  {
-    const snapAt = setPane.indexOf('const visibleBefore = onScreenTabIds(');
-    const writeAt = setPane.indexOf('set({ splitPanes: next })');
-    const touchAt = setPane.indexOf('touchGlobalTabMru(projectId, tabId, visibleBefore)');
-    assert.ok(snapAt >= 0, 'setSplitPaneTab must snapshot the screen');
-    assert.ok(writeAt > snapAt, 'the snapshot must be taken BEFORE the pane write');
-    assert.ok(touchAt > writeAt, 'and the touch happens with that pre-write picture');
-  }
-  const addTab = block(store, 'addTabToSplit: (projectId, tabId) => {', '\n\n  removeTabFromSplit:');
-  {
-    const snapAt = addTab.indexOf('const visibleBefore = onScreenTabIds(');
-    const writeAt = addTab.indexOf('set({ splitPanes: res.panes');
-    const touchAt = addTab.indexOf('touchGlobalTabMru(projectId, tabId, visibleBefore)');
-    assert.ok(snapAt >= 0, 'addTabToSplit must snapshot the screen');
-    assert.ok(writeAt > snapAt, 'snapshot BEFORE the pane write');
-    assert.ok(touchAt > writeAt, 'touch with the pre-write picture');
-  }
+test('addTabToSplit touches the global history itself', () => {
+  // Правило посещения живёт в touchGlobalTabMru, и switchTab его кормит. Но
+  // «добавить в рабочую область» пишет панель НАПРЯМУЮ и через switchTab не
+  // проходит, а вкладка при этом ПОЯВЛЯЕТСЯ — то есть это посещение. Отмечать
+  // надо снимком экрана ДО записи: после неё вкладка уже видна, и живое чтение
+  // классифицировало бы посещение как «ничего нового не появилось».
+  //
+  // Вторым таким писателем был `setSplitPaneTab` (список недавних в шапке
+  // панели) — удалён 2026-08-17 вместе со списком.
+  const addTab = block(store, 'addTabToSplit: (projectId, tabId) => {', '\n\n  clearTabFromSplitPane:');
+  const snapAt = addTab.indexOf('const visibleBefore = onScreenTabIds(');
+  const writeAt = addTab.indexOf('set({ splitPanes: res.panes');
+  const touchAt = addTab.indexOf('touchGlobalTabMru(projectId, tabId, visibleBefore)');
+  assert.ok(snapAt >= 0, 'addTabToSplit must snapshot the screen');
+  assert.ok(writeAt > snapAt, 'snapshot BEFORE the pane write');
+  assert.ok(touchAt > writeAt, 'touch with the pre-write picture');
 });
 
 // ── Global Ctrl+Tab (per-pane scope removed 2026-08-17) ───────────────────
@@ -252,15 +242,99 @@ test('the switcher is global-only: no pane scope anywhere', () => {
   assert.doesNotMatch(switcher, /workspaceOwnsKeyboard/);
 });
 
-test('a visible tab is a legal Ctrl+Tab target — the model does not skip on-screen tabs', () => {
-  // Committing a visible tab JUMPS focus to its pane; skipping it would make
-  // "one Ctrl+Tab back after an accidental pane click" impossible.
+test('Ctrl+Tab offers only what is NOT on screen; Cmd+P offers everything', () => {
+  // The gesture means "bring back what I cannot see", so a tab filling half the
+  // screen is not an answer. Search is the opposite: an existing tab must be
+  // findable by name whatever is visible, or the search lies about what exists.
+  const build = block(switcher, 'function computeRowsFromStores(', '\n}');
+  assert.match(build, /hideOnScreen/);
+  // Uses the SAME "what is visible" answer as the visit rule — two definitions
+  // would let the list and the history disagree about which tabs count.
+  assert.match(build, /onScreenTabIds\(\{/);
+  assert.match(build, /!hidden\.has\(t\.id\)/);
+  // ctrl → filtered, search → not.
+  assert.match(switcher, /computeRowsFromStores\(mode === 'search' \? query : '', mode === 'ctrl'\)/);
+  // The fast tap (Ctrl released before the first frame) must filter too, or it
+  // would land on a tab the visible list does not even offer.
+  const keyUp = block(switcher, 'const onKeyUp = (e: KeyboardEvent) => {', '\n    };');
+  assert.match(keyUp, /computeRowsFromStores\('', true\)/);
+});
+
+test('the CURRENT tab is the one visible tab kept, and it is pinned to row 1', () => {
+  // "Where am I → where am I going": row 1 is the anchor, and the highlight sits
+  // on row 2. Without it the panel opened straight onto the target and the first
+  // row read as "the current tab" while pointing at the wrong one.
+  //
+  // One condition decides the exemption AND the pin. Splitting them is how row 1
+  // would come to mean different things depending on what is on screen.
+  const build = block(switcher, 'function computeRowsFromStores(', '\n}');
+  assert.match(build, /const anchorTabId = hideOnScreen \? currentTabId : null;/);
+  // Exempt from the ON-SCREEN filter only — sub-agent children are still never
+  // switcher rows, whatever the user happens to be focused on.
+  assert.match(build, /!t\.parentTabId && \(t\.id === anchorTabId \|\| !hidden \|\| !hidden\.has\(t\.id\)\)/);
+  assert.match(build, /pinnedFirstTabId: anchorTabId/);
+  // Search must NOT pin: a current tab floated above a match would read as a
+  // search result. Same expression, and it is null whenever hideOnScreen is off.
+  assert.doesNotMatch(build, /pinnedFirstTabId: currentTabId/);
+});
+
+test('the anchor outranks recency, and is never what releasing Ctrl picks', () => {
   const model = fs.readFileSync(
     path.join(here, '..', 'utils', 'tabSwitcherModel.mjs'),
     'utf8',
   );
+  // Being looked at is not recorded as a visit (tabVisitHistoryRule), so the
+  // current tab is frequently NOT the head of the history — the pin cannot be
+  // left to the MRU.
+  assert.match(model, /pinnedFirstTabId && tab\.id === pinnedFirstTabId\)\s*\n?\s*\? -1/);
+  // …and the highlight skips it, so it stays an anchor rather than a target.
   const initial = block(model, 'export function initialCtrlIndex(', '\n}');
-  assert.doesNotMatch(initial, /onScreen/);
+  assert.match(initial, /entry\.tabId === activeTabId\) continue;/);
+  // Nothing but the anchor → select NOTHING. Falling back to the current tab
+  // would re-activate it, and activation switches the project view and drags
+  // the sidebar to that row — not a no-op.
+  assert.match(initial, /if \(activeTabId && selectable\.length > 0\) return -1;/);
+});
+
+test('the anchor row does not look like a target', () => {
+  // Two rings in one list would ask "which of these am I picking?". The anchor
+  // gets a left rail and dimmed text instead; the selection ring stays the
+  // property of the row the keyboard is on.
+  assert.match(switcher, /anchor=\{anchor\}/);
+  assert.match(switcher, /mode === 'ctrl' && !!activeTabId && tab\.id === activeTabId/);
+  const rows = fs.readFileSync(
+    path.join(here, '..', 'components', 'Workspace', 'TabListRows.tsx'),
+    'utf8',
+  );
+  assert.match(rows, /selected[\s\S]{0,120}: \(anchor \? 'inset 2px 0 0 0 #6e6e76' : 'none'\)/);
+  // Colour, not opacity alone — an alpha-only difference is what video codecs
+  // eat on dark backgrounds (AI-Optimized UI rule).
+  assert.match(rows, /anchor \? '#9a9a9f' : '#e6e6e6'/);
+});
+
+test('"everything is on screen" is said UNDER the anchor, not instead of the list', () => {
+  // The ctrl list is never empty now (it always holds the anchor), so the old
+  // empty-state wording would never appear. Two different facts, two places:
+  // no tabs at all vs. nowhere to go back to.
+  assert.match(switcher, /mode === 'ctrl' \? 'Нет открытых вкладок' : 'No tabs found'/);
+  assert.match(switcher, /nothingToReturnTo &&[\s\S]{0,600}Все вкладки уже на экране/);
+  // Counted from the rows themselves so it cannot disagree with what is drawn.
+  assert.match(switcher, /const nothingToReturnTo = rows\.filter\(\(r\) => r\.kind === 'tab'\)\.length <= 1;/);
+});
+
+test('the ctrl list recomputes when the panes change', () => {
+  // Which tabs are on screen is part of that list's CONTENT: a tab must return
+  // to it the moment its pane empties. A string selector, never the array —
+  // Fingerprint Pattern.
+  assert.match(switcher, /const onScreenKey = useWorkspaceStore\(\(s\) => onScreenTabIds\(\{/);
+  assert.match(switcher, /\}\)\.join\(','\)\);/);
+  const memoDeps = block(switcher, 'const rows: Row\[\] = useMemo(', '\n  useEffect(');
+  assert.match(memoDeps, /onScreenKey/);
+  // …and when the ANCHOR changes: row 1 is the current tab, so switching tabs
+  // with the panel closed must rebuild the list before it reopens. A string
+  // selector for the same reason.
+  assert.match(switcher, /const activeTabId = useWorkspaceStore\(\(s\) => \(/);
+  assert.match(memoDeps, /activeTabId\]/);
 });
 
 test('middle click forgets a row and does NOT navigate or close the window', () => {
@@ -289,10 +363,14 @@ test('closing a tab purges it from every pane history', () => {
 test('the pane object is only ever rebuilt through the history carrier', () => {
   // A pane is rebuilt from scratch on activation, so anything not explicitly
   // carried is erased — hand-assembling {projectId, tabId} is how the history
-  // would quietly reset on every switch.
-  const setPane = block(store, 'setSplitPaneTab: (paneIndex, projectId, tabId) => {', '\n\n  restoreSplitPanePreviousTab:');
-  assert.match(setPane, /paneWithHistoryFrom\(/);
-  assert.doesNotMatch(setPane, /prevProjectId: target\.projectId/);
+  // (and, before that, the pane's column) would quietly reset on every switch.
+  const model = fs.readFileSync(
+    path.join(here, '..', 'utils', 'splitPanesModel.mjs'),
+    'utf8',
+  );
+  const activation = block(model, 'export function resolveSplitActivation(', '\n}');
+  assert.match(activation, /paneWithHistoryFrom\(/);
+  assert.doesNotMatch(activation, /prevProjectId:/);
 });
 
 test('Ctrl+P opens the same search as Cmd+P, in the overlay AND out of the PTY', () => {

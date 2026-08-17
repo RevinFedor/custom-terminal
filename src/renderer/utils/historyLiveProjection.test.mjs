@@ -4,6 +4,7 @@ import {
   applyHistoryLiveToolResultsToEntry,
   buildHistoryLivePresentation,
   extractHistoryLiveToolResults,
+  historyLivePresentationIdentities,
   historyLivePresentationKey,
   reconcileCommittedHistoryLiveProjection,
   reconcileHistoryLiveToolResults,
@@ -475,6 +476,59 @@ test('manual Codex live user hands off to its durable row by exact rollout ident
   }];
   assert.strictEqual(buildHistoryLivePresentation(durable, live), durable);
   assert.deepEqual(reconcileCommittedHistoryLiveProjection(live, durable).entries, []);
+});
+
+test('canonical Codex event row retires its response carrier through an exact source alias', () => {
+  const responseIdentity = 'codex-user-source-session-a-2048';
+  const eventIdentity = 'codex-user-source-session-a-2304';
+  const live = [{
+    uuid: 'local-prompt-1',
+    sourceIdentity: responseIdentity,
+    role: 'queued',
+    queueStatus: 'sent',
+    sessionId: 'session-a',
+    content: 'Paired prompt',
+  }];
+  const durable = [{
+    uuid: 'codex-user-session-a-18',
+    sourceIdentity: eventIdentity,
+    sourceIdentityAliases: [responseIdentity],
+    role: 'user',
+    sessionId: 'session-a',
+    content: 'Paired prompt',
+  }];
+
+  assert.deepEqual(
+    historyLivePresentationIdentities(durable[0]).slice(0, 2),
+    [eventIdentity, responseIdentity],
+  );
+  assert.strictEqual(buildHistoryLivePresentation(durable, live), durable);
+  assert.deepEqual(reconcileCommittedHistoryLiveProjection(live, durable).entries, []);
+});
+
+test('live response carrier upgrades in place when canonical event carries its alias', () => {
+  const responseIdentity = 'codex-user-source-session-a-2048';
+  const response = envelope(canonical(
+    'codex-response-user-session-a-17',
+    'user',
+    [{ type: 'text', text: 'Paired prompt' }],
+    { sourceIdentity: responseIdentity },
+  ));
+  const canonicalEvent = envelope(canonical(
+    'codex-user-session-a-18',
+    'user',
+    [{ type: 'text', text: 'Paired prompt' }],
+    {
+      sourceIdentity: 'codex-user-source-session-a-2304',
+      sourceIdentityAliases: [responseIdentity],
+    },
+  ));
+
+  const afterResponse = reduceHistoryLiveProjection([], response, { includeUserText: true });
+  const afterEvent = reduceHistoryLiveProjection(afterResponse, canonicalEvent, { includeUserText: true });
+  assert.equal(afterEvent.length, 1);
+  assert.equal(afterEvent[0].sourceIdentity, 'codex-user-source-session-a-2304');
+  assert.deepEqual(afterEvent[0].sourceIdentityAliases, [responseIdentity]);
 });
 
 test('assistant text, thinking, and tool calls project to one FullHistory-like entry', () => {

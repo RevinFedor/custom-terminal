@@ -179,13 +179,30 @@ test('History presents terminal lifecycle and input delivery as two independent 
     ['compact keeps priority', "title: 'COMPACTING'"],
     ['ordinary history refresh stays lower priority', 'showUpdatingChip'],
     ['exact handoff status is selected independently', 'const displayedInputStatus = activeInputStatus'],
-    ['terminal and input labels are composed', "terminalStatusTitle + ' / ' + inputStatusPresentation.label"],
   ]);
   assert.doesNotMatch(
     between(historySource, 'const unifiedTransientStatus = isCancellingTurn', 'const displayedInputStatus'),
     /busyAction === 'send'/,
   );
   assert.match(historySource, /data-agent-send-phase=\{displayedInputStatus \|\| undefined\}/);
+  // Судьба отправки НЕ склеивается с состоянием терминала в видимую плашку: она
+  // уже показана бейджем над самим сообщением, а приставкой к терминалу
+  // вытаскивала на экран слово «Ready», у которого своего права появиться нет.
+  // В подсказке при наведении она остаётся — там место не расходуется.
+  assert.doesNotMatch(historySource, /terminalStatusTitle \+ ' \/ ' \+ inputStatusPresentation\.label/);
+  assert.match(historySource, /const statusTitle = statusCopied \? 'COPIED' : terminalStatusTitle;/);
+  assert.match(
+    historySource,
+    /const statusDescription = inputStatusPresentation[\s\S]{0,120}inputStatusPresentation\.title/,
+  );
+  // Готовность сама по себе не показывается: «всё готово» = не происходит ничего.
+  const showStatusTextRule = between(
+    historySource,
+    'const showStatusText = statusCopied',
+    'const showBusyLoader',
+  );
+  assert.doesNotMatch(showStatusTextRule, /inputStatusPresentation/);
+  assert.doesNotMatch(showStatusTextRule, /status === 'active'/);
   assert.match(historySource, /\|\| status === 'starting'[\s\S]{0,180}const canAcceptSubmitIntent/);
   assert.match(historySource, /busyAction === 'resume' && status === 'starting'/);
   assert.match(historySource, /sendCanJoinExistingLaunch[\s\S]{0,220}activeKind === 'resume'/);

@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   computePromptQueueInstallBlockers,
   describeQueuePromise,
+  promptQueueReadFailureBlocker,
 } = require('./prompt-queue-install-blockers');
 
 const armed = (extra = {}) => ({
@@ -141,6 +142,16 @@ test('queue and loop armed together report both', () => {
     ).reason,
     'queue+loop',
   );
+});
+
+test('a persisted queue read failure blocks install instead of reporting false idle', () => {
+  assert.deepEqual(promptQueueReadFailureBlocker(new Error('sqlite unavailable')), {
+    tabId: '__prompt_queue_state__',
+    kind: 'prompt-queue-state',
+    status: 'unknown',
+    reason: 'persisted-queue-read-failed',
+    error: 'sqlite unavailable',
+  });
 });
 
 test('a garbage entry describes no promise', () => {

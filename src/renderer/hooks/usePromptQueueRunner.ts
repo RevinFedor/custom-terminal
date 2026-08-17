@@ -29,6 +29,7 @@ import {
   buildPromptQueueReceiptHandoffId,
   promptQueueReceiptReplayNeedsNoBusyStart,
 } from '../utils/promptQueueReceiptIdentity.mjs';
+import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -108,16 +109,14 @@ function seedBusySnapshotFromWorkspace(tabId: string, options: { replace?: boole
 
 type QueueAgent = 'claude' | 'codex';
 
-function getPromptQueueAgent(tabId: string): QueueAgent {
+function getPromptQueueAgent(tabId: string): QueueAgent | null {
   const state = useWorkspaceStore.getState();
   for (const ws of state.openProjects.values()) {
     const tab = ws.tabs.get(tabId);
     if (!tab) continue;
-    if (tab.commandType === 'codex') return 'codex';
-    if (tab.commandType !== 'claude' && tab.codexSessionId && !tab.claudeSessionId) return 'codex';
-    return 'claude';
+    return resolvePtyAgentOwner(tab);
   }
-  return 'claude';
+  return null;
 }
 
 function getWorkspaceCommandType(tabId: string): string | null {
@@ -130,7 +129,8 @@ function getWorkspaceCommandType(tabId: string): string | null {
 }
 
 function getPromptQueueAgentLabel(tabId: string): string {
-  return getPromptQueueAgent(tabId) === 'codex' ? 'Codex' : 'Claude';
+  const owner = getPromptQueueAgent(tabId);
+  return owner === 'codex' ? 'Codex' : owner === 'claude' ? 'Claude' : 'AI';
 }
 
 function getPromptQueueSessionId(tabId: string, agent: QueueAgent): string | null {
@@ -169,6 +169,13 @@ function sendQueueCommand(
   source: 'prompt-queue' | 'prompt-loop' = 'prompt-queue',
 ): Promise<unknown> {
   const agent = getPromptQueueAgent(tabId);
+  if (!agent) {
+    return Promise.resolve({
+      success: false,
+      submitted: false,
+      error: 'provider_owner_unknown',
+    });
+  }
   const channel = agent === 'codex' ? 'codex:send-command' : 'claude:send-command';
   const isSlashCommand = String(payload || '').trimStart().startsWith('/');
   const options = {
@@ -406,6 +413,14 @@ async function readQueueOwnerReadiness(ownerTabId: string): Promise<{
   reason: string;
 }> {
   const agent = getPromptQueueAgent(ownerTabId);
+  if (!agent) {
+    return {
+      ready: false,
+      status: 'unknown',
+      inputReady: false,
+      reason: 'provider-owner-unknown',
+    };
+  }
   if (agent === 'claude') {
     const gate = getClaudeStartupDefaultsGateSnapshot(ownerTabId);
     if (claudeQueueStartupPending.has(ownerTabId) || gate?.status === 'pending' || gate?.status === 'failed') {
@@ -607,6 +622,11 @@ function beginValidatedQueueSend(
         if (initiated?.headId !== head.id) {
           queueOwnerLaunchInitiated.set(ownerTabId, { headId: head.id, at: Date.now() });
           const agent = getPromptQueueAgent(ownerTabId);
+          if (!agent) {
+            queueOwnerLaunchInitiated.delete(ownerTabId);
+            clearDeferredOwnerAttempt(ownerTabId, attempt, 'provider-owner-unknown');
+            return;
+          }
           const runtime = getHistoryAgentRuntime(agent);
           const ownerSessionId = getPromptQueueSessionId(ownerTabId, agent);
           const ownerCwd = getTabCwd(ownerTabId);
@@ -751,6 +771,11 @@ function beginValidatedQueueSend(
         ...(chip.sourceKey ? { sourceKey: chip.sourceKey } : {}),
       }));
     const agent = getPromptQueueAgent(ownerTabId);
+    if (!agent) {
+      queueAwaitingBusyStart.delete(ownerTabId);
+      clearDeferredOwnerAttempt(ownerTabId, attempt, 'provider-owner-unknown-before-send');
+      return;
+    }
     const handoffId = buildPromptQueueReceiptHandoffId({
       kind,
       itemId: head.id,
@@ -837,15 +862,23 @@ function beginValidatedQueueSend(
     }
     const auditProof = historyPromptHandoffAuditProofFromSendResult(res);
     const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(res);
+    const providerQueueReturned = historyPromptAuditIsProviderQueueReturn(
+      res?.pasteAudit || res,
+    );
     const finalAuditFailure = res?.success === false
       && res?.submitted === true
-      && !unconfirmedStatus;
+      && !unconfirmedStatus
+      && !providerQueueReturned;
     settleHistoryPromptHandoff(ownerTabId, handoffId, {
-      queueStatus: finalAuditFailure
+      queueStatus: providerQueueReturned
+        ? 'cancelled'
+        : finalAuditFailure
         ? 'failed'
         : unconfirmedStatus
           || (res?.queued === true ? 'queued' : 'sent'),
-      reason: finalAuditFailure
+      reason: providerQueueReturned
+        ? 'provider-queue-returned-to-terminal-composer'
+        : finalAuditFailure
         ? 'send-submitted-audit-failed'
         : unconfirmedStatus === 'audit-pending'
           ? 'send-submitted-audit-pending'
@@ -1443,12 +1476,18 @@ export function usePromptQueueRunner() {
     const handleBusyState = (channel: 'claude' | 'gemini' | 'codex') =>
       (_: any, data: BusyStatePayload) => {
         const { tabId, busy, reason } = data;
-        if (channel === 'claude' && reason === 'spinner') {
-          const commandType = getWorkspaceCommandType(tabId);
-          if (commandType === 'codex' || commandType === 'gemini') {
-            console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=claude reason=spinner → IGNORE foreign spinner for ' + commandType);
-            return;
-          }
+        const effectiveOwner = getPromptQueueAgent(tabId);
+        const commandType = getWorkspaceCommandType(tabId);
+        const channelOwnsTab = channel === 'gemini'
+          ? commandType === 'gemini'
+          : effectiveOwner === channel;
+        if (!channelOwnsTab) {
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
+            + ' ch=' + channel
+            + ' owner=' + (effectiveOwner || commandType || 'unknown')
+            + ' reason=' + (reason || '-')
+            + ' → IGNORE foreign lifecycle');
+          return;
         }
 
         // Spinner frames are presentation-only heuristics. Do not let them
@@ -1686,6 +1725,7 @@ export function usePromptQueueRunner() {
 
     const codexTurnStateResolvedHandler = (_: unknown, state: any) => {
       if (!state?.tabId || !canProcessWorkflowOutcomes()) return;
+      if (getPromptQueueAgent(state.tabId) !== 'codex') return;
       applyCodexTurnStateSnapshot(state.tabId, state, 'codex-state-resolved');
     };
 
@@ -1747,12 +1787,15 @@ export function usePromptQueueRunner() {
     };
     const claudeReadyHandler = (_: unknown, data: { tabId?: string }) => {
       if (!data?.tabId) return;
+      if (getPromptQueueAgent(data.tabId) !== 'claude') return;
       // Claude's prompt is visible, but /model and /effort startup defaults may
       // still be applying. The gate event below is the actual send boundary.
       claudeQueueStartupPending.add(data.tabId);
     };
     const codexReadyHandler = (_: unknown, data: { tabId?: string }) => {
-      if (data?.tabId) signalQueueOwnerReadiness(data.tabId, 'codex-tui-ready');
+      if (data?.tabId && getPromptQueueAgent(data.tabId) === 'codex') {
+        signalQueueOwnerReadiness(data.tabId, 'codex-tui-ready');
+      }
     };
     const claudeStartupGateHandler = (event: Event) => {
       const detail = (event as CustomEvent<{ tabId?: string; status?: string }>).detail || {};

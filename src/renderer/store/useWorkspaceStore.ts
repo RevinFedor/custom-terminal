@@ -46,6 +46,7 @@ import {
 } from '../utils/splitPanesModel.mjs';
 import { isVisitWorthRecording, onScreenTabIds } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
+import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -1188,8 +1189,15 @@ const resolveHistoryRestoreCwd = async (
   }
 };
 
-const isAiRuntimeTab = (tab?: Pick<Tab, 'commandType' | 'tabType'> | null): boolean => {
-  return !!tab && (tab.tabType === 'claude-sdk' || tab.commandType === 'claude' || tab.commandType === 'gemini' || tab.commandType === 'codex');
+const isAiRuntimeTab = (tab?: Pick<Tab,
+  'commandType' | 'tabType' | 'claudeSessionId' | 'codexSessionId'> | null): boolean => {
+  return !!tab && (
+    tab.tabType === 'claude-sdk'
+    || tab.commandType === 'gemini'
+    || !!tab.claudeSessionId
+    || !!tab.codexSessionId
+    || resolvePtyAgentOwner(tab) !== null
+  );
 };
 
 const isSdkBusyState = (tab?: Pick<Tab, 'sdkState'> | null): boolean => {
@@ -1468,12 +1476,6 @@ interface WorkspaceStore {
   addVerticalSplitPane: (atPaneIndex: number | null, side: 'above' | 'below') => boolean;
   /** Middle-click on a file pane: bring back what that pane showed before. */
   restoreSplitPanePreviousTab: (tabId: string) => boolean;
-  /**
-   * Put a tab into ONE pane without focusing it or moving the center.
-   * The second path next to activateCenterTab: "show this here" instead of
-   * "go to this".
-   */
-  setSplitPaneTab: (paneIndex: number, projectId: string, tabId: string) => boolean;
   // ✕ / Escape on an empty placeholder pane (real panes close by tabId).
   removeEmptySplitPane: (paneIndex: number) => void;
   focusSplitPane: (paneIndex: number) => void;
@@ -1551,6 +1553,7 @@ interface WorkspaceStore {
   markAiForkAutoTitle: (tabId: string, toolType: AutoTabTitleTool, sourceSessionId: string) => void;
   getAiLaunchSnapshot: (tabId: string) => AiLaunchSnapshot | null;
   clearAiLaunchSnapshot: (tabId: string, reason?: string) => void;
+  restoreRejectedAiLaunchSnapshot: (tabId: string, toolType: AutoTabTitleTool, reason?: string) => boolean;
   discardUnmaterializedAiLaunchSession: (tabId: string, reason: string) => Promise<boolean>;
   toggleTabCollapsed: (projectId: string, tabId: string) => void;
 
@@ -2084,54 +2087,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return true;
   },
 
-  setSplitPaneTab: (paneIndex, projectId, tabId) => {
-    const st = get();
-    if (!st.openProjects.get(projectId)?.tabs.get(tabId)) return false;
-
-    // Single mode has no pane list to write into: the header still offers the
-    // control, and choosing there means "make this the center" — the only
-    // surface available. Nothing to keep focus away from.
-    if (st.splitPanes.length === 0) {
-      get().activateCenterTab(projectId, tabId);
-      return true;
-    }
-
-    const target = st.splitPanes[paneIndex];
-    if (!target) return false;
-    if (target.tabId === tabId) return true;
-    // One tab, one pane: a tab visible elsewhere would otherwise appear twice.
-    if (st.splitPanes.some((pane, i) => i !== paneIndex && pane.tabId === tabId)) return false;
-
-    // The pre-write picture, for the visit rule below.
-    const visibleBefore = onScreenTabIds({ panes: st.splitPanes, centerTabId: null });
-
-    const next = st.splitPanes.slice();
-    // Pane-level recency through the ONE carrier (paneWithHistoryFrom): the
-    // pane object is rebuilt here, and anything not explicitly carried is
-    // silently erased — hand-assembling the object is how the history would
-    // quietly reset on every pick from the hover list.
-    next[paneIndex] = paneWithHistoryFrom(
-      {
-        projectId,
-        tabId,
-        ...(target.column !== undefined ? { column: target.column } : null),
-      },
-      target,
-    );
-    // splitFocusedIndex is deliberately NOT touched: this is the whole point of
-    // the second path. The center follows the FOCUSED pane, so leaving focus
-    // alone also leaves the center where the user left it.
-    set({ splitPanes: next });
-    // A VISIT: the picked tab just APPEARED in this pane. This path writes the
-    // pane itself and never goes through switchTab, so without an explicit
-    // touch here the hover-list navigation left no trace in the global history
-    // (reported live). Focus staying put does not matter — the rule is about
-    // visibility, not focus.
-    get().touchGlobalTabMru(projectId, tabId, visibleBefore);
-    console.log('[Split] setPaneTab pane=' + paneIndex + ' tab=' + tabId.slice(-12) + ' focus-unchanged');
-    get().saveSession();
-    return true;
-  },
+  // Здесь был `setSplitPaneTab` — «показать вкладку В ЭТОЙ панели, не переходя
+  // на неё». Единственным его вызовом был список недавних по наведению в шапке
+  // панели, удалённый 2026-08-17 вместе с ним. Если сценарий «подготовить
+  // соседнее окно, не уходя из своего» вернётся, восстанавливать нужно вместе
+  // с двумя правилами, которые здесь стоили крови: пересборка панели ТОЛЬКО
+  // через `paneWithHistoryFrom` (иначе теряется история и колонка панели) и
+  // явная отметка посещения с ДО-записи снимком экрана (иначе появление
+  // вкладки не попадает в общую историю).
 
   restoreSplitPanePreviousTab: (tabId) => {
     const st = get();
@@ -3240,6 +3203,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const tab = workspace.tabs.get(tabId);
     if (!tab) return false;
     const skipProcessCheck = options?.skipProcessCheck || false;
+    const ptyAgentOwner = resolvePtyAgentOwner(tab);
+    const hasAmbiguousPtyBindings = !!tab.claudeSessionId && !!tab.codexSessionId;
+    const effectiveCommandType = ptyAgentOwner
+      || (hasAmbiguousPtyBindings ? null : tab.commandType);
     const isAiTab = isAiRuntimeTab(tab);
     const aiBusyAtClose = isAiBusyTab(tab, options?.aiBusyOverride);
     console.log('[CloseTab] start project=' + projectId.slice(-12) +
@@ -3336,14 +3303,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     };
     const archiveCommit = await commitArchiveWithStopRetry({
       shouldArchive: shouldArchiveToHistory,
-      commandType: tab.commandType,
+      commandType: effectiveCommandType,
       // The unproven-writer refusal only: stop the live Codex first, then
       // retry the History write — the exact sequence the user performed by
       // hand (right-click → Стоп → close). Confirmation stays as-is: it was
       // already asked above when the agent is mid-answer.
       stopProcess: () => ipcRenderer.invoke('terminal:stop-ai-process', {
         tabId,
-        toolType: tab.commandType,
+        toolType: effectiveCommandType,
         reason: 'close-tab-archive-retry',
       }),
       archive: () => ipcRenderer.invoke('project:archive-tab', {
@@ -3355,7 +3322,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           color: tab.color,
           notes: tab.notes,
           taskPlan: tab.taskPlan,
-          commandType: tab.commandType,
+          commandType: effectiveCommandType,
           tabType: tab.tabType,
           url: tab.url,
           filePath: tab.filePath,
@@ -3454,7 +3421,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         shouldStopAiProcess,
         stopAiProcess: () => ipcRenderer.invoke('terminal:stop-ai-process', {
           tabId,
-          toolType: tab.commandType,
+          toolType: effectiveCommandType,
           reason: 'close-tab',
         }),
         killTerminal: () => ipcRenderer.send('terminal:kill', tabId),
@@ -4356,6 +4323,27 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         const codexSess = tab.codexSessionId ? tab.codexSessionId.slice(0, 8) : 'null';
         const callerLine = (new Error().stack || '').split('\n').slice(2, 5).join(' | ');
         console.warn('[Store:setTabCommandType] tab=' + tabId.slice(-8) + ' ' + prev + ' → ' + commandType + ' | claude=' + claudeSess + ' gemini=' + geminiSess + ' codex=' + codexSess + ' | caller=' + callerLine);
+        const hasClaudeBinding = !!tab.claudeSessionId;
+        const hasCodexBinding = !!tab.codexSessionId;
+        const requestedPtyOwner = commandType === 'claude' || commandType === 'codex'
+          ? commandType
+          : null;
+        const boundPtyOwner = hasClaudeBinding !== hasCodexBinding
+          ? (hasClaudeBinding ? 'claude' : 'codex')
+          : null;
+        if (
+          requestedPtyOwner
+          && (
+            (hasClaudeBinding && hasCodexBinding)
+            || (boundPtyOwner && boundPtyOwner !== requestedPtyOwner)
+          )
+        ) {
+          console.error('[Store:setTabCommandType] rejected owner mutation tab=' + tabId.slice(-8)
+            + ' requested=' + requestedPtyOwner
+            + ' bound=' + (boundPtyOwner || 'ambiguous')
+            + ' action=keep-committed-owner');
+          return;
+        }
         if ((commandType === 'claude' || commandType === 'codex') && !aiLaunchSnapshots.has(tabId)) {
           const hasSessionForLaunch = commandType === 'claude' ? !!tab.claudeSessionId : !!tab.codexSessionId;
           if (!hasSessionForLaunch) {
@@ -4470,6 +4458,59 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!snap) return;
     aiLaunchSnapshots.delete(tabId);
     console.warn('[Store:AiLaunchSnapshot] clear tab=' + tabId.slice(-8) + ' type=' + snap.sessionType + ' reason=' + reason);
+  },
+
+  restoreRejectedAiLaunchSnapshot: (tabId, toolType, reason = 'launch-rejected') => {
+    const snap = aiLaunchSnapshots.get(tabId);
+    if (!snap || snap.sessionType !== toolType) return false;
+
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab || tab.commandType !== toolType) return false;
+      const currentAttemptSession = toolType === 'claude'
+        ? tab.claudeSessionId
+        : tab.codexSessionId;
+      const snapshotAttemptSession = toolType === 'claude'
+        ? snap.claudeSessionId
+        : snap.codexSessionId;
+      if ((currentAttemptSession || null) !== (snapshotAttemptSession || null)) {
+        console.warn('[Store:AiLaunchSnapshot] stale rejection ignored tab=' + tabId.slice(-8)
+          + ' attempted=' + toolType
+          + ' reason=newer-session-materialized');
+        return false;
+      }
+
+      // A rejected main-side launch cannot own this tab. Restore the exact
+      // pre-launch presentation/binding transaction instead of leaving a
+      // provider label that no running process ever accepted.
+      if (snap.commandType) tab.commandType = snap.commandType;
+      else delete tab.commandType;
+      tab.name = snap.name;
+      tab.color = snap.color;
+      tab.colorSetManually = snap.colorSetManually;
+      tab.nameSetManually = snap.nameSetManually;
+      tab.claudeSessionId = snap.claudeSessionId;
+      tab.geminiSessionId = snap.geminiSessionId;
+      tab.codexSessionId = snap.codexSessionId;
+      tab.wasInterrupted = snap.wasInterrupted;
+      tab.overlayDismissed = snap.overlayDismissed;
+
+      aiLaunchSnapshots.delete(tabId);
+      clearPendingAutoTabTitle(tabId, 'launch-rejected');
+      autoTabTitleIntents.delete(tabId);
+      console.warn('[Store:AiLaunchSnapshot] restore tab=' + tabId.slice(-8)
+        + ' attempted=' + toolType
+        + ' command=' + (tab.commandType || 'none')
+        + ' reason=' + reason);
+      set({ openProjects: new Map(openProjects) });
+      saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'ai-launch-rejected');
+      return true;
+    }
+
+    aiLaunchSnapshots.delete(tabId);
+    autoTabTitleIntents.delete(tabId);
+    return false;
   },
 
   discardUnmaterializedAiLaunchSession: async (tabId, reason) => {

@@ -3,11 +3,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  codexUserMessageAuditText,
   codexAuditRecordIsAfterBoundary,
   codexCanonicalUserMessageMatch,
   consumeCodexUserMessageAuditChunk,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
+  selectCodexPreferredUserMessageAuditRecords,
   selectCodexPendingPromptAudit,
 } = require('./codex-prompt-audit');
 
@@ -56,6 +58,141 @@ test('provisional source audit parser carries a split JSONL row with its origina
   assert.equal(second.records[0].byteOffset, 240_143);
   assert.equal(second.records[0].record.payload.message, 'split audit row');
   assert.equal(second.partial, '');
+});
+
+test('provisional Resume accepts an image-bearing response_item user carrier without event_msg', () => {
+  const record = {
+    timestamp: '2026-08-17T10:19:49.357Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,very-large-payload' },
+        { type: 'input_text', text: '<pasted_content>question</pasted_content>' },
+        { type: 'input_image', image_url: 'data:image/png;base64,second-large-payload' },
+      ],
+    },
+  };
+  const consumed = consumeCodexUserMessageAuditChunk({
+    chunk: JSON.stringify(record) + '\n',
+    incomingStartOffset: 36_563_744,
+  });
+
+  assert.equal(consumed.records.length, 1);
+  assert.equal(consumed.records[0].byteOffset, 36_563_744);
+  assert.equal(
+    codexUserMessageAuditText(consumed.records[0].record),
+    ' [Image] <pasted_content>question</pasted_content> [Image] ',
+  );
+});
+
+test('two image paste paths match the ordered response_item image slots exactly', () => {
+  const firstPath = '/tmp/noted-terminal-codex-image-input/first.png';
+  const secondPath = '/tmp/noted-terminal-codex-image-input/second.png';
+  const middle = '<pasted_content>question</pasted_content>';
+  const expectedText = firstPath + middle + secondPath;
+  const actualText = ' [Image] ' + middle + ' [Image] ';
+  const selected = selectCodexPendingPromptAudit([{
+    expectedText,
+    expectedLen: expectedText.length,
+    expectedHash: 'expected-operation-hash',
+    expectedImagePaths: [firstPath, secondPath],
+    sentAt: Date.parse('2026-08-17T10:19:48.810Z'),
+    preSubmitBoundary: {
+      sessionId: '01a00e88-0d4c-7e53-95f3-22e31a2ecfc2',
+      filePath: '/rollout.jsonl',
+      fileSize: 36_536_092,
+    },
+  }], {
+    actualText,
+    actualHash: 'different-transcript-hash',
+    actualPayload: { type: 'message', role: 'user' },
+    actualIdentity: {
+      sessionId: '01a00e88-0d4c-7e53-95f3-22e31a2ecfc2',
+      filePath: '/rollout.jsonl',
+      byteOffset: 36_563_744,
+      timestamp: '2026-08-17T10:19:49.357Z',
+    },
+  });
+
+  assert.equal(selected?.canonicalMatch?.reason, 'codex_image_placeholder_canonical');
+});
+
+test('Codex XML-like image blocks count each label plus path as one slot', () => {
+  const paths = [
+    '/tmp/noted-terminal-codex-image-input/first.png',
+    '/tmp/noted-terminal-codex-image-input/second.png',
+    '/tmp/noted-terminal-codex-image-input/third.png',
+  ];
+  const middle = 'question between images';
+  const expected = paths[0] + paths[1] + middle + paths[2];
+  const actual = [
+    `<image name=[Image #1] path="${paths[0]}">\n<<ImageDisplayed>>\n</image>`,
+    `<image name=[Image #2] path="${paths[1]}">\n<<ImageDisplayed>>\n</image>`,
+    middle,
+    `<image name=[Image #3] path="${paths[2]}">\n<<ImageDisplayed>>\n</image>`,
+  ].join('');
+  const matched = codexCanonicalUserMessageMatch({
+    expectedText: expected,
+    expectedImagePaths: paths,
+  }, actual);
+  assert.equal(matched?.reason, 'codex_image_placeholder_canonical');
+  assert.equal(codexCanonicalUserMessageMatch({
+    expectedText: expected,
+    expectedImagePaths: paths,
+  }, actual.replace(middle, 'different question')), null);
+});
+
+test('response_item assistant messages never become user delivery proof', () => {
+  const line = JSON.stringify({
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'answer' }],
+    },
+  }) + '\n';
+  assert.equal(consumeCodexUserMessageAuditChunk({ chunk: line }).records.length, 0);
+});
+
+test('paired response_item and event_msg select one canonical event carrier', () => {
+  const response = {
+    byteOffset: 100,
+    record: {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'same prompt' }],
+      },
+    },
+  };
+  const event = {
+    byteOffset: 200,
+    record: {
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'same prompt' },
+    },
+  };
+  assert.deepEqual(selectCodexPreferredUserMessageAuditRecords([response, event]), [event]);
+});
+
+test('response-only carriers remain distinct for two identical physical sends', () => {
+  const candidate = (byteOffset) => ({
+    byteOffset,
+    record: {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'same prompt' }],
+      },
+    },
+  });
+  const first = candidate(100);
+  const second = candidate(300);
+  assert.deepEqual(selectCodexPreferredUserMessageAuditRecords([first, second]), [first, second]);
 });
 
 test('same-file identical records before the pre-Enter byte boundary are not causal', () => {

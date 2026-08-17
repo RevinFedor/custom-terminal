@@ -9,7 +9,7 @@ const INHERITED_ACTIVE = new Set([
 ]);
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
-const SOURCE_FOLLOWUP_DELIVERY_STATUSES = new Set(['pending', 'sending', 'sent', 'queued']);
+const SOURCE_FOLLOWUP_DELIVERY_STATUSES = new Set(['pending', 'sending', 'audit-pending', 'sent', 'queued']);
 const SOURCE_NOTIFICATION_PROBLEM_STATUSES = new Set(['waiting-for-input', 'failed', 'unconfirmed']);
 
 export function isOrchestrationResultProofPending(run) {

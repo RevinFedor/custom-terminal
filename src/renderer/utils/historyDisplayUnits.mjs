@@ -336,6 +336,11 @@ export function entrySeriesFamily(entry) {
  * family + docs scope, and MCP additionally per server. */
 export function entryAggregateKey(entry) {
   if (!isObject(entry) || entry.role !== 'assistant') return null;
+  // A physical record that carries reasoning remains a broad-work member even
+  // if the provider colocated a tool call in the same record. Otherwise the
+  // inner file aggregate could still display `thinking` as its child through
+  // a composite row — the same hierarchy lie as swallowing a separate row.
+  if (entry.thinking || entry.hasThinking === true) return null;
   const facts = entryActionFacts(entry);
   if (facts.length === 0) return null;
   let key = null;
@@ -407,93 +412,62 @@ function makeInnerGroup(members, facts, expandedKeys) {
 
 /**
  * Second presentation level for the members of an expanded broad group.
- * It stays FLAT for Virtuoso: collapsed aggregate = one group unit; expanded
- * aggregate = its header followed by ordinary entry units carrying
- * `expandedSubgroup` metadata. No nested list and no loss of raw UUIDs.
+ *
+ * A homogeneous aggregate owns an uninterrupted run of ACTIONS only.
+ * Thinking, captions and any other row are hard boundaries: `Read → think →
+ * Read` is not a two-file series. This is deliberately stricter than broad
+ * grouping, where reasoning may still ride inside one work block.
+ *
+ * The projection stays flat for Virtuoso. An expanded aggregate is its header
+ * followed by ordinary collapsed tool-card entries; every row keeps its raw
+ * UUID and no passenger can acquire `expandedSubgroup` by position.
  */
 export function buildHistoryInnerUnits(entries, options = {}) {
   const list = Array.isArray(entries) ? entries : [];
   const expandedKeys = options.expandedKeys instanceof Set
     ? options.expandedKeys
     : new Set(Array.isArray(options.expandedKeys) ? options.expandedKeys : []);
-  const membership = messageMembershipMap(list, entryAggregateKey);
   const units = [];
   let index = 0;
   while (index < list.length) {
-    const start = index;
-    let signature = entryAggregateKey(list[index]);
-    if (!signature && isCaptionForNext(list[index], list[index + 1])) {
-      signature = entryAggregateKey(list[index + 1]);
-    }
-    if (!signature && isThinkingOnlyRow(list[index])) {
-      const messageId = typeof list[index]?.messageId === 'string' ? list[index].messageId : '';
-      const structural = messageId ? membership.get(messageId) : null;
-      if (structural?.size === 1) signature = Array.from(structural)[0];
-      else if (!structural || structural.size === 0) {
-        signature = nextActionValueAfterPassengers(list, index, entryAggregateKey);
-      }
-    }
+    const signature = entryAggregateKey(list[index]);
     if (!signature) {
       units.push({ kind: 'entry', entry: list[index] });
       index += 1;
       continue;
     }
 
-    const members = [];
+    const actionMembers = [];
     let cursor = index;
     while (cursor < list.length) {
       const candidate = list[cursor];
       const candidateKey = entryAggregateKey(candidate);
       if (candidateKey === signature) {
-        members.push(candidate);
+        actionMembers.push(candidate);
         cursor += 1;
         continue;
-      }
-      if (
-        !candidateKey
-        && isCaptionForNext(candidate, list[cursor + 1])
-        && entryAggregateKey(list[cursor + 1]) === signature
-      ) {
-        members.push(candidate);
-        cursor += 1;
-        continue;
-      }
-      if (!candidateKey && isThinkingOnlyRow(candidate)) {
-        const structural = structuralPassengerMatch(candidate, membership, signature);
-        const fallback = !structural.known
-          && nextActionValueAfterPassengers(list, cursor, entryAggregateKey) === signature;
-        if (structural.matches || fallback) {
-          members.push(candidate);
-          cursor += 1;
-          continue;
-        }
       }
       break;
     }
-    const facts = members.flatMap((member) => entryActionFacts(member));
-    if (members.length === 0) {
-      units.push({ kind: 'entry', entry: list[start] });
-      index = start + 1;
-      continue;
-    }
+    const facts = actionMembers.flatMap((member) => entryActionFacts(member));
     if (facts.length < 2) {
-      for (const member of members) units.push({ kind: 'entry', entry: member });
-      index = Math.max(cursor, start + 1);
+      for (const member of actionMembers) units.push({ kind: 'entry', entry: member });
+      index = Math.max(cursor, index + 1);
       continue;
     }
-    const group = makeInnerGroup(members, facts, expandedKeys);
+    const group = makeInnerGroup(actionMembers, facts, expandedKeys);
     units.push(group);
     if (group.expanded) {
-      for (let memberIndex = 0; memberIndex < members.length; memberIndex += 1) {
+      for (let actionIndex = 0; actionIndex < actionMembers.length; actionIndex += 1) {
         units.push({
           kind: 'entry',
-          entry: members[memberIndex],
+          entry: actionMembers[actionIndex],
           expandedSubgroup: {
             key: group.key,
             familyKey: group.familyKey,
             docsKind: group.docsKind,
-            first: memberIndex === 0,
-            last: memberIndex === members.length - 1,
+            first: actionIndex === 0,
+            last: actionIndex === actionMembers.length - 1,
           },
         });
       }
@@ -512,8 +486,9 @@ export function buildHistoryInnerUnits(entries, options = {}) {
  * `key` = 'grp:' + first member's first tool_use id (stable across appends:
  * a growing live series keeps its first member). Expanded groups are NOT
  * returned as groups — the caller passes `expandedKeys`, and expanded
- * members come back as plain entry units (so heavy bodies mount only then),
- * with `expandedGroup` metadata on each for rail rendering.
+ * members come back as plain entry units (so their light card headers mount
+ * only then). Heavy bodies still wait for the CHILD card's own click, with
+ * `expandedGroup` metadata used only for rail rendering.
  */
 export function buildHistoryDisplayUnits(entries, options = {}) {
   const list = Array.isArray(entries) ? entries : [];
@@ -674,9 +649,13 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
     const firstCallId = facts.find((fact) => fact.toolUseId)?.toolUseId
       || allMembers[0]?.uuid || String(index);
     const aggregateKeys = new Set(facts.map((fact) => fact.aggregateKey).filter(Boolean));
-    // A homogeneous run is already the user's second-level entity and may
-    // live at the root without a redundant generic stack wrapper.
-    if (aggregateKeys.size === 1) {
+    // A PURE homogeneous action run is already the user's second-level entity
+    // and may live at the root without a redundant generic stack wrapper.
+    // Once reasoning/caption rows are present it is a broad WORK block: keep
+    // that outer owner so those rows never masquerade as children of `Read…`.
+    const pureHomogeneousRun = aggregateKeys.size === 1
+      && allMembers.every((member) => entryAggregateKey(member) !== null);
+    if (pureHomogeneousRun) {
       const direct = makeInnerGroup(allMembers, facts, expandedKeys);
       direct.captionEntry = captionEntry;
       units.push(direct);
@@ -1024,11 +1003,12 @@ export const HISTORY_GROUPABLE_FAMILIES = GROUPABLE_FAMILIES;
 /**
  * Per-family breakdown of a group's calls, in FIRST-APPEARANCE order.
  *
- * The header of a mixed run must speak honest phrases — «Read 3 files ·
- * Ran git 3 commands · npm» — rather than a synthetic «6 steps», so it needs
- * the counts per family plus the distinct subjects each family touched. The
- * order is the order the families first appeared, which matches how the run
- * actually unfolded.
+ * The header of a mixed run speaks in ACTION TYPES and CALL COUNTS —
+ * `Read ×3 · Git ×1` — rather than pretending that three Read calls always
+ * mean three different files. Distinct subjects are still collected for the
+ * optional detail line and for the inner homogeneous series, but they never
+ * redefine the counter. The order is the order the families first appeared,
+ * which matches how the run actually unfolded.
  */
 export function groupFamilyBreakdown(facts) {
   const list = Array.isArray(facts) ? facts : [];
@@ -1075,13 +1055,10 @@ export function groupFamilyBreakdown(facts) {
     }
   }
   const result = Array.from(byFamily.values());
-  for (const bucket of result) {
-    // «Read 53 files» must mean 53 distinct files, not 53 windows/calls.
-    // Other families name operations (queries/commands/calls), so their count
-    // remains the call count even when several happen against one target.
-    bucket.count = (bucket.family === 'read' || bucket.family === 'edit')
-      ? (bucket.targets.size || bucket.callCount)
-      : bucket.callCount;
-  }
+  // One multiplier has one meaning everywhere: number of source tool calls.
+  // Target cardinality remains available through `targets`; conflating it
+  // with `count` produced the false label `Read 53 files` for 53 windows over
+  // a much smaller set of files.
+  for (const bucket of result) bucket.count = bucket.callCount;
   return result;
 }

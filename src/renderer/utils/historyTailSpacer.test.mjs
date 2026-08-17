@@ -4,6 +4,7 @@ import {
   createHistoryTailSpacer,
   historyContentDistanceFromBottom,
   historyTailReserveDeficitAfterShrink,
+  isUserOwnedScrollBurn,
 } from './historyTailSpacer.mjs';
 
 test('arm keeps the larger reserve; burn shrinks by travelled distance only', () => {
@@ -105,4 +106,48 @@ test('preview shrink deficit uses the pre-change reading position after browser 
 test('preview resize needs no reserve while real content still absorbs the shrink', () => {
   const scroller = { scrollHeight: 1600, scrollTop: 800, clientHeight: 450 };
   assert.equal(historyTailReserveDeficitAfterShrink(scroller, 800), 0);
+});
+
+test('programmatic negative scroll never burns; a real gesture does', () => {
+  // Prod 17.08 11:52:42.8–43.0 (tab-3314): collapse armed 6945px, then ~40
+  // burns down to zero within 800ms with NO user gesture in between. The
+  // clamp/Virtuoso scroll events fed themselves: each burn shrank the
+  // scroller, the browser clamped again, the next negative delta burned more.
+  const gate = (over) => isUserOwnedScrollBurn(over);
+  // Hold alive → the shrink compensation owns the frame, nothing burns.
+  assert.equal(gate({ holdActive: true, pointerScrollActive: true, msSinceGesture: 0 }), false);
+  // Browser clamp / late Virtuoso pass: no gesture at all.
+  assert.equal(gate({ msSinceGesture: Number.POSITIVE_INFINITY }), false);
+  // Gesture long past (the 17.08 trace: last wheel ~500ms before the click).
+  assert.equal(gate({ msSinceGesture: 800 }), false);
+  // Genuine wheel/touch/key just now.
+  assert.equal(gate({ msSinceGesture: 16 }), true);
+  // Scrollbar drag in progress — no discrete events, pointer flag is proof.
+  assert.equal(gate({ pointerScrollActive: true, msSinceGesture: 5000 }), true);
+});
+
+test('a large reserve survives a full programmatic clamp cascade', () => {
+  const spacer = createHistoryTailSpacer({});
+  spacer.arm(6945, 'collapse-hold');
+  // Replay of the production cascade shape through the gate.
+  for (const delta of [1, 2, 1, 4, 23, 120, 963, 76]) {
+    if (isUserOwnedScrollBurn({ holdActive: false, msSinceGesture: 900 })) {
+      spacer.burn(delta, 'user-scroll');
+    }
+  }
+  assert.equal(spacer.get(), 6945);
+  // Then the user really scrolls up 300px — the reserve follows exactly.
+  assert.ok(isUserOwnedScrollBurn({ msSinceGesture: 10 }));
+  spacer.burn(300, 'user-scroll');
+  assert.equal(spacer.get(), 6645);
+});
+
+test('burn diagnostics carry the source', () => {
+  const lines = [];
+  const spacer = createHistoryTailSpacer({ diag: (line) => lines.push(line) });
+  spacer.arm(500, 'collapse-hold');
+  spacer.burn(100, 'user-scroll');
+  spacer.burn(50, 'deficit-reconcile');
+  assert.ok(lines.some((l) => l.includes('burn px=100') && l.includes('src=user-scroll')));
+  assert.ok(lines.some((l) => l.includes('burn px=50') && l.includes('src=deficit-reconcile')));
 });

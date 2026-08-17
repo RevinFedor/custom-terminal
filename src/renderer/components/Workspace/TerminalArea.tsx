@@ -25,6 +25,7 @@ import { isEmptyPane, paneIsStacked, splitSizesFingerprint } from '../../utils/s
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
+import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -470,12 +471,7 @@ function TerminalArea({
     if (!ws?.activeTabId || ws.currentView !== 'terminal') return '';
     const tab = ws.tabs.get(ws.activeTabId);
     if (!tab || tab.tabType === 'claude-sdk') return '';
-    const engine: InterruptedEngine | null =
-      tab.commandType === 'codex' ? 'codex'
-      : tab.commandType === 'claude' ? 'claude'
-      : tab.codexSessionId ? 'codex'
-      : tab.claudeSessionId ? 'claude'
-      : null;
+    const engine = resolvePtyAgentOwner(tab) as InterruptedEngine | null;
     if (!engine) return '';
     const sessionId = engine === 'codex' ? (tab.codexSessionId || '') : (tab.claudeSessionId || '');
     return `${tab.id}|${engine}|${sessionId}`;
@@ -883,9 +879,9 @@ function TerminalArea({
     const tab = ws.tabs.get(ws.activeTabId);
     // SDK tabs handle resume via claude-sdk:send-message, not PTY overlay
     if (!tab || tab.tabType === 'claude-sdk' || !tab.wasInterrupted || tab.overlayDismissed) return '';
-    if (tab.commandType === 'codex' && tab.codexSessionId) return `codex:${tab.codexSessionId}`;
-    if (tab.claudeSessionId && !tab.claudeActive) return `claude:${tab.claudeSessionId}`;
-    if (tab.codexSessionId) return `codex:${tab.codexSessionId}`;
+    const owner = resolvePtyAgentOwner(tab);
+    if (owner === 'codex' && tab.codexSessionId) return `codex:${tab.codexSessionId}`;
+    if (owner === 'claude' && tab.claudeSessionId && !tab.claudeActive) return `claude:${tab.claudeSessionId}`;
     return '';
   });
   const [activeTabInterruptedEngine, activeTabSessionId] = useMemo(() => {
@@ -1264,10 +1260,7 @@ function TerminalArea({
           // pane's own host (z-layer of the PANE, not of the terminal), and
           // agent panes always author through History (docked or inline
           // composer), same as the single-mode agent layouts.
-          const paneAgentPair = inPane
-            && tab.commandType !== 'gemini'
-            && (tab.commandType === 'claude' || tab.commandType === 'codex'
-              || !!tab.claudeSessionId || !!tab.codexSessionId);
+          const paneAgentPair = inPane && resolvePtyAgentOwner(tab) !== null;
           inner = (
             <Terminal
               key={tab.id}

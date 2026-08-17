@@ -10,6 +10,7 @@ import {
   waitForXtermPresentationAfterDrain,
 } from '../../utils/xtermWritePump';
 import ControlHint from '../UI/ControlHint';
+import SideSurfaceToggleButton from './SideSurfaceToggleButton';
 
 const { shell } = window.require('electron');
 
@@ -96,6 +97,10 @@ import {
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { resolveCenterRightInset } from '../../utils/surfaceInsets.mjs';
+import {
+  resolvePtyAgentOwner,
+  shouldInterpretPtyScreenAsShellCommand,
+} from '../../utils/ptyAgentOwner.mjs';
 import { canTerminalClaimFocus } from '../../utils/terminalFocusClaim.mjs';
 import { measureTerminalViewportIntersection } from '../../utils/terminalViewportIntersection.mjs';
 import { log } from '../../utils/logger';
@@ -274,7 +279,7 @@ function isCodexTabForStyleProbe(tabId: string): boolean {
   for (const workspace of state.openProjects.values()) {
     const tab = workspace.tabs.get(tabId);
     if (!tab) continue;
-    return tab.commandType === 'codex' || !!tab.codexSessionId;
+    return resolvePtyAgentOwner(tab) === 'codex';
   }
   return false;
 }
@@ -742,17 +747,30 @@ function getCurrentCommand(term: XTerminal): string {
 }
 
 const { ipcRenderer, clipboard } = window.require('electron');
+const ptyAgentLaunchAttemptSeq = new Map<string, number>();
 
 const invokePtyAgentLaunch = async (
   channel: 'claude:run-command' | 'codex:run-command',
   payload: any,
   pendingClaudeSessionId?: string | null,
 ) => {
+  const attemptedToolType = channel.startsWith('codex') ? 'codex' : 'claude';
+  const tabId = String(payload?.tabId || '');
+  const attemptSeq = (ptyAgentLaunchAttemptSeq.get(tabId) || 0) + 1;
+  ptyAgentLaunchAttemptSeq.set(tabId, attemptSeq);
+  const isCurrentAttempt = () => ptyAgentLaunchAttemptSeq.get(tabId) === attemptSeq;
   try {
     const result = await ipcRenderer.invoke(channel, payload);
     if (result?.success === false || result?.accepted === false) {
       if (pendingClaudeSessionId) clearPendingResume(payload?.tabId);
       const message = result?.error || result?.reason || 'launch rejected';
+      if (isCurrentAttempt()) {
+        useWorkspaceStore.getState().restoreRejectedAiLaunchSnapshot(
+          tabId,
+          attemptedToolType,
+          message,
+        );
+      }
       console.warn('[Terminal:AgentLaunch] rejected channel=' + channel
         + ' tab=' + String(payload?.tabId || '').slice(-12)
         + ' error=' + message);
@@ -765,6 +783,13 @@ const invokePtyAgentLaunch = async (
   } catch (error: any) {
     if (pendingClaudeSessionId) clearPendingResume(payload?.tabId);
     const message = error?.message || String(error);
+    if (isCurrentAttempt()) {
+      useWorkspaceStore.getState().restoreRejectedAiLaunchSnapshot(
+        tabId,
+        attemptedToolType,
+        'invoke-failed:' + message,
+      );
+    }
     console.warn('[Terminal:AgentLaunch] invoke failed channel=' + channel
       + ' tab=' + String(payload?.tabId || '').slice(-12)
       + ' error=' + message);
@@ -773,6 +798,8 @@ const invokePtyAgentLaunch = async (
       'error',
     );
     return { success: false, accepted: false, error: message };
+  } finally {
+    if (isCurrentAttempt()) ptyAgentLaunchAttemptSeq.delete(tabId);
   }
 };
 
@@ -1613,8 +1640,14 @@ function Terminal({
   const promptQueueAgent = useWorkspaceStore((state): 'claude' | 'codex' | null => {
     for (const [, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
-      if (tab?.commandType === 'claude') return 'claude';
-      if (tab?.commandType === 'codex') return 'codex';
+      if (tab) return resolvePtyAgentOwner(tab);
+    }
+    return null;
+  });
+  const storedCommandType = useWorkspaceStore((state) => {
+    for (const [, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) return tab.commandType || null;
     }
     return null;
   });
@@ -1622,6 +1655,13 @@ function Terminal({
   useEffect(() => {
     promptQueueAgentRef.current = promptQueueAgent;
   }, [promptQueueAgent]);
+  useEffect(() => {
+    if (!promptQueueAgent || storedCommandType === promptQueueAgent) return;
+    console.warn('[Terminal:AgentOwnerRepair] tab=' + tabId.slice(-8)
+      + ' stale=' + (storedCommandType || 'none')
+      + ' owner=' + promptQueueAgent);
+    useWorkspaceStore.getState().setTabCommandType(tabId, promptQueueAgent);
+  }, [promptQueueAgent, storedCommandType, tabId]);
   const agentBusy = useWorkspaceStore((state) => {
     for (const [, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
@@ -1637,8 +1677,9 @@ function Terminal({
     for (const [, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (!tab) continue;
-      if (tab.commandType === 'codex') return !!tab.codexSessionId;
-      if (tab.commandType === 'claude') return !!tab.claudeSessionId;
+      const owner = resolvePtyAgentOwner(tab);
+      if (owner === 'codex') return !!tab.codexSessionId;
+      if (owner === 'claude') return !!tab.claudeSessionId;
       return false;
     }
     return false;
@@ -1647,7 +1688,7 @@ function Terminal({
     for (const [, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (!tab) continue;
-      return tab.commandType === 'codex' || !!tab.codexSessionId;
+      return resolvePtyAgentOwner(tab) === 'codex' || !!tab.codexSessionId;
     }
     return false;
   });
@@ -1658,9 +1699,11 @@ function Terminal({
   // so devServer/gemini regex matches (e.g. Claude rendering `⏺ Bash(npm run
   // dev…)`) must NOT downgrade the tab type. See fix #2 / fact-tabs.md.
   const claudeProcessAliveRef = useRef(false);
+  const foregroundProcessKnownRef = useRef(false);
   useEffect(() => {
     const onStarted = (_: any, data: { tabId: string }) => {
       if (data.tabId === tabId) {
+        foregroundProcessKnownRef.current = true;
         console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' command-started → alive=true');
         claudeProcessAliveRef.current = true;
         setClaudeProcessAlive(true);
@@ -1668,6 +1711,7 @@ function Terminal({
     };
     const onFinished = (_: any, data: { tabId: string }) => {
       if (data.tabId === tabId) {
+        foregroundProcessKnownRef.current = true;
         const wasAlive = claudeProcessAliveRef.current;
         const launchSnapshot = useWorkspaceStore.getState().getAiLaunchSnapshot(tabId);
         if (!wasAlive && launchSnapshot) {
@@ -1695,6 +1739,7 @@ function Terminal({
       expectedProcess: 'codex',
       allowProcessTreeLookup: allowCodexProcessLookup,
     }).then((s: any) => {
+      foregroundProcessKnownRef.current = true;
       console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' initial-sync isRunning=' + !!s?.isRunning);
       if (s?.isRunning) { claudeProcessAliveRef.current = true; setClaudeProcessAlive(true); }
     }).catch(() => {});
@@ -2711,9 +2756,19 @@ function Terminal({
           return true; // Allow default handling
         }
 
-        // SAFETY: If terminal is in Alternate Buffer (TUI active), BYPASS interception!
-        // This fixes the issue where Enter is swallowed in interactive menus (like "Resume Session")
-        if (term.buffer.active.type === 'alternate') {
+        // Screen text is not a shell command while a foreground process owns
+        // the PTY. Codex deliberately runs in the normal buffer, so checking
+        // only xterm's alternate buffer let rendered TUI prose ending in
+        // "claude" relabel a live Codex tab and swallow manual Enter.
+        const foregroundProcessState = claudeProcessAliveRef.current
+          ? true
+          : foregroundProcessKnownRef.current
+            ? false
+            : undefined;
+        if (!shouldInterpretPtyScreenAsShellCommand({
+          foregroundProcessAlive: foregroundProcessState,
+          bufferType: term.buffer.active.type,
+        })) {
           return true;
         }
 
@@ -3296,8 +3351,15 @@ function Terminal({
             return true;
           }
 
-          // SAFETY: If terminal is in Alternate Buffer (TUI active), BYPASS interception!
-          if (term.buffer.active.type === 'alternate') {
+          const foregroundProcessState = claudeProcessAliveRef.current
+            ? true
+            : foregroundProcessKnownRef.current
+              ? false
+              : undefined;
+          if (!shouldInterpretPtyScreenAsShellCommand({
+            foregroundProcessAlive: foregroundProcessState,
+            bufferType: term.buffer.active.type,
+          })) {
             return true;
           }
 
@@ -3840,6 +3902,25 @@ function Terminal({
         return promptQueuePortalHost ? createPortal(overlay, promptQueuePortalHost) : overlay;
       })()}
 
+      {/* «Выдвинуть вторую поверхность» — та же кнопка, что над полем History, и
+          тот же компонент: развилка «что выдвигать» одна на оба режима. Стоит
+          только когда терминал ДЕРЖИТ ЦЕНТР: у панели, приткнутой сбоку, эта
+          кнопка принадлежит центральной поверхности, иначе на экране оказались бы
+          две кнопки для одного переключателя. */}
+      {active && presentedProp && isTerminalCentre && (
+        <div
+          data-terminal-side-surface-toggle
+          className="pointer-events-auto"
+          style={{
+            position: 'absolute',
+            bottom: 16,
+            right: terminalArrowRightInset + 16,
+            zIndex: 10001,
+          }}
+        >
+          <SideSurfaceToggleButton tabId={tabId} size={28} />
+        </div>
+      )}
       {/* Scroll-to-bottom button — OUTSIDE isolation:isolate wrapper so its z-index
           participates in root stacking context (above Timeline tooltip portal z:10000) */}
       {active && presentedProp && showScrollButton && (
@@ -3855,15 +3936,20 @@ function Terminal({
 	            // up on opposite sides of the same panel. Previously this jumped
 	            // to the LEFT edge when the transcript opened, which read as a
 	            // different button appearing somewhere else.
-	            right: terminalArrowRightInset + 16,
-	            width: '36px',
-            height: '36px',
-            borderRadius: '8px',
+	            //
+	            // Слева от кнопки раскладки, в 2px, когда та есть — пара читается
+	            // как один блок из двух кнопок.
+	            right: terminalArrowRightInset + 16 + (isTerminalCentre ? 28 + 2 : 0),
+	            // 28px, как у стрелки History: раньше здесь было 36 и та же по
+	            // смыслу кнопка выглядела в двух поверхностях по-разному.
+	            width: '28px',
+            height: '28px',
+            borderRadius: '6px',
             backgroundColor: 'rgba(60, 60, 60, 0.85)',
             backdropFilter: 'blur(8px)',
             border: '1px solid rgba(255, 255, 255, 0.1)',
             color: 'rgba(255, 255, 255, 0.8)',
-            fontSize: '18px',
+            fontSize: '15px',
             boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)',
             zIndex: 10001
           }}

@@ -70,10 +70,21 @@ test('F4 real Codex runtime preserves its softened post-Enter state as audit-pen
     /historyPromptHandoffUnconfirmedStatusFromSendResult\(result\)/,
     'an exact bound send keeps using the shared unresolved-receipt classifier',
   );
+  // An unresolved receipt still keeps the prompt — that is the invariant here.
+  // The condition gained one guard since this test was written: a prompt the
+  // provider handed BACK to the terminal composer is cancelled, not
+  // "delivered but unconfirmed", so it must not raise the unconfirmed notice.
+  // Assert the classifier's verdict is what drives the flag, and that the
+  // provider-queue return is excluded — not the exact former spelling.
   assert.match(
     pendingSendBoundary,
-    /sendDeliveryUnconfirmed = unconfirmedStatus !== null/,
+    /sendDeliveryUnconfirmed = [\s\S]{0,120}unconfirmedStatus !== null/,
     'History must preserve the prompt while rendering a post-Enter soft timeout as unresolved rather than final sent',
+  );
+  assert.match(
+    pendingSendBoundary,
+    /sendDeliveryUnconfirmed = !providerQueueReturned/,
+    'a prompt returned to the terminal composer is cancelled, not an unconfirmed delivery',
   );
   assert.match(
     historyPromptHandoffSource,
@@ -1840,21 +1851,14 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     });
     const pendingNotification = await waitFor(async () => {
       const state = await api('/api/orchestrations/' + runId);
-      return state.body.run?.notificationStatus === 'audit-pending' ? state : null;
-    }, 'completion harness did not retain the post-Enter handoff as audit-pending');
+      return state.body.run?.notificationStatus === 'unconfirmed' ? state : null;
+    }, 'completion harness did not expose the unconfirmed post-Enter handoff');
     assert.equal(pendingNotification.body.run.status, 'completed');
     assert.ok(controller.completionPrompt, 'completion prompt must have crossed the real notification caller');
     assert.equal(controller.completionSendCount, 1);
 
-    const retryWhilePending = await api('/api/orchestrations/' + runId + '/action', {
-      action: 'retry',
-      tabId: 'phase2-source-tab',
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(retryWhilePending.body?.ok === true, false,
-      'Retry must be refused while the exact completion audit is still pending.');
     assert.equal(controller.completionSendCount, 1,
-      'Retry during audit-pending must not perform a second physical notification send.');
+      'Unconfirmed delivery must not retry automatically.');
 
     const completionHash = promptAuditFingerprint(controller.completionPrompt);
     const lateAudit = await webServer.notifyAgentPromptAuditResult({

@@ -53,6 +53,7 @@ import {
   resolveCodexEffectiveSettings,
 } from '../../utils/codexEffectiveSettings.mjs';
 import { planAgentSettingsAvailability } from '../../utils/agentSettingsAvailability.mjs';
+import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import { applyClaudePtySetting } from '../../utils/claudePtyActions';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import {
@@ -387,23 +388,21 @@ export default function ClaudeControlBar({
   projectPath,
 }: Props) {
   const showToast = useUIStore((s) => s.showToast);
-  // The active agent follows the process-promoted command type first. A tab
-  // can retain an older Claude/Codex transcript while a different agent is
-  // already running in its PTY; letting the older id win would route controls
-  // to the wrong TUI and render both quick-switch variants. Session ids are a
-  // fallback only for tabs whose current command has no AI type yet.
+  // A single concrete session binding owns the PTY even if a stale renderer
+  // label says otherwise. With two conflicting bindings the destructive PTY
+  // transition engine below remains unknown and main must provide live proof.
   const savedSessionType: 'claude' | 'gemini' | 'codex' = claudeSessionId
     ? 'claude'
     : geminiSessionId ? 'gemini'
     : codexSessionId ? 'codex'
     : 'claude';
-  const sessionType: 'claude' | 'gemini' | 'codex' = commandType === 'gemini'
-    ? 'gemini'
-    : commandType === 'codex'
-      ? 'codex'
-      : commandType === 'claude'
-        ? 'claude'
-        : savedSessionType;
+  const resolvedPtyOwner = resolvePtyAgentOwner({
+    commandType,
+    claudeSessionId,
+    codexSessionId,
+  });
+  const sessionType: 'claude' | 'gemini' | 'codex' = resolvedPtyOwner
+    || (commandType === 'gemini' ? 'gemini' : savedSessionType);
   const sessionId = sessionType === 'claude'
     ? claudeSessionId
     : sessionType === 'gemini'
@@ -1273,9 +1272,7 @@ export default function ClaudeControlBar({
   }, [tabId]);
   const ptyTransitionEngine = useMemo<PtyTransitionEngine | null>(() => {
     if (isSDKTab) return null;
-    if (commandType === 'codex' || codexSessionId) return 'codex';
-    if (commandType === 'claude' || claudeSessionId) return 'claude';
-    return null;
+    return resolvePtyAgentOwner({ commandType, claudeSessionId, codexSessionId });
   }, [claudeSessionId, codexSessionId, commandType, isSDKTab]);
   const [sessionActionBlockedStatus, setSessionActionBlockedStatus] = useState<SessionActionBlockedStatus>(null);
   // The Codex "is the writer proven yet" probe used to gate the fork chip that
@@ -4393,8 +4390,10 @@ export default function ClaudeControlBar({
                 gap: 4,
                 visibility: modelSpinning ? 'hidden' : 'visible',
               }}>
+                {/* Без значка раскрытия: кнопка показывает ТЕКУЩЕЕ значение, и
+                    что по нему открывается список — понятно с первого раза, а
+                    треугольник занимал место в самой узкой строке интерфейса. */}
                 <span style={{ color: codexModelMenuDisabled || modelBlocked ? '#666' : '#fff' }}>{modelLabel}</span>
-                <span style={{ opacity: codexModelMenuDisabled || modelBlocked ? 0.25 : 0.6 }}>▴</span>
               </span>
               {modelSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
             </button>
@@ -4675,10 +4674,10 @@ export default function ClaudeControlBar({
                 gap: 4,
                 visibility: effortSpinning ? 'hidden' : 'visible',
               }}>
+                {/* Значка раскрытия нет — как и у модели рядом. */}
                 <span style={{ color: codexEffortDisabled || effortBlocked ? '#666' : undefined }}>
                   {effortTriggerLabel}
                 </span>
-                <span style={{ opacity: codexEffortDisabled || effortBlocked ? 0.25 : 0.6 }}>▴</span>
               </span>
               {effortSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
             </button>
@@ -4736,50 +4735,12 @@ export default function ClaudeControlBar({
                   );
                 })}
 
-                {/* Session modifier, last row. Same position for both agents,
-                    deliberately different meaning: Think decides WHETHER the
-                    levels above apply at all, Fast decides how fast the request
-                    is served and leaves them alone. */}
-                {isCodex ? (
-                  <>
-                    <span aria-hidden style={settingsMenuSeparatorStyle} />
-                    <button
-                      type="button"
-                      aria-label={codexFastStateLabel}
-                      aria-pressed={codexFastModeState.known ? codexFastModeState.active : undefined}
-                      data-codex-fast-state={codexFastModeState.state}
-                      data-codex-service-tier={codexFastModeState.serviceTier || ''}
-                      title={codexFastTitle}
-                      disabled={codexFastDisabled}
-                      onClick={() => {
-                        setPinnedPopup(null);
-                        sendCodexFast();
-                      }}
-                      style={{
-                        ...settingsMenuRowStyle(codexFastDisabled),
-                        ...(codexFastModeState.active && !codexFastDisabled
-                          ? { backgroundColor: 'rgba(251,191,36,0.18)', color: '#fbbf24' }
-                          : {}),
-                      }}
-                    >
-                      <svg
-                        width="11"
-                        height="11"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2.4"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden="true"
-                      >
-                        <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
-                      </svg>
-                      <span>Fast</span>
-                      {codexFastModeState.active && <span style={{ marginLeft: 'auto' }}>✓</span>}
-                    </button>
-                  </>
-                ) : !isDeepSeekPTY && (
+                {/* Session modifier, last row — только Claude Think: он решает,
+                    ПРИМЕНЯЮТСЯ ли уровни выше, поэтому стоит с ними в одной
+                    колонке. Codex Fast к уровням отношения не имеет (он про
+                    скорость обслуживания запроса) и вернулся отдельной кнопкой
+                    справа от этой — см. ниже. */}
+                {!isCodex && !isDeepSeekPTY && (
                   <>
                     <span aria-hidden style={settingsMenuSeparatorStyle} />
                     <button
@@ -4810,6 +4771,73 @@ export default function ClaudeControlBar({
             ))}
           </div>
           );
+          })()}
+
+          {/* Codex Fast — СВОЙ квадрат справа от блока усилия, как было до
+              переезда в меню. Внутри меню он оказался не на месте: та колонка
+              отвечает на вопрос «насколько глубоко думать», а Fast отвечает на
+              другой — «как быстро обслужить запрос», и уровни не меняет вообще.
+              Плюс он бинарный: у переключателя нет причин прятаться за раскрытие
+              списка, из-за которого его нельзя было включить одним кликом. */}
+          {isCodex && (() => {
+            const fastSpinning = isBusySpinnerOn('fast');
+            const fastBlocked = isBusyBlocked('fast');
+            return (
+              <ControlHint label={codexFastStateLabel} disabled={codexFastDisabled}>
+                <button
+                  type="button"
+                  data-agent-setting-trigger="fast"
+                  aria-label={codexFastStateLabel}
+                  aria-pressed={codexFastModeState.known ? codexFastModeState.active : undefined}
+                  data-codex-fast-state={codexFastModeState.state}
+                  data-codex-service-tier={codexFastModeState.serviceTier || ''}
+                  data-busy-spinner={fastSpinning ? '1' : undefined}
+                  title={codexFastTitle}
+                  disabled={codexFastDisabled || fastBlocked}
+                  aria-busy={fastSpinning}
+                  {...(fastSpinning ? {
+                    onClick: forceResetBusy,
+                    onMouseEnter: () => setBusyCancelHover(true),
+                    onMouseLeave: () => setBusyCancelHover(false),
+                  } : { onClick: sendCodexFast })}
+                  style={{
+                    ...triggerStyle,
+                    position: 'relative',
+                    // Квадрат: у кнопки один глиф и нет подписи, поэтому ширина
+                    // равна высоте — иначе пустой квадрат с молнией смотрелся бы
+                    // как обрезанная кнопка с текстом.
+                    width: 22,
+                    padding: 0,
+                    justifyContent: 'center',
+                    ...(codexFastModeState.active && !codexFastDisabled
+                      ? {
+                          backgroundColor: 'rgba(251,191,36,0.18)',
+                          borderColor: 'rgba(251,191,36,0.55)',
+                          color: '#fbbf24',
+                        }
+                      : {}),
+                  }}
+                >
+                  <svg
+                    width="11"
+                    height="11"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.4"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                    // Подпись остаётся в раскладке, пока крутится кружок —
+                    // ширина кнопки не меняется в момент клика.
+                    style={{ visibility: fastSpinning ? 'hidden' : undefined }}
+                  >
+                    <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
+                  </svg>
+                  {fastSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
+                </button>
+              </ControlHint>
+            );
           })()}
         </div>
         );

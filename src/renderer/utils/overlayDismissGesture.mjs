@@ -28,7 +28,6 @@
 export const DISMISSIBLE_OVERLAY_SELECTORS = Object.freeze([
   '[data-tab-context-menu]',
   '[data-split-direction-menu]',
-  '[data-pane-recent-menu]',
   '[data-run-after-picker-menu]',
   '[data-command-history-popover]',
 ]);

@@ -21,7 +21,9 @@ import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { PaneMapCells, usePaneMapColumns } from './PaneMap';
 import { splitAvailability } from '../../utils/splitPanesModel.mjs';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
-import { TabProcessBar, TabStatusMarker } from './TabSignals';
+import { TabProcessBar, TabStatusMarker, TabFastBadge } from './TabSignals';
+import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
+import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -538,8 +540,7 @@ const isCodexSessionTab = (tab?: {
   claudeSessionId?: string;
   geminiSessionId?: string;
   codexSessionId?: string;
-} | null) => tab?.commandType === 'codex'
-  || (!tab?.claudeSessionId && !tab?.geminiSessionId && !!tab?.codexSessionId);
+} | null) => resolvePtyAgentOwner(tab || {}) === 'codex';
 
 const shortVerticalRowKey = (key?: string | null) => {
   if (!key) return '-';
@@ -1646,6 +1647,31 @@ const TabItem = memo(({
   // Settings → форма маркера статуса (круг или квадрат) + размер в px.
   const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
   const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
+  // Codex Fast для карточки. Читается ТЕМ ЖЕ резолвером, что и кнопка Fast в
+  // панели управления: два независимых вычисления «включён ли Fast» разошлись бы
+  // на первом же граничном случае, а граничный случай здесь основной — тариф
+  // принадлежит КОНКРЕТНОМУ writer'у, и после смены сессии старое доказательство
+  // силы не имеет. Поэтому на unknown значка нет вовсе: соврать «Fast выключен»
+  // так же плохо, как соврать «включён».
+  //
+  // Селекторы гранулярные (Fingerprint): подписка на Map перерисовывала бы всё
+  // приложение на любое изменение любой вкладки.
+  const codexLiveServiceTier = useWorkspaceStore(
+    (s) => s.openProjects.get(projectId)?.tabs.get(tab.id)?.codexLiveServiceTier,
+  );
+  const codexLiveServiceTierSessionId = useWorkspaceStore(
+    (s) => s.openProjects.get(projectId)?.tabs.get(tab.id)?.codexLiveServiceTierSessionId,
+  );
+  const codexLiveSettingsSessionId = useWorkspaceStore(
+    (s) => s.openProjects.get(projectId)?.tabs.get(tab.id)?.codexLiveSettingsSessionId,
+  );
+  const codexFastActive = resolveCodexFastModeState({
+    currentSessionId: codexLiveSettingsSessionId
+      || codexLiveServiceTierSessionId
+      || tab.codexSessionId,
+    serviceTierSessionId: codexLiveServiceTierSessionId,
+    serviceTier: codexLiveServiceTier,
+  }).active;
   const visualStateLogRef = useRef<string>('');
   const bgDiagRenderRef = useRef<string>('');
   const bgDiagComputedRef = useRef<string>('');
@@ -2004,6 +2030,14 @@ const TabItem = memo(({
                 radius={tabGeo.borderRadius}
                 outset={processBarPosition === 'right' ? 0 : 2}
               />
+              {/* Codex Fast — жёлтая молния на ВЕРХНЕМ конце полоски процесса.
+                  Живёт рядом с полоской и держится за тот же край, потому что
+                  описывает свойство этой вкладки, а не добавляет значок в общую
+                  строку названия. Наружу выходит лишь частью высоты: серединой
+                  на шве было бы не понять, чья она — верхней вкладки или
+                  нижней. Рисуется независимо от полоски: Fast может быть
+                  доказан и когда процесс уже не идёт. */}
+              <TabFastBadge active={codexFastActive} />
               {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
                   rendered above). The whole-tab background pulse was removed —
                   the loader is the переливающаяся полоска у края, not a tint of
@@ -6784,15 +6818,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const contextMenuTabId = contextMenu?.tabId || null;
   const contextTabForMenu = contextMenuTabId ? workspace?.tabs.get(contextMenuTabId) : null;
   const isContextFileTab = contextTabForMenu?.tabType === 'file';
-  const contextForkProvider = contextTabForMenu?.commandType === 'claude'
-    ? 'claude'
-    : contextTabForMenu?.commandType === 'codex'
-      ? 'codex'
-      : contextTabForMenu?.claudeSessionId && !contextTabForMenu?.codexSessionId
-        ? 'claude'
-        : contextTabForMenu?.codexSessionId && !contextTabForMenu?.claudeSessionId
-          ? 'codex'
-          : null;
+  const contextForkProvider = resolvePtyAgentOwner(contextTabForMenu || {});
   const contextForkSessionAvailable = contextForkProvider === 'claude'
     ? !!contextTabForMenu?.claudeSessionId
     : contextForkProvider === 'codex'
@@ -9151,10 +9177,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
               const isSDKBusy = tab?.tabType === 'claude-sdk' && claudeBusyMap.get(id);
               if (!processStatus.get(id) && !isSDKBusy) continue;
               const cmd = tab?.commandType;
+              const ptyOwner = resolvePtyAgentOwner(tab || {});
               if (tab?.tabType === 'claude-sdk') claudeCount++;
-              else if (cmd === 'claude') claudeCount++;
+              else if (ptyOwner === 'claude') claudeCount++;
               else if (cmd === 'gemini') geminiCount++;
-              else if (cmd === 'codex') codexCount++;
+              else if (ptyOwner === 'codex') codexCount++;
               else scriptCount++; // bash, devServer, shell-script — everything else with live process
             }
             const totalAI = claudeCount + geminiCount + codexCount;
@@ -9240,6 +9267,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
               await Promise.all(targetTabIds.map(id => {
                 const tab = workspace.tabs.get(id);
                 const cmd = tab?.commandType;
+                const ptyOwner = resolvePtyAgentOwner(tab || {});
                 // SDK route: cancel the in-process query (claude-sdk:stop). No PTY.
                 if (tab?.tabType === 'claude-sdk') {
                   if (!claudeBusyMap.get(id)) return null;
@@ -9247,7 +9275,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                   window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId: id } }));
                   return ipcRenderer.invoke('claude-sdk:stop', { tabId: id });
                 }
-                if (cmd !== 'claude' && cmd !== 'gemini' && cmd !== 'codex') return null;
+                if (!ptyOwner && cmd !== 'gemini') return null;
                 if (!processStatus.get(id)) return null;
                 return ipcRenderer.invoke('terminal:stop-ai-process', id);
               }).filter(Boolean));

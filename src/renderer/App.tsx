@@ -1,6 +1,7 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId } from './store/useWorkspaceStore';
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
+import { resolvePtyAgentOwner } from './utils/ptyAgentOwner.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
 import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG } from './utils/projectCardPresence.mjs';
@@ -19,6 +20,7 @@ import ControlHint from './components/UI/ControlHint';
 import Tooltip from './components/UI/Tooltip';
 import PromptPickerOverlay from './components/Workspace/PromptPickerOverlay';
 import TabSwitcherOverlay from './components/Workspace/TabSwitcherOverlay';
+import { getTabChromeColorConfig } from './components/Workspace/tabChrome';
 // Drag and drop
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -83,6 +85,7 @@ import { generateTabTitleFromSession } from './utils/generateTabTitle';
 import { linkFileTab } from './utils/linkFileTab';
 import { resolveDockBusyBadgeState } from './utils/dockBusyBadgeState.mjs';
 import { shouldNavigateProjectsWithArrow } from './utils/projectArrowNavigation.mjs';
+import { resolveFocusedTerminalSelection } from './utils/focusedTerminalContext.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -314,8 +317,19 @@ async function getDockBusyIconDataUrl(count: number, kind: 'active' | 'inherited
 // Shared predicate — see utils/aiForegroundProcess.mjs for why the match must
 // tolerate a path prefix (`node /opt/homebrew/bin/codex`).
 
-function isAiRuntimeTabLike(tab?: { commandType?: string; tabType?: string } | null): boolean {
-  return !!tab && (tab.tabType === 'claude-sdk' || tab.commandType === 'claude' || tab.commandType === 'gemini' || tab.commandType === 'codex');
+function isAiRuntimeTabLike(tab?: {
+  commandType?: string;
+  tabType?: string;
+  claudeSessionId?: string;
+  codexSessionId?: string;
+} | null): boolean {
+  return !!tab && (
+    tab.tabType === 'claude-sdk'
+    || tab.commandType === 'gemini'
+    || !!tab.claudeSessionId
+    || !!tab.codexSessionId
+    || resolvePtyAgentOwner(tab) !== null
+  );
 }
 
 function isSdkBusyStateLike(tab?: { sdkState?: string } | null): boolean {
@@ -1261,7 +1275,10 @@ function App() {
       }
 
       if (isAiRuntimeTabLike(tab)) {
-        return ipcRenderer.invoke('terminal:stop-ai-process', { tabId: id, toolType: tab.commandType || null });
+        return ipcRenderer.invoke('terminal:stop-ai-process', {
+          tabId: id,
+          toolType: resolvePtyAgentOwner(tab),
+        });
       }
 
       return ipcRenderer.invoke('terminal:deterministic-stop', { tabId: id, restart: false });
@@ -1655,14 +1672,15 @@ function App() {
         return next;
       });
       const workspaceState = useWorkspaceStore.getState();
-      let codexTabFinished = commandType === 'codex';
-      if (!codexTabFinished) {
-        for (const [, workspace] of workspaceState.openProjects) {
-          const tab = workspace.tabs.get(tabId);
-          if (tab) {
-            codexTabFinished = tab.commandType === 'codex';
-            break;
-          }
+      let codexTabFinished = false;
+      for (const [, workspace] of workspaceState.openProjects) {
+        const tab = workspace.tabs.get(tabId);
+        if (tab) {
+          codexTabFinished = resolvePtyAgentOwner({
+            ...tab,
+            commandType: commandType || tab.commandType,
+          }) === 'codex';
+          break;
         }
       }
       if (codexTabFinished) {
@@ -2016,9 +2034,7 @@ function App() {
         };
         const toolForTab = (tab: any | null): AgentHistoryTool | null => {
           if (!tab || tab.tabType === 'claude-sdk') return null;
-          if (tab.commandType === 'codex') return 'codex';
-          if (tab.commandType === 'claude') return 'claude';
-          return null;
+          return resolvePtyAgentOwner(tab);
         };
         const sessionIdForTab = (tab: any | null, toolType: AgentHistoryTool | null): string | null => {
           if (!tab || !toolType) return null;
@@ -2187,6 +2203,104 @@ function App() {
             projectId: INBOX_PROJECT_ID,
             path: inbox?.projectPath || getInboxProjectPath(),
             isOpen: !!inbox,
+          });
+        }
+        if (action === 'getFocusedTerminalContext') {
+          // Capture the exact visible terminal surface once. The async history
+          // probes below must not drift to whichever tab the user focuses next.
+          const liveState = useWorkspaceStore.getState();
+          const focused = resolveFocusedTerminalSelection(liveState);
+          if (!focused.selection) {
+            return reply(true, { context: null, reason: focused.reason });
+          }
+
+          const { projectId, tabId } = focused.selection;
+          const workspace = liveState.openProjects.get(projectId);
+          const liveTab = workspace?.tabs.get(tabId) as any;
+          if (!workspace || !liveTab) {
+            return reply(true, { context: null, reason: 'focused-tab-not-found' });
+          }
+          const tab = { ...liveTab };
+          const projectMeta = useProjectsStore.getState().projects?.[projectId];
+          const toolType = toolForTab(tab);
+          const chrome = getTabChromeColorConfig(tab);
+
+          let sessionStatus: AgentRuntimeStatus | null = null;
+          let sessionId: string | null = sessionIdForTab(tab, toolType);
+          let historySessionId: string | null = null;
+          let historyReady = false;
+          let historyReason = toolType ? 'history-not-materialized' : 'not-an-ai-history-tab';
+
+          const [materialization, presenceProof] = await Promise.all([
+            toolType === 'claude' ? readClaudeMaterialization(tab) : Promise.resolve(null),
+            toolType
+              ? getHistoryAgentRuntime(toolType).getPresence(tabId, projectId)
+                  .then((presence: any) => ({ presence, failed: false }))
+                  .catch(() => ({ presence: null, failed: true }))
+              : Promise.resolve({ presence: null, failed: false }),
+          ]);
+
+          if (toolType === 'claude') {
+            historyReady = materialization?.conversationMaterialized === true;
+            historySessionId = historyReady ? (tab.claudeSessionId || null) : null;
+            historyReason = historyReady
+              ? 'claude-materialized'
+              : (materialization?.materializationReason || 'history-not-materialized');
+          }
+
+          if (toolType) {
+            if (!presenceProof.failed) {
+              const presence = presenceProof.presence;
+              sessionStatus = presence?.status || 'unknown';
+              if (toolType === 'codex') {
+                const runtimeSnapshot = (presence as any)?.runtimeSnapshot as CodexRuntimeSessionSnapshot | null;
+                sessionId = getCodexDisplaySessionId(runtimeSnapshot) || tab.codexSessionId || null;
+                historySessionId = getCodexRuntimeReadSessionId(runtimeSnapshot);
+                historyReady = !!historySessionId;
+                historyReason = historyReady ? 'codex-read-session-proven' : 'codex-read-session-unavailable';
+              }
+            } else {
+              sessionStatus = 'unknown';
+              if (toolType === 'codex') {
+                sessionId = null;
+                historySessionId = null;
+                historyReady = false;
+                historyReason = 'runtime-proof-unavailable';
+              }
+            }
+          }
+
+          return reply(true, {
+            context: {
+              capturedAt: Date.now(),
+              project: {
+                id: projectId,
+                name: projectMeta?.name || workspace.projectPath?.split('/').pop() || projectId,
+                path: projectMeta?.path || workspace.projectPath || tab.cwd || null,
+                icon: projectMeta?.icon || null,
+              },
+              tab: {
+                id: tabId,
+                name: tab.name || 'Terminal',
+                tabType: tab.tabType || 'terminal',
+                commandType: tab.commandType || 'generic',
+                color: tab.color || 'default',
+                cwd: tab.cwd || workspace.projectPath || null,
+                status: sessionStatus,
+              },
+              agent: {
+                provider: toolType,
+                sessionId,
+                historySessionId,
+                historyReady,
+                historyReason,
+              },
+              appearance: {
+                borderColor: chrome.borderColor,
+                backgroundColor: chrome.bgColor,
+              },
+            },
+            reason: null,
           });
         }
         if (action === 'getOpenProjectIds') {
@@ -2568,7 +2682,7 @@ function App() {
           if (!tabId || !sessionId) return reply(false, null, 'tabId+sessionId required');
           const found = findTabProject(tabId);
           if (!found) return reply(false, null, 'tab not in any open project');
-          if (found.tab?.commandType !== 'codex') return reply(false, null, 'tab is not Codex');
+          if (resolvePtyAgentOwner(found.tab) !== 'codex') return reply(false, null, 'tab is not Codex');
           const committed = await useWorkspaceStore.getState().setCodexSessionId(tabId, sessionId, reason || 'api-edit-range');
           if (!committed) return reply(false, null, 'Codex session binding could not be committed');
           return reply(true, { tabId, sessionId });
@@ -2591,6 +2705,7 @@ function App() {
           for (const ws of state.openProjects.values()) {
             const t = ws.tabs.get(tabId);
             if (!t) continue;
+            const ptyOwner = resolvePtyAgentOwner(t);
             // PTY+Claude: current-session model/effort come from the same
             // confirmed active JSONL branch as the desktop ControlBar. The
             // renderer sentinels are only dedupe locks and miss manual terminal
@@ -2598,7 +2713,7 @@ function App() {
             // conversation.
             // Thinking is always "adaptive" on PTY — controlled by claude:toggle-thinking,
             // not surfaced as a separate param in the mobile UI here.
-            if (t.commandType === 'claude' && t.tabType !== 'claude-sdk') {
+            if (ptyOwner === 'claude' && t.tabType !== 'claude-sdk') {
               let model = 'default';
               let confirmedEffort: string | null = null;
               try {
@@ -2655,7 +2770,7 @@ function App() {
                 contextPct,
               });
             }
-            if (t.commandType === 'codex' && t.tabType !== 'claude-sdk') {
+            if (ptyOwner === 'codex' && t.tabType !== 'claude-sdk') {
               // Codex has no bridge metadata; last-known % lives in SQLite (written
               // by emitCodexContextPct's persist path). Same on-open seed contract.
               let contextPct: number | null = null;
@@ -2759,11 +2874,12 @@ function App() {
             if (t) { tab = t; break; }
           }
           if (!tab) return reply(false, null, 'tab not open');
+          const ptyOwner = resolvePtyAgentOwner(tab);
           // PTY+Claude: dispatch slash commands. /model X works any time;
           // /effort Y only takes effect when Claude is at the prompt — but
           // safePasteAndSubmit serialises via its per-term mutex, so even
           // during a turn the command queues correctly.
-          if (tab.commandType === 'claude' && tab.tabType !== 'claude-sdk') {
+          if (ptyOwner === 'claude' && tab.tabType !== 'claude-sdk') {
             if (model !== undefined) {
               const modelSentinel = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
               const previousModelSentinel = modelSentinel?.get(tabId);
@@ -2825,7 +2941,7 @@ function App() {
             }
             return reply(true, { tabId, model, effort, thinking });
           }
-          if (tab.commandType === 'codex' && tab.tabType !== 'claude-sdk') {
+          if (ptyOwner === 'codex' && tab.tabType !== 'claude-sdk') {
             const ui = useUIStore.getState();
             const defaultModel = cleanDefaultSetting(ui.defaultCodexModel) || DEFAULT_CODEX_MODEL;
             const defaultEffort = cleanDefaultSetting(ui.defaultCodexEffort) || DEFAULT_CODEX_EFFORT;
@@ -3022,8 +3138,9 @@ function App() {
               if (t.parentTabId) continue;
               if (t.id === ownerTabId) continue;
               const isSDK = t.tabType === 'claude-sdk';
-              const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
-              const isCodex = !isSDK && t.commandType === 'codex' && !!t.codexSessionId;
+              const ptyOwner = resolvePtyAgentOwner(t);
+              const isClaudePTY = !isSDK && ptyOwner === 'claude' && !!t.claudeSessionId;
+              const isCodex = !isSDK && ptyOwner === 'codex' && !!t.codexSessionId;
               const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
               let kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex' | null = null;
               if (isSDK) kind = 'claude-sdk';
@@ -4368,11 +4485,10 @@ function App() {
             const tabs: { tabId: string; sessionId: string; engine: 'claude' | 'codex'; cwd?: string }[] = [];
             for (const [, ws] of s.openProjects) {
               for (const [tabId, tab] of ws.tabs) {
-                if (tab.wasInterrupted && tab.claudeSessionId && !tab.overlayDismissed &&
-                    (tab.commandType === 'claude' || tab.color === 'claude')) {
+                const owner = resolvePtyAgentOwner(tab);
+                if (tab.wasInterrupted && owner === 'claude' && tab.claudeSessionId && !tab.overlayDismissed) {
                   tabs.push({ tabId, sessionId: tab.claudeSessionId, engine: 'claude', cwd: tab.cwd });
-                } else if (tab.wasInterrupted && tab.codexSessionId && !tab.overlayDismissed &&
-                           tab.commandType === 'codex') {
+                } else if (tab.wasInterrupted && owner === 'codex' && tab.codexSessionId && !tab.overlayDismissed) {
                   tabs.push({ tabId, sessionId: tab.codexSessionId, engine: 'codex', cwd: tab.cwd });
                 }
               }
@@ -4785,7 +4901,7 @@ function App() {
                 const busyAi: { id: string; name: string }[] = [];
                 for (const id of selected) {
                   const tab = activeProject.tabs.get(id) as any;
-                  const isAiTab = tab?.tabType === 'claude-sdk' || tab?.commandType === 'claude' || tab?.commandType === 'gemini' || tab?.commandType === 'codex';
+                  const isAiTab = isAiRuntimeTabLike(tab);
                   const aiBusy = readLiveTabTurnBusy(id);
                   if (isAiTab && aiBusy) {
                     busyAi.push({ id, name: tab?.name || 'AI' });

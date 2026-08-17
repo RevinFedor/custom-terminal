@@ -80,6 +80,33 @@ test('deletes one middle Codex turn without changing the source records', () => 
   assert.equal(JSON.stringify(records), before);
 });
 
+test('response_item-only user turn remains editable as one real turn', () => {
+  const records = [
+    record('session_meta', { id: 'response-only-session', cwd: '/tmp/project' }, '2026-08-17T10:24:26.000Z'),
+    record('event_msg', { type: 'task_started' }, '2026-08-17T10:24:26.100Z'),
+    record('response_item', {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'response-only turn' }],
+    }, '2026-08-17T10:24:26.200Z'),
+    assistantRecord('answer', '2026-08-17T10:24:27.000Z'),
+    record('event_msg', { type: 'task_complete', last_agent_message: 'answer' }, '2026-08-17T10:24:27.100Z'),
+  ].map((entry, index) => ({ ...entry, __line: index }));
+  const timeline = _api.buildCodexTimeline(records, 'response-only-session');
+  const target = timeline.find((entry) => entry.type === 'user');
+  assert.equal(target?.content, 'response-only turn');
+
+  const plan = _api.planCodexRangeRewrite(
+    records,
+    'response-only-session',
+    target.uuid,
+    target.uuid,
+  );
+  assert.equal(plan.success, true);
+  assert.equal(plan.removedUsers, 1);
+  assert.deepEqual(userTexts(plan.outputRecords), []);
+});
+
 test('deletes an arbitrary Codex range across compact records without extending to the start', () => {
   const records = rangeFixture();
   const timeline = _api.buildCodexTimeline(records, 'source-session');

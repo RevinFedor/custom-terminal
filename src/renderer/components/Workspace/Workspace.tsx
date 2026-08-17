@@ -30,6 +30,7 @@ import {
   directoryChangeEventNames,
   planWorkingDirectoryChange,
 } from '../../utils/workingDirectoryChange.mjs';
+import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -355,15 +356,12 @@ export default function Workspace() {
   const isCommandRunning = effectiveTab?.id
     ? commandRunningByTab.get(effectiveTab.id) === true
     : false;
-  const primaryHistoryTool = effectiveCommandType === 'codex'
-    ? 'codex'
-    : effectiveCommandType === 'claude'
-      ? 'claude'
-      : effectiveCodexSessionId && !effectiveClaudeSessionId
-        ? 'codex'
-        : effectiveClaudeSessionId
-          ? 'claude'
-          : null;
+  const effectivePtyOwner = resolvePtyAgentOwner({
+    commandType: effectiveCommandType,
+    claudeSessionId: effectiveClaudeSessionId,
+    codexSessionId: effectiveCodexSessionId,
+  });
+  const primaryHistoryTool = effectivePtyOwner;
   // A tab that owns the History ↔ terminal surface pair. Which of the two
   // holds the center is this tab's user choice. Both layouts render the SAME
   // HistoryPanel and the SAME xterm; only their presentation changes.
@@ -1122,18 +1120,18 @@ export default function Workspace() {
   // Requiring cmdType match caused timeline to permanently disappear.
   // Split mode: each pane renders its OWN Timeline column — the global one
   // would be a second rail for the focused tab.
-  const showTimeline = !filePreview && !splitActiveLayout
-    && (effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId);
-  const timelineSessionId = effectiveCodexSessionId && effectiveCommandType === 'codex'
+  const timelineToolType = effectivePtyOwner
+    || (effectiveCommandType === 'gemini' && effectiveGeminiSessionId ? 'gemini' : null);
+  const timelineSessionId = timelineToolType === 'codex'
     ? effectiveCodexSessionId
-    : effectiveGeminiSessionId && effectiveCommandType === 'gemini'
-      ? effectiveGeminiSessionId
-      : effectiveClaudeSessionId;
-  const timelineToolType = (effectiveCodexSessionId && effectiveCommandType === 'codex'
-    ? 'codex'
-    : effectiveGeminiSessionId && effectiveCommandType === 'gemini'
-      ? 'gemini'
-      : 'claude') as 'claude' | 'gemini' | 'codex';
+    : timelineToolType === 'claude'
+      ? effectiveClaudeSessionId
+      : timelineToolType === 'gemini'
+        ? effectiveGeminiSessionId
+        : null;
+  const showTimeline = !filePreview && !splitActiveLayout
+    && !!timelineToolType
+    && !!timelineSessionId;
   // Timeline can hold hundreds of rendered rows. Switching its owner in the
   // urgent tab-click render synchronously tears down the old tree before the
   // new primary History surface can paint. Keep the previous Timeline owner
@@ -1146,7 +1144,7 @@ export default function Workspace() {
           tabId: effectiveTab.id,
           sessionId: timelineSessionId || '',
           cwd: effectiveTab.cwd || currentProject?.path || '',
-          toolType: timelineToolType,
+          toolType: timelineToolType as 'claude' | 'gemini' | 'codex',
         }
       : null),
     [showTimeline, effectiveTab?.id, effectiveTab?.cwd, timelineSessionId, timelineToolType, currentProject?.path],
@@ -1371,12 +1369,7 @@ export default function Workspace() {
 
       const claudeSessionId = ownerTab.claudeSessionId || null;
       const codexSessionId = ownerTab.codexSessionId || null;
-      const toolType = ownerTab.commandType === 'codex'
-        || (codexSessionId && !claudeSessionId)
-        ? 'codex'
-        : ownerTab.commandType === 'claude' || claudeSessionId
-          ? 'claude'
-          : null;
+      const toolType = resolvePtyAgentOwner(ownerTab);
       const sessionId = toolType === 'codex' ? codexSessionId : toolType === 'claude' ? claudeSessionId : null;
       const runtime = toolType ? getHistoryAgentRuntime(toolType) : null;
       let presence = runtime

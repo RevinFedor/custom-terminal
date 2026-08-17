@@ -242,6 +242,75 @@ test('one allowlisted canonical Codex record produces promotable audit data', as
   assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
 });
 
+test('restart promotes a two-image response_item user carrier when event_msg is absent', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-codex-response-user-');
+  const transcriptPath = path.join(dir, 'codex.jsonl');
+  const expected = '[imagePath: /tmp/first.png]<pasted_content>question</pasted_content>'
+    + '[imagePath: /tmp/second.png]';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await codexBoundary(transcriptPath);
+  await fs.promises.appendFile(transcriptPath, JSON.stringify({
+    timestamp: '2026-08-17T10:19:49.357Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,first' },
+        { type: 'input_text', text: '<pasted_content>question</pasted_content>' },
+        { type: 'input_image', image_url: 'data:image/png;base64,second' },
+      ],
+    },
+  }) + '\n');
+
+  const source = unresolvedRecord('codex', boundary, expected);
+  const result = await reconcileAgentSendStartupRecord(source);
+  assert.equal(result.decision, 'found');
+  assert.equal(result.reason, 'codex_image_placeholder_canonical');
+  assert.equal(result.audit.canonicalized, true);
+  assert.equal(result.audit.canonicalReason, 'codex_image_placeholder_canonical');
+  assert.equal(result.audit.recordByteOffset, 0);
+  assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
+});
+
+test('restart promotes the exact Codex XML-like image carrier as one slot per asset', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-codex-xml-images-');
+  const transcriptPath = path.join(dir, 'codex.jsonl');
+  const expected = '[imagePath: /Users/test/Application Support/one.png]'
+    + '[imagePath: /Users/test/Application Support/two.png]'
+    + 'question'
+    + '[imagePath: /Users/test/Application Support/three.png]';
+  const transportPaths = ['/tmp/one.png', '/tmp/two.png', '/tmp/three.png'];
+  const actual = transportPaths
+    .map((imagePath, index) => (
+      `<image name=[Image #${index + 1}] path="${imagePath}">\n`
+      + '<<ImageDisplayed>>\n</image>'
+    ))
+    .slice(0, 2)
+    .join('')
+    + 'question'
+    + `<image name=[Image #3] path="${transportPaths[2]}">\n<<ImageDisplayed>>\n</image>`;
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await codexBoundary(transcriptPath);
+  await fs.promises.appendFile(transcriptPath, JSON.stringify({
+    timestamp: '2026-08-17T11:34:40.102Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: actual }],
+    },
+  }) + '\n');
+
+  const result = await reconcileAgentSendStartupRecord(
+    unresolvedRecord('codex', boundary, expected),
+  );
+  assert.equal(result.decision, 'found');
+  assert.equal(result.reason, 'codex_image_placeholder_canonical');
+  assert.equal(result.audit.canonicalized, true);
+  assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
+});
+
 test('startup reconciliation accepts only the declared Codex CRLF to double-LF materialization', async (t) => {
   const dir = await tempDir(t, 'agent-startup-codex-crlf-');
   const transcriptPath = path.join(dir, 'codex.jsonl');

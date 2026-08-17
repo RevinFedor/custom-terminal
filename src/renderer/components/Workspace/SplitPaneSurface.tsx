@@ -7,6 +7,7 @@ import Timeline from './Timeline';
 import ClaudeControlBar from './ClaudeControlBar';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
+import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -74,12 +75,16 @@ export default function SplitPaneSurface({
   const sideHistoryOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
   const setHistoryPanelOpen = useUIStore((state) => state.setHistoryPanelOpen);
 
-  const isCodex = commandType === 'codex'
-    || (commandType !== 'claude' && !!codexSessionId && !claudeSessionId);
+  const ptyAgentOwner = resolvePtyAgentOwner({
+    commandType,
+    claudeSessionId,
+    codexSessionId,
+  });
+  const isCodex = ptyAgentOwner === 'codex';
   const isAgentTab = tabType !== 'claude-sdk'
     && tabType !== 'browser'
     && tabType !== 'file'
-    && (commandType === 'claude' || commandType === 'codex' || !!claudeSessionId || !!codexSessionId);
+    && ptyAgentOwner !== null;
   const historySelected = isAgentTab && !terminalIsPrimary;
   const agentSessionId = isCodex ? codexSessionId : claudeSessionId;
   const agentToolType: 'claude' | 'codex' = isCodex ? 'codex' : 'claude';

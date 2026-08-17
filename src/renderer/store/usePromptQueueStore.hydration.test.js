@@ -219,7 +219,9 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.equal(
     queueModule.buildQueuedPromptPayload(queue.items[0]),
     [
-      'updated instruction',
+      // Сохранённый промпт уезжает в своей метке — ровно как вставка ниже, и по
+      // той же причине: чип в истории должен читаться из самого текста.
+      '<saved_prompt name="PROMPT">\nupdated instruction\n</saved_prompt>',
       '<pasted_content>\nraw paste\n</pasted_content>',
       '[imagePath: /durable/a.png] compare [imagePath: /durable/b.png]',
     ].join('\n\n'),

@@ -327,7 +327,7 @@ GET  /api/terminal-tabs/:tabId/history              → JSON or NDJSON (Accept-d
                                                → Accept: application/x-ndjson → streamed line-by-line, Brotli-4
 POST /api/terminal-tabs/:tabId/truncate              → drop everything ≥ targetUuid (Edit/Repeat)
 GET  /api/terminal-tabs/:tabId/timeline             → parseTimelineEntries
-POST /api/terminal-tabs/:tabId/rewind               → native rewind/backtrack через общий agent scenario; при stopped session сначала resume + readiness
+POST /api/terminal-tabs/:tabId/rewind               → общий agent scenario; `mode:native` делает native rewind/backtrack, `mode:ai` делает тот же native rewind и auto-submit Gemini-сводки; при stopped session сначала resume + readiness
 GET  /api/terminal-tabs/:tabId/params               → параметры модели/effort/think для agent tab
 POST /api/terminal-tabs/:tabId/params               → применить параметры через runtime-specific path
 POST /api/terminal-tabs/:tabId/codex/fast           → одноразовая live-команда `/fast` для Codex PTY, НЕ persistent params; успех может вернуть `serviceTier`/`notice` из TUI submit-frame
@@ -367,6 +367,8 @@ GET  /api/terminal-tabs/:tabId/status                → status строка (in
 ```
 
 Для Claude/Codex PTY-табов расширение mobile-web — см. `fact-mobile-claude-pty.md`. `/send`, `/stop`, `/interrupt`, `/draft`, `/draft-state` и `/rewind` роутятся через общий scenario layer: backend сам выбирает Claude PTY/Codex PTY runtime, а endpoint остаётся Project Terminal API. Legacy SDK fallback существует только для старых SDK-табов, не как модель нового API.
+
+Название `AI` на iOS и сиреневый `AI` в desktop Timeline пока не означает один mutation-контракт. Mobile `POST .../rewind {mode:"ai"}` сначала выполняет native откат живой Claude/Codex-сессии, затем отправляет Gemini-сводку агенту как новый prompt. Desktop `AI` в single/range context menu переписывает сохранённый диапазон истории и заменяет его сводкой только после review/Apply; соседний desktop `Chat` вообще оставляет Rewind-промпт неотправленным для ручной правки. Простое переименование desktop-кнопок поэтому не меняет iOS и внешних клиентов. Сводить эти пути можно только отдельным расширением Project API для history-rewrite/prepare-chat, а не переопределением существующего `mode:"ai"`: старый мобильный capability native rollback + auto-submit должен сохраниться.
 
 `/start` и `/resume` — часть того же Project Terminal API, а не сырой bridge proxy. Успешный ответ доказывает готовность live runtime/composer'а к следующей команде; bridge failure/runtime readiness timeout возвращаются как non-success JSON. После ожидания startup defaults сервер обязательно перечитывает единый свежий runtime snapshot: readiness до ожидания не переживает Exit/Stop автоматически. Ошибка defaults при всё ещё живом и заново доказанном runtime не равна failed resume: ответ несёт `startupDefaultsReady=false`/`startupDefaultsError`, а клиент показывает warning/error gate без вечного `starting`. Если свежий snapshot уже `stopping/inactive`, потерял `inputReady` или недоступен, ответ не может сохранить старое `ready:true`. Native клиент после настоящей action-ошибки должен снять локальный `starting`, а не ждать следующего poll/SSE snapshot'а, потому что `starting busy=false` после failed resume часто является stale startup state.
 

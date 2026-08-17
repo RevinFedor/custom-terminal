@@ -409,6 +409,7 @@ function shouldMarkSourceFollowupUnconfirmed(run, reconciliation) {
     && run.sourceFollowupPending === true
     && !run.sourceFollowupStartedAt
     && (run.notificationStatus === 'sending'
+      || run.notificationStatus === 'audit-pending'
       || run.notificationStatus === 'sent'
       || run.notificationStatus === 'queued');
 }
@@ -656,9 +657,20 @@ function outcomeForReason(reason) {
   const value = String(reason || '').toLowerCase();
   if (value.includes('target_closed') || value.includes('target-closed') || value === 'close') return 'target_closed';
   if (value.includes('startup')) return 'startup_failed';
+  if (value.includes('replace')) return 'process_replaced';
+  if (value === 'pty-exit'
+    || value === 'terminal-kill'
+    || value === 'watchdog'
+    || value === 'command-finished'
+    || value === 'exit'
+    || value.includes('process-exit')
+    || value.includes('process_killed')) return 'process_exited';
   if (value.includes('process') && (value.includes('exit') || value.includes('killed'))) return 'process_exited';
   if (value.includes('no-final-result')) return 'failed';
-  if (value.includes('abort') || value.includes('interrupt') || value.includes('manual-stop')) return 'interrupted';
+  if (value.includes('abort')
+    || value.includes('interrupt')
+    || value.includes('manual-stop')
+    || value === 'stopping') return 'interrupted';
   if (value.includes('failed') || value.includes('error')) return 'failed';
   return isAbortedReason(value) ? 'unknown' : 'success';
 }
@@ -668,7 +680,8 @@ function canExactResultResolveRecovery(run) {
   if (['target_closed', 'process_exited', 'process_replaced'].includes(run.outcome)) return true;
   const error = String(run.error || '').toLowerCase();
   return error.includes('delivery outcome is unknown')
-    || error.includes('bridge_timeout_delivery_unknown');
+    || error.includes('bridge_timeout_delivery_unknown')
+    || error.includes('result proof deadline');
 }
 
 function clampDelay(value, fallback) {
@@ -1290,10 +1303,6 @@ class OrchestrationRunStore {
         changed,
       };
     }
-    if (isTerminalStatus(run.status)) {
-      return { confirmed: false, reason: 'run-already-settled', run: publicRun(run), changed };
-    }
-
     const parsedAuditAt = Date.parse(String(proof.auditTimestamp || ''));
     const requestedNow = Number(options.now);
     const now = Number.isFinite(requestedNow)
@@ -1328,8 +1337,19 @@ class OrchestrationRunStore {
         }
       : bindPromptProofExecutionContext(run, proof);
 
+    const repairableUnknownDelivery = run.status === 'waiting_recovery'
+      && canExactResultResolveRecovery(run);
+    if (repairableUnknownDelivery) {
+      run.outcome = null;
+      run.error = null;
+      run.recoveryDeadlineAt = null;
+      run.completionReason = null;
+      run.ownCompletedAt = null;
+    }
+
     const predecessor = run.predecessorRunId ? this.runs.get(run.predecessorRunId) : null;
-    if (!isPausedRun(run)
+    if (!isTerminalStatus(run.status)
+      && !isPausedRun(run)
       && run.resumeAwaitingNewTurn !== true
       && run.deliveryAcceptedAt
       && (!predecessor || !ownsTargetExecution(predecessor))) {
@@ -1340,6 +1360,7 @@ class OrchestrationRunStore {
       run.deliveryTransportUnknownAt = null;
       run.deliveryTransportError = null;
     }
+    const adoptedChildRunIds = this._adoptExactOrphanChildren(run, changed, now);
     run.updatedAt = now;
     this._pushChanged(changed, run);
     this._schedulePersist();
@@ -1347,6 +1368,7 @@ class OrchestrationRunStore {
       confirmed: true,
       contextBound: contextBinding.contextBound,
       contextReason: contextBinding.contextReason,
+      adoptedChildRunIds,
       run: publicRun(run),
       changed,
     };
@@ -1467,6 +1489,47 @@ class OrchestrationRunStore {
 
   async applyLifecycle(tabId, payload = {}) {
     await this.initialize();
+    if (payload.type === 'background-work') {
+      const changed = [];
+      const settled = [];
+      const count = Math.max(0, Number(payload.backgroundWorkCount) || 0);
+      const candidates = this._activeForTarget(tabId).filter((run) => (
+        run.waitingForInternalDescendants === true
+        && run.targetBusySeen !== true
+        && (run.internalBackgroundWorkProvider || run.targetToolType) === 'codex'
+      ));
+      if (candidates.length !== 1) {
+        return {
+          changed,
+          settled,
+          completed: [],
+          ignored: true,
+          ignoreReason: candidates.length === 0
+            ? 'background-work-owner-unavailable'
+            : 'background-work-owner-ambiguous',
+        };
+      }
+      const run = candidates[0];
+      const now = Date.now();
+      run.internalBackgroundWorkCount = count;
+      run.updatedAt = now;
+      if (count === 0) {
+        run.waitingForInternalDescendants = false;
+        run.ownCompletedAt ||= now;
+        run.completionReason ||= 'codex-background-work-complete';
+        run.outcome = 'success';
+        this._settleSuccessfulRun(run, changed, settled, now);
+        this._refreshAncestors(run.parentRunId, changed, settled, now);
+      } else {
+        this._pushChanged(changed, run);
+      }
+      this._schedulePersist();
+      return {
+        changed,
+        settled,
+        completed: settled.filter((item) => item.status === 'completed'),
+      };
+    }
     const activityResult = payload.type === 'busy' && payload.busy === true
       ? this._recordTargetActivity(tabId, {
           source: 'lifecycle-busy',
@@ -1542,7 +1605,30 @@ class OrchestrationRunStore {
         head.targetLifecycleGeneration = payload.lifecycleGeneration;
       }
       const generationCheck = lifecycleGenerationCheck(head, payload.lifecycleGeneration);
-      if (generationCheck.verdict === 'changed' || generationCheck.verdict === 'unknown') {
+      if (generationCheck.verdict === 'changed') {
+        this._beginRecovery(
+          head,
+          'process_replaced',
+          'target process ownership changed: ' + generationCheck.reason,
+          changed,
+          settled,
+          now,
+        );
+        head.observedLifecycleGeneration = payload.lifecycleGeneration || null;
+        head.updatedAt = now;
+        this._refreshAncestors(head.parentRunId, changed, settled, now);
+        this._schedulePersist();
+        return {
+          changed,
+          settled,
+          completed: [],
+          ignored: false,
+          generationVerdict: generationCheck.verdict,
+          expectedLifecycleGeneration: head.targetLifecycleGeneration || null,
+          observedLifecycleGeneration: payload.lifecycleGeneration || null,
+        };
+      }
+      if (generationCheck.verdict === 'unknown') {
         return {
           changed,
           settled,
@@ -1605,13 +1691,27 @@ class OrchestrationRunStore {
             || executionContext?.provider
             || normalizeExecutionContext(head.targetExecutionContext)?.provider
             || null;
-          if (outcome === 'success' && provider === 'claude' && backgroundWorkCount > 0) {
+          const promptProofMissing = head.requiresTargetPromptProof === true
+            && !head.targetPromptProofAt;
+          if (outcome === 'success' && promptProofMissing) {
+            head.ownCompletedAt = now;
+            head.completionReason = payload.reason || 'turn-complete-without-prompt-proof';
+            this._beginRecovery(
+              head,
+              'unknown',
+              'delivery outcome is unknown: target turn ended before exact prompt proof',
+              changed,
+              settled,
+              now,
+            );
+          } else if (outcome === 'success' && backgroundWorkCount > 0) {
             head.status = 'running';
             head.outcome = null;
             head.ownCompletedAt = null;
             head.completionReason = null;
             head.waitingForInternalDescendants = true;
             head.internalBackgroundWorkCount = backgroundWorkCount;
+            head.internalBackgroundWorkProvider = provider;
             head.internalContinuationBaseline = Number(head.internalContinuationCountSeen || 0);
             head.internalTurnStoppedAt = now;
             head.updatedAt = now;
@@ -1739,7 +1839,7 @@ class OrchestrationRunStore {
       run.parentFollowupPending = false;
       const sameParentTurn = followupContext.disposition === 'same-active-turn'
         || followupContext.disposition === 'same-settled-turn';
-      if (!isPausedRun(parent) && !sameParentTurn) {
+      if (causalParent && !sameParentTurn) {
         parent.resultPromptHash = run.notificationPromptHash || parent.resultPromptHash || null;
         parent.resultPromptProofUserUuid = proof.userUuid || parent.resultPromptProofUserUuid || null;
         parent.resultAfterAt = null;
@@ -2057,6 +2157,31 @@ class OrchestrationRunStore {
     this._refreshAncestors(run.parentRunId, changed, settled, now);
     this._schedulePersist();
     return { changed, settled };
+  }
+
+  async beginResultProofRecovery(runId, reason = 'result proof deadline elapsed', options = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run || run.status !== 'completed' || run.resultComplete === true) {
+      return { changed: [], settled: [], run: publicRun(run) };
+    }
+    const now = Number(options.now) || Date.now();
+    const changed = [];
+    const settled = [];
+    run.completedAt = null;
+    run.resultProofDeadlineAt = null;
+    this._beginRecovery(
+      run,
+      'failed',
+      reason,
+      changed,
+      settled,
+      now,
+      options.failureGraceMs,
+    );
+    this._refreshAncestors(run.parentRunId, changed, settled, now);
+    this._schedulePersist();
+    return { changed, settled, run: publicRun(run) };
   }
 
   async handleSourceClosed(tabId) {
@@ -2530,9 +2655,32 @@ class OrchestrationRunStore {
       && !isTerminalStatus(run.status)
       && !isPausedRun(run)
       && run.resumeAwaitingNewTurn !== true
+      && (run.requiresTargetPromptProof !== true || !!run.targetPromptProofAt)
       && executionContextsMatch(run.targetExecutionContext, sourceExecutionContext)
     ));
     return matches.length === 1 ? matches[0].runId : null;
+  }
+
+  _adoptExactOrphanChildren(parent, changed, now = Date.now()) {
+    if (!parent
+      || isTerminalStatus(parent.status)
+      || isPausedRun(parent)
+      || parent.resumeAwaitingNewTurn === true
+      || (parent.requiresTargetPromptProof === true && !parent.targetPromptProofAt)) return [];
+    const parentContext = normalizeExecutionContext(parent.targetExecutionContext);
+    if (!parentContext) return [];
+    const adopted = [];
+    for (const child of this.runs.values()) {
+      if (child.runId === parent.runId
+        || child.parentRunId
+        || child.sourceTabId !== parent.targetTabId
+        || !executionContextsMatch(child.sourceExecutionContext, parentContext)) continue;
+      child.parentRunId = parent.runId;
+      child.updatedAt = now;
+      adopted.push(child.runId);
+      this._pushChanged(changed, child);
+    }
+    return adopted;
   }
 
   _validateParent(parentRunId, input) {

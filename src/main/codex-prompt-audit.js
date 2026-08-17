@@ -14,6 +14,92 @@ function collectCodexPayloadImagePaths(payload) {
   return paths;
 }
 
+function isCodexUserMessageAuditRecord(record) {
+  const payload = record?.payload || {};
+  return (record?.type === 'event_msg' && payload.type === 'user_message')
+    || (
+      record?.type === 'response_item'
+      && payload.type === 'message'
+      && payload.role === 'user'
+    );
+}
+
+function codexUserMessageAuditText(record) {
+  if (!isCodexUserMessageAuditRecord(record)) return null;
+  const payload = record?.payload || {};
+  if (typeof payload.message === 'string') return payload.message;
+  if (typeof payload.text === 'string') return payload.text;
+  if (!Array.isArray(payload.content)) return null;
+  const parts = [];
+  for (const item of payload.content) {
+    if (typeof item === 'string') {
+      parts.push(item);
+      continue;
+    }
+    const type = String(item?.type || '').toLowerCase();
+    if (
+      type.includes('image')
+      || typeof item?.image_url === 'string'
+      || typeof item?.imageUrl === 'string'
+    ) {
+      // response_item can be the only durable carrier for an image prompt.
+      // Preserve the exact content order without retaining its huge data URL.
+      parts.push(' [Image] ');
+    } else if (typeof item?.text === 'string') {
+      parts.push(item.text);
+    } else if (typeof item?.value === 'string') {
+      parts.push(item.value);
+    } else if (typeof item?.message === 'string') {
+      parts.push(item.message);
+    }
+  }
+  return parts.length > 0 ? parts.join('') : null;
+}
+
+function codexUserCarrierTextsMatch(left, right) {
+  const a = String(left ?? '');
+  const b = String(right ?? '');
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return !!codexCanonicalUserMessageMatch({ expectedText: a }, b)
+    || !!codexCanonicalUserMessageMatch({ expectedText: b }, a);
+}
+
+function selectCodexPreferredUserMessageAuditRecords(candidates) {
+  const source = Array.isArray(candidates) ? candidates : [];
+  const events = source
+    .filter((candidate) => candidate?.record?.type === 'event_msg')
+    .map((candidate) => ({
+      candidate,
+      text: codexUserMessageAuditText(candidate.record),
+      claimed: false,
+    }));
+  const selected = [...events.map((item) => item.candidate)];
+  for (const candidate of source) {
+    if (candidate?.record?.type !== 'response_item') continue;
+    const text = codexUserMessageAuditText(candidate.record);
+    const responseOffset = Number(candidate?.byteOffset);
+    const paired = events.find((event) => {
+      if (event.claimed || !codexUserCarrierTextsMatch(text, event.text)) return false;
+      const eventOffset = Number(event.candidate?.byteOffset);
+      return !Number.isFinite(responseOffset)
+        || !Number.isFinite(eventOffset)
+        || eventOffset >= responseOffset;
+    });
+    if (paired) {
+      paired.claimed = true;
+      continue;
+    }
+    selected.push(candidate);
+  }
+  return selected.sort((left, right) => {
+    const a = Number(left?.byteOffset);
+    const b = Number(right?.byteOffset);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+    return a - b;
+  });
+}
+
 function codexPromptHasImageMarker(text) {
   return /\[(?:Image(?:\s+#?\d+)?|imagePath:\s*[^\]\r\n]+?|imageError:\s*[^\]\r\n]+?|image:\s*[^\]\r\n]+?)\]/i.test(String(text || ''));
 }
@@ -21,6 +107,11 @@ function codexPromptHasImageMarker(text) {
 function normalizeCodexPromptImageSlots(text, imagePaths = []) {
   let value = String(text || '');
   value = value
+    // Newer Codex response_item user carriers wrap each transported image as
+    // one XML-like block. The label and path describe the SAME slot; treating
+    // them independently doubles the image count and leaves CONFIRMING stuck.
+    .replace(/<image\s+name\s*=\s*["']?\[Image(?:\s+#?\d+)?\]["']?\s+path\s*=\s*(?:"[^"]+"|'[^']+'|[^\s>]+)\s*>\s*<<ImageDisplayed>>\s*<\/image\s*>/gi, ' [Image] ')
+    .replace(/<image\s+name\s*=\s*["']?\[Image(?:\s+#?\d+)?\]["']?\s+path\s*=\s*(?:"[^"]+"|'[^']+'|[^\s>]+)\s*\/?>/gi, ' [Image] ')
     .replace(/\[imagePath:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
     .replace(/\[imageError:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
     .replace(/\[image:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
@@ -59,7 +150,10 @@ function codexCanonicalUserMessageMatch(audit, actualText) {
   }
 
   const payload = audit?.actualPayload || null;
-  const imagePaths = collectCodexPayloadImagePaths(payload);
+  const imagePaths = [
+    ...collectCodexPayloadImagePaths(payload),
+    ...(Array.isArray(audit?.expectedImagePaths) ? audit.expectedImagePaths : []),
+  ];
   if ((imagePaths.length > 0 || codexPromptHasImageMarker(expected) || codexPromptHasImageMarker(actual))
     && normalizeCodexPromptImageSlots(expected, imagePaths) === normalizeCodexPromptImageSlots(actual, imagePaths)) {
     return { reason: 'codex_image_placeholder_canonical' };
@@ -163,8 +257,11 @@ function partitionCodexPendingPromptAuditsForRetention(
 
 // A provisional Resume watcher intentionally withholds normal lifecycle
 // processing until writer ownership is proven. The first post-Enter
-// user_message is itself part of that proof, so it needs a narrow parser that
-// can inspect only audit records without publishing busy/history state. Keep a
+// user carrier is itself part of that proof, so it needs a narrow parser that
+// can inspect only audit records without publishing busy/history state. Codex
+// normally writes event_msg/user_message, but image-bearing turns can persist
+// only response_item/message(role=user). Both are exact provider-owned input
+// records. Keep a
 // separate partial buffer from the normal turn parser: once ownership is
 // accepted, the held byte range is replayed through the full parser.
 function consumeCodexUserMessageAuditChunk({
@@ -189,7 +286,7 @@ function consumeCodexUserMessageAuditChunk({
     if (text) {
       try {
         const record = JSON.parse(text);
-        if (record?.type === 'event_msg' && record?.payload?.type === 'user_message') {
+        if (isCodexUserMessageAuditRecord(record)) {
           records.push({
             record,
             byteOffset: combinedStartOffset + lineStart,
@@ -213,12 +310,16 @@ function consumeCodexUserMessageAuditChunk({
 }
 
 module.exports = {
+  codexUserMessageAuditText,
+  codexUserCarrierTextsMatch,
   codexAuditRecordIsAfterBoundary,
   codexCanonicalUserMessageMatch,
   codexPromptHasImageMarker,
   collectCodexPayloadImagePaths,
   consumeCodexUserMessageAuditChunk,
+  isCodexUserMessageAuditRecord,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
   selectCodexPendingPromptAudit,
+  selectCodexPreferredUserMessageAuditRecords,
 };

@@ -8,6 +8,7 @@
 //   GET  /api/me                                 → { ok: true } if token valid
 //   GET  /api/agent-models                        → { codex:[…], claude:[…] } model catalog
 //   GET  /api/projects                            → all projects from DB
+//   GET  /api/focused-terminal-context             → exact terminal surface focused in desktop UI
 //   GET  /api/projects/:projectId/tabs            → tabs of one project (DB)
 //   POST /api/projects/:projectId/agent-tabs       → create Claude/Codex terminal tab
 //   POST /api/terminal-tabs/:tabId/send            → send prompt through scenario layer
@@ -51,6 +52,7 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const {
   codexSessionIdFromAuthoritativeStatus,
 } = require('./codex-runtime-contract');
+const { resolveAiToolOwner } = require('./ai-tool-owner');
 const {
   classifyAgentActionBridgeError,
   classifyAgentActionResult,
@@ -262,6 +264,7 @@ let projectPromptCatalog = null;
 // authoritative for a live rollout, so web routes fall back to this callback
 // when the bridge is unavailable instead of publishing the saved resume ID.
 let resolveCodexRuntimeSessionInfo = null;
+let resolveAgentToolType = null;
 // tabId → Set<Sink>. A Sink is the common interface for both transports:
 //   { kind:'ws'|'sse', send(str):void, isAlive():bool, close():void }
 // WebSocket and SSE both register here so webBroadcast() fans out to either
@@ -309,6 +312,7 @@ const agentSendReceiptRegistry = createAgentSendReceiptRegistry({
   },
 });
 let orchestrationPolicyTimer = null;
+const ORCHESTRATION_RESULT_PROOF_FLUSH_GRACE_MS = 60_000;
 let orchestrationResultProofCoordinator = null;
 let orchestrationSourceProofCoordinator = null;
 
@@ -2275,6 +2279,24 @@ function promptFingerprint(prompt) {
   return crypto.createHash('sha256').update(normalized).digest('hex');
 }
 
+function resolvePersistedPtyAgentOwner(tab) {
+  if (!tab || (tab.tabType || 'terminal') === 'claude-sdk') return null;
+  return resolveAiToolOwner({
+    claudeSessionId: tab.claudeSessionId || null,
+    codexSessionId: tab.codexSessionId || null,
+    storedCommandType: tab.commandType || null,
+  });
+}
+
+function resolveCurrentPtyAgentOwner(tab) {
+  if (!tab) return null;
+  const live = typeof resolveAgentToolType === 'function'
+    ? resolveAgentToolType(tab.tabId)
+    : null;
+  if (live?.observed === true) return live.toolType || null;
+  return resolvePersistedPtyAgentOwner(tab);
+}
+
 function findOrchestrationTabDescriptor(tabId) {
   if (!tabId) return null;
   try {
@@ -2282,11 +2304,9 @@ function findOrchestrationTabDescriptor(tabId) {
     for (const project of projectManager.db.getAllProjects()) {
       const tab = (project.tabs || []).find((item) => item.tabId === tabId);
       if (!tab) continue;
-      const toolType = tab.commandType === 'codex'
-        ? 'codex'
-        : tab.commandType === 'claude' || tab.tabType === 'claude-sdk'
-          ? 'claude'
-          : null;
+      const toolType = tab.tabType === 'claude-sdk'
+        ? 'claude'
+        : resolveCurrentPtyAgentOwner(tab);
       return {
         tabId,
         tabName: tab.name || tabId.slice(-12),
@@ -2557,13 +2577,6 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
   orchestrationNotificationInflight.add(run.runId);
   const notificationText = orchestrationNotificationText(current);
   const notificationHandoffId = 'orchestration-complete:' + current.runId;
-  const sending = await store.markNotification(current.runId, 'sending', {
-    notificationAttemptedAt: Date.now(),
-    notificationPromptHash: promptFingerprint(notificationText),
-    notificationPromptAuditHash: promptAuditFingerprint(notificationText),
-    notificationHandoffId,
-  });
-  emitOrchestrationChanges(sending?.changed, 'notification-sending');
   try {
     const status = await resolveAgentSessionInfo(current.sourceTabId, 2000);
     if (!status) {
@@ -2575,6 +2588,30 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       emitOrchestrationChanges(sourceClosed?.changed, 'notification-source-closed');
       return;
     }
+    const sourceBusy = status?.busy === true
+      || status?.turnBusy === true
+      || status?.isBusy === true
+      || status?.status === 'busy'
+      || status?.sessionStatus === 'busy';
+    if (sourceBusy) {
+      const deferred = await store.patch(current.runId, {
+        notificationDeferredAt: Date.now(),
+        notificationDeferredReason: 'source-busy',
+      });
+      emitOrchestrationRun(deferred, 'notification-deferred-source-busy');
+      return;
+    }
+    const notificationAttempt = Number(current.notificationAttempt || 0) + 1;
+    const sending = await store.markNotification(current.runId, 'sending', {
+      notificationAttempt,
+      notificationAttemptedAt: Date.now(),
+      notificationPromptHash: promptFingerprint(notificationText),
+      notificationPromptAuditHash: promptAuditFingerprint(notificationText),
+      notificationHandoffId,
+      notificationDeferredAt: null,
+      notificationDeferredReason: null,
+    });
+    emitOrchestrationChanges(sending?.changed, 'notification-sending');
     const notificationSourceSessionId = status?.sessionId || current.notificationSourceSessionId || null;
     if (notificationSourceSessionId) {
       await store.patch(current.runId, { notificationSourceSessionId });
@@ -2591,7 +2628,7 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       handoffId: notificationHandoffId,
       source: 'orchestration-completion:' + current.runId,
       statusAtSend: status?.status || status?.sessionStatus || 'unknown',
-      queue: true,
+      queue: false,
       ownership: 'project',
       presentationSnapshot: orchestrationPresentationSnapshot(
         current,
@@ -2635,12 +2672,14 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       });
       emitOrchestrationChanges(unknown?.changed, 'notification-delivery-unknown');
     } else if (sendReceipt.state === 'audit-pending') {
-      const pending = await store.markNotification(current.runId, 'audit-pending', {
+      const pending = await store.markNotification(current.runId, 'unconfirmed', {
         notificationAuditPendingAt: Date.now(),
-        notificationError: null,
+        notificationError: 'Enter пересечён, но точное подтверждение доставки пока не найдено',
+        notificationUnconfirmedAt: Date.now(),
+        notificationUnconfirmedReason: 'source-followup-audit-timeout',
         notificationCancelRequestedAt: null,
       });
-      emitOrchestrationChanges(pending?.changed, 'notification-audit-pending');
+      emitOrchestrationChanges(pending?.changed, 'notification-unconfirmed');
     } else {
       const delivered = await store.markNotification(current.runId, result?.queued ? 'queued' : 'sent', {
         notificationDeliveredAt: Date.now(),
@@ -3147,6 +3186,10 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
           Number(probe.internalContinuationCount) || 0,
         ),
         resultProofStatus: resultComplete ? 'complete' : 'awaiting-transcript',
+        resultProofDeadlineAt: resultComplete
+          ? null
+          : (current.resultProofDeadlineAt
+            || Date.now() + ORCHESTRATION_RESULT_PROOF_FLUSH_GRACE_MS),
         resultProofObservedSize: Number.isFinite(Number(sourceSnapshot?.size))
           ? Number(sourceSnapshot.size)
           : null,
@@ -3224,16 +3267,45 @@ async function retryWaitingNotificationsForSource(tabId) {
   const runs = await getOrchestrationRunStore().listForTab(tabId);
   for (const run of runs) {
     if (run.sourceTabId !== tabId || !isTerminalStatus(run.status)) continue;
-    if (run.notificationStatus !== 'waiting-for-input' && run.notificationStatus !== 'failed') continue;
+    const neverAttemptedPending = run.notificationStatus === 'pending'
+      && !run.notificationAttemptedAt;
+    if (!neverAttemptedPending
+      && run.notificationStatus !== 'waiting-for-input'
+      && run.notificationStatus !== 'failed') continue;
     await sendOrchestrationCompletionNotification(run);
   }
 }
 
+async function reconcileAwaitingSourceProofsAfterDone(tabId) {
+  const store = getOrchestrationRunStore();
+  const runs = await store.listForTab(tabId);
+  for (const run of runs) {
+    if (run.sourceTabId !== tabId
+      || !isTerminalStatus(run.status)
+      || run.notificationStatus !== 'audit-pending'
+      || run.sourceFollowupPending !== true
+      || run.sourceFollowupStartedAt) continue;
+    const current = await store.getInternal(run.runId);
+    const proof = await reconcileOrchestrationSourceFollowup(
+      current,
+      'source-done-followup-reconcile',
+    );
+    const after = await store.getInternal(run.runId);
+    if (!shouldMarkSourceFollowupUnconfirmed(after, proof)) continue;
+    const unconfirmed = await store.markNotification(run.runId, 'unconfirmed', {
+      notificationError: 'Точное подтверждение доставки не найдено после завершения хода источника',
+      notificationUnconfirmedAt: Date.now(),
+      notificationUnconfirmedReason: proof?.reason || 'source-followup-turn-not-found',
+    });
+    emitOrchestrationChanges(unconfirmed?.changed, 'source-followup-unconfirmed-after-done');
+  }
+}
+
 async function processOrchestrationLifecycle(tabId, payload) {
-  if (!tabId || !['busy', 'done', 'snapshot'].includes(payload?.type)) return;
+  if (!tabId || !['busy', 'done', 'snapshot', 'background-work'].includes(payload?.type)) return;
   try {
     const store = getOrchestrationRunStore();
-    if (payload.type === 'busy' || payload.type === 'done') {
+    if (payload.type === 'busy' || payload.type === 'done' || payload.type === 'background-work') {
       const result = await store.applyLifecycle(tabId, payload);
       const internal = (result.changed || []).find((run) => (
         run.waitingForInternalDescendants === true
@@ -3256,6 +3328,9 @@ async function processOrchestrationLifecycle(tabId, payload) {
     // This lets it queue behind the active turn without guessing from a timer.
     if (shouldRetryWaitingNotificationForSourceLifecycle(payload)) {
       await retryWaitingNotificationsForSource(tabId);
+    }
+    if (payload.type === 'done') {
+      await reconcileAwaitingSourceProofsAfterDone(tabId);
     }
     const snapshotAdmission = payload.type === 'snapshot'
       ? resolveOrchestrationDeliveryAdmission(payload)
@@ -3424,6 +3499,20 @@ function validateOrchestrationAutoStopAuthority(authority = {}) {
 async function processDueOrchestrationPolicies() {
   const store = getOrchestrationRunStore();
   const now = Date.now();
+  const proofRuns = await store.listAll();
+  for (const run of proofRuns) {
+    if (run.status !== 'completed'
+      || run.resultComplete === true
+      || !run.resultProofDeadlineAt
+      || run.resultProofDeadlineAt > now) continue;
+    const recovery = await store.beginResultProofRecovery(
+      run.runId,
+      'result proof deadline elapsed after authoritative target completion',
+      { now },
+    );
+    emitOrchestrationChanges(recovery.changed, 'result-proof-deadline');
+    await finalizeSettledOrchestrations(recovery.settled, 'result-proof-deadline');
+  }
   const expired = await store.expireRecoveryDeadlines(now);
   emitOrchestrationChanges(expired.changed, 'recovery-expired');
   await finalizeSettledOrchestrations(expired.settled, 'recovery-expired');
@@ -3500,7 +3589,16 @@ async function scheduleOrchestrationPolicyTimer() {
       || run.autoStopFinishedAt) return next;
     return next === null || run.autoStopAt < next ? run.autoStopAt : next;
   }, null);
-  const nextAt = [recoveryAt, autoStopAt].filter((value) => Number.isFinite(value)).sort((a, b) => a - b)[0];
+  const resultProofAt = allRuns.reduce((next, run) => {
+    if (run.status !== 'completed'
+      || run.resultComplete === true
+      || !Number.isFinite(Number(run.resultProofDeadlineAt))) return next;
+    const value = Number(run.resultProofDeadlineAt);
+    return next === null || value < next ? value : next;
+  }, null);
+  const nextAt = [recoveryAt, autoStopAt, resultProofAt]
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b)[0];
   if (!nextAt) return;
   const delay = Math.max(0, Math.min(0x7fffffff, nextAt - Date.now()));
   orchestrationPolicyTimer = setTimeout(() => {
@@ -3511,10 +3609,102 @@ async function scheduleOrchestrationPolicyTimer() {
   }, delay);
 }
 
+async function recoverMissingOrchestrationTarget(run, reason = 'startup-missing-target') {
+  if (!run?.runId || findOrchestrationTabDescriptor(run.targetTabId)) {
+    return { handled: false, recovered: false, run };
+  }
+  const store = getOrchestrationRunStore();
+  const current = await store.getInternal(run.runId);
+  if (!current || isTerminalStatus(current.status)) {
+    return { handled: false, recovered: false, run: current };
+  }
+
+  const canFinishReservedCreation = current.targetCreated === true
+    && !current.targetMaterializedAt
+    && !!current.deliveryIntent
+    && !current.deliveryDispatchStartedAt;
+  if (!canFinishReservedCreation) {
+    const closed = await store.handleTargetClosed(current.targetTabId, {
+      failureGraceMs: current.failureGraceMs,
+    });
+    emitOrchestrationChanges(closed, reason + '-target-closed');
+    return {
+      handled: true,
+      recovered: false,
+      run: await store.get(current.runId),
+    };
+  }
+
+  try {
+    const intent = current.deliveryIntent;
+    const created = await bridgeRequest('createAgentTab', {
+      projectId: current.targetProjectId,
+      toolType: current.targetToolType,
+      name: current.targetTabName || undefined,
+      reservedTabId: current.targetTabId,
+      startNow: true,
+      background: true,
+      codexModel: intent.model || undefined,
+      codexEffort: intent.effort || undefined,
+      visualParentTabId: current.targetParentTabId || undefined,
+      afterTabId: current.targetParentTabId || undefined,
+    }, 12_000);
+    if (!created?.tabId || created.tabId !== current.targetTabId) {
+      throw new Error('recovered target tab does not match its durable reservation');
+    }
+    const descriptor = findOrchestrationTabDescriptor(current.targetTabId) || {};
+    const materialized = await store.patch(current.runId, {
+      status: 'starting',
+      targetMaterializedAt: Date.now(),
+      targetTabName: descriptor.tabName || created.name || current.targetTabName,
+      targetProjectId: descriptor.projectId || created.projectId || current.targetProjectId,
+      targetProjectName: descriptor.projectName || created.projectName || current.targetProjectName,
+      targetProjectPath: descriptor.projectPath || created.projectPath || created.cwd || current.targetProjectPath,
+      targetCwd: descriptor.cwd || created.cwd || current.targetCwd,
+      targetToolType: descriptor.toolType || created.toolType || current.targetToolType,
+    });
+    emitOrchestrationRun(materialized, reason + '-target-recreated');
+    const status = await waitForAgentReady(current.targetTabId, 20_000);
+    await store.patch(current.runId, {
+      status: 'queued',
+      sessionId: status?.sessionId || current.sessionId || null,
+      targetLifecycleGeneration: status?.lifecycleGeneration || null,
+      targetLaunchGeneration: status?.launchGeneration || null,
+    });
+    const delivery = await dispatchDeferredOrchestrationRun(current.runId, {
+      reason: reason + '-dispatch',
+      targetStatus: status,
+    });
+    return {
+      handled: true,
+      recovered: delivery.dispatched === true,
+      run: delivery.run || await store.get(current.runId),
+    };
+  } catch (error) {
+    const failed = await store.beginRecovery(
+      current.runId,
+      'startup_failed',
+      'reserved target recovery failed: ' + String(error?.message || error),
+    );
+    emitOrchestrationChanges(failed.changed, reason + '-target-recovery-failed');
+    await finalizeSettledOrchestrations(failed.settled, reason + '-target-recovery-failed');
+    return {
+      handled: true,
+      recovered: false,
+      run: await store.get(current.runId),
+      error: String(error?.message || error),
+    };
+  }
+}
+
 async function reconcileActiveOrchestrations() {
   const store = getOrchestrationRunStore();
   const active = await store.listActive();
   for (const run of active) {
+    if (isActiveStatus(run.status) && !findOrchestrationTabDescriptor(run.targetTabId)) {
+      const recovery = await recoverMissingOrchestrationTarget(run, 'startup-reconcile');
+      if (recovery.handled) continue;
+    }
     if (isActiveStatus(run.status)) {
       await reconcileOrchestrationRun(run.runId, 'startup-reconcile');
     } else if (run.status === 'completed' && run.resultComplete !== true) {
@@ -3757,7 +3947,7 @@ async function performOrchestrationAction(runId, action, options = {}) {
     const actionTabId = cleanOptionalString(options.tabId, '');
     const sourceNotificationAwaitingProof = current.sourceTabId === actionTabId
       && isTerminalStatus(current.status)
-      && ['audit-pending', 'unconfirmed'].includes(current.notificationStatus);
+      && current.notificationStatus === 'audit-pending';
     if (sourceNotificationAwaitingProof) {
       return {
         ok: false,
@@ -3767,7 +3957,7 @@ async function performOrchestrationAction(runId, action, options = {}) {
     }
     const canRetrySourceNotification = current.sourceTabId === actionTabId
       && isTerminalStatus(current.status)
-      && ['waiting-for-input', 'failed'].includes(current.notificationStatus);
+      && ['waiting-for-input', 'failed', 'unconfirmed'].includes(current.notificationStatus);
     if (canRetrySourceNotification) {
       await sendOrchestrationCompletionNotification(current, { force: true });
       const retried = await store.get(runId);
@@ -4300,8 +4490,9 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500, { onLateStatus =
     for (const p of projectManager.db.getAllProjects()) {
       const t = (p.tabs || []).find(x => x.tabId === tabId);
       if (!t) continue;
-      const isCodex = t.commandType === 'codex' && (t.tabType || 'terminal') !== 'claude-sdk';
-      const isClaude = t.commandType === 'claude' && (t.tabType || 'terminal') !== 'claude-sdk';
+      const persistedOwner = resolveCurrentPtyAgentOwner(t);
+      const isCodex = persistedOwner === 'codex';
+      const isClaude = persistedOwner === 'claude';
       const toolType = isCodex ? 'codex' : isClaude ? 'claude' : null;
       if (isCodex) {
         return await overlayMainCodexRuntime({
@@ -4424,6 +4615,25 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (parsed.pathname === '/api/me' && req.method === 'GET') {
     if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
     return sendJson(res, 200, { ok: true, lanIp: getLanIp() });
+  }
+
+  if (parsed.pathname === '/api/focused-terminal-context' && req.method === 'GET') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    try {
+      const data = await bridgeRequest('getFocusedTerminalContext', {}, 3000);
+      return sendJson(res, 200, {
+        ok: true,
+        instancePid: process.pid,
+        context: data?.context || null,
+        reason: data?.reason || null,
+      });
+    } catch (e) {
+      return sendJson(res, 503, {
+        ok: false,
+        error: 'focused terminal context unavailable',
+        detail: String(e?.message || e),
+      });
+    }
   }
 
   if (parsed.pathname === '/api/ios/push-token' && req.method === 'POST') {
@@ -4833,6 +5043,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         autoStopCreatedTargets: typeof body.autoStopCreatedTargets === 'boolean' ? body.autoStopCreatedTargets : undefined,
         promptHash: promptFingerprint(prompt),
         targetPromptAuditHash: promptAuditFingerprint(prompt),
+        requiresTargetPromptProof: true,
         promptChars: prompt.length,
         // A second delegation to the same target must wait in the Project API,
         // not inside Claude's native busy queue.  Persist the unsent intent so
@@ -4856,10 +5067,28 @@ async function handleApi(req, res, parsed, sdkSessions) {
         });
       }
       if (!reservation.created) {
+        let idempotentRun = reservation.run;
+        if (isActiveStatus(idempotentRun.status)) {
+          if (!findOrchestrationTabDescriptor(idempotentRun.targetTabId)) {
+            const recovered = await recoverMissingOrchestrationTarget(
+              idempotentRun,
+              'idempotent-retry',
+            );
+            idempotentRun = recovered.run || idempotentRun;
+          } else {
+            const internalExisting = await getOrchestrationRunStore().getInternal(idempotentRun.runId);
+            if (internalExisting?.deliveryIntent) {
+              const delivery = await dispatchDeferredOrchestrationRun(idempotentRun.runId, {
+                reason: 'idempotent-retry',
+              });
+              idempotentRun = delivery.run || await getOrchestrationRunStore().get(idempotentRun.runId);
+            }
+          }
+        }
         return sendJson(res, 200, {
           ok: true,
           idempotent: true,
-          run: withOrchestrationUrls(reservation.run),
+          run: withOrchestrationUrls(idempotentRun),
         });
       }
       let run = reservation.run;
@@ -4871,6 +5100,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         target = restored.descriptor;
         run = await getOrchestrationRunStore().patch(run.runId, {
           status: 'starting',
+          targetMaterializedAt: Date.now(),
           targetTabName: target.tabName,
           targetProjectId: target.projectId,
           targetProjectName: target.projectName,
@@ -4909,6 +5139,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         };
         run = await getOrchestrationRunStore().patch(run.runId, {
           status: 'starting',
+          targetMaterializedAt: Date.now(),
           targetTabName: target.tabName,
           targetProjectId: target.projectId,
           targetProjectName: target.projectName,
@@ -4951,8 +5182,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
           run.runId,
           'failed',
           'target is busy and queue=false',
+          { failureGraceMs: 0 },
         );
         emitOrchestrationChanges(failed.changed, 'send-refused-busy');
+        await finalizeSettledOrchestrations(failed.settled, 'send-refused-busy');
         return sendJson(res, 409, {
           ok: false,
           success: false,
@@ -5477,7 +5710,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // expose the persisted "persistent" arm flag below.
     }
     const ptyAgentIds = (project.tabs || [])
-      .filter(t => (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk')
+      .filter(t => resolveCurrentPtyAgentOwner(t) !== null)
       .map(t => t.tabId);
     if (ptyAgentIds.length > 0) {
       try {
@@ -5506,7 +5739,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     // A closed/not-yet-hydrated renderer tab otherwise answers `inactive` and
     // would expose SQLite while a live or unresolved Codex process exists.
     for (const t of project.tabs || []) {
-      if (t.commandType !== 'codex') continue;
+      if (resolveCurrentPtyAgentOwner(t) !== 'codex') continue;
       let runtime = null;
       try {
         runtime = typeof resolveCodexRuntimeSessionInfo === 'function'
@@ -5565,8 +5798,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const runtimeStatus = statusMap.get(t.tabId) || null;
       const runtimeCodexSessionId = runtimeSessionMap.get(t.tabId) || null;
       const runtimeCodexReadSessionId = runtimeReadSessionMap.get(t.tabId) || null;
-      const isCodex = t.commandType === 'codex';
-      const isClaude = t.commandType === 'claude';
+      const persistedOwner = resolveCurrentPtyAgentOwner(t);
+      const isCodex = persistedOwner === 'codex';
+      const isClaude = persistedOwner === 'claude';
       const codexWriterConfirmed = codexWriterConfirmedMap.get(t.tabId) === true;
       const codexWriterUsableForMutation = codexWriterUsableMap.get(t.tabId) === true;
       const codexHistoricalSessionId = t.codexSessionId || null;
@@ -5588,13 +5822,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // Assigned-category status (DB column session_status holds the palette id;
       // distinct from runtime sessionStatus which drives the loader/background).
       const statusId = t.sessionStatus || null;
-      const isPtyAgent = (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk';
+      const isPtyAgent = persistedOwner !== null;
       const notification = completionNotificationMap.get(t.tabId) || {};
       return {
         tabId: t.tabId,
         name: t.name,
         tabType: t.tabType || 'terminal',
-        commandType: t.commandType,
+        commandType: persistedOwner || t.commandType,
         color: t.color || null,   // desktop TabColor — drives row bg (mobile mirrors desktop)
         cwd: t.cwd,
         filePath: t.filePath || null,
@@ -5624,8 +5858,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         lastNotReady: lastNotReadyMap.get(t.tabId) || null,
         startupFailed: startupFailedMap.get(t.tabId) || false,
         startupError: startupErrorMap.get(t.tabId) || null,
-        startupDefaultsPending: t.commandType === 'claude' ? (startupDefaultsPendingMap.get(t.tabId) || false) : false,
-        startupDefaultsReady: t.commandType === 'claude' ? (startupDefaultsReadyMap.get(t.tabId) || false) : (isPtyAgent ? true : false),
+        startupDefaultsPending: isClaude ? (startupDefaultsPendingMap.get(t.tabId) || false) : false,
+        startupDefaultsReady: isClaude ? (startupDefaultsReadyMap.get(t.tabId) || false) : (isPtyAgent ? true : false),
         startupDefaultsError: startupDefaultsErrorMap.get(t.tabId) || null,
         awaiting: awaitingMap.get(t.tabId) || false,
         statusId,
@@ -7642,12 +7876,12 @@ function releaseTranscriptSubscriptionsIfOrphan() {
 // actively subscribed, 'message' fan-out is logged with metadata only. That
 // gives a permanent causal trace for "server emitted → SSE wrote → iOS applied"
 // without dumping chat text or spamming desktop-only sessions with message drops.
-const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity', 'orchestration-update']);
+const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'background-work', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity', 'orchestration-update']);
 function webBroadcast(tabId, payload) {
   payload = withMessageProjection(payload);
   const type = payload && payload.type;
   const loggable = BCAST_LOG_TYPES.has(type);
-  if (type === 'busy' || type === 'done' || type === 'snapshot') {
+  if (type === 'busy' || type === 'done' || type === 'snapshot' || type === 'background-work') {
     void processOrchestrationLifecycle(tabId, payload);
   }
   const runId = externalRunByTabId.get(tabId);
@@ -8046,6 +8280,7 @@ function start({
   getClaudePendingQuestion: getQFn,
   transcriptService: transcriptServiceFn,
   resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn,
+  resolveAgentToolType: resolveAgentToolTypeFn,
   getAgentTurnResult: getAgentTurnResultFn,
   getAgentExecutionContext: getAgentExecutionContextFn,
   readAgentLifecycleIdentity: readAgentLifecycleIdentityFn,
@@ -8080,6 +8315,7 @@ function start({
   transcriptService = transcriptServiceFn || null;
   ensureOrchestrationProofCoordinators();
   resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
+  resolveAgentToolType = resolveAgentToolTypeFn || null;
   getAgentTurnResult = getAgentTurnResultFn || null;
   getAgentExecutionContext = getAgentExecutionContextFn || null;
   readAgentLifecycleIdentity = readAgentLifecycleIdentityFn || null;

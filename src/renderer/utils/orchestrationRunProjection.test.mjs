@@ -52,3 +52,16 @@ test('a prompt waiting to cross Enter blocks completion without inherited shimme
   assert.equal(isOrchestrationCompletionBlocking(value), true);
   assert.equal(isOrchestrationInheritedActivity(value), false);
 });
+
+test('audit-pending source handoff stays visible and blocking in renderer parity with main', () => {
+  const value = run({
+    status: 'completed',
+    resultComplete: true,
+    notificationStatus: 'audit-pending',
+    sourceFollowupPending: true,
+    sourceFollowupStartedAt: null,
+  });
+  assert.equal(shouldRetainOrchestrationRun(value), true);
+  assert.equal(isOrchestrationCompletionBlocking(value), true);
+  assert.equal(isOrchestrationInheritedActivity(value), true);
+});

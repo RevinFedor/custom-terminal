@@ -268,6 +268,13 @@ function createClaudeStartupMainRuntime({
     const model = String(settings?.model || '').trim();
     const effort = String(settings?.effort || '').trim();
 
+    if (settings?.modelAlreadyConfirmed === true && model && model !== 'none' && !claims.model) {
+      recordConfirmedClaim(tabId, generation, '/model ' + model, 'session-history');
+    }
+    if (settings?.effortAlreadyConfirmed === true && effort && effort !== 'none' && !claims.effort) {
+      recordConfirmedClaim(tabId, generation, '/effort ' + effort, 'session-history');
+    }
+
     if (model && model !== 'none' && !claims.model) {
       steps.push({
         phase: PHASE.MODEL,

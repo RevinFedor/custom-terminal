@@ -38,15 +38,22 @@ export function createHistoryTailSpacer({ onChange, diag } = {}) {
       publish(reason);
     },
     /** Burn part of the reserve as the user scrolls AWAY from the bottom —
-     * at most `deltaPx` (the upward distance just travelled). */
-    burn(deltaPx) {
+     * at most `deltaPx` (the upward distance just travelled).
+     *
+     * `source` is mandatory in spirit: prod 17.08 showed an avalanche of
+     * ~40 burns down to zero within 800ms of a collapse with NO user gesture
+     * in between (browser clamp + Virtuoso's late measurement pass both emit
+     * scroll events). Without the source in the log the two burn callers —
+     * the user's upward travel and the per-commit deficit reconciliation —
+     * are indistinguishable in a production trace. */
+    burn(deltaPx, source = 'unknown') {
       if (px <= 0) return 0;
       const burnPx = Math.max(0, Math.round(Number(deltaPx) || 0));
       if (burnPx <= 0) return 0;
       const burned = Math.min(px, burnPx);
       px -= burned;
       if (typeof diag === 'function') {
-        diag('TAIL_SPACER burn px=' + burned + ' left=' + px);
+        diag('TAIL_SPACER burn px=' + burned + ' left=' + px + ' src=' + source);
       }
       publish('burn');
       return burned;
@@ -71,6 +78,38 @@ export function createHistoryTailSpacer({ onChange, diag } = {}) {
       return false;
     },
   };
+}
+
+/** Window after a discrete gesture event (wheel/touchmove/scroll key) during
+ * which the scroll events it produces are still that gesture's. A wheel tick
+ * lands its scroll event in the same or next frame; momentum/smooth scrolling
+ * keeps firing gesture events of its own, so this stays short on purpose. */
+export const HISTORY_GESTURE_SCROLL_WINDOW_MS = 250;
+
+/**
+ * May this negative scroll delta consume the reserve?
+ *
+ * Only the USER moving up may. The reserve exists precisely because the
+ * browser and Virtuoso move scrollTop by themselves after a shrink: the
+ * clamp fires immediately, Virtuoso's measurement pass lands up to ~250ms
+ * later, and the hold loop re-asserts the position each frame — every one of
+ * those emits scroll events with a negative delta. Burning on those made the
+ * reserve evaporate on its own (prod 17.08 11:52:42.8–43.0: ~40 burns to
+ * zero, no gesture in the whole window) and the frame jumped.
+ *
+ * Proof of user ownership is a gesture that a programmatic writer cannot
+ * fake: an in-progress scrollbar drag (pointer down on the scrollbar) or a
+ * discrete gesture event within the window above. A live hold vetoes
+ * everything — that frame belongs to the shrink compensation.
+ */
+export function isUserOwnedScrollBurn({
+  holdActive = false,
+  pointerScrollActive = false,
+  msSinceGesture = Number.POSITIVE_INFINITY,
+} = {}) {
+  if (holdActive) return false;
+  if (pointerScrollActive) return true;
+  return msSinceGesture <= HISTORY_GESTURE_SCROLL_WINDOW_MS;
 }
 
 /** Bottom distance corrected for the reserve: the CONTENT bottom, not the

@@ -285,6 +285,75 @@ test('mixed outer group expands into flat inner Read and MCP aggregates', () => 
   assert.deepEqual(resolveHistoryDisplayTarget(openedOuter, readB.uuid), { index: 1, groupKey: readKey });
 });
 
+test('thinking is a hard boundary for inner Read aggregation', () => {
+  const readA = row('assistant', {
+    actions: [raw('Read', 'read', { args: { file_path: 'src/a.ts' } })],
+    messageId: 'm1',
+  });
+  const thought = row('assistant', {
+    thinking: 'compare with the second file',
+    thinkingSeconds: 7,
+    messageId: 'm2',
+  });
+  const readB = row('assistant', {
+    actions: [raw('Read', 'read', { args: { file_path: 'src/b.ts' } })],
+    messageId: 'm2',
+  });
+  const entries = [readA, thought, readB];
+  const collapsed = buildHistoryDisplayUnits(entries, { threshold: 2 });
+  assert.equal(collapsed.length, 1);
+  assert.equal(collapsed[0].level, 1, 'reasoning makes this a broad work block, not a root file aggregate');
+  const outerKey = collapsed[0].key;
+
+  const openedOuter = buildHistoryDisplayUnits(entries, {
+    threshold: 2,
+    expandedKeys: new Set([outerKey]),
+  });
+  assert.equal(openedOuter.length, 4, 'outer header + Read + thinking + Read, in source order');
+  assert.ok(openedOuter.slice(1).every((unit) => unit.kind === 'entry'));
+  assert.equal(openedOuter[1].entry, readA);
+  assert.equal(openedOuter[2].entry, thought);
+  assert.equal(openedOuter[3].entry, readB);
+  assert.equal(openedOuter[2].expandedGroup.key, outerKey);
+  assert.ok(openedOuter.slice(1).every((unit) => unit.expandedSubgroup === undefined));
+});
+
+test('a composite thinking plus tool record cannot enter an inner aggregate', () => {
+  const composite = row('assistant', {
+    thinking: 'inspect first',
+    actions: [raw('Read', 'read', { args: { file_path: 'src/a.ts' } })],
+  });
+  const read = row('assistant', {
+    actions: [raw('Read', 'read', { args: { file_path: 'src/b.ts' } })],
+  });
+  const outer = buildHistoryDisplayUnits([composite, read], { threshold: 2 })[0];
+  assert.equal(outer.level, 1);
+  const expanded = buildHistoryDisplayUnits([composite, read], {
+    threshold: 2,
+    expandedKeys: new Set([outer.key]),
+  });
+  assert.ok(expanded.slice(1).every((unit) => unit.kind === 'entry'));
+  assert.ok(expanded.slice(1).every((unit) => unit.expandedSubgroup === undefined));
+});
+
+test('a caption between equal actions also breaks the inner aggregate', () => {
+  const readA = row('assistant', {
+    actions: [raw('Read', 'read', { args: { file_path: 'src/a.ts' } })],
+  });
+  const caption = row('assistant', { content: 'Now compare the other file' });
+  const readB = row('assistant', {
+    actions: [raw('Read', 'read', { args: { file_path: 'src/b.ts' } })],
+  });
+  const outer = buildHistoryDisplayUnits([readA, caption, readB], { threshold: 2 })[0];
+  assert.equal(outer.level, 1);
+  const expanded = buildHistoryDisplayUnits([readA, caption, readB], {
+    threshold: 2,
+    expandedKeys: new Set([outer.key]),
+  });
+  assert.deepEqual(expanded.slice(1).map((unit) => unit.entry), [readA, caption, readB]);
+  assert.ok(expanded.slice(1).every((unit) => unit.expandedSubgroup === undefined));
+});
+
 test('docs scope splits inner Read aggregates without changing chronology', () => {
   const entries = [
     row('assistant', { actions: [raw('Read', 'read', { args: { file_path: 'docs/a.md' } })] }),

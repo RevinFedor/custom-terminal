@@ -15,7 +15,9 @@ const {
   extractClaudeQueueOperationPromptText,
 } = require('./claude-prompt-carriers');
 const {
+  codexUserMessageAuditText,
   consumeCodexUserMessageAuditChunk,
+  selectCodexPreferredUserMessageAuditRecords,
   selectCodexPendingPromptAudit,
 } = require('./codex-prompt-audit');
 const {
@@ -758,20 +760,8 @@ async function reconcileClaude(context, maxReadBytes, options = {}) {
   return found(context.record, 'exact-post-boundary-candidate', audit, { evidence });
 }
 
-function codexUserMessageText(payload) {
-  if (typeof payload?.message === 'string') return payload.message;
-  if (typeof payload?.text === 'string') return payload.text;
-  if (!Array.isArray(payload?.content)) return null;
-  const parts = [];
-  for (const item of payload.content) {
-    if (typeof item === 'string') parts.push(item);
-    else if (typeof item?.text === 'string') parts.push(item.text);
-  }
-  return parts.length > 0 ? parts.join('') : null;
-}
-
 function selectCodexStartupCandidate(context, validated, auditExpectation, candidate) {
-  const actualText = codexUserMessageText(candidate.record?.payload);
+  const actualText = codexUserMessageAuditText(candidate.record);
   if (actualText === null) {
     return { ok: false, reason: 'codex-user-message-text-unavailable' };
   }
@@ -834,7 +824,8 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     preSubmitBoundary: context.boundary,
   };
   const matches = [];
-  for (const candidate of consumed.records) {
+  const preferredCandidates = selectCodexPreferredUserMessageAuditRecords(consumed.records);
+  for (const candidate of preferredCandidates) {
     const selected = selectCodexStartupCandidate(
       context,
       validated,
@@ -844,7 +835,7 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     if (!selected.ok) return unknown(context.record, selected.reason);
     if (selected.match) matches.push(selected.match);
   }
-  const evidence = evidenceFor(validated, snapshot, consumed.records.length, matches.length);
+  const evidence = evidenceFor(validated, snapshot, preferredCandidates.length, matches.length);
   const hasClosedCausalRange = snapshot.causalUpperBoundaryOffset !== null
     && snapshot.rangeComplete === true;
   let match = null;
@@ -857,7 +848,7 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     }
     [match] = matches;
   } else {
-    const firstCandidate = consumed.records[0] || null;
+    const firstCandidate = preferredCandidates[0] || null;
     if (!firstCandidate) {
       return snapshot.rangeComplete
         ? absent(context.record, 'no-post-boundary-user-message', { evidence })

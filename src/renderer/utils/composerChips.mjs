@@ -5,6 +5,60 @@ export const MAX_AI_COMPOSER_CHIP_THRESHOLD = 100_000;
 const PASTED_CONTENT_OPEN = '<pasted_content>';
 const PASTED_CONTENT_CLOSE = '</pasted_content>';
 
+// Метка сохранённого промпта — ровно та же роль, что у `<pasted_content>` для
+// вставки: она едет В САМОМ ТЕКСТЕ, поэтому чип в истории восстанавливается из
+// текста и не зависит ни от чего внешнего.
+//
+// Зачем понадобилась. Раньше в тексте от чипа не оставалось ничего — только его
+// развёрнутое тело, а «это был чип» знала отдельная запись рядом с историей.
+// Она сверяется с текстом, и на любом расхождении (промпт поправили перед
+// отправкой, сообщение пришло другим путём, запись не доехала) история честно
+// показывала простыню вместо чипа. Пользователь: «а то сейчас они могут не
+// совпасть». С меткой совпадать больше нечему.
+//
+// Почему это безопасно для агента: он читает тег как обычную разметку вокруг
+// того же текста, который получал и раньше. `<pasted_content>` живёт так же и с
+// тем же смыслом — «это вставленный кусок, а не моя фраза».
+//
+// Имя промпта попадает в атрибут: без него после перезапуска у чипа не осталось
+// бы подписи, и «Ревью» превратилось бы в безымянный «PROMPT».
+const PROMPT_CHIP_OPEN_PREFIX = '<saved_prompt';
+const PROMPT_CHIP_CLOSE = '</saved_prompt>';
+// Экранированный вид закрывающей метки — для случая, когда она встречается в
+// самом теле промпта (см. buildPromptChipWrapper).
+const PROMPT_CHIP_CLOSE_ESCAPED = '<\\/saved_prompt>';
+
+/** Экранируем только то, что ломает разбор самого атрибута. */
+const escapePromptChipLabel = (label) => String(label || '')
+  .replace(/&/g, '&amp;')
+  .replace(/"/g, '&quot;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/[\r\n]+/g, ' ')
+  .trim();
+
+const unescapePromptChipLabel = (label) => String(label || '')
+  .replace(/&quot;/g, '"')
+  .replace(/&lt;/g, '<')
+  .replace(/&gt;/g, '>')
+  // `&amp;` последним: иначе `&amp;quot;` развернулось бы в кавычку.
+  .replace(/&amp;/g, '&');
+
+export function buildPromptChipWrapper(chip) {
+  const label = escapePromptChipLabel(chip?.label || 'PROMPT');
+  const open = label
+    ? `${PROMPT_CHIP_OPEN_PREFIX} name="${label}">`
+    : `${PROMPT_CHIP_OPEN_PREFIX}>`;
+  // Тело промпта может само содержать нашу закрывающую метку — например, если
+  // это промпт про эту же механику или скопированный кусок такого сообщения.
+  // Тогда разбор закрылся бы на ней, чип оборвался посередине, а хвост тела уехал
+  // в обычный текст вместе с осиротевшим тегом. Экранируем закрывающую метку
+  // внутри тела и разворачиваем обратно при чтении: агент видит текст без
+  // искажения смысла, а разбор — ровно одну границу.
+  const body = String(chip?.text || '').split(PROMPT_CHIP_CLOSE).join(PROMPT_CHIP_CLOSE_ESCAPED);
+  return `${open}\n${body}\n${PROMPT_CHIP_CLOSE}`;
+}
+
 export function normalizeComposerChipThreshold(
   value,
   fallback = DEFAULT_AI_COMPOSER_CHIP_THRESHOLD,
@@ -308,9 +362,12 @@ export function mergeComposerAuthoringSnapshot({
  */
 export function serializeComposerDraft({ text = '', chips = [] } = {}) {
   const normalized = normalizeComposerChips(chips);
+  // Сохранённый промпт уезжает В СВОЕЙ МЕТКЕ, как и вставка: тогда чип в истории
+  // читается из самого текста, а не из отдельной записи, которая может с ним
+  // разойтись. Тело внутри метки — тот же самый текст, что уходил раньше.
   const promptParts = normalized
     .filter((chip) => chip.kind === 'prompt')
-    .map((chip) => chip.text);
+    .map((chip) => buildPromptChipWrapper(chip));
   const editableText = String(text || '');
 
   // An anchored paste expands IN PLACE, because the user put it at a specific
@@ -380,32 +437,75 @@ export function parsePastedContentParts(value) {
   const parts = [];
   let cursor = 0;
 
+  const trimOneNewline = (content) => {
+    let body = content;
+    if (body.startsWith('\r\n')) body = body.slice(2);
+    else if (body.startsWith('\n')) body = body.slice(1);
+    if (body.endsWith('\r\n')) body = body.slice(0, -2);
+    else if (body.endsWith('\n')) body = body.slice(0, -1);
+    return body;
+  };
+
+  // Оба вида обёрток разбираются ОДНИМ проходом слева направо, а не двумя
+  // последовательными: вложенный случай (вставка внутри сохранённого промпта)
+  // при двух проходах разорвал бы внешнюю обёртку по внутренней. Здесь берётся
+  // ближайшая открывающая метка, и её содержимое целиком уходит своему чипу.
   while (cursor < text.length) {
-    const openAt = text.indexOf(PASTED_CONTENT_OPEN, cursor);
-    if (openAt < 0) {
+    const pasteAt = text.indexOf(PASTED_CONTENT_OPEN, cursor);
+    const promptAt = text.indexOf(PROMPT_CHIP_OPEN_PREFIX, cursor);
+    const candidates = [
+      ...(pasteAt >= 0 ? [{ at: pasteAt, kind: 'paste' }] : []),
+      ...(promptAt >= 0 ? [{ at: promptAt, kind: 'prompt' }] : []),
+    ].sort((left, right) => left.at - right.at);
+    if (candidates.length === 0) {
       const tail = text.slice(cursor);
       if (tail) parts.push({ kind: 'text', text: tail });
       break;
     }
 
-    const contentStart = openAt + PASTED_CONTENT_OPEN.length;
-    const closeAt = text.indexOf(PASTED_CONTENT_CLOSE, contentStart);
+    const next = candidates[0];
+    if (next.kind === 'paste') {
+      const contentStart = next.at + PASTED_CONTENT_OPEN.length;
+      const closeAt = text.indexOf(PASTED_CONTENT_CLOSE, contentStart);
+      if (closeAt < 0) {
+        const tail = text.slice(cursor);
+        if (tail) parts.push({ kind: 'text', text: tail });
+        break;
+      }
+      const before = text.slice(cursor, next.at);
+      if (before) parts.push({ kind: 'text', text: before });
+      parts.push({ kind: 'paste', text: trimOneNewline(text.slice(contentStart, closeAt)) });
+      cursor = closeAt + PASTED_CONTENT_CLOSE.length;
+      continue;
+    }
+
+    // `<saved_prompt name="…">` или `<saved_prompt>`. Открывающая метка обязана
+    // закрыться на той же строке: `>` за переводом строки означает, что это
+    // просто похожий текст, а не наша обёртка.
+    const openEnd = text.indexOf('>', next.at + PROMPT_CHIP_OPEN_PREFIX.length);
+    const lineEnd = text.indexOf('\n', next.at);
+    const malformedOpen = openEnd < 0 || (lineEnd >= 0 && openEnd > lineEnd);
+    const closeAt = malformedOpen ? -1 : text.indexOf(PROMPT_CHIP_CLOSE, openEnd + 1);
     if (closeAt < 0) {
+      // Незакрытая или искажённая обёртка неоднозначна: показываем как обычный
+      // текст, ничего не додумывая. Дальше по строке метку не ищем — иначе
+      // случайный `</saved_prompt>` ниже склеил бы куски в чужой чип.
       const tail = text.slice(cursor);
       if (tail) parts.push({ kind: 'text', text: tail });
       break;
     }
-
-    const before = text.slice(cursor, openAt);
+    const before = text.slice(cursor, next.at);
     if (before) parts.push({ kind: 'text', text: before });
-
-    let content = text.slice(contentStart, closeAt);
-    if (content.startsWith('\r\n')) content = content.slice(2);
-    else if (content.startsWith('\n')) content = content.slice(1);
-    if (content.endsWith('\r\n')) content = content.slice(0, -2);
-    else if (content.endsWith('\n')) content = content.slice(0, -1);
-    parts.push({ kind: 'paste', text: content });
-    cursor = closeAt + PASTED_CONTENT_CLOSE.length;
+    const attrs = text.slice(next.at + PROMPT_CHIP_OPEN_PREFIX.length, openEnd);
+    const nameMatch = attrs.match(/\bname="([^"]*)"/);
+    parts.push({
+      kind: 'prompt-wrapper',
+      label: nameMatch ? unescapePromptChipLabel(nameMatch[1]) : '',
+      text: trimOneNewline(text.slice(openEnd + 1, closeAt))
+        // Обратная сторона экранирования в buildPromptChipWrapper.
+        .split(PROMPT_CHIP_CLOSE_ESCAPED).join(PROMPT_CHIP_CLOSE),
+    });
+    cursor = closeAt + PROMPT_CHIP_CLOSE.length;
   }
 
   return parts;
@@ -422,14 +522,25 @@ export function parsePastedContentParts(value) {
  * the surrounding text in its original order. A paste-only turn stays on the
  * old full-text fallback until its native picker representation is observed;
  * that is fail-closed rather than guessing from an opaque body.
+ *
+ * Обёртка сохранённого промпта — НЕ такой случай, и это важное различие.
+ * `<pasted_content>` сворачивает сам Claude, поэтому в его списке тела вставки
+ * нет. `<saved_prompt>` он не знает и никак не сворачивает: строка в списке
+ * содержит и тег, и тело — ровно то, что мы отправили. Поэтому текст обёртки
+ * остаётся в ключе поиска целиком, и его нельзя выкидывать «по аналогии» со
+ * вставкой: иначе ключ разойдётся с тем, что реально видно в списке, и откат
+ * перестанет находить ход.
  */
 export function buildClaudeRewindPromptProjection(value) {
   const fullText = String(value || '').trim();
   const parts = parsePastedContentParts(fullText);
   const pastePartCount = parts.filter((part) => part.kind === 'paste').length;
   const ordinaryParts = parts
-    .filter((part) => part.kind === 'text')
-    .map((part) => part.text);
+    .filter((part) => part.kind === 'text' || part.kind === 'prompt-wrapper')
+    .map((part) => (part.kind === 'prompt-wrapper'
+      // Тег в списке присутствует буквально, поэтому воссоздаём его как есть.
+      ? buildPromptChipWrapper({ label: part.label, text: part.text })
+      : part.text));
   const ordinaryText = ordinaryParts.join(' ').replace(/\s+/g, ' ').trim();
   const normalizedFullText = fullText.replace(/\s+/g, ' ').trim();
 
@@ -501,6 +612,38 @@ export function buildHistoryComposerPresentationParts({
   chips = [],
   imagePaths = [],
 } = {}) {
+  // Метка в самом тексте — старший источник: она приехала вместе с сообщением и
+  // разойтись с ним не может. Запись-спутник рядом с историей остаётся для
+  // сообщений, отправленных ДО появления метки, и для тех, что пришли путём, где
+  // текст собирали не мы.
+  const wrapperParts = parsePastedContentParts(String(text || ''));
+  const hasWrappedPromptChip = wrapperParts.some((part) => part.kind === 'prompt-wrapper');
+  if (hasWrappedPromptChip) {
+    const parts = [];
+    for (const part of wrapperParts) {
+      if (part.kind === 'paste') {
+        parts.push(part);
+        continue;
+      }
+      if (part.kind === 'prompt-wrapper') {
+        parts.push({
+          kind: 'prompt',
+          chip: {
+            // id только для React-ключа и раскрытия: собственной судьбы у него
+            // нет, чип целиком описан текстом.
+            id: 'wrapped-prompt-' + parts.length,
+            kind: 'prompt',
+            label: part.label || 'PROMPT',
+            text: part.text,
+          },
+        });
+        continue;
+      }
+      parts.push(...splitHistoryImageParts(part.text, imagePaths));
+    }
+    return { matchedPromptChips: true, parts };
+  }
+
   const promptPresentation = splitPromptChipPresentation({ text, chips });
   const parts = [];
   promptPresentation.chips.forEach((chip, index) => {
@@ -515,6 +658,7 @@ export function buildHistoryComposerPresentationParts({
       parts.push(part);
       continue;
     }
+    // `prompt-wrapper` в этой ветке невозможен: мы в ней только когда метки нет.
     parts.push(...splitHistoryImageParts(part.text, imagePaths));
   }
   return {

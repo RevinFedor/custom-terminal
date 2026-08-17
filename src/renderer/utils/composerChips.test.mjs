@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_AI_COMPOSER_CHIP_THRESHOLD,
   DICTATION_CLIPBOARD_FLAVOR,
+  buildClaudeRewindPromptProjection,
   buildHistoryComposerPresentationParts,
   isDictationClipboardPayload,
   haveSameComposerChips,
@@ -138,16 +139,19 @@ test('serialization puts prompt chips first, paste wrappers second, and editable
     text: 'cover note',
     chips: [
       chip('paste-1', 'paste', 'raw paste'),
-      chip('prompt-1', 'prompt', 'saved prompt', { sourceKey: 'prompt:1' }),
-      chip('prompt-2', 'prompt', 'saved variation', { sourceKey: 'prompt:1:variation:2' }),
+      chip('prompt-1', 'prompt', 'saved prompt', { sourceKey: 'prompt:1', label: 'One' }),
+      chip('prompt-2', 'prompt', 'saved variation', { sourceKey: 'prompt:1:variation:2', label: 'Two' }),
     ],
   });
 
+  // Сохранённый промпт уезжает В МЕТКЕ, как и вставка: чип в истории должен
+  // восстанавливаться из самого текста, а не из отдельной записи, которая может
+  // с ним разойтись.
   assert.equal(
     payload,
     [
-      'saved prompt',
-      'saved variation',
+      '<saved_prompt name="One">\nsaved prompt\n</saved_prompt>',
+      '<saved_prompt name="Two">\nsaved variation\n</saved_prompt>',
       '<pasted_content>\nraw paste\n</pasted_content>',
       'cover note',
     ].join('\n\n'),
@@ -158,10 +162,10 @@ test('prompt presentation sidecar removes only the exact durable prefix', () => 
   const promptChip = chip('prompt-1', 'prompt', 'saved prompt body', {
     label: 'Review: UI / UX',
   });
-  const payload = serializeComposerDraft({
-    text: 'user note',
-    chips: [promptChip],
-  });
+  // Сообщение, отправленное ДО появления метки: тело промпта лежало в тексте
+  // голым префиксом. Запись-спутник остаётся единственным способом узнать чип в
+  // таких сообщениях, поэтому её разбор проверяется на прежнем виде текста.
+  const payload = [promptChip.text, 'user note'].join('\n\n');
 
   assert.deepEqual(splitPromptChipPresentation({
     text: payload,
@@ -389,7 +393,9 @@ test('prompt chips keep their prefix placement alongside an anchored paste', () 
   const paste = pasteChip('paste-1', 'BLOB');
   const text = 'край ' + buildPasteChipMarker(paste);
   const out = serializeComposerDraft({ text, chips: [prompt, paste] });
-  assert.ok(out.startsWith('PROMPT\n\n'));
+  // Промпт по-прежнему идёт префиксом, но в своей метке; вставка остаётся ровно
+  // там, куда её поставил курсор.
+  assert.ok(out.startsWith('<saved_prompt name="P">\nPROMPT\n</saved_prompt>\n\n'));
   assert.match(out, /край <pasted_content>\nBLOB\n<\/pasted_content>$/);
 });
 
@@ -506,4 +512,147 @@ test('marker-aware caret: image and paste markers obey one rule', () => {
   assert.equal(move(paste.start + 4, 'forward'), paste.end);
   assert.equal(move(image.end, 'backward'), image.start);
   assert.equal(move(paste.end, 'backward'), paste.start);
+});
+
+/**
+ * Метка сохранённого промпта — та же роль, что у `<pasted_content>` для вставки:
+ * она едет В САМОМ ТЕКСТЕ, поэтому чип в истории читается из текста и не может
+ * разойтись с отдельной записью рядом с историей. До неё любое расхождение
+ * (промпт поправили перед отправкой, запись не доехала) превращало сообщение в
+ * простыню без чипа — пользователь: «а то сейчас они могут не совпасть».
+ */
+
+test('чип промпта восстанавливается из ТЕКСТА, без записи-спутника', () => {
+  const promptChip = chip('p1', 'prompt', 'тело сохранённого промпта', { label: 'Ревью' });
+  const sent = serializeComposerDraft({ text: 'моя фраза', chips: [promptChip] });
+  // Главный кейс: спутника нет вообще.
+  const result = buildHistoryComposerPresentationParts({ text: sent, chips: [] });
+  assert.equal(result.matchedPromptChips, true);
+  assert.deepEqual(result.parts.map((part) => part.kind), ['prompt', 'text']);
+  assert.equal(result.parts[0].chip.label, 'Ревью');
+  assert.equal(result.parts[0].chip.text, 'тело сохранённого промпта');
+  assert.equal(result.parts[1].text, '\n\nмоя фраза');
+});
+
+test('сообщения, отправленные ДО метки, продолжают читаться по записи-спутнику', () => {
+  // Единственный источник для них — запись рядом с историей, и он должен
+  // работать ровно как раньше, иначе вся прошлая переписка потеряет чипы.
+  const promptChip = chip('p1', 'prompt', 'старое тело', { label: 'Старый' });
+  const legacyText = [promptChip.text, 'моя фраза'].join('\n\n');
+  const withSidecar = buildHistoryComposerPresentationParts({
+    text: legacyText,
+    chips: [promptChip],
+  });
+  assert.equal(withSidecar.matchedPromptChips, true);
+  assert.equal(withSidecar.parts[0].kind, 'prompt');
+  // Без спутника у старого сообщения по-прежнему нет способа узнать чип —
+  // показываем полный текст, а не выдумываем чип.
+  const withoutSidecar = buildHistoryComposerPresentationParts({
+    text: legacyText,
+    chips: [],
+  });
+  assert.equal(withoutSidecar.matchedPromptChips, false);
+  assert.deepEqual(withoutSidecar.parts.map((part) => part.kind), ['text']);
+});
+
+test('имя промпта переживает кавычки и угловые скобки', () => {
+  // Без имени в метке после перезапуска «Ревью» превратилось бы в безымянный
+  // PROMPT, поэтому оно едет атрибутом — и обязано вернуться байт в байт.
+  const label = 'Ревью "кода" <v2> & прочее';
+  const sent = serializeComposerDraft({
+    text: '',
+    chips: [chip('p1', 'prompt', 'тело', { label })],
+  });
+  assert.doesNotMatch(sent.split('\n')[0], /name="[^"]*"[^>]*"/);
+  const result = buildHistoryComposerPresentationParts({ text: sent, chips: [] });
+  assert.equal(result.parts[0].chip.label, label);
+});
+
+test('закрывающая метка ВНУТРИ тела промпта не разрывает чип', () => {
+  // Промпт про эту же механику (или скопированный кусок такого сообщения) несёт
+  // в себе `</saved_prompt>`. Без экранирования разбор закрывался на нём: чип
+  // обрывался посередине, а хвост тела уезжал в обычный текст вместе с
+  // осиротевшим тегом.
+  const body = 'тело </saved_prompt> хвост';
+  const sent = serializeComposerDraft({
+    text: 'после',
+    chips: [chip('p1', 'prompt', body, { label: 'E' })],
+  });
+  const result = buildHistoryComposerPresentationParts({ text: sent, chips: [] });
+  assert.deepEqual(result.parts.map((part) => part.kind), ['prompt', 'text']);
+  assert.equal(result.parts[0].chip.text, body);
+  assert.equal(result.parts[1].text, '\n\nпосле');
+});
+
+test('похожий текст пользователя не превращается в чип', () => {
+  // Метка — доказательство, а не совпадение слов: незакрытая или просто
+  // упомянутая в переписке, она остаётся обычным текстом.
+  for (const value of [
+    'обсуждаем <saved_prompt> в переписке',
+    'текст <saved_prompt name="x">\nтело без закрытия',
+  ]) {
+    const result = buildHistoryComposerPresentationParts({ text: value, chips: [] });
+    assert.deepEqual(result.parts.map((part) => part.kind), ['text']);
+    assert.equal(result.parts[0].text, value);
+  }
+  // Внутри вставки метка не разбирается: тело вставки владеет своими байтами и
+  // может содержать документацию про эту самую механику.
+  const insidePaste = 'до <pasted_content>\n<saved_prompt name="x">\nтело\n</saved_prompt>\n</pasted_content>';
+  const nested = buildHistoryComposerPresentationParts({ text: insidePaste, chips: [] });
+  assert.deepEqual(nested.parts.map((part) => part.kind), ['text', 'paste']);
+  assert.match(nested.parts[1].text, /^<saved_prompt name="x">/);
+});
+
+test('промпт, вставка и картинка сохраняют порядок отправки', () => {
+  const paste = pasteChip('paste-1', 'BLOB');
+  const text = 'до ' + buildPasteChipMarker(paste) + ' и [Image #1] после';
+  const sent = serializeComposerDraft({
+    text,
+    chips: [chip('p1', 'prompt', 'ПРОМПТ', { label: 'P' }), paste],
+  });
+  const result = buildHistoryComposerPresentationParts({
+    text: sent,
+    chips: [],
+    imagePaths: [{ id: 1, path: '/tmp/one.png', availability: 'available' }],
+  });
+  assert.deepEqual(result.parts.map((part) => part.kind), [
+    'prompt', 'text', 'paste', 'text', 'image', 'text',
+  ]);
+});
+
+test('ключ поиска для откатов содержит метку целиком', () => {
+  // `<pasted_content>` сворачивает сам Claude, поэтому тело вставки из ключа
+  // убирается. `<saved_prompt>` он не знает и не сворачивает: строка в его списке
+  // содержит и тег, и тело. Выкинуть их «по аналогии» значит разойтись с тем, что
+  // реально видно в списке, и потерять ход при откате.
+  const sent = serializeComposerDraft({
+    text: 'моя фраза',
+    chips: [chip('p1', 'prompt', 'тело промпта', { label: 'Ревью' })],
+  });
+  const projection = buildClaudeRewindPromptProjection(sent);
+  assert.equal(projection.menuSource, 'full-text');
+  assert.equal(projection.menuText, sent.replace(/\s+/g, ' ').trim());
+  assert.match(projection.menuText, /<saved_prompt name="Ревью">/);
+  // А вставка по-прежнему выпадает из ключа — её тела в списке нет.
+  const withPaste = serializeComposerDraft({
+    text: 'обычный текст',
+    chips: [pasteChip('paste-1', 'СКРЫТОЕ ТЕЛО')],
+  });
+  const pasteProjection = buildClaudeRewindPromptProjection(withPaste);
+  assert.equal(pasteProjection.menuSource, 'ordinary-text-outside-paste');
+  assert.doesNotMatch(pasteProjection.menuText, /СКРЫТОЕ ТЕЛО/);
+
+  // Решающий случай — ПРОМПТ И ВСТАВКА ВМЕСТЕ. Только здесь видно разницу: без
+  // вставки ключ уходит в резервную ветку «весь текст» и остаётся правильным
+  // случайно, даже если обёртку из него выбросили. С вставкой ветка меняется, и
+  // потерянная обёртка становится видна.
+  const paste = pasteChip('paste-2', 'СКРЫТОЕ ТЕЛО ВСТАВКИ');
+  const mixed = serializeComposerDraft({
+    text: 'до ' + buildPasteChipMarker(paste) + ' после',
+    chips: [chip('p2', 'prompt', 'тело промпта', { label: 'Ревью' }), paste],
+  });
+  const mixedProjection = buildClaudeRewindPromptProjection(mixed);
+  assert.equal(mixedProjection.menuSource, 'ordinary-text-outside-paste');
+  assert.match(mixedProjection.menuText, /<saved_prompt name="Ревью">\s*тело промпта\s*<\/saved_prompt>/);
+  assert.doesNotMatch(mixedProjection.menuText, /СКРЫТОЕ ТЕЛО ВСТАВКИ/);
 });

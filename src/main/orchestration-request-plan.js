@@ -110,9 +110,20 @@ function resolveOrchestrationDeliveryAdmission(status = {}) {
 }
 
 function isOrchestrationDeliveryIdentityCompatible(run = {}, status = {}) {
+  status = status || {};
   const expectedTool = run.targetToolType || null;
   const observedTool = status.toolType || status.commandType || null;
   if (expectedTool && observedTool && expectedTool !== observedTool) return false;
+
+  const observedTabId = status.tabId || null;
+  if (run.targetTabId && observedTabId && run.targetTabId !== observedTabId) return false;
+
+  // A prompt which has not crossed Enter belongs to the durable tab address,
+  // not to the conversation/process which happened to be alive when it was
+  // queued. Resume legitimately creates a new Claude session and Codex may
+  // adopt a linked rollout. The exact post-Enter prompt audit binds that fresh
+  // writer; rejecting it here would leave the durable intent queued forever.
+  if (run.deliveryIntent) return true;
 
   const expectedSession = run.sessionId || null;
   const observedSession = status.sessionId || null;

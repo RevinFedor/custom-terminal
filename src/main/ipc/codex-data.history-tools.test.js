@@ -356,6 +356,48 @@ test('maps parallel image and MCP calls, then folds wait result into those cards
   assert.equal(JSON.stringify(history).includes('do-not-render'), false);
 });
 
+test('delegate MCP keeps the full prompt out of the collapsed header summary', () => {
+  const delegatedPrompt = 'FULL DELEGATED TASK '.repeat(120).trim();
+  const source = [
+    'const result = await tools.mcp__terminal__delegate_to_session({',
+    '  targetTabId: "tab-2403",',
+    '  label: "History tail-spacer jump",',
+    `  prompt: ${JSON.stringify(delegatedPrompt)},`,
+    '});',
+    'text(JSON.stringify(result));',
+  ].join('\n');
+  const history = historyFor(execCall('exec-delegate', source), output('exec-delegate', '{}'));
+  const [action] = rawActions(history);
+
+  assert.equal(action.toolName, 'MCP');
+  assert.equal(action.mcpServer, 'terminal');
+  assert.equal(action.mcpMethod, 'delegate_to_session');
+  assert.equal(
+    action.args.summary,
+    'terminal · delegate_to_session — History tail-spacer jump',
+    'the explicit orchestration label is the only collapsed-row subject',
+  );
+  assert.equal(action.args.prompt, delegatedPrompt, 'expanded arguments and copy keep the original task');
+  assert.equal(action.args.summary.includes(delegatedPrompt), false);
+});
+
+test('prompt-only MCP call has no synthesized prompt preview', () => {
+  const delegatedPrompt = 'do not print this entire task in the feed';
+  const source = [
+    'const result = await tools.mcp__terminal__send_prompt({',
+    '  tabId: "tab-1",',
+    `  prompt: ${JSON.stringify(delegatedPrompt)},`,
+    '});',
+    'text(JSON.stringify(result));',
+  ].join('\n');
+  const history = historyFor(execCall('exec-send-prompt', source), output('exec-send-prompt', '{}'));
+  const [action] = rawActions(history);
+
+  assert.equal(action.args.summary, 'terminal · send_prompt');
+  assert.equal(action.args.prompt, delegatedPrompt);
+  assert.equal(action.args.summary.includes(delegatedPrompt), false);
+});
+
 test('turns apply_patch into per-file edit cards even when patch text contains a fake declaration', () => {
   const patchText = [
     '*** Begin Patch',

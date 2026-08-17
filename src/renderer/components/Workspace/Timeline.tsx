@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -1500,7 +1500,7 @@ function Timeline({
     sourceContent: string;
     compactText: string;
     compactUuid?: string; // UUID of the inserted compact entry (after apply)
-    autoEditInitial?: boolean; // open with first Gemini-message in inline-edit mode
+    initialInput?: string; // configured Rewind prompt, left unsent in Chat mode
   } | null>(null);
   // Ref mirror — always current, used by useEffect cleanup (closures capture stale state)
   const editRangeStateRef = useRef(editRangeState);
@@ -4986,12 +4986,11 @@ function Timeline({
     }
   };
 
-  // Third zone of the violet Rewind: open the review window with EMPTY text and
-  // let the user write the replacement summary themselves — no Gemini call at
-  // all. Shared by the selection menu and the single-point menu; duplicating it
-  // per call site is how the two paths drifted apart in the first place (the
-  // single-point flow had no window whatsoever).
-  const openEditRangeWithoutSummary = async (
+  // Chat action for history rewrite: gather the same source and configured
+  // Rewind prompt as the automatic AI action, but leave that prompt in the
+  // Gemini composer. Nothing is sent and history is not changed until the user
+  // explicitly sends, reviews the answer and clicks Apply.
+  const openEditRangeChat = async (
     range: { startIndex: number; endIndex: number },
     startUuid: string,
     endUuid: string,
@@ -5015,18 +5014,44 @@ function Timeline({
     setRangeActionMenu(null);
     setPostPromptMode(false);
     try {
+      let promptState = usePromptsStore.getState();
+      if (!promptState.isLoaded) {
+        await promptState.loadPrompts();
+        promptState = usePromptsStore.getState();
+      }
+      const promptConfig = promptState.getPromptById(promptState.rewindPromptId);
+      if (!promptConfig) {
+        useUIStore.getState().showToast('Не настроен Rewind-промпт', 'error', 3000);
+        return;
+      }
+      let fileContentsBlock = '';
+      const filePaths = promptConfig.filePaths || [];
+      if (filePaths.length > 0) {
+        const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', filePaths);
+        if (filesResult.success && filesResult.data.length > 0) {
+          fileContentsBlock = '\n\n' + filesResult.data.map((file: { path: string; content: string }) =>
+            `--- File: ${file.path} ---\n${file.content}`
+          ).join('\n\n');
+        }
+      }
       const copyRangeChannel = isCodex ? 'codex:copy-range' : 'claude:copy-range';
       const result = await ipcRenderer.invoke(copyRangeChannel, {
         sessionId, cwd, startUuid, endUuid,
         ...copyFlags,
       });
       if (result.success) {
-        setEditRangeState({ range, phase: 'ready', sourceContent: result.content, compactText: '', autoEditInitial: true });
+        setEditRangeState({
+          range,
+          phase: 'ready',
+          sourceContent: result.content,
+          compactText: '',
+          initialInput: promptConfig.content + fileContentsBlock,
+        });
       } else {
         useUIStore.getState().showToast('Не удалось собрать диапазон', 'error', 3000);
       }
     } catch (err: any) {
-      console.error('[EditRange:ManualOpen] Failed:', err);
+      console.error('[EditRange:ChatOpen] Failed:', err);
       useUIStore.getState().showToast('Ошибка: ' + (err.message || err), 'error', 3000);
     }
   };
@@ -5962,12 +5987,11 @@ function Timeline({
   // `AI` button already consumed (it copied entry.uuid → last entry) before
   // pasting the summary blindly into the composer with no window at all.
   //
-  // `openEmptyWindow` skips Gemini entirely: the window opens with empty text
-  // for the user to write the summary themselves — the same third zone the
-  // selection menu has.
+  // `openChat` skips the automatic Gemini request and opens the same review
+  // window with the configured prompt still sitting unsent in its composer.
   const requestHistoryRewrite = useCallback((
     entry: TimelineEntry,
-    options?: { additionalPrompt?: string; openEmptyWindow?: boolean },
+    options?: { additionalPrompt?: string; openChat?: boolean },
   ) => {
     if (rejectBlockedHistoryMutation(historyRewriteUiBlocked)) return false;
     if (!supportsEditRangeActions || !sessionId) return false;
@@ -5979,14 +6003,14 @@ function Timeline({
     const endUuid = entries[endIndex].uuid;
     console.warn('[Restore:Rewind] history-rewrite request source=timeline-menu'
       + ' scope=single-point'
-      + ' empty=' + (options?.openEmptyWindow ? '1' : '0')
+      + ' chat=' + (options?.openChat ? '1' : '0')
       + ' prompt=' + (options?.additionalPrompt ? options.additionalPrompt.length : 0)
       + ' range=[' + startIndex + ',' + endIndex + ']'
       + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none')
       + ' entry=' + entry.uuid.slice(0, 8));
     setContextMenu(null);
-    if (options?.openEmptyWindow) {
-      void openEditRangeWithoutSummary(range, startUuid, endUuid);
+    if (options?.openChat) {
+      void openEditRangeChat(range, startUuid, endUuid);
       return true;
     }
     void executeRangeAction('edit', range, startUuid, endUuid, options?.additionalPrompt);
@@ -7575,12 +7599,13 @@ function Timeline({
           const rightOffset = window.innerWidth - containerRect.left + 8;
           const panelEl = (
             <EditRangePanel
+              key={`${sessionId}:${editRangeState.range.startIndex}:${editRangeState.range.endIndex}:${editRangeState.initialInput !== undefined ? 'chat' : 'ai'}`}
               sourceContent={editRangeState.sourceContent}
               initialCompact={editRangeState.compactText}
               anchorTop={anchorTop}
               anchorHeight={anchorHeight}
               rightOffset={rightOffset}
-              autoEditInitial={editRangeState.autoEditInitial}
+              initialInput={editRangeState.initialInput}
               onApply={async (compactText, onProgress) => {
                 console.warn('[EditRange] Applying, compact length:', compactText.length);
                 setEditRangeState(prev => prev ? { ...prev, phase: 'applying' } : null);
@@ -8604,11 +8629,12 @@ function Timeline({
                       })()}
                     </>
                   )}
-                  {/* Two DIFFERENT rewinds, separated by kind and by colour.
-                      Amber = native: the app drives the agent's own /rewind, the
-                      transcript on disk is untouched. Violet = rewrite: the span
-                      is removed from the history file and replaced by one
-                      summary. They used to sit in one amber split control where
+                  {/* Two DIFFERENT rewind families, separated by kind and colour.
+                      Amber = native: the app drives the agent's own rewind UI.
+                      Claude keeps a preview until submit; Codex persists its
+                      thread rollback immediately. Violet = rewrite: the span is
+                      removed from the history file and replaced by one summary.
+                      They used to sit in one amber split control where
                       the right zone silently ran Gemini and pasted the result
                       with no review window — the same operation as the selection
                       Rewind, but with a different colour, name and behaviour. */}
@@ -8616,7 +8642,11 @@ function Timeline({
                     const rewindAvailability = getRewindRequestState(contextMenu.entry);
                     const canStartRewind = rewindAvailability.canStart;
                     const rewindBusyTitle = rewindAvailability.reason || undefined;
-                    const nativeAgentSuffix = isCodex ? 'Codex' : isGemini ? 'Gemini' : 'Claude';
+                    const nativeRewindDescription = isCodex
+                      ? 'Нативный откат внутри Codex — откат сохраняется сразу, выбранный prompt вернётся в input'
+                      : isGemini
+                        ? 'Нативный откат внутри Gemini — выбранный prompt вернётся в input'
+                        : 'Нативный откат внутри Claude — preview до следующей отправки, выбранный prompt вернётся в input';
                     const nativeLabel = rewindState
                       ? (rewindState.phase === 'preparing'
                         ? 'Preparing...'
@@ -8631,7 +8661,7 @@ function Timeline({
                         : rewindState.phase === 'done'
                         ? 'Done'
                         : 'Paste...')
-                      : 'Rewind (' + nativeAgentSuffix + ')';
+                      : 'Rewind';
                     // Rewriting history needs a user entry it can actually cut
                     // at; boundary rows are handled by the delete flow above.
                     const canRewriteHistory = supportsEditRangeActions
@@ -8642,7 +8672,7 @@ function Timeline({
                     return (
                       <>
                         <div className="border-t border-white/10 my-1" />
-                        <Tooltip content={rewindBusyTitle || ('Нативный откат внутри ' + nativeAgentSuffix + ' — история на диске не меняется')}>
+                        <Tooltip content={rewindBusyTitle || nativeRewindDescription}>
                           <button
                             data-testid="timeline-rewind-native-single"
                             className={`w-full text-left px-3 py-2 text-xs rounded transition-colors flex items-center gap-2 ${canStartRewind ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
@@ -8658,45 +8688,34 @@ function Timeline({
                           </button>
                         </Tooltip>
                         {canRewriteHistory && (
-                          // Same three zones as the selection Rewind: summary +
-                          // window, own instruction first, empty window.
+                          // Two rewrite actions beside native Rewind: automatic
+                          // AI summary, or a chat with the configured prompt left
+                          // unsent so the user can replace or extend it first.
                           <div className="flex rounded overflow-hidden" data-testid="timeline-rewind-rewrite-single">
-                            <Tooltip content="Откат переписыванием истории: диапазон до конца заменится одной сводкой">
+                            <Tooltip content="AI: пересказать диапазон и подготовить откат переписыванием истории">
                               <button
+                                data-testid="timeline-rewind-ai-single"
                                 className="flex-1 text-left px-3 py-2 text-xs text-violet-400 hover:bg-violet-600/20 transition-colors cursor-pointer flex items-center gap-2"
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   requestHistoryRewrite(contextMenu.entry);
                                 }}
                               >
-                                <Repeat2 size={12} />
-                                Rewind
+                                <Sparkles size={12} />
+                                AI
                               </button>
                             </Tooltip>
-                            <Tooltip content="Добавить инструкцию к промпту">
+                            <Tooltip content="Chat: открыть Gemini с настроенным, но ещё не отправленным промптом">
                               <button
-                                data-testid="timeline-rewind-rewrite-prompt-single"
-                                className="px-2 py-2 text-xs text-violet-400/60 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10"
+                                data-testid="timeline-rewind-chat-single"
+                                className="px-3 py-2 text-xs text-violet-400/70 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center gap-1.5"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  setSinglePostPromptEntryUuid(contextMenu.entry.uuid);
-                                  setPostPromptText('');
-                                  setTimeout(() => postPromptRef.current?.focus(), 50);
+                                  requestHistoryRewrite(contextMenu.entry, { openChat: true });
                                 }}
                               >
-                                ▶
-                              </button>
-                            </Tooltip>
-                            <Tooltip content="Открыть пустой чат (без Gemini)">
-                              <button
-                                data-testid="timeline-rewind-rewrite-empty-single"
-                                className="px-2 py-2 text-xs text-violet-400/60 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  requestHistoryRewrite(contextMenu.entry, { openEmptyWindow: true });
-                                }}
-                              >
-                                <Pencil size={11} />
+                                <MessageSquareText size={11} />
+                                Chat
                               </button>
                             </Tooltip>
                           </div>
@@ -8858,45 +8877,32 @@ function Timeline({
                     Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
                   </button>
                   {supportsEditRangeActions && !historyRewriteUiBlocked && (
-                    // Same action as the single-point violet Rewind — history is
-                    // rewritten and the removed range is replaced by one summary.
-                    // Only the boundaries differ (selection instead of one click),
-                    // so it must not carry a different name: "Редактировать" read
-                    // as a fourth, unrelated operation.
+                    // Range selection exposes the same history-rewrite pair as
+                    // a single point. Native Rewind has no arbitrary-range form.
                     <div className="flex rounded overflow-hidden" data-testid="timeline-rewind-split-range">
                       <button
+                        data-testid="timeline-rewind-ai-range"
                         className="flex-1 text-left px-3 py-2 text-xs text-violet-400 hover:bg-violet-600/20 transition-colors cursor-pointer flex items-center gap-2"
                         onClick={(e) => {
                           e.stopPropagation();
                           executeRangeAction('edit', rangeActionMenu.range, rangeActionMenu.startUuid, rangeActionMenu.endUuid);
                         }}
                       >
-                        <Repeat2 size={12} />
-                        Rewind
+                        <Sparkles size={12} />
+                        AI
                       </button>
-                      <Tooltip content="Добавить инструкцию к промпту">
+                      <Tooltip content="Открыть Gemini с настроенным, но ещё не отправленным промптом">
                       <button
-                        className="px-2 py-2 text-xs text-violet-400/60 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setPostPromptMode(true);
-                          setPostPromptText('');
-                          setTimeout(() => postPromptRef.current?.focus(), 50);
-                        }}
-                      >
-                        ▶
-                      </button>
-                      </Tooltip>
-                      <Tooltip content="Открыть пустой чат (без Gemini)">
-                      <button
-                        className="px-2 py-2 text-xs text-violet-400/60 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
+                        data-testid="timeline-rewind-chat-range"
+                        className="px-3 py-2 text-xs text-violet-400/70 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center gap-1.5"
                         onClick={(e) => {
                           e.stopPropagation();
                           const { range, startUuid, endUuid } = rangeActionMenu;
-                          void openEditRangeWithoutSummary(range, startUuid, endUuid);
+                          void openEditRangeChat(range, startUuid, endUuid);
                         }}
                       >
-                        <Pencil size={11} />
+                        <MessageSquareText size={11} />
+                        Chat
                       </button>
                       </Tooltip>
                     </div>

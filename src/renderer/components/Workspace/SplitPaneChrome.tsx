@@ -32,7 +32,6 @@ import {
   useTabActivitySignals,
 } from './TabSignals';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
-import { PaneRecentTabsButton } from './PaneRecentTabsButton';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 
@@ -451,11 +450,15 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           )}
       </span>
 
-      {/* Recent tabs — right of the name, as approved. Puts a tab into THIS
-          pane WITHOUT taking focus; the chip's own click still navigates. Two
-          neighbouring controls, two different questions: "go there" and "show
-          it here". */}
-      <PaneRecentTabsButton paneIndex={paneIndex ?? -1} currentTabId={tabId} />
+      {/* Здесь была кнопка «недавние вкладки» — список по наведению, который
+          клал вкладку в ЭТУ панель, не забирая фокус. Удалена 2026-08-17:
+          список шёл в порядке свежести (журнал), а пользователь выбирает
+          вкладку глазами по КАРТЕ — иерархии бокового меню, которую сам
+          расставил. Журнальный порядок читался как «сплошной набор файлов».
+          Боковое меню теперь следует за активной вкладкой, поэтому нужный
+          список и так всегда слева. Если вернётся сценарий «подготовить
+          соседнее окно, не уходя из своего» — восстанавливать с порядком
+          сайдбара, а не MRU. */}
 
       <span style={{ flex: 1 }} />
 

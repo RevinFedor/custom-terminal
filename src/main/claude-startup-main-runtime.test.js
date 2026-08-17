@@ -232,6 +232,49 @@ test('both readiness signals join one main-owned sequence', async () => {
   assert.deepEqual(h.gates.map((item) => item.status), ['pending', 'ready']);
 });
 
+test('exact settings already confirmed by the resumed session close the gate without re-sending slash commands', async () => {
+  const h = harness({
+    resolveSettings: async () => ({
+      model: 'claude-fable-5[1m]',
+      effort: 'max',
+      modelAlreadyConfirmed: true,
+      effortAlreadyConfirmed: true,
+      source: 'session-history',
+    }),
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  const result = await run.promise;
+  assert.equal(result.status, 'ready');
+  assert.deepEqual(h.sends, []);
+  assert.deepEqual(h.gates.map((item) => item.status), ['pending', 'ready']);
+  assert.equal(h.runtime.snapshot('tab-a').claims.model.via, 'session-history');
+  assert.equal(h.runtime.snapshot('tab-a').claims.effort.via, 'session-history');
+});
+
+test('an explicit next-launch override still sends when it differs from confirmed session history', async () => {
+  const h = harness({
+    resolveSettings: async () => ({
+      model: 'opus',
+      effort: 'high',
+      modelAlreadyConfirmed: false,
+      effortAlreadyConfirmed: true,
+      source: 'tab-startup-intent',
+    }),
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  const result = await run.promise;
+  assert.equal(result.status, 'ready');
+  assert.deepEqual(h.sends.map((item) => item.command), ['/model opus']);
+});
+
 test('manual effort selected while model proof is pending wins over default effort', async () => {
   const modelProof = deferred();
   const h = harness({

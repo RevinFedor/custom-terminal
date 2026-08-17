@@ -241,6 +241,13 @@ const projectUserEntry = (canonical, envelope, blocks) => {
     ...(typeof canonical.sourceIdentity === 'string'
       ? { sourceIdentity: canonical.sourceIdentity }
       : {}),
+    ...(Array.isArray(canonical.sourceIdentityAliases)
+      ? {
+          sourceIdentityAliases: canonical.sourceIdentityAliases.filter((identity) => (
+            typeof identity === 'string' && identity
+          )),
+        }
+      : {}),
     ...(recordByteOffsetFrom(envelope) !== null
       ? { recordByteOffset: recordByteOffsetFrom(envelope) }
       : {}),
@@ -257,13 +264,11 @@ const projectUserEntry = (canonical, envelope, blocks) => {
 };
 
 const upsertEntry = (entries, incoming, { beforeFirstQueued = false } = {}) => {
-  const index = entries.findIndex((entry) =>
+  const incomingIdentities = new Set(historyLivePresentationIdentities(incoming));
+  const index = entries.findIndex((entry) => (
     entry?.uuid === incoming.uuid
-    || (
-      incoming.sourceIdentity
-      && entry?.sourceIdentity === incoming.sourceIdentity
-    )
-  );
+    || historyLivePresentationIdentities(entry).some((identity) => incomingIdentities.has(identity))
+  ));
   if (index < 0) {
     if (beforeFirstQueued) {
       const queuedIndex = entries.findIndex((entry) => (
@@ -648,6 +653,12 @@ export function historyLivePresentationIdentities(entry) {
   const identities = [];
   const sourceIdentity = String(entry?.sourceIdentity || '');
   if (sourceIdentity) identities.push(sourceIdentity);
+  for (const alias of Array.isArray(entry?.sourceIdentityAliases)
+    ? entry.sourceIdentityAliases
+    : []) {
+    const normalized = String(alias || '');
+    if (normalized && !identities.includes(normalized)) identities.push(normalized);
+  }
   const queueIdentity = claudeHistoryQueuePresentationIdentity(entry);
   if (queueIdentity && !identities.includes(queueIdentity)) identities.push(queueIdentity);
   // Claude's durable projection preserves the JSONL assistant UUID directly.
@@ -723,6 +734,7 @@ export function reduceHistoryLiveProjection(
   { includeUserText = false } = {},
 ) {
   const entries = Array.isArray(currentEntries) ? currentEntries : [];
+  const canonical = unwrapLiveMessage(envelope);
   if (
     envelope?.type === 'turn_boundary'
     && TURN_BOUNDARIES_THAT_CLEAR_PENDING_THINKING.has(envelope.boundary)
@@ -745,18 +757,26 @@ export function reduceHistoryLiveProjection(
     };
     return upsertEntry(entries, entry);
   }
-  const promptCarrier = reduceClaudeHistoryPromptCarrier(entries, envelope, {
-    includeUserText,
-  });
-  if (promptCarrier.handled) {
-    return promptCarrier.promptBoundary
-      ? clearPendingThinking(
-          promptCarrier.entries,
-          String(envelope?.sessionId || envelope?.message?.sessionId || ''),
-        )
-      : promptCarrier.entries;
+  // A paired Codex user carrier retains the earlier physical source as an
+  // exact alias. Route that canonical upgrade through the provider-neutral
+  // identity upsert below; the Claude prompt-carrier reducer predates source
+  // aliases and would otherwise append the canonical event beside the already
+  // visible response carrier for one frame.
+  const hasExactSourceAliases = Array.isArray(canonical?.sourceIdentityAliases)
+    && canonical.sourceIdentityAliases.some((identity) => typeof identity === 'string' && identity);
+  if (!hasExactSourceAliases) {
+    const promptCarrier = reduceClaudeHistoryPromptCarrier(entries, envelope, {
+      includeUserText,
+    });
+    if (promptCarrier.handled) {
+      return promptCarrier.promptBoundary
+        ? clearPendingThinking(
+            promptCarrier.entries,
+            String(envelope?.sessionId || envelope?.message?.sessionId || ''),
+          )
+        : promptCarrier.entries;
+    }
   }
-  const canonical = unwrapLiveMessage(envelope);
   if (!canonical) return entries;
 
   const role = canonical.message?.role || canonical.type;

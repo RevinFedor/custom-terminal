@@ -26,7 +26,8 @@ const closeTab = (() => {
 
 test('the close archive goes through the stop-and-retry wrapper', () => {
   assert.match(closeTab, /commitArchiveWithStopRetry\(/);
-  assert.match(closeTab, /commandType: tab\.commandType/);
+  assert.match(closeTab, /commandType: effectiveCommandType/);
+  assert.match(closeTab, /toolType: effectiveCommandType/);
   assert.match(closeTab, /reason: 'close-tab-archive-retry'/);
   // The old direct call must be gone — two archive calls with different rules
   // is exactly the drift this file guards against.

@@ -184,6 +184,29 @@ test('missing optional identity does not invent a contradiction', () => {
   }), true);
 });
 
+test('an unsent durable intent follows its exact tab across Resume identity changes', () => {
+  const run = {
+    targetTabId: 'target-tab',
+    targetToolType: 'claude',
+    sessionId: 'old-session',
+    targetLifecycleGeneration: 'old-generation',
+    targetLaunchGeneration: 'old-launch',
+    deliveryIntent: { prompt: 'continue' },
+  };
+  assert.equal(isOrchestrationDeliveryIdentityCompatible(run, {
+    tabId: 'target-tab',
+    toolType: 'claude',
+    sessionId: 'new-session',
+    lifecycleGeneration: 'new-generation',
+    launchGeneration: 'new-launch',
+  }), true);
+  assert.equal(isOrchestrationDeliveryIdentityCompatible(run, {
+    tabId: 'other-tab',
+    toolType: 'claude',
+  }), false);
+  assert.equal(isOrchestrationDeliveryIdentityCompatible(run, null), true);
+});
+
 test('close guard treats active as idle and lifecycle transitions as busy', () => {
   assert.equal(isAgentStatusBusyForClose({ status: 'active', busy: false }), false);
   assert.equal(isAgentStatusBusyForClose({ status: 'busy' }), true);

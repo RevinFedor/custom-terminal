@@ -34,8 +34,13 @@ export function getLayoutVariants(text) {
 // projects: Array<{ projectId, projectName, tabs: Array<{ id, name, ... }>, tabHistory?: string[] }>
 //   tabs come in natural sidebar order; extra fields pass through to rows.
 // globalMru: Array<{ projectId, tabId }> most-recent-first.
-// activeTabId: current tab (globally focused).
-export function buildSwitcherRows({ projects, globalMru = [], query = '' }) {
+// pinnedFirstTabId: the tab that must head the list whatever its recency —
+//   Ctrl+Tab puts the CURRENT tab there as an anchor ("ты здесь"), so the
+//   highlighted second row reads as "and this is where I am going". It cannot
+//   be left to the MRU: focusing a pane whose tab was already visible is not
+//   recorded as a visit (see tabVisitHistoryRule), so the tab under the user's
+//   eyes is frequently NOT the head of the history.
+export function buildSwitcherRows({ projects, globalMru = [], query = '', pinnedFirstTabId = null }) {
   const mruRank = new Map();
   globalMru.forEach((entry, i) => {
     if (!entry || !entry.tabId) return;
@@ -61,7 +66,11 @@ export function buildSwitcherRows({ projects, globalMru = [], query = '' }) {
         projectIndex,
         naturalIndex,
         tab,
-        rank: mruRank.has(tab.id) ? mruRank.get(tab.id) : Infinity,
+        // -1 outranks every MRU position, so the anchor row is first even when
+        // the current tab has no history entry at all.
+        rank: (pinnedFirstTabId && tab.id === pinnedFirstTabId)
+          ? -1
+          : (mruRank.has(tab.id) ? mruRank.get(tab.id) : Infinity),
       });
     });
   });
@@ -101,16 +110,16 @@ export function selectableIndices(rows) {
   return out;
 }
 
-// Initial highlight for ctrl-mode: the PREVIOUS tab — the most recent history
-// entry that is not the active tab, visible in another pane or not.
+// Initial highlight for ctrl-mode: the most recent history entry present in
+// `rows`, skipping the active tab.
 //
-// A visible tab is a legal target now: picking it JUMPS focus to its pane
-// (switchTab's split rule), which is exactly the one-press undo of an
-// accidental click into the neighbouring pane. Visits are recorded only when a
-// tab APPEARS (tabVisitHistoryRule), so a focus move does not rewrite the
-// history — the A↔B toggle between two visible panes works in both directions
-// off the same list. The old "skip everything on screen" rule came from the
-// pane-scoped era, where a visible tab as a target meant a duplicate.
+// Row 1 of the ctrl list is the ACTIVE tab — an anchor, not a destination — so
+// skipping it here is what makes the highlight land on row 2, "where releasing
+// Ctrl takes me". Everything else on screen is absent from `rows` entirely
+// (TabSwitcherOverlay::computeRowsFromStores), so the freshest remaining row is
+// the freshest thing the user cannot see. Filtering at the list level rather
+// than at the highlight is what keeps the gesture consistent — stepping,
+// wrapping and the fast tap all walk the same rows.
 export function initialCtrlIndex(rows, globalMru, activeTabId) {
   const byTabId = new Map();
   rows.forEach((row, i) => { if (row.kind === 'tab' && !row.missing) byTabId.set(row.tab.id, i); });
@@ -121,7 +130,13 @@ export function initialCtrlIndex(rows, globalMru, activeTabId) {
   }
   const selectable = selectableIndices(rows);
   const nonActive = selectable.find(i => rows[i].tab.id !== activeTabId);
-  return nonActive !== undefined ? nonActive : (selectable[0] ?? -1);
+  if (nonActive !== undefined) return nonActive;
+  // Nothing but the anchor: the gesture has no destination, so it must select
+  // NOTHING rather than fall back to the current tab. Re-activating the tab the
+  // user is already on is not a no-op downstream — it switches the project view
+  // to the terminal and yanks the sidebar to that row.
+  if (activeTabId && selectable.length > 0) return -1;
+  return selectable[0] ?? -1;
 }
 
 // Step selection over tab rows only, wrapping, skipping project headers.

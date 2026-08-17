@@ -17,6 +17,7 @@ const {
   buildOrchestrationResultLookup,
   orchestrationSendFailureRecoveryPolicy,
   resolveCausalSourceExecutionContext,
+  outcomeForReason,
 } = require('./orchestration-runs');
 
 async function makeStore() {
@@ -108,6 +109,28 @@ test('waiting source notifications retry on a source turn start or proven-ready 
     type: 'snapshot', inputReady: false, busy: false,
   }), false);
   assert.equal(shouldRetryWaitingNotificationForSourceLifecycle({ type: 'message' }), false);
+});
+
+test('abnormal runtime exits never normalize to orchestration success', () => {
+  assert.equal(outcomeForReason('pty-exit'), 'process_exited');
+  assert.equal(outcomeForReason('terminal-kill'), 'process_exited');
+  assert.equal(outcomeForReason('command-finished'), 'process_exited');
+  assert.equal(outcomeForReason('watchdog'), 'process_exited');
+  assert.equal(outcomeForReason('replace'), 'process_replaced');
+  assert.equal(outcomeForReason('manual-stop'), 'interrupted');
+  assert.equal(outcomeForReason('task_complete'), 'success');
+  assert.equal(outcomeForReason(undefined), 'success');
+});
+
+test('audit-pending source delivery becomes unconfirmed when restart finds no exact proof', () => {
+  assert.equal(shouldMarkSourceFollowupUnconfirmed({
+    ...baseRun('audit-pending-restart'),
+    status: 'completed',
+    notifySource: true,
+    notificationStatus: 'audit-pending',
+    sourceFollowupPending: true,
+    sourceFollowupStartedAt: null,
+  }, { confirmed: false, reason: 'turn-not-found' }), true);
 });
 
 test('durable reservation is idempotent only for the same request fingerprint', async () => {
@@ -682,6 +705,45 @@ test('exact target prompt proof binds the pre-delivery turn and makes nested wor
   }
 });
 
+test('a late exact target proof adopts only orphan children from the same physical turn', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    const context = {
+      provider: 'claude',
+      sessionId: 'session-target-1',
+      turnId: 'claude:late-proof',
+      processId: 'pid-target-1',
+      generation: 9,
+      startedAt: 100,
+    };
+    await store.create({
+      ...baseRun('parent-late-proof'),
+      targetToolType: 'claude',
+      requiresTargetPromptProof: true,
+    });
+    await store.markDelivery('parent-late-proof');
+    await store.applyLifecycle('target-1', {
+      type: 'busy', busy: true, executionContext: context,
+    });
+    await store.create({
+      ...baseRun('child-before-proof', 'tester-tab'),
+      sourceTabId: 'target-1',
+      sourceExecutionContext: context,
+    });
+    assert.equal((await store.get('child-before-proof')).parentRunId, null);
+
+    const proof = await store.confirmTargetPromptDelivery('parent-late-proof', {
+      ...targetAuditProof('parent-late-proof'),
+      executionContext: context,
+    });
+    assert.deepEqual(proof.adoptedChildRunIds, ['child-before-proof']);
+    assert.equal((await store.get('child-before-proof')).parentRunId, 'parent-late-proof');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
 test('prompt proof execution context rejects mismatches and duplicate proof preserves identity', async () => {
   const { store, cleanup } = await makeStore();
   try {
@@ -825,7 +887,7 @@ test('target prompt proof is order-independent and rejects neighboring identitie
   }
 });
 
-test('Codex lifecycle advances only the run bound to the same process generation', async () => {
+test('Codex lifecycle rejects a foreign generation and advances only a matching run', async () => {
   const { store, cleanup } = await makeStore();
   try {
     await store.create({
@@ -841,23 +903,116 @@ test('Codex lifecycle advances only the run bound to the same process generation
       busy: true,
       lifecycleGeneration: 'pty-b:1',
     });
-    assert.equal(staleBusy.ignored, true);
-    assert.equal(staleBusy.ignoreReason, 'process-generation-changed');
-    assert.equal((await store.get('run-generation')).status, 'sent');
+    assert.equal(staleBusy.ignored, false);
+    assert.equal(staleBusy.generationVerdict, 'changed');
+    assert.equal((await store.get('run-generation')).status, 'waiting_recovery');
 
-    await store.applyLifecycle('target-1', {
+    await store.create({
+      ...baseRun('run-generation-match', 'target-2'),
+      targetToolType: 'codex',
+    });
+    await store.markDelivery('run-generation-match', {
+      lifecycleGeneration: 'pty-a:7',
+    });
+    await store.applyLifecycle('target-2', {
       type: 'busy',
       busy: true,
       lifecycleGeneration: 'pty-a:7',
     });
-    assert.equal((await store.get('run-generation')).status, 'running');
+    assert.equal((await store.get('run-generation-match')).status, 'running');
 
-    await store.applyLifecycle('target-1', {
+    await store.applyLifecycle('target-2', {
       type: 'done',
       reason: 'task_complete',
       lifecycleGeneration: 'pty-a:7',
     });
-    assert.equal((await store.get('run-generation')).status, 'completed');
+    assert.equal((await store.get('run-generation-match')).status, 'completed');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('a changed Codex generation moves the exact active run into process replacement recovery', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({
+      ...baseRun('run-live-generation-change'),
+      targetToolType: 'codex',
+    });
+    await store.markDelivery('run-live-generation-change', {
+      lifecycleGeneration: 'pty-old:1',
+    });
+    await store.applyLifecycle('target-1', {
+      type: 'busy',
+      busy: true,
+      lifecycleGeneration: 'pty-old:1',
+    });
+
+    const changed = await store.applyLifecycle('target-1', {
+      type: 'done',
+      reason: 'pty-exit',
+      lifecycleGeneration: 'pty-new:1',
+    });
+    const run = await store.get('run-live-generation-change');
+    assert.equal(changed.generationVerdict, 'changed');
+    assert.equal(run.status, 'waiting_recovery');
+    assert.equal(run.outcome, 'process_replaced');
+    assert.match(run.error, /process ownership changed/);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('a required prompt proof cannot become success from a neighbouring busy turn', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({
+      ...baseRun('run-proof-required'),
+      targetToolType: 'claude',
+      requiresTargetPromptProof: true,
+    });
+    await store.markDelivery('run-proof-required');
+    await store.applyLifecycle('target-1', {
+      type: 'busy',
+      busy: true,
+      executionContext: {
+        provider: 'claude',
+        sessionId: 'session-target-1',
+        turnId: 'claude:provisional',
+      },
+    });
+    await store.applyLifecycle('target-1', {
+      type: 'done',
+      reason: 'task_complete',
+      executionContext: {
+        provider: 'claude',
+        sessionId: 'session-target-1',
+        turnId: 'claude:provisional',
+      },
+    });
+    const waiting = await store.get('run-proof-required');
+    assert.equal(waiting.status, 'waiting_recovery');
+    assert.equal(waiting.outcome, 'unknown');
+    assert.match(waiting.error, /delivery outcome is unknown/);
+
+    const lateProof = await store.confirmTargetPromptDelivery(
+      'run-proof-required',
+      {
+        ...targetAuditProof('run-proof-required'),
+        executionContext: {
+          provider: 'claude',
+          sessionId: 'session-target-1',
+          turnId: 'claude:provisional',
+        },
+      },
+    );
+    assert.equal(lateProof.confirmed, true);
+    const repaired = await store.get('run-proof-required');
+    assert.equal(repaired.status, 'running');
+    assert.equal(repaired.outcome, null);
+    assert.equal(repaired.error, null);
   } finally {
     await store.flush();
     await cleanup();
@@ -1715,6 +1870,26 @@ test('waitForDescendants false allows an early parent result', async () => {
     assert.deepEqual(event.settled.map((run) => run.runId), ['parent']);
     assert.equal((await store.get('parent')).status, 'completed');
     assert.equal((await store.get('child')).status, 'sent');
+
+    await store.patch('parent', {
+      resultPromptHash: 'early-result-hash',
+      resultPromptProofUserUuid: 'early-result-user',
+      resultComplete: true,
+    });
+    await store.applyLifecycle('tester', { type: 'busy', busy: true });
+    await store.applyLifecycle('tester', { type: 'done', reason: 'task_complete' });
+    await store.patch('child', { resultComplete: true, resultProofStatus: 'complete' });
+    await store.markNotification('child', 'sending', {
+      notificationAttemptedAt: 100,
+      notificationPromptHash: 'hash-child-completion',
+      notificationPromptAuditHash: 'notification-audit-hash-child',
+      notificationHandoffId: 'orchestration-complete:child',
+    });
+    await store.confirmSourceFollowup('child', completionAuditProof('child', 'worker'));
+    const stableParent = await store.getInternal('parent');
+    assert.equal(stableParent.resultPromptHash, 'early-result-hash');
+    assert.equal(stableParent.resultPromptProofUserUuid, 'early-result-user');
+    assert.equal(stableParent.status, 'completed');
   } finally {
     await store.flush();
     await cleanup();
@@ -2307,6 +2482,44 @@ test('transcript reconciliation never completes from a partial assistant block',
     const run = await store.get('run-1');
     assert.notEqual(run.status, 'completed');
     assert.equal(run.ownCompletedAt, null);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('expired result materialization becomes recoverable instead of an eternal proof spinner', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({ ...baseRun('run-proof-deadline'), notifySource: false });
+    await store.markDelivery('run-proof-deadline');
+    await store.applyLifecycle('target-1', { type: 'busy', busy: true });
+    await store.applyLifecycle('target-1', { type: 'done', reason: 'task_complete' });
+    await store.patch('run-proof-deadline', {
+      resultComplete: false,
+      resultProofStatus: 'awaiting-transcript',
+      resultProofDeadlineAt: 100,
+    });
+
+    const recovery = await store.beginResultProofRecovery(
+      'run-proof-deadline',
+      'result proof deadline elapsed after authoritative target completion',
+      { now: 200 },
+    );
+    assert.equal(recovery.run.status, 'waiting_recovery');
+    assert.equal(recovery.run.outcome, 'failed');
+    assert.match(recovery.run.error, /result proof deadline/);
+
+    await store.reconcile('run-proof-deadline', {
+      busy: false,
+      resultFound: true,
+      resultComplete: true,
+      resultAvailable: true,
+      turnIndex: 3,
+    });
+    const repaired = await store.get('run-proof-deadline');
+    assert.equal(repaired.status, 'completed');
+    assert.equal(repaired.outcome, 'success');
   } finally {
     await store.flush();
     await cleanup();
@@ -3159,6 +3372,51 @@ test('Claude intermediate Stop waits for background agents and adopts only a str
     });
     assert.equal((await store.get('run-internal-agent')).status, 'completed');
     assert.deepEqual(final.settled.map((run) => run.runId), ['run-internal-agent']);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('Codex task_complete waits for live internal agents and settles on their exact zero edge', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create({
+      ...baseRun('run-codex-background', 'codex-target'),
+      targetToolType: 'codex',
+    });
+    await store.markDelivery('run-codex-background', {
+      lifecycleGeneration: 'pty-codex:1',
+    });
+    await store.applyLifecycle('codex-target', {
+      type: 'busy',
+      busy: true,
+      lifecycleGeneration: 'pty-codex:1',
+    });
+    const intermediate = await store.applyLifecycle('codex-target', {
+      type: 'done',
+      reason: 'task_complete',
+      lifecycleGeneration: 'pty-codex:1',
+      backgroundWorkCount: 2,
+    });
+    assert.deepEqual(intermediate.settled, []);
+    const waiting = await store.get('run-codex-background');
+    assert.equal(waiting.status, 'running');
+    assert.equal(waiting.waitingForInternalDescendants, true);
+    assert.equal(waiting.internalBackgroundWorkProvider, 'codex');
+
+    await store.applyLifecycle('codex-target', {
+      type: 'background-work',
+      backgroundWorkCount: 1,
+    });
+    assert.equal((await store.get('run-codex-background')).status, 'running');
+
+    const completed = await store.applyLifecycle('codex-target', {
+      type: 'background-work',
+      backgroundWorkCount: 0,
+    });
+    assert.equal((await store.get('run-codex-background')).status, 'completed');
+    assert.deepEqual(completed.settled.map((run) => run.runId), ['run-codex-background']);
   } finally {
     await store.flush();
     await cleanup();

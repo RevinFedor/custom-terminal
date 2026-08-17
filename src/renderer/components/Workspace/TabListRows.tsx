@@ -129,6 +129,17 @@ export interface TabListTabRowProps {
    * project it belongs to.
    */
   paneMapProjectId?: string | null;
+  /**
+   * "Ты здесь": the row is the tab the user is on, shown as a reference point
+   * rather than as a destination (Ctrl+Tab's row 1).
+   *
+   * It reads as a starting point, not as a selection: a left rail plus dimmed
+   * text, and no selection ring — the ring belongs to the row the keyboard is
+   * on, and two rings would ask "which of these am I picking?". Colour, not
+   * opacity alone: an alpha-only difference is what video codecs eat on dark
+   * backgrounds (AI-Optimized UI rule).
+   */
+  anchor?: boolean;
 }
 
 export function TabListTabRow({
@@ -144,6 +155,7 @@ export function TabListTabRow({
   onPointerDown,
   trailingLabel,
   paneMapProjectId,
+  anchor = false,
 }: TabListTabRowProps) {
   const chrome = getTabChromeColorConfig(tab as any);
   const hasColor = !!tab.color && tab.color !== 'default';
@@ -159,9 +171,12 @@ export function TabListTabRow({
     <div
       data-tab-list-row={tab.id}
       data-switcher-index={index}
+      data-tab-list-anchor={anchor ? '1' : undefined}
       onPointerEnter={onPointerEnter}
       onPointerDown={onPointerDown}
-      title={missing ? 'Файл не найден на диске (перемещён или удалён)' : tab.name}
+      title={anchor
+        ? 'Вкладка, на которой вы сейчас — точка отсчёта'
+        : (missing ? 'Файл не найден на диске (перемещён или удалён)' : tab.name)}
       style={{
         position: 'relative',
         marginLeft: 4, // tabs sit slightly inside their project header
@@ -173,7 +188,9 @@ export function TabListTabRow({
         borderRadius: 5,
         cursor: missing ? 'default' : 'pointer',
         background: bg,
-        boxShadow: selected ? 'inset 0 0 0 1px rgba(255,255,255,0.30)' : 'none',
+        boxShadow: selected
+          ? 'inset 0 0 0 1px rgba(255,255,255,0.30)'
+          : (anchor ? 'inset 2px 0 0 0 #6e6e76' : 'none'),
         marginBottom: 1,
         overflow: 'hidden',
         userSelect: 'none',
@@ -198,7 +215,7 @@ export function TabListTabRow({
 
       <span
         style={{
-          color: missing ? '#9a9a9e' : '#e6e6e6',
+          color: missing ? '#9a9a9e' : (anchor ? '#9a9a9f' : '#e6e6e6'),
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           textOverflow: 'ellipsis',

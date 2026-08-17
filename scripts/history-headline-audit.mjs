@@ -160,7 +160,11 @@ const RULES = {
   'read-no-path':           { severity: 'BAD', note: 'Read без пути' },
   'edit-no-path':           { severity: 'BAD', note: 'Edit без пути' },
   'junk-run-subject':       { severity: 'BAD', note: 'мусор в заголовке запуска (=, кавычки, $)' },
-  'empty-subject-fallback': { severity: 'WARN', note: 'пустой объект → карточка печатает сырую команду серым' },
+  // Historical rule id stays CLI-compatible. Since 17.08 the package no
+  // longer falls back to a raw command when History injected a semantic
+  // headline; an empty subject now means a verb-only header that is worth
+  // reviewing, not a pipeline leak.
+  'empty-subject-fallback': { severity: 'WARN', note: 'пустой объект → заголовок показывает только смысловой глагол' },
   'overlong-subject':       { severity: 'WARN', note: 'объект длиннее 160 символов' },
   'space-no-path-subject':  { severity: 'WARN', note: 'объект с пробелами, не похожий на путь' },
 };

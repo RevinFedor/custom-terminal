@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { AppWindow, ArrowDown, ArrowRight, Bot, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, Square, SquareTerminal, Terminal, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
+import { AppWindow, ArrowDown, ArrowRight, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, Square, Terminal, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import {
   ComposerEditor,
@@ -534,35 +534,16 @@ export function PromptQueueOverlay({
   const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
   const historyPinned = useUIStore((s) => s.historyPinned);
   const timelinePinned = useUIStore((s) => s.timelinePinned);
-  // "Slide out the OTHER surface" — one control that never disappears.
+  // Кнопка «выдвинуть вторую поверхность» жила здесь и переехала к полю ввода
+  // (`SideSurfaceToggleButton`): раскладку меняют, не отрывая руки от набора.
+  // Вместе с ней удалено всё её состояние — открыта ли вторая поверхность и как
+  // её переключать. Держать эти вычисления «на случай» нельзя: незакрытое
+  // состояние без единственного читателя следующий человек примет за работающее.
   //
-  // Which surface that is depends on who currently owns the center, and that is
-  // the whole point: with History in the center it slides out the terminal, and
-  // after a swap it slides out the chat. Gating it on "History is primary" made
-  // it vanish on every swap, even though the gesture it offers still exists —
-  // юзер: «при реверсе она не может, блядь, пропадать; логика та же, только
-  // выдвигается не терминал, а боковой чат».
-  //
-  // Read from the store rather than passed down: the rail is portalled into a
-  // host, and its two mounting sites (single mode, split pane) would each have
-  // to thread the same prop.
+  // Одно из них осталось: `terminalIsPrimary` ниже решает, показывать ли кнопку
+  // History — в terminal-primary транскрипт САМ является боковой панелью, и две
+  // кнопки щёлкали бы один и тот же переключатель.
   const terminalIsPrimary = useUIStore((s) => resolveTabTerminalPrimary(s, tabId));
-  const sideTerminalOpen = useUIStore((s) => s.sideTerminalOpenTabs[tabId] ?? false);
-  const setSideTerminalOpen = useUIStore((s) => s.setSideTerminalOpen);
-  // In terminal-primary the transcript IS the side panel, and its open flag is
-  // the same one the History toggle below uses — so there the two controls would
-  // be the same switch twice. That case hides the History button instead, since
-  // this one already names the surface being slid out.
-  const secondarySurfaceOpen = terminalIsPrimary ? historyPanelOpen : sideTerminalOpen;
-  const showTerminalToggle = true;
-  const onToggleTerminal = useCallback(() => {
-    const state = useUIStore.getState();
-    if (resolveTabTerminalPrimary(state, tabId)) {
-      state.setHistoryPanelOpen(tabId, !(state.historyPanelOpenTabs[tabId] ?? false));
-      return;
-    }
-    state.setSideTerminalOpen(tabId, !(state.sideTerminalOpenTabs[tabId] ?? false));
-  }, [tabId]);
   const [dragWidth, setDragWidth] = useState<number | null>(null);
   const effectiveWidth = dragWidth ?? promptQueueWidth;
   const chipTextLineHeight = Math.max(12, Math.round(promptQueueChipFontSize * 1.27));
@@ -3252,30 +3233,11 @@ export function PromptQueueOverlay({
               composer's status control, where it was welded to a status
               indicator and read as part of it. */}
           <span className="pq-rail-group">
-            {showTerminalToggle && (
-              <ControlHint
-                label={(secondarySurfaceOpen ? 'Скрыть ' : 'Выдвинуть ')
-                  + (terminalIsPrimary ? 'AI-чат' : 'терминал')}
-                side="left"
-              >
-              <button
-                className={`pq-rail-button pq-rail-meta${secondarySurfaceOpen ? ' pq-rail-active' : ''}`}
-                data-rail-surface-toggle={terminalIsPrimary ? 'chat' : 'terminal'}
-                onClick={onToggleTerminal}
-                title={(secondarySurfaceOpen ? 'Hide ' : 'Show ')
-                  + (terminalIsPrimary ? 'side chat' : 'side terminal')}
-                aria-label={terminalIsPrimary ? 'Toggle side chat' : 'Toggle side terminal'}
-                aria-pressed={secondarySurfaceOpen}
-              >
-                {/* The icon names the surface being slid out, so it swaps with
-                    the center: terminal glyph while History owns the center,
-                    chat glyph after a swap. */}
-                {terminalIsPrimary
-                  ? <Bot size={13} strokeWidth={2.1} />
-                  : <SquareTerminal size={13} strokeWidth={2.1} />}
-              </button>
-              </ControlHint>
-            )}
+            {/* Кнопка «выдвинуть вторую поверхность» ПЕРЕЕХАЛА к полю ввода —
+                вплотную над ним, слева от неё стрелка вниз (см.
+                SideSurfaceToggleButton). Здесь её быть не должно: два одинаковых
+                переключателя в разных углах экрана — это не два способа, а
+                непонятно, какой из них «настоящий». */}
             <ControlHint label={timelineTreeMode ? 'Скрыть Timeline' : 'Открыть Timeline'} shortcut="⌘\\" side="left">
             <button
               className={`pq-rail-button pq-rail-meta${timelineTreeMode ? ' pq-rail-active' : ''}`}

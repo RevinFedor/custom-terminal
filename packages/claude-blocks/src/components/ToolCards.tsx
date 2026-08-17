@@ -141,10 +141,16 @@ const BashCard: React.FC<{ toolName?: string; args: Record<string, any>; result:
   // subject is the literal word «script», which next to the label would read
   // «Bash script» — one word said twice.
   const isScript = toolName === 'Script';
+  const hasInjectedHeadline = Boolean(injected);
   const subject = isScript ? '' : headline.subject;
   const preview = subject
     ? <HeaderSubject text={subject} wrap={!isRun} detail={headline.detail} />
-    : (isScript ? null : <span className="cb-italic-dim">{cmd || '(no command)'}</span>);
+    // A host-supplied semantic headline is authoritative even when its
+    // subject is empty. Falling back to `cmd` here leaked a complete pipeline
+    // into collapsed Git/Read/Search rows in grey italics. Raw invocation is
+    // a compatibility fallback ONLY for standalone package consumers that
+    // supplied no headline at all; History always opens it in the body.
+    : ((isScript || hasInjectedHeadline) ? null : <span className="cb-italic-dim">{cmd || '(no command)'}</span>);
   // Reads drop the invocation line entirely (the header already says file and
   // range); every other family keeps it so the call reads apart from the result.
   const showInvocation = !!cmd && headline.verb !== 'Read';
@@ -352,6 +358,14 @@ const McpToolCard: React.FC<{
         break;
       }
     }
+    // Backward guard for already-projected/cached rows. Older Codex
+    // normalization treated an MCP `prompt` as a short subject and produced
+    // `terminal · delegate_to_session — <the complete task>`. A collapsed
+    // card then leaked thousands of characters into the feed even though its
+    // JSON body was closed. Prompt text is invocation payload: it belongs to
+    // the expanded arguments section (and copy), never to the header.
+    const rawPrompt = typeof args?.prompt === 'string' ? args.prompt.trim() : '';
+    if (rawPrompt && summary.includes(rawPrompt)) return '';
     return summary;
   })();
   const resultText = result == null ? '' : (typeof result === 'string' ? result : JSON.stringify(result, null, 2));

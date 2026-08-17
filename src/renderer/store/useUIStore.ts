@@ -746,9 +746,6 @@ interface UIStore {
   setHistoryPinned: (v: boolean) => void;
   /** Project selected in the Run after picker. Survives restart; manual only. */
   runAfterPickerProjectId: string | null;
-  /** Width of the pane header's recent-tabs list, dragged by its right edge. */
-  paneRecentTabsWidth: number;
-  setPaneRecentTabsWidth: (width: number) => void;
   setRunAfterPickerProjectId: (projectId: string | null) => void;
   timelinePinned: boolean;
   setTimelinePinned: (v: boolean) => void;
@@ -1663,10 +1660,6 @@ const APP_STATE_KEY_SIDE_TERMINAL_OPEN_TABS = 'sideTerminalOpenTabs';
 // the show-all toggle next to it, which is a one-off "show me more right now"
 // and therefore never persists.
 const APP_STATE_KEY_RUN_AFTER_PICKER_PROJECT = 'runAfterPickerProjectId';
-// Width of the pane header's recent-tabs list. Durable for the same reason the
-// side panels' widths are: a size the user dragged is a decision, and having
-// to redo it every launch reads as the app forgetting.
-const APP_STATE_KEY_PANE_RECENT_TABS_WIDTH = 'paneRecentTabsWidth';
 // Side TRANSCRIPT open-state, the twin of the side-terminal map above. Both
 // halves of the Cmd+] pair must survive a restart, otherwise the restored
 // layout is only half the one the user left.
@@ -1676,10 +1669,6 @@ const LS_TERMINAL_PRIMARY_TABS = 'noted-terminal-terminal-primary-tabs';
 const LS_SIDE_TERMINAL_WIDTH = 'noted-terminal-side-terminal-width';
 const LS_SIDE_TERMINAL_OPEN_TABS = 'noted-terminal-side-terminal-open-tabs';
 const LS_RUN_AFTER_PICKER_PROJECT = 'noted-terminal-run-after-picker-project';
-const LS_PANE_RECENT_TABS_WIDTH = 'noted-terminal-pane-recent-tabs-width';
-export const PANE_RECENT_TABS_MIN_WIDTH = 180;
-export const PANE_RECENT_TABS_MAX_WIDTH = 640;
-export const PANE_RECENT_TABS_DEFAULT_WIDTH = 260;
 const LS_HISTORY_PANEL_OPEN_TABS = 'noted-terminal-history-panel-open-tabs';
 const SIDE_TERMINAL_MIN_WIDTH = 360;
 const SIDE_TERMINAL_MAX_WIDTH = 1200;
@@ -1758,24 +1747,6 @@ const readLocalRunAfterPickerProject = (): string | null => {
   try { return localStorage.getItem(LS_RUN_AFTER_PICKER_PROJECT) || null; }
   catch { return null; }
 };
-const clampPaneRecentTabsWidth = (value: unknown): number => {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return PANE_RECENT_TABS_DEFAULT_WIDTH;
-  return Math.max(PANE_RECENT_TABS_MIN_WIDTH, Math.min(PANE_RECENT_TABS_MAX_WIDTH, Math.round(n)));
-};
-const readLocalPaneRecentTabsWidth = (): number => {
-  try {
-    const raw = localStorage.getItem(LS_PANE_RECENT_TABS_WIDTH);
-    return raw === null ? PANE_RECENT_TABS_DEFAULT_WIDTH : clampPaneRecentTabsWidth(raw);
-  } catch { return PANE_RECENT_TABS_DEFAULT_WIDTH; }
-};
-const savePaneRecentTabsWidth = (width: number) => {
-  try { localStorage.setItem(LS_PANE_RECENT_TABS_WIDTH, String(width)); } catch {}
-  try {
-    const { ipcRenderer } = window.require('electron');
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_PANE_RECENT_TABS_WIDTH, value: width }).catch(() => {});
-  } catch {}
-};
 const saveRunAfterPickerProject = (projectId: string | null) => {
   try {
     if (projectId) localStorage.setItem(LS_RUN_AFTER_PICKER_PROJECT, projectId);
@@ -1831,18 +1802,6 @@ const initialHistoryPanelOpenTabs = readLocalHistoryPanelOpenTabs();
     if (typeof persisted === 'string' && persisted) {
       useUIStore.setState({ runAfterPickerProjectId: persisted });
       try { localStorage.setItem(LS_RUN_AFTER_PICKER_PROJECT, persisted); } catch {}
-    }
-  } catch {}
-})();
-
-(async () => {
-  try {
-    const { ipcRenderer } = window.require('electron');
-    const persisted = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_PANE_RECENT_TABS_WIDTH);
-    if (persisted !== null && persisted !== undefined) {
-      const width = clampPaneRecentTabsWidth(persisted);
-      useUIStore.setState({ paneRecentTabsWidth: width });
-      try { localStorage.setItem(LS_PANE_RECENT_TABS_WIDTH, String(width)); } catch {}
     }
   } catch {}
 })();
@@ -3467,13 +3426,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     if (get().runAfterPickerProjectId === projectId) return;
     set({ runAfterPickerProjectId: projectId });
     saveRunAfterPickerProject(projectId);
-  },
-  paneRecentTabsWidth: readLocalPaneRecentTabsWidth(),
-  setPaneRecentTabsWidth: (width) => {
-    const clamped = clampPaneRecentTabsWidth(width);
-    if (get().paneRecentTabsWidth === clamped) return;
-    set({ paneRecentTabsWidth: clamped });
-    savePaneRecentTabsWidth(clamped);
   },
   timelinePinned: initialTimelinePinned,
   setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },

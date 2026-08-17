@@ -71,26 +71,50 @@ test('one hop reaches the previous project tab regardless of current project siz
   assert.equal(rows[idx].tab.id, 'a');
 });
 
-test('Ctrl+Tab highlights the previous tab even when it is visible in another pane', () => {
-  // Two panes hold a and d; the user just clicked from d's pane into a's.
-  // The previous entry is d — visible, and exactly the target: committing it
-  // jumps focus back to its pane (switchTab's split rule), so one Ctrl+Tab
-  // undoes the accidental click. Visits record only APPEARANCES, so that focus
-  // click did not rewrite the history.
-  const rows = buildSwitcherRows({
-    projects,
-    globalMru: [
-      { projectId: 'p1', tabId: 'a' },
-      { projectId: 'p2', tabId: 'd' },
-      { projectId: 'p1', tabId: 'b' },
-    ],
-  });
-  const idx = initialCtrlIndex(rows, [
-    { projectId: 'p1', tabId: 'a' },
+test('Ctrl+Tab: row 1 is the anchor, the highlight lands on row 2', () => {
+  // The caller (TabSwitcherOverlay::computeRowsFromStores) drops every tab on
+  // screen EXCEPT the current one, and pins that one first. So with a (current)
+  // and d (other pane) visible, the rows are a, then what cannot be seen — and
+  // the highlight lands on b, "where releasing Ctrl takes me".
+  const withAnchor = [{
+    projectId: 'p1',
+    projectName: 'custom-terminal',
+    tabs: [tab('a', 'claude-03'), tab('b', 'run-dev'), tab('c', 'bash')],
+  }];
+  const mru = [
     { projectId: 'p2', tabId: 'd' },
     { projectId: 'p1', tabId: 'b' },
-  ], 'a');
-  assert.equal(rows[idx].tab.id, 'd', 'the previous tab wins, on screen or not');
+    { projectId: 'p1', tabId: 'a' },
+  ];
+  const rows = buildSwitcherRows({ projects: withAnchor, globalMru: mru, pinnedFirstTabId: 'a' });
+  // 'a' heads the list although the history ranks it LAST of the three — being
+  // looked at is not recorded as a visit, so recency cannot supply the anchor.
+  assert.deepEqual(rows.filter(r => r.kind === 'tab').map(r => r.tab.id), ['a', 'b', 'c']);
+  const idx = initialCtrlIndex(rows, mru, 'a');
+  assert.equal(rows[idx].tab.id, 'b');
+  // d is on screen in the other pane → the caller never passes it here.
+  assert.ok(!rows.some(r => r.kind === 'tab' && r.tab.id === 'd'));
+});
+
+test('the anchor heads the list even with no history at all', () => {
+  const rows = buildSwitcherRows({ projects, globalMru: [], pinnedFirstTabId: 'e' });
+  const first = rows.find(r => r.kind === 'tab');
+  assert.equal(first.tab.id, 'e');
+  assert.equal(rows[0].kind, 'project', 'its project header still comes first');
+  assert.equal(rows[0].projectId, 'p2');
+});
+
+test('nothing but the anchor selects NOTHING — never the current tab', () => {
+  // Every other tab is on screen, so the caller passes only the anchor. Picking
+  // it would re-activate the tab the user is already on, which is not a no-op:
+  // activation switches the project view and yanks the sidebar to that row.
+  const onlyAnchor = [{ projectId: 'p1', projectName: 'custom-terminal', tabs: [tab('a')] }];
+  const rows = buildSwitcherRows({
+    projects: onlyAnchor,
+    globalMru: [{ projectId: 'p1', tabId: 'a' }],
+    pinnedFirstTabId: 'a',
+  });
+  assert.equal(initialCtrlIndex(rows, [{ projectId: 'p1', tabId: 'a' }], 'a'), -1);
 });
 
 test('single mode: the previous tab wins', () => {

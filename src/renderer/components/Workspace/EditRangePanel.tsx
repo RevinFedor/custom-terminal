@@ -6,6 +6,10 @@ import MarkdownRenderer from '../Research/MarkdownRenderer';
 import { usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore, ThinkingLevel, AIModel } from '../../store/useUIStore';
 import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
+import {
+  buildEditRangeSubmission,
+  buildInitialEditRangeMessages,
+} from '../../utils/editRangeConversation.mjs';
 
 const AI_MODELS = GEMINI_MODEL_OPTIONS.map((m) => ({ value: m.value, label: m.label.replace(/^Gemini /, '') }));
 
@@ -20,6 +24,7 @@ interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  apiContent?: string;
 }
 
 interface ApplyStep {
@@ -50,7 +55,7 @@ interface EditRangePanelProps {
   anchorTop: number;
   anchorHeight: number;
   rightOffset: number;
-  autoEditInitial?: boolean;
+  initialInput?: string;
   onApply: (
     compactText: string,
     onProgress?: (stage: ApplyStage) => void,
@@ -65,7 +70,7 @@ export default function EditRangePanel({
   anchorTop,
   anchorHeight,
   rightOffset,
-  autoEditInitial,
+  initialInput,
   onApply,
   onApplyError,
   onClose,
@@ -78,25 +83,14 @@ export default function EditRangePanel({
   const chatEndRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
-  const [messages, setMessages] = useState<Message[]>(() => [
-    { id: 'source', role: 'user', content: sourceContent },
-    { id: 'initial', role: 'assistant', content: initialCompact },
-  ]);
-  const [inputValue, setInputValue] = useState('');
+  const [messages, setMessages] = useState<Message[]>(() => buildInitialEditRangeMessages(initialCompact));
+  const [inputValue, setInputValue] = useState(initialInput || '');
   const [isLoading, setIsLoading] = useState(false);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
   const [sourceExpanded, setSourceExpanded] = useState(false);
-  const [editingMsgId, setEditingMsgId] = useState<string | null>(autoEditInitial ? 'initial' : null);
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState('');
   const editTextareaRef = useRef<HTMLTextAreaElement>(null);
-
-  // Auto-focus the edit textarea when opened in manual mode (autoEditInitial)
-  useEffect(() => {
-    if (autoEditInitial) {
-      setTimeout(() => editTextareaRef.current?.focus(), 50);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   // Apply flow state
   const [applyPhase, setApplyPhase] = useState<'idle' | 'running' | 'done'>('idle');
@@ -130,7 +124,14 @@ export default function EditRangePanel({
 
   // Focus input on mount
   useEffect(() => {
-    setTimeout(() => inputRef.current?.focus(), 200);
+    setTimeout(() => {
+      const input = inputRef.current;
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      input.style.height = 'auto';
+      input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
+    }, 200);
   }, []);
 
   // Escape to close (only when idle or done)
@@ -181,7 +182,13 @@ export default function EditRangePanel({
     const trimmed = inputValue.trim();
     if (!trimmed || isLoading) return;
 
-    const userMsg: Message = { id: `user-${Date.now()}`, role: 'user', content: trimmed };
+    const submission = buildEditRangeSubmission({
+      sourceContent,
+      messages,
+      inputValue: trimmed,
+      promptDraftMode: initialInput !== undefined,
+    });
+    const userMsg = submission.userMessage as Message;
     setMessages(prev => [...prev, userMsg]);
     setInputValue('');
     setIsLoading(true);
@@ -193,10 +200,7 @@ export default function EditRangePanel({
       const apiKey = process.env.GEMINI_API_KEY;
 
       // Build conversation history for API
-      const contents = [...messages, userMsg].map(msg => ({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content }]
-      }));
+      const contents = submission.contents;
 
       const requestBody: any = {
         contents,
@@ -239,7 +243,7 @@ export default function EditRangePanel({
       setAbortController(null);
       setIsLoading(false);
     }
-  }, [inputValue, isLoading, messages, selectedModel, thinkingLevel, showToast]);
+  }, [initialInput, inputValue, isLoading, messages, selectedModel, showToast, sourceContent, thinkingLevel]);
 
   const handleCancel = () => {
     if (abortController) {
@@ -597,8 +601,8 @@ export default function EditRangePanel({
           )}
         </div>
 
-        {/* Messages (skip first user = source) */}
-        {messages.slice(1).map((msg) => (
+        {/* Conversation messages; source is displayed separately above. */}
+        {messages.map((msg) => (
           <div key={msg.id} style={{ marginBottom: '8px' }}>
             {msg.role === 'user' ? (
               <div style={{

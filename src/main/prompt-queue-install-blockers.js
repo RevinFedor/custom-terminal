@@ -34,6 +34,17 @@
 // reading the log should see which of the two it is.
 
 const QUEUE_BLOCKER_KIND = 'prompt-queue';
+const QUEUE_STATE_BLOCKER_KIND = 'prompt-queue-state';
+
+function promptQueueReadFailureBlocker(error) {
+  return {
+    tabId: '__prompt_queue_state__',
+    kind: QUEUE_STATE_BLOCKER_KIND,
+    status: 'unknown',
+    reason: 'persisted-queue-read-failed',
+    error: String(error?.message || error || 'unknown error'),
+  };
+}
 
 function isEnabledQueuedItem(item) {
   return !!item && item.enabled !== false;
@@ -119,6 +130,8 @@ function computePromptQueueInstallBlockers({
 
 module.exports = {
   QUEUE_BLOCKER_KIND,
+  QUEUE_STATE_BLOCKER_KIND,
   computePromptQueueInstallBlockers,
   describeQueuePromise,
+  promptQueueReadFailureBlocker,
 };

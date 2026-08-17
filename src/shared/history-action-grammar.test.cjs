@@ -116,6 +116,18 @@ test('git headline is subcommand + target file name', () => {
   );
 });
 
+test('git headline re-derives status when an old row has no bashDetail stamp', () => {
+  assert.deepEqual(
+    historyActionHeadline({
+      toolName: 'Bash',
+      args: { command: "git status --short | sed -n '1,260p' | rg webodm" },
+      family: 'git',
+      bashWord: 'git',
+    }),
+    { verb: 'Git', subject: 'status', detail: '' },
+  );
+});
+
 test('search headline is pattern + scope; ls-like tools name the directory', () => {
   assert.deepEqual(
     historyActionHeadline({

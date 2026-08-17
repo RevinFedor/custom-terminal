@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, RotateCcw, AlertTriangle, Copy, Check, Loader2, Play, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, AlertTriangle, Copy, Check, Loader2, Play, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Trash2 } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import {
   ComposerEditor,
@@ -29,6 +29,7 @@ import {
 } from '../../store/rewindOperationState';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
+import SideSurfaceToggleButton from './SideSurfaceToggleButton';
 import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
 import {
   getHistoryAgentRuntime,
@@ -184,6 +185,7 @@ import {
 import {
   createHistoryTailSpacer,
   historyTailReserveDeficitAfterShrink,
+  isUserOwnedScrollBurn,
 } from '../../utils/historyTailSpacer.mjs';
 import {
   acceptHistoryPromptHandoffProviderQueue,
@@ -195,6 +197,7 @@ import {
   getHistoryPromptHandoffsSnapshot,
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   historyPromptHandoffAuditProofFromSendResult,
+  historyPromptAuditIsProviderQueueReturn,
   historyPromptHandoffInitialStatus,
   historyPromptHandoffStatusPresentation,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
@@ -213,8 +216,8 @@ import {
   resolveHistoryPromptHandoffPresentationSession,
 } from '../../utils/historyPromptPresentation.mjs';
 import {
-  elapsedHistoryResponseDurationMs,
-  formatHistoryResponseDuration,
+  historyResponseTailLabel,
+  resolveHistoryResponseTailTiming,
 } from '../../utils/historyResponseTiming.mjs';
 import { queueSendTransferredOwnership } from '../../store/usePromptQueueStore';
 import { resolveCenterRightInset } from '../../utils/surfaceInsets.mjs';
@@ -413,6 +416,20 @@ interface HistoryActivityTiming {
   durationMs: number | null;
 }
 
+interface HistoryResponseTailTiming {
+  state: 'running' | 'completed';
+  intervalId: number | null;
+  startTs: number;
+  endTs: number | null;
+  durationMs: number | null;
+}
+
+interface HistoryResponseActivitySnapshot {
+  tabId: string;
+  toolType: AgentHistoryTool;
+  timing: HistoryActivityTiming | null;
+}
+
 interface TerminalHistoryPreview {
   previewId: string;
   tabId: string;
@@ -436,6 +453,10 @@ interface TerminalHistoryPreview {
 
 interface HistoryVirtuosoContext {
   terminalPreview: TerminalHistoryPreview | null;
+  // One response-level clock at the physical transcript tail. It is not a
+  // display unit: second ticks stay inside the Footer and cannot rebuild
+  // grouping, hydration or Virtuoso item geometry.
+  responseTiming: HistoryResponseTailTiming | null;
   // Transient tail reserve (fake scroll) armed by a near-bottom collapse.
   // Rendered as Footer height so the frame does not jump; burns on upward
   // scroll. Presentation-only — never part of saved positions.
@@ -666,6 +687,37 @@ const HistoryBottomSpacer = memo(() => (
   />
 ));
 
+const HistoryResponseTailTimer = memo(({ timing }: {
+  timing: HistoryResponseTailTiming;
+}) => {
+  // The one-second clock is deliberately local to the O(1) Footer. Keeping it
+  // out of HistoryPanel means a tick changes one text node, not the transcript
+  // projection and every visible virtual row.
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    if (timing.state !== 'running') return;
+    setClock(Date.now());
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [timing.intervalId, timing.startTs, timing.state]);
+  const label = historyResponseTailLabel(timing, clock);
+  return (
+    <div
+      data-history-tail-response-timer
+      data-state={timing.state}
+      aria-label={label || undefined}
+      title={timing.state === 'running'
+        ? 'Общее время текущего ответа'
+        : 'Общее время последнего завершённого ответа'}
+      className="hp-history-response-tail"
+    >
+      <span aria-hidden className="hp-history-response-tail-line" />
+      <span className="hp-history-response-tail-label">{label}</span>
+      <span aria-hidden className="hp-history-response-tail-line" />
+    </div>
+  );
+});
+
 const openTerminalHistoryPreviewContextMenu = (
   event: React.MouseEvent<HTMLDivElement>,
   preview: TerminalHistoryPreview,
@@ -732,6 +784,9 @@ const HistoryTerminalPreviewFooter = memo(({ context }: {
             <CBMarkdown text={preview.text} />
           </div>
         </ConversationMessage>
+      )}
+      {context?.responseTiming && (
+        <HistoryResponseTailTimer timing={context.responseTiming} />
       )}
       {(context?.tailSpacerPx ?? 0) > 0 && (
         // Fake scroll reserve from a near-bottom collapse: holds the frame
@@ -2010,7 +2065,6 @@ const HistoryToolCallPart = memo(({
   mcpServer,
   mcpMethod,
   docsKind,
-  forceOpen = false,
 }: {
   toolName: string;
   args: Record<string, any>;
@@ -2031,7 +2085,6 @@ const HistoryToolCallPart = memo(({
   mcpServer?: string;
   mcpMethod?: string;
   docsKind?: string;
-  forceOpen?: boolean;
 }) => {
   const anchorRef = useRef<HTMLDivElement>(null);
   // Every card starts collapsed — including Edit/Write/MultiEdit, which used
@@ -2045,7 +2098,7 @@ const HistoryToolCallPart = memo(({
   // line, which also keeps measured-geometry snapshots honest.
   const [localOpen, setLocalOpen] = useState(false);
   const onToggle = useHistoryRevealToggle(anchorRef, localOpen, setLocalOpen);
-  const open = forceOpen || localOpen;
+  const open = localOpen;
   // The full output is fetched when the card is expanded; the preview renders
   // in the collapsed header either way. Copy is the SECOND reader of the same
   // payload — pressing it on a collapsed card must not hand over a preview.
@@ -2073,7 +2126,7 @@ const HistoryToolCallPart = memo(({
         headline={historyActionHeadline({ toolName, args, family, bashWord, bashDetail, mcpServer, mcpMethod })}
         mcpServer={mcpServer}
         mcpMethod={mcpMethod}
-        collapse={{ open, onToggle: forceOpen ? () => {} : onToggle, anchorRef }}
+        collapse={{ open, onToggle, anchorRef }}
         // Electron clipboard, never navigator.clipboard in a renderer — the
         // latter silently fails without HTTPS/permissions (project rule).
         // Routed through the rehydration-aware copy so a dehydrated result is
@@ -2701,6 +2754,10 @@ const HistoryCollapsiblePrompt = ({
   );
   return (
     <div ref={anchorRef}>
+      {/* Верхняя кнопка только у раскрытого блока: у свёрнутого начало текста
+          видно целиком, и дублировать «раскрыть» в двух углах маленькой шапки
+          нечего. У раскрытого же конец текста может быть далеко, поэтому
+          «Свернуть» нужно и там, где чтение началось, и там, где закончилось. */}
       {open && !forceExpanded && <div className="cb-collapse-top">{toggle}</div>}
       <p className="cb-msg-text">
         {renderSentHistoryPromptHighlight(open ? text : preview + '…')}
@@ -3055,6 +3112,9 @@ const HistoryUserEntry = memo(({
   const canRewind = allowRewind && !rewindLocked;
   const queueStatus = entry.queueStatus;
   const queueStatusPresentation = historyPromptHandoffStatusPresentation(queueStatus);
+  const canDismissUnconfirmed = queueStatus === 'delivery-unknown'
+    && !!entry.handoffId
+    && !!onDismissUnconfirmed;
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -3093,6 +3153,12 @@ const HistoryUserEntry = memo(({
     }));
   };
 
+  const dismissUnconfirmed = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (canDismissUnconfirmed) onDismissUnconfirmed?.(entry);
+  };
+
   return (
     <ConversationMessage
       layout="user"
@@ -3100,15 +3166,34 @@ const HistoryUserEntry = memo(({
       emphasis={editableLastPrompt ? 'editable' : 'none'}
       title={editableLastPrompt ? 'Editable last prompt' : undefined}
       status={queueStatusPresentation ? (
-        <MessageStatusBadge
-          label={queueStatusPresentation.label}
-          tone={queueStatusPresentation.tone}
-          pending={queueStatusPresentation.pending}
-          title={queueStatusPresentation.title}
-          meta={entry.timestamp
-            ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-            : undefined}
-        />
+        <span className="hp-user-message-status">
+          {canDismissUnconfirmed && (
+            <Tooltip content="Скрыть это предупреждение">
+              <button
+                type="button"
+                className="hp-user-message-status-dismiss"
+                aria-label="Dismiss unconfirmed prompt"
+                onMouseDown={stopActionPropagation}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+                onClick={dismissUnconfirmed}
+              >
+                <X size={10} />
+              </button>
+            </Tooltip>
+          )}
+          <MessageStatusBadge
+            label={queueStatusPresentation.label}
+            tone={queueStatusPresentation.tone}
+            pending={queueStatusPresentation.pending}
+            title={queueStatusPresentation.title}
+            meta={entry.timestamp
+              ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+              : undefined}
+          />
+        </span>
       ) : undefined}
       actions={(
         <MessageActionRail placement="outside-start" aria-label="Prompt actions">
@@ -3142,26 +3227,6 @@ const HistoryUserEntry = memo(({
               </MessageActionButton>
             </Tooltip>
           )}
-          {queueStatus === 'delivery-unknown' && entry.handoffId && onDismissUnconfirmed && (
-            <Tooltip content="Скрыть это предупреждение">
-              <MessageActionButton
-                tone="warning"
-                aria-label="Dismiss unconfirmed prompt"
-                onMouseDown={stopActionPropagation}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                }}
-                onClick={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  onDismissUnconfirmed(entry);
-                }}
-              >
-                <X size={11} />
-              </MessageActionButton>
-            </Tooltip>
-          )}
         </MessageActionRail>
       )}
     >
@@ -3177,10 +3242,8 @@ const HistoryUserEntry = memo(({
 
 const HistoryAssistantEntry = memo(({
   entry,
-  forceToolOpen = false,
 }: {
   entry: FullHistoryEntry;
-  forceToolOpen?: boolean;
 }) => {
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -3265,7 +3328,6 @@ const HistoryAssistantEntry = memo(({
                 mcpServer={action.rawTool.mcpServer}
                 mcpMethod={action.rawTool.mcpMethod}
                 docsKind={presentation.docsKind}
-                forceOpen={forceToolOpen}
               />
               {backgroundRunning && (
                 // The card holds only the acceptance text; the live face of
@@ -3305,37 +3367,6 @@ const HistoryAssistantEntry = memo(({
         );
       })}
 
-      {entry.responseTiming && (
-        // Turn separator, Codex-TUI style: a full-width hairline closes the
-        // worked turn. The duration label is inscribed only when the turn ran
-        // longer than 60s (a fast turn does not brag); the value is the same
-        // loader-based activity timing that always drove this slot — no new
-        // time source. Constant one-line geometry either way (tail contract).
-        <div
-          data-history-response-duration
-          title="Время работы приложения от начала ответа до завершения loader"
-          style={{
-            marginTop: 8,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            color: '#5b5b60',
-            fontSize: '0.72em',
-            fontVariantNumeric: 'tabular-nums',
-            letterSpacing: '0.02em',
-            userSelect: 'none',
-            minHeight: 14,
-          }}
-        >
-          <span aria-hidden style={{ flex: '0 0 24px', borderTop: '1px solid #2c2c2c' }} />
-          {entry.responseTiming.durationMs > 60_000 && (
-            <span style={{ flexShrink: 0 }}>
-              worked {formatHistoryResponseDuration(entry.responseTiming.durationMs)}
-            </span>
-          )}
-          <span aria-hidden style={{ flex: '1 1 auto', borderTop: '1px solid #2c2c2c' }} />
-        </div>
-      )}
     </ConversationMessage>
   );
 });
@@ -3539,10 +3570,6 @@ const HistoryCollapsedGroupRow = memo(({
   const { verb, digest } = inner
     ? historyInnerGroupHeaderData(group, live)
     : historyGroupHeaderData(group, live);
-  const thinkingLabel = (() => {
-    const duration = formatThinkingDuration(Number(group.thinkingSeconds) || 0);
-    return duration ? 'думал ' + duration : '';
-  })();
   const caption = group.captionEntry && typeof group.captionEntry.content === 'string'
     ? group.captionEntry.content.trim()
     : '';
@@ -3599,15 +3626,6 @@ const HistoryCollapsedGroupRow = memo(({
             below — a long caption used to push the counts off the right edge,
             leaving the row with no readable meta at all. */}
         <span className="hp-history-group-count">{verb}</span>
-        {/* Reasoning is NOT one of the counted actions — it is the time the
-            block spent thinking, summed once for the whole run. Naming it
-            among the phrases («Read 2 files · 3 thoughts») would count
-            thoughts, which answers nothing; the total answers the real
-            question — why two reads took a minute. Collapsed only: expanded,
-            each think row states its own duration. */}
-        {!expanded && thinkingLabel && (
-          <span className="hp-history-group-think">{thinkingLabel}</span>
-        )}
         {editStats && (editStats.added > 0 || editStats.removed > 0) && (
           <span className="hp-history-group-stats cb-diff-stats">
             {editStats.added > 0 && <span className="cb-c-add">+{editStats.added}</span>}
@@ -3706,7 +3724,6 @@ const HistoryEntry = memo(({
   rewindLocked,
   rewindUnavailableReason,
   forceExpanded,
-  forceToolOpen,
   onDismissUnconfirmed,
 }: {
   entry: FullHistoryEntry;
@@ -3716,7 +3733,6 @@ const HistoryEntry = memo(({
   rewindLocked: boolean;
   rewindUnavailableReason?: string | null;
   forceExpanded?: boolean;
-  forceToolOpen?: boolean;
   onDismissUnconfirmed?: (entry: FullHistoryEntry) => void;
 }) => {
   if (entry.role === 'compact') {
@@ -3795,7 +3811,7 @@ const HistoryEntry = memo(({
     );
   }
 
-  return <HistoryAssistantEntry entry={entry} forceToolOpen={forceToolOpen} />;
+  return <HistoryAssistantEntry entry={entry} />;
 });
 
 // The feed's quietest voice — service text, as opposed to content.
@@ -3817,6 +3833,32 @@ const HISTORY_SERVICE_TEXT_RATIO = 0.82;
 // matching «the example» by eye instead of by reference, so the chip shouted at a
 // size that was already too close to the content's.
 const HISTORY_SERVICE_TEXT_WEIGHT = 400;
+
+// How far the composer's frame stands off the left/right edge of the centre
+// surface.
+//
+// One number for the frame AND for the button pair pinned just above its top
+// edge, because the frame's border draws a vertical line the eye uses as a
+// ruler: anything sitting above it that stops a few pixels short or long reads
+// as broken. It already broke once — the frame kept its own 16 while the
+// side-surface toggle carried an independent 12, and the button ended up 4px
+// past the line the border drew (user: «по вертикальной границе справа должны
+// совпадать… какого хуя он правее»).
+const HISTORY_COMPOSER_SIDE_INSET = 16;
+
+// Насколько плашка состояния поднимается ВЫШЕ верхней рамки композера.
+//
+// Она сидит верхом на линии (`bottom: 0` + `translateY(50%)`), то есть ровно
+// половина её высоты уходит наружу, вверх. Полоса промптов стоит в том же слое
+// над ней и, чтобы не наложиться, обязана подняться как минимум на эту половину.
+//
+// Считается, а НЕ задаётся числом: высота плашки — это её кегль (доля от шрифта
+// транскрипта) на межстрочном 1.35, то есть она растёт вместе с настройкой
+// размера шрифта у пользователя. Константа 8px, посчитанная для 13px, ломалась
+// ровно так же, как когда-то кнопки «свернуть» на рамке сообщения: при 20px
+// полоса промптов уже наезжала на плашку. Проверено измерением на 10/13/16/20/24.
+const historyComposerStatusRise = (transcriptFontSize: number) =>
+  Math.ceil(transcriptFontSize * HISTORY_SERVICE_TEXT_RATIO * 1.35 / 2);
 
 // Flash/search/component styles. Keep the existing node across HMR, but refresh
 // its contents: an "inject once" guard leaves stale CSS in a live dev renderer.
@@ -3881,6 +3923,29 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-agent-prompt::-webkit-scrollbar-thumb {
   background: #454545;
   border-radius: 999px;
+}
+.hp-user-message-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.hp-user-message-status-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-radius: 5px;
+  background: rgba(245, 158, 11, 0.08);
+  color: #d6a24a;
+  cursor: pointer;
+}
+.hp-user-message-status-dismiss:hover {
+  border-color: rgba(245, 158, 11, 0.8);
+  background: rgba(245, 158, 11, 0.16);
+  color: #f0b95b;
 }
 .hp-agent-prompt::-webkit-scrollbar-thumb:hover {
   background: #5a5a5a;
@@ -3959,9 +4024,13 @@ const historyPanelStyleText = `@keyframes hp-flash {
    live operation to the member digest (owner contract: constant tail
    geometry). */
 .hp-history-group {
-  /* A container opens a "chapter" of work — extra air ABOVE separates
-     chapters while atoms in between stay dense. */
-  margin: 8px 0 2px;
+  /* Root rows have one symmetric rhythm, regardless of whether the row is a
+     card, thinking, or a collapsed group. The wrapper gives a group 2px and
+     this box gives it 8px on EACH side: 10px total, exactly the same as a
+     normal service row (outer 4 + cb-row-block 4 + card margin 2).
+     The old 8px above / 2px below made the visible gap Edit→Group 6px larger
+     than Group→Thinking — the asymmetry reported on probe-a/b/c. */
+  margin: 8px 0;
   border-radius: 4px;
   /* Align the header icon with regular tool-card icons: a card's icon sits at
      12px (.cb-row-block padding; the head's -4px margin and 4px padding
@@ -3972,11 +4041,14 @@ const historyPanelStyleText = `@keyframes hp-flash {
 }
 /* Homogeneous aggregate: the semantic icon (Read/Search/Edit/MCP) is its
    identity, so it is visually lighter than the broad stack chapter. */
-.hp-history-group--inner { margin-top: 2px; margin-bottom: 2px; }
+.hp-history-group--inner { margin-top: 8px; margin-bottom: 8px; }
 .hp-history-group-member > [data-history-group] .hp-history-group--inner {
   margin: 0;
-  padding-left: 4px;
-  padding-right: 4px;
+  /* Same content column as an ordinary child card (.cb-row-block: 12px).
+     The old 4px put subgroup glyphs 8px LEFT of neighbouring Read/Thinking
+     rows, so peers looked like different hierarchy levels before opening. */
+  padding-left: 12px;
+  padding-right: 12px;
 }
 .hp-history-group-head {
   /* Block-level flex with an INTEGRAL min-height: a virtualized feed measures
@@ -4030,13 +4102,32 @@ const historyPanelStyleText = `@keyframes hp-flash {
 }
 .hp-history-slash-ic { flex-shrink: 0; color: #6f6d68; }
 .hp-history-slash-cmd { overflow-wrap: anywhere; }
-/* Reasoning time of a collapsed run — one quiet figure, never a phrase among
-   the action counts (thoughts are not actions and must not be counted as
-   such). Same muted weight as the ± digits. */
-.hp-history-group-think {
-  flex-shrink: 0;
-  color: #8f8d88;
-  font-size: 0.82em;
+/* One response-level timer at the physical History tail. Its fixed one-line
+   geometry survives Working -> Worked without moving the reading position;
+   tabular digits stop the label width from breathing on every second. */
+.hp-history-response-tail {
+  min-height: 22px;
+  box-sizing: border-box;
+  padding: 8px 16px 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #68686d;
+  font-size: 0.72em;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  line-height: 14px;
+  user-select: none;
+  pointer-events: none;
+}
+.hp-history-response-tail-line {
+  flex: 1 1 auto;
+  min-width: 12px;
+  border-top: 1px solid #2c2c2c;
+}
+.hp-history-response-tail-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 /* ± totals of a collapsed edit run — the fact the user scans, kept ON the
    header line rather than a second row per file. */
@@ -4071,7 +4162,7 @@ const historyPanelStyleText = `@keyframes hp-flash {
   line-height: 1.4;
 }
 /* Expanded members: shared left rail marks the group extent; contents are the
-   ordinary cards (heavy bodies mount only here). */
+   ordinary collapsed cards. Heavy bodies still require each card's own click. */
 .hp-history-group-member {
   border-left: 1px solid rgba(255, 255, 255, 0.10);
   /* The rail hangs from the CENTER of the group glyph (icon column starts at
@@ -4127,7 +4218,7 @@ const historyPanelStyleText = `@keyframes hp-flash {
    «Read 3 files»), so repeating that same word on every member doubles it
    (user feedback). A MIXED group is the opposite case: the verb is the only
    thing telling one member from the next, so it stays. */
-.hp-history-group-member[data-history-group-uniform="1"] .cb-tool-label { display: none; }
+.hp-history-group-member[data-history-group-uniform="1"] > .cb-row .cb-tool-label { display: none; }
 /* Rhythm INSIDE a container is tighter than the rhythm BETWEEN containers.
    A group is one thing the eye takes in at once — its members are a list, not
    a sequence of separate steps — so they tile without any air of their own
@@ -4147,10 +4238,11 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-history-group-member .cb-tool:has(> .cb-tool-body) { margin-bottom: 8px; }
 /* A reasoning row inside a group is a member like any other. */
 .hp-history-group-member .cb-think { margin-top: 0; margin-bottom: 0; }
-/* Third level: raw bodies below one homogeneous aggregate. The list remains
-   flat in Virtuoso; this nested rail is presentation only. Tool headers are
-   suppressed because the aggregate already named the action/targets, and the
-   host force-opens each visible body's original result. */
+/* Third level: ordinary tool CARDS below one homogeneous aggregate. The list
+   remains flat in Virtuoso; this nested rail is presentation only. The group
+   header summarises the series, while every child keeps its own Read/Search/
+   MCP header and starts COLLAPSED. Its body belongs to the child's own click,
+   never to expanding the parent group. */
 .hp-history-subgroup-member {
   border-left: 1px solid rgba(255, 255, 255, 0.10);
   margin-left: 19px;
@@ -4158,8 +4250,9 @@ const historyPanelStyleText = `@keyframes hp-flash {
   display: flow-root;
 }
 .hp-history-subgroup-member[data-history-subgroup-last="1"] { position: relative; }
-.hp-history-subgroup-member .cb-tool-head { display: none; }
-.hp-history-subgroup-member .cb-tool { margin-top: 0; margin-bottom: 8px; }
+.hp-history-subgroup-member .cb-tool { margin-top: 0; margin-bottom: 0; }
+.hp-history-subgroup-member .cb-tool-head { padding-top: 0; padding-bottom: 0; }
+.hp-history-subgroup-member .cb-tool:has(> .cb-tool-body) { margin-bottom: 8px; }
 .hp-history-subgroup-member .cb-tool-body { padding-top: 0; }
 .hp-history-subgroup-member .cb-think { margin-top: 0; margin-bottom: 0; }
 /* A direct homogeneous aggregate at the root uses the same rail geometry as
@@ -4232,6 +4325,17 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-composer-chip-action-danger:hover,
 .hp-composer-chip-action-danger:focus-visible {
   color: #f87171;
+}
+/* Полоса промптов над рамкой — единственное место, где чип стоит НА линии, а не
+   в строке. Здесь всё внутри чипа обязано быть не выше 14px: он не тянет за
+   собой раскладку, но, распухнув, наедет на плашку состояния над ним. В обычной
+   строке эти же кнопки остаются 18px. */
+[data-history-composer-prompt-band] .cb-composer-chip {
+  padding: 1px 6px;
+}
+[data-history-composer-prompt-band] .hp-composer-chip-action {
+  width: 14px;
+  height: 14px;
 }
 .hp-composer-chip-preview {
   flex: 1 0 100%;
@@ -4365,22 +4469,24 @@ function HistorySpinner({ size = 14, flexShrink = 0 }: { size?: number; flexShri
   );
 }
 
-// One affordance for "the other surface". The frame and the busy perimeter are
-// identical in both layouts — only the glyph inside says WHICH surface the click
-// reveals: a shell prompt for the terminal, transcript lines for History. Same
-// place, same size, same loader, so the control stays recognisable after a swap.
+// Состояние АГЕНТА, и только оно: цвет рамки — статус, бегущий периметр —
+// «занят». Про раскладку эта иконка не знает ничего.
+//
+// У неё было два свойства от раскладки, и оба оказались багами. `active` давал
+// свечение, когда открыта боковая панель, — тень менялась от действия, которое
+// этой кнопке не принадлежит (выдвижением управляет своя кнопка в рейле).
+// `surface` менял рисунок при реверсе — та же кнопка после смены центральной
+// поверхности выглядела другой, хотя про агента ничего не изменилось. Оба свойства
+// удалены, чтобы не вернулись: рисунок один — терминальный, потому что кнопка про
+// процесс в терминале, а не про то, что сейчас в центре.
 function HistoryTerminalActivityIcon({
   size = 19,
   busy = false,
-  active = false,
   color,
-  surface = 'terminal',
 }: {
   size?: number;
   busy?: boolean;
-  active?: boolean;
   color?: string;
-  surface?: 'terminal' | 'history';
 }) {
   return (
     <svg
@@ -4398,24 +4504,11 @@ function HistoryTerminalActivityIcon({
         display: 'block',
         flexShrink: 0,
         color,
-        filter: active
-          ? 'drop-shadow(0 0 3px rgba(245, 245, 245, 0.45))'
-          : undefined,
       }}
     >
       <rect x="1" y="2" width="18" height="16" rx="2" opacity={busy ? 0.32 : 1} />
-      {surface === 'history' ? (
-        <>
-          <path d="M5 6.5h10" />
-          <path d="M5 10h10" />
-          <path d="M5 13.5h6" />
-        </>
-      ) : (
-        <>
-          <path d="m5 7 2.5 2L5 11" />
-          <path d="M10 12h5" />
-        </>
-      )}
+      <path d="m5 7 2.5 2L5 11" />
+      <path d="M10 12h5" />
       {busy && (
         <rect
           className="hp-terminal-perimeter-loader"
@@ -5043,6 +5136,7 @@ function AgentHistoryControls({
   onHeightChange,
   onRuntimeSnapshotChange,
   onInputBusyChange,
+  onResponseTimingChange,
   overlayComposer = false,
   agentInputSurface: agentInputSurfaceProp,
   suppressWindowEscape = false,
@@ -5106,6 +5200,7 @@ function AgentHistoryControls({
   onHeightChange?: (height: number) => void;
   onRuntimeSnapshotChange?: (snapshot: any | null) => void;
   onInputBusyChange?: (busy: boolean) => void;
+  onResponseTimingChange?: (snapshot: HistoryResponseActivitySnapshot) => void;
   overlayComposer?: boolean;
   agentInputSurface?: boolean;
   // Split: only the FOCUSED pane's composer listens to window-level Escape.
@@ -5224,13 +5319,15 @@ function AgentHistoryControls({
   const [answeringQuestion, setAnsweringQuestion] = useState(false);
   const [questionError, setQuestionError] = useState<string | null>(null);
   const [resumeMaterialized, setResumeMaterialized] = useState<boolean | null>(toolType === 'claude' ? null : true);
-  const [resumeUnavailableReason, setResumeUnavailableReason] = useState<string | null>(null);
+  // `resumeUnavailableReason` удалён: он писался в четырёх местах и не читался
+  // нигде — остаток от кнопки Resume, которую заменил жест на кнопке терминала.
+  // Само «можно ли возобновить» живёт в `resumeMaterialized`, а причина отказа
+  // теперь доходит до пользователя объявлением через `reportError`.
   const [statusCopied, setStatusCopied] = useState(false);
   const [statusHover, setStatusHover] = useState(false);
   const [previewChipId, setPreviewChipId] = useState<string | null>(null);
   const [activityTiming, setActivityTiming] = useState<HistoryActivityTiming | null>(null);
   const [pasteActivityStartedAt, setPasteActivityStartedAt] = useState<number | null>(null);
-  const [activityClock, setActivityClock] = useState(() => Date.now());
   const controlsRef = useRef<HTMLDivElement | null>(null);
   // Publishing the controls slot as a callback ref, not through an effect and an
   // id lookup: the node this points at is replaced whenever the panel changes
@@ -5547,7 +5644,6 @@ function AgentHistoryControls({
           ? Number(timing.durationMs)
           : null,
       } : null);
-      setActivityClock(Date.now());
     } catch (e: any) {
       if (
         tabIdRef.current !== requestTabId
@@ -5647,12 +5743,9 @@ function AgentHistoryControls({
               : null,
           );
           if (runtime.toolType === 'claude') {
-            const materialized = presence.conversationMaterialized === true || presence.canResume === true;
-            setResumeMaterialized(materialized);
-            setResumeUnavailableReason(materialized ? null : (presence.materializationReason || 'session_not_materialized'));
+            setResumeMaterialized(presence.conversationMaterialized === true || presence.canResume === true);
           } else {
             setResumeMaterialized(true);
-            setResumeUnavailableReason(null);
           }
           if (presence.awaiting) {
             void refreshPendingQuestion('presence-awaiting');
@@ -5773,10 +5866,8 @@ function AgentHistoryControls({
     setAnsweringQuestion(false);
     setQuestionError(null);
     setResumeMaterialized(toolType === 'claude' ? null : true);
-    setResumeUnavailableReason(null);
     setActivityTiming(null);
     setPasteActivityStartedAt(null);
-    setActivityClock(Date.now());
     setPresenceResolving(true);
     setProcessLifecycleGeneration(null);
     setStatusFrom(
@@ -5824,13 +5915,6 @@ function AgentHistoryControls({
       ipcRenderer.removeListener('agent-activity:timing-changed', handleTimingChanged);
     };
   }, [refreshActivityTiming, tabId]);
-
-  useEffect(() => {
-    if (activityTiming?.state !== 'running' && pasteActivityStartedAt === null) return;
-    setActivityClock(Date.now());
-    const timer = setInterval(() => setActivityClock(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [activityTiming?.startTs, activityTiming?.state, pasteActivityStartedAt]);
 
   useEffect(() => {
     if (activityTiming?.state !== 'pending' || !activityTiming.endTs) return;
@@ -5982,7 +6066,6 @@ function AgentHistoryControls({
       const nextBusy = !!data.busy;
       if (nextBusy && !pasteBusyRef.current) {
         setPasteActivityStartedAt(Date.now());
-        setActivityClock(Date.now());
       } else if (!nextBusy) {
         setPasteActivityStartedAt(null);
       }
@@ -6561,7 +6644,7 @@ function AgentHistoryControls({
     let sendOwnershipTransferred = false;
     let sendDeliveryUnconfirmed = false;
     let sendTransferredQueueStatus: Exclude<HistoryPromptHandoffStatus,
-      'preparing' | 'sending' | 'cancelled' | 'failed'> = 'sent';
+      'preparing' | 'sending' | 'failed'> = 'sent';
     let sendAuditIdentity: {
       requiresAuditIdentity?: boolean;
       auditTimestamp?: string;
@@ -6677,7 +6760,6 @@ function AgentHistoryControls({
         if (!result.success) {
           if (runtime.toolType === 'claude' && result.error === 'session_not_materialized') {
             setResumeMaterialized(false);
-            setResumeUnavailableReason(result.materializationReason || 'session_not_materialized');
             throw new Error('Claude has no saved conversation yet');
           }
           throw new Error(result.error || 'Resume failed');
@@ -6970,13 +7052,17 @@ function AgentHistoryControls({
         const unconfirmedStatus = sendIdentityFailure
           ? 'delivery-unknown' as const
           : historyPromptHandoffUnconfirmedStatusFromSendResult(result);
+        const providerQueueReturned = historyPromptAuditIsProviderQueueReturn(
+          result?.pasteAudit || result,
+        );
         const finalAuditFailure = result?.success === false
           && result?.submitted === true
           && !unconfirmedStatus;
         const effectiveStatusAtSend = result?.effectiveStatusAtSend || statusAtSend;
         const resultQueueStatus: Exclude<HistoryPromptHandoffStatus,
-          'preparing' | 'sending' | 'cancelled' | 'failed'> = unconfirmedStatus
-          || (effectiveStatusAtSend === 'busy' ? 'queued' : 'sent');
+          'preparing' | 'sending' | 'failed'> = providerQueueReturned
+          ? 'cancelled'
+          : unconfirmedStatus || (effectiveStatusAtSend === 'busy' ? 'queued' : 'sent');
         sendAuditIdentity = {
           requiresAuditIdentity: resultOwnershipTransferred,
           auditTimestamp: auditProof?.auditTimestamp,
@@ -6991,6 +7077,8 @@ function AgentHistoryControls({
             queueStatus: resultQueueStatus,
             reason: sendIdentityFailure
               ? 'send-durable-identity-' + sendIdentityFailure
+              : providerQueueReturned
+                ? 'provider-queue-returned-to-terminal-composer'
               : finalAuditFailure
               ? 'send-submitted-audit-unconfirmed'
               : resultQueueStatus === 'audit-pending'
@@ -7011,8 +7099,10 @@ function AgentHistoryControls({
           ' chunks=' + (result?.chunksTotal ?? 'na') +
           ' error=' + (result?.error || '-'));
         sendOwnershipTransferred = resultOwnershipTransferred;
-        sendDeliveryUnconfirmed = unconfirmedStatus !== null
-          || (result?.submitted === true && result?.success === false);
+        sendDeliveryUnconfirmed = !providerQueueReturned && (
+          unconfirmedStatus !== null
+          || (result?.submitted === true && result?.success === false)
+        );
         sendRefusalPasteWritten = result?.pasteWritten === true;
         sendTransferredQueueStatus = resultQueueStatus;
         historyDiag('SEND_OWNERSHIP tab=' + tabId.slice(-12) +
@@ -8310,23 +8400,35 @@ function AgentHistoryControls({
     return () => { ipcRenderer.removeListener('paste-chip-menu-action', onMenuAction); };
   }, [replacePasteAnchor, tabId]);
 
-  // The top line above the input carries PROMPTS only. A pasted blob is part of
-  // what you are writing, not a saved prompt you picked — its place is inline in
-  // the field, the way a terminal shows `[Pasted Content N chars]`. Mixing both
-  // kinds in one strip made the row read as "attachments" and pushed the actual
-  // prompt labels out of view on narrow widths.
-  const composerSurfaceChips = useMemo<AIComposerSurfaceChip[]>(
-    () => draftChips
-      .filter((chip) => chip.kind === 'prompt')
-      .map((chip) => ({
-        id: chip.id,
-        kind: chip.kind,
-        label: chip.label || 'PROMPT',
-        text: chip.text,
-        onRestore: () => restoreChipToComposer(chip),
-        onDiscard: () => discardComposerChip(chip.id),
-      })),
-    [discardComposerChip, draftChips, restoreChipToComposer],
+  // Прикреплённые промпты живут НАД рамкой, в том же слое, что и плашка
+  // состояния, — нижней полосой, вплотную к рамке. Это ровно то, на что
+  // договорились: «то, что касается прикреплённых промптов, их по-хорошему
+  // перекреплять всё выше, тоже в позиции абсолют… перекреплять также над
+  // рамкой», и порядок снизу вверх — черновик/промпты ближе к полю, системные
+  // статусы выше.
+  //
+  // Внутрь рамки их отдавать нельзя по той же причине, по которой оттуда убрали
+  // весь текст переменной длины: строка над полем — слот фиксированной высоты,
+  // и чип с рамкой в неё не влезает. В прошлой версии они уходили в `chips`
+  // общей поверхности и рисовались ПОВЕРХ поля ввода, перекрывая набранный
+  // текст (юзер: «что это за хуйня… как ты вообще додумался разместить туда
+  // промпты»). Над рамкой места сколько угодно, и пусто он не занимает ничего.
+  const composerPromptChips = useMemo(
+    () => draftChips.filter((chip) => chip.kind === 'prompt'),
+    [draftChips],
+  );
+  // Раскрытие тела промпта делит одну область предпросмотра со вставками, и
+  // ЭТА область принадлежит общей поверхности композера. Поэтому сами чипы
+  // рисуем сами (над рамкой), а их раскрытое тело по-прежнему отдаём
+  // поверхности — иначе клик по чипу молча ничего не делал бы.
+  const composerPromptChipsForPreview = useMemo<AIComposerSurfaceChip[]>(
+    () => composerPromptChips.map((chip) => ({
+      id: chip.id,
+      kind: chip.kind,
+      label: chip.label || 'PROMPT',
+      text: chip.text,
+    })),
+    [composerPromptChips],
   );
   const composerInlinePasteChips = useMemo(
     () => draftChips.filter((chip) => chip.kind === 'paste'),
@@ -8366,8 +8468,16 @@ function AgentHistoryControls({
     });
   }, [draftImageDetailPreview, draftImages, previewChipId, promptImageMarkerRanges]);
   const composerInlineChipsForPreview = useMemo(
-    () => [...composerInlinePasteChipsForPreview, ...composerInlineImageChipsForPreview],
-    [composerInlineImageChipsForPreview, composerInlinePasteChipsForPreview],
+    () => [
+      ...composerPromptChipsForPreview,
+      ...composerInlinePasteChipsForPreview,
+      ...composerInlineImageChipsForPreview,
+    ],
+    [
+      composerInlineImageChipsForPreview,
+      composerInlinePasteChipsForPreview,
+      composerPromptChipsForPreview,
+    ],
   );
 
   const basicStatusDescription: Record<AgentPtyStatus, string> = {
@@ -8413,11 +8523,18 @@ function AgentHistoryControls({
     unifiedTransientStatus?.description ||
     activeLifecycle?.description ||
     basicStatusDescription[status];
-  const statusTitle = statusCopied
-    ? 'COPIED'
-    : inputStatusPresentation
-      ? terminalStatusTitle + ' / ' + inputStatusPresentation.label
-      : terminalStatusTitle;
+  // Судьба ОТПРАВЛЕННОГО сообщения в плашку больше не попадает: она уже
+  // показана бейджем над самим сообщением в истории (`MessageStatusBadge` у
+  // каждой записи), и там ей самое место — она относится к конкретной записи, а
+  // не к терминалу. В плашке она давала строку вида «Ready / confirming», где
+  // первое слово — паразит: готовность не событие и сама по себе не
+  // показывается, но приставка к статусу отправки заставляла её появиться.
+  // Пользователь: «"confirming" для сообщения не должны показываться, поскольку
+  // в history они показываются для каждого сообщения отдельно».
+  //
+  // В подсказке при наведении статус отправки остаётся: там он не занимает
+  // места на экране и отвечает на прямой вопрос «а что с моей отправкой».
+  const statusTitle = statusCopied ? 'COPIED' : terminalStatusTitle;
   const statusDescription = inputStatusPresentation
     ? terminalStatusDescription + '\n' + inputStatusPresentation.title
     : terminalStatusDescription;
@@ -8434,32 +8551,45 @@ function AgentHistoryControls({
           ? '#60a5fa'
           : meta.color
   );
+  // Плашка = ТО, ЧТО ПРОИСХОДИТ с терминалом: запуск, остановка, прерывание,
+  // сжатие контекста, неподтверждённое состояние. Готовность сюда не входит —
+  // «всё готово» означает, что не происходит ничего, и показывать это нечего.
+  // Статуса отправки здесь тоже нет: он висел приставкой и вытаскивал за собой
+  // слово «Ready», хотя своего права появиться у того не было.
   const showStatusText = statusCopied
     || !!unifiedTransientStatus
-    || !!inputStatusPresentation
     || !!activeLifecycle
     || status === 'starting'
     || status === 'stopping'
     || (status === 'unknown' && !presenceResolving);
   const showBusyLoader = status === 'busy' || isPasteBusy;
-  const displayedActivityTiming = activityTiming?.state === 'running'
-    ? activityTiming
-    : pasteActivityStartedAt !== null
-      ? {
-          state: 'running' as const,
-          intervalId: null,
-          toolType,
-          sessionId: null,
-          startTs: pasteActivityStartedAt,
-          endTs: null,
-          durationMs: null,
-        }
-      : activityTiming;
-  const activityDurationLabel = displayedActivityTiming
-    ? formatHistoryResponseDuration(
-        elapsedHistoryResponseDurationMs(displayedActivityTiming, activityClock),
-      )
-    : null;
+  const activityTimingOwnerMatches = activityTimingOwnerKeyRef.current === tabId + ':' + toolType;
+  const displayedActivityTiming = useMemo<HistoryActivityTiming | null>(() => (
+    !activityTimingOwnerMatches
+      ? null
+      : activityTiming?.state === 'running'
+      ? activityTiming
+      : pasteActivityStartedAt !== null
+        ? {
+            state: 'running',
+            intervalId: null,
+            toolType,
+            sessionId: null,
+            startTs: pasteActivityStartedAt,
+            endTs: null,
+            durationMs: null,
+          }
+        : activityTiming
+  ), [activityTiming, activityTimingOwnerMatches, pasteActivityStartedAt, toolType]);
+  // Controls own the exact activity/preflight signals, but no longer render
+  // their clock. Publish edge changes to the transcript; the Footer owns the
+  // one-second tick so this very large component does not rerender each second.
+  useEffect(() => {
+    onResponseTimingChange?.({ tabId, toolType, timing: displayedActivityTiming });
+  }, [displayedActivityTiming, onResponseTimingChange, tabId, toolType]);
+  useEffect(() => () => {
+    onResponseTimingChange?.({ tabId, toolType, timing: null });
+  }, [onResponseTimingChange, tabId, toolType]);
   const copyStatusDetails = useCallback(() => {
     const text = [
       statusTitle === 'COPIED' ? (activeLifecycle?.title || meta.label) : statusTitle,
@@ -8535,7 +8665,6 @@ function AgentHistoryControls({
   // in the same place.
   const hasFloatingStatus = showStatusText
     || !!activeLifecycle
-    || !!activityDurationLabel
     || terminalOnlySlashDraft
     || (!!visibleDraftWarning && !!inlineDraftNoticeMeta)
     || rewindPreviewActive;
@@ -8708,26 +8837,6 @@ function AgentHistoryControls({
           </button>
         )}
 
-        {activityDurationLabel && (
-          <span
-            data-history-response-timer
-            data-state={displayedActivityTiming?.state}
-            title={displayedActivityTiming?.state === 'running'
-              ? 'Время текущего ответа'
-              : 'Ответ завершён; ждём точную запись в истории'}
-            style={{
-              color: displayedActivityTiming?.state === 'running' ? '#a1a1aa' : '#7c8494',
-              // Proportional digits make 1м09с and 1м10с different widths, and
-              // the chip is centred — every tick would nudge it sideways.
-              fontVariantNumeric: 'tabular-nums',
-              whiteSpace: 'nowrap',
-              flexShrink: 0,
-            }}
-          >
-            {activityDurationLabel}
-          </span>
-        )}
-
         {terminalOnlySlashDraft && (
           <span
             id={'history-terminal-only-hint-' + tabId}
@@ -8809,6 +8918,105 @@ function AgentHistoryControls({
       </span>
     </div>
   );
+
+  // Прикреплённые промпты — НИЖНЯЯ полоса того же слоя над рамкой.
+  //
+  // Почему именно здесь, а не в строке внутри рамки: чип с рамкой выше слота
+  // фиксированной высоты, в котором живёт строка над полем, и любая попытка
+  // положить его туда либо распирает композер, либо (как случилось) рисует его
+  // поверх набранного текста. А слой над рамкой пуст, пока в нём ничего нет, и
+  // не стоит ни строки.
+  //
+  // Полоса стоит ВЫШЕ плашки состояния и НЕ в одном ряду с ней: они появляются
+  // и исчезают независимо, и если бы делили ряд, то исчезновение статуса
+  // сдвигало бы промпты влево (юзер сам это и предвидел: «а если у меня будет
+  // одновременно и прикреплённый промпт, и резюминг, они будут идти друг за
+  // другом… нет, это будет некрасиво»). Сейчас промпты стоят на одном месте
+  // всегда, статус приходит НАД ними.
+  const historyComposerPromptBand = composerPromptChips.length === 0 ? null : (
+    <div
+      data-history-composer-prompt-band
+      style={{
+        position: 'absolute',
+        // Тот же левый край, что у плашки состояния: обе полосы — подписи одной
+        // и той же рамки и обязаны начинаться на одной вертикали.
+        left: 12,
+        // Вплотную над рамкой. Слой обрывается ровно на её верхнем крае, а
+        // плашка состояния садится ВЕРХОМ на линию, поэтому полоса промптов
+        // поднимается на выступающую половину плашки плюс зазор. Высота плашки
+        // зависит от шрифта, поэтому и подъём считается, а не задан числом.
+        bottom: historyComposerStatusRise(historyTranscriptFontSize) + 3,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 5,
+        maxWidth: 'calc(100% - 24px)',
+        // Чипы уезжают в горизонтальную прокрутку, а не переносятся: перенос
+        // добавил бы вторую полосу и сдвинул всё, что стоит выше.
+        flexWrap: 'nowrap',
+        overflowX: 'auto',
+        overflowY: 'hidden',
+        scrollbarWidth: 'none',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        // Тот же кегль, что у остальных подписей рамки: промпт здесь — тоже
+        // подпись, а не содержимое.
+        fontSize: historyTranscriptFontSize * HISTORY_SERVICE_TEXT_RATIO,
+        fontWeight: HISTORY_SERVICE_TEXT_WEIGHT,
+        lineHeight: 1.35,
+      }}
+    >
+      {composerPromptChips.map((chip) => (
+        <ComposerChip
+          key={chip.id}
+          kind="prompt"
+          label={chip.label || 'PROMPT'}
+          onClick={() => setPreviewChipId(previewChipId === chip.id ? null : chip.id)}
+          trailing={(
+            <>
+              <ControlHint label="Вернуть промпт в текст">
+                <button
+                  type="button"
+                  className="hp-composer-chip-action"
+                  aria-label="Вернуть чип в текст"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    restoreChipToComposer(chip);
+                  }}
+                >
+                  <ArrowDownToLine size={11} />
+                </button>
+              </ControlHint>
+              <ControlHint label="Удалить промпт">
+                <button
+                  type="button"
+                  className="hp-composer-chip-action hp-composer-chip-action-danger"
+                  aria-label="Удалить чип"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    discardComposerChip(chip.id);
+                  }}
+                >
+                  <Trash2 size={11} />
+                </button>
+              </ControlHint>
+            </>
+          )}
+        />
+      ))}
+    </div>
+  );
+
+  const historyComposerOverlay = (historyComposerFloatingStatus || historyComposerPromptBand)
+    ? (
+      <>
+        {historyComposerFloatingStatus}
+        {historyComposerPromptBand}
+      </>
+    )
+    : null;
 
   const historyComposerTopBar = (
     <div className="hp-history-composer-toolbar">
@@ -8894,12 +9102,13 @@ function AgentHistoryControls({
               style={{ margin: '0 3px', color: '#4ade80', flexShrink: 0 }}
             />
           ) : (
+            // Кнопка отвечает ТОЛЬКО за жизнь агента: запущен, занят, остановлен.
+            // Ни свечение, ни рисунок не зависят от раскладки — см. комментарий
+            // у HistoryTerminalActivityIcon, там оба удалённых свойства описаны.
             <HistoryTerminalActivityIcon
               size={20}
               busy={showBusyLoader || isCompacting}
-              active={!!(terminalOpen && onToggleTerminal)}
               color={statusAccent}
-              surface={terminalIsPrimary ? 'history' : 'terminal'}
             />
           )}
           {/* The status TEXT moved above the frame — see
@@ -8980,8 +9189,10 @@ function AgentHistoryControls({
       data-history-controls
       style={{
         position: overlayComposer ? 'absolute' : 'relative',
-        left: overlayComposer ? 16 : undefined,
-        right: overlayComposer ? 16 : undefined,
+        // Same constant the button pair above the frame uses, so the vertical
+        // line the border draws and the buttons standing on it cannot disagree.
+        left: overlayComposer ? HISTORY_COMPOSER_SIDE_INSET : undefined,
+        right: overlayComposer ? HISTORY_COMPOSER_SIDE_INSET : undefined,
         bottom: overlayComposer ? 0 : undefined,
         zIndex: overlayComposer ? 20 : undefined,
         flexShrink: 0,
@@ -9013,7 +9224,9 @@ function AgentHistoryControls({
           className="hp-history-composer-frame"
           topBar={historyComposerTopBar}
           topBarTrailing={historyComposerTopBarTrailing}
-          chips={composerSurfaceChips}
+          // Никаких чипов ВНУТРИ поверхности: и промпты, и вставки, и картинки
+          // рисуются либо над рамкой (промпты), либо внутри самого текста
+          // (вставки/картинки). Здесь остаётся только их раскрытое тело.
           externalExpandableChips={composerInlineChipsForPreview}
           expandedChipId={previewChipId}
           onExpandedChipChange={setPreviewChipId}
@@ -9021,7 +9234,7 @@ function AgentHistoryControls({
           // Floats above the frame, in the same stack the expanded chip preview
           // already uses. Empty it costs nothing; full it cannot move a single
           // control in the row below.
-          overlay={historyComposerFloatingStatus}
+          overlay={historyComposerOverlay}
           secondaryFontSize={aiSecondaryFontSize}
           input={(
             <div
@@ -9700,6 +9913,30 @@ function HistoryPanel({
   );
   const rewindLocked = isRewindOperationBlocking(activeRewindOperation);
   const [controlsPasteBusy, setControlsPasteBusy] = useState(false);
+  const [responseActivitySnapshot, setResponseActivitySnapshot] = useState<HistoryResponseActivitySnapshot>({
+    tabId,
+    toolType: toolType as AgentHistoryTool,
+    timing: null,
+  });
+  const handleResponseTimingChange = useCallback((next: HistoryResponseActivitySnapshot) => {
+    setResponseActivitySnapshot((previous) => {
+      const left = previous.timing;
+      const right = next.timing;
+      const sameTiming = left === right || (!!left && !!right
+        && left.state === right.state
+        && left.intervalId === right.intervalId
+        && left.toolType === right.toolType
+        && left.sessionId === right.sessionId
+        && left.startTs === right.startTs
+        && left.endTs === right.endTs
+        && left.durationMs === right.durationMs);
+      return previous.tabId === next.tabId
+        && previous.toolType === next.toolType
+        && sameTiming
+        ? previous
+        : next;
+    });
+  }, []);
   const [codexHistoryActions, setCodexHistoryActions] = useState<{
     canNativeRewind: boolean;
     canRewriteHistory: boolean;
@@ -10276,6 +10513,28 @@ function HistoryPanel({
   );
   const displayEntries = rewindPreviewResult.entries;
   const transcriptEntries = displayEntries;
+  const visibleResponseActivityTiming = responseActivitySnapshot.tabId === tabId
+    && responseActivitySnapshot.toolType === toolType
+    ? responseActivitySnapshot.timing
+    : null;
+  const liveResponseTailTiming = useMemo<HistoryResponseTailTiming | null>(
+    () => resolveHistoryResponseTailTiming(
+      visibleResponseActivityTiming,
+      EMPTY_HISTORY_ENTRIES,
+    ) as HistoryResponseTailTiming | null,
+    [visibleResponseActivityTiming],
+  );
+  const completedResponseTailTiming = useMemo<HistoryResponseTailTiming | null>(
+    () => resolveHistoryResponseTailTiming(
+      null,
+      displayEntries,
+    ) as HistoryResponseTailTiming | null,
+    [displayEntries],
+  );
+  // While a response is live, appends may rebuild the durable row array but
+  // must not churn Footer context. The live interval object stays referentially
+  // stable until an actual activity edge; durable timing takes over afterwards.
+  const responseTailTiming = liveResponseTailTiming || completedResponseTailTiming;
   // ===== Display units: series collapsing (последняя ступень проекции) =====
   // Approved contract (docs/tmp/визуал-history.md::Вердикт): the unit list is
   // presentation-only; group keys are internal; everything that crosses this
@@ -10420,8 +10679,16 @@ function HistoryPanel({
   // Footer (historyTailSpacerPx), burns on upward scroll, zeroes on restore
   // start / owner change / tail growth. Never persisted.
   const [historyTailSpacerPx, setHistoryTailSpacerPx] = useState(0);
+  // One diagnostic line per armed reserve when programmatic scroll tried to
+  // consume it — enough to recognise the 17.08 pattern in a prod trace
+  // without flooding (the blocked case fires dozens of times per collapse).
+  const historyTailSpacerBurnBlockLoggedRef = useRef(false);
   const historyTailSpacerRef = useRef(createHistoryTailSpacer({
-    onChange: (px: number) => setHistoryTailSpacerPx(px),
+    onChange: (px: number, reason?: string) => {
+      // Each fresh reserve gets its own "programmatic burn was blocked" line.
+      if (reason !== 'burn') historyTailSpacerBurnBlockLoggedRef.current = false;
+      setHistoryTailSpacerPx(px);
+    },
     diag: (line: string) => historyDiag(line + ' tab=' + tabId.slice(-12)),
   }));
   const historyTailHoldSeqRef = useRef(0);
@@ -10459,7 +10726,7 @@ function HistoryPanel({
     if (deficit <= 2) {
       spacer.reset('content-refilled');
     } else if (deficit < spacerPx) {
-      spacer.burn(spacerPx - deficit);
+      spacer.burn(spacerPx - deficit, 'deficit-reconcile');
     }
     // deficit >= spacerPx: nothing refilled yet — keep the reserve whole.
   });
@@ -10469,8 +10736,12 @@ function HistoryPanel({
     ? terminalPreview
     : null;
   const historyVirtuosoContext = useMemo<HistoryVirtuosoContext>(
-    () => ({ terminalPreview: visibleTerminalPreview, tailSpacerPx: historyTailSpacerPx }),
-    [visibleTerminalPreview, historyTailSpacerPx],
+    () => ({
+      terminalPreview: visibleTerminalPreview,
+      responseTiming: responseTailTiming,
+      tailSpacerPx: historyTailSpacerPx,
+    }),
+    [visibleTerminalPreview, responseTailTiming, historyTailSpacerPx],
   );
   const visibleLiveToolResults = liveToolResultsRef.current.ownerKey === historyOwnerKey
     ? liveToolResults
@@ -11690,6 +11961,20 @@ function HistoryPanel({
       ? Number(changedAtOverride)
       : Date.now();
     const handoffMeta = promptHandoffMetaRef.current.get(handoffId) || null;
+    const currentHandoff = getHistoryPromptHandoffsSnapshot(tabId)
+      .find((record) => record.handoffId === handoffId) || null;
+    if (
+      currentHandoff
+      && (currentHandoff.queueStatus === 'cancelled' || currentHandoff.queueStatus === 'failed')
+      && queueStatus !== currentHandoff.queueStatus
+    ) {
+      historyDiag('LOCAL_STATUS_IGNORED tab=' + tabId.slice(-12)
+        + ' handoff=' + handoffId
+        + ' queueStatus=' + queueStatus
+        + ' reason=' + reason
+        + ' terminal=' + currentHandoff.queueStatus);
+      return;
+    }
     if (handoffMeta && identity) {
       promptHandoffMetaRef.current.set(handoffId, {
         ...handoffMeta,
@@ -15137,9 +15422,32 @@ function HistoryPanel({
     // Tail-spacer burn: scrolling AWAY from the bottom consumes the reserve
     // by the distance travelled, so the fake bottom shrinks toward the real
     // one and disappears by the time the user is back in the content.
+    // Ownership proof required (prod 17.08, tab-3314): after a collapse the
+    // browser clamp, Virtuoso's late measurement pass and the hold loop all
+    // emit scroll events with a negative delta. Burning on the raw delta let
+    // the reserve consume itself in ~0.8s with no gesture at all — ~40 burns
+    // down to zero — and the frame jumped. Only a real upward gesture (or an
+    // in-progress scrollbar drag) may consume it; a live hold vetoes all.
     const spacer = historyTailSpacerRef.current;
     if (spacer.get() > 0 && deltaTop < 0) {
-      spacer.burn(-deltaTop);
+      const userOwned = isUserOwnedScrollBurn({
+        holdActive: historyTailHoldTargetRef.current !== null,
+        pointerScrollActive: historyPointerScrollActiveRef.current,
+        msSinceGesture: performance.now() - historyUserGestureAtRef.current,
+      });
+      if (userOwned) {
+        spacer.burn(-deltaTop, 'user-scroll');
+      } else if (!historyTailSpacerBurnBlockLoggedRef.current) {
+        historyTailSpacerBurnBlockLoggedRef.current = true;
+        historyDiag('TAIL_SPACER burn-blocked tab=' + tabId.slice(-12)
+          + ' px=' + spacer.get()
+          + ' delta=' + Math.round(-deltaTop)
+          + ' hold=' + (historyTailHoldTargetRef.current !== null ? 1 : 0)
+          + ' gen=' + historyUserGestureGenerationRef.current
+          + ' sinceGestureMs=' + Math.round(
+            performance.now() - historyUserGestureAtRef.current,
+          ));
+      }
     }
     const spacerPx = spacer.get();
     // Bottom math is against the CONTENT bottom (reserve subtracted) — guard 1
@@ -15409,6 +15717,7 @@ function HistoryPanel({
       operationalPhase={compactOperationalPhase}
       onRuntimeSnapshotChange={handleRuntimeSnapshotChange}
       onInputBusyChange={setControlsPasteBusy}
+      onResponseTimingChange={handleResponseTimingChange}
       onHeightChange={handleControlsHeightChange}
       // Overlay geometry belongs to the centered layout only; docked below the
       // terminal the composer is a normal bottom row of the workspace column.
@@ -16167,7 +16476,6 @@ function HistoryPanel({
                       searchQuery.length >= 2
                       && entry.content.toLowerCase().includes(searchQuery.toLowerCase())
                     }
-                    forceToolOpen={!!expandedSubgroup}
                   />
                 </>
               );
@@ -16304,12 +16612,44 @@ function HistoryPanel({
             />
           </div>
         )}
+        {/* «Выдвинуть вторую поверхность» — вплотную над полем ввода, у правого
+            края. Стоит ВСЕГДА, в отличие от стрелки слева от него: это орган
+            управления раскладкой, и он не должен появляться и исчезать от
+            прокрутки транскрипта — иначе за ним пришлось бы охотиться.
+
+            ПРАВЫЙ КРАЙ КНОПКИ = ПРАВЫЙ КРАЙ РАМКИ ПОЛЯ ВВОДА. Не «примерно
+            там же»: пользователь требовал совпадения по вертикали, и глаз ловит
+            рассинхрон в 4px мгновенно, потому что рамка рисует эту линию.
+            Поэтому отступ берётся из ЕДИНСТВЕННОГО источника — из того же
+            числа, которым сама панель управления отодвинута от края
+            (HISTORY_COMPOSER_SIDE_INSET). Своё независимое число здесь уже
+            один раз разъехалось: у кнопки был `centerRightInset + 12`, а у
+            рамки — свои 16px, и кнопка встала на 4px правее линии. */}
+        {mainSurface && (
+          <div
+            data-history-side-surface-toggle
+            style={{
+              position: 'absolute',
+              // 1px над рамкой поля — «буквально в расстоянии одного пикселя».
+              bottom: controlsHeight + 1,
+              right: centerRightInset + HISTORY_COMPOSER_SIDE_INSET,
+              zIndex: 10,
+            }}
+          >
+            <SideSurfaceToggleButton tabId={tabId} size={28} />
+          </div>
+        )}
         {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll.
             When this panel is the CENTER surface it must dodge the right-docked
             side panel, exactly like the Run after strip and the terminal's own
             arrow (shared arithmetic in surfaceInsets). As a side panel it insets
             nothing: its own bottom-right corner is already clear, and shifting
-            it would push the control out of the panel it belongs to. */}
+            it would push the control out of the panel it belongs to.
+
+            Слева от кнопки раскладки, в 2px: пара стоит в одном месте, и стрелка
+            не занимает её позицию, когда прячется. В боковой панели кнопки
+            раскладки нет (она принадлежит центральной поверхности), поэтому там
+            стрелка остаётся у самого края. */}
         <ControlHint label="Прокрутить History вниз">
         <div
           ref={scrollArrowRef}
@@ -16318,8 +16658,10 @@ function HistoryPanel({
           style={{
             display: 'none',
             position: 'absolute',
-            bottom: (mainSurface ? controlsHeight : 0) + 12,
-            right: (mainSurface ? centerRightInset : 0) + 12,
+            bottom: mainSurface ? controlsHeight + 1 : 12,
+            right: mainSurface
+              ? centerRightInset + HISTORY_COMPOSER_SIDE_INSET + 28 + 2
+              : 12,
             width: 28,
             height: 28,
             borderRadius: 6,

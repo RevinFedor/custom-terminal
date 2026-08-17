@@ -22,6 +22,10 @@ const {
 } = require('../codex-process-action-ownership');
 const { promptFingerprint } = require('../claude-prompt-carriers');
 const { classifyCodexTurnRecord } = require('../codex-turn-outcome');
+const {
+  codexUserCarrierTextsMatch,
+  codexUserMessageAuditText,
+} = require('../codex-prompt-audit');
 const { classifyHistoryAction } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
 const {
   CodexAccountProfileManager,
@@ -184,6 +188,40 @@ function stableSourceIdentity(sessionId, record, prefix = 'codex') {
     ? Number(record.__byteOffset)
     : Number(record?.__line ?? -1);
   return `${prefix}-source-${sessionId || 'unknown'}-${position}`;
+}
+
+function addStableSourceIdentityAlias(entry, alias) {
+  const normalized = typeof alias === 'string' ? alias.trim() : '';
+  if (!entry || !normalized || normalized === entry.sourceIdentity) return;
+  const aliases = Array.isArray(entry.sourceIdentityAliases)
+    ? entry.sourceIdentityAliases.filter((value) => (
+        typeof value === 'string'
+        && value
+        && value !== entry.sourceIdentity
+      ))
+    : [];
+  if (!aliases.includes(normalized)) aliases.push(normalized);
+  entry.sourceIdentityAliases = aliases;
+}
+
+function promoteStableSourceIdentity(entry, nextIdentity) {
+  if (!entry || typeof nextIdentity !== 'string' || !nextIdentity) return;
+  const previousIdentity = typeof entry.sourceIdentity === 'string'
+    ? entry.sourceIdentity
+    : '';
+  entry.sourceIdentity = nextIdentity;
+  const aliases = Array.isArray(entry.sourceIdentityAliases)
+    ? entry.sourceIdentityAliases.filter((value) => (
+        typeof value === 'string'
+        && value
+        && value !== nextIdentity
+      ))
+    : [];
+  if (previousIdentity && previousIdentity !== nextIdentity && !aliases.includes(previousIdentity)) {
+    aliases.push(previousIdentity);
+  }
+  if (aliases.length > 0) entry.sourceIdentityAliases = aliases;
+  else delete entry.sourceIdentityAliases;
 }
 
 function parseTimestampMs(value) {
@@ -1112,6 +1150,24 @@ function firstCodexToolDetail(args) {
   return '';
 }
 
+/**
+ * A short, safe subject for an MCP card header.
+ *
+ * `prompt` is deliberately NOT a candidate. For send/delegate tools it is
+ * the whole user task (often several thousand characters), not a summary.
+ * Putting it into `args.summary` made a COLLAPSED `terminal · delegate to
+ * session` row print the complete delegated instruction inline. The prompt
+ * remains in `args` for the explicitly expanded body and row copy.
+ */
+function firstCodexMcpDetail(args) {
+  if (!args || typeof args !== 'object') return '';
+  const direct = args.label || args.query || args.q || args.path || args.file_path
+    || args.location || args.uri || args.pattern;
+  if (typeof direct === 'string') return direct;
+  const query = Array.isArray(args.search_query) ? args.search_query[0]?.q : null;
+  return typeof query === 'string' ? query : '';
+}
+
 function normalizeCodexHistoryCall(toolName, args, namespace = '') {
   const name = String(toolName || 'tool');
   const input = args && typeof args === 'object' ? args : { input: args };
@@ -1170,7 +1226,7 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
   ) {
     const parts = qualifiedName.replace(/^mcp__/, '').split('__');
     const action = parts.length > 1 ? `${parts[0]} · ${parts.slice(1).join(' ')}` : humanizeCodexToolName(qualifiedName);
-    const detail = firstCodexToolDetail(input);
+    const detail = firstCodexMcpDetail(input);
     // Parsed transport identity for the renderer: the visual dictionary
     // forbids surfacing `mcp__server__tool` as the row label, and the display
     // grouping collapses MCP series per SERVER — both need these fields.
@@ -2857,6 +2913,7 @@ function isCodexSubagentNotification(payload = {}) {
  */
 function createCodexTimelineProjector(sessionId) {
   const entries = [];
+  const pendingResponseUsers = [];
   let currentUser = null;
   let currentTurnIndex = -1;
   let latestModel = null;
@@ -2866,6 +2923,8 @@ function createCodexTimelineProjector(sessionId) {
   let metaRecord = null;
   let forkLiveStartLine;
   let forkStartedAtMs = NaN;
+  let currentTurnCanonicalUserText = null;
+  let currentTurnCanonicalUserEntry = null;
 
   const feed = (record) => {
     const payload = record.payload || {};
@@ -2923,6 +2982,10 @@ function createCodexTimelineProjector(sessionId) {
     }
 
     if (record.type === 'event_msg') {
+      if (payload.type === 'task_started') {
+        currentTurnCanonicalUserText = null;
+        currentTurnCanonicalUserEntry = null;
+      }
       if (payload.type === 'user_message') {
         // Companion pairing window closes at the next real user turn (same
         // counter semantics as the old whole-file pre-pass).
@@ -2933,27 +2996,51 @@ function createCodexTimelineProjector(sessionId) {
         // message. Full history feeds it to the card tracker; Timeline must
         // not mint a phantom dot for it.
         if (isCodexSubagentNotification(payload)) return;
-        currentTurnIndex += 1;
-        const entry = {
-          uuid: stableUuid(sessionId, record.__line, 'codex-user'),
-          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
-          type: 'user',
-          timestamp: recordTimestamp(record),
-          content: text,
-          sourceLine: record.__line,
-          hasImage: Array.isArray(payload.images) ? payload.images.length > 0 : false,
-          sessionId,
-          turnIndex: currentTurnIndex,
-          responseModel: latestModel || undefined,
-          responseEffort: latestEffort || undefined,
-        };
-        entries.push(entry);
-        currentUser = entry;
+        const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
+          codexUserCarrierTextsMatch(candidate.text, text)
+        ));
+        if (pendingIndex >= 0) {
+          const pending = pendingResponseUsers.splice(pendingIndex, 1)[0];
+          pending.entry.uuid = stableUuid(sessionId, record.__line, 'codex-user');
+          promoteStableSourceIdentity(
+            pending.entry,
+            stableSourceIdentity(sessionId, record, 'codex-user'),
+          );
+          pending.entry.timestamp = recordTimestamp(record);
+          pending.entry.content = text;
+          pending.entry.sourceLine = record.__line;
+          pending.entry.hasImage = Array.isArray(payload.images) ? payload.images.length > 0 : false;
+          currentUser = pending.entry;
+        } else {
+          currentTurnIndex += 1;
+          const entry = {
+            uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+            sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+            type: 'user',
+            timestamp: recordTimestamp(record),
+            content: text,
+            sourceLine: record.__line,
+            hasImage: Array.isArray(payload.images) ? payload.images.length > 0 : false,
+            sessionId,
+            turnIndex: currentTurnIndex,
+            responseModel: latestModel || undefined,
+            responseEffort: latestEffort || undefined,
+          };
+          entries.push(entry);
+          currentUser = entry;
+        }
+        currentTurnCanonicalUserText = text;
+        currentTurnCanonicalUserEntry = currentUser;
       } else if (payload.type === 'thread_rolled_back') {
         const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
         logCodexRollback('timeline', sessionId, record, rollback);
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
         currentUser = lastCodexTimelineUser(entries);
+        currentTurnCanonicalUserEntry = currentUser;
+        currentTurnCanonicalUserText = currentUser?.content || null;
+        for (let index = pendingResponseUsers.length - 1; index >= 0; index -= 1) {
+          if (!entries.includes(pendingResponseUsers[index].entry)) pendingResponseUsers.splice(index, 1);
+        }
       } else if (payload.type === 'token_count') {
         const info = payload.info || {};
         latestTokenCountInfo = info;
@@ -3001,6 +3088,7 @@ function createCodexTimelineProjector(sessionId) {
         }
       } else if (payload.type === 'task_complete' && currentUser) {
         currentUser.responseComplete = true;
+        pendingResponseUsers.length = 0;
       } else if (isCompactPayload(payload)) {
         if (pendingCompactCompanions > 0) {
           pendingCompactCompanions -= 1;
@@ -3022,6 +3110,38 @@ function createCodexTimelineProjector(sessionId) {
     }
 
     if (record.type === 'response_item') {
+      if (payload.type === 'message' && payload.role === 'user') {
+        const text = codexUserMessageAuditText(record) || '';
+        if (!text || text.includes('<subagent_notification>')) return;
+        if (currentTurnCanonicalUserText
+          && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, text)) {
+          addStableSourceIdentityAlias(
+            currentTurnCanonicalUserEntry,
+            stableSourceIdentity(sessionId, record, 'codex-user'),
+          );
+          return;
+        }
+        pendingCompactCompanions = 0;
+        currentTurnIndex += 1;
+        const content = Array.isArray(payload.content) ? payload.content : [];
+        const entry = {
+          uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+          type: 'user',
+          timestamp: recordTimestamp(record),
+          content: text,
+          sourceLine: record.__line,
+          hasImage: content.some((part) => String(part?.type || '').toLowerCase().includes('image')),
+          sessionId,
+          turnIndex: currentTurnIndex,
+          responseModel: latestModel || undefined,
+          responseEffort: latestEffort || undefined,
+        };
+        entries.push(entry);
+        currentUser = entry;
+        pendingResponseUsers.push({ entry, text });
+        return;
+      }
       if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
         collectCodexDocsAttributes(currentUser, payload);
       }
@@ -3089,6 +3209,7 @@ function buildCodexTimeline(records, sessionId) {
  */
 function createCodexHistoryProjector(sessionId) {
   const entries = [];
+  const pendingResponseUsers = [];
   const pendingCalls = new Map();
   const pendingExecCells = new Map();
   const subagents = createCodexSubagentTracker();
@@ -3113,6 +3234,8 @@ function createCodexHistoryProjector(sessionId) {
   // real user turn is that snapshot's telemetry twin and renders nothing.
   let pendingCompactCompanions = 0;
   let consumedRecords = 0;
+  let currentTurnCanonicalUserText = null;
+  let currentTurnCanonicalUserEntry = null;
 
   const feed = (record) => {
     consumedRecords += 1;
@@ -3170,6 +3293,10 @@ function createCodexHistoryProjector(sessionId) {
     }
 
     if (record.type === 'event_msg') {
+      if (payload.type === 'task_started') {
+        currentTurnCanonicalUserText = null;
+        currentTurnCanonicalUserEntry = null;
+      }
       if (
         payload.type === 'user_message'
         || payload.type === 'task_started'
@@ -3196,22 +3323,47 @@ function createCodexHistoryProjector(sessionId) {
           subagents.onSubagentNotification(userText);
           return;
         }
-        currentTurnIndex += 1;
-        entries.push({
-          uuid: stableUuid(sessionId, record.__line, 'codex-user'),
-          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
-          role: 'user',
-          timestamp: recordTimestamp(record),
-          content: userText,
-          sessionId,
-          turnIndex: currentTurnIndex,
-        });
+        const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
+          codexUserCarrierTextsMatch(candidate.text, userText)
+        ));
+        if (pendingIndex >= 0) {
+          const pending = pendingResponseUsers.splice(pendingIndex, 1)[0];
+          pending.entry.uuid = stableUuid(sessionId, record.__line, 'codex-user');
+          promoteStableSourceIdentity(
+            pending.entry,
+            stableSourceIdentity(sessionId, record, 'codex-user'),
+          );
+          pending.entry.timestamp = recordTimestamp(record);
+          pending.entry.content = userText;
+          currentTurnCanonicalUserEntry = pending.entry;
+        } else {
+          currentTurnIndex += 1;
+          const entry = {
+            uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+            sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+            role: 'user',
+            timestamp: recordTimestamp(record),
+            content: userText,
+            sessionId,
+            turnIndex: currentTurnIndex,
+          };
+          entries.push(entry);
+          currentTurnCanonicalUserEntry = entry;
+        }
+        currentTurnCanonicalUserText = userText;
       } else if (payload.type === 'thread_rolled_back') {
         const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
         logCodexRollback('full-history', sessionId, record, rollback);
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
+        currentTurnCanonicalUserEntry = [...entries].reverse().find((entry) => entry?.role === 'user') || null;
+        currentTurnCanonicalUserText = currentTurnCanonicalUserEntry?.content || null;
+        for (let index = pendingResponseUsers.length - 1; index >= 0; index -= 1) {
+          if (!entries.includes(pendingResponseUsers[index].entry)) pendingResponseUsers.splice(index, 1);
+        }
       } else if (payload.type === 'token_count') {
         latestTokenCountInfo = payload.info || {};
+      } else if (payload.type === 'task_complete') {
+        pendingResponseUsers.length = 0;
       } else if (payload.type === 'sub_agent_activity') {
         // v2 collaboration: the only parent-side link spawn call → child
         // rollout (agent_thread_id) + live status kinds started/interacted/
@@ -3241,17 +3393,41 @@ function createCodexHistoryProjector(sessionId) {
     if (record.type !== 'response_item') return;
 
     if (payload.type === 'message' && payload.role === 'user') {
-      const userText = extractTextContent(payload.content) || '';
+      const userText = codexUserMessageAuditText(record) || '';
       // Codex currently persists fire-and-forget subagent completion in two
       // legitimate carrier shapes. Older rollouts used event_msg
       // user_message; newer/mixed protocol runs can write only a
       // response_item user message. Both carry the same exact agent identity
-      // and must close the same Task card. Normal user response_items remain
-      // ignored here because their paired event_msg is the canonical visible
-      // transcript row.
+      // and must close the same Task card. A normal response_item is also the
+      // fallback visible user carrier when this Codex protocol run omits the
+      // paired event_msg; the block below upgrades it in place if that event
+      // eventually arrives.
       if (userText.includes('<subagent_notification>')) {
         subagents.onSubagentNotification(userText);
+        return;
       }
+      if (!userText) return;
+      if (currentTurnCanonicalUserText
+        && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, userText)) {
+        addStableSourceIdentityAlias(
+          currentTurnCanonicalUserEntry,
+          stableSourceIdentity(sessionId, record, 'codex-user'),
+        );
+        return;
+      }
+      pendingCompactCompanions = 0;
+      currentTurnIndex += 1;
+      const entry = {
+        uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+        sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+        role: 'user',
+        timestamp: recordTimestamp(record),
+        content: userText,
+        sessionId,
+        turnIndex: currentTurnIndex,
+      };
+      entries.push(entry);
+      pendingResponseUsers.push({ entry, text: userText });
       return;
     }
 
@@ -3305,6 +3481,12 @@ function createCodexHistoryProjector(sessionId) {
         timestamp: recordTimestamp(record),
         line: record.__line,
         byteOffset: record.__byteOffset,
+        // Exact presentation slot at CALL time. Most calls close immediately,
+        // but a lost output can leave one pending for days. finalize() must
+        // materialize that orphan where the call happened, not append it after
+        // every later final answer (real session 7395…: old Search 12367 was
+        // rendered below answer 13737 although its byte offset was 35MB older).
+        entryIndexAtCall: entries.length,
         record,
       };
       // Register spawn cards at CALL time: the v2 sub_agent_activity(started)
@@ -3401,6 +3583,15 @@ function createCodexHistoryProjector(sessionId) {
     // not consumed, so later `feed` calls attach them to their real records
     // exactly as a fresh one-shot pass at that future moment would.
     const tail = [];
+    const tailPlacements = [];
+    const rememberTailPlacement = (call, beforeLength) => {
+      const anchor = Number.isInteger(call?.entryIndexAtCall)
+        ? Math.max(0, Math.min(entries.length, call.entryIndexAtCall))
+        : entries.length;
+      for (let index = beforeLength; index < tail.length; index += 1) {
+        tailPlacements.push({ entry: tail[index], anchor });
+      }
+    };
     let tailThinking = pendingThinking;
     for (const call of pendingCalls.values()) {
       const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
@@ -3411,6 +3602,7 @@ function createCodexHistoryProjector(sessionId) {
       // orphan the accumulated status of the previous one).
       if (isCodexSubagentSpawnCall(call)) {
         if (!call.subagentCard) call.subagentCard = registerSubagentSpawn(call);
+        const beforeLength = tail.length;
         pushAssistantEntry(
           tail,
           sessionId,
@@ -3420,6 +3612,7 @@ function createCodexHistoryProjector(sessionId) {
           tailThinking,
           [call.subagentCard],
         );
+        rememberTailPlacement(call, beforeLength);
         tailThinking = '';
         continue;
       }
@@ -3429,6 +3622,7 @@ function createCodexHistoryProjector(sessionId) {
         continue;
       }
       const decoded = codexHistoryActionsForCall(call, undefined, false);
+      const beforeLength = tail.length;
       pushAssistantEntry(
         tail,
         sessionId,
@@ -3438,6 +3632,7 @@ function createCodexHistoryProjector(sessionId) {
         tailThinking,
         decoded.actions
       );
+      rememberTailPlacement(call, beforeLength);
       tailThinking = '';
     }
 
@@ -3469,14 +3664,26 @@ function createCodexHistoryProjector(sessionId) {
       }
     }
 
-    const presented = new Array(entries.length + tail.length);
-    for (let index = 0; index < entries.length; index += 1) {
-      const { turnIndex, ...entry } = entries[index];
-      presented[index] = entry;
+    // Pending calls are presentation rows, but not necessarily TAIL rows. A
+    // current in-flight call naturally anchors at entries.length; an old call
+    // whose output was lost anchors at the number of rows that existed when
+    // its call record arrived. Buckets preserve provider arrival order when
+    // several concurrent calls share one slot.
+    const pendingByAnchor = new Map();
+    for (const placement of tailPlacements) {
+      const bucket = pendingByAnchor.get(placement.anchor) || [];
+      bucket.push(placement.entry);
+      pendingByAnchor.set(placement.anchor, bucket);
     }
-    for (let index = 0; index < tail.length; index += 1) {
-      const { turnIndex, ...entry } = tail[index];
-      presented[entries.length + index] = entry;
+    const presented = [];
+    const appendPresented = (source) => {
+      const { turnIndex, ...entry } = source;
+      presented.push(entry);
+    };
+    for (let index = 0; index <= entries.length; index += 1) {
+      const pending = pendingByAnchor.get(index);
+      if (pending) pending.forEach(appendPresented);
+      if (index < entries.length) appendPresented(entries[index]);
     }
     return presented;
   };
@@ -3999,7 +4206,7 @@ function codexPendingStartForUserMessage(pending, message) {
   for (let i = pending.length - 1; i >= 0; i--) {
     const record = pending[i]?.record;
     if (!isCodexResponseUserRecord(record)) continue;
-    const text = normalizeCodexText(extractTextContent(record.payload?.content));
+    const text = normalizeCodexText(codexUserMessageAuditText(record));
     if (text === expected) {
       duplicateIdx = i;
       break;
@@ -4052,6 +4259,35 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
   let currentTurnIndex = -1;
 
   const flushPending = (turnIndex) => {
+    const fallbackIndex = pending.findIndex((item) => {
+      if (!isCodexResponseUserRecord(item?.record)) return false;
+      const text = codexUserMessageAuditText(item.record) || '';
+      return !!text && !text.includes('<subagent_notification>');
+    });
+    if (fallbackIndex >= 0) {
+      const fallbackText = codexUserMessageAuditText(pending[fallbackIndex].record) || '';
+      const turnStart = codexPendingStartForUserMessage(pending, fallbackText);
+      for (let index = 0; index < turnStart; index += 1) {
+        pushCodexVisibleWrapper(wrappers, pending[index].record, turnIndex);
+      }
+      currentTurnIndex = Math.max(currentTurnIndex, turnIndex) + 1;
+      for (let index = turnStart; index < pending.length; index += 1) {
+        const record = pending[index].record;
+        pushCodexVisibleWrapper(
+          wrappers,
+          record,
+          currentTurnIndex,
+          record === pending[fallbackIndex].record
+            ? {
+                sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
+                kind: 'user',
+              }
+            : {},
+        );
+      }
+      pending.length = 0;
+      return;
+    }
     while (pending.length > 0) {
       const item = pending.shift();
       pushCodexVisibleWrapper(wrappers, item.record, turnIndex);
@@ -4355,8 +4591,7 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
         inserted = true;
       }
       removedRecords += 1;
-      const payload = wrapper.record?.payload || {};
-      if (wrapper.record?.type === 'event_msg' && payload.type === 'user_message') removedUsers += 1;
+      if (wrapper.kind === 'user') removedUsers += 1;
       continue;
     }
     outputRecords.push(cloneCodexRecordForWrite(wrapper.record));
@@ -4539,10 +4774,12 @@ function codexCopyOptions(params = {}) {
 
 function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), options = {}) {
   const entries = [];
+  const pendingResponseUsers = [];
   const compactCompanionLines = codexCompactCompanionLines(records);
   const pendingCalls = new Map();
   let currentTurnIndex = -1;
   let pendingThinking = '';
+  let currentTurnCanonicalUserText = null;
   const expandedCompactUuids = options.expandedCompactUuids instanceof Set
     ? options.expandedCompactUuids
     : new Set();
@@ -4571,25 +4808,41 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
     }
 
     if (record.type === 'event_msg') {
+      if (payload.type === 'task_started') currentTurnCanonicalUserText = null;
       if (payload.type === 'user_message') {
         // Codex persists a built-in subagent completion as an event_msg with a
         // user role, but it is a service carrier inside the current external
         // turn. Timeline already ignores it; the clean result projection must
         // keep the same boundary or it drops the final assistant tail.
         if (isCodexSubagentNotification(payload)) continue;
-        currentTurnIndex += 1;
+        const userText = payload.message || extractTextContent(payload.content) || '';
+        const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
+          codexUserCarrierTextsMatch(candidate.text, userText)
+        ));
+        const pending = pendingIndex >= 0
+          ? pendingResponseUsers.splice(pendingIndex, 1)[0]
+          : null;
+        if (!pending) currentTurnIndex += 1;
         if (opts.includeUser) {
           const images = [
             ...(Array.isArray(payload.local_images) ? payload.local_images : []),
             ...(Array.isArray(payload.images) ? payload.images : []),
           ];
           const imageLines = images.map((img) => `[image: ${typeof img === 'string' ? img : 'attached image'}]`);
-          push({
-            kind: 'user',
-            text: [payload.message || extractTextContent(payload.content), ...imageLines].filter(Boolean).join('\n'),
-            sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
-          });
+          const presentedText = [userText, ...imageLines].filter(Boolean).join('\n');
+          if (pending?.entry) {
+            pending.entry.text = presentedText;
+            pending.entry.sourceUuid = stableUuid(sessionId, record.__line, 'codex-user');
+          } else {
+            const entry = {
+              kind: 'user',
+              text: presentedText,
+              sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
+            };
+            push(entry);
+          }
         }
+        currentTurnCanonicalUserText = userText;
       } else if (payload.type === 'thread_rolled_back') {
         removeLastCodexTurns(entries, Number(payload.num_turns || payload.turns || 1));
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
@@ -4602,11 +4855,32 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
             sourceUuid,
           });
         }
-      }
+      } else if (payload.type === 'task_complete') pendingResponseUsers.length = 0;
       continue;
     }
 
     if (record.type !== 'response_item') continue;
+
+    if (payload.type === 'message' && payload.role === 'user') {
+      const userText = codexUserMessageAuditText(record) || '';
+      if (!userText || userText.includes('<subagent_notification>')) continue;
+      if (currentTurnCanonicalUserText
+        && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, userText)) {
+        continue;
+      }
+      currentTurnIndex += 1;
+      let entry = null;
+      if (opts.includeUser) {
+        entry = {
+          kind: 'user',
+          text: userText,
+          sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
+        };
+        push(entry);
+      }
+      pendingResponseUsers.push({ entry, text: userText });
+      continue;
+    }
 
     if (payload.type === 'reasoning') {
       const text = extractReasoning(payload.summary || payload.content);

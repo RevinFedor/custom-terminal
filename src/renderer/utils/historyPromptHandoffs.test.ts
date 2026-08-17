@@ -380,6 +380,26 @@ test('a late pending receipt cannot regress SENT with exact proof', () => {
   assert.equal(stale?.auditProof?.entryUuid, 'exact-user-uuid');
 });
 
+test('a late timeout cannot resurrect a provider-returned cancelled attempt', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  begin(store, 'tab-a', 'handoff-returned');
+  const cancelled = store.settle('tab-a', 'handoff-returned', {
+    queueStatus: 'cancelled',
+    reason: 'provider-queue-returned-to-terminal-composer',
+    changedAt: 300,
+  });
+  const stale = store.settle('tab-a', 'handoff-returned', {
+    queueStatus: 'audit-pending',
+    reason: 'send-submitted-audit-pending',
+    changedAt: 400,
+  });
+
+  assert.strictEqual(stale, cancelled);
+  assert.equal(stale?.queueStatus, 'cancelled');
+  assert.equal(stale?.statusReason, 'provider-queue-returned-to-terminal-composer');
+  assert.equal(stale?.statusChangedAt, 300);
+});
+
 test('only a genuinely new send attempt can reset an exact receipt', () => {
   const store = new HistoryPromptHandoffStore(limits());
   store.begin({
@@ -944,6 +964,37 @@ test('post-Enter receipts remain visibly unconfirmed instead of becoming SENT', 
   assert.equal(byId.get('audit-pending-handoff')?.statusReason, 'send-submitted-audit-pending');
 });
 
+test('send result preserves exact provider queue return instead of reopening CONFIRMING', async () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  const queueReturn = {
+    success: false,
+    submitted: true,
+    cancelled: true,
+    semanticStatus: 'not-submitted',
+    providerAccepted: false,
+    providerTurnCreated: false,
+    providerQueueReturned: true,
+    providerQueueOperation: 'popAll',
+    composerDraftState: 'exact-provider-queue-return',
+    draftPreserved: true,
+    sourceIdentity: 'claude-queue:offset:session-a:20125979',
+  };
+
+  await runHistoryPromptHandoff({
+    tabId: 'tab-api',
+    handoffId: 'returned-handoff',
+    toolType: 'claude',
+    text: 'returned prompt',
+    source: 'history-panel',
+    statusAtSend: 'busy',
+    send: async () => ({ ...queueReturn, pasteAudit: queueReturn }),
+  }, store);
+
+  const handoff = store.getSnapshot('tab-api')[0];
+  assert.equal(handoff?.queueStatus, 'cancelled');
+  assert.equal(handoff?.statusReason, 'provider-queue-returned-to-terminal-composer');
+});
+
 test('late exact audit promotes only its handoff to SENT', () => {
   const store = new HistoryPromptHandoffStore(limits());
   begin(store, 'tab-api', 'handoff-a');
@@ -1025,8 +1076,20 @@ test('manual History and Run After share the receipt presentation mapping', () =
     /bindHistoryPromptHandoffSendIdentity\([\s\S]{0,260}sendAttemptId: resultSendAttemptId,[\s\S]{0,120}sendOperationKey: resultSendOperationKey/,
   );
   assert.match(
+    historyPanelSource,
+    /const providerQueueReturned = historyPromptAuditIsProviderQueueReturn\([\s\S]{0,120}result\?\.pasteAudit \|\| result/,
+  );
+  assert.match(
+    historyPanelSource,
+    /currentHandoff\.queueStatus === 'cancelled'[\s\S]{0,180}LOCAL_STATUS_IGNORED/,
+  );
+  assert.match(
     queueRunnerSource,
     /const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult\(res\)/,
+  );
+  assert.match(
+    queueRunnerSource,
+    /const providerQueueReturned = historyPromptAuditIsProviderQueueReturn\([\s\S]{0,100}res\?\.pasteAudit \|\| res/,
   );
   assert.match(
     queueRunnerSource,

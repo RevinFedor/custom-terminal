@@ -956,6 +956,17 @@ export class HistoryPromptHandoffStore {
     const current = tab?.get(handoffId);
     if (!tab || !current) return undefined;
 
+    if (
+      current.value.queueStatus === 'cancelled'
+      || current.value.queueStatus === 'failed'
+    ) {
+      // These are terminal outcomes of the exact attempt. A caller that was
+      // already awaiting the audit may return afterwards with its older
+      // audit-pending/timeout snapshot; it cannot resurrect the operation.
+      // Only begin() with a genuinely new attempt is a reset boundary.
+      return current.value;
+    }
+
     let queueStatus: HistoryPromptHandoffStatus | null = null;
     if (phase === 'queued') {
       if (current.value.queueStatus === 'preparing' || current.value.queueStatus === 'sending') {
@@ -1123,6 +1134,16 @@ export class HistoryPromptHandoffStore {
     const tab = this.tabs.get(tabId);
     const current = tab?.get(handoffId);
     if (!tab || !current) return undefined;
+
+    if (
+      current.value.queueStatus === 'cancelled'
+      || current.value.queueStatus === 'failed'
+    ) {
+      // Final provider refusal/cancellation belongs to this exact attempt.
+      // A promise that began before it may resolve later with an older timeout
+      // snapshot, but only begin() with a new attempt may reopen the handoff.
+      return current.value;
+    }
 
     const nextProof = mergeCompatibleAuditProof(current.value.auditProof, input.proof);
     const currentHasExactReceipt = current.value.queueStatus === 'sent'
@@ -1483,13 +1504,18 @@ export async function runHistoryPromptHandoff(
 
   try {
     const result = await input.send(handoffId);
+    const providerQueueReturned = historyPromptAuditIsProviderQueueReturn(
+      result?.pasteAudit || result,
+    );
     const transferred = !result
       || typeof result !== 'object'
       || result.success !== false
       || result.submitted === true;
     const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(result);
     const proof = historyPromptHandoffAuditProofFromSendResult(result);
-    const queueStatus: SettledHistoryPromptHandoffStatus = !transferred
+    const queueStatus: SettledHistoryPromptHandoffStatus = providerQueueReturned
+      ? 'cancelled'
+      : !transferred
       || (result?.success === false && result?.submitted === true && !unconfirmedStatus)
       ? 'failed'
       : unconfirmedStatus
@@ -1498,6 +1524,8 @@ export async function runHistoryPromptHandoff(
       queueStatus,
       reason: !transferred
         ? 'send-refused-before-submit'
+        : providerQueueReturned
+          ? 'provider-queue-returned-to-terminal-composer'
         : queueStatus === 'failed'
           ? 'send-submitted-audit-failed'
           : queueStatus === 'audit-pending'

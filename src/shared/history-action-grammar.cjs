@@ -609,7 +609,14 @@ function historyActionHeadline({ toolName, args, family, bashWord, bashDetail, m
     const fam2 = fam || bashFamily(word);
     const { subject, detail } = extractBashSubject(command, fam2, word);
     if (fam2 === 'git') {
-      const sub = bashDetail || '';
+      // Old/projected rows may carry `family=git` without the optional
+      // `bashDetail` stamp. Re-derive the subcommand from the invocation
+      // instead of returning an empty subject — an empty semantic subject
+      // made the card renderer fall back to the WHOLE raw pipeline in grey
+      // (`Git git status --short | sed … | rg …`, reported live 17.08).
+      const sub = bashDetail
+        || classifyHistoryAction({ toolName: 'Bash', args }).bashDetail
+        || '';
       const target = subject ? subject.split('/').pop() : '';
       return { verb: 'Git', subject: [sub, target].filter(Boolean).join(' · '), detail: '' };
     }
