@@ -474,6 +474,9 @@ function createTerminalHistoryPreviewController({
       promptText: submittedPrompt,
       promptPrefixClipped: frame.promptPrefixClipped === true,
       regionTruncated: frame.truncated === true,
+      exactStructuredBoundaryKind: frame.boundaryKind === 'exact-jsonl-frame-baseline'
+        ? state.rebaseBaselineKind
+        : null,
     });
     state.lastFilteredBlockKinds = Array.isArray(extracted.filteredBlockKinds)
       ? extracted.filteredBlockKinds
@@ -499,6 +502,11 @@ function createTerminalHistoryPreviewController({
       }
       return false;
     }
+    // Preserve what the terminal parser proved before exact JSONL/tool
+    // receipts subtract already-materialized content. A frame which becomes
+    // empty only after that subtraction may still contain the beginning of a
+    // new assistant answer, so it must not replace the exact screen baseline.
+    const rawFrameWasEmpty = extracted.status === 'empty';
     if (Array.isArray(frame.baselinePhysicalLines)) {
       const baselineExtracted = extractTerminalHistoryPreviewText({
         provider: state.provider,
@@ -593,12 +601,13 @@ function createTerminalHistoryPreviewController({
       }
     }
     if (extracted.status === 'empty') {
-      // A later committed frame containing only structured/status UI is a
-      // stronger baseline than an older viewport which may still contain
-      // already-materialized prose. This also records the exact tool frame
-      // while the marker fast-path is still alive, before a later redraw can
-      // dispose it. Advancing here never invents output.
-      if (!state.text
+      // Only a frame which the terminal parser itself proved to contain no
+      // assistant text may replace the baseline. An otherwise-valid frame can
+      // become empty later because JSONL or a structured tool receipt removed
+      // known content; advancing on that derived result would let the baseline
+      // chase and absorb the beginning of the next real answer.
+      if (rawFrameWasEmpty
+        && !state.text
         && state.rebaseBaselineSnapshot
         && state.rebaseBaselineSnapshot !== committedSnapshot) {
         state.rebaseBaselineSnapshot = committedSnapshot;

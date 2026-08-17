@@ -109,6 +109,8 @@ export interface TabListTabRowProps {
   hasProcess?: boolean;
   /** An answer is streaming → shimmer over the strip. */
   busy?: boolean;
+  /** Waiting for a delegated session → purple base under the same shimmer. */
+  inheritedBusy?: boolean;
   sessionStatuses?: SessionStatusLike[];
   /** Marks the row for tests and for hover hit-testing by the caller. */
   index?: number;
@@ -135,6 +137,7 @@ export function TabListTabRow({
   missing = false,
   hasProcess = false,
   busy = false,
+  inheritedBusy = false,
   sessionStatuses,
   index,
   onPointerEnter,
@@ -179,7 +182,13 @@ export function TabListTabRow({
     >
       {/* Shared tab signals — same component as the sidebar card and the pane
           header, so a strip here can never mean something else. */}
-      <TabProcessBar hasProcess={hasProcess} busy={busy} radius={5} zIndex={1} />
+      <TabProcessBar
+        hasProcess={hasProcess}
+        busy={busy}
+        inheritedBusy={inheritedBusy}
+        radius={5}
+        zIndex={1}
+      />
       <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} left={6} />
 
       {tab.tabType === 'file' && (

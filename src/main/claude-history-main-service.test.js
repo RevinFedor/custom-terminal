@@ -51,3 +51,16 @@ test('Claude last=N projection is bounded while the rich history is built', () =
   assert.match(source, /if \(tailOnlyWindow && entries\.length > requestedTailLimit\) entries\.shift\(\)/);
   assert.match(source, /total: projectedEntryTotal/);
 });
+
+test('Claude full History treats popAll as returning queued prompts to the composer', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'ipc', 'claude-data.js'), 'utf8');
+  const popAllStart = source.indexOf("entry.operation === 'popAll'");
+  assert.notEqual(popAllStart, -1);
+  const popAllBody = source.slice(popAllStart, popAllStart + 900);
+  assert.match(popAllBody, /queued\.queueStatus !== 'queued'/);
+  assert.match(popAllBody, /pendingQueueEntries\.splice\(queueIndex, 1\)/);
+  assert.match(popAllBody, /entries\.splice\(renderedIdx, 1\)/);
+  assert.doesNotMatch(popAllBody, /queued\.queueStatus = 'sent'/);
+  assert.doesNotMatch(popAllBody, /queued\.queueStatus = 'cancelled'/);
+  assert.doesNotMatch(popAllBody, /promoteAllPendingCompactEntries/);
+});

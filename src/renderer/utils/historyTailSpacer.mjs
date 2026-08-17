@@ -1,6 +1,7 @@
 /**
  * Transient tail spacer — the "fake scroll reserve" that keeps the screen
- * still when a block collapses near the BOTTOM of the feed.
+ * still when content below the reading point shrinks near the BOTTOM of the
+ * feed (a collapsed block or a shorter/disappearing terminal preview).
  *
  * Collapsing the last expanded block removes hundreds of pixels below the
  * viewport; without compensation the scroller clamps and the content the user
@@ -26,8 +27,9 @@ export function createHistoryTailSpacer({ onChange, diag } = {}) {
 
   return {
     get: () => px,
-    /** Arm the reserve (collapse near the bottom). Replaces, never adds up:
-     * two quick collapses keep the larger single reserve. */
+    /** Arm the reserve after a tail shrink. Replaces, never adds up: two quick
+     * direct arms keep the larger single reserve. Callers that observe
+     * separate shrink deficits may explicitly pass `get() + deficit`. */
     arm(nextPx, reason = 'collapse') {
       const value = Math.max(0, Math.round(Number(nextPx) || 0));
       if (value <= 0) return;
@@ -78,4 +80,18 @@ export function historyContentDistanceFromBottom(scroller, spacerPx) {
   const raw = Number(scroller.scrollHeight || 0)
     - (Number(scroller.scrollTop || 0) + Number(scroller.clientHeight || 0));
   return raw - Math.max(0, Number(spacerPx) || 0);
+}
+
+/**
+ * Pixels the browser can no longer represent after content below the reading
+ * point shrank. Supplying the PRE-change scrollTop is essential: the live
+ * scrollTop may already have been clamped by the time React/Virtuoso reports
+ * the new height.
+ */
+export function historyTailReserveDeficitAfterShrink(scroller, scrollTopBefore) {
+  if (!scroller) return 0;
+  const oldTop = Math.max(0, Number(scrollTopBefore) || 0);
+  const viewport = Math.max(0, Number(scroller.clientHeight) || 0);
+  const nextHeight = Math.max(0, Number(scroller.scrollHeight) || 0);
+  return Math.max(0, Math.round(oldTop + viewport - nextHeight));
 }

@@ -65,16 +65,27 @@ test('compact boundary settles the newest exact compact owned by that session', 
   assert.equal(ordinary.queueStatus, 'sent');
 });
 
-test('popAll settles every exact compact but leaves ordinary prompts pending', () => {
+test('bulk accepted-compact promotion leaves ordinary prompts pending', () => {
   const one = queued('/compact');
   const ordinary = queued('normal prompt');
   const two = queued('  /compact\r\n');
   const pending = [one, ordinary, two];
   assert.deepEqual(
-    promoteAllPendingCompactEntries(pending, { reason: 'popAll' }),
+    promoteAllPendingCompactEntries(pending, { reason: 'accepted-replay' }),
     [one, two],
   );
   assert.deepEqual(pending, [ordinary]);
   assert.equal(one.role, 'slash');
   assert.equal(two.role, 'slash');
+});
+
+test('a cancelled compact is never promoted by a later compact boundary', () => {
+  const cancelled = { ...queued('/compact'), queueStatus: 'cancelled' };
+  const pending = [cancelled];
+  assert.equal(
+    promotePendingCompactEntry(pending, { reason: 'compact_boundary' }),
+    null,
+  );
+  assert.deepEqual(pending, [cancelled]);
+  assert.equal(cancelled.role, 'queued');
 });

@@ -194,28 +194,6 @@
 }
 .animate-reopen-pulse { animation: reopen-pulse 0.3s ease-in-out 2; }
 
-/* "Nothing moved, and here is why": the pane header chip navigates to the tab's
-   project, so when the sidebar is already on that project the click has no
-   visible effect. One flash of that project's card says where the click went.
-
-   Two cycles × 300ms, matching the auto-clear in useUIStore::pulseProjectCard.
-   Animates background-color and an inset ring rather than opacity — per the
-   project's AI-Optimized UI rule, opacity-only fades are eaten by H.264/JPEG on
-   screen recordings. The ACTIVE project card is painted solid white underneath,
-   so a white wash would be invisible there: the accent tint is what reads on
-   both the white active card and the dark idle one. */
-@keyframes project-card-pulse {
-  0%, 100% {
-    background-color: rgba(99, 102, 241, 0);
-    box-shadow: inset 0 0 0 0 rgba(99, 102, 241, 0);
-  }
-  50% {
-    background-color: rgba(99, 102, 241, 0.38);
-    box-shadow: inset 0 0 0 1px rgba(129, 140, 248, 0.9);
-  }
-}
-.animate-project-card-pulse { animation: project-card-pulse 0.3s ease-in-out 2; }
-
 @keyframes tab-dot-spin {
   to { transform: rotate(360deg); }
 }
@@ -457,76 +435,38 @@
   will-change: opacity, filter;
 }
 
-/* ControlBar (Provider/Model/Effort/Think) busy-overlay. Используется когда
-   командная операция в полёте (claude:send-command, provider:switch и т.п.).
-   Не меняет ширину блока (overlay через ::after, position:absolute), не подменяет
-   цвета триггеров — даёт визуальный сигнал «занят» через узкую полосу свечения,
-   бегущую слева направо. Пара с inline-style `pointer-events: none` на самом
-   блоке — клики блокируются, но визуально вкладка живая, а не серая-dead. */
-@keyframes control-bar-busy-sweep {
-  0%   { transform: translateX(-100%); }
-  100% { transform: translateX(200%); }
+/* Строки раскрывающихся меню панели управления (черновик терминала, провайдер +
+   модель, effort). Hover ЗДЕСЬ, а не в inline-стилях: активная строка красит
+   себе фон инлайном, и внешнее правило проиграло бы ей по специфичности — но
+   активной строке подсветка и не нужна, она уже выделена. Для остальных это
+   единственный сигнал «сюда попадёт клик»: без него курсор ездит по столбцу,
+   и ничего не отвечает. */
+.cb-menu-row:not(:disabled):not([data-row-active="1"]):hover {
+  background-color: #3a3a3a !important;
+  color: #fff;
 }
-.control-bar-busy-overlay {
-  position: relative;
-  /* Тонкий outline вокруг "занятого" кластера — лёгкий tint claude-оранжевый. */
-  box-shadow: inset 0 0 0 1px rgba(218, 119, 86, 0.25);
-  border-radius: 4px;
-  transition: box-shadow 0.16s ease;
+.cb-menu-row:not(:disabled):focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
 }
-.control-bar-busy-overlay::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: 4px;
-  overflow: hidden;
-  background: linear-gradient(
-    90deg,
-    rgba(218, 119, 86, 0) 0%,
-    rgba(218, 119, 86, 0.08) 35%,
-    rgba(218, 119, 86, 0.22) 50%,
-    rgba(218, 119, 86, 0.08) 65%,
-    rgba(218, 119, 86, 0) 100%
-  );
-  background-size: 50% 100%;
-  background-repeat: no-repeat;
-  animation: control-bar-busy-sweep 1.6s linear infinite;
-  pointer-events: none;
-  z-index: 1;
+/* Выбранная строка уже покрашена своим акцентом инлайном, поэтому она
+   исключена из правила выше: перекрасив её в общий серый, мы бы стёрли
+   единственный признак выбора. Ей достаточно подсветиться ярче. */
+.cb-menu-row[data-row-active="1"]:not(:disabled):hover {
+  filter: brightness(1.15);
 }
 
-/* Click-to-reset escape hatch for a STUCK busy indicator on the right cluster
-   (Provider/Model/Effort/Think). The parent .control-bar-busy-overlay sets
-   pointer-events:none while busy, so this child re-enables itself with
-   pointer-events:auto and sits ABOVE the shimmer ::after (z-index 2 > 1).
-   Idle look = invisible (transparent, label hidden) so the orange shimmer shows
-   through untouched. Hover = dark red wash + static uppercase "СБРОС"
-   label — destructive-intent affordance, and per the project's AI-OCR rule the
-   label is static uppercase B/W (no opacity-only animation) so it's readable on
-   video. Click clears the local busy flags. See
-   fact-claude-control-bar.md::Busy-state tab binding. */
-.control-bar-busy-reset {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  pointer-events: auto;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 4px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  color: transparent;
-  background-color: transparent;
-  transition: background-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
-}
-.control-bar-busy-reset:hover {
-  color: #fecaca;
-  background-color: rgba(82, 22, 22, 0.86);
-  box-shadow: inset 0 0 0 1px rgba(153, 27, 27, 0.55), 0 0 6px rgba(127, 29, 29, 0.28);
-}
+/* Мёртвый блок удалён: переливающаяся полоса по всему правому кластеру
+   (.control-bar-busy-overlay) и красный оверлей «СБРОС» поверх неё
+   (.control-bar-busy-reset).
+
+   Почему убрано, а не поправлено. Индикатор был на КЛАСТЕРЕ, а операция —
+   всегда над одной кнопкой: смена одного значения зажигала полосу шириной
+   почти в окно, и между проходами свечения не было видно вообще ничего —
+   «я вообще не вижу, есть у нас loader или нет». Ожидание теперь показывается
+   там, где происходит: кружок на самой изменяемой кнопке, соседи просто
+   недоступны, наведение на кружок даёт красный ✕ отмены. См.
+   utils/controlBarBusyTarget.mjs и ControlBusySpinner в ClaudeControlBar. */
 
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(-4px); }
@@ -728,4 +668,18 @@
 [data-terminal-pane-wrapper][data-split-pane-index]:hover
   [data-split-pane-focus-frame="0"][data-split-pane-frame-state="idle"] {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.20);
+}
+
+/* Действия панели (кнопка деления; дальше — будущие) видимы у панели В ФОКУСЕ,
+   у прочих появляются при наведении на шапку — паттерн заголовка групп VS Code
+   (утверждено 2026-08-17). Скрытие — прозрачностью, НЕ размонтированием: кнопка
+   держит своё место, и раскладка шапки не дёргается (урок «кнопка пропала» —
+   13.1). pointer-events не трогаем: невидимая кнопка кликабельна только после
+   наведения, которое её и проявило, так что мёртвых зон нет. */
+[data-split-attach-row]:not([data-focused]) [data-split-button] {
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+[data-split-attach-row]:not([data-focused]):hover [data-split-button] {
+  opacity: 1;
 }

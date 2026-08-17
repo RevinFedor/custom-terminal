@@ -56,7 +56,43 @@ test('an inactive lifecycle snapshot wakes a deferred orchestration for resume',
 
   assert.match(lifecycle, /resolveOrchestrationDeliveryAdmission\(payload\)/);
   assert.match(lifecycle, /snapshotAdmission\?\.canDispatch === true/);
-  assert.match(lifecycle, /dispatchNextDeferredOrchestrationForTarget\(tabId/);
+  assert.match(lifecycle, /dispatchNextDeferredOrchestrationForTarget\(\s*tabId/);
+  assert.match(lifecycle, /payload\.type === 'snapshot' \? payload : null/);
+});
+
+test('a readiness edge racing an active dispatch is replayed instead of dropped', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
+  const dispatcher = between(
+    source,
+    'async function dispatchDeferredOrchestrationRun',
+    '\nasync function dispatchNextDeferredOrchestrationForTarget',
+  );
+
+  assert.match(dispatcher, /orchestrationDeliverySingleFlight\.run\(runId/);
+  assert.match(dispatcher, /singleFlightOwned:\s*true/);
+  assert.match(dispatcher, /readAgentStartReadiness\(current\.targetTabId\)/);
+  assert.match(dispatcher, /isOrchestrationDeliveryIdentityCompatible\(current, exactStatus\)/);
+  assert.match(dispatcher, /event=exact-readiness-recheck/);
+  assert.doesNotMatch(dispatcher, /delivery-already-inflight/);
+});
+
+test('a renderer status reply arriving after timeout wakes only its exact run', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
+  const dispatcher = between(
+    source,
+    'async function dispatchDeferredOrchestrationRun',
+    '\nasync function dispatchNextDeferredOrchestrationForTarget',
+  );
+  const resolver = between(
+    source,
+    'async function resolveAgentSessionInfo',
+    '\nfunction registerBridgeReplyHandler',
+  );
+
+  assert.match(resolver, /onLateReply:[\s\S]*onLateStatus\(data\)/);
+  assert.match(dispatcher, /isOrchestrationDeliveryIdentityCompatible\(current, lateStatus\)/);
+  assert.match(dispatcher, /reason:\s*'late-runtime-status'/);
+  assert.match(dispatcher, /targetStatus:\s*lateStatus/);
 });
 
 test('OID-3: dispatch readiness comes from live presence, not metadata-only tab info', () => {

@@ -130,6 +130,7 @@ test('row window keeps length and order, stubbing only outside the span', () => 
   assert.equal(result.entries[50].rowStub, true, 'mid-list row is a stub');
   assert.equal(result.entries[50].content, undefined, 'stub carries no content');
   assert.equal(result.entries[50].actions, undefined, 'stub carries no actions');
+  assert.equal(result.entries[50].hasThinking, true, 'thinking identity survives without its heavy text');
   // Identity survives — this is what anchors, keys and live/durable matching
   // are built on.
   assert.equal(result.entries[50].uuid, 'h50');
@@ -138,6 +139,33 @@ test('row window keeps length and order, stubbing only outside the span', () => 
   assert.equal(result.entries[50].sourceIdentity, heavy[50].sourceIdentity);
   assert.equal(result.hydratedCount, 10);
   assert.equal(result.stubbedCount, 90);
+});
+
+test('stub keeps action target/docs identity used by both grouping levels', () => {
+  const rows = Array.from({ length: 20 }, (_u, index) => heavyRow(index));
+  rows[2] = heavyRow(2, {
+    messageId: 'msg-docs',
+    thinkingSeconds: 7,
+    actions: [{
+      tool: '__raw__',
+      rawTool: {
+        toolUseId: 'docs-read',
+        toolName: 'Read',
+        args: { file_path: 'docs/knowledge/fact-history.md', offset: 10, limit: 20 },
+        family: 'read',
+        result: 'ok',
+      },
+    }],
+  });
+  const result = applyHistoryRowWindow(rows, { radius: 3, alwaysHydrateTail: 2 });
+  const stub = result.entries[2];
+  assert.equal(stub.rowStub, true);
+  assert.equal(stub.messageId, 'msg-docs');
+  assert.equal(stub.thinkingSeconds, 7);
+  assert.equal(stub.actionSummary[0].targetKey, 'docs/knowledge/fact-history.md');
+  assert.equal(stub.actionSummary[0].targetLabel, 'fact-history.md');
+  assert.equal(stub.actionSummary[0].docsKind, 'search');
+  assert.equal(stub.actionSummary[0].aggregateKey, 'read:docs');
 });
 
 test('row window centres on a named row and still keeps the tail hydrated', () => {

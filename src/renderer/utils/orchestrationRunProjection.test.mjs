@@ -41,3 +41,14 @@ test('recovery and delivery attention block completion without inherited shimmer
     assert.equal(isOrchestrationInheritedActivity(value), false);
   }
 });
+
+test('a prompt waiting to cross Enter blocks completion without inherited shimmer', () => {
+  const value = run({
+    status: 'queued',
+    deliveryAcceptedAt: null,
+    targetPromptProofAt: null,
+  });
+  assert.equal(shouldRetainOrchestrationRun(value), true);
+  assert.equal(isOrchestrationCompletionBlocking(value), true);
+  assert.equal(isOrchestrationInheritedActivity(value), false);
+});

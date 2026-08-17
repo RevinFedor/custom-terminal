@@ -3,7 +3,7 @@ import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocuse
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
-import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG, PROJECT_CARD_WORKING_RING } from './utils/projectCardPresence.mjs';
+import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG } from './utils/projectCardPresence.mjs';
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
@@ -88,6 +88,36 @@ const { ipcRenderer } = window.require('electron');
 
 const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
 const DRAFT_SCREEN_DIAGNOSTIC_SETTLE_TIMEOUT_MS = 60_000;
+
+// Оранжевый акцент — пипеткой из build-resources/icon.icns (доминирующий
+// насыщенный цвет уголков), не подобранный на глаз. Кнопка Dashboard —
+// единственное место в титлбаре, где приложение представляет само себя,
+// поэтому её палитра обязана совпадать с иконкой в доке.
+const APP_ICON_ORANGE = '#F09018';
+
+// Домик тем же контуром, что остальные иконки титлбара (lucide-геометрия:
+// сетка 24, штрих 2, скруглённые концы). Эмодзи 🏠 рендерился шрифтом системы:
+// он не наследовал цвет, игнорировал размер шрифта вкладок и выглядел
+// наклейкой рядом с векторными соседями.
+function AppHomeGlyph({ size = 13 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: 'block', flexShrink: 0 }}
+    >
+      <path d="M3 10.2 12 3l9 7.2" />
+      <path d="M5 9.6V20h14V9.6" />
+    </svg>
+  );
+}
 const draftScreenDiagnosticWaits = new Map<string, symbol>();
 type AgentRuntimeStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping' | 'unknown';
 
@@ -498,14 +528,6 @@ const ProjectTabItem = memo(({
 
   // Settings → Размеры → ТАБЫ → Проекты. Padding x/y чипа проекта в TitleBar.
   const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
-  // Boolean, not the id: subscribing to the id would re-render EVERY project
-  // card on every pulse (Fingerprint Pattern — a selector must answer this
-  // component's own question).
-  const projectCardPulseActive = useUIStore((s) => s.projectCardPulseId === projectId);
-  // Remount key: a second click while the flash is still running must replay it
-  // from the start. Re-keying the node is what does that — the store cannot
-  // "clear then set on the next frame", because a hidden window paints no frames.
-  const projectCardPulseSeq = useUIStore((s) => s.projectCardPulseSeq);
   // Is THIS project on screen (a pane shows one of its tabs) without being the
   // selected one? Computed inside the selector so what leaves the store is a
   // short string, never an array — a selector returning panes would re-render
@@ -513,10 +535,6 @@ const ProjectTabItem = memo(({
   const cardPresence = useWorkspaceStore((s) => projectCardPresence({
     projectId,
     focusedProjectId: s.focusedProjectId || s.activeProjectId,
-    // The ACTIVE tab's project — one tier above merely visible. Follows the
-    // active tab, not the keyboard owner: a click into the sidebar must not
-    // flicker the titlebar.
-    activeProjectId: s.activeProjectId,
     panes: s.splitPanes,
     centerProjectId: s.activeProjectId,
   }));
@@ -695,33 +713,13 @@ const ProjectTabItem = memo(({
           the user was working in it. A faint wash, because the card's edges are
           taken by the drop outline and the focus ring, and its inside by the
           completion flash, the awaiting pulse and the process counter. */}
-      {!isActive && (cardPresence === 'on-screen' || cardPresence === 'working') && (
+      {!isActive && cardPresence === 'on-screen' && (
         <div
           className="absolute inset-0 rounded-sm pointer-events-none"
           style={{
             background: PROJECT_CARD_ON_SCREEN_BG,
-            // 'working' — the ACTIVE tab belongs to this project: the wash gains
-            // a 1px contour, the same language as the pane frame (contour =
-            // "work happens here"). Deliberately NOT a brighter wash: two alphas
-            // a few percent apart cannot be told apart on a small card, while
-            // "has an edge" reads instantly. The focused white plate stays the
-            // loudest — a working card outshining it would read as "switching
-            // the tab switched the project".
-            boxShadow: cardPresence === 'working' ? PROJECT_CARD_WORKING_RING : undefined,
             zIndex: 6,
           }}
-          aria-hidden
-        />
-      )}
-      {/* One flash when the pane header chip pointed here and the sidebar was
-          already on this project — the click's only visible answer in that case.
-          Above the active-white background so it reads on both states, below the
-          z-10 label, and pointer-events-none so it never eats a click. */}
-      {projectCardPulseActive && (
-        <div
-          key={projectCardPulseSeq}
-          className="animate-project-card-pulse absolute inset-0 rounded-sm pointer-events-none"
-          style={{ zIndex: 7 }}
           aria-hidden
         />
       )}
@@ -5198,21 +5196,41 @@ function App() {
             </ControlHint>
           ) : (
             <ControlHint label={view === 'dashboard' ? 'Вернуться в рабочий проект' : 'Открыть Dashboard'} side="bottom">
+              {/* Цвета — из иконки приложения: чёрная подложка + оранжевый
+                  акцент. Активное состояние держит ту же пару, только меняет
+                  местами фон и передний план, поэтому «здесь» читается как
+                  контраст, а не как другая палитра. */}
               <button
                 data-workspace-navigation
                 data-project-navigation
-                className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
-                  view === 'dashboard'
-                    ? 'text-black'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-                style={{ fontSize: `${projectTabsFontSize}px` }}
+                className="relative px-2.5 py-1.5 cursor-pointer transition-colors"
+                style={{
+                  fontSize: `${projectTabsFontSize}px`,
+                  // Моноширинный — как в терминале: подпись Home и есть слово
+                  // с иконки приложения, а не обычный интерфейсный текст.
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  fontWeight: 700,
+                  letterSpacing: 0.2,
+                  color: view === 'dashboard' ? APP_ICON_ORANGE : '#8a8a8a',
+                }}
+                onMouseEnter={(e) => {
+                  if (view !== 'dashboard') e.currentTarget.style.color = APP_ICON_ORANGE;
+                }}
+                onMouseLeave={(e) => {
+                  if (view !== 'dashboard') e.currentTarget.style.color = '#8a8a8a';
+                }}
                 onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
               >
                 {view === 'dashboard' && (
-                  <div className="absolute inset-0 bg-white rounded" />
+                  <div
+                    className="absolute inset-0 rounded"
+                    style={{ backgroundColor: '#000', border: `1px solid ${APP_ICON_ORANGE}` }}
+                  />
                 )}
-                <span className="relative z-10">🏠</span>
+                <span className="relative z-10 inline-flex items-center gap-1.5">
+                  <AppHomeGlyph size={Math.round(projectTabsFontSize * 1.05)} />
+                  Home
+                </span>
               </button>
             </ControlHint>
           )}

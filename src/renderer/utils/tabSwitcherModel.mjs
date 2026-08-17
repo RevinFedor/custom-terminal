@@ -101,40 +101,25 @@ export function selectableIndices(rows) {
   return out;
 }
 
-// Initial highlight for ctrl-mode: the most recent tab that is NOT already on
-// screen — Ctrl+Tab exists to bring back what you cannot see. Fallback chain:
-// the most recent visible-but-not-focused tab (in a full split that is the only
-// meaningful target, and the gesture must not become a dead key), then any row
-// that is not the current tab, then the first selectable row.
+// Initial highlight for ctrl-mode: the PREVIOUS tab — the most recent history
+// entry that is not the active tab, visible in another pane or not.
 //
-// `onScreenTabIds` defaults to just the active tab, which is what single mode is:
-// callers in a split pass every pane's tab. Without that, the highlight landed on
-// the neighbouring pane's tab — i.e. offered to "switch to" something already
-// visible, while the hidden tab the user wanted sat further down the list.
-export function initialCtrlIndex(rows, globalMru, activeTabId, onScreenTabIds) {
+// A visible tab is a legal target now: picking it JUMPS focus to its pane
+// (switchTab's split rule), which is exactly the one-press undo of an
+// accidental click into the neighbouring pane. Visits are recorded only when a
+// tab APPEARS (tabVisitHistoryRule), so a focus move does not rewrite the
+// history — the A↔B toggle between two visible panes works in both directions
+// off the same list. The old "skip everything on screen" rule came from the
+// pane-scoped era, where a visible tab as a target meant a duplicate.
+export function initialCtrlIndex(rows, globalMru, activeTabId) {
   const byTabId = new Map();
   rows.forEach((row, i) => { if (row.kind === 'tab' && !row.missing) byTabId.set(row.tab.id, i); });
-  const onScreen = new Set(
-    Array.isArray(onScreenTabIds) && onScreenTabIds.length > 0
-      ? onScreenTabIds
-      : [activeTabId].filter(Boolean),
-  );
-  // Pass 1 — most recent tab that is not on screen at all.
-  for (const entry of globalMru) {
-    if (!entry || !entry.tabId || onScreen.has(entry.tabId)) continue;
-    const idx = byTabId.get(entry.tabId);
-    if (idx !== undefined) return idx;
-  }
-  // Pass 2 — everything visible (e.g. a two-pane split holding both tabs): the
-  // neighbouring pane is then the only place left to go.
   for (const entry of globalMru) {
     if (!entry || !entry.tabId || entry.tabId === activeTabId) continue;
     const idx = byTabId.get(entry.tabId);
     if (idx !== undefined) return idx;
   }
   const selectable = selectableIndices(rows);
-  const offScreen = selectable.find((i) => !onScreen.has(rows[i].tab.id));
-  if (offScreen !== undefined) return offScreen;
   const nonActive = selectable.find(i => rows[i].tab.id !== activeTabId);
   return nonActive !== undefined ? nonActive : (selectable[0] ?? -1);
 }

@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
-import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles, Settings2, Check, ListTree, ArrowRightLeft } from 'lucide-react';
+import { History, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles, Settings2, Check, ListTree, ArrowRightLeft } from 'lucide-react';
 import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
 import ControlHint from '../UI/ControlHint';
@@ -45,13 +45,6 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
   const [isResumingAll, setIsResumingAll] = useState(false);
   const focusedProjectId = useWorkspaceStore(selectFocusedProjectId);
   const centerProjectId = useWorkspaceStore((state) => state.activeProjectId);
-  // Ctrl+Tab is GLOBAL right now, and that is worth showing: with panes on
-  // screen the keyboard has left them (their frame just dimmed), so the signal
-  // moves to the global switcher's own button. Boolean selector — recomputes on
-  // every store write but only re-renders on an actual flip.
-  const switcherGlobalArmed = useWorkspaceStore((state) => (
-    state.splitPanes.length > 0 && !state.workspaceOwnsKeyboard
-  ));
   const currentView = useWorkspaceStore((state) => {
     const projectId = selectFocusedProjectId(state);
     if (!projectId) return 'terminal';
@@ -93,6 +86,17 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
     return state.openProjects.get(projectId)?.projectPath;
   });
   const currentProjectPath = currentProjectMetaPath || currentWorkspaceProjectPath;
+  // Working directory of the ACTIVE tab — what Git is about now. A string
+  // selector (Fingerprint Pattern): recomputes on every store write, re-renders
+  // only when the path actually changes.
+  const activeTabCwd = useWorkspaceStore((state) => {
+    const projectId = state.activeProjectId;
+    if (!projectId) return '';
+    const workspace = state.openProjects.get(projectId);
+    const tabId = state.getEffectiveTabId();
+    const tab = tabId && workspace ? workspace.tabs.get(tabId) : null;
+    return tab?.cwd || '';
+  });
   const centerProjectMetaPath = useProjectsStore((state) => (
     centerProjectId ? state.projects[centerProjectId]?.path : undefined
   ));
@@ -622,8 +626,10 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
         </ControlHint>
       )}
 
-      {/* Home Button */}
-      <ControlHint label={isHomeActive ? 'Вернуться в терминал' : 'Открыть Home проекта'}>
+      {/* History Button — открывает ProjectHome, а он показывает историю вкладок
+          проекта (закрытые сессии, поиск по ним, превью). Подпись «Home» была
+          про внутреннее имя вида, а не про то, что пользователь там находит. */}
+      <ControlHint label={isHomeActive ? 'Вернуться в терминал' : 'Открыть историю вкладок проекта'}>
       <button
         data-workspace-navigation
         onClick={() => focusedProjectId && setProjectView(focusedProjectId, isHomeActive ? 'terminal' : 'home')}
@@ -631,8 +637,8 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
         onMouseEnter={(e) => handleMouseEnter(e, isHomeActive)}
         onMouseLeave={(e) => handleMouseLeave(e, isHomeActive)}
       >
-        <Home size={14} />
-        <span>Home</span>
+        <History size={14} />
+        <span>History</span>
       </button>
       </ControlHint>
 
@@ -880,13 +886,10 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           up flush against the right-hand cluster instead of pushing it off. */}
       <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <Tooltip
-          content={switcherGlobalArmed
-            ? 'Ctrl+Tab сейчас глобальный — клавиатура вне панелей. Клик — список всех вкладок (⌘P)'
-            : 'Переключить вкладку — список всех вкладок с поиском (⌘P / Ctrl+Tab)'}
+          content="Переключить вкладку — список всех вкладок с поиском (⌘P / Ctrl+Tab)"
         >
           <button
             data-tab-switcher-toolbar-button
-            data-switcher-global-armed={switcherGlobalArmed ? '1' : undefined}
             onClick={openTabSwitcherPanel}
             style={{
               display: 'flex',
@@ -896,19 +899,9 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
               padding: '0 8px',
               marginRight: 10,
               borderRadius: 6,
-              // The OTHER END of the pane frame's dimming. When the keyboard
-              // leaves the panes (split active), the frame drops to its dim
-              // state and Ctrl+Tab becomes global — so the signal moves HERE:
-              // the global switcher's own button brightens. One condition, two
-              // ends, and the eye is led from the pane to where the gesture now
-              // points. Brightness only, same language as the frame; deliberately
-              // silent in single mode, where Ctrl+Tab is always global and a
-              // standing highlight would carry no information.
-              border: switcherGlobalArmed
-                ? '1px solid rgba(255,255,255,0.45)'
-                : '1px solid rgba(255,255,255,0.10)',
-              background: switcherGlobalArmed ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.04)',
-              color: switcherGlobalArmed ? '#e4e4e7' : '#9a9aa0',
+              border: '1px solid rgba(255,255,255,0.10)',
+              background: 'rgba(255,255,255,0.04)',
+              color: '#9a9aa0',
               fontSize: 11,
               fontWeight: 600,
               whiteSpace: 'nowrap',
@@ -921,10 +914,8 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
               (e.currentTarget as HTMLElement).style.color = '#e4e4e7';
             }}
             onMouseLeave={(e) => {
-              (e.currentTarget as HTMLElement).style.background = switcherGlobalArmed
-                ? 'rgba(255,255,255,0.10)'
-                : 'rgba(255,255,255,0.04)';
-              (e.currentTarget as HTMLElement).style.color = switcherGlobalArmed ? '#e4e4e7' : '#9a9aa0';
+              (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)';
+              (e.currentTarget as HTMLElement).style.color = '#9a9aa0';
             }}
           >
             <ArrowRightLeft size={12} />
@@ -1015,12 +1006,19 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
         <CopySessionWithChips />
       </div>
 
-      {!isSystemProject && currentProjectPath && (
+      {/* Git follows the ACTIVE TAB's directory (2026-08-17): the directory
+          belongs to the tab, so a tab sitting in a worktree must show ITS
+          branch. `projectPath` stays the PROJECT's — it identifies the panel's
+          saved state and the repository list; `tabCwd` is what the status is
+          about. Passing the tab's path as projectPath instead would re-key the
+          panel on every tab switch and wipe a half-typed commit message. */}
+      {!isSystemProject && (activeTabCwd || currentProjectPath) && (
         <div className="flex items-stretch h-full">
           <GitStatusButton
             projectId={focusedProjectId}
             projectName={currentProjectName}
             projectPath={currentProjectPath}
+            tabCwd={activeTabCwd}
           />
         </div>
       )}

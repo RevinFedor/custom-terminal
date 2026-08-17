@@ -1,6 +1,10 @@
-// Первый клик по невыбранной панели — контракты, которых чистое правило не
-// видит: КОГДА он гасится, ГДЕ показывается предупреждение и что жест не
-// остаётся взведённым.
+// Клик по невыбранной панели: он ФОКУСИРУЕТ её и при этом доходит до цели.
+//
+// Раньше первый клик по невыбранной панели гасился (чтобы случайное попадание
+// не раскрыло блок размышлений). Правило снято по запросу 2026-08-17: на
+// практике оно читалось как мёртвый клик, а случайное раскрытие отменить
+// дешевле, чем клик, который ничего не сделал. Тест держит противоположный
+// контракт — гашения нет ни в каком виде.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -21,45 +25,36 @@ function block(source, start, end) {
   return source.slice(from, to);
 }
 
-const guard = block(
+const paneFocus = block(
   terminalArea,
-  'const swallowNextClickRef = useRef(false);',
-  '\n  useEffect(() => {\n    if (focusedEmptyPaneIndex < 0) return;',
+  'const onPointerDown = (e: PointerEvent) => {',
+  '\n    };',
 );
 
-test('гасится и `click`, а не только `pointerdown`', () => {
-  // Раскрытие блоков (размышления, bash) висит на click, а click — ОТДЕЛЬНОЕ
-  // событие: остановка pointerdown его не отменяет. Гашение только pointerdown
-  // выглядело бы как фикс, пока каждая карточка продолжала раскрываться.
-  assert.match(guard, /swallowNextClickRef\.current = true/);
-  assert.match(guard, /addEventListener\('click', swallowIfArmed, true\)/);
-  // …и в фазе ПЕРЕХВАТА, до обработчиков транскрипта.
-  const clickAt = guard.indexOf("addEventListener('click', swallowIfArmed, true)");
-  assert.ok(clickAt > 0, 'click listener must be registered in capture phase');
+test('клик по панели только переводит фокус и никого не глотает', () => {
+  assert.match(paneFocus, /st\.focusSplitPane\(idx\)/);
+  assert.doesNotMatch(paneFocus, /stopPropagation/);
+  assert.doesNotMatch(paneFocus, /preventDefault/);
+  // Ни следа старого механизма во всём файле.
+  assert.doesNotMatch(terminalArea, /swallowNextClickRef/);
+  assert.doesNotMatch(terminalArea, /shouldSwallowFirstPaneClick/);
 });
 
-test('взведённый жест снимается, если клика так и не было', () => {
-  // Иначе гашение «доживёт» до следующего, ни в чём не виноватого клика и
-  // будет выглядеть случайным мёртвым кликом минутами позже.
-  assert.match(guard, /const disarm = \(\)/);
-  assert.match(guard, /addEventListener\('pointercancel', disarm, true\)/);
-  assert.match(guard, /addEventListener\('blur', disarm\)/);
-  // И всё снимается при размонтировании.
-  const cleanup = block(guard, 'return () => {', '\n  }, [splitPaneCount]);');
-  assert.match(cleanup, /removeEventListener\('click', swallowIfArmed, true\)/);
-  assert.match(cleanup, /swallowNextClickRef\.current = false/);
+test('правая и средняя кнопки по-прежнему не двигают фокус', () => {
+  // ПКМ открывает меню О чём-то, средняя — убирает; ни то ни другое не
+  // означает «хочу работать здесь», и увод фокуса вытаскивал поверхность
+  // из-под только что открытого меню.
+  assert.match(paneFocus, /if \(e\.button !== 0\) return;/);
 });
 
-test('решение принимает чистое правило, а не сам обработчик', () => {
-  assert.match(guard, /shouldSwallowFirstPaneClick\(\{/);
-  assert.match(guard, /paneIndex: idx/);
-  assert.match(guard, /focusedIndex: st\.splitFocusedIndex/);
-  // Панель всё равно получает фокус — жест обязан что-то делать.
-  assert.match(guard, /st\.focusSplitPane\(idx\)/);
+test('клик, закрывающий меню, не достаётся панели', () => {
+  const guardAt = paneFocus.indexOf('notePointerDownForDismissal(document)');
+  const focusAt = paneFocus.indexOf('focusSplitPane(idx)');
+  assert.ok(guardAt >= 0, 'expected the dismissal guard');
+  assert.ok(focusAt > guardAt, 'the guard must run BEFORE focus moves');
 });
 
-test('наведение подсвечивает панель заранее — и только невыбранную', () => {
-  // Предупреждение должно быть ДО клика, иначе гашение читается как поломка.
+test('наведение подсвечивает невыбранную панель — рамкой из CSS, не из состояния', () => {
   assert.match(globalsCss, /\[data-terminal-pane-wrapper\]\[data-split-pane-index\]:hover/);
   assert.match(globalsCss, /\[data-split-pane-focus-frame="0"\]\[data-split-pane-frame-state="idle"\]/);
   // CSS, а не состояние React: панель держит терминал и транскрипт, и

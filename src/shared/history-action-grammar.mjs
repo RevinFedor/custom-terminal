@@ -28,15 +28,16 @@ export const BASH_SEARCH_WORDS = new Set([
 export function effectiveBashWord(command) {
   const text = typeof command === 'string' ? command : '';
   if (!text.trim()) return '';
-  let line = '';
+  // ALL lines, not just the first: a command that leads with an
+  // assignment-only line (`F=/path/to.jsonl⏎node -e '…'`) has its real word
+  // on line two — stopping at line one classified it as a wordless run with
+  // an empty header (corpus audit).
+  const segments = [];
   for (const candidate of text.split('\n')) {
     const trimmed = candidate.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
-    line = trimmed;
-    break;
+    segments.push(...trimmed.split(/&&|;/));
   }
-  if (!line) return '';
-  const segments = line.split(/&&|;/);
   for (let raw of segments) {
     let segment = raw.trim();
     if (!segment) continue;
@@ -114,6 +115,11 @@ export function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } =
     case 'Edit':
     case 'Write':
     case 'MultiEdit':
+    // A patch that never applied (Codex: the script building it crashed).
+    // It touched no file, so it must not claim one — but it IS an attempt to
+    // change files, and leaving it in `other` kept it out of every block, so
+    // one failed attempt stood alone between two edit groups.
+    case 'Patch':
       return { family: 'edit' };
     case 'MCP':
       return { family: 'mcp', mcpServer: 'mcp', mcpMethod: '' };
@@ -126,6 +132,11 @@ export function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } =
     case 'WebSearch':
     case 'WebFetch':
       return { family: 'web' };
+    case 'Script':
+      // A JS snippet Codex ran in its own sandbox with no tool inside it.
+      // It is a run: same class as shell commands, so it never splits the
+      // group it sits in (as its own family it used to cut noise runs in two).
+      return { family: 'run' };
     case 'Tool Search':
     case 'ToolSearch':
       // Codex's "look what tools exist" — the emptiest noise there is: the
@@ -172,6 +183,72 @@ export const HISTORY_CAPTION_MAX_CHARS = 600;
 
 const SHELL_OPTION = /^-/;
 
+/**
+ * Search options that CONSUME the next token as their value.
+ *
+ * grep/rg spell context, limits and globs as «flag value» pairs, so a naive
+ * "drop tokens starting with -" leaves the VALUE standing where the pattern
+ * should be. Short forms are matched per letter (`-nA` bundles `-n` and `-A`,
+ * and the bundle still eats one value), long forms by name.
+ */
+const SEARCH_VALUE_FLAGS_SHORT = new Set(['A', 'B', 'C', 'm', 'e', 'f', 'g', 'd', 't', 'T']);
+const SEARCH_VALUE_FLAGS_LONG = new Set([
+  'after-context', 'before-context', 'context', 'max-count', 'regexp', 'file',
+  'glob', 'iglob', 'type', 'type-not', 'type-add', 'max-depth', 'maxdepth',
+  'threads', 'include', 'exclude', 'exclude-dir', 'color', 'colour', 'replace',
+  'sort', 'sortr', 'pre', 'path-separator', 'max-filesize', 'ignore-file',
+]);
+
+/**
+ * Split a search command's arguments into what the user SEARCHED FOR and the
+ * noise around it.
+ *
+ * Returns `positional` (option values removed) and `flagPattern` — the pattern
+ * given explicitly via `-e`/`--regexp`, which outranks position because that
+ * is exactly what those flags mean.
+ */
+function splitSearchArguments(tokens) {
+  const positional = [];
+  let flagPattern = '';
+  let endOfOptions = false;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = String(tokens[i] || '');
+    if (endOfOptions || !SHELL_OPTION.test(token) || token === '-') {
+      positional.push(token);
+      continue;
+    }
+    if (token === '--') { endOfOptions = true; continue; }
+    if (token.startsWith('--')) {
+      const eq = token.indexOf('=');
+      const name = (eq >= 0 ? token.slice(2, eq) : token.slice(2)).toLowerCase();
+      const inlineValue = eq >= 0 ? token.slice(eq + 1) : null;
+      if (!SEARCH_VALUE_FLAGS_LONG.has(name)) continue;
+      // `--regexp=x` / `--regexp x` — the pattern, stated outright.
+      const value = inlineValue !== null ? inlineValue : (i + 1 < tokens.length ? tokens[i += 1] : '');
+      if ((name === 'regexp' || name === 'file') && !flagPattern && value) flagPattern = value;
+      continue;
+    }
+    // Short bundle: `-nA`, `-rn`, `-m2` (value glued on).
+    const letters = token.slice(1);
+    let consumes = '';
+    for (let k = 0; k < letters.length; k += 1) {
+      const letter = letters[k];
+      if (!SEARCH_VALUE_FLAGS_SHORT.has(letter)) continue;
+      consumes = letter;
+      const glued = letters.slice(k + 1);
+      if (glued) {
+        if ((letter === 'e' || letter === 'f') && !flagPattern) flagPattern = glued;
+        consumes = '';                       // value came glued — nothing to eat
+      }
+      break;
+    }
+    if (!consumes) continue;
+    const value = i + 1 < tokens.length ? tokens[i += 1] : '';
+    if ((consumes === 'e' || consumes === 'f') && !flagPattern && value) flagPattern = value;
+  }
+  return { positional, flagPattern };
+}
+
 function unquoteToken(token) {
   const text = String(token || '');
   if (text.length >= 2) {
@@ -184,14 +261,35 @@ function unquoteToken(token) {
   return text;
 }
 
+/**
+ * Shell-ish tokenizer: whitespace splits OUTSIDE quotes, quotes are stripped
+ * and their content — spaces included — stays inside one token. The previous
+ * regex only recognised a quote at a token's START, so `DB="$HOME/App
+ * Support/x.db"` broke at the inner space and the header showed the torn tail
+ * (`noted-terminal-dev.db"` — corpus audit).
+ */
 export function tokenizeCommand(command) {
   const text = String(command || '');
   const out = [];
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let match;
-  while ((match = re.exec(text)) !== null) {
-    out.push(match[1] !== undefined ? match[1] : match[2] !== undefined ? match[2] : match[3]);
+  let current = '';
+  let started = false;
+  let quote = '';
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\' && quote === '"' && i + 1 < text.length) { current += text[i + 1]; i += 1; continue; }
+      if (ch === quote) { quote = ''; continue; }
+      current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; started = true; continue; }
+    if (/\s/.test(ch)) {
+      if (started || current) { out.push(current); current = ''; started = false; }
+      continue;
+    }
+    current += ch;
   }
+  if (started || current) out.push(current);
   return out;
 }
 
@@ -220,26 +318,153 @@ function extractLineRange(word, tokens) {
   return '';
 }
 
+/**
+ * First shell stage of a command — split on `|`, `&&`, `;` that are NOT inside
+ * quotes.
+ *
+ * A naive `.split(/\||&&|;/)` cuts inside quoted arguments, and one very
+ * common tool carries those characters as DATA: a jq program is one quoted
+ * string full of pipes (`jq '.trace | keys, {n:(.e|length)}' file.json`).
+ * Cutting at the first inner pipe left the stage as `jq '.trace ` — no path
+ * in it — so the header had no subject and the card fell back to printing the
+ * whole raw command in grey (user: «серый непонятный текст вместо имени
+ * файла»).
+ */
+export function firstShellStage(command) {
+  const text = String(command || '');
+  let quote = '';
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\' && quote !== "'") { i += 1; continue; }
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+    if (ch === '\\') { i += 1; continue; }
+    if (ch === ';') return text.slice(0, i);
+    if (ch === '|') {
+      // `||` is a separator too — both halves are stages.
+      return text.slice(0, i);
+    }
+    if (ch === '&' && text[i + 1] === '&') return text.slice(0, i);
+  }
+  return text;
+}
+
+/**
+ * Quote-aware split of a command into its shell stages (`|`, `&&`, `;`,
+ * newlines). Separators inside quotes are data — same rule as
+ * firstShellStage, applied to the WHOLE command.
+ */
+function splitShellStages(command) {
+  const text = String(command || '');
+  const stages = [];
+  let start = 0;
+  let quote = '';
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\' && quote !== "'") { i += 1; continue; }
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+    if (ch === '\\') { i += 1; continue; }
+    if (ch === ';' || ch === '\n' || ch === '|' || (ch === '&' && text[i + 1] === '&')) {
+      stages.push(text.slice(start, i));
+      if (ch === '&') i += 1;
+      start = i + 1;
+    }
+  }
+  stages.push(text.slice(start));
+  return stages.map((stage) => stage.trim()).filter(Boolean);
+}
+
 export function extractBashSubject(command, family, word) {
   const text = String(command || '');
   if (!text.trim()) return { subject: '', detail: '' };
-  const firstSegment = text.split(/\||&&|;/)[0] || text;
-  const tokens = tokenizeCommand(firstSegment).map(unquoteToken);
+  // The subject lives in the stage the WORD came from — never blindly in
+  // stage one. The classifier walks past wrapper stages to find the acting
+  // word (`P=file; echo "…"; awk '…' $P | head` classifies as awk), but the
+  // extractor used to read stage one regardless, which there is the variable
+  // assignment: no subject, and the card fell back to printing the whole raw
+  // pipeline in dim grey (live screenshot, five awk walls in a row).
+  //
+  // Assignments passed on the way are collected so a `$VAR` argument can be
+  // resolved to the value it names — `P=~/…/production.log; awk '…' $P` is
+  // the model's own shorthand for a long path, and the header exists to show
+  // exactly that path.
+  const stages = splitShellStages(text);
+  const assignments = new Map();
+  let stage = null;
+  for (const candidate of stages) {
+    let lead = '';
+    for (const token of tokenizeCommand(candidate)) {
+      const assign = token.match(/^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/);
+      if (assign) {
+        if (stage === null) assignments.set(assign[1], unquoteToken(assign[2]));
+        continue;
+      }
+      lead = (unquoteToken(token).split('/').pop() || '').toLowerCase();
+      break;
+    }
+    if (stage === null && word && lead === word) stage = candidate;
+  }
+  if (stage === null) stage = stages[0] || text;
+  // A `$VAR` argument resolves through three doors, best first: a value
+  // assigned earlier in this same command; `$HOME` (its meaning is fixed —
+  // `~` is the standard display for it); any other unknown variable keeps its
+  // `$` — corpus audit: `$SP/map-body.txt` with no assignment in sight, and
+  // inventing a value would be a lie. Substitution is INSIDE the token, not
+  // whole-token: real commands write `"$D/agent.meta.json"`. Depth-limited
+  // recursion, because assignment VALUES are themselves shell text —
+  // `LOG="$HOME/…/production.log"` needs the inner `$HOME` resolved too
+  // (corpus audit: one substitution pass left `$HOME/…` on the header).
+  const substituteVars = (value, depth = 0) => String(value).replace(
+    /\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g,
+    (whole, name) => {
+      if (depth < 3 && assignments.has(name)) return substituteVars(assignments.get(name), depth + 1);
+      if (name === 'HOME') return '~';
+      return whole;
+    },
+  );
+  const tokens = tokenizeCommand(stage).map((token) => substituteVars(unquoteToken(token)));
   const detail = family === 'read' ? extractLineRange(word, tokens) : '';
   if (family === 'git') {
     const path = tokens.slice(2).find((token) => looksLikePath(token) && token !== '--');
     return { subject: path || '', detail: '' };
   }
   if (family === 'search') {
-    const args = tokens.slice(1).filter((token) => !SHELL_OPTION.test(token));
-    const pattern = args.find((token) => !looksLikePath(token)) || '';
-    const scope = args.find((token) => looksLikePath(token)) || '';
+    // The pattern is POSITIONAL: grep/rg take it as the first non-flag
+    // argument. Guessing it as "the first token that does not look like a
+    // path" broke the common case of searching for a file NAME
+    // (`grep "grammar.cjs" src/`): the pattern itself looks like a path, so
+    // nothing qualified and the header came out empty (corpus audit).
+    //
+    // But an option's VALUE is not a positional argument. Dropping only the
+    // tokens that start with `-` left `8` from `grep -A 8 "real" file`
+    // standing first, so the context SIZE became "the pattern" and the row
+    // read «Search 8 · file» — 47 rows in the corpus (1.3% of searches), and
+    // worse, two different searches of one file rendered as the same row
+    // («нахуй мне search дублировать, если они идут для одного и того же
+    // файла»). So options are consumed WITH their value.
+    const { positional, flagPattern } = splitSearchArguments(tokens.slice(1));
+    const pattern = flagPattern || positional[0] || '';
+    const scope = (flagPattern ? positional : positional.slice(1))
+      .find((token) => looksLikePath(token)) || '';
     if (word === 'ls' || word === 'find' || word === 'tree' || word === 'fd') {
-      return { subject: scope || pattern, detail: '' };
+      return { subject: positional.find((token) => looksLikePath(token)) || pattern, detail: '' };
     }
     return { subject: pattern, detail: scope };
   }
+  // Read subject must BE a path. The old fallback took the last argument even
+  // when nothing looked like one, which put a jq PROGRAM on the header
+  // (`{incidentId:.incident…}`, `"INCIDENT "+.id`) — corpus audit found 13
+  // such rows. A read of an unnamed stream has no subject; an empty subject
+  // at least falls back honestly.
   const path = tokens.slice(1).reverse().find(looksLikePath) || '';
+  if (family === 'read' && path && /[|;{}()+]/.test(path)) return { subject: '', detail };
   return { subject: path, detail };
 }
 
@@ -247,12 +472,26 @@ export function extractBashSubject(command, family, word) {
 function shortRunSubject(command, word) {
   const text = String(command || '').trim();
   if (!text) return '';
-  const firstLine = text.split('\n').find((line) => line.trim() && !line.trim().startsWith('#')) || text;
-  const firstSegment = firstLine.split(/\||&&|;/)[0].trim();
-  const tokens = tokenizeCommand(firstSegment);
+  // The subject comes from the first stage that CONTAINS a program — not from
+  // stage one unconditionally. `F=/path.jsonl⏎node -e '…'` opens with an
+  // assignment-only stage; reading only it produced an empty headline
+  // (corpus audit) and the card printed the raw command instead.
+  let tokens = [];
   let start = 0;
-  while (start < tokens.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[start]) || tokens[start] === 'cd')) {
-    start += 1;
+  for (const stage of splitShellStages(text)) {
+    if (stage.trim().startsWith('#')) continue;
+    const candidate = tokenizeCommand(stage)
+      // A subshell paren is invocation plumbing, not part of any word —
+      // unstripped it glued onto the program name («(NOTED_WEB_PORT=1 npx…»,
+      // corpus audit) and dragged the assignment into the headline with it.
+      .map((token) => String(token).replace(/^\(+/, ''))
+      .filter(Boolean);
+    let lead = 0;
+    while (lead < candidate.length
+      && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(candidate[lead]) || candidate[lead] === 'cd')) {
+      lead += 1;
+    }
+    if (lead < candidate.length) { tokens = candidate; start = lead; break; }
   }
   const program = tokens[start] ? unquoteToken(tokens[start]).split('/').pop() : (word || '');
   if (!program) return '';
@@ -280,6 +519,15 @@ export function historyActionHeadline({ toolName, args, family, bashWord, bashDe
       detail = limit > 0 ? args.offset + '–' + (args.offset + limit) : 'from ' + args.offset;
     }
     return { verb: 'Read', subject: String(path), detail };
+  }
+  if (name === 'Patch') {
+    // Attempted, not done — the one edit-family row that must NOT read «Edit».
+    return { verb: 'Patch', subject: String(args?.summary || 'not applied'), detail: '' };
+  }
+  if (name === 'Script') {
+    // JS, not a shell line: reading it with the shell rules printed its first
+    // two tokens («Run const example»). The source belongs to the body.
+    return { verb: 'Run', subject: 'script', detail: '' };
   }
   if (name === 'Edit' || name === 'Write' || name === 'MultiEdit' || name === 'Update' || fam === 'edit') {
     const path = args?.file_path || args?.path || '';
@@ -309,4 +557,89 @@ export function historyActionHeadline({ toolName, args, family, bashWord, bashDe
     return { verb: 'Run', subject: shortRunSubject(command, word), detail: '' };
   }
   return { verb: name || 'Tool', subject: '', detail: '' };
+}
+
+/** Stable target/scope identity for presentation grouping.
+ *
+ * The headline answers WHAT to print; this metadata answers WHICH repeated
+ * calls touch the same thing. A read's line window and a search's pattern are
+ * operation detail, not the target identity: two windows of `main.js` are one
+ * file, two patterns scoped to `main.js` are one searchable target. Kept in
+ * the shared CJS/ESM grammar so full renderer rows and main-made stubs cannot
+ * disagree as hydration moves.
+ */
+export function historyActionPresentationMeta({ toolName, args, family, bashWord, bashDetail, mcpServer, mcpMethod } = {}) {
+  const name = String(toolName || '');
+  const classified = classifyHistoryAction({ toolName: name, args, mcpServer, mcpMethod });
+  const fam = String(family || classified.family || 'other');
+  const server = String(mcpServer || classified.mcpServer || '');
+  const method = String(mcpMethod || classified.mcpMethod || '');
+  const headline = historyActionHeadline({
+    toolName: name,
+    args,
+    family: fam,
+    bashWord: bashWord || classified.bashWord,
+    bashDetail: bashDetail || classified.bashDetail,
+    mcpServer: server,
+    mcpMethod: method,
+  });
+  const normalizeTarget = (value) => String(value || '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/{2,}/g, '/');
+  const shortTarget = (value) => {
+    const text = normalizeTarget(value);
+    if (!text) return '';
+    if (text.includes('/')) {
+      const parts = text.split('/').filter(Boolean);
+      return parts[parts.length - 1] || text;
+    }
+    return text;
+  };
+  const docsTarget = (value) => {
+    const text = normalizeTarget(value);
+    if (!text) return false;
+    const parts = text.split('/').filter(Boolean);
+    const base = parts[parts.length - 1] || '';
+    return base === 'CLAUDE.md' || parts.some((part) => part.toLowerCase() === 'docs');
+  };
+
+  let targetSource = '';
+  let targetLabel = '';
+  let operationLabel = String(headline.subject || '');
+  if (fam === 'mcp') {
+    targetSource = server || 'mcp';
+    targetLabel = (method || server || 'mcp').replace(/_/g, ' ');
+    operationLabel = targetLabel;
+  } else if (fam === 'search') {
+    // A scoped search groups by the file/directory, while its pattern stays
+    // available as operationLabel for the expanded original calls.
+    targetSource = String(headline.detail || headline.subject || '');
+    targetLabel = shortTarget(targetSource);
+  } else {
+    targetSource = String(headline.subject || '');
+    targetLabel = shortTarget(targetSource);
+  }
+  const targetKey = normalizeTarget(targetSource);
+  const isKnowledgeSearch = fam === 'mcp'
+    && server.toLowerCase() === 'knowledge'
+    && method.toLowerCase().replace(/\s+/g, '_') === 'docs_search';
+  const docsKind = isKnowledgeSearch
+    ? 'search'
+    : docsTarget(targetKey)
+      ? (fam === 'edit' ? 'edit' : (fam === 'read' || fam === 'search' ? 'search' : ''))
+      : '';
+  const scope = docsKind ? 'docs' : 'regular';
+  const aggregateKey = fam === 'mcp'
+    ? `mcp:${server || 'mcp'}:${scope}`
+    : `${fam}:${scope}`;
+  return {
+    aggregateKey,
+    targetKey,
+    targetLabel,
+    operationLabel,
+    docsKind,
+  };
 }

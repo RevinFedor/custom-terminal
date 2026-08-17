@@ -25,6 +25,7 @@
 import React, { useEffect, useState } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -116,6 +117,14 @@ export function TabProcessBar({
  * Live process / AI-busy signals for ONE tab, read from the same broadcasts the
  * sidebar list consumes.
  *
+ * THREE signals, not two. The third — "this tab is waiting for a delegated
+ * session it started" — used to be missing here, so every surface built on this
+ * hook (the pane header chip, the pane's recent-tabs list) drew an idle tab
+ * while the sidebar card drew the purple waiting strip for the SAME tab at the
+ * SAME moment. The sidebar was not more correct, only better wired: it asked
+ * the orchestration store itself. Asking it once, here, is what keeps the
+ * surfaces from disagreeing again — the whole reason this file exists.
+ *
  * Subscribed per surface rather than threaded down as props: the pane header is
  * rendered from three call sites, and a prop chain left some of them silently
  * without a loader.
@@ -135,8 +144,16 @@ export function TabProcessBar({
  *     on screen (store.setAiBusy).
  * After that, transitions keep both up to date as before.
  */
-export function useTabActivitySignals(tabId: string): { hasProcess: boolean; busy: boolean } {
+export function useTabActivitySignals(tabId: string): {
+  hasProcess: boolean;
+  busy: boolean;
+  inheritedBusy: boolean;
+} {
   const [hasProcess, setHasProcess] = useState(false);
+  // Waiting for a delegated session. Same source and same precedence as the
+  // sidebar card: a tab answering itself shows its OWN colour, so the two
+  // states never paint over each other.
+  const orchestrationBusy = useOrchestrationStore((s) => s.inheritedBusyTabIds.has(tabId));
   // Seed from the durable per-tab flag, then follow the live edges. Subscribing
   // to the store here (instead of reading it once) also covers the tabs whose
   // busy state arrives through a channel this hook does not listen to — SDK
@@ -186,7 +203,7 @@ export function useTabActivitySignals(tabId: string): { hasProcess: boolean; bus
     };
   }, [tabId]);
 
-  return { hasProcess, busy };
+  return { hasProcess, busy, inheritedBusy: orchestrationBusy && !busy };
 }
 
 // Task squares along the card's bottom seam. Geometry is shared so the pane

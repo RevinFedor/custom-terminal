@@ -494,9 +494,17 @@ function decodeSimpleJsStringToken(source, start = 0) {
   const quote = source[index];
   if (quote !== '"' && quote !== "'" && quote !== '`') return null;
   let value = '';
+  // A backtick string with `${…}` in it is a TEMPLATE: its real value exists
+  // only at runtime. Reading it as a finished literal is what put `${file}`
+  // and `${content.split("` on screen as a file name and a diff — the parser
+  // handed the source of the value to a card that promised the value itself.
+  // Refusing it here lets the caller fall back to the authoritative
+  // patch-apply event, which names the files that actually changed.
+  let template = false;
   for (index += 1; index < source.length; index += 1) {
     const ch = source[index];
-    if (ch === quote) return { value, end: index + 1 };
+    if (ch === quote) return (quote === '`' && template) ? null : { value, end: index + 1 };
+    if (quote === '`' && ch === '$' && source[index + 1] === '{') template = true;
     if (ch !== '\\') {
       value += ch;
       continue;
@@ -924,19 +932,27 @@ function parseCodexPatchApplyChanges(payload) {
       continue;
     }
     if (changeType === 'delete') {
-      if (typeof change.content !== 'string') return null;
+      // Real rollouts often omit `content` on deletes (only the fact of the
+      // deletion is recorded). That is still an authoritative edit action —
+      // demanding content here used to void the WHOLE event, which left
+      // computed-patch calls rendering as the junk «Edit (patch)».
+      const content = typeof change.content === 'string' ? change.content : '';
       actions.push({
         toolName: 'Edit',
         args: {
           file_path: filePath,
-          old_string: change.content,
+          old_string: content,
           new_string: '',
         },
-        diffHunks: [{
-          oldStart: 1,
-          newStart: 0,
-          entries: change.content.split('\n').map((line) => ({ tag: 'del', line })),
-        }],
+        ...(content
+          ? {
+            diffHunks: [{
+              oldStart: 1,
+              newStart: 0,
+              entries: content.split('\n').map((line) => ({ tag: 'del', line })),
+            }],
+          }
+          : {}),
       });
       continue;
     }
@@ -995,6 +1011,17 @@ function attachCodexPatchApplyEvent(pendingCalls, payload, cwd) {
     direct.patchApplyEvents.push(payload);
     return true;
   }
+  // The event's call_id names the EXEC call itself when apply_patch ran
+  // nested inside `tools.exec(...)`. With a computed patch text the path
+  // comparison below has nothing to compare (the literal parser cannot
+  // resolve `const patch = header + files.map(...)`), so the same-call_id
+  // exec that visibly invokes tools.apply_patch is the authoritative owner.
+  if (direct?.toolName === 'exec'
+      && typeof direct?.args?.input === 'string'
+      && direct.args.input.includes('apply_patch')) {
+    direct.patchApplyEvents.push(payload);
+    return true;
+  }
 
   const eventPaths = codexPatchEventPathSet(payload, cwd);
   if (!eventPaths) return false;
@@ -1008,8 +1035,42 @@ function attachCodexPatchApplyEvent(pendingCalls, payload, cwd) {
     ));
     if (matches) candidates.push(call);
   }
-  if (candidates.length !== 1) return false;
-  candidates[0].patchApplyEvents.push(payload);
+  if (candidates.length === 1) {
+    candidates[0].patchApplyEvents.push(payload);
+    return true;
+  }
+  if (candidates.length > 1) return false;
+
+  // Last resort — ORDER, because identity is not available at all.
+  //
+  // The event names itself `exec-<uuid>`, which is a DIFFERENT id space from
+  // the call's `call_<id>`: measured over 40 rollouts, 1540 of 1540 events
+  // failed the direct id lookup. Path comparison rescues only literal
+  // patches; every computed one (`const patch = "…" + files.map(…)`, a
+  // template literal with `${file}`) has no text to compare, which is exactly
+  // why those cards printed the placeholder subject `(patch)` / `${file}`
+  // instead of the files that changed.
+  //
+  // What IS reliable is the protocol's own sequencing: Codex emits the event
+  // while the call is still open (verified: 27/27 events arrive before their
+  // call's output) and never runs two patch calls concurrently — across the
+  // same 40 rollouts, 1531 of 1540 events had EXACTLY ONE open apply_patch
+  // call and not one had two. So when precisely one open call invokes
+  // apply_patch, it is the owner. Two open candidates is ambiguous and the
+  // event is dropped rather than guessed: a wrong attachment would print
+  // someone else's files.
+  const open = [];
+  for (const call of pendingCalls.values()) {
+    if (eventTurnId && call.turnId && eventTurnId !== call.turnId) continue;
+    if (call.toolName === 'apply_patch') { open.push(call); continue; }
+    if (call.toolName === 'exec'
+        && typeof call?.args?.input === 'string'
+        && call.args.input.includes('apply_patch')) {
+      open.push(call);
+    }
+  }
+  if (open.length !== 1) return false;
+  open[0].patchApplyEvents.push(payload);
   return true;
 }
 
@@ -1061,7 +1122,13 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
   if (qualifiedName === 'apply_patch') {
     const patchText = typeof input.input === 'string' ? input.input : '';
     const actions = parseApplyPatchHistoryActions(patchText);
-    return actions.length > 0 ? actions : [{ toolName: 'Edit', args: { file_path: '(patch)' } }];
+    if (actions.length > 0) return actions;
+    // No readable patch and no authoritative apply event (the caller tries
+    // that first). Verified cause in production: the script that was to BUILD
+    // the patch crashed, so nothing was ever applied. Claiming «Edit» here
+    // painted a failed run as a successful file change — the row now says a
+    // patch was attempted and names no file it did not touch.
+    return [{ toolName: 'Patch', args: { summary: 'Patch not applied' } }];
   }
   if (qualifiedName === 'exec_command' || qualifiedName === 'run_command' || qualifiedName === 'restart_process' || qualifiedName === 'kill_process' || qualifiedName === 'run_chain') {
     let command = input.cmd || input.command || input.input || '';
@@ -1192,16 +1259,47 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
       const args = parsed && typeof parsed === 'object'
         ? parsed
         : (typeof parsed === 'string' ? { input: parsed } : { input: compactPreview(nestedCall.argumentsText, 1000) });
-      const canonicalPatchActions = nestedCall.toolName === 'apply_patch' && typeof parsed === 'string'
-        ? takeCanonicalCodexPatchActions(call, parsed, usedPatchEventIndexes)
-        : null;
+      let canonicalPatchActions = null;
+      if (nestedCall.toolName === 'apply_patch') {
+        if (typeof parsed === 'string') {
+          canonicalPatchActions = takeCanonicalCodexPatchActions(call, parsed, usedPatchEventIndexes);
+        }
+        // Computed patch text (`const patch = header + files.map(...)`):
+        // the literal parser cannot resolve it, which used to leave the
+        // junk «Edit (patch)» card. The patch_apply_end event on this SAME
+        // call_id carries the authoritative per-file changes — when exactly
+        // one unclaimed event exists, its actions are the truth.
+        if (!canonicalPatchActions) {
+          const events = Array.isArray(call?.patchApplyEvents) ? call.patchApplyEvents : [];
+          const free = [];
+          for (let index = 0; index < events.length; index += 1) {
+            if (usedPatchEventIndexes.has(index)) continue;
+            const actions = parseCodexPatchApplyChanges(events[index]);
+            if (actions) free.push({ index, actions });
+          }
+          if (free.length === 1) {
+            usedPatchEventIndexes.add(free[0].index);
+            canonicalPatchActions = free[0].actions;
+          }
+        }
+      }
       callGroups.push(canonicalPatchActions || normalizeCodexHistoryCall(nestedCall.toolName, args));
     }
   } else if (call?.toolName === 'exec') {
+    // An exec that calls no tool at all is a plain snippet Codex ran in its
+    // own sandbox to check something (`text(typeof atob)`). «Orchestration»
+    // was an invented category the user could not place — it named nothing
+    // the model did. It is a script run, so it says so and joins the noise
+    // class like every other run (as its own row it split neighbouring
+    // groups in two).
     const lookup = /\bALL_TOOLS\b/.test(source);
     callGroups.push([{
-      toolName: lookup ? 'Tool Search' : 'Orchestration',
-      args: { summary: lookup ? 'Inspect available tools' : compactPreview(source, 240) },
+      toolName: lookup ? 'Tool Search' : 'Script',
+      // The snippet IS the invocation, so it goes to the body like any other
+      // run; the header must not try to read JS as a shell line (it produced
+      // «Run const example» — the first two tokens of the source). `Script`
+      // has its own headline rule: one word, source in the body.
+      args: lookup ? { summary: 'Inspect available tools' } : { command: source },
     }]);
   } else {
     const patchText = call?.toolName === 'apply_patch' && typeof call?.args?.input === 'string'

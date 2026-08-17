@@ -39,6 +39,7 @@ function isSourceNotificationBlocked(run) {
 export function isOrchestrationInheritedActivity(run) {
   if (!isSeparateSourceRun(run)) return false;
   if (run?.resumeAwaitingNewTurn === true) return false;
+  if (run?.status === 'queued' && !run.deliveryAcceptedAt && !run.targetPromptProofAt) return false;
   return INHERITED_ACTIVE.has(run.status)
     || isOrchestrationResultProofPending(run)
     || isSourceFollowupPending(run);

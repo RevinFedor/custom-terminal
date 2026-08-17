@@ -15,6 +15,8 @@ import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
 import { useSplitAttachRowHeight, SplitPaneAttachRow } from './SplitPaneChrome';
+import { TabLocationBar } from './TabLocationBar';
+import { TOP_STRIP_H } from '../../constants/layout';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
 import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
@@ -1662,6 +1664,11 @@ export default function Workspace() {
         <ProjectToolbar isSystemProject={isFocusedInboxProject} />
       </div>
 
+      {/* WHERE the active tab is. The directory belongs to the tab, not to the
+          project — see TabLocationBar. */}
+      <TabLocationBar />
+
+
       {/* MAIN ROW: TabSidebar | Terminal. */}
       <div className="flex-1 flex min-h-0 relative">
       {/* LEFT COLUMN: vertical tab sidebar */}
@@ -1680,9 +1687,6 @@ export default function Workspace() {
       ))}
 
       {/* CENTER COLUMN: Terminal/Home Area (no more TabBar above it) */}
-      {/* data-workspace-center: keyboard-owner marker (keyboardOwnerGesture.mjs).
-          The whole column IS the work — terminal, History, composer, control
-          bar — so one marker on the column beats chasing every inner surface. */}
       <div data-workspace-center className="flex-1 flex flex-col min-w-0 relative">
 
         <div className="flex-1 flex flex-col min-w-0 relative">
@@ -1908,7 +1912,7 @@ export default function Workspace() {
         const { sidebarExpandedDirs, sidebarScrollTop } = getSidebarState(activeProjectId);
         const effectiveSidebarWidth = sidebarWidth || 280;
         return ReactDOM.createPortal(
-          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 70, bottom: 0, width: effectiveSidebarWidth, zIndex: 2147482000, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
+          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: TOP_STRIP_H, bottom: 0, width: effectiveSidebarWidth, zIndex: 2147482000, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
             <Sidebar
               key={activeProjectId}
               folderPath={explorerPath}

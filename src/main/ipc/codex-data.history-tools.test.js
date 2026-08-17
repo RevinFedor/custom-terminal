@@ -395,8 +395,14 @@ test('does not promote quoted tool examples to real History actions', () => {
   const history = historyFor(execCall('exec-4', source), output('exec-4', 'example only'));
 
   const actions = rawActions(history);
+  // The point of this test is that a tool call MENTIONED in a string or a
+  // comment never becomes a real row: no `rm -rf /` command card, no Edit.
+  // The snippet itself is still one row — a script Codex ran in its sandbox.
+  // (It used to be labelled «Orchestration», an invented category that named
+  // nothing the model did and, being its own family, split the groups around
+  // it; it is a run like any other now.)
   assert.equal(actions.length, 1);
-  assert.equal(actions[0].toolName, 'Orchestration');
+  assert.equal(actions[0].toolName, 'Script');
   assert.equal(actions.some((action) => action.toolName === 'Bash' || action.toolName === 'Edit'), false);
 });
 

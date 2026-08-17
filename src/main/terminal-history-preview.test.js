@@ -70,6 +70,46 @@ test('Claude activity block may include an assistant bullet and changing multi-l
   assert.equal(result.status, 'empty');
 });
 
+test('Claude narrow API retry card is service chrome, not streamed assistant prose', () => {
+  // Exact text/hash from production incident 061006b6-… . Claude painted its
+  // two-column retry card over three physical rows, with the spinner isolated.
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row('✻'),
+      row('Waiting for API         · will retry in 2m 38s · check your'),
+      row('response               network'),
+      row('❯ '),
+    ],
+  });
+  assert.equal(result.status, 'empty');
+  assert.deepEqual(result.filteredBlockKinds, ['retry-status']);
+  assert.equal(result.composerFound, true);
+});
+
+test('Claude retry words remain prose without the complete provider card receipt', () => {
+  const ordinarySentence = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row('Waiting for API — клиент will retry in 2m, если это потребуется.'),
+      row('❯ '),
+    ],
+  });
+  assert.equal(ordinarySentence.status, 'text');
+
+  const spinnerThenProse = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row('✻'),
+      row('Обычный ответ после значка не является retry-карточкой.'),
+      row('❯ '),
+    ],
+  });
+  assert.equal(spinnerThenProse.status, 'text');
+  assert.match(spinnerThenProse.text, /Обычный ответ/);
+  assert.deepEqual(spinnerThenProse.filteredBlockKinds, []);
+});
+
 test('a Claude Tip continuation stays system chrome when its root is above the owned boundary', () => {
   const result = extractTerminalHistoryPreviewText({
     provider: 'claude',
@@ -112,6 +152,159 @@ test('a Codex plan continuation stays system chrome when Updated Plan is above t
   assert.equal(result.status, 'empty');
   assert.equal(result.leadingContextLinesRemoved, 3);
   assert.ok(result.filteredBlockKinds.includes('boundary-system-continuation'));
+});
+
+test('a Claude queued user card stays outside preview when the exact boundary cuts off its prompt root', () => {
+  const promptStyle = {
+    firstTextStyle: 'fg=50331648:16777215,bg=50331648:3618615',
+    hasNonDefaultFg: true,
+    hasNonDefaultBg: true,
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    leadingPhysicalLines: [
+      row('❯ L1VzZXJz... <pasted_content>', { row: 2191, ...promptStyle }),
+      row('  во время стриминга есть последний блок,', { row: 2192, ...promptStyle }),
+    ],
+    physicalLines: [
+      row('  какой-то, и он постепенно обновляется. Прикол в чём:', {
+        row: 2193,
+        ...promptStyle,
+      }),
+      row('  перед тем как появился пустой инпут, было подёргивание.', {
+        row: 2194,
+        ...promptStyle,
+      }),
+      row('  </pasted_content>', { row: 2195, ...promptStyle }),
+      row('', { row: 2196 }),
+      row('✻ Working (2s · esc to interrupt)', {
+        row: 2197,
+        hasNonDefaultFg: true,
+      }),
+      row('❯ ', { row: 2198 }),
+    ],
+  });
+  assert.equal(result.status, 'empty');
+  assert.equal(result.leadingContextLinesRemoved, 3);
+  assert.ok(result.filteredBlockKinds.includes('boundary-prompt-card-continuation'));
+});
+
+test('a full provider-styled Claude user card is removed without hiding an ordinary quote', () => {
+  const promptStyle = {
+    firstTextStyle: 'fg=50331648:16777215,bg=50331648:3618615',
+    hasNonDefaultBg: true,
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row('❯ следующий пользовательский prompt', promptStyle),
+      row('  продолжение prompt', promptStyle),
+      row(''),
+      row('⏺ Настоящий ответ Claude.'),
+      row('❯ '),
+    ],
+  });
+  assert.equal(result.text, 'Настоящий ответ Claude.');
+  assert.equal(result.residualPromptLinesRemoved, 2);
+  assert.equal(result.residualPromptBlocksRemoved, 1);
+
+  const ordinaryQuote = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row('⏺ Обычная цитата:'),
+      row('❯ это текст без provider-owned background'),
+      row('❯ '),
+    ],
+  });
+  assert.equal(ordinaryQuote.text, 'Обычная цитата:\n❯ это текст без provider-owned background');
+  assert.equal(ordinaryQuote.residualPromptLinesRemoved, 0);
+});
+
+test('a dim Codex transcript body cut by the exact boundary stays inside its tool card', () => {
+  const dim = { hasDim: true, allTextDim: true };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    leadingPhysicalLines: [
+      row('    … +496 lines (ctrl + t to view transcript)', { row: 1101, ...dim }),
+      row('                "lineFeeds": 28,', { row: 1102, ...dim }),
+    ],
+    physicalLines: [
+      row('      {', { row: 1103, ...dim }),
+      row('    … +262 lines (ctrl + t to view transcript)', { row: 1104, ...dim }),
+      row('      }', { row: 1105, ...dim }),
+      row('    ]', { row: 1106, ...dim }),
+      row('', { row: 1107 }),
+      row('• Explored', { row: 1108, hasDim: true }),
+      row('  └ Read terminal-history-preview.js', { row: 1109, hasDim: true }),
+      row('', { row: 1110 }),
+      row('• Настоящий ответ после большого результата.', { row: 1111 }),
+      row('› ', { row: 1112 }),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ после большого результата.');
+  assert.ok(result.filteredBlockKinds.includes('boundary-tool-result-continuation'));
+  assert.ok(result.filteredBlockKinds.includes('tool-card'));
+  assert.equal(result.styleEvidenceUsed, true);
+});
+
+test('an exact Codex tool boundary owns a huge dim invocation after its receipt scrolled away', () => {
+  const dim = { hasDim: true, allTextDim: true };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    exactStructuredBoundaryKind: 'tool-use',
+    leadingPhysicalLines: [
+      row('        agrofield_4 показывает круговой progress', { row: 1225, ...dim }),
+      row('        «Импорт данных / Анализ датасета»', { row: 1226, ...dim }),
+    ],
+    physicalLines: [
+      row('        переключатель сырого вывода.\\n- Нельзя выдавать', {
+        row: 1227,
+        ...dim,
+      }),
+      row('        придуманные этапы за фактические.', { row: 1228, ...dim }),
+      row('        Issue.\",\"notifySource\":true,\"waitForDescendants\":true})', {
+        row: 1229,
+        hasDim: true,
+        allTextDim: false,
+      }),
+      row('    {\"ok\": true, \"accepted\": true, \"queued\": true,', {
+        row: 1230,
+        ...dim,
+      }),
+      row('        \"auditPending\": false, \"run\": null}', { row: 1231, ...dim }),
+      row('', { row: 1232 }),
+      row('• Working (2m 08s • esc to interrupt)', { row: 1233, hasDim: true }),
+      row('', { row: 1234 }),
+      row('• Настоящий ответ после делегации.', { row: 1235 }),
+      row('› Write tests for @filename', { row: 1236 }),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ после делегации.');
+  assert.deepEqual(result.filteredBlockKinds, [
+    'boundary-exact-tool-card-continuation',
+    'tool-card',
+    'activity',
+  ]);
+  assert.equal(result.styleEvidenceUsed, true);
+});
+
+test('ordinary dim prose spanning a boundary is preserved without a transcript receipt', () => {
+  const dim = { hasDim: true, allTextDim: true };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    leadingPhysicalLines: [
+      row('• В этом ответе первая часть находится выше границы.', { row: 40, ...dim }),
+    ],
+    physicalLines: [
+      row('Вторая часть всё ещё является обычным ответом.', { row: 41, ...dim }),
+      row('› ', { row: 42 }),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Вторая часть всё ещё является обычным ответом.');
+  assert.deepEqual(result.filteredBlockKinds, []);
 });
 
 test('a viewport-clipped Codex Explored child stays inside its tool card', () => {
@@ -592,6 +785,43 @@ test('Codex transport warning is reconstructed across explicit narrow-pane rows'
   assert.deepEqual(result.filteredBlockKinds, ['transport-status']);
 });
 
+test('Codex MCP startup warnings stay outside assistant preview', () => {
+  const warningStyle = {
+    hasNonDefaultFg: true,
+    firstTextStyle: 'fg=33554432:3,bg=0:-1',
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('⚠ MCP client for `sc-desktop-tg-search` timed out after 30', warningStyle),
+      row('  seconds. Add or adjust `startup_timeout_sec` in your', warningStyle),
+      row('  config.toml:', warningStyle),
+      row('  [mcp_servers.sc-desktop-tg-search]', warningStyle),
+      row('  startup_timeout_sec = XX', warningStyle),
+      row(''),
+      row('⚠ MCP startup incomplete (failed: sc-desktop-tg-search)', warningStyle),
+      row(''),
+      row('• Настоящий ответ после предупреждения.'),
+      row('› Use /skills to list available skills'),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ после предупреждения.');
+  assert.deepEqual(result.filteredBlockKinds, ['startup-warning']);
+
+  const ordinaryProse = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('• В документации упомянут startup_timeout_sec, но это часть ответа.'),
+      row('› Use /skills to list available skills'),
+    ],
+  });
+  assert.equal(
+    ordinaryProse.text,
+    'В документации упомянут startup_timeout_sec, но это часть ответа.',
+  );
+});
+
 test('a provider-styled historical Codex prompt is removed after a full-screen redraw', () => {
   const promptStyle = {
     activeByInverse: true,
@@ -791,6 +1021,54 @@ test('a viewport-clipped styled Codex tool child cannot become assistant prose',
   assert.equal(result.styleEvidenceUsed, true);
 });
 
+test('a late-painted clipped Codex numbered diff card cannot become assistant prose', () => {
+  const deleted = {
+    hasDim: true,
+    hasNonDefaultBg: true,
+    firstTextStyle: 'fg=0:-1,bg=50331648:4858397,dim',
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('     90 -            console.log("Done!");', deleted),
+      row('     91 -            cb();', deleted),
+      row('     92 -        });', deleted),
+      row('     93 -', deleted),
+      row('     94 -        archive.on(\'error\', err => {', deleted),
+      row('     95 -            console.log(`Bundle failed:', deleted),
+      row('          ${err.message}`);', deleted),
+      row(''),
+      row('• Ran set -e'),
+      row('  └ exact tool output', { hasDim: true, allTextDim: true }),
+      row(''),
+      row('• Настоящий ответ после поздно дорисованного diff.'),
+      row('› Implement {feature}'),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ после поздно дорисованного diff.');
+  assert.deepEqual(result.filteredBlockKinds, ['tool-card']);
+  assert.equal(result.styleEvidenceUsed, true);
+});
+
+test('numbered plus/minus prose without Codex diff-card styling is preserved', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'codex',
+    physicalLines: [
+      row('• Пример обычного ответа:'),
+      row('90 - это не удалённая строка инструмента'),
+      row('91 + это тоже часть объяснения'),
+      row('› Implement {feature}'),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(
+    result.text,
+    'Пример обычного ответа:\n90 - это не удалённая строка инструмента\n91 + это тоже часть объяснения',
+  );
+  assert.deepEqual(result.filteredBlockKinds, []);
+});
+
 test('an unstyled clipped tree prefix remains ordinary Codex prose', () => {
   const result = extractTerminalHistoryPreviewText({
     provider: 'codex',
@@ -962,6 +1240,24 @@ test('Claude expandable thinking summary and its wrapped children stay out of pr
   assert.equal(result.status, 'empty');
   assert.equal(result.text, '');
   assert.deepEqual(result.filteredBlockKinds, ['structured-summary', 'activity']);
+});
+
+test('Claude expandable summary split by explicit cursor rows stays out of prose', () => {
+  const systemStyle = {
+    hasNonDefaultFg: true,
+    firstTextStyle: 'fg=50331648:10066329,bg=0:-1',
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row('⏺ Thinking for 1m 4s, searching for 1 pattern… (ctrl+o to ', systemStyle),
+      row('  expand)', systemStyle),
+      row('❯ '),
+    ],
+  });
+  assert.equal(result.status, 'empty');
+  assert.deepEqual(result.filteredBlockKinds, ['structured-summary']);
+  assert.equal(result.styleEvidenceUsed, true);
 });
 
 test('ordinary Claude prose mentioning the expand shortcut remains assistant text', () => {

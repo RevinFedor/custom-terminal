@@ -275,7 +275,7 @@ async function readBoundedTail(handle, fileSize, maxReadBytes) {
   };
 }
 
-function readClaudeUserRecordsFromBuffer(
+function readClaudeRecordsFromBuffer(
   buffer,
   transcriptPath = null,
   {
@@ -302,19 +302,13 @@ function readClaudeUserRecordsFromBuffer(
     if (rawLine) {
       try {
         const record = JSON.parse(rawLine);
-        const carrier = extractClaudePromptCarrier(record);
-        const text = carrier?.text ?? null;
-        if (text !== null) {
-          candidates.push({
-            record,
-            text,
-            promptCarrierKind: carrier.kind,
-            byteOffset: Number(baseOffset) + lineStart,
-            transcriptPath: transcriptPath ? path.resolve(transcriptPath) : null,
-            bytesRead: Number.isFinite(bytesRead) ? bytesRead : source.length,
-            readMode,
-          });
-        }
+        candidates.push({
+          record,
+          byteOffset: Number(baseOffset) + lineStart,
+          transcriptPath: transcriptPath ? path.resolve(transcriptPath) : null,
+          bytesRead: Number.isFinite(bytesRead) ? bytesRead : source.length,
+          readMode,
+        });
       } catch {
         // A partial final line is intentionally ignored. The next file event
         // or audit retry reads the same bounded range after it is completed.
@@ -322,6 +316,21 @@ function readClaudeUserRecordsFromBuffer(
     }
     if (newline < 0) break;
     lineStart = newline + 1;
+  }
+  return candidates;
+}
+
+function readClaudeUserRecordsFromBuffer(buffer, transcriptPath = null, options = {}) {
+  const candidates = [];
+  for (const candidate of readClaudeRecordsFromBuffer(buffer, transcriptPath, options)) {
+    const carrier = extractClaudePromptCarrier(candidate.record);
+    const text = carrier?.text ?? null;
+    if (text === null) continue;
+    candidates.push({
+      ...candidate,
+      text,
+      promptCarrierKind: carrier.kind,
+    });
   }
   return candidates;
 }
@@ -525,6 +534,17 @@ function selectClaudeLivePromptOwner(
     candidateLen === Number(audit.expectedLen)
     && candidateHash === String(audit.expectedHash || '')
   );
+  const isMergedQueuedPayload = (audit) => {
+    const expectedText = typeof audit?.expectedText === 'string' ? audit.expectedText : '';
+    if (
+      !expectedText
+      || expectedText.length !== Number(audit.expectedLen)
+      || hashText(expectedText) !== String(audit.expectedHash || '')
+      || candidate.text.length <= expectedText.length
+      || !candidate.text.startsWith(expectedText)
+    ) return false;
+    return /\s/u.test(candidate.text.charAt(expectedText.length));
+  };
 
   // A queue carrier has already established the app-owned FIFO position.
   // The first matching canonical record after that exact byte offset belongs
@@ -542,6 +562,29 @@ function selectClaudeLivePromptOwner(
       audit.liveCanonicalPromptUuid = candidateUuid || null;
       return { audit, candidate, reason: 'canonical-after-exact-queue-claim' };
     }
+    const mergedCandidates = source.filter((audit) => {
+      const queueClaim = audit.liveQueuePromptClaim;
+      if (!queueClaim || audit.liveCanonicalPromptUuid || !isMergedQueuedPayload(audit)) {
+        return false;
+      }
+      const claimOffset = Number(queueClaim.byteOffset);
+      return !(
+        Number.isFinite(candidateOffset)
+        && Number.isFinite(claimOffset)
+        && candidateOffset < claimOffset
+      );
+    });
+    // Prefix text alone is never ownership. The exact provider enqueue claim
+    // makes the merge causal; duplicates remain unresolved instead of guessed.
+    if (mergedCandidates.length === 1) {
+      const [audit] = mergedCandidates;
+      audit.liveCanonicalPromptUuid = candidateUuid || null;
+      return {
+        audit,
+        candidate,
+        reason: 'canonical-merged-after-exact-queue-claim',
+      };
+    }
   }
 
   // Once an audit has claimed a queue position it cannot claim a second
@@ -556,7 +599,13 @@ function selectClaudeLivePromptOwner(
     selection.audit.liveQueuePromptClaim = {
       byteOffset: Number.isFinite(candidateOffset) ? candidateOffset : null,
       timestamp: candidate.record?.timestamp || null,
-      sessionId: candidate.record?.sessionId || null,
+      sessionId: candidate.record?.sessionId
+        || candidate.record?.session_id
+        || candidate.sessionId
+        || null,
+      entryUuid: candidate.record?.uuid || null,
+      sourceIdentity: candidate.queueSourceIdentity || null,
+      transcriptPath: candidate.transcriptPath || null,
       hash: candidateHash,
     };
     return { ...selection, reason: 'causal-queue-claim' };
@@ -566,12 +615,254 @@ function selectClaudeLivePromptOwner(
 }
 
 /**
+ * Resolve Claude's provider-native queue consumption back to the exact
+ * app-owned enqueue claim. `dequeue` consumes the oldest claimed item and
+ * `remove` uses exact content when Claude provides it. A consumption record is
+ * stronger than the caller timeout but does not rely on a later
+ * `queued_command`, which Claude is allowed to omit (notably around
+ * AskUserQuestion and edited queue input).
+ *
+ * `popAll` is deliberately excluded: Claude uses it to move every editable
+ * queue item back into its composer (for example after Up-arrow retrieval).
+ * Treating that operation as consumption turns a cancelled prompt into SENT.
+ */
+function selectClaudeLiveQueueSettlementAudits(
+  audits,
+  candidate,
+  { hashText = promptAuditFingerprint } = {},
+) {
+  const record = candidate?.record || null;
+  const operation = String(record?.operation || '');
+  if (
+    record?.type !== 'queue-operation'
+    || (operation !== 'dequeue' && operation !== 'remove')
+  ) return [];
+
+  const candidateOffset = Number(candidate.byteOffset);
+  const candidateSessionId = String(
+    record.sessionId || record.session_id || candidate.sessionId || '',
+  );
+  const candidateTranscriptPath = String(candidate.transcriptPath || '');
+  const settlementText = typeof record.content === 'string' ? record.content : '';
+  const settlementHash = settlementText ? hashText(settlementText) : '';
+  const source = (Array.isArray(audits) ? audits : [])
+    .filter((audit) => {
+      if (!audit || audit.finished === true || audit.liveQueueSettlementClaim) return false;
+      const claim = audit.liveQueuePromptClaim;
+      if (!claim) return false;
+      const claimOffset = Number(claim.byteOffset);
+      if (
+        Number.isFinite(candidateOffset)
+        && Number.isFinite(claimOffset)
+        && candidateOffset < claimOffset
+      ) return false;
+      if (candidateSessionId && claim.sessionId && candidateSessionId !== String(claim.sessionId)) {
+        return false;
+      }
+      if (
+        candidateTranscriptPath
+        && claim.transcriptPath
+        && candidateTranscriptPath !== String(claim.transcriptPath)
+      ) return false;
+      if (settlementText) {
+        return settlementText.length === Number(audit.expectedLen)
+          && settlementHash === String(audit.expectedHash || '');
+      }
+      return true;
+    })
+    .sort((left, right) => (
+      Number(left.liveQueuePromptClaim?.byteOffset ?? Number.MAX_SAFE_INTEGER)
+      - Number(right.liveQueuePromptClaim?.byteOffset ?? Number.MAX_SAFE_INTEGER)
+    ));
+
+  return source.slice(0, 1).map((audit) => {
+    audit.liveQueueSettlementClaim = {
+      operation,
+      byteOffset: Number.isFinite(candidateOffset) ? candidateOffset : null,
+      timestamp: record.timestamp || null,
+      sessionId: candidateSessionId || null,
+      entryUuid: record.uuid || null,
+    };
+    return {
+      audit,
+      candidate,
+      reason: 'provider-queue-' + operation,
+    };
+  });
+}
+
+/**
+ * Resolve Claude's `popAll` back to every exact app-owned queue claim that it
+ * returned to the native composer. The record has no prompt body, so identity
+ * comes from the earlier exact enqueue UUID/offset and the same transcript
+ * session. No text or timestamp fallback is allowed.
+ */
+function selectClaudeLiveQueueReturnAudits(audits, candidate) {
+  const record = candidate?.record || null;
+  if (record?.type !== 'queue-operation' || record.operation !== 'popAll') return [];
+
+  const candidateOffset = Number(candidate.byteOffset);
+  const candidateSessionId = String(
+    record.sessionId || record.session_id || candidate.sessionId || '',
+  );
+  const candidateTranscriptPath = String(candidate.transcriptPath || '');
+  return (Array.isArray(audits) ? audits : [])
+    .filter((audit) => {
+      if (!audit || audit.finished === true || audit.liveQueueReturnClaim) return false;
+      const claim = audit.liveQueuePromptClaim;
+      if (!claim?.sourceIdentity) return false;
+      const claimOffset = Number(claim.byteOffset);
+      if (
+        Number.isFinite(candidateOffset)
+        && Number.isFinite(claimOffset)
+        && candidateOffset < claimOffset
+      ) return false;
+      if (candidateSessionId && claim.sessionId && candidateSessionId !== String(claim.sessionId)) {
+        return false;
+      }
+      if (
+        candidateTranscriptPath
+        && claim.transcriptPath
+        && candidateTranscriptPath !== String(claim.transcriptPath)
+      ) return false;
+      return true;
+    })
+    .sort((left, right) => (
+      Number(left.liveQueuePromptClaim?.byteOffset ?? Number.MAX_SAFE_INTEGER)
+      - Number(right.liveQueuePromptClaim?.byteOffset ?? Number.MAX_SAFE_INTEGER)
+    ))
+    .map((audit) => {
+      audit.liveQueueReturnClaim = {
+        operation: 'popAll',
+        byteOffset: Number.isFinite(candidateOffset) ? candidateOffset : null,
+        timestamp: record.timestamp || null,
+        sessionId: candidateSessionId || null,
+        entryUuid: record.uuid || null,
+      };
+      return {
+        audit,
+        candidate,
+        reason: 'provider-queue-returned-to-composer',
+      };
+    });
+}
+
+function buildClaudeLiveQueueReturnResult(
+  selection,
+  { sessionId = null, hashText = promptAuditFingerprint } = {},
+) {
+  const audit = selection?.audit || null;
+  const queueClaim = audit?.liveQueuePromptClaim || null;
+  const returnClaim = audit?.liveQueueReturnClaim || null;
+  const expectedText = typeof audit?.expectedText === 'string' ? audit.expectedText : '';
+  if (
+    !audit?.handoffId
+    || audit.finished === true
+    || !queueClaim?.sourceIdentity
+    || !returnClaim
+    || expectedText.length !== Number(audit.expectedLen)
+    || hashText(expectedText) !== String(audit.expectedHash || '')
+  ) return null;
+  const exactSessionId = queueClaim.sessionId
+    || returnClaim.sessionId
+    || sessionId
+    || audit.historySessionId
+    || null;
+  if (!exactSessionId) return null;
+  return {
+    audit,
+    result: {
+      success: false,
+      cancelled: true,
+      accepted: false,
+      submitted: true,
+      pasteWritten: true,
+      enterWritten: true,
+      semanticStatus: 'not-submitted',
+      providerAccepted: false,
+      providerTurnCreated: false,
+      providerQueueReturned: true,
+      providerQueueOperation: 'popAll',
+      composerDraftState: 'exact-provider-queue-return',
+      draftPreserved: true,
+      lateReconciliationPending: false,
+      auditPending: false,
+      deliveryUnknown: false,
+      status: 'provider-not-accepted',
+      code: 'claude_queue_returned_to_composer',
+      error: 'claude_queue_returned_to_composer',
+      actualLen: expectedText.length,
+      actualHash: String(audit.expectedHash || ''),
+      expectedLen: audit.expectedLen,
+      expectedHash: audit.expectedHash,
+      sessionId: exactSessionId,
+      entryUuid: null,
+      sourceIdentity: queueClaim.sourceIdentity,
+      auditTimestamp: returnClaim.timestamp
+        || queueClaim.timestamp
+        || new Date(audit.sentAt).toISOString(),
+      ...(Number.isFinite(Number(queueClaim.byteOffset))
+        ? { recordByteOffset: Number(queueClaim.byteOffset) }
+        : {}),
+      ...(Number.isFinite(Number(returnClaim.byteOffset))
+        ? { queueReturnRecordByteOffset: Number(returnClaim.byteOffset) }
+        : {}),
+      canonicalized: true,
+      canonicalReason: selection.reason || 'provider-queue-returned-to-composer',
+    },
+    actualText: expectedText,
+  };
+}
+
+function buildClaudeLiveQueueSettlementConfirmation(
+  selection,
+  { sessionId = null, hashText = promptAuditFingerprint } = {},
+) {
+  const audit = selection?.audit || null;
+  const queueClaim = audit?.liveQueuePromptClaim || null;
+  const expectedText = typeof audit?.expectedText === 'string' ? audit.expectedText : '';
+  if (
+    !audit?.handoffId
+    || audit.finished === true
+    || !queueClaim
+    || !queueClaim.sourceIdentity
+    || expectedText.length !== Number(audit.expectedLen)
+    || hashText(expectedText) !== String(audit.expectedHash || '')
+  ) return null;
+  const exactSessionId = queueClaim.sessionId
+    || sessionId
+    || audit.historySessionId
+    || null;
+  if (!exactSessionId) return null;
+  return {
+    audit,
+    result: {
+      success: true,
+      actualLen: expectedText.length,
+      actualHash: String(audit.expectedHash || ''),
+      expectedLen: audit.expectedLen,
+      expectedHash: audit.expectedHash,
+      sessionId: exactSessionId,
+      entryUuid: null,
+      sourceIdentity: queueClaim.sourceIdentity,
+      auditTimestamp: queueClaim.timestamp || new Date(audit.sentAt).toISOString(),
+      ...(Number.isFinite(Number(queueClaim.byteOffset))
+        ? { recordByteOffset: Number(queueClaim.byteOffset) }
+        : {}),
+      canonicalized: true,
+      canonicalReason: selection.reason || 'provider-queue-consumed',
+    },
+    actualText: expectedText,
+  };
+}
+
+/**
  * Converts an exact live canonical carrier into the same audit proof normally
  * produced by the UserPromptSubmit hook. Claude does not emit that hook for a
  * prompt accepted while another turn is streaming: it writes an enqueue and,
- * later, a queued_command attachment instead. The enqueue proves queue order;
- * only the canonical record (with its UUID) is strong enough to finish the
- * History handoff.
+ * later, a queued_command attachment instead. The enqueue proves queue order.
+ * A canonical row can preserve the queued text exactly or append user text;
+ * the latter is accepted only after one unique exact provider queue claim.
  */
 function buildClaudeLivePromptAuditConfirmation(
   selection,
@@ -586,6 +877,8 @@ function buildClaudeLivePromptAuditConfirmation(
   const kind = String(candidate?.promptCarrierKind || '');
   const actualText = typeof candidate?.text === 'string' ? candidate.text : '';
   const entryUuid = typeof record?.uuid === 'string' ? record.uuid : '';
+  const mergedQueueTurn = selection?.reason === 'canonical-merged-after-exact-queue-claim';
+  const expectedText = typeof audit?.expectedText === 'string' ? audit.expectedText : '';
   if (
     !audit?.handoffId
     || audit.finished === true
@@ -594,8 +887,19 @@ function buildClaudeLivePromptAuditConfirmation(
     || !entryUuid
   ) return null;
 
-  const actualHash = hashText(actualText);
-  if (
+  const actualHash = mergedQueueTurn
+    ? String(audit.expectedHash || '')
+    : hashText(actualText);
+  if (mergedQueueTurn) {
+    if (
+      !expectedText
+      || expectedText.length !== Number(audit.expectedLen)
+      || hashText(expectedText) !== actualHash
+      || actualText.length <= expectedText.length
+      || !actualText.startsWith(expectedText)
+      || !/\s/u.test(actualText.charAt(expectedText.length))
+    ) return null;
+  } else if (
     actualText.length !== Number(audit.expectedLen)
     || actualHash !== String(audit.expectedHash || '')
   ) return null;
@@ -609,10 +913,13 @@ function buildClaudeLivePromptAuditConfirmation(
     audit,
     result: {
       success: true,
-      actualLen: actualText.length,
+      actualLen: mergedQueueTurn ? expectedText.length : actualText.length,
       actualHash,
       sessionId: auditSessionId,
       entryUuid,
+      ...(audit.liveQueuePromptClaim?.sourceIdentity
+        ? { sourceIdentity: audit.liveQueuePromptClaim.sourceIdentity }
+        : {}),
       auditTimestamp: record.timestamp || new Date(audit.sentAt).toISOString(),
       ...(Number.isFinite(Number(candidate.byteOffset))
         ? { recordByteOffset: Number(candidate.byteOffset) }
@@ -622,7 +929,7 @@ function buildClaudeLivePromptAuditConfirmation(
       canonicalized: true,
       canonicalReason: selection.reason || selection.causality?.reason || 'live-canonical-carrier',
     },
-    actualText,
+    actualText: mergedQueueTurn ? expectedText : actualText,
     recordByteOffset: Number.isFinite(Number(candidate.byteOffset))
       ? Number(candidate.byteOffset)
       : null,
@@ -778,6 +1085,8 @@ function classifyClaudeAuditRecordAfterBoundary(candidate, boundary, audit = nul
 }
 
 module.exports = {
+  buildClaudeLiveQueueReturnResult,
+  buildClaudeLiveQueueSettlementConfirmation,
   DEFAULT_CLAUDE_AUDIT_READ_BYTES,
   captureClaudePromptAuditBoundary,
   classifyClaudePromptAuditAdmission,
@@ -785,11 +1094,14 @@ module.exports = {
   classifyClaudePromptSubmitRouteAdmission,
   extractClaudeUserText,
   readClaudeUserRecords,
+  readClaudeRecordsFromBuffer,
   readClaudeUserRecordsFromBuffer,
   readLastClaudeUserRecord,
   readLastClaudeUserRecordFromBuffer,
   buildClaudeLivePromptAuditConfirmation,
   selectClaudeLivePromptOwner,
+  selectClaudeLiveQueueReturnAudits,
+  selectClaudeLiveQueueSettlementAudits,
   selectClaudePendingPromptAudit,
   selectUniqueClaudePromptSubmitAudit,
   shouldStageClaudeUserPromptAudit,

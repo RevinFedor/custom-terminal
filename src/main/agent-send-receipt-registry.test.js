@@ -94,6 +94,17 @@ test('receipt classification keeps transport, provider acceptance, and unknown o
   );
   assert.equal(
     classifyAgentSendRegistryReceipt(exactProviderNotAccepted({
+      composerDraftState: 'exact-provider-queue-return',
+      providerQueueReturned: true,
+      providerQueueOperation: 'popAll',
+      sourceIdentity: 'claude-queue:uuid:return-enqueue',
+      exactDraftRemained: false,
+    })),
+    RECEIPT_STATES.PROVIDER_NOT_ACCEPTED,
+    'an exact provider queue return proves that no Claude user turn was created',
+  );
+  assert.equal(
+    classifyAgentSendRegistryReceipt(exactProviderNotAccepted({
       composerDraftState: 'exact-provider-image-transform',
       providerImageTransform: true,
       expectedImagePathCount: 5,

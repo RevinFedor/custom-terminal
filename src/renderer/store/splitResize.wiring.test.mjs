@@ -16,7 +16,6 @@ const store = read('useWorkspaceStore.ts');
 const chrome = read('..', 'components', 'Workspace', 'SplitPaneChrome.tsx');
 const terminalArea = read('..', 'components', 'Workspace', 'TerminalArea.tsx');
 const snapshot = read('..', 'utils', 'sessionSnapshot.mjs');
-const gestures = read('..', 'utils', 'keyboardOwnerGesture.mjs');
 
 function block(source, start, end) {
   const from = source.indexOf(start);
@@ -130,14 +129,6 @@ test('"add to workspace" is capped by COLUMNS, not by the pane count', () => {
 });
 
 // ── Gestures around the drag ──────────────────────────────────────────────
-
-test('grabbing a divider does not move the keyboard owner', () => {
-  // A resize is about GEOMETRY, not "I want to type here": without this, a
-  // drag started while the keyboard was in the sidebar would flip ownership
-  // and flash the pane frame mid-drag.
-  const neutral = block(gestures, 'OWNERSHIP_NEUTRAL_SELECTORS', ']);');
-  assert.match(neutral, /\[data-split-divider\]/);
-});
 
 test('the strips are the violet drag language, same as the sidebar handle', () => {
   assert.match(chrome, /SPLIT_DIVIDER_HOVER_BG = 'rgba\(99,102,241,0\.4\)'/);

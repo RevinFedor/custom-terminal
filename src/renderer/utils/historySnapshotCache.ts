@@ -56,6 +56,16 @@ export interface HistorySnapshotCacheLimits {
    */
   maxOversizedBytes?: number;
   maxOversizedSnapshots?: number;
+  /**
+   * Snapshots ABOVE this size are routed to the protected oversized pool even
+   * though they would fit the normal budget. Without it a 45MB Claude session
+   * falls into a gap: too big to coexist with normal tabs (45 of 64MB leaves
+   * 19MB for everyone else — any churn evicts the giant) yet too small for
+   * the >maxBytes oversized rule. Observed live 16.08 15:31: every
+   * 2998↔2912 switch re-parsed 7323 rows cold (~1.7s) because of exactly
+   * this. Defaults to maxBytes (no early routing) unless set.
+   */
+  oversizedThresholdBytes?: number;
 }
 
 export interface HistorySnapshotCacheStats {
@@ -130,6 +140,12 @@ export const DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS: Readonly<HistorySnapshotCach
   // and this bridge allowance can then come back down.
   maxOversizedBytes: 360 * 1024 * 1024,
   maxOversizedSnapshots: 3,
+  // Claude has no row windowing (yet): a busy Claude session projects to
+  // ~45MB and lives in the NORMAL pool where it starves every other tab.
+  // Route anything above half the normal budget into the protected pool —
+  // three such owners fit 360MB with room, and normal tabs get their 64MB
+  // back. Remove when Claude gets the windowed model.
+  oversizedThresholdBytes: 32 * 1024 * 1024,
 });
 
 export const DEFAULT_HISTORY_VOLATILE_OVERLAY_CACHE_LIMITS:
@@ -348,6 +364,7 @@ interface ResolvedHistorySnapshotCacheLimits {
   maxSnapshots: number;
   maxOversizedBytes: number;
   maxOversizedSnapshots: number;
+  oversizedThresholdBytes: number;
 }
 
 export class HistorySnapshotCache {
@@ -374,10 +391,19 @@ export class HistorySnapshotCache {
     if (maxOversizedBytes < limits.maxBytes) {
       throw new RangeError('maxOversizedBytes must be greater than or equal to maxBytes');
     }
+    // Explicit-limits callers (tests) keep the exact old behaviour: routing
+    // starts strictly above maxBytes unless a threshold is asked for.
+    const oversizedThresholdBytes =
+      limits.oversizedThresholdBytes ?? limits.maxBytes;
+    assertPositiveLimit('oversizedThresholdBytes', oversizedThresholdBytes);
+    if (oversizedThresholdBytes > limits.maxBytes) {
+      throw new RangeError('oversizedThresholdBytes must not exceed maxBytes');
+    }
     this.limits = Object.freeze({
       ...limits,
       maxOversizedBytes,
       maxOversizedSnapshots,
+      oversizedThresholdBytes,
     });
   }
 
@@ -477,7 +503,7 @@ export class HistorySnapshotCache {
     const record = { owner: frozenOwner, snapshot, approxBytes };
     const isOversized =
       entryCount > this.limits.maxEntries ||
-      approxBytes > this.limits.maxBytes;
+      approxBytes > this.limits.oversizedThresholdBytes;
 
     if (isOversized) {
       if (approxBytes > this.limits.maxOversizedBytes) {

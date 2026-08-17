@@ -223,6 +223,19 @@ test('an active orchestration blocks install on both its inherited source and re
   ]);
 });
 
+test('an undispatched queued run blocks work without claiming inherited activity', () => {
+  const blockers = orchestrationInstallBlockers({
+    ...baseRun('run-queued', 'target-queued'),
+    status: 'queued',
+    deliveryAcceptedAt: null,
+    targetPromptProofAt: null,
+  });
+  assert.deepEqual(blockers.map((loader) => [loader.tabId, loader.role, loader.status]), [
+    ['source-1', 'source', 'recovery'],
+    ['target-queued', 'target', 'recovery'],
+  ]);
+});
+
 test('active-loaders stays non-idle for Voice Record and deduplicates runtime with orchestration by tab', () => {
   const snapshot = mergeActiveLoadersWithOrchestrations({
     idle: false,

@@ -97,7 +97,7 @@ function PaneRecentTabRow({
   onForget: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
-  const { hasProcess, busy } = useTabActivitySignals(row.tab.id);
+  const { hasProcess, busy, inheritedBusy } = useTabActivitySignals(row.tab.id);
   return (
     <div
       onMouseEnter={() => setHovered(true)}
@@ -110,6 +110,7 @@ function PaneRecentTabRow({
         selected={hovered}
         hasProcess={hasProcess || !!row.tab.sdkProcessAlive}
         busy={busy}
+        inheritedBusy={inheritedBusy}
         sessionStatuses={sessionStatuses}
         // Layout map: which pane this tab is already open in. This list PUTS a tab
         // into a pane, so knowing it is already in one — and in which — is the

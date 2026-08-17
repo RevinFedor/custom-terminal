@@ -14,6 +14,7 @@ import {
   RotateCcw,
   Send,
   Settings2,
+  Timer,
   TimerOff,
   X,
 } from 'lucide-react';
@@ -56,7 +57,7 @@ const STATUS_LABEL: Record<OrchestrationStatus, string> = {
   starting: 'Запуск',
   sending: 'Отправка',
   sent: 'Доставлено',
-  queued: 'Ожидает ввода',
+  queued: 'Ожидает отправки',
   running: 'Работает',
   waiting_descendants: 'Ждёт дочерние',
   waiting_recovery: 'Связь прервана',
@@ -75,7 +76,7 @@ function statusColor(status: OrchestrationStatus): string {
 
 type RunPresentation = {
   color: string;
-  icon: 'success' | 'error' | 'cancelled' | 'loading' | 'recovery';
+  icon: 'success' | 'error' | 'cancelled' | 'loading' | 'waiting' | 'recovery';
   label: string;
   spinning: boolean;
 };
@@ -138,9 +139,9 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   if (run.status === 'sent' && run.deliveryAuditPendingAt && !run.targetPromptProofAt) {
     return {
       color: '#fbbf24',
-      icon: 'loading',
+      icon: 'waiting',
       label: 'Проверка доставки',
-      spinning: true,
+      spinning: false,
     };
   }
   if (hasSourceNotificationError(run, tabId)) {
@@ -162,7 +163,7 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
       label: isPaused(run)
         ? 'На паузе'
         : run.outcome === 'interrupted' ? 'Остановлено вручную' : 'Связь прервана',
-      spinning: true,
+      spinning: false,
     };
   }
   if (hasPendingSourceHandoff(run, tabId)) {
@@ -175,6 +176,14 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   }
   if (run.status === 'completed') return { color: '#4ade80', icon: 'success', label: 'Готово', spinning: false };
   if (run.status === 'cancelled') return { color: '#737373', icon: 'cancelled', label: 'Закрыто', spinning: false };
+  if (run.status === 'queued' || run.status === 'sent') {
+    return {
+      color: '#fbbf24',
+      icon: 'waiting',
+      label: STATUS_LABEL[run.status],
+      spinning: false,
+    };
+  }
   return {
     color: statusColor(run.status),
     icon: 'loading',
@@ -191,10 +200,11 @@ function StatusIcon({ presentation }: { presentation: RunPresentation }) {
   if (presentation.icon === 'success') icon = <CircleCheck size={14} strokeWidth={2.2} />;
   else if (presentation.icon === 'error') icon = <CircleAlert size={14} strokeWidth={2.2} />;
   else if (presentation.icon === 'cancelled') icon = <X size={14} strokeWidth={2.2} />;
+  else if (presentation.icon === 'waiting') icon = <Timer size={14} strokeWidth={2.2} />;
   else if (presentation.icon === 'recovery') {
     icon = (
       <>
-        <LoaderCircle className="animate-spin" size={13} strokeWidth={2.2} />
+        <Timer size={13} strokeWidth={2.2} />
         <CircleAlert size={10} strokeWidth={2.4} />
       </>
     );

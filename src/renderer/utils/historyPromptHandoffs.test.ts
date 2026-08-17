@@ -9,6 +9,7 @@ import {
   getHistoryPromptHandoffsSnapshot,
   hydrateHistoryPromptHandoffFromDurableReceipt,
   historyPromptHandoffInitialStatus,
+  historyPromptAuditIsProviderQueueReturn,
   historyPromptHandoffStatusPresentation,
   historyPromptHandoffAcceptsAuditIdentity,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
@@ -22,6 +23,30 @@ import {
   type HistoryPromptHandoffProjectionRow,
   type HistoryPromptHandoffStoreLimits,
 } from './historyPromptHandoffs.ts';
+
+test('only an exact Claude queue return is classified as cancellation', () => {
+  const exact = {
+    success: false,
+    cancelled: true,
+    semanticStatus: 'not-submitted',
+    providerAccepted: false,
+    providerTurnCreated: false,
+    providerQueueReturned: true,
+    providerQueueOperation: 'popAll',
+    composerDraftState: 'exact-provider-queue-return',
+    draftPreserved: true,
+    sourceIdentity: 'claude-queue:uuid:return-enqueue',
+  };
+  assert.equal(historyPromptAuditIsProviderQueueReturn(exact), true);
+  assert.equal(historyPromptAuditIsProviderQueueReturn({
+    ...exact,
+    sourceIdentity: null,
+  }), false);
+  assert.equal(historyPromptAuditIsProviderQueueReturn({
+    ...exact,
+    providerQueueOperation: 'dequeue',
+  }), false);
+});
 
 const limits = (
   overrides: Partial<HistoryPromptHandoffStoreLimits> = {},
@@ -211,10 +236,20 @@ test('exact Claude provider queue evidence replaces CONFIRMING and resists the l
       sendAttemptId: 'attempt-provider-queue',
       sendOperationKey: 'history:tab-provider-queue:handoff-provider-queue',
       changedAt: 200,
+      proof: {
+        sourceIdentity: 'claude-queue:uuid:queue-operation-provider-queue',
+        sessionId: 'session-provider-queue',
+        entryUuid: 'queue-operation-provider-queue',
+        recordByteOffset: 84,
+      },
     },
   );
   assert.equal(accepted?.queueStatus, 'queued');
   assert.equal(accepted?.statusReason, 'provider-queue-accepted');
+  assert.equal(
+    accepted?.providerQueueProof?.sourceIdentity,
+    'claude-queue:uuid:queue-operation-provider-queue',
+  );
 
   const timedOut = store.settle('tab-provider-queue', 'handoff-provider-queue', {
     queueStatus: 'audit-pending',
@@ -1055,6 +1090,7 @@ test('a durable exact Claude queue receipt remounts as QUEUED instead of CONFIRM
         attemptId,
         acceptedAt: '2026-08-16T01:58:27.200Z',
         entryUuid: 'queue-operation-durable',
+        sourceIdentity: 'claude-queue:uuid:queue-operation-durable',
         recordByteOffset: 84,
       },
     },
@@ -1062,10 +1098,31 @@ test('a durable exact Claude queue receipt remounts as QUEUED instead of CONFIRM
   assert.equal(outcome.hydrated, true);
   assert.equal(outcome.handoff?.queueStatus, 'queued');
   assert.equal(outcome.handoff?.statusReason, 'durable-provider-queue-accepted');
+  assert.equal(
+    outcome.handoff?.providerQueueProof?.sourceIdentity,
+    'claude-queue:uuid:queue-operation-durable',
+  );
+  assert.equal(outcome.handoff?.providerQueueProof?.recordByteOffset, 84);
+  const projection = reconcileHistoryPromptHandoffRows({
+    rows: [{
+      uuid: `local-${handoffId}`,
+      content: 'already accepted into the native Claude queue',
+      handoffId,
+      queueStatus: 'audit-pending',
+      sessionId: 'session-durable-provider-queue',
+    } satisfies TestProjectionRow],
+    handoffs: outcome.handoff ? [outcome.handoff] : [],
+    createRow: createProjectionRow,
+  });
+  assert.equal(
+    projection.rows[0]?.sourceIdentity,
+    'claude-queue:uuid:queue-operation-durable',
+  );
+  assert.equal(projection.rows[0]?.recordByteOffset, 84);
   consumeHistoryPromptHandoff(tabId, handoffId);
 });
 
-test('stale queue metadata cannot mask an unconfirmed restart receipt', () => {
+test('exact provider queue ownership survives startup delivery-unknown projection', () => {
   const tabId = 'tab-stale-provider-queue';
   const handoffId = 'handoff-stale-provider-queue';
   const operationKey = `history:${tabId}:${handoffId}`;
@@ -1092,8 +1149,27 @@ test('stale queue metadata cannot mask an unconfirmed restart receipt', () => {
     },
   });
   assert.equal(outcome.hydrated, true);
-  assert.equal(outcome.handoff?.queueStatus, 'delivery-unknown');
+  assert.equal(outcome.handoff?.queueStatus, 'queued');
   consumeHistoryPromptHandoff(tabId, handoffId);
+});
+
+test('provider-not-accepted queue return does not resurrect a History card after remount', () => {
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey: 'history:tab-returned:handoff-returned',
+    surface: 'desktop-history',
+    tabId: 'tab-returned',
+    handoffId: 'handoff-returned',
+    provider: 'claude',
+    sessionId: 'session-returned',
+    state: 'provider-not-accepted',
+    attemptId: 'attempt-returned',
+    receipt: {
+      promptText: 'the provider moved this back to its terminal composer',
+      providerQueueReturned: true,
+    },
+  });
+  assert.equal(outcome.hydrated, false);
+  assert.equal(outcome.reason, 'durable-history-send-returned-to-terminal-composer');
 });
 
 test('a dismissed unconfirmed receipt stays hidden after renderer reload', () => {

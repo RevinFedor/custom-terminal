@@ -17,11 +17,18 @@ import {
   type DiffEntry, type DiffHunk, type ToolStatus,
 } from '../helpers';
 
-/** Collapse-пропы, общие для всех карточек (потребитель внедряет персист). */
+/**
+ * Injection every card forwards to ToolCard verbatim: collapse persistence
+ * (host-owned) plus the hover copy hook. They travel together because every
+ * card already spreads this one object — a second channel would mean editing
+ * six card signatures for one button.
+ */
 export interface CollapseInjection {
   open?: boolean;
   onToggle?: () => void;
   anchorRef?: React.RefObject<HTMLDivElement | null>;
+  getCopyText?: () => string;
+  onCopy?: (text: string) => void;
 }
 
 /**
@@ -112,8 +119,8 @@ const HeaderSubject: React.FC<{ text: string; wrap?: boolean; detail?: string }>
 );
 
 // ---- Bash ----
-const BashCard: React.FC<{ args: Record<string, any>; result: any; status: ToolStatus; family?: string; headline?: ActionHeadline } & CollapseInjection> =
-({ args, result, status, family, headline: injected, ...collapse }) => {
+const BashCard: React.FC<{ toolName?: string; args: Record<string, any>; result: any; status: ToolStatus; family?: string; headline?: ActionHeadline } & CollapseInjection> =
+({ toolName, args, result, status, family, headline: injected, ...collapse }) => {
   const cmd: string = args.command || '';
   const description: string = args.description || '';
   const resultText = resultToText(result);
@@ -130,9 +137,14 @@ const BashCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
   };
   const isRun = headline.verb === 'Run';
   const label = headline.verb === 'Run' ? 'Bash' : headline.verb;
-  const preview = headline.subject
-    ? <HeaderSubject text={headline.subject} wrap={!isRun} detail={headline.detail} />
-    : <span className="cb-italic-dim">{cmd || '(no command)'}</span>;
+  // A sandbox snippet already says everything in its label; its grammar
+  // subject is the literal word «script», which next to the label would read
+  // «Bash script» — one word said twice.
+  const isScript = toolName === 'Script';
+  const subject = isScript ? '' : headline.subject;
+  const preview = subject
+    ? <HeaderSubject text={subject} wrap={!isRun} detail={headline.detail} />
+    : (isScript ? null : <span className="cb-italic-dim">{cmd || '(no command)'}</span>);
   // Reads drop the invocation line entirely (the header already says file and
   // range); every other family keeps it so the call reads apart from the result.
   const showInvocation = !!cmd && headline.verb !== 'Read';
@@ -156,7 +168,7 @@ const BashCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
       )}
     </div>
   ) : null;
-  return <ToolCard status={status} icon={toolIcon('Bash', 13, family)} label={label} description={isRun ? (description || undefined) : undefined} preview={preview} body={body} defaultOpen={false} {...collapse} />;
+  return <ToolCard status={status} icon={toolIcon('Bash', 13, family)} label={isScript ? 'Script' : label} description={isRun ? (description || undefined) : undefined} preview={preview} body={body} defaultOpen={false} {...collapse} />;
 };
 
 // ---- Read ----
@@ -415,6 +427,54 @@ const GenericToolCard: React.FC<{ toolName: string; args: Record<string, any>; r
   return <ToolCard status={status} icon={icon} label={humanToolLabel(toolName)} preview={preview} body={body} defaultOpen={false} {...collapse} />;
 };
 
+/**
+ * What a row hands over when its copy button is pressed: the payload in its
+ * ORIGINAL form, not the rendering.
+ *
+ * Per kind, because "the content" means a different thing per kind:
+ *  - a read → the file text it shows when expanded;
+ *  - a run → the command AND its output, because either alone is half the
+ *    story of what happened;
+ *  - an edit → the path plus the diff exactly as the transcript recorded it;
+ *  - an MCP call → arguments and result, the two halves of the exchange.
+ * Nothing to hand over → empty string → no button at all (a control that
+ * copies nothing is worse than no control).
+ */
+function toolCopyText(
+  toolName: string,
+  args: Record<string, any>,
+  result: any,
+  diffHunks?: readonly DiffHunk[],
+): string {
+  const resultText = resultToText(result);
+  if (toolName === 'Read') {
+    return resultText.replace(/\n+$/, '');
+  }
+  if (toolName === 'Bash' || toolName === 'Script') {
+    const command = typeof args?.command === 'string' ? args.command : '';
+    if (command && resultText) return command + '\n\n' + resultText;
+    return command || resultText;
+  }
+  if (toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit' || toolName === 'Update') {
+    const path = String(args?.file_path || args?.path || '');
+    if (Array.isArray(diffHunks) && diffHunks.length > 0) {
+      const diff = diffHunks
+        .map((hunk) => hunk.entries
+          .map((row) => (row.tag === 'add' ? '+' : row.tag === 'del' ? '-' : ' ') + row.line)
+          .join('\n'))
+        .join('\n');
+      return path ? path + '\n\n' + diff : diff;
+    }
+    if (toolName === 'Write' && typeof args?.content === 'string') {
+      return path ? path + '\n\n' + args.content : args.content;
+    }
+    return path;
+  }
+  const argsText = args && Object.keys(args).length > 0 ? JSON.stringify(args, null, 2) : '';
+  if (argsText && resultText) return argsText + '\n\n' + resultText;
+  return resultText || argsText;
+}
+
 /** Диспетчер: tool-имя → нужная карточка. `collapse` внедряет персист раскрытия. */
 export interface ToolCallProps {
   toolName: string;
@@ -443,11 +503,18 @@ export interface ToolCallProps {
   mcpServer?: string;
   mcpMethod?: string;
   collapse?: CollapseInjection;
+  /** Host clipboard for the row's hover copy button; omitted → no button. */
+  onCopy?: (text: string) => void;
 }
 
-export const ToolCallPart: React.FC<ToolCallProps> = ({ toolName, args, result, isError, startLine, diffHunks, awaitingApproval, family, headline, mcpServer, mcpMethod, collapse }) => {
+export const ToolCallPart: React.FC<ToolCallProps> = ({ toolName, args, result, isError, startLine, diffHunks, awaitingApproval, family, headline, mcpServer, mcpMethod, collapse, onCopy }) => {
   const status = toolStatusFrom(result, isError, awaitingApproval);
-  const inj = collapse || {};
+  // Built lazily: a collapsed row must not pay for a string nobody requested,
+  // and a dehydrated result would be materialised for nothing.
+  const copyInjection = onCopy
+    ? { onCopy, getCopyText: () => toolCopyText(toolName, args, result, diffHunks) }
+    : {};
+  const inj = { ...(collapse || {}), ...copyInjection };
   if (toolName.startsWith('mcp__') || toolName === 'MCP' || family === 'mcp') {
     return (
       <McpToolCard
@@ -461,8 +528,18 @@ export const ToolCallPart: React.FC<ToolCallProps> = ({ toolName, args, result, 
       />
     );
   }
-  if (toolName === 'Bash') return <BashCard args={args} result={result} status={status} family={family} headline={headline} {...inj} />;
+  // `Script` = a JS snippet Codex ran in its sandbox. Same card as a shell run
+  // (header names it, body shows the source and the output); only the parser's
+  // name differs, because the header grammar must not read JS as a shell line.
+  if (toolName === 'Bash' || toolName === 'Script') {
+    return <BashCard toolName={toolName} args={args} result={result} status={status} family={family} headline={headline} {...inj} />;
+  }
   if (toolName === 'Read') return <ReadCard args={args} result={result} status={status} headline={headline} {...inj} />;
+  // A patch that never applied groups WITH the edits (same family) but is not
+  // one: the edit card would promise a file and a diff it does not have.
+  if (toolName === 'Patch') {
+    return <GenericToolCard toolName={toolName} args={args} result={result} status={status} family={family} {...inj} />;
+  }
   // `Update` is Codex's name for the same act; it must not become a fourth verb.
   if (toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit' || toolName === 'Update' || family === 'edit') {
     return <EditCard toolName={toolName} args={args} status={status} startLine={startLine} diffHunks={diffHunks} {...inj} />;

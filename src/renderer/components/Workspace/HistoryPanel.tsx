@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, RotateCcw, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, RotateCcw, AlertTriangle, Copy, Check, Loader2, Play, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import {
   ComposerEditor,
@@ -16,7 +16,10 @@ import {
   type HistoryPromptDraftWriteOptions,
   type HistoryRewindPreview,
 } from '../../store/useUIStore';
-import { historyActionHeadline } from '../../../shared/history-action-grammar.mjs';
+import {
+  historyActionHeadline,
+  historyActionPresentationMeta,
+} from '../../../shared/history-action-grammar.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useRewindOperationStore } from '../../store/useRewindOperationStore';
 import {
@@ -53,6 +56,10 @@ import {
 } from '../../utils/agentActionCoordinator.mjs';
 import { isHistoryTaskBackgroundLive } from '../../utils/historyBackgroundLiveness.mjs';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import {
+  setComposerControlsHost,
+  releaseComposerControlsHost,
+} from '../../utils/composerControlsHost.mjs';
 import { recordHistorySurfacePresented } from '../../utils/timelineTranscriptRefresh.mjs';
 import { foldHistoryAgentProcessLiveness } from '../../utils/historyProcessLiveness.mjs';
 import {
@@ -157,7 +164,7 @@ import {
   applyHistoryLiveToolResultsToEntry,
   buildHistoryLivePresentation,
   extractHistoryLiveToolResults,
-  historyLivePresentationIdentity,
+  historyLivePresentationIdentities,
   historyLivePresentationKey,
   reconcileCommittedHistoryLiveProjection,
   reconcileHistoryLiveToolResults,
@@ -165,12 +172,19 @@ import {
   shouldIncludeHistoryLiveUserText,
 } from '../../utils/historyLiveProjection.mjs';
 import {
-  buildHistoryDisplayUnits,
+  buildHistoryDisplayUnitsAppended,
+  buildHistoryDisplayUnitsCached,
+  findHistoryHydrationStub,
   groupFamilyBreakdown,
   historyDisplayUnitUuid,
+  isGroupUnit,
+  peekHistoryDisplayUnitsCached,
   resolveHistoryDisplayTarget,
 } from '../../utils/historyDisplayUnits.mjs';
-import { createHistoryTailSpacer } from '../../utils/historyTailSpacer.mjs';
+import {
+  createHistoryTailSpacer,
+  historyTailReserveDeficitAfterShrink,
+} from '../../utils/historyTailSpacer.mjs';
 import {
   acceptHistoryPromptHandoffProviderQueue,
   advanceHistoryPromptHandoffTransportPhase,
@@ -300,6 +314,7 @@ interface RawAction {
     // family read/search/git/run/edit/mcp/plan/web + parsed MCP server·method.
     family?: string;
     bashWord?: string;
+    bashDetail?: string;
     mcpServer?: string;
     mcpMethod?: string;
     diffHunks?: Array<{
@@ -1326,49 +1341,149 @@ function findHistoryScrollParent(element: HTMLElement | null): HTMLElement | nul
 }
 
 /**
- * History expansion follows the revealed content, not the old header position.
- * After Virtuoso has measured the taller row, scroll only by the part that fell
- * below the viewport. Blocks that already fit do not move the list.
+ * THE stationary-click law («это прям база», 16.08): the row the user clicked
+ * does not move — in EITHER direction.
+ *
+ * Expand: the body opens DOWNWARD below the header; the header stays exactly
+ * where it was. The list grew below the click point, so the thumb shortens
+ * and content below shifts down — the natural consequence, never
+ * compensated. No auto-scroll «to show the revealed content» (earlier
+ * iterations pulled the list up and the header «уходит вверх» — rejected),
+ * and no tail-follow either: expanding while pinned to the streaming tail
+ * previously let followOutput treat the grown list as new content and jump
+ * to the new bottom — the exact «нажимаю, и строчка уходит вверх» report.
+ * Expanding IS leaving the bottom, so the pin turns off first.
+ *
+ * Collapse: height above the click point is unchanged, so normally nothing
+ * moves either. The one failure mode is at the BOTTOM: the shrunken content
+ * cannot fill the viewport any more, the browser clamps scrollTop and the
+ * frame jumps down. The missing height is reserved as fake empty space below
+ * the content (the tail spacer) in the same task — the frame stays put, the
+ * reserve burns away as the user scrolls up. Virtuoso can propagate a
+ * mid-list shrink through a late measurement pass, so the clamp check runs
+ * again one frame later.
+ *
+ * Both directions work per-scroller (several History panels can be mounted
+ * at once — column mode): the panel registers its scroller's operations
+ * here, and the shared toggle helper looks them up by the scroller it found.
  */
+interface HistoryRevealScrollerOps {
+  /** Grow the tail reserve by px and commit it synchronously. */
+  armTailReserve(px: number, reason?: string): void;
+  /** Turn off tail-following (the user is now reading, not following). */
+  unpinTail(): void;
+  /** True while/just after a REAL gesture (wheel, touch, scroll keys,
+   * scrollbar drag). Programmatic writers cannot fake this. */
+  isUserGestureRecent(): boolean;
+  /** A held frame may accept the gesture that established its initial reading
+   * position, but must yield to every gesture that happens afterwards. */
+  getUserGestureGeneration(): number;
+  isUserGestureActive(): boolean;
+  /** During a shrink the browser may already clamp live scrollTop. The hold
+   * target is the pre-change reading position used by spacer reconciliation. */
+  beginTailHold(scrollTop: number): number;
+  isTailHoldCurrent(token: number): boolean;
+  endTailHold(token: number): void;
+}
+const historyRevealOpsByScroller = new WeakMap<HTMLElement, HistoryRevealScrollerOps>();
+
+/**
+ * Keep the frame still after any tail shrink (group collapse or terminal
+ * preview replacement). Two writers fight the held position (both measured
+ * live, 16.08):
+ *   1. the browser CLAMP — the shrunken content cannot fill the viewport at
+ *      the old scrollTop, scrollTop snaps to the new maximum;
+ *   2. Virtuoso's own shrink compensation — its measurement pass lands up to
+ *      ~250ms later and moves scrollTop again.
+ * Any deficit becomes tail reserve (fake space below the content), and the
+ * position is re-asserted every frame for a short window so the late writer
+ * loses too. A real user gesture ends the hold immediately — from that
+ * moment the position belongs to the user.
+ */
+function holdHistoryShrinkFrame(
+  scroller: HTMLElement,
+  scrollTopBefore: number,
+  ops: HistoryRevealScrollerOps,
+  options: {
+    reason?: string;
+    allowExistingGesture?: boolean;
+    gestureGenerationAtStart?: number;
+    exactTarget?: boolean;
+    onFinish?: () => void;
+  } = {},
+): () => void {
+  const HOLD_MS = 400;
+  const startedAt = performance.now();
+  const gestureGenerationAtStart = options.gestureGenerationAtStart
+    ?? ops.getUserGestureGeneration();
+  const tailHoldToken = ops.beginTailHold(scrollTopBefore);
+  let cancelled = false;
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    ops.endTailHold(tailHoldToken);
+    options.onFinish?.();
+  };
+  // Standing in reserved space is reading, not tail-following — unpin once,
+  // or followOutput treats the next unit change as a reason to jump.
+  ops.unpinTail();
+  const step = () => {
+    if (cancelled || !scroller.isConnected || !ops.isTailHoldCurrent(tailHoldToken)) {
+      finish();
+      return;
+    }
+    const userTookOwnership = options.allowExistingGesture
+      ? ops.isUserGestureActive()
+        || ops.getUserGestureGeneration() !== gestureGenerationAtStart
+      : ops.isUserGestureRecent();
+    if (userTookOwnership) { finish(); return; }
+    const deficit = historyTailReserveDeficitAfterShrink(scroller, scrollTopBefore);
+    // >2px: fractional row heights produce ±1px deficits that would arm a
+    // useless 1px reserve (and trip the mustBeZero diagnostics later).
+    if (deficit > 2) ops.armTailReserve(deficit, options.reason);
+    if (options.exactTarget && Math.abs(scroller.scrollTop - scrollTopBefore) > 0.5) {
+      scroller.scrollTop = scrollTopBefore;
+    } else if (scroller.scrollTop < scrollTopBefore - 0.5) {
+      scroller.scrollTop = scrollTopBefore;
+    }
+    if (performance.now() - startedAt < HOLD_MS) {
+      requestAnimationFrame(step);
+    } else {
+      finish();
+    }
+  };
+  step();
+  return () => {
+    cancelled = true;
+    finish();
+  };
+}
+
 function applyHistoryRevealUpdate(
   anchor: HTMLElement | null,
   opening: boolean,
   update: () => void,
 ) {
   const scroller = findHistoryScrollParent(anchor);
+  if (!scroller) {
+    flushSync(update);
+    return;
+  }
+  const ops = historyRevealOpsByScroller.get(scroller) || null;
+  // Toggling a row is READING, both directions — turn tail-following off
+  // BEFORE the list changes size. A stale follow intent (pinned earlier,
+  // then the list grew without a scroll event) otherwise fires on the very
+  // resize this toggle causes and jumps to the new bottom, moving the
+  // clicked row (measured live 16.08: collapse at dist=836 → +246px jump).
+  ops?.unpinTail();
+  if (opening) {
+    flushSync(update);
+    return;
+  }
+  const scrollTopBefore = scroller.scrollTop;
   flushSync(update);
-  if (!opening || !anchor || !scroller) return;
-
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      if (!anchor.isConnected || !scroller.isConnected) return;
-      const anchorRect = anchor.getBoundingClientRect();
-      const scrollerRect = scroller.getBoundingClientRect();
-      // In the primary History surface the composer floats over the scroller.
-      // The footer spacer keeps the final row reachable, but the composer's
-      // occupied height is still not part of the currently visible viewport.
-      // Reuse that single geometry source instead of querying a second DOM
-      // element (which could select controls from another mounted tab).
-      const overlayHeight = Number.parseFloat(
-        window.getComputedStyle(scroller).getPropertyValue('--hp-composer-overlay-height'),
-      ) || 0;
-      const visibleBottom = scrollerRect.bottom - overlayHeight - 8;
-      const overflow = anchorRect.bottom - visibleBottom;
-      if (overflow <= 0.5) return;
-      // Never push the row's own HEADER off the top.
-      //
-      // Pulling the whole overflow into view is right for a short body, but a
-      // tall one is taller than the viewport: the scroll then runs past the
-      // header and the user loses the thing they just opened («менюшка уходит
-      // вверх — она не должна двигаться, я сам проскроллю», 16.08). The
-      // header's distance to the top of the viewport is therefore the hard
-      // budget: spend what is available, leave the rest to the user's own
-      // scroll, and stop at 0 when the header already sits at the top.
-      const headroom = Math.max(0, anchorRect.top - scrollerRect.top - 8);
-      const shift = Math.min(overflow, headroom);
-      if (shift > 0.5) scroller.scrollTop += shift;
-    });
-  });
+  if (ops) holdHistoryShrinkFrame(scroller, scrollTopBefore, ops);
 }
 
 /**
@@ -1717,6 +1832,52 @@ const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
   );
 });
 
+/** «2m 40s» / «22s» — shared by the think row and the group header. */
+const formatThinkingDuration = (seconds: number): string => {
+  if (!(seconds > 0)) return '';
+  if (seconds < 60) return seconds + 's';
+  const rest = seconds % 60;
+  return Math.floor(seconds / 60) + 'm' + (rest ? ' ' + rest + 's' : '');
+};
+
+/**
+ * Copy of a row whose payload may be DEHYDRATED (main ships a preview plus a
+ * ref for anything large).
+ *
+ * Copying the preview would hand over a truncated payload with no sign that
+ * it was cut — the one outcome a copy button must never produce. So a press
+ * on a not-yet-loaded row asks for the payload and copies it the moment it
+ * arrives, using the same lazy loader (and cache) that expanding uses. Rows
+ * whose text is already whole copy synchronously, as before.
+ */
+const useRehydratedCopy = (
+  preview: string | undefined,
+  ref: HistoryPayloadRef | undefined,
+  presented: string | undefined,
+  requestPayload: (wanted: boolean) => void,
+) => {
+  const pendingRef = useRef(false);
+  const isWhole = !ref || (presented != null && presented !== preview);
+  // The deferred press completes in an EFFECT, never during render: writing
+  // to the clipboard is a side effect, and React may render a component more
+  // than once per commit.
+  useEffect(() => {
+    if (!pendingRef.current || !isWhole) return;
+    pendingRef.current = false;
+    const text = presented || preview || '';
+    if (text) clipboard.writeText(text);
+  }, [isWhole, presented, preview]);
+  return (value: string) => {
+    if (isWhole) {
+      const text = value || presented || preview || '';
+      if (text) clipboard.writeText(text);
+      return;
+    }
+    pendingRef.current = true;
+    requestPayload(true);
+  };
+};
+
 const HistoryThinkBlock = memo(({ text, payloadRef, seconds }: {
   text: string;
   payloadRef?: HistoryPayloadRef;
@@ -1725,12 +1886,25 @@ const HistoryThinkBlock = memo(({ text, payloadRef, seconds }: {
   const anchorRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const onToggle = useHistoryRevealToggle(anchorRef, open, setOpen);
-  const { text: presented } = useRehydratedPayload(text, payloadRef, open);
+  // Two readers of one payload: expanding shows it, copy hands it over. The
+  // copy hook only says whether it still needs the full text; the fetch stays
+  // a single call so both paths share one request and one cache entry.
+  const [copyWanted, setCopyWanted] = useState(false);
+  const { text: presented } = useRehydratedPayload(text, payloadRef, open || copyWanted);
+  const copy = useRehydratedCopy(text, payloadRef, presented, setCopyWanted);
   // «thinking · 2m 40s» — duration derived from record timestamps (parser).
-  const label = typeof seconds === 'number' && seconds > 0
-    ? 'thinking · ' + (seconds >= 60 ? Math.floor(seconds / 60) + 'm ' + (seconds % 60 ? (seconds % 60) + 's' : '').trim() : seconds + 's')
-    : 'thinking';
-  return <CBThinkBlock text={presented || text} label={label} open={open} onToggle={onToggle} anchorRef={anchorRef} />;
+  const duration = formatThinkingDuration(Number(seconds) || 0);
+  const label = duration ? 'thinking · ' + duration : 'thinking';
+  return (
+    <CBThinkBlock
+      text={presented || text}
+      label={label}
+      open={open}
+      onToggle={onToggle}
+      anchorRef={anchorRef}
+      onCopy={copy}
+    />
+  );
 });
 
 // Session-scoped fetch context for dehydrated payloads. Card components sit
@@ -1835,6 +2009,8 @@ const HistoryToolCallPart = memo(({
   bashDetail,
   mcpServer,
   mcpMethod,
+  docsKind,
+  forceOpen = false,
 }: {
   toolName: string;
   args: Record<string, any>;
@@ -1854,6 +2030,8 @@ const HistoryToolCallPart = memo(({
   bashDetail?: string;
   mcpServer?: string;
   mcpMethod?: string;
+  docsKind?: string;
+  forceOpen?: boolean;
 }) => {
   const anchorRef = useRef<HTMLDivElement>(null);
   // Every card starts collapsed — including Edit/Write/MultiEdit, which used
@@ -1865,16 +2043,21 @@ const HistoryToolCallPart = memo(({
   // and the ±line counts; the hunks enter the DOM only on explicit expand,
   // exactly like Bash/Read output. Collapsed height is one stable header
   // line, which also keeps measured-geometry snapshots honest.
-  const [open, setOpen] = useState(false);
-  const onToggle = useHistoryRevealToggle(anchorRef, open, setOpen);
+  const [localOpen, setLocalOpen] = useState(false);
+  const onToggle = useHistoryRevealToggle(anchorRef, localOpen, setLocalOpen);
+  const open = forceOpen || localOpen;
   // The full output is fetched when the card is expanded; the preview renders
-  // in the collapsed header either way.
-  const { text: presentedResult, pending, failed } = useRehydratedPayload(result, resultRef, open);
+  // in the collapsed header either way. Copy is the SECOND reader of the same
+  // payload — pressing it on a collapsed card must not hand over a preview.
+  const [copyWanted, setCopyWanted] = useState(false);
+  const { text: presentedResult, pending, failed } = useRehydratedPayload(result, resultRef, open || copyWanted);
+  const copyResult = useRehydratedCopy(result, resultRef, presentedResult, setCopyWanted);
 
   return (
     <div
       className="hp-tool-scroll-scope"
       data-history-tool-name={toolName}
+      data-history-docs-kind={docsKind || undefined}
     >
       <CBToolCallPart
         toolName={toolName}
@@ -1890,7 +2073,12 @@ const HistoryToolCallPart = memo(({
         headline={historyActionHeadline({ toolName, args, family, bashWord, bashDetail, mcpServer, mcpMethod })}
         mcpServer={mcpServer}
         mcpMethod={mcpMethod}
-        collapse={{ open, onToggle, anchorRef }}
+        collapse={{ open, onToggle: forceOpen ? () => {} : onToggle, anchorRef }}
+        // Electron clipboard, never navigator.clipboard in a renderer — the
+        // latter silently fails without HTTPS/permissions (project rule).
+        // Routed through the rehydration-aware copy so a dehydrated result is
+        // fetched first instead of copying its preview.
+        onCopy={copyResult}
       />
       {open && pending && (
         <div style={{ fontSize: '0.8em', color: '#818cf8', padding: '2px 8px' }}>
@@ -2987,7 +3175,13 @@ const HistoryUserEntry = memo(({
   );
 });
 
-const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
+const HistoryAssistantEntry = memo(({
+  entry,
+  forceToolOpen = false,
+}: {
+  entry: FullHistoryEntry;
+  forceToolOpen?: boolean;
+}) => {
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveBackgroundUuids = React.useContext(HistoryBackgroundLiveContext);
@@ -3047,6 +3241,15 @@ const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
             : toolResult;
           const backgroundRunning = action.rawTool.backgroundStatus === 'running'
             && liveBackgroundUuids.has(entry.uuid);
+          const presentation = historyActionPresentationMeta({
+            toolName,
+            args: action.rawTool.args || {},
+            family: action.rawTool.family,
+            bashWord: action.rawTool.bashWord,
+            bashDetail: action.rawTool.bashDetail,
+            mcpServer: action.rawTool.mcpServer,
+            mcpMethod: action.rawTool.mcpMethod,
+          });
           return (
             <div key={'raw' + index + ':' + toolName}>
               <HistoryToolCallPart
@@ -3061,6 +3264,8 @@ const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
                 bashDetail={action.rawTool.bashDetail}
                 mcpServer={action.rawTool.mcpServer}
                 mcpMethod={action.rawTool.mcpMethod}
+                docsKind={presentation.docsKind}
+                forceOpen={forceToolOpen}
               />
               {backgroundRunning && (
                 // The card holds only the acceptance text; the live face of
@@ -3149,6 +3354,73 @@ const HISTORY_GROUP_FAMILY_META: Record<string, { label: string; active: string;
   edit: { label: 'Edited', active: 'Editing', unit: ['file', 'files'] },
 };
 
+const HISTORY_INNER_NAMES_MAX_CHARS = 70;
+
+/** Distinct user-visible targets in first-appearance order. Repeated windows
+ * of one file collapse to one name; basename collisions regain the shortest
+ * useful parent suffix instead of pretending two `index.ts` files are one. */
+const historyGroupTargetLabels = (facts: Array<any>, family: string): string[] => {
+  const items: Array<{ key: string; label: string; full: string }> = [];
+  const seen = new Set<string>();
+  for (const fact of facts) {
+    const operation = String(fact.operationLabel || fact.mcpMethod || fact.subject || '');
+    const target = String(fact.targetKey || '');
+    const key = family === 'mcp' || family === 'run' || family === 'git'
+      ? (operation || fact.toolUseId || '')
+      : (target || fact.targetLabel || operation || fact.toolUseId || '');
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const label = family === 'mcp'
+      ? operation.replace(/_/g, ' ')
+      : String(fact.targetLabel || operation || target);
+    items.push({ key, label, full: target || key });
+  }
+  const collisions = new Map<string, number>();
+  for (const item of items) collisions.set(item.label, (collisions.get(item.label) || 0) + 1);
+  return items.map((item) => {
+    if ((collisions.get(item.label) || 0) <= 1) return item.label;
+    const parts = item.full.split('/').filter(Boolean);
+    if (parts.length >= 2) return parts.slice(-2).join('/');
+    return item.full || item.label;
+  }).filter(Boolean);
+};
+
+const historyInnerGroupHeaderData = (group: any, live: boolean) => {
+  const family = String(group.familyKey || group.facts?.[0]?.family || 'run');
+  const targets = historyGroupTargetLabels(group.facts || [], family);
+  const joined = targets.join(', ');
+  const showNames = targets.length > 0 && targets.length <= 3
+    && joined.length <= HISTORY_INNER_NAMES_MAX_CHARS
+    && !(family === 'mcp' && (group.facts?.length || 0) > 3);
+  const docs = group.docsKind ? 'docs ' : '';
+  const count = targets.length || group.facts?.length || 0;
+  if (family === 'mcp') {
+    const server = String(group.facts?.[0]?.mcpServer || 'mcp');
+    if (showNames) return { verb: `${server} · ${joined}`, digest: '' };
+    return {
+      verb: live
+        ? `Calling ${server} · ${group.facts?.length || 0} calls`
+        : `${server} · ${group.facts?.length || 0} calls`,
+      digest: '',
+    };
+  }
+  const words: Record<string, [string, string, string]> = {
+    read: ['Read', 'Reading', 'files'],
+    search: ['Search', 'Searching', targets.length > 0 ? 'files' : 'queries'],
+    edit: ['Edit', 'Editing', 'files'],
+    git: ['Git', 'Running git', 'commands'],
+    run: ['Run', 'Running', 'commands'],
+    web: ['Web', 'Searching web', 'queries'],
+    toolsearch: ['Tool search', 'Searching tools', 'calls'],
+  };
+  const meta = words[family] || words.run;
+  if (showNames) return { verb: `${live ? meta[1] : meta[0]} ${joined}`, digest: '' };
+  return {
+    verb: `${live ? meta[1] : meta[0]} ${count} ${docs}${count === 1 && meta[2] === 'files' ? 'file' : meta[2]}`,
+    digest: '',
+  };
+};
+
 /**
  * Header text of a collapsed group.
  *
@@ -3169,7 +3441,7 @@ const historyGroupHeaderData = (group: {
   errorCount: number;
 }, live: boolean) => {
   const breakdown = groupFamilyBreakdown(group.facts);
-  const phrase = (bucket: { family: string; count: number; words: Map<string, number> }) => {
+  const phrase = (bucket: { family: string; docsKind?: string; count: number; words: Map<string, number> }) => {
     if (bucket.family === 'mcp') {
       // «Called <server> ×N»: the verb says it is an MCP call, the noun is
       // the SERVER, the count is per server. Never the method — «Called
@@ -3186,7 +3458,10 @@ const historyGroupHeaderData = (group: {
       return bucket.count > 1 ? `Tool search ×${bucket.count}` : 'Tool search';
     }
     const meta = HISTORY_GROUP_FAMILY_META[bucket.family] || HISTORY_GROUP_FAMILY_META.run;
-    const unit = bucket.count === 1 ? meta.unit[0] : meta.unit[1];
+    const unitBase = bucket.count === 1 ? meta.unit[0] : meta.unit[1];
+    const unit = bucket.docsKind && (bucket.family === 'read' || bucket.family === 'edit')
+      ? `docs ${unitBase}`
+      : unitBase;
     return `${live ? meta.active : meta.label} ${bucket.count} ${unit}`;
   };
   if (breakdown.length === 0) return { verb: live ? 'Working' : 'Done', digest: '' };
@@ -3236,11 +3511,14 @@ const HistoryCollapsedGroupRow = memo(({
 }: {
   group: {
     key: string;
+    level?: number;
     familyKey: string;
+    docsKind?: string;
     entries: FullHistoryEntry[];
     captionEntry?: FullHistoryEntry | null;
-    facts: Array<{ toolUseId?: string; toolName?: string; family?: string; bashWord?: string; bashDetail?: string; mcpServer?: string; mcpMethod?: string; isError?: boolean }>;
+    facts: Array<{ toolUseId?: string; toolName?: string; family?: string; bashWord?: string; bashDetail?: string; mcpServer?: string; mcpMethod?: string; targetKey?: string; targetLabel?: string; operationLabel?: string; docsKind?: string; isError?: boolean }>;
     errorCount: number;
+    thinkingSeconds?: number;
   };
   expanded: boolean;
   liveBackgroundUuids: ReadonlySet<string>;
@@ -3257,7 +3535,14 @@ const HistoryCollapsedGroupRow = memo(({
   // through think-gaps when nothing inside the group was running.
   const live = (isTurnBusy && group.facts.some((fact) => (fact as any).inFlight === true))
     || group.entries.some((entry) => liveBackgroundUuids.has(entry.uuid));
-  const { verb, digest } = historyGroupHeaderData(group, live);
+  const inner = group.level === 2;
+  const { verb, digest } = inner
+    ? historyInnerGroupHeaderData(group, live)
+    : historyGroupHeaderData(group, live);
+  const thinkingLabel = (() => {
+    const duration = formatThinkingDuration(Number(group.thinkingSeconds) || 0);
+    return duration ? 'думал ' + duration : '';
+  })();
   const caption = group.captionEntry && typeof group.captionEntry.content === 'string'
     ? group.captionEntry.content.trim()
     : '';
@@ -3273,7 +3558,12 @@ const HistoryCollapsedGroupRow = memo(({
   // group and card never look alike.
   const editStats = group.familyKey === 'edit' ? historyEditGroupStats(group.entries) : null;
   return (
-    <div className="hp-history-group" data-history-group-live={live ? '1' : undefined}>
+    <div
+      className={`hp-history-group${inner ? ' hp-history-group--inner' : ''}`}
+      data-history-group-live={live ? '1' : undefined}
+      data-history-group-level={inner ? '2' : '1'}
+      data-history-docs-kind={group.docsKind || undefined}
+    >
       <div className="hp-history-group-head">
       <div
         className="hp-history-group-head-inner"
@@ -3289,7 +3579,9 @@ const HistoryCollapsedGroupRow = memo(({
         }}
       >
         <ColoredToolIcon
-          icon={cbToolIcon('Bash', 13, 'group')}
+          icon={inner
+            ? cbToolIcon(group.facts[0]?.toolName || 'Bash', 13, group.familyKey)
+            : cbToolIcon('Bash', 13, 'group')}
           // Collapsed: the group INHERITS the running child's spinner. Expanded:
           // the spinner lives on that child card itself (its status is already
           // 'running'), the header goes back to the static stack — one loader
@@ -3307,6 +3599,15 @@ const HistoryCollapsedGroupRow = memo(({
             below — a long caption used to push the counts off the right edge,
             leaving the row with no readable meta at all. */}
         <span className="hp-history-group-count">{verb}</span>
+        {/* Reasoning is NOT one of the counted actions — it is the time the
+            block spent thinking, summed once for the whole run. Naming it
+            among the phrases («Read 2 files · 3 thoughts») would count
+            thoughts, which answers nothing; the total answers the real
+            question — why two reads took a minute. Collapsed only: expanded,
+            each think row states its own duration. */}
+        {!expanded && thinkingLabel && (
+          <span className="hp-history-group-think">{thinkingLabel}</span>
+        )}
         {editStats && (editStats.added > 0 || editStats.removed > 0) && (
           <span className="hp-history-group-stats cb-diff-stats">
             {editStats.added > 0 && <span className="cb-c-add">+{editStats.added}</span>}
@@ -3332,6 +3633,70 @@ const HistoryCollapsedGroupRow = memo(({
   );
 });
 
+const HistoryGroupFoot = ({
+  groupKey,
+  onCollapse,
+  title = 'Свернуть блок',
+}: {
+  groupKey: string;
+  onCollapse: (groupKey: string) => void;
+  title?: string;
+}) => (
+  <button
+    type="button"
+    className="hp-history-group-foot"
+    data-history-group-foot={groupKey}
+    aria-label={title}
+    title={title}
+    onClick={() => onCollapse(groupKey)}
+  >
+    <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden focusable="false">
+      <path d="M7 14 V6.5" fill="none" stroke="currentColor" strokeWidth="1" />
+      <path
+        d="M11 10 L7 6 L3 10"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.25"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  </button>
+);
+
+/**
+ * A slash command the USER typed (`/model`, `/effort`, `/rewind`).
+ *
+ * Not a message: nothing was said to the model, a switch was flipped. So it
+ * is neither a right-side bubble (that column means "the user spoke") nor a
+ * coloured/filled block (colour in this feed means STATE, and a filled
+ * background is far too heavy for a one-word setting — user's own read). It
+ * is a service line, exactly like a tool row: left side, one line, quiet
+ * grey, small glyph. Previously these fell through to the assistant branch
+ * and rendered as bare left-aligned text that looked like a torn-off message.
+ */
+/**
+ * Status titles arrive as legacy ALL-CAPS constants («LOADING CODEX
+ * SESSION...»). The feed speaks sentence case everywhere (one type voice —
+ * user decision), so the chip presents them as a sentence; the constants stay
+ * untouched because tests and logs match on them.
+ */
+const presentStatusTitle = (title: string): string => {
+  const text = String(title || '');
+  if (!/[A-Z]/.test(text) || text !== text.toUpperCase()) return text;
+  const lower = text.toLowerCase();
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+};
+
+const HistorySlashRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
+  <ConversationMessage layout="block" entryUuid={entry.uuid} className="hp-assistant-tool-only">
+    <div className="hp-history-slash">
+      <SlidersHorizontal size={12} className="hp-history-slash-ic" />
+      <span className="hp-history-slash-cmd">{entry.content}</span>
+    </div>
+  </ConversationMessage>
+));
+
 // Single history entry renderer
 const HistoryEntry = memo(({
   entry,
@@ -3341,6 +3706,7 @@ const HistoryEntry = memo(({
   rewindLocked,
   rewindUnavailableReason,
   forceExpanded,
+  forceToolOpen,
   onDismissUnconfirmed,
 }: {
   entry: FullHistoryEntry;
@@ -3350,6 +3716,7 @@ const HistoryEntry = memo(({
   rewindLocked: boolean;
   rewindUnavailableReason?: string | null;
   forceExpanded?: boolean;
+  forceToolOpen?: boolean;
   onDismissUnconfirmed?: (entry: FullHistoryEntry) => void;
 }) => {
   if (entry.role === 'compact') {
@@ -3410,6 +3777,10 @@ const HistoryEntry = memo(({
     );
   }
 
+  if (entry.role === 'slash') {
+    return <HistorySlashRow entry={entry} />;
+  }
+
   if (entry.role === 'user') {
     return (
       <HistoryUserEntry
@@ -3424,8 +3795,28 @@ const HistoryEntry = memo(({
     );
   }
 
-  return <HistoryAssistantEntry entry={entry} />;
+  return <HistoryAssistantEntry entry={entry} forceToolOpen={forceToolOpen} />;
 });
+
+// The feed's quietest voice — service text, as opposed to content.
+//
+// One number, used by BOTH the CSS below (`.hp-history-group-detail`, the «└ …»
+// line under a collapsed group header) and by the inline-styled status chip on
+// the composer's border. They are the same kind of text — a caption ABOUT
+// something rather than the something — so they must not be sized separately;
+// picking a number for one of them by eye is how the chip twice ended up as loud
+// as the chat text itself.
+const HISTORY_SERVICE_TEXT_RATIO = 0.82;
+// …and its WEIGHT. The reference line sets none, i.e. it inherits the feed's
+// ordinary text weight — a caption is quieter than what it annotates, so it has
+// nothing to be emphatic about. Written out as a number rather than left to
+// inheritance because the chip is styled inline and would otherwise pick up
+// whatever weight its own container happens to carry.
+//
+// Half-bold (650) here was the second half of the same mistake as the font size:
+// matching «the example» by eye instead of by reference, so the chip shouted at a
+// size that was already too close to the content's.
+const HISTORY_SERVICE_TEXT_WEIGHT = 400;
 
 // Flash/search/component styles. Keep the existing node across HMR, but refresh
 // its contents: an "inject once" guard leaves stale CSS in a live dev renderer.
@@ -3542,6 +3933,15 @@ const historyPanelStyleText = `@keyframes hp-flash {
   margin-top: 2px;
   margin-bottom: 2px;
 }
+/* A reasoning row is a service line exactly like a tool row, so it gets the
+   same tight rhythm. Its package default (12px above and below, sized for a
+   chat bubble) survived here and made every «thinking · 39s» a 30px hole in
+   an otherwise dense feed — three of them in a row read as three separate
+   sections of nothing. */
+.hp-history-transcript .cb-think {
+  margin-top: 2px;
+  margin-bottom: 2px;
+}
 /* Action rows are service lines under the prose, not competing blocks: one
    compact line (~22px), secondary type size, tight paddings. The expanded
    body keeps full size — density applies to the HEADER line only. */
@@ -3569,6 +3969,14 @@ const historyPanelStyleText = `@keyframes hp-flash {
      padding must be exactly 12px too — 14px put the glyph 2px right of the
      card icon column (measured live). */
   padding: 0 12px;
+}
+/* Homogeneous aggregate: the semantic icon (Read/Search/Edit/MCP) is its
+   identity, so it is visually lighter than the broad stack chapter. */
+.hp-history-group--inner { margin-top: 2px; margin-bottom: 2px; }
+.hp-history-group-member > [data-history-group] .hp-history-group--inner {
+  margin: 0;
+  padding-left: 4px;
+  padding-right: 4px;
 }
 .hp-history-group-head {
   /* Block-level flex with an INTEGRAL min-height: a virtualized feed measures
@@ -3605,6 +4013,31 @@ const historyPanelStyleText = `@keyframes hp-flash {
   overflow-wrap: anywhere;
   line-height: 1.35;
 }
+/* User's own slash command: a service line, same rhythm and voice as a tool
+   row — never a chat bubble and never a filled block. */
+.hp-history-slash {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  /* NO horizontal padding: the row wrapper (.cb-row-block) already insets by
+     12px, so adding 12 more pushed this row a step right of every other row
+     and it read as a child of something — while it has no parent (user).
+     Its glyph must sit on the same vertical line as every other row's glyph. */
+  padding: 0;
+  color: #8f8d88;
+  font-size: 0.9em;
+}
+.hp-history-slash-ic { flex-shrink: 0; color: #6f6d68; }
+.hp-history-slash-cmd { overflow-wrap: anywhere; }
+/* Reasoning time of a collapsed run — one quiet figure, never a phrase among
+   the action counts (thoughts are not actions and must not be counted as
+   such). Same muted weight as the ± digits. */
+.hp-history-group-think {
+  flex-shrink: 0;
+  color: #8f8d88;
+  font-size: 0.82em;
+}
 /* ± totals of a collapsed edit run — the fact the user scans, kept ON the
    header line rather than a second row per file. */
 .hp-history-group-stats {
@@ -3629,7 +4062,10 @@ const historyPanelStyleText = `@keyframes hp-flash {
   min-height: 18px;
   padding: 0 4px 0 26px;
   color: #8f8d88;
-  font-size: 0.82em;
+  /* The reference for every service caption in this panel — see
+     HISTORY_SERVICE_TEXT_RATIO. Interpolated rather than written as a literal so
+     the composer's status chip, which is styled inline, cannot drift from it. */
+  font-size: ${HISTORY_SERVICE_TEXT_RATIO}em;
   /* Full subject list, wrapped — never «file.md, file2.md · 3 more». */
   overflow-wrap: anywhere;
   line-height: 1.4;
@@ -3653,37 +4089,97 @@ const historyPanelStyleText = `@keyframes hp-flash {
      with 24px holes between members (user: «полоска прерывается»). */
   display: flow-root;
 }
+/* The rail's FOOT: the last stretch of the vertical line, turned into a
+   collapse control.
+   It costs the block NO extra height — the button is absolutely positioned
+   over the rail's own bottom segment, and that segment is hidden underneath
+   it (border-bottom-left-radius on the member would bend the line; masking a
+   fixed 14px instead keeps the rail's geometry exactly as it was). The glyph
+   is the line itself turning upward: the eye already follows this line down,
+   so the control appears where the line ENDS rather than as a new element
+   somewhere else. */
+.hp-history-group-member[data-history-group-last="1"] { position: relative; }
+.hp-history-group-foot {
+  position: absolute;
+  /* The rail is the member's own 1px left border at x=-1 relative to the
+     content box; the 14px hit area is CENTRED on it (-8px), so the chevron's
+     two arms have room on both sides and the click target is comfortable
+     without the drawing drifting off the line. */
+  left: -8px;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: none;
+  /* The panel's own ground, so the covered rail segment disappears cleanly
+     under the hook instead of showing through it. */
+  background: #151515;
+  color: rgba(255, 255, 255, 0.28);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.12s;
+}
+.hp-history-group-foot:hover,
+.hp-history-group-foot:focus-visible { color: #b8b6b1; }
 /* A SINGLE-family group already names the family in its header («Ran git…»,
    «Read 3 files»), so repeating that same word on every member doubles it
    (user feedback). A MIXED group is the opposite case: the verb is the only
    thing telling one member from the next, so it stays. */
 .hp-history-group-member[data-history-group-uniform="1"] .cb-tool-label { display: none; }
-/* Group open/close motion — GPU-only (opacity/transform). Height is NOT
-   animated here on purpose: member rows are virtualized list items, and
-   animating their height would make the list remeasure every frame (the
-   scroll-jitter class of bug). Opening plays on mount; closing plays on the
-   still-mounted nodes for one beat before the state change removes them. */
-@keyframes hp-group-reveal {
-  from { opacity: 0; transform: translateY(-3px); }
-  to { opacity: 1; transform: translateY(0); }
+/* Rhythm INSIDE a container is tighter than the rhythm BETWEEN containers.
+   A group is one thing the eye takes in at once — its members are a list, not
+   a sequence of separate steps — so they tile without any air of their own
+   and the only vertical space left is the hover pill's own padding (4px), the
+   part that must stay because it is the clickable surface.
+   Before this the space between two members was built from three layers at
+   once — the card's own 2px margin, the head's 2px padding and the pill's 4px
+   — i.e. 16px between neighbours, which made a 19-file group read as 19
+   separate events (user, comparing with Codex: «внутри группы значительно
+   меньше»). Groups themselves keep their margins: separating chapters of work
+   is exactly what that air is for. */
+.hp-history-group-member .cb-tool { margin-top: 0; margin-bottom: 0; }
+.hp-history-group-member .cb-tool-head { padding-top: 0; padding-bottom: 0; }
+/* The one exception: a member that is OPEN has a body, and a body pressed
+   flush against the next row's header would read as belonging to that row.
+   Air returns for that row only, and only while it is open. */
+.hp-history-group-member .cb-tool:has(> .cb-tool-body) { margin-bottom: 8px; }
+/* A reasoning row inside a group is a member like any other. */
+.hp-history-group-member .cb-think { margin-top: 0; margin-bottom: 0; }
+/* Third level: raw bodies below one homogeneous aggregate. The list remains
+   flat in Virtuoso; this nested rail is presentation only. Tool headers are
+   suppressed because the aggregate already named the action/targets, and the
+   host force-opens each visible body's original result. */
+.hp-history-subgroup-member {
+  border-left: 1px solid rgba(255, 255, 255, 0.10);
+  margin-left: 19px;
+  padding-left: 5px;
+  display: flow-root;
 }
-@keyframes hp-group-fold {
-  from { opacity: 1; transform: translateY(0); }
-  to { opacity: 0; transform: translateY(-4px); }
+.hp-history-subgroup-member[data-history-subgroup-last="1"] { position: relative; }
+.hp-history-subgroup-member .cb-tool-head { display: none; }
+.hp-history-subgroup-member .cb-tool { margin-top: 0; margin-bottom: 8px; }
+.hp-history-subgroup-member .cb-tool-body { padding-top: 0; }
+.hp-history-subgroup-member .cb-think { margin-top: 0; margin-bottom: 0; }
+/* A direct homogeneous aggregate at the root uses the same rail geometry as
+   one nested under a broad block. */
+.hp-history-subgroup-member--root { margin-left: 19px; }
+
+/* Documentation is an action attribute, not a new status. Running/error keep
+   their status colours; completed icons inherit Timeline's two docs channels. */
+.hp-tool-scroll-scope[data-history-docs-kind="search"] .cb-tool-ic.cb-c-done,
+.hp-history-group[data-history-docs-kind="search"] > .hp-history-group-head .cb-tool-ic.cb-c-done {
+  color: #bef264;
 }
-.hp-history-group-member,
-.hp-history-group-collapsed-appear {
-  animation: hp-group-reveal 140ms ease-out;
+.hp-tool-scroll-scope[data-history-docs-kind="edit"] .cb-tool-ic.cb-c-done,
+.hp-history-group[data-history-docs-kind="edit"] > .hp-history-group-head .cb-tool-ic.cb-c-done {
+  color: #4ade80;
 }
-.hp-history-group-member--closing {
-  animation: hp-group-fold 110ms ease-in forwards;
-  pointer-events: none;
-}
-@media (prefers-reduced-motion: reduce) {
-  .hp-history-group-member,
-  .hp-history-group-member--closing,
-  .hp-history-group-collapsed-appear { animation: none; }
-}
+/* No open/close animation, by decision (16.08): rows in the virtualized list
+   change height in one frame, and the toggle handlers compensate scrollTop in
+   that same frame so the clicked row never moves. Any animated variant either
+   fought the remeasure (jitter) or fought the compensation. */
 .hp-history-composer-frame {
   border-color: #333;
   background: #0f0f0f;
@@ -3702,9 +4198,15 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-history-composer-toolbar {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  /* Не переносится. Строка живёт в слоте фиксированной высоты (24px), поэтому
+     перенесённая часть просто уехала бы за границу и стала невидимой — хуже,
+     чем сжатая. Всё, что здесь может расти в ширину (статус, предупреждения,
+     панель управления), само сокращается: у панели для этого есть отдельное
+     правило гашения показаний. */
+  flex-wrap: nowrap;
   gap: 5px;
   min-width: 0;
+  width: 100%;
 }
 .hp-composer-chip-action {
   width: 18px;
@@ -4622,6 +5124,10 @@ function AgentHistoryControls({
   const prompt = useUIStore(useCallback((s) => s.historyPromptDrafts[tabId] || '', [tabId]));
   const historyComposerFontSize = useUIStore((s) => s.historyComposerFontSize);
   const aiSecondaryFontSize = useUIStore((s) => s.aiSecondaryFontSize);
+  // The transcript's base size — the floating status chip derives from IT
+  // (same 0.9 ratio as .cb-tool-label), so the chip speaks in the same voice
+  // as the feed's service lines instead of the separate secondary scale.
+  const historyTranscriptFontSize = useUIStore((s) => s.historyFontSize);
   const historyComposerMinRowsSetting = useUIStore((s) => s.historyComposerMinRows);
   const historyComposerMaxRowsSetting = useUIStore((s) => s.historyComposerMaxRows);
   const stackedComposerMaxRows = useUIStore((s) => s.stackedComposerMaxRows);
@@ -4675,7 +5181,42 @@ function AgentHistoryControls({
   }, [isPasteBusy, onInputBusyChange]);
   useEffect(() => () => onInputBusyChange?.(false), [onInputBusyChange]);
   const [historyUpdating, setHistoryUpdating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // A failure is ANNOUNCED (top-right toast), it is not a state of the composer.
+  //
+  // It used to be a line at the very bottom of the panel: it appeared under the
+  // input, raised the whole frame, and then stayed until some unrelated action
+  // happened to clear it — a Stop that failed ten minutes ago still sat there
+  // while the user typed the next prompt. Two things were wrong with that. The
+  // panel paid layout for something that is an event, and the message had no
+  // lifetime of its own, so an old failure kept describing a situation that no
+  // longer existed.
+  //
+  // Scoped to this tab, so a failure in a background pane is announced over ITS
+  // surface and not over the one being read; a tab-scoped toast falls back to
+  // the window corner when its tab is off screen, so nothing is lost either way.
+  const reportError = useCallback((cause: unknown) => {
+    const message = (typeof cause === 'string'
+      ? cause
+      : String((cause as any)?.message ?? cause ?? '')).trim();
+    if (!message) return;
+    // Headline = the first line. A stack or a multi-line CLI complaint keeps its
+    // full text, but behind the chevron: the toast must stay readable at a glance
+    // and still be copyable in full.
+    const firstLine = (message.split('\n')[0] || message).trim() || message;
+    const headline = firstLine.length > 160 ? firstLine.slice(0, 157) + '…' : firstLine;
+    useUIStore.getState().showToast(
+      headline,
+      'error',
+      6000,
+      false,
+      message,
+      undefined,
+      undefined,
+      tabId,
+      undefined,
+      headline === message ? undefined : message,
+    );
+  }, [tabId]);
   const [draftWarning, setDraftWarning] = useState<string | null>(null);
   const delayedDeliveryWarningHandoffRef = useRef<string | null>(null);
   const [interruptAwaiting, setInterruptAwaiting] = useState(false);
@@ -4685,11 +5226,35 @@ function AgentHistoryControls({
   const [resumeMaterialized, setResumeMaterialized] = useState<boolean | null>(toolType === 'claude' ? null : true);
   const [resumeUnavailableReason, setResumeUnavailableReason] = useState<string | null>(null);
   const [statusCopied, setStatusCopied] = useState(false);
+  const [statusHover, setStatusHover] = useState(false);
   const [previewChipId, setPreviewChipId] = useState<string | null>(null);
   const [activityTiming, setActivityTiming] = useState<HistoryActivityTiming | null>(null);
   const [pasteActivityStartedAt, setPasteActivityStartedAt] = useState<number | null>(null);
   const [activityClock, setActivityClock] = useState(() => Date.now());
   const controlsRef = useRef<HTMLDivElement | null>(null);
+  // Publishing the controls slot as a callback ref, not through an effect and an
+  // id lookup: the node this points at is replaced whenever the panel changes
+  // layout, and an id lookup would keep answering with the detached one — the
+  // controls would then draw into a node nobody can see.
+  const composerControlsHostRef = useRef<HTMLDivElement | null>(null);
+  const composerControlsHostTabRef = useRef<string>(tabId);
+  const setComposerControlsHostNode = useCallback((node: HTMLDivElement | null) => {
+    const previousTab = composerControlsHostTabRef.current;
+    const previousNode = composerControlsHostRef.current;
+    // Withdraw only OUR node. When the layout is rebuilt React mounts the new
+    // composer before unmounting the old one, so clearing by tab id alone would
+    // erase the slot the new one has just published — and the controls would
+    // stay in the strip forever, because nothing publishes a second time.
+    if (previousNode) releaseComposerControlsHost(previousTab, previousNode);
+    composerControlsHostTabRef.current = tabId;
+    composerControlsHostRef.current = node;
+    if (node) setComposerControlsHost(tabId, node);
+  }, [tabId]);
+  useEffect(() => () => {
+    if (composerControlsHostRef.current) {
+      releaseComposerControlsHost(composerControlsHostTabRef.current, composerControlsHostRef.current);
+    }
+  }, []);
   const statusCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const promptTextareaRef = useRef<ComposerEditorHandle | null>(null);
   const initialComposerView = useUIStore.getState().historyComposerViewByTab[tabId];
@@ -5136,6 +5701,7 @@ function AgentHistoryControls({
     const handoff = getHistoryPromptHandoffsSnapshot(tabId)
       .find((candidate) => candidate.handoffId === pending.handoffId);
     const proof = handoff?.auditProof || null;
+    const queueProof = handoff?.providerQueueProof || null;
     return {
       ...pending.durableIdentity,
       requiresAuditIdentity: true,
@@ -5143,9 +5709,13 @@ function AgentHistoryControls({
       auditHash: proof?.actualHash || pending.durableIdentity.auditHash,
       auditSessionId: proof?.sessionId || pending.durableIdentity.auditSessionId,
       auditEntryUuid: proof?.entryUuid || pending.durableIdentity.auditEntryUuid,
-      sourceIdentity: proof?.sourceIdentity || pending.durableIdentity.sourceIdentity,
-      recordByteOffset: proof?.recordByteOffset ?? pending.durableIdentity.recordByteOffset,
-      sessionId: proof?.sessionId || pending.durableIdentity.sessionId,
+      sourceIdentity: proof?.sourceIdentity
+        || queueProof?.sourceIdentity
+        || pending.durableIdentity.sourceIdentity,
+      recordByteOffset: proof?.recordByteOffset
+        ?? queueProof?.recordByteOffset
+        ?? pending.durableIdentity.recordByteOffset,
+      sessionId: proof?.sessionId || queueProof?.sessionId || pending.durableIdentity.sessionId,
     } satisfies DurablePromptIdentity;
   }, [tabId]);
 
@@ -5195,7 +5765,8 @@ function AgentHistoryControls({
     setBusyAction(coordinatedAction ? 'send' : null);
     setIsPasteBusy(false);
     setHistoryUpdating(false);
-    setError(null);
+    // Nothing to clear for failures: each one is an announcement with its own
+    // lifetime, not a piece of this tab's state that a reset has to sweep.
     setDraftWarning(null);
     setInterruptAwaiting(false);
     setPendingQuestion(null);
@@ -5299,10 +5870,10 @@ function AgentHistoryControls({
       return;
     }
     if (event.reason === 'queued-stop-failed') {
-      setError(String(event.result?.error || 'Stop failed'));
+      reportError(event.result?.error || 'Stop failed');
     }
     refreshPresence();
-  }), [refreshPresence, setStatusFrom]);
+  }), [refreshPresence, reportError, setStatusFrom]);
 
   useEffect(() => {
     const handleAgentError = (event: Event) => {
@@ -5310,7 +5881,7 @@ function AgentHistoryControls({
       if (detail.tabId !== tabId) return;
       const message = String(detail.message || detail.error || '').trim();
       if (!message) return;
-      setError(message);
+      reportError(message);
       setDraftWarning(null);
     };
     const handleStartupGate = (event: Event) => {
@@ -5318,7 +5889,7 @@ function AgentHistoryControls({
       if (detail.tabId !== tabId) return;
       if (detail.status === 'failed') {
         const message = String(detail.error || detail.reason || 'Claude startup failed').trim();
-        setError(message);
+        reportError(message);
         setDraftWarning(null);
         refreshPresence();
       } else if (detail.status === 'ready') {
@@ -5340,7 +5911,7 @@ function AgentHistoryControls({
       window.removeEventListener('history-panel:draft-warning', handleDraftWarning);
       window.removeEventListener('claude-startup-defaults-gate', handleStartupGate);
     };
-  }, [refreshPresence, tabId]);
+  }, [refreshPresence, reportError, tabId]);
 
   useEffect(() => {
     const handleTuiReady = (_: any, data: { tabId?: string }) => {
@@ -5740,11 +6311,11 @@ function AgentHistoryControls({
       return;
     }
     if (statusRef.current !== 'active' && statusRef.current !== 'busy') {
-      setError(runtime.label + ' is not ready (' + statusRef.current + ')');
+      reportError(runtime.label + ' is not ready (' + statusRef.current + ')');
       return;
     }
     if (pendingQuestionRef.current) {
-      setError(runtime.label + ' is waiting for a question answer');
+      reportError(runtime.label + ' is waiting for a question answer');
       return;
     }
 
@@ -5755,7 +6326,6 @@ function AgentHistoryControls({
     );
     actionInFlightRef.current = true;
     setBusyAction('grab');
-    setError(null);
     setDraftWarning(null);
     try {
       const draft = await readTerminalDraft('manual-pull');
@@ -5805,7 +6375,7 @@ function AgentHistoryControls({
       requestAnimationFrame(() => promptTextareaRef.current?.focus());
     } catch (e: any) {
       if (isCurrentAction()) {
-        setError(String(e?.message || e));
+        reportError(e);
         refreshPresence();
       }
     } finally {
@@ -5814,7 +6384,7 @@ function AgentHistoryControls({
         setBusyAction(null);
       }
     }
-  }, [readTerminalDraft, refreshPresence, runtime.label, runtime.logPrefix, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
+  }, [readTerminalDraft, refreshPresence, reportError, runtime.label, runtime.logPrefix, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
 
   const prepareHistoryPromptForSend = useCallback(async (
     text: string,
@@ -6093,7 +6663,6 @@ function AgentHistoryControls({
     actionInFlightRef.current = true;
     activeActionKindRef.current = kind;
     setBusyAction(kind);
-    setError(null);
     try {
       if (kind === 'resume') {
         processStopInFlightRef.current = false;
@@ -6597,7 +7166,7 @@ function AgentHistoryControls({
         }
       }
       if (currentAction) {
-        setError(String(e?.message || e));
+        reportError(e);
         if (kind === 'stop') {
           processStopInFlightRef.current = false;
           presenceGenerationRef.current += 1;
@@ -6656,7 +7225,7 @@ function AgentHistoryControls({
         }
       }
     }
-  }, [applyHistoryComposerSnapshot, busyAction, cwd, flushHistoryComposerDrafts, flushHistoryComposerView, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, resumeMaterialized, runtime, sessionId, setHistoryComposerView, setHistoryPromptDraft, setStatusFrom, tabId]);
+  }, [applyHistoryComposerSnapshot, busyAction, cwd, flushHistoryComposerDrafts, flushHistoryComposerView, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, reportError, resumeMaterialized, runtime, sessionId, setHistoryComposerView, setHistoryPromptDraft, setStatusFrom, tabId]);
 
   useEffect(() => {
     const submitComposer = (event: Event) => {
@@ -6977,8 +7546,18 @@ function AgentHistoryControls({
   const inlineDraftNoticeMeta = isImageDraftNotice ? null : draftNoticeMeta;
   const persistentImageDraftNotice = derivedDraftImageNotice && !derivedDraftImageNotice.progress
     ? derivedDraftImageNotice
+    // Red means BLOCKED, so a report that does not block must not be painted red.
+    //
+    // This branch covers image messages that arrive as plain text rather than
+    // from the draft inspection (an image that stayed behind in the terminal, a
+    // clipboard save that failed, a picture returned by Rewind). They read as
+    // "we already dealt with it — an error marker is in the text, fix or replace
+    // it", and Send stays available: only `derivedDraftImageNotice.blocking`
+    // actually gates it (see `canAcceptSubmitIntent`). Hardcoding `blocking:true`
+    // gave them the red `role="alert"` reserved for "you cannot send this",
+    // announcing a barrier that does not exist.
     : (isImageDraftNotice && !isImageProgressNotice && visibleDraftWarning
-      ? { message: visibleDraftWarning, blocking: true, progress: false }
+      ? { message: visibleDraftWarning, blocking: false, progress: false }
       : null);
   const historyImageNoticeBanner = persistentImageDraftNotice ? (
     <div
@@ -7897,13 +8476,32 @@ function AgentHistoryControls({
     setStatusCopied(false);
     }, 900);
   }, [activeLifecycle?.title, meta.label, statusDescription, statusDetail, statusSessionId, statusTitle, tabId]);
+  // The status control is now the session's start/stop, not a surface switch.
+  //
+  // It used to toggle the terminal, which put two unrelated jobs on one button:
+  // "what is happening" and "show me the other panel". The surface toggles moved
+  // to the Run after rail, where they sit as one pair, and this control kept the
+  // half that actually belongs next to a status indicator — acting on the thing
+  // whose state it reports.
+  //
+  // Nothing is offered that the session cannot do right now: with no session and
+  // no way to start one, the click still falls back to copying the details.
+  const statusPrimaryAction: 'stop' | 'start' | 'copy' =
+    canInterruptTurn || canStopProcess ? 'stop'
+      : canStartOrResume ? 'start'
+        : 'copy';
   const activateUnifiedStatus = useCallback(() => {
-    if (onToggleTerminal) {
-      onToggleTerminal();
+    if (statusPrimaryAction === 'stop') {
+      // Interrupt the answer while one is running; otherwise stop the process.
+      void runAction(canInterruptTurn ? 'interrupt' : 'stop');
+      return;
+    }
+    if (statusPrimaryAction === 'start') {
+      void runAction('resume');
       return;
     }
     copyStatusDetails();
-  }, [copyStatusDetails, onToggleTerminal]);
+  }, [canInterruptTurn, copyStatusDetails, runAction, statusPrimaryAction]);
 
   // History owns PTY state, but the top line follows the SDK presentation:
   // one compact terminal/status affordance plus transient authoring notices.
@@ -7912,18 +8510,319 @@ function AgentHistoryControls({
   // the layout: History-primary hides/opens the terminal, terminal-primary
   // hides/opens the transcript. Same control, same "show me the other one".
   const secondarySurfaceLabel = terminalIsPrimary ? 'History' : 'terminal';
+  const statusActionLabel = statusPrimaryAction === 'stop'
+    ? (canInterruptTurn ? 'Остановить текущий ответ' : 'Остановить процесс')
+    : statusPrimaryAction === 'start'
+      ? (sessionId ? 'Возобновить сессию' : 'Запустить ' + runtime.label)
+      : 'Скопировать детали статуса';
+  // Status sits ON the frame's top edge, centred — like a caption engraved into
+  // a border, not a line of layout above it.
+  //
+  // Two constraints decided this. It cannot live IN the row: the row is a fixed
+  // slot of fixed-size controls, and text of unbounded length ("SENDING",
+  // "CLAUDE SESSION INTERRUPTED", a failure with a RETRY button) shoves every
+  // button sideways and back on each change of state. And it cannot take a line
+  // of its own above the frame: that line already belongs to attachments, and a
+  // second one would raise the whole composer.
+  //
+  // Absolutely positioned astride the border, it costs zero layout in both
+  // directions. The chip paints the composer's own background so the border
+  // passes behind it and stops at its edges — the text reads as part of the
+  // frame rather than as something floating over the transcript.
+  // No `&& !error` on the warning and the rewind badge any more: a failure is a
+  // toast now, in a different corner of the screen, so it can no longer collide
+  // with them. Suppressing them was only ever about not stacking two red things
+  // in the same place.
+  const hasFloatingStatus = showStatusText
+    || !!activeLifecycle
+    || !!activityDurationLabel
+    || terminalOnlySlashDraft
+    || (!!visibleDraftWarning && !!inlineDraftNoticeMeta)
+    || rewindPreviewActive;
+  const historyComposerFloatingStatus = !hasFloatingStatus ? null : (
+    <div
+      data-history-composer-floating-status
+      style={{
+        position: 'absolute',
+        // LEFT, aligned with the frame's own content inset — a service caption
+        // starts where every other service line in this feed starts. The
+        // centred/right placements read as a floating widget, not a label of
+        // this frame (user).
+        left: 12,
+        // The frame's own top edge. The overlay slot ends exactly there, so the
+        // chip is pulled down by half its height to straddle the line.
+        bottom: 0,
+        transform: 'translate(0, 50%)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        maxWidth: 'calc(100% - 24px)',
+        padding: '0 8px',
+        // Same ground as the composer, so the border disappears behind the chip
+        // instead of striking through the text. Taken from the frame's own
+        // token — a literal here would show as a seam the moment the composer
+        // background changes.
+        background: 'var(--cb-composer-bg, #0f0f0f)',
+        borderRadius: 4,
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        // EXACTLY the size of a group header's second line (`.hp-history-group-detail`,
+        // 0.82em of the transcript font — the «└ …» caption under «Searched 5
+        // queries»). That line is the quietest service text in the feed, and this
+        // chip is the same kind of thing: an annotation of the frame, not content.
+        //
+        // Two earlier values were both wrong for the same reason — they were
+        // picked as absolute numbers instead of derived from that one reference.
+        // 0.9em is a tool-card LABEL, a step louder, and at the default 13px it
+        // lands within a pixel of the chat text itself, so the chip read as a
+        // message rather than as a caption (user, twice: «почему он по размеру
+        // такой, как у меня текст в чате»).
+        //
+        // No `Math.max` floor here on purpose: a floor would hold the chip at
+        // 10px while the reference line kept shrinking with the user's transcript
+        // setting, and the two would visibly diverge again at small sizes.
+        fontSize: historyTranscriptFontSize * HISTORY_SERVICE_TEXT_RATIO,
+        // Set on the CONTAINER so every part inside inherits it — status, timer,
+        // hints, badges. Each part used to carry its own 600-750, which is how the
+        // chip stayed bold after the size was fixed.
+        fontWeight: HISTORY_SERVICE_TEXT_WEIGHT,
+        lineHeight: 1.35,
+        whiteSpace: 'nowrap',
+        // Buttons inside (dismiss / retry) must stay clickable; the chip itself
+        // is not a target.
+        pointerEvents: 'none',
+      }}
+    >
+      <span style={{ display: 'contents', pointerEvents: 'auto' }}>
+        {showStatusText && (
+          <span
+            data-agent-status-title
+            style={{
+              color: statusAccent,
+              // Weight inherited from the chip. The status is distinguished by its
+              // COLOUR (statusAccent) — adding weight on top made the one part the
+              // user reads most the loudest thing on the frame.
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              minWidth: 0,
+            }}
+          >
+            {presentStatusTitle(statusTitle)}
+          </span>
+        )}
+        {activeLifecycle?.kind === 'error' && (
+          <span
+            role="status"
+            data-agent-lifecycle-description
+            title={activeLifecycle.detail || activeLifecycle.description}
+            style={{
+              color: '#fca5a5',
+              // The chip straddles a 1px border; a 20px line-height would push
+              // it off the line it is supposed to sit on.
+              lineHeight: 1.35,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              minWidth: 0,
+            }}
+          >
+            {activeLifecycle.description}
+          </span>
+        )}
+
+        {activeLifecycle?.kind === 'error' && activeLifecycle.onDismiss && (
+          <button
+            type="button"
+            data-agent-lifecycle-dismiss
+            aria-label={activeLifecycle.dismissLabel || 'Dismiss starting status'}
+            onMouseDown={(event) => {
+              // Do not move focus out of the History composer while clearing the
+              // same main-owned failure that the floating terminal can clear.
+              event.preventDefault();
+            }}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              activeLifecycle.onDismiss?.();
+            }}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 16,
+              height: 16,
+              padding: 0,
+              borderRadius: 4,
+              border: '1px solid rgba(248, 113, 113, 0.35)',
+              background: 'rgba(127, 29, 29, 0.16)',
+              color: '#fca5a5',
+              // A glyph, not text: its size is set by the 16px box it centres in,
+              // not by the caption's scale.
+              fontFamily: 'inherit',
+              fontSize: 13,
+              lineHeight: 1,
+              cursor: 'pointer',
+              flexShrink: 0,
+            }}
+          >
+            ×
+          </button>
+        )}
+
+        {activeLifecycle?.kind === 'error' && activeLifecycle.onRetry && (
+          <button
+            type="button"
+            data-agent-lifecycle-retry
+            aria-label={activeLifecycle.retryLabel || 'Retry startup settings'}
+            onMouseDown={(event) => {
+              // Keep the user's composer selection/draft intact while the shared
+              // TerminalArea owner starts the retry transaction.
+              event.preventDefault();
+            }}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              activeLifecycle.onRetry?.();
+            }}
+            style={{
+              height: 16,
+              padding: '0 6px',
+              borderRadius: 4,
+              border: '1px solid rgba(248, 113, 113, 0.5)',
+              background: 'rgba(127, 29, 29, 0.22)',
+              color: '#fecaca',
+              // A <button> does NOT inherit type by default — the UA stylesheet
+              // gives it `font: 400 13.333px Arial`, family included. So the whole
+              // font has to be inherited explicitly, otherwise this one word is
+              // set in a different typeface from the sentence it belongs to.
+              fontFamily: 'inherit',
+              fontSize: 'inherit',
+              fontWeight: 'inherit',
+              letterSpacing: '0.035em',
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+              flexShrink: 0,
+            }}
+          >
+            {activeLifecycle.retryLabel || 'RETRY SETTINGS'}
+          </button>
+        )}
+
+        {activityDurationLabel && (
+          <span
+            data-history-response-timer
+            data-state={displayedActivityTiming?.state}
+            title={displayedActivityTiming?.state === 'running'
+              ? 'Время текущего ответа'
+              : 'Ответ завершён; ждём точную запись в истории'}
+            style={{
+              color: displayedActivityTiming?.state === 'running' ? '#a1a1aa' : '#7c8494',
+              // Proportional digits make 1м09с and 1м10с different widths, and
+              // the chip is centred — every tick would nudge it sideways.
+              fontVariantNumeric: 'tabular-nums',
+              whiteSpace: 'nowrap',
+              flexShrink: 0,
+            }}
+          >
+            {activityDurationLabel}
+          </span>
+        )}
+
+        {terminalOnlySlashDraft && (
+          <span
+            id={'history-terminal-only-hint-' + tabId}
+            role="status"
+            data-history-terminal-only-hint
+            style={{
+              color: '#8b8b92',
+              whiteSpace: 'nowrap',
+              flexShrink: 0,
+            }}
+          >
+            ← Terminal only
+          </span>
+        )}
+
+        {visibleDraftWarning && inlineDraftNoticeMeta && (
+          <Tooltip content={visibleDraftWarning}>
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                minWidth: 0,
+                maxWidth: 260,
+                height: 16,
+                padding: '0 6px',
+                borderRadius: 4,
+                border: '1px solid ' + (inlineDraftNoticeMeta.tone === 'info' ? 'rgba(113, 113, 122, 0.55)' : 'rgba(251, 191, 36, 0.45)'),
+                backgroundColor: inlineDraftNoticeMeta.tone === 'info' ? 'rgba(82, 82, 91, 0.18)' : 'rgba(217, 119, 6, 0.16)',
+                color: inlineDraftNoticeMeta.tone === 'info' ? '#d4d4d8' : '#fbbf24',
+                // Inherits the chip's weight like everything else in it. A badge
+                // is already set apart by its border, fill and colour; adding
+                // weight on top made a secondary badge heavier than the status
+                // text beside it, which inverts what matters.
+                letterSpacing: 0,
+                flexShrink: 1,
+              }}
+            >
+              {inlineDraftNoticeMeta.tone !== 'info' && <AlertTriangle size={11} style={{ flexShrink: 0 }} />}
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {inlineDraftNoticeMeta.label}
+              </span>
+            </div>
+          </Tooltip>
+        )}
+
+        {rewindPreviewActive && (
+          <Tooltip content="Preview after native rewind. JSONL is not changed until you submit the restored prompt. Restarting Claude or reopening History shows the full transcript again.">
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                minWidth: 0,
+                maxWidth: 260,
+                height: 16,
+                padding: '0 6px',
+                borderRadius: 4,
+                border: '1px solid rgba(217, 119, 6, 0.42)',
+                backgroundColor: 'rgba(217, 119, 6, 0.13)',
+                color: '#fbbf24',
+                // Weight inherited. This badge stays legible because it is
+                // UPPERCASE inside a coloured outline — which is also what keeps
+                // it readable on a screen recording (see the AI-Optimized UI rule
+                // in CLAUDE.md), so nothing is lost by dropping the extra bold.
+                letterSpacing: 0,
+                flexShrink: 1,
+              }}
+            >
+              <span style={{ whiteSpace: 'nowrap' }}>REWIND PREVIEW</span>
+              <span style={{ color: '#a1a1aa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {rewindPreviewHiddenTurnCount > 0
+                  ? rewindPreviewHiddenTurnCount + (rewindPreviewHiddenTurnCount === 1 ? ' turn hidden' : ' turns hidden')
+                  : 'unsaved'}
+              </span>
+            </div>
+          </Tooltip>
+        )}
+      </span>
+    </div>
+  );
+
   const historyComposerTopBar = (
     <div className="hp-history-composer-toolbar">
+      {/* Cmd-hover only. It used to be `always`, from when this control was an
+          opaque icon whose meaning had to be spelled out — now the hover state
+          itself says what the click does (▶ / red ■), and a card popping up on
+          every pass of the cursor was just noise over the transcript. */}
       <Tooltip
-        always
         interactive={false}
         side="top"
         content={[
           statusDescription,
           statusDetail,
-          onToggleTerminal
-            ? ((terminalOpen ? 'Click to hide ' : 'Click to open ') + secondarySurfaceLabel)
-            : 'Click to copy status details',
+          statusActionLabel,
           'Right-click to copy status details',
         ].filter(Boolean).join('\n')}
       >
@@ -7932,12 +8831,11 @@ function AgentHistoryControls({
           data-agent-status-row
           data-agent-operational-phase={isCompacting ? 'compacting' : undefined}
           data-agent-send-phase={displayedInputStatus || undefined}
-          data-terminal-toggle={onToggleTerminal ? 'status' : undefined}
-          aria-label={onToggleTerminal
-            ? ((terminalOpen ? 'Hide ' : 'Open ') + secondarySurfaceLabel)
-            : 'Copy agent status details'}
-          aria-pressed={onToggleTerminal ? !!terminalOpen : undefined}
+          data-agent-status-action={statusPrimaryAction}
+          aria-label={statusActionLabel}
           onClick={activateUnifiedStatus}
+          onMouseEnter={() => setStatusHover(true)}
+          onMouseLeave={() => setStatusHover(false)}
           onContextMenu={(event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -7946,24 +8844,55 @@ function AgentHistoryControls({
           style={{
             display: 'inline-flex',
             alignItems: 'center',
-            gap: showStatusText ? 6 : 0,
-            minWidth: showStatusText ? 24 : 20,
-            maxWidth: 'min(36vw, 360px)',
+            justifyContent: 'center',
+            // Fixed square, always. Its size no longer follows the status text
+            // (that lives above the frame now), so neighbouring controls never
+            // move when the agent changes state.
+            width: 24,
             height: 22,
-            padding: showStatusText ? '0 4px 0 0' : 0,
+            padding: 0,
             border: 0,
-            borderRadius: 0,
-            background: 'transparent',
+            // Hovering a live session paints the whole control red and swaps the
+            // activity glyph for a stop square. The rule this obeys: a control
+            // that ENDS a state must not look like the indicator that reports it
+            // — see methodology/переносимый-дизайн.md, destructive ≠ status.
+            borderRadius: 5,
+            background: statusHover && statusPrimaryAction === 'stop'
+              ? 'rgba(220,38,38,0.20)'
+              : statusHover && statusPrimaryAction === 'start'
+                ? 'rgba(255,255,255,0.08)'
+                : 'transparent',
             color: statusCopied ? '#86efac' : '#aaa',
             fontSize: aiSecondaryFontSize,
             fontWeight: 650,
-            letterSpacing: showStatusText ? '0.04em' : 0,
-            cursor: onToggleTerminal ? 'pointer' : 'copy',
+            cursor: statusPrimaryAction === 'copy' ? 'copy' : 'pointer',
             flexShrink: 0,
+            transition: 'background-color 0.12s',
           }}
         >
           {presenceResolving ? (
             <HistoryOwnerTransitionIcon size={20} />
+          ) : statusHover && statusPrimaryAction === 'stop' ? (
+            <span
+              aria-hidden
+              data-agent-status-glyph="stop"
+              style={{
+                width: 9,
+                height: 9,
+                borderRadius: 2,
+                margin: '0 5px',
+                background: '#f87171',
+                flexShrink: 0,
+              }}
+            />
+          ) : statusHover && statusPrimaryAction === 'start' ? (
+            <Play
+              aria-hidden
+              data-agent-status-glyph="start"
+              size={13}
+              strokeWidth={2.2}
+              style={{ margin: '0 3px', color: '#4ade80', flexShrink: 0 }}
+            />
           ) : (
             <HistoryTerminalActivityIcon
               size={20}
@@ -7973,198 +8902,26 @@ function AgentHistoryControls({
               surface={terminalIsPrimary ? 'history' : 'terminal'}
             />
           )}
-          {showStatusText && (
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {statusTitle}
-            </span>
-          )}
+          {/* The status TEXT moved above the frame — see
+              historyComposerFloatingStatus. Inside the row it grew and shrank
+              with the agent's state and shoved every control sideways. */}
         </button>
       </Tooltip>
 
-      {activeLifecycle?.kind === 'error' && (
-        <span
-          role="status"
-          data-agent-lifecycle-description
-          title={activeLifecycle.detail || activeLifecycle.description}
-          style={{
-            color: '#fca5a5',
-            fontSize: aiSecondaryFontSize,
-            fontWeight: 600,
-            lineHeight: '20px',
-            whiteSpace: 'nowrap',
-            flexShrink: 0,
-          }}
-        >
-          {activeLifecycle.description}
-        </span>
-      )}
-
-      {activeLifecycle?.kind === 'error' && activeLifecycle.onDismiss && (
-        <button
-          type="button"
-          data-agent-lifecycle-dismiss
-          aria-label={activeLifecycle.dismissLabel || 'Dismiss starting status'}
-          onMouseDown={(event) => {
-            // Do not move focus out of the History composer while clearing the
-            // same main-owned failure that the floating terminal can clear.
-            event.preventDefault();
-          }}
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            activeLifecycle.onDismiss?.();
-          }}
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            width: 20,
-            height: 20,
-            padding: 0,
-            borderRadius: 5,
-            border: '1px solid rgba(248, 113, 113, 0.35)',
-            background: 'rgba(127, 29, 29, 0.16)',
-            color: '#fca5a5',
-            fontSize: 16,
-            lineHeight: 1,
-            cursor: 'pointer',
-            flexShrink: 0,
-          }}
-        >
-          ×
-        </button>
-      )}
-
-      {activeLifecycle?.kind === 'error' && activeLifecycle.onRetry && (
-        <button
-          type="button"
-          data-agent-lifecycle-retry
-          aria-label={activeLifecycle.retryLabel || 'Retry startup settings'}
-          onMouseDown={(event) => {
-            // Keep the user's composer selection/draft intact while the shared
-            // TerminalArea owner starts the retry transaction.
-            event.preventDefault();
-          }}
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            activeLifecycle.onRetry?.();
-          }}
-          style={{
-            height: 20,
-            padding: '0 7px',
-            borderRadius: 5,
-            border: '1px solid rgba(248, 113, 113, 0.5)',
-            background: 'rgba(127, 29, 29, 0.22)',
-            color: '#fecaca',
-            fontSize: aiSecondaryFontSize,
-            fontWeight: 750,
-            letterSpacing: '0.035em',
-            cursor: 'pointer',
-            whiteSpace: 'nowrap',
-            flexShrink: 0,
-          }}
-        >
-          {activeLifecycle.retryLabel || 'RETRY SETTINGS'}
-        </button>
-      )}
-
-      {activityDurationLabel && (
-        <span
-          data-history-response-timer
-          data-state={displayedActivityTiming?.state}
-          title={displayedActivityTiming?.state === 'running'
-            ? 'Время текущего ответа'
-            : 'Ответ завершён; ждём точную запись в истории'}
-          style={{
-            color: displayedActivityTiming?.state === 'running' ? '#a1a1aa' : '#7c8494',
-            fontSize: aiSecondaryFontSize,
-            fontWeight: 600,
-            fontVariantNumeric: 'tabular-nums',
-            whiteSpace: 'nowrap',
-            flexShrink: 0,
-          }}
-        >
-          {activityDurationLabel}
-        </span>
-      )}
-
-      {terminalOnlySlashDraft && (
-        <span
-          id={'history-terminal-only-hint-' + tabId}
-          role="status"
-          data-history-terminal-only-hint
-          style={{
-            color: '#8b8b92',
-            fontSize: aiSecondaryFontSize,
-            fontWeight: 600,
-            whiteSpace: 'nowrap',
-            flexShrink: 0,
-          }}
-        >
-          ← Terminal only
-        </span>
-      )}
-
-      {visibleDraftWarning && !error && inlineDraftNoticeMeta && (
-        <Tooltip content={visibleDraftWarning}>
-          <div
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 4,
-              minWidth: 0,
-              maxWidth: 260,
-              height: 20,
-              padding: '0 7px',
-              borderRadius: 5,
-              border: '1px solid ' + (inlineDraftNoticeMeta.tone === 'info' ? 'rgba(113, 113, 122, 0.55)' : 'rgba(251, 191, 36, 0.45)'),
-              backgroundColor: inlineDraftNoticeMeta.tone === 'info' ? 'rgba(82, 82, 91, 0.18)' : 'rgba(217, 119, 6, 0.16)',
-              color: inlineDraftNoticeMeta.tone === 'info' ? '#d4d4d8' : '#fbbf24',
-              fontSize: aiSecondaryFontSize,
-              fontWeight: 650,
-              letterSpacing: 0,
-              flexShrink: 1,
-            }}
-          >
-            {inlineDraftNoticeMeta.tone !== 'info' && <AlertTriangle size={12} style={{ flexShrink: 0 }} />}
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {inlineDraftNoticeMeta.label}
-            </span>
-          </div>
-        </Tooltip>
-      )}
-
-      {rewindPreviewActive && !error && (
-        <Tooltip content="Preview after native rewind. JSONL is not changed until you submit the restored prompt. Restarting Claude or reopening History shows the full transcript again.">
-          <div
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 5,
-              minWidth: 0,
-              maxWidth: 260,
-              height: 20,
-              padding: '0 7px',
-              borderRadius: 5,
-              border: '1px solid rgba(217, 119, 6, 0.42)',
-              backgroundColor: 'rgba(217, 119, 6, 0.13)',
-              color: '#fbbf24',
-              fontSize: aiSecondaryFontSize,
-              fontWeight: 750,
-              letterSpacing: 0,
-              flexShrink: 1,
-            }}
-          >
-            <span style={{ whiteSpace: 'nowrap' }}>REWIND PREVIEW</span>
-            <span style={{ color: '#a1a1aa', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {rewindPreviewHiddenTurnCount > 0
-                ? rewindPreviewHiddenTurnCount + (rewindPreviewHiddenTurnCount === 1 ? ' turn hidden' : ' turns hidden')
-                : 'unsaved'}
-            </span>
-          </div>
-        </Tooltip>
-      )}
+      {/* Where the agent's controls are drawn. They belong to this line but are
+          owned by ClaudeControlBar, which stays mounted where it always was —
+          see composerControlsHost.mjs for why the component does not move.
+          It sits INSIDE this toolbar rather than beside the input, because the
+          composer disappears entirely while a question from the agent is
+          pending, and this same toolbar is what that card keeps. */}
+      <div
+        ref={setComposerControlsHostNode}
+        data-composer-controls-host={tabId}
+        // Takes the rest of the line: the controls own their own left/right
+        // arrangement inside, and the spacer they use to push the readings
+        // rightward only works if this slot is actually wide.
+        style={{ display: 'flex', alignItems: 'center', flex: '1 1 auto', minWidth: 0 }}
+      />
 
     </div>
   );
@@ -8261,6 +9018,10 @@ function AgentHistoryControls({
           expandedChipId={previewChipId}
           onExpandedChipChange={setPreviewChipId}
           notice={historyImageNoticeBanner}
+          // Floats above the frame, in the same stack the expanded chip preview
+          // already uses. Empty it costs nothing; full it cannot move a single
+          // control in the row below.
+          overlay={historyComposerFloatingStatus}
           secondaryFontSize={aiSecondaryFontSize}
           input={(
             <div
@@ -8309,7 +9070,6 @@ function AgentHistoryControls({
                     ) as HistoryPromptDraftChip[],
                   });
                   if (draftWarning) setDraftWarning(null);
-                  if (error) setError(null);
                 }}
                 onCopy={handleComposerImageAwareCopy}
                 onCut={handleComposerImageAwareCopy}
@@ -8350,7 +9110,6 @@ function AgentHistoryControls({
                       userEvent: 'input.paste',
                     });
                     if (draftWarning) setDraftWarning(null);
-                    if (error) setError(null);
                     requestAnimationFrame(() => {
                       const textarea = promptTextareaRef.current;
                       if (!textarea) return;
@@ -8515,11 +9274,10 @@ function AgentHistoryControls({
           )}
         />
       )}
-      {error && (
-        <div style={{ marginTop: 6, color: '#fca5a5', fontSize: 11, wordBreak: 'break-word' }}>
-          {error}
-        </div>
-      )}
+      {/* No failure line here any more — failures are announced as a toast in the
+          top-right corner (see `reportError`). A line at the bottom of the panel
+          cost a row of layout under the input and, having no lifetime of its own,
+          kept showing a failure long after the situation had changed. */}
     </div>
   );
 }
@@ -9155,6 +9913,9 @@ function HistoryPanel({
     ownerKey: string;
     entries: FullHistoryEntry[];
   }>({ ownerKey: historyOwnerKey, entries: [] });
+  // Dedup for LIVE_ORPHANS diagnostics: one line per distinct unmatched-live
+  // composition, not one per reconciliation pass.
+  const liveOrphanDigestRef = useRef('');
   const liveToolResultsRef = useRef<{
     ownerKey: string;
     results: Map<string, HistoryLiveToolResult>;
@@ -9164,8 +9925,7 @@ function HistoryPanel({
       (firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined)
       || []
     )
-      .map((entry) => historyLivePresentationIdentity(entry))
-      .filter((identity): identity is string => !!identity),
+      .flatMap((entry) => historyLivePresentationIdentities(entry)),
   ));
   const presentationEntriesRef = useRef(entries);
   presentationEntriesRef.current = entries;
@@ -9283,10 +10043,32 @@ function HistoryPanel({
     durableSourceIdentitiesRef.current = reconciled.durableIdentities;
     if (live.ownerKey !== ownerKey || live.entries.length === 0) return;
     const remaining = reconciled.entries as FullHistoryEntry[];
+    // Orphan diagnostics (16.08: an assistant block rendered at the very
+    // tail, and stayed at the tail after the NEXT prompt — a live row whose
+    // sourceIdentity never matched its durable twin survives reconciliation
+    // forever and is appended after everything by the live merge). Log the
+    // exact unmatched identities once per composition so the next incident
+    // names the mismatch instead of guessing. Quiet while the turn is busy —
+    // unmatched live rows are the NORMAL state mid-stream.
+    if (remaining.length > 0 && !isTurnBusyRef.current) {
+      const digest = remaining
+        .map((entry) => (historyLivePresentationIdentities(entry)[0] || entry.uuid || '?').slice(-64))
+        .join(',')
+        .slice(0, 240);
+      if (liveOrphanDigestRef.current !== digest) {
+        liveOrphanDigestRef.current = digest;
+        historyDiag('LIVE_ORPHANS tab=' + tabId.slice(-12)
+          + ' count=' + remaining.length
+          + ' durable=' + durableEntries.length
+          + ' ids=' + digest);
+      }
+    } else if (remaining.length === 0) {
+      liveOrphanDigestRef.current = '';
+    }
     if (remaining.length === live.entries.length) return;
     liveProjectionRef.current = { ownerKey, entries: remaining };
     setLiveEntries(remaining);
-  }, []);
+  }, [tabId]);
   const reconcileLiveToolResultsAgainstDurable = useCallback((
     durableEntries: FullHistoryEntry[],
     ownerKey = historyOwnerKeyRef.current,
@@ -9302,13 +10084,13 @@ function HistoryPanel({
     const live = liveProjectionRef.current;
     const durableIdentities = new Set(
       rawServerEntriesRef.current
-        .map((entry) => historyLivePresentationIdentity(entry))
-        .filter((identity): identity is string => !!identity),
+        .flatMap((entry) => historyLivePresentationIdentities(entry)),
     );
     const hasUnmatchedProjection = live.ownerKey === ownerKey
       && live.entries.some((entry) => {
-        const identity = historyLivePresentationIdentity(entry);
-        return !identity || !durableIdentities.has(identity);
+        const identities = historyLivePresentationIdentities(entry);
+        return identities.length === 0
+          || !identities.some((identity) => durableIdentities.has(identity));
       });
     return hasUnmatchedProjection || (
       liveToolResultsRef.current.ownerKey === ownerKey
@@ -9513,14 +10295,84 @@ function HistoryPanel({
     // after creation so render order stays legal.
     tailSpacerOwnerResetRef.current?.();
   }
+  // Previous (rows, options, units) triple for the incremental append path —
+  // owner-scoped: another tab's rows must never serve as a diff baseline.
+  const displayUnitsPrevRef = useRef<{
+    ownerKey: string;
+    entries: FullHistoryEntry[];
+    options: { enabled: boolean; threshold: number; expandedKeys: ReadonlySet<string> };
+    units: unknown[];
+  } | null>(null);
   const displayUnits = useMemo(
-    () => buildHistoryDisplayUnits(displayEntries, {
+    () => {
+      const unitOptions = {
+        enabled: historyGroupActionsEnabled,
+        threshold: 2,
+        expandedKeys: expandedGroupKeys,
+      };
+      // Cross-visit cache first. useMemo is one slot, so A→B→A switching
+      // rebuilt the same projection on every return (107-168ms on a 6.4K-row
+      // session, twice per click — THE 16.08 click regression). Groups are
+      // static between visits: same rows array + same expanded set = same
+      // units, served from the WeakMap in historyDisplayUnits.mjs.
+      const cached = peekHistoryDisplayUnitsCached(displayEntries, unitOptions);
+      if (cached) return cached;
+      // Perf attribution for real rebuilds (the mark names any long task
+      // overlapping it; the ms log catches sub-50ms rebuilds too).
+      const endMark = markRendererActivity('history-group-units:' + tabId.slice(-8));
+      const startedAt = performance.now();
+      let mode = 'full';
+      let reusedUnits = 0;
+      let rebuiltEntries = displayEntries.length;
+      try {
+        // Live append/delta: reuse the unit prefix up to the last hard
+        // grouping boundary before the first changed row. Row REFERENCE
+        // identity is the witness (delta reassembly preserves refs), so a
+        // full reload that recreates objects falls back to the full build.
+        const previous = displayUnitsPrevRef.current;
+        if (previous && previous.ownerKey === historyOwnerKey) {
+          const appended = buildHistoryDisplayUnitsAppended(
+            previous.entries,
+            previous.units,
+            displayEntries,
+            unitOptions,
+            previous.options,
+          );
+          if (appended) {
+            mode = 'append';
+            reusedUnits = appended.reusedUnits;
+            rebuiltEntries = appended.rebuiltEntries;
+            return appended.units;
+          }
+        }
+        return buildHistoryDisplayUnitsCached(displayEntries, unitOptions);
+      } finally {
+        endMark();
+        const elapsedMs = performance.now() - startedAt;
+        if (elapsedMs >= 8 || mode === 'append') {
+          historyDiag('GROUP_UNITS_BUILD tab=' + tabId.slice(-12)
+            + ' entries=' + displayEntries.length
+            + ' expanded=' + expandedGroupKeys.size
+            + ' mode=' + mode
+            + (mode === 'append'
+              ? ' reusedUnits=' + reusedUnits + ' rebuiltEntries=' + rebuiltEntries
+              : '')
+            + ' ms=' + elapsedMs.toFixed(1));
+        }
+      }
+    },
+    [displayEntries, expandedGroupKeys, historyGroupActionsEnabled, historyOwnerKey, tabId],
+  );
+  displayUnitsPrevRef.current = {
+    ownerKey: historyOwnerKey,
+    entries: displayEntries,
+    options: {
       enabled: historyGroupActionsEnabled,
       threshold: 2,
       expandedKeys: expandedGroupKeys,
-    }),
-    [displayEntries, expandedGroupKeys, historyGroupActionsEnabled],
-  );
+    },
+    units: displayUnits as unknown[],
+  };
   const displayUnitsRef = useRef(displayUnits);
   displayUnitsRef.current = displayUnits;
   // uuid → unit index for every entry uuid (members of collapsed groups map
@@ -9572,127 +10424,45 @@ function HistoryPanel({
     onChange: (px: number) => setHistoryTailSpacerPx(px),
     diag: (line: string) => historyDiag(line + ' tab=' + tabId.slice(-12)),
   }));
-  tailSpacerOwnerResetRef.current = () => historyTailSpacerRef.current.reset('owner-change');
-  // New rows at the tail make the reserve meaningless (real content now fills
-  // the space) — zero it, but only when zeroing cannot clamp the position:
-  // growth added at least the reserve's height below the viewport.
-  const tailSpacerEntryCountRef = useRef(displayEntries.length);
-  if (displayEntries.length > tailSpacerEntryCountRef.current
-    && historyTailSpacerRef.current.get() > 0) {
-    historyTailSpacerRef.current.reset('new-rows');
-  }
-  tailSpacerEntryCountRef.current = displayEntries.length;
-  // Expand a group WITHOUT moving what the user is reading: when the group
-  // header sits ABOVE the viewport, the inserted member heights land above
-  // the reading position — compensate scrollTop by the measured growth on
-  // the next frame (owner condition 4: toggles are index-space edits the
-  // "rows above must not move" law does not cover by itself).
-  const expandGroupPreservingViewport = useCallback((groupKey: string, reason: string) => {
+  const historyTailHoldSeqRef = useRef(0);
+  const historyTailHoldTargetRef = useRef<{ token: number; scrollTop: number } | null>(null);
+  tailSpacerOwnerResetRef.current = () => {
+    historyTailHoldTargetRef.current = null;
+    historyTailSpacerRef.current.reset('owner-change');
+  };
+  // Reserve reconciliation, every commit while a reserve is armed. The
+  // reserve's invariant is «spacer == clamp deficit»: exactly the height
+  // missing between the viewport bottom and the real content bottom. New
+  // rows, a STREAMING growth of the last block (same row count — length
+  // watching missed it, reported live 16.08 «при обновлении последнего
+  // блока пустое пространство пропадает»), a late Virtuoso re-measure: all
+  // of them change the deficit, and the reserve follows it downward. It
+  // never grows here (arming is the collapse path's job), so the position
+  // cannot clamp by construction; deficit ≤ 2 → content genuinely refilled
+  // the space → full reset.
+  useLayoutEffect(() => {
+    const spacer = historyTailSpacerRef.current;
+    const spacerPx = spacer.get();
+    if (spacerPx <= 0) return;
     const scroller = virtuosoScrollerRef.current;
-    const headBefore = scroller?.querySelector(
-      `[data-history-group="${CSS.escape(groupKey)}"]`,
-    ) as HTMLElement | null;
-    const scrollerTop = scroller?.getBoundingClientRect().top ?? 0;
-    const headAbove = headBefore
-      ? headBefore.getBoundingClientRect().top - scrollerTop < 0
-      : false;
-    const scrollHeightBefore = scroller?.scrollHeight ?? 0;
-    historyDiag('GROUP_EXPAND tab=' + tabId.slice(-12)
-      + ' key=' + groupKey.slice(0, 24)
-      + ' reason=' + reason);
-    setExpandedGroupKeys((previous) => {
-      if (previous.has(groupKey)) return previous;
-      const next = new Set(previous);
-      next.add(groupKey);
-      return next;
-    });
-    if (headAbove && scroller) {
-      requestAnimationFrame(() => {
-        const grownBy = scroller.scrollHeight - scrollHeightBefore;
-        if (grownBy > 0) scroller.scrollTop += grownBy;
-      });
+    if (!scroller) { spacer.reset('no-scroller'); return; }
+    // scrollHeight includes the reserve rendered by the PREVIOUS commit
+    // (same px — state has not changed in this commit), so subtract it to
+    // get the real content bottom.
+    const contentBottom = scroller.scrollHeight - spacerPx;
+    // A shrink hold owns a PRE-change reading position. The browser can clamp
+    // live scrollTop before the reserve state commits; using that damaged
+    // value here would instantly zero the reserve we just armed.
+    const positionTop = historyTailHoldTargetRef.current?.scrollTop
+      ?? scroller.scrollTop;
+    const deficit = Math.round(positionTop + scroller.clientHeight - contentBottom);
+    if (deficit <= 2) {
+      spacer.reset('content-refilled');
+    } else if (deficit < spacerPx) {
+      spacer.burn(spacerPx - deficit);
     }
-  }, [tabId]);
-  // Collapse a group WITHOUT moving what the user is reading. Above the
-  // viewport → compensate scrollTop by the removed height (toggle law:
-  // "rows above must not move" does not cover index-space edits — owner
-  // condition 4). Near the bottom with nothing below → arm the tail reserve
-  // so the frame stays put and the reserve burns on the way up.
-  const collapseGroupPreservingViewport = useCallback((groupKey: string) => {
-    const scroller = virtuosoScrollerRef.current;
-    const groupHead = scroller?.querySelector(
-      `[data-history-group="${CSS.escape(groupKey)}"]`,
-    ) as HTMLElement | null;
-    // Closing animation for group members.
-    //
-    // Member rows are Virtuoso items: React removes them from the list, so
-    // there is nothing left to transition — the only way to show the collapse
-    // is to play it on the CURRENT nodes before the state change lands. They
-    // fade and slide up for one short beat while the rows are still mounted;
-    // the state update below then removes them mid-fade, which reads as the
-    // block folding away rather than blinking out. Deliberately GPU-only
-    // (opacity/transform): touching height here would make Virtuoso remeasure
-    // every frame — the jitter class of bug we just fixed.
-    const closingNodes = scroller
-      ? Array.from(scroller.querySelectorAll(
-        `[data-history-group-member="${CSS.escape(groupKey)}"]`,
-      )) as HTMLElement[]
-      : [];
-    const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-    if (!reducedMotion) {
-      for (const node of closingNodes) node.classList.add('hp-history-group-member--closing');
-    }
-    const scrollerRect = scroller?.getBoundingClientRect() || null;
-    const memberNodes = scroller
-      ? Array.from(scroller.querySelectorAll(`[data-history-group-member="${CSS.escape(groupKey)}"]`))
-      : [];
-    // Height the collapse will remove ≈ mounted members' extent minus the
-    // detail line the collapsed header gains back (~18px). The header row
-    // itself exists in both states. Unmounted members are outside the
-    // viewport by definition and do not affect the visible frame.
-    let removedPx = 0;
-    for (const node of memberNodes) {
-      removedPx += (node as HTMLElement).getBoundingClientRect().height;
-    }
-    removedPx = Math.max(0, removedPx - 18);
-    const headTop = groupHead && scrollerRect
-      ? groupHead.getBoundingClientRect().top - scrollerRect.top
-      : 0;
-    const aboveViewport = groupHead && headTop < 0;
-    const commitCollapse = () => {
-      setExpandedGroupKeys((previous) => {
-        if (!previous.has(groupKey)) return previous;
-        const next = new Set(previous);
-        next.delete(groupKey);
-        return next;
-      });
-    };
-    if (closingNodes.length > 0 && !reducedMotion) {
-      // One beat of the closing animation, then remove. Shorter than the
-      // 140ms keyframe on purpose: the rows should still be visibly moving
-      // when they go, otherwise the fold reads as a pause followed by a jump.
-      window.setTimeout(commitCollapse, 90);
-    } else {
-      commitCollapse();
-    }
-    if (!scroller || removedPx <= 0) return;
-    if (aboveViewport) {
-      // Removed height is entirely above the reading position: pull
-      // scrollTop up by the same amount in the same frame.
-      requestAnimationFrame(() => {
-        scroller.scrollTop = Math.max(0, scroller.scrollTop - removedPx);
-      });
-      return;
-    }
-    const distFromBottom = scroller.scrollHeight
-      - (scroller.scrollTop + scroller.clientHeight)
-      - historyTailSpacerRef.current.get();
-    if (distFromBottom <= removedPx + 60) {
-      // Nothing (or not enough) below to absorb the removal — the scroller
-      // would clamp and yank the frame. Reserve the removed height instead.
-      historyTailSpacerRef.current.arm(removedPx, 'collapse-near-bottom');
-    }
-  }, []);
+    // deficit >= spacerPx: nothing refilled yet — keep the reserve whole.
+  });
   const visibleTerminalPreview = terminalPreview?.tabId === tabId
     && terminalPreview.toolType === toolType
     && (!sessionId || !terminalPreview.sessionId || terminalPreview.sessionId === sessionId)
@@ -10013,6 +10783,11 @@ function HistoryPanel({
   // must not look like the user scrolled away from the tail.
   const isAtBottomRef = useRef(true);
   const historyPointerScrollActiveRef = useRef(false);
+  // Timestamp of the last REAL scroll gesture (wheel/touch/scroll keys).
+  // Programmatic scrollTop writes cannot move it; the collapse hold loop
+  // reads it to yield to the user instantly.
+  const historyUserGestureAtRef = useRef(0);
+  const historyUserGestureGenerationRef = useRef(0);
   // Bumped by real user scroll intent and by owner change; the scroll-restore
   // convergence loop checks it each frame so it never fights the user.
   const scrollRestoreGenRef = useRef(0);
@@ -10044,6 +10819,261 @@ function HistoryPanel({
     () => () => historyTailPinScheduler.cancel(),
     [historyTailPinScheduler],
   );
+  // Card- and group-level toggles both need this panel's tail operations.
+  // Card toggles run through the shared applyHistoryRevealUpdate helper,
+  // which looks the ops up by scroller element (column mode mounts several
+  // panels at once) — registered from the scrollerRef callback below so it
+  // exists before the first possible click. Closes over refs and the stable
+  // scheduler only — safe to create once.
+  const historyRevealOps = useMemo<HistoryRevealScrollerOps>(() => ({
+    armTailReserve: (px: number, reason = 'collapse-hold') => {
+      flushSync(() => {
+        historyTailSpacerRef.current.arm(
+          historyTailSpacerRef.current.get() + px,
+          reason,
+        );
+      });
+    },
+    unpinTail: () => {
+      isAtBottomRef.current = false;
+      historyTailPinScheduler.cancel();
+    },
+    isUserGestureRecent: () => (
+      historyPointerScrollActiveRef.current
+      || performance.now() - historyUserGestureAtRef.current < 500
+    ),
+    getUserGestureGeneration: () => historyUserGestureGenerationRef.current,
+    isUserGestureActive: () => historyPointerScrollActiveRef.current,
+    beginTailHold: (scrollTop: number) => {
+      const token = ++historyTailHoldSeqRef.current;
+      historyTailHoldTargetRef.current = { token, scrollTop };
+      return token;
+    },
+    isTailHoldCurrent: (token: number) => historyTailHoldTargetRef.current?.token === token,
+    endTailHold: (token: number) => {
+      if (historyTailHoldTargetRef.current?.token === token) {
+        historyTailHoldTargetRef.current = null;
+      }
+    },
+  }), [historyTailPinScheduler]);
+  // Group toggles obey the same stationary-click law as card toggles (see
+  // applyHistoryRevealUpdate): the clicked header does not move. Expand
+  // grows the list BELOW the header (unpin first, or followOutput treats the
+  // growth as new content and jumps to the new bottom — the reported
+  // «нажимаю, и строчка уходит вверх»); collapse keeps scrollTop and turns
+  // any clamp deficit into tail reserve. Toggles are click-driven, so the
+  // header is on screen by construction — no above-viewport branch.
+  const expandGroupPreservingViewport = useCallback((groupKey: string, reason: string) => {
+    historyDiag('GROUP_EXPAND tab=' + tabId.slice(-12)
+      + ' key=' + groupKey.slice(0, 24)
+      + ' reason=' + reason);
+    historyRevealOps.unpinTail();
+    setExpandedGroupKeys((previous) => {
+      if (previous.has(groupKey)) return previous;
+      const next = new Set(previous);
+      next.add(groupKey);
+      return next;
+    });
+  }, [historyRevealOps, tabId]);
+  const collapseGroupPreservingViewport = useCallback((groupKey: string) => {
+    const scroller = virtuosoScrollerRef.current;
+    const scrollTopBefore = scroller?.scrollTop ?? 0;
+    // Same order as the card path: following off BEFORE the resize, or a
+    // stale tail pin rides the shrink to the new bottom (+246px measured).
+    historyRevealOps.unpinTail();
+    flushSync(() => {
+      setExpandedGroupKeys((previous) => {
+        if (!previous.has(groupKey)) return previous;
+        const next = new Set(previous);
+        next.delete(groupKey);
+        return next;
+      });
+    });
+    if (scroller) {
+      holdHistoryShrinkFrame(scroller, scrollTopBefore, historyRevealOps);
+    }
+  }, [historyRevealOps]);
+  /**
+   * Collapse from the rail's FOOT — the control at the bottom end of an
+   * expanded block.
+   *
+   * Where the view lands is the whole question. Collapsing removes everything
+   * ABOVE the click point, so simply holding scrollTop would leave the user
+   * staring at rows from further down the feed while the block they just
+   * closed sits far above, off-screen — the block would appear to vanish.
+   * The honest landing is the block's own header: it is what the whole
+   * expansion collapsed INTO.
+   *
+   * Two cases, one rule («land on the header»):
+   *  - header still on screen → hold position; the header does not move, so
+   *    nothing moves at all — the best possible outcome;
+   *  - header scrolled off above → put it back at the top of the viewport.
+   * The shrink-hold machinery is reused as-is: passing the TARGET position
+   * makes it arm exactly the tail reserve that position needs, so a block near
+   * the bottom cannot be clamped away from it.
+   */
+  const collapseGroupFromFoot = useCallback((groupKey: string) => {
+    const scroller = virtuosoScrollerRef.current;
+    if (!scroller) {
+      collapseGroupPreservingViewport(groupKey);
+      return;
+    }
+    // Attribute compare instead of a selector: group keys carry `:` and other
+    // characters that would have to be escaped, and there are only a handful
+    // of headers in a virtualized DOM.
+    let header: HTMLElement | null = null;
+    for (const node of Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-group]'))) {
+      if (node.getAttribute('data-history-group') === groupKey) { header = node; break; }
+    }
+    const scrollTopBefore = scroller.scrollTop;
+    const headerOffset = header
+      ? header.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+      : null;
+    const headerIndex = displayUnits.findIndex(
+      (unit: any) => unit?.kind === 'group' && unit.key === groupKey,
+    );
+    const target = headerOffset !== null && headerOffset < 0
+      ? Math.max(0, scrollTopBefore + headerOffset - 8)
+      : scrollTopBefore;
+    historyDiag('GROUP_COLLAPSE tab=' + tabId.slice(-12)
+      + ' key=' + groupKey.slice(0, 24)
+      + ' reason=foot'
+      + ' headerOffset=' + (headerOffset === null ? 'virtualized' : Math.round(headerOffset)));
+    historyRevealOps.unpinTail();
+    flushSync(() => {
+      setExpandedGroupKeys((previous) => {
+        if (!previous.has(groupKey)) return previous;
+        const next = new Set(previous);
+        next.delete(groupKey);
+        return next;
+      });
+    });
+    if (headerOffset === null || headerOffset < 0) {
+      // The data list has just changed shape. A pre-collapse pixel target is
+      // not authoritative for Virtuoso: its remeasurement may move the same
+      // logical item hundreds of pixels. Ask for the header by index on the
+      // first post-commit frame, then measure the REAL header and lock that
+      // exact position on the next frame.
+      requestAnimationFrame(() => {
+        if (headerIndex < 0 || !scroller.isConnected) return;
+        virtuosoRef.current?.scrollToIndex({ index: headerIndex, align: 'start' });
+        requestAnimationFrame(() => {
+          if (!scroller.isConnected) return;
+          let landedHeader: HTMLElement | null = null;
+          for (const node of Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-group]'))) {
+            if (node.getAttribute('data-history-group') === groupKey) { landedHeader = node; break; }
+          }
+          if (!landedHeader) {
+            virtuosoRef.current?.scrollToIndex({ index: headerIndex, align: 'start' });
+            return;
+          }
+          const landedOffset = landedHeader.getBoundingClientRect().top
+            - scroller.getBoundingClientRect().top;
+          const landedTarget = Math.max(0, scroller.scrollTop + landedOffset - 8);
+          scroller.scrollTop = landedTarget;
+          holdHistoryShrinkFrame(scroller, landedTarget, historyRevealOps, {
+            reason: 'group-foot-collapse',
+            exactTarget: true,
+          });
+        });
+      });
+      return;
+    }
+    if (target !== scrollTopBefore) scroller.scrollTop = target;
+    holdHistoryShrinkFrame(scroller, target, historyRevealOps, { reason: 'group-foot-collapse' });
+  }, [collapseGroupPreservingViewport, displayUnits, historyRevealOps, tabId]);
+
+  // A provisional terminal footer is not a durable History row, but it still
+  // changes the same scroller's physical height. Capture the reading position
+  // BEFORE replacing/clearing it. If the resulting footer is shorter and the
+  // browser clamps the viewport, the existing tail reserve replaces exactly
+  // the missing pixels. Appends that only grow the footer cost two cheap frame
+  // checks and never arm a reserve.
+  const terminalPreviewGeometryTransitionRef = useRef<{
+    ownerKey: string;
+    scrollTopBefore: number;
+    scrollHeightBefore: number;
+    followBottom: boolean;
+    gestureGeneration: number;
+    reason: string;
+  } | null>(null);
+  const terminalPreviewGeometryFramesRef = useRef<{
+    first: number;
+    second: number;
+  } | null>(null);
+  const captureTerminalPreviewGeometry = useCallback((reason: string) => {
+    const scroller = virtuosoScrollerRef.current;
+    if (!scroller) return;
+    const pending = terminalPreviewGeometryTransitionRef.current;
+    // Several coalesced preview events before React paints are one physical
+    // resize. Preserve the earliest pre-change geometry, not an intermediate
+    // already-clamped sample.
+    if (pending?.ownerKey === historyOwnerKey) return;
+    terminalPreviewGeometryTransitionRef.current = {
+      ownerKey: historyOwnerKey,
+      scrollTopBefore: scroller.scrollTop,
+      scrollHeightBefore: scroller.scrollHeight,
+      followBottom: isAtBottomRef.current,
+      gestureGeneration: historyUserGestureGenerationRef.current,
+      reason,
+    };
+  }, [historyOwnerKey]);
+  useLayoutEffect(() => {
+    const pending = terminalPreviewGeometryTransitionRef.current;
+    if (!pending || pending.ownerKey !== historyOwnerKey) {
+      if (pending) terminalPreviewGeometryTransitionRef.current = null;
+      return;
+    }
+    if (terminalPreviewGeometryFramesRef.current) return;
+    const frames = { first: 0, second: 0 };
+    terminalPreviewGeometryFramesRef.current = frames;
+    frames.first = requestAnimationFrame(() => {
+      frames.second = requestAnimationFrame(() => {
+        if (terminalPreviewGeometryFramesRef.current !== frames) return;
+        terminalPreviewGeometryFramesRef.current = null;
+        const transition = terminalPreviewGeometryTransitionRef.current;
+        terminalPreviewGeometryTransitionRef.current = null;
+        if (!transition || transition.ownerKey !== historyOwnerKey) return;
+        const scroller = virtuosoScrollerRef.current;
+        if (!scroller?.isConnected) return;
+        const gestureChanged = historyUserGestureGenerationRef.current
+          !== transition.gestureGeneration;
+        const deficit = historyTailReserveDeficitAfterShrink(
+          scroller,
+          transition.scrollTopBefore,
+        );
+        historyDiag('TERMINAL_PREVIEW_GEOMETRY tab=' + tabId.slice(-12)
+          + ' reason=' + transition.reason
+          + ' beforeTop=' + Math.round(transition.scrollTopBefore)
+          + ' beforeHeight=' + Math.round(transition.scrollHeightBefore)
+          + ' afterTop=' + Math.round(scroller.scrollTop)
+          + ' afterHeight=' + Math.round(scroller.scrollHeight)
+          + ' deficit=' + deficit
+          + ' followBefore=' + (transition.followBottom ? '1' : '0')
+          + ' followNow=' + (isAtBottomRef.current ? '1' : '0')
+          + ' gestureChanged=' + (gestureChanged ? '1' : '0'));
+        if (isAtBottomRef.current) {
+          historyTailPinScheduler.schedule({ shouldPin: true });
+          return;
+        }
+        if (gestureChanged || deficit <= 2) return;
+        holdHistoryShrinkFrame(scroller, transition.scrollTopBefore, historyRevealOps, {
+          reason: 'terminal-preview-shrink-hold',
+          allowExistingGesture: true,
+          gestureGenerationAtStart: transition.gestureGeneration,
+        });
+      });
+    });
+  }, [historyOwnerKey, historyRevealOps, historyTailPinScheduler, tabId, terminalPreview]);
+  useLayoutEffect(() => () => {
+    const frames = terminalPreviewGeometryFramesRef.current;
+    if (frames) {
+      cancelAnimationFrame(frames.first);
+      if (frames.second) cancelAnimationFrame(frames.second);
+      terminalPreviewGeometryFramesRef.current = null;
+    }
+    terminalPreviewGeometryTransitionRef.current = null;
+  }, [historyOwnerKey]);
   // Visible index range from Virtuoso. Drives the visible-uuid set without
   // an IntersectionObserver (cheaper, exact: no threshold guessing).
   const visibleRangeRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
@@ -10076,10 +11106,13 @@ function HistoryPanel({
     centerUuid: string | null;
     centerMissing: boolean;
   } | null>(null);
-  // Same-uuid re-issue cooldown. The jump loop calls in every frame while
-  // its target is a stub; without this, the gap between a response landing
-  // and React committing the hydrated rows would fire a duplicate load.
-  const hydrationLastIssuedRef = useRef<{ centerUuid: string; at: number } | null>(null);
+  // Re-issue cooldown over the RECENT centres, not just the last one. The
+  // jump loop calls in every frame while its target is a stub; and a feedback
+  // loop that ALTERNATES between two centres walks straight through a
+  // single-slot cooldown (production 16.08 02:04: two stub flanks requested
+  // in strict turns, each response evicting the other flank). A small map of
+  // recently issued uuids refuses both.
+  const hydrationLastIssuedRef = useRef<Map<string, number>>(new Map());
   // While a Timeline jump is converging, IT owns the hydration centre. The
   // viewport watcher fires on every intermediate range the hunt passes
   // through; letting it re-centre mid-jump can pull the span away from the
@@ -10110,12 +11143,11 @@ function HistoryPanel({
     if (!centerUuid) return false;
     const last = hydrationLastResultRef.current;
     if (last && last.centerMissing && last.centerUuid === centerUuid) return false;
-    const lastIssued = hydrationLastIssuedRef.current;
-    if (
-      lastIssued
-      && lastIssued.centerUuid === centerUuid
-      && performance.now() - lastIssued.at < HYDRATION_REISSUE_COOLDOWN_MS
-    ) return false;
+    const issuedMap = hydrationLastIssuedRef.current;
+    const issuedAt = issuedMap.get(centerUuid);
+    if (issuedAt !== undefined && performance.now() - issuedAt < HYDRATION_REISSUE_COOLDOWN_MS) {
+      return false;
+    }
     if (hydrationRequestInFlightRef.current) {
       if (hydrationCenterUuidRef.current !== centerUuid) {
         const firstQueue = hydrationPendingRef.current?.centerUuid !== centerUuid;
@@ -10133,7 +11165,14 @@ function HistoryPanel({
     const seq = ++hydrationRequestSeqRef.current;
     hydrationCenterUuidRef.current = centerUuid;
     hydrationRequestInFlightRef.current = true;
-    hydrationLastIssuedRef.current = { centerUuid, at: performance.now() };
+    issuedMap.set(centerUuid, performance.now());
+    // Bounded: drop expired marks, keep the map at a handful of live ones.
+    if (issuedMap.size > 8) {
+      const cutoff = performance.now() - HYDRATION_REISSUE_COOLDOWN_MS;
+      for (const [uuid, at] of issuedMap) {
+        if (at < cutoff) issuedMap.delete(uuid);
+      }
+    }
     historyDiag('HYDRATION_REQUEST tab=' + tabId.slice(-12) +
       ' reason=' + reason + extra +
       ' uuid=' + centerUuid.slice(0, 8));
@@ -10970,8 +12009,9 @@ function HistoryPanel({
       : snapshot.filter((record) => record.handoffId === change.handoffId);
     for (const record of records) {
       if (record.toolType !== toolType) continue;
+      const carrierProof = record.auditProof || record.providerQueueProof;
       const sessionRoute = resolveHistoryPromptHandoffPresentationSession({
-        auditSessionId: record.auditProof?.sessionId,
+        auditSessionId: carrierProof?.sessionId,
         sessionIdHint: record.sessionIdHint,
         currentSessionId: sessionId,
       });
@@ -10994,8 +12034,8 @@ function HistoryPanel({
         auditHash: record.auditProof?.actualHash,
         auditSessionId,
         auditEntryUuid: record.auditProof?.entryUuid,
-        sourceIdentity: record.auditProof?.sourceIdentity,
-        recordByteOffset: record.auditProof?.recordByteOffset,
+        sourceIdentity: carrierProof?.sourceIdentity,
+        recordByteOffset: carrierProof?.recordByteOffset,
       };
       if (
         record.queueStatus === 'preparing'
@@ -11342,12 +12382,13 @@ function HistoryPanel({
       .sort((left, right) => left.submittedAt - right.submittedAt);
     for (const handoff of handoffs) {
       if (handoff.toolType !== toolType) continue;
+      const carrierProof = handoff.auditProof || handoff.providerQueueProof;
       const localIdentity: FullHistoryEntry = {
         uuid: LOCAL_PROMPT_PREFIX + tabId + '-' + handoff.handoffId,
         role: 'queued',
         timestamp: new Date(handoff.submittedAt).toISOString(),
         content: normalizeHistoryPromptText(handoff.text),
-        sessionId: handoff.auditProof?.sessionId || handoff.sessionIdHint || sessionId,
+        sessionId: carrierProof?.sessionId || handoff.sessionIdHint || sessionId,
         optimisticAt: handoff.submittedAt,
         queueStatus: handoff.queueStatus,
         statusReason: handoff.statusReason,
@@ -11356,8 +12397,8 @@ function HistoryPanel({
         auditHash: handoff.auditProof?.actualHash,
         auditSessionId: handoff.auditProof?.sessionId || undefined,
         auditEntryUuid: handoff.auditProof?.entryUuid,
-        sourceIdentity: handoff.auditProof?.sourceIdentity,
-        recordByteOffset: handoff.auditProof?.recordByteOffset,
+        sourceIdentity: carrierProof?.sourceIdentity,
+        recordByteOffset: carrierProof?.recordByteOffset,
       };
       const legacyOrchestrationMatch = serverEntries.find((entry) => (
         !consumedServerUuids.has(entry.uuid)
@@ -11383,15 +12424,19 @@ function HistoryPanel({
         attemptId: handoff.sendAttemptId,
         handoffId: handoff.handoffId,
         provider: handoff.toolType,
-        sessionId: handoff.auditProof?.sessionId || handoff.sessionIdHint,
+        sessionId: carrierProof?.sessionId || handoff.sessionIdHint,
         auditEntryUuid: handoff.auditProof?.entryUuid,
-        auditSourceIdentity: handoff.auditProof?.sourceIdentity,
+        auditSourceIdentity: carrierProof?.sourceIdentity,
       }, matched).then((acknowledged) => {
         if (!acknowledged) return;
         consumeHistoryPromptHandoff(tabId, handoff.handoffId);
         historyDiag('HANDOFF_CONSUMED tab=' + tabId.slice(-12) +
           ' handoff=' + handoff.handoffId +
-          ' proof=' + (handoff.auditProof ? 'audit' : 'fallback'));
+          ' proof=' + (handoff.auditProof
+            ? 'audit'
+            : handoff.providerQueueProof
+              ? 'provider-queue'
+              : 'fallback'));
       });
     }
   }, [acknowledgeMaterializedHistoryReceipt, removeLocalPromptEntry, sessionId, tabId, toolType]);
@@ -11948,71 +12993,26 @@ function HistoryPanel({
     // A converging Timeline jump owns the centre; ranges published while it
     // hunts are transit, not reading positions.
     if (historyJumpHydrationActiveRef.current) return;
-    // The visible range indexes display UNITS (groups collapse rows) — scan
-    // the unit list for stub-carrying rows and speak uuids over the boundary
-    // (owner contract: main only ever receives entry uuids).
-    const units = displayUnitsRef.current;
-    const total = units.length;
-    if (total === 0) return;
-    const unitHasStub = (unit: any): FullHistoryEntry | null => {
-      if (!unit) return null;
-      if (unit.kind === 'group') {
-        for (const member of unit.entries as FullHistoryEntry[]) {
-          if ((member as any)?.rowStub) return member;
-        }
-        return null;
-      }
-      return (unit.entry as any)?.rowStub ? unit.entry as FullHistoryEntry : null;
-    };
-    const unitAnchorEntry = (unit: any): FullHistoryEntry | null => {
-      if (!unit) return null;
-      return unit.kind === 'group'
-        ? (unit.entries[0] as FullHistoryEntry) || null
-        : (unit.entry as FullHistoryEntry) || null;
-    };
+    // Anchor on the STUB, never on the viewport midpoint (the midpoint anchor
+    // looped in production 16.08 ~01:08 — grouping moved it to a different
+    // entry after every response, and that entry often could not anchor a
+    // span at all). The stub search itself is bounded in ENTRIES and skips
+    // collapsed groups — see findHistoryHydrationStub for the second loop
+    // this closed (16.08 ~02:04: two stub flanks wider than one window,
+    // every response evicting the other flank, ~7 reloads/s standing still).
     const range = visibleRangeRef.current;
-    const scanFrom = Math.max(0, range.start - HISTORY_HYDRATION_REFETCH_MARGIN_ROWS);
-    const scanTo = Math.min(total - 1, range.end + HISTORY_HYDRATION_REFETCH_MARGIN_ROWS);
-    let stubEntry: FullHistoryEntry | null = null;
-    let stubIndex = -1;
-    for (let index = scanFrom; index <= scanTo; index += 1) {
-      const found = unitHasStub(units[index]);
-      if (found) { stubEntry = found; stubIndex = index; break; }
-    }
-    if (!stubEntry) return;
-    // Centre on the middle of what is on screen: the span then extends
-    // symmetrically, so scrolling back the other way is covered too. A stub
-    // still carries its uuid, so centring works even mid-stub-zone. A row
-    // main does not know (an optimistic local prompt) cannot anchor a span —
-    // fall back to the stub itself, which is a durable server row by
-    // construction.
-    const centerIndex = Math.max(0, Math.min(total - 1, Math.round((range.start + range.end) / 2)));
-    let centerEntry = unitAnchorEntry(units[centerIndex]);
-    if (!centerEntry?.uuid || !lastServerEntryUuidsRef.current.has(centerEntry.uuid)) {
-      centerEntry = stubEntry;
-    }
-    // Anchor on the STUB, never on the viewport midpoint.
-    //
-    // Two failures made the midpoint anchor loop forever (production 16.08,
-    // ~8 rebuilds/s with the user not scrolling at all — 31 requests for
-    // `range=926-933` alternating with 30 for `range=920-939`):
-    //   1. grouping changes how many UNITS the same rows occupy, so after
-    //      every hydration the midpoint index lands on a different entry and
-    //      the same-uuid cooldown never matches (`uuid=codex-us` ↔
-    //      `uuid=codex-co`);
-    //   2. that entry is often one main cannot resolve as a server row, so
-    //      the response falls back to the TAIL window (`span=1474-2229`) and
-    //      the visible stubs — around unit 670-930 — stay stubs. The request
-    //      therefore never made progress, which is what let it repeat.
-    // A stub is a durable server row by construction, so centring on it both
-    // resolves and covers the rows that actually need data: it hydrates, the
-    // next scan finds the next stub (progress) or none (silence).
+    const found = findHistoryHydrationStub(
+      displayUnitsRef.current,
+      range,
+      HISTORY_HYDRATION_REFETCH_MARGIN_ROWS,
+    );
+    if (!found) return;
+    const stubEntry = found.entry as FullHistoryEntry;
     requestHistoryHydrationAt(
-      stubEntry.uuid || centerEntry?.uuid || null,
+      stubEntry.uuid || null,
       reason,
       ' range=' + range.start + '-' + range.end
-        + ' stubAt=' + stubIndex
-        + ' center=' + centerIndex,
+        + ' stubAt=' + found.index,
     );
   }, [requestHistoryHydrationAt, toolType]);
 
@@ -12305,7 +13305,7 @@ function HistoryPanel({
     hydrationRequestInFlightRef.current = false;
     hydrationPendingRef.current = null;
     hydrationLastResultRef.current = null;
-    hydrationLastIssuedRef.current = null;
+    hydrationLastIssuedRef.current = new Map();
     historyJumpHydrationActiveRef.current = false;
     // Seed the FIRST request's hydration centre from where this owner will
     // actually land: a pending Timeline jump wins, then the saved reading
@@ -12403,7 +13403,7 @@ function HistoryPanel({
     const ownerHandoffs = getHistoryPromptHandoffsSnapshot(tabId).filter((handoff) => {
       if (handoff.toolType !== toolType) return false;
       const sessionRoute = resolveHistoryPromptHandoffPresentationSession({
-        auditSessionId: handoff.auditProof?.sessionId,
+        auditSessionId: handoff.auditProof?.sessionId || handoff.providerQueueProof?.sessionId,
         sessionIdHint: handoff.sessionIdHint,
         currentSessionId: sessionId,
       });
@@ -12416,10 +13416,11 @@ function HistoryPanel({
       const cleanContent = normalizeHistoryPromptText(handoff.text);
       if (!cleanContent) continue;
       const route = handoffSessionRoutes.get(handoff.handoffId);
+      const carrierProof = handoff.auditProof || handoff.providerQueueProof;
       restoredHandoffMeta.set(handoff.handoffId, {
         text: cleanContent,
         submittedAt: handoff.submittedAt,
-        sessionId: handoff.auditProof?.sessionId
+        sessionId: carrierProof?.sessionId
           || route?.presentationSessionId
           || handoff.sessionIdHint
           || sessionId,
@@ -12427,8 +13428,8 @@ function HistoryPanel({
         auditTimestamp: handoff.auditProof?.auditTimestamp,
         auditHash: handoff.auditProof?.actualHash,
         auditEntryUuid: handoff.auditProof?.entryUuid,
-        sourceIdentity: handoff.auditProof?.sourceIdentity,
-        recordByteOffset: handoff.auditProof?.recordByteOffset,
+        sourceIdentity: carrierProof?.sourceIdentity,
+        recordByteOffset: carrierProof?.recordByteOffset,
       });
     }
     const restoredOverlayRows = (
@@ -12673,8 +13674,7 @@ function HistoryPanel({
     ) return;
     durableSourceIdentitiesRef.current = new Set(
       entries
-        .map((entry) => historyLivePresentationIdentity(entry))
-        .filter((identity): identity is string => !!identity),
+        .flatMap((entry) => historyLivePresentationIdentities(entry)),
     );
     reconcileLiveProjectionAgainstDurable(entries, historyOwnerKey);
   }, [
@@ -13098,6 +14098,7 @@ function HistoryPanel({
           + ' current=' + String(previous?.previewId || '').slice(-18));
         return;
       }
+      if (previous) captureTerminalPreviewGeometry('apply');
       terminalPreviewRef.current = incoming as TerminalHistoryPreview;
       setTerminalPreview(incoming as TerminalHistoryPreview);
       historyDiag('TERMINAL_PREVIEW_APPLY tab=' + tabId.slice(-12)
@@ -13123,6 +14124,7 @@ function HistoryPanel({
       if (detail.action === 'clear') {
         const previous = terminalPreviewRef.current;
         if (!previous || previous.previewId === detail.previewId) {
+          if (previous) captureTerminalPreviewGeometry('clear');
           terminalPreviewRef.current = null;
           setTerminalPreview(null);
         }
@@ -13153,7 +14155,7 @@ function HistoryPanel({
       terminalPreviewRef.current = null;
       setTerminalPreview(null);
     };
-  }, [sessionId, tabId, terminalHistoryStreamingEnabled, toolType]);
+  }, [captureTerminalPreviewGeometry, sessionId, tabId, terminalHistoryStreamingEnabled, toolType]);
 
   useEffect(() => {
     const onTerminalPreviewDiagnosticResult = (_event: any, detail: any) => {
@@ -13251,6 +14253,21 @@ function HistoryPanel({
             ? promptOwner.sendOperationKey
             : null,
           changedAt: Number.isFinite(acceptedAt) ? acceptedAt : Date.now(),
+          proof: typeof promptOwner.sourceIdentity === 'string' && promptOwner.sourceIdentity
+            ? {
+                sourceIdentity: promptOwner.sourceIdentity,
+                sessionId: typeof promptOwner.sessionId === 'string'
+                  ? promptOwner.sessionId
+                  : detail.sessionId,
+                ...(typeof promptOwner.entryUuid === 'string' && promptOwner.entryUuid
+                  ? { entryUuid: promptOwner.entryUuid }
+                  : {}),
+                ...(Number.isSafeInteger(Number(promptOwner.recordByteOffset))
+                  && Number(promptOwner.recordByteOffset) >= 0
+                  ? { recordByteOffset: Number(promptOwner.recordByteOffset) }
+                  : {}),
+              }
+            : null,
         });
       }
       const current = liveProjectionRef.current.ownerKey === ownerKey
@@ -13278,18 +14295,17 @@ function HistoryPanel({
       if (projectionChanged) {
         const alreadyPresentedLiveIdentities = new Set(
           current
-            .map((entry) => historyLivePresentationIdentity(entry))
-            .filter((identity): identity is string => !!identity),
+            .flatMap((entry) => historyLivePresentationIdentities(entry)),
         );
         const projected = reduced
           .map((entry: FullHistoryEntry) => (
             entry.liveProjection ? entry : { ...entry, liveProjection: true }
           ))
           .filter((entry: FullHistoryEntry) => {
-            const identity = historyLivePresentationIdentity(entry);
-            return !identity
-              || !durableSourceIdentitiesRef.current.has(identity)
-              || alreadyPresentedLiveIdentities.has(identity);
+            const identities = historyLivePresentationIdentities(entry);
+            return identities.length === 0
+              || !identities.some((identity) => durableSourceIdentitiesRef.current.has(identity))
+              || identities.some((identity) => alreadyPresentedLiveIdentities.has(identity));
           });
         projectionChanged = projected !== current;
         liveProjectionRef.current = { ownerKey, entries: projected };
@@ -13758,6 +14774,17 @@ function HistoryPanel({
 
   const handleUserScrollIntent = useCallback((event: Event) => {
     const reason = event.type === 'touchmove' ? 'user-touchmove' : 'user-wheel';
+    historyUserGestureAtRef.current = performance.now();
+    historyUserGestureGenerationRef.current += 1;
+    // A GESTURE re-arms the hydration burst breaker — this, not scrollTop
+    // movement, is what "the user genuinely wants new rows" means (scrollTop
+    // moves on every reload of the very loop the breaker stops).
+    {
+      const burst = hydrationBurstRef.current;
+      burst.since = performance.now();
+      burst.count = 0;
+      burst.tripped = false;
+    }
     let isUpwardIntent = false;
     if (event.type === 'wheel') {
       isUpwardIntent = (event as WheelEvent).deltaY < 0;
@@ -13816,6 +14843,12 @@ function HistoryPanel({
     // scrollbar drag may unpin a concurrently growing preview through scroll.
     if (onVerticalScrollbar || onHorizontalScrollbar) {
       historyPointerScrollActiveRef.current = true;
+      historyUserGestureAtRef.current = performance.now();
+      historyUserGestureGenerationRef.current += 1;
+      const burst = hydrationBurstRef.current;
+      burst.since = performance.now();
+      burst.count = 0;
+      burst.tripped = false;
     }
   }, []);
 
@@ -13824,6 +14857,14 @@ function HistoryPanel({
   }, []);
 
   const handleHistoryScrollerKeyIntent = useCallback((event: KeyboardEvent) => {
+    const scrollKeys = ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '];
+    if (!scrollKeys.includes(event.key)) return;
+    historyUserGestureAtRef.current = performance.now();
+    historyUserGestureGenerationRef.current += 1;
+    const burst = hydrationBurstRef.current;
+    burst.since = performance.now();
+    burst.count = 0;
+    burst.tripped = false;
     const movesUp = event.key === 'ArrowUp'
       || event.key === 'PageUp'
       || event.key === 'Home'
@@ -14062,10 +15103,16 @@ function HistoryPanel({
     // Keep the seek-kick target on the element that is actually moving.
     historySeekScroller = el;
     const deltaTop = el.scrollTop - lastScrollTopRef.current;
-    // A real scroll means new rows are genuinely wanted: re-arm the hydration
-    // oscillation breaker so a burst that tripped earlier does not leave the
-    // panel permanently un-hydrating.
-    if (deltaTop !== 0) {
+    // The hydration burst breaker is deliberately NOT re-armed on mere
+    // scrollTop movement: every reload of the loop this breaker exists to
+    // stop remeasures row heights and nudges scrollTop itself, so re-arming
+    // on position change let the loop reset its own breaker every pass
+    // (production 16.08 02:04 — the breaker never fired once through two
+    // minutes of ~7 reloads/s). Re-arm lives on GESTURES: wheel/touch/keys
+    // in their listeners, and an in-progress scrollbar drag here (the drag
+    // produces no further discrete events, but the pointer-down flag is a
+    // positive signal the loop cannot fake).
+    if (historyPointerScrollActiveRef.current) {
       const burst = hydrationBurstRef.current;
       burst.since = performance.now();
       burst.count = 0;
@@ -14239,7 +15286,7 @@ function HistoryPanel({
     const directlyVisibleUsers: string[] = [];
     for (let i = clampedStart; i <= clampedEnd; i++) {
       const unit = units[i] as any;
-      const unitEntries: FullHistoryEntry[] = unit.kind === 'group'
+      const unitEntries: FullHistoryEntry[] = isGroupUnit(unit)
         ? unit.entries
         : [unit.entry];
       for (const e of unitEntries) {
@@ -14687,7 +15734,7 @@ function HistoryPanel({
             // the rollout event and the durable History refresh. A collapsed
             // group keys by its own stable group key (first call id).
             computeItemKey={(_idx, unit) => (
-              (unit as any).kind === 'group'
+              isGroupUnit(unit)
                 ? (unit as any).key
                 : historyLivePresentationKey((unit as any).entry)
             )}
@@ -14696,6 +15743,9 @@ function HistoryPanel({
             scrollerRef={(el) => {
               const prev = virtuosoScrollerRef.current;
               if (prev && prev !== el) {
+                if (historyRevealOpsByScroller.get(prev) === historyRevealOps) {
+                  historyRevealOpsByScroller.delete(prev);
+                }
                 prev.removeEventListener('scroll', handleScroll);
                 prev.removeEventListener('wheel', handleUserScrollIntent);
                 prev.removeEventListener('touchstart', handleHistoryTouchStart);
@@ -14718,6 +15768,7 @@ function HistoryPanel({
               }
               if (el) {
                 const scroller = el as HTMLElement;
+                historyRevealOpsByScroller.set(scroller, historyRevealOps);
                 scroller.addEventListener('scroll', handleScroll, { passive: true });
                 scroller.addEventListener('wheel', handleUserScrollIntent, { passive: true });
                 scroller.addEventListener('touchstart', handleHistoryTouchStart, { passive: true });
@@ -14957,7 +16008,10 @@ function HistoryPanel({
                 const groupAnchorUuid = group.entries[0]?.uuid || '';
                 const groupChainBreak =
                   claudeMemoryBoundaryIndex >= 0 && _idx <= claudeMemoryBoundaryIndex;
-                return (
+                const parentGroup = group.parentGroup as
+                  | { key: string; familyKey: string; uniform?: boolean; first: boolean; last: boolean }
+                  | undefined;
+                const headerNode = (
                   <div
                     // When expanded, the first MEMBER row carries the anchor
                     // uuid as data-uuid; the header must not duplicate it or
@@ -14992,11 +16046,36 @@ function HistoryPanel({
                     />
                   </div>
                 );
+                if (!parentGroup) return headerNode;
+                return (
+                  <div
+                    data-history-row-owner={historyOwnerDomId}
+                    data-history-row-real="1"
+                    className="hp-history-group-member"
+                    data-history-group-member={parentGroup.key}
+                    data-history-group-uniform={parentGroup.uniform ? '1' : undefined}
+                    data-history-group-last={parentGroup.last ? '1' : undefined}
+                    style={{
+                      backgroundColor: groupChainBreak ? 'rgba(239, 68, 68, 0.06)' : undefined,
+                    }}
+                  >
+                    {headerNode}
+                    {parentGroup.last && (
+                      <HistoryGroupFoot
+                        groupKey={parentGroup.key}
+                        onCollapse={collapseGroupFromFoot}
+                      />
+                    )}
+                  </div>
+                );
               }
               const entryUnit = unit as any;
               const entry = entryUnit.entry as FullHistoryEntry;
               const expandedGroup = entryUnit.expandedGroup as
                 | { key: string; familyKey: string; uniform?: boolean; first: boolean; last: boolean }
+                | undefined;
+              const expandedSubgroup = entryUnit.expandedSubgroup as
+                | { key: string; familyKey: string; docsKind?: string; first: boolean; last: boolean }
                 | undefined;
               const presentedEntry = applyHistoryLiveToolResultsToEntry(
                 entry,
@@ -15088,6 +16167,7 @@ function HistoryPanel({
                       searchQuery.length >= 2
                       && entry.content.toLowerCase().includes(searchQuery.toLowerCase())
                     }
+                    forceToolOpen={!!expandedSubgroup}
                   />
                 </>
               );
@@ -15107,22 +16187,63 @@ function HistoryPanel({
                     // Member rows tile FLUSH: any wrapper padding would cut
                     // the group rail into segments (the member's border-left
                     // cannot reach across it).
-                    paddingTop: expandedGroup ? 0 : 4,
-                    paddingBottom: expandedGroup ? 0 : 4,
+                    paddingTop: expandedGroup || expandedSubgroup ? 0 : 4,
+                    paddingBottom: expandedGroup || expandedSubgroup ? 0 : 4,
                     backgroundColor: isChainBreakZone ? 'rgba(239, 68, 68, 0.06)' : undefined,
                     ...(flashUuid === presentedEntry.uuid ? { animation: 'hp-flash 500ms ease-in-out' } : undefined),
                   }}
                 >
                   {expandedGroup ? (
-                    // Member of an expanded group: indented under the rail;
-                    // collapsing happens on the group HEADER above (its own
-                    // unit row), not on a floating button here.
+                    // Member of an expanded group: indented under the rail.
+                    // Collapsing happens on the group HEADER above — and, for
+                    // a block taller than the screen, on the rail's own foot
+                    // (see below), so the user does not have to scroll back up
+                    // to find the only control that closes it.
                     <div
                       className="hp-history-group-member"
                       data-history-group-member={expandedGroup.key}
                       data-history-group-uniform={expandedGroup.uniform ? '1' : undefined}
+                      data-history-group-last={expandedGroup.last ? '1' : undefined}
+                    >
+                      {expandedSubgroup ? (
+                        <div
+                          className="hp-history-subgroup-member"
+                          data-history-subgroup-member={expandedSubgroup.key}
+                          data-history-subgroup-last={expandedSubgroup.last ? '1' : undefined}
+                          data-history-docs-kind={expandedSubgroup.docsKind || undefined}
+                        >
+                          {entryBody}
+                          {expandedSubgroup.last && (
+                            <HistoryGroupFoot
+                              groupKey={expandedSubgroup.key}
+                              onCollapse={collapseGroupFromFoot}
+                              title="Свернуть серию"
+                            />
+                          )}
+                        </div>
+                      ) : entryBody}
+                      {expandedGroup.last && (
+                        <HistoryGroupFoot
+                          groupKey={expandedGroup.key}
+                          onCollapse={collapseGroupFromFoot}
+                        />
+                      )}
+                    </div>
+                  ) : expandedSubgroup ? (
+                    <div
+                      className="hp-history-subgroup-member hp-history-subgroup-member--root"
+                      data-history-subgroup-member={expandedSubgroup.key}
+                      data-history-subgroup-last={expandedSubgroup.last ? '1' : undefined}
+                      data-history-docs-kind={expandedSubgroup.docsKind || undefined}
                     >
                       {entryBody}
+                      {expandedSubgroup.last && (
+                        <HistoryGroupFoot
+                          groupKey={expandedSubgroup.key}
+                          onCollapse={collapseGroupFromFoot}
+                          title="Свернуть серию"
+                        />
+                      )}
                     </div>
                   ) : entryBody}
                 </div>

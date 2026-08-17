@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  claudeQueuePromptSourceIdentity,
   claudeInternalAgentContinuationKind,
   extractClaudeQueueOperationPromptText,
   extractClaudePromptCarrier,
@@ -12,6 +13,24 @@ const {
   promptFingerprint,
   selectClaudeQueuedPromptIndex,
 } = require('./claude-prompt-carriers');
+
+test('Claude queue source identity prefers provider UUID and falls back to exact byte position', () => {
+  assert.equal(claudeQueuePromptSourceIdentity({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    uuid: 'queue-uuid',
+  }), 'claude-queue:uuid:queue-uuid');
+  assert.equal(claudeQueuePromptSourceIdentity({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    sessionId: 'session-a',
+  }, { recordByteOffset: 42 }), 'claude-queue:offset:session-a:42');
+  assert.equal(claudeQueuePromptSourceIdentity({
+    type: 'queue-operation',
+    operation: 'remove',
+    uuid: 'not-an-enqueue',
+  }), null);
+});
 
 test('extracts a normal Claude user prompt', () => {
   assert.deepEqual(extractClaudePromptCarrier({

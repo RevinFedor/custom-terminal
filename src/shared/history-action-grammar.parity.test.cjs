@@ -59,12 +59,36 @@ test('CJS and ESM grammar twins agree on every classification', async () => {
     { toolName: 'Grep', args: { pattern: 'foo', path: 'src' } },
     { toolName: 'MCP', family: 'mcp', mcpServer: 'terminal', mcpMethod: 'complete_task' },
     { toolName: 'WebSearch', args: { query: 'anthropic' } },
+    // Corpus-audit shapes (scripts/history-headline-audit.mjs) — the exact
+    // command forms that broke in production; parity must hold on them too.
+    { toolName: 'Bash', args: { command: 'P=~/L/x.log; echo "b"; awk \'$1 >= "12"\' $P | head -20' }, family: 'read', bashWord: 'awk' },
+    { toolName: 'Bash', args: { command: 'stat -f m "$HOME/Library/Logs/nt/production.log"' }, family: 'read', bashWord: 'stat' },
+    { toolName: 'Bash', args: { command: 'grep -rn "grammar.cjs" src/renderer/ | grep -v test' }, family: 'search', bashWord: 'grep' },
+    { toolName: 'Bash', args: { command: 'DB="$HOME/App Support/noted-dev.db"; sqlite3 "$DB" ".tables"' }, family: 'run', bashWord: 'sqlite3' },
+    { toolName: 'Bash', args: { command: '(NOTED_WEB_PORT=7979 npx electron-vite dev > /tmp/d.log 2>&1 &) ; sleep 15' }, family: 'run', bashWord: 'npx' },
+    { toolName: 'Bash', args: { command: 'F=/tmp/x.jsonl\nnode -e "1" "$F"' }, family: 'run', bashWord: 'node' },
+    { toolName: 'Bash', args: { command: "jq '{a:.b | c}' /tmp/probe.json" }, family: 'read', bashWord: 'jq' },
   ];
   for (const call of headlineCalls) {
     assert.deepEqual(
       cjs.historyActionHeadline(call),
       esm.historyActionHeadline(call),
       'historyActionHeadline parity for: ' + JSON.stringify(call),
+    );
+  }
+
+  const presentationCalls = [
+    { toolName: 'Read', args: { file_path: 'docs/knowledge/fact.md', offset: 10, limit: 20 }, family: 'read' },
+    { toolName: 'Edit', args: { file_path: '/repo/src/main.js' }, family: 'edit' },
+    { toolName: 'Bash', args: { command: 'grep -A 8 "needle" src/main/main.js' }, family: 'search', bashWord: 'grep' },
+    { toolName: 'MCP', args: {}, family: 'mcp', mcpServer: 'terminal', mcpMethod: 'list_tabs' },
+    { toolName: 'mcp__knowledge__docs_search', args: { query: 'history grouping' } },
+  ];
+  for (const call of presentationCalls) {
+    assert.deepEqual(
+      cjs.historyActionPresentationMeta(call),
+      esm.historyActionPresentationMeta(call),
+      'historyActionPresentationMeta parity for: ' + JSON.stringify(call),
     );
   }
 

@@ -72,22 +72,40 @@ test('edits collapse WITH EACH OTHER but never merge into noise', () => {
   ];
   const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
   assert.equal(units.length, 3);
-  assert.equal(units[0].familyKey, 'noise');
+  assert.equal(units[0].familyKey, 'read');
   assert.equal(units[1].familyKey, 'edit');
   assert.equal(units[1].facts.length, 3);
-  assert.equal(units[2].familyKey, 'noise');
+  assert.equal(units[2].familyKey, 'run');
   assert.equal(entrySeriesFamily(entries[2]), 'edit');
   assert.equal(entrySeriesFamily(entries[0]), 'noise');
 });
 
-test('a row mixing an edit and a read in ONE message never collapses', () => {
+test('a row mixing a shell call and an edit belongs to the edit block', () => {
+  // Codex's normal working shape: ONE record holds the script it ran and the
+  // patch that script produced. Treating that mix as "never collapses" left
+  // a whole session of such records as hundreds of unmergeable rows standing
+  // between collapsed blocks (live screenshot, rollout 01a00884).
   const composite = row('assistant', {
-    actions: [raw('Read', 'read'), raw('Edit', 'edit')],
+    actions: [raw('Bash', 'run'), raw('Edit', 'edit')],
+  });
+  assert.equal(entrySeriesFamily(composite), 'edit');
+  const units = buildHistoryDisplayUnits([
+    composite,
+    row('assistant', { actions: [raw('Edit', 'edit')] }),
+  ], { threshold: 2 });
+  assert.equal(units.length, 1);
+  assert.equal(units[0].kind, 'group');
+  assert.equal(units[0].familyKey, 'edit');
+  // The shell call rides INSIDE the edit block — it is not lost, and the
+  // header counts it, so «Edited 2 files · Ran 1 command» stays honest.
+  assert.equal(units[0].facts.length, 3);
+});
+
+test('a mix with no edit at all stays uncollapsed', () => {
+  const composite = row('assistant', {
+    actions: [raw('Read', 'read'), raw('Plan', 'plan')],
   });
   assert.equal(entrySeriesFamily(composite), null);
-  const units = buildHistoryDisplayUnits([composite, bashRow('read')], { threshold: 2 });
-  assert.equal(units.length, 2);
-  assert.ok(units.every((unit) => unit.kind === 'entry'));
 });
 
 test('caption (shared messageId, Claude) joins the group and does not break it', () => {
@@ -174,6 +192,44 @@ test('GIDRATION INVARIANCE: stubs with actionSummary group exactly like full row
   }
 });
 
+test('HYDRATION INVARIANCE: a stubbed thinking marker keeps messageId ownership', () => {
+  const full = [
+    row('assistant', { actions: [raw('Read', 'read')], messageId: 'm1' }),
+    row('assistant', { actions: [raw('Read', 'read')], messageId: 'm2' }),
+    row('assistant', { thinking: 'tail', thinkingSeconds: 5, messageId: 'm2' }),
+  ];
+  const stubbed = full.map((entry) => {
+    if (entry.thinking) {
+      return {
+        rowStub: true,
+        uuid: entry.uuid,
+        role: entry.role,
+        messageId: entry.messageId,
+        hasThinking: true,
+        thinkingSeconds: entry.thinkingSeconds,
+      };
+    }
+    return {
+      rowStub: true,
+      uuid: entry.uuid,
+      role: entry.role,
+      messageId: entry.messageId,
+      actionSummary: entry.actions.map((action) => ({
+        toolUseId: action.rawTool.toolUseId,
+        toolName: action.rawTool.toolName,
+        family: action.rawTool.family,
+        aggregateKey: 'read:regular',
+      })),
+    };
+  });
+  const fullUnits = buildHistoryDisplayUnits(full, { threshold: 2 });
+  const stubUnits = buildHistoryDisplayUnits(stubbed, { threshold: 2 });
+  assert.equal(fullUnits.length, 1);
+  assert.equal(stubUnits.length, 1);
+  assert.equal(stubUnits[0].entries.length, 3);
+  assert.equal(stubUnits[0].thinkingSeconds, 5);
+});
+
 test('expandedKeys keeps the header unit and unrolls members after it', () => {
   const entries = [bashRow('read'), bashRow('read'), bashRow('read')];
   const collapsed = buildHistoryDisplayUnits(entries, { threshold: 2 });
@@ -190,9 +246,62 @@ test('expandedKeys keeps the header unit and unrolls members after it', () => {
   assert.equal(expanded[0].expanded, true);
   assert.equal(expanded[0].key, key);
   assert.ok(expanded.slice(1).every((unit) => unit.kind === 'entry'));
-  assert.equal(expanded[1].expandedGroup.key, key);
-  assert.equal(expanded[1].expandedGroup.first, true);
-  assert.equal(expanded[3].expandedGroup.last, true);
+  assert.equal(expanded[0].level, 2, 'a homogeneous run needs no redundant outer stack');
+  assert.equal(expanded[1].expandedSubgroup.key, key);
+  assert.equal(expanded[1].expandedSubgroup.first, true);
+  assert.equal(expanded[3].expandedSubgroup.last, true);
+});
+
+test('mixed outer group expands into flat inner Read and MCP aggregates', () => {
+  const readA = row('assistant', { actions: [raw('Read', 'read', { args: { file_path: 'src/main.js', offset: 10 } })] });
+  const readB = row('assistant', { actions: [raw('Read', 'read', { args: { file_path: 'src/main.js', offset: 200 } })] });
+  const mcpA = row('assistant', { actions: [raw('MCP', 'mcp', { mcpServer: 'terminal', mcpMethod: 'list_tabs', args: {} })] });
+  const mcpB = row('assistant', { actions: [raw('MCP', 'mcp', { mcpServer: 'terminal', mcpMethod: 'current_context', args: {} })] });
+  const entries = [readA, readB, mcpA, mcpB];
+  const collapsed = buildHistoryDisplayUnits(entries, { threshold: 2 });
+  assert.equal(collapsed.length, 1);
+  assert.equal(collapsed[0].level, 1);
+  const outerKey = collapsed[0].key;
+
+  const openedOuter = buildHistoryDisplayUnits(entries, {
+    threshold: 2,
+    expandedKeys: new Set([outerKey]),
+  });
+  assert.equal(openedOuter.length, 3, 'outer header + two collapsed inner aggregates');
+  assert.equal(openedOuter[1].level, 2);
+  assert.equal(openedOuter[1].familyKey, 'read');
+  assert.equal(openedOuter[2].familyKey, 'mcp');
+  assert.equal(openedOuter[1].parentGroup.key, outerKey);
+  assert.equal(openedOuter[2].parentGroup.last, true);
+
+  const readKey = openedOuter[1].key;
+  const openedRead = buildHistoryDisplayUnits(entries, {
+    threshold: 2,
+    expandedKeys: new Set([outerKey, readKey]),
+  });
+  assert.equal(openedRead.length, 5, 'outer + read header + two raw rows + MCP header');
+  assert.equal(openedRead[2].expandedSubgroup.key, readKey);
+  assert.equal(openedRead[2].expandedGroup.key, outerKey, 'raw row keeps both ancestor rails');
+  assert.deepEqual(resolveHistoryDisplayTarget(openedOuter, readB.uuid), { index: 1, groupKey: readKey });
+});
+
+test('docs scope splits inner Read aggregates without changing chronology', () => {
+  const entries = [
+    row('assistant', { actions: [raw('Read', 'read', { args: { file_path: 'docs/a.md' } })] }),
+    row('assistant', { actions: [raw('Read', 'read', { args: { file_path: 'docs/b.md' } })] }),
+    row('assistant', { actions: [raw('Read', 'read', { args: { file_path: 'src/a.ts' } })] }),
+    row('assistant', { actions: [raw('Read', 'read', { args: { file_path: 'src/b.ts' } })] }),
+  ];
+  const outer = buildHistoryDisplayUnits(entries, { threshold: 2 })[0];
+  assert.equal(outer.level, 1, 'different semantic scopes earn the broad outer block');
+  const expanded = buildHistoryDisplayUnits(entries, {
+    threshold: 2,
+    expandedKeys: new Set([outer.key]),
+  });
+  assert.equal(expanded.length, 3);
+  assert.equal(expanded[1].docsKind, 'search');
+  assert.equal(expanded[1].aggregateKey, 'read:docs');
+  assert.equal(expanded[2].aggregateKey, 'read:regular');
 });
 
 test('resolver: uuid inside collapsed group names the group; visible uuid names its index', () => {
@@ -263,7 +372,8 @@ test('mixed-group breakdown keeps first-appearance order and per-family counts',
   ];
   const breakdown = groupFamilyBreakdown(facts);
   assert.deepEqual(breakdown.map((b) => b.family), ['read', 'git', 'run', 'mcp']);
-  assert.deepEqual(breakdown.map((b) => b.count), [2, 2, 1, 2]);
+  assert.deepEqual(breakdown.map((b) => b.count), [1, 2, 1, 2]);
+  assert.deepEqual(breakdown.map((b) => b.callCount), [2, 2, 1, 2]);
   // git's distinguishing token is the SUBCOMMAND, never the word "git"
   assert.deepEqual([...breakdown[1].words.keys()], ['diff', 'status']);
   // mcp's distinguishing token is the SERVER (methods are member-level detail):
@@ -271,6 +381,20 @@ test('mixed-group breakdown keeps first-appearance order and per-family counts',
   assert.deepEqual([...breakdown[3].words.entries()], [['electron', 2]]);
   // subjects deduplicate: two reads of the same file name it once
   assert.deepEqual(breakdown[0].subjects, ['PresentationVideo.tsx']);
+});
+
+test('outer breakdown keeps docs and regular files as separate honest phrases', async () => {
+  const { groupFamilyBreakdown } = await import('./historyDisplayUnits.mjs');
+  const breakdown = groupFamilyBreakdown([
+    { family: 'read', targetKey: 'docs/a.md', targetLabel: 'a.md', docsKind: 'search' },
+    { family: 'read', targetKey: 'docs/b.md', targetLabel: 'b.md', docsKind: 'search' },
+    { family: 'read', targetKey: 'src/main.js', targetLabel: 'main.js' },
+  ]);
+  assert.equal(breakdown.length, 2);
+  assert.deepEqual(breakdown.map((bucket) => [bucket.family, bucket.docsKind, bucket.count]), [
+    ['read', 'search', 2],
+    ['read', '', 1],
+  ]);
 });
 
 test('edit block swallows a short noise pocket BETWEEN edits (E N N E → one block)', () => {
@@ -365,4 +489,307 @@ test('inFlight marks only calls genuinely awaiting a result', async () => {
   });
   const facts = m.entryActionFacts(entry);
   assert.deepEqual(facts.map((f) => f.inFlight), [true, false, false, false, false]);
+});
+
+// ── findHistoryHydrationStub: the entry-bounded stub search ────────────────
+
+test('hydration stub search: margin is bounded in ENTRIES, not units', async () => {
+  const { findHistoryHydrationStub } = await import('./historyDisplayUnits.mjs');
+  // One collapsed group unit hiding 100 stubbed entries, far above the
+  // viewport; then hydrated singles. Margin 50 entries: the walk crosses the
+  // group (weight 100) and must STOP — with unit-based margins it would have
+  // reached the stub behind it.
+  const groupMembers = Array.from({ length: 100 }, () => bashRow('read', { rowStub: true }));
+  const farStub = row('user', { rowStub: true, content: '' });
+  const units = [
+    { kind: 'entry', entry: farStub },
+    { kind: 'group', key: 'grp:x', familyKey: 'noise', entries: groupMembers, facts: [], errorCount: 0 },
+    { kind: 'entry', entry: row('user', { content: 'visible' }) },
+    { kind: 'entry', entry: row('user', { content: 'visible2' }) },
+  ];
+  const found = findHistoryHydrationStub(units, { start: 2, end: 3 }, 50);
+  assert.equal(found, null);
+  // A wider margin (150 entries) does reach past the group to the far stub.
+  const foundWide = findHistoryHydrationStub(units, { start: 2, end: 3 }, 150);
+  assert.equal(foundWide?.entry, farStub);
+});
+
+test('hydration stub search: off-screen collapsed groups are not targets, on-screen ones are', async () => {
+  const { findHistoryHydrationStub } = await import('./historyDisplayUnits.mjs');
+  const stubMember = bashRow('read', { rowStub: true });
+  const group = { kind: 'group', key: 'grp:y', familyKey: 'noise', entries: [stubMember, bashRow('read', { rowStub: true })], facts: [], errorCount: 0 };
+  const visible = { kind: 'entry', entry: row('user', { content: 'v' }) };
+  // Group off-screen (below viewport, within margin): NOT a target.
+  assert.equal(findHistoryHydrationStub([visible, group], { start: 0, end: 0 }, 10), null);
+  // Group inside the viewport: its stubbed member IS a target (caption needs content).
+  const foundOnScreen = findHistoryHydrationStub([visible, group], { start: 0, end: 1 }, 10);
+  assert.equal(foundOnScreen?.entry, stubMember);
+});
+
+test('hydration stub search: on-screen entry stub always wins', async () => {
+  const { findHistoryHydrationStub } = await import('./historyDisplayUnits.mjs');
+  const onScreen = row('user', { rowStub: true, content: '' });
+  const units = [
+    { kind: 'entry', entry: row('user', { content: 'a' }) },
+    { kind: 'entry', entry: onScreen },
+  ];
+  const found = findHistoryHydrationStub(units, { start: 0, end: 1 }, 0);
+  assert.equal(found?.entry, onScreen);
+  assert.equal(found?.index, 1);
+});
+
+test('reasoning rides inside a run: it neither breaks it nor counts as a call', () => {
+  // The screenshot case: read → think → search → think → bash. Six rows that
+  // are one block of work; reasoning as a standalone event cut it into a
+  // ladder of three groups and three lone rows.
+  const entries = [
+    row('assistant', { actions: [raw('Read', 'read')] }),
+    row('assistant', { thinking: 'a', thinkingSeconds: 7 }),
+    row('assistant', { actions: [raw('Grep', 'search')] }),
+    row('assistant', { thinking: 'b', thinkingSeconds: 5 }),
+    row('assistant', { actions: [raw('Bash', 'run')] }),
+  ];
+  const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
+  assert.equal(units.length, 1);
+  assert.equal(units[0].kind, 'group');
+  // THREE calls, not five: thoughts are not actions and must never inflate
+  // the header's count.
+  assert.equal(units[0].facts.length, 3);
+  // One summed figure for the whole block.
+  assert.equal(units[0].thinkingSeconds, 12);
+});
+
+test('a reasoning TAIL after the last call is not part of the block', () => {
+  const entries = [
+    row('assistant', { actions: [raw('Read', 'read')] }),
+    row('assistant', { actions: [raw('Read', 'read')] }),
+    row('assistant', { thinking: 'next step', thinkingSeconds: 9 }),
+  ];
+  const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
+  assert.equal(units.length, 2);
+  assert.equal(units[0].kind, 'group');
+  assert.equal(units[0].thinkingSeconds, 0, 'the tail thought belongs to what comes next');
+  assert.equal(units[1].kind, 'entry');
+});
+
+test('messageId keeps a trailing reasoning row with the response that owns it', () => {
+  const entries = [
+    row('assistant', { actions: [raw('Read', 'read')], messageId: 'm1' }),
+    row('assistant', { actions: [raw('Read', 'read')], messageId: 'm2' }),
+    row('assistant', { thinking: 'analysis of the second read', thinkingSeconds: 9, messageId: 'm2' }),
+  ];
+  const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
+  assert.equal(units.length, 1);
+  assert.equal(units[0].entries.length, 3);
+  assert.equal(units[0].thinkingSeconds, 9);
+});
+
+test('messageId moves reasoning forward through its caption instead of orphaning it', () => {
+  const entries = [
+    row('assistant', { actions: [raw('Edit', 'edit')], messageId: 'old' }),
+    row('assistant', { actions: [raw('Edit', 'edit')], messageId: 'old2' }),
+    row('assistant', { thinking: 'prepare next reads', thinkingSeconds: 4, messageId: 'next' }),
+    row('assistant', { content: 'Now inspect the parent state', messageId: 'next' }),
+    row('assistant', { actions: [raw('Read', 'read')], messageId: 'next' }),
+    row('assistant', { actions: [raw('Read', 'read')], messageId: 'next2' }),
+  ];
+  const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
+  assert.equal(units.length, 2);
+  assert.equal(units[0].thinkingSeconds, 0);
+  assert.equal(units[1].thinkingSeconds, 4);
+  assert.equal(units[1].entries[0].thinking, 'prepare next reads');
+});
+
+test('reasoning leading INTO a run opens that run', () => {
+  const entries = [
+    row('assistant', { thinking: 'plan', thinkingSeconds: 4 }),
+    row('assistant', { actions: [raw('Read', 'read')] }),
+    row('assistant', { actions: [raw('Read', 'read')] }),
+  ];
+  const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
+  assert.equal(units.length, 1);
+  assert.equal(units[0].kind, 'group');
+  assert.equal(units[0].facts.length, 2);
+  assert.equal(units[0].thinkingSeconds, 4);
+});
+
+test('reasoning alone never invents a group', () => {
+  const entries = [
+    row('assistant', { thinking: 'a', thinkingSeconds: 3 }),
+    row('assistant', { thinking: 'b', thinkingSeconds: 4 }),
+  ];
+  const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
+  assert.ok(units.every((unit) => unit.kind === 'entry'), 'nothing to group');
+});
+
+test('slash commands never group — each stays its own service line', () => {
+  // A settings block («Изменены настройки ×2») was tried and rejected live:
+  // two one-word rows cost nothing, while the wrapper hid WHICH settings
+  // changed — the only information those rows carry.
+  const slash = (content, uuid) => ({ role: 'slash', uuid, content });
+  const rows = [slash('/model opus', 's1'), slash('/effort max', 's2'), slash('/model', 's3')];
+  const units = buildHistoryDisplayUnits(rows, { threshold: 2 });
+  assert.equal(units.length, 3);
+  assert.ok(units.every((unit) => unit.kind === 'entry'));
+  assert.deepEqual(resolveHistoryDisplayTarget(units, 's3'), { index: 2 });
+});
+
+test('a slash row still breaks an action series around it', () => {
+  const entries = [
+    bashRow('read'),
+    bashRow('read'),
+    { role: 'slash', uuid: 'sl-1', content: '/model' },
+    bashRow('read'),
+    bashRow('read'),
+  ];
+  const units = buildHistoryDisplayUnits(entries, { threshold: 2 });
+  assert.equal(units.length, 3);
+  assert.equal(units[0].kind, 'group');
+  assert.equal(units[1].kind, 'entry');
+  assert.equal(units[2].kind, 'group');
+});
+
+test('units cache: same rows array + same expanded set is a hit; new array is a miss', async () => {
+  const { peekHistoryDisplayUnitsCached, buildHistoryDisplayUnitsCached } =
+    await import('./historyDisplayUnits.mjs');
+  const rows = [bashRow('read'), bashRow('read'), row('user', { content: 'x' })];
+  const options = { enabled: true, threshold: 2, expandedKeys: new Set() };
+
+  assert.equal(peekHistoryDisplayUnitsCached(rows, options), null, 'cold peek misses');
+  const built = buildHistoryDisplayUnitsCached(rows, options);
+  assert.equal(peekHistoryDisplayUnitsCached(rows, options), built, 'same array+set hits');
+  // A different Set INSTANCE with the same content still hits (signature, not identity).
+  assert.equal(
+    peekHistoryDisplayUnitsCached(rows, { enabled: true, threshold: 2, expandedKeys: new Set() }),
+    built,
+  );
+  // Toggling a group is a different signature — its own slot, both stay warm.
+  const expanded = { enabled: true, threshold: 2, expandedKeys: new Set([built[0].key]) };
+  assert.equal(peekHistoryDisplayUnitsCached(rows, expanded), null);
+  const builtExpanded = buildHistoryDisplayUnitsCached(rows, expanded);
+  assert.notEqual(builtExpanded, built);
+  assert.equal(peekHistoryDisplayUnitsCached(rows, expanded), builtExpanded);
+  assert.equal(peekHistoryDisplayUnitsCached(rows, options), built, 'collapse-back stays warm');
+  // A NEW rows array (delta reassembly) legitimately misses.
+  assert.equal(peekHistoryDisplayUnitsCached([...rows], options), null);
+  // Kill switch bypasses grouping but caches too.
+  const off = buildHistoryDisplayUnitsCached(rows, { enabled: false });
+  assert.equal(peekHistoryDisplayUnitsCached(rows, { enabled: false }), off);
+  assert.equal(off.every((unit) => unit.kind === 'entry'), true);
+});
+
+test('appended build: tail append reuses the prefix and equals the full build', async () => {
+  const { buildHistoryDisplayUnitsAppended } = await import('./historyDisplayUnits.mjs');
+  const options = { enabled: true, threshold: 2, expandedKeys: new Set() };
+  // Prefix with hard boundaries (user rows) so there is something to reuse.
+  const prev = [];
+  for (let i = 0; i < 6; i += 1) {
+    prev.push(bashRow('read'), bashRow('read'), row('user', { content: 'q' + i }));
+  }
+  const prevUnits = buildHistoryDisplayUnits(prev, options);
+  // Live append: same row REFERENCES + new tail rows (one more series).
+  const next = [...prev, bashRow('git'), bashRow('git')];
+  const appended = buildHistoryDisplayUnitsAppended(prev, prevUnits, next, options);
+  assert.ok(appended, 'tail append qualifies for the incremental path');
+  assert.ok(appended.reusedUnits > 0, 'a prefix was reused');
+  assert.ok(appended.rebuiltEntries < next.length, 'only the tail was rebuilt');
+  const full = buildHistoryDisplayUnits(next, options);
+  assert.deepEqual(
+    appended.units.map((u) => u.kind === 'group' ? ['g', u.entries.map((e) => e.uuid)] : ['e', u.entry.uuid]),
+    full.map((u) => u.kind === 'group' ? ['g', u.entries.map((e) => e.uuid)] : ['e', u.entry.uuid]),
+    'incremental result structurally equals the full build',
+  );
+});
+
+test('appended build: growth INSIDE the tail series regroups it identically', async () => {
+  const { buildHistoryDisplayUnitsAppended } = await import('./historyDisplayUnits.mjs');
+  const options = { enabled: true, threshold: 2, expandedKeys: new Set() };
+  const prev = [
+    bashRow('read'), row('user', { content: 'q' }),
+    bashRow('read'), // tail series of ONE call (below threshold → lone row)
+  ];
+  const prevUnits = buildHistoryDisplayUnits(prev, options);
+  // The append EXTENDS the tail series past the threshold — the lone row
+  // must become a group; prefix reuse must stop before it.
+  const next = [...prev, bashRow('read'), bashRow('read')];
+  const appended = buildHistoryDisplayUnitsAppended(prev, prevUnits, next, options);
+  const full = buildHistoryDisplayUnits(next, options);
+  if (appended) {
+    assert.deepEqual(
+      appended.units.map((u) => u.kind === 'group' ? ['g', u.entries.map((e) => e.uuid)] : ['e', u.entry.uuid]),
+      full.map((u) => u.kind === 'group' ? ['g', u.entries.map((e) => e.uuid)] : ['e', u.entry.uuid]),
+      'series that grew across the cut regroups exactly as the full build',
+    );
+  }
+  // Either the incremental path produced the identical structure or it
+  // declined (null) and the caller full-builds — both are correct; silently
+  // WRONG grouping is the only failure mode this test rejects.
+});
+
+test('appended build reuses an expanded inner aggregate atomically', async () => {
+  const { buildHistoryDisplayUnitsAppended } = await import('./historyDisplayUnits.mjs');
+  const firstRows = [bashRow('read'), bashRow('read')];
+  const firstKey = buildHistoryDisplayUnits(firstRows, { threshold: 2 })[0].key;
+  const options = { enabled: true, threshold: 2, expandedKeys: new Set([firstKey]) };
+  const prev = [...firstRows, row('user', { content: 'boundary' })];
+  for (let i = 0; i < 6; i += 1) {
+    prev.push(bashRow('run'), bashRow('run'), row('user', { content: 'q' + i }));
+  }
+  const prevUnits = buildHistoryDisplayUnits(prev, options);
+  const next = [...prev, bashRow('git'), bashRow('git')];
+  const appended = buildHistoryDisplayUnitsAppended(prev, prevUnits, next, options);
+  assert.ok(appended);
+  const full = buildHistoryDisplayUnits(next, options);
+  const shape = (units) => units.map((unit) => unit.kind === 'group'
+    ? ['g', unit.key, unit.entries.map((entry) => entry.uuid)]
+    : ['e', unit.entry.uuid, unit.expandedSubgroup?.key || unit.expandedGroup?.key || '']);
+  assert.deepEqual(shape(appended.units), shape(full));
+});
+
+test('appended build: every split point over a mixed corpus equals the full build', async () => {
+  const { buildHistoryDisplayUnitsAppended } = await import('./historyDisplayUnits.mjs');
+  const options = { enabled: true, threshold: 2, expandedKeys: new Set() };
+  const corpus = [
+    bashRow('read'), bashRow('read'),
+    row('user', { content: 'q1' }),
+    row('assistant', { content: 'short caption', messageId: 'm1' }),
+    row('assistant', { actions: [raw('Bash', 'search')], messageId: 'm1' }),
+    bashRow('search'),
+    row('assistant', { content: 'a long standalone reply '.repeat(40) }),
+    row('assistant', { actions: [raw('Edit', 'edit')] }),
+    bashRow('read'),
+    row('assistant', { actions: [raw('Edit', 'edit')] }),
+    row('user', { content: 'q2' }),
+    bashRow('git'), bashRow('git'), bashRow('run'),
+  ];
+  for (let cut = 1; cut < corpus.length; cut += 1) {
+    const prev = corpus.slice(0, cut);
+    const prevUnits = buildHistoryDisplayUnits(prev, options);
+    const next = [...prev, ...corpus.slice(cut).map((entry) => ({ ...entry }))];
+    const appended = buildHistoryDisplayUnitsAppended(prev, prevUnits, next, options);
+    if (!appended) continue; // declined → caller full-builds; correctness holds
+    const full = buildHistoryDisplayUnits(next, options);
+    assert.deepEqual(
+      appended.units.map((u) => u.kind === 'group' ? ['g', u.entries.map((e) => e.uuid)] : ['e', u.entry.uuid]),
+      full.map((u) => u.kind === 'group' ? ['g', u.entries.map((e) => e.uuid)] : ['e', u.entry.uuid]),
+      'split at ' + cut + ' diverged from the full build',
+    );
+  }
+});
+
+test('appended build declines on expansion change and on rewritten arrays', async () => {
+  const { buildHistoryDisplayUnitsAppended } = await import('./historyDisplayUnits.mjs');
+  const options = { enabled: true, threshold: 2, expandedKeys: new Set() };
+  const prev = [];
+  for (let i = 0; i < 6; i += 1) {
+    prev.push(bashRow('read'), bashRow('read'), row('user', { content: 'q' + i }));
+  }
+  const prevUnits = buildHistoryDisplayUnits(prev, options);
+  const next = [...prev, bashRow('git'), bashRow('git')];
+  // Expansion signature moved → decline (reused units would carry the old shape).
+  const otherOptions = { enabled: true, threshold: 2, expandedKeys: new Set(['grp:whatever']) };
+  assert.equal(buildHistoryDisplayUnitsAppended(prev, prevUnits, next, otherOptions, options), null);
+  // Full object rewrite (Claude reload) → zero common prefix → decline.
+  const rewritten = next.map((entry) => ({ ...entry }));
+  assert.equal(buildHistoryDisplayUnitsAppended(prev, prevUnits, rewritten, options), null);
 });

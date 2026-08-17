@@ -202,7 +202,19 @@ function commitDetailsRequestKey(repoPath: string, hash: string, filePath?: stri
 type Props = {
   projectId?: string | null;
   projectName?: string;
+  /** The PROJECT's directory: panel identity, repository list, "home" repo. */
   projectPath?: string;
+  /**
+   * Working directory of the ACTIVE tab — what the status is actually about.
+   *
+   * The directory belongs to the tab (a `cd` moves it; a tab can sit in a
+   * worktree while the project points at the main checkout), so this is the
+   * repository the button reports on. Deliberately a SECOND prop rather than
+   * projectPath: the panel's saved state, its reset effect and the repo list
+   * are all keyed on the project, and re-keying them on every tab switch would
+   * close the panel and wipe a half-typed commit message.
+   */
+  tabCwd?: string;
 };
 
 type GitToolbarAction = GitRunAfterAction | 'commit' | 'push' | 'fetch' | 'undo' | 'checkout' | 'merge' | 'abort-merge';
@@ -401,7 +413,7 @@ function changedPathMatchesRepoFile(repoPath?: string | null, filePath?: string 
   return changed === absoluteFilePath || changed.startsWith(`${absoluteFilePath}/`);
 }
 
-export default function GitStatusButton({ projectId, projectName, projectPath }: Props) {
+export default function GitStatusButton({ projectId, projectName, projectPath, tabCwd }: Props) {
   const showToast = useUIStore((state) => state.showToast);
   const activeTabMetaKey = useWorkspaceStore((state) => {
     const activeProjectId = state.activeProjectId;
@@ -503,6 +515,11 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const gitToolbarSuccessTimerRef = useRef<number | null>(null);
   const consumedRunAfterTaskIdsRef = useRef<Set<string>>(new Set());
 
+  // Has the user pinned a repository by hand? Until they do, the button
+  // follows the active tab's directory; after, it stays where they put it
+  // (until the project changes, which resets everything below).
+  const repoPinnedRef = useRef(false);
+
   const runAfterProjectKey = useMemo(
     () => gitRunAfterProjectKey(projectId, projectPath),
     [projectId, projectPath]
@@ -538,7 +555,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     return historyItems.filter((commit) => `${commit.hash} ${commit.subject} ${commit.date}`.toLowerCase().includes(q));
   }, [historyItems, historySearch]);
   const hydratedForCurrentProject = hydratedStateKey === panelStateKey;
-  const effectiveRepoPath = (hydratedForCurrentProject ? selectedRepoPath : (projectPath || '')) || projectPath || '';
+  // Default repository = the ACTIVE TAB's directory (it owns the cwd), falling
+  // back to the project's. An explicit pick in the repo selector still wins:
+  // `selectedRepoPath` is only equal to the default until the user chooses
+  // otherwise, and `tabFollowsSelection` below keeps it following tab switches
+  // for as long as it has not been overridden.
+  const defaultRepoPath = tabCwd || projectPath || '';
+  const effectiveRepoPath = (hydratedForCurrentProject ? selectedRepoPath : defaultRepoPath) || defaultRepoPath;
   const runAfterTask = storedRunAfterTask?.repoPath === effectiveRepoPath ? storedRunAfterTask : null;
   const runAfterAction = runAfterTask?.phase === 'waiting' ? runAfterTask.action : null;
   const runAfterTargetTabId = runAfterTask?.phase === 'waiting' ? runAfterTask.triggerTabId : null;
@@ -825,9 +848,22 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
   }, [projectPath, showToast]);
 
+  // Follow the ACTIVE TAB's directory while the repository is not pinned by
+  // hand. Switching to a tab that lives in a worktree must move the button
+  // there — that is the whole point of "the directory belongs to the tab".
+  useEffect(() => {
+    if (!tabCwd) return;
+    if (repoPinnedRef.current) return;
+    if (hydratedStateKey !== panelStateKey) return; // hydration owns the value
+    setSelectedRepoPath((prev) => (prev === tabCwd ? prev : tabCwd));
+  }, [tabCwd, hydratedStateKey, panelStateKey]);
+
   useEffect(() => {
     const nextProjectPath = projectPath || '';
     latestProjectPathRef.current = nextProjectPath;
+    // A different project starts over: whatever was pinned belonged to the old
+    // one, and its saved state is re-hydrated below.
+    repoPinnedRef.current = false;
     statusRequestRef.current += 1;
     historyRequestRef.current += 1;
     commitDetailsRequestRef.current += 1;
@@ -836,7 +872,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setStatus(null);
     setStatusLoading(Boolean(nextProjectPath));
     setSelectedPathsManual(false);
-    setSelectedRepoPath(nextProjectPath);
+    // The tab's own folder is the default; the project's is the fallback.
+    setSelectedRepoPath(tabCwd || nextProjectPath);
     setRepositories(makeHomeRepositories(nextProjectPath));
     setRepositoriesProjectPath('');
     setRepositoriesLoading(false);
@@ -1219,6 +1256,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       setRepoContextMenu(null);
       return;
     }
+    // An explicit pick pins the repository: from here on tab switches no longer
+    // move it (see the follow effect below). Returning to the tab's own folder
+    // is a pick like any other — it just happens to match the default again.
+    repoPinnedRef.current = true;
     historyRequestRef.current += 1;
     commitDetailsRequestRef.current += 1;
     branchesRequestRef.current += 1;

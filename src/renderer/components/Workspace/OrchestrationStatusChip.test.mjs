@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, 'OrchestrationStatusChip.tsx'), 'utf8');
 
-test('manual recovery shows a stable yellow loader and warning together', () => {
+test('manual recovery shows a static yellow timer and warning together', () => {
   const presentationStart = source.indexOf('function runPresentation');
   const presentationEnd = source.indexOf('function StatusIcon', presentationStart);
   const presentation = source.slice(presentationStart, presentationEnd);
@@ -19,19 +19,22 @@ test('manual recovery shows a stable yellow loader and warning together', () => 
   assert.match(presentation, /icon: 'recovery'/);
   assert.match(presentation, /run\.outcome === 'interrupted' \? 'Остановлено вручную'/);
   assert.match(statusIcon, /presentation\.icon === 'recovery'/);
-  assert.match(statusIcon, /<LoaderCircle className="animate-spin"/);
+  assert.match(statusIcon, /presentation\.icon === 'recovery'[\s\S]*?<Timer size=\{13\}/);
   assert.match(statusIcon, /<CircleAlert size=\{10\}/);
   assert.match(statusIcon, /width: 26, height: 14/);
 });
 
-test('sent delivery awaiting exact audit keeps the yellow loader spinning', () => {
+test('yellow delivery and queued states use a static timer instead of a frozen loader', () => {
   const presentationStart = source.indexOf('function runPresentation');
   const presentationEnd = source.indexOf('function StatusIcon', presentationStart);
   const presentation = source.slice(presentationStart, presentationEnd);
 
   assert.match(presentation, /run\.status === 'sent' && run\.deliveryAuditPendingAt && !run\.targetPromptProofAt/);
   assert.match(presentation, /label: 'Проверка доставки'/);
-  assert.match(presentation, /color: '#fbbf24'[\s\S]*?spinning: true/);
+  assert.match(presentation, /color: '#fbbf24'[\s\S]*?icon: 'waiting'[\s\S]*?spinning: false/);
+  assert.match(presentation, /run\.status === 'queued' \|\| run\.status === 'sent'/);
+  assert.match(source, /else if \(presentation\.icon === 'waiting'\) icon = <Timer/);
+  assert.match(source, /queued: 'Ожидает отправки'/);
 });
 
 test('manual recovery exposes automatic continuation, timer hold, report, and detach actions', () => {

@@ -437,7 +437,7 @@ class AgentSendReceiptStore {
             settled_at = @settledAt
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
-          AND state = 'audit-pending'
+          AND state IN ('audit-pending', 'delivery-unknown')
       `),
       promote: this.db.prepare(`
         UPDATE ${TABLE_NAME}
@@ -842,6 +842,7 @@ class AgentSendReceiptStore {
         || new Date(updatedAt).toISOString();
       const sessionId = optionalString(evidence.sessionId);
       const entryUuid = optionalString(evidence.entryUuid);
+      const sourceIdentity = optionalString(evidence.sourceIdentity);
       const recordByteOffset = evidence.recordByteOffset !== null
         && evidence.recordByteOffset !== undefined
         && Number.isSafeInteger(Number(evidence.recordByteOffset))
@@ -863,6 +864,13 @@ class AgentSendReceiptStore {
         }
         if (previousQueue.entryUuid && entryUuid && previousQueue.entryUuid !== entryUuid) {
           conflicts.push('entryUuid');
+        }
+        if (
+          previousQueue.sourceIdentity
+          && sourceIdentity
+          && previousQueue.sourceIdentity !== sourceIdentity
+        ) {
+          conflicts.push('sourceIdentity');
         }
         if (
           previousQueue.recordByteOffset !== null
@@ -912,6 +920,7 @@ class AgentSendReceiptStore {
         observedAt: updatedAt,
         ...(sessionId ? { sessionId } : {}),
         ...(entryUuid ? { entryUuid } : {}),
+        ...(sourceIdentity ? { sourceIdentity } : {}),
         ...(recordByteOffset !== null ? { recordByteOffset } : {}),
       };
       const receipt = {
@@ -966,7 +975,8 @@ class AgentSendReceiptStore {
       };
       const nextState = classifyAgentSendRegistryReceipt(mergedReceipt);
       if (
-        record.state === STORE_STATES.AUDIT_PENDING
+        (record.state === STORE_STATES.AUDIT_PENDING
+          || record.state === STORE_STATES.DELIVERY_UNKNOWN)
         && nextState === STORE_STATES.PROVIDER_NOT_ACCEPTED
         && isExactProviderNotAcceptedReceipt(mergedReceipt)
       ) {

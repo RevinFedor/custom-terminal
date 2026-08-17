@@ -490,12 +490,18 @@ function decorateHistoryPromptPresentations(db, {
 
   let changed = false;
   const decorated = source.map((entry) => {
-    const isUserEntry = entry?.role === 'user' || entry?.type === 'user' || entry?.kind === 'user';
-    if (!isUserEntry || !entry.uuid) return entry;
+    const isPromptEntry = entry?.role === 'user'
+      || entry?.role === 'queued'
+      || entry?.type === 'user'
+      || entry?.kind === 'user';
+    if (!isPromptEntry || !entry.uuid) return entry;
     let row = exact.get(entry.uuid) || null;
     if (!row) {
-      const timestamp = String(entry.timestamp || '');
-      const hash = promptTransportHash(entry.content || '');
+      const timestamp = String(
+        entry.promptPresentationAuditTimestamp || entry.timestamp || '',
+      );
+      const hash = String(entry.promptPresentationTransportHash || '')
+        || promptTransportHash(entry.content || '');
       row = pending.get(`${timestamp}\u0000${hash}`) || null;
       if (row && !row.entryUuid && db.bindHistoryPromptPresentationEntry) {
         db.bindHistoryPromptPresentationEntry({

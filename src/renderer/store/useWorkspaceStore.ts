@@ -40,7 +40,6 @@ import {
   resolveSplitActivation,
   sanitizePanes,
   paneWithHistoryFrom,
-  dropFromPaneHistory,
   dropTabFromAllPaneHistories,
   emptyPaneByClosedTab,
   packSplitSizes,
@@ -1435,8 +1434,6 @@ interface WorkspaceStore {
    * the order from it and the entry would come back.
    */
   forgetGlobalTabVisit: (projectId: string, tabId: string) => void;
-  /** Same gesture in a PANE's own list: forget this row for that pane only. */
-  forgetPaneTabVisit: (paneIndex: number, tabId: string) => void;
   // Split workspace (up to 3 side-by-side panes, cross-project). Empty =
   // single mode. Persisted in the session state. Focused pane index kept in
   // sync with activeProjectId/activeTabId by activateCenterTab.
@@ -1456,23 +1453,6 @@ interface WorkspaceStore {
    * pointer speed. Packs against the current panes (equal split stores null).
    */
   commitSplitSizes: (sizes: SplitSizes | null) => void;
-  /**
-   * Does the workspace own the keyboard, or does the surrounding interface?
-   *
-   * NOT a second focus and NOT a second active tab: the active tab always
-   * exists and every tab-owned surface keeps following it. This answers only
-   * "where do keystrokes go", which is what decides whether Ctrl+Tab walks the
-   * focused PANE's own history or the global one.
-   *
-   * true — the focused pane (or, in single mode, the centre) has the keyboard;
-   * false — the user clicked the sidebar / a top bar / the dashboard, so the
-   * gesture is global while the tab stays exactly as active as before.
-   *
-   * Session-transient on purpose: after a restart the keyboard belongs to the
-   * workspace, same as it did before any of this existed.
-   */
-  workspaceOwnsKeyboard: boolean;
-  setWorkspaceOwnsKeyboard: (owns: boolean) => void;
   addTabToSplit: (projectId: string, tabId: string) => boolean;
   /**
    * «Убрать вкладку из окна»: the pane STAYS and becomes an empty placeholder.
@@ -1498,16 +1478,12 @@ interface WorkspaceStore {
   removeEmptySplitPane: (paneIndex: number) => void;
   focusSplitPane: (paneIndex: number) => void;
   // ONE entry point for "user activated tab X of project P" (sidebar click,
-  // switcher commit, pane focus, cross-tab jumps). Moves the CENTER only:
-  // activeProjectId follows the tab, focusedProjectId (sidebar/toolbar) stays
-  // — that is the «смена вкладки ≠ смена проекта» rule.
+  // switcher commit, pane focus, cross-tab jumps). Activation moves BOTH
+  // pointers — the centre AND the sidebar (activationFollowPatch inside
+  // switchTab): the sidebar is the map of "where I am", so it always shows the
+  // active tab's project. An explicit project click (showWorkspace) can still
+  // park the sidebar elsewhere until the next activation.
   activateCenterTab: (projectId: string, tabId: string) => void;
-  /**
-   * "Go to this tab, and bring the project with it" — activateCenterTab PLUS
-   * the sidebar. For surfaces that name a tab which may belong to a project the
-   * sidebar is not showing (the pane header chip).
-   */
-  activateTabAndProject: (projectId: string, tabId: string) => void;
   // Transient "reveal this tab in the sidebar list" request. Set by explicit
   // activations (Ctrl+Tab / Cmd+P commit, split pane focus) so TabBar scrolls
   // the row into view instantly — including right after a cross-project
@@ -1882,18 +1858,23 @@ const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
 // Center follows the activated tab's project; the sidebar does not. Before
 // the first cross-project divergence focusedProjectId is null (legacy
 // sessions) — pin it to the previous center so the sidebar visibly stays.
-const centerFollowPatch = (
+// Tab activation moves BOTH pointers: the centre (activeProjectId) and the
+// sidebar (focusedProjectId). One-pointer model (2026-08-17): activating a tab
+// means the sidebar shows that tab's project — the user reads the sidebar as
+// the map of "where I am", and with cross-project panes the old rule («смена
+// вкладки ≠ смена проекта») left them working in a project whose tabs the
+// sidebar did not show at all.
+//
+// The sidebar can still be PARKED on another project by an explicit project
+// click (showWorkspace) — that parking holds until the next tab activation,
+// which is exactly this patch.
+const activationFollowPatch = (
   st: { activeProjectId: string | null; focusedProjectId: string | null },
   projectId: string,
 ): Partial<Pick<WorkspaceStore, 'activeProjectId' | 'focusedProjectId'>> => (
-  st.activeProjectId === projectId
+  st.activeProjectId === projectId && st.focusedProjectId === projectId
     ? {}
-    : {
-      activeProjectId: projectId,
-      ...(st.focusedProjectId === null && st.activeProjectId
-        ? { focusedProjectId: st.activeProjectId }
-        : {}),
-    }
+    : { activeProjectId: projectId, focusedProjectId: projectId }
 );
 
 // Selector helper for project-owned surfaces (sidebar, toolbar, titlebar,
@@ -1971,14 +1952,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
-  forgetPaneTabVisit: (paneIndex, tabId) => {
-    const res = dropFromPaneHistory(get().splitPanes, paneIndex, tabId);
-    if (!res) return;
-    set({ splitPanes: res.panes });
-    console.log('[TabHistory] forget-pane pane=' + paneIndex + ' tab=' + tabId.slice(-12));
-    get().saveSession();
-  },
-
   // ── Split workspace ──────────────────────────────────────────────────────
   splitPanes: [],
   splitFocusedIndex: 0,
@@ -1994,13 +1967,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       ? 'cols=' + packed.cols.map((f) => f.toFixed(3)).join('/')
       : 'reset-to-equal'));
     get().saveSession();
-  },
-  // Starts true: on launch the workspace is where the user works, and this is
-  // the pre-existing behaviour for every gesture that reads it.
-  workspaceOwnsKeyboard: true,
-  setWorkspaceOwnsKeyboard: (owns) => {
-    if (get().workspaceOwnsKeyboard === !!owns) return; // no-op → no re-render
-    set({ workspaceOwnsKeyboard: !!owns });
   },
   addTabToSplit: (projectId, tabId) => {
     const { splitPanes, splitFocusedIndex, activeProjectId, openProjects } = get();
@@ -2235,59 +2201,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   activateCenterTab: (projectId, tabId) => {
-    // Split rules live inside switchTab (the single activation choke point);
-    // this wrapper adds the center follow-through WITHOUT moving the sidebar:
-    // switchTab itself shifts activeProjectId via centerFollowPatch, so
-    // showWorkspace (explicit project navigation) is deliberately NOT called.
+    // Split rules live inside switchTab (the single activation choke point),
+    // and so does the sidebar follow-through: switchTab writes BOTH pointers
+    // via activationFollowPatch. showWorkspace (explicit project navigation,
+    // with its project-history reshuffle) is deliberately NOT called here.
     const st = get();
     st.switchTab(projectId, tabId);
     st.setProjectView(projectId, 'terminal');
-    // Activating a tab always leaves Home — including the SIDEBAR project's
-    // Home overlay when the tab belongs to another project (the overlay
-    // covers the whole center; leaving it up would hide the tab just shown).
-    const focusedPid = get().getFocusedProjectId();
-    if (focusedPid && focusedPid !== projectId
-      && get().openProjects.get(focusedPid)?.currentView === 'home') {
-      st.setProjectView(focusedPid, 'terminal');
-    }
     if (get().view !== 'workspace') {
-      // Dashboard → workspace is view navigation, not project navigation;
-      // land on the sidebar's project, showing the activated tab.
+      // Dashboard → workspace is view navigation, not project navigation.
       set({ view: 'workspace' });
     }
-    // Reveal the row in the sidebar when the sidebar shows this project
-    // (instant, wins over saved-scroll restore).
+    // Reveal the row in the sidebar list — the sidebar now shows this project
+    // (activation moved it). Instant, wins over saved-scroll restore.
     if (get().getFocusedProjectId() === projectId) {
       get().requestTabListReveal(projectId, tabId);
     }
   },
 
-  activateTabAndProject: (projectId, tabId) => {
-    // Two navigations, in this order, and the order is the whole point.
-    //
-    // showWorkspace is the ONLY writer of the sidebar pointer, and it keeps the
-    // center deliberately still ("выбор проекта не меняет активную вкладку").
-    // So the project moves first and the tab moves second — the reverse order
-    // would let the project step land last and undo nothing visible, but it
-    // would also make the tab reveal fire before the sidebar was showing this
-    // project, and the row would never scroll into view.
-    //
-    // Kept as its own method rather than a flag on activateCenterTab: the
-    // one-argument version is the rule for tab switching everywhere else
-    // («смена вкладки ≠ смена проекта»), and a boolean would invite callers to
-    // opt out of it one by one.
-    const workspace = get().openProjects.get(projectId);
-    if (!workspace || !workspace.tabs.has(tabId)) return;
-    if (get().getFocusedProjectId() !== projectId) {
-      get().showWorkspace(projectId);
-    } else {
-      // Already there: the navigation half of this click has nothing to do, so
-      // without a signal the control reads as broken. Flash the project's card
-      // once — it names WHERE the click would have taken you.
-      useUIStore.getState().pulseProjectCard(projectId);
-    }
-    get().activateCenterTab(projectId, tabId);
-  },
   isRestoring: false,
   pendingEditTabId: null,
   tabTitleNamingIds: new Set(),
@@ -3993,12 +3924,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const endTabSwitchMark = markRendererActivity('tab-switch:' + tabId.slice(-8));
       // Use startTransition to prevent UI blocking during re-render
       startTransition(() => {
-        // CENTER follows the activated tab's project so every tab-owned
-        // surface (control bar, History, Timeline, hotkeys) works unchanged.
-        // The SIDEBAR does not: focusedProjectId is pinned to the previous
-        // project on first divergence and moves only on explicit project
-        // clicks. This is the "смена вкладки ≠ смена проекта" rule.
-        set({ openProjects: new Map(openProjects), ...centerFollowPatch(get(), projectId) });
+        // BOTH pointers follow the activated tab: the centre (every tab-owned
+        // surface — control bar, History, Timeline, hotkeys) and the sidebar
+        // (the map the user navigates by). An explicit project click can still
+        // park the sidebar elsewhere — until the next activation lands here.
+        set({ openProjects: new Map(openProjects), ...activationFollowPatch(get(), projectId) });
       });
       const syncMs = performance.now() - _t0;
       console.warn(

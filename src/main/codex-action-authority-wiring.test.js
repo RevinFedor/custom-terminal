@@ -37,6 +37,12 @@ const timelineSource = fs.readFileSync(
   path.join(repoDir, 'src/renderer/components/Workspace/Timeline.tsx'),
   'utf8',
 );
+// The tab's context menu now owns copy-session and fork (both left the control
+// bar as duplicates of gestures already available there).
+const tabBarSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/components/Workspace/TabBar.tsx'),
+  'utf8',
+);
 const workspaceSource = fs.readFileSync(
   path.join(repoDir, 'src/renderer/components/Workspace/Workspace.tsx'),
   'utf8',
@@ -108,6 +114,12 @@ test('native Rewind controls keep one authority without admitting unrelated manu
   assert.match(tracker, /cancelCodexWriterHandoffBeforeAction\(tabId, 'manual-rewind-input-gap'\)/);
   assert.match(tracker, /state\.ownedInputRevision = ownershipAdvance\.ownedInputRevision/);
   assert.match(tracker, /control\.kind === 'cancel'/);
+  const deferredEnter = tracker.indexOf("if (data === '\\r' || data === '\\n')");
+  const observerRevocation = tracker.indexOf("manual-rewind-protocol-left");
+  assert.ok(deferredEnter >= 0 && deferredEnter < observerRevocation,
+    'an unclassified Enter must reach the dedicated flushed confirmation path before observer revocation');
+  assert.match(tracker.slice(deferredEnter, observerRevocation),
+    /defer candidate Enter to Rewind confirmation[\s\S]{0,260}return/);
   assert.match(tracker, /manual-rewind-protocol-left/);
 
   const boundaryStart = mainSource.indexOf('function markCodexWriterHandoffActionBoundary');
@@ -306,15 +318,33 @@ test('startup completion retains the Resume read lease and post-Enter barrier un
   );
 });
 
-test('both copy buttons consume the main read contract while mutations keep writer guards', () => {
-  const copyIdStart = controlBarSource.indexOf('const copySessionId = async () =>');
-  const copyIdEnd = controlBarSource.indexOf('// Live bridge data', copyIdStart);
-  assert.ok(copyIdStart >= 0 && copyIdEnd > copyIdStart);
-  const copyId = controlBarSource.slice(copyIdStart, copyIdEnd);
-  assert.match(copyId, /requireCodexActionSessionId\('скопировать ID сессии'\)/);
-  assert.doesNotMatch(copyId, /requireMutationSafe|,\s*true\)/);
+test('every copy path consumes the main read contract while mutations keep writer guards', () => {
+  // READ vs MUTATE, not "which button". Copying an id only needs an id that can
+  // be read; starting, continuing or forking a session WRITES, and a write must
+  // be refused unless the writer is confirmed. The rule survived a move of the
+  // surfaces — copy and fork left the control bar for the tab's context menu
+  // (they were duplicates of gestures the user already had there) — so the
+  // assertions follow the gestures to their new homes rather than pinning the
+  // deleted buttons. Anything that reintroduces a copy WITHOUT the read contract,
+  // or a fork WITHOUT `requireMutationSafe`, must fail here.
+  const copyUuidStart = tabBarSource.indexOf('const copyUuidWithPath = async (e: React.MouseEvent)');
+  const copyUuidEnd = tabBarSource.indexOf('const lines = resolvedRows.map', copyUuidStart);
+  assert.ok(copyUuidStart >= 0 && copyUuidEnd > copyUuidStart);
+  const copyUuid = tabBarSource.slice(copyUuidStart, copyUuidEnd);
+  assert.match(copyUuid, /operation: 'скопировать UUID сессии'/);
+  assert.doesNotMatch(copyUuid, /requireMutationSafe/);
+
+  // Fork — including the SDK variant added alongside it — goes through ONE
+  // resolver, and that resolver demands a mutation-safe writer for Codex.
+  const forkResolverStart = tabBarSource.indexOf('const resolveContextForkSessionId = async (');
+  const forkResolverEnd = tabBarSource.indexOf('const handleContextFork', forkResolverStart);
+  assert.ok(forkResolverStart >= 0 && forkResolverEnd > forkResolverStart);
+  const forkResolver = tabBarSource.slice(forkResolverStart, forkResolverEnd);
+  assert.match(forkResolver, /requireCodexSurfaceSessionId\(\{[\s\S]{0,200}requireMutationSafe: true/);
+  assert.match(tabBarSource, /resolveContextForkSessionId\([\s\S]{0,120}'создать fork сессии'/);
+  assert.match(tabBarSource, /resolveContextForkSessionId\([\s\S]{0,120}'создать fork сессии в SDK-вкладке'/);
+  // Continuing a stopped session is a write too, and it stayed in the bar.
   assert.match(controlBarSource, /requireCodexActionSessionId\('продолжить Codex-сессию', true\)/);
-  assert.match(controlBarSource, /requireCodexActionSessionId\('создать fork Codex-сессии', true\)/);
 
   const copySessionStart = copySessionSource.indexOf("if (kind === 'codex' && !overrideInput)");
   const copySessionEnd = copySessionSource.indexOf('if (!targetId) continue;', copySessionStart);

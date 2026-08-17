@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { shouldWrapControlBar, CONTROL_BAR_CLUSTER_MIN_GAP_PX } from './controlBarWrap.mjs';
+import {
+  shouldWrapControlBar,
+  shouldShedControlBarReadings,
+  CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+} from './controlBarWrap.mjs';
 
 test('wraps once the two clusters would touch', () => {
   // The reported case: a split pane at roughly half the window width, both
@@ -48,6 +52,100 @@ test('a hidden bar (width 0) does not wrap', () => {
   // leave the bar stacked when it comes back.
   assert.equal(
     shouldWrapControlBar({ availableWidth: 0, leftWidth: 380, rightWidth: 300 }),
+    false,
+  );
+});
+
+// ── В композере переносить нельзя: вторая строка вернула бы ту самую высоту,
+//    ради которой панель туда и переехала. Вместо переноса гаснут показания. ──
+
+test('показания гаснут, когда одна строка не вмещает всё', () => {
+  assert.equal(
+    shouldShedControlBarReadings({
+      availableWidth: 380,
+      leftWidth: 240,
+      rightWidth: 200,
+      readingsWidth: 70,
+    }),
+    true,
+  );
+});
+
+test('пока места хватает, показания остаются', () => {
+  assert.equal(
+    shouldShedControlBarReadings({
+      availableWidth: 900,
+      leftWidth: 240,
+      rightWidth: 200,
+      readingsWidth: 70,
+    }),
+    false,
+  );
+});
+
+test('спрятанные показания не возвращаются от того, что без них стало влезать', () => {
+  // Ловушка, ради которой в правиле есть отдельный признак: спрятав показания,
+  // мы сами уменьшили нужную ширину. Наивный пересчёт ответил бы «влезает», они
+  // вернулись бы, ширина снова выросла — и так по кругу на одной ширине окна.
+  const hiddenLeft = 240 - 70;
+  assert.equal(
+    shouldShedControlBarReadings({
+      availableWidth: 380,
+      leftWidth: hiddenLeft,
+      rightWidth: 200,
+      readingsWidth: 70,
+      readingsHidden: true,
+    }),
+    true,
+    'сравнивать надо с шириной, которая нужна ВМЕСТЕ с показаниями',
+  );
+});
+
+test('после реального расширения окна показания возвращаются', () => {
+  const hiddenLeft = 240 - 70;
+  assert.equal(
+    shouldShedControlBarReadings({
+      availableWidth: 900,
+      leftWidth: hiddenLeft,
+      rightWidth: 200,
+      readingsWidth: 70,
+      readingsHidden: true,
+    }),
+    false,
+  );
+});
+
+test('когда показаний нет вообще, гасить нечего', () => {
+  // У Codex нет чипа кэша, у свежей вкладки нет процента контекста. Ответить
+  // «прячь» здесь значило бы пообещать ширину, которой не появится.
+  assert.equal(
+    shouldShedControlBarReadings({
+      availableWidth: 200,
+      leftWidth: 240,
+      rightWidth: 200,
+      readingsWidth: 0,
+    }),
+    false,
+  );
+});
+
+test('неизмеренная панель не прячет показания', () => {
+  assert.equal(
+    shouldShedControlBarReadings({
+      availableWidth: 0,
+      leftWidth: 0,
+      rightWidth: 0,
+      readingsWidth: 0,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldShedControlBarReadings({
+      availableWidth: 380,
+      leftWidth: 0,
+      rightWidth: 200,
+      readingsWidth: 70,
+    }),
     false,
   );
 });

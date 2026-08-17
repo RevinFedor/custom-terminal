@@ -19,6 +19,16 @@ import {
   type CodexModelOption,
 } from '../../constants/codexSettings';
 import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
+import SideFlyout from '../UI/SideFlyout';
+import {
+  getComposerControlsHost,
+  subscribeComposerControlsHost,
+} from '../../utils/composerControlsHost.mjs';
+import {
+  controlBarBusyTarget,
+  isControlBarBusyTarget,
+  isControlBarBusyBlocked,
+} from '../../utils/controlBarBusyTarget.mjs';
 import ControlHint from '../UI/ControlHint';
 import { PROVIDER_CATALOG } from './providerCatalog';
 import SessionActionChip from './SessionActionChip';
@@ -35,7 +45,6 @@ import { getHistoryAgentRuntime, type AgentPtyStatus } from '../../utils/history
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { readCodexDraftAuthority } from '../../utils/codexDraftAuthority.mjs';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
-import { isCodexRuntimeForkReady } from '../../utils/codexPtyPresence.mjs';
 import {
   planCodexLaunchSettingsPersistence,
   planCodexPickerStateApplication,
@@ -46,9 +55,34 @@ import {
 import { planAgentSettingsAvailability } from '../../utils/agentSettingsAvailability.mjs';
 import { applyClaudePtySetting } from '../../utils/claudePtyActions';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
-import { shouldWrapControlBar, measureClusterContentWidth, CONTROL_BAR_CLUSTER_MIN_GAP_PX } from '../../utils/controlBarWrap.mjs';
+import {
+  shouldWrapControlBar,
+  shouldShedControlBarReadings,
+  measureClusterContentWidth,
+  CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+} from '../../utils/controlBarWrap.mjs';
 
 const { ipcRenderer } = window.require('electron');
+
+// Last CONFIRMED (model, effort) per Claude session, renderer-lifetime LRU.
+// Seeds the control bar on a return visit so the tab-switch frame does not
+// reset-to-default + refetch what it already knew (the reset was part of
+// every `controlbar-rebind` block, 16.08). Values here are only ever what
+// main confirmed from the JSONL branch — optimistic picks never land in it.
+const confirmedSettingsSeedCache = new Map<string, { model: string | null; effort: string | undefined }>();
+const CONFIRMED_SETTINGS_SEED_MAX = 64;
+function rememberConfirmedSettingsSeed(
+  sessionId: string,
+  seed: { model: string | null; effort: string | undefined },
+) {
+  confirmedSettingsSeedCache.delete(sessionId);
+  confirmedSettingsSeedCache.set(sessionId, seed);
+  while (confirmedSettingsSeedCache.size > CONFIRMED_SETTINGS_SEED_MAX) {
+    const oldest = confirmedSettingsSeedCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    confirmedSettingsSeedCache.delete(oldest);
+  }
+}
 
 interface Props {
   tabId: string;
@@ -77,6 +111,9 @@ interface Props {
 // not the whole bar. Hidden entirely when not Anthropic (DeepSeek/Zen have no
 // cache → parent passes show=false) or when no turn has touched the cache yet.
 const CACHE_TTL_MIN = 60; // server-side 1h TTL (see fact-provider-proxy.md)
+// Mirrors the union in utils/controlBarBusyTarget.mjs — a plain .mjs module
+// carries no types to import.
+type ControlBarBusyTarget = 'model' | 'effort' | 'provider' | 'think' | 'fast' | 'quick' | 'session' | null;
 type PtyTransitionEngine = 'claude' | 'codex';
 type SessionActionBlockedStatus = Extract<AgentPtyStatus, 'starting' | 'stopping'> | null;
 // Upper bound for an inline chip action (fork, clipboard fork). Generous
@@ -84,8 +121,6 @@ type SessionActionBlockedStatus = Extract<AgentPtyStatus, 'starting' | 'stopping
 // operation reports instead of spinning for the rest of the session.
 const INLINE_ACTION_DEADLINE_MS = 90_000;
 type InlineAsyncActionKey =
-  | 'fork-to-pty'
-  | 'fork-to-sdk'
   | 'fork-from-clipboard-claude'
   | 'fork-from-clipboard-sdk'
   | 'fork-from-clipboard-codex';
@@ -135,6 +170,70 @@ function InlineActionContent({
         />
       )}
     </span>
+  );
+}
+
+/**
+ * The wait shown ON the control being written, and its cancel gesture.
+ *
+ * Replaces a shimmer that swept across the entire right cluster: one changed
+ * value lit a strip the width of the window, and between passes of the sweep
+ * nothing was visible at all — "я вообще не вижу, есть у нас loader или нет".
+ *
+ * Two things it must not do. It must not change the trigger's width: the label
+ * stays in layout (hidden, not removed) so the neighbouring controls cannot
+ * move at the exact moment of a click. And the spinner must not fill the whole
+ * button — a ring the size of the glyph reads as a control in progress, a ring
+ * the size of the box reads as the box itself being replaced.
+ *
+ * Hovering it offers the way out: the ring turns into a red ✕, because a write
+ * that never confirms would otherwise leave the control waiting forever.
+ */
+function ControlBusySpinner({
+  hovered,
+  size = 12,
+}: {
+  hovered: boolean;
+  size?: number;
+}) {
+  if (hovered) {
+    return (
+      <span
+        aria-hidden
+        data-control-busy-cancel
+        style={{
+          position: 'absolute',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: size,
+          height: size,
+          color: '#f87171',
+          fontSize: size,
+          lineHeight: 1,
+          fontWeight: 700,
+          pointerEvents: 'none',
+        }}
+      >
+        ✕
+      </span>
+    );
+  }
+  return (
+    <span
+      aria-hidden
+      data-control-busy-spinner
+      className="animate-spin"
+      style={{
+        position: 'absolute',
+        width: size,
+        height: size,
+        borderRadius: '50%',
+        border: '1.5px solid rgba(167,139,250,0.25)',
+        borderTopColor: '#a78bfa',
+        pointerEvents: 'none',
+      }}
+    />
   );
 }
 
@@ -310,9 +409,6 @@ export default function ClaudeControlBar({
     : sessionType === 'gemini'
       ? geminiSessionId
       : codexSessionId;
-  const [sessionCopied, setSessionCopied] = useState(false);
-  const [sessionCopyHover, setSessionCopyHover] = useState(false);
-  const [sessionCopyRect, setSessionCopyRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   // Per-field primitive selectors. A single composite-object selector returned a
   // fresh `{}` on every render → Zustand fires re-renders forever → Maximum
   // update depth. Anti-pattern documented in CLAUDE.md ("Zustand: Не подписывайся
@@ -476,8 +572,17 @@ export default function ClaudeControlBar({
   // Confirmed current-session settings. Unlike StatusBar defaults, these are
   // reconstructed from the active JSONL branch and therefore survive renderer
   // restart, follow native Rewind, and include commands typed in the terminal.
-  const [claudeModel, setClaudeModel] = useState<string | null>(null);
-  const [effortLocal, setEffortLocal] = useState<string | undefined>(undefined);
+  // Seeded from the renderer-local per-session cache: a RETURN to a session
+  // shows its last confirmed values in the same frame instead of resetting
+  // to defaults and re-earning them a round-trip later (the reset+refetch
+  // pair was part of every tab-switch frame — `controlbar-rebind` marks,
+  // 16.08). Freshness is still verified in the background; a moved value
+  // simply lands as a normal update.
+  const seededSettings = claudeSessionId
+    ? confirmedSettingsSeedCache.get(claudeSessionId)
+    : undefined;
+  const [claudeModel, setClaudeModel] = useState<string | null>(seededSettings?.model ?? null);
+  const [effortLocal, setEffortLocal] = useState<string | undefined>(seededSettings?.effort);
   // Confirmation-in-flight: the JSONL-branch read that proves model/effort.
   // With the main-side cache a warm answer lands within a frame or two; a
   // cold heavy session takes visibly long — during that window the cluster
@@ -525,6 +630,10 @@ export default function ClaudeControlBar({
       }
       if (result.model) setClaudeModel(result.model);
       setEffortLocal(result.effort || undefined);
+      rememberConfirmedSettingsSeed(claudeSessionId, {
+        model: result.model || null,
+        effort: result.effort || undefined,
+      });
       console.warn(
         '[ClaudeControlBar:ConfirmedSettings] tab=' + tabId.slice(-12)
         + ' sid=' + claudeSessionId.slice(0, 8)
@@ -595,12 +704,26 @@ export default function ClaudeControlBar({
 
   useEffect(() => {
     // Surface mark for freeze attribution: the control-bar rebind on a tab
-    // switch (settings reset + confirmed-settings kick) participates in the
-    // switch frame and must be nameable in during= separately from History.
+    // switch participates in the switch frame and must be nameable in
+    // during= separately from History.
     const endMark = markRendererActivity('controlbar-rebind:' + tabId.slice(-8));
     requestAnimationFrame(() => endMark());
-    setClaudeModel(null);
-    setEffortLocal(undefined);
+    // Session change: show this session's LAST CONFIRMED values immediately
+    // (per-session seed cache) instead of resetting to defaults — the reset
+    // rendered a wrong-looking default and forced an extra commit when the
+    // round-trip landed with the same values it wiped. Cold sessions (no
+    // seed yet) still reset. Freshness is re-verified right after either way.
+    const seed = claudeSessionId
+      ? confirmedSettingsSeedCache.get(claudeSessionId)
+      : undefined;
+    setClaudeModel(seed?.model ?? null);
+    setEffortLocal(seed?.effort);
+    if (seed) {
+      console.warn('[ClaudeControlBar:ConfirmedSettings] seeded tab=' + tabId.slice(-12)
+        + ' sid=' + String(claudeSessionId).slice(0, 8)
+        + ' model=' + (seed.model || 'bridge/default')
+        + ' effort=' + (seed.effort || 'unset'));
+    }
     void refreshClaudeConfirmedSettings('session-change');
   }, [claudeSessionId, refreshClaudeConfirmedSettings, tabId]);
 
@@ -775,25 +898,6 @@ export default function ClaudeControlBar({
     } catch (error: any) {
       showToast(error?.message || `Не удалось проверить Codex-сессию перед действием «${operation}»`, 'warning');
       return null;
-    }
-  };
-
-  const copySessionId = async () => {
-    const actionSessionId = sessionType === 'codex'
-      ? await requireCodexActionSessionId('скопировать ID сессии')
-      : sessionId;
-    if (!actionSessionId) return;
-    if (!(await ensureClaudeArtifactSession('copy-session-id'))) return;
-    // Electron clipboard, не navigator.clipboard — последний в renderer тихо
-    // отваливается без HTTPS/permissions, юзер видит как «даже логов нет».
-    // См. CLAUDE.md anti-pattern «Не используй navigator.clipboard в renderer».
-    try {
-      const { clipboard } = window.require('electron');
-      clipboard.writeText(actionSessionId);
-      setSessionCopied(true);
-      setTimeout(() => setSessionCopied(false), 1000);
-    } catch (e) {
-      console.error('[ClaudeControlBar] copySessionId failed:', e);
     }
   };
 
@@ -1093,6 +1197,10 @@ export default function ClaudeControlBar({
   const isBusy = isPasteBusy || isLocalBusy;
   const busySnapshotRef = useRef({ paste: false, local: false });
   const localBusyReasonRef = useRef<string | null>(null);
+  // The same reason as a rendered value. It decides WHICH control shows the
+  // spinner, and a ref alone would not re-render when it changes — the spinner
+  // would appear on whatever control happened to be busy last.
+  const [localBusyReason, setLocalBusyReason] = useState<string | null>(null);
   const controlActionInFlightRef = useRef<string | null>(null);
   // Fork actions live outside the provider/model busy overlay, so they need
   // their own immediate, in-place feedback. Keep identity in the state because
@@ -1170,15 +1278,10 @@ export default function ClaudeControlBar({
     return null;
   }, [claudeSessionId, codexSessionId, commandType, isSDKTab]);
   const [sessionActionBlockedStatus, setSessionActionBlockedStatus] = useState<SessionActionBlockedStatus>(null);
-  const [codexForkProof, setCodexForkProof] = useState<{
-    tabId: string;
-    ready: boolean;
-    probeFailed?: boolean;
-  } | null>(null);
-  const codexForkWriterReady = codexForkProof?.tabId === tabId && codexForkProof.ready;
-  const codexForkProbeFailed = codexForkProof?.tabId === tabId
-    && codexForkProof.probeFailed === true;
-  const codexForkWaitingForHistory = sessionType === 'codex' && !codexForkWriterReady;
+  // The Codex "is the writer proven yet" probe used to gate the fork chip that
+  // lived here. Forking moved to the tab's right-click menu, and that menu runs
+  // its own proof at click time (`requireCodexSurfaceSessionId`) — a stored flag
+  // would only be a second, staler copy of the same answer.
   const sessionActionProbeSeqRef = useRef(0);
   const setSessionActionBlockedStatusIfChanged = useCallback((next: SessionActionBlockedStatus, reason: string) => {
     setSessionActionBlockedStatus((prev) => {
@@ -1192,22 +1295,11 @@ export default function ClaudeControlBar({
     const seq = ++sessionActionProbeSeqRef.current;
     if (!engine || !tabId) {
       setSessionActionBlockedStatusIfChanged(null, reason + ':no-engine');
-      setCodexForkProof(null);
       return;
     }
     try {
       const presence = await getHistoryAgentRuntime(engine).getPresence(tabId, projectId);
       if (seq !== sessionActionProbeSeqRef.current) return;
-      if (engine === 'codex') {
-        const snapshot = presence.runtimeSnapshot;
-        setCodexForkProof({
-          tabId,
-          ready: isCodexRuntimeForkReady(snapshot),
-          probeFailed: false,
-        });
-      } else {
-        setCodexForkProof(null);
-      }
       const next: SessionActionBlockedStatus =
         presence.status === 'starting' || presence.status === 'stopping'
           ? presence.status
@@ -1215,15 +1307,13 @@ export default function ClaudeControlBar({
       setSessionActionBlockedStatusIfChanged(next, reason + ':' + presence.status);
     } catch (e: any) {
       if (seq !== sessionActionProbeSeqRef.current) return;
-      if (engine === 'codex') {
-        setCodexForkProof({ tabId, ready: false, probeFailed: true });
-      }
       console.warn('[SessionActionChip] presence failed tab=' + tabId.slice(-12) + ' type=' + (engine || '-') + ' reason=' + reason + ' error=' + String(e?.message || e));
     }
   }, [projectId, ptyTransitionEngine, setSessionActionBlockedStatusIfChanged, tabId]);
   const setLocalBusy = (busy: boolean, reason: string) => {
     console.log('[ControlBarLoader] local-set tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason + ' busy=' + busy + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     localBusyReasonRef.current = busy ? reason : null;
+    setLocalBusyReason(busy ? reason : null);
     setIsLocalBusy(busy);
   };
   const beginControlAction = (reason: string) => {
@@ -1262,7 +1352,6 @@ export default function ClaudeControlBar({
     if (!ptyTransitionEngine) {
       sessionActionProbeSeqRef.current += 1;
       setSessionActionBlockedStatusIfChanged(null, 'bind:no-engine');
-      setCodexForkProof(null);
       return;
     }
     void refreshSessionActionBlockedStatus('bind');
@@ -1276,7 +1365,6 @@ export default function ClaudeControlBar({
     };
     const onCommandStarted = (_: any, data: { tabId?: string; commandType?: string | null }) => {
       if (!eventBelongsHere(data?.tabId, data?.commandType || null)) return;
-      if (ptyTransitionEngine === 'codex') setCodexForkProof({ tabId, ready: false });
       setSessionActionBlockedStatusIfChanged('starting', 'command-started');
       void refreshSessionActionBlockedStatus('command-started');
     };
@@ -1387,6 +1475,7 @@ export default function ClaudeControlBar({
     console.log('[ControlBarLoader] bind-reset tab=' + tabId.slice(-12) + ' type=' + sessionType + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     busySnapshotRef.current = { paste: false, local: false };
     localBusyReasonRef.current = null;
+    setLocalBusyReason(null);
     controlActionInFlightRef.current = null;
     setIsPasteBusy(false);
     setIsLocalBusy(false);
@@ -1414,6 +1503,7 @@ export default function ClaudeControlBar({
           return;
         }
         localBusyReasonRef.current = null;
+        setLocalBusyReason(null);
         controlActionInFlightRef.current = null;
         setIsPasteBusy(false);
         setIsLocalBusy(false);
@@ -1616,6 +1706,10 @@ export default function ClaudeControlBar({
   // needs at least one cache-bearing turn captured this session.
   const showCacheChip = !isCodex && (isSDKTab || isAnthropicPTY) && cacheData != null;
   const showRightCluster = settingsAvailability.showRightCluster;
+  // Provider is a PTY-Claude concept: SDK talks to Anthropic directly and Codex
+  // has no provider proxy in our sense. Same condition its own trigger used
+  // before it became the first section of the model menu.
+  const showProviderSection = !isSDKTab && !isCodex;
   const isPrimaryHistoryAgent = historyIsPrimary
     && (sessionType === 'claude' || sessionType === 'codex')
     && !isSDKTab;
@@ -1627,6 +1721,11 @@ export default function ClaudeControlBar({
   // Start/Resume; History itself remains the authority for whether a submit is
   // currently accepted. Legacy terminal tabs retain the old live-PTY guard.
   const showComposerInputActions = isPrimaryHistoryAgent || showLivePtyInputActions;
+  // The draft menu stays mounted whenever any of its three actions can ever
+  // apply to this tab, and dims the ones that cannot right now. Mounting it
+  // only while the process is live would make a control appear and vanish under
+  // the cursor across every Start/Stop — the same reason Mic/Enter stay put.
+  const showDraftMenuControl = isPrimaryHistoryAgent || showLivePtyInputActions;
   const [enterPending, setEnterPending] = useState(false);
   const cancelPendingEnterRef = useRef(false);
   const dictationSnapshot = useDictationSnapshot();
@@ -1729,6 +1828,16 @@ export default function ClaudeControlBar({
     return effortLocal;
   })();
 
+  // Trigger caption. Same short forms as the menu rows, so what the collapsed
+  // control says is literally the row that is checked inside it.
+  const effortTriggerLabel = !effortActive
+    ? 'effort'
+    : effortActive === 'ultracode' || (isCodex && effortActive === 'ultra')
+      ? 'ultra'
+      : effortActive === 'medium' ? 'med'
+        : effortActive === 'xhigh' ? 'xhi'
+          : effortActive;
+
   const quickClaudeModel = claudeCodeModels.find((model) => model.id === claudeCodeSettings.quickModel);
   const quickClaudeEffort = quickClaudeModel
     ? resolveClaudeEffortForModel(quickClaudeModel, claudeCodeSettings.quickEffort)
@@ -1788,14 +1897,26 @@ export default function ClaudeControlBar({
   // ===== popup state =====
   // Hover opens a temporary menu. Click upgrades it to a pinned state with an
   // explicit white frame; click-outside and Escape are the dismissal paths.
-  type PopupKey = 'provider' | 'model' | 'effort';
+  // `draft` is the terminal-draft menu: one trigger instead of the three
+  // separate buttons (pull into the input / copy / copy+clear) that used to sit
+  // side by side. Same upward-popover machinery as the settings triggers, so it
+  // inherits the hover bridge, the click-to-pin and the Escape handling.
+  type PopupKey = 'draft' | 'provider' | 'model' | 'effort';
+  // Provider is the exception: click-only. It changes far less often than the
+  // model, and on hover it kept opening while the cursor was merely on its way
+  // somewhere else. Everything else still opens on hover.
+  const CLICK_ONLY_POPUPS: PopupKey[] = ['provider'];
   const [pinnedPopup, setPinnedPopup] = useState<PopupKey | null>(null);
   const [hoveredTrigger, setHoveredTrigger] = useState<PopupKey | null>(null);
   const [hoveredPopup, setHoveredPopup] = useState<PopupKey | null>(null);
+  // Provider rows inside the model menu: folded until its chip is clicked.
+  const [providerSectionOpen, setProviderSectionOpen] = useState(false);
+  // Hover on the control that currently carries the spinner — it turns the ring
+  // into a red ✕, so the wait always has a visible way out.
+  const [busyCancelHover, setBusyCancelHover] = useState(false);
   const [hoveredModelMenuModel, setHoveredModelMenuModel] = useState<string | null>(null);
   const [hoveredModelMenuAnchor, setHoveredModelMenuAnchor] = useState<HTMLButtonElement | null>(null);
   const isCmdPressed = useCmdKey();
-  const showSessionIdTooltip = isCmdPressed && sessionCopyHover && hasArtifactSession && !!sessionCopyRect;
   // The selected agent type is promoted from the live agent process.  Keep one
   // quick-switch affordance: an untouched Anthropic provider default must not
   // create a second Claude button while the same PTY is running Codex.
@@ -1826,6 +1947,20 @@ export default function ClaudeControlBar({
     ?? hoveredTrigger
     ?? hoveredPopup;
 
+  // Where to draw. The composer publishes a slot inside its top line; while it
+  // does, the strip under the terminal is not rendered at all and these very
+  // controls appear in the composer instead. Subscribed rather than looked up
+  // by id: the composer's node is replaced when the panel changes layout, and a
+  // one-shot lookup would keep pointing at the detached one.
+  const [composerControlsHost, setComposerControlsHostNode] = useState<Element | null>(
+    () => getComposerControlsHost(tabId),
+  );
+  useEffect(() => {
+    setComposerControlsHostNode(getComposerControlsHost(tabId));
+    return subscribeComposerControlsHost(tabId, setComposerControlsHostNode);
+  }, [tabId]);
+  const dockedInComposer = !!composerControlsHost;
+
   const rootRef = useRef<HTMLDivElement>(null);
   // ── Перенос в две строки при нехватке ширины ────────────────────────────
   // Каждая кнопка в баре — pill фиксированного размера (flexShrink: 0), потому
@@ -1838,10 +1973,18 @@ export default function ClaudeControlBar({
   // какие необязательные чипы сейчас показаны.
   const leftClusterRef = useRef<HTMLDivElement>(null);
   const rightClusterRef = useRef<HTMLDivElement>(null);
+  const readingsRef = useRef<HTMLDivElement>(null);
   const [clustersWrapped, setClustersWrapped] = useState(false);
+  // Docked in the composer the bar may not grow a second line, so instead of
+  // wrapping it drops the readings. Their last measured width is remembered
+  // while they are hidden: the comparison has to keep using the width the bar
+  // needs WITH them, or hiding them would immediately make everything "fit" and
+  // bring them straight back — a flicker at one exact window width.
+  const [readingsShed, setReadingsShed] = useState(false);
+  const readingsWidthRef = useRef(0);
   // Refs на каждый trigger + popup для geometric bridge (mousemove hit-test).
-  const triggerRefs = useRef<Record<PopupKey, HTMLButtonElement | null>>({ provider: null, model: null, effort: null });
-  const popupRefs = useRef<Record<PopupKey, HTMLDivElement | null>>({ provider: null, model: null, effort: null });
+  const triggerRefs = useRef<Record<PopupKey, HTMLButtonElement | null>>({ draft: null, provider: null, model: null, effort: null });
+  const popupRefs = useRef<Record<PopupKey, HTMLDivElement | null>>({ draft: null, provider: null, model: null, effort: null });
   const modelEffortPopupRef = useRef<HTMLDivElement | null>(null);
 
   // Ловушка, из-за которой наивная версия начинает мигать: после переноса блоки
@@ -1865,16 +2008,37 @@ export default function ClaudeControlBar({
     const measure = () => {
       const style = window.getComputedStyle(root);
       const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+      // Ширина СОДЕРЖИМОГО, а не выданная раскладкой: у левого блока в конце
+      // стоит распорка, прижимающая счётчик контекста к правому краю, поэтому
+      // scrollWidth всегда равен ширине бара (замерено: 600 из 600 при
+      // реальной сумме детей 521). С таким числом сравнение становится
+      // самоссылочным — оно растёт вместе с доступной шириной, и бар уже
+      // никогда не «влезает» обратно в одну строку.
+      const availableWidth = root.clientWidth - padding;
+      const leftWidth = measureClusterContentWidth(left, 10);
+      const rightWidth = measureClusterContentWidth(right, 6);
+      const readingsNode = readingsRef.current;
+      if (readingsNode) {
+        const width = readingsNode.getBoundingClientRect().width;
+        if (width > 0) readingsWidthRef.current = width;
+      }
+      if (dockedInComposer) {
+        setClustersWrapped(false);
+        setReadingsShed(shouldShedControlBarReadings({
+          availableWidth,
+          leftWidth,
+          rightWidth,
+          readingsWidth: readingsWidthRef.current,
+          readingsHidden: !readingsNode,
+          minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+        }));
+        return;
+      }
+      setReadingsShed(false);
       setClustersWrapped(shouldWrapControlBar({
-        availableWidth: root.clientWidth - padding,
-        // Ширина СОДЕРЖИМОГО, а не выданная раскладкой: у левого блока в конце
-        // стоит распорка, прижимающая счётчик контекста к правому краю, поэтому
-        // scrollWidth всегда равен ширине бара (замерено: 600 из 600 при
-        // реальной сумме детей 521). С таким числом сравнение становится
-        // самоссылочным — оно растёт вместе с доступной шириной, и бар уже
-        // никогда не «влезает» обратно в одну строку.
-        leftWidth: measureClusterContentWidth(left, 10),
-        rightWidth: measureClusterContentWidth(right, 6),
+        availableWidth,
+        leftWidth,
+        rightWidth,
         minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
       }));
     };
@@ -1902,7 +2066,7 @@ export default function ClaudeControlBar({
       observer.disconnect();
       window.removeEventListener('resize', measure);
     };
-  }, [showRightCluster, sessionType, tabId, hasArtifactSession, contextPct > 0, showCacheChip]);
+  }, [showRightCluster, sessionType, tabId, hasArtifactSession, contextPct > 0, showCacheChip, dockedInComposer]);
 
   // Второй, безусловный источник того же расчёта: без списка зависимостей он
   // выполняется после каждого рендера. Это и есть страховка от скрытого окна и
@@ -1916,8 +2080,29 @@ export default function ClaudeControlBar({
     if (!root || !left || !right) return;
     const style = window.getComputedStyle(root);
     const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+    const availableWidth = root.clientWidth - padding;
+    if (dockedInComposer) {
+      // Здесь тоже нельзя мерить scrollWidth целиком по той же причине, что и
+      // выше: у левого блока распорка. Считаем детей.
+      const readingsNode = readingsRef.current;
+      if (readingsNode) {
+        const width = readingsNode.getBoundingClientRect().width;
+        if (width > 0) readingsWidthRef.current = width;
+      }
+      setClustersWrapped(false);
+      setReadingsShed(shouldShedControlBarReadings({
+        availableWidth,
+        leftWidth: measureClusterContentWidth(left, 10),
+        rightWidth: measureClusterContentWidth(right, 6),
+        readingsWidth: readingsWidthRef.current,
+        readingsHidden: !readingsNode,
+        minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+      }));
+      return;
+    }
+    setReadingsShed(false);
     setClustersWrapped(shouldWrapControlBar({
-      availableWidth: root.clientWidth - padding,
+      availableWidth,
       leftWidth: left.scrollWidth,
       rightWidth: right.scrollWidth,
       minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
@@ -1928,6 +2113,10 @@ export default function ClaudeControlBar({
     if (openPopup === 'model') return;
     setHoveredModelMenuModel(null);
     setHoveredModelMenuAnchor(null);
+    // Fold the provider rows back. Left open, the menu would reopen expanded
+    // next time — and the whole point of the chip is that the models are what
+    // the menu shows at rest.
+    setProviderSectionOpen(false);
   }, [openPopup]);
 
   // Click-outside закрывает только pinned popup (CMD-hover закрывается по
@@ -1964,7 +2153,10 @@ export default function ClaudeControlBar({
       const { clientX: x, clientY: y } = e;
       let newTrigger: PopupKey | null = null;
       let newPopup: PopupKey | null = null;
-      (['provider', 'model', 'effort'] as PopupKey[]).forEach((key) => {
+      // Provider is excluded: it opens on click only, so a mouse passing over
+      // its trigger must not open it — and while it IS open (pinned), the
+      // bridge must not close it either.
+      (['draft', 'model', 'effort'] as PopupKey[]).forEach((key) => {
         const t = triggerRefs.current[key]?.getBoundingClientRect();
         const p = popupRefs.current[key]?.getBoundingClientRect();
         const secondary = key === 'model' ? modelEffortPopupRef.current?.getBoundingClientRect() : null;
@@ -2869,9 +3061,23 @@ export default function ClaudeControlBar({
     window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId } }));
   };
 
-  const refreshTimeline = () => {
-    window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId } }));
-  };
+  // Which control is being written, and therefore which one shows the spinner.
+  // Everything else in the cluster is plainly unavailable meanwhile — the CLI
+  // applies one setting at a time.
+  const busyTarget = controlBarBusyTarget(localBusyReason);
+  const isBusySpinnerOn = (control: ControlBarBusyTarget) => isControlBarBusyTarget({
+    busy: isLocalBusy,
+    reason: localBusyReason,
+    control,
+  });
+  const isBusyBlocked = (control: ControlBarBusyTarget) => isControlBarBusyBlocked({
+    busy: isLocalBusy || isPasteBusy,
+    reason: isPasteBusy ? null : localBusyReason,
+    control,
+  });
+  useEffect(() => {
+    if (!isLocalBusy) setBusyCancelHover(false);
+  }, [isLocalBusy]);
 
   // Manual escape hatch for a STUCK local-control indicator. The right cluster's
   // shimmer is driven only by isLocalBusy; isPasteBusy remains a silent write
@@ -2883,6 +3089,11 @@ export default function ClaudeControlBar({
   const forceResetBusy = () => {
     console.warn('[ControlBar] manual local-busy reset by user for tab ' + tabId.slice(-12));
     setLocalBusy(false, 'manual-reset');
+    // Release the in-flight guard too. Without it the visible wait ends but the
+    // NEXT click is silently refused by beginControlAction, so cancelling would
+    // leave the control looking free and behaving dead.
+    controlActionInFlightRef.current = null;
+    setBusyCancelHover(false);
     focusTerminal();
   };
 
@@ -2999,33 +3210,10 @@ export default function ClaudeControlBar({
     sendRawEnterToPty();
   };
 
-  // Fork current session into a PTY tab. This button is visible only when the
-  // current tab already has a session, so it is a branch action FROM this tab,
-  // never a launch target. Always create a neighbour tab; in-place reuse is only
-  // valid for clipboard `*-F` chips on a pristine PTY tab.
-  const forkToTab = async () => {
-    if (!tabId || !sessionType) return;
-    const actionSessionId = sessionType === 'codex'
-      ? await requireCodexActionSessionId('создать fork Codex-сессии', true)
-      : sessionId;
-    if (!actionSessionId) return;
-    if (!(await ensureClaudeArtifactSession('fork-to-tab'))) return;
-    const state = useWorkspaceStore.getState();
-    for (const [projectId, workspace] of state.openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (!tab) continue;
-      const currentCwd = tab.cwd || projectPath || '';
-      const forkName = tab.name ? `${tab.name}_fork` : undefined;
-      await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
-        pendingAction: { type: sessionType === 'claude' ? 'claude-fork' : sessionType === 'codex' ? 'codex-fork' : 'gemini-fork', sessionId: actionSessionId },
-        nameSetManually: sessionType === 'gemini' ? !!forkName : false,
-        afterTabId: tab.id,
-        visualParentTabId: tab.id,
-      });
-      showToast(`Fork ${sessionType === 'claude' ? 'Claude' : sessionType === 'codex' ? 'Codex' : 'Gemini'} → ${forkName || 'новая вкладка'}`, 'success');
-      break;
-    }
-  };
+  // Forking the CURRENT session now lives in the tab's right-click menu
+  // (Compact Fork | Fork | SDK). Both the plain-PTY and the SDK variant moved
+  // there verbatim, including the Codex writer-proof gate — see TabBar
+  // `handleContextFork`.
 
   // Pull a UUID out of clipboard text. The clipboard might hold raw whitespace
   // ("  uuid \n"), a TUI bracketed-paste echo, or "/resume <uuid>" — strip and
@@ -3203,31 +3391,6 @@ export default function ClaudeControlBar({
     }
   };
 
-  // Fork current Claude session into SDK. This is a branch action FROM a tab
-  // that already has Claude history, so it always creates a neighbour SDK tab.
-  // In-place PTY→SDK conversion is reserved for clipboard `SDK-F` on a pristine
-  // PTY target.
-  const forkToSDK = async () => {
-    if (!sessionId || !tabId || sessionType !== 'claude') return;
-    if (!(await ensureClaudeArtifactSession('fork-to-sdk'))) return;
-    const state = useWorkspaceStore.getState();
-    for (const [projectId, workspace] of state.openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (!tab) continue;
-      const currentCwd = tab.cwd || projectPath || '';
-      const forkResult = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId: sessionId, cwd: currentCwd, skipChainResolve: true });
-      if (!forkResult.success) { showToast('Fork failed: ' + forkResult.error, 'error'); return; }
-      const forkName = tab.name ? `${tab.name}_fork` : undefined;
-      const sdkTabId = await state.createSDKTab(projectId, forkName, {
-        afterTabId: tab.id,
-        visualParentTabId: tab.id,
-      });
-      state.updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
-      showToast(`SDK fork → ${forkName || 'новая вкладка'}`, 'success');
-      break;
-    }
-  };
-
   // ===== Prompt copy / clear (Claude/Codex PTY — Gemini has no equivalent IPC). =====
   // clearAfter=true uses claude:grab-input (atomic copy+truncate in one Ctrl+G round,
   // helper truncates the tempfile before sending text back to socket — see
@@ -3297,10 +3460,9 @@ export default function ClaudeControlBar({
   const effortLabel = (effortActive === 'medium' ? 'med' : effortActive === 'xhigh' ? 'xhi' : effortActive === 'ultracode' ? 'ultra' : (effortActive || '—'));
 
   // ===== styles =====
-  // Triggers сами не меняют opacity при busy — лоадер реализован overlay'ем на
-  // обёртке кластера (см. `<div className="control-bar-busy-overlay">` ниже).
-  // Это сохраняет ширину блока (раньше opacity 0.5 + текст разной длины менял
-  // визуальную ширину, плюс «серая» подсветка читалась как «мёртвое» состояние).
+  // Ширина триггера не должна зависеть от того, идёт запись или нет: подпись
+  // остаётся в раскладке (скрытая, а не удалённая), кружок рисуется поверх неё
+  // absolute. Иначе соседние кнопки уезжали бы вбок ровно в момент клика.
   const triggerStyle: React.CSSProperties = {
     height: 22,
     padding: '0 8px',
@@ -3351,19 +3513,62 @@ export default function ClaudeControlBar({
     );
   };
 
-  const pillStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
+  // Rows of the terminal-draft menu. Full-width and left-aligned, unlike the
+  // settings pills: these are actions with sentence labels, not values being
+  // compared, so the eye should scan one column of verbs.
+  const draftMenuItemStyle = (disabled: boolean): React.CSSProperties => ({
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 5,
+    width: '100%',
+    height: 22,
+    padding: '0 8px',
+    fontSize: 11,
+    fontFamily: 'inherit',
+    textAlign: 'left',
+    color: disabled ? '#555' : '#ccc',
+    backgroundColor: disabled ? '#222' : '#2d2d2d',
+    borderWidth: 0,
+    borderStyle: 'none',
+    borderRadius: 3,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    whiteSpace: 'nowrap',
+  });
+
+  // Rows of the settings menus (provider, model, effort). Same geometry as the
+  // draft menu so the three columns read as one family; the active row paints
+  // its own accent over this base.
+  const settingsMenuRowStyle = (disabled: boolean): React.CSSProperties => ({
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 5,
+    width: '100%',
     height: 20,
     padding: '0 8px',
     fontSize: 11,
-    fontWeight: active ? 500 : 400,
-    color: disabled ? '#555' : active ? '#fff' : '#aaa',
-    backgroundColor: active ? '#DA7756' : disabled ? '#222' : '#2d2d2d',
+    fontFamily: 'inherit',
+    fontWeight: 400,
+    textAlign: 'left',
+    color: disabled ? '#555' : '#aaa',
+    backgroundColor: disabled ? '#222' : '#2d2d2d',
     borderWidth: 0,
     borderStyle: 'none',
-    borderColor: 'transparent',
     borderRadius: 3,
     cursor: disabled ? 'not-allowed' : 'pointer',
+    whiteSpace: 'nowrap',
   });
+  const settingsMenuHeadingStyle: React.CSSProperties = {
+    padding: '2px 6px 3px',
+    color: '#777',
+    fontSize: 10,
+    letterSpacing: '0.04em',
+    borderBottom: '1px solid rgba(255,255,255,0.08)',
+  };
+  const settingsMenuSeparatorStyle: React.CSSProperties = {
+    height: 1,
+    margin: '2px 0',
+    background: 'rgba(255,255,255,0.12)',
+  };
 
   // ============================================================================
   // ===== render =====
@@ -3379,12 +3584,8 @@ export default function ClaudeControlBar({
   //                              | session)| process)    | БД, claude  | session)| активен)    | turn'ами)
   //                              |         |             | мёртв)      |         |             |
   // -----------------------------+---------+-------------+-------------+---------+-------------+----------
-  // ⎘ copy-session-id            | -       | + если saved| + saved     | -       | + (если sid)| + (если sid)
   // SessionActionChip            | "Start" | "Stop" hover| "Continue"  | "Claude"| "Stop" hover| "Claude"
   //   transition/loader          | disabled during PTY starting/stopping and local control-action in-flight
-  // ↻ refresh-timeline           | -       | + saved     | + saved     | -       | +           | +
-  // ⑂→▭ forkToTab (PTY)          | -       | + saved     | + saved     | -       | +           | +
-  // ⑂→SDK forkToSDK              | -       | + saved     | + saved     | -       | -           | -
   // SDK startNewSDKTab           | + 1)    | -           | -           | -       | -           | -
   // Claude-F (from clipboard)    | + 1)    | -           | -           | -       | -           | -
   // SDK-F (from clipboard)       | + 1)    | -           | -           | -       | -           | -
@@ -3408,6 +3609,16 @@ export default function ClaudeControlBar({
   //    Раньше guard был `!hasAnySession && !isSDKTab` — кнопки показывались
   //    в окне «процесс стартанул, sessionId ещё не записался в Tab». Юзер
   //    видел Claude-F/SDK-F одновременно с живым claude процессом.
+  //
+  // ЧЕГО ЗДЕСЬ БОЛЬШЕ НЕТ (не возвращать):
+  //   ⎘ copy-session-id, ↻ refresh-timeline — удалены. ID сессии копируется
+  //     правым кликом по вкладке («ID-Tab | UUID + Path»), Timeline обновляется
+  //     сам. Юзер: «кнопку перезагрузки можно удалить, я её не использую» /
+  //     «эту тоже удалить, я копирую через правый клик по вкладке».
+  //   ⑂→▭ / ⑂→SDK — форки ТЕКУЩЕЙ сессии переехали в то же контекстное меню
+  //     вкладки («Compact Fork | Fork | SDK»). Здесь остались только clipboard
+  //     `*-F`: это НЕ форки текущей сессии, а запуски пустой вкладки из чужого
+  //     session id, поэтому они и живут рядом с остальными launch-кнопками.
   //
   // ВЕТКИ И ИХ ИСТОЧНИКИ:
   //
@@ -3435,36 +3646,49 @@ export default function ClaudeControlBar({
   //              keeps its old live-process-only raw-input behavior.
   //
   // АНТИПАТТЕРН (не повторять):
-  //   — Для in-flight control-команд (`/model`, `/effort`, provider switch)
-  //     не ставь `disabled + opacity` на каждый trigger: блок визуально
-  //     съёживается. Используй .control-bar-busy-overlay (shimmer ::after) —
-  //     см. fact-claude-control-bar.md::Busy-overlay. Semantic unavailable
-  //     states (PTY idle, Codex streaming) — отдельный случай: там кнопки
-  //     действительно недоступны, а не "команда уже применяется".
+  //   — Не возвращай индикатор на ВЕСЬ кластер. Переливающаяся полоса по
+  //     правому блоку зажигала при смене одного значения строку шириной почти
+  //     в окно, а между проходами свечения не показывала ничего вообще.
+  //     Ожидание принадлежит той кнопке, которую пишут: кружок на ней
+  //     (ControlBusySpinner), соседи — обычный disabled, наведение на кружок
+  //     даёт красный ✕ отмены. Правило «кто занят» — utils/controlBarBusyTarget.mjs.
+  //   — Подпись при этом не убирается из раскладки, иначе триггер сожмётся и
+  //     сдвинет соседей в момент клика.
   //   — Композитный селектор Zustand `state => ({ a, b, c })` → новая ссылка
   //     каждый рендер → infinite re-render. Используй отдельные primitive
   //     селекторы (см. начало компонента, `tabType` / `sdkModel` etc).
   //
   // ============================================================================
-  return (
+  const barBody = (
     <div
       ref={rootRef}
+      data-agent-control-bar={tabId}
+      data-agent-control-bar-placement={dockedInComposer ? 'composer' : 'strip'}
       style={{
         position: 'relative',
         display: 'flex',
         // Перенос: правый блок остаётся на ПЕРВОЙ строке, левый уходит на вторую
         // (порядок задан через `order` ниже). Так органы управления, к которым
         // тянешься чаще, сохраняют своё место относительно поля ввода сверху.
+        // В композере переноса нет: он вернул бы ту самую высоту, ради которой
+        // панель туда и переезжала. Там вместо переноса гаснут показания.
         flexDirection: clustersWrapped ? 'column' : 'row',
         alignItems: clustersWrapped ? 'stretch' : 'center',
-        gap: clustersWrapped ? 2 : 12,
-        padding: '4px 10px',
-        // Высота фиксирована только в одну строку. В две — по содержимому: бар
-        // это обычная строка раскладки, и всё под ним просто сдвигается вниз.
-        ...(clustersWrapped ? null : { height: 30 }),
-        borderTop: '1px solid #2a2a2a',
-        backgroundColor: '#161616',
-        flexShrink: 0,
+        gap: clustersWrapped ? 2 : dockedInComposer ? 8 : 12,
+        // Пристыкованная панель — часть строки композера, а не своя полоса:
+        // ни фона, ни рамки, ни собственных отступов, иначе внутри рамки
+        // появилась бы вторая рамка.
+        ...(dockedInComposer
+          ? { flex: 1, minWidth: 0, height: '100%', padding: 0 }
+          : {
+            padding: '4px 10px',
+            // Высота фиксирована только в одну строку. В две — по содержимому:
+            // бар это обычная строка раскладки, и всё под ним просто сдвигается.
+            ...(clustersWrapped ? null : { height: 30 }),
+            borderTop: '1px solid #2a2a2a',
+            backgroundColor: '#161616',
+            flexShrink: 0,
+          }),
       }}
     >
       {/* LEFT: session controls + context meter */}
@@ -3481,58 +3705,25 @@ export default function ClaudeControlBar({
           minWidth: 0,
         }}
       >
-        {/* ── [⎘ session-id-copy | SessionActionChip | ↻ refresh-timeline] ──
-            Container border видим только при наличии sessionId. Содержимое
-            заходит в один rounded-3-pill блок. Copy/Refresh скрыты на
-            новой вкладке (нечего копировать / нечего обновлять). */}
+        {/* ── [SessionActionChip] ──
+            Container border видим только при наличии sessionId.
+
+            Копирование id сессии и перезагрузка Timeline отсюда УДАЛЕНЫ: id
+            копируется правым кликом по вкладке (там же UUID + путь), Timeline
+            обновляется сам. Юзер: «кнопку перезагрузки можно удалить, я её не
+            использую» / «эту тоже удалить, я копирую через правый клик». */}
         <div
           className="inline-flex items-center rounded overflow-hidden"
           style={{
             gap: 0,
-            border: hasArtifactSession ? '1px solid rgba(255,255,255,0.10)' : 'none',
+            // Docked: the pill is empty for PTY tabs (the chip moved out), and a
+            // lone border around nothing would read as a broken control.
+            border: hasArtifactSession && !(dockedInComposer && !isSDKTab)
+              ? '1px solid rgba(255,255,255,0.10)'
+              : 'none',
             flexShrink: 0,
           }}
         >
-          {hasArtifactSession && (
-            <span
-              className="cursor-pointer flex-shrink-0 inline-flex items-center justify-center transition-colors"
-              style={{
-                color: sessionCopied ? '#4ade80' : '#aaa',
-                fontSize: 13,
-                lineHeight: 1,
-                width: 22,
-                height: 18,
-                backgroundColor: 'transparent',
-                userSelect: 'none',
-              }}
-              onMouseEnter={(e) => {
-                setSessionCopyHover(true);
-                const rect = e.currentTarget.getBoundingClientRect();
-                setSessionCopyRect({
-                  left: rect.left,
-                  top: rect.top,
-                  width: rect.width,
-                  height: rect.height,
-                });
-                if (sessionCopied) return;
-                const el = e.currentTarget as HTMLSpanElement;
-                el.style.color = '#fff';
-                el.style.backgroundColor = 'rgba(255,255,255,0.08)';
-              }}
-              onMouseLeave={(e) => {
-                setSessionCopyHover(false);
-                setSessionCopyRect(null);
-                if (sessionCopied) return;
-                const el = e.currentTarget as HTMLSpanElement;
-                el.style.color = '#aaa';
-                el.style.backgroundColor = 'transparent';
-              }}
-              onClick={copySessionId}
-              title="Copy session ID"
-            >
-              {sessionCopied ? '✓' : '⎘'}
-            </span>
-          )}
           {/* PTY mode: 3-state матрица (Start/Continue/Stop). SDK mode: 2-state
               (idle / running) — там Continue/Start не имеют семантики, таб
               существует — query запустится первым же сообщением. См. headed
@@ -3586,7 +3777,13 @@ export default function ClaudeControlBar({
                 </ControlHint>
               );
             })()
-          ) : (
+          ) : !dockedInComposer && (
+            // Docked in the composer this chip is GONE: the status control to
+            // its left already starts and stops the session (hover → ▶ / ■), and
+            // two controls for one action next to each other is exactly what the
+            // move was meant to remove. Юзер: «все кнопки Resume — нет, у нас
+            // есть кнопка терминала, при hover она превращается в play».
+            // The strip keeps it — there is no status control there.
             <SessionActionChip
               sessionType={sessionType}
               mode="pty"
@@ -3600,153 +3797,13 @@ export default function ClaudeControlBar({
               onStop={onStop}
             />
           )}
-          {hasArtifactSession && (
-            <ControlHint label="Обновить Timeline">
-            <button
-              className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
-              style={{
-                color: '#aaa',
-                fontSize: 13,
-                lineHeight: 1,
-                width: 22,
-                height: 18,
-                padding: 0,
-                background: 'transparent',
-                border: 'none',
-                userSelect: 'none',
-              }}
-              onMouseEnter={(e) => {
-                const el = e.currentTarget as HTMLButtonElement;
-                el.style.color = '#fff';
-                el.style.background = 'rgba(255,255,255,0.08)';
-              }}
-              onMouseLeave={(e) => {
-                const el = e.currentTarget as HTMLButtonElement;
-                el.style.color = '#aaa';
-                el.style.background = 'transparent';
-              }}
-              onClick={refreshTimeline}
-              title="Refresh timeline"
-            >↻</button>
-            </ControlHint>
-          )}
         </div>
-        {showSessionIdTooltip && sessionCopyRect && sessionId && (
-          <div
-            data-session-id-tooltip
-            style={{
-              position: 'fixed',
-              left: sessionCopyRect.left + sessionCopyRect.width / 2,
-              top: Math.max(8, sessionCopyRect.top - 8),
-              transform: 'translate(-50%, -100%)',
-              zIndex: 10000,
-              pointerEvents: 'none',
-              maxWidth: 'calc(100vw - 16px)',
-              padding: '5px 8px',
-              borderRadius: 6,
-              border: '1px solid rgba(255,255,255,0.14)',
-              background: '#101010',
-              color: '#d4d4d4',
-              boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
-              fontSize: 11,
-              lineHeight: 1.2,
-              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-              whiteSpace: 'nowrap',
-            }}
-          >
-            {sessionId}
-          </div>
-        )}
 
-        {/* Forks: session-origin actions into a new PTY tab
-            (⑂→▭) and a new SDK tab (⑂→SDK).
-            SDK fork only for Claude sessions — SDK doesn't run Gemini.
-            Без активной сессии форкать нечего, поэтому обе fork-кнопки
-            скрываются и заменяются на одну `+ SDK` (создать новый SDK таб)
-            — единственное осмысленное действие в этом слоте при пустой
-            сессии. На SDK-табе вариант «открыть SDK» не показываем — юзер
-            уже в SDK. */}
-        {hasArtifactSession && (
-          <ControlHint
-            label={codexForkProbeFailed
-              ? 'Не удалось проверить активную историю Codex — нажмите, чтобы повторить'
-              : codexForkWaitingForHistory
-              ? 'После Resume ветка Codex подтвердится вашим первым сообщением — до этого форк недоступен'
-              : 'Создать fork сессии в новой PTY-вкладке'}
-          >
-          <button
-            type="button"
-            aria-busy={isInlineActionLoading('fork-to-pty')}
-            aria-disabled={inlineAction?.tabId === tabId || codexForkWaitingForHistory}
-            className="text-[10px] px-1.5 py-0.5 rounded text-[#999] hover:text-white cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
-            style={{
-              backgroundColor: 'transparent',
-              border: '1px solid rgba(255,255,255,0.10)',
-              flexShrink: 0,
-              cursor: codexForkWaitingForHistory ? 'not-allowed' : 'pointer',
-              opacity: codexForkWaitingForHistory ? 0.72 : 1,
-            }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(255,255,255,0.06)'; }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
-            onClick={() => {
-              if (codexForkWaitingForHistory) {
-                void refreshSessionActionBlockedStatus('fork-chip-click');
-                return;
-              }
-              void runInlineAction('fork-to-pty', forkToTab);
-            }}
-            title={codexForkProbeFailed
-              ? 'Проверить активную историю Codex ещё раз'
-              : codexForkWaitingForHistory
-              ? 'Активная история Codex ещё подтверждается'
-              : 'Fork в новую вкладку'}
-          >
-            {/* A spinner promises "this finishes on its own". In the Codex
-                provisional window it does not: the writer is confirmed by the
-                user's FIRST MESSAGE, so the chip used to spin indefinitely with
-                the real reason hidden in a hover title. Waiting-for-writer is a
-                static state (dimmed label + hint), and the spinner is reserved
-                for an actual in-flight fork. */}
-            <InlineActionContent loading={isInlineActionLoading('fork-to-pty')}>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
-                <span>⑂→</span>
-                <span style={{ fontSize: '11px' }}>▭</span>
-                {codexForkWaitingForHistory && (
-                  <span style={{ fontSize: '9px', opacity: 0.75, marginLeft: 2 }}>
-                    ждёт 1-е сообщение
-                  </span>
-                )}
-              </span>
-            </InlineActionContent>
-          </button>
-          </ControlHint>
-        )}
-        {sessionType === 'claude' && sessionId && hasArtifactSession && (
-          <ControlHint label="Создать fork Claude-сессии в SDK-вкладке">
-          <button
-            type="button"
-            aria-busy={isInlineActionLoading('fork-to-sdk')}
-            aria-disabled={inlineAction?.tabId === tabId}
-            className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none transition-colors"
-            style={{
-              color: '#DA7756',
-              backgroundColor: 'transparent',
-              border: '1px solid rgba(218,119,86,0.30)',
-              flexShrink: 0,
-            }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218,119,86,0.15)'; (e.currentTarget as HTMLButtonElement).style.color = '#FF9466'; }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = '#DA7756'; }}
-            onClick={() => void runInlineAction('fork-to-sdk', forkToSDK)}
-            title="Fork в новый SDK таб"
-          >
-            <InlineActionContent loading={isInlineActionLoading('fork-to-sdk')}>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
-                <span>⑂→SDK</span>
-              </span>
-            </InlineActionContent>
-          </button>
-          </ControlHint>
-        )}
+        {/* Forks from the CURRENT session live in the tab's right-click menu
+            (Compact Fork | Fork | SDK), not here: the bar is about the live
+            session, and forking is a tab-level action the user already reaches
+            from the tab. Clipboard `*-F` launches below stay — they are launch
+            actions for an EMPTY tab, not forks of anything running. */}
         {/* Pristine-PTY guard: видно только в новой PTY-вкладке (нет сохранённой
             сессии И нет живого процесса). hasAnySession false + isCommandRunning true
             = окно «процесс стартанул, но беседа ещё не материализована» — там
@@ -3860,94 +3917,110 @@ export default function ClaudeControlBar({
           </>
         )}
 
-        {/* terminal→ prompt | terminal→ + clear — Claude/Codex PTY only.
-            Copies the live TUI input; the SDK composer has no equivalent grab,
-            so these actions stay hidden for SDK tabs. */}
-        {showLivePtyInputActions && (
-          <div
-            className="inline-flex items-stretch rounded select-none overflow-hidden"
-            style={{
-              height: 22,
-              border: '1px solid rgba(255,255,255,0.12)',
-              backgroundColor: 'rgba(255,255,255,0.03)',
-              color: '#bbb',
-              fontSize: 11,
-              flexShrink: 0,
-            }}
-          >
+        {/* Terminal draft — one trigger, three actions in an upward menu.
+            They all read the SAME thing (the live TUI composer) and differ only
+            in where the text lands, so three permanent buttons spent three
+            slots on one subject. The headline action is "into the input": it is
+            the only one after which the text is where the user is looking.
+            Hidden for SDK tabs — there is no TUI composer to grab from. */}
+        {showDraftMenuControl && (
+          <div style={{ position: 'relative', display: 'inline-flex', flexShrink: 0 }}>
             <ControlHint
-              label="Скопировать ввод из терминала"
-              shortcut="Терминальный ввод останется на месте"
+              label="Черновик из терминала"
+              shortcut="Наведите для выбора действия"
             >
-            <button
-              onClick={() => handleCopyPrompt(false)}
-              className="inline-flex items-center gap-1 cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
-              style={{ padding: '0 8px', background: 'transparent', border: 'none', color: 'inherit' }}
-              aria-label={`Copy live ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal input`}
-              title={`Copy live ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal input`}
-            >
-              <TerminalSourceMark />
-              <span style={{ fontSize: 12, lineHeight: 1 }}>⎘</span>
-              <span>prompt</span>
-            </button>
-            </ControlHint>
-            <span style={{ width: 1, alignSelf: 'center', height: '70%', backgroundColor: 'rgba(255,255,255,0.12)' }} />
-            <ControlHint
-              label="Скопировать и очистить ввод терминала"
-              shortcut="Копирование и очистка выполняются атомарно"
-            >
-            <button
-              onClick={() => handleCopyPrompt(true)}
-              className="inline-flex items-center gap-0.5 cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
-              style={{ padding: '0 8px', background: 'transparent', border: 'none', color: 'inherit' }}
-              aria-label={`Copy and clear live ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal input`}
-              title={`Copy and clear live ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal input`}
-            >
-              <TerminalSourceMark />
-              <span>+</span>
-              <span>clear</span>
-            </button>
-            </ControlHint>
-          </div>
-        )}
-        {isPrimaryHistoryAgent && (
-          <ControlHint
-            label="Перенести черновик из терминала в History input"
-            shortcut="Терминальный ввод очищается атомарно"
-            disabled={!historyCanPullDraft}
-          >
             <button
               type="button"
-              aria-label={`Move ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal draft to History input`}
-              disabled={!historyCanPullDraft}
+              {...triggerProps('draft')}
+              data-terminal-draft-trigger
+              aria-label="Действия с черновиком терминала"
+              aria-expanded={openPopup === 'draft'}
               onMouseDown={(event) => event.preventDefault()}
-              onClick={() => {
-                window.dispatchEvent(new CustomEvent('history-panel:pull-terminal-draft', {
-                  detail: { tabId, source: 'control-bar' },
-                }));
-                focusHistoryComposer();
-              }}
-              className={`inline-flex items-center justify-center gap-1 transition-colors ${historyCanPullDraft ? 'cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white' : ''}`}
               style={{
-                height: 22,
-                minWidth: 38,
-                padding: '0 7px',
-                background: 'transparent',
-                border: '1px solid rgba(167,139,250,0.30)',
-                borderRadius: 4,
-                color: historyCanPullDraft ? '#a78bfa' : '#555',
-                cursor: historyCanPullDraft ? 'pointer' : 'default',
-                fontSize: 11,
-                lineHeight: 1,
-                flexShrink: 0,
+                ...triggerStyle,
+                padding: '0 6px',
+                gap: 3,
+                color: '#a78bfa',
+                borderColor: 'rgba(167,139,250,0.30)',
+                ...(pinnedPopup === 'draft' ? {
+                  borderColor: '#fff',
+                  boxShadow: '0 0 0 1px rgba(255,255,255,0.14)',
+                } : {}),
               }}
-              title="Move terminal draft → visible History input"
+              title="Черновик терминала: перенести в поле ввода, скопировать, скопировать и очистить"
             >
-              <SquareTerminal size={11} strokeWidth={1.8} aria-hidden />
-              <span aria-hidden>→</span>
-              <span aria-hidden style={{ fontSize: 10 }}>input</span>
+              <SquareTerminal size={12} strokeWidth={1.8} aria-hidden />
+              <span style={{ opacity: 0.6, fontSize: 9 }}>▴</span>
             </button>
-          </ControlHint>
+            </ControlHint>
+            {openPopup === 'draft' && renderControlPopup('draft', (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 168 }}>
+                {isPrimaryHistoryAgent && (
+                  <button
+                    type="button"
+                    className="cb-menu-row"
+                    data-terminal-draft-action="pull"
+                    disabled={!historyCanPullDraft}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => {
+                      setPinnedPopup(null);
+                      window.dispatchEvent(new CustomEvent('history-panel:pull-terminal-draft', {
+                        detail: { tabId, source: 'control-bar' },
+                      }));
+                      focusHistoryComposer();
+                    }}
+                    style={{
+                      ...draftMenuItemStyle(!historyCanPullDraft),
+                      color: historyCanPullDraft ? '#a78bfa' : '#555',
+                    }}
+                    title="Перенести черновик из терминала в поле ввода (терминальный ввод очищается)"
+                  >
+                    <SquareTerminal size={11} strokeWidth={1.8} aria-hidden />
+                    <span aria-hidden>→</span>
+                    <span>в поле ввода</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="cb-menu-row"
+                  data-terminal-draft-action="copy"
+                  disabled={!showLivePtyInputActions}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => {
+                    setPinnedPopup(null);
+                    void handleCopyPrompt(false);
+                  }}
+                  style={draftMenuItemStyle(!showLivePtyInputActions)}
+                  title={showLivePtyInputActions
+                    ? 'Скопировать ввод терминала (сам ввод останется на месте)'
+                    : 'Доступно только при живом процессе'}
+                >
+                  <TerminalSourceMark />
+                  <span style={{ fontSize: 12, lineHeight: 1 }}>⎘</span>
+                  <span>скопировать</span>
+                </button>
+                <button
+                  type="button"
+                  className="cb-menu-row"
+                  data-terminal-draft-action="grab"
+                  disabled={!showLivePtyInputActions}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => {
+                    setPinnedPopup(null);
+                    void handleCopyPrompt(true);
+                  }}
+                  style={draftMenuItemStyle(!showLivePtyInputActions)}
+                  title={showLivePtyInputActions
+                    ? 'Скопировать и очистить ввод терминала (атомарно)'
+                    : 'Доступно только при живом процессе'}
+                >
+                  <TerminalSourceMark />
+                  <span>+</span>
+                  <span>скопировать и очистить</span>
+                </button>
+              </div>
+            ))}
+          </div>
         )}
 
         {/* Live AI input actions. Mic delivery follows the tab's visible owner:
@@ -4063,28 +4136,41 @@ export default function ClaudeControlBar({
           </div>
         )}
 
-        {/* Context meter — pushes to far right of LEFT cluster via flex spacer.
+        {/* Readings — pushed to the far right of the LEFT cluster by the spacer.
             Полоска убрана: места мало (control bar 30px, юзеру важна цифра, а
             не визуальный объём). Только цветной процент: цвет даёт градиент
-            здоровья (зелёный → амбер → красный), сама цифра — точное значение. */}
+            здоровья (зелёный → амбер → красный), сама цифра — точное значение.
+
+            Одна группа на два показания, потому что в узком композере они
+            гаснут вместе: это единственное здесь, что можно посмотреть в другом
+            месте (Timeline), тогда как каждая кнопка рядом — действие без
+            второго входа. */}
         <div style={{ flex: 1 }} />
-        {showCacheChip && <CacheCooldownChip data={cacheData!} busy={cacheBusy} />}
-        {/* Vertical divider — only when BOTH chip and context% are present, so a
-            lone separator never floats next to a single value. Same hairline
-            style as the session-pill divider above. */}
-        {showCacheChip && contextPct > 0 && (
-          <span style={{ width: 1, alignSelf: 'center', height: '70%', backgroundColor: 'rgba(255,255,255,0.12)', flexShrink: 0 }} />
-        )}
-        {contextPct > 0 ? (
-          <ControlHint label={`Использовано ${contextPct.toFixed(0)}% контекстного окна`}>
-          <span
-            style={{ fontSize: 11, color: meterColor, fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}
-            title="Context usage"
+        {!readingsShed && (showCacheChip || contextPct > 0) && (
+          <div
+            ref={readingsRef}
+            data-agent-control-readings
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}
           >
-            {contextPct.toFixed(0)}%
-          </span>
-          </ControlHint>
-        ) : null}
+            {showCacheChip && <CacheCooldownChip data={cacheData!} busy={cacheBusy} />}
+            {/* Vertical divider — only when BOTH chip and context% are present, so a
+                lone separator never floats next to a single value. Same hairline
+                style as the session-pill divider above. */}
+            {showCacheChip && contextPct > 0 && (
+              <span style={{ width: 1, alignSelf: 'center', height: 14, backgroundColor: 'rgba(255,255,255,0.12)', flexShrink: 0 }} />
+            )}
+            {contextPct > 0 ? (
+              <ControlHint label={`Использовано ${contextPct.toFixed(0)}% контекстного окна`}>
+              <span
+                style={{ fontSize: 11, color: meterColor, fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}
+                title="Context usage"
+              >
+                {contextPct.toFixed(0)}%
+              </span>
+              </ControlHint>
+            ) : null}
+          </div>
+        )}
       </div>
 
       {/* RIGHT: dropdowns. Два блокирующих состояния:
@@ -4118,14 +4204,22 @@ export default function ClaudeControlBar({
         return (
         <div
           ref={rightClusterRef}
-          // Same shimmer for two different waits: a local control operation
-          // (blocks clicks via isBusy below) and a confirmed-settings read in
-          // flight (does NOT block — the displayed model/effort just isn't
-          // proven yet; a user pick during the read wins over the response).
-          className={isLocalBusy || confirmingSettings ? 'control-bar-busy-overlay' : undefined}
+          // No cluster-wide indicator any more.
+          //
+          // It used to be a shimmer sweeping across the whole right cluster:
+          // changing one value lit a strip the width of the window, and between
+          // passes of the sweep there was no sign of anything happening at all —
+          // the user could not tell whether a change was still being applied.
+          //
+          // Now the wait is shown where it belongs: a spinner on the ONE control
+          // being written (see busySpinner below), its neighbours plainly
+          // unavailable. `confirmingSettings` — the read that merely proves the
+          // displayed value — shows nothing: it blocks nothing and asking the
+          // user to watch it was noise.
           data-agent-settings-scope="tab"
           data-session-type={sessionType}
           data-settings-confirming={confirmingSettings ? '1' : undefined}
+          data-settings-busy-target={isLocalBusy ? (busyTarget || 'unknown') : undefined}
           style={{
             position: 'relative',
             display: 'flex',
@@ -4134,85 +4228,46 @@ export default function ClaudeControlBar({
             // Первая строка при переносе. justifyContent сохраняет прижатие к
             // правому краю, как в одну строку, — иначе блок «переехал бы» влево.
             ...(clustersWrapped ? { order: 1, justifyContent: 'flex-end' } : null),
-            pointerEvents: isBusy ? 'none' : 'auto',
+            // Clicks are gated per control, not on the wrapper: the control that
+            // owns the spinner must stay clickable so the write can be cancelled.
+            pointerEvents: isPasteBusy ? 'none' : 'auto',
             opacity: !canControl ? 0.4 : 1,
             transition: 'opacity 0.15s',
           }}
-          aria-busy={isLocalBusy || confirmingSettings}
+          aria-busy={isLocalBusy}
         >
-          {/* Click-to-reset escape hatch — covers the WHOLE cluster only while a
-              local settings/control operation is busy. Parent sets
-              pointer-events:none; this re-enables itself (CSS) and sits above
-              the shimmer. Hover = red "СБРОС", click force-clears a stuck
-              local-control loader. See forceResetBusy + fact-claude-control-bar.md. */}
-          {isLocalBusy && (
-            <div
-              className="control-bar-busy-reset"
-              onClick={forceResetBusy}
-              title="Сбросить зависший индикатор (loader не сбросился сам)"
-            >
-              СБРОС
-            </div>
-          )}
-          {/* Provider — only for PTY tabs */}
-          {!isSDKTab && !isCodex && (
-            <div style={{ position: 'relative' }}>
-              <button
-                {...triggerProps('provider')}
-                style={{
-                  ...triggerStyle,
-                  color: activeProvider.tint,
-                  borderColor: `${activeProvider.tint}66`,
-                  backgroundColor: `${activeProvider.tint}1F`,
-                  padding: '0 6px',
-                  gap: 3,
-                }}
-                title={`Provider: ${activeProvider.label} (клик закрепит, ⌘+наведение откроет временно)`}
-              >
-                <activeProvider.Icon size={12} color={activeProvider.tint} />
-                <span style={{ opacity: 0.6, fontSize: 9 }}>▴</span>
-              </button>
-              {openPopup === 'provider' && renderControlPopup('provider',
-                PROVIDER_CATALOG.map(p => {
-                      const active = p.id === providerState.type;
-                      return (
-                        <button
-                          key={p.id}
-                          style={{
-                            ...pillStyle(active, false),
-                            color: active ? '#fff' : p.tint,
-                            backgroundColor: active ? p.tint : 'transparent',
-                            borderWidth: 1,
-                            borderStyle: 'solid',
-                            borderColor: active ? p.tint : 'rgba(255,255,255,0.08)',
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: 4,
-                          }}
-                          onClick={() => pickProvider(p.id)}
-                        >
-                          <p.Icon size={11} color={active ? '#fff' : p.tint} />
-                          <span>{p.label}</span>
-                        </button>
-                      );
-                    })
-              )}
-            </div>
-          )}
+          {/* Provider has NO trigger of its own in the row: it lives at the TOP
+              OF THE MODEL MENU as a single collapsed chip, and only a click on
+              that chip unfolds the list of providers. Two things it must not be:
+              a permanent slot in the row (it changes far less often than
+              anything else there), and an always-expanded section of the menu
+              (its rows then stand between the cursor and the models on every
+              hover). Юзер: «должна показываться там, где до этого был провайдер
+              — навожусь на модель, появляется список моделей, и в самом верху
+              эта плашка; при клике на неё раскрывается». */}
 
-          {showQuickPresetControl && (
+          {showQuickPresetControl && (() => {
+          const quickSpinning = isBusySpinnerOn('quick');
+          const quickBlocked = isBusyBlocked('quick');
+          return (
             <div style={{ position: 'relative', display: 'inline-flex' }}>
               <button
                 ref={quickPresetButtonRef}
                 type="button"
-                disabled={quickPresetDisabled || !hasQuickPreset}
-                onClick={quickPresetIsCodex ? toggleQuickCodexPreset : toggleQuickClaudePreset}
+                data-busy-spinner={quickSpinning ? '1' : undefined}
+                disabled={quickPresetDisabled || !hasQuickPreset || quickBlocked}
+                aria-busy={quickSpinning}
+                onClick={quickSpinning
+                  ? forceResetBusy
+                  : (quickPresetIsCodex ? toggleQuickCodexPreset : toggleQuickClaudePreset)}
                 onMouseEnter={(event) => {
+                  if (quickSpinning) { setBusyCancelHover(true); return; }
                   setQuickPresetHover(true);
                   const rect = event.currentTarget.getBoundingClientRect();
                   setQuickPresetRect({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
                 }}
                 onMouseLeave={() => {
+                  setBusyCancelHover(false);
                   setQuickPresetHover(false);
                   setQuickPresetRect(null);
                 }}
@@ -4232,23 +4287,35 @@ export default function ClaudeControlBar({
                       : `Переключить на ${quickPresetModel?.label} / ${quickPresetEffort}`}
                 style={{
                   ...triggerStyle,
+                  position: 'relative',
                   width: 22,
                   padding: 0,
                   justifyContent: 'center',
-                  color: quickPresetDisabled || !hasQuickPreset ? '#555' : quickPresetApplied && quickPresetMatchesCurrent ? '#fff' : quickPresetIsCodex ? '#9ce8c4' : '#f0b098',
-                  borderColor: quickPresetApplied && quickPresetMatchesCurrent ? '#fff' : quickPresetIsCodex ? 'rgba(52,211,153,0.48)' : 'rgba(218,119,86,0.5)',
-                  backgroundColor: quickPresetApplied && quickPresetMatchesCurrent ? (quickPresetIsCodex ? 'rgba(52,211,153,0.24)' : 'rgba(218,119,86,0.25)') : 'transparent',
-                  cursor: quickPresetDisabled || !hasQuickPreset ? 'not-allowed' : 'pointer',
+                  color: quickPresetDisabled || !hasQuickPreset || quickBlocked ? '#555' : quickPresetApplied && quickPresetMatchesCurrent ? '#fff' : quickPresetIsCodex ? '#9ce8c4' : '#f0b098',
+                  borderColor: quickSpinning
+                    ? (busyCancelHover ? 'rgba(248,113,113,0.55)' : 'rgba(167,139,250,0.45)')
+                    : quickPresetApplied && quickPresetMatchesCurrent ? '#fff' : quickPresetIsCodex ? 'rgba(52,211,153,0.48)' : 'rgba(218,119,86,0.5)',
+                  backgroundColor: quickSpinning
+                    ? (busyCancelHover ? 'rgba(220,38,38,0.14)' : 'transparent')
+                    : quickPresetApplied && quickPresetMatchesCurrent ? (quickPresetIsCodex ? 'rgba(52,211,153,0.24)' : 'rgba(218,119,86,0.25)') : 'transparent',
+                  cursor: quickSpinning ? 'pointer'
+                    : quickPresetDisabled || !hasQuickPreset || quickBlocked ? 'not-allowed' : 'pointer',
                 }}
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <svg
+                  width="13" height="13" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round"
+                  aria-hidden
+                  style={{ visibility: quickSpinning ? 'hidden' : 'visible' }}
+                >
                   <path d="M17 3l4 4-4 4" />
                   <path d="M3 7h18" />
                   <path d="M7 21l-4-4 4-4" />
                   <path d="M21 17H3" />
                 </svg>
+                {quickSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
               </button>
-              {showQuickPresetTooltip && quickPresetButtonRef.current && createPortal(
+              {showQuickPresetTooltip && !quickSpinning && quickPresetButtonRef.current && createPortal(
                 <CenteredUpwardPopover
                   getAnchorRect={() => quickPresetButtonRef.current?.getBoundingClientRect() || null}
                   zIndex={10060}
@@ -4262,29 +4329,54 @@ export default function ClaudeControlBar({
                 document.body,
               )}
             </div>
-          )}
+          );
+          })()}
 
           {/* Model */}
+          {(() => {
+          const modelSpinning = isBusySpinnerOn('model');
+          const modelBlocked = isBusyBlocked('model');
+          return (
           <div style={{ position: 'relative' }}>
             <button
-              {...triggerProps('model')}
+              {...(modelSpinning ? {
+                ref: (el: HTMLButtonElement | null) => { triggerRefs.current.model = el; },
+                // While it spins the trigger is a CANCEL button, not a menu:
+                // opening the list mid-write would offer a choice that cannot be
+                // taken. Hover swaps the ring for a red ✕, the click aborts.
+                onClick: forceResetBusy,
+                onMouseEnter: () => setBusyCancelHover(true),
+                onMouseLeave: () => setBusyCancelHover(false),
+              } : triggerProps('model'))}
               data-agent-setting-trigger="model"
               data-setting-value={modelActiveId}
-              disabled={codexModelMenuDisabled}
+              data-busy-spinner={modelSpinning ? '1' : undefined}
+              disabled={codexModelMenuDisabled || modelBlocked}
+              aria-busy={modelSpinning}
               style={{
                 ...triggerStyle,
-                ...(pinnedPopup === 'model' && !codexModelMenuDisabled ? {
+                position: 'relative',
+                ...(pinnedPopup === 'model' && !codexModelMenuDisabled && !modelSpinning ? {
                   borderColor: '#fff',
                   boxShadow: '0 0 0 1px rgba(255,255,255,0.14)',
                 } : {}),
-                ...(codexModelMenuDisabled ? {
+                ...(modelSpinning ? {
+                  borderColor: busyCancelHover ? 'rgba(248,113,113,0.55)' : 'rgba(167,139,250,0.45)',
+                  backgroundColor: busyCancelHover ? 'rgba(220,38,38,0.14)' : 'transparent',
+                  cursor: 'pointer',
+                } : {}),
+                ...((codexModelMenuDisabled || modelBlocked) && !modelSpinning ? {
                   color: '#555',
                   borderColor: 'rgba(255,255,255,0.08)',
                   backgroundColor: '#222',
                   cursor: 'not-allowed',
                 } : {}),
               }}
-              title={codexModelMenuDisabled
+              title={modelSpinning
+                ? 'Применяю модель… нажмите, чтобы отменить ожидание'
+                : modelBlocked
+                  ? 'Идёт применение другой настройки'
+                : codexModelMenuDisabled
                 ? 'Model пока недоступен'
                 : codexModelDisabled
                   ? 'Текущая пара не подтверждена: наведите на модель и выберите model + effort вместе'
@@ -4292,53 +4384,134 @@ export default function ClaudeControlBar({
                   ? 'Model можно сменить во время streaming; выбор применяется к следующей работе сессии'
                   : 'Наведите для выбора; клик закрепит меню'}
             >
-              <span style={{ color: codexModelMenuDisabled ? '#666' : '#fff' }}>{modelLabel}</span>
-              <span style={{ opacity: codexModelMenuDisabled ? 0.25 : 0.6 }}>▴</span>
+              {/* The label stays in layout while the spinner is up — removing it
+                  would shrink the trigger and shove its neighbours sideways at
+                  the exact moment of the click. */}
+              <span style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                visibility: modelSpinning ? 'hidden' : 'visible',
+              }}>
+                <span style={{ color: codexModelMenuDisabled || modelBlocked ? '#666' : '#fff' }}>{modelLabel}</span>
+                <span style={{ opacity: codexModelMenuDisabled || modelBlocked ? 0.25 : 0.6 }}>▴</span>
+              </span>
+              {modelSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
             </button>
-            {openPopup === 'model' && renderControlPopup('model',
-              supportsModelEffortPair ? (
-                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                  {modelOptions.map((model) => {
-                    const active = model.id === modelActiveId;
-                    const modelPairDisabled = isCodex && codexModelDisabled;
-                    return (
-                      <button
-                        key={model.id}
-                        data-agent-setting-option="model"
-                        data-setting-value={model.id}
-                        aria-pressed={active}
-                        disabled={isCodex && codexModelMenuDisabled}
-                        aria-disabled={modelPairDisabled}
-                        style={pillStyle(active, modelPairDisabled)}
-                        onMouseEnter={(event) => {
+            {openPopup === 'model' && !modelSpinning && renderControlPopup('model', (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 96 }}>
+                {/* Provider chip — the menu's header, folded by default.
+                    It answers "where does this run" and the models below answer
+                    "what runs there", so it belongs above them; but it changes
+                    far less often, so it must not spend three rows there at
+                    rest. Collapsed it is one chip naming the current provider;
+                    a click unfolds the alternatives in place. PTY-Claude only —
+                    SDK talks to Anthropic directly and Codex has no provider
+                    proxy in our sense. */}
+                {showProviderSection && (
+                  <>
+                    <button
+                      type="button"
+                      className="cb-menu-row"
+                      data-agent-setting-trigger="provider"
+                      data-setting-value={providerState.type}
+                      data-row-active="1"
+                      aria-expanded={providerSectionOpen}
+                      onClick={() => setProviderSectionOpen((current) => !current)}
+                      style={{
+                        ...settingsMenuRowStyle(false),
+                        justifyContent: 'space-between',
+                        color: activeProvider.tint,
+                        backgroundColor: `${activeProvider.tint}1F`,
+                        borderWidth: 1,
+                        borderStyle: 'solid',
+                        borderColor: `${activeProvider.tint}66`,
+                      }}
+                      title={providerSectionOpen
+                        ? 'Свернуть выбор провайдера'
+                        : `Провайдер: ${activeProvider.label} — нажмите, чтобы сменить`}
+                    >
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          {activeProvider.label}
+                        </span>
+                        <activeProvider.Icon size={11} color={activeProvider.tint} />
+                      </span>
+                      <span aria-hidden style={{ opacity: 0.6, fontSize: 9 }}>
+                        {providerSectionOpen ? '▴' : '▾'}
+                      </span>
+                    </button>
+                    {providerSectionOpen && PROVIDER_CATALOG
+                      .filter((p) => p.id !== providerState.type)
+                      .map((p) => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          className="cb-menu-row"
+                          data-agent-setting-option="provider"
+                          data-setting-value={p.id}
+                          style={{
+                            ...settingsMenuRowStyle(false),
+                            color: p.tint,
+                            backgroundColor: 'transparent',
+                            borderWidth: 1,
+                            borderStyle: 'solid',
+                            borderColor: 'rgba(255,255,255,0.08)',
+                          }}
+                          onClick={() => {
+                            setProviderSectionOpen(false);
+                            setPinnedPopup(null);
+                            pickProvider(p.id);
+                          }}
+                          title={`Переключить на ${p.label}`}
+                        >
+                          <p.Icon size={11} color={p.tint} />
+                          <span>{p.label}</span>
+                        </button>
+                      ))}
+                    <span aria-hidden style={settingsMenuSeparatorStyle} />
+                  </>
+                )}
+                {modelOptions.map((model) => {
+                  const active = model.id === modelActiveId;
+                  const modelPairDisabled = supportsModelEffortPair
+                    ? isCodex && codexModelDisabled
+                    : codexModelDisabled;
+                  return (
+                    <button
+                      key={model.id}
+                      className="cb-menu-row"
+                      data-agent-setting-option="model"
+                      data-setting-value={model.id}
+                      data-row-active={active ? '1' : undefined}
+                      aria-pressed={active}
+                      disabled={supportsModelEffortPair
+                        ? (isCodex && codexModelMenuDisabled)
+                        : codexModelDisabled}
+                      aria-disabled={modelPairDisabled}
+                      style={{
+                        ...settingsMenuRowStyle(modelPairDisabled),
+                        ...(active ? { backgroundColor: '#DA7756', color: '#fff' } : {}),
+                      }}
+                      onMouseEnter={supportsModelEffortPair
+                        ? (event) => {
                           setHoveredModelMenuModel(model.id);
                           setHoveredModelMenuAnchor(event.currentTarget);
-                        }}
-                        onClick={() => {
-                          if (!modelPairDisabled) pickModel(model.id);
-                        }}
-                        title={modelPairDisabled
+                        }
+                        : undefined}
+                      onClick={() => {
+                        if (!modelPairDisabled) pickModel(model.id);
+                      }}
+                      title={!supportsModelEffortPair
+                        ? model.label
+                        : modelPairDisabled
                           ? `Наведите и выберите ${model.label} вместе с effort`
                           : `Наведите и выберите ${model.label} с effort`}
-                      >{model.label}</button>
-                    );
-                  })}
-                </div>
-              ) : modelOptions.map((model) => {
-                const active = model.id === modelActiveId;
-                return (
-                  <button
-                    key={model.id}
-                    data-agent-setting-option="model"
-                    data-setting-value={model.id}
-                    aria-pressed={active}
-                    disabled={codexModelDisabled}
-                    style={pillStyle(active, codexModelDisabled)}
-                    onClick={() => pickModel(model.id)}
-                  >{model.label}</button>
-                );
-              })
-            )}
+                    >{model.label}</button>
+                  );
+                })}
+              </div>
+            ))}
             {supportsModelEffortPair && openPopup === 'model' && hoveredModelMenuAnchor && (() => {
               const hoveredCodexModel = codexModels.find((model) => model.id === hoveredModelMenuModel);
               const hoveredClaudeModel = claudeCodeModels.find((model) => model.id === hoveredModelMenuModel);
@@ -4349,10 +4522,13 @@ export default function ClaudeControlBar({
               const modelEffortPairDisabled = isCodex && codexExplicitPairDisabled;
               if (!hoveredModel || hoveredEfforts.length === 0) return null;
               return createPortal(
-                <CenteredUpwardPopover
+                // Beside the hovered row, not above the trigger: the model list
+                // is a vertical column now, so its compatible efforts belong
+                // next to the row they describe.
+                <SideFlyout
                   ref={(node) => { modelEffortPopupRef.current = node; }}
                   getAnchorRect={() => hoveredModelMenuAnchor.getBoundingClientRect()}
-                  horizontalAlign="end"
+                  side="right"
                   gap={4}
                   zIndex={10055}
                   data-agent-settings-scope="tab"
@@ -4378,10 +4554,11 @@ export default function ClaudeControlBar({
                   <div
                     aria-label={`Effort для ${hoveredModel.label}`}
                     style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 4,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 3,
                       width: 'max-content',
+                      minWidth: 74,
                       maxWidth: '100%',
                       padding: 4,
                       backgroundColor: '#1f1f1f',
@@ -4406,7 +4583,12 @@ export default function ClaudeControlBar({
                           onClick={() => isCodex
                             ? pickCodexModelEffort(hoveredModel.id, effort)
                             : pickClaudeModelEffort(hoveredModel.id, effort)}
-                          style={pillStyle(hoveredModel.id === modelActiveId && effort === effortActive, disabled)}
+                          style={{
+                            ...settingsMenuRowStyle(disabled),
+                            ...(hoveredModel.id === modelActiveId && effort === effortActive
+                              ? { backgroundColor: '#DA7756', color: '#fff' }
+                              : {}),
+                          }}
                           title={stoppedUltra
                             ? 'Ultra можно включить только в живой сессии Codex'
                             : `Выбрать ${hoveredModel.label} / ${effort}`}
@@ -4416,168 +4598,234 @@ export default function ClaudeControlBar({
                       );
                     })}
                   </div>
-                </CenteredUpwardPopover>,
+                </SideFlyout>,
                 document.body,
               );
             })()}
           </div>
+          );
+          })()}
 
-          {/* Effort. Dimmed (but still clickable) when Think is OFF — effort
-              only takes effect during reasoning, so visually telegraphing that
-              the value won't matter right now. Не disabled: юзер может пресет-
-              нуть Effort заранее, потом включить Think. */}
-          {/* Effort — inline pill row instead of a dropdown. The configured
-              model decides which levels appear here; changing model chooses a
-              compatible level when the previous one is unavailable. */}
-          <ControlHint
-            label="Выбрать глубину рассуждения"
-            shortcut={!thinkActive ? 'Применяется, когда Think включён' : undefined}
-            disabled={codexEffortDisabled}
-          >
-          <div
-            data-agent-setting-group="effort"
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 2,
-              opacity: !thinkActive ? 0.4 : 1,
-              transition: 'opacity 0.12s',
-            }}
-            title={!thinkActive
-              ? 'Effort применяется только когда Think включён'
-              : 'Effort level'}
-          >
-            {effortLevels.map(level => {
-              const active = effortActive === level;
-              const isUltra = level === 'ultracode' || (isCodex && level === 'ultra');
-              const label = isUltra ? 'ultra'
-                : level === 'medium' ? 'med'
-                : level === 'xhigh' ? 'xhi'
-                : level;
-              const title = isUltra
-                ? isCodex
-                  ? 'ultra — максимальное размышление и проактивная работа с несколькими агентами; расход может быстро вырасти.'
-                  : 'ultracode — xhigh + авто dynamic-workflows на всю сессию (Claude сам решает когда запускать workflow). Дорого по токенам; сбрасывается в начале новой сессии.'
-                : level;
-              const stoppedCodexUltra = isCodex && !isCommandRunning && level === 'ultra';
-              const effortChoiceDisabled = codexEffortDisabled || stoppedCodexUltra;
-              // ultracode pill: purple accent (matches workflow chip), separated
-              // from the plain levels by a thin divider so it reads as a mode.
-              return (
-                <React.Fragment key={level}>
-                  {isUltra && <span aria-hidden style={{ width: 1, alignSelf: 'stretch', background: 'rgba(255,255,255,0.12)', margin: '2px 2px' }} />}
-                  <button
-                    data-agent-setting-option="effort"
-                    data-setting-value={level}
-                    aria-pressed={active}
-                    disabled={effortChoiceDisabled}
-                    style={isUltra ? {
-                      ...pillStyle(active, effortChoiceDisabled),
-                      ...(active
-                        ? { backgroundColor: '#7c5cd6', borderColor: '#a78bfa', color: '#fff' }
-                        : { color: '#a78bfa', borderColor: 'rgba(167,139,250,0.4)' }),
-                      ...(effortChoiceDisabled ? { color: '#555', backgroundColor: '#222', borderColor: 'rgba(255,255,255,0.08)', cursor: 'not-allowed' } : {}),
-                    } : {
-                      ...pillStyle(active, effortChoiceDisabled),
-                      ...(effortChoiceDisabled ? { color: '#555', backgroundColor: '#222', cursor: 'not-allowed' } : {}),
-                    }}
-                    title={stoppedCodexUltra
-                      ? 'Ultra можно включить только в живой сессии Codex'
-                      : title}
-                    onClick={() => pickEffort(level)}
-                  >{label}</button>
-                </React.Fragment>
-              );
-            })}
-          </div>
-          </ControlHint>
-
-          {isCodex && (
-            <ControlHint label={codexFastStateLabel} disabled={codexFastDisabled}>
+          {/* Effort — one trigger that opens the levels upward, with the
+              session modifier (Claude Think / Codex Fast) as the last row of
+              the same column. Was an inline row of up to six pills plus two
+              standalone buttons: eight slots for one subject, and the widest
+              thing in the bar. The trigger dims when Think is off — the value
+              still applies to the next reasoning turn, so it stays clickable. */}
+          {(() => {
+          const effortSpinning = isBusySpinnerOn('effort') || isBusySpinnerOn('think') || isBusySpinnerOn('fast');
+          const effortBlocked = isBusyBlocked('effort') && isBusyBlocked('think') && isBusyBlocked('fast');
+          return (
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <ControlHint
+              label="Выбрать глубину рассуждения"
+              shortcut={!thinkActive && !isCodex ? 'Применяется, когда Think включён' : undefined}
+              disabled={codexEffortDisabled}
+            >
             <button
               type="button"
-              aria-label={codexFastStateLabel}
-              aria-pressed={codexFastModeState.known ? codexFastModeState.active : undefined}
-              data-codex-fast-state={codexFastModeState.state}
-              data-codex-service-tier={codexFastModeState.serviceTier || ''}
-              title={codexFastTitle}
-              disabled={codexFastDisabled}
-              onClick={sendCodexFast}
+              {...(effortSpinning ? {
+                ref: (el: HTMLButtonElement | null) => { triggerRefs.current.effort = el; },
+                onClick: forceResetBusy,
+                onMouseEnter: () => setBusyCancelHover(true),
+                onMouseLeave: () => setBusyCancelHover(false),
+              } : triggerProps('effort'))}
+              data-agent-setting-trigger="effort"
+              data-setting-value={effortActive || ''}
+              data-busy-spinner={effortSpinning ? '1' : undefined}
+              disabled={codexEffortDisabled || effortBlocked}
+              aria-busy={effortSpinning}
               style={{
                 ...triggerStyle,
-                width: 24,
-                padding: 0,
-                justifyContent: 'center',
-                color: codexFastModeState.active
-                  ? (codexFastDisabled ? '#a8842d' : '#fbbf24')
-                  : codexFastModeState.known
-                    ? (codexFastDisabled ? '#555' : '#bbb')
-                    : '#666',
-                borderColor: codexFastModeState.active
-                  ? 'rgba(251,191,36,0.55)'
-                  : codexFastDisabled
-                    ? 'rgba(255,255,255,0.08)'
-                    : 'rgba(255,255,255,0.12)',
-                backgroundColor: codexFastModeState.active
-                  ? 'rgba(251,191,36,0.14)'
-                  : 'transparent',
-                boxShadow: codexFastModeState.active
-                  ? 'inset 0 0 0 1px rgba(251,191,36,0.08)'
-                  : 'none',
-                cursor: codexFastDisabled ? 'not-allowed' : triggerStyle.cursor,
+                position: 'relative',
+                opacity: !thinkActive && !isCodex && !effortSpinning ? 0.55 : 1,
+                transition: 'opacity 0.12s, background-color 0.12s, color 0.12s, border-color 0.12s',
+                ...(pinnedPopup === 'effort' && !codexEffortDisabled && !effortSpinning ? {
+                  borderColor: '#fff',
+                  boxShadow: '0 0 0 1px rgba(255,255,255,0.14)',
+                } : {}),
+                ...(effortActive === 'ultracode' || (isCodex && effortActive === 'ultra')
+                  ? { color: '#a78bfa', borderColor: 'rgba(167,139,250,0.4)' }
+                  : {}),
+                ...(effortSpinning ? {
+                  borderColor: busyCancelHover ? 'rgba(248,113,113,0.55)' : 'rgba(167,139,250,0.45)',
+                  backgroundColor: busyCancelHover ? 'rgba(220,38,38,0.14)' : 'transparent',
+                  cursor: 'pointer',
+                } : {}),
+                ...((codexEffortDisabled || effortBlocked) && !effortSpinning ? {
+                  color: '#555',
+                  borderColor: 'rgba(255,255,255,0.08)',
+                  backgroundColor: '#222',
+                  cursor: 'not-allowed',
+                } : {}),
               }}
+              title={effortSpinning
+                ? 'Применяю настройку… нажмите, чтобы отменить ожидание'
+                : effortBlocked
+                  ? 'Идёт применение другой настройки'
+                : codexEffortDisabled
+                ? 'Effort пока недоступен'
+                : !thinkActive && !isCodex
+                  ? 'Effort применяется только когда Think включён'
+                  : 'Наведите для выбора; клик закрепит меню'}
             >
-              <svg
-                width="13"
-                height="13"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.4"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
+              <span style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                visibility: effortSpinning ? 'hidden' : 'visible',
+              }}>
+                <span style={{ color: codexEffortDisabled || effortBlocked ? '#666' : undefined }}>
+                  {effortTriggerLabel}
+                </span>
+                <span style={{ opacity: codexEffortDisabled || effortBlocked ? 0.25 : 0.6 }}>▴</span>
+              </span>
+              {effortSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
+            </button>
+            </ControlHint>
+            {openPopup === 'effort' && !effortSpinning && renderControlPopup('effort', (
+              <div
+                data-agent-setting-group="effort"
+                style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 84 }}
               >
-                <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
-              </svg>
-            </button>
-            </ControlHint>
-          )}
+                {effortLevels.map(level => {
+                  const active = effortActive === level;
+                  const isUltra = level === 'ultracode' || (isCodex && level === 'ultra');
+                  const label = isUltra ? 'ultra'
+                    : level === 'medium' ? 'med'
+                    : level === 'xhigh' ? 'xhi'
+                    : level;
+                  const title = isUltra
+                    ? isCodex
+                      ? 'ultra — максимальное размышление и проактивная работа с несколькими агентами; расход может быстро вырасти.'
+                      : 'ultracode — xhigh + авто dynamic-workflows на всю сессию (Claude сам решает когда запускать workflow). Дорого по токенам; сбрасывается в начале новой сессии.'
+                    : level;
+                  const stoppedCodexUltra = isCodex && !isCommandRunning && level === 'ultra';
+                  const effortChoiceDisabled = codexEffortDisabled || stoppedCodexUltra;
+                  // ultracode row: purple accent (matches the workflow chip),
+                  // separated from the plain levels by a hairline so it reads as
+                  // a mode rather than one more level.
+                  return (
+                    <React.Fragment key={level}>
+                      {isUltra && <span aria-hidden style={settingsMenuSeparatorStyle} />}
+                      <button
+                        type="button"
+                        data-agent-setting-option="effort"
+                        data-setting-value={level}
+                        aria-pressed={active}
+                        disabled={effortChoiceDisabled}
+                        style={{
+                          ...settingsMenuRowStyle(effortChoiceDisabled),
+                          ...(isUltra && !effortChoiceDisabled
+                            ? (active
+                              ? { backgroundColor: '#7c5cd6', color: '#fff' }
+                              : { color: '#a78bfa' })
+                            : active && !effortChoiceDisabled
+                              ? { backgroundColor: '#DA7756', color: '#fff' }
+                              : {}),
+                        }}
+                        title={stoppedCodexUltra
+                          ? 'Ultra можно включить только в живой сессии Codex'
+                          : title}
+                        onClick={() => {
+                          setPinnedPopup(null);
+                          pickEffort(level);
+                        }}
+                      >{label}</button>
+                    </React.Fragment>
+                  );
+                })}
 
-	          {/* Think — single toggle, no dropdown */}
-          {!isDeepSeekPTY && !isCodex && (
-            <ControlHint
-              label={settingsAvailability.liveOnlyControlsDisabled
-                ? 'Think доступен после запуска Claude'
-                : (thinkActive ? 'Выключить Think' : 'Включить Think')}
-              disabled={settingsAvailability.liveOnlyControlsDisabled}
-            >
-            <button
-              disabled={settingsAvailability.liveOnlyControlsDisabled}
-              style={{
-                ...triggerStyle,
-                color: settingsAvailability.liveOnlyControlsDisabled ? '#555' : (thinkActive ? '#fff' : '#888'),
-                borderColor: settingsAvailability.liveOnlyControlsDisabled
-                  ? 'rgba(255,255,255,0.08)'
-                  : (thinkActive ? '#DA7756' : 'rgba(255,255,255,0.08)'),
-                backgroundColor: settingsAvailability.liveOnlyControlsDisabled
-                  ? '#222'
-                  : (thinkActive ? 'rgba(218,119,86,0.18)' : 'transparent'),
-                cursor: settingsAvailability.liveOnlyControlsDisabled ? 'not-allowed' : triggerStyle.cursor,
-              }}
-              onClick={toggleThink}
-              title={settingsAvailability.liveOnlyControlsDisabled
-                ? 'Think доступен после запуска Claude'
-                : 'Think mode'}
-            >
-              Think
-            </button>
-            </ControlHint>
-          )}
+                {/* Session modifier, last row. Same position for both agents,
+                    deliberately different meaning: Think decides WHETHER the
+                    levels above apply at all, Fast decides how fast the request
+                    is served and leaves them alone. */}
+                {isCodex ? (
+                  <>
+                    <span aria-hidden style={settingsMenuSeparatorStyle} />
+                    <button
+                      type="button"
+                      aria-label={codexFastStateLabel}
+                      aria-pressed={codexFastModeState.known ? codexFastModeState.active : undefined}
+                      data-codex-fast-state={codexFastModeState.state}
+                      data-codex-service-tier={codexFastModeState.serviceTier || ''}
+                      title={codexFastTitle}
+                      disabled={codexFastDisabled}
+                      onClick={() => {
+                        setPinnedPopup(null);
+                        sendCodexFast();
+                      }}
+                      style={{
+                        ...settingsMenuRowStyle(codexFastDisabled),
+                        ...(codexFastModeState.active && !codexFastDisabled
+                          ? { backgroundColor: 'rgba(251,191,36,0.18)', color: '#fbbf24' }
+                          : {}),
+                      }}
+                    >
+                      <svg
+                        width="11"
+                        height="11"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.4"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
+                      </svg>
+                      <span>Fast</span>
+                      {codexFastModeState.active && <span style={{ marginLeft: 'auto' }}>✓</span>}
+                    </button>
+                  </>
+                ) : !isDeepSeekPTY && (
+                  <>
+                    <span aria-hidden style={settingsMenuSeparatorStyle} />
+                    <button
+                      type="button"
+                      data-agent-setting-option="think"
+                      aria-pressed={thinkActive}
+                      disabled={settingsAvailability.liveOnlyControlsDisabled}
+                      onClick={() => {
+                        setPinnedPopup(null);
+                        toggleThink();
+                      }}
+                      style={{
+                        ...settingsMenuRowStyle(settingsAvailability.liveOnlyControlsDisabled),
+                        ...(thinkActive && !settingsAvailability.liveOnlyControlsDisabled
+                          ? { backgroundColor: 'rgba(218,119,86,0.22)', color: '#ffcbb5' }
+                          : {}),
+                      }}
+                      title={settingsAvailability.liveOnlyControlsDisabled
+                        ? 'Think доступен после запуска Claude'
+                        : 'Think mode'}
+                    >
+                      <span>Think</span>
+                      {thinkActive && <span style={{ marginLeft: 'auto' }}>✓</span>}
+                    </button>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+          );
+          })()}
         </div>
         );
       })()}
 
     </div>
   );
+
+  // Drawn into the composer when it offers a slot, otherwise in its own strip
+  // under the terminal. The COMPONENT never moves either way — a portal changes
+  // where the DOM lands, not where the component lives in the React tree, so
+  // every effect, subscription and piece of busy state survives the switch
+  // untouched. That is the whole point: this component's behaviour is months of
+  // accumulated fixes, and re-implementing it inside the composer would re-open
+  // all of them. See composerControlsHost.mjs.
+  return composerControlsHost
+    ? createPortal(barBody, composerControlsHost)
+    : barBody;
 }

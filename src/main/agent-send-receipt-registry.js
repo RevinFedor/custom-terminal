@@ -100,6 +100,11 @@ function isExactProviderNotAcceptedReceipt(receipt = {}) {
     && receipt?.providerImageTransform === true
     && Number(receipt?.expectedImagePathCount) > 0
     && Number(receipt?.expectedImagePathCount) === Number(receipt?.capturedImageCount);
+  const exactProviderQueueReturn = receipt?.composerDraftState === 'exact-provider-queue-return'
+    && receipt?.providerQueueReturned === true
+    && receipt?.providerQueueOperation === 'popAll'
+    && typeof receipt?.sourceIdentity === 'string'
+    && receipt.sourceIdentity.startsWith('claude-queue:');
   return receipt?.success === false
     && receipt?.submitted === true
     && receipt?.pasteWritten === true
@@ -107,8 +112,12 @@ function isExactProviderNotAcceptedReceipt(receipt = {}) {
     && receipt?.semanticStatus === 'not-submitted'
     && receipt?.providerAccepted === false
     && receipt?.providerTurnCreated === false
-    && (receipt?.composerDraftState === 'exact-original' || exactProviderImageTransform)
-    && receipt?.exactDraftRemained === true
+    && (
+      receipt?.composerDraftState === 'exact-original'
+      || exactProviderImageTransform
+      || exactProviderQueueReturn
+    )
+    && (receipt?.exactDraftRemained === true || exactProviderQueueReturn)
     && receipt?.draftPreserved === true
     && receipt?.lateReconciliationPending === false;
 }

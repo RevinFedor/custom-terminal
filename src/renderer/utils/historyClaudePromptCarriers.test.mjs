@@ -38,7 +38,7 @@ test('enqueue creates one exact live queue identity and replay upserts it', () =
   assert.equal(extractClaudeHistoryPromptCarrierText(enqueue()), prompt);
 });
 
-test('dequeue and remove settle only one matching queued prompt while popAll settles all', () => {
+test('dequeue and remove consume one prompt while popAll returns and removes every queued prompt', () => {
   const first = reduceClaudeHistoryPromptCarrier([], enqueue('A'), { includeUserText: true });
   const second = reduceClaudeHistoryPromptCarrier(first.entries, wrap({
     type: 'queue-operation', operation: 'enqueue', content: 'B', timestamp: '2026-07-28T12:00:01.000Z', sessionId,
@@ -56,7 +56,8 @@ test('dequeue and remove settle only one matching queued prompt while popAll set
   const popped = reduceClaudeHistoryPromptCarrier(allQueued, wrap({
     type: 'queue-operation', operation: 'popAll', timestamp: '2026-07-28T12:00:04.000Z', sessionId,
   }), { includeUserText: true });
-  assert.deepEqual(popped.entries.map((entry) => entry.queueStatus), ['sent', 'sent']);
+  assert.deepEqual(popped.entries, []);
+  assert.equal(hasClaudeHistoryLiveQueuePrompt(popped.entries), false);
 });
 
 test('replayed dequeue settles exactly one queued prompt and a new dequeue settles the next', () => {
@@ -101,6 +102,7 @@ test('queued_command replaces one matching interim row with its canonical UUID',
     content: prompt,
     queueStatus: 'sent',
     sessionId,
+    sourceIdentity: 'claude-queue:session-a:2026-07-28T12:00:00.000Z:4c2a7abd',
   });
 });
 
@@ -161,6 +163,60 @@ test('ordinary user carrier replaces one matching interim row', () => {
   assert.equal(canonical.entries.length, 1);
   assert.equal(canonical.entries[0].uuid, 'user-uuid');
   assert.equal(canonical.entries[0].role, 'user');
+});
+
+test('a consumed queue row is replaced by the one canonical user turn that appends text', () => {
+  const queueEnvelope = wrap({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    uuid: 'provider-queue-uuid',
+    content: prompt,
+    timestamp,
+    sessionId,
+  });
+  const queued = reduceClaudeHistoryPromptCarrier([], queueEnvelope, { includeUserText: true });
+  assert.equal(queued.entries[0].sourceIdentity, 'claude-queue:uuid:provider-queue-uuid');
+  const consumed = reduceClaudeHistoryPromptCarrier(queued.entries, wrap({
+    type: 'queue-operation',
+    operation: 'dequeue',
+    timestamp: '2026-07-28T12:00:01.000Z',
+    sessionId,
+  }), { includeUserText: true });
+  const merged = reduceClaudeHistoryPromptCarrier(consumed.entries, wrap({
+    type: 'user',
+    uuid: 'merged-user-uuid',
+    timestamp: '2026-07-28T12:00:02.000Z',
+    sessionId,
+    message: { role: 'user', content: prompt + '\nadditional user text' },
+  }), { includeUserText: true });
+  assert.equal(merged.entries.length, 1);
+  assert.equal(merged.entries[0].uuid, 'merged-user-uuid');
+  assert.equal(merged.entries[0].content, prompt + '\nadditional user text');
+  assert.equal(merged.entries[0].sourceIdentity, 'claude-queue:uuid:provider-queue-uuid');
+});
+
+test('a later manual user turn after popAll cannot inherit returned queue identity', () => {
+  const first = reduceClaudeHistoryPromptCarrier([], enqueue(), { includeUserText: true });
+  const second = reduceClaudeHistoryPromptCarrier(first.entries, wrap({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    content: prompt,
+    timestamp: '2026-07-28T12:00:01.000Z',
+    sessionId,
+  }), { includeUserText: true });
+  const consumed = reduceClaudeHistoryPromptCarrier(second.entries, wrap({
+    type: 'queue-operation', operation: 'popAll', timestamp: '2026-07-28T12:00:02.000Z', sessionId,
+  }), { includeUserText: true });
+  const ambiguous = reduceClaudeHistoryPromptCarrier(consumed.entries, wrap({
+    type: 'user',
+    uuid: 'ambiguous-merged-user',
+    timestamp: '2026-07-28T12:00:03.000Z',
+    sessionId,
+    message: { role: 'user', content: prompt + '\nextra' },
+  }), { includeUserText: true });
+  assert.equal(ambiguous.entries.length, 1);
+  assert.equal(ambiguous.entries[0].uuid, 'ambiguous-merged-user');
+  assert.equal(ambiguous.entries[0].sourceIdentity, undefined);
 });
 
 test('tool results and unrelated provider records remain delegated to the live reducer', () => {

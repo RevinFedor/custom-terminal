@@ -35,12 +35,18 @@ function createHarness() {
     getContext: () => context,
     readFrame: ({ state, snapshot }) => {
       if (snapshot.useExactBaseline === true) {
+        const boundaryRow = Number.isFinite(Number(snapshot.exactBoundaryRow))
+          ? Number(snapshot.exactBoundaryRow)
+          : 9;
         return {
           status: 'ready',
           reason: 'owned-output-after-exact-jsonl-frame-baseline',
           boundaryKind: 'exact-jsonl-frame-baseline',
-          boundaryRow: 9,
-          physicalLines: snapshot.lines,
+          boundaryRow,
+          leadingPhysicalLines: snapshot.lines.filter((line) => (
+            line.row <= boundaryRow && line.row >= boundaryRow - 24
+          )),
+          physicalLines: snapshot.lines.filter((line) => line.row > boundaryRow),
           baselinePhysicalLines: state.rebaseBaselineSnapshot?.lines || [],
           baselineFrameGeneration:
             state.rebaseBaselineSnapshot?.committedFrameGeneration ?? null,
@@ -736,6 +742,65 @@ test('disposed post-tool marker recovers from the exact committed frame baseline
   assert.match(h.logs.join('\n'), /BASELINE_DELTA .*kind=tool-result/);
 });
 
+test('exact baseline carries its tool kind into the boundary-spanning card classifier', () => {
+  const h = createHarness();
+  const dim = { wrapped: false, hasDim: true, allTextDim: true };
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+    sourceSequence: 40,
+  });
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 11, text: '• Working (1s • esc to interrupt)', wrapped: false },
+    { row: 12, text: '› ', wrapped: false },
+  ])), false);
+  assert.equal(h.controller.observeBoundary({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    sourceSequence: 41,
+    identity: 'large-tool-use-41',
+    kind: 'tool-use',
+  }), true);
+  const state = h.controller._turns.get('tab-a');
+  state.marker.isDisposed = true;
+
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 19, text: '        tail above exact boundary', ...dim },
+    { row: 20, text: '        final context row', ...dim },
+    { row: 21, text: '        huge delegated prompt body', ...dim },
+    {
+      row: 22,
+      text: '        Issue.\",\"notifySource\":true})',
+      wrapped: false,
+      hasDim: true,
+      allTextDim: false,
+    },
+    { row: 23, text: '    {\"ok\":true,\"accepted\":true}', ...dim },
+    { row: 24, text: '', wrapped: false },
+    { row: 25, text: '• Working (3s • esc to interrupt)', wrapped: false },
+    { row: 26, text: '› ', wrapped: false },
+  ], {
+    committedFrameGeneration: 9,
+    writeSeq: 11,
+    useExactBaseline: true,
+    exactBoundaryRow: 20,
+  })), false);
+  h.flushTimers();
+  assert.deepEqual(state.lastFilteredBlockKinds, [
+    'boundary-exact-tool-card-continuation',
+    'tool-card',
+    'activity',
+  ]);
+  assert.equal(h.emitted.length, 0);
+  assert.match(
+    h.logs.join('\n'),
+    /WAIT .*systemBlocks=boundary-exact-tool-card-continuation,tool-card,activity/,
+  );
+});
+
 test('JSONL-before-xterm ordering cannot duplicate an already materialized Codex paragraph', () => {
   const h = createHarness();
   const canonical = 'Здесь мыслительный поток собрал две важные вещи в одну.';
@@ -1120,6 +1185,13 @@ test('exact tool receipt prevents a later torn Codex search projection from publ
     kind: 'tool-use',
     structuredTexts: [command],
   }), true);
+  const state = h.controller._turns.get('tab-a');
+  const exactBaseline = h.frame([], {
+    committedFrameGeneration: 7,
+    writeSeq: 9,
+  });
+  state.rebaseBaselineSnapshot = exactBaseline;
+  state.rebaseBaselineKind = 'tool-use';
   assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
     { row: 11, text: 'classify|branch-status|scrol', wrapped: false },
     { row: 12, text: 'led-character-overlap|provisiona', wrapped: false },
@@ -1128,13 +1200,140 @@ test('exact tool receipt prevents a later torn Codex search projection from publ
   ], {
     committedFrameGeneration: 8,
     writeSeq: 10,
+    useExactBaseline: true,
+    exactBoundaryRow: 10,
   })), false);
   h.flushTimers();
   assert.equal(h.emitted.length, 0);
+  assert.strictEqual(state.rebaseBaselineSnapshot, exactBaseline);
+  assert.equal(state.baselineAdvanceCount, 0);
   assert.match(
     h.logs.join('\n'),
     /STRUCTURED_SUPPRESS .*reason=structured-projection-only .*kind=committed-frame/,
   );
+
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 11, text: 'classify|branch-status|scrol', wrapped: false },
+    { row: 12, text: 'led-character-overlap|provisiona', wrapped: false },
+    { row: 13, text: 'l-text-not-yet-materialized|', wrapped: false },
+    { row: 14, text: 'BOUNDARY_HELD|tool-use in terminal-history-preview.js', wrapped: false },
+    { row: 15, text: 'Настоящий ответ после сохранённой карточки.', wrapped: false },
+  ], {
+    committedFrameGeneration: 9,
+    writeSeq: 11,
+    useExactBaseline: true,
+    exactBoundaryRow: 10,
+  })), true);
+  h.flushTimers();
+  assert.equal(h.emitted.at(-1).action, 'update');
+  assert.equal(
+    h.emitted.at(-1).preview.text,
+    'Настоящий ответ после сохранённой карточки.',
+  );
+});
+
+test('exact tool boundary ignores a numbered diff card painted after the JSONL receipt', () => {
+  const h = createHarness();
+  const deleted = {
+    wrapped: false,
+    hasDim: true,
+    hasNonDefaultBg: true,
+    firstTextStyle: 'fg=0:-1,bg=50331648:4858397,dim',
+  };
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+    sourceSequence: 30,
+  });
+  h.setMarkerLine(20);
+  assert.equal(h.controller.observeBoundary({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    sourceSequence: 31,
+    identity: 'late-painted-update-result',
+    kind: 'tool-result',
+  }), true);
+
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 21, text: '     90 -            console.log("Done!");', ...deleted },
+    { row: 22, text: '     91 -            cb();', ...deleted },
+    { row: 23, text: '     92 -        });', ...deleted },
+    { row: 24, text: '     93 -', ...deleted },
+    { row: 25, text: '', wrapped: false },
+    { row: 26, text: '• Working (1s • esc to interrupt)', wrapped: false },
+    { row: 27, text: '› Implement {feature}', wrapped: false },
+  ], {
+    committedFrameGeneration: 8,
+    writeSeq: 10,
+  })), false);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 0);
+
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 21, text: '     90 -            console.log("Done!");', ...deleted },
+    { row: 22, text: '     91 -            cb();', ...deleted },
+    { row: 23, text: '     92 -        });', ...deleted },
+    { row: 24, text: '     93 -', ...deleted },
+    { row: 25, text: '', wrapped: false },
+    { row: 26, text: '• Настоящий ответ после инструмента.', wrapped: false },
+    { row: 27, text: '› Implement {feature}', wrapped: false },
+  ], {
+    committedFrameGeneration: 9,
+    writeSeq: 11,
+  })), true);
+  h.flushTimers();
+  assert.equal(h.emitted.at(-1).preview.text, 'Настоящий ответ после инструмента.');
+});
+
+test('exact boundary ignores a clipped dim transcript body and admits the next Codex prose', () => {
+  const h = createHarness();
+  const dim = { wrapped: false, hasDim: true, allTextDim: true };
+  h.setMarkerLine(1102);
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-a',
+    turnId: 'turn-a',
+    sourceSequence: 30,
+  });
+
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 1101, text: '    … +496 lines (ctrl + t to view transcript)', ...dim },
+    { row: 1102, text: '                "lineFeeds": 28,', ...dim },
+    { row: 1103, text: '      {', ...dim },
+    { row: 1104, text: '    … +262 lines (ctrl + t to view transcript)', ...dim },
+    { row: 1105, text: '      }', ...dim },
+    { row: 1106, text: '    ]', ...dim },
+    { row: 1107, text: '', wrapped: false },
+    { row: 1108, text: '• Working (1s • esc to interrupt)', wrapped: false },
+    { row: 1109, text: '› ', wrapped: false },
+  ], {
+    committedFrameGeneration: 8,
+    writeSeq: 10,
+  })), false);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 0);
+  assert.match(h.logs.join('\n'), /systemBlocks=.*boundary-tool-result-continuation/);
+
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 1101, text: '    … +496 lines (ctrl + t to view transcript)', ...dim },
+    { row: 1102, text: '                "lineFeeds": 28,', ...dim },
+    { row: 1103, text: '      {', ...dim },
+    { row: 1104, text: '    … +262 lines (ctrl + t to view transcript)', ...dim },
+    { row: 1105, text: '      }', ...dim },
+    { row: 1106, text: '    ]', ...dim },
+    { row: 1107, text: '', wrapped: false },
+    { row: 1108, text: '• Настоящий ответ после большого результата.', wrapped: false },
+    { row: 1109, text: '› ', wrapped: false },
+  ], {
+    committedFrameGeneration: 9,
+    writeSeq: 11,
+  })), true);
+  h.flushTimers();
+  assert.equal(h.emitted.at(-1).preview.text, 'Настоящий ответ после большого результата.');
 });
 
 test('separate Claude thinking and tool receipts clear their short-prefix projection chain', () => {

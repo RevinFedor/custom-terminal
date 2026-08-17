@@ -46,7 +46,101 @@ function materializeClaudeOrchestrationTurn(turn, recordMap, maxChars = 100_000)
   };
 }
 
+function collectClaudeOrchestrationExecutionTurns(
+  turns,
+  startTurnIndex,
+  { resultBeforeAt = null } = {},
+) {
+  const rows = Array.isArray(turns) ? turns : [];
+  if (!Number.isInteger(startTurnIndex) || startTurnIndex < 0 || startTurnIndex >= rows.length) {
+    return {
+      turns: [],
+      startTurnIndex: null,
+      endTurnIndex: null,
+      boundaryReason: 'start-turn-unavailable',
+    };
+  }
+
+  const upperBound = Number(resultBeforeAt) > 0 ? Number(resultBeforeAt) : 0;
+  const executionTurns = [rows[startTurnIndex]];
+  let endTurnIndex = startTurnIndex;
+  let boundaryReason = 'end-of-transcript';
+
+  for (let index = startTurnIndex + 1; index < rows.length; index += 1) {
+    const candidate = rows[index];
+    if (candidate?.kind !== 'queued_command') {
+      boundaryReason = 'new-logical-turn';
+      break;
+    }
+    if (upperBound) {
+      const promptAt = Date.parse(candidate.userTimestamp || '');
+      if (!Number.isFinite(promptAt) || promptAt > upperBound) {
+        boundaryReason = 'completion-upper-bound';
+        break;
+      }
+    }
+    executionTurns.push(candidate);
+    endTurnIndex = index;
+  }
+
+  return {
+    turns: executionTurns,
+    startTurnIndex,
+    endTurnIndex,
+    boundaryReason,
+  };
+}
+
+function materializeClaudeOrchestrationExecution({
+  turns,
+  startTurnIndex,
+  recordMap,
+  resultBeforeAt = null,
+  maxChars = 100_000,
+}) {
+  const execution = collectClaudeOrchestrationExecutionTurns(
+    turns,
+    startTurnIndex,
+    { resultBeforeAt },
+  );
+  if (execution.turns.length === 0) {
+    return {
+      complete: false,
+      assistantText: '',
+      assistantChars: 0,
+      truncated: false,
+      assistantBlockCount: 0,
+      internalContinuationCount: 0,
+      queuedContinuationCount: 0,
+      ...execution,
+    };
+  }
+
+  const latestTurn = execution.turns.at(-1);
+  const mergedTurn = {
+    assistantUuids: execution.turns.flatMap((turn) => turn?.assistantUuids || []),
+    // A completion before a later queued user message is not the completion of
+    // the physical execution. Only the newest queued slice may close it.
+    completionAssistantUuids: Array.isArray(latestTurn?.completionAssistantUuids)
+      ? latestTurn.completionAssistantUuids
+      : (latestTurn?.assistantUuids || []),
+    internalContinuationCount: execution.turns.reduce(
+      (total, turn) => total + Math.max(0, Number(turn?.internalContinuationCount) || 0),
+      0,
+    ),
+  };
+  return {
+    ...materializeClaudeOrchestrationTurn(mergedTurn, recordMap, maxChars),
+    queuedContinuationCount: Math.max(0, execution.turns.length - 1),
+    startTurnIndex: execution.startTurnIndex,
+    endTurnIndex: execution.endTurnIndex,
+    boundaryReason: execution.boundaryReason,
+  };
+}
+
 module.exports = {
+  collectClaudeOrchestrationExecutionTurns,
   hasCompletionAfterLatestInternalContinuation,
+  materializeClaudeOrchestrationExecution,
   materializeClaudeOrchestrationTurn,
 };

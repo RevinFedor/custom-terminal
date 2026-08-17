@@ -73,6 +73,15 @@ test('only exact native Rewind controls may advance the action-owned input revis
     kind: 'confirm-pending',
     reason: 'rewind-confirm-frame-pending',
   }, 'a pending mirror defers Enter classification to the fail-closed async preflight');
+  assert.deepEqual(classifyManualCodexRewindControlInput({
+    data: '\r',
+    frame: { kind: 'ordinary-enter', possibleRewind: true },
+    candidateObserver: true,
+  }), {
+    owned: true,
+    kind: 'confirm-pending',
+    reason: 'rewind-confirm-frame-pending',
+  }, 'strong partial native chrome keeps the Enter revision inside the Rewind action');
   assert.equal(classifyManualCodexRewindControlInput({
     data: '\r',
     frame: classifyManualCodexEnterFrame({ success: true, lines: [] }),
@@ -245,16 +254,20 @@ test('physical Enter is classified as native Rewind only for a proven headless o
 });
 
 test('real narrow Codex transcript frame accepts the right-edge clipped message label', () => {
-  const mkFrame = (selectedText) => ({
+  const mkFrame = (selectedText, {
+    cols = 69,
+    footer = 'q to quit esc/← to edit prev → to edit next enter to edit mess',
+    occupiedEndX = null,
+  } = {}) => ({
     success: true,
     rows: 22,
-    cols: 69,
+    cols,
     viewportY: 186,
     lines: [
       { row: 186, text: '/ T R A N S C R I P T / / / / / / / / / / / / / / / / /' },
       { row: 189, text: `› ${selectedText}` },
       { row: 205, text: '↑/↓ to scroll pgup/pgdn to page home/end to jump' },
-      { row: 206, text: 'q to quit esc/← to edit prev → to edit next enter to edit mess' },
+      { row: 206, text: footer, occupiedEndX },
     ],
     codexActivePrompt: {
       row: 189,
@@ -285,6 +298,25 @@ test('real narrow Codex transcript frame accepts the right-edge clipped message 
       selectedRow: 189,
       reason: 'headless-transcript-active-prompt',
     },
+  );
+
+  const production70ColumnFrame = mkFrame('S10_C_PRODUCTION_70_COLS', {
+    cols: 70,
+    footer: 'q to quit esc/← to edit prev → to edit next enter to edit messa',
+    occupiedEndX: 69,
+  });
+  assert.equal(
+    classifyManualCodexEnterFrame(production70ColumnFrame).kind,
+    'native-rewind-confirm',
+    'raw double-space cells may reach the 70-column edge after normalized text already fits',
+  );
+
+  const samePrefixAwayFromPhysicalEdge = structuredClone(production70ColumnFrame);
+  samePrefixAwayFromPhysicalEdge.lines[3].occupiedEndX = 55;
+  assert.equal(
+    classifyManualCodexEnterFrame(samePrefixAwayFromPhysicalEdge).kind,
+    'ordinary-enter',
+    'a footer-looking draft away from the physical edge is not clipping proof',
   );
 
   const quotedChromeInOrdinaryScrollback = structuredClone(realFrameA);
@@ -480,6 +512,21 @@ test('an armed Rewind candidate never turns unavailable or changed screen proof 
     }),
     { handled: true, writeEnter: false, reason: 'rewind-screen-unavailable' },
     'unknown screen state after idle Escape is fail-closed',
+  );
+
+  const partialRewindSnapshot = overlaySnapshot('target prompt');
+  partialRewindSnapshot.lines.pop();
+  const partialRewindFrame = classifyManualCodexEnterFrame(partialRewindSnapshot);
+  assert.equal(partialRewindFrame.kind, 'ordinary-enter');
+  assert.equal(partialRewindFrame.possibleRewind, true);
+  assert.deepEqual(
+    decideManualCodexRewindEnterWrite({
+      frame: partialRewindFrame,
+      observerAvailable: true,
+      candidateObserver: true,
+    }),
+    { handled: true, writeEnter: false, reason: 'rewind-frame-incomplete' },
+    'partial native chrome keeps Enter inside the Rewind proof path instead of submitting it',
   );
 
   const ordinarySnapshot = overlaySnapshot('ordinary draft');

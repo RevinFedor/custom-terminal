@@ -71,6 +71,44 @@ test('post-Enter sidecar decorates the exact durable prompt without changing its
   assert.equal(store.rows[0].entryUuid, 'codex-user-writer-1-17');
 });
 
+test('a Claude queue presentation follows the prompt into a uniquely merged canonical user turn', () => {
+  const store = createStore();
+  const queuedText = 'queued prompt';
+  const queueTimestamp = '2026-08-16T09:58:43.000Z';
+  assert.equal(saveAuditedPromptPresentation(store, {
+    toolType: 'claude',
+    sessionId: 'claude-queue-session',
+    auditTimestamp: queueTimestamp,
+    actualText: queuedText,
+    snapshot: {
+      promptChips: [{
+        id: 'queue-chip',
+        kind: 'prompt',
+        label: 'Queued source',
+        text: queuedText,
+      }],
+    },
+  }), true);
+
+  const decorated = decorateHistoryPromptPresentations(store, {
+    toolType: 'claude',
+    sessionId: 'claude-queue-session',
+    entries: [{
+      uuid: 'claude-merged-user',
+      role: 'user',
+      timestamp: '2026-08-16T10:01:47.000Z',
+      content: queuedText + '\nadditional user text',
+      sourceIdentity: 'claude-queue:uuid:provider-enqueue',
+      promptPresentationAuditTimestamp: queueTimestamp,
+      promptPresentationTransportHash: promptTransportHash(queuedText),
+    }],
+  });
+
+  assert.equal(decorated[0].content, queuedText + '\nadditional user text');
+  assert.equal(decorated[0].promptChips[0].label, 'Queued source');
+  assert.equal(store.rows[0].entryUuid, 'claude-merged-user');
+});
+
 test('audited image refs decorate the exact durable prompt and keep thumbnail identity', () => {
   const store = createStore();
   const content = 'before [Image #1] after';

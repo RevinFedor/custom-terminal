@@ -20,6 +20,7 @@ import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { PaneMapCells, usePaneMapColumns } from './PaneMap';
 import { splitAvailability } from '../../utils/splitPanesModel.mjs';
+import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { TabProcessBar, TabStatusMarker } from './TabSignals';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
@@ -229,6 +230,10 @@ type RestartAfterScriptRunState = {
 
 let forcedDragCursorDepth = 0;
 let forcedDragCursorStyleEl: HTMLStyleElement | null = null;
+
+// Last tab-list reveal request (seq) already handled — see the reveal effect
+// inside TabBar for why this must survive the component unmounting.
+let consumedTabListRevealSeq = 0;
 const TABBAR_FORCE_RELEASE_EVENT = 'noted:tabbar-force-release';
 
 const isTabbarDragVisualLockActive = () =>
@@ -3896,7 +3901,23 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
       if (tabId === workspace?.activeTabId && viewingSubAgentTabId) {
         useWorkspaceStore.getState().setViewingSubAgent(null);
       }
-      useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+      // Click-cost split (16.08: tab-click handlerMs grew 75→300ms between
+      // builds with `during=none-marked` — this names the two halves).
+      // syncMs inside switchTab covers the store move; activateMs here covers
+      // everything the click does synchronously, so activateMs - syncMs is
+      // the cost living OUTSIDE switchTab (view flips, reveal, subscribers).
+      const activateStartedAt = performance.now();
+      const endClickMark = markRendererActivity('tab-click:' + tabId.slice(-8));
+      try {
+        useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+      } finally {
+        endClickMark();
+        const activateMs = performance.now() - activateStartedAt;
+        if (activateMs >= 50) {
+          console.warn('[Perf:TabClick] tab=' + tabId.slice(-12)
+            + ' activateMs=' + activateMs.toFixed(1));
+        }
+      }
     }
   };
   // OSC 133 Event-driven process status (replaces polling)
@@ -6896,6 +6917,50 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     }
   };
 
+  // Fork the current Claude session into an SDK tab. Unlike the PTY forks
+  // above, the copy of the conversation file must exist BEFORE the tab does:
+  // an SDK tab has no launch command to hand a session id to, so the new id is
+  // written straight onto the created tab. Claude only — SDK does not run
+  // Codex. Moved verbatim from the bottom control bar, which no longer carries
+  // session actions.
+  const handleContextForkToSDK = async () => {
+    const menu = contextMenu;
+    const tab = menu ? workspace.tabs.get(menu.tabId) : null;
+    if (!menu || !tab || contextForkProvider !== 'claude' || !contextForkSessionAvailable) return;
+    setContextMenu(null);
+
+    const sourceSessionId = await resolveContextForkSessionId(
+      tab,
+      'claude',
+      'создать fork сессии в SDK-вкладке',
+    );
+    if (!sourceSessionId) return;
+
+    const cwd = tab.cwd || workspace.projectPath || '';
+    try {
+      const forkResult = await ipcRenderer.invoke('claude:fork-session-file', {
+        sourceSessionId,
+        cwd,
+        skipChainResolve: true,
+      });
+      if (!forkResult?.success || !forkResult?.newSessionId) {
+        showToast('SDK fork не создан: ' + (forkResult?.error || 'неизвестная ошибка'), 'error');
+        return;
+      }
+      const forkName = tab.name ? `${tab.name}_fork` : undefined;
+      const sdkTabId = await useWorkspaceStore.getState().createSDKTab(projectId, forkName, {
+        afterTabId: tab.id,
+        visualParentTabId: tab.id,
+      });
+      useWorkspaceStore.getState().updateSDKState(sdkTabId, {
+        claudeSessionId: forkResult.newSessionId,
+      });
+      showToast(`SDK fork → ${forkName || 'новая вкладка'}`, 'success');
+    } catch (error: any) {
+      showToast('Не удалось открыть SDK-вкладку fork: ' + (error?.message || String(error)), 'error');
+    }
+  };
+
   const handleCloseTab = async (e: React.MouseEvent, tabId: string) => {
     e.stopPropagation();
     // If multi-select and clicked tab is among selected — close all selected
@@ -8040,13 +8105,14 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   // tab and would drag the list away from the offset the user left. Only a
   // real change of the active tab INSIDE the visible project counts.
   //
-  // And it must stay a no-op whenever the row is ALREADY on screen. This is a
-  // rescue for a row the user cannot see, not a "centre the selection" rule:
-  // clicking a visible tab must never move the list under the cursor. The
-  // check is explicit geometry against THIS scroller, because scrollIntoView
-  // means "make it visible" — it re-aligns a row that is merely near an edge,
-  // and it walks every scrollable ancestor, so it moves the list on clicks
-  // that should have changed nothing.
+  // And it must stay a no-op whenever the row is ALREADY on screen: clicking a
+  // visible tab must never move the list under the cursor. A row that is NOT
+  // visible is brought toward the middle (tabListRevealScroll.mjs) — the same
+  // rule as the explicit reveal below, so the two paths cannot disagree about
+  // where the active row ends up. Geometry is measured against THIS scroller,
+  // never scrollIntoView: that one means "make it visible", so it re-aligns a
+  // row merely near an edge and walks every scrollable ancestor, moving the
+  // list on clicks that should have changed nothing.
   const lastAutoScrolledTabRef = useRef<string | null>(null);
   useEffect(() => {
     const scrollContainer = scrollContainerRef.current;
@@ -8071,14 +8137,15 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
       // wrapper, so offsetTop ≈ 0 for ALL rows — a naive check then reads
       // any row as "above the viewport" and slams the list to the top.
       const rect = measureVerticalRowFlipRect(activeEl, scrollContainer);
-      // Vertical sidebar axis.
-      const rowBottom = rect.top + rect.height;
-      const viewTop = scrollContainer.scrollTop;
-      const viewBottom = viewTop + scrollContainer.clientHeight;
-      if (rect.top < viewTop) scrollContainer.scrollTop = rect.top;
-      else if (rowBottom > viewBottom) {
-        scrollContainer.scrollTop = rowBottom - scrollContainer.clientHeight;
-      }
+      // Vertical sidebar axis — toward the middle, clamped at the ends.
+      const nextTop = tabListRevealScrollTop({
+        rowTop: rect.top,
+        rowHeight: rect.height,
+        viewTop: scrollContainer.scrollTop,
+        viewHeight: scrollContainer.clientHeight,
+        contentHeight: scrollContainer.scrollHeight,
+      });
+      if (nextTop !== null) scrollContainer.scrollTop = nextTop;
       // Horizontal top-bar axis (the old scrollIntoView covered it too).
       const rowRight = rect.left + rect.width;
       const viewLeft = scrollContainer.scrollLeft;
@@ -8093,17 +8160,31 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   }, [workspace.activeTabId, mainTabs.length, projectId]);
 
   // Explicit reveal request (Ctrl+Tab / Cmd+P commit, split focus): INSTANT
-  // scroll that aligns the row's edge with the list edge when it is out of
-  // view (top-with-top above, bottom-with-bottom below). Unlike the effect
-  // above this one also fires right after a cross-project switch and takes
-  // priority over that project's saved-scroll restore — the user asked for
-  // this tab, not for where the list stood last time.
+  // scroll that brings the row toward the MIDDLE of the list — see
+  // tabListRevealScroll.mjs for the rule (middle when reachable, otherwise the
+  // list simply hits its end; a fully visible row is left alone). Unlike the
+  // effect above this one also fires right after a cross-project switch and
+  // takes priority over that project's saved-scroll restore — the user asked
+  // for this tab, not for where the list stood last time.
   const tabListRevealRequest = useWorkspaceStore((s) => s.tabListRevealRequest);
   useLayoutEffect(() => {
     if (!isVerticalLayout) return;
     if (!tabListRevealRequest || tabListRevealRequest.projectId !== projectId) return;
+    // ONE-SHOT, consumed by seq. The store field lives on after handling, so
+    // without this a RETURN to the same project re-ran the effect against the
+    // stale request: it cancelled the per-project saved-scroll restore and
+    // dragged the list to a tab from the previous visit — reported live as
+    // "позиция скролла не сохраняется при переключении проектов". The counter
+    // is module-level, not a ref: TabBar unmounts on the dashboard trip, and a
+    // ref reset to 0 would let the same stale request fire once more on every
+    // return from the dashboard. Exactly one TabBar handles a given request
+    // (vertical layout + matching project), so a shared counter is safe.
+    if (tabListRevealRequest.seq === consumedTabListRevealSeq) return;
     const scroller = scrollContainerRef.current;
+    // No scroller — this instance cannot handle the request (menu-owner
+    // TabBars render no list); leave it unconsumed for the one that can.
     if (!scroller) return;
+    consumedTabListRevealSeq = tabListRevealRequest.seq;
 
     // The reveal owns the scroll from here: cancel a pending per-project
     // restore so it can't clamp us back after rows finish laying out.
@@ -8126,16 +8207,13 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
       // every click, and then persisted 0 as the saved offset ("scroll
       // resets"). Measure against the scroller itself.
       const rect = measureVerticalRowFlipRect(row, scroller);
-      const rowTop = rect.top;
-      const rowBottom = rowTop + rect.height;
-      const viewTop = scroller.scrollTop;
-      const viewBottom = viewTop + scroller.clientHeight;
-      let next: number | null = null;
-      if (rowTop < viewTop) {
-        next = rowTop; // above → align top edges
-      } else if (rowBottom > viewBottom) {
-        next = rowBottom - scroller.clientHeight; // below → align bottom edges
-      }
+      const next = tabListRevealScrollTop({
+        rowTop: rect.top,
+        rowHeight: rect.height,
+        viewTop: scroller.scrollTop,
+        viewHeight: scroller.clientHeight,
+        contentHeight: scroller.scrollHeight,
+      });
       if (next !== null) {
         scroller.scrollTop = next;
         // Persist the revealed position (the reveal, not the stale saved
@@ -9679,11 +9757,19 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
             </>
           )}
 
-          {/* Session fork: ordinary full-history fork + compact-tail fork. */}
+          {/* Session fork: compact-tail fork + ordinary full-history fork, plus
+              an SDK variant for Claude. The third slot appears only for Claude
+              because SDK does not run Codex; the row keeps two columns for
+              Codex rather than showing a dead third one. */}
           {!isMultiSelect && contextForkProvider && contextForkSessionAvailable && (
             <div
               data-tab-fork-split
-              className="grid grid-cols-[7fr_3fr] border-t border-[#333] border-b border-[#333]"
+              className={
+                'grid border-t border-[#333] border-b border-[#333] '
+                + (contextForkProvider === 'claude'
+                  ? 'grid-cols-[6fr_2fr_2fr]'
+                  : 'grid-cols-[7fr_3fr]')
+              }
             >
               <button
                 data-tab-fork-compact
@@ -9704,6 +9790,17 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
               >
                 <span>Fork</span>
               </button>
+              {contextForkProvider === 'claude' && (
+                <button
+                  data-tab-fork-sdk
+                  className="px-2 py-1.5 text-[12px] text-[#DA7756] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#333]"
+                  title="Fork the complete session into an SDK tab"
+                  aria-label="Fork complete session into SDK tab"
+                  onClick={() => void handleContextForkToSDK()}
+                >
+                  <span>SDK</span>
+                </button>
+              )}
             </div>
           )}
 

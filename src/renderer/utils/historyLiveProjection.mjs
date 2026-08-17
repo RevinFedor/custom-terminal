@@ -418,17 +418,17 @@ export function reconcileHistoryLiveToolResults(durableEntries, liveResults) {
 export function reconcileCommittedHistoryLiveProjection(liveEntries, durableEntries) {
   const durableIdentities = new Set(
     (durableEntries || [])
-      .map((entry) => historyLivePresentationIdentity(entry))
-      .filter(Boolean),
+      .flatMap((entry) => historyLivePresentationIdentities(entry)),
   );
   const source = Array.isArray(liveEntries) ? liveEntries : [];
   if (source.length === 0) {
     return { entries: source, durableIdentities };
   }
-  const remaining = source.filter((entry) =>
-    !historyLivePresentationIdentity(entry)
-    || !durableIdentities.has(historyLivePresentationIdentity(entry))
-  );
+  const remaining = source.filter((entry) => {
+    const identities = historyLivePresentationIdentities(entry);
+    return identities.length === 0
+      || !identities.some((identity) => durableIdentities.has(identity));
+  });
   return {
     entries: remaining.length === source.length ? source : remaining,
     durableIdentities,
@@ -449,13 +449,13 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
 
   const durableIdentities = new Set(
     durable
-      .map((entry) => historyLivePresentationIdentity(entry))
-      .filter(Boolean),
+      .flatMap((entry) => historyLivePresentationIdentities(entry)),
   );
-  const unmatchedLive = live.filter((entry) =>
-    !historyLivePresentationIdentity(entry)
-    || !durableIdentities.has(historyLivePresentationIdentity(entry))
-  );
+  const unmatchedLive = live.filter((entry) => {
+    const identities = historyLivePresentationIdentities(entry);
+    return identities.length === 0
+      || !identities.some((identity) => durableIdentities.has(identity));
+  });
   if (unmatchedLive.length === 0) return durable;
 
   // A prompt submitted while the current turn is busy remains the final
@@ -634,20 +634,32 @@ export function historyLivePresentationKey(entry) {
 }
 
 export function historyLivePresentationIdentity(entry) {
+  return historyLivePresentationIdentities(entry)[0] || '';
+}
+
+/**
+ * One physical History record can legitimately carry more than one exact
+ * identity while it moves from a provider queue record to the canonical
+ * transcript record. Keep every exact alias so a cold live replay cannot
+ * re-introduce the canonical UUID after its queue carrier was already covered
+ * by the durable snapshot.
+ */
+export function historyLivePresentationIdentities(entry) {
+  const identities = [];
   const sourceIdentity = String(entry?.sourceIdentity || '');
-  if (sourceIdentity) return sourceIdentity;
+  if (sourceIdentity) identities.push(sourceIdentity);
   const queueIdentity = claudeHistoryQueuePresentationIdentity(entry);
-  if (queueIdentity) return queueIdentity;
+  if (queueIdentity && !identities.includes(queueIdentity)) identities.push(queueIdentity);
   // Claude's durable projection preserves the JSONL assistant UUID directly.
   // That UUID is the exact live→durable identity even though Claude does not
   // add Codex's separate sourceIdentity field.
   if (entry?.role === 'assistant' && entry?.uuid) {
-    return 'assistant-uuid:' + String(entry.uuid);
+    identities.push('assistant-uuid:' + String(entry.uuid));
   }
   if (entry?.role === 'user' && entry?.uuid) {
-    return 'user-uuid:' + String(entry.uuid);
+    identities.push('user-uuid:' + String(entry.uuid));
   }
-  return '';
+  return identities;
 }
 
 const TURN_BOUNDARIES_THAT_CLEAR_PENDING_THINKING = new Set([

@@ -510,7 +510,12 @@ function orchestrationInstallBlockers(run) {
   const resultProofPending = isResultProofPending(run);
   const active = isActiveStatus(run.status);
   const waitingForResumedTurn = run.resumeAwaitingNewTurn === true;
-  const attentionOnly = run.status === 'waiting_recovery' || waitingForResumedTurn;
+  const deliveryAwaitingReadiness = run.status === 'queued'
+    && !run.deliveryAcceptedAt
+    && !run.targetPromptProofAt;
+  const attentionOnly = run.status === 'waiting_recovery'
+    || waitingForResumedTurn
+    || deliveryAwaitingReadiness;
 
   if (resultProofPending) {
     if (separateSource) {
@@ -1181,6 +1186,7 @@ class OrchestrationRunStore {
     baselineBusy = false,
     sessionId = null,
     lifecycleGeneration = null,
+    launchGeneration = null,
     auditPending = false,
   } = {}) {
     await this.initialize();
@@ -1191,6 +1197,7 @@ class OrchestrationRunStore {
     if (isPausedRun(run)) {
       run.sessionId = sessionId || run.sessionId || null;
       run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
+      run.targetLaunchGeneration = launchGeneration || run.targetLaunchGeneration || null;
       run.deliveryAcceptedAt ||= Date.now();
       run.deliveryAuditPendingAt = auditPending ? (run.deliveryAuditPendingAt || Date.now()) : null;
       run.deliveryIntent = null;
@@ -1203,6 +1210,7 @@ class OrchestrationRunStore {
     run.status = (waitingForPredecessor || run.waitingForPriorTurn) ? 'queued' : 'sent';
     run.sessionId = sessionId || run.sessionId || null;
     run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
+    run.targetLaunchGeneration = launchGeneration || run.targetLaunchGeneration || null;
     run.deliveryAcceptedAt = Date.now();
     run.deliveryAuditPendingAt = auditPending ? run.deliveryAcceptedAt : null;
     run.deliveryIntent = null;
@@ -1348,6 +1356,7 @@ class OrchestrationRunStore {
     reason = 'target-busy',
     sessionId = null,
     lifecycleGeneration = null,
+    launchGeneration = null,
   } = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
@@ -1360,6 +1369,7 @@ class OrchestrationRunStore {
     run.deliveryDeferredReason = reason;
     run.sessionId = sessionId || run.sessionId || null;
     run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
+    run.targetLaunchGeneration = launchGeneration || run.targetLaunchGeneration || null;
     run.updatedAt = now;
     this._schedulePersist();
     return publicRun(run);
@@ -1368,6 +1378,7 @@ class OrchestrationRunStore {
   async claimDeferredDelivery(runId, {
     sessionId = null,
     lifecycleGeneration = null,
+    launchGeneration = null,
   } = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
@@ -1396,6 +1407,7 @@ class OrchestrationRunStore {
     run.deliveryDeferredReason = null;
     run.sessionId = sessionId || run.sessionId || null;
     run.targetLifecycleGeneration = lifecycleGeneration || run.targetLifecycleGeneration || null;
+    run.targetLaunchGeneration = launchGeneration || run.targetLaunchGeneration || null;
     run.updatedAt = now;
     // The durable claim is the boundary before PTY Enter. If persistence
     // fails, the caller must not press Enter; a best-effort write would make a

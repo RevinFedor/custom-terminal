@@ -138,6 +138,9 @@
      narrowed to its content by an inner wrapper instead — see
      .cb-tool-head-inner. */
   display: flex;
+  width: 100%;
+  box-sizing: border-box;
+  position: relative;
   align-items: center;
   border-radius: 4px;
   transition: background 0.15s;
@@ -242,20 +245,10 @@
   font-family: var(--cb-font-mono);
   font-variant-numeric: tabular-nums;
 }
-/* раскрытое тело — вертикальная линия слева вместо карточки */
-/* Height animation wrapper: 0fr → 1fr on a single grid row is the one way to
-   transition to CONTENT height without measuring it in JS, and unlike a
-   conditional mount it also plays when closing. */
-.cb-tool-reveal {
-  display: grid;
-  grid-template-rows: 0fr;
-  transition: grid-template-rows 160ms cubic-bezier(0.22, 0.61, 0.36, 1);
-}
-.cb-tool-reveal[data-open="true"] { grid-template-rows: 1fr; }
-.cb-tool-reveal-inner { overflow: hidden; min-height: 0; }
-@media (prefers-reduced-motion: reduce) {
-  .cb-tool-reveal { transition: none; }
-}
+/* раскрытое тело — вертикальная линия слева вместо карточки.
+   Без анимации высоты (решение 16.08): в виртуализированной ленте она либо
+   дёргает перемер строк, либо ломает правило «строка под кликом не двигается».
+   Тело появляется в один кадр — scroll-компенсация написана ровно под это. */
 .cb-tool-body { margin-left: 8px; margin-top: 6px; padding-left: 12px; position: relative; }
 .cb-rail {
   position: absolute;
@@ -331,14 +324,57 @@
 }
 /* Codex-reference rest/hover states for the edit row: counts sit muted until
    the pointer is on the row, then take their diff colours; the chevron is
-   the package's collapse affordance and needs no change here. */
+   the package's collapse affordance and needs no change here.
+   ONE hover surface: the counts must colour from the same box that shows the
+   hover pill — the shrink-to-fit inner wrapper. Hanging them off the OUTER
+   full-width row made the digits react a screen-width away from the pill
+   (pointer far right of a short row: colours flip, no pill), i.e. two
+   different answers to "am I on this row?" at once. */
 .cb-tool-head .cb-diff-stats .cb-c-add,
 .cb-tool-head .cb-diff-stats .cb-c-del {
   color: var(--cb-muted);
   transition: color 0.12s;
 }
-.cb-tool-head:hover .cb-diff-stats .cb-c-add { color: var(--cb-diff-add); }
-.cb-tool-head:hover .cb-diff-stats .cb-c-del { color: var(--cb-diff-del); }
+.cb-tool-head .cb-tool-head-inner:hover .cb-diff-stats .cb-c-add { color: var(--cb-diff-add); }
+.cb-tool-head .cb-tool-head-inner:hover .cb-diff-stats .cb-c-del { color: var(--cb-diff-del); }
+
+/* Hover copy for an expandable row (tool card, reasoning) — the affordance
+   the user already knows from a prompt row, in the same place: the row's
+   RIGHT edge, revealed by hovering the row.
+   It sits outside the shrink-to-fit hit area on purpose: inside it, the
+   button would ride at the end of the text and shift with every label
+   change, so its position would never be learnable. Keyboard focus reveals
+   it too — a control reachable by Tab must not be invisible. */
+.cb-row-copy {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  margin-left: 0;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--cb-muted);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+.cb-tool:hover .cb-row-copy,
+.cb-tool:focus-within .cb-row-copy,
+.cb-think:hover .cb-row-copy,
+.cb-think:focus-within .cb-row-copy {
+  opacity: 1;
+  pointer-events: auto;
+}
+.cb-row-copy:hover { color: #fff; background: var(--cb-action-hover); }
 
 /* ============================================================
    READ — badge «N lines»
@@ -459,6 +495,19 @@
    THINKING / REASONING
    ============================================================ */
 .cb-think { margin: 12px 60px 12px 0; }
+/* Header line of a reasoning row: the toggle keeps its shrink-to-fit hit area
+   (hover pill ends where the label ends), the copy button is pushed to the
+   row's right edge — the same geometry a tool row has. */
+.cb-think-head {
+  display: flex;
+  width: 100%;
+  box-sizing: border-box;
+  position: relative;
+  align-items: center;
+  gap: 8px;
+}
+.cb-tool-head:has(> .cb-row-copy),
+.cb-think-head:has(> .cb-row-copy) { padding-right: 28px; }
 .cb-think-btn {
   /* Same content-width hit area rule as .cb-tool-head: the hover/click
      surface ends where the label ends, not at the feed's right edge. */

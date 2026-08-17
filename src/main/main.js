@@ -126,6 +126,9 @@ const {
 const {
   assertAgentProviderModel,
 } = require(path.join(srcMainDir, 'agent-provider-model-contract'));
+const {
+  computePromptQueueInstallBlockers,
+} = require(path.join(srcMainDir, 'prompt-queue-install-blockers'));
 const taskCompletionIntents = new TaskCompletionIntentRegistry();
 const { createXtermWritePump } = require(path.join(srcSharedDir, 'xterm-write-pump.cjs'));
 const {
@@ -187,6 +190,7 @@ const {
   inspectClaudeProviderFatalFrame,
 } = require(path.join(srcMainDir, 'claude-provider-fatal-state'));
 const {
+  claudeQueuePromptSourceIdentity,
   claudeInternalAgentContinuationKind,
   claudeInternalAgentContinuationKindFromEntry,
   extractClaudeQueueOperationPromptText,
@@ -194,6 +198,7 @@ const {
   findMatchingClaudePromptTurn,
 } = require(path.join(srcMainDir, 'claude-prompt-carriers'));
 const {
+  materializeClaudeOrchestrationExecution,
   materializeClaudeOrchestrationTurn,
 } = require(path.join(srcMainDir, 'claude-orchestration-result'));
 const {
@@ -309,6 +314,8 @@ const {
   selectCodexPendingPromptAudit,
 } = require(path.join(srcMainDir, 'codex-prompt-audit'));
 const {
+  buildClaudeLiveQueueReturnResult,
+  buildClaudeLiveQueueSettlementConfirmation,
   buildClaudeLivePromptAuditConfirmation,
   captureClaudePromptAuditBoundary,
   classifyClaudePromptAuditAdmission,
@@ -316,6 +323,8 @@ const {
   readClaudeUserRecords,
   readLastClaudeUserRecord,
   selectClaudeLivePromptOwner,
+  selectClaudeLiveQueueReturnAudits,
+  selectClaudeLiveQueueSettlementAudits,
   selectClaudePendingPromptAudit,
   selectUniqueClaudePromptSubmitAudit,
   shouldStageClaudeUserPromptAudit,
@@ -387,6 +396,7 @@ const agentSendReceiptStartupReady = (async () => {
     allRecords: agentSendReceiptStartupReconcile.records,
   });
   let promoted = 0;
+  let providerNotAccepted = 0;
   let absent = 0;
   let unknown = 0;
   let markedUnconfirmed = 0;
@@ -402,6 +412,20 @@ const agentSendReceiptStartupReady = (async () => {
         console.warn('[AgentSendReceipt] startup transcript proof rejected operation='
           + String(result.operationKey || '-').slice(0, 72)
           + ' reason=' + (promotion?.reason || 'unknown'));
+      }
+    } else if (result?.decision === 'provider-not-accepted' && result.receipt) {
+      const settlement = agentSendReceiptStore.settleAttempt(
+        result.operationKey,
+        result.attemptId,
+        result.receipt,
+      );
+      if (settlement?.record?.state === AGENT_SEND_DURABLE_STATES.PROVIDER_NOT_ACCEPTED) {
+        providerNotAccepted += 1;
+      } else {
+        unknown += 1;
+        console.warn('[AgentSendReceipt] startup provider queue return rejected operation='
+          + String(result.operationKey || '-').slice(0, 72)
+          + ' reason=' + (settlement?.reason || 'unknown'));
       }
     } else {
       if (result?.decision === 'absent') absent += 1;
@@ -436,6 +460,7 @@ const agentSendReceiptStartupReady = (async () => {
     }
     console.warn('[AgentSendReceipt] startup transcript reconcile records=' + decisions.length
       + ' promoted=' + promoted
+      + ' providerNotAccepted=' + providerNotAccepted
       + ' absent=' + absent
       + ' unknown=' + unknown
       + ' markedUnconfirmed=' + markedUnconfirmed
@@ -445,6 +470,7 @@ const agentSendReceiptStartupReady = (async () => {
     ready: true,
     records: decisions.length,
     promoted,
+    providerNotAccepted,
     absent,
     unknown,
     markedUnconfirmed,
@@ -685,6 +711,11 @@ const {
   decideCodexResumeGoalAutoEnter,
   inspectCodexResumeGoalPrompt,
 } = require(path.join(srcMainDir, 'codex-resume-goal-prompt'));
+const {
+  decideCodexUpdatePromptAction,
+  decideCodexUpdatePromptDismissal,
+  inspectCodexUpdatePrompt,
+} = require(path.join(srcMainDir, 'codex-update-prompt'));
 const {
   claimRewindOperation,
   classifyRewindCancel,
@@ -1791,19 +1822,136 @@ const transcriptService = createSessionTranscriptService({
     recordByteOffset,
     record,
   }) => {
+    const pendingAudits = getPendingClaudePasteAudits(tabId);
+    const queueReturnSelections = selectClaudeLiveQueueReturnAudits(
+      pendingAudits,
+      {
+        record,
+        byteOffset: recordByteOffset,
+        transcriptPath,
+        sessionId,
+      },
+    );
+    if (queueReturnSelections.length > 0) {
+      let firstReturn = null;
+      for (const returnSelection of queueReturnSelections) {
+        const queueReturn = buildClaudeLiveQueueReturnResult(
+          returnSelection,
+          { sessionId, hashText: pasteAuditHash },
+        );
+        if (!queueReturn) continue;
+        if (queueReturn.audit.sendOperationKey && queueReturn.audit.sendAttemptId) {
+          const durableSettlement = agentSendReceiptStore.settleAttempt(
+            queueReturn.audit.sendOperationKey,
+            queueReturn.audit.sendAttemptId,
+            {
+              ...queueReturn.result,
+              operationKey: queueReturn.audit.sendOperationKey,
+              attemptId: queueReturn.audit.sendAttemptId,
+              provider: 'claude',
+              transcriptBoundary: queueReturn.audit.preSubmitBoundary || null,
+            },
+          );
+          if (durableSettlement?.record?.state
+            !== AGENT_SEND_DURABLE_STATES.PROVIDER_NOT_ACCEPTED) {
+            console.warn('[PasteAudit:QUEUE_RETURN_REJECTED] tab=' + String(tabId).slice(-12)
+              + ' handoff=' + queueReturn.audit.handoffId
+              + ' operation=' + String(queueReturn.audit.sendOperationKey).slice(0, 72)
+              + ' attempt=' + String(queueReturn.audit.sendAttemptId).slice(0, 12)
+              + ' reason=' + (durableSettlement?.reason || 'unknown'));
+            continue;
+          }
+        }
+        console.log('[PasteAudit:QUEUE_RETURNED] tab=' + String(tabId).slice(-12)
+          + ' handoff=' + queueReturn.audit.handoffId
+          + ' source=' + queueReturn.result.sourceIdentity
+          + ' enqueueOffset=' + String(queueReturn.result.recordByteOffset ?? '-')
+          + ' returnOffset=' + String(queueReturn.result.queueReturnRecordByteOffset ?? '-'));
+        finishClaudePasteAudit(tabId, queueReturn.audit, queueReturn.result);
+        if (!firstReturn) firstReturn = queueReturn;
+      }
+      if (firstReturn) {
+        return {
+          handoffId: firstReturn.audit.handoffId,
+          source: firstReturn.audit.source || null,
+          reason: firstReturn.result.canonicalReason,
+          deliveryStage: 'provider-queue-returned',
+          sendAttemptId: firstReturn.audit.sendAttemptId || null,
+          sendOperationKey: firstReturn.audit.sendOperationKey || null,
+          sessionId: firstReturn.result.sessionId,
+          sourceIdentity: firstReturn.result.sourceIdentity,
+        };
+      }
+    }
+    const queueSettlementSelections = selectClaudeLiveQueueSettlementAudits(
+      pendingAudits,
+      {
+        record,
+        byteOffset: recordByteOffset,
+        transcriptPath,
+        sessionId,
+      },
+      { hashText: pasteAuditHash },
+    );
+    if (queueSettlementSelections.length > 0) {
+      let firstConfirmation = null;
+      for (const settlementSelection of queueSettlementSelections) {
+        const settlementConfirmation = buildClaudeLiveQueueSettlementConfirmation(
+          settlementSelection,
+          { sessionId, hashText: pasteAuditHash },
+        );
+        if (!settlementConfirmation) continue;
+        const presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
+          toolType: 'claude',
+          sessionId: settlementConfirmation.result.sessionId,
+          entryUuid: null,
+          auditTimestamp: settlementConfirmation.result.auditTimestamp,
+          actualText: settlementConfirmation.actualText,
+          actualHash: settlementConfirmation.result.actualHash,
+          snapshot: settlementConfirmation.audit.presentationSnapshot,
+        });
+        console.log('[PasteAudit:QUEUE_CONSUMED] tab=' + String(tabId).slice(-12)
+          + ' handoff=' + settlementConfirmation.audit.handoffId
+          + ' operation=' + String(record?.operation || '-')
+          + ' source=' + settlementConfirmation.result.sourceIdentity
+          + ' settlementOffset=' + String(recordByteOffset ?? '-')
+          + ' presentationSaved=' + presentationSaved);
+        finishClaudePasteAudit(tabId, settlementConfirmation.audit, {
+          ...settlementConfirmation.result,
+          presentationSaved,
+        });
+        if (!firstConfirmation) firstConfirmation = settlementConfirmation;
+      }
+      if (firstConfirmation) {
+        return {
+          handoffId: firstConfirmation.audit.handoffId,
+          source: firstConfirmation.audit.source || null,
+          reason: firstConfirmation.result.canonicalReason,
+          deliveryStage: 'provider-queue-consumed',
+          sendAttemptId: firstConfirmation.audit.sendAttemptId || null,
+          sendOperationKey: firstConfirmation.audit.sendOperationKey || null,
+          sessionId: firstConfirmation.result.sessionId,
+          sourceIdentity: firstConfirmation.result.sourceIdentity,
+        };
+      }
+    }
     const queueOperationText = extractClaudeQueueOperationPromptText(record);
     const carrier = queueOperationText !== null
       ? { kind: 'queue-operation', text: queueOperationText }
       : extractClaudePromptCarrier(record);
     if (!carrier?.text) return null;
+    const queueSourceIdentity = queueOperationText !== null
+      ? claudeQueuePromptSourceIdentity(record, { sessionId, recordByteOffset })
+      : null;
     const selection = selectClaudeLivePromptOwner(
-      getPendingClaudePasteAudits(tabId),
+      pendingAudits,
       {
         record,
         text: carrier.text,
         promptCarrierKind: carrier.kind,
         byteOffset: recordByteOffset,
         transcriptPath,
+        queueSourceIdentity,
       },
       { hashText: pasteAuditHash },
     );
@@ -1832,6 +1980,7 @@ const transcriptService = createSessionTranscriptService({
           provider: 'claude',
           sessionId,
           entryUuid: record?.uuid || null,
+          sourceIdentity: queueSourceIdentity,
           recordByteOffset,
           acceptedAt: record?.timestamp || null,
         },
@@ -1882,6 +2031,12 @@ const transcriptService = createSessionTranscriptService({
       sendOperationKey: selection.audit.sendOperationKey || null,
       sessionId,
       entryUuid: record?.uuid || null,
+      ...(Number.isSafeInteger(Number(recordByteOffset)) && Number(recordByteOffset) >= 0
+        ? { recordByteOffset: Number(recordByteOffset) }
+        : {}),
+      ...((confirmation?.result?.sourceIdentity || queueSourceIdentity)
+        ? { sourceIdentity: confirmation?.result?.sourceIdentity || queueSourceIdentity }
+        : {}),
     };
   },
   onLiveMessage: (detail) => {
@@ -6263,6 +6418,43 @@ function computeActiveLoaders() {
     if (!operation?.tabId || seen.has(operation.tabId)) continue;
     loaders.push(operation);
     seen.add(operation.tabId);
+  }
+
+  // 7) Outstanding Run after / Loop promises. Everything above answers "is a
+  //    turn running right now?"; a queue chain is only finished when nothing is
+  //    owed. Between two links nobody runs — the trigger tab has finished and
+  //    the owner tab has not started — and that hole is a real state, not a
+  //    sampling artifact: measured 1.7s on 2026-08-16, wide enough for the
+  //    rebuild to land inside it and Ctrl+C a chain mid-flight. No number of
+  //    extra idle confirmations closes it; the promise itself has to be visible.
+  //
+  //    Read from the persisted snapshot the queue store writes: main keeps no
+  //    live copy of the renderer's queues, and a second copy would be one more
+  //    thing to drift. A small keyed SELECT + parse, once per poll.
+  //
+  //    Liveness is "the tab row still exists", NOT "the PTY is alive": an armed
+  //    queue legitimately waits on a stopped tab and launches it when its
+  //    trigger fires (seen live: `inactive → LAUNCH_FOR_QUEUE start-fresh`).
+  //    Only a genuinely closed tab's leftover row must be ignored, or it would
+  //    wedge every future rebuild.
+  try {
+    const queueBlockers = computePromptQueueInstallBlockers({
+      persistedQueues: projectManager?.db?.getAppState('promptQueueByTab') || null,
+      sharedLoopText: projectManager?.db?.getAppState('promptQueueSharedLoopPrompt') || null,
+      tabExists: (tabId) => !!tabRowFor(tabId),
+      labelFor,
+      seen,
+    });
+    for (const blocker of queueBlockers) {
+      loaders.push(blocker);
+      seen.add(blocker.tabId);
+    }
+  } catch (e) {
+    // Never fail the whole snapshot over the queue read. Losing this one
+    // contribution degrades to the previous behaviour; throwing would make
+    // /api/active-loaders answer 500, which observers treat as "not idle"
+    // anyway — but the running-turn blockers would be lost from the log.
+    console.warn('[ActiveLoaders] prompt-queue blockers unavailable: ' + (e?.message || String(e)));
   }
 
   return { idle: loaders.length === 0, count: loaders.length, loaders, ts: Date.now() };
@@ -14838,11 +15030,34 @@ async function _getAgentTurnResultForOrchestration({
       }
     }
   }
-  const claudeResult = materializeClaudeOrchestrationTurn(
-    match.turn,
-    data.recordMap,
-    maxChars,
-  );
+  const exactClaudeExecutionProof = targetExecutionContext?.provider === 'claude'
+    && !!targetExecutionContext.turnId
+    && !!promptUserUuid
+    && (!targetExecutionContext.sessionId || targetExecutionContext.sessionId === sessionId);
+  const claudeResult = exactClaudeExecutionProof
+    ? materializeClaudeOrchestrationExecution({
+        turns: data.turns,
+        startTurnIndex: match.turnIndex,
+        recordMap: data.recordMap,
+        resultBeforeAt,
+        maxChars,
+      })
+    : materializeClaudeOrchestrationTurn(
+        match.turn,
+        data.recordMap,
+        maxChars,
+      );
+  if (exactClaudeExecutionProof) {
+    console.log('[OrchestrationResultProof] Claude execution materialized'
+      + ' session=' + String(sessionId).slice(0, 12)
+      + ' turn=' + String(targetExecutionContext.turnId).slice(0, 24)
+      + ' start=' + match.turnIndex
+      + ' end=' + claudeResult.endTurnIndex
+      + ' queued=' + claudeResult.queuedContinuationCount
+      + ' boundary=' + claudeResult.boundaryReason
+      + ' complete=' + (claudeResult.complete === true)
+      + ' blocks=' + claudeResult.assistantBlockCount);
+  }
   return {
     found: true,
     complete: claudeResult.complete,
@@ -14854,6 +15069,7 @@ async function _getAgentTurnResultForOrchestration({
     truncated: claudeResult.truncated,
     assistantBlockCount: claudeResult.assistantBlockCount,
     internalContinuationCount: claudeResult.internalContinuationCount,
+    queuedContinuationCount: claudeResult.queuedContinuationCount || 0,
     sourceSnapshot: data.sourceSnapshot || null,
   };
 }
@@ -19192,7 +19408,21 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
     toolType,
     source: audit.source || null,
     success: result?.success === true,
+    cancelled: result?.cancelled === true,
     error: result?.error || null,
+    code: result?.code || null,
+    status: result?.status || null,
+    semanticStatus: result?.semanticStatus || null,
+    providerAccepted: typeof result?.providerAccepted === 'boolean'
+      ? result.providerAccepted
+      : null,
+    providerTurnCreated: typeof result?.providerTurnCreated === 'boolean'
+      ? result.providerTurnCreated
+      : null,
+    providerQueueReturned: result?.providerQueueReturned === true,
+    providerQueueOperation: result?.providerQueueOperation || null,
+    composerDraftState: result?.composerDraftState || null,
+    draftPreserved: result?.draftPreserved === true,
     late: audit.callerTimedOut === true,
     auditTimestamp: result?.auditTimestamp || null,
     actualHash: result?.actualHash || null,
@@ -33342,6 +33572,8 @@ const CODEX_WATCHER_SCAN_MS = 1000;
 const CODEX_TURN_CATCHUP_BYTES = 8 * 1024 * 1024;
 const CODEX_SYNC_MARKER = '\x1b[?2026l';
 const CODEX_STARTUP_AUTO_ENTER_TTL_MS = 45 * 1000;
+const CODEX_STARTUP_UPDATE_ACTION_MAX_ATTEMPTS = 3;
+const CODEX_STARTUP_UPDATE_ACTION_RETRY_MS = 120;
 const CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS = 15 * 1000;
 const CODEX_POST_TRUST_AUTO_ENTER_TTL_MS = 12 * 1000;
 const CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT = 20 * 1024;
@@ -42550,6 +42782,16 @@ function trackManualCodexRewindNavigationInput(tabId, data, {
     return;
   }
   if (control.owned) return;
+  // Enter has a dedicated synchronous/async confirmation path immediately
+  // after this tracker.  Do not revoke the causal observer here merely because
+  // the current frame is between two Codex redraws; that would destroy the
+  // exact source/action identity before the final flushed proof is read.
+  if (data === '\r' || data === '\n') {
+    console.log('[CodexWriterHandoff] defer candidate Enter to Rewind confirmation tab='
+      + String(tabId).slice(-12)
+      + ' frame=' + (frame.reason || frame.kind || 'unknown'));
+    return;
+  }
   if (control.kind === 'cancel') {
     cancelCodexWriterHandoffBeforeAction(tabId, 'manual-rewind-ui-cancelled');
   } else {
@@ -43996,6 +44238,8 @@ function armCodexStartupAutoEnter(tabId, {
     allowedPromptTypes,
     firedTypes: new Set(),
     fired: false,
+    actionInFlightPrompt: null,
+    updateActionAttempts: 0,
     timeout: null,
   };
   codexStartupAutoEnter.set(tabId, state);
@@ -44544,48 +44788,6 @@ function isCodexCwdChooser(cleanText) {
   return inspectCodexCwdChooser(cleanText).canAutoEnter;
 }
 
-function inspectCodexUpdatePrompt(cleanText) {
-  const text = String(cleanText || '').replace(/\u00a0/g, ' ');
-  const compact = text.toLowerCase().replace(/\s+/g, ' ');
-  const squashed = compact.replace(/[^a-z0-9]+/g, '');
-  const hasPhrase = (phrase) => squashed.includes(String(phrase).toLowerCase().replace(/[^a-z0-9]+/g, ''));
-  const firstOptionSelected = /[›❯>]\s*1\.\s*Update\s+now/i.test(text);
-  const secondOptionSelected = /[›❯>]\s*2\.\s*Skip(?!\s+until)/i.test(text);
-  const thirdOptionSelected = /[›❯>]\s*3\.\s*Skip\s+until\s+next\s+version/i.test(text);
-  const checks = {
-    title: hasPhrase('update available'),
-    updateNow: hasPhrase('update now'),
-    skip: hasPhrase('skip'),
-    skipUntilNext: hasPhrase('skip until next version'),
-    continueHint: hasPhrase('press enter to continue'),
-    installHint: hasPhrase('run npm install g openai codex to update'),
-    releaseNotes: hasPhrase('github com openai codex releases latest') || hasPhrase('see full release notes'),
-  };
-  const missing = Object.entries(checks)
-    .filter(([, ok]) => !ok)
-    .map(([key]) => key);
-  const interactiveVisible = checks.title && checks.updateNow && checks.skip && checks.skipUntilNext;
-  const passiveVisible = checks.title && (checks.installHint || checks.releaseNotes);
-  const visible = interactiveVisible || passiveVisible;
-  const canAutoSkip = interactiveVisible && checks.continueHint && (firstOptionSelected || secondOptionSelected) && !thirdOptionSelected;
-  let skipReason = null;
-  if (passiveVisible && !interactiveVisible) skipReason = 'passive-update-banner';
-  else if (visible && missing.length > 0) skipReason = 'missing:' + missing.join(',');
-  else if (visible && thirdOptionSelected) skipReason = 'skip-until-next-selected';
-  else if (visible && !firstOptionSelected && !secondOptionSelected) skipReason = 'skip-option-not-reachable';
-  return {
-    visible,
-    canAutoSkip,
-    interactiveVisible,
-    passiveVisible,
-    firstOptionSelected,
-    secondOptionSelected,
-    thirdOptionSelected,
-    missing,
-    skipReason,
-  };
-}
-
 async function maybeAdoptCodexStartupAutoEnterFromLivePrompt(tabId, inspected, source = 'stream') {
   if (!tabId
     || codexStartupAutoEnter.has(tabId)
@@ -44713,6 +44915,133 @@ function isCodexUpdatePrompt(cleanText) {
   return inspectCodexUpdatePrompt(cleanText).canAutoSkip;
 }
 
+async function performCodexStartupUpdateAutoSkip({
+  tabId,
+  state,
+  expectedTerm,
+  expectedRunSeq,
+  expectedInputRevision,
+} = {}) {
+  const currentBoundary = (screenAvailable, cleanText = '') => ({
+    sameTerminal: !!expectedTerm && terminals.get(tabId) === expectedTerm,
+    sameRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0) === expectedRunSeq,
+    sameInputRevision: getTerminalInputRevision(tabId) === expectedInputRevision,
+    screenAvailable,
+    cleanText,
+  });
+  const writeGuard = (phase) => {
+    if (codexStartupAutoEnter.get(tabId) !== state) {
+      return { allowed: false, reason: 'startup-state-changed', phase };
+    }
+    const boundary = currentBoundary(true);
+    if (!boundary.sameTerminal) return { allowed: false, reason: 'terminal-changed', phase };
+    if (!boundary.sameRunSeq) return { allowed: false, reason: 'run-changed', phase };
+    if (!boundary.sameInputRevision) return { allowed: false, reason: 'input-changed', phase };
+    return { allowed: true, reason: 'same-startup-boundary', phase };
+  };
+
+  let screen;
+  try {
+    screen = await readCodexAuthoritativeScreen(tabId, 'startup-update-action');
+  } catch (error) {
+    screen = { success: false, error: error?.message || String(error) };
+  }
+  if (codexStartupAutoEnter.get(tabId) !== state) {
+    return { success: false, reason: 'startup-state-changed', retryable: false };
+  }
+  let admission = decideCodexUpdatePromptAction({
+    ...currentBoundary(screen?.success === true, screen?.clean || ''),
+  });
+  if (!admission.allowed) {
+    const alreadyDismissed = decideCodexUpdatePromptDismissal({
+      ...currentBoundary(screen?.success === true, screen?.clean || ''),
+    });
+    if (alreadyDismissed.allowed) {
+      return { success: true, reason: 'prompt-already-dismissed' };
+    }
+    return {
+      success: false,
+      reason: admission.reason,
+      retryable: admission.reason === 'screen-unavailable',
+      screenError: screen?.error || null,
+    };
+  }
+
+  if (admission.action === 'select-skip') {
+    console.log('[CodexStartupPrompt] writing ArrowDown tab=' + String(tabId).slice(-12)
+      + ' prompt=update-available stage=select-skip');
+    const selected = await sendCodexKeyAndCapture(
+      expectedTerm,
+      '\x1b[B',
+      2500,
+      '[CodexStartupPrompt:UpdateSelect:' + String(tabId).slice(-12) + ']',
+      (cleanText) => decideCodexUpdatePromptAction({
+        ...currentBoundary(true, cleanText),
+      }).action === 'confirm-skip',
+      {
+        tabId,
+        authoritativeScreen: true,
+        writeGuard,
+        writePhase: 'update-select-skip',
+      },
+    );
+    if (selected?.writeAborted) {
+      return { success: false, reason: selected.error || 'select-write-refused', retryable: false };
+    }
+    admission = decideCodexUpdatePromptAction({
+      ...currentBoundary(true, selected?.clean || ''),
+    });
+    if (!admission.allowed || admission.action !== 'confirm-skip') {
+      const dismissedAfterSelection = decideCodexUpdatePromptDismissal({
+        ...currentBoundary(true, selected?.clean || ''),
+      });
+      if (dismissedAfterSelection.allowed) {
+        return { success: true, reason: 'prompt-dismissed-after-selection' };
+      }
+      return {
+        success: false,
+        reason: admission.reason || 'skip-selection-not-confirmed',
+        retryable: admission.reason === 'update-selected'
+          || admission.reason === 'skip-option-not-reachable'
+          || admission.reason === 'prompt-closed'
+          || selected?.timedOut === true,
+      };
+    }
+  }
+
+  console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12)
+    + ' prompt=update-available stage=confirm-skip');
+  const dismissed = await sendCodexKeyAndCapture(
+    expectedTerm,
+    '\r',
+    3000,
+    '[CodexStartupPrompt:UpdateConfirm:' + String(tabId).slice(-12) + ']',
+    (cleanText) => decideCodexUpdatePromptDismissal({
+      ...currentBoundary(true, cleanText),
+    }).allowed === true,
+    {
+      tabId,
+      authoritativeScreen: true,
+      writeGuard,
+      writePhase: 'update-confirm-skip',
+    },
+  );
+  if (dismissed?.writeAborted) {
+    return { success: false, reason: dismissed.error || 'confirm-write-refused', retryable: false };
+  }
+  const dismissal = decideCodexUpdatePromptDismissal({
+    ...currentBoundary(true, dismissed?.clean || ''),
+  });
+  if (!dismissal.allowed) {
+    return {
+      success: false,
+      reason: dismissal.reason,
+      retryable: dismissal.reason === 'prompt-still-visible' || dismissed?.timedOut === true,
+    };
+  }
+  return { success: true, reason: dismissal.reason };
+}
+
 function isCodexTrustDirectoryPrompt(cleanText) {
   const text = String(cleanText || '').replace(/\u00a0/g, ' ');
   const compact = text.toLowerCase().replace(/\s+/g, ' ');
@@ -44755,6 +45084,7 @@ function detectCodexStartupAutoEnterPrompt(cleanText, state) {
 function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
   const state = codexStartupAutoEnter.get(tabId);
   if (!state) return;
+  if (state.actionInFlightPrompt) return;
   const ageMs = Date.now() - state.armedAt;
   if (ageMs > CODEX_STARTUP_AUTO_ENTER_TTL_MS) {
     clearCodexStartupAutoEnter(tabId, 'expired-on-data');
@@ -44883,8 +45213,11 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
   const expectedTerm = terminals.get(tabId) || null;
   const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   const expectedInputRevision = getTerminalInputRevision(tabId);
-  state.firedTypes.add(promptType);
-  state.fired = true;
+  state.actionInFlightPrompt = promptType;
+  if (promptType !== 'update-available') {
+    state.firedTypes.add(promptType);
+    state.fired = true;
+  }
   const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 260);
   console.log('[CodexStartupPrompt] detected tab=' + String(tabId).slice(-12) +
     ' command=' + (state.command || 'unknown') +
@@ -44894,7 +45227,7 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
     ' ageMs=' + ageMs +
     ' rawBytes=' + rawBytes +
     ' preview=' + JSON.stringify(preview) +
-    ' — sending Enter in 120ms');
+    ' — starting confirmed action in 120ms');
   setTimeout(async () => {
     const current = codexStartupAutoEnter.get(tabId);
     if (current !== state) return;
@@ -44902,30 +45235,55 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
     let wroteAction = false;
     if (term) {
       if (promptType === 'update-available') {
-        let actionFrame = clean;
-        if (state.source === 'live-process-adoption') {
-          const latestRaw = codexTuiReadyBuffers.get(tabId) || '';
-          const latestClean = cleanCodexTuiFrame(latestRaw);
-          const latestInspected = inspectCodexInputReadyFrame(latestClean, latestRaw);
-          const latestFrame = typeof latestInspected?.sampleText === 'string'
-            ? latestInspected.sampleText
-            : '';
-          const latestUpdatePrompt = inspectCodexUpdatePrompt(latestFrame);
-          if (!Array.isArray(latestInspected?.blockers)
-            || !latestInspected.blockers.includes('update-prompt')
-            || !latestUpdatePrompt.canAutoSkip) {
-            console.log('[CodexStartupPrompt] live action cancelled after final revalidation tab=' + String(tabId).slice(-12)
-              + ' reason=' + (latestInspected?.reason || latestUpdatePrompt.skipReason || 'update-picker-changed'));
-            clearCodexStartupAutoEnter(tabId, 'live-update-picker-changed');
+        state.updateActionAttempts = Number(state.updateActionAttempts || 0) + 1;
+        const outcome = await performCodexStartupUpdateAutoSkip({
+          tabId,
+          state,
+          expectedTerm,
+          expectedRunSeq,
+          expectedInputRevision,
+        });
+        if (codexStartupAutoEnter.get(tabId) !== state) return;
+        state.actionInFlightPrompt = null;
+        if (!outcome.success) {
+          const attempt = state.updateActionAttempts;
+          console.warn('[CodexStartupPrompt] update skip not confirmed tab=' + String(tabId).slice(-12)
+            + ' attempt=' + attempt
+            + ' reason=' + outcome.reason
+            + (outcome.screenError ? ' screenError=' + outcome.screenError : ''));
+          if (outcome.retryable && attempt < CODEX_STARTUP_UPDATE_ACTION_MAX_ATTEMPTS) {
+            setTimeout(async () => {
+              if (codexStartupAutoEnter.get(tabId) !== state || state.actionInFlightPrompt) return;
+              const retryScreen = await readCodexAuthoritativeScreen(
+                tabId,
+                'startup-update-retry-' + (attempt + 1),
+              );
+              if (codexStartupAutoEnter.get(tabId) !== state || retryScreen?.success !== true) return;
+              tryHandleCodexStartupAutoEnter(tabId, '', {
+                cleanSnapshot: retryScreen.clean,
+                source: 'update-retry-' + (attempt + 1),
+              });
+            }, CODEX_STARTUP_UPDATE_ACTION_RETRY_MS);
             return;
           }
-          actionFrame = latestFrame;
+          clearCodexStartupAutoEnter(tabId, 'update-unconfirmed-' + outcome.reason);
+          queueMicrotask(() => {
+            const launch = codexLastRunCommandPayload.get(tabId) || null;
+            if (launch?.launchId && launch?.startedAt) {
+              surfaceCodexStartupTimeoutIfDue(
+                tabId,
+                launch.launchId,
+                launch.startedAt,
+                'update-action-unconfirmed',
+              );
+            }
+          });
+          return;
         }
-        const updatePrompt = inspectCodexUpdatePrompt(actionFrame);
-        const sequence = updatePrompt.secondOptionSelected ? '\r' : '\x1b[B\r';
-        const action = updatePrompt.secondOptionSelected ? 'enter-skip' : 'down-enter-skip';
-        console.log('[CodexStartupPrompt] writing ' + action + ' tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
-        term.write(sequence);
+        state.firedTypes.add(promptType);
+        state.fired = true;
+        resetCodexTuiReadyDetection(tabId, 'startup-prompt-' + promptType);
+        wroteAction = true;
       } else if (promptType === 'model-migration') {
         let currentScreen;
         try {
@@ -45011,8 +45369,11 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
         console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
         term.write('\r');
       }
-      resetCodexTuiReadyDetection(tabId, 'startup-prompt-' + promptType);
-      wroteAction = true;
+      if (promptType !== 'update-available') {
+        resetCodexTuiReadyDetection(tabId, 'startup-prompt-' + promptType);
+        wroteAction = true;
+        state.actionInFlightPrompt = null;
+      }
     } else {
       console.warn('[CodexStartupPrompt] terminal missing before startup prompt action tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
     }
@@ -45032,6 +45393,14 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
           : CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS;
       scheduleCodexStartupAutoEnterTimeout(tabId, state, nextTtl);
       console.log('[CodexStartupPrompt] keep armed tab=' + String(tabId).slice(-12) + ' reason=await-' + remainingPromptTypes.join(',') + ' ttlMs=' + nextTtl);
+      void readCodexAuthoritativeScreen(tabId, 'startup-next-prompt-after-' + promptType)
+        .then((nextScreen) => {
+          if (codexStartupAutoEnter.get(tabId) !== state || nextScreen?.success !== true) return;
+          tryHandleCodexStartupAutoEnter(tabId, '', {
+            cleanSnapshot: nextScreen.clean,
+            source: 'post-' + promptType,
+          });
+        });
       return;
     }
     clearCodexStartupAutoEnter(tabId, 'confirmed-' + promptType);

@@ -49,6 +49,48 @@ test('native queue enqueue is projected immediately and dequeue settles the same
   assert.equal(settled[0].queueStatus, 'sent');
 });
 
+test('popAll hides returned prompts and its replay cannot cancel a newer queue item', () => {
+  const queued = reduceHistoryLiveProjection([], {
+    ...enqueue(),
+    recordByteOffset: 20,
+  }, { includeUserText: true });
+  const popAll = {
+    ...envelope({
+      type: 'queue-operation',
+      operation: 'popAll',
+      uuid: 'provider-popall-1',
+      timestamp: '2026-07-28T10:00:01.000Z',
+      sessionId,
+    }),
+    recordByteOffset: 40,
+  };
+  const returned = reduceHistoryLiveProjection(queued, popAll, { includeUserText: true });
+  assert.equal(returned.length, 0);
+  assert.deepEqual(buildHistoryLivePresentation([], returned), []);
+
+  const nextPrompt = 'NEW PROMPT AFTER RETURN';
+  const withNewQueue = reduceHistoryLiveProjection(returned, {
+    ...envelope({
+      type: 'queue-operation',
+      operation: 'enqueue',
+      uuid: 'provider-enqueue-2',
+      content: nextPrompt,
+      timestamp: '2026-07-28T10:00:02.000Z',
+      sessionId,
+    }),
+    recordByteOffset: 60,
+  }, { includeUserText: true });
+  const replayed = reduceHistoryLiveProjection(withNewQueue, popAll, { includeUserText: true });
+  assert.equal(
+    replayed.find((entry) => entry.content === nextPrompt)?.queueStatus,
+    'queued',
+  );
+  assert.deepEqual(
+    buildHistoryLivePresentation([], replayed).map((entry) => entry.content),
+    [nextPrompt],
+  );
+});
+
 test('queued_command replaces its matching synthetic queue row with one canonical user row', () => {
   const queued = reduceHistoryLiveProjection([], enqueue(), { includeUserText: true });
   const canonical = reduceHistoryLiveProjection(queued, envelope({
@@ -105,6 +147,34 @@ test('canonical live user hands off to its durable row without a duplicate or bl
   }];
   assert.deepEqual(buildHistoryLivePresentation(durable, live), durable);
   assert.deepEqual(reconcileCommittedHistoryLiveProjection(live, durable).entries, []);
+});
+
+test('cold replay canonical user is covered by a durable queue carrier for the same exact record', () => {
+  const canonicalUuid = '30b526f6-b514-45ab-8b5e-d0fb0d952ee1';
+  const queueSourceIdentity = 'claude-queue:offset:b11c2736-91c8-4981-a664-f020597c750b:101027488';
+  const durable = [{
+    uuid: canonicalUuid,
+    role: 'user',
+    timestamp: '2026-08-16T12:32:20.000Z',
+    content: prompt,
+    sessionId,
+    sourceIdentity: queueSourceIdentity,
+    queueStatus: 'sent',
+  }];
+  const live = [{
+    uuid: canonicalUuid,
+    role: 'user',
+    timestamp: '2026-08-16T12:32:20.000Z',
+    content: prompt,
+    sessionId,
+    queueStatus: 'sent',
+  }];
+
+  assert.strictEqual(buildHistoryLivePresentation(durable, live), durable);
+  const reconciled = reconcileCommittedHistoryLiveProjection(live, durable);
+  assert.deepEqual(reconciled.entries, []);
+  assert.equal(reconciled.durableIdentities.has(queueSourceIdentity), true);
+  assert.equal(reconciled.durableIdentities.has('user-uuid:' + canonicalUuid), true);
 });
 
 test('durable queue-operation row replaces the same live interim row by exact queue identity', () => {

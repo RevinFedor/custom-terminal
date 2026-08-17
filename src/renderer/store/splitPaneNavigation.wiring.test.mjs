@@ -115,31 +115,30 @@ test('closing a TAB empties its pane; only "remove from workspace" deletes the p
   assert.match(removeFromSplit, /removePaneByTab\(splitPanes, splitFocusedIndex, tabId\)/);
 });
 
-// ── Left click brings the project along ───────────────────────────────────
+// ── One pointer: activation brings the sidebar along ──────────────────────
 
-test('the chip navigates to the tab AND its project', () => {
-  // Panes are cross-project, so this chip can name a tab the sidebar is not
-  // showing. activateCenterTab deliberately never moves the sidebar.
-  assert.match(chrome, /activateTabAndProject\(projectId, tabId\)/);
-  assert.doesNotMatch(
-    chrome,
-    /onClick=\{\(e\) => \{[\s\S]{0,600}?activateCenterTab\(projectId, tabId\)/,
-    'the chip must not use the tab-only path for its left click',
-  );
+test('the chip uses the single activation path — activation itself moves the sidebar', () => {
+  // One-pointer model: switchTab writes BOTH activeProjectId and
+  // focusedProjectId (activationFollowPatch), so the chip needs no special
+  // project-following method. activateTabAndProject is gone.
+  assert.match(chrome, /activateCenterTab\(projectId, tabId\)/);
+  assert.doesNotMatch(chrome, /activateTabAndProject\(/);
+  assert.doesNotMatch(store, /activateTabAndProject/);
 });
 
-test('project moves before the tab, so the reveal lands in the right list', () => {
-  const activate = block(
-    store,
-    'activateTabAndProject: (projectId, tabId) => {',
-    '\n  isRestoring:',
-  );
-  const showAt = activate.indexOf('showWorkspace(projectId)');
-  const activateAt = activate.indexOf('activateCenterTab(projectId, tabId)');
-  assert.ok(showAt >= 0 && activateAt > showAt,
-    'showWorkspace must run first — it is the only writer of the sidebar pointer');
-  // A tab that no longer exists must not move the sidebar to its project.
-  assert.match(activate, /if \(!workspace \|\| !workspace\.tabs\.has\(tabId\)\) return;/);
+test('switchTab moves both pointers together', () => {
+  const patch = block(store, 'const activationFollowPatch = (', '\n);');
+  assert.match(patch, /activeProjectId: projectId, focusedProjectId: projectId/);
+  // No-op guard: both already there → empty patch, no re-render.
+  assert.match(patch, /st\.activeProjectId === projectId && st\.focusedProjectId === projectId/);
+  // switchTab is the single consumer — every activation funnels through it.
+  assert.match(store, /\.\.\.activationFollowPatch\(get\(\), projectId\)/);
+});
+
+test('an explicit project click still parks the sidebar without touching the centre', () => {
+  const show = block(store, 'showWorkspace: (projectId) => {', '\n  },');
+  assert.match(show, /focusedProjectId: projectId/);
+  assert.doesNotMatch(show, /switchTab\(/, 'a project click must not swap the visible tab');
 });
 
 test('a right click opens the menu without navigating anywhere', () => {
@@ -194,13 +193,14 @@ test('the click that dismisses a menu does not also focus the pane', () => {
   assert.match(onDown, /if \(notePointerDownForDismissal\(document\)\) return;/);
 });
 
-test('tab switching everywhere else still leaves the sidebar alone', () => {
-  // The whole reason this is a separate method: activateCenterTab is the rule
-  // for every other surface and must keep NOT moving the project.
+test('activateCenterTab delegates the sidebar move to switchTab, not showWorkspace', () => {
+  // The sidebar follows activation INSIDE switchTab (one write, no project
+  // navigation side effects like the project-history reshuffle showWorkspace
+  // does). activateCenterTab must not duplicate it.
   const activateCenter = block(
     store,
     'activateCenterTab: (projectId, tabId) => {',
-    '\n\n  activateTabAndProject:',
+    '\n\n  isRestoring:',
   );
   assert.doesNotMatch(activateCenter, /showWorkspace\(/);
   assert.doesNotMatch(activateCenter, /focusedProjectId:/);
@@ -236,41 +236,31 @@ test('setSplitPaneTab and addTabToSplit touch the global history themselves', ()
   }
 });
 
-// ── Per-pane Ctrl+Tab ─────────────────────────────────────────────────────
+// ── Global Ctrl+Tab (per-pane scope removed 2026-08-17) ───────────────────
 
 const switcher = fs.readFileSync(
   path.join(here, '..', 'components', 'Workspace', 'TabSwitcherOverlay.tsx'),
   'utf8',
 );
 
-test('the switcher scope is resolved ONCE at open, not read per keystroke', () => {
-  // Scope must not shift under the keys mid-cycle: the rows are already drawn
-  // from one history, and a scope that re-derives on every step would swap the
-  // list out from under the selection.
-  const openCtrl = block(switcher, 'const openCtrl = useCallback(', '}, []);');
-  assert.match(openCtrl, /resolveSwitcherScope\(/);
-  assert.match(openCtrl, /setPaneScope\(/);
-  // The step branch only moves the index.
-  const stepBranch = block(switcher, "if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'Tab')", 'return;');
-  assert.doesNotMatch(stepBranch, /resolveSwitcherScope\(/);
+test('the switcher is global-only: no pane scope anywhere', () => {
+  // Per-pane Ctrl+Tab was removed: the user picks tabs by the sidebar's map,
+  // and a pane-local journal answered a question nobody asked. The jump into a
+  // visible pane lives in switchTab (resolveSplitActivation), not here.
+  assert.doesNotMatch(switcher, /paneScope/);
+  assert.doesNotMatch(switcher, /resolveSwitcherScope/);
+  assert.doesNotMatch(switcher, /workspaceOwnsKeyboard/);
 });
 
-test('the fast tap resolves the pane scope too', () => {
-  // Ctrl can be released before React renders; without this the classic
-  // A-to-B toggle would silently fall back to the GLOBAL history even though
-  // the user was working inside a pane.
-  const keyUp = block(switcher, 'const onKeyUp = (e: KeyboardEvent) => {', '\n    };');
-  const resolveAt = keyUp.indexOf('resolveSwitcherScope(');
-  const globalAt = keyUp.indexOf('initialCtrlIndex(');
-  assert.ok(resolveAt >= 0, 'fast tap must resolve the scope');
-  assert.ok(globalAt > resolveAt, 'the global fallback comes AFTER the pane branch');
-});
-
-test('a pane list is anchored at its pane, never at the window corner', () => {
-  // Same lesson as the toast fix: a surface about one pane must appear at that
-  // pane. Here it also answers "whose history am I walking".
-  assert.match(switcher, /data-terminal-pane-wrapper\]\[data-split-pane-index="\$\{paneScope\.paneIndex\}"/);
-  assert.match(switcher, /data-tab-switcher-scope/);
+test('a visible tab is a legal Ctrl+Tab target — the model does not skip on-screen tabs', () => {
+  // Committing a visible tab JUMPS focus to its pane; skipping it would make
+  // "one Ctrl+Tab back after an accidental pane click" impossible.
+  const model = fs.readFileSync(
+    path.join(here, '..', 'utils', 'tabSwitcherModel.mjs'),
+    'utf8',
+  );
+  const initial = block(model, 'export function initialCtrlIndex(', '\n}');
+  assert.doesNotMatch(initial, /onScreen/);
 });
 
 test('middle click forgets a row and does NOT navigate or close the window', () => {
@@ -279,10 +269,7 @@ test('middle click forgets a row and does NOT navigate or close the window', () 
   const commitAt = rowDown.indexOf('commitRow(row)');
   assert.ok(forgetAt >= 0 && commitAt > forgetAt, 'the middle-click branch must precede the pick');
   assert.match(rowDown, /if \(e\.button === 1\) \{ forgetRow\(row\); return; \}/);
-  // forgetRow routes by scope: the pane list edits the pane, the global list
-  // edits the global order.
   const forget = block(switcher, 'const forgetRow = useCallback(', '}, []);');
-  assert.match(forget, /forgetPaneTabVisit\(/);
   assert.match(forget, /forgetGlobalTabVisit\(/);
 });
 
@@ -290,7 +277,7 @@ test('forgetting a global row clears the durable stamp too', () => {
   // Restore derives the order from each tab lastActivatedAt and uses the saved
   // array only for unstamped tabs — clearing just the array would let the
   // entry come back on the next launch.
-  const forget = block(store, 'forgetGlobalTabVisit: (projectId, tabId) => {', '\n\n  forgetPaneTabVisit:');
+  const forget = block(store, 'forgetGlobalTabVisit: (projectId, tabId) => {', '\n  },');
   assert.match(forget, /delete tab\.lastActivatedAt/);
   assert.match(forget, /dropFromMru\(/);
 });

@@ -81,10 +81,14 @@ const {
 const {
   buildDelegationResultTarget,
   isAgentStatusBusyForClose,
+  isOrchestrationDeliveryIdentityCompatible,
   resolveOrchestrationDeliveryAdmission,
   resolveNewAgentTabPlacement,
   resolveOrchestrationSendOptions,
 } = require('./orchestration-request-plan');
+const {
+  createOrchestrationDeliverySingleFlight,
+} = require('./orchestration-delivery-single-flight');
 const {
   findTaskCompletionBlockers,
 } = require('./task-completion-intent');
@@ -285,7 +289,16 @@ const orchestrationCompletionInflight = new Set();
 const orchestrationCompletionTrailing = new Set();
 const orchestrationNotificationInflight = new Set();
 const orchestrationAutoStopInflight = new Set();
-const orchestrationDeliveryInflight = new Set();
+const orchestrationDeliverySingleFlight = createOrchestrationDeliverySingleFlight({
+  onEvent(event, detail) {
+    console.log('[OrchestrationDeliveryWake] event=' + event
+      + ' run=' + String(detail?.runId || '-').slice(0, 12)
+      + ' reason=' + String(detail?.request?.reason || '-')
+      + ' status=' + String(detail?.request?.targetStatus?.status
+        || detail?.request?.targetStatus?.sessionStatus
+        || '-'));
+  },
+});
 const closedAgentRestoreInflight = new Map();
 const agentSendReceiptRegistry = createAgentSendReceiptRegistry({
   onEvict(detail) {
@@ -2017,6 +2030,7 @@ async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
     baselineBusy: false,
     sessionId: sendResult?.sessionId || acceptedRuntime?.sessionId || targetStatus?.sessionId || null,
     lifecycleGeneration: acceptedRuntime?.lifecycleGeneration || targetStatus?.lifecycleGeneration || null,
+    launchGeneration: acceptedRuntime?.launchGeneration || targetStatus?.launchGeneration || null,
     auditPending: sendReceipt.state === 'audit-pending',
   });
   emitOrchestrationRun(accepted, reason + '-delivery-accepted');
@@ -2027,12 +2041,20 @@ async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
 async function dispatchDeferredOrchestrationRun(runId, {
   reason = 'delivery-wake',
   targetStatus = null,
+  singleFlightOwned = false,
 } = {}) {
-  if (!runId || orchestrationDeliveryInflight.has(runId)) {
-    return { dispatched: false, deferred: true, reason: 'delivery-already-inflight' };
+  if (!runId) {
+    return { dispatched: false, deferred: false, reason: 'run-id-required' };
   }
-  orchestrationDeliveryInflight.add(runId);
-  try {
+  if (!singleFlightOwned) {
+    return orchestrationDeliverySingleFlight.run(runId, { reason, targetStatus }, (attempt) => (
+      dispatchDeferredOrchestrationRun(runId, {
+        ...attempt,
+        singleFlightOwned: true,
+      })
+    ));
+  }
+
     const store = getOrchestrationRunStore();
     const current = await store.getInternal(runId);
     if (!current || isTerminalStatus(current.status)) {
@@ -2042,22 +2064,57 @@ async function dispatchDeferredOrchestrationRun(runId, {
       return { dispatched: false, deferred: false, reason: 'delivery-already-crossed-enter', run: await store.get(runId) };
     }
 
-    const status = targetStatus
-      || await resolveAgentSessionInfo(current.targetTabId, 2000).catch(() => null);
-    const deliveryAdmission = resolveOrchestrationDeliveryAdmission(status);
+    let status = targetStatus
+      || await resolveAgentSessionInfo(current.targetTabId, 2000, {
+        onLateStatus: (lateStatus) => {
+          if (!isOrchestrationDeliveryIdentityCompatible(current, lateStatus)) {
+            console.warn('[OrchestrationDeliveryWake] rejected late status identity run=' + current.runId
+              + ' target=' + shortId(current.targetTabId, 12));
+            return;
+          }
+          void dispatchDeferredOrchestrationRun(current.runId, {
+            reason: 'late-runtime-status',
+            targetStatus: lateStatus,
+          }).catch((error) => {
+            console.warn('[OrchestrationDeliveryWake] late status dispatch failed run=' + current.runId
+              + ' error=' + String(error?.message || error));
+          });
+        },
+      }).catch(() => null);
+    if (status && !isOrchestrationDeliveryIdentityCompatible(current, status)) {
+      console.warn('[OrchestrationDeliveryWake] rejected runtime status identity run=' + current.runId
+        + ' target=' + shortId(current.targetTabId, 12));
+      status = null;
+    }
+    let deliveryAdmission = resolveOrchestrationDeliveryAdmission(status);
     if (!deliveryAdmission.canDispatch) {
       const deferred = await store.deferDelivery(runId, {
         reason: deliveryAdmission.reason,
         sessionId: status?.sessionId || null,
         lifecycleGeneration: status?.lifecycleGeneration || null,
+        launchGeneration: status?.launchGeneration || null,
       });
       emitOrchestrationRun(deferred, reason + '-deferred');
-      return { dispatched: false, deferred: true, reason: 'target-not-idle', run: deferred };
+      const exactStatus = typeof readAgentStartReadiness === 'function'
+        ? await readAgentStartReadiness(current.targetTabId).catch(() => null)
+        : null;
+      const exactAdmission = resolveOrchestrationDeliveryAdmission(exactStatus);
+      if (!exactAdmission.canDispatch
+        || !isOrchestrationDeliveryIdentityCompatible(current, exactStatus)) {
+        return { dispatched: false, deferred: true, reason: 'target-not-idle', run: deferred };
+      }
+      console.log('[OrchestrationDeliveryWake] event=exact-readiness-recheck'
+        + ' run=' + current.runId
+        + ' reason=' + deliveryAdmission.reason
+        + ' status=' + String(exactStatus?.status || exactStatus?.sessionStatus || '-'));
+      status = exactStatus;
+      deliveryAdmission = exactAdmission;
     }
 
     const claimed = await store.claimDeferredDelivery(runId, {
       sessionId: status?.sessionId || null,
       lifecycleGeneration: status?.lifecycleGeneration || null,
+      launchGeneration: status?.launchGeneration || null,
     });
     if (!claimed.claimed) {
       if (claimed.reason === 'delivery-outcome-unknown') {
@@ -2159,12 +2216,9 @@ async function dispatchDeferredOrchestrationRun(runId, {
       sendResult,
       run: appliedReceipt.run,
     };
-  } finally {
-    orchestrationDeliveryInflight.delete(runId);
-  }
 }
 
-async function dispatchNextDeferredOrchestrationForTarget(tabId, reason = 'target-idle') {
+async function dispatchNextDeferredOrchestrationForTarget(tabId, reason = 'target-idle', targetStatus = null) {
   if (!tabId) return null;
   const store = getOrchestrationRunStore();
   const candidates = (await store.listAll())
@@ -2173,7 +2227,7 @@ async function dispatchNextDeferredOrchestrationForTarget(tabId, reason = 'targe
   for (const candidate of candidates) {
     const internal = await store.getInternal(candidate.runId);
     if (!internal?.deliveryIntent) continue;
-    return dispatchDeferredOrchestrationRun(candidate.runId, { reason });
+    return dispatchDeferredOrchestrationRun(candidate.runId, { reason, targetStatus });
   }
   return null;
 }
@@ -3207,7 +3261,11 @@ async function processOrchestrationLifecycle(tabId, payload) {
       ? resolveOrchestrationDeliveryAdmission(payload)
       : null;
     if (payload.type === 'done' || snapshotAdmission?.canDispatch === true) {
-      await dispatchNextDeferredOrchestrationForTarget(tabId, 'target-idle-lifecycle');
+      await dispatchNextDeferredOrchestrationForTarget(
+        tabId,
+        'target-idle-lifecycle',
+        payload.type === 'snapshot' ? payload : null,
+      );
     }
     void scheduleOrchestrationPolicyTimer();
   } catch (error) {
@@ -4177,7 +4235,7 @@ function bridgeRequest(action, payload, timeoutMs = 5000, {
   });
 }
 
-async function resolveAgentSessionInfo(tabId, timeoutMs = 1500) {
+async function resolveAgentSessionInfo(tabId, timeoutMs = 1500, { onLateStatus = null } = {}) {
   let info = null;
   try {
     // Orchestration needs the live presence snapshot (status/inputReady), not
@@ -4185,7 +4243,13 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500) {
     // truthfully identify a Claude tab while leaving lifecycle absent; treating
     // that shape as `unknown` strands every durable delivery in the server
     // queue even though the composer is already ready.
-    info = await bridgeRequest('getClaudeTabStatus', { tabId }, timeoutMs);
+    info = await bridgeRequest('getClaudeTabStatus', { tabId }, timeoutMs, {
+      onLateReply: typeof onLateStatus === 'function'
+        ? ({ ok, data }) => {
+            if (ok && data) return onLateStatus(data);
+          }
+        : null,
+    });
   } catch {}
   const overlayMainCodexRuntime = async (base = {}, historicalSessionId = null) => {
     let runtime = null;
@@ -4866,6 +4930,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       await getOrchestrationRunStore().patch(run.runId, {
         status: 'sending',
         sessionId: targetStatus?.sessionId || null,
+        targetLaunchGeneration: targetStatus?.launchGeneration || null,
       });
       emitOrchestrationRun(await getOrchestrationRunStore().get(run.runId), 'sending');
 
@@ -4903,6 +4968,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           reason: predecessorBlocksDelivery ? 'predecessor-not-materialized' : 'target-busy',
           sessionId: targetStatus?.sessionId || null,
           lifecycleGeneration: targetStatus?.lifecycleGeneration || null,
+          launchGeneration: targetStatus?.launchGeneration || null,
         });
         emitOrchestrationRun(queued, 'delivery-deferred');
         // Close the race where the predecessor became fully idle between the

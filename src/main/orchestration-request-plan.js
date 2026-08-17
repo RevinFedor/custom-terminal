@@ -109,6 +109,29 @@ function resolveOrchestrationDeliveryAdmission(status = {}) {
   };
 }
 
+function isOrchestrationDeliveryIdentityCompatible(run = {}, status = {}) {
+  const expectedTool = run.targetToolType || null;
+  const observedTool = status.toolType || status.commandType || null;
+  if (expectedTool && observedTool && expectedTool !== observedTool) return false;
+
+  const expectedSession = run.sessionId || null;
+  const observedSession = status.sessionId || null;
+  if (expectedSession && observedSession && expectedSession !== observedSession) return false;
+
+  const expectedLifecycleGeneration = run.targetLifecycleGeneration || null;
+  const observedLifecycleGeneration = status.lifecycleGeneration || null;
+  if (expectedLifecycleGeneration
+    && observedLifecycleGeneration
+    && expectedLifecycleGeneration !== observedLifecycleGeneration) return false;
+
+  const expectedLaunchGeneration = run.targetLaunchGeneration || null;
+  const observedLaunchGeneration = status.launchGeneration || null;
+  if (expectedLaunchGeneration
+    && observedLaunchGeneration
+    && expectedLaunchGeneration !== observedLaunchGeneration) return false;
+  return true;
+}
+
 function isAgentStatusBusyForClose(status) {
   const lifecycle = status?.status || status?.sessionStatus || 'unknown';
   return status?.busy === true
@@ -131,6 +154,7 @@ function buildDelegationResultTarget(run) {
 module.exports = {
   buildDelegationResultTarget,
   isAgentStatusBusyForClose,
+  isOrchestrationDeliveryIdentityCompatible,
   normalizePlacement,
   resolveOrchestrationDeliveryAdmission,
   resolveNewAgentTabPlacement,

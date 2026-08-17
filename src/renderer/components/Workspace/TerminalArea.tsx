@@ -22,7 +22,6 @@ import {
 } from '../../utils/sessionStartingState.mjs';
 import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
 import { isEmptyPane, paneIsStacked, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
-import { shouldSwallowFirstPaneClick } from '../../utils/paneFirstClickGuard.mjs';
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
@@ -1097,8 +1096,6 @@ function TerminalArea({
       ? s.splitFocusedIndex
       : -1
   ));
-  // Armed by a swallowed first press, consumed by the click that follows it.
-  const swallowNextClickRef = useRef(false);
   useEffect(() => {
     if (splitPaneCount === 0) return;
     const onPointerDown = (e: PointerEvent) => {
@@ -1119,67 +1116,18 @@ function TerminalArea({
       if (!el) return;
       const idx = Number(el.getAttribute('data-split-pane-index'));
       const st = useWorkspaceStore.getState();
-      // The first click into an UNFOCUSED pane selects it and stops there: the
-      // transcript is full of things that catch a click (a thinking block, a
-      // bash output, any expandable card), and expanding one as a side effect
-      // of "go here" changes content the user never asked to change.
+      // The click both FOCUSES the pane and reaches whatever is under it.
       //
-      // Two surfaces still receive that first click, because their target is
-      // unambiguous by itself: the TERMINAL (a click there places the cursor /
-      // selects text, in a pane or in the side frame alike) and the INPUT
-      // (swallowing it would demand two clicks before typing).
-      //
-      // Swallowing happens on pointerdown in the CAPTURE phase — before the
-      // transcript's own handlers see it, which is the only place where "the
-      // click never reached the card" is true rather than "the card already
-      // reacted".
-      if (shouldSwallowFirstPaneClick({
-        target: e.target as Element | null,
-        paneIndex: idx,
-        focusedIndex: st.splitFocusedIndex,
-        button: e.button,
-      })) {
-        e.preventDefault();
-        e.stopPropagation();
-        // `click` is a SEPARATE event: stopping pointerdown does not stop it,
-        // and the expanders listen on click. So the swallow is armed here and
-        // executed by the click/mouse listeners below — stopping only
-        // pointerdown would have looked like a fix while every card still
-        // expanded.
-        swallowNextClickRef.current = true;
-        if (Number.isFinite(idx)) st.focusSplitPane(idx);
-        return;
-      }
-      swallowNextClickRef.current = false;
+      // There used to be a swallow here: the first click into an unfocused pane
+      // only selected it, so a stray hit could not expand a thinking block as a
+      // side effect of "go here". Removed by request (2026-08-17) — in practice
+      // it read as a dead click, and the accidental expansion it prevented is
+      // cheaper to undo than a click that does nothing.
       if (Number.isFinite(idx) && idx !== st.splitFocusedIndex) st.focusSplitPane(idx);
     };
-    // The armed swallow consumes exactly ONE gesture, on window in the capture
-    // phase — before any transcript handler runs.
-    const swallowIfArmed = (e: Event) => {
-      if (!swallowNextClickRef.current) return;
-      if ((e as MouseEvent).button !== undefined && (e as MouseEvent).button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.type === 'click') swallowNextClickRef.current = false;
-    };
-    // A press that never became a click (drag out of the pane, right-click
-    // after, focus lost) must not leave the guard armed for a later, unrelated
-    // click — that would look like a random dead click minutes later.
-    const disarm = () => { swallowNextClickRef.current = false; };
     window.addEventListener('pointerdown', onPointerDown, true);
-    window.addEventListener('mousedown', swallowIfArmed, true);
-    window.addEventListener('mouseup', swallowIfArmed, true);
-    window.addEventListener('click', swallowIfArmed, true);
-    window.addEventListener('pointercancel', disarm, true);
-    window.addEventListener('blur', disarm);
     return () => {
       window.removeEventListener('pointerdown', onPointerDown, true);
-      window.removeEventListener('mousedown', swallowIfArmed, true);
-      window.removeEventListener('mouseup', swallowIfArmed, true);
-      window.removeEventListener('click', swallowIfArmed, true);
-      window.removeEventListener('pointercancel', disarm, true);
-      window.removeEventListener('blur', disarm);
-      swallowNextClickRef.current = false;
     };
   }, [splitPaneCount]);
 

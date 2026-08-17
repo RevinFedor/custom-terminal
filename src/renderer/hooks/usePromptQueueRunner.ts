@@ -18,6 +18,7 @@ import {
 import {
   beginHistoryPromptHandoff,
   getHistoryPromptHandoffsSnapshot,
+  historyPromptAuditIsProviderQueueReturn,
   historyPromptHandoffAcceptsAuditIdentity,
   historyPromptHandoffAuditProofFromSendResult,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
@@ -1238,6 +1239,14 @@ export function usePromptQueueRunner() {
           queueStatus: 'sent',
           reason: detail.late === true ? 'late-audit-confirmed' : 'audit-confirmed',
           proof,
+          requiresAuditIdentity: true,
+        });
+        return;
+      }
+      if (historyPromptAuditIsProviderQueueReturn(detail)) {
+        settleHistoryPromptHandoff(auditTabId, handoffId, {
+          queueStatus: 'cancelled',
+          reason: 'provider-queue-returned-to-terminal-composer',
           requiresAuditIdentity: true,
         });
         return;

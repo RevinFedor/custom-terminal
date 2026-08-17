@@ -418,3 +418,31 @@ test('volatile overlay byte budget rejects one huge optimistic prompt', () => {
   }), false);
   assert.deepEqual(cache.stats(), { owners: 0, items: 0, approxBytes: 0, keys: [] });
 });
+
+test('mid-size giant routes to the protected pool instead of starving normal tabs', () => {
+  // The 16.08 15:31 gap: a 45MB Claude projection fit the 64MB normal pool,
+  // occupied ~70% of it, and every other tab's write evicted it — each
+  // 2998↔2912 return re-parsed 7323 rows cold. With the threshold it must
+  // live in the oversized pool and survive normal-pool churn.
+  const cache = new HistorySnapshotCache({
+    maxBytes: 64_000,
+    maxEntries: 100,
+    maxSnapshots: 8,
+    maxOversizedBytes: 360_000,
+    maxOversizedSnapshots: 3,
+    oversizedThresholdBytes: 32_000,
+  });
+  const giant = owner('claude-45mb');
+  const giantEntries = [{ uuid: 'g', content: 'g'.repeat(22_000) }]; // ~45k with overhead
+  assert.equal(cache.set(giant, { entries: giantEntries }).stored, true);
+
+  // Churn the normal pool well past its budget: the giant must not be touched.
+  for (let index = 0; index < 6; index += 1) {
+    cache.set(owner('normal-' + index), {
+      entries: [{ uuid: 'n' + index, content: 'n'.repeat(4_000) }],
+    });
+  }
+  assert.equal(cache.get(giant)?.entries, giantEntries);
+  // And the normal pool kept its own recent owners (no giant squatting).
+  assert.equal(cache.has(owner('normal-5')), true);
+});

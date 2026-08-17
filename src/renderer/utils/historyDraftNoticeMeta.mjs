@@ -29,6 +29,26 @@ export function getHistoryDraftNoticeMeta(message) {
       tone: 'info',
     };
   }
+  // A STOPPED SEND is a fact about the send, even when the sentence also asks the
+  // user to look at image placeholders. It has to be classified here, ABOVE the
+  // attachment rule, because the two classes are presented in different places:
+  // an attachment problem gets a wide block above the input (it must show an
+  // exact slot and file path), while a stopped send belongs on the composer's
+  // border next to «Resuming» / «Stopping» — it is the same kind of thing as
+  // those, a state of the send.
+  //
+  // The bug this ordering fixes: «Terminal draft found — send stopped, text moved
+  // to top. Review image placeholders.» matched the image rule first, so a
+  // stopped send was announced as an attachment problem in its own block at the
+  // top of the composer (user: «это тоже семантическая ошибка, она не должна
+  // появляться отдельно вверху»). The mention of placeholders is an aside; the
+  // subject of the sentence is that nothing was sent.
+  if (/terminal draft found|another terminal draft|text moved to top|send stopped/i.test(value)) {
+    return {
+      label: 'Send stopped · draft moved',
+      tone: 'warning',
+    };
+  }
   if (/\bimage(?:\s+#?\d+)?\b|imageError|image attachment|image marker|image file|картинк|вложени/i.test(value)) {
     return {
       label: 'Image needs attention',
@@ -44,12 +64,6 @@ export function getHistoryDraftNoticeMeta(message) {
   if (/delivery is unconfirmed/i.test(value)) {
     return {
       label: 'Delivery unconfirmed',
-      tone: 'warning',
-    };
-  }
-  if (/terminal draft found|another terminal draft|text moved to top/i.test(value)) {
-    return {
-      label: 'Send stopped · draft moved',
       tone: 'warning',
     };
   }

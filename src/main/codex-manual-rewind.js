@@ -118,7 +118,7 @@ function classifyManualCodexRewindControlInput({
     if (frame?.kind === 'native-rewind-confirm') {
       return { owned: true, kind: 'confirm', reason: 'rewind-confirm-control' };
     }
-    if (framePending === true) {
+    if (framePending === true || frame?.possibleRewind === true) {
       return { owned: true, kind: 'confirm-pending', reason: 'rewind-confirm-frame-pending' };
     }
     return { owned: false, kind: 'ordinary-input', reason: 'rewind-frame-unproven' };
@@ -206,15 +206,33 @@ function classifyManualCodexEnterFrame(snapshot) {
     const occupiedEndX = Number(row?.occupiedEndX);
     const isExactResponsivePrefix = row.text.length >= minimumResponsiveFooter.length
       && responsiveEditFooter.startsWith(row.text);
-    const isNarrowRightEdgeClip = Number.isFinite(cols)
+    // xterm reports the physical cell boundary, while normalizeManualRewindText
+    // collapses Codex's double-space groups.  The normalized canonical footer
+    // is therefore shorter than the same row on screen.  Prove truncation by
+    // the physical right edge instead of comparing cols with normalized text
+    // length (the production 70-column frame ended in "messa").
+    const isRightEdgeClip = Number.isFinite(cols)
       && cols > 0
-      && cols < responsiveEditFooter.length
       && Number.isFinite(occupiedEndX)
+      // Codex reserves a small responsive gutter on some widths; the exact
+      // prefix plus the full title/selection/footer geometry remains required.
       && occupiedEndX >= cols - 8;
-    return isExactResponsivePrefix && isNarrowRightEdgeClip;
+    return isExactResponsivePrefix && isRightEdgeClip;
   };
   const hasTranscriptTitle = titleRows.some(({ row }) => (
     Number.isFinite(row) && Number.isFinite(activeRow) && row < activeRow
+  ));
+  const scrollFooterRows = normalizedRows.filter((row) => (
+    scrollFooterPattern.test(row.text)
+    && Number.isFinite(row.row)
+    && Number.isFinite(activeRow)
+    && row.row > activeRow
+  ));
+  const editFooterRows = normalizedRows.filter((row) => (
+    editFooterMatches(row)
+    && Number.isFinite(row.row)
+    && Number.isFinite(activeRow)
+    && row.row > activeRow
   ));
   const hasTranscriptFooter = normalizedRows.some((row, index) => {
     if (!scrollFooterPattern.test(row.text)) return false;
@@ -231,6 +249,14 @@ function classifyManualCodexEnterFrame(snapshot) {
   const activePromptProven = active?.hasInverse === true
     && Number.isFinite(activeRow)
     && selectedText.length > 0;
+  // A candidate observer plus the exact title, active inverse selection and
+  // either native footer row is strong evidence that Enter belongs to Rewind.
+  // It is not enough to mutate history, but it is enough to stop the key from
+  // falling through as an ordinary submit while the frame is incomplete.
+  const possibleRewind = snapshot?.success === true
+    && hasTranscriptTitle
+    && activePromptProven
+    && (scrollFooterRows.length > 0 || editFooterRows.length > 0);
 
   if (snapshot?.success === true && hasTranscriptChrome && activePromptProven) {
     return {
@@ -244,6 +270,7 @@ function classifyManualCodexEnterFrame(snapshot) {
   return {
     kind: 'ordinary-enter',
     proven: false,
+    possibleRewind,
     selectedText: '',
     selectedRow: null,
     reason: snapshot?.success !== true
@@ -327,6 +354,9 @@ function decideManualCodexRewindEnterWrite({
     }
     if (candidateObserver && frame?.reason === 'headless-screen-unavailable') {
       return { handled: true, writeEnter: false, reason: 'rewind-screen-unavailable' };
+    }
+    if (candidateObserver && frame?.possibleRewind === true) {
+      return { handled: true, writeEnter: false, reason: 'rewind-frame-incomplete' };
     }
     return { handled: false, writeEnter: false, reason: 'ordinary-enter' };
   }

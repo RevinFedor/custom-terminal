@@ -316,9 +316,6 @@ export default function Dashboard() {
   };
 
   return (
-    // data-dashboard-root: keyboard-owner marker (keyboardOwnerGesture.mjs) —
-    // a press here moves the keyboard OUT of the workspace, so Ctrl+Tab goes
-    // back to the global list.
     <div data-dashboard-root className="flex-1 flex flex-col bg-bg-main overflow-hidden">
       <div className="flex-1 overflow-y-auto overflow-x-hidden px-6 pb-6 pt-12">
         {/* All Projects Section */}

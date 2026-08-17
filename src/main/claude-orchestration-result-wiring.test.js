@@ -29,5 +29,10 @@ test('Claude result proof materializes the continuation-aware turn projection', 
   const reader = mainSource.slice(start, end);
 
   assert.match(reader, /materializeClaudeOrchestrationTurn\(/);
+  assert.match(reader, /targetExecutionContext\?\.provider === 'claude'/);
+  assert.match(reader, /materializeClaudeOrchestrationExecution\(\{/);
+  assert.match(reader, /resultBeforeAt,/);
+  assert.match(reader, /\[OrchestrationResultProof\] Claude execution materialized/);
   assert.match(reader, /internalContinuationCount: claudeResult\.internalContinuationCount/);
+  assert.match(reader, /queuedContinuationCount: claudeResult\.queuedContinuationCount \|\| 0/);
 });

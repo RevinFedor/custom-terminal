@@ -1,7 +1,10 @@
 'use strict';
 
 const path = require('path');
-const { historyActionHeadline } = require(path.join(__dirname, '..', 'shared', 'history-action-grammar.cjs'));
+const {
+  historyActionHeadline,
+  historyActionPresentationMeta,
+} = require(path.join(__dirname, '..', 'shared', 'history-action-grammar.cjs'));
 
 function normalizePositiveInt(value, fallback = null, max = 20_000) {
   if (value == null || value === '') return fallback;
@@ -155,6 +158,15 @@ function stubActionSummary(actions) {
     if (!action || typeof action !== 'object') continue;
     if (action.tool === '__raw__' && action.rawTool) {
       const raw = action.rawTool;
+      const presentation = historyActionPresentationMeta({
+        toolName: raw.toolName,
+        args: raw.args,
+        family: raw.family,
+        bashWord: raw.bashWord,
+        bashDetail: raw.bashDetail,
+        mcpServer: raw.mcpServer,
+        mcpMethod: raw.mcpMethod,
+      });
       summary.push({
         toolUseId: raw.toolUseId,
         toolName: raw.toolName,
@@ -168,6 +180,11 @@ function stubActionSummary(actions) {
         // would yield it are exactly what a stub omits). Kept to the last two
         // path segments — the digest never shows a full path.
         subject: stubActionSubject(raw),
+        aggregateKey: presentation.aggregateKey,
+        targetKey: presentation.targetKey,
+        targetLabel: presentation.targetLabel,
+        operationLabel: presentation.operationLabel,
+        docsKind: presentation.docsKind,
         isError: raw.isError === true ? true : undefined,
       });
     } else if (action.tool === 'Task') {
@@ -212,6 +229,10 @@ function makeHistoryRowStub(entry) {
   // Whether the row has visible text matters to grouping (text ends a series);
   // ship the fact without the content.
   if (typeof entry.content === 'string' && entry.content.trim()) stub.hasContent = true;
+  // Reasoning text is heavy and stays dehydrated, but its structural presence
+  // and duration participate in grouping exactly like a hydrated row.
+  if (typeof entry.thinking === 'string' && entry.thinking.trim()) stub.hasThinking = true;
+  if (entry.thinkingSeconds !== undefined) stub.thinkingSeconds = entry.thinkingSeconds;
   const actionSummary = stubActionSummary(entry.actions);
   if (actionSummary) stub.actionSummary = actionSummary;
   return stub;

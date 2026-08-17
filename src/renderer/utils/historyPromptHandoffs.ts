@@ -64,6 +64,18 @@ export interface HistoryPromptHandoffAuditProof {
   canonicalReason?: string;
 }
 
+/**
+ * Exact identity of the native Claude queue item that accepted this send.
+ * Enqueue proves ownership, not yet a canonical user turn, so this remains
+ * separate from `auditProof` until the queue item is consumed.
+ */
+export interface HistoryPromptHandoffProviderQueueProof {
+  sourceIdentity: string;
+  sessionId: string | null;
+  entryUuid?: string;
+  recordByteOffset?: number;
+}
+
 export interface HistoryPromptHandoff {
   tabId: string;
   handoffId: string;
@@ -82,6 +94,7 @@ export interface HistoryPromptHandoff {
   statusChangedAt: number;
   requiresAuditIdentity: boolean;
   auditProof: Readonly<HistoryPromptHandoffAuditProof> | null;
+  providerQueueProof: Readonly<HistoryPromptHandoffProviderQueueProof> | null;
 }
 
 export interface BeginHistoryPromptHandoffInput {
@@ -99,6 +112,7 @@ export interface BeginHistoryPromptHandoffInput {
   statusAtSend?: HistoryPromptHandoffAgentStatus;
   initialStatus?: Extract<HistoryPromptHandoffStatus, 'preparing' | 'sending' | 'queued'>;
   requiresAuditIdentity?: boolean;
+  initialProviderQueueProof?: HistoryPromptHandoffProviderQueueProof | null;
   /** Durable remount only: seed the first observable snapshot at its receipt state. */
   initialReceipt?: SettleHistoryPromptHandoffInput;
 }
@@ -119,6 +133,7 @@ export interface BindHistoryPromptHandoffSendIdentityInput {
 export interface AcceptHistoryPromptHandoffProviderQueueInput
   extends BindHistoryPromptHandoffSendIdentityInput {
   changedAt?: number;
+  proof?: HistoryPromptHandoffProviderQueueProof | null;
 }
 
 export interface DurableHistorySendReceiptRecord {
@@ -325,6 +340,23 @@ export function historyPromptHandoffAcceptsAuditIdentity(
   return true;
 }
 
+/** Exact provider evidence that Claude moved this queue item back to its TUI composer. */
+export function historyPromptAuditIsProviderQueueReturn(
+  audit: Record<string, unknown> | null | undefined,
+): boolean {
+  return audit?.success === false
+    && audit?.cancelled === true
+    && audit?.semanticStatus === 'not-submitted'
+    && audit?.providerAccepted === false
+    && audit?.providerTurnCreated === false
+    && audit?.providerQueueReturned === true
+    && audit?.providerQueueOperation === 'popAll'
+    && audit?.composerDraftState === 'exact-provider-queue-return'
+    && audit?.draftPreserved === true
+    && typeof audit?.sourceIdentity === 'string'
+    && audit.sourceIdentity.startsWith('claude-queue:');
+}
+
 export const DEFAULT_HISTORY_PROMPT_HANDOFF_LIMITS:
   Readonly<HistoryPromptHandoffStoreLimits> = Object.freeze({
     maxTabs: 16,
@@ -364,7 +396,11 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
     + stringBytes(value.source)
     + stringBytes(value.statusAtSend)
     + stringBytes(value.queueStatus)
-    + stringBytes(value.statusReason);
+    + stringBytes(value.statusReason)
+    + stringBytes(value.providerQueueProof?.sourceIdentity)
+    + stringBytes(value.providerQueueProof?.sessionId)
+    + stringBytes(value.providerQueueProof?.entryUuid)
+    + stringBytes(value.providerQueueProof?.recordByteOffset);
   for (const chip of value.promptChips) {
     bytes += RECORD_OVERHEAD_BYTES
       + stringBytes(chip.id)
@@ -460,6 +496,61 @@ function freezeProof(
   });
 }
 
+function freezeProviderQueueProof(
+  proof: HistoryPromptHandoffProviderQueueProof | null | undefined,
+): Readonly<HistoryPromptHandoffProviderQueueProof> | null {
+  if (!proof) return null;
+  const sourceIdentity = String(proof.sourceIdentity || '').trim();
+  if (!sourceIdentity) return null;
+  return Object.freeze({
+    sourceIdentity,
+    sessionId: typeof proof.sessionId === 'string' ? proof.sessionId : null,
+    ...(typeof proof.entryUuid === 'string' && proof.entryUuid
+      ? { entryUuid: proof.entryUuid }
+      : {}),
+    ...(Number.isSafeInteger(Number(proof.recordByteOffset))
+      && Number(proof.recordByteOffset) >= 0
+      ? { recordByteOffset: Number(proof.recordByteOffset) }
+      : {}),
+  });
+}
+
+function mergeCompatibleProviderQueueProof(
+  current: Readonly<HistoryPromptHandoffProviderQueueProof> | null,
+  incoming: HistoryPromptHandoffProviderQueueProof | null | undefined,
+): Readonly<HistoryPromptHandoffProviderQueueProof> | null {
+  if (!incoming) return current;
+  const frozenIncoming = freezeProviderQueueProof(incoming);
+  if (!frozenIncoming) return current;
+  if (!current) return frozenIncoming;
+  const conflicts = current.sourceIdentity !== frozenIncoming.sourceIdentity
+    || (!!current.sessionId
+      && !!frozenIncoming.sessionId
+      && current.sessionId !== frozenIncoming.sessionId)
+    || (!!current.entryUuid
+      && !!frozenIncoming.entryUuid
+      && current.entryUuid !== frozenIncoming.entryUuid)
+    || (current.recordByteOffset !== undefined
+      && frozenIncoming.recordByteOffset !== undefined
+      && current.recordByteOffset !== frozenIncoming.recordByteOffset);
+  if (conflicts) return current;
+  if (
+    current.sessionId === (current.sessionId || frozenIncoming.sessionId)
+    && current.entryUuid === (current.entryUuid || frozenIncoming.entryUuid)
+    && current.recordByteOffset === (
+      current.recordByteOffset ?? frozenIncoming.recordByteOffset
+    )
+  ) {
+    return current;
+  }
+  return freezeProviderQueueProof({
+    sourceIdentity: current.sourceIdentity,
+    sessionId: current.sessionId || frozenIncoming.sessionId,
+    entryUuid: current.entryUuid || frozenIncoming.entryUuid,
+    recordByteOffset: current.recordByteOffset ?? frozenIncoming.recordByteOffset,
+  });
+}
+
 function mergeCompatibleAuditProof(
   current: Readonly<HistoryPromptHandoffAuditProof> | null,
   incoming: HistoryPromptHandoffAuditProof | null | undefined,
@@ -506,6 +597,7 @@ function freezeHandoff(value: HistoryPromptHandoff): Readonly<HistoryPromptHando
     promptChips: Object.freeze(value.promptChips.map(freezeChip)),
     imagePaths: Object.freeze(value.imagePaths.map(freezeImageRef)),
     auditProof: freezeProof(value.auditProof),
+    providerQueueProof: freezeProviderQueueProof(value.providerQueueProof),
   });
 }
 
@@ -535,14 +627,15 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
   handoff: Readonly<HistoryPromptHandoff>,
 ): TRow {
   const proof = handoff.auditProof;
+  const queueProof = handoff.providerQueueProof;
   const timestamp = submittedTimestamp(handoff.submittedAt, row.timestamp);
   const auditSessionId = proof?.sessionId || undefined;
-  const sessionId = auditSessionId || row.sessionId;
+  const sessionId = auditSessionId || queueProof?.sessionId || row.sessionId;
   const auditTimestamp = proof?.auditTimestamp || undefined;
   const auditHash = proof?.actualHash || undefined;
   const auditEntryUuid = proof?.entryUuid || undefined;
-  const sourceIdentity = proof?.sourceIdentity || undefined;
-  const recordByteOffset = proof?.recordByteOffset;
+  const sourceIdentity = proof?.sourceIdentity || queueProof?.sourceIdentity || undefined;
+  const recordByteOffset = proof?.recordByteOffset ?? queueProof?.recordByteOffset;
 
   if (
     row.handoffId === handoff.handoffId
@@ -779,6 +872,7 @@ export class HistoryPromptHandoffStore {
           requiresAuditIdentity: existing.value.requiresAuditIdentity
             || input.requiresAuditIdentity === true,
           auditProof: freezeProof(initialReceipt?.proof),
+          providerQueueProof: freezeProviderQueueProof(input.initialProviderQueueProof),
         });
         const nextBytes = estimateHandoffBytes(next);
         this.approxBytes += nextBytes - existing.approxBytes;
@@ -829,6 +923,7 @@ export class HistoryPromptHandoffStore {
         : submittedAt,
       requiresAuditIdentity: input.requiresAuditIdentity !== false,
       auditProof: freezeProof(initialReceipt?.proof),
+      providerQueueProof: freezeProviderQueueProof(input.initialProviderQueueProof),
     });
     const approxBytes = estimateHandoffBytes(value);
     if (approxBytes > this.limits.maxBytes) return undefined;
@@ -927,10 +1022,15 @@ export class HistoryPromptHandoffStore {
       current.value.statusChangedAt,
       finiteTimestamp(input.changedAt, Date.now()),
     );
+    const providerQueueProof = mergeCompatibleProviderQueueProof(
+      current.value.providerQueueProof,
+      input.proof,
+    );
     if (
       current.value.queueStatus === 'queued'
       && current.value.statusReason === 'provider-queue-accepted'
       && current.value.statusChangedAt === statusChangedAt
+      && current.value.providerQueueProof === providerQueueProof
     ) {
       return current.value;
     }
@@ -939,6 +1039,7 @@ export class HistoryPromptHandoffStore {
       queueStatus: 'queued',
       statusReason: 'provider-queue-accepted',
       statusChangedAt,
+      providerQueueProof,
     });
     const approxBytes = estimateHandoffBytes(next);
     if (approxBytes > this.limits.maxBytes) return undefined;
@@ -1550,6 +1651,14 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
       restorableDraft: promptText,
     };
   }
+  if (record.state === 'provider-not-accepted') {
+    return {
+      hydrated: false,
+      reason: receipt.providerQueueReturned === true
+        ? 'durable-history-send-returned-to-terminal-composer'
+        : 'durable-history-send-provider-not-accepted',
+    };
+  }
   if (
     Number.isFinite(Number(receipt.presentationDismissedAt))
     && receipt.presentationDismissedSurface === 'desktop-history'
@@ -1569,6 +1678,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   const exactProviderQueueAccepted = (
     record.state === 'audit-pending'
     || record.state === 'enter-armed'
+    || record.state === 'delivery-unknown'
   )
     && providerQueue.accepted === true
     && providerQueue.provider === 'claude'
@@ -1594,10 +1704,36 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     : (typeof auditIdentity.entryUuid === 'string' ? auditIdentity.entryUuid : '');
   const sourceIdentity = typeof receipt.sourceIdentity === 'string' && receipt.sourceIdentity
     ? receipt.sourceIdentity
-    : (typeof auditIdentity.sourceIdentity === 'string' ? auditIdentity.sourceIdentity : '');
+    : (typeof auditIdentity.sourceIdentity === 'string' && auditIdentity.sourceIdentity
+      ? auditIdentity.sourceIdentity
+      : (typeof providerQueue.sourceIdentity === 'string' ? providerQueue.sourceIdentity : ''));
   const recordByteOffset = Number.isSafeInteger(Number(receipt.recordByteOffset))
     && Number(receipt.recordByteOffset) >= 0
     ? Number(receipt.recordByteOffset)
+    : (Number.isSafeInteger(Number(providerQueue.recordByteOffset))
+      && Number(providerQueue.recordByteOffset) >= 0
+      ? Number(providerQueue.recordByteOffset)
+      : null);
+  const providerQueueEntryUuid = typeof providerQueue.entryUuid === 'string'
+    && providerQueue.entryUuid
+    ? providerQueue.entryUuid
+    : '';
+  const providerQueueSourceIdentity = typeof providerQueue.sourceIdentity === 'string'
+    && providerQueue.sourceIdentity
+    ? providerQueue.sourceIdentity
+    : (providerQueueEntryUuid ? `claude-queue:uuid:${providerQueueEntryUuid}` : '');
+  const initialProviderQueueProof = exactProviderQueueAccepted && providerQueueSourceIdentity
+    ? {
+        sourceIdentity: providerQueueSourceIdentity,
+        sessionId: typeof providerQueue.sessionId === 'string'
+          ? providerQueue.sessionId
+          : (typeof record.sessionId === 'string' ? record.sessionId : null),
+        ...(providerQueueEntryUuid ? { entryUuid: providerQueueEntryUuid } : {}),
+        ...(Number.isSafeInteger(Number(providerQueue.recordByteOffset))
+          && Number(providerQueue.recordByteOffset) >= 0
+          ? { recordByteOffset: Number(providerQueue.recordByteOffset) }
+          : {}),
+      }
     : null;
   if (queueStatus === 'sent' && !entryUuid && !sourceIdentity) {
     // Legacy confirmed receipts already prove transcript delivery, but older
@@ -1665,6 +1801,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     source: typeof receipt.source === 'string' ? receipt.source : 'history-panel',
     statusAtSend: 'unknown',
     requiresAuditIdentity: true,
+    initialProviderQueueProof,
     ...(initialReceipt ? { initialReceipt } : {}),
   });
   if (!begun) return { hydrated: false, reason: 'durable-history-handoff-bounds' };
@@ -1673,13 +1810,22 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     sendOperationKey: operationKey,
   });
   if (!bound.ok) return { hydrated: false, reason: bound.reason };
+  const hydratedHandoff = initialProviderQueueProof
+    && bound.handoff.providerQueueProof?.sourceIdentity !== initialProviderQueueProof.sourceIdentity
+    ? acceptHistoryPromptHandoffProviderQueue(tabId, handoffId, {
+        sendAttemptId: attemptId,
+        sendOperationKey: operationKey,
+        proof: initialProviderQueueProof,
+        changedAt: Number(record.updatedAt) || Date.now(),
+      }) || bound.handoff
+    : bound.handoff;
 
   if (!queueStatus) {
-    return { hydrated: true, reason: 'durable-history-send-active', handoff: bound.handoff };
+    return { hydrated: true, reason: 'durable-history-send-active', handoff: hydratedHandoff };
   }
   return {
     hydrated: true,
     reason: 'durable-history-receipt-hydrated',
-    handoff: bound.handoff,
+    handoff: hydratedHandoff,
   };
 }

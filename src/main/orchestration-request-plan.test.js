@@ -3,6 +3,7 @@ const test = require('node:test');
 const {
   buildDelegationResultTarget,
   isAgentStatusBusyForClose,
+  isOrchestrationDeliveryIdentityCompatible,
   resolveOrchestrationDeliveryAdmission,
   resolveNewAgentTabPlacement,
   resolveOrchestrationSendOptions,
@@ -131,6 +132,56 @@ test('ready idle target enters delivery without another launch', () => {
     requiresRuntimeLaunch: false,
     reason: null,
   });
+});
+
+test('a readiness wake belongs to the same provider session and generation', () => {
+  const run = {
+    targetToolType: 'claude',
+    sessionId: 'session-a',
+    targetLifecycleGeneration: 'generation-a',
+    targetLaunchGeneration: 'launch-a',
+  };
+  assert.equal(isOrchestrationDeliveryIdentityCompatible(run, {
+    toolType: 'claude',
+    sessionId: 'session-a',
+    lifecycleGeneration: 'generation-a',
+    launchGeneration: 'launch-a',
+  }), true);
+  assert.equal(isOrchestrationDeliveryIdentityCompatible(run, {
+    toolType: 'codex',
+    sessionId: 'session-a',
+    lifecycleGeneration: 'generation-a',
+    launchGeneration: 'launch-a',
+  }), false);
+  assert.equal(isOrchestrationDeliveryIdentityCompatible(run, {
+    toolType: 'claude',
+    sessionId: 'session-b',
+    lifecycleGeneration: 'generation-a',
+    launchGeneration: 'launch-a',
+  }), false);
+  assert.equal(isOrchestrationDeliveryIdentityCompatible(run, {
+    toolType: 'claude',
+    sessionId: 'session-a',
+    lifecycleGeneration: 'generation-b',
+    launchGeneration: 'launch-a',
+  }), false);
+  assert.equal(isOrchestrationDeliveryIdentityCompatible(run, {
+    toolType: 'claude',
+    sessionId: 'session-a',
+    lifecycleGeneration: 'generation-a',
+    launchGeneration: 'launch-b',
+  }), false);
+});
+
+test('missing optional identity does not invent a contradiction', () => {
+  assert.equal(isOrchestrationDeliveryIdentityCompatible({
+    targetToolType: 'claude',
+    sessionId: null,
+  }, {
+    toolType: 'claude',
+    sessionId: 'new-session',
+    launchGeneration: 'launch-4',
+  }), true);
 });
 
 test('close guard treats active as idle and lifecycle transitions as busy', () => {

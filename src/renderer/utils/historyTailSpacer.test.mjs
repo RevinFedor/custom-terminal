@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import {
   createHistoryTailSpacer,
   historyContentDistanceFromBottom,
+  historyTailReserveDeficitAfterShrink,
 } from './historyTailSpacer.mjs';
 
 test('arm keeps the larger reserve; burn shrinks by travelled distance only', () => {
@@ -48,4 +49,60 @@ test('onChange publishes every transition with its reason', () => {
   spacer.burn(40);
   spacer.reset('new-rows');
   assert.deepEqual(events, [[100, 'collapse'], [60, 'burn'], [0, 'new-rows']]);
+});
+
+test('streaming growth burns only the refilled height, not the whole reserve', () => {
+  // 16.08 live: collapsing near the bottom armed ~400px; then the LAST block
+  // kept streaming and each durable refresh hard-zeroed the reserve — the
+  // visual gap vanished and the frame jumped. The reconciliation contract:
+  // reserve follows the clamp deficit downward, exactly.
+  const spacer = createHistoryTailSpacer({});
+  spacer.arm(400, 'collapse-hold');
+  // Layout-effect reconciliation math (mirrors HistoryPanel): content grew by
+  // 150px → deficit shrinks from 400 to 250 → burn the difference.
+  const scroller = { scrollHeight: 1000 + spacer.get(), scrollTop: 800, clientHeight: 450 };
+  const contentBottom = scroller.scrollHeight - spacer.get();
+  const deficit = Math.round(scroller.scrollTop + scroller.clientHeight - contentBottom);
+  assert.equal(deficit, 250);
+  spacer.burn(spacer.get() - deficit);
+  assert.equal(spacer.get(), 250, 'reserve shrinks by the grown height only');
+  // Growth that refills everything → deficit <= 2 → full reset.
+  spacer.reset('content-refilled');
+  assert.equal(spacer.get(), 0);
+});
+
+test('preview shrink deficit uses the pre-change reading position after browser clamp', () => {
+  // The reader was at 800. Removing a 150px preview clamps the live scrollTop
+  // to 650 before React sees the new DOM. Only the captured pre-change value
+  // proves how much blank reserve is required to keep the frame stationary.
+  const clampedScroller = { scrollHeight: 1100, scrollTop: 650, clientHeight: 450 };
+  assert.equal(
+    historyTailReserveDeficitAfterShrink(clampedScroller, 800),
+    150,
+  );
+  assert.equal(
+    historyTailReserveDeficitAfterShrink(clampedScroller, clampedScroller.scrollTop),
+    0,
+    'the already-clamped live position cannot reconstruct the removed height',
+  );
+
+  const spacer = createHistoryTailSpacer({});
+  spacer.arm(150, 'terminal-preview-shrink-hold');
+  const withReserve = {
+    scrollHeight: clampedScroller.scrollHeight + spacer.get(),
+    scrollTop: clampedScroller.scrollTop,
+    clientHeight: clampedScroller.clientHeight,
+  };
+  const contentBottom = withReserve.scrollHeight - spacer.get();
+  const heldDeficit = 800 + withReserve.clientHeight - contentBottom;
+  assert.equal(
+    heldDeficit,
+    spacer.get(),
+    'reconciliation must use the held pre-change position until live scrollTop is restored',
+  );
+});
+
+test('preview resize needs no reserve while real content still absorbs the shrink', () => {
+  const scroller = { scrollHeight: 1600, scrollTop: 800, clientHeight: 450 };
+  assert.equal(historyTailReserveDeficitAfterShrink(scroller, 800), 0);
 });

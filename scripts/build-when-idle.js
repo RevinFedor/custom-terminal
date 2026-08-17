@@ -120,17 +120,27 @@ const KIND_LABEL = {
   gemini: C.magenta + 'gemini' + C.reset,
   process: C.yellow + 'process' + C.reset,
   'restart-after': C.yellow + 'restart-after' + C.reset,
+  // Not a running turn: the tab is OWED queued work (Run after / Loop). It can
+  // sit here with nothing streaming — that gap between two links of a chain is
+  // exactly what this blocker exists to cover, so it must not read as "busy".
+  'prompt-queue': C.magenta + 'run-after' + C.reset,
 };
 // Stable per-tab description used both in the live list and in the closed/idle
 // announcements, so "what appeared" and "what went idle" read identically.
 function loaderLabel(l) {
   const proj = l.project ? C.bold + l.project + C.reset : C.gray + '(no project)' + C.reset;
   const cmd = l.command ? C.gray + ' (' + l.command + ')' + C.reset : '';
-  return (KIND_LABEL[l.kind] || l.kind) + C.gray + ' · ' + C.reset + proj + C.gray + ' · ' + C.reset + (l.name || '?') + cmd;
+  // For a queue blocker the useful detail is how much is still owed, not a
+  // command line (there is none until it fires).
+  const queued = l.kind === 'prompt-queue' && l.pending
+    ? C.gray + ' (' + l.pending + ' queued)' + C.reset
+    : '';
+  return (KIND_LABEL[l.kind] || l.kind) + C.gray + ' · ' + C.reset + proj + C.gray + ' · ' + C.reset + (l.name || '?') + cmd + queued;
 }
 function dot(status) {
   return status === 'busy' ? C.green + '●' + C.reset
     : status === 'running' ? C.yellow + '●' + C.reset
+    : status === 'queued' ? C.magenta + '◌' + C.reset // owed, not running
     : C.cyan + '◐' + C.reset; // active / starting (alive but not actively streaming)
 }
 

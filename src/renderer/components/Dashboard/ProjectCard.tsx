@@ -13,6 +13,7 @@ interface Project {
   path: string;
   name: string;
   description?: string;
+  icon?: string | null;
 }
 
 interface TabsStats {
@@ -116,10 +117,23 @@ export default function ProjectCard({
         className="grid min-w-0 items-center gap-1.5 px-2 pt-1 pb-0"
         style={{ gridTemplateColumns: 'auto minmax(0, 1fr) auto' }}
       >
-        <FolderOpen
-          size={12}
-          className="flex-shrink-0 text-[#888]"
-        />
+        {/* The project's OWN icon when one is set — same identity mark the
+            titlebar card and the pane header badge carry, so the project looks
+            like the same object everywhere. Folder stays the fallback. */}
+        {project.icon ? (
+          <img
+            src={project.icon}
+            alt=""
+            draggable={false}
+            className="flex-shrink-0"
+            style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover' }}
+          />
+        ) : (
+          <FolderOpen
+            size={12}
+            className="flex-shrink-0 text-[#888]"
+          />
+        )}
         <div className="min-w-0 overflow-hidden">
           <SmartPopover content={project.description || ''} isOpen={isHoveringName}>
             <span

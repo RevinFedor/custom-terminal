@@ -5,9 +5,15 @@ const path = require('node:path');
 const { TextDecoder } = require('node:util');
 
 const {
+  readClaudeRecordsFromBuffer,
   readClaudeUserRecordsFromBuffer,
   selectClaudePendingPromptAudit,
 } = require('./claude-prompt-audit');
+const {
+  claudeQueuePromptSourceIdentity,
+  extractClaudePromptCarrier,
+  extractClaudeQueueOperationPromptText,
+} = require('./claude-prompt-carriers');
 const {
   consumeCodexUserMessageAuditChunk,
   selectCodexPendingPromptAudit,
@@ -60,6 +66,13 @@ function found(record, reason, audit, extra = {}) {
   return decision(record, 'found', reason, {
     ...extra,
     audit,
+  });
+}
+
+function providerNotAccepted(record, reason, receipt, extra = {}) {
+  return decision(record, 'provider-not-accepted', reason, {
+    ...extra,
+    receipt,
   });
 }
 
@@ -443,14 +456,196 @@ function evidenceFor(boundary, snapshot, candidateCount, matchCount) {
   };
 }
 
+function claudeProviderQueueEvidence(context) {
+  const providerQueue = context?.record?.receipt?.providerQueue;
+  if (!providerQueue || typeof providerQueue !== 'object') return null;
+  const entryUuid = cleanString(providerQueue.entryUuid);
+  const recordByteOffset = nonNegativeSafeInteger(providerQueue.recordByteOffset);
+  const sessionId = cleanString(providerQueue.sessionId) || context.sessionId;
+  const sourceIdentity = cleanString(providerQueue.sourceIdentity)
+    || (entryUuid ? `claude-queue:uuid:${entryUuid}` : '')
+    || (sessionId && recordByteOffset !== null
+      ? `claude-queue:offset:${sessionId}:${recordByteOffset}`
+      : '');
+  if (!sourceIdentity) return null;
+  if (sessionId && sessionId !== context.sessionId) return null;
+  return {
+    sourceIdentity,
+    entryUuid: entryUuid || null,
+    recordByteOffset,
+    sessionId,
+  };
+}
+
+function isStrictQueuedPromptPrefix(actualText, expectedText) {
+  if (
+    typeof actualText !== 'string'
+    || typeof expectedText !== 'string'
+    || actualText.length <= expectedText.length
+    || !actualText.startsWith(expectedText)
+  ) return false;
+  return /\s/u.test(actualText.charAt(expectedText.length));
+}
+
+function reconcileClaudeProviderQueue(context, validated, snapshot) {
+  const queueEvidence = claudeProviderQueueEvidence(context);
+  if (!queueEvidence) return null;
+  const records = readClaudeRecordsFromBuffer(
+    snapshot.buffer,
+    validated.transcriptPath,
+    {
+      baseOffset: validated.fileSize,
+      skipLeadingPartial: false,
+      bytesRead: snapshot.bytesRead,
+      readMode: 'startup-provider-queue',
+    },
+  );
+  const enqueueMatches = records.filter((candidate) => {
+    const record = candidate.record;
+    if (record?.type !== 'queue-operation' || record.operation !== 'enqueue') return false;
+    const candidateSessionId = cleanString(record.sessionId || record.session_id)
+      || context.sessionId;
+    if (candidateSessionId !== context.sessionId) return false;
+    if (
+      queueEvidence.recordByteOffset !== null
+      && Number(candidate.byteOffset) !== queueEvidence.recordByteOffset
+    ) return false;
+    if (
+      queueEvidence.entryUuid
+      && cleanString(record.uuid) !== queueEvidence.entryUuid
+    ) return false;
+    const sourceIdentity = claudeQueuePromptSourceIdentity(record, {
+      sessionId: candidateSessionId,
+      recordByteOffset: candidate.byteOffset,
+    });
+    return sourceIdentity === queueEvidence.sourceIdentity
+      && extractClaudeQueueOperationPromptText(record) === context.promptText;
+  });
+  const baseEvidence = evidenceFor(
+    validated,
+    snapshot,
+    records.length,
+    enqueueMatches.length,
+  );
+  if (enqueueMatches.length === 0) {
+    return unknown(context.record, 'provider-queue-enqueue-not-found', {
+      evidence: baseEvidence,
+    });
+  }
+  if (enqueueMatches.length > 1) {
+    return unknown(context.record, 'provider-queue-enqueue-ambiguous', {
+      evidence: baseEvidence,
+    });
+  }
+
+  const enqueue = enqueueMatches[0];
+  let exactSettlement = null;
+  for (const candidate of records) {
+    if (Number(candidate.byteOffset) <= Number(enqueue.byteOffset)) continue;
+    const record = candidate.record;
+    const candidateSessionId = cleanString(record?.sessionId || record?.session_id)
+      || context.sessionId;
+    if (candidateSessionId !== context.sessionId) continue;
+
+    const carrier = extractClaudePromptCarrier(record);
+    if (carrier?.text === context.promptText
+      || isStrictQueuedPromptPrefix(carrier?.text, context.promptText)) {
+      const merged = carrier.text !== context.promptText;
+      const audit = makeAudit(context, {
+        actualText: context.promptText,
+        actualHash: context.promptHash,
+        entryUuid: record.uuid,
+        sourceIdentity: queueEvidence.sourceIdentity,
+        recordByteOffset: candidate.byteOffset,
+        timestamp: record.timestamp,
+        canonicalReason: merged ? 'claude_queue_prompt_merged_into_user_turn' : null,
+      });
+      return found(
+        context.record,
+        merged ? 'provider-queue-merged-user-turn' : 'provider-queue-canonical-user-turn',
+        audit,
+        { evidence: { ...baseEvidence, matchCount: 1 } },
+      );
+    }
+
+    if (record?.type !== 'queue-operation') continue;
+    if (record.operation === 'popAll') {
+      return providerNotAccepted(
+        context.record,
+        'provider-queue-returned-to-composer',
+        {
+          success: false,
+          cancelled: true,
+          accepted: false,
+          submitted: true,
+          pasteWritten: true,
+          enterWritten: true,
+          semanticStatus: 'not-submitted',
+          providerAccepted: false,
+          providerTurnCreated: false,
+          providerQueueReturned: true,
+          providerQueueOperation: 'popAll',
+          composerDraftState: 'exact-provider-queue-return',
+          draftPreserved: true,
+          lateReconciliationPending: false,
+          auditPending: false,
+          deliveryUnknown: false,
+          status: 'provider-not-accepted',
+          code: 'claude_queue_returned_to_composer',
+          error: 'claude_queue_returned_to_composer',
+          operationKey: context.operationKey,
+          attemptId: context.attemptId,
+          provider: 'claude',
+          sessionId: context.sessionId,
+          actualLen: context.promptLength,
+          actualHash: context.promptHash,
+          expectedLen: context.promptLength,
+          expectedHash: context.promptHash,
+          sourceIdentity: queueEvidence.sourceIdentity,
+          recordByteOffset: enqueue.byteOffset,
+          queueReturnRecordByteOffset: candidate.byteOffset,
+          auditTimestamp: numericTimestamp(record.timestamp),
+          transcriptBoundary: context.boundary,
+          canonicalized: true,
+          canonicalReason: 'provider-queue-returned-to-composer',
+        },
+        { evidence: { ...baseEvidence, matchCount: 1 } },
+      );
+    }
+    if (record.operation === 'remove' || record.operation === 'dequeue') {
+      const settlementText = typeof record.content === 'string' ? record.content : '';
+      if (settlementText && settlementText === context.promptText) {
+        exactSettlement = candidate;
+        break;
+      }
+    }
+  }
+  if (!exactSettlement) return null;
+  const audit = makeAudit(context, {
+    actualText: context.promptText,
+    actualHash: context.promptHash,
+    sourceIdentity: queueEvidence.sourceIdentity,
+    recordByteOffset: enqueue.byteOffset,
+    timestamp: enqueue.record?.timestamp,
+    canonicalReason: `provider-queue-${exactSettlement.record.operation}`,
+  });
+  return found(
+    context.record,
+    `provider-queue-${exactSettlement.record.operation}`,
+    audit,
+    { evidence: { ...baseEvidence, matchCount: 1 } },
+  );
+}
+
 async function reconcileClaude(context, maxReadBytes, options = {}) {
   const validated = validateClaudeBoundary(context);
   if (!validated.ok) return unknown(context.record, validated.reason, validated);
+  const providerQueueEvidence = claudeProviderQueueEvidence(context);
   const snapshot = await readBoundedCausalPrefix(
     validated.transcriptPath,
     validated.fileSize,
     maxReadBytes,
-    options.causalUpperBoundaryOffset,
+    providerQueueEvidence ? null : options.causalUpperBoundaryOffset,
   );
   if (!snapshot.ok) return unknown(context.record, snapshot.reason, snapshot);
   if (snapshot.causalRangeBytes === 0) {
@@ -458,6 +653,13 @@ async function reconcileClaude(context, maxReadBytes, options = {}) {
       evidence: evidenceFor(validated, snapshot, 0, 0),
     });
   }
+
+  const providerQueueDecision = reconcileClaudeProviderQueue(
+    context,
+    validated,
+    snapshot,
+  );
+  if (providerQueueDecision) return providerQueueDecision;
 
   const candidates = readClaudeUserRecordsFromBuffer(
     snapshot.buffer,

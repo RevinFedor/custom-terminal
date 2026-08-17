@@ -33,6 +33,7 @@ function promotePendingCompactEntry(pendingEntries, options = {}) {
   for (; index >= 0 && index < pendingEntries.length; index += direction) {
     const entry = pendingEntries[index];
     if (!entry || !isExactQueuedCompact(entry.content)) continue;
+    if (entry.queueStatus === 'cancelled') continue;
     if (sessionId && entry.sessionId && entry.sessionId !== sessionId) continue;
     return promoteQueuedCompactEntry(pendingEntries, entry, options);
   }

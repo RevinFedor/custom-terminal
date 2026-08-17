@@ -25,10 +25,11 @@ const {
   decorateHistoryResponseTimings,
 } = require('../history-response-timings');
 const {
+  claudeQueuePromptSourceIdentity,
   selectClaudeQueuedPromptIndex,
 } = require('../claude-prompt-carriers');
+const { promptAuditFingerprint } = require('../prompt-audit-fingerprint');
 const {
-  promoteAllPendingCompactEntries,
   promotePendingCompactEntry,
   promoteQueuedCompactEntry,
 } = require('../claude-compact-queue-projection');
@@ -5157,9 +5158,52 @@ function register({
       const normalizeQueuedText = (text) => String(text || '')
         .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
         .replace(/\[200~/g, '').replace(/~\]/g, '').trim();
-      const slashCommandEntryFromText = (text, uuid, timestamp, entrySid, recordByteOffset) => {
+      // A BARE command (`/effort` with no args) is how the picker menu is
+      // opened — the chosen value never lands in <command-args>, only in the
+      // NEXT record's <local-command-stdout> («Set effort level to max…»).
+      // The row must still read as the full command (user contract: «пишется
+      // полная команда — название и продолжение до конца»), so the outcome is
+      // recovered from that stdout. A cancelled picker recovers nothing and
+      // the bare name is the honest whole truth.
+      const recoverBareCommandArgs = (commandName, fromIndex) => {
+        for (let k = fromIndex + 1; k < Math.min(fromIndex + 4, historyBranch.length); k += 1) {
+          const next = historyBranch[k];
+          const text = typeof next?.message?.content === 'string' ? next.message.content : '';
+          const stdout = text.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/)?.[1] || '';
+          if (!stdout) continue;
+          // ANSI SGR sequences (the stdout carries ESC[1m…ESC[22m bolding).
+          const plain = stdout.replace(new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g'), '').trim();
+          if (commandName === 'model') {
+            const m = plain.match(/Set model to\s+(.+?)(?:\s+and saved.*)?$/im);
+            if (m) return m[1].trim();
+          }
+          if (commandName === 'effort') {
+            const m = plain.match(/Set effort level to\s+([a-z-]+)/i);
+            if (m) return m[1].trim();
+          }
+          return '';
+        }
+        return '';
+      };
+      const slashCommandEntryFromText = (text, uuid, timestamp, entrySid, recordByteOffset, recordIndex) => {
         const slash = slashCommandDisplayFromText(text);
         if (!slash) return null;
+        if (!slash.args && Number.isInteger(recordIndex)) {
+          const cleanName = slash.name.replace(/^\/+/, '').toLowerCase();
+          const recovered = recoverBareCommandArgs(cleanName, recordIndex);
+          if (recovered) slash.content = formatSlashCommandDisplay(slash.name, recovered);
+        }
+        // `/compact` is announced TWICE by Claude: once by this service record
+        // and once by the compaction summary row («context compacted · 705k
+        // tokens»), and the file order puts the command AFTER the summary
+        // (verified: summary at line 5196, command at 5198 of the probe
+        // session) — so the feed showed the same event twice, in reverse.
+        // The summary is the honest one: it carries the outcome. Reordering
+        // rows is not an option — the parent chain the rewind walks is built
+        // on this exact order — so the duplicate is dropped instead.
+        // `hidden` (not null): null would mean "not a slash command" and let
+        // the raw `<command-name>…` service text through as a user message.
+        if (slash.name.replace(/^\/+/, '').toLowerCase() === 'compact') return { hidden: true };
         return {
           uuid,
           role: 'slash',
@@ -5180,19 +5224,39 @@ function register({
         if (text.startsWith('Caveat: The messages below')) return true;
         return false;
       };
-      const dropMatchingQueuedEntry = (cleanContent, timestamp, entrySid) => {
-        const idx = selectClaudeQueuedPromptIndex(pendingQueueEntries, {
+      const takeMatchingQueuedEntry = (cleanContent, timestamp, entrySid, {
+        allowConsumedPrefix = false,
+      } = {}) => {
+        let idx = selectClaudeQueuedPromptIndex(pendingQueueEntries, {
           text: cleanContent,
           timestamp,
           sessionId: entrySid,
           normalizeText: normalizeQueuedText,
         });
-        if (idx < 0) return;
+        if (idx < 0 && allowConsumedPrefix) {
+          const actual = normalizeQueuedText(cleanContent);
+          const candidates = pendingQueueEntries
+            .map((queued, index) => ({ queued, index }))
+            .filter(({ queued }) => {
+              if (queued?.queueStatus !== 'sent') return false;
+              if (entrySid && queued.sessionId && queued.sessionId !== entrySid) return false;
+              const expected = normalizeQueuedText(queued.content);
+              if (!expected || actual.length <= expected.length || !actual.startsWith(expected)) {
+                return false;
+              }
+              return /\s/u.test(actual.charAt(expected.length));
+            });
+          // A modified canonical turn may consume one exact provider queue
+          // item, but similar/duplicate prefixes are not identity.
+          if (candidates.length === 1) idx = candidates[0].index;
+        }
+        if (idx < 0) return null;
         const queued = pendingQueueEntries[idx];
         pendingQueueEntries.splice(idx, 1);
         const renderedIdx = entries.findIndex(e => e.uuid === queued.uuid);
         if (renderedIdx >= 0) entries.splice(renderedIdx, 1);
         projectedEntryTotal = Math.max(0, projectedEntryTotal - 1);
+        return queued;
       };
 
       for (let i = 0; i < historyBranch.length; i++) {
@@ -5225,15 +5289,32 @@ function register({
         if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command') {
           const cleanContent = normalizeQueuedText(extractQueuedCommandPromptText(entry.attachment.prompt));
           if (!cleanContent || shouldSkipPromptText(cleanContent)) continue;
-          dropMatchingQueuedEntry(cleanContent, entry.timestamp, entrySid);
+          const consumedQueue = takeMatchingQueuedEntry(
+            cleanContent,
+            entry.timestamp,
+            entrySid,
+            { allowConsumedPrefix: true },
+          );
+          const inheritedQueuePresentation = consumedQueue
+            ? {
+                ...(consumedQueue.sourceIdentity
+                  ? { sourceIdentity: consumedQueue.sourceIdentity }
+                  : {}),
+                promptPresentationAuditTimestamp: consumedQueue.timestamp,
+                promptPresentationTransportHash: promptAuditFingerprint(consumedQueue.content),
+              }
+            : {};
           const slashEntry = slashCommandEntryFromText(
             cleanContent,
             entry.uuid,
             entry.timestamp,
             entrySid,
             entry.__byteOffset,
+            i,
           );
-          if (slashEntry) {
+          if (slashEntry?.hidden) {
+            // Suppressed duplicate (see slashCommandEntryFromText).
+          } else if (slashEntry) {
             appendProjectedEntry(slashEntry);
           } else {
             appendProjectedEntry({
@@ -5244,6 +5325,7 @@ function register({
               queueStatus: 'sent',
               sessionId: entrySid,
               recordByteOffset: entry.__byteOffset,
+              ...inheritedQueuePresentation,
             });
           }
           continue;
@@ -5253,6 +5335,10 @@ function register({
           if (entry.operation === 'enqueue') {
             const cleanContent = normalizeQueuedText(entry.content || '');
             if (shouldSkipPromptText(cleanContent)) continue;
+            const queueSourceIdentity = claudeQueuePromptSourceIdentity(entry, {
+              sessionId: entrySid,
+              recordByteOffset: entry.__byteOffset,
+            });
             const queuedEntry = {
               uuid: entry._queueId || ('queue-' + (entry.sessionId || entry._fromFile || 'unknown') + '-' + (entry.timestamp || pendingQueueEntries.length)),
               role: 'queued',
@@ -5261,6 +5347,7 @@ function register({
               queueStatus: 'queued',
               sessionId: entrySid,
               recordByteOffset: entry.__byteOffset,
+              ...(queueSourceIdentity ? { sourceIdentity: queueSourceIdentity } : {}),
             };
             pendingQueueEntries.push(queuedEntry);
             appendProjectedEntry(queuedEntry);
@@ -5278,21 +5365,39 @@ function register({
               }
             }
           } else if (entry.operation === 'remove') {
-            const idx = pendingQueueEntries.findIndex(q => q.queueStatus === 'queued');
+            const removeContent = normalizeQueuedText(entry.content || '');
+            const exactRemoveIndex = removeContent
+              ? pendingQueueEntries.findIndex((queued) => (
+                  queued?.queueStatus === 'queued'
+                  && (!entrySid || !queued.sessionId || queued.sessionId === entrySid)
+                  && normalizeQueuedText(queued.content) === removeContent
+                ))
+              : -1;
+            const idx = exactRemoveIndex >= 0
+              ? exactRemoveIndex
+              : pendingQueueEntries.findIndex(q => q.queueStatus === 'queued');
             if (idx >= 0) {
               const queued = pendingQueueEntries[idx];
               // Claude can emit `remove` when a queued prompt is consumed after an
               // interactive AskUserQuestion form without writing a normal user row.
               // Keep it visible as sent; a later matching user row replaces it via
-              // dropMatchingQueuedEntry().
+              // takeMatchingQueuedEntry().
               if (!promoteQueuedCompactEntry(pendingQueueEntries, queued, { reason: 'remove' })) {
                 queued.queueStatus = 'sent';
               }
             }
           } else if (entry.operation === 'popAll') {
-            promoteAllPendingCompactEntries(pendingQueueEntries, { reason: 'popAll' });
-            for (const queued of pendingQueueEntries) {
-              if (queued.queueStatus === 'queued') queued.queueStatus = 'sent';
+            // `popAllEditable` returns every still-editable queue item to the
+            // Claude TUI composer. It is not a delivered History record. Drop
+            // only pending items; already consumed dequeue/remove rows remain
+            // available for a later canonical user carrier to adopt.
+            for (let queueIndex = pendingQueueEntries.length - 1; queueIndex >= 0; queueIndex -= 1) {
+              const queued = pendingQueueEntries[queueIndex];
+              if (queued.queueStatus !== 'queued') continue;
+              pendingQueueEntries.splice(queueIndex, 1);
+              const renderedIdx = entries.findIndex(candidate => candidate.uuid === queued.uuid);
+              if (renderedIdx >= 0) entries.splice(renderedIdx, 1);
+              projectedEntryTotal = Math.max(0, projectedEntryTotal - 1);
             }
           }
           continue;
@@ -5325,7 +5430,21 @@ function register({
 
           let cleanContent = normalizeQueuedText(rawContent);
           if (!cleanContent) continue;
-          dropMatchingQueuedEntry(cleanContent, entry.timestamp, entrySid);
+          const consumedQueue = takeMatchingQueuedEntry(
+            cleanContent,
+            entry.timestamp,
+            entrySid,
+            { allowConsumedPrefix: true },
+          );
+          const inheritedQueuePresentation = consumedQueue
+            ? {
+                ...(consumedQueue.sourceIdentity
+                  ? { sourceIdentity: consumedQueue.sourceIdentity }
+                  : {}),
+                promptPresentationAuditTimestamp: consumedQueue.timestamp,
+                promptPresentationTransportHash: promptAuditFingerprint(consumedQueue.content),
+              }
+            : {};
 
           if (entry.isCompactSummary) {
             let pairedWithCompactBoundary = false;
@@ -5356,7 +5475,9 @@ function register({
             entry.timestamp,
             entrySid,
             entry.__byteOffset,
+            i,
           );
+          if (slashEntry?.hidden) continue;
           if (slashEntry) {
             appendProjectedEntry(slashEntry);
             continue;
@@ -5371,6 +5492,7 @@ function register({
             content: cleanContent,
             sessionId: entrySid,
             recordByteOffset: entry.__byteOffset,
+            ...inheritedQueuePresentation,
           });
         } else if (entry.type === 'assistant') {
           const msgContent = entry.message?.content;
@@ -5545,6 +5667,32 @@ function register({
               }
             }
             textContent = textParts.join('\n\n');
+          }
+
+          // Claude sometimes splits ONE reasoning block across consecutive
+          // records of the SAME response (measured: 50 of 50 consecutive
+          // thinking rows share their message.id — there is no case of two
+          // genuinely different reasonings in a row). Rendering them as two
+          // rows showed «thinking · 7s» + «thinking · 4s» for a single
+          // thought. Fold the continuation into the row already emitted:
+          // texts join, durations add.
+          const previousProjected = entries.length > 0 ? entries[entries.length - 1] : null;
+          if (
+            thinkingParts.length > 0
+            && actions.length === 0
+            && !textContent.trim()
+            && previousProjected
+            && previousProjected.role === 'assistant'
+            && previousProjected.thinking
+            && !previousProjected.content
+            && !previousProjected.actions
+            && previousProjected.messageId
+            && previousProjected.messageId === (entry.message?.id || '')
+          ) {
+            previousProjected.thinking += '\n\n' + thinkingParts.join('\n\n---\n\n');
+            previousProjected.thinkingSeconds =
+              (Number(previousProjected.thinkingSeconds) || 0) + (Number(thinkingSeconds) || 0);
+            continue;
           }
 
           if (textContent.trim() || actions.length > 0 || thinkingParts.length > 0) {

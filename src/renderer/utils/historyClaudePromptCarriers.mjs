@@ -130,9 +130,27 @@ const queueIdentityFrom = ({ sessionId, timestamp, text }) => {
   return 'claude-queue:' + sessionId + ':' + timestamp + ':' + hashText(normalized);
 };
 
+const queueSourceIdentityFrom = (record, envelope, text) => {
+  const entryUuid = typeof record?.uuid === 'string' ? record.uuid.trim() : '';
+  if (entryUuid) return 'claude-queue:uuid:' + entryUuid;
+  const sessionId = recordSessionId(record, envelope);
+  const recordByteOffset = recordByteOffsetFrom(envelope);
+  if (sessionId && recordByteOffset !== null) {
+    return 'claude-queue:offset:' + sessionId + ':' + recordByteOffset;
+  }
+  return queueIdentityFrom({
+    sessionId,
+    timestamp: recordTimestamp(record, envelope),
+    text,
+  });
+};
+
 export function claudeHistoryQueuePresentationIdentity(entry) {
   if (entry?.role !== 'queued') return '';
   if (String(entry?.uuid || '').startsWith('local-prompt-')) return '';
+  if (String(entry?.sourceIdentity || '').startsWith('claude-queue:')) {
+    return String(entry.sourceIdentity);
+  }
   return queueIdentityFrom({
     sessionId: String(entry.sessionId || ''),
     timestamp: String(entry.timestamp || ''),
@@ -142,23 +160,45 @@ export function claudeHistoryQueuePresentationIdentity(entry) {
 
 export const hasClaudeHistoryLiveQueuePrompt = (entries) => (
   Array.isArray(entries)
-  && entries.some((entry) => String(entry?.sourceIdentity || '').startsWith('claude-queue:'))
+  && entries.some((entry) => (
+    entry?.queueStatus === 'queued'
+    && String(entry?.sourceIdentity || '').startsWith('claude-queue:')
+  ))
 );
 
-const removeOneMatchingQueue = (entries, text, timestamp = '') => {
+const removeOneMatchingQueue = (entries, text, timestamp = '', {
+  allowConsumedPrefix = false,
+  sessionId = '',
+} = {}) => {
   const expected = promptIdentityText(text);
   const expectedTimestamp = String(timestamp || '');
   if (!expected) return { entries, removed: null };
-  const candidates = entries
+  let candidates = entries
     .map((entry, index) => ({ entry, index }))
     .filter(({ entry }) => (
       entry?.role === 'queued'
+      && entry.queueStatus !== 'cancelled'
       && promptIdentityText(entry.content) === expected
     ));
   const exact = expectedTimestamp
     ? candidates.find(({ entry }) => String(entry.timestamp || '') === expectedTimestamp)
     : null;
-  const index = exact?.index ?? candidates[0]?.index ?? -1;
+  let index = exact?.index ?? candidates[0]?.index ?? -1;
+  if (index < 0 && allowConsumedPrefix) {
+    const exactSessionId = String(sessionId || '');
+    candidates = entries
+      .map((entry, candidateIndex) => ({ entry, index: candidateIndex }))
+      .filter(({ entry }) => {
+        if (entry?.role !== 'queued' || entry.queueStatus !== 'sent') return false;
+        if (exactSessionId && entry.sessionId && entry.sessionId !== exactSessionId) return false;
+        const queuedText = promptIdentityText(entry.content);
+        if (!queuedText || expected.length <= queuedText.length || !expected.startsWith(queuedText)) {
+          return false;
+        }
+        return /\s/u.test(expected.charAt(queuedText.length));
+      });
+    if (candidates.length === 1) index = candidates[0].index;
+  }
   if (index < 0) return { entries, removed: null };
   return {
     entries: [...entries.slice(0, index), ...entries.slice(index + 1)],
@@ -199,20 +239,48 @@ const withQueueSettlement = (entry, settlementIdentity) => {
   };
 };
 
-const updateQueuedStatus = (entries, operation, text, settlementIdentity) => {
+const updateQueuedStatus = (
+  entries,
+  operation,
+  text,
+  settlementIdentity,
+  { recordByteOffset = null, timestamp = '' } = {},
+) => {
   if (hasQueueSettlement(entries, settlementIdentity)) return entries;
+  if (operation === 'popAll') {
+    const exactSettlementOffset = Number.isSafeInteger(recordByteOffset)
+      ? recordByteOffset
+      : null;
+    const settlementAt = Date.parse(String(timestamp || ''));
+    return entries.filter((entry) => {
+      if (entry?.role !== 'queued' || entry.queueStatus !== 'queued') return true;
+      const entryOffset = Number(entry.recordByteOffset);
+      if (exactSettlementOffset !== null && Number.isSafeInteger(entryOffset)) {
+        return entryOffset > exactSettlementOffset;
+      }
+      const entryAt = Date.parse(String(entry.timestamp || ''));
+      if (Number.isFinite(settlementAt) && Number.isFinite(entryAt)) {
+        return entryAt > settlementAt;
+      }
+      // Live delivery is ordered. With no persisted position at all, every
+      // currently queued row necessarily precedes this popAll envelope.
+      return false;
+    });
+  }
   const expected = promptIdentityText(text);
   let changed = false;
   let consumed = false;
   const next = entries.map((entry) => {
     if (entry?.role !== 'queued' || entry.queueStatus !== 'queued') return entry;
     const exactContentMatch = expected && promptIdentityText(entry.content) === expected;
-    const applies = operation === 'popAll'
-      || (!consumed && (exactContentMatch || !expected));
+    const applies = !consumed && (exactContentMatch || !expected);
     if (!applies) return entry;
-    consumed = operation !== 'popAll';
+    consumed = true;
     changed = true;
-    return withQueueSettlement({ ...entry, queueStatus: 'sent' }, settlementIdentity);
+    return withQueueSettlement({
+      ...entry,
+      queueStatus: 'sent',
+    }, settlementIdentity);
   });
   return changed ? next : entries;
 };
@@ -257,7 +325,7 @@ export function reduceClaudeHistoryPromptCarrier(
       };
       const sessionId = recordSessionId(record, envelope);
       const timestamp = recordTimestamp(record, envelope);
-      const sourceIdentity = queueIdentityFrom({ sessionId, timestamp, text });
+      const sourceIdentity = queueSourceIdentityFrom(record, envelope, text);
       const entry = {
         uuid: sourceIdentity || ('claude-queue:' + hashText(text)),
         sourceIdentity,
@@ -285,6 +353,10 @@ export function reduceClaudeHistoryPromptCarrier(
           record.operation,
           record.content,
           queueSettlementIdentityFrom(record, envelope),
+          {
+            recordByteOffset: recordByteOffsetFrom(envelope),
+            timestamp: recordTimestamp(record, envelope),
+          },
         ),
         projectedUser: false,
         promptBoundary: false,
@@ -312,9 +384,16 @@ export function reduceClaudeHistoryPromptCarrier(
           entries,
           attachmentText,
           recordTimestamp(record, envelope),
+          {
+            allowConsumedPrefix: true,
+            sessionId: recordSessionId(record, envelope),
+          },
         );
     const inheritedSettlements = Array.isArray(queueMatch.removed?.queueSettlementIdentities)
       ? { queueSettlementIdentities: queueMatch.removed.queueSettlementIdentities }
+      : {};
+    const inheritedQueueIdentity = queueMatch.removed?.sourceIdentity
+      ? { sourceIdentity: queueMatch.removed.sourceIdentity }
       : {};
     return {
       handled: true,
@@ -331,6 +410,7 @@ export function reduceClaudeHistoryPromptCarrier(
         ...(recordByteOffsetFrom(envelope) !== null
           ? { recordByteOffset: recordByteOffsetFrom(envelope) }
           : {}),
+        ...inheritedQueueIdentity,
         ...inheritedSettlements,
       }),
       projectedUser: true,
@@ -357,9 +437,15 @@ export function reduceClaudeHistoryPromptCarrier(
     const existingCanonical = entries.some((entry) => entry?.uuid === String(record.uuid));
     const queueMatch = existingCanonical
       ? { entries, removed: null }
-      : removeOneMatchingQueue(entries, text);
+      : removeOneMatchingQueue(entries, text, '', {
+          allowConsumedPrefix: true,
+          sessionId: recordSessionId(record, envelope),
+        });
     const inheritedSettlements = Array.isArray(queueMatch.removed?.queueSettlementIdentities)
       ? { queueSettlementIdentities: queueMatch.removed.queueSettlementIdentities }
+      : {};
+    const inheritedQueueIdentity = queueMatch.removed?.sourceIdentity
+      ? { sourceIdentity: queueMatch.removed.sourceIdentity }
       : {};
     return {
       handled: true,
@@ -375,6 +461,7 @@ export function reduceClaudeHistoryPromptCarrier(
         ...(recordByteOffsetFrom(envelope) !== null
           ? { recordByteOffset: recordByteOffsetFrom(envelope) }
           : {}),
+        ...inheritedQueueIdentity,
         ...inheritedSettlements,
       }),
       projectedUser: true,

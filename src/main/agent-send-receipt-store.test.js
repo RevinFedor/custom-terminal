@@ -160,6 +160,7 @@ test('exact Claude queue acceptance survives the caller timeout without becoming
       provider: 'claude',
       sessionId: 'session-a',
       entryUuid: 'queue-operation-a',
+      sourceIdentity: 'claude-queue:uuid:queue-operation-a',
       recordByteOffset: 84,
       acceptedAt: '2026-08-16T01:58:27.200Z',
     },
@@ -176,6 +177,7 @@ test('exact Claude queue acceptance survives the caller timeout without becoming
     observedAt: 110,
     sessionId: 'session-a',
     entryUuid: 'queue-operation-a',
+    sourceIdentity: 'claude-queue:uuid:queue-operation-a',
     recordByteOffset: 84,
   });
 
@@ -198,6 +200,7 @@ test('exact Claude queue acceptance survives the caller timeout without becoming
       provider: 'claude',
       sessionId: 'session-a',
       entryUuid: 'queue-operation-a',
+      sourceIdentity: 'claude-queue:uuid:queue-operation-a',
       recordByteOffset: 84,
     },
   );
@@ -211,12 +214,13 @@ test('exact Claude queue acceptance survives the caller timeout without becoming
       provider: 'claude',
       sessionId: 'session-a',
       entryUuid: 'foreign-queue-operation',
+      sourceIdentity: 'claude-queue:uuid:foreign-queue-operation',
       recordByteOffset: 96,
     },
   );
   assert.equal(conflict.ok, false);
   assert.equal(conflict.reason, 'provider-queue-identity-conflict');
-  assert.deepEqual(conflict.mismatchedFields, ['entryUuid', 'recordByteOffset']);
+  assert.deepEqual(conflict.mismatchedFields, ['entryUuid', 'sourceIdentity', 'recordByteOffset']);
 });
 
 test('provider queue evidence cannot attach to another attempt or a non-Claude receipt', (t) => {
@@ -351,6 +355,44 @@ test('startup reconciliation replaces an endless audit spinner with replay-safe 
   }));
   assert.equal(promoted.promoted, true, 'a later exact record may still resolve the receipt');
   assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
+});
+
+test('a startup-discovered provider queue return terminalizes delivery-unknown', (t) => {
+  let time = 100;
+  const harness = openMemoryHarness(t, { now: () => time });
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'claude' }));
+  store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    accepted: true,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+  store.markStartupUnconfirmed(
+    begun.record.operationKey,
+    begun.attemptId,
+    { decision: 'unknown', reason: 'pre-scan' },
+  );
+  assert.equal(store.get(begun.record.operationKey).state, STORE_STATES.DELIVERY_UNKNOWN);
+
+  time = 140;
+  const returned = store.settleAttempt(
+    begun.record.operationKey,
+    begun.attemptId,
+    exactProviderNotAccepted({
+      composerDraftState: 'exact-provider-queue-return',
+      providerQueueReturned: true,
+      providerQueueOperation: 'popAll',
+      sourceIdentity: 'claude-queue:uuid:return-enqueue',
+      exactDraftRemained: false,
+    }),
+  );
+  assert.equal(returned.applied, true);
+  assert.equal(returned.record.state, STORE_STATES.PROVIDER_NOT_ACCEPTED);
+  assert.equal(returned.record.settledAt, 140);
+  assert.equal(returned.record.receipt.providerQueueReturned, true);
 });
 
 test('startup unconfirmed transition cannot overwrite a settled receipt or a newer attempt', (t) => {

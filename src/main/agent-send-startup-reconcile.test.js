@@ -117,6 +117,108 @@ test('one exact post-boundary Claude record produces promotable audit data', asy
   assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
 });
 
+test('startup follows one exact provider queue identity into a merged Claude user turn', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-claude-queue-merged-');
+  const transcriptPath = path.join(dir, 'claude.jsonl');
+  const prompt = 'queued startup prompt';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  const enqueue = {
+    type: 'queue-operation',
+    operation: 'enqueue',
+    uuid: 'provider-enqueue-uuid',
+    sessionId: 'claude-session',
+    timestamp: '2026-08-16T09:58:43.000Z',
+    content: prompt,
+  };
+  const merged = claudeUser(
+    'merged-user-uuid',
+    prompt + '\nadditional user text',
+  );
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify(enqueue) + '\n'
+      + JSON.stringify({
+        type: 'queue-operation',
+        operation: 'dequeue',
+        sessionId: 'claude-session',
+        timestamp: '2026-08-16T10:01:46.000Z',
+      }) + '\n'
+      + JSON.stringify(merged) + '\n',
+  );
+
+  const source = unresolvedRecord('claude', boundary, prompt, {
+    receipt: {
+      transportText: prompt,
+      providerQueue: {
+        sessionId: 'claude-session',
+        entryUuid: 'provider-enqueue-uuid',
+        sourceIdentity: 'claude-queue:uuid:provider-enqueue-uuid',
+        recordByteOffset: boundary.fileSize,
+      },
+    },
+  });
+  const result = await reconcileAgentSendStartupRecord(source);
+  assert.equal(result.decision, 'found');
+  assert.equal(result.reason, 'provider-queue-merged-user-turn');
+  assert.equal(result.audit.entryUuid, 'merged-user-uuid');
+  assert.equal(result.audit.sourceIdentity, 'claude-queue:uuid:provider-enqueue-uuid');
+  assert.equal(result.audit.actualHash, source.promptHash);
+  assert.equal(result.audit.expectedHash, source.promptHash);
+  assert.equal(result.audit.canonicalReason, 'claude_queue_prompt_merged_into_user_turn');
+  assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
+});
+
+test('startup treats exact popAll as queue return even when a later user turn has the old prefix', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-claude-queue-popall-');
+  const transcriptPath = path.join(dir, 'claude.jsonl');
+  const prompt = 'queued prompt without canonical row';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await captureClaudePromptAuditBoundary(transcriptPath);
+  await fs.promises.appendFile(
+    transcriptPath,
+    JSON.stringify({
+      type: 'queue-operation',
+      operation: 'enqueue',
+      uuid: 'popall-enqueue',
+      sessionId: 'claude-session',
+      timestamp: '2026-08-16T10:10:00.000Z',
+      content: prompt,
+    }) + '\n'
+      + JSON.stringify({
+        type: 'queue-operation',
+        operation: 'popAll',
+        sessionId: 'claude-session',
+        timestamp: '2026-08-16T10:10:01.000Z',
+      }) + '\n'
+      + JSON.stringify(claudeUser(
+        'later-manual-user',
+        prompt + '\nnew text submitted after queue retrieval',
+      )) + '\n',
+  );
+
+  const source = unresolvedRecord('claude', boundary, prompt, {
+    receipt: {
+      transportText: prompt,
+      providerQueue: {
+        sessionId: 'claude-session',
+        entryUuid: 'popall-enqueue',
+        recordByteOffset: boundary.fileSize,
+      },
+    },
+  });
+  const result = await reconcileAgentSendStartupRecord(source);
+  assert.equal(result.decision, 'provider-not-accepted');
+  assert.equal(result.reason, 'provider-queue-returned-to-composer');
+  assert.equal(result.audit, null);
+  assert.equal(result.receipt.success, false);
+  assert.equal(result.receipt.cancelled, true);
+  assert.equal(result.receipt.providerQueueReturned, true);
+  assert.equal(result.receipt.sourceIdentity, 'claude-queue:uuid:popall-enqueue');
+  assert.equal(result.receipt.recordByteOffset, boundary.fileSize);
+  assert.ok(result.receipt.queueReturnRecordByteOffset > boundary.fileSize);
+});
+
 test('one allowlisted canonical Codex record produces promotable audit data', async (t) => {
   const dir = await tempDir(t, 'agent-startup-codex-canonical-');
   const transcriptPath = path.join(dir, 'codex.jsonl');

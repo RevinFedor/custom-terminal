@@ -77,3 +77,59 @@ export function shouldWrapControlBar({ availableWidth, leftWidth, rightWidth, mi
   const gap = Number.isFinite(Number(minGap)) ? Number(minGap) : CONTROL_BAR_CLUSTER_MIN_GAP_PX;
   return left + right + gap > available;
 }
+
+/**
+ * Inside the composer the bar may NOT wrap: a second line would give back the
+ * exact height the move into the composer was meant to remove. So when it does
+ * not fit there, something has to go — and it is the readings, never the
+ * controls.
+ *
+ * The readings (cache countdown, context %) are the only things here the user
+ * can get somewhere else: both are also in Timeline. Every other item performs
+ * an action that has no second entry point in this layout. Dropping a control to
+ * keep a number visible would be the wrong trade in a panel this narrow.
+ *
+ * THE TRAP THIS SIGNATURE EXISTS TO AVOID. Hiding the readings makes the bar
+ * narrower, so a naive re-measure then answers "it fits" — and they come back,
+ * and it does not fit, and they go away: a permanent flicker at one width. The
+ * comparison therefore always uses the width the bar needs WITH the readings
+ * present, which does not depend on the current answer. The caller keeps the
+ * last known readings width while they are hidden and adds it back here.
+ *
+ * @param {object} args
+ * @param {number} args.availableWidth inner width available to the bar
+ * @param {number} args.leftWidth      measured width of the left cluster now
+ * @param {number} args.rightWidth     measured width of the right cluster now
+ * @param {number} args.readingsWidth  width the readings occupy when shown; the
+ *                                     caller passes the remembered value while
+ *                                     they are hidden, 0 when there are none
+ * @param {boolean} args.readingsHidden whether the measured widths above were
+ *                                     taken with the readings already hidden
+ * @param {number} [args.minGap]
+ * @returns {boolean} true when the readings must stay hidden to fit one line
+ */
+export function shouldShedControlBarReadings({
+  availableWidth,
+  leftWidth,
+  rightWidth,
+  readingsWidth,
+  readingsHidden = false,
+  minGap,
+}) {
+  const available = Number(availableWidth);
+  const left = Number(leftWidth);
+  const right = Number(rightWidth);
+  const readings = Number(readingsWidth);
+  if (!Number.isFinite(available) || available <= 0) return false;
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
+  if (left <= 0 || right <= 0) return false;
+  // Nothing to shed: this tab has no cache chip and no context %, so hiding
+  // them cannot buy any width and the answer must be "keep everything".
+  const readingsSpace = Number.isFinite(readings) && readings > 0 ? readings : 0;
+  if (readingsSpace <= 0) return false;
+  const gap = Number.isFinite(Number(minGap)) ? Number(minGap) : CONTROL_BAR_CLUSTER_MIN_GAP_PX;
+  // Always compare against the full-content width, whether or not the readings
+  // are on screen right now.
+  const needed = left + right + gap + (readingsHidden ? readingsSpace : 0);
+  return needed > available;
+}

@@ -71,10 +71,12 @@ test('one hop reaches the previous project tab regardless of current project siz
   assert.equal(rows[idx].tab.id, 'a');
 });
 
-test('Ctrl+Tab highlights the most recent tab that is NOT on screen', () => {
-  // Two panes hold a and d; the switcher must offer something you cannot see.
-  // Before this rule the highlight landed on the neighbouring pane's tab — i.e.
-  // "switch to" a tab already in front of you, while the hidden one sat below.
+test('Ctrl+Tab highlights the previous tab even when it is visible in another pane', () => {
+  // Two panes hold a and d; the user just clicked from d's pane into a's.
+  // The previous entry is d — visible, and exactly the target: committing it
+  // jumps focus back to its pane (switchTab's split rule), so one Ctrl+Tab
+  // undoes the accidental click. Visits record only APPEARANCES, so that focus
+  // click did not rewrite the history.
   const rows = buildSwitcherRows({
     projects,
     globalMru: [
@@ -87,27 +89,11 @@ test('Ctrl+Tab highlights the most recent tab that is NOT on screen', () => {
     { projectId: 'p1', tabId: 'a' },
     { projectId: 'p2', tabId: 'd' },
     { projectId: 'p1', tabId: 'b' },
-  ], 'a', ['a', 'd']);
-  assert.equal(rows[idx].tab.id, 'b', 'b is the most recent tab that is off screen');
+  ], 'a');
+  assert.equal(rows[idx].tab.id, 'd', 'the previous tab wins, on screen or not');
 });
 
-test('with every tab on screen the gesture still targets the other pane', () => {
-  // A full split of the only two tabs: nothing is hidden, so the neighbouring
-  // pane is the one meaningful target. The key must not become dead.
-  const twoTabs = [{ projectId: 'p1', projectName: 'p1', tabs: [tab('a'), tab('b')] }];
-  const rows = buildSwitcherRows({
-    projects: twoTabs,
-    globalMru: [{ projectId: 'p1', tabId: 'a' }, { projectId: 'p1', tabId: 'b' }],
-  });
-  const idx = initialCtrlIndex(rows, [
-    { projectId: 'p1', tabId: 'a' },
-    { projectId: 'p1', tabId: 'b' },
-  ], 'a', ['a', 'b']);
-  assert.equal(rows[idx].tab.id, 'b');
-});
-
-test('single mode is unchanged: the previous tab wins', () => {
-  // No panes → on-screen is just the active tab, which is the old behaviour.
+test('single mode: the previous tab wins', () => {
   const rows = buildSwitcherRows({
     projects,
     globalMru: [{ projectId: 'p2', tabId: 'd' }, { projectId: 'p1', tabId: 'a' }],
@@ -115,17 +101,13 @@ test('single mode is unchanged: the previous tab wins', () => {
   assert.equal(rows[initialCtrlIndex(rows, [
     { projectId: 'p2', tabId: 'd' },
     { projectId: 'p1', tabId: 'a' },
-  ], 'd')].tab.id, 'a', 'no on-screen list passed → defaults to the active tab');
-  assert.equal(rows[initialCtrlIndex(rows, [
-    { projectId: 'p2', tabId: 'd' },
-    { projectId: 'p1', tabId: 'a' },
-  ], 'd', ['d'])].tab.id, 'a');
+  ], 'd')].tab.id, 'a');
 });
 
-test('an empty history still lands on an off-screen tab', () => {
+test('an empty history falls back to any non-active tab', () => {
   const rows = buildSwitcherRows({ projects, globalMru: [] });
-  const idx = initialCtrlIndex(rows, [], 'a', ['a', 'd']);
-  assert.ok(!['a', 'd'].includes(rows[idx].tab.id), 'must not preselect a visible tab');
+  const idx = initialCtrlIndex(rows, [], 'a');
+  assert.notEqual(rows[idx].tab.id, 'a', 'must not preselect the active tab');
 });
 
 test('selection skips project headers and wraps', () => {

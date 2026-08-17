@@ -254,8 +254,12 @@ export default function EditProjectModal() {
               </div>
 
               <div>
+                {/* Renamed from "System Path" (2026-08-17): the directory
+                    belongs to TABS — each tab carries its own cwd. The project
+                    only supplies the default for NEW tabs, and the old name
+                    read as the project's identity. */}
                 <label className="block text-[10px] text-gray-500 uppercase font-bold mb-1.5 ml-1 flex items-center gap-2">
-                  System Path
+                  Директория по умолчанию — для новых вкладок
                   {isPathValid === true && <CheckCircle2 size={12} className="text-green-500" />}
                   {isPathValid === false && <AlertCircle size={12} className="text-red-500" />}
                 </label>

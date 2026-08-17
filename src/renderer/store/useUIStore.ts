@@ -588,17 +588,6 @@ interface UIStore {
   reopenPulseActive: boolean;
   triggerReopenPulse: () => void;
 
-  // "Nothing moved, and here is why": the pane header chip navigates to the
-  // tab's project, so when the sidebar is ALREADY on that project the click has
-  // no visible effect and reads as a dead control. One flash of that project's
-  // card answers where the click went. Holds the project id, not a boolean —
-  // several project cards are on screen at once, and only the one meant may
-  // flash.
-  projectCardPulseId: string | null;
-  /** Bumped on every pulse so a repeat click replays the animation. */
-  projectCardPulseSeq: number;
-  pulseProjectCard: (projectId: string) => void;
-
   // History Panel (per-tab state)
   historyPanelOpenTabs: Record<string, boolean>;
   historyPanelWidth: number;
@@ -2965,34 +2954,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
         w.__reopenPulseTimer = null;
       }, 600);
     }
-  },
-
-  projectCardPulseId: null,
-  projectCardPulseSeq: 0,
-  pulseProjectCard: (projectId) => {
-    if (!projectId) return;
-    // Set SYNCHRONOUSLY, in one write. The obvious version — clear, wait a
-    // frame, set again, so the CSS animation restarts from its first keyframe —
-    // never fires in a window that is not on screen: a hidden window paints no
-    // frames, so requestAnimationFrame simply does not run (measured: no frame
-    // after 2.3s). A signal must not depend on a frame.
-    //
-    // The re-arm is carried by a counter instead: the component keys its
-    // animated node on it, so React remounts the node and the animation replays
-    // from the start even when the id has not changed.
-    const seq = (get().projectCardPulseSeq || 0) + 1;
-    set({ projectCardPulseId: projectId, projectCardPulseSeq: seq });
-    if (typeof window === 'undefined') return;
-    const w = window as any;
-    if (w.__projectCardPulseTimer) clearTimeout(w.__projectCardPulseTimer);
-    w.__projectCardPulseTimer = setTimeout(() => {
-      // Only clear OUR pulse: a newer click (on this card or another) bumped the
-      // counter, and its own timer owns the clearing from then on.
-      if (useUIStore.getState().projectCardPulseSeq === seq) {
-        useUIStore.setState({ projectCardPulseId: null });
-      }
-      w.__projectCardPulseTimer = null;
-    }, 600);
   },
 
   // History Panel (per-tab state)

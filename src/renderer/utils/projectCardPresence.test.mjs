@@ -70,41 +70,14 @@ test('missing input degrades to idle', () => {
 });
 
 
-// ── the 'working' tier ────────────────────────────────────────────────────
-
-test('the ACTIVE tab makes its project working, one step above on-screen', () => {
+// The fourth tier — 'working', a contour for the ACTIVE tab's project — was
+// removed with the one-pointer model (2026-08-17): the sidebar follows every
+// activation, so the focused card and the working card are the same card
+// outside a transient explicit parking. Three states must stay three.
+test('there is no working tier: the active tab project reads as plain on-screen while parked', () => {
   assert.equal(projectCardPresence({
     projectId: 'p2',
     focusedProjectId: 'p1',
-    activeProjectId: 'p2',
-    panes: [pane('p1', 'a'), pane('p2', 'b')],
-  }), 'working');
-  // The neighbouring pane's project stays plain on-screen.
-  assert.equal(projectCardPresence({
-    projectId: 'p1',
-    focusedProjectId: 'p3',
-    activeProjectId: 'p2',
     panes: [pane('p1', 'a'), pane('p2', 'b')],
   }), 'on-screen');
-});
-
-test('focused beats working: the explicit choice stays the loudest', () => {
-  // «Смена вкладки ≠ смена проекта»: if the working card outshone the focused
-  // one, switching a tab would READ as switching the project.
-  assert.equal(projectCardPresence({
-    projectId: 'p1',
-    focusedProjectId: 'p1',
-    activeProjectId: 'p1',
-    panes: [pane('p1', 'a')],
-  }), 'focused');
-});
-
-test('single mode: the centre tab of another project is working, not merely on-screen', () => {
-  assert.equal(projectCardPresence({
-    projectId: 'p2',
-    focusedProjectId: 'p1',
-    activeProjectId: 'p2',
-    panes: [],
-    centerProjectId: 'p2',
-  }), 'working');
 });

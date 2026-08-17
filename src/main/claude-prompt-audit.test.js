@@ -7,6 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 
 const {
+  buildClaudeLiveQueueReturnResult,
+  buildClaudeLiveQueueSettlementConfirmation,
   buildClaudeLivePromptAuditConfirmation,
   captureClaudePromptAuditBoundary,
   classifyClaudePromptAuditAdmission,
@@ -15,6 +17,8 @@ const {
   readClaudeUserRecords,
   readLastClaudeUserRecord,
   selectClaudeLivePromptOwner,
+  selectClaudeLiveQueueReturnAudits,
+  selectClaudeLiveQueueSettlementAudits,
   selectClaudePendingPromptAudit,
   selectUniqueClaudePromptSubmitAudit,
   shouldStageClaudeUserPromptAudit,
@@ -648,6 +652,267 @@ test('a live queued_command completes only its exact claimed History audit', () 
     recordByteOffset: 140,
   });
   assert.equal(confirmation?.recordByteOffset, 140);
+});
+
+test('provider queue settlement finalizes the exact claimed prompt without waiting for queued_command', () => {
+  const text = 'queued prompt with no standalone user row';
+  const boundary = { available: true, transcriptPath: '/tmp/live.jsonl', fileSize: 80 };
+  const audit = makeAudit(text, boundary, {
+    handoffId: 'history-queue-consumed',
+    expectedText: text,
+  });
+  const enqueue = {
+    record: {
+      type: 'queue-operation',
+      operation: 'enqueue',
+      uuid: 'queue-enqueue-uuid',
+      content: text,
+      timestamp: '2026-07-24T10:00:00.100Z',
+      sessionId: 'session-live',
+    },
+    text,
+    promptCarrierKind: 'queue-operation',
+    byteOffset: 100,
+    transcriptPath: '/tmp/live.jsonl',
+    queueSourceIdentity: 'claude-queue:uuid:queue-enqueue-uuid',
+  };
+  assert.equal(
+    selectClaudeLivePromptOwner([audit], enqueue, { hashText: sha16 })?.audit,
+    audit,
+  );
+
+  const settlement = {
+    record: {
+      type: 'queue-operation',
+      operation: 'dequeue',
+      uuid: 'queue-dequeue-uuid',
+      timestamp: '2026-07-24T10:00:02.000Z',
+      sessionId: 'session-live',
+    },
+    byteOffset: 140,
+    transcriptPath: '/tmp/live.jsonl',
+    sessionId: 'session-live',
+  };
+  const selections = selectClaudeLiveQueueSettlementAudits([audit], settlement, {
+    hashText: sha16,
+  });
+  assert.equal(selections.length, 1);
+  assert.equal(selections[0].audit, audit);
+  const confirmation = buildClaudeLiveQueueSettlementConfirmation(selections[0], {
+    sessionId: 'session-live',
+    hashText: sha16,
+  });
+  assert.deepEqual(confirmation?.result, {
+    success: true,
+    actualLen: text.length,
+    actualHash: sha16(text),
+    expectedLen: text.length,
+    expectedHash: sha16(text),
+    sessionId: 'session-live',
+    entryUuid: null,
+    sourceIdentity: 'claude-queue:uuid:queue-enqueue-uuid',
+    auditTimestamp: '2026-07-24T10:00:00.100Z',
+    recordByteOffset: 100,
+    canonicalized: true,
+    canonicalReason: 'provider-queue-dequeue',
+  });
+});
+
+test('popAll returns every exact queue claim instead of confirming delivery', () => {
+  const boundary = { available: true, transcriptPath: '/tmp/returned.jsonl', fileSize: 10 };
+  const firstText = 'first queued prompt';
+  const secondText = 'second queued prompt';
+  const first = makeAudit(firstText, boundary, {
+    handoffId: 'history-queue-return-first',
+    expectedText: firstText,
+  });
+  const second = makeAudit(secondText, boundary, {
+    handoffId: 'history-queue-return-second',
+    expectedText: secondText,
+  });
+  for (const [audit, text, uuid, byteOffset] of [
+    [first, firstText, 'return-enqueue-first', 20],
+    [second, secondText, 'return-enqueue-second', 40],
+  ]) {
+    selectClaudeLivePromptOwner([audit], {
+      record: {
+        type: 'queue-operation',
+        operation: 'enqueue',
+        uuid,
+        content: text,
+        timestamp: '2026-08-16T10:00:00.000Z',
+        sessionId: 'session-return',
+      },
+      text,
+      promptCarrierKind: 'queue-operation',
+      byteOffset,
+      transcriptPath: '/tmp/returned.jsonl',
+      queueSourceIdentity: 'claude-queue:uuid:' + uuid,
+    }, { hashText: sha16 });
+  }
+
+  const popAll = {
+    record: {
+      type: 'queue-operation',
+      operation: 'popAll',
+      uuid: 'return-popall',
+      timestamp: '2026-08-16T10:00:01.000Z',
+      sessionId: 'session-return',
+    },
+    byteOffset: 60,
+    transcriptPath: '/tmp/returned.jsonl',
+    sessionId: 'session-return',
+  };
+  assert.deepEqual(
+    selectClaudeLiveQueueSettlementAudits([first, second], popAll, { hashText: sha16 }),
+    [],
+  );
+  const returned = selectClaudeLiveQueueReturnAudits([first, second], popAll);
+  assert.deepEqual(returned.map((selection) => selection.audit), [first, second]);
+  const result = buildClaudeLiveQueueReturnResult(returned[0], {
+    sessionId: 'session-return',
+    hashText: sha16,
+  })?.result;
+  assert.equal(result?.success, false);
+  assert.equal(result?.cancelled, true);
+  assert.equal(result?.semanticStatus, 'not-submitted');
+  assert.equal(result?.providerQueueReturned, true);
+  assert.equal(result?.composerDraftState, 'exact-provider-queue-return');
+  assert.equal(result?.sourceIdentity, 'claude-queue:uuid:return-enqueue-first');
+  assert.equal(result?.recordByteOffset, 20);
+  assert.equal(result?.queueReturnRecordByteOffset, 60);
+});
+
+test('one exact queue claim follows its text into a canonical user turn with appended text', () => {
+  const text = 'queued prompt';
+  const boundary = { available: true, transcriptPath: '/tmp/merged.jsonl', fileSize: 20 };
+  const audit = makeAudit(text, boundary, {
+    handoffId: 'history-queue-merged',
+    expectedText: text,
+  });
+  selectClaudeLivePromptOwner([audit], {
+    record: {
+      type: 'queue-operation',
+      operation: 'enqueue',
+      uuid: 'merged-enqueue',
+      content: text,
+      timestamp: '2026-08-16T09:58:43.000Z',
+      sessionId: 'session-merged',
+    },
+    text,
+    promptCarrierKind: 'queue-operation',
+    byteOffset: 40,
+    transcriptPath: '/tmp/merged.jsonl',
+    queueSourceIdentity: 'claude-queue:uuid:merged-enqueue',
+  }, { hashText: sha16 });
+
+  const candidate = {
+    record: {
+      type: 'user',
+      uuid: 'merged-user',
+      timestamp: '2026-08-16T10:01:47.000Z',
+      sessionId: 'session-merged',
+      message: { role: 'user', content: text + '\nadditional text' },
+    },
+    text: text + '\nadditional text',
+    promptCarrierKind: 'user',
+    byteOffset: 80,
+    transcriptPath: '/tmp/merged.jsonl',
+  };
+  const selection = selectClaudeLivePromptOwner([audit], candidate, { hashText: sha16 });
+  assert.equal(selection?.reason, 'canonical-merged-after-exact-queue-claim');
+  const confirmation = buildClaudeLivePromptAuditConfirmation(selection, candidate, {
+    sessionId: 'session-merged',
+    hashText: sha16,
+  });
+  assert.equal(confirmation?.result.actualLen, text.length);
+  assert.equal(confirmation?.result.actualHash, sha16(text));
+  assert.equal(confirmation?.result.entryUuid, 'merged-user');
+  assert.equal(
+    confirmation?.result.sourceIdentity,
+    'claude-queue:uuid:merged-enqueue',
+  );
+  assert.equal(confirmation?.actualText, text);
+});
+
+test('a merged canonical turn cannot guess between two exact queue claims with the same prefix', () => {
+  const text = 'same queued prefix';
+  const boundary = { available: true, transcriptPath: '/tmp/ambiguous-merge.jsonl', fileSize: 0 };
+  const first = makeAudit(text, boundary, {
+    handoffId: 'first-merged',
+    expectedText: text,
+  });
+  const second = makeAudit(text, boundary, {
+    handoffId: 'second-merged',
+    expectedText: text,
+  });
+  for (const [audit, offset, uuid] of [
+    [first, 10, 'first-enqueue'],
+    [second, 20, 'second-enqueue'],
+  ]) {
+    selectClaudeLivePromptOwner([first, second], {
+      record: {
+        type: 'queue-operation', operation: 'enqueue', uuid, content: text,
+        sessionId: 'session-ambiguous',
+      },
+      text,
+      promptCarrierKind: 'queue-operation',
+      byteOffset: offset,
+      transcriptPath: '/tmp/ambiguous-merge.jsonl',
+      queueSourceIdentity: `claude-queue:uuid:${uuid}`,
+    }, { hashText: sha16 });
+    assert.equal(audit.liveQueuePromptClaim?.entryUuid, uuid);
+  }
+  const merged = selectClaudeLivePromptOwner([first, second], {
+    record: {
+      type: 'user', uuid: 'merged-ambiguous', sessionId: 'session-ambiguous',
+    },
+    text: text + '\nextra',
+    promptCarrierKind: 'user',
+    byteOffset: 30,
+    transcriptPath: '/tmp/ambiguous-merge.jsonl',
+  }, { hashText: sha16 });
+  assert.equal(merged, null);
+});
+
+test('queue settlement cannot consume a foreign exact-content claim', () => {
+  const text = 'owned queue prompt';
+  const audit = makeAudit(text, {
+    available: true,
+    transcriptPath: '/tmp/owned.jsonl',
+    fileSize: 10,
+  }, {
+    handoffId: 'owned',
+    expectedText: text,
+  });
+  selectClaudeLivePromptOwner([audit], {
+    record: {
+      type: 'queue-operation',
+      operation: 'enqueue',
+      uuid: 'owned-enqueue',
+      content: text,
+      sessionId: 'owned-session',
+    },
+    text,
+    promptCarrierKind: 'queue-operation',
+    byteOffset: 20,
+    transcriptPath: '/tmp/owned.jsonl',
+    queueSourceIdentity: 'claude-queue:uuid:owned-enqueue',
+  }, { hashText: sha16 });
+
+  const foreign = selectClaudeLiveQueueSettlementAudits([audit], {
+    record: {
+      type: 'queue-operation',
+      operation: 'remove',
+      content: text,
+      sessionId: 'foreign-session',
+    },
+    byteOffset: 40,
+    transcriptPath: '/tmp/foreign.jsonl',
+    sessionId: 'foreign-session',
+  }, { hashText: sha16 });
+  assert.deepEqual(foreign, []);
+  assert.equal(audit.liveQueueSettlementClaim, undefined);
 });
 
 test('an ordinary live user carrier completes its exact History audit without a queue claim', () => {

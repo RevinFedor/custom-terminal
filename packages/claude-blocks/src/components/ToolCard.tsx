@@ -5,8 +5,9 @@
    Collapse-механизм внедряемый (controlled open/onToggle ИЛИ
    внутренний useState) — десктоп/мобайл подставляют свой персист.
    ============================================================ */
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import { Loader2Icon, AlertTriangleIcon, ChevronRightIcon } from '../icons';
+import { RowCopyButton } from './RowCopyButton';
 import type { ToolStatus } from '../helpers';
 
 const STATUS_CLASS: Record<ToolStatus, string> = {
@@ -53,11 +54,19 @@ export interface ToolCardProps {
   onToggle?: () => void;
   /** Якорь корня — для desktop scroll-compensation. */
   anchorRef?: React.RefObject<HTMLDivElement | null>;
+  /**
+   * Full row payload for the hover copy button (original form: command +
+   * output, file content, diff). Omitted → no button, because there is
+   * nothing this row could honestly hand over.
+   */
+  getCopyText?: () => string;
+  onCopy?: (text: string) => void;
 }
 
 export const ToolCard: React.FC<ToolCardProps> = ({
   status, icon, label, description, preview, badges, subtitle, body,
   collapsible = true, defaultOpen = false, open, onToggle, anchorRef,
+  getCopyText, onCopy,
 }) => {
   const [internalOpen, setInternalOpen] = useState(defaultOpen);
   const localRef = useRef<HTMLDivElement>(null);
@@ -68,49 +77,6 @@ export const ToolCard: React.FC<ToolCardProps> = ({
 
   const hasBody = body !== undefined && body !== null && body !== false;
   const clickable = hasBody && collapsible;
-  const revealRef = useRef<HTMLDivElement>(null);
-  // `mounted` trails `isOpen`: true immediately on open (so the grid exists
-  // to animate), and stays true until the closing transition ends.
-  const [mounted, setMounted] = useState(isOpen);
-  // A transition only runs when a value CHANGES on an element the browser has
-  // already laid out. The wrapper mounts in the same commit as the open
-  // state, so painting it directly at 1fr produced no animation at all
-  // (measured live: full height at t=40ms). `revealActive` is therefore
-  // flipped one frame AFTER mount — first frame 0fr, next frame 1fr, which is
-  // a real change and animates.
-  const [revealActive, setRevealActive] = useState(false);
-  useEffect(() => {
-    if (!mounted) { setRevealActive(false); return; }
-    if (!isOpen) { setRevealActive(false); return; }
-    const raf = requestAnimationFrame(() => setRevealActive(true));
-    return () => cancelAnimationFrame(raf);
-  }, [mounted, isOpen]);
-  useEffect(() => {
-    if (isOpen) { setMounted(true); return; }
-    if (!mounted) return;
-    const node = revealRef.current;
-    if (!node) { setMounted(false); return; }
-    const reduced = typeof window !== 'undefined'
-      && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-    if (reduced) { setMounted(false); return; }
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      setMounted(false);
-    };
-    const onEnd = (event: TransitionEvent) => {
-      if (event.target === node && event.propertyName === 'grid-template-rows') finish();
-    };
-    node.addEventListener('transitionend', onEnd);
-    // Safety net: a row scrolled out of view (or a browser that skips the
-    // transition) must not leave the body mounted forever.
-    const timer = window.setTimeout(finish, 400);
-    return () => {
-      node.removeEventListener('transitionend', onEnd);
-      window.clearTimeout(timer);
-    };
-  }, [isOpen, mounted]);
 
   return (
     <div ref={rootRef} className="cb-tool">
@@ -143,28 +109,25 @@ export const ToolCard: React.FC<ToolCardProps> = ({
             {clickable && <ChevronRightIcon size={11} className="cb-tool-chevron" />}
           </span>
         </div>
+        {/* Copy sits OUTSIDE the shrink-to-fit inner box, pinned to the row's
+            right edge — the same place and the same hover rule as a prompt
+            row's copy. Inside the inner box it would ride at the end of the
+            text and move with every label. */}
+        {getCopyText && onCopy && (
+          <RowCopyButton getText={getCopyText} onCopy={onCopy} />
+        )}
       </div>
       {subtitle && <div className="cb-tool-sub">{subtitle}</div>}
-      {/* Height animation, both directions.
-          The body is wrapped in a grid whose single row goes 0fr → 1fr, which
-          the browser interpolates as a real height change — no JS measuring,
-          no absolute clone, and it plays on CLOSE too (a plain conditional
-          mount can only animate the opening half). `mounted` keeps the
-          subtree alive for the closing frames and drops it after, so a
-          collapsed card still costs nothing — the perf rule that heavy diff
-          rows must not live in the feed while collapsed is preserved. */}
-      {hasBody && mounted && (
-        <div
-          className="cb-tool-reveal"
-          data-open={isOpen && revealActive ? 'true' : 'false'}
-          ref={revealRef}
-        >
-          <div className="cb-tool-reveal-inner">
-            <div className="cb-tool-body">
-              <span className="cb-rail" />
-              {body}
-            </div>
-          </div>
+      {/* No height animation, by decision (16.08): every animated variant
+          either fought the virtualized list (height remeasure jitter) or the
+          stationary-click rule below. The body mounts open and unmounts
+          closed — a collapsed card costs nothing, and the row's height
+          changes in ONE frame, which is exactly what the caller's scroll
+          compensation is written against. */}
+      {hasBody && isOpen && (
+        <div className="cb-tool-body">
+          <span className="cb-rail" />
+          {body}
         </div>
       )}
     </div>

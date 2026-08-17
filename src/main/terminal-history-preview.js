@@ -254,11 +254,11 @@ const CLAUDE_BARE_TOOL_INVOCATION_RE = /^\s*⏺\s+[A-Z][A-Za-z0-9_.:-]{1,64}\s*\
 // the later styled `⎿` result child.
 const CLAUDE_OPEN_TOOL_INVOCATION_RE = /^\s*⏺\s+[A-Z][A-Za-z0-9_.:-]{1,64}\s*\(/u;
 // Newer Claude builds render the compact summary of an expandable thinking or
-// tool group with a gray `●` instead of the ordinary assistant/tool `⏺`.
+// tool group with either the ordinary provider glyph `⏺` or a gray `●`.
 // The title and counters are intentionally free-form; the bullet plus the
 // keyboard affordance are the stable structural evidence. Wrapped physical
 // rows are joined before this classifier runs.
-const CLAUDE_EXPANDABLE_SUMMARY_ANCHOR_RE = /^\s*●\s+.+\(\s*(?:ctrl|control|cmd)\+[^)]{1,24}\s+to\s+(?:expand|collapse|open|view)[^)]*\)\s*$/iu;
+const CLAUDE_EXPANDABLE_SUMMARY_ANCHOR_RE = /^\s*(?:⏺|●)\s+.+\(\s*(?:ctrl|control|cmd)\+[^)]{1,24}\s+to\s+(?:expand|collapse|open|view)[^)]*\)\s*$/iu;
 // Claude sometimes repaints an expandable summary without either provider
 // root glyph (`⏺` / `●`). This is not limited to thinking: production frame
 // 2197 rendered `Reading 1 file… (ctrl+o to expand)` the same way. Do not
@@ -267,6 +267,16 @@ const CLAUDE_EXPANDABLE_SUMMARY_ANCHOR_RE = /^\s*●\s+.+\(\s*(?:ctrl|control|cm
 // ordinary assistant prose.
 const CLAUDE_BARE_EXPANDABLE_SUMMARY_ANCHOR_RE = /^(?!\s*(?:⏺|●)(?:\s|$))(?=\s*\S)[^\n]{1,240}\(\s*(?:ctrl|control|cmd)\+[^)]{1,24}\s+to\s+(?:expand|collapse|open|view)[^)]*\)\s*$/iu;
 const CLAUDE_CLIPPED_EXPANDABLE_SUMMARY_ANCHOR_RE = /^\s*(?:…|\.\.\.)\s*\+\d+\s+lines?\s*\(\s*(?:ctrl|control|cmd)\+[^)]{1,24}\s+to\s+(?:expand|collapse|open|view)[^)]*\)/iu;
+// Claude's API retry card is laid out as two columns. In a narrow terminal the
+// spinner can occupy one physical row while `Waiting for API`, the countdown
+// and `check your network` are interleaved over the following rows. It is not
+// an activity verb and therefore cannot be recognized by the ordinary spinner
+// grammar. Require the provider glyph plus both independent service receipts;
+// neither colour nor a lone `Waiting...` phrase may hide assistant prose.
+const CLAUDE_RETRY_CARD_ROOT_RE = /^\s*(?:⏺|●)?\s*[✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❈❉❊❋·*](?:\s+Waiting\b|\s*$)/iu;
+const CLAUDE_RETRY_CARD_WAIT_RE = /\bWaiting\s+for\s+(?:the\s+)?API\b/iu;
+const CLAUDE_RETRY_CARD_COUNTDOWN_RE = /\b(?:will\s+retry|retrying)\s+in\s+\d+(?:\s*[hms])?(?:\s+\d+(?:\s*[hms])?){0,2}\b/iu;
+const CLAUDE_RETRY_CARD_NETWORK_RE = /\bcheck\s+your(?:\s+response)?\s+network\b/iu;
 // Codex renders provider-owned progress rows with the same `•` root glyph as
 // assistant prose. Tool-card geometry alone therefore cannot distinguish a
 // standalone web-search update or a call whose result is still pending. Keep
@@ -285,6 +295,70 @@ const CODEX_QUEUED_MESSAGE_CONTINUATION_RE = /^\s*\(press esc to interrupt and s
 const CODEX_QUEUED_MESSAGE_BRANCH_RE = /^\s*↳(?:\s+.*)?$/u;
 const CODEX_TRANSPORT_STATUS_RE = /^\s*⚠\s*Falling back from WebSockets to HTTPS transport\.?(?:\s+stream disconnected before completion:\s*websocket)?(?:\s+closed by server before response\.completed)?\s*$/iu;
 const CODEX_TRANSPORT_CONTINUATION_RE = /^\s*(?:stream disconnected before completion:\s*websocket(?:\s+closed by server before response\.completed)?|closed by server before response\.completed)\s*$/iu;
+// Codex paints MCP startup failures as yellow warning cards before ordinary
+// assistant output. The server name and timeout are dynamic, but the complete
+// provider grammar is stable. Require the warning root plus its config receipt
+// (or the complete startup-incomplete sentence); a lone warning glyph or a
+// prose mention of `startup_timeout_sec` remains eligible assistant text.
+const CODEX_MCP_STARTUP_TIMEOUT_ROOT_RE = /^\s*⚠\s*MCP client for\s+.+?\s+timed out after\s+\d+(?:\.\d+)?\s+seconds?\b/iu;
+const CODEX_MCP_STARTUP_TIMEOUT_CONFIG_RE = /\bstartup_timeout_sec\b\s*=\s*(?:XX|\d+(?:\.\d+)?)\b/iu;
+const CODEX_MCP_STARTUP_INCOMPLETE_RE = /^\s*⚠\s*MCP startup incomplete\s*\(\s*failed:\s*[^)]+\)\s*$/iu;
+const CODEX_TRANSCRIPT_FOLD_SUMMARY_RE = /^\s*(?:…|\.\.\.)\s*\+\d+\s+lines?\s*\(\s*(?:ctrl|control|cmd)\s*\+\s*t\s+to\s+view\s+transcript\s*\)\s*$/iu;
+
+// Reassembles Claude's multi-column retry card after xterm has split it into
+// independent logical rows. The complete shape is deliberately required:
+// spinner root + API wait label + retry countdown + network affordance. This
+// keeps a quoted retry sentence, an arbitrary spinner-prefixed answer and
+// future prose eligible.
+function classifySplitClaudeRetryCardAnchor(lines, start) {
+  const source = Array.isArray(lines) ? lines : [];
+  const root = String(source[start]?.text || '');
+  if (!CLAUDE_RETRY_CARD_ROOT_RE.test(root)) return null;
+
+  let combined = '';
+  let styleEvidence = false;
+  const limit = Math.min(source.length, start + 5);
+  for (let end = start; end < limit; end += 1) {
+    const raw = String(source[end]?.text || '');
+    if (!raw.trim()) break;
+    if (end > start && (STRONG_COMPOSER_RE.test(raw)
+      || TERMINAL_ROOT_BLOCK_MARKER.claude.test(raw))) break;
+    combined = compactText(combined + ' ' + raw);
+    styleEvidence = styleEvidence
+      || terminalLineStyleEvidence(source[end]).hasSystemTint;
+    if (CLAUDE_RETRY_CARD_WAIT_RE.test(combined)
+      && CLAUDE_RETRY_CARD_COUNTDOWN_RE.test(combined)
+      && CLAUDE_RETRY_CARD_NETWORK_RE.test(combined)) {
+      return { kind: 'retry-status', styleEvidence, endIndex: end };
+    }
+  }
+  return null;
+}
+
+// Claude sometimes positions the second half of an expandable summary with an
+// explicit cursor move instead of xterm soft-wrap. In that frame
+// `⏺ Thinking ... (ctrl+o to ` and `expand)` are separate logical rows. Join a
+// tiny adjacent window only for the complete provider glyph + keyboard
+// affordance grammar; ordinary multi-line prose is never inferred from style.
+function classifySplitClaudeExpandableSummaryAnchor(lines, start) {
+  const source = Array.isArray(lines) ? lines : [];
+  let combined = '';
+  let styleEvidence = false;
+  const limit = Math.min(source.length, start + 4);
+  for (let end = start; end < limit; end += 1) {
+    const raw = String(source[end]?.text || '');
+    if (!raw.trim()) break;
+    combined = combined
+      ? `${combined.trimEnd()} ${raw.trim()}`
+      : raw;
+    styleEvidence = styleEvidence
+      || terminalLineStyleEvidence(source[end]).hasSystemTint;
+    if (CLAUDE_EXPANDABLE_SUMMARY_ANCHOR_RE.test(combined)) {
+      return { kind: 'structured-summary', styleEvidence, endIndex: end };
+    }
+  }
+  return null;
+}
 
 // Codex often redraws narrow panes with explicit cursor moves rather than
 // xterm soft-wraps. Reassemble only the exact queue-card sentence over a small
@@ -341,8 +415,48 @@ function classifySplitCodexTransportAnchor(lines, start) {
     : null;
 }
 
+function classifySplitCodexMcpStartupAnchor(lines, start) {
+  const source = Array.isArray(lines) ? lines : [];
+  const first = String(source[start]?.text || '');
+  if (CODEX_MCP_STARTUP_INCOMPLETE_RE.test(first)) {
+    return {
+      kind: 'startup-warning',
+      styleEvidence: terminalLineStyleEvidence(source[start]).hasSystemTint,
+      endIndex: start,
+    };
+  }
+  if (!/^\s*⚠\s*MCP client for\b/iu.test(first)) return null;
+
+  let combined = '';
+  let styleEvidence = false;
+  const limit = Math.min(source.length, start + 9);
+  for (let end = start; end < limit; end += 1) {
+    const raw = String(source[end]?.text || '');
+    if (!raw.trim()) break;
+    if (end > start && (STRONG_COMPOSER_RE.test(raw)
+      || TERMINAL_ROOT_BLOCK_MARKER.codex.test(raw)
+      || /^\s*⚠\s*/u.test(raw))) break;
+    combined = compactText(combined + ' ' + raw);
+    styleEvidence = styleEvidence
+      || terminalLineStyleEvidence(source[end]).hasSystemTint;
+    if (CODEX_MCP_STARTUP_TIMEOUT_ROOT_RE.test(combined)
+      && CODEX_MCP_STARTUP_TIMEOUT_CONFIG_RE.test(combined)) {
+      return { kind: 'startup-warning', styleEvidence, endIndex: end };
+    }
+  }
+  return null;
+}
+
 function classifyTerminalSystemBlockAt(lines, index, provider) {
+  if (provider === 'claude') {
+    const retry = classifySplitClaudeRetryCardAnchor(lines, index);
+    if (retry) return retry;
+    const expandable = classifySplitClaudeExpandableSummaryAnchor(lines, index);
+    if (expandable) return expandable;
+  }
   if (provider === 'codex') {
+    const mcpStartup = classifySplitCodexMcpStartupAnchor(lines, index);
+    if (mcpStartup) return mcpStartup;
     const transport = classifySplitCodexTransportAnchor(lines, index);
     if (transport) return transport;
     const queue = classifySplitCodexQueueAnchor(lines, index);
@@ -511,6 +625,82 @@ function filterClippedCodexToolCardPrefix(lines, provider) {
   };
 }
 
+const CODEX_NUMBERED_DIFF_ROW_RE = /^\s*\d+\s+[+-](?:\s|$)/u;
+
+function terminalLineBackgroundToken(line) {
+  const style = terminalLineStyleEvidence(line);
+  for (const value of [style.firstTextStyle, ...style.styles]) {
+    const match = /(?:^|,)bg=([^,\s]+)/u.exec(String(value || ''));
+    if (match && match[1] !== '0:-1') return match[1];
+  }
+  return null;
+}
+
+/**
+ * Removes the clipped body of a Codex Update/MultiEdit diff card.
+ *
+ * The exact tool-result can reach JSONL before Codex finishes painting the
+ * same result into the PTY. In that race the new baseline lands immediately
+ * above a presentation-only numbered diff (`90 - ...`) and the card root is
+ * no longer inside the owned region. Text alone is not enough authority: an
+ * assistant may legitimately discuss numbered +/- lines. Require the stable
+ * provider geometry together — at least two gutter rows, dim cells and one
+ * shared non-default background — and consume only the prefix with that same
+ * background. The first ordinary row after the card remains eligible prose.
+ */
+function filterClippedCodexNumberedDiffPrefix(lines, provider) {
+  const source = Array.isArray(lines) ? lines : [];
+  if (provider !== 'codex' || source.length === 0) {
+    return { lines: source, filtered: 0, styleEvidence: false };
+  }
+  let start = 0;
+  while (start < source.length && !String(source[start]?.text || '').trim()) start += 1;
+  if (start >= source.length) {
+    return { lines: source, filtered: 0, styleEvidence: false };
+  }
+  const firstText = String(source[start]?.text || '');
+  const firstStyle = terminalLineStyleEvidence(source[start]);
+  const background = terminalLineBackgroundToken(source[start]);
+  if (!CODEX_NUMBERED_DIFF_ROW_RE.test(firstText)
+    || !firstStyle.hasDim
+    || !firstStyle.hasNonDefaultBg
+    || !background) {
+    return { lines: source, filtered: 0, styleEvidence: false };
+  }
+
+  let end = start;
+  let gutterRows = 0;
+  while (end < source.length) {
+    const raw = String(source[end]?.text || '');
+    if (!raw.trim()) break;
+    const style = terminalLineStyleEvidence(source[end]);
+    if (!style.hasDim
+      || !style.hasNonDefaultBg
+      || terminalLineBackgroundToken(source[end]) !== background) break;
+    if (CODEX_NUMBERED_DIFF_ROW_RE.test(raw)) {
+      gutterRows += 1;
+      end += 1;
+      continue;
+    }
+    // Narrow panes paint a wrapped source line as another physical row rather
+    // than setting xterm's wrapped bit. It remains indented under the same
+    // coloured diff card and has the same background receipt.
+    if (gutterRows > 0 && /^\s{4,}\S/u.test(raw)) {
+      end += 1;
+      continue;
+    }
+    break;
+  }
+  if (gutterRows < 2) {
+    return { lines: source, filtered: 0, styleEvidence: false };
+  }
+  return {
+    lines: source.slice(0, start).concat(source.slice(end)),
+    filtered: end - start,
+    styleEvidence: true,
+  };
+}
+
 function filterInlineTerminalToolCards(lines, provider) {
   const source = Array.isArray(lines) ? lines : [];
   const rootMarker = TERMINAL_ROOT_BLOCK_MARKER[provider];
@@ -604,6 +794,7 @@ function filterBoundarySpanningProviderBlock({
   leadingPhysicalLines,
   physicalLines,
   provider,
+  exactStructuredBoundaryKind = null,
 } = {}) {
   const ownedLogical = logicalTerminalLines(physicalLines);
   const leading = Array.isArray(leadingPhysicalLines) ? leadingPhysicalLines : [];
@@ -638,6 +829,163 @@ function filterBoundarySpanningProviderBlock({
       kinds: [],
       styleEvidence: false,
     };
+  }
+
+  // A queued/submitted user card can be repainted after an exact assistant or
+  // tool boundary. If that boundary cuts through the card, the owned region
+  // starts with innocent-looking prompt prose while its `❯` / `›` root sits
+  // just above the boundary. Carry the card identity across the cut using the
+  // provider-owned background/inverse geometry. This is provider-neutral:
+  // Claude and Codex use different lifecycle paths but the same structural
+  // proof. Text prefixes are deliberately irrelevant.
+  const contextPhysical = context
+    .slice()
+    .sort((left, right) => Number(left?.row) - Number(right?.row));
+  const ownedPhysical = (Array.isArray(physicalLines) ? physicalLines : [])
+    .slice()
+    .sort((left, right) => Number(left?.row) - Number(right?.row));
+  const firstOwnedPhysical = ownedPhysical[0];
+  const firstOwnedPhysicalRow = Number(firstOwnedPhysical?.row);
+  let promptRootIndex = -1;
+  for (let index = contextPhysical.length - 1; index >= 0; index -= 1) {
+    const raw = String(contextPhysical[index]?.text || '');
+    const style = terminalLineStyleEvidence(contextPhysical[index]);
+    if (STRONG_COMPOSER_RE.test(raw)
+      && (style.activeByInverse || style.hasInverse || style.hasNonDefaultBg)) {
+      promptRootIndex = index;
+      break;
+    }
+  }
+  if (promptRootIndex >= 0 && Number.isFinite(firstOwnedPhysicalRow)) {
+    const root = contextPhysical[promptRootIndex];
+    const rootBackground = terminalLineBackgroundToken(root);
+    const promptSpan = [...contextPhysical.slice(promptRootIndex), ...ownedPhysical];
+    let previousRow = null;
+    let lastPromptRow = null;
+    for (const line of promptSpan) {
+      const row = Number(line?.row);
+      const raw = String(line?.text || '');
+      const style = terminalLineStyleEvidence(line);
+      const background = terminalLineBackgroundToken(line);
+      const adjacent = previousRow === null
+        || (Number.isFinite(row) && row === previousRow + 1);
+      const samePromptSurface = rootBackground
+        ? background === rootBackground
+        : (style.activeByInverse || style.hasInverse || style.hasNonDefaultBg);
+      if (!adjacent || !raw.trim() || !samePromptSurface) break;
+      lastPromptRow = row;
+      previousRow = row;
+    }
+    if (Number.isFinite(lastPromptRow) && lastPromptRow >= firstOwnedPhysicalRow) {
+      const lines = ownedLogical.filter((line) => line.startRow > lastPromptRow);
+      const filtered = ownedLogical.length - lines.length;
+      if (filtered > 0) {
+        return {
+          lines,
+          filtered,
+          kinds: ['boundary-prompt-card-continuation'],
+          styleEvidence: true,
+        };
+      }
+    }
+  }
+
+  // An exact JSONL boundary can cut through the expanded body of a large
+  // Codex tool result whose root has already scrolled far beyond the small
+  // context window. In that shape both sides of the boundary are one dim
+  // provider-owned body. Usually an adjacent row still carries Codex's exact
+  // `… +N lines (ctrl + t to view transcript)` receipt. For a very large tool
+  // invocation even that receipt can scroll away; then the exact structured
+  // `tool-use` / `tool-result` record is the missing authority. Never infer
+  // this from dim prose alone.
+  if (provider === 'codex') {
+    const contextTail = contextPhysical.at(-1);
+    const ownedHead = ownedPhysical[0];
+    const contextTailRow = Number(contextTail?.row);
+    const ownedHeadRow = Number(ownedHead?.row);
+    const rowsAreAdjacent = Number.isFinite(contextTailRow)
+      && Number.isFinite(ownedHeadRow)
+      && ownedHeadRow === contextTailRow + 1;
+    const boundaryIsDimBody = rowsAreAdjacent
+      && String(contextTail?.text || '').trim()
+      && String(ownedHead?.text || '').trim()
+      && terminalLineStyleEvidence(contextTail).allTextDim
+      && terminalLineStyleEvidence(ownedHead).allTextDim;
+    if (boundaryIsDimBody) {
+      const contextSuffix = [];
+      for (let index = contextPhysical.length - 1; index >= 0; index -= 1) {
+        const line = contextPhysical[index];
+        const next = contextSuffix[0];
+        const row = Number(line?.row);
+        const nextRow = Number(next?.row);
+        if (!String(line?.text || '').trim()
+          || !terminalLineStyleEvidence(line).allTextDim
+          || (next && (!Number.isFinite(row) || !Number.isFinite(nextRow) || nextRow !== row + 1))) {
+          break;
+        }
+        contextSuffix.unshift(line);
+      }
+      const ownedPrefix = [];
+      for (const line of ownedPhysical) {
+        const previous = ownedPrefix.at(-1);
+        const row = Number(line?.row);
+        const previousRow = Number(previous?.row);
+        if (!String(line?.text || '').trim()
+          || !terminalLineStyleEvidence(line).allTextDim
+          || (previous && (!Number.isFinite(row)
+            || !Number.isFinite(previousRow)
+            || row !== previousRow + 1))) {
+          break;
+        }
+        ownedPrefix.push(line);
+      }
+      const hasTranscriptReceipt = [...contextSuffix, ...ownedPrefix]
+        .some((line) => CODEX_TRANSCRIPT_FOLD_SUMMARY_RE.test(String(line?.text || '')));
+      const exactToolBoundary = (exactStructuredBoundaryKind === 'tool-use'
+        || exactStructuredBoundaryKind === 'tool-result')
+        && /^\s{2,}\S/u.test(String(contextTail?.text || ''))
+        && /^\s{2,}\S/u.test(String(ownedHead?.text || ''));
+      let provenOwnedPrefix = ownedPrefix;
+      if (exactToolBoundary) {
+        // Once the exact tool receipt and the cross-boundary dim cells prove
+        // ownership, keep following the indented card body. A URL/identifier
+        // inside an otherwise dim card can use a non-dim colour, so requiring
+        // every later cell to remain dim would leak the final JSON rows. Stop
+        // before the first top-level provider row or prose paragraph.
+        provenOwnedPrefix = [];
+        for (const line of ownedPhysical) {
+          const previous = provenOwnedPrefix.at(-1);
+          const row = Number(line?.row);
+          const previousRow = Number(previous?.row);
+          const raw = String(line?.text || '');
+          const adjacent = !previous || (Number.isFinite(row)
+            && Number.isFinite(previousRow)
+            && row === previousRow + 1);
+          const continuesToolBody = terminalLineStyleEvidence(line).allTextDim
+            || /^\s{2,}\S/u.test(raw);
+          if (!adjacent || !raw.trim() || !continuesToolBody) break;
+          provenOwnedPrefix.push(line);
+        }
+      }
+      if ((hasTranscriptReceipt || exactToolBoundary) && provenOwnedPrefix.length > 0) {
+        const lastOwnedPrefixRow = Number(provenOwnedPrefix.at(-1)?.row);
+        const lines = ownedLogical.filter((line) => line.startRow > lastOwnedPrefixRow);
+        const filtered = ownedLogical.length - lines.length;
+        if (filtered > 0) {
+          return {
+            lines,
+            filtered,
+            kinds: [
+              exactToolBoundary
+                ? 'boundary-exact-tool-card-continuation'
+                : 'boundary-tool-result-continuation',
+              'tool-card',
+            ],
+            styleEvidence: true,
+          };
+        }
+      }
+    }
   }
 
   const combined = logicalTerminalLines([...context, ...physicalLines]);
@@ -766,9 +1114,9 @@ function removeClippedSubmittedPromptPrefix(lines, promptText) {
     : { lines, removed: 0 };
 }
 
-function removeResidualCodexSubmittedPromptBlocks(lines, provider) {
+function removeResidualSubmittedPromptBlocks(lines, provider) {
   const source = Array.isArray(lines) ? lines : [];
-  if (provider !== 'codex' || source.length === 0) {
+  if ((provider !== 'codex' && provider !== 'claude') || source.length === 0) {
     return { lines: source, removed: 0, blocks: 0 };
   }
   const excluded = new Set();
@@ -789,13 +1137,18 @@ function removeResidualCodexSubmittedPromptBlocks(lines, provider) {
     // provider-owned background/inverse card is the structural proof; an
     // ordinary `›` in assistant prose still has no such style and is kept.
     blocks += 1;
+    const rootBackground = terminalLineBackgroundToken(line);
     excluded.add(index);
     index += 1;
     while (index < source.length) {
       const continuation = terminalLineStyleEvidence(source[index]);
-      if (!(continuation.activeByInverse
-        || continuation.hasInverse
-        || continuation.hasNonDefaultBg)) break;
+      const continuationBackground = terminalLineBackgroundToken(source[index]);
+      const samePromptSurface = rootBackground
+        ? continuationBackground === rootBackground
+        : (continuation.activeByInverse
+          || continuation.hasInverse
+          || continuation.hasNonDefaultBg);
+      if (!samePromptSurface || !String(source[index]?.text || '').trim()) break;
       excluded.add(index);
       index += 1;
     }
@@ -858,6 +1211,7 @@ function extractTerminalHistoryPreviewText({
   promptText = '',
   promptPrefixClipped = false,
   regionTruncated = false,
+  exactStructuredBoundaryKind = null,
 } = {}) {
   const normalizedProvider = normalizeProvider(provider);
   if (!normalizedProvider) {
@@ -867,6 +1221,7 @@ function extractTerminalHistoryPreviewText({
     leadingPhysicalLines,
     physicalLines,
     provider: normalizedProvider,
+    exactStructuredBoundaryKind,
   });
   const logical = boundaryContext.lines;
   if (logical.length === 0) {
@@ -879,19 +1234,23 @@ function extractTerminalHistoryPreviewText({
     promptRemoval = removeClippedSubmittedPromptPrefix(owned, promptText);
   }
   owned = promptRemoval.lines;
-  // A full-screen Codex repaint can destroy the xterm marker and redraw a
-  // previously submitted user prompt below the exact JSONL baseline. That
+  // A full-screen provider repaint can destroy the xterm marker and redraw a
+  // submitted or queued user prompt below the exact JSONL baseline. That
   // prompt is not assistant output. Remove only provider-styled inverse/
-  // background prompt blocks; an ordinary `›` in assistant prose remains.
-  const residualPromptBlocks = removeResidualCodexSubmittedPromptBlocks(
+  // background prompt blocks; an ordinary `›`/`❯` in prose remains.
+  const residualPromptBlocks = removeResidualSubmittedPromptBlocks(
     owned,
     normalizedProvider,
   );
   owned = residualPromptBlocks.lines;
   const withoutFrameChrome = owned.filter((line) => !isFrameOnlyLine(line.text));
+  const clippedDiffCard = filterClippedCodexNumberedDiffPrefix(
+    withoutFrameChrome,
+    normalizedProvider,
+  );
   // Tool cards are atomic provider records. Classify them before their styled
   // result child is consumed as a standalone branch/status row.
-  const toolCards = filterInlineTerminalToolCards(withoutFrameChrome, normalizedProvider);
+  const toolCards = filterInlineTerminalToolCards(clippedDiffCard.lines, normalizedProvider);
   const systemBlocks = filterTerminalSystemBlocks(toolCards.lines, normalizedProvider);
   const clippedToolCard = filterClippedCodexToolCardPrefix(
     systemBlocks.lines,
@@ -906,12 +1265,13 @@ function extractTerminalHistoryPreviewText({
     ...boundaryContext.kinds,
     ...systemBlocks.kinds,
   ]));
-  if ((toolCards.filtered > 0 || clippedToolCard.filtered > 0)
+  if ((clippedDiffCard.filtered > 0 || toolCards.filtered > 0 || clippedToolCard.filtered > 0)
     && !filteredBlockKinds.includes('tool-card')) {
     filteredBlockKinds.push('tool-card');
   }
   const styleEvidenceUsed = boundaryContext.styleEvidence === true
     || systemBlocks.styleEvidence === true
+    || clippedDiffCard.styleEvidence === true
     || toolCards.styleEvidence === true
     || clippedToolCard.styleEvidence === true;
   if (text.length > MAX_PREVIEW_CHARS) {

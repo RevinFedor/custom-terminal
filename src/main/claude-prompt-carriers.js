@@ -58,6 +58,27 @@ function extractClaudeQueueOperationPromptText(entry) {
   return text.trim() ? text : null;
 }
 
+/**
+ * Stable identity for the provider-owned queue row. Claude normally gives the
+ * enqueue record a UUID; byte position is the exact fallback for older rows.
+ * The same identity is attached to the durable History projection so an
+ * app-owned optimistic prompt can be consumed after renderer/app restart.
+ */
+function claudeQueuePromptSourceIdentity(entry, {
+  sessionId = null,
+  recordByteOffset = null,
+} = {}) {
+  if (entry?.type !== 'queue-operation' || entry?.operation !== 'enqueue') return null;
+  const entryUuid = typeof entry.uuid === 'string' ? entry.uuid.trim() : '';
+  if (entryUuid) return 'claude-queue:uuid:' + entryUuid;
+  const exactSessionId = String(
+    entry.sessionId || entry.session_id || sessionId || '',
+  ).trim();
+  const offset = Number(recordByteOffset ?? entry.__byteOffset);
+  if (!exactSessionId || !Number.isSafeInteger(offset) || offset < 0) return null;
+  return 'claude-queue:offset:' + exactSessionId + ':' + offset;
+}
+
 function isClaudeTaskNotificationCarrier(entry) {
   if (entry?.type === 'attachment'
     && entry?.attachment?.type === 'queued_command'
@@ -135,6 +156,7 @@ function selectClaudeQueuedPromptIndex(
   const candidates = (Array.isArray(pendingEntries) ? pendingEntries : [])
     .map((entry, index) => ({ entry, index }))
     .filter(({ entry }) => {
+      if (entry?.queueStatus === 'cancelled') return false;
       if (normalizeText(entry?.content) !== normalized) return false;
       const candidateSessionId = String(entry?.sessionId || '');
       return !expectedSessionId || !candidateSessionId || candidateSessionId === expectedSessionId;
@@ -197,6 +219,7 @@ function findMatchingClaudePromptTurn({
 }
 
 module.exports = {
+  claudeQueuePromptSourceIdentity,
   claudeInternalAgentContinuationKind,
   claudeInternalAgentContinuationKindFromEntry,
   extractClaudeQueueOperationPromptText,

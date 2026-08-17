@@ -92,7 +92,7 @@ Noted Terminal — кастомный эмулятор терминала на �
 - При изменении Terminal API сначала читать `docs/knowledge/fact-mobile-web.md`, `docs/knowledge/fact-mobile-claude-pty.md`, `docs/knowledge/fact-codex.md`, `docs/knowledge/fact-terminal-mcp.md` и `docs/methodology/сценарии-багов.md` через `docs_search`; iOS/Voice Record не являются source of truth для этой механики.
 
 ## Navigation
-- **Home Button Toggle:** Кнопка 🏠 (Home) работает как переключатель. При нахождении на Dashboard повторный клик по 🏠 возвращает пользователя в контекст последнего активного проекта вместо перезагрузки Dashboard. Это сокращает время на навигацию при частом переходе между Dashboard и проектами.
+- **Home Button Toggle:** Кнопка Home в титлбаре (векторный домик + подпись, чёрно-оранжевая палитра иконки приложения `#F09018`) работает как переключатель. При нахождении на Dashboard повторный клик по ней возвращает пользователя в контекст последнего активного проекта вместо перезагрузки Dashboard. Это сокращает время на навигацию при частом переходе между Dashboard и проектами.
 
 ## Методологии
 - **Дизайн-методология**: [`docs/methodology/переносимый-дизайн.md`](docs/methodology/переносимый-дизайн.md) — UX-философия (детерминизм клика, destructive ≠ status, layout reservation) + UI implementation patterns (Invisible Bridge, Cmd+Hover, virtualization, GPU-анимации, immediate injection, tiered debounce). Один файл, два слоя.

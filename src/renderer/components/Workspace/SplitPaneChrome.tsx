@@ -20,7 +20,6 @@ import {
   splitAvailability,
   splitDividerDescriptors,
 } from '../../utils/splitPanesModel.mjs';
-import { paneFrameState } from '../../utils/paneSwitcherScope.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { openTabContextMenuAt } from './TabBar';
 import {
@@ -116,7 +115,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   const statusMeta = tabSessionStatus
     ? sessionStatuses.find((s) => s.id === tabSessionStatus)
     : undefined;
-  const { hasProcess, busy } = useTabActivitySignals(tabId);
+  const { hasProcess, busy, inheritedBusy } = useTabActivitySignals(tabId);
   const [tabChipHovered, setTabChipHovered] = useState(false);
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
   // Rename in place: same action as double-click in the sidebar list, so a tab
@@ -213,29 +212,21 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         pointerEvents: 'auto',
       }}
     >
-      <button
-        title={workspacePath || displayProjectName}
-        onClick={(e) => {
-          e.stopPropagation();
-          if (workspacePath) useWorkspaceStore.getState().openProject(projectId, workspacePath);
-        }}
-        onPointerDown={(e) => e.stopPropagation()}
+      {/* Project = an inert 12px badge, icon only. It answers "whose zone is
+          this window" — the one mark that survives when the sidebar shows a
+          different project. NOT a button (2026-08-17): with the one-pointer
+          model a click anywhere in the pane already focuses it and the sidebar
+          follows the tab's project, so a click here had nothing left to do —
+          navigation lives on the titlebar cards and the tab chip. The name
+          moved into the tooltip: next to the tab chip it repeated information
+          the icon already carries and stole width from the tab's own name. */}
+      <span
+        title={displayProjectName + (workspacePath ? `\n${workspacePath}` : '')}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
-          gap: 5,
-          flexShrink: 1,
-          minWidth: 0,
-          padding: 0,
-          background: 'transparent',
-          border: 'none',
-          fontSize: 11,
-          fontWeight: 600,
-          color: '#8a8a8f',
-          cursor: 'pointer',
+          flexShrink: 0,
         }}
-        onMouseEnter={(e) => { e.currentTarget.style.color = '#b4b4b8'; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = '#8a8a8f'; }}
       >
         {projectMeta?.icon ? (
           <img
@@ -244,12 +235,10 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
             draggable={false}
             style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.65 }}
           />
-        ) : isInboxProjectId(projectId) ? (
-          // Inbox has no picture of its own, so it gets the same dashed
-          // placeholder square as its card in the titlebar — otherwise the chip
-          // is the one place where this project has no mark at all and reads as
-          // "icon failed to load". Same size as a real icon so the name does not
-          // shift between projects.
+        ) : (
+          // No icon set (or Inbox): the same dashed placeholder square as the
+          // titlebar card, so the header never reads as "icon failed to load"
+          // and the chip's left edge does not shift between projects.
           <span
             aria-hidden
             style={{
@@ -261,18 +250,8 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
               background: 'rgba(148,163,184,0.08)',
             }}
           />
-        ) : null}
-        <span
-          style={{
-            minWidth: 0,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {displayProjectName}
-        </span>
-      </button>
+        )}
+      </span>
 
       <span
           // Named so a test can ask "does the chip FOR THIS TAB carry the
@@ -299,16 +278,12 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           draggable={false}
           onDragStart={(e) => e.preventDefault()}
           onClick={(e) => {
-            // "Go to this tab" — and, unlike a click in the sidebar list, also
-            // go to its PROJECT. This chip is the one place that can name a tab
-            // from a project the sidebar is not showing (panes are
-            // cross-project), so "смена вкладки ≠ смена проекта" gives the
-            // wrong answer here: the tab appeared in the center while the
-            // sidebar still listed a different project's tabs, and the row the
-            // user had just clicked was nowhere in it.
+            // "Go to this tab". Activation itself brings the sidebar to the
+            // tab's project now (one-pointer model), so the chip needs no
+            // special project-following path anymore.
             e.stopPropagation();
             if (renaming) return;
-            useWorkspaceStore.getState().activateTabAndProject(projectId, tabId);
+            useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
           }}
           onDoubleClick={(e) => {
             // Same gesture as in the sidebar list. File tabs keep their file
@@ -391,7 +366,13 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
               tab it describes, next to the split button, even though its width,
               color and edge were all correct. Shared component, so the sidebar
               card and this chip cannot drift apart again. */}
-          <TabProcessBar hasProcess={hasProcess} busy={busy} radius={4} zIndex={4} />
+          <TabProcessBar
+            hasProcess={hasProcess}
+            busy={busy}
+            inheritedBusy={inheritedBusy}
+            radius={4}
+            zIndex={4}
+          />
           <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} />
           {tabType === 'file' && <FileText size={10} style={{ color: '#a78bfa', flexShrink: 0 }} />}
           {renaming ? (
@@ -478,6 +459,11 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
 
       <span style={{ flex: 1 }} />
 
+      {/* VS Code header pattern (approved 2026-08-17): pane ACTIONS show on
+          the focused pane only; an unfocused pane reveals them on header
+          hover (see globals.css [data-split-attach-row]). The button stays
+          mounted either way — the reveal is opacity, so the header layout
+          never shifts and the "кнопка пропала" bug class stays impossible. */}
       <button
         data-split-button
         data-split-horizontal={splitCan.horizontal ? '1' : '0'}
@@ -635,19 +621,15 @@ export const SPLIT_PANE_HOVER_RING = 'inset 0 0 0 1px rgba(255,255,255,0.20)';
 
 // White focus frame of the focused pane; hairline separator on the others.
 export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
-  // The frame now answers TWO questions with one mark: which pane is active,
-  // and whose history Ctrl+Tab will walk. They are the same pane whenever the
-  // workspace holds the keyboard — which is nearly always, so that is the
-  // NORMAL state and must stay the quiet one. The exception (keyboard moved to
-  // the sidebar / a top bar / the dashboard) dims the contour to say "the
-  // gesture is global now"; the tab underneath is still active and every
-  // tab-owned surface still follows it.
+  // Two states only: focused (full bright contour) and idle (side hairlines,
+  // hover ring). The third state — "active but the keyboard is elsewhere" —
+  // died with per-pane Ctrl+Tab (2026-08-17): the gesture is always global
+  // now, so the frame has nothing extra to signal.
   //
   // Brightness, not colour: tabs carry their own colours and a coloured
   // contour would fight them, and violet already means "drag me" on the
   // resize handles.
-  const keyboardHere = useWorkspaceStore((s) => s.workspaceOwnsKeyboard);
-  const state = paneFrameState({ isFocusedPane: focused, keyboardInPane: keyboardHere });
+  const state = focused ? 'focused' : 'idle';
   return (
     <div
       aria-hidden
@@ -664,19 +646,13 @@ export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
         // reads as "this pane ends here", which is exactly wrong.
         zIndex: SPLIT_PANE_FOCUS_FRAME_Z,
         // 1px everywhere, same thickness as the inter-pane separators — focus
-        // is carried by brightness, not by weight. 0.75 → 0.30 is a fourfold
-        // drop and still a full contour against the neighbours' two 0.08 side
-        // lines, so all three states stay distinguishable.
+        // is carried by brightness, not by weight.
         // The idle frame leaves its box-shadow to the STYLESHEET (see
         // globals.css: `[data-split-pane-frame-state="idle"]`), because that is
         // the only state with a :hover variant — and an inline box-shadow here
         // would win over any :hover rule, which is exactly why the first
         // CSS-only attempt rendered nothing at all.
-        ...(state === 'owns-keyboard'
-          ? { boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.75)' }
-          : state === 'active-only'
-            ? { boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.30)' }
-            : null),
+        ...(focused ? { boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.75)' } : null),
         transition: 'box-shadow 0.12s ease',
       }}
     />
