@@ -142,6 +142,30 @@ test('real hook keeps old and non-prompt event envelopes compatible', async () =
   }
 });
 
+test('real hook forwards exact tool identity and bounded result metadata', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'noted-turn-hook-tool-'));
+  try {
+    const result = await runHookAgainstSocket(root, {
+      hook_event_name: 'PostToolUse',
+      session_id: 'session-tool',
+      cwd: projectDir,
+      tool_name: 'Edit',
+      tool_use_id: 'toolu_123',
+      tool_input: { file_path: '/tmp/file.md' },
+      tool_response: { structuredPatch: [{ oldStart: 1, lines: ['+new'] }] },
+    });
+
+    assert.equal(result.exit.code, 0);
+    assert.equal(result.envelope.tool_use_id, 'toolu_123');
+    assert.equal(result.envelope.tool_name, 'Edit');
+    assert.deepEqual(result.envelope.tool_response, {
+      structuredPatch: [{ oldStart: 1, lines: ['+new'] }],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('installer mirrors repo hook, preserves settings, repairs drift, and is idempotent', async () => {
   const home = await mkdtemp(join(tmpdir(), 'noted-turn-hook-home-'));
   try {

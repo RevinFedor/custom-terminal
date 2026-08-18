@@ -253,7 +253,22 @@ export default function Tooltip({
         if (r.ok) { chosen = { left: r.left, top: r.top, arrowSide: s }; break; }
         if (!chosen) chosen = { left: r.left, top: r.top, arrowSide: s };
       }
-      if (chosen) setPos(chosen);
+      // Сравниваем с текущим положением, а не пишем безусловно. Список
+      // зависимостей этого эффекта содержит `content` — а это узел разметки,
+      // который вызывающий код почти всегда создаёт заново на каждом рендере.
+      // Значит зависимость «меняется» каждый раз, эффект запускается заново, и
+      // безусловная запись нового объекта с ТЕМИ ЖЕ числами давала новый
+      // рендер — круг замыкался и React обрывал его ошибкой #185.
+      if (chosen) {
+        setPos((prev) => (
+          prev
+          && Math.abs(prev.left - chosen!.left) < 0.5
+          && Math.abs(prev.top - chosen!.top) < 0.5
+          && prev.arrowSide === chosen!.arrowSide
+            ? prev
+            : chosen
+        ));
+      }
     };
 
     measure();

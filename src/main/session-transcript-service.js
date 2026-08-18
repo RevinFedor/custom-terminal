@@ -25,6 +25,10 @@ const {
   diffHistoryEntriesAgainstDigest,
   HistoryDeltaDigestStore,
 } = require('./history-delta');
+const {
+  isCodexEnvironmentContextUserText,
+} = require('./codex-prompt-audit');
+const { deriveCodexForkSnapshot } = require('./session-history-events');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -104,13 +108,15 @@ function isClaudePendingThinkingRecord(record) {
 function codexRecordToMobileMessage(record, sessionId) {
   const payload = record?.payload || {};
   if (isCodexUserMessageRecord(record)) {
+    const text = payload.message || '';
+    if (isCodexEnvironmentContextUserText(text)) return null;
     return {
       type: 'user',
       uuid: getRecordUuid(record, sessionId, record.__line),
       timestamp: record.timestamp || null,
       message: {
         role: 'user',
-        content: payload.message || '',
+        content: text,
       },
     };
   }
@@ -158,6 +164,7 @@ class SessionTranscriptService {
     resolveClaudePromptOwner = null,
     claudeData,
     codexData,
+    sessionHistoryStore = null,
     promptPresentationStore = null,
     recoverManagedHistoryImageRef = null,
     idleGraceMs = IDLE_STATE_GRACE_MS,
@@ -173,6 +180,7 @@ class SessionTranscriptService {
       : null;
     this.claudeData = claudeData;
     this.codexData = codexData;
+    this.sessionHistoryStore = sessionHistoryStore;
     this.promptPresentationStore = promptPresentationStore;
     this.recoverManagedHistoryImageRef = typeof recoverManagedHistoryImageRef === 'function'
       ? recoverManagedHistoryImageRef
@@ -443,6 +451,25 @@ class SessionTranscriptService {
         loadedRecordCount = loaded.records?.length || 0;
       }
       const loadedAt = Date.now();
+      try {
+        const snapshot = deriveCodexForkSnapshot(entries, sessionMeta);
+        if (snapshot && this.sessionHistoryStore?.saveSessionForkEvent) {
+          this.sessionHistoryStore.saveSessionForkEvent({
+            provider: 'codex',
+            sourceSessionId: snapshot.sourceSessionId,
+            childSessionId: sessionId,
+            entryUuids: snapshot.entryUuids,
+            boundaryEntryUuid: snapshot.boundaryEntryUuid,
+            snapshotComplete: snapshot.snapshotComplete,
+            occurredAt: snapshot.occurredAt,
+            forkMode: 'unknown',
+            origin: 'transcript',
+            isDirect: true,
+          });
+        }
+      } catch (historyEventError) {
+        console.warn('[TranscriptService] Codex fork event reconcile failed session=' + shortId(sessionId) + ': ' + historyEventError.message);
+      }
       const presentedEntries = decorateHistoryPromptPresentations(this.promptPresentationStore, {
         toolType,
         sessionId,

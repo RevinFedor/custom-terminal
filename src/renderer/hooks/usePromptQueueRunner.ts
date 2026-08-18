@@ -30,6 +30,10 @@ import {
   promptQueueReceiptReplayNeedsNoBusyStart,
 } from '../utils/promptQueueReceiptIdentity.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
+import {
+  executeHistoryRewriteRewindScenario,
+  HistoryRewriteRewindError,
+} from '../utils/historyRewriteRewind';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -550,6 +554,159 @@ function queueOwnerHasPendingContinuationAt(ownerTabId: string, outcomeTs: numbe
   return queuePending || loopPending;
 }
 
+function scheduleQueueFollowupAfterMetaAction(ownerTabId: string): void {
+  setTimeout(() => {
+    const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+    if (!queue.autoRun || queue.firstDelayCountdownAt !== null) return;
+    const head = enabledQueueHead(queue);
+    if (!head || queueSendInflight.has(ownerTabId)) return;
+    const triggerTabId = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
+    // A per-item pivot remains a real future dependency. Completing a local
+    // action must not consume a historical completion from that target.
+    if (triggerTabId !== ownerTabId) return;
+    if (head.trigger?.kind === 'timer' && head.trigger.seconds > 0) {
+      usePromptQueueStore.getState().startFirstDelayCountdown(ownerTabId);
+      for (const listener of queueDelayStartListeners) listener(ownerTabId, 'meta-action-followup');
+      return;
+    }
+    beginValidatedQueueSend(ownerTabId, ownerTabId, head, 'cold-start');
+  }, 0);
+}
+
+function beginValidatedQueueMetaAction(
+  ownerTabId: string,
+  triggerTabId: string,
+  head: QueuedPrompt,
+  label: 'turn-end' | 'cold-start',
+): boolean {
+  if (!head.metaAction || queueSendInflight.has(ownerTabId)) return false;
+  const queueAtStart = usePromptQueueStore.getState().getQueue(ownerTabId);
+  if (enabledQueueHead(queueAtStart)?.id !== head.id
+    || !queueAtStart.autoRun
+    || getEffectiveQueueTrigger(ownerTabId, queueAtStart, { clearStaleTarget: true }) !== triggerTabId) {
+    return false;
+  }
+  if (triggerTabId !== ownerTabId && !pivotTriggerHasFreshCompletion(queueAtStart, triggerTabId)) {
+    return false;
+  }
+
+  const existing = deferredOwnerSends.get(ownerTabId);
+  const attempt: DeferredOwnerSend = existing?.headId === head.id
+    ? existing
+    : {
+        kind: 'queue',
+        triggerTabId,
+        headId: head.id,
+        label,
+        workflowArmedAt: queueAtStart.workflowArmedAt,
+        attemptId: ++queueSendAttemptSequence,
+        causeKey: null,
+      };
+  deferredOwnerSends.set(ownerTabId, attempt);
+
+  queueSendInflight.add(ownerTabId);
+  let succeeded = false;
+  let waitingForReadiness = false;
+  void (async () => {
+    const presence = await readQueueOwnerReadiness(ownerTabId);
+    if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) return;
+    if (presence.status === 'busy'
+      || presence.status === 'starting'
+      || presence.status === 'stopping'
+      || (presence.status === 'active' && !presence.inputReady)) {
+      waitingForReadiness = true;
+      console.log('[PromptQueueRunner] meta action waits owner=' + ownerTabId.slice(-8)
+        + ' kind=' + head.metaAction?.kind + ' status=' + presence.status);
+      return;
+    }
+    if (presence.status !== 'active' && presence.status !== 'inactive') {
+      throw new Error('Не удалось подтвердить состояние вкладки перед действием');
+    }
+
+    const action = head.metaAction;
+    if (!action) return;
+    if (action.kind === 'restart') {
+      const result = await ipcRenderer.invoke('terminal:deterministic-stop', {
+        tabId: ownerTabId,
+        restart: true,
+      });
+      if (!result?.success) {
+        throw new Error(result?.error || 'Перезапуск вкладки не завершён');
+      }
+    } else {
+      const agent = getPromptQueueAgent(ownerTabId);
+      if (agent !== action.toolType) {
+        throw new Error('Тип агента изменился после добавления Rewind в очередь');
+      }
+      const sessionId = getPromptQueueSessionId(ownerTabId, agent);
+      if (!sessionId) throw new Error('У вкладки больше нет сохранённой сессии для Rewind');
+      await executeHistoryRewriteRewindScenario({
+        tabId: ownerTabId,
+        toolType: action.toolType,
+        sessionId,
+        cwd: getTabCwd(ownerTabId),
+        target: {
+          uuid: action.targetUuid,
+          text: action.targetText,
+        },
+      });
+    }
+
+    if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) return;
+    const committed = usePromptQueueStore.getState().commitSentHead(
+      ownerTabId,
+      head.id,
+      triggerTabId,
+    );
+    succeeded = committed.removed;
+    if (!succeeded) throw new Error('Действие изменилось до завершения исполнения');
+    useUIStore.getState().showToast(
+      action.kind === 'restart' ? 'Restart выполнен' : 'Rewind выполнен',
+      'success',
+      1800,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      ownerTabId,
+    );
+  })().catch((error: unknown) => {
+    const message = String((error as any)?.message || error || 'unknown');
+    const historyMutated = error instanceof HistoryRewriteRewindError && error.historyMutated;
+    console.error('[PromptQueueRunner] meta action failed owner=' + ownerTabId.slice(-8)
+      + ' kind=' + head.metaAction?.kind + ' mutated=' + (historyMutated ? '1' : '0')
+      + ' error=' + message);
+    const current = deferredOwnerAttemptIsCurrent(ownerTabId, attempt);
+    if (historyMutated && current) {
+      // The destructive half already committed. Keeping the same action would
+      // offer a retry against a target that was just removed from history.
+      usePromptQueueStore.getState().commitSentHead(ownerTabId, head.id, triggerTabId);
+    }
+    if (current || historyMutated) {
+      usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
+      usePromptQueueStore.getState().setStopAfter(ownerTabId, false);
+    }
+    useUIStore.getState().showToast(
+      (head.metaAction?.kind === 'restart' ? 'Restart' : 'Rewind') + ' в очереди остановлен: ' + message,
+      'error',
+      5000,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      ownerTabId,
+    );
+  }).finally(() => {
+    queueSendInflight.delete(ownerTabId);
+    if (!waitingForReadiness && deferredOwnerSends.get(ownerTabId) === attempt) {
+      clearDeferredOwnerSend(ownerTabId, succeeded ? 'meta-action-committed' : 'meta-action-wait-or-failed');
+    }
+    if (succeeded) scheduleQueueFollowupAfterMetaAction(ownerTabId);
+    signalContinuationRelease(ownerTabId, 'meta-action-settled');
+  });
+  return true;
+}
+
 function beginValidatedQueueSend(
   ownerTabId: string,
   triggerTabId: string,
@@ -558,6 +715,9 @@ function beginValidatedQueueSend(
   kind: ContinuationKind = 'queue',
   causeKey: string | null = null,
 ): boolean {
+  if (kind === 'queue' && head.metaAction) {
+    return beginValidatedQueueMetaAction(ownerTabId, triggerTabId, head, label);
+  }
   if (queueSendInflight.has(ownerTabId)) return false;
   if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) return false;
   if (isPromptQueueEditorLocked(ownerTabId)) {

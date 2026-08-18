@@ -68,6 +68,10 @@ test('late exact audit commits durable receipt before any renderer/web projectio
 });
 
 test('canonical History materialization is durably acknowledged before local SENT is consumed', () => {
+  assert.match(historySource, /historyEntryHasExactIdentity\(entry, localEntry\.auditEntryUuid\)/,
+    'a promoted Codex response carrier must adopt through its exact canonical alias');
+  assert.match(historySource, /sourceIdentityAliases:\s*entry\.sourceIdentityAliases/,
+    'canonical aliases must reach local-to-durable adoption');
   const consumeBody = between(
     historySource,
     'const consumeMaterializedPromptHandoffs = useCallback',
@@ -101,7 +105,7 @@ test('canonical History materialization is durably acknowledged before local SEN
   assert.match(mainSource, /agentSendReceiptStore\.acknowledgePresentation\(\{/);
 });
 
-test('UNCONFIRMED History rows have a durable presentation-only dismiss action', () => {
+test('every local History status row has a durable presentation-only dismiss action', () => {
   assert.match(mainSource, /ipcMain\.handle\('agent:dismiss-send-receipt-presentation'/);
   assert.match(mainSource, /agentSendReceiptStore\.dismissPresentation\(\{/);
   const mainDismissBody = between(
@@ -113,17 +117,20 @@ test('UNCONFIRMED History rows have a durable presentation-only dismiss action',
     'desktop History dismissal must resolve the exact handoff across every send origin');
   assert.doesNotMatch(mainDismissBody, /list\(\{[\s\S]{0,100}surface:/,
     'the immutable send origin must not be mistaken for the presentation surface');
-  assert.match(historySource, /queueStatus === 'delivery-unknown'[\s\S]{0,260}onDismissUnconfirmed/);
+  assert.match(historySource, /isLocalPromptEntry\(entry\)[\s\S]{0,180}onDismissPromptPresentation/);
   const dismissBody = between(
     historySource,
-    'const dismissUnconfirmedPromptEntry = useCallback',
+    'const dismissPromptPresentation = useCallback',
     'const acknowledgeMaterializedHistoryReceipt = useCallback',
   );
   ordered(dismissBody, [
     ['durable dismissal requested', "ipcRenderer.invoke('agent:dismiss-send-receipt-presentation'"],
     ['renderer handoff consumed', 'consumeHistoryPromptHandoff(tabId, handoffId)'],
-    ['local row removed', "removeLocalPromptEntry(handoffId, 'user-dismissed-unconfirmed')"],
+    ['local row removed', "removeLocalPromptEntry(handoffId, 'user-dismissed-prompt-presentation')"],
   ]);
+  assert.match(historySource, /--hp-user-message-status-height:\s*20px/);
+  assert.match(historySource, /\.hp-user-message-status > \.cb-message-status[\s\S]{0,180}height:\s*var\(--hp-user-message-status-height\)/);
+  assert.match(historySource, /\.hp-user-message-status-dismiss[\s\S]{0,220}width:\s*var\(--hp-user-message-status-height\)[\s\S]{0,80}height:\s*var\(--hp-user-message-status-height\)/);
 });
 
 test('main returns the generated attempt identity to the exact History handoff', () => {

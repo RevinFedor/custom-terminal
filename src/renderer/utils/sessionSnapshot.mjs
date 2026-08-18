@@ -46,6 +46,11 @@ export function buildSessionSnapshot(state) {
     // Divider positions; null = equal split (the stored default is absent,
     // same as a pane's `column`).
     splitSizes: state.splitSizes ?? null,
+    // The single-mode centre's strip, PER PROJECT: without a split there is no
+    // pane object to hang it on, and the centre shows a different project's tabs
+    // as you move between projects — one shared list would follow you across and
+    // read as somebody else's tabs.
+    centerStrips: state.centerStrips || {},
   };
 }
 
@@ -66,4 +71,5 @@ export const SESSION_SNAPSHOT_FIELDS = Object.freeze([
   'splitPanes',
   'splitFocusedIndex',
   'splitSizes',
+  'centerStrips',
 ]);

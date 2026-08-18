@@ -19,6 +19,7 @@ import { useCmdKey } from '../hooks/useCmdHoverPopover';
 import { CUSTOM_ICONS } from '../assets/icons/registry';
 import CenteredUpwardPopover from './UI/CenteredUpwardPopover';
 import ControlHint from './UI/ControlHint';
+import HelpButton from './UI/HelpButton';
 
 const { ipcRenderer } = window.require('electron');
 const CODEX_ICON_URL = new URL('../assets/icons/codex-color.svg', import.meta.url).href;
@@ -30,9 +31,11 @@ const CODEX_ICON_URL = new URL('../assets/icons/codex-color.svg', import.meta.ur
 // Right side is reserved for less-frequent toggles (debug, defaults).
 interface StatusBarProps {
   onOpenSettings?: () => void;
+  /** Открыть справку — кнопка стоит первой слева в этой строке. */
+  onOpenHelp?: () => void;
 }
 
-export default function StatusBar({ onOpenSettings }: StatusBarProps) {
+export default function StatusBar({ onOpenSettings, onOpenHelp }: StatusBarProps) {
   const debugHoverBridges = useUIStore((s) => s.debugHoverBridges);
   const setDebugHoverBridges = useUIStore((s) => s.setDebugHoverBridges);
   const streamerMode = useUIStore((s) => s.streamerMode);
@@ -118,6 +121,9 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
       }}
     >
       <div className="flex items-center gap-3">
+        {/* Справка — первой слева. Переехала сюда из шапки: там она занимала
+            самое видное место приложения под то, что открывают раз в месяц. */}
+        {onOpenHelp && <HelpButton onOpenHelp={onOpenHelp} />}
         <McpActivityChip />
         <StatusToggle
           label="stream"

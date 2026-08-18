@@ -61,6 +61,22 @@ Terminal MCP `send_prompt` подтверждает только доставк�
 
 Каждый `/compact` в JSONL — **пара соседних записей**: `compact_boundary` (turnIndex N, без контента, `preTokens`/`postTokens` в `compactMetadata`) и сразу следом `isCompactSummary`-user-запись (turnIndex N+1, 6-17K символов auto-сгенерированного summary). `list_turns` отдаёт их как `kind:'compact_boundary'` и `kind:'compact_summary'` — это **одна логическая операция**, не две. Точка сжатия = boundary, содержимое сжатого = summary. Агент, ссылающийся на «turn N+1» после boundary, не ошибается — это summary-запись, отдельный addressable entry.
 
+## App-owned compact/fork context
+
+`session_stats` при чтении идемпотентно сверяет provider transcript с
+`session_history_events` и возвращает компактный `historyEvents`: direct fork,
+children и compacts без тяжёлого UUID snapshot. `totalIterations` считает только
+реальные user/queued turns без noise. `list_turns` добавляет `iterationIndex`, а
+compact-строки — `afterIterationIndex` и `nextIterationIndex`; Claude
+boundary+summary имеют одну `compactEventIdentity`.
+
+Команда `/compact` не является фактом: строка БД появляется только после
+Claude `compact_boundary` либо Codex top-level `compacted`. Старые/provider-native
+fork восстанавливаются из Claude `forkedFrom` или Codex `forked_from_id`, после
+чего переживают закрытие вкладки и удаление orchestration-run. Источник истории,
+visual parent и orchestration parent возвращаются разными полями и не могут
+подменять друг друга.
+
 ## Что намеренно НЕ выставлено
 
 `tool_use` args и `tool_result` контент в history API **отсутствуют сознательно** — это дампы файлов, диффы, stdout, которые забьют контекст регистратора. Для понимания «что агент делал» достаточно имён tool_uses из `list_turns` (`Bash`, `Read`, `Edit`, `mcp__electron__*`). `isCompactSummary` помечается отдельным kind, чтобы агент не спутал auto-summary с реальным user-промптом.

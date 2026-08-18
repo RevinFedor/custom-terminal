@@ -21,6 +21,12 @@ const tabBar = fs.readFileSync(
   path.join(here, '..', 'components', 'Workspace', 'TabBar.tsx'),
   'utf8',
 );
+// Чип вкладки в шапке окна уехал из SplitPaneChrome в свой файл — сами правила
+// не изменились, изменился только их адрес.
+const chip = fs.readFileSync(
+  path.join(here, '..', 'components', 'Workspace', 'PaneTabChip.tsx'),
+  'utf8',
+);
 const workspace = fs.readFileSync(
   path.join(here, '..', 'components', 'Workspace', 'Workspace.tsx'),
   'utf8',
@@ -57,7 +63,7 @@ test('middle-click on the chip CLEARS the window, it does not close it', () => {
   // The pane is a window the user built: a stray middle-click must not be able
   // to destroy it. The tab leaves the window (and keeps living in the sidebar);
   // closing the window itself is the placeholder's own ✕.
-  const aux = block(chrome, 'onAuxClick={(e) => {', 'style={{');
+  const aux = block(chip, 'onAuxClick={(e) => {', 'style={{');
   const restoreAt = aux.indexOf('restoreSplitPanePreviousTab(tabId)');
   const clearAt = aux.indexOf('clearTabFromSplitPane(tabId)');
   // Step-back first (a file pane returns to what it showed before), then clear
@@ -121,7 +127,8 @@ test('the chip uses the single activation path — activation itself moves the s
   // One-pointer model: switchTab writes BOTH activeProjectId and
   // focusedProjectId (activationFollowPatch), so the chip needs no special
   // project-following method. activateTabAndProject is gone.
-  assert.match(chrome, /activateCenterTab\(projectId, tabId\)/);
+  assert.match(chip, /activateCenterTab\(projectId, tabId\)/);
+  assert.doesNotMatch(chip, /activateTabAndProject\(/);
   assert.doesNotMatch(chrome, /activateTabAndProject\(/);
   assert.doesNotMatch(store, /activateTabAndProject/);
 });
@@ -167,9 +174,11 @@ test('every pane project has a menu owner mounted', () => {
   assert.match(workspace, /paneMenuOwnerProjectIds\.map/);
   // Selector must return a STRING, never a fresh array — an array literal is a
   // new reference every render and re-renders the workspace on any store write.
-  assert.match(workspace, /paneMenuOwnerKey[\s\S]{0,600}?\.join\('\|'\)/);
-  // Only OTHER projects: the sidebar already owns its own menu.
-  assert.match(workspace, /pane\.projectId !== sidebarPid/);
+  assert.match(workspace, /paneMenuOwnerKey[\s\S]{0,1200}?\.join\('\|'\)/);
+  // Only OTHER projects: the sidebar already owns its own menu. (Читается по
+  // всей полосе панели, не только по показанному чипу: правый клик по
+  // припаркованному чипу открывает то же меню.)
+  assert.match(workspace, /\.projectId !== sidebarPid/);
   // menuOnlyForProject renders no list — otherwise there would be two visible
   // tab lists with two selections.
   assert.match(tabBar, /menuOnlyForProject \? null :/);
@@ -206,24 +215,47 @@ test('activateCenterTab delegates the sidebar move to switchTab, not showWorkspa
   assert.doesNotMatch(activateCenter, /focusedProjectId:/);
 });
 
-// ── Пишущий панель в обход switchTab всё равно отмечает посещение ─────────
+// ── Свежесть следует за ФОКУСОМ, а не за появлением на экране ─────────────
 
-test('addTabToSplit touches the global history itself', () => {
-  // Правило посещения живёт в touchGlobalTabMru, и switchTab его кормит. Но
-  // «добавить в рабочую область» пишет панель НАПРЯМУЮ и через switchTab не
-  // проходит, а вкладка при этом ПОЯВЛЯЕТСЯ — то есть это посещение. Отмечать
-  // надо снимком экрана ДО записи: после неё вкладка уже видна, и живое чтение
-  // классифицировало бы посещение как «ничего нового не появилось».
+test('свежесть пишется на каждой активации, включая уже видимую вкладку', () => {
+  // Симптом, который это чинит: правило «отмечать, только если вкладка ПОЯВИЛАСЬ»
+  // замораживало позицию всего, что лежит в панели. В такой вкладке можно было
+  // работать полдня без единой записи (она не появлялась — она уже была там), а
+  // уход с экрана событием не является вовсе. Позиция стояла на месте, и каждая
+  // чужая активация толкала её на шаг вниз: *«вкладка отходит всё назад и назад»*.
   //
-  // Вторым таким писателем был `setSplitPaneTab` (список недавних в шапке
-  // панели) — удалён 2026-08-17 вместе со списком.
+  // Видимость больше не решает, писать ли; она решает только, что предлагать —
+  // и решает это переключатель над своими строками.
+  const touch = block(store, 'touchGlobalTabMru: (projectId, tabId) => {', '\n\n  forgetGlobalTabVisit:');
+  assert.match(touch, /isVisitWorthRecording\(\{ tabId \}\)/);
+  assert.doesNotMatch(touch, /visibleBefore/, 'снимок «что было видно» больше не нужен');
+  assert.doesNotMatch(touch, /onScreenTabIds/, 'видимость здесь не спрашивают');
+  // Ни один вызывающий не передаёт третий аргумент — иначе он бы намекал, что
+  // видимость всё ещё что-то решает.
+  assert.doesNotMatch(store, /touchGlobalTabMru\([^)]*,[^)]*,[^)]*\)/);
+});
+
+test('лишняя отметка не превращается в запись всего списка вкладок', () => {
+  // Теперь пишет КАЖДАЯ активация, в том числе повторный клик по той же
+  // вкладке, а каждая отметка стоит полной записи списка вкладок проекта.
+  // Уже самая свежая → относительный порядок не изменится, писать нечего.
+  const touch = block(store, 'touchGlobalTabMru: (projectId, tabId) => {', '\n\n  forgetGlobalTabVisit:');
+  assert.match(touch, /const isAlreadyFreshest = globalTabMru\[0\]\?\.tabId === tabId;/);
+  // …но вкладка без отметки обязана её получить, даже стоя первой: после
+  // перезапуска порядок выводится из отметок, а её может ранжировать всего лишь
+  // сохранённый запасной список. Пропустив её, оставили бы её без отметки
+  // навсегда — и на следующем запуске она провалилась бы под все отмеченные.
+  assert.match(touch, /if \(tab && \(!isAlreadyFreshest \|\| !tab\.lastActivatedAt\)\)/);
+  assert.match(touch, /if \(isAlreadyFreshest\) return;/);
+});
+
+test('добавление вкладки в панель отмечается единой точкой активации', () => {
+  // Раньше здесь была отдельная отметка со снимком экрана ДО записи панели:
+  // активация после неё видела вкладку уже видимой и правило её отбрасывало.
+  // Теперь видимость ничего не решает, поэтому вторая отметка — просто дубль.
   const addTab = block(store, 'addTabToSplit: (projectId, tabId) => {', '\n\n  clearTabFromSplitPane:');
-  const snapAt = addTab.indexOf('const visibleBefore = onScreenTabIds(');
-  const writeAt = addTab.indexOf('set({ splitPanes: res.panes');
-  const touchAt = addTab.indexOf('touchGlobalTabMru(projectId, tabId, visibleBefore)');
-  assert.ok(snapAt >= 0, 'addTabToSplit must snapshot the screen');
-  assert.ok(writeAt > snapAt, 'snapshot BEFORE the pane write');
-  assert.ok(touchAt > writeAt, 'touch with the pre-write picture');
+  assert.doesNotMatch(addTab, /touchGlobalTabMru/);
+  assert.match(addTab, /activateCenterTab\(projectId, tabId\)/);
 });
 
 // ── Global Ctrl+Tab (per-pane scope removed 2026-08-17) ───────────────────
@@ -316,7 +348,7 @@ test('"everything is on screen" is said UNDER the anchor, not instead of the lis
   // The ctrl list is never empty now (it always holds the anchor), so the old
   // empty-state wording would never appear. Two different facts, two places:
   // no tabs at all vs. nowhere to go back to.
-  assert.match(switcher, /mode === 'ctrl' \? 'Нет открытых вкладок' : 'No tabs found'/);
+  assert.match(switcher, /mode === 'ctrl'\s*\n?\s*\? 'Нет открытых вкладок'/);
   assert.match(switcher, /nothingToReturnTo &&[\s\S]{0,600}Все вкладки уже на экране/);
   // Counted from the rows themselves so it cannot disagree with what is drawn.
   assert.match(switcher, /const nothingToReturnTo = rows\.filter\(\(r\) => r\.kind === 'tab'\)\.length <= 1;/);
@@ -334,7 +366,7 @@ test('the ctrl list recomputes when the panes change', () => {
   // with the panel closed must rebuild the list before it reopens. A string
   // selector for the same reason.
   assert.match(switcher, /const activeTabId = useWorkspaceStore\(\(s\) => \(/);
-  assert.match(memoDeps, /activeTabId\]/);
+  assert.match(memoDeps, /activeTabId/);
 });
 
 test('middle click forgets a row and does NOT navigate or close the window', () => {
@@ -383,4 +415,47 @@ test('Ctrl+P opens the same search as Cmd+P, in the overlay AND out of the PTY',
   // line", so leaking it would edit the command line while the panel opens.
   const swallows = terminal.match(/\(event\.metaKey !== event\.ctrlKey\)[\s\S]{0,120}KeyP/g) || [];
   assert.equal(swallows.length, 2, 'both handlers must swallow Ctrl+P');
+});
+
+// ── Переименование происходит там, где на него нажали ─────────────────────
+
+test('Rename из шапки окна открывает поле ВВОДА в этой шапке, а не в боковом списке', () => {
+  // Меню вкладки одно на всё приложение — оно принадлежит боковому списку.
+  // Его пункт «Rename» открывал поле ввода ТАМ, где живёт меню, а не там,
+  // откуда его позвали: пользователь нажимал правой кнопкой на вкладке в шапке
+  // окна, а поле появлялось в боковом списке, часто вообще вне видимой части.
+  // Enter при этом менял имя правильно — то есть переименование «работало», но
+  // выглядело так, будто произошло не с той вкладкой.
+  //
+  // Теперь поверхность, открывшая меню, представляется по имени, и «Rename»
+  // возвращает запрос ей.
+  const opener = block(
+    tabBar,
+    'export function openTabContextMenuAt(',
+    '\n// Маркеры реальных задач',
+  );
+  assert.match(opener, /renameHost/, 'открыватель обязан уметь назвать себя');
+
+  const renameItem = block(tabBar, '  const handleContextRename = () => {', '\n  };');
+  // Ключевое: при наличии хозяина СВОЁ поле не открывается — иначе на одну
+  // вкладку было бы два поля ввода, и видно было бы не то.
+  assert.match(renameItem, /renameHostRef\.current/);
+  assert.match(renameItem, /TAB_RENAME_REQUEST_EVENT/);
+  assert.match(renameItem, /\}\s*else if \(tab\) \{\s*\n\s*startTabRename\(tab\);/);
+
+  // Чип вкладки в шапке окна: и представляется, и слушает ответ.
+  assert.match(chip, /openTabContextMenuAt\(projectId, tabId, e\.clientX, e\.clientY, \{ renameHost: renameHostId \}\)/);
+  assert.match(chip, /window\.addEventListener\(TAB_RENAME_REQUEST_EVENT/);
+  // Имя хозяина включает НОМЕР ПАНЕЛИ, а не только вкладку: одна и та же
+  // вкладка может быть видна и в шапке одиночного режима, и в панели — начать
+  // правку должна ровно та, на которой нажали.
+  assert.match(chip, /const renameHostId = `split-pane-header:\$\{paneIndex \?\? 'center'\}:\$\{tabId\}`/);
+});
+
+test('обычный правый клик в боковом списке по-прежнему переименовывает у себя', () => {
+  // Метка хозяина живёт ровно столько, сколько открытое меню. Свой правый клик
+  // обязан её снять — иначе следующий «Rename» уехал бы в шапку окна, которая
+  // звала меню до этого.
+  const handler = block(tabBar, '  const handleContextMenu = (e: React.MouseEvent, tabId: string) => {', '\n  };');
+  assert.match(handler, /renameHostRef\.current = null;/);
 });

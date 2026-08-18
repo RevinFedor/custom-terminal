@@ -559,6 +559,11 @@ const TOOLS = [
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'Task sent to the target full session.' },
+        prompts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional saved Noted Terminal prompt ids or exact titles. The Project API resolves their bodies at send time and attaches them as prompt chips without returning the bodies to this caller.',
+        },
         sourceTabId: { type: 'string', description: 'Optional source tab. Defaults to the session that owns this MCP process.' },
         targetTabId: { type: 'string', description: 'Existing target AI tab. Mutually exclusive with creating via targetProjectId.' },
         targetProjectId: { type: 'string', description: 'Project where a new target session should be created.' },
@@ -570,6 +575,9 @@ const TOOLS = [
         thinking: { type: 'string', description: 'Optional Claude thinking mode.' },
         placement: { type: 'string', enum: ['child', 'root'], description: 'Placement for a newly created target. Default child when source and target are in the same project; use root for an independent session.' },
         parentTabId: { type: 'string', description: 'Optional explicit visual parent for a newly created target in the target project.' },
+        forkFromTabId: { type: 'string', description: 'Optional open Claude/Codex tab whose history should seed the new target. The default is a fork from its latest real compact; the child keeps the source provider and cwd.' },
+        fullHistoryFork: { type: 'boolean', description: 'Default false. When forkFromTabId is set, copy the full source history instead of starting at its latest compact. Use only when the user explicitly requests the full history.' },
+        compactBeforeTask: { type: 'boolean', description: 'Default false. After the fork is ready, run one exact native /compact and wait for its completion before the task prompt may cross Enter.' },
         parentRunId: { type: 'string', description: 'Optional explicit orchestration parent. Normally inferred from the source tab active run.' },
         waitForDescendants: { type: 'boolean', description: 'Default true. Keep the parent run active until nested Terminal MCP delegations are consumed. Set false only when an early report is intentional.' },
         notifySource: { type: 'boolean', description: 'Default true. Queue one short completion notification in the source input.' },
@@ -619,7 +627,7 @@ const TOOLS = [
   },
   {
     name: 'list_open_sessions',
-    description: 'List open Claude/Codex sessions with tab identity, model, context usage, and the authoritative busy/status lifecycle. Use this for inspection, not for sending prompts. A response is complete only when busy=false or the lifecycle reports a terminal completion event.',
+    description: 'Read the live lifecycle of open Claude/Codex sessions: tab identity, model, context usage, and authoritative busy/status state. This is a status tool, not transcript search. When the user asks where a topic/feature appeared, call search_sessions first instead of list_open_sessions followed by list_turns across candidates. A response is complete only when busy=false or the lifecycle reports a terminal completion event.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -628,8 +636,30 @@ const TOOLS = [
     },
   },
   {
+    name: 'search_sessions',
+    description: 'Primary tool for questions like "where / in which tab / on which iteration did I discuss or implement X". Search open and archived Claude/Codex sessions across projects using ordinary keyword matching over user prompts and assistant text. Copy a short contiguous phrase likely present verbatim in the original prompt, preferably a UI position, visible label, or exact action. Do not assemble scattered nouns: all meaningful query words must match. If there is no result, retry once with a contiguous subphrase; never fall back to list_open_sessions plus list_turns across candidates. A transport error (fetch failed, timeout, app/port unavailable, non-empty errors) is not a zero-match result and must not trigger transcript reads. Results already include title, tabId, sessionId, zero-based iterationIndex, totalIterations, and previews. Do not call list_turns merely to reconfirm a match. Supports today/yesterday and explicit created/closed date windows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Copy a contiguous 2-4 word phrase verbatim from the user request; positions, labels, and exact actions beat scattered feature nouns. Every meaningful word must occur in the session title, user prompt, or assistant text. If there is no match, retry once with a contiguous subphrase. Omit only to list sessions in a selected date/project window.' },
+        project: { type: 'string', description: 'Optional exact project id, name, or path. Omit to search every project.' },
+        period: { type: 'string', enum: ['today', 'yesterday'], description: 'Optional local-calendar shortcut.' },
+        dateField: { type: 'string', enum: ['activity', 'created', 'closed'], description: 'Default activity: closed_at for archived sessions and created_at for open sessions.' },
+        dateFrom: { type: 'string', description: 'Optional inclusive ISO timestamp/date or epoch.' },
+        dateTo: { type: 'string', description: 'Optional exclusive ISO timestamp/date or epoch.' },
+        includeOpen: { type: 'boolean', description: 'Default true.' },
+        includeClosed: { type: 'boolean', description: 'Default true.' },
+        maxCandidates: { type: 'integer', description: 'Maximum newest sessions to inspect, default 100 and maximum 250.' },
+        candidateOffset: { type: 'integer', description: 'Offset into the date/project-filtered session catalog. Increase it while hasMoreCandidates=true when searching older sessions.' },
+        maxMatches: { type: 'integer', description: 'Maximum returned matching iterations, default 50 and maximum 200.' },
+        matchesPerSession: { type: 'integer', description: 'Maximum matches from one session, default 3 and maximum 10.' },
+        cwd: { type: 'string', description: 'Optional cwd used only to select the running Noted Terminal instance.' },
+      },
+    },
+  },
+  {
     name: 'session_stats',
-    description: 'Read metadata and size statistics for one Claude/Codex transcript without loading its content. Includes the live lifecycle wait gate, context/model data when available, Timeline note counts, compaction markers, and docs activity.',
+    description: 'Read metadata and size statistics for one Claude/Codex transcript without loading its content. Includes totalIterations, app-owned compact/fork historyEvents, separate visual tab relations, the live lifecycle wait gate, context/model data when available, Timeline note counts, and docs activity. Fork iteration coordinates are zero-based and describe the parent session at fork time.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -655,7 +685,7 @@ const TOOLS = [
   },
   {
     name: 'list_turns',
-    description: 'List addressable transcript turns with previews, block sizes, UUIDs, tools, notes, and docs markers. Content remains paginated; use the targeted read tools for full blocks.',
+    description: 'Map turns inside one already-selected session; this is not a cross-session search tool. Use search_sessions first for topic/feature lookup, then call list_turns only when its match preview is insufficient to reconstruct chronology. Inspect one session at a time, normally with kind="user", from="latest_compact" or from="end", and a small page; paginate only as evidence requires. Never call it across several candidate sessions just to find a phrase, and never repeat the same call with unchanged arguments. Returns zero-based iterationIndex values, compact boundaries, previews, block sizes, UUIDs, tools, notes, and docs markers; read full content only through targeted turn tools.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -663,6 +693,7 @@ const TOOLS = [
         cwd: { type: 'string' },
         limit: { type: 'integer', description: 'Default 50, maximum 500.' },
         offset: { type: 'integer', description: 'Pagination offset.' },
+        from: { type: 'string', enum: ['latest_compact', 'end', 'start'], description: 'Default latest_compact. Start at the latest compact summary/boundary and read its tail; end reads the newest page; start preserves chronological pagination from the first turn.' },
         kind: { type: 'string', description: 'Optional user, compact_summary, or compact_boundary filter.' },
         includeNoise: { type: 'boolean', description: 'Include command/system/interrupted noise prompts.' },
       },
@@ -683,7 +714,7 @@ const TOOLS = [
   },
   {
     name: 'get_user_prompt',
-    description: 'Read one user prompt by turnIndex, optionally sliced by character offsets. Negative offsets are supported.',
+    description: 'Read one user prompt after search_sessions or list_turns has identified its exact turnIndex. This is targeted evidence, not a way to scan a session. Optionally slice by character offsets; negative offsets are supported.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -698,7 +729,7 @@ const TOOLS = [
   },
   {
     name: 'get_thinking',
-    description: 'Read thinking blocks from one turn. Omit block for a size/preview map; pass block for full or ranged content.',
+    description: 'Read thinking only from an already-selected turn. Omit block first for a size/preview map; then pass one block and, for a large block, a needed character range.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -714,7 +745,7 @@ const TOOLS = [
   },
   {
     name: 'get_assistant_text',
-    description: 'Read assistant text blocks from one turn. Omit block for a size/preview map; pass block for full or ranged content. The result includes lifecycle and must not be treated as final while busy=true.',
+    description: 'Read assistant text only from an already-selected turn. Omit block first for a size/preview map; then pass one block and, for a large block, a needed character range. The result includes lifecycle and must not be treated as final while busy=true.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -849,6 +880,11 @@ const TOOLS = [
       properties: {
         tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
         prompt: { type: 'string', description: 'Prompt text to paste into the live AI session' },
+        prompts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional saved Noted Terminal prompt ids or exact titles. Their bodies are resolved server-side and delivered as visible prompt chips.',
+        },
         submit: { type: 'boolean', description: 'Default true. Set false to leave the prompt editable in the input box.' },
         model: { type: 'string', description: 'Optional exact provider model ID, or a unique model key/label from Noted Terminal Settings. Ambiguous aliases are rejected.' },
         effort: { type: 'string', description: 'Optional effort override for scenario send.' },
@@ -908,6 +944,57 @@ const TOOLS = [
         parentTabId: { type: 'string', description: 'Optional explicit visual parent for a new AI tab.' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Required in external mode when multiple projects are open and cwd is omitted.' },
       },
+    },
+  },
+  {
+    name: 'list_windows',
+    description: 'Read the WORKSPACE layout: the windows currently on screen, left to right and top to bottom, each with the tabs it holds and which one it is showing. A window holds a strip of tabs and shows one of them, so "held here" and "visible here" are different answers — `tabs` is the strip, `shownTabId` is what fills the window. `index` is what arrange_windows and open_tabs_in_window take as an anchor. Call this before arranging so the anchor refers to the window the user means.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id. Use in external mode to pick the instance.' },
+        cwd: { type: 'string', description: 'Optional project path used to pick the instance.' },
+      },
+    },
+  },
+  {
+    name: 'arrange_windows',
+    description: 'Place tabs into workspace windows in ONE atomic step — the layout half of requests like «сделай форк этой вкладки для Claude и Codex и открой их справа, разделив окно на два» or «открой обе в одном окне справа».\n\nThe NESTING says how they are laid out, so there is no separate flag:\n  windows: [["tab-A"], ["tab-B"]]  → two windows side by side\n  windows: [["tab-A", "tab-B"]]    → ONE window holding both, showing the first\n\n`side` is WHERE the new area goes relative to the anchor window; `divide` is how several windows split THAT area — "columns" (default, side by side) or "rows" (stacked, i.e. the new area is one column divided horizontally). Note that side:"above"/"below" instead joins the anchor window\'s own column.\n\nA named tab MOVES: a tab lives in exactly one window, so placing it also takes it out of wherever it was. Typical flow: fork_tab (once per agent) → arrange_windows with both new tab ids. Do not try to compose a layout out of several calls — this one applies the whole arrangement or none of it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        windows: {
+          type: 'array',
+          description: 'Outer array = windows in order; inner array = the tabs inside one window, first one shown. Entries are tab ids or {projectId, tabId}.',
+          items: {
+            oneOf: [
+              { type: 'string' },
+              { type: 'array', items: { oneOf: [{ type: 'string' }, { type: 'object' }] } },
+            ],
+          },
+        },
+        side: { type: 'string', enum: ['right', 'left', 'above', 'below'], description: 'Where the new area goes relative to the anchor window. Default "right".' },
+        divide: { type: 'string', enum: ['columns', 'rows'], description: 'How several windows split the new area: "columns" side by side (default), "rows" stacked. Ignored for side above/below, which always stacks into the anchor column.' },
+        anchorIndex: { type: 'number', description: 'Window index (from list_windows) to place relative to. Default: the focused window.' },
+        projectId: { type: 'string' },
+        cwd: { type: 'string' },
+      },
+      required: ['windows'],
+    },
+  },
+  {
+    name: 'fork_tab',
+    description: 'Fork a LIVE agent tab: a new tab appears next to it, continuing a COPY of the conversation, and its agent starts on that copy. This is the tab-level fork the user means by «сделай форк этой вкладки» — distinct from fork_session, which only copies the history file and starts nothing.\n\nProvider, session id and launch command all come from the source tab, so there is nothing to pass but the tab. It REFUSES a tab that is busy/starting/stopping, or whose conversation was never saved — a fork of a half-written history is worse than no fork. By default it forks from the source\'s LATEST CONTEXT COMPACTION (cheaper and what the desktop menu does); pass fullHistory:true for the whole transcript.\n\nThe fork opens in the background: WHERE it should appear is a separate question, answered by arrange_windows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Tab to fork (from list_tabs / list_windows).' },
+        fullHistory: { type: 'boolean', description: 'Fork the WHOLE transcript instead of the source\'s latest context compaction. Default false — the compaction point is what the desktop menu uses and is much cheaper.' },
+        name: { type: 'string', description: 'Name for the new tab. Default: "<source name>_compact" / "_fork".' },
+        projectId: { type: 'string' },
+        cwd: { type: 'string' },
+      },
+      required: ['tabId'],
     },
   },
   {
@@ -1299,27 +1386,31 @@ async function callTool(name, args) {
       const sourceTabId = args.sourceTabId || PARENT_TAB_ID;
       if (!sourceTabId) throw new Error('sourceTabId is required outside a parent Noted Terminal session');
       const targetProjectId = args.targetProjectId || (!args.targetTabId ? PARENT_PROJECT_ID : undefined);
-      if (!args.targetTabId && !targetProjectId) {
-        throw new Error('targetTabId or targetProjectId is required');
+      if (!args.targetTabId && !targetProjectId && !args.forkFromTabId) {
+        throw new Error('targetTabId, targetProjectId, or forkFromTabId is required');
       }
       const target = projectHint({
         projectId: targetProjectId || PARENT_PROJECT_ID,
         cwd: PROJECT_CWD,
-      }, sourceTabId);
+      }, args.forkFromTabId || sourceTabId);
       const result = await httpApiPost(target, '/api/orchestrations', {
         runId: args.runId || undefined,
         sourceTabId,
         targetTabId: args.targetTabId || undefined,
-        targetProjectId: targetProjectId || undefined,
-        toolType: args.toolType || 'claude',
+        targetProjectId: targetProjectId || target.projectId || undefined,
+        toolType: args.toolType || (args.forkFromTabId ? undefined : 'claude'),
         name: args.name || undefined,
         label: args.label || undefined,
         prompt: args.prompt,
+        prompts: args.prompts || undefined,
         model: args.model || undefined,
         effort: args.effort || undefined,
         thinking: args.thinking || undefined,
         placement: args.placement || 'child',
         parentTabId: args.parentTabId || undefined,
+        forkFromTabId: args.forkFromTabId || undefined,
+        fullHistoryFork: args.fullHistoryFork === true,
+        compactBeforeTask: args.compactBeforeTask === true,
         parentRunId: args.parentRunId || undefined,
         sourceMeta: buildSourceMeta(),
         waitForDescendants: args.waitForDescendants !== false,
@@ -1366,6 +1457,25 @@ async function callTool(name, args) {
       }, null, 2);
     }
 
+    case 'search_sessions': {
+      const endpoint = '/overseer/search-sessions' + qs({
+        query: args.query,
+        project: args.project,
+        period: args.period,
+        dateField: args.dateField,
+        dateFrom: args.dateFrom,
+        dateTo: args.dateTo,
+        includeOpen: args.includeOpen === false ? 0 : undefined,
+        includeClosed: args.includeClosed === false ? 0 : undefined,
+        maxCandidates: args.maxCandidates,
+        candidateOffset: args.candidateOffset,
+        maxMatches: args.maxMatches,
+        matchesPerSession: args.matchesPerSession,
+      });
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      return JSON.stringify(result, null, 2);
+    }
+
     case 'session_stats': {
       const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/stats' + qs({ cwd: args.cwd });
       const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
@@ -1395,6 +1505,7 @@ async function callTool(name, args) {
         cwd: args.cwd,
         limit: args.limit,
         offset: args.offset,
+        from: args.from || 'latest_compact',
         kind: args.kind,
         includeNoise: args.includeNoise ? 1 : undefined,
       });
@@ -1541,6 +1652,7 @@ async function callTool(name, args) {
           '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/send',
           {
             prompt: args.prompt,
+            prompts: args.prompts || undefined,
             model: args.model || undefined,
             effort: args.effort || undefined,
             thinking: args.thinking || undefined,
@@ -1616,6 +1728,37 @@ async function callTool(name, args) {
         tabId: args.tabId,
         ...result,
       }, null, 2);
+    }
+
+    case 'list_windows': {
+      const target = resolveExternalCreateTarget(args);
+      const data = await httpApiGet(target, '/api/workspace');
+      return JSON.stringify(data, null, 2);
+    }
+
+    case 'arrange_windows': {
+      const target = resolveExternalCreateTarget(args);
+      // A bare id is a window of one tab, so the caller can write
+      // `windows: ["a", "b"]` for the common "each in its own window" case.
+      const windows = (Array.isArray(args.windows) ? args.windows : [])
+        .map((entry) => (Array.isArray(entry) ? entry : [entry]));
+      const data = await httpApiPost(target, '/api/workspace/arrange', {
+        windows,
+        side: args.side,
+        divide: args.divide,
+        anchorIndex: args.anchorIndex,
+      });
+      return JSON.stringify(data, null, 2);
+    }
+
+    case 'fork_tab': {
+      const target = resolveExternalCreateTarget(args);
+      const data = await httpApiPost(
+        target,
+        '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/fork',
+        { name: args.name, fullHistory: args.fullHistory === true },
+      );
+      return JSON.stringify(data, null, 2);
     }
 
     case 'create_tab': {

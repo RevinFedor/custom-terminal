@@ -429,6 +429,7 @@ interface UIStore {
   historyFontSize: number; // Primary History transcript font size (messages + tool blocks).
   historyComposerFontSize: number; // Primary History prompt textarea font size.
   aiSecondaryFontSize: number; // Secondary AI labels, statuses and composer chips.
+  historyMarkdownCodeMaxLines: number; // Vertical viewport of fenced Markdown blocks; long lines wrap.
   historyComposerMinRows: number; // Empty height for the primary History prompt textarea.
   historyComposerMaxRows: number; // Auto-grow ceiling for the primary History prompt textarea.
   stackedComposerMaxRows: number; // Same ceiling for a pane stacked in a column (starts at 1 row).
@@ -461,6 +462,7 @@ interface UIStore {
   setHistoryFontSize: (size: number) => void;
   setHistoryComposerFontSize: (size: number) => void;
   setAiSecondaryFontSize: (size: number) => void;
+  setHistoryMarkdownCodeMaxLines: (lines: number) => void;
   setHistoryComposerMinRows: (rows: number) => void;
   setHistoryComposerMaxRows: (rows: number) => void;
   setAiComposerChipThreshold: (characters: number) => void;
@@ -620,6 +622,12 @@ interface UIStore {
   removeHistoryPromptDraftChip: (tabId: string, chipId: string) => void;
   appendHistoryPromptDraft: (tabId: string, text: string) => void;
   flushHistoryComposerDrafts: () => void;
+  /**
+   * Записать черновик на диск через полсекунды покоя. Вызывается КАЖДЫМ
+   * изменением текста, картинок и чипов — чтобы при перезапуске восстановилось
+   * то, что человек печатал, а не то, что он успел отправить.
+   */
+  scheduleHistoryComposerDraftSave: () => void;
   setHistoryComposerView: (
     tabId: string,
     patch: Partial<Pick<HistoryComposerViewState, 'selectionStart' | 'selectionEnd' | 'scrollTop'>>,
@@ -1221,6 +1229,13 @@ const loadAiSecondaryFontSize = (): number => {
     if (v) return Math.max(8, Math.min(18, Math.round(Number(v) || 11)));
   } catch {}
   return 11;
+};
+const loadHistoryMarkdownCodeMaxLines = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-history-markdown-code-max-lines');
+    if (v) return Math.max(5, Math.min(100, Math.round(Number(v) || 30)));
+  } catch {}
+  return 30;
 };
 const loadHistoryComposerMinRows = (): number => {
   try {
@@ -2390,6 +2405,22 @@ const saveApiSettings = (settings: ApiSettings) => {
 const initialApiSettings = loadApiSettings();
 
 const HISTORY_COMPOSER_DRAFTS_STORAGE_KEY = 'noted-terminal-history-composer-drafts';
+
+// Автосохранение черновика поля ввода, пока пользователь печатает.
+//
+// Раньше запись на диск делали только «события»: отправка, уход со вкладки,
+// закрытие окна. Пока человек просто печатал, текст жил только в памяти — и
+// любое падение или убитый процесс уносили длинный промпт целиком. Юзер: *«всё,
+// что находится в инпуте, должно сохраняться в базу, чтобы если приложение
+// перезапущу — восстанавливалось всегда всё»*.
+//
+// Задержка, а не запись на каждую букву: промпты бывают в десятки килобайт, а
+// запись синхронно зеркалится в SQLite. Полсекунды покоя — цена, которую
+// пользователь не замечает, а платит за неё раз на абзац, а не раз на символ.
+// Явные `flush*` остаются и после этого: они гарантируют запись ИМЕННО СЕЙЧАС —
+// на закрытии окна ждать полсекунды уже некому.
+const COMPOSER_DRAFT_AUTOSAVE_MS = 500;
+let composerDraftAutosaveTimer: ReturnType<typeof setTimeout> | null = null;
 const initialHistoryComposerDraftState = (() => {
   try {
     const raw = localStorage.getItem(HISTORY_COMPOSER_DRAFTS_STORAGE_KEY);
@@ -2561,6 +2592,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyFontSize: loadHistoryFontSize(),
   historyComposerFontSize: loadHistoryComposerFontSize(),
   aiSecondaryFontSize: loadAiSecondaryFontSize(),
+  historyMarkdownCodeMaxLines: loadHistoryMarkdownCodeMaxLines(),
   historyComposerMinRows: initialHistoryComposerMinRows,
   historyComposerMaxRows: initialHistoryComposerMaxRows,
   stackedComposerMaxRows: loadStackedComposerMaxRows(),
@@ -2651,6 +2683,14 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(8, Math.min(18, Math.round(size)));
     set({ aiSecondaryFontSize: clamped });
     try { localStorage.setItem('noted-terminal-ai-secondary-font-size', String(clamped)); } catch {}
+  },
+
+  setHistoryMarkdownCodeMaxLines: (lines: number) => {
+    const clamped = Math.max(5, Math.min(100, Math.round(lines)));
+    set({ historyMarkdownCodeMaxLines: clamped });
+    try {
+      localStorage.setItem('noted-terminal-history-markdown-code-max-lines', String(clamped));
+    } catch {}
   },
 
   setHistoryComposerMinRows: (rows: number) => {
@@ -3086,6 +3126,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
     };
   }),
   flushHistoryComposerDrafts: () => {
+    // Явный flush отменяет отложенный: он пишет ТО ЖЕ состояние, только сейчас,
+    // и оставленный таймер потом переписал бы уже записанное ещё раз.
+    if (composerDraftAutosaveTimer !== null) {
+      clearTimeout(composerDraftAutosaveTimer);
+      composerDraftAutosaveTimer = null;
+    }
     const state = get();
     const memory = buildComposerDraftMemory({
       drafts: state.historyPromptDrafts,
@@ -3100,6 +3146,13 @@ export const useUIStore = create<UIStore>((set, get) => ({
     } catch (cause) {
       console.warn('[HistoryComposerPersistence] save failed:', cause);
     }
+  },
+  scheduleHistoryComposerDraftSave: () => {
+    if (composerDraftAutosaveTimer !== null) clearTimeout(composerDraftAutosaveTimer);
+    composerDraftAutosaveTimer = setTimeout(() => {
+      composerDraftAutosaveTimer = null;
+      get().flushHistoryComposerDrafts();
+    }, COMPOSER_DRAFT_AUTOSAVE_MS);
   },
   setHistoryComposerView: (tabId, patch) => set(state => {
     const next = rememberComposerView(state.historyComposerViewByTab, tabId, patch);
@@ -3842,6 +3895,35 @@ export const useUIStore = create<UIStore>((set, get) => ({
   activeArea: 'workspace',
   setActiveArea: (area) => set({ activeArea: area })
 }));
+
+// Черновик поля ввода сохраняется САМ, пока человек печатает.
+//
+// Подписка, а не вызов в каждом писателе: черновик меняют пять разных методов
+// (текст, чипы — поставить/добавить/убрать, дописать в конец), и это ровно тот
+// случай, когда «не забыть дописать строчку» — вопрос времени. Здесь же
+// сохранение следует за самим ФАКТОМ изменения, поэтому шестой писатель,
+// который появится завтра, получит его бесплатно.
+//
+// Сравниваются ссылки: все мутаторы пересобирают объекты, поэтому неравенство
+// ссылок и есть «что-то поменялось», без обхода содержимого на каждую букву.
+if (typeof window !== 'undefined') {
+  let lastDraftSnapshot = {
+    drafts: useUIStore.getState().historyPromptDrafts,
+    images: useUIStore.getState().historyPromptDraftImages,
+    chips: useUIStore.getState().historyPromptDraftChips,
+  };
+  useUIStore.subscribe((state) => {
+    if (state.historyPromptDrafts === lastDraftSnapshot.drafts
+      && state.historyPromptDraftImages === lastDraftSnapshot.images
+      && state.historyPromptDraftChips === lastDraftSnapshot.chips) return;
+    lastDraftSnapshot = {
+      drafts: state.historyPromptDrafts,
+      images: state.historyPromptDraftImages,
+      chips: state.historyPromptDraftChips,
+    };
+    state.scheduleHistoryComposerDraftSave();
+  });
+}
 
 if (typeof window !== 'undefined') {
   (window as any).useUIStore = useUIStore;

@@ -40,6 +40,18 @@ function optionalString(value) {
   return normalized || null;
 }
 
+/**
+ * Локальная slash-команда: у неё нет обычной записи ответа, поэтому и обычной
+ * расписки об отправке быть не должно.
+ *
+ * Ведущие пробелы отбрасываются, как и в остальных проверках slash по проекту:
+ * пользователь мог начать строку с пробела, команда от этого локальной быть не
+ * перестала.
+ */
+function isLocalSlashCommandPrompt(rawPrompt) {
+  return typeof rawPrompt === 'string' && rawPrompt.trimStart().startsWith('/');
+}
+
 function isDesktopHistorySendReceiptEligible(input = {}) {
   const source = String(input.source || '');
   const rawPrompt = typeof input.rawPrompt === 'string' ? input.rawPrompt : null;
@@ -50,7 +62,14 @@ function isDesktopHistorySendReceiptEligible(input = {}) {
     // Local slash commands have a command-specific completion proof rather than
     // a user_message audit. They need their own receipt contract; do not leave a
     // generic prompt receipt permanently pending for them.
-    && !(DESKTOP_AUTOMATION_SEND_SOURCES.has(source) && rawPrompt?.trimStart().startsWith('/'))
+    //
+    // Applies to EVERY History send source, not just automation. The exception
+    // used to be limited to the queue because a slash command could not be sent
+    // from the composer at all — the renderer refused it before this point. Now
+    // that the composer sends them, the same rule has to cover it: otherwise a
+    // manual `/compact` mints a receipt that waits forever for an audit record
+    // the command never produces, and the message stays UNCONFIRMED.
+    && !isLocalSlashCommandPrompt(rawPrompt)
     && !optionalString(input.sendOperationKey)
     && !optionalString(input.sendAttemptId);
 }

@@ -1,37 +1,25 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Columns2, FileText } from 'lucide-react';
+import { Columns2, PanelBottom, PanelTop } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
-import { useProjectsStore } from '../../store/useProjectsStore';
-import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
-import { getTabChromeColorConfig, flattenRgbaOnTabbarPanel, adjustRgbaAlpha } from './tabChrome';
 import {
-  resolveTabCardBackground,
-  resolveTabCardMetrics,
   resolveSplitAttachRowHeight,
-  TAB_CARD_LINE_HEIGHT,
+  resolveTabCardBottomOverhang,
 } from '../../utils/tabCardVisual.mjs';
 import {
   isEmptyPane,
   paneGridRects,
+  paneTabs,
   normalizeSplitSizes,
   resizeFractions,
   splitAvailability,
   splitDividerDescriptors,
 } from '../../utils/splitPanesModel.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
-import { openTabContextMenuAt } from './TabBar';
-import {
-  TabProcessBar,
-  TabStatusMarker,
-  TabTaskMarker,
-  TASK_MARKER_GAP_PX,
-  TASK_MARKER_LANE_HEIGHT_PX,
-  TASK_MARKER_DEFAULT_COLOR,
-  useTabActivitySignals,
-} from './TabSignals';
-import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
+import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
+import PaneTabStrip from './PaneTabStrip';
+import { TabLocationLine } from './TabLocationLine';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 
@@ -44,16 +32,21 @@ const { ipcRenderer } = window.require('electron');
 export const SPLIT_ATTACH_ROW_H = 26;
 
 /**
- * Live height of the pane header row, derived from the same Settings → Размеры
+ * Live height of the pane header, derived from the same Settings → Размеры
  * values the chip inside it obeys. Every surface that positions content BELOW
  * the row (pane content top, toast anchor, single-mode header slot, file
  * preview offset) must use this hook, not the constant — one of them reading a
  * different number is how the chip and the separator ended up crossing.
+ *
+ * The header is TWO lines: the tab chip, and the tab's working directory under
+ * it (moved here 2026-08-17 from a full-width row of its own — see
+ * TabLocationLine). Both lines are inside the same reserved slot, so callers ask
+ * this one question and get the whole header's height.
  */
 export function useSplitAttachRowHeight(): number {
   const tabGeo = useUIStore((s) => s.tabGeometry);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
-  return resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize });
+  return resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize, withPath: true });
 }
 
 // Fractional columns, fractional rows inside a column (equal when sizes are
@@ -95,44 +88,16 @@ interface AttachRowProps {
 // separate armed mode was pure surface for a rare case.
 
 export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: AttachRowProps) {
-  const projectMeta = useProjectsStore((s) => s.projects[projectId]);
-  const projectName = projectMeta?.name
-    || (isInboxProjectId(projectId) ? INBOX_PROJECT_NAME : null);
-  const workspacePath = useWorkspaceStore((s) => s.openProjects.get(projectId)?.projectPath || '');
-  // Subscribe to the PRIMITIVE fields, never to the tab object: rename mutates
-  // `tab.name` in place and only swaps the openProjects Map, so the object
-  // reference stays equal and an object-returning selector never re-renders —
-  // the header kept the stale name until some unrelated update repainted it.
-  // (Same Fingerprint-Pattern rule as fix-performance-lags.md.)
-  const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
-  const tabName = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.name || '');
-  const tabColor = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.color);
-  const tabType = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
   const splitPanes = useWorkspaceStore((s) => s.splitPanes);
-  const tabSessionStatus = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus);
-  const sessionStatuses = useUIStore((s) => s.sessionStatuses);
-  const statusMeta = tabSessionStatus
-    ? sessionStatuses.find((s) => s.id === tabSessionStatus)
-    : undefined;
-  const { hasProcess, busy, inheritedBusy } = useTabActivitySignals(tabId);
-  const [tabChipHovered, setTabChipHovered] = useState(false);
+  const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
-  // Rename in place: same action as double-click in the sidebar list, so a tab
-  // can be renamed from whichever surface the user is already looking at.
-  const [renaming, setRenaming] = useState(false);
-  const [renameDraft, setRenameDraft] = useState('');
   // Measured position of the split-direction menu, clamped into the window.
   const splitMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [splitMenuPos, setSplitMenuPos] = useState<{ x: number; y: number } | null>(null);
-  const taskPlan = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.taskPlan);
-  const taskStatuses = useUIStore((s) => s.taskStatuses);
-  const taskStatusShape = useUIStore((s) => s.taskStatusMarker.shape);
   // The SAME size settings the sidebar card obeys (Settings → Размеры), so
-  // changing them there moves this chip too instead of leaving two sizes.
+  // changing them there moves this header too instead of leaving two sizes.
   const tabGeo = useUIStore((s) => s.tabGeometry);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
-  const taskItems = taskPlan?.items || [];
-  const displayProjectName = projectName || workspacePath.split('/').filter(Boolean).pop() || 'Project';
   // The button STAYS and greys out at the limit instead of disappearing: a
   // control that vanishes reads as a bug ("кнопка пропала"), a greyed one with
   // a tooltip states the rule. Each direction is asked about separately —
@@ -140,12 +105,68 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   const splitCan = splitAvailability(splitPanes, paneIndex ?? null);
   const inSplit = splitPanes.length > 0;
 
-  const commitRename = () => {
-    const next = renameDraft.trim();
-    setRenaming(false);
-    if (!next || next === tabName) return;
-    useWorkspaceStore.getState().renameTab(projectId, tabId, next);
-  };
+  // The strip this header draws. A STRING selector (Fingerprint Pattern) — a
+  // selector returning the entry array would allocate on every store write and
+  // repaint every header in the workspace.
+  const stripKey = useWorkspaceStore((s) => {
+    const pane = paneIndex === null || paneIndex === undefined ? null : s.splitPanes[paneIndex];
+    if (pane) return paneTabs(pane).map((e: any) => `${e.projectId}:${e.tabId}`).join(',');
+    // Single mode has no pane object, so the strip lives per project — keyed by
+    // the project the CENTRE is showing, which is not always the project of the
+    // tab this header was handed (a strip can hold another project's tab). A
+    // project with no strip is exactly the pre-strip behaviour: the header names
+    // the one tab it was given.
+    const center = s.centerStrips[s.activeProjectId || projectId];
+    if (!center || center.length === 0) return `${projectId}:${tabId}`;
+    return center.map((e) => `${e.projectId}:${e.tabId}`).join(',');
+  });
+  const entries = React.useMemo(
+    () => stripKey.split(',').filter(Boolean).map((pair) => {
+      const at = pair.lastIndexOf(':');
+      return { projectId: pair.slice(0, at), tabId: pair.slice(at + 1) };
+    }),
+    [stripKey],
+  );
+
+  // Double-click on the strip's empty space: a brand-new tab joins THIS window.
+  //
+  // Created at the END of the project's list, like every other new tab — the
+  // sidebar order is the user's own map and a window must not insert into the
+  // middle of it. The tab is created without an agent: it is a live shell, and
+  // the launch strip inside it is how it becomes Claude or Codex. Юзер: *«кликаю
+  // два раза, открывается новая вкладка сбоку»*.
+  const createTabInThisWindow = React.useCallback(async () => {
+    const store = useWorkspaceStore.getState();
+    const owner = paneIndex === null || paneIndex === undefined
+      ? projectId
+      : (store.splitPanes[paneIndex]?.projectId || projectId);
+    const workspace = store.openProjects.get(owner);
+    if (!workspace) return;
+    const projectPath = workspace.projectPath && !workspace.projectPath.startsWith('__unset__')
+      ? workspace.projectPath
+      : '';
+    const cwd = projectPath || workspace.tabs.get(workspace.activeTabId || '')?.cwd || '';
+    // `background` keeps createTab from activating it: the arrival is the
+    // STRIP's business, and the store action below both adds the chip and shows
+    // it in one write. Letting createTab activate first would run activation
+    // against a strip that does not contain the tab yet — i.e. the replace rule,
+    // which would swap out the very chip the user is adding a neighbour to.
+    //
+    // Named, not auto-numbered: `tab-7` says only that six others came before
+    // it. This tab's whole state is "nothing started here yet", and the name is
+    // the one place that can say so before anything else on the chip can.
+    // It keeps the name until it is renamed or an agent is launched into it.
+    const newTabId = await store.createTab(owner, EMPTY_TAB_NAME, cwd, {
+      skipInitialRename: true,
+      background: true,
+    });
+    if (!newTabId) return;
+    if (paneIndex === null || paneIndex === undefined) {
+      useWorkspaceStore.getState().addTabToCenterStrip(owner, newTabId);
+      return;
+    }
+    useWorkspaceStore.getState().addTabToSplitPaneStrip(paneIndex, owner, newTabId);
+  }, [paneIndex, projectId]);
 
   // Clamp the split-direction menu into the window once it has a measurable
   // box. useLayoutEffect, not useEffect: the corrected position must land in
@@ -168,26 +189,11 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   }, [splitMenu]);
 
   if (!tabExists) return null;
-  const chrome = getTabChromeColorConfig({ color: tabColor, tabType });
-  const hasColor = !!tabColor && tabColor !== 'default';
-  // Size, colour and hover all come from the shared card rules, so this chip
-  // and the sidebar card cannot look like two different objects for the same
-  // tab. Before this, the chip was 21px tall at 11.5px text next to a 27px
-  // card at 14px, and its hover painted a flat white wash OVER the tab's own
-  // colour — a green tab flashed grey-green and read as another widget.
-  const cardMetrics = resolveTabCardMetrics(tabGeo, {
-    fontSize: tabsFontSize,
-    showTaskLane: taskItems.length > 0,
-    hasStatusMarker: !!statusMeta,
-  });
-  const tabChipBg = flattenRgbaOnTabbarPanel(resolveTabCardBackground(
-    { bgColor: chrome.bgColor, hasColor, hovered: tabChipHovered },
-    adjustRgbaAlpha,
-  ));
-  // Derived from the SAME settings as the chip, so the row always fits it.
+  // Derived from the SAME settings as the chips, so the row always fits them.
   // The wrapper that reserves this slot uses the same hook — see
   // useSplitAttachRowHeight.
-  const rowH = resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize });
+  const rowH = resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize, withPath: true });
+  const seamH = resolveTabCardBottomOverhang(tabGeo);
   return (
     <div
       data-split-attach-row
@@ -198,9 +204,19 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         left: 0,
         right: 0,
         height: rowH,
+        // TWO lines: the strip of tab chips, and the working directory of the
+        // tab currently shown. The path moved here from a full-width row of its
+        // own — it belongs to the tab, so it belongs where the tab is named, and
+        // every window now answers about its own folder instead of only the
+        // active one.
         display: 'flex',
-        alignItems: 'center',
-        gap: 6,
+        flexDirection: 'column',
+        justifyContent: 'center',
+        // The seam a chip's marks hang into. In the sidebar that is the gap
+        // before the next card; here it has to be asked for, or the context
+        // number and the task squares land on the path text. Same number the
+        // height above reserves — one resolver, so they cannot disagree.
+        rowGap: seamH,
         padding: '0 8px',
         background: 'transparent',
         boxSizing: 'border-box',
@@ -211,256 +227,21 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         pointerEvents: 'auto',
       }}
     >
-      {/* Project = an inert 12px badge, icon only. It answers "whose zone is
-          this window" — the one mark that survives when the sidebar shows a
-          different project. NOT a button (2026-08-17): with the one-pointer
-          model a click anywhere in the pane already focuses it and the sidebar
-          follows the tab's project, so a click here had nothing left to do —
-          navigation lives on the titlebar cards and the tab chip. The name
-          moved into the tooltip: next to the tab chip it repeated information
-          the icon already carries and stole width from the tab's own name. */}
-      <span
-        title={displayProjectName + (workspacePath ? `\n${workspacePath}` : '')}
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          flexShrink: 0,
-        }}
-      >
-        {projectMeta?.icon ? (
-          <img
-            src={projectMeta.icon}
-            alt=""
-            draggable={false}
-            style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.65 }}
-          />
-        ) : (
-          // No icon set (or Inbox): the same dashed placeholder square as the
-          // titlebar card, so the header never reads as "icon failed to load"
-          // and the chip's left edge does not shift between projects.
-          <span
-            aria-hidden
-            style={{
-              width: 12,
-              height: 12,
-              borderRadius: 2,
-              flexShrink: 0,
-              border: '1px dashed rgba(148,163,184,0.8)',
-              background: 'rgba(148,163,184,0.08)',
-            }}
-          />
-        )}
-      </span>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+      {/* The strip: project icon per RUN of same-project chips, then the chips.
+          The icon labels a run rather than riding on every chip — with one icon
+          per chip it sits BETWEEN two of them and it is unreadable which of the
+          two it belongs to. */}
+      <PaneTabStrip
+        entries={entries}
+        shownTabId={tabId}
+        paneIndex={paneIndex ?? null}
+        inSplit={inSplit}
+        onCreateTab={createTabInThisWindow}
+      />
 
-      <span
-          // Named so a test can ask "does the chip FOR THIS TAB carry the
-          // loader" — the question the process-bar bugs kept getting wrong,
-          // and one that is unanswerable without knowing which tab a chip is.
-          data-split-pane-tab-chip
-          data-tab-id={tabId}
-          title={inSplit
-            ? 'Клик — перейти на вкладку. Средний клик — убрать вкладку из этого окна (окно останется)'
-            : 'Клик — перейти на вкладку'}
-          onMouseEnter={() => setTabChipHovered(true)}
-          onMouseLeave={() => setTabChipHovered(false)}
-          // Only a LEFT press may take focus. A right-click opens a menu about
-          // this tab — inspecting a tab is not switching to it, and stealing
-          // focus there moves the surface out from under the menu the user just
-          // opened. (pointerdown fires for every button, hence the check.)
-          onPointerDown={(e) => {
-            e.stopPropagation();
-            if (e.button !== 0) e.preventDefault();
-          }}
-          // Nothing in this header is draggable: a pane header shows ONE tab,
-          // so there is no order to rearrange, and a drag here would only be a
-          // way to start an action the surface cannot finish.
-          draggable={false}
-          onDragStart={(e) => e.preventDefault()}
-          onClick={(e) => {
-            // "Go to this tab". Activation itself brings the sidebar to the
-            // tab's project now (one-pointer model), so the chip needs no
-            // special project-following path anymore.
-            e.stopPropagation();
-            if (renaming) return;
-            useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
-          }}
-          onDoubleClick={(e) => {
-            // Same gesture as in the sidebar list. File tabs keep their file
-            // name — renaming one there would promise something the file
-            // itself does not do.
-            e.preventDefault();
-            e.stopPropagation();
-            if (tabType === 'file') return;
-            setRenameDraft(tabName);
-            setRenaming(true);
-          }}
-          onContextMenu={(e) => {
-            // The sidebar's own menu, opened for THIS tab — not a second copy.
-            // It renders downward from the click: the header is flush against
-            // the top of the pane, so there is no room above it.
-            e.preventDefault();
-            e.stopPropagation();
-            openTabContextMenuAt(projectId, tabId, e.clientX, e.clientY);
-          }}
-          onAuxClick={(e) => {
-            // Middle-click takes this tab OUT OF THE WINDOW: the pane stays and
-            // becomes an empty placeholder, and the tab keeps living in the
-            // sidebar list — it is not closed. Closing the window itself is the
-            // placeholder's own ✕, so a stray middle-click can never destroy a
-            // layout the user built.
-            //
-            // It acts on the tab NAMED IN THIS CHIP and on nothing else. The
-            // guard below is not defensive noise: the row is also rendered in
-            // single mode from the CENTER tab, so a stale/foreign tabId here
-            // would silently empty a pane the user is not even looking at.
-            if (e.button !== 1 || !inSplit) return;
-            const paneOfThisTab = useWorkspaceStore.getState().splitPanes
-              .some((p) => p.projectId === projectId && p.tabId === tabId);
-            if (!paneOfThisTab) return;
-            e.preventDefault();
-            e.stopPropagation();
-            // A file pane steps BACK to whatever this pane showed before it.
-            // Opening a file from an agent and middle-clicking it is "undo
-            // that", not "clear this window" — the pane returns to its previous
-            // tab instead of going empty. Falls through to clearing when there
-            // is nothing to step back to, so the gesture is never dead.
-            if (useWorkspaceStore.getState().restoreSplitPanePreviousTab(tabId)) return;
-            useWorkspaceStore.getState().clearTabFromSplitPane(tabId);
-          }}
-          style={{
-            // The signals below are absolutely positioned against THIS chip.
-            position: 'relative',
-            flexShrink: 1,
-            minWidth: 0,
-            // NOT `overflow: hidden`. The task squares hang a few px BELOW the
-            // bottom edge on purpose — they mark the boundary, and a lane that
-            // stops inside the card says nothing. Clipping here trimmed them
-            // flush and made them look like a row inside the chip.
-            // The name gets its own clipping instead, on the text node.
-            whiteSpace: 'nowrap',
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 4,
-            fontSize: cardMetrics.fontSize,
-            // Pinned, not browser-default: the row height PREDICTS the chip's
-            // height from this number (resolveSplitAttachRowHeight), and the
-            // default 'normal' is font-dependent — the prediction would drift.
-            lineHeight: TAB_CARD_LINE_HEIGHT,
-            color: '#e8e8e8',
-            cursor: 'pointer',
-            // Hover brightens the tab's OWN colour (shared rule), it does not
-            // paint over it.
-            background: tabChipBg,
-            border: `1px solid ${chrome.borderColor}55`,
-            borderRadius: cardMetrics.borderRadius,
-            // Left padding clears the status marker when one is shown, so the
-            // name never sits under it — same rule as the sidebar card.
-            padding: cardMetrics.padding,
-            transition: 'background-color 0.12s ease',
-          }}
-        >
-          {/* Signals belong to the TAB, so they hang off the chip — not off the
-              header row. The row is the full pane width (~1215px) while the chip
-              is ~195px: anchoring the bar to the row put it ~900px away from the
-              tab it describes, next to the split button, even though its width,
-              color and edge were all correct. Shared component, so the sidebar
-              card and this chip cannot drift apart again. */}
-          <TabProcessBar
-            hasProcess={hasProcess}
-            busy={busy}
-            inheritedBusy={inheritedBusy}
-            radius={4}
-            zIndex={4}
-          />
-          <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} />
-          {tabType === 'file' && <FileText size={10} style={{ color: '#a78bfa', flexShrink: 0 }} />}
-          {renaming ? (
-            <input
-              autoFocus
-              value={renameDraft}
-              onChange={(e) => setRenameDraft(e.target.value)}
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={(e) => e.stopPropagation()}
-              onBlur={commitRename}
-              onKeyDown={(e) => {
-                e.stopPropagation();
-                if (e.key === 'Enter') commitRename();
-                else if (e.key === 'Escape') setRenaming(false);
-              }}
-              style={{
-                width: Math.max(60, renameDraft.length * 6.5 + 12),
-                minWidth: 60,
-                padding: 0,
-                border: 'none',
-                outline: 'none',
-                background: 'transparent',
-                color: '#fff',
-                font: 'inherit',
-              }}
-            />
-          ) : (
-            // The name clips itself now that the chip no longer clips its
-            // children — otherwise a long tab name would stretch the header.
-            <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {tabName}
-            </span>
-          )}
-          {/* Task squares along the bottom seam of the chip — the same lane the
-              sidebar card carries, from the same component. Partial overlap with
-              the content below is intended: they mark the boundary. */}
-          {taskItems.length > 0 && (
-            <span
-              data-task-plan-tab-markers
-              style={{
-                position: 'absolute',
-                left: 6,
-                right: 6,
-                // Hangs below the bottom edge by the shared rule, same as the
-                // sidebar card — the squares straddle the seam rather than
-                // sitting inside it.
-                bottom: `${cardMetrics.laneBottomPx}px`,
-                height: `${TASK_MARKER_LANE_HEIGHT_PX}px`,
-                display: 'flex',
-                alignItems: 'flex-end',
-                gap: `${TASK_MARKER_GAP_PX}px`,
-                overflow: 'hidden',
-                pointerEvents: 'none',
-                zIndex: 7,
-              }}
-            >
-              {taskItems.map((task: any) => {
-                const status = task.statusId
-                  ? taskStatuses.find((candidate) => candidate.id === task.statusId)
-                  : undefined;
-                return (
-                  <TabTaskMarker
-                    key={task.id}
-                    color={status?.color || TASK_MARKER_DEFAULT_COLOR}
-                    shape={taskStatusShape}
-                    title={task.title}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
-                      requestTaskPlanNavigation({ tabId, taskId: task.id, view: 'active' });
-                    }}
-                  />
-                );
-              })}
-            </span>
-          )}
-      </span>
-
-      {/* Здесь была кнопка «недавние вкладки» — список по наведению, который
-          клал вкладку в ЭТУ панель, не забирая фокус. Удалена 2026-08-17:
-          список шёл в порядке свежести (журнал), а пользователь выбирает
-          вкладку глазами по КАРТЕ — иерархии бокового меню, которую сам
-          расставил. Журнальный порядок читался как «сплошной набор файлов».
-          Боковое меню теперь следует за активной вкладкой, поэтому нужный
-          список и так всегда слева. Если вернётся сценарий «подготовить
-          соседнее окно, не уходя из своего» — восстанавливать с порядком
-          сайдбара, а не MRU. */}
-
-      <span style={{ flex: 1 }} />
+      {/* No spacer: the strip itself takes the free width, so the split button
+          stays pinned right whether there is one chip or twelve. */}
 
       {/* VS Code header pattern (approved 2026-08-17): pane ACTIONS show on
           the focused pane only; an unfocused pane reveals them on header
@@ -471,13 +252,11 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         data-split-button
         data-split-horizontal={splitCan.horizontal ? '1' : '0'}
         data-split-vertical={splitCan.vertical ? '1' : '0'}
-        title={splitCan.horizontal
+        // Количество панелей больше не ограничено (2026-08-17), поэтому
+        // единственная оставшаяся причина отказа — незаполненная пустая панель.
+        title={splitCan.horizontal || splitCan.vertical
           ? 'Разделить рабочую область. Правый клик — разделить по горизонтали'
-          : splitCan.vertical
-            ? 'Три колонки уже открыты. Правый клик — разделить эту колонку по горизонтали'
-            : splitCan.reason === 'placeholder'
-              ? 'Сначала выберите вкладку для пустой панели'
-              : 'Рабочая область заполнена: три колонки, в этой уже две строки'}
+          : 'Сначала выберите вкладку для пустой панели'}
         onClick={(e) => {
           e.stopPropagation();
           // Left click means "split sideways". When only the vertical
@@ -533,8 +312,12 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
       >
         <Columns2 size={12} />
       </button>
+      </div>
 
-      {/* Rendered through a portal: the header is 26px tall with overflow
+      {/* Line 2 — where this tab's terminal actually is. */}
+      <TabLocationLine projectId={projectId} tabId={tabId} />
+
+      {/* Rendered through a portal: the header is short with overflow
           clipping, so an inline menu would be cut off at the first row. */}
       {splitMenu && createPortal(
         <>
@@ -557,7 +340,11 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
               top: splitMenuPos ? splitMenuPos.y : splitMenu.y + 4,
               left: splitMenuPos ? splitMenuPos.x : splitMenu.x,
               zIndex: 9999,
-              minWidth: 190,
+              // Was 190px for «Разделить: панель сверху/снизу» — a sentence
+              // that repeated the verb of the button it opened from. The menu
+              // only ever answers WHERE, so the items say just that, and the
+              // box shrinks to what two short answers need.
+              minWidth: 108,
               padding: '4px 0',
               background: '#242427',
               border: '1px solid rgba(255,255,255,0.12)',
@@ -568,22 +355,36 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
               userSelect: 'none',
             }}
           >
+            {/* Icon + one word. The verb lives on the button that opened this
+                menu; repeating it in both rows made the reader compare two long
+                strings to find the single word that differs. The panel icons
+                show the shape of the result, so the word only has to name the
+                side. */}
             {([
-              { side: 'above' as const, label: 'Разделить: панель сверху' },
-              { side: 'below' as const, label: 'Разделить: панель снизу' },
-            ]).map(({ side, label }) => (
+              { side: 'above' as const, label: 'Сверху', Icon: PanelTop },
+              { side: 'below' as const, label: 'Снизу', Icon: PanelBottom },
+            ]).map(({ side, label, Icon }) => (
               <div
                 key={side}
+                data-split-direction-item={side}
                 onMouseDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation();
                   setSplitMenu(null);
                   useWorkspaceStore.getState().addVerticalSplitPane(paneIndex ?? null, side);
                 }}
-                style={{ padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '5px 12px',
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap',
+                }}
                 onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
                 onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
               >
+                <Icon size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
                 {label}
               </div>
             ))}

@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel, PROMPT_SUMMARY_PROMPT_ID } from '../../store/usePromptsStore';
 import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
@@ -101,6 +101,16 @@ const DEFAULT_DOC_FILE_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/
 // Track if settings was opened at least once (for default tab)
 let hasOpenedBefore = false;
 let lastActiveTab: SettingsTab = 'ai';
+// Session-only by design: survives tab switches and closing/reopening the
+// modal, but a real app quit reloads this module and clears every position.
+const settingsScrollPositions = new Map<string, number>();
+const restoreSettingsScrollPosition = (key: string, node: HTMLElement | null) => {
+  if (!node) return;
+  node.scrollTop = settingsScrollPositions.get(key) || 0;
+};
+const rememberSettingsScrollPosition = (key: string, scrollTop: number) => {
+  settingsScrollPositions.set(key, Math.max(0, scrollTop));
+};
 
 // Shortcuts data
 const SHORTCUTS = [
@@ -1469,13 +1479,22 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     return hasOpenedBefore ? lastActiveTab : 'ai';
   });
   const [aiSubTab, setAiSubTab] = useState<AISubTab>('text');
+  const contentScrollRef = useRef<HTMLDivElement>(null);
+
+  // The top content node is reused while its tab changes, so the browser would
+  // otherwise carry one tab's offset into another. Restore each tab's own
+  // position before paint; reopening the modal follows the same path.
+  useLayoutEffect(() => {
+    if (!isOpen) return;
+    restoreSettingsScrollPosition(`tab:${activeTab}`, contentScrollRef.current);
+  }, [activeTab, isOpen]);
 
   // Programmatic open with requested tab (e.g. ПКМ на SemanticIndexButton).
   // Срабатывает на переходе isOpen=false→true когда initialTab задан.
   // Не блокирует ручное переключение табов после открытия — пользователь
   // нажал ПКМ → попал на «Системные», дальше может кликать другие табы.
   const prevIsOpenRef = useRef(isOpen);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (isOpen && !prevIsOpenRef.current && initialTab) {
       const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai', 'projects'];
       if (valid.includes(initialTab as SettingsTab)) {
@@ -1508,6 +1527,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setHistoryComposerFontSize = useUIStore((s) => s.setHistoryComposerFontSize);
   const aiSecondaryFontSize = useUIStore((s) => s.aiSecondaryFontSize);
   const setAiSecondaryFontSize = useUIStore((s) => s.setAiSecondaryFontSize);
+  const historyMarkdownCodeMaxLines = useUIStore((s) => s.historyMarkdownCodeMaxLines);
+  const setHistoryMarkdownCodeMaxLines = useUIStore((s) => s.setHistoryMarkdownCodeMaxLines);
   const historyComposerMinRows = useUIStore((s) => s.historyComposerMinRows);
   const setHistoryComposerMinRows = useUIStore((s) => s.setHistoryComposerMinRows);
   const historyComposerMaxRows = useUIStore((s) => s.historyComposerMaxRows);
@@ -2612,8 +2633,11 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             ref={(element) => {
               textListRef.current = element;
               promptDnd.scrollerRef.current = element;
+              restoreSettingsScrollPosition('ai:text:list', element);
             }}
+            onScroll={(event) => rememberSettingsScrollPosition('ai:text:list', event.currentTarget.scrollTop)}
             onDragStart={(e) => e.preventDefault()}
+            data-settings-scroll-key="ai:text:list"
             data-prompt-outline="true"
             data-prompt-outline-phase={promptDnd.dragState?.phase || 'idle'}
             data-prompt-outline-navigation={promptDnd.dragState?.navigationMode ? 'true' : undefined}
@@ -2686,7 +2710,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 </div>
                 <VRIconBtn title="Удалить промпт" danger onClick={() => editingInsertionIndex !== null && deletePrompt(editingInsertionIndex)}><VRTrashIcon /></VRIconBtn>
               </div>
-              <div style={{ padding: 14, overflowY: 'auto', minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div
+                ref={(node) => restoreSettingsScrollPosition('ai:text:editor', node)}
+                onScroll={(event) => rememberSettingsScrollPosition('ai:text:editor', event.currentTarget.scrollTop)}
+                data-settings-scroll-key="ai:text:editor"
+                style={{ padding: 14, overflowY: 'auto', minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}
+              >
                 <VRField label="Текст">
                   <textarea
                     value={localInsertionContent}
@@ -2823,7 +2852,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             {renderTokenMetric('total', totals.totalTokens || 0, '#e0f2fe')}
           </div>
 
-          <div style={{ padding: 12, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div
+            ref={(node) => restoreSettingsScrollPosition('ai:usage:breakdown', node)}
+            onScroll={(event) => rememberSettingsScrollPosition('ai:usage:breakdown', event.currentTarget.scrollTop)}
+            data-settings-scroll-key="ai:usage:breakdown"
+            style={{ padding: 12, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10 }}
+          >
             <div style={{ background: VR_CARD, border: `1px solid ${VR_BORDER}`, borderRadius: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div style={{ color: VR_DIM, fontSize: 10, textTransform: 'uppercase', fontWeight: 750 }}>по prompt</div>
               {byPrompt.length > 0
@@ -2844,7 +2878,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             <span style={{ fontSize: 11, fontWeight: 750, letterSpacing: 0.4, color: VR_DIM, textTransform: 'uppercase' }}>История вызовов</span>
             {aiUsageLoading && <VRTag>loading</VRTag>}
           </div>
-          <div style={{ padding: 12, minHeight: 0, flex: 1, overflowY: 'auto' }}>
+          <div
+            ref={(node) => restoreSettingsScrollPosition('ai:usage:history', node)}
+            onScroll={(event) => rememberSettingsScrollPosition('ai:usage:history', event.currentTarget.scrollTop)}
+            data-settings-scroll-key="ai:usage:history"
+            style={{ padding: 12, minHeight: 0, flex: 1, overflowY: 'auto' }}
+          >
             {Object.keys(grouped).length === 0 && !aiUsageLoading ? (
               <VREmpty text="История AI-вызовов пустая" />
             ) : Object.entries(grouped).map(([date, rows]) => (
@@ -3012,7 +3051,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             <VRIconBtn title="Закрыть" onClick={closeAIPromptEditor}><VRXIcon /></VRIconBtn>
           </div>
 
-          <div style={{ padding: 14, overflowY: 'auto', minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div
+            ref={(node) => restoreSettingsScrollPosition('ai:system:editor', node)}
+            onScroll={(event) => rememberSettingsScrollPosition('ai:system:editor', event.currentTarget.scrollTop)}
+            data-settings-scroll-key="ai:system:editor"
+            style={{ padding: 14, overflowY: 'auto', minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}
+          >
             <VRField label="Название">
               <input
                 type="text"
@@ -3174,7 +3218,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             <button onClick={addAIPrompt} style={vrSmallBtnStyle('accent')}><VRPlusIcon small /> Промпт</button>
           </div>
 
-          <div style={{ padding: 8, overflowY: 'auto', minHeight: 0, flex: 1 }}>
+          <div
+            ref={(node) => restoreSettingsScrollPosition('ai:system:list', node)}
+            onScroll={(event) => rememberSettingsScrollPosition('ai:system:list', event.currentTarget.scrollTop)}
+            data-settings-scroll-key="ai:system:list"
+            style={{ padding: 8, overflowY: 'auto', minHeight: 0, flex: 1 }}
+          >
             {aiPrompts.map((aiPrompt) => {
               const isSelected = editingPromptId === aiPrompt.id;
               const displayName = isSelected ? localPromptName : aiPrompt.name;
@@ -3780,7 +3829,15 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         </div>
 
         {/* Content */}
-        <div style={{ padding: '20px 24px', overflowY: 'auto', flex: 1 }}>
+        <div
+          ref={contentScrollRef}
+          data-settings-scroll-key={`tab:${activeTab}`}
+          onScroll={(event) => rememberSettingsScrollPosition(
+            `tab:${activeTab}`,
+            event.currentTarget.scrollTop,
+          )}
+          style={{ padding: '20px 24px', overflowY: 'auto', flex: 1 }}
+        >
           {activeTab === 'shortcuts' && (
             <div style={{ display: 'flex', gap: '32px' }}>
               {/* Left column */}
@@ -3904,6 +3961,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsGrid4>
                 <FontSizeSlider label="Шрифт сообщений" description="Основной текст и вызовы инструментов в History" value={historyFontSize} onChange={setHistoryFontSize} min={8} max={24} />
                 <FontSizeSlider label="Шрифт вторичных элементов" description="Подписи, статусы и чипы AI-интерфейса" value={aiSecondaryFontSize} onChange={setAiSecondaryFontSize} min={8} max={18} />
+                <FontSizeSlider label="Строк в код-блоке" description="После этого предела появляется вертикальная прокрутка; длинные строки переносятся" value={historyMarkdownCodeMaxLines} onChange={setHistoryMarkdownCodeMaxLines} min={5} max={100} suffix="" />
               </SettingsGrid4>
 
               <SettingsSubSectionHeader title="Поле ввода" />

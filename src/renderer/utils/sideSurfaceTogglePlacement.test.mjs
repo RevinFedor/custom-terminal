@@ -62,11 +62,14 @@ test('правый край кнопки совпадает с правым кр
   // два (16 у рамки, 12 у кнопки), кнопка стояла на 4px правее линии.
   assert.match(history, /const HISTORY_COMPOSER_SIDE_INSET = 16;/);
   assert.match(history, /right: centerRightInset \+ HISTORY_COMPOSER_SIDE_INSET,/);
-  assert.match(history, /left: overlayComposer \? HISTORY_COMPOSER_SIDE_INSET : undefined/);
-  assert.match(history, /right: overlayComposer \? HISTORY_COMPOSER_SIDE_INSET : undefined/);
+  // Отступ рамки берётся из ТОЙ ЖЕ константы. Как именно он задан — раньше
+  // `left/right` у абсолютной панели, сейчас `padding` у обычной строки колонки —
+  // не важно; важно, что число одно, иначе кнопка снова встанет мимо линии.
+  assert.match(history, /paddingLeft: overlayComposer \? HISTORY_COMPOSER_SIDE_INSET/);
+  assert.match(history, /paddingRight: overlayComposer \? HISTORY_COMPOSER_SIDE_INSET/);
   // Прежние независимые числа не должны вернуться ни с одной стороны.
   assert.doesNotMatch(history, /right: centerRightInset \+ 12,/);
-  assert.doesNotMatch(history, /left: overlayComposer \? 16 : undefined/);
+  assert.doesNotMatch(history, /paddingLeft: overlayComposer \? 16/);
 });
 
 test('значок масштабируется вместе с квадратом кнопки', () => {

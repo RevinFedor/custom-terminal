@@ -96,12 +96,17 @@ import {
 } from '../../store/useWorkspaceStore';
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
-import { resolveCenterRightInset } from '../../utils/surfaceInsets.mjs';
+import { resolveCenterRightInset, resolveTimelineInset } from '../../utils/surfaceInsets.mjs';
 import {
   resolvePtyAgentOwner,
   shouldInterpretPtyScreenAsShellCommand,
 } from '../../utils/ptyAgentOwner.mjs';
 import { canTerminalClaimFocus } from '../../utils/terminalFocusClaim.mjs';
+import { isEmptyTab } from '../../utils/emptyTab.mjs';
+import {
+  setEmptyTabLaunchHost,
+  releaseEmptyTabLaunchHost,
+} from '../../utils/emptyTabLaunchHost.mjs';
 import { measureTerminalViewportIntersection } from '../../utils/terminalViewportIntersection.mjs';
 import { log } from '../../utils/logger';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
@@ -1069,7 +1074,7 @@ interface TerminalProps {
   active?: boolean;
   isActiveProject?: boolean; // For lazy init optimization
   ownerProjectId?: string;
-  onLinkClick?: (url: string) => void; // Override link handler (used by BrowserTab)
+  onLinkClick?: (url: string) => void; // Override link handler (no caller today: the embedded browser tab that used it is gone)
   presented?: boolean;
   promptQueuePortalHostId?: string;
   hidePromptQueueHistoryToggle?: boolean;
@@ -1623,8 +1628,23 @@ function Terminal({
     // A pinned panel is a column: the centre already ends before it.
     sidePanelPinned: historyPinnedSetting,
   };
-  // Anchored to the CENTRE box → always dodges whichever panel is docked over it.
-  const promptQueueRightInset = resolveCenterRightInset(sharedInsetArgs);
+  // Run after больше НЕ отходит от бокового окна (2026-08-17).
+  //
+  // Полоска уезжала влево, когда справа открывалось боковое окно — терминал или
+  // переписка, — чтобы не оказаться под ним. Плата за это: полоска меняла место
+  // при каждом ⌘] / ⌘-переключении поверхностей, а сдвиг был заметно больше её
+  // самой. Отступать ей и не нужно: у неё есть свёрнутый вид, в котором она и
+  // так почти ничего не занимает. Юзер: *«он не должен сдвигаться влево, я решил
+  // эту фичу убрать, так как у нас уже доступен свёрнутый режим»*.
+  //
+  // От РАЗВЁРНУТОГО Timeline полоска отступает по-прежнему: это не окно, которое
+  // можно закрыть одной клавишей, а колонка, поверх которой полоска была бы
+  // просто не видна. Поэтому здесь именно ширина Timeline, а не общий отступ.
+  //
+  // Кнопки, привязанные к САМОМУ терминалу (стрелка вниз, кнопка второй
+  // поверхности), отступают как раньше — они живут в другой коробке, и её правый
+  // край боковое окно действительно закрывает.
+  const promptQueueRightInset = resolveTimelineInset(sharedInsetArgs);
   // Anchored to THIS terminal → when the terminal IS the docked panel, its own
   // right edge is already clear and insetting would push the arrow out of itself.
   const terminalArrowRightInset = resolveCenterRightInset({
@@ -1789,6 +1809,30 @@ function Terminal({
     }
     setPromptQueuePortalHost(document.getElementById(promptQueuePortalHostId));
   }, [promptQueuePortalHostId]);
+
+  // «Пустая вкладка»: пока в ней ничего не запущено, терминал отдаёт место в
+  // своей середине под кнопки запуска. Признак читается из тех же полей
+  // вкладки, что и везде — это описание, а не отдельное состояние
+  // (см. emptyTab.mjs). Селектор возвращает булево, не объект вкладки.
+  const isEmptyTabHere = useWorkspaceStore((s) => {
+    // Свой проект известен — ищем прямо в нём. Обход всех открытых проектов
+    // выполнялся бы на КАЖДУЮ запись в состояние, у каждого терминала.
+    const own = ownerProjectId ? s.openProjects.get(ownerProjectId)?.tabs.get(tabId) : null;
+    if (own) return isEmptyTab(own);
+    for (const workspace of s.openProjects.values()) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) return isEmptyTab(tab);
+    }
+    return false;
+  });
+  const emptyLaunchSlotRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    // Публикуем узел ПОСЛЕ отрисовки — до неё ref пуст, и подписчик получил бы
+    // «места нет» ровно в тот кадр, когда место появилось.
+    const node = isEmptyTabHere ? emptyLaunchSlotRef.current : null;
+    setEmptyTabLaunchHost(tabId, node);
+    return () => releaseEmptyTabLaunchHost(tabId, node);
+  }, [tabId, isEmptyTabHere]);
 
   useEffect(() => {
     if (!effectivePresented || !isVisible) return;
@@ -2721,6 +2765,15 @@ function Terminal({
         if (event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'Tab') {
           return false;
         }
+        // Ctrl+Q — project switcher (ProjectSwitcherOverlay). This one MUST be
+        // swallowed rather than merely handled elsewhere: Ctrl+Q is XOFF, and
+        // leaking it to the PTY freezes the terminal's output until Ctrl+S — a
+        // hang that reads as "the app broke", with no visible cause.
+        // event.code, so a RU layout (Ctrl+Й) behaves identically.
+        if (event.ctrlKey && !event.metaKey && !event.altKey
+            && event.type === 'keydown' && event.code === 'KeyQ') {
+          return false;
+        }
         // Cmd+P / Ctrl+P — tab search switcher. Layout-agnostic via event.code.
         // Both modifiers open the same panel, so both must be kept out of the
         // PTY (Ctrl+P is readline "previous line" — leaking it would edit the
@@ -3318,6 +3371,12 @@ function Terminal({
           if (event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'Tab') {
             return false;
           }
+          // Ctrl+Q — project switcher (mirrors primary handler). XOFF: leaking
+          // it would freeze the PTY's output until Ctrl+S.
+          if (event.ctrlKey && !event.metaKey && !event.altKey
+              && event.type === 'keydown' && event.code === 'KeyQ') {
+            return false;
+          }
           // Cmd+P / Ctrl+P — tab search switcher. Layout-agnostic via event.code.
           // Both modifiers open the same panel, so both must be kept out of the
           // PTY (Ctrl+P is readline "previous line" — leaking it would edit the
@@ -3885,6 +3944,50 @@ function Terminal({
           onClick={handleClick}
           onContextMenu={handleContextMenu}
         />
+
+        {/* «Пустая вкладка» — место в СЕРЕДИНЕ терминала, куда панель управления
+            рисует свою полосу запуска, пока в этой вкладке ничего не запущено.
+            Кнопки при этом не переезжают и не дублируются: сюда порталом
+            приходит та же самая полоса, вместе со всеми защитами запуска.
+            См. emptyTabLaunchHost.mjs.
+
+            Слот пропускает клики насквозь — под ним живой shell, и человек,
+            которому нужна просто команда, её и печатает. Свои клики ловит только
+            сама полоса (она в pointerEvents:auto внутри). */}
+        {isEmptyTabHere && (
+          <div
+            aria-hidden={false}
+            style={{
+              position: 'absolute',
+              inset: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'none',
+              zIndex: 40,
+            }}
+          >
+            <div
+              data-empty-tab-launch-slot={tabId}
+              ref={emptyLaunchSlotRef}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 6,
+                flexWrap: 'wrap',
+                // Только сама плашка ловит клики; всё вокруг остаётся терминалом.
+                pointerEvents: 'auto',
+                padding: '10px 14px',
+                borderRadius: 10,
+                // Тихая подложка, а не окно поверх терминала: она группирует
+                // кнопки, но не притворяется отдельной поверхностью.
+                background: 'rgba(22,22,22,0.82)',
+                border: '1px solid rgba(255,255,255,0.07)',
+              }}
+            />
+          </div>
+        )}
 
       </div>
 

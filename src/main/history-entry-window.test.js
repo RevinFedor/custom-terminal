@@ -112,6 +112,7 @@ const heavyRow = (index, extra = {}) => ({
   timestamp: '2026-08-07T10:00:00.000Z',
   sessionId: 's',
   sourceIdentity: `codex-source-s-${index}`,
+  sourceIdentityAliases: [`codex-response-source-s-${index}`],
   content: 'x'.repeat(500),
   thinking: 'y'.repeat(500),
   actions: [{ tool: '__raw__', rawTool: { toolUseId: `c${index}`, toolName: 'Bash', args: {}, result: 'ok' } }],
@@ -137,6 +138,11 @@ test('row window keeps length and order, stubbing only outside the span', () => 
   assert.equal(result.entries[50].role, heavy[50].role);
   assert.equal(result.entries[50].timestamp, heavy[50].timestamp);
   assert.equal(result.entries[50].sourceIdentity, heavy[50].sourceIdentity);
+  assert.deepEqual(
+    result.entries[50].sourceIdentityAliases,
+    heavy[50].sourceIdentityAliases,
+    'dehydration keeps exact Codex source aliases needed for local adoption',
+  );
   assert.equal(result.hydratedCount, 10);
   assert.equal(result.stubbedCount, 90);
 });

@@ -5,6 +5,43 @@
 
 Команда: **`npm run build:i-obs`** (`i` = install, `obs` = observe). Реализация — `scripts/build-when-idle.js` (чистый Node, без зависимостей).
 
+## Соседний режим: `build:i-cont`
+
+`npm run build:i-cont` намеренно не ждёт idle: он выполняет канонический
+`build:install`, затем отправляет ровно слово `continue` каждой Claude/Codex
+PTY-вкладке, которую этот shutdown действительно остановил. Команду, как и
+`build:i-obs`, запускают из внешнего терминала: процесс внутри Noted Terminal
+умрёт вместе с заменяемым приложением и не сможет выполнить post-install часть.
+
+Источник целей — не список открытых вкладок и не сохранённый `commandType`.
+Перед graceful shutdown main сохраняет точный набор `{tabId, provider,
+sessionId, shutdownPid}` из тех же live-карт, которыми помечает
+`was_interrupted`. Новая версия замораживает этот снимок до renderer restore:
+обычный AutoResume может уже очистить визуальный interrupted-флаг, но не может
+изменить список именно этого shutdown. Для первого install старый билд ещё не
+умеет писать точный снимок; разрешён только ограниченный bootstrap по
+`was_interrupted` с единственной непротиворечивой Claude- либо Codex-binding.
+Две binding, одна подпись без session ID и сменившаяся session остаются
+unresolved и не получают текст.
+
+После появления нового production API wrapper:
+
+1. проверяет, что точный snapshot принадлежит PID заменённого приложения и был
+   записан во время текущего build;
+2. ждёт восстановленного status каждой цели;
+3. по одной допускает отправки через `POST /api/terminal-tabs/:tabId/send` с
+   постоянным handoff ID операции;
+4. не ждёт завершения ответа модели: после принятия `continue` следующая
+   вкладка проходит startup admission, поэтому сами agent-turn работают
+   параллельно;
+5. не повторяет HTTP timeout/`202`: Enter мог уже пересечь PTY, поэтому такой
+   результат остаётся `ACCEPTED/VERIFYING`, а не становится blind retry.
+
+Это не новая очередь и не новый terminal transport. Start/Resume, `/model` /
+`/effort`, exact draft proof, paste+Enter и transcript audit остаются у общего
+Project API scenario. Wrapper только выбирает доказанные shutdown-цели и
+последовательно вызывает этот сценарий.
+
 ## Что считается «активным» (блокирует ребилд)
 Единый ответ `/api/active-loaders` объединяет два авторитетных main-process источника: runtime-снимок `computeActiveLoaders()` и durable store оркестраций. Runtime-часть **переиспользует те же самые live-Map'ы, что питают per-tab loader в UI**; inherited/completion-часть читается прямо из сохранённых run, а не из renderer/Zustand:
 

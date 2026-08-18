@@ -1,3 +1,5 @@
+import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
+
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
 
 export type HistoryPromptHandoffStatus =
@@ -172,6 +174,7 @@ export interface DurableHistoryCanonicalPromptEntry {
   uuid?: string | null;
   sessionId?: string | null;
   sourceIdentity?: string | null;
+  sourceIdentityAliases?: string[] | null;
   semanticTags?: Array<{
     kind?: string | null;
     runId?: string | null;
@@ -1593,6 +1596,42 @@ export const subscribeHistoryPromptHandoffs = (
 export const getHistoryPromptHandoffsSnapshot = (tabId: string) =>
   historyPromptHandoffStore.getSnapshot(tabId);
 
+export function waitForHistoryPromptHandoffSendIdentity(
+  tabId: string,
+  handoffId: string,
+  timeoutMs = 1500,
+): Promise<Readonly<HistoryPromptHandoff> | null> {
+  const current = getHistoryPromptHandoffsSnapshot(tabId)
+    .find((handoff) => handoff.handoffId === handoffId);
+  if (!current) return Promise.resolve(null);
+  if (current.sendOperationKey && current.sendAttemptId) return Promise.resolve(current);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let unsubscribe = () => {};
+    const finish = (handoff: Readonly<HistoryPromptHandoff> | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(handoff);
+    };
+    const timer = setTimeout(() => finish(null), Math.max(0, timeoutMs));
+    const registeredUnsubscribe = subscribeHistoryPromptHandoffs(tabId, (snapshot) => {
+      const handoff = snapshot.find((candidate) => candidate.handoffId === handoffId) || null;
+      if (!handoff) {
+        finish(null);
+        return;
+      }
+      if (handoff.sendOperationKey && handoff.sendAttemptId) finish(handoff);
+    });
+    unsubscribe = registeredUnsubscribe;
+    // subscribe() replays synchronously; if that replay settled the promise,
+    // finish() still had the initial no-op cleanup function.
+    if (settled) registeredUnsubscribe();
+  });
+}
+
 const ORCHESTRATION_COMPLETION_HANDOFF_PREFIX = 'orchestration-complete:';
 const ORCHESTRATION_COMPLETION_SOURCE_PREFIX = 'orchestration-completion:';
 
@@ -1645,8 +1684,8 @@ export function durableHistorySendReceiptMatchesCanonicalEntry(
     ? receipt.sessionId
     : (typeof record.sessionId === 'string' ? record.sessionId : '');
   if (exactSessionId && entry.sessionId && exactSessionId !== entry.sessionId) return false;
-  if (entryUuid) return entry.uuid === entryUuid;
-  return !!sourceIdentity && entry.sourceIdentity === sourceIdentity;
+  if (entryUuid) return historyEntryHasExactIdentity(entry, entryUuid);
+  return !!sourceIdentity && historyEntryHasExactIdentity(entry, sourceIdentity);
 }
 
 export function hydrateHistoryPromptHandoffFromDurableReceipt(

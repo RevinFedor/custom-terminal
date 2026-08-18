@@ -15,12 +15,11 @@
  *    actionSummary) so grouping(any hydration window) === grouping(full).
  *  - Kill switch: `enabled: false` → identity projection.
  *
- * What groups: consecutive assistant entries whose actions all belong to one
- * family (git/read/search/run/mcp — MCP additionally per server), with no
- * standalone reply, no user row, no edit and no family change in between.
- * Caption texts (entry text in the same model response as its calls — Claude:
- * shared messageId; Codex: commentary phase directly before calls) do NOT
- * break a series; a standalone reply does.
+ * What groups: consecutive assistant work actions form a broad noise/edit
+ * block even when their concrete types change; an uninterrupted homogeneous
+ * signature may additionally become the inner series. Caption text and
+ * structurally owned reasoning ride with the broad block. User rows,
+ * standalone replies and interactive questions remain hard boundaries.
  *
  * Corpus grounding (docs/tmp/визуал-history-research-*.md): threshold 2 is
  * the user's pick; families are mandatory because 76% of Claude Bash / 65%
@@ -31,6 +30,7 @@ import {
   HISTORY_CAPTION_MAX_CHARS,
   historyActionHeadline,
   historyActionPresentationMeta,
+  historyDisplayPath,
 } from '../../shared/history-action-grammar.mjs';
 
 /** Short digest subject for a hydrated action — mirrors main's stubActionSubject. */
@@ -45,12 +45,7 @@ function hydratedSubject(raw, presentation = null) {
         mcpServer: raw.mcpServer,
         mcpMethod: raw.mcpMethod,
       }).subject || ''));
-    if (!subject) return '';
-    if (subject.includes('/')) {
-      const parts = subject.split('/').filter(Boolean);
-      return parts[parts.length - 1] || '';
-    }
-    return subject.length > 60 ? subject.slice(0, 60) : subject;
+    return subject ? historyDisplayPath(subject) : '';
   } catch {
     return '';
   }
@@ -59,21 +54,23 @@ function hydratedSubject(raw, presentation = null) {
 /**
  * Two collapsing CLASSES, not one list of families.
  *
- * `noise` — reads, searches, git, shell runs, MCP calls, web lookups. The user
- * does not open these; a run of them is one line no matter how the types
- * interleave, because "read, then git, then read, then npm" as four separate
- * rows is exactly the wall this feature exists to remove.
+ * `noise` — the work log: reads, searches, git/shell, MCP/web, plan updates,
+ * agents, waits and generic tool calls. A run of them is one broad block no
+ * matter how the types interleave; every type remains named in the header as
+ * its own `×N` fragment. AskUser/Question deliberately stays outside — hiding
+ * a live request for user input would break the interaction, not compress it.
  *
  * `edit` — every file mutation (Edit / Write / MultiEdit / Update, one verb).
  * Edits collapse only WITH EACH OTHER and never merge into the noise class:
  * which files changed and by how much is the one thing the user scans.
  *
- * Everything else (plan, task, question, wait, other) keeps its own row.
+ * Question/AskUser and non-action transcript rows keep their own row.
  */
 const CLASS_BY_FAMILY = new Map([
   ['read', 'noise'], ['search', 'noise'], ['git', 'noise'],
   ['run', 'noise'], ['mcp', 'noise'], ['web', 'noise'],
-  ['toolsearch', 'noise'],
+  ['toolsearch', 'noise'], ['plan', 'noise'], ['task', 'noise'],
+  ['wait', 'noise'], ['other', 'noise'],
   ['edit', 'edit'],
 ]);
 
@@ -219,8 +216,9 @@ export function entryActionFacts(entry) {
  * this feature removes.
  *
  * So a reasoning row rides along inside the series (see `isSeriesPassenger`)
- * without ever counting as a call: the header must keep saying «Read 2 files»
- * for two reads, never «5 calls».
+ * without inflating any TOOL multiplier: two reads stay `Read ×2`. The broad
+ * header may additionally end in the purple thinking glyph plus `×3`,
+ * counting visible reasoning rows without pretending they were tool calls.
  */
 export function isThinkingOnlyRow(entry) {
   if (!isObject(entry) || entry.role !== 'assistant') return false;
@@ -286,11 +284,8 @@ export function isCaptionForNext(entry, nextEntry) {
 
 /**
  * The single family of an entry's groupable actions, or null when the entry
- * does not participate in series grouping (mixed families, edits, tasks,
- * text-only rows, non-assistant rows).
- * MCP rows return `mcp:<server>` — a server change breaks the series by
- * construction (user decision: «MCP · 12 calls» must not hide which system
- * was touched).
+ * does not participate in series grouping (an interactive question,
+ * text-only row, or non-assistant row).
  */
 /**
  * The collapsing class of one row: 'noise', 'edit', or null (never collapses).
@@ -679,11 +674,20 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
     }
 
     const key = 'grp:' + firstCallId;
+    const outerDocsKinds = new Set(facts.map((fact) => fact.docsKind || ''));
+    const outerDocsKind = outerDocsKinds.size === 1
+      ? Array.from(outerDocsKinds)[0]
+      : '';
     const groupUnit = {
       kind: 'group',
       level: 1,
       key,
       familyKey: runFamily,
+      // The stack glyph inherits a docs colour only when the WHOLE broad
+      // block shares that channel. Mixed blocks colour their individual
+      // header fragments instead; painting the shared glyph would claim the
+      // ordinary calls were documentation work too.
+      docsKind: outerDocsKind,
       entries: allMembers,
       captionEntry,
       facts,
@@ -793,7 +797,7 @@ export function buildHistoryDisplayUnitsCached(entries, options = {}) {
  * (run may extend / dissolve into an edit block), reasoning-only rows (ride
  * along), short caption-eligible text (may become the headline of a call
  * that has not arrived yet). Everything else — user rows, slash rows,
- * standalone replies, final answers, tasks — is a hard grouping boundary:
+ * standalone replies, final answers and interactive questions — is a hard grouping boundary:
  * no chain the builder recognizes crosses it, in either direction.
  */
 function isGroupingConnectorRow(entry) {
@@ -1016,31 +1020,34 @@ export function groupFamilyBreakdown(facts) {
   for (const fact of list) {
     const family = fact?.family || 'other';
     const docsKind = fact?.docsKind || '';
-    const bucketKey = `${family}:${docsKind || 'regular'}`;
-    let bucket = byFamily.get(bucketKey);
+    // The broad header counts TYPES, not presentation scopes. Splitting one
+    // family into `Edit ×1 · Edit ×1` merely because one target lived under
+    // docs/ looked like a duplicated operation. Scope remains a hard boundary
+    // for INNER series and stays on each child card; here equal families add.
+    let bucket = byFamily.get(family);
     if (!bucket) {
       bucket = {
         family,
-        docsKind,
+        docsKind: '',
+        docsKinds: new Set(),
         count: 0,
         callCount: 0,
         words: new Map(),
         subjects: [],
         targets: new Map(),
       };
-      byFamily.set(bucketKey, bucket);
+      byFamily.set(family, bucket);
     }
+    bucket.docsKinds.add(docsKind);
     bucket.callCount += 1;
-    // The distinguishing token per family: git → subcommand, mcp → method,
+    // The distinguishing token per family: git → subcommand, MCP → server,
     // shell → command word, native tools → their name.
     const word = family === 'git'
       ? (fact.bashDetail || 'git')
       : family === 'mcp'
         // The distinguishing token of an MCP call is the SERVER — the header
-        // phrase reads «Called electron ×7». Methods are member-level detail
-        // (each expanded row already says `server · method`). Counting
-        // methods here once made the phrase print «Called evaluate», which
-        // reads as a mystery verb with no server and no count.
+        // fragment reads `MCP electron ×7`. Methods are member-level detail
+        // (each expanded row already says `server · method`).
         ? (fact.mcpServer || 'mcp')
         : (fact.bashWord || fact.toolName || '');
     if (word) bucket.words.set(word, (bucket.words.get(word) || 0) + 1);
@@ -1056,9 +1063,15 @@ export function groupFamilyBreakdown(facts) {
   }
   const result = Array.from(byFamily.values());
   // One multiplier has one meaning everywhere: number of source tool calls.
-  // Target cardinality remains available through `targets`; conflating it
-  // with `count` produced the false label `Read 53 files` for 53 windows over
-  // a much smaller set of files.
-  for (const bucket of result) bucket.count = bucket.callCount;
+  // A docs accent survives only when EVERY call of this family has the same
+  // docs channel; a mixed docs/regular `Edit ×2` stays neutral rather than
+  // colouring the ordinary edit or splitting the word into a fake duplicate.
+  for (const bucket of result) {
+    bucket.count = bucket.callCount;
+    bucket.docsKind = bucket.docsKinds.size === 1
+      ? (Array.from(bucket.docsKinds)[0] || '')
+      : '';
+    delete bucket.docsKinds;
+  }
   return result;
 }

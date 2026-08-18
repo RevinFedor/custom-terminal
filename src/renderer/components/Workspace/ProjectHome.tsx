@@ -424,7 +424,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       tab.color || '',
       tab.commandType || '',
       tab.tabType || '',
-      tab.url || '',
       tab.claudeSessionId || '',
       tab.geminiSessionId || '',
       tab.codexSessionId || '',
@@ -900,8 +899,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     await createTab(projectId, entry.name || 'tab', entry.cwd || project?.path || '/', {
       color: (entry.color || undefined) as TabColor | undefined,
       commandType: entry.command_type as any || undefined,
-      tabType: (entry.tab_type || 'terminal') as TabType,
-      url: entry.url || undefined,
+      // 'browser' в старых записях истории читаем как обычный терминал:
+      // встроенного браузера больше нет.
+      tabType: (entry.tab_type === 'file' ? 'file' : entry.tab_type === 'claude-sdk' ? 'claude-sdk' : 'terminal') as TabType,
       pendingAction,
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
@@ -1015,7 +1015,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         color: tab.color || null,
         commandType: tab.commandType || null,
         tabType: tab.tabType || 'terminal',
-        url: tab.url || null,
         claudeSessionId: tab.claudeSessionId || null,
         geminiSessionId: tab.geminiSessionId || null,
       }
@@ -1036,7 +1035,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         color: entry.color || null,
         commandType: entry.command_type || null,
         tabType: entry.tab_type || 'terminal',
-        url: entry.url || null,
         claudeSessionId: entry.claude_session_id || null,
         geminiSessionId: entry.gemini_session_id || null,
       }

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   getHistoryDraftNoticeMeta,
+  historyDraftNoticeBelongsOnComposerBorder,
   isHistoryDeliveryConfirmationNotice,
 } from './historyDraftNoticeMeta.mjs';
 
@@ -13,6 +14,7 @@ test('delayed delivery confirmation is not presented as a stopped send', () => {
     label: 'Confirming send',
     tone: 'info',
   });
+  assert.equal(historyDraftNoticeBelongsOnComposerBorder(message), false);
 });
 
 test('unknown delivery and a moved terminal draft keep distinct warnings', () => {
@@ -28,6 +30,9 @@ test('unknown delivery and a moved terminal draft keep distinct warnings', () =>
     label: 'Send stopped · draft moved',
     tone: 'warning',
   });
+  assert.equal(historyDraftNoticeBelongsOnComposerBorder(
+    'Terminal draft found — send stopped, text moved to top.',
+  ), true);
 });
 
 test('unclassified warnings do not claim that a draft was moved', () => {

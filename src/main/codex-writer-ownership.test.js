@@ -64,7 +64,7 @@ test('Rewind failure cleanup closes only a proven pre-commit protocol UI', () =>
   }), false, 'after Enter no cleanup key may guess the current TUI state');
 });
 
-test('manual Codex Enter loses only to an already-submitted first write or foreign reservation', () => {
+test('manual Codex Enter loses only to an active first write or pre-Enter reservation', () => {
   assert.deepEqual(classifyManualCodexSubmitAfterWriteQueue({
     activeOperation: { kind: 'codex-model-effort-picker' },
   }), {
@@ -117,6 +117,26 @@ test('manual Codex Enter loses only to an already-submitted first write or forei
     competingReservation: { launchId: 'launch-b' },
     ownReservation,
   }).reason, 'provisional-submit-reserved-by-other');
+  assert.deepEqual(classifyManualCodexSubmitAfterWriteQueue({
+    competingReservation: {
+      launchId: 'launch-b',
+      submitted: true,
+      enterWritten: true,
+    },
+    ownReservation,
+  }), {
+    suppress: false,
+    bypassQueue: false,
+    reason: 'manual-submit-after-reserved-enter',
+  });
+  assert.equal(classifyManualCodexSubmitAfterWriteQueue({
+    competingReservation: {
+      launchId: 'launch-b',
+      submitted: true,
+      enterWritten: false,
+    },
+    ownReservation,
+  }).suppress, true, 'a programmatic Enter that has not crossed PTY still owns the boundary');
 });
 
 test('parses lsof field records and keeps only writable rollout files', () => {

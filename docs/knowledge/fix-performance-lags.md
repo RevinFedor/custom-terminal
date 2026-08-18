@@ -192,7 +192,7 @@ const ids = useStore(useShallow(s => s.items.filter(i => i.active).map(i => i.id
 
 **Recurrence 2026-05-28: Run-after picker.** Селектор `useWorkspaceStore((state) => { /* walk projects, build tabs array */ return { projectId, activeTabId, tabs }; })` возвращал свежий объект на каждый рендер. `set({ openProjects: new Map(...) })` срабатывает на любое busy-событие в любом табе любого проекта → новая ссылка → re-render picker'а → селектор снова создаёт свежий `{projectId, activeTabId, tabs}` → loop → `Maximum update depth exceeded`. Фикс — fingerprint string из id+name AI-табов (только нашего проекта) + `useMemo([fingerprint, tabId])` для деривации shape через `useWorkspaceStore.getState()` внутри useMemo. См. `knowledge/fact-prompt-queue.md::Fingerprint Pattern в селекторе`. Урок: при подписке на nested Map (`openProjects.<projectId>.tabs`) **всегда** возвращай примитив, никогда — объект-результат итерации.
 
-**Recurrence 2026-06-13: ProjectToolbar prompt-summary controls.** Симптом в production: при открытии приложения React показывал `Something went wrong / Minified React error #185`. Причина была не в Timeline summary store, а в `ProjectToolbar` selector'е к `useWorkspaceStore`: он каждый render возвращал новый объект `{ tabId, toolType, sessionId }` для активной вкладки. Даже без `map/filter` это тот же trap — Zustand сравнивает selector result по `Object.is`, object literal всегда новый, React 19 уходит в loop. Фикс: selector возвращает primitive key `${tabId}|${toolType}|${sessionId}`, а объект собирается рядом через `useMemo`. Правило распространяется и на "маленькие" selectors активного таба; свежий объект опасен не только при больших списках.
+**Recurrence 2026-06-13: prompt-summary controls верхней полосы** (тогда `ProjectToolbar`, теперь `WorkspaceTitleBarTools`). Симптом в production: при открытии приложения React показывал `Something went wrong / Minified React error #185`. Причина была не в Timeline summary store, а в selector'е к `useWorkspaceStore`: он каждый render возвращал новый объект `{ tabId, toolType, sessionId }` для активной вкладки. Даже без `map/filter` это тот же trap — Zustand сравнивает selector result по `Object.is`, object literal всегда новый, React 19 уходит в loop. Фикс: selector возвращает primitive key `${tabId}|${toolType}|${sessionId}`, а объект собирается рядом через `useMemo`. Правило распространяется и на "маленькие" selectors активного таба; свежий объект опасен не только при больших списках.
 
 ---
 
@@ -282,7 +282,7 @@ startTransition(() => {
 - При прокрутке мышью скроллится именно он, не активный.
 
 ### Root Cause: каждый проект "claim" один таб
-Чтобы убрать `activeTabId` из fingerprint в `TerminalArea` (см. секцию 6) и не пересчитывать список 40+ терминалов при каждом переключении, селектор активности был перенесён **внутрь** `Terminal`/`BrowserTab`/`ClaudeSDKTab`. Первая (сломанная) версия:
+Чтобы убрать `activeTabId` из fingerprint в `TerminalArea` (см. секцию 6) и не пересчитывать список 40+ терминалов при каждом переключении, селектор активности был перенесён **внутрь** `Terminal`/`BrowserTab`/`ClaudeSDKTab` (BrowserTab с тех пор удалён). Первая (сломанная) версия:
 
 ```tsx
 const activeFromStore = useWorkspaceStore((state) => {
@@ -304,7 +304,7 @@ return state.activeProjectId === projId && workspace.activeTabId === tabId;
 
 Селектор обязан проверять **И** projectId, **И** tabId. Невидимый контекст: AI без этого комментария может в рефакторинге убрать `state.activeProjectId === projId &&` как "избыточный" — оба компонента и так подписаны на свой `tabId`.
 
-Финальный контракт после прод-регрессии 2026-06: активность terminal-layer не должна жить только внутри `Terminal`/`BrowserTab`/`ClaudeSDKTab`. `TerminalArea` оставляет структурный fingerprint для mount/unmount, но отдельно подписывается на `activeLayerKey` (`view + activeProjectId + activeTabId + currentView + viewingSubAgentTabId`) и передаёт `active/isActiveProject` вниз props-ами. Это сохраняет xterm-состояние без remount, но не даёт старому проекту оставить в DOM `active=1 opacity=1` после перехода на другой проект.
+Финальный контракт после прод-регрессии 2026-06: активность terminal-layer не должна жить только внутри `Terminal`/`ClaudeSDKTab`. `TerminalArea` оставляет структурный fingerprint для mount/unmount, но отдельно подписывается на `activeLayerKey` (`view + activeProjectId + activeTabId + currentView + viewingSubAgentTabId`) и передаёт `active/isActiveProject` вниз props-ами. Это сохраняет xterm-состояние без remount, но не даёт старому проекту оставить в DOM `active=1 opacity=1` после перехода на другой проект.
 
 ### Регрессия-сигнал
 В каждом Terminal в useEffect ведётся регистрация в модульный `_visibleTerminals: Set<string>`. После каждого изменения rAF-debounce проверяет инвариант "ровно 1 терминал visible":
@@ -329,7 +329,7 @@ parts.push(projId === projectId ? `${projId}${hostActivePart}` : projId);
 parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab.terminalId || ''}`);
 ```
 - `projId` других проектов — без `activeTabId`. Переключение там не задевает host.
-- `tab.id` + `tabType` — для add/remove/retype. Если таб сменил тип `terminal → browser`, useMemo пересоберёт элементы (другой компонент).
+- `tab.id` + `tabType` — для add/remove/retype. Если таб сменил тип (`terminal → claude-sdk`, `terminal → file`), useMemo пересоберёт элементы — это другой компонент.
 - `activeView`/`terminalId` для browser-таба — это не project/tab switch, а смена собственной поверхности browser ↔ embedded terminal; её надо прокидывать в props, иначе внутренний терминал browser-таба получает stale `activeView`.
 
 ### Исключение: Sub-agent Override

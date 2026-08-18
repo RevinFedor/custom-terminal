@@ -311,6 +311,42 @@ test('restart promotes the exact Codex XML-like image carrier as one slot per as
   assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
 });
 
+test('restart reconciles a relocated Codex image envelope within its exact causal boundary', async (t) => {
+  const dir = await tempDir(t, 'agent-startup-codex-relocated-image-');
+  const transcriptPath = path.join(dir, 'codex.jsonl');
+  const expected = 'before [imagePath: /saved/prompt-assets/content-hash.png] after';
+  const providerPath = '/tmp/noted-terminal-codex-image-input/content-hash.png';
+  const actual = `<image name=[Image #1] path="${providerPath}"> [Image] </image>`
+    + 'before [Image #1] after';
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await codexBoundary(transcriptPath);
+  await fs.promises.appendFile(transcriptPath, JSON.stringify({
+    timestamp: '2026-08-17T16:40:34.800Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: actual }],
+    },
+  }) + '\n');
+
+  const source = unresolvedRecord('codex', boundary, expected);
+  source.receipt.expectedImagePaths = [providerPath];
+  const result = await reconcileAgentSendStartupRecord(source);
+  assert.equal(result.decision, 'found');
+  assert.equal(result.reason, 'codex_image_placeholder_canonical');
+  assert.equal(result.audit.recordByteOffset, 0);
+  assert.equal(classifyAgentPromptAuditIdentity(result.audit).accepted, true);
+
+  const wrongIdentity = unresolvedRecord('codex', boundary, expected);
+  wrongIdentity.receipt.expectedImagePaths = [
+    '/tmp/noted-terminal-codex-image-input/different-content-hash.png',
+  ];
+  const rejected = await reconcileAgentSendStartupRecord(wrongIdentity);
+  assert.equal(rejected.decision, 'unknown');
+  assert.equal(rejected.reason, 'first-post-boundary-user-message-mismatch');
+});
+
 test('startup reconciliation accepts only the declared Codex CRLF to double-LF materialization', async (t) => {
   const dir = await tempDir(t, 'agent-startup-codex-crlf-');
   const transcriptPath = path.join(dir, 'codex.jsonl');

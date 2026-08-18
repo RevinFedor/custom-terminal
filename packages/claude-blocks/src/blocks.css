@@ -123,6 +123,19 @@
 }
 .cb-code-copy:hover { color: #fff; background: rgba(255, 255, 255, 0.06); }
 .cb-code-copy[data-copied="true"] { color: var(--cb-done); }
+.cb-code-scroll {
+  max-width: 100%;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.cb-code-scroll code {
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 
 /* ============================================================
    TOOL CALL — общий каркас (ToolCard)

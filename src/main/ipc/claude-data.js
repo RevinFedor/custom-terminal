@@ -35,6 +35,10 @@ const {
 } = require('../claude-compact-queue-projection');
 const { applyHistoryEntryWindow } = require('../history-entry-window');
 const { classifyHistoryAction } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
+const {
+  resolveForkMarkerBoundary,
+  selectDirectForkMarker,
+} = require(path.join(__dirname, '..', '..', 'shared', 'fork-marker-boundary.cjs'));
 
 let _projectManager = null;
 let _getClaudeEditableLastPromptState = null;
@@ -94,7 +98,17 @@ function shortKnowledgeDocsPath(filePath) {
 // JSONL is append-only — when file grows we only parse NEW bytes, not the whole file.
 // For a 159MB session file: first read ~3.5s, all subsequent reads ~0ms (if no new entries)
 // or microseconds (if only a few new lines added).
-const CLAUDE_JSONL_CACHE_MAX_RAW_BYTES = 768 * 1024 * 1024;
+// Budget in SOURCE bytes, but the thing being bounded is the parsed record
+// map — and that costs several times its source size (per-record objects,
+// strings, index maps). The old 768MB source budget therefore allowed a heap
+// far past V8's ~4GB ceiling: prod 17.08 crashed three times with
+// «FatalProcessOutOfMemory» while this transcript's own file stood at 111MB
+// and the main process peaked at 3.5GB. Two such files were enough.
+//
+// 192MB of source ≈ under a gigabyte of parsed records — the largest set that
+// leaves headroom for a concurrent full parse (which briefly holds the raw
+// buffer, its string copy and the split lines on top of the cache).
+const CLAUDE_JSONL_CACHE_MAX_RAW_BYTES = 192 * 1024 * 1024;
 const CLAUDE_JSONL_CACHE_MAX_FILES = 3;
 const CLAUDE_JSONL_PARSE_YIELD_LINES = 2_000;
 const CLAUDE_JSONL_PARSE_YIELD_CHARS = 4 * 1024 * 1024;
@@ -777,7 +791,20 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
   };
 
   // ── Case 1: File unchanged → return cached result immediately ──────────────
-  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+  //
+  // Same BYTE COUNT is the proof, not the modification time. These files are
+  // append-only: nothing can change inside them without the size changing too.
+  // The timestamp, on the other hand, moves on its own — the full read below
+  // re-stats the file AFTER streaming it, so the stored timestamp belongs to a
+  // later moment than the stored size, and a touch alone shifts it as well.
+  // While both had to match, that harmless drift fell through to «the file was
+  // rewritten» and re-parsed the whole transcript: the live 111MB session was
+  // read twice in a row (prod 18.08 00:0x, «full … reason=first-read» followed
+  // immediately by «full … reason=rewrite-or-shrink»), each pass allocating a
+  // fresh copy of ~15k records. Matching on size keeps the timestamp as a hint
+  // and refreshes it in place.
+  if (cached && cached.size === stat.size) {
+    if (cached.mtimeMs !== stat.mtimeMs) cached.mtimeMs = stat.mtimeMs;
     touchClaudeJsonlCacheEntry(filePath, cached);
     return { stale: false, value: {
       recordMap: cached.recordMap,
@@ -877,31 +904,81 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
   }
 
   // ── Case 3: First read or file shrunk (shouldn't happen for JSONL) → full read ──
-  const contentBuffer = await fs.promises.readFile(filePath);
-  const content = contentBuffer.toString('utf-8');
-  const lines = content.split('\n');
-  const leftover = lines.pop(); // may be incomplete last line
-
+  //
+  // Streamed in chunks on purpose. Reading the whole file at once held THREE
+  // full copies at the same moment — the raw buffer, its UTF-8 string, and the
+  // array of split lines — so a 111MB transcript cost ~700MB before a single
+  // record was parsed. That is what pushed the main process past V8's ceiling
+  // and aborted it three times on 17.08. Each chunk is released before the
+  // next is read, so the peak is one chunk plus the parsed records that have
+  // to exist anyway.
   const recordMap = new Map();
   const progressEntries = [];
   const queueOperations = [];
-  const {
-    lastRecord,
-    bridgeSessionId,
-    fileIndex,
-    queueIndex,
-    yieldCount,
-  } = await _parseJsonlLines(
-    lines, sessionId, recordMap, progressEntries, queueOperations, 0, null, 0, 0
-  );
+  let lastRecord = null;
+  let bridgeSessionId = null;
+  let fileIndex = 0;
+  let queueIndex = 0;
+  let yieldCount = 0;
+  let byteOffset = 0;
+  let leftover = '';
+  let capturedSizeFromStream = 0;
+
+  {
+    const stream = fs.createReadStream(filePath, {
+      encoding: 'utf-8',
+      // Measured on the real 108MB transcript (peak RSS above baseline):
+      // one-shot read 317MB · 4MB chunks 466MB · 1MB 117MB · 256KB 98MB.
+      // Big chunks lose to the one-shot read because each one still spawns a
+      // string + a line array while the previous pair is not yet collected;
+      // small chunks keep every transient short-lived. Below 256KB the line
+      // count per chunk drops without buying more headroom.
+      highWaterMark: 256 * 1024,
+    });
+    try {
+      for await (const chunk of stream) {
+        capturedSizeFromStream += Buffer.byteLength(chunk, 'utf8');
+        const lines = (leftover + chunk).split('\n');
+        // The last piece may be a partial line split across chunks; it is
+        // carried into the next chunk instead of being parsed truncated.
+        leftover = lines.pop() || '';
+        const parsed = await _parseJsonlLines(
+          lines,
+          sessionId,
+          recordMap,
+          progressEntries,
+          queueOperations,
+          fileIndex,
+          bridgeSessionId,
+          queueIndex,
+          byteOffset,
+        );
+        lastRecord = parsed.lastRecord || lastRecord;
+        bridgeSessionId = parsed.bridgeSessionId || bridgeSessionId;
+        fileIndex = parsed.fileIndex;
+        queueIndex = parsed.queueIndex;
+        // Every chunk boundary IS a yield: the stream hands control back to
+        // the event loop between reads. The in-parser yield counter only sees
+        // yields it forced itself, and one chunk is smaller than its budget,
+        // so it now reports zero for files that used to report dozens. Count
+        // the boundaries, or the «bounded batches» guarantee looks lost when
+        // it actually became finer-grained.
+        yieldCount += parsed.yieldCount + 1;
+        _jsonlParseYieldCount += 1;
+        byteOffset = parsed.byteOffset;
+      }
+    } finally {
+      stream.destroy();
+    }
+  }
 
   if (claudeJsonlEpoch(filePath) !== expectedEpoch) {
     return { stale: true, value: null };
   }
 
-  // readFile may include bytes appended after the initial stat. The parsed
-  // byte count is the only safe next incremental offset.
-  const capturedSize = contentBuffer.length;
+  // The stream may include bytes appended after the initial stat. The number
+  // of bytes actually consumed is the only safe next incremental offset.
+  const capturedSize = capturedSizeFromStream;
   let capturedMtimeMs = stat.mtimeMs;
   try {
     capturedMtimeMs = (await fs.promises.stat(filePath)).mtimeMs;
@@ -1012,6 +1089,41 @@ function _injectQueueOperationsIntoBranch(activeBranch, queueOperations) {
   };
 
   return [...activeBranch, ...relevantQueueOps].sort((a, b) => orderOf(a) - orderOf(b));
+}
+
+const CLAUDE_COMPACT_SUMMARY_PREFIX =
+  'This session is being continued from a previous conversation';
+
+function claudeUserRecordText(entry) {
+  if (entry?.type !== 'user') return '';
+  const content = entry.message?.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.find((part) => part?.type === 'text' && typeof part.text === 'string')?.text || '';
+}
+
+function isClaudeCompactSummaryCandidate(entry, knownText = '') {
+  if (entry?.type !== 'user') return false;
+  if (entry.isCompactSummary === true) return true;
+  const text = String(knownText || claudeUserRecordText(entry)).trim();
+  return text.startsWith(CLAUDE_COMPACT_SUMMARY_PREFIX);
+}
+
+/** Find the compact boundary which owns a summary row. Queue-operation lines
+ * are injected into the branch for delivery state but are not conversation
+ * turns; treating one as the previous semantic record made History miss an
+ * otherwise exact boundary→summary pair and paint the summary as a user bubble.
+ */
+function previousClaudeCompactBoundary(branch, fromIndex) {
+  for (let index = fromIndex - 1; index >= 0; index -= 1) {
+    const candidate = branch[index];
+    if (!candidate || candidate.isSidechain || candidate.type === 'summary') continue;
+    if (candidate.type === 'queue-operation' || candidate.isMeta === true) continue;
+    return candidate.type === 'system' && candidate.subtype === 'compact_boundary'
+      ? candidate
+      : null;
+  }
+  return null;
 }
 
 // Resolve the full chain of JSONL files by following bridge entries backwards.
@@ -1212,7 +1324,7 @@ function resolveLatestSessionInChain(sessionId, cwd) {
 // ========== TIMELINE PARSER FUNCTION ==========
 // Shared function to parse Timeline entries from JSONL file using Backtrace algorithm
 // Returns array of entry UUIDs in display order (for fork marker snapshot)
-async function parseTimelineUuids(sourcePath) {
+async function parseTimelineUuids(sourcePath, options = {}) {
   try {
     const content = await fs.promises.readFile(sourcePath, 'utf-8');
     const lines = content.trim().split('\n').filter(line => line.trim());
@@ -1232,7 +1344,7 @@ async function parseTimelineUuids(sourcePath) {
       } catch {}
     }
 
-    if (!lastRecord) return [];
+    if (!lastRecord) return options.includeStats === true ? { uuids: [], totalIterations: 0 } : [];
 
     // BACKTRACE: Walk backwards from last record following parentUuid
     const activeBranch = [];
@@ -1302,6 +1414,7 @@ async function parseTimelineUuids(sourcePath) {
 
     // Filter for Timeline display (same logic as get-timeline handler)
     const uuids = [];
+    let totalIterations = 0;
     for (const entry of activeBranch) {
       if (entry.isSidechain || entry.type === 'summary') continue;
 
@@ -1310,6 +1423,7 @@ async function parseTimelineUuids(sourcePath) {
         if (!rawContent || entry.isMeta) continue;
         if (slashCommandDisplayFromText(rawContent)) continue;
         uuids.push(entry.uuid);
+        totalIterations += 1;
       } else if (entry.type === 'user') {
         let rawContent = entry.message?.content;
         if (Array.isArray(rawContent)) {
@@ -1327,15 +1441,16 @@ async function parseTimelineUuids(sourcePath) {
             rawContent.startsWith('[Request interrupted')) continue;
 
         uuids.push(entry.uuid);
+        if (entry.isCompactSummary !== true) totalIterations += 1;
       } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
         uuids.push(entry.uuid);
       }
     }
 
-    return uuids;
+    return options.includeStats === true ? { uuids, totalIterations } : uuids;
   } catch (e) {
     console.error('[parseTimelineUuids] Error:', e.message);
-    return [];
+    return options.includeStats === true ? { uuids: [], totalIterations: 0 } : [];
   }
 }
 
@@ -1765,6 +1880,7 @@ const _api = {
   resetJsonlCacheForTests: resetClaudeJsonlCacheForTests,
   inspectClaudeForkSource,
   writeClaudeForkJsonlExclusive,
+  resetSessionMaterializationCacheForTests: () => sessionMaterializationCache.clear(),
 };
 
 // Stash-miss recovery for dehydrated Claude payloads. Payload identity is
@@ -2726,6 +2842,7 @@ function register({
           error: 'В этой Claude-сессии ещё нет сжатия контекста',
         };
       }
+      const sourceTimelineSnapshot = await parseTimelineUuids(sourcePath, { includeStats: true });
 
       // Generate new UUID
       const newSessionId = crypto.randomUUID();
@@ -2745,7 +2862,9 @@ function register({
       });
       // Snapshot the history actually inherited by the child. For a compact
       // fork this deliberately excludes every pre-compact UUID.
-      const entryUuids = await parseTimelineUuids(destPath);
+      const entryUuids = fromLatestCompact
+        ? await parseTimelineUuids(destPath)
+        : sourceTimelineSnapshot.uuids;
       console.log('[Claude Fork] Copied and rewrote sessionIds:', sourcePath, '->', destPath,
         'startLine:', startLine, 'retainedRecords:', written.retainedRecordCount,
         'timelineEntries:', entryUuids.length,
@@ -2753,7 +2872,14 @@ function register({
 
       // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
       try {
-        projectManager.db.saveForkMarker(resolvedSourceId, newSessionId, entryUuids);
+        projectManager.db.saveForkMarker(resolvedSourceId, newSessionId, entryUuids, {
+          forkMode: fromLatestCompact ? 'latest_compact' : 'full',
+          origin: 'app',
+          afterIterationIndex: sourceTimelineSnapshot.totalIterations > 0
+            ? sourceTimelineSnapshot.totalIterations - 1
+            : null,
+          nextIterationIndex: sourceTimelineSnapshot.totalIterations,
+        });
         console.log('[Claude Fork] Fork marker saved with', entryUuids.length, 'UUIDs');
       } catch (e) {
         console.warn('[Claude Fork] Could not save fork marker:', e.message);
@@ -3524,15 +3650,46 @@ function register({
     return _deleteEffortEntries(sessionId, cwd, projectManager);
   });
 
-  // Get fork markers for a session (for Timeline blue lines)
-  ipcMain.handle('claude:get-fork-markers', async (event, { sessionId }) => {
+  const readSessionHistoryEvents = async ({ sessionId }) => {
     if (!sessionId) return { success: false, error: 'No session ID', markers: [] };
     try {
       const markers = projectManager.db.getForkMarkers(sessionId);
-      return { success: true, markers };
+      const historyEvents = projectManager.db.getSessionHistoryContext(sessionId);
+      return { success: true, markers, historyEvents };
     } catch (error) {
-      console.error('[Fork Markers] Error:', error);
+      console.error('[SessionHistoryEvents] Error:', error);
       return { success: false, error: error.message, markers: [] };
+    }
+  };
+
+  // Generic app-owned event read. Keep the Claude channel as a compatibility
+  // shim for older renderer builds during rollout.
+  ipcMain.handle('timeline:get-session-history-events', async (_event, payload = {}) => (
+    readSessionHistoryEvents(payload)
+  ));
+  ipcMain.handle('claude:get-fork-markers', async (_event, payload = {}) => (
+    readSessionHistoryEvents(payload)
+  ));
+  ipcMain.handle('session-history:annotate-fork', async (_event, payload = {}) => {
+    try {
+      const event = projectManager.db.saveSessionForkEvent({
+        provider: payload.provider,
+        sourceSessionId: payload.sourceSessionId,
+        childSessionId: payload.childSessionId,
+        entryUuids: Array.isArray(payload.entryUuids) ? payload.entryUuids : [],
+        snapshotComplete: payload.snapshotComplete === true,
+        sourceTabId: payload.sourceTabId || null,
+        childTabId: payload.childTabId || null,
+        visualParentTabId: payload.visualParentTabId || null,
+        orchestrationRunId: payload.orchestrationRunId || null,
+        forkMode: payload.forkMode || 'unknown',
+        origin: payload.origin || 'app',
+        occurredAt: payload.occurredAt || null,
+        isDirect: true,
+      });
+      return { success: true, event };
+    } catch (error) {
+      return { success: false, error: error.message };
     }
   });
 
@@ -4074,6 +4231,7 @@ function register({
             timestamp: entry.timestamp,
             content: 'Conversation compacted',
             preTokens: entry.compactMetadata?.preTokens,
+            postTokens: entry.compactMetadata?.postTokens,
             sessionId: entry.sessionId || entry._fromFile
           });
         }
@@ -4284,46 +4442,20 @@ function register({
       }
       console.log('[Claude Export] SessionId distribution:', JSON.stringify(sidCounts));
 
-      // 3. FORK MARKERS: Precompute which UUIDs are fork boundaries
-      // Helper: check if a record is a Timeline-eligible entry (user message or compact boundary)
-      const isTimelineEntry = (rec) => {
-        if (rec.type === 'system' && rec.subtype === 'compact_boundary') return true;
-        if (rec.type !== 'user') return false;
-        if (rec.isSidechain || rec.isMeta) return false;
-        const content = rec.message?.content;
-        if (Array.isArray(content) && content.some(item => item.type === 'tool_result')) return false;
-        return true;
-      };
-
+      // 3. FORK MARKER: one canonical sparse-snapshot boundary. The previous
+      // edge detector emitted many separators after Rewind/edit-range holes.
       const forkBoundaryUuids = new Set();
       let hasForkAtBeginning = false; // Fork with empty snapshot = fork before any entries
       let forkMarkers = [];
+      let directForkMarker = null;
       try {
         forkMarkers = projectManager.db.getForkMarkers(sessionId);
         console.log('[Claude Export] Fork markers found:', forkMarkers.length);
-        for (const marker of forkMarkers) {
-          const snapshotSet = new Set(Array.isArray(marker.entry_uuids) ? marker.entry_uuids : []);
-          if (snapshotSet.size === 0) {
-            hasForkAtBeginning = true;
-            continue;
-          }
-          // Find boundary: last Timeline-eligible entry in snapshot where next Timeline-eligible entry is NOT in snapshot
-          for (let idx = 0; idx < activeBranch.length; idx++) {
-            const rec = activeBranch[idx];
-            if (!snapshotSet.has(rec.uuid)) continue;
-            let nextTimelineEntry = null;
-            for (let j = idx + 1; j < activeBranch.length; j++) {
-              if (isTimelineEntry(activeBranch[j])) {
-                nextTimelineEntry = activeBranch[j];
-                break;
-              }
-            }
-            if (!nextTimelineEntry) {
-              forkBoundaryUuids.add(rec.uuid);
-            } else if (!snapshotSet.has(nextTimelineEntry.uuid)) {
-              forkBoundaryUuids.add(rec.uuid);
-            }
-          }
+        directForkMarker = selectDirectForkMarker(forkMarkers, sessionId, activeBranch);
+        if (directForkMarker && directForkMarker.snapshot_complete !== false && !directForkMarker.hidden) {
+          const boundary = resolveForkMarkerBoundary(activeBranch, directForkMarker);
+          hasForkAtBeginning = boundary.atBeginning;
+          if (boundary.boundaryUuid) forkBoundaryUuids.add(boundary.boundaryUuid);
         }
         console.log('[Claude Export] Fork boundary UUIDs:', forkBoundaryUuids.size, 'hasForkAtBeginning:', hasForkAtBeginning);
       } catch (e) {
@@ -4399,7 +4531,8 @@ function register({
       const lastSeg = treeSegments[treeSegments.length - 1];
       if (lastSeg.fullSessionId !== sessionId) {
         // Determine type: check fork markers (source = last segment = fork) or session boundary
-        const isForkFromLast = forkMarkers.some(m => m.source_session_id === lastSeg.fullSessionId);
+        const isForkFromLast = directForkMarker?.source_session_id === lastSeg.fullSessionId
+          && directForkMarker?.fork_session_id === sessionId;
         treeSegments.push({
           startIdx: activeBranch.length,
           endIdx: activeBranch.length - 1,
@@ -5118,12 +5251,13 @@ function register({
       let hasForkAtBeginning = false;
       try {
         const forkMarkers = projectManager.db.getForkMarkers(sessionId);
-        for (const marker of forkMarkers) {
-          if ((Array.isArray(marker.entry_uuids) ? marker.entry_uuids : []).length === 0) {
-            hasForkAtBeginning = true;
-            break;
-          }
-        }
+        const directMarker = selectDirectForkMarker(forkMarkers, sessionId, []);
+        hasForkAtBeginning = !!(
+          directMarker
+          && directMarker.snapshot_complete !== false
+          && !directMarker.hidden
+          && resolveForkMarkerBoundary([], directMarker).atBeginning
+        );
       } catch (e) {
         // Fork markers not available — that's OK
       }
@@ -5446,27 +5580,28 @@ function register({
               }
             : {};
 
-          if (entry.isCompactSummary) {
-            let pairedWithCompactBoundary = false;
-            for (let j = i - 1; j >= 0; j--) {
-              const prev = historyBranch[j];
-              if (!prev || prev.isSidechain || prev.type === 'summary') continue;
-              pairedWithCompactBoundary = prev.type === 'system' && prev.subtype === 'compact_boundary';
-              break;
-            }
-            if (pairedWithCompactBoundary) {
+          const compactSummaryCandidate = isClaudeCompactSummaryCandidate(entry, cleanContent);
+          if (compactSummaryCandidate) {
+            const pairedBoundary = previousClaudeCompactBoundary(historyBranch, i);
+            if (pairedBoundary) {
               continue;
             }
-            appendProjectedEntry({
-              uuid: entry.uuid,
-              role: 'compact',
-              timestamp: entry.timestamp || '',
-              content: 'COMPACTED',
-              compactSummary: cleanContent,
-              sessionId: entrySid,
-              recordByteOffset: entry.__byteOffset,
-            });
-            continue;
+            // An authoritative standalone compact summary still renders as a
+            // compact row. The phrase fallback WITHOUT a nearby boundary is
+            // Context Overflow Recovery and keeps the existing `continued`
+            // path below.
+            if (entry.isCompactSummary === true) {
+              appendProjectedEntry({
+                uuid: entry.uuid,
+                role: 'compact',
+                timestamp: entry.timestamp || '',
+                content: 'COMPACTED',
+                compactSummary: cleanContent,
+                sessionId: entrySid,
+                recordByteOffset: entry.__byteOffset,
+              });
+              continue;
+            }
           }
 
           const slashEntry = slashCommandEntryFromText(
@@ -5734,7 +5869,7 @@ function register({
           let compactSummary = '';
           for (let j = i + 1; j < historyBranch.length; j++) {
             const next = historyBranch[j];
-            if (next.isCompactSummary && next.type === 'user') {
+            if (isClaudeCompactSummaryCandidate(next)) {
               const raw = typeof next.message?.content === 'string'
                 ? next.message.content
                 : Array.isArray(next.message?.content)
@@ -5754,6 +5889,7 @@ function register({
             content: 'COMPACTED',
             compactSummary: compactSummary || undefined,
             preTokens: entry.compactMetadata?.preTokens || undefined,
+            postTokens: entry.compactMetadata?.postTokens || undefined,
             sessionId: entrySid,
             recordByteOffset: entry.__byteOffset,
           });
@@ -5960,11 +6096,7 @@ function register({
   ipcMain.handle('timeline:delete-fork-marker', async (event, { sourceSessionId, forkSessionId }) => {
     try {
       const db = projectManager.db;
-      db.db.prepare('UPDATE fork_markers SET hidden = 1 WHERE source_session_id = ? AND forked_to_session_id = ?')
-        .run(sourceSessionId, forkSessionId);
-      // Invalidate cache so Timeline picks up hidden=1 without restart.
-      db.invalidateForkMarkerCache(sourceSessionId);
-      db.invalidateForkMarkerCache(forkSessionId);
+      db.hideForkMarker(sourceSessionId, forkSessionId);
       console.log('[ForkMarker] Hidden:', sourceSessionId?.slice(0, 8), '→', forkSessionId?.slice(0, 8));
       return { success: true };
     } catch (error) {
@@ -6133,6 +6265,12 @@ function parseTimelineEntries(sourcePath) {
 // every poll). The user felt it as "only THIS tab hangs on switch".
 const sessionMaterializationCache = new Map(); // sessionId -> { filePath, size, mtimeMs, result }
 const SESSION_MATERIALIZATION_CACHE_MAX = 32;
+// Насколько файл может вырасти, прежде чем точное число записей пересчитают.
+// Ответ на вопрос «в сессии вообще есть записи?» из выросшего файла и так
+// известен (см. ниже), а число используется только для показа и логов, поэтому
+// платить за него полным разбором на каждое изменение нельзя. 32 МБ — это про
+// один пересчёт на очень длинную сессию вместо одного на каждое сообщение.
+const SESSION_MATERIALIZATION_RECOUNT_GROWTH_BYTES = 32 * 1024 * 1024;
 function getSessionMaterialization(sessionId, cwd) {
   if (!sessionId) {
     return {
@@ -6172,6 +6310,45 @@ function getSessionMaterialization(sessionId, cwd) {
       sessionMaterializationCache.set(sessionId, cached);
       return cached.result;
     }
+    // Файл ТОЛЬКО ВЫРОС, и в прошлый раз записи в нём уже были → ответ на
+    // вопрос «сессия непустая?» измениться не мог, и перечитывать файл незачем.
+    //
+    // Почему это важно: ниже стоит СИНХРОННОЕ чтение всего файла целиком. Для
+    // живой сессии на 111 МБ это ~450 мс, в течение которых главный процесс не
+    // делает вообще ничего другого, плюс сотни мегабайт временных копий. А
+    // дёргается это на каждое изменение транскрипта, то есть каждые пару
+    // секунд, пока агент работает. Замерено в проде 18.08 00:05–00:07: главный
+    // процесс замирал на 660–810 мс подряд, и пользователь в ЭТО время просто
+    // прокручивал историю в другой вкладке — отсюда «жёсткие подёргивания при
+    // обычном скролле». Это ровно тот запрет из CLAUDE.md: ответ «ничего не
+    // изменилось» обязан стоить один stat, а не чтение файла.
+    //
+    // Единственное, что может обнулить число записей, — переписывание файла
+    // (откат, форк, обрезка), а это меняет размер в меньшую сторону или ломает
+    // совпадение пути; такой случай сюда не попадает и разбирается честно.
+    const grewOnly = cached
+      && stat
+      && cached.filePath === found.filePath
+      && stat.size > cached.size
+      && cached.result?.timelineCount > 0;
+    if (grewOnly && stat.size - cached.exactCountSize < SESSION_MATERIALIZATION_RECOUNT_GROWTH_BYTES) {
+      const result = {
+        ...cached.result,
+        fileSize: stat.size,
+        // Число записей — от последнего точного пересчёта: оно нужно только для
+        // показа и логов, решения принимаются по признаку «сессия непустая».
+        timelineCountExactAtBytes: cached.exactCountSize,
+      };
+      sessionMaterializationCache.delete(sessionId);
+      sessionMaterializationCache.set(sessionId, {
+        filePath: found.filePath,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        exactCountSize: cached.exactCountSize,
+        result,
+      });
+      return result;
+    }
     const entries = parseTimelineEntries(found.filePath);
     const timelineCount = Array.isArray(entries) ? entries.length : 0;
     const result = {
@@ -6190,6 +6367,8 @@ function getSessionMaterialization(sessionId, cwd) {
         filePath: found.filePath,
         size: stat.size,
         mtimeMs: stat.mtimeMs,
+        // Размер, на котором число записей было посчитано честно.
+        exactCountSize: stat.size,
         result,
       });
       while (sessionMaterializationCache.size > SESSION_MATERIALIZATION_CACHE_MAX) {

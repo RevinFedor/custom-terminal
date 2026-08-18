@@ -269,6 +269,16 @@ export type QueuedComposerChip = {
   createdAt?: number;
 };
 
+export type QueuedMetaAction =
+  | { kind: 'restart' }
+  | {
+      kind: 'rewind';
+      targetUuid: string;
+      targetText: string;
+      sourceSessionId: string;
+      toolType: 'claude' | 'codex';
+    };
+
 export type QueuedPrompt = {
   id: string;
   // false = keep visible in the list, but skip it when Run-after picks the
@@ -277,6 +287,10 @@ export type QueuedPrompt = {
   // Optional one-shot scheduling rule for this queue item. Only the enabled
   // head can consume the queue's single runtime countdown slot.
   trigger?: { kind: 'timer'; seconds: number } | { kind: 'onTab'; tabId: string };
+  // A queue slot can be a product action instead of text submitted to the
+  // agent. Keeping it on the same durable item preserves reorder, enable,
+  // per-item trigger and restart/hydration semantics without a second queue.
+  metaAction?: QueuedMetaAction;
   // Human-facing label shown in the Run-after menu. The actual payload sent to
   // the agent remains `text`.
   title?: string;
@@ -523,6 +537,7 @@ interface PromptQueueStore {
     title?: string,
     chips?: QueuedComposerChip[],
   ) => string;
+  addMetaAction: (tabId: string, action: QueuedMetaAction, title?: string) => string;
   removePrompt: (
     tabId: string,
     id: string,
@@ -997,6 +1012,40 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       if (added?.attachmentState === 'materializing') {
         void ensureQueuedPromptImagesReady(tabId, id);
       }
+      return id;
+    },
+
+    addMetaAction: (tabId, action, title) => {
+      const id = nextId();
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        const cur = next.get(tabId) ?? EMPTY;
+        const wasEmpty = countEnabledQueuedPrompts(cur.items) === 0;
+        const shouldArmHint = wasEmpty && !cur.autoRun;
+        if (wasEmpty && cur.autoRun) markRuntimeWorkflowArm(tabId);
+        const defaultTitle = action.kind === 'restart'
+          ? 'Restart tab'
+          : 'Rewind: ' + action.targetText.replace(/\s+/g, ' ').trim().slice(0, 56);
+        const normalizedTitle = String(title || defaultTitle).trim() || defaultTitle;
+        const items = [...cur.items, {
+          id,
+          enabled: true,
+          metaAction: action,
+          title: normalizedTitle,
+          titleManual: true,
+          text: '',
+          images: 0,
+          attachmentState: 'ready' as const,
+          createdAt: Date.now(),
+        }];
+        next.set(tabId, {
+          ...cur,
+          items,
+          firstChipHintActive: shouldArmHint ? true : cur.firstChipHintActive,
+          workflowArmedAt: wasEmpty && cur.autoRun ? Date.now() : cur.workflowArmedAt,
+        });
+        return { queues: next };
+      });
       return id;
     },
 
@@ -1902,10 +1951,29 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
     : item.trigger?.kind === 'onTab' && typeof item.trigger.tabId === 'string' && item.trigger.tabId.length > 0
       ? { kind: 'onTab' as const, tabId: item.trigger.tabId }
       : undefined;
+  const metaAction: QueuedMetaAction | undefined = item.metaAction?.kind === 'restart'
+    ? { kind: 'restart' }
+    : item.metaAction?.kind === 'rewind'
+      && typeof item.metaAction.targetUuid === 'string'
+      && typeof item.metaAction.targetText === 'string'
+      && typeof item.metaAction.sourceSessionId === 'string'
+      && (item.metaAction.toolType === 'claude' || item.metaAction.toolType === 'codex')
+      ? {
+          kind: 'rewind',
+          targetUuid: item.metaAction.targetUuid,
+          targetText: item.metaAction.targetText,
+          sourceSessionId: item.metaAction.sourceSessionId,
+          toolType: item.metaAction.toolType,
+        }
+      : undefined;
+  // A persisted row that claims to be an action but lost required identity
+  // must never degrade into an empty prompt and get submitted to the agent.
+  if (item.metaAction && !metaAction) return null;
   const normalized = normalizeQueuedPrompt({
     id: typeof item.id === 'string' && item.id ? item.id : nextId(),
     enabled: item.enabled !== false,
     trigger,
+    metaAction,
     title: typeof item.title === 'string' ? item.title : undefined,
     titleManual: item.titleManual === true,
     text: item.text,

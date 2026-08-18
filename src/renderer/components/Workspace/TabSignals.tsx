@@ -26,6 +26,8 @@ import React, { useEffect, useState } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
+import { contextUsageColor, contextUsageDisplayValue } from '../../utils/contextUsageMeter.mjs';
+import { isStaleAgainstPending } from '../../utils/pendingResume';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -211,6 +213,175 @@ export function TabFastBadge({
             на 11px поверх полоски обводка сливается в пятно. */}
         <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
       </svg>
+    </span>
+  );
+}
+
+/**
+ * Заполнение контекстного окна — число в правом НИЖНЕМ углу карточки.
+ *
+ * Та же механика, что у молнии Fast: абсолютная позиция у угла, часть высоты
+ * снаружи, выступ ограничен зазором между карточками. Отличается только угол
+ * (низ вместо верха) и то, что содержимое — число, а не глиф.
+ *
+ * Цвет и формат НЕ решаются здесь: они берутся из `contextUsageMeter.mjs`, из
+ * которого их берёт и панель управления. Иначе одно и то же число показывалось
+ * бы в двух местах разными цветами — в панели ещё зелёное, на карточке уже
+ * жёлтое, и пользователь перестал бы верить обоим.
+ *
+ * Знак процента опущен намеренно: в углу карточки он не добавляет смысла (число
+ * тут может значить только одно), а места занимает столько же, сколько цифра.
+ */
+export const TAB_CONTEXT_BADGE_FONT_PX = 8;
+
+/**
+ * На сколько число заезжает ЗА правый край карточки, чтобы лечь на полоску
+ * процесса.
+ *
+ * Это не «красивый отступ», а ширина самой полоски минус пиксель: при нулевом
+ * значении последняя цифра только КАСАЛАСЬ бы полоски своим правым габаритом, а
+ * у цифры справа есть собственный внутренний зазор шрифта — визуально она всё
+ * равно осталась бы левее линии. Поэтому смещение считается от ширины полоски,
+ * а не подбирается на глаз: поменяется полоска — поедет и число.
+ */
+export const CONTEXT_BADGE_BAR_OVERLAP_PX = TAB_PROCESS_BAR_W_PX - 1;
+
+/**
+ * Заполнение контекста ОДНОЙ вкладки, по тем же каналам, что у панели
+ * управления, и с тем же durable-стартом.
+ *
+ * Три канала, потому что их три у самого значения: Claude присылает его в
+ * bridge-кадре, Codex — своим IPC, SDK — оконным событием. Слушать надо все:
+ * подписка на один канал даёт пустой угол у половины вкладок.
+ *
+ * Начальное значение читается из БД, а не ждёт первого события. События несут
+ * только ИЗМЕНЕНИЯ: вкладка, у которой ход прошёл раньше (или процесс уже
+ * закрыт), не пришлёт ничего, и без чтения её число не появилось бы никогда —
+ * та же ловушка, что описана в `useTabActivitySignals` про «стартовое значение».
+ */
+export function useTabContextUsage(tabId: string): number | null {
+  const [pct, setPct] = useState<number | null>(null);
+  // Сессия, которой вкладка принадлежит СЕЙЧАС. Нужна не для показа, а для
+  // отказа: см. проверку владения ниже. Селектор гранулярный (возвращает
+  // строку), поэтому подписка не тянет за собой Map.
+  const boundClaudeSessionId = useWorkspaceStore((s) => {
+    for (const workspace of s.openProjects.values()) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) return tab.claudeSessionId || '';
+    }
+    return '';
+  });
+
+  useEffect(() => {
+    let disposed = false;
+    setPct(null);
+    ipcRenderer.invoke('tab:get-context-pct', { tabId })
+      .then((r: any) => {
+        if (disposed) return;
+        const seeded = Number(r?.pct);
+        if (Number.isFinite(seeded) && seeded > 0) setPct((prev) => prev ?? seeded);
+      })
+      .catch(() => {});
+
+    const apply = (data: any) => {
+      if (disposed || data?.tabId !== tabId) return;
+      const next = Number(data?.contextPct);
+      if (Number.isFinite(next) && next > 0) setPct(next);
+    };
+    // Совпадения по вкладке НЕДОСТАТОЧНО, чтобы принять число.
+    //
+    // Claude никогда не удаляет свои bridge-файлы, и при повторном
+    // использовании PID кадр давно мёртвой сессии приходит с ЭТИМ tabId —
+    // именно тот шрам, что описан в fix-bridge-stale-takeover.md. Панель
+    // управления такие кадры отбрасывает по двум признакам сразу, а карточка
+    // раньше принимала любой: в итоге на одну и ту же вкладку в двух местах
+    // показывались РАЗНЫЕ числа, причём неверное — на более заметном.
+    //
+    // Проверка ровно та же, что в панели, чтобы поверхности не разошлись снова:
+    //   • кадр называет не ту сессию, к которой вкладка уже привязана;
+    //   • для вкладки идёт resume, и кадр пришёл от другой сессии.
+    const ownsFrame = (data: any) => {
+      const frameSessionId = typeof data?.sessionId === 'string' ? data.sessionId : '';
+      if (!frameSessionId) return true;
+      if (isStaleAgainstPending(tabId, frameSessionId)) return false;
+      return true;
+    };
+    const onClaudeBridge = (_: unknown, data: any) => {
+      const frameSessionId = typeof data?.sessionId === 'string' ? data.sessionId : '';
+      if (boundClaudeSessionId && frameSessionId && frameSessionId !== boundClaudeSessionId) return;
+      if (!ownsFrame(data)) return;
+      apply(data);
+    };
+    const onCodexContext = (_: unknown, data: any) => {
+      if (!ownsFrame(data)) return;
+      apply(data);
+    };
+    // SDK-вкладка шлёт своё значение окном и без id сессии: у неё нет ни
+    // bridge-файла, ни повторно используемого PID, поэтому и подменить кадр
+    // нечем — проверять здесь нечего.
+    const onWindowEvent = (event: Event) => apply((event as CustomEvent).detail || {});
+
+    ipcRenderer.on('claude:bridge-update', onClaudeBridge);
+    ipcRenderer.on('codex:context-update', onCodexContext);
+    window.addEventListener('sdk-context-update', onWindowEvent);
+    return () => {
+      disposed = true;
+      ipcRenderer.removeListener('claude:bridge-update', onClaudeBridge);
+      ipcRenderer.removeListener('codex:context-update', onCodexContext);
+      window.removeEventListener('sdk-context-update', onWindowEvent);
+    };
+  }, [boundClaudeSessionId, tabId]);
+
+  return pct;
+}
+
+export function TabContextUsageBadge({
+  pct,
+  zIndex = 7,
+}: {
+  /** Доля заполнения. Ничего не рисуем, пока измерения не было. */
+  pct?: number | null;
+  zIndex?: number;
+}) {
+  const position = useUIStore((s) => s.processBar.position);
+  const gapPx = useUIStore((s) => s.tabGeometry.gap);
+  const value = contextUsageDisplayValue(pct);
+  if (value === null) return null;
+  // Число ВСЕГДА у правого края — это его угол, независимо от того, где стоит
+  // полоска процесса (молния занимает ВЕРХНИЙ конец, они не встречаются).
+  //
+  // Раньше отступ обходил полоску (`ширина + 2`), и число висело левее неё —
+  // рядом с меткой, но не на её линии. Теперь оно ложится НА полоску, как и
+  // молния: обе метки принадлежат одному краю, и число, отодвинутое от него,
+  // читалось как отдельный элемент строки, а не как отметка на этом крае
+  // (просьба пользователя, 2026-08-18). Читаемость поверх цветной полоски даёт
+  // тёмная обводка ниже, а `zIndex` выше полоски — она под числом, не над.
+  const rightInset = position === 'right' ? -CONTEXT_BADGE_BAR_OVERLAP_PX : 2;
+  return (
+    <span
+      data-tab-context-usage
+      title={`Использовано ${value}% контекстного окна`}
+      aria-hidden
+      style={{
+        position: 'absolute',
+        right: rightInset,
+        // Наружу — та же доля и то же ограничение зазором, что у молнии.
+        bottom: -tabFastBadgeOutsidePx(gapPx, TAB_CONTEXT_BADGE_FONT_PX),
+        // `line-height: 1` — без него строка свисает на лишние ~40% кегля и
+        // число уезжает на соседнюю карточку даже при достаточном зазоре.
+        lineHeight: 1,
+        fontSize: TAB_CONTEXT_BADGE_FONT_PX,
+        fontVariantNumeric: 'tabular-nums',
+        fontWeight: 600,
+        color: contextUsageColor(pct),
+        pointerEvents: 'none',
+        zIndex,
+        // Тёмная подложка глифа: число ложится и на фон вкладки, и на полосу
+        // задач у нижнего шва, и должно читаться на обоих.
+        textShadow: '0 0 2px rgba(0,0,0,0.9)',
+      }}
+    >
+      {value}
     </span>
   );
 }

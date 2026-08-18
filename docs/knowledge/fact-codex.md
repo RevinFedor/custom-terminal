@@ -53,6 +53,61 @@ Launch cwd для ControlBar — это `tab.cwd`, а не только `project
 
 Все app-controlled Codex launches передают этот cwd не только как shell working directory, но и явно через `codex -C <cwd>`. Это важно для restore/continue: если Codex показывает chooser между session directory и current directory, текущий рабочий root уже закреплён командой запуска, а не угадывается по shell. ProjectHome использует это как деградацию для удалённых папок: Codex history entry с отсутствующим `cwd` открывается в ближайшем существующем родителе и показывает toast, тогда как Claude/обычный terminal по-прежнему падают с `working_directory_missing`.
 
+### Патченный бинарник Codex — это пара, а не один файл
+
+Noted Terminal подставляет Codex-вкладкам собственную сборку CLI из
+`~/.noted-terminal/bin/codex` (через `NOTED_CODEX_BIN_DIR` + префикс PATH,
+восстанавливаемый в shell integration). Начиная с Codex 0.147 этого файла
+недостаточно: CLI запускает вспомогательный процесс `codex-code-mode-host`,
+который ищет **рядом с собой** — по пути собственного исполняемого файла
+(`InstallContext::code_mode_host_program_from_exe`), а не по PATH. Наш bin —
+голая папка без `codex-package.json`/`codex-resources`, поэтому «соседа» там не
+окажется, если его туда явно не положить.
+
+Отсюда невидимая ловушка: сборочный скрипт собирал только `codex`, вкладка
+стартовала нормально, а падал каждый вызов инструмента:
+
+```
+failed to spawn code-mode host /Users/<user>/.noted-terminal/bin/codex-code-mode-host:
+host executable was not found
+```
+
+Ключевое: **локальные feature-флаги это не лечат и не объясняют**. Режим
+инструментов для модели задаёт сервер — `~/.codex/models_cache.json` присылает
+`tool_mode = code_mode_only` для `gpt-5.6-sol/terra/luna` и `codex-auto-review`.
+Серверное значение имеет приоритет над `[features]` (`core/src/tools/mod.rs`:
+`model_info.tool_mode.unwrap_or_else(...)`), поэтому `code_mode = false` в
+`~/.codex/config.toml` ничего не отключает. А `code_mode_only` — режим без
+запасного варианта: обычные прямые инструменты не подставляются, и сессия
+теряет всё, включая web-поиск.
+
+Второй слой ловушки: попытка «выключить» проблему через `code_mode_host = false`
+меняет симптом на `code-mode host is disabled` и делает хуже. Это Stable-фича с
+`default_enabled = true`; она управляет не самим Code Mode, а только наличием
+host'а, который Code Mode требует.
+
+Host нельзя собрать локально: `codex-code-mode-runtime` зависит от крейта `v8`,
+а prebuilt-архив для `aarch64-apple-darwin` не публикуется — build.rs падает с
+HTTP 404. Поэтому единственный законный источник — vendor-payload официального
+npm-пакета `@openai/codex-<platform>`, и версия обязана совпадать с версией
+нашего патченного CLI: host говорит по версионированному framed-протоколу
+(`ClientHello`/`SupportedProtocolVersions`), чужая сборка может не сойтись на
+handshake. Копировать host из `ChatGPT.app` или `.plugin-appserver` нельзя —
+это другая ветка сборки без гарантии совпадения версии.
+
+Ремонт двухсторонний, оба слоя обязательны:
+
+1. `scripts/build-install-noted-codex.sh` ставит host атомарно рядом с `codex`
+   через `scripts/noted-codex-host-resolve.mjs` (резолв по точной версии, отказ
+   при несовпадении). Host проверяется и на fast-path «codex уже актуален» —
+   у него отдельный жизненный цикл, и codex-marker про него ничего не знает.
+   При свежей сборке host ставится **до** публикации нового `codex`, иначе на
+   диск попадёт заведомо нерабочая пара.
+2. `decideCodexBinaryOverride` в `codex-semantic-channel.js`: если соседа нет,
+   приложение вообще не подставляет свой бинарник и оставляет пользовательский
+   Codex. Рабочая сессия важнее semantic side-channel — потеря обогащения
+   Timeline обратима, мёртвая вкладка нет.
+
 Launch failure — часть того же shell boundary, а не состояние Codex TUI. `terminal:create` обязан проверить `cwd` до spawn'а PTY: если папка проекта удалена/переименована, это `working_directory_missing`, а не shell, в который можно потом вставить первый prompt. Native/API launch (`/agent-tabs`, Inbox, History runtime) ждёт structured result от `codex:run-command`; при failed spawn/run нельзя слать `terminal:force-command-started`, иначе iOS увидит fake `starting` без процесса, обычный input на fresh tab и локальную user-row, которую rollout никогда не подтвердит. Прод-шрам: проект ссылался на отсутствующий `/Users/fedor/Desktop/cli-tools`, zsh сразу exit'нулся, web route ответил success, а первый mobile send зависал в `inactive/no session`.
 
 ## Готовность и переходные состояния
@@ -145,7 +200,7 @@ Model/effort в Codex History — display-only строки из `turn_context`,
 
 Новый общий путь для desktop Timeline/History и Project Terminal API — `agent-transcript:*` поверх `SessionTranscriptService` (см. `fact-transcript-сервис.md`). Старые `codex:get-timeline` / `codex:get-full-history` остаются совместимыми entrypoints, но добавлять новый per-surface polling reader нельзя: длинный rollout один, consumers много. Codex parser поэтому держит incremental cache по файлу: unchanged `size+mtimeMs` = cache hit, append читает только новые bytes и склеивает `leftover`, shrink/rewrite делает chunked full reread, concurrent callers делят один inflight promise. Full-record cache — LRU до трёх файлов и 768 MiB raw bytes, но один oversized active rollout намеренно остаётся: его eviction заставил бы повторно парсить 600+ MB на каждом клике. Логи `[CodexJsonlCache] full/append/evict` нужны для blame'а: если Timeline/History тормозит на большой сессии, сначала проверь что нет повторного `full reason=first-read/rewrite-or-shrink` на каждом refresh.
 
-Codex compact надо читать из **top-level** записи `type: "compacted"`: именно там лежит `payload.replacement_history` — полный свёрнутый контекст. Соседний `event_msg.payload.type === "context_compacted"` полезен только как marker/telemetry и сам summary не содержит. Если парсер цепляется за `context_compacted`, HistoryPanel показывает пустую плашку `History Compacted`, а Timeline умеет только «здесь был compact», без содержимого. Для clean copy/export этот snapshot не разворачивается рекурсивно: иначе старые prompts дублируются при каждом новом compact. Исключение — явное одиночное `Копировать compact` из Timeline (`codex:copy-range` с `startUuid=endUuid` одного compact marker): пользователь выбрал сам compact как объект, поэтому backend разворачивает именно его `replacement_history`, а не оставляет заглушку `Conversation compacted`. См. [`fix-codex-дубли-после-сжатия.md`](fix-codex-дубли-после-сжатия.md). `preTokens` для плашки берётся из последнего предыдущего `event_msg.token_count.info.last_token_usage.total_tokens`, потому что сама compact-запись не несёт уже готового «237k tokens».
+Codex compact надо читать из **top-level** записи `type: "compacted"`: именно там лежит `payload.replacement_history` — полный свёрнутый контекст. Соседний `event_msg.payload.type === "context_compacted"` полезен только как marker/telemetry и сам summary не содержит. Если парсер цепляется за `context_compacted`, HistoryPanel показывает пустую плашку `History Compacted`, а Timeline умеет только «здесь был compact», без содержимого. Для clean copy/export этот snapshot не разворачивается рекурсивно: иначе старые prompts дублируются при каждом новом compact. Исключение — явное одиночное `Копировать compact` из Timeline (`codex:copy-range` с `startUuid=endUuid` одного compact marker): пользователь выбрал сам compact как объект, поэтому backend разворачивает именно его `replacement_history`, а не оставляет заглушку `Conversation compacted`. См. [`fix-codex-дубли-после-сжатия.md`](fix-codex-дубли-после-сжатия.md). Последний предыдущий `token_count` даёт только `preTokens` — размер окна **до** сжатия. Он остаётся технической статистикой и не печатается как размер compact. Пока протокол не отдаёт явный `postTokens`, History/Timeline показывают `context compacted (encrypted)` без числа; если будущая версия добавит `post_tokens/postTokens/compacted_tokens`, число можно показать как размер результата.
 
 Живая операция не восстанавливается из старого rollout. Для внешнего submit
 точная текущая `event_msg.user_message` со значением `/compact` за byte-границей

@@ -25,13 +25,24 @@ import {
   subscribeComposerControlsHost,
 } from '../../utils/composerControlsHost.mjs';
 import {
+  getWorkspaceOverlayHost,
+  subscribeWorkspaceOverlayHost,
+  workspaceOverlayPortalTarget,
+} from '../../utils/workspaceOverlayHost.mjs';
+import {
+  getEmptyTabLaunchHost,
+  subscribeEmptyTabLaunchHost,
+} from '../../utils/emptyTabLaunchHost.mjs';
+import {
   controlBarBusyTarget,
   isControlBarBusyTarget,
   isControlBarBusyBlocked,
 } from '../../utils/controlBarBusyTarget.mjs';
 import ControlHint from '../UI/ControlHint';
 import { PROVIDER_CATALOG } from './providerCatalog';
+import { readSessionIdFromClipboard } from '../../utils/clipboardSessionId';
 import SessionActionChip from './SessionActionChip';
+import AiLaunchStrip from './AiLaunchStrip';
 import MicButton from './MicButton';
 import {
   DICTATION_DELIVERED_EVENT,
@@ -45,6 +56,7 @@ import { getHistoryAgentRuntime, type AgentPtyStatus } from '../../utils/history
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { readCodexDraftAuthority } from '../../utils/codexDraftAuthority.mjs';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
+import { contextUsageColor } from '../../utils/contextUsageMeter.mjs';
 import {
   planCodexLaunchSettingsPersistence,
   planCodexPickerStateApplication,
@@ -56,6 +68,10 @@ import { planAgentSettingsAvailability } from '../../utils/agentSettingsAvailabi
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import { applyClaudePtySetting } from '../../utils/claudePtyActions';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import {
+  selectSessionOwnedSettings,
+  settingProofNeedsAttention,
+} from '../../utils/confirmedAgentSettings.mjs';
 import {
   shouldWrapControlBar,
   shouldShedControlBarReadings,
@@ -582,6 +598,21 @@ export default function ClaudeControlBar({
     : undefined;
   const [claudeModel, setClaudeModel] = useState<string | null>(seededSettings?.model ?? null);
   const [effortLocal, setEffortLocal] = useState<string | undefined>(seededSettings?.effort);
+  // This component instance is intentionally reused across tab switches. The
+  // value therefore needs its own session owner; otherwise the first render of
+  // tab B briefly paints tab A's model/effort before the effects below run.
+  const [confirmedSettingsOwnerSessionId, setConfirmedSettingsOwnerSessionId] = useState<string | null>(
+    seededSettings && claudeSessionId ? claudeSessionId : null,
+  );
+  const currentConfirmedSettings = selectSessionOwnedSettings({
+    sessionId: claudeSessionId,
+    stateOwnerSessionId: confirmedSettingsOwnerSessionId,
+    stateModel: claudeModel,
+    stateEffort: effortLocal,
+    seed: seededSettings || null,
+  });
+  const confirmedClaudeModel = currentConfirmedSettings.model as string | null;
+  const confirmedClaudeEffort = currentConfirmedSettings.effort as string | undefined;
   // Confirmation-in-flight: the JSONL-branch read that proves model/effort.
   // With the main-side cache a warm answer lands within a frame or two; a
   // cold heavy session takes visibly long — during that window the cluster
@@ -605,6 +636,7 @@ export default function ClaudeControlBar({
       claudeSettingsRequestRef.current += 1;
       setClaudeModel(null);
       setEffortLocal(undefined);
+      setConfirmedSettingsOwnerSessionId(null);
       setConfirmingSettings(false);
       return null;
     }
@@ -629,6 +661,7 @@ export default function ClaudeControlBar({
       }
       if (result.model) setClaudeModel(result.model);
       setEffortLocal(result.effort || undefined);
+      setConfirmedSettingsOwnerSessionId(claudeSessionId);
       rememberConfirmedSettingsSeed(claudeSessionId, {
         model: result.model || null,
         effort: result.effort || undefined,
@@ -717,6 +750,7 @@ export default function ClaudeControlBar({
       : undefined;
     setClaudeModel(seed?.model ?? null);
     setEffortLocal(seed?.effort);
+    setConfirmedSettingsOwnerSessionId(seed && claudeSessionId ? claudeSessionId : null);
     if (seed) {
       console.warn('[ClaudeControlBar:ConfirmedSettings] seeded tab=' + tabId.slice(-12)
         + ' sid=' + String(claudeSessionId).slice(0, 8)
@@ -1786,22 +1820,24 @@ export default function ClaudeControlBar({
     ? defaultClaudeEffort
     : undefined;
 
+  const resolveAnthropicModelId = (value: string | null | undefined): string => {
+    const normalized = String(value || '').toLowerCase();
+    if (normalized.includes('1m context')) return 'default';
+    const dynamic = claudeCodeModels.find((m) => {
+      if (m.id === 'default') return false;
+      const id = m.id.toLowerCase();
+      const label = m.label.toLowerCase();
+      return (id && normalized.includes(id)) || (label && normalized.includes(label));
+    });
+    return dynamic?.id || 'default';
+  };
+
   // Model active id
-  const lm = (pendingClaudeModel || claudeModel || fallbackClaudeModel).toLowerCase();
+  const selectedClaudeModel = pendingClaudeModel || confirmedClaudeModel || fallbackClaudeModel;
   const modelActiveId: string = (() => {
     if (isCodex) return codexModel;
     if (isSDKTab) return sdkModel || 'default';
-    if (isAnthropicPTY) {
-      if (lm.includes('1m context')) return 'default';
-      const dynamic = claudeCodeModels.find((m) => {
-        if (m.id === 'default') return false;
-        const id = m.id.toLowerCase();
-        const label = m.label.toLowerCase();
-        return (id && lm.includes(id)) || (label && lm.includes(label));
-      });
-      if (dynamic) return dynamic.id;
-      return 'default';
-    }
+    if (isAnthropicPTY) return resolveAnthropicModelId(selectedClaudeModel);
     return providerState.model || activeProvider.models[0]?.id || '';
   })();
 
@@ -1821,9 +1857,23 @@ export default function ClaudeControlBar({
     if (isCodex) return codexEffort;
     if (isSDKTab) return sdkEffort;
     if (isDeepSeekPTY) return providerState.effort || 'medium';
-    if (isAnthropicPTY) return pendingClaudeEffort || effortLocal || fallbackClaudeEffort;
-    return effortLocal;
+    if (isAnthropicPTY) return pendingClaudeEffort || confirmedClaudeEffort || fallbackClaudeEffort;
+    return confirmedClaudeEffort;
   })();
+
+  const claudeModelProofNeedsAttention = isAnthropicPTY && settingProofNeedsAttention({
+    sessionBound: !!claudeSessionId,
+    confirmedValue: confirmedClaudeModel,
+    pendingValue: isCommandRunning ? pendingClaudeModel : null,
+    valuesMatch: pendingClaudeModel && confirmedClaudeModel
+      ? resolveAnthropicModelId(pendingClaudeModel) === resolveAnthropicModelId(confirmedClaudeModel)
+      : null,
+  });
+  const claudeEffortProofNeedsAttention = isAnthropicPTY && settingProofNeedsAttention({
+    sessionBound: !!claudeSessionId,
+    confirmedValue: confirmedClaudeEffort,
+    pendingValue: isCommandRunning ? pendingClaudeEffort : null,
+  });
 
   // Trigger caption. Same short forms as the menu rows, so what the collapsed
   // control says is literally the row that is checked inside it.
@@ -1949,6 +1999,19 @@ export default function ClaudeControlBar({
   // controls appear in the composer instead. Subscribed rather than looked up
   // by id: the composer's node is replaced when the panel changes layout, and a
   // one-shot lookup would keep pointing at the detached one.
+  // Слой, в котором рисуются меню этой панели. Он лежит ВНУТРИ рабочей области,
+  // поэтому меню прячутся вместе с ней при переходе на Home. Раньше они уезжали
+  // в корень страницы и оставались висеть поверх Home на своём верхнем слое.
+  // Подписка, а не разовый поиск: слой публикуется при монтировании рабочей
+  // области, и разовое чтение при первом рендере панели могло его не застать.
+  const [workspaceOverlayHost, setWorkspaceOverlayHostNode] = useState<Element | null>(
+    () => getWorkspaceOverlayHost(),
+  );
+  useEffect(() => {
+    setWorkspaceOverlayHostNode(getWorkspaceOverlayHost());
+    return subscribeWorkspaceOverlayHost(setWorkspaceOverlayHostNode);
+  }, []);
+  const overlayPortalTarget = workspaceOverlayHost || workspaceOverlayPortalTarget();
   const [composerControlsHost, setComposerControlsHostNode] = useState<Element | null>(
     () => getComposerControlsHost(tabId),
   );
@@ -1957,6 +2020,25 @@ export default function ClaudeControlBar({
     return subscribeComposerControlsHost(tabId, setComposerControlsHostNode);
   }, [tabId]);
   const dockedInComposer = !!composerControlsHost;
+
+  // Second slot, same mechanism: while nothing is running in this tab, the
+  // terminal publishes a node in its own middle and the LAUNCH strip is drawn
+  // there instead of in the bar's corner. Only the strip moves — everything else
+  // in the bar stays where it is. See emptyTabLaunchHost.mjs.
+  const [emptyLaunchHost, setEmptyLaunchHostNode] = useState<Element | null>(
+    () => getEmptyTabLaunchHost(tabId),
+  );
+  useEffect(() => {
+    setEmptyLaunchHostNode(getEmptyTabLaunchHost(tabId));
+    return subscribeEmptyTabLaunchHost(tabId, setEmptyLaunchHostNode);
+  }, [tabId]);
+  // Draw `node` into `host` when there is one, in place otherwise. The strip
+  // must keep working when the terminal has not published a slot (History is
+  // primary, the tab is a pane, restore has not finished) — a launch button that
+  // disappears because a HOST is missing would read as "the button is gone".
+  const renderInto = (host: Element | null, node: React.ReactNode) => (
+    host ? createPortal(node, host) : node
+  );
 
   const rootRef = useRef<HTMLDivElement>(null);
   // ── Перенос в две строки при нехватке ширины ────────────────────────────
@@ -1987,8 +2069,10 @@ export default function ClaudeControlBar({
   // Ловушка, из-за которой наивная версия начинает мигать: после переноса блоки
   // стоят в столбик, и их «естественная» ширина уже не читается — обе становятся
   // равны ширине бара, условие переворачивается, строки схлопываются обратно, и
-  // так по кругу. Поэтому меряем scrollWidth (нужная ширина содержимого, а не
-  // выданная раскладкой) — она одинакова в обоих состояниях.
+  // так по кругу. Поэтому меряем сумму детей (нужная ширина содержимого, а не
+  // выданная раскладкой) — она одинакова в обоих состояниях. Именно сумму, а
+  // не scrollWidth: у левого блока в конце распорка, и scrollWidth равен
+  // выданной ширине — см. measureClusterContentWidth.
   // useLayoutEffect, а не useEffect: правый кластер рендерится внутри вызова
   // функции ниже, поэтому его ref привязывается позже — обычный эффект успевал
   // прочитать пустую ссылку, сбросить перенос и больше не пересчитаться, потому
@@ -2069,7 +2153,10 @@ export default function ClaudeControlBar({
   // выполняется после каждого рендера. Это и есть страховка от скрытого окна и
   // от смены ширины, о которой наблюдатель не сообщил. Само по себе цикла не
   // даёт: setClustersWrapped с тем же значением React не считает изменением, а
-  // scrollWidth одинаков в обеих раскладках (в столбик блоки не сжимаются).
+  // сумма детей одинакова в обеих раскладках (в столбик блоки не сжимаются).
+  // ОБЯЗАТЕЛЬНОЕ условие безопасности этого эффекта — мерить ТЕМ ЖЕ способом,
+  // что и эффект выше. Пока здесь стоял scrollWidth, два эффекта отвечали на
+  // один вопрос по-разному и переписывали ответы друг друга по кругу.
   useLayoutEffect(() => {
     const root = rootRef.current;
     const left = leftClusterRef.current;
@@ -2098,10 +2185,19 @@ export default function ClaudeControlBar({
       return;
     }
     setReadingsShed(false);
+    // Тот же способ замера, что и в эффекте выше, и это обязательное условие.
+    // Здесь стоял scrollWidth — ровно то число, от которого предостерегает
+    // measureClusterContentWidth: у левого блока в конце распорка, поэтому
+    // scrollWidth равен выданной ширине, а не нужной. Получалось, что два
+    // эффекта в одном компоненте отвечали на один вопрос по-разному: один
+    // говорил «влезает», другой «не влезает», каждый переписывал ответ
+    // другого, и каждая запись вызывала новый рендер — бесконечный круг,
+    // который React обрывает ошибкой #185 (прод 17.08 20:34:09 и 20:41:05,
+    // «Something went wrong» на весь экран).
     setClustersWrapped(shouldWrapControlBar({
       availableWidth,
-      leftWidth: left.scrollWidth,
-      rightWidth: right.scrollWidth,
+      leftWidth: measureClusterContentWidth(left, 10),
+      rightWidth: measureClusterContentWidth(right, 6),
       minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
     }));
   });
@@ -2351,6 +2447,7 @@ export default function ClaudeControlBar({
         source,
       });
       setEffortLocal(level);
+      void refreshClaudeConfirmedSettings('local-effort-change');
       return true;
     } catch (error: any) {
       if (sentinelMap) {
@@ -2421,6 +2518,10 @@ export default function ClaudeControlBar({
       setClaudeModel(model);
       await applyClaudePtySetting({ tabId, kind: 'effort', value: effort, source: `controlbar:${source}-effort` });
       setEffortLocal(effort);
+      if (claudeSessionId) {
+        setConfirmedSettingsOwnerSessionId(claudeSessionId);
+        rememberConfirmedSettingsSeed(claudeSessionId, { model, effort });
+      }
       return true;
     } catch (error: any) {
       if (!modelApplied && modelSentinelMap) {
@@ -2631,8 +2732,8 @@ export default function ClaudeControlBar({
         if (success) clearQuickClaudeToggle();
         return;
       }
-      const nextEffort = effortLocal && !claudeEffortsForModel(nextModel).includes(effortLocal)
-        ? resolveClaudeEffortForModel(nextModel, effortLocal)
+      const nextEffort = confirmedClaudeEffort && !claudeEffortsForModel(nextModel).includes(confirmedClaudeEffort)
+        ? resolveClaudeEffortForModel(nextModel, confirmedClaudeEffort)
         : null;
       setLocalBusy(true, 'claude-model:' + mid);
       const modelSentinelMap = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
@@ -2646,6 +2747,7 @@ export default function ClaudeControlBar({
           source: 'controlbar:model',
         });
         setClaudeModel(mid);
+        void refreshClaudeConfirmedSettings('local-model-change');
         if (nextEffort) {
           const effortApplied = await setEffortOnPTY(
             nextEffort,
@@ -3212,19 +3314,10 @@ export default function ClaudeControlBar({
   // there verbatim, including the Codex writer-proof gate — see TabBar
   // `handleContextFork`.
 
-  // Pull a UUID out of clipboard text. The clipboard might hold raw whitespace
-  // ("  uuid \n"), a TUI bracketed-paste echo, or "/resume <uuid>" — strip and
-  // validate with the canonical UUID v4 regex. Returns null on no/invalid uuid.
-  const readSessionFromClipboard = (): string | null => {
-    try {
-      const { clipboard } = window.require('electron');
-      const raw = String(clipboard.readText() || '').trim();
-      const m = raw.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-      return m ? m[0] : null;
-    } catch {
-      return null;
-    }
-  };
+  // Один читатель буфера на все поверхности запуска — см.
+  // utils/clipboardSessionId. Пустое окно рабочей области запускает те же
+  // форки, и две копии регулярки разъехались бы на первом же исправлении.
+  const readSessionFromClipboard = readSessionIdFromClipboard;
 
   const canUseCurrentEmptyPtyForFork = (tab: any) => {
     return tab?.tabType !== 'claude-sdk'
@@ -3442,13 +3535,19 @@ export default function ClaudeControlBar({
   };
 
   // ===== render helpers =====
-  const meterColor = contextPct > 80 ? '#ef4444' : contextPct > 50 ? '#f59e0b' : '#4ade80';
+  // Цвет заполнения контекста — из общего модуля: такое же число показывает
+  // угол карточки вкладки, и два независимых порога рано или поздно показали бы
+  // один контекст разными цветами.
+  const meterColor = contextUsageColor(contextPct);
 
   // Visible label on a trigger pill
   const modelLabel = (() => {
     if (isCodex) {
       const m = codexModels.find(m => m.id === modelActiveId);
       return m?.label || modelActiveId || '—';
+    }
+    if (isAnthropicPTY && claudeSessionId && !confirmedClaudeModel && !pendingClaudeModel) {
+      return 'model';
     }
     const modelOptions = isAnthropicPTY ? claudeCodeModels : activeProvider.models;
     const m = modelOptions.find(m => m.id === modelActiveId);
@@ -3506,7 +3605,7 @@ export default function ClaudeControlBar({
       >
         <div style={popupCardStyle}>{children}</div>
       </CenteredUpwardPopover>,
-      document.body,
+      overlayPortalTarget,
     );
   };
 
@@ -3774,13 +3873,20 @@ export default function ClaudeControlBar({
                 </ControlHint>
               );
             })()
-          ) : !dockedInComposer && (
+          ) : (!dockedInComposer && !emptyLaunchHost) && (
             // Docked in the composer this chip is GONE: the status control to
             // its left already starts and stops the session (hover → ▶ / ■), and
             // two controls for one action next to each other is exactly what the
             // move was meant to remove. Юзер: «все кнопки Resume — нет, у нас
             // есть кнопка терминала, при hover она превращается в play».
             // The strip keeps it — there is no status control there.
+            //
+            // И оно же уходит, когда вкладка ПУСТАЯ и полоса запуска уехала в
+            // центр терминала: этот чип — «Start» той же полосы, её первая
+            // кнопка. Оставшись здесь, он оказывался в другом конце экрана от
+            // своих же соседей, а в центре первой кнопкой становился зелёный
+            // «Start» Codex — то есть оба места врали, какой агент запустится.
+            // Полосу рисует AiLaunchStrip с ownsClaudeChip (см. ниже).
             <SessionActionChip
               sessionType={sessionType}
               mode="pty"
@@ -3818,100 +3924,76 @@ export default function ClaudeControlBar({
             «занятой» вкладке выглядели как «процесс работает, но почему-то
             предлагают форкнуть из буфера». */}
         {!hasAnySession && !isSDKTab && !isCommandRunning && (
-          <>
-            <ControlHint label="Создать Claude fork из session ID в буфере">
-            <button
-              type="button"
-              aria-busy={isInlineActionLoading('fork-from-clipboard-claude')}
-              aria-disabled={inlineAction?.tabId === tabId}
-              className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
-              style={{
-                color: '#DA7756',
-                backgroundColor: 'transparent',
-                border: '1px solid rgba(218,119,86,0.30)',
-                flexShrink: 0,
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218,119,86,0.15)'; (e.currentTarget as HTMLButtonElement).style.color = '#FF9466'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = '#DA7756'; }}
-              onClick={() => void runInlineAction('fork-from-clipboard-claude', forkFromClipboardClaude)}
-              title="Форк Claude из session ID в буфере обмена"
-            >
-              <InlineActionContent loading={isInlineActionLoading('fork-from-clipboard-claude')}>
-                Claude-F
-              </InlineActionContent>
-            </button>
-            </ControlHint>
-            <ControlHint label="Открыть новую Claude SDK-вкладку">
-            <button
-              className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
-              style={{
-                color: '#DA7756',
-                backgroundColor: 'transparent',
-                border: '1px solid rgba(218,119,86,0.30)',
-                flexShrink: 0,
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218,119,86,0.15)'; (e.currentTarget as HTMLButtonElement).style.color = '#FF9466'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = '#DA7756'; }}
-              onClick={startNewSDKTab}
-              title="Открыть новый Claude SDK таб"
-            >SDK</button>
-            </ControlHint>
-            <ControlHint label="Создать SDK fork из session ID в буфере">
-            <button
-              type="button"
-              aria-busy={isInlineActionLoading('fork-from-clipboard-sdk')}
-              aria-disabled={inlineAction?.tabId === tabId}
-              className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
-              style={{
-                color: '#DA7756',
-                backgroundColor: 'transparent',
-                border: '1px solid rgba(218,119,86,0.30)',
-                flexShrink: 0,
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(218,119,86,0.15)'; (e.currentTarget as HTMLButtonElement).style.color = '#FF9466'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = '#DA7756'; }}
-              onClick={() => void runInlineAction('fork-from-clipboard-sdk', forkFromClipboardSDK)}
-              title="Форк SDK из session ID в буфере обмена"
-            >
-              <InlineActionContent loading={isInlineActionLoading('fork-from-clipboard-sdk')}>
-                SDK-F
-              </InlineActionContent>
-            </button>
-            </ControlHint>
-            <SessionActionChip
-              sessionType="codex"
-              mode="pty"
-              isCommandRunning={false}
-              hasAnySession={false}
+          // ОДНА полоса запуска на три места: здесь, в ЦЕНТРЕ пустой вкладки и
+          // в пустом окне рабочей области (AiLaunchStrip) — один компонент, не
+          // три копии. Ведущий чип «Claude» рисуется ВЫШЕ, вне полосы: он же
+          // управляет живой сессией (Continue/Resume/Stop) и остаётся на месте,
+          // даже когда кнопок запуска нет.
+          //
+          // Пока во вкладке ничего не запущено, полоса рисуется ПОРТАЛОМ в
+          // середину терминала: там она единственное, что можно сделать, а в
+          // углу была самым мелким, что есть на экране. Компонент при этом не
+          // переезжает — портал меняет место в DOM, а не в дереве, поэтому все
+          // защиты запуска (гард жизненного цикла, авто-имя, проверки Codex)
+          // остаются теми же самыми.
+          renderInto(
+            emptyLaunchHost,
+            <AiLaunchStrip
+              // В центре пустой вкладки полоса ВЕДУЩАЯ и рисует чип Claude сама:
+              // отдельного чипа рядом там нет (он остался бы в баре, за экран от
+              // своих же кнопок). В самом баре чип по-прежнему снаружи полосы —
+              // он же управляет живой сессией и остаётся, когда кнопок запуска
+              // уже нет.
+              ownsClaudeChip={!!emptyLaunchHost}
               disabled={sessionActionDisabled}
               disabledTitle={sessionActionDisabledTitle}
-              onStart={startCodexTab}
-              onContinue={startCodexTab}
-              onStop={() => {}}
-            />
-            <ControlHint label="Создать Codex fork из session ID в буфере">
-            <button
-              type="button"
-              aria-busy={isInlineActionLoading('fork-from-clipboard-codex')}
-              aria-disabled={inlineAction?.tabId === tabId}
-              className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
-              style={{
-                color: '#10A37F',
-                backgroundColor: 'transparent',
-                border: '1px solid rgba(16,163,127,0.35)',
-                flexShrink: 0,
+              isBusy={(action) => isInlineActionLoading(
+                action === 'claude-fork' ? 'fork-from-clipboard-claude'
+                  : action === 'sdk-fork' ? 'fork-from-clipboard-sdk'
+                  : 'fork-from-clipboard-codex'
+              )}
+              renderBusy={(action, content) => (
+                <InlineActionContent loading={isInlineActionLoading(
+                  action === 'claude-fork' ? 'fork-from-clipboard-claude'
+                    : action === 'sdk-fork' ? 'fork-from-clipboard-sdk'
+                    : 'fork-from-clipboard-codex'
+                )}>
+                  {content}
+                </InlineActionContent>
+              )}
+              onLaunch={(action) => {
+                // Здесь запуск ПРЕВРАЩАЕТ текущую вкладку: пользователь стоит в
+                // ней, и заводить соседнюю на каждое нажатие было бы неожиданно.
+                // Пустое окно отвечает иначе — там вкладки ещё нет.
+                switch (action) {
+                  case 'claude':
+                    // Есть только когда полоса ведущая (центр пустой вкладки).
+                    // Тот же onStart, что у чипа в баре: он несёт гард
+                    // жизненного цикла и авто-имя, а второй путь запуска
+                    // разошёлся бы с ним на первом же изменении правил.
+                    void onStart();
+                    return;
+                  case 'claude-fork':
+                    void runInlineAction('fork-from-clipboard-claude', forkFromClipboardClaude);
+                    return;
+                  case 'sdk':
+                    startNewSDKTab();
+                    return;
+                  case 'sdk-fork':
+                    void runInlineAction('fork-from-clipboard-sdk', forkFromClipboardSDK);
+                    return;
+                  case 'codex':
+                    void startCodexTab();
+                    return;
+                  case 'codex-fork':
+                    void runInlineAction('fork-from-clipboard-codex', forkFromClipboardCodex);
+                    return;
+                  default:
+                    return;
+                }
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(16,163,127,0.14)'; (e.currentTarget as HTMLButtonElement).style.color = '#34d399'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = '#10A37F'; }}
-              onClick={() => void runInlineAction('fork-from-clipboard-codex', forkFromClipboardCodex)}
-              title="Форк Codex из session ID в буфере обмена"
-            >
-              <InlineActionContent loading={isInlineActionLoading('fork-from-clipboard-codex')}>
-                Codex-F
-              </InlineActionContent>
-            </button>
-            </ControlHint>
-          </>
+            />
+          )
         )}
 
         {/* Terminal draft — one trigger, three actions in an upward menu.
@@ -4323,7 +4405,7 @@ export default function ClaudeControlBar({
                     <span style={{ color: quickPresetIsCodex ? '#34D399' : '#DA7756', fontWeight: 700 }}>{quickPresetEffort === 'medium' ? 'med' : quickPresetEffort === 'xhigh' ? 'xhi' : quickPresetEffort === 'ultracode' ? 'ultra' : quickPresetEffort}</span>
                   </div>
                 </CenteredUpwardPopover>,
-                document.body,
+                overlayPortalTarget,
               )}
             </div>
           );
@@ -4357,6 +4439,11 @@ export default function ClaudeControlBar({
                   borderColor: '#fff',
                   boxShadow: '0 0 0 1px rgba(255,255,255,0.14)',
                 } : {}),
+                ...(claudeModelProofNeedsAttention && !modelSpinning ? {
+                  color: '#fbbf24',
+                  borderColor: 'rgba(245,158,11,0.55)',
+                  backgroundColor: 'rgba(245,158,11,0.07)',
+                } : {}),
                 ...(modelSpinning ? {
                   borderColor: busyCancelHover ? 'rgba(248,113,113,0.55)' : 'rgba(167,139,250,0.45)',
                   backgroundColor: busyCancelHover ? 'rgba(220,38,38,0.14)' : 'transparent',
@@ -4373,6 +4460,8 @@ export default function ClaudeControlBar({
                 ? 'Применяю модель… нажмите, чтобы отменить ожидание'
                 : modelBlocked
                   ? 'Идёт применение другой настройки'
+                : claudeModelProofNeedsAttention
+                  ? 'Текущая модель Claude ещё не подтверждена историей этой сессии'
                 : codexModelMenuDisabled
                 ? 'Model пока недоступен'
                 : codexModelDisabled
@@ -4393,7 +4482,14 @@ export default function ClaudeControlBar({
                 {/* Без значка раскрытия: кнопка показывает ТЕКУЩЕЕ значение, и
                     что по нему открывается список — понятно с первого раза, а
                     треугольник занимал место в самой узкой строке интерфейса. */}
-                <span style={{ color: codexModelMenuDisabled || modelBlocked ? '#666' : '#fff' }}>{modelLabel}</span>
+                <span style={{ color: codexModelMenuDisabled || modelBlocked ? '#666' : claudeModelProofNeedsAttention ? '#fbbf24' : '#fff' }}>{modelLabel}</span>
+                {claudeModelProofNeedsAttention && (
+                  <span
+                    data-setting-proof-warning="model"
+                    aria-label="Модель не подтверждена"
+                    style={{ color: '#fbbf24', fontWeight: 800, lineHeight: 1 }}
+                  >!</span>
+                )}
               </span>
               {modelSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
             </button>
@@ -4598,7 +4694,7 @@ export default function ClaudeControlBar({
                     })}
                   </div>
                 </SideFlyout>,
-                document.body,
+                overlayPortalTarget,
               );
             })()}
           </div>
@@ -4646,6 +4742,11 @@ export default function ClaudeControlBar({
                 ...(effortActive === 'ultracode' || (isCodex && effortActive === 'ultra')
                   ? { color: '#a78bfa', borderColor: 'rgba(167,139,250,0.4)' }
                   : {}),
+                ...(claudeEffortProofNeedsAttention && !effortSpinning ? {
+                  color: '#fbbf24',
+                  borderColor: 'rgba(245,158,11,0.55)',
+                  backgroundColor: 'rgba(245,158,11,0.07)',
+                } : {}),
                 ...(effortSpinning ? {
                   borderColor: busyCancelHover ? 'rgba(248,113,113,0.55)' : 'rgba(167,139,250,0.45)',
                   backgroundColor: busyCancelHover ? 'rgba(220,38,38,0.14)' : 'transparent',
@@ -4662,6 +4763,8 @@ export default function ClaudeControlBar({
                 ? 'Применяю настройку… нажмите, чтобы отменить ожидание'
                 : effortBlocked
                   ? 'Идёт применение другой настройки'
+                : claudeEffortProofNeedsAttention
+                  ? 'Текущий effort Claude ещё не подтверждён историей этой сессии'
                 : codexEffortDisabled
                 ? 'Effort пока недоступен'
                 : !thinkActive && !isCodex
@@ -4675,9 +4778,16 @@ export default function ClaudeControlBar({
                 visibility: effortSpinning ? 'hidden' : 'visible',
               }}>
                 {/* Значка раскрытия нет — как и у модели рядом. */}
-                <span style={{ color: codexEffortDisabled || effortBlocked ? '#666' : undefined }}>
+                <span style={{ color: codexEffortDisabled || effortBlocked ? '#666' : claudeEffortProofNeedsAttention ? '#fbbf24' : undefined }}>
                   {effortTriggerLabel}
                 </span>
+                {claudeEffortProofNeedsAttention && (
+                  <span
+                    data-setting-proof-warning="effort"
+                    aria-label="Effort не подтверждён"
+                    style={{ color: '#fbbf24', fontWeight: 800, lineHeight: 1 }}
+                  >!</span>
+                )}
               </span>
               {effortSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
             </button>

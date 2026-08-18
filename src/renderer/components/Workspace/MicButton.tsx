@@ -59,8 +59,7 @@ function useTargetMode(tabId: string): DictationMode {
       // can arrive on different store updates. Dictation therefore belongs to
       // the tab-scoped History draft, never to the hidden xterm composer.
       if (
-        t.tabType !== 'browser'
-        && t.tabType !== 'file'
+        t.tabType !== 'file'
         && (
           t.commandType === 'claude'
           || t.commandType === 'codex'

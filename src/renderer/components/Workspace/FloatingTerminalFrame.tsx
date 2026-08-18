@@ -129,6 +129,23 @@ export default function FloatingTerminalFrame({
         data-floating-terminal
         data-floating-terminal-open={isPresented ? '1' : '0'}
         data-floating-terminal-selected={terminalSelected ? '1' : '0'}
+        // A CLOSED side panel is closed for the keyboard too.
+        //
+        // It is only hidden by `translateX(100%)` — the terminal stays mounted
+        // (it must: its PTY geometry and scrollback have to survive the toggle),
+        // and a merely translated element is still visible to the browser's
+        // focus order. So Tab walked into the off-screen xterm, the browser
+        // scrolled the whole pane sideways to "reveal" the thing it had just
+        // focused, and the panel appeared to open — dragging the layout and the
+        // composer with it. The next Cmd+] then read as "opens again, closes
+        // only on the press after that": the state was still `false`, so one
+        // press set it to true, and only the following one closed it.
+        //
+        // Reported live 2026-08-17 22:22 MSK. `inert` (not `tabIndex={-1}`)
+        // because the whole SUBTREE must leave the focus order — the xterm
+        // helper textarea is a descendant, not this node. React 19 passes a
+        // boolean `inert` through as the real attribute.
+        inert={floating && !open}
         onPointerDownCapture={(event) => {
           // Portalled Run after UI remains a React child, so only a physical
           // hit inside this panel proves that terminal input was selected.

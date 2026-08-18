@@ -22,6 +22,7 @@ test('Claude spinner remains diagnostic and cannot mutate public busy state', ()
   const app = read('src/renderer/App.tsx');
   const tabBar = read('src/renderer/components/Workspace/TabBar.tsx');
   const terminalArea = read('src/renderer/components/Workspace/TerminalArea.tsx');
+  const lifecycleHook = read('src/renderer/components/Workspace/useAgentLifecycle.ts');
   const controlBar = read('src/renderer/components/Workspace/ClaudeControlBar.tsx');
   const runAfterPicker = read('src/renderer/components/Workspace/RunAfterTabPicker.tsx');
 
@@ -55,7 +56,9 @@ test('Claude spinner remains diagnostic and cannot mutate public busy state', ()
 
   assert.match(app, /handleClaudeBusyState[\s\S]{0,500}if \(data\.reason === 'spinner'\) return/);
   assert.match(tabBar, /handleClaudeBusy[\s\S]{0,500}if \(reason === 'spinner'\) return/);
-  assert.match(terminalArea, /onClaudeBusy[\s\S]{0,300}data\.reason === 'spinner'/);
+  assert.match(terminalArea, /useAgentLifecycle/,
+    'TerminalArea delegates per-tab lifecycle events to the shared hook');
+  assert.match(lifecycleHook, /onClaudeBusy[\s\S]{0,300}data\.reason === 'spinner'/);
   assert.match(controlBar, /onAgentBusy[\s\S]{0,400}data\.reason === 'spinner'/);
   assert.match(runAfterPicker, /handleClaudeBusy[\s\S]{0,300}if \(reason === 'spinner'\) return/);
 });

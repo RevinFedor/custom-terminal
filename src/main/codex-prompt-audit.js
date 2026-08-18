@@ -14,6 +14,109 @@ function collectCodexPayloadImagePaths(payload) {
   return paths;
 }
 
+const CODEX_PROVIDER_IMAGE_BLOCK_RE = /<image\s+name\s*=\s*["']?\[Image(?:\s+#?(\d+))?\]["']?\s+path\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))\s*>\s*(?:<<ImageDisplayed>>|\[Image(?:\s+#?(\d+))?\])\s*<\/image\s*>/gi;
+
+function collectCodexProviderImageBlocks(text) {
+  const blocks = [];
+  const pattern = new RegExp(CODEX_PROVIDER_IMAGE_BLOCK_RE.source, 'gi');
+  for (const match of String(text || '').matchAll(pattern)) {
+    const nameSlot = match[1] ? Number(match[1]) : null;
+    const bodySlot = match[5] ? Number(match[5]) : null;
+    blocks.push({
+      match: match[0],
+      index: match.index,
+      nameSlot,
+      bodySlot,
+      path: match[2] || match[3] || match[4] || '',
+      slotsAgree: nameSlot === null || bodySlot === null || nameSlot === bodySlot,
+    });
+  }
+  return blocks;
+}
+
+function codexProviderImageIdentityMatches(text, expectedImagePaths) {
+  const blocks = collectCodexProviderImageBlocks(text);
+  if (blocks.length === 0) return { present: false, valid: true };
+  const expected = (Array.isArray(expectedImagePaths) ? expectedImagePaths : [])
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => value.trim());
+  if (expected.length === 0) {
+    return { present: true, valid: false, reason: 'provider-image-without-expected-identity' };
+  }
+
+  const claimedSlots = new Set();
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = blocks[index];
+    if (!block.slotsAgree) {
+      return { present: true, valid: false, reason: 'provider-image-slot-disagrees' };
+    }
+    const slot = block.nameSlot || block.bodySlot || (index + 1);
+    if (!Number.isInteger(slot) || slot < 1 || slot > expected.length) {
+      return { present: true, valid: false, reason: 'provider-image-slot-out-of-range' };
+    }
+    if (claimedSlots.has(slot)) {
+      return { present: true, valid: false, reason: 'provider-image-slot-repeated' };
+    }
+    claimedSlots.add(slot);
+    if (block.path !== expected[slot - 1]) {
+      return { present: true, valid: false, reason: 'provider-image-path-mismatch' };
+    }
+  }
+  return { present: true, valid: true };
+}
+
+function normalizeCodexProviderImageMarkup(text, imagePaths = [], {
+  allowProviderMarkup = false,
+} = {}) {
+  const allowedPathCounts = new Map();
+  for (const value of Array.isArray(imagePaths) ? imagePaths : []) {
+    if (typeof value !== 'string' || !value.trim()) continue;
+    const path = value.trim();
+    allowedPathCounts.set(path, (allowedPathCounts.get(path) || 0) + 1);
+  }
+  if (allowedPathCounts.size === 0 && allowProviderMarkup !== true) return String(text || '');
+
+  const source = String(text || '');
+  // Codex 0.147 moves the provider image envelope to the beginning of the
+  // materialized user_message while leaving `[Image #N]` where that same
+  // attachment occurred in the submitted text. The carriers are therefore
+  // not necessarily adjacent. Determine duplicate slots after removing every
+  // provider envelope, then omit only the envelope whose numbered placeholder
+  // still exists elsewhere. A provider-only image remains one visible slot.
+  const withoutProviderBlocks = source.replace(CODEX_PROVIDER_IMAGE_BLOCK_RE, ' ');
+  const referencedSlots = new Map();
+  for (const match of withoutProviderBlocks.matchAll(/\[Image\s+#?(\d+)\]/gi)) {
+    referencedSlots.set(match[1], (referencedSlots.get(match[1]) || 0) + 1);
+  }
+  const usedPathCounts = new Map();
+  const normalizedBlocks = source.replace(
+    CODEX_PROVIDER_IMAGE_BLOCK_RE,
+    (match, slot, doubleQuotedPath, singleQuotedPath, barePath, bodySlot) => {
+      if (slot && bodySlot && slot !== bodySlot) return match;
+      const path = doubleQuotedPath || singleQuotedPath || barePath || '';
+      const allowed = Number(allowedPathCounts.get(path) || 0);
+      const used = Number(usedPathCounts.get(path) || 0);
+      const exactPathAdmitted = allowed > used;
+      if (allowedPathCounts.size > 0 && !exactPathAdmitted) return match;
+      if (allowedPathCounts.size === 0 && allowProviderMarkup !== true) return match;
+      if (exactPathAdmitted) usedPathCounts.set(path, used + 1);
+      if (slot && Number(referencedSlots.get(slot) || 0) > 0) {
+        referencedSlots.set(slot, referencedSlots.get(slot) - 1);
+        return ' ';
+      }
+      return ` [Image${slot ? ` #${slot}` : ''}] `;
+    },
+  );
+  // Codex 0.14x can materialize one transported image as both the provider
+  // block and the immediately following numbered placeholder. They are two
+  // carriers for the same slot, not two attachments. Only collapse an exact
+  // adjacent duplicate number; `[Image #1][Image #2]` remains two images.
+  return normalizedBlocks.replace(
+    /(\[Image\s+#?(\d+)\])\s*\[Image\s+#?\2\]/gi,
+    '$1',
+  );
+}
+
 function isCodexUserMessageAuditRecord(record) {
   const payload = record?.payload || {};
   return (record?.type === 'event_msg' && payload.type === 'user_message')
@@ -24,11 +127,31 @@ function isCodexUserMessageAuditRecord(record) {
     );
 }
 
-function codexUserMessageAuditText(record) {
+// Reserved model-input envelope emitted by Codex itself. Keep this classifier
+// beside the canonical user-carrier reader so durable History, Timeline, live
+// History and compatibility projections cannot drift on whether it is a real
+// user-authored turn.
+function isCodexEnvironmentContextUserText(text) {
+  const value = String(text || '').trim();
+  return /^<environment_context>[\s\S]*<\/environment_context>$/.test(value);
+}
+
+function codexUserMessageAuditText(record, {
+  preserveProviderImageMarkup = false,
+} = {}) {
   if (!isCodexUserMessageAuditRecord(record)) return null;
   const payload = record?.payload || {};
-  if (typeof payload.message === 'string') return payload.message;
-  if (typeof payload.text === 'string') return payload.text;
+  const imagePaths = collectCodexPayloadImagePaths(payload);
+  if (typeof payload.message === 'string') {
+    return preserveProviderImageMarkup
+      ? payload.message
+      : normalizeCodexProviderImageMarkup(payload.message, imagePaths);
+  }
+  if (typeof payload.text === 'string') {
+    return preserveProviderImageMarkup
+      ? payload.text
+      : normalizeCodexProviderImageMarkup(payload.text, imagePaths);
+  }
   if (!Array.isArray(payload.content)) return null;
   const parts = [];
   for (const item of payload.content) {
@@ -53,7 +176,11 @@ function codexUserMessageAuditText(record) {
       parts.push(item.message);
     }
   }
-  return parts.length > 0 ? parts.join('') : null;
+  if (parts.length === 0) return null;
+  const joined = parts.join('');
+  return preserveProviderImageMarkup
+    ? joined
+    : normalizeCodexProviderImageMarkup(joined, imagePaths);
 }
 
 function codexUserCarrierTextsMatch(left, right) {
@@ -61,8 +188,14 @@ function codexUserCarrierTextsMatch(left, right) {
   const b = String(right ?? '');
   if (!a || !b) return false;
   if (a === b) return true;
-  return !!codexCanonicalUserMessageMatch({ expectedText: a }, b)
-    || !!codexCanonicalUserMessageMatch({ expectedText: b }, a);
+  return !!codexCanonicalUserMessageMatch({
+    expectedText: a,
+    allowUnprovenImageCarrier: true,
+  }, b)
+    || !!codexCanonicalUserMessageMatch({
+      expectedText: b,
+      allowUnprovenImageCarrier: true,
+    }, a);
 }
 
 function selectCodexPreferredUserMessageAuditRecords(candidates) {
@@ -105,13 +238,16 @@ function codexPromptHasImageMarker(text) {
 }
 
 function normalizeCodexPromptImageSlots(text, imagePaths = []) {
-  let value = String(text || '');
+  let value = normalizeCodexProviderImageMarkup(text, imagePaths, {
+    // This helper is entered only by the image-aware canonical comparison.
+    // Startup recovery can have the exact transported prompt but no retained
+    // structured path array, so the provider block itself remains admissible.
+    allowProviderMarkup: true,
+  });
   value = value
-    // Newer Codex response_item user carriers wrap each transported image as
-    // one XML-like block. The label and path describe the SAME slot; treating
-    // them independently doubles the image count and leaves CONFIRMING stuck.
-    .replace(/<image\s+name\s*=\s*["']?\[Image(?:\s+#?\d+)?\]["']?\s+path\s*=\s*(?:"[^"]+"|'[^']+'|[^\s>]+)\s*>\s*<<ImageDisplayed>>\s*<\/image\s*>/gi, ' [Image] ')
-    .replace(/<image\s+name\s*=\s*["']?\[Image(?:\s+#?\d+)?\]["']?\s+path\s*=\s*(?:"[^"]+"|'[^']+'|[^\s>]+)\s*\/?>/gi, ' [Image] ')
+    // Older/self-closing provider carriers have no body. Full provider blocks
+    // were normalized above so their label and path remain one image slot.
+    .replace(/<image\s+name\s*=\s*["']?\[Image(?:\s+#?\d+)?\]["']?\s+path\s*=\s*(?:"[^"]+"|'[^']+'|[^\s>]+)\s*\/\s*>/gi, ' [Image] ')
     .replace(/\[imagePath:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
     .replace(/\[imageError:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
     .replace(/\[image:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
@@ -150,11 +286,19 @@ function codexCanonicalUserMessageMatch(audit, actualText) {
   }
 
   const payload = audit?.actualPayload || null;
-  const imagePaths = [
-    ...collectCodexPayloadImagePaths(payload),
-    ...(Array.isArray(audit?.expectedImagePaths) ? audit.expectedImagePaths : []),
-  ];
-  if ((imagePaths.length > 0 || codexPromptHasImageMarker(expected) || codexPromptHasImageMarker(actual))
+  const expectedImagePaths = (Array.isArray(audit?.expectedImagePaths)
+    ? audit.expectedImagePaths
+    : []).filter((value) => typeof value === 'string' && value.trim());
+  const payloadImagePaths = collectCodexPayloadImagePaths(payload);
+  const imagePaths = expectedImagePaths.length > 0 ? expectedImagePaths : payloadImagePaths;
+  const providerIdentity = codexProviderImageIdentityMatches(actual, expectedImagePaths);
+  if (providerIdentity.present && expectedImagePaths.length > 0 && !providerIdentity.valid) {
+    return null;
+  }
+  const imageCarrierAdmitted = imagePaths.length > 0
+    || audit?.allowUnprovenImageCarrier === true;
+  if (imageCarrierAdmitted
+    && (codexPromptHasImageMarker(expected) || codexPromptHasImageMarker(actual) || imagePaths.length > 0)
     && normalizeCodexPromptImageSlots(expected, imagePaths) === normalizeCodexPromptImageSlots(actual, imagePaths)) {
     return { reason: 'codex_image_placeholder_canonical' };
   }
@@ -317,7 +461,9 @@ module.exports = {
   codexPromptHasImageMarker,
   collectCodexPayloadImagePaths,
   consumeCodexUserMessageAuditChunk,
+  isCodexEnvironmentContextUserText,
   isCodexUserMessageAuditRecord,
+  normalizeCodexProviderImageMarkup,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
   selectCodexPendingPromptAudit,

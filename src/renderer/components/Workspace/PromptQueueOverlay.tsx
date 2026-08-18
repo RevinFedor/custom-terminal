@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { AppWindow, ArrowDown, ArrowRight, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, Square, Terminal, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
+import { AppWindow, ArrowDown, ArrowRight, CheckSquare, ChevronLeft, History, LoaderCircle, MoreHorizontal, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, RotateCcw, RotateCw, Square, Terminal, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import {
   ComposerEditor,
@@ -308,7 +308,7 @@ export function PromptQueueOverlay({
   const runAfterTabId = queue?.runAfterTabId ?? null;
   const pinnedPreviewId = queue?.previewId ?? null;
   const {
-    addPrompt, removePrompt, updatePrompt, reorderPrompt,
+    addPrompt, addMetaAction, removePrompt, updatePrompt, reorderPrompt,
     setPromptTrigger,
     setAutoRun, setStopAfter, setCloseAfter,
     setPostPromptEnabled, setPostPromptText,
@@ -376,6 +376,7 @@ export function PromptQueueOverlay({
   const [editorFocusWithin, setEditorFocusWithin] = useState(false);
   const [editorPinned, setEditorPinned] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
+  const dragIdRef = useRef<string | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
   const [armedFlash, setArmedFlash] = useState(false);
   // Anchor for the editor modal — when set, the modal aligns its right edge to this rect's left edge
@@ -403,7 +404,13 @@ export function PromptQueueOverlay({
   const [onTabTriggerOpenKeys, setOnTabTriggerOpenKeys] = useState<Map<string, number>>(() => new Map());
   const onTabTriggerOpenSeqRef = useRef(0);
   const [timerTriggerDraftIds, setTimerTriggerDraftIds] = useState<Set<string>>(() => new Set());
+  const [metaActionsMenu, setMetaActionsMenu] = useState<{ left: number; top: number } | null>(null);
+  const [rewindTargetRequestId, setRewindTargetRequestId] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const queueHoverPreviewPanelRef = useRef<HTMLDivElement>(null);
+  const metaActionsButtonRef = useRef<HTMLButtonElement>(null);
+  const metaActionsMenuRef = useRef<HTMLDivElement>(null);
+  const metaActionsCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chipListRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const editorPreviewRef = useRef<HTMLDivElement>(null);
@@ -603,12 +610,15 @@ export function PromptQueueOverlay({
   const replayingIdsRef = useRef<Set<string>>(new Set());
   const [replayHoverId, setReplayHoverId] = useState<string | null>(null);
   const [railRunHover, setRailRunHover] = useState(false);
+  const [queueHoverPreviewOpen, setQueueHoverPreviewOpen] = useState(false);
   const [cmdPressed, setCmdPressed] = useState(false);
   const cmdPressedRef = useRef(false);
   const [panelOpening, setPanelOpening] = useState(false);
   const [panelClosing, setPanelClosing] = useState(false);
   const collapseTimerRef = useRef<number | null>(null);
   const openingTimerRef = useRef<number | null>(null);
+  const queueHoverCloseTimerRef = useRef<number | null>(null);
+  const queueCountButtonRef = useRef<HTMLButtonElement>(null);
   const prevHintRef = useRef(false);
   useEffect(() => {
     if (firstChipArmedHint && !prevHintRef.current) {
@@ -703,6 +713,90 @@ export function PromptQueueOverlay({
       });
     }, 560);
   }, []);
+
+  const clearMetaActionsCloseTimer = useCallback(() => {
+    if (!metaActionsCloseTimerRef.current) return;
+    clearTimeout(metaActionsCloseTimerRef.current);
+    metaActionsCloseTimerRef.current = null;
+  }, []);
+
+  const openMetaActionsMenu = useCallback(() => {
+    clearMetaActionsCloseTimer();
+    const rect = metaActionsButtonRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const width = 168;
+    const height = 72;
+    setMetaActionsMenu({
+      left: Math.max(8, rect.left - width - 6),
+      top: Math.max(8, Math.min(rect.top, window.innerHeight - height - 8)),
+    });
+  }, [clearMetaActionsCloseTimer]);
+
+  const scheduleMetaActionsMenuClose = useCallback(() => {
+    clearMetaActionsCloseTimer();
+    metaActionsCloseTimerRef.current = setTimeout(() => {
+      metaActionsCloseTimerRef.current = null;
+      setMetaActionsMenu(null);
+    }, 110);
+  }, [clearMetaActionsCloseTimer]);
+
+  const enqueueRestartAction = useCallback(() => {
+    const id = addMetaAction(tabId, { kind: 'restart' }, 'Restart tab');
+    markAppearing(id);
+    setMetaActionsMenu(null);
+  }, [addMetaAction, markAppearing, tabId]);
+
+  const requestQueuedRewindTarget = useCallback(() => {
+    const requestId = 'pq-rewind-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+    setRewindTargetRequestId(requestId);
+    setMetaActionsMenu(null);
+    window.dispatchEvent(new CustomEvent('prompt-queue:request-rewind-target', {
+      detail: { tabId, requestId },
+    }));
+  }, [tabId]);
+
+  useEffect(() => {
+    const onSelected = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        requestId?: string;
+        uuid?: string;
+        text?: string;
+        sessionId?: string;
+        toolType?: 'claude' | 'codex';
+      }>).detail;
+      if (!detail
+        || detail.tabId !== tabId
+        || detail.requestId !== rewindTargetRequestId
+        || !detail.uuid
+        || !detail.text
+        || !detail.sessionId
+        || (detail.toolType !== 'claude' && detail.toolType !== 'codex')) return;
+      const id = addMetaAction(tabId, {
+        kind: 'rewind',
+        targetUuid: detail.uuid,
+        targetText: detail.text,
+        sourceSessionId: detail.sessionId,
+        toolType: detail.toolType,
+      });
+      markAppearing(id);
+      setRewindTargetRequestId(null);
+    };
+    const onCancelled = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string; requestId?: string }>).detail;
+      if (detail?.tabId === tabId && detail.requestId === rewindTargetRequestId) {
+        setRewindTargetRequestId(null);
+      }
+    };
+    window.addEventListener('prompt-queue:rewind-target-selected', onSelected);
+    window.addEventListener('prompt-queue:rewind-target-cancelled', onCancelled);
+    return () => {
+      window.removeEventListener('prompt-queue:rewind-target-selected', onSelected);
+      window.removeEventListener('prompt-queue:rewind-target-cancelled', onCancelled);
+    };
+  }, [addMetaAction, markAppearing, rewindTargetRequestId, tabId]);
+
+  useEffect(() => () => clearMetaActionsCloseTimer(), [clearMetaActionsCloseTimer]);
 
   const setTitleLoading = useCallback((id: string, loading: boolean) => {
     setTitleLoadingIds((prev) => {
@@ -2183,6 +2277,7 @@ export function PromptQueueOverlay({
   }, [timelineTreeMode, tabId, historyPinned, setHistoryPanelOpen, setTimelineTreeMode]);
 
   const expandPanel = useCallback(() => {
+    setQueueHoverPreviewOpen(false);
     if (collapseTimerRef.current !== null) {
       window.clearTimeout(collapseTimerRef.current);
       collapseTimerRef.current = null;
@@ -2217,6 +2312,63 @@ export function PromptQueueOverlay({
     }, PANEL_SLIDE_MS);
   }, [commitEditor, tabId, setPanelCollapsed]);
 
+  const cancelQueueHoverPreviewClose = useCallback(() => {
+    if (queueHoverCloseTimerRef.current === null) return;
+    window.clearTimeout(queueHoverCloseTimerRef.current);
+    queueHoverCloseTimerRef.current = null;
+  }, []);
+
+  const openQueueHoverPreview = useCallback(() => {
+    cancelQueueHoverPreviewClose();
+    if (!collapsed || panelClosing || items.length === 0) return;
+    setQueueHoverPreviewOpen(true);
+  }, [cancelQueueHoverPreviewClose, collapsed, items.length, panelClosing]);
+
+  const scheduleQueueHoverPreviewClose = useCallback(() => {
+    cancelQueueHoverPreviewClose();
+    queueHoverCloseTimerRef.current = window.setTimeout(() => {
+      queueHoverCloseTimerRef.current = null;
+      // A trigger picker or chip menu is a child interaction even though it is
+      // portalled to body. Closing the preview under it would make a click on
+      // the selected target also unmount the owning queue row.
+      if (dragIdRef.current
+        || document.querySelector('[data-run-after-picker-menu], [data-prompt-queue-chip-menu]')) return;
+      setQueueHoverPreviewOpen(false);
+    }, 140);
+  }, [cancelQueueHoverPreviewClose]);
+
+  useEffect(() => {
+    if (collapsed && items.length > 0) return;
+    cancelQueueHoverPreviewClose();
+    setQueueHoverPreviewOpen(false);
+  }, [cancelQueueHoverPreviewClose, collapsed, items.length]);
+
+  useEffect(() => {
+    if (!queueHoverPreviewOpen) return;
+    const onMouseMove = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (dragIdRef.current) return;
+      if (queueHoverPreviewPanelRef.current?.contains(target)) return;
+      if (queueCountButtonRef.current?.contains(target)) return;
+      const element = target instanceof Element ? target : null;
+      if (element?.closest('[data-run-after-picker-menu], [data-prompt-queue-chip-menu]')) return;
+      const countRect = queueCountButtonRef.current?.getBoundingClientRect();
+      const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect();
+      if (countRect && previewRect
+        && event.clientX >= previewRect.left - 2
+        && event.clientX <= previewRect.right + 2
+        && event.clientY >= countRect.bottom - 2
+        && event.clientY <= previewRect.top + 2) {
+        return;
+      }
+      cancelQueueHoverPreviewClose();
+      setQueueHoverPreviewOpen(false);
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    return () => window.removeEventListener('mousemove', onMouseMove);
+  }, [cancelQueueHoverPreviewClose, queueHoverPreviewOpen]);
+
   useEffect(() => {
     return () => {
       if (collapseTimerRef.current !== null) {
@@ -2227,11 +2379,16 @@ export function PromptQueueOverlay({
         window.clearTimeout(openingTimerRef.current);
         openingTimerRef.current = null;
       }
+      if (queueHoverCloseTimerRef.current !== null) {
+        window.clearTimeout(queueHoverCloseTimerRef.current);
+        queueHoverCloseTimerRef.current = null;
+      }
     };
   }, []);
 
   // ─── drag-and-drop reorder ───────────────────────────────────────────────
   const onDragStart = (id: string) => (e: React.DragEvent) => {
+    dragIdRef.current = id;
     setDragId(id);
     e.dataTransfer.effectAllowed = 'move';
   };
@@ -2245,15 +2402,25 @@ export function PromptQueueOverlay({
     const fromIdx = items.findIndex((i) => i.id === dragId);
     if (fromIdx < 0) return;
     reorderPrompt(tabId, fromIdx, idx);
+    dragIdRef.current = null;
     setDragId(null);
     setDragOverIdx(null);
   };
-  const onDragEnd = () => { setDragId(null); setDragOverIdx(null); };
+  const onDragEnd = () => {
+    dragIdRef.current = null;
+    setDragId(null);
+    setDragOverIdx(null);
+  };
 
   // chipRefs is still used: openEditor() needs each chip's top coordinate to
   // anchor the editor slideout next to the clicked chip.
   const chipRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const panelOpen = !collapsed || panelClosing;
+  const queueHoverPreviewVisible = collapsed
+    && !panelClosing
+    && queueHoverPreviewOpen
+    && items.length > 0;
+  const panelAttached = panelOpen || queueHoverPreviewVisible;
   const arrowExpanded = !collapsed && !panelClosing;
   const addEditorActive = editorOpen && !isSpecialPromptMode && editingId === null;
   const railRunBg = autoRun
@@ -2338,9 +2505,13 @@ export function PromptQueueOverlay({
           boxSizing: 'border-box',
         }}
       >
-        {panelOpen && (
+        {(panelOpen || queueHoverPreviewVisible) && (
           <div
+            ref={queueHoverPreviewVisible ? queueHoverPreviewPanelRef : undefined}
             className={panelClosing ? 'pq-panel-closing' : (panelOpening ? 'pq-panel-opening' : undefined)}
+            data-prompt-queue-hover-preview={queueHoverPreviewVisible ? 'true' : undefined}
+            onMouseEnter={queueHoverPreviewVisible ? cancelQueueHoverPreviewClose : undefined}
+            onMouseLeave={queueHoverPreviewVisible ? scheduleQueueHoverPreviewClose : undefined}
             style={{
               position: 'relative',
               width: effectiveWidth,
@@ -2350,7 +2521,7 @@ export function PromptQueueOverlay({
               // rail sits (both are right-anchored), rounded elsewhere.
               borderRadius: '6px 0 6px 6px',
               backdropFilter: 'blur(8px)',
-              maxHeight: '100%',
+              maxHeight: queueHoverPreviewVisible ? 'min(60vh, 420px)' : '100%',
               display: 'flex',
               flexDirection: 'column',
               overflow: 'hidden',
@@ -2366,7 +2537,7 @@ export function PromptQueueOverlay({
             width 6) — the panel is `overflow:hidden`, so an outside offset would
             be clipped to a sliver; the 6px zone sits over the header's left
             padding, not over any interactive control. */}
-        <div
+        {!queueHoverPreviewVisible && <div
           data-cmd-hover-popover
           onMouseDown={startResize}
           title="Потяни — изменить ширину"
@@ -2379,7 +2550,7 @@ export function PromptQueueOverlay({
             cursor: 'ew-resize',
             zIndex: FLOATING_OVERLAY_Z_INDEX,
           }}
-        />
+        />}
         {/* Header row: first-delay timer input on left, Run/Stop pills on right.
             The title "Очередь" was removed — context is obvious from the panel.
             Timer input doubles as a countdown display when armed:
@@ -2391,7 +2562,7 @@ export function PromptQueueOverlay({
         <div style={{
           padding: '6px 8px',
           borderBottom: `1px solid ${BORDER}`,
-          display: 'flex',
+          display: queueHoverPreviewVisible ? 'none' : 'flex',
           flexDirection: 'column',
           gap: 4,
           minWidth: 0,
@@ -2723,7 +2894,7 @@ export function PromptQueueOverlay({
         </div>
 
         {/* Clear-all row — only when queue has items */}
-        {items.length > 0 && (
+        {items.length > 0 && !queueHoverPreviewVisible && (
           <div style={{ padding: '2px 8px 4px', borderBottom: `1px solid ${BORDER}`, display: 'flex', justifyContent: 'flex-end' }}>
             <ControlHint label="Удалить все сообщения из очереди" side="left">
             <button
@@ -2735,7 +2906,17 @@ export function PromptQueueOverlay({
         )}
 
         {/* Chip list */}
-        <div ref={chipListRef} style={{ overflowY: 'auto', flex: 1 }}>
+        <div
+          ref={chipListRef}
+          data-prompt-queue-item-list
+          style={{
+            overflowY: 'auto',
+            flex: 1,
+            maxHeight: queueHoverPreviewVisible ? 'min(56vh, 390px)' : undefined,
+            paddingTop: queueHoverPreviewVisible ? 3 : 0,
+            paddingBottom: queueHoverPreviewVisible ? 3 : 0,
+          }}
+        >
           {items.length === 0 && (
             <div style={{ padding: '4px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.2 }}>
               empty
@@ -2743,6 +2924,7 @@ export function PromptQueueOverlay({
           )}
           {items.map((it, idx) => {
             const isEnabled = isQueuedPromptEnabled(it);
+            const isMetaAction = !!it.metaAction;
             const isTitleLoading = titleLoadingIds.has(it.id);
             const title = isTitleLoading ? '' : chipTitle(it);
             const isMultiLine = chipLineClamp > 1;
@@ -2797,6 +2979,7 @@ export function PromptQueueOverlay({
                     e.stopPropagation();
                     return;
                   }
+                  if (isMetaAction || queueHoverPreviewVisible) return;
                   openEditor(it.id, 'pin');
                 }}
                 onContextMenu={(e) => openChipContextMenu(it.id, e)}
@@ -2844,14 +3027,16 @@ export function PromptQueueOverlay({
                   type="button"
                   data-chip-action="replay"
                   ref={(el) => { if (el) replayButtonRefs.current.set(it.id, el); else replayButtonRefs.current.delete(it.id); }}
-                  disabled={replayingIds.has(it.id)}
+                  disabled={isMetaAction || replayingIds.has(it.id)}
                   onMouseDown={(e) => {
                     e.stopPropagation();
                     e.preventDefault();
+                    if (isMetaAction) return;
                     console.log('[PromptQueue] replay mousedown tab=' + tabId.slice(-8) + ' item=' + it.id.slice(-8) + ' meta=' + e.metaKey + ' disabled=' + replayingIds.has(it.id));
                   }}
                   onClick={(e) => {
                     e.stopPropagation();
+                    if (isMetaAction) return;
                     if (editorOpen) commitEditor({ wakeAutoRun: false });
                     const latestItem = usePromptQueueStore.getState().getQueue(tabId)
                       .items.find((p) => p.id === it.id);
@@ -2867,7 +3052,9 @@ export function PromptQueueOverlay({
                     replayChip(it.id, latestItem, { submit: submitNow });
                   }}
                   title={
-                    replayingIds.has(it.id)
+                    isMetaAction
+                      ? (it.metaAction?.kind === 'rewind' ? 'Queued Rewind action' : 'Queued Restart action')
+                      : replayingIds.has(it.id)
                       ? 'Replay in progress…'
                       : (isReplaySubmitMode
                         ? '⌘+click: paste and send'
@@ -2883,7 +3070,7 @@ export function PromptQueueOverlay({
                     color: replayingIds.has(it.id)
                       ? TINT
                       : (isReplaySubmitMode ? SAVE_GREEN : (isReplayHovered ? TINT : TEXT_MUTED)),
-                    cursor: replayingIds.has(it.id) ? 'default' : 'pointer',
+                    cursor: isMetaAction || replayingIds.has(it.id) ? 'default' : 'pointer',
                     padding: 0, lineHeight: 1, fontSize: 10,
                     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                     width: 16, height: 16, borderRadius: 999,
@@ -2892,23 +3079,28 @@ export function PromptQueueOverlay({
                     boxSizing: 'border-box',
                   }}
                   onMouseEnter={(e) => {
-                    if (replayingIds.has(it.id)) return;
+                    if (isMetaAction || replayingIds.has(it.id)) return;
                     setReplayHoverId(it.id);
                     const effectiveCmd = e.metaKey;
                     cmdPressedRef.current = effectiveCmd;
                     setCmdPressed(effectiveCmd);
-                    openEditor(it.id, 'hover');
+                    if (!queueHoverPreviewVisible) openEditor(it.id, 'hover');
                   }}
                   onMouseMove={(e) => {
-                    if (replayingIds.has(it.id)) return;
+                    if (isMetaAction || replayingIds.has(it.id)) return;
                     cmdPressedRef.current = e.metaKey;
                     setCmdPressed(e.metaKey);
                   }}
                   onMouseLeave={() => {
-                    if (replayingIds.has(it.id)) return;
+                    if (isMetaAction || replayingIds.has(it.id)) return;
                     setReplayHoverId((cur) => cur === it.id ? null : cur);
                   }}
-                >{replayingIds.has(it.id) ? <span className="pq-spinner" /> : '▶'}</button>
+                >{isMetaAction
+                    ? (it.metaAction?.kind === 'rewind'
+                      ? <RotateCcw size={12} strokeWidth={2} />
+                      : <RotateCw size={12} strokeWidth={2} />)
+                    : (replayingIds.has(it.id) ? <span className="pq-spinner" /> : '▶')}
+                </button>
                 {isTitleLoading ? (
                   <span style={{
                     flex: 1,
@@ -3088,8 +3280,8 @@ export function PromptQueueOverlay({
           })}
         </div>
 
-        {/* Footer — one split control. The left zone owns the seam. */}
-        <div style={{ display: 'flex', borderTop: `1px solid ${BORDER}` }}>
+        {/* Footer — prompt sources plus durable queue actions. */}
+        <div style={{ display: queueHoverPreviewVisible ? 'none' : 'flex', borderTop: `1px solid ${BORDER}` }}>
           <ControlHint label={`Забрать текущий prompt из ${agentLabel} в очередь`} side="left">
           <button
             onClick={grabCurrent}
@@ -3112,6 +3304,29 @@ export function PromptQueueOverlay({
             }}
           ><Plus size={13} /></button>
           </ControlHint>
+          <ControlHint label="Добавить действие в очередь" side="left">
+          <button
+            ref={metaActionsButtonRef}
+            data-editor-trigger="meta-action"
+            aria-label="Add queue action"
+            title="Add queue action"
+            onMouseEnter={openMetaActionsMenu}
+            onMouseLeave={scheduleMetaActionsMenuClose}
+            onClick={() => metaActionsMenu ? setMetaActionsMenu(null) : openMetaActionsMenu()}
+            style={{
+              flex: '1 1 20%',
+              padding: '6px 4px',
+              background: rewindTargetRequestId ? `${PULSE}26` : 'transparent',
+              border: 'none',
+              borderLeft: `1px solid ${BORDER}`,
+              color: rewindTargetRequestId ? PULSE : '#aaa',
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          ><MoreHorizontal size={14} /></button>
+          </ControlHint>
         </div>
           </div>
         )}
@@ -3125,12 +3340,17 @@ export function PromptQueueOverlay({
             order: -1,
             position: 'relative',
             zIndex: 2,
-            padding: '3px 5px',
+            // Без внутренних отступов (2026-08-17): рамка идёт прямо по краю
+            // кнопок, поэтому сами кнопки становятся выше и полоска перестаёт
+            // тратить высоту на воздух вокруг них. Раньше здесь было 3px сверху
+            // и снизу и 5px по бокам — при высоте кнопки в 18px это почти треть
+            // полоски.
+            padding: 0,
             boxSizing: 'border-box',
             background: '#151515',
             border: '1px solid #303030',
-            borderRadius: panelOpen ? '8px 8px 0 0' : 8,
-            borderBottom: panelOpen ? 'none' : undefined,
+            borderRadius: panelAttached ? '8px 8px 0 0' : 8,
+            borderBottom: panelAttached ? 'none' : undefined,
             display: 'flex',
             flexDirection: 'row',
             alignItems: 'center',
@@ -3172,10 +3392,17 @@ export function PromptQueueOverlay({
             side="left"
           >
           <button
+            ref={queueCountButtonRef}
             className="pq-rail-button"
             onClick={toggleAutoRun}
-            onMouseEnter={() => setRailRunHover(true)}
-            onMouseLeave={() => setRailRunHover(false)}
+            onMouseEnter={() => {
+              setRailRunHover(true);
+              openQueueHoverPreview();
+            }}
+            onMouseLeave={() => {
+              setRailRunHover(false);
+              scheduleQueueHoverPreviewClose();
+            }}
             title={(autoRun ? 'Run after on' : 'Run after off') + ' · ' + activeItemCount + ' queued'}
             aria-label={(autoRun ? 'Run after on' : 'Run after off') + ', ' + activeItemCount + ' queued'}
             style={{
@@ -3274,10 +3501,55 @@ export function PromptQueueOverlay({
         </div>
       </div>
 
+      {metaActionsMenu && createPortal(
+        <div
+          ref={metaActionsMenuRef}
+          data-prompt-queue-meta-actions
+          onMouseEnter={clearMetaActionsCloseTimer}
+          onMouseLeave={scheduleMetaActionsMenuClose}
+          onMouseDown={(event) => event.stopPropagation()}
+          style={{
+            position: 'fixed',
+            left: metaActionsMenu.left,
+            top: metaActionsMenu.top,
+            width: 168,
+            padding: 4,
+            background: 'rgba(18,18,18,0.98)',
+            border: `1px solid ${BORDER}`,
+            borderRadius: 7,
+            boxShadow: '0 10px 30px rgba(0,0,0,0.36)',
+            zIndex: FLOATING_OVERLAY_Z_INDEX + 12,
+            boxSizing: 'border-box',
+          }}
+        >
+          <button
+            type="button"
+            onClick={requestQueuedRewindTarget}
+            style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: PULSE, cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
+            onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(139,92,246,0.12)'; }}
+            onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+          >
+            <RotateCcw size={14} strokeWidth={1.9} />
+            <span>Rewind</span>
+          </button>
+          <button
+            type="button"
+            onClick={enqueueRestartAction}
+            style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#ddd', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
+            onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(255,255,255,0.06)'; }}
+            onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+          >
+            <RotateCw size={14} strokeWidth={1.9} />
+            <span>Restart</span>
+          </button>
+        </div>,
+        document.body,
+      )}
+
       {chipContextMenu && chipContextItem && createPortal((() => {
         const enabled = isQueuedPromptEnabled(chipContextItem);
         const menuWidth = 206;
-        const menuHeight = chipContextItem.trigger ? 164 : 134;
+        const menuHeight = (chipContextItem.trigger ? 164 : 134) - (chipContextItem.metaAction ? 30 : 0);
         const left = Math.max(8, Math.min(chipContextMenu.x, window.innerWidth - menuWidth - 8));
         const top = Math.max(8, Math.min(chipContextMenu.y, window.innerHeight - menuHeight - 8));
         const itemBase: CSSProperties = {
@@ -3298,6 +3570,7 @@ export function PromptQueueOverlay({
         };
         return (
           <div
+            data-prompt-queue-chip-menu
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             style={{
@@ -3398,25 +3671,27 @@ export function PromptQueueOverlay({
                 <span style={{ flex: 1, minWidth: 0 }}>Clear trigger</span>
               </button>
             )}
-            <button
-              onClick={() => regenerateChipTitle(chipContextItem.id)}
-              disabled={titleLoadingIds.has(chipContextItem.id)}
-              style={{
-                ...itemBase,
-                color: titleLoadingIds.has(chipContextItem.id) ? TEXT_DIM : '#ddd',
-                cursor: titleLoadingIds.has(chipContextItem.id) ? 'default' : 'pointer',
-              }}
-              onMouseEnter={(e) => {
-                if (titleLoadingIds.has(chipContextItem.id)) return;
-                (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)';
-              }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
-            >
-              {titleLoadingIds.has(chipContextItem.id)
-                ? <span className="pq-spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
-                : <RefreshCw size={14} strokeWidth={1.9} />}
-              <span style={{ flex: 1, minWidth: 0 }}>Refresh title</span>
-            </button>
+            {!chipContextItem.metaAction && (
+              <button
+                onClick={() => regenerateChipTitle(chipContextItem.id)}
+                disabled={titleLoadingIds.has(chipContextItem.id)}
+                style={{
+                  ...itemBase,
+                  color: titleLoadingIds.has(chipContextItem.id) ? TEXT_DIM : '#ddd',
+                  cursor: titleLoadingIds.has(chipContextItem.id) ? 'default' : 'pointer',
+                }}
+                onMouseEnter={(e) => {
+                  if (titleLoadingIds.has(chipContextItem.id)) return;
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)';
+                }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+              >
+                {titleLoadingIds.has(chipContextItem.id)
+                  ? <span className="pq-spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
+                  : <RefreshCw size={14} strokeWidth={1.9} />}
+                <span style={{ flex: 1, minWidth: 0 }}>Refresh title</span>
+              </button>
+            )}
           </div>
         );
       })(), document.body)}
@@ -3900,16 +4175,18 @@ export function PromptQueueOverlay({
           align-items: center;
           justify-content: center;
           box-sizing: border-box;
-          width: 21px;
-          min-width: 21px;
-          max-width: 21px;
-          height: 21px;
-          min-height: 21px;
-          max-height: 21px;
-          flex: 0 0 21px;
+          width: 26px;
+          min-width: 26px;
+          max-width: 26px;
+          height: 26px;
+          min-height: 26px;
+          max-height: 26px;
+          flex: 0 0 26px;
           /* Squares (was 999px circles): the rail is now a horizontal row
              above the panel — square buttons read as one compact toolbar.
-             21px ≈ старые 30px −30% по просьбе юзера. */
+             21 → 26px вместе с удалением отступов рейла: полоска занимает
+             столько же места, сколько занимала, но всё это место теперь —
+             кнопки, а не воздух вокруг них. */
           border-radius: 5px;
           padding: 0;
           line-height: 1;
@@ -3976,12 +4253,12 @@ export function PromptQueueOverlay({
         /* Единственная кнопка рейла, которая шире квадрата: она несёт две
            иконки (терминал → стрелка) и является главным действием. Все
            три ширины переопределяются вместе — базовый .pq-rail-button
-           фиксирует min/max, иначе flex сожмёт её обратно в 21px. */
+           фиксирует min/max, иначе flex сожмёт её обратно в квадрат. */
         .pq-rail-button.pq-rail-wide {
-          width: 34px;
-          min-width: 34px;
-          max-width: 34px;
-          flex: 0 0 34px;
+          width: 38px;
+          min-width: 38px;
+          max-width: 38px;
+          flex: 0 0 38px;
           gap: 1px;
         }
         .pq-rail-primary:hover {

@@ -74,15 +74,35 @@ export default function SessionActionChip({
   // бессмысленна.
   const showStartOnHover = !disabled && mode === 'pty' && hover && !hasAnySession;
 
-  const label = sessionIdle
-    ? idleLabel
-    : showStopOnHover ? 'Stop'
-    : showStartOnHover ? 'Start'
-    : defaultLabel;
+  // ПОДПИСЬ = ДЕЙСТВИЕ, а не имя агента (2026-08-17).
+  //
+  // Кнопка называлась именем агента («Claude», «Codex») и превращалась в
+  // Start/Stop только под курсором. То есть в покое она сообщала, ЧЬЯ она, а не
+  // что произойдёт по нажатию — а чей это агент, и так написано на вкладке, в
+  // шапке панели и в самом терминале. Юзер: *«если Claude уже остановлен, замени
+  // на Start. И не надо писать название — только Start/Stop»*.
+  //
+  // Наведение больше не меняет ТЕКСТ: менять надпись под курсором можно, когда
+  // она в покое говорит о другом; теперь она с самого начала говорит о действии,
+  // и подмена читалась бы как «кнопка передумала». Цвет и фон на наведении
+  // остаются — это по-прежнему обратная связь «сюда можно нажать».
+  //
+  // SDK-режим сохраняет имя: там в покое кнопка ничего не запускает и не
+  // останавливает (запускать нечего, между ходами процесса нет), поэтому
+  // называть её действием значило бы обещать несуществующее.
+  const label = mode === 'sdk'
+    ? (showStopOnHover ? 'Stop' : defaultLabel)
+    : isCommandRunning
+      ? 'Stop'
+      : sessionIdle ? idleLabel : 'Start';
+  // Цвет по-прежнему говорит, ЧЕЙ это агент — имя ушло из подписи, но не из
+  // кнопки: оранжевый Claude и зелёный Codex различимы без чтения. Красный
+  // только под курсором на живом процессе: «сейчас остановлю» — предупреждение,
+  // а не постоянное состояние.
   const color = showStopOnHover
     ? '#ef4444'
     : disabled ? '#777'
-    : sessionIdle || showStartOnHover ? accentBright : accent;
+    : sessionIdle || showStartOnHover || hover ? accentBright : accent;
 
   const handleClick = () => {
     if (disabled) return;

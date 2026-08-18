@@ -1,6 +1,6 @@
 # Feature: Unified AI Usage (Claude + Codex)
 
-Единый контрол в [`ProjectToolbar.tsx`](../../src/renderer/components/Workspace/ProjectToolbar.tsx), реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). Слева постоянно виден Codex, справа Claude; половины соприкасаются без зазора и открывают один общий popover на нужном провайдере.
+Единый контрол в правой части шапки ([`WorkspaceTitleBarTools.tsx`](../../src/renderer/components/Workspace/WorkspaceTitleBarTools.tsx)), реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). Слева постоянно виден Codex, справа Claude; половины соприкасаются без зазора и открывают один общий popover на нужном провайдере.
 
 ## Компактное лицо и общий popover
 

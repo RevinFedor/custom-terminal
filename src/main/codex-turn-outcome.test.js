@@ -16,6 +16,13 @@ const {
   takeCodexSourceProofReleaseAtScanBoundary,
   trackerHasFinalResultForEvent,
 } = require('./codex-turn-outcome');
+const {
+  classifyCodexWriterAdoption,
+  isCodexResumeSourceAuditPending,
+} = require('./codex-writer-ownership');
+const {
+  selectCodexPendingPromptAudit,
+} = require('./codex-prompt-audit');
 
 test('task_complete is a natural completion only with a non-empty final result', () => {
   assert.deepEqual(
@@ -278,6 +285,98 @@ test('provisional resume source publishes append-in-place lifecycle exactly once
     released.publication.busy,
     completed.busy,
   ], [true, false]);
+});
+
+test('matched image carrier releases the already observed Resume task_started exactly once', () => {
+  const imagePath = '/tmp/noted-terminal-codex-image-input/f2daf846013d0ea3bb2f6ec9ec4f5e6afc624f76403a62c8aeb0f2d82e30ac35.png';
+  const audit = {
+    expectedText: `before ${imagePath} after`,
+    expectedLen: 13 + imagePath.length,
+    expectedHash: 'expected-provider-transform',
+    expectedImagePaths: [imagePath],
+  };
+  const actualText = `<image name=[Image #1] path="${imagePath}"> [Image] </image>`
+    + 'before [Image #1] after';
+  const matched = selectCodexPendingPromptAudit([audit], {
+    actualText,
+    actualHash: 'materialized-provider-transform',
+  });
+  assert.equal(matched?.audit, audit);
+  assert.equal(matched?.canonicalMatch?.reason, 'codex_image_placeholder_canonical');
+
+  const discovery = {
+    sourceMode: 'resume',
+    sourceSessionId: 'source-session',
+    launchId: 'launch-1',
+    provisionalSubmitReservation: {
+      sourceSessionId: 'source-session',
+      launchId: 'launch-1',
+      requiresUserMessageAudit: true,
+      auditMatched: false,
+    },
+  };
+  assert.equal(isCodexResumeSourceAuditPending({
+    sourceMode: 'resume',
+    sourceSessionId: 'source-session',
+    launchId: 'launch-1',
+    discovery,
+  }), true);
+
+  // task_started has already been read from the held source rollout, but must
+  // not reach the UI until the exact post-Enter user carrier above is proven.
+  const held = {
+    offset: 240,
+    liveTurnEvents: 1,
+    busy: true,
+    lastEventType: 'task_started',
+    lastEventTs: '2026-08-17T16:40:33.281Z',
+    lastOutcomeReason: 'task_started',
+    lastOutcomeTurnId: 'turn-production',
+  };
+  configureCodexCatchUpSuppression(held, {
+    suppressBusy: true,
+    suppressPublic: true,
+  });
+  discovery.provisionalSubmitReservation.auditMatched = true;
+  const stillPending = isCodexResumeSourceAuditPending({
+    sourceMode: 'resume',
+    sourceSessionId: 'source-session',
+    launchId: 'launch-1',
+    discovery,
+  });
+  assert.equal(stillPending, false);
+  assert.deepEqual(classifyCodexWriterAdoption({
+    sourceMode: 'resume',
+    sourceMatch: 'source-in-place',
+    linkedBoundaryFound: true,
+    resumeSubmitAuditPending: stillPending,
+  }), {
+    status: 'commit',
+    sourceSettled: true,
+  });
+
+  assert.equal(armCodexSuppressedCatchUpRelease(held, {
+    targetOffset: 240,
+    kind: 'source-proof-replay',
+  }), true);
+  const released = completeCodexSuppressedCatchUpRelease(held);
+  assert.equal(released.released, true);
+  assert.deepEqual(released.publication, {
+    busy: true,
+    reason: 'task_started',
+    outcome: {
+      event: 'task_started',
+      busy: true,
+      reason: 'task_started',
+      hasFinalResult: null,
+    },
+    timestamp: '2026-08-17T16:40:33.281Z',
+    turnId: 'turn-production',
+  });
+  assert.deepEqual(completeCodexSuppressedCatchUpRelease(held), {
+    released: false,
+    publication: null,
+  }, 'the held task start cannot be published twice');
 });
 
 test('suppressed replay stays provisional until the exact held byte range is read successfully', () => {

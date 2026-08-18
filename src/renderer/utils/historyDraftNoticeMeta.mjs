@@ -3,6 +3,13 @@ export function isHistoryDeliveryConfirmationNotice(message) {
   return /delivery is unconfirmed|delivery confirmation is delayed/i.test(value);
 }
 
+export function historyDraftNoticeBelongsOnComposerBorder(message) {
+  // Delivery is already rendered on the exact optimistic message card. A
+  // second "Confirming send" chip on the terminal/composer frame makes an old
+  // receipt look like current terminal activity and can outlive the turn.
+  return !isHistoryDeliveryConfirmationNotice(message);
+}
+
 export function getHistoryDraftNoticeMeta(message) {
   const value = String(message || '');
   if (/terminal input is empty/i.test(value)) {

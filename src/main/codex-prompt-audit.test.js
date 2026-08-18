@@ -7,6 +7,7 @@ const {
   codexAuditRecordIsAfterBoundary,
   codexCanonicalUserMessageMatch,
   consumeCodexUserMessageAuditChunk,
+  normalizeCodexProviderImageMarkup,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
   selectCodexPreferredUserMessageAuditRecords,
@@ -142,6 +143,205 @@ test('Codex XML-like image blocks count each label plus path as one slot', () =>
     expectedText: expected,
     expectedImagePaths: paths,
   }, actual.replace(middle, 'different question')), null);
+});
+
+test('17 Aug provider image block plus duplicate numbered placeholder is one audited slot', () => {
+  const imagePath = '/tmp/noted-terminal-codex-image-input/ea92e0079bbae126b5feef46950051614bfd003b6d7a2ca703c9a735f5325675.png';
+  const task = 'change only the requested group colors';
+  const expectedText = `${imagePath}  ${task}`;
+  const actualText = `<image name=[Image #1] path="${imagePath}"> [Image] </image>[Image #1]   ${task}`;
+  const audit = {
+    expectedText,
+    expectedLen: expectedText.length,
+    expectedHash: '66cc84f61b308c76',
+    expectedImagePaths: [imagePath],
+  };
+
+  assert.equal(
+    normalizeCodexPromptImageSlots(expectedText, [imagePath]),
+    normalizeCodexPromptImageSlots(actualText, [imagePath]),
+  );
+  assert.equal(
+    selectCodexPendingPromptAudit([audit], {
+      actualText,
+      actualHash: 'c31ae5975f87a3e5',
+    })?.canonicalMatch?.reason,
+    'codex_image_placeholder_canonical',
+  );
+});
+
+test('17 Aug provider envelope and its in-place placeholder stay one slot across prose', () => {
+  const imagePath = '/tmp/noted-terminal-codex-image-input/f2daf846013d0ea3bb2f6ec9ec4f5e6afc624f76403a62c8aeb0f2d82e30ac35.png';
+  const before = 'Почему сообщения дублируются?';
+  const after = 'Agent metadata follows';
+  const expectedText = `${before}${imagePath} ${after}`;
+  const actualText = `<image name=[Image #1] path="${imagePath}"> [Image] </image>`
+    + `${before}[Image #1] ${after}`;
+  const audit = {
+    expectedText,
+    expectedLen: expectedText.length,
+    expectedHash: 'expected-hash',
+    expectedImagePaths: [imagePath],
+  };
+
+  assert.equal(
+    normalizeCodexPromptImageSlots(expectedText, [imagePath]),
+    normalizeCodexPromptImageSlots(actualText, [imagePath]),
+  );
+  assert.equal(
+    selectCodexPendingPromptAudit([audit], {
+      actualText,
+      actualHash: 'provider-hash',
+    })?.canonicalMatch?.reason,
+    'codex_image_placeholder_canonical',
+  );
+});
+
+test('19:40 tab-3607 production carrier matches the exact 877-char send', () => {
+  const assetPath = '/Users/fedor/Library/Application Support/noted-terminal/prompt-queue-assets/f2daf846013d0ea3bb2f6ec9ec4f5e6afc624f76403a62c8aeb0f2d82e30ac35.png';
+  const providerPath = '/tmp/noted-terminal-codex-image-input/f2daf846013d0ea3bb2f6ec9ec4f5e6afc624f76403a62c8aeb0f2d82e30ac35.png';
+  const submitted = `Что за хуйня, почему тут, блядь, все два идёт дублируется? Это вот эти вот два сообщения, что это какая-то хуета: «проверь, посмотри, что там за дела». Куда это взялось?[imagePath: ${assetPath}] Agent: Codex
+Role: assistant
+Time: 17.08.2026, 19:38:08
+Message ID: codex-live-961a6c74-5c56-4cc2-8c2d-0d433caaeac2-2026-08-17T16-38-08-384Z-84-tool
+Session ID: 961a6c74-5c56-4cc2-8c2d-0d433caaeac2 Agent: Codex
+Role: assistant
+Time: 17.08.2026, 19:38:48
+Message ID: codex-live-961a6c74-5c56-4cc2-8c2d-0d433caaeac2-2026-08-17T16-38-48-863Z-87-tool
+Session ID: 961a6c74-5c56-4cc2-8c2d-0d433caaeac2 Версия билда, если что, тут старая, но предпоследняя, я бы сказал. Но основные правки там уже должны быть внесены. То есть, что вот эта вот суета с цветом — это непонятно откуда взялось, это очень странно.`;
+  const expectedText = submitted.replace(`[imagePath: ${assetPath}]`, providerPath);
+  const actualText = `<image name=[Image #1] path="${providerPath}"> [Image] </image>`
+    + submitted.replace(`[imagePath: ${assetPath}]`, '[Image #1] ');
+  const audit = {
+    handoffId: 'msxgmn7e-6xuohw',
+    expectedText,
+    expectedLen: expectedText.length,
+    expectedHash: 'cd11e781287eedf9',
+    expectedImagePaths: [providerPath],
+  };
+
+  assert.equal(expectedText.length, 877);
+  assert.equal(actualText.length, 936);
+  assert.equal(
+    selectCodexPendingPromptAudit([audit], {
+      actualText,
+      actualHash: '43c76afc88fd08db',
+    })?.canonicalMatch?.reason,
+    'codex_image_placeholder_canonical',
+  );
+  assert.equal(
+    selectCodexPendingPromptAudit([audit], {
+      actualText: actualText.replace('предпоследняя', 'последняя'),
+      actualHash: 'different-non-image-byte',
+    }),
+    null,
+    'a non-image text change must never be hidden by image canonicalization',
+  );
+});
+
+test('live delivery audit preserves provider path evidence until exact comparison', () => {
+  const imagePath = '/tmp/noted-terminal-codex-image-input/content-hash.png';
+  const providerText = `<image name=[Image #1] path="${imagePath}"> [Image] </image>`
+    + 'before [Image #1] after';
+  const record = {
+    type: 'event_msg',
+    payload: {
+      type: 'user_message',
+      message: providerText,
+      local_images: [imagePath],
+    },
+  };
+  assert.equal(
+    codexUserMessageAuditText(record).trim(),
+    'before [Image #1] after',
+    'presentation text removes the duplicate provider carrier',
+  );
+  assert.equal(
+    codexUserMessageAuditText(record, { preserveProviderImageMarkup: true }),
+    providerText,
+    'delivery proof retains the exact path and slot for validation',
+  );
+});
+
+test('provider image identity rejects changed paths, reordered slots and duplicate slot claims', () => {
+  const first = '/tmp/noted-terminal-codex-image-input/first-hash.png';
+  const second = '/tmp/noted-terminal-codex-image-input/second-hash.png';
+  const expectedText = `before ${first} middle ${second} after`;
+  const audit = { expectedText, expectedImagePaths: [first, second] };
+  const block = (slot, imagePath) => `<image name=[Image #${slot}] path="${imagePath}"> [Image] </image>`;
+  const valid = block(1, first) + block(2, second)
+    + 'before [Image #1] middle [Image #2] after';
+
+  assert.equal(
+    codexCanonicalUserMessageMatch(audit, valid)?.reason,
+    'codex_image_placeholder_canonical',
+  );
+  assert.equal(
+    codexCanonicalUserMessageMatch(
+      audit,
+      block(1, second) + block(2, first)
+        + 'before [Image #1] middle [Image #2] after',
+    ),
+    null,
+    'slot numbers cannot conceal reordered attachment identities',
+  );
+  assert.equal(
+    codexCanonicalUserMessageMatch(
+      audit,
+      block(1, first) + block(1, second)
+        + 'before [Image #1] middle [Image #2] after',
+    ),
+    null,
+    'two provider envelopes cannot claim the same slot',
+  );
+  assert.equal(
+    codexCanonicalUserMessageMatch(
+      audit,
+      block(1, '/tmp/noted-terminal-codex-image-input/unrelated.png')
+        + block(2, second)
+        + 'before [Image #1] middle [Image #2] after',
+    ),
+    null,
+    'a different provider image path is not the sent attachment',
+  );
+});
+
+test('the same image attached twice remains two ordered slots', () => {
+  const repeated = '/tmp/noted-terminal-codex-image-input/repeated-hash.png';
+  const expectedText = `left ${repeated} center ${repeated} right`;
+  const actualText = `<image name=[Image #1] path="${repeated}"> [Image] </image>`
+    + `<image name=[Image #2] path="${repeated}"> [Image] </image>`
+    + 'left [Image #1] center [Image #2] right';
+  assert.equal(
+    codexCanonicalUserMessageMatch({
+      expectedText,
+      expectedImagePaths: [repeated, repeated],
+    }, actualText)?.reason,
+    'codex_image_placeholder_canonical',
+  );
+});
+
+test('provider image normalization preserves a distinct adjacent image slot', () => {
+  const imagePaths = ['/tmp/first.png', '/tmp/second.png'];
+  const actual = '<image name=[Image #1] path="/tmp/first.png"> [Image] </image>[Image #2] compare';
+  assert.equal(
+    normalizeCodexPromptImageSlots(actual, imagePaths),
+    '[Image] [Image] compare',
+  );
+});
+
+test('literal provider-looking prose stays opaque without structured image evidence', () => {
+  const literal = '<image name=[Image #1] path="/tmp/example.png"> [Image] </image>[Image #1] docs';
+  assert.equal(normalizeCodexProviderImageMarkup(literal, []), literal);
+  assert.equal(codexUserMessageAuditText({
+    type: 'event_msg',
+    payload: { type: 'user_message', message: literal },
+  }), literal);
+  assert.equal(
+    codexCanonicalUserMessageMatch({ expectedText: literal }, '[Image #1] docs'),
+    null,
+    'literal XML examples cannot become delivery proof without attachment evidence',
+  );
 });
 
 test('response_item assistant messages never become user delivery proof', () => {

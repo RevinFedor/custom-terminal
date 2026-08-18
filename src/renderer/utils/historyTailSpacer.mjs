@@ -18,6 +18,8 @@
  *  5. Our scrollTop signal stays authoritative over Virtuoso's atBottom.
  */
 
+import { HISTORY_TAIL_PIN_THRESHOLD_PX } from './historyBottomScroll.mjs';
+
 export function createHistoryTailSpacer({ onChange, diag } = {}) {
   let px = 0;
 
@@ -112,6 +114,34 @@ export function isUserOwnedScrollBurn({
   return msSinceGesture <= HISTORY_GESTURE_SCROLL_WINDOW_MS;
 }
 
+/**
+ * THE question «is the user at the bottom?», asked in one place.
+ *
+ * Three callers used to answer it their own way and disagreed whenever a
+ * reserve was armed: the scroll handler subtracted the reserve, while the
+ * mount wave and the composer-resize re-pin called the bare geometry helper
+ * and concluded «not at the bottom» for a reader who was standing exactly
+ * there — silently dropping the tail hold. The bottom is the bottom of the
+ * CONTENT: the reserve is fake empty space, never content.
+ *
+ * The threshold is not a bare constant either. The composer grows by a whole
+ * text row at a time (tens of pixels) while the pin threshold is 4px, so a
+ * reader parked at the tail fell out of «at the bottom» the moment the input
+ * wrapped a line. Callers that know a live resize is happening pass its
+ * height delta as `slackPx`.
+ */
+export function isHistoryAtContentBottom(scroller, {
+  spacerPx = 0,
+  thresholdPx = HISTORY_TAIL_PIN_THRESHOLD_PX,
+  slackPx = 0,
+} = {}) {
+  if (!scroller) return false;
+  const distance = historyContentDistanceFromBottom(scroller, spacerPx);
+  const threshold = Math.max(0, Number(thresholdPx) || 0)
+    + Math.max(0, Number(slackPx) || 0);
+  return distance <= threshold;
+}
+
 /** Bottom distance corrected for the reserve: the CONTENT bottom, not the
  * padded scroller bottom. All tail-pin math must use this. */
 export function historyContentDistanceFromBottom(scroller, spacerPx) {
@@ -119,6 +149,33 @@ export function historyContentDistanceFromBottom(scroller, spacerPx) {
   const raw = Number(scroller.scrollHeight || 0)
     - (Number(scroller.scrollTop || 0) + Number(scroller.clientHeight || 0));
   return raw - Math.max(0, Number(spacerPx) || 0);
+}
+
+/**
+ * How much of the reserve this commit's CONTENT GROWTH refills.
+ *
+ * The reserve must not be re-derived from the reader's distance to the bottom.
+ * That distance shrinks for two different reasons — the user scrolled up, and
+ * the content grew — but only the second one refills the fake space. Deriving
+ * it from the distance double-counted every upward pixel: the scroll handler
+ * burned it, then the reconciliation running on that same commit measured a
+ * smaller deficit and burned the identical pixels again (prod 17.08 19:25–26,
+ * pairs of «burn px=N src=user-scroll» + «burn px=N src=deficit-reconcile»;
+ * felt as one wheel tick travelling two or three ticks' worth of feed).
+ *
+ * `null` for `previousBottom` means «first measurement, nothing to compare» —
+ * no burn, just record.
+ */
+export function historyTailReserveGrowthBurn({
+  spacerPx = 0, previousContentBottom = null, contentBottom = 0,
+} = {}) {
+  const reserve = Math.max(0, Math.round(Number(spacerPx) || 0));
+  if (reserve <= 0) return 0;
+  if (previousContentBottom === null || previousContentBottom === undefined) return 0;
+  const grew = Math.round(Number(contentBottom) || 0)
+    - Math.round(Number(previousContentBottom) || 0);
+  if (grew <= 0) return 0;
+  return Math.min(reserve, grew);
 }
 
 /**

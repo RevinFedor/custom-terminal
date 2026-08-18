@@ -16,6 +16,13 @@ const {
   normalizeForkMarkerEntryUuids,
   parseForkMarkerEntryUuidsJson,
 } = require('./fork-marker-snapshot');
+const {
+  cleanString: cleanSessionHistoryEventString,
+  forkEventKey,
+  normalizeEventType: normalizeSessionHistoryEventType,
+  normalizeProvider: normalizeSessionHistoryProvider,
+  toEpochSeconds: sessionHistoryEventEpochSeconds,
+} = require('./session-history-events');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const INBOX_PROJECT_NAME = 'Inbox';
 const INBOX_PROJECT_DESCRIPTION = 'System workspace for API-created and unassigned agent tabs.';
@@ -523,6 +530,96 @@ class DatabaseManager {
     try { this.db.exec(`ALTER TABLE fork_markers ADD COLUMN entry_uuids_json TEXT NOT NULL DEFAULT '[]'`); } catch (e) {}
     // Migration: add hidden column for soft-delete (keeps snapshot data for boundary suppression)
     try { this.db.exec(`ALTER TABLE fork_markers ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+
+    // App-owned normalized history facts. Provider transcripts remain recovery
+    // evidence, but UI/MCP consumers read this projection so Claude and Codex
+    // expose the same fork/compact contract.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS session_history_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_key TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        source_session_id TEXT DEFAULT NULL,
+        child_session_id TEXT DEFAULT NULL,
+        source_tab_id TEXT DEFAULT NULL,
+        child_tab_id TEXT DEFAULT NULL,
+        visual_parent_tab_id TEXT DEFAULT NULL,
+        orchestration_run_id TEXT DEFAULT NULL,
+        orchestration_parent_run_id TEXT DEFAULT NULL,
+        fork_mode TEXT DEFAULT NULL,
+        entry_uuids_json TEXT NOT NULL DEFAULT '[]',
+        snapshot_complete INTEGER NOT NULL DEFAULT 1,
+        boundary_entry_uuid TEXT DEFAULT NULL,
+        summary_entry_uuid TEXT DEFAULT NULL,
+        occurred_at INTEGER DEFAULT NULL,
+        turn_index INTEGER DEFAULT NULL,
+        after_iteration_index INTEGER DEFAULT NULL,
+        next_iteration_index INTEGER DEFAULT NULL,
+        trigger TEXT DEFAULT NULL,
+        pre_tokens INTEGER DEFAULT NULL,
+        post_tokens INTEGER DEFAULT NULL,
+        origin TEXT NOT NULL DEFAULT 'app',
+        inherited INTEGER NOT NULL DEFAULT 0,
+        is_direct INTEGER NOT NULL DEFAULT 0,
+        metadata_copied INTEGER NOT NULL DEFAULT 0,
+        hidden INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+      )
+    `);
+    try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN snapshot_complete INTEGER NOT NULL DEFAULT 1`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN orchestration_parent_run_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN metadata_copied INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_session_history_events_session
+      ON session_history_events(session_id, event_type, occurred_at, id);
+      CREATE INDEX IF NOT EXISTS idx_session_history_events_source
+      ON session_history_events(source_session_id, event_type, occurred_at, id);
+    `);
+
+    // Legacy Claude rows already drive the blue Timeline stripe. Import them
+    // once without guessing away cascade ancestry; the newest row for a child
+    // is marked direct, while all snapshots remain available for compatibility.
+    try {
+      const legacyRows = this.db.prepare(`
+        SELECT id, source_session_id, forked_to_session_id, entry_uuids_json,
+               created_at, hidden
+        FROM fork_markers
+        ORDER BY id
+      `).all();
+      const newestIdByChild = new Map();
+      for (const row of legacyRows) newestIdByChild.set(row.forked_to_session_id, row.id);
+      const insertLegacy = this.db.prepare(`
+        INSERT OR IGNORE INTO session_history_events (
+          event_key, event_type, provider, session_id,
+          source_session_id, child_session_id, entry_uuids_json,
+          occurred_at, origin, is_direct, hidden, created_at, updated_at
+        ) VALUES (?, 'fork', 'claude', ?, ?, ?, ?, ?, 'legacy-fork-marker', ?, ?, ?, ?)
+      `);
+      const migrateLegacy = this.db.transaction(() => {
+        for (const row of legacyRows) {
+          const key = forkEventKey('claude', row.source_session_id, row.forked_to_session_id);
+          if (!key) continue;
+          insertLegacy.run(
+            key,
+            row.forked_to_session_id,
+            row.source_session_id,
+            row.forked_to_session_id,
+            row.entry_uuids_json || '[]',
+            row.created_at || null,
+            newestIdByChild.get(row.forked_to_session_id) === row.id ? 1 : 0,
+            row.hidden ? 1 : 0,
+            row.created_at || null,
+            row.created_at || null,
+          );
+        }
+      });
+      migrateLegacy();
+    } catch (e) {
+      console.warn('[DB] session_history_events legacy migration failed:', e.message);
+    }
 
     // Tab history table - closed tabs archive
     this.db.exec(`
@@ -1691,12 +1788,14 @@ class DatabaseManager {
         overlayDismissed: t.overlay_dismissed === 1,
         notes: t.notes || '',
         taskPlan: normalizeTaskPlan(t.task_plan),
-        tabType: t.tab_type || 'terminal',
-        url: t.url || undefined,
+        // Встроенная browser-вкладка удалена 2026-08-17. У кого-то в базе такие
+        // строки ещё лежат, и рендерер про этот тип уже не знает — поэтому здесь
+        // они становятся обычным терминалом, а не «вкладкой, которую никто не
+        // умеет показать». Колонки url/terminal_id/terminal_name/active_view
+        // остаются в схеме пустыми: удалять колонку в SQLite дороже, чем
+        // перестать её читать.
+        tabType: (!t.tab_type || t.tab_type === 'browser') ? 'terminal' : t.tab_type,
         filePath: t.file_path || undefined,
-        terminalId: t.terminal_id || undefined,
-        terminalName: t.terminal_name || undefined,
-        activeView: t.active_view || undefined,
         createdAt: t.created_at || undefined,
         isCollapsed: t.is_collapsed === 1,
         groupId: t.tab_group_id || undefined,
@@ -5382,35 +5481,334 @@ class DatabaseManager {
 
   // ========== FORK MARKERS ==========
 
+  _mapSessionHistoryEvent(row) {
+    if (!row) return null;
+    return {
+      eventKey: row.event_key,
+      eventType: row.event_type,
+      provider: row.provider,
+      sessionId: row.session_id,
+      sourceSessionId: row.source_session_id || null,
+      childSessionId: row.child_session_id || null,
+      sourceTabId: row.source_tab_id || null,
+      childTabId: row.child_tab_id || null,
+      visualParentTabId: row.visual_parent_tab_id || null,
+      orchestrationRunId: row.orchestration_run_id || null,
+      orchestrationParentRunId: row.orchestration_parent_run_id || null,
+      forkMode: row.fork_mode || null,
+      entryUuids: parseForkMarkerEntryUuidsJson(row.entry_uuids_json),
+      snapshotComplete: row.snapshot_complete !== 0,
+      boundaryEntryUuid: row.boundary_entry_uuid || null,
+      summaryEntryUuid: row.summary_entry_uuid || null,
+      occurredAt: row.occurred_at ?? null,
+      turnIndex: row.turn_index ?? null,
+      afterIterationIndex: row.after_iteration_index ?? null,
+      nextIterationIndex: row.next_iteration_index ?? null,
+      trigger: row.trigger || null,
+      preTokens: row.pre_tokens ?? null,
+      postTokens: row.post_tokens ?? null,
+      origin: row.origin || null,
+      inherited: row.inherited === 1,
+      isDirect: row.is_direct === 1,
+      metadataCopied: row.metadata_copied === 1,
+      hidden: row.hidden === 1,
+      createdAt: row.created_at ?? null,
+      updatedAt: row.updated_at ?? null,
+    };
+  }
+
+  saveSessionHistoryEvent(event) {
+    const eventType = normalizeSessionHistoryEventType(event?.eventType);
+    const provider = normalizeSessionHistoryProvider(event?.provider);
+    const sessionId = cleanSessionHistoryEventString(event?.sessionId);
+    const eventKey = cleanSessionHistoryEventString(event?.eventKey);
+    if (!eventType || !provider || !sessionId || !eventKey) {
+      throw new Error('invalid_session_history_event_identity');
+    }
+
+    const entryUuids = normalizeForkMarkerEntryUuids(event?.entryUuids);
+    const now = Math.floor(Date.now() / 1000);
+    const optionalInteger = (value) => {
+      if (value === null || value === undefined || value === '') return null;
+      const numeric = Number(value);
+      return Number.isInteger(numeric) ? numeric : null;
+    };
+    const optionalNumber = (value) => {
+      if (value === null || value === undefined || value === '') return null;
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : null;
+    };
+    const params = {
+      eventKey,
+      eventType,
+      provider,
+      sessionId,
+      sourceSessionId: cleanSessionHistoryEventString(event?.sourceSessionId) || null,
+      childSessionId: cleanSessionHistoryEventString(event?.childSessionId) || null,
+      sourceTabId: cleanSessionHistoryEventString(event?.sourceTabId) || null,
+      childTabId: cleanSessionHistoryEventString(event?.childTabId) || null,
+      visualParentTabId: cleanSessionHistoryEventString(event?.visualParentTabId) || null,
+      orchestrationRunId: cleanSessionHistoryEventString(event?.orchestrationRunId) || null,
+      orchestrationParentRunId: cleanSessionHistoryEventString(event?.orchestrationParentRunId) || null,
+      forkMode: cleanSessionHistoryEventString(event?.forkMode) || null,
+      entryUuidsJson: JSON.stringify(entryUuids),
+      snapshotComplete: event?.snapshotComplete === false ? 0 : 1,
+      boundaryEntryUuid: cleanSessionHistoryEventString(event?.boundaryEntryUuid) || null,
+      summaryEntryUuid: cleanSessionHistoryEventString(event?.summaryEntryUuid) || null,
+      occurredAt: sessionHistoryEventEpochSeconds(event?.occurredAt),
+      turnIndex: optionalInteger(event?.turnIndex),
+      afterIterationIndex: optionalInteger(event?.afterIterationIndex),
+      nextIterationIndex: optionalInteger(event?.nextIterationIndex),
+      trigger: cleanSessionHistoryEventString(event?.trigger) || null,
+      preTokens: optionalNumber(event?.preTokens),
+      postTokens: optionalNumber(event?.postTokens),
+      origin: cleanSessionHistoryEventString(event?.origin) || 'app',
+      inherited: event?.inherited === true ? 1 : 0,
+      isDirect: event?.isDirect === true ? 1 : 0,
+      metadataCopied: event?.metadataCopied === true ? 1 : 0,
+      createdAt: sessionHistoryEventEpochSeconds(event?.createdAt) || now,
+      updatedAt: now,
+    };
+
+    const writeResult = this.db.prepare(`
+      INSERT INTO session_history_events (
+        event_key, event_type, provider, session_id,
+        source_session_id, child_session_id,
+        source_tab_id, child_tab_id, visual_parent_tab_id, orchestration_run_id,
+        orchestration_parent_run_id,
+        fork_mode, entry_uuids_json, snapshot_complete, boundary_entry_uuid, summary_entry_uuid,
+        occurred_at, turn_index, after_iteration_index, next_iteration_index,
+        trigger, pre_tokens, post_tokens, origin, inherited, is_direct, metadata_copied,
+        created_at, updated_at
+      ) VALUES (
+        @eventKey, @eventType, @provider, @sessionId,
+        @sourceSessionId, @childSessionId,
+        @sourceTabId, @childTabId, @visualParentTabId, @orchestrationRunId,
+        @orchestrationParentRunId,
+        @forkMode, @entryUuidsJson, @snapshotComplete, @boundaryEntryUuid, @summaryEntryUuid,
+        @occurredAt, @turnIndex, @afterIterationIndex, @nextIterationIndex,
+        @trigger, @preTokens, @postTokens, @origin, @inherited, @isDirect, @metadataCopied,
+        @createdAt, @updatedAt
+      )
+      ON CONFLICT(event_key) DO UPDATE SET
+        source_session_id = COALESCE(excluded.source_session_id, session_history_events.source_session_id),
+        child_session_id = COALESCE(excluded.child_session_id, session_history_events.child_session_id),
+        source_tab_id = COALESCE(excluded.source_tab_id, session_history_events.source_tab_id),
+        child_tab_id = COALESCE(excluded.child_tab_id, session_history_events.child_tab_id),
+        visual_parent_tab_id = COALESCE(excluded.visual_parent_tab_id, session_history_events.visual_parent_tab_id),
+        orchestration_run_id = COALESCE(excluded.orchestration_run_id, session_history_events.orchestration_run_id),
+        orchestration_parent_run_id = COALESCE(excluded.orchestration_parent_run_id, session_history_events.orchestration_parent_run_id),
+        fork_mode = CASE
+          WHEN excluded.fork_mode IS NOT NULL AND excluded.fork_mode != 'unknown' THEN excluded.fork_mode
+          ELSE session_history_events.fork_mode
+        END,
+        entry_uuids_json = CASE
+          WHEN session_history_events.snapshot_complete = 0 AND excluded.snapshot_complete = 1
+            THEN excluded.entry_uuids_json
+          WHEN session_history_events.entry_uuids_json = '[]' AND excluded.entry_uuids_json != '[]'
+            THEN excluded.entry_uuids_json
+          ELSE session_history_events.entry_uuids_json
+        END,
+        snapshot_complete = MAX(session_history_events.snapshot_complete, excluded.snapshot_complete),
+        boundary_entry_uuid = COALESCE(session_history_events.boundary_entry_uuid, excluded.boundary_entry_uuid),
+        summary_entry_uuid = COALESCE(session_history_events.summary_entry_uuid, excluded.summary_entry_uuid),
+        occurred_at = COALESCE(session_history_events.occurred_at, excluded.occurred_at),
+        turn_index = COALESCE(session_history_events.turn_index, excluded.turn_index),
+        after_iteration_index = COALESCE(session_history_events.after_iteration_index, excluded.after_iteration_index),
+        next_iteration_index = COALESCE(session_history_events.next_iteration_index, excluded.next_iteration_index),
+        trigger = COALESCE(session_history_events.trigger, excluded.trigger),
+        pre_tokens = COALESCE(session_history_events.pre_tokens, excluded.pre_tokens),
+        post_tokens = COALESCE(session_history_events.post_tokens, excluded.post_tokens),
+        origin = CASE
+          WHEN session_history_events.origin IN ('app', 'terminal-mcp', 'orchestration')
+            THEN session_history_events.origin
+          ELSE excluded.origin
+        END,
+        inherited = MAX(session_history_events.inherited, excluded.inherited),
+        is_direct = MAX(session_history_events.is_direct, excluded.is_direct),
+        metadata_copied = MAX(session_history_events.metadata_copied, excluded.metadata_copied),
+        updated_at = excluded.updated_at
+      WHERE
+        (session_history_events.source_session_id IS NULL AND excluded.source_session_id IS NOT NULL)
+        OR (session_history_events.child_session_id IS NULL AND excluded.child_session_id IS NOT NULL)
+        OR (session_history_events.source_tab_id IS NULL AND excluded.source_tab_id IS NOT NULL)
+        OR (session_history_events.child_tab_id IS NULL AND excluded.child_tab_id IS NOT NULL)
+        OR (session_history_events.visual_parent_tab_id IS NULL AND excluded.visual_parent_tab_id IS NOT NULL)
+        OR (session_history_events.orchestration_run_id IS NULL AND excluded.orchestration_run_id IS NOT NULL)
+        OR (session_history_events.orchestration_parent_run_id IS NULL AND excluded.orchestration_parent_run_id IS NOT NULL)
+        OR ((session_history_events.fork_mode IS NULL OR session_history_events.fork_mode = 'unknown')
+            AND excluded.fork_mode IS NOT NULL AND excluded.fork_mode != 'unknown')
+        OR (session_history_events.snapshot_complete = 0 AND excluded.snapshot_complete = 1)
+        OR (session_history_events.entry_uuids_json = '[]' AND excluded.entry_uuids_json != '[]')
+        OR (session_history_events.boundary_entry_uuid IS NULL AND excluded.boundary_entry_uuid IS NOT NULL)
+        OR (session_history_events.summary_entry_uuid IS NULL AND excluded.summary_entry_uuid IS NOT NULL)
+        OR (session_history_events.occurred_at IS NULL AND excluded.occurred_at IS NOT NULL)
+        OR (session_history_events.turn_index IS NULL AND excluded.turn_index IS NOT NULL)
+        OR (session_history_events.after_iteration_index IS NULL AND excluded.after_iteration_index IS NOT NULL)
+        OR (session_history_events.next_iteration_index IS NULL AND excluded.next_iteration_index IS NOT NULL)
+        OR (session_history_events.trigger IS NULL AND excluded.trigger IS NOT NULL)
+        OR (session_history_events.pre_tokens IS NULL AND excluded.pre_tokens IS NOT NULL)
+        OR (session_history_events.post_tokens IS NULL AND excluded.post_tokens IS NOT NULL)
+        OR (session_history_events.origin NOT IN ('app', 'terminal-mcp', 'orchestration')
+            AND excluded.origin != session_history_events.origin)
+        OR session_history_events.inherited < excluded.inherited
+        OR session_history_events.is_direct < excluded.is_direct
+        OR session_history_events.metadata_copied < excluded.metadata_copied
+    `).run(params);
+
+    const saved = this._mapSessionHistoryEvent(
+      this.db.prepare('SELECT * FROM session_history_events WHERE event_key = ?').get(eventKey),
+    );
+    Object.defineProperty(saved, '_writeChanged', {
+      configurable: false,
+      enumerable: false,
+      value: writeResult.changes > 0,
+      writable: false,
+    });
+    return saved;
+  }
+
+  saveSessionForkEvent({
+    provider,
+    sourceSessionId,
+    childSessionId,
+    entryUuids,
+    ...metadata
+  }) {
+    const normalizedProvider = normalizeSessionHistoryProvider(provider);
+    const source = cleanSessionHistoryEventString(sourceSessionId);
+    const child = cleanSessionHistoryEventString(childSessionId);
+    const eventKey = forkEventKey(normalizedProvider, source, child);
+    if (!eventKey) throw new Error('invalid_session_fork_identity');
+    const snapshot = normalizeForkMarkerEntryUuids(entryUuids);
+    const event = this.saveSessionHistoryEvent({
+      eventKey,
+      eventType: 'fork',
+      provider: normalizedProvider,
+      sessionId: child,
+      sourceSessionId: source,
+      childSessionId: child,
+      entryUuids: snapshot,
+      ...metadata,
+      boundaryEntryUuid: metadata.boundaryEntryUuid || snapshot.at(-1) || null,
+      snapshotComplete: metadata.snapshotComplete !== false,
+      occurredAt: metadata.occurredAt || Date.now(),
+      isDirect: metadata.isDirect !== false,
+    });
+
+    // Keep old Claude readers functional during rollout. Codex must not enter
+    // this provider-less legacy table: the next startup would migrate it back
+    // as a false Claude lineage event.
+    let legacyChanged = false;
+    if (normalizedProvider === 'claude') {
+      const legacyResult = this.db.prepare(`
+        INSERT INTO fork_markers (
+          source_session_id, forked_to_session_id, entry_uuids_json, created_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(source_session_id, forked_to_session_id) DO UPDATE SET
+          entry_uuids_json = CASE
+            WHEN fork_markers.entry_uuids_json = '[]' AND excluded.entry_uuids_json != '[]'
+            THEN excluded.entry_uuids_json
+            ELSE fork_markers.entry_uuids_json
+          END
+        WHERE fork_markers.entry_uuids_json = '[]' AND excluded.entry_uuids_json != '[]'
+      `).run(source, child, JSON.stringify(snapshot), event.occurredAt || event.createdAt || null);
+      legacyChanged = legacyResult.changes > 0;
+    }
+
+    if (event._writeChanged || legacyChanged) {
+      this.invalidateForkMarkerCache(source);
+      this.invalidateForkMarkerCache(child);
+    }
+    return event;
+  }
+
   /**
    * Save a fork marker when a session is forked
    * @param {string} sourceSessionId - Original session UUID
    * @param {string} forkedToSessionId - New session UUID
    * @param {string[]} entryUuids - Array of all entry UUIDs at fork time (snapshot)
    */
-  saveForkMarker(sourceSessionId, forkedToSessionId, entryUuids) {
+  saveForkMarker(sourceSessionId, forkedToSessionId, entryUuids, metadata = {}) {
     try {
-      // No inheritance needed: fork now rewrites all sessionIds in the copied JSONL,
-      // eliminating false boundaries. Inherited markers would only cause wrong blue stripes.
-
-      // Add the new fork marker
       const normalizedEntryUuids = normalizeForkMarkerEntryUuids(entryUuids);
       if (!Array.isArray(entryUuids)) {
         console.warn('[DB] Fork marker snapshot rejected non-array value; saving empty boundary');
       }
-      const entryUuidsJson = JSON.stringify(normalizedEntryUuids);
-      this.db.prepare(`
-        INSERT OR REPLACE INTO fork_markers (source_session_id, forked_to_session_id, entry_uuids_json)
-        VALUES (?, ?, ?)
-      `).run(sourceSessionId, forkedToSessionId, entryUuidsJson);
-      console.log('[DB] Fork marker saved:', { sourceSessionId, forkedToSessionId, entryCount: normalizedEntryUuids.length });
-
-      // Invalidate cache for both endpoints so the next Timeline read sees the new marker.
-      this.invalidateForkMarkerCache(sourceSessionId);
-      this.invalidateForkMarkerCache(forkedToSessionId);
+      const saved = this.saveSessionForkEvent({
+        provider: metadata.provider || 'claude',
+        sourceSessionId,
+        childSessionId: forkedToSessionId,
+        entryUuids: normalizedEntryUuids,
+        origin: metadata.origin || 'app',
+        forkMode: metadata.forkMode || null,
+        sourceTabId: metadata.sourceTabId || null,
+        childTabId: metadata.childTabId || null,
+        visualParentTabId: metadata.visualParentTabId || null,
+        orchestrationRunId: metadata.orchestrationRunId || null,
+        occurredAt: metadata.occurredAt || null,
+        isDirect: metadata.isDirect !== false,
+      });
+      console.log('[DB] Fork marker saved:', {
+        provider: saved.provider,
+        sourceSessionId,
+        forkedToSessionId,
+        entryCount: normalizedEntryUuids.length,
+      });
+      return saved;
     } catch (e) {
       console.error('[DB] Failed to save fork marker:', e);
+      return null;
     }
+  }
+
+  saveCompactHistoryEvents(events) {
+    const source = Array.isArray(events) ? events : [];
+    const saved = [];
+    const write = this.db.transaction(() => {
+      for (const event of source) saved.push(this.saveSessionHistoryEvent(event));
+    });
+    write();
+    return saved;
+  }
+
+  getSessionHistoryEvents(sessionId) {
+    if (!sessionId) return [];
+    return this.db.prepare(`
+      SELECT *
+      FROM session_history_events
+      WHERE session_id = ? OR source_session_id = ?
+      ORDER BY COALESCE(occurred_at, created_at), id
+    `).all(sessionId, sessionId).map((row) => this._mapSessionHistoryEvent(row));
+  }
+
+  getSessionHistoryContext(sessionId) {
+    const events = this.getSessionHistoryEvents(sessionId);
+    const directFork = events
+      .filter((event) => event.eventType === 'fork' && event.sessionId === sessionId)
+      .sort((left, right) => (
+        Number(right.isDirect) - Number(left.isDirect)
+        || Number(right.occurredAt || right.createdAt || 0) - Number(left.occurredAt || left.createdAt || 0)
+      ))[0] || null;
+    return {
+      fork: directFork,
+      children: events.filter((event) => (
+        event.eventType === 'fork' && event.sourceSessionId === sessionId
+      )),
+      compacts: events.filter((event) => (
+        event.eventType === 'compact' && event.sessionId === sessionId
+      )),
+    };
+  }
+
+  markSessionForkMetadataCopied(eventKey) {
+    const key = cleanSessionHistoryEventString(eventKey);
+    if (!key) return false;
+    return this.db.prepare(`
+      UPDATE session_history_events
+      SET metadata_copied = 1, updated_at = strftime('%s', 'now')
+      WHERE event_key = ? AND event_type = 'fork' AND metadata_copied = 0
+    `).run(key).changes > 0;
   }
 
   /**
@@ -5466,10 +5864,11 @@ class DatabaseManager {
 
     // Search by both source and destination to show markers in both sessions
     const rows = this.db.prepare(`
-      SELECT source_session_id, forked_to_session_id, entry_uuids_json, created_at, hidden
-      FROM fork_markers
-      WHERE source_session_id = ? OR forked_to_session_id = ?
-      ORDER BY created_at
+      SELECT *
+      FROM session_history_events
+      WHERE event_type = 'fork'
+        AND (source_session_id = ? OR session_id = ?)
+      ORDER BY COALESCE(occurred_at, created_at), id
     `).all(sessionId, sessionId);
 
     this._forkMarkerCacheStats.miss++;
@@ -5477,10 +5876,22 @@ class DatabaseManager {
 
     const markers = rows.map(row => ({
       source_session_id: row.source_session_id,
-      fork_session_id: row.forked_to_session_id,
+      fork_session_id: row.child_session_id || row.session_id,
       entry_uuids: parseForkMarkerEntryUuidsJson(row.entry_uuids_json),
-      created_at: row.created_at,
-      hidden: !!row.hidden
+      created_at: row.occurred_at || row.created_at,
+      hidden: !!row.hidden,
+      provider: row.provider,
+      event_key: row.event_key,
+      is_direct: !!row.is_direct,
+      metadata_copied: !!row.metadata_copied,
+      fork_mode: row.fork_mode || null,
+      source_tab_id: row.source_tab_id || null,
+      child_tab_id: row.child_tab_id || null,
+      visual_parent_tab_id: row.visual_parent_tab_id || null,
+      orchestration_run_id: row.orchestration_run_id || null,
+      orchestration_parent_run_id: row.orchestration_parent_run_id || null,
+      boundary_entry_uuid: row.boundary_entry_uuid || null,
+      snapshot_complete: row.snapshot_complete !== 0,
     }));
 
     this._forkMarkerCache.set(sessionId, { markers, ts: Date.now() });
@@ -5495,9 +5906,32 @@ class DatabaseManager {
   getParentSession(sessionId) {
     return this.db.prepare(`
       SELECT source_session_id
-      FROM fork_markers
-      WHERE forked_to_session_id = ?
+      FROM session_history_events
+      WHERE event_type = 'fork' AND session_id = ?
+      ORDER BY is_direct DESC, COALESCE(occurred_at, created_at) DESC, id DESC
+      LIMIT 1
     `).get(sessionId) || null;
+  }
+
+  hideForkMarker(sourceSessionId, forkSessionId) {
+    const source = cleanSessionHistoryEventString(sourceSessionId);
+    const child = cleanSessionHistoryEventString(forkSessionId);
+    if (!source || !child) return 0;
+    const changed = this.db.transaction(() => {
+      const canonical = this.db.prepare(`
+        UPDATE session_history_events
+        SET hidden = 1, updated_at = strftime('%s', 'now')
+        WHERE event_type = 'fork' AND source_session_id = ? AND session_id = ?
+      `).run(source, child).changes;
+      this.db.prepare(`
+        UPDATE fork_markers SET hidden = 1
+        WHERE source_session_id = ? AND forked_to_session_id = ?
+      `).run(source, child);
+      return canonical;
+    })();
+    this.invalidateForkMarkerCache(source);
+    this.invalidateForkMarkerCache(child);
+    return changed;
   }
 
   // ========== SESSION LINKS (Clear Context chain) ==========
@@ -5699,6 +6133,74 @@ class DatabaseManager {
 
     for (let i = 0; i < entryUuids.length; i += CHUNK) {
       tx(entryUuids.slice(i, i + CHUNK));
+    }
+
+    return { notes: notesCopied, rewindMarkers: rewindCopied };
+  }
+
+  copyTimelineMetadataForMappedFork(newSessionId, mappings, forkTabId) {
+    const normalized = [];
+    const seenChildren = new Set();
+    for (const mapping of Array.isArray(mappings) ? mappings : []) {
+      const sourceUuid = cleanSessionHistoryEventString(mapping?.sourceUuid);
+      const childUuid = cleanSessionHistoryEventString(mapping?.childUuid);
+      if (!sourceUuid || !childUuid || seenChildren.has(childUuid)) continue;
+      seenChildren.add(childUuid);
+      normalized.push({ sourceUuid, childUuid });
+    }
+    if (normalized.length === 0) return { notes: 0, rewindMarkers: 0 };
+
+    const insertNote = this.db.prepare(`
+      INSERT OR IGNORE INTO timeline_notes (
+        entry_uuid, session_id, tab_id, content, position, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'))
+    `);
+    const insertRewind = this.db.prepare(`
+      INSERT OR IGNORE INTO timeline_rewind_markers (entry_uuid, session_id)
+      VALUES (?, ?)
+    `);
+    let notesCopied = 0;
+    let rewindCopied = 0;
+    const CHUNK = 500;
+
+    for (let offset = 0; offset < normalized.length; offset += CHUNK) {
+      const chunk = normalized.slice(offset, offset + CHUNK);
+      const childBySource = new Map(chunk.map((mapping) => [mapping.sourceUuid, mapping.childUuid]));
+      const sourceUuids = [...childBySource.keys()];
+      const placeholders = sourceUuids.map(() => '?').join(',');
+      const copy = this.db.transaction(() => {
+        const noteRows = this.db.prepare(`
+          SELECT entry_uuid, content, position, MAX(updated_at) AS updated_at
+          FROM timeline_notes
+          WHERE entry_uuid IN (${placeholders})
+          GROUP BY entry_uuid
+        `).all(...sourceUuids);
+        for (const row of noteRows) {
+          const childUuid = childBySource.get(row.entry_uuid);
+          if (!childUuid) continue;
+          const result = insertNote.run(
+            childUuid,
+            newSessionId,
+            forkTabId || '',
+            row.content || '',
+            row.position || 'before',
+          );
+          if (result.changes > 0) notesCopied += 1;
+        }
+
+        const rewindRows = this.db.prepare(`
+          SELECT DISTINCT entry_uuid
+          FROM timeline_rewind_markers
+          WHERE entry_uuid IN (${placeholders})
+        `).all(...sourceUuids);
+        for (const row of rewindRows) {
+          const childUuid = childBySource.get(row.entry_uuid);
+          if (!childUuid) continue;
+          const result = insertRewind.run(childUuid, newSessionId);
+          if (result.changes > 0) rewindCopied += 1;
+        }
+      });
+      copy();
     }
 
     return { notes: notesCopied, rewindMarkers: rewindCopied };

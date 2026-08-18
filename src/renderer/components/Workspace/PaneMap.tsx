@@ -3,7 +3,13 @@
 // Cell position mirrors the pane's POSITION ON SCREEN, in both axes, so the
 // answer is read without being decoded: the left cell is the left pane, a
 // stacked column draws as a stacked column. Filled = this tab's pane, bright =
-// the focused one.
+// the focused one, HOLLOW = its window, but a neighbouring chip is showing.
+//
+// The hollow state arrived with strips (2026-08-18): a window holds several tabs
+// and shows one, so "which window" and "can I see it" stopped being the same
+// question. Two marks would have been the obvious answer and the wrong one — the
+// row has no width for a second one, and the two would have to be read together
+// anyway. Position keeps answering the first question, fill answers the second.
 //
 // This lived inside TabBar and was therefore available on exactly one surface —
 // the sidebar list. But the question it answers ("is this the tab of the side
@@ -36,8 +42,17 @@ export const PANE_MAP_SLOT_W_PX = (PANE_MAP_CELL_W_PX * PANE_MAP_MAX_CELLS)
 const PANE_MAP_COLORS = {
   'self-focused': '#e8e8ea',
   self: '#8a8a92',
+  // 'held' is drawn HOLLOW instead (see below) — a window this tab is in, with a
+  // neighbouring chip on screen. It has no fill colour at all.
+  held: 'transparent',
   other: 'rgba(255,255,255,0.13)',
 } as const;
+
+// The hollow cell: an outline in the same grey the filled "self" uses, so the
+// pair reads as one thing in two states rather than two different marks. Which
+// WINDOW is answered by the cell's position, as always; whether the tab is
+// SHOWING there is answered by whether the cell is filled.
+const PANE_MAP_HELD_OUTLINE = 'inset 0 0 0 1px #8a8a92';
 
 export interface PaneMapCell { mine: boolean; state: string }
 
@@ -75,6 +90,7 @@ export function PaneMapCells({ columns }: { columns: Array<Array<PaneMapCell>> }
           {rows.map((cell, rowIndex) => (
             <span
               key={rowIndex}
+              data-pane-map-cell={cell.state}
               style={{
                 width: `${PANE_MAP_CELL_W_PX}px`,
                 // Rows share the column's height, minus the gaps between them —
@@ -84,6 +100,10 @@ export function PaneMapCells({ columns }: { columns: Array<Array<PaneMapCell>> }
                 borderRadius: 1.5,
                 background: PANE_MAP_COLORS[cell.state as keyof typeof PANE_MAP_COLORS]
                   || PANE_MAP_COLORS.other,
+                // An OUTLINE, not a border: a border would eat into the 4px cell
+                // and make the hollow one visibly smaller than its filled
+                // neighbours — the map would then look like a different layout.
+                ...(cell.state === 'held' ? { boxShadow: PANE_MAP_HELD_OUTLINE } : null),
               }}
             />
           ))}

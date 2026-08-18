@@ -149,3 +149,40 @@ test('неизмеренная панель не прячет показания
     false,
   );
 });
+
+test('both measurements of the same bar must agree (prod 17.08 #185)', () => {
+  // Причина падения «Something went wrong» (React #185, 20:34 и 20:41): панель
+  // считала ширину дважды и РАЗНЫМИ способами. Один замер суммировал детей
+  // (нужная ширина), второй брал scrollWidth — а он у левого блока равен
+  // выданной ширине из-за распорки в конце. На одной и той же панели два
+  // ответа расходились, каждый переписывал чужой, и каждая запись давала новый
+  // рендер: бесконечный круг.
+  const availableWidth = 620;
+  const contentLeft = 380;   // реальная сумма детей
+  const scrollWidthLeft = availableWidth; // распорка растянула блок на всю ширину
+  const right = 180;
+  const byContent = shouldWrapControlBar({
+    availableWidth, leftWidth: contentLeft, rightWidth: right,
+  });
+  const byScrollWidth = shouldWrapControlBar({
+    availableWidth, leftWidth: scrollWidthLeft, rightWidth: right,
+  });
+  assert.equal(byContent, false, 'по реальной ширине содержимого — влезает');
+  assert.equal(byScrollWidth, true, 'по scrollWidth — «не влезает», и это ложь');
+  assert.notEqual(
+    byContent, byScrollWidth,
+    'расхождение и есть причина: оба замера обязаны использовать сумму детей',
+  );
+});
+
+test('a stable width gives a stable answer (no oscillation)', () => {
+  // Прямая проверка устойчивости: повторные замеры при неизменной ширине
+  // обязаны давать один и тот же ответ, иначе круг перерисовок неизбежен.
+  const args = { availableWidth: 620, leftWidth: 380, rightWidth: 300 };
+  const answers = new Set([
+    shouldWrapControlBar(args),
+    shouldWrapControlBar(args),
+    shouldWrapControlBar(args),
+  ]);
+  assert.equal(answers.size, 1);
+});

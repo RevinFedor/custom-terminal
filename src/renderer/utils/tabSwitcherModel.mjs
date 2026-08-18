@@ -104,9 +104,16 @@ export function buildSwitcherRows({ projects, globalMru = [], query = '', pinned
 // Missing linked files (file tab whose file vanished from disk) stay VISIBLE
 // with a red icon but are not selectable — stepping jumps over them, exactly
 // like project headers.
+// Строки найденных промптов (поиск по итерациям) выбираются так же, как
+// вкладки: список один, и стрелки не должны знать, чем именно он сейчас
+// наполнен. Заголовок вкладки над найденным — такой же разделитель, как
+// заголовок проекта, и точно так же пропускается.
 export function selectableIndices(rows) {
   const out = [];
-  rows.forEach((row, i) => { if (row.kind === 'tab' && !row.missing) out.push(i); });
+  rows.forEach((row, i) => {
+    if (row.kind === 'iteration') { out.push(i); return; }
+    if (row.kind === 'tab' && !row.missing) out.push(i);
+  });
   return out;
 }
 
@@ -129,7 +136,9 @@ export function initialCtrlIndex(rows, globalMru, activeTabId) {
     if (idx !== undefined) return idx;
   }
   const selectable = selectableIndices(rows);
-  const nonActive = selectable.find(i => rows[i].tab.id !== activeTabId);
+  // initialCtrlIndex вызывается только для Ctrl+Tab, где строк-ходов не бывает;
+  // проверка типа здесь — защита от падения, если список когда-нибудь смешают.
+  const nonActive = selectable.find(i => rows[i].kind === 'tab' && rows[i].tab.id !== activeTabId);
   if (nonActive !== undefined) return nonActive;
   // Nothing but the anchor: the gesture has no destination, so it must select
   // NOTHING rather than fall back to the current tab. Re-activating the tab the

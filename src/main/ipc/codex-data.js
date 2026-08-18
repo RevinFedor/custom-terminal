@@ -22,11 +22,17 @@ const {
 } = require('../codex-process-action-ownership');
 const { promptFingerprint } = require('../claude-prompt-carriers');
 const { classifyCodexTurnRecord } = require('../codex-turn-outcome');
+const { resolveCodexSourceSettingsProof } = require('../codex-source-settings');
 const {
   codexUserCarrierTextsMatch,
   codexUserMessageAuditText,
+  isCodexEnvironmentContextUserText,
 } = require('../codex-prompt-audit');
 const { classifyHistoryAction } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
+const {
+  deriveCodexForkSnapshot,
+  mapTimelineEntryUuidsAcrossFork,
+} = require('../session-history-events');
 const {
   CodexAccountProfileManager,
   DEFAULT_PROFILE_ID,
@@ -1522,6 +1528,19 @@ function compactEventTitle(payload) {
   return payload?.message || payload?.summary || payload?.text || payload?.content || 'Conversation compacted';
 }
 
+// Codex does not currently emit this for encrypted compaction v2, but accept
+// only explicitly post-compact fields if a future protocol adds one. Generic
+// usage.total_tokens is the PRE-compaction window and must never be reused.
+function compactPostTokenCount(payload) {
+  const value = Number(
+    payload?.post_tokens
+    ?? payload?.postTokens
+    ?? payload?.compacted_tokens
+    ?? payload?.compactedTokens,
+  );
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
 function isCompactPayload(payload) {
   const t = String(payload?.type || payload?.name || '').toLowerCase();
   return t === 'compact' ||
@@ -2968,6 +2987,8 @@ function createCodexTimelineProjector(sessionId) {
         content: compactEventTitle(payload),
         sourceLine: record.__line,
         preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
+        postTokens: compactPostTokenCount(payload),
+        compactEncrypted: true,
         sessionId,
         turnIndex: currentTurnIndex,
       });
@@ -2987,15 +3008,17 @@ function createCodexTimelineProjector(sessionId) {
         currentTurnCanonicalUserEntry = null;
       }
       if (payload.type === 'user_message') {
-        // Companion pairing window closes at the next real user turn (same
-        // counter semantics as the old whole-file pre-pass).
-        pendingCompactCompanions = 0;
-        const text = payload.message || extractTextContent(payload.content) || '';
+        const text = codexUserMessageAuditText(record) || '';
         // Service record, not a user turn: a fire-and-forget subagent
         // announces completion via <subagent_notification> inside a user
         // message. Full history feeds it to the card tracker; Timeline must
         // not mint a phantom dot for it.
         if (isCodexSubagentNotification(payload)) return;
+        if (isCodexEnvironmentContextUserText(text)) return;
+        // Companion pairing window closes at the next REAL user turn (same
+        // counter semantics as the old whole-file pre-pass). Injected
+        // environment context above is service input, not that boundary.
+        pendingCompactCompanions = 0;
         const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
           codexUserCarrierTextsMatch(candidate.text, text)
         ));
@@ -3102,6 +3125,8 @@ function createCodexTimelineProjector(sessionId) {
           content: compactEventTitle(payload),
           sourceLine: record.__line,
           preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
+          postTokens: compactPostTokenCount(payload),
+          compactEncrypted: true,
           sessionId,
           turnIndex: currentTurnIndex,
         });
@@ -3112,7 +3137,9 @@ function createCodexTimelineProjector(sessionId) {
     if (record.type === 'response_item') {
       if (payload.type === 'message' && payload.role === 'user') {
         const text = codexUserMessageAuditText(record) || '';
-        if (!text || text.includes('<subagent_notification>')) return;
+        if (!text
+          || text.includes('<subagent_notification>')
+          || isCodexEnvironmentContextUserText(text)) return;
         if (currentTurnCanonicalUserText
           && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, text)) {
           addStableSourceIdentityAlias(
@@ -3286,6 +3313,8 @@ function createCodexHistoryProjector(sessionId) {
         content: 'Conversation compacted',
         compactSummary: compactEventContent(payload),
         preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
+        postTokens: compactPostTokenCount(payload),
+        compactEncrypted: true,
         sessionId,
         turnIndex: currentTurnIndex,
       });
@@ -3308,11 +3337,7 @@ function createCodexHistoryProjector(sessionId) {
       if (payload.type === 'patch_apply_end') {
         attachCodexPatchApplyEvent(pendingCalls, payload, sessionCwd);
       } else if (payload.type === 'user_message') {
-        // The companion pairing window closes at the next real user turn —
-        // reset BEFORE the notification check, mirroring the old pre-pass
-        // which reset on every user_message unconditionally.
-        pendingCompactCompanions = 0;
-        const userText = payload.message || extractTextContent(payload.content) || '';
+        const userText = codexUserMessageAuditText(record) || '';
         // Third subagent completion path: a fire-and-forget child announces
         // its outcome via <subagent_notification> INSIDE a user message —
         // no wait_agent output, no agent_message FINAL_ANSWER ever arrives
@@ -3323,6 +3348,10 @@ function createCodexHistoryProjector(sessionId) {
           subagents.onSubagentNotification(userText);
           return;
         }
+        if (isCodexEnvironmentContextUserText(userText)) return;
+        // The companion pairing window closes at the next REAL user turn.
+        // Codex service carriers above do not create transcript boundaries.
+        pendingCompactCompanions = 0;
         const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
           codexUserCarrierTextsMatch(candidate.text, userText)
         ));
@@ -3383,6 +3412,8 @@ function createCodexHistoryProjector(sessionId) {
           content: 'Conversation compacted',
           compactSummary: compactEventContent(payload),
           preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
+          postTokens: compactPostTokenCount(payload),
+          compactEncrypted: true,
           sessionId,
           turnIndex: currentTurnIndex,
         });
@@ -3406,7 +3437,7 @@ function createCodexHistoryProjector(sessionId) {
         subagents.onSubagentNotification(userText);
         return;
       }
-      if (!userText) return;
+      if (!userText || isCodexEnvironmentContextUserText(userText)) return;
       if (currentTurnCanonicalUserText
         && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, userText)) {
         addStableSourceIdentityAlias(
@@ -4156,16 +4187,16 @@ function removeLastCodexRecordTurns(wrappers, numTurns) {
   if (!requested || requested <= 0) return { removedTurns: [], removedRecords: 0 };
   const turns = [];
   for (let i = wrappers.length - 1; i >= 0; i--) {
-    const tid = wrappers[i]?.turnIndex;
-    if (typeof tid !== 'number') continue;
-    if (!turns.includes(tid)) turns.push(tid);
+    const turnKey = wrappers[i]?.turnKey;
+    if (!Number.isFinite(turnKey)) continue;
+    if (!turns.includes(turnKey)) turns.push(turnKey);
     if (turns.length >= requested) break;
   }
   if (turns.length === 0) return { removedTurns: [], removedRecords: 0 };
   const remove = new Set(turns);
   let removedRecords = 0;
   for (let i = wrappers.length - 1; i >= 0; i--) {
-    if (!remove.has(wrappers[i]?.turnIndex)) continue;
+    if (!remove.has(wrappers[i]?.turnKey)) continue;
     wrappers.splice(i, 1);
     removedRecords += 1;
   }
@@ -4212,7 +4243,26 @@ function codexPendingStartForUserMessage(pending, message) {
       break;
     }
   }
-  if (duplicateIdx < 0) return pending.length;
+  if (duplicateIdx < 0) {
+    // Some Codex protocol generations emit only event_msg/user_message. The
+    // preceding task_started + turn_context still belong to that new turn;
+    // leaving them on the previous turn creates an orphan settings/start pair
+    // after deletion. A task_started is the causal boundary. Without one, only
+    // a trailing turn_context can safely move with the user record.
+    let taskStartedIdx = -1;
+    for (let i = pending.length - 1; i >= 0; i -= 1) {
+      const record = pending[i]?.record;
+      if (record?.type === 'event_msg' && record.payload?.type === 'task_started') {
+        taskStartedIdx = i;
+        break;
+      }
+    }
+    let start = taskStartedIdx >= 0 ? taskStartedIdx : pending.length;
+    while (start > 0 && pending[start - 1]?.record?.type === 'turn_context') {
+      start -= 1;
+    }
+    return start;
+  }
   let start = duplicateIdx;
   while (start > 0) {
     const prev = pending[start - 1]?.record;
@@ -4247,6 +4297,7 @@ function pushCodexVisibleWrapper(wrappers, record, turnIndex, extra = {}) {
   wrappers.push({
     record,
     turnIndex: typeof turnIndex === 'number' && turnIndex >= 0 ? turnIndex : null,
+    turnKey: Number.isFinite(extra.turnKey) ? Number(extra.turnKey) : null,
     line: record?.__line,
     ...extra,
   });
@@ -4257,6 +4308,7 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
   const compactCompanionLines = codexCompactCompanionLines(records);
   const pending = [];
   let currentTurnIndex = -1;
+  let currentTurnKey = null;
 
   const flushPending = (turnIndex) => {
     const fallbackIndex = pending.findIndex((item) => {
@@ -4268,9 +4320,12 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
       const fallbackText = codexUserMessageAuditText(pending[fallbackIndex].record) || '';
       const turnStart = codexPendingStartForUserMessage(pending, fallbackText);
       for (let index = 0; index < turnStart; index += 1) {
-        pushCodexVisibleWrapper(wrappers, pending[index].record, turnIndex);
+        pushCodexVisibleWrapper(wrappers, pending[index].record, turnIndex, {
+          turnKey: currentTurnKey,
+        });
       }
       currentTurnIndex = Math.max(currentTurnIndex, turnIndex) + 1;
+      currentTurnKey = Number(pending[fallbackIndex].record?.__line);
       for (let index = turnStart; index < pending.length; index += 1) {
         const record = pending[index].record;
         pushCodexVisibleWrapper(
@@ -4281,8 +4336,9 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
             ? {
                 sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
                 kind: 'user',
+                turnKey: currentTurnKey,
               }
-            : {},
+            : { turnKey: currentTurnKey },
         );
       }
       pending.length = 0;
@@ -4290,7 +4346,9 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
     }
     while (pending.length > 0) {
       const item = pending.shift();
-      pushCodexVisibleWrapper(wrappers, item.record, turnIndex);
+      pushCodexVisibleWrapper(wrappers, item.record, turnIndex, {
+        turnKey: currentTurnKey,
+      });
     }
   };
 
@@ -4303,24 +4361,44 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
       pending.length = 0;
       removeLastCodexRecordTurns(wrappers, Number(payload.num_turns || payload.turns || 1));
       currentTurnIndex = maxCodexRecordTurnIndex(wrappers);
+      currentTurnKey = [...wrappers].reverse().find((wrapper) => Number.isFinite(wrapper?.turnKey))?.turnKey ?? null;
       continue;
     }
 
     if (record?.type === 'event_msg' && payload.type === 'user_message') {
+      if (isCodexSubagentNotification(payload)) {
+        for (const item of pending) {
+          pushCodexVisibleWrapper(wrappers, item.record, currentTurnIndex, {
+            turnKey: currentTurnKey,
+          });
+        }
+        pending.length = 0;
+        pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+          turnKey: currentTurnKey,
+        });
+        continue;
+      }
       const previousTurnIndex = currentTurnIndex;
+      const previousTurnKey = currentTurnKey;
       currentTurnIndex += 1;
-      const text = payload.message || extractTextContent(payload.content) || '';
+      currentTurnKey = Number(record.__line);
+      const text = codexUserMessageAuditText(record) || '';
       const turnStart = codexPendingStartForUserMessage(pending, text);
       for (let i = 0; i < turnStart; i++) {
-        pushCodexVisibleWrapper(wrappers, pending[i].record, previousTurnIndex);
+        pushCodexVisibleWrapper(wrappers, pending[i].record, previousTurnIndex, {
+          turnKey: previousTurnKey,
+        });
       }
       for (let i = turnStart; i < pending.length; i++) {
-        pushCodexVisibleWrapper(wrappers, pending[i].record, currentTurnIndex);
+        pushCodexVisibleWrapper(wrappers, pending[i].record, currentTurnIndex, {
+          turnKey: currentTurnKey,
+        });
       }
       pending.length = 0;
       pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
         sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
         kind: 'user',
+        turnKey: currentTurnKey,
       });
       continue;
     }
@@ -4338,7 +4416,9 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
       pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
         sourceUuid: stableUuid(sessionId, record.__line, 'codex-compact'),
         kind: 'compact',
+        turnKey: null,
       });
+      currentTurnKey = null;
       continue;
     }
 
@@ -4347,11 +4427,15 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
       pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
         sourceUuid: isTopLevelCompanion ? null : stableUuid(sessionId, record.__line, 'codex-compact'),
         kind: isTopLevelCompanion ? undefined : 'compact',
+        turnKey: null,
       });
+      currentTurnKey = null;
       continue;
     }
 
-    pushCodexVisibleWrapper(wrappers, record, currentTurnIndex);
+    pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+      turnKey: currentTurnKey,
+    });
   }
 
   if (pending.length > 0) {
@@ -4458,7 +4542,153 @@ function rewriteCodexEditedForkMetadata(
   }
 }
 
-async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords) {
+function normalizeCodexHistoryMutationSettingsProof(value, sourceSessionId) {
+  const model = typeof value?.model === 'string' ? value.model.trim() : '';
+  const effort = typeof value?.effort === 'string' ? value.effort.trim().toLowerCase() : '';
+  const proofAt = Number(value?.proofAt);
+  const ownerSessionId = typeof value?.sessionId === 'string' ? value.sessionId.trim() : '';
+  if (!model || !effort || !Number.isFinite(proofAt) || proofAt <= 0) return null;
+  if (ownerSessionId && ownerSessionId !== sourceSessionId) return null;
+  return {
+    model,
+    effort,
+    proofAt,
+    sessionId: sourceSessionId,
+    ...(typeof value?.fast === 'boolean' ? { fast: value.fast } : {}),
+  };
+}
+
+function resolveCodexHistoryMutationSettingsProof(records, sourceSessionId, explicitProof = null) {
+  const normalizedExplicit = normalizeCodexHistoryMutationSettingsProof(explicitProof, sourceSessionId);
+  const source = resolveCodexSourceSettingsProof(records, sourceSessionId);
+  if (source.status === 'found') {
+    const record = records[source.recordIndex];
+    const recordAt = Date.parse(record?.timestamp || '');
+    const sourceProofAt = Number.isFinite(recordAt) && recordAt > 0 ? recordAt : Date.now();
+    const matchingExplicit = normalizedExplicit
+      && normalizedExplicit.model === source.model
+      && normalizedExplicit.effort === source.effort
+      ? normalizedExplicit
+      : null;
+    return {
+      status: 'found',
+      model: source.model,
+      effort: source.effort,
+      proofAt: matchingExplicit
+        ? Math.max(sourceProofAt, matchingExplicit.proofAt)
+        : sourceProofAt,
+      sessionId: sourceSessionId,
+      sourceKind: source.sourceKind,
+      source: 'source-jsonl',
+      ...(matchingExplicit && typeof matchingExplicit.fast === 'boolean'
+        ? { fast: matchingExplicit.fast }
+        : {}),
+    };
+  }
+  if (source.status === 'invalid') return source;
+  if (normalizedExplicit) {
+    return {
+      status: 'found',
+      ...normalizedExplicit,
+      sourceKind: 'renderer-proof',
+      source: 'exact-renderer-proof',
+    };
+  }
+  return source;
+}
+
+function ensureCodexEditedForkSettingsProof(outputRecords, newSessionId, proof, nowIso) {
+  if (!proof || proof.status !== 'found') {
+    return { success: false, error: 'Codex history mutation settings proof is unavailable' };
+  }
+  let resolved = resolveCodexSourceSettingsProof(outputRecords, newSessionId);
+  if (resolved.status === 'found'
+    && resolved.model === proof.model
+    && resolved.effort === proof.effort) {
+    return { success: true, injected: false, proof };
+  }
+  if (resolved.status === 'invalid') {
+    return {
+      success: false,
+      error: 'Codex edited child settings metadata is invalid: ' + (resolved.reason || 'unknown'),
+    };
+  }
+  // Append the carried pair so it is the latest structured settings state of
+  // the edited thread. Inserting near session_meta would let an older retained
+  // turn_context later in the file override it during Resume proof.
+  outputRecords.push({
+    timestamp: nowIso,
+    type: 'event_msg',
+    payload: {
+      type: 'thread_settings_applied',
+      thread_settings: {
+        model: proof.model,
+        reasoning_effort: proof.effort,
+      },
+      source: 'noted-terminal-history-mutation',
+      source_session_id: proof.sessionId,
+      proof_at: proof.proofAt,
+    },
+  });
+  resolved = resolveCodexSourceSettingsProof(outputRecords, newSessionId);
+  if (resolved.status !== 'found'
+    || resolved.model !== proof.model
+    || resolved.effort !== proof.effort) {
+    return {
+      success: false,
+      error: 'Codex edited child settings proof validation failed',
+      status: resolved.status,
+      reason: resolved.reason,
+    };
+  }
+  return { success: true, injected: true, proof };
+}
+
+function persistCodexForkHistoryEvent({
+  sourceSessionId,
+  childSessionId,
+  sourceRecords,
+  outputRecords,
+  occurredAt,
+  forkMode,
+  origin = 'app',
+}) {
+  if (!codexUsageStateStore?.saveSessionForkEvent) return false;
+  const childRecords = (Array.isArray(outputRecords) ? outputRecords : [])
+    .map((record, index) => ({ ...record, __line: index }));
+  const childTimeline = buildCodexTimeline(childRecords, childSessionId);
+  const sourceTimeline = buildCodexTimeline(
+    Array.isArray(sourceRecords) ? sourceRecords : [],
+    sourceSessionId,
+  );
+  const sourceTotalIterations = sourceTimeline.filter((entry) => entry?.type === 'user').length;
+  const event = codexUsageStateStore.saveSessionForkEvent({
+    provider: 'codex',
+    sourceSessionId,
+    childSessionId,
+    entryUuids: childTimeline.map((entry) => entry.uuid).filter(Boolean),
+    boundaryEntryUuid: childTimeline.at(-1)?.uuid || null,
+    snapshotComplete: true,
+    occurredAt,
+    forkMode,
+    origin,
+    isDirect: true,
+    afterIterationIndex: sourceTotalIterations > 0 ? sourceTotalIterations - 1 : null,
+    nextIterationIndex: sourceTotalIterations,
+  });
+  if (codexUsageStateStore.copyTimelineMetadataForMappedFork) {
+    const mappings = mapTimelineEntryUuidsAcrossFork(sourceTimeline, childTimeline);
+    codexUsageStateStore.copyTimelineMetadataForMappedFork(
+      childSessionId,
+      mappings,
+      null,
+    );
+    codexUsageStateStore.markSessionForkMetadataCopied?.(event.eventKey);
+  }
+  return true;
+}
+
+async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords, options = {}) {
   const now = new Date();
   const nowIso = now.toISOString();
   const newSessionId = crypto.randomUUID();
@@ -4474,6 +4704,27 @@ async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords
     newSessionId,
     nowIso,
   );
+  const settingsProof = resolveCodexHistoryMutationSettingsProof(
+    records,
+    sourceSessionId,
+    options.codexSettingsProof,
+  );
+  const settingsReady = settingsProof?.status === 'found'
+    ? ensureCodexEditedForkSettingsProof(
+        outputRecords,
+        newSessionId,
+        settingsProof,
+        nowIso,
+      )
+    : options.requireSettingsProof === true
+      ? { success: false, error: 'Codex history mutation settings proof is unavailable' }
+      : { success: true, injected: false, proof: null };
+  if (!settingsReady.success) {
+    const error = new Error(settingsReady.error);
+    error.code = 'codex_history_mutation_settings_unproven';
+    error.reason = settingsProof?.reason || settingsReady.reason || 'settings-pair-absent';
+    throw error;
+  }
 
   let filePath = '';
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -4481,7 +4732,23 @@ async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords
     filePath = path.join(dir, `rollout-${codexRolloutTimestamp(now)}-${newSessionId}${suffix}.jsonl`);
     try {
       await writeCodexJsonlExclusive(filePath, outputRecords);
-      return { newSessionId, filePath };
+      return {
+        newSessionId,
+        filePath,
+        createdAt: nowIso,
+        ...(settingsProof?.status === 'found'
+          ? {
+              codexSettingsProof: {
+                model: settingsProof.model,
+                effort: settingsProof.effort,
+                proofAt: settingsProof.proofAt,
+                sessionId: newSessionId,
+                ...(typeof settingsProof.fast === 'boolean' ? { fast: settingsProof.fast } : {}),
+              },
+            }
+          : {}),
+        settingsProofInjected: settingsReady.injected === true,
+      };
     } catch (error) {
       if (error && error.code === 'EEXIST') continue;
       throw error;
@@ -4516,6 +4783,60 @@ function createCodexReplacementRecords(compactText, timestamp = new Date().toISO
   ];
 }
 
+function codexTimelineSemanticEntry(entry) {
+  return {
+    type: entry?.type || 'unknown',
+    content: normalizeCodexText(entry?.content || ''),
+    compactSummary: normalizeCodexText(entry?.compactSummary || ''),
+    hasImage: entry?.hasImage === true,
+  };
+}
+
+function validateCodexRangeRewriteProjection({
+  sourceTimeline,
+  outputRecords,
+  minIndex,
+  maxIndex,
+  replacementText,
+}) {
+  const expected = sourceTimeline
+    .filter((_entry, index) => index < minIndex || index > maxIndex)
+    .map(codexTimelineSemanticEntry);
+  if (replacementText) {
+    expected.splice(minIndex, 0, {
+      type: 'user',
+      content: normalizeCodexText(replacementText),
+      compactSummary: '',
+      hasImage: false,
+    });
+  }
+  const projectedRecords = outputRecords.map((record, index) => ({
+    ...record,
+    __line: index,
+  }));
+  const actual = buildCodexTimeline(projectedRecords, 'codex-range-validation')
+    .map(codexTimelineSemanticEntry);
+  if (actual.length !== expected.length) {
+    return {
+      success: false,
+      error: 'Codex range rewrite projection count mismatch',
+      expectedCount: expected.length,
+      actualCount: actual.length,
+    };
+  }
+  for (let index = 0; index < expected.length; index += 1) {
+    if (JSON.stringify(actual[index]) === JSON.stringify(expected[index])) continue;
+    return {
+      success: false,
+      error: 'Codex range rewrite projection content mismatch',
+      mismatchIndex: index,
+      expected: expected[index],
+      actual: actual[index],
+    };
+  }
+  return { success: true, expectedCount: expected.length, actualCount: actual.length };
+}
+
 function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replacementText = null) {
   const timeline = buildCodexTimeline(records, sessionId);
   const startIndex = timeline.findIndex((entry) => entry.uuid === startUuid);
@@ -4525,26 +4846,70 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
   }
 
   const minIndex = Math.min(startIndex, endIndex);
-  const maxIndex = Math.max(startIndex, endIndex);
+  let maxIndex = Math.max(startIndex, endIndex);
+  // A rewrite from the first visible entry is a new root. Any compact snapshot
+  // immediately following the selected prefix still describes that deleted
+  // root and cannot lead the first retained user turn. Middle-range deletes do
+  // not use this expansion: their following compact remains valid and must stay.
+  if (minIndex === 0) {
+    while (timeline[maxIndex + 1]?.type === 'compact') maxIndex += 1;
+  }
   const selected = timeline.slice(minIndex, maxIndex + 1);
 
   const selectedTurns = new Set();
+  const selectedTurnKeys = new Set();
   const selectedCompacts = new Set();
+  const wrappers = buildCodexVisibleRecordWrappers(records, sessionId);
+  const canonicalByUuid = new Map(
+    wrappers
+      .filter((wrapper) => wrapper.sourceUuid)
+      .map((wrapper) => [wrapper.sourceUuid, wrapper]),
+  );
+  const selectedUserUuids = new Set();
   for (const entry of selected) {
-    if (entry.type === 'compact') selectedCompacts.add(entry.uuid);
-    else if (typeof entry.turnIndex === 'number') selectedTurns.add(entry.turnIndex);
+    if (entry.type === 'compact') {
+      selectedCompacts.add(entry.uuid);
+      continue;
+    }
+    if (entry.type !== 'user') continue;
+    const canonical = canonicalByUuid.get(entry.uuid);
+    if (!canonical || canonical.kind !== 'user' || !Number.isFinite(canonical.turnKey)) {
+      return {
+        success: false,
+        error: 'Selected Codex user turn has no exact rollout identity',
+        entryUuid: entry.uuid,
+      };
+    }
+    selectedUserUuids.add(entry.uuid);
+    selectedTurnKeys.add(Number(canonical.turnKey));
+    if (typeof entry.turnIndex === 'number') selectedTurns.add(entry.turnIndex);
   }
-  if (selectedTurns.size === 0 && selectedCompacts.size === 0) {
+  if (selectedTurnKeys.size !== selectedUserUuids.size) {
+    return {
+      success: false,
+      error: 'Selected Codex turns have ambiguous rollout identities',
+      selectedUsers: selectedUserUuids.size,
+      selectedTurnKeys: selectedTurnKeys.size,
+    };
+  }
+  if (selectedTurnKeys.size === 0 && selectedCompacts.size === 0) {
     return { success: false, error: 'Selected range has no editable Codex turns' };
   }
 
-  const wrappers = buildCodexVisibleRecordWrappers(records, sessionId);
   const selectedCompactLines = new Set(
     wrappers
       .filter((wrapper) => wrapper.sourceUuid && selectedCompacts.has(wrapper.sourceUuid))
       .map((wrapper) => Number(wrapper.line))
       .filter((line) => Number.isFinite(line))
   );
+  if (selectedCompactLines.size !== selectedCompacts.size) {
+    return {
+      success: false,
+      error: 'Selected Codex compact has no exact rollout identity',
+      selectedCompacts: selectedCompacts.size,
+      selectedCompactLines: selectedCompactLines.size,
+    };
+  }
   const isSelectedCompactCompanion = (wrapper) => {
     if (!isCodexCompactRecord(wrapper.record)) return false;
     const line = Number(wrapper.line);
@@ -4555,7 +4920,7 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     return false;
   };
   const shouldRemoveWrapper = (wrapper) => {
-    if (typeof wrapper.turnIndex === 'number' && selectedTurns.has(wrapper.turnIndex)) return true;
+    if (Number.isFinite(wrapper.turnKey) && selectedTurnKeys.has(Number(wrapper.turnKey))) return true;
     if (wrapper.sourceUuid && selectedCompacts.has(wrapper.sourceUuid)) return true;
     return isSelectedCompactCompanion(wrapper);
   };
@@ -4582,6 +4947,7 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
   let inserted = false;
   let removedRecords = 0;
   let removedUsers = 0;
+  const removedUserUuids = new Set();
 
   for (const wrapper of wrappers) {
     const shouldRemove = shouldRemoveWrapper(wrapper);
@@ -4591,7 +4957,10 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
         inserted = true;
       }
       removedRecords += 1;
-      if (wrapper.kind === 'user') removedUsers += 1;
+      if (wrapper.kind === 'user') {
+        removedUsers += 1;
+        if (wrapper.sourceUuid) removedUserUuids.add(wrapper.sourceUuid);
+      }
       continue;
     }
     outputRecords.push(cloneCodexRecordForWrite(wrapper.record));
@@ -4601,6 +4970,26 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     for (const replacement of replacementRecords) outputRecords.push(replacement);
   }
 
+  if (removedUsers !== selectedUserUuids.size
+    || removedUserUuids.size !== selectedUserUuids.size
+    || [...selectedUserUuids].some((uuid) => !removedUserUuids.has(uuid))) {
+    return {
+      success: false,
+      error: 'Codex range rewrite user identity validation failed',
+      selectedUsers: selectedUserUuids.size,
+      removedUsers,
+      removedUserUuids: [...removedUserUuids],
+    };
+  }
+  const projection = validateCodexRangeRewriteProjection({
+    sourceTimeline: timeline,
+    outputRecords,
+    minIndex,
+    maxIndex,
+    replacementText,
+  });
+  if (!projection.success) return projection;
+
   return {
     success: true,
     outputRecords,
@@ -4609,7 +4998,9 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     removedUsers,
     selectedCount: selected.length,
     selectedTurns: Array.from(selectedTurns),
+    selectedTurnKeys: Array.from(selectedTurnKeys),
     selectedCompacts: Array.from(selectedCompacts),
+    expectedRemainingCount: projection.expectedCount,
   };
 }
 
@@ -4663,7 +5054,21 @@ async function forkCodexFromLatestCompact({ sessionId, cwd }) {
     sessionId,
     cwd,
     plan.outputRecords,
+    { forkMode: 'latest_compact' },
   );
+  let historyEventPersisted = false;
+  try {
+    historyEventPersisted = persistCodexForkHistoryEvent({
+      sourceSessionId: sessionId,
+      childSessionId: result.newSessionId,
+      sourceRecords: loaded.records,
+      outputRecords: plan.outputRecords,
+      occurredAt: result.createdAt,
+      forkMode: 'latest_compact',
+    });
+  } catch (historyEventError) {
+    console.warn('[CodexData] compact fork history event persist failed child=' + result.newSessionId.slice(0, 8) + ': ' + historyEventError.message);
+  }
   return {
     success: true,
     newSessionId: result.newSessionId,
@@ -4673,10 +5078,19 @@ async function forkCodexFromLatestCompact({ sessionId, cwd }) {
     compactLine: plan.compactLine,
     removedRecordCount: plan.removedRecordCount,
     retainedRecordCount: plan.retainedRecordCount,
+    historyEventPersisted,
   };
 }
 
-async function editCodexRange({ sessionId, cwd, startUuid, endUuid, compactText }) {
+async function editCodexRange({
+  sessionId,
+  cwd,
+  startUuid,
+  endUuid,
+  compactText,
+  codexSettingsProof = null,
+  validateOnly = false,
+}) {
   const replacementText = String(compactText || '').trim();
   if (!sessionId) return { success: false, error: 'sessionId required' };
   if (!startUuid || !endUuid) return { success: false, error: 'startUuid/endUuid required' };
@@ -4693,14 +5107,84 @@ async function editCodexRange({ sessionId, cwd, startUuid, endUuid, compactText 
     replacementText
   );
   if (!plan.success) return plan;
+  const effectiveSettingsProof = resolveCodexHistoryMutationSettingsProof(
+    loaded.records,
+    sessionId,
+    codexSettingsProof,
+  );
+  if (effectiveSettingsProof.status !== 'found') {
+    return {
+      success: false,
+      error: 'Codex history mutation settings proof is unavailable',
+      code: 'codex_history_mutation_settings_unproven',
+      reason: effectiveSettingsProof.reason || 'settings-pair-absent',
+    };
+  }
+
+  console.log('[CodexRangeRewrite] operation=edit source=' + String(sessionId).slice(0, 8)
+    + ' selected=' + plan.selectedCount
+    + ' users=' + plan.removedUsers
+    + ' rawRecords=' + plan.removedCount
+    + ' expectedRemaining=' + plan.expectedRemainingCount);
+  if (validateOnly === true) {
+    return {
+      success: true,
+      validationOnly: true,
+      removedCount: plan.removedCount,
+      removedUsers: plan.removedUsers,
+      selectedCount: plan.selectedCount,
+      expectedRemainingCount: plan.expectedRemainingCount,
+      codexSettingsProof: effectiveSettingsProof,
+    };
+  }
 
   const replacementEventRecord = plan.replacementRecords.find(
     (record) => record.type === 'event_msg' && record.payload?.type === 'user_message'
   );
-  const result = await writeCodexEditedFork(loaded.records, sessionId, cwd, plan.outputRecords);
+  let result;
+  try {
+    result = await writeCodexEditedFork(loaded.records, sessionId, cwd, plan.outputRecords, {
+      codexSettingsProof: effectiveSettingsProof,
+      requireSettingsProof: true,
+      forkMode: 'history_edit',
+    });
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error),
+      code: error?.code || null,
+      reason: error?.reason || null,
+    };
+  }
   const outputRecords = plan.outputRecords;
+  const rewrittenRecords = outputRecords.map((record, index) => ({ ...record, __line: index }));
+  const remainingTimeline = buildCodexTimeline(rewrittenRecords, result.newSessionId);
+  if (remainingTimeline.length !== plan.expectedRemainingCount) {
+    await fs.promises.unlink(result.filePath).catch(() => {});
+    invalidateCodexJsonlCache(result.filePath);
+    return {
+      success: false,
+      error: 'Codex edited child failed post-write Timeline validation',
+      code: 'codex_history_mutation_postwrite_validation_failed',
+      expectedRemainingCount: plan.expectedRemainingCount,
+      actualRemainingCount: remainingTimeline.length,
+    };
+  }
   const finalLine = outputRecords.findIndex((record) => record === replacementEventRecord);
   const replacementUuid = finalLine >= 0 ? stableUuid(result.newSessionId, finalLine, 'codex-user') : null;
+  let historyEventPersisted = false;
+  try {
+    historyEventPersisted = persistCodexForkHistoryEvent({
+      sourceSessionId: sessionId,
+      childSessionId: result.newSessionId,
+      sourceRecords: loaded.records,
+      outputRecords,
+      occurredAt: result.createdAt,
+      forkMode: 'history_edit',
+    });
+  } catch (historyEventError) {
+    console.warn('[CodexData] edited fork history event persist failed child=' + result.newSessionId.slice(0, 8) + ': ' + historyEventError.message);
+  }
 
   return {
     success: true,
@@ -4714,10 +5198,22 @@ async function editCodexRange({ sessionId, cwd, startUuid, endUuid, compactText 
     selectedCount: plan.selectedCount,
     selectedTurns: plan.selectedTurns,
     selectedCompacts: plan.selectedCompacts,
+    codexSettingsProof: result.codexSettingsProof,
+    settingsProofInjected: result.settingsProofInjected,
+    expectedRemainingCount: plan.expectedRemainingCount,
+    remainingCount: remainingTimeline.length,
+    historyEventPersisted,
   };
 }
 
-async function deleteCodexRange({ sessionId, cwd, startUuid, endUuid }) {
+async function deleteCodexRange({
+  sessionId,
+  cwd,
+  startUuid,
+  endUuid,
+  codexSettingsProof = null,
+  validateOnly = false,
+}) {
   if (!sessionId) return { success: false, error: 'sessionId required' };
   if (!startUuid || !endUuid) return { success: false, error: 'startUuid/endUuid required' };
 
@@ -4731,10 +5227,81 @@ async function deleteCodexRange({ sessionId, cwd, startUuid, endUuid }) {
     endUuid
   );
   if (!plan.success) return plan;
+  const effectiveSettingsProof = resolveCodexHistoryMutationSettingsProof(
+    loaded.records,
+    sessionId,
+    codexSettingsProof,
+  );
+  if (effectiveSettingsProof.status !== 'found') {
+    return {
+      success: false,
+      error: 'Codex history mutation settings proof is unavailable',
+      code: 'codex_history_mutation_settings_unproven',
+      reason: effectiveSettingsProof.reason || 'settings-pair-absent',
+    };
+  }
 
-  const result = await writeCodexEditedFork(loaded.records, sessionId, cwd, plan.outputRecords);
+  console.log('[CodexRangeRewrite] operation=delete source=' + String(sessionId).slice(0, 8)
+    + ' selected=' + plan.selectedCount
+    + ' users=' + plan.removedUsers
+    + ' rawRecords=' + plan.removedCount
+    + ' turnKeys=' + plan.selectedTurnKeys.join(',')
+    + ' expectedRemaining=' + plan.expectedRemainingCount);
+  if (validateOnly === true) {
+    return {
+      success: true,
+      validationOnly: true,
+      removedCount: plan.removedCount,
+      removedUsers: plan.removedUsers,
+      selectedCount: plan.selectedCount,
+      selectedTurnKeys: plan.selectedTurnKeys,
+      selectedCompacts: plan.selectedCompacts,
+      expectedRemainingCount: plan.expectedRemainingCount,
+      codexSettingsProof: effectiveSettingsProof,
+    };
+  }
+
+  let result;
+  try {
+    result = await writeCodexEditedFork(loaded.records, sessionId, cwd, plan.outputRecords, {
+      codexSettingsProof: effectiveSettingsProof,
+      requireSettingsProof: true,
+      forkMode: 'history_delete',
+    });
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error),
+      code: error?.code || null,
+      reason: error?.reason || null,
+    };
+  }
   const rewrittenRecords = plan.outputRecords.map((record, index) => ({ ...record, __line: index }));
   const remainingTimeline = buildCodexTimeline(rewrittenRecords, result.newSessionId);
+  if (remainingTimeline.length !== plan.expectedRemainingCount) {
+    await fs.promises.unlink(result.filePath).catch(() => {});
+    invalidateCodexJsonlCache(result.filePath);
+    return {
+      success: false,
+      error: 'Codex deleted child failed post-write Timeline validation',
+      code: 'codex_history_mutation_postwrite_validation_failed',
+      expectedRemainingCount: plan.expectedRemainingCount,
+      actualRemainingCount: remainingTimeline.length,
+    };
+  }
+  let historyEventPersisted = false;
+  try {
+    historyEventPersisted = persistCodexForkHistoryEvent({
+      sourceSessionId: sessionId,
+      childSessionId: result.newSessionId,
+      sourceRecords: loaded.records,
+      outputRecords: plan.outputRecords,
+      occurredAt: result.createdAt,
+      forkMode: 'history_delete',
+    });
+  } catch (historyEventError) {
+    console.warn('[CodexData] deleted fork history event persist failed child=' + result.newSessionId.slice(0, 8) + ': ' + historyEventError.message);
+  }
 
   return {
     success: true,
@@ -4746,9 +5313,14 @@ async function deleteCodexRange({ sessionId, cwd, startUuid, endUuid }) {
     selectedCount: plan.selectedCount,
     selectedTurns: plan.selectedTurns,
     selectedCompacts: plan.selectedCompacts,
+    selectedTurnKeys: plan.selectedTurnKeys,
     remainingCount: remainingTimeline.length,
     remainingUsers: remainingTimeline.filter((entry) => entry.type === 'user').length,
     fileDeleted: false,
+    codexSettingsProof: result.codexSettingsProof,
+    settingsProofInjected: result.settingsProofInjected,
+    expectedRemainingCount: plan.expectedRemainingCount,
+    historyEventPersisted,
   };
 }
 
@@ -4816,6 +5388,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
         // keep the same boundary or it drops the final assistant tail.
         if (isCodexSubagentNotification(payload)) continue;
         const userText = payload.message || extractTextContent(payload.content) || '';
+        if (isCodexEnvironmentContextUserText(userText)) continue;
         const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
           codexUserCarrierTextsMatch(candidate.text, userText)
         ));
@@ -4863,7 +5436,9 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
 
     if (payload.type === 'message' && payload.role === 'user') {
       const userText = codexUserMessageAuditText(record) || '';
-      if (!userText || userText.includes('<subagent_notification>')) continue;
+      if (!userText
+        || userText.includes('<subagent_notification>')
+        || isCodexEnvironmentContextUserText(userText)) continue;
       if (currentTurnCanonicalUserText
         && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, userText)) {
         continue;
@@ -5233,7 +5808,7 @@ function buildCodexProviderTurnAssistantResult(
     if ((lowerBound || upperBound) && !Number.isFinite(timestampMs)) continue;
     if (lowerBound && timestampMs < lowerBound) continue;
     if (upperBound && timestampMs > upperBound) continue;
-    const text = payload.message || extractTextContent(payload.content) || '';
+    const text = codexUserMessageAuditText(record) || '';
     if (promptFingerprint(text) === expectedPromptHash) {
       promptCandidates.push({ index, record, userUuid });
     }
@@ -7545,10 +8120,32 @@ function register({ projectManager, transcriptService } = {}) {
       // the storm that evicted the active session from the records cache.
       const projected = await projectCodexTimelineFromFile(sessionId, cwd);
       if (!projected.success) return projected;
+      let historyEventPersisted = false;
+      try {
+        const snapshot = deriveCodexForkSnapshot(projected.entries, projected.sessionMeta);
+        if (snapshot && codexUsageStateStore?.saveSessionForkEvent) {
+          codexUsageStateStore.saveSessionForkEvent({
+            provider: 'codex',
+            sourceSessionId: snapshot.sourceSessionId,
+            childSessionId: sessionId,
+            entryUuids: snapshot.entryUuids,
+            boundaryEntryUuid: snapshot.boundaryEntryUuid,
+            snapshotComplete: snapshot.snapshotComplete,
+            occurredAt: snapshot.occurredAt,
+            forkMode: 'unknown',
+            origin: 'transcript',
+            isDirect: true,
+          });
+          historyEventPersisted = true;
+        }
+      } catch (historyEventError) {
+        console.warn('[CodexData] timeline fork event reconcile failed session=' + String(sessionId).slice(0, 8) + ': ' + historyEventError.message);
+      }
       return {
         success: true,
         entries: projected.entries,
         sessionMeta: projected.sessionMeta,
+        historyEventPersisted,
         sessionBoundaries: [],
         claudeMemoryBoundaryUuid: null,
         filePath: projected.filePath,
@@ -7650,7 +8247,12 @@ function register({ projectManager, transcriptService } = {}) {
       return await editCodexRange(params);
     } catch (error) {
       console.error('[CodexData] edit-range error:', error);
-      return { success: false, error: error.message };
+      return {
+        success: false,
+        error: error.message,
+        code: error.code || null,
+        reason: error.reason || null,
+      };
     }
   });
 
@@ -7659,7 +8261,12 @@ function register({ projectManager, transcriptService } = {}) {
       return await deleteCodexRange(params);
     } catch (error) {
       console.error('[CodexData] delete-range error:', error);
-      return { success: false, error: error.message };
+      return {
+        success: false,
+        error: error.message,
+        code: error.code || null,
+        reason: error.reason || null,
+      };
     }
   });
 
@@ -7952,8 +8559,11 @@ module.exports = {
     findCodexPromptExecutionContext,
     buildCodexVisibleRecordWrappers,
     planCodexRangeRewrite,
+    validateCodexRangeRewriteProjection,
     planCodexForkFromLatestCompact,
     rewriteCodexEditedForkMetadata,
+    resolveCodexHistoryMutationSettingsProof,
+    ensureCodexEditedForkSettingsProof,
     writeCodexJsonlExclusive,
     editCodexRange,
     deleteCodexRange,

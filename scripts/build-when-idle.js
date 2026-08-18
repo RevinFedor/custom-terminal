@@ -23,16 +23,12 @@
 //   NO_BUILD=1             just watch + report, never trigger the build
 //   PORT=7878              skip discovery, force this port (127.0.0.1)
 
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 const http = require('http');
-const { execSync, spawn } = require('child_process');
-
-const HOME = os.homedir();
-const DISCOVERY_DIR = path.join(HOME, '.noted-terminal');
-const TOKEN_PATH = path.join(DISCOVERY_DIR, 'web-token.txt');
-const PROD_APP_MARKER = '/Applications/Noted Terminal.app';
+const { spawn } = require('child_process');
+const {
+  findProdServer: findDiscoveredProdServer,
+  readToken,
+} = require('./noted-prod-api');
 
 const POLL_MS = parseInt(process.env.POLL_MS || '', 10) || 1000;
 const IDLE_CONFIRM = parseInt(process.env.IDLE_CONFIRM || '', 10) || 2;
@@ -46,39 +42,13 @@ const C = {
 };
 
 function now() { return new Date().toTimeString().slice(0, 8); }
-function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
-function pidCommand(pid) {
-  try { return execSync('ps -p ' + pid + ' -o command=', { encoding: 'utf8', timeout: 1500 }).trim(); }
-  catch { return ''; }
-}
-
-function readToken() {
-  try { return fs.readFileSync(TOKEN_PATH, 'utf8').trim(); }
-  catch { return null; }
-}
-
 // Find the live PRODUCTION web-server instance. The discovery dir accumulates
 // hundreds of stale web-server-<pid>.json files (the app never deletes them on
 // crash) — so we filter to: PID still alive AND its process command points at
 // the installed /Applications app (excludes electron-vite dev instances on
 // 7979). Newest updatedAt wins if somehow more than one prod copy runs.
 function findProdServer() {
-  if (FORCE_PORT) return { port: FORCE_PORT, pid: null, cmd: '(forced)', forced: true };
-  let files = [];
-  try { files = fs.readdirSync(DISCOVERY_DIR).filter((f) => /^web-server-\d+\.json$/.test(f)); }
-  catch { return null; }
-  const candidates = [];
-  for (const f of files) {
-    let j;
-    try { j = JSON.parse(fs.readFileSync(path.join(DISCOVERY_DIR, f), 'utf8')); } catch { continue; }
-    if (!j.pid || !j.port) continue;
-    if (!pidAlive(j.pid)) continue;
-    const cmd = pidCommand(j.pid);
-    if (!cmd.includes(PROD_APP_MARKER)) continue; // dev / unrelated / dead-but-reused PID
-    candidates.push({ port: j.port, pid: j.pid, updatedAt: j.updatedAt || 0, cmd });
-  }
-  candidates.sort((a, b) => b.updatedAt - a.updatedAt);
-  return candidates[0] || null;
+  return findDiscoveredProdServer({ forcePort: FORCE_PORT });
 }
 
 // A dedicated sentinel for "this running build predates the feature": the old
@@ -163,7 +133,7 @@ function runBuild() {
 async function main() {
   const token = readToken();
   if (!token) {
-    console.error(C.red + 'No web token at ' + TOKEN_PATH + C.reset);
+    console.error(C.red + 'No Noted Terminal web token found.' + C.reset);
     console.error(C.gray + 'Is Noted Terminal installed and launched at least once?' + C.reset);
     process.exit(1);
   }

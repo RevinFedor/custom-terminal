@@ -55,7 +55,7 @@ SQLite-схема приложения, философия «проект как
 | `wasInterrupted` flag | JSON-метаданные табов | 500мс |
 | Emergency save (beforeunload) | SQLite | синхронный `ipcRenderer.sendSync` |
 
-External Codex run metadata (`externalRun`) — не runtime-only. Она хранит источник внешнего запроса, collapse-state и настройки `autoStopMs`/`autoCloseMs`, поэтому должна сериализоваться в `tabs.external_run` тем же путём, что tab metadata. Иначе после hot reload/restart Inbox-вкладка остаётся `Codex · ...`, но ProjectToolbar не видит, что это external run, и кнопка настроек исчезает с Home-вида.
+External Codex run metadata (`externalRun`) — не runtime-only. Она хранит источник внешнего запроса, collapse-state и настройки `autoStopMs`/`autoCloseMs`, поэтому должна сериализоваться в `tabs.external_run` тем же путём, что tab metadata. Иначе после hot reload/restart Inbox-вкладка остаётся `Codex · ...`, но кнопки рабочей области в шапке не видят, что это external run, и кнопка настроек исчезает с Home-вида.
 
 **Emergency save**: на `beforeunload` используется `sendSync` вместо `invoke` — гарантия записи до закрытия окна, даже при ценой UI-блока на 50мс.
 

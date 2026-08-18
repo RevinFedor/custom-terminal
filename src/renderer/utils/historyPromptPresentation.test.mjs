@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  historyEntryHasExactIdentity,
   matchesHistoryPromptAdoption,
   matchesHistoryPromptSuppression,
   resolveHistoryPromptHandoffPresentationSession,
@@ -126,6 +127,33 @@ test('source identity is the strongest exact adoption proof', () => {
     requiresAuditIdentity: true,
     sourceIdentity: 'codex-user-source-session-a-2048',
   }), false);
+});
+
+test('a promoted Codex carrier keeps exact adoption through its source alias', () => {
+  const entry = {
+    uuid: 'canonical-event-row',
+    role: 'user',
+    normalizedText: 'same prompt',
+    timestamp: '2026-08-17T14:27:54.422Z',
+    sessionId: 'session-a',
+    sourceIdentity: 'codex-user-source-session-a-event',
+    sourceIdentityAliases: ['codex-user-source-session-a-response'],
+  };
+  assert.equal(historyEntryHasExactIdentity(
+    entry,
+    'codex-user-source-session-a-response',
+  ), true);
+  assert.equal(matchesHistoryPromptAdoption(entry, {
+    normalizedText: 'same prompt',
+    requiresAuditIdentity: true,
+    sourceIdentity: 'codex-user-source-session-a-response',
+  }), true);
+  assert.equal(matchesHistoryPromptSuppression(entry, {
+    normalizedText: 'same prompt',
+    requiresAuditIdentity: true,
+    sourceIdentity: 'codex-user-source-session-a-response',
+  }), true);
+  assert.equal(historyEntryHasExactIdentity(entry, 'foreign-source'), false);
 });
 
 test('exact source identity adopts and suppresses the same record despite provider text normalization', () => {

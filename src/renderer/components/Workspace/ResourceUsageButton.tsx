@@ -56,6 +56,13 @@ type MetricsPayload = {
 
 type Mode = 'memory' | 'cpu';
 
+// Самая длинная подпись, которую эта кнопка может показать: «99.99 ГБ» —
+// два знака до точки, два после, пробел и две буквы. `ch` берёт ширину цифры
+// текущего шрифта, а `tabular-nums` на кнопке делает все цифры одинаковыми,
+// поэтому мерка держится и на другом размере шрифта. Единица «ГБ» шире цифры,
+// отсюда небольшой запас.
+const RESOURCE_CHIP_VALUE_WIDTH_CH = '7.6ch';
+
 function formatBytes(bytes: number): string {
   if (!bytes || bytes < 0) return '0 МБ';
   const mb = bytes / 1048576;
@@ -214,7 +221,20 @@ const ResourceUsageButton: React.FC = () => {
           }}
         >
           <Activity size={11} />
-          <span>{chipValue}</span>
+          {/* Место под число зарезервировано ЗАРАНЕЕ, а не подгоняется под
+              текущее значение: кнопка стоит в ряду других, и когда число
+              меняется каждые пару секунд («980 МБ» → «1.02 ГБ»), меняющаяся
+              ширина двигает всё, что справа. Ширина берётся от самой длинной
+              подписи, какая тут вообще бывает — «99.99 ГБ». */}
+          <span
+            style={{
+              display: 'inline-flex',
+              justifyContent: 'flex-end',
+              minWidth: RESOURCE_CHIP_VALUE_WIDTH_CH,
+            }}
+          >
+            {chipValue}
+          </span>
           {orphanCount > 0 && (
             <span style={{ color: '#fca5a5' }}>·{orphanCount}</span>
           )}

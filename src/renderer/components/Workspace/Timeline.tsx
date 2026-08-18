@@ -25,8 +25,11 @@ import {
   useTimelineOutlineStore,
   type TimelineSemanticGroup,
 } from '../../store/useTimelineOutlineStore';
-import { buildCodexRunPayload } from '../../utils/codexLaunch';
-import { requireConfirmedCodexWriter } from '../../utils/codexWriterIdentity';
+import {
+  buildCodexRunPayload,
+  buildCodexHistoryMutationResumePayload,
+  getCodexHistoryMutationSettingsProof,
+} from '../../utils/codexLaunch';
 import { requireCommittedCodexRewind } from '../../utils/codexRewindCommit';
 import {
   prepareCodexRewindRuntime,
@@ -55,9 +58,16 @@ import {
 import {
   normalizeForkMarkerEntryUuids,
   normalizeForkMarkers,
+  resolveForkMarkerBoundary,
+  selectDirectForkMarker,
 } from '../../utils/forkMarkerSnapshot.mjs';
 import { buildClaudeRewindPromptProjection } from '../../utils/composerChips.mjs';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
+import { stopClaudePtyProcess } from '../../utils/claudePtyActions';
+import {
+  executeHistoryRewriteRewindScenario,
+  HistoryRewriteRewindError,
+} from '../../utils/historyRewriteRewind';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 
@@ -89,6 +99,7 @@ const REWIND_BUSY_GUARD_RE = /\bis busy; wait for the current turn before rewind
 // real found/failed ack that follows. This timer only covers "the panel never
 // answered at all" (e.g. no session).
 const HISTORY_SCROLL_SAFETY_TIMEOUT_MS = 22000;
+const DELETE_PREFIX_STRONG_CONFIRM_THRESHOLD = 20;
 const EXPANDED_PREVIEW_CHARS_PER_LINE = 180;
 const EXPANDED_PREVIEW_MIN_CHARS = 240;
 const EXPANDED_PREVIEW_MAX_CHARS = 1800;
@@ -294,6 +305,8 @@ interface TimelineEntry {
   isCompactSummary?: boolean;
   compactSummary?: string;
   preTokens?: number;
+  postTokens?: number;
+  compactEncrypted?: boolean;
   hasImage?: boolean;
   sessionId?: string;
   isPlan?: boolean;
@@ -523,6 +536,14 @@ interface ForkMarker {
   fork_session_id: string;
   entry_uuids: string[];  // Snapshot of all entry UUIDs at fork time
   hidden?: boolean;        // Soft-deleted: stripe hidden but snapshot kept for boundary suppression
+  provider?: 'claude' | 'codex';
+  is_direct?: boolean;
+  snapshot_complete?: boolean;
+  fork_mode?: string | null;
+  source_tab_id?: string | null;
+  child_tab_id?: string | null;
+  visual_parent_tab_id?: string | null;
+  orchestration_run_id?: string | null;
 }
 
 // Extract search text from entry content for terminal buffer search.
@@ -1220,6 +1241,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
       {/* Fork marker — not navigable; Cmd+hover opens the fork tooltip. */}
       {forkMarkerVisible && (
         <div
+          data-timeline-fork-marker="boundary"
           className="flex-shrink-0 w-full flex items-center justify-center relative"
           style={{ height: '8px', cursor: isCmdHeld ? 'pointer' : 'default', padding: '6px 0', boxSizing: 'content-box' }}
           onClick={(e) => { e.stopPropagation(); api.flashStripFailed(index, 'fork'); }}
@@ -1398,6 +1420,9 @@ function Timeline({
   const [expandedDocsSearch, setExpandedDocsSearch] = useState<Set<string>>(new Set());
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const selectionStartIdRef = useRef<string | null>(null);
+  const [queuedRewindTargetRequest, setQueuedRewindTargetRequest] = useState<{
+    requestId: string;
+  } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry, source?: 'dot' | 'segment', anchorY?: number } | null>(null);
   const [refreshingActionUuid, setRefreshingActionUuid] = useState<string | null>(null);
   const [sessionBoundaries, setSessionBoundaries] = useState<SessionBoundary[]>([]);
@@ -1439,6 +1464,60 @@ function Timeline({
   const [rewindLoadingMenu, setRewindLoadingMenu] = useState<{ x: number; y: number } | null>(null);
   const [rewindAgentPresence, setRewindAgentPresence] = useState<AgentPtyPresence | null>(null);
   const rewindAgentStatus: AgentPtyStatus | null = rewindAgentPresence?.status || null;
+
+  useEffect(() => {
+    const onRequest = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string; requestId?: string }>).detail;
+      if (!detail || detail.tabId !== tabId || !detail.requestId) return;
+      if (readOnly || !sessionId || (toolType !== 'claude' && toolType !== 'codex')) {
+        useUIStore.getState().showToast(
+          'Rewind нельзя добавить: у Timeline нет доступной AI-сессии',
+          'warning',
+          2600,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          tabId,
+        );
+        window.dispatchEvent(new CustomEvent('prompt-queue:rewind-target-cancelled', {
+          detail: { tabId, requestId: detail.requestId },
+        }));
+        return;
+      }
+      setQueuedRewindTargetRequest((current) => {
+        if (current && current.requestId !== detail.requestId) {
+          window.dispatchEvent(new CustomEvent('prompt-queue:rewind-target-cancelled', {
+            detail: { tabId, requestId: current.requestId },
+          }));
+        }
+        return { requestId: detail.requestId };
+      });
+      selectionStartIdRef.current = null;
+      setSelectionStartId(null);
+      setContextMenu(null);
+      setRangeActionMenu(null);
+      setActiveTooltipIndex(null);
+    };
+    window.addEventListener('prompt-queue:request-rewind-target', onRequest);
+    return () => window.removeEventListener('prompt-queue:request-rewind-target', onRequest);
+  }, [readOnly, sessionId, tabId, toolType]);
+
+  useEffect(() => {
+    if (!queuedRewindTargetRequest) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      const requestId = queuedRewindTargetRequest.requestId;
+      setQueuedRewindTargetRequest(null);
+      window.dispatchEvent(new CustomEvent('prompt-queue:rewind-target-cancelled', {
+        detail: { tabId, requestId },
+      }));
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [queuedRewindTargetRequest, tabId]);
 
   const createAgentReadyWait = useCallback((runtime: ReturnType<typeof getHistoryAgentRuntime>, timeoutMs = 30000) => {
     let cleanup = () => {};
@@ -1574,14 +1653,17 @@ function Timeline({
   const [deleteRangeScope, setDeleteRangeScope] = useState<DeleteScope>('selection');
   // Animation state while delete IPC is running (red overlay over the range)
   const [deletingRange, setDeletingRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
+  const [deletingPhase, setDeletingPhase] = useState<'validating' | 'stopping' | 'rewriting' | 'restarting' | null>(null);
   // Inline confirm for "Удалить запрос" inside contextMenu (single user-entry delete)
   const [deleteEntryConfirmMode, setDeleteEntryConfirmMode] = useState(false);
   const [deleteEntryScope, setDeleteEntryScope] = useState<DeleteScope>('selection');
+  const [deleteDangerConfirmArmed, setDeleteDangerConfirmArmed] = useState(false);
   // effect: contextMenu closes → reset entry-delete confirm (prevents reopening in confirm state)
   useEffect(() => {
     if (!contextMenu) {
       setDeleteEntryConfirmMode(false);
       setDeleteEntryScope('selection');
+      setDeleteDangerConfirmArmed(false);
     }
   }, [contextMenu]);
   // effect: rangeActionMenu closes → reset deleteConfirmMode (prevents next popup opening in confirm state)
@@ -1589,6 +1671,7 @@ function Timeline({
     if (!rangeActionMenu) {
       setDeleteConfirmMode(false);
       setDeleteRangeScope('selection');
+      setDeleteDangerConfirmArmed(false);
     }
   }, [rangeActionMenu]);
 
@@ -2286,13 +2369,20 @@ function Timeline({
   const historyActionInFlight = isTabAiBusy || isTurnBusy || lifecycleBlocksHistoryAction;
   const historyRewriteUiBlocked = historyActionInFlight
     || (isCodex && historyActionSnapshot?.canRewriteHistory !== true);
-  const historyDeleteUiBlocked = historyActionInFlight
-    || (isCodex && historyActionSnapshot?.canDeleteHistory !== true);
-  const historyMutationBlockedMessage = historyActionInFlight
-    ? 'Дождись завершения текущей отправки или ответа'
-    : isCodex
-      ? 'Текущая Codex-сессия ещё не подтверждена для изменения истории'
-      : 'Изменение истории сейчас недоступно';
+  // Delete and durable Rewind own stop → mutate displayed history → restart.
+  // They do not need a pre-existing live-writer proof and must stay available
+  // through Resume/provisional-source and an active turn. Only another delete
+  // mutation already crossing that boundary disables them.
+  const historyDeleteUiBlocked = deletingRange !== null
+    || editRangeState?.phase === 'applying'
+    || rewindAgentStatus === 'stopping';
+  const historyMutationBlockedMessage = deletingRange
+    ? 'Изменение истории уже подготавливается'
+    : historyActionInFlight
+      ? 'Дождись завершения текущей отправки или ответа'
+      : isCodex
+        ? 'Текущая Codex-сессия ещё не подтверждена для изменения истории'
+        : 'Изменение истории сейчас недоступно';
   const rejectBlockedHistoryMutation = useCallback((blocked: boolean) => {
     if (!blocked) return false;
     useUIStore.getState().showToast(historyMutationBlockedMessage, 'warning', 2600);
@@ -2532,20 +2622,10 @@ function Timeline({
   // non-snapshot edge. If the parent session ran rewind / edit-range / delete-range
   // between forks, the snapshot becomes a sparse set of survivors instead of a prefix,
   // and a naive "snapshot edge" detector drew dozens of false stripes.
-  const forkMarkerLastSnapIndex = useMemo(() => {
-    const arr: number[] = [];
-    for (const m of forkMarkers) {
-      const snap = normalizeForkMarkerEntryUuids(m.entry_uuids);
-      if (snap.length === 0) { arr.push(-1); continue; }
-      let lastIdx = -1;
-      for (const uuid of snap) {
-        const index = entryIndexByUuid.get(uuid);
-        if (index != null && index > lastIdx) lastIdx = index;
-      }
-      arr.push(lastIdx);
-    }
-    return arr;
-  }, [forkMarkers, entryIndexByUuid]);
+  const forkMarkerLastSnapIndex = useMemo(
+    () => forkMarkers.map((marker) => resolveForkMarkerBoundary(entries, marker).boundaryIndex),
+    [forkMarkers, entries]
+  );
   const forkMarkerIndexByLastSnapIndex = useMemo(() => {
     const markerIndexByEntryIndex = new Map<number, number>();
     forkMarkerLastSnapIndex.forEach((entryIndex, markerIndex) => {
@@ -2728,8 +2808,9 @@ function Timeline({
   }, [sessionId]);
 
   // Claude has a real compact summary and keeps the existing lazy tooltip path.
-  // Codex's original compact body is server-encrypted; do not fetch or present
-  // replacement_history as if it were that body — Codex shows count-only ×N.
+  // Codex's model-readable compact body is server-encrypted; do not fetch or
+  // present replacement_history as if it were that body. Without an exact
+  // postTokens metric its marker says encrypted and prints no token number.
   useEffect(() => {
     if (!sessionId || isGemini || isCodex || activeTooltipIndex === null) return;
     const entry = entries[activeTooltipIndex];
@@ -3085,8 +3166,14 @@ function Timeline({
           ifRevision: cachedSnapshot?.revision || null,
           ...callerContext,
         });
+        const historyEventsResult = await ipcRenderer.invoke(
+          'timeline:get-session-history-events',
+          { sessionId, ...callerContext },
+        );
         if (!ownsLoad()) return;
+        let markerEntries: TimelineEntry[] = [];
         if (timelineResult.success && timelineResult.unchanged === true && cachedSnapshot) {
+          markerEntries = cachedSnapshot.entries;
           setEntriesSnapshot((current) => (
             current.ownerKey === ownerKeyAtStart
             && current.entries === cachedSnapshot.entries
@@ -3103,6 +3190,7 @@ function Timeline({
           ));
         } else if (timelineResult.success) {
           const nextEntries = timelineResult.entries || [];
+          markerEntries = nextEntries;
           const nextSessionMeta = timelineResult.sessionMeta || null;
           setTimelineSnapshotCache(ownerKeyAtStart, {
             entries: nextEntries,
@@ -3111,9 +3199,13 @@ function Timeline({
           });
           setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: nextEntries });
           setSessionBoundaries([]);
-          setForkMarkers([]);
           setCodexSessionMeta(nextSessionMeta);
           setClaudeMemoryBoundaryUuid(null);
+        }
+        if (historyEventsResult?.success && timelineResult.success) {
+          const all = normalizeForkMarkers(historyEventsResult.markers) as ForkMarker[];
+          const directParent = selectDirectForkMarker(all, sessionId, markerEntries) as ForkMarker | null;
+          setForkMarkers(directParent?.snapshot_complete === false ? [] : (directParent ? [directParent] : []));
         }
       } else {
         // Claude: load timeline entries and fork markers in parallel.
@@ -3129,7 +3221,7 @@ function Timeline({
             ifRevision: cachedClaudeSnapshot?.revision || null,
             ...callerContext,
           }),
-          ipcRenderer.invoke('claude:get-fork-markers', { sessionId, ...callerContext })
+          ipcRenderer.invoke('timeline:get-session-history-events', { sessionId, ...callerContext })
         ]);
 
         if (!ownsLoad()) return;
@@ -3224,18 +3316,12 @@ function Timeline({
           }
         }
         if (markersResult.success) {
-          // Only keep directParent marker (forked_to === sessionId) — shows fork point in CHILD sessions.
-          // fromMe markers (source === sessionId) are NOT shown in parent — fork point is
-          // already visible in the child's timeline via its own directParent marker.
           const all = normalizeForkMarkers(markersResult.markers) as ForkMarker[];
-          const toMe = all.filter((m: ForkMarker) => m.fork_session_id === sessionId);
-          let directParent: ForkMarker | null = null;
-          for (const m of toMe) {
-            if (!directParent || (m.entry_uuids?.length || 0) > (directParent.entry_uuids?.length || 0)) {
-              directParent = m;
-            }
-          }
-          setForkMarkers(directParent ? [directParent] : []);
+          const markerEntries = timelineResult.success && timelineResult.unchanged === true && cachedClaudeSnapshot
+            ? cachedClaudeSnapshot.entries
+            : timelineResult.entries || [];
+          const directParent = selectDirectForkMarker(all, sessionId, markerEntries) as ForkMarker | null;
+          setForkMarkers(directParent?.snapshot_complete === false ? [] : (directParent ? [directParent] : []));
         }
       }
       // Load notes for this session (works for both Claude and Gemini)
@@ -4463,6 +4549,38 @@ function Timeline({
   // ════════════════════════════════════════════════════════════
 
   const handleEntryClick = (entry: TimelineEntry, e?: React.MouseEvent) => {
+    if (queuedRewindTargetRequest) {
+      e?.preventDefault();
+      e?.stopPropagation();
+      if (entry.type !== 'user' || entry.isCompactSummary || !sessionId
+        || (toolType !== 'claude' && toolType !== 'codex')) {
+        useUIStore.getState().showToast(
+          'Для Rewind выбери обычный пользовательский prompt',
+          'warning',
+          2200,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          tabId,
+        );
+        return;
+      }
+      const requestId = queuedRewindTargetRequest.requestId;
+      setQueuedRewindTargetRequest(null);
+      setClickedState(null);
+      window.dispatchEvent(new CustomEvent('prompt-queue:rewind-target-selected', {
+        detail: {
+          tabId,
+          requestId,
+          uuid: entry.uuid,
+          text: entry.content,
+          sessionId,
+          toolType,
+        },
+      }));
+      return;
+    }
     if (readOnly) {
       const index = entries.findIndex(e => e.uuid === entry.uuid);
       const targetUuid = getHistoryPanelTargetUuid(entry, index);
@@ -4755,6 +4873,10 @@ function Timeline({
   };
 
   const handleEntryDoubleClick = (entry: TimelineEntry) => {
+    if (queuedRewindTargetRequest) {
+      handleEntryClick(entry);
+      return;
+    }
     if (readOnly) return;
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
@@ -4768,6 +4890,7 @@ function Timeline({
   const handleRightClick = (e: React.MouseEvent, entry: TimelineEntry, _source?: 'dot' | 'segment') => {
     e.preventDefault();
     e.stopPropagation();
+    if (queuedRewindTargetRequest) return;
     if (readOnly) return;
 
     // Position: anchor popup's RIGHT edge to Timeline's LEFT edge (mirrors note tooltip).
@@ -4925,10 +5048,12 @@ function Timeline({
     }
   };
 
-  const stopCodexForHistoryMutation = async (operation: 'Edit Range' | 'Delete Range'): Promise<string> => {
+  const stopCodexForHistoryMutation = async (operation: 'Edit Range' | 'Delete Range' | 'History Rewind'): Promise<string> => {
     const caller = operation === 'Edit Range'
       ? 'Timeline.codexEditRange'
-      : 'Timeline.codexDeleteRange';
+      : operation === 'Delete Range'
+        ? 'Timeline.codexDeleteRange'
+        : 'Timeline.codexHistoryRewind';
     const cmdState = await ipcRenderer.invoke('terminal:getCommandState', {
       tabId,
       caller,
@@ -4940,41 +5065,44 @@ function Timeline({
       throw new Error(`Не удалось проверить процесс Codex перед ${operation}; история не изменена`);
     }
 
-    // A stopped tab has no live writer to prove. Its persisted session is the
-    // historical mutation target; do not auto-resume here because that would
-    // silently choose launch settings (model/effort) inside a history action.
-    if (!cmdState?.isRunning) {
-      const historicalSessionId = sessionIdRef.current;
-      if (!historicalSessionId) {
-        throw new Error(`Нет Codex-сессии для ${operation}`);
+    // The Timeline source is the explicit mutation target. A Resume can stay
+    // provisional until Codex writes something new; requiring a live writer
+    // here made Delete disappear or stop on the first click and work only on a
+    // second click after the process was already gone. Stop first, then mutate
+    // the exact saved history currently displayed to the user.
+    const historicalSessionId = sessionIdRef.current;
+    if (!historicalSessionId) {
+      throw new Error(`Нет Codex-сессии для ${operation}`);
+    }
+    if (cmdState?.isRunning) {
+      const stopResult = await ipcRenderer.invoke('terminal:stop-ai-process', {
+        tabId,
+        toolType: 'codex',
+        reason: 'timeline-history-mutation',
+      });
+      if (!stopResult?.success) {
+        throw new Error(stopResult?.error || 'Failed to stop Codex');
       }
-      return historicalSessionId;
     }
-
-    const writerSessionId = await requireConfirmedCodexWriter({
-      tabId,
-      expectedSessionId: sessionIdRef.current,
-      operation: operation === 'Edit Range' ? 'Редактировать историю' : 'Удалить историю',
-    });
-
-    const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch((err: any) => {
-      console.warn(`[Codex${operation.replace(/\s/g, '')}] turn-state lookup failed:`, err?.message || err);
-      return null;
-    });
-    if (turnState?.busy === true) {
-      throw new Error(`Codex сейчас выполняет turn — дождитесь завершения перед ${operation}`);
-    }
-
-    const stopResult = await ipcRenderer.invoke('terminal:stop-ai-process', tabId);
-    if (!stopResult?.success) {
-      throw new Error(stopResult?.error || 'Failed to stop Codex');
-    }
-    return writerSessionId;
+    return historicalSessionId;
   };
 
-  const adoptAndRestartCodexHistory = async (newSessionId: string, reason: 'editRange' | 'deleteRange') => {
-    const committed = await useWorkspaceStore.getState().setCodexSessionId(tabId, newSessionId, reason);
-    if (!committed) throw new Error('Codex session binding could not be committed');
+  const adoptAndRestartCodexHistory = async (
+    newSessionId: string,
+    reason: 'editRange' | 'deleteRange',
+    codexSettingsProof?: { model: string; effort: string; proofAt: number; fast?: boolean } | null,
+  ) => {
+    const committed = await useWorkspaceStore.getState().setCodexSessionId(
+      tabId,
+      newSessionId,
+      reason,
+      codexSettingsProof ? { codexSettingsProof } : {},
+    );
+    if (!committed) {
+      const error: any = new Error('Codex session binding could not be committed');
+      error.codexHistoryChildAdopted = false;
+      throw error;
+    }
     const launchResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
       tabId,
       command: 'codex-c',
@@ -4982,7 +5110,9 @@ function Timeline({
       cwd,
     }));
     if (launchResult?.success === false) {
-      throw new Error(launchResult.error || launchResult.reason || 'Codex restart failed');
+      const error: any = new Error(launchResult.error || launchResult.reason || 'Codex restart failed');
+      error.codexHistoryChildAdopted = true;
+      throw error;
     }
   };
 
@@ -5155,30 +5285,59 @@ function Timeline({
     setDeleteConfirmMode(false);
     setDeleteEntryConfirmMode(false);
     setDeletingRange(range);
+    setDeletingPhase(isCodex ? 'validating' : 'stopping');
 
+    let historyMutated = false;
+    let historyChildAdopted = false;
+    let sourceSessionRestored = false;
+    let stoppedTool: 'claude' | 'codex' | null = null;
+    let stoppedSessionId = sessionId;
+    let codexSettingsProof = isCodex
+      ? getCodexHistoryMutationSettingsProof(tabId, sessionId)
+      : null;
     try {
       let mutationSessionId = sessionId;
       if (isCodex) {
+        const preflight = await ipcRenderer.invoke('codex:delete-range', {
+          sessionId,
+          cwd,
+          startUuid,
+          endUuid,
+          validateOnly: true,
+          ...(codexSettingsProof ? { codexSettingsProof } : {}),
+        });
+        if (!preflight?.success) {
+          throw new Error(preflight?.error || 'Codex delete-range validation failed');
+        }
+        codexSettingsProof = preflight.codexSettingsProof || codexSettingsProof;
+        setDeletingPhase('stopping');
         mutationSessionId = await stopCodexForHistoryMutation('Delete Range');
+        stoppedTool = 'codex';
+        stoppedSessionId = mutationSessionId;
+      } else {
+        const stopped = await stopClaudePtyProcess(tabId, {
+          reason: 'timeline-delete-range',
+        });
+        if (stopped?.success === false) {
+          throw new Error(stopped.error || 'Claude did not stop before Delete Range');
+        }
+        stoppedTool = 'claude';
       }
 
       const deleteChannel = isCodex ? 'codex:delete-range' : 'claude:delete-range';
+      setDeletingPhase('rewriting');
       const result = await ipcRenderer.invoke(deleteChannel, {
         sessionId: mutationSessionId,
         cwd,
         startUuid,
         endUuid,
+        ...(codexSettingsProof ? { codexSettingsProof } : {}),
       });
 
-      setDeletingRange(null);
-
       if (!result.success) {
-        useUIStore.getState().showToast(
-          'Удаление не удалось: ' + (result.error || 'unknown'),
-          'error', 4000
-        );
-        return;
+        throw new Error(result.error || 'unknown');
       }
+      historyMutated = true;
 
       const removedTotal = result.removedCount || 0;
       const removedHuman = result.removedUsers || 0;
@@ -5187,16 +5346,36 @@ function Timeline({
         if (!result.newSessionId) {
           throw new Error('Codex delete-range did not return a new session');
         }
-        await adoptAndRestartCodexHistory(result.newSessionId, 'deleteRange');
+        setDeletingPhase('restarting');
+        await adoptAndRestartCodexHistory(
+          result.newSessionId,
+          'deleteRange',
+          result.codexSettingsProof || codexSettingsProof,
+        );
+        historyChildAdopted = true;
+        stoppedTool = null;
       } else if (result.fileDeleted) {
         // Файл стёрт — освобождаем таб от сессии. Кнопка "Продолжить" запустит claude
         // как новую сессию (без --resume), а Timeline опустеет на следующем рефреше.
         const ws = useWorkspaceStore.getState();
         ws.setClaudeSessionId(tabId, '', 'timelineChain');
+        stoppedTool = null;
       } else {
+        setDeletingPhase('restarting');
+        const launchResult = await ipcRenderer.invoke('claude:run-command', {
+          tabId,
+          command: 'claude-c',
+          sessionId: mutationSessionId,
+        });
+        if (launchResult?.success === false || launchResult?.accepted === false) {
+          throw new Error(launchResult?.error || launchResult?.reason || 'Claude restart rejected after Delete Range');
+        }
+        stoppedTool = null;
         loadTimeline('delete-range');
       }
 
+      setDeletingRange(null);
+      setDeletingPhase(null);
       useUIStore.getState().showToast(
         isCodex
           ? `Удалено ${removedHuman} ходов (${removedTotal} записей). Создана новая версия истории`
@@ -5204,11 +5383,124 @@ function Timeline({
         'success', 2500
       );
     } catch (err: any) {
-      console.error('[Timeline] Delete range failed:', err);
+      const deleteErrorMessage = String(err?.message || err || 'unknown');
+      historyChildAdopted = historyChildAdopted || err?.codexHistoryChildAdopted === true;
+      console.error('[Timeline] Delete range failed: ' + deleteErrorMessage
+        + ' historyMutated=' + (historyMutated ? '1' : '0')
+        + ' childAdopted=' + (historyChildAdopted ? '1' : '0')
+        + ' tool=' + toolType
+        + ' session=' + String(stoppedSessionId || sessionId).slice(0, 8));
       setDeletingRange(null);
+      setDeletingPhase(null);
+      if (!historyChildAdopted && stoppedTool) {
+        try {
+          if (stoppedTool === 'codex') {
+            const restored = await ipcRenderer.invoke('codex:run-command', buildCodexHistoryMutationResumePayload(
+              {
+                tabId,
+                command: 'codex-c',
+                sessionId: stoppedSessionId,
+                cwd,
+              },
+              codexSettingsProof,
+            ));
+            if (restored?.success === false || restored?.accepted === false) {
+              throw new Error(restored?.error || restored?.reason || 'Codex source restart failed');
+            }
+            sourceSessionRestored = true;
+          } else {
+            const restored = await ipcRenderer.invoke('claude:run-command', {
+              tabId,
+              command: 'claude-c',
+              sessionId: stoppedSessionId,
+            });
+            if (restored?.success === false || restored?.accepted === false) {
+              throw new Error(restored?.error || restored?.reason || 'Claude source restart failed');
+            }
+            sourceSessionRestored = true;
+          }
+        } catch (restartError) {
+          console.warn('[DeleteRange] Failed to restore source session after mutation error:', restartError);
+        }
+      }
       useUIStore.getState().showToast(
-        'Удаление не удалось: ' + (err?.message || String(err)),
+        historyChildAdopted
+          ? 'История удалена, но перезапуск не завершён: ' + deleteErrorMessage
+          : historyMutated
+            ? (sourceSessionRestored
+              ? 'Удаление не принято вкладкой; исходная сессия восстановлена: ' + deleteErrorMessage
+              : 'Создана отдельная изменённая копия, но вкладка осталась на остановленной исходной сессии: ' + deleteErrorMessage)
+            : (stoppedTool && !sourceSessionRestored
+              ? 'Удаление не выполнено, исходную сессию не удалось перезапустить: ' + deleteErrorMessage
+              : 'Удаление не удалось: ' + deleteErrorMessage),
         'error', 4000
+      );
+    }
+  };
+
+  // Durable Rewind by rewriting the saved history. Unlike the amber native
+  // action, this never opens Claude/Codex's own picker. It stops the writer,
+  // removes the selected user turn and the complete future tail, puts that
+  // user prompt into History input, then resumes the surviving history.
+  const executeHistoryRewriteRewind = async (entry: TimelineEntry) => {
+    if (!sessionId || entry.type !== 'user' || entry.isCompactSummary) return;
+    if (deletingRange || editRangeState?.phase === 'applying' || rewindAgentStatus === 'stopping') {
+      useUIStore.getState().showToast('Rewind уже подготавливается', 'warning', 2200);
+      return;
+    }
+    const startIndex = entries.findIndex((candidate) => candidate.uuid === entry.uuid);
+    const endIndex = entries.length - 1;
+    const endUuid = entries[endIndex]?.uuid;
+    const promptDraft = entry.content.trim();
+    if (startIndex < 0 || !endUuid || !promptDraft) return;
+
+    const range = { startIndex, endIndex };
+    console.warn('[HistoryRewriteRewind] start tool=' + toolType
+      + ' tab=' + tabId.slice(-12)
+      + ' session=' + sessionId.slice(0, 8)
+      + ' start=' + entry.uuid.slice(0, 8)
+      + ' end=' + endUuid.slice(0, 8));
+    setContextMenu(null);
+    setDeletingRange(range);
+
+    try {
+      await executeHistoryRewriteRewindScenario({
+        tabId,
+        toolType: isCodex ? 'codex' : 'claude',
+        sessionId,
+        cwd,
+        target: {
+          uuid: entry.uuid,
+          text: promptDraft,
+          endUuid,
+        },
+      });
+
+      setDeletingRange(null);
+      console.warn('[HistoryRewriteRewind] done tool=' + toolType
+        + ' tab=' + tabId.slice(-12)
+        + ' session=' + sessionId.slice(0, 8));
+      useUIStore.getState().showToast(
+        'Rewind выполнен: история обрезана, запрос возвращён в input',
+        'success',
+        2500,
+      );
+    } catch (error: any) {
+      setDeletingRange(null);
+      const message = error?.message || String(error);
+      const historyMutated = error instanceof HistoryRewriteRewindError
+        ? error.historyMutated
+        : false;
+      console.error('[HistoryRewriteRewind] failed tool=' + toolType
+        + ' tab=' + tabId.slice(-12)
+        + ' mutated=' + historyMutated
+        + ' error=' + message);
+      useUIStore.getState().showToast(
+        historyMutated
+          ? 'История обрезана и запрос сохранён в input, но перезапуск не завершён: ' + message
+          : 'Rewind не выполнен: ' + message,
+        'error',
+        5000,
       );
     }
   };
@@ -6823,16 +7115,11 @@ function Timeline({
   // Note tooltip position (same logic, simpler — smaller tooltip)
   const activeNoteEntry = activeNoteIndex !== null ? entries[activeNoteIndex] : null;
   // Fork marker tooltip position (same pattern as notes)
-  const activeForkMarker = activeForkMarkerIndex !== null ? forkMarkers.find(m => {
-    if (m.hidden) return false; // hidden markers don't show tooltip
-    const snapshot = normalizeForkMarkerEntryUuids(m.entry_uuids);
-    if (snapshot.length === 0) return false;
-    const snap = new Set(snapshot);
-    const e = entries[activeForkMarkerIndex];
-    if (!e || !snap.has(e.uuid)) return false;
-    const next = entries[activeForkMarkerIndex + 1];
-    return activeForkMarkerIndex === entries.length - 1 || (next && !snap.has(next.uuid));
-  }) : null;
+  const activeForkMarker = activeForkMarkerIndex !== null
+    ? forkMarkers.find((marker, markerIndex) => (
+        !marker.hidden && forkMarkerLastSnapIndex[markerIndex] === activeForkMarkerIndex
+      )) || null
+    : null;
 
   const forkTooltipPos = activeForkMarkerIndex !== null ? (() => {
     // Position at the fork STRIP level (between entry N and entry N+1), not at entry N's dot
@@ -7003,9 +7290,44 @@ function Timeline({
           right: isExpandedLayout && !pinned ? 0 : undefined,
           // Font-size root for em-based descendants (chip + preview text).
           fontSize: `${timelineFontSize}px`,
+          cursor: queuedRewindTargetRequest ? 'crosshair' : undefined,
           transition: widthTransitionEnabled ? 'width 50ms ease-out' : 'none',
         }}
       >
+        {queuedRewindTargetRequest && (
+          <div
+            data-prompt-queue-rewind-target-mode
+            aria-label="Select a Timeline point for queued Rewind"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              zIndex: 44,
+              pointerEvents: 'none',
+              border: '1px solid rgba(167,139,250,0.82)',
+              background: 'rgba(139,92,246,0.045)',
+              boxShadow: 'inset 0 0 12px rgba(139,92,246,0.12)',
+            }}
+          >
+            <div
+              style={{
+                position: 'absolute',
+                right: 'calc(100% + 7px)',
+                top: 7,
+                width: 174,
+                padding: '6px 8px',
+                border: '1px solid rgba(167,139,250,0.45)',
+                borderRadius: 6,
+                background: 'rgba(18,18,18,0.97)',
+                color: '#c4b5fd',
+                boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
+                fontSize: 10,
+                lineHeight: 1.35,
+              }}
+            >
+              Выбери prompt для Rewind<br />Esc — отмена
+            </div>
+          </div>
+        )}
         {/* Drag handle for width — only when expanded layout is on.
             In collapsed (32px) mode no resize gesture, it'd just confuse.
             Width persists in localStorage via setTimelineWidth (clamped [32, 600]). */}
@@ -7110,9 +7432,10 @@ function Timeline({
             </Tooltip>
           )}
           {/* Fork marker at the very beginning (empty snapshot = fork before any entries) */}
-          {forkMarkers.some(m => !m.hidden && (!m.entry_uuids || m.entry_uuids.length === 0)) && entries.length > 0 && (
+          {forkMarkers.some(m => m.snapshot_complete !== false && !m.hidden && (!m.entry_uuids || m.entry_uuids.length === 0)) && entries.length > 0 && (
             <Tooltip content="Fork point - this session was forked from here">
             <div
+              data-timeline-fork-marker="beginning"
               className="flex-shrink-0 w-full flex items-center justify-center"
               style={{ height: '8px' }}
             >
@@ -7372,7 +7695,13 @@ function Timeline({
                 }}
               />
               <StatusLabelPortal
-                label="DELETING..."
+                label={deletingPhase === 'validating'
+                  ? 'CHECKING...'
+                  : deletingPhase === 'stopping'
+                    ? 'STOPPING...'
+                    : deletingPhase === 'restarting'
+                    ? 'RESTARTING...'
+                    : 'DELETING...'}
                 top={fixedTop}
                 rightOffset={rightOffset}
                 color="#ef4444"
@@ -7616,38 +7945,83 @@ function Timeline({
                 const endUuid = entries[range.endIndex].uuid;
 
                 if (isCodex) {
-                  const mutationSessionId = await stopCodexForHistoryMutation('Edit Range');
-
-                  onProgress?.('editing');
-                  console.warn('[CodexEditRange] Creating edited local rollout fork...');
-                  const result = await ipcRenderer.invoke('codex:edit-range', {
-                    sessionId: mutationSessionId, cwd, startUuid, endUuid, compactText,
-                  });
-
-                  if (!result.success) {
-                    throw new Error(result.error);
-                  }
-
-                  console.warn('[CodexEditRange] New session:', result.newSessionId?.slice(0, 8), 'replacementUuid:', result.replacementUuid);
-                  const doneState = editRangeState
-                    ? { ...editRangeState, phase: 'done' as const, compactUuid: result.replacementUuid || result.compactUuid }
+                  let codexSettingsProof = sessionId
+                    ? getCodexHistoryMutationSettingsProof(tabId, sessionId)
                     : null;
-                  if (doneState && result.newSessionId) {
-                    _savedEditRangeMap.set(result.newSessionId, doneState);
-                    if (_savedEditRangeMap.size > SAVED_MAP_MAX) {
-                      const first = _savedEditRangeMap.keys().next().value;
-                      if (first) _savedEditRangeMap.delete(first);
+                  let sourceStopped = false;
+                  let childAdopted = false;
+                  let childSessionId: string | null = null;
+                  try {
+                    const preflight = await ipcRenderer.invoke('codex:edit-range', {
+                      sessionId,
+                      cwd,
+                      startUuid,
+                      endUuid,
+                      compactText,
+                      validateOnly: true,
+                      ...(codexSettingsProof ? { codexSettingsProof } : {}),
+                    });
+                    if (!preflight?.success) {
+                      throw new Error(preflight?.error || 'Codex edit-range validation failed');
                     }
-                  }
+                    codexSettingsProof = preflight.codexSettingsProof || codexSettingsProof;
+                    const mutationSessionId = await stopCodexForHistoryMutation('Edit Range');
+                    sourceStopped = true;
 
-                  if (result.newSessionId) {
-                    onProgress?.('restarting');
-                    await adoptAndRestartCodexHistory(result.newSessionId, 'editRange');
-                  }
+                    onProgress?.('editing');
+                    console.warn('[CodexEditRange] Creating edited local rollout fork...');
+                    const result = await ipcRenderer.invoke('codex:edit-range', {
+                      sessionId: mutationSessionId, cwd, startUuid, endUuid, compactText,
+                      ...(codexSettingsProof ? { codexSettingsProof } : {}),
+                    });
 
-                  setEditRangeState(doneState);
-                  useUIStore.getState().showToast('Codex Edit Range создан', 'success', 1500);
-                  return { removedCount: result.removedCount, removedUsers: result.removedUsers };
+                    if (!result.success) throw new Error(result.error);
+                    childSessionId = result.newSessionId || null;
+                    console.warn('[CodexEditRange] New session:', result.newSessionId?.slice(0, 8), 'replacementUuid:', result.replacementUuid);
+                    const doneState = editRangeState
+                      ? { ...editRangeState, phase: 'done' as const, compactUuid: result.replacementUuid || result.compactUuid }
+                      : null;
+                    if (doneState && result.newSessionId) {
+                      _savedEditRangeMap.set(result.newSessionId, doneState);
+                      if (_savedEditRangeMap.size > SAVED_MAP_MAX) {
+                        const first = _savedEditRangeMap.keys().next().value;
+                        if (first) _savedEditRangeMap.delete(first);
+                      }
+                    }
+
+                    if (result.newSessionId) {
+                      onProgress?.('restarting');
+                      await adoptAndRestartCodexHistory(
+                        result.newSessionId,
+                        'editRange',
+                        result.codexSettingsProof || codexSettingsProof,
+                      );
+                      childAdopted = true;
+                    }
+
+                    setEditRangeState(doneState);
+                    useUIStore.getState().showToast('Codex Edit Range создан', 'success', 1500);
+                    return { removedCount: result.removedCount, removedUsers: result.removedUsers };
+                  } catch (error: any) {
+                    childAdopted = childAdopted || error?.codexHistoryChildAdopted === true;
+                    if (childSessionId && !childAdopted) _savedEditRangeMap.delete(childSessionId);
+                    if (sourceStopped && !childAdopted && sessionId) {
+                      try {
+                        const restored = await ipcRenderer.invoke('codex:run-command', buildCodexHistoryMutationResumePayload(
+                          { tabId, command: 'codex-c', sessionId, cwd },
+                          codexSettingsProof,
+                        ));
+                        if (restored?.success === false || restored?.accepted === false) {
+                          console.error('[CodexEditRange] source restart failed: '
+                            + String(restored?.error || restored?.reason || 'unknown'));
+                        }
+                      } catch (restartError: any) {
+                        console.error('[CodexEditRange] source restart threw: '
+                          + String(restartError?.message || restartError));
+                      }
+                    }
+                    throw error;
+                  }
                 }
 
                 // Step 1: Exit Claude only when a real Claude process is still running.
@@ -7985,15 +8359,27 @@ function Timeline({
                   const isLoadingCompact = currentActiveEntry.type === 'compact'
                     && !currentActiveEntry.compactSummary
                     && cached === undefined;
-                  const displayText = compactText || (isLoadingCompact ? 'Загружаю compact summary...' : 'Compact summary не найден');
+                  const compactEncrypted = isCodex
+                    || currentActiveCompactBoundaryEntry?.compactEncrypted === true
+                    || currentActiveEntry.compactEncrypted === true;
+                  const displayText = compactText || (compactEncrypted
+                    ? 'Compact state is encrypted.'
+                    : isLoadingCompact
+                      ? 'Загружаю compact summary...'
+                      : 'Compact summary не найден');
                   const canCopyCompact = !!compactText;
-                  const compactPreTokens = currentActiveCompactBoundaryEntry?.preTokens || currentActiveEntry.preTokens;
+                  const compactPostTokens = currentActiveCompactBoundaryEntry?.postTokens || currentActiveEntry.postTokens;
+                  const compactMetric = compactPostTokens
+                    ? ` (${compactPostTokens >= 1000 ? Math.round(compactPostTokens / 1000) + 'k' : compactPostTokens} tokens)`
+                    : compactEncrypted
+                      ? ' (encrypted)'
+                      : '';
                   return (
                     <>
                       <div className="flex items-center gap-2 shrink-0">
                         <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#f59e0b', flexShrink: 0 }} />
                         <span className="text-amber-400 font-medium text-[11px]">
-                          History Compacted ({compactPreTokens ? `${Math.round(compactPreTokens / 1000)}k` : '?'} tokens)
+                          History Compacted{compactMetric}
                         </span>
                       </div>
                       <div
@@ -8540,6 +8926,7 @@ function Timeline({
                             onClick={(e) => {
                               e.stopPropagation();
                               setDeleteEntryScope('selection');
+                              setDeleteDangerConfirmArmed(false);
                               setDeleteEntryConfirmMode(true);
                             }}
                           >
@@ -8560,6 +8947,7 @@ function Timeline({
                               onClick={(e) => {
                                 e.stopPropagation();
                                 setDeleteEntryScope('through-start');
+                                setDeleteDangerConfirmArmed(false);
                                 setDeleteEntryConfirmMode(true);
                               }}
                             >
@@ -8586,6 +8974,8 @@ function Timeline({
                         };
                         const startUuid = entries[deleteRange.startIndex]?.uuid;
                         const count = deleteRange.endIndex - deleteRange.startIndex + 1;
+                        const needsStrongConfirm = deleteThroughStart
+                          && count >= DELETE_PREFIX_STRONG_CONFIRM_THRESHOLD;
                         return (
                           <div className="p-2 flex flex-col gap-2" data-testid="timeline-delete-confirm-single">
                             <div className="text-[11px] text-red-300 leading-snug">
@@ -8594,7 +8984,9 @@ function Timeline({
                                 : crossesClaudeBoundary && deleteEntryScope === 'selection'
                                 ? <>Это граница истории Claude. Удалить <span className="font-semibold">{count}</span> записей от начала до неё?</>
                                 : deleteThroughStart
-                                  ? <>Удалить <span className="font-semibold">{count}</span> записей от начала до выбранной?</>
+                                  ? deleteDangerConfirmArmed
+                                    ? <><span className="font-semibold text-red-200">Последнее подтверждение:</span><br/>удалить всю историю от начала до точки — <span className="font-semibold">{count}</span> записей, останется {Math.max(0, entries.length - count)}?</>
+                                    : <>Удалить всю историю от начала до выбранной — <span className="font-semibold">{count}</span> записей, останется {Math.max(0, entries.length - count)}?</>
                                   : <>Удалить выбранную запись?</>}
                               {!deleteSingleClaudePrompt && <>{' '}<span className="text-red-400/70">Действие необратимо.</span></>}
                             </div>
@@ -8604,6 +8996,7 @@ function Timeline({
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   setDeleteEntryConfirmMode(false);
+                                  setDeleteDangerConfirmArmed(false);
                                 }}
                               >
                                 Отмена
@@ -8613,6 +9006,10 @@ function Timeline({
                                 className="flex-1 px-3 py-1.5 text-xs text-white bg-red-600/80 hover:bg-red-600 rounded transition-colors cursor-pointer flex items-center justify-center gap-1.5"
                                 onClick={(e) => {
                                   e.stopPropagation();
+                                  if (needsStrongConfirm && !deleteDangerConfirmArmed) {
+                                    setDeleteDangerConfirmArmed(true);
+                                    return;
+                                  }
                                   if (deleteSingleClaudePrompt) {
                                     void handleDeleteClaudeUserEntry(contextMenu.entry);
                                   } else if (startUuid) {
@@ -8621,7 +9018,9 @@ function Timeline({
                                 }}
                               >
                                 <Trash2 size={12} />
-                                Удалить
+                                {needsStrongConfirm
+                                  ? (deleteDangerConfirmArmed ? `Удалить ${count}` : 'Подтвердить масштаб')
+                                  : 'Удалить'}
                               </button>
                             </div>
                           </div>
@@ -8632,8 +9031,9 @@ function Timeline({
                   {/* Two DIFFERENT rewind families, separated by kind and colour.
                       Amber = native: the app drives the agent's own rewind UI.
                       Claude keeps a preview until submit; Codex persists its
-                      thread rollback immediately. Violet = rewrite: the span is
-                      removed from the history file and replaced by one summary.
+                      thread rollback immediately. Violet = saved-history work:
+                      direct Rewind removes the tail; AI/Chat can replace it with
+                      one reviewed summary.
                       They used to sit in one amber split control where
                       the right zone silently ran Gemini and pasted the result
                       with no review window — the same operation as the selection
@@ -8642,11 +9042,7 @@ function Timeline({
                     const rewindAvailability = getRewindRequestState(contextMenu.entry);
                     const canStartRewind = rewindAvailability.canStart;
                     const rewindBusyTitle = rewindAvailability.reason || undefined;
-                    const nativeRewindDescription = isCodex
-                      ? 'Нативный откат внутри Codex — откат сохраняется сразу, выбранный prompt вернётся в input'
-                      : isGemini
-                        ? 'Нативный откат внутри Gemini — выбранный prompt вернётся в input'
-                        : 'Нативный откат внутри Claude — preview до следующей отправки, выбранный prompt вернётся в input';
+                    const nativeAgentSuffix = isCodex ? 'Codex' : isGemini ? 'Gemini' : 'Claude';
                     const nativeLabel = rewindState
                       ? (rewindState.phase === 'preparing'
                         ? 'Preparing...'
@@ -8661,18 +9057,20 @@ function Timeline({
                         : rewindState.phase === 'done'
                         ? 'Done'
                         : 'Paste...')
-                      : 'Rewind';
-                    // Rewriting history needs a user entry it can actually cut
-                    // at; boundary rows are handled by the delete flow above.
-                    const canRewriteHistory = supportsEditRangeActions
-                      && !historyRewriteUiBlocked
+                      : 'Rewind (' + nativeAgentSuffix + ')';
+                    // Saved-history actions remain discoverable across Resume,
+                    // writer proof gaps and an active turn. Direct Rewind owns
+                    // stop → mutate → restart, so it must not disappear behind
+                    // the stricter middle-edit permission snapshot.
+                    const canShowSavedHistoryActions = supportsEditRangeActions
                       && !!sessionId
                       && contextMenu.entry.type === 'user'
                       && !contextMenu.entry.isCompactSummary;
+                    const historyRewriteRewindPreparing = historyDeleteUiBlocked;
                     return (
                       <>
                         <div className="border-t border-white/10 my-1" />
-                        <Tooltip content={rewindBusyTitle || nativeRewindDescription}>
+                        <Tooltip content={rewindBusyTitle || ('Нативный откат внутри ' + nativeAgentSuffix + ' — история на диске не меняется')}>
                           <button
                             data-testid="timeline-rewind-native-single"
                             className={`w-full text-left px-3 py-2 text-xs rounded transition-colors flex items-center gap-2 ${canStartRewind ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
@@ -8687,15 +9085,31 @@ function Timeline({
                             {nativeLabel}
                           </button>
                         </Tooltip>
-                        {canRewriteHistory && (
-                          // Two rewrite actions beside native Rewind: automatic
-                          // AI summary, or a chat with the configured prompt left
-                          // unsent so the user can replace or extend it first.
+                        {canShowSavedHistoryActions && (
+                          // Three saved-history actions below the untouched native
+                          // Rewind: direct tail truncation, automatic AI summary,
+                          // or a chat with the configured prompt left unsent.
                           <div className="flex rounded overflow-hidden" data-testid="timeline-rewind-rewrite-single">
+                            <Tooltip content="Rewind: остановить агента, обрезать сохранённую историю и вернуть выбранный запрос в input">
+                              <button
+                                data-testid="timeline-rewind-history-single"
+                                disabled={historyRewriteRewindPreparing}
+                                className={`flex-1 text-left px-3 py-2 text-xs transition-colors flex items-center gap-2 ${historyRewriteRewindPreparing
+                                  ? 'text-violet-400/35 cursor-not-allowed'
+                                  : 'text-violet-400 hover:bg-violet-600/20 cursor-pointer'}`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void executeHistoryRewriteRewind(contextMenu.entry);
+                                }}
+                              >
+                                <Repeat2 size={12} />
+                                {historyRewriteRewindPreparing ? 'Preparing...' : 'Rewind'}
+                              </button>
+                            </Tooltip>
                             <Tooltip content="AI: пересказать диапазон и подготовить откат переписыванием истории">
                               <button
                                 data-testid="timeline-rewind-ai-single"
-                                className="flex-1 text-left px-3 py-2 text-xs text-violet-400 hover:bg-violet-600/20 transition-colors cursor-pointer flex items-center gap-2"
+                                className="px-3 py-2 text-xs text-violet-400/80 hover:bg-violet-600/30 hover:text-violet-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center gap-1.5"
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   requestHistoryRewrite(contextMenu.entry);
@@ -8801,13 +9215,17 @@ function Timeline({
                   ? entries[0].uuid
                   : rangeActionMenu.startUuid;
                 const effCount = effRange.endIndex - effRange.startIndex + 1;
+                const needsStrongConfirm = deleteThroughStart
+                  && effCount >= DELETE_PREFIX_STRONG_CONFIRM_THRESHOLD;
                 return (
                 <div className="p-2 flex flex-col gap-2" data-testid="timeline-delete-confirm-range">
                   <div className="text-[11px] text-red-300 leading-snug">
                     {crossesClaudeBoundary && deleteRangeScope === 'selection'
                       ? <>В выделении граница истории Claude.<br/>Удалить <span className="font-semibold">{effCount}</span> записей от начала до выбранной?</>
                       : deleteThroughStart
-                        ? <>Удалить <span className="font-semibold">{effCount}</span> записей от начала до выбранной?</>
+                        ? deleteDangerConfirmArmed
+                          ? <><span className="font-semibold text-red-200">Последнее подтверждение:</span><br/>удалить всю историю от начала до точки — <span className="font-semibold">{effCount}</span> записей, останется {Math.max(0, entries.length - effCount)}?</>
+                          : <>Удалить всю историю от начала до выбранной — <span className="font-semibold">{effCount}</span> записей, останется {Math.max(0, entries.length - effCount)}?</>
                         : <>Удалить <span className="font-semibold">{effCount}</span> выбранных записей?</>}
                     {' '}<span className="text-red-400/70">Действие необратимо.</span>
                   </div>
@@ -8817,6 +9235,7 @@ function Timeline({
                       onClick={(e) => {
                         e.stopPropagation();
                         setDeleteConfirmMode(false);
+                        setDeleteDangerConfirmArmed(false);
                       }}
                     >
                       Отмена
@@ -8826,11 +9245,17 @@ function Timeline({
                       className="flex-1 px-3 py-1.5 text-xs text-white bg-red-600/80 hover:bg-red-600 rounded transition-colors cursor-pointer flex items-center justify-center gap-1.5"
                       onClick={(e) => {
                         e.stopPropagation();
+                        if (needsStrongConfirm && !deleteDangerConfirmArmed) {
+                          setDeleteDangerConfirmArmed(true);
+                          return;
+                        }
                         void executeDeleteRange(effRange, effStartUuid, rangeActionMenu.endUuid);
                       }}
                     >
                       <Trash2 size={12} />
-                      Удалить
+                      {needsStrongConfirm
+                        ? (deleteDangerConfirmArmed ? `Удалить ${effCount}` : 'Подтвердить масштаб')
+                        : 'Удалить'}
                     </button>
                   </div>
                 </div>
@@ -8922,6 +9347,7 @@ function Timeline({
                         onClick={(e) => {
                           e.stopPropagation();
                           setDeleteRangeScope('selection');
+                          setDeleteDangerConfirmArmed(false);
                           setDeleteConfirmMode(true);
                         }}
                       >
@@ -8940,6 +9366,7 @@ function Timeline({
                           onClick={(e) => {
                             e.stopPropagation();
                             setDeleteRangeScope('through-start');
+                            setDeleteDangerConfirmArmed(false);
                             setDeleteConfirmMode(true);
                           }}
                         >

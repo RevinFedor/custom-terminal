@@ -74,6 +74,59 @@ export function bashFamily(word) {
   return 'run';
 }
 
+/** Detect a Python invocation that actually mutates a file and recover its
+ * target when the script makes that target explicit. Merely running Python is
+ * still Run. The edit proof is a write-mode open or a pathlib mutation; text
+ * operations such as s.replace() alone are not enough. */
+function pythonEditInfo(command, word) {
+  const interpreter = String(word || effectiveBashWord(command)).toLowerCase();
+  if (interpreter !== 'py' && !/^python(?:\d+(?:\.\d+)*)?$/.test(interpreter)) {
+    return { isEdit: false, target: '' };
+  }
+  const source = String(command || '');
+  const aliases = new Map();
+  const assignments = /\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:(?:pathlib\.)?Path\s*\(\s*)?(?:[rRuUbBfF]{0,2})?(['"])([^'"\r\n]+)\2\s*\)?/g;
+  let match;
+  while ((match = assignments.exec(source)) !== null) aliases.set(match[1], match[3]);
+
+  const resolveTarget = (expression) => {
+    let value = String(expression || '').trim();
+    const pathCall = value.match(/^(?:pathlib\.)?Path\s*\(\s*([\s\S]+?)\s*\)$/);
+    if (pathCall) value = pathCall[1].trim();
+    const literal = value.match(/^(?:[rRuUbBfF]{0,2})?(['"])([^'"\r\n]+)\1$/);
+    if (literal) return literal[2];
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) return aliases.get(value) || '';
+    return '';
+  };
+
+  let isEdit = false;
+  let target = '';
+  const remember = (expression) => {
+    isEdit = true;
+    if (!target) target = resolveTarget(expression);
+  };
+
+  // open(path, 'w'/'a'/'x'/'r+') mutates even when the subsequent .write()
+  // is on another line or hidden behind a file-handle variable.
+  const writeOpen = /\b(?:io\.)?open\s*\(\s*([^,\r\n]+?)\s*,\s*(?:mode\s*=\s*)?(['"])([^'"]*)\2/g;
+  while ((match = writeOpen.exec(source)) !== null) {
+    if (/[wax+]/i.test(match[3])) remember(match[1]);
+  }
+
+  // pathlib direct/variable writes. Do not include generic .replace(): the
+  // exact real-world scripts use string.replace() before writing, and that
+  // transformation by itself changes no file.
+  const pathWrite = /(?:\b(?:pathlib\.)?Path\s*\(\s*([^)]+?)\s*\)|\b([A-Za-z_][A-Za-z0-9_]*))\s*\.\s*(?:write_text|write_bytes|touch|unlink)\s*\(/g;
+  while ((match = pathWrite.exec(source)) !== null) {
+    // A bare object.rename() may be a DataFrame/string-domain operation. A
+    // Path(...) receiver is proof; a variable receiver is proof only when its
+    // path assignment is visible in the same script.
+    if (match[1] || aliases.has(match[2])) remember(match[1] || match[2]);
+  }
+
+  return { isEdit, target };
+}
+
 export function parseMcpToolName(toolName) {
   const name = String(toolName || '');
   if (!name.startsWith('mcp__')) return null;
@@ -99,6 +152,8 @@ export function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } =
   switch (name) {
     case 'Bash': {
       const word = effectiveBashWord(args?.command);
+      const pythonEdit = pythonEditInfo(args?.command, word);
+      if (pythonEdit.isEdit) return { family: 'edit', bashWord: word || undefined };
       const family = bashFamily(word);
       let bashDetail;
       if (family === 'git' && typeof args?.command === 'string') {
@@ -142,7 +197,7 @@ export function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } =
       // Codex's "look what tools exist" — the emptiest noise there is: the
       // text is always the same, it carries nothing for understanding the
       // run. Its own family INSIDE the noise class, so it dissolves into
-      // noise containers (header says «Tool search ×2») instead of standing
+      // noise containers (header says `Tools ×2`) instead of standing
       // between them and splitting them (seen live: one lone Tool Search cut
       // a noise run into two containers).
       return { family: 'toolsearch' };
@@ -159,20 +214,24 @@ export function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } =
   }
 }
 
+// Canonical TYPE word used by every collapsed History container. Status lives
+// in the spinner/icon and cardinality is always rendered separately as `×N`;
+// keeping old tense/unit phrases here would create a second formatter capable
+// of resurrecting `Ran 3 commands` or `Read 6 files` in another consumer.
 export const FAMILY_LABELS = {
-  read: { active: 'Reading', done: 'Read', unit: ['file', 'files'] },
-  search: { active: 'Searching', done: 'Searched', unit: ['query', 'queries'] },
-  git: { active: 'Running git', done: 'Ran git', unit: ['command', 'commands'] },
-  run: { active: 'Running', done: 'Ran', unit: ['command', 'commands'] },
-  edit: { active: 'Editing', done: 'Edited', unit: ['file', 'files'] },
-  mcp: { active: 'Calling', done: 'Called', unit: ['call', 'calls'] },
-  plan: { active: 'Updating plan', done: 'Updated plan', unit: ['step', 'steps'] },
-  web: { active: 'Searching web', done: 'Searched web', unit: ['query', 'queries'] },
-  toolsearch: { active: 'Searching tools', done: 'Tool search', unit: ['call', 'calls'] },
-  task: { active: 'Running agent', done: 'Ran agent', unit: ['agent', 'agents'] },
-  question: { active: 'Asking', done: 'Asked', unit: ['question', 'questions'] },
-  wait: { active: 'Waiting', done: 'Waited', unit: ['task', 'tasks'] },
-  other: { active: 'Working', done: 'Done', unit: ['call', 'calls'] },
+  read: 'Read',
+  search: 'Search',
+  git: 'Git',
+  run: 'Run',
+  edit: 'Edit',
+  mcp: 'MCP',
+  plan: 'Plan',
+  web: 'Web',
+  toolsearch: 'Tools',
+  task: 'Agent',
+  question: 'Question',
+  wait: 'Wait',
+  other: 'Tool',
 };
 
 export const HISTORY_CAPTION_MAX_CHARS = 600;
@@ -504,6 +563,24 @@ function shortRunSubject(command, word) {
   return parts.join(' ');
 }
 
+/** Header path contract shared by native Read/Edit and shell-derived reads.
+ * Ordinary source paths collapse to the basename; documentation keeps the
+ * useful repository-relative tail beginning at its `docs/` segment. The full
+ * path remains presentation identity and expanded-body data. */
+export function historyDisplayPath(value) {
+  const text = String(value || '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/');
+  if (!text) return '';
+  const parts = text.split('/').filter(Boolean);
+  if (parts.length === 0) return text;
+  const docsIndex = parts.findIndex((part) => part.toLowerCase() === 'docs');
+  if (docsIndex >= 0) return parts.slice(docsIndex).join('/');
+  return parts[parts.length - 1] || text;
+}
+
 export function historyActionHeadline({ toolName, args, family, bashWord, bashDetail, mcpServer, mcpMethod } = {}) {
   const name = String(toolName || '');
   const fam = String(family || '');
@@ -518,7 +595,7 @@ export function historyActionHeadline({ toolName, args, family, bashWord, bashDe
       const limit = typeof args?.limit === 'number' ? args.limit : 0;
       detail = limit > 0 ? args.offset + '–' + (args.offset + limit) : 'from ' + args.offset;
     }
-    return { verb: 'Read', subject: String(path), detail };
+    return { verb: 'Read', subject: historyDisplayPath(path), detail };
   }
   if (name === 'Patch') {
     // Attempted, not done — the one edit-family row that must NOT read «Edit».
@@ -529,15 +606,15 @@ export function historyActionHeadline({ toolName, args, family, bashWord, bashDe
     // two tokens («Run const example»). The source belongs to the body.
     return { verb: 'Run', subject: 'script', detail: '' };
   }
-  if (name === 'Edit' || name === 'Write' || name === 'MultiEdit' || name === 'Update' || fam === 'edit') {
+  if (name === 'Edit' || name === 'Write' || name === 'MultiEdit' || name === 'Update' || (fam === 'edit' && name !== 'Bash')) {
     const path = args?.file_path || args?.path || '';
-    return { verb: 'Edit', subject: String(path), detail: '' };
+    return { verb: 'Edit', subject: historyDisplayPath(path), detail: '' };
   }
   if (name === 'Grep') {
-    return { verb: 'Search', subject: String(args?.pattern || ''), detail: String(args?.path || args?.glob || '') };
+    return { verb: 'Search', subject: 'grep', detail: historyDisplayPath(args?.path || args?.glob || '') };
   }
   if (name === 'Glob') {
-    return { verb: 'Search', subject: String(args?.pattern || ''), detail: String(args?.path || '') };
+    return { verb: 'Search', subject: 'glob', detail: historyDisplayPath(args?.path || '') };
   }
   if (name === 'WebSearch' || name === 'WebFetch') {
     return { verb: 'Web', subject: String(args?.query || args?.url || ''), detail: '' };
@@ -545,7 +622,11 @@ export function historyActionHeadline({ toolName, args, family, bashWord, bashDe
   if (name === 'Bash') {
     const command = typeof args?.command === 'string' ? args.command : '';
     const word = bashWord || effectiveBashWord(command);
-    const fam2 = fam || bashFamily(word);
+    const pythonEdit = pythonEditInfo(command, word);
+    const fam2 = fam || (pythonEdit.isEdit ? 'edit' : bashFamily(word));
+    if (fam2 === 'edit') {
+      return { verb: 'Edit', subject: historyDisplayPath(pythonEdit.target), detail: '' };
+    }
     const { subject, detail } = extractBashSubject(command, fam2, word);
     if (fam2 === 'git') {
       // Old/projected rows may carry `family=git` without the optional
@@ -559,8 +640,14 @@ export function historyActionHeadline({ toolName, args, family, bashWord, bashDe
       const target = subject ? subject.split('/').pop() : '';
       return { verb: 'Git', subject: [sub, target].filter(Boolean).join(' · '), detail: '' };
     }
-    if (fam2 === 'read') return { verb: 'Read', subject, detail };
-    if (fam2 === 'search') return { verb: 'Search', subject, detail };
+    if (fam2 === 'read') return { verb: 'Read', subject: historyDisplayPath(subject), detail };
+    if (fam2 === 'search') {
+      return {
+        verb: 'Search',
+        subject: word || 'search',
+        detail: historyDisplayPath(detail),
+      };
+    }
     return { verb: 'Run', subject: shortRunSubject(command, word), detail: '' };
   }
   return { verb: name || 'Tool', subject: '', detail: '' };
@@ -596,15 +683,6 @@ export function historyActionPresentationMeta({ toolName, args, family, bashWord
     .replace(/\\/g, '/')
     .replace(/^\.\//, '')
     .replace(/\/{2,}/g, '/');
-  const shortTarget = (value) => {
-    const text = normalizeTarget(value);
-    if (!text) return '';
-    if (text.includes('/')) {
-      const parts = text.split('/').filter(Boolean);
-      return parts[parts.length - 1] || text;
-    }
-    return text;
-  };
   const docsTarget = (value) => {
     const text = normalizeTarget(value);
     if (!text) return false;
@@ -616,6 +694,26 @@ export function historyActionPresentationMeta({ toolName, args, family, bashWord
   let targetSource = '';
   let targetLabel = '';
   let operationLabel = String(headline.subject || '');
+  let rawPathTarget = '';
+  let rawSearchTarget = '';
+  if (name === 'Read' || name === 'Edit' || name === 'Write' || name === 'MultiEdit' || name === 'Update') {
+    rawPathTarget = String(args?.file_path || args?.path || '');
+  } else if (name === 'Bash' && (fam === 'read' || fam === 'edit')) {
+    const command = typeof args?.command === 'string' ? args.command : '';
+    const word = bashWord || classified.bashWord || effectiveBashWord(command);
+    rawPathTarget = fam === 'edit'
+      ? String(pythonEditInfo(command, word).target || '')
+      : String(extractBashSubject(command, fam, word).subject || '');
+  }
+  if (fam === 'search') {
+    if (name === 'Grep') rawSearchTarget = String(args?.path || args?.glob || '');
+    else if (name === 'Glob') rawSearchTarget = String(args?.path || '');
+    else if (name === 'Bash') {
+      const command = typeof args?.command === 'string' ? args.command : '';
+      const word = bashWord || classified.bashWord || effectiveBashWord(command);
+      rawSearchTarget = String(extractBashSubject(command, fam, word).detail || '');
+    }
+  }
   if (fam === 'mcp') {
     targetSource = server || 'mcp';
     targetLabel = (method || server || 'mcp').replace(/_/g, ' ');
@@ -623,11 +721,14 @@ export function historyActionPresentationMeta({ toolName, args, family, bashWord
   } else if (fam === 'search') {
     // A scoped search groups by the file/directory, while its pattern stays
     // available as operationLabel for the expanded original calls.
-    targetSource = String(headline.detail || headline.subject || '');
-    targetLabel = shortTarget(targetSource);
+    targetSource = String(rawSearchTarget || headline.detail || headline.subject || '');
+    targetLabel = historyDisplayPath(targetSource);
+  } else if (rawPathTarget) {
+    targetSource = rawPathTarget;
+    targetLabel = historyDisplayPath(rawPathTarget);
   } else {
     targetSource = String(headline.subject || '');
-    targetLabel = shortTarget(targetSource);
+    targetLabel = historyDisplayPath(targetSource);
   }
   const targetKey = normalizeTarget(targetSource);
   const isKnowledgeSearch = fam === 'mcp'

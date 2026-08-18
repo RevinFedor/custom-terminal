@@ -1,9 +1,12 @@
-// Pure rules of the split workspace (up to 3 panes side-by-side).
+// Pure rules of the split workspace.
 //
-// A pane = { projectId, tabId }. `panes.length === 0` — single mode: the
-// center shows ONE tab (store.centerTab). Focus is an index into panes; the
-// focused pane's tab (or centerTab in single mode) is what every tab-owned
-// surface (control bar, History, Timeline, task plan) follows.
+// A pane = { projectId, tabId, tabs? }: a STRIP of tabs with exactly one of
+// them shown. `tabId` is the shown one — the meaning it always had, so every
+// reader that asks "which tab is in this pane" keeps working unchanged.
+// `panes.length === 0` — single mode: the center shows ONE tab
+// (store.centerTab). Focus is an index into panes; the focused pane's tab (or
+// centerTab in single mode) is what every tab-owned surface (control bar,
+// History, Timeline, task plan) follows.
 //
 // The CENTER is decoupled from the sidebar project: activating a tab changes
 // only what the center shows, and an explicit project click (titlebar,
@@ -16,21 +19,35 @@
 //     unchanged;
 //   • otherwise → the pane in focus replaces its tab with the target.
 
-// ── How much the workspace holds ──────────────────────────────────────────
+// ── How much the workspace holds: as much as the user asks for ────────────
 //
-// The limit is stated in the dimension it is actually about: SCREEN COLUMNS.
-// Width is the scarce resource — a terminal squeezed under ~300px stops being
-// usable — so at most three columns stand side by side. Height is cheaper, so a
-// column may be split once into two rows.
+// There is NO cap on columns or rows (removed 2026-08-17). Юзер: *«ограничение
+// на количество окон быть не должно… я открыл 4 окна и новые создать не могу,
+// такого быть не должно»*.
 //
-// It used to be a single flat "at most 3 panes", written when a pane and a
-// column were the same thing. Vertical splitting arrived later and silently
-// changed what that number meant: it stopped capping the columns on screen and
-// started capping the whole GRID, which forbids a 2×2 layout even though that
-// is only two columns wide. Reported live: three panes (one column + a stacked
-// pair), and splitting the single column was impossible.
-export const MAX_SPLIT_COLUMNS = 3;
-export const MAX_ROWS_PER_COLUMN = 2;
+// The caps existed to protect readability — a terminal squeezed under ~300px
+// stops being usable. But that protection was already being done by something
+// else, and better: SPLIT_MIN_FRACTION keeps every pane at ≥15% of the axis, and
+// the user can drag the dividers. A hard count did not add safety on top of
+// that; it only refused a layout the user had explicitly asked for, from a rule
+// nobody could see. Judging "too small" belongs to the person looking at the
+// screen, not to a constant guessing at their monitor.
+//
+// The history of these numbers is a warning about counting the wrong thing. It
+// started as a flat "at most 3 panes", written when a pane and a column were the
+// same thing. Vertical splitting arrived later and silently changed what that
+// number meant: it stopped capping the columns on screen and started capping the
+// whole GRID, forbidding a 2×2 layout that is only two columns wide. That was
+// fixed by splitting it into two caps — and the two caps then multiplied into a
+// third, invisible limit of six panes, which is what the user hit. A limit that
+// keeps changing meaning under you is a sign it was never the real constraint.
+//
+// Kept as `Infinity` rather than deleted so the call sites keep reading as
+// "checked against the limit": bringing a cap back is then one line here, not an
+// archaeology exercise across four functions. `MAX_SPLIT_PANES` also still names
+// the restore-time truncation, which now truncates nothing.
+export const MAX_SPLIT_COLUMNS = Infinity;
+export const MAX_ROWS_PER_COLUMN = Infinity;
 /** Total cap, derived — used for restore-time truncation, not for decisions. */
 export const MAX_SPLIT_PANES = MAX_SPLIT_COLUMNS * MAX_ROWS_PER_COLUMN;
 
@@ -143,29 +160,347 @@ const finalizeRemoval = (panes, focusedIndex, idx) => {
 };
 
 // Activation of (projectId, tabId) with split active. Returns next state.
+//
+// With strips there are three cases, and the middle one is new:
+//   • the tab is SHOWN somewhere      → focus that pane, change nothing;
+//   • the tab has a CHIP somewhere    → focus that pane and show it there;
+//   • the tab is nowhere              → the focused pane's shown chip is
+//                                       REPLACED, in place, keeping its position
+//                                       in the strip and every other chip.
+//
+// Ordinary navigation must not GROW a strip. It is what a person does dozens of
+// times an hour, and a strip that grows from it would swallow the whole tab list
+// within minutes — including out of Ctrl+Tab, which by rule skips everything a
+// window holds. Chips appear only from gestures that mean "one more here": a
+// double-click on the header's empty space, or a drag into it.
 export function resolveSplitActivation(panes, focusedIndex, projectId, tabId) {
   if (!Array.isArray(panes) || panes.length === 0) {
     return { panes: [], focusedIndex: 0, changed: false };
   }
-  const existing = panes.findIndex((p) => p && p.tabId && p.tabId === tabId);
-  if (existing >= 0) {
-    return { panes, focusedIndex: existing, changed: existing !== focusedIndex };
+  const shownAt = panes.findIndex((p) => p && p.tabId && p.tabId === tabId);
+  if (shownAt >= 0) {
+    return { panes, focusedIndex: shownAt, changed: shownAt !== focusedIndex };
+  }
+  const heldAt = paneIndexHoldingTab(panes, tabId);
+  if (heldAt >= 0) {
+    // Its window already has a slot for it: show it there rather than dragging
+    // it into whichever pane happens to hold focus. A tab lives in one window,
+    // and activation goes TO the tab — moving the tab to the focus would tear it
+    // out of the strip the user built.
+    const pane = panes[heldAt];
+    const next = panes.slice();
+    next[heldAt] = paneWithHistoryFrom(paneWithTabs(pane, paneTabs(pane), tabId), pane);
+    return { panes: next, focusedIndex: heldAt, changed: true };
   }
   const at = clampIndex(panes, focusedIndex);
-  const next = panes.slice();
-  // Keep the slot's COLUMN: activation changes which tab a pane shows, never
-  // where that pane is. Writing a bare {projectId, tabId} dropped the column
-  // and the pane silently jumped out of its stack — measured live: filling the
-  // lower row of a split column turned two stacked 409px rows into two 623px
-  // side-by-side columns.
   const slot = panes[at];
+  const next = panes.slice();
+  // Replace the SHOWN chip in place. The strip's other chips and this chip's
+  // position in it are the layout the user built — activation changes what a
+  // slot holds, never the shape of the strip.
+  //
+  // The pane also keeps its COLUMN, for the same reason at the layout level:
+  // writing a bare {projectId, tabId} dropped it and the pane silently jumped
+  // out of its stack — measured live, filling the lower row of a split column
+  // turned two stacked 409px rows into two 623px side-by-side columns.
+  const strip = paneTabs(slot);
+  const replaced = strip.map((entry) => (
+    entry.tabId === slot.tabId ? { projectId, tabId } : entry
+  ));
   next[at] = paneWithHistoryFrom(
-    slot && slot.column !== undefined
-      ? { projectId, tabId, column: slot.column }
-      : { projectId, tabId },
+    paneWithTabs(slot, replaced.length > 0 ? replaced : [{ projectId, tabId }], tabId),
     slot,
   );
   return { panes: next, focusedIndex: at, changed: true };
+}
+
+// ── The strip: a pane holds a LIST of tabs, one of them shown ─────────────
+//
+// A pane used to hold exactly one tab, so "what is in this window" and "what is
+// on screen in it" were the same sentence. They are now two:
+//
+//   pane.tabs   — the strip, in the order the chips are drawn, left to right
+//   pane.tabId  — which of them is SHOWN (unchanged meaning, unchanged readers)
+//
+// STORAGE RULE, the same one `column` follows: a single-tab pane stores NO
+// `tabs` at all, byte-identical to every layout saved before this existed. The
+// list appears the moment a second chip does. So a missing list means "the strip
+// is just [tabId]" — which is what every legacy session is, and it restores
+// unchanged. `paneTabs` is the only reader of the raw field for that reason:
+// nothing else may treat "absent" as "empty".
+//
+// The array stays FLAT and stays the source of truth for order. Order is the
+// user's (double-click appends, drag would reorder) — never recency, because the
+// strip is a MAP the user builds, and a map that reshuffles itself is unreadable.
+// That is the same lesson the pane header's recent-list died of.
+
+// A strip entry is {projectId, tabId} — the same shape as a history entry and as
+// the pane itself. Ids alone would have been shorter and wrong: panes are
+// cross-project, so "close this project" has to find its chips inside strips,
+// and a bare id cannot answer whose it is.
+//
+// The three operations below work on a BARE strip, with no pane around it,
+// because the same strip exists in a place that has no pane: the single-mode
+// centre, where the workspace is not split at all. Sharing the arithmetic is the
+// point — the two surfaces must agree on what "add", "remove" and "replace in
+// place" mean, or the header would behave differently before and after a split.
+
+/** Insert a chip; `at` omitted appends. Existing chip → unchanged. */
+export function insertIntoStrip(strip, projectId, tabId, at = null) {
+  const list = Array.isArray(strip) ? strip : [];
+  if (!tabId || list.some((e) => e && e.tabId === tabId)) return list;
+  const insertAt = at === null || at === undefined
+    ? list.length
+    : Math.max(0, Math.min(list.length, at | 0));
+  const next = list.slice();
+  next.splice(insertAt, 0, { projectId, tabId });
+  return next;
+}
+
+/** Drop a chip. Returns the same array when it was not there. */
+export function removeFromStrip(strip, tabId) {
+  const list = Array.isArray(strip) ? strip : [];
+  if (!tabId || !list.some((e) => e && e.tabId === tabId)) return list;
+  return list.filter((e) => e && e.tabId !== tabId);
+}
+
+/**
+ * Swap one chip for another WITHOUT moving it — the shape of ordinary
+ * navigation: a window shows something else now, but the strip the user built
+ * keeps its order and its other chips.
+ */
+export function replaceInStrip(strip, outgoingTabId, projectId, tabId) {
+  const list = Array.isArray(strip) ? strip : [];
+  if (!tabId) return list;
+  if (list.some((e) => e && e.tabId === tabId)) return list; // already a chip
+  const at = list.findIndex((e) => e && e.tabId === outgoingTabId);
+  if (at === -1) return insertIntoStrip(list, projectId, tabId);
+  const next = list.slice();
+  next[at] = { projectId, tabId };
+  return next;
+}
+
+/** The pane's strip, in chip order. Never empty for a real pane. */
+export function paneTabs(pane) {
+  if (!pane) return [];
+  const list = Array.isArray(pane.tabs) ? pane.tabs.filter((e) => e && e.tabId) : [];
+  if (list.length > 0) return list;
+  return pane.tabId ? [{ projectId: pane.projectId, tabId: pane.tabId }] : [];
+}
+
+/**
+ * Does this pane hold that tab at all — shown, or merely present as a chip?
+ *
+ * Id-only, because tab ids are globally unique (`<projectId>-tab-<n>`) and every
+ * caller of this one has nothing but an id: "a tab was closed", "is this tab
+ * anywhere". The map below is the exception — it is given a PAIR and must honour
+ * it, so it uses the strict form.
+ */
+export function paneHoldsTab(pane, tabId) {
+  return !!tabId && paneTabs(pane).some((e) => e.tabId === tabId);
+}
+
+/** Strict form: the chip must belong to that project too. */
+function paneHoldsTabOfProject(pane, projectId, tabId) {
+  return !!tabId && paneTabs(pane).some((e) => e.tabId === tabId && e.projectId === projectId);
+}
+
+/**
+ * Write a strip back onto a pane, collapsing the single-tab case to the legacy
+ * shape (see the storage rule above).
+ *
+ * The pane's own projectId follows the SHOWN tab, because that is what it has
+ * always meant — every existing reader of pane.projectId is asking about what is
+ * on screen there.
+ */
+function paneWithTabs(pane, tabs, shownTabId) {
+  const list = tabs.filter((e) => e && e.tabId);
+  const shown = list.find((e) => e.tabId === shownTabId) || list[0] || null;
+  const { tabs: _drop, ...rest } = pane || {};
+  const next = { ...rest, projectId: shown ? shown.projectId : '', tabId: shown ? shown.tabId : '' };
+  if (list.length > 1) next.tabs = list.map((e) => ({ projectId: e.projectId, tabId: e.tabId }));
+  return next;
+}
+
+/** Every tab held by any pane — shown or not. The switcher's "on screen" set. */
+export function allPaneTabIds(panes) {
+  const out = [];
+  (Array.isArray(panes) ? panes : []).forEach((pane) => {
+    paneTabs(pane).forEach(({ tabId }) => { if (!out.includes(tabId)) out.push(tabId); });
+  });
+  return out;
+}
+
+/** Which pane holds this tab (shown or not), or -1. */
+export function paneIndexHoldingTab(panes, tabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (!tabId) return -1;
+  return list.findIndex((pane) => paneHoldsTab(pane, tabId));
+}
+
+/**
+ * Add a tab to a pane's strip and show it. Already there → just show it.
+ *
+ * ONE TAB LIVES IN ONE WINDOW, and this is where that is enforced: a tab that
+ * was in another window LEAVES it. The chip MOVES, it is never copied.
+ *
+ * Two panes naming the same tab is not a cosmetic duplicate. A live terminal is
+ * one DOM node, so it is drawn in exactly one of them — and the other window
+ * loses everything, header included, because a window's whole chrome is
+ * rendered by the tab it shows. What the user sees is not "the same tab twice"
+ * but a black rectangle where a window used to be: *«переместил вкладку — окно
+ * тупо пропало»*. The window was intact the whole time; it was showing a tab
+ * that was being drawn somewhere else.
+ *
+ * The invariant lives here and not in the callers because there is no caller
+ * for whom the copy would be right: putting a tab into a window always means it
+ * is now THERE. So «move to window» needs no detach step of its own, and the
+ * next caller cannot forget one.
+ *
+ * A window whose last chip left this way becomes a placeholder — «нет вкладки»,
+ * waiting for the next tab — not a closed window: taking a tab out of a window
+ * is not dismissing the window. Their indices come back in `emptied`, and the
+ * indices of everything else survive, because a placeholder keeps its slot.
+ *
+ * `at` inserts at a position; omitted appends (the double-click on empty header
+ * space, which always means "one more, at the end"). Returns null when nothing
+ * changes, so callers skip the write.
+ */
+export function addTabToPane(panes, paneIndex, projectId, tabId, at = null) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (!list[paneIndex] || !tabId) return null;
+  // Detach FIRST, from every OTHER pane: only after that does the target's own
+  // strip describe the whole truth. Removal never changes the array length, so
+  // `paneIndex` still means the same window below.
+  let detached = list;
+  const emptied = [];
+  list.forEach((pane, index) => {
+    if (index === paneIndex || !paneHoldsTab(pane, tabId)) return;
+    const res = removeTabFromPane(detached, index, tabId);
+    if (!res) return;
+    detached = res.panes;
+    if (res.emptied) emptied.push(index);
+  });
+  const moved = detached !== list;
+  const pane = detached[paneIndex];
+  const strip = paneTabs(pane);
+  if (strip.some((e) => e.tabId === tabId)) {
+    if (pane.tabId === tabId) return moved ? { panes: detached, emptied } : null;
+    const next = detached.slice();
+    next[paneIndex] = paneWithHistoryFrom(paneWithTabs(pane, strip, tabId), pane);
+    return { panes: next, emptied };
+  }
+  const insertAt = at === null || at === undefined
+    ? strip.length
+    : Math.max(0, Math.min(strip.length, at | 0));
+  const grown = strip.slice();
+  grown.splice(insertAt, 0, { projectId, tabId });
+  const next = detached.slice();
+  // The outgoing SHOWN tab goes into the pane's history: it stops being visible
+  // here even though its chip stays. The history answers "what did this window
+  // show before", which is exactly what changed.
+  next[paneIndex] = paneWithHistoryFrom(paneWithTabs(pane, grown, tabId), pane);
+  return { panes: next, emptied };
+}
+
+/**
+ * Remove a tab from ONE pane's strip.
+ *
+ * When the removed tab was the shown one, the NEIGHBOUR takes over — the chip to
+ * the right, or the left when there is none. Not the freshest, not the first:
+ * the strip is a spatial map, and after a chip goes the eye is already where its
+ * neighbour is. (Same reason the strip is not ordered by recency.)
+ *
+ * Returns `{ panes, emptied }`; `emptied` is true when the last chip left and the
+ * pane became a placeholder. Only the placeholder's own ✕ closes the window —
+ * clearing what is inside a window is not dismissing the window.
+ */
+export function removeTabFromPane(panes, paneIndex, tabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane || !tabId) return null;
+  const strip = paneTabs(pane);
+  const at = strip.findIndex((e) => e.tabId === tabId);
+  if (at === -1) return null;
+  const rest = strip.filter((e) => e.tabId !== tabId);
+  const next = list.slice();
+  if (rest.length === 0) {
+    const { tabs: _drop, ...bare } = pane;
+    next[paneIndex] = { ...bare, projectId: '', tabId: '' };
+    return { panes: next, emptied: true };
+  }
+  const shown = pane.tabId === tabId
+    ? rest[Math.min(at, rest.length - 1)].tabId
+    : pane.tabId;
+  // History only moves when what is SHOWN changes.
+  const rebuilt = paneWithTabs(pane, rest, shown);
+  next[paneIndex] = pane.tabId === tabId ? paneWithHistoryFrom(rebuilt, pane) : rebuilt;
+  return { panes: next, emptied: false };
+}
+
+/**
+ * A tab was closed or moved away entirely: drop it from EVERY strip.
+ *
+ * A pane that held it without showing it simply loses a chip — nothing about the
+ * layout changes there, which is why this is separate from emptyPaneByClosedTab.
+ * Returns null when no strip contained it.
+ */
+export function dropTabFromAllPaneStrips(panes, tabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (!tabId) return null;
+  let changed = false;
+  let next = list;
+  list.forEach((pane, index) => {
+    if (!paneHoldsTab(pane, tabId)) return;
+    const res = removeTabFromPane(next, index, tabId);
+    if (!res) return;
+    changed = true;
+    next = res.panes;
+  });
+  return changed ? { panes: next } : null;
+}
+
+/**
+ * Tabs changed OWNER (moved to another project). Rewrite the project on every
+ * chip that names one of them, in every strip.
+ *
+ * Three call sites move tabs across projects (one tab, a selection, a whole
+ * group) and each used to patch only the pane's own `projectId` — i.e. only the
+ * SHOWN chip. An unshown chip kept pointing at the project the tab had left, and
+ * the next restore would drop it as a tab that does not exist there.
+ *
+ * @param {(tabId: string) => boolean} moved  is this tab one of the moved ones
+ */
+export function reprojectPaneTabs(panes, moved, projectId) {
+  const list = Array.isArray(panes) ? panes : [];
+  return list.map((pane) => {
+    if (!pane || !pane.tabId) return pane;
+    const strip = paneTabs(pane);
+    if (!strip.some((e) => moved(e.tabId))) return pane;
+    const next = strip.map((e) => (moved(e.tabId) ? { projectId, tabId: e.tabId } : e));
+    return paneWithTabs(pane, next, pane.tabId);
+  });
+}
+
+/**
+ * Move a tab's chip within its own strip (drag inside the header).
+ * Returns null when the move is a no-op.
+ */
+export function reorderPaneTab(panes, paneIndex, tabId, toIndex) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane || !tabId) return null;
+  const strip = paneTabs(pane);
+  const from = strip.findIndex((e) => e.tabId === tabId);
+  if (from === -1) return null;
+  const to = Math.max(0, Math.min(strip.length - 1, toIndex | 0));
+  if (to === from) return null;
+  const moved = strip.slice();
+  const [entry] = moved.splice(from, 1);
+  moved.splice(to, 0, entry);
+  const next = list.slice();
+  next[paneIndex] = paneWithTabs(pane, moved, pane.tabId);
+  return { panes: next };
 }
 
 // ── What this pane showed before ──────────────────────────────────────────
@@ -228,7 +563,9 @@ export function restorablePaneHistory(panes, paneIndex, tabExists = () => true) 
   const list = Array.isArray(panes) ? panes : [];
   const pane = list[paneIndex];
   if (!pane) return [];
-  const visible = new Set(list.map((p) => p && p.tabId).filter(Boolean));
+  // Anything with a CHIP counts as already here: offering it as a "bring back"
+  // would be offering a click on a chip the user can already see.
+  const visible = new Set(allPaneTabIds(list));
   return paneHistory(pane).filter((e) => (
     e && e.tabId && !visible.has(e.tabId) && tabExists(e.projectId, e.tabId)
   ));
@@ -253,11 +590,15 @@ export function restorePanePreviousTab(panes, focusedIndex, tabId, tabExists = (
   const target = candidates[0];
   const pane = list[idx];
   const next = list.slice();
-  const restored = { projectId: target.projectId, tabId: target.tabId };
-  if (pane.column !== undefined) restored.column = pane.column;
+  // The restored tab takes the OUTGOING chip's place in the strip: this gesture
+  // undoes "I opened a file here", so the slot it opened into is exactly where
+  // the previous tab belongs. Other chips are untouched.
+  const strip = paneTabs(pane).map((entry) => (
+    entry.tabId === tabId ? { projectId: target.projectId, tabId: target.tabId } : entry
+  ));
   // The outgoing tab becomes the newest history entry, so the gesture toggles;
   // everything older survives underneath.
-  next[idx] = paneWithHistoryFrom(restored, pane);
+  next[idx] = paneWithHistoryFrom(paneWithTabs(pane, strip, target.tabId), pane);
   return { panes: next, focusedIndex: clampIndex(next, focusedIndex), restoredIndex: idx };
 }
 
@@ -313,7 +654,10 @@ const stripHistory = (pane) => {
 // (same tab, already present, or the workspace is full).
 export function addPane(panes, focusedIndex, current, added) {
   if (!added || !added.tabId) return null;
-  if (panes.some((p) => p.tabId === added.tabId)) return null;
+  // Already SOMEWHERE in the workspace — including as an unshown chip. A tab
+  // lives in one window; a second copy would be a second live terminal for the
+  // same session, which cannot exist.
+  if (paneIndexHoldingTab(panes, added.tabId) >= 0) return null;
   if (panes.length === 0) {
     if (!current || !current.tabId || current.tabId === added.tabId) return null;
     return { panes: [current, added], focusedIndex: 1 };
@@ -453,11 +797,12 @@ export function addEmptyPaneVertical(panes, focusedIndex, current, atIndex, side
   return { panes: next, focusedIndex: insertAt };
 }
 
-// Remove a tab's pane (close tab / ПКМ «Убрать»). A single remaining REAL
-// pane collapses the split back to single mode.
+// Remove a tab's pane (ПКМ «Убрать окно»). A single remaining REAL pane
+// collapses the split back to single mode. This closes the WINDOW, so it takes
+// the whole strip with it — unlike emptyPaneByClosedTab, which removes one chip.
 export function removePaneByTab(panes, focusedIndex, tabId) {
   if (!tabId) return null;
-  const idx = panes.findIndex((p) => p.tabId === tabId);
+  const idx = paneIndexHoldingTab(panes, tabId);
   if (idx === -1) return null;
   return finalizeRemoval(panes, focusedIndex, idx);
 }
@@ -488,22 +833,25 @@ export function removePaneByTab(panes, focusedIndex, tabId) {
  * common case and the collapse rule swallowed it. Only the placeholder's own ✕
  * closes a window.
  *
+ * With STRIPS this removes ONE CHIP, not the window's contents: the neighbouring
+ * chip takes over and the window goes empty only when the last one leaves. Same
+ * sentence as before, one level finer — "the pane stays, it just stops showing
+ * this tab" now has a step between "showing it" and "showing nothing".
+ *
  * Returns null when the tab has no pane.
  */
 export function emptyPaneByClosedTab(panes, focusedIndex, tabId) {
   const list = Array.isArray(panes) ? panes : [];
   if (!tabId) return null;
-  const idx = list.findIndex((p) => p && p.tabId === tabId);
+  const idx = paneIndexHoldingTab(list, tabId);
   if (idx === -1) return null;
-  const pane = list[idx];
-  const next = list.slice();
-  // The slot keeps its COLUMN — the geometry the user built is what stays.
-  // History goes with the tab: it named tabs shown in this slot, and the entry
-  // for a closed tab is purged anyway (dropTabFromAllPaneHistories).
-  next[idx] = pane.column !== undefined
-    ? { projectId: '', tabId: '', column: pane.column }
-    : { projectId: '', tabId: '' };
-  return { panes: next, focusedIndex: clampIndex(next, focusedIndex), emptiedIndex: idx };
+  // The slot keeps its COLUMN — the geometry the user built is what stays. The
+  // strip's other chips stay too; history is carried by removeTabFromPane when
+  // what is SHOWN changes, and the entry for a closed tab is purged separately
+  // (dropTabFromAllPaneHistories).
+  const res = removeTabFromPane(list, idx, tabId);
+  if (!res) return null;
+  return { panes: res.panes, focusedIndex: clampIndex(res.panes, focusedIndex), emptiedIndex: idx };
 }
 
 // Remove a pane by position — the only way to close an EMPTY placeholder
@@ -513,14 +861,32 @@ export function removePaneAt(panes, focusedIndex, index) {
   return finalizeRemoval(panes, focusedIndex, index);
 }
 
+/**
+ * A project was closed: its tabs are gone, so its CHIPS are gone.
+ *
+ * A pane survives if any chip of another project remains in it — closing one
+ * project must not tear down a window that is also showing a different one. The
+ * pane disappears only when the whole strip belonged to the closed project.
+ */
 export function removePanesByProject(panes, focusedIndex, projectId) {
   if (!projectId) return null;
-  const next = panes.filter((p) => p.projectId !== projectId);
-  if (next.length === panes.length) return null;
+  const list = Array.isArray(panes) ? panes : [];
+  let changed = false;
+  const rebuilt = list.map((pane) => {
+    if (isEmptyPane(pane)) return pane;
+    const strip = paneTabs(pane);
+    const kept = strip.filter((e) => e.projectId !== projectId);
+    if (kept.length === strip.length) return pane;
+    changed = true;
+    if (kept.length === 0) return null; // whole window belonged to that project
+    return paneWithTabs(pane, kept, pane.tabId);
+  });
+  if (!changed) return null;
+  const next = rebuilt.filter(Boolean);
   if (next.filter((p) => !isEmptyPane(p)).length <= 1) return { panes: [], focusedIndex: 0 };
-  const focusedTab = panes[clampIndex(panes, focusedIndex)];
-  const keptFocus = next.findIndex((p) => p.tabId === focusedTab?.tabId);
-  return { panes: next, focusedIndex: keptFocus >= 0 ? keptFocus : 0 };
+  const focusedTab = list[clampIndex(list, focusedIndex)];
+  const keptFocus = next.findIndex((p) => p && p.tabId === focusedTab?.tabId);
+  return { panes: normalizeColumns(next), focusedIndex: keptFocus >= 0 ? keptFocus : 0 };
 }
 
 // Restore-time validation: keep panes whose tab still exists, PLUS windows the
@@ -536,28 +902,247 @@ export function removePanesByProject(panes, focusedIndex, projectId) {
 // silently closed a window they had chosen to keep.
 export function sanitizePanes(panes, focusedIndex, tabExists) {
   const valid = (Array.isArray(panes) ? panes : [])
-    .filter((p) => (
-      p && typeof p.projectId === 'string' && typeof p.tabId === 'string'
-      && (!p.tabId || tabExists(p.projectId, p.tabId))
-    ))
+    .map((p) => {
+      if (!p || typeof p.projectId !== 'string' || typeof p.tabId !== 'string') return null;
+      if (!p.tabId) return p; // deliberately empty window
+      // Scrub the STRIP, not just the shown tab: a chip whose tab was deleted
+      // while the app was closed would restore as a dead chip, and if it was the
+      // shown one the whole window would be dropped even though its other chips
+      // are alive. The shown tab is re-picked from what survived, in strip order.
+      const strip = paneTabs(p).filter((e) => e && e.tabId && tabExists(e.projectId, e.tabId));
+      if (strip.length === 0) return null;
+      return paneWithTabs(p, strip, p.tabId);
+    })
+    .filter(Boolean);
+  // Одна вкладка — одно окно, и на входе с диска тоже. Раскладка приходит из
+  // сохранённой сессии: она может быть старше этого правила или поправлена
+  // руками, а вкладка, названная двумя окнами, рисуется только в одном — второе
+  // остаётся чёрным прямоугольником без шапки. Снимаем дубликат ЗДЕСЬ, чтобы
+  // такая раскладка не пережила перезапуск.
+  //
+  // Право на вкладку получает окно, которое её ПОКАЗЫВАЕТ: отобрать чип у него
+  // значит погасить как раз то окно, где вкладка сейчас и нарисована. Среди
+  // равных — первое по порядку. Окно, оставшееся совсем без чипов, уходит: это
+  // не окно, которое человек намеренно оставил пустым.
+  const owner = new Map();
+  valid.forEach((pane, index) => {
+    if (pane.tabId && !owner.has(pane.tabId)) owner.set(pane.tabId, index);
+  });
+  valid.forEach((pane, index) => {
+    paneTabs(pane).forEach(({ tabId }) => { if (!owner.has(tabId)) owner.set(tabId, index); });
+  });
+  const unique = valid
+    .map((pane, index) => {
+      if (!pane.tabId) return pane; // намеренно пустое окно
+      const strip = paneTabs(pane).filter((e) => owner.get(e.tabId) === index);
+      return strip.length === 0 ? null : paneWithTabs(pane, strip, pane.tabId);
+    })
+    .filter(Boolean)
     .map((p) => {
       const history = paneHistory(p).filter((e) => e && e.tabId && tabExists(e.projectId, e.tabId));
       const { prevProjectId, prevTabId, ...rest } = p;
       return history.length > 0 ? { ...rest, history } : stripHistory(rest);
     });
   // An all-empty layout is not a layout — nothing to come back to.
-  if (valid.length < 2 || !valid.some((p) => p.tabId)) return { panes: [], focusedIndex: 0 };
+  if (unique.length < 2 || !unique.some((p) => p.tabId)) return { panes: [], focusedIndex: 0 };
   // Truncation keeps whole COLUMNS: a flat slice can cut a stacked column in
   // half and leave a lone row where the user had a pair. Restores are already
   // within the caps in practice — this is the backstop for a hand-edited or
   // future-version session.
   const kept = [];
-  paneColumns(valid).slice(0, MAX_SPLIT_COLUMNS).forEach((rows) => {
+  paneColumns(unique).slice(0, MAX_SPLIT_COLUMNS).forEach((rows) => {
     rows.slice(0, MAX_ROWS_PER_COLUMN).forEach(({ pane }) => kept.push(pane));
   });
   const next = normalizeColumns(kept);
   if (next.length < 2) return { panes: [], focusedIndex: 0 };
   return { panes: next, focusedIndex: clampIndex(next, focusedIndex) };
+}
+
+// ── Раскладка целиком, одним описанием ────────────────────────────────────
+//
+// Every function above is a GESTURE: one click's worth of change, with the
+// guards a gesture needs (only one placeholder at a time, because a person has
+// to fill it before making another). An API caller does not make gestures — it
+// states the arrangement it wants: «эти две вкладки справа, каждая своим окном»
+// or «эти две справа, в одном окне». Composing that out of gestures means four
+// round-trips that can each half-fail, and the placeholder guard refuses the
+// second step anyway.
+//
+// So this is its own path, and it is ATOMIC: one call returns the whole new
+// layout or nothing. The nesting of `windows` carries the distinction that used
+// to need a separate flag — outer array is windows, inner array is the strip
+// inside one window:
+//
+//   [[codex], [claude]]   → two windows side by side
+//   [[codex, claude]]     → one window, two chips
+//
+// A tab named here MOVES: it lives in exactly one window, so placing it
+// somewhere is also taking it out of wherever it was.
+
+/**
+ * @param {Array} panes                   current panes ([] = single mode)
+ * @param {number} focusedIndex
+ * @param {object} spec
+ * @param {number} [spec.anchorIndex]     window to place relative to (default: focused)
+ * @param {'right'|'left'|'above'|'below'} spec.side
+ * @param {Array<Array<{projectId: string, tabId: string}>>} spec.windows
+ * @param {'columns'|'rows'} [spec.divide] how several windows divide the new area
+ * @param {{projectId: string, tabId: string}|null} current  centre tab (single mode)
+ * @returns {{panes: Array, focusedIndex: number, placedIndices: number[]}|null}
+ */
+export function arrangePanes(panes, focusedIndex, spec, current = null) {
+  const windows = (Array.isArray(spec?.windows) ? spec.windows : [])
+    .map((strip) => (Array.isArray(strip) ? strip.filter((e) => e && e.tabId) : []))
+    .filter((strip) => strip.length > 0);
+  if (windows.length === 0) return null;
+  const side = spec?.side === 'left' || spec?.side === 'above' || spec?.side === 'below'
+    ? spec.side
+    : 'right';
+  // TWO different questions, and conflating them was the first bug here:
+  //   • WHERE the new area goes relative to the anchor  → `side`;
+  //   • HOW several windows divide THAT area            → `divide`.
+  // «справа, и раздели это окно на два по горизонтали» means one new column to
+  // the right, split into two rows — not two rows added to the anchor's own
+  // column, which is what a single flag produced.
+  const intoAnchorColumn = side === 'above' || side === 'below';
+  const divideRows = intoAnchorColumn || spec?.divide === 'rows';
+
+  let list = Array.isArray(panes) ? panes.slice() : [];
+  // Single mode: the centre becomes the first window, exactly as the split
+  // gestures do — otherwise "put this to the right of what I am looking at"
+  // would have nothing to be to the right OF.
+  if (list.length === 0) {
+    if (!current || !current.tabId) return null;
+    list = [stripColumn(current)];
+  }
+
+  // The named tabs are MOVING: pull them out of wherever they are now. A window
+  // that loses its last chip this way disappears — it was showing one of the
+  // tabs being rearranged, so leaving an empty box behind would be leaving
+  // debris from the very move the caller asked for. A window the user had
+  // deliberately left empty is untouched (it holds none of these tabs).
+  const anchorPaneBefore = list[clampIndex(list, (
+    Number.isInteger(spec?.anchorIndex) ? spec.anchorIndex : focusedIndex
+  ))];
+  const moving = windows.flat();
+  moving.forEach(({ tabId }) => {
+    const res = dropTabFromAllPaneStrips(list, tabId);
+    if (res) list = res.panes;
+  });
+  list = list.filter((pane) => !isEmptyPane(pane) || panes.some((p) => p === pane));
+
+  // The anchor may have been the pane that just disappeared; then the layout has
+  // no "relative to" left and the new windows simply take the whole area.
+  const anchorAt = list.indexOf(anchorPaneBefore);
+  const anchorIndex = anchorAt >= 0 ? anchorAt : (list.length > 0 ? clampIndex(list, 0) : -1);
+  if (anchorIndex < 0) {
+    // Nothing left to anchor to: the arrangement IS the workspace.
+    const built = windows.map((strip, i) => paneWithTabs(
+      divideRows ? { column: 0 } : { column: i },
+      strip,
+      strip[0].tabId,
+    ));
+    const next = normalizeColumns(built);
+    return { panes: next, focusedIndex: 0, placedIndices: next.map((_, i) => i) };
+  }
+
+  const anchorColumn = paneColumn(list[anchorIndex], anchorIndex);
+  // Columns become EXPLICIT before any splice: with implicit columns an
+  // insertion shifts array positions and therefore silently re-columns every
+  // pane after it (the lesson addEmptyPaneVertical documents).
+  const explicit = list.map((pane, index) => ({ ...pane, column: paneColumn(pane, index) }));
+
+  if (intoAnchorColumn) {
+    // «сверху/снизу» — the new windows join the anchor's OWN column as rows.
+    const built = windows.map((strip) => paneWithTabs({ column: anchorColumn }, strip, strip[0].tabId));
+    // Rows of one column are contiguous in the array, so "above" means before
+    // the first of them and "below" after the last.
+    const rows = explicit
+      .map((pane, index) => ({ pane, index }))
+      .filter(({ pane }) => pane.column === anchorColumn);
+    const insertAt = side === 'above'
+      ? rows[0].index
+      : rows[rows.length - 1].index + 1;
+    const next = explicit.slice();
+    next.splice(insertAt, 0, ...built);
+    const normalized = normalizeColumns(next);
+    return {
+      panes: normalized,
+      focusedIndex: insertAt,
+      placedIndices: built.map((_, i) => insertAt + i),
+    };
+  }
+
+  // A new AREA opens beside the anchor — at its column (left) or right after it
+  // (right) — and everything at or beyond that shifts along. How many COLUMNS
+  // that area takes is the second question: side by side (default) it is one
+  // column per window; divided into rows it is a single column of rows.
+  const firstNewColumn = side === 'left' ? anchorColumn : anchorColumn + 1;
+  const newColumnCount = divideRows ? 1 : windows.length;
+  const shifted = explicit.map((pane) => (
+    pane.column >= firstNewColumn ? { ...pane, column: pane.column + newColumnCount } : pane
+  ));
+  const built = windows.map((strip, i) => paneWithTabs(
+    { column: divideRows ? firstNewColumn : firstNewColumn + i },
+    strip,
+    strip[0].tabId,
+  ));
+  // Keep the flat array sorted by column: the block goes before the first pane
+  // whose column is now past the new ones.
+  let insertAt = shifted.length;
+  for (let i = 0; i < shifted.length; i += 1) {
+    if (shifted[i].column >= firstNewColumn) { insertAt = i; break; }
+  }
+  const next = shifted.slice();
+  next.splice(insertAt, 0, ...built);
+  const normalized = normalizeColumns(next);
+  return {
+    panes: normalized,
+    focusedIndex: insertAt,
+    placedIndices: built.map((_, i) => insertAt + i),
+  };
+}
+
+/**
+ * The workspace as an API caller reads it: windows in SCREEN order, each with
+ * its strip, which chip is shown, and where it sits in the grid.
+ *
+ * Screen order, not array order — the array is sorted by column but a reader
+ * asking "what is the window on the right" must not have to know that.
+ */
+export function describeWorkspace(panes, focusedIndex, current = null) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (list.length === 0) {
+    return {
+      split: false,
+      windows: current && current.tabId
+        ? [{
+          index: 0,
+          column: 0,
+          row: 0,
+          focused: true,
+          shownTabId: current.tabId,
+          tabs: [{ projectId: current.projectId, tabId: current.tabId }],
+        }]
+        : [],
+    };
+  }
+  const focus = clampIndex(list, focusedIndex);
+  const windows = [];
+  paneColumns(list).forEach((rows, columnIndex) => {
+    rows.forEach(({ pane, index }, rowIndex) => {
+      windows.push({
+        index,
+        column: columnIndex,
+        row: rowIndex,
+        focused: index === focus,
+        empty: isEmptyPane(pane),
+        shownTabId: pane.tabId || null,
+        tabs: paneTabs(pane).map((e) => ({ projectId: e.projectId, tabId: e.tabId })),
+      });
+    });
+  });
+  return { split: true, windows };
 }
 
 // Geometry: equal columns, no draggable divider (v1). Returns percent rects.
@@ -774,11 +1359,18 @@ export function paneIsStacked(panes, index) {
 // the pane's POSITION ON SCREEN — read without reading.
 //
 // Returns one cell per pane, left-to-right in screen order:
-//   state 'self-focused' — this tab's pane, and it holds focus
-//   state 'self'         — this tab's pane, not focused
+//   state 'self-focused' — this tab's pane, shown there, and it holds focus
+//   state 'self'         — this tab's pane, shown there, not focused
+//   state 'held'         — this tab's pane, but a NEIGHBOURING CHIP is shown
 //   state 'other'        — some other pane
 // Single mode (panes.length === 0) still returns ONE cell so an open tab always
 // carries a mark; `mine` is then simply "is this the center tab".
+//
+// The 'held' state exists because a pane now holds a strip: a tab can be in a
+// window without being the one on screen there. With only "mine / not mine" the
+// mark would claim the tab is visible when it is not — and "where is it" and
+// "can I see it" are exactly the two questions a person asks of this mark. So the
+// CELL says which window, and how it is filled says whether it is showing.
 //
 // Returns [] when the tab is in no pane at all. Callers must still RESERVE the
 // slot in that case — a map that appears and disappears makes the tab name
@@ -795,11 +1387,12 @@ export function paneMapCells(panes, focusedIndex, projectId, tabId, centerTab = 
   const focus = clampIndex(list, focusedIndex);
   let found = false;
   const cells = list.map((pane, index) => {
-    const mine = !!pane && pane.projectId === projectId && pane.tabId === tabId;
-    if (mine) found = true;
+    const shown = !!pane && pane.projectId === projectId && pane.tabId === tabId;
+    const held = !shown && paneHoldsTabOfProject(pane, projectId, tabId);
+    if (shown || held) found = true;
     return {
-      mine,
-      state: mine ? (index === focus ? 'self-focused' : 'self') : 'other',
+      mine: shown || held,
+      state: shown ? (index === focus ? 'self-focused' : 'self') : (held ? 'held' : 'other'),
     };
   });
   return found ? cells : [];
@@ -821,9 +1414,13 @@ export function paneMapGrid(panes, focusedIndex, projectId, tabId, centerTab = n
   const focus = clampIndex(list, focusedIndex);
   let found = false;
   const grid = paneColumns(list).map((rows) => rows.map(({ pane, index }) => {
-    const mine = !!pane && pane.projectId === projectId && pane.tabId === tabId;
-    if (mine) found = true;
-    return { mine, state: mine ? (index === focus ? 'self-focused' : 'self') : 'other' };
+    const shown = !!pane && pane.projectId === projectId && pane.tabId === tabId;
+    const held = !shown && paneHoldsTabOfProject(pane, projectId, tabId);
+    if (shown || held) found = true;
+    return {
+      mine: shown || held,
+      state: shown ? (index === focus ? 'self-focused' : 'self') : (held ? 'held' : 'other'),
+    };
   }));
   return found ? grid : [];
 }

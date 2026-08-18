@@ -4,6 +4,8 @@ import {
   createHistoryTailSpacer,
   historyContentDistanceFromBottom,
   historyTailReserveDeficitAfterShrink,
+  historyTailReserveGrowthBurn,
+  isHistoryAtContentBottom,
   isUserOwnedScrollBurn,
 } from './historyTailSpacer.mjs';
 
@@ -150,4 +152,128 @@ test('burn diagnostics carry the source', () => {
   spacer.burn(50, 'deficit-reconcile');
   assert.ok(lines.some((l) => l.includes('burn px=100') && l.includes('src=user-scroll')));
   assert.ok(lines.some((l) => l.includes('burn px=50') && l.includes('src=deficit-reconcile')));
+});
+
+test('bottom question is answered against CONTENT, not the padded scroller', () => {
+  // A reserve is fake empty space below the content. Standing at the visual
+  // bottom with 400px of reserve below is «at the bottom»; the bare geometry
+  // helper says otherwise, and the mount wave / composer re-pin used to
+  // believe it and silently drop the tail hold.
+  const atVisualBottom = { scrollHeight: 5400, scrollTop: 4600, clientHeight: 400 };
+  assert.equal(isHistoryAtContentBottom(atVisualBottom, { spacerPx: 400 }), true);
+  assert.equal(isHistoryAtContentBottom(atVisualBottom, { spacerPx: 0 }), false);
+  // Genuinely mid-list stays mid-list whatever the reserve.
+  const midList = { scrollHeight: 5400, scrollTop: 1000, clientHeight: 400 };
+  assert.equal(isHistoryAtContentBottom(midList, { spacerPx: 400 }), false);
+  assert.equal(isHistoryAtContentBottom(null, { spacerPx: 0 }), false);
+});
+
+test('composer growth slack keeps a tail reader pinned', () => {
+  // The composer is the column's last row: growing it by one text line
+  // shortens the viewport, so a reader parked at the tail measures exactly
+  // that many pixels away — against a 4px threshold that reads as «left the
+  // bottom» and the re-pin never runs.
+  const afterGrowth = { scrollHeight: 5000, scrollTop: 4634, clientHeight: 340 };
+  assert.equal(isHistoryAtContentBottom(afterGrowth, {}), false);
+  assert.equal(isHistoryAtContentBottom(afterGrowth, { slackPx: 26 }), true);
+  // Slack is bounded by the actual growth — it never excuses a real scroll.
+  const scrolledAway = { scrollHeight: 5000, scrollTop: 4000, clientHeight: 340 };
+  assert.equal(isHistoryAtContentBottom(scrolledAway, { slackPx: 26 }), false);
+});
+
+test('reconciliation follows content growth, never the reader position', () => {
+  // Scrolling up does not refill the fake space — the content is unchanged,
+  // only the reader moved. Reconciliation must stay silent there.
+  assert.equal(historyTailReserveGrowthBurn({
+    spacerPx: 247, previousContentBottom: 126000, contentBottom: 126000,
+  }), 0);
+  // Real growth (a streaming block got taller, a row materialised) refills
+  // exactly its own height.
+  assert.equal(historyTailReserveGrowthBurn({
+    spacerPx: 247, previousContentBottom: 126000, contentBottom: 126040,
+  }), 40);
+  // Growth larger than the reserve refills all of it, never more.
+  assert.equal(historyTailReserveGrowthBurn({
+    spacerPx: 247, previousContentBottom: 126000, contentBottom: 126900,
+  }), 247);
+  // Shrink is the arming path's business, not this one's.
+  assert.equal(historyTailReserveGrowthBurn({
+    spacerPx: 247, previousContentBottom: 126000, contentBottom: 125500,
+  }), 0);
+  // First measurement of a fresh reserve has nothing to compare against.
+  assert.equal(historyTailReserveGrowthBurn({
+    spacerPx: 247, previousContentBottom: null, contentBottom: 126000,
+  }), 0);
+  assert.equal(historyTailReserveGrowthBurn({ spacerPx: 0 }), 0);
+});
+
+test('one wheel tick costs one tick of reserve (prod 17.08 19:26)', () => {
+  // The reported bug: «один скролл работает как за два, за три». The scroll
+  // handler burned the travelled pixels, then the per-commit reconciliation —
+  // which ran on the very commit that burn caused — re-derived the reserve
+  // from the reader's distance to the bottom, measured it smaller by exactly
+  // the same amount, and burned those pixels a second time. The trace shows
+  // the pairs: burn px=1 user-scroll, burn px=1 deficit-reconcile.
+  const lines = [];
+  const spacer = createHistoryTailSpacer({ diag: (l) => lines.push(l) });
+  spacer.arm(247, 'group-foot-collapse');
+  let contentBottom = 126000;      // motionless content: nothing is growing
+  let previousBottom = null;
+  for (const travelled of [1, 1, 1, 2, 2, 3, 3, 4, 4, 5]) {
+    spacer.burn(travelled, 'user-scroll');
+    // The commit that burn triggered runs the reconciliation.
+    const refill = historyTailReserveGrowthBurn({
+      spacerPx: spacer.get(), previousContentBottom: previousBottom, contentBottom,
+    });
+    previousBottom = contentBottom;
+    if (refill > 0) spacer.burn(refill, 'content-growth');
+  }
+  // 26px travelled → exactly 26px consumed, not 52.
+  assert.equal(spacer.get(), 247 - 26);
+  assert.equal(lines.filter((l) => l.includes('src=content-growth')).length, 0);
+  // …and genuine growth still refills the reserve.
+  contentBottom += 60;
+  assert.equal(historyTailReserveGrowthBurn({
+    spacerPx: spacer.get(), previousContentBottom: previousBottom, contentBottom,
+  }), 60);
+});
+
+test('the reserve rendering late must not read as content growth (prod 18.08 00:29)', () => {
+  // Виртуализация применяет высоту подвала на коммит позже. Если дно контента
+  // считать по НАМЕРЕННОЙ высоте резерва, первый замер (резерва в разметке ещё
+  // нет) и второй (уже есть) расходятся ровно на резерв — и это читается как
+  // «контент вырос настолько же», то есть резерв схлопывается разом.
+  const CONTENT = 126000;
+  const RESERVE = 332;
+
+  // Как было: вычитаем намеренное число из высоты прокрутки.
+  const intentBefore = (CONTENT) - RESERVE;            // подвал ещё не применён
+  const intentAfter = (CONTENT + RESERVE) - RESERVE;   // подвал применён
+  assert.equal(
+    historyTailReserveGrowthBurn({
+      spacerPx: RESERVE, previousContentBottom: intentBefore, contentBottom: intentAfter,
+    }),
+    RESERVE,
+    'намеренная высота даёт ложный «рост» ровно на величину резерва',
+  );
+
+  // Как стало: вычитаем ФАКТИЧЕСКУЮ высоту элемента в разметке.
+  const domBefore = CONTENT - 0;                       // элемента ещё нет → 0
+  const domAfter = (CONTENT + RESERVE) - RESERVE;      // элемент есть → его высота
+  assert.equal(domBefore, domAfter, 'дно контента одно и то же в обоих кадрах');
+  assert.equal(
+    historyTailReserveGrowthBurn({
+      spacerPx: RESERVE, previousContentBottom: domBefore, contentBottom: domAfter,
+    }),
+    0,
+    'ложного схлопывания больше нет',
+  );
+
+  // И настоящий рост поверх применённого подвала по-прежнему виден.
+  assert.equal(
+    historyTailReserveGrowthBurn({
+      spacerPx: RESERVE, previousContentBottom: domAfter, contentBottom: domAfter + 90,
+    }),
+    90,
+  );
 });

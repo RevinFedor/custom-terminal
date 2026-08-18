@@ -104,25 +104,31 @@ test('a split STARTED from single mode opens equal, not at the dead layout\'s si
 
 // ── The split button at the limit ─────────────────────────────────────────
 
-test('the split button greys out at the limit instead of disappearing', () => {
+test('the split button greys out when refused instead of disappearing', () => {
   // Reported live: three panes open (one column + a stacked pair) and «кнопка,
   // отвечающая за разделение, тупо пропала». Two defects in one: the cap was
   // counted in panes rather than columns, and the control was mounted
   // CONDITIONALLY, so hitting it removed the button instead of explaining it.
+  //
+  // The caps themselves are gone (2026-08-17), so the only refusal left is an
+  // unfilled placeholder — but the mounting rule outlives them: a control that
+  // vanishes reads as a bug whatever made it unavailable.
   const row = block(chrome, 'export function SplitPaneAttachRow(', '\n/** Above every surface');
   assert.ok(!/\{canSplit && \(/.test(row), 'the button must not be conditionally mounted');
   assert.match(row, /splitAvailability\(splitPanes, paneIndex \?\? null\)/);
-  // Both directions asked separately: three full columns must not hide the
-  // still-possible vertical split.
+  // Both directions asked separately: a full column must not hide the
+  // still-possible sideways split.
   assert.match(row, /splitCan\.horizontal/);
   assert.match(row, /splitCan\.vertical/);
   // And the disabled state must SAY why.
-  assert.match(row, /Рабочая область заполнена/);
+  assert.match(row, /Сначала выберите вкладку для пустой панели/);
 });
 
-test('"add to workspace" is capped by COLUMNS, not by the pane count', () => {
-  // A stacked pair is two panes in ONE column; counting panes refused a third
-  // column while the screen still had room for it.
+test('"add to workspace" asks the model, never counts panes itself', () => {
+  // It counted panes, which refused a third column while the screen still had
+  // room. The count caps are gone now, but the rule that survives them is the
+  // one that mattered: one place answers "can this still be split", and every
+  // caller asks IT rather than re-deriving the answer from a number.
   const tabBar = read('..', 'components', 'Workspace', 'TabBar.tsx');
   assert.ok(!/const splitFull = splitPanes\.length >= 3;/.test(tabBar));
   assert.match(tabBar, /splitFull = !splitAvailability\(splitPanes, null\)\.horizontal/);
@@ -135,4 +141,21 @@ test('the strips are the violet drag language, same as the sidebar handle', () =
   const layer = block(chrome, 'export function SplitDividerLayer()', '\n// Markdown/file content');
   assert.match(layer, /col-resize/);
   assert.match(layer, /row-resize/);
+});
+
+// ── Меню направления: иконка + одно слово ─────────────────────────────────
+
+test('пункты меню направления называют только СТОРОНУ, глагол остаётся на кнопке', () => {
+  // Было «Разделить: панель сверху» / «Разделить: панель снизу» — две длинные
+  // строки, отличающиеся одним словом в самом конце. Чтобы выбрать, приходилось
+  // дочитывать обе до конца, хотя вопрос у меню ровно один: с какой стороны.
+  // Глагол уже назван кнопкой, которая это меню открыла.
+  const row = block(chrome, 'export function SplitPaneAttachRow(', '\n/** Above every surface');
+  assert.doesNotMatch(row, /label: 'Разделить: панель/);
+  assert.match(row, /side: 'above' as const, label: 'Сверху', Icon: PanelTop/);
+  assert.match(row, /side: 'below' as const, label: 'Снизу', Icon: PanelBottom/);
+  // Иконка показывает ФОРМУ результата — без неё одно слово осталось бы без
+  // подсказки, что вообще произойдёт.
+  assert.match(chrome, /import \{[^}]*PanelBottom[^}]*PanelTop[^}]*\} from 'lucide-react'/);
+  assert.match(row, /<Icon size=\{13\}/);
 });

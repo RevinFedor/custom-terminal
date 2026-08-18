@@ -1,10 +1,16 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId } from './store/useWorkspaceStore';
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
+import { setWorkspaceOverlayHost, releaseWorkspaceOverlayHost } from './utils/workspaceOverlayHost.mjs';
 import { resolvePtyAgentOwner } from './utils/ptyAgentOwner.mjs';
+import { describeWorkspace } from './utils/splitPanesModel.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
 import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG } from './utils/projectCardPresence.mjs';
+import {
+  PROJECT_HOVER_PREVIEW_EVENT,
+  type ProjectHoverPreviewDetail,
+} from './constants/projectHoverPreview';
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
@@ -15,11 +21,12 @@ import EditProjectModal from './components/UI/EditProjectModal';
 import SessionInputModal from './components/UI/SessionInputModal';
 import SettingsModal from './components/UI/SettingsModal';
 import HelpModal from './components/UI/HelpModal';
-import HelpButton from './components/UI/HelpButton';
 import ControlHint from './components/UI/ControlHint';
 import Tooltip from './components/UI/Tooltip';
 import PromptPickerOverlay from './components/Workspace/PromptPickerOverlay';
+import WorkspaceTitleBarTools from './components/Workspace/WorkspaceTitleBarTools';
 import TabSwitcherOverlay from './components/Workspace/TabSwitcherOverlay';
+import ProjectSwitcherOverlay from './components/Workspace/ProjectSwitcherOverlay';
 import { getTabChromeColorConfig } from './components/Workspace/tabChrome';
 // Drag and drop
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
@@ -47,7 +54,10 @@ import {
   subscribeOrchestrationRunChanges,
   useOrchestrationStore,
 } from './store/useOrchestrationStore';
-import { buildCodexRunPayload } from './utils/codexLaunch';
+import {
+  buildCodexRunPayload,
+  getCodexHistoryMutationSettingsProof,
+} from './utils/codexLaunch';
 import {
   getCodexDisplaySessionId,
   getConfirmedCodexWriterSessionId,
@@ -81,11 +91,13 @@ import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/cl
 import { getClaudeStartupDefaultsGateSnapshot } from './utils/claudeStartupDefaultsGate';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
+import { PROJECT_CARD_MAX_H, TITLE_BAR_H } from './constants/layout';
 import { generateTabTitleFromSession } from './utils/generateTabTitle';
 import { linkFileTab } from './utils/linkFileTab';
 import { resolveDockBusyBadgeState } from './utils/dockBusyBadgeState.mjs';
 import { shouldNavigateProjectsWithArrow } from './utils/projectArrowNavigation.mjs';
 import { resolveFocusedTerminalSelection } from './utils/focusedTerminalContext.mjs';
+import { collectAgentBusyHydration } from './utils/agentBusyHydration.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -97,6 +109,13 @@ const DRAFT_SCREEN_DIAGNOSTIC_SETTLE_TIMEOUT_MS = 60_000;
 // единственное место в титлбаре, где приложение представляет само себя,
 // поэтому её палитра обязана совпадать с иконкой в доке.
 const APP_ICON_ORANGE = '#F09018';
+// Тот же оранжевый, приглушённый — покойное состояние кнопки Home. Она красит
+// не состояние, а само приложение, поэтому серого у неё нет вовсе: есть тише и
+// громче. Значения — тот же тон с меньшей насыщенностью/светлотой, а не
+// прозрачность: полупрозрачный оранжевый на разных подложках титлбара давал
+// разный цвет.
+const APP_ICON_ORANGE_MUTED = '#B36C1E';
+const APP_ICON_ORANGE_HOVER_BG = 'rgba(240,144,24,0.12)';
 
 // Домик тем же контуром, что остальные иконки титлбара (lucide-геометрия:
 // сетка 24, штрих 2, скруглённые концы). Эмодзи 🏠 рендерился шрифтом системы:
@@ -586,6 +605,24 @@ const ProjectTabItem = memo(({
     };
   }, [hasCompletionNotification]);
 
+  // Наведение — одно на два источника: мышь и Ctrl+Q.
+  //
+  // Раньше ховер жил только в CSS (`hover:text-white`), и клавиатура физически
+  // не могла его вызвать. Теперь это состояние, поэтому переключатель проектов
+  // подсвечивает карточку РОВНО так же, как курсор: не «похоже», а тем же
+  // кодом — разойтись им нечем.
+  const [isHovered, setIsHovered] = useState(false);
+  const [isPreviewHovered, setIsPreviewHovered] = useState(false);
+  useEffect(() => {
+    const onPreview = (event: Event) => {
+      const detail = (event as CustomEvent<ProjectHoverPreviewDetail>).detail;
+      setIsPreviewHovered(detail?.projectId === projectId);
+    };
+    window.addEventListener(PROJECT_HOVER_PREVIEW_EVENT, onPreview);
+    return () => window.removeEventListener(PROJECT_HOVER_PREVIEW_EVENT, onPreview);
+  }, [projectId]);
+  const hovered = isHovered || isPreviewHovered;
+
   useEffect(() => {
     const handleStructuredProjectTarget = (event: Event) => {
       const detail = (event as CustomEvent<{
@@ -675,11 +712,13 @@ const ProjectTabItem = memo(({
   }, [projectId, index, onTabDrop, isEditing, isPinnedSystem]);
 
   // Text color: active (selected) = black, has processes = white, idle = gray
+  // hover:text-white заменён на состояние: класс работал только от курсора, а
+  // подсветить карточку должен уметь и Ctrl+Q.
   const textColor = isActive
     ? 'text-black'
-    : activeProcessCount > 0 || isProjectBusy
+    : activeProcessCount > 0 || isProjectBusy || hovered
       ? 'text-white'
-      : 'text-gray-400 hover:text-white';
+      : 'text-gray-400';
   const dropState = structuredDropState
     || (isTabDropBlocked ? 'blocked' : isTabDropTarget ? 'allowed' : null);
 
@@ -698,7 +737,10 @@ const ProjectTabItem = memo(({
         padding: `${projectTabGeometry.paddingY}px ${projectTabGeometry.paddingX}px`,
         fontSize: `${fontSize}px`,
         lineHeight: '16px',
-        height: `${Math.max(20, 16 + projectTabGeometry.paddingY * 2)}px`,
+        // Потолок высоты: шапка теперь одна строка, и настроенные пользователем
+        // вертикальные отступы не должны выпихивать карточку за её край.
+        height: `${Math.min(PROJECT_CARD_MAX_H, Math.max(20, 16 + projectTabGeometry.paddingY * 2))}px`,
+        flexShrink: 0,
         opacity: isDragging ? 0.5 : 1,
         outline: dropState === 'allowed'
           ? '2px solid #4ade80'
@@ -708,6 +750,8 @@ const ProjectTabItem = memo(({
         outlineOffset: '-2px',
         borderRadius: dropState ? '4px' : '2px', // Consistency with rounded-sm
       }}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
       onClick={onClick}
       onDoubleClick={isPinnedSystem ? undefined : onDoubleClick}
       onContextMenu={isPinnedSystem ? undefined : onContextMenu}
@@ -727,6 +771,17 @@ const ProjectTabItem = memo(({
           the user was working in it. A faint wash, because the card's edges are
           taken by the drop outline and the focus ring, and its inside by the
           completion flash, the awaiting pulse and the process counter. */}
+      {/* Наведение (курсором или из Ctrl+Q) — подложка, а не только цвет текста:
+          в списке переключателя строка выделяется фоном, и карточка обязана
+          отвечать тем же, иначе связь «эта строка = вот эта карточка» читается
+          только по имени. Под текстом (z-10) и над presence-заливкой. */}
+      {!isActive && hovered && (
+        <div
+          className="absolute inset-0 rounded-sm pointer-events-none"
+          style={{ background: 'rgba(255,255,255,0.08)', zIndex: 7 }}
+          aria-hidden
+        />
+      )}
       {!isActive && cardPresence === 'on-screen' && (
         <div
           className="absolute inset-0 rounded-sm pointer-events-none"
@@ -1013,6 +1068,10 @@ function App() {
   const { projects, loadProjects, updateProject } = useProjectsStore();
   const { closeFilePreview, filePreview, showToast, openEditModal, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, dragAreaWidth, setDragAreaWidth } = useUIStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
+  // Home стоит в одном ряду с карточками проектов и обязан слушаться тех же
+  // Settings → Размеры: иначе он выпадает из ряда по высоте и по вертикальному
+  // центру (симптом: «он по вертикали находится выше, чем должен»).
+  const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
   const inheritedBusyProjectKey = useOrchestrationStore((s) => (
     Array.from(s.inheritedBusyProjectIds).sort().join('\u0000')
   ));
@@ -1037,6 +1096,22 @@ function App() {
     notificationInheritedBusyRef.current = new Set(inheritedBusyTabIds);
   }, [inheritedBusyTabKey, inheritedBusyTabIds]);
 
+  // Слой всплывающих меню рабочей области — см. workspaceOverlayHost.mjs.
+  // Ссылка-функция, а не эффект: узел нужно опубликовать в тот же момент, когда
+  // он появился в документе, иначе первое же меню успело бы отрисоваться мимо.
+  const workspaceOverlayNodeRef = useRef<HTMLDivElement | null>(null);
+  const workspaceOverlayHostRef = useCallback((node: HTMLDivElement | null) => {
+    if (node) {
+      workspaceOverlayNodeRef.current = node;
+      setWorkspaceOverlayHost(node);
+      return;
+    }
+    // При размонтировании ссылка приходит пустой, поэтому снимаем ИМЕННО тот
+    // узел, который публиковали: снятие «по факту размонтирования» стёрло бы
+    // слой, только что опубликованный новым узлом при перестроении разметки.
+    releaseWorkspaceOverlayHost(workspaceOverlayNodeRef.current);
+    workspaceOverlayNodeRef.current = null;
+  }, []);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   // Запрошенный начальный таб для SettingsModal — выставляется через
@@ -1569,12 +1644,32 @@ function App() {
   // Track process status via OSC 133 events
   useEffect(() => {
     let disposed = false;
+    // The batched restore request races with live busy/idle IPC. Once a tab has
+    // emitted an authoritative edge in this renderer generation, that edge is
+    // newer than the in-flight snapshot and must win.
+    const authoritativeBusyEventsSeen = new Set<string>();
+    const applyClaudeVisualBusy = (tabId: string, busy: boolean, reason?: string) => {
+      const state = useWorkspaceStore.getState();
+      state.setClaudeBusy(tabId, busy);
+      state.setAiBusy(tabId, busy, reason);
+      setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
+    };
     // Initial load: get state for all tabs
     const initProcessStatus = async () => {
-      const allTabs: Array<{ tabId: string; commandType?: string }> = [];
+      const allTabs: Array<{
+        tabId: string;
+        commandType?: string;
+        hasClaudeSession: boolean;
+        hasCodexSession: boolean;
+      }> = [];
       openProjects.forEach((workspace) => {
         workspace.tabs.forEach((tab: any, tabId) => {
-          allTabs.push({ tabId, commandType: tab?.commandType });
+          allTabs.push({
+            tabId,
+            commandType: tab?.commandType,
+            hasClaudeSession: !!tab?.claudeSessionId,
+            hasCodexSession: !!tab?.codexSessionId,
+          });
         });
       });
 
@@ -1585,11 +1680,30 @@ function App() {
       try {
         const result = await ipcRenderer.invoke('terminal:getCommandStates', {
           caller: 'App.processStatusInit',
-          tabs: allTabs.map(({ tabId, commandType }) => ({ tabId, commandType })),
+          tabs: allTabs,
         });
         const states = result?.states || {};
         for (const { tabId } of allTabs) {
           newStatus.set(tabId, states[tabId]?.isRunning === true);
+        }
+        if (disposed) return;
+        const busyUpdates = collectAgentBusyHydration({
+          tabs: allTabs,
+          states,
+          eventObserved: authoritativeBusyEventsSeen,
+        });
+        for (const update of busyUpdates) {
+          if (update.engine === 'claude') {
+            applyClaudeVisualBusy(update.tabId, update.busy, update.reason);
+          } else {
+            useWorkspaceStore.getState().setAiBusy(update.tabId, update.busy, update.reason);
+            setBusyTabs(prev => {
+              const next = new Map(prev);
+              if (update.busy) next.set(update.tabId, true);
+              else next.delete(update.tabId);
+              return next;
+            });
+          }
         }
       } catch {
         for (const { tabId } of allTabs) newStatus.set(tabId, false);
@@ -1598,43 +1712,6 @@ function App() {
       setProcessStatus(newStatus);
     };
     initProcessStatus();
-
-    const syncCodexTurnBusy = async () => {
-      const codexTabIds: string[] = [];
-      openProjects.forEach((workspace) => {
-        workspace.tabs.forEach((tab: any, tabId) => {
-          if (tab?.commandType === 'codex' || tab?.codexSessionId) codexTabIds.push(tabId);
-        });
-      });
-      if (codexTabIds.length === 0) return;
-      // Batched: the turn state for every Codex tab arrives in one request,
-      // resolved through the same classifier the single call uses.
-      const batch = await ipcRenderer.invoke('terminal:getCommandStates', {
-        caller: 'App.codexTurnBusySync',
-        tabs: codexTabIds.map((tabId) => ({ tabId, commandType: 'codex' })),
-      }).catch(() => null);
-      const batchStates = batch?.states || {};
-      for (const tabId of codexTabIds) {
-        const res = batchStates[tabId]?.codexTurn;
-        if (disposed) return;
-        if (!res?.hasWatcher) continue;
-        if (res.catchUpPending) continue;
-        const busy = res.busy === true;
-        const reason = busy
-          ? 'task_started'
-          : (res.outcomeKnown && res.lastOutcomeReason
-            ? res.lastOutcomeReason
-            : 'codex-outcome-unknown');
-        useWorkspaceStore.getState().setAiBusy(tabId, busy, reason);
-        setBusyTabs(prev => {
-          const next = new Map(prev);
-          if (busy) next.set(tabId, true);
-          else next.delete(tabId);
-          return next;
-        });
-      }
-    };
-    syncCodexTurnBusy();
 
     // Listen for command start/finish
     const handleCommandStarted = (
@@ -1698,13 +1775,6 @@ function App() {
       state.setClaudeActive(tabId, false);
     };
 
-    const applyClaudeVisualBusy = (tabId: string, busy: boolean, reason?: string) => {
-      const state = useWorkspaceStore.getState();
-      state.setClaudeBusy(tabId, busy);
-      state.setAiBusy(tabId, busy, reason);
-      setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
-    };
-
     // Claude's animated TUI glyph is not a lifecycle event. The main process no
     // longer publishes it, and this guard keeps a hot-reloaded/older main from
     // mutating the app-wide turn state. Hook/local-command edges are exact.
@@ -1712,6 +1782,7 @@ function App() {
       console.warn('[App:BusyState] tabId=' + data.tabId.slice(-8) + ' busy=' + data.busy + (data.reason ? ' reason=' + data.reason : ''));
       if (data.reason === 'spinner') return;
 
+      authoritativeBusyEventsSeen.add(data.tabId);
       applyClaudeVisualBusy(data.tabId, data.busy, data.reason);
       // Safety net for awaiting ⊆ busy: any turn-end clears a lingering awaiting flag
       // (user pressed Esc to cancel the whole turn instead of answering the question).
@@ -2172,6 +2243,241 @@ function App() {
             if (tab) return { projectId, tab };
           }
           return null;
+        };
+        const forkAgentTab = async (options: any = {}) => {
+          const sourceTabId = String(options.sourceTabId || options.tabId || '').trim();
+          if (!sourceTabId) throw new Error('sourceTabId required');
+          const source = findTabProject(sourceTabId);
+          if (!source) throw new Error('source tab not open');
+          const targetProjectId = String(options.projectId || source.projectId).trim();
+          if (targetProjectId !== source.projectId) {
+            throw new Error('fork target must stay in the source project');
+          }
+          const ws = await ensureProjectWorkspace(targetProjectId);
+          if (!ws) throw new Error('source project not open');
+
+          const sourceTab = ws.tabs.get(sourceTabId) as any;
+          const provider = toolForTab(sourceTab);
+          const runtime = provider ? getHistoryAgentRuntime(provider) : null;
+          if (!sourceTab || !provider || !runtime) {
+            throw new Error('source tab has no forkable Claude/Codex session');
+          }
+          const presence = await runtime.getPresence(sourceTabId, targetProjectId).catch(() => null);
+          const lifecycle = presence?.status || 'unknown';
+          if (presence?.busy === true || lifecycle === 'busy' || lifecycle === 'starting' || lifecycle === 'stopping') {
+            throw new Error('source tab must be idle before fork');
+          }
+
+          let sourceSessionId = provider === 'codex'
+            ? await requireCodexSurfaceSessionId({
+              tabId: sourceTabId,
+              operation: 'Создать fork для делегации',
+              requireMutationSafe: true,
+            })
+            : sourceTab.claudeSessionId || null;
+          if (!sourceSessionId) throw new Error('source tab history session is unavailable');
+          if (provider === 'claude' && sourceTab.tabType !== 'claude-sdk') {
+            const materialization = await ipcRenderer.invoke('claude:session-materialization', {
+              sessionId: sourceSessionId,
+              cwd: sourceTab.cwd,
+            }).catch(() => null);
+            if (materialization?.materialized !== true && materialization?.conversationMaterialized !== true) {
+              throw new Error('source tab has no saved Claude conversation');
+            }
+          }
+
+          const fromLatestCompact = options.fromLatestCompact !== false;
+          let launchSessionId = sourceSessionId;
+          if (fromLatestCompact) {
+            const forkResult = provider === 'claude'
+              ? await ipcRenderer.invoke('claude:fork-session-file', {
+                sourceSessionId,
+                cwd: sourceTab.cwd || ws.projectPath || '',
+                skipChainResolve: true,
+                fromLatestCompact: true,
+              })
+              : await ipcRenderer.invoke('codex:fork-from-latest-compact', {
+                sessionId: sourceSessionId,
+                cwd: sourceTab.cwd || ws.projectPath || '',
+              });
+            if (!forkResult?.success || !forkResult?.newSessionId) {
+              const error: any = new Error(forkResult?.error || 'latest compact fork failed');
+              error.code = forkResult?.reason === 'no-compact'
+                ? 'fork_latest_compact_missing'
+                : 'fork_materialization_failed';
+              throw error;
+            }
+            launchSessionId = forkResult.newSessionId;
+          }
+
+          const requestedParentId = String(options.visualParentTabId || sourceTabId).trim();
+          if (!ws.tabs.has(requestedParentId)) throw new Error('visual parent tab not open');
+          const reservedTabId = String(options.reservedTabId || '').trim() || undefined;
+          if (reservedTabId && ws.tabs.has(reservedTabId)) throw new Error('reserved target tab already exists');
+          const explicitName = String(options.name || '').trim()
+            || `${sourceTab.name || provider}_${fromLatestCompact ? 'compact' : 'fork'}`;
+          const createOptions: any = {
+            commandType: provider,
+            color: provider,
+            nameSetManually: true,
+            skipInitialRename: true,
+            background: options.background !== false,
+            restoreId: reservedTabId,
+            appendToEnd: true,
+            afterTabId: String(options.afterTabId || requestedParentId),
+            visualParentTabId: requestedParentId,
+            codexModel: typeof options.codexModel === 'string' ? options.codexModel : undefined,
+            codexEffort: typeof options.codexEffort === 'string' ? options.codexEffort : undefined,
+            ...(fromLatestCompact && provider === 'claude' ? { claudeSessionId: launchSessionId } : {}),
+            ...(fromLatestCompact && provider === 'codex' ? { codexSessionId: launchSessionId } : {}),
+          };
+          const newTabId = await useWorkspaceStore.getState().createTabAfterCurrent(
+            targetProjectId,
+            explicitName,
+            sourceTab.cwd || ws.projectPath || '',
+            createOptions,
+          );
+          const createdTab = useWorkspaceStore.getState().openProjects.get(targetProjectId)?.tabs.get(newTabId) as any;
+          useWorkspaceStore.getState().setTabCommandType(newTabId, provider);
+          if (fromLatestCompact) {
+            const annotation = await ipcRenderer.invoke('session-history:annotate-fork', {
+              provider,
+              sourceSessionId,
+              childSessionId: launchSessionId,
+              sourceTabId,
+              childTabId: newTabId,
+              visualParentTabId: requestedParentId,
+              forkMode: 'latest_compact',
+              origin: 'app',
+              snapshotComplete: false,
+            });
+            if (annotation?.success === false) {
+              console.warn('[SessionHistoryEvents] compact fork annotation failed:', annotation.error);
+            }
+          }
+          let launchResult: any;
+          if (provider === 'codex') {
+            launchResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+              tabId: newTabId,
+              command: fromLatestCompact ? 'codex-c' : 'codex-f',
+              sessionId: launchSessionId,
+              cwd: createdTab?.cwd || sourceTab.cwd,
+            }));
+          } else {
+            launchResult = await ipcRenderer.invoke('claude:run-command', {
+              tabId: newTabId,
+              command: fromLatestCompact ? 'claude-c' : 'claude-f',
+              ...(fromLatestCompact
+                ? { sessionId: launchSessionId }
+                : { forkSessionId: launchSessionId }),
+              cwd: createdTab?.cwd || sourceTab.cwd,
+            });
+          }
+          if (launchResult?.success === false || launchResult?.accepted === false) {
+            await useWorkspaceStore.getState().closeTab(targetProjectId, newTabId, {
+              skipProcessCheck: true,
+              forceCleanup: true,
+              archive: false,
+            } as any).catch(() => false);
+            throw new Error(launchResult?.error || launchResult?.reason || 'fork launch failed');
+          }
+          return {
+            tabId: newTabId,
+            sourceTabId,
+            sourceSessionId,
+            sessionId: fromLatestCompact ? launchSessionId : null,
+            projectId: targetProjectId,
+            name: explicitName,
+            toolType: provider,
+            commandType: provider,
+            cwd: createdTab?.cwd || sourceTab.cwd || ws.projectPath,
+            visualParentTabId: requestedParentId,
+            fromLatestCompact,
+            starting: true,
+            launchAccepted: launchResult?.accepted ?? launchResult?.success ?? null,
+          };
+        };
+        const waitForCompactCompletion = async (
+          tabId: string,
+          provider: 'claude' | 'codex',
+          handoffId: string,
+          timeoutMs = 180_000,
+        ) => {
+          const matches = (operation: any) => operation
+            && operation.tabId === tabId
+            && operation.provider === provider
+            && operation.handoffId === handoffId
+            && operation.active === false;
+          return await new Promise<any>((resolve, reject) => {
+            let timer: ReturnType<typeof setTimeout> | null = null;
+            const cleanup = () => {
+              if (timer) clearTimeout(timer);
+              timer = null;
+              ipcRenderer.removeListener('agent:operational-phase', onPhase);
+            };
+            const onPhase = (_event: any, operation: any) => {
+              if (!matches(operation)) return;
+              cleanup();
+              resolve(operation);
+            };
+            ipcRenderer.on('agent:operational-phase', onPhase);
+            void ipcRenderer.invoke('agent:get-operational-phase', { tabId, provider }).then((snapshot: any) => {
+              const settled = (snapshot?.settled || []).find(matches);
+              if (!settled) return;
+              cleanup();
+              resolve(settled);
+            }).catch(() => {});
+            timer = setTimeout(() => {
+              cleanup();
+              reject(new Error('compact completion timed out'));
+            }, timeoutMs);
+          });
+        };
+        const compactAgentTab = async (options: any = {}) => {
+          const tabId = String(options.tabId || '').trim();
+          const handoffId = String(options.handoffId || '').trim();
+          if (!tabId || !handoffId) throw new Error('tabId and handoffId required');
+          const described = describeAgentTab(tabId, options.projectId || null);
+          if (!described.tab || !described.toolType || !described.runtime) {
+            throw new Error('target tab is not a live Claude/Codex session');
+          }
+          const presence = await described.runtime.getPresence(tabId, options.projectId || undefined).catch(() => null);
+          if (presence?.status !== 'active' || presence?.inputReady !== true || presence?.busy === true) {
+            throw new Error('target tab is not idle and input-ready for compact');
+          }
+          const provider = described.toolType;
+          const sent = provider === 'codex'
+            ? await ipcRenderer.invoke('codex:send-live-slash-command', {
+              tabId,
+              command: '/compact',
+              handoffId,
+              hasDraft: false,
+              turnBusy: false,
+            })
+            : await ipcRenderer.invoke('claude:send-command', tabId, '/compact', {
+              source: 'orchestration-pre-task-compact',
+              handoffId,
+              stashFirst: false,
+            });
+          if (sent?.success !== true || sent?.submitted === false) {
+            throw new Error(sent?.error || sent?.reason || 'compact command was not accepted');
+          }
+          const operation = await waitForCompactCompletion(
+            tabId,
+            provider,
+            handoffId,
+            Number(options.timeoutMs) || 180_000,
+          );
+          if (operation?.outcome !== 'completed') {
+            throw new Error('compact ended with ' + String(operation?.outcome || operation?.reason || 'unknown'));
+          }
+          return {
+            success: true,
+            tabId,
+            provider,
+            handoffId,
+            operation,
+          };
         };
         if (action === 'getAppSettings') {
           const uiState = useUIStore.getState();
@@ -2678,12 +2984,17 @@ function App() {
           return reply(true, { tabId, status: status || null });
         }
         if (action === 'setCodexSessionId') {
-          const { tabId, sessionId, reason } = payload || {};
+          const { tabId, sessionId, reason, codexSettingsProof } = payload || {};
           if (!tabId || !sessionId) return reply(false, null, 'tabId+sessionId required');
           const found = findTabProject(tabId);
           if (!found) return reply(false, null, 'tab not in any open project');
           if (resolvePtyAgentOwner(found.tab) !== 'codex') return reply(false, null, 'tab is not Codex');
-          const committed = await useWorkspaceStore.getState().setCodexSessionId(tabId, sessionId, reason || 'api-edit-range');
+          const committed = await useWorkspaceStore.getState().setCodexSessionId(
+            tabId,
+            sessionId,
+            reason || 'api-edit-range',
+            codexSettingsProof ? { codexSettingsProof } : {},
+          );
           if (!committed) return reply(false, null, 'Codex session binding could not be committed');
           return reply(true, { tabId, sessionId });
         }
@@ -3189,6 +3500,27 @@ function App() {
           try {
             switch (op) {
               case 'add':            s.addPrompt(tabId, String(a.text || ''), undefined, undefined, typeof a.title === 'string' ? a.title : undefined); break;
+              case 'addAction': {
+                if (a.kind === 'restart') {
+                  s.addMetaAction(tabId, { kind: 'restart' }, typeof a.title === 'string' ? a.title : undefined);
+                  break;
+                }
+                if (a.kind === 'rewind'
+                  && typeof a.targetUuid === 'string'
+                  && typeof a.targetText === 'string'
+                  && typeof a.sourceSessionId === 'string'
+                  && (a.toolType === 'claude' || a.toolType === 'codex')) {
+                  s.addMetaAction(tabId, {
+                    kind: 'rewind',
+                    targetUuid: a.targetUuid,
+                    targetText: a.targetText,
+                    sourceSessionId: a.sourceSessionId,
+                    toolType: a.toolType,
+                  }, typeof a.title === 'string' ? a.title : undefined);
+                  break;
+                }
+                return reply(false, null, 'invalid queued action');
+              }
               case 'remove':         s.removePrompt(tabId, String(a.id)); break;
               case 'update':         s.updatePrompt(tabId, String(a.id), {
                 text: typeof a.text === 'string' ? a.text : undefined,
@@ -3274,57 +3606,25 @@ function App() {
           return reply(!!result?.success, result, result?.error);
         }
         if (action === 'forkToTab') {
-          const { tabId: srcTabId } = payload || {};
-          if (!srcTabId) return reply(false, null, 'tabId required');
-          let srcTab: any = null;
-          let projectId: string | null = null;
-          for (const [pid, ws] of state.openProjects) {
-            const t = ws.tabs.get(srcTabId);
-            if (t) { srcTab = t; projectId = pid; break; }
-          }
-          if (!srcTab || !projectId) return reply(false, null, 'source tab not open');
-
-          const declaredType = String(srcTab.commandType || srcTab.toolType || '').toLowerCase();
-          const sessionType = declaredType.includes('codex') || (!!srcTab.codexSessionId && !declaredType.includes('claude'))
-            ? 'codex'
-            : declaredType.includes('claude') || srcTab.tabType === 'claude-sdk' || !!srcTab.claudeSessionId
-              ? 'claude'
-              : null;
-          let sessionId = sessionType === 'codex' ? srcTab.codexSessionId : srcTab.claudeSessionId;
-          if (sessionType === 'codex') {
-            sessionId = await requireCodexSurfaceSessionId({
-              tabId: srcTabId,
-              operation: 'Создать fork',
-              requireMutationSafe: true,
-            });
-          }
-          if (!sessionType || !sessionId) return reply(false, null, 'source tab has no forkable Claude/Codex session');
-
-          if (sessionType === 'claude' && srcTab.tabType !== 'claude-sdk') {
-            const materialization = await ipcRenderer.invoke('claude:session-materialization', {
-              sessionId,
-              cwd: srcTab.cwd,
-            }).catch(() => null);
-            if (materialization?.materialized !== true && materialization?.conversationMaterialized !== true) {
-              return reply(false, null, 'source tab has no saved Claude conversation');
-            }
-          }
-
-          const forkName = srcTab.name ? `${srcTab.name}_fork` : undefined;
-          const newTabId = await state.createTabAfterCurrent(projectId, forkName, srcTab.cwd || '', {
-            pendingAction: { type: sessionType === 'claude' ? 'claude-fork' : 'codex-fork', sessionId },
-            nameSetManually: false,
-            afterTabId: srcTab.id,
-            visualParentTabId: srcTab.id,
+          const data = await forkAgentTab({
+            ...(payload || {}),
+            sourceTabId: payload?.tabId,
+            fromLatestCompact: false,
+            background: false,
           });
           return reply(true, {
-            tabId: newTabId,
-            sourceTabId: srcTabId,
-            sessionId,
-            projectId,
-            name: forkName || null,
-            sessionType,
+            ...data,
+            sessionId: data.sessionId || data.sourceSessionId,
+            sessionType: data.toolType,
           });
+        }
+        if (action === 'forkAgentTab') {
+          const data = await forkAgentTab(payload || {});
+          return reply(true, data);
+        }
+        if (action === 'compactAgentTab') {
+          const data = await compactAgentTab(payload || {});
+          return reply(true, data);
         }
         if (action === 'forkToSDK') {
           const { tabId: srcTabId } = payload || {};
@@ -3418,6 +3718,51 @@ function App() {
             return reply(false, restored, restored.message || restored.reason || 'closed tab restore failed');
           }
           return reply(true, { ...restored, projectId, restored: true });
+        }
+        if (action === 'describeWorkspaceLayout') {
+          // Что сейчас на экране: окна в ЭКРАННОМ порядке, у каждого своя полоса
+          // вкладок и та из них, что показана. Читатель по API не должен знать,
+          // что внутри окна лежит список, а массив отсортирован по колонкам.
+          const centerProjectId = state.activeProjectId;
+          const centerTabId = centerProjectId
+            ? state.openProjects.get(centerProjectId)?.activeTabId || ''
+            : '';
+          const view = describeWorkspace(
+            state.splitPanes,
+            state.splitFocusedIndex,
+            centerProjectId && centerTabId
+              ? { projectId: centerProjectId, tabId: centerTabId }
+              : null,
+          );
+          // Имена вкладок — чтобы вызывающий мог сказать «окно с codex», а не
+          // сверять идентификаторы.
+          const named = view.windows.map((w: any) => ({
+            ...w,
+            tabs: w.tabs.map((e: any) => ({
+              ...e,
+              name: state.openProjects.get(e.projectId)?.tabs.get(e.tabId)?.name || null,
+            })),
+          }));
+          return reply(true, { ...view, windows: named });
+        }
+        if (action === 'arrangeWorkspaceLayout') {
+          const { side, divide, anchorIndex, windows } = payload || {};
+          if (!Array.isArray(windows) || windows.length === 0) {
+            return reply(false, null, 'windows required');
+          }
+          const res = state.arrangeSplitPanes({
+            side,
+            divide,
+            anchorIndex: Number.isInteger(anchorIndex) ? anchorIndex : undefined,
+            windows: windows.map((strip: any) => (Array.isArray(strip) ? strip : [strip])),
+          });
+          if (!res) return reply(false, null, 'no known tabs to arrange');
+          const after = useWorkspaceStore.getState();
+          return reply(true, {
+            placedIndices: res.placedIndices,
+            focusedIndex: res.focusedIndex,
+            ...describeWorkspace(after.splitPanes, after.splitFocusedIndex, null),
+          });
         }
         if (action === 'createAgentTab') {
           const {
@@ -4166,6 +4511,9 @@ function App() {
 	            timelineCount: toolType === 'claude' ? materialization?.timelineCount ?? null : null,
 	            materializationReason: toolType === 'claude' ? materialization?.materializationReason || materialization?.reason || null : null,
 	            cwd: tab.cwd,
+	            codexSettingsProof: toolType === 'codex' && effectiveSessionId
+	              ? getCodexHistoryMutationSettingsProof(tabId, effectiveSessionId)
+	              : null,
 	          });
         }
         if (action === 'loadSDKHistory') {
@@ -4236,6 +4584,7 @@ function App() {
     // process strip. Otherwise Codex can shimmer in the sidebar while the project
     // tab stays visually idle.
     const handleCodexBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+      authoritativeBusyEventsSeen.add(tabId);
       useWorkspaceStore.getState().setAiBusy(tabId, busy, reason);
       setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
     };
@@ -4453,6 +4802,9 @@ function App() {
       state.saveSessionImmediate();
       flushScrollSavesSync();
       flushPromptQueueStoreSync();
+      // Черновик поля ввода сохраняется сам, но с задержкой в полсекунды — на
+      // закрытии окна ждать её уже некому, поэтому здесь запись немедленная.
+      useUIStore.getState().flushHistoryComposerDrafts();
     };
 
     window.addEventListener('beforeunload', handleBeforeUnload);
@@ -5259,22 +5611,39 @@ function App() {
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-bg-main text-white">
-      {/* Title Bar */}
+      {/* Шапка приложения — ЕДИНСТВЕННАЯ строка наверху (2026-08-18).
+          Слева карточки проектов, справа кнопки рабочей области. Отдельная
+          полоса кнопок во всю ширину под шапкой удалена: она забирала высоту у
+          терминала на каждом экране ради десятка кнопок, а справа от карточек
+          здесь и так всегда пустовало место.
+
+          Высота уменьшена (было 40) и живёт в constants/layout вместе с
+          отражением в titleBarOverlay главного процесса — иначе кнопки окна
+          macOS встанут не по центру строки. */}
       <div
-        className={`title-bar h-[40px] transition-all duration-300 flex items-center select-none border-b ${
-          activeArea === 'projects' 
-            ? 'bg-white/[0.05] border-white/20 ring-1 ring-white/10 shadow-[inset_0_0_20px_rgba(255,255,255,0.02)]' 
+        className={`title-bar transition-all duration-300 flex items-center select-none border-b ${
+          activeArea === 'projects'
+            ? 'bg-white/[0.05] border-white/20 ring-1 ring-white/10 shadow-[inset_0_0_20px_rgba(255,255,255,0.02)]'
             : 'bg-tab border-border-main'
         }`}
         style={{
+          height: TITLE_BAR_H,
+          flexShrink: 0,
           WebkitAppRegion: 'drag', // Window can be dragged by clicking any empty space
           paddingLeft: 'env(titlebar-area-x, 85px)'
         } as any}
       >
-        {/* Project Tabs - portfolio style */}
+        {/* Project Tabs - portfolio style.
+            Проектов может быть больше, чем влезает: строка одна на всё, и
+            карточки соревнуются за неё с кнопками справа. Поэтому у списка своя
+            горизонтальная прокрутка (`min-w-0` обязателен — без него flex-блок
+            не даёт себе сжаться и выдавливает соседей за край окна), а полоса
+            прокрутки спрятана: в строке высотой 30px она съела бы пятую часть
+            высоты. Прокрутка колесом работает как обычно. */}
         <div
-          className="flex items-center gap-1 px-2 h-full"
-          style={{ WebkitAppRegion: 'no-drag' } as any}
+          data-project-tabs-strip
+          className="flex items-center gap-1 px-2 h-full min-w-0 scrollbar-hide"
+          style={{ WebkitAppRegion: 'no-drag', overflowX: 'auto', overflowY: 'hidden' } as any}
           onMouseDown={() => setActiveArea('projects')} // Focus projects when clicking this container
           onDoubleClick={(e) => {
             if (e.target === e.currentTarget) {
@@ -5287,8 +5656,6 @@ function App() {
             }
           }}
         >
-          <HelpButton onOpenHelp={() => setHelpOpen(true)} />
-
           {/* Home / DEV indicator */}
           {window.location.hostname === 'localhost' ? (
             <ControlHint label={view === 'dashboard' ? 'Вернуться в рабочий проект' : 'Открыть Dashboard'} side="bottom">
@@ -5312,38 +5679,63 @@ function App() {
             </ControlHint>
           ) : (
             <ControlHint label={view === 'dashboard' ? 'Вернуться в рабочий проект' : 'Открыть Dashboard'} side="bottom">
-              {/* Цвета — из иконки приложения: чёрная подложка + оранжевый
-                  акцент. Активное состояние держит ту же пару, только меняет
-                  местами фон и передний план, поэтому «здесь» читается как
-                  контраст, а не как другая палитра. */}
+              {/* Home ВСЕГДА оранжевый — это цвет приложения, а не подсветка
+                  состояния. Раньше он загорался только на наведении и в
+                  активном виде, поэтому в покое читался как обычная серая
+                  кнопка рядом с проектами и переставал представлять приложение.
+                  Юзер: «он должен быть всегда такой слегка оранжевый… как когда
+                  я на него наведусь».
+                  Наведение теперь меняет ФОН, а не цвет текста — цвету текста
+                  меняться уже некуда, и это тот же язык, что у карточек
+                  проектов рядом.
+
+                  Геометрия — та же, что у карточек (Settings → Размеры), а не
+                  собственные px-2.5/py-1.5: свои отступы ставили Home на другую
+                  высоту, и он визуально сидел выше соседей. */}
               <button
                 data-workspace-navigation
                 data-project-navigation
-                className="relative px-2.5 py-1.5 cursor-pointer transition-colors"
+                data-app-home-button
+                className="relative inline-flex items-center cursor-pointer transition-colors rounded-sm"
                 style={{
+                  padding: `${projectTabGeometry.paddingY}px ${projectTabGeometry.paddingX}px`,
+                  // Потолок высоты: строка теперь одна и низкая, а вертикальные
+                  // отступы карточек настраивает пользователь — без потолка
+                  // Home вылезал бы за край шапки. По ширине ограничений нет.
+                  height: `${Math.min(PROJECT_CARD_MAX_H, Math.max(20, 16 + projectTabGeometry.paddingY * 2))}px`,
                   fontSize: `${projectTabsFontSize}px`,
+                  lineHeight: '16px',
                   // Моноширинный — как в терминале: подпись Home и есть слово
                   // с иконки приложения, а не обычный интерфейсный текст.
                   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
                   fontWeight: 700,
                   letterSpacing: 0.2,
-                  color: view === 'dashboard' ? APP_ICON_ORANGE : '#8a8a8a',
+                  // Приглушённый оранжевый в покое, полный — когда мы на
+                  // Dashboard. Одна палитра, две громкости; серого состояния у
+                  // этой кнопки больше нет.
+                  color: view === 'dashboard' ? APP_ICON_ORANGE : APP_ICON_ORANGE_MUTED,
                 }}
                 onMouseEnter={(e) => {
-                  if (view !== 'dashboard') e.currentTarget.style.color = APP_ICON_ORANGE;
+                  if (view !== 'dashboard') {
+                    e.currentTarget.style.color = APP_ICON_ORANGE;
+                    e.currentTarget.style.backgroundColor = APP_ICON_ORANGE_HOVER_BG;
+                  }
                 }}
                 onMouseLeave={(e) => {
-                  if (view !== 'dashboard') e.currentTarget.style.color = '#8a8a8a';
+                  if (view !== 'dashboard') {
+                    e.currentTarget.style.color = APP_ICON_ORANGE_MUTED;
+                    e.currentTarget.style.backgroundColor = 'transparent';
+                  }
                 }}
                 onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
               >
                 {view === 'dashboard' && (
                   <div
-                    className="absolute inset-0 rounded"
+                    className="absolute inset-0 rounded-sm"
                     style={{ backgroundColor: '#000', border: `1px solid ${APP_ICON_ORANGE}` }}
                   />
                 )}
-                <span className="relative z-10 inline-flex items-center gap-1.5">
+                <span className="relative z-10 inline-flex items-center gap-1.5 leading-none">
                   <AppHomeGlyph size={Math.round(projectTabsFontSize * 1.05)} />
                   Home
                 </span>
@@ -5459,7 +5851,7 @@ function App() {
         </div>
 
         {/* Drag area + Empty drop zone for reordering */}
-        <div className="flex flex-1 h-full items-center">
+        <div className="flex flex-1 min-w-0 h-full items-center">
           <ProjectEmptyDropZone
             onMouseDown={() => setActiveArea('projects')}
             onDrop={(id) => {
@@ -5475,7 +5867,14 @@ function App() {
             onHoverChange={setProjectEmptyZoneHovered}
             onDoubleClick={handleCreateNewProject}
           />
-          
+
+          {/* Кнопки рабочей области — переехали сюда из удалённой полосы под
+              шапкой. Стоят перед областью перетаскивания: она остаётся крайней
+              справа, вместе со своей ручкой изменения ширины. На Dashboard
+              рабочей области нет, поэтому и кнопок нет — иначе они управляли бы
+              проектом, которого не видно. */}
+          {view === 'workspace' && <WorkspaceTitleBarTools />}
+
           {/* Resizable Window Drag Area */}
           <div className="relative h-full flex-shrink-0 flex" style={{ width: dragAreaWidth }}>
             {/* Resize handle */}
@@ -5514,12 +5913,28 @@ function App() {
             ...(view !== 'workspace' ? { inset: 0, pointerEvents: 'none' as const } : {}),
           }}
         >
+          {/* Слой для всплывающих меню рабочей области.
+              Меню рисуются порталом, то есть их узел уезжает из того места
+              дерева, где живёт компонент. Пока он уезжал в корень страницы,
+              меню оставались висеть поверх Home: рабочая область при переходе
+              на Home не размонтируется, её прячут невидимостью, а узел в корне
+              страницы к спрятанному поддереву не относится.
+              Слой лежит ЗДЕСЬ, внутри спрятанного поддерева, поэтому меню
+              прячутся вместе с рабочей областью сами собой — без проверки «а не
+              Home ли сейчас» в каждом меню, которую однажды забыли бы добавить.
+              Узел пустой и без геометрии: меню внутри позиционируются
+              относительно окна сами. */}
+          <div ref={workspaceOverlayHostRef} data-workspace-overlay-host />
           <Workspace />
         </div>
       </div>
 
-      {/* VSCode-style status bar — full width across terminal + sidebar */}
-      <StatusBar onOpenSettings={() => setSettingsOpen(true)} />
+      {/* VSCode-style status bar — full width across terminal + sidebar.
+          Справка живёт здесь же, первой слева (переехала из шапки). */}
+      <StatusBar
+        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenHelp={() => setHelpOpen(true)}
+      />
 
       {/* Global UI Components */}
       <ShutdownOverlay />
@@ -5541,6 +5956,11 @@ function App() {
         busyTabs={busyTabs}
         pasteBusyTabs={pasteBusyTabs}
       />
+
+      {/* Ctrl+Q — тот же жест, что Ctrl+Tab, но по проектам. Синглтон рядом с
+          ним и по той же причине: слушатели клавиш глобальные, и второй
+          смонтированный экземпляр означал бы две панели на одно нажатие. */}
+      <ProjectSwitcherOverlay />
 
       {/* Project Context Menu */}
       {projectContextMenu && (

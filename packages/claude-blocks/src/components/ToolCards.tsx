@@ -70,6 +70,33 @@ const HL_FONT = { style: { fontFamily: 'inherit' } } as const;
  */
 const HIGHLIGHT_MAX_CHARS = 16 * 1024;
 
+// Portable fallback for consumers that do not inject the host grammar.
+// Ordinary files speak by basename; docs retain the useful tail from docs/.
+// Identity and expanded paths remain the untouched `path` value.
+const toolHeaderPath = (value: string): string => {
+  const text = String(value || '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/');
+  if (!text) return '';
+  const parts = text.split('/').filter(Boolean);
+  if (parts.length === 0) return text;
+  const docsIndex = parts.findIndex((part) => part.toLowerCase() === 'docs');
+  return docsIndex >= 0
+    ? parts.slice(docsIndex).join('/')
+    : (parts[parts.length - 1] || text);
+};
+
+const FALLBACK_SEARCH_PROGRAMS = new Set([
+  'rg', 'grep', 'egrep', 'fgrep', 'find', 'fd', 'ls', 'tree', 'which',
+  'whereis', 'locate', 'ag',
+]);
+const fallbackShellProgram = (command: string): string => {
+  const match = String(command || '').trim().match(/^\(?\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*([^\s;&|]+)/);
+  return match ? (match[1].split('/').pop() || '').toLowerCase() : '';
+};
+
 const PlainOutput: React.FC<{ text: string; maxHeight: number; topBorder?: boolean }> =
 ({ text, maxHeight, topBorder }) => (
   <pre
@@ -130,9 +157,14 @@ const BashCard: React.FC<{ toolName?: string; args: Record<string, any>; result:
   // command IS what happened. The parser computes this once (shared grammar);
   // the package only renders it, and falls back to a family verb + the raw
   // command for standalone consumers that ship no headline.
+  const fallbackProgram = fallbackShellProgram(cmd);
+  const fallbackIsSearch = family === 'search'
+    || (!family && FALLBACK_SEARCH_PROGRAMS.has(fallbackProgram));
   const headline: ActionHeadline = injected || {
-    verb: family === 'read' ? 'Read' : family === 'search' ? 'Search' : family === 'git' ? 'Git' : 'Run',
-    subject: cmd,
+    verb: family === 'read' ? 'Read' : fallbackIsSearch ? 'Search' : family === 'git' ? 'Git' : 'Run',
+    // A search pattern is arguments, never a headline. Standalone consumers
+    // without the host grammar still get `Search rg`, not the full regex.
+    subject: fallbackIsSearch ? (fallbackProgram || 'search') : cmd,
     detail: '',
   };
   const isRun = headline.verb === 'Run';
@@ -186,8 +218,9 @@ const ReadCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
   const content = raw.replace(/\n+$/, '');
   const lines = content ? content.split('\n') : [];
   const badges = lines.length > 0 ? <span className="cb-read-badge">{lines.length} lines</span> : null;
+  const displayPath = headline?.subject || toolHeaderPath(path);
   const preview = path
-    ? <HeaderSubject text={path} wrap detail={headline?.detail} />
+    ? <HeaderSubject text={displayPath} wrap detail={headline?.detail} />
     : <span className="cb-italic-dim">(no path)</span>;
   const body = content ? (
     content.length > HIGHLIGHT_MAX_CHARS ? (
@@ -214,8 +247,9 @@ const EditCard: React.FC<{
   status: ToolStatus;
   startLine?: number;
   diffHunks?: readonly DiffHunk[];
+  headline?: ActionHeadline;
 } & CollapseInjection> =
-({ toolName, args, status, startLine, diffHunks, ...collapse }) => {
+({ toolName, args, status, startLine, diffHunks, headline, ...collapse }) => {
   const path: string = args.file_path || args.path || '';
   const lang = detectLanguage(path);
   const fallbackDiff: DiffEntry[] = React.useMemo(() => {
@@ -253,11 +287,10 @@ const EditCard: React.FC<{
   // showing three different words made a run of edits look like a run of
   // unrelated operations.
   const verb = 'Edit';
-  const fileName = path ? (path.split('/').filter(Boolean).pop() || path) : '';
-  // Header carries the file NAME first, counts AFTER it (uniform order across
-  // the whole feed — user decision), the full path lives in the expanded
-  // body. Counts are muted at rest and take colour on hover (Codex
-  // reference); CSS drives that.
+  const fileName = headline?.subject || toolHeaderPath(path);
+  // Header carries basename (or docs/... for documentation) first, counts
+  // AFTER it; the full path lives in the expanded body. Counts are muted at
+  // rest and take colour on hover (Codex reference); CSS drives that.
   const stats = (added > 0 || removed > 0) ? (
     <span className="cb-diff-stats">
       {added > 0 && <span className="cb-c-add">+{added}</span>}
@@ -420,12 +453,22 @@ export function humanToolLabel(name: string): string {
   return lower.charAt(0).toUpperCase() + lower.slice(1);
 }
 
-const GenericToolCard: React.FC<{ toolName: string; args: Record<string, any>; result: any; status: ToolStatus; family?: string } & CollapseInjection> =
-({ toolName, args, result, status, family, ...collapse }) => {
+const GenericToolCard: React.FC<{ toolName: string; args: Record<string, any>; result: any; status: ToolStatus; family?: string; headline?: ActionHeadline } & CollapseInjection> =
+({ toolName, args, result, status, family, headline, ...collapse }) => {
   const icon = toolIcon(toolName, 13, family);
+  const nativeSearch = toolName === 'Grep' || toolName === 'Glob';
+  const semanticSearch = headline?.verb === 'Search' || nativeSearch;
+  const searchHeadline = headline?.verb === 'Search'
+    ? headline
+    : nativeSearch
+      ? {
+          verb: 'Search',
+          subject: toolName.toLowerCase(),
+          detail: toolHeaderPath(args?.path || args?.glob || ''),
+        }
+      : undefined;
   const summary = (() => {
-    if (toolName === 'Glob') return args.pattern || '';
-    if (toolName === 'Grep') return args.pattern || '';
+    if (semanticSearch) return searchHeadline?.subject || '';
     if (toolName === 'WebSearch' || toolName === 'WebFetch') return args.query || args.url || '';
     if (typeof args === 'object' && args) {
       const first = Object.values(args).find(v => typeof v === 'string') as string | undefined;
@@ -434,11 +477,31 @@ const GenericToolCard: React.FC<{ toolName: string; args: Record<string, any>; r
     return '';
   })();
   const resultText = result == null ? '' : (typeof result === 'string' ? result : JSON.stringify(result, null, 2));
-  // Same no-truncation rule as Bash/Read subjects: a long pattern or URL
-  // wraps to a second line instead of losing its tail.
-  const preview = summary ? <HeaderSubject text={summary} wrap /> : null;
-  const body = resultText ? <pre className="cb-generic-out">{resultText}</pre> : null;
-  return <ToolCard status={status} icon={icon} label={humanToolLabel(toolName)} preview={preview} body={body} defaultOpen={false} {...collapse} />;
+  // Non-search generic subjects (for example a URL) wrap instead of truncating.
+  // Search patterns were consumed above as arguments and never reach summary.
+  const preview = summary
+    ? <HeaderSubject text={summary} wrap detail={semanticSearch ? searchHeadline?.detail : undefined} />
+    : null;
+  const searchArgsText = semanticSearch && args && Object.keys(args).length > 0
+    ? JSON.stringify(args, null, 2)
+    : '';
+  const body = semanticSearch && (searchArgsText || resultText) ? (
+    <div className="cb-mcp-body">
+      {searchArgsText && (
+        <div className="cb-mcp-args">
+          <div className="cb-mcp-section-label">arguments</div>
+          <pre className="cb-generic-out" style={{ maxHeight: 120, padding: 0 }}>{searchArgsText}</pre>
+        </div>
+      )}
+      {resultText && (
+        <div className={searchArgsText ? 'cb-mcp-result' : undefined}>
+          {searchArgsText && <div className="cb-mcp-section-label">result</div>}
+          <pre className="cb-generic-out">{resultText}</pre>
+        </div>
+      )}
+    </div>
+  ) : resultText ? <pre className="cb-generic-out">{resultText}</pre> : null;
+  return <ToolCard status={status} icon={icon} label={semanticSearch ? 'Search' : humanToolLabel(toolName)} preview={preview} body={body} defaultOpen={false} {...collapse} />;
 };
 
 /**
@@ -552,13 +615,13 @@ export const ToolCallPart: React.FC<ToolCallProps> = ({ toolName, args, result, 
   // A patch that never applied groups WITH the edits (same family) but is not
   // one: the edit card would promise a file and a diff it does not have.
   if (toolName === 'Patch') {
-    return <GenericToolCard toolName={toolName} args={args} result={result} status={status} family={family} {...inj} />;
+    return <GenericToolCard toolName={toolName} args={args} result={result} status={status} family={family} headline={headline} {...inj} />;
   }
   // `Update` is Codex's name for the same act; it must not become a fourth verb.
   if (toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit' || toolName === 'Update' || family === 'edit') {
-    return <EditCard toolName={toolName} args={args} status={status} startLine={startLine} diffHunks={diffHunks} {...inj} />;
+    return <EditCard toolName={toolName} args={args} status={status} startLine={startLine} diffHunks={diffHunks} headline={headline} {...inj} />;
   }
-  return <GenericToolCard toolName={toolName} args={args} result={result} status={status} family={family} {...inj} />;
+  return <GenericToolCard toolName={toolName} args={args} result={result} status={status} family={family} headline={headline} {...inj} />;
 };
 
 export { BashCard, ReadCard, EditCard, GenericToolCard, McpToolCard };

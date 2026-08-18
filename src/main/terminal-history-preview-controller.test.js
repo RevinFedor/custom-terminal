@@ -168,6 +168,111 @@ test('late exact Codex prompt may arm an absent turn but cannot replace an activ
   assert.equal(h.emitted.at(-1).preview.text, 'streamed Codex answer');
 });
 
+test('Codex semantic authority publishes raw markdown and never parses tool cells as prose', () => {
+  const h = createHarness();
+  assert.equal(h.controller.activateSemanticSource({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+    processId: 42,
+  }), true);
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'thread-a',
+    turnId: 'turn-a',
+  });
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 11, text: '    Read HistoryPanel.tsx, main.js', hasNonDefaultFg: true },
+    { row: 12, text: '› ', wrapped: false },
+  ])), false);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 0);
+
+  assert.equal(h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+    event: {
+      type: 'item_started',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      item: { kind: 'agentMessage', itemId: 'assistant-1', phase: 'finalAnswer' },
+    },
+  }), true);
+  assert.equal(h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+    event: {
+      type: 'assistant_delta',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      itemId: 'assistant-1',
+      delta: '**Готово**\n\n| A | B |',
+    },
+  }), true);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 1);
+  assert.equal(h.emitted[0].preview.text, '**Готово**\n\n| A | B |');
+  assert.equal(h.emitted[0].preview.sourceMode, 'semantic');
+  assert.match(h.logs.join('\n'), /SEMANTIC_AUTHORITY/);
+});
+
+test('an installed semantic producer blocks xterm guessing even before its hello arrives', () => {
+  const h = createHarness();
+  assert.equal(h.controller.expectSemanticSource({ tabId: 'tab-a' }), true);
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'thread-a',
+    turnId: 'turn-a',
+  });
+  assert.equal(h.controller.observeFrame('tab-a', h.mirror, h.frame([
+    { row: 11, text: '    Read main.js', hasNonDefaultFg: true },
+  ])), false);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 0);
+  assert.equal(h.controller._turns.get('tab-a').sourceMode, 'semantic-pending');
+});
+
+test('exact semantic item completion repairs a dropped delta instead of falling back to xterm', () => {
+  const h = createHarness();
+  h.controller.activateSemanticSource({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+  });
+  assert.equal(h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+    gap: true,
+    event: {
+      type: 'assistant_delta',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      itemId: 'assistant-1',
+      delta: 'lost prefix',
+    },
+  }), false);
+  h.flushTimers();
+  assert.equal(h.emitted.length, 0);
+  assert.equal(h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+    event: {
+      type: 'item_completed',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      item: {
+        kind: 'agentMessage',
+        itemId: 'assistant-1',
+        phase: 'finalAnswer',
+        text: 'Полный **точный** ответ',
+      },
+    },
+  }), true);
+  h.flushTimers();
+  assert.equal(h.emitted.at(-1).preview.text, 'Полный **точный** ответ');
+  assert.match(h.logs.join('\n'), /SEMANTIC_GAP/);
+});
+
 test('Claude activity repaint cannot poison the first assistant frame', () => {
   const h = createHarness();
   h.controller.begin({

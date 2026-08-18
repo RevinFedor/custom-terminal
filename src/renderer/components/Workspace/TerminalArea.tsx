@@ -2,61 +2,27 @@ import React, { memo, useCallback, useMemo, useEffect, useState, useRef } from '
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
-import BrowserTab from './BrowserTab';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
 import { useSplitAttachRowHeight, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
 import { motion, AnimatePresence } from 'framer-motion';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { clearPendingResume, markPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
-import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
-import {
-  applyAgentLaunchPreparationSnapshot,
-  applyClaudeStartupDefaultsGate,
-  describeLaunchPreparationFailure,
-  hideSessionStartingFromLifecycle,
-  invalidateSessionStartingProbeSequence,
-  isSessionStartingProbeCurrent,
-  restoreClaudeStartupDefaultsGate,
-  syncSessionStartingWithPresence,
-} from '../../utils/sessionStartingState.mjs';
-import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
 import { isEmptyPane, paneIsStacked, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
+// Машина состояний запуска/остановки живёт здесь и параметризована `tabId`,
+// поэтому её монтирует и одиночный режим, и каждая панель сплита отдельно.
+import { useAgentLifecycle } from './useAgentLifecycle';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
+import AiLaunchStrip, { type AiLaunchAction } from './AiLaunchStrip';
+import { readSessionIdFromClipboard } from '../../utils/clipboardSessionId';
+import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
 type InterruptedEngine = 'claude' | 'codex';
-
-type SessionStartingState = {
-  tabId: string;
-  engine: InterruptedEngine;
-  sessionId?: string | null;
-  since: number;
-  lastNotReady?: any;
-  holdUntilReady?: boolean;
-  startupPending?: boolean;
-  startupFailed?: boolean;
-  startupError?: string | null;
-  startupFailedCommand?: string | null;
-  startupProofOutcome?: string | null;
-  startupUserRetryable?: boolean;
-  stickySource?: 'claude-startup-defaults';
-  launchPreparing?: boolean;
-  launchPreparationPhase?: string | null;
-  launchPreparationToken?: number | null;
-  launchPreparationStatus?: 'preparing' | 'accepted' | 'rejected' | null;
-};
-
-type AgentStoppingState = {
-  tabId: string;
-  engine: InterruptedEngine;
-  since: number;
-  reason?: string | null;
-};
 
 type ExternalRunMeta = {
   runId?: string;
@@ -195,107 +161,10 @@ const RestoredTerminalError = memo(({ tabId, ownerProjectId, cwd, error, visible
   );
 });
 
-const getSessionStartingPresentation = (state: SessionStartingState) => {
-  const engineLabel = state.engine === 'codex' ? 'CODEX' : 'CLAUDE';
-  const sessionLabel = state.sessionId ? state.sessionId.slice(0, 8) : null;
-  const reason = String(state.lastNotReady?.reason || '');
-  const blockers = new Set<string>(Array.isArray(state.lastNotReady?.blockers)
-    ? state.lastNotReady.blockers
-    : []);
-  const hasBlocker = (name: string) => blockers.has(name) || reason.includes(name);
-  const isError = state.startupFailed === true;
-
-  if (state.launchPreparing) {
-    const repairingHistory = state.launchPreparationPhase === 'repairing-history';
-    return {
-      isError: false,
-      title: state.sessionId ? `PREPARING ${engineLabel} SESSION...` : `STARTING ${engineLabel}...`,
-      subtitle: repairingHistory
-        ? 'Checking the saved conversation before launch'
-        : 'Checking the terminal before launch',
-      detail: sessionLabel ? `Session ${sessionLabel}` : null,
-    };
-  }
-
-  if (isError) {
-    const failedCommand = String(state.startupFailedCommand || '');
-    const proofOutcome = String(state.startupProofOutcome || '');
-    const launchFailure = describeLaunchPreparationFailure(state);
-    return {
-      isError: true,
-      title: `${engineLabel} START FAILED`,
-      // Name the command that actually failed. "Terminal input did not become
-      // ready" was wrong in the real incident: the input WAS ready, one startup
-      // command was swallowed by the TUI.
-      subtitle: failedCommand
-        ? (proofOutcome === 'unresolved'
-          ? `Could not confirm ${failedCommand}`
-          : `${failedCommand} was not applied`)
-        : (launchFailure?.subtitle || 'Terminal input did not become ready'),
-      detail: launchFailure?.detail
-        || state.startupError
-        || 'Close this status or stop the process and try again',
-    };
-  }
-
-  if (state.startupPending) {
-    return {
-      isError: false,
-      title: `CONFIGURING ${engineLabel}...`,
-      subtitle: 'Applying startup settings',
-      detail: sessionLabel ? `Session ${sessionLabel}` : null,
-    };
-  }
-
-  if (hasBlocker('auth-required')) {
-    return {
-      isError: false,
-      title: `${engineLabel} NEEDS SIGN-IN`,
-      subtitle: 'The terminal is waiting for your sign-in choice',
-      detail: 'Choose a sign-in method in the terminal',
-    };
-  }
-
-  if (hasBlocker('update-prompt') || hasBlocker('model-migration')) {
-    return {
-      isError: false,
-      title: `LOADING ${engineLabel} SESSION...`,
-      subtitle: 'The terminal is still loading behind the startup menu',
-      detail: 'Codex is not ready for prompts yet',
-    };
-  }
-
-  if (hasBlocker('trust-directory') || hasBlocker('cwd-chooser')) {
-    return {
-      isError: false,
-      title: `WAITING FOR ${engineLabel}...`,
-      subtitle: 'The terminal is waiting for a confirmation',
-      detail: `${engineLabel} is not ready for prompts yet`,
-    };
-  }
-
-  if (hasBlocker('mcp-startup')) {
-    return {
-      isError: false,
-      title: `STARTING ${engineLabel} TOOLS...`,
-      subtitle: 'Loading terminal integrations',
-      detail: sessionLabel ? `Session ${sessionLabel}` : null,
-    };
-  }
-
-  const isPreparingTerminal = reason === 'empty'
-    || reason === 'no-sync-marker'
-    || reason === 'no-codex-ui-text'
-    || reason === 'no-composer-frame';
-  return {
-    isError: false,
-    title: state.sessionId ? `LOADING ${engineLabel} SESSION...` : `STARTING ${engineLabel}...`,
-    subtitle: isPreparingTerminal
-      ? 'Restoring history and preparing terminal input'
-      : 'Waiting for terminal input to become ready',
-    detail: sessionLabel ? `Session ${sessionLabel}` : null,
-  };
-};
+// Типы состояния запуска/остановки и сборка его текста переехали в
+// `useAgentLifecycle` вместе с самой машиной. Копии здесь удалены намеренно: две
+// формулировки одного статуса разъехались бы при первой правке подписи, и одна
+// поверхность тихо осталась бы с прежним текстом.
 
 // The floating lifecycle CARD (AgentLifecycleStatusCard + its two wrappers,
 // SessionStartingOverlay and AgentStoppingOverlay) lived here and was removed:
@@ -466,493 +335,19 @@ function TerminalArea({
     if (!ws?.activeTabId) return null;
     return ((ws.tabs.get(ws.activeTabId) as any)?.externalRun || null) as ExternalRunMeta | null;
   });
-  const activeAgentStartingKey = useWorkspaceStore((s) => {
-    const ws = s.openProjects.get(projectId);
-    if (!ws?.activeTabId || ws.currentView !== 'terminal') return '';
-    const tab = ws.tabs.get(ws.activeTabId);
-    if (!tab || tab.tabType === 'claude-sdk') return '';
-    const engine = resolvePtyAgentOwner(tab) as InterruptedEngine | null;
-    if (!engine) return '';
-    const sessionId = engine === 'codex' ? (tab.codexSessionId || '') : (tab.claudeSessionId || '');
-    return `${tab.id}|${engine}|${sessionId}`;
+  // Состояние запуска/остановки СВОЕЙ вкладки. Машина переехала в
+  // `useAgentLifecycle`: она параметризована `tabId`, поэтому каждая видимая
+  // вкладка держит свой экземпляр. Здесь — экземпляр для одиночного режима
+  // (центральная поверхность проекта); панели сплита монтируют свои сами.
+  //
+  // Раньше эта машина жила прямо тут в единственном экземпляре и читала
+  // `activeTabId`, из-за чего плашка процесса не строилась для неактивной
+  // вкладки вообще — не «скрывалась», а отсутствовала.
+  const lifecycleSummary = useAgentLifecycle({
+    projectId,
+    tabId: activeTabId,
+    enabled: currentView === 'terminal',
   });
-  const activeAgentStartingInfo = useMemo(() => {
-    if (!activeAgentStartingKey) return null;
-    const [tabId, engine, sessionId] = activeAgentStartingKey.split('|');
-    if (!tabId || (engine !== 'claude' && engine !== 'codex')) return null;
-    return {
-      tabId,
-      engine: engine as InterruptedEngine,
-      sessionId: sessionId || null,
-    };
-  }, [activeAgentStartingKey]);
-  const activeAgentStartingInfoRef = useRef(activeAgentStartingInfo);
-  const startingProbeSeqRef = useRef(0);
-  const dismissedStartingKeysRef = useRef<Set<string>>(new Set());
-  const [sessionStarting, setSessionStarting] = useState<SessionStartingState | null>(null);
-  const [agentStopping, setAgentStopping] = useState<AgentStoppingState | null>(null);
-
-  const startingDismissKey = useCallback((info: { tabId: string; engine: InterruptedEngine; sessionId?: string | null }) => (
-    `${info.tabId}|${info.engine}|${info.sessionId || ''}`
-  ), []);
-
-  const invalidateStartingProbeForTab = useCallback((tabId: string) => {
-    startingProbeSeqRef.current = invalidateSessionStartingProbeSequence(
-      startingProbeSeqRef.current,
-      activeAgentStartingInfoRef.current,
-      tabId,
-    );
-  }, []);
-
-  const applyLaunchPreparationState = useCallback((state: any) => {
-    const info = activeAgentStartingInfoRef.current;
-    if (!info || currentView !== 'terminal') return;
-    const tabId = String(state?.tabId || info.tabId);
-    const engine = state?.toolType === 'codex'
-      ? 'codex'
-      : (state?.toolType === 'claude' ? 'claude' : info.engine);
-    if (info.tabId !== tabId || info.engine !== engine) return;
-    const restoresVisibleState = state?.preparing === true
-      || (state && state.preparing === false && state.accepted !== true && state.cleared !== true);
-    if (restoresVisibleState) {
-      dismissedStartingKeysRef.current.delete(startingDismissKey(info));
-      invalidateStartingProbeForTab(tabId);
-    } else if (state?.cleared === true) {
-      invalidateStartingProbeForTab(tabId);
-    }
-    setSessionStarting((prev) => applyAgentLaunchPreparationSnapshot(prev, info, state));
-  }, [currentView, invalidateStartingProbeForTab, startingDismissKey]);
-
-  useEffect(() => {
-    activeAgentStartingInfoRef.current = activeAgentStartingInfo;
-  }, [activeAgentStartingInfo]);
-
-  // Launch preparation starts before a shell command exists, so neither OSC
-  // command state nor TUI presence can reconstruct it. Main keeps an exact
-  // tab-scoped snapshot; this read makes tab switches lossless.
-  useEffect(() => {
-    const info = activeAgentStartingInfo;
-    if (!info || currentView !== 'terminal') return;
-    let cancelled = false;
-    ipcRenderer.invoke('agent:get-launch-preparation-state', info.tabId)
-      .then((result: any) => {
-        if (cancelled) return;
-        if (activeAgentStartingInfoRef.current?.tabId !== info.tabId) return;
-        applyLaunchPreparationState(result?.state || null);
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [activeAgentStartingInfo, activeAgentStartingKey, applyLaunchPreparationState, currentView]);
-
-  // Re-read the startup gate whenever this surface (re)binds to a Claude tab.
-  // The gate event is delivered only to the ACTIVE tab; in the 2026-07-25
-  // incident the `failed` event landed 549ms after the user switched away, the
-  // active-tab guard dropped it, and coming back showed a generic "starting"
-  // with no reason — while the failure was still recorded in both the renderer
-  // map and main's mirror. The event is now an optimization; this is the
-  // contract.
-  useEffect(() => {
-    const info = activeAgentStartingInfo;
-    if (!info || info.engine !== 'claude' || currentView !== 'terminal') return;
-    let cancelled = false;
-    fetchClaudeStartupDefaultsGate(info.tabId).then((gate) => {
-      if (cancelled) return;
-      if (activeAgentStartingInfoRef.current?.tabId !== info.tabId) return;
-      setSessionStarting((prev) => restoreClaudeStartupDefaultsGate(prev, info, gate));
-      console.warn('[SessionStartingOverlay] gate-restored tab=' + info.tabId.slice(-12)
-        + ' status=' + (gate?.status || 'absent')
-        + ' command=' + (gate?.failedCommand || '-')
-        + ' outcome=' + (gate?.proofOutcome || '-'));
-    });
-    return () => { cancelled = true; };
-  }, [activeAgentStartingInfo, currentView]);
-
-  useEffect(() => {
-    if (!activeTabId || currentView !== 'terminal') {
-      setAgentStopping(null);
-      return;
-    }
-    let cancelled = false;
-    ipcRenderer.invoke('agent:get-stopping-state', activeTabId)
-      .then((state: any) => {
-        if (cancelled) return;
-        if (state?.stopping) {
-          const engine = state.toolType === 'codex' ? 'codex' : 'claude';
-          setAgentStopping((prev) => {
-            if (prev?.tabId === activeTabId && prev.engine === engine) {
-              return { ...prev, reason: state.reason || prev.reason || null };
-            }
-            console.warn('[AgentStoppingOverlay] hydrate tab=' + activeTabId.slice(-12) + ' engine=' + engine + ' reason=' + (state.reason || '-'));
-            return {
-              tabId: activeTabId,
-              engine,
-              since: state.since || Date.now(),
-              reason: state.reason || null,
-            };
-          });
-        } else {
-          setAgentStopping((prev) => prev?.tabId === activeTabId ? null : prev);
-        }
-      })
-      .catch((e: any) => {
-        if (!cancelled) console.warn('[AgentStoppingOverlay] hydrate failed tab=' + activeTabId.slice(-12) + ' error=' + (e?.message || String(e)));
-      });
-    return () => { cancelled = true; };
-  }, [activeTabId, currentView]);
-
-  const refreshSessionStarting = useCallback(async (reason: string) => {
-    const info = activeAgentStartingInfoRef.current;
-    const seq = ++startingProbeSeqRef.current;
-    if (!info || currentView !== 'terminal') {
-      setSessionStarting(null);
-      return;
-    }
-    try {
-      const presence = await getHistoryAgentRuntime(info.engine).getPresence(info.tabId, projectId);
-      const latest = activeAgentStartingInfoRef.current;
-      if (!isSessionStartingProbeCurrent(seq, startingProbeSeqRef.current, info, latest)) return;
-      const isVisibleStartupState = presence.status === 'starting' || presence.manualActionRequired === true;
-      if (isVisibleStartupState && dismissedStartingKeysRef.current.has(startingDismissKey(info))) return;
-      if (!isVisibleStartupState) {
-        dismissedStartingKeysRef.current.delete(startingDismissKey(info));
-      }
-      setSessionStarting((prev) => {
-        const next = syncSessionStartingWithPresence(prev, info, presence);
-        if (!prev && next) {
-          console.warn('[SessionStartingOverlay] show tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
-        } else if (prev?.tabId === info.tabId && !next) {
-          console.warn('[SessionStartingOverlay] hide tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' status=' + presence.status);
-        }
-        return next;
-      });
-    } catch (e: any) {
-      if (seq !== startingProbeSeqRef.current) return;
-      console.warn('[SessionStartingOverlay] presence failed tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' error=' + (e?.message || String(e)));
-    }
-  }, [currentView, projectId, startingDismissKey]);
-
-  useEffect(() => {
-    if (!activeAgentStartingInfo || currentView !== 'terminal') {
-      startingProbeSeqRef.current++;
-      setSessionStarting(null);
-      return;
-    }
-    void refreshSessionStarting('active-tab');
-  }, [activeAgentStartingKey, activeAgentStartingInfo, currentView, refreshSessionStarting]);
-
-  useEffect(() => {
-    const showFromEvent = (tabId: string, reason: string) => {
-      const info = activeAgentStartingInfoRef.current;
-      if (!info || info.tabId !== tabId || currentView !== 'terminal') return;
-      dismissedStartingKeysRef.current.delete(startingDismissKey(info));
-      console.warn('[SessionStartingOverlay] event-start tab=' + tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
-      setSessionStarting((prev) => prev?.tabId === tabId ? prev : {
-        tabId,
-        engine: info.engine,
-        sessionId: info.sessionId,
-        holdUntilReady: true,
-        since: Date.now(),
-      });
-    };
-    const hideFromEvent = (tabId: string, reason: string, force = false) => {
-      const info = activeAgentStartingInfoRef.current;
-      invalidateStartingProbeForTab(tabId);
-      if (info?.tabId === tabId) dismissedStartingKeysRef.current.delete(startingDismissKey(info));
-      setSessionStarting((prev) => {
-        if (prev?.tabId !== tabId) return prev;
-        const next = hideSessionStartingFromLifecycle(prev, tabId, { force });
-        if (!next) console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason + ' engine=' + prev.engine);
-        return next;
-      });
-    };
-    const onCommandStarted = (_: any, data: { tabId: string; commandType?: string | null }) => {
-      if (data.commandType === 'claude' || data.commandType === 'codex') {
-        showFromEvent(data.tabId, 'command-started');
-      } else {
-        void refreshSessionStarting('command-started');
-      }
-    };
-    const onCommandFinished = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'command-finished', true);
-    const onClaudeReady = (_: any, data: { tabId: string }) => {
-      const info = activeAgentStartingInfoRef.current;
-      if (info?.tabId === data.tabId && info.engine !== 'claude') return;
-      hideFromEvent(data.tabId, 'claude-tui-ready', true);
-    };
-    const onCodexReady = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'codex-tui-ready', true);
-    const onClaudeBusy = (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
-      if (!data.busy || data.reason === 'spinner') return;
-      hideFromEvent(data.tabId, 'claude-busy', true);
-    };
-    const onCodexBusy = (_: any, data: { tabId: string; busy: boolean }) => {
-      if (!data.busy) return;
-      hideFromEvent(data.tabId, 'codex-busy', true);
-    };
-    const onCodexNotReady = (_: any, data: { tabId?: string; reason?: string | null }) => {
-      const eventTabId = data?.tabId || '';
-      const info = activeAgentStartingInfoRef.current;
-      if (!eventTabId || !info || info.tabId !== eventTabId || info.engine !== 'codex' || currentView !== 'terminal') return;
-      if (data.reason === 'manual-stop') {
-        invalidateStartingProbeForTab(eventTabId);
-        setSessionStarting(null);
-        console.warn('[SessionStartingOverlay] ignore not-ready after manual Stop tab=' + eventTabId.slice(-12));
-        return;
-      }
-      void refreshSessionStarting('codex-tui-not-ready:' + (data.reason || '-'));
-    };
-    const onCodexManualAction = (_: any, data: { tabId?: string; type?: string | null }) => {
-      const eventTabId = data?.tabId || '';
-      const info = activeAgentStartingInfoRef.current;
-      if (!eventTabId || !info || info.tabId !== eventTabId || info.engine !== 'codex' || currentView !== 'terminal') return;
-      void refreshSessionStarting('codex-manual-action:' + (data.type || '-'));
-    };
-    const onLaunchPreparation = (_: any, state: any) => {
-      applyLaunchPreparationState(state);
-    };
-    const onAgentStopping = (_: any, data: {
-      tabId?: string;
-      toolType?: string | null;
-      stopping?: boolean;
-      reason?: string | null;
-      since?: number;
-    }) => {
-      const eventTabId = data?.tabId || '';
-      if (!eventTabId) return;
-      const engine: InterruptedEngine = data.toolType === 'codex' ? 'codex' : 'claude';
-      if (data.stopping) {
-        if (eventTabId !== activeTabId || currentView !== 'terminal') return;
-        invalidateStartingProbeForTab(eventTabId);
-        setSessionStarting(null);
-        setAgentStopping((prev) => {
-          if (prev?.tabId === eventTabId && prev.engine === engine) {
-            return { ...prev, reason: data.reason || prev.reason || null };
-          }
-          console.warn('[AgentStoppingOverlay] show tab=' + eventTabId.slice(-12) + ' engine=' + engine + ' reason=' + (data.reason || '-'));
-          return {
-            tabId: eventTabId,
-            engine,
-            since: data.since || Date.now(),
-            reason: data.reason || null,
-          };
-        });
-      } else {
-        setAgentStopping((prev) => {
-          if (prev?.tabId === eventTabId) {
-            console.warn('[AgentStoppingOverlay] hide tab=' + eventTabId.slice(-12) + ' reason=' + (data.reason || '-'));
-            return null;
-          }
-          return prev;
-        });
-      }
-    };
-    const onClaudeStartupGate = (event: Event) => {
-      const detail = (event as CustomEvent<{
-        tabId?: string;
-        status?: string;
-        reason?: string;
-        error?: string | null;
-        failedCommand?: string | null;
-        proofOutcome?: string | null;
-        userRetryable?: boolean;
-      }>).detail || {};
-      const gateTabId = detail.tabId || '';
-      const info = activeAgentStartingInfoRef.current;
-      if (!gateTabId || !info || info.tabId !== gateTabId || info.engine !== 'claude' || currentView !== 'terminal') return;
-      if (detail.status === 'pending' || detail.status === 'failed') {
-        dismissedStartingKeysRef.current.delete(startingDismissKey(info));
-      }
-      if (detail.status === 'ready' || detail.status === 'cleared') {
-        invalidateStartingProbeForTab(gateTabId);
-      }
-      if (detail.status === 'ready' || detail.status === 'cleared' || detail.status === 'pending' || detail.status === 'failed') {
-        setSessionStarting((prev) => {
-          const next = applyClaudeStartupDefaultsGate(prev, info, { ...detail, tabId: gateTabId });
-          console.warn('[SessionStartingOverlay] gate-' + detail.status + ' tab=' + gateTabId.slice(-12) + ' reason=' + (detail.reason || '-') + ' error=' + (detail.error || '-'));
-          return next;
-        });
-      }
-    };
-
-    ipcRenderer.on('terminal:command-started', onCommandStarted);
-    ipcRenderer.on('terminal:command-finished', onCommandFinished);
-    ipcRenderer.on('claude:tui-ready', onClaudeReady);
-    ipcRenderer.on('codex:tui-ready', onCodexReady);
-    ipcRenderer.on('codex:tui-not-ready', onCodexNotReady);
-    ipcRenderer.on('codex:tui-manual-action-required', onCodexManualAction);
-    ipcRenderer.on('agent:launch-preparation-state', onLaunchPreparation);
-    ipcRenderer.on('claude:busy-state', onClaudeBusy);
-    ipcRenderer.on('codex:busy-state', onCodexBusy);
-    ipcRenderer.on('agent:stopping-state', onAgentStopping);
-    window.addEventListener('claude-startup-defaults-gate', onClaudeStartupGate);
-    return () => {
-      ipcRenderer.removeListener('terminal:command-started', onCommandStarted);
-      ipcRenderer.removeListener('terminal:command-finished', onCommandFinished);
-      ipcRenderer.removeListener('claude:tui-ready', onClaudeReady);
-      ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
-      ipcRenderer.removeListener('codex:tui-not-ready', onCodexNotReady);
-      ipcRenderer.removeListener('codex:tui-manual-action-required', onCodexManualAction);
-      ipcRenderer.removeListener('agent:launch-preparation-state', onLaunchPreparation);
-      ipcRenderer.removeListener('claude:busy-state', onClaudeBusy);
-      ipcRenderer.removeListener('codex:busy-state', onCodexBusy);
-      ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
-      window.removeEventListener('claude-startup-defaults-gate', onClaudeStartupGate);
-    };
-  }, [activeTabId, applyLaunchPreparationState, currentView, invalidateStartingProbeForTab, refreshSessionStarting, startingDismissKey]);
-
-  const handleDismissSessionStarting = useCallback(() => {
-    const current = sessionStarting;
-    if (current) {
-      dismissedStartingKeysRef.current.add(startingDismissKey(current));
-      console.warn('[SessionStartingOverlay] dismissed tab=' + current.tabId.slice(-12) + ' engine=' + current.engine);
-      if (
-        current.launchPreparationStatus === 'rejected'
-        && Number(current.launchPreparationToken || 0) > 0
-      ) {
-        void ipcRenderer.invoke('agent:clear-launch-preparation-state', {
-          tabId: current.tabId,
-          token: current.launchPreparationToken,
-          reason: 'user-dismissed',
-        }).then((result: any) => {
-          // A new launch may supersede the card between click and IPC. Its
-          // exact token is intentionally not cleared; immediately apply the
-          // authoritative replacement instead.
-          if (result?.cleared !== true && result?.state) {
-            applyLaunchPreparationState(result.state);
-          }
-        }).catch((error: any) => {
-          console.warn('[SessionStartingOverlay] launch failure dismiss failed tab='
-            + current.tabId.slice(-12) + ' error=' + (error?.message || String(error)));
-        });
-      }
-    }
-    setSessionStarting(null);
-  }, [applyLaunchPreparationState, sessionStarting, startingDismissKey]);
-
-  // Explicit user approval re-enters the main-owned transaction for the same
-  // live launch. Main keeps already-proven earlier steps and retries only the
-  // failed setting.
-  const handleRetryStartupDefaults = useCallback(async () => {
-    const current = sessionStarting;
-    if (!current || current.engine !== 'claude') return;
-    console.warn('[StartupRetry] decision=user action=manual-retry tab=' + current.tabId.slice(-12)
-      + ' command=' + (current.startupFailedCommand || '-'));
-    setSessionStarting(null);
-    const result = await ipcRenderer.invoke('claude:retry-startup-defaults', {
-      tabId: current.tabId,
-    }).catch((error: any) => ({
-      success: false,
-      accepted: false,
-      error: error?.message || String(error),
-    }));
-    if (result?.accepted === true) return;
-    setSessionStarting((prev) => applyClaudeStartupDefaultsGate(prev, current, {
-      tabId: current.tabId,
-      status: 'failed',
-      reason: 'manual-retry-rejected',
-      error: result?.error || result?.reason || 'No live Claude launch to retry',
-      failedCommand: current.startupFailedCommand || null,
-      proofOutcome: current.startupProofOutcome || null,
-      userRetryable: false,
-    }));
-  }, [sessionStarting]);
-
-  // DEBUG: Track render reason
-  const renderCountRef = useRef(0);
-  renderCountRef.current++;
-
-  // Check if sub-agent is actively visible (parent Gemini tab is the active tab)
-  const isSubAgentVisible = useWorkspaceStore((s) => {
-    if (!viewingSubAgentTabId) return false;
-    const ws = s.openProjects.get(projectId);
-    if (!ws?.activeTabId) return false;
-    const viewedTab = ws.tabs.get(viewingSubAgentTabId);
-    return !!viewedTab && viewedTab.parentTabId === ws.activeTabId;
-  });
-
-  if ((window as any).__NOTED_RENDER_DIAG__ === true) {
-    console.warn(`[TerminalArea:RENDER #${renderCountRef.current}] projectId=${projectId} currentView=${currentView}`);
-  }
-
-  // Get active tab info for interrupted session overlay (targeted selectors)
-  const activeTabInterruptedKey = useWorkspaceStore((s) => {
-    const ws = s.openProjects.get(projectId);
-    if (!ws?.activeTabId) return '';
-    const tab = ws.tabs.get(ws.activeTabId);
-    // SDK tabs handle resume via claude-sdk:send-message, not PTY overlay
-    if (!tab || tab.tabType === 'claude-sdk' || !tab.wasInterrupted || tab.overlayDismissed) return '';
-    const owner = resolvePtyAgentOwner(tab);
-    if (owner === 'codex' && tab.codexSessionId) return `codex:${tab.codexSessionId}`;
-    if (owner === 'claude' && tab.claudeSessionId && !tab.claudeActive) return `claude:${tab.claudeSessionId}`;
-    return '';
-  });
-  const [activeTabInterruptedEngine, activeTabSessionId] = useMemo(() => {
-    if (!activeTabInterruptedKey) return [null, null] as [InterruptedEngine | null, string | null];
-    const idx = activeTabInterruptedKey.indexOf(':');
-    if (idx < 0) return [null, null] as [InterruptedEngine | null, string | null];
-    return [
-      activeTabInterruptedKey.slice(0, idx) as InterruptedEngine,
-      activeTabInterruptedKey.slice(idx + 1),
-    ];
-  }, [activeTabInterruptedKey]);
-  const activeTabIdForOverlay = activeTabId;
-  const isRestoring = useWorkspaceStore((s) => s.isRestoring);
-  const showAgentStoppingOverlay = !!agentStopping
-    && currentView === 'terminal'
-    && activeTabIdForOverlay === agentStopping.tabId;
-  const showSessionStartingOverlay = !!sessionStarting
-    && currentView === 'terminal'
-    && !showAgentStoppingOverlay
-    && activeTabIdForOverlay === sessionStarting.tabId;
-  const showInterruptedOverlay = !!activeTabInterruptedEngine
-    && !!activeTabSessionId
-    && currentView === 'terminal'
-    && !isRestoring
-    && !showAgentStoppingOverlay
-    && !showSessionStartingOverlay;
-
-  const lifecycleSummary = useMemo<AgentLifecycleSummary | null>(() => {
-    if (showAgentStoppingOverlay && agentStopping) {
-      const engineLabel = agentStopping.engine === 'codex' ? 'CODEX' : 'CLAUDE';
-      return {
-        tabId: agentStopping.tabId,
-        kind: 'stopping',
-        title: `STOPPING ${engineLabel}...`,
-        description: 'Waiting for the process to exit safely',
-        detail: agentStopping.reason || null,
-        spinner: true,
-      };
-    }
-    if (showInterruptedOverlay && activeTabIdForOverlay && activeTabSessionId) {
-      const engineLabel = activeTabInterruptedEngine === 'codex' ? 'CODEX' : 'CLAUDE';
-      return {
-        tabId: activeTabIdForOverlay,
-        sessionId: activeTabSessionId,
-        kind: 'interrupted',
-        title: `${engineLabel} SESSION INTERRUPTED`,
-        description: 'The saved conversation can be continued from this tab',
-        detail: `Session ${activeTabSessionId}`,
-        spinner: false,
-      };
-    }
-    if (showSessionStartingOverlay && sessionStarting) {
-      const presentation = getSessionStartingPresentation(sessionStarting);
-      const canRetryStartupSettings = presentation.isError
-        && sessionStarting.startupUserRetryable === true;
-      return {
-        tabId: sessionStarting.tabId,
-        sessionId: sessionStarting.sessionId || null,
-        kind: presentation.isError ? 'error' : 'starting',
-        title: presentation.title,
-        description: presentation.subtitle,
-        detail: presentation.detail,
-        spinner: !presentation.isError,
-        dismissLabel: presentation.isError ? 'Dismiss starting status' : undefined,
-        onDismiss: presentation.isError ? handleDismissSessionStarting : undefined,
-        retryLabel: canRetryStartupSettings ? 'RETRY SETTINGS' : undefined,
-        onRetry: canRetryStartupSettings ? handleRetryStartupDefaults : undefined,
-      };
-    }
-    return null;
-  }, [activeTabIdForOverlay, activeTabInterruptedEngine, activeTabSessionId, agentStopping, handleDismissSessionStarting, handleRetryStartupDefaults, sessionStarting, showAgentStoppingOverlay, showInterruptedOverlay, showSessionStartingOverlay]);
 
   useEffect(() => {
     onLifecycleStatusChange?.(lifecycleSummary);
@@ -961,6 +356,20 @@ function TerminalArea({
   useEffect(() => () => {
     onLifecycleStatusChange?.(null);
   }, [onLifecycleStatusChange]);
+
+  // Прерванная сессия: сводка выше уже несёт этот вид состояния для СВОЕЙ
+  // вкладки, поэтому оверлей читает её, а не считает признак второй раз.
+  const isRestoring = useWorkspaceStore((s) => s.isRestoring);
+  const activeTabIdForOverlay = activeTabId;
+  const interruptedLifecycle = lifecycleSummary?.kind === 'interrupted' ? lifecycleSummary : null;
+  const activeTabSessionId = interruptedLifecycle?.sessionId || null;
+  // Движок берётся из поля сводки, а НЕ из её заголовка: разбор подписи
+  // (`title.startsWith('CODEX')`) связал бы возобновление сессии с текстом, и
+  // правка формулировки молча сломала бы «продолжить».
+  const activeTabInterruptedEngine: InterruptedEngine | null = interruptedLifecycle?.engine || null;
+  const showInterruptedOverlay = !!interruptedLifecycle
+    && currentView === 'terminal'
+    && !isRestoring;
 
   
   // Handle continuing interrupted AI session (use fresh state from getState)
@@ -1042,6 +451,23 @@ function TerminalArea({
     }
   };
 
+  // DEBUG: Track render reason
+  const renderCountRef = useRef(0);
+  renderCountRef.current++;
+
+  // Check if sub-agent is actively visible (parent Gemini tab is the active tab)
+  const isSubAgentVisible = useWorkspaceStore((s) => {
+    if (!viewingSubAgentTabId) return false;
+    const ws = s.openProjects.get(projectId);
+    if (!ws?.activeTabId) return false;
+    const viewedTab = ws.tabs.get(viewingSubAgentTabId);
+    return !!viewedTab && (viewedTab as any).parentTabId === ws.activeTabId;
+  });
+
+  if ((window as any).__NOTED_RENDER_DIAG__ === true) {
+    console.warn(`[TerminalArea:RENDER #${renderCountRef.current}] projectId=${projectId} currentView=${currentView}`);
+  }
+
   // Stable string selector — re-renders only when tab structure changes or a
   // tab changes its own rendered surface. Active project/tab visibility is
   // tracked separately below so project switches do not remount xterm.
@@ -1053,7 +479,7 @@ function TerminalArea({
         : '';
       parts.push(`${projId}${subAgentPart}`);
       workspace.tabs.forEach((tab) => {
-        parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab.terminalId || ''}:${(tab as any).restoreError ? 'restore-error' : 'ok'}`);
+        parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${(tab as any).restoreError ? 'restore-error' : 'ok'}`);
       });
     });
     return parts.join(',');
@@ -1146,6 +572,99 @@ function TerminalArea({
   // stale 26 is exactly the chip-over-the-separator bug.
   const attachRowH = useSplitAttachRowHeight();
 
+  // Запуск агента из ШАПКИ ПУСТОГО ОКНА.
+  //
+  // Полоса кнопок — та же, что в баре новой вкладки (AiLaunchStrip), но здесь
+  // ей некуда приземлиться: вкладки в этом окне ещё нет, а превращать чужую
+  // (как делает бар, стоящий ВНУТРИ вкладки) тут нечего. Поэтому создаём новую
+  // вкладку в конце списка проекта и она сама встаёт в это окно: панель в
+  // фокусе принимает активируемую вкладку — то самое общее правило активации,
+  // которым пользуются и боковой список, и Ctrl+Tab.
+  //
+  // Проект берём у ОКНА, а не «активный»: окна кросс-проектные, и вкладка,
+  // созданная в чужом проекте, выглядела бы как чужая папка в чужом списке.
+  // Пустое окно своего проекта не помнит, поэтому спрашиваем боковое меню —
+  // это и есть «где я сейчас работаю».
+  const launchIntoEmptyPane = useCallback(async (
+    paneIndex: number,
+    action: AiLaunchAction | 'empty',
+  ) => {
+    const store = useWorkspaceStore.getState();
+    const targetProjectId = store.getFocusedProjectId() || store.activeProjectId;
+    if (!targetProjectId) return;
+    const workspace = store.openProjects.get(targetProjectId);
+    if (!workspace) return;
+    // Окно должно быть в фокусе ДО создания вкладки: активация кладёт её именно
+    // в сфокусированное окно, а кликнуть могли по кнопке в шапке соседнего.
+    if (store.splitFocusedIndex !== paneIndex) store.focusSplitPane(paneIndex);
+
+    const projectPath = workspace.projectPath && !workspace.projectPath.startsWith('__unset__')
+      ? workspace.projectPath
+      : '';
+    const activeTab = workspace.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
+    const cwd = projectPath || activeTab?.cwd || '';
+
+    if (action === 'empty') {
+      // «Пустая вкладка»: живой shell без агента. Отдельного типа вкладки нет —
+      // «пустая» это описание, а не состояние (см. emptyTab.mjs).
+      await useWorkspaceStore.getState().createTab(targetProjectId, EMPTY_TAB_NAME, cwd, {
+        skipInitialRename: true,
+      });
+      return;
+    }
+    if (action === 'sdk') {
+      await useWorkspaceStore.getState().createSDKTab(targetProjectId);
+      return;
+    }
+    if (action === 'claude' || action === 'codex') {
+      // Тот же контракт, что у всех прочих точек запуска: вкладка несёт
+      // pendingAction, а CLI поднимает Terminal.tsx, когда shell готов. Свой
+      // запуск отсюда гонялся бы с ним и стартовал два процесса в одном PTY.
+      await useWorkspaceStore.getState().createTab(targetProjectId, undefined, cwd, {
+        color: action,
+        pendingAction: { type: action === 'codex' ? 'codex-new' : 'claude-new' },
+        skipInitialRename: true,
+      });
+      return;
+    }
+    // Форки из буфера: без UUID в буфере создавать вкладку незачем — пустая
+    // вкладка «на всякий случай» это мусор, который пользователь не просил.
+    const clipSid = readSessionIdFromClipboard();
+    if (!clipSid) {
+      useUIStore.getState().showToast('В буфере нет session ID (UUID)', 'warning');
+      return;
+    }
+    if (action === 'sdk-fork') {
+      const forkResult = await ipcRenderer.invoke('claude:fork-session-file', {
+        sourceSessionId: clipSid,
+        cwd,
+        skipChainResolve: true,
+      });
+      if (!forkResult?.success) {
+        useUIStore.getState().showToast('Fork failed: ' + (forkResult?.error || 'unknown'), 'error');
+        return;
+      }
+      const sdkTabId = await useWorkspaceStore.getState().createSDKTab(
+        targetProjectId,
+        `${clipSid.slice(0, 8)}_fork`,
+      );
+      useWorkspaceStore.getState().updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+      return;
+    }
+    const isCodex = action === 'codex-fork';
+    await useWorkspaceStore.getState().createTab(
+      targetProjectId,
+      `${clipSid.slice(0, 8)}_${isCodex ? 'codex' : 'fork'}`,
+      cwd,
+      {
+        color: isCodex ? 'codex' : 'claude',
+        pendingAction: { type: isCodex ? 'codex-fork' : 'claude-fork', sessionId: clipSid },
+        nameSetManually: false,
+        skipInitialRename: true,
+      },
+    );
+  }, []);
+
   const terminals = useMemo(() => {
     const t0 = Date.now();
     const result: React.ReactNode[] = [];
@@ -1161,8 +680,24 @@ function TerminalArea({
     const splitSizes = state.splitSizes;
     const splitActive = splitPanes.length > 0;
     const splitFocusedTabId = splitActive ? (splitPanes[state.splitFocusedIndex]?.tabId || null) : null;
+    // Куда рисуется вкладка. ПЕРВОЕ окно, а не последнее: вся разметка окна —
+    // шапка, содержимое, рамка фокуса — рендерится вкладкой, которую окно
+    // показывает, поэтому тихая перезапись оставляла бы предыдущее окно вообще
+    // без разметки: чёрный прямоугольник без шапки, «окно тупо пропало».
+    // Состояния «одна вкладка в двух окнах» быть не должно — модель снимает
+    // дубликат и при добавлении, и при восстановлении сессии, — поэтому если он
+    // всё же дошёл сюда, он должен быть ГРОМКИМ, а не невидимым.
     const paneIndexByTabId = new Map<string, number>();
-    splitPanes.forEach((p, i) => paneIndexByTabId.set(p.tabId, i));
+    splitPanes.forEach((p, i) => {
+      if (!p.tabId) return; // намеренно пустое окно
+      const already = paneIndexByTabId.get(p.tabId);
+      if (already !== undefined) {
+        console.warn('[TerminalArea] duplicate pane tab=' + p.tabId.slice(-12)
+          + ' panes=' + already + ',' + i + ' — rendering in ' + already);
+        return;
+      }
+      paneIndexByTabId.set(p.tabId, i);
+    });
     let sdkCount = 0;
     let totalCount = 0;
 
@@ -1208,21 +743,6 @@ function TerminalArea({
               tabId={tab.id}
               cwd={tab.cwd}
               ownerProjectId={projId}
-              active={active}
-              isActiveProject={isActiveProject}
-            />
-          );
-        } else if (tab.tabType === 'browser') {
-          inner = (
-            <BrowserTab
-              key={tab.id}
-              tabId={tab.id}
-              url={tab.url || 'http://localhost:3000'}
-              ownerProjectId={projId}
-              terminalId={tab.terminalId || tab.id}
-              terminalName={tab.terminalName}
-              activeView={tab.activeView || 'browser'}
-              cwd={tab.cwd}
               active={active}
               isActiveProject={isActiveProject}
             />
@@ -1344,15 +864,15 @@ function TerminalArea({
                 pointerEvents: 'none',
               }}
             >
-              {inPane && tab.tabType !== 'browser' && tab.tabType !== 'file' ? (
+              {inPane && tab.tabType !== 'file' ? (
                 <SplitPaneSurface
                   projectId={projId}
                   tabId={tab.id}
                   focused={focusedPane}
-                  // The pane shows the status inside its own transcript header;
-                  // it filters by tabId, so only the pane the status is about
-                  // displays it.
-                  lifecycleStatus={lifecycleSummary}
+                  // Статус процесса панель собирает САМА, по своему `tabId`.
+                  // Раньше он приходил отсюда пропом, но строился только для
+                  // активной вкладки — то есть во второй панели его не было
+                  // никогда, сколько бы она ни фильтровала по `tabId`.
                   stacked={paneIsStacked(splitPanes, paneIndex)}
                 >
                   {inner}
@@ -1382,6 +902,13 @@ function TerminalArea({
         >
           <div
             data-split-attach-row
+            // Двойной клик по пустому месту шапки — то же, что в шапке обычного
+            // окна: ещё одна вкладка сюда. Пустое окно только выглядит иначе,
+            // жест один.
+            onDoubleClick={(e) => {
+              e.stopPropagation();
+              launchIntoEmptyPane(paneIndex, 'empty');
+            }}
             style={{
               position: 'absolute',
               top: 0,
@@ -1401,7 +928,12 @@ function TerminalArea({
               userSelect: 'none',
             }}
           >
-            <span>Выберите вкладку</span>
+            {/* Шапка пустого окна называет ЕГО состояние, а кнопки запуска
+                переехали вниз, в центр (см. ниже): полоса из шести кнопок в
+                строке заголовка выглядела как содержимое окна, хотя окно пустое.
+                Юзер: *«кнопки… тогда переносите вниз, если у меня ничего нет —
+                это будет более логично»*. */}
+            <span style={{ color: '#6f6f75', fontWeight: 500 }}>Нет вкладки</span>
             <span style={{ flex: 1 }} />
             <button
               title="Убрать пустую панель"
@@ -1430,6 +962,13 @@ function TerminalArea({
             </button>
           </div>
           <div
+            // Двойной клик по телу — тот же жест, что по шапке: всё окно пустое,
+            // и требовать попасть именно в верхние 26 пикселей было бы правилом
+            // без причины.
+            onDoubleClick={(e) => {
+              e.stopPropagation();
+              launchIntoEmptyPane(paneIndex, 'empty');
+            }}
             style={{
               position: 'absolute',
               top: attachRowH,
@@ -1437,8 +976,10 @@ function TerminalArea({
               right: 0,
               bottom: 0,
               display: 'flex',
+              flexDirection: 'column',
               alignItems: 'center',
               justifyContent: 'center',
+              gap: 10,
               padding: 16,
               background: '#161616',
               color: '#777',
@@ -1448,7 +989,19 @@ function TerminalArea({
               userSelect: 'none',
             }}
           >
-            Ctrl+Tab / Cmd+P или клик по вкладке слева
+            {/* ТА ЖЕ полоса запуска, что в баре вкладки — один компонент, не
+                копия. Здесь она ВЕДУЩАЯ (рисует и чип Claude): живой сессии в
+                пустом окне нет, а значит нет и её отдельной кнопки управления,
+                рядом с которой чип оказался бы вторым. */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'center' }}>
+              <AiLaunchStrip
+                ownsClaudeChip
+                onLaunch={(action) => launchIntoEmptyPane(paneIndex, action)}
+              />
+            </div>
+            <div style={{ color: '#5f5f65', fontSize: 11.5 }}>
+              Двойной клик — пустая вкладка · Ctrl+Tab / Cmd+P или клик по вкладке слева
+            </div>
           </div>
           <SplitPaneFocusFrame focused={focusedPane} />
         </div>

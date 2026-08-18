@@ -745,6 +745,8 @@ async function probeClaudeDraft(tabId: string, reason: string) {
   const resolved = await ipcRenderer.invoke('claude:get-draft-state', tabId, {
     reason,
     timeoutMs: 700,
+    waitOnUnknownOnly: true,
+    waitTimeoutMs: 15000,
   }).catch((error: any) => ({
     success: false,
     hasDraft: null,

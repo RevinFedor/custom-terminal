@@ -51,10 +51,12 @@ test('every execution-affecting field changes request identity', () => {
     { waitForDescendants: false },
     { parentRunId: 'parent' },
     { placement: 'root', visualParentTabId: '', afterTabId: '' },
+    { forkFromTabId: 'source-history' },
     { failureGraceMs: 123 },
     { successAutoStopMs: 456 },
     { reactToManualInterrupt: true },
     { autoStopCreatedTargets: false },
+    { compactBeforeTask: true },
   ];
   for (const patch of variants) {
     assert.notEqual(
@@ -63,6 +65,22 @@ test('every execution-affecting field changes request identity', () => {
       JSON.stringify(patch),
     );
   }
+});
+
+test('fork mode changes identity only for a fork-backed new target', () => {
+  const fresh = normalizeOrchestrationRequestIdentity(base());
+  assert.equal(Object.hasOwn(fresh.target, 'fork'), false);
+
+  const compactFork = orchestrationRequestFingerprint({
+    ...base(),
+    forkFromTabId: 'source-history',
+  });
+  const fullFork = orchestrationRequestFingerprint({
+    ...base(),
+    forkFromTabId: 'source-history',
+    fullHistoryFork: true,
+  });
+  assert.notEqual(compactFork, fullFork);
 });
 
 test('full prompt is not retained in normalized identity', () => {

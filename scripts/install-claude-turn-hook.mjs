@@ -11,9 +11,13 @@ export const CLAUDE_TURN_HOOK_SPECS = Object.freeze([
   Object.freeze({ event: 'UserPromptSubmit', matcher: null }),
   Object.freeze({ event: 'Stop', matcher: null }),
   Object.freeze({ event: 'StopFailure', matcher: null }),
-  Object.freeze({ event: 'PreToolUse', matcher: 'AskUserQuestion' }),
-  Object.freeze({ event: 'PostToolUse', matcher: 'AskUserQuestion' }),
-  Object.freeze({ event: 'PostToolUseFailure', matcher: 'AskUserQuestion' }),
+  // All tools feed the same local ownership socket. AskUserQuestion keeps its
+  // dedicated UI handling in main, while Edit/Read/Bash/etc. provide exact
+  // tool_use_id brackets so clipped TUI bodies can never become assistant
+  // streaming text after their visual root scrolls away.
+  Object.freeze({ event: 'PreToolUse', matcher: null }),
+  Object.freeze({ event: 'PostToolUse', matcher: null }),
+  Object.freeze({ event: 'PostToolUseFailure', matcher: null }),
 ]);
 
 function parseArgs(argv) {

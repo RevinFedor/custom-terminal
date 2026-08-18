@@ -36,9 +36,31 @@ test('live image audit carries the exact staged transport paths', () => {
   assert.match(staging, /\.map\(\(segment\) => segment\.text\)/);
 });
 
+test('delivery proof keeps raw provider identity while presentation uses one normalized slot', () => {
+  const audit = main.slice(
+    main.indexOf('function processCodexUserMessagePasteAudit'),
+    main.indexOf('function processCodexSourceAuditOnlyText'),
+  );
+  assert.match(audit, /preserveProviderImageMarkup: true/);
+  assert.match(audit, /const presentationText = codexUserMessageAuditText\(record\) \?\? actualText/);
+  assert.match(audit, /actualText: presentationText,[\s\S]{0,80}actualHash: presentationHash/);
+});
+
+test('durable receipt preserves staged paths for exact restart reconciliation', () => {
+  const durableStage = main.slice(
+    main.indexOf('const stagedDurableContext = agentSendReceiptStore.stageAttemptContext'),
+    main.indexOf('if (stagedDurableContext?.ok !== true)',
+      main.indexOf('const stagedDurableContext = agentSendReceiptStore.stageAttemptContext')),
+  );
+  assert.match(durableStage, /transportText: content/);
+  assert.match(durableStage, /expectedImagePaths: \(codexImagePasteSegments \|\| \[\]\)/);
+  assert.match(startup, /expectedImagePaths: provider === 'codex'/);
+  assert.match(startup, /allowUnprovenImageCarrier: context\.expectedImagePaths\.length === 0/);
+});
+
 test('restart reconciliation reads response_item text through the same audit contract', () => {
   assert.match(startup, /codexUserMessageAuditText/);
-  assert.match(startup, /const actualText = codexUserMessageAuditText\(candidate\.record\)/);
+  assert.match(startup, /const actualText = codexUserMessageAuditText\(candidate\.record, \{[\s\S]{0,100}preserveProviderImageMarkup: true/);
   assert.doesNotMatch(startup, /function codexUserMessageText\(/);
 });
 

@@ -19,9 +19,10 @@ import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { PaneMapCells, usePaneMapColumns } from './PaneMap';
-import { splitAvailability } from '../../utils/splitPanesModel.mjs';
+import { splitAvailability, paneIndexHoldingTab } from '../../utils/splitPanesModel.mjs';
+import MoveToWindowMenu from './MoveToWindowMenu';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
-import { TabProcessBar, TabStatusMarker, TabFastBadge } from './TabSignals';
+import { TabProcessBar, TabStatusMarker, TabFastBadge, TabContextUsageBadge, useTabContextUsage } from './TabSignals';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 // Removed: framer-motion import - was causing lag on project switch
@@ -98,6 +99,24 @@ const STRUCTURED_PROJECT_DROP_EVENT = 'structured-tab-project-target';
 export const TAB_CONTEXT_MENU_EVENT = 'tab-context-menu:open';
 
 /**
+ * "Rename this tab" asked for by a menu that was opened from ANOTHER surface.
+ *
+ * The menu itself is the sidebar's — one implementation, opened for a tab the
+ * pane header names (see openTabContextMenuAt). Its Rename item, however, used
+ * to start editing where the MENU lives, not where the GESTURE came from: the
+ * user right-clicked the tab in the pane header and the input appeared in the
+ * sidebar list, often scrolled out of view. Enter still committed the right
+ * name, so the rename "worked" while looking like it had happened to the wrong
+ * tab.
+ *
+ * So the request travels back: the surface that opened the menu says "I can
+ * host the input", and Rename hands editing to it instead of opening its own.
+ * The sidebar keeps its inline rename for its own right-clicks — nothing is
+ * asked, so nothing answers, and the item behaves exactly as before.
+ */
+export const TAB_RENAME_REQUEST_EVENT = 'tab-context-menu:rename';
+
+/**
  * Ask the sidebar list of `projectId` to open its context menu for `tabId`.
  *
  * Only ONE list is mounted — the sidebar's, for the project the sidebar shows —
@@ -116,9 +135,15 @@ export const TAB_CONTEXT_MENU_EVENT = 'tab-context-menu:open';
  * Deliberately NOT changing the CENTER: a right click asks about a tab, it does
  * not switch to it.
  */
-export function openTabContextMenuAt(projectId: string, tabId: string, x: number, y: number): void {
+export function openTabContextMenuAt(
+  projectId: string,
+  tabId: string,
+  x: number,
+  y: number,
+  options?: { renameHost?: string },
+): void {
   window.dispatchEvent(new CustomEvent(TAB_CONTEXT_MENU_EVENT, {
-    detail: { projectId, tabId, x, y },
+    detail: { projectId, tabId, x, y, renameHost: options?.renameHost },
   }));
 }
 
@@ -1344,7 +1369,7 @@ const TabItem = memo(({
     && (activeTaskPlanItems.length > 0 || archivedTaskPlanItems.length > 0);
   const verticalPaddingTop = showTaskMarkerLane ? Math.max(0, tabGeo.paddingY - 2) : tabGeo.paddingY;
   const verticalPaddingBottom = showTaskMarkerLane ? tabGeo.paddingY + 2 : tabGeo.paddingY;
-  const taskMarkerLaneLeft = tab.tabType === 'browser' ? tabGeo.paddingX : tabGeo.paddingLeft;
+  const taskMarkerLaneLeft = tabGeo.paddingLeft;
   const taskMarkerLaneRight = archivedTaskPlanItems.length > 0
     ? TASK_ARCHIVE_RIGHT_INSET_PX + TASK_ARCHIVE_COUNTER_SIZE_PX + TASK_MARKER_SECONDARY_GAP_PX
     : tabGeo.paddingX;
@@ -1488,11 +1513,7 @@ const TabItem = memo(({
     overflow: 'visible',
     padding: isCollapsed
       ? '0'
-        : (tab.tabType === 'browser'
-        // Browser tabs: no left gutter at all.
-        ? (isHorizontal ? '0 12px' : `${verticalPaddingTop}px ${tabGeo.paddingX}px ${verticalPaddingBottom}px`)
-        // Vertical mode: всё из стора tabGeometry (Settings → Размеры).
-        : (isVerticalMode
+        : ((isVerticalMode
           ? `${verticalPaddingTop}px ${tabGeo.paddingX}px ${verticalPaddingBottom}px ${tabGeo.paddingLeft}px`
           // SDK tabs: left gutter 32px (matches PTY claude — keeps the green dot
           // the same distance from the left edge so adjacent PTY+SDK tabs align
@@ -1665,6 +1686,9 @@ const TabItem = memo(({
   const codexLiveSettingsSessionId = useWorkspaceStore(
     (s) => s.openProjects.get(projectId)?.tabs.get(tab.id)?.codexLiveSettingsSessionId,
   );
+  // Заполнение контекста этой вкладки. Хук сам читает durable-значение и
+  // слушает все три канала обновления (Claude/Codex/SDK).
+  const tabContextPct = useTabContextUsage(tab.id);
   const codexFastActive = resolveCodexFastModeState({
     currentSessionId: codexLiveSettingsSessionId
       || codexLiveServiceTierSessionId
@@ -2038,6 +2062,13 @@ const TabItem = memo(({
                   нижней. Рисуется независимо от полоски: Fast может быть
                   доказан и когда процесс уже не идёт. */}
               <TabFastBadge active={codexFastActive} />
+              {/* Заполнение контекста — число в правом НИЖНЕМ углу, той же
+                  механикой, что молния: абсолютная позиция, часть высоты
+                  снаружи, выступ ограничен зазором. Цвет и формат наследуются
+                  из общего модуля вместе с панелью управления. Работает и для
+                  Claude, и для Codex: значение приходит по трём каналам, хук
+                  слушает все. */}
+              <TabContextUsageBadge pct={tabContextPct} />
               {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
                   rendered above). The whole-tab background pulse was removed —
                   the loader is the переливающаяся полоска у края, not a tint of
@@ -2217,8 +2248,8 @@ const TabItem = memo(({
             </>
           )}
 
-          {/* Restart zone - left part of tab (horizontal only; not for browser/SDK) */}
-          {!isVerticalMode && tab.tabType !== 'browser' && tab.tabType !== 'claude-sdk' && (
+          {/* Restart zone - left part of tab (horizontal only; not for SDK) */}
+          {!isVerticalMode && tab.tabType !== 'claude-sdk' && (
             <RestartZone
               hasProcess={hasProcess}
               hasColor={!!hasColor}
@@ -2296,7 +2327,7 @@ const TabItem = memo(({
             <input
               ref={inputRef}
               type="text"
-              className="bg-[#333] border border-accent rounded px-2 py-0.5 text-[13px] text-white outline-none"
+              className="bg-[#333] rounded text-white outline-none"
               style={{
                 // Vertical mode (TabSidebar): растягиваем input на остаток ширины, чтобы
                 // кнопка заметок справа осталась прижата к правому краю TabItem (а не
@@ -2305,6 +2336,23 @@ const TabItem = memo(({
                 width: isHorizontal ? 100 : undefined,
                 flex: isHorizontal ? 'none' : 1,
                 minWidth: 0,
+                // ПЕРЕИМЕНОВАНИЕ НЕ МЕНЯЕТ РАЗМЕР КАРТОЧКИ (2026-08-17).
+                //
+                // Поле ввода занимало БОЛЬШЕ места, чем подпись, которую оно
+                // заменяет: свой размер шрифта (13px вместо размера карточки),
+                // свои отступы сверху и снизу и рамка в потоке. Высота карточки
+                // считается по содержимому, поэтому она подпрыгивала на время
+                // переименования, а соседние карточки сдвигались.
+                //
+                // Теперь поле повторяет коробку подписи: тот же шрифт (`font`
+                // наследуется целиком, вместе с межстрочным), нулевые
+                // вертикальные отступы, а рамка нарисована тенью — тень не
+                // занимает места в раскладке. Осталось только то, что и должно
+                // меняться: фон и курсор.
+                font: 'inherit',
+                padding: '0 4px',
+                border: 'none',
+                boxShadow: 'inset 0 0 0 1px var(--color-accent)',
               }}
               value={editValue}
               onChange={(e) => onEditChange(e.target.value)}
@@ -2323,7 +2371,6 @@ const TabItem = memo(({
                 fontStyle: tab.aiClosing ? 'italic' : undefined,
               }}
             >
-              {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
               {tab.tabType === 'file' && (
                 // Red = the linked file vanished from disk (moved/renamed/
                 // deleted). The tab stays; only the icon reports the state.
@@ -3207,8 +3254,19 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         <input
           ref={inputRef}
           type="text"
-          className="bg-[#333] border border-accent rounded px-2 py-0.5 text-white outline-none"
-          style={{ flex: 1, minWidth: 0, fontSize: 'inherit' }}
+          className="bg-[#333] rounded text-white outline-none"
+          // Та же коробка, что у подписи группы: наследованный шрифт, нулевые
+          // вертикальные отступы, рамка тенью. Иначе строка группы на время
+          // переименования становится выше и толкает весь список вниз — ровно
+          // тот же эффект, что был у карточки вкладки.
+          style={{
+            flex: 1,
+            minWidth: 0,
+            font: 'inherit',
+            padding: '0 4px',
+            border: 'none',
+            boxShadow: 'inset 0 0 0 1px var(--color-accent)',
+          }}
           value={editValue}
           onChange={(e) => onEditChange(e.target.value)}
           onBlur={onEditSubmit}
@@ -3577,6 +3635,12 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const [editValue, setEditValue] = useState('');
   const [editOriginalValue, setEditOriginalValue] = useState('');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
+  // Where the OPEN menu's Rename should put its input. Null = here, in this
+  // list. A string names another surface (the pane header), which asked for the
+  // menu and can host the input on the tab the user actually right-clicked.
+  // A ref, not state: nothing re-renders because of it — it is read once, at
+  // the moment Rename is clicked.
+  const renameHostRef = useRef<string | null>(null);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [groupEditValue, setGroupEditValue] = useState('');
   const [groupContextMenu, setGroupContextMenu] = useState<{ x: number; y: number; groupId: string } | null>(null);
@@ -6911,7 +6975,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     const suffix = fromLatestCompact ? '_compact' : '_fork';
     const forkName = tab.name ? `${tab.name}${suffix}` : undefined;
     try {
-      await useWorkspaceStore.getState().createTabAfterCurrent(projectId, forkName, cwd, {
+      const newTabId = await useWorkspaceStore.getState().createTabAfterCurrent(projectId, forkName, cwd, {
         pendingAction: fromLatestCompact
           ? {
             type: provider === 'claude' ? 'claude-compact-fork' : 'codex-compact-fork',
@@ -6931,7 +6995,19 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
         nameSetManually: false,
         afterTabId: tab.id,
         visualParentTabId: tab.id,
+        // Creation only inserts the tab. Visibility/focus must go through the
+        // same activation choke point as an ordinary click; otherwise a split
+        // keeps showing the old slot even though workspace.activeTabId already
+        // points at the fork.
+        background: true,
       });
+      if (!newTabId) throw new Error('fork tab was not created');
+      const state = useWorkspaceStore.getState();
+      const sourcePaneIndex = paneIndexHoldingTab(state.splitPanes, tab.id);
+      if (sourcePaneIndex >= 0 && sourcePaneIndex !== state.splitFocusedIndex) {
+        state.focusSplitPane(sourcePaneIndex);
+      }
+      state.activateCenterTab(projectId, newTabId);
       showToast(
         fromLatestCompact
           ? `Fork ${provider === 'claude' ? 'Claude' : 'Codex'} от последнего compact создан`
@@ -7039,6 +7115,10 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const handleContextMenu = (e: React.MouseEvent, tabId: string) => {
     e.preventDefault();
     e.stopPropagation();
+    // A real right click in THIS list: the list hosts its own rename input.
+    // (The external opener sets this again right after calling us — see the
+    // TAB_CONTEXT_MENU_EVENT listener.)
+    renameHostRef.current = null;
     setGroupContextMenu(null);
     setEmptyContextMenu(null);
     setCommandHistoryPopover(null);
@@ -7143,7 +7223,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   useEffect(() => {
     const onOpenRequest = (event: Event) => {
       const detail = (event as CustomEvent).detail as
-        { projectId?: string; tabId?: string; x?: number; y?: number } | undefined;
+        { projectId?: string; tabId?: string; x?: number; y?: number; renameHost?: string } | undefined;
       if (!detail?.tabId || detail.projectId !== projectId) return;
       if (!workspace.tabs.has(detail.tabId)) return;
       handleContextMenu(
@@ -7155,6 +7235,10 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
         } as unknown as React.MouseEvent,
         detail.tabId,
       );
+      // AFTER the handler, which clears this for its own right clicks: who
+      // opened the menu, and can they host the rename input themselves.
+      // Remembered for exactly as long as the menu lives.
+      renameHostRef.current = detail.renameHost || null;
     };
     window.addEventListener(TAB_CONTEXT_MENU_EVENT, onOpenRequest);
     return () => window.removeEventListener(TAB_CONTEXT_MENU_EVENT, onOpenRequest);
@@ -7595,9 +7679,21 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
 
   const handleContextRename = () => {
     if (contextMenu) {
+      const host = renameHostRef.current;
       const tab = workspace.tabs.get(contextMenu.tabId);
-      if (tab) startTabRename(tab);
+      if (host) {
+        // The menu was opened from another surface — rename THERE, where the
+        // user's cursor and attention already are. This list must not open its
+        // own input: two inputs for one tab, and the visible one would be the
+        // wrong one (that was the bug).
+        window.dispatchEvent(new CustomEvent(TAB_RENAME_REQUEST_EVENT, {
+          detail: { host, projectId, tabId: contextMenu.tabId },
+        }));
+      } else if (tab) {
+        startTabRename(tab);
+      }
     }
+    renameHostRef.current = null;
     setContextMenu(null);
   };
 
@@ -9931,6 +10027,34 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
             </div>
           )}
 
+          {/* «Move to window» — перенос вкладки в другое окно рабочей области.
+              Не перетаскиванием: это был бы третий drag в приложении, через всю
+              область, мимо чужих окон, с промахами. Юзер: *«перетаскивание пока
+              слишком сложно»*. Вместо жеста — названная цель, нарисованная как
+              текущая раскладка. Подменю по наведению, как у Info выше. */}
+          {!isMultiSelect && contextMenu && (
+            <div className="relative group/move-window">
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+              >
+                <span className="flex items-center gap-2 min-w-0">
+                  <Columns2 size={12} className="text-[#888] flex-shrink-0" />
+                  <span className="truncate">Move to window</span>
+                </span>
+                <span className="text-[#666]">{'\u203A'}</span>
+              </button>
+              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/move-window:block">
+                <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl w-[260px]">
+                  <MoveToWindowMenu
+                    projectId={projectId}
+                    tabId={contextMenu.tabId}
+                    onDone={() => setContextMenu(null)}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Separator */}
           <div className="my-1 border-t border-[#444]" />
 
@@ -10211,7 +10335,10 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
               «Добавить в рабочую область (N)» and «Убрать из рабочей области». */}
           {!isMultiSelect && contextMenu && (() => {
             const splitPanes = useWorkspaceStore.getState().splitPanes;
-            const inSplit = splitPanes.some((p) => p.tabId === contextMenu.tabId);
+            // Held ANYWHERE — a parked chip is in the workspace just as much as
+            // a shown one, and offering "add" for a tab that already has a chip
+            // would promise a second copy of a single live terminal.
+            const inSplit = paneIndexHoldingTab(splitPanes, contextMenu.tabId) >= 0;
             // In single mode the pair is (active tab, clicked tab) — clicking
             // the active tab itself would pair it with itself: no-op.
             const centerWorkspace = useWorkspaceStore.getState().openProjects.get(activeProjectId || '');
@@ -10231,10 +10358,10 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                   disabled ? 'text-[#555] cursor-not-allowed' : 'text-[#ccc] hover:bg-white/10 cursor-pointer'
                 }`}
                 title={inSplit
-                  ? 'Убрать эту панель из рабочей области'
+                  ? 'Убрать это окно из рабочей области'
                   : splitFull
-                    ? 'Максимум 3 колонки. Разделить колонку по горизонтали можно из шапки панели'
-                    : 'Показать вкладку второй панелью рядом с текущей'}
+                    ? 'Сначала выберите вкладку для пустого окна'
+                    : 'Показать вкладку вторым окном рядом с текущим'}
                 onClick={(e) => {
                   e.stopPropagation();
                   if (disabled) return;
@@ -10250,6 +10377,48 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                 {inSplit
                   ? 'Убрать из области'
                   : `Добавить в область${splitPanes.length > 0 ? ` (${splitPanes.length})` : ''}`}
+              </button>
+            );
+          })()}
+
+          {/* «Открыть в этом окне» — второй чип в полосе окна, где человек уже
+              стоит. Обычный клик по вкладке ЗАМЕНЯЕТ показанный чип (иначе полоса
+              росла бы от любой навигации), а добавляет только осознанный жест: в
+              шапке это двойной клик по пустому месту, здесь — этот пункт.
+              Перетащить вкладку из бокового списка в шапку нельзя: список
+              использует свою систему перетаскивания, не браузерную. */}
+          {!isMultiSelect && contextMenu && (() => {
+            const st = useWorkspaceStore.getState();
+            const heldAt = paneIndexHoldingTab(st.splitPanes, contextMenu.tabId);
+            if (heldAt >= 0) return null; // уже лежит в каком-то окне
+            const target = st.splitPanes.length > 0
+              ? st.splitPanes[st.splitFocusedIndex]
+              : null;
+            // В сплите цель — окно в фокусе; без сплита — сам центр. Пустое окно
+            // не годится: там нечему становиться соседом, туда вкладка просто
+            // кладётся обычной активацией.
+            if (st.splitPanes.length > 0 && (!target || !target.tabId)) return null;
+            const centerTabId = st.activeProjectId
+              ? st.openProjects.get(st.activeProjectId)?.activeTabId
+              : null;
+            if (st.splitPanes.length === 0 && (!centerTabId || centerTabId === contextMenu.tabId)) return null;
+            return (
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] flex items-center gap-2 text-[#ccc] hover:bg-white/10 cursor-pointer"
+                title="Добавить вкладку в полосу окна, в котором вы сейчас"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const store = useWorkspaceStore.getState();
+                  if (store.splitPanes.length > 0) {
+                    store.addTabToSplitPaneStrip(store.splitFocusedIndex, projectId, contextMenu.tabId);
+                  } else {
+                    store.addTabToCenterStrip(projectId, contextMenu.tabId);
+                  }
+                  setContextMenu(null);
+                }}
+              >
+                <Columns2 size={12} className="text-[#888] flex-shrink-0" />
+                Открыть в этом окне
               </button>
             );
           })()}

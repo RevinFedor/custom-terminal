@@ -5,6 +5,8 @@ import {
   resolveTabCardTextColor,
   resolveTabCardMetrics,
   resolveSplitAttachRowHeight,
+  resolveTabCardBottomOverhang,
+  SPLIT_ATTACH_PATH_LINE_H,
   TAB_CARD_LINE_HEIGHT,
 } from './tabCardVisual.mjs';
 
@@ -128,4 +130,51 @@ test('a chip made smaller than the classic row does not shrink the row', () => {
 
 test('broken settings degrade to the default 26, never NaN', () => {
   assert.equal(resolveSplitAttachRowHeight({ paddingY: 'x' }, { fontSize: 'y' }), 26);
+  assert.equal(
+    resolveSplitAttachRowHeight({ paddingY: 'x' }, { fontSize: 'y', withPath: true }),
+    26 + resolveTabCardBottomOverhang({ gap: 'x' }) + SPLIT_ATTACH_PATH_LINE_H,
+  );
+});
+
+// Живой баг (2026-08-18): зелёное число заполнения контекста легло НА строку
+// пути — на скриншоте оно сидело поперёк хвоста «…/custom-terminal».
+//
+// Метки карточки свисают ниже её коробки НАМЕРЕННО: полоска квадратов, которая
+// заканчивается внутри карточки, ничего не говорит о границе. В боковом списке
+// они свисают в зазор перед следующей карточкой, и зазор их же и ограничивает.
+// Под чипом в шапке следующей карточки нет — там строка пути, и место под
+// свес надо зарезервировать.
+test('шапка резервирует место под свес меток чипа', () => {
+  const overhang = resolveTabCardBottomOverhang(geo);
+  assert.ok(overhang > 0, 'при обычном зазоре метки свисают');
+  const chipOnly = resolveSplitAttachRowHeight(geo, { fontSize: 14 });
+  const withPath = resolveSplitAttachRowHeight(geo, { fontSize: 14, withPath: true });
+  assert.equal(withPath, chipOnly + overhang + SPLIT_ATTACH_PATH_LINE_H);
+});
+
+test('свес ограничен зазором между карточками — тем же, что и в списке', () => {
+  // Ноль зазора — метки не выходят наружу, и резервировать нечего.
+  assert.equal(resolveTabCardBottomOverhang({ gap: 0 }), 0);
+  // Меньше свеса — свес обрезается зазором, а не наоборот.
+  assert.equal(resolveTabCardBottomOverhang({ gap: 2 }), 2);
+  // Больше — упирается в долю самой метки (полоска задач: зазор минус 1px,
+  // который она оставляет соседней карточке).
+  assert.equal(resolveTabCardBottomOverhang({ gap: 10 }), 9);
+  assert.equal(resolveTabCardBottomOverhang(undefined), 3);
+});
+
+// The path line moved INTO the header (2026-08-17, from a full-width row of its
+// own). Whoever positions content below the header must get the whole height
+// from this one resolver — a second line the callers do not know about is the
+// same bug as the old hard-coded 26, one line lower.
+test('the path line is part of the header height, on top of the chip row', () => {
+  const seam = resolveTabCardBottomOverhang(geo) + SPLIT_ATTACH_PATH_LINE_H;
+  const withoutPath = resolveSplitAttachRowHeight(geo, { fontSize: 14 });
+  const withPath = resolveSplitAttachRowHeight(geo, { fontSize: 14, withPath: true });
+  assert.equal(withPath, withoutPath + seam);
+  // …and it rides on the SETTINGS-derived row, not on the 26 floor: a taller
+  // chip must still fit above the path.
+  const bigWithPath = resolveSplitAttachRowHeight(geo, { fontSize: 18, withPath: true });
+  assert.equal(bigWithPath, resolveSplitAttachRowHeight(geo, { fontSize: 18 }) + seam);
+  assert.ok(bigWithPath > withPath);
 });

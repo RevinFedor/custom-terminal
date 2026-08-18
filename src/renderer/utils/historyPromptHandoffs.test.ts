@@ -4,6 +4,8 @@ import test from 'node:test';
 import {
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   HistoryPromptHandoffStore,
+  beginHistoryPromptHandoff,
+  bindHistoryPromptHandoffSendIdentity,
   consumeHistoryPromptHandoff,
   durableHistorySendReceiptMatchesCanonicalEntry,
   getHistoryPromptHandoffsSnapshot,
@@ -18,6 +20,7 @@ import {
   runHistoryPromptHandoff,
   selectLatestHistoryPromptInputStatus,
   subscribeHistoryPromptHandoffs,
+  waitForHistoryPromptHandoffSendIdentity,
   type HistoryPromptHandoff,
   type HistoryPromptHandoffChange,
   type HistoryPromptHandoffProjectionRow,
@@ -717,6 +720,27 @@ test('send identity binds monotonically onto an existing exact receipt', () => {
   assert.deepEqual(bound.ok && bound.handoff.auditProof, exact?.auditProof);
 });
 
+test('a PREPARING dismiss waits for the exact durable send identity event', async () => {
+  const tabId = 'tab-dismiss-before-reserve';
+  const handoffId = 'handoff-dismiss-before-reserve';
+  beginHistoryPromptHandoff({
+    tabId,
+    handoffId,
+    toolType: 'codex',
+    text: 'hide this presentation',
+    submittedAt: Date.now(),
+    initialStatus: 'preparing',
+  });
+  const waiting = waitForHistoryPromptHandoffSendIdentity(tabId, handoffId, 100);
+  bindHistoryPromptHandoffSendIdentity(tabId, handoffId, {
+    sendOperationKey: 'history:tab-dismiss-before-reserve:handoff-dismiss-before-reserve',
+    sendAttemptId: 'attempt-dismiss-before-reserve',
+  });
+  const resolved = await waiting;
+  assert.equal(resolved?.sendAttemptId, 'attempt-dismiss-before-reserve');
+  consumeHistoryPromptHandoff(tabId, handoffId);
+});
+
 test('replaying the same send identity is idempotent', () => {
   const store = new HistoryPromptHandoffStore(limits());
   begin(store, 'tab-a', 'handoff-a');
@@ -1301,7 +1325,7 @@ test('durable confirmation hydrates as one final SENT snapshot without transient
   consumeHistoryPromptHandoff(tabId, handoffId);
 });
 
-test('durable presentation matching uses exact Claude UUID or Codex source identity only', () => {
+test('durable presentation matching uses exact Claude UUID or Codex source identity aliases only', () => {
   const claudeReceipt = {
     operationKey: 'history:tab-a:claude-a',
     surface: 'desktop-history',
@@ -1340,6 +1364,12 @@ test('durable presentation matching uses exact Claude UUID or Codex source ident
     sessionId: 'session-a',
     sourceIdentity: 'codex-user-source-session-a-4096',
   }), true);
+  assert.equal(durableHistorySendReceiptMatchesCanonicalEntry(codexReceipt, {
+    uuid: 'canonical-event-row',
+    sessionId: 'session-a',
+    sourceIdentity: 'codex-user-source-session-a-8192',
+    sourceIdentityAliases: ['codex-user-source-session-a-4096'],
+  }), true, 'a promoted event carrier must retain the exact audited response carrier');
   assert.equal(durableHistorySendReceiptMatchesCanonicalEntry(codexReceipt, {
     uuid: 'same-text-is-not-proof',
     sessionId: 'session-a',

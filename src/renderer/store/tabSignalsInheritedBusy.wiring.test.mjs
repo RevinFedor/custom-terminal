@@ -22,7 +22,7 @@ const workspaceDir = path.join(here, '..', 'components', 'Workspace');
 const read = (name) => fs.readFileSync(path.join(workspaceDir, name), 'utf8');
 
 const signals = read('TabSignals.tsx');
-const chrome = read('SplitPaneChrome.tsx');
+const chrome = read('PaneTabChip.tsx');
 const rows = read('TabListRows.tsx');
 const switcher = read('TabSwitcherOverlay.tsx');
 

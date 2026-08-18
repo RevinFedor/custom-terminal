@@ -1,10 +1,16 @@
 import React, { useCallback } from 'react';
 import TabBar from './TabBar';
+import SidebarToolsRow from './SidebarToolsRow';
 import { useUIStore } from '../../store/useUIStore';
 
 // Permanent left column rendering tabs vertically. Hosts <TabBar layout="vertical" />
 // and exposes a 6px drag handle on its right edge for width resize. State lives in
 // useUIStore.tabSidebarWidth (persisted via the store's localStorage hydration).
+//
+// Первой строкой здесь стоят инструменты проекта (SidebarToolsRow) — они
+// переехали из полосы во всю ширину окна, которая жила под шапкой. Всё, что там
+// было, относится к тому же проекту, чей список вкладок идёт ниже, поэтому
+// кнопки стоят над своим списком, а не тянутся через весь экран.
 const MIN_W = 140;
 const MAX_W = 400;
 
@@ -38,10 +44,17 @@ export default function TabSidebar({ projectId }: TabSidebarProps) {
 
   return (
     <div
-      className="relative shrink-0 h-full"
-      style={{ width, borderTop: '1px solid #5a5a60' }}
+      className="relative shrink-0 h-full flex flex-col min-h-0"
+      // Своей верхней линии у панели больше нет. Она рисовала границу под
+      // удалённой полосой кнопок — короткую, обрывавшуюся на краю сайдбара.
+      // Теперь сверху шапка со своей линией во всю ширину, и вторая давала бы
+      // двойную черту шириной ровно с эту панель.
+      style={{ width }}
     >
-      <TabBar projectId={projectId} layout="vertical" />
+      <SidebarToolsRow projectId={projectId} />
+      <div className="flex-1 min-h-0">
+        <TabBar projectId={projectId} layout="vertical" />
+      </div>
       <div
         onMouseDown={handleResizeMouseDown}
         style={{

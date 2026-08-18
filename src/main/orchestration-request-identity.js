@@ -35,6 +35,12 @@ function normalizeOrchestrationRequestIdentity(input = {}) {
         placement: cleanString(input.placement) || 'child',
         visualParentTabId: cleanString(input.visualParentTabId),
         afterTabId: cleanString(input.afterTabId),
+        ...(cleanString(input.forkFromTabId) ? {
+          fork: {
+            sourceTabId: cleanString(input.forkFromTabId),
+            mode: input.fullHistoryFork === true ? 'full' : 'latest-compact',
+          },
+        } : {}),
       },
     prompt: {
       hash: promptHash(prompt),
@@ -57,6 +63,7 @@ function normalizeOrchestrationRequestIdentity(input = {}) {
     autoStopCreatedTargets: typeof input.autoStopCreatedTargets === 'boolean'
       ? input.autoStopCreatedTargets
       : null,
+    ...(input.compactBeforeTask === true ? { compactBeforeTask: true } : {}),
   };
 }
 

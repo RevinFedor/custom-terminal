@@ -443,11 +443,17 @@ test('pre-Enter context binds the exact writer session and rejects a contradicto
   const staged = store.stageAttemptContext(begun.record.operationKey, begun.attemptId, {
     sessionId: 'writer-session',
     promptText: 'exact writer prompt',
+    expectedImagePaths: [
+      '/tmp/noted-terminal-codex-image-input/content-hash.png',
+    ],
     transcriptBoundary: boundary,
   });
   assert.equal(staged.ok, true);
   assert.equal(staged.record.sessionId, 'writer-session');
   assert.equal(staged.record.receipt.sessionId, 'writer-session');
+  assert.deepEqual(staged.record.receipt.expectedImagePaths, [
+    '/tmp/noted-terminal-codex-image-input/content-hash.png',
+  ]);
   assert.deepEqual(staged.record.transcriptBoundary, boundary);
 
   const contradictory = store.stageAttemptContext(
@@ -859,6 +865,61 @@ test('History dismissal is durable without changing delivery truth or external s
   assert.equal(retry.action, 'replay');
   assert.equal(retry.retryable, false, 'hiding a warning must not authorize a blind resend');
   assert.equal(getUuidCount(), 1);
+});
+
+test('a confirmed send can hide only its stale local History presentation', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const attempt = store.beginAttempt(identity({ provider: 'codex' }));
+  const promoted = store.promoteFromAudit(exactAudit(attempt.attemptId, {
+    provider: 'codex',
+    sourceIdentity: 'codex-user-source-session-a-response',
+  }));
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
+
+  const dismissed = store.dismissPresentation({
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+  });
+  assert.equal(dismissed.ok, true);
+  assert.equal(dismissed.record.state, STORE_STATES.CONFIRMED);
+  assert.ok(dismissed.record.receipt.presentationDismissedAt);
+});
+
+test('hiding CONFIRMING survives a later exact confirmation without changing delivery', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const attempt = store.beginAttempt(identity({ provider: 'codex' }));
+  const pending = store.settleAttempt(attempt.record.operationKey, attempt.attemptId, {
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+  assert.equal(pending.record.state, STORE_STATES.AUDIT_PENDING);
+  const dismissed = store.dismissPresentation({
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+  });
+  assert.equal(dismissed.ok, true);
+  const dismissedAt = dismissed.record.receipt.presentationDismissedAt;
+
+  const promoted = store.promoteFromAudit(exactAudit(attempt.attemptId, {
+    provider: 'codex',
+    sourceIdentity: 'codex-user-source-session-a-response',
+  }));
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
+  assert.equal(promoted.record.receipt.presentationDismissedAt, dismissedAt);
 });
 
 test('canonical desktop History can acknowledge an exact Project API delivery', (t) => {

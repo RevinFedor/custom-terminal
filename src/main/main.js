@@ -93,6 +93,25 @@ if (process.env.NOTED_E2E_TEST === 'true') {
   });
 }
 
+// Потолок памяти главного процесса. По умолчанию движок обрывает процесс
+// примерно на 4 ГБ — и это не «утечка кончилась», а жёсткий предел: при его
+// достижении вызывается abort(), приложение просто исчезает с системным
+// сообщением о сбое (прод 17.08 19:10, 20:41, 20:47 и 18.08 03:04 — во всех
+// четырёх отчётах одна и та же вершина стека: FatalProcessOutOfMemory).
+//
+// Рабочий объём здесь законно большой: живой транскрипт сессии на 111 МБ — это
+// ~15 тысяч разобранных записей, которые обязаны лежать в памяти целиком, иначе
+// каждый запрос истории перечитывал бы файл заново. Замерено в проде: ровный
+// фон 1.6 ГБ, а любой обычный всплеск (разбор второго транскрипта, сборка
+// таймлайна) добавляет к нему ещё 1.5–2 ГБ — и упирается в предел. В машине
+// 32 ГБ, так что предел здесь искусственный.
+//
+// 8 ГБ — это НЕ разрешение течь: фон и всплески измерены и укладываются вдвое,
+// запас нужен ровно на то, чтобы одновременный всплеск не убивал процесс.
+// Если фон когда-нибудь подберётся к 8 ГБ — это уже настоящая утечка, и её
+// надо искать, а не поднимать число дальше.
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=8192');
+
 // Disable HTTP cache to ensure fresh code after updates
 app.commandLine.appendSwitch('disable-http-cache');
 
@@ -136,6 +155,11 @@ const {
 const {
   resolveAiToolOwner,
 } = require(path.join(srcMainDir, 'ai-tool-owner'));
+const {
+  SHUTDOWN_INTERRUPTED_SESSIONS_KEY,
+  createShutdownInterruptedSnapshot,
+  resolveStartupInterruptedSnapshot,
+} = require(path.join(srcMainDir, 'build-install-continue'));
 const taskCompletionIntents = new TaskCompletionIntentRegistry();
 const { createXtermWritePump } = require(path.join(srcSharedDir, 'xterm-write-pump.cjs'));
 const {
@@ -178,6 +202,24 @@ const {
 } = require(path.join(srcMainDir, 'claude-hook-routing'));
 const { buildSessionProgress } = require(path.join(srcMainDir, 'session-progress'));
 const {
+  resolveSearchDateWindow,
+  scoreSessionTurnMatch,
+  sessionMatchesDate,
+} = require(path.join(srcMainDir, 'session-catalog-search'));
+const {
+  decorateTurnsWithIterationCoordinates,
+  deriveClaudeForkSnapshot,
+  deriveCodexForkSnapshot,
+  deriveCompactEvents,
+  mapTimelineEntryUuidsAcrossFork,
+} = require(path.join(srcMainDir, 'session-history-events'));
+const {
+  buildSnippet,
+  countLines,
+  findQueryOffsets,
+  queryWords,
+} = require(path.join(srcMainDir, 'iteration-search-match'));
+const {
   findClaudeAgentFile,
   findCodexAgentFile,
   readAgentSteps,
@@ -193,6 +235,9 @@ const {
   validateClaudeComposerSubmitGeneration,
   validateClaudeComposerWriteBoundary,
 } = require(path.join(srcMainDir, 'claude-composer-proof'));
+const {
+  projectClaudePtyPresence,
+} = require(path.join(srcMainDir, 'claude-pty-presence'));
 const {
   inspectClaudeProviderFatalFrame,
 } = require(path.join(srcMainDir, 'claude-provider-fatal-state'));
@@ -311,12 +356,20 @@ const {
   buildChildProcessEnv,
   isolateMainProcessEnv,
 } = require(path.join(srcMainDir, 'child-process-env'));
+const {
+  createCodexSemanticChannelServer,
+  decideCodexBinaryOverride,
+} = require(path.join(srcMainDir, 'codex-semantic-channel'));
+const {
+  createClaudeToolScreenHoldTracker,
+} = require(path.join(srcMainDir, 'claude-tool-screen-hold'));
 isolateMainProcessEnv();
 const {
   codexUserMessageAuditText,
   codexPromptHasImageMarker,
   collectCodexPayloadImagePaths,
   consumeCodexUserMessageAuditChunk,
+  isCodexEnvironmentContextUserText,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
   selectCodexPreferredUserMessageAuditRecords,
@@ -1829,6 +1882,7 @@ function clearClaudeBackgroundActivityObserver(tabId, reason = 'process-ended') 
 const transcriptService = createSessionTranscriptService({
   getMainWindow: () => mainWindow,
   webBroadcast: (tabId, payload) => _webBroadcast(tabId, payload),
+  sessionHistoryStore: projectManager.db,
   resolveClaudePromptOwner: ({
     tabId,
     sessionId,
@@ -2131,6 +2185,40 @@ const processTreeSnapshotSingleFlight = createProcessTreeSnapshotSingleFlight({
 });
 const AI_PROCESS_LOOKUP_CACHE_MS = 2000;
 const aiProcessLookupCache = new Map(); // `${tabId}:${expectedName}` -> { at, matches }
+// Descriptor probes (lsof, one child process each) are per-TAB by nature, so
+// the per-tab coalescing above cannot bound them: with 13 agent tabs alive,
+// thirteen independent probes hit the OS in the same frame and the main
+// process stalled for seconds (prod 17.08 20:56 — nine status requests
+// completed in the SAME millisecond after each had waited ~4s in that queue).
+// This gate keeps a small number in flight and lets the rest wait for a slot
+// instead of piling onto the OS at once. Two at a time keeps a single tab's
+// own retry responsive while removing the stampede.
+const CODEX_DESCRIPTOR_PROBE_MAX_CONCURRENT = 2;
+const codexDescriptorProbeGate = createConcurrencyGate(CODEX_DESCRIPTOR_PROBE_MAX_CONCURRENT);
+
+function createConcurrencyGate(limit) {
+  let active = 0;
+  const waiting = [];
+  const release = () => {
+    active -= 1;
+    const next = waiting.shift();
+    if (next) next();
+  };
+  return {
+    stats: () => ({ active, waiting: waiting.length }),
+    async run(task) {
+      if (active >= limit) {
+        await new Promise((resolve) => waiting.push(resolve));
+      }
+      active += 1;
+      try {
+        return await task();
+      } finally {
+        release();
+      }
+    },
+  };
+}
 const terminalProjectIds = new Map(); // tabId -> projectId (authoritative parent project for MCP routing)
 
 function getDockBaseIconCandidates() {
@@ -2339,7 +2427,23 @@ function terminalHistoryStructuredProofTexts(message, kind) {
     }
     if (result.length >= 64) break;
   }
+  if (kind === 'tool-result') {
+    // Claude Edit stores the exact structured patch beside message.content,
+    // not inside the visible tool_result string.
+    collectTerminalHistoryStructuredProofStrings(message?.toolUseResult, result);
+    collectTerminalHistoryStructuredProofStrings(message?.message?.toolUseResult, result);
+  }
   return result.slice(0, 64);
+}
+
+function terminalHistoryToolResultIds(message) {
+  const content = message?.message?.content;
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((block) => block?.type === 'tool_result')
+    .map((block) => block.tool_use_id || block.toolUseId || null)
+    .filter(Boolean)
+    .map(String);
 }
 
 function observeTerminalHistoryCanonicalLiveMessage(detail) {
@@ -2356,6 +2460,16 @@ function observeTerminalHistoryCanonicalLiveMessage(detail) {
   };
   const kind = terminalHistoryStructuredBoundaryKind(message);
   const structuredTexts = terminalHistoryStructuredProofTexts(message, kind);
+  if (provider === 'claude' && kind === 'tool-result') {
+    const toolUseIds = terminalHistoryToolResultIds(message);
+    const released = toolUseIds.length > 0
+      ? claudeToolScreenHolds.release({ tabId: detail.tabId, toolUseIds })
+      : claudeToolScreenHolds.releaseCompleted(detail.tabId);
+    console.log('[ClaudeToolScreenHold] JSONL_RELEASE tab=' + String(detail.tabId).slice(-12)
+      + ' ids=' + (toolUseIds.join(',') || '-')
+      + ' released=' + released
+      + ' remaining=' + claudeToolScreenHolds.snapshot(detail.tabId).length);
+  }
   const text = terminalHistoryAssistantText(message);
   if (text) {
     const canonicalObserved = terminalHistoryPreviewController.observeCanonical({
@@ -2416,6 +2530,9 @@ function findTerminalHistoryPreviewComposerRow(snapshot, provider) {
 }
 
 function readTerminalHistoryPreviewFrame({ state, snapshot }) {
+  if (state?.provider === 'claude' && claudeToolScreenHolds.isHeld(state.tabId)) {
+    return { status: 'unknown', reason: 'claude-hook-tool-screen-owned' };
+  }
   const viewportY = Number(snapshot?.viewportY);
   const lines = Array.isArray(snapshot?.lines) ? snapshot.lines : [];
   const preViewportLines = Array.isArray(snapshot?.preViewportLines)
@@ -2561,6 +2678,85 @@ const terminalHistoryPreviewController = createTerminalHistoryPreviewController(
   log: console,
   isEnabled: () => terminalHistoryStreamingEnabled,
 });
+const claudeToolScreenHolds = createClaudeToolScreenHoldTracker();
+
+const codexSemanticChannels = new Map();
+const notedCodexBinPath = path.join(os.homedir(), '.noted-terminal', 'bin', 'codex');
+
+function handleCodexSemanticChannelEvent(detail) {
+  const tabId = detail?.tabId;
+  const instanceId = detail?.instanceId;
+  const event = detail?.event;
+  if (!tabId || !instanceId || !event?.type) return false;
+  if (event.type === 'hello') {
+    const activated = terminalHistoryPreviewController.activateSemanticSource({
+      tabId,
+      instanceId,
+      processId: detail.pid,
+    });
+    console.log('[CodexSemanticChannel] HELLO tab=' + String(tabId).slice(-12)
+      + ' instance=' + String(instanceId).slice(-18)
+      + ' pid=' + (detail.pid ?? '-')
+      + ' activated=' + activated);
+    return activated;
+  }
+  if (event.type === 'disconnect') {
+    return terminalHistoryPreviewController.disconnectSemanticSource({
+      tabId,
+      instanceId,
+      reason: 'socket-disconnect',
+    });
+  }
+  const observed = terminalHistoryPreviewController.observeSemanticEvent({
+    tabId,
+    instanceId,
+    gap: detail.gap === true,
+    event,
+  });
+  if (detail.gap === true) {
+    console.warn('[CodexSemanticChannel] GAP tab=' + String(tabId).slice(-12)
+      + ' instance=' + String(instanceId).slice(-18)
+      + ' seq=' + (detail.seq ?? '-')
+      + ' event=' + event.type);
+  }
+  return observed;
+}
+
+async function closeCodexSemanticChannel(tabId, reason) {
+  const channel = codexSemanticChannels.get(tabId);
+  if (!channel) {
+    terminalHistoryPreviewController.clearSemanticSource(tabId, reason);
+    return false;
+  }
+  codexSemanticChannels.delete(tabId);
+  terminalHistoryPreviewController.clearSemanticSource(tabId, reason);
+  try {
+    await channel.close(reason);
+  } catch (error) {
+    console.warn('[CodexSemanticChannel] close failed tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason + ' error=' + (error?.message || String(error)));
+  }
+  return true;
+}
+
+async function prepareCodexSemanticChannel(tabId) {
+  await closeCodexSemanticChannel(tabId, 'terminal-generation-changed');
+  try {
+    const channel = await createCodexSemanticChannelServer({
+      tabId,
+      onEvent: handleCodexSemanticChannelEvent,
+      log: console,
+    });
+    codexSemanticChannels.set(tabId, channel);
+    console.log('[CodexSemanticChannel] LISTEN tab=' + String(tabId).slice(-12)
+      + ' socket=' + JSON.stringify(channel.socketPath));
+    return channel;
+  } catch (error) {
+    console.warn('[CodexSemanticChannel] unavailable tab=' + String(tabId).slice(-12)
+      + ' error=' + (error?.message || String(error)));
+    return null;
+  }
+}
 
 ipcMain.handle('agent-transcript:set-terminal-preview-enabled', (_event, payload = {}) => {
   const enabled = payload?.enabled !== false;
@@ -2641,6 +2837,9 @@ function normalizeTerminalHistoryPreviewDiagnosticPreview(value) {
     writeSeq: terminalHistoryPreviewDiagnosticNumber(value.writeSeq),
     previewSeq: terminalHistoryPreviewDiagnosticNumber(value.previewSeq),
     phase: value.phase === 'streaming' || value.phase === 'settled' ? value.phase : null,
+    sourceMode: value.sourceMode === 'semantic' || value.sourceMode === 'semantic-pending'
+      ? value.sourceMode
+      : 'screen',
     textHash: typeof value.textHash === 'string' ? value.textHash : null,
     startedAt: terminalHistoryPreviewDiagnosticNumber(value.startedAt),
     updatedAt: terminalHistoryPreviewDiagnosticNumber(value.updatedAt),
@@ -5510,6 +5709,108 @@ async function requestTerminalClaudeDraftState(webContents, tabId, reason, timeo
       : (parsedProof?.proofReason === 'active-prompt-not-found'
         ? { exactCaptureBlockedReason: missingPromptAdmission.reason }
         : {})),
+  };
+}
+
+function claudeDraftProofIsSettled(result) {
+  return (result?.proofOutcome === 'found' && result?.hasDraft === true)
+    || (result?.proofOutcome === 'absent' && result?.hasDraft === false);
+}
+
+async function waitForTerminalClaudeDraftState(
+  webContents,
+  tabId,
+  reason,
+  timeoutMs = 700,
+  {
+    waitOnUnknownOnly = false,
+    waitTimeoutMs = 15000,
+  } = {},
+) {
+  const firstMirror = getHeadlessTerminalMirror(tabId);
+  let observedWriteSeq = Number(firstMirror?.writeSeq || 0);
+  let result = await requestTerminalClaudeDraftState(
+    webContents,
+    tabId,
+    reason,
+    timeoutMs,
+  );
+  if (waitOnUnknownOnly !== true || claudeDraftProofIsSettled(result)) {
+    return { ...result, timedOut: false, checks: 1 };
+  }
+
+  const deadline = Date.now() + Math.max(100, Number(waitTimeoutMs) || 15000);
+  let checks = 1;
+  console.log('[ClaudeDraftProofWait] start tab=' + String(tabId).slice(-12)
+    + ' generation=' + String(firstMirror?.generation || '-').slice(0, 8)
+    + ' reason=' + reason
+    + ' initial=' + (result?.proofOutcome || 'unknown')
+    + ':' + (result?.proofReason || result?.error || '-'));
+  while (Date.now() < deadline) {
+    const mirror = getHeadlessTerminalMirror(tabId);
+    if (!mirror || mirror !== firstMirror || mirror.disposed === true || mirror.failed === true) {
+      return {
+        ...result,
+        timedOut: false,
+        checks,
+        proofOutcome: 'unknown',
+        hasDraft: null,
+        proofReason: !mirror || mirror !== firstMirror
+          ? 'headless-mirror-generation-changed'
+          : 'headless-mirror-failed',
+      };
+    }
+    const resultWriteSeq = Number(result?.mirrorWriteSeq);
+    if (Number.isFinite(resultWriteSeq)) {
+      observedWriteSeq = Math.max(observedWriteSeq, resultWriteSeq);
+    }
+    if (Number(mirror.writeSeq || 0) <= observedWriteSeq) {
+      const edge = await waitForHeadlessSynchronizedOutputClose(
+        tabId,
+        mirror,
+        Math.max(50, deadline - Date.now()),
+        { afterWriteSeq: observedWriteSeq },
+      );
+      if (edge?.ready !== true) {
+        console.warn('[ClaudeDraftProofWait] finish tab=' + String(tabId).slice(-12)
+          + ' reason=' + reason
+          + ' outcome=unknown'
+          + ' edge=' + (edge?.reason || '-')
+          + ' checks=' + checks);
+        return {
+          ...result,
+          timedOut: true,
+          checks,
+          proofOutcome: 'unknown',
+          hasDraft: null,
+          proofReason: edge?.reason || result?.proofReason || 'claude-draft-proof-timeout',
+        };
+      }
+    }
+    observedWriteSeq = Math.max(observedWriteSeq, Number(mirror.writeSeq || 0));
+    checks += 1;
+    result = await requestTerminalClaudeDraftState(
+      webContents,
+      tabId,
+      reason + ':wait-' + checks,
+      timeoutMs,
+    );
+    if (claudeDraftProofIsSettled(result)) {
+      console.log('[ClaudeDraftProofWait] finish tab=' + String(tabId).slice(-12)
+        + ' reason=' + reason
+        + ' outcome=' + result.proofOutcome
+        + ' hasDraft=' + result.hasDraft
+        + ' checks=' + checks);
+      return { ...result, timedOut: false, checks };
+    }
+  }
+  return {
+    ...result,
+    timedOut: true,
+    checks,
+    proofOutcome: 'unknown',
+    hasDraft: null,
+    proofReason: result?.proofReason || 'claude-draft-proof-timeout',
   };
 }
 
@@ -10544,13 +10845,74 @@ function clearAiStopping(tabId, reason = 'clear', options = {}) {
 
 function getInterruptedAiSessionEntries() {
   const entries = new Map();
-  for (const [tabId, sessionId] of bridgeKnownSessions) {
-    if (sessionId) entries.set(tabId, { engine: 'claude', sessionId });
-  }
-  for (const [tabId, sessionId] of codexKnownSessions) {
-    if (sessionId) entries.set(tabId, { engine: 'codex', sessionId });
+  const tabIds = new Set([...bridgeKnownSessions.keys(), ...codexKnownSessions.keys()]);
+  for (const tabId of tabIds) {
+    const claudeSessionId = bridgeKnownSessions.get(tabId) || null;
+    const codexSessionId = codexKnownSessions.get(tabId) || null;
+    const runtimeOwners = [];
+    if (claudeSessionId) runtimeOwners.push('claude');
+    if (codexSessionId) runtimeOwners.push('codex');
+    const engine = resolveAiToolOwner({ runtimeOwners });
+    if (engine === 'claude') {
+      entries.set(tabId, { engine, sessionId: claudeSessionId });
+    } else if (engine === 'codex') {
+      entries.set(tabId, { engine, sessionId: codexSessionId });
+    } else if (runtimeOwners.length > 0) {
+      // Keep the tab in graceful-stop/wasInterrupted handling, but never choose
+      // a continuation provider when two live runtimes claim the same PTY.
+      entries.set(tabId, { engine: null, sessionId: null, ambiguousOwners: runtimeOwners });
+    }
   }
   return entries;
+}
+
+let startupInterruptedAgentSnapshot = {
+  version: 1,
+  source: 'not-captured',
+  capturedAt: null,
+  shutdownPid: null,
+  resolvedAt: null,
+  targets: [],
+  unresolved: [],
+};
+
+function persistShutdownInterruptedAgentSnapshot(entries, reason) {
+  const snapshot = createShutdownInterruptedSnapshot(entries, {
+    capturedAt: Date.now(),
+    shutdownPid: process.pid,
+    reason,
+  });
+  projectManager.db.setAppState(SHUTDOWN_INTERRUPTED_SESSIONS_KEY, snapshot);
+  console.log('[Shutdown:ContinueSnapshot] reason=' + reason
+    + ' targets=' + snapshot.targets.length
+    + ' pid=' + process.pid);
+  return snapshot;
+}
+
+function captureStartupInterruptedAgentSnapshot() {
+  try {
+    startupInterruptedAgentSnapshot = resolveStartupInterruptedSnapshot({
+      persistedSnapshot: projectManager.db.getAppState(SHUTDOWN_INTERRUPTED_SESSIONS_KEY),
+      projects: projectManager.db.getAllProjects(),
+      resolvedAt: Date.now(),
+    });
+    console.log('[Startup:ContinueSnapshot] source=' + startupInterruptedAgentSnapshot.source
+      + ' targets=' + startupInterruptedAgentSnapshot.targets.length
+      + ' unresolved=' + startupInterruptedAgentSnapshot.unresolved.length
+      + ' shutdownPid=' + (startupInterruptedAgentSnapshot.shutdownPid || '-'));
+  } catch (error) {
+    startupInterruptedAgentSnapshot = {
+      version: 1,
+      source: 'capture-failed',
+      capturedAt: null,
+      shutdownPid: null,
+      resolvedAt: Date.now(),
+      targets: [],
+      unresolved: [{ reason: error?.message || String(error) }],
+    };
+    console.warn('[Startup:ContinueSnapshot] capture failed:', error?.message || error);
+  }
+  return startupInterruptedAgentSnapshot;
 }
 
 function formatInterruptedAiSessionIds(entries) {
@@ -12282,6 +12644,7 @@ function startClaudeHookServer() {
           ts,
           transcript_path,
           ppid,
+          tool_use_id,
           prompt: submitted_prompt,
         } = msg;
         const eventSeq = ++claudeHookEventSeq;
@@ -12473,6 +12836,9 @@ function startClaudeHookServer() {
 
         const hookEventTs = Date.now();
         claudeHookLastEvent.set(tabId, { event, ts: hookEventTs, sessionId: session_id });
+        if (event === 'UserPromptSubmit' || event === 'Stop' || event === 'StopFailure') {
+          claudeToolScreenHolds.clear(tabId);
+        }
 
         // ── Awaiting-user-input: AskUserQuestion brackets ──
         // PreToolUse(AskUserQuestion) fires the instant Claude blocks on its
@@ -12485,6 +12851,33 @@ function startClaudeHookServer() {
         // The tool_name guard keeps us scoped to AskUserQuestion even if other
         // tools ever get a PreToolUse matcher pointed at this same script.
         if (event === 'PreToolUse' || event === 'PostToolUse' || event === 'PostToolUseFailure') {
+          let exactToolUseId = tool_use_id ? String(tool_use_id) : null;
+          if (!exactToolUseId && event !== 'PreToolUse') {
+            const legacyMatch = claudeToolScreenHolds.snapshot(tabId)
+              .reverse()
+              .find((tool) => !tool.completed
+                && (!msg.tool_name || tool.toolName === String(msg.tool_name)));
+            exactToolUseId = legacyMatch?.toolUseId || null;
+          }
+          if (!exactToolUseId && event === 'PreToolUse') {
+            exactToolUseId = 'legacy:' + eventSeq + ':' + String(msg.tool_name || 'tool');
+          }
+          const tracked = event === 'PreToolUse'
+            ? claudeToolScreenHolds.start({
+              tabId,
+              toolUseId: exactToolUseId,
+              toolName: msg.tool_name,
+            })
+            : claudeToolScreenHolds.complete({
+              tabId,
+              toolUseId: exactToolUseId,
+            });
+          console.log('[ClaudeToolScreenHold] ' + event.toUpperCase()
+            + ' tab=' + String(tabId).slice(-12)
+            + ' tool=' + String(msg.tool_name || '-')
+            + ' id=' + String(exactToolUseId || '-').slice(-24)
+            + ' tracked=' + tracked
+            + ' held=' + claudeToolScreenHolds.snapshot(tabId).length);
           if (msg.tool_name === 'AskUserQuestion') {
             const awaiting = event === 'PreToolUse';
             const prevAwaiting = claudeAwaitingInput.get(tabId);
@@ -12503,12 +12896,18 @@ function startClaudeHookServer() {
             // TUI via keystrokes — see claudePendingQuestion + answerClaudeQuestionPTY.
             if (awaiting) {
               const questions = Array.isArray(msg.tool_input?.questions) ? msg.tool_input.questions : [];
-              // toolUseID isn't in the hook payload; PTY answers don't need it
-              // (we drive the TUI, not a parked canUseTool Promise). Use a synthetic
-              // marker so the mobile envelope shape matches the SDK one.
-              claudePendingQuestion.set(tabId, { questions, at: Date.now() });
+              claudePendingQuestion.set(tabId, {
+                questions,
+                toolUseID: exactToolUseId || 'pty',
+                at: Date.now(),
+              });
               console.log('[ClaudeHook] PTY question stored tab=' + tabId.slice(-12) + ' qs=' + questions.length);
-              _webBroadcast(tabId, { type: 'ask-question', source: 'pty', toolUseID: 'pty', questions });
+              _webBroadcast(tabId, {
+                type: 'ask-question',
+                source: 'pty',
+                toolUseID: exactToolUseId || 'pty',
+                questions,
+              });
             } else {
               if (claudePendingQuestion.has(tabId)) {
                 claudePendingQuestion.delete(tabId);
@@ -13175,6 +13574,13 @@ if [[ -n "$__ct_injected_visual" && "$__ct_injected_visual" == *noted-code-grab*
 fi
 unset __ct_injected_editor __ct_injected_visual
 
+# Keep Noted's patched Codex ahead of a user-level npm/brew Codex even when
+# the user's .zshrc rewrites PATH after terminal:create injected it.
+if [[ -n "$NOTED_CODEX_BIN_DIR" && -x "$NOTED_CODEX_BIN_DIR/codex" ]]; then
+  path=("$NOTED_CODEX_BIN_DIR" \${path:#$NOTED_CODEX_BIN_DIR})
+  export PATH
+fi
+
 # OSC 7 - Report current directory to terminal
 __ct_osc7() {
   printf "\\033]7;file://%s%s\\033\\\\" "$HOST" "$PWD"
@@ -13240,6 +13646,13 @@ if [[ -n "$__ct_injected_visual" && "$__ct_injected_visual" == *noted-code-grab*
   export VISUAL="$__ct_injected_visual"
 fi
 unset __ct_injected_editor __ct_injected_visual
+
+if [[ -n "$NOTED_CODEX_BIN_DIR" && -x "$NOTED_CODEX_BIN_DIR/codex" ]]; then
+  case ":$PATH:" in
+    *":$NOTED_CODEX_BIN_DIR:"*) ;;
+    *) export PATH="$NOTED_CODEX_BIN_DIR:$PATH" ;;
+  esac
+fi
 
 __ct_in_command=0
 
@@ -13902,18 +14315,31 @@ function createWindow() {
     titleBarStyle: 'hidden',
     titleBarOverlay: {
       color: 'rgba(0,0,0,0)',
-      height: 40,
+      // Совпадает с TITLE_BAR_H из src/renderer/constants/layout.ts. Это
+      // высота полосы, в которой macOS рисует кнопки закрыть/свернуть; если
+      // числа разойдутся, кружки встанут не по центру нашей шапки. 2026-08-18:
+      // шапка стала ниже (было 40), потому что вторая строка кнопок удалена.
+      height: 30,
       symbolColor: '#ffffff'
     },
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
-      webviewTag: true,
+      // webviewTag выключён 2026-08-17: его включали ради встроенной
+      // browser-вкладки, а её больше нет. Тег даёт странице право встраивать
+      // произвольный сайт внутрь окна приложения — не оставляем это включённым
+      // без того, кто этим пользуется.
     },
   };
 
   mainWindow = new BrowserWindow(windowOptions);
   console.log('[Window] BrowserWindow created');
+
+  // Открываем окно развёрнутым на весь рабочий стол (macOS zoom — как двойной
+  // клик по титлбару), НЕ нативный полноэкранный режим: тот уводит окно в
+  // отдельное пространство Spaces, прячет Dock/меню и ломает наши overlay-окна
+  // (Global Dictation чип, tab-switcher), которые живут поверх обычного экрана.
+  mainWindow.maximize();
 
   // Cmd+Tab focus restore: when macOS re-fronts our window via Cmd+Tab,
   // Chromium does NOT auto-restore DOM focus to any element. Side-effect:
@@ -14656,6 +15082,8 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
   }
 
   const historyEntries = codexDataModule._api.buildCodexFullHistory(loaded.records, sessionId);
+  const timelineEntries = codexDataModule._api.buildCodexTimeline(loaded.records, sessionId);
+  const sessionMeta = codexDataModule._api.getTimelineSessionMeta(loaded.records);
   const turns = [];
   const recordMap = new Map();
   let current = null;
@@ -14803,6 +15231,8 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
     branchLength: historyEntries.length,
     filePath: loaded.filePath,
     recordMap,
+    timelineEntries,
+    sessionMeta,
     ...annotations,
   };
   _overseerTurnsCache.set(cacheKey, result);
@@ -14847,6 +15277,251 @@ async function _loadSessionTurns(sessionId, cwd, options = {}) {
   };
   _overseerTurnsCache.set(cacheKey, result);
   return result;
+}
+
+function _sessionHistoryAppRelations(sessionId) {
+  const empty = { openTabs: [], archivedTabs: [] };
+  if (!sessionId || !projectManager?.db?.db) return empty;
+  try {
+    const rows = projectManager.db.db.prepare(`
+      SELECT project_id, tab_id, name, command_type, visual_parent_tab_id,
+             claude_session_id, codex_session_id, created_at
+      FROM tabs
+      WHERE claude_session_id = ? OR codex_session_id = ?
+      ORDER BY created_at, id
+    `).all(sessionId, sessionId);
+    const openTabs = rows.map((row) => {
+      const parent = row.visual_parent_tab_id
+        ? projectManager.db.db.prepare(`
+            SELECT tab_id, name, claude_session_id, codex_session_id
+            FROM tabs
+            WHERE project_id = ? AND tab_id = ?
+            LIMIT 1
+          `).get(row.project_id, row.visual_parent_tab_id)
+        : null;
+      return {
+        projectId: row.project_id,
+        tabId: row.tab_id,
+        name: row.name,
+        provider: row.command_type || null,
+        visualParent: parent ? {
+          tabId: parent.tab_id,
+          name: parent.name,
+          sessionId: parent.codex_session_id || parent.claude_session_id || null,
+        } : null,
+        createdAt: row.created_at ?? null,
+      };
+    });
+    const archivedTabs = projectManager.db.db.prepare(`
+      SELECT id, project_id, tab_id, name, command_type, created_at, closed_at
+      FROM tab_history
+      WHERE claude_session_id = ? OR codex_session_id = ?
+      ORDER BY closed_at DESC, id DESC
+    `).all(sessionId, sessionId).map((row) => ({
+      historyId: row.id,
+      projectId: row.project_id,
+      tabId: row.tab_id,
+      name: row.name,
+      provider: row.command_type || null,
+      createdAt: row.created_at ?? null,
+      closedAt: row.closed_at ?? null,
+    }));
+    return { openTabs, archivedTabs };
+  } catch (error) {
+    console.warn('[SessionHistoryEvents] app relation lookup failed:', error.message);
+    return empty;
+  }
+}
+
+async function _reconcileSessionHistoryEvents(data, cwd = null) {
+  const sessionId = data?.sessionId;
+  const provider = data?.engine === 'codex' ? 'codex' : 'claude';
+  if (!sessionId || !projectManager?.db) {
+    return {
+      totalIterations: decorateTurnsWithIterationCoordinates(data?.turns).totalIterations,
+      historyEvents: { fork: null, children: [], compacts: [] },
+      appRelations: { openTabs: [], archivedTabs: [] },
+    };
+  }
+
+  try {
+    if (provider === 'claude') {
+      const snapshot = deriveClaudeForkSnapshot(data.turns, data.recordMap);
+      if (snapshot) {
+        projectManager.db.saveSessionForkEvent({
+          provider: 'claude',
+          sourceSessionId: snapshot.sourceSessionId,
+          childSessionId: sessionId,
+          entryUuids: snapshot.entryUuids,
+          boundaryEntryUuid: snapshot.boundaryEntryUuid,
+          snapshotComplete: snapshot.snapshotComplete,
+          forkMode: 'full',
+          origin: 'transcript',
+          isDirect: true,
+        });
+      }
+    }
+    if (provider === 'codex' && data.sessionMeta?.forked_from_id) {
+      const snapshot = deriveCodexForkSnapshot(data.timelineEntries, data.sessionMeta);
+      projectManager.db.saveSessionForkEvent({
+        provider: 'codex',
+        sourceSessionId: snapshot.sourceSessionId,
+        childSessionId: sessionId,
+        entryUuids: snapshot.entryUuids,
+        boundaryEntryUuid: snapshot.boundaryEntryUuid,
+        snapshotComplete: snapshot.snapshotComplete,
+        occurredAt: snapshot.occurredAt,
+        forkMode: 'unknown',
+        origin: 'transcript',
+        isDirect: true,
+      });
+    }
+
+    let historyEvents = projectManager.db.getSessionHistoryContext(sessionId);
+    let forkParentData = null;
+    if (historyEvents.fork && (
+      historyEvents.fork.nextIterationIndex == null
+      || (historyEvents.fork.provider === 'codex' && historyEvents.fork.metadataCopied !== true)
+    )) {
+      try {
+        forkParentData = await _loadSessionTurns(historyEvents.fork.sourceSessionId, cwd);
+        const parentCoordinates = decorateTurnsWithIterationCoordinates(forkParentData.turns);
+        let nextIterationIndex = null;
+        if (historyEvents.fork.nextIterationIndex == null && historyEvents.fork.provider === 'claude') {
+          const inherited = new Set(historyEvents.fork.entryUuids || []);
+          for (const turn of parentCoordinates.turns) {
+            if (!inherited.has(turn.userUuid)) continue;
+            if (turn.iterationIndex != null) nextIterationIndex = turn.iterationIndex + 1;
+            else if (turn.nextIterationIndex != null) nextIterationIndex = turn.nextIterationIndex;
+          }
+        } else if (historyEvents.fork.nextIterationIndex == null) {
+          const forkAtSeconds = historyEvents.fork.occurredAt;
+          const forkAtMs = Number(forkAtSeconds) * 1000;
+          if (forkAtSeconds != null && Number.isFinite(forkAtMs)) {
+            nextIterationIndex = parentCoordinates.turns.filter((turn) => {
+              if (turn.iterationIndex == null || !turn.userTimestamp) return false;
+              const turnAtMs = Date.parse(String(turn.userTimestamp));
+              return Number.isFinite(turnAtMs) && turnAtMs <= forkAtMs + 1000;
+            }).length;
+          }
+        }
+        if (nextIterationIndex != null) {
+          projectManager.db.saveSessionForkEvent({
+            provider: historyEvents.fork.provider,
+            sourceSessionId: historyEvents.fork.sourceSessionId,
+            childSessionId: sessionId,
+            entryUuids: historyEvents.fork.entryUuids,
+            snapshotComplete: historyEvents.fork.snapshotComplete,
+            boundaryEntryUuid: historyEvents.fork.boundaryEntryUuid,
+            forkMode: historyEvents.fork.forkMode || 'unknown',
+            occurredAt: historyEvents.fork.occurredAt,
+            origin: historyEvents.fork.origin || 'transcript',
+            afterIterationIndex: nextIterationIndex > 0 ? nextIterationIndex - 1 : null,
+            nextIterationIndex,
+            isDirect: true,
+          });
+          historyEvents = projectManager.db.getSessionHistoryContext(sessionId);
+        }
+      } catch (coordinateError) {
+        console.warn('[SessionHistoryEvents] fork iteration backfill failed child=' + String(sessionId).slice(0, 8) + ': ' + coordinateError.message);
+      }
+    }
+    const inheritedUuids = new Set(historyEvents.fork?.entryUuids || []);
+    const compactEvents = deriveCompactEvents({ provider, sessionId, turns: data.turns })
+      .map((event) => ({
+        ...event,
+        inherited: inheritedUuids.has(event.boundaryEntryUuid)
+          || inheritedUuids.has(event.summaryEntryUuid),
+      }));
+    if (compactEvents.length > 0) {
+      projectManager.db.saveCompactHistoryEvents(compactEvents);
+      historyEvents = projectManager.db.getSessionHistoryContext(sessionId);
+    }
+    let appRelations = _sessionHistoryAppRelations(sessionId);
+    if (historyEvents.fork && appRelations.openTabs.length > 0) {
+      const childTab = appRelations.openTabs[0];
+      const sourceRelations = historyEvents.fork.sourceSessionId
+        ? _sessionHistoryAppRelations(historyEvents.fork.sourceSessionId)
+        : { openTabs: [] };
+      const sourceTabId = sourceRelations.openTabs.length === 1
+        ? sourceRelations.openTabs[0].tabId
+        : null;
+      projectManager.db.saveSessionForkEvent({
+        provider: historyEvents.fork.provider,
+        sourceSessionId: historyEvents.fork.sourceSessionId,
+        childSessionId: sessionId,
+        entryUuids: historyEvents.fork.entryUuids,
+        snapshotComplete: historyEvents.fork.snapshotComplete,
+        boundaryEntryUuid: historyEvents.fork.boundaryEntryUuid,
+        sourceTabId,
+        childTabId: childTab.tabId,
+        visualParentTabId: childTab.visualParent?.tabId || null,
+        orchestrationRunId: historyEvents.fork.orchestrationRunId,
+        forkMode: historyEvents.fork.forkMode || 'unknown',
+        occurredAt: historyEvents.fork.occurredAt,
+        origin: historyEvents.fork.origin || 'transcript',
+        isDirect: true,
+      });
+      historyEvents = projectManager.db.getSessionHistoryContext(sessionId);
+      appRelations = _sessionHistoryAppRelations(sessionId);
+    }
+    if (
+      historyEvents.fork?.provider === 'codex'
+      && historyEvents.fork.metadataCopied !== true
+      && forkParentData?.timelineEntries
+      && data.timelineEntries
+    ) {
+      const mappings = mapTimelineEntryUuidsAcrossFork(
+        forkParentData.timelineEntries,
+        data.timelineEntries,
+      );
+      const copied = projectManager.db.copyTimelineMetadataForMappedFork(
+        sessionId,
+        mappings,
+        historyEvents.fork.childTabId || appRelations.openTabs[0]?.tabId || null,
+      );
+      if (copied.notes > 0 || copied.rewindMarkers > 0) {
+        console.log('[SessionHistoryEvents] copied Codex fork metadata child=' + String(sessionId).slice(0, 8)
+          + ' notes=' + copied.notes + ' rewindMarkers=' + copied.rewindMarkers);
+      }
+      projectManager.db.markSessionForkMetadataCopied(historyEvents.fork.eventKey);
+      historyEvents = projectManager.db.getSessionHistoryContext(sessionId);
+    }
+    return {
+      totalIterations: decorateTurnsWithIterationCoordinates(data.turns).totalIterations,
+      historyEvents,
+      appRelations,
+    };
+  } catch (error) {
+    console.warn('[SessionHistoryEvents] reconciliation failed sid=' + String(sessionId).slice(0, 8) + ':', error.message);
+    return {
+      totalIterations: decorateTurnsWithIterationCoordinates(data.turns).totalIterations,
+      historyEvents: projectManager.db.getSessionHistoryContext?.(sessionId)
+        || { fork: null, children: [], compacts: [] },
+      appRelations: _sessionHistoryAppRelations(sessionId),
+      reconciliationError: error.message,
+    };
+  }
+}
+
+function _sessionHistoryContextForApi(context) {
+  const expose = (event) => {
+    if (!event) return null;
+    const { entryUuids, ...publicEvent } = event;
+    const seconds = Number(event.occurredAt);
+    return {
+      ...publicEvent,
+      snapshotEntryCount: Array.isArray(entryUuids) ? entryUuids.length : 0,
+      occurredAtIso: Number.isFinite(seconds)
+        ? new Date(seconds * 1000).toISOString()
+        : null,
+    };
+  };
+  return {
+    fork: expose(context?.fork),
+    children: (context?.children || []).map(expose),
+    compacts: (context?.compacts || []).map(expose),
+  };
 }
 
 function _markTerminalAsAiTab(tabId, engine, sessionId = null) {
@@ -15155,9 +15830,501 @@ async function _getAgentTurnResultForOrchestration({
   };
 }
 
+function sessionCatalogProjectMatches(candidate, projectFilter) {
+  const wanted = String(projectFilter || '').trim().toLocaleLowerCase();
+  if (!wanted) return true;
+  return [candidate.projectId, candidate.projectName, candidate.projectPath]
+    .some((value) => String(value || '').trim().toLocaleLowerCase() === wanted);
+}
+
+async function listSessionCatalogCandidates({
+  includeOpen = true,
+  includeClosed = true,
+  project = '',
+  dateField = 'activity',
+  fromMs = null,
+  toMs = null,
+  maxCandidates = 100,
+  candidateOffset = 0,
+} = {}) {
+  const candidates = [];
+  const seen = new Set();
+  if (includeOpen) {
+    const rows = projectManager.db.db.prepare(`
+      SELECT t.tab_id, t.name, t.cwd, t.command_type, t.tab_type,
+             t.claude_session_id, t.codex_session_id, t.created_at,
+             p.id AS project_id, p.name AS project_name, p.path AS project_path
+        FROM tabs t
+        JOIN projects p ON p.id = t.project_id
+       WHERE t.claude_session_id IS NOT NULL
+          OR t.codex_session_id IS NOT NULL
+          OR t.command_type IN ('claude', 'claude-sdk', 'codex')
+       ORDER BY COALESCE(t.created_at, 0) DESC, t.id DESC
+    `).all();
+    for (const row of rows) {
+      const isCodex = row.command_type === 'codex' || !!row.codex_session_id;
+      let sessionId = isCodex ? row.codex_session_id : row.claude_session_id;
+      if (isCodex) {
+        const runtime = await getCodexRuntimeSessionSnapshot(row.tab_id, {
+          reason: 'terminal-mcp-session-search',
+        }).catch(() => null);
+        sessionId = runtime?.sessionId || sessionId;
+      } else {
+        sessionId = bridgeKnownSessions.get(row.tab_id) || sessionId;
+      }
+      if (!sessionId) continue;
+      const candidate = {
+        source: 'open',
+        status: 'open',
+        historyId: null,
+        tabId: row.tab_id || null,
+        title: row.name || row.tab_id || sessionId,
+        projectId: row.project_id,
+        projectName: row.project_name || null,
+        projectPath: row.project_path || null,
+        cwd: row.cwd || row.project_path || null,
+        provider: isCodex ? 'codex' : 'claude',
+        sessionId,
+        createdAt: Number(row.created_at) || null,
+        closedAt: null,
+      };
+      if (!sessionCatalogProjectMatches(candidate, project)) continue;
+      if (!sessionMatchesDate(candidate, { dateField, fromMs, toMs })) continue;
+      const key = candidate.provider + ':' + candidate.sessionId;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(candidate);
+    }
+  }
+  if (includeClosed) {
+    const rows = projectManager.db.db.prepare(`
+      SELECT h.id AS history_id, h.tab_id, h.name, h.cwd, h.command_type,
+             h.claude_session_id, h.codex_session_id, h.created_at, h.closed_at,
+             p.id AS project_id, p.name AS project_name, p.path AS project_path
+        FROM tab_history h
+        JOIN projects p ON p.id = h.project_id
+       WHERE (h.tab_type IS NULL OR h.tab_type != 'file')
+         AND (h.claude_session_id IS NOT NULL OR h.codex_session_id IS NOT NULL)
+       ORDER BY h.closed_at DESC, h.id DESC
+    `).all();
+    for (const row of rows) {
+      const isCodex = row.command_type === 'codex' || !!row.codex_session_id;
+      const sessionId = isCodex ? row.codex_session_id : row.claude_session_id;
+      if (!sessionId) continue;
+      const candidate = {
+        source: 'history',
+        status: 'closed',
+        historyId: Number(row.history_id) || null,
+        tabId: row.tab_id || null,
+        title: row.name || row.tab_id || sessionId,
+        projectId: row.project_id,
+        projectName: row.project_name || null,
+        projectPath: row.project_path || null,
+        cwd: row.cwd || row.project_path || null,
+        provider: isCodex ? 'codex' : 'claude',
+        sessionId,
+        createdAt: Number(row.created_at) || null,
+        closedAt: Number(row.closed_at) || null,
+      };
+      if (!sessionCatalogProjectMatches(candidate, project)) continue;
+      if (!sessionMatchesDate(candidate, { dateField, fromMs, toMs })) continue;
+      const key = candidate.provider + ':' + candidate.sessionId;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(candidate);
+    }
+  }
+  candidates.sort((left, right) => (
+    Number(right.closedAt || right.createdAt || 0) - Number(left.closedAt || left.createdAt || 0)
+  ));
+  const limit = Math.max(1, Math.min(250, Number(maxCandidates) || 100));
+  const offset = Math.max(0, Number(candidateOffset) || 0);
+  return {
+    candidates: candidates.slice(offset, offset + limit),
+    total: candidates.length,
+    offset,
+    limit,
+  };
+}
+
+function sessionCatalogTimestamp(value) {
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds > 0
+    ? new Date(seconds * 1000).toISOString()
+    : null;
+}
+
+async function searchSessionCatalog(options = {}) {
+  const query = String(options.query || '').trim();
+  const dateWindow = resolveSearchDateWindow({
+    period: options.period,
+    dateFrom: options.dateFrom,
+    dateTo: options.dateTo,
+  });
+  const candidatePage = await listSessionCatalogCandidates({
+    includeOpen: options.includeOpen !== false,
+    includeClosed: options.includeClosed !== false,
+    project: options.project || options.projectId || '',
+    dateField: options.dateField,
+    fromMs: dateWindow.fromMs,
+    toMs: dateWindow.toMs,
+    maxCandidates: options.maxCandidates,
+    candidateOffset: options.candidateOffset,
+  });
+  const candidates = candidatePage.candidates;
+  const maxMatches = Math.max(1, Math.min(200, Number(options.maxMatches) || 50));
+  const matchesPerSession = Math.max(1, Math.min(10, Number(options.matchesPerSession) || 3));
+  const matches = [];
+  const sessions = [];
+  const errors = [];
+
+  for (const candidate of candidates) {
+    let data;
+    try {
+      data = await _loadSessionTurns(candidate.sessionId, candidate.cwd);
+    } catch (error) {
+      errors.push({
+        sessionId: candidate.sessionId,
+        title: candidate.title,
+        error: String(error?.message || error),
+      });
+      continue;
+    }
+    const iterations = [];
+    for (const turn of data.turns || []) {
+      if ((turn.kind !== 'user' && turn.kind !== 'queued_command') || turn.isNoise) continue;
+      const userRecord = data.recordMap.get(turn.userUuid);
+      const userText = _extractTurnPromptText(userRecord) || '';
+      if (!String(userText).trim()) continue;
+      const assistant = _collectAssistantBlocks(turn, data.recordMap).text.join('\n\n');
+      iterations.push({
+        turn,
+        userText,
+        assistantText: assistant,
+      });
+    }
+    const totalIterations = iterations.length;
+    sessions.push({ ...candidate, totalIterations });
+    if (!query) continue;
+
+    const sessionMatches = [];
+    for (let iterationIndex = 0; iterationIndex < iterations.length; iterationIndex += 1) {
+      const iteration = iterations[iterationIndex];
+      const match = scoreSessionTurnMatch({
+        query,
+        title: '',
+        userText: iteration.userText,
+        assistantText: iteration.assistantText,
+      });
+      if (!match.matched) continue;
+      sessionMatches.push({
+        ...candidate,
+        iterationIndex,
+        totalIterations,
+        turnIndex: (data.turns || []).indexOf(iteration.turn),
+        entryUuid: iteration.turn.userUuid || null,
+        timestamp: iteration.turn.userTimestamp || null,
+        matchedIn: match.matchedIn,
+        score: match.score,
+        userPreview: iteration.userText.slice(0, 500),
+        assistantPreview: iteration.assistantText.slice(0, 500),
+      });
+    }
+    if (sessionMatches.length === 0) {
+      const titleMatch = scoreSessionTurnMatch({ query, title: candidate.title });
+      if (titleMatch.matched) {
+        sessionMatches.push({
+          ...candidate,
+          iterationIndex: null,
+          totalIterations,
+          turnIndex: null,
+          entryUuid: null,
+          timestamp: null,
+          matchedIn: ['title'],
+          score: titleMatch.score,
+          userPreview: '',
+          assistantPreview: '',
+        });
+      }
+    }
+    sessionMatches.sort((left, right) => right.score - left.score || left.iterationIndex - right.iterationIndex);
+    matches.push(...sessionMatches.slice(0, matchesPerSession));
+  }
+
+  matches.sort((left, right) => (
+    right.score - left.score
+    || Number(right.closedAt || right.createdAt || 0) - Number(left.closedAt || left.createdAt || 0)
+    || Number(left.iterationIndex || 0) - Number(right.iterationIndex || 0)
+  ));
+  const publicSession = (session) => ({
+    status: session.status,
+    tabId: session.tabId,
+    historyId: session.historyId,
+    title: session.title,
+    projectId: session.projectId,
+    projectName: session.projectName,
+    projectPath: session.projectPath,
+    cwd: session.cwd,
+    provider: session.provider,
+    sessionId: session.sessionId,
+    createdAt: sessionCatalogTimestamp(session.createdAt),
+    closedAt: sessionCatalogTimestamp(session.closedAt),
+    totalIterations: session.totalIterations,
+  });
+  const resultMatches = matches.slice(0, maxMatches).map((match) => ({
+    ...publicSession(match),
+    iterationIndex: match.iterationIndex,
+    turnIndex: match.turnIndex,
+    entryUuid: match.entryUuid,
+    timestamp: match.timestamp,
+    matchedIn: match.matchedIn,
+    score: match.score,
+    userPreview: match.userPreview,
+    assistantPreview: match.assistantPreview,
+  }));
+  return {
+    query,
+    period: dateWindow.period,
+    dateField: options.dateField || 'activity',
+    dateFrom: Number.isFinite(dateWindow.fromMs) ? new Date(dateWindow.fromMs).toISOString() : null,
+    dateTo: Number.isFinite(dateWindow.toMs) ? new Date(dateWindow.toMs).toISOString() : null,
+    searchedSessions: sessions.length,
+    candidateTotal: candidatePage.total,
+    candidateOffset: candidatePage.offset,
+    candidateLimit: candidatePage.limit,
+    hasMoreCandidates: candidatePage.offset + candidates.length < candidatePage.total,
+    totalIterationsAcrossSessions: sessions.reduce((sum, session) => sum + session.totalIterations, 0),
+    returned: query ? resultMatches.length : sessions.length,
+    sessions: query ? undefined : sessions.map(publicSession),
+    matches: query ? resultMatches : undefined,
+    errors,
+  };
+}
+
+// ── Поиск по промптам ОТКРЫТЫХ вкладок (переключатель Cmd+P) ───────────────
+//
+// Отдельно от `searchSessionCatalog` выше, и это не дублирование: тот отвечает
+// на «найди сессию по всему архиву» (для MCP: закрытые вместе с открытыми,
+// диапазоны дат, оценка совпадения), а этот — на «в какой из моих открытых
+// вкладок я это писал». Разные вопросы дают разные ответы почти во всём:
+//
+//   • здесь строка результата = ОДИН промпт, а не сессия с превью лучшего;
+//   • здесь нужны смещения совпадений, чтобы подсветить найденное в тексте;
+//   • здесь порядок задаёт не оценка, а сама вкладка: результаты сгруппированы
+//     по вкладкам, внутри вкладки — по ходу разговора. Буквальный поиск не
+//     умеет ранжировать честно, и делать вид, что умеет, значит переставлять
+//     строки по причине, которую нельзя объяснить.
+//
+// Читает ровно те же turn'ы, что Timeline и History (`_loadSessionTurns`), —
+// свой парсер разошёлся бы с ними по uuid, и переход «к найденному ходу»
+// приводил бы не туда.
+const ITERATION_SEARCH_MIN_QUERY = 2;
+
+// Поиск ПОТОКОВЫЙ: каждая вкладка отдаётся отдельным событием, как только
+// разобрана. Это не оптимизация, а разница между «десять секунд пустого экрана»
+// и «первый ответ через полсекунды». Ждать общего конца незачем — порядок групп
+// задаёт свежесть вкладок, она известна заранее, и ни одна поздняя вкладка не
+// может переставить уже показанные.
+//
+// Стоимость решения — второй проход. Запасной режим («не нашлось фразой — ищем
+// словами») можно объявить только когда точно известно, что фразы нет НИ В ОДНОЙ
+// вкладке; в потоке этот момент наступает в самом конце. Поэтому второй проход
+// идёт отдельным событием и помечен как замена, а не добавка: клиент выбрасывает
+// показанное и рисует новое. Иначе список молча смешал бы точные совпадения с
+// приблизительными.
+async function searchOpenTabPrompts(options = {}) {
+  const rawQuery = String(options.query || '').trim();
+  const targets = Array.isArray(options.targets) ? options.targets : [];
+  const emit = typeof options.onTab === 'function' ? options.onTab : null;
+  if (rawQuery.length < ITERATION_SEARCH_MIN_QUERY) {
+    return { success: true, query: rawQuery, mode: 'phrase', matches: [], total: 0, truncated: false, scanned: 0, errors: [] };
+  }
+  const maxMatches = Math.max(1, Math.min(500, Number(options.maxMatches) || 200));
+  const maxPerTab = Math.max(1, Math.min(100, Number(options.maxPerTab) || 20));
+  const startedAt = Date.now();
+  const errors = [];
+
+  const scanTab = async (target, mode) => {
+    const sessionId = String(target?.sessionId || '');
+    const tabId = String(target?.tabId || '');
+    if (!sessionId || !tabId) return null;
+    let data;
+    try {
+      data = await _loadSessionTurns(sessionId, target.cwd || null);
+    } catch (error) {
+      if (mode === 'phrase') {
+        errors.push({ tabId, sessionId, error: String(error?.message || error) });
+      }
+      return null;
+    }
+    // Разбор сессии — синхронная работа процессора, а вкладок много. Без паузы
+    // между ними десяток крупных сессий сложился бы в одну длинную остановку
+    // интерфейса: главный процесс всё это время не отвечает ни на клики, ни на
+    // ввод в терминале. Пауза между вкладками, а не внутри одной, — дробить
+    // разбор одной сессии нечем, он атомарен.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const hits = [];
+    let iterationIndex = -1;
+    let truncatedHere = false;
+    for (let turnIndex = 0; turnIndex < (data.turns || []).length; turnIndex += 1) {
+      const turn = data.turns[turnIndex];
+      if (!turn || (turn.kind !== 'user' && turn.kind !== 'queued_command')) continue;
+      const record = data.recordMap.get(turn.userUuid);
+      const text = _extractTurnPromptText(record) || '';
+      if (!String(text).trim()) continue;
+      // Номер хода считается по ВСЕМ пользовательским промптам вкладки, а не по
+      // найденным: «#7» должно означать седьмой промпт разговора, иначе номер
+      // меняется от запроса к запросу и перестаёт быть адресом.
+      iterationIndex += 1;
+      if (turn.isNoise) continue;
+      if (hits.length >= maxPerTab) { truncatedHere = true; continue; }
+      const offsets = findQueryOffsets(text, rawQuery, mode);
+      if (offsets.length === 0) continue;
+      const snippet = buildSnippet(text, offsets);
+      hits.push({
+        tabId,
+        sessionId,
+        projectId: target.projectId || null,
+        toolType: target.toolType === 'codex' ? 'codex' : 'claude',
+        entryUuid: turn.userUuid || null,
+        turnIndex,
+        iterationIndex,
+        timestamp: turn.userTimestamp || null,
+        matchCount: offsets.length,
+        fullText: text,
+        fullLines: countLines(text),
+        fullOffsets: offsets,
+        snippetText: snippet.text,
+        snippetOffsets: snippet.offsets,
+        snippetHeadTrimmed: snippet.headTrimmed,
+        snippetTailTrimmed: snippet.tailTrimmed,
+      });
+    }
+    // Всего промптов во вкладке — знаменатель для «#7/214». Считается ЗДЕСЬ, а
+    // не на клиенте: клиент видит только найденное и знаменателя знать не может.
+    const totalIterations = iterationIndex + 1;
+    for (const hit of hits) hit.totalIterations = totalIterations;
+    return { tabId, hits, totalIterations, truncated: truncatedHere };
+  };
+
+  const runPass = async (mode, replaces) => {
+    const perTab = [];
+    let scanned = 0;
+    let emitted = 0;
+    for (const target of targets) {
+      const group = await scanTab(target, mode);
+      if (!group) continue;
+      scanned += 1;
+      if (group.hits.length === 0) continue;
+      perTab.push(group);
+      if (emitted < maxMatches && emit) {
+        // Событие на КАЖДУЮ вкладку с попаданиями — сразу, до конца обхода.
+        emit({
+          query: rawQuery,
+          mode,
+          replaces,
+          tabId: group.tabId,
+          hits: group.hits,
+          totalIterations: group.totalIterations,
+          truncated: group.truncated,
+        });
+      }
+      emitted += group.hits.length;
+    }
+    return { perTab, scanned };
+  };
+
+  let mode = 'phrase';
+  let pass = await runPass('phrase', false);
+  if (pass.perTab.length === 0) {
+    const words = queryWords(rawQuery);
+    if (words.length > 1) {
+      mode = 'words';
+      // `replaces: true` — второй проход не дополняет первый, а заменяет его.
+      // Первый ничего не нашёл, но клиент уже мог показать заголовки; смешать
+      // два режима в одном списке значило бы соврать про половину строк.
+      pass = await runPass('words', true);
+    }
+  }
+
+  const matches = [];
+  let total = 0;
+  for (const group of pass.perTab) {
+    total += group.hits.length;
+    for (const hit of group.hits) {
+      if (matches.length < maxMatches) matches.push(hit);
+    }
+  }
+  console.log('[IterationSearch] query=' + JSON.stringify(rawQuery)
+    + ' mode=' + mode
+    + ' tabs=' + targets.length
+    + ' scanned=' + pass.scanned
+    + ' tabsWithHits=' + pass.perTab.length
+    + ' matches=' + total
+    + ' returned=' + matches.length
+    + ' errors=' + errors.length
+    + ' ms=' + (Date.now() - startedAt));
+  return {
+    success: true,
+    query: rawQuery,
+    mode,
+    matches,
+    total,
+    truncated: total > matches.length,
+    scanned: pass.scanned,
+    errors,
+  };
+}
+
+ipcMain.handle('iteration-search:open-tabs', async (event, payload = {}) => {
+  // Номер запроса задаёт КЛИЕНТ и присылает обратно в каждом событии: ответы
+  // приходят порознь, человек к этому времени уже дописал строку, и без номера
+  // поздний кусок старого поиска дорисовался бы в свежий список.
+  const requestId = String(payload.requestId || '');
+  const sender = event?.sender;
+  try {
+    return await searchOpenTabPrompts({
+      ...payload,
+      onTab: requestId && sender && !sender.isDestroyed()
+        ? (chunk) => {
+          if (sender.isDestroyed()) return;
+          sender.send('iteration-search:chunk', { requestId, ...chunk });
+        }
+        : null,
+    });
+  } catch (error) {
+    console.warn('[IterationSearch] failed: ' + (error?.message || error));
+    return { success: false, error: String(error?.message || error), matches: [], total: 0 };
+  }
+});
+
 async function handleOverseerRequest(rawUrl) {
   const url = new URL(rawUrl, 'http://localhost');
   const p = url.pathname; // e.g. /overseer/sessions
+
+  if (p === '/overseer/search-sessions') {
+    const result = await searchSessionCatalog({
+      query: url.searchParams.get('query') || '',
+      project: url.searchParams.get('project') || url.searchParams.get('projectId') || '',
+      period: url.searchParams.get('period') || '',
+      dateField: url.searchParams.get('dateField') || 'activity',
+      dateFrom: url.searchParams.get('dateFrom'),
+      dateTo: url.searchParams.get('dateTo'),
+      includeOpen: url.searchParams.get('includeOpen') !== '0',
+      includeClosed: url.searchParams.get('includeClosed') !== '0',
+      maxCandidates: url.searchParams.get('maxCandidates'),
+      candidateOffset: url.searchParams.get('candidateOffset'),
+      maxMatches: url.searchParams.get('maxMatches'),
+      matchesPerSession: url.searchParams.get('matchesPerSession'),
+    });
+    console.log('[MCP:SessionSearch] query=' + JSON.stringify(result.query)
+      + ' period=' + (result.period || '-')
+      + ' sessions=' + result.searchedSessions
+      + ' returned=' + result.returned
+      + ' errors=' + result.errors.length);
+    return { body: result };
+  }
 
   if (p === '/overseer/sessions') {
     // Live tabs from DB (any project) with a known Claude/Codex sessionId.
@@ -15272,6 +16439,9 @@ async function handleOverseerRequest(rawUrl) {
   const cwd = url.searchParams.get('cwd') || null;
 
   const data = await _loadSessionTurns(sessionId, cwd);
+  const sessionHistoryProjection = (subpath === '/stats' || subpath === '' || subpath === '/turns')
+    ? await _reconcileSessionHistoryEvents(data, cwd)
+    : null;
 
   if (subpath === '/progress') {
     const progress = buildSessionProgress({
@@ -15338,6 +16508,7 @@ async function handleOverseerRequest(rawUrl) {
       sizeBytes: data.size,
       branchLength: data.branchLength,
       turnCount: data.turns.length,
+      totalIterations: sessionHistoryProjection?.totalIterations ?? Math.max(0, userTurns - noisePromptCount),
       userTurns,
       queuedCommandTurns,
       compactSummaries,
@@ -15354,6 +16525,9 @@ async function handleOverseerRequest(rawUrl) {
       rewindMarkerCount: data.rewindByTurn.size,
       docsEditedTurns,
       docsSearchTurns,
+      historyEvents: _sessionHistoryContextForApi(sessionHistoryProjection?.historyEvents),
+      appRelations: sessionHistoryProjection?.appRelations || { openTabs: [], archivedTabs: [] },
+      reconciliationError: sessionHistoryProjection?.reconciliationError || undefined,
     }};
   }
 
@@ -15408,18 +16582,27 @@ async function handleOverseerRequest(rawUrl) {
   if (subpath === '/turns') {
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 500);
     const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0);
+    const from = ['latest_compact', 'end', 'start'].includes(url.searchParams.get('from'))
+      ? url.searchParams.get('from')
+      : 'start';
     const includeNoise = url.searchParams.get('includeNoise') === '1';
     const kindFilter = url.searchParams.get('kind') || null; // user | queued_command | compact_summary | compact_boundary
 
+    const coordinated = decorateTurnsWithIterationCoordinates(data.turns);
     const items = [];
-    for (let i = 0; i < data.turns.length; i++) {
-      const t = data.turns[i];
+    for (let i = 0; i < coordinated.turns.length; i++) {
+      const t = coordinated.turns[i];
       if (kindFilter && t.kind !== kindFilter) continue;
       if (!includeNoise && t.kind === 'user' && t.isNoise) continue;
       const note = data.notesByTurn.get(i);
       const rewindMarker = data.rewindByTurn.get(i);
       items.push({
         turnIndex: i,
+        iterationIndex: t.iterationIndex ?? null,
+        afterIterationIndex: t.afterIterationIndex ?? null,
+        nextIterationIndex: t.nextIterationIndex ?? null,
+        compactEventIdentity: t.compactEventIdentity || undefined,
+        compactPart: t.compactPart || undefined,
         kind: t.kind,
         timestamp: t.userTimestamp,
         userUuid: t.userUuid,
@@ -15438,6 +16621,7 @@ async function handleOverseerRequest(rawUrl) {
         model: t.assistantModel || null,
         preTokens: t.preTokens || undefined,
         postTokens: t.postTokens || undefined,
+        trigger: t.trigger || undefined,
         // Annotations: user-authored note attached to this turn (purple),
         // rewind marker (pink dot from previous edit-range), docs-related
         // signals (green dot for any /docs/ or CLAUDE.md edit in this turn).
@@ -15447,14 +16631,39 @@ async function handleOverseerRequest(rawUrl) {
         docsSearchQueries: t.docsSearchQueries && t.docsSearchQueries.length ? t.docsSearchQueries : undefined,
       });
     }
-    const total = items.length;
+    const sourceTotal = items.length;
+    let windowItems = items;
+    let windowStart = 0;
+    if (from === 'latest_compact') {
+      const compactIndex = items.findLastIndex((item) => (
+        item.kind === 'compact_summary' || item.kind === 'compact_boundary'
+      ));
+      if (compactIndex >= 0) {
+        windowStart = compactIndex;
+        windowItems = items.slice(compactIndex);
+      } else {
+        windowStart = Math.max(0, items.length - limit);
+        windowItems = items.slice(windowStart);
+      }
+    } else if (from === 'end') {
+      windowStart = Math.max(0, items.length - limit - offset);
+      windowItems = items.slice(windowStart, Math.max(windowStart, items.length - offset));
+    }
+    const total = windowItems.length;
+    const page = from === 'end'
+      ? windowItems
+      : windowItems.slice(offset, offset + limit);
     return { body: {
       sessionId,
+      from,
+      sourceTotal,
+      totalIterations: coordinated.totalIterations,
+      windowStartTurnIndex: items[windowStart]?.turnIndex ?? null,
       total,
-      returned: Math.min(limit, Math.max(0, total - offset)),
+      returned: page.length,
       offset,
       limit,
-      turns: items.slice(offset, offset + limit),
+      turns: page,
     }};
   }
 
@@ -17249,6 +18458,11 @@ function stopMcpHttpServer() {
 }
 
 app.whenReady().then(async () => {
+  // Freeze the exact shutdown-owned target set before renderer restoration can
+  // clear wasInterrupted during AutoResume. `build:i-cont` reads this immutable
+  // boot snapshot after installing the new app and submits through Project API.
+  captureStartupInterruptedAgentSnapshot();
+
   // Microphone permission for Soniox dictation (MicButton, mobile-web composer).
   // Without these two handlers Electron's default is "deny" — getUserMedia
   // rejects with AbortError "The user aborted a request" even when macOS itself
@@ -17397,6 +18611,7 @@ app.whenReady().then(async () => {
       sdkSessions,
       computeActiveLoaders,
       computeProjectActivity,
+      startupInterruptedAgentSnapshot,
       // Mobile question answering (PTY drives TUI keystrokes, SDK resolves the
       // parked canUseTool Promise) + snapshot read for connect-mid-question.
       answerClaudeQuestion: answerClaudeQuestionUnified,
@@ -17678,6 +18893,7 @@ app.on('before-quit', async (event) => {
       for (const [tabId] of activeAiSessions) {
         marked += markStmt.run(tabId).changes;
       }
+      persistShutdownInterruptedAgentSnapshot(activeAiSessions, 'before-quit');
       console.log('[Shutdown:before-quit] EARLY-MARK ai=' + activeAiSessions.size +
         ' bridge=' + bridgeKnownSessions.size +
         ' codex=' + codexKnownSessions.size +
@@ -17794,6 +19010,7 @@ app.on('will-quit', () => {
       for (const [tabId] of activeAiSessions) {
         marked += markStmt.run(tabId).changes;
       }
+      persistShutdownInterruptedAgentSnapshot(activeAiSessions, 'will-quit');
 
       console.log('[Shutdown:will-quit] cleared=' + cleared.changes + ' marked=' + marked +
         ' bridge=' + bridgeKnownSessions.size +
@@ -18081,6 +19298,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       throw error;
     }
 
+    const codexSemanticChannel = await prepareCodexSemanticChannel(tabId);
+
     // Build env with shell integration
     const shellEnv = buildChildProcessEnv({
       TERM: 'xterm-256color',
@@ -18125,6 +19344,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // activeProjectId fallback. See methodology/design.md::ID-pinned routing.
       NOTED_PARENT_PROJECT_ID: typeof projectId === 'string' && projectId ? projectId : '',
       NOTED_PARENT_TAB_ID: typeof tabId === 'string' ? tabId : '',
+      // A patched Codex writes exact assistant/tool events here before
+      // ratatui converts them to ANSI cells. The ordinary PTY remains the
+      // source for input, cursor, readiness and the visible terminal.
+      NOTED_TERMINAL_CODEX_EVENTS_SOCKET: codexSemanticChannel?.socketPath || '',
       // Claude Code 2.1.110+ uses an aggressive alternate-screen renderer by
       // default. Each alt-screen transition (\x1b[?1049h/l) drops Claude's own
       // DEC ?2004 (bracketed paste mode) — after a few transitions a large
@@ -18150,6 +19373,24 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     delete shellEnv.NO_COLOR;
     if (shellEnv.FORCE_COLOR === '0') {
       delete shellEnv.FORCE_COLOR;
+    }
+    const codexBinaryOverride = decideCodexBinaryOverride({
+      hasSemanticChannel: Boolean(codexSemanticChannel),
+      codexBinPath: notedCodexBinPath,
+    });
+    if (codexBinaryOverride.enabled) {
+      terminalHistoryPreviewController.expectSemanticSource({ tabId });
+      shellEnv.NOTED_CODEX_BIN_DIR = path.dirname(notedCodexBinPath);
+      shellEnv.PATH = path.dirname(notedCodexBinPath)
+        + path.delimiter + String(shellEnv.PATH || '');
+      console.log('[CodexSemanticChannel] custom binary enabled tab='
+        + String(tabId).slice(-12) + ' binary=' + JSON.stringify(notedCodexBinPath));
+    } else if (codexBinaryOverride.reason === 'missing-code-mode-host') {
+      console.warn('[CodexSemanticChannel] custom binary skipped tab='
+        + String(tabId).slice(-12)
+        + ' reason=missing-code-mode-host expected='
+        + JSON.stringify(codexBinaryOverride.hostPath)
+        + ' hint=run "npm run install:codex-sidechannel"');
     }
 
     // Zsh: use ZDOTDIR to load our integration
@@ -18180,13 +19421,19 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     // Deterministic: no timeouts, no `-c` non-interactive corner cases.
     const shellArgs = [];
 
-    const ptyProcess = pty.spawn(shell, shellArgs, {
-      name: 'xterm-256color',
-      cols: cols || 80,
-      rows: rows || 24,
-      cwd: workingDir,
-      env: shellEnv
-    });
+    let ptyProcess;
+    try {
+      ptyProcess = pty.spawn(shell, shellArgs, {
+        name: 'xterm-256color',
+        cols: cols || 80,
+        rows: rows || 24,
+        cwd: workingDir,
+        env: shellEnv
+      });
+    } catch (error) {
+      await closeCodexSemanticChannel(tabId, 'pty-spawn-failed');
+      throw error;
+    }
     console.timeEnd(`[PERF:main] pty.spawn ${tabId}`);
     console.log(`[PTY:CREATED] tabId=${tabId} pid=${ptyProcess.pid} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)} initialCommand=${initialCommand ? JSON.stringify(initialCommand) : 'none'}`);
 
@@ -18902,6 +20149,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       terminalCommandState.delete(tabId);
       clearTimeout(codexFinishDebounceTimers.get(tabId));
       codexFinishDebounceTimers.delete(tabId);
+      void closeCodexSemanticChannel(tabId, 'pty-exit');
       clearCodexDescendantExitRecheck(tabId, 'pty-exit');
       terminalInitialCommand.delete(tabId);
       terminalOutputBuffer.delete(tabId);
@@ -18911,6 +20159,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       invalidateAiProcessLookupCache(tabId);
       clearAiStopping(tabId, 'pty-exit');
       clearCodexLaunchPayload(tabId, 'pty-exit');
+	      claudeToolScreenHolds.clear(tabId);
 	      claudeCliActive.delete(tabId);
 	      clearBridgeTab(tabId, 'pty-exit');
 	      clearCodexKnownSession(tabId, 'pty-exit');
@@ -21338,6 +22587,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         sessionId: durablePreSubmitBoundary?.sessionId || null,
         promptText: durableRawPrompt,
         transportText: content,
+        expectedImagePaths: (codexImagePasteSegments || [])
+          .filter((segment) => segment?.kind === 'image' && typeof segment.text === 'string')
+          .map((segment) => segment.text),
         presentationSnapshot: normalizedPresentationSnapshot,
         transcriptBoundary: durablePreSubmitBoundary || null,
       },
@@ -23626,6 +24878,54 @@ ipcMain.handle('__test:ai-boundary', async (_event, request = {}) => {
   };
 });
 
+// Runtime-only Claude presence. Keep this projection in one place so every
+// consumer (History, Project API and renderer restore) agrees on whether the
+// current PTY owns an active turn. Transcript/materialization fields are added
+// by the public `claude:get-presence` handler below; they are intentionally not
+// needed by the batched renderer restore path.
+function getClaudePtyRuntimePresence(tabId, evidence = {}) {
+  const hasBridge = bridgeKnownSessions.has(tabId);
+  const turnBusy = claudeTurnBusy.get(tabId) === true;
+  const localCommandActive = claudeLocalCommandWatchers.has(tabId);
+  const hasTerm = terminals.has(tabId);
+  const promptReady = claudePromptReady.has(tabId);
+  const stopping = aiStoppingTabs.get(tabId);
+  const startupIntent = claudeStartupIntents.get(tabId);
+  const startupIntentFresh = !!startupIntent && (Date.now() - startupIntent.at) < 45_000;
+  if (startupIntent && !startupIntentFresh) {
+    claudeStartupIntents.delete(tabId);
+  }
+  const awaiting = !!claudeAwaitingInput.get(tabId);
+  const launch = claudeLaunchGenerationByTab.get(tabId) || null;
+  const startupGate = claudeStartupDefaultsGateByTab.get(tabId) || null;
+  const startupGatePending = !!launch?.generation
+    && startupGate?.generation === launch.generation
+    && startupGate?.status !== 'ready'
+    && startupGate?.status !== 'cleared';
+  const projected = projectClaudePtyPresence({
+    hasTerm,
+    hasBridge,
+    promptReady,
+    cliActive: claudeCliActive.get(tabId) === true,
+    processAlive: evidence.providerProcessAlive === true,
+    processLookupUnknown: evidence.processLookupUnknown === true,
+    turnBusy,
+    localCommandActive,
+    stopping: stopping?.toolType === 'claude',
+    startupIntentFresh,
+    startupGatePending,
+  });
+  return {
+    ...projected,
+    hasBridge,
+    hasTerm,
+    awaiting,
+    runtimeSessionId: bridgeKnownSessions.get(tabId) || null,
+    providerProcessAlive: evidence.providerProcessAlive === true,
+    processLookupUnknown: evidence.processLookupUnknown === true,
+  };
+}
+
 ipcMain.handle('claude:get-presence', async (event, tabIdArg, requestContext = null) => {
   const tabId = typeof tabIdArg === 'string'
     ? tabIdArg
@@ -23633,7 +24933,22 @@ ipcMain.handle('claude:get-presence', async (event, tabIdArg, requestContext = n
   const context = typeof tabIdArg === 'object' && tabIdArg !== null
     ? (tabIdArg.context || requestContext)
     : requestContext;
-  const hasBridge = bridgeKnownSessions.has(tabId);
+  // In-memory bridge/prompt flags are deliberately empty for a short window
+  // after a main-process restart. The live PTY process is the stronger fact:
+  // resolve it through the same provider-aware process proof used by every
+  // other lifecycle surface before projecting Start/Stop.
+  const commandState = await resolveTerminalCommandState({
+    tabId,
+    caller: 'claude:get-presence',
+    expectedProcess: 'claude',
+    allowProcessTreeLookup: true,
+    requireProviderProof: true,
+  });
+  const runtimePresence = getClaudePtyRuntimePresence(tabId, {
+    providerProcessAlive: commandState?.expectedProcess === 'claude'
+      && commandState?.providerProcessAlive === true,
+    processLookupUnknown: commandState?.processLookupUnknown === true,
+  });
   const persisted = (() => {
     try {
       return projectManager?.db?.db?.prepare(
@@ -23663,44 +24978,33 @@ ipcMain.handle('claude:get-presence', async (event, tabIdArg, requestContext = n
   // Process-running ("Claude is up in this PTY") is conveyed by the 'active'
   // status + the navbar Stop button (claudeStatus), NOT by this busy flag.
   // See fact-mobile-claude-pty.md::Composer busy = turn, not spinner/alive.
-  const isBusy = !!claudeTurnBusy.get(tabId) || claudeLocalCommandWatchers.has(tabId);
-  const hasTerm = terminals.has(tabId);
-  const inputReady = claudePromptReady.has(tabId);
-  const stopping = aiStoppingTabs.get(tabId);
-  const startupIntent = claudeStartupIntents.get(tabId);
-  const startupIntentFresh = !!startupIntent && (Date.now() - startupIntent.at) < 45_000;
-  if (startupIntent && !startupIntentFresh) {
-    claudeStartupIntents.delete(tabId);
-  }
-  // awaiting = Claude is blocked on an AskUserQuestion (purple "needs answer"
-  // marker). Surfaced so the mobile tab list can dot the tab the way the desktop
-  // glows it. Only meaningful while the process is alive.
-  const awaiting = !!claudeAwaitingInput.get(tabId);
-  let status;
-  if (stopping?.toolType === 'claude') status = 'stopping';
-  else if (!hasTerm) status = 'inactive';
-  else if (inputReady && claudeCliActive.get(tabId) === true) status = isBusy ? 'busy' : 'active';
-  else if (hasBridge) {
-    if (isBusy) status = 'busy';
-    else if (inputReady) status = 'active';
-    else status = 'starting'; // Claude process exists but TUI hasn't drawn the prompt yet
-  } else if (startupIntentFresh) status = 'starting';
-  else status = 'inactive';
-  const materializationSessionId = persisted?.claude_session_id || bridgeKnownSessions.get(tabId) || null;
+  const materializationSessionId = persisted?.claude_session_id || runtimePresence.runtimeSessionId || null;
   const materialization = materializationSessionId && getSessionMaterialization
     ? getSessionMaterialization(materializationSessionId, persisted?.cwd || null)
     : null;
   const conversationMaterialized = materialization?.materialized === true;
   const presence = {
-    status,
-    hasBridge,
-    isBusy,
-    hasTerm,
-    inputReady: status === 'stopping' ? false : inputReady,
-    awaiting,
+    status: runtimePresence.status,
+    hasBridge: runtimePresence.hasBridge,
+    isBusy: runtimePresence.isBusy,
+    hasTerm: runtimePresence.hasTerm,
+    providerProcessAlive: runtimePresence.providerProcessAlive,
+    processLookupUnknown: runtimePresence.processLookupUnknown,
+    inputReady: runtimePresence.inputReady,
+    awaiting: runtimePresence.awaiting,
     sessionId: materializationSessionId,
     conversationMaterialized,
-    canResume: status === 'inactive' && conversationMaterialized,
+    // Именно `runtimePresence.status`, а не голое `status`: такой переменной в
+    // этом обработчике нет, и обращение к ней роняло ВЕСЬ ответ о состоянии
+    // Claude с ошибкой (281 падение в логе за одну сессию, 2026-08-18).
+    //
+    // Цена ошибки была непропорциональна опечатке. Ответ о состоянии — общий
+    // источник для трёх поверхностей сразу, и падал он молча для пользователя:
+    // на кнопке терминала не появлялось ни «запустить», ни «остановить» —
+    // наведение не давало ничего, клик не делал ничего; плашка запуска/ошибки
+    // не могла построиться; значок действия сессии не обновлялся. Claude при
+    // этом был жив — сломан был только рассказ о нём.
+    canResume: runtimePresence.status === 'inactive' && conversationMaterialized,
     canCopySessionId: conversationMaterialized,
     timelineCount: typeof materialization?.timelineCount === 'number' ? materialization.timelineCount : null,
     materializationReason: materialization?.reason || null,
@@ -28859,6 +30163,8 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
   clearCodexLaunchPayload(tabId, 'terminal-kill');
   clearCodexKnownSession(tabId, 'terminal-kill');
   clearCodexTuiReady(tabId, 'terminal-kill');
+  claudeToolScreenHolds.clear(tabId);
+  await closeCodexSemanticChannel(tabId, 'terminal-kill');
   codexImageBindings.clear(tabId);
   geminiActiveTabs.delete(tabId);
   geminiInputCharCount.delete(tabId);
@@ -29268,8 +30574,16 @@ ipcMain.handle('terminal:get-shell-prompt-readiness', (_event, request) => {
 async function resolveTerminalCommandState(requestOptions = {}) {
   const tabId = requestOptions.tabId;
   const caller = requestOptions.caller || 'legacy';
-  const expectedProcess = requestOptions.expectedProcess || 'codex';
-  const allowProcessTreeLookup = requestOptions.allowProcessTreeLookup !== false;
+  const requestedExpectedProcess = requestOptions.expectedProcess || null;
+  // A renderer hint is not ownership proof. A single live/persisted Claude
+  // binding must beat callers left over from the Codex-only implementation;
+  // otherwise every Claude tab asks the OS for `codex`, finds none, and offers
+  // Resume over an already-running Claude process.
+  const expectedProcess = resolveAiToolTypeForTab(tabId, requestedExpectedProcess);
+  const requireProviderProof = requestOptions.requireProviderProof === true
+    || expectedProcess === 'claude';
+  const allowProcessTreeLookup = requestOptions.allowProcessTreeLookup !== false
+    || requireProviderProof;
   const ignoreBridgeAlive = requestOptions.ignoreBridgeAlive === true;
   const startedAt = nodePerformance.now();
   const startAbs = nodePerformance.timeOrigin + startedAt;
@@ -29287,10 +30601,11 @@ async function resolveTerminalCommandState(requestOptions = {}) {
   // bridge knows a live session for this tab, Claude IS running regardless of
   // whether we captured the OSC B — report alive so the gate is correct.
   //
-  // Codex has no Claude-style bridge, so on initial sync we use a narrow
-  // process-tree fallback: if a real codex descendant is still under this PTY,
-  // the prompt queue overlay/process strip should also treat the tab as alive.
-  // This is not a busy signal; it only answers "is the AI process running?".
+  // Process-tree proof closes two restart gaps. Codex has no Claude-style
+  // bridge at all; Claude temporarily has no fresh bridge/statusline record
+  // after main restarts. In both cases a provider descendant under this exact
+  // PTY proves process liveness. This is not a busy signal; it only answers
+  // "is the AI process running?".
   const bridgeAlive = !ignoreBridgeAlive && bridgeKnownSessions.has(tabId);
   const oscRunning = !!(state && state.isRunning);
   if (expectedProcess === 'codex' && codexManualActionRequired.has(tabId)) {
@@ -29301,17 +30616,17 @@ async function resolveTerminalCommandState(requestOptions = {}) {
       manualActionType: codexManualActionRequired.get(tabId)?.type || null,
     };
   }
-  let codexAlive = false;
-  let codexLookupMs = 0;
-  let codexMatches = 0;
-  let didCodexLookup = false;
+  let providerProcessAlive = false;
+  let providerLookupMs = 0;
+  let providerMatches = 0;
+  let didProviderLookup = false;
   let processLookupUnknown = false;
   let processLookupError = null;
-  if (!oscRunning && !bridgeAlive && allowProcessTreeLookup) {
-    didCodexLookup = true;
+  if (!bridgeAlive && allowProcessTreeLookup && (!oscRunning || requireProviderProof)) {
+    didProviderLookup = true;
     const lookupStartedAt = nodePerformance.now();
     const lookup = await inspectAiDescendantProcessesByTabCached(tabId, expectedProcess);
-    codexLookupMs = nodePerformance.now() - lookupStartedAt;
+    providerLookupMs = nodePerformance.now() - lookupStartedAt;
     const establishedCodexRuntime = expectedProcess === 'codex' && (
       codexKnownSessions.has(tabId)
       || codexTurnWatchers.has(tabId)
@@ -29320,7 +30635,7 @@ async function resolveTerminalCommandState(requestOptions = {}) {
       || activityOpenIntervals.get(tabId)?.engine === 'codex'
     );
     const presence = resolveProcessPresence(lookup, { established: establishedCodexRuntime });
-    codexAlive = presence.present;
+    providerProcessAlive = presence.present;
     processLookupUnknown = presence.lookupUnknown;
     processLookupError = presence.error?.message || null;
     if (processLookupUnknown) {
@@ -29330,8 +30645,8 @@ async function resolveTerminalCommandState(requestOptions = {}) {
         + ' preserveEstablished=' + establishedCodexRuntime
         + ' error=' + processLookupError);
     } else {
-      codexMatches = lookup.matches.length;
-      if (codexAlive && expectedProcess === 'codex') {
+      providerMatches = lookup.matches.length;
+      if (providerProcessAlive && expectedProcess === 'codex') {
         await keepCodexRuntimeAliveFromProcessProof(tabId, lookup.matches, 'get-command-state-process-proof', {
           emitCommandStarted: true,
         });
@@ -29341,11 +30656,11 @@ async function resolveTerminalCommandState(requestOptions = {}) {
   if (bridgeAlive && !oscRunning) {
     console.warn(`[RunAfterDiag] getCommandState tab=${tabId.slice(-8)} oscRunning=false BUT bridgeAlive=true → reporting isRunning=true (OSC B was missed)`);
   }
-  if (codexAlive && !oscRunning) {
-    console.warn(`[RunAfterDiag] getCommandState tab=${tabId.slice(-8)} oscRunning=false BUT codexAlive=true → reporting isRunning=true (OSC B was missed)`);
+  if (providerProcessAlive && !oscRunning) {
+    console.warn(`[RunAfterDiag] getCommandState tab=${tabId.slice(-8)} oscRunning=false BUT providerProcessAlive=true expected=${expectedProcess || 'any'} → reporting isRunning=true (OSC B was missed)`);
   }
   const durMs = nodePerformance.now() - startedAt;
-  if (durMs > 50 || codexLookupMs > 50 || didCodexLookup) {
+  if (durMs > 50 || providerLookupMs > 50 || didProviderLookup) {
     console.warn(
       '[Perf:GetCommandState] tab=' + tabId.slice(-8) +
       ' caller=' + caller +
@@ -29357,17 +30672,19 @@ async function resolveTerminalCommandState(requestOptions = {}) {
       ' ignoreBridgeAlive=' + ignoreBridgeAlive +
       ' allowProcessTreeLookup=' + allowProcessTreeLookup +
       ' expected=' + expectedProcess +
-      ' codexLookup=' + didCodexLookup +
-      ' codexLookupMs=' + codexLookupMs.toFixed(1) +
-      ' codexMatches=' + codexMatches +
+      ' providerLookup=' + didProviderLookup +
+      ' providerLookupMs=' + providerLookupMs.toFixed(1) +
+      ' providerMatches=' + providerMatches +
       ' processLookupUnknown=' + processLookupUnknown +
-      ' result=' + (oscRunning || bridgeAlive || codexAlive)
+      ' result=' + (oscRunning || bridgeAlive || providerProcessAlive)
     );
   }
   try {
     return {
-      isRunning: oscRunning || bridgeAlive || codexAlive,
+      isRunning: oscRunning || bridgeAlive || providerProcessAlive,
       lastExitCode: state ? state.lastExitCode : 0,
+      expectedProcess: expectedProcess || null,
+      providerProcessAlive,
       processLookupUnknown,
       processLookupError,
     };
@@ -29417,20 +30734,24 @@ ipcMain.handle('terminal:getCommandStates', async (_event, request = {}) => {
   for (const entry of requested) {
     const tabId = typeof entry === 'string' ? entry : entry?.tabId;
     if (!tabId) continue;
-    const wantsCodex = typeof entry === 'object' && entry?.commandType === 'codex';
+    const requestedCommandType = typeof entry === 'object' ? entry?.commandType : null;
+    const resolvedToolType = resolveAiToolTypeForTab(tabId, requestedCommandType || null);
+    const wantsCodex = resolvedToolType === 'codex';
+    const wantsClaude = resolvedToolType === 'claude';
     let commandState = null;
     try {
       commandState = await resolveTerminalCommandState({
         tabId,
         caller,
-        expectedProcess: 'codex',
-        allowProcessTreeLookup: wantsCodex,
+        expectedProcess: resolvedToolType,
+        allowProcessTreeLookup: wantsCodex || wantsClaude,
+        requireProviderProof: wantsClaude,
       });
     } catch (error) {
       commandState = { isRunning: false, error: String(error?.message || error) };
     }
     let codexTurn = null;
-    if (wantsCodex || (typeof entry === 'object' && entry?.hasCodexSession)) {
+    if (wantsCodex) {
       try {
         codexTurn = await resolveCodexTurnState(tabId);
         turnStates += 1;
@@ -29438,7 +30759,20 @@ ipcMain.handle('terminal:getCommandStates', async (_event, request = {}) => {
         codexTurn = null;
       }
     }
-    states[tabId] = { ...commandState, codexTurn };
+    const claudePresence = wantsClaude
+      ? getClaudePtyRuntimePresence(tabId, {
+        providerProcessAlive: commandState?.expectedProcess === 'claude'
+          && commandState?.providerProcessAlive === true,
+        processLookupUnknown: commandState?.processLookupUnknown === true,
+      })
+      : null;
+    if (claudePresence) turnStates += 1;
+    states[tabId] = {
+      ...commandState,
+      resolvedToolType,
+      codexTurn,
+      claudePresence,
+    };
   }
   const durMs = nodePerformance.now() - startedAt;
   if (durMs > 50) {
@@ -36440,11 +37774,15 @@ ipcMain.handle('codex:get-draft-state', async (_event, tabId, options = {}) => {
 
 ipcMain.handle('claude:get-draft-state', async (_event, tabId, options = {}) => {
   const reason = typeof options?.reason === 'string' ? options.reason : 'claude-get-draft-state';
-  const result = await requestTerminalClaudeDraftState(
+  const result = await waitForTerminalClaudeDraftState(
     mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
     tabId,
     reason,
     Number(options?.timeoutMs) || 700,
+    {
+      waitOnUnknownOnly: options?.waitOnUnknownOnly === true,
+      waitTimeoutMs: Number(options?.waitTimeoutMs) || 15000,
+    },
   );
   return decorateAgentDraftProofIdentity(tabId, result);
 });
@@ -37086,12 +38424,22 @@ function codexLiveSourceIdentity(state, record, prefix = 'codex-assistant') {
 function buildCodexHistoryLiveCompactEntry(state, record) {
   if (record?.type !== 'compacted') return null;
   const sessionId = state.sessionId || codexKnownSessions.get(state.tabId) || null;
+  const rawPostTokens = Number(
+    record?.payload?.post_tokens
+    ?? record?.payload?.postTokens
+    ?? record?.payload?.compacted_tokens
+    ?? record?.payload?.compactedTokens,
+  );
   return {
     uuid: codexLiveUuid(state, record, 'compact'),
     sourceIdentity: codexLiveSourceIdentity(state, record, 'codex-compact'),
     role: 'compact',
     timestamp: record.timestamp || new Date().toISOString(),
     content: 'Conversation compacted',
+    postTokens: Number.isFinite(rawPostTokens) && rawPostTokens > 0
+      ? Math.floor(rawPostTokens)
+      : undefined,
+    compactEncrypted: true,
     sessionId,
   };
 }
@@ -37226,7 +38574,7 @@ function buildCodexLiveRawMessage(state, record) {
 
   if (record.type === 'event_msg' && event === 'user_message') {
     const text = payload.message || extractCodexLiveText(payload.content) || '';
-    if (!String(text).trim()) return null;
+    if (!String(text).trim() || isCodexEnvironmentContextUserText(text)) return null;
     const uuid = codexLiveUuid(state, record, 'user');
     return {
       type: 'user',
@@ -37241,7 +38589,9 @@ function buildCodexLiveRawMessage(state, record) {
 
   if (payload.type === 'message' && payload.role === 'user') {
     const text = codexUserMessageAuditText(record) || '';
-    if (!String(text).trim() || text.includes('<subagent_notification>')) return null;
+    if (!String(text).trim()
+      || text.includes('<subagent_notification>')
+      || isCodexEnvironmentContextUserText(text)) return null;
     const uuid = codexLiveUuid(state, record, 'user');
     return {
       type: 'user',
@@ -37737,10 +39087,16 @@ function processCodexUserMessagePasteAudit(state, record) {
   const audits = getPendingCodexPasteAudits(state.tabId);
   if (audits.length === 0) return false;
   try {
-    const actualText = codexUserMessageAuditText(record);
+    const actualText = codexUserMessageAuditText(record, {
+      // Delivery comparison must retain the provider envelope until its exact
+      // numbered path is checked against the attachment staged before Enter.
+      preserveProviderImageMarkup: true,
+    });
     if (actualText === null) return false;
     const actualLen = actualText.length;
     const actualHash = pasteAuditHash(actualText);
+    const presentationText = codexUserMessageAuditText(record) ?? actualText;
+    const presentationHash = pasteAuditHash(presentationText);
     const selection = selectCodexPendingPromptAudit(audits, {
       actualText,
       actualHash,
@@ -37786,8 +39142,11 @@ function processCodexUserMessagePasteAudit(state, record) {
         toolType: 'codex',
         sessionId: auditSessionId,
         auditTimestamp,
-        actualText,
-        actualHash,
+        // Delivery proof retains the raw provider envelope above, while the
+        // projector renders the normalized single-slot carrier. Persist the
+        // sidecar against that rendered identity so chips/images survive.
+        actualText: presentationText,
+        actualHash: presentationHash,
         snapshot: matchedAudit.presentationSnapshot,
       });
     } catch (error) {
@@ -38596,7 +39955,9 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
   }
   if (!suppressPublications && event === 'task_started') {
     pendingManualCompact = reconcileCodexManualCompactPendingOwner(state.tabId);
-    if (pendingManualCompact?.source === 'manual-xterm-enter') {
+    if (pendingManualCompact
+      && (pendingManualCompact.source === 'manual-xterm-enter'
+        || pendingManualCompact.source === 'programmatic-live-slash')) {
       const owner = readCodexManualInputOwner(state.tabId);
       const confirmed = compactOperations.confirmStart({
         tabId: state.tabId,
@@ -38608,7 +39969,9 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
         terminal: owner.terminal,
         eventSequence: record.__eventSequence,
         sourceByteOffset: Number(record.__byteOffset),
-        proof: 'task_started-after-manual-enter',
+        proof: pendingManualCompact.source === 'programmatic-live-slash'
+          ? 'task_started-after-programmatic-slash'
+          : 'task_started-after-manual-enter',
         startedAt: Date.parse(record.timestamp || '') || Date.now(),
       });
       if (confirmed) {
@@ -41037,14 +42400,18 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
     const descriptorStartedAtMs = Date.now();
     try {
       const lsofBinary = fs.existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
-      const result = await execFileAsync(lsofBinary, [
+      // Gated: every agent tab probes its own PIDs, so per-tab coalescing
+      // cannot stop 13 tabs from spawning descriptor probes in one frame.
+      // Waiting for a slot costs the same wall-clock as waiting behind the
+      // OS, but keeps the main process responsive between probes.
+      const result = await codexDescriptorProbeGate.run(() => execFileAsync(lsofBinary, [
         '-a',
         '-p', String(match.pid),
         '-Fpfan',
       ], {
         timeout: 1500,
         maxBuffer: 1024 * 1024,
-      });
+      }));
       checked += 1;
       reports.push({
         pid: match.pid,
@@ -49050,6 +50417,7 @@ ipcMain.handle('codex:get-persistent-model-effort-proof', async (_event, { tabId
 ipcMain.handle('codex:send-live-slash-command', async (_event, {
   tabId,
   command,
+  handoffId = null,
   hasDraft = null,
   draftSource = '',
   draftPreview = '',
@@ -49173,6 +50541,36 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
           return admission;
         };
 
+        let compactPendingOperation = null;
+        if (String(command || '').trim() === '/compact') {
+          const boundary = captureCodexManualCompactBoundary(tabId, readCodexManualInputOwner(tabId));
+          if (!boundary) {
+            return {
+              success: false,
+              error: 'codex_compact_boundary_unavailable',
+              submitted: false,
+            };
+          }
+          compactPendingOperation = compactOperations.armPending({
+            ...boundary,
+            command: '/compact',
+            promptGeneration: boundary.promptSeq,
+            operationId: handoffId
+              ? 'codex:api:' + handoffId
+              : undefined,
+            handoffId,
+            source: 'programmatic-live-slash',
+            acceptedAt: Date.now(),
+          });
+          if (!compactPendingOperation) {
+            return {
+              success: false,
+              error: 'codex_compact_operation_conflict',
+              submitted: false,
+            };
+          }
+        }
+
         const result = await sendCodexLiveSlashCommand(term, {
           tabId,
           command,
@@ -49196,6 +50594,17 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
             },
           ),
         });
+        if (compactPendingOperation && result?.success !== true && result?.submitted !== true) {
+          cancelCodexManualCompactPending(
+            tabId,
+            result?.error || 'programmatic-compact-not-submitted',
+            compactPendingOperation.operationId,
+          );
+        }
+        if (compactPendingOperation && result && typeof result === 'object') {
+          result.compactOperationId = compactPendingOperation.operationId;
+          result.handoffId = handoffId || null;
+        }
         if (result?.success === true && typeof result?.serviceTier === 'string') {
           const serviceTierProof = publishCodexServiceTierProof(
             tabId,
@@ -49927,7 +51336,8 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           };
 
           // Get Timeline UUIDs snapshot using Backtrace algorithm
-          const entryUuids = await parseTimelineUuids(sourcePath);
+          const timelineSnapshot = await parseTimelineUuids(sourcePath, { includeStats: true });
+          const entryUuids = timelineSnapshot.uuids;
           console.log('[Claude Runner] Timeline entries:', entryUuids.length);
 
           let written;
@@ -49992,7 +51402,19 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           // accepted. A rejected final proof/write therefore leaves no fork
           // marker, copied Timeline rows, imported links, or orphan JSONL.
           try {
-            projectManager.db.saveForkMarker(forkSessionId, newSessionId, entryUuids);
+            const tabRelation = projectManager.db.db.prepare(`
+              SELECT visual_parent_tab_id FROM tabs WHERE tab_id = ? LIMIT 1
+            `).get(tabId);
+            projectManager.db.saveForkMarker(forkSessionId, newSessionId, entryUuids, {
+              forkMode: 'full',
+              origin: 'app',
+              childTabId: tabId,
+              visualParentTabId: tabRelation?.visual_parent_tab_id || null,
+              afterIterationIndex: timelineSnapshot.totalIterations > 0
+                ? timelineSnapshot.totalIterations - 1
+                : null,
+              nextIterationIndex: timelineSnapshot.totalIterations,
+            });
             console.log('[Claude Runner] Fork marker saved with', entryUuids.length, 'UUIDs');
           } catch (e) { console.warn('[Claude Runner] Fork marker error:', e.message); }
 
@@ -52025,12 +53447,30 @@ ipcMain.handle('claude-sdk:fork-from-session', async (event, { sessionId, cwd })
     const newSessionId = crypto.randomUUID();
     if (!fs.existsSync(primaryDir)) fs.mkdirSync(primaryDir, { recursive: true });
     const destPath = path.join(primaryDir, `${newSessionId}.jsonl`);
-    fs.copyFileSync(sourcePath, destPath);
+    const timelineSnapshot = await parseTimelineUuids(sourcePath, { includeStats: true });
+    const written = await writeClaudeForkJsonlExclusive({
+      sourcePath,
+      destPath,
+      newSessionId,
+      startLine: 0,
+    });
 
     // Mark the fork in DB so Timeline can show the boundary in both sessions
     try {
-      const entryUuids = await parseTimelineUuids(sourcePath);
-      projectManager.db.saveForkMarker(sessionId, newSessionId, entryUuids);
+      const entryUuids = timelineSnapshot.uuids;
+      projectManager.db.saveForkMarker(sessionId, newSessionId, entryUuids, {
+        forkMode: 'full',
+        origin: 'app',
+        afterIterationIndex: timelineSnapshot.totalIterations > 0
+          ? timelineSnapshot.totalIterations - 1
+          : null,
+        nextIterationIndex: timelineSnapshot.totalIterations,
+      });
+      projectManager.db.copyTimelineMetadataForFork(
+        newSessionId,
+        written.retainedUuids,
+        null,
+      );
     } catch (e) { console.warn('[ClaudeSDK] fork marker save error:', e.message); }
 
     console.log('[ClaudeSDK] forked ' + sessionId.slice(0, 8) + ' → ' + newSessionId.slice(0, 8));

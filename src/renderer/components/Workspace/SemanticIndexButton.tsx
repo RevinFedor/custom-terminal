@@ -26,11 +26,15 @@ interface ProgressState {
 
 interface SemanticIndexButtonProps {
   // Колбэк для ПКМ — открыть Settings на вкладке «Системные».
-  // Хост (ProjectToolbar) знает про SettingsModal lifecycle, кнопка — нет.
+  // Хост (SidebarToolsRow) знает про SettingsModal lifecycle, кнопка — нет.
   onOpenSettings?: () => void;
+  // Кнопка живёт в узком ряду инструментов боковой панели, где её обычные
+  // отступы в 12px съели бы место двух соседей. Смысл и состояния те же —
+  // меняется только коробка: рамка вместо полной высоты полосы.
+  compact?: boolean;
 }
 
-export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexButtonProps) {
+export default function SemanticIndexButton({ onOpenSettings, compact = false }: SemanticIndexButtonProps) {
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
   const { showToast } = useUIStore();
   const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
@@ -206,29 +210,52 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
 
   if (!activeProjectId) return null;
 
-  const buttonStyle: React.CSSProperties = {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: '6px',
-    padding: '0 12px',
-    height: '100%',
-    fontSize: '12px',
-    color: '#888',
-    backgroundColor: 'transparent',
-    border: 'none',
-    borderTop: '2px solid transparent',
-    cursor: isRunning ? 'default' : 'pointer',
-    outline: 'none',
-    fontVariantNumeric: 'tabular-nums',
-  };
+  const idleBackground = compact ? 'rgba(255,255,255,0.035)' : 'transparent';
+  const buttonStyle: React.CSSProperties = compact
+    ? {
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 4,
+      padding: '0 6px',
+      height: 26,
+      minWidth: 26,
+      flexShrink: 0,
+      borderRadius: 5,
+      fontSize: 11,
+      fontWeight: 600,
+      color: '#8a8a90',
+      backgroundColor: idleBackground,
+      border: '1px solid rgba(255,255,255,0.10)',
+      cursor: isRunning ? 'default' : 'pointer',
+      outline: 'none',
+      fontVariantNumeric: 'tabular-nums',
+    }
+    : {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: '6px',
+      padding: '0 12px',
+      height: '100%',
+      fontSize: '12px',
+      color: '#888',
+      backgroundColor: 'transparent',
+      border: 'none',
+      borderTop: '2px solid transparent',
+      cursor: isRunning ? 'default' : 'pointer',
+      outline: 'none',
+      fontVariantNumeric: 'tabular-nums',
+    };
+
+  const iconSize = 13;
 
   const handleEnter = (e: React.MouseEvent<HTMLButtonElement>) => {
     if (isRunning) return;
-    e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.05)';
+    e.currentTarget.style.backgroundColor = compact ? 'rgba(255,255,255,0.09)' : 'rgba(255,255,255,0.05)';
   };
   const handleLeave = (e: React.MouseEvent<HTMLButtonElement>) => {
-    e.currentTarget.style.backgroundColor = 'transparent';
+    e.currentTarget.style.backgroundColor = idleBackground;
   };
 
   // === Running state ===
@@ -253,9 +280,13 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
     return (
       <Tooltip content={tooltipText}>
         <button onClick={handleClick} onContextMenu={handleContextMenu} style={buttonStyle} disabled>
-          <Loader2 size={13} className="animate-spin" style={{ color: '#d97706' }} />
+          <Loader2 size={iconSize} className="animate-spin" style={{ color: '#d97706' }} />
           <span style={{ color: '#d97706' }}>{counter}</span>
-          <span style={{ color: '#a855f7', marginLeft: '4px' }}>×{parallelismLabel}</span>
+          {/* Число одновременных воркеров — отладочная подробность. В узком ряду
+              она вытесняет соседние кнопки, а тот же счёт есть в подсказке. */}
+          {!compact && (
+            <span style={{ color: '#a855f7', marginLeft: '4px' }}>×{parallelismLabel}</span>
+          )}
         </button>
       </Tooltip>
     );
@@ -265,7 +296,7 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
   if (!status) {
     return (
       <button onContextMenu={handleContextMenu} style={{ ...buttonStyle, opacity: 0.4 }} disabled>
-        <CircleCheck size={13} />
+        <CircleCheck size={iconSize} />
         <span>—</span>
       </button>
     );
@@ -281,8 +312,10 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
           onMouseEnter={handleEnter}
           onMouseLeave={handleLeave}
         >
-          <AlertTriangle size={13} style={{ color: '#d97706' }} />
-          <span style={{ color: '#d97706' }}>no index</span>
+          <AlertTriangle size={iconSize} style={{ color: '#d97706' }} />
+          {/* «Индекса нет» — состояние, а не число. В узком ряду его несёт
+              сам янтарный значок, подпись есть в подсказке. */}
+          {!compact && <span style={{ color: '#d97706' }}>no index</span>}
         </button>
       </Tooltip>
     );
@@ -305,11 +338,14 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
         onMouseEnter={handleEnter}
         onMouseLeave={handleLeave}
       >
-        <CircleCheck size={13} style={{ color: '#22c55e' }} />
-        <span style={{ color: '#22c55e' }}>{status.fresh}</span>
+        <CircleCheck size={iconSize} style={{ color: '#22c55e' }} />
+        {/* В узком ряду число актуальных файлов не показываем: «всё в порядке»
+            и так сказано зелёным значком. Отставание — другое дело, это
+            единственное число, ради которого сюда смотрят. */}
+        {!compact && <span style={{ color: '#22c55e' }}>{status.fresh}</span>}
         {outdated > 0 && (
           <>
-            <AlertTriangle size={13} style={{ color: '#d97706', marginLeft: '4px' }} />
+            <AlertTriangle size={iconSize} style={{ color: '#d97706', marginLeft: compact ? 0 : '4px' }} />
             <span style={{ color: '#d97706' }}>{outdated}</span>
           </>
         )}

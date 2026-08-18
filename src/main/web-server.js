@@ -125,6 +125,10 @@ const {
   resolveRestorableAgentTab,
   runSingleFlight,
 } = require('./agent-tab-restore');
+const {
+  prependSavedPromptChips,
+  resolveSavedPromptRefs,
+} = require('./agent-saved-prompt-refs');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 // Lazy-require the helpers (loaded fresh each call so missing module just
@@ -241,6 +245,8 @@ let computeActiveLoaders = null;
 // list badge. This is deliberately project-scoped, not a tab transcript stream:
 // one SSE connection carries a full snapshot of {projectId,count,streaming}.
 let computeProjectActivity = null;
+// Frozen in main before renderer restore can clear wasInterrupted.
+let startupInterruptedSnapshot = null;
 // Mobile question answering — injected by main.start(). answerClaudeQuestion
 // routes SDK (resolve parked Promise) vs PTY (drive TUI keystrokes);
 // getClaudePendingQuestion reads the live pending question for the SSE snapshot.
@@ -653,6 +659,46 @@ function appendAttachmentsToPrompt(prompt, attachments) {
   return {
     prompt: [cleanPrompt, attachmentBlock].filter(Boolean).join('\n\n'),
     attachments: normalized,
+  };
+}
+
+async function resolveSavedPromptText(prompt) {
+  const parts = [];
+  const own = String(prompt?.content || '').trim();
+  if (own) parts.push(own);
+
+  const filePaths = Array.isArray(prompt?.file_paths) ? prompt.file_paths : [];
+  for (const fp of filePaths) {
+    const filePath = typeof fp === 'string' ? fp.trim() : '';
+    if (!filePath) continue;
+    try {
+      const raw = await fs.promises.readFile(filePath, 'utf8');
+      const sanitized = sanitizeFileForPrompt ? sanitizeFileForPrompt(raw, filePath) : raw;
+      const text = String(sanitized || '').trim();
+      if (text) parts.push(text);
+    } catch (error) {
+      console.warn('[SavedPromptRefs] linked file unavailable prompt='
+        + cleanOptionalString(prompt?.id || prompt?.title, '-')
+        + ' file=' + filePath
+        + ' error=' + String(error?.message || error));
+    }
+  }
+  return parts.join('\n\n');
+}
+
+async function resolveSendPromptPresentation(projectManager, body, taskPrompt) {
+  const refs = body?.prompts ?? body?.promptRefs ?? null;
+  if (refs == null) {
+    return { prompt: String(taskPrompt || '').trim(), promptChips: [] };
+  }
+  const promptChips = await resolveSavedPromptRefs({
+    refs,
+    prompts: projectManager.getPrompts(),
+    resolveText: resolveSavedPromptText,
+  });
+  return {
+    prompt: prependSavedPromptChips(String(taskPrompt || '').trim(), promptChips),
+    promptChips,
   };
 }
 
@@ -2042,6 +2088,61 @@ async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
   return { kind: 'accepted', receiptState: sendReceipt.state, run: reconciled || accepted };
 }
 
+async function prepareOrchestrationTargetForDelivery(runId, reason) {
+  const store = getOrchestrationRunStore();
+  let current = await store.getInternal(runId);
+  if (!current?.compactBeforeTask || current.targetPreparationCompletedAt) {
+    return { prepared: true, run: current };
+  }
+  if (current.targetPreparationStartedAt) {
+    const recovery = await store.beginRecovery(
+      runId,
+      'startup_failed',
+      'pre-task compact outcome is unknown after interruption; retry explicitly',
+      { failureGraceMs: 0 },
+    );
+    emitOrchestrationChanges(recovery.changed, reason + '-compact-outcome-unknown');
+    await finalizeSettledOrchestrations(recovery.settled, reason + '-compact-outcome-unknown');
+    return { prepared: false, run: await store.getInternal(runId), reason: 'compact-outcome-unknown' };
+  }
+
+  current = await store.patch(runId, {
+    status: 'starting',
+    targetPreparationStartedAt: Date.now(),
+    targetPreparationKind: 'compact',
+  });
+  await store.persistStrict();
+  emitOrchestrationRun(current, reason + '-compact-started');
+  try {
+    const result = await bridgeRequest('compactAgentTab', {
+      tabId: current.targetTabId,
+      projectId: current.targetProjectId,
+      handoffId: 'orchestration-pre-task-compact:' + current.runId,
+      timeoutMs: 180_000,
+    }, 185_000);
+    if (result?.success !== true) throw new Error(result?.error || 'pre-task compact failed');
+    const prepared = await store.patch(runId, {
+      status: 'queued',
+      targetPreparationCompletedAt: Date.now(),
+      targetPreparationOperationId: result?.operation?.operationId || null,
+      targetPreparationError: null,
+    });
+    await store.persistStrict();
+    emitOrchestrationRun(prepared, reason + '-compact-completed');
+    return { prepared: true, run: await store.getInternal(runId) };
+  } catch (error) {
+    const recovery = await store.beginRecovery(
+      runId,
+      'startup_failed',
+      'pre-task compact failed: ' + String(error?.message || error),
+      { failureGraceMs: 0 },
+    );
+    emitOrchestrationChanges(recovery.changed, reason + '-compact-failed');
+    await finalizeSettledOrchestrations(recovery.settled, reason + '-compact-failed');
+    return { prepared: false, run: await store.getInternal(runId), reason: 'compact-failed' };
+  }
+}
+
 async function dispatchDeferredOrchestrationRun(runId, {
   reason = 'delivery-wake',
   targetStatus = null,
@@ -2060,14 +2161,13 @@ async function dispatchDeferredOrchestrationRun(runId, {
   }
 
     const store = getOrchestrationRunStore();
-    const current = await store.getInternal(runId);
+    let current = await store.getInternal(runId);
     if (!current || isTerminalStatus(current.status)) {
       return { dispatched: false, deferred: false, reason: 'run-not-active', run: await store.get(runId) };
     }
     if (!current.deliveryIntent) {
       return { dispatched: false, deferred: false, reason: 'delivery-already-crossed-enter', run: await store.get(runId) };
     }
-
     let status = targetStatus
       || await resolveAgentSessionInfo(current.targetTabId, 2000, {
         onLateStatus: (lateStatus) => {
@@ -2113,6 +2213,53 @@ async function dispatchDeferredOrchestrationRun(runId, {
         + ' status=' + String(exactStatus?.status || exactStatus?.sessionStatus || '-'));
       status = exactStatus;
       deliveryAdmission = exactAdmission;
+    }
+
+    if (current.compactBeforeTask && !current.targetPreparationCompletedAt) {
+      if (deliveryAdmission.statusAtSend !== 'active') {
+        const deferred = await store.deferDelivery(runId, {
+          reason: 'target-preparation-requires-active-runtime',
+          sessionId: status?.sessionId || null,
+          lifecycleGeneration: status?.lifecycleGeneration || null,
+          launchGeneration: status?.launchGeneration || null,
+        });
+        emitOrchestrationRun(deferred, reason + '-compact-awaiting-active-runtime');
+        return {
+          dispatched: false,
+          deferred: true,
+          reason: 'target-preparation-requires-active-runtime',
+          run: deferred,
+        };
+      }
+      const preparation = await prepareOrchestrationTargetForDelivery(runId, reason);
+      if (!preparation.prepared) {
+        return {
+          dispatched: false,
+          deferred: false,
+          reason: preparation.reason,
+          run: await store.get(runId),
+        };
+      }
+      current = preparation.run;
+      status = typeof readAgentStartReadiness === 'function'
+        ? await readAgentStartReadiness(current.targetTabId).catch(() => status)
+        : await resolveAgentSessionInfo(current.targetTabId, 2000).catch(() => status);
+      deliveryAdmission = resolveOrchestrationDeliveryAdmission(status);
+      if (!deliveryAdmission.canDispatch || deliveryAdmission.statusAtSend !== 'active') {
+        const deferred = await store.deferDelivery(runId, {
+          reason: 'target-not-ready-after-preparation',
+          sessionId: status?.sessionId || null,
+          lifecycleGeneration: status?.lifecycleGeneration || null,
+          launchGeneration: status?.launchGeneration || null,
+        });
+        emitOrchestrationRun(deferred, reason + '-compact-finished-target-not-ready');
+        return {
+          dispatched: false,
+          deferred: true,
+          reason: 'target-not-ready-after-preparation',
+          run: deferred,
+        };
+      }
     }
 
     const claimed = await store.claimDeferredDelivery(runId, {
@@ -2535,7 +2682,11 @@ function orchestrationNotificationText(run) {
 
 function orchestrationPresentationSnapshot(run, phase) {
   if (!run?.runId) return null;
+  const promptChips = phase === 'request' && Array.isArray(run.deliveryIntent?.promptChips)
+    ? run.deliveryIntent.promptChips
+    : [];
   return {
+    ...(promptChips.length > 0 ? { promptChips } : {}),
     semanticTags: [{
       kind: 'orchestration',
       runId: run.runId,
@@ -3609,6 +3760,62 @@ async function scheduleOrchestrationPolicyTimer() {
   }, delay);
 }
 
+async function materializeReservedOrchestrationTarget(run, intent) {
+  if (run.forkFromTabId) {
+    return bridgeRequest('forkAgentTab', {
+      sourceTabId: run.forkFromTabId,
+      projectId: run.targetProjectId,
+      name: run.targetTabName || undefined,
+      reservedTabId: run.targetTabId,
+      background: true,
+      fromLatestCompact: run.fullHistoryFork !== true,
+      visualParentTabId: run.targetParentTabId || run.forkFromTabId,
+      afterTabId: run.targetParentTabId || run.forkFromTabId,
+      codexModel: intent?.model || undefined,
+      codexEffort: intent?.effort || undefined,
+    }, 60_000);
+  }
+  return bridgeRequest('createAgentTab', {
+    projectId: run.targetProjectId,
+    toolType: run.targetToolType,
+    name: run.targetTabName || undefined,
+    reservedTabId: run.targetTabId,
+    startNow: true,
+    background: true,
+    codexModel: intent?.model || undefined,
+    codexEffort: intent?.effort || undefined,
+    visualParentTabId: run.targetParentTabId || undefined,
+    afterTabId: run.targetParentTabId || undefined,
+  }, 12_000);
+}
+
+function persistOrchestrationForkEvent(run, childSessionId) {
+  if (!run?.forkFromTabId || !run?.forkSourceSessionId || !childSessionId) return false;
+  try {
+    const db = require('./project-manager').db;
+    db.saveSessionForkEvent({
+      provider: run.targetToolType,
+      sourceSessionId: run.forkSourceSessionId,
+      childSessionId,
+      entryUuids: [],
+      snapshotComplete: false,
+      sourceTabId: run.forkFromTabId,
+      childTabId: run.targetTabId,
+      visualParentTabId: run.targetParentTabId || run.forkFromTabId,
+      orchestrationRunId: run.runId,
+      orchestrationParentRunId: run.parentRunId || null,
+      forkMode: run.fullHistoryFork === true ? 'full' : 'latest_compact',
+      occurredAt: run.createdAt || null,
+      origin: 'orchestration',
+      isDirect: true,
+    });
+    return true;
+  } catch (error) {
+    console.warn('[Orchestration] fork history event persist failed run=' + run.runId + ': ' + error.message);
+    return false;
+  }
+}
+
 async function recoverMissingOrchestrationTarget(run, reason = 'startup-missing-target') {
   if (!run?.runId || findOrchestrationTabDescriptor(run.targetTabId)) {
     return { handled: false, recovered: false, run };
@@ -3637,18 +3844,7 @@ async function recoverMissingOrchestrationTarget(run, reason = 'startup-missing-
 
   try {
     const intent = current.deliveryIntent;
-    const created = await bridgeRequest('createAgentTab', {
-      projectId: current.targetProjectId,
-      toolType: current.targetToolType,
-      name: current.targetTabName || undefined,
-      reservedTabId: current.targetTabId,
-      startNow: true,
-      background: true,
-      codexModel: intent.model || undefined,
-      codexEffort: intent.effort || undefined,
-      visualParentTabId: current.targetParentTabId || undefined,
-      afterTabId: current.targetParentTabId || undefined,
-    }, 12_000);
+    const created = await materializeReservedOrchestrationTarget(current, intent);
     if (!created?.tabId || created.tabId !== current.targetTabId) {
       throw new Error('recovered target tab does not match its durable reservation');
     }
@@ -3662,9 +3858,15 @@ async function recoverMissingOrchestrationTarget(run, reason = 'startup-missing-
       targetProjectPath: descriptor.projectPath || created.projectPath || created.cwd || current.targetProjectPath,
       targetCwd: descriptor.cwd || created.cwd || current.targetCwd,
       targetToolType: descriptor.toolType || created.toolType || current.targetToolType,
+      forkSourceSessionId: created.sourceSessionId || current.forkSourceSessionId || null,
+      targetForkSessionId: created.sessionId || current.targetForkSessionId || null,
     });
     emitOrchestrationRun(materialized, reason + '-target-recreated');
     const status = await waitForAgentReady(current.targetTabId, 20_000);
+    persistOrchestrationForkEvent(
+      { ...current, ...materialized },
+      status?.sessionId || created.sessionId || current.targetForkSessionId || null,
+    );
     await store.patch(current.runId, {
       status: 'queued',
       sessionId: status?.sessionId || current.sessionId || null,
@@ -4128,6 +4330,8 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
           full: full || undefined,
           ts: mobileTimelineTs(entry.ts || entry.timestamp || fullEntry.ts || fullEntry.timestamp),
           preTokens: entry.preTokens || fullEntry.preTokens || undefined,
+          postTokens: entry.postTokens || fullEntry.postTokens || undefined,
+          compactEncrypted: entry.compactEncrypted === true || fullEntry.compactEncrypted === true || undefined,
           truncated: entry.truncated || undefined,
           tools: entry.tools || undefined,
         };
@@ -4144,6 +4348,8 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
           full: full || undefined,
           ts: mobileTimelineTs(entry.ts || entry.timestamp || fullEntry.ts || fullEntry.timestamp),
           preTokens: entry.preTokens || fullEntry.preTokens || undefined,
+          postTokens: entry.postTokens || fullEntry.postTokens || undefined,
+          compactEncrypted: entry.compactEncrypted === true || fullEntry.compactEncrypted === true || undefined,
           truncated: entry.truncated || undefined,
           tools: entry.tools || undefined,
         };
@@ -4166,6 +4372,8 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
         full: full || undefined,
         ts: Number.isFinite(tsMs) ? Math.floor(tsMs / 1000) : undefined,
         preTokens: entry.preTokens || fullEntry.preTokens || undefined,
+        postTokens: entry.postTokens || fullEntry.postTokens || undefined,
+        compactEncrypted: entry.compactEncrypted === true || fullEntry.compactEncrypted === true || undefined,
       };
     });
 }
@@ -4845,6 +5053,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // Immutable boot snapshot of the Claude/Codex PTYs stopped by the previous
+  // graceful app shutdown. `build:i-cont` reads this only from the replacement
+  // app and submits through the ordinary Project API send scenario.
+  if (parsed.pathname === '/api/build-continue-targets' && req.method === 'GET') {
+    const snapshot = startupInterruptedSnapshot || {
+      version: 1,
+      source: 'snapshot-unavailable',
+      capturedAt: null,
+      shutdownPid: null,
+      resolvedAt: Date.now(),
+      targets: [],
+      unresolved: [{ reason: 'startup interrupted snapshot unavailable' }],
+    };
+    return sendJson(res, 200, { ok: true, snapshot });
+  }
+
   const projectManager = require('./project-manager');
 
   if (parsed.pathname === '/api/orchestrations' && req.method === 'GET') {
@@ -4875,25 +5099,45 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let createdRunId = null;
     try {
       const body = await readBody(req);
-      const prompt = cleanOptionalString(body.prompt ?? body.text, '');
+      const taskPrompt = cleanOptionalString(body.prompt ?? body.text, '');
       const sourceTabId = cleanOptionalString(body.sourceTabId, '');
       let targetTabId = cleanOptionalString(body.targetTabId, '');
-      const targetProjectId = cleanOptionalString(body.targetProjectId || body.projectId, '');
+      let targetProjectId = cleanOptionalString(body.targetProjectId || body.projectId, '');
+      const forkFromTabId = cleanOptionalString(body.forkFromTabId, '');
       const requestedTargetToolType = resolveAgentProvider({
         toolType: body.toolType,
         provider: body.provider,
         fallback: 'claude',
       });
       const notifySource = body.notifySource !== false;
-      if (!prompt) return sendJson(res, 400, { ok: false, error: 'prompt required' });
+      if (!taskPrompt) return sendJson(res, 400, { ok: false, error: 'prompt required' });
       if (!sourceTabId) return sendJson(res, 400, { ok: false, error: 'sourceTabId required' });
-      if (!targetTabId && !targetProjectId) {
+      if (targetTabId && forkFromTabId) {
+        return sendJson(res, 400, { ok: false, error: 'targetTabId and forkFromTabId are mutually exclusive' });
+      }
+      if (body.compactBeforeTask === true && !forkFromTabId) {
+        return sendJson(res, 400, { ok: false, error: 'compactBeforeTask requires forkFromTabId' });
+      }
+      if (!targetTabId && !targetProjectId && !forkFromTabId) {
         return sendJson(res, 400, { ok: false, error: 'targetTabId or targetProjectId required' });
       }
 
       const requestedRunId = cleanOptionalString(body.runId, '') || crypto.randomUUID();
+      const promptPresentation = await resolveSendPromptPresentation(projectManager, body, taskPrompt);
+      const prompt = promptPresentation.prompt;
       const source = findOrchestrationTabDescriptor(sourceTabId);
       if (!source) return sendJson(res, 404, { ok: false, error: 'source tab not found' });
+      const forkSource = forkFromTabId ? findOrchestrationTabDescriptor(forkFromTabId) : null;
+      if (forkFromTabId && !forkSource) {
+        return sendJson(res, 404, { ok: false, error: 'fork source tab not found or not open' });
+      }
+      if (forkSource && !forkSource.toolType) {
+        return sendJson(res, 409, { ok: false, error: 'fork source is not a Claude/Codex agent' });
+      }
+      if (forkSource && !targetProjectId) targetProjectId = forkSource.projectId;
+      if (forkSource && forkSource.projectId !== targetProjectId) {
+        return sendJson(res, 409, { ok: false, error: 'fork target must stay in the source project' });
+      }
       if (notifySource && !source.toolType) {
         return sendJson(res, 409, { ok: false, error: 'source tab is not a Claude/Codex agent' });
       }
@@ -4936,7 +5180,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         }
         targetPlacement = resolveNewAgentTabPlacement({
           placement: body.placement,
-          parentTabId: cleanOptionalString(body.parentTabId, ''),
+          parentTabId: cleanOptionalString(body.parentTabId, '') || forkFromTabId,
           sourceTabId,
           sourceProjectId: source.projectId,
           targetProjectId,
@@ -4962,9 +5206,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
           projectId: targetProject.projectId,
           projectName: targetProject.projectName,
           projectPath: targetProject.projectPath,
-          cwd: targetProject.cwd,
-          toolType: requestedTargetToolType,
-          commandType: requestedTargetToolType,
+          cwd: forkSource?.cwd || targetProject.cwd,
+          toolType: forkSource?.toolType || requestedTargetToolType,
+          commandType: forkSource?.toolType || requestedTargetToolType,
         };
       }
       if (targetTabId === sourceTabId) {
@@ -4985,6 +5229,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
         mismatch.statusCode = 400;
         throw mismatch;
       }
+      if (forkSource && hasExplicitTargetProvider && requestedTargetToolType !== forkSource.toolType) {
+        const mismatch = new Error(
+          `Requested ${requestedTargetToolType} cannot fork a ${forkSource.toolType} session.`,
+        );
+        mismatch.code = 'agent_fork_provider_mismatch';
+        mismatch.statusCode = 400;
+        throw mismatch;
+      }
       const requestedModel = resolveProjectAgentModel(projectManager, {
         provider: target.toolType,
         model: requestedModelInput,
@@ -4999,6 +5251,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         placement: targetPlacement?.placement || null,
         visualParentTabId: targetPlacement?.visualParentTabId || null,
         afterTabId: targetPlacement?.afterTabId || null,
+        forkFromTabId,
+        fullHistoryFork: body.fullHistoryFork === true,
+        compactBeforeTask: body.compactBeforeTask === true,
         prompt,
         label: cleanOptionalString(body.label, ''),
         model: requestedModel,
@@ -5033,6 +5288,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         targetCreated,
         targetPlacement: targetPlacement?.placement || null,
         targetParentTabId: targetPlacement?.visualParentTabId || null,
+        forkFromTabId: forkFromTabId || null,
+        forkSourceSessionId: forkSource?.sessionId || null,
+        fullHistoryFork: forkFromTabId ? body.fullHistoryFork === true : false,
+        compactBeforeTask: forkFromTabId ? body.compactBeforeTask === true : false,
         parentRunId: cleanOptionalString(body.parentRunId, '') || undefined,
         sourceExecutionContext,
         waitForDescendants: body.waitForDescendants !== false,
@@ -5050,6 +5309,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         // that this queue survives restart; publicRun() redacts it.
         deliveryIntent: {
           prompt,
+          promptChips: promptPresentation.promptChips,
           model: requestedModel,
           effort: requestedEffort,
           thinking: requestedThinking,
@@ -5112,18 +5372,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
 
       if (targetCreated) {
-        const created = await bridgeRequest('createAgentTab', {
-          projectId: targetProjectId,
-          toolType: requestedTargetToolType,
-          name: targetName,
-          reservedTabId: targetTabId,
-          startNow: true,
-          background: true,
-          codexModel: requestedModel,
-          codexEffort: requestedEffort,
-          visualParentTabId: targetPlacement.visualParentTabId,
-          afterTabId: targetPlacement.afterTabId,
-        }, 12_000);
+        const internalReservedRun = await getOrchestrationRunStore().getInternal(run.runId);
+        const created = await materializeReservedOrchestrationTarget(
+          internalReservedRun,
+          internalReservedRun?.deliveryIntent,
+        );
         if (!created?.tabId || created.tabId !== targetTabId) {
           throw new Error('created target tab does not match its durable reservation');
         }
@@ -5146,6 +5399,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
           targetProjectPath: target.projectPath,
           targetCwd: target.cwd,
           targetToolType: target.toolType,
+          forkSourceSessionId: created.sourceSessionId || run.forkSourceSessionId || null,
+          targetForkSessionId: created.sessionId || run.targetForkSessionId || null,
         });
       }
       emitOrchestrationRun(run, 'created');
@@ -5157,6 +5412,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
       } else {
         targetStatus = await resolveAgentSessionInfo(targetTabId, 2000);
       }
+      persistOrchestrationForkEvent(
+        run,
+        targetStatus?.sessionId || run.targetForkSessionId || null,
+      );
       const baselineStatus = targetStatus?.status || targetStatus?.sessionStatus || 'unknown';
       await getOrchestrationRunStore().patch(run.runId, {
         status: 'sending',
@@ -5579,31 +5838,6 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  async function resolveMobilePromptRow(prompt) {
-    const parts = [];
-    const own = String(prompt?.content || '').trim();
-    if (own) parts.push(own);
-
-    const filePaths = Array.isArray(prompt?.file_paths) ? prompt.file_paths : [];
-    for (const fp of filePaths) {
-      const filePath = typeof fp === 'string' ? fp.trim() : '';
-      if (!filePath) continue;
-      try {
-        const raw = await fs.promises.readFile(filePath, 'utf8');
-        const clean = sanitizeFileForPrompt ? sanitizeFileForPrompt(raw, filePath) : raw;
-        const trimmed = String(clean || '').trim();
-        if (trimmed) parts.push(trimmed);
-      } catch (e) {
-        console.warn('[WebServer] /api/prompts failed to read prompt file:', filePath, e.message);
-      }
-    }
-
-    return {
-      ...prompt,
-      resolvedText: parts.join('\n\n'),
-    };
-  }
-
   // Prompts library (groups + items). Read-only — used by mobile composer
   // Insert-Prompt button. Schema:
   //   group: { id, name, position }
@@ -5611,7 +5845,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (parsed.pathname === '/api/prompts' && req.method === 'GET') {
     try {
       const groups = projectManager.getPromptGroups();
-      const prompts = await Promise.all(projectManager.getPrompts().map(resolveMobilePromptRow));
+      const prompts = await Promise.all(projectManager.getPrompts().map(async (prompt) => ({
+        ...prompt,
+        resolvedText: await resolveSavedPromptText(prompt),
+      })));
       // Cheap content fingerprint — client passes ?etag=<previous> to skip the
       // body when nothing changed. SHA-1 of the canonical JSON, hex-truncated
       // to 16 chars (~10^19 keys, plenty for a never-evicted cache).
@@ -6000,7 +6237,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const operationHandoffId = cleanOptionalString(handoffId, '')
         || 'project-send:' + crypto.randomUUID();
       const sendOperationKey = `project:${tabId}:${operationHandoffId}`;
-      const sendPayload = appendAttachmentsToPrompt(prompt, attachments);
+      const promptPresentation = await resolveSendPromptPresentation(projectManager, body, prompt);
+      const sendPayload = appendAttachmentsToPrompt(promptPresentation.prompt, attachments);
       // This request is the user's explicit authorization to reopen a closed
       // archived AI tab. Passive lifecycle/reconcile paths never call this.
       const openDescriptor = findOrchestrationTabDescriptor(tabId);
@@ -6042,6 +6280,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         sendOperationKey,
         sendSurface: 'project-api',
         provider: targetProvider,
+        presentationSnapshot: promptPresentation.promptChips.length > 0
+          ? { promptChips: promptPresentation.promptChips }
+          : null,
         // A stopped/new Claude prompt can create a new physical session. The
         // exact post-Enter audit binds that session to the receipt.
         sessionId: null,
@@ -6704,6 +6945,98 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // Форк вкладки: копия разговора в новой вкладке, рядом с исходной.
+  //
+  // Отличается от /overseer/fork, который правит только файл истории: здесь
+  // появляется живая вкладка с агентом, продолжающим копию.
+  //
+  // Реализация НЕ своя: тот же `forkAgentTab`, которым уже пользуется
+  // оркестрация (materializeReservedOrchestrationTarget). Он несёт то, что
+  // отдельная копия растеряла бы: отказ форкать занятую вкладку, проверку что
+  // разговор вообще сохранён, запись родословной форка и закрытие вкладки,
+  // если запуск не приняли. Таймаут тот же 60с — форк от последнего сжатия
+  // сначала материализует файл истории.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/fork$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('forkAgentTab', {
+        sourceTabId: tabId,
+        name: cleanOptionalString(body.name, '') || undefined,
+        background: true,
+        // По умолчанию — от последнего сжатия контекста, как в оркестрации и в
+        // меню вкладки: полная история дороже и нужна редко.
+        fromLatestCompact: body.fullHistory !== true && body.fromLatestCompact !== false,
+      }, 60_000);
+      console.log('[WebTabFork] OK source=' + shortId(tabId, 12)
+        + ' fork=' + shortId(data?.tabId, 12)
+        + ' provider=' + (data?.toolType || data?.provider || '-'));
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      console.warn('[WebTabFork] ERR source=' + shortId(tabId, 12)
+        + ' error=' + String(e?.message || e));
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
+  // ── Рабочая область: что на экране и как это переставить ────────────────
+  //
+  // The workspace had no API at all: a caller could create tabs but not say
+  // WHERE they should appear, so «сделай форк и открой обе справа» was not
+  // expressible. Two endpoints, because they are two different questions —
+  // reading the arrangement and stating a new one.
+  if (parsed.pathname === '/api/workspace' && req.method === 'GET') {
+    try {
+      const data = await bridgeRequest('describeWorkspaceLayout', {}, 5_000);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
+  // ONE call applies the whole arrangement. Composing it from single-window
+  // gestures would be several requests that can each half-fail, and the desktop
+  // guard "one empty window at a time" refuses the second one anyway.
+  if (parsed.pathname === '/api/workspace/arrange' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      // Nesting carries the distinction, so no extra flag: [[a],[b]] means two
+      // windows side by side, [[a,b]] means one window with two tabs.
+      const windows = Array.isArray(body.windows) ? body.windows : [];
+      if (windows.length === 0) {
+        return sendJson(res, 400, { ok: false, error: 'windows required' });
+      }
+      const normalized = windows.map((strip) => (Array.isArray(strip) ? strip : [strip])
+        .map((entry) => {
+          if (typeof entry === 'string') {
+            const descriptor = findOrchestrationTabDescriptor(entry);
+            return descriptor
+              ? { projectId: descriptor.projectId, tabId: entry }
+              : { projectId: '', tabId: entry };
+          }
+          return {
+            projectId: cleanOptionalString(entry?.projectId, ''),
+            tabId: cleanOptionalString(entry?.tabId, ''),
+          };
+        })
+        .filter((entry) => entry.tabId));
+      console.log('[WebWorkspace] arrange windows=' + normalized.length
+        + ' tabs=' + normalized.flat().length
+        + ' side=' + (body.side || 'right')
+        + ' divide=' + (body.divide || 'columns'));
+      const data = await bridgeRequest('arrangeWorkspaceLayout', {
+        side: cleanOptionalString(body.side, '') || undefined,
+        divide: cleanOptionalString(body.divide, '') || undefined,
+        anchorIndex: Number.isInteger(body.anchorIndex) ? body.anchorIndex : undefined,
+        windows: normalized,
+      }, 8_000);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
   // Start a fresh agent runtime in an existing PTY tab. This is intentionally
   // separate from /resume: an unmaterialized Claude tab has no saved
   // conversation to resume, but it still needs a way to launch Claude again.
@@ -6984,6 +7317,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
           startUuid: target.startUuid,
           endUuid: target.endUuid,
           compactText,
+          ...(target.status?.codexSettingsProof
+            ? { codexSettingsProof: target.status.codexSettingsProof }
+            : {}),
         })
         : await claudeDataApi.editRange({
           sessionId: target.sessionId,
@@ -7000,6 +7336,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             tabId,
             sessionId: result.newSessionId,
             reason: 'api-edit-range',
+            codexSettingsProof: result.codexSettingsProof || target.status?.codexSettingsProof || null,
           }, 3000);
           adoptedSessionId = result.newSessionId;
         } catch (adoptErr) {
@@ -7013,6 +7350,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ' removed=' + (result?.removedCount == null ? '-' : result.removedCount) +
         ' newSid=' + shortId(result?.newSessionId) +
         ' adopted=' + shortId(adoptedSessionId) +
+        ' code=' + (result?.code || '-') +
+        ' error=' + JSON.stringify(result?.error || adoptionError || '') +
         ' ms=' + (Date.now() - started));
       const statusCode = result?.success === false ? 409 : 200;
       return sendJson(res, statusCode, {
@@ -7058,6 +7397,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
           cwd: target.cwd,
           startUuid: target.startUuid,
           endUuid: target.endUuid,
+          ...(target.status?.codexSettingsProof
+            ? { codexSettingsProof: target.status.codexSettingsProof }
+            : {}),
         })
         : await claudeDataApi.deleteRange({
           sessionId: target.sessionId,
@@ -7073,6 +7415,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             tabId,
             sessionId: result.newSessionId,
             reason: 'api-delete-range',
+            codexSettingsProof: result.codexSettingsProof || target.status?.codexSettingsProof || null,
           }, 3000);
           adoptedSessionId = result.newSessionId;
         } catch (adoptErr) {
@@ -7087,6 +7430,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ' fileDeleted=' + (result?.fileDeleted === true) +
         ' newSid=' + shortId(result?.newSessionId) +
         ' adopted=' + shortId(adoptedSessionId) +
+        ' code=' + (result?.code || '-') +
+        ' error=' + JSON.stringify(result?.error || adoptionError || '') +
         ' ms=' + (Date.now() - started));
       const statusCode = result?.success === false ? 409 : 200;
       return sendJson(res, statusCode, {
@@ -8276,6 +8621,7 @@ function start({
   agentSendReceiptStartupReady: agentSendReceiptStartupReadyFn,
   computeActiveLoaders: computeFn,
   computeProjectActivity: computeProjectActivityFn,
+  startupInterruptedAgentSnapshot: startupInterruptedSnapshotFn,
   answerClaudeQuestion: answerFn,
   getClaudePendingQuestion: getQFn,
   transcriptService: transcriptServiceFn,
@@ -8310,6 +8656,7 @@ function start({
   }
   computeActiveLoaders = computeFn || null;
   computeProjectActivity = computeProjectActivityFn || null;
+  startupInterruptedSnapshot = startupInterruptedSnapshotFn || null;
   answerClaudeQuestion = answerFn || null;
   getClaudePendingQuestion = getQFn || null;
   transcriptService = transcriptServiceFn || null;
@@ -8421,6 +8768,7 @@ function stop() {
   wss = null;
   computeActiveLoaders = null;
   computeProjectActivity = null;
+  startupInterruptedSnapshot = null;
   answerClaudeQuestion = null;
   getClaudePendingQuestion = null;
   transcriptService = null;

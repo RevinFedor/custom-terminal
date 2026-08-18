@@ -1,0 +1,356 @@
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 79e2c3fe..8e4921c9 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -16,6 +16,9 @@ impl ChatWidget {
+         }
+ 
+         let from_replay = replay_kind.is_some();
++        if !from_replay {
++            crate::noted_side_channel::emit_notification(&notification);
++        }
+         let is_resume_initial_replay =
+             matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages));
+         let is_retry_error = matches!(
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index c79e6add..59c1bb52 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -150,6 +150,7 @@ mod model_migration;
+ mod motion;
+ mod multi_agents;
+ mod named_session_lookup;
++mod noted_side_channel;
+ mod notifications;
+ #[cfg(any(not(debug_assertions), test))]
+ mod npm_registry;
+@@ -885,6 +886,11 @@ pub async fn run_main(
+     loader_overrides: LoaderOverrides,
+     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
+ ) -> std::io::Result<AppExitInfo> {
++    // Noted Terminal can provide a private local Unix socket for structured
++    // assistant/tool events. This is deliberately additive to the PTY: the
++    // TUI keeps rendering normally while the parent receives the source event
++    // before ratatui turns it into terminal cells.
++    noted_side_channel::initialize();
+     let strict_config = cli.strict_config;
+     let (sandbox_mode, approval_policy) = if cli.dangerously_bypass_approvals_and_sandbox {
+         (
+
+diff --git a/codex-rs/tui/src/noted_side_channel.rs b/codex-rs/tui/src/noted_side_channel.rs
+new file mode 100644
+index 00000000..45e179c2
+--- /dev/null
++++ b/codex-rs/tui/src/noted_side_channel.rs
+@@ -0,0 +1,251 @@
++//! Optional structured event side-channel for Noted Terminal.
++//!
++//! The ordinary TUI still owns stdout and the PTY. When the parent exports
++//! [`SOCKET_ENV`], selected semantic notifications are copied to a private
++//! Unix socket as newline-delimited JSON before ratatui renders them. The hot
++//! TUI path never blocks: a bounded queue feeds one background writer and a
++//! sequence gap tells the parent to stop trusting an incomplete stream.
++
++use codex_app_server_protocol::ServerNotification;
++use codex_app_server_protocol::ThreadItem;
++use serde_json::Value;
++use serde_json::json;
++use std::sync::OnceLock;
++
++const SOCKET_ENV: &str = "NOTED_TERMINAL_CODEX_EVENTS_SOCKET";
++const PROTOCOL_VERSION: u8 = 1;
++const MAX_EVENT_BYTES: usize = 1024 * 1024;
++const QUEUE_CAPACITY: usize = 4096;
++
++#[cfg(unix)]
++mod platform {
++    use super::*;
++    use std::io::Write;
++    use std::os::unix::net::UnixStream;
++    use std::path::PathBuf;
++    use std::sync::atomic::AtomicBool;
++    use std::sync::atomic::AtomicU64;
++    use std::sync::atomic::Ordering;
++    use std::sync::mpsc::SyncSender;
++    use std::sync::mpsc::TrySendError;
++    use std::sync::mpsc::sync_channel;
++    use std::thread;
++    use std::time::SystemTime;
++    use std::time::UNIX_EPOCH;
++
++    pub(super) struct Channel {
++        sender: SyncSender<Vec<u8>>,
++        sequence: AtomicU64,
++        dropped_before: AtomicBool,
++        instance_id: String,
++    }
++
++    impl Channel {
++        fn create(socket_path: PathBuf) -> Self {
++            let (sender, receiver) = sync_channel::<Vec<u8>>(QUEUE_CAPACITY);
++            let pid = std::process::id();
++            let started_at_ns = SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .map(|value| value.as_nanos())
++                .unwrap_or_default();
++            let instance_id = format!("{pid}-{started_at_ns}");
++            let writer_instance_id = instance_id.clone();
++            let _ = thread::Builder::new()
++                .name("noted-codex-events".to_string())
++                .spawn(move || {
++                    // Connect immediately so the parent can disable its
++                    // screen-text fallback before the first tool/status frame
++                    // is rendered. A later event retries if startup raced the
++                    // socket listener.
++                    let mut stream = connect(&socket_path, &writer_instance_id, pid).ok();
++                    while let Ok(event) = receiver.recv() {
++                        if write_event(&socket_path, &writer_instance_id, pid, &mut stream, &event)
++                            .is_err()
++                        {
++                            stream = None;
++                        }
++                    }
++                });
++            Self {
++                sender,
++                sequence: AtomicU64::new(0),
++                dropped_before: AtomicBool::new(false),
++                instance_id,
++            }
++        }
++
++        pub(super) fn emit(&self, payload: Value) {
++            let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
++            let dropped_before = self.dropped_before.swap(false, Ordering::AcqRel);
++            let event = json!({
++                "v": PROTOCOL_VERSION,
++                "instanceId": self.instance_id,
++                "pid": std::process::id(),
++                "seq": sequence,
++                "droppedBefore": dropped_before,
++                "event": payload,
++            });
++            let Ok(mut bytes) = serde_json::to_vec(&event) else {
++                self.dropped_before.store(true, Ordering::Release);
++                return;
++            };
++            if bytes.len() > MAX_EVENT_BYTES {
++                self.dropped_before.store(true, Ordering::Release);
++                return;
++            }
++            bytes.push(b'\n');
++            match self.sender.try_send(bytes) {
++                Ok(()) => {}
++                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
++                    self.dropped_before.store(true, Ordering::Release);
++                }
++            }
++        }
++    }
++
++    fn connect(socket_path: &PathBuf, instance_id: &str, pid: u32) -> std::io::Result<UnixStream> {
++        let mut stream = UnixStream::connect(socket_path)?;
++        let hello = json!({
++            "v": PROTOCOL_VERSION,
++            "instanceId": instance_id,
++            "pid": pid,
++            "seq": 0,
++            "droppedBefore": false,
++            "event": { "type": "hello" },
++        });
++        serde_json::to_writer(&mut stream, &hello)?;
++        stream.write_all(b"\n")?;
++        stream.flush()?;
++        Ok(stream)
++    }
++
++    fn write_event(
++        socket_path: &PathBuf,
++        instance_id: &str,
++        pid: u32,
++        stream: &mut Option<UnixStream>,
++        event: &[u8],
++    ) -> std::io::Result<()> {
++        if stream.is_none() {
++            *stream = Some(connect(socket_path, instance_id, pid)?);
++        }
++        let result = stream
++            .as_mut()
++            .expect("stream must exist after connect")
++            .write_all(event);
++        if result.is_ok() {
++            return result;
++        }
++        *stream = Some(connect(socket_path, instance_id, pid)?);
++        stream
++            .as_mut()
++            .expect("stream must exist after reconnect")
++            .write_all(event)
++    }
++
++    pub(super) fn from_env() -> Option<Channel> {
++        let path = std::env::var_os(SOCKET_ENV)?;
++        if path.is_empty() {
++            return None;
++        }
++        Some(Channel::create(PathBuf::from(path)))
++    }
++}
++
++#[cfg(not(unix))]
++mod platform {
++    use super::*;
++
++    pub(super) struct Channel;
++
++    impl Channel {
++        pub(super) fn emit(&self, _payload: Value) {}
++    }
++
++    pub(super) fn from_env() -> Option<Channel> {
++        None
++    }
++}
++
++static CHANNEL: OnceLock<Option<platform::Channel>> = OnceLock::new();
++
++pub(crate) fn initialize() {
++    let _ = channel();
++}
++
++pub(crate) fn emit_notification(notification: &ServerNotification) {
++    let Some(payload) = project_notification(notification) else {
++        return;
++    };
++    if let Some(channel) = channel() {
++        channel.emit(payload);
++    }
++}
++
++fn channel() -> Option<&'static platform::Channel> {
++    CHANNEL.get_or_init(platform::from_env).as_ref()
++}
++
++fn project_notification(notification: &ServerNotification) -> Option<Value> {
++    match notification {
++        ServerNotification::AgentMessageDelta(value) => Some(json!({
++            "type": "assistant_delta",
++            "threadId": value.thread_id,
++            "turnId": value.turn_id,
++            "itemId": value.item_id,
++            "delta": value.delta,
++        })),
++        ServerNotification::ItemStarted(value) => Some(json!({
++            "type": "item_started",
++            "threadId": value.thread_id,
++            "turnId": value.turn_id,
++            "item": project_item(&value.item, false),
++        })),
++        ServerNotification::ItemCompleted(value) => Some(json!({
++            "type": "item_completed",
++            "threadId": value.thread_id,
++            "turnId": value.turn_id,
++            "item": project_item(&value.item, true),
++        })),
++        ServerNotification::TurnStarted(value) => Some(json!({
++            "type": "turn_started",
++            "threadId": value.thread_id,
++            "turnId": value.turn.id,
++        })),
++        ServerNotification::TurnCompleted(value) => Some(json!({
++            "type": "turn_completed",
++            "threadId": value.thread_id,
++            "turnId": value.turn.id,
++            "status": value.turn.status,
++        })),
++        _ => None,
++    }
++}
++
++fn project_item(item: &ThreadItem, include_assistant_text: bool) -> Value {
++    let serialized = serde_json::to_value(item).unwrap_or(Value::Null);
++    let kind = serialized
++        .get("type")
++        .and_then(Value::as_str)
++        .unwrap_or("unknown");
++    let item_id = serialized
++        .get("id")
++        .and_then(Value::as_str)
++        .unwrap_or_default();
++    let phase = serialized.get("phase").cloned().unwrap_or(Value::Null);
++    let text = if include_assistant_text && kind == "agentMessage" {
++        serialized.get("text").cloned().unwrap_or(Value::Null)
++    } else {
++        Value::Null
++    };
++    json!({
++        "kind": kind,
++        "itemId": item_id,
++        "phase": phase,
++        "text": text,
++    })
++}
++
++#[cfg(test)]
++#[path = "noted_side_channel_tests.rs"]
++mod tests;
+
+diff --git a/codex-rs/tui/src/noted_side_channel_tests.rs b/codex-rs/tui/src/noted_side_channel_tests.rs
+new file mode 100644
+index 00000000..b98f9274
+--- /dev/null
++++ b/codex-rs/tui/src/noted_side_channel_tests.rs
+@@ -0,0 +1,52 @@
++use super::*;
++use codex_app_server_protocol::AgentMessageDeltaNotification;
++use codex_app_server_protocol::ItemCompletedNotification;
++
++#[test]
++fn assistant_delta_projection_keeps_raw_markdown_and_identity() {
++    let notification = ServerNotification::AgentMessageDelta(AgentMessageDeltaNotification {
++        thread_id: "thread-1".to_string(),
++        turn_id: "turn-1".to_string(),
++        item_id: "item-1".to_string(),
++        delta: "**ready**\n".to_string(),
++    });
++    assert_eq!(
++        project_notification(&notification),
++        Some(json!({
++            "type": "assistant_delta",
++            "threadId": "thread-1",
++            "turnId": "turn-1",
++            "itemId": "item-1",
++            "delta": "**ready**\n",
++        })),
++    );
++}
++
++#[test]
++fn completed_agent_item_keeps_text_but_not_unrelated_payload() {
++    let notification = ServerNotification::ItemCompleted(ItemCompletedNotification {
++        item: ThreadItem::AgentMessage {
++            id: "item-1".to_string(),
++            text: "| A | B |".to_string(),
++            phase: None,
++            memory_citation: None,
++        },
++        thread_id: "thread-1".to_string(),
++        turn_id: "turn-1".to_string(),
++        completed_at_ms: 42,
++    });
++    assert_eq!(
++        project_notification(&notification),
++        Some(json!({
++            "type": "item_completed",
++            "threadId": "thread-1",
++            "turnId": "turn-1",
++            "item": {
++                "kind": "agentMessage",
++                "itemId": "item-1",
++                "phase": null,
++                "text": "| A | B |",
++            },
++        })),
++    );
++}
+

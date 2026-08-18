@@ -282,7 +282,7 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({ entry, ctx }) => {
           <div ref={anchorRef as any} className="cb-compact-card">
             <div className="cb-compact-head">
               <span className="cb-compact-label">Compact summary</span>
-              {m && <span className="cb-compact-metrics">{k(m.preTokens)} → {k(m.postTokens)} tokens · {secs}s</span>}
+              {m && m.postTokens > 0 && <span className="cb-compact-metrics">{k(m.postTokens)} tokens · {secs}s</span>}
             </div>
             {needsCollapse && open && <div className="cb-compact-toggle-top">{Toggle}</div>}
             <div className="cb-compact-body">{needsCollapse && !open ? preview + '…' : text}</div>

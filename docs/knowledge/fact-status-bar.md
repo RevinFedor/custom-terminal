@@ -13,8 +13,11 @@ VSCode-style полоса по всей нижней границе окна (п
 
 | Элемент | Назначение | Persistence |
 |---|---|---|
+| `HelpButton` («справка») | Открывает справку по приложению. Переехала сюда из шапки 2026-08-18. | — |
 | `MCP` chip | Последние mutating-вызовы Terminal MCP: запуск/stop/prompt/команда/chain. Клик раскрывает события и может вернуть пользователя в target project/tab. | renderer-session, не persist |
 | `WebServerChip` | LAN IP мобильного web-сервера | derived, не persist |
+
+**Справка стоит здесь, а не в шапке.** Раньше это была первая кнопка шапки — самое видное место приложения, рядом с проектами, между которыми переключаются весь день. Читают справку редко и один раз, поэтому она уехала туда, где живут такие же нечастые переключатели. Форма подстроена под соседей: значок плюс подпись, высота 18 — квадратной кнопки со значком в этой строке нет ни у кого, и одинокий значок среди подписанных словами читался бы как непонятная лишняя точка.
 
 ### Правая зона
 
@@ -29,7 +32,7 @@ VSCode-style полоса по всей нижней границе окна (п
 | `● freeze tooltips` toggle | Cmd-popup'ы Timeline (tooltip / note / fork) не закрываются по Cmd-release / mouseleave — для инспекции DOM в DevTools | SQLite `app:setState(freezeCmdPopups)` + localStorage boot mirror |
 | `⚙` Settings button | Открывает `SettingsModal` | — |
 
-**Чип лимитов Claude — не здесь.** Weekly% Anthropic подписки и per-tab token-cost живут в [`ProjectToolbar`](../../src/renderer/components/Workspace/ProjectToolbar.tsx), не в StatusBar. Причина: chip session-aware (читает `getEffectiveTabId` и активный проект), а status bar — глобальные toggle'ы без привязки к табу. См. [`fact-claude-usage-chip.md`](fact-claude-usage-chip.md).
+**Чип лимитов Claude — не здесь.** Weekly% Anthropic подписки и per-tab token-cost живут в правой части шапки ([`WorkspaceTitleBarTools.tsx`](../../src/renderer/components/Workspace/WorkspaceTitleBarTools.tsx)), не в StatusBar. Причина: chip session-aware (читает `getEffectiveTabId` и активный проект), а status bar — глобальные toggle'ы без привязки к табу. См. [`fact-claude-usage-chip.md`](fact-claude-usage-chip.md).
 
 **History/Timeline pin split.** Раньше один pin смешивал две разные поверхности: HistoryPanel (`Cmd+]` / `Option+]`) и expanded Timeline (`Cmd+\` / `Option+\`). Это разные жесты и разные layout-риски: пользователь может хотеть держать History обычной колонкой, но Timeline оставлять overlay поверх терминала для быстрого скана, или наоборот. Поэтому StatusBar показывает две соседние половины с независимым active state. Legacy migration для `historyPinned` читает старое combined `timelinePinned`, чтобы существующим пользователям не сломать привычную pinned-историю после обновления; дальше значения живут отдельно.
 

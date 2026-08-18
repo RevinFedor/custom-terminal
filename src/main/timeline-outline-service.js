@@ -1,4 +1,8 @@
 const crypto = require('node:crypto');
+const {
+  resolveForkMarkerBoundary,
+  selectDirectForkMarker,
+} = require('../shared/fork-marker-boundary.cjs');
 
 const TIMELINE_GROUPING_PROMPT_ID = 'timeline-grouping';
 const OUTLINE_SCHEMA_VERSION = 2;
@@ -629,9 +633,14 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
   for (const marker of barriers?.rewindMarkers || []) {
     if (marker?.entry_uuid) boundaryBeforeUuids.add(String(marker.entry_uuid));
   }
-  for (const marker of barriers?.forkMarkers || []) {
-    const uuids = Array.isArray(marker?.entry_uuids) ? marker.entry_uuids : [];
-    if (uuids.length > 0) boundaryAfterUuids.add(String(uuids[uuids.length - 1]));
+  const directForkMarker = selectDirectForkMarker(
+    barriers?.forkMarkers || [],
+    sessionId,
+    timelineResult.entries,
+  );
+  if (directForkMarker?.snapshot_complete !== false) {
+    const forkBoundary = resolveForkMarkerBoundary(timelineResult.entries, directForkMarker);
+    if (forkBoundary.boundaryUuid) boundaryAfterUuids.add(forkBoundary.boundaryUuid);
   }
 
   const prepared = prepareGroupingInput(timelineResult.entries, presets, {

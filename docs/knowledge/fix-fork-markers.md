@@ -69,3 +69,24 @@
 **Связанные факты:**
 - [`fact-timeline.md`](fact-timeline.md) — Fork & Plan Mode Markers (визуальные разделители)
 - [`fact-backtrace-jsonl.md`](fact-backtrace-jsonl.md) — Section 3: Fork vs Bridge isolation
+
+### Этап 6: app-owned lineage для Claude и Codex (2026-08-18)
+
+`fork_markers` был Claude-only таблицей для рисунка, а не общим фактом
+происхождения. Timeline, экспорт и semantic outline вычисляли последнюю точку
+snapshot разными алгоритмами; Codex знал `forked_from_id`, но синей полосы не
+имел вообще.
+
+Канонический слой теперь `session_history_events`. Он хранит provider, прямой
+source/child, режим fork, child-addressable UUID snapshot, координату нулевой
+пользовательской итерации, tab/orchestration relations и hidden отдельно от
+lineage. Старые `fork_markers` мигрируются, Claude временно dual-write'ится для
+обратной совместимости, Codex в provider-less legacy table не пишется.
+
+Все потребители используют один `resolveForkMarkerBoundary`: максимальную
+сохранившуюся позицию текущей Timeline, входящую в snapshot. Rewind/edit/delete
+могут сделать snapshot дырявым, но не могут создать вторую синюю полосу.
+`UPSERT` никогда не сбрасывает hidden и не расширяет уже доказанный snapshot
+поздними child-ходами. Для Codex snapshot состоит из synthetic UUID именно
+child-сессии; неизменившиеся notes/rewind markers переносятся на новые UUID по
+детерминированному fingerprint времени+типа+контента.

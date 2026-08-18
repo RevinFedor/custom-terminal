@@ -6,7 +6,6 @@ import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import TabBar from './TabBar';
 import TabSidebar from './TabSidebar';
-import ProjectToolbar from './ProjectToolbar';
 import ProjectHome from './ProjectHome';
 import TerminalArea, { type AgentLifecycleSummary } from './TerminalArea';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
@@ -15,14 +14,14 @@ import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
 import { useSplitAttachRowHeight, SplitPaneAttachRow } from './SplitPaneChrome';
-import { TabLocationBar } from './TabLocationBar';
-import { TOP_STRIP_H } from '../../constants/layout';
+import { EXPLORER_TOP_H } from '../../constants/layout';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
 import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from '../../constants/systemProjects';
 import { linkFileTab } from '../../utils/linkFileTab';
 import { resolvePaneSurfaceHotkeyTabId } from '../../utils/paneSurfaceHotkeyTarget.mjs';
+import { paneTabs } from '../../utils/splitPanesModel.mjs';
 import { probeFiles } from '../../utils/missingFileTracker';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
@@ -132,7 +131,6 @@ export default function Workspace() {
     return projectId ? (s.openProjects.get(projectId)?.currentView || 'terminal') : 'terminal';
   });
   const isInboxProject = isInboxProjectId(activeProjectId);
-  const isFocusedInboxProject = isInboxProjectId(focusedProjectId);
   const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
   const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
   const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
@@ -368,7 +366,6 @@ export default function Workspace() {
   const agentSurfacePairAvailable = !!effectiveTab
     && currentView === 'terminal'
     && effectiveTabType !== 'claude-sdk'
-    && effectiveTabType !== 'browser'
     && effectiveTabType !== 'file'
     && !filePreview
     && !!primaryHistoryTool;
@@ -385,8 +382,13 @@ export default function Workspace() {
     const sidebarPid = s.focusedProjectId || s.activeProjectId;
     const ids = new Set<string>();
     for (const pane of s.splitPanes) {
-      if (pane.projectId && pane.projectId !== sidebarPid && s.openProjects.has(pane.projectId)) {
-        ids.add(pane.projectId);
+      // Every project in the STRIP, not just the shown chip's: a right-click on
+      // a parked chip opens the same menu, and its owner must be mounted or the
+      // menu silently does not appear.
+      for (const entry of paneTabs(pane) as Array<{ projectId: string }>) {
+        if (entry.projectId && entry.projectId !== sidebarPid && s.openProjects.has(entry.projectId)) {
+          ids.add(entry.projectId);
+        }
       }
     }
     return Array.from(ids).sort().join('|');
@@ -1283,7 +1285,7 @@ export default function Workspace() {
   // Placement freeze — same pattern as committedTimelineRuntimeRef above.
   // The panel's tree POSITION (primary / overlay / pinned) is chosen by urgent
   // flags, but its IDENTITY arrives through the deferred lane. When a switch
-  // changes the layout class (agent-primary → browser/file/terminal-primary),
+  // changes the layout class (agent-primary → file/terminal-primary),
   // the urgent frame used to move the node to another position while the
   // deferred owner still pointed at the OLD tab — React unmounted and
   // remounted the old owner there: a full 1000-row mount, owner effects and a
@@ -1320,7 +1322,7 @@ export default function Workspace() {
   });
   // While the stale owner waits out the deferred beat, the frozen node must
   // not fight the NEW tab's layout: when the placement class changed (or the
-  // new tab has no history surface at all — browser/file), the old panel would
+  // new tab has no history surface at all — a linked file), the old panel would
   // either flash its rows over an unrelated surface or, kept in flow with
   // visibility:hidden, still occupy its box and shove the terminal aside for a
   // frame. display:none keeps the React instance mounted (the whole point —
@@ -1650,17 +1652,17 @@ export default function Workspace() {
 
   return (
     <div className="flex-1 flex flex-col h-full min-h-0 overflow-hidden relative">
-      {/* TOP ROW: ProjectToolbar — full width across all columns.
-          Divider под тулбаром НЕ здесь — он рендерится внутри TabSidebar, чтобы линия
-          обрывалась на границе сайдбара и не уходила в область терминала. */}
-      <div className="h-[30px] shrink-0">
-        <ProjectToolbar isSystemProject={isFocusedInboxProject} />
-      </div>
+      {/* Полоса кнопок во всю ширину окна стояла здесь и удалена 2026-08-18.
+          Она тянулась через весь экран ради десятка кнопок и отнимала высоту у
+          терминала постоянно. Кнопки проекта (файлы, история вкладок, VS Code,
+          индекс) уехали внутрь боковой панели вкладок — туда, где стоит их
+          проект; кнопки рабочей области (⌘P, Timeline, ресурсы, Docs, Git) —
+          наверх, в свободную правую часть шапки приложения. */}
 
-      {/* WHERE the active tab is. The directory belongs to the tab, not to the
-          project — see TabLocationBar. */}
-      <TabLocationBar />
-
+      {/* Строка с рабочей директорией жила здесь и переехала в шапку каждого
+          окна (SplitPaneAttachRow): полоса во всю ширину ради одной короткой
+          подписи была несоразмерна тому, что она сообщает, и отвечала только за
+          активную вкладку — пути остальных панелей не показывались вовсе. */}
 
       {/* MAIN ROW: TabSidebar | Terminal. */}
       <div className="flex-1 flex min-h-0 relative">
@@ -1766,7 +1768,15 @@ export default function Workspace() {
                 measured height of the docked input, so the strip stops above
                 the composer instead of running under it. In terminal-primary
                 that same measurement is what shifts the terminal upward, so
-                both surfaces read one number and cannot disagree. */}
+                both surfaces read one number and cannot disagree.
+
+                Слой ВЫШЕ бокового окна (у того 130). Полоска перестала
+                отходить влево при его открытии — уступать место окну, которое
+                закрывается одной клавишей, ей нечего, — и на прежнем слое 120
+                это означало не «стоит на месте», а «спряталась под ним». Она
+                принадлежит рабочей области, а боковое окно — временный гость
+                поверх центра: гость не может закрывать собой постоянный
+                орган управления. */}
             {(historyIsPrimary || historyIsAgentSidePanel) && (
               <div
                 id={promptQueuePortalHostId}
@@ -1778,7 +1788,7 @@ export default function Workspace() {
                   left: 0,
                   right: 0,
                   bottom: Math.max(0, historyControlsHeight),
-                  zIndex: 120,
+                  zIndex: 140,
                   pointerEvents: 'none',
                 }}
               />
@@ -1831,10 +1841,10 @@ export default function Workspace() {
 
           {/* Claude control bar — Provider/Model/Effort/Think + Ctx meter +
               SessionActionChip (Start/Continue/Stop). Visible on every Terminal
-              column (any tabType except 'browser'). Without a live AI session
+              column (any tabType except a linked file). Without a live AI session
               the bar dims the right cluster and shows a Start-capable chip so
               the user can spawn Claude from any terminal. */}
-          {!splitActiveLayout && effectiveTab && currentView === 'terminal' && effectiveTabType !== 'browser' && effectiveTabType !== 'file' && (
+          {!splitActiveLayout && effectiveTab && currentView === 'terminal' && effectiveTabType !== 'file' && (
             <ClaudeControlBar
               tabId={effectiveTab.id}
               projectId={activeProjectId}
@@ -1905,7 +1915,7 @@ export default function Workspace() {
         const { sidebarExpandedDirs, sidebarScrollTop } = getSidebarState(activeProjectId);
         const effectiveSidebarWidth = sidebarWidth || 280;
         return ReactDOM.createPortal(
-          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: TOP_STRIP_H, bottom: 0, width: effectiveSidebarWidth, zIndex: 2147482000, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
+          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: EXPLORER_TOP_H, bottom: 0, width: effectiveSidebarWidth, zIndex: 2147482000, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
             <Sidebar
               key={activeProjectId}
               folderPath={explorerPath}

@@ -39,8 +39,28 @@ export const MarkdownCodeBlock: React.FC<{ language: string; code: string }> = (
         language={language || 'text'}
         style={oneDark as any}
         PreTag="div"
-        customStyle={{ margin: 0, padding: '10px 12px', background: 'transparent', fontSize: '0.92em' }}
-        codeTagProps={{ style: { fontFamily: 'inherit' } }}
+        className="cb-code-scroll"
+        customStyle={{
+          margin: 0,
+          padding: '10px 12px',
+          background: 'transparent',
+          fontSize: '0.92em',
+          lineHeight: 1.5,
+          maxHeight: 'var(--cb-markdown-code-max-height, 43.4em)',
+          overflowX: 'hidden',
+          overflowY: 'auto',
+          whiteSpace: 'pre-wrap',
+          overflowWrap: 'anywhere',
+          wordBreak: 'break-word',
+        }}
+        codeTagProps={{
+          style: {
+            fontFamily: 'inherit',
+            whiteSpace: 'pre-wrap',
+            overflowWrap: 'anywhere',
+            wordBreak: 'break-word',
+          },
+        }}
       >
         {code}
       </SyntaxHighlighter>

@@ -54,7 +54,9 @@ test('a late confirmation clears only the notice owned by its exact handoff', ()
 
 test('known unavailable image warns persistently without disabling Send', () => {
   const availabilityStart = source.indexOf('const canAcceptSubmitIntent =');
-  const availabilityEnd = source.indexOf('\n  const terminalOnlySlashDraft', availabilityStart);
+  // Правой границей был `terminalOnlySlashDraft` — флаг запрета slash-команд,
+  // удалённый вместе с самим запретом. Границу держит следующее объявление.
+  const availabilityEnd = source.indexOf('\n  const canSend =', availabilityStart);
   assert.ok(availabilityStart >= 0 && availabilityEnd > availabilityStart);
   const availability = source.slice(availabilityStart, availabilityEnd);
   assert.match(availability, /!derivedDraftImageNotice\?\.blocking/);

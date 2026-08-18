@@ -6,7 +6,7 @@ import TabTaskPlanPanel from './TabTaskPlanPanel';
 import Timeline from './Timeline';
 import ClaudeControlBar from './ClaudeControlBar';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
-import type { AgentLifecycleSummary } from './agentLifecycleSummary';
+import { useAgentLifecycle } from './useAgentLifecycle';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -21,13 +21,6 @@ interface SplitPaneSurfaceProps {
   projectId: string;
   tabId: string;
   focused: boolean;
-  /**
-   * Start/stop/interrupted status of the agent in THIS pane, shown inside the
-   * pane's own transcript header. Panes had no such wiring, which is why the
-   * floating status card could not simply be deleted: without this, a pane
-   * would have had no way to say "loading session" at all.
-   */
-  lifecycleStatus?: AgentLifecycleSummary | null;
   /** This pane shares its column with another, so it is roughly half height. */
   stacked?: boolean;
   children: ReactNode;
@@ -48,13 +41,9 @@ export default function SplitPaneSurface({
   projectId,
   tabId,
   focused,
-  lifecycleStatus = null,
   stacked = false,
   children,
 }: SplitPaneSurfaceProps) {
-  // Only the pane whose tab the status is ABOUT may show it — panes belong to
-  // different tabs, and a neighbour's "loading session" would be a lie here.
-  const paneLifecycleStatus = lifecycleStatus?.tabId === tabId ? lifecycleStatus : null;
   const tabType = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
   const commandType = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.commandType || null);
   const claudeSessionId = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.claudeSessionId || '');
@@ -65,6 +54,19 @@ export default function SplitPaneSurface({
   const aiBusy = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.aiBusy === true);
   const projectPath = useWorkspaceStore((state) => state.openProjects.get(projectId)?.projectPath || cwd);
   const workspaceVisible = useWorkspaceStore((state) => state.view === 'workspace');
+  // Панель СОБИРАЕТ состояние своей вкладки сама, а не получает пропом сверху.
+  //
+  // Раньше сводка приходила из `TerminalArea` в одном экземпляре и строилась для
+  // АКТИВНОЙ вкладки, а панель лишь фильтровала её по `tabId`. Фильтр был верным,
+  // но фильтровать было нечего: для неактивной вкладки состояние не строилось
+  // вовсе, поэтому во второй панели сплита «CLAUDE START FAILED» не появлялся
+  // никогда. Свой экземпляр машины на панель — единственный способ сделать
+  // плашку свойством процесса, а не фокуса.
+  const paneLifecycleStatus = useAgentLifecycle({
+    projectId,
+    tabId,
+    enabled: workspaceVisible,
+  });
   const terminalIsPrimary = useUIStore((state) => resolveTabTerminalPrimary(state, tabId));
   const setTabTerminalIsPrimary = useUIStore((state) => state.setTabTerminalIsPrimary);
   const historyPanelWidth = useUIStore((state) => state.historyPanelWidth);
@@ -82,7 +84,6 @@ export default function SplitPaneSurface({
   });
   const isCodex = ptyAgentOwner === 'codex';
   const isAgentTab = tabType !== 'claude-sdk'
-    && tabType !== 'browser'
     && tabType !== 'file'
     && ptyAgentOwner !== null;
   const historySelected = isAgentTab && !terminalIsPrimary;
@@ -143,7 +144,7 @@ export default function SplitPaneSurface({
   }, [setHistoryPanelOpen, tabId]);
 
   const composerHostId = splitPaneComposerHostId(tabId);
-  const showControlBar = tabType !== 'browser' && tabType !== 'file';
+  const showControlBar = tabType !== 'file';
 
   // Height of the transcript's docked controls (composer). The terminal keeps
   // stable PTY geometry and is shifted/cropped above this overlay.

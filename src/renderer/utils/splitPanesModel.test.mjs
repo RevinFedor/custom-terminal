@@ -26,6 +26,16 @@ import {
   splitAvailability,
   emptyPaneByClosedTab,
   PANE_HISTORY_CAP,
+  paneTabs,
+  paneHoldsTab,
+  addTabToPane,
+  removeTabFromPane,
+  dropTabFromAllPaneStrips,
+  reorderPaneTab,
+  allPaneTabIds,
+  paneIndexHoldingTab,
+  arrangePanes,
+  describeWorkspace,
 } from './splitPanesModel.mjs';
 
 const p = (projectId, tabId) => ({ projectId, tabId });
@@ -37,12 +47,20 @@ test('addPane: single mode → two panes, focus on the added one', () => {
   assert.equal(res.focusedIndex, 1);
 });
 
-test('addPane: rejects duplicates and >3 panes', () => {
+test('addPane: rejects duplicates, but never refuses on count', () => {
+  // The count caps were removed 2026-08-17 — *«ограничение на количество окон
+  // быть не должно»*. Readability is protected by SPLIT_MIN_FRACTION and by the
+  // draggable dividers, which the user can see and control; a hard number only
+  // refused a layout they had explicitly asked for.
   const two = [p('p1', 'a'), p('p2', 'b')];
-  assert.equal(addPane(two, 0, null, p('p1', 'a')), null);
-  const three = addPane(two, 0, null, p('p1', 'c')).panes;
-  assert.equal(three.length, 3);
-  assert.equal(addPane(three, 0, null, p('p1', 'd')), null);
+  assert.equal(addPane(two, 0, null, p('p1', 'a')), null, 'a duplicate is still refused');
+  let panes = two;
+  for (const tabId of ['c', 'd', 'e', 'f', 'g']) {
+    const res = addPane(panes, 0, null, p('p1', tabId));
+    assert.ok(res, `pane ${tabId} must be accepted`);
+    panes = res.panes;
+  }
+  assert.equal(panes.length, 7);
 });
 
 test('addPane fills an existing empty placeholder instead of appending', () => {
@@ -82,8 +100,12 @@ test('addEmptyPane: single → [current, empty] focused on empty; one placeholde
   assert.equal(res.focusedIndex, 1);
   assert.equal(isEmptyPane(res.panes[1]), true);
   assert.equal(addEmptyPane(res.panes, 1, null), null); // second placeholder refused
+  // …and that unfilled placeholder is now the ONLY reason to refuse: a full
+  // layout no longer exists (count caps removed 2026-08-17).
   const three = [p('p1', 'a'), p('p2', 'b'), p('p3', 'c')];
-  assert.equal(addEmptyPane(three, 0, null), null); // full
+  const fourth = addEmptyPane(three, 0, null);
+  assert.ok(fourth, 'a fourth column must be allowed');
+  assert.equal(fourth.panes.length, 4);
 });
 
 test('addEmptyPane inserts the placeholder right after the pressed pane', () => {
@@ -263,54 +285,55 @@ test('addEmptyPaneVertical refuses a second placeholder', () => {
   assert.equal(addEmptyPaneVertical(withEmpty, 0, null, 0, 'below'), null);
 });
 
-// THE BUG THIS REPLACES: the cap used to be a flat "at most 3 panes", written
-// when a pane and a column were the same thing. After vertical splitting
-// arrived that number silently stopped capping COLUMNS and started capping the
-// whole grid — so with three columns open, stacking any of them was refused
-// even though the layout is only three columns wide. Reported live: «кнопка,
-// отвечающая за разделение, тупо пропала» (it also VANISHED rather than
-// greying out, which is why it read as a missing button rather than a limit).
-test('stacking is capped per COLUMN, not by the total pane count', () => {
+// THE HISTORY THIS REPLACES, kept because it is a warning about counting the
+// wrong thing. The cap started as a flat "at most 3 panes", written when a pane
+// and a column were the same thing. Vertical splitting arrived and that number
+// silently stopped capping COLUMNS and started capping the whole grid — with
+// three columns open, stacking any of them was refused. Reported then: «кнопка,
+// отвечающая за разделение, тупо пропала». Splitting it into two caps fixed that
+// and multiplied them into a third, invisible limit of six panes, which is what
+// the user hit next: *«я открыл 4 окна и новые создать не могу»*. Both caps
+// removed 2026-08-17; readability is protected by SPLIT_MIN_FRACTION and the
+// draggable dividers, which the user can actually see.
+test('stacking a column is never refused on count', () => {
   const three = [p('p1', 'a'), p('p2', 'b'), p('p3', 'c')];
   const res = addEmptyPaneVertical(three, 0, null, 0, 'below');
   assert.ok(res, 'three columns still allow stacking one of them');
   assert.equal(paneColumns(res.panes).length, 3, 'still three columns');
   assert.equal(paneColumns(res.panes)[0].length, 2, 'the first column now has two rows');
-  // …and a column that already holds two rows refuses a third.
+  // The placeholder still blocks — that rule is about an UNFINISHED GESTURE,
+  // not about size, so it survives the removal of the caps.
   assert.equal(addEmptyPaneVertical(res.panes, 0, null, 0, 'below'), null,
     'the placeholder blocks it now');
   const filled = resolveSplitActivation(res.panes, 1, 'p1', 'd').panes;
-  assert.equal(addEmptyPaneVertical(filled, 0, null, 0, 'below'), null,
-    'and a full column refuses a third row');
-  // A full column must not block its NEIGHBOUR, which is still one row deep.
-  const neighbourIndex = filled.findIndex((pane, i) => pane.tabId === 'b');
-  assert.ok(addEmptyPaneVertical(filled, 0, null, neighbourIndex, 'below'),
-    'the neighbouring column can still be stacked');
+  const third = addEmptyPaneVertical(filled, 0, null, 0, 'below');
+  assert.ok(third, 'a third row in the same column is allowed');
+  assert.equal(paneColumns(third.panes)[0].length, 3);
 });
 
-test('a new COLUMN is capped at three, whatever the rows hold', () => {
+test('a new COLUMN is never refused on count either', () => {
   const three = [p('p1', 'a'), p('p2', 'b'), p('p3', 'c')];
-  assert.equal(addEmptyPane(three, 0, null, 0), null, 'no fourth column');
-  assert.equal(addPane(three, 0, null, p('p4', 'd')), null, 'and none by "add to workspace"');
-  // Two columns, one of them stacked = 3 panes — a third column is still free.
+  assert.ok(addEmptyPane(three, 0, null, 0), 'a fourth column is allowed');
+  assert.ok(addPane(three, 0, null, p('p4', 'd')), 'and so is "add to workspace"');
+  // Two columns, one of them stacked — a new column still opens beside them.
   const stacked = addEmptyPaneVertical([p('p1', 'a'), p('p2', 'b')], 0, null, 0, 'below').panes;
   const filled = resolveSplitActivation(stacked, 1, 'p1', 'c').panes;
   assert.equal(filled.length, 3, 'three panes');
-  assert.ok(addPane(filled, 0, null, p('p4', 'd')), 'but only two columns, so one more fits');
+  assert.ok(addPane(filled, 0, null, p('p4', 'd')));
 });
 
-test('splitAvailability answers each direction separately', () => {
+test('splitAvailability: only an unfilled placeholder can refuse', () => {
   const three = [p('p1', 'a'), p('p2', 'b'), p('p3', 'c')];
-  assert.deepEqual(splitAvailability(three, 0), { horizontal: false, vertical: true, reason: null });
+  assert.deepEqual(splitAvailability(three, 0), { horizontal: true, vertical: true, reason: null });
   const stackedFirst = addEmptyPaneVertical(three, 0, null, 0, 'below').panes;
-  // A placeholder blocks everything until it is filled.
+  // A placeholder blocks everything until it is filled — an unfinished gesture,
+  // not a size limit, so this is the one refusal that survives.
   assert.deepEqual(splitAvailability(stackedFirst, 0),
     { horizontal: false, vertical: false, reason: 'placeholder' });
   const filled = resolveSplitActivation(stackedFirst, 1, 'p1', 'd').panes;
-  assert.deepEqual(splitAvailability(filled, 0),
-    { horizontal: false, vertical: false, reason: 'columns-full' }, 'this column is full too');
-  assert.deepEqual(splitAvailability(filled, 2), { horizontal: false, vertical: true, reason: null },
-    'the neighbour still has room below');
+  assert.deepEqual(splitAvailability(filled, 0), { horizontal: true, vertical: true, reason: null },
+    'an already stacked column still splits both ways');
+  assert.deepEqual(splitAvailability(filled, 2), { horizontal: true, vertical: true, reason: null });
   // Single mode: both directions are open.
   assert.deepEqual(splitAvailability([], 0), { horizontal: true, vertical: true, reason: null });
 });
@@ -660,4 +683,330 @@ test('ДВА окна ведут себя так же, как три: второ
 test('вкладка не из панели ничего не меняет', () => {
   assert.equal(emptyPaneByClosedTab([p('p1', 'a'), p('p2', 'b')], 0, 'zzz'), null);
   assert.equal(emptyPaneByClosedTab([], 0, 'a'), null);
+});
+
+// ── Полоса вкладок в одном окне ───────────────────────────────────────────
+//
+// Окно перестало быть «одна вкладка» и стало «список вкладок, одна показана».
+// Тесты ниже держат ровно эту границу: что меняет состав полосы, а что — только
+// то, какая из уже лежащих в ней вкладок сейчас на экране.
+
+test('полоса: одиночное окно хранится в старой форме, вторая вкладка её создаёт', () => {
+  const one = [p('p1', 'a'), p('p2', 'b')];
+  // Одна вкладка — поля `tabs` нет вовсе: сессии, записанные до полосы,
+  // восстанавливаются байт в байт (то же правило, что у `column`).
+  assert.equal('tabs' in one[0], false);
+  assert.deepEqual(paneTabs(one[0]), [p('p1', 'a')]);
+
+  const grown = addTabToPane(one, 0, 'p1', 'c');
+  assert.deepEqual(grown.panes[0].tabs, [p('p1', 'a'), p('p1', 'c')]);
+  // Показана новая, и `tabId` по-прежнему значит «что на экране» — ради этого
+  // ни один старый читатель не переписывался.
+  assert.equal(grown.panes[0].tabId, 'c');
+  // Соседнее окно не тронуто.
+  assert.equal(grown.panes[1], one[1]);
+});
+
+test('полоса помнит проект каждой вкладки — окна кросс-проектные', () => {
+  const panes = [p('p1', 'a'), p('p2', 'b')];
+  const res = addTabToPane(panes, 0, 'p9', 'z');
+  assert.deepEqual(res.panes[0].tabs, [p('p1', 'a'), p('p9', 'z')]);
+  // Проект самой панели следует за показанной вкладкой — именно это значение
+  // читают все существующие потребители `pane.projectId`.
+  assert.equal(res.panes[0].projectId, 'p9');
+});
+
+test('обычная навигация НЕ растит полосу — заменяет показанную вкладку на месте', () => {
+  const panes = addTabToPane([p('p1', 'a'), p('p2', 'b')], 0, 'p1', 'c').panes;
+  // Показана 'c', в полосе [a, c].
+  const res = resolveSplitActivation(panes, 0, 'p1', 'zzz');
+  assert.deepEqual(res.panes[0].tabs, [p('p1', 'a'), p('p1', 'zzz')]);
+  assert.equal(res.panes[0].tabId, 'zzz');
+  // Иначе полоса за час работы съела бы весь список вкладок — и вместе с ним
+  // весь Ctrl+Tab, который по правилу пропускает всё, что лежит в окнах.
+});
+
+test('активация вкладки, у которой уже есть чип, идёт В ЕЁ окно', () => {
+  const panes = addTabToPane([p('p1', 'a'), p('p2', 'b')], 0, 'p1', 'c').panes;
+  // Фокус на втором окне, активируем 'a' — она чип первого окна.
+  const res = resolveSplitActivation(panes, 1, 'p1', 'a');
+  assert.equal(res.focusedIndex, 0, 'фокус переходит к окну вкладки');
+  assert.equal(res.panes[0].tabId, 'a');
+  // Состав обеих полос не изменился: вкладка не выдёргивается в чужое окно.
+  assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['a', 'c']);
+  assert.equal(res.panes[1].tabId, 'b');
+});
+
+test('уже показанная вкладка: только фокус, ничего не переписывается', () => {
+  const panes = addTabToPane([p('p1', 'a'), p('p2', 'b')], 0, 'p1', 'c').panes;
+  const res = resolveSplitActivation(panes, 1, 'p1', 'c');
+  assert.equal(res.panes, panes, 'массив тот же по ссылке');
+  assert.equal(res.focusedIndex, 0);
+});
+
+test('закрытие чипа: показ переходит к СОСЕДУ, окно остаётся', () => {
+  let panes = [p('p1', 'a'), p('p2', 'b')];
+  panes = addTabToPane(panes, 0, 'p1', 'c').panes;
+  panes = addTabToPane(panes, 0, 'p1', 'd').panes; // [a, c, d], показана d
+  const mid = removeTabFromPane(panes, 0, 'c');
+  assert.deepEqual(paneTabs(mid.panes[0]).map((e) => e.tabId), ['a', 'd']);
+  assert.equal(mid.panes[0].tabId, 'd', 'показанная не менялась — убрали другой чип');
+
+  const shown = removeTabFromPane(mid.panes, 0, 'd');
+  // Соседа справа нет — берём слева. Не «самую свежую» и не «первую»: полоса
+  // это карта, и после закрытия глаз уже там, где сосед.
+  assert.equal(shown.panes[0].tabId, 'a');
+  assert.equal(shown.emptied, false);
+});
+
+test('последний чип ушёл — окно пустеет, но не закрывается', () => {
+  const panes = [p('p1', 'a'), p('p2', 'b')];
+  const res = removeTabFromPane(panes, 0, 'a');
+  assert.equal(res.emptied, true);
+  assert.equal(isEmptyPane(res.panes[0]), true);
+  assert.equal(res.panes.length, 2, 'окно осталось: очистить содержимое ≠ закрыть окно');
+});
+
+test('закрытая вкладка исчезает из ВСЕХ полос', () => {
+  let panes = [p('p1', 'a'), p('p2', 'b')];
+  panes = addTabToPane(panes, 1, 'p1', 'a2').panes;
+  const res = dropTabFromAllPaneStrips(panes, 'a2');
+  assert.deepEqual(paneTabs(res.panes[1]).map((e) => e.tabId), ['b']);
+  assert.equal(dropTabFromAllPaneStrips(panes, 'нет-такой'), null);
+});
+
+test('вкладка живёт ровно в одном окне', () => {
+  const panes = addTabToPane([p('p1', 'a'), p('p2', 'b')], 0, 'p1', 'c').panes;
+  // Один живой терминал нельзя нарисовать в двух местах, поэтому «добавить в
+  // рабочую область» отказывает и для НЕпоказанного чипа тоже.
+  assert.equal(addPane(panes, 0, null, p('p1', 'c')), null);
+  assert.equal(paneIndexHoldingTab(panes, 'c'), 0);
+  assert.deepEqual(allPaneTabIds(panes), ['a', 'c', 'b']);
+});
+
+test('положить вкладку в окно значит ЗАБРАТЬ её из прежнего', () => {
+  // Живой терминал — один узел, и рисует его то окно, которое вкладку
+  // показывает. Второе окно, назвавшее ту же вкладку, теряет вообще всё, включая
+  // шапку: человек видит чёрный прямоугольник и говорит «окно тупо пропало».
+  let panes = [p('p1', 'a'), p('p2', 'b')];
+  panes = addTabToPane(panes, 1, 'p2', 'b2').panes; // окно 1: [b, b2]
+  const res = addTabToPane(panes, 0, 'p2', 'b2');   // «перенести b2 в окно 0»
+  assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['a', 'b2']);
+  assert.deepEqual(paneTabs(res.panes[1]).map((e) => e.tabId), ['b'], 'чип переезжает, а не копируется');
+  assert.equal(paneIndexHoldingTab(res.panes, 'b2'), 0);
+  // Проект чипа переезжает вместе с ним: полосы кросс-проектные.
+  assert.equal(res.panes[0].projectId, 'p2');
+  assert.deepEqual(res.emptied, [], 'прежнее окно не опустело — там остался b');
+});
+
+test('окно, отдавшее последний чип, становится «нет вкладки», а не закрывается', () => {
+  // Ровно то, чего человек и ждёт: «должна была переместиться, а на её месте —
+  // отсутствие вкладок».
+  const res = addTabToPane([p('p1', 'a'), p('p2', 'b')], 0, 'p2', 'b');
+  assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['a', 'b']);
+  assert.equal(isEmptyPane(res.panes[1]), true);
+  assert.equal(res.panes.length, 2, 'окно осталось на своём месте');
+  // Индексы не поехали — и место, куда клали, всё ещё то самое.
+  assert.deepEqual(res.emptied, [1]);
+});
+
+test('перенос в окно, где чип уже лежит: просто показать', () => {
+  let panes = [p('p1', 'a'), p('p2', 'b')];
+  panes = addTabToPane(panes, 0, 'p1', 'c').panes; // окно 0: [a, c], показана c
+  const res = addTabToPane(panes, 0, 'p1', 'a');
+  assert.equal(res.panes[0].tabId, 'a');
+  assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['a', 'c'], 'порядок полосы не трогаем');
+  // Показана и лежит здесь же — менять нечего.
+  assert.equal(addTabToPane(res.panes, 0, 'p1', 'a'), null);
+});
+
+test('восстановление снимает дубликат: показывающее окно оставляет вкладку себе', () => {
+  // Раскладка приходит с диска и может быть старше правила «одна вкладка — одно
+  // окно». Пережить перезапуск такое состояние не должно.
+  const saved = [
+    { projectId: 'p1', tabId: 'a', tabs: [p('p1', 'a'), p('p2', 'b')] }, // b лежит чипом
+    { projectId: 'p2', tabId: 'b' },                                     // и показана здесь
+  ];
+  const res = sanitizePanes(saved, 0, () => true);
+  assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['a']);
+  assert.deepEqual(paneTabs(res.panes[1]).map((e) => e.tabId), ['b'], 'право у того, кто рисует');
+  assert.equal(res.panes.length, 2);
+});
+
+test('карта окон: полая клетка — «лежит здесь, но показана другая»', () => {
+  const panes = addTabToPane([p('p1', 'a'), p('p2', 'b')], 0, 'p1', 'c').panes;
+  // 'c' показана в первом окне, 'a' в нём же лежит чипом.
+  assert.deepEqual(paneMapCells(panes, 0, 'p1', 'c'), [
+    { mine: true, state: 'self-focused' },
+    { mine: false, state: 'other' },
+  ]);
+  assert.deepEqual(paneMapCells(panes, 0, 'p1', 'a'), [
+    { mine: true, state: 'held' },
+    { mine: false, state: 'other' },
+  ]);
+  // Та же вкладка в другом проекте — не эта вкладка.
+  assert.deepEqual(paneMapCells(panes, 0, 'p9', 'a'), []);
+});
+
+test('перетаскивание чипа меняет порядок, но не показ', () => {
+  let panes = [p('p1', 'a'), p('p2', 'b')];
+  panes = addTabToPane(panes, 0, 'p1', 'c').panes;
+  panes = addTabToPane(panes, 0, 'p1', 'd').panes; // [a, c, d], показана d
+  const res = reorderPaneTab(panes, 0, 'd', 0);
+  assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['d', 'a', 'c']);
+  assert.equal(res.panes[0].tabId, 'd');
+  assert.equal(reorderPaneTab(res.panes, 0, 'd', 0), null, 'сдвиг на место — не запись');
+});
+
+test('закрытие проекта убирает его чипы, а окно с чужими остаётся', () => {
+  let panes = [p('p1', 'a'), p('p2', 'b'), p('p1', 'c')];
+  panes = addTabToPane(panes, 0, 'p2', 'x').panes; // окно 0: [a(p1), x(p2)]
+  const res = removePanesByProject(panes, 0, 'p1');
+  // Окно 0 выжило на чужом чипе; окно, целиком принадлежавшее p1, ушло.
+  assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['x']);
+  assert.equal(res.panes.length, 2);
+});
+
+test('восстановление чистит полосу, а не выбрасывает окно целиком', () => {
+  let panes = [p('p1', 'a'), p('p2', 'b')];
+  panes = addTabToPane(panes, 0, 'p1', 'dead').panes; // показана мёртвая
+  const alive = (projectId, tabId) => tabId !== 'dead';
+  const res = sanitizePanes(panes, 0, alive);
+  // Раньше мёртвая ПОКАЗАННАЯ вкладка убивала окно вместе с живыми чипами.
+  assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['a']);
+  assert.equal(res.panes[0].tabId, 'a');
+  assert.equal(res.panes.length, 2);
+});
+
+// ── Раскладка целиком, одним вызовом (для Terminal MCP) ───────────────────
+//
+// Всё, что выше, — ЖЕСТЫ: один клик и его защиты. Вызывающий по API не делает
+// жестов, он называет раскладку целиком. Собирать её из жестов — это четыре
+// обращения, каждое из которых может наполовину не удаться, а защита «одна
+// пустая панель за раз» вторую и вовсе отклонит.
+
+test('раскладка: две вкладки — два окна справа', () => {
+  const res = arrangePanes([], 0, {
+    side: 'right',
+    windows: [[p('p1', 'codex')], [p('p1', 'claude')]],
+  }, p('p1', 'a'));
+  // Центр стал первым окном, два новых встали справа, по колонке на каждое.
+  assert.deepEqual(res.panes.map((x) => x.tabId), ['a', 'codex', 'claude']);
+  assert.equal(res.panes.every((x) => x.column === undefined), true, 'чисто горизонтально — колонки не хранятся');
+  assert.equal(res.focusedIndex, 1, 'фокус на первом созданном');
+});
+
+test('раскладка: две вкладки — ОДНО окно с двумя чипами', () => {
+  // Та же просьба, но «внутри одного окна». Вложенность списка и есть эта
+  // разница — отдельный флаг не нужен.
+  const res = arrangePanes([], 0, {
+    side: 'right',
+    windows: [[p('p1', 'codex'), p('p1', 'claude')]],
+  }, p('p1', 'a'));
+  assert.equal(res.panes.length, 2);
+  assert.deepEqual(paneTabs(res.panes[1]).map((e) => e.tabId), ['codex', 'claude']);
+  assert.equal(res.panes[1].tabId, 'codex', 'показан первый названный');
+});
+
+test('раскладка: деление по горизонтали кладёт окна в одну колонку', () => {
+  const res = arrangePanes([], 0, {
+    side: 'right',
+    divide: 'rows',
+    windows: [[p('p1', 'codex')], [p('p1', 'claude')]],
+  }, p('p1', 'a'));
+  // Оба новых окна — строки одной колонки, а не две колонки.
+  assert.equal(res.panes[1].column, res.panes[2].column);
+  assert.notEqual(res.panes[0].column, res.panes[1].column);
+});
+
+test('раскладка: названная вкладка ПЕРЕЕЗЖАЕТ, а не копируется', () => {
+  const panes = [p('p1', 'a'), p('p1', 'codex')];
+  const res = arrangePanes(panes, 0, {
+    side: 'right',
+    windows: [[p('p1', 'codex')]],
+  });
+  // Вкладка живёт в одном окне: старое место освободилось и исчезло вместе с
+  // ним — оно показывало ровно ту вкладку, которую переставляли.
+  assert.equal(res.panes.filter((x) => x.tabId === 'codex').length, 1);
+  assert.deepEqual(res.panes.map((x) => x.tabId), ['a', 'codex']);
+});
+
+test('раскладка: пустое окно пользователя не трогается', () => {
+  const panes = [p('p1', 'a'), EMPTY];
+  const res = arrangePanes(panes, 0, {
+    side: 'right',
+    windows: [[p('p1', 'codex')]],
+  });
+  // Пустое окно оставлено намеренно — оно не мусор от этой перестановки.
+  assert.equal(res.panes.some(isEmptyPane), true);
+});
+
+test('раскладка: слева — значит слева', () => {
+  const res = arrangePanes([p('p1', 'a')], 0, {
+    side: 'left',
+    windows: [[p('p1', 'codex')]],
+  });
+  assert.deepEqual(res.panes.map((x) => x.tabId), ['codex', 'a']);
+});
+
+test('описание раскладки идёт в ЭКРАННОМ порядке', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  panes = addEmptyPaneVertical(panes, 0, null, 0, 'below').panes; // колонка 0: a, пусто
+  const view = describeWorkspace(panes, 0);
+  assert.equal(view.split, true);
+  assert.deepEqual(view.windows.map((w) => [w.column, w.row]), [[0, 0], [0, 1], [1, 0]]);
+  assert.equal(view.windows[1].empty, true);
+});
+
+test('описание: одиночный режим — одно окно с одной вкладкой', () => {
+  const view = describeWorkspace([], 0, p('p1', 'a'));
+  assert.equal(view.split, false);
+  assert.deepEqual(view.windows[0].tabs, [p('p1', 'a')]);
+  assert.equal(view.windows[0].focused, true);
+});
+
+test('«сверху» и «справа, разделив на два» — разные просьбы', () => {
+  const base = [p('p1', 'a'), p('p1', 'b')];
+  // «сверху»: новые окна встают в колонку САМОГО якоря.
+  const above = arrangePanes(base, 0, {
+    side: 'above',
+    windows: [[p('p1', 'x')]],
+  });
+  assert.equal(above.panes[0].column, above.panes[1].column, 'x встал над a, в его колонке');
+  assert.deepEqual(above.panes.map((e) => e.tabId), ['x', 'a', 'b']);
+
+  // «справа, раздели на два»: НОВАЯ колонка справа, поделённая на строки.
+  const right = arrangePanes(base, 0, {
+    side: 'right',
+    divide: 'rows',
+    windows: [[p('p1', 'x')], [p('p1', 'y')]],
+  });
+  const cols = right.panes.map((e) => e.column);
+  assert.equal(cols[1], cols[2], 'x и y — строки одной колонки');
+  assert.notEqual(cols[0], cols[1], 'и это НЕ колонка якоря');
+  assert.equal(cols[3], cols[1] + 1, 'колонка b сдвинулась ровно на одну');
+});
+
+test('раскладка: переставили ОДИН чип — окно с остальными живо', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  panes = addTabToPane(panes, 1, 'p1', 'c').panes; // второе окно: [b, c]
+  const res = arrangePanes(panes, 0, {
+    side: 'right',
+    windows: [[p('p1', 'c')]],
+  });
+  // Ушёл только 'c'. Окно 'b' не «потеряло последний чип» и осталось.
+  assert.equal(res.panes.some((x) => x.tabId === 'b'), true);
+  assert.deepEqual(res.panes.map((x) => x.tabId), ['a', 'c', 'b']);
+});
+
+test('раскладка: якорь может исчезнуть — тогда он же и переставляется', () => {
+  // Просьба «эту вкладку — справа», когда стоишь в её же окне: окно исчезает
+  // вместе с последним чипом, и относительно чего ставить — уже нечего.
+  // Раскладка не должна на этом падать.
+  const res = arrangePanes([p('p1', 'a'), p('p1', 'b')], 0, {
+    side: 'right',
+    windows: [[p('p1', 'a')]],
+  });
+  assert.deepEqual(res.panes.map((x) => x.tabId), ['b', 'a']);
+  assert.equal(res.focusedIndex, 1);
 });

@@ -4,6 +4,7 @@ const path = require('path');
 const {
   historyActionHeadline,
   historyActionPresentationMeta,
+  historyDisplayPath,
 } = require(path.join(__dirname, '..', 'shared', 'history-action-grammar.cjs'));
 
 function normalizePositiveInt(value, fallback = null, max = 20_000) {
@@ -139,7 +140,10 @@ function applyHistoryEntryWindow(entries, bounds = null) {
  *   - the last `alwaysHydrateTail` rows (the composer, tail-pin, live
  *     projection and "what just happened" all read the tail).
  */
-const HISTORY_ROW_STUB_FIELDS = ['uuid', 'role', 'timestamp', 'sessionId', 'messageId', 'textPhase'];
+const HISTORY_ROW_STUB_FIELDS = [
+  'uuid', 'role', 'timestamp', 'sessionId', 'messageId', 'textPhase',
+  'preTokens', 'postTokens', 'compactEncrypted',
+];
 
 /**
  * Grouping metadata a stub must keep. The display-side series collapsing
@@ -207,12 +211,7 @@ function stubActionSubject(raw) {
       mcpMethod: raw.mcpMethod,
     });
     const subject = String(headline.subject || '');
-    if (!subject) return undefined;
-    if (subject.includes('/')) {
-      const parts = subject.split('/').filter(Boolean);
-      return parts[parts.length - 1] || undefined;
-    }
-    return subject.length > 60 ? subject.slice(0, 60) : subject;
+    return subject ? historyDisplayPath(subject) : undefined;
   } catch {
     return undefined;
   }
@@ -226,6 +225,13 @@ function makeHistoryRowStub(entry) {
   // sourceIdentity is how live rows and durable rows recognise each other;
   // dropping it would make a live row duplicate its own durable twin.
   if (entry.sourceIdentity !== undefined) stub.sourceIdentity = entry.sourceIdentity;
+  // A Codex response_item may later be promoted to its paired event_msg. The
+  // earlier exact identity remains an alias of the same row and is required
+  // to retire a durable local SENT/CONFIRMING card even while the old row is
+  // outside the hydrated viewport.
+  if (entry.sourceIdentityAliases !== undefined) {
+    stub.sourceIdentityAliases = entry.sourceIdentityAliases;
+  }
   // Whether the row has visible text matters to grouping (text ends a series);
   // ship the fact without the content.
   if (typeof entry.content === 'string' && entry.content.trim()) stub.hasContent = true;

@@ -422,6 +422,33 @@ test('image response carrier aliases the canonical event row without creating a 
   }
 });
 
+test('provider image block is presented as one clean History and Timeline marker', () => {
+  const imagePath = '/tmp/noted-terminal-codex-image-input/incident.png';
+  const message = `<image name=[Image #1] path="${imagePath}"> [Image] </image>[Image #1] fix colors`;
+  const record = {
+    __line: 40,
+    __byteOffset: 4000,
+    timestamp: '2026-08-17T16:06:30.049Z',
+    type: 'event_msg',
+    payload: {
+      type: 'user_message',
+      message,
+      images: [imagePath],
+    },
+  };
+
+  const history = createCodexHistoryProjector('provider-image-session');
+  const timeline = createCodexTimelineProjector('provider-image-session');
+  history.feed(record);
+  timeline.feed(record);
+
+  const historyUser = history.finalize().find((entry) => entry.role === 'user');
+  const timelineUser = timeline.finalize().find((entry) => entry.type === 'user');
+  assert.equal(historyUser?.content, ' [Image #1] fix colors');
+  assert.equal(timelineUser?.content, ' [Image #1] fix colors');
+  assert.equal(timelineUser?.hasImage, true);
+});
+
 test('two byte-identical paired sends keep separate canonical events and FIFO response aliases', () => {
   const records = [
     {

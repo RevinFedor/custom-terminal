@@ -48,6 +48,7 @@ function createTerminalHistoryPreviewController({
   if (typeof emit !== 'function') throw new TypeError('emit is required');
 
   const turns = new Map();
+  const semanticAuthorities = new Map();
 
   const writeLog = (level, event, state, detail = {}) => {
     const fn = level === 'error'
@@ -85,6 +86,7 @@ function createTerminalHistoryPreviewController({
     writeSeq: state.writeSeq,
     previewSeq: state.previewSeq,
     phase: state.phase,
+    sourceMode: state.sourceMode || 'screen',
     text: state.text,
     textHash: state.text ? previewTextHash(state.text) : null,
     startedAt: state.startedAt,
@@ -257,6 +259,207 @@ function createTerminalHistoryPreviewController({
     return cleared;
   };
 
+  const activateSemanticSource = ({ tabId, instanceId, processId = null } = {}) => {
+    if (!tabId || !instanceId) return false;
+    const previous = semanticAuthorities.get(tabId) || null;
+    const authority = {
+      instanceId: String(instanceId),
+      processId: finiteNumberOrNull(processId),
+      connected: true,
+      expected: true,
+      gap: false,
+    };
+    semanticAuthorities.set(tabId, authority);
+    const state = turns.get(tabId);
+    if (state?.provider === 'codex') {
+      cancelPendingEmission(state);
+      if (state.text && state.sourceMode !== 'semantic') {
+        emitAction(state, 'clear', 'semantic-authority-established');
+      }
+      state.text = '';
+      state.sourceMode = 'semantic';
+      state.semanticInstanceId = authority.instanceId;
+      state.semanticGap = false;
+      state.semanticItems = new Map();
+      state.semanticItemOrder = [];
+      state.lastMergeReason = 'semantic-authority-established';
+      state.lastUnknownKey = null;
+      state.coalescedFrames = 0;
+    }
+    writeLog('log', 'SEMANTIC_AUTHORITY', state || {
+      tabId,
+      provider: 'codex',
+      phase: 'idle',
+    }, {
+      instance: short(instanceId, 18),
+      pid: authority.processId ?? '-',
+      replaced: previous?.instanceId && previous.instanceId !== authority.instanceId,
+    });
+    return true;
+  };
+
+  const expectSemanticSource = ({ tabId } = {}) => {
+    if (!tabId) return false;
+    const previous = semanticAuthorities.get(tabId) || {};
+    semanticAuthorities.set(tabId, {
+      ...previous,
+      expected: true,
+      connected: previous.connected === true,
+    });
+    return true;
+  };
+
+  const disconnectSemanticSource = ({ tabId, instanceId, reason = 'disconnect' } = {}) => {
+    const authority = semanticAuthorities.get(tabId);
+    if (!authority || (instanceId && authority.instanceId !== instanceId)) return false;
+    authority.connected = false;
+    const state = turns.get(tabId);
+    if (state?.sourceMode === 'semantic' && state.semanticInstanceId === authority.instanceId) {
+      state.semanticGap = true;
+      writeLog('warn', 'SEMANTIC_FREEZE', state, {
+        reason,
+        instance: short(authority.instanceId, 18),
+      });
+    }
+    return true;
+  };
+
+  const clearSemanticSource = (tabId, reason = 'clear') => {
+    const authority = semanticAuthorities.get(tabId);
+    if (!authority) return false;
+    semanticAuthorities.delete(tabId);
+    const state = turns.get(tabId);
+    if (state?.sourceMode === 'semantic') {
+      writeLog('log', 'SEMANTIC_RELEASE', state, {
+        reason,
+        instance: short(authority.instanceId, 18),
+      });
+    }
+    return true;
+  };
+
+  const semanticText = (state) => state.semanticItemOrder
+    .map((itemId) => state.semanticItems.get(itemId)?.text || '')
+    .filter((text) => text.length > 0)
+    .join('\n\n');
+
+  const setSemanticText = (state, reason) => {
+    const fullText = semanticText(state);
+    const nextText = fullText.length > MAX_PREVIEW_CHARS
+      ? fullText.slice(fullText.length - MAX_PREVIEW_CHARS)
+      : fullText;
+    if (nextText === state.text) return false;
+    cancelPendingEmission(state);
+    const previousText = state.text;
+    state.text = nextText;
+    state.truncated = fullText.length > MAX_PREVIEW_CHARS;
+    state.lastMergeReason = reason;
+    state.lastFrameReason = reason;
+    state.lastUnknownKey = null;
+    if (!nextText) {
+      if (previousText && state.previewSeq > 0) {
+        emitAction(state, 'clear', reason);
+      }
+      return true;
+    }
+    scheduleFramePublication(state);
+    return true;
+  };
+
+  const ensureSemanticTurn = ({ tabId, threadId = null, turnId = null, instanceId } = {}) => {
+    let state = turns.get(tabId);
+    if (!state
+      || state.provider !== 'codex'
+      || (turnId && state.turnId && state.turnId !== turnId)) {
+      begin({
+        tabId,
+        provider: 'codex',
+        sessionId: threadId,
+        turnId,
+        promptSource: 'codex-semantic-channel',
+      });
+      state = turns.get(tabId);
+    }
+    if (!state) return null;
+    state.sourceMode = 'semantic';
+    state.semanticInstanceId = instanceId;
+    if (!(state.semanticItems instanceof Map)) state.semanticItems = new Map();
+    if (!Array.isArray(state.semanticItemOrder)) state.semanticItemOrder = [];
+    return state;
+  };
+
+  const observeSemanticEvent = ({
+    tabId,
+    instanceId,
+    gap = false,
+    event,
+  } = {}) => {
+    const authority = semanticAuthorities.get(tabId);
+    if (!authority || authority.instanceId !== instanceId || authority.connected !== true) {
+      return false;
+    }
+    if (!event || typeof event !== 'object') return false;
+    if (gap) authority.gap = true;
+    const type = String(event.type || '');
+    if (type === 'disconnect') {
+      return disconnectSemanticSource({ tabId, instanceId, reason: 'socket-disconnect' });
+    }
+    if (type === 'turn_started') {
+      authority.turnId = event.turnId || null;
+      authority.threadId = event.threadId || null;
+      authority.gap = gap === true;
+      return true;
+    }
+    if (type !== 'assistant_delta'
+      && type !== 'item_started'
+      && type !== 'item_completed'
+      && type !== 'turn_completed') return false;
+
+    const item = event.item && typeof event.item === 'object' ? event.item : null;
+    const itemKind = String(item?.kind || '');
+    const assistantEvent = type === 'assistant_delta' || itemKind === 'agentMessage';
+    if (!assistantEvent) return true;
+    const itemId = String(event.itemId || item?.itemId || '');
+    if (!itemId) return false;
+    const state = ensureSemanticTurn({
+      tabId,
+      threadId: event.threadId || authority.threadId || null,
+      turnId: event.turnId || authority.turnId || null,
+      instanceId,
+    });
+    if (!state) return false;
+    if (gap) {
+      state.semanticGap = true;
+      writeLog('warn', 'SEMANTIC_GAP', state, {
+        instance: short(instanceId, 18),
+        item: short(itemId, 18),
+        type,
+      });
+    }
+    let semanticItem = state.semanticItems.get(itemId);
+    if (!semanticItem) {
+      semanticItem = { itemId, text: '', phase: null, completed: false };
+      state.semanticItems.set(itemId, semanticItem);
+      state.semanticItemOrder.push(itemId);
+    }
+    if (item?.phase != null) semanticItem.phase = item.phase;
+    if (type === 'item_completed') {
+      if (typeof item?.text === 'string') semanticItem.text = item.text;
+      semanticItem.completed = true;
+      // Item completion is the exact full text for this item and repairs any
+      // dropped delta inside it. Other items have their own exact completion.
+      state.semanticGap = false;
+      authority.gap = false;
+      return setSemanticText(state, 'semantic-assistant-completed');
+    }
+    if (type === 'assistant_delta') {
+      if (state.semanticGap || authority.gap || typeof event.delta !== 'string') return false;
+      semanticItem.text += event.delta;
+      return setSemanticText(state, 'semantic-assistant-delta');
+    }
+    return true;
+  };
+
   const registerMarker = (context) => {
     try { return context?.mirror?.terminal?.registerMarker?.(0) || null; } catch { return null; }
   };
@@ -333,6 +536,15 @@ function createTerminalHistoryPreviewController({
       mirrorGeneration: context.mirror.generation,
       mirrorGenerationOrdinal: context.mirror.generationOrdinal,
       phase: 'streaming',
+      sourceMode: provider === 'codex' && semanticAuthorities.get(tabId)?.expected === true
+        ? (semanticAuthorities.get(tabId)?.connected === true ? 'semantic' : 'semantic-pending')
+        : 'screen',
+      semanticInstanceId: provider === 'codex'
+        ? semanticAuthorities.get(tabId)?.instanceId || null
+        : null,
+      semanticGap: false,
+      semanticItems: new Map(),
+      semanticItemOrder: [],
       text: '',
       previewSeq: 0,
       startedAt,
@@ -400,6 +612,19 @@ function createTerminalHistoryPreviewController({
     const ownership = exactContext(state);
     if (!ownership.ok) {
       clear(tabId, ownership.reason, state);
+      return false;
+    }
+    // A patched Codex gives us the raw assistant event before ratatui turns it
+    // into cells. Keep the headless snapshot for terminal mechanics and
+    // diagnostics, but never reinterpret its tool/status rows as prose while
+    // the semantic source owns this turn.
+    if (state.sourceMode === 'semantic' || state.sourceMode === 'semantic-pending') {
+      if (committedSnapshot?.authoritativeFrameCommitted
+        && committedSnapshot.mirrorGeneration === state.mirrorGeneration) {
+        state.lastCommittedSnapshot = committedSnapshot;
+        state.committedFrameGeneration = committedSnapshot.committedFrameGeneration ?? null;
+        state.writeSeq = committedSnapshot.writeSeq ?? null;
+      }
       return false;
     }
     if ((!state.marker || state.marker.isDisposed || Number(state.marker.line) < 0)
@@ -1067,17 +1292,23 @@ function createTerminalHistoryPreviewController({
   };
 
   return {
+    activateSemanticSource,
     begin,
     beginIfAbsent,
     bindPrompt,
     clear,
     clearAll,
+    clearSemanticSource,
+    disconnectSemanticSource,
+    expectSemanticSource,
     finish,
     get,
     observeBoundary,
     observeCanonical,
     observeFrame,
+    observeSemanticEvent,
     _turns: turns,
+    _semanticAuthorities: semanticAuthorities,
   };
 }
 

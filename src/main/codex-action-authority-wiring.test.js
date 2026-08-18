@@ -207,6 +207,38 @@ test('post-Enter timeout remains accepted but unknown, and orchestration waits f
   assert.match(mainSource, /executionContextSource: 'codex-task-started'[\s\S]{0,120}\{ renderer: false, web: true \}/);
 });
 
+test('a matched Resume audit adopts the writer and replays held lifecycle without a second Enter', () => {
+  const finishStart = mainSource.indexOf('function finishCodexPasteAudit');
+  const finishEnd = mainSource.indexOf('function waitForCodexPasteAudit', finishStart);
+  const finish = mainSource.slice(finishStart, finishEnd);
+  assert.ok(finishStart >= 0 && finishEnd > finishStart);
+  assert.ok(
+    finish.indexOf('releaseCodexProvisionalSourceAfterMatchedAudit')
+      < finish.indexOf('removePendingCodexPasteAudit'),
+    'the exact audit must release its provisional owner before its evidence is removed',
+  );
+
+  const releaseStart = mainSource.indexOf('function releaseCodexProvisionalSourceAfterMatchedAudit');
+  const releaseEnd = mainSource.indexOf('function processCodexUserMessagePasteAudit', releaseStart);
+  const release = mainSource.slice(releaseStart, releaseEnd);
+  assert.ok(releaseStart >= 0 && releaseEnd > releaseStart);
+  assert.match(release, /reservation\.auditMatched = true/);
+  assert.match(release, /reconcileCodexWriterFromProcess\(tabId, \{/);
+  assert.doesNotMatch(release, /term\.write|safePasteAndSubmit|submitSequence/,
+    'writer adoption may only consume rollout evidence, never write another prompt or Enter');
+
+  const reconcileStart = mainSource.indexOf('async function reconcileCodexWriterFromProcessInner');
+  const reconcileEnd = mainSource.indexOf('async function reconcileCodexWriterFromProcess(', reconcileStart);
+  const reconcile = mainSource.slice(reconcileStart, reconcileEnd);
+  assert.match(reconcile, /if \(sourceAppendLiveProven\) \{[\s\S]{0,180}releaseCodexSourceObservationAfterWriterProof/);
+
+  const publishStart = mainSource.indexOf('function publishCodexSuppressedCatchUpRelease');
+  const publishEnd = mainSource.indexOf('function releaseCodexSourceObservationAfterWriterProof', publishStart);
+  const publish = mainSource.slice(publishStart, publishEnd);
+  assert.match(publish, /emitCodexBusy\(/);
+  assert.doesNotMatch(publish, /term\.write|safePasteAndSubmit|submitSequence/);
+});
+
 test('the shared barrier does not gate settings, Fork, or stopped-send scenario entry', () => {
   const runtimeContract = fs.readFileSync(
     path.join(repoDir, 'src/main/codex-runtime-contract.js'),
@@ -252,7 +284,7 @@ test('main publishes one launch-scoped read identity without promoting it to wri
   assert.match(mainSource, /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,240}clearCodexReadIdentitySubmitBarrier/);
 });
 
-test('history mutation affordances consume one action-specific runtime verdict and paste-busy boundary', () => {
+test('native/middle-edit affordances consume runtime verdict while delete owns stop and saved-history mutation', () => {
   const snapshotStart = mainSource.indexOf('async function getCodexRuntimeSessionSnapshot');
   const snapshotEnd = mainSource.indexOf('function getCodexSessionOwner', snapshotStart);
   const snapshot = mainSource.slice(snapshotStart, snapshotEnd);
@@ -272,7 +304,7 @@ test('history mutation affordances consume one action-specific runtime verdict a
 
   assert.match(timelineSource, /historyActionSnapshot\?\.canNativeRewind !== true/);
   assert.match(timelineSource, /historyActionSnapshot\?\.canRewriteHistory !== true/);
-  assert.match(timelineSource, /historyActionSnapshot\?\.canDeleteHistory !== true/);
+  assert.doesNotMatch(timelineSource, /historyActionSnapshot\?\.canDeleteHistory !== true/);
   assert.match(timelineSource, /isTabAiBusy \|\| isTurnBusy \|\| lifecycleBlocksHistoryAction/);
   assert.doesNotMatch(
     timelineSource,
@@ -281,6 +313,9 @@ test('history mutation affordances consume one action-specific runtime verdict a
   );
   assert.match(timelineSource, /disabled=\{historyDeleteUiBlocked\}/);
   assert.match(timelineSource, /title=\{historyDeleteUiBlocked \? historyMutationBlockedMessage : undefined\}/);
+  assert.match(timelineSource, /const historyDeleteUiBlocked = deletingRange !== null[\s\S]{0,140}rewindAgentStatus === 'stopping'/);
+  assert.match(timelineSource, /const historicalSessionId = sessionIdRef\.current/);
+  assert.match(timelineSource, /terminal:stop-ai-process[\s\S]{0,700}return historicalSessionId/);
 });
 
 test('startup completion retains the Resume read lease and post-Enter barrier until adoption', () => {

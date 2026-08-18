@@ -683,3 +683,12 @@
 [data-split-attach-row]:not([data-focused]):hover [data-split-button] {
   opacity: 1;
 }
+
+/* Полоса вкладок в шапке окна прокручивается вбок, но своей полосы прокрутки не
+   показывает: шапка — две короткие строки, и горизонтальный скроллбар отнял бы
+   третью ради того, что счётчики «+N» по краям говорят точнее.
+   scrollbarWidth задан инлайном (Firefox), здесь — WebKit, где свойства нет. */
+[data-pane-tab-strip-scroller]::-webkit-scrollbar {
+  height: 0;
+  width: 0;
+}

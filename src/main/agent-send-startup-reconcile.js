@@ -111,6 +111,17 @@ function promptTextFromReceipt(record) {
   return null;
 }
 
+function codexExpectedImagePathsFromReceipt(record) {
+  const receipt = record?.receipt && typeof record.receipt === 'object'
+    ? record.receipt
+    : {};
+  return (Array.isArray(receipt.expectedImagePaths) ? receipt.expectedImagePaths : [])
+    .flatMap((value) => {
+      const imagePath = cleanString(value);
+      return imagePath && path.isAbsolute(imagePath) ? [imagePath] : [];
+    });
+}
+
 function claudeSessionIdFromTranscriptPath(value) {
   const exactPath = resolveExactPath(value);
   if (!exactPath) return '';
@@ -184,6 +195,9 @@ function normalizeUnresolvedRecord(record) {
       promptLength,
       promptText: prompt.text,
       promptTextField: prompt.field,
+      expectedImagePaths: provider === 'codex'
+        ? codexExpectedImagePathsFromReceipt(record)
+        : [],
       boundary: record.transcriptBoundary,
     },
   };
@@ -761,7 +775,9 @@ async function reconcileClaude(context, maxReadBytes, options = {}) {
 }
 
 function selectCodexStartupCandidate(context, validated, auditExpectation, candidate) {
-  const actualText = codexUserMessageAuditText(candidate.record);
+  const actualText = codexUserMessageAuditText(candidate.record, {
+    preserveProviderImageMarkup: true,
+  });
   if (actualText === null) {
     return { ok: false, reason: 'codex-user-message-text-unavailable' };
   }
@@ -818,6 +834,12 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     expectedText: context.promptText,
     expectedLen: context.promptLength,
     expectedHash: context.promptHash,
+    // Legacy durable Codex receipts predate persisted staged image paths.
+    // Their exact causal byte boundary still permits the established ordered-
+    // slot transformation, while live sends use expectedImagePaths and thus
+    // require exact provider path/slot identity.
+    expectedImagePaths: context.expectedImagePaths,
+    allowUnprovenImageCarrier: context.expectedImagePaths.length === 0,
     sentAt: numericTimestamp(context.boundary.capturedAt)
       ?? numericTimestamp(context.record.updatedAt)
       ?? 0,

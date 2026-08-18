@@ -43,8 +43,18 @@ import {
   dropTabFromAllPaneHistories,
   emptyPaneByClosedTab,
   packSplitSizes,
+  paneTabs,
+  addTabToPane,
+  reorderPaneTab,
+  dropTabFromAllPaneStrips,
+  paneIndexHoldingTab,
+  reprojectPaneTabs,
+  insertIntoStrip,
+  removeFromStrip,
+  replaceInStrip,
+  arrangePanes,
 } from '../utils/splitPanesModel.mjs';
-import { isVisitWorthRecording, onScreenTabIds } from '../utils/tabVisitHistoryRule.mjs';
+import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 
@@ -154,7 +164,10 @@ export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple
 
 export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini' | 'codex';
 
-export type TabType = 'terminal' | 'browser' | 'claude-sdk' | 'file';
+// 'browser' убран 2026-08-17 вместе со встроенным браузером. В базе у старых
+// вкладок это значение ещё может лежать — при загрузке оно приводится к
+// 'terminal' (см. database.js), поэтому здесь его быть уже не должно.
+export type TabType = 'terminal' | 'claude-sdk' | 'file';
 
 export interface TabTaskPlanSubtask {
   id: string;
@@ -588,7 +601,6 @@ export interface TabHistoryRestoreEntry {
   task_plan?: string | null;
   command_type?: string | null;
   tab_type?: string | null;
-  url?: string | null;
   file_path?: string | null;
   claude_session_id?: string | null;
   gemini_session_id?: string | null;
@@ -640,12 +652,8 @@ interface Tab {
   nameSetManually?: boolean; // True if user renamed tab manually - prevents auto-rename on commandType detection
   commandType?: CommandType; // Type of running command (for restart button visibility)
   isUtility?: boolean; // Legacy persistence field; restored and saved as false.
-  tabType?: TabType; // Terminal or browser tab
-  url?: string; // URL for browser tabs
+  tabType?: TabType; // Terminal, Claude SDK, or linked file tab
   filePath?: string; // Absolute file path for linked file tabs
-  terminalId?: string; // Terminal ID for browser tabs (linked terminal)
-  terminalName?: string; // Terminal name for browser tabs
-  activeView?: 'browser' | 'terminal'; // Which view is active in the tab
   createdAt?: number; // Timestamp when tab was created
   /**
    * When this tab was last ACTIVATED (ms epoch). Durable recency for the
@@ -968,7 +976,6 @@ const restoreTabOptions = (savedTab: any) => ({
   notes: savedTab.notes,
   taskPlan: savedTab.taskPlan,
   tabType: savedTab.tabType,
-  url: savedTab.url,
   filePath: savedTab.filePath,
   createdAt: savedTab.createdAt,
   isCollapsed: savedTab.isCollapsed,
@@ -1053,7 +1060,6 @@ const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err
     notes: savedTab.notes,
     taskPlan: savedTab.taskPlan,
     tabType: savedTab.tabType || 'terminal',
-    url: savedTab.url,
     filePath: savedTab.filePath,
     createdAt: savedTab.createdAt || Math.floor(Date.now() / 1000),
     isCollapsed: savedTab.isCollapsed,
@@ -1357,8 +1363,25 @@ export interface GlobalTabMruEntry {
 // project chip in the attach row). This is what stops "смена вкладки утащила
 // меня в чужой проект".
 export interface SplitPane {
+  /** Project of the SHOWN tab. Follows `tabId` — see below. */
   projectId: string;
+  /** The tab currently SHOWN here. One of `tabs`, when that list exists. */
   tabId: string;
+  /**
+   * The pane's STRIP: every tab whose chip is drawn in this window's header,
+   * left to right, in the order the user built.
+   *
+   * Absent on a single-tab pane — including every session saved before strips
+   * existed — where the strip is simply `[{projectId, tabId}]`. Same
+   * all-or-nothing storage rule as `column`, and the same reason: a legacy
+   * layout must restore byte-identical. Read it through `paneTabs()`, never
+   * directly: "absent" means "one", not "none".
+   *
+   * Order is the USER'S (append on double-click, drag to reorder) — never
+   * recency. A strip is a map you build; a map that reshuffles itself cannot be
+   * read, which is what killed the pane header's old recent-list.
+   */
+  tabs?: Array<{ projectId: string; tabId: string }>;
   /**
    * Which COLUMN this pane belongs to; panes in the same column stack
    * vertically, top to bottom in array order.
@@ -1427,12 +1450,11 @@ interface WorkspaceStore {
   // restarts.
   globalTabMru: GlobalTabMruEntry[];
   /**
-   * Record a VISIT (tab appeared on screen). `visibleBefore` is the set of tabs
-   * that were on screen BEFORE the caller switched — callers that have already
-   * moved activeTabId must pass it, otherwise the rule inspects the new state and
-   * every switch looks like "it was already visible".
+   * Record a VISIT: this tab was just focused, so it is the freshest thing the
+   * user worked in. Called by every activation path — being already on screen
+   * does not exempt it (that question belongs to the switcher's own list).
    */
-  touchGlobalTabMru: (projectId: string, tabId: string, visibleBefore?: string[]) => void;
+  touchGlobalTabMru: (projectId: string, tabId: string) => void;
   /**
    * "Forget this row" — middle-click in a tab list. Removes the tab from the
    * GLOBAL visit order without touching the tab itself: it stays open, it just
@@ -1476,6 +1498,56 @@ interface WorkspaceStore {
   addVerticalSplitPane: (atPaneIndex: number | null, side: 'above' | 'below') => boolean;
   /** Middle-click on a file pane: bring back what that pane showed before. */
   restoreSplitPanePreviousTab: (tabId: string) => boolean;
+  /**
+   * Double-click on the header's empty space: a brand-new tab joins THIS
+   * window's strip as one more chip, shown immediately.
+   *
+   * Its own action rather than "create + activate", because ordinary activation
+   * deliberately REPLACES the shown chip (see resolveSplitActivation): growing a
+   * strip is a separate intention and must have a separate gesture.
+   */
+  addTabToSplitPaneStrip: (paneIndex: number, projectId: string, tabId: string) => void;
+  /** Drag a chip within its own window's strip. */
+  reorderSplitPaneTab: (paneIndex: number, tabId: string, toIndex: number) => void;
+  /**
+   * The single-mode centre's strip, keyed by project.
+   *
+   * Without a split there is no pane object to carry it, and the centre shows a
+   * different project's tabs as the user moves between projects — one shared
+   * list would follow them across and read as somebody else's tabs. Empty or
+   * one-element strips are not stored: a project the user never built a strip in
+   * behaves exactly as it did before strips existed.
+   */
+  centerStrips: Record<string, Array<{ projectId: string; tabId: string }>>;
+  /**
+   * Under WHICH key the centre's strip lives — the project whose tab the centre
+   * is showing, not the project of the tab being talked about. The two differ as
+   * soon as a strip holds another project's tab (strips are cross-project, like
+   * windows), and a chip asking by its own project would address a second strip
+   * nobody is looking at. One resolver so "add" and "remove" cannot disagree.
+   */
+  centerStripKey: () => string | null;
+  /** Double-click on the centre header's empty space (single mode). */
+  addTabToCenterStrip: (projectId: string, tabId: string) => void;
+  /** Drag a chip in the centre's strip (single mode). */
+  reorderCenterStripTab: (projectId: string, tabId: string, toIndex: number) => void;
+  /** Middle-click on a centre chip: take it out of the strip. */
+  removeTabFromCenterStrip: (projectId: string, tabId: string) => void;
+  /**
+   * Arrange several tabs into windows in ONE step — the API path.
+   *
+   * Every other split action is a gesture: one click's worth of change. An API
+   * caller states an arrangement instead («эти две справа, каждая своим окном»),
+   * and composing that out of gestures is four calls that can each half-fail —
+   * plus the "one placeholder at a time" guard, which refuses the second one.
+   * So this applies the whole layout or none of it.
+   */
+  arrangeSplitPanes: (spec: {
+    anchorIndex?: number;
+    side?: 'right' | 'left' | 'above' | 'below';
+    divide?: 'columns' | 'rows';
+    windows: Array<Array<{ projectId: string; tabId: string }>>;
+  }) => { placedIndices: number[]; focusedIndex: number } | null;
   // ✕ / Escape on an empty placeholder pane (real panes close by tabId).
   removeEmptySplitPane: (paneIndex: number) => void;
   focusSplitPane: (paneIndex: number) => void;
@@ -1515,8 +1587,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string) => Promise<TabHistoryRestoreResult>;
@@ -1634,11 +1706,6 @@ interface WorkspaceStore {
   // Reorder projects (for drag-and-drop)
   reorderProjects: (orderedProjectIds: string[]) => void;
 
-  // Browser tabs
-  createBrowserTab: (projectId: string) => Promise<string>;
-  updateTabUrl: (tabId: string, url: string) => void;
-  setBrowserActiveView: (tabId: string, view: 'browser' | 'terminal') => void;
-
   // Claude SDK tabs
   createSDKTab: (projectId: string, name?: string, options?: { afterTabId?: string; groupId?: string; visualParentTabId?: string; background?: boolean }) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
@@ -1748,11 +1815,7 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     notes: tab.notes,
     taskPlan: tab.taskPlan,
     tabType: tab.tabType,
-    url: tab.url,
     filePath: tab.filePath,
-    terminalId: tab.terminalId,
-    terminalName: tab.terminalName,
-    activeView: tab.activeView,
     createdAt: tab.createdAt,
     // Durable tab-visit time. Main applies never-downgrade, so payloads that
     // omit it (rename, colour, reorder — most of them) keep the stored value.
@@ -1895,43 +1958,43 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   openProjects: new Map(),
   projectHistory: [],
   globalTabMru: [],
-  touchGlobalTabMru: (projectId, tabId, visibleBefore) => {
-    const { globalTabMru, isRestoring, openProjects, splitPanes, activeProjectId } = get();
+  touchGlobalTabMru: (projectId, tabId) => {
+    const { globalTabMru, isRestoring, openProjects } = get();
     if (isRestoring) return; // restore replays activations; keep the saved order
-    // A VISIT is "this tab appeared on screen", not "this tab was clicked".
+    // FRESHNESS FOLLOWS FOCUS — every activation, including one onto a tab that
+    // was already on screen in another pane. Being visible is a separate
+    // question, and it is asked by the switcher about its own rows, not here.
     //
-    // With panes those differ: clicking the neighbouring pane moves focus while
-    // both tabs stay visible, so recording it rewrites the history with an event
-    // it does not describe — and Ctrl+Tab then offers the tab you are looking at,
-    // which is the opposite of what the gesture is for. Checked here because this
-    // is the single point every activation path already funnels through.
-    //
-    // `visibleBefore` matters: switchTab sets workspace.activeTabId BEFORE calling
-    // this, so reading the live state here would report the tab as already
-    // visible and nothing would ever be recorded. Callers that have moved the
-    // pointer pass the pre-switch snapshot; the rest (createTab) have not moved
-    // it yet and can be read live.
-    const centerTabId = activeProjectId
-      ? openProjects.get(activeProjectId)?.activeTabId || null
-      : null;
-    const visibleTabIds = visibleBefore
-      ?? onScreenTabIds({ panes: splitPanes, centerTabId });
-    if (!isVisitWorthRecording({ tabId, visibleTabIds })) return;
+    // This used to be gated on "did the tab APPEAR", which froze the rank of any
+    // tab living in a pane: it could be worked in all day without one recorded
+    // event, because it never appeared — it was already there — and leaving the
+    // screen is not an event either. Every unrelated activation then pushed it
+    // one place down. Reported live: *«вкладка отходит всё назад и назад»* — the
+    // tab just worked in showed up tenth in Ctrl+Tab. See tabVisitHistoryRule.
+    if (!isVisitWorthRecording({ tabId })) return;
+    const isAlreadyFreshest = globalTabMru[0]?.tabId === tabId;
     // Durable half of the same event: stamp the tab itself, so the visit order
     // survives a restart even for projects whose in-session list is empty.
     // Written here — the one place every activation path already funnels
     // through — rather than at each call site, which is how the per-project
     // list and the global list drifted apart in the first place.
+    //
+    // Skipped when the tab is ALREADY the freshest: re-focusing it cannot change
+    // any relative order, and each stamp costs a full tab-list write. The
+    // `!tab.lastActivatedAt` half is not optional — a restored tab can head the
+    // list with no stamp at all (ranked by the saved fallback order), and
+    // skipping it would leave it unstamped forever, sinking it below every
+    // stamped tab on the next restart.
     const workspace = openProjects.get(projectId);
     const tab = workspace?.tabs.get(tabId);
-    if (tab) {
+    if (tab && (!isAlreadyFreshest || !tab.lastActivatedAt)) {
       tab.lastActivatedAt = Date.now();
       // Persist through the normal tab writer. Callers below already re-set
       // openProjects and call saveSession; this one write is what makes the
       // stamp durable.
       saveTabs(projectId, workspace!.tabs);
     }
-    if (globalTabMru[0]?.tabId === tabId) return; // no-op → no re-render
+    if (isAlreadyFreshest) return; // no-op → no re-render
     set({ globalTabMru: touchMru(globalTabMru, projectId, tabId) });
   },
 
@@ -1977,16 +2040,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const current = activeProjectId && activeWs?.activeTabId
       ? { projectId: activeProjectId, tabId: activeWs.activeTabId }
       : null;
-    // BEFORE the pane write: adding a tab to the workspace makes it APPEAR, so
-    // this is a visit. switchTab (via activateCenterTab below) snapshots the
-    // screen AFTER the pane list already contains the tab, sees "already
-    // visible" and correctly skips — so the appearance must be recorded here,
-    // with the pre-write picture. (Reported live: navigating through the pane
-    // header's hover list never reached the global history.)
-    const visibleBefore = onScreenTabIds({
-      panes: splitPanes,
-      centerTabId: activeWs?.activeTabId || null,
-    });
     const res = addPane(splitPanes, splitFocusedIndex, current, { projectId, tabId });
     if (!res) return false;
     // A split STARTED from single mode is a NEW layout and opens equal. The
@@ -1998,8 +2051,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // 2-column fractions correctly return when the shape returns.)
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, ...(splitPanes.length === 0 ? { splitSizes: null } : {}) });
     console.log('[Split] addTab tab=' + tabId.slice(-12) + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
-    get().touchGlobalTabMru(projectId, tabId, visibleBefore);
-    // Focus follows the newly added pane → its tab becomes the center tab.
+    // Focus follows the newly added pane → its tab becomes the center tab, and
+    // activation records the visit. No separate touch here: freshness follows
+    // focus now, so a tab that lands on screen and takes focus is recorded by
+    // the one path every activation already goes through.
     get().activateCenterTab(projectId, tabId);
     get().saveSession();
     return true;
@@ -2009,6 +2064,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // «Убрать вкладку из окна», не «закрыть окно» и не «закрыть вкладку»: the
     // tab keeps living in the sidebar, the pane keeps its place and waits for
     // the next tab. Closing the pane is the placeholder's own ✕.
+    //
+    // With strips this removes ONE CHIP: the neighbouring chip takes over, and
+    // the window goes empty only when the last chip leaves. Same sentence as
+    // before, one level finer.
     const { splitPanes, splitFocusedIndex } = get();
     const res = emptyPaneByClosedTab(splitPanes, splitFocusedIndex, tabId);
     if (!res) return false;
@@ -2127,6 +2186,139 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (restored?.tabId) get().activateCenterTab(restored.projectId, restored.tabId);
     get().saveSession();
     return true;
+  },
+
+  centerStrips: {},
+
+  // ПОД КАКИМ КЛЮЧОМ лежит полоса одиночного центра.
+  //
+  // Ключ — проект, чью вкладку центр СЕЙЧАС показывает, а не проект вкладки, о
+  // которой идёт речь. Эти двое расходятся, как только в полосу попадает вкладка
+  // чужого проекта (а полосы, как и окна, межпроектные), и чип потом просил бы
+  // операцию по СВОЕМУ проекту — то есть по несуществующей второй полосе.
+  // Один резолвер на всех, чтобы «положить» и «убрать» не могли разойтись.
+  centerStripKey: () => get().activeProjectId || null,
+
+  addTabToCenterStrip: (projectId, tabId) => {
+    const st = get();
+    // The strip is keyed by the project whose tab the centre is SHOWING, not by
+    // the project of the tab being added: the two differ whenever a tab is added
+    // from another project's list, and keying by the newcomer would start a
+    // second strip that nobody is looking at.
+    const centerProjectId = st.activeProjectId;
+    if (!centerProjectId) return;
+    const shown = st.openProjects.get(centerProjectId)?.activeTabId || '';
+    const current = st.centerStrips[centerProjectId] || [];
+    // A strip that did not exist starts from what the centre is showing: the
+    // chip already on screen is the first one, otherwise the new tab would look
+    // like it replaced something that quietly vanished.
+    const base = current.length > 0
+      ? current
+      : (shown ? [{ projectId: centerProjectId, tabId: shown }] : []);
+    if (base.length === 0) return; // нечего расширять: центр пуст
+    const next = insertIntoStrip(base, projectId, tabId);
+    if (next === base && current.length > 0) return;
+    set({ centerStrips: { ...st.centerStrips, [centerProjectId]: next } });
+    get().activateCenterTab(projectId, tabId);
+    get().saveSession();
+  },
+
+  reorderCenterStripTab: (_projectId, tabId, toIndex) => {
+    const st = get();
+    const key = st.centerStripKey();
+    if (!key) return;
+    const strip = st.centerStrips[key] || [];
+    const from = strip.findIndex((e) => e.tabId === tabId);
+    if (from === -1) return;
+    const to = Math.max(0, Math.min(strip.length - 1, toIndex | 0));
+    if (to === from) return;
+    const next = strip.slice();
+    const [entry] = next.splice(from, 1);
+    next.splice(to, 0, entry);
+    set({ centerStrips: { ...st.centerStrips, [key]: next } });
+    get().saveSession();
+  },
+
+  removeTabFromCenterStrip: (_projectId, tabId) => {
+    const st = get();
+    const key = st.centerStripKey();
+    if (!key) return;
+    const strip = st.centerStrips[key] || [];
+    const at = strip.findIndex((e) => e.tabId === tabId);
+    if (at === -1) return;
+    const rest = removeFromStrip(strip, tabId);
+    const nextStrips = { ...st.centerStrips };
+    // One chip left is not a strip: drop the record so the project goes back to
+    // behaving exactly as it did before a strip was ever built here.
+    if (rest.length > 1) nextStrips[key] = rest;
+    else delete nextStrips[key];
+    set({ centerStrips: nextStrips });
+    // The centre must keep showing something. Same neighbour rule as a window's
+    // strip: the chip to the right, or the left when there is none.
+    const shown = st.openProjects.get(key)?.activeTabId;
+    if (shown === tabId && rest.length > 0) {
+      const heir = rest[Math.min(at, rest.length - 1)];
+      get().activateCenterTab(heir.projectId, heir.tabId);
+    }
+    get().saveSession();
+  },
+
+  arrangeSplitPanes: (spec) => {
+    const st = get();
+    // The centre, for the single-mode case: «справа от того, на что я смотрю»
+    // needs something to be to the right OF.
+    const centerTabId = st.activeProjectId
+      ? st.openProjects.get(st.activeProjectId)?.activeTabId || ''
+      : '';
+    const current = st.activeProjectId && centerTabId
+      ? { projectId: st.activeProjectId, tabId: centerTabId }
+      : null;
+    // Only tabs that actually exist: a caller naming a closed tab would
+    // otherwise get a window showing nothing.
+    const windows = (spec.windows || [])
+      .map((strip) => (strip || []).filter((e) => (
+        e && e.tabId && st.openProjects.get(e.projectId)?.tabs.has(e.tabId)
+      )))
+      .filter((strip) => strip.length > 0);
+    if (windows.length === 0) return null;
+    const res = arrangePanes(st.splitPanes, st.splitFocusedIndex, { ...spec, windows }, current);
+    if (!res) return null;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    console.log('[Split] arrange windows=' + windows.length
+      + ' side=' + (spec.side || 'right')
+      + ' divide=' + (spec.divide || 'columns')
+      + ' panes=' + res.panes.length);
+    // The centre follows the first window placed — the same rule as clicking it.
+    const focused = res.panes[res.focusedIndex];
+    if (focused?.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
+    get().saveSession();
+    return { placedIndices: res.placedIndices, focusedIndex: res.focusedIndex };
+  },
+
+  addTabToSplitPaneStrip: (paneIndex, projectId, tabId) => {
+    const st = get();
+    const res = addTabToPane(st.splitPanes, paneIndex, projectId, tabId);
+    if (!res) return;
+    set({ splitPanes: res.panes });
+    console.log('[Split] stripAdd pane=' + paneIndex
+      + ' tab=' + String(tabId).slice(-12)
+      + ' chips=' + paneTabs(res.panes[paneIndex]).length
+      // Откуда вкладка ушла: чип переезжает, а не копируется. Пустой список —
+      // вкладка не лежала ни в одном окне (обычный случай новой вкладки).
+      + (res.emptied && res.emptied.length ? ' emptiedPanes=' + res.emptied.join(',') : ''));
+    // The window the chip landed in takes focus, and the centre follows — the
+    // same rule as clicking that window. Runs through activateCenterTab so
+    // freshness, the sidebar pointer and the reveal all happen exactly once.
+    if (st.splitFocusedIndex !== paneIndex) set({ splitFocusedIndex: paneIndex });
+    get().activateCenterTab(projectId, tabId);
+    get().saveSession();
+  },
+
+  reorderSplitPaneTab: (paneIndex, tabId, toIndex) => {
+    const res = reorderPaneTab(get().splitPanes, paneIndex, tabId, toIndex);
+    if (!res) return;
+    set({ splitPanes: res.panes });
+    get().saveSession();
   },
 
   removeEmptySplitPane: (paneIndex) => {
@@ -2488,6 +2680,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         sessionState.splitFocusedIndex ?? 0,
         (projectId: string, tabId: string) => !!openProjects.get(projectId)?.tabs.has(tabId),
       );
+      // Single-mode centre strips: same scrub as the panes — a chip whose tab
+      // did not come back must not restore as a row pointing at nothing, and a
+      // project left with one chip has no strip at all.
+      const restoredCenterStrips: Record<string, Array<{ projectId: string; tabId: string }>> = {};
+      Object.entries((sessionState as any).centerStrips || {}).forEach(([pid, raw]) => {
+        const kept = (Array.isArray(raw) ? raw : [])
+          .filter((e: any) => e && e.tabId && openProjects.get(e.projectId)?.tabs.has(e.tabId));
+        if (kept.length > 1) restoredCenterStrips[pid] = kept as Array<{ projectId: string; tabId: string }>;
+      });
       const restoredActiveId = sessionState.activeProjectId && openProjects.has(sessionState.activeProjectId)
         ? sessionState.activeProjectId
         : null;
@@ -2515,6 +2716,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // drops sizes whose structure did not survive (a pane's tab is gone →
         // that dimension reads as equal anyway, so store nothing for it).
         splitSizes: packSplitSizes(restoredSplit.panes, (sessionState as any).splitSizes ?? null),
+        centerStrips: restoredCenterStrips,
       });
       console.warn(
         `[RestoreSession] done durMs=${(performance.now() - restoreStart).toFixed(1)}` +
@@ -2935,7 +3137,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       notes: options?.notes,
       taskPlan: options?.taskPlan,
       tabType: options?.tabType || 'terminal',
-      url: options?.url,
       filePath: (options as any)?.filePath,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
       // Restore carries the durable visit stamp; a brand-new tab has none until
@@ -3101,7 +3302,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       notes: options?.notes,
       taskPlan: options?.taskPlan,
       tabType: options?.tabType || 'terminal',
-      url: options?.url,
       filePath: (options as any)?.filePath,
       nameSetManually: (options as any)?.nameSetManually,
       groupId: targetGroupId,
@@ -3324,7 +3524,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           taskPlan: tab.taskPlan,
           commandType: effectiveCommandType,
           tabType: tab.tabType,
-          url: tab.url,
           filePath: tab.filePath,
           createdAt: tab.createdAt,
           claudeSessionId: tab.claudeSessionId,
@@ -3508,6 +3707,29 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           + ' panes=' + splitRes.panes.length
           + (splitRes.emptiedIndex !== undefined ? ' emptied=' + splitRes.emptiedIndex : ' collapsed'));
       }
+      // …and out of any OTHER window that merely held its chip. The call above
+      // acts on the one window that was SHOWING it; a chip sitting unshown
+      // elsewhere would otherwise survive its own tab and restore as a row
+      // pointing at nothing.
+      const strips = dropTabFromAllPaneStrips(get().splitPanes, tabId);
+      if (strips) set({ splitPanes: strips.panes });
+      // Same for the single-mode centre's strips — ALL of them, not just this
+      // tab's own project: strips are cross-project, so a tab can sit as a chip
+      // in a strip belonging to a project it does not come from.
+      {
+        const before = get().centerStrips;
+        let changed = false;
+        const nextStrips: typeof before = {};
+        Object.entries(before).forEach(([key, strip]) => {
+          if (!strip.some((e) => e.tabId === tabId)) { nextStrips[key] = strip; return; }
+          changed = true;
+          const rest = removeFromStrip(strip, tabId);
+          // One chip left is not a strip: the project goes back to behaving
+          // exactly as it did before a strip was ever built there.
+          if (rest.length > 1) nextStrips[key] = rest;
+        });
+        if (changed) set({ centerStrips: nextStrips });
+      }
     }
 
     if (workspace.activeTabId === tabId) {
@@ -3686,8 +3908,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         notes: entry.notes || undefined,
         taskPlan: parseHistoryTaskPlan(entry.task_plan),
         commandType: (entry.command_type || undefined) as CommandType | undefined,
-        tabType: (entry.tab_type || 'terminal') as TabType,
-        url: entry.url || undefined,
+        // 'browser' в старых записях истории читаем как обычный терминал:
+        // такой вкладки больше нет, а восстанавливать её нечем.
+        tabType: (entry.tab_type === 'file' ? 'file' : entry.tab_type === 'claude-sdk' ? 'claude-sdk' : 'terminal') as TabType,
         filePath: entry.file_path || undefined,
         pendingAction: buildHistoryPendingAction(entry, options.resumePolicy),
         claudeSessionId: entry.claude_session_id || undefined,
@@ -3847,15 +4070,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const _t0 = performance.now();
       const _startAbs = performance.timeOrigin + _t0;
       const prevActiveId = workspace.activeTabId;
-      // What was on screen BEFORE this switch — captured here because
-      // workspace.activeTabId is overwritten a few lines below, and the visit
-      // rule needs the "before" picture (see touchGlobalTabMru).
-      const visibleBeforeSwitch = onScreenTabIds({
-        panes: get().splitPanes,
-        centerTabId: get().activeProjectId
-          ? openProjects.get(get().activeProjectId!)?.activeTabId || null
-          : null,
-      });
+      // What the CENTRE was showing, captured before anything is overwritten.
+      // Not the same as prevActiveId once the switch crosses projects: that one
+      // is the target project's previous tab, this one is the tab on screen.
+      const centerShownBefore = (() => {
+        const centerPid = get().activeProjectId;
+        if (!centerPid) return null;
+        return openProjects.get(centerPid)?.activeTabId || null;
+      })();
       const currentView = workspace.currentView;
       const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
       const targetTab = workspace.tabs.get(tabId);
@@ -3872,7 +4094,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       workspace.selectedTabIds = [tabId]; // Update selection on direct switch
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
-      get().touchGlobalTabMru(projectId, tabId, visibleBeforeSwitch);
+      get().touchGlobalTabMru(projectId, tabId);
       // Split rule at the single activation choke point: visible tab → focus
       // its pane; hidden tab → replace the focused pane's slot (an empty
       // placeholder pane in focus gets filled the same way). Runs for every
@@ -3883,6 +4105,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           const splitRes = resolveSplitActivation(splitPanes, splitFocusedIndex, projectId, tabId);
           if (splitRes.panes !== splitPanes || splitRes.focusedIndex !== splitFocusedIndex) {
             set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex });
+          }
+        } else {
+          // Single mode: the centre's strip follows the same rule as a window's
+          // — the shown chip is REPLACED in place, so ordinary navigation never
+          // grows the strip.
+          //
+          // Keyed by the project the centre was showing BEFORE this switch: the
+          // strip belongs to that centre, and the incoming tab may come from a
+          // different project (strips are cross-project). Projects without a
+          // strip are untouched — for them this is a lookup that finds nothing.
+          const key = get().activeProjectId || projectId;
+          const strip = get().centerStrips[key];
+          if (strip && strip.length > 0) {
+            // The OUTGOING chip is what the centre was showing — the active tab
+            // of the centre's own project, read before this switch overwrote it.
+            // `prevActiveId` above is the previous tab of the TARGET project,
+            // which is a different thing whenever the switch crosses projects.
+            const next = replaceInStrip(strip, centerShownBefore || '', projectId, tabId);
+            if (next !== strip) set({ centerStrips: { ...get().centerStrips, [key]: next } });
           }
         }
       }
@@ -4677,7 +4918,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({
       openProjects: new Map(openProjects),
       globalTabMru: get().globalTabMru.map((e) => e.tabId === tabId ? { ...e, projectId: targetProjectId } : e),
-      splitPanes: get().splitPanes.map((p) => p.tabId === tabId ? { ...p, projectId: targetProjectId } : p),
+      splitPanes: reprojectPaneTabs(get().splitPanes, (id) => id === tabId, targetProjectId),
     });
 
     // Save both projects
@@ -4766,7 +5007,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({
       openProjects: new Map(openProjects),
       globalTabMru: get().globalTabMru.map((e) => movingSet.has(e.tabId) ? { ...e, projectId: targetProjectId } : e),
-      splitPanes: get().splitPanes.map((p) => movingSet.has(p.tabId) ? { ...p, projectId: targetProjectId } : p),
+      splitPanes: reprojectPaneTabs(get().splitPanes, (id) => movingSet.has(id), targetProjectId),
     });
     saveTabs(src.projectId, src.tabs, true);  // forceCleanup: intentional batch move
     saveTabs(tgt.projectId, tgt.tabs);
@@ -4889,7 +5130,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({
       openProjects: new Map(currentOpenProjects),
       globalTabMru: get().globalTabMru.map((e) => movingSet.has(e.tabId) ? { ...e, projectId: targetProjectId } : e),
-      splitPanes: get().splitPanes.map((p) => movingSet.has(p.tabId) ? { ...p, projectId: targetProjectId } : p),
+      splitPanes: reprojectPaneTabs(get().splitPanes, (id) => movingSet.has(id), targetProjectId),
     });
     notifyProjectLayoutChanged(sourceProjectId, 'tab-group-project-transfer');
     notifyProjectLayoutChanged(targetProjectId, 'tab-group-project-transfer');
@@ -5888,42 +6129,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     notifyProjectOrderChanged('project-order');
   },
 
-  // Browser tabs
-  createBrowserTab: async (projectId) => {
-    const { openProjects, createTab } = get();
-    const workspace = openProjects.get(projectId);
-    const projectPath = workspace?.projectPath;
-    const cwd = (projectPath && !projectPath.startsWith('__unset__')) ? projectPath : (process.env.HOME || '~');
-    return createTab(projectId, 'Browser', cwd, { tabType: 'browser', url: 'http://localhost:3000' });
-  },
-
-  updateTabUrl: (tabId, url) => {
-    const { openProjects } = get();
-    for (const [, workspace] of openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab) {
-        // Guard: skip if unchanged
-        if (tab.url === url) return;
-        tab.url = url;
-        saveTabs(workspace.projectId, workspace.tabs);
-        set({});
-        return;
-      }
-    }
-  },
-
-  setBrowserActiveView: (tabId, view) => {
-    const { openProjects } = get();
-    for (const [, workspace] of openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab) {
-        tab.activeView = view;
-        set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectId, workspace.tabs);
-        return;
-      }
-    }
-  },
+  // Здесь жили действия browser-вкладки: создать её, запомнить адрес страницы и
+  // переключить её внутренний вид (страница/терминал). Вкладка целиком удалена
+  // 2026-08-17 — встроенным браузером не пользовались, а живой браузер у нас
+  // снаружи и управляется через MCP.
 
   // Claude SDK tabs
   createSDKTab: async (projectId, name, options) => {
@@ -6141,8 +6350,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           geminiSessionId: tab.geminiSessionId, codexSessionId: tab.codexSessionId,
           codexModel: tab.codexModel, codexEffort: tab.codexEffort, codexSettingsProofAt: tab.codexSettingsProofAt, codexSettingsProofSessionId: tab.codexSettingsProofSessionId, codexModelMigrationPending: tab.codexModelMigrationPending, codexModelMigrationRestoreDefaultModel: tab.codexModelMigrationRestoreDefaultModel, codexModelMigrationRestoreDefaultEffort: tab.codexModelMigrationRestoreDefaultEffort, codexModelMigrationSourceModel: tab.codexModelMigrationSourceModel, codexModelMigrationSourceEffort: tab.codexModelMigrationSourceEffort, codexModelMigrationTargetModel: tab.codexModelMigrationTargetModel, codexModelMigrationConfigPath: tab.codexModelMigrationConfigPath, codexModelMigrationConfigFingerprint: tab.codexModelMigrationConfigFingerprint, codexModelMigrationConfigAlreadyTarget: tab.codexModelMigrationConfigAlreadyTarget, externalRun: tab.externalRun, sessionStatus: tab.sessionStatus, wasInterrupted: tab.wasInterrupted,
           overlayDismissed: tab.overlayDismissed, notes: tab.notes, taskPlan: tab.taskPlan, tabType: tab.tabType,
-          url: tab.url, filePath: tab.filePath, terminalId: tab.terminalId, terminalName: tab.terminalName,
-          activeView: tab.activeView, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
+          filePath: tab.filePath, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
           groupId: tab.groupId, visualParentTabId: tab.visualParentTabId,
           completionNotificationPersistent: tab.completionNotificationPersistent,
           restartAfterTabId: tab.restartAfterTabId,

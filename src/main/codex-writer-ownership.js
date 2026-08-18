@@ -1818,10 +1818,19 @@ function classifyManualCodexSubmitAfterWriteQueue({
   ) {
     return { suppress: true, bypassQueue: false, reason: 'preceding-first-submit-won' };
   }
-  // Resume has an additional launch-scoped reservation. A reservation owned by
-  // another path means arbitration is unresolved even if its write result has
-  // not been published yet; fail closed instead of interleaving two Enters.
+  // Resume has an additional launch-scoped reservation. Before its first Enter
+  // crosses the PTY boundary, a physical Enter must not race the programmatic
+  // write. After that exact Enter was written, the reservation owns only late
+  // audit/attribution — never the user's keyboard. Keeping it as an input lock
+  // would make one unresolved History send disable every later manual Enter.
   if (competingReservation && competingReservation !== ownReservation) {
+    if (competingReservation.enterWritten === true) {
+      return {
+        suppress: false,
+        bypassQueue: false,
+        reason: 'manual-submit-after-reserved-enter',
+      };
+    }
     return { suppress: true, bypassQueue: false, reason: 'provisional-submit-reserved-by-other' };
   }
   return { suppress: false, bypassQueue: false, reason: 'manual-submit-owns-boundary' };

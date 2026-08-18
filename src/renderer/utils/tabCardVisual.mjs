@@ -105,6 +105,15 @@ export const TAB_CARD_LINE_HEIGHT = 1.2;
 export const SPLIT_ATTACH_ROW_MIN_H = 26;
 
 /**
+ * Height of the pane header's SECOND line: the tab's working directory.
+ *
+ * Its own constant rather than a literal at the two places that need it (the
+ * row and everything positioned below the row), for exactly the reason the row
+ * height is computed rather than hard-coded — see the note above.
+ */
+export const SPLIT_ATTACH_PATH_LINE_H = 13;
+
+/**
  * Height of a pane's attach row: the chip's own height plus 1px of air, never
  * below the classic 26 (at default settings the math lands exactly on 26, so
  * nothing moves for anyone who has not touched Размеры).
@@ -112,13 +121,49 @@ export const SPLIT_ATTACH_ROW_MIN_H = 26;
  * Only fontSize and paddingY matter: the task-lane variant shifts padding
  * between top and bottom but keeps the sum, and the status marker only widens
  * the left inset.
+ *
+ * `withPath` adds the directory line under the chip. It is a PARAMETER rather
+ * than a second function because every surface that positions content below the
+ * header must get the same answer as the header itself — the whole reason this
+ * lives in one resolver.
  */
-export function resolveSplitAttachRowHeight(geo, { fontSize } = {}) {
+export function resolveSplitAttachRowHeight(geo, { fontSize, withPath = false } = {}) {
   const paddingY = num(geo?.paddingY, 3);
   const fs = num(fontSize, 14);
   const chipH = Math.ceil(fs * TAB_CARD_LINE_HEIGHT) + paddingY * 2 + 2; // +2 — chip borders
-  return Math.max(SPLIT_ATTACH_ROW_MIN_H, chipH + 1);
+  const base = Math.max(SPLIT_ATTACH_ROW_MIN_H, chipH + 1);
+  return withPath
+    ? base + resolveTabCardBottomOverhang(geo) + SPLIT_ATTACH_PATH_LINE_H
+    : base;
 }
+
+/**
+ * How far a card's marks hang BELOW its box.
+ *
+ * Two of them do it on purpose: the context-usage number and the task-square
+ * lane straddle the bottom edge, because a lane that stops inside the card says
+ * nothing about a boundary. In the sidebar they hang into the gap before the
+ * next card, so the gap is what limits them — and that limit is where this
+ * number comes from.
+ *
+ * The pane header has no next card: under the chip sits the path line. Without
+ * reserving the same room, the marks land ON the path — measured live, the
+ * green context number sat across the tail of «…/custom-terminal». So the header
+ * asks for the overhang and puts it between its two lines.
+ */
+export function resolveTabCardBottomOverhang(geo) {
+  const gap = Math.max(0, Math.floor(num(geo?.gap, 4)));
+  // The badge is clamped by the gap (TabSignals::tabFastBadgeOutsidePx); the
+  // lane by the gap minus the 1px clearance it leaves the next card.
+  const badge = Math.min(TAB_CARD_BADGE_OUTSIDE_PX, gap);
+  const lane = Math.max(0, gap - 1);
+  return Math.max(badge, lane);
+}
+
+// round(TAB_CONTEXT_BADGE_FONT_PX × TAB_FAST_BADGE_OUTSIDE_RATIO) — the share of
+// itself a badge shows outside the card. Lives here, with the rest of the card's
+// geometry, so the header can reserve for it without importing a component.
+export const TAB_CARD_BADGE_OUTSIDE_PX = 3;
 
 const num = (value, fallback) => {
   const n = Number(value);

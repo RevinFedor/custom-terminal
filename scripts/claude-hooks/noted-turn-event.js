@@ -13,6 +13,32 @@ const LEGACY_SOCK = '/tmp/noted-terminal-claude-hook.sock';
 const DISCOVERY_DIR = path.join(os.homedir(), '.noted-terminal');
 const DIAG = process.env.NOTED_CLAUDE_HOOK_DIAG
   || '/tmp/noted-claude-hook-diag.log';
+const MAX_TOOL_METADATA_CHARS = 128 * 1024;
+
+function boundedHookValue(value, budget = { remaining: MAX_TOOL_METADATA_CHARS }, depth = 0) {
+  if (budget.remaining <= 0 || depth > 8 || value == null) return null;
+  if (typeof value === 'string') {
+    const text = value.slice(0, budget.remaining);
+    budget.remaining -= text.length;
+    return text;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (Array.isArray(value)) {
+    const result = [];
+    for (const item of value) {
+      if (budget.remaining <= 0) break;
+      result.push(boundedHookValue(item, budget, depth + 1));
+    }
+    return result;
+  }
+  if (typeof value !== 'object') return null;
+  const result = {};
+  for (const [key, nested] of Object.entries(value)) {
+    if (budget.remaining <= 0) break;
+    result[key] = boundedHookValue(nested, budget, depth + 1);
+  }
+  return result;
+}
 
 function diag(line) {
   try {
@@ -113,7 +139,10 @@ process.stdin.on('end', () => {
     last_assistant_message: payload.last_assistant_message || null,
     stop_hook_active: payload.stop_hook_active || false,
     tool_name: payload.tool_name || null,
-    tool_input: payload.tool_input || null,
+    tool_use_id: payload.tool_use_id || null,
+    tool_input: boundedHookValue(payload.tool_input),
+    tool_response: boundedHookValue(payload.tool_response),
+    error: boundedHookValue(payload.error),
     ts: Date.now(),
   };
   // The exact accepted prompt is causal identity for one UserPromptSubmit

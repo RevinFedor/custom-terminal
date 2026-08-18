@@ -38,6 +38,11 @@ const findCodexTabState = (tabId: string): {
   codexSettingsProofAt?: number;
   codexSettingsProofSessionId?: string;
   codexModelMigrationPending?: boolean;
+  codexLiveModel?: string;
+  codexLiveEffort?: string;
+  codexLiveSettingsSessionId?: string;
+  codexLiveServiceTier?: string;
+  codexLiveServiceTierSessionId?: string;
 } => {
   const state = useWorkspaceStore.getState();
   for (const [, workspace] of state.openProjects) {
@@ -49,10 +54,53 @@ const findCodexTabState = (tabId: string): {
         codexSettingsProofAt: tab.codexSettingsProofAt,
         codexSettingsProofSessionId: tab.codexSettingsProofSessionId,
         codexModelMigrationPending: tab.codexModelMigrationPending,
+        codexLiveModel: tab.codexLiveModel,
+        codexLiveEffort: tab.codexLiveEffort,
+        codexLiveSettingsSessionId: tab.codexLiveSettingsSessionId,
+        codexLiveServiceTier: tab.codexLiveServiceTier,
+        codexLiveServiceTierSessionId: tab.codexLiveServiceTierSessionId,
       };
     }
   }
   return {};
+};
+
+export const getCodexHistoryMutationSettingsProof = (
+  tabId: string,
+  sessionId: string,
+): { model: string; effort: string; proofAt: number; sessionId: string; fast?: boolean } | null => {
+  const tab = findCodexTabState(tabId);
+  const proofAt = Number(tab.codexSettingsProofAt || 0);
+  if (!Number.isFinite(proofAt) || proofAt <= 0) return null;
+  const liveOwner = cleanSetting(tab.codexLiveSettingsSessionId);
+  const liveModel = cleanSetting(tab.codexLiveModel);
+  const liveEffort = cleanSetting(tab.codexLiveEffort);
+  const tierOwner = cleanSetting(tab.codexLiveServiceTierSessionId);
+  const fast = tierOwner === sessionId && tab.codexLiveServiceTier
+    ? tab.codexLiveServiceTier === 'priority'
+    : undefined;
+  if (liveOwner === sessionId && liveModel && liveEffort) {
+    return {
+      model: liveModel,
+      effort: liveEffort,
+      proofAt,
+      sessionId,
+      ...(typeof fast === 'boolean' ? { fast } : {}),
+    };
+  }
+  const model = cleanSetting(tab.codexModel);
+  const effort = cleanSetting(tab.codexEffort);
+  const owner = cleanSetting(tab.codexSettingsProofSessionId);
+  if (owner === sessionId && model && effort) {
+    return { model, effort, proofAt, sessionId, ...(typeof fast === 'boolean' ? { fast } : {}) };
+  }
+  // An explicit pair selected while the tab is stopped is intentionally
+  // ownerless until its next launch. It is still a user-authorized exact pair,
+  // unlike global defaults, and can seed the edited child safely.
+  if (!owner && model && effort && effort !== 'ultra') {
+    return { model, effort, proofAt, sessionId, ...(typeof fast === 'boolean' ? { fast } : {}) };
+  }
+  return null;
 };
 
 export const getCodexLaunchOptions = (tabId: string): {
@@ -108,5 +156,27 @@ export const buildCodexRunPayload = (base: CodexRunPayloadBase): CodexRunPayload
     ...(effortSource ? { effortSource } : {}),
     ...(modelMigrationPending ? { modelMigrationPending: true } : {}),
     ...(settingsIntent ? { settingsIntent } : {}),
+  };
+};
+
+export const buildCodexHistoryMutationResumePayload = (
+  base: CodexRunPayloadBase,
+  proof?: { model: string; effort: string; proofAt: number } | null,
+): CodexRunPayload => {
+  const payload = buildCodexRunPayload(base);
+  if (!proof?.model || !proof?.effort || !Number.isFinite(Number(proof.proofAt))) {
+    return payload;
+  }
+  // This is not a guessed default. It is the exact pair captured before the
+  // mutation stopped the writer (or returned by validated child creation).
+  // Marking it as next-launch lets a legacy rollout with no turn_context be
+  // restored after a pre-publication failure without weakening normal Resume.
+  return {
+    ...payload,
+    model: proof.model,
+    effort: proof.effort,
+    modelSource: 'tab',
+    effortSource: 'tab',
+    settingsIntent: 'next-launch',
   };
 };

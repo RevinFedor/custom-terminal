@@ -6,6 +6,13 @@
 export interface AgentLifecycleSummary {
   tabId: string;
   sessionId?: string | null;
+  /**
+   * Который агент. Поле явное, потому что «продолжить прерванную сессию» должно
+   * знать движок, а вытаскивать его из заголовка (`title.startsWith('CODEX')`)
+   * — значит связать поведение с текстом подписи: перевод или правка формулировки
+   * молча сломали бы возобновление.
+   */
+  engine?: 'claude' | 'codex';
   kind: 'starting' | 'stopping' | 'interrupted' | 'error';
   title: string;
   description: string;

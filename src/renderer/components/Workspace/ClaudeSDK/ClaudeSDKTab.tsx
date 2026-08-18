@@ -55,6 +55,10 @@ import { BackgroundTasksBar } from './BackgroundTasksBar';
 import { TaskDetailPane } from './TaskDetailPane';
 import { WorkflowPanel } from './WorkflowPanel';
 import SDKAskQuestion, { type SDKQuestion } from './SDKAskQuestion';
+import {
+  classifyHistoryAction,
+  historyActionHeadline,
+} from '../../../../shared/history-action-grammar.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -4356,9 +4360,9 @@ const CompactSummaryMsg = () => {
           <span className="text-[0.85em] font-semibold uppercase tracking-wide" style={{ color: '#DA7756' }}>
             Compact summary
           </span>
-          {metrics && (
+          {metrics && metrics.postTokens > 0 && (
             <span className="text-[0.77em] font-mono" style={{ color: '#a87356' }}>
-              {k(metrics.preTokens)} → {k(metrics.postTokens)} tokens · {s}s
+              {k(metrics.postTokens)} tokens · {s}s
             </span>
           )}
         </div>
@@ -4535,12 +4539,26 @@ const ToolCallPart = ({ toolName, args, result, isError }: { toolName: string; a
   const anchorRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(() => defaultOpenForTool(toolName));
   const onToggle = useStableCollapseToggle(anchorRef, () => setOpen(v => !v));
+  const classified = classifyHistoryAction({ toolName, args });
+  const headline = historyActionHeadline({
+    toolName,
+    args,
+    family: classified.family,
+    bashWord: classified.bashWord,
+    bashDetail: classified.bashDetail,
+    mcpServer: classified.mcpServer,
+    mcpMethod: classified.mcpMethod,
+  });
   return (
     <CBToolCallPart
       toolName={toolName}
       args={args}
       result={result}
       isError={isError}
+      family={classified.family}
+      headline={headline}
+      mcpServer={classified.mcpServer}
+      mcpMethod={classified.mcpMethod}
       collapse={{ open, onToggle, anchorRef }}
     />
   );

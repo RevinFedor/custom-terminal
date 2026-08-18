@@ -963,7 +963,13 @@ async function ensureAgentReadyForSend({
   if (presence?.status === 'busy') return 'busy';
   if (isReadyComposer()) {
     await waitStartupDefaultsIfNeeded();
-    return 'active';
+    presence = await runtime.getPresence(tabId).catch(() => null);
+    assertSendNotCancelled();
+    if (presence?.status === 'stopping') {
+      throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
+    }
+    if (presence?.status === 'busy') return 'busy';
+    if (isReadyComposer()) return 'active';
   }
   if (presence?.status === 'active' && !presence?.inputReady && sessionId && runtime.inspectDraft) {
     const draftState = runtime.inspectDraft(tabId);
@@ -1023,6 +1029,23 @@ async function ensureAgentReadyForSend({
           + ' inputReady=' + !!presence?.inputReady
           + ' busy=' + !!presence?.isBusy);
       }
+      if (toolType === 'claude' && presence?.status === 'starting') {
+        // The first Claude prompt glyph is only a wake-up hint. Startup can
+        // still own the composer with /model or /effort, so wait for the exact
+        // launch gate and then re-read one coherent presence snapshot.
+        readyWait.cancel();
+        await waitStartupDefaultsIfNeeded();
+        presence = await runtime.getPresence(tabId).catch(() => null);
+        assertSendNotCancelled();
+        if (presence?.status === 'stopping') {
+          throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
+        }
+        if (presence?.status === 'busy') return 'busy';
+        if (isReadyComposer()) return 'active';
+        // The wait above cancelled this pass's listener. Re-arm before the
+        // next coherent presence check instead of awaiting a dead promise.
+        continue;
+      }
       if (presence?.status === 'stopping') {
         throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
       }
@@ -1030,7 +1053,13 @@ async function ensureAgentReadyForSend({
       if (isReadyComposer()) {
         readyWait.cancel();
         await waitStartupDefaultsIfNeeded();
-        return 'active';
+        presence = await runtime.getPresence(tabId).catch(() => null);
+        assertSendNotCancelled();
+        if (presence?.status === 'stopping') {
+          throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
+        }
+        if (presence?.status === 'busy') return 'busy';
+        if (isReadyComposer()) return 'active';
       }
       if (remainingMs <= 0) {
         throw new Error(runtime.label + ' session is not ready for send');

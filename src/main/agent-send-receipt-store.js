@@ -43,11 +43,11 @@ const STARTUP_UNCONFIRMED_STATES = new Set([
   STORE_STATES.AUDIT_PENDING,
 ]);
 
-const DISMISSIBLE_PRESENTATION_STATES = new Set([
-  STORE_STATES.ENTER_ARMED,
-  STORE_STATES.DELIVERY_UNKNOWN,
-  STORE_STATES.AUDIT_PENDING,
-]);
+// Dismissal changes only the desktop History presentation. It never changes
+// delivery truth, retryability or the active PTY operation, so every durable
+// receipt state is safe to hide. A canonical provider row may still appear at
+// its real transcript position later.
+const DISMISSIBLE_PRESENTATION_STATES = new Set(Object.values(STORE_STATES));
 
 const REPLAY_STATES = new Set([
   STORE_STATES.IN_FLIGHT,
@@ -479,7 +479,7 @@ class AgentSendReceiptStore {
             updated_at = @dismissedAt
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
-          AND state IN ('enter-armed', 'delivery-unknown', 'audit-pending')
+          AND state = @expectedState
       `),
       startupInFlight: this.db.prepare(`
         SELECT * FROM ${TABLE_NAME}
@@ -1408,6 +1408,7 @@ class AgentSendReceiptStore {
       const info = this.statements.dismissPresentation.run({
         operationKey,
         attemptId,
+        expectedState: record.state,
         receiptJson: encodeJson(receipt),
         dismissedAt,
       });
