@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   deriveConfirmedClaudeSettings,
+  deriveLatestConfirmedClaudeRuntimeEffort,
   projectConfirmedClaudeSettingsForRuntime,
   traceClaudeActiveBranch,
 } = require('./claude-confirmed-settings');
@@ -109,6 +110,45 @@ test('active parentUuid branch excludes a physically newer abandoned Rewind futu
     'live-out',
   ]);
   assert.equal(deriveConfirmedClaudeSettings(activeBranch).model.value, 'sonnet');
+});
+
+test('process-local effort remains provable after the conversation branch moves past its slash pair', () => {
+  const base = wrapper('base-model', null, 'model', 'opus', 1);
+  const baseOut = stdout('base-model-out', 'base-model', 'Set model to Opus 5', 2);
+  const effort = wrapper('runtime-effort', 'base-model-out', 'effort', 'max', 3);
+  const effortOut = stdout(
+    'runtime-effort-out',
+    'runtime-effort',
+    'Set effort level to max (this session only)',
+    4,
+  );
+  const laterTurn = {
+    uuid: 'later-turn',
+    parentUuid: 'base-model-out',
+    type: 'user',
+    message: { content: 'Continue working' },
+    timestamp: '2026-07-23T10:00:05.000Z',
+    sessionId: 'session-a',
+    _fromFile: 'session-a',
+    _fileIndex: 5,
+  };
+  const records = [base, baseOut, effort, effortOut, laterTurn];
+  const { activeBranch } = traceClaudeActiveBranch({
+    recordMap: new Map(records.map((record) => [record.uuid, record])),
+    lastRecord: laterTurn,
+  });
+
+  assert.equal(deriveConfirmedClaudeSettings(activeBranch)?.effort, undefined);
+  assert.deepEqual(
+    deriveLatestConfirmedClaudeRuntimeEffort(records, { sessionId: 'session-a' }),
+    {
+      value: 'max',
+      proofAt: Date.parse(effortOut.timestamp),
+      proofSessionId: 'session-a',
+      wrapperUuid: 'runtime-effort',
+      stdoutUuid: 'runtime-effort-out',
+    },
+  );
 });
 
 test('linked resume chain can inherit a confirmed parent setting', () => {

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -42,6 +43,10 @@ const DOCS_ONLY_STORAGE_KEY = 'noted-terminal.git.docsOnlyAiContext';
 const DEFAULT_PANEL_SIZE = { width: 1040, height: 640 };
 const MIN_PANEL_SIZE = { width: 760, height: 420 };
 const PANEL_MARGIN = 16;
+// Ниже этой ширины ОКНА (не экрана) чип Git показывает только значок: строку
+// он делит с полосой вкладок, и обрезанное многоточием название стоит места
+// больше, чем сообщает.
+const GIT_CHIP_BRANCH_MIN_HOST_PX = 520;
 const MIN_LEFT_PANE_WIDTH = 320;
 const MIN_RIGHT_PANE_WIDTH = 380;
 const HISTORY_PAGE_SIZE = 60;
@@ -431,7 +436,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
   const panelRef = useRef<HTMLDivElement>(null);
   const generateButtonRef = useRef<HTMLButtonElement>(null);
   const generateCommitButtonRef = useRef<HTMLButtonElement>(null);
-  const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
+  const [pos, setPos] = useState<
+    { top: number; left: number; maxWidth: number; maxHeight: number } | null
+  >(null);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
   const [selectedPathsManual, setSelectedPathsManual] = useState(false);
   const [panelTab, setPanelTab] = useState<'changes' | 'history'>('changes');
@@ -439,7 +446,38 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
   const [docsOnlyWhenPresent, setDocsOnlyWhenPresent] = useState(loadDocsOnlySetting);
   const [search, setSearch] = useState('');
   const [activeFilePath, setActiveFilePath] = useState('');
+  // Показывать ли НАЗВАНИЕ ВЕТКИ.
+  //
+  // В шапке окна кнопка делит строку с полосой вкладок, и в узком окне название
+  // ветки отъедало у вкладок ширину ради надписи, которая всё равно обрезалась
+  // многоточием. Ниже порога остаётся значок — он говорит «здесь Git», а ветку
+  // называет подсказка при наведении.
+  //
+  // Порог считается от ширины ОКНА, а не экрана: кнопка живёт в окне, и на 4K с
+  // одним окном во весь экран любой процент от монитора не значит ничего.
+  const [showBranchName, setShowBranchName] = useState(true);
+  useEffect(() => {
+    const host = triggerRef.current?.closest('[data-split-attach-row]')
+      || triggerRef.current?.parentElement;
+    if (!host || typeof ResizeObserver === 'undefined') return undefined;
+    const measure = () => {
+      const width = (host as HTMLElement).getBoundingClientRect().width;
+      // Ширина, а не число колонок: колонка — позиция в списке, а места на
+      // экране у неё столько, сколько дали перегородки.
+      setShowBranchName(width >= GIT_CHIP_BRANCH_MIN_HOST_PX);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(host as HTMLElement);
+    return () => ro.disconnect();
+  }, []);
+
   const [panelSize, setPanelSize] = useState(() => normalizePanelSize(DEFAULT_PANEL_SIZE));
+  // Размер нужен ПРИ РАСЧЁТЕ места, но читать его из замыкания нельзя: сторона
+  // выбирается по тому, влезет ли панель, а замыкание помнит размер на момент
+  // открытия — после ресайза выбор считался бы по старому.
+  const panelSizeRef = useRef(panelSize);
+  panelSizeRef.current = panelSize;
   const [splitLeftWidth, setSplitLeftWidth] = useState(() => normalizeSplitLeftWidth(undefined, DEFAULT_PANEL_SIZE.width));
   const [commitDescriptionLines, setCommitDescriptionLines] = useState(() => normalizeCommitDescriptionLines(undefined));
   const [selectedRepoPath, setSelectedRepoPath] = useState(projectPath || '');
@@ -919,18 +957,62 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
     loadStatus(false);
   }, [loadStatus]);
 
+  // ГДЕ раскрывается панель.
+  //
+  // Пока Git жил в общей верхней полосе, ответ был один на всё приложение:
+  // «под полосой, во всю ширину справа». Кнопка переехала в шапку ОКНА, а окон
+  // может быть сколько угодно и где угодно — окно внизу слева не имеет под
+  // собой ничего, и панель, раскрытая вниз, ушла бы за экран.
+  //
+  // Сторона выбирается по СВОБОДНОМУ МЕСТУ вокруг кнопки, а не по номеру
+  // колонки: колонка — позиция в списке, а не место на экране, и первая колонка
+  // при одном окне и при трёх стоит в разных местах. Считаем от прямоугольника
+  // самой кнопки, он всегда честен.
+  //
+  // После выбора стороны панель ДОВОДИТСЯ в экран тем же общим механизмом,
+  // которым уже прижимаются меню вкладки и меню деления окна
+  // (`clampMenuToViewport`). Отсюда следует важное: с кнопкой у панели общей
+  // остаётся только та сторона, от которой она раскрылась, — по второй оси она
+  // может встать не вплотную. Жёсткая привязка обоих краёв к кнопке выглядит
+  // аккуратнее ровно до первого узкого окна у края экрана, где панель просто
+  // уезжает за границу.
   useEffect(() => {
     if (!open || !triggerRef.current) return;
     const place = () => {
-      const toolbar = triggerRef.current!.closest('[data-project-toolbar]') as HTMLElement | null;
-      const anchorRect = toolbar?.getBoundingClientRect() || triggerRef.current!.getBoundingClientRect();
-      setPos({ top: Math.max(0, Math.round(anchorRect.bottom)), right: 0 });
+      const rect = triggerRef.current!.getBoundingClientRect();
+      const size = normalizePanelSize(panelSizeRef.current);
+      const below = window.innerHeight - rect.bottom;
+      const above = rect.top;
+      // Вниз — по умолчанию: панель читается как продолжение кнопки. Вверх
+      // уходим, только когда снизу не помещается И сверху места честно больше.
+      const openUp = below < size.height + PANEL_MARGIN && above > below;
+      const desiredTop = openUp ? rect.top - size.height : rect.bottom;
+      // По горизонтали панель выравнивается по ЛЕВОМУ краю кнопки: слева от неё
+      // стоят чипы вкладок, и панель, растущая влево, накрывала бы их.
+      const clamped = clampMenuToViewport({
+        x: rect.left,
+        y: desiredTop,
+        width: size.width,
+        height: size.height,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        pad: PANEL_MARGIN,
+      });
+      setPos({
+        top: Math.max(0, Math.round(clamped.y)),
+        left: Math.max(0, Math.round(clamped.x)),
+        // Место под панель считается ОТ ЕЁ КРАЯ до края экрана, а не от нуля:
+        // раньше панель начиналась у правого края и «сколько влезает» совпадало
+        // с шириной экрана.
+        maxWidth: Math.max(MIN_PANEL_SIZE.width, window.innerWidth - clamped.x - PANEL_MARGIN),
+        maxHeight: Math.max(MIN_PANEL_SIZE.height, window.innerHeight - clamped.y - PANEL_MARGIN),
+      });
       setPanelSize((prev) => normalizePanelSize(prev));
     };
     place();
     window.addEventListener('resize', place);
     return () => window.removeEventListener('resize', place);
-  }, [open]);
+  }, [open, panelSize.width, panelSize.height]);
 
   useEffect(() => {
     if (!panelStateKey) return;
@@ -1819,8 +1901,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
     : '';
   const renderedPanelSize = pos
     ? {
-      width: Math.max(MIN_PANEL_SIZE.width, Math.min(panelSize.width, window.innerWidth - pos.right - PANEL_MARGIN)),
-      height: Math.max(MIN_PANEL_SIZE.height, Math.min(panelSize.height, window.innerHeight - pos.top - PANEL_MARGIN)),
+      width: Math.max(MIN_PANEL_SIZE.width, Math.min(panelSize.width, pos.maxWidth)),
+      height: Math.max(MIN_PANEL_SIZE.height, Math.min(panelSize.height, pos.maxHeight)),
     }
     : panelSize;
   const renderedSplitLeftWidth = normalizeSplitLeftWidth(splitLeftWidth, renderedPanelSize.width);
@@ -1928,18 +2010,22 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
         }}
       >
         <GitBranch size={12} />
-        <span style={{ maxWidth: 72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 700 }}>
-          {status.branch}
-        </span>
-        <span style={gitToolbarRunAfterStatusStyle(gitNavbarStatusPhase)}>
-          {gitNavbarStatusPhase === 'success' ? (
-            <Check size={11} strokeWidth={2.5} />
-          ) : gitNavbarStatusPhase === 'waiting' || gitNavbarStatusPhase === 'running' ? (
-            <Loader2 size={11} className="animate-spin" />
-          ) : null}
-        </span>
+        {/* Название ветки исчезает в узком окне — см. showBranchName. */}
+        {showBranchName && (
+          <span style={{ maxWidth: 72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 700 }}>
+            {status.branch}
+          </span>
+        )}
+        {/* Число изменений и загрузчик — ОДНО место, а не два.
+            Отдельный слот под загрузчик занимал ширину всегда, в том числе
+            когда ничего не идёт: постоянная плата за редкое событие, и это
+            в шапке окна, где ширину делят с чипами вкладок. Теперь кольцо
+            крутится ВОКРУГ числа: занятость — свойство того же счётчика, а
+            не соседний значок. Кольцо рисуется рамкой поверх, поэтому не
+            меняет размер овала: двузначное число просто шире. */}
         <span
           style={{
+            position: 'relative',
             minWidth: 28,
             height: 16,
             padding: '0 5px',
@@ -1957,6 +2043,32 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
           }}
         >
           {compactText}
+          {gitNavbarStatusPhase === 'running' || gitNavbarStatusPhase === 'waiting' ? (
+            <span
+              data-git-chip-spinner
+              aria-hidden
+              className="animate-spin"
+              style={{
+                position: 'absolute',
+                inset: -2,
+                borderRadius: 999,
+                border: '1.5px solid transparent',
+                borderTopColor: gitNavbarStatusPhase === 'running' ? '#fbbf24' : 'rgba(251,191,36,0.55)',
+                pointerEvents: 'none',
+              }}
+            />
+          ) : gitNavbarStatusPhase === 'success' ? (
+            <span
+              aria-hidden
+              style={{
+                position: 'absolute',
+                inset: -2,
+                borderRadius: 999,
+                border: '1.5px solid rgba(74,222,128,0.75)',
+                pointerEvents: 'none',
+              }}
+            />
+          ) : null}
         </span>
       </button>
       </ControlHint>
@@ -1974,14 +2086,17 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
             style={{
               position: 'fixed',
               top: pos.top,
-              right: pos.right,
+              left: pos.left,
               zIndex: 9999,
               width: renderedPanelSize.width,
               height: renderedPanelSize.height,
               overflow: 'hidden',
               backgroundColor: '#181a1f',
               border: '1px solid #373b44',
-              borderRadius: '0 0 0 8px',
+              // Панель больше не приклеена к правому краю экрана — скругление
+              // по всем углам, иначе два из них выглядят обрезанными посреди
+              // рабочей области.
+              borderRadius: 8,
               boxShadow: '0 14px 38px rgba(0,0,0,0.62)',
               color: '#e5e7eb',
               display: 'flex',

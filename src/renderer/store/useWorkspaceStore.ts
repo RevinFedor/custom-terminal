@@ -51,7 +51,6 @@ import {
   reprojectPaneTabs,
   insertIntoStrip,
   removeFromStrip,
-  replaceInStrip,
   arrangePanes,
 } from '../utils/splitPanesModel.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
@@ -4070,14 +4069,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const _t0 = performance.now();
       const _startAbs = performance.timeOrigin + _t0;
       const prevActiveId = workspace.activeTabId;
-      // What the CENTRE was showing, captured before anything is overwritten.
-      // Not the same as prevActiveId once the switch crosses projects: that one
-      // is the target project's previous tab, this one is the tab on screen.
-      const centerShownBefore = (() => {
-        const centerPid = get().activeProjectId;
-        if (!centerPid) return null;
-        return openProjects.get(centerPid)?.activeTabId || null;
-      })();
       const currentView = workspace.currentView;
       const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
       const targetTab = workspace.tabs.get(tabId);
@@ -4108,8 +4099,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           }
         } else {
           // Single mode: the centre's strip follows the same rule as a window's
-          // — the shown chip is REPLACED in place, so ordinary navigation never
-          // grows the strip.
+          // — a tab that is not in the strip JOINS it, at the end. A tab that
+          // already has a chip is simply shown (nothing to write here: the chip
+          // stays where the user put it, and the centre's active tab is what
+          // moved).
           //
           // Keyed by the project the centre was showing BEFORE this switch: the
           // strip belongs to that centre, and the incoming tab may come from a
@@ -4118,11 +4111,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           const key = get().activeProjectId || projectId;
           const strip = get().centerStrips[key];
           if (strip && strip.length > 0) {
-            // The OUTGOING chip is what the centre was showing — the active tab
-            // of the centre's own project, read before this switch overwrote it.
-            // `prevActiveId` above is the previous tab of the TARGET project,
-            // which is a different thing whenever the switch crosses projects.
-            const next = replaceInStrip(strip, centerShownBefore || '', projectId, tabId);
+            const next = insertIntoStrip(strip, projectId, tabId);
             if (next !== strip) set({ centerStrips: { ...get().centerStrips, [key]: next } });
           }
         }

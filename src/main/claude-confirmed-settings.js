@@ -252,6 +252,59 @@ function deriveConfirmedClaudeSettings(activeBranch) {
 }
 
 /**
+ * Effort is a process-local setting, not a conversational-branch setting.
+ * Claude writes local slash commands beside the normal parentUuid chain; once
+ * the next ordinary turn lands, that local-command pair may no longer be an
+ * ancestor of the active conversation even though it still controls the same
+ * live process. Read the latest exact wrapper -> stdout pair from the physical
+ * session records and let the runtime-generation projection below decide
+ * whether that proof belongs to the current process.
+ */
+function deriveLatestConfirmedClaudeRuntimeEffort(records, { sessionId = null } = {}) {
+  const values = Array.isArray(records) ? records : Array.from(records || []);
+  const byUuid = new Map(
+    values
+      .filter((record) => record?.uuid)
+      .map((record) => [record.uuid, record])
+  );
+  const expectedSessionId = String(sessionId || '').trim() || null;
+  let latest = null;
+
+  for (let order = 0; order < values.length; order += 1) {
+    const record = values[order];
+    const wrapper = byUuid.get(record?.parentUuid);
+    const setting = parseClaudeSettingWrapper(wrapper);
+    if (setting?.kind !== 'effort' || !isConfirmedClaudeSettingStdout(record, setting)) continue;
+    const proofAt = Date.parse(record.timestamp || wrapper.timestamp || '');
+    const proofSessionId = record.sessionId || wrapper.sessionId || record._fromFile || null;
+    if (expectedSessionId && proofSessionId && proofSessionId !== expectedSessionId) continue;
+    const candidate = {
+      value: setting.value,
+      proofAt: Number.isFinite(proofAt) ? proofAt : 0,
+      proofSessionId,
+      wrapperUuid: wrapper.uuid,
+      stdoutUuid: record.uuid,
+      fileIndex: Number.isFinite(Number(record._fileIndex)) ? Number(record._fileIndex) : -1,
+      order,
+    };
+    if (!latest
+      || candidate.proofAt > latest.proofAt
+      || (candidate.proofAt === latest.proofAt && candidate.fileIndex > latest.fileIndex)
+      || (
+        candidate.proofAt === latest.proofAt
+        && candidate.fileIndex === latest.fileIndex
+        && candidate.order > latest.order
+      )) {
+      latest = candidate;
+    }
+  }
+
+  if (!latest) return null;
+  const { fileIndex: _fileIndex, order: _order, ...proof } = latest;
+  return proof;
+}
+
+/**
  * `/effort` is explicitly process-local in Claude Code (its confirmation says
  * "this session only"). JSONL therefore proves what an older runtime used, not
  * what a newly resumed process is using. Keep the historical fact for History,
@@ -287,6 +340,7 @@ function projectConfirmedClaudeSettingsForRuntime(result, runtimeScope = null) {
 
 module.exports = {
   deriveConfirmedClaudeSettings,
+  deriveLatestConfirmedClaudeRuntimeEffort,
   isConfirmedClaudeSettingStdout,
   normalizeClaudeLocalCommandText,
   parseClaudeSettingWrapper,

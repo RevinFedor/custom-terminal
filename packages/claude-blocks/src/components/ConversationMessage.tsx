@@ -227,6 +227,7 @@ export interface MessageEventProps
   pending?: boolean;
   icon?: React.ReactNode;
   meta?: React.ReactNode;
+  actions?: React.ReactNode;
   entryUuid?: string;
   children?: React.ReactNode;
 }
@@ -238,6 +239,7 @@ export const MessageEvent: React.FC<MessageEventProps> = ({
   pending = false,
   icon,
   meta,
+  actions,
   entryUuid,
   children,
   className,
@@ -251,14 +253,17 @@ export const MessageEvent: React.FC<MessageEventProps> = ({
     className={className}
   >
     <div className="cb-message-event-card">
-      <MessageStatusBadge
-        label={label}
-        tone={tone === 'default' ? 'neutral' : tone}
-        pending={pending}
-        icon={icon}
-        meta={meta}
-        className="cb-message-event-status"
-      />
+      <div className="cb-message-event-head">
+        <MessageStatusBadge
+          label={label}
+          tone={tone === 'default' ? 'neutral' : tone}
+          pending={pending}
+          icon={icon}
+          meta={meta}
+          className="cb-message-event-status"
+        />
+        {actions != null && <div className="cb-message-event-actions">{actions}</div>}
+      </div>
       {children != null && <div className="cb-message-event-body">{children}</div>}
     </div>
   </ConversationMessage>

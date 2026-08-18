@@ -144,7 +144,7 @@ test('cwd footer is not readiness proof without the current composer prompt', ()
   assert.equal(inspected.reason, 'no-composer-frame');
 });
 
-test('current startup blocker still wins over a cwd composer footer', () => {
+test('current MCP progress does not block a verified cwd composer footer', () => {
   const inspected = inspectCodexInputReadyTextCore([
     'Starting MCP servers (1/2)',
     '› Write tests for @filename',
@@ -153,8 +153,9 @@ test('current startup blocker still wins over a cwd composer footer', () => {
     requireSyncMarker: false,
     blockers: ['mcp-startup'],
   });
-  assert.equal(inspected.ready, false);
-  assert.equal(inspected.reason, 'blocked:mcp-startup');
+  assert.equal(inspected.ready, true);
+  assert.equal(inspected.reason, 'ready:mcp-startup-background');
+  assert.deepEqual(inspected.ignoredBlockers, ['mcp-startup']);
 });
 
 test('finds the latest supported composer marker', () => {
@@ -168,14 +169,30 @@ test('does not mistake Russian guillemets inside a draft for composer markers', 
   assert.equal(hasCodexComposerPromptGlyph('Обычная строка: «готово»'), false);
 });
 
-test('a current startup blocker wins over a visible composer', () => {
-  const inspected = inspectCodexInputReadyTextCore(readyFrame('»'), '', {
+test('a current MCP progress row does not block a verified visible composer', () => {
+  const inspected = inspectCodexInputReadyTextCore([
+    'Starting MCP servers (9/10): openaiDeveloperDocs',
+    readyFrame('»'),
+  ].join('\n'), '', {
+    requireSyncMarker: false,
+    blockers: ['mcp-startup'],
+  });
+  assert.equal(inspected.ready, true);
+  assert.equal(inspected.reason, 'ready:mcp-startup-background');
+  assert.equal(inspected.hasComposerFrame, true);
+});
+
+test('MCP interrupted remains blocked even when a composer is visible', () => {
+  const inspected = inspectCodexInputReadyTextCore([
+    '⚠ MCP startup interrupted. The following servers were not initialized: docs',
+    '› Explain this codebase',
+    'gpt-5.6-sol max · Full Access',
+  ].join('\n'), '', {
     requireSyncMarker: false,
     blockers: ['mcp-startup'],
   });
   assert.equal(inspected.ready, false);
   assert.equal(inspected.reason, 'blocked:mcp-startup');
-  assert.equal(inspected.hasComposerFrame, true);
 });
 
 test('authoritative current MCP blocker is never ignored after READY or during a prompt', () => {
@@ -362,6 +379,10 @@ test('MCP watchdog survives an animated redraw gap until a decisive frame arrive
   assert.deepEqual(decideCodexMcpWatchdogReconcile({
     inspected: { ready: true, reason: 'ready', blockers: [] },
     mcpVisible: false,
+  }), { action: 'clear', reason: 'current-composer-ready' });
+  assert.deepEqual(decideCodexMcpWatchdogReconcile({
+    inspected: { ready: true, reason: 'ready:mcp-startup-background', blockers: [] },
+    mcpVisible: true,
   }), { action: 'clear', reason: 'current-composer-ready' });
   assert.deepEqual(decideCodexMcpWatchdogReconcile({
     inspected: { ready: false, reason: 'blocked:auth-required', blockers: ['auth-required'] },

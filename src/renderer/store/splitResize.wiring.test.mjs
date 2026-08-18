@@ -124,14 +124,18 @@ test('the split button greys out when refused instead of disappearing', () => {
   assert.match(row, /Сначала выберите вкладку для пустой панели/);
 });
 
-test('"add to workspace" asks the model, never counts panes itself', () => {
-  // It counted panes, which refused a third column while the screen still had
-  // room. The count caps are gone now, but the rule that survives them is the
-  // one that mattered: one place answers "can this still be split", and every
-  // caller asks IT rather than re-deriving the answer from a number.
+test('«можно ли ещё делить» спрашивают у модели, а не считают панели', () => {
+  // Когда-то это считалось числом панелей и отказывало в третьей колонке, пока
+  // на экране ещё было место. Ограничений по числу давно нет, но правило,
+  // которое их пережило, важнее: на вопрос отвечает ОДНО место, и вызывающие
+  // спрашивают его, а не выводят ответ из числа заново.
+  //
+  // Пункты контекстного меню «Добавить в область» и «Открыть в этом окне»
+  // удалены по просьбе пользователя (2026-08-18), поэтому единственный
+  // оставшийся вызывающий — шапка окна; она проверена тестом выше.
   const tabBar = read('..', 'components', 'Workspace', 'TabBar.tsx');
-  assert.ok(!/const splitFull = splitPanes\.length >= 3;/.test(tabBar));
-  assert.match(tabBar, /splitFull = !splitAvailability\(splitPanes, null\)\.horizontal/);
+  assert.ok(!/splitPanes\.length >= 3/.test(tabBar), 'счёт панелей не должен вернуться');
+  assert.ok(!/Добавить в область/.test(tabBar));
 });
 
 // ── Gestures around the drag ──────────────────────────────────────────────

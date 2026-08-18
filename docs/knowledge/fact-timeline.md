@@ -20,6 +20,13 @@
 
    **Visibility/authority:** янтарный native Rewind подчиняется live-runtime readiness и во время `busy/starting/stopping` остаётся видимым disabled. Сиреневый suffix-Rewind и Delete владеют полным сценарием `stop → mutate именно показанную сохранённую session → restart`, поэтому не зависят от предварительного Codex writer-proof, не исчезают в `provisional-source` после Resume и не блокируются обычным turn loader. Disabled для них означает только уже начавшуюся destructive preparation/mutation. Прод-шрам 2026-08-17, `tab-3608`: после успешного Delete `01a00f1a → a1fd561d` Resume оставался `provisional-source` более двух минут; старая проверка `canRewriteHistory/canDeleteHistory` спрятала сиреневую строку и выключила Delete, пока ручной Escape случайно не создал writer-proof.
    Кнопка Rewind под user-сообщением History передаёт сюда raw UUID и использует тот же eligibility guard/handler; второй rollback-flow запрещён.
+   Native Rewind Claude/Codex удерживает одну общую PTY-транзакцию. Внутренний
+   захват composer работает на уже занятой write-boundary и не вызывает
+   публичный сериализованный capture повторно. До подтверждающего Enter Cancel
+   считается завершённым только после выхода main-handler из этой транзакции;
+   renderer всё это время показывает `CANCELLING REWIND`, а после settlement
+   физический terminal input больше не ждёт старого Rewind. Локальная failed /
+   cancelled event-карточка закрывается крестиком как presentation-only запись.
    Цвет заметки в меню — её собственный `#0891b2`, тот же, что у полоски и точки заметки на таймлайне: сиреневый теперь означает «откат переписыванием», и один цвет не может стоять за двумя разными действиями в одном меню.
 
    Destructive-действия во время активной отправки/ответа не меняют историю, но и не исчезают из меню: single/range Delete остаются видимыми disabled с объяснением «дождись завершения». Полное скрытие создавало ложное ощущение, что capability случайно пропала; runtime-verdict и повторный guard непосредственно перед mutation при этом остаются обязательными.

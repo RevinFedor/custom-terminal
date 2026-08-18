@@ -8154,6 +8154,7 @@ ipcMain.handle('__test:codex-action-authority', (_event, payload = {}) => {
 // Enter. Keep operation ownership in main so a stale component cannot cancel a
 // newer rewind, and so cancellation never types `q` after mutation began.
 const activeRewindOperations = new Map(); // tabId → { opId, toolType, mutationStarted, protocolUiOpen }
+const rewindOperationSettlements = new WeakMap(); // operation → { promise, resolve }
 let codexRewindRecoveryScanStatus = 'not-run'; // complete | unknown
 const codexLaunchObservationPending = new Map(); // tabId → launchId while observer is being attached
 // tabId → launchId from PTY write until authoritative TUI/rollout/lifecycle
@@ -21812,9 +21813,12 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   let claudeDraftGuardProof = null;
   let effectiveClaudeExactEmptyEvidence = claudeExactEmptyEvidence || startupExactEmptyEvidence;
   const exactSendCancellationRequested = () => !!(
-    broadcastTabId
-    && handoffId
-    && agentSendCancellations.isCancelled(broadcastTabId, handoffId, sendAttemptId)
+    sendOperationContext?.cancelRequested === true
+    || (
+      broadcastTabId
+      && handoffId
+      && agentSendCancellations.isCancelled(broadcastTabId, handoffId, sendAttemptId)
+    )
   );
   const cancelledSendResult = (stage) => {
     console.warn(logPrefix + ' [AgentSendCancel] refuse tab=' + String(broadcastTabId || '').slice(-12)
@@ -22655,12 +22659,15 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     const cancellationWait = broadcastTabId && handoffId
       ? agentSendCancellations.wait(broadcastTabId, handoffId, sendAttemptId)
       : null;
-    const renderOutcome = cancellationWait
-      ? await Promise.race([
-          render.then(value => ({ kind: 'render', value })),
-          cancellationWait.promise.then(value => ({ kind: 'cancel', value })),
-        ])
-      : { kind: 'render', value: await render };
+    const renderRaces = [render.then(value => ({ kind: 'render', value }))];
+    if (cancellationWait) {
+      renderRaces.push(cancellationWait.promise.then(value => ({ kind: 'cancel', value })));
+    }
+    if (sendOperationContext?.cancelPromise) {
+      renderRaces.push(Promise.resolve(sendOperationContext.cancelPromise)
+        .then(value => ({ kind: 'cancel', value })));
+    }
+    const renderOutcome = await Promise.race(renderRaces);
     cancellationWait?.dispose();
     if (renderOutcome.kind === 'cancel' && renderOutcome.value?.cancelled === true) {
       render.cancel?.();
@@ -27133,11 +27140,37 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId, desiredThinking = 
 const rewindCancelTabs = new Set();
 
 function beginActiveRewindOperation(tabId, toolType, opId) {
-  return claimRewindOperation(activeRewindOperations, { tabId, toolType, opId });
+  const claim = claimRewindOperation(activeRewindOperations, { tabId, toolType, opId });
+  if (claim.success) {
+    let resolve;
+    const promise = new Promise((done) => { resolve = done; });
+    rewindOperationSettlements.set(claim.operation, { promise, resolve });
+  }
+  return claim;
 }
 
 function finishActiveRewindOperation(operation) {
-  finishRewindOperation(activeRewindOperations, operation);
+  const finished = finishRewindOperation(activeRewindOperations, operation);
+  if (finished) {
+    const settlement = rewindOperationSettlements.get(operation);
+    rewindOperationSettlements.delete(operation);
+    settlement?.resolve?.({ settled: true });
+  }
+  return finished;
+}
+
+async function waitForActiveRewindSettlement(operation, timeoutMs = 12000) {
+  const settlement = rewindOperationSettlements.get(operation);
+  if (!settlement) return true;
+  let timer = null;
+  const outcome = await Promise.race([
+    settlement.promise.then(() => true),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return outcome === true;
 }
 
 function markActiveRewindMutationStarted(operation, sender) {
@@ -27182,29 +27215,42 @@ ipcMain.handle('rewind:cancel', async (_event, { tabId, toolType, opId } = {}) =
     return cancelDecision.response;
   }
   rewindCancelTabs.add(tabId);
+  // A native Rewind owns the shared PTY write boundary until its handler
+  // observes this cancellation. Do not tell the renderer that Cancel finished
+  // before that transaction actually releases: otherwise the UI unlocks while
+  // physical keys are still queued behind the old owner.
+  if (operation.ptyWriteOperation) {
+    operation.ptyWriteOperation.cancelRequested = true;
+    operation.ptyWriteOperation.resolveCancel?.({ cancelled: true });
+  }
   if (operation.toolType === 'codex') {
     revokeCodexActionAuthoritiesForTab(tabId, 'rewind-cancelled', {
       profile: CODEX_ACTION_PROFILE_NATIVE_REWIND,
     });
   }
   const term = terminals.get(tabId);
-  if (term) {
-    try {
-      // `q` in a clean Codex composer is user input, not cancel. Only send it
-      // when the transcript protocol UI is known to be open; otherwise the
-      // operation observes rewindCancelTabs before its next write.
-      if (operation.toolType !== 'codex' || operation.protocolUiOpen) {
-        term.write(operation.toolType === 'codex' ? 'q' : '\x1b');
-      }
-    } catch (err) {
-      console.warn('[Rewind:Cancel] write failed tab=' + String(tabId).slice(-12) + ' error=' + (err?.message || err));
-    }
-  }
+  // The transaction that opened a picker is the only owner allowed to close
+  // it. Writing Esc/q here would bypass the PTY serializer and can race that
+  // transaction's own finally-cleanup (a second q becomes user text in a clean
+  // Codex composer). The cancellation signal wakes/bounds its current wait;
+  // its catch/finally performs the one protocol-specific close.
   console.log('[Rewind:Cancel] accepted tab=' + String(tabId).slice(-12)
     + ' tool=' + operation.toolType
     + ' op=' + operation.opId
     + ' hasTerm=' + !!term
     + ' protocolUiOpen=' + operation.protocolUiOpen);
+  const settled = await waitForActiveRewindSettlement(operation);
+  if (!settled) {
+    console.warn('[Rewind:Cancel] settlement timeout tab=' + String(tabId).slice(-12)
+      + ' tool=' + operation.toolType
+      + ' op=' + operation.opId);
+    return {
+      success: false,
+      accepted: false,
+      cancellationPending: true,
+      error: 'rewind_cancel_settlement_timeout',
+    };
+  }
   return cancelDecision.response;
 });
 
@@ -27223,6 +27269,23 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
   const activeRewindClaim = beginActiveRewindOperation(tabId, 'claude', opId);
   if (!activeRewindClaim.success) return activeRewindClaim;
   const activeRewindOperation = activeRewindClaim.operation;
+  let resolveClaudeRewindCancel;
+  const claudeRewindCancelPromise = new Promise((resolve) => {
+    resolveClaudeRewindCancel = resolve;
+  });
+  const claudeRewindPtyOperation = {
+    kind: 'claude-native-rewind',
+    source: 'claude-native-rewind',
+    tabId,
+    submitted: false,
+    identityPending: false,
+    manualInputYields: false,
+    cancelRequested: false,
+    cancelPromise: claudeRewindCancelPromise,
+    resolveCancel: resolveClaudeRewindCancel,
+    queuedAt: Date.now(),
+  };
+  activeRewindOperation.ptyWriteOperation = claudeRewindPtyOperation;
   rewindCancelTabs.delete(tabId);
   const rewindDeadlineAt = Date.now() + Math.max(3000, Math.min(180000, Number(deadlineMs) || 18000));
   let rewindDeadlineHit = false;
@@ -27528,7 +27591,17 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
     let lastResult = null;
     for (let attempt = 0; attempt < delays.length; attempt++) {
       if (delays[attempt] > 0) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
-      const result = await captureClaudeInput(tabId, 'grab');
+      // Native Rewind already owns the PTY serializer. Calling the public
+      // serialized capture wrapper here would enqueue behind this transaction and
+      // deadlock it forever. Use the at-boundary primitive, exactly like the
+      // Codex Rewind path below.
+      const result = await captureAgentInputAtWriteBoundary(
+        tabId,
+        'grab',
+        'claude',
+        { ownedWriteOperation: claudeRewindPtyOperation },
+        term,
+      );
       lastResult = result;
       const text = typeof result?.text === 'string' ? result.text : '';
       const normalized = normalizeCandidate(text);
@@ -27587,14 +27660,26 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
 
   try {
     return await withPtyWriteLock(term, async () => {
+      throwIfRewindCancelled('locked-before-preflight');
       const dz = claudeCtrlCDangerZone.get(tabId);
       if (dz) {
         console.log('[Claude:Rewind] DangerZone active — waiting for prompt return...');
         await dz.promise;
+        throwIfRewindCancelled('after-danger-zone');
         console.log('[Claude:Rewind] DangerZone cleared');
       }
 
-      const inputCheck = await captureClaudeInput(tabId, 'copy');
+      // This callback is already inside the one Rewind PTY transaction. A
+      // second lock through the public serialized capture wrapper waits for itself and
+      // is the exact production deadlock from tab-3604/tab-3748.
+      const inputCheck = await captureAgentInputAtWriteBoundary(
+        tabId,
+        'copy',
+        'claude',
+        { ownedWriteOperation: claudeRewindPtyOperation },
+        term,
+      );
+      throwIfRewindCancelled('after-input-preflight');
       if (!inputCheck.success) {
         console.log('[Claude:Rewind] Input preflight failed: ' + (inputCheck.error || 'unknown'));
         return { success: false, error: inputCheck.error || 'input_check_failed' };
@@ -27756,6 +27841,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
         '[Claude:Rewind:menu]'
       );
 
+      throwIfRewindCancelled('before-rewind-command');
       console.log('[Claude:Rewind] Sending /rewind via slash command');
       const commandResult = await _safePasteAndSubmitInner(term, '/rewind', {
         submit: true,
@@ -27763,8 +27849,10 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
         ctrlCFirst: false,
         dismissAutocomplete: true,
         fast: false,
+        sendOperationContext: claudeRewindPtyOperation,
         logPrefix: '[Claude:Rewind:command]'
       });
+      throwIfRewindCancelled('after-rewind-command');
       if (!commandResult || commandResult.success === false) {
         return { success: false, error: commandResult?.error || 'rewind_command_failed' };
       }
@@ -27789,6 +27877,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
         }))));
 
       if (isClaudeRewindSlashHelpOpen(afterSlashClean) && !menuReadyRe.test(afterSlashClean)) {
+        throwIfRewindCancelled('before-slash-help-confirm');
         console.warn('[Claude:Rewind] Slash help still visible after /rewind Enter; sending confirm Enter');
         term.write('\r');
         await drainPtyData(term, 80, 500);
@@ -27813,6 +27902,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
       }
 
       const menuRaw = await menuWait;
+      throwIfRewindCancelled('after-menu-wait');
       const menuClean = cleanBuffer(menuRaw);
       const moreAboveMatch = menuClean.match(/↑\s*(\d+)\s*more\s*above/i);
       const moreAboveCount = moreAboveMatch ? Number(moreAboveMatch[1]) : 0;
@@ -28065,7 +28155,9 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
         return { success: false, error: notFoundError, pressCount, deadlineHit: rewindDeadlineHit };
       }
 
+      throwIfRewindCancelled('before-confirm-preflight');
       const confirmSelection = await readRendererSelection('confirm-preflight');
+      throwIfRewindCancelled('after-confirm-preflight');
       if (!confirmSelection.menuScopeFound) {
         console.error('[Claude:Rewind] Picker proof missing immediately before Enter; refusing mutation reason='
           + confirmSelection.menuScopeReason);
@@ -28092,6 +28184,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
       }
 
       console.log('[Claude:Rewind] Confirming target with Enter');
+      throwIfRewindCancelled('before-confirm');
       markActiveRewindMutationStarted(activeRewindOperation, event.sender);
       await writeAndWait('\r', /\x1b\[\?2026l|\x1b\]7777;prompt:|[⏵❯╰]/, 6000, '[Claude:Rewind:confirm]');
       await waitForPtyText(term, /\x1b\]7777;prompt:|[⏵❯╰]|\x1b\[\?2026l/, 5000, '[Claude:Rewind:prompt]');
@@ -28165,7 +28258,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
         historyDraftWarning: restoredHistoryDraft?.historyDraftWarning || '',
         restoredMatchMode: restoredHistoryDraft?.matchMode || '',
       };
-    });
+    }, claudeRewindPtyOperation);
   } catch (err) {
     if (err?.code === 'rewind_cancelled') {
       try { term.write('\x1b'); } catch {}
@@ -29155,9 +29248,27 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return activeRewindClaim;
   }
   const activeRewindOperation = activeRewindClaim.operation;
+  let resolveCodexRewindCancel;
+  const codexRewindCancelPromise = new Promise((resolve) => {
+    resolveCodexRewindCancel = resolve;
+  });
+  const codexRewindPtyOperation = {
+    kind: 'codex-native-rewind',
+    source: 'codex-native-rewind',
+    tabId,
+    submitted: false,
+    identityPending: false,
+    manualInputYields: false,
+    cancelRequested: false,
+    cancelPromise: codexRewindCancelPromise,
+    resolveCancel: resolveCodexRewindCancel,
+    queuedAt: Date.now(),
+  };
+  activeRewindOperation.ptyWriteOperation = codexRewindPtyOperation;
 
   try {
     codexRewindOperationResult = await withPtyWriteLock(term, async () => {
+      throwIfCodexRewindCancelled('locked-before-authorization');
       const count = Number(rewindableCount);
       const idx = Number(targetIndex);
       if (!Number.isFinite(count) || !Number.isFinite(idx) || count <= 0 || idx < 0 || idx >= count) {
@@ -29172,6 +29283,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       // Re-prove process, writer/provisional launch, readiness and idle state
       // while holding the same lock that guards the first Escape.
       const targetAuthorization = await authorizeCodexRewindAtWriteBoundary('locked-before-target-load');
+      throwIfCodexRewindCancelled('after-target-authorization');
       if (!targetAuthorization.success) return targetAuthorization;
       writer = targetAuthorization.writer;
       provisionalResumeRewind = targetAuthorization.provisionalResumeRewind;
@@ -29372,6 +29484,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
             || codexTranscriptOverlayObserved(clean)
             || codexRewindProtocolChromeObserved(clean)
         );
+        throwIfCodexRewindCancelled('after-prime-' + attemptLabel);
         const hasPrimeHint = !primeFrame.timedOut && codexPrimeHintObserved(primeFrame.clean);
         const openedDirectly = !primeFrame.timedOut && codexTranscriptOverlayObserved(primeFrame.clean);
         const protocolChrome = codexRewindProtocolChromeObserved(primeFrame.clean);
@@ -29403,6 +29516,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           };
         }
 
+        throwIfCodexRewindCancelled('before-open-' + attemptLabel);
         const openFrame = await sendCodexKeyAndCapture(
           term,
           '\x1b',
@@ -29410,6 +29524,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           '[Codex:Rewind:open:' + attemptLabel + ']',
           (clean) => codexTranscriptOverlayObserved(clean)
         );
+        throwIfCodexRewindCancelled('after-open-' + attemptLabel);
         console.log('[Codex:Rewind] open Esc ' + attemptLabel + ' timedOut=' + openFrame.timedOut + ' clean=' + JSON.stringify(openFrame.clean.slice(0, 260)));
         if (/No previous message to edit/i.test(openFrame.clean)) {
           return { success: false, error: 'no_previous_message', rollbackMayHaveApplied: false };
@@ -29548,6 +29663,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
             } else if (step > 0) {
               const correctedOlderSteps = step - 1;
               console.log('[Codex:Rewind] target is next prompt after selected row; moving Right once to commit target correctedOlderSteps=' + correctedOlderSteps + ' fromStep=' + step);
+              throwIfCodexRewindCancelled('before-correct-right#' + step);
               const rightFrame = await sendCodexKeyAndCapture(
                 term,
                 '\x1b[C',
@@ -29556,6 +29672,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
                 (clean, raw) => raw.includes(CODEX_SYNC_MARKER)
                   || /enter to edit message|edit prev|edit next|Context\s+\d+%/i.test(clean)
               );
+              throwIfCodexRewindCancelled('after-correct-right#' + step);
               if (rightFrame.timedOut) {
                 try { term.write('q'); } catch {}
                 return {
@@ -29887,7 +30004,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         restoredMatchMode: grabResult.matchMode || '',
         ...writerHandoff,
       };
-    });
+    }, codexRewindPtyOperation);
     return codexRewindOperationResult;
   } catch (err) {
     if (err?.code === 'rewind_cancelled') {

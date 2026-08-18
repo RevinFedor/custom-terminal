@@ -29,6 +29,12 @@ test('confirmed effort is projected through the exact live Claude generation', (
 test('renderer never seeds process-local effort from a previous bind', () => {
   assert.match(controlBar, /const modelOnlySeed = \{ model: seed\.model, effort: undefined \}/);
   assert.match(controlBar, /\[claudeSessionId, isCommandRunning, refreshClaudeConfirmedSettings, tabId\]/);
+  assert.match(controlBar, /const sessionChanged = confirmedSettingsBoundSessionRef\.current !== claudeSessionId;[\s\S]*?if \(sessionChanged\) \{[\s\S]*?setEffortLocal\(seed\?\.effort\)/);
+  const contextSeedEffect = controlBar.slice(
+    controlBar.indexOf('// Seed the meter from the last value persisted for THIS tab'),
+    controlBar.indexOf('// SDK tab: context % lives in ClaudeSDKTab local state'),
+  );
+  assert.doesNotMatch(contextSeedEffect, /setClaudeModel\(null\)/);
   assert.match(controlBar, /effortCurrentRuntime=/);
 });
 

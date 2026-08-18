@@ -45,11 +45,15 @@ test('полоса переживает перезапуск — и мёртвы
   assert.match(store, /if \(kept\.length > 1\) restoredCenterStrips\[pid\] = kept/);
 });
 
-test('обычная навигация не растит полосу', () => {
-  // Иначе за час работы полоса съела бы весь список вкладок — и вместе с ним
-  // весь Ctrl+Tab, который по правилу пропускает всё, что лежит в окнах.
-  // Чипы добавляет только жест «ещё одну сюда».
-  assert.match(store, /replaceInStrip\(strip, centerShownBefore \|\| '', projectId, tabId\)/);
+test('клик по вкладке слева ДОБАВЛЯЕТ её в конец полосы, а не заменяет показанную', () => {
+  // Замена молча уносила из окна ту вкладку, которую человек туда сам положил.
+  // Юзер: *«чтобы она не заменяла текущую, а открывалась в конце»*.
+  //
+  // От бесконечного роста полосу держит другое правило: вкладка, уже лежащая в
+  // каком-то окне, не добавляется второй раз — её ПОКАЗЫВАЮТ там, где она
+  // живёт. Значит каждая вкладка попадает в полосу ровно один раз.
+  assert.match(store, /const next = insertIntoStrip\(strip, projectId, tabId\);/);
+  assert.doesNotMatch(store, /replaceInStrip/);
   assert.match(header, /addTabToSplitPaneStrip\(paneIndex, owner, newTabId\)/);
   assert.match(header, /addTabToCenterStrip\(owner, newTabId\)/);
 });
@@ -64,9 +68,6 @@ test('полоса центра адресуется по показанному
   // доставал полосу сам и мог спросить не ту.
   assert.match(store, /reorderCenterStripTab: \(_projectId, tabId, toIndex\) => \{/);
   assert.match(store, /removeTabFromCenterStrip: \(_projectId, tabId\) => \{/);
-  // Исходящий чип — то, что показывал ЦЕНТР, снятое до перезаписи. Активная
-  // вкладка целевого проекта — другое, как только переход межпроектный.
-  assert.match(store, /const centerShownBefore = \(\(\) => \{/);
 });
 
 test('новая вкладка создаётся в фоне, а показывает её полоса', () => {
@@ -171,6 +172,25 @@ test('между окнами переносит НАЗВАННАЯ цель, а
   assert.match(moveMenu, /addTabToCenterStrip\(projectId, tabId\)/);
 });
 
+test('переименование в чипе выглядит и работает как в боковом списке', () => {
+  // Жест один — «переименовать вкладку», — и разное поведение на двух
+  // поверхностях читается как две разные функции.
+  //
+  // Весь текст выделен: переименовывают, чтобы НАЗВАТЬ заново, и первая буква
+  // должна заменить старое имя. Курсор внутри текста заставляет сначала
+  // стирать, а куда он встанет — зависит от места клика, то есть один жест
+  // давал бы разный результат от раза к разу.
+  assert.match(chip, /node\.focus\(\);\n\s+node\.select\(\);/);
+  // Ровно один раз: `ref` зовётся и на каждую букву, а повторный select
+  // выделял бы только что набранное — следующая буква стирала бы предыдущую.
+  assert.match(chip, /if \(!node \|\| renameFocusedRef\.current\) return;/);
+  assert.doesNotMatch(chip, /autoFocus/);
+  // Рамка тенью: тень не занимает места, и чип не раздувается на время
+  // правки, сдвигая соседей по полосе. Та же строка, что в боковом списке.
+  assert.match(chip, /boxShadow: 'inset 0 0 0 1px var\(--color-accent\)'/);
+  assert.match(tabbar, /boxShadow: 'inset 0 0 0 1px var\(--color-accent\)'/);
+});
+
 test('окно, где вкладка уже лежит, не предлагается', () => {
   // Строка остаётся видимой — исчезающий пункт читается как «кнопка пропала».
   assert.match(moveMenu, /const homeIndex = windows\.find\(/);
@@ -217,4 +237,47 @@ test('рисунок раскладки повторяет ПРОПОРЦИИ э
   assert.doesNotMatch(moveMenu, /height: 46/);
   // Перегородки двигает человек — рисунок обязан пересчитаться следом.
   assert.match(moveMenu, /splitSizesFingerprint\(s\.splitSizes\)/);
+});
+
+// ── Git и копирование сессии переехали к своим вопросам ───────────────────
+
+test('Git отвечает про вкладку ЭТОГО окна, а не про активную', () => {
+  // В верхней полосе Git был один на всё приложение и говорил про активную
+  // вкладку. С несколькими окнами это стало враньём: в каждом может быть свой
+  // worktree и своя ветка. Теперь на вопрос «какая тут ветка» отвечает шапка
+  // того окна, над которым человек смотрит.
+  const tools = fs.readFileSync(path.join(workspaceDir, 'WorkspaceTitleBarTools.tsx'), 'utf8');
+  assert.doesNotMatch(tools, /GitStatusButton/);
+  assert.match(header, /<GitStatusButton/);
+  // Путь — вкладки (worktree), проект — проектный: он опознаёт сохранённое
+  // состояние панели, и подмена пересоздавала бы её на каждом переключении.
+  assert.match(header, /tabCwd=\{gitCwd\}/);
+  assert.match(header, /projectPath=\{gitProjectPath\}/);
+});
+
+test('панель Git раскрывается от своей кнопки и доводится общим механизмом', () => {
+  const git = fs.readFileSync(path.join(workspaceDir, 'GitStatusButton.tsx'), 'utf8');
+  // Раньше якорем была общая верхняя полоса — под окном внизу слева такой
+  // полосы нет, и панель ушла бы за экран.
+  assert.doesNotMatch(git, /data-project-toolbar/);
+  assert.match(git, /triggerRef\.current!\.getBoundingClientRect\(\)/);
+  // Тот же доводчик, что у меню вкладки и меню деления: третьего способа
+  // позиционировать всплывающую панель в приложении быть не должно.
+  assert.match(git, /clampMenuToViewport\(\{/);
+  // Место под панель считается от ЕЁ края, а не от нуля.
+  assert.match(git, /window\.innerWidth - clamped\.x - PANEL_MARGIN/);
+});
+
+test('копирование сессии живёт в одном месте на кнопку и на меню', () => {
+  const tabbarSrc = fs.readFileSync(path.join(workspaceDir, 'TabBar.tsx'), 'utf8');
+  const chip = fs.readFileSync(path.join(workspaceDir, 'CopySessionButton.tsx'), 'utf8');
+  // Вторая реализация разошлась бы с первой на первом же изменении фильтров
+  // или правила выбора Codex-сессии.
+  assert.match(tabbarSrc, /copySessionsToClipboard\(\{/);
+  assert.match(chip, /copySessionsToClipboard\(\{/);
+  assert.doesNotMatch(tabbarSrc, /claude:export-clean-session/);
+  // Действие — у вкладки, о которой говорят; настройки — в нижней полосе,
+  // рядом с прочими умолчаниями приложения.
+  assert.match(chip, /Settings Copy/);
+  assert.doesNotMatch(chip, /Copy session/);
 });

@@ -19,7 +19,8 @@ import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { PaneMapCells, usePaneMapColumns } from './PaneMap';
-import { splitAvailability, paneIndexHoldingTab } from '../../utils/splitPanesModel.mjs';
+import { paneIndexHoldingTab } from '../../utils/splitPanesModel.mjs';
+import { copySessionsToClipboard, tabHasCopyableSession } from '../../utils/copySessionExport';
 import MoveToWindowMenu from './MoveToWindowMenu';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
@@ -3653,7 +3654,6 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const [commandHistoryByTab, setCommandHistoryByTab] = useState<Map<string, CommandRunHistoryEntry[]>>(new Map());
   const [commandHistoryPopover, setCommandHistoryPopover] = useState<{ tabId: string; x: number; y: number } | null>(null);
   const [restartAfterFallbackCommands, setRestartAfterFallbackCommands] = useState<Map<string, string>>(new Map());
-  const [contextFavoriteId, setContextFavoriteId] = useState<number | null>(null);
   const [emptyZoneHovered, setEmptyZoneHovered] = useState(false);
   const [dragPreview, setDragPreview] = useState<DragPreviewLayout | null>(null);
   const [tabHorizontalIntent, setTabHorizontalIntent] = useState<TabHorizontalIntent | null>(null);
@@ -7134,7 +7134,6 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
       setContextScripts([]);
       setContextShScripts([]);
       setContextLastCommand(null);
-      setContextFavoriteId(null);
       return;
     }
 
@@ -7203,18 +7202,6 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
       }
     })();
 
-    // Check if tab is already in favorites
-    setContextFavoriteId(null);
-    (async () => {
-      try {
-        const favorites = await ipcRenderer.invoke('project:get-favorites', { projectId });
-        const tab = workspace.tabs.get(tabId);
-        if (tab && favorites) {
-          const match = favorites.find((f: any) => f.name === tab.name && f.cwd === tab.cwd && f.tab_type === (tab.tabType || 'terminal'));
-          setContextFavoriteId(match ? match.id : null);
-        }
-      } catch { /* ignore */ }
-    })();
   };
 
   // External opener (split-pane header). Reuses handleContextMenu so the menu
@@ -10269,6 +10256,67 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
             );
           })()}
 
+          {/* «Копировать сессию» — та же операция, что была кнопкой в верхней
+              полосе, приведённая к вкладке, по которой нажали. Наверху она
+              работала по АКТИВНОЙ вкладке, а окон теперь несколько: «активная»
+              и «та, о которой я говорю» разошлись, и наверху ответ был чужой.
+              Настройки копирования остались там же, где были — у кнопки
+              настроек в нижней полосе; здесь только само действие. */}
+          {contextMenu && (() => {
+            const targets = isMultiSelect
+              ? selectedTabIds.map((id) => workspace.tabs.get(id)).filter(Boolean)
+              : [workspace.tabs.get(contextMenu.tabId)].filter(Boolean);
+            const copyable = targets.filter((tab) => tabHasCopyableSession(tab as any));
+            if (copyable.length === 0) return null;
+            const label = isMultiSelect
+              ? `Копировать сессии (${copyable.length})`
+              : 'Копировать сессию';
+            return (
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                title="Скопировать переписку сессии в буфер (фильтры — в настройках копирования)"
+                onClick={async (e) => {
+                  e.stopPropagation();
+                  setContextMenu(null);
+                  const ui = useUIStore.getState();
+                  try {
+                    const res = await copySessionsToClipboard({
+                      tabs: copyable as any,
+                      fallbackCwd: project?.path || '',
+                      filters: {
+                        includeEditing: ui.copyIncludeEditing,
+                        includeReading: ui.copyIncludeReading,
+                        fromStart: ui.copyFromStart,
+                        includeSubagentResult: ui.copyIncludeSubagentResult,
+                        includeSubagentHistory: ui.copyIncludeSubagentHistory,
+                        includeUser: ui.copyIncludeUser,
+                        includeClaude: ui.copyIncludeClaude,
+                        includeText: ui.copyIncludeText,
+                        includeThinking: ui.copyIncludeThinking,
+                        includeBash: ui.copyIncludeBash,
+                        includeTools: ui.copyIncludeTools,
+                        includeWebSearch: ui.copyIncludeWebSearch,
+                        includeToolSearch: ui.copyIncludeToolSearch,
+                        includeOtherTools: ui.copyIncludeOtherTools,
+                      },
+                    });
+                    if (res.copied > 0) {
+                      const sizeKB = Math.round(res.content.length / 1024);
+                      showToast(`Скопировано ${res.copied}/${res.requested} сессий (${sizeKB}KB)`, 'success');
+                    } else {
+                      showToast('Не удалось скопировать ни одну сессию', 'error');
+                    }
+                  } catch (error: any) {
+                    showToast(error?.message || 'Не удалось скопировать сессию', 'error');
+                  }
+                }}
+              >
+                <Copy size={12} className="text-[#888] flex-shrink-0" />
+                {label}
+              </button>
+            );
+          })()}
+
           {/* Revert Session — submenu shown only for claude tabs with rotation history.
               Safety-net for accidental overwrites by bridge watcher / AutoResume / Timeline
               chain resolver — user can return to the previous value with one click.
@@ -10350,152 +10398,6 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
             );
           })()}
 
-          {/* Add / Remove Favorites */}
-          {!isMultiSelect && !isContextFileTab && (
-            <button
-              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-              onClick={async (e) => {
-                e.stopPropagation();
-                if (contextMenu) {
-                  if (contextFavoriteId) {
-                    // Remove from favorites
-                    await ipcRenderer.invoke('project:delete-favorite', { id: contextFavoriteId });
-                    const tab = workspace.tabs.get(contextMenu.tabId);
-                    showToast(`"${tab?.name || 'Tab'}" removed from favorites`, 'success');
-                  } else {
-                    // Add to favorites
-                    const tab = workspace.tabs.get(contextMenu.tabId);
-                    if (tab) {
-                      let codexSessionId = tab.codexSessionId || null;
-                      if (isCodexSessionTab(tab)) {
-                        try {
-                          codexSessionId = await requireCodexSurfaceSessionId({
-                            tabId: tab.id,
-                            operation: 'добавить Codex-сессию в избранное',
-                            requireMutationSafe: true,
-                          });
-                        } catch (error: any) {
-                          showToast(error?.message || 'Не удалось проверить Codex-сессию перед добавлением в избранное', 'warning');
-                          return;
-                        }
-                      }
-                      await ipcRenderer.invoke('project:add-favorite', {
-                        projectId,
-                        tab: {
-                          name: tab.name,
-                          cwd: tab.cwd,
-                          color: tab.color || null,
-                          commandType: tab.commandType || null,
-                          tabType: tab.tabType || 'terminal',
-                          url: tab.url || null,
-                          claudeSessionId: tab.claudeSessionId || null,
-                          geminiSessionId: tab.geminiSessionId || null,
-                          codexSessionId,
-                        }
-                      });
-                      showToast(`"${tab.name}" added to favorites`, 'success');
-                    }
-                  }
-                }
-                setContextMenu(null);
-              }}
-            >
-              {contextFavoriteId ? 'Remove from Favorites' : 'Add to Favorites'}
-            </button>
-          )}
-
-          {/* Split workspace: add/remove this tab as a side-by-side pane.
-              Reverse-button semantics — the same slot toggles between
-              «Добавить в рабочую область (N)» and «Убрать из рабочей области». */}
-          {!isMultiSelect && contextMenu && (() => {
-            const splitPanes = useWorkspaceStore.getState().splitPanes;
-            // Held ANYWHERE — a parked chip is in the workspace just as much as
-            // a shown one, and offering "add" for a tab that already has a chip
-            // would promise a second copy of a single live terminal.
-            const inSplit = paneIndexHoldingTab(splitPanes, contextMenu.tabId) >= 0;
-            // In single mode the pair is (active tab, clicked tab) — clicking
-            // the active tab itself would pair it with itself: no-op.
-            const centerWorkspace = useWorkspaceStore.getState().openProjects.get(activeProjectId || '');
-            const isActiveSingleTab = splitPanes.length === 0
-              && activeProjectId === projectId
-              && centerWorkspace?.activeTabId === contextMenu.tabId;
-            // "Add to the workspace" appends a COLUMN, so the column cap
-            // decides — not the total pane count, which refused while the
-            // screen still had a free column (a stacked pair counts as two
-            // panes but occupies one column).
-            const splitFull = !splitAvailability(splitPanes, null).horizontal
-              && !splitPanes.some((p) => !p.tabId);
-            const disabled = !inSplit && (splitFull || isActiveSingleTab);
-            return (
-              <button
-                className={`w-full text-left px-4 py-1.5 text-[13px] flex items-center gap-2 ${
-                  disabled ? 'text-[#555] cursor-not-allowed' : 'text-[#ccc] hover:bg-white/10 cursor-pointer'
-                }`}
-                title={inSplit
-                  ? 'Убрать это окно из рабочей области'
-                  : splitFull
-                    ? 'Сначала выберите вкладку для пустого окна'
-                    : 'Показать вкладку вторым окном рядом с текущим'}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (disabled) return;
-                  const st = useWorkspaceStore.getState();
-                  if (inSplit) st.removeTabFromSplit(contextMenu.tabId);
-                  else st.addTabToSplit(projectId, contextMenu.tabId);
-                  setContextMenu(null);
-                }}
-              >
-                <Columns2 size={12} className={disabled ? 'text-[#555]' : 'text-[#888] flex-shrink-0'} />
-                {/* Short labels on purpose: «в рабочую область» wrapped onto a
-                    second line and made the row twice as tall. */}
-                {inSplit
-                  ? 'Убрать из области'
-                  : `Добавить в область${splitPanes.length > 0 ? ` (${splitPanes.length})` : ''}`}
-              </button>
-            );
-          })()}
-
-          {/* «Открыть в этом окне» — второй чип в полосе окна, где человек уже
-              стоит. Обычный клик по вкладке ЗАМЕНЯЕТ показанный чип (иначе полоса
-              росла бы от любой навигации), а добавляет только осознанный жест: в
-              шапке это двойной клик по пустому месту, здесь — этот пункт.
-              Перетащить вкладку из бокового списка в шапку нельзя: список
-              использует свою систему перетаскивания, не браузерную. */}
-          {!isMultiSelect && contextMenu && (() => {
-            const st = useWorkspaceStore.getState();
-            const heldAt = paneIndexHoldingTab(st.splitPanes, contextMenu.tabId);
-            if (heldAt >= 0) return null; // уже лежит в каком-то окне
-            const target = st.splitPanes.length > 0
-              ? st.splitPanes[st.splitFocusedIndex]
-              : null;
-            // В сплите цель — окно в фокусе; без сплита — сам центр. Пустое окно
-            // не годится: там нечему становиться соседом, туда вкладка просто
-            // кладётся обычной активацией.
-            if (st.splitPanes.length > 0 && (!target || !target.tabId)) return null;
-            const centerTabId = st.activeProjectId
-              ? st.openProjects.get(st.activeProjectId)?.activeTabId
-              : null;
-            if (st.splitPanes.length === 0 && (!centerTabId || centerTabId === contextMenu.tabId)) return null;
-            return (
-              <button
-                className="w-full text-left px-4 py-1.5 text-[13px] flex items-center gap-2 text-[#ccc] hover:bg-white/10 cursor-pointer"
-                title="Добавить вкладку в полосу окна, в котором вы сейчас"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  const store = useWorkspaceStore.getState();
-                  if (store.splitPanes.length > 0) {
-                    store.addTabToSplitPaneStrip(store.splitFocusedIndex, projectId, contextMenu.tabId);
-                  } else {
-                    store.addTabToCenterStrip(projectId, contextMenu.tabId);
-                  }
-                  setContextMenu(null);
-                }}
-              >
-                <Columns2 size={12} className="text-[#888] flex-shrink-0" />
-                Открыть в этом окне
-              </button>
-            );
-          })()}
         </div>
       )}
 

@@ -178,6 +178,7 @@ import {
   reconcileCommittedHistoryLiveProjection,
   reconcileHistoryLiveToolResults,
   reduceHistoryLiveProjection,
+  retireHistoryLivePromptByExactProof,
   shouldIncludeHistoryLiveUserText,
 } from '../../utils/historyLiveProjection.mjs';
 import {
@@ -3308,6 +3309,7 @@ const HistoryUserEntry = memo(({
   rewindUnavailableReason,
   forceExpanded,
   onDismissPromptPresentation,
+  onDismissRewindPresentation,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
@@ -3317,6 +3319,7 @@ const HistoryUserEntry = memo(({
   rewindUnavailableReason?: string | null;
   forceExpanded?: boolean;
   onDismissPromptPresentation?: (entry: FullHistoryEntry) => void;
+  onDismissRewindPresentation?: (entry: FullHistoryEntry) => void;
 }) => {
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -4080,6 +4083,21 @@ const HistoryEntry = memo(({
         tone={failed ? 'danger' : 'warning'}
         pending={active}
         entryUuid={entry.uuid}
+        actions={failed && entry.uuid.startsWith(LOCAL_REWIND_PREFIX)
+          && onDismissRewindPresentation ? (
+            <MessageActionButton
+              tone="danger"
+              data-history-rewind-dismiss="1"
+              aria-label="Dismiss Rewind error"
+              title="Dismiss"
+              onClick={(event) => {
+                event.stopPropagation();
+                onDismissRewindPresentation(entry);
+              }}
+            >
+              <X size={13} aria-hidden />
+            </MessageActionButton>
+          ) : undefined}
         meta={entry.timestamp
           ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           : undefined}
@@ -4230,6 +4248,7 @@ const historyPanelStyleText = `@keyframes hp-flash {
    всегда, видимостью управляет тот же :hover. Так «что случится по клику»
    и «что происходит сейчас» не могут разойтись во времени. */
 [data-agent-status-row] > [data-agent-status-hover-glyph] { display: none; }
+[data-agent-status-row] > [data-agent-status-idle-glyph] { display: block; }
 [data-agent-status-row]:hover > [data-agent-status-hover-glyph] { display: block; }
 /* Значок состояния прячется, только если под курсором есть чем его заменить.
    Пока действие не определено (состояние ещё выясняется), значка действия нет
@@ -9600,7 +9619,12 @@ function AgentHistoryControls({
                   остановлен. Ни свечение, ни рисунок не зависят от раскладки —
                   см. комментарий у HistoryTerminalActivityIcon, там оба
                   удалённых свойства описаны. */}
-              <span data-agent-status-idle-glyph style={{ display: 'block', flexShrink: 0 }}>
+              {/* Никакого `display` в стиле элемента: он сильнее правила из
+                  таблицы стилей и не дал бы его спрятать под курсором — тогда
+                  видно оба значка сразу. Ровно эта ошибка уже была тут с фоном
+                  кнопки. Раскладку задаёт `flex-shrink`, показ — только
+                  таблица стилей. */}
+              <span data-agent-status-idle-glyph style={{ flexShrink: 0 }}>
                 <HistoryTerminalActivityIcon
                   size={20}
                   busy={showBusyLoader || isCompacting}
@@ -12886,6 +12910,20 @@ function HistoryPanel({
         sourceIdentity: carrierProof?.sourceIdentity,
         recordByteOffset: carrierProof?.recordByteOffset,
       };
+      if (identity.sourceIdentity && liveProjectionRef.current.ownerKey === historyOwnerKey) {
+        const currentLive = liveProjectionRef.current.entries;
+        const retainedLive = retireHistoryLivePromptByExactProof(currentLive, {
+          sourceIdentity: identity.sourceIdentity,
+          entryUuid: identity.auditEntryUuid,
+        }) as FullHistoryEntry[];
+        if (retainedLive !== currentLive) {
+          liveProjectionRef.current = { ownerKey: historyOwnerKey, entries: retainedLive };
+          setLiveEntries(retainedLive);
+          historyDiag('LIVE_PROMPT_RETIRED tab=' + tabId.slice(-12)
+            + ' handoff=' + record.handoffId
+            + ' proof=exact-source-identity');
+        }
+      }
       if (
         record.queueStatus === 'preparing'
         || record.queueStatus === 'sending'
@@ -12927,6 +12965,7 @@ function HistoryPanel({
     }
   }), [
     appendLocalPromptEntry,
+    historyOwnerKey,
     removeLocalPromptEntry,
     sessionId,
     tabId,
@@ -13203,6 +13242,17 @@ function HistoryPanel({
       return next;
     });
   }, [historySnapshotOwner, persistVolatileOverlay, sessionId, setHistoryPromptDraft, setHistoryRewindPreview, tabId, toolType]);
+
+  const dismissLocalRewindPresentation = useCallback((entry: FullHistoryEntry) => {
+    if (entry.role !== 'rewind' || !entry.uuid.startsWith(LOCAL_REWIND_PREFIX)) return;
+    setEntries((previous) => {
+      const next = previous.filter((candidate) => candidate.uuid !== entry.uuid);
+      if (next.length === previous.length) return previous;
+      presentationEntriesRef.current = next;
+      persistVolatileOverlay(historySnapshotOwner, next);
+      return next;
+    });
+  }, [historySnapshotOwner, persistVolatileOverlay]);
 
   useEffect(() => {
     const previousOwner = rewindPreviewOwnerRef.current;
@@ -15151,6 +15201,7 @@ function HistoryPanel({
         .map(([handoffId, handoff]) => ({
           handoffId,
           auditEntryUuid: handoff.auditEntryUuid,
+          sourceIdentity: handoff.sourceIdentity,
         }));
       // History-originated sends already own an optimistic prompt row. Native
       // xterm input has no such owner, so its canonical Claude or Codex user
@@ -17097,6 +17148,7 @@ function HistoryPanel({
                     rewindLocked={historyRewindLocked}
                     rewindUnavailableReason={historyRewindUnavailableReason}
                     onDismissPromptPresentation={dismissPromptPresentation}
+                    onDismissRewindPresentation={dismissLocalRewindPresentation}
                     forceExpanded={
                       searchQuery.length >= 2
                       && entry.content.toLowerCase().includes(searchQuery.toLowerCase())

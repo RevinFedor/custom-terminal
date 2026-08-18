@@ -20,6 +20,7 @@ import { CUSTOM_ICONS } from '../assets/icons/registry';
 import CenteredUpwardPopover from './UI/CenteredUpwardPopover';
 import ControlHint from './UI/ControlHint';
 import HelpButton from './UI/HelpButton';
+import CopySessionSettingsChip from './Workspace/CopySessionSettingsChip';
 
 const { ipcRenderer } = window.require('electron');
 const CODEX_ICON_URL = new URL('../assets/icons/codex-color.svg', import.meta.url).href;
@@ -135,6 +136,11 @@ export default function StatusBar({ onOpenSettings, onOpenHelp }: StatusBarProps
         <WebServerChip hidden={streamerMode} />
       </div>
       <div className="flex items-center gap-2">
+        {/* Настройки копирования сессии — слева от выбора модели по умолчанию.
+            Само действие «скопировать» переехало в контекстное меню вкладки, а
+            здесь остались НАСТРОЙКИ: они общие для всех копирований, не свойство
+            одной вкладки, и место им — там же, где прочие умолчания приложения. */}
+        <CopySessionSettingsChip />
         <EngineDefaultsSelector
           engine="Claude"
           accent="#DA7756"

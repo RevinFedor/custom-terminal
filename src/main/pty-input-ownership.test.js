@@ -71,3 +71,25 @@ test('terminal protocol replies and user-owned picker automation bypass the manu
     queuedOperation,
   }), false);
 });
+
+test('native Rewind owns physical input only until its PTY transaction releases', () => {
+  const rewind = {
+    kind: 'claude-native-rewind',
+    manualInputYields: false,
+    cancelRequested: false,
+  };
+  assert.equal(shouldSerializeManualPtyInput({
+    activeOperation: rewind,
+    queuedOperation: rewind,
+  }), true);
+
+  rewind.cancelRequested = true;
+  assert.equal(shouldSerializeManualPtyInput({
+    activeOperation: rewind,
+    queuedOperation: rewind,
+  }), true, 'cancelling remains visibly locked until main releases the transaction');
+  assert.equal(shouldSerializeManualPtyInput({
+    activeOperation: null,
+    queuedOperation: null,
+  }), false, 'after settlement there is no stale PTY owner to block input');
+});

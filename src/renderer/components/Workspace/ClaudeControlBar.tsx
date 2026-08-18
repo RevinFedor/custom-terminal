@@ -611,6 +611,9 @@ export default function ClaudeControlBar({
   const [confirmedSettingsOwnerSessionId, setConfirmedSettingsOwnerSessionId] = useState<string | null>(
     seededSettings && claudeSessionId ? claudeSessionId : null,
   );
+  const confirmedSettingsBoundSessionRef = useRef<string | null>(
+    seededSettings && claudeSessionId ? claudeSessionId : null,
+  );
   const currentConfirmedSettings = selectSessionOwnedSettings({
     sessionId: claudeSessionId,
     stateOwnerSessionId: confirmedSettingsOwnerSessionId,
@@ -756,19 +759,26 @@ export default function ClaudeControlBar({
     // round-trip landed with the same values it wiped. Cold sessions (no
     // seed yet) still reset. Effort always resets to unproven until the current
     // runtime generation is verified. Freshness is re-verified right after.
-    const seed = claudeSessionId
-      ? confirmedSettingsSeedCache.get(claudeSessionId)
-      : undefined;
-    setClaudeModel(seed?.model ?? null);
-    setEffortLocal(seed?.effort);
-    setConfirmedSettingsOwnerSessionId(seed && claudeSessionId ? claudeSessionId : null);
-    if (seed) {
-      console.warn('[ClaudeControlBar:ConfirmedSettings] seeded tab=' + tabId.slice(-12)
-        + ' sid=' + String(claudeSessionId).slice(0, 8)
-        + ' model=' + (seed.model || 'bridge/default')
-        + ' effort=runtime-proof-required');
+    const sessionChanged = confirmedSettingsBoundSessionRef.current !== claudeSessionId;
+    if (sessionChanged) {
+      confirmedSettingsBoundSessionRef.current = claudeSessionId;
+      const seed = claudeSessionId
+        ? confirmedSettingsSeedCache.get(claudeSessionId)
+        : undefined;
+      setClaudeModel(seed?.model ?? null);
+      setEffortLocal(seed?.effort);
+      setConfirmedSettingsOwnerSessionId(seed && claudeSessionId ? claudeSessionId : null);
+      if (seed) {
+        console.warn('[ClaudeControlBar:ConfirmedSettings] seeded tab=' + tabId.slice(-12)
+          + ' sid=' + String(claudeSessionId).slice(0, 8)
+          + ' model=' + (seed.model || 'bridge/default')
+          + ' effort=runtime-proof-required');
+      }
     }
-    void refreshClaudeConfirmedSettings('session-change');
+    // A process-state edge for the same session revalidates the authoritative
+    // main-side runtime generation but does not blank an already confirmed
+    // model/effort while that asynchronous proof is in flight.
+    void refreshClaudeConfirmedSettings(sessionChanged ? 'session-change' : 'process-state-change');
   }, [claudeSessionId, isCommandRunning, refreshClaudeConfirmedSettings, tabId]);
 
   useEffect(() => {
@@ -1066,7 +1076,6 @@ export default function ClaudeControlBar({
   // or not launched yet). Guard against a live tick that already landed: only
   // apply the seed if the meter is still at 0.
   useEffect(() => {
-    setClaudeModel(null);
     setContextPct(0);
     setCacheData(null);
     lastPersistedPctRef.current = -1;

@@ -161,18 +161,28 @@ const finalizeRemoval = (panes, focusedIndex, idx) => {
 
 // Activation of (projectId, tabId) with split active. Returns next state.
 //
-// With strips there are three cases, and the middle one is new:
+// Three cases:
 //   • the tab is SHOWN somewhere      → focus that pane, change nothing;
 //   • the tab has a CHIP somewhere    → focus that pane and show it there;
-//   • the tab is nowhere              → the focused pane's shown chip is
-//                                       REPLACED, in place, keeping its position
-//                                       in the strip and every other chip.
+//   • the tab is nowhere              → it JOINS the focused window's strip, at
+//                                       the END, and is shown there.
 //
-// Ordinary navigation must not GROW a strip. It is what a person does dozens of
-// times an hour, and a strip that grows from it would swallow the whole tab list
-// within minutes — including out of Ctrl+Tab, which by rule skips everything a
-// window holds. Chips appear only from gestures that mean "one more here": a
-// double-click on the header's empty space, or a drag into it.
+// The last case used to REPLACE the shown chip in place, on the theory that
+// ordinary navigation must never grow a strip — a person switches tabs dozens of
+// times an hour, and a strip growing from that would swallow the whole tab list
+// (and empty Ctrl+Tab with it, since it skips everything a window holds).
+//
+// That theory was right about the danger and wrong about the remedy. Replacing
+// meant the window silently LOST a tab on every sidebar click: the chip the user
+// had put there is gone, and nothing said it would be. Юзер: *«сделай так, чтобы
+// когда я слева нажимаю на вкладку, она не заменяла текущую, а открывалась в
+// конце»*. Appending keeps both tabs and puts the newcomer where new things go —
+// the end, the same place the double-click gesture puts them.
+//
+// The runaway strip stays bounded by the OTHER rule instead: a tab already held
+// by some window is never added again, it is shown where it lives (case two). So
+// a strip grows only by tabs that were nowhere, and each of them lands exactly
+// once. Closing a chip is still the way to shrink it.
 export function resolveSplitActivation(panes, focusedIndex, projectId, tabId) {
   if (!Array.isArray(panes) || panes.length === 0) {
     return { panes: [], focusedIndex: 0, changed: false };
@@ -195,22 +205,21 @@ export function resolveSplitActivation(panes, focusedIndex, projectId, tabId) {
   const at = clampIndex(panes, focusedIndex);
   const slot = panes[at];
   const next = panes.slice();
-  // Replace the SHOWN chip in place. The strip's other chips and this chip's
-  // position in it are the layout the user built — activation changes what a
-  // slot holds, never the shape of the strip.
+  // APPEND to the focused window's strip and show the newcomer. The end, not
+  // beside the shown chip: "newest goes last" is where the double-click gesture
+  // puts a tab too, and a chip inserted mid-strip would shift the positions the
+  // user is navigating by.
   //
-  // The pane also keeps its COLUMN, for the same reason at the layout level:
-  // writing a bare {projectId, tabId} dropped it and the pane silently jumped
-  // out of its stack — measured live, filling the lower row of a split column
-  // turned two stacked 409px rows into two 623px side-by-side columns.
-  const strip = paneTabs(slot);
-  const replaced = strip.map((entry) => (
-    entry.tabId === slot.tabId ? { projectId, tabId } : entry
-  ));
-  next[at] = paneWithHistoryFrom(
-    paneWithTabs(slot, replaced.length > 0 ? replaced : [{ projectId, tabId }], tabId),
-    slot,
-  );
+  // An EMPTY window (a placeholder) has no strip at all — the tab simply fills
+  // it, which `paneTabs` already reports as an empty list.
+  //
+  // The pane keeps its COLUMN, and this is why the strip is rebuilt through
+  // `paneWithTabs(slot, …)` rather than written as a bare {projectId, tabId}:
+  // that dropped the column and the pane silently jumped out of its stack —
+  // measured live, filling the lower row of a split column turned two stacked
+  // 409px rows into two 623px side-by-side columns.
+  const grown = paneTabs(slot).concat([{ projectId, tabId }]);
+  next[at] = paneWithHistoryFrom(paneWithTabs(slot, grown, tabId), slot);
   return { panes: next, focusedIndex: at, changed: true };
 }
 

@@ -281,3 +281,25 @@ test('exact handoff id or audited transcript UUID proves History ownership', () 
     promptOwner: { handoffId: 'history-handoff' },
   }, handoffs), true);
 });
+
+test('exact audited source identity proves ownership when the live envelope misses promptOwner', () => {
+  const sourceIdentity = 'codex-user-source-session-a-4096';
+  assert.equal(isHistoryPromptLocallyOwned(wrap({
+    type: 'user',
+    uuid: 'codex-live-user',
+    sourceIdentity,
+    message: { role: 'user', content: 'SAME TEXT' },
+  }), [{
+    handoffId: 'history-handoff',
+    sourceIdentity,
+  }]), true);
+  assert.equal(isHistoryPromptLocallyOwned(wrap({
+    type: 'user',
+    uuid: 'manual-user',
+    sourceIdentity: 'codex-user-source-session-a-8192',
+    message: { role: 'user', content: 'SAME TEXT' },
+  }), [{
+    handoffId: 'history-handoff',
+    sourceIdentity,
+  }]), false);
+});

@@ -258,13 +258,28 @@ function inspectCodexInputReadyTextCore(clean, raw, {
   const hasCodexUiText = CODEX_UI_TEXT_RE.test(text) || !!composerFooter;
   const hasPromptGlyph = CODEX_READY_PROMPT_LINE_RE.test(text);
   const hasComposerFrame = (/[╭╰│]/u.test(text) || hasPromptGlyph) && hasCodexUiText;
+  // Codex keeps the composer interactive while background MCP clients are
+  // starting. The progress row is therefore not an input blocker once this
+  // exact frame also proves the composer and its model/effort footer. Keep the
+  // interrupted/failure form blocked: it is a different terminal state and
+  // must not be inferred from the ordinary in-progress banner.
+  const mcpStartupInProgress = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)|servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)/i.test(text)
+    && !/MCP\s+startup\s+interrupted|MCP\s+startup\s+incomplete/i.test(text);
+  const composerAcceptsInputDuringMcpStartup = uniqueBlockers.includes('mcp-startup')
+    && mcpStartupInProgress
+    && !!composerFooter
+    && hasPromptGlyph
+    && hasComposerFrame;
+  const effectiveBlockers = composerAcceptsInputDuringMcpStartup
+    ? uniqueBlockers.filter((blocker) => blocker !== 'mcp-startup')
+    : uniqueBlockers;
 
-  if (uniqueBlockers.length > 0) {
+  if (effectiveBlockers.length > 0) {
     return {
       ready: false,
-      reason: 'blocked:' + uniqueBlockers.join('+'),
+      reason: 'blocked:' + effectiveBlockers.join('+'),
       source,
-      blockers: uniqueBlockers,
+      blockers: effectiveBlockers,
       hasSynchronizedFrame,
       hasCodexUiText,
       hasPromptGlyph,
@@ -279,8 +294,12 @@ function inspectCodexInputReadyTextCore(clean, raw, {
   }
   return {
     ready: true,
-    reason: 'ready',
+    reason: composerAcceptsInputDuringMcpStartup
+      ? 'ready:mcp-startup-background'
+      : 'ready',
     source,
+    blockers: [],
+    ignoredBlockers: composerAcceptsInputDuringMcpStartup ? ['mcp-startup'] : [],
     hasSynchronizedFrame,
     hasCodexUiText,
     hasPromptGlyph,
@@ -322,12 +341,15 @@ function decideCodexMcpWatchdogReconcile({
   if (synchronizedOutputOpen || !authoritativeFrameCommitted) {
     return { action: 'keep', reason: 'current-frame-transitional' };
   }
+  // A verified composer is usable even if its adjacent status band still says
+  // that MCP clients are starting. Never preserve a destructive restart timer
+  // over stronger current-frame input proof.
+  if (inspected.ready) {
+    return { action: 'clear', reason: 'current-composer-ready' };
+  }
   const blockers = Array.isArray(inspected.blockers) ? inspected.blockers : [];
   if (mcpVisible || blockers.includes('mcp-startup')) {
     return { action: 'keep', reason: 'mcp-startup-current' };
-  }
-  if (inspected.ready) {
-    return { action: 'clear', reason: 'current-composer-ready' };
   }
   if (blockers.length > 0) {
     return { action: 'clear', reason: 'different-current-blocker' };

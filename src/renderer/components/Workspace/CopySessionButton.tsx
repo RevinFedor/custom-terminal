@@ -5,10 +5,8 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 import { User as UserIcon } from 'lucide-react';
-import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
+import { copySessionsToClipboard, tabHasCopyableSession } from '../../utils/copySessionExport';
 import ControlHint from '../UI/ControlHint';
-
-const { ipcRenderer } = window.require('electron');
 
 const SettingsPortal: React.FC<{ children: React.ReactNode }> = ({ children }) =>
   createPortal(children, document.body);
@@ -162,7 +160,6 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
 
   const [showSettings, setShowSettings] = useState(false);
   const [buttonHovered, setButtonHovered] = useState(false);
-  const [copyHovered, setCopyHovered] = useState(false);   // hovering the "Copy session" text area
   const [iconHovered, setIconHovered] = useState(false);   // hovering the 📋 icon (opens settings popup)
   const [inputPopupHovered, setInputPopupHovered] = useState(false);
   const [customId, setCustomId] = useState('');
@@ -210,79 +207,33 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
     const activeProject = getActiveProject();
     if (!activeProject) { showToast('No active project', 'error'); return; }
 
-    const tabsToCopy = isMultiSelect ? selectedTabs : (activeTabId ? [activeProject.tabs.get(activeTabId)] : []);
-    const validTabs = tabsToCopy.filter(t => t && (
-      t.claudeSessionId
-      || t.geminiSessionId
-      || t.codexSessionId
-      || t.commandType === 'codex'
-      || overrideInput
-    ));
-    if (validTabs.length === 0) { showToast('Нет сессий для копирования', 'warning'); return; }
+    const tabs = isMultiSelect
+      ? selectedTabs
+      : (activeTabId ? [activeProject.tabs.get(activeTabId)] : []);
+    if (!overrideInput && !tabs.some(tabHasCopyableSession)) {
+      showToast('Нет сессий для копирования', 'warning');
+      return;
+    }
 
     setIsCopying(true);
     try {
-      const allResults: string[] = [];
-      for (const tab of validTabs) {
-        if (!tab) continue;
-        const declaredCodex = tab.commandType === 'codex';
-        let targetId = '';
-        let parsedCwd = '';
-        let kind: 'claude' | 'gemini' | 'codex' = 'claude';
-
-        if (overrideInput) {
-          const uuidMatch = overrideInput.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-          const cwdMatch = overrideInput.match(/cwd:\s*(\/[^\s\n]+)/i);
-          if (uuidMatch) targetId = uuidMatch[0];
-          if (cwdMatch) parsedCwd = cwdMatch[1];
-          kind = declaredCodex || tab.codexSessionId ? 'codex' : tab.geminiSessionId ? 'gemini' : 'claude';
-        }
-        if (!targetId) {
-          if (declaredCodex) { targetId = tab.codexSessionId || ''; kind = 'codex'; }
-          else if (tab.claudeSessionId) { targetId = tab.claudeSessionId; kind = 'claude'; }
-          else if (tab.geminiSessionId) { targetId = tab.geminiSessionId; kind = 'gemini'; }
-          else if (tab.codexSessionId) { targetId = tab.codexSessionId; kind = 'codex'; }
-        }
-        // A manually entered UUID is an explicit historical export target. The
-        // regular tab button consumes main's read-only identity: the exact idle
-        // Resume source, an adopted live writer, or stopped persisted history.
-        if (kind === 'codex' && !overrideInput) {
-          targetId = await requireCodexSurfaceSessionId({
-            tabId: tab.id,
-            operation: 'Копировать сессию',
-          });
-        }
-        if (!targetId) continue;
-
-        const tabCwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null);
-        const cwd = parsedCwd || tabCwd || tab.cwd || activeProject.projectPath;
-
-        let result;
-        if (kind === 'gemini') {
-          result = await ipcRenderer.invoke('gemini:copy-range', { sessionId: targetId, cwd, startUuid: null, endUuid: null });
-        } else if (kind === 'codex') {
-          result = await ipcRenderer.invoke('codex:export-clean-session', {
-            sessionId: targetId, cwd, includeEditing, includeReading, fromStart,
-            includeSubagentResult, includeSubagentHistory,
-            includeUser, includeClaude, includeText, includeThinking, includeBash, includeTools,
-            includeWebSearch, includeToolSearch, includeOtherTools,
-          });
-        } else {
-          result = await ipcRenderer.invoke('claude:export-clean-session', {
-            sessionId: targetId, cwd, includeEditing, includeReading, fromStart,
-            includeSubagentResult, includeSubagentHistory,
-            includeUser, includeClaude, includeText, includeThinking, includeBash, includeTools,
-            includeWebSearch, includeToolSearch, includeOtherTools,
-          });
-        }
-        if (result?.success) allResults.push(result.content);
-      }
-      if (allResults.length > 0) {
-        const finalContent = allResults.join('\n\n' + '='.repeat(40) + '\n\n');
-        const { clipboard } = window.require('electron');
-        clipboard.writeText(finalContent);
-        const sizeKB = Math.round(finalContent.length / 1024);
-        showToast(`Скопировано ${validTabs.length}/${tabsToCopy.length} сессий (${sizeKB}KB)`, 'success');
+      // Сама операция живёт в copySessionExport.ts — её же зовёт пункт
+      // контекстного меню вкладки. Здесь остались только сообщения: они
+      // принадлежат этой кнопке и в меню звучат иначе.
+      const res = await copySessionsToClipboard({
+        tabs,
+        fallbackCwd: activeProject.projectPath,
+        overrideInput,
+        filters: {
+          includeEditing, includeReading, fromStart,
+          includeSubagentResult, includeSubagentHistory,
+          includeUser, includeClaude, includeText, includeThinking, includeBash, includeTools,
+          includeWebSearch, includeToolSearch, includeOtherTools,
+        },
+      });
+      if (res.copied > 0) {
+        const sizeKB = Math.round(res.content.length / 1024);
+        showToast(`Скопировано ${res.copied}/${res.requested} сессий (${sizeKB}KB)`, 'success');
       } else {
         showToast('Не удалось скопировать ни одну сессию', 'error');
       }
@@ -302,25 +253,26 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
       <div
         ref={buttonRef}
         onMouseEnter={() => setButtonHovered(true)}
-        onMouseLeave={() => { setButtonHovered(false); setCopyHovered(false); setIconHovered(false); }}
+        onMouseLeave={() => { setButtonHovered(false); setIconHovered(false); }}
         className="inline-flex items-center rounded select-none overflow-hidden"
         style={{
           color: accent,
           border: `1px solid ${accentRgba} 0.25)`,
           fontSize: '11px',
-          height: 26,
-          opacity: isCopying ? 0.5 : 1,
+          height: 20,
           backgroundColor: `${accentRgba} 0.08)`,
         }}
       >
-        {/* 📋 settings half — открывает popup настроек по КЛИКУ (toggle). Hover больше не
-            триггерит появление: hover-popup мешал пользователю работать рядом, поэтому
-            переведено на explicit click. Visual hover-state на самой иконке остаётся для
-            affordance — она выглядит кликабельной. */}
+        {/* Один чип — одни НАСТРОЙКИ. Действие «скопировать» уехало в
+            контекстное меню вкладки: здесь оно работало по АКТИВНОЙ вкладке, а
+            окон теперь несколько, и «активная» перестала совпадать с «той, о
+            которой я говорю». Настройки же общие для всех копирований — они и
+            остались, рядом с прочими умолчаниями приложения. */}
         <ControlHint
           label="Настройки копирования сессии"
+          modifiedAction="⌘ наведение — скопировать сессию по чужому ID"
           disabled={showSettings || showInputPopup}
-          side="bottom"
+          side="top"
         >
         <span
           ref={iconRef}
@@ -332,53 +284,21 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
             setShowSettings(prev => !prev);
           }}
           style={{
-            position: 'relative',
-            fontSize: 13,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+            fontSize: 11,
             lineHeight: 1,
-            padding: '0 6px',
+            padding: '0 7px',
             height: '100%',
             cursor: 'pointer',
             backgroundColor: (showSettings || iconHovered) ? `${accentRgba} 0.28)` : 'transparent',
             transition: 'background-color 0.12s',
-          }}
-          className="inline-flex items-center justify-center"
-        >
-          📋
-        </span>
-        </ControlHint>
-        {/* Divider — accent-tinted vertical line between the 📋 (settings) half and the
-            "Copy session" half. Fork-toggle indication has moved to a dedicated chip in
-            the markers row, so the divider keeps the calm orange tone regardless. */}
-        <span style={{ width: 1, height: '70%', backgroundColor: `${accentRgba} 0.25)` }} />
-        {/* Copy label half — hovers like a real button so user knows "click here = copy" */}
-        <ControlHint
-          label={isMultiSelect ? `Скопировать ${selectedTabs.length} сессии` : 'Скопировать текущую сессию'}
-          modifiedAction="⌘ наведение — указать другой session ID"
-          disabled={isCopying || showInputPopup}
-          side="bottom"
-        >
-        <span
-          onMouseEnter={() => setCopyHovered(true)}
-          onMouseLeave={() => setCopyHovered(false)}
-          onClick={() => { if (!isCopying) handleCopy(); }}
-          style={{
-            lineHeight: 1,
-            padding: '0 10px',
-            height: '100%',
-            cursor: 'pointer',
-            display: 'inline-flex',
-            alignItems: 'center',
-            backgroundColor: copyHovered ? `${accentRgba} 0.28)` : 'transparent',
-            color: copyHovered ? '#fff' : accent,
-            // Юзер: «не должно при ховер-эффекте менять ширину». Bold (600) шире чем
-            // regular (400) — текст разъезжался при hover, остальной toolbar дёргался.
-            // Фиксированный 500: визуально чуть «жирнее» чем стандартный 400 (читаемо
-            // и без hover, и с hover), но без скачка metrics.
-            fontWeight: 500,
-            transition: 'background-color 0.12s, color 0.12s',
+            whiteSpace: 'nowrap',
           }}
         >
-          {isCopying ? 'Copying...' : isMultiSelect ? `Copy ${selectedTabs.length}× session` : customId.trim() ? 'Copy custom' : 'Copy session'}
+          <span style={{ fontSize: 12, lineHeight: 1 }}>📋</span>
+          <span style={{ fontWeight: 500 }}>Settings Copy</span>
         </span>
         </ControlHint>
       </div>
@@ -404,14 +324,12 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
               ref={settingsPopupRef}
               onClick={(e) => e.stopPropagation()}
               style={{
-                // Position: below the trigger, right-edge-aligned to the trigger's
-                // right edge. Этот вариант ставит popover на ту же нижнюю линию,
-                // что и Docs-popover в ProjectToolbar — оба идут вниз от своих
-                // триггеров справа налево. Раньше popover открывался слева-центр
-                // и упирался в левый край экрана, когда CopySessionButton живёт в
-                // правом краю toolbar'а.
+                // ВВЕРХ от триггера: чип переехал в нижнюю полосу приложения, и
+                // панель, открытая вниз, ушла бы за нижний край экрана. Правый
+                // край панели совпадает с правым краем чипа — так же, как было
+                // в верхней полосе, только по другой оси.
                 position: 'fixed',
-                top: bRect.bottom + 6,
+                bottom: window.innerHeight - bRect.top + 6,
                 right: window.innerWidth - bRect.right,
                 zIndex: 10000,
                 display: 'flex',
@@ -701,7 +619,7 @@ function InputPopup({
   onPopupEnter: () => void;
   onPopupLeave: () => void;
 }) {
-  const [box, setBox] = useState<{ left: number; top: number; width: number } | null>(null);
+  const [box, setBox] = useState<{ left: number; bottom: number; width: number } | null>(null);
 
   useLayoutEffect(() => {
     if (!visible || !buttonRef.current) { setBox(null); return; }
@@ -713,10 +631,12 @@ function InputPopup({
       const sidebarLeft = sidebar ? sidebar.getBoundingClientRect().left : window.innerWidth;
       const rightLimit = Math.min(sidebarLeft, window.innerWidth) - 8;
       const width = Math.max(120, rightLimit - r.left);
-      // Wrapper top = r.bottom (NO gap). The visual 4px gap below the button is created
-      // by paddingTop INSIDE the wrapper. This keeps the wrapper's hover-area flush with
-      // the button so the cursor can travel through the gap without losing hover.
-      setBox({ left: r.left, top: r.bottom, width });
+      // Раскрывается ВВЕРХ: чип живёт в нижней полосе приложения, и поле,
+      // открытое вниз, ушло бы за нижний край. Мост наведения тоже переехал —
+      // теперь это paddingBottom, чтобы курсор мог пройти от чипа к полю, не
+      // теряя наведения (иначе поле исчезает ровно в момент, когда к нему
+      // тянутся).
+      setBox({ left: r.left, bottom: window.innerHeight - r.top, width });
     };
     measure();
     window.addEventListener('resize', measure);
@@ -735,9 +655,9 @@ function InputPopup({
         style={{
           position: 'fixed',
           left: box.left,
-          top: box.top,
+          bottom: box.bottom,
           width: box.width,
-          paddingTop: 4, // invisible CSS-bridge: extends hit area upward to the button
+          paddingBottom: 4, // невидимый мост: тянет зону наведения вниз, к чипу
           zIndex: 10000,
         }}
       >

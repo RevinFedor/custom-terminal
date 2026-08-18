@@ -100,10 +100,16 @@ export default function PaneTabChip({
   // can be renamed from whichever surface the user is already looking at.
   const [renaming, setRenaming] = useState(false);
   const [renameDraft, setRenameDraft] = useState('');
+  // Выделять текст можно ровно ОДИН раз, при появлении поля. `ref` зовётся и
+  // на последующих перерисовках (а они идут на каждую букву), и повторный
+  // `select()` выделял бы только что набранное — то есть следующая буква
+  // стирала бы предыдущую.
+  const renameFocusedRef = useRef(false);
 
   const commitRename = () => {
     const next = renameDraft.trim();
     setRenaming(false);
+    renameFocusedRef.current = false;
     if (!next || next === tabName) return;
     useWorkspaceStore.getState().renameTab(projectId, tabId, next);
   };
@@ -424,8 +430,25 @@ export default function PaneTabChip({
           simply never set. The folder says what it is instead. */}
       {isEmpty && <Folder size={10} style={{ color: '#8a8a92', flexShrink: 0 }} />}
       {renaming ? (
+        // Переименование выглядит и ведёт себя ТАК ЖЕ, как в боковом списке:
+        // жест один, и разное поведение читалось бы как разные функции.
+        //
+        // Весь текст выделен (`select()`, а не просто фокус): переименовывают,
+        // чтобы НАЗВАТЬ заново, поэтому первая же буква должна заменить
+        // старое имя. Курсор, поставленный в текст, заставляет сначала стирать
+        // — а куда он встанет, зависит от того, куда попал клик, то есть
+        // результат жеста был бы разным от раза к разу.
+        //
+        // Рамка тенью, а не border'ом: тень не занимает места в раскладке, и
+        // чип не раздувается на время правки, сдвигая соседей по полосе.
+        // Шрифт наследуется целиком — поле повторяет коробку подписи.
         <input
-          autoFocus
+          ref={(node) => {
+            if (!node || renameFocusedRef.current) return;
+            renameFocusedRef.current = true;
+            node.focus();
+            node.select();
+          }}
           value={renameDraft}
           onChange={(e) => setRenameDraft(e.target.value)}
           onPointerDown={(e) => e.stopPropagation()}
@@ -434,15 +457,20 @@ export default function PaneTabChip({
           onKeyDown={(e) => {
             e.stopPropagation();
             if (e.key === 'Enter') commitRename();
-            else if (e.key === 'Escape') setRenaming(false);
+            else if (e.key === 'Escape') {
+              setRenaming(false);
+              renameFocusedRef.current = false;
+            }
           }}
           style={{
             width: Math.max(60, renameDraft.length * 6.5 + 12),
             minWidth: 60,
-            padding: 0,
+            padding: '0 4px',
             border: 'none',
             outline: 'none',
-            background: 'transparent',
+            background: '#333',
+            borderRadius: 3,
+            boxShadow: 'inset 0 0 0 1px var(--color-accent)',
             color: '#fff',
             font: 'inherit',
           }}

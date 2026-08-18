@@ -8,9 +8,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import DocsButton from './DocsButton';
 import ClaudeUsageButton from './ClaudeUsageButton';
 import ResourceUsageButton from './ResourceUsageButton';
-import GitStatusButton from './GitStatusButton';
 import TimelineToolsButton from './TimelineToolsButton';
-import CopySessionWithChips from './CopySessionWithChips';
 import { useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import {
   timelineOutlineKey,
@@ -60,33 +58,9 @@ export default function WorkspaceTitleBarTools() {
   const centerProjectId = useWorkspaceStore((state) => state.activeProjectId);
   const isSystemProject = isInboxProjectId(focusedProjectId);
 
-  const currentProjectMetaPath = useProjectsStore((state) => (
-    focusedProjectId ? state.projects[focusedProjectId]?.path : undefined
-  ));
-  const currentProjectName = useProjectsStore((state) => (
-    focusedProjectId ? state.projects[focusedProjectId]?.name : undefined
-  ));
-  const currentWorkspaceProjectPath = useWorkspaceStore((state) => {
-    const projectId = selectFocusedProjectId(state);
-    if (!projectId) return undefined;
-    return state.openProjects.get(projectId)?.projectPath;
-  });
-  const currentProjectPath = currentProjectMetaPath || currentWorkspaceProjectPath;
   const centerProjectName = useProjectsStore((state) => (
     centerProjectId ? state.projects[centerProjectId]?.name : undefined
   ));
-
-  // Рабочая директория АКТИВНОЙ вкладки — то, о чём сейчас говорит Git.
-  // Строковый селектор (Fingerprint Pattern): пересчитывается на каждую запись
-  // в стор, но перерисовывает только когда путь действительно изменился.
-  const activeTabCwd = useWorkspaceStore((state) => {
-    const projectId = state.activeProjectId;
-    if (!projectId) return '';
-    const workspace = state.openProjects.get(projectId);
-    const tabId = state.getEffectiveTabId();
-    const tab = tabId && workspace ? workspace.tabs.get(tabId) : null;
-    return tab?.cwd || '';
-  });
 
   const activeExternalRunKey = useWorkspaceStore((state) => {
     const projectId = state.activeProjectId;
@@ -544,31 +518,6 @@ export default function WorkspaceTitleBarTools() {
       {/* Действия с документацией (Update Docs / Update API). */}
       {!isSystemProject && <DocsButton />}
 
-      {/* Копирование сессии. Ничего не рисует, когда у активной вкладки нет
-          сессии Claude/Gemini/Codex — на обычных вкладках ряд просто короче. */}
-      <CopySessionWithChips />
-
-      {/* Git следует за директорией АКТИВНОЙ ВКЛАДКИ (2026-08-17): директория
-          принадлежит вкладке, поэтому вкладка в worktree обязана показывать СВОЮ
-          ветку. `projectPath` остаётся проектным — он опознаёт сохранённое
-          состояние панели и список репозиториев; `tabCwd` — то, о чём статус.
-          Передать путь вкладки как projectPath значило бы пересоздавать панель
-          на каждом переключении и стирать наполовину написанное сообщение
-          коммита. */}
-      {!isSystemProject && (activeTabCwd || currentProjectPath) && (
-        // Кнопка Git рисует себя во всю высоту хозяина и с прямыми углами: она
-        // жила в конце полосы и упиралась в край окна. Здесь края нет, поэтому
-        // высоту задаёт эта коробка, а скругление она же и обрезает — иначе
-        // кнопка была бы выше соседей и с чужими углами.
-        <div style={{ display: 'flex', alignItems: 'stretch', height: 24, borderRadius: 6, overflow: 'hidden', flexShrink: 0 }}>
-          <GitStatusButton
-            projectId={focusedProjectId}
-            projectName={currentProjectName}
-            projectPath={currentProjectPath}
-            tabCwd={activeTabCwd}
-          />
-        </div>
-      )}
     </div>
   );
 }

@@ -673,6 +673,22 @@ export function historyLivePresentationIdentities(entry) {
   return identities;
 }
 
+export function retireHistoryLivePromptByExactProof(entries, {
+  sourceIdentity = null,
+  entryUuid = null,
+} = {}) {
+  const source = Array.isArray(entries) ? entries : [];
+  const exactSource = String(sourceIdentity || '').trim();
+  const exactUuid = String(entryUuid || '').trim();
+  if (!exactSource && !exactUuid) return source;
+  const next = source.filter((entry) => {
+    if (exactUuid && String(entry?.uuid || '') === exactUuid) return false;
+    if (!exactSource) return true;
+    return !historyLivePresentationIdentities(entry).includes(exactSource);
+  });
+  return next.length === source.length ? source : next;
+}
+
 const TURN_BOUNDARIES_THAT_CLEAR_PENDING_THINKING = new Set([
   'task_started',
   'task_complete',

@@ -16,6 +16,7 @@ const {
 } = require('../history-revision');
 const {
   deriveConfirmedClaudeSettings,
+  deriveLatestConfirmedClaudeRuntimeEffort,
   projectConfirmedClaudeSettingsForRuntime,
   traceClaudeActiveBranch,
 } = require('../claude-confirmed-settings');
@@ -4935,16 +4936,21 @@ function register({
         ),
       });
       const confirmed = deriveConfirmedClaudeSettings(activeBranch);
+      const runtimeEffort = deriveLatestConfirmedClaudeRuntimeEffort(
+        recordMap.values(),
+        { sessionId },
+      );
+      const confirmedEffort = runtimeEffort || confirmed?.effort || null;
       const result = {
         success: true,
         sessionId,
         latestSessionId: resolveLatestSessionInChain(sessionId, cwd),
         model: confirmed?.model?.value || null,
-        effort: confirmed?.effort?.value || null,
+        effort: confirmedEffort?.value || null,
         modelProofAt: confirmed?.model?.proofAt || 0,
-        effortProofAt: confirmed?.effort?.proofAt || 0,
+        effortProofAt: confirmedEffort?.proofAt || 0,
         modelProofSessionId: confirmed?.model?.proofSessionId || null,
-        effortProofSessionId: confirmed?.effort?.proofSessionId || null,
+        effortProofSessionId: confirmedEffort?.proofSessionId || null,
         proof: 'active-jsonl-branch',
       };
       // Witness captured AFTER the resolve, over the exact files it read —

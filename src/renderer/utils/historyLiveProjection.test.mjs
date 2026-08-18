@@ -7,6 +7,7 @@ import {
   historyLivePresentationIdentities,
   historyLivePresentationKey,
   reconcileCommittedHistoryLiveProjection,
+  retireHistoryLivePromptByExactProof,
   reconcileHistoryLiveToolResults,
   reduceHistoryLiveProjection,
   shouldIncludeHistoryLiveUserText,
@@ -504,6 +505,21 @@ test('canonical Codex event row retires its response carrier through an exact so
   );
   assert.strictEqual(buildHistoryLivePresentation(durable, live), durable);
   assert.deepEqual(reconcileCommittedHistoryLiveProjection(live, durable).entries, []);
+});
+
+test('late audit proof retires an already painted optimistic duplicate by exact source identity', () => {
+  const sourceIdentity = 'codex-user-source-session-a-4096';
+  const live = [{
+    uuid: 'codex-live-user',
+    sourceIdentity,
+    role: 'user',
+    sessionId: 'session-a',
+    content: '[Image #1] prompt',
+  }];
+  assert.deepEqual(retireHistoryLivePromptByExactProof(live, { sourceIdentity }), []);
+  assert.strictEqual(retireHistoryLivePromptByExactProof(live, {
+    sourceIdentity: 'codex-user-source-session-a-8192',
+  }), live, 'identical text is irrelevant without exact identity');
 });
 
 test('live response carrier upgrades in place when canonical event carries its alias', () => {

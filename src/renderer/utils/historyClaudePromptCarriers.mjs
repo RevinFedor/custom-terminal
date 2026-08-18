@@ -117,7 +117,18 @@ export function isHistoryPromptLocallyOwned(envelope, handoffs) {
 
   const record = rawRecord(envelope);
   const entryUuid = typeof record?.uuid === 'string' ? record.uuid : '';
-  return !!entryUuid && source.some((handoff) => handoff?.auditEntryUuid === entryUuid);
+  if (entryUuid && source.some((handoff) => handoff?.auditEntryUuid === entryUuid)) {
+    return true;
+  }
+
+  const exactSourceIdentities = [
+    record?.sourceIdentity,
+    ...(Array.isArray(record?.sourceIdentityAliases) ? record.sourceIdentityAliases : []),
+  ].filter((identity) => typeof identity === 'string' && identity);
+  return exactSourceIdentities.length > 0 && source.some((handoff) => (
+    typeof handoff?.sourceIdentity === 'string'
+    && exactSourceIdentities.includes(handoff.sourceIdentity)
+  ));
 }
 
 // Compatibility alias for the original Claude-only caller. The ownership

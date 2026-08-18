@@ -19,6 +19,9 @@ import {
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabStrip from './PaneTabStrip';
+import GitStatusButton from './GitStatusButton';
+import { useProjectsStore } from '../../store/useProjectsStore';
+import { isInboxProjectId } from '../../constants/systemProjects';
 import { TabLocationLine } from './TabLocationLine';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
@@ -104,6 +107,24 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   // three columns full does not mean this column cannot still be stacked.
   const splitCan = splitAvailability(splitPanes, paneIndex ?? null);
   const inSplit = splitPanes.length > 0;
+
+  // Git этой шапки: проект — тот, кому принадлежит показанная вкладка, путь —
+  // её собственный (вкладка может сидеть в worktree). Строковые селекторы, а
+  // не объекты: шапка есть у каждого окна, и селектор, отдающий объект, давал
+  // бы новую ссылку на каждую запись в стор (правило Fingerprint).
+  const ownerProjectId = useWorkspaceStore((s) => (
+    s.openProjects.get(projectId)?.tabs.has(tabId) ? projectId : ''
+  ));
+  const gitCwd = useWorkspaceStore((s) => (
+    s.openProjects.get(projectId)?.tabs.get(tabId)?.cwd || ''
+  ));
+  const gitProjectPath = useWorkspaceStore((s) => (
+    s.openProjects.get(projectId)?.projectPath || ''
+  ));
+  const gitProjectName = useProjectsStore((s) => s.projects[projectId]?.name || '');
+  // У Inbox нет своего репозитория — вкладки там чужие, и ветка «проекта»
+  // ничего не значила бы. То же исключение, что было в верхней полосе.
+  const gitAvailable = !!ownerProjectId && !!gitCwd && !isInboxProjectId(projectId);
 
   // The strip this header draws. A STRING selector (Fingerprint Pattern) — a
   // selector returning the entry array would allocate on every store write and
@@ -243,6 +264,27 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
 
       {/* No spacer: the strip itself takes the free width, so the split button
           stays pinned right whether there is one chip or twelve. */}
+
+      {/* Git — рядом с кнопкой деления, слева от неё.
+          Он следует за директорией ПОКАЗАННОЙ ЗДЕСЬ вкладки, а не активной: в
+          верхней полосе Git отвечал про одну вкладку на всё приложение, и с
+          несколькими окнами это стало враньём — в каждом окне может быть свой
+          worktree и своя ветка. Теперь на вопрос «какая тут ветка» отвечает та
+          шапка, над которой человек и смотрит.
+          `projectPath` остаётся ПРОЕКТНЫМ: он опознаёт сохранённое состояние
+          панели и список репозиториев. Подменить его путём вкладки значило бы
+          пересоздавать панель на каждое переключение и стирать наполовину
+          написанное сообщение коммита. */}
+      {gitAvailable && (
+        <div style={{ display: 'flex', alignItems: 'stretch', height: 20, borderRadius: 4, overflow: 'hidden', flexShrink: 0, marginRight: 4 }}>
+          <GitStatusButton
+            projectId={ownerProjectId}
+            projectName={gitProjectName}
+            projectPath={gitProjectPath}
+            tabCwd={gitCwd}
+          />
+        </div>
+      )}
 
       {/* VS Code header pattern (approved 2026-08-17): pane ACTIONS show on
           the focused pane only; an unfocused pane reveals them on header

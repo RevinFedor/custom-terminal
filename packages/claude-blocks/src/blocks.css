@@ -867,7 +867,20 @@
   border-left-color: var(--cb-message-danger);
   background: var(--cb-error-bg);
 }
+.cb-message-event-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
 .cb-message-event-status { margin-bottom: 0; }
+.cb-message-event-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
 .cb-message-event-body {
   margin-top: 5px;
   color: var(--cb-msg-text);
