@@ -135,6 +135,22 @@ export default function TimelineToolsButton({
       : 'transparent';
   };
 
+  // Наведение — как у соседей по шапке. Кнопка со своим цветом состояния
+  // (открыта, идёт работа, включён авто) на курсор не отвечает: её подложка
+  // уже занята под сообщение о состоянии, и подсветка поверх соврала бы.
+  const hoverIn = (event: React.MouseEvent<HTMLButtonElement>) => {
+    if (active) return;
+    event.currentTarget.style.background = 'rgba(255,255,255,0.10)';
+    event.currentTarget.style.borderColor = 'rgba(255,255,255,0.22)';
+    event.currentTarget.style.color = '#e4e4e7';
+  };
+  const hoverOut = (event: React.MouseEvent<HTMLButtonElement>) => {
+    if (active) return;
+    event.currentTarget.style.background = 'rgba(255,255,255,0.04)';
+    event.currentTarget.style.borderColor = 'rgba(255,255,255,0.12)';
+    event.currentTarget.style.color = '#a1a1aa';
+  };
+
   return (
     <>
       <Tooltip content="Инструменты Timeline: группы сессии и пересказы сообщений">
@@ -143,6 +159,8 @@ export default function TimelineToolsButton({
           data-timeline-tools-button
           aria-expanded={open}
           onClick={() => setOpen((value) => !value)}
+          onMouseEnter={hoverIn}
+          onMouseLeave={hoverOut}
           style={triggerStyle}
         >
           <ListTree size={12} className={outlineGenerating ? 'animate-pulse text-purple-300' : ''} />

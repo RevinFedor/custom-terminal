@@ -81,7 +81,7 @@ test('no override when the patched codex itself is absent', () => {
   assert.equal(decision.reason, 'missing-codex-binary');
 });
 
-test('windows looks for the .exe host next to the patched codex', () => {
+test('windows keeps the stock Codex until a named-pipe producer exists', () => {
   const codexBin = path.join('C:\\noted', 'bin', 'codex.exe');
   const hostBin = path.join('C:\\noted', 'bin', 'codex-code-mode-host.exe');
 
@@ -92,8 +92,9 @@ test('windows looks for the .exe host next to the patched codex', () => {
     fileExists: fileExistsIn([codexBin, hostBin]),
   });
 
-  assert.equal(decision.enabled, true);
-  assert.equal(decision.hostPath, hostBin);
+  assert.equal(decision.enabled, false);
+  assert.equal(decision.reason, 'unsupported-platform');
+  assert.equal(decision.hostPath, null);
 });
 
 test('an unrelated host elsewhere on PATH does not satisfy the sibling rule', () => {

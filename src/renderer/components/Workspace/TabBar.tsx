@@ -22,6 +22,8 @@ import { PaneMapCells, usePaneMapColumns } from './PaneMap';
 import { splitAvailability, paneIndexHoldingTab } from '../../utils/splitPanesModel.mjs';
 import MoveToWindowMenu from './MoveToWindowMenu';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
+import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
+import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { TabProcessBar, TabStatusMarker, TabFastBadge, TabContextUsageBadge, useTabContextUsage } from './TabSignals';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
@@ -9286,6 +9288,52 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
             // and Ctrl+C path instead of SIGTERM (zsh/bash handles SIGINT, no danger zone like Claude TUI).
             const showStopScript = !showStopAI && scriptCount > 0;
             const SCRIPT_TINT = '#dc2626'; // cherry-red — distinguish from green "running" dot; AI buttons keep their own tints
+            const RUN_TINT = '#4ade80'; // зелёный «живого процесса» — тот же, что у точки запущенной вкладки
+
+            // Что делать с вкладками, на которых ничего не запущено. Живой
+            // процесс вытесняет запуск (см. tabMenuRunAction.mjs), поэтому эта
+            // ветка включается только когда останавливать нечего.
+            const runState = resolveTabMenuRunState(
+              targetTabIds.map((id) => {
+                const tab = workspace.tabs.get(id);
+                if (!tab) return null;
+                return { ...tab, __ptyOwner: resolvePtyAgentOwner(tab) };
+              }).filter(Boolean) as any[],
+              new Set(targetTabIds.filter((id) => (
+                processStatus.get(id) || (workspace.tabs.get(id)?.tabType === 'claude-sdk' && claudeBusyMap.get(id))
+              ))),
+            );
+            const runTooltip = runState.kind === 'run'
+              ? (runState.count > 1
+                ? `Запустить агента на ${runState.count} вкладках`
+                : (runState.mode === 'resume'
+                  ? `Продолжить сохранённую сессию ${runState.toolType === 'codex' ? 'Codex' : 'Claude'}`
+                  : `Запустить ${runState.toolType === 'codex' ? 'Codex' : 'Claude'} заново`))
+              : '';
+
+            // Запуск идёт через общий слой запуска агентов — тот же, которым
+            // пользуется кнопка состояния в переписке. Здесь только выбор
+            // «продолжить или начать заново», сам запуск не дублируется.
+            const handleRunAI = async (e: React.MouseEvent) => {
+              e.stopPropagation();
+              setContextMenu(null);
+              await Promise.all(runState.targets.map(async (target: any) => {
+                const runtime = getHistoryAgentRuntime(target.toolType);
+                const result = target.mode === 'resume'
+                  ? await runtime.resume({
+                    tabId: target.tabId,
+                    sessionId: target.sessionId,
+                    cwd: target.cwd || undefined,
+                  })
+                  : await runtime.startFresh?.({
+                    tabId: target.tabId,
+                    cwd: target.cwd || undefined,
+                  });
+                if (result && result.success === false) {
+                  showToast(`Не удалось запустить: ${result.error || 'неизвестная ошибка'}`, 'error');
+                }
+              }));
+            };
 
             // Majority decides base color. Minority is rendered as a small "+N"
             // badge, so mixed Claude/Gemini/Codex selections stay readable.
@@ -9472,8 +9520,34 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                 {scriptLabel}
               </button>
               </Tooltip>
+            ) : runState.kind === 'run' ? (
+              // Сессия не запущена — в слоте «Запустить», а не серая надпись
+              // «Stop», которую нельзя нажать. Место занимало сообщение о том,
+              // что сделать нельзя ничего, ровно тогда, когда сделать нужно
+              // ровно одно.
+              //
+              // Запуск идёт тем же общим слоем, что и кнопка состояния в
+              // переписке (historyAgentRuntimes): у запуска агента один код на
+              // всё приложение, второй разошёлся бы с ним на первой же
+              // особенности — пометке «resume в пути», авто-имени вкладки,
+              // снятии пометки «прервана».
+              <Tooltip content={runTooltip}>
+              <button
+                className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444] whitespace-nowrap"
+                style={{ color: RUN_TINT, backgroundColor: RUN_TINT + '14' }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = RUN_TINT + '33'; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = RUN_TINT + '14'; }}
+                onClick={handleRunAI}
+              >
+                <Play size={9} fill={RUN_TINT} strokeWidth={0} />
+                {tabMenuRunLabel(runState)}
+              </button>
+              </Tooltip>
             ) : (
-              <Tooltip content="No active process to stop">
+              // Ни живого процесса, ни того, кого можно запустить: обычная
+              // терминальная вкладка или файл. Слот всё равно остаётся —
+              // иначе строка кнопок меняет ширину от вкладки к вкладке.
+              <Tooltip content="Нечего запускать или останавливать на этой вкладке">
               <button
                 disabled
                 className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] flex items-center justify-center gap-1.5 border-l border-[#444] cursor-not-allowed whitespace-nowrap"

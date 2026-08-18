@@ -89,6 +89,28 @@ test('счётчик вместо скроллбара', () => {
   assert.doesNotMatch(strip, /overflowX: 'scroll'/);
 });
 
+test('имя вкладки в полосе не обрезается', () => {
+  // Многоточие стояло ровно там, где был ответ, — на поверхности, вся работа
+  // которой в том, чтобы сказать, какая вкладка какая. Уезжает за край — про
+  // это говорят счётчики, а не огрызок имени.
+  assert.doesNotMatch(chip, /maxWidth: inStrip \? 220/);
+  assert.match(chip, /inStrip\n\s+\? \{ whiteSpace: 'nowrap' \}/);
+});
+
+test('счётчик скрытых красится цветом агента и растёт столбиком', () => {
+  // Одно число отвечает «сколько», а спрашивают «что»: две Claude и один Codex
+  // — другая ситуация, чем три Codex. Цвет берётся из ОБЩЕЙ таблицы вкладок:
+  // вторая таблица на одну полосу разошлась бы с первой.
+  assert.match(strip, /groupOverflowByKind/);
+  assert.match(strip, /from '\.\/tabChrome'/);
+  assert.match(strip, /flexDirection: 'column'/);
+  assert.match(strip, /data-strip-overflow-kind/);
+  // Цвет вкладки меняется в момент старта агента — часто уже за краем. Без
+  // подписки квадратик остался бы серым до случайной прокрутки.
+  assert.match(strip, /const kindsKey = useWorkspaceStore/);
+  assert.match(strip, /shownTabId, kindsKey\]/);
+});
+
 test('иконка проекта одна на группу подряд идущих вкладок', () => {
   // Иконка на каждом чипе стоит МЕЖДУ двумя чипами, и непонятно, чья она —
   // левого или правого.
@@ -141,7 +163,7 @@ test('между окнами переносит НАЗВАННАЯ цель, а
   assert.match(tabbar, /<MoveToWindowMenu/);
   // Карта повторяет раскладку: сетка по колонкам, окна колонки — друг под
   // другом. Плоский ряд нарисовал бы раскладку, которой нет.
-  assert.match(moveMenu, /gridTemplateColumns: `repeat\(\$\{columnCount\}/);
+  assert.match(moveMenu, /gridTemplateColumns: columnWidths/);
   assert.match(moveMenu, /windows\.filter\(\(w\) => w\.column === columnIndex\)/);
   // Вкладка уходит в КОНЕЦ полосы выбранного окна — тем же действием, что и
   // двойной клик по шапке.
@@ -182,4 +204,17 @@ test('одна вкладка = одно окно: перенос ЗАБИРАЕ
   assert.match(area, /duplicate pane tab=/);
   // И не переживает перезапуск.
   assert.match(model, /owner\.get\(e\.tabId\) === index/);
+});
+
+test('рисунок раскладки повторяет ПРОПОРЦИИ экрана, а не раздаёт всем поровну', () => {
+  // Фиксированная высота у каждого прямоугольника — второй ответ на вопрос
+  // «какой величины это окно», и он расходится с первым: окно во всю высоту
+  // колонки рисовалось половиной просто потому, что рядом стояло второе.
+  // Доли берём у самой рабочей области, вместе с перетянутыми перегородками.
+  assert.match(moveMenu, /paneGridRects\(st\.splitPanes, st\.splitSizes\)/);
+  assert.match(moveMenu, /flex: `\$\{Math\.max\(w\.heightPct, 1\)\} 1 0`/);
+  assert.match(moveMenu, /columnWidths\.map\(\(w\) => `\$\{Math\.max\(w, 8\)\}fr`\)/);
+  assert.doesNotMatch(moveMenu, /height: 46/);
+  // Перегородки двигает человек — рисунок обязан пересчитаться следом.
+  assert.match(moveMenu, /splitSizesFingerprint\(s\.splitSizes\)/);
 });

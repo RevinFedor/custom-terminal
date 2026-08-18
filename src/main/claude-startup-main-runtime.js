@@ -124,7 +124,10 @@ async function resolveClaudeSettingsAcrossForkChain({
       model = result.model;
       modelSessionId = currentSessionId;
     }
-    if (!effort && result.effort) {
+    // Effort is process-local. A parent/older JSONL record is historical proof,
+    // not the setting of the process that is starting now. The data layer only
+    // marks it current when its stdout was written inside this exact live launch.
+    if (!effort && result.effort && result.effortCurrentRuntime === true) {
       effort = result.effort;
       effortSessionId = currentSessionId;
     }

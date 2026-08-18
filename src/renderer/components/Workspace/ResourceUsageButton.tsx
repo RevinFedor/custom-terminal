@@ -61,7 +61,11 @@ type Mode = 'memory' | 'cpu';
 // текущего шрифта, а `tabular-nums` на кнопке делает все цифры одинаковыми,
 // поэтому мерка держится и на другом размере шрифта. Единица «ГБ» шире цифры,
 // отсюда небольшой запас.
-const RESOURCE_CHIP_VALUE_WIDTH_CH = '7.6ch';
+// Место под число: самая длинная подпись здесь — «10.90 ГБ», то есть четыре
+// цифры, точка, пробел и единица. Прежние 7.6ch мерились по «99.99 ГБ» с
+// запасом, и запас читался как дыра между значком и числом: резерв не виден
+// сам по себе, виден только пустой промежуток, который он оставляет.
+const RESOURCE_CHIP_VALUE_WIDTH_CH = '6.6ch';
 
 function formatBytes(bytes: number): string {
   if (!bytes || bytes < 0) return '0 МБ';
@@ -212,12 +216,26 @@ const ResourceUsageButton: React.FC = () => {
         <button
           ref={buttonRef}
           onClick={() => setOpen(value => !value)}
-          className="flex h-[22px] items-center gap-1 rounded-md px-1.5 text-[11px] transition-colors cursor-pointer"
+          className="flex h-[26px] items-center gap-1 rounded-md px-1.5 text-[11px] transition-colors cursor-pointer"
           style={{
             border: '1px solid ' + (open ? 'rgba(56,189,248,0.28)' : 'rgba(255,255,255,0.10)'),
             background: open ? 'rgba(56,189,248,0.13)' : 'rgba(255,255,255,0.04)',
             color: open ? '#bae6fd' : '#aaa',
             fontVariantNumeric: 'tabular-nums',
+          }}
+          // Наведение — как у соседей по шапке. Открытая панель уже красит
+          // кнопку своим цветом, поверх него подсвечивать нечего.
+          onMouseEnter={(event) => {
+            if (open) return;
+            event.currentTarget.style.background = 'rgba(255,255,255,0.10)';
+            event.currentTarget.style.borderColor = 'rgba(255,255,255,0.22)';
+            event.currentTarget.style.color = '#e4e4e7';
+          }}
+          onMouseLeave={(event) => {
+            if (open) return;
+            event.currentTarget.style.background = 'rgba(255,255,255,0.04)';
+            event.currentTarget.style.borderColor = 'rgba(255,255,255,0.10)';
+            event.currentTarget.style.color = '#aaa';
           }}
         >
           <Activity size={11} />

@@ -494,6 +494,8 @@ interface ProjectTabItemProps {
   projectId: string;
   projectName: string;
   projectIcon?: string | null;
+  /** Показывать только значок: подпись в карточке скрыта (имя остаётся в подсказке). */
+  hideProjectName?: boolean;
   index: number;
   isActive: boolean;
   fontSize: number;
@@ -523,6 +525,7 @@ const ProjectTabItem = memo(({
   projectId,
   projectName,
   projectIcon,
+  hideProjectName = false,
   index,
   isActive,
   fontSize,
@@ -729,6 +732,10 @@ const ProjectTabItem = memo(({
       data-project-navigation
       data-structured-project-drop-target
       data-project-id={projectId}
+      // При скрытой подписи имя обязано возвращаться по наведению: карточка,
+      // на которой ничего не написано, не должна быть ещё и неопознаваемой.
+      // В остальных случаях подсказки нет — имя и так написано.
+      title={hideProjectName && projectIcon ? projectName : undefined}
       className={`relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${
         isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
       } ${textColor}`}
@@ -852,7 +859,13 @@ const ProjectTabItem = memo(({
                 aria-hidden
               />
             ) : null}
-            <span className="max-w-[120px] truncate">{projectName}</span>
+            {/* «Только значок»: подпись скрыта, но имя остаётся в подсказке и
+                в доступности — карточка без имени не должна становиться
+                безымянной для тех, кто её не видит глазами. Настройка возможна
+                только при значке, поэтому пустой карточки не бывает. */}
+            {hideProjectName && projectIcon
+              ? <span className="sr-only">{projectName}</span>
+              : <span className="max-w-[120px] truncate">{projectName}</span>}
           </>
         )}
         {(activeProcessCount > 0 || isProjectBusy || isProjectLoading) && !isEditing && (
@@ -5805,6 +5818,7 @@ function App() {
                 projectId={projectId}
                 projectName={lastCreatedProjectId === projectId ? projectEditValue : project.name}
                 projectIcon={project.icon}
+                hideProjectName={!!project.hideName}
                 index={index}
                 isActive={isActive}
                 fontSize={projectTabsFontSize}

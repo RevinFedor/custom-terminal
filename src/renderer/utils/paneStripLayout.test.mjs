@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  groupOverflowByKind,
   groupStripByProject,
   resolveStripOverflow,
   scrollOffsetForChip,
@@ -33,25 +34,22 @@ test('скрытые вкладки считаются с двух сторон 
     { left: 300, width: 100 },
   ];
   // Окно 100..300: первая ушла влево, последняя не влезла справа.
-  assert.deepEqual(
-    resolveStripOverflow({ chips, scrollLeft: 100, viewportWidth: 200 }),
-    { hiddenLeft: 1, hiddenRight: 1 },
-  );
+  const clipped = resolveStripOverflow({ chips, scrollLeft: 100, viewportWidth: 200 });
+  assert.equal(clipped.hiddenLeft, 1);
+  assert.equal(clipped.hiddenRight, 1);
   // Всё видно — счётчиков нет.
-  assert.deepEqual(
-    resolveStripOverflow({ chips, scrollLeft: 0, viewportWidth: 400 }),
-    { hiddenLeft: 0, hiddenRight: 0 },
-  );
+  const whole = resolveStripOverflow({ chips, scrollLeft: 0, viewportWidth: 400 });
+  assert.equal(whole.hiddenLeft, 0);
+  assert.equal(whole.hiddenRight, 0);
 });
 
 test('частично видимая вкладка НЕ считается скрытой', () => {
   const chips = [{ left: 0, width: 100 }, { left: 100, width: 100 }];
   // Вторая видна наполовину — её видно и по ней можно кликнуть, значит она не
   // «скрыта». Иначе её назвали бы дважды: и полоской на экране, и числом.
-  assert.deepEqual(
-    resolveStripOverflow({ chips, scrollLeft: 0, viewportWidth: 150 }),
-    { hiddenLeft: 0, hiddenRight: 0 },
-  );
+  const half = resolveStripOverflow({ chips, scrollLeft: 0, viewportWidth: 150 });
+  assert.equal(half.hiddenLeft, 0);
+  assert.equal(half.hiddenRight, 0);
 });
 
 test('вкладка вплотную к краю не мигает в счётчике', () => {
@@ -60,6 +58,38 @@ test('вкладка вплотную к краю не мигает в счёт�
     resolveStripOverflow({ chips, scrollLeft: 100, viewportWidth: 200 }).hiddenLeft,
     1,
   );
+});
+
+test('скрытые вкладки называются поимённо, а не только числом', () => {
+  // Счётчик красится в цвет своего агента, значит одного числа мало: нужно
+  // знать, КТО именно уехал за край.
+  const chips = [
+    { left: 0, width: 100, tabId: 'a' },
+    { left: 100, width: 100, tabId: 'b' },
+    { left: 200, width: 100, tabId: 'c' },
+  ];
+  const res = resolveStripOverflow({ chips, scrollLeft: 100, viewportWidth: 100 });
+  assert.deepEqual(res.hiddenLeftIds, ['a']);
+  assert.deepEqual(res.hiddenRightIds, ['c']);
+  assert.equal(res.hiddenLeft, 1);
+  assert.equal(res.hiddenRight, 1);
+});
+
+test('квадратик на каждый вид, в порядке появления в полосе', () => {
+  // Порядок — первое появление, не «сначала кого больше»: полоса это карта,
+  // которую расставил человек, и счётчики её продолжают за краем окна.
+  const kind = { a: 'codex', b: 'claude', c: 'claude', d: 'codex' };
+  assert.deepEqual(
+    groupOverflowByKind(['a', 'b', 'c', 'd'], (id) => kind[id]),
+    [{ kind: 'codex', count: 2 }, { kind: 'claude', count: 2 }],
+  );
+  // Вкладка без агента — свой вид, а не «непонятно что»: серый квадратик
+  // честнее, чем приписать её чужому цвету.
+  assert.deepEqual(
+    groupOverflowByKind(['x'], () => undefined),
+    [{ kind: 'default', count: 1 }],
+  );
+  assert.deepEqual(groupOverflowByKind([], () => 'claude'), []);
 });
 
 test('показанная вкладка подтягивается в видимую часть, но не дёргается зря', () => {

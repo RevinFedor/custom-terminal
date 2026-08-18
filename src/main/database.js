@@ -466,6 +466,11 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE projects ADD COLUMN icon TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
+    // «Показывать только значок»: у проекта со значком можно спрятать подпись,
+    // чтобы карточка в шапке занимала меньше места.
+    try {
+      this.db.exec(`ALTER TABLE projects ADD COLUMN hide_name INTEGER DEFAULT 0`);
+    } catch (e) { /* column already exists */ }
 
     // Gemini history table
     this.db.exec(`
@@ -1728,6 +1733,10 @@ class DatabaseManager {
       name: project.name,
       description: project.description || '',
       icon: project.icon || null,
+      // Прятать подпись можно только при живом значке: иначе карточка стала бы
+      // пустой. Правило применяется ЗДЕСЬ, на чтении, а не только в интерфейсе —
+      // значок можно убрать, и сохранённое «спрятать» пережило бы его.
+      hideName: project.hide_name === 1 && !!project.icon,
       geminiPrompt: project.gemini_prompt,
       notesGlobal: project.notes_global || '',
       tabGroups: (() => {
@@ -3364,7 +3373,7 @@ class DatabaseManager {
   }
 
   updateProjectMetadata(projectId, metadata) {
-    const { name, description, geminiPrompt, path: newPath, icon } = metadata;
+    const { name, description, geminiPrompt, path: newPath, icon, hideName } = metadata;
     const updates = [];
     const params = [];
 
@@ -3373,6 +3382,7 @@ class DatabaseManager {
     if (geminiPrompt !== undefined) { updates.push('gemini_prompt = ?'); params.push(geminiPrompt); }
     if (newPath !== undefined) { updates.push('path = ?'); params.push(newPath); }
     if (icon !== undefined) { updates.push('icon = ?'); params.push(icon || null); }
+    if (hideName !== undefined) { updates.push('hide_name = ?'); params.push(hideName ? 1 : 0); }
 
     if (updates.length > 0) {
       params.push(projectId);

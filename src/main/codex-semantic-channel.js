@@ -10,6 +10,16 @@ const PROTOCOL_VERSION = 1;
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_BUFFER_BYTES = MAX_LINE_BYTES * 2;
 
+function defaultSocketRoot(platform = process.platform, pid = process.pid) {
+  if (platform === 'darwin' || platform === 'linux') {
+    // sockaddr_un.sun_path is only ~104 bytes on macOS. os.tmpdir() expands
+    // to a long /var/folders/... path and produced a listener Rust could not
+    // address. Keep the whole generated socket comfortably below that limit.
+    return path.join('/tmp', 'noted-codex-' + pid);
+  }
+  return path.join(os.tmpdir(), 'noted-terminal-codex-events-' + pid);
+}
+
 function shortSocketName(tabId) {
   return crypto.createHash('sha256').update(String(tabId || '')).digest('hex').slice(0, 20);
 }
@@ -35,6 +45,9 @@ function decideCodexBinaryOverride({
 } = {}) {
   if (!hasSemanticChannel) {
     return { enabled: false, reason: 'no-semantic-channel', hostPath: null };
+  }
+  if (platform !== 'darwin' && platform !== 'linux') {
+    return { enabled: false, reason: 'unsupported-platform', hostPath: null };
   }
   if (!codexBinPath || !fileExists(codexBinPath)) {
     return { enabled: false, reason: 'missing-codex-binary', hostPath: null };
@@ -70,7 +83,7 @@ async function createCodexSemanticChannelServer({
   tabId,
   onEvent,
   log = console,
-  socketRoot = path.join(os.tmpdir(), 'noted-terminal-codex-events-' + process.pid),
+  socketRoot = defaultSocketRoot(),
 } = {}) {
   if (!tabId) throw new TypeError('tabId is required');
   if (typeof onEvent !== 'function') throw new TypeError('onEvent is required');
@@ -86,6 +99,7 @@ async function createCodexSemanticChannelServer({
 
   const sockets = new Set();
   let activeInstanceId = null;
+  let activeSocket = null;
   let closed = false;
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -135,6 +149,7 @@ async function createCodexSemanticChannelServer({
           }
           connectionInstanceId = envelope.instanceId;
           activeInstanceId = envelope.instanceId;
+          activeSocket = socket;
           lastSequence = 0;
           onEvent({ ...envelope, tabId, gap: false });
           continue;
@@ -159,7 +174,10 @@ async function createCodexSemanticChannelServer({
     });
     socket.on('close', () => {
       sockets.delete(socket);
-      if (connectionInstanceId && activeInstanceId === connectionInstanceId) {
+      if (connectionInstanceId
+        && activeInstanceId === connectionInstanceId
+        && activeSocket === socket) {
+        activeSocket = null;
         onEvent({
           v: PROTOCOL_VERSION,
           tabId,
@@ -214,6 +232,7 @@ module.exports = {
   PROTOCOL_VERSION,
   createCodexSemanticChannelServer,
   decideCodexBinaryOverride,
+  defaultSocketRoot,
   shortSocketName,
   validateEnvelope,
 };

@@ -4210,6 +4210,34 @@ const historyPanelStyleText = `@keyframes hp-flash {
     -webkit-text-fill-color: currentColor;
   }
 }
+/* Подсветка кнопки состояния под курсором.
+   Решает БРАУЗЕР, а не наше состояние в памяти. Причина — замерено: когда узел
+   кнопки удаляют из документа прямо под курсором (перестроение разметки: смена
+   владельца истории, вход/выход из сплита, Ctrl+Tab), события «курсор ушёл» не
+   приходит вовсе — уходить уже неоткуда. Наш флаг оставался поднятым, и кнопка
+   продолжала показывать «остановить» на уже другой вкладке, пока пользователь
+   не наведётся на неё ещё раз и не уведёт курсор.
+   У :hover этой болезни нет по устройству: это не запомненный факт, а ответ
+   на вопрос «курсор над этим узлом сейчас», и у нового узла он вычисляется
+   заново. */
+[data-agent-status-row][data-agent-status-action='stop']:hover {
+  background-color: rgba(220, 38, 38, 0.20);
+}
+[data-agent-status-row][data-agent-status-action='start']:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+/* Значки: под курсором показываем действие, иначе — состояние. Оба нарисованы
+   всегда, видимостью управляет тот же :hover. Так «что случится по клику»
+   и «что происходит сейчас» не могут разойтись во времени. */
+[data-agent-status-row] > [data-agent-status-hover-glyph] { display: none; }
+[data-agent-status-row]:hover > [data-agent-status-hover-glyph] { display: block; }
+/* Значок состояния прячется, только если под курсором есть чем его заменить.
+   Пока действие не определено (состояние ещё выясняется), значка действия нет
+   вовсе — и без этого условия кнопка стала бы под курсором ПУСТОЙ. */
+[data-agent-status-row][data-agent-status-action='stop']:hover > [data-agent-status-idle-glyph],
+[data-agent-status-row][data-agent-status-action='start']:hover > [data-agent-status-idle-glyph] {
+  display: none;
+}
 ::highlight(hp-search) {
   background-color: rgba(234, 179, 8, 0.35);
   color: inherit;
@@ -5754,7 +5782,6 @@ function AgentHistoryControls({
   // Само «можно ли возобновить» живёт в `resumeMaterialized`, а причина отказа
   // теперь доходит до пользователя объявлением через `reportError`.
   const [statusCopied, setStatusCopied] = useState(false);
-  const [statusHover, setStatusHover] = useState(false);
   const [previewChipId, setPreviewChipId] = useState<string | null>(null);
   const [activityTiming, setActivityTiming] = useState<HistoryActivityTiming | null>(null);
   const [pasteActivityStartedAt, setPasteActivityStartedAt] = useState<number | null>(null);
@@ -9496,8 +9523,6 @@ function AgentHistoryControls({
           aria-label={statusActionLabel}
           aria-disabled={statusPrimaryAction === 'pending'}
           onClick={activateUnifiedStatus}
-          onMouseEnter={() => setStatusHover(true)}
-          onMouseLeave={() => setStatusHover(false)}
           onContextMenu={(event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -9519,11 +9544,12 @@ function AgentHistoryControls({
             // that ENDS a state must not look like the indicator that reports it
             // — see methodology/переносимый-дизайн.md, destructive ≠ status.
             borderRadius: 5,
-            background: statusHover && statusPrimaryAction === 'stop'
-              ? 'rgba(220,38,38,0.20)'
-              : statusHover && statusPrimaryAction === 'start'
-                ? 'rgba(255,255,255,0.08)'
-                : 'transparent',
+            // Фон здесь НЕ задаётся вовсе — им целиком распоряжается таблица
+            // стилей по `:hover` (см. выше). Даже `transparent`, выставленный
+            // тут, перебил бы правило подсветки: встроенный стиль сильнее
+            // правила из таблицы, и кнопка осталась бы прозрачной под курсором.
+            // (Поймано замером: значки менялись, фон — нет.) Прозрачность и так
+            // действует по умолчанию — у кнопки нет своего фона.
             color: statusCopied ? '#86efac' : '#aaa',
             fontSize: aiSecondaryFontSize,
             fontWeight: 650,
@@ -9534,36 +9560,54 @@ function AgentHistoryControls({
         >
           {presenceResolving ? (
             <HistoryOwnerTransitionIcon size={20} />
-          ) : statusHover && statusPrimaryAction === 'stop' ? (
-            <span
-              aria-hidden
-              data-agent-status-glyph="stop"
-              style={{
-                width: 9,
-                height: 9,
-                borderRadius: 2,
-                margin: '0 5px',
-                background: '#f87171',
-                flexShrink: 0,
-              }}
-            />
-          ) : statusHover && statusPrimaryAction === 'start' ? (
-            <Play
-              aria-hidden
-              data-agent-status-glyph="start"
-              size={13}
-              strokeWidth={2.2}
-              style={{ margin: '0 3px', color: '#4ade80', flexShrink: 0 }}
-            />
           ) : (
-            // Кнопка отвечает ТОЛЬКО за жизнь агента: запущен, занят, остановлен.
-            // Ни свечение, ни рисунок не зависят от раскладки — см. комментарий
-            // у HistoryTerminalActivityIcon, там оба удалённых свойства описаны.
-            <HistoryTerminalActivityIcon
-              size={20}
-              busy={showBusyLoader || isCompacting}
-              color={statusAccent}
-            />
+            // Оба значка нарисованы ВСЕГДА, а показывает нужный — браузер, по
+            // `:hover` (правила в таблице стилей выше). Раньше выбор шёл здесь,
+            // из запомненного «курсор над кнопкой», и этот флаг застревал: когда
+            // узел кнопки удаляли прямо под курсором (смена владельца истории,
+            // сплит, Ctrl+Tab), события «курсор ушёл» не приходило вовсе, и
+            // кнопка продолжала показывать «остановить» на уже другой вкладке.
+            //
+            // Значок действия и значок состояния сменяются одним и тем же
+            // правилом, поэтому разойтись во времени они не могут: не бывает
+            // кадра, где видно оба или не видно ни одного.
+            <>
+              {statusPrimaryAction === 'stop' ? (
+                <span
+                  aria-hidden
+                  data-agent-status-hover-glyph
+                  data-agent-status-glyph="stop"
+                  style={{
+                    width: 9,
+                    height: 9,
+                    borderRadius: 2,
+                    margin: '0 5px',
+                    background: '#f87171',
+                    flexShrink: 0,
+                  }}
+                />
+              ) : statusPrimaryAction === 'start' ? (
+                <Play
+                  aria-hidden
+                  data-agent-status-hover-glyph
+                  data-agent-status-glyph="start"
+                  size={13}
+                  strokeWidth={2.2}
+                  style={{ margin: '0 3px', color: '#4ade80', flexShrink: 0 }}
+                />
+              ) : null}
+              {/* Кнопка отвечает ТОЛЬКО за жизнь агента: запущен, занят,
+                  остановлен. Ни свечение, ни рисунок не зависят от раскладки —
+                  см. комментарий у HistoryTerminalActivityIcon, там оба
+                  удалённых свойства описаны. */}
+              <span data-agent-status-idle-glyph style={{ display: 'block', flexShrink: 0 }}>
+                <HistoryTerminalActivityIcon
+                  size={20}
+                  busy={showBusyLoader || isCompacting}
+                  color={statusAccent}
+                />
+              </span>
+            </>
           )}
           {/* The status TEXT moved above the frame — see
               historyComposerFloatingStatus. Inside the row it grew and shrank
@@ -13798,6 +13842,22 @@ function HistoryPanel({
     // A converging Timeline jump owns the centre; ranges published while it
     // hunts are transit, not reading positions.
     if (historyJumpHydrationActiveRef.current) return;
+    // A position restore is transit too — and this is the one that cost a
+    // whole tab.
+    //
+    // Switching to a tab remounts the list, and the list publishes its first
+    // range (rows 0-9, the top) BEFORE the restore has moved it to where the
+    // person was reading. The watcher believed that range: it saw stubs at
+    // row 0, asked main to hydrate around row 0 — and main's answer evicted
+    // the span the reader was actually in. Live 18.08 01:50:31: `range=0-9
+    // stubAt=0` immediately after the switch, the readable span moved from
+    // 645-1394 to 0-750, and the tab went grey until it was clicked again.
+    //
+    // A jump restore already knew this; the position restore is the same fact
+    // — the viewport is being MOVED, not read — and it already has a signal.
+    // Ranges during the hunt are a machine scrolling, not a person reading,
+    // and only a person's position deserves the hydrated span.
+    if (reason === 'range-changed' && historyRestoreInFlightRef.current !== 0) return;
     // Anchor on the STUB, never on the viewport midpoint (the midpoint anchor
     // looped in production 16.08 ~01:08 — grouping moved it to a different
     // entry after every response, and that entry often could not anchor a
@@ -14653,6 +14713,15 @@ function HistoryPanel({
       if (historyRestoreInFlightRef.current === restoreToken) {
         historyRestoreInFlightRef.current = 0;
         stampHistoryMachineScrollCooldown();
+        // The machine stopped moving, so the visible range finally means a
+        // reading position: check it once. Ranges published DURING the hunt
+        // were refused above, and this is the event that says they may now be
+        // believed — without it a restore that landed on stubs (its anchor row
+        // was edited away) would wait for the person to scroll.
+        // `maybeRequestHistoryHydration` only reads refs, so calling the
+        // closure this effect captured is safe; it is not in the dep list
+        // because its identity is stable and this effect is position-critical.
+        maybeRequestHistoryHydration('restore-settled');
       }
       // While the mount wave still renders shells, Virtuoso's state would
       // bank SHELL heights as if they were card measurements — for an

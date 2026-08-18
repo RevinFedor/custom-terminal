@@ -256,7 +256,7 @@ Claude Think, наоборот, остался последней строкой
 
 ## Подтверждённые model/effort: кэш в main + ожидание «подтверждение в полёте»
 
-Кластер Model/Effort для PTY-Claude показывает не дефолты StatusBar, а ПОДТВЕРЖДЁННЫЕ настройки текущей сессии — их main реконструирует бэктрейсом активной JSONL-ветки (`claude:get-confirmed-settings`). Реконструкция полная и на 59MB-сессии стоила 480-1630мс main-времени, а вызывается она на каждый tab switch (session-change) и на каждое изменение транскрипта — это был один из слагаемых свап-фриза.
+Кластер Model/Effort для PTY-Claude не принимает правдоподобный fallback за live-state. Model main реконструирует бэктрейсом активной JSONL-ветки (`claude:get-confirmed-settings`). Effort имеет более узкий контракт: Claude подтверждает его строкой `this session only`, поэтому JSONL старого процесса — только исторический факт. Текущим считается лишь `/effort` stdout, записанный после accepted launch-boundary нынешней живой process generation. Реконструкция полной ветки на 59MB-сессии стоила 480-1630мс main-времени, а вызывается она на каждый tab switch (session-change) и на каждое изменение транскрипта — это был один из слагаемых свап-фриза.
 
 Кэш в main: ответ переиспользуется, пока каждый файл цепочки байт-в-байт тот же (свидетель identity+mtime+size, снятый ПОСЛЕ resolve по точному списку прочитанных файлов + mtime папки проекта — resume/fork-ребёнок появляется новым файлом и меняет latestSessionId, не трогая существующие). Живой ход инвалидирует кэш собственным append'ом. LRU 24 сессии, только в памяти — первый запрос после рестарта main снова полный. В логе `ConfirmedSettings ... cache=hit|miss`.
 
@@ -272,7 +272,7 @@ Escape hatch поверх автоматических сбросов, изна�
 
 Tab-метаданные (`tabType`, `sdkModel`, `sdkEffort`, `sdkThinking`) читаются через **отдельные** primitive Zustand-селекторы на каждое поле. **НЕ** единый композитный селектор — он возвращал бы свежий объект `{}` на каждом рендере, Zustand видит новую ссылку и фурит компонент в бесконечный re-render. Это та же ловушка что в CLAUDE.md anti-pattern «Не подписывайся на Map целиком» (Zustand fingerprint pattern).
 
-PTY-Claude Model/Effort в ControlBar — проекция подтверждённого состояния **текущей сессии**, а не local mirror глобальных defaults. При привязке сессии bar читает её активную `parentUuid`-ветку и принимает только прямую пару `/<setting> value` → `<local-command-stdout>Set ...</local-command-stdout>`. Тот же transcript watcher обновляет bar после ручной команды в терминале; после Rewind физически более новые записи отброшенной ветки не выигрывают. Поэтому renderer/app restart восстанавливает фактические `model/effort`, а не сбрасывает их в `default`/`unset`.
+PTY-Claude Model/Effort в ControlBar — проекция доказанного состояния, но области жизни различаются. Model принадлежит **текущей сессии**; effort — **текущему процессу этой сессии**. Bar принимает только прямую пару `/<setting> value` → `<local-command-stdout>Set ...</local-command-stdout>` на активной `parentUuid`-ветке, а для effort дополнительно требует timestamp не раньше текущей launch generation. Transcript watcher обновляет bar после ручной команды; Rewind отбрасывает abandoned future. Renderer seed хранит только model: effort без runtime generation не кэшируется, иначе после Resume старый `max` снова выглядит применённым до того, как новый процесс вообще получил `/effort max`.
 
 Когда типизированная Claude/Codex PTY-вкладка остановлена, те же Model/Effort
 становятся выбором **следующего запуска**. Для Claude сохраняется только полная
@@ -284,7 +284,7 @@ pending-состояния только после proof обеих команд
 footer не подтвердит именно эту пару. Поэтому pending-выбор показывается выше
 старого подтверждённого значения, но не выдаётся за уже применённое live-state.
 
-StatusBar при этом остаётся настройкой **будущих** запусков. `_modelSentForTab` / `_effortSentForTab` лишь не дают двум startup-путям повторно отправить одну команду и очищаются со смертью процесса; они не являются источником отображаемого значения. Ошибка чтения JSONL не разрешает подменить состояние текущей сессии StatusBar-default'ом. `thinkLocal` остаётся отдельным TUI-mirror. См. `fact-claude-tui-control.md::Startup defaults /model + /effort при запуске Claude`.
+StatusBar при этом остаётся настройкой **будущих** запусков. При Resume старая подтверждённая model может закрыть model-step, но effort default/next-launch применяется заново: исторический `this session only` не закрывает новую generation. `_modelSentForTab` / `_effortSentForTab` лишь дедуплицируют команды внутри одной generation и очищаются со смертью процесса. До нового effort proof ControlBar показывает выбранный fallback с жёлтым `!`, а не выдаёт его за подтверждённый live-state. `thinkLocal` остаётся отдельным TUI-mirror. См. `fact-claude-tui-control.md::Startup defaults /model + /effort при запуске Claude`.
 
 ## Context % bridge: три канала — PTY, SDK, Codex
 

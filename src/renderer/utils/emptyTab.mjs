@@ -1,4 +1,4 @@
-// «Пустая вкладка» — a tab with no agent started in it.
+// «Терминал» — a tab with no agent started in it.
 //
 // It is NOT a new kind of tab. It is an ordinary terminal tab with a live shell,
 // exactly what Ctrl+T has always made; what is new is that the interface says so
@@ -15,9 +15,16 @@
 // session and no agent has been launched into it. Nothing stores it, nothing has
 // to keep it in sync, and it stops being true the moment an agent starts —
 // including when the agent is started from outside the app.
+//
+// WHY NOT «Пустая вкладка», which is what the name used to be: in this app
+// «пусто» already means "no tab at all" — it is what an empty window says. A tab
+// called that claimed the word for something that is not it, and the two states
+// read as one. Юзер: *«пустая вкладка означает полное отсутствие… это значит,
+// что вкладки вообще не создаётся»*. What this tab actually is, is a terminal —
+// so it says «Терминал», and «пусто» goes back to meaning nothing.
 
 /** The name a tab gets when it is created with nothing running in it. */
-export const EMPTY_TAB_NAME = 'Пустая вкладка';
+export const EMPTY_TAB_NAME = 'Терминал';
 
 /** Nothing is running here and nothing has been asked to run. */
 export function isEmptyTab(tab) {

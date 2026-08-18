@@ -1,4 +1,4 @@
-// ONE launch strip: «Claude | Claude-F | SDK | SDK-F | Codex | Codex-F».
+// ONE launch strip: «Claude | Claude-F | SDK | SDK-F | Codex | Codex-F | Терминал».
 //
 // It answers a single question — "start a session with which agent" — and it is
 // asked in two places that used to answer it differently:
@@ -33,12 +33,16 @@ export type AiLaunchAction =
   | 'sdk'
   | 'sdk-fork'
   | 'codex'
-  | 'codex-fork';
+  | 'codex-fork'
+  | 'terminal';
 
 const CLAUDE_ACCENT = '#DA7756';
 const CLAUDE_ACCENT_BRIGHT = '#FF9466';
 const CODEX_ACCENT = '#10A37F';
 const CODEX_ACCENT_BRIGHT = '#34d399';
+// Серый, а не цвет агента: это единственный пункт, который НИЧЕГО не запускает.
+const TERMINAL_ACCENT = '#8a8a92';
+const TERMINAL_ACCENT_BRIGHT = '#c8c8ce';
 
 interface ForkChipProps {
   label: string;
@@ -116,6 +120,14 @@ export interface AiLaunchStripProps {
   /** Greys the primary Claude/Codex chips (a lifecycle action is in flight). */
   disabled?: boolean;
   disabledTitle?: string;
+  /**
+   * Offer «Терминал» — a tab with no agent at all?
+   *
+   * Only where the strip CREATES a tab (an empty window). Inside a tab the strip
+   * converts the tab you are standing in, and "convert this terminal into a
+   * terminal" is a button that does nothing: the tab is already exactly that.
+   */
+  showTerminal?: boolean;
 }
 
 export default function AiLaunchStrip({
@@ -125,6 +137,7 @@ export default function AiLaunchStrip({
   disabled = false,
   disabledTitle,
   ownsClaudeChip = false,
+  showTerminal = false,
 }: AiLaunchStripProps) {
   const busy = (action: AiLaunchAction) => !!isBusy?.(action);
   const wrap = (action: AiLaunchAction, content: React.ReactNode) => (
@@ -209,6 +222,24 @@ export default function AiLaunchStrip({
       >
         {wrap('codex-fork', 'Codex-F')}
       </ForkChip>
+      {/* «Терминал» — единственный пункт, который ничего не запускает: вкладка
+          так и остаётся живым shell'ом. Стоит последним и серым, потому что
+          строка отвечает на вопрос «каким агентом начать», а этот ответ —
+          «никаким». Он нужен именно здесь: раньше терминальную вкладку можно
+          было получить только двойным кликом по шапке, то есть жестом, который
+          человек уже сделал, чтобы сюда попасть. */}
+      {showTerminal && (
+        <ForkChip
+          label="Терминал"
+          hint="Вкладка без агента: живой shell"
+          title="Терминал: вкладка без агента"
+          accent={TERMINAL_ACCENT}
+          accentBright={TERMINAL_ACCENT_BRIGHT}
+          tint="rgba(255,255,255,0.08)"
+          border="rgba(255,255,255,0.18)"
+          onClick={() => onLaunch('terminal')}
+        />
+      )}
     </>
   );
 }

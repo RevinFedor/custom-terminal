@@ -273,6 +273,27 @@ test('exact semantic item completion repairs a dropped delta instead of falling 
   assert.match(h.logs.join('\n'), /SEMANTIC_GAP/);
 });
 
+test('same Codex semantic instance reconnect preserves accumulated markdown', () => {
+  const h = createHarness();
+  h.controller.activateSemanticSource({ tabId: 'tab-a', instanceId: 'same' });
+  h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'same',
+    event: {
+      type: 'assistant_delta',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      itemId: 'assistant-1',
+      delta: 'Первая часть',
+    },
+  });
+  h.flushTimers();
+  h.controller.disconnectSemanticSource({ tabId: 'tab-a', instanceId: 'same' });
+  h.controller.activateSemanticSource({ tabId: 'tab-a', instanceId: 'same' });
+  assert.equal(h.controller.get('tab-a').text, 'Первая часть');
+  assert.match(h.logs.join('\n'), /reconnected=true/);
+});
+
 test('Claude activity repaint cannot poison the first assistant frame', () => {
   const h = createHarness();
   h.controller.begin({

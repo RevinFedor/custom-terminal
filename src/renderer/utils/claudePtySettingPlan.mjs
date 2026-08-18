@@ -14,6 +14,7 @@ function isExactConfirmedSetting({
   if (clean(confirmed.sessionId) !== sessionId) return false;
   if (clean(confirmed.latestSessionId) !== sessionId) return false;
   if (clean(confirmed[kind]) !== value) return false;
+  if (kind === 'effort' && confirmed.effortCurrentRuntime !== true) return false;
   return Number(confirmed[kind + 'ProofAt']) > 0;
 }
 

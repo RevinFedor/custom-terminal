@@ -313,7 +313,13 @@ export default function PaneTabChip({
         // split button out of a narrow window.
         flexShrink: inStrip ? 0 : 1,
         minWidth: 0,
-        maxWidth: inStrip ? 220 : undefined,
+        // NO width cap in a strip. A cap turns a name into «terminal mcp -> …»
+        // — an ellipsis where the answer was, on the very surface whose job is
+        // to say which tab is which. The strip scrolls instead, and what
+        // scrolls off the edge is named by the badges there. Юзер: *«нет
+        // ограничений по ширине… если вкладок слишком много — писать справа»*.
+        // A LONE chip still shrinks: it is not a strip, and its long name must
+        // not push the split button out of a narrow window.
         // NOT `overflow: hidden`. The task squares hang a few px BELOW the
         // bottom edge on purpose — they mark the boundary, and a lane that
         // stops inside the card says nothing. Clipping here trimmed them
@@ -442,9 +448,13 @@ export default function PaneTabChip({
           }}
         />
       ) : (
-        // The name clips itself now that the chip no longer clips its
-        // children — otherwise a long tab name would stretch the header.
-        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        // В полосе имя показывается целиком: полоса прокручивается, и обрезать
+        // здесь нечего. Вне полосы чип делит одну строку с кнопками окна и
+        // сжимается — там многоточие честнее, чем выдавленная за край кнопка.
+        <span style={inStrip
+          ? { whiteSpace: 'nowrap' }
+          : { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+        >
           {tabName}
         </span>
       )}

@@ -34777,6 +34777,15 @@ require(path.join(srcMainDir, 'ipc', 'claude-data')).register({
   getClaudeEditableLastPromptState: (tabId, reason) =>
     getClaudeEditableLastPromptState(tabId, reason || 'claude-full-history-editable-last-prompt'),
   recoverManagedHistoryImageRef: (ref) => promptQueueAssetStore.existingManagedRefSync(ref),
+  getClaudeRuntimeSettingsScope: (tabId) => {
+    const launch = claudeLaunchGenerationByTab.get(tabId) || null;
+    return {
+      generation: launch?.generation || null,
+      startedAt: Number(launch?.at || 0),
+      sessionId: bridgeKnownSessions.get(tabId) || launch?.sessionIdHint || null,
+      processAlive: isClaudeProcessRunningInTab(tabId),
+    };
+  },
 });
 codexDataModule.register({ projectManager, transcriptService });
 transcriptService.registerIpc();

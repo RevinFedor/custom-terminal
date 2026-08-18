@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 const {
   createCodexSemanticChannelServer,
+  defaultSocketRoot,
   validateEnvelope,
 } = require('./codex-semantic-channel');
 
@@ -53,6 +54,13 @@ test('validateEnvelope rejects unversioned and malformed payloads', () => {
   );
 });
 
+test('default macOS socket path leaves room under sockaddr_un limit', () => {
+  const socketRoot = defaultSocketRoot('darwin', 12345);
+  const fullPath = path.join(socketRoot, 'a'.repeat(20) + '-12345678.sock');
+  assert.equal(socketRoot, '/tmp/noted-codex-12345');
+  assert.ok(fullPath.length < 104, `socket path is ${fullPath.length} bytes`);
+});
+
 test('server frames chunked NDJSON and reports sequence gaps', async (t) => {
   const socketRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-semantic-test-'));
   const events = [];
@@ -78,4 +86,30 @@ test('server frames chunked NDJSON and reports sequence gaps', async (t) => {
   assert.equal(events[1].gap, false);
   assert.equal(events[2].event.delta, 'three');
   assert.equal(events[2].gap, true);
+});
+
+test('closing a superseded socket cannot disconnect the replacement connection', async (t) => {
+  const socketRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-semantic-reconnect-'));
+  const events = [];
+  const channel = await createCodexSemanticChannelServer({
+    tabId: 'tab-reconnect',
+    socketRoot,
+    onEvent: (event) => events.push(event),
+    log: { warn() {} },
+  });
+  t.after(async () => {
+    await channel.close('test');
+    await fs.promises.rm(socketRoot, { recursive: true, force: true });
+  });
+  const first = await connect(channel.socketPath);
+  first.write('{"v":1,"instanceId":"same","pid":7,"seq":0,"event":{"type":"hello"}}\n');
+  await waitFor(() => events.length === 1);
+  const second = await connect(channel.socketPath);
+  second.write('{"v":1,"instanceId":"same","pid":7,"seq":0,"event":{"type":"hello"}}\n');
+  await waitFor(() => events.length === 2);
+  first.destroy();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.some((event) => event.event.type === 'disconnect'), false);
+  second.destroy();
+  await waitFor(() => events.some((event) => event.event.type === 'disconnect'));
 });

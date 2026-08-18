@@ -100,7 +100,7 @@ test('only a complete Anthropic next-launch pair overrides resolved settings', (
   });
 });
 
-test('compact fork inherits a complete confirmed pair from its durable parent', async () => {
+test('compact fork inherits model but never process-local effort from its durable parent', async () => {
   const reads = [];
   const result = await resolveClaudeSettingsAcrossForkChain({
     sessionId: 'compact-child',
@@ -109,7 +109,13 @@ test('compact fork inherits a complete confirmed pair from its durable parent', 
       if (sessionId === 'compact-child') {
         return { success: true, sessionId, model: null, effort: null };
       }
-      return { success: true, sessionId, model: 'haiku', effort: 'medium' };
+      return {
+        success: true,
+        sessionId,
+        model: 'haiku',
+        effort: 'medium',
+        effortCurrentRuntime: false,
+      };
     },
     getParentSession: (sessionId) => sessionId === 'compact-child'
       ? { source_session_id: 'source-parent' }
@@ -119,9 +125,9 @@ test('compact fork inherits a complete confirmed pair from its durable parent', 
   assert.deepEqual(reads, ['compact-child', 'source-parent']);
   assert.equal(result.success, true);
   assert.equal(result.model, 'haiku');
-  assert.equal(result.effort, 'medium');
+  assert.equal(result.effort, null);
   assert.equal(result.modelSessionId, 'source-parent');
-  assert.equal(result.effortSessionId, 'source-parent');
+  assert.equal(result.effortSessionId, null);
   assert.equal(result.inherited, true);
 });
 
@@ -129,8 +135,8 @@ test('child-confirmed fields win while a fork parent fills only missing settings
   const result = await resolveClaudeSettingsAcrossForkChain({
     sessionId: 'child',
     readSettings: async (sessionId) => sessionId === 'child'
-      ? { success: true, sessionId, model: null, effort: 'max' }
-      : { success: true, sessionId, model: 'haiku', effort: 'medium' },
+      ? { success: true, sessionId, model: null, effort: 'max', effortCurrentRuntime: true }
+      : { success: true, sessionId, model: 'haiku', effort: 'medium', effortCurrentRuntime: false },
     getParentSession: (sessionId) => sessionId === 'child'
       ? { source_session_id: 'parent' }
       : null,

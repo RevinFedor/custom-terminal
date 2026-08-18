@@ -9,6 +9,8 @@ interface Project {
   name: string;
   description?: string;
   icon?: string | null;
+  /** Показывать в шапке только значок, без подписи. Возможно лишь при значке. */
+  hideName?: boolean;
   notes?: string;
   quickActions?: any[];
   tabs?: any[];
@@ -64,15 +66,17 @@ export const useProjectsStore = create<ProjectsStore>((set, get) => ({
         updates.name !== undefined ||
         updates.description !== undefined ||
         updates.path !== undefined ||
-        updates.icon !== undefined
+        updates.icon !== undefined ||
+        updates.hideName !== undefined
       ) {
         await ipcRenderer.invoke('project:save-metadata', {
           projectId: project.id,
-          metadata: { 
-            name: updates.name, 
+          metadata: {
+            name: updates.name,
             description: updates.description,
             path: updates.path,
-            icon: updates.icon
+            icon: updates.icon,
+            hideName: updates.hideName,
           }
         });
       }

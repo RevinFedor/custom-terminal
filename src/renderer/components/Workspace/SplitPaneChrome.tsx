@@ -153,9 +153,10 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
     // which would swap out the very chip the user is adding a neighbour to.
     //
     // Named, not auto-numbered: `tab-7` says only that six others came before
-    // it. This tab's whole state is "nothing started here yet", and the name is
-    // the one place that can say so before anything else on the chip can.
-    // It keeps the name until it is renamed or an agent is launched into it.
+    // it. This tab is a terminal with nothing started in it, and the name says
+    // exactly that — see emptyTab.mjs on why it is not called «пустая»: in this
+    // app «пусто» already means "no tab at all", which is what an empty window
+    // says. It keeps the name until it is renamed or an agent is launched here.
     const newTabId = await store.createTab(owner, EMPTY_TAB_NAME, cwd, {
       skipInitialRename: true,
       background: true,

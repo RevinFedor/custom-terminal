@@ -20,6 +20,13 @@
 /** Gap the two clusters must keep between them before wrapping (px). */
 export const CONTROL_BAR_CLUSTER_MIN_GAP_PX = 8;
 
+/** Gaps BETWEEN the children inside each cluster. Named because the same number
+ * has to be used twice for one answer — once when summing the children, once
+ * when reconstructing the width of a child that is currently hidden — and the
+ * two must never drift apart. */
+export const LEFT_CLUSTER_INNER_GAP_PX = 10;
+export const RIGHT_CLUSTER_INNER_GAP_PX = 6;
+
 /**
  * How much width a cluster's CONTENT actually needs, in px.
  *
@@ -100,9 +107,21 @@ export function shouldWrapControlBar({ availableWidth, leftWidth, rightWidth, mi
  * @param {number} args.availableWidth inner width available to the bar
  * @param {number} args.leftWidth      measured width of the left cluster now
  * @param {number} args.rightWidth     measured width of the right cluster now
+ * WHAT «THE WIDTH OF THE READINGS» MUST INCLUDE. The readings are one of the
+ * left cluster's children, so hiding them removes their own width AND the gap
+ * that separated them from the neighbour — the cluster's measured width drops
+ * by width + gap, while a reconstruction that adds back only the width lands
+ * that gap short. The two states then disagree by exactly one gap: at any width
+ * inside that band the bar hides the readings, re-measures, decides they fit,
+ * shows them, and hides them again — a permanent flicker (independently
+ * reproduced by two audits, 18.08; the band width tracked the gap exactly and
+ * vanished at gap 0). Callers therefore pass the cluster's own inner gap.
+ *
  * @param {number} args.readingsWidth  width the readings occupy when shown; the
  *                                     caller passes the remembered value while
  *                                     they are hidden, 0 when there are none
+ * @param {number} [args.readingsGapPx] the cluster's inner gap, which vanishes
+ *                                     together with the readings
  * @param {boolean} args.readingsHidden whether the measured widths above were
  *                                     taken with the readings already hidden
  * @param {number} [args.minGap]
@@ -113,6 +132,7 @@ export function shouldShedControlBarReadings({
   leftWidth,
   rightWidth,
   readingsWidth,
+  readingsGapPx = 0,
   readingsHidden = false,
   minGap,
 }) {
@@ -130,6 +150,8 @@ export function shouldShedControlBarReadings({
   const gap = Number.isFinite(Number(minGap)) ? Number(minGap) : CONTROL_BAR_CLUSTER_MIN_GAP_PX;
   // Always compare against the full-content width, whether or not the readings
   // are on screen right now.
-  const needed = left + right + gap + (readingsHidden ? readingsSpace : 0);
+  const readingsGap = Math.max(0, Number(readingsGapPx) || 0);
+  const needed = left + right + gap
+    + (readingsHidden ? readingsSpace + readingsGap : 0);
   return needed > available;
 }

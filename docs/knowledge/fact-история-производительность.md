@@ -82,6 +82,14 @@
 
 Дельта и окно КОМПОНУЮТСЯ: дайджест описывает окно, которое получил вызывающий, а не всю проекцию. Смена формы окна отдаёт полное окно (первая строка нового окна отсутствует в дайджесте → `windowIsContinuation=false`), повтор того же окна над дописанной сессией — только изменённые строки. Fail-closed по построению: строки, которых у клиента не было, никогда не «дошиваются» дельтой.
 
+### Читаемый кусок двигает только ЧТЕНИЕ, не переезд
+
+Кроме окна по строкам есть окно по СОДЕРЖИМОМУ: несколько сотен записей вокруг места чтения приходят целиком, остальные — заглушками (`applyHistoryRowWindow`). Окно едет за видимой областью, и весь вопрос в том, какое движение области считать чтением.
+
+Живой баг (18.08 01:50:31, `tab-3607`): переключение на вкладку заново монтирует список, и он публикует первую видимую область — **верх, строки 0-9** — ДО того, как восстановление положения увело его туда, где человек читал. Наблюдатель поверил: `HYDRATION_REQUEST reason=range-changed range=0-9 stubAt=0`, и следом `span=645-1394 → 0-750`. Читаемый кусок уехал из-под читателя: вкладка «стала вся серая», пока по ней не кликнули ещё раз.
+
+Прыжок по таймлайну это уже знал и свои промежуточные области игнорировал. Восстановление положения — тот же факт (**область двигают, а не читают**) и у него уже был свой признак `historyRestoreInFlightRef`; наблюдатель его просто не спрашивал. Теперь `range-changed` во время переезда отвергается, а в точке, где признак снимается, идёт одна проверка `reason=restore-settled`. Без неё восстановление, приехавшее на заглушки (его строка-якорь была отредактирована), ждало бы, пока человек сам прокрутит: **отказ обязан сопровождаться событием «теперь можно»**.
+
 ## Лог-словарь и приёмочный флоу
 
 `MOUNT_WAVE_START/DONE/CANCEL rows= upgraded= steps= maxStepMs= heights=measured|avg` · `SCROLL_SEEK_ENTER velocity= burst=` / `SCROLL_SEEK_EXIT heldMs=` · `LOAD_FRESH_PROBE unchanged=1` · `LOAD_STALE_BANKED` · `LOAD_DELTA changed= total=` / `LOAD_DELTA_MISMATCH reason=` · `[CodexHistoryProjector] mode=rebuild|append|unchanged fed= readKB= consumed=` · `[TranscriptService:HistoryDelta] changed= unchanged= windowed=` · `[TranscriptService:HistoryWindow] rows= total= startIndex= above= below=` · `[CodexJsonlCache] full|append|evict` · `[Perf:LongTask] during=` (атрибуция: `history-owner-mount:`, `history-mount-wave:`, `timeline-swap:`, `controlbar-rebind:`, `terminal-hydrate:`, `tab-switch:`) · `inputDelayMs=` на каждом реальном событии.

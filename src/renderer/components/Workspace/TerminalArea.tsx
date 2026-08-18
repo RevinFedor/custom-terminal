@@ -587,7 +587,7 @@ function TerminalArea({
   // это и есть «где я сейчас работаю».
   const launchIntoEmptyPane = useCallback(async (
     paneIndex: number,
-    action: AiLaunchAction | 'empty',
+    action: AiLaunchAction,
   ) => {
     const store = useWorkspaceStore.getState();
     const targetProjectId = store.getFocusedProjectId() || store.activeProjectId;
@@ -604,9 +604,9 @@ function TerminalArea({
     const activeTab = workspace.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
     const cwd = projectPath || activeTab?.cwd || '';
 
-    if (action === 'empty') {
-      // «Пустая вкладка»: живой shell без агента. Отдельного типа вкладки нет —
-      // «пустая» это описание, а не состояние (см. emptyTab.mjs).
+    if (action === 'terminal') {
+      // Вкладка без агента: живой shell. Отдельного типа вкладки нет — «пустая»
+      // это описание, а не состояние (см. emptyTab.mjs).
       await useWorkspaceStore.getState().createTab(targetProjectId, EMPTY_TAB_NAME, cwd, {
         skipInitialRename: true,
       });
@@ -907,7 +907,7 @@ function TerminalArea({
             // жест один.
             onDoubleClick={(e) => {
               e.stopPropagation();
-              launchIntoEmptyPane(paneIndex, 'empty');
+              launchIntoEmptyPane(paneIndex, 'terminal');
             }}
             style={{
               position: 'absolute',
@@ -967,7 +967,7 @@ function TerminalArea({
             // без причины.
             onDoubleClick={(e) => {
               e.stopPropagation();
-              launchIntoEmptyPane(paneIndex, 'empty');
+              launchIntoEmptyPane(paneIndex, 'terminal');
             }}
             style={{
               position: 'absolute',
@@ -996,6 +996,10 @@ function TerminalArea({
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'center' }}>
               <AiLaunchStrip
                 ownsClaudeChip
+                // Здесь полоса СОЗДАЁТ вкладку, поэтому «Терминал» — законный
+                // ответ: вкладка без агента. Внутри вкладки его нет — там
+                // «превратить терминал в терминал» ничего бы не делало.
+                showTerminal
                 onLaunch={(action) => launchIntoEmptyPane(paneIndex, action)}
               />
             </div>

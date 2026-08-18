@@ -262,16 +262,20 @@ function createTerminalHistoryPreviewController({
   const activateSemanticSource = ({ tabId, instanceId, processId = null } = {}) => {
     if (!tabId || !instanceId) return false;
     const previous = semanticAuthorities.get(tabId) || null;
+    const sameInstance = previous?.instanceId === String(instanceId);
     const authority = {
       instanceId: String(instanceId),
       processId: finiteNumberOrNull(processId),
       connected: true,
       expected: true,
-      gap: false,
+      gap: sameInstance ? previous.gap === true : false,
     };
     semanticAuthorities.set(tabId, authority);
     const state = turns.get(tabId);
-    if (state?.provider === 'codex') {
+    if (state?.provider === 'codex'
+      && !(sameInstance
+        && state.sourceMode === 'semantic'
+        && state.semanticInstanceId === authority.instanceId)) {
       cancelPendingEmission(state);
       if (state.text && state.sourceMode !== 'semantic') {
         emitAction(state, 'clear', 'semantic-authority-established');
@@ -294,6 +298,7 @@ function createTerminalHistoryPreviewController({
       instance: short(instanceId, 18),
       pid: authority.processId ?? '-',
       replaced: previous?.instanceId && previous.instanceId !== authority.instanceId,
+      reconnected: sameInstance,
     });
     return true;
   };

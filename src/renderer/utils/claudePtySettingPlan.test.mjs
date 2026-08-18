@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { planClaudePtySettings } from './claudePtySettingPlan.mjs';
 
-test('skips model and effort only when the active session has exact JSONL proof', () => {
+test('skips model and effort only when the active session and runtime have exact proof', () => {
   const plan = planClaudePtySettings({
     requestedModel: 'claude-opus-5[1m]',
     requestedEffort: 'max',
@@ -13,6 +13,7 @@ test('skips model and effort only when the active session has exact JSONL proof'
       latestSessionId: 'session-1',
       model: 'claude-opus-5[1m]',
       effort: 'max',
+      effortCurrentRuntime: true,
       modelProofAt: 10,
       effortProofAt: 11,
     },
@@ -32,6 +33,7 @@ test('a stale session or missing proof never suppresses the setting command', ()
       latestSessionId: 'session-1',
       model: 'claude-opus-5[1m]',
       effort: 'max',
+      effortCurrentRuntime: true,
       modelProofAt: 10,
       effortProofAt: 11,
     },
@@ -51,4 +53,20 @@ test('a stale session or missing proof never suppresses the setting command', ()
     },
   });
   assert.equal(unproven.applyModel, true);
+});
+
+test('historical effort proof from an older Claude process is re-applied', () => {
+  const plan = planClaudePtySettings({
+    requestedEffort: 'low',
+    currentSessionId: 'session-1',
+    confirmed: {
+      success: true,
+      sessionId: 'session-1',
+      latestSessionId: 'session-1',
+      effort: 'low',
+      effortProofAt: 11,
+      effortCurrentRuntime: false,
+    },
+  });
+  assert.equal(plan.applyEffort, true);
 });

@@ -3,7 +3,8 @@
 // Two rules, both pure, both about reading rather than about state:
 //
 //   1. consecutive chips of the same project share ONE project icon;
-//   2. chips that scrolled fully out of sight are counted, not scrolled to.
+//   2. chips that scrolled fully out of sight are counted BY KIND, not scrolled
+//      to.
 //
 // They live here rather than in the header component because both are the kind
 // of arithmetic that silently drifts once it is inlined next to JSX — and both
@@ -54,9 +55,14 @@ export function groupStripByProject(entries) {
  * Both ends are counted separately because they answer different questions:
  * "there is more behind me" and "there is more ahead".
  *
+ * WHICH chips are hidden, not merely how many: the badge is painted in the
+ * colour of the agent it stands for, so the caller needs their identities. The
+ * plain counts stay in the result — that is what the caller renders when every
+ * hidden chip is of one kind.
+ *
  * @param {object} args
- * @param {Array<{left: number, width: number}>} args.chips  positions inside the
- *   scrolling content, in strip order
+ * @param {Array<{left: number, width: number, tabId?: string}>} args.chips
+ *   positions inside the scrolling content, in strip order
  * @param {number} args.scrollLeft
  * @param {number} args.viewportWidth
  * @param {number} [args.tolerancePx]  sub-pixel slack; a chip flush against the
@@ -66,16 +72,52 @@ export function resolveStripOverflow({ chips, scrollLeft, viewportWidth, toleran
   const list = Array.isArray(chips) ? chips : [];
   const from = Number(scrollLeft) || 0;
   const to = from + (Number(viewportWidth) || 0);
-  let hiddenLeft = 0;
-  let hiddenRight = 0;
+  const hiddenLeftIds = [];
+  const hiddenRightIds = [];
   list.forEach((chip) => {
     if (!chip) return;
     const left = Number(chip.left) || 0;
     const right = left + (Number(chip.width) || 0);
-    if (right <= from + tolerancePx) hiddenLeft += 1;
-    else if (left >= to - tolerancePx) hiddenRight += 1;
+    if (right <= from + tolerancePx) hiddenLeftIds.push(chip.tabId);
+    else if (left >= to - tolerancePx) hiddenRightIds.push(chip.tabId);
   });
-  return { hiddenLeft, hiddenRight };
+  return {
+    hiddenLeft: hiddenLeftIds.length,
+    hiddenRight: hiddenRightIds.length,
+    hiddenLeftIds,
+    hiddenRightIds,
+  };
+}
+
+/**
+ * Break one side's hidden chips down BY KIND — one badge per kind, «×N» inside.
+ *
+ * A single number answers "how many are out of sight" and stops there. What a
+ * person actually asks of a strip is *what* is out of sight: two Claude tabs and
+ * one Codex tab is a different situation from three Codex tabs. The strip
+ * already says that with colour — orange is Claude, green is Codex — so the
+ * badge borrows the same colour instead of inventing a second vocabulary, and
+ * «×2» in orange reads without a legend. Юзер: *«писать с бэкграундом оранжевым
+ * либо зелёным… если там оба, то писать по вертикали друг над другом, два
+ * квадратика с цифрой»*.
+ *
+ * Order is FIRST APPEARANCE in the strip — not by count, not alphabetical: the
+ * strip is a map the user arranged, and the badges continue that map past the
+ * edge of the window.
+ *
+ * @param {Array<string>} hiddenIds  tab ids, in strip order
+ * @param {(tabId: string) => string} kindOf  colour key of that tab
+ * @returns {Array<{kind: string, count: number}>}
+ */
+export function groupOverflowByKind(hiddenIds, kindOf) {
+  const out = [];
+  const at = new Map();
+  (Array.isArray(hiddenIds) ? hiddenIds : []).forEach((tabId) => {
+    const kind = (typeof kindOf === 'function' ? kindOf(tabId) : '') || 'default';
+    if (at.has(kind)) out[at.get(kind)].count += 1;
+    else { at.set(kind, out.length); out.push({ kind, count: 1 }); }
+  });
+  return out;
 }
 
 /**

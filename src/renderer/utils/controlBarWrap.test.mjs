@@ -5,6 +5,7 @@ import {
   shouldWrapControlBar,
   shouldShedControlBarReadings,
   CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+  LEFT_CLUSTER_INNER_GAP_PX,
 } from './controlBarWrap.mjs';
 
 test('wraps once the two clusters would touch', () => {
@@ -185,4 +186,59 @@ test('a stable width gives a stable answer (no oscillation)', () => {
     shouldWrapControlBar(args),
   ]);
   assert.equal(answers.size, 1);
+});
+
+test('hiding the readings must not change the width the bar is judged to need', () => {
+  // Показания — ребёнок левого блока, поэтому вместе с ними из замера уходит
+  // и отступ перед ними. Если вернуть обратно только ширину, два состояния
+  // одной и той же панели отвечают на один вопрос по-разному.
+  const READINGS = 54;
+  const RIGHT = 200;
+  const gap = LEFT_CLUSTER_INNER_GAP_PX;
+  const leftShown = 300 + READINGS + 3 * gap;  // четыре ребёнка — три отступа
+  const leftHidden = 300 + 2 * gap;            // три ребёнка — два отступа
+
+  // Одна и та же панель, снятая в двух состояниях, обязана требовать одно
+  // и то же место.
+  const neededShown = leftShown + RIGHT + CONTROL_BAR_CLUSTER_MIN_GAP_PX;
+  const neededHidden = leftHidden + READINGS + gap + RIGHT
+    + CONTROL_BAR_CLUSTER_MIN_GAP_PX;
+  assert.equal(neededHidden, neededShown);
+});
+
+test('the shed decision is a fixed point at every width', () => {
+  // Ответ, посчитанный в состоянии «показания видны», не должен переворачиваться
+  // после того, как их скрыли, — иначе на этой ширине они мигают без остановки,
+  // и каждое мигание вызывает следующую перерисовку (прод-круг, ошибка React #185).
+  const READINGS = 54;
+  const RIGHT = 200;
+  const gap = LEFT_CLUSTER_INNER_GAP_PX;
+  const leftShown = 300 + READINGS + 3 * gap;
+  const leftHidden = 300 + 2 * gap;
+  const unstable = [];
+  for (let availableWidth = 400; availableWidth <= 800; availableWidth += 1) {
+    const fromShown = shouldShedControlBarReadings({
+      availableWidth,
+      leftWidth: leftShown,
+      rightWidth: RIGHT,
+      readingsWidth: READINGS,
+      readingsGapPx: gap,
+      readingsHidden: false,
+      minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+    });
+    const fromHidden = shouldShedControlBarReadings({
+      availableWidth,
+      leftWidth: leftHidden,
+      rightWidth: RIGHT,
+      readingsWidth: READINGS,
+      readingsGapPx: gap,
+      readingsHidden: true,
+      minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+    });
+    if (fromShown !== fromHidden) unstable.push(availableWidth);
+  }
+  assert.deepEqual(
+    unstable, [],
+    'ширины, на которых ответ не устаканивается: ' + unstable.join(','),
+  );
 });

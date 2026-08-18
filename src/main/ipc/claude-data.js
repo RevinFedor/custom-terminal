@@ -16,6 +16,7 @@ const {
 } = require('../history-revision');
 const {
   deriveConfirmedClaudeSettings,
+  projectConfirmedClaudeSettingsForRuntime,
   traceClaudeActiveBranch,
 } = require('../claude-confirmed-settings');
 const {
@@ -43,6 +44,7 @@ const {
 let _projectManager = null;
 let _getClaudeEditableLastPromptState = null;
 let _recoverManagedHistoryImageRef = null;
+let _getClaudeRuntimeSettingsScope = null;
 
 let _localPerfOpSeq = 0;
 function _beginPerfOp(kind, detail = {}) {
@@ -2040,11 +2042,15 @@ function register({
   formatToolAction,
   getClaudeEditableLastPromptState,
   recoverManagedHistoryImageRef,
+  getClaudeRuntimeSettingsScope,
 }) {
   _projectManager = projectManager;
   _getClaudeEditableLastPromptState = typeof getClaudeEditableLastPromptState === 'function' ? getClaudeEditableLastPromptState : null;
   _recoverManagedHistoryImageRef = typeof recoverManagedHistoryImageRef === 'function'
     ? recoverManagedHistoryImageRef
+    : null;
+  _getClaudeRuntimeSettingsScope = typeof getClaudeRuntimeSettingsScope === 'function'
+    ? getClaudeRuntimeSettingsScope
     : null;
 
   // Export a range of messages from Claude session
@@ -4797,6 +4803,19 @@ function register({
   // (the child JSONL exists on disk), so the witness covers them.
   const confirmedSettingsCache = new Map(); // sessionId -> { witness, result }
   const CONFIRMED_SETTINGS_CACHE_MAX = 24;
+  const projectConfirmedSettingsForCurrentRuntime = (result, tabId) => {
+    let runtimeScope = null;
+    if (tabId && _getClaudeRuntimeSettingsScope) {
+      try {
+        runtimeScope = _getClaudeRuntimeSettingsScope(tabId) || null;
+      } catch (error) {
+        console.warn('[ClaudeConfirmedSettings] runtime scope failed tab='
+          + String(tabId).slice(-12)
+          + ' error=' + (error?.message || String(error)));
+      }
+    }
+    return projectConfirmedClaudeSettingsForRuntime(result, runtimeScope);
+  };
   const confirmedSettingsWitness = (sources, primaryFound) => {
     const parts = [];
     if (primaryFound?.filePath) {
@@ -4883,7 +4902,10 @@ function register({
           // LRU refresh.
           confirmedSettingsCache.delete(sessionId);
           confirmedSettingsCache.set(sessionId, cached);
-          return { ...cached.result, cache: 'hit' };
+          return projectConfirmedSettingsForCurrentRuntime(
+            { ...cached.result, cache: 'hit' },
+            cleanTabId,
+          );
         }
       }
       const {
@@ -4942,7 +4964,7 @@ function register({
           confirmedSettingsCache.delete(oldest);
         }
       }
-      return result;
+      return projectConfirmedSettingsForCurrentRuntime(result, cleanTabId);
     } catch (error) {
       return {
         success: false,
@@ -6264,7 +6286,16 @@ function parseTimelineEntries(sourcePath) {
 // 318-335ms get-presence calls in one switch — get-presence calls this on
 // every poll). The user felt it as "only THIS tab hangs on switch".
 const sessionMaterializationCache = new Map(); // sessionId -> { filePath, size, mtimeMs, result }
-const SESSION_MATERIALIZATION_CACHE_MAX = 32;
+// Лимит обязан быть заведомо больше числа одновременно открытых вкладок.
+// Пока он был равен 32, а вкладок у пользователя 45, кэш вытеснял сам себя по
+// кругу: к моменту повторного обращения к первой сессии её ответ уже выбросили,
+// и каждый обход всех вкладок заново читал и разбирал все файлы целиком —
+// «прогретого» состояния не наступало никогда (независимый аудит 18.08:
+// три круга подряд дали 45, 45, 45 полных чтений, ни одного попадания).
+// Цена одной записи здесь — несколько сотен байт (путь, размер, время и
+// маленький ответ), поэтому запас берётся с большим избытком: сотни записей
+// стоят десятки килобайт против гигабайтов лишнего чтения.
+const SESSION_MATERIALIZATION_CACHE_MAX = 512;
 // Насколько файл может вырасти, прежде чем точное число записей пересчитают.
 // Ответ на вопрос «в сессии вообще есть записи?» из выросшего файла и так
 // известен (см. ниже), а число используется только для показа и логов, поэтому

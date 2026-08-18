@@ -77,23 +77,29 @@ import {
   shouldShedControlBarReadings,
   measureClusterContentWidth,
   CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+  LEFT_CLUSTER_INNER_GAP_PX,
+  RIGHT_CLUSTER_INNER_GAP_PX,
 } from '../../utils/controlBarWrap.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
-// Last CONFIRMED (model, effort) per Claude session, renderer-lifetime LRU.
+// Last confirmed MODEL per Claude session, renderer-lifetime LRU.
 // Seeds the control bar on a return visit so the tab-switch frame does not
 // reset-to-default + refetch what it already knew (the reset was part of
 // every `controlbar-rebind` block, 16.08). Values here are only ever what
 // main confirmed from the JSONL branch — optimistic picks never land in it.
+// Effort is intentionally never seeded: Claude confirms it as "this session
+// only", so carrying it across a tab/process rebind can paint an older runtime
+// value before main proves the current launch.
 const confirmedSettingsSeedCache = new Map<string, { model: string | null; effort: string | undefined }>();
 const CONFIRMED_SETTINGS_SEED_MAX = 64;
 function rememberConfirmedSettingsSeed(
   sessionId: string,
   seed: { model: string | null; effort: string | undefined },
 ) {
+  const modelOnlySeed = { model: seed.model, effort: undefined };
   confirmedSettingsSeedCache.delete(sessionId);
-  confirmedSettingsSeedCache.set(sessionId, seed);
+  confirmedSettingsSeedCache.set(sessionId, modelOnlySeed);
   while (confirmedSettingsSeedCache.size > CONFIRMED_SETTINGS_SEED_MAX) {
     const oldest = confirmedSettingsSeedCache.keys().next().value as string | undefined;
     if (oldest === undefined) break;
@@ -584,9 +590,10 @@ export default function ClaudeControlBar({
     (s) => s.historyComposerAvailability[tabId]?.canPullDraft === true,
   );
   const isClaudePtySession = sessionType === 'claude' && !isSDKTab;
-  // Confirmed current-session settings. Unlike StatusBar defaults, these are
-  // reconstructed from the active JSONL branch and therefore survive renderer
-  // restart, follow native Rewind, and include commands typed in the terminal.
+  // Confirmed current-session settings. Model is reconstructed from the active
+  // JSONL branch. Effort is accepted only when main proves that its command was
+  // written inside the CURRENT Claude process generation — historical
+  // `/effort` records remain in History but do not describe a resumed process.
   // Seeded from the renderer-local per-session cache: a RETURN to a session
   // shows its last confirmed values in the same frame instead of resetting
   // to defaults and re-earning them a round-trip later (the reset+refetch
@@ -671,6 +678,9 @@ export default function ClaudeControlBar({
         + ' sid=' + claudeSessionId.slice(0, 8)
         + ' model=' + (result.model || 'bridge/default')
         + ' effort=' + (result.effort || 'unset')
+        + ' historicalEffort=' + (result.effortHistorical || 'unset')
+        + ' effortCurrentRuntime=' + (result.effortCurrentRuntime === true ? '1' : '0')
+        + ' runtime=' + (result.runtimeGeneration || '-')
         + ' cache=' + (result.cache || 'miss')
         + ' check=' + checkReason
       );
@@ -740,11 +750,12 @@ export default function ClaudeControlBar({
     // during= separately from History.
     const endMark = markRendererActivity('controlbar-rebind:' + tabId.slice(-8));
     requestAnimationFrame(() => endMark());
-    // Session change: show this session's LAST CONFIRMED values immediately
-    // (per-session seed cache) instead of resetting to defaults — the reset
+    // Session/process change: show this session's last confirmed MODEL
+    // immediately (per-session seed cache) instead of resetting it to defaults — the reset
     // rendered a wrong-looking default and forced an extra commit when the
     // round-trip landed with the same values it wiped. Cold sessions (no
-    // seed yet) still reset. Freshness is re-verified right after either way.
+    // seed yet) still reset. Effort always resets to unproven until the current
+    // runtime generation is verified. Freshness is re-verified right after.
     const seed = claudeSessionId
       ? confirmedSettingsSeedCache.get(claudeSessionId)
       : undefined;
@@ -755,10 +766,10 @@ export default function ClaudeControlBar({
       console.warn('[ClaudeControlBar:ConfirmedSettings] seeded tab=' + tabId.slice(-12)
         + ' sid=' + String(claudeSessionId).slice(0, 8)
         + ' model=' + (seed.model || 'bridge/default')
-        + ' effort=' + (seed.effort || 'unset'));
+        + ' effort=runtime-proof-required');
     }
     void refreshClaudeConfirmedSettings('session-change');
-  }, [claudeSessionId, refreshClaudeConfirmedSettings, tabId]);
+  }, [claudeSessionId, isCommandRunning, refreshClaudeConfirmedSettings, tabId]);
 
   useEffect(() => {
     if (!isClaudePtySession || !claudeSessionId) return;
@@ -2096,8 +2107,8 @@ export default function ClaudeControlBar({
       // самоссылочным — оно растёт вместе с доступной шириной, и бар уже
       // никогда не «влезает» обратно в одну строку.
       const availableWidth = root.clientWidth - padding;
-      const leftWidth = measureClusterContentWidth(left, 10);
-      const rightWidth = measureClusterContentWidth(right, 6);
+      const leftWidth = measureClusterContentWidth(left, LEFT_CLUSTER_INNER_GAP_PX);
+      const rightWidth = measureClusterContentWidth(right, RIGHT_CLUSTER_INNER_GAP_PX);
       const readingsNode = readingsRef.current;
       if (readingsNode) {
         const width = readingsNode.getBoundingClientRect().width;
@@ -2110,6 +2121,11 @@ export default function ClaudeControlBar({
           leftWidth,
           rightWidth,
           readingsWidth: readingsWidthRef.current,
+          // Вместе с показаниями из замера уходит и отступ перед ними —
+          // тот же, с которым мерили блок строкой выше. Без него две
+          // раскладки расходятся ровно на этот отступ, и на полосе такой
+          // ширины показания мигают без остановки.
+          readingsGapPx: LEFT_CLUSTER_INNER_GAP_PX,
           readingsHidden: !readingsNode,
           minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
         }));
@@ -2176,9 +2192,10 @@ export default function ClaudeControlBar({
       setClustersWrapped(false);
       setReadingsShed(shouldShedControlBarReadings({
         availableWidth,
-        leftWidth: measureClusterContentWidth(left, 10),
-        rightWidth: measureClusterContentWidth(right, 6),
+        leftWidth: measureClusterContentWidth(left, LEFT_CLUSTER_INNER_GAP_PX),
+        rightWidth: measureClusterContentWidth(right, RIGHT_CLUSTER_INNER_GAP_PX),
         readingsWidth: readingsWidthRef.current,
+        readingsGapPx: LEFT_CLUSTER_INNER_GAP_PX,
         readingsHidden: !readingsNode,
         minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
       }));
@@ -2196,8 +2213,8 @@ export default function ClaudeControlBar({
     // «Something went wrong» на весь экран).
     setClustersWrapped(shouldWrapControlBar({
       availableWidth,
-      leftWidth: measureClusterContentWidth(left, 10),
-      rightWidth: measureClusterContentWidth(right, 6),
+      leftWidth: measureClusterContentWidth(left, LEFT_CLUSTER_INNER_GAP_PX),
+      rightWidth: measureClusterContentWidth(right, RIGHT_CLUSTER_INNER_GAP_PX),
       minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
     }));
   });

@@ -16,7 +16,11 @@
 
 import React from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { describeWorkspace, paneColumns } from '../../utils/splitPanesModel.mjs';
+import { describeWorkspace, paneColumns, paneGridRects, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
+
+// Высота всего рисунка. Окна делят её В ТЕХ ЖЕ долях, что и на экране, поэтому
+// число здесь одно: пропорции приходят из раскладки, а не задаются тут.
+const MAP_HEIGHT_PX = 104;
 
 interface WindowCell {
   index: number;
@@ -26,6 +30,10 @@ interface WindowCell {
   empty?: boolean;
   shownTabId: string | null;
   tabs: Array<{ projectId: string; tabId: string }>;
+  /** Доля окна в его колонке, в процентах — та же, что на экране. */
+  heightPct: number;
+  /** Доля колонки в ширине — тоже с экрана. */
+  widthPct: number;
 }
 
 /** Строка меню + карта окон, которая появляется по наведению. */
@@ -47,6 +55,8 @@ export default function MoveToWindowMenu({
       // Полоса одиночного центра — тоже раскладка: без неё картинка показала бы
       // одну вкладку там, где на экране их три.
       + '#' + (s.centerStrips[s.activeProjectId || ''] || []).map((e) => e.tabId).join('~')
+      // Перегородки двигает человек, и рисунок обязан двигаться следом.
+      + '#' + splitSizesFingerprint(s.splitSizes)
   ));
   const windows: WindowCell[] = React.useMemo(() => {
     const st = useWorkspaceStore.getState();
@@ -60,20 +70,36 @@ export default function MoveToWindowMenu({
         ? { projectId: st.activeProjectId, tabId: centerTabId }
         : null,
     );
-    const cells = view.windows as WindowCell[];
+    // Пропорции берём У САМОЙ рабочей области, а не пересчитываем: доли окон и
+    // колонок уже посчитаны для экрана, вместе с перетянутыми перегородками.
+    // Свой расчёт был бы вторым ответом на тот же вопрос и разошёлся бы с
+    // первым — что и произошло, когда рисунок раздавал всем окнам одну высоту.
+    const rects = paneGridRects(st.splitPanes, st.splitSizes);
+    const cells = (view.windows as WindowCell[]).map((w) => ({
+      ...w,
+      heightPct: rects[w.index]?.heightPct ?? 100,
+      widthPct: rects[w.index]?.widthPct ?? 100,
+    }));
     // Одиночный центр: модель окон не знает про его полосу — она живёт у
     // проекта, — а картинка обязана показывать то же, что шапка на экране.
     if (st.splitPanes.length === 0 && cells.length === 1) {
       const strip = st.centerStrips[st.activeProjectId || ''] || [];
-      if (strip.length > 1) return [{ ...cells[0], tabs: strip.map((e) => ({ ...e })) }];
+      const only = { ...cells[0], heightPct: 100, widthPct: 100 };
+      return strip.length > 1 ? [{ ...only, tabs: strip.map((e) => ({ ...e })) }] : [only];
     }
     return cells;
   }, [layoutKey]);
 
-  const columnCount = React.useMemo(() => {
+  // Ширина каждой колонки — как на экране. Берём с ЛЮБОГО её окна: доля колонки
+  // общая для всех её строк.
+  const columnWidths = React.useMemo(() => {
     const st = useWorkspaceStore.getState();
-    return Math.max(1, paneColumns(st.splitPanes).length || 1);
-  }, [layoutKey]);
+    const count = Math.max(1, paneColumns(st.splitPanes).length || 1);
+    return Array.from({ length: count }, (_, columnIndex) => (
+      windows.find((w) => w.column === columnIndex)?.widthPct ?? (100 / count)
+    ));
+  }, [windows]);
+  const columnCount = columnWidths.length;
 
   const moveTo = (target: WindowCell) => {
     const store = useWorkspaceStore.getState();
@@ -104,8 +130,12 @@ export default function MoveToWindowMenu({
         data-move-to-window-map
         style={{
           display: 'grid',
-          gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))`,
+          // Колонки в тех же долях, что на экране, а не поровну.
+          gridTemplateColumns: columnWidths.map((w) => `${Math.max(w, 8)}fr`).join(' '),
           gap: 4,
+          // Общая высота фиксирована, а делят её окна по своим долям: только так
+          // «окно на всю высоту колонки» и рисуется на всю высоту.
+          height: MAP_HEIGHT_PX,
         }}
       >
         {/* Прямоугольники раскладываются по КОЛОНКАМ и строкам, как окна на
@@ -113,7 +143,7 @@ export default function MoveToWindowMenu({
             в своей ячейке. Плоский ряд нарисовал бы два окна рядом там, где они
             одно под другим, — то есть раскладку, которой нет. */}
         {Array.from({ length: columnCount }, (_, columnIndex) => (
-          <div key={columnIndex} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div key={columnIndex} style={{ display: 'flex', flexDirection: 'column', gap: 4, minHeight: 0 }}>
             {windows.filter((w) => w.column === columnIndex).map((w) => {
               const here = w.index === homeIndex;
               const label = w.empty
@@ -141,7 +171,11 @@ export default function MoveToWindowMenu({
                   }}
                   onClick={() => { if (!here) moveTo(w); }}
                   style={{
-                    height: 46,
+                    // Доля высоты — с экрана. Фиксированная высота у всех и была
+                    // тем самым враньём: окно во всю колонку рисовалось
+                    // половиной, потому что рядом стояло второе такое же.
+                    flex: `${Math.max(w.heightPct, 1)} 1 0`,
+                    minHeight: 0,
                     borderRadius: 5,
                     // Рамка ярче у окна в фокусе — тот же язык, что у самой
                     // рабочей области: белый контур значит «здесь фокус».
@@ -155,6 +189,7 @@ export default function MoveToWindowMenu({
                     flexDirection: 'column',
                     justifyContent: 'space-between',
                     alignItems: 'flex-start',
+                    overflow: 'hidden',
                     cursor: here ? 'default' : 'pointer',
                     transition: 'background-color 0.12s, border-color 0.12s',
                     textAlign: 'left',

@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   deriveConfirmedClaudeSettings,
+  projectConfirmedClaudeSettingsForRuntime,
   traceClaudeActiveBranch,
 } = require('./claude-confirmed-settings');
 
@@ -143,4 +144,40 @@ test('linked resume chain can inherit a confirmed parent setting', () => {
     }],
   });
   assert.equal(deriveConfirmedClaudeSettings(activeBranch).model.value, 'sonnet');
+});
+
+test('historical effort does not claim a newer Claude process generation', () => {
+  const projected = projectConfirmedClaudeSettingsForRuntime({
+    success: true,
+    sessionId: 'session-a',
+    effort: 'max',
+    effortProofAt: 100,
+    effortProofSessionId: 'session-a',
+  }, {
+    generation: 'launch-2',
+    startedAt: 200,
+    sessionId: 'session-a',
+    processAlive: true,
+  });
+  assert.equal(projected.effortHistorical, 'max');
+  assert.equal(projected.effort, null);
+  assert.equal(projected.effortCurrentRuntime, false);
+});
+
+test('effort proof written inside the current live generation is current', () => {
+  const projected = projectConfirmedClaudeSettingsForRuntime({
+    success: true,
+    sessionId: 'session-a',
+    effort: 'low',
+    effortProofAt: 250,
+    effortProofSessionId: 'session-a',
+  }, {
+    generation: 'launch-2',
+    startedAt: 200,
+    sessionId: 'session-a',
+    processAlive: true,
+  });
+  assert.equal(projected.effortHistorical, 'low');
+  assert.equal(projected.effort, 'low');
+  assert.equal(projected.effortCurrentRuntime, true);
 });

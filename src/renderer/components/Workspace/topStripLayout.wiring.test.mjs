@@ -149,3 +149,74 @@ test('кнопка индекса в узком ряду показывает с
   assert.match(semantic, /\{outdated > 0 && \(/);
   assert.match(semantic, /\{!compact && <span style=\{\{ color: '#22c55e' \}\}>\{status\.fresh\}<\/span>\}/);
 });
+
+test('полоска Run after стоит ВЫШЕ бокового окна, а не под ним', () => {
+  // Она перестала отходить влево при открытии бокового окна — уступать место
+  // окну, которое закрывается одной клавишей, ей нечего. Но на прежнем слое
+  // это означало не «стоит на месте», а «спряталась под ним».
+  const host = workspace.slice(workspace.indexOf('data-workspace-prompt-queue-host'));
+  const style = host.slice(0, host.indexOf('/>'));
+  const hostZ = Number((style.match(/zIndex: (\d+)/) || [])[1]);
+  const frame = readRepo('src/renderer/components/Workspace/FloatingTerminalFrame.tsx');
+  const panelZ = Number((frame.match(/zIndex: floating \? (\d+)/) || [])[1]);
+  assert.ok(Number.isFinite(hostZ) && Number.isFinite(panelZ));
+  assert.ok(hostZ > panelZ, `полоска (${hostZ}) должна быть выше бокового окна (${panelZ})`);
+});
+
+test('кнопки шапки отвечают на курсор — все, а не через одну', () => {
+  // Кнопка, которая молчит под курсором, читается как подпись. Соседи по
+  // строке при этом подсвечиваются, и разница выглядит поломкой.
+  const usage = read('ClaudeUsageButton.tsx');
+  assert.match(usage, /\.usage-provider-trigger:not\(\[aria-expanded="true"\]\):hover/);
+  const timeline = read('TimelineToolsButton.tsx');
+  assert.match(timeline, /onMouseEnter=\{hoverIn\}/);
+  assert.match(timeline, /onMouseLeave=\{hoverOut\}/);
+  // Кнопка со своим цветом состояния на курсор не отвечает: её подложка уже
+  // занята под сообщение о состоянии, подсветка поверх соврала бы.
+  assert.match(timeline, /const hoverIn = \(event: React\.MouseEvent<HTMLButtonElement>\) => \{\s*\n\s*if \(active\) return;/);
+  const resource = read('ResourceUsageButton.tsx');
+  assert.match(resource, /onMouseEnter=\{\(event\) => \{\s*\n\s*if \(open\) return;/);
+});
+
+test('кнопки инструментов боковой панели той же меры, что кнопки шапки', () => {
+  // Две разные меры кнопки в одном окне читаются как два разных приложения.
+  const row = read('SidebarToolsRow.tsx');
+  assert.match(row, /height: 26,/);
+  assert.match(row, /fontSize: 11,/);
+  const docs = read('DocsButton.tsx');
+  assert.match(docs, /height: 26,/);
+  assert.match(docs, /fontSize: 11,/);
+  // Кнопка индекса живёт в том же ряду и обязана совпадать с соседями.
+  const semantic = read('SemanticIndexButton.tsx');
+  assert.match(semantic, /height: 26,\s*\n\s*minWidth: 26,/);
+  // Высота ряда следует за кнопкой, а не наоборот.
+  assert.match(layout, /export const SIDEBAR_TOOLS_H = 30;/);
+});
+
+test('«Только значок» невозможно включить там, где значка нет', () => {
+  // Иначе карточка проекта стала бы пустым прямоугольником. Правило стоит на
+  // ОБОИХ концах: в интерфейсе и на чтении из базы — значок можно убрать
+  // позже, и одно лишь выключение галочки этого не переживёт.
+  const modal = readRepo('src/renderer/components/UI/EditProjectModal.tsx');
+  assert.match(modal, /disabled=\{!hasIcon\}/);
+  assert.match(modal, /hideName: hasIcon \? hideName : false,/);
+  const db = readRepo('src/main/database.js');
+  assert.match(db, /hideName: project\.hide_name === 1 && !!project\.icon,/);
+  // Скрыта ПОДПИСЬ, а не имя: оно остаётся в подсказке и в доступности.
+  assert.match(app, /title=\{hideProjectName && projectIcon \? projectName : undefined\}/);
+  assert.match(app, /<span className="sr-only">\{projectName\}<\/span>/);
+});
+
+test('«Запустить» в меню вкладки переиспользует общий запуск агентов', () => {
+  // Второй код запуска разошёлся бы с первым на первой же особенности —
+  // пометке «resume в пути», авто-имени вкладки, снятии пометки «прервана».
+  const tabBar = read('TabBar.tsx');
+  assert.match(tabBar, /getHistoryAgentRuntime\(target\.toolType\)/);
+  assert.match(tabBar, /runtime\.resume\(\{/);
+  assert.match(tabBar, /runtime\.startFresh\?\.\(\{/);
+  // Решение «Run или Stop» — чистая функция, общая с кнопкой состояния в
+  // переписке по правилу «живое действие вытесняет запуск».
+  assert.match(tabBar, /resolveTabMenuRunState\(/);
+  const model = readRepo('src/renderer/utils/tabMenuRunAction.mjs');
+  assert.match(model, /if \(running > 0\) return \{ kind: 'stop'/);
+});

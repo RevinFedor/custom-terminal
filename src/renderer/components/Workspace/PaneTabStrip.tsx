@@ -17,8 +17,9 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
-import { groupStripByProject, resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
+import { groupOverflowByKind, groupStripByProject, resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
 import PaneTabChip from './PaneTabChip';
+import { TAB_COLORS, adjustRgbaAlpha } from './tabChrome';
 
 export interface StripEntry { projectId: string; tabId: string }
 
@@ -66,18 +67,43 @@ function StripProjectIcon({ projectId }: { projectId: string }) {
   );
 }
 
-/** «+N» — chips that scrolled fully out of view on one side. */
-function StripOverflowCount({ side, count, onClick }: {
+/** Как называется вид вкладки для счётчика: её цвет и есть её вид. */
+const KIND_LABEL: Record<string, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  gemini: 'Gemini',
+  default: 'без агента',
+};
+
+/**
+ * «×N» — вкладки, полностью ушедшие за край, по одному квадратику на вид.
+ *
+ * Цвет берётся из общей таблицы вкладок, а не подбирается здесь: оранжевый — то
+ * же «Claude», что у самих чипов, и счётчик читается без легенды. Заливка чуть
+ * плотнее, чем у чипа: квадратик мельче, а на той же прозрачности мелкое пятно
+ * выглядит выцветшим рядом с полноразмерным чипом того же цвета.
+ *
+ * Несколько видов идут СТОЛБИКОМ, а не в строку: полоса — одна строка, и
+ * второй квадратик рядом отъедал бы ширину у самих вкладок. Юзер: *«если там
+ * оба, писать по вертикали друг над другом»*.
+ */
+function StripOverflowCount({ side, groups, onClick }: {
   side: 'left' | 'right';
-  count: number;
+  groups: Array<{ kind: string; count: number }>;
   onClick: () => void;
 }) {
-  if (count <= 0) return null;
+  if (groups.length === 0) return null;
+  const total = groups.reduce((sum, g) => sum + g.count, 0);
+  const where = side === 'left' ? 'слева' : 'справа';
+  const title = `${where}: `
+    + groups.map((g) => `${g.count} × ${KIND_LABEL[g.kind] || g.kind}`).join(', ')
+    + ' — клик прокрутит';
   return (
     <button
       type="button"
       data-strip-overflow={side}
-      title={`Ещё ${count} ${count === 1 ? 'вкладка' : 'вкладок'} ${side === 'left' ? 'слева' : 'справа'} — клик прокрутит`}
+      data-strip-overflow-count={total}
+      title={title}
       onClick={(e) => { e.stopPropagation(); onClick(); }}
       // Двойной клик по счётчику — это два клика прокрутки, а не «ещё одна
       // вкладка сюда»: жест полосы принадлежит её ПУСТОМУ месту, а здесь стоит
@@ -86,20 +112,44 @@ function StripOverflowCount({ side, count, onClick }: {
       onPointerDown={(e) => e.stopPropagation()}
       style={{
         flexShrink: 0,
-        padding: '0 4px',
-        height: 14,
-        lineHeight: '14px',
-        fontSize: 10,
-        fontWeight: 600,
-        color: '#9b9ba1',
-        background: 'rgba(255,255,255,0.06)',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'stretch',
+        gap: 1,
+        padding: 0,
+        background: 'transparent',
         border: 'none',
-        borderRadius: 3,
         cursor: 'pointer',
         userSelect: 'none',
       }}
     >
-      +{count}
+      {groups.map((g) => {
+        const entry = TAB_COLORS.find((c) => c.color === g.kind);
+        const bg = entry && entry.bgColor !== 'transparent'
+          ? adjustRgbaAlpha(entry.bgColor, 0.14)
+          : 'rgba(255,255,255,0.10)';
+        return (
+          <span
+            key={g.kind}
+            data-strip-overflow-kind={g.kind}
+            style={{
+              display: 'block',
+              minWidth: 15,
+              padding: '0 3px',
+              height: 13,
+              lineHeight: '13px',
+              fontSize: 9.5,
+              fontWeight: 700,
+              textAlign: 'center',
+              color: entry?.borderColor && g.kind !== 'default' ? entry.borderColor : '#c2c2c8',
+              background: bg,
+              borderRadius: 3,
+            }}
+          >
+            {'\u00D7' + g.count}
+          </span>
+        );
+      })}
     </button>
   );
 }
@@ -118,28 +168,62 @@ export default function PaneTabStrip({
   entries, shownTabId, paneIndex, inSplit, onCreateTab,
 }: PaneTabStripProps) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
-  const [overflow, setOverflow] = useState({ hiddenLeft: 0, hiddenRight: 0 });
+  // Разбивка по видам, а не два числа: счётчик красится в цвет своего агента, и
+  // строка «×2 оранжевый» отвечает на вопрос, ради которого в полосу и смотрят.
+  const [overflow, setOverflow] = useState<{
+    left: Array<{ kind: string; count: number }>;
+    right: Array<{ kind: string; count: number }>;
+  }>({ left: [], right: [] });
   const inStrip = entries.length > 1;
+
+  // Вид вкладки = её цвет, тот же самый, что у чипа: вторая таблица цветов на
+  // одну полосу разошлась бы с первой на первой же новой раскраске.
+  const kindOfTab = useCallback((tabId: string) => {
+    const st = useWorkspaceStore.getState();
+    const owner = entries.find((e) => e.tabId === tabId)?.projectId;
+    const color = owner ? st.openProjects.get(owner)?.tabs.get(tabId)?.color : undefined;
+    return color && TAB_COLORS.some((c) => c.color === color && c.color !== 'default')
+      ? String(color)
+      : 'default';
+  }, [entries]);
+
+  // Цвет вкладки меняется в тот момент, когда в ней стартует агент, — и часто
+  // это вкладка, уже ушедшая за край. Без подписки квадратик остался бы серым
+  // до случайной прокрутки, то есть врал бы ровно о том, ради чего он есть.
+  // Строка, не массив: селектор с объектами — новая ссылка на каждую запись в
+  // стор, а полоса стоит в шапке КАЖДОГО окна (правило Fingerprint).
+  const kindsKey = useWorkspaceStore((s) => entries
+    .map((e) => s.openProjects.get(e.projectId)?.tabs.get(e.tabId)?.color || '-')
+    .join(','));
 
   const measure = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
     const chips = Array.from(el.querySelectorAll<HTMLElement>('[data-strip-item]'))
-      .map((node) => ({ left: node.offsetLeft, width: node.offsetWidth }));
+      .map((node) => ({
+        left: node.offsetLeft,
+        width: node.offsetWidth,
+        tabId: node.dataset.stripTabId || '',
+      }));
     const next = resolveStripOverflow({
       chips,
       scrollLeft: el.scrollLeft,
       viewportWidth: el.clientWidth,
     });
+    const left = groupOverflowByKind(next.hiddenLeftIds, kindOfTab);
+    const right = groupOverflowByKind(next.hiddenRightIds, kindOfTab);
+    const same = (a: Array<{ kind: string; count: number }>, b: Array<{ kind: string; count: number }>) => (
+      a.length === b.length && a.every((g, i) => g.kind === b[i].kind && g.count === b[i].count)
+    );
     setOverflow((prev) => (
-      prev.hiddenLeft === next.hiddenLeft && prev.hiddenRight === next.hiddenRight ? prev : next
+      same(prev.left, left) && same(prev.right, right) ? prev : { left, right }
     ));
-  }, []);
+  }, [kindOfTab]);
 
   // Measured after layout, not on a timer: the counts are a statement about what
   // is on screen RIGHT NOW, and a frame of "+0" while the numbers catch up reads
   // as "nothing is hidden" — the one thing they exist to deny.
-  useLayoutEffect(measure, [measure, entries.length, shownTabId]);
+  useLayoutEffect(measure, [measure, entries.length, shownTabId, kindsKey]);
   useEffect(() => {
     const el = scrollerRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return undefined;
@@ -190,7 +274,7 @@ export default function PaneTabStrip({
       }}
       style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0, flex: 1 }}
     >
-      <StripOverflowCount side="left" count={overflow.hiddenLeft} onClick={() => scrollBy(-1)} />
+      <StripOverflowCount side="left" groups={overflow.left} onClick={() => scrollBy(-1)} />
       <div
         ref={scrollerRef}
         data-pane-tab-strip-scroller
@@ -245,7 +329,7 @@ export default function PaneTabStrip({
           </React.Fragment>
         ))}
       </div>
-      <StripOverflowCount side="right" count={overflow.hiddenRight} onClick={() => scrollBy(1)} />
+      <StripOverflowCount side="right" groups={overflow.right} onClick={() => scrollBy(1)} />
     </div>
   );
 }

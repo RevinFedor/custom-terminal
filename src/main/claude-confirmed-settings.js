@@ -251,10 +251,45 @@ function deriveConfirmedClaudeSettings(activeBranch) {
   return result;
 }
 
+/**
+ * `/effort` is explicitly process-local in Claude Code (its confirmation says
+ * "this session only"). JSONL therefore proves what an older runtime used, not
+ * what a newly resumed process is using. Keep the historical fact for History,
+ * but expose it as current only when the proof belongs to this exact live launch
+ * generation and was written after its accepted shell boundary.
+ */
+function projectConfirmedClaudeSettingsForRuntime(result, runtimeScope = null) {
+  const source = result && typeof result === 'object' ? result : {};
+  const historicalEffort = source.effort || null;
+  const generation = String(runtimeScope?.generation || '').trim() || null;
+  const runtimeStartedAt = Number(runtimeScope?.startedAt || 0);
+  const runtimeSessionId = String(runtimeScope?.sessionId || '').trim() || null;
+  const proofSessionId = String(source.effortProofSessionId || '').trim() || null;
+  const proofAt = Number(source.effortProofAt || 0);
+  const sessionMatches = !runtimeSessionId || !proofSessionId
+    || runtimeSessionId === proofSessionId;
+  const effortCurrentRuntime = !!historicalEffort
+    && runtimeScope?.processAlive === true
+    && !!generation
+    && runtimeStartedAt > 0
+    && proofAt >= runtimeStartedAt
+    && sessionMatches;
+
+  return {
+    ...source,
+    effortHistorical: historicalEffort,
+    effort: effortCurrentRuntime ? historicalEffort : null,
+    effortCurrentRuntime,
+    runtimeGeneration: generation,
+    runtimeStartedAt: runtimeStartedAt > 0 ? runtimeStartedAt : null,
+  };
+}
+
 module.exports = {
   deriveConfirmedClaudeSettings,
   isConfirmedClaudeSettingStdout,
   normalizeClaudeLocalCommandText,
   parseClaudeSettingWrapper,
+  projectConfirmedClaudeSettingsForRuntime,
   traceClaudeActiveBranch,
 };

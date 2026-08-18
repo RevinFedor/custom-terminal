@@ -1551,6 +1551,18 @@ function ClaudeUsageChip({
           from { transform: rotate(0deg); }
           to { transform: rotate(360deg); }
         }
+        /* Наведение — как у соседей по шапке (⌘P и остальные): подложка
+           светлеет, текст становится ярче. Без него обе половины выглядели
+           неживыми среди кнопок, которые на курсор отвечают, и читались как
+           подпись, а не как то, что можно нажать.
+
+           Только когда всплывающая панель закрыта: открытая кнопка уже несёт
+           свой цвет провайдера, и подсветка поверх него означала бы «наведено»
+           там, где уже сказано «открыто». */
+        .usage-provider-trigger:not([aria-expanded="true"]):hover {
+          background: rgba(255,255,255,0.10) !important;
+          border-color: rgba(255,255,255,0.22) !important;
+        }
         @keyframes flash-fail {
           0%   { background: rgba(248,113,113,0.22); }
           100% { background: transparent; }
