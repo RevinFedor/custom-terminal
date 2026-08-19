@@ -123,6 +123,30 @@ test('absent proof triggers exactly one automatic retry, then succeeds', async (
   assert.ok(h.logs.some((l) => l.includes('[StartupRetry] decision=absent action=auto-retry')));
 });
 
+test('same-generation empty proof spends the same single retry budget on a fresh repaste', async () => {
+  let effortProofs = 0;
+  const recovery = { kind: 'repaste-after-empty' };
+  const h = makeHarness({
+    proofScript: (args) => {
+      if (args.command !== '/effort max') return { outcome: PROOF.FOUND };
+      effortProofs += 1;
+      return effortProofs === 1
+        ? { outcome: PROOF.ABSENT, recovery }
+        : { outcome: PROOF.FOUND };
+    },
+  });
+  const run = h.coordinator.ensureTransaction({
+    tabId: 'tab-empty-repaste', generation: 'g1', trigger: 'tui-ready',
+    steps: h.steps, sendCommand: h.sendCommand, proveCommand: h.proveCommand,
+  });
+  const result = await run.promise;
+
+  assert.equal(result.status, 'ready');
+  const effortSends = h.sends.filter((send) => send.command === '/effort max');
+  assert.equal(effortSends.length, 2);
+  assert.deepEqual(effortSends[1].recovery, recovery);
+});
+
 test('unresolved proof is never auto-retried and fails with the command named', async () => {
   const h = makeHarness({
     proofScript: (args) => (args.command === '/effort max'

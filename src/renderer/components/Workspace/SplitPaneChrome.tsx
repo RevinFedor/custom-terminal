@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Columns2, PanelBottom, PanelTop } from 'lucide-react';
+import { ArrowLeftRight, Columns2, PanelBottom, PanelTop } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -19,6 +19,7 @@ import {
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabStrip from './PaneTabStrip';
+import MoveToWindowMenu from './MoveToWindowMenu';
 import GitStatusButton from './GitStatusButton';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { isInboxProjectId } from '../../constants/systemProjects';
@@ -94,6 +95,8 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   const splitPanes = useWorkspaceStore((s) => s.splitPanes);
   const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
+  // Раскрыта ли карта окон внутри этого меню (пункт «Поменять местами»).
+  const [swapMapOpen, setSwapMapOpen] = useState(false);
   // Measured position of the split-direction menu, clamped into the window.
   const splitMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [splitMenuPos, setSplitMenuPos] = useState<{ x: number; y: number } | null>(null);
@@ -195,7 +198,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   // the same frame, or the menu is visibly drawn outside the app and then
   // jumps. Declared ABOVE the early return below — hooks cannot be conditional.
   React.useLayoutEffect(() => {
-    if (!splitMenu) { setSplitMenuPos(null); return; }
+    if (!splitMenu) { setSplitMenuPos(null); setSwapMapOpen(false); return; }
     const el = splitMenuRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
@@ -276,7 +279,13 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           пересоздавать панель на каждое переключение и стирать наполовину
           написанное сообщение коммита. */}
       {gitAvailable && (
-        <div style={{ display: 'flex', alignItems: 'stretch', height: 20, borderRadius: 4, overflow: 'hidden', flexShrink: 0, marginRight: 4 }}>
+        // `data-split-button` — тот же признак, что у кнопки деления: действия
+        // окна видны у окна В ФОКУСЕ, у остальных проявляются при наведении на
+        // шапку (globals.css). Git — такое же действие окна, и своё правило
+        // видимости у него было бы вторым ответом на один вопрос. Прячется
+        // ПРОЗРАЧНОСТЬЮ, не размонтированием: место в строке остаётся занятым,
+        // и полоса вкладок не дёргается при наведении.
+        <div data-split-button style={{ display: 'flex', alignItems: 'stretch', height: 20, borderRadius: 4, overflow: 'hidden', flexShrink: 0, marginRight: 4 }}>
           <GitStatusButton
             projectId={ownerProjectId}
             projectName={gitProjectName}
@@ -319,7 +328,10 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
-          if (!splitCan.vertical) return;
+          // Открываем ВСЕГДА. Раньше меню было целиком про «куда добавить
+          // панель» и молчало, когда добавлять уже некуда; теперь его первый
+          // пункт — обмен местами между существующими окнами, и он от этого
+          // запрета не зависит. Недоступные направления гасятся внутри меню.
           setSplitMenu({ x: e.clientX, y: e.clientY });
         }}
         onPointerDown={(e) => {
@@ -387,7 +399,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
               // that repeated the verb of the button it opened from. The menu
               // only ever answers WHERE, so the items say just that, and the
               // box shrinks to what two short answers need.
-              minWidth: 108,
+              minWidth: swapMapOpen ? 260 : 128,
               padding: '4px 0',
               background: '#242427',
               border: '1px solid rgba(255,255,255,0.12)',
@@ -398,6 +410,56 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
               userSelect: 'none',
             }}
           >
+            {/* ПЕРВЫМ пунктом — «Поменять местами»: он про уже существующие
+                окна, а два следующих создают новое. Раскрывает ту же карту
+                окон, что и «Move to window» в меню вкладки, — тот же вопрос
+                «какое окно», нарисованный тем же способом. Разница в том, что
+                выбранное окно не принимает вкладку, а меняется с этим окном
+                содержимым целиком. Юзер: *«эти два окна меняются местами между
+                собой»*.
+                Только в разделённой области: меняться местами одному окну не с
+                чем. */}
+            {inSplit && paneIndex !== null && paneIndex !== undefined && (
+              <div
+                data-split-swap-item
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => { e.stopPropagation(); setSwapMapOpen((v) => !v); }}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '5px 12px',
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap',
+                  background: swapMapOpen ? 'rgba(255,255,255,0.08)' : 'transparent',
+                }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
+                onMouseLeave={(e) => {
+                  (e.currentTarget as HTMLElement).style.background = swapMapOpen ? 'rgba(255,255,255,0.08)' : 'transparent';
+                }}
+              >
+                <ArrowLeftRight size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
+                Поменять местами
+              </div>
+            )}
+            {swapMapOpen && paneIndex !== null && paneIndex !== undefined && (
+              <div
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  borderTop: '1px solid rgba(255,255,255,0.10)',
+                  borderBottom: '1px solid rgba(255,255,255,0.10)',
+                  marginTop: 2,
+                  marginBottom: 2,
+                }}
+              >
+                <MoveToWindowMenu
+                  mode="swap"
+                  sourcePaneIndex={paneIndex}
+                  onDone={() => { setSwapMapOpen(false); setSplitMenu(null); }}
+                />
+              </div>
+            )}
             {/* Icon + one word. The verb lives on the button that opened this
                 menu; repeating it in both rows made the reader compare two long
                 strings to find the single word that differs. The panel icons
@@ -411,8 +473,10 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
                 key={side}
                 data-split-direction-item={side}
                 onMouseDown={(e) => e.stopPropagation()}
+                title={splitCan.vertical ? undefined : 'Сначала выберите вкладку для пустой панели'}
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (!splitCan.vertical) return;
                   setSplitMenu(null);
                   useWorkspaceStore.getState().addVerticalSplitPane(paneIndex ?? null, side);
                 }}
@@ -421,13 +485,19 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
                   alignItems: 'center',
                   gap: 8,
                   padding: '5px 12px',
-                  cursor: 'pointer',
+                  // Недоступное направление ГАСНЕТ, а не исчезает: пропавший
+                  // пункт читается как поломка, погашенный — называет правило.
+                  cursor: splitCan.vertical ? 'pointer' : 'not-allowed',
+                  color: splitCan.vertical ? undefined : '#6a6a70',
                   whiteSpace: 'nowrap',
                 }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
+                onMouseEnter={(e) => {
+                  if (!splitCan.vertical) return;
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)';
+                }}
                 onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
               >
-                <Icon size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
+                <Icon size={13} style={{ flexShrink: 0, color: splitCan.vertical ? '#9a9aa0' : '#5f5f65' }} />
                 {label}
               </div>
             ))}
@@ -460,11 +530,13 @@ export const SPLIT_PANE_CONTENT_INSET_PX = 2;
  * pane lights up under the cursor, so "this click will select this pane"
  * is visible in advance instead of felt afterwards as a dead click.
  *
- * Between the two neighbour states (0.08 side lines) and the active-but-no-
- * keyboard state (0.30 full contour): loud enough to notice, quiet enough not
- * to be mistaken for focus itself.
+ * Ярче двух боковых линий соседа (0.08) и заметно тише рамки фокуса (0.75):
+ * достаточно, чтобы читаться рядом с ней на общем шве, и недостаточно, чтобы
+ * спутать с самим фокусом. Было 0.20 — на шве с окном в фокусе такая линия
+ * терялась (см. globals.css: рамки соседей лежат в РАЗНЫХ пиксельных колонках,
+ * поэтому спор решается только яркостью).
  */
-export const SPLIT_PANE_HOVER_RING = 'inset 0 0 0 1px rgba(255,255,255,0.20)';
+export const SPLIT_PANE_HOVER_RING = 'inset 0 0 0 1px rgba(255,255,255,0.42)';
 
 // White focus frame of the focused pane; hairline separator on the others.
 export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
@@ -508,10 +580,28 @@ export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
 
 // ── Resizable dividers ────────────────────────────────────────────────────
 
-/** 6px grab strip centred on the 1px boundary — same feel as the TabSidebar
+/** 6px violet strip centred on the 1px boundary — same feel as the TabSidebar
  *  handle, and the same violet: violet already means "drag me" here. */
-const SPLIT_DIVIDER_HIT_PX = 6;
+const SPLIT_DIVIDER_VISUAL_PX = 6;
+/**
+ * Насколько зона захвата ШИРЕ видимой полоски, с каждой стороны.
+ *
+ * Поймать границу мышью и увидеть её — разные задачи с разными правильными
+ * размерами: полоска толщиной с прицел выглядит грубо, а прицел толщиной с
+ * полоску заставляет целиться. Поэтому это два числа, и растёт только зона:
+ * подсветка при наведении рисуется внутренней полоской прежней ширины, так что
+ * на экране не меняется ничего. Юзер: *«визуально всё должно быть идентично, но
+ * область срабатывания увеличь на пару пикселей»*.
+ */
+const SPLIT_DIVIDER_HIT_GROW_PX = 2;
+const SPLIT_DIVIDER_HIT_PX = SPLIT_DIVIDER_VISUAL_PX + SPLIT_DIVIDER_HIT_GROW_PX * 2;
 const SPLIT_DIVIDER_HOVER_BG = 'rgba(99,102,241,0.4)';
+
+/** Подсветка живёт на ВНУТРЕННЕЙ полоске, а не на всей зоне захвата. */
+const paintDivider = (strip: HTMLElement | null | undefined, on: boolean) => {
+  const visual = strip?.firstElementChild as HTMLElement | null;
+  if (visual) visual.style.background = on ? SPLIT_DIVIDER_HOVER_BG : '';
+};
 
 type LiveSizes = { cols: number[]; rows: number[][] };
 
@@ -604,7 +694,7 @@ export function SplitDividerLayer() {
     // structure), so the min-size clamp never accumulates across moves.
     const base = normalizeSplitSizes(panes, sizes) as LiveSizes;
     draggingIdRef.current = divider.id;
-    strip.style.background = SPLIT_DIVIDER_HOVER_BG;
+    paintDivider(strip, true);
     const onMove = (ev: MouseEvent) => {
       let next: LiveSizes;
       if (divider.kind === 'col') {
@@ -629,7 +719,7 @@ export function SplitDividerLayer() {
       document.body.style.userSelect = '';
       draggingIdRef.current = null;
       cancelDragRef.current = null;
-      if (!strip.matches(':hover')) strip.style.background = '';
+      if (!strip.matches(':hover')) paintDivider(strip, false);
     };
     const onUp = () => {
       stopListening();
@@ -665,13 +755,18 @@ export function SplitDividerLayer() {
           // (Micro-jitter between the two clicks is harmless: a near-equal
           // drag packs to null anyway — see EQUAL_EPS in the model.)
           onDoubleClick={() => useWorkspaceStore.getState().commitSplitSizes(null)}
-          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = SPLIT_DIVIDER_HOVER_BG; }}
+          onMouseEnter={(e) => { paintDivider(e.currentTarget as HTMLElement, true); }}
           onMouseLeave={(e) => {
-            if (draggingIdRef.current !== d.id) (e.currentTarget as HTMLElement).style.background = '';
+            if (draggingIdRef.current !== d.id) paintDivider(e.currentTarget as HTMLElement, false);
           }}
           style={{
             position: 'absolute',
             pointerEvents: 'auto',
+            // Прозрачная зона захвата: она шире видимой полоски и сама ничего
+            // не рисует.
+            display: 'flex',
+            alignItems: 'stretch',
+            justifyContent: 'center',
             ...(d.kind === 'col'
               ? {
                 left: `calc(${d.xPct}% - ${SPLIT_DIVIDER_HIT_PX / 2}px)`,
@@ -679,6 +774,7 @@ export function SplitDividerLayer() {
                 bottom: 0,
                 width: SPLIT_DIVIDER_HIT_PX,
                 cursor: 'col-resize',
+                flexDirection: 'row' as const,
               }
               : {
                 top: `calc(${d.yPct}% - ${SPLIT_DIVIDER_HIT_PX / 2}px)`,
@@ -686,9 +782,23 @@ export function SplitDividerLayer() {
                 width: `${d.widthPct}%`,
                 height: SPLIT_DIVIDER_HIT_PX,
                 cursor: 'row-resize',
+                flexDirection: 'column' as const,
               }),
           }}
-        />
+        >
+          {/* Видимая полоска — прежних 6px по центру зоны. Первый ребёнок:
+              подсветку красит `paintDivider`, который её так и находит. */}
+          <span
+            aria-hidden
+            data-split-divider-visual
+            style={{
+              flexShrink: 0,
+              ...(d.kind === 'col'
+                ? { width: SPLIT_DIVIDER_VISUAL_PX, alignSelf: 'stretch' }
+                : { height: SPLIT_DIVIDER_VISUAL_PX, alignSelf: 'stretch' }),
+            }}
+          />
+        </div>
       ))}
     </div>
   );

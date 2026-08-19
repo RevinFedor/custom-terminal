@@ -198,6 +198,48 @@ test('explicit queue with settings is rejected even if caller supplied active st
   assert.equal(plan.code, 'codex_settings_change_requires_idle');
 });
 
+test('busy queue accepts a requested pair already proven for the exact live writer', () => {
+  assert.deepEqual(planCodexHistorySettings({
+    requestedModel: 'gpt-5.6-sol',
+    requestedEffort: 'max',
+    currentModel: 'stale-model',
+    currentEffort: 'low',
+    currentProofSessionId: 'writer-a',
+    runtimeSnapshot: {
+      ...LIVE_WRITER,
+      codexCurrentSettingsOwnerId: 'writer-a',
+      codexCurrentModel: 'gpt-5.6-sol',
+      codexCurrentEffort: 'max',
+    },
+    statusAtSend: 'busy',
+    queue: true,
+  }), {
+    hasRequestedSettings: false,
+    settingsAlreadyApplied: true,
+    blocked: false,
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+  });
+});
+
+test('busy queue still rejects a real settings difference from the proven writer', () => {
+  const plan = planCodexHistorySettings({
+    requestedModel: 'gpt-5.6-sol',
+    requestedEffort: 'high',
+    currentProofSessionId: 'writer-a',
+    runtimeSnapshot: {
+      ...LIVE_WRITER,
+      codexCurrentSettingsOwnerId: 'writer-a',
+      codexCurrentModel: 'gpt-5.6-sol',
+      codexCurrentEffort: 'max',
+    },
+    statusAtSend: 'busy',
+    queue: true,
+  });
+  assert.equal(plan.blocked, true);
+  assert.equal(plan.code, 'codex_settings_change_requires_idle');
+});
+
 test('busy prompt without settings remains eligible for the normal queue flow', () => {
   assert.deepEqual(planCodexHistorySettings({
     requestedModel: 'none',
@@ -247,9 +289,10 @@ test('runtime proof resolver accepts only the explicitly confirmed live writer',
   assert.deepEqual(resolveCodexSettingsRuntimeProof(LIVE_WRITER), {
     runtimeState: 'live',
     activeWriterSessionId: 'writer-a',
-    currentSettingsOwnerId: 'writer-a',
+    currentSettingsOwnerId: '',
     currentSettingsModel: '',
     currentSettingsEffort: '',
+    confirmedWriterSettingsProven: false,
     provisionalSettingsProven: false,
   });
   assert.deepEqual(resolveCodexSettingsRuntimeProof({
@@ -262,6 +305,7 @@ test('runtime proof resolver accepts only the explicitly confirmed live writer',
     currentSettingsOwnerId: '',
     currentSettingsModel: '',
     currentSettingsEffort: '',
+    confirmedWriterSettingsProven: false,
     provisionalSettingsProven: false,
   });
   assert.deepEqual(resolveCodexSettingsRuntimeProof({ liveLifecycle: false }), {
@@ -270,6 +314,7 @@ test('runtime proof resolver accepts only the explicitly confirmed live writer',
     currentSettingsOwnerId: '',
     currentSettingsModel: '',
     currentSettingsEffort: '',
+    confirmedWriterSettingsProven: false,
     provisionalSettingsProven: false,
   });
   assert.equal(codexSettingsProofMatchesActiveWriter({

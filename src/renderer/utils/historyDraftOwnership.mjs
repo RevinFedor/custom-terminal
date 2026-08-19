@@ -130,3 +130,36 @@ export function mergeFailedHistoryAuthoringSnapshot({
     missingImageSourceIds: inserted.missingSourceIds,
   };
 }
+
+/**
+ * Restore an accepted FIFO batch before whatever the user typed afterwards.
+ * Applying snapshots newest→oldest through the single-snapshot prepend rule
+ * yields A,B,C,current without inventing a second ordering algorithm.
+ */
+export function mergeFailedHistoryAuthoringSnapshots({
+  currentText = '',
+  currentImages = [],
+  currentChips = [],
+  snapshots = [],
+  createChipId = defaultRestoredChipId,
+} = {}) {
+  let text = String(currentText || '');
+  let images = currentImages;
+  let chips = currentChips;
+  for (let index = snapshots.length - 1; index >= 0; index -= 1) {
+    const snapshot = snapshots[index] || {};
+    const merged = mergeFailedHistoryAuthoringSnapshot({
+      currentText: text,
+      currentImages: images,
+      currentChips: chips,
+      snapshotText: snapshot.text || '',
+      snapshotImages: snapshot.images || [],
+      snapshotChips: snapshot.chips || [],
+      createChipId,
+    });
+    text = merged.text;
+    images = merged.images;
+    chips = merged.chips;
+  }
+  return { text, images, chips };
+}

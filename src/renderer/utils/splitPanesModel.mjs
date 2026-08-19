@@ -512,6 +512,44 @@ export function reorderPaneTab(panes, paneIndex, tabId, toIndex) {
   return { panes: next };
 }
 
+/**
+ * Поменять местами СОДЕРЖИМОЕ двух окон.
+ *
+ * Не то же, что «перенести вкладку в другое окно»: там вкладка уходит из одного
+ * места в другое, а окно, откуда она ушла, живёт дальше своей жизнью. Здесь
+ * меняются местами два окна целиком — со всеми своими вкладками, с тем, какая
+ * из них показана, и с их прошлым. Юзер: *«у меня есть окно, в нём 6 вкладок; я
+ * выбираю другое окно, и эти два окна меняются местами»*.
+ *
+ * МЕСТО остаётся за окном, а не переезжает с содержимым: колонка и порядок строк
+ * — это раскладка на экране, и обмен не должен её перекраивать. Поэтому
+ * переставляется всё, КРОМЕ `column`: два окна разной высоты просто обменялись
+ * содержимым, а сетка осталась той же самой.
+ *
+ * Фокус едет ЗА СОДЕРЖИМЫМ: человек назвал два окна и ждёт, что его вкладки
+ * окажутся на новом месте, — значит и рамка фокуса должна быть там же.
+ */
+export function swapPanes(panes, focusedIndex, a, b) {
+  const list = Array.isArray(panes) ? panes : [];
+  const from = a | 0;
+  const to = b | 0;
+  if (from === to) return null;
+  if (!list[from] || !list[to]) return null;
+  const next = list.slice();
+  // Колонка принадлежит МЕСТУ: снимаем её с приезжающего окна и надеваем ту,
+  // что была у места. Пустые панели тоже участвуют — «поменять местами с пустым
+  // окном» это законный способ подвинуть содержимое, не создавая ничего нового.
+  const keepColumn = (pane, place, placeIndex) => {
+    const column = paneColumn(place, placeIndex);
+    const body = stripColumn(pane);
+    return 'column' in place ? { ...body, column } : body;
+  };
+  next[from] = keepColumn(list[to], list[from], from);
+  next[to] = keepColumn(list[from], list[to], to);
+  const focused = focusedIndex === from ? to : focusedIndex === to ? from : focusedIndex;
+  return { panes: normalizeColumns(next), focusedIndex: focused };
+}
+
 // ── What this pane showed before ──────────────────────────────────────────
 //
 // Recency at PANE level, which the global tab history cannot answer: "what was

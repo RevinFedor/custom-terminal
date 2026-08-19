@@ -7,9 +7,12 @@ const repoRoot = path.join(import.meta.dirname, '../..');
 const read = (relative) => fs.readFileSync(path.join(repoRoot, relative), 'utf8');
 const panel = read('renderer/components/Workspace/HistoryPanel.tsx');
 const receipt = read('main/agent-history-send-receipt.js');
+const runtime = read('renderer/utils/historyAgentRuntimes.ts');
+const main = read('main/main.js');
 
 /**
- * Slash-команда отправляется из History как обычное сообщение.
+ * Slash-команда видна в History как пользовательская команда, но физически
+ * отправляется специализированной TUI-транзакцией.
  *
  * Раньше общий submit-path её глотал: Enter не делал ничего, а рядом висела
  * подсказка «← Terminal only» — команду предлагалось вводить в живой терминал.
@@ -17,8 +20,7 @@ const receipt = read('main/agent-history-send-receipt.js');
  * (`fix-compact-logic.md`) оставлял открытым: «пускай можно будет отправлять
  * команды слэш».
  *
- * Результата у локальных команд может не быть — это принято сознательно.
- * Отображается само сообщение, потому что оно и есть user message.
+ * В rollout `user_message` её нет, поэтому обычный prompt audit здесь запрещён.
  */
 
 test('отправку slash больше ничто не глотает', () => {
@@ -41,8 +43,9 @@ test('локальная slash-команда не порождает распи
   // У неё нет записи `user_message`, поэтому обычная расписка висела бы вечно и
   // сообщение осталось бы UNCONFIRMED.
   assert.match(receipt, /function isLocalSlashCommandPrompt\(rawPrompt\)/);
-  assert.match(receipt, /rawPrompt\.trimStart\(\)\.startsWith\('\/'\)/);
-  assert.match(receipt, /&& !isLocalSlashCommandPrompt\(rawPrompt\)/);
+  assert.ok(receipt.includes("normalized.includes('\\n')"));
+  assert.match(receipt, /hasStructuredPayload/);
+  assert.match(receipt, /isLocalSlashCommandPrompt\(rawPrompt\) && !hasStructuredPayload/);
 });
 
 test('правило покрывает ВСЕ источники History, а не только автоматику', () => {
@@ -56,5 +59,18 @@ test('правило покрывает ВСЕ источники History, а н
   );
   assert.ok(fn.length > 0);
   assert.match(fn, /isOwnedDesktopHistorySendSource\(source\)/);
-  assert.match(fn, /!isLocalSlashCommandPrompt\(rawPrompt\)/);
+  assert.match(fn, /isLocalSlashCommandPrompt\(rawPrompt\) && !hasStructuredPayload/);
+});
+
+test('History routes standalone Codex slash through exact TUI ingestion instead of user_message audit', () => {
+  assert.match(runtime, /isStandaloneCodexLocalSlashCommand\(\{/);
+  assert.match(runtime, /ipcRenderer\.invoke\('codex:send-live-slash-command'/);
+  assert.match(main, /localCommandProof = 'codex-tui-input-frame-and-enter'/);
+  assert.match(panel, /projectCodexLocalSlashSendResult\(\{/);
+  assert.match(panel, /requiresAuditIdentity: !localSlashReceipt\.handled/);
+});
+
+test('provider-busy slash is admitted only for an owned History queue source', () => {
+  assert.match(main, /queuedHistoryCommand = queue === true[\s\S]{0,120}isOwnedDesktopHistorySendSource/);
+  assert.match(main, /codexSlashCommandAllowsTurnBusy\(\{/);
 });

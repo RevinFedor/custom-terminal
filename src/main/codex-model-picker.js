@@ -647,6 +647,31 @@ function decideCodexPickerCleanupFrame({
   return { action: 'stop', success: false, reason: 'interactive-surface-unproven' };
 }
 
+function decideCodexOwnedSlashDraft({
+  slashInserted = false,
+  enterSubmitted = false,
+  identityCurrent = false,
+  identityReason = 'operation-identity-changed',
+  draftProofAvailable = false,
+  hasDraft = null,
+  expectedCommand = '',
+  currentDraft = '',
+} = {}) {
+  if (!slashInserted || enterSubmitted) {
+    return { action: 'preserve', owned: false, reason: 'slash-draft-not-owned' };
+  }
+  if (!identityCurrent) {
+    return { action: 'preserve', owned: false, reason: identityReason };
+  }
+  if (!draftProofAvailable || hasDraft !== true) {
+    return { action: 'preserve', owned: false, reason: 'exact-draft-proof-unavailable' };
+  }
+  if (String(currentDraft || '') !== String(expectedCommand || '')) {
+    return { action: 'preserve', owned: false, reason: 'draft-changed-after-slash-insert' };
+  }
+  return { action: 'use-exact-draft', owned: true, reason: 'exact-owned-slash-draft' };
+}
+
 function valuesFromPicker(source) {
   const values = Array.isArray(source)
     ? source
@@ -1139,6 +1164,7 @@ module.exports = {
   codexEffortApplicationMode,
   codexEffortCanUsePlanScope,
   codexModelEffortAppliedMessageCount,
+  decideCodexOwnedSlashDraft,
   decideCodexModelMigrationAcknowledgement,
   decideCodexModelMigrationAutoEnter,
   decideCodexPickerCleanupFrame,

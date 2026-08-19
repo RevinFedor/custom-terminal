@@ -13,8 +13,11 @@ import { requireConfirmedCodexWriter } from './codexWriterIdentity';
 import { selectRewindOperation } from '../store/rewindOperationState';
 import { useRewindOperationStore } from '../store/useRewindOperationStore';
 import {
+  cancelCoordinatedAgentSendFollowers,
   createCoordinatedAgentSendCancellationWait,
+  getCoordinatedAgentSendCancellation,
   isCoordinatedAgentSendCancellationRequested,
+  settleCoordinatedAgentSend,
 } from './agentActionCoordinator.mjs';
 import {
   applyAgentDraftCaptureResolution,
@@ -25,6 +28,7 @@ import {
 import { buildClaudeRewindPromptProjection } from './composerChips.mjs';
 import { enqueueAgentSendScenario } from './agentSendSequencer.mjs';
 import { showAgentDraftScreenContradictionToast } from './agentDraftContradictionToast.mjs';
+import { getCodexRuntimeReadSessionId } from './codexPtyPresence.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -57,6 +61,12 @@ export interface SendAgentPromptScenarioArgs {
   returnDraftOnConflict?: boolean;
   claudeExactEmptyEvidence?: Record<string, unknown> | null;
   coordinatedSendToken?: number | null;
+  // Explicit alternate gesture: stop the provider, persist the immutable
+  // authoring snapshot into model-visible history WITHOUT a model turn, then
+  // reopen that exact session and wait for an idle composer.
+  recordWithoutReply?: boolean;
+  onRestartPhase?: (phase: 'stopping' | 'starting') => void;
+  onHistoryRecorded?: (result: any) => void | Promise<void>;
   onReadyForSend?: (status: Extract<AgentPtyStatus, 'active' | 'busy'>) => void;
   presentationSnapshot?: {
     historySessionId?: string | null;
@@ -172,28 +182,218 @@ async function runAgentPromptScenario({
   returnDraftOnConflict,
   claudeExactEmptyEvidence,
   coordinatedSendToken,
+  recordWithoutReply,
+  onRestartPhase,
+  onHistoryRecorded,
   onReadyForSend,
   presentationSnapshot,
 }: SendAgentPromptScenarioArgs): Promise<any> {
   const assertSendNotCancelled = () => {
-    if (
-      coordinatedSendToken
-      && isCoordinatedAgentSendCancellationRequested(tabId, coordinatedSendToken)
-    ) {
-      throw new Error('Send cancelled before terminal submission');
+    if (coordinatedSendToken) {
+      const cancellation = getCoordinatedAgentSendCancellation(tabId, coordinatedSendToken);
+      if (cancellation) {
+        throw Object.assign(
+          new Error('Send cancelled before terminal submission'),
+          {
+            coordinatedCancelReason: cancellation.cancelReason,
+            cascadeRestoreByToken: cancellation.cascadeRestoreByToken,
+            cascadeRestoreBatched: cancellation.cascadeRestoreBatched === true,
+          },
+        );
+      }
     }
   };
-  const requestedStatusForSend = normalizeStatus(statusAtSend);
-  const statusForSend = await ensureAgentReadyForSend({
-    tabId,
-    toolType,
-    runtime,
-    sessionId,
-    cwd,
-    coordinatedSendToken,
-    requestedStatusAtSend: requestedStatusForSend,
-  }) || requestedStatusForSend;
-  assertSendNotCancelled();
+  const requestedStatusAtClick = normalizeStatus(statusAtSend);
+  let restartPerformed = false;
+  let restartSessionId = sessionId;
+  let historySessionAuthority: 'live-writer' | 'history-hint' | 'fresh' = sessionId
+    ? 'history-hint'
+    : 'fresh';
+  let historyContextResult: any = null;
+  if (recordWithoutReply === true) {
+    let presence = await runtime.getPresence(tabId).catch((err: any) => {
+      console.warn('[AgentScenario:record-context] presence failed before stop tool=' + toolType
+        + ' tab=' + String(tabId).slice(-12) + ' ' + (err?.message || err));
+      return null;
+    });
+    assertSendNotCancelled();
+    if (!presence || presence.status === 'unknown') {
+      throw new Error(runtime.label + ' status could not be verified before recording context');
+    }
+    if (presence.status === 'stopping') {
+      throw new Error(runtime.label + ' is already stopping; wait before recording context');
+    }
+    if (presence.status === 'busy' || presence.status === 'starting') {
+      throw new Error(runtime.label + ' must be idle before recording context');
+    }
+    const livePresence = presence.status === 'active'
+      || presence.status === 'busy'
+      || presence.status === 'starting';
+    if (livePresence) {
+      const provenLiveSessionId = presence.sessionId
+        || (toolType === 'codex'
+          ? getCodexRuntimeReadSessionId(presence.runtimeSnapshot)
+          : null);
+      if (provenLiveSessionId) {
+        restartSessionId = provenLiveSessionId;
+        historySessionAuthority = 'live-writer';
+      } else if (
+        !sessionId
+        || (toolType === 'claude' && presence.conversationMaterialized === false)
+      ) {
+        restartSessionId = null;
+        historySessionAuthority = 'fresh';
+      } else {
+        throw new Error(runtime.label + ' live writer session could not be verified before recording context');
+      }
+    }
+    if (toolType === 'claude' && restartSessionId) {
+      const conversationMaterialized = presence.conversationMaterialized === true
+        || presence.canResume === true;
+      const conversationProvenFresh = presence.conversationMaterialized === false
+        && presence.canResume !== true;
+      if (!conversationMaterialized && !conversationProvenFresh) {
+        throw new Error('Claude conversation state could not be verified before recording context');
+      }
+      restartSessionId = conversationMaterialized ? restartSessionId : null;
+      if (!restartSessionId) historySessionAuthority = 'fresh';
+    }
+    if (presence.status === 'active' || presence.status === 'busy' || presence.status === 'starting') {
+      onRestartPhase?.('stopping');
+      console.log('[AgentScenario:record-context] stop tool=' + toolType
+        + ' tab=' + String(tabId).slice(-12)
+        + ' status=' + presence.status);
+      const stopped = await stopAgentProcessScenario({
+        tabId,
+        toolType,
+        runtime,
+        reason: 'record-history-context',
+      });
+      assertSendNotCancelled();
+      if (stopped?.success === false) {
+        // A concurrent clean exit may win the stop request. Accept it only
+        // after a fresh authoritative presence read proves the process gone.
+        presence = await runtime.getPresence(tabId).catch(() => null);
+        if (presence?.status !== 'inactive') {
+          throw new Error(stopped?.error || runtime.label + ' could not stop before recording context');
+        }
+      }
+      restartPerformed = true;
+    }
+    onRestartPhase?.('starting');
+    assertSendNotCancelled();
+    historyContextResult = await runtime.recordHistoryContext(tabId, prompt, {
+      sessionId: restartSessionId,
+      sessionAuthority: historySessionAuthority,
+      cwd,
+      handoffId,
+      source,
+      model,
+      effort,
+      presentationSnapshot,
+    });
+    if (historyContextResult?.success === false && historyContextResult?.accepted !== true) {
+      throw Object.assign(
+        new Error(historyContextResult?.error || 'History context was not recorded'),
+        { historyContextResult },
+      );
+    }
+    restartSessionId = historyContextResult?.sessionId || null;
+    if (!restartSessionId) {
+      if (coordinatedSendToken) {
+          cancelCoordinatedAgentSendFollowers(
+            tabId,
+            coordinatedSendToken,
+            'history-context-session-unresolved',
+            Date.now(),
+            { cascadeRestore: false },
+        );
+      }
+      return {
+        ...(historyContextResult || {}),
+        requestedStatusAtSend: requestedStatusAtClick,
+        effectiveStatusAtSend: 'inactive',
+        recordWithoutReply: true,
+        restartPerformed,
+        restartSessionId: null,
+        reopened: false,
+      };
+    }
+    if (toolType === 'codex') {
+      const adopted = await useWorkspaceStore.getState().setCodexSessionId(
+        tabId,
+        restartSessionId,
+        'historyContext',
+      );
+      if (!adopted) {
+        if (coordinatedSendToken) {
+          cancelCoordinatedAgentSendFollowers(
+            tabId,
+            coordinatedSendToken,
+            'history-context-session-not-adopted',
+            Date.now(),
+            { cascadeRestore: false },
+          );
+        }
+        return {
+          ...historyContextResult,
+          success: true,
+          requestedStatusAtSend: requestedStatusAtClick,
+          effectiveStatusAtSend: 'inactive',
+          recordWithoutReply: true,
+          restartPerformed,
+          restartSessionId,
+          reopened: false,
+          reopenWarning: 'Codex history was recorded, but the tab could not adopt the new session',
+        };
+      }
+    } else {
+      useWorkspaceStore.getState().setClaudeSessionId(
+        tabId,
+        restartSessionId,
+        'historyContext',
+      );
+    }
+    if (historyContextResult?.historyRecorded === true) {
+      await onHistoryRecorded?.(historyContextResult);
+    }
+  }
+  // After the explicit stop, `starting` from the click-time snapshot is stale.
+  const requestedStatusForSend = recordWithoutReply === true
+    ? 'inactive'
+    : requestedStatusAtClick;
+  let statusForSend: AgentPtyStatus | undefined;
+  let runtimeSnapshotForSend: any = null;
+  try {
+    const readyForSend = await ensureAgentReadyForSend({
+      tabId,
+      toolType,
+      runtime,
+      sessionId: recordWithoutReply === true ? restartSessionId : sessionId,
+      cwd,
+      coordinatedSendToken,
+      requestedStatusAtSend: requestedStatusForSend,
+      resumePausedGoal: recordWithoutReply === true ? false : undefined,
+    });
+    statusForSend = readyForSend?.status || requestedStatusForSend;
+    runtimeSnapshotForSend = readyForSend?.presence?.runtimeSnapshot || null;
+  } catch (error: any) {
+    if (recordWithoutReply === true && historyContextResult?.historyRecorded === true) {
+      return {
+        ...historyContextResult,
+        success: true,
+        requestedStatusAtSend: requestedStatusAtClick,
+        effectiveStatusAtSend: 'inactive',
+        recordWithoutReply: true,
+        restartPerformed,
+        restartSessionId,
+        reopened: false,
+        reopenWarning: String(error?.message || error),
+      };
+    }
+    throw error;
+  }
+  if (recordWithoutReply !== true) assertSendNotCancelled();
   if (statusForSend === 'active' || statusForSend === 'busy') {
     onReadyForSend?.(statusForSend);
   }
@@ -202,6 +402,17 @@ async function runAgentPromptScenario({
       + ' tab=' + String(tabId).slice(-12)
       + ' requested=' + requestedStatusForSend
       + ' effective=' + statusForSend);
+  }
+  if (recordWithoutReply === true) {
+    return {
+      ...(historyContextResult || {}),
+      requestedStatusAtSend: requestedStatusAtClick,
+      effectiveStatusAtSend: statusForSend,
+      recordWithoutReply: true,
+      restartPerformed,
+      restartSessionId,
+      reopened: true,
+    };
   }
 
   const canInspectDraft = !!runtime.probeDraft || !!runtime.inspectDraft;
@@ -384,25 +595,30 @@ async function runAgentPromptScenario({
     : undefined;
 
   assertSendNotCancelled();
+  const effectivePresentationSnapshot = presentationSnapshot;
   const result = await runtime.sendPrompt(tabId, prompt, {
     handoffId: typeof handoffId === 'string' ? handoffId : undefined,
     sendAttemptId: typeof sendAttemptId === 'string' ? sendAttemptId : undefined,
     sendOperationKey: typeof sendOperationKey === 'string' ? sendOperationKey : undefined,
     source: typeof source === 'string' ? source : 'mobile-native',
     statusAtSend: statusForSend,
-    queue: queue === true,
+    queue: queue === true || statusForSend === 'busy',
     model: typeof model === 'string' ? model : undefined,
     effort: typeof effort === 'string' ? effort : undefined,
     thinking: typeof thinking === 'string' ? thinking : undefined,
+    runtimeSnapshot: runtimeSnapshotForSend,
     claudeExactEmptyEvidence: exactEmptyEvidenceForSend,
     refreshClaudeExactEmptyEvidence,
-    presentationSnapshot,
+    presentationSnapshot: effectivePresentationSnapshot,
     ...(toolType === 'claude' ? { assertNotCancelled: assertSendNotCancelled } : {}),
   });
   return {
     ...(result || {}),
-    requestedStatusAtSend: requestedStatusForSend,
+    requestedStatusAtSend: requestedStatusAtClick,
     effectiveStatusAtSend: statusForSend,
+    recordWithoutReply: false,
+    restartPerformed,
+    restartSessionId: undefined,
   };
 }
 
@@ -412,7 +628,49 @@ export function sendAgentPromptScenario(
   return enqueueAgentSendScenario({
     tabId: args.tabId,
     handoffId: args.handoffId,
-    run: () => runAgentPromptScenario(args),
+    run: async () => {
+      let result: any = null;
+      let failure: any = null;
+      try {
+        result = await runAgentPromptScenario(args);
+      } catch (error: any) {
+        failure = error;
+        if (
+          args.recordWithoutReply === true
+          && args.coordinatedSendToken
+          && error?.historyContextResult?.accepted !== true
+        ) {
+          const cascade = cancelCoordinatedAgentSendFollowers(
+            args.tabId,
+            args.coordinatedSendToken,
+            'history-context-not-recorded',
+          );
+          failure.cancelledFollowerHandoffIds = cascade.handoffIds || [];
+          failure.cascadeRestoreOwnerToken = args.coordinatedSendToken;
+        }
+      }
+      let coordinatedSettlement: any = null;
+      if (args.coordinatedSendToken) {
+        coordinatedSettlement = await settleCoordinatedAgentSend({
+          tabId: args.tabId,
+          token: args.coordinatedSendToken,
+          runQueuedStop: () => stopAgentProcessScenario({
+            tabId: args.tabId,
+            toolType: args.toolType,
+            runtime: args.runtime,
+            reason: 'queued-stop-after-send',
+          }),
+        });
+      }
+      // The FIFO lane must not release the next intent until this exact
+      // coordinator token is settled; otherwise the follower starts while the
+      // previous token is still the Stop owner.
+      if (failure) {
+        failure.coordinatedSettlement = coordinatedSettlement;
+        throw failure;
+      }
+      return { ...(result || {}), coordinatedSettlement };
+    },
   });
 }
 
@@ -924,6 +1182,7 @@ async function ensureAgentReadyForSend({
   cwd,
   coordinatedSendToken,
   requestedStatusAtSend,
+  resumePausedGoal,
 }: {
   tabId: string;
   toolType: AgentHistoryTool;
@@ -932,6 +1191,7 @@ async function ensureAgentReadyForSend({
   cwd?: string;
   coordinatedSendToken?: number | null;
   requestedStatusAtSend?: AgentPtyStatus;
+  resumePausedGoal?: boolean;
 }) {
   const assertSendNotCancelled = () => {
     if (
@@ -950,6 +1210,7 @@ async function ensureAgentReadyForSend({
     return null;
   });
   assertSendNotCancelled();
+  const resolved = (status: AgentPtyStatus) => ({ status, presence });
   console.log('[AgentScenario:send] presence before tool=' + toolType
     + ' tab=' + String(tabId).slice(-12)
     + ' status=' + (presence?.status || 'unknown')
@@ -960,7 +1221,7 @@ async function ensureAgentReadyForSend({
   if (presence?.status === 'stopping') {
     throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
   }
-  if (presence?.status === 'busy') return 'busy';
+  if (presence?.status === 'busy') return resolved('busy');
   if (isReadyComposer()) {
     await waitStartupDefaultsIfNeeded();
     presence = await runtime.getPresence(tabId).catch(() => null);
@@ -968,15 +1229,15 @@ async function ensureAgentReadyForSend({
     if (presence?.status === 'stopping') {
       throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
     }
-    if (presence?.status === 'busy') return 'busy';
-    if (isReadyComposer()) return 'active';
+    if (presence?.status === 'busy') return resolved('busy');
+    if (isReadyComposer()) return resolved('active');
   }
   if (presence?.status === 'active' && !presence?.inputReady && sessionId && runtime.inspectDraft) {
     const draftState = runtime.inspectDraft(tabId);
     if (draftState?.source === 'no-terminal' && !terminalRegistry.get(tabId)) {
       console.log('[AgentScenario:send] renderer terminal not mounted; continue with PTY/audit path tool='
         + toolType + ' tab=' + String(tabId).slice(-12));
-      return 'active';
+      return resolved('active');
     }
   }
 
@@ -989,7 +1250,7 @@ async function ensureAgentReadyForSend({
     }
     console.log('[AgentScenario:send] ' + actionLabel + ' before send tool=' + toolType + ' tab=' + String(tabId).slice(-12));
     const resumeResult = hasSession
-      ? await runtime.resume({ tabId, sessionId, cwd })
+      ? await runtime.resume({ tabId, sessionId, cwd, resumePausedGoal })
       : await runtime.startFresh!({ tabId, cwd });
     if (resumeResult?.success === false) {
       throw new Error(resumeResult.error || runtime.label + ' ' + actionLabel + ' failed before send');
@@ -1033,23 +1294,36 @@ async function ensureAgentReadyForSend({
         // The first Claude prompt glyph is only a wake-up hint. Startup can
         // still own the composer with /model or /effort, so wait for the exact
         // launch gate and then re-read one coherent presence snapshot.
-        readyWait.cancel();
         await waitStartupDefaultsIfNeeded();
         presence = await runtime.getPresence(tabId).catch(() => null);
         assertSendNotCancelled();
         if (presence?.status === 'stopping') {
           throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
         }
-        if (presence?.status === 'busy') return 'busy';
-        if (isReadyComposer()) return 'active';
-        // The wait above cancelled this pass's listener. Re-arm before the
-        // next coherent presence check instead of awaiting a dead promise.
+        if (presence?.status === 'busy') return resolved('busy');
+        if (isReadyComposer()) return resolved('active');
+        if (remainingMs <= 0) {
+          throw new Error(runtime.label + ' session is not ready for send');
+        }
+        // Startup defaults may finish before the lifecycle publishes the next
+        // complete composer frame. Keep this pass's already-armed listener and
+        // sleep on that event; an immediate `continue` here spins thousands of
+        // presence reads while Claude is legitimately still starting.
+        if (cancellationWait) {
+          const outcome = await Promise.race([
+            readyWait.promise.then(() => 'ready'),
+            cancellationWait.promise.then(() => 'cancelled'),
+          ]);
+          if (outcome === 'cancelled') assertSendNotCancelled();
+        } else {
+          await readyWait.promise;
+        }
         continue;
       }
       if (presence?.status === 'stopping') {
         throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
       }
-      if (presence?.status === 'busy') return 'busy';
+      if (presence?.status === 'busy') return resolved('busy');
       if (isReadyComposer()) {
         readyWait.cancel();
         await waitStartupDefaultsIfNeeded();
@@ -1058,8 +1332,8 @@ async function ensureAgentReadyForSend({
         if (presence?.status === 'stopping') {
           throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
         }
-        if (presence?.status === 'busy') return 'busy';
-        if (isReadyComposer()) return 'active';
+        if (presence?.status === 'busy') return resolved('busy');
+        if (isReadyComposer()) return resolved('active');
       }
       if (remainingMs <= 0) {
         throw new Error(runtime.label + ' session is not ready for send');

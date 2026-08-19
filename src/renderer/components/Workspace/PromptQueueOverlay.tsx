@@ -51,6 +51,7 @@ import {
 } from '../../utils/composerClipboard.mjs';
 import { electronComposerClipboardAdapter } from '../../utils/electronComposerClipboardAdapter';
 import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlacement.mjs';
+import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
 import { shouldDisarmAfterTriggerClear } from '../../utils/runAfterTriggerClear.mjs';
 import {
   combineFirstDelayParts,
@@ -149,6 +150,17 @@ const COLLAPSED_RAIL_FULL_WIDTH = 66;
 const COLLAPSED_RAIL_COMPACT_WIDTH = 32;
 // Rail row sits flush on top of the Run after panel — no gap between them.
 const COLLAPSED_RAIL_GAP = 0;
+// Блоки, открытые ИЗ панели: они лежат прямо в body (иначе их обрезала бы
+// панель со своим `overflow: hidden`), поэтому находятся по метке, а не по
+// вложенности. Полоска кнопок добавляется отдельно — у неё есть свой ref.
+const HOVER_CLUSTER_SELECTOR = [
+  '[data-run-after-picker-menu]',
+  '[data-prompt-queue-chip-menu]',
+  '[data-prompt-queue-meta-actions]',
+].join(', ');
+// Допуск по краю: субпиксельные координаты панели и округление позиции курсора
+// иначе дают «курсор снаружи» на самой границе.
+const HOVER_CLUSTER_PAD = 2;
 const PANEL_SLIDE_MS = 100;
 
 // Which screen edge the overlay is docked to. The panel is pinned by this edge
@@ -617,8 +629,8 @@ export function PromptQueueOverlay({
   const [panelClosing, setPanelClosing] = useState(false);
   const collapseTimerRef = useRef<number | null>(null);
   const openingTimerRef = useRef<number | null>(null);
-  const queueHoverCloseTimerRef = useRef<number | null>(null);
   const queueCountButtonRef = useRef<HTMLButtonElement>(null);
+  const railRef = useRef<HTMLDivElement>(null);
   const prevHintRef = useRef(false);
   useEffect(() => {
     if (firstChipArmedHint && !prevHintRef.current) {
@@ -2312,62 +2324,48 @@ export function PromptQueueOverlay({
     }, PANEL_SLIDE_MS);
   }, [commitEditor, tabId, setPanelCollapsed]);
 
-  const cancelQueueHoverPreviewClose = useCallback(() => {
-    if (queueHoverCloseTimerRef.current === null) return;
-    window.clearTimeout(queueHoverCloseTimerRef.current);
-    queueHoverCloseTimerRef.current = null;
-  }, []);
-
   const openQueueHoverPreview = useCallback(() => {
-    cancelQueueHoverPreviewClose();
     if (!collapsed || panelClosing || items.length === 0) return;
     setQueueHoverPreviewOpen(true);
-  }, [cancelQueueHoverPreviewClose, collapsed, items.length, panelClosing]);
-
-  const scheduleQueueHoverPreviewClose = useCallback(() => {
-    cancelQueueHoverPreviewClose();
-    queueHoverCloseTimerRef.current = window.setTimeout(() => {
-      queueHoverCloseTimerRef.current = null;
-      // A trigger picker or chip menu is a child interaction even though it is
-      // portalled to body. Closing the preview under it would make a click on
-      // the selected target also unmount the owning queue row.
-      if (dragIdRef.current
-        || document.querySelector('[data-run-after-picker-menu], [data-prompt-queue-chip-menu]')) return;
-      setQueueHoverPreviewOpen(false);
-    }, 140);
-  }, [cancelQueueHoverPreviewClose]);
+  }, [collapsed, items.length, panelClosing]);
 
   useEffect(() => {
     if (collapsed && items.length > 0) return;
-    cancelQueueHoverPreviewClose();
     setQueueHoverPreviewOpen(false);
-  }, [cancelQueueHoverPreviewClose, collapsed, items.length]);
+  }, [collapsed, items.length]);
 
+  // Окно живёт, пока курсор внутри своего целого: полоска кнопок, сама панель
+  // и всё, что открыто ИЗ неё (список вкладок, меню сообщения, меню действий),
+  // плюс зазоры между панелью и этими блоками. Зазор — визуальная деталь; для
+  // курсора он должен быть продолжением панели, иначе окно исчезает ровно
+  // посреди движения к списку, который сам же и открыло.
+  //
+  // Читаются живые прямоугольники: список вкладок раскрывается влево или
+  // вправо, вверх или вниз в зависимости от места у края экрана, и любой
+  // заранее записанный «список сторон» разошёлся бы с тем, что на экране.
   useEffect(() => {
     if (!queueHoverPreviewOpen) return;
     const onMouseMove = (event: MouseEvent) => {
-      const target = event.target as Node | null;
-      if (!target) return;
       if (dragIdRef.current) return;
-      if (queueHoverPreviewPanelRef.current?.contains(target)) return;
-      if (queueCountButtonRef.current?.contains(target)) return;
-      const element = target instanceof Element ? target : null;
-      if (element?.closest('[data-run-after-picker-menu], [data-prompt-queue-chip-menu]')) return;
-      const countRect = queueCountButtonRef.current?.getBoundingClientRect();
-      const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect();
-      if (countRect && previewRect
-        && event.clientX >= previewRect.left - 2
-        && event.clientX <= previewRect.right + 2
-        && event.clientY >= countRect.bottom - 2
-        && event.clientY <= previewRect.top + 2) {
-        return;
-      }
-      cancelQueueHoverPreviewClose();
+      const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect() ?? null;
+      if (!previewRect) return;
+      const satellites: (DOMRect | null)[] = [
+        railRef.current?.getBoundingClientRect() ?? null,
+        ...Array.from(document.querySelectorAll<HTMLElement>(HOVER_CLUSTER_SELECTOR))
+          .map((el) => el.getBoundingClientRect()),
+      ];
+      if (pointInHoverCluster({
+        hub: previewRect,
+        satellites,
+        x: event.clientX,
+        y: event.clientY,
+        pad: HOVER_CLUSTER_PAD,
+      })) return;
       setQueueHoverPreviewOpen(false);
     };
     window.addEventListener('mousemove', onMouseMove);
     return () => window.removeEventListener('mousemove', onMouseMove);
-  }, [cancelQueueHoverPreviewClose, queueHoverPreviewOpen]);
+  }, [queueHoverPreviewOpen]);
 
   useEffect(() => {
     return () => {
@@ -2378,10 +2376,6 @@ export function PromptQueueOverlay({
       if (openingTimerRef.current !== null) {
         window.clearTimeout(openingTimerRef.current);
         openingTimerRef.current = null;
-      }
-      if (queueHoverCloseTimerRef.current !== null) {
-        window.clearTimeout(queueHoverCloseTimerRef.current);
-        queueHoverCloseTimerRef.current = null;
       }
     };
   }, []);
@@ -2510,8 +2504,6 @@ export function PromptQueueOverlay({
             ref={queueHoverPreviewVisible ? queueHoverPreviewPanelRef : undefined}
             className={panelClosing ? 'pq-panel-closing' : (panelOpening ? 'pq-panel-opening' : undefined)}
             data-prompt-queue-hover-preview={queueHoverPreviewVisible ? 'true' : undefined}
-            onMouseEnter={queueHoverPreviewVisible ? cancelQueueHoverPreviewClose : undefined}
-            onMouseLeave={queueHoverPreviewVisible ? scheduleQueueHoverPreviewClose : undefined}
             style={{
               position: 'relative',
               width: effectiveWidth,
@@ -3331,6 +3323,7 @@ export function PromptQueueOverlay({
           </div>
         )}
         <div
+          ref={railRef}
           className="pq-collapsed-rail"
           style={{
             // Horizontal row of square buttons ABOVE the panel (order:-1 in
@@ -3401,7 +3394,6 @@ export function PromptQueueOverlay({
             }}
             onMouseLeave={() => {
               setRailRunHover(false);
-              scheduleQueueHoverPreviewClose();
             }}
             title={(autoRun ? 'Run after on' : 'Run after off') + ' · ' + activeItemCount + ' queued'}
             aria-label={(autoRun ? 'Run after on' : 'Run after off') + ', ' + activeItemCount + ' queued'}

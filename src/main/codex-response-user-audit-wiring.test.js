@@ -42,7 +42,7 @@ test('delivery proof keeps raw provider identity while presentation uses one nor
     main.indexOf('function processCodexSourceAuditOnlyText'),
   );
   assert.match(audit, /preserveProviderImageMarkup: true/);
-  assert.match(audit, /const presentationText = codexUserMessageAuditText\(record\) \?\? actualText/);
+  assert.match(audit, /const presentationText = codexUserMessagePresentationText\(record\) \|\| actualText/);
   assert.match(audit, /actualText: presentationText,[\s\S]{0,80}actualHash: presentationHash/);
 });
 
@@ -76,7 +76,11 @@ test('active writer chooses one preferred carrier before per-line audit', () => 
   assert.match(turnText, /selectCodexPreferredUserMessageAuditRecords\(carriers\.records\)/);
   assert.match(turnText, /state\.preferredUserAuditOffsets = new Set/);
   assert.match(turnLine, /preferredResponseUserCarrier[\s\S]*?processCodexUserMessagePasteAudit/);
-  assert.match(turnLine, /responseUserRecord && !preferredResponseUserCarrier/);
+  assert.match(
+    turnLine,
+    /projectCodexLiveMessageForPublication\(state, record, liveMessage,[\s\S]*?publishResponseCarrier: !responseUserRecord \|\| preferredResponseUserCarrier/,
+  );
+  assert.doesNotMatch(turnLine, /responseUserRecord && !preferredResponseUserCarrier\)\s*\?\s*null/);
   assert.match(main, /payload\.type === 'message' && payload\.role === 'user'[\s\S]*?codexLiveSourceIdentity\(state, record, 'codex-user'\)/);
 });
 

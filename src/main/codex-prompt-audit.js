@@ -136,6 +136,15 @@ function isCodexEnvironmentContextUserText(text) {
   return /^<environment_context>[\s\S]*<\/environment_context>$/.test(value);
 }
 
+// Codex persists automatically attached project instructions as role=user.
+// They are useful model context and stay visible in History as a chip, but a
+// clean conversation export must not pretend the user authored them.
+function isCodexProjectInstructionsUserText(text) {
+  const value = String(text || '').trim();
+  return /^#\s+(?:AGENTS\.md|CLAUDE\.md)\s+instructions\s+for\s+[^\r\n]+(?:\r?\n|$)/i.test(value)
+    && /<(?:INSTRUCTIONS|instructions)>/i.test(value.slice(0, 2000));
+}
+
 function codexUserMessageAuditText(record, {
   preserveProviderImageMarkup = false,
 } = {}) {
@@ -154,6 +163,7 @@ function codexUserMessageAuditText(record, {
   }
   if (!Array.isArray(payload.content)) return null;
   const parts = [];
+  let imageIndex = 0;
   for (const item of payload.content) {
     if (typeof item === 'string') {
       parts.push(item);
@@ -167,7 +177,8 @@ function codexUserMessageAuditText(record, {
     ) {
       // response_item can be the only durable carrier for an image prompt.
       // Preserve the exact content order without retaining its huge data URL.
-      parts.push(' [Image] ');
+      imageIndex += 1;
+      parts.push(` [Image #${imageIndex}] `);
     } else if (typeof item?.text === 'string') {
       parts.push(item.text);
     } else if (typeof item?.value === 'string') {
@@ -181,6 +192,20 @@ function codexUserMessageAuditText(record, {
   return preserveProviderImageMarkup
     ? joined
     : normalizeCodexProviderImageMarkup(joined, imagePaths);
+}
+
+// A persisted Codex user carrier can contain provider-owned image transport
+// markup even when this particular protocol generation omitted local_images.
+// Audit keeps that ambiguity byte-exact; every user-facing projection uses
+// this explicit presentation contract and collapses the transport envelope to
+// the single numbered image marker stored at the prompt position.
+function codexUserMessagePresentationText(record) {
+  const raw = codexUserMessageAuditText(record) || '';
+  return normalizeCodexProviderImageMarkup(
+    raw,
+    collectCodexPayloadImagePaths(record?.payload || {}),
+    { allowProviderMarkup: true },
+  );
 }
 
 function codexUserCarrierTextsMatch(left, right) {
@@ -455,6 +480,7 @@ function consumeCodexUserMessageAuditChunk({
 
 module.exports = {
   codexUserMessageAuditText,
+  codexUserMessagePresentationText,
   codexUserCarrierTextsMatch,
   codexAuditRecordIsAfterBoundary,
   codexCanonicalUserMessageMatch,
@@ -462,6 +488,7 @@ module.exports = {
   collectCodexPayloadImagePaths,
   consumeCodexUserMessageAuditChunk,
   isCodexEnvironmentContextUserText,
+  isCodexProjectInstructionsUserText,
   isCodexUserMessageAuditRecord,
   normalizeCodexProviderImageMarkup,
   normalizeCodexPromptImageSlots,

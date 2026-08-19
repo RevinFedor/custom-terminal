@@ -166,6 +166,36 @@ function classifyClaudeStartupDeliveryProof({
   if (base.success === true || base.outcome === PROOF.FOUND) {
     return { ...base, outcome: PROOF.FOUND };
   }
+  const startupPromptProof = sendResult?.startupPromptProof || null;
+  const stableRepasteIdentity = sendResult?.submitted === false
+    && sendResult?.pasteWritten === true
+    && sendResult?.reason === 'claude-startup-command-not-proven-at-enter'
+    && composer?.success === true
+    && composer?.empty === true
+    && composer?.terminalIdentityStable === true
+    && composer?.startupGenerationStable === true
+    && startupPromptProof
+    && Number.isFinite(Number(startupPromptProof.terminalRunSeq))
+    && Number(composer.terminalRunSeq) === Number(startupPromptProof.terminalRunSeq)
+    && startupPromptProof.terminalLifecycleGeneration
+    && composer.terminalLifecycleGeneration
+      === startupPromptProof.terminalLifecycleGeneration
+    && startupPromptProof.mirrorGeneration
+    && composer.mirrorGeneration === startupPromptProof.mirrorGeneration
+    && Number.isFinite(Number(startupPromptProof.inputRevision))
+    && Number(composer.inputRevision) === Number(startupPromptProof.inputRevision) + 1;
+  if (stableRepasteIdentity) {
+    return {
+      ...base,
+      success: false,
+      outcome: PROOF.ABSENT,
+      reason: 'exact-empty-after-paste-before-enter',
+      scanReason: base.reason || null,
+      recovery: { kind: 'repaste-after-empty' },
+      composerProof: 'empty',
+      submitProof: 'not-written',
+    };
+  }
   if (
     sendResult?.submitted === false
     && composer?.success === true
@@ -194,6 +224,38 @@ function classifyClaudeStartupDeliveryProof({
       : (sendResult?.submitted === true ? 'written' : 'unknown'),
     composerError: composer?.error || null,
   };
+}
+
+function classifyClaudeStartupRetryComposer({
+  recovery = null,
+  command = '',
+  composer = null,
+} = {}) {
+  const expected = String(command || '').trim();
+  const actual = String(composer?.text || '').trim();
+  const exactTransactionCommand = recovery?.kind === 'repaste-after-empty'
+    && composer?.proofOutcome === 'found'
+    && composer?.hasDraft === true
+    && (
+      String(composer?.source || '').startsWith('headless-main:')
+      || composer?.exactCapture === true
+    )
+    && parseSettingCommand(expected) !== null
+    && actual === expected;
+
+  return exactTransactionCommand
+    ? {
+      ownership: 'transaction-command',
+      action: 'submit-existing-input',
+      reason: 'exact-retry-command-restored-before-repaste',
+    }
+    : {
+      ownership: composer?.hasDraft === true ? 'user-or-unknown' : 'empty',
+      action: composer?.hasDraft === true ? 'preserve-native-draft' : 'repaste',
+      reason: composer?.hasDraft === true
+        ? 'not-exact-transaction-command'
+        : 'composer-empty',
+    };
 }
 
 // Main-process ownership adapter for the pure startup coordinator.
@@ -633,6 +695,7 @@ function createClaudeStartupMainRuntime({
 module.exports = {
   applyClaudeStartupIntent,
   classifyClaudeStartupDeliveryProof,
+  classifyClaudeStartupRetryComposer,
   createClaudeStartupMainRuntime,
   normalizeClaudeStartupIntent,
   parseSettingCommand,

@@ -6,8 +6,8 @@
 // with each surface.
 //
 // IMPORTANT: values are canonical. Claude saffron #DA7756 / Gemini #4E86F8 /
-// Codex #10A37F are the same brand tints used in ActionsPanel, InfoPanel and
-// ApiSettingsModal — do not fork per-surface variants.
+// Codex #10A37F are the same brand tints used in InfoPanel and the tab
+// surfaces — do not fork per-surface variants.
 
 export interface TabChromeColorEntry {
   color: string;

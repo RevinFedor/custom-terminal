@@ -78,7 +78,7 @@ Flow в `safePasteAndSubmit` опцией `stashFirst: true`:
 5. `drainPtyData(50)` — settle для tail re-renders
 6. `\r` — submit
 
-**Корнер-кейс:** если инпут пуст И в Claude уже есть stash, Ctrl+S **попнет** stash обратно в инпут (`handleStash` в PromptInput.tsx::1357 двунаправленный). Наша команда тогда дописывается к восстановленному тексту. На практике это происходит редко (только сразу после нашего же предыдущего slash-cmd, до того как user успел отправить что-то своё) и сабмит всё равно работает — slash-команда уйдёт как обычный prompt. Альтернатива — детект через PTY-buffer строки `Stashed (auto-restores after submit)` — добавляет 200-300ms; не стоит.
+**Корнер-кейс:** если инпут пуст И в Claude уже есть stash, Ctrl+S **попнет** stash обратно в инпут (`handleStash` в PromptInput.tsx::1357 двунаправленный). Поэтому startup retry не вызывает Ctrl+S вслепую. Если после exact-empty proof снова появился дословно тот же app-owned `/model`/`/effort`, он повторно проверяется и отправляется одним Enter как продолжение той же транзакции; только отличающийся реальный draft проходит native stash-flow. Иначе служебная команда сама попадёт в stash, восстановится позднее и History ошибочно покажет `Send stopped · draft moved`.
 
 ### Cmd+] History send preflight: draft переносится, отправка останавливается
 
@@ -285,6 +285,22 @@ PTY chunk/renderer-текст теперь только будит провер�
 
 **Принцип:** см. `methodology/переносимый-дизайн.md::Ink TUI: пробелы как ANSI-команды, текст разорван по чанкам`. Любой будущий парсер TUI-вывода для Claude должен матчить **минимальные уникальные подстроки** (одно слово или короткая фраза), не комбинацию из двух — Ink почти гарантированно разнесёт их по чанкам.
 
+### Onboarding `Quick safety check: Is this a project you created or one you trust?`
+
+На первом запуске Claude в новой директории этот экран появляется раньше
+обычного composer. Пункт `❯ 1. Yes, I trust this folder` для управляемой
+Noted Terminal вкладки подтверждается автоматически одним Enter.
+
+Символ `❯` у варианта меню не является prompt-ready. Уникальный заголовок
+`Quick safety check…` сразу блокирует raw glyph readiness, а действие разрешает
+только полный закрытый main/headless кадр с описанием безопасности, `Security
+guide`, обеими целыми опциями и выделенным `1. Yes`. Если выделен `2. No` или
+selection не доказан, приложение ничего не нажимает. Перед Enter повторно
+сверяются terminal, launch, run, lifecycle, mirror и input revision; после
+Enter следующий committed frame обязан показать исчезновение меню. One-shot
+привязан к launch/lifecycle generation, поэтому Ink re-render не создаёт второй
+Enter. Лишь затем startup `/model`/`/effort` получает stable composer lease.
+
 ### Onboarding `Make auto mode your default permission mode?`
 
 Claude может показать это меню до первого обычного composer. Для Noted
@@ -314,7 +330,8 @@ Resume/Fork launch generation несёт явный session intent: сначал
 `ready` того же поколения, доказавшего и `/model`, и `/effort`.
 
 ```
-Claude рисует prompt-символ ⏵ в PTY → main эмитит claude:tui-ready (~0.8с после старта)
+Claude сначала закрывает actionable onboarding/trust screen текущей generation
+→ рисует prompt-символ ⏵ в PTY → main эмитит claude:tui-ready (~0.8с после старта)
 → main открывает/присоединяет одну транзакцию по launch generation
 → main получает session settings из активной JSONL-ветки или SQLite defaults для fresh/пустых полей
 → транзакция ждёт устойчивый composer-frame того же generation: после последнего startup redraw наступила output-silence граница

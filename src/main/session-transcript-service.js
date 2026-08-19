@@ -7,6 +7,7 @@ const {
 } = require('./history-revision');
 const {
   decorateHistoryPromptPresentations,
+  recoverManagedHistoryImageRefs,
 } = require('./history-prompt-presentations');
 const {
   decorateHistoryResponseTimings,
@@ -27,6 +28,7 @@ const {
 } = require('./history-delta');
 const {
   isCodexEnvironmentContextUserText,
+  codexUserMessagePresentationText,
 } = require('./codex-prompt-audit');
 const { deriveCodexForkSnapshot } = require('./session-history-events');
 
@@ -108,7 +110,7 @@ function isClaudePendingThinkingRecord(record) {
 function codexRecordToMobileMessage(record, sessionId) {
   const payload = record?.payload || {};
   if (isCodexUserMessageRecord(record)) {
-    const text = payload.message || '';
+    const text = codexUserMessagePresentationText(record);
     if (isCodexEnvironmentContextUserText(text)) return null;
     return {
       type: 'user',
@@ -1191,6 +1193,13 @@ class SessionTranscriptService {
           }
         }
       }
+      // Durable Claude projection already removes the exact app-owned
+      // history-only boundary. The live stream must apply the same provider
+      // predicate before renderer fan-out; otherwise History briefly renders
+      // an empty assistant row until the next full refresh.
+      if (this.claudeData?._api?.isClaudeHistoryContextAck?.(record) === true) {
+        continue;
+      }
       const content = record?.message?.content;
       const hasToolResult = record?.type === 'user'
         && Array.isArray(content)
@@ -1208,6 +1217,15 @@ class SessionTranscriptService {
         && !isQueueOperation
         && !isQueuedCommand
       ) continue;
+      const liveImagePaths = isOrdinaryUser
+        ? recoverManagedHistoryImageRefs({
+            entry: {
+              content: this.claudeData?._api?.claudeUserRecordText?.(record) || '',
+            },
+            imagePaths: [],
+            resolveManagedImageRef: this.recoverManagedHistoryImageRef,
+          }).imagePaths
+        : [];
       if (isClaudePendingThinkingRecord(record)) {
         record.livePendingThinking = true;
       }
@@ -1239,6 +1257,7 @@ class SessionTranscriptService {
           recordByteOffset,
           recordEndByteOffset,
           message: record,
+          ...(liveImagePaths.length > 0 ? { imagePaths: liveImagePaths } : {}),
           ...(promptOwner ? { promptOwner } : {}),
         };
         if (this.onLiveMessage) {

@@ -44,11 +44,10 @@ test('normal Queue and Loop prompts share the desktop durable receipt contract',
   // появляющуюся, и сообщение остаётся UNCONFIRMED.
   assert.match(
     receipt,
-    /function isLocalSlashCommandPrompt\(rawPrompt\)[\s\S]*rawPrompt\.trimStart\(\)\.startsWith\('\/'\)/,
+    /function isLocalSlashCommandPrompt\(rawPrompt\)[\s\S]*normalized\.includes\('\\n'\)[\s\S]*\^\\\/\[\^\\s\/\]\+/,
     'slash commands remain outside generic user_message proof until their command receipt exists',
   );
-  assert.match(receipt, /&& !isLocalSlashCommandPrompt\(rawPrompt\)/);
+  assert.match(receipt, /isLocalSlashCommandPrompt\(rawPrompt\) && !hasStructuredPayload/);
   // И правило больше не сужено до automation-источников.
   assert.doesNotMatch(receipt, /DESKTOP_AUTOMATION_SEND_SOURCES\.has\(source\) && rawPrompt/);
 });
-

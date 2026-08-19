@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -44,10 +44,16 @@ import {
 } from '../../utils/historyAgentRuntimes';
 import type { HistoryDurableRevision } from '../../utils/historySnapshotCache';
 import { shouldClearRewindPreviewForOwnerTransition } from '../../utils/historyRewindPreviewOwner';
+import { copySessionFiltersFromState } from '../../utils/copySessionFilters';
+import { subscribeHistoryPromptHandoffs } from '../../utils/historyPromptHandoffs';
 import {
+  mergeTimelineEntriesWithSentHandoffs,
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
+  projectTimelineSentHandoffs,
   readPresentedHistorySurface,
+  retainUnmaterializedTimelineSentHandoffs,
+  upsertTimelineSentHandoffEntries,
 } from '../../utils/timelineTranscriptRefresh.mjs';
 import {
   buildTimelineCornerBadges,
@@ -169,7 +175,7 @@ const DOCS_TIMELINE_COLORS = {
 } as const;
 
 type TimelineCornerBadgeItem = {
-  kind: 'count' | 'loop' | 'docs-edit' | 'docs-search';
+  kind: 'count' | 'loop' | 'docs-edit' | 'docs-search' | 'agents';
   slot: 'top-right' | 'middle-right' | 'bottom-right' | 'middle-inner';
   text?: string;
   tone?: 'compact' | 'group' | null;
@@ -180,7 +186,9 @@ const TimelineCornerBadges: React.FC<{
   isExpandedLayout: boolean;
   timelineFontSize: number;
   groupAccent: string;
-}> = ({ items, isExpandedLayout, timelineFontSize, groupAccent }) => {
+  onAgentsClick?: () => void;
+  agentsTitle?: string;
+}> = ({ items, isExpandedLayout, timelineFontSize, groupAccent, onAgentsClick, agentsTitle }) => {
   const rightColumnCount = items.filter(item => item.slot.endsWith('right')).length;
   const dense = !isExpandedLayout && rightColumnCount >= 3;
 
@@ -222,6 +230,36 @@ const TimelineCornerBadges: React.FC<{
           >
             {badge.text}
           </span>
+        );
+      }
+
+      if (badge.kind === 'agents') {
+        return (
+          <button
+            key={`${badge.kind}:${badge.slot}`}
+            type="button"
+            aria-label={agentsTitle || `${badge.text || 1} agents`}
+            title={agentsTitle || `${badge.text || 1} agents`}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onAgentsClick?.();
+            }}
+            style={{
+              ...positionStyle,
+              display: 'inline-flex', alignItems: 'center', gap: 1,
+              padding: 0, border: 'none', background: 'transparent',
+              color: '#818cf8', cursor: 'pointer', lineHeight: 1,
+              pointerEvents: 'auto',
+            }}
+          >
+            <Bot size={isExpandedLayout ? 9 : 7} strokeWidth={2.2} />
+            {Number(badge.text) > 1 && (
+              <span style={{ fontSize: isExpandedLayout ? 8 : 7, fontFamily: 'monospace' }}>
+                {badge.text}
+              </span>
+            )}
+          </button>
         );
       }
 
@@ -314,6 +352,7 @@ interface TimelineEntry {
   isSubAgentTimeout?: boolean;
   subAgentName?: string;
   subAgentTaskId?: string;
+  subAgents?: Array<{ key: string; label: string }>;
   docsEdited?: string[];
   docsSearchQueries?: string[];
   semanticTags?: Array<{
@@ -334,6 +373,10 @@ interface TimelineEntry {
   responseModel?: string;          // last assistant.message.model for this turn (e.g. 'deepseek-v4-flash', 'claude-opus-4-7')
   responseHasThinking?: boolean;   // any assistant content block of type 'thinking' in this turn
   sourceLine?: number;
+  sourceIdentity?: string;
+  sourceIdentityAliases?: string[];
+  handoffId?: string;
+  isSentHandoffProjection?: boolean;
   // Codex-only per-turn API usage from last_token_usage (honest per-entry, see codex-data.js).
   // Input split = uncached + cache-read (Codex has no cache_creation); output split = answer + reasoning.
   codexUsage?: {
@@ -443,7 +486,7 @@ function selectAutoTabTitlePrompt(
   codexSessionMeta: CodexTimelineSessionMeta | null
 ): TimelineEntry | undefined {
   if (pending.mode !== 'fork') {
-    return entries.find(isEligibleTabTitleEntry);
+    return entries.find((entry) => !entry.isSentHandoffProjection && isEligibleTabTitleEntry(entry));
   }
 
   if (toolType === 'claude') {
@@ -451,7 +494,7 @@ function selectAutoTabTitlePrompt(
     const boundaryIndex = forkMarkerLastSnapIndex.length > 0
       ? Math.max(...forkMarkerLastSnapIndex)
       : -1;
-    return entries.find((entry, index) => index > boundaryIndex && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry));
+    return entries.find((entry, index) => index > boundaryIndex && !entry.isSentHandoffProjection && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry));
   }
 
   const forkedFromId = codexSessionMeta?.forked_from_id;
@@ -466,6 +509,7 @@ function selectAutoTabTitlePrompt(
     return entries.find((entry) => {
       return typeof entry.sourceLine === 'number'
         && entry.sourceLine > forkLiveStartLine
+        && !entry.isSentHandoffProjection
         && !getOrchestrationTag(entry)
         && isEligibleTabTitleEntry(entry);
     });
@@ -477,6 +521,7 @@ function selectAutoTabTitlePrompt(
   return entries.find((entry) => {
     const entryAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
     return Number.isFinite(entryAt) && entryAt >= startedAt + 1000
+      && !entry.isSentHandoffProjection
       && !getOrchestrationTag(entry)
       && isEligibleTabTitleEntry(entry);
   });
@@ -768,6 +813,7 @@ interface TimelineRowApi {
   handleEntryClick: (entry: TimelineEntry, e?: React.MouseEvent) => void;
   handleEntryDoubleClick: (entry: TimelineEntry) => void;
   handleRightClick: (e: React.MouseEvent, entry: TimelineEntry) => void;
+  openEntryAgents: (entry: TimelineEntry) => void;
   handleNoteStripEnter: (index: number) => void;
   handleNoteStripLeave: (e: React.MouseEvent) => void;
   flashStripFailed: (index: number, kind: 'fork' | 'plan' | 'boundary' | 'compact-strip') => void;
@@ -903,6 +949,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
     isLoop: isLoopPrompt,
     docsEditedCount: markerEdited.length,
     docsSearchCount: markerSearched.length,
+    subagentCount: entry.subAgents?.length || 0,
     collapsedGroupSize: isGroupCollapsed ? groupInfo?.groupSize || 0 : 0,
     compactClusterSize: displaysAsCompact && !treeMode ? compactClusterCount : 0,
   });
@@ -1118,6 +1165,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
           isExpandedLayout={isExpandedLayout}
           timelineFontSize={timelineFontSize}
           groupAccent={groupAccent}
+          onAgentsClick={() => api.openEntryAgents(entry)}
+          agentsTitle={(entry.subAgents || []).map((agent) => agent.label).join(', ')}
         />
 
         {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
@@ -1384,10 +1433,25 @@ function Timeline({
     ownerKey: timelineOwnerKey,
     entries: [],
   });
+  const [sentHandoffSnapshot, setSentHandoffSnapshot] = useState<{
+    ownerKey: string;
+    entries: TimelineEntry[];
+  }>({
+    ownerKey: timelineOwnerKey,
+    entries: [],
+  });
   // A prop switch immediately makes the previous array invisible. This is the
   // ownership boundary that prevents new session IDs from being paired with
   // stale prompts while the next async JSONL read is still in flight.
-  const entries = entriesSnapshot.ownerKey === timelineOwnerKey ? entriesSnapshot.entries : [];
+  const durableEntries = entriesSnapshot.ownerKey === timelineOwnerKey
+    ? entriesSnapshot.entries
+    : [];
+  const sentHandoffEntries = sentHandoffSnapshot.ownerKey === timelineOwnerKey
+    ? sentHandoffSnapshot.entries
+    : [];
+  const entries = useMemo<TimelineEntry[]>(() => (
+    mergeTimelineEntriesWithSentHandoffs(durableEntries, sentHandoffEntries)
+  ), [durableEntries, sentHandoffEntries]);
   const [loadingOwnerKey, setLoadingOwnerKey] = useState<string | null>(
     sessionId ? timelineOwnerKey : null
   );
@@ -1704,7 +1768,8 @@ function Timeline({
     apiInputCacheRead?: number;
     categories: {
       user: number; claudeText: number; claudeThinking: number;
-      read: number; edit: number; bash: number; tools: number;
+      read: number; search: number; edit: number; run: number; git: number;
+      mcp: number; web: number; plan: number; other: number;
       subagentResult: number; subagentHistory: number; compact: number;
     };
   };
@@ -2236,16 +2301,19 @@ function Timeline({
   const copyIncludeEditing = useUIStore(state => state.copyIncludeEditing);
   const copyIncludeReading = useUIStore(state => state.copyIncludeReading);
   const copyIncludeUser = useUIStore(state => state.copyIncludeUser);
-  const copyIncludeClaude = useUIStore(state => state.copyIncludeClaude);
   const copyIncludeText = useUIStore(state => state.copyIncludeText);
   const copyIncludeThinking = useUIStore(state => state.copyIncludeThinking);
-  const copyIncludeBash = useUIStore(state => state.copyIncludeBash);
-  const copyIncludeTools = useUIStore(state => state.copyIncludeTools);
+  const copyIncludeActions = useUIStore(state => state.copyIncludeActions);
+  const copyIncludeSearch = useUIStore(state => state.copyIncludeSearch);
+  const copyIncludeRun = useUIStore(state => state.copyIncludeRun);
+  const copyIncludeGit = useUIStore(state => state.copyIncludeGit);
+  const copyIncludeMcp = useUIStore(state => state.copyIncludeMcp);
+  const copyIncludePlan = useUIStore(state => state.copyIncludePlan);
   const copyIncludeWebSearch = useUIStore(state => state.copyIncludeWebSearch);
-  const copyIncludeToolSearch = useUIStore(state => state.copyIncludeToolSearch);
   const copyIncludeOtherTools = useUIStore(state => state.copyIncludeOtherTools);
   const copyIncludeSubagentResult = useUIStore(state => state.copyIncludeSubagentResult);
   const copyIncludeSubagentHistory = useUIStore(state => state.copyIncludeSubagentHistory);
+  const copyFromStart = useUIStore(state => state.copyFromStart);
   const debugHoverBridges = useUIStore(state => state.debugHoverBridges);
   const freezeCmdPopups = useUIStore(state => state.freezeCmdPopups);
 
@@ -2293,21 +2361,24 @@ function Timeline({
   // All copy settings as a single object — spread into IPC invoke calls (range-copy, single-copy,
   // edit-range source fetch, rewind compact). Centralises forwarding so adding a future flag
   // doesn't require touching every callsite.
-  const copyFlags = {
-    includeEditing: copyIncludeEditing,
-    includeReading: copyIncludeReading,
-    includeUser: copyIncludeUser,
-    includeClaude: copyIncludeClaude,
-    includeText: copyIncludeText,
-    includeThinking: copyIncludeThinking,
-    includeBash: copyIncludeBash,
-    includeTools: copyIncludeTools,
-    includeWebSearch: copyIncludeWebSearch,
-    includeToolSearch: copyIncludeToolSearch,
-    includeOtherTools: copyIncludeOtherTools,
-    includeSubagentResult: copyIncludeSubagentResult,
-    includeSubagentHistory: copyIncludeSubagentHistory,
-  };
+  const copyFlags = copySessionFiltersFromState({
+    copyIncludeUser,
+    copyIncludeText,
+    copyIncludeThinking,
+    copyIncludeActions,
+    copyIncludeReading,
+    copyIncludeSearch,
+    copyIncludeEditing,
+    copyIncludeRun,
+    copyIncludeGit,
+    copyIncludeMcp,
+    copyIncludeWebSearch,
+    copyIncludePlan,
+    copyIncludeOtherTools,
+    copyIncludeSubagentResult,
+    copyIncludeSubagentHistory,
+    copyFromStart,
+  });
   const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
   const setHistoryPromptDraft = useUIStore(state => state.setHistoryPromptDraft);
   const setHistoryRewindPreview = useUIStore(state => state.setHistoryRewindPreview);
@@ -2489,7 +2560,7 @@ function Timeline({
   }, [entries]);
 
   const outlineEligibleUuids = useMemo(() => entries
-    .filter((entry) => entry.uuid && !entry.isSubAgent && !entry.isSubAgentTimeout && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry))
+    .filter((entry) => entry.uuid && !entry.isSentHandoffProjection && !entry.isSubAgent && !entry.isSubAgentTimeout && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry))
     .map((entry) => entry.uuid), [entries]);
 
   const semanticGroups = useMemo<TimelineSemanticGroup[]>(() => {
@@ -3020,6 +3091,68 @@ function Timeline({
   // SECTION: TIMELINE DATA LOAD — loadTimeline IPC, 2s poll, session-switch cleanup, _savedEditRangeMap save/restore
   // ════════════════════════════════════════════════════════════
 
+  // SENT is already an exact delivery fact even when a busy turn keeps the
+  // expensive transcript refresh deferred. Capture the same handoff proof
+  // History uses and keep one lightweight, canonically-addressed user point
+  // until the normal Timeline snapshot contains that identity.
+  useEffect(() => {
+    if (!sessionId || (toolType !== 'claude' && toolType !== 'codex')) return;
+    return subscribeHistoryPromptHandoffs(tabId, (snapshot, change) => {
+      const projected = projectTimelineSentHandoffs(
+        snapshot,
+        { toolType, sessionId },
+      ) as TimelineEntry[];
+      if (projected.length === 0) return;
+      setSentHandoffSnapshot((current) => {
+        const currentEntries = current.ownerKey === timelineOwnerKey ? current.entries : [];
+        const changed = projected.some((candidate) => {
+          const existing = currentEntries.find((entry) => entry.handoffId === candidate.handoffId);
+          return !existing
+            || existing.uuid !== candidate.uuid
+            || existing.sourceIdentity !== candidate.sourceIdentity;
+        });
+        if (!changed && current.ownerKey === timelineOwnerKey) return current;
+        const nextEntries = upsertTimelineSentHandoffEntries(
+          currentEntries,
+          projected,
+        ) as TimelineEntry[];
+        console.warn(
+          '[Timeline:SentHandoffPoint]'
+          + ' inst=' + timelineInstanceIdRef.current
+          + ' tab=' + tabId.slice(-8)
+          + ' session=' + sessionId.substring(0, 8)
+          + ' change=' + change.type
+          + ' added=' + projected.map((entry) => entry.uuid.slice(0, 12)).join(',')
+          + ' busy=' + (isTurnBusyRef.current ? '1' : '0'),
+        );
+        return { ownerKey: timelineOwnerKey, entries: nextEntries };
+      });
+    });
+  }, [sessionId, tabId, timelineOwnerKey, toolType]);
+
+  // Reconciliation is identity-only. The canonical row wins in the same
+  // render through `entries`; this effect then releases the bounded preview
+  // so large prompt text is not retained after the durable refresh.
+  useEffect(() => {
+    if (durableEntries.length === 0 || sentHandoffEntries.length === 0) return;
+    setSentHandoffSnapshot((current) => {
+      if (current.ownerKey !== timelineOwnerKey) return current;
+      const retained = retainUnmaterializedTimelineSentHandoffs(
+        durableEntries,
+        current.entries,
+      ) as TimelineEntry[];
+      if (retained.length === current.entries.length) return current;
+      console.warn(
+        '[Timeline:SentHandoffAdopt]'
+        + ' inst=' + timelineInstanceIdRef.current
+        + ' tab=' + tabId.slice(-8)
+        + ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none')
+        + ' adopted=' + (current.entries.length - retained.length),
+      );
+      return { ownerKey: timelineOwnerKey, entries: retained };
+    });
+  }, [durableEntries, sentHandoffEntries.length, sessionId, tabId, timelineOwnerKey]);
+
   useLayoutEffect(() => {
     // Invalidate every older request before the browser can paint the new tab.
     // The next load owns a fresh generation and may commit only to this key.
@@ -3036,6 +3169,10 @@ function Timeline({
     setLoadingOwnerKey(sessionId ? timelineOwnerKey : null);
     setHydratedTimelineOwnerKey('');
     setEntriesSnapshot({
+      ownerKey: timelineOwnerKey,
+      entries: [],
+    });
+    setSentHandoffSnapshot({
       ownerKey: timelineOwnerKey,
       entries: [],
     });
@@ -3535,7 +3672,7 @@ function Timeline({
         tabId,
         toolType: summaryToolType,
         sessionId,
-        entries,
+        entries: entries.filter((entry) => !entry.isSentHandoffProjection),
       });
     };
     window.addEventListener('timeline-summary:refresh-tab', handler as EventListener);
@@ -3545,7 +3682,7 @@ function Timeline({
   useEffect(() => {
     if (!promptSummaryAutoEnabled || !summaryToolType || !sessionId) return;
     if (!promptSummaryLoadedSessionKeys.has(`${summaryToolType}:${sessionId}`)) return;
-    const eligibleEntries = entries.filter((entry) => entry.uuid && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry));
+    const eligibleEntries = entries.filter((entry) => entry.uuid && !entry.isSentHandoffProjection && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry));
     let cancelled = false;
     // Long sessions can contain hundreds of eligible prompts. Launching every
     // AI request in the same render creates a network/state-update storm; the
@@ -4581,7 +4718,7 @@ function Timeline({
       }));
       return;
     }
-    if (readOnly) {
+    if (readOnly && !selectionStartIdRef.current) {
       const index = entries.findIndex(e => e.uuid === entry.uuid);
       const targetUuid = getHistoryPanelTargetUuid(entry, index);
       if (e) e.stopPropagation();
@@ -4606,6 +4743,11 @@ function Timeline({
 
     // Если режим выделения активен — показываем меню выбора действия
     if (selectionStartIdRef.current) {
+      // Selection owns this click completely. In particular, the second point
+      // must never fall through to the normal Timeline/History navigation
+      // path while the range action menu is being opened.
+      e?.preventDefault();
+      e?.stopPropagation();
       if (selectionStartIdRef.current === entry.uuid) {
         // Клик по той же точке → отменить выделение
         selectionStartIdRef.current = null;
@@ -4650,8 +4792,6 @@ function Timeline({
 
         // Prevent handleClickOutside from immediately clearing the menu
         justSetRangeMenuRef.current = true;
-        if (e) e.stopPropagation();
-
         // Mutually exclusive with the single-point menu — same anchor, same
         // screen position, and this one renders on the higher layer.
         setContextMenu(null);
@@ -6405,8 +6545,8 @@ function Timeline({
   };
 
   const handleRefreshTimelineAction = async (entry: TimelineEntry) => {
-    if (!summaryToolType || !sessionId || getOrchestrationTag(entry) || !isEligibleTabTitleEntry(entry) || refreshingActionUuid) return;
-    const eligibleEntries = entries.filter((candidate) => candidate.uuid && isEligibleTabTitleEntry(candidate));
+    if (!summaryToolType || !sessionId || entry.isSentHandoffProjection || getOrchestrationTag(entry) || !isEligibleTabTitleEntry(entry) || refreshingActionUuid) return;
+    const eligibleEntries = entries.filter((candidate) => candidate.uuid && !candidate.isSentHandoffProjection && isEligibleTabTitleEntry(candidate));
     const targetIndex = eligibleEntries.findIndex((candidate) => candidate.uuid === entry.uuid);
     if (targetIndex < 0) return;
     if (isTabAiBusy && targetIndex === eligibleEntries.length - 1) {
@@ -6677,6 +6817,23 @@ function Timeline({
   rowApi.handleEntryClick = handleEntryClick;
   rowApi.handleEntryDoubleClick = handleEntryDoubleClick;
   rowApi.handleRightClick = handleRightClick;
+  rowApi.openEntryAgents = (entry) => {
+    const agents = Array.isArray(entry.subAgents) ? entry.subAgents : [];
+    if (agents.length === 0) return;
+    const dispatch = () => window.dispatchEvent(new CustomEvent('history-panel:open-agent', {
+      detail: {
+        tabId,
+        entryUuid: entry.uuid,
+        ...(agents.length === 1 ? { agentKey: agents[0].key } : {}),
+      },
+    }));
+    if (!historyTargetVisible) {
+      setHistoryPanelOpen(tabId, true);
+      requestAnimationFrame(() => requestAnimationFrame(dispatch));
+    } else {
+      dispatch();
+    }
+  };
   rowApi.handleNoteStripEnter = handleNoteStripEnter;
   rowApi.handleNoteStripLeave = handleNoteStripLeave;
   rowApi.flashStripFailed = flashStripFailed;
@@ -7490,7 +7647,14 @@ function Timeline({
             // Collapsed semantic groups own a synthetic header, never a raw
             // prompt. Keep invisible raw refs so index/UUID addressing remains
             // canonical while no prompt masquerades as the group toggle.
-            if (isExpandedLayout && semanticGroup && !isSemanticGroupExpanded) {
+            if (isExpandedLayout
+              && semanticGroup
+              && !isSemanticGroupExpanded
+              // Compact/continued are structural Timeline points, not hidden
+              // work-group children. A trailing compact is assigned to the
+              // preceding semantic group for ownership/badges, but must stay
+              // independently visible and selectable when that group closes.
+              && !isAttributeEntry(entry)) {
               const hiddenEntry = <div key={`semantic-hidden:${entry.uuid}`} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
               return isSemanticGroupStart
                 ? <React.Fragment key={entry.uuid}>{renderSemanticGroupHeader(semanticGroup, false)}{hiddenEntry}</React.Fragment>
@@ -7541,7 +7705,7 @@ function Timeline({
               : undefined;
             const isEditingThis = activeNoteIndex === index && isNoteEditing;
             const summaryKey = summaryToolType && sessionId ? timelineSummaryKey(summaryToolType, sessionId, entry.uuid) : '';
-            const summaryEligible = !!summaryKey && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry);
+            const summaryEligible = !!summaryKey && !entry.isSentHandoffProjection && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry);
             const semanticActionMeta = semanticActionByUuid.get(entry.uuid);
 
             return (
@@ -8858,24 +9022,49 @@ function Timeline({
                       standalone continued (Context Overflow Recovery bridge text). */}
                   {(contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact' || contextMenu.entry.type === 'continued') && (
                     <>
-                      <button
-                        className="w-full text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 rounded transition-colors cursor-pointer flex items-center gap-2"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleCopySingleEntry(contextMenu.entry);
-                        }}
+                      <div
+                        className="w-full flex overflow-hidden rounded"
+                        data-testid="timeline-range-selection-split"
                       >
-                        <Copy size={12} />
-                        {contextMenu.entry.type === 'compact' || contextMenu.entry.isCompactSummary
-                          ? 'Копировать compact'
-                          : contextMenu.entry.type === 'continued'
-                            ? 'Копировать continued'
-                            : 'Копировать'}
-                      </button>
+                        <button
+                          type="button"
+                          data-testid="timeline-range-selection-start"
+                          className="text-left px-3 py-2 text-xs text-white hover:bg-blue-600/80 transition-colors cursor-pointer flex items-center"
+                          style={{ flex: '4 1 0%', minWidth: 0 }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startRangeSelection(contextMenu.entry);
+                          }}
+                        >
+                          Выбрать
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="timeline-copy-single-entry"
+                          className="py-2 text-white hover:bg-blue-600/80 transition-colors cursor-pointer flex items-center justify-center border-l border-white/10"
+                          style={{ flex: '1 1 0%', minWidth: '30px' }}
+                          aria-label={contextMenu.entry.type === 'compact' || contextMenu.entry.isCompactSummary
+                            ? 'Копировать compact'
+                            : contextMenu.entry.type === 'continued'
+                              ? 'Копировать continued'
+                              : 'Копировать запись'}
+                          title={contextMenu.entry.type === 'compact' || contextMenu.entry.isCompactSummary
+                            ? 'Копировать compact'
+                            : contextMenu.entry.type === 'continued'
+                              ? 'Копировать continued'
+                              : 'Копировать'}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleCopySingleEntry(contextMenu.entry);
+                          }}
+                        >
+                          <Copy size={12} />
+                        </button>
+                      </div>
                       <div className="border-t border-white/10 my-1" />
                     </>
                   )}
-                  {summaryToolType && contextMenu.entry.type === 'user' && !contextMenu.entry.isCompactSummary && isEligibleTabTitleEntry(contextMenu.entry) && (
+                  {summaryToolType && contextMenu.entry.type === 'user' && !contextMenu.entry.isSentHandoffProjection && !contextMenu.entry.isCompactSummary && isEligibleTabTitleEntry(contextMenu.entry) && (
                     <>
                       <button
                         className="w-full text-left px-3 py-2 text-xs text-sky-300 hover:bg-sky-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
@@ -9461,9 +9650,14 @@ function Timeline({
             { key: 'claudeText', label: 'Claude · answer', value: tokenEstimate.categories.claudeText },
             { key: 'claudeThinking', label: 'Claude · thinking', value: tokenEstimate.categories.claudeThinking },
             { key: 'read', label: 'Read', value: tokenEstimate.categories.read },
-            { key: 'edit', label: 'Edit · Write', value: tokenEstimate.categories.edit },
-            { key: 'bash', label: 'Bash · shell', value: tokenEstimate.categories.bash },
-            { key: 'tools', label: 'MCP · web · прочее', value: tokenEstimate.categories.tools },
+            { key: 'search', label: 'Search', value: tokenEstimate.categories.search },
+            { key: 'edit', label: 'Edit', value: tokenEstimate.categories.edit },
+            { key: 'run', label: 'Run · команды', value: tokenEstimate.categories.run },
+            { key: 'git', label: 'Git', value: tokenEstimate.categories.git },
+            { key: 'mcp', label: 'MCP', value: tokenEstimate.categories.mcp },
+            { key: 'web', label: 'Web', value: tokenEstimate.categories.web },
+            { key: 'plan', label: 'Plan', value: tokenEstimate.categories.plan },
+            { key: 'other', label: 'Прочее', value: tokenEstimate.categories.other },
             { key: 'subagentResult', label: 'Субагент · result', value: tokenEstimate.categories.subagentResult },
             { key: 'subagentHistory', label: 'Субагент · history', value: tokenEstimate.categories.subagentHistory },
             { key: 'compact', label: 'Compact summary', value: tokenEstimate.categories.compact },
@@ -9532,9 +9726,14 @@ function Timeline({
             { key: 'claudeText', label: 'Claude · answer', value: singleTokenEstimate.categories.claudeText },
             { key: 'claudeThinking', label: 'Claude · thinking', value: singleTokenEstimate.categories.claudeThinking },
             { key: 'read', label: 'Read', value: singleTokenEstimate.categories.read },
-            { key: 'edit', label: 'Edit · Write', value: singleTokenEstimate.categories.edit },
-            { key: 'bash', label: 'Bash · shell', value: singleTokenEstimate.categories.bash },
-            { key: 'tools', label: 'MCP · web · прочее', value: singleTokenEstimate.categories.tools },
+            { key: 'search', label: 'Search', value: singleTokenEstimate.categories.search },
+            { key: 'edit', label: 'Edit', value: singleTokenEstimate.categories.edit },
+            { key: 'run', label: 'Run · команды', value: singleTokenEstimate.categories.run },
+            { key: 'git', label: 'Git', value: singleTokenEstimate.categories.git },
+            { key: 'mcp', label: 'MCP', value: singleTokenEstimate.categories.mcp },
+            { key: 'web', label: 'Web', value: singleTokenEstimate.categories.web },
+            { key: 'plan', label: 'Plan', value: singleTokenEstimate.categories.plan },
+            { key: 'other', label: 'Прочее', value: singleTokenEstimate.categories.other },
             { key: 'subagentResult', label: 'Субагент · result', value: singleTokenEstimate.categories.subagentResult },
             { key: 'subagentHistory', label: 'Субагент · history', value: singleTokenEstimate.categories.subagentHistory },
             { key: 'compact', label: 'Compact summary', value: singleTokenEstimate.categories.compact },

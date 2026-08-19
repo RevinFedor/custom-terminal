@@ -245,6 +245,14 @@ export default function PaneTabChip({
         // special project-following path anymore.
         e.stopPropagation();
         if (renaming) return;
+        // ⌘-клик по чипу — «выбрать это окно, не съезжая из чужого проекта».
+        // Тот же жест, что ⌘-клик по телу окна: двигается только рамка фокуса.
+        // Человек, стоящий в другом проекте, называет окно-цель и возвращается
+        // к своему списку, где вкладка так и осталась под рукой.
+        if (e.metaKey && paneIndex !== null && paneIndex !== undefined) {
+          useWorkspaceStore.getState().focusSplitPane(paneIndex, { keepSidebar: true });
+          return;
+        }
         useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
       }}
       onDoubleClick={(e) => {

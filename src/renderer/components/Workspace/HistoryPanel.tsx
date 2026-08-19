@@ -17,7 +17,6 @@ import {
   type HistoryRewindPreview,
 } from '../../store/useUIStore';
 import {
-  FAMILY_LABELS as HISTORY_GROUP_FAMILY_LABEL,
   historyActionHeadline,
   historyActionPresentationMeta,
   historyDisplayPath,
@@ -41,7 +40,7 @@ import {
   type AgentPtyStatus,
   type AgentQuestion,
 } from '../../utils/historyAgentRuntimes';
-import { sendAgentPromptScenario, stopAgentProcessScenario } from '../../utils/agentScenarios';
+import { sendAgentPromptScenario } from '../../utils/agentScenarios';
 import {
   buildExactDraftCaptureProof,
   classifyAgentDraftPreflight,
@@ -54,7 +53,6 @@ import {
   bindCoordinatedAgentSendHandoff,
   getCoordinatedAgentAction,
   requestCoordinatedStopAfterSend,
-  settleCoordinatedAgentSend,
   subscribeCoordinatedAgentActions,
 } from '../../utils/agentActionCoordinator.mjs';
 import { isHistoryTaskBackgroundLive } from '../../utils/historyBackgroundLiveness.mjs';
@@ -148,6 +146,7 @@ import {
 import {
   interruptedPromptDraftMatchesHandoff,
   mergeFailedHistoryAuthoringSnapshot,
+  mergeFailedHistoryAuthoringSnapshots,
   resolveInterruptedPromptOwnership,
 } from '../../utils/historyDraftOwnership.mjs';
 import {
@@ -185,7 +184,6 @@ import {
   buildHistoryDisplayUnitsAppended,
   buildHistoryDisplayUnitsCached,
   findHistoryHydrationStub,
-  groupFamilyBreakdown,
   historyDisplayUnitUuid,
   isGroupUnit,
   peekHistoryDisplayUnitsCached,
@@ -201,6 +199,7 @@ import {
 } from '../../utils/historyTailSpacer.mjs';
 import {
   acceptHistoryPromptHandoffProviderQueue,
+  adoptHistoryPromptHandoffCanonicalEntry,
   advanceHistoryPromptHandoffTransportPhase,
   beginHistoryPromptHandoff,
   bindHistoryPromptHandoffSendIdentity,
@@ -224,6 +223,10 @@ import {
   type HistoryPromptHandoffStatus,
 } from '../../utils/historyPromptHandoffs';
 import {
+  isStandaloneCodexLocalSlashCommand,
+  projectCodexLocalSlashSendResult,
+} from '../../utils/codexLocalSlashCommand.mjs';
+import {
   historyEntryHasExactIdentity,
   matchesHistoryPromptAdoption,
   matchesHistoryPromptSuppression,
@@ -240,14 +243,16 @@ import {
   planCodexHistorySettingsProjection,
   resolveCodexEffectiveSettings,
 } from '../../utils/codexEffectiveSettings.mjs';
+import {
+  getCodexHistoryMutationSettingsProof,
+  getCodexLaunchOptions,
+} from '../../utils/codexLaunch';
 import type { AgentLifecycleSummary } from './TerminalArea';
 // Shared conversation blocks — same renderer as the SDK tab. The JSONL history
-// window now draws tool-calls / diff / thinking / markdown through this package
-// so its style matches the rest of the app. Subagents (Task) are intentionally
-// left on the legacy SubAgentBlock path ("субагентов пока не трогаем").
+// window draws tool-calls / diff / thinking / markdown through this package;
+// nested Task histories meet the same grammar in
+// HistoryTranscriptPresentation rather than maintaining inline mini-cards.
 import {
-  ColoredToolIcon,
-  BrainIcon as CBBrainIcon,
   ConversationMessage,
   ComposerChip,
   Markdown as CBMarkdown,
@@ -257,7 +262,6 @@ import {
   MessageStatusBadge,
   ThinkBlock as CBThinkBlock,
   ToolCallPart as CBToolCallPart,
-  toolIcon as cbToolIcon,
   CompressIcon as CBCompressIcon,
 } from '@noted/claude-blocks';
 import {
@@ -265,6 +269,16 @@ import {
   AIComposerSurface,
   type AIComposerSurfaceChip,
 } from './AIConversation/AIComposerSurface';
+import PastedContentPreview from './AIConversation/PastedContentPreview';
+import {
+  HistoryCollapsedGroupRow,
+  HistoryGroupFoot,
+  HistoryGroupRail,
+  HistoryTranscriptPresentation,
+  historyTurnsToTranscriptSteps,
+  mergeHistoryTranscriptSteps,
+  type HistoryTranscriptStep,
+} from './HistoryTranscriptPresentation';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -307,6 +321,9 @@ interface TaskAction {
   // (see subagent-transcript.js).
   agentId?: string;
   taskPrompt?: string;
+  startedAt?: number;
+  completedAt?: number;
+  durationMs?: number;
 }
 // Raw tool carrier emitted by the main-process parser for every non-Task
 // tool_use — full name+input+result, rendered via the package ToolCallPart.
@@ -422,6 +439,14 @@ interface FullHistoryEntry {
     mcpServer?: string;
     mcpMethod?: string;
     isError?: boolean;
+    description?: string;
+    subagentStatus?: 'running' | 'completed' | 'interrupted';
+    agentSessionId?: string;
+    agentId?: string;
+    taskPrompt?: string;
+    startedAt?: number;
+    completedAt?: number;
+    durationMs?: number;
   }>;
 }
 
@@ -1251,6 +1276,13 @@ const historyActionPresentationEqual = (left: Action, right: Action) => {
     return left.description === right.description &&
       left.toolUseId === right.toolUseId &&
       left.result === right.result &&
+      left.subagentStatus === right.subagentStatus &&
+      left.agentSessionId === right.agentSessionId &&
+      left.agentId === right.agentId &&
+      left.processGeneration === right.processGeneration &&
+      left.startedAt === right.startedAt &&
+      left.completedAt === right.completedAt &&
+      left.durationMs === right.durationMs &&
       JSON.stringify(left.history || []) === JSON.stringify(right.history || []);
   }
   if (isFileAction(left) && isFileAction(right)) {
@@ -1394,9 +1426,9 @@ const serverHistoryMaterializedRewindBranch = (serverEntries: FullHistoryEntry[]
   return hasNewUserAfterTarget && !hasOldFuture;
 };
 
-// Thinking + markdown now render via @noted/claude-blocks (CBThinkBlock /
-// CBMarkdown) — the local ThinkingBlock and the MarkdownRenderer import were
-// removed. SubAgentBlock (Task) keeps its own inline rendering below.
+// Thinking + markdown render via @noted/claude-blocks (CBThinkBlock /
+// CBMarkdown). Task owns only its lifecycle/result shell here; its nested
+// transcript renders through HistoryTranscriptPresentation below.
 
 // Same path voice as raw tool cards/groups: basename normally, docs/... for
 // documentation. Legacy FileAction rows must not resurrect their old .../a/b
@@ -1719,95 +1751,96 @@ const ReadActionBlock = ({ filePath }: { filePath: string }) => (
 );
 
 // Sub-agent (Task) — blue border, collapsible result and history
-const SubAgentBlock = memo(({ action }: { action: TaskAction }) => {
-  const [showResult, setShowResult] = useState(false);
-  const [showHistory, setShowHistory] = useState(false);
-  const resultRef = useRef<HTMLDivElement>(null);
-  const historyRef = useRef<HTMLDivElement>(null);
-  const toggleResult = useHistoryRevealToggle(resultRef, showResult, setShowResult);
-  const toggleHistory = useHistoryRevealToggle(historyRef, showHistory, setShowHistory);
+const formatSubagentDuration = (durationMs: number) => {
+  const seconds = Math.max(0, Math.floor(durationMs / 1000));
+  if (seconds < 60) return seconds + 's';
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest === 0 ? minutes + 'm' : minutes + 'm ' + rest + 's';
+};
+
+const historyAgentKey = (action: TaskAction, entryUuid: string) => (
+  'task:' + (action.toolUseId || action.agentSessionId || action.agentId || entryUuid)
+);
+
+interface HistoryAgentInspectorController {
+  selectedKey: string | null;
+  openAgent: (agentKey: string) => void;
+}
+
+const HistoryAgentInspectorContext = React.createContext<HistoryAgentInspectorController>({
+  selectedKey: null,
+  openAgent: () => {},
+});
+
+// A Task row is an address into the single docked Agent Inspector. Its own
+// transcript never expands inside the virtualized History list: that created
+// a scrollable History inside another scrollable History and made wheel/anchor
+// ownership ambiguous.
+const SubAgentBlock = memo(({
+  action,
+  entryUuid,
+  live,
+}: {
+  action: TaskAction;
+  entryUuid: string;
+  live: boolean;
+}) => {
+  const inspector = React.useContext(HistoryAgentInspectorContext);
   // Codex subagent live status: the loader is INHERITED by the card while the
   // in-process agent works; interrupted is amber, not an error red.
-  const subagentRunning = action.subagentStatus === 'running';
-  const subagentInterrupted = action.subagentStatus === 'interrupted';
+  // `subagentStatus` is durable transcript history, not a live lease. A
+  // completed child can have an old `running` card in a cached/replayed row;
+  // only the main-owned exact call-id snapshot may animate it now.
+  const subagentRunning = live;
+  const subagentInterrupted = action.subagentStatus === 'interrupted'
+    || (!live
+      && action.subagentStatus !== 'completed'
+      && action.result == null
+      && !(Number(action.completedAt) > 0));
+  const description = String(action.description || 'Task agent')
+    .replace(/\s+·\s+running\s*$/i, '');
+  const durationMs = Number(action.durationMs) > 0
+    ? Number(action.durationMs)
+    : Number(action.completedAt) > 0 && Number(action.startedAt) > 0
+      ? Math.max(0, Number(action.completedAt) - Number(action.startedAt))
+      : 0;
+  const agentKey = historyAgentKey(action, entryUuid);
+  const selected = inspector.selectedKey === agentKey;
+  const rowColor = subagentInterrupted ? '#d97706' : live ? '#d97706' : '#818cf8';
 
   return (
-    <div style={{ marginTop: 4, borderLeft: '3px solid ' + (subagentInterrupted ? '#d97706' : '#60a5fa'), paddingLeft: 8 }}>
-      <span style={{ fontSize: '0.85em', color: subagentInterrupted ? '#d97706' : '#60a5fa', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+    <div
+      data-history-agent-card={agentKey}
+      style={{ marginTop: 4, borderLeft: '3px solid ' + rowColor, paddingLeft: 8 }}
+    >
+      <button
+        type="button"
+        onClick={() => inspector.openAgent(agentKey)}
+        className="group"
+        aria-expanded={selected}
+        style={{
+          width: '100%', minWidth: 0, display: 'flex', alignItems: 'center', gap: 6,
+          padding: '2px 4px 2px 0', border: 'none', borderRadius: 4,
+          background: selected ? 'rgba(129, 140, 248, 0.08)' : 'transparent',
+          color: rowColor, cursor: 'pointer', fontSize: '0.85em', textAlign: 'left',
+        }}
+        title="Открыть агента"
+      >
         {subagentRunning && (
           <Loader2 size={11} strokeWidth={2.5} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
         )}
-        {'\u{1F9F5}'} {action.description || 'Task agent'}
-      </span>
-
-      {action.result && (
-        <div ref={resultRef} style={{ marginTop: 2 }}>
-          <button
-            onClick={toggleResult}
-            style={{
-              background: 'none', border: 'none', color: '#60a5fa',
-              cursor: 'pointer', fontSize: '0.77em', display: 'flex',
-              alignItems: 'center', gap: 3, padding: 0, opacity: 0.8,
-            }}
-          >
-            {showResult ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-            Результат
-          </button>
-          {showResult && (
-            <div data-history-empty-state="unbound-session" style={{
-              marginTop: 2, fontSize: '0.85em', color: '#bbb',
-              whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-              maxHeight: 300, overflowY: 'auto',
-              backgroundColor: 'rgba(96, 165, 250, 0.05)',
-              padding: '4px 6px', borderRadius: 4,
-            }}>
-              {action.result}
-            </div>
-          )}
-        </div>
-      )}
-
-      {action.history && action.history.length > 0 && (
-        <div ref={historyRef} style={{ marginTop: 2 }}>
-          <button
-            onClick={toggleHistory}
-            style={{
-              background: 'none', border: 'none', color: '#4ade80',
-              cursor: 'pointer', fontSize: '0.77em', display: 'flex',
-              alignItems: 'center', gap: 3, padding: 0, opacity: 0.8,
-            }}
-          >
-            {showHistory ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-            История ({action.history.length} turns)
-          </button>
-          {showHistory && (
-            <div style={{
-              marginTop: 2, fontSize: '0.85em', maxHeight: 400, overflowY: 'auto',
-              display: 'flex', flexDirection: 'column', gap: 2,
-            }}>
-              {action.history.map((turn, i) => (
-                <div key={i} style={{
-                  padding: '2px 4px', borderRadius: 3,
-                  backgroundColor: turn.type === 'user'
-                    ? 'rgba(255,255,255,0.03)' : 'transparent',
-                }}>
-                  <span style={{ color: turn.type === 'user' ? '#888' : '#60a5fa', fontSize: '0.77em' }}>
-                    {turn.type === 'user' ? '\u{1F464}' : '\u{1F916}'}
-                  </span>{' '}
-                  {turn.content && (
-                    <span style={{ color: '#aaa', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                      {turn.content.length > 300 ? turn.content.substring(0, 300) + '...' : turn.content}
-                    </span>
-                  )}
-                  {turn.tools && turn.tools.map((t, j) => (
-                    <div key={j} style={{ color: '#777', fontSize: '0.77em', paddingLeft: 14 }}>{t}</div>
-                  ))}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+        {!subagentRunning && <Bot size={11} style={{ flexShrink: 0 }} />}
+        <span className="truncate" style={{ minWidth: 0, flex: 1 }}>{description}</span>
+        {!subagentRunning && durationMs > 0 && (
+          <span style={{ color: '#777', fontVariantNumeric: 'tabular-nums' }}>
+            {formatSubagentDuration(durationMs)}
+          </span>
+        )}
+        {selected
+          ? <ChevronDown size={11} style={{ color: '#777', flexShrink: 0 }} />
+          : <ChevronRight size={11} className="opacity-0 group-hover:opacity-100" style={{ color: '#777', flexShrink: 0 }} />}
+      </button>
     </div>
   );
 });
@@ -1989,6 +2022,7 @@ const HistoryThinkBlock = memo(({ text, payloadRef, seconds }: {
 // several layers below the panel; the context avoids threading
 // toolType/sessionId/cwd through every action render.
 const HistoryPayloadContext = React.createContext<{
+  tabId: string;
   toolType: 'claude' | 'gemini' | 'codex';
   sessionId: string;
   cwd?: string;
@@ -2175,13 +2209,17 @@ const HistoryToolCallPart = memo(({
 // chips strip above the composer — the same presentation the SDK tab uses
 // (BackgroundTasksBar): the inline card stays in the transcript with a
 // terminal/handed-off state, while the LIVE face of the process is the chip.
-// Chips derive purely from durable entries; no separate lifecycle store.
+// Card content comes from durable/live History rows; liveness comes from the
+// same main-owned exact active-call snapshot as the tab loader.
 interface HistoryBackgroundChip {
   key: string;
   kind: 'bash' | 'subagent';
   label: string;
   entryUuid: string;
   startedAt: number;
+  status?: 'running' | 'completed' | 'interrupted';
+  completedAt?: number;
+  durationMs?: number;
   // Detail-pane payload (workflow-style expansion above the bar).
   taskHistory?: Array<{ type: string; content?: string; tools?: string[] }>;
   taskResult?: string;
@@ -2191,13 +2229,35 @@ interface HistoryBackgroundChip {
   bashAcceptance?: string;
 }
 
-// One parsed step of a subagent's own transcript (main-side reader).
-interface SubagentStep {
-  kind: 'tool' | 'message' | 'thinking';
-  text: string;
-  tool?: string;
-  final?: boolean;
+type HistoryAgentChip = HistoryBackgroundChip & {
+  kind: 'subagent';
+  status: 'running' | 'completed' | 'interrupted';
+};
+
+const EMPTY_HISTORY_AGENTS: HistoryAgentChip[] = [];
+
+interface HistoryBackgroundAgentProof {
+  provider: 'claude' | 'codex';
+  toolUseId: string;
+  agentId?: string;
+  agentSessionId?: string;
+  sessionId?: string | null;
+  generation?: string | null;
+  startedAt?: number;
 }
+
+interface HistoryBackgroundWorkSnapshot {
+  tabId: string;
+  revision: number;
+  agents: HistoryBackgroundAgentProof[];
+}
+
+const historySubagentCallIdentity = (value: string | undefined) => (
+  String(value || '').replace(/:canonical:\d+$/, '')
+);
+
+// One parsed step of a subagent's own transcript (main-side reader).
+type SubagentStep = HistoryTranscriptStep;
 
 const collectHistoryBackgroundChips = (
   entries: FullHistoryEntry[],
@@ -2206,6 +2266,7 @@ const collectHistoryBackgroundChips = (
   currentSessionId: string,
   currentProcessGeneration: string | null,
   chipToolType: string = 'claude',
+  exactActiveSubagents: ReadonlyMap<string, HistoryBackgroundAgentProof> | null = null,
 ): HistoryBackgroundChip[] => {
   // A chip is the LIVE face of work. Two liveness models:
   //
@@ -2260,6 +2321,7 @@ const collectHistoryBackgroundChips = (
           label: command.slice(0, 80) || action.rawTool.toolName,
           entryUuid: entry.uuid,
           startedAt: Date.parse(entry.timestamp || '') || 0,
+          status: 'running',
           bashAcceptance: action.rawTool.result,
         });
         continue;
@@ -2267,7 +2329,16 @@ const collectHistoryBackgroundChips = (
       if (!isTaskAction(action)) continue;
       // Explicit rollout status (Codex) is process-scoped truth; a Claude
       // Task without one is turn-scoped and needs the busy gate.
-      const running = isHistoryTaskBackgroundLive({
+      const callIdentity = historySubagentCallIdentity(action.toolUseId);
+      const exactActivity = callIdentity && exactActiveSubagents
+        ? exactActiveSubagents.get(callIdentity) || null
+        : null;
+      const running = action.subagentStatus
+        // Explicit background status is process-scoped. The exact main-owned
+        // active-call snapshot is the authority; replayed `running` text from
+        // a durable card cannot resurrect a child after completion.
+        ? exactActivity?.provider === chipToolType
+        : isHistoryTaskBackgroundLive({
         // Provider decides which proof of liveness applies: Codex must match a
         // process generation, Claude never has one to match.
         toolType: chipToolType,
@@ -2283,13 +2354,19 @@ const collectHistoryBackgroundChips = (
         chips.push({
           key: 'task:' + (action.toolUseId || entry.uuid),
           kind: 'subagent',
-          label: (action.description || 'Task agent').slice(0, 80),
+          label: String(action.description || 'Task agent')
+            .replace(/\s+·\s+running\s*$/i, '')
+            .slice(0, 80),
           entryUuid: entry.uuid,
-          startedAt: Date.parse(entry.timestamp || '') || 0,
+          startedAt: Number(exactActivity?.startedAt)
+            || Number(action.startedAt)
+            || Date.parse(entry.timestamp || '')
+            || 0,
+          status: 'running',
           taskHistory: action.history,
           taskResult: action.result,
-          agentSessionId: action.agentSessionId,
-          agentId: action.agentId,
+          agentSessionId: exactActivity?.agentSessionId || action.agentSessionId,
+          agentId: exactActivity?.agentId || action.agentId,
           taskPrompt: action.taskPrompt,
         });
       }
@@ -2299,10 +2376,97 @@ const collectHistoryBackgroundChips = (
   return chips.sort((a, b) => b.startedAt - a.startedAt);
 };
 
+const collectHistoryAgentChips = (
+  entries: FullHistoryEntry[],
+  liveChips: HistoryBackgroundChip[],
+): HistoryAgentChip[] => {
+  const liveByKey = new Map<string, HistoryAgentChip>(
+    liveChips
+      .filter((chip): chip is HistoryAgentChip => chip.kind === 'subagent')
+      .map((chip): [string, HistoryAgentChip] => [
+        chip.key,
+        { ...chip, kind: 'subagent', status: 'running' },
+      ]),
+  );
+  const byKey = new Map<string, HistoryAgentChip>();
+  for (const entry of entries) {
+    const hydratedTasks = Array.isArray(entry.actions)
+      ? entry.actions.filter(isTaskAction)
+      : [];
+    const stubTasks: TaskAction[] = hydratedTasks.length === 0
+      ? (entry.actionSummary || [])
+          .filter((summary) => summary.toolName === 'Task' || summary.family === 'task')
+          .map((summary) => ({
+            tool: 'Task' as const,
+            description: String(summary.description || 'Agent'),
+            toolUseId: summary.toolUseId,
+            subagentStatus: summary.subagentStatus,
+            agentSessionId: summary.agentSessionId,
+            agentId: summary.agentId,
+            taskPrompt: summary.taskPrompt,
+            startedAt: summary.startedAt,
+            completedAt: summary.completedAt,
+            durationMs: summary.durationMs,
+          }))
+      : [];
+    for (const action of [...hydratedTasks, ...stubTasks]) {
+      const key = historyAgentKey(action, entry.uuid);
+      const live = liveByKey.get(key);
+      const startedAt = Number(live?.startedAt)
+        || Number(action.startedAt)
+        || Date.parse(entry.timestamp || '')
+        || 0;
+      const completedAt = Number(action.completedAt) || 0;
+      const durationMs = Number(action.durationMs) > 0
+        ? Number(action.durationMs)
+        : completedAt > 0 && startedAt > 0
+          ? Math.max(0, completedAt - startedAt)
+          : 0;
+      const status: HistoryAgentChip['status'] = live
+        ? 'running'
+        : action.subagentStatus === 'interrupted'
+          ? 'interrupted'
+          : action.subagentStatus === 'completed' || action.result != null || completedAt > 0
+            ? 'completed'
+            : 'interrupted';
+      const previous = byKey.get(key);
+      const record: HistoryAgentChip = {
+        key,
+        kind: 'subagent',
+        label: String(action.description || live?.label || 'Task agent')
+          .replace(/\s+·\s+running\s*$/i, '')
+          .slice(0, 120),
+        entryUuid: entry.uuid,
+        startedAt,
+        status,
+        completedAt: completedAt || undefined,
+        durationMs: durationMs || undefined,
+        taskHistory: (action.history?.length || 0) > 0 ? action.history : previous?.taskHistory,
+        taskResult: action.result ?? previous?.taskResult,
+        agentSessionId: live?.agentSessionId || action.agentSessionId || previous?.agentSessionId,
+        agentId: live?.agentId || action.agentId || previous?.agentId,
+        taskPrompt: action.taskPrompt || previous?.taskPrompt,
+      };
+      byKey.set(key, record);
+      liveByKey.delete(key);
+    }
+  }
+  // A spawn can reach the canonical live stream before the durable card has
+  // entered the current hydration window. Keep that active agent addressable;
+  // the durable record will enrich the same key later.
+  for (const [key, live] of liveByKey) byKey.set(key, live);
+  return Array.from(byKey.values()).sort((left, right) => {
+    if (left.status === 'running' && right.status !== 'running') return -1;
+    if (right.status === 'running' && left.status !== 'running') return 1;
+    return right.startedAt - left.startedAt;
+  });
+};
+
 // Entry uuids that currently have a LIVE background chip. The inline
 // «РАБОТАЕТ В ФОНЕ» badge follows chip liveness: a background card whose
 // process died with the turn (no notification ever) must not pulse forever.
 const HistoryBackgroundLiveContext = React.createContext<ReadonlySet<string>>(new Set());
+const HistoryBackgroundTaskCallContext = React.createContext<ReadonlySet<string>>(new Set());
 
 
 const HistoryBackgroundDot = () => (
@@ -2315,6 +2479,11 @@ const HistoryBackgroundDot = () => (
     }}
   />
 );
+
+const historySubagentScrollMemory = new Map<string, {
+  scrollTop: number;
+  followBottom: boolean;
+}>();
 
 const formatBackgroundElapsed = (startedAt: number) => {
   if (!startedAt) return '';
@@ -2333,11 +2502,18 @@ const formatBackgroundElapsed = (startedAt: number) => {
 // 3810), and re-parsing the whole file every tick would stall the main process
 // precisely while the user is watching. `offset` advances by consumed bytes;
 // a partial trailing line is left for the next tick instead of being dropped.
-const useSubagentSteps = (chip: HistoryBackgroundChip | null, tabId: string, toolType: string, cwd: string, sessionId: string) => {
+function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, toolType: string, cwd: string, sessionId: string) {
   const [steps, setSteps] = useState<SubagentStep[]>([]);
   const [pending, setPending] = useState(false);
   const offsetRef = useRef(0);
-  const chipKey = chip?.kind === 'subagent' ? chip.key : '';
+  const readerIdRef = useRef(
+    `history-subagent-reader:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`,
+  );
+  const canLocateTranscript = toolType === 'codex'
+    || !!chip?.agentSessionId
+    || !!chip?.agentId
+    || !!chip?.taskPrompt;
+  const chipKey = chip?.kind === 'subagent' && canLocateTranscript ? chip.key : '';
 
   useEffect(() => {
     if (!chipKey) { setSteps([]); setPending(false); offsetRef.current = 0; return; }
@@ -2361,6 +2537,7 @@ const useSubagentSteps = (chip: HistoryBackgroundChip | null, tabId: string, too
           if (resolved?.threadId) resolvedThreadId = resolved.threadId;
         }
         const res = await ipcRenderer.invoke('subagent:read-steps', {
+          readerId: readerIdRef.current,
           chipKey,
           toolType,
           parentSessionId: sessionId,
@@ -2375,27 +2552,44 @@ const useSubagentSteps = (chip: HistoryBackgroundChip | null, tabId: string, too
         if (res?.success && Array.isArray(res.steps)) {
           offsetRef.current = Number(res.offset) || offsetRef.current;
           if (res.steps.length > 0) {
-            // Append: each tick returns only what was newly written.
-            setSteps((prev) => [...prev, ...res.steps].slice(-400));
+            // Calls and results may cross byte-read boundaries. The reader
+            // returns the same stable id when a result arrives; update that
+            // card instead of drawing a duplicate pending+completed pair.
+            setSteps((prev) => mergeHistoryTranscriptSteps(
+              res.reset === true ? [] : prev,
+              res.steps,
+            ));
             setPending(false);
+          } else if (res.reset === true) {
+            setSteps([]);
           } else if (!res.pending) {
             setPending(false);
           }
+        } else if (chip?.status !== 'running') {
+          setPending(false);
         }
-      } catch { /* transient: the file may be mid-rotation */ }
+      } catch {
+        // A live file may appear on the next incremental read. A completed
+        // agent gets one bounded attempt and then shows the durable result or
+        // the explicit unavailable state instead of an eternal loader.
+        if (chip?.status !== 'running' && !cancelled) setPending(false);
+      }
     };
-    tick();
-    const timer = window.setInterval(tick, 1200);
-    return () => { cancelled = true; window.clearInterval(timer); };
-  }, [chipKey, toolType, cwd, sessionId, chip?.agentId, chip?.agentSessionId, chip?.taskPrompt, chip?.label, chip?.startedAt]);
+    void tick();
+    // A completed transcript is immutable: read it once. Only a genuinely
+    // running agent keeps the legacy incremental tail reader alive.
+    const timer = chip?.status === 'running' ? window.setInterval(tick, 1200) : null;
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [chipKey, toolType, cwd, sessionId, chip?.agentId, chip?.agentSessionId, chip?.taskPrompt, chip?.label, chip?.startedAt, chip?.status]);
 
   return { steps, pending };
-};
+}
 
-// Workflow-style detail pane above the chips bar: what the agent is doing
-// right now — its real steps, tailed live from the agent's own transcript.
-// Read-only by design: no input; stopping stays on the existing Escape flow
-// which interrupts the whole turn.
+// One docked inspector serves both live and completed agents. It is a sibling
+// of the History viewport, not a scrollable child inside a virtual row.
 const HistoryBackgroundDetailPane = memo(({
   chip,
   onJumpToCard,
@@ -2413,30 +2607,96 @@ const HistoryBackgroundDetailPane = memo(({
   cwd: string;
   sessionId: string;
 }) => {
+  const running = chip.status === 'running'
+    || (chip.kind === 'bash' && chip.status !== 'completed' && chip.status !== 'interrupted');
+  const interrupted = chip.status === 'interrupted';
+  const statusLabel = running ? 'Working' : interrupted ? 'Interrupted' : 'Completed';
+  const statusColor = running ? '#d97706' : interrupted ? '#d97706' : '#4ade80';
+  const durationMs = Number(chip.durationMs) > 0
+    ? Number(chip.durationMs)
+    : Number(chip.completedAt) > 0 && Number(chip.startedAt) > 0
+      ? Math.max(0, Number(chip.completedAt) - Number(chip.startedAt))
+      : 0;
   const scrollRef = useRef<HTMLDivElement>(null);
+  const followBottomRef = useRef(true);
+  const restoredScrollRef = useRef(false);
+  const programmaticScrollRef = useRef(false);
   const { steps: liveSteps, pending: stepsPending } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
   const [showThinking, setShowThinking] = useState(false);
+  useEffect(() => setShowThinking(false), [chip.key]);
   // Reasoning dwarfs everything else (784 thinking records vs 39 answers on a
   // real Codex agent), so it is folded away unless explicitly asked for.
   const visibleSteps = useMemo(
     () => (showThinking ? liveSteps : liveSteps.filter((step) => step.kind !== 'thinking')),
     [liveSteps, showThinking],
   );
+  const fallbackSteps = useMemo(
+    () => historyTurnsToTranscriptSteps(chip.taskHistory || []),
+    [chip.taskHistory, chip.taskHistory?.length],
+  );
+  const basePresentedSteps = visibleSteps.length > 0 ? visibleSteps : fallbackSteps;
+  const presentedSteps = useMemo(() => {
+    const result = !running ? String(chip.taskResult || '').trim() : '';
+    if (!result || basePresentedSteps.some((step) => String(step.text || '').trim() === result)) {
+      return basePresentedSteps;
+    }
+    return [
+      ...basePresentedSteps,
+      {
+        id: chip.key + ':final-result',
+        kind: 'message' as const,
+        role: 'assistant' as const,
+        text: result,
+        final: true,
+      },
+    ];
+  }, [basePresentedSteps, chip.key, chip.taskResult, running]);
   const thinkingCount = useMemo(
     () => liveSteps.reduce((sum, step) => sum + (step.kind === 'thinking' ? 1 : 0), 0),
     [liveSteps],
   );
-  const stepCount = visibleSteps.length || chip.taskHistory?.length || 0;
-  // Follow the newest step while the agent works.
+  const stepCount = presentedSteps.length;
+  useEffect(() => {
+    restoredScrollRef.current = false;
+    const saved = historySubagentScrollMemory.get(chip.key);
+    followBottomRef.current = saved?.followBottom ?? true;
+    return () => {
+      const el = scrollRef.current;
+      if (!el) return;
+      historySubagentScrollMemory.delete(chip.key);
+      historySubagentScrollMemory.set(chip.key, {
+        scrollTop: el.scrollTop,
+        followBottom: followBottomRef.current,
+      });
+      if (historySubagentScrollMemory.size > 128) {
+        const oldest = historySubagentScrollMemory.keys().next().value;
+        if (oldest) historySubagentScrollMemory.delete(oldest);
+      }
+    };
+  }, [chip.key]);
+  // Follow new work only while the reader was already at the bottom. A user
+  // inspecting an older step owns their position; collapse/reopen and tab
+  // switches restore that exact nested scroll instead of snapping to tail.
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [stepCount]);
+    if (!el) return;
+    const saved = historySubagentScrollMemory.get(chip.key);
+    programmaticScrollRef.current = true;
+    if (!restoredScrollRef.current && saved && !saved.followBottom) {
+      el.scrollTop = Math.min(saved.scrollTop, Math.max(0, el.scrollHeight - el.clientHeight));
+      restoredScrollRef.current = true;
+    } else if (followBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+      restoredScrollRef.current = true;
+    }
+    requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+  }, [chip.key, stepCount]);
   return (
     <div
       data-history-background-detail
       style={{
-        maxHeight: 260,
+        height: '100%',
+        minHeight: 0,
         display: 'flex',
         flexDirection: 'column',
         borderTop: '1px solid #2a2a2a',
@@ -2448,13 +2708,20 @@ const HistoryBackgroundDetailPane = memo(({
         padding: '5px 10px', borderBottom: '1px solid #222',
         color: '#bdbdbd', fontSize: '0.85em',
       }}>
-        <HistoryBackgroundDot />
+        {running
+          ? <HistoryBackgroundDot />
+          : interrupted
+            ? <AlertTriangle size={11} style={{ color: statusColor, flexShrink: 0 }} />
+            : <Check size={11} style={{ color: statusColor, flexShrink: 0 }} />}
         {chip.kind === 'bash'
-          ? <TerminalSquare size={12} style={{ color: '#d97706', flexShrink: 0 }} />
-          : <Bot size={12} style={{ color: '#d97706', flexShrink: 0 }} />}
+          ? <TerminalSquare size={12} style={{ color: statusColor, flexShrink: 0 }} />
+          : <Bot size={12} style={{ color: statusColor, flexShrink: 0 }} />}
         <span className="truncate" style={{ flex: 1, fontFamily: 'monospace' }}>{chip.label}</span>
-        <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums' }}>
-          {formatBackgroundElapsed(chip.startedAt)}
+        <span style={{ color: statusColor, fontSize: '0.9em' }}>{statusLabel}</span>
+        <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums', minWidth: 0 }}>
+          {running
+            ? formatBackgroundElapsed(chip.startedAt)
+            : durationMs > 0 ? formatSubagentDuration(durationMs) : ''}
         </span>
         <button
           type="button"
@@ -2481,46 +2748,30 @@ const HistoryBackgroundDetailPane = memo(({
       </div>
       <div
         ref={scrollRef}
-        style={{ overflowY: 'auto', padding: '6px 10px', fontSize: '0.82em', color: '#aaa' }}
+        onScroll={(event) => {
+          if (programmaticScrollRef.current) return;
+          const el = event.currentTarget;
+          followBottomRef.current = el.scrollHeight - el.clientHeight - el.scrollTop <= 12;
+          historySubagentScrollMemory.delete(chip.key);
+          historySubagentScrollMemory.set(chip.key, {
+            scrollTop: el.scrollTop,
+            followBottom: followBottomRef.current,
+          });
+        }}
+        style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '6px 10px', fontSize: '0.82em', color: '#aaa' }}
       >
-        {chip.kind === 'subagent' && (visibleSteps.length > 0 ? (
+        {chip.kind === 'subagent' && (stepsPending && presentedSteps.length === 0 ? (
+          <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, color: '#777' }}>
+            <HistorySpinner size={14} />
+            Загружаем историю агента…
+          </div>
+        ) : presentedSteps.length > 0 ? (
           <>
-            {visibleSteps.map((step, index) => (
-              <div key={index} style={{ marginBottom: 5 }}>
-                {step.kind === 'tool' && (
-                  <div style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
-                    <span style={{ color: '#60a5fa', fontFamily: 'monospace', flexShrink: 0 }}>
-                      {step.tool}
-                    </span>
-                    <span style={{
-                      color: '#7a7a7a', fontFamily: 'monospace', fontSize: '0.95em',
-                      whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                      maxHeight: 44, overflow: 'hidden',
-                    }}>
-                      {step.text}
-                    </span>
-                  </div>
-                )}
-                {step.kind === 'message' && (
-                  <div style={{
-                    whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                    color: step.final ? '#ddd' : '#bbb',
-                    maxHeight: 140, overflow: 'hidden',
-                  }}>
-                    {step.text}
-                  </div>
-                )}
-                {step.kind === 'thinking' && (
-                  <div style={{
-                    whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                    color: '#6b6b6b', fontStyle: 'italic',
-                    maxHeight: 100, overflow: 'hidden',
-                  }}>
-                    {step.text}
-                  </div>
-                )}
-              </div>
-            ))}
+            <HistoryTranscriptPresentation
+              steps={presentedSteps}
+              isTurnBusy={running}
+              onCopy={(text) => clipboard.writeText(text)}
+            />
             {thinkingCount > 0 && (
               <button
                 type="button"
@@ -2536,9 +2787,9 @@ const HistoryBackgroundDetailPane = memo(({
           </>
         ) : (
           <div style={{ color: '#666' }}>
-            {stepsPending
-              ? 'Загружаем шаги агента…'
-              : 'Агент работает — промежуточные шаги появятся здесь по мере записи.'}
+            {running
+              ? 'Агент работает — промежуточные шаги появятся здесь по мере записи.'
+              : 'История агента недоступна.'}
           </div>
         ))}
         {chip.kind === 'bash' && (
@@ -2551,10 +2802,92 @@ const HistoryBackgroundDetailPane = memo(({
   );
 });
 
+const HistoryAgentRoster = memo(({
+  agents,
+  selectedKey,
+  onSelect,
+  onClose,
+}: {
+  agents: HistoryAgentChip[];
+  selectedKey: string | null;
+  onSelect: (agentKey: string) => void;
+  onClose: () => void;
+}) => {
+  const running = agents.filter((agent) => agent.status === 'running');
+  const completed = agents.filter((agent) => agent.status === 'completed');
+  const interrupted = agents.filter((agent) => agent.status === 'interrupted');
+  const renderSection = (label: string, records: HistoryAgentChip[]) => {
+    if (records.length === 0) return null;
+    return (
+      <div>
+        <div style={{ padding: '5px 10px 3px', color: '#666', fontSize: '0.72em', textTransform: 'uppercase', letterSpacing: 0.7 }}>
+          {label}
+        </div>
+        {records.map((agent) => {
+          const selected = selectedKey === agent.key;
+          const interrupted = agent.status === 'interrupted';
+          const duration = Number(agent.durationMs) > 0
+            ? Number(agent.durationMs)
+            : Number(agent.completedAt) > 0 && agent.startedAt > 0
+              ? Math.max(0, Number(agent.completedAt) - agent.startedAt)
+              : 0;
+          return (
+            <button
+              key={agent.key}
+              type="button"
+              onClick={() => onSelect(agent.key)}
+              style={{
+                width: '100%', minWidth: 0, display: 'flex', alignItems: 'center', gap: 7,
+                padding: '5px 10px', border: 'none', background: selected ? 'rgba(129, 140, 248, 0.10)' : 'transparent',
+                color: '#bdbdbd', cursor: 'pointer', textAlign: 'left', fontSize: '0.82em',
+              }}
+              onMouseEnter={(event) => { if (!selected) event.currentTarget.style.background = 'rgba(255,255,255,0.04)'; }}
+              onMouseLeave={(event) => { if (!selected) event.currentTarget.style.background = 'transparent'; }}
+            >
+              {agent.status === 'running'
+                ? <HistoryBackgroundDot />
+                : interrupted
+                  ? <AlertTriangle size={11} style={{ color: '#d97706', flexShrink: 0 }} />
+                  : <Check size={11} style={{ color: '#4ade80', flexShrink: 0 }} />}
+              <Bot size={11} style={{ color: agent.status === 'running' || interrupted ? '#d97706' : '#818cf8', flexShrink: 0 }} />
+              <span className="truncate" style={{ minWidth: 0, flex: 1 }}>{agent.label}</span>
+              <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}>
+                {agent.status === 'running'
+                  ? formatBackgroundElapsed(agent.startedAt)
+                  : duration > 0 ? formatSubagentDuration(duration) : ''}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  };
+  return (
+    <div style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', borderTop: '1px solid #2a2a2a', background: '#111' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '5px 10px', borderBottom: '1px solid #222', color: '#bdbdbd', fontSize: '0.85em' }}>
+        <Bot size={12} style={{ color: '#818cf8' }} />
+        <span style={{ flex: 1 }}>Agents · {agents.length}</span>
+        <button type="button" onClick={onClose} aria-label="Close agents list" style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: 2 }}>
+          <X size={13} />
+        </button>
+      </div>
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', paddingBottom: 4 }}>
+        {renderSection('Running', running)}
+        {renderSection('Completed', completed)}
+        {renderSection('Interrupted', interrupted)}
+      </div>
+    </div>
+  );
+});
+
 const HistoryBackgroundTasksBar = memo(({
   chips,
-  expandedKey,
-  onToggle,
+  agents,
+  selectedKey,
+  rosterOpen,
+  onToggleDetail,
+  onToggleRoster,
+  onSelectAgent,
   onJumpToCard,
   tabId,
   toolType,
@@ -2562,8 +2895,12 @@ const HistoryBackgroundTasksBar = memo(({
   sessionId,
 }: {
   chips: HistoryBackgroundChip[];
-  expandedKey: string | null;
-  onToggle: (chipKey: string) => void;
+  agents: HistoryAgentChip[];
+  selectedKey: string | null;
+  rosterOpen: boolean;
+  onToggleDetail: (chipKey: string) => void;
+  onToggleRoster: () => void;
+  onSelectAgent: (agentKey: string) => void;
   onJumpToCard: (entryUuid: string) => void;
   // Passed through to the detail pane, which needs them to locate the
   // expanded agent's own transcript.
@@ -2574,38 +2911,132 @@ const HistoryBackgroundTasksBar = memo(({
 }) => {
   // 1s tick keeps elapsed labels live while anything runs.
   const [, force] = React.useReducer((x: number) => x + 1, 0);
+  const [inspectorHeight, setInspectorHeight] = useState(260);
+  const resizeCleanupRef = useRef<null | (() => void)>(null);
+  useEffect(() => () => resizeCleanupRef.current?.(), []);
+  const beginInspectorResize = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    resizeCleanupRef.current?.();
+    const startY = event.clientY;
+    const startHeight = inspectorHeight;
+    const previousUserSelect = document.body.style.userSelect;
+    const previousCursor = document.body.style.cursor;
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'ns-resize';
+    const onMove = (moveEvent: MouseEvent) => {
+      const maxHeight = Math.max(160, Math.min(620, window.innerHeight - 120));
+      setInspectorHeight(Math.max(140, Math.min(maxHeight, startHeight + startY - moveEvent.clientY)));
+    };
+    const cleanup = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', cleanup);
+      document.body.style.userSelect = previousUserSelect;
+      document.body.style.cursor = previousCursor;
+      resizeCleanupRef.current = null;
+    };
+    resizeCleanupRef.current = cleanup;
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', cleanup);
+  }, [inspectorHeight]);
   useEffect(() => {
-    if (chips.length === 0) return;
+    if (chips.length === 0 && !agents.some((agent) => agent.status === 'running')) return;
     const handle = window.setInterval(() => force(), 1000);
     return () => window.clearInterval(handle);
-  }, [chips.length]);
-  if (chips.length === 0) return null;
-  const expandedChip = expandedKey
-    ? chips.find((chip) => chip.key === expandedKey) || null
+  }, [agents, chips.length]);
+  if (chips.length === 0 && agents.length === 0) return null;
+  const detailItems = new Map<string, HistoryBackgroundChip>();
+  for (const chip of chips) detailItems.set(chip.key, chip);
+  for (const agent of agents) detailItems.set(agent.key, agent);
+  const expandedChip = selectedKey
+    ? detailItems.get(selectedKey) || null
     : null;
+  const runningAgentCount = agents.reduce((sum, agent) => sum + (agent.status === 'running' ? 1 : 0), 0);
+  const popoverOpen = rosterOpen || !!expandedChip;
   return (
-    <div style={{ display: 'flex', flexDirection: 'column' }}>
-      {expandedChip && (
-        <HistoryBackgroundDetailPane
-          chip={expandedChip}
-          onJumpToCard={onJumpToCard}
-          onClose={() => onToggle(expandedChip.key)}
-          tabId={tabId}
-          toolType={toolType}
-          cwd={cwd}
-          sessionId={sessionId}
-        />
+    <div style={{ position: 'relative', width: '100%', minWidth: 0 }}>
+      {popoverOpen && (
+        <div
+          data-history-agent-popover
+          style={{
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            bottom: '100%',
+            height: inspectorHeight,
+            minHeight: 140,
+            maxHeight: 'calc(100vh - 120px)',
+            zIndex: 20,
+            background: '#111',
+            boxShadow: '0 -10px 24px rgba(0, 0, 0, 0.34)',
+          }}
+        >
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Изменить высоту Agent Inspector"
+            onMouseDown={beginInspectorResize}
+            style={{
+              position: 'absolute', left: 0, right: 0, top: -4, height: 8,
+              zIndex: 2, cursor: 'ns-resize', display: 'flex', justifyContent: 'center', alignItems: 'center',
+            }}
+          >
+            <span style={{ width: 38, height: 2, borderRadius: 2, background: '#4a4a4a', pointerEvents: 'none' }} />
+          </div>
+          {rosterOpen ? (
+            <HistoryAgentRoster
+              agents={agents}
+              selectedKey={selectedKey}
+              onSelect={onSelectAgent}
+              onClose={onToggleRoster}
+            />
+          ) : expandedChip && (
+            <HistoryBackgroundDetailPane
+              chip={expandedChip}
+              onJumpToCard={onJumpToCard}
+              onClose={() => onToggleDetail(expandedChip.key)}
+              tabId={tabId}
+              toolType={toolType}
+              cwd={cwd}
+              sessionId={sessionId}
+            />
+          )}
+        </div>
       )}
       <div
         data-history-background-tasks
-        className="flex items-stretch overflow-x-auto shrink-0"
-        style={{ borderTop: '1px solid #2a2a2a', background: '#141414' }}
+        className="inline-flex items-stretch overflow-x-auto shrink-0"
+        style={{
+          display: 'inline-flex',
+          width: 'max-content',
+          maxWidth: '100%',
+          borderTop: '1px solid #2a2a2a',
+          borderRight: '1px solid #2a2a2a',
+          background: '#141414',
+        }}
       >
+        {agents.length > 0 && (
+          <button
+            type="button"
+            onClick={onToggleRoster}
+            onMouseDown={(event) => event.preventDefault()}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[0.85em] font-mono shrink-0 cursor-pointer outline-none"
+            style={{
+              background: rosterOpen ? 'rgba(129, 140, 248, 0.10)' : 'transparent',
+              color: '#bdbdbd', minHeight: 22, border: 'none',
+            }}
+            title="Показать всех агентов"
+          >
+            {runningAgentCount > 0 ? <HistoryBackgroundDot /> : <Bot size={11} style={{ color: '#818cf8' }} />}
+            <span>Agents</span>
+            <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums' }}>{agents.length}</span>
+          </button>
+        )}
         {chips.map((chip, index) => {
-          const expanded = chip.key === expandedKey;
+          const expanded = chip.key === selectedKey && !rosterOpen;
           return (
             <React.Fragment key={chip.key}>
-              {index > 0 && (
+              {(index > 0 || agents.length > 0) && (
                 <span
                   aria-hidden
                   className="self-stretch shrink-0"
@@ -2614,7 +3045,7 @@ const HistoryBackgroundTasksBar = memo(({
               )}
               <button
                 type="button"
-                onClick={() => onToggle(chip.key)}
+                onClick={() => onToggleDetail(chip.key)}
                 onMouseDown={(event) => event.preventDefault()}
                 className="group inline-flex items-center gap-1.5 px-2.5 py-1 text-[0.85em] font-mono shrink-0 cursor-pointer transition-colors outline-none"
                 style={{
@@ -2969,11 +3400,11 @@ const historyInstructionAttachment = (
   return { fileName, scopeLabel, provider: toolType };
 };
 
-/** A user row made from exactly one attachment already has its own complete
- * visual container. Wrapping that chip in the orange message bubble creates a
- * meaningless second card. Keep the raw message untouched; this predicate is
- * presentation-only and deliberately ignores whitespace-only text parts. */
-const historyUserPromptIsSingleChip = ({
+/** A user row made only from attachment chips already has complete visual
+ * containers. Wrapping one or several of them in the orange message bubble
+ * creates a meaningless second card. Keep the raw message untouched; this
+ * predicate is presentation-only and ignores whitespace-only separators. */
+const historyUserPromptIsChipOnly = ({
   text,
   promptChips = [],
   imagePaths = [],
@@ -2993,7 +3424,7 @@ const historyUserPromptIsSingleChip = ({
   const visibleParts = (presentation.parts as Array<any>).filter((part) => (
     part?.kind !== 'text' || String(part?.text || '').trim().length > 0
   ));
-  return visibleParts.length === 1 && visibleParts[0]?.kind !== 'text';
+  return visibleParts.length > 0 && visibleParts.every((part) => part?.kind !== 'text');
 };
 
 const HistoryInstructionProviderIcon = ({ provider }: { provider: 'codex' | 'claude' }) => (
@@ -3075,18 +3506,120 @@ const HistoryInstructionChip = ({
   );
 };
 
+type HistoryPromptPresentationPart = {
+  part: any;
+  sourceIndex: number;
+};
+
+/** Saved prompts are serialized as a prefix before the user's own text. The
+ * parser preserves the separating newlines because they are canonical bytes,
+ * but presentation treats that prefix as one attachment band. This removes
+ * only whitespace BETWEEN leading prompt chips; whitespace in the actual
+ * message body remains untouched. */
+const splitLeadingHistoryPromptParts = (parts: Array<any>) => {
+  const promptParts: HistoryPromptPresentationPart[] = [];
+  let cursor = 0;
+  let foundPrompt = false;
+  while (cursor < parts.length) {
+    const part = parts[cursor];
+    if (part?.kind === 'prompt') {
+      promptParts.push({ part, sourceIndex: cursor });
+      foundPrompt = true;
+      cursor += 1;
+      continue;
+    }
+    if (part?.kind === 'text' && String(part.text || '').trim().length === 0) {
+      cursor += 1;
+      continue;
+    }
+    break;
+  }
+  if (!foundPrompt) return { promptParts: [], bodyParts: parts };
+  const bodyParts = parts.slice(cursor);
+  // Wrapper serialization joins the last prompt and ordinary text with one
+  // `\n\n`. parsePastedContentParts keeps it attached to that first text part;
+  // remove only this known transport delimiter, not user-authored spaces.
+  if (bodyParts[0]?.kind === 'text') {
+    bodyParts[0] = {
+      ...bodyParts[0],
+      text: String(bodyParts[0].text || '').replace(/^(?:\r?\n){2}/, ''),
+    };
+  }
+  return { promptParts, bodyParts };
+};
+
+const HistoryUserPromptBand = ({
+  parts,
+}: {
+  parts: HistoryPromptPresentationPart[];
+}) => {
+  const [expandedPart, setExpandedPart] = useState<string | null>(null);
+  const anchorsRef = useRef<Map<string, HTMLElement>>(new Map());
+  const setAnchor = useCallback((partKey: string, node: HTMLElement | null) => {
+    if (node) anchorsRef.current.set(partKey, node);
+    else anchorsRef.current.delete(partKey);
+  }, []);
+  const closePopover = useCallback(() => setExpandedPart(null), []);
+
+  return (
+    <div className="hp-history-user-prompt-band" data-history-user-prompt-band>
+      {parts.map(({ part, sourceIndex }) => {
+        const chip = part.chip as HistoryPromptDraftChip;
+        const partKey = `prompt-band:${sourceIndex}:${chip.id || sourceIndex}`;
+        const open = expandedPart === partKey;
+        return (
+          <React.Fragment key={partKey}>
+            <span
+              ref={(node) => setAnchor(partKey, node)}
+              style={{ display: 'inline-flex', verticalAlign: 'middle' }}
+            >
+              <ComposerChip
+                kind="prompt"
+                label={chip.label || 'PROMPT'}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setExpandedPart((current) => current === partKey ? null : partKey);
+                }}
+              />
+            </span>
+            {open && (
+              <HistoryChipPopover
+                anchor={anchorsRef.current.get(partKey) || null}
+                onClose={closePopover}
+              >
+                <div
+                  className="cb-paste-chip-body"
+                  style={{ width: '100%', margin: 0, maxHeight: 'min(360px, calc(100vh - 32px))' }}
+                >
+                  <div style={{ marginBottom: 5, color: '#777', fontSize: '0.82em' }}>
+                    {chip.text.length.toLocaleString()} символов
+                  </div>
+                  <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{chip.text}</pre>
+                </div>
+              </HistoryChipPopover>
+            )}
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+};
+
 const HistoryUserPromptContent = ({
   text,
   promptChips = [],
   imagePaths = [],
   toolType,
   forceExpanded = false,
+  presentationParts,
 }: {
   text: string;
   promptChips?: HistoryPromptDraftChip[];
   imagePaths?: HistoryPromptDraftImageRef[];
   toolType?: 'claude' | 'gemini' | 'codex';
   forceExpanded?: boolean;
+  presentationParts?: Array<any>;
 }) => {
   const instructionAttachment = useMemo(
     () => historyInstructionAttachment(text, toolType),
@@ -3114,7 +3647,7 @@ const HistoryUserPromptContent = ({
     () => buildHistoryComposerPresentationParts({ text, chips: promptChips, imagePaths }),
     [imagePaths, promptChips, text],
   );
-  const parts = presentation.parts as Array<any>;
+  const parts = presentationParts || (presentation.parts as Array<any>);
   const hasOpaquePart = parts.some((part) => part.kind !== 'text');
   const imagePreviewUrls = useComposerImagePreviews(imagePaths);
   const expandedImagePart = useMemo(() => {
@@ -3136,8 +3669,11 @@ const HistoryUserPromptContent = ({
     );
   }
 
+  if (parts.length === 0) return null;
+
   if (!hasOpaquePart) {
-    return <HistoryCollapsiblePrompt text={text} forceExpanded={forceExpanded} />;
+    const plainText = parts.map((part) => String(part?.text || '')).join('');
+    return <HistoryCollapsiblePrompt text={plainText} forceExpanded={forceExpanded} />;
   }
 
   // Единица сворачивания — СООБЩЕНИЕ, а не отдельный текстовый кусок. Кнопка
@@ -3235,18 +3771,15 @@ const HistoryUserPromptContent = ({
                 buttonRef={(node) => setRevealAnchor(partKey, node)}
                 onClick={() => togglePopoverPart(partKey)}
               />
-              {forceExpanded && <pre className="cb-paste-chip-body">{part.text}</pre>}
+              {forceExpanded && (
+                <PastedContentPreview text={part.text} />
+              )}
               {!forceExpanded && open && (
                 <HistoryChipPopover
                   anchor={revealAnchorsRef.current.get(partKey) || null}
                   onClose={closePopover}
                 >
-                  <pre
-                    className="cb-paste-chip-body"
-                    style={{ width: '100%', margin: 0, maxHeight: 'min(360px, calc(100vh - 32px))' }}
-                  >
-                    {part.text}
-                  </pre>
+                  <PastedContentPreview text={part.text} />
                 </HistoryChipPopover>
               )}
             </React.Fragment>
@@ -3324,14 +3857,29 @@ const HistoryUserEntry = memo(({
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editableLastPrompt = entry.deliveryStatus === 'editable-last-prompt';
-  const canRewind = allowRewind && !rewindLocked;
+  const instructionAttachment = useMemo(
+    () => historyInstructionAttachment(entry.content, toolType),
+    [entry.content, toolType],
+  );
+  const canRewind = allowRewind && !rewindLocked && !instructionAttachment;
   const queueStatus = entry.queueStatus;
   const queueStatusPresentation = historyPromptHandoffStatusPresentation(queueStatus);
   const canDismissPromptPresentation = isLocalPromptEntry(entry)
     && !!entry.handoffId
     && !!onDismissPromptPresentation;
-  const singleChipOnly = useMemo(() => (
-    !forceExpanded && historyUserPromptIsSingleChip({
+  const promptPresentation = useMemo(() => buildHistoryComposerPresentationParts({
+    text: entry.content,
+    chips: entry.promptChips,
+    imagePaths: entry.imagePaths,
+  }), [entry.content, entry.imagePaths, entry.promptChips]);
+  const detachedPrompts = useMemo(() => (
+    forceExpanded
+      ? { promptParts: [] as HistoryPromptPresentationPart[], bodyParts: promptPresentation.parts as Array<any> }
+      : splitLeadingHistoryPromptParts(promptPresentation.parts as Array<any>)
+  ), [forceExpanded, promptPresentation.parts]);
+  const hasDetachedPromptBand = detachedPrompts.promptParts.length > 0;
+  const chipOnly = useMemo(() => (
+    !forceExpanded && historyUserPromptIsChipOnly({
       text: entry.content,
       promptChips: entry.promptChips,
       imagePaths: entry.imagePaths,
@@ -3388,8 +3936,11 @@ const HistoryUserEntry = memo(({
       entryUuid={entry.uuid}
       emphasis={editableLastPrompt ? 'editable' : 'none'}
       title={editableLastPrompt ? 'Editable last prompt' : undefined}
-      contentClassName={singleChipOnly ? 'hp-history-user-bubble--single-chip' : undefined}
-      status={queueStatusPresentation ? (
+      contentClassName={chipOnly ? 'hp-history-user-bubble--single-chip' : undefined}
+      status={hasDetachedPromptBand ? (
+        <HistoryUserPromptBand parts={detachedPrompts.promptParts} />
+      ) : undefined}
+      footer={queueStatusPresentation ? (
         <span className="hp-user-message-status">
           {canDismissPromptPresentation && (
             <Tooltip content="Скрыть эту карточку">
@@ -3434,7 +3985,7 @@ const HistoryUserEntry = memo(({
               {copied ? <Check size={11} /> : <Copy size={11} />}
             </MessageActionButton>
           </Tooltip>
-          {allowRewind && (
+          {allowRewind && !instructionAttachment && (
             <Tooltip content={rewindUnavailableReason || (rewindLocked ? 'Rewind уже выполняется' : 'Откатиться к этому prompt')}>
               <MessageActionButton
                 tone="warning"
@@ -3460,6 +4011,7 @@ const HistoryUserEntry = memo(({
         imagePaths={entry.imagePaths}
         toolType={toolType}
         forceExpanded={forceExpanded}
+        presentationParts={hasDetachedPromptBand ? detachedPrompts.bodyParts : undefined}
       />
     </ConversationMessage>
   );
@@ -3473,6 +4025,7 @@ const HistoryAssistantEntry = memo(({
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveBackgroundUuids = React.useContext(HistoryBackgroundLiveContext);
+  const liveBackgroundTaskCalls = React.useContext(HistoryBackgroundTaskCallContext);
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
   }, []);
@@ -3570,7 +4123,16 @@ const HistoryAssistantEntry = memo(({
             </div>
           );
         }
-        if (isTaskAction(action)) return <SubAgentBlock key={'task' + index} action={action} />;
+        if (isTaskAction(action)) {
+          return (
+            <SubAgentBlock
+              key={'task' + index}
+              action={action}
+              entryUuid={entry.uuid}
+              live={liveBackgroundTaskCalls.has(historySubagentCallIdentity(action.toolUseId))}
+            />
+          );
+        }
         if (isFileAction(action)) {
           return action.tool === 'Read'
             ? <ReadActionBlock key={'rd' + index} filePath={action.filePath} />
@@ -3595,390 +4157,6 @@ const HistoryAssistantEntry = memo(({
     </ConversationMessage>
   );
 });
-
-// ---- Collapsed series group row (display-units projection) ----
-// Fixed two-line geometry: header (icon + caption/verb + count + status) and
-// a detail line that NEVER disappears — while the series is live it shows the
-// current operation, afterwards the member digest (owner contract: constant
-// tail geometry; a vanishing second line would break tail pinning).
-type HistoryGroupHeaderSegment = {
-  key: string;
-  label: string;
-  ariaLabel?: string;
-  qualifier?: string;
-  count: number;
-  docsKind?: string;
-  docsAccent?: boolean;
-  icon?: 'thinking';
-};
-
-type HistoryGroupHeaderData = {
-  segments: HistoryGroupHeaderSegment[];
-  digest: string;
-};
-
-const HISTORY_INNER_NAMES_MAX_CHARS = 70;
-const historyGroupFamilyLabel = (family: string): string => (
-  (HISTORY_GROUP_FAMILY_LABEL as Record<string, string>)[family]
-  || (HISTORY_GROUP_FAMILY_LABEL as Record<string, string>).other
-  || 'Tool'
-);
-
-/** Distinct user-visible labels in first-appearance order. Identity remains
- * the full target key, but the header contract is basename normally and
- * docs/... for documentation. Two ordinary files sharing a basename therefore
- * show that basename once; ×N still reports the honest call count. */
-const historyGroupTargetLabels = (facts: Array<any>, family: string): string[] => {
-  const items: Array<{ key: string; label: string }> = [];
-  const seen = new Set<string>();
-  for (const fact of facts) {
-    const operation = String(fact.operationLabel || fact.mcpMethod || fact.subject || '');
-    const target = String(fact.targetKey || '');
-    const key = family === 'mcp' || family === 'run' || family === 'git'
-      ? (operation || fact.toolUseId || '')
-      : (target || fact.targetLabel || operation || fact.toolUseId || '');
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    const label = family === 'mcp'
-      ? operation.replace(/_/g, ' ')
-      : String(fact.targetLabel || operation || target);
-    items.push({ key, label });
-  }
-  const labels: string[] = [];
-  const seenLabels = new Set<string>();
-  for (const item of items) {
-    if (!item.label || seenLabels.has(item.label)) continue;
-    seenLabels.add(item.label);
-    labels.push(item.label);
-  }
-  return labels;
-};
-
-const historyInnerGroupHeaderData = (group: any): HistoryGroupHeaderData => {
-  const family = String(group.familyKey || group.facts?.[0]?.family || 'run');
-  const targets = historyGroupTargetLabels(group.facts || [], family);
-  const joined = targets.join(', ');
-  const showNames = targets.length > 0 && targets.length <= 3
-    && joined.length <= HISTORY_INNER_NAMES_MAX_CHARS
-    && !(family === 'mcp' && (group.facts?.length || 0) > 3);
-  const count = Math.max(1, group.facts?.length || 0);
-  const docsKind = String(group.docsKind || '');
-  if (family === 'mcp') {
-    const server = String(group.facts?.[0]?.mcpServer || 'mcp').replace(/_/g, ' ');
-    return {
-      segments: [{
-        key: `mcp:${server}:${docsKind || 'regular'}`,
-        label: 'MCP',
-        qualifier: server.toLowerCase() === 'mcp' ? undefined : server,
-        count,
-        docsKind,
-      }],
-      digest: '',
-    };
-  }
-  return {
-    segments: [{
-      key: `${family}:${docsKind || 'regular'}`,
-      label: historyGroupFamilyLabel(family),
-      // Names stay valuable only for the file/search series where they answer
-      // WHAT was touched. Every series still ends in ×N, including a repeated
-      // read of one target (`Read main.js ×2`).
-      qualifier: showNames && (family === 'read' || family === 'search' || family === 'edit')
-        ? joined
-        : undefined,
-      count,
-      docsKind,
-      docsAccent: !!docsKind && (family === 'read' || family === 'search' || family === 'edit'),
-    }],
-    digest: '',
-  };
-};
-
-/**
- * Header text of a collapsed group.
- *
- * A group is now a CLASS (noise / edit), not a single family, so the header is
- * built from the per-family breakdown. Every fragment has one grammar:
- * `Type [qualifier] ×calls`. The multiplier is explicit even for one call;
- * there are no family-specific nouns (`files / queries / commands / calls`)
- * and no tense (`Called / Ran / Searched`).
- * The digest line (single-family only) names the distinct SUBJECTS — files
- * read, git subcommands — never the word already in the verb.
- */
-const historyGroupHeaderData = (group: {
-  familyKey: string;
-  facts: Array<{ toolUseId?: string; toolName?: string; family?: string; bashWord?: string; bashDetail?: string; mcpServer?: string; mcpMethod?: string; subject?: string; isError?: boolean }>;
-  entries: FullHistoryEntry[];
-  captionEntry?: FullHistoryEntry | null;
-  errorCount: number;
-}): HistoryGroupHeaderData => {
-  const breakdown = groupFamilyBreakdown(group.facts);
-  const segments: HistoryGroupHeaderSegment[] = [];
-  for (let bucketIndex = 0; bucketIndex < breakdown.length; bucketIndex += 1) {
-    const bucket = breakdown[bucketIndex];
-    if (bucket.family === 'mcp') {
-      // MCP is the type; the server is a qualifier. Different servers keep
-      // separate fragments so `MCP terminal ×2 · MCP knowledge ×1` never
-      // collapses back into the opaque old phrase `Called mcp`.
-      const servers: Array<[string, number]> = Array.from(
-        bucket.words.entries() as Iterable<[string, number]>,
-      );
-      if (servers.length === 0) servers.push(['mcp', bucket.count]);
-      for (let serverIndex = 0; serverIndex < servers.length; serverIndex += 1) {
-        const [rawServer, count] = servers[serverIndex];
-        const server = String(rawServer || 'mcp').replace(/_/g, ' ');
-        segments.push({
-          key: `mcp:${bucket.docsKind || 'regular'}:${serverIndex}:${server}`,
-          label: 'MCP',
-          qualifier: server.toLowerCase() === 'mcp' ? undefined : server,
-          count: Math.max(1, Number(count) || 0),
-          docsKind: bucket.docsKind || '',
-        });
-      }
-      continue;
-    }
-    segments.push({
-      key: `${bucket.family}:${bucket.docsKind || 'regular'}:${bucketIndex}`,
-      label: historyGroupFamilyLabel(bucket.family),
-      count: Math.max(1, Number(bucket.count) || 0),
-      docsKind: bucket.docsKind || '',
-      docsAccent: !!bucket.docsKind
-        && (bucket.family === 'read' || bucket.family === 'search' || bucket.family === 'edit'),
-    });
-  }
-
-  // Thinking is a real visible child of the broad work block, but not a tool
-  // call and not part of any family bucket. Count displayed reasoning blocks,
-  // place the fragment last, and leave seconds on the individual rows.
-  const thinkingCount = group.entries.reduce(
-    (sum, entry) => sum + ((entry?.thinking || entry?.hasThinking === true) ? 1 : 0),
-    0,
-  );
-  if (thinkingCount > 0) {
-    segments.push({
-      key: 'thinking',
-      label: '',
-      ariaLabel: 'Thinking',
-      count: thinkingCount,
-      icon: 'thinking',
-    });
-  }
-
-  if (segments.length === 0) {
-    segments.push({ key: 'work', label: 'Work', count: Math.max(1, group.entries.length) });
-  }
-  if (breakdown.length === 1) {
-    const bucket = breakdown[0];
-    // Single family: the second line lists WHAT was touched. Files where we
-    // have them (read/edit), otherwise the distinguishing command word.
-    const parts = bucket.subjects.length > 0
-      ? bucket.subjects
-      : Array.from(bucket.words.entries())
-        .map(([word, n]) => (n > 1 ? `${word} ×${n}` : word));
-    return { segments, digest: parts.join(', ') };
-  }
-  return { segments, digest: '' };
-};
-
-const historyGroupHeaderText = (segments: HistoryGroupHeaderSegment[]): string => (
-  segments.map((segment) => [
-    segment.ariaLabel || segment.label,
-    segment.qualifier,
-    `×${segment.count}`,
-  ].filter(Boolean).join(' ')).join(' · ')
-);
-
-const HistoryCollapsedGroupRow = memo(({
-  group,
-  expanded,
-  liveBackgroundUuids,
-  isTurnBusy,
-  isLastUnit,
-  onToggle,
-}: {
-  group: {
-    key: string;
-    level?: number;
-    familyKey: string;
-    docsKind?: string;
-    entries: FullHistoryEntry[];
-    captionEntry?: FullHistoryEntry | null;
-    facts: Array<{ toolUseId?: string; toolName?: string; family?: string; bashWord?: string; bashDetail?: string; mcpServer?: string; mcpMethod?: string; targetKey?: string; targetLabel?: string; operationLabel?: string; docsKind?: string; isError?: boolean }>;
-    errorCount: number;
-    thinkingSeconds?: number;
-  };
-  expanded: boolean;
-  liveBackgroundUuids: ReadonlySet<string>;
-  isTurnBusy: boolean;
-  isLastUnit: boolean;
-  onToggle: () => void;
-}) => {
-  // Liveness = a member call is GENUINELY awaiting its result during a busy
-  // turn, or a member carries live background work. Never "the turn is busy
-  // and we are the tail": that rule made the spinner a function of display
-  // position — expanding the group demoted the header from last-unit and the
-  // spinner vanished while nothing else changed (user: «в свёрнутом роллер
-  // есть, в развёрнутом нет — какого хуя»), and it also burned the spinner
-  // through think-gaps when nothing inside the group was running.
-  const live = (isTurnBusy && group.facts.some((fact) => (fact as any).inFlight === true))
-    || group.entries.some((entry) => liveBackgroundUuids.has(entry.uuid));
-  const inner = group.level === 2;
-  const { segments, digest } = inner
-    ? historyInnerGroupHeaderData(group)
-    : historyGroupHeaderData(group);
-  const headerText = historyGroupHeaderText(segments);
-  const caption = group.captionEntry && typeof group.captionEntry.content === 'string'
-    ? group.captionEntry.content.trim()
-    : '';
-  // ONE glyph for every collapsed group, whatever is inside it.
-  //
-  // Earlier the icon followed the dominant family, so two rows that are the
-  // same THING — a collapsed, expandable run of work — wore different glyphs
-  // (a file-edit sheet here, three strokes there) and the row's real identity
-  // stopped being legible at a glance. The family is already spelled out in
-  // words right next to it (`Run ×2 · Search ×1`); the glyph's
-  // job is to say "this is a group, click to open", which is one fact and
-  // therefore one symbol. Individual cards keep their own family glyphs, so
-  // group and card never look alike.
-  return (
-    <div
-      className={`hp-history-group${inner ? ' hp-history-group--inner' : ''}`}
-      data-history-group-live={live ? '1' : undefined}
-      data-history-group-level={inner ? '2' : '1'}
-      data-history-docs-kind={group.docsKind || undefined}
-    >
-      <div className="hp-history-group-head">
-      <div
-        className="hp-history-group-head-inner"
-        role="button"
-        tabIndex={0}
-        aria-expanded={expanded}
-        onClick={onToggle}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            onToggle();
-          }
-        }}
-      >
-        <ColoredToolIcon
-          icon={inner
-            ? cbToolIcon(group.facts[0]?.toolName || 'Bash', 13, group.familyKey)
-            : cbToolIcon('Bash', 13, 'group')}
-          // Collapsed: the group INHERITS the running child's spinner. Expanded:
-          // the spinner lives on that child card itself (its status is already
-          // 'running'), the header goes back to the static stack — one loader
-          // per fact, never two for the same call.
-          //
-          // The header never turns red for member errors: successes are not
-          // marked either, so flagging only failures is dishonest asymmetry
-          // (user decision) — and one failed probe painting a 7-call group's
-          // whole identity red overstates it. The failing card is red itself
-          // on expand.
-          status={live && !expanded ? 'running' : 'done'}
-        />
-        {/* WHAT HAPPENED comes first, right after the glyph. A docs fragment
-            may colour its ACTION word only; qualifier and ×N keep the shared
-            neutral hierarchy. Structured spans make that distinction possible
-            inside one mixed group while preserving one accessible line. */}
-        <span className="hp-history-group-count" aria-label={headerText}>
-          {segments.map((segment, index) => (
-            <React.Fragment key={segment.key}>
-              {index > 0 && <span className="hp-history-group-separator"> · </span>}
-              <span className={`hp-history-group-token${segment.docsAccent ? ` hp-history-group-token--docs-${segment.docsKind}` : ''}`}>
-                {segment.icon === 'thinking'
-                  ? <CBBrainIcon size={13} className="cb-think-ic hp-history-group-thinking-icon" />
-                  : <span className="hp-history-group-token-label">{segment.label}</span>}
-                {segment.qualifier && (
-                  <span className="hp-history-group-token-qualifier"> {segment.qualifier}</span>
-                )}
-                <span className="hp-history-group-token-count"> ×{segment.count}</span>
-              </span>
-            </React.Fragment>
-          ))}
-        </span>
-        {expanded
-          ? <ChevronDown size={11} style={{ color: '#6f6d68', flexShrink: 0 }} />
-          : <ChevronRight size={11} style={{ color: '#6f6d68', flexShrink: 0 }} />}
-      </div>
-      </div>
-      {/* Second line while collapsed: the model's caption if it wrote one,
-          otherwise the digest of subjects. Never both — the row stays two
-          lines tall. */}
-      {!expanded && (caption || digest) && (
-        <div className="hp-history-group-detail">
-          <span aria-hidden style={{ flexShrink: 0 }}>└</span>
-          <span>{caption || digest}</span>
-        </div>
-      )}
-    </div>
-  );
-});
-
-const HistoryGroupFoot = ({
-  groupKey,
-  onCollapse,
-  title = 'Свернуть блок',
-}: {
-  groupKey: string;
-  onCollapse: (groupKey: string, source?: 'foot' | 'rail') => void;
-  title?: string;
-}) => (
-  <button
-    type="button"
-    className="hp-history-group-foot"
-    data-history-group-foot={groupKey}
-    aria-label={title}
-    title={title}
-    onClick={() => onCollapse(groupKey, 'foot')}
-  >
-    <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden focusable="false">
-      {/* The rail ARRIVES at the arrow tip and ends there. The old path ran
-          from the tip down to y=14, so a vertical tail visibly continued
-          underneath the upward chevron. */}
-      <path d="M7 0 V6" fill="none" stroke="currentColor" strokeWidth="1" />
-      <path
-        d="M11 10 L7 6 L3 10"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.25"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  </button>
-);
-
-const HistoryGroupRail = ({
-  groupKey,
-  onCollapse,
-  title = 'Свернуть блок',
-  nested = false,
-}: {
-  groupKey: string;
-  onCollapse: (groupKey: string, source?: 'foot' | 'rail') => void;
-  title?: string;
-  nested?: boolean;
-}) => (
-  <button
-    type="button"
-    className="hp-history-group-rail-control"
-    data-history-group-rail={groupKey}
-    data-history-group-rail-level={nested ? 'inner' : 'outer'}
-    aria-label={title}
-    title={title}
-    tabIndex={-1}
-    onMouseDown={(event) => {
-      event.preventDefault();
-      event.stopPropagation();
-    }}
-    onClick={(event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      onCollapse(groupKey, 'rail');
-    }}
-  />
-);
 
 /**
  * A slash command the USER typed (`/model`, `/effort`, `/rewind`).
@@ -4293,7 +4471,8 @@ const historyPanelStyleText = `@keyframes hp-flash {
   align-items: center;
   justify-content: center;
   gap: 3px;
-  margin-bottom: 4px;
+  margin-top: 4px;
+  margin-bottom: 0;
 }
 .hp-user-message-status > .cb-message-status {
   height: var(--hp-user-message-status-height);
@@ -4326,6 +4505,16 @@ const historyPanelStyleText = `@keyframes hp-flash {
   border-color: rgba(245, 158, 11, 0.8);
   background: rgba(245, 158, 11, 0.16);
   color: #f0b95b;
+}
+.hp-history-user-prompt-band {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 100%;
+  margin-bottom: 4px;
+  white-space: normal;
 }
 .hp-agent-prompt::-webkit-scrollbar-thumb:hover {
   background: #5a5a5a;
@@ -4385,9 +4574,9 @@ const historyPanelStyleText = `@keyframes hp-flash {
   padding-top: 0;
   padding-bottom: 0;
 }
-/* A lone prompt/paste/image/instructions chip is already a bordered card.
-   Remove only the redundant outer user bubble; mixed content still needs the
-   orange container that explains which pieces belong to one sent message. */
+/* Prompt/paste/image/instructions chips are already bordered cards. A row made
+   only from one or several chips needs no second orange container; mixed
+   content keeps the orange bubble around the user's actual text. */
 .hp-history-transcript .cb-user-bubble.hp-history-user-bubble--single-chip {
   padding: 0;
   border: 0;
@@ -4419,6 +4608,13 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-history-transcript .hp-assistant-tool-only {
   padding-top: 0;
   padding-bottom: 0;
+}
+.hp-history-nested-transcript {
+  min-width: 0;
+}
+.hp-history-nested-transcript .hp-history-group-foot {
+  /* Nested subagent detail uses #111 rather than the primary History canvas. */
+  background: #111111;
 }
 /* Collapsed group unit: fixed two-line geometry (header + detail line). The
    detail line NEVER disappears on completion — its content changes from the
@@ -4496,6 +4692,9 @@ const historyPanelStyleText = `@keyframes hp-flash {
   color: #888;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+.hp-history-group-token-count--error {
+  color: rgba(248, 113, 113, 0.58);
 }
 .hp-history-group-thinking-icon {
   display: inline-block;
@@ -4622,7 +4821,9 @@ const historyPanelStyleText = `@keyframes hp-flash {
 /* Every visible segment of the rail is the SAME collapse control. The
    transparent button is centred on the 1px border and spans the member's full
    height; it adds no layout width and does not turn the content area into a
-   target. Hover/focus brightens only the line segment under the pointer. */
+   target. Pointer enter marks every currently rendered segment with the same
+   group key, so one hover brightens the whole continuous rail rather than the
+   30px fragment owned by one virtual row. */
 .hp-history-group-rail-control {
   position: absolute;
   left: -7px;
@@ -4639,7 +4840,9 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-history-group-member:has(> .hp-history-group-rail-control:hover),
 .hp-history-group-member:has(> .hp-history-group-rail-control:focus-visible),
 .hp-history-subgroup-member:has(> .hp-history-group-rail-control:hover),
-.hp-history-subgroup-member:has(> .hp-history-group-rail-control:focus-visible) {
+.hp-history-subgroup-member:has(> .hp-history-group-rail-control:focus-visible),
+.hp-history-group-member[data-history-group-rail-hot="1"],
+.hp-history-subgroup-member[data-history-group-rail-hot="1"] {
   border-left-color: rgba(255, 255, 255, 0.42);
 }
 
@@ -4676,7 +4879,8 @@ const historyPanelStyleText = `@keyframes hp-flash {
   z-index: 2;
 }
 .hp-history-group-foot:hover,
-.hp-history-group-foot:focus-visible { color: #b8b6b1; }
+.hp-history-group-foot:focus-visible,
+[data-history-group-rail-hot="1"] > .hp-history-group-foot { color: #b8b6b1; }
 /* A SINGLE-family group already names the family in its header (Git ×3,
    Read ×3), so repeating that same word on every member doubles it
    (user feedback). A MIXED group is the opposite case: the verb is the only
@@ -4796,6 +5000,23 @@ const historyPanelStyleText = `@keyframes hp-flash {
    строке эти же кнопки остаются 18px. */
 [data-history-composer-prompt-band] .cb-composer-chip {
   padding: 1px 6px;
+  /* Непрозрачная подложка под чипом.
+     Слой над рамкой сам по себе прозрачный, а под ним идёт переписка — и
+     собственный фон чипа (13% плотности) её не закрывал: замерено, сквозь чип
+     просвечивало 87% того, что под ним, и на светлой строке текста подпись
+     чипа падала до контраста 1.28 (нечитаемо) вместо 9.45.
+     Слой берётся от рамки ввода тем же токеном, что и плашка состояния рядом:
+     фон рамки поменяется — подложка поедет за ним, без второй правки. Свой
+     цвет чипа ложится СВЕРХУ этой подложки, поэтому оттенок сохраняется.
+     Верхний слой записан заливкой в один цвет, а не вторым цветом через
+     запятую: в сокращённой записи фона несколько слоёв — это только
+     изображения, цвет допустим лишь последним, и запись с двумя цветами
+     браузер отбрасывает ЦЕЛИКОМ (поймано замером: чип остался прозрачным). */
+  background-color: var(--cb-composer-bg, #0f0f0f);
+  background-image: linear-gradient(
+    var(--cb-composer-chip-prompt-bg),
+    var(--cb-composer-chip-prompt-bg)
+  );
 }
 [data-history-composer-prompt-band] .hp-composer-chip-action {
   width: 14px;
@@ -5748,11 +5969,9 @@ function AgentHistoryControls({
   //
   // It used to be a line at the very bottom of the panel: it appeared under the
   // input, raised the whole frame, and then stayed until some unrelated action
-  // happened to clear it — a Stop that failed ten minutes ago still sat there
-  // while the user typed the next prompt. Two things were wrong with that. The
-  // panel paid layout for something that is an event, and the message had no
-  // lifetime of its own, so an old failure kept describing a situation that no
-  // longer existed.
+  // happened to clear it. The toast keeps the event out of the composer layout,
+  // but a terminal failure must not disappear before the user can inspect or
+  // copy its incident report. It therefore stays until explicitly dismissed.
   //
   // Scoped to this tab, so a failure in a background pane is announced over ITS
   // surface and not over the one being read; a tab-scoped toast falls back to
@@ -5780,7 +5999,7 @@ function AgentHistoryControls({
       headline,
       'error',
       6000,
-      false,
+      true,
       incidentReport,
       undefined,
       undefined,
@@ -7030,7 +7249,12 @@ function AgentHistoryControls({
     }
   }, [runtime.logPrefix, tabId]);
 
-  const runAction = useCallback(async (kind: 'resume' | 'send' | 'interrupt' | 'stop') => {
+  const runAction = useCallback(async (
+    kind: 'resume' | 'send' | 'interrupt' | 'stop',
+    options: { recordWithoutReply?: boolean } = {},
+  ) => {
+    const recordWithoutReply = kind === 'send' && options.recordWithoutReply === true;
+    let queuedBehindExistingSend = false;
     const coordinatedAtClick = getCoordinatedAgentAction(tabId);
     if (coordinatedAtClick) {
       actionInFlightRef.current = true;
@@ -7048,6 +7272,12 @@ function AgentHistoryControls({
         // process or requiring a second Enter.
         historyDiag('JOIN_ACTION tab=' + tabId.slice(-12)
           + ' kind=send after=resume status=starting');
+      } else if (kind === 'send' && activeKind === 'send') {
+        queuedBehindExistingSend = true;
+        historyDiag('QUEUE_ACTION tab=' + tabId.slice(-12)
+          + ' kind=send after=send'
+          + ' status=' + statusRef.current
+          + ' head=' + (coordinatedAtClick?.handoffId || '-'));
       } else if (kind === 'stop' && activeKind === 'send') {
         const queued = requestCoordinatedStopAfterSend(tabId);
         if (queued.queued && !queued.deduped) {
@@ -7089,24 +7319,28 @@ function AgentHistoryControls({
         return;
       }
     }
-    if (kind === 'send' && pasteBusyRef.current) {
+    if (kind === 'send' && pasteBusyRef.current && !queuedBehindExistingSend) {
       console.log('[' + runtime.logPrefix + '] drop-action tab=' + tabId.slice(-12) + ' kind=send reason=paste-busy');
       return;
     }
     const actionTabId = tabId;
     let coordinatedSendToken: number | null = null;
     if (kind === 'send') {
-      const started = beginCoordinatedAgentSend(actionTabId);
+      const started = beginCoordinatedAgentSend(actionTabId, Date.now(), {
+        recordWithoutReply,
+      });
       if (!started.started || !started.token) {
         historyDiag('DROP_ACTION tab=' + actionTabId.slice(-12)
           + ' kind=send reason=' + (started.reason || 'coordinator-inflight'));
         return;
       }
       coordinatedSendToken = started.token;
+      queuedBehindExistingSend = queuedBehindExistingSend || started.queued === true;
     }
     const actionSeq = ++actionSeqRef.current;
     const isCurrentAction = () => (
-      tabIdRef.current === actionTabId && actionSeqRef.current === actionSeq
+      tabIdRef.current === actionTabId
+      && (kind === 'send' || actionSeqRef.current === actionSeq)
     );
     let sendHandoffId: string | null = null;
     let sendOwnershipTransferred = false;
@@ -7132,6 +7366,9 @@ function AgentHistoryControls({
     let sendIncidentImages = 0;
     let sendIncidentChips = 0;
     let sendFailureResult: any = null;
+    let sendCoordinatedSettlement: any = null;
+    let historyRecordSettledEarly = false;
+    let cascadeBatchRestored = false;
     const restoreClearedSendSnapshot = (reason: string) => {
       const restorePrompt = clearedPromptText;
       if (
@@ -7265,10 +7502,16 @@ function AgentHistoryControls({
             ? (runtime.toolType !== 'claude' || resumeMaterialized === true)
             : !!runtime.startFresh
         );
+        const canRecordWithoutReply = recordWithoutReply
+          && (statusAtSend === 'active' || statusAtSend === 'inactive');
+        const canQueueBehindExistingSend = queuedBehindExistingSend
+          && statusAtSend !== 'unknown';
         if (statusAtSend !== 'active'
           && !acceptsBusyPrompt
           && !canLaunchBeforeSend
-          && !canWaitForExistingLaunch) {
+          && !canWaitForExistingLaunch
+          && !canRecordWithoutReply
+          && !canQueueBehindExistingSend) {
           throw new Error(runtime.label + ' is not ready (' + statusAtSend + ')');
         }
         if (statusAtSend === 'active') {
@@ -7351,7 +7594,9 @@ function AgentHistoryControls({
         sendIncidentPromptText = sendPayload;
         const handoffId = createPromptHandoffId();
         const submittedAt = Date.now();
-        const initialQueueStatus = historyPromptHandoffInitialStatus(statusAtSend);
+        const initialQueueStatus = recordWithoutReply || queuedBehindExistingSend
+          ? 'preparing'
+          : historyPromptHandoffInitialStatus(statusAtSend);
         sendHandoffId = handoffId;
         if (coordinatedSendToken) {
           const bound = bindCoordinatedAgentSendHandoff(
@@ -7384,6 +7629,14 @@ function AgentHistoryControls({
         const promptChipsForHistory = sourceDraftChips
           .filter((chip) => chip.kind === 'prompt')
           .map((chip) => ({ ...chip, kind: 'prompt' as const }));
+        const localCodexSlashCandidate = !recordWithoutReply
+          && runtime.toolType === 'codex'
+          && isStandaloneCodexLocalSlashCommand({
+            prompt: sendPayload,
+            imageCount: sendDraftImages.length,
+            chipCount: promptChipsForHistory.length,
+          });
+        const requiresAuditIdentity = !localCodexSlashCandidate;
         beginHistoryPromptHandoff({
           tabId: actionTabId,
           handoffId,
@@ -7392,11 +7645,14 @@ function AgentHistoryControls({
           text: presentationText,
           promptChips: promptChipsForHistory,
           imagePaths: sendDraftImages,
+          authoringText: rawDraftSnapshot,
+          authoringChips: sourceDraftChips,
+          authoringImagePaths: sendDraftImages,
           submittedAt,
           source: 'history-panel',
           statusAtSend,
           initialStatus: initialQueueStatus,
-          requiresAuditIdentity: true,
+          requiresAuditIdentity,
         });
         onPromptSubmitted(presentationText, initialQueueStatus, {
           handoffId,
@@ -7404,7 +7660,7 @@ function AgentHistoryControls({
           submittedAt,
           promptChips: promptChipsForHistory,
           imagePaths: sendDraftImages,
-          requiresAuditIdentity: true,
+          requiresAuditIdentity,
         });
         const latestText = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
         const latestImages = retainHistoryDraftImages(
@@ -7465,21 +7721,95 @@ function AgentHistoryControls({
         }
         delayedDeliveryWarningHandoffRef.current = null;
         setDraftWarning(null);
+        const codexMutationProof = runtime.toolType === 'codex' && sessionId
+          ? getCodexHistoryMutationSettingsProof(tabId, sessionId)
+          : null;
+        const codexLaunchSettings = runtime.toolType === 'codex'
+          ? getCodexLaunchOptions(tabId)
+          : null;
         const result = await sendAgentPromptScenario({
           tabId,
           toolType: runtime.toolType,
           runtime,
+          // The common scenario re-proves whether a Claude UUID represents a
+          // materialized conversation before it stops the process. Renderer
+          // state may still be loading and cannot choose Fresh vs Resume.
           sessionId,
           cwd,
           prompt: sendPayload,
           handoffId,
+          // Recording context is a lifecycle policy of the same History
+          // authoring operation. Keeping the canonical source preserves the
+          // durable identity used to replace the optimistic row exactly.
           source: 'history-panel',
           statusAtSend,
-          queue: statusAtSend === 'busy',
+          queue: !recordWithoutReply && statusAtSend === 'busy',
+          model: codexMutationProof?.model || codexLaunchSettings?.model,
+          effort: codexMutationProof?.effort || codexLaunchSettings?.effort,
           returnDraftOnConflict: true,
           claudeExactEmptyEvidence,
           coordinatedSendToken,
+          recordWithoutReply,
+          onRestartPhase: (phase) => {
+            if (!isCurrentAction()) return;
+            if (phase === 'stopping') {
+              processStopInFlightRef.current = true;
+              presenceGenerationRef.current += 1;
+              setStatusFrom('stopping', 'record-context-stop');
+            } else {
+              processStopInFlightRef.current = false;
+              presenceGenerationRef.current += 1;
+              setStatusFrom('starting', 'record-context-start');
+            }
+          },
+          onHistoryRecorded: (recorded) => {
+            const attemptId = String(recorded?.sendAttemptId || recorded?.attemptId || '');
+            const operationKey = String(recorded?.sendOperationKey || recorded?.operationKey || '');
+            const proof = historyPromptHandoffAuditProofFromSendResult(recorded);
+            if (!attemptId || !operationKey || !proof) {
+              historyDiag('HISTORY_CONTEXT_EARLY_PROOF_MISSING tab=' + actionTabId.slice(-12)
+                + ' handoff=' + handoffId
+                + ' attempt=' + (attemptId || '-')
+                + ' operation=' + (operationKey || '-'));
+              return;
+            }
+            const bound = bindHistoryPromptHandoffSendIdentity(actionTabId, handoffId, {
+              sendAttemptId: attemptId,
+              sendOperationKey: operationKey,
+            });
+            if (!bound.ok) {
+              historyDiag('HISTORY_CONTEXT_EARLY_BIND_FAILED tab=' + actionTabId.slice(-12)
+                + ' handoff=' + handoffId
+                + ' reason=' + (bound.reason || 'unknown'));
+              return;
+            }
+            sendOwnershipTransferred = true;
+            sendAuditIdentity = {
+              requiresAuditIdentity: true,
+              auditTimestamp: proof.auditTimestamp,
+              auditHash: proof.actualHash,
+              auditSessionId: proof.sessionId || undefined,
+              auditEntryUuid: proof.entryUuid,
+              sourceIdentity: proof.sourceIdentity,
+              recordByteOffset: proof.recordByteOffset,
+            };
+            settleHistoryPromptHandoff(actionTabId, handoffId, {
+              queueStatus: 'sent',
+              reason: 'history-context-recorded',
+              proof,
+              requiresAuditIdentity: true,
+            });
+            onPromptStatusChange(
+              handoffId,
+              'sent',
+              'history-context-recorded',
+              sendAuditIdentity,
+            );
+            historyRecordSettledEarly = true;
+            refreshHistoryWithUpdating('history-context-recorded');
+          },
           onReadyForSend: (readyStatus) => {
+            if (recordWithoutReply) return;
             advanceHistoryPromptHandoffTransportPhase(
               actionTabId,
               handoffId,
@@ -7493,7 +7823,14 @@ function AgentHistoryControls({
           },
         });
         sendFailureResult = result;
-        const resultOwnershipTransferred = queueSendTransferredOwnership(result);
+        sendCoordinatedSettlement = result?.coordinatedSettlement || null;
+        const localSlashReceipt = projectCodexLocalSlashSendResult({
+          candidate: localCodexSlashCandidate,
+          result,
+        });
+        const resultOwnershipTransferred = localSlashReceipt.handled
+          ? localSlashReceipt.transferred === true
+          : queueSendTransferredOwnership(result);
         const resultSendAttemptId = typeof (result?.sendAttemptId || result?.attemptId) === 'string'
           ? String(result.sendAttemptId || result.attemptId)
           : '';
@@ -7501,7 +7838,7 @@ function AgentHistoryControls({
           ? String(result.sendOperationKey || result.operationKey)
           : '';
         let sendIdentityFailure = '';
-        if (resultOwnershipTransferred) {
+        if (resultOwnershipTransferred && !localSlashReceipt.handled) {
           if (!resultSendAttemptId || !resultSendOperationKey) {
             sendIdentityFailure = 'missing-durable-send-identity';
           } else {
@@ -7527,13 +7864,18 @@ function AgentHistoryControls({
         // A receipt from a different/unknown physical attempt cannot prove
         // this optimistic row. Keep ownership with the terminal and show an
         // explicit unconfirmed state; never retry the already-submitted text.
-        const auditProof = sendIdentityFailure
+        const auditProof = localSlashReceipt.handled || sendIdentityFailure
           ? null
           : historyPromptHandoffAuditProofFromSendResult(result);
-        const unconfirmedStatus = sendIdentityFailure
-          ? 'delivery-unknown' as const
-          : historyPromptHandoffUnconfirmedStatusFromSendResult(result);
-        const providerQueueReturned = historyPromptAuditIsProviderQueueReturn(
+        const unconfirmedStatus = localSlashReceipt.handled
+          ? (localSlashReceipt.queueStatus === 'delivery-unknown'
+            ? 'delivery-unknown' as const
+            : null)
+          : sendIdentityFailure
+            ? 'delivery-unknown' as const
+            : historyPromptHandoffUnconfirmedStatusFromSendResult(result);
+        const historyOnly = result?.historyOnly === true;
+        const providerQueueReturned = !historyOnly && historyPromptAuditIsProviderQueueReturn(
           result?.pasteAudit || result,
         );
         const finalAuditFailure = result?.success === false
@@ -7541,11 +7883,14 @@ function AgentHistoryControls({
           && !unconfirmedStatus;
         const effectiveStatusAtSend = result?.effectiveStatusAtSend || statusAtSend;
         const resultQueueStatus: Exclude<HistoryPromptHandoffStatus,
-          'preparing' | 'sending' | 'failed'> = providerQueueReturned
-          ? 'cancelled'
-          : unconfirmedStatus || (effectiveStatusAtSend === 'busy' ? 'queued' : 'sent');
+          'preparing' | 'sending' | 'failed'> = localSlashReceipt.handled
+          && localSlashReceipt.queueStatus
+          ? localSlashReceipt.queueStatus
+          : providerQueueReturned
+            ? 'cancelled'
+            : unconfirmedStatus || (effectiveStatusAtSend === 'busy' ? 'queued' : 'sent');
         sendAuditIdentity = {
-          requiresAuditIdentity: resultOwnershipTransferred,
+          requiresAuditIdentity: resultOwnershipTransferred && !localSlashReceipt.handled,
           auditTimestamp: auditProof?.auditTimestamp,
           auditHash: auditProof?.actualHash,
           auditSessionId: auditProof?.sessionId || undefined,
@@ -7553,10 +7898,12 @@ function AgentHistoryControls({
           sourceIdentity: auditProof?.sourceIdentity,
           recordByteOffset: auditProof?.recordByteOffset,
         };
-        if (resultOwnershipTransferred) {
+        if (resultOwnershipTransferred && !historyRecordSettledEarly) {
           settleHistoryPromptHandoff(actionTabId, handoffId, {
             queueStatus: resultQueueStatus,
-            reason: sendIdentityFailure
+            reason: localSlashReceipt.handled
+              ? localSlashReceipt.reason || 'codex-local-slash-submitted'
+              : sendIdentityFailure
               ? 'send-durable-identity-' + sendIdentityFailure
               : providerQueueReturned
                 ? 'provider-queue-returned-to-terminal-composer'
@@ -7566,11 +7913,13 @@ function AgentHistoryControls({
                 ? 'send-submitted-audit-pending'
                 : resultQueueStatus === 'delivery-unknown'
                   ? 'send-delivery-unknown'
-                : 'send-result',
+                : historyOnly
+                  ? 'history-context-recorded'
+                  : 'send-result',
             proof: auditProof,
-            requiresAuditIdentity: true,
+            requiresAuditIdentity: !localSlashReceipt.handled,
           });
-        } else {
+        } else if (!resultOwnershipTransferred) {
           retractHistoryPromptHandoff(actionTabId, handoffId, 'send-refused-before-submit');
         }
         historyDiag('SEND_RESULT tab=' + tabId.slice(-12) +
@@ -7580,10 +7929,12 @@ function AgentHistoryControls({
           ' chunks=' + (result?.chunksTotal ?? 'na') +
           ' error=' + (result?.error || '-'));
         sendOwnershipTransferred = resultOwnershipTransferred;
-        sendDeliveryUnconfirmed = !providerQueueReturned && (
-          unconfirmedStatus !== null
-          || (result?.submitted === true && result?.success === false)
-        );
+        sendDeliveryUnconfirmed = localSlashReceipt.handled
+          ? localSlashReceipt.deliveryUnconfirmed === true
+          : !providerQueueReturned && (
+              unconfirmedStatus !== null
+              || (result?.submitted === true && result?.success === false)
+            );
         sendRefusalPasteWritten = result?.pasteWritten === true;
         sendTransferredQueueStatus = resultQueueStatus;
         historyDiag('SEND_OWNERSHIP tab=' + tabId.slice(-12) +
@@ -7609,7 +7960,9 @@ function AgentHistoryControls({
             setDraftWarning(null);
           } else {
             setDraftWarning(unconfirmedStatus === 'delivery-unknown'
-              ? 'Prompt delivery is unconfirmed. It will not be sent again automatically.'
+              ? historyOnly
+                ? 'History recording is unconfirmed. It will not be repeated automatically.'
+                : 'Prompt delivery is unconfirmed. It will not be sent again automatically.'
               : 'Prompt was submitted, but delivery confirmation is delayed. It will not be sent again automatically.');
           }
           console.warn('[' + runtime.logPrefix + ':draft] send delivery unconfirmed; ownership kept by terminal tab='
@@ -7617,29 +7970,31 @@ function AgentHistoryControls({
             + ' handoff=' + handoffId
             + ' error=' + (result?.error || '-'));
         }
-        midstreamPromptRecoveryRef.current = {
-          serializedText: presentationText,
-          transportText: sendPayload,
-          rawText: rawDraftSnapshot,
-          chips: sourceDraftChips,
-          images: sendDraftImages,
-          at: Date.now(),
-          submittedAt,
-          handoffId,
-          statusAtSend: (effectiveStatusAtSend === 'active' || effectiveStatusAtSend === 'busy')
-            ? effectiveStatusAtSend
-            : statusAtSend,
-          durableIdentity: {
-            requiresAuditIdentity: true,
-            auditTimestamp: sendAuditIdentity.auditTimestamp,
-            auditHash: sendAuditIdentity.auditHash,
-            auditSessionId: sendAuditIdentity.auditSessionId,
-            auditEntryUuid: sendAuditIdentity.auditEntryUuid,
-            sourceIdentity: sendAuditIdentity.sourceIdentity,
-            recordByteOffset: sendAuditIdentity.recordByteOffset,
-            sessionId: sendAuditIdentity.auditSessionId || sessionId || undefined,
-          },
-        };
+        if (!localSlashReceipt.handled && !historyOnly) {
+          midstreamPromptRecoveryRef.current = {
+            serializedText: presentationText,
+            transportText: sendPayload,
+            rawText: rawDraftSnapshot,
+            chips: sourceDraftChips,
+            images: sendDraftImages,
+            at: Date.now(),
+            submittedAt,
+            handoffId,
+            statusAtSend: (effectiveStatusAtSend === 'active' || effectiveStatusAtSend === 'busy')
+              ? effectiveStatusAtSend
+              : statusAtSend,
+            durableIdentity: {
+              requiresAuditIdentity: true,
+              auditTimestamp: sendAuditIdentity.auditTimestamp,
+              auditHash: sendAuditIdentity.auditHash,
+              auditSessionId: sendAuditIdentity.auditSessionId,
+              auditEntryUuid: sendAuditIdentity.auditEntryUuid,
+              sourceIdentity: sendAuditIdentity.sourceIdentity,
+              recordByteOffset: sendAuditIdentity.recordByteOffset,
+              sessionId: sendAuditIdentity.auditSessionId || sessionId || undefined,
+            },
+          };
+        }
         console.log('[' + runtime.logPrefix + ':draft] send tracked tab=' + tabId.slice(-12) + ' handoff=' + handoffId + ' statusAtSend=' + statusAtSend + ' chars=' + presentationText.length + ' chips=' + sourceDraftChips.length);
         const coordinatedAfterSend = getCoordinatedAgentAction(actionTabId);
         if (
@@ -7651,6 +8006,15 @@ function AgentHistoryControls({
             + ' submitted=' + !!result?.submitted
             + ' transferred=' + sendOwnershipTransferred
             + ' queuedAgeMs=' + (Date.now() - coordinatedAfterSend.stopRequestedAt));
+        } else if (historyOnly) {
+          midstreamPromptRecoveryRef.current = null;
+          if (result?.reopenWarning) {
+            setDraftWarning('Context was recorded, but the agent did not reopen: ' + result.reopenWarning);
+          }
+          if (result?.reopened === true) setStatusFrom('active', 'history-context-ready');
+          else refreshPresence();
+        } else if (localSlashReceipt.handled) {
+          refreshPresence();
         } else if (runtime.optimisticBusyOnSend) {
           setStatusFrom('busy', 'send-click');
         } else {
@@ -7703,11 +8067,80 @@ function AgentHistoryControls({
         setStatusFrom('inactive', 'stop-process-click');
       }
     } catch (e: any) {
+      if (kind === 'send') {
+        sendCoordinatedSettlement = e?.coordinatedSettlement || sendCoordinatedSettlement;
+      }
       const currentAction = isCurrentAction();
+      if (kind === 'send' && e?.cascadeRestoreByToken && e?.cascadeRestoreBatched === true) {
+        historyDiag('SEND_CASCADE_FOLLOWER_SKIP tab=' + actionTabId.slice(-12)
+          + ' handoff=' + (sendHandoffId || '-')
+          + ' ownerToken=' + e.cascadeRestoreByToken);
+        sendHandoffId = null;
+        return;
+      }
       if (!currentAction && kind !== 'send') {
         console.log('[' + runtime.logPrefix + '] stale action error ignored tab=' + actionTabId.slice(-12)
           + ' kind=' + kind + ' actionSeq=' + actionSeq + ' currentSeq=' + actionSeqRef.current);
         return;
+      }
+      const cascadeHandoffIds = Array.isArray(e?.cancelledFollowerHandoffIds)
+        ? [sendHandoffId, ...e.cancelledFollowerHandoffIds].filter(Boolean) as string[]
+        : [];
+      if (kind === 'send' && !sendOwnershipTransferred && cascadeHandoffIds.length > 1) {
+        const handoffs = getHistoryPromptHandoffsSnapshot(actionTabId);
+        const byId = new Map(handoffs.map((handoff) => [handoff.handoffId, handoff]));
+        const snapshots = cascadeHandoffIds
+          .map((handoffId) => byId.get(handoffId))
+          .filter(Boolean) as Array<{
+            handoffId: string;
+            authoringText: string;
+            authoringChips: readonly Readonly<Record<string, any>>[];
+            authoringImagePaths: readonly Readonly<HistoryPromptDraftImageRef>[];
+          }>;
+        if (snapshots.length === cascadeHandoffIds.length) {
+          const merged = mergeFailedHistoryAuthoringSnapshots({
+            currentText: useUIStore.getState().historyPromptDrafts[actionTabId] || '',
+            currentImages: useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
+            currentChips: useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
+            snapshots: snapshots.map((snapshot) => ({
+              text: snapshot.authoringText,
+              images: snapshot.authoringImagePaths,
+              chips: snapshot.authoringChips,
+            })),
+            createChipId: (chip: HistoryPromptDraftChip) => createComposerChipId(chip.kind),
+          });
+          const mergedText = merged.text;
+          const mergedImages = merged.images;
+          const mergedChips = merged.chips as HistoryPromptDraftChip[];
+          applyHistoryComposerSnapshot({
+            ownerTabId: actionTabId,
+            text: mergedText,
+            images: mergedImages,
+            chips: mergedChips,
+            selectionStart: mergedText.length,
+            history: 'external',
+            userEvent: 'input.complete',
+          });
+          setHistoryComposerView(actionTabId, {
+            selectionStart: mergedText.length,
+            selectionEnd: mergedText.length,
+            scrollTop: 0,
+          });
+          flushHistoryComposerDrafts();
+          flushHistoryComposerView();
+          for (const followerId of e.cancelledFollowerHandoffIds) {
+            retractHistoryPromptHandoff(actionTabId, followerId, 'history-context-head-failed');
+            onPromptStatusChange(followerId, 'failed', 'history-context-head-failed');
+          }
+          clearedPromptText = null;
+          clearedPromptImages = [];
+          clearedPromptChips = [];
+          cascadeBatchRestored = true;
+          setDraftWarning('Context was not recorded. Accepted drafts were restored in their original order.');
+          historyDiag('SEND_CASCADE_RESTORE tab=' + actionTabId.slice(-12)
+            + ' handoffs=' + cascadeHandoffIds.join(',')
+            + ' chars=' + mergedText.length);
+        }
       }
       if (kind === 'send' && sendHandoffId) {
         if (sendOwnershipTransferred) {
@@ -7725,7 +8158,7 @@ function AgentHistoryControls({
           retractHistoryPromptHandoff(actionTabId, sendHandoffId, 'send-pre-submit-error');
           onPromptStatusChange(sendHandoffId, 'failed', 'send-pre-submit-error');
         }
-        if (!sendOwnershipTransferred) {
+        if (!sendOwnershipTransferred && !cascadeBatchRestored) {
           if (sendRefusalPasteWritten) {
             deferredSendRollback = true;
             historyDiag('SEND_ROLLBACK_DEFER tab=' + actionTabId.slice(-12)
@@ -7767,40 +8200,25 @@ function AgentHistoryControls({
         kind === 'interrupt' &&
         isCurrentAction() &&
         interruptAwaitRef.current?.seq === actionSeq;
-      if (isCurrentAction() && !keepInterruptAwait) {
+      if (isCurrentAction()
+        && !keepInterruptAwait
+        && !(kind === 'send' && coordinatedSendToken)) {
         actionInFlightRef.current = false;
         activeActionKindRef.current = null;
-        if (kind === 'stop') processStopInFlightRef.current = false;
+        if (kind === 'stop' || recordWithoutReply) {
+          processStopInFlightRef.current = false;
+        }
         setBusyAction(null);
       }
       if (kind === 'send' && coordinatedSendToken) {
-        const coordinatedSettlement = await settleCoordinatedAgentSend({
-          tabId: actionTabId,
-          token: coordinatedSendToken,
-          runQueuedStop: async () => {
-            const queuedStop = getCoordinatedAgentAction(actionTabId);
-            historyDiag('RUN_QUEUED_ACTION tab=' + actionTabId.slice(-12)
-              + ' kind=stop after=send'
-              + ' queuedAgeMs=' + (
-                queuedStop?.stopRequestedAt
-                  ? Date.now() - queuedStop.stopRequestedAt
-                  : 0
-              ));
-            return await stopAgentProcessScenario({
-              tabId: actionTabId,
-              toolType: runtime.toolType,
-              runtime,
-            });
-          },
-        });
         if (deferredSendRollback) {
-          if (coordinatedSettlement.stopped) {
+          if (sendCoordinatedSettlement?.stopped) {
             restoreClearedSendSnapshot('post-paste-stop-proved');
           } else {
             historyDiag('SEND_ROLLBACK_WITHHELD tab=' + actionTabId.slice(-12)
               + ' handoff=' + (sendHandoffId || '-')
               + ' reason=stop-not-proved'
-              + ' settlement=' + (coordinatedSettlement.reason || '-'));
+              + ' settlement=' + (sendCoordinatedSettlement?.reason || '-'));
             if (isCurrentAction()) {
               setDraftWarning('Send was cancelled after paste, but process stop was not proven. The prompt was not restored to avoid sending it twice.');
             }
@@ -7818,9 +8236,14 @@ function AgentHistoryControls({
 
   useEffect(() => {
     const submitComposer = (event: Event) => {
-      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        recordWithoutReply?: boolean;
+      }>).detail;
       if (detail?.tabId !== tabId) return;
-      void runAction('send');
+      void runAction('send', {
+        recordWithoutReply: detail.recordWithoutReply === true,
+      });
     };
     window.addEventListener('history-panel:submit-composer', submitComposer);
     return () => window.removeEventListener('history-panel:submit-composer', submitComposer);
@@ -7899,8 +8322,17 @@ function AgentHistoryControls({
 
   const meta = AGENT_STATUS_META[status];
   const rawActiveLifecycle = lifecycleStatus?.tabId === tabId ? lifecycleStatus : null;
-  const localStopInProgress = busyAction === 'stop' || status === 'stopping';
-  const effectiveStopping = localStopInProgress || rawActiveLifecycle?.kind === 'stopping';
+  const coordinatedComposerAction = getCoordinatedAgentAction(tabId);
+  const recordContextAcceptsFollowup = busyAction === 'send'
+    && coordinatedComposerAction?.recordWithoutReply === true
+    && coordinatedComposerAction.stopRequestedAt === null;
+  // A lifecycle Stop normally locks authoring. Recording context is different:
+  // the Stop belongs to the accepted head prompt, while History remains the
+  // owner of later authoring and may queue another immutable PREPARING intent.
+  const localStopInProgress = busyAction === 'stop'
+    || (status === 'stopping' && !recordContextAcceptsFollowup);
+  const effectiveStopping = !recordContextAcceptsFollowup
+    && (localStopInProgress || rawActiveLifecycle?.kind === 'stopping');
   const activeLifecycle: AgentLifecycleSummary | null = effectiveStopping
     ? (rawActiveLifecycle?.kind === 'stopping'
       ? rawActiveLifecycle
@@ -7917,7 +8349,8 @@ function AgentHistoryControls({
   const isTurnBusy = status === 'busy';
   const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion || rewindLocked || effectiveStopping;
   const sendControlsLocked = controlsLocked
-    && !(busyAction === 'resume' && status === 'starting');
+    && !(busyAction === 'resume' && status === 'starting')
+    && !recordContextAcceptsFollowup;
   const isCancellingTurn = busyAction === 'interrupt' || interruptAwaiting;
   const isCompacting = operationalPhase?.tabId === tabId
     && operationalPhase.provider === toolType
@@ -8104,21 +8537,17 @@ function AgentHistoryControls({
   const canAcceptPrompt = status === 'active'
     || (status === 'busy' && runtime.allowSendWhileBusy)
     || status === 'starting'
+    || recordContextAcceptsFollowup
     || canStartOrResume;
   const canAcceptSubmitIntent = canAcceptPrompt
     && !pendingQuestion
     && !sendControlsLocked
     && !historyImagePastePending
     && !derivedDraftImageNotice?.blocking;
-  // Slash-команда — обычное сообщение пользователя, и отправляется как обычное.
-  // Раньше общий submit-path её глотал: Enter не делал ничего, а рядом висела
-  // подсказка «← Terminal only», то есть команду предлагалось вводить в живой
-  // TUI. Пользователь решил иначе: «пускай можно будет отправлять команды слэш».
-  //
-  // Результат команды при этом может и не появиться в истории: у локальных
-  // команд (`/compact`, `/model`) нет обычной записи ответа. Это ожидаемо и
-  // принято — «в лучшем случае мы ничего не увидим». Само сообщение при этом
-  // отображается как любое другое, потому что оно и есть user message.
+  // Standalone Codex slash is a local TUI action, not a rollout user_message.
+  // History still shows the user's command, but delivery is proven by the
+  // specialized slash transaction (exact input frame + Enter), never by the
+  // ordinary conversation audit. Command output may remain terminal-only.
   const canSend = canAcceptSubmitIntent
     && (prompt.trim().length > 0 || draftChips.length > 0);
   const canGrabDraft = (status === 'active' || status === 'busy') && !pendingQuestion && !controlsLocked;
@@ -10868,14 +11297,13 @@ function HistoryPanel({
     );
   }, []);
   const historyPayloadContextValue = useMemo(
-    () => (sessionId ? { toolType, sessionId, cwd } : null),
-    [toolType, sessionId, cwd],
+    () => (sessionId ? { tabId, toolType, sessionId, cwd } : null),
+    [tabId, toolType, sessionId, cwd],
   );
-  // Background chips derive from durable rows only; local/optimistic rows
-  // can never be background work. Process liveness comes from the composer
-  // availability the controls already publish (status: active/busy/starting
-  // = agent process alive) — Codex in-process subagents outlive their spawn
-  // turn but never their host process.
+  // Background chip PRESENTATION comes from durable/live provider rows;
+  // local/optimistic rows can never be background work. Process availability
+  // remains a coarse host boundary, while exact subagent liveness is joined
+  // below from main's active call-id snapshot.
   // NO RECORD ≠ DEAD PROCESS. The availability record is deleted on every
   // rebind of the composer to a tab, so defaulting the missing case to
   // `inactive` asserted "the process ended" at the exact moment we knew
@@ -10907,6 +11335,72 @@ function HistoryPanel({
     if (agentProcessStatus !== 'unknown') known.set(tabId, alive);
     return alive;
   }, [agentProcessStatus, tabId]);
+  // Exact active subagents come from the same main-owned provider watchers
+  // that drive the tab loader. History used to re-infer this from durable Task
+  // cards, creating two authorities: the tab correctly dropped a completed
+  // child while a cached `running` card resurrected it with a 200-minute
+  // timer after switching back. The snapshot is monotonic by revision, so a
+  // slower mount-time query cannot overwrite a newer completion event.
+  const [mainBackgroundWork, setMainBackgroundWork] = useState<HistoryBackgroundWorkSnapshot>({
+    tabId: '',
+    revision: -1,
+    agents: [],
+  });
+  useEffect(() => {
+    let cancelled = false;
+    const accept = (detail: any) => {
+      if (cancelled || String(detail?.tabId || '') !== tabId) return;
+      const revision = Number(detail?.revision);
+      const nextRevision = Number.isFinite(revision) ? revision : 0;
+      const agents = Array.isArray(detail?.agents) ? detail.agents : [];
+      const normalizedAgents: HistoryBackgroundAgentProof[] = agents
+        .map((agent: any): HistoryBackgroundAgentProof => ({
+          provider: agent?.provider === 'codex' ? 'codex' : 'claude',
+          toolUseId: String(agent?.toolUseId || ''),
+          agentId: String(agent?.agentId || ''),
+          agentSessionId: String(agent?.agentSessionId || ''),
+          sessionId: agent?.sessionId ? String(agent.sessionId) : null,
+          generation: agent?.generation ? String(agent.generation) : null,
+          startedAt: Number(agent?.startedAt) || 0,
+        }))
+        .filter((agent) => !!agent.toolUseId);
+      setMainBackgroundWork((previous) => {
+        if (previous.tabId === tabId && previous.revision > nextRevision) return previous;
+        return {
+          tabId,
+          revision: nextRevision,
+          agents: normalizedAgents,
+        };
+      });
+    };
+    const onBackgroundWork = (_event: unknown, detail: any) => accept(detail);
+    ipcRenderer.on('tab:background-work', onBackgroundWork);
+    void ipcRenderer.invoke('agent:list-background-work', { tabIds: [tabId] })
+      .then((result: any) => {
+        const record = Array.isArray(result?.records)
+          ? result.records.find((item: any) => String(item?.tabId || '') === tabId)
+          : null;
+        if (record) accept(record);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      ipcRenderer.removeListener('tab:background-work', onBackgroundWork);
+    };
+  }, [tabId]);
+  const exactActiveSubagents = useMemo(() => {
+    if (mainBackgroundWork.tabId !== tabId) return null;
+    const exact = new Map<string, HistoryBackgroundAgentProof>();
+    for (const agent of mainBackgroundWork.agents) {
+      if (agent.provider !== toolType) continue;
+      if (agent.sessionId && sessionId && agent.sessionId !== sessionId) continue;
+      if (agent.generation && agentProcessGeneration
+        && agent.generation !== agentProcessGeneration) continue;
+      const callIdentity = historySubagentCallIdentity(agent.toolUseId);
+      if (callIdentity) exact.set(callIdentity, agent);
+    }
+    return exact;
+  }, [agentProcessGeneration, mainBackgroundWork, sessionId, tabId, toolType]);
   // Chips must see the SAME rows the transcript shows, durable + live. A Codex
   // subagent is durable only after the rollout is re-read, but its spawn is
   // already on screen through the live stream — computing chips from durable
@@ -10969,12 +11463,22 @@ function HistoryPanel({
         sessionId || '',
         agentProcessGeneration,
         toolType,
+        exactActiveSubagents,
       )
       : EMPTY_HISTORY_CHIPS),
-    [chipsOwnerSettled, chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration, toolType],
+    [chipsOwnerSettled, chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration, toolType, exactActiveSubagents],
   );
   const liveBackgroundUuids = useMemo(
     () => new Set(backgroundHistoryChips.map((chip) => chip.entryUuid)),
+    [backgroundHistoryChips],
+  );
+  const liveBackgroundTaskCalls = useMemo(
+    () => new Set(
+      backgroundHistoryChips
+        .filter((chip) => chip.kind === 'subagent')
+        .map((chip) => historySubagentCallIdentity(chip.key.replace(/^task:/, '')))
+        .filter(Boolean),
+    ),
     [backgroundHistoryChips],
   );
   // Observable trace of the background zone. Both the presence AND the
@@ -11015,18 +11519,58 @@ function HistoryPanel({
       + ' processGeneration=' + (agentProcessGeneration || '-')
       + ' keys=' + (backgroundChipsDigest || '-'));
   }, [tabId, backgroundChipsDigest, backgroundHistoryChips.length, backgroundAgentChipCount, chipsOwnerSettled, chipsFreshOwnerKey, chipsLiveOwnerProven, historyOwnerKey, isTurnBusy, agentProcessAlive, agentProcessGeneration]);
-  // The strip stays a History presentation, but tab-loader ownership lives in
-  // main's provider transcript observers. History must never publish process
-  // liveness: mounting, switching or closing this surface is not a lifecycle
-  // event and used to erase or resurrect real background work.
+  const historyAgentChips = useMemo(
+    () => (chipsOwnerSettled
+      ? collectHistoryAgentChips(chipSourceEntries, backgroundHistoryChips)
+      : EMPTY_HISTORY_AGENTS),
+    [backgroundHistoryChips, chipSourceEntries, chipsOwnerSettled],
+  );
+  // The dock selection survives running → completed because both faces use
+  // the same `task:<toolUseId>` key. It resets only when the selected action
+  // genuinely leaves this session/owner.
   const [expandedBackgroundChipKey, setExpandedBackgroundChipKey] = useState<string | null>(null);
-  // Auto-close the pane when its chip finishes (mirrors the SDK bar).
+  const [agentRosterOpen, setAgentRosterOpen] = useState(false);
+  const availableDetailKeys = useMemo(() => new Set([
+    ...backgroundHistoryChips.map((chip) => chip.key),
+    ...historyAgentChips.map((agent) => agent.key),
+  ]), [backgroundHistoryChips, historyAgentChips]);
   useEffect(() => {
-    if (!expandedBackgroundChipKey) return;
-    if (!backgroundHistoryChips.some((chip) => chip.key === expandedBackgroundChipKey)) {
+    if (!expandedBackgroundChipKey || !chipsOwnerSettled) return;
+    if (!availableDetailKeys.has(expandedBackgroundChipKey)) {
       setExpandedBackgroundChipKey(null);
     }
-  }, [backgroundHistoryChips, expandedBackgroundChipKey]);
+  }, [availableDetailKeys, chipsOwnerSettled, expandedBackgroundChipKey]);
+  useEffect(() => {
+    setExpandedBackgroundChipKey(null);
+    setAgentRosterOpen(false);
+  }, [historyOwnerKey]);
+  const openHistoryAgent = useCallback((agentKey: string) => {
+    if (!agentKey) return;
+    setExpandedBackgroundChipKey(agentKey);
+    setAgentRosterOpen(false);
+  }, []);
+  const toggleHistoryDetail = useCallback((detailKey: string) => {
+    setAgentRosterOpen(false);
+    setExpandedBackgroundChipKey((current) => current === detailKey ? null : detailKey);
+  }, []);
+  const agentInspectorController = useMemo<HistoryAgentInspectorController>(() => ({
+    selectedKey: expandedBackgroundChipKey,
+    openAgent: openHistoryAgent,
+  }), [expandedBackgroundChipKey, openHistoryAgent]);
+  useEffect(() => {
+    const onOpenAgent = (event: Event) => {
+      const detail = (event as CustomEvent).detail || {};
+      if (detail.tabId && detail.tabId !== tabId) return;
+      const requestedKey = String(detail.agentKey || '');
+      if (requestedKey) {
+        openHistoryAgent(requestedKey);
+      } else {
+        setAgentRosterOpen(true);
+      }
+    };
+    window.addEventListener('history-panel:open-agent', onOpenAgent);
+    return () => window.removeEventListener('history-panel:open-agent', onOpenAgent);
+  }, [openHistoryAgent, tabId]);
   const visibleLiveEntries = liveProjectionRef.current.ownerKey === historyOwnerKey
     ? liveEntries
     : [];
@@ -13318,6 +13862,12 @@ function HistoryPanel({
           ' proof=orchestration-run-tag');
         continue;
       }
+      adoptHistoryPromptHandoffCanonicalEntry(tabId, handoff.handoffId, {
+        entryUuid: matched.uuid,
+        sessionId: matched.sessionId,
+        sourceIdentity: matched.sourceIdentity,
+        sourceIdentityAliases: matched.sourceIdentityAliases,
+      });
       void acknowledgeMaterializedHistoryReceipt({
         operationKey: handoff.sendOperationKey,
         attemptId: handoff.sendAttemptId,
@@ -16640,6 +17190,8 @@ function HistoryPanel({
         )}
         <HistoryPayloadContext.Provider value={historyPayloadContextValue}>
         <HistoryBackgroundLiveContext.Provider value={liveBackgroundUuids}>
+        <HistoryBackgroundTaskCallContext.Provider value={liveBackgroundTaskCalls}>
+        <HistoryAgentInspectorContext.Provider value={agentInspectorController}>
         {/* The two extra conditions skip mounting the list during commits
             that are guaranteed to be replaced BEFORE the browser paints:
             (1) the transitional commit right after the owner prop changed
@@ -17273,40 +17825,10 @@ function HistoryPanel({
           )}
           </>
         )}
+        </HistoryAgentInspectorContext.Provider>
+        </HistoryBackgroundTaskCallContext.Provider>
         </HistoryBackgroundLiveContext.Provider>
         </HistoryPayloadContext.Provider>
-        {backgroundHistoryChips.length > 0 && (
-          // Live face of background work (bash run_in_background, subagents):
-          // chips strip pinned above the composer, SDK-tab presentation. A
-          // chip click expands the workflow-style detail pane above the bar;
-          // «в историю» inside the pane jumps to the transcript card. The
-          // inline card keeps the handed-off/terminal state.
-          <div
-            style={{
-              position: 'absolute',
-              left: 0,
-              right: 0,
-              // The composer is the column's last row now, so the bottom of
-              // THIS box (the transcript stage) already is the input's top
-              // border — no composer-height offset to subtract any more.
-              bottom: 0,
-              zIndex: 7,
-            }}
-          >
-            <HistoryBackgroundTasksBar
-              chips={backgroundHistoryChips}
-              expandedKey={expandedBackgroundChipKey}
-              onToggle={(chipKey) => setExpandedBackgroundChipKey(
-                (current) => current === chipKey ? null : chipKey,
-              )}
-              onJumpToCard={(entryUuid) => setHistoryScrollToUuid(entryUuid)}
-              tabId={tabId}
-              toolType={toolType}
-              cwd={cwd}
-              sessionId={sessionId || ''}
-            />
-          </div>
-        )}
         {/* «Выдвинуть вторую поверхность» — вплотную над полем ввода, у правого
             края. Стоит ВСЕГДА, в отличие от стрелки слева от него: это орган
             управления раскладкой, и он не должен появляться и исчезать от
@@ -17373,6 +17895,28 @@ function HistoryPanel({
         </div>
         </ControlHint>
       </div>
+
+      {(backgroundHistoryChips.length > 0 || historyAgentChips.length > 0) && (
+        // Only the compact chip-row owns normal-flow height. Its Inspector is
+        // an absolute popover upward, so opening/loading/switching a child
+        // transcript never changes the History viewport or a Virtuoso row.
+        <div data-history-agent-dock style={{ flex: '0 0 auto', width: '100%', minWidth: 0, zIndex: 7 }}>
+          <HistoryBackgroundTasksBar
+            chips={backgroundHistoryChips}
+            agents={historyAgentChips}
+            selectedKey={expandedBackgroundChipKey}
+            rosterOpen={agentRosterOpen}
+            onToggleDetail={toggleHistoryDetail}
+            onToggleRoster={() => setAgentRosterOpen((current) => !current)}
+            onSelectAgent={openHistoryAgent}
+            onJumpToCard={(entryUuid) => setHistoryScrollToUuid(entryUuid)}
+            tabId={tabId}
+            toolType={toolType}
+            cwd={cwd}
+            sessionId={sessionId || ''}
+          />
+        </div>
+      )}
 
       {composerNode && !composerPortalHostId && composerNode}
     </div>

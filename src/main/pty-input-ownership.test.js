@@ -4,9 +4,33 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  classifyLateMcpProofInput,
   classifyManualPtyInputAtBoundary,
   shouldSerializeManualPtyInput,
 } = require('./pty-input-ownership');
+
+test('manual input yields late MCP diagnostic proof while protocol replies preserve it', () => {
+  assert.deepEqual(classifyLateMcpProofInput({
+    proofPending: true,
+    xtermInputOrigin: 'user',
+  }), {
+    action: 'deliver',
+    reason: 'manual-input-owns-terminal',
+    cancelProof: true,
+  });
+  assert.equal(classifyLateMcpProofInput({
+    proofPending: true,
+    xtermInputOrigin: null,
+  }).cancelProof, true, 'unknown origin remains fail-safe manual ownership');
+  assert.deepEqual(classifyLateMcpProofInput({
+    proofPending: true,
+    xtermInputOrigin: 'terminal-response',
+  }), {
+    action: 'deliver',
+    reason: 'terminal-protocol-response',
+    cancelProof: false,
+  });
+});
 
 test('manual input waits behind an existing PTY write without invalidating it at receipt time', () => {
   const paste = {

@@ -279,6 +279,16 @@ test('late MCP raw hint resolves only on its exact committed current frame', () 
     action: 'clear',
     reason: 'current-composer-ready',
   });
+  assert.deepEqual(decideCodexLateMcpCommittedFrame({
+    identityCurrent: true,
+    candidateWriteSeq: 12,
+    committedWriteSeq: 13,
+    authoritativeFrameCommitted: true,
+    inspected: { ready: false, blockers: [] },
+  }), {
+    action: 'clear',
+    reason: 'current-mcp-blocker-absent',
+  }, 'an app-owned /model transition cannot keep a stale MCP diagnosis modal');
 });
 
 test('late MCP recovery authority belongs to one exact launch and input generation', () => {

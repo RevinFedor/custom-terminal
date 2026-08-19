@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  decideCodexLeaveGoalPausedAutoEnter,
   decideCodexResumeGoalAutoEnter,
   inspectCodexResumeGoalPrompt,
 } = require('./codex-resume-goal-prompt');
@@ -84,6 +85,20 @@ test('requires the exact current terminal, run, input revision, and screen', () 
   assert.equal(decideCodexResumeGoalAutoEnter({ ...base, sameInputRevision: false }).reason, 'input-changed');
   assert.equal(decideCodexResumeGoalAutoEnter({ ...base, screenAvailable: false }).reason, 'screen-unavailable');
   assert.equal(decideCodexResumeGoalAutoEnter({ ...base, cleanText: '› ordinary prompt' }).reason, 'prompt-closed');
+});
+
+test('history-only Resume can select Leave paused without starting the saved goal', () => {
+  const leaveFrame = narrowProductionFrame
+    .replace('› 1. Resume goal', '  1. Resume goal')
+    .replace('  2. Leave paused', '› 2. Leave paused');
+  const base = {
+    sameTerminal: true,
+    sameRunSeq: true,
+    sameInputRevision: true,
+    screenAvailable: true,
+  };
+  assert.equal(decideCodexLeaveGoalPausedAutoEnter({ ...base, cleanText: leaveFrame }).allowed, true);
+  assert.equal(decideCodexLeaveGoalPausedAutoEnter({ ...base, cleanText: narrowProductionFrame }).allowed, false);
 });
 
 test('an old Resume goal modal followed by a newer screen cannot authorize Enter', () => {

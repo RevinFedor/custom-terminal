@@ -1,5 +1,5 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { buildCodexRunPayload } from './codexLaunch';
+import { buildCodexRunPayload, getCodexLaunchOptions } from './codexLaunch';
 import {
   codexSettingsProofMatchesRuntimeOwner,
   isCompleteCodexSettingsRequest,
@@ -9,6 +9,11 @@ import {
 import { readCodexPtyPresence } from './codexPtyPresence.mjs';
 import { readCodexDraftAuthority } from './codexDraftAuthority.mjs';
 import {
+  isStandaloneCodexLocalSlashCommand,
+  normalizeCodexLocalSlashCommand,
+} from './codexLocalSlashCommand.mjs';
+import {
+  planCodexLaunchSettingsPersistence,
   planCodexPickerStateApplication,
   resolveCodexEffectiveSettings,
 } from './codexEffectiveSettings.mjs';
@@ -62,6 +67,7 @@ export interface AgentPtyPresence {
   manualActionRequired?: boolean;
   manualActionType?: string | null;
   sessionId?: string | null;
+  sessionAuthority?: 'live-writer' | 'history-hint' | 'fresh';
   conversationMaterialized?: boolean;
   canResume?: boolean;
   canCopySessionId?: boolean;
@@ -102,6 +108,7 @@ export interface AgentSendPromptOptions {
   model?: string;
   effort?: string;
   thinking?: string;
+  runtimeSnapshot?: any;
   assertNotCancelled?: () => void;
   claudeExactEmptyEvidence?: Record<string, unknown> | null;
   refreshClaudeExactEmptyEvidence?: () => Promise<{
@@ -145,6 +152,16 @@ export interface AgentSendPromptOptions {
   };
 }
 
+export interface AgentHistoryContextOptions {
+  sessionId?: string | null;
+  cwd?: string;
+  handoffId?: string;
+  source?: string;
+  model?: string;
+  effort?: string;
+  presentationSnapshot?: AgentSendPromptOptions['presentationSnapshot'];
+}
+
 export interface HistoryAgentRuntime {
   toolType: AgentHistoryTool;
   label: string;
@@ -165,9 +182,23 @@ export interface HistoryAgentRuntime {
     projectId?: string | null,
     context?: AgentPresenceRequestContext,
   ) => Promise<AgentPtyPresence>;
-  startFresh?: (args: { tabId: string; cwd?: string }) => Promise<AgentResumeResult>;
-  resume: (args: { tabId: string; sessionId: string; cwd?: string }) => Promise<AgentResumeResult>;
+  startFresh?: (args: {
+    tabId: string;
+    cwd?: string;
+    developerInstructions?: string;
+  }) => Promise<AgentResumeResult>;
+  resume: (args: {
+    tabId: string;
+    sessionId: string;
+    cwd?: string;
+    resumePausedGoal?: boolean;
+  }) => Promise<AgentResumeResult>;
   sendPrompt: (tabId: string, prompt: string, options?: AgentSendPromptOptions) => Promise<any>;
+  recordHistoryContext: (
+    tabId: string,
+    prompt: string,
+    options?: AgentHistoryContextOptions,
+  ) => Promise<any>;
   // `context.busy` lets a runtime refuse an interrupt that would do something
   // else entirely on an idle composer (Codex: Escape opens native Rewind).
   interruptTurn: (
@@ -325,10 +356,12 @@ async function resumeCodexSession({
   tabId,
   sessionId,
   cwd,
+  resumePausedGoal,
 }: {
   tabId: string;
   sessionId: string;
   cwd?: string;
+  resumePausedGoal?: boolean;
 }): Promise<AgentResumeResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
   if (!sessionId) return { success: false, error: 'sessionId required' };
@@ -340,6 +373,7 @@ async function resumeCodexSession({
     command: 'codex-c',
     sessionId,
     cwd,
+    ...(typeof resumePausedGoal === 'boolean' ? { resumePausedGoal } : {}),
   })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
   if (runResult?.success === false || runResult?.accepted === false) {
     return { success: false, error: runResult.error || 'Codex resume failed' };
@@ -348,28 +382,89 @@ async function resumeCodexSession({
   return { success: true, sessionId };
 }
 
-async function startFreshCodexSession({
+export async function startFreshCodexSession({
   tabId,
   cwd,
+  developerInstructions,
 }: {
   tabId: string;
   cwd?: string;
+  developerInstructions?: string;
 }): Promise<AgentResumeResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
   const store = useWorkspaceStore.getState();
   store.setTabCommandType(tabId, 'codex');
   store.markAiLaunchAutoTitle(tabId, 'codex');
-  console.log('[CodexHistoryActions:startFresh] start tab=' + shortTab(tabId));
-  const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+  // Freeze the exact tab/global choice at the user's Start click. Binding the
+  // newly-created UUID must not change which next-launch pair this operation
+  // carries while materialization is in flight.
+  const launchOptions = getCodexLaunchOptions(tabId);
+  let projectId: string | null = null;
+  let tabCwd = cwd;
+  for (const [, workspace] of store.openProjects) {
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) continue;
+    projectId = workspace.projectId;
+    tabCwd = tabCwd || tab.cwd;
+    break;
+  }
+  if (!projectId || !tabCwd) {
+    return { success: false, error: 'Codex tab project/cwd is unavailable' };
+  }
+  console.log('[CodexHistoryActions:startFresh] materialize tab=' + shortTab(tabId));
+  const materialized = await ipcRenderer.invoke('codex:materialize-empty-session', {
+    projectId,
     tabId,
-    command: 'codex',
-    cwd,
-  })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+    cwd: tabCwd,
+  }).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+  if (materialized?.success !== true || !materialized?.sessionId) {
+    return { success: false, error: materialized?.error || 'Codex session materialization failed' };
+  }
+  const bound = await store.setCodexSessionId(
+    tabId,
+    materialized.sessionId,
+    'detected',
+  );
+  if (!bound) {
+    return { success: false, error: 'Codex materialized session could not bind to the tab' };
+  }
+  // The durable UUID now belongs to the tab even if the following PTY launch
+  // is rejected. Do not let a stale pre-materialization rollback restore the
+  // old bash identity or erase this resumable metadata-only session.
+  store.clearAiLaunchSnapshot(tabId, 'codex-empty-session-materialized');
+  const runPayload = {
+    tabId,
+    command: 'codex-c',
+    sessionId: materialized.sessionId,
+    cwd: tabCwd,
+    materializedFresh: materialized.metadataOnly === true,
+    developerInstructions,
+    ...launchOptions,
+  };
+  console.log('[CodexHistoryActions:startFresh] resume tab=' + shortTab(tabId)
+    + ' sid=' + String(materialized.sessionId).slice(0, 8)
+    + ' model=' + (runPayload.model || '-')
+    + ' effort=' + (runPayload.effort || '-')
+    + ' modelSource=' + (runPayload.modelSource || '-')
+    + ' effortSource=' + (runPayload.effortSource || '-'));
+  const runResult = await ipcRenderer.invoke('codex:run-command', runPayload)
+    .catch((err: any) => ({ success: false, error: String(err?.message || err) }));
   if (runResult?.success === false || runResult?.accepted === false) {
     return { success: false, error: runResult.error || 'Codex start failed' };
   }
+  const persisted = planCodexLaunchSettingsPersistence({
+    command: 'codex-c',
+    result: runResult,
+    payload: runPayload,
+  });
+  if (persisted) store.updateCodexState(tabId, persisted);
   store.clearInterruptedState?.(tabId);
-  return { success: true, status: 'starting' };
+  return {
+    success: true,
+    status: 'starting',
+    sessionId: materialized.sessionId,
+    conversationMaterialized: false,
+  };
 }
 
 async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSendPromptOptions = {}): Promise<any> {
@@ -382,10 +477,16 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
     && value.trim().length > 0
     && value.trim() !== 'none'
   ));
-  const settingsRuntimeSnapshot = hasSettingsRequest
+  let settingsRuntimeSnapshot = hasSettingsRequest
+    ? (options.runtimeSnapshot || null)
+    : null;
+  if (
+    hasSettingsRequest
+    && !settingsRuntimeSnapshot
     && options.statusAtSend !== 'busy'
     && options.queue !== true
-    ? await ipcRenderer.invoke('codex:get-runtime-session', {
+  ) {
+    settingsRuntimeSnapshot = await ipcRenderer.invoke('codex:get-runtime-session', {
       tabId,
       projectId: tabContext?.projectId || null,
     }).catch((error: any) => {
@@ -393,8 +494,8 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
         + shortTab(tabId)
         + ' error=' + errorText(error));
       return null;
-    })
-    : null;
+    });
+  }
   const {
     activeWriterSessionId,
     currentSettingsOwnerId,
@@ -454,6 +555,11 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   }
   useWorkspaceStore.getState().clearInterruptedState?.(tabId);
   const queue = options.queue === true || options.statusAtSend === 'busy';
+  const localSlashCommand = isStandaloneCodexLocalSlashCommand({
+    prompt,
+    imageCount: options.presentationSnapshot?.imagePaths?.length || 0,
+    chipCount: options.presentationSnapshot?.promptChips?.length || 0,
+  });
   const modelForPicker = settingsPlan.model;
   const effortForPicker = settingsPlan.effort;
   const visualDraftStateForSend = terminalRegistry.getCodexDraftState(tabId);
@@ -569,17 +675,47 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
       }
     }
   }
-  const work = ipcRenderer.invoke('codex:send-command', tabId, prompt, {
-    queue,
-    handoffId: options.handoffId || null,
-    sendAttemptId: options.sendAttemptId || null,
-    sendOperationKey: options.sendOperationKey || null,
-    source: options.source || null,
-    statusAtSend: options.statusAtSend || null,
-    skipVisibleDraftGuard: false,
-    presentationSnapshot: options.presentationSnapshot || null,
-  })
+  const sendInvocation = localSlashCommand
+    ? ipcRenderer.invoke('codex:send-live-slash-command', {
+        tabId,
+        command: normalizeCodexLocalSlashCommand(prompt),
+        handoffId: options.handoffId || null,
+        source: options.source || null,
+        queue,
+        statusAtSend: options.statusAtSend || null,
+        hasDraft: draftStateForSend?.hasDraft ?? null,
+        draftSource: draftStateForSend?.source || 'history-send-preflight',
+        draftPreview: draftStateForSend?.preview || '',
+        visualHasDraft: draftStateForSend?.hasDraft ?? null,
+        visualSource: draftStateForSend?.source || 'history-send-preflight',
+        visualPreview: draftStateForSend?.preview || '',
+        turnBusy: queue,
+      })
+    : ipcRenderer.invoke('codex:send-command', tabId, prompt, {
+        queue,
+        handoffId: options.handoffId || null,
+        sendAttemptId: options.sendAttemptId || null,
+        sendOperationKey: options.sendOperationKey || null,
+        source: options.source || null,
+        statusAtSend: options.statusAtSend || null,
+        skipVisibleDraftGuard: false,
+        presentationSnapshot: options.presentationSnapshot || null,
+      });
+  const work = sendInvocation
     .then((result: any) => {
+      if (localSlashCommand) {
+        console.log('[CodexHistoryActions:send] local slash done tab=' + shortTab(tabId)
+          + ' handoff=' + (options.handoffId || '-')
+          + ' success=' + (result?.success === true)
+          + ' submitted=' + (result?.submitted === true)
+          + ' queued=' + queue
+          + ' proof=' + (result?.localCommandProof || '-'));
+        return {
+          ...(result || {}),
+          localSlashCommand: true,
+          queued: queue,
+        };
+      }
       const auditTimeoutAfterSubmit = isSubmittedCodexAuditTimeout(result);
       console.log('[CodexHistoryActions:send] done tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' success=' + (auditTimeoutAfterSubmit ? 'unknown' : result?.success !== false) + ' queued=' + (result?.queued ? 'true' : 'false') + ' submitKey=' + (result?.submitKey || '-') + ' auditSoft=' + auditTimeoutAfterSubmit);
       if (auditTimeoutAfterSubmit) {
@@ -764,6 +900,34 @@ async function probeClaudeDraft(tabId: string, reason: string) {
   return resolved;
 }
 
+async function recordAgentHistoryContext(
+  toolType: AgentHistoryTool,
+  tabId: string,
+  prompt: string,
+  options: AgentHistoryContextOptions = {},
+) {
+  const codexSettings = toolType === 'codex' ? getCodexLaunchOptions(tabId) : {};
+  return ipcRenderer.invoke('agent:record-history-context', {
+    tabId,
+    toolType,
+    sessionId: options.sessionId || null,
+    sessionAuthority: options.sessionAuthority || (options.sessionId ? 'history-hint' : 'fresh'),
+    cwd: options.cwd,
+    prompt,
+    handoffId: options.handoffId || null,
+    source: options.source || 'history-panel',
+    model: options.model || codexSettings.model || null,
+    effort: options.effort || codexSettings.effort || null,
+    presentationSnapshot: options.presentationSnapshot || null,
+  }).catch((error: any) => ({
+    success: false,
+    accepted: false,
+    submitted: false,
+    historyOnly: true,
+    error: errorText(error),
+  }));
+}
+
 const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   toolType: 'claude',
   label: 'Claude',
@@ -785,6 +949,9 @@ const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   startFresh: startFreshClaudePtySession,
   resume: resumeClaudePtySession,
   sendPrompt: sendClaudePtyPrompt,
+  recordHistoryContext: (tabId, prompt, options) => (
+    recordAgentHistoryContext('claude', tabId, prompt, options)
+  ),
   interruptTurn: interruptClaudePtyTurn,
   stopProcess: stopClaudePtyProcess,
   grabDraft: grabClaudePtyDraft,
@@ -815,6 +982,9 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   startFresh: startFreshCodexSession,
   resume: resumeCodexSession,
   sendPrompt: sendCodexPrompt,
+  recordHistoryContext: (tabId, prompt, options) => (
+    recordAgentHistoryContext('codex', tabId, prompt, options)
+  ),
   interruptTurn: interruptCodexTurn,
   stopProcess: stopCodexProcess,
   grabDraft: grabCodexDraft,

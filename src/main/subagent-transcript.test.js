@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const {
+  createSubagentStepProjectionState,
   readAgentSteps,
   claudeRecordToSteps,
   codexRecordToSteps,
@@ -58,10 +59,23 @@ test('claude tool label falls back through the input shapes', () => {
   assert.equal(bare[0].tool, 'WebFetch');
 });
 
-test('claude user records contribute no steps', () => {
-  // The first user record is the task itself (used for identity matching),
-  // and tool_result records are echoes — neither is a step of the agent's work.
-  assert.deepEqual(claudeRecordToSteps({ type: 'user', message: { content: 'задача' } }), []);
+test('claude keeps the full child prompt while tool results update their call', () => {
+  const state = createSubagentStepProjectionState();
+  const prompt = 'задача\n<pasted_content>' + 'x'.repeat(900) + '</pasted_content>';
+  const user = claudeRecordToSteps({ type: 'user', uuid: 'u1', message: { content: prompt } }, state);
+  assert.equal(user[0].text, prompt);
+
+  const call = claudeRecordToSteps({
+    type: 'assistant',
+    uuid: 'a1',
+    message: { content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/tmp/a' } }] },
+  }, state);
+  const result = claudeRecordToSteps({
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'file body' }] },
+  }, state);
+  assert.equal(result[0].id, call[0].id);
+  assert.equal(result[0].result, 'file body');
 });
 
 // ── Codex records ──────────────────────────────────────────────────────────
@@ -77,7 +91,7 @@ test('codex reasoning / tool / message map to steps', () => {
     payload: { type: 'custom_tool_call', name: 'exec', input: 'const r = await tools.exec_command({cmd:"ls"})' },
   });
   assert.equal(tool[0].kind, 'tool');
-  assert.equal(tool[0].tool, 'exec');
+  assert.equal(tool[0].tool, 'Script');
   assert.match(tool[0].text, /exec_command/);
 
   const final = codexRecordToSteps({
@@ -98,6 +112,30 @@ test('codex bookkeeping records are ignored', () => {
   for (const type of ['token_count', 'turn_context', 'world_state', 'session_meta']) {
     assert.deepEqual(codexRecordToSteps({ payload: { type } }), [], type);
   }
+});
+
+test('codex nested exec uses the parent canonical decoder and pairs its result', () => {
+  const { _api } = require('./ipc/codex-data');
+  const state = createSubagentStepProjectionState();
+  const call = codexRecordToSteps({
+    payload: {
+      type: 'custom_tool_call',
+      name: 'exec',
+      call_id: 'call_nested',
+      input: 'const r = await tools.exec_command({cmd:"git status",workdir:"/tmp"}); text(r.output);',
+    },
+  }, state, _api.codexHistoryActionsForCall);
+  assert.equal(call[0].tool, 'Bash');
+  assert.equal(call[0].args.command, 'git status');
+  const result = codexRecordToSteps({
+    payload: {
+      type: 'custom_tool_call_output',
+      call_id: 'call_nested',
+      output: 'clean',
+    },
+  }, state, _api.codexHistoryActionsForCall);
+  assert.equal(result[0].id, call[0].id);
+  assert.equal(result[0].result, 'clean');
 });
 
 // ── incremental reading ────────────────────────────────────────────────────
@@ -167,7 +205,7 @@ test('codex lookup without an id returns nothing instead of scanning', () => {
 
 // ── completion by the agent's own transcript ───────────────────────────────
 
-const { isAgentFinishedByOwnTranscript } = require('./subagent-transcript');
+const { isAgentFinishedByOwnTranscript, readAgentCompletionProof } = require('./subagent-transcript');
 
 test('codex completion is recognised from the agent transcript tail', () => {
   // The parent is not a reliable witness: `wait_agent` is routinely called with
@@ -194,6 +232,21 @@ test('a still-working codex agent is not declared finished', () => {
     JSON.stringify({ payload: { type: 'custom_tool_call', name: 'exec', input: 'sleep 120' } }) + '\n',
     (file) => {
       assert.equal(isAgentFinishedByOwnTranscript({ toolType: 'codex', filePath: file }), false);
+    },
+  );
+});
+
+test('completion proof returns the provider timestamp for frozen duration', () => {
+  withTempFile(
+    JSON.stringify({
+      timestamp: '2026-08-18T20:12:42.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete' },
+    }) + '\n',
+    (file) => {
+      const proof = readAgentCompletionProof({ toolType: 'codex', filePath: file });
+      assert.equal(proof.finished, true);
+      assert.equal(proof.completedAt, Date.parse('2026-08-18T20:12:42.000Z'));
     },
   );
 });

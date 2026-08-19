@@ -26,6 +26,20 @@ import React, { useMemo } from 'react';
 import { paneMapGrid as paneMapGridModel } from '../../utils/splitPanesModel.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
+// Номер ЧУЖОГО пространства рядом с картой.
+//
+// Карта рисует раскладку того пространства, где вкладка лежит, а не того, в
+// котором человек сейчас. Значит нужен ответ на третий вопрос — в каком именно,
+// — и приглушением его дать нельзя: самый блёклый цвет уже занят чужими окнами,
+// ниже него ничего нет. Поэтому чужое пространство помечается РАМКОЙ вокруг
+// карты и его номером из полосы: клетки сохраняют свои цвета, позиция и
+// заливка читаются как раньше, а номер различает два пространства одинаковой
+// формы — случай, где форма карты бессильна.
+//
+// Место под цифру резервируется ВСЕГДА, иначе имена вкладок дёргались бы при
+// каждом переносе вкладки между пространствами.
+export const PANE_MAP_SPACE_SLOT_W_PX = 7;
+
 export const PANE_MAP_CELL_W_PX = 4;
 export const PANE_MAP_CELL_H_PX = 9;
 export const PANE_MAP_CELL_GAP_PX = 1.5;
@@ -55,6 +69,50 @@ const PANE_MAP_COLORS = {
 const PANE_MAP_HELD_OUTLINE = 'inset 0 0 0 1px #8a8a92';
 
 export interface PaneMapCell { mine: boolean; state: string }
+
+/** Обёртка карты, помечающая ЧУЖОЕ пространство рамкой и его номером. */
+function SpaceBadge({ spaceIndex, spaceName, children }: {
+  spaceIndex: number;
+  spaceName: string;
+  children: React.ReactNode;
+}) {
+  const foreign = spaceIndex >= 0;
+  return (
+    <span
+      data-tab-pane-map-space={foreign ? spaceIndex + 1 : undefined}
+      title={foreign ? `Разложена в пространстве «${spaceName}»` : undefined}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 2,
+        flexShrink: 0,
+        // Рамка обнимает карту целиком: она про то, ГДЕ эта раскладка, а не про
+        // отдельную клетку. Внутренняя тень, а не border — border съел бы
+        // ширину у самих клеток и карта выглядела бы другой раскладкой.
+        padding: foreign ? '1px 2px' : 0,
+        borderRadius: 3,
+        boxShadow: foreign ? 'inset 0 0 0 1px rgba(255,255,255,0.28)' : undefined,
+      }}
+    >
+      {children}
+      <span
+        aria-hidden
+        style={{
+          width: `${PANE_MAP_SPACE_SLOT_W_PX}px`,
+          flexShrink: 0,
+          textAlign: 'center',
+          fontSize: 8.5,
+          fontWeight: 700,
+          lineHeight: 1,
+          fontVariantNumeric: 'tabular-nums',
+          color: foreign ? '#b9b9c0' : 'transparent',
+        }}
+      >
+        {foreign ? spaceIndex + 1 : '0'}
+      </span>
+    </span>
+  );
+}
 
 /**
  * Columns of rows, mirroring the workspace. A flat row of cells cannot express a
@@ -123,8 +181,29 @@ export function PaneMapCells({ columns }: { columns: Array<Array<PaneMapCell>> }
  * layout survives the round-trip through the fingerprint.
  */
 export function usePaneMapColumns(projectId: string, tabId: string): Array<Array<PaneMapCell>> {
+  return usePaneMapPlacement(projectId, tabId).columns;
+}
+
+/**
+ * Где эта вкладка разложена: карта окон ПЛЮС пространство, которому эти окна
+ * принадлежат.
+ *
+ * Карта рисует раскладку ТОГО пространства, где вкладка лежит, а не того, в
+ * котором человек сейчас: вопрос «где она открыта» не перестаёт иметь ответ
+ * оттого, что смотрят в другую раскладку. `spaceIndex` — номер чужого
+ * пространства (или -1, если вкладка здесь же); он и различает два пространства
+ * одинаковой формы, где карта бессильна.
+ */
+export function usePaneMapPlacement(projectId: string, tabId: string): {
+  columns: Array<Array<PaneMapCell>>;
+  spaceIndex: number;
+  spaceName: string;
+} {
+  // Одна строка на всё: и клетки, и номер, и имя. Селектор, отдающий объект, —
+  // новая ссылка на каждую запись в стор, то есть перерисовка КАЖДОЙ строки
+  // списка (правило Fingerprint, fix-performance-lags).
   const fingerprint = useWorkspaceStore((s) => {
-    const grid = paneMapGridModel(
+    const here = paneMapGridModel(
       s.splitPanes,
       s.splitFocusedIndex,
       projectId,
@@ -133,20 +212,40 @@ export function usePaneMapColumns(projectId: string, tabId: string): Array<Array
         ? { projectId: s.activeProjectId, tabId: s.openProjects.get(s.activeProjectId)?.activeTabId || '' }
         : null,
     );
-    return grid.map((column) => column.map((c) => c.state).join(',')).join('|');
+    const draw = (grid: any[]) => grid.map((column: any[]) => column.map((c: any) => c.state).join(',')).join('|');
+    if (here.length > 0) return draw(here) + '#-1#';
+    // Здесь её нет — ищем в остальных пространствах и рисуем ИХ раскладку.
+    const at = s.workspaceSpaceIndexOfTab(tabId);
+    if (at < 0) return '#-1#';
+    const space = s.spaces[at];
+    const layout = space?.layout || {};
+    const grid = paneMapGridModel(
+      layout.splitPanes || [],
+      layout.splitFocusedIndex ?? 0,
+      projectId,
+      tabId,
+      layout.activeProjectId ? { projectId: layout.activeProjectId, tabId } : null,
+    );
+    return draw(grid) + '#' + at + '#' + (space?.name || '');
   });
-  return useMemo(
-    () => (fingerprint
-      ? fingerprint.split('|').map((column) => (
-        column.split(',').map((state) => ({ mine: state !== 'other', state }))
-      ))
-      : []),
-    [fingerprint],
-  );
+  return useMemo(() => {
+    const [cells, indexPart, namePart] = fingerprint.split('#');
+    return {
+      columns: cells
+        ? cells.split('|').map((column) => column.split(',').map((state) => ({ mine: state !== 'other', state })))
+        : [],
+      spaceIndex: Number(indexPart ?? -1),
+      spaceName: namePart || '',
+    };
+  }, [fingerprint]);
 }
 
 /** Drop-in for a list row: subscribes itself and renders the mark. */
 export function TabPaneMap({ projectId, tabId }: { projectId: string; tabId: string }) {
-  const columns = usePaneMapColumns(projectId, tabId);
-  return <PaneMapCells columns={columns} />;
+  const { columns, spaceIndex, spaceName } = usePaneMapPlacement(projectId, tabId);
+  return (
+    <SpaceBadge spaceIndex={spaceIndex} spaceName={spaceName}>
+      <PaneMapCells columns={columns} />
+    </SpaceBadge>
+  );
 }

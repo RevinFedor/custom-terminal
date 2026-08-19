@@ -38,6 +38,15 @@ const {
 const { applyHistoryEntryWindow } = require('../history-entry-window');
 const { classifyHistoryAction } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
 const {
+  actionDetailsEnabled,
+  copyActionFamily,
+} = require('../copy-action-format');
+const {
+  CLAUDE_HISTORY_CONTEXT_ACK_MODEL,
+  CLAUDE_HISTORY_CONTEXT_ACK_TEXT,
+  buildClaudeHistoryContextContent,
+} = require('../agent-history-context-injection');
+const {
   resolveForkMarkerBoundary,
   selectDirectForkMarker,
 } = require(path.join(__dirname, '..', '..', 'shared', 'fork-marker-boundary.cjs'));
@@ -118,6 +127,7 @@ const CLAUDE_JSONL_PARSE_YIELD_CHARS = 4 * 1024 * 1024;
 const _jsonlCache = new Map();
 let _jsonlCacheRawBytes = 0;
 const _jsonlInflight = new Map();
+const _claudeHistoryContextInflight = new Map();
 const _jsonlEpochByFile = new Map();
 let _jsonlGlobalEpoch = 0;
 let _jsonlInflightJoinCount = 0;
@@ -1102,7 +1112,26 @@ function claudeUserRecordText(entry) {
   const content = entry.message?.content;
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
-  return content.find((part) => part?.type === 'text' && typeof part.text === 'string')?.text || '';
+  let imageIndex = 0;
+  return content.map((part) => {
+    if (part?.type === 'text' && typeof part.text === 'string') return part.text;
+    if (part?.type === 'image' || part?.source?.type === 'base64') {
+      imageIndex += 1;
+      return `[Image #${imageIndex}]`;
+    }
+    return '';
+  }).join('');
+}
+
+function isClaudeHistoryContextAck(entry) {
+  if (entry?.type !== 'assistant') return false;
+  if (entry?.message?.model !== CLAUDE_HISTORY_CONTEXT_ACK_MODEL) return false;
+  const content = entry.message?.content;
+  return Array.isArray(content)
+    && content.length === 1
+    && content[0]?.type === 'text'
+    && content[0]?.text === CLAUDE_HISTORY_CONTEXT_ACK_TEXT
+    && entry.message?.stop_reason === 'end_turn';
 }
 
 function isClaudeCompactSummaryCandidate(entry, knownText = '') {
@@ -1419,6 +1448,7 @@ async function parseTimelineUuids(sourcePath, options = {}) {
     const uuids = [];
     let totalIterations = 0;
     for (const entry of activeBranch) {
+      if (isClaudeHistoryContextAck(entry)) continue;
       if (entry.isSidechain || entry.type === 'summary') continue;
 
       if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command') {
@@ -1431,8 +1461,7 @@ async function parseTimelineUuids(sourcePath, options = {}) {
         let rawContent = entry.message?.content;
         if (Array.isArray(rawContent)) {
           if (rawContent.some(item => item.type === 'tool_result')) continue;
-          const textBlock = rawContent.find(item => item.type === 'text' && item.text);
-          rawContent = textBlock?.text || null;
+          rawContent = claudeUserRecordText(entry) || null;
         }
         if (!rawContent || typeof rawContent !== 'string') continue;
         if (entry.isMeta) continue;
@@ -1867,12 +1896,15 @@ const _api = {
   forkSessionFile: null,   // ({sourceSessionId, cwd, skipChainResolve?, fromLatestCompact?}) → {success, newSessionId, forkEntryCount}
   editRange: null,         // ({sessionId, cwd, startUuid, endUuid, compactText}) → {success, removedCount, ...}
   deleteRange: null,       // ({sessionId, cwd, startUuid, endUuid}) → {success, removedCount, fileDeleted}
+  appendHistoryContext: null, // ({sessionId?, cwd, prompt, entryUuid?, onBeforeCommit?}) → exact user record without a model turn
   getConfirmedSettings: null, // ({tabId, sessionId?, cwd?}) → active-branch model/effort proof
   getFullHistory: null, // (payload, {sender?}) → main-owned structured History
   parseClaudeStructuredPatchHunks,
   extractClaudeToolDiffHunks,
   rebuildHistoryPayloadStash,
   deriveClaudeAsyncAgentStatus,
+  claudeUserRecordText,
+  isClaudeHistoryContextAck,
   buildClaudeTaskNotificationIndex,
   extractClaudeTaskNotificationTexts,
   parseClaudeTaskNotification,
@@ -2054,6 +2086,187 @@ function register({
     ? getClaudeRuntimeSettingsScope
     : null;
 
+  _api.appendHistoryContext = async function ({
+    sessionId = null,
+    sessionAuthority = 'history-hint',
+    cwd,
+    prompt,
+    imagePaths = [],
+    entryUuid = null,
+    onBeforeCommit = null,
+  } = {}) {
+    let exactCwd = typeof cwd === 'string' && path.isAbsolute(cwd)
+      ? cwd
+      : null;
+    const exactPrompt = typeof prompt === 'string' ? prompt : '';
+    if (!exactCwd) return { success: false, committed: false, error: 'history_context_cwd_required' };
+    if (!exactPrompt.trim()) return { success: false, committed: false, error: 'history_context_prompt_required' };
+
+    let exactSessionId = typeof sessionId === 'string' && sessionId.trim()
+      ? sessionId.trim()
+      : null;
+    let filePath;
+    let projectDir;
+    let parentUuid = null;
+    let inheritedVersion = '1.0.0';
+    let expectedSource = null;
+    let fresh = false;
+
+    if (exactSessionId) {
+      if (sessionAuthority !== 'live-writer') {
+        exactSessionId = resolveLatestSessionInChain(exactSessionId, exactCwd);
+      }
+      const found = findSessionFile(exactSessionId, exactCwd);
+      if (!found) return { success: false, committed: false, error: 'claude_history_context_session_not_found' };
+      ({ filePath, projectDir } = found);
+      const loaded = await loadJsonlRecords(filePath);
+      expectedSource = loaded.sourceSnapshot || null;
+      parentUuid = loaded.lastRecord?.uuid || null;
+      const recordedCwd = readSessionCwdFromFile(filePath);
+      if (recordedCwd) exactCwd = recordedCwd;
+      inheritedVersion = typeof loaded.lastRecord?.version === 'string' && loaded.lastRecord.version
+        ? loaded.lastRecord.version
+        : inheritedVersion;
+      if (!parentUuid) {
+        return { success: false, committed: false, error: 'claude_history_context_tip_unavailable' };
+      }
+    } else {
+      exactSessionId = crypto.randomUUID();
+      projectDir = path.join(
+        os.homedir(),
+        '.claude',
+        'projects',
+        exactCwd.replace(/\//g, '-'),
+      );
+      filePath = path.join(projectDir, exactSessionId + '.jsonl');
+      fresh = true;
+    }
+
+    const exactEntryUuid = typeof entryUuid === 'string' && entryUuid.trim()
+      ? entryUuid.trim()
+      : crypto.randomUUID();
+    const content = await buildClaudeHistoryContextContent(exactPrompt, { imagePaths });
+    const timestamp = new Date().toISOString();
+    const ackTimestamp = new Date(Date.parse(timestamp) + 1).toISOString();
+    const ackUuid = crypto.randomUUID();
+    const record = {
+      parentUuid,
+      isSidechain: false,
+      cwd: exactCwd,
+      sessionId: exactSessionId,
+      version: inheritedVersion,
+      type: 'user',
+      message: { role: 'user', content },
+      uuid: exactEntryUuid,
+      timestamp,
+    };
+    const ackRecord = {
+      parentUuid: exactEntryUuid,
+      isSidechain: false,
+      cwd: exactCwd,
+      sessionId: exactSessionId,
+      version: inheritedVersion,
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: CLAUDE_HISTORY_CONTEXT_ACK_TEXT }],
+        model: CLAUDE_HISTORY_CONTEXT_ACK_MODEL,
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+      },
+      uuid: ackUuid,
+      timestamp: ackTimestamp,
+    };
+    const serialized = JSON.stringify(record) + '\n' + JSON.stringify(ackRecord) + '\n';
+    const lockKey = path.resolve(filePath);
+    const previous = _claudeHistoryContextInflight.get(lockKey) || Promise.resolve();
+    let committed = false;
+    let writeStarted = false;
+    let recordByteOffset = 0;
+    const work = previous.catch(() => {}).then(async () => {
+      await fs.promises.mkdir(projectDir, { recursive: true });
+      if (!fresh) {
+        const sourceNow = await fs.promises.stat(filePath);
+        if (!expectedSource
+          || sourceNow.size !== Number(expectedSource.size)
+          || sourceNow.mtimeMs !== Number(expectedSource.mtimeMs)) {
+          const error = new Error('claude_history_context_source_changed');
+          error.code = 'claude_history_context_source_changed';
+          throw error;
+        }
+        if (sourceNow.size > 0) {
+          const handle = await fs.promises.open(filePath, 'r');
+          try {
+            const tail = Buffer.alloc(1);
+            await handle.read(tail, 0, 1, sourceNow.size - 1);
+            if (tail[0] !== 0x0a) {
+              const error = new Error('claude_history_context_partial_tail');
+              error.code = 'claude_history_context_partial_tail';
+              throw error;
+            }
+          } finally {
+            await handle.close();
+          }
+        }
+      }
+      if (typeof onBeforeCommit === 'function') await onBeforeCommit({
+        provider: 'claude',
+        sessionId: exactSessionId,
+        entryUuid: exactEntryUuid,
+        filePath,
+        fresh,
+      });
+      if (fresh) {
+        const handle = await fs.promises.open(filePath, 'wx', 0o600);
+        try {
+          writeStarted = true;
+          await handle.writeFile(serialized, 'utf8');
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        recordByteOffset = 0;
+      } else {
+        const stat = await fs.promises.stat(filePath);
+        recordByteOffset = stat.size;
+        const handle = await fs.promises.open(filePath, 'a');
+        try {
+          writeStarted = true;
+          await handle.writeFile(serialized, 'utf8');
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      }
+      committed = true;
+      invalidateClaudeJsonlCache(filePath);
+      return {
+        success: true,
+        committed: true,
+        provider: 'claude',
+        sessionId: exactSessionId,
+        entryUuid: exactEntryUuid,
+        sourceIdentity: exactEntryUuid,
+        recordByteOffset,
+        auditTimestamp: timestamp,
+        fresh,
+        filePath,
+      };
+    });
+    _claudeHistoryContextInflight.set(lockKey, work);
+    try {
+      return await work;
+    } catch (error) {
+      error.historyContextCommitted = committed;
+      error.historyContextOutcomeUnknown = writeStarted && !committed;
+      throw error;
+    } finally {
+      if (_claudeHistoryContextInflight.get(lockKey) === work) {
+        _claudeHistoryContextInflight.delete(lockKey);
+      }
+    }
+  };
+
   // Export a range of messages from Claude session
   ipcMain.handle('claude:copy-range', async (event, {
     sessionId, cwd, startUuid, endUuid,
@@ -2065,6 +2278,10 @@ function register({
     includeText = true, includeThinking = true,
     includeBash = false, includeTools = false,
     includeWebSearch = false, includeToolSearch = false, includeOtherTools = includeTools,
+    includeActions = true,
+    includeSearch = includeBash, includeRun = includeBash, includeGit = includeBash,
+    includeMcp = includeTools, includeWeb = includeWebSearch,
+    includePlan = includeOtherTools || includeToolSearch, includeOther = includeOtherTools,
     assistantOnly = false, maxChars = 8000,
   }) => {
     console.log('[Claude Export] Exporting range from', startUuid, 'to', endUuid);
@@ -2232,6 +2449,7 @@ function register({
       if (assistantOnly) {
         const assistantBlocks = [];
         for (const entry of range) {
+          if (isClaudeHistoryContextAck(entry)) continue;
           if (entry?.type !== 'assistant' || entry.isSidechain || entry.type === 'summary') continue;
           const content = entry.message?.content;
           if (typeof content === 'string') {
@@ -2252,27 +2470,35 @@ function register({
           : { success: false, error: 'No completed assistant response found' };
       }
 
-      // Group-based filtering flags forwarded to formatToolAction.
-      // reading/editing keep their legacy meaning, bash/tools are new.
+      const actionFilters = {
+        includeReading, includeSearch, includeEditing, includeRun, includeGit,
+        includeMcp, includeWeb, includePlan, includeOther,
+        includeSubagentResult, includeSubagentHistory,
+      };
       const groupFlags = {
+        includeClaude,
+        actions: !!includeActions,
         reading: !!includeReading,
+        search: !!includeSearch,
         editing: !!includeEditing,
-        bash: !!includeBash,
-        mcp: !!includeTools,
-        web: !!includeWebSearch,
-        toolSearch: !!includeToolSearch,
-        tools: !!includeOtherTools,
+        run: !!includeRun,
+        git: !!includeGit,
+        mcp: !!includeMcp,
+        web: !!includeWeb,
+        plan: !!includePlan,
+        other: !!includeOther,
       };
       // Used to decide whether ANY action label is worth attaching to a Claude turn.
       // Without this guard a turn that contains only a filtered-out tool_use would still
       // emit an empty "## Claude" block with the user prefix.
-      const claudeHasActionAppetite = includeReading || includeEditing || includeBash || includeTools || includeWebSearch || includeToolSearch || includeOtherTools || includeSubagentResult || includeSubagentHistory;
+      const claudeHasActionAppetite = !!includeActions;
 
       // Format the range
       let output = `# Claude Session Export (Range)\nSession: ${sessionId}\n\n---\n\n`;
 
       for (let i = 0; i < range.length; i++) {
         const entry = range[i];
+        if (isClaudeHistoryContextAck(entry)) continue;
         if (entry.isSidechain || entry.type === 'summary') continue;
 
         if (entry.type === 'user') {
@@ -2284,8 +2510,7 @@ function register({
               b && b.type === 'text' && typeof b.text === 'string' && /^\s*\[Image: source: /.test(b.text)
             );
             if (isImageMetaWrapper) continue;
-            const textBlock = rawContent.find(item => item.type === 'text');
-            rawContent = textBlock?.text || '';
+            rawContent = claudeUserRecordText(entry);
           }
           if (!rawContent || typeof rawContent !== 'string') continue;
 
@@ -2351,23 +2576,8 @@ function register({
                 // Group classification stays for one optimization: skip the toolResult
                 // search when the group is off, since formatToolAction will return label-only
                 // anyway. O(n) inner loop * O(toolUse) per turn matters on long ranges.
-                const group = (() => {
-                  if (block.name === 'Read' || block.name === 'NotebookRead') return 'reading';
-                  if (block.name === 'Edit' || block.name === 'Write' || block.name === 'NotebookEdit') return 'editing';
-                  if (block.name === 'Bash' || block.name === 'Monitor' || block.name === 'Grep' || block.name === 'Glob') return 'bash';
-                  if (block.name === 'Task' || block.name === 'Agent') return 'subagent';
-                  if (block.name === 'WebSearch' || block.name === 'WebFetch') return 'web';
-                  if (typeof block.name === 'string' && block.name.startsWith('mcp__')) return 'mcp';
-                  return 'tools';
-                })();
-                const groupOn = (group === 'reading' && groupFlags.reading)
-                  || (group === 'editing' && groupFlags.editing)
-                  || (group === 'bash' && groupFlags.bash)
-                  || (group === 'mcp' && groupFlags.mcp)
-                  || (group === 'web' && groupFlags.web)
-                  || (group === 'toolSearch' && groupFlags.toolSearch)
-                  || (group === 'tools' && groupFlags.tools)
-                  || (group === 'subagent' && (includeSubagentResult || includeSubagentHistory));
+                const group = copyActionFamily({ toolName: block.name, args: block.input || {} });
+                const groupOn = !!includeActions && actionDetailsEnabled(group, actionFilters);
 
                 let toolResult = null;
                 if (groupOn) {
@@ -2556,7 +2766,8 @@ function register({
       // Char accumulator per category. Final tokens = ceil(chars/3.5).
       const chars = {
         user: 0, claudeText: 0, claudeThinking: 0,
-        read: 0, edit: 0, bash: 0, tools: 0,
+        read: 0, search: 0, edit: 0, run: 0, git: 0,
+        mcp: 0, web: 0, plan: 0, other: 0,
         subagentResult: 0, subagentHistory: 0,
         compact: 0,
       };
@@ -2580,15 +2791,6 @@ function register({
       let apiInputCacheCreate = 0;
       let apiInputCacheRead = 0;
       let apiOutputTokens = 0;
-
-      // Same tool→group classifier as the inline ones in copy-range (and getToolGroup).
-      const classifyTool = (name) => {
-        if (name === 'Read' || name === 'NotebookRead') return 'read';
-        if (name === 'Edit' || name === 'Write' || name === 'NotebookEdit') return 'edit';
-        if (name === 'Bash' || name === 'Monitor' || name === 'Grep' || name === 'Glob') return 'bash';
-        if (name === 'Task' || name === 'Agent') return 'subagent';
-        return 'tools';
-      };
 
       // Match tool_result to its tool_use by id — same lookup as copy-range.
       const resultByUseId = new Map();
@@ -2619,6 +2821,7 @@ function register({
       }
 
       for (const entry of range) {
+        if (isClaudeHistoryContextAck(entry)) continue;
         if (entry.isSidechain || entry.type === 'summary') continue;
 
         if (entry.type === 'user') {
@@ -2627,10 +2830,13 @@ function register({
             // tool_result entries are accounted via their tool_use match above —
             // don't double-count them as user content.
             if (rawContent.some(item => item && item.type === 'tool_result')) continue;
-            const textBlock = rawContent.find(item => item && item.type === 'text');
-            rawContent = textBlock?.text || '';
+            rawContent = claudeUserRecordText(entry);
           }
           if (!rawContent || typeof rawContent !== 'string') continue;
+          if (entry.isCompactSummary) {
+            chars.compact += rawContent.length;
+            continue;
+          }
           if (rawContent.includes('[Request interrupted')) continue;
           if (rawContent.includes('<command-name>') ||
               rawContent.includes('<command-message>') ||
@@ -2667,7 +2873,7 @@ function register({
               if (block.type === 'thinking' && block.thinking) chars.claudeThinking += block.thinking.length;
               else if (block.type === 'text' && block.text) chars.claudeText += block.text.length;
               else if (block.type === 'tool_use') {
-                const group = classifyTool(block.name);
+                const group = copyActionFamily({ toolName: block.name, args: block.input || {} });
                 const inputStr = (() => {
                   try {
                     const cleanInput = (block.input && typeof block.input === 'object') ? { ...block.input } : block.input;
@@ -2678,21 +2884,23 @@ function register({
                 const resStr = (block.id && resultByUseId.get(block.id)) || '';
                 const totalLen = inputStr.length + resStr.length;
                 if (group === 'read') chars.read += totalLen;
+                else if (group === 'search') chars.search += totalLen;
                 else if (group === 'edit') chars.edit += totalLen;
-                else if (group === 'bash') chars.bash += totalLen;
-                else if (group === 'subagent') chars.subagentResult += totalLen;
-                else chars.tools += totalLen;
+                else if (group === 'run') chars.run += totalLen;
+                else if (group === 'git') chars.git += totalLen;
+                else if (group === 'mcp') chars.mcp += totalLen;
+                else if (group === 'web') chars.web += totalLen;
+                else if (group === 'plan') chars.plan += totalLen;
+                else if (group === 'agent') chars.subagentResult += totalLen;
+                else chars.other += totalLen;
               }
             }
           }
         }
-        else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-          // Compact summary is appended in copy-range output. Approximate via metadata.preTokens
-          // if present (it's already in tokens, not chars). We'll convert back to fake chars to keep
-          // single tokens formula consistent — preTokens * 3.5.
-          const pre = entry.compactMetadata?.preTokens;
-          if (typeof pre === 'number') chars.compact += pre * 3.5;
-        }
+        // compact_boundary itself has no copy text. Its paired readable
+        // isCompactSummary user record above owns the actual JSONL weight;
+        // preTokens is the context BEFORE compaction and must never pose as
+        // the size of the summary.
       }
 
       const toTokens = (c) => Math.ceil(c / 3.5);
@@ -2701,9 +2909,14 @@ function register({
         claudeText: toTokens(chars.claudeText),
         claudeThinking: toTokens(chars.claudeThinking),
         read: toTokens(chars.read),
+        search: toTokens(chars.search),
         edit: toTokens(chars.edit),
-        bash: toTokens(chars.bash),
-        tools: toTokens(chars.tools),
+        run: toTokens(chars.run),
+        git: toTokens(chars.git),
+        mcp: toTokens(chars.mcp),
+        web: toTokens(chars.web),
+        plan: toTokens(chars.plan),
+        other: toTokens(chars.other),
         subagentResult: toTokens(chars.subagentResult),
         subagentHistory: toTokens(chars.subagentHistory),
         compact: toTokens(chars.compact),
@@ -2717,64 +2930,6 @@ function register({
       };
     } catch (error) {
       console.error('[Claude EstimateRangeTokens] Error:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-  // Create a pre-filled Claude JSONL session (user question + assistant analysis)
-  // Used by Update API: API response is embedded as assistant message, then Claude --resume shows it
-  ipcMain.handle('claude:create-prefilled-session', async (event, { content, cwd }) => {
-    try {
-      const sessionId = crypto.randomUUID();
-      const uuid1 = crypto.randomUUID();
-      const uuid2 = crypto.randomUUID();
-      const now = new Date().toISOString();
-
-      const projectSlug = cwd.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
-      if (!fs.existsSync(projectDir)) fs.mkdirSync(projectDir, { recursive: true });
-
-      // Entry 1: user message with FULL API response (visible in Claude TUI)
-      const userEntry = {
-        parentUuid: null,
-        isSidechain: false,
-        userType: 'external',
-        cwd,
-        sessionId,
-        version: '1.0.0',
-        type: 'user',
-        message: { role: 'user', content: 'Результат анализа сессии внешним AI-агентом:\n\n' + content },
-        uuid: uuid1,
-        timestamp: now
-      };
-
-      // Entry 2: short assistant ack (completes the turn so Claude shows prompt on resume)
-      const assistantEntry = {
-        parentUuid: uuid1,
-        isSidechain: false,
-        userType: 'external',
-        cwd,
-        sessionId,
-        version: '1.0.0',
-        type: 'assistant',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'Принял. Готов применить изменения из анализа выше. Подтвердите командой.' }],
-          model: 'external-api',
-          stop_reason: 'end_turn',
-          stop_sequence: null
-        },
-        uuid: uuid2,
-        timestamp: new Date(Date.now() + 1000).toISOString()
-      };
-
-      const filePath = path.join(projectDir, sessionId + '.jsonl');
-      fs.writeFileSync(filePath, JSON.stringify(userEntry) + '\n' + JSON.stringify(assistantEntry) + '\n', 'utf-8');
-
-      console.log('[Claude Prefilled] Created: ' + filePath + ' (' + content.length + ' chars)');
-      return { success: true, sessionId, filePath, totalChars: content.length };
-    } catch (error) {
-      console.error('[Claude Prefilled] Error:', error);
       return { success: false, error: error.message };
     }
   });
@@ -4085,6 +4240,7 @@ function register({
       const entries = [];
       let skippedSidechain = 0, skippedSummary = 0, skippedToolResult = 0, skippedNoContent = 0, skippedSystem = 0;
       for (const entry of activeBranch) {
+        if (isClaudeHistoryContextAck(entry)) continue;
         // Skip sidechain entries (internal Claude operations)
         if (entry.isSidechain) { skippedSidechain++; continue; }
 
@@ -4104,11 +4260,10 @@ function register({
               skippedToolResult++;
               continue;
             }
-            // Detect image blocks (Claude Code shows these as [Image #N] in terminal)
+            // Rebuild every text/image segment in provider order so Timeline,
+            // History and Copy agree on the same user row.
             hasImage = rawContent.some(item => item.type === 'image');
-            // Find first text block for other array types
-            const textBlock = rawContent.find(item => item.type === 'text' && item.text);
-            rawContent = textBlock?.text || (hasImage ? '[Image]' : null);
+            rawContent = claudeUserRecordText(entry) || (hasImage ? '[Image #1]' : null);
           }
 
           // Skip if no valid content
@@ -4173,14 +4328,17 @@ function register({
           let responseHasThinking = false;
           const docsEditedSet = new Set();
           const docsSearchQueriesSet = new Set();
+          const subAgentsByKey = new Map();
           const entryIdx = activeBranch.indexOf(entry);
           for (let j = entryIdx + 1; j < activeBranch.length; j++) {
             const next = activeBranch[j];
-            if (next.type === 'assistant' && next.message?.usage) {
-              responseTokens += (next.message.usage.output_tokens || 0);
-              const mdl = next.message.model;
+            if (next.type === 'assistant') {
+              if (next.message?.usage) {
+                responseTokens += (next.message.usage.output_tokens || 0);
+              }
+              const mdl = next.message?.model;
               if (mdl && mdl !== '<synthetic>') responseModel = mdl;
-              const content = next.message.content;
+              const content = next.message?.content;
               if (Array.isArray(content)) {
                 if (content.some(c => c && c.type === 'thinking')) responseHasThinking = true;
                 for (const block of content) {
@@ -4195,6 +4353,17 @@ function register({
                   if (block.name === 'mcp__knowledge__docs_search') {
                     const q = block.input?.query || '';
                     if (q) docsSearchQueriesSet.add(q);
+                  }
+                  if ((block.name === 'Task' || block.name === 'Agent') && block.id) {
+                    const input = block.input && typeof block.input === 'object' ? block.input : {};
+                    const prompt = typeof input.prompt === 'string' ? input.prompt : '';
+                    const label = String(
+                      input.description || input.task_name || input.name || prompt.slice(0, 80) || 'Agent',
+                    ).replace(/\s+·\s+running\s*$/i, '');
+                    subAgentsByKey.set('task:' + block.id, {
+                      key: 'task:' + block.id,
+                      label,
+                    });
                   }
                 }
               }
@@ -4230,6 +4399,7 @@ function register({
             // separate docs_edit/docs_search dots. Empty arrays omitted to keep entry shape clean.
             docsEdited: docsEditedSet.size > 0 ? Array.from(docsEditedSet) : undefined,
             docsSearchQueries: docsSearchQueriesSet.size > 0 ? Array.from(docsSearchQueriesSet) : undefined,
+            subAgents: subAgentsByKey.size > 0 ? Array.from(subAgentsByKey.values()) : undefined,
           });
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           entries.push({
@@ -4333,6 +4503,10 @@ function register({
     includeText = true, includeThinking = true,
     includeBash = false, includeTools = false,
     includeWebSearch = false, includeToolSearch = false, includeOtherTools = includeTools,
+    includeActions = true,
+    includeSearch = includeBash, includeRun = includeBash, includeGit = includeBash,
+    includeMcp = includeTools, includeWeb = includeWebSearch,
+    includePlan = includeOtherTools || includeToolSearch, includeOther = includeOtherTools,
   }) => {
     // Backward compat: old callers may pass includeCode
     if (includeCode !== undefined && includeEditing === undefined) {
@@ -4637,16 +4811,25 @@ function register({
         }
       }
 
-      const groupFlags = {
-        reading: !!includeReading,
-        editing: !!includeEditing,
-        bash: !!includeBash,
-        mcp: !!includeTools,
-        web: !!includeWebSearch,
-        toolSearch: !!includeToolSearch,
-        tools: !!includeOtherTools,
+      const actionFilters = {
+        includeReading, includeSearch, includeEditing, includeRun, includeGit,
+        includeMcp, includeWeb, includePlan, includeOther,
+        includeSubagentResult, includeSubagentHistory,
       };
-      const claudeHasActionAppetite = includeReading || includeEditing || includeBash || includeTools || includeWebSearch || includeToolSearch || includeOtherTools || includeSubagentResult || includeSubagentHistory;
+      const groupFlags = {
+        includeClaude,
+        actions: !!includeActions,
+        reading: !!includeReading,
+        search: !!includeSearch,
+        editing: !!includeEditing,
+        run: !!includeRun,
+        git: !!includeGit,
+        mcp: !!includeMcp,
+        web: !!includeWeb,
+        plan: !!includePlan,
+        other: !!includeOther,
+      };
+      const claudeHasActionAppetite = !!includeActions;
 
       // Delegate to shared formatToolAction with current session's settings
       const formatTool = (toolName, input, toolResult = null, toolUseId = null) => {
@@ -4660,6 +4843,8 @@ function register({
       // Process the active branch
       for (let i = 0; i < activeBranch.length; i++) {
         const entry = activeBranch[i];
+
+        if (isClaudeHistoryContextAck(entry)) continue;
 
         if (entry.isSidechain || entry.type === 'summary') continue;
 
@@ -4676,7 +4861,7 @@ function register({
 
           if (typeof rawContent !== 'string') {
             if (Array.isArray(rawContent)) {
-              rawContent = rawContent.find(item => item.type === 'text')?.text || null;
+              rawContent = claudeUserRecordText(entry) || null;
             } else {
               rawContent = null;
             }
@@ -4720,23 +4905,8 @@ function register({
               if (block.type === 'tool_use') {
                 // Label-always — see same note in claude:copy-range.
                 // Group classification gates only the toolResult search (perf optimization).
-                const group = (() => {
-                  if (block.name === 'Read' || block.name === 'NotebookRead') return 'reading';
-                  if (block.name === 'Edit' || block.name === 'Write' || block.name === 'NotebookEdit') return 'editing';
-                  if (block.name === 'Bash' || block.name === 'Monitor' || block.name === 'Grep' || block.name === 'Glob') return 'bash';
-                  if (block.name === 'Task' || block.name === 'Agent') return 'subagent';
-                  if (block.name === 'WebSearch' || block.name === 'WebFetch') return 'web';
-                  if (typeof block.name === 'string' && block.name.startsWith('mcp__')) return 'mcp';
-                  return 'tools';
-                })();
-                const groupOn = (group === 'reading' && groupFlags.reading)
-                  || (group === 'editing' && groupFlags.editing)
-                  || (group === 'bash' && groupFlags.bash)
-                  || (group === 'mcp' && groupFlags.mcp)
-                  || (group === 'web' && groupFlags.web)
-                  || (group === 'toolSearch' && groupFlags.toolSearch)
-                  || (group === 'tools' && groupFlags.tools)
-                  || (group === 'subagent' && (includeSubagentResult || includeSubagentHistory));
+                const group = copyActionFamily({ toolName: block.name, args: block.input || {} });
+                const groupOn = !!includeActions && actionDetailsEnabled(group, actionFilters);
 
                 const toolResult = groupOn
                   ? (exportToolResultByUseId.get(block.id) || null)
@@ -5423,6 +5593,7 @@ function register({
 
       for (let i = 0; i < historyBranch.length; i++) {
         const entry = historyBranch[i];
+        if (isClaudeHistoryContextAck(entry)) continue;
         if (entry.isSidechain || entry.type === 'summary') continue;
 
         // Plan mode / clear context boundary detection
@@ -5570,7 +5741,7 @@ function register({
           if (Array.isArray(rawContent) && rawContent.some(item => item.type === 'tool_result')) continue;
           if (typeof rawContent !== 'string') {
             if (Array.isArray(rawContent)) {
-              rawContent = rawContent.find(item => item.type === 'text')?.text || null;
+              rawContent = claudeUserRecordText(entry) || null;
             } else {
               rawContent = null;
             }
@@ -5734,6 +5905,7 @@ function register({
                   return {
                     text,
                     isError: !!res.is_error,
+                    completedAt: Date.parse(found.record?.timestamp || '') || 0,
                     diffHunks: diffHunks || undefined,
                     // Accepted-but-unnotified background work is RUNNING: the
                     // acceptance result exists (so the card is not spinning),
@@ -5750,8 +5922,20 @@ function register({
                   // 'Agent' is the CLI's current name for the same tool.
                   const actionObj = fmtAction(name, input, block.id);
                   if (typeof actionObj === 'object' && actionObj.tool === 'Task') {
+                    actionObj.startedAt = Date.parse(entry.timestamp || '') || 0;
                     const rr = findToolResult();
-                    if (rr) actionObj.result = rr.text;
+                    if (rr) {
+                      actionObj.result = rr.text;
+                      if (rr.completedAt > 0) {
+                        actionObj.completedAt = rr.completedAt;
+                        if (Number(actionObj.startedAt) > 0) {
+                          actionObj.durationMs = Math.max(
+                            0,
+                            rr.completedAt - Number(actionObj.startedAt),
+                          );
+                        }
+                      }
+                    }
                     // Async launch (backgrounded agent): the tool_result is
                     // only an acceptance receipt — internal metadata, never
                     // the answer. Structural identity is toolUseResult.isAsync
@@ -5770,11 +5954,19 @@ function register({
                       actionObj.agentId = acceptedAgentId;
                     }
                     if (acceptance?.record?.toolUseResult?.isAsync === true) {
+                      // The immediate tool_result is launch acceptance, not
+                      // completion. Discard its timing; only the later task
+                      // notification (or an explicit stop proof) may freeze a
+                      // duration for an async agent.
+                      delete actionObj.completedAt;
+                      delete actionObj.durationMs;
                       const notification = taskNotificationByToolUseId.get(block.id);
                       if (!actionObj.agentId && notification?.agentId) {
                         actionObj.agentId = notification.agentId;
                       }
                       const status = deriveClaudeAsyncAgentStatus(notification);
+                      const resumedAt = Date.parse(notification?.resumedAt || '');
+                      if (Number.isFinite(resumedAt)) actionObj.startedAt = resumedAt;
                       // A user-stopped agent will never notify: the sidecar
                       // proof is terminal and outranks "no notification yet".
                       const userStopped = stoppedAgentToolUseIds.has(block.id);
@@ -5785,6 +5977,16 @@ function register({
                         // Hide the acceptance boilerplate while running.
                         delete actionObj.result;
                       } else {
+                        const completedAt = Date.parse(notification?.timestamp || '');
+                        if (Number.isFinite(completedAt)) {
+                          actionObj.completedAt = completedAt;
+                          if (Number(actionObj.startedAt) > 0) {
+                            actionObj.durationMs = Math.max(
+                              0,
+                              completedAt - Number(actionObj.startedAt),
+                            );
+                          }
+                        }
                         const body = [notification?.summary, notification?.result]
                           .filter(Boolean).join('\n')
                           || (userStopped ? 'Агент остановлен.' : '');

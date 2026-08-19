@@ -31,7 +31,6 @@
 - **`gemini -r <id>`** — resume конкретной сессии по UUID. Используется при Fork и ручном возобновлении.
 - **`gemini -r`** (`bareResume`) — resume последней по mtime сессии. Файл находится через `readdirSync` + сортировка.
 - **`gemini -y`** (`yesMode`) — auto-approve без ручного подтверждения. Используется, когда промпт заранее подготовлен.
-- **`gemini -y -r <id>`** (`resumeSessionId` + `yesMode`) — resume prefilled-сессии с auto-approve. Основной режим для **Update Docs** (см. `fact-docs-update.md`).
 
 ### 5. Ограничения
 - **Exclusive Session:** В одной вкладке может быть активна только одна AI-сессия (либо Claude, либо Gemini). Запуск второй блокируется с выводом предупреждения в терминал.

@@ -9,6 +9,7 @@ const {
 function spawn(toolUseId = 'toolu_agent') {
   return {
     type: 'assistant',
+    timestamp: '2026-08-18T18:51:36.000Z',
     sessionId: 'session-a',
     message: {
       content: [{
@@ -42,6 +43,10 @@ test('an async agent is counted only after structural acceptance', () => {
   assert.equal(tracker.snapshot('tab-a').count, 0);
   tracker.observe({ tabId: 'tab-a', sessionId: 'session-a', record: accept() });
   assert.equal(tracker.snapshot('tab-a').count, 1);
+  assert.equal(
+    tracker.snapshot('tab-a').agents[0].startedAt,
+    Date.parse('2026-08-18T18:51:36.000Z'),
+  );
   assert.equal(changes.at(-1).count, 1);
 });
 

@@ -193,6 +193,14 @@ function decideCodexLateMcpCommittedFrame({
   if (inspected?.ready === true) {
     return { action: 'clear', reason: 'current-composer-ready' };
   }
+  // This proof owns only the late MCP diagnosis. Once the exact candidate
+  // write is committed, a current frame with no MCP blocker must release it
+  // even when an app-owned slash command has made the composer transitional.
+  // Other control surfaces keep their own guards; the stale warning above the
+  // current composer cannot turn this diagnostic into a modal input lock.
+  if (inspected && blockers.length === 0) {
+    return { action: 'clear', reason: 'current-mcp-blocker-absent' };
+  }
   return { action: 'wait', reason: 'current-frame-transitional' };
 }
 

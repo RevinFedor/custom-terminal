@@ -1,3 +1,5 @@
+import { captureSpaceLayout } from './workspaceSpacesModel.mjs';
+
 // What "the saved session" IS — one definition, used by BOTH ways it is written.
 //
 // The session is written on two paths:
@@ -51,6 +53,17 @@ export function buildSessionSnapshot(state) {
     // as you move between projects — one shared list would follow you across and
     // read as somebody else's tabs.
     centerStrips: state.centerStrips || {},
+    // Рабочие пространства. Раскладка текущего лежит ВЫШЕ, на верхнем уровне —
+    // здесь она записывается ещё и в его собственный снимок, иначе перезапуск
+    // вернул бы окна на месте, но у пространства они бы «пропали» при первом же
+    // переключении. Один и тот же вопрос, два читателя: верхний уровень отвечает
+    // «что показать сразу», список — «что показать, когда сюда вернутся».
+    spaces: (state.spaces || []).map((space) => (
+      space.id === state.activeSpaceId
+        ? { ...space, layout: captureSpaceLayout(state) }
+        : space
+    )),
+    activeSpaceId: state.activeSpaceId ?? null,
   };
 }
 
@@ -72,4 +85,6 @@ export const SESSION_SNAPSHOT_FIELDS = Object.freeze([
   'splitFocusedIndex',
   'splitSizes',
   'centerStrips',
+  'spaces',
+  'activeSpaceId',
 ]);

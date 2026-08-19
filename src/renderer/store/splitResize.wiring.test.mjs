@@ -163,3 +163,49 @@ test('пункты меню направления называют только
   assert.match(chrome, /import \{[^}]*PanelBottom[^}]*PanelTop[^}]*\} from 'lucide-react'/);
   assert.match(row, /<Icon size=\{13\}/);
 });
+
+// ── Зона захвата шире видимой полоски ─────────────────────────────────────
+
+test('перегородку ловят по зоне ШИРЕ, чем она нарисована', () => {
+  // Поймать границу мышью и увидеть её — разные задачи с разными правильными
+  // размерами: полоска толщиной с прицел выглядит грубо, прицел толщиной с
+  // полоску заставляет целиться. Два числа, и растёт только зона — на экране не
+  // меняется ничего (юзер: «визуально идентично, область срабатывания больше»).
+  assert.match(chrome, /const SPLIT_DIVIDER_VISUAL_PX = 6;/);
+  assert.match(chrome, /const SPLIT_DIVIDER_HIT_GROW_PX = 2;/);
+  assert.match(chrome, /SPLIT_DIVIDER_VISUAL_PX \+ SPLIT_DIVIDER_HIT_GROW_PX \* 2/);
+  // Подсветка живёт на ВНУТРЕННЕЙ полоске: покрась её на всей зоне — и
+  // «визуально идентично» сломается ровно в момент наведения.
+  assert.match(chrome, /data-split-divider-visual/);
+  assert.match(chrome, /const paintDivider = /);
+});
+
+// ── Контур наведения против рамки фокуса ──────────────────────────────────
+
+test('контур наведения читается рядом с рамкой окна в фокусе', () => {
+  // Окна лежат вплотную и рисуют рамки ВНУТРЬ себя — на шве оказываются две
+  // соседние пиксельные колонки, а не одна общая. Тусклый контур наведения рядом
+  // с яркой рамкой фокуса не читался: человек наводит на соседнее окно и не
+  // видит отклика с той стороны, откуда пришёл курсор. Слоями это не лечится —
+  // ничто ничего не перекрывает; решает только яркость.
+  const css = fs.readFileSync(path.join(here, '..', 'styles', 'globals.css'), 'utf8');
+  assert.match(css, /inset 0 0 0 1px rgba\(255, 255, 255, 0\.42\)/);
+  assert.match(chrome, /SPLIT_PANE_HOVER_RING = 'inset 0 0 0 1px rgba\(255,255,255,0\.42\)'/);
+});
+
+// ── Плашка прерванной сессии принадлежит своему окну ──────────────────────
+
+test('«сессия прервана» рисуется в СВОЁМ окне, а не поверх всей области', () => {
+  const surface = fs.readFileSync(path.join(here, '..', 'components', 'Workspace', 'SplitPaneSurface.tsx'), 'utf8');
+  const area = fs.readFileSync(path.join(here, '..', 'components', 'Workspace', 'TerminalArea.tsx'), 'utf8');
+  // Одна плашка на всё приложение накрывала соседей и висела над окном, к
+  // которому не относится: она говорит про ОДНУ вкладку.
+  assert.match(surface, /<InterruptedSessionOverlay/);
+  assert.match(area, /&& !splitActiveLayout;/);
+  // Возобновление — один модуль на обе поверхности: вторая копия разошлась бы с
+  // первой на первом же изменении (каналы Claude/Codex, сторож bridge, порядок
+  // «сначала запрос, потом снимаем пометку»).
+  assert.match(surface, /continueInterruptedSession\(\{/);
+  assert.match(area, /continueInterruptedSession\(\{/);
+  assert.doesNotMatch(area, /claude:run-command/);
+});

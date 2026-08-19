@@ -4,6 +4,34 @@ function isManualSubmitInput(data) {
   return data === '\r' || data === '\n';
 }
 
+function classifyLateMcpProofInput({
+  proofPending = false,
+  xtermInputOrigin = null,
+} = {}) {
+  if (!proofPending) {
+    return {
+      action: 'deliver',
+      reason: 'late-mcp-proof-not-pending',
+      cancelProof: false,
+    };
+  }
+  if (xtermInputOrigin === 'terminal-response') {
+    return {
+      action: 'deliver',
+      reason: 'terminal-protocol-response',
+      cancelProof: false,
+    };
+  }
+  // A late MCP candidate is diagnostic, not an input owner. Any physical or
+  // origin-unknown xterm input wins immediately; inputRevision will then make
+  // every stale automation proof fail at its own write boundary.
+  return {
+    action: 'deliver',
+    reason: 'manual-input-owns-terminal',
+    cancelProof: true,
+  };
+}
+
 function shouldSerializeManualPtyInput({
   alreadySerialized = false,
   isTerminalProtocolResponse = false,
@@ -47,6 +75,7 @@ function classifyManualPtyInputAtBoundary({
 }
 
 module.exports = {
+  classifyLateMcpProofInput,
   classifyManualPtyInputAtBoundary,
   isManualSubmitInput,
   shouldSerializeManualPtyInput,

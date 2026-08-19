@@ -35,6 +35,7 @@ import {
   allPaneTabIds,
   paneIndexHoldingTab,
   arrangePanes,
+  swapPanes,
   describeWorkspace,
 } from './splitPanesModel.mjs';
 
@@ -1041,4 +1042,42 @@ test('раскладка: якорь может исчезнуть — тогд�
   });
   assert.deepEqual(res.panes.map((x) => x.tabId), ['b', 'a']);
   assert.equal(res.focusedIndex, 1);
+});
+
+// ── Обмен окон местами ────────────────────────────────────────────────────
+
+test('обмен: два окна меняются содержимым целиком, вместе со своими полосами', () => {
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  panes = addTabToPane(panes, 0, 'p1', 'c').panes; // первое окно: [a, c]
+  const res = swapPanes(panes, 0, 0, 1);
+  // Полоса уехала ЦЕЛИКОМ, а не одной показанной вкладкой.
+  assert.deepEqual(paneTabs(res.panes[1]).map((e) => e.tabId), ['a', 'c']);
+  assert.equal(res.panes[0].tabId, 'b');
+  // Показанной в первом окне была 'c' (её туда и положили) — она и переезжает.
+  assert.equal(res.panes[1].tabId, 'c', 'показанная вкладка переезжает с полосой');
+});
+
+test('обмен: фокус едет за содержимым', () => {
+  const res = swapPanes([p('p1', 'a'), p('p1', 'b')], 0, 0, 1);
+  assert.equal(res.focusedIndex, 1);
+  const back = swapPanes([p('p1', 'a'), p('p1', 'b')], 1, 0, 1);
+  assert.equal(back.focusedIndex, 0);
+  const other = swapPanes([p('p1', 'a'), p('p1', 'b'), p('p1', 'c')], 2, 0, 1);
+  assert.equal(other.focusedIndex, 2, 'чужой фокус не трогаем');
+});
+
+test('обмен: МЕСТО остаётся за окном — колонка не переезжает с содержимым', () => {
+  // Колонка 0 из двух строк + колонка 1 одной строкой. Меняем строку из первой
+  // колонки со вторым столбцом: сетка обязана остаться той же самой.
+  let panes = [p('p1', 'a'), p('p1', 'b')];
+  panes = addEmptyPaneVertical(panes, 0, null, 0, 'below').panes;
+  panes = panes.map((x) => (x.tabId ? x : { ...x, projectId: 'p1', tabId: 'z' }));
+  const before = panes.map((x) => x.column);
+  const res = swapPanes(panes, 0, 0, panes.length - 1);
+  assert.deepEqual(res.panes.map((x) => x.column), before, 'сетка не перекроилась');
+});
+
+test('обмен: одно и то же окно — ничего не происходит', () => {
+  assert.equal(swapPanes([p('p1', 'a'), p('p1', 'b')], 0, 1, 1), null);
+  assert.equal(swapPanes([p('p1', 'a')], 0, 0, 5), null);
 });

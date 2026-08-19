@@ -98,7 +98,31 @@ function decideCodexResumeGoalAutoEnter({
   return { allowed: true, reason: 'resume-goal-selected', prompt };
 }
 
+function decideCodexLeaveGoalPausedAutoEnter({
+  sameTerminal,
+  sameRunSeq,
+  sameInputRevision,
+  screenAvailable,
+  cleanText,
+} = {}) {
+  if (sameTerminal !== true) return { allowed: false, reason: 'terminal-changed' };
+  if (sameRunSeq !== true) return { allowed: false, reason: 'run-changed' };
+  if (sameInputRevision !== true) return { allowed: false, reason: 'input-changed' };
+  if (screenAvailable !== true) return { allowed: false, reason: 'screen-unavailable' };
+  const prompt = inspectCodexResumeGoalPrompt(cleanText);
+  if (!prompt.visible) return { allowed: false, reason: 'prompt-closed', prompt };
+  if (!prompt.interactiveVisible || !prompt.secondOptionSelected || prompt.firstOptionSelected) {
+    return {
+      allowed: false,
+      reason: prompt.skipReason || 'leave-paused-not-selected',
+      prompt,
+    };
+  }
+  return { allowed: true, reason: 'leave-paused-selected', prompt };
+}
+
 module.exports = {
+  decideCodexLeaveGoalPausedAutoEnter,
   decideCodexResumeGoalAutoEnter,
   inspectCodexResumeGoalPrompt,
 };

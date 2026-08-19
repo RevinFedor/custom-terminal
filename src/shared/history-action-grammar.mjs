@@ -25,6 +25,13 @@ export const BASH_SEARCH_WORDS = new Set([
   'whereis', 'locate', 'ag',
 ]);
 
+// Shell HTTP clients are still COMMANDS. Keep the vocabulary exported for
+// consumers that need to recognise the program, but never promote curl/wget
+// to the provider-owned Web family: they are commonly local API probes.
+export const BASH_WEB_WORDS = new Set(['curl', 'wget', 'http', 'https', 'httpie']);
+export const BASH_EDIT_WORDS = new Set(['cp', 'mv', 'rm', 'touch', 'truncate']);
+const BASH_REDIRECT_EDIT_WORDS = new Set(['cat', 'echo', 'printf', 'tee']);
+
 export function effectiveBashWord(command) {
   const text = typeof command === 'string' ? command : '';
   if (!text.trim()) return '';
@@ -127,6 +134,54 @@ function pythonEditInfo(command, word) {
   return { isEdit, target };
 }
 
+function shellEditInfo(command, word) {
+  const python = pythonEditInfo(command, word);
+  const isEphemeralTarget = (target) => /^\/?tmp\//.test(String(target || '').replace(/^\.\//, ''));
+  if (python.isEdit) return isEphemeralTarget(python.target) ? { isEdit: false, target: '' } : python;
+  const text = String(command || '');
+  const actingWord = String(word || effectiveBashWord(text)).toLowerCase();
+  const targetFromArguments = () => {
+    const stage = splitShellStages(text).find((candidate) => {
+      const first = tokenizeCommand(candidate)[0] || '';
+      return (String(first).split('/').pop() || '').toLowerCase() === actingWord;
+    }) || text;
+    return tokenizeCommand(stage).slice(1).reverse().find(looksLikePath) || '';
+  };
+
+  if (BASH_EDIT_WORDS.has(actingWord)) {
+    const target = targetFromArguments();
+    return isEphemeralTarget(target) ? { isEdit: false, target: '' } : { isEdit: true, target };
+  }
+  if (actingWord === 'sed' && /(?:^|\s)(?:--in-place(?:=\S*)?|-[A-Za-z]*i[^\s]*)(?=\s|$)/.test(text)) {
+    const target = targetFromArguments();
+    return isEphemeralTarget(target) ? { isEdit: false, target: '' } : { isEdit: true, target };
+  }
+  if (actingWord === 'perl' && /(?:^|\s)-[A-Za-z]*i[^\s]*(?=\s|$)/.test(text)) {
+    const target = targetFromArguments();
+    return isEphemeralTarget(target) ? { isEdit: false, target: '' } : { isEdit: true, target };
+  }
+  if (actingWord === 'tee') {
+    const target = targetFromArguments();
+    if (target && !isEphemeralTarget(target)) return { isEdit: true, target };
+  }
+
+  // Explicit stdout redirection is a file write. Ignore stderr redirection,
+  // descriptor duplication and /dev/null — they are execution plumbing.
+  const firstToken = tokenizeCommand(firstShellStage(text))[0] || '';
+  const redirectOwner = actingWord || (String(firstToken).split('/').pop() || '').toLowerCase();
+  if (!BASH_REDIRECT_EDIT_WORDS.has(redirectOwner)) return { isEdit: false, target: '' };
+  const redirect = /(^|[\s;|&])(\d*)>>?\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g;
+  let match;
+  while ((match = redirect.exec(text)) !== null) {
+    if (match[2] && match[2] !== '1') continue;
+    const target = String(match[3] || match[4] || match[5] || '');
+    if (!target || target.startsWith('&') || /^\/dev\/(?:null|stdout|stderr)$/.test(target)) continue;
+    if (isEphemeralTarget(target)) continue;
+    return { isEdit: true, target };
+  }
+  return { isEdit: false, target: '' };
+}
+
 export function parseMcpToolName(toolName) {
   const name = String(toolName || '');
   if (!name.startsWith('mcp__')) return null;
@@ -152,8 +207,8 @@ export function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } =
   switch (name) {
     case 'Bash': {
       const word = effectiveBashWord(args?.command);
-      const pythonEdit = pythonEditInfo(args?.command, word);
-      if (pythonEdit.isEdit) return { family: 'edit', bashWord: word || undefined };
+      const shellEdit = shellEditInfo(args?.command, word);
+      if (shellEdit.isEdit) return { family: 'edit', bashWord: word || undefined };
       const family = bashFamily(word);
       let bashDetail;
       if (family === 'git' && typeof args?.command === 'string') {
@@ -170,6 +225,7 @@ export function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } =
     case 'Edit':
     case 'Write':
     case 'MultiEdit':
+    case 'Update':
     // A patch that never applied (Codex: the script building it crashed).
     // It touched no file, so it must not claim one — but it IS an attempt to
     // change files, and leaving it in `other` kept it out of every block, so
@@ -622,10 +678,10 @@ export function historyActionHeadline({ toolName, args, family, bashWord, bashDe
   if (name === 'Bash') {
     const command = typeof args?.command === 'string' ? args.command : '';
     const word = bashWord || effectiveBashWord(command);
-    const pythonEdit = pythonEditInfo(command, word);
-    const fam2 = fam || (pythonEdit.isEdit ? 'edit' : bashFamily(word));
+    const shellEdit = shellEditInfo(command, word);
+    const fam2 = fam || (shellEdit.isEdit ? 'edit' : bashFamily(word));
     if (fam2 === 'edit') {
-      return { verb: 'Edit', subject: historyDisplayPath(pythonEdit.target), detail: '' };
+      return { verb: 'Edit', subject: historyDisplayPath(shellEdit.target), detail: '' };
     }
     const { subject, detail } = extractBashSubject(command, fam2, word);
     if (fam2 === 'git') {
@@ -648,6 +704,7 @@ export function historyActionHeadline({ toolName, args, family, bashWord, bashDe
         detail: historyDisplayPath(detail),
       };
     }
+    if (fam2 === 'web') return { verb: 'Web', subject: word || 'request', detail: '' };
     return { verb: 'Run', subject: shortRunSubject(command, word), detail: '' };
   }
   return { verb: name || 'Tool', subject: '', detail: '' };
@@ -702,7 +759,7 @@ export function historyActionPresentationMeta({ toolName, args, family, bashWord
     const command = typeof args?.command === 'string' ? args.command : '';
     const word = bashWord || classified.bashWord || effectiveBashWord(command);
     rawPathTarget = fam === 'edit'
-      ? String(pythonEditInfo(command, word).target || '')
+      ? String(shellEditInfo(command, word).target || '')
       : String(extractBashSubject(command, fam, word).subject || '');
   }
   if (fam === 'search') {

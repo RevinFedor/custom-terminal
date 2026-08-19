@@ -1,7 +1,11 @@
-# Fix: Tab Naming Race Condition (docs-XX → claude)
+# Fix: Tab Naming Race Condition (заданное имя → claude)
+
+> Исходный случай — вкладки `docs-XX` пайплайна обновления документации,
+> удалённого 2026-08-18. Правило живо для любого программного создания вкладки
+> с заранее заданным именем.
 
 ## Problem
-При создании таба обновления документации через `createTabAfterCurrent` с опциями `{ nameSetManually: true, name: 'docs-01' }` флаг `nameSetManually` терялся при конструировании объекта Tab. Когда пользователь запускал Claude в этом табе, функция `setTabCommandType` перезаписывала имя на `claude`, игнорируя intentional naming.
+При создании вкладки через `createTabAfterCurrent` с опциями `{ nameSetManually: true, name: 'docs-01' }` флаг `nameSetManually` терялся при конструировании объекта Tab. Когда пользователь запускал Claude в этом табе, функция `setTabCommandType` перезаписывала имя на `claude`, игнорируя intentional naming.
 
 ## Symptoms
 - Таб создается с именем `docs-01` ✓

@@ -196,7 +196,7 @@ test('the click that dismisses a menu does not also focus the pane', () => {
   );
   const onDown = block(terminalArea, 'const onPointerDown = (e: PointerEvent) => {', '\n    };');
   const guardAt = onDown.indexOf('notePointerDownForDismissal(document)');
-  const focusAt = onDown.indexOf('focusSplitPane(idx)');
+  const focusAt = onDown.indexOf('focusSplitPane(idx,');
   assert.ok(guardAt >= 0, 'expected the dismissal guard');
   assert.ok(focusAt > guardAt, 'the guard must run BEFORE focus moves');
   assert.match(onDown, /if \(notePointerDownForDismissal\(document\)\) return;/);

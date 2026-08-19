@@ -42,7 +42,7 @@ test('Resume goal Enter is revalidated against the exact current lifecycle and s
   );
   const actionStart = handler.indexOf("} else if (promptType === 'resume-goal')");
   assert.ok(actionStart >= 0, 'resume-goal action branch must exist');
-  const action = handler.slice(actionStart, handler.indexOf('} else {', actionStart + 1));
+  const action = handler.slice(actionStart, handler.indexOf('const remainingPromptTypes', actionStart));
   assert.match(action, /readCodexAuthoritativeScreen\([\s\S]*?'startup-resume-goal-action'/);
   assert.match(action, /decideCodexResumeGoalAutoEnter\(\{/);
   assert.match(action, /sameTerminal:/);
@@ -51,6 +51,9 @@ test('Resume goal Enter is revalidated against the exact current lifecycle and s
   assert.match(action, /screenAvailable:/);
   assert.match(action, /if \(!admission\.allowed\)/);
   assert.match(action, /term\.write\('\\r'\)/);
+  assert.match(action, /resumePausedGoal === false/);
+  assert.match(action, /term\.write\('\\x1b\[B'\)/);
+  assert.match(action, /decideCodexLeaveGoalPausedAutoEnter\(\{/);
   assert.ok(
     action.indexOf('if (!admission.allowed)') < action.indexOf("term.write('\\r')"),
     'Enter must follow final admission',

@@ -470,18 +470,17 @@ function timeLabel(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-// Counter of broken file paths attached to AI prompts (+ doc-prompt file, if it's used).
+// Counter of broken file paths attached to AI prompts.
 // Subscribes to usePromptsStore so it recomputes on save/delete; rechecks disk via
 // `ai-prompts:check-paths` IPC with a 300ms debounce. Click → opens Settings (caller
 // can route to the AI tab; we just open the modal for now).
 function InvalidPathsChip({ onOpenSettings }: { onOpenSettings?: () => void }) {
   const prompts = usePromptsStore((s) => s.prompts);
   const isLoaded = usePromptsStore((s) => s.isLoaded);
-  const docPrompt = useUIStore((s) => s.docPrompt);
   const [missing, setMissing] = useState<string[]>([]);
 
-  // Flat list of every absolute path we care about (prompts × filePaths + docPrompt.filePath
-  // if useFile is on). useMemo with JSON serialization gives a stable string dependency for
+  // Flat list of every absolute path we care about (prompts × filePaths).
+  // useMemo with JSON serialization gives a stable string dependency for
   // useEffect — Zustand returns new array references on every set, but the actual content
   // changes rarely. This avoids re-running the check on unrelated store mutations.
   const allPathsKey = useMemo(() => {
@@ -491,9 +490,8 @@ function InvalidPathsChip({ onOpenSettings }: { onOpenSettings?: () => void }) {
         for (const fp of p.filePaths) if (typeof fp === 'string' && fp.trim()) paths.push(fp);
       }
     }
-    if (docPrompt?.useFile && docPrompt.filePath?.trim()) paths.push(docPrompt.filePath);
     return JSON.stringify(paths);
-  }, [prompts, docPrompt]);
+  }, [prompts]);
 
   useEffect(() => {
     if (!isLoaded) return;

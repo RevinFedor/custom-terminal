@@ -21,6 +21,9 @@ const completeSnapshot = (overrides = {}) => ({
   readSessionId: 'writer-session',
   readIdentitySource: 'live-writer',
   savedSessionId: 'saved-session',
+  conversationMaterialized: true,
+  timelineCount: 1,
+  materializationReason: 'user-history-present',
   canCopySessionId: true,
   hasTerm: true,
   lastNotReady: null,
@@ -53,6 +56,9 @@ test('an incomplete legacy snapshot is rejected instead of mixing extra IPC gene
       'projectId',
       'readSessionId',
       'readIdentitySource',
+      'conversationMaterialized',
+      'timelineCount',
+      'materializationReason',
       'hasTerm',
       'lastNotReady',
       'startupFailed',
@@ -90,7 +96,8 @@ test('a complete main snapshot projects lifecycle, readiness, and identity atomi
     conversationMaterialized: true,
     canResume: false,
     canCopySessionId: true,
-    materializationReason: 'codex-session-id',
+    timelineCount: 1,
+    materializationReason: 'user-history-present',
     runtimeSnapshot: snapshot,
   });
 });
@@ -304,11 +311,13 @@ test('fork readiness ignores inactive presentation labels without a safe writer'
     sessionStatus: 'inactive',
     writerConfirmed: false,
     writerUsableForMutation: false,
+    conversationMaterialized: true,
   }), false);
   assert.equal(isCodexRuntimeForkReady({
     liveLifecycle: false,
     writerConfirmed: false,
     writerUsableForMutation: false,
+    conversationMaterialized: true,
   }), true);
   assert.equal(isCodexRuntimeForkReady({
     liveLifecycle: true,
@@ -317,5 +326,10 @@ test('fork readiness ignores inactive presentation labels without a safe writer'
     writerUsableForMutation: true,
     writerProof: 'process-open-rollout',
     provenWriterSessionId: 'writer-session',
+    conversationMaterialized: true,
   }), true);
+  assert.equal(isCodexRuntimeForkReady({
+    liveLifecycle: false,
+    conversationMaterialized: false,
+  }), false);
 });

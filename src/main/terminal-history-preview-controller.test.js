@@ -273,6 +273,163 @@ test('exact semantic item completion repairs a dropped delta instead of falling 
   assert.match(h.logs.join('\n'), /SEMANTIC_GAP/);
 });
 
+test('late semantic item completion cannot resurrect an assistant block already saved to JSONL', () => {
+  const h = createHarness();
+  h.controller.activateSemanticSource({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+  });
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'thread-a',
+    turnId: 'turn-a',
+  });
+  h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+    event: {
+      type: 'item_started',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      item: { kind: 'agentMessage', itemId: 'assistant-1', phase: 'finalAnswer' },
+    },
+  });
+  h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+    event: {
+      type: 'assistant_delta',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      itemId: 'assistant-1',
+      delta: 'Точный ответ',
+    },
+  });
+  h.flushTimers();
+  assert.equal(h.emitted.at(-1).preview.text, 'Точный ответ');
+
+  assert.equal(h.controller.observeCanonical({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'thread-a',
+    sourceSequence: 1,
+    identity: 'rollout-assistant-1',
+    canonicalText: 'Точный ответ',
+  }), true);
+  assert.equal(h.emitted.at(-1).action, 'clear');
+  const emittedAfterCanonical = h.emitted.length;
+
+  assert.equal(h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+    event: {
+      type: 'item_completed',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      item: {
+        kind: 'agentMessage',
+        itemId: 'assistant-1',
+        phase: 'finalAnswer',
+        text: 'Точный ответ',
+      },
+    },
+  }), true);
+  h.flushTimers();
+  assert.equal(h.emitted.length, emittedAfterCanonical);
+  assert.equal(h.controller.get('tab-a'), null);
+  assert.match(h.logs.join('\n'), /SEMANTIC_CANONICAL_ACK .*match=exact-text/);
+
+  assert.equal(h.controller.finish({
+    tabId: 'tab-a',
+    provider: 'codex',
+    turnId: 'turn-a',
+  }), true);
+  assert.equal(h.controller._turns.has('tab-a'), false);
+  assert.equal(h.emitted.length, emittedAfterCanonical);
+});
+
+test('each exact JSONL block retires only its matching semantic item', () => {
+  const h = createHarness();
+  h.controller.activateSemanticSource({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+  });
+  h.controller.begin({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'thread-a',
+    turnId: 'turn-a',
+  });
+  const streamItem = (itemId, text) => {
+    h.controller.observeSemanticEvent({
+      tabId: 'tab-a',
+      instanceId: 'codex-process-1',
+      event: {
+        type: 'item_started',
+        threadId: 'thread-a',
+        turnId: 'turn-a',
+        item: { kind: 'agentMessage', itemId, phase: 'commentary' },
+      },
+    });
+    h.controller.observeSemanticEvent({
+      tabId: 'tab-a',
+      instanceId: 'codex-process-1',
+      event: {
+        type: 'assistant_delta',
+        threadId: 'thread-a',
+        turnId: 'turn-a',
+        itemId,
+        delta: text,
+      },
+    });
+    h.flushTimers();
+  };
+
+  streamItem('assistant-1', 'Первый блок');
+  h.controller.observeCanonical({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'thread-a',
+    sourceSequence: 1,
+    identity: 'rollout-assistant-1',
+    semanticItemId: 'assistant-1',
+    canonicalText: 'Первый блок',
+  });
+  streamItem('assistant-2', 'Второй блок');
+  assert.equal(h.emitted.at(-1).preview.text, 'Второй блок');
+  assert.doesNotMatch(h.emitted.at(-1).preview.text, /Первый блок/);
+
+  h.controller.observeCanonical({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'thread-a',
+    sourceSequence: 2,
+    identity: 'rollout-assistant-2',
+    semanticItemId: 'assistant-2',
+    canonicalText: 'Второй блок',
+  });
+  const emittedAfterCanonical = h.emitted.length;
+  h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'codex-process-1',
+    event: {
+      type: 'item_completed',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      item: {
+        kind: 'agentMessage',
+        itemId: 'assistant-2',
+        phase: 'commentary',
+        text: 'Второй блок',
+      },
+    },
+  });
+  h.flushTimers();
+  assert.equal(h.emitted.length, emittedAfterCanonical);
+  assert.equal(h.controller.get('tab-a'), null);
+});
+
 test('same Codex semantic instance reconnect preserves accumulated markdown', () => {
   const h = createHarness();
   h.controller.activateSemanticSource({ tabId: 'tab-a', instanceId: 'same' });

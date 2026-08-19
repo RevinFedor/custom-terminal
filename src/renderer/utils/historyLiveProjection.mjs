@@ -236,6 +236,9 @@ const projectUserEntry = (canonical, envelope, blocks) => {
     .filter(Boolean)
     .join('\n');
   if (!text) return null;
+  const imagePaths = Array.isArray(canonical.imagePaths)
+    ? canonical.imagePaths
+    : (Array.isArray(envelope?.imagePaths) ? envelope.imagePaths : []);
   return {
     uuid: canonical.uuid,
     ...(typeof canonical.sourceIdentity === 'string'
@@ -259,6 +262,7 @@ const projectUserEntry = (canonical, envelope, blocks) => {
       || FALLBACK_TIMESTAMP,
     ),
     content: text,
+    ...(imagePaths.length > 0 ? { imagePaths: imagePaths.map((ref) => ({ ...ref })) } : {}),
     sessionId: String(canonical.sessionId || envelope.sessionId || ''),
   };
 };

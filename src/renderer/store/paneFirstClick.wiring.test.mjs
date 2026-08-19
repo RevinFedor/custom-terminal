@@ -32,7 +32,7 @@ const paneFocus = block(
 );
 
 test('клик по панели только переводит фокус и никого не глотает', () => {
-  assert.match(paneFocus, /st\.focusSplitPane\(idx\)/);
+  assert.match(paneFocus, /st\.focusSplitPane\(idx, /);
   assert.doesNotMatch(paneFocus, /stopPropagation/);
   assert.doesNotMatch(paneFocus, /preventDefault/);
   // Ни следа старого механизма во всём файле.
@@ -49,7 +49,7 @@ test('правая и средняя кнопки по-прежнему не д�
 
 test('клик, закрывающий меню, не достаётся панели', () => {
   const guardAt = paneFocus.indexOf('notePointerDownForDismissal(document)');
-  const focusAt = paneFocus.indexOf('focusSplitPane(idx)');
+  const focusAt = paneFocus.indexOf('focusSplitPane(idx,');
   assert.ok(guardAt >= 0, 'expected the dismissal guard');
   assert.ok(focusAt > guardAt, 'the guard must run BEFORE focus moves');
 });

@@ -2,7 +2,7 @@ const { ipcMain, shell } = require('electron');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { callGeminiApi } = require('./docs');
+const { callGeminiApi } = require('./gemini-api');
 const { buildChildProcessEnv } = require('../child-process-env');
 
 const GIT_TIMEOUT_MS = 90 * 1000;

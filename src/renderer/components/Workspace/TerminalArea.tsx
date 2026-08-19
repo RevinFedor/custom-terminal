@@ -5,12 +5,11 @@ import Terminal from './Terminal';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
 import { useSplitAttachRowHeight, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
 import { motion, AnimatePresence } from 'framer-motion';
-import { terminalRegistry } from '../../utils/terminalRegistry';
-import { clearPendingResume, markPendingResume } from '../../utils/pendingResume';
-import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { isEmptyPane, paneIsStacked, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
+import InterruptedSessionOverlay from './InterruptedSessionOverlay';
+import { continueInterruptedSession } from '../../utils/continueInterruptedSession';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
 // Машина состояний запуска/остановки живёт здесь и параметризована `tabId`,
 // поэтому её монтирует и одиночный режим, и каждая панель сплита отдельно.
@@ -175,121 +174,10 @@ const RestoredTerminalError = memo(({ tabId, ownerProjectId, cwd, error, visible
 // lifecycleSummary built from them — because that state is what every surface
 // now reads, including panes.
 
-// Overlay for interrupted AI sessions
-const InterruptedSessionOverlay = memo(({ tabId, sessionId, engine, onContinue, onDismiss }: {
-  tabId: string;
-  sessionId: string;
-  engine: InterruptedEngine;
-  onContinue: () => void;
-  onDismiss: () => void;
-}) => {
-  const [isLoading, setIsLoading] = useState(false);
-  const engineLabel = engine === 'codex' ? 'Codex' : 'Claude';
-
-  // Handle backdrop click
-  const handleBackdropClick = (e: React.MouseEvent) => {
-    console.log('[InterruptedOverlay] Backdrop click, isLoading:', isLoading, 'tabId:', tabId);
-    e.stopPropagation();
-    if (!isLoading) {
-      console.log('[InterruptedOverlay] Calling onDismiss');
-      onDismiss();
-    }
-  };
-
-  // Handle continue click - disable after first click
-  const handleContinueClick = (e: React.MouseEvent) => {
-    console.log('[InterruptedOverlay] Continue click, isLoading:', isLoading, 'tabId:', tabId, 'sessionId:', sessionId);
-    e.stopPropagation();
-    if (isLoading) {
-      console.log('[InterruptedOverlay] Already loading, ignoring');
-      return;
-    }
-    console.log('[InterruptedOverlay] Setting isLoading=true, calling onContinue');
-    setIsLoading(true);
-    onContinue();
-  };
-
-  // Handle close button click
-  const handleCloseClick = (e: React.MouseEvent) => {
-    console.log('[InterruptedOverlay] Close button click, isLoading:', isLoading, 'tabId:', tabId);
-    e.stopPropagation();
-    if (!isLoading) {
-      console.log('[InterruptedOverlay] Calling onDismiss');
-      onDismiss();
-    }
-  };
-
-  return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="absolute inset-0 z-50 flex items-center justify-center"
-      onClick={handleBackdropClick}
-      onDoubleClick={(e) => e.stopPropagation()}
-    >
-      {/* Semi-transparent backdrop */}
-      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm pointer-events-none" />
-
-      {/* Modal */}
-      <motion.div
-        initial={{ scale: 0.95, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        exit={{ scale: 0.95, opacity: 0 }}
-        className="relative bg-panel border border-border-main rounded-xl shadow-2xl p-6 max-w-sm mx-4 z-10"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Close button */}
-        <button
-          className="absolute top-3 right-3 text-[#666] hover:text-white text-xl leading-none w-6 h-6 flex items-center justify-center rounded hover:bg-white/10 disabled:opacity-50"
-          onClick={handleCloseClick}
-          disabled={isLoading}
-        >
-          ×
-        </button>
-
-        {/* Icon */}
-        <div className="w-12 h-12 rounded-full bg-yellow-500/20 flex items-center justify-center mb-4 mx-auto">
-          <span className="text-2xl">⚠️</span>
-        </div>
-
-        {/* Title */}
-        <h3 className="text-white text-center font-medium mb-2">
-          Сессия была прервана
-        </h3>
-
-        {/* Description */}
-        <p className="text-[#888] text-sm text-center mb-4">
-          Приложение было закрыто во время активной {engineLabel} сессии
-        </p>
-
-        {/* Session ID */}
-        <div className="bg-[#1a1a1a] rounded-lg p-2 mb-4">
-          <code className="text-[10px] text-[#666] break-all">{sessionId}</code>
-        </div>
-
-        {/* Continue button */}
-        <button
-          className="w-full bg-accent hover:bg-accent/80 disabled:bg-accent/50 disabled:cursor-not-allowed text-white py-2.5 px-4 rounded-lg font-bold text-sm transition-colors flex items-center justify-center gap-2"
-          onClick={handleContinueClick}
-          disabled={isLoading}
-        >
-          {isLoading ? (
-            <>
-              <div className="w-2.5 h-2.5 rounded-full bg-white animate-glow-blue" />
-              <span className="tracking-widest">LOADING...</span>
-            </>
-          ) : '⏵ ПРОДОЛЖИТЬ СЕССИЮ'}
-        </button>
-
-        {/* Hint */}
-        <p className="text-[#555] text-[10px] text-center mt-3">
-          Или нажмите на фон чтобы закрыть
-        </p>
-      </motion.div>
-    </motion.div>
-  );
-});
+// Плашка «сессия была прервана» переехала в свой модуль
+// (./InterruptedSessionOverlay): её рисует и одиночный центр, и КАЖДАЯ панель
+// разделённой области — по своей вкладке. Оставь она здесь, панель импортировала
+// бы файл, который сам её и рендерит.
 
 // Declared in its own module (./agentLifecycleSummary) because SplitPaneSurface
 // consumes it and this file renders SplitPaneSurface. Re-exported here so the
@@ -367,79 +255,29 @@ function TerminalArea({
   // (`title.startsWith('CODEX')`) связал бы возобновление сессии с текстом, и
   // правка формулировки молча сломала бы «продолжить».
   const activeTabInterruptedEngine: InterruptedEngine | null = interruptedLifecycle?.engine || null;
+  // Разделение окон: у каждого окна СВОЯ плашка прерванной сессии — её рисует
+  // сама панель (`SplitPaneSurface`), по своей вкладке. Здесь плашка одна на всё
+  // приложение и растянута на всю рабочую область, поэтому в разделённом виде
+  // она накрывала соседей и висела «хуй пойми где» — над окном, к которому
+  // отношения не имеет. Юзер: *«эта большая плашка отображается не в окне»*.
+  const splitActiveLayout = useWorkspaceStore((s) => s.splitPanes.length > 0);
   const showInterruptedOverlay = !!interruptedLifecycle
     && currentView === 'terminal'
-    && !isRestoring;
+    && !isRestoring
+    && !splitActiveLayout;
 
   
-  // Handle continuing interrupted AI session (use fresh state from getState)
-  const continueSessionInflightRef = useRef<Set<string>>(new Set());
-  const handleContinueSession = async (sessionId?: string, engine?: InterruptedEngine | null) => {
-    const tabId = activeTabId;
-    const targetSessionId = sessionId || activeTabSessionId;
-    const targetEngine = engine || activeTabInterruptedEngine;
-    console.log('[TerminalArea] handleContinueSession called, activeTab:', tabId, 'engine:', targetEngine, 'sessionId:', targetSessionId);
-
-    if (tabId && targetSessionId && targetEngine) {
-      if (continueSessionInflightRef.current.has(tabId)) {
-        console.warn('[TerminalArea] Continue already in flight for tab:', tabId);
-        return;
-      }
-      continueSessionInflightRef.current.add(tabId);
-      console.log('[TerminalArea] Sending resume; interrupted state stays until launch is accepted');
-
-      const setTabCommandType = useWorkspaceStore.getState().setTabCommandType;
-      setTabCommandType(tabId, targetEngine);
-
-      terminalRegistry.get(tabId)?.scrollToBottom();
-      terminalRegistry.get(tabId)?.focus();
-      requestAnimationFrame(() => terminalRegistry.get(tabId)?.focus());
-
-      try {
-        let runResult: any;
-        if (targetEngine === 'codex') {
-          const ws = useWorkspaceStore.getState().openProjects.get(projectId);
-          const cwd = ws?.tabs.get(tabId)?.cwd;
-          console.log('[TerminalArea] Invoking codex:run-command codex-c:', targetSessionId);
-          runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
-            tabId,
-            command: 'codex-c',
-            sessionId: targetSessionId,
-            cwd,
-          }));
-        } else {
-          // Arm the 15s stale-bridge guard immediately before the confirmed
-          // launch request; clear it again if main rejects the write.
-          markPendingResume(tabId, targetSessionId);
-          const tabCwd = useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId)?.cwd;
-          console.log('[TerminalArea] Invoking claude:run-command resume:', targetSessionId);
-          runResult = await ipcRenderer.invoke('claude:run-command', {
-            tabId,
-            command: 'claude-c',
-            sessionId: targetSessionId,
-            ...(tabCwd ? { cdTo: tabCwd } : {}),
-          });
-        }
-        if (runResult?.success === false || runResult?.accepted === false) {
-          if (targetEngine === 'claude') clearPendingResume(tabId);
-          console.warn('[TerminalArea] Resume rejected tab=' + tabId.slice(-12)
-            + ' engine=' + targetEngine
-            + ' error=' + (runResult?.error || runResult?.reason || 'unknown'));
-          return;
-        }
-        clearInterruptedState(tabId);
-      } catch (error: any) {
-        if (targetEngine === 'claude') clearPendingResume(tabId);
-        console.warn('[TerminalArea] Resume failed tab=' + tabId.slice(-12)
-          + ' engine=' + targetEngine
-          + ' error=' + (error?.message || String(error)));
-      } finally {
-        continueSessionInflightRef.current.delete(tabId);
-      }
-    } else {
-      console.log('[TerminalArea] handleContinueSession: Missing activeTab, engine or sessionId!');
-    }
-  };
+  // Возобновление живёт в общем модуле: ту же плашку рисует каждое окно
+  // разделённой области, и вторая копия этой логики разошлась бы с первой.
+  const handleContinueSession = (sessionId?: string, engine?: InterruptedEngine | null) => (
+    continueInterruptedSession({
+      tabId: activeTabId,
+      projectId,
+      sessionId: sessionId || activeTabSessionId,
+      engine: engine || activeTabInterruptedEngine,
+      clearInterruptedState,
+    })
+  );
 
   // Handle dismissing the interrupted overlay
   const handleDismissOverlay = () => {
@@ -545,7 +383,14 @@ function TerminalArea({
       // side effect of "go here". Removed by request (2026-08-17) — in practice
       // it read as a dead click, and the accidental expansion it prevented is
       // cheaper to undo than a click that does nothing.
-      if (Number.isFinite(idx) && idx !== st.splitFocusedIndex) st.focusSplitPane(idx);
+      // ⌘-клик — «прицелиться в окно, не съезжая из чужого проекта»: двигает
+      // только рамку фокуса, боковое меню и центр остаются как есть. Нужен,
+      // когда человек стоит в другом проекте и выбирает, КУДА оттуда положить
+      // вкладку: обычный клик сменил бы проект вместе со списком, из которого
+      // он и собирался выбирать.
+      if (Number.isFinite(idx) && idx !== st.splitFocusedIndex) {
+        st.focusSplitPane(idx, e.metaKey ? { keepSidebar: true } : undefined);
+      }
     };
     window.addEventListener('pointerdown', onPointerDown, true);
     return () => {

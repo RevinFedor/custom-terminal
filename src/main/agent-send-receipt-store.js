@@ -1205,12 +1205,16 @@ class AgentSendReceiptStore {
       }
       const updatedAt = this.now();
       const auditTimestamp = audit.auditTimestamp || new Date(updatedAt).toISOString();
+      const historyOnly = audit.raw?.historyOnly === true;
       const receipt = {
         ...(record.receipt || {}),
         ok: true,
         success: true,
         accepted: true,
-        submitted: true,
+        submitted: !historyOnly,
+        ...(historyOnly
+          ? { historyOnly: true, historyRecorded: true, modelTurnStarted: false }
+          : {}),
         status: 'sent',
         deliveryUnknown: false,
         auditPending: false,

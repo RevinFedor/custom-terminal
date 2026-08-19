@@ -9,6 +9,8 @@ export interface CodexRunPayloadBase {
   cwd?: string;
   developerInstructions?: string;
   launchSource?: 'auto-resume' | 'explicit';
+  resumePausedGoal?: boolean;
+  materializedFresh?: boolean;
 }
 
 export interface CodexRunPayload extends CodexRunPayloadBase {

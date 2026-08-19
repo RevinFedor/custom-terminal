@@ -143,6 +143,24 @@ test('a background begin is replayed when History subscribes later', () => {
   unsubscribe();
 });
 
+test('handoff retains an exact authoring snapshot for ordered cascade rollback', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  const value = store.begin({
+    tabId: 'tab-authoring',
+    handoffId: 'handoff-authoring',
+    toolType: 'claude',
+    text: 'presentation text',
+    authoringText: 'raw textarea text',
+    authoringChips: [{ id: 'paste-1', kind: 'paste', text: 'hidden paste body' }],
+    authoringImagePaths: [{ id: 4, path: '/tmp/image.png', availability: 'available' }],
+    source: 'history-panel',
+    statusAtSend: 'active',
+  });
+  assert.equal(value?.authoringText, 'raw textarea text');
+  assert.equal(value?.authoringChips[0].kind, 'paste');
+  assert.equal(value?.authoringImagePaths[0].id, 4);
+});
+
 test('a submit made during startup is visible immediately and advances through exact transport phases', () => {
   assert.equal(historyPromptHandoffInitialStatus('inactive'), 'preparing');
   assert.equal(historyPromptHandoffInitialStatus('starting'), 'preparing');
@@ -352,6 +370,45 @@ test('settle preserves exact handoff identity and immutable audit proof', () => 
   assert.equal(Object.isFrozen(settled?.promptChips), true);
   assert.equal(Object.isFrozen(settled?.imagePaths), true);
   assert.equal(Object.isFrozen(settled?.imagePaths[0]), true);
+});
+
+test('History canonical adoption enriches the same SENT handoff before consume', () => {
+  const store = new HistoryPromptHandoffStore(limits());
+  begin(store, 'tab-a', 'handoff-a');
+  store.settle('tab-a', 'handoff-a', {
+    queueStatus: 'sent',
+    reason: 'audit-confirmed',
+    proof: {
+      auditTimestamp: '2026-08-18T22:08:26.286Z',
+      actualHash: 'exact-hash',
+      sessionId: 'session-live',
+      sourceIdentity: 'codex-user-source-session-live-2232297',
+    },
+  });
+  const changes: HistoryPromptHandoffChange[] = [];
+  const unsubscribe = store.subscribe('tab-a', (_snapshot, change) => changes.push(change));
+  const adopted = store.adoptCanonicalEntry('tab-a', 'handoff-a', {
+    entryUuid: 'codex-user-session-live-687',
+    sessionId: 'session-live',
+    sourceIdentity: 'codex-user-source-session-live-2232400',
+    sourceIdentityAliases: ['codex-user-source-session-live-2232297'],
+  });
+  unsubscribe();
+
+  assert.equal(adopted?.queueStatus, 'sent');
+  assert.equal(adopted?.auditProof?.entryUuid, 'codex-user-session-live-687');
+  assert.equal(
+    adopted?.auditProof?.sourceIdentity,
+    'codex-user-source-session-live-2232297',
+  );
+  assert.equal(changes.at(-1)?.type, 'canonical-adopt');
+
+  const wrong = store.adoptCanonicalEntry('tab-a', 'handoff-a', {
+    entryUuid: 'similar-text-but-foreign-entry',
+    sessionId: 'session-live',
+    sourceIdentity: 'foreign-source',
+  });
+  assert.equal(wrong, undefined);
 });
 
 test('a late pending receipt cannot regress SENT with exact proof', () => {
@@ -1093,7 +1150,15 @@ test('manual History and Run After share the receipt presentation mapping', () =
 
   assert.match(
     historyPanelSource,
-    /const unconfirmedStatus = sendIdentityFailure[\s\S]{0,180}historyPromptHandoffUnconfirmedStatusFromSendResult\(result\)/,
+    /const unconfirmedStatus = localSlashReceipt\.handled[\s\S]{0,320}historyPromptHandoffUnconfirmedStatusFromSendResult\(result\)/,
+  );
+  assert.match(
+    historyPanelSource,
+    /projectCodexLocalSlashSendResult\(\{/,
+  );
+  assert.match(
+    historyPanelSource,
+    /requiresAuditIdentity: resultOwnershipTransferred && !localSlashReceipt\.handled/,
   );
   assert.match(
     historyPanelSource,
@@ -1101,7 +1166,7 @@ test('manual History and Run After share the receipt presentation mapping', () =
   );
   assert.match(
     historyPanelSource,
-    /const providerQueueReturned = historyPromptAuditIsProviderQueueReturn\([\s\S]{0,120}result\?\.pasteAudit \|\| result/,
+    /const providerQueueReturned = !historyOnly && historyPromptAuditIsProviderQueueReturn\([\s\S]{0,120}result\?\.pasteAudit \|\| result/,
   );
   assert.match(
     historyPanelSource,

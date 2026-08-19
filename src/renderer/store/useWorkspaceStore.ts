@@ -52,7 +52,21 @@ import {
   insertIntoStrip,
   removeFromStrip,
   arrangePanes,
+  swapPanes,
+  allPaneTabIds,
 } from '../utils/splitPanesModel.mjs';
+import {
+  addSpace,
+  captureSpaceLayout,
+  removeSpace as removeSpaceFromList,
+  renameSpace as renameSpaceInList,
+  restoreSpaces,
+  spaceIndexHoldingTab,
+  spaceTabCount,
+  switchSpace as switchSpaceInList,
+  emptySpaceLayout,
+  dropTabsFromOtherSpaces,
+} from '../utils/workspaceSpacesModel.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
@@ -236,6 +250,7 @@ export type SessionWriteReason =
   | 'userManual'
   | 'timelineChain'
   | 'fork'
+  | 'historyContext'
   | 'restoredFromDb'
   | 'userRevert'
   | 'unknown';
@@ -245,6 +260,7 @@ export type CodexSessionWriteReason =
   | 'userIntercept'
   | 'editRange'
   | 'deleteRange'
+  | 'historyContext'
   | 'unknown';
 
 export interface CodexSessionAdoptionOptions {
@@ -1508,6 +1524,8 @@ interface WorkspaceStore {
   addTabToSplitPaneStrip: (paneIndex: number, projectId: string, tabId: string) => void;
   /** Drag a chip within its own window's strip. */
   reorderSplitPaneTab: (paneIndex: number, tabId: string, toIndex: number) => void;
+  /** Поменять местами содержимое двух окон целиком. */
+  swapSplitPanes: (from: number, to: number) => void;
   /**
    * The single-mode centre's strip, keyed by project.
    *
@@ -1518,6 +1536,26 @@ interface WorkspaceStore {
    * behaves exactly as it did before strips existed.
    */
   centerStrips: Record<string, Array<{ projectId: string; tabId: string }>>;
+  /**
+   * Рабочие пространства — ВИДЫ на раскладку окон.
+   *
+   * Вкладки им не принадлежат: те живут в списке проекта, а пространство помнит
+   * только, как они разложены. Поля раскладки (`splitPanes`, `splitSizes`,
+   * `centerStrips`, оба указателя проекта) остаются на верхнем уровне стора —
+   * их читают десятки мест, и заворачивать каждое чтение в «раскладку текущего
+   * пространства» значило бы переписать их все ради одного нового слоя.
+   * Пространство при переключении СНИМАЕТ их себе и КЛАДЁТ обратно.
+   */
+  spaces: Array<{ id: string; name: string; layout: Record<string, any> }>;
+  activeSpaceId: string;
+  addWorkspaceSpace: () => void;
+  removeWorkspaceSpace: (id: string) => void;
+  renameWorkspaceSpace: (id: string, name: string) => void;
+  switchWorkspaceSpace: (id: string) => void;
+  /** Сколько РАЗНЫХ вкладок разложено в пространстве — число рядом с именем. */
+  workspaceSpaceTabCount: (id: string) => number;
+  /** Номер пространства, где лежит вкладка, или -1. Для карточки в списке. */
+  workspaceSpaceIndexOfTab: (tabId: string) => number;
   /**
    * Under WHICH key the centre's strip lives — the project whose tab the centre
    * is showing, not the project of the tab being talked about. The two differ as
@@ -1549,7 +1587,12 @@ interface WorkspaceStore {
   }) => { placedIndices: number[]; focusedIndex: number } | null;
   // ✕ / Escape on an empty placeholder pane (real panes close by tabId).
   removeEmptySplitPane: (paneIndex: number) => void;
-  focusSplitPane: (paneIndex: number) => void;
+  // `keepSidebar` — «прицелиться в окно, не съезжая из чужого проекта».
+  // Обычный клик по окну переводит и центр, и боковое меню на проект окна:
+  // это правильный ответ на «я работаю здесь». Но у человека бывает обратный
+  // порядок — он уже стоит в чужом проекте и выбирает, КУДА оттуда положить
+  // вкладку. См. комментарий у реализации.
+  focusSplitPane: (paneIndex: number, options?: { keepSidebar?: boolean }) => void;
   // ONE entry point for "user activated tab X of project P" (sidebar click,
   // switcher commit, pane focus, cross-tab jumps). Activation moves BOTH
   // pointers — the centre AND the sidebar (activationFollowPatch inside
@@ -2189,6 +2232,117 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   centerStrips: {},
 
+  // ── Рабочие пространства ────────────────────────────────────────────────
+  //
+  // Одно пространство есть ВСЕГДА: состояния «ни одного» не существует, поэтому
+  // приложению не нужен экран, которого больше нигде нет. До первого
+  // восстановления это то самое единственное, и его раскладка — та, что уже
+  // лежит в сторе.
+  spaces: [{ id: 'space-1', name: 'main', layout: {} }],
+  activeSpaceId: 'space-1',
+
+  addWorkspaceSpace: () => {
+    const st = get();
+    const id = 'space-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+    const res = addSpace(st.spaces, st.activeSpaceId, id);
+    if (!res) return;
+    // Уходящее пространство обязано забрать свою раскладку С СОБОЙ, иначе
+    // следующее переключение затрёт её пустой: раскладка живёт в общем
+    // состоянии, а не внутри пространства.
+    const saved = res.spaces.map((space: any) => (
+      space.id === st.activeSpaceId ? { ...space, layout: captureSpaceLayout(st) } : space
+    ));
+    set({
+      spaces: saved,
+      activeSpaceId: res.activeSpaceId,
+      // Новое пространство ПУСТОЕ: ни окон, ни вкладок. Указатели проектов
+      // остаются на месте — пустое окно всё равно должно предлагать запуск
+      // где-то, а не в никуда.
+      splitPanes: [],
+      splitFocusedIndex: 0,
+      splitSizes: null,
+      centerStrips: {},
+    });
+    console.log('[Spaces] add id=' + res.activeSpaceId + ' total=' + saved.length);
+    get().saveSession();
+  },
+
+  removeWorkspaceSpace: (id) => {
+    const st = get();
+    const res = removeSpaceFromList(st.spaces, st.activeSpaceId, id);
+    if (!res) return; // последнее не удаляется
+    // Удаляют РАСКЛАДКУ: вкладки остаются в списке проекта, процессы живут.
+    // Поэтому подтверждения нет — цена ошибки здесь ниже, чем у закрытой
+    // вкладки, а вернуться можно, разложив окна заново.
+    const movingAway = st.activeSpaceId === id;
+    const target = res.spaces.find((space: any) => space.id === res.activeSpaceId);
+    set({
+      spaces: res.spaces,
+      activeSpaceId: res.activeSpaceId,
+      // Уходим из удаляемого — показываем раскладку наследника. `emptySpaceLayout`
+      // подстилает поля, которых в старом снимке могло не быть.
+      ...(movingAway ? { ...emptySpaceLayout(), ...(target?.layout || {}) } : {}),
+    });
+    console.log('[Spaces] remove id=' + id + ' active=' + res.activeSpaceId + ' left=' + res.spaces.length);
+    get().saveSession();
+  },
+
+  renameWorkspaceSpace: (id, name) => {
+    const res = renameSpaceInList(get().spaces, id, name);
+    if (!res) return;
+    set({ spaces: res.spaces });
+    get().saveSession();
+  },
+
+  switchWorkspaceSpace: (id) => {
+    const st = get();
+    const res = switchSpaceInList(st.spaces, st.activeSpaceId, id, captureSpaceLayout(st));
+    if (!res) return;
+    // Приходящая раскладка чистится ЗДЕСЬ, а не при восстановлении сессии: пока
+    // в пространство не вернулись, его окна могут указывать на вкладки, которые
+    // за это время закрыли, — а вкладки проектов, ещё не открытых в этом
+    // запуске, на старте вообще неизвестны. Момент возврата — первый, когда
+    // ответ «жива ли эта вкладка» становится достоверным.
+    const alive = (projectId: string, tabId: string) => (
+      !!get().openProjects.get(projectId)?.tabs.has(tabId)
+    );
+    const layout: any = { ...res.layout };
+    const scrubbed = sanitizePanes(layout.splitPanes || [], layout.splitFocusedIndex ?? 0, alive);
+    layout.splitPanes = scrubbed.panes;
+    layout.splitFocusedIndex = scrubbed.focusedIndex;
+    layout.splitSizes = packSplitSizes(scrubbed.panes, layout.splitSizes ?? null);
+    const strips: Record<string, Array<{ projectId: string; tabId: string }>> = {};
+    Object.entries(layout.centerStrips || {}).forEach(([pid, raw]) => {
+      const kept = (Array.isArray(raw) ? raw : [])
+        .filter((e: any) => e && e.tabId && alive(e.projectId, e.tabId));
+      if (kept.length > 1) strips[pid] = kept as Array<{ projectId: string; tabId: string }>;
+    });
+    layout.centerStrips = strips;
+    set({ spaces: res.spaces, activeSpaceId: res.activeSpaceId, ...layout });
+    console.log('[Spaces] switch to=' + id
+      + ' panes=' + (res.layout.splitPanes?.length || 0));
+    get().saveSession();
+  },
+
+  workspaceSpaceTabCount: (id) => {
+    const st = get();
+    const space = st.spaces.find((s: any) => s.id === id);
+    if (!space) return 0;
+    // Текущее пространство считается по ЖИВОМУ состоянию, а не по снимку: снимок
+    // у него старше на одно переключение, и число отставало бы от того, что
+    // человек прямо сейчас видит на экране.
+    const layout = id === st.activeSpaceId ? captureSpaceLayout(st) : space.layout;
+    return spaceTabCount({ ...space, layout }, allPaneTabIds);
+  },
+
+  workspaceSpaceIndexOfTab: (tabId) => {
+    const st = get();
+    const withLive = st.spaces.map((space: any) => (
+      space.id === st.activeSpaceId ? { ...space, layout: captureSpaceLayout(st) } : space
+    ));
+    return spaceIndexHoldingTab(withLive, tabId, allPaneTabIds);
+  },
+
   // ПОД КАКИМ КЛЮЧОМ лежит полоса одиночного центра.
   //
   // Ключ — проект, чью вкладку центр СЕЙЧАС показывает, а не проект вкладки, о
@@ -2313,6 +2467,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
+  swapSplitPanes: (from, to) => {
+    const st = get();
+    const res = swapPanes(st.splitPanes, st.splitFocusedIndex, from, to);
+    if (!res) return;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    console.log('[Split] swapPanes ' + from + '<->' + to + ' focused=' + res.focusedIndex);
+    // Центр идёт за содержимым: человек назвал два окна и ждёт свои вкладки на
+    // новом месте — там же должна оказаться и показанная вкладка.
+    const focused = res.panes[res.focusedIndex];
+    if (focused?.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
+    get().saveSession();
+  },
+
   reorderSplitPaneTab: (paneIndex, tabId, toIndex) => {
     const res = reorderPaneTab(get().splitPanes, paneIndex, tabId, toIndex);
     if (!res) return;
@@ -2332,10 +2499,33 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
-  focusSplitPane: (paneIndex) => {
+  focusSplitPane: (paneIndex, options) => {
     const { splitPanes, splitFocusedIndex } = get();
     const pane = splitPanes[paneIndex];
     if (!pane) return;
+    // «Прицелиться в окно, оставшись в чужом проекте».
+    //
+    // Обычный клик по окну — это «я работаю здесь», и он двигает оба
+    // указателя: центр и боковое меню. Но есть обратный порядок, в котором
+    // правило мешает: человек уже припарковал боковое меню на другом проекте,
+    // видит там нужную вкладку и хочет положить её в КОНКРЕТНОЕ окно. Чтобы
+    // назвать окно, надо по нему кликнуть — и парковка тут же слетает вместе
+    // со списком, из которого он собирался выбрать. Юзер: *«мне нужно сначала
+    // кликнуть по этому окну, но тогда сменится проект, и надо переходить
+    // обратно»*.
+    //
+    // Поэтому у жеста есть тихий вариант: ⌘-клик двигает ТОЛЬКО рамку фокуса.
+    // Центр остаётся на прежней вкладке — окно, у которого нет активной
+    // вкладки, ничего показать не может, а «выбранное окно» и «показанная
+    // вкладка» здесь и должны разойтись: следующая активация вкладки положит
+    // её именно сюда.
+    if (options?.keepSidebar) {
+      if (splitFocusedIndex !== paneIndex) {
+        set({ splitFocusedIndex: paneIndex });
+        get().saveSession();
+      }
+      return;
+    }
     if (isEmptyPane(pane)) {
       // Placeholder has no tab — only the focus ring moves; the center keeps
       // showing the previous pane's tab until an activation fills this slot.
@@ -2701,7 +2891,36 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         && openProjects.has((sessionState as any).focusedProjectId)
         ? (sessionState as any).focusedProjectId as string
         : null;
+      // Рабочие пространства. Раскладка, сохранённая ДО появления фичи, лежит на
+      // верхнем уровне записи — она и становится первым пространством: человек
+      // закрыл приложение с разложенными окнами и обязан увидеть их же, а не
+      // пустое «main». Чистка мёртвых вкладок применяется только к текущему:
+      // окна остальных проверяются в момент переключения, потому что вкладки
+      // проектов, ещё не открытых в этом запуске, до тех пор просто неизвестны.
+      const restoredLayout = {
+        splitPanes: restoredSplit.panes,
+        splitFocusedIndex: restoredSplit.focusedIndex,
+        splitSizes: packSplitSizes(restoredSplit.panes, (sessionState as any).splitSizes ?? null),
+        centerStrips: restoredCenterStrips,
+        activeProjectId: restoredActiveId,
+        focusedProjectId: restoredFocusedId,
+      };
+      const restoredSpacesRaw = restoreSpaces(sessionState as any, restoredLayout);
+      // Текущему пространству кладём ВЫЧИЩЕННУЮ раскладку, а не сохранённую как
+      // есть: обе описывают одно и то же, но мёртвые вкладки убраны только в
+      // первой. Без этого первый же уход и возврат воскресил бы чипы, указывающие
+      // в никуда, — на верхнем уровне их уже нет, а в снимке пространства ещё да.
+      const restoredSpaces = {
+        ...restoredSpacesRaw,
+        spaces: restoredSpacesRaw.spaces.map((space: any) => (
+          space.id === restoredSpacesRaw.activeSpaceId
+            ? { ...space, layout: { ...space.layout, ...restoredLayout } }
+            : space
+        )),
+      };
       set({
+        spaces: restoredSpaces.spaces,
+        activeSpaceId: restoredSpaces.activeSpaceId,
         activeProjectId: restoredActiveId,
         focusedProjectId: restoredFocusedId,
         view: savedView === 'workspace' && restoredActiveId ? 'workspace' : 'dashboard',
@@ -3033,6 +3252,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
 
       const splitAfterClose = removePanesByProject(get().splitPanes, get().splitFocusedIndex, projectId);
+      // Чипы закрытого проекта уходят и из окон ОСТАЛЬНЫХ пространств: их
+      // раскладка лежит в снимках, обычные пути её не видят, и вкладки закрытого
+      // проекта дожили бы там до возврата.
+      const spacesAfterClose = (() => {
+        const st = get();
+        const doomed = Array.from(workspace?.tabs.keys() || []);
+        return dropTabsFromOtherSpaces(st.spaces, st.activeSpaceId, doomed, dropTabFromAllPaneStrips);
+      })();
       // Sidebar owner: dropped with its project; otherwise untouched (it may
       // legitimately differ from the center's project).
       const prevFocusedId = get().focusedProjectId;
@@ -3043,6 +3270,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         projectHistory: newHistory,
         globalTabMru: dropProjectFromMru(get().globalTabMru, projectId),
         ...(splitAfterClose ? { splitPanes: splitAfterClose.panes, splitFocusedIndex: splitAfterClose.focusedIndex } : {}),
+        ...(spacesAfterClose ? { spaces: spacesAfterClose.spaces } : {}),
         // If we closed the active project and no projects are left in history -> dashboard
         view: (isClosingActive && !nextActiveId && view === 'workspace') ? 'dashboard' : view
       }));
@@ -3678,6 +3906,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const purge = dropTabFromAllPaneHistories(get().splitPanes, tabId);
       if (purge) set({ splitPanes: purge.panes });
     }
+    // …и из окон ОСТАЛЬНЫХ пространств. Их раскладка лежит в снимках и обычными
+    // путями не правится вовсе: чип, указывающий на закрытую вкладку, дожил бы
+    // до возврата в то пространство и нарисовался бы там окном без разметки.
+    {
+      const st = get();
+      const purge = dropTabsFromOtherSpaces(st.spaces, st.activeSpaceId, [tabId], dropTabFromAllPaneStrips);
+      if (purge) set({ spaces: purge.spaces });
+    }
     // Closing a TAB is not "remove this pane from the workspace": the slot the
     // user built is not part of what they deleted. The pane stays and becomes
     // an empty placeholder; only a two-pane split collapses, because a split of
@@ -4090,6 +4326,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // its pane; hidden tab → replace the focused pane's slot (an empty
       // placeholder pane in focus gets filled the same way). Runs for every
       // caller (sidebar click, switcher, project click).
+      {
+        // ПЕРЕД правилом окон — правило пространств. Вкладка, разложенная в
+        // другом пространстве, уже имеет своё место; открыть её здесь значило бы
+        // завести ей второе, а человек в этот момент просит показать её — то
+        // самое окно, которое обещала карта в списке. Поэтому сначала переходим
+        // туда, и правило окон ниже отрабатывает уже в нужной раскладке, где
+        // вкладка «видна» и просто получает фокус своего окна.
+        const holder = get().workspaceSpaceIndexOfTab(tabId);
+        const holderId = holder >= 0 ? get().spaces[holder]?.id : null;
+        if (holderId && holderId !== get().activeSpaceId) {
+          get().switchWorkspaceSpace(holderId);
+        }
+      }
       {
         const { splitPanes, splitFocusedIndex } = get();
         if (splitPanes.length > 0) {
@@ -5717,7 +5966,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           return true;
         }
         const prev = tab.codexSessionId;
-        const persistentHistoryMutation = ['editRange', 'deleteRange', 'api-edit-range', 'api-delete-range'].includes(reason);
+        const persistentHistoryMutation = ['editRange', 'deleteRange', 'historyContext', 'api-edit-range', 'api-delete-range'].includes(reason);
         if (persistentHistoryMutation) {
           // CAS is the admission gate, not a best-effort background write. Do
           // not mutate renderer memory or launch Resume until main confirms the

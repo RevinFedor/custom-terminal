@@ -14,6 +14,7 @@ const {
   codexEffortCanUsePlanScope,
   codexModelEffortAppliedMessageCount,
   classifyCodexManualEnterFrame,
+  decideCodexOwnedSlashDraft,
   decideCodexModelMigrationAcknowledgement,
   decideCodexModelMigrationAutoEnter,
   decideCodexPickerCleanupFrame,
@@ -41,6 +42,36 @@ const {
   verifyCodexModelMigrationConfig,
   verifyCodexTopLevelConfig,
 } = require('./codex-model-picker');
+
+test('only an exact unchanged app-owned slash draft may be retried or cleared', () => {
+  const exact = {
+    slashInserted: true,
+    enterSubmitted: false,
+    identityCurrent: true,
+    draftProofAvailable: true,
+    hasDraft: true,
+    expectedCommand: '/model',
+    currentDraft: '/model',
+  };
+  assert.deepEqual(decideCodexOwnedSlashDraft(exact), {
+    action: 'use-exact-draft',
+    owned: true,
+    reason: 'exact-owned-slash-draft',
+  });
+  assert.equal(decideCodexOwnedSlashDraft({
+    ...exact,
+    currentDraft: '/model user edit',
+  }).reason, 'draft-changed-after-slash-insert');
+  assert.equal(decideCodexOwnedSlashDraft({
+    ...exact,
+    identityCurrent: false,
+    identityReason: 'terminal-generation-changed',
+  }).reason, 'terminal-generation-changed');
+  assert.equal(decideCodexOwnedSlashDraft({
+    ...exact,
+    enterSubmitted: true,
+  }).reason, 'slash-draft-not-owned');
+});
 
 test('verified composer footer proves exact model, effort, and optional FAST state', () => {
   assert.deepEqual(parseCodexVerifiedComposerFooter([

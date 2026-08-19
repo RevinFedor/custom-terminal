@@ -286,6 +286,7 @@ function createTerminalHistoryPreviewController({
       state.semanticGap = false;
       state.semanticItems = new Map();
       state.semanticItemOrder = [];
+      state.semanticCanonicalReceipts = [];
       state.lastMergeReason = 'semantic-authority-established';
       state.lastUnknownKey = null;
       state.coalescedFrames = 0;
@@ -343,10 +344,94 @@ function createTerminalHistoryPreviewController({
     return true;
   };
 
+  const normalizedSemanticText = (value) => String(value || '').trim();
+
   const semanticText = (state) => state.semanticItemOrder
-    .map((itemId) => state.semanticItems.get(itemId)?.text || '')
+    .map((itemId) => state.semanticItems.get(itemId))
+    .filter((item) => item?.materialized !== true)
+    .map((item) => item?.text || '')
     .filter((text) => text.length > 0)
     .join('\n\n');
+
+  const reconcileSemanticCanonicalReceipts = (state, { allowTextFallback = false } = {}) => {
+    if (state?.sourceMode !== 'semantic'
+      || !(state.semanticItems instanceof Map)
+      || !Array.isArray(state.semanticItemOrder)
+      || !Array.isArray(state.semanticCanonicalReceipts)
+      || state.semanticCanonicalReceipts.length === 0) return 0;
+
+    const pending = [];
+    let matched = 0;
+    for (const receipt of state.semanticCanonicalReceipts) {
+      let item = receipt.itemId ? state.semanticItems.get(receipt.itemId) : null;
+      let match = item ? 'item-id' : null;
+      if (item?.materialized === true) {
+        writeLog('log', 'SEMANTIC_CANONICAL_ACK', state, {
+          match: 'already-materialized',
+          item: short(item.itemId, 18),
+          identity: short(receipt.identity, 20),
+          pending: pending.length,
+        });
+        matched += 1;
+        continue;
+      }
+      if (!item && allowTextFallback && receipt.text) {
+        item = state.semanticItemOrder
+          .map((itemId) => state.semanticItems.get(itemId))
+          .find((candidate) => (
+            candidate?.materialized !== true
+            && candidate?.completed === true
+            && normalizedSemanticText(candidate.text) === receipt.text
+          )) || null;
+        if (item) match = receipt.itemId ? 'exact-text-after-id-miss' : 'exact-text';
+      }
+      if (!item) {
+        pending.push(receipt);
+        continue;
+      }
+      item.materialized = true;
+      item.canonicalIdentity = receipt.identity || null;
+      matched += 1;
+      writeLog('log', 'SEMANTIC_CANONICAL_ACK', state, {
+        match,
+        item: short(item.itemId, 18),
+        identity: short(receipt.identity, 20),
+        pending: Math.max(0, state.semanticCanonicalReceipts.length - matched),
+      });
+    }
+    state.semanticCanonicalReceipts = pending;
+    return matched;
+  };
+
+  const observeSemanticCanonicalReceipt = (state, {
+    itemId = null,
+    identity = null,
+    text = '',
+  } = {}) => {
+    if (state?.sourceMode !== 'semantic') return 0;
+    if (!Array.isArray(state.semanticCanonicalReceipts)) {
+      state.semanticCanonicalReceipts = [];
+    }
+    const receipt = {
+      itemId: typeof itemId === 'string' && itemId ? itemId : null,
+      identity: typeof identity === 'string' && identity ? identity : null,
+      text: normalizedSemanticText(text),
+    };
+    state.semanticCanonicalReceipts.push(receipt);
+    const matched = reconcileSemanticCanonicalReceipts(state, {
+      allowTextFallback: true,
+    });
+    if (matched === 0) {
+      writeLog('log', 'SEMANTIC_CANONICAL_PENDING', state, {
+        item: short(receipt.itemId, 18),
+        identity: short(receipt.identity, 20),
+        canonicalChars: receipt.text.length,
+        canonicalHash: receipt.text ? previewTextHash(receipt.text) : '-',
+        pending: state.semanticCanonicalReceipts.length,
+      });
+    }
+    return matched;
+  };
 
   const setSemanticText = (state, reason) => {
     const fullText = semanticText(state);
@@ -443,11 +528,19 @@ function createTerminalHistoryPreviewController({
     }
     let semanticItem = state.semanticItems.get(itemId);
     if (!semanticItem) {
-      semanticItem = { itemId, text: '', phase: null, completed: false };
+      semanticItem = {
+        itemId,
+        text: '',
+        phase: null,
+        completed: false,
+        materialized: false,
+        canonicalIdentity: null,
+      };
       state.semanticItems.set(itemId, semanticItem);
       state.semanticItemOrder.push(itemId);
     }
     if (item?.phase != null) semanticItem.phase = item.phase;
+    const identityMatches = reconcileSemanticCanonicalReceipts(state);
     if (type === 'item_completed') {
       if (typeof item?.text === 'string') semanticItem.text = item.text;
       semanticItem.completed = true;
@@ -455,7 +548,12 @@ function createTerminalHistoryPreviewController({
       // dropped delta inside it. Other items have their own exact completion.
       state.semanticGap = false;
       authority.gap = false;
-      return setSemanticText(state, 'semantic-assistant-completed');
+      const textMatches = reconcileSemanticCanonicalReceipts(state, {
+        allowTextFallback: true,
+      });
+      return setSemanticText(state, 'semantic-assistant-completed')
+        || identityMatches > 0
+        || textMatches > 0;
     }
     if (type === 'assistant_delta') {
       if (state.semanticGap || authority.gap || typeof event.delta !== 'string') return false;
@@ -550,6 +648,7 @@ function createTerminalHistoryPreviewController({
       semanticGap: false,
       semanticItems: new Map(),
       semanticItemOrder: [],
+      semanticCanonicalReceipts: [],
       text: '',
       previewSeq: 0,
       startedAt,
@@ -1042,6 +1141,7 @@ function createTerminalHistoryPreviewController({
     sourceSequence = null,
     sourceEndOffset = null,
     identity = null,
+    semanticItemId = null,
     canonicalText = '',
   } = {}) => {
     const state = turns.get(tabId);
@@ -1081,6 +1181,11 @@ function createTerminalHistoryPreviewController({
     const previousChars = state.text.length;
     const previousHash = state.text ? previewTextHash(state.text) : '-';
     const materializedText = String(canonicalText || '').trim();
+    const semanticAcks = observeSemanticCanonicalReceipt(state, {
+      itemId: semanticItemId,
+      identity,
+      text: materializedText,
+    });
     cancelPendingEmission(state);
     if (state.text) emitAction(state, 'clear', 'canonical-materialized');
     writeLog('log', 'CANONICAL', state, {
@@ -1091,6 +1196,8 @@ function createTerminalHistoryPreviewController({
       clearedHash: previousHash,
       canonicalChars: materializedText.length,
       canonicalHash: materializedText ? previewTextHash(materializedText) : '-',
+      semanticItem: short(semanticItemId, 18),
+      semanticAcks,
       disposition: state.phase === 'settled' ? 'finish' : 'rebase',
     });
     if (state.phase === 'settled') {

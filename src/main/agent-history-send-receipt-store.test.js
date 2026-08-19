@@ -127,6 +127,41 @@ test('desktop History exact receipt survives SQLite reopen and never authorizes 
   assert.equal(uuidCalls, 1);
 });
 
+test('history-only provider proof stays confirmed without pretending a model turn was submitted', (t) => {
+  let db;
+  try {
+    db = new Database(':memory:');
+  } catch (error) {
+    if (error?.code === 'ERR_DLOPEN_FAILED' && /NODE_MODULE_VERSION/.test(error?.message || '')) {
+      t.skip('better-sqlite3 uses the Electron ABI; run with ELECTRON_RUN_AS_NODE=1');
+      return;
+    }
+    throw error;
+  }
+  t.after(() => db.close());
+  const store = createAgentSendReceiptStore(db, { randomUUID: () => 'history-only-attempt' });
+  const identity = historyIdentity({ sessionId: null });
+  const attempt = store.beginAttempt(identity);
+  store.markAttemptState(identity.operationKey, attempt.attemptId, STORE_STATES.ENTER_ARMED);
+  const promoted = store.promoteFromAudit({
+    success: true,
+    historyOnly: true,
+    modelTurnStarted: false,
+    operationKey: identity.operationKey,
+    attemptId: attempt.attemptId,
+    provider: 'claude',
+    sessionId: 'materialized-session',
+    promptHash: identity.promptHash,
+    expectedHash: identity.promptHash,
+    entryUuid: 'history-only-entry',
+    auditTimestamp: '2026-08-18T00:00:00.000Z',
+  });
+  assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
+  assert.equal(promoted.record.receipt.submitted, false);
+  assert.equal(promoted.record.receipt.historyOnly, true);
+  assert.equal(promoted.record.receipt.modelTurnStarted, false);
+});
+
 test('same displayed transport cannot let a different raw request or handoff adopt the receipt', (t) => {
   let db;
   try {

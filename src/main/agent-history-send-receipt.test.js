@@ -39,6 +39,15 @@ test('owned desktop prompt surfaces receive automatic durable identity, but queu
     source: 'prompt-queue',
     rawPrompt: ' /compact',
   }), false);
+  assert.equal(isDesktopHistorySendReceiptEligible({
+    ...base,
+    rawPrompt: '/status\nexplain this output',
+  }), true, 'a multiline prompt is a conversation turn, not a local command');
+  assert.equal(isDesktopHistorySendReceiptEligible({
+    ...base,
+    rawPrompt: '/status',
+    presentationSnapshot: { imagePaths: [{ id: 1, path: '/tmp/a.png' }] },
+  }), true, 'structured attachments keep the ordinary durable send contract');
   assert.equal(isDesktopHistorySendReceiptEligible({ ...base, submit: false }), false);
   assert.equal(isDesktopHistorySendReceiptEligible({ ...base, sendOperationKey: 'owned' }), false);
   assert.equal(isDesktopHistorySendReceiptEligible({ ...base, sendAttemptId: 'attempt' }), false);

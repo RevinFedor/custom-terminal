@@ -8,6 +8,7 @@ import {
   type ComposerDensity,
 } from '@noted/claude-blocks';
 import { useUIStore } from '../../../store/useUIStore';
+import PastedContentPreview from './PastedContentPreview';
 
 const TerminalHistoryStreamIcon: React.FC<{ active: boolean }> = ({ active }) => (
   <svg
@@ -193,7 +194,20 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
       : null
   );
   const isImagePreview = expandedChip?.kind === 'image';
-  const preview = hasExpandedPreview && expandedChip ? (
+  const isPastedContentPreview = expandedChip?.kind === 'paste'
+    && typeof expandedChip.text === 'string';
+  const preview = hasExpandedPreview && expandedChip && isPastedContentPreview ? (
+    <PastedContentPreview
+      text={expandedChip.text as string}
+      maxHeight="min(320px, 48vh)"
+      style={{
+        marginBottom: 6,
+        boxShadow: '0 14px 34px rgba(0,0,0,0.48)',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        fontSize: secondaryFontSize,
+      }}
+    />
+  ) : hasExpandedPreview && expandedChip ? (
     <div
       data-ai-composer-chip-preview={expandedChip.id}
       data-ai-composer-preview-kind={expandedChip.kind}

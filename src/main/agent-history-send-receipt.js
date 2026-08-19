@@ -49,12 +49,22 @@ function optionalString(value) {
  * перестала.
  */
 function isLocalSlashCommandPrompt(rawPrompt) {
-  return typeof rawPrompt === 'string' && rawPrompt.trimStart().startsWith('/');
+  if (typeof rawPrompt !== 'string') return false;
+  const normalized = rawPrompt.trim();
+  return !!normalized
+    && !normalized.includes('\n')
+    && !normalized.includes('\r')
+    && /^\/[^\s/]+(?:[ \t].*)?$/.test(normalized);
 }
 
 function isDesktopHistorySendReceiptEligible(input = {}) {
   const source = String(input.source || '');
   const rawPrompt = typeof input.rawPrompt === 'string' ? input.rawPrompt : null;
+  const presentation = input.presentationSnapshot && typeof input.presentationSnapshot === 'object'
+    ? input.presentationSnapshot
+    : {};
+  const hasStructuredPayload = (Array.isArray(presentation.imagePaths) && presentation.imagePaths.length > 0)
+    || (Array.isArray(presentation.promptChips) && presentation.promptChips.length > 0);
   return input.submit === true
     && !!optionalString(input.tabId)
     && !!optionalString(input.handoffId)
@@ -69,7 +79,7 @@ function isDesktopHistorySendReceiptEligible(input = {}) {
     // that the composer sends them, the same rule has to cover it: otherwise a
     // manual `/compact` mints a receipt that waits forever for an audit record
     // the command never produces, and the message stays UNCONFIRMED.
-    && !isLocalSlashCommandPrompt(rawPrompt)
+    && !(isLocalSlashCommandPrompt(rawPrompt) && !hasStructuredPayload)
     && !optionalString(input.sendOperationKey)
     && !optionalString(input.sendAttemptId);
 }

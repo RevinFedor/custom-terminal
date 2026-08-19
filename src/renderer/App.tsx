@@ -66,7 +66,12 @@ import {
   type CodexRuntimeSessionSnapshot,
 } from './utils/codexWriterIdentity';
 import { getCodexRuntimeReadSessionId } from './utils/codexPtyPresence.mjs';
-import { getHistoryAgentRuntime, type AgentHistoryTool } from './utils/historyAgentRuntimes';
+import {
+  getHistoryAgentRuntime,
+  startFreshCodexSession,
+  type AgentHistoryTool,
+} from './utils/historyAgentRuntimes';
+import { copySessionFiltersFromState } from './utils/copySessionFilters';
 import {
   isCompleteCodexSettingsRequest,
   planCodexHistorySettings,
@@ -363,22 +368,7 @@ function cleanDefaultSetting(value: unknown): string | undefined {
 }
 
 function getTimelineCopyFlagsFromStore() {
-  const s = useUIStore.getState();
-  return {
-    includeEditing: s.copyIncludeEditing,
-    includeReading: s.copyIncludeReading,
-    includeUser: s.copyIncludeUser,
-    includeClaude: s.copyIncludeClaude,
-    includeText: s.copyIncludeText,
-    includeThinking: s.copyIncludeThinking,
-    includeBash: s.copyIncludeBash,
-    includeTools: s.copyIncludeTools,
-    includeWebSearch: s.copyIncludeWebSearch,
-    includeToolSearch: s.copyIncludeToolSearch,
-    includeOtherTools: s.copyIncludeOtherTools,
-    includeSubagentResult: s.copyIncludeSubagentResult,
-    includeSubagentHistory: s.copyIncludeSubagentHistory,
-  };
+  return copySessionFiltersFromState(useUIStore.getState());
 }
 
 async function buildMobileAiRewindText(args: {
@@ -517,7 +507,6 @@ interface ProjectTabItemProps {
   onDoubleClick: () => void;
   onTabDrop?: (tabId: string, sourceProjectId: string, selectedTabIds?: string[]) => void; // For dropping terminal tabs
   isAreaActive?: boolean;
-  isProjectLoading?: boolean; // API request in progress (Update API, Research, etc.)
   isPinnedSystem?: boolean;
 }
 
@@ -547,7 +536,6 @@ const ProjectTabItem = memo(({
   isProjectBusy = false,
   isProjectInheritedBusy = false,
   isProjectAwaiting = false,
-  isProjectLoading = false,
   isPinnedSystem = false
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
@@ -868,7 +856,7 @@ const ProjectTabItem = memo(({
               : <span className="max-w-[120px] truncate">{projectName}</span>}
           </>
         )}
-        {(activeProcessCount > 0 || isProjectBusy || isProjectLoading) && !isEditing && (
+        {(activeProcessCount > 0 || isProjectBusy) && !isEditing && (
           <span
             className="relative flex items-center justify-center text-[10px] font-medium rounded-full"
             style={{
@@ -882,7 +870,7 @@ const ProjectTabItem = memo(({
               boxSizing: 'border-box',
             }}
           >
-            {(isProjectBusy || isProjectLoading) && (
+            {isProjectBusy && (
               <span
                 className="absolute inset-0 rounded-full"
                 style={{
@@ -1324,7 +1312,6 @@ function App() {
   // tabId -> awaiting (Claude blocked on AskUserQuestion, waiting for human answer).
   // Feeds the project-tab purple glow. Bracketed by claude:awaiting-input (main.js).
   const [awaitingTabs, setAwaitingTabs] = useState<Map<string, boolean>>(new Map());
-  const [apiLoadingProjects, setApiLoadingProjects] = useState<Set<string>>(new Set()); // projectIds with active API requests
 
   const getProjectStopTargetIds = useCallback((projectId: string) => {
     const workspace = useWorkspaceStore.getState().openProjects.get(projectId) || openProjects.get(projectId);
@@ -1379,21 +1366,6 @@ function App() {
       ' durMs=' + (performance.now() - startedAt).toFixed(1)
     );
   }, [getProjectStopTargetIds]);
-
-  // Listen for project API loading events from ActionsPanel
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const { projectId, loading } = (e as CustomEvent).detail;
-      setApiLoadingProjects(prev => {
-        const next = new Set(prev);
-        if (loading) next.add(projectId);
-        else next.delete(projectId);
-        return next;
-      });
-    };
-    window.addEventListener('project:api-loading', handler);
-    return () => window.removeEventListener('project:api-loading', handler);
-  }, []);
 
   // Drag area resize
   const isResizingDragArea = useRef(false);
@@ -1555,28 +1527,6 @@ function App() {
     })();
     return () => { cancelled = true; };
   }, []); // Empty deps = only on mount
-
-  // Sync apiSettings + docPrompt to main process (for MCP update_docs tool)
-  useEffect(() => {
-    const syncToMain = () => {
-      const { apiSettings, docPrompt } = useUIStore.getState();
-      ipcRenderer.invoke('docs:sync-settings', { apiSettings, docPrompt });
-    };
-
-    // Sync on mount
-    syncToMain();
-
-    // Sync on changes
-    let prev = JSON.stringify({ a: useUIStore.getState().apiSettings, d: useUIStore.getState().docPrompt });
-    const unsub = useUIStore.subscribe((state) => {
-      const curr = JSON.stringify({ a: state.apiSettings, d: state.docPrompt });
-      if (curr !== prev) {
-        prev = curr;
-        ipcRenderer.invoke('docs:sync-settings', { apiSettings: state.apiSettings, docPrompt: state.docPrompt });
-      }
-    });
-    return unsub;
-  }, []);
 
   // Listen for draft project events from ProjectHome
   useEffect(() => {
@@ -3847,12 +3797,11 @@ function App() {
             state.setTabCommandType(tabId, agent);
             state.markAiLaunchAutoTitle(tabId, agent);
             if (agent === 'codex') {
-              const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+              const runResult = await startFreshCodexSession({
                 tabId,
-                command: 'codex',
                 cwd: tab?.cwd || cwd,
                 developerInstructions: typeof codexDeveloperInstructions === 'string' ? codexDeveloperInstructions.trim() : undefined,
-              })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+              }).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
               if (runResult?.success === false || runResult?.accepted === false) {
                 await state.closeTab(projectId, tabId, { skipProcessCheck: true, forceCleanup: true, archive: false } as any).catch(() => false);
                 return reply(false, null, runResult.error || 'Codex start failed');
@@ -4050,11 +3999,10 @@ function App() {
             state.markAiLaunchAutoTitle(tabId, toolType);
             let launchAccepted: any = null;
             if (toolType === 'codex') {
-              const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+              const runResult = await startFreshCodexSession({
                 tabId,
-                command: 'codex',
                 cwd: tab.cwd,
-              })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+              }).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
               if (runResult?.success === false || runResult?.accepted === false) {
                 return reply(false, null, runResult.error || 'Codex start failed');
               }
@@ -5540,16 +5488,14 @@ function App() {
       if (isTabInterrupted(tab)) interruptedCount++;
     });
 
-    const isProjectLoading = apiLoadingProjects.has(projectId);
     const hasInheritedBusyTab = inheritedBusyProjectIds.has(projectId);
     return {
       activeCount,
       hasAwaitingTab,
       completionNotificationCount,
       interruptedCount,
-      isProjectLoading,
-      hasProjectInheritedShimmer: hasInheritedBusyTab && !hasBusyTab && !hasPasteBusyTab && !isProjectLoading,
-      hasProjectShimmer: hasBusyTab || hasPasteBusyTab || hasInheritedBusyTab || isProjectLoading,
+      hasProjectInheritedShimmer: hasInheritedBusyTab && !hasBusyTab && !hasPasteBusyTab,
+      hasProjectShimmer: hasBusyTab || hasPasteBusyTab || hasInheritedBusyTab,
     };
   };
   const inboxIndicators = getProjectTabIndicators(INBOX_PROJECT_ID, inboxWorkspace);
@@ -5771,7 +5717,6 @@ function App() {
             isProjectBusy={inboxIndicators.hasProjectShimmer}
             isProjectInheritedBusy={inboxIndicators.hasProjectInheritedShimmer}
             isProjectAwaiting={inboxIndicators.hasAwaitingTab}
-            isProjectLoading={inboxIndicators.isProjectLoading}
             isEditing={false}
             editValue=""
             onEditChange={() => {}}
@@ -5835,7 +5780,6 @@ function App() {
                 onEditSubmit={handleSubmitProjectRename}
                 onEditCancel={handleCancelProjectRename}
                 isAreaActive={activeArea === 'projects'}
-                isProjectLoading={indicators.isProjectLoading}
                 onClick={() => {
                   openProject(projectId, project.path);
                 }}

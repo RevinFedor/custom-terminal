@@ -562,6 +562,57 @@ const createHistoryImageMarkerRegex = () => new RegExp(
   'gi',
 );
 
+const createHistoryProviderImageBlockRegex = () => new RegExp(
+  String.raw`<image\s+name\s*=\s*["']?\[Image(?:\s+#?(\d+))?\]["']?\s+path\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))\s*>\s*(?:<<ImageDisplayed>>|\[Image(?:\s+#?(\d+))?\])\s*</image\s*>`,
+  'gi',
+);
+
+/**
+ * Codex can persist one attachment twice in its user carrier: first as its
+ * provider-only `<image name=… path=…>…</image>` envelope, then as the native
+ * `[Image #N]` marker at the original prompt position. Main normally removes
+ * that transport envelope. This renderer guard covers already-cached/live
+ * rows from an older main process, but only when the exact saved image ref
+ * proves both the slot and path. Literal markup remains literal text.
+ */
+function normalizeHistoryProviderImageMarkup(text, imagePaths = []) {
+  const source = String(text || '');
+  const refs = Array.isArray(imagePaths) ? imagePaths : [];
+  if (refs.length === 0 || !source.toLowerCase().includes('<image')) return source;
+
+  const refsById = new Map(refs.flatMap((ref) => {
+    const id = Number(ref?.id);
+    const filePath = typeof ref?.path === 'string' ? ref.path.trim() : '';
+    return Number.isInteger(id) && id > 0 && filePath ? [[id, filePath]] : [];
+  }));
+  const providerRe = createHistoryProviderImageBlockRegex();
+  const withoutProviderBlocks = source.replace(providerRe, ' ');
+  const remainingSlots = new Map();
+  for (const match of withoutProviderBlocks.matchAll(/\[Image\s+#?(\d+)\]/gi)) {
+    remainingSlots.set(match[1], (remainingSlots.get(match[1]) || 0) + 1);
+  }
+
+  const normalized = source.replace(
+    createHistoryProviderImageBlockRegex(),
+    (whole, nameSlotRaw, doublePath, singlePath, barePath, bodySlotRaw) => {
+      if (nameSlotRaw && bodySlotRaw && nameSlotRaw !== bodySlotRaw) return whole;
+      const slot = Number(nameSlotRaw || bodySlotRaw || 0);
+      const filePath = String(doublePath || singlePath || barePath || '').trim();
+      if (!Number.isInteger(slot) || slot < 1 || refsById.get(slot) !== filePath) return whole;
+      const slotKey = String(slot);
+      if (Number(remainingSlots.get(slotKey) || 0) > 0) {
+        remainingSlots.set(slotKey, remainingSlots.get(slotKey) - 1);
+        return ' ';
+      }
+      return ` [Image #${slot}] `;
+    },
+  );
+  return normalized.replace(
+    /(\[Image\s+#?(\d+)\])\s*\[Image\s+#?\2\]/gi,
+    '$1',
+  );
+}
+
 function splitHistoryImageParts(text, imagePaths = []) {
   const value = String(text || '');
   const refs = Array.isArray(imagePaths) ? imagePaths : [];
@@ -639,7 +690,10 @@ export function buildHistoryComposerPresentationParts({
         });
         continue;
       }
-      parts.push(...splitHistoryImageParts(part.text, imagePaths));
+      parts.push(...splitHistoryImageParts(
+        normalizeHistoryProviderImageMarkup(part.text, imagePaths),
+        imagePaths,
+      ));
     }
     return { matchedPromptChips: true, parts };
   }
@@ -659,7 +713,10 @@ export function buildHistoryComposerPresentationParts({
       continue;
     }
     // `prompt-wrapper` в этой ветке невозможен: мы в ней только когда метки нет.
-    parts.push(...splitHistoryImageParts(part.text, imagePaths));
+    parts.push(...splitHistoryImageParts(
+      normalizeHistoryProviderImageMarkup(part.text, imagePaths),
+      imagePaths,
+    ));
   }
   return {
     matchedPromptChips: promptPresentation.matched,

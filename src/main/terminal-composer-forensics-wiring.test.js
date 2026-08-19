@@ -79,6 +79,17 @@ test('a screen-versus-exact-input contradiction persists one latest JSON artifac
   assert.match(artifact, /\[AgentDraftProof:FORENSIC_ARTIFACT\]/);
 });
 
+test('a startup command lost before Enter persists the same raw PTY forensic ledger', () => {
+  const enterGuard = main.indexOf("startupEnterBoundary.reason === 'claude-startup-command-not-proven-at-enter'");
+  const artifact = main.indexOf('captureAgentDraftForensicArtifact(', enterGuard);
+  const refusal = main.indexOf('startupPromptProof: startupEnterBoundary.proof || null', enterGuard);
+  assert.ok(enterGuard > 0 && artifact > enterGuard && refusal > artifact);
+  const branch = main.slice(enterGuard, refusal + 80);
+  assert.match(branch, /mode:\s*'startup-setting-before-enter'/);
+  assert.match(branch, /pasteWritten,/);
+  assert.match(branch, /enterWritten:\s*false/);
+});
+
 test('an unresolved Claude post-Enter proof persists one scoped attempt artifact', () => {
   assert.match(main, /snapshotTerminalComposerForensicWindow/);
   assert.match(main, /persistTerminalSendForensicArtifact/);

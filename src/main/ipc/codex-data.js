@@ -15,7 +15,7 @@ const {
 } = require('../codex-subagent-cards');
 const {
   findCodexAgentFile,
-  isAgentFinishedByOwnTranscript,
+  readAgentCompletionProof,
 } = require('../subagent-transcript');
 const {
   getCodexProcessActionGeneration,
@@ -26,9 +26,14 @@ const { resolveCodexSourceSettingsProof } = require('../codex-source-settings');
 const {
   codexUserCarrierTextsMatch,
   codexUserMessageAuditText,
+  codexUserMessagePresentationText,
   isCodexEnvironmentContextUserText,
+  isCodexProjectInstructionsUserText,
 } = require('../codex-prompt-audit');
 const { classifyHistoryAction } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
+const {
+  formatCopyAction,
+} = require('../copy-action-format');
 const {
   deriveCodexForkSnapshot,
   mapTimelineEntryUuidsAcrossFork,
@@ -37,6 +42,9 @@ const {
   CodexAccountProfileManager,
   DEFAULT_PROFILE_ID,
 } = require('../codex-account-profiles');
+const {
+  buildCodexHistoryContextItem,
+} = require('../agent-history-context-injection');
 const { execFile } = require('child_process');
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -101,6 +109,7 @@ const _codexJsonlCache = new Map();
 let _codexJsonlCacheRawBytes = 0;
 const _codexSessionSelectSkipLogged = new Set();
 const _codexJsonlInflight = new Map();
+const _codexHistoryContextInflight = new Map();
 
 function deleteCodexJsonlCacheEntry(filePath) {
   const cached = _codexJsonlCache.get(filePath);
@@ -1556,27 +1565,30 @@ function isCompactPayload(payload) {
 // turn one compaction into two markers. Pair by semantic order instead: keep a
 // pending top-level event through token/context bookkeeping and consume the
 // next compact-like event before the next real user turn.
-function codexCompactCompanionLines(records) {
-  const companions = new Set();
-  let pendingTopLevelCount = 0;
+function codexCompactCompanionPairs(records) {
+  const pairs = new Map();
+  const pendingTopLevelLines = [];
   for (const record of Array.isArray(records) ? records : []) {
     const payload = record?.payload || {};
     if (record?.type === 'compacted') {
-      pendingTopLevelCount += 1;
+      if (Number.isFinite(Number(record.__line))) pendingTopLevelLines.push(Number(record.__line));
       continue;
     }
     if (record?.type === 'event_msg' && isCompactPayload(payload)) {
-      if (pendingTopLevelCount > 0) {
-        companions.add(record.__line);
-        pendingTopLevelCount -= 1;
+      if (pendingTopLevelLines.length > 0 && Number.isFinite(Number(record.__line))) {
+        pairs.set(pendingTopLevelLines.shift(), Number(record.__line));
       }
       continue;
     }
     if (record?.type === 'event_msg' && payload.type === 'user_message') {
-      pendingTopLevelCount = 0;
+      pendingTopLevelLines.length = 0;
     }
   }
-  return companions;
+  return pairs;
+}
+
+function codexCompactCompanionLines(records) {
+  return new Set(codexCompactCompanionPairs(records).values());
 }
 
 async function walkJsonlFiles(rootDir, maxFiles = 4000) {
@@ -2945,6 +2957,39 @@ function createCodexTimelineProjector(sessionId) {
   let currentTurnCanonicalUserText = null;
   let currentTurnCanonicalUserEntry = null;
 
+  const attachSubagentLaunch = (entry, payload, record) => {
+    if (!entry) return;
+    const callId = String(payload.call_id || payload.id || stableUuid(sessionId, record.__line, 'codex-agent'));
+    const call = {
+      callId,
+      toolName: payload.name || payload.tool_name || payload.type,
+      namespace: payload.namespace || '',
+      args: parseToolArguments(payload),
+    };
+    const nestedSource = call.toolName === 'exec' && typeof call.args?.input === 'string'
+      ? call.args.input
+      : '';
+    if (!isCodexSubagentSpawnCall(call) && !/\bspawn_agent\s*\(/.test(nestedSource)) return;
+    // Reuse the exact History decoder: current Codex often wraps
+    // `collaboration.spawn_agent` inside one custom `exec` call, so checking
+    // only the outer tool name would miss the launch marker on Timeline.
+    const decoded = codexHistoryActionsForCall(call, '', false);
+    const card = (decoded.actions || []).find((action) => action?.tool === 'Task');
+    if (!card) return;
+    const label = String(
+      card?.description
+      || call.args?.task_name
+      || call.args?.label
+      || call.args?.agent_type
+      || 'Agent',
+    ).replace(/\s+·\s+running\s*$/i, '');
+    const key = 'task:' + (card.toolUseId || callId);
+    if (!Array.isArray(entry.subAgents)) entry.subAgents = [];
+    if (!entry.subAgents.some((agent) => agent?.key === key)) {
+      entry.subAgents.push({ key, label });
+    }
+  };
+
   const feed = (record) => {
     const payload = record.payload || {};
 
@@ -3008,13 +3053,14 @@ function createCodexTimelineProjector(sessionId) {
         currentTurnCanonicalUserEntry = null;
       }
       if (payload.type === 'user_message') {
-        const text = codexUserMessageAuditText(record) || '';
+        const text = codexUserMessagePresentationText(record);
         // Service record, not a user turn: a fire-and-forget subagent
         // announces completion via <subagent_notification> inside a user
         // message. Full history feeds it to the card tracker; Timeline must
         // not mint a phantom dot for it.
         if (isCodexSubagentNotification(payload)) return;
-        if (isCodexEnvironmentContextUserText(text)) return;
+        if (isCodexEnvironmentContextUserText(text)
+          || isCodexProjectInstructionsUserText(text)) return;
         // Companion pairing window closes at the next REAL user turn (same
         // counter semantics as the old whole-file pre-pass). Injected
         // environment context above is service input, not that boundary.
@@ -3136,10 +3182,11 @@ function createCodexTimelineProjector(sessionId) {
 
     if (record.type === 'response_item') {
       if (payload.type === 'message' && payload.role === 'user') {
-        const text = codexUserMessageAuditText(record) || '';
+        const text = codexUserMessagePresentationText(record);
         if (!text
           || text.includes('<subagent_notification>')
-          || isCodexEnvironmentContextUserText(text)) return;
+          || isCodexEnvironmentContextUserText(text)
+          || isCodexProjectInstructionsUserText(text)) return;
         if (currentTurnCanonicalUserText
           && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, text)) {
           addStableSourceIdentityAlias(
@@ -3171,6 +3218,7 @@ function createCodexTimelineProjector(sessionId) {
       }
       if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
         collectCodexDocsAttributes(currentUser, payload);
+        attachSubagentLaunch(currentUser, payload, record);
       }
       if (payload.type === 'reasoning' && currentUser) {
         currentUser.responseHasThinking = true;
@@ -3180,7 +3228,12 @@ function createCodexTimelineProjector(sessionId) {
     }
   };
 
-  const finalize = () => entries.map((entry) => ({ ...entry }));
+  const finalize = () => entries.map((entry) => ({
+    ...entry,
+    ...(Array.isArray(entry.subAgents)
+      ? { subAgents: entry.subAgents.map((agent) => ({ ...agent })) }
+      : {}),
+  }));
 
   const getSessionMeta = () => {
     const meta = metaRecord?.payload || {};
@@ -3237,6 +3290,7 @@ function buildCodexTimeline(records, sessionId) {
 function createCodexHistoryProjector(sessionId) {
   const entries = [];
   const pendingResponseUsers = [];
+  const pendingProjectInstructions = [];
   const pendingCalls = new Map();
   const pendingExecCells = new Map();
   const subagents = createCodexSubagentTracker();
@@ -3263,6 +3317,45 @@ function createCodexHistoryProjector(sessionId) {
   let consumedRecords = 0;
   let currentTurnCanonicalUserText = null;
   let currentTurnCanonicalUserEntry = null;
+
+  const queueProjectInstructions = (record, text) => {
+    const existingIndex = pendingProjectInstructions.findIndex((candidate) => (
+      codexUserCarrierTextsMatch(candidate.text, text)
+    ));
+    if (existingIndex >= 0) {
+      // Prefer event_msg when a protocol generation emits both carriers. The
+      // row is still held until the following real user turn supplies its
+      // structural coordinate.
+      if (record?.type === 'event_msg') {
+        const pending = pendingProjectInstructions[existingIndex];
+        pending.record = record;
+        pending.entry.uuid = stableUuid(sessionId, record.__line, 'codex-user');
+        promoteStableSourceIdentity(
+          pending.entry,
+          stableSourceIdentity(sessionId, record, 'codex-user'),
+        );
+        pending.entry.timestamp = recordTimestamp(record);
+      }
+      return;
+    }
+    const entry = {
+      uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+      sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+      role: 'user',
+      timestamp: recordTimestamp(record),
+      content: text,
+      sessionId,
+      turnIndex: currentTurnIndex + 1,
+      serviceCarrier: 'project-instructions',
+    };
+    entries.push(entry);
+    pendingProjectInstructions.push({ record, text, entry });
+  };
+
+  const flushProjectInstructions = (turnIndex) => {
+    for (const pending of pendingProjectInstructions) pending.entry.turnIndex = turnIndex;
+    pendingProjectInstructions.length = 0;
+  };
 
   const feed = (record) => {
     consumedRecords += 1;
@@ -3303,6 +3396,7 @@ function createCodexHistoryProjector(sessionId) {
     }
 
     if (record.type === 'compacted') {
+      pendingProjectInstructions.length = 0;
       pendingCompactCompanions += 1;
       const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
       entries.push({
@@ -3337,7 +3431,7 @@ function createCodexHistoryProjector(sessionId) {
       if (payload.type === 'patch_apply_end') {
         attachCodexPatchApplyEvent(pendingCalls, payload, sessionCwd);
       } else if (payload.type === 'user_message') {
-        const userText = codexUserMessageAuditText(record) || '';
+        const userText = codexUserMessagePresentationText(record);
         // Third subagent completion path: a fire-and-forget child announces
         // its outcome via <subagent_notification> INSIDE a user message —
         // no wait_agent output, no agent_message FINAL_ANSWER ever arrives
@@ -3345,10 +3439,14 @@ function createCodexHistoryProjector(sessionId) {
         // and keep the service record out of the transcript, like Claude's
         // <task-notification> filter.
         if (userText.includes('<subagent_notification>')) {
-          subagents.onSubagentNotification(userText);
+          subagents.onSubagentNotification(userText, recordTimestamp(record));
           return;
         }
         if (isCodexEnvironmentContextUserText(userText)) return;
+        if (isCodexProjectInstructionsUserText(userText)) {
+          queueProjectInstructions(record, userText);
+          return;
+        }
         // The companion pairing window closes at the next REAL user turn.
         // Codex service carriers above do not create transcript boundaries.
         pendingCompactCompanions = 0;
@@ -3367,6 +3465,7 @@ function createCodexHistoryProjector(sessionId) {
           currentTurnCanonicalUserEntry = pending.entry;
         } else {
           currentTurnIndex += 1;
+          flushProjectInstructions(currentTurnIndex);
           const entry = {
             uuid: stableUuid(sessionId, record.__line, 'codex-user'),
             sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
@@ -3381,6 +3480,7 @@ function createCodexHistoryProjector(sessionId) {
         }
         currentTurnCanonicalUserText = userText;
       } else if (payload.type === 'thread_rolled_back') {
+        pendingProjectInstructions.length = 0;
         const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
         logCodexRollback('full-history', sessionId, record, rollback);
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
@@ -3393,11 +3493,12 @@ function createCodexHistoryProjector(sessionId) {
         latestTokenCountInfo = payload.info || {};
       } else if (payload.type === 'task_complete') {
         pendingResponseUsers.length = 0;
+        pendingProjectInstructions.length = 0;
       } else if (payload.type === 'sub_agent_activity') {
         // v2 collaboration: the only parent-side link spawn call → child
         // rollout (agent_thread_id) + live status kinds started/interacted/
         // interrupted. Mutates the already-pushed Task card in place.
-        subagents.onSubAgentActivity(payload);
+        subagents.onSubAgentActivity(payload, recordTimestamp(record));
       } else if (isCompactPayload(payload)) {
         if (pendingCompactCompanions > 0) {
           pendingCompactCompanions -= 1;
@@ -3424,7 +3525,7 @@ function createCodexHistoryProjector(sessionId) {
     if (record.type !== 'response_item') return;
 
     if (payload.type === 'message' && payload.role === 'user') {
-      const userText = codexUserMessageAuditText(record) || '';
+      const userText = codexUserMessagePresentationText(record);
       // Codex currently persists fire-and-forget subagent completion in two
       // legitimate carrier shapes. Older rollouts used event_msg
       // user_message; newer/mixed protocol runs can write only a
@@ -3434,10 +3535,14 @@ function createCodexHistoryProjector(sessionId) {
       // paired event_msg; the block below upgrades it in place if that event
       // eventually arrives.
       if (userText.includes('<subagent_notification>')) {
-        subagents.onSubagentNotification(userText);
+        subagents.onSubagentNotification(userText, recordTimestamp(record));
         return;
       }
       if (!userText || isCodexEnvironmentContextUserText(userText)) return;
+      if (isCodexProjectInstructionsUserText(userText)) {
+        queueProjectInstructions(record, userText);
+        return;
+      }
       if (currentTurnCanonicalUserText
         && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, userText)) {
         addStableSourceIdentityAlias(
@@ -3448,6 +3553,7 @@ function createCodexHistoryProjector(sessionId) {
       }
       pendingCompactCompanions = 0;
       currentTurnIndex += 1;
+      flushProjectInstructions(currentTurnIndex);
       const entry = {
         uuid: stableUuid(sessionId, record.__line, 'codex-user'),
         sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
@@ -3486,7 +3592,7 @@ function createCodexHistoryProjector(sessionId) {
       // becomes the Task card's result; interim MESSAGE payloads are encrypted
       // and only prove liveness. Never rendered as a normal assistant row —
       // author is the subagent, not this session's assistant.
-      subagents.onAgentMessage(payload, extractTextContent);
+      subagents.onAgentMessage(payload, extractTextContent, recordTimestamp(record));
       return;
     }
 
@@ -3547,7 +3653,7 @@ function createCodexHistoryProjector(sessionId) {
       // rendering as generic "Spawn Agent"/"Wait Agent" JSON cards.
       if (isCodexSubagentSpawnCall(call)) {
         const card = call.subagentCard || registerSubagentSpawn(call);
-        subagents.attachSpawnOutput(call.callId, payload.output);
+        subagents.attachSpawnOutput(call.callId, payload.output, recordTimestamp(record));
         pushAssistantEntry(
           entries,
           sessionId,
@@ -3564,7 +3670,11 @@ function createCodexHistoryProjector(sessionId) {
         return;
       }
       if (isCodexSubagentControlCall(call)) {
-        const absorbed = subagents.absorbControlOutput(call, payload.output);
+        const absorbed = subagents.absorbControlOutput(
+          call,
+          payload.output,
+          recordTimestamp(record),
+        );
         if (absorbed) {
           pushAssistantEntry(entries, sessionId, record, currentTurnIndex, '', pendingThinking, null);
           pendingThinking = '';
@@ -3667,7 +3777,9 @@ function createCodexHistoryProjector(sessionId) {
       tailThinking = '';
     }
 
-    // Last resort for cards the parent never closed. `wait_agent` is routinely
+    // Last resort for cards the parent never closed, and exact timing source
+    // for cards a later list_agents query could only classify as completed.
+    // `wait_agent` is routinely
     // called with no target, and its "Wait completed" output names nobody — so
     // an agent that really finished can leave zero terminal trace in this
     // rollout and keep animating the tab forever (live production tab: 12 of
@@ -3675,23 +3787,33 @@ function createCodexHistoryProjector(sessionId) {
     // agent is checked against its OWN transcript, which is authoritative
     // about itself. Card mutation here is monotone — an explicit resume
     // record arriving later through `feed` reopens it, same as a fresh pass.
-    const stillRunning = subagents.runningCards();
-    if (stillRunning.length > 0) {
+    const trackedCards = subagents.allCards().filter((card) => (
+      card.subagentStatus === 'running'
+      || (card.subagentStatus === 'completed' && !Number(card.completedAt))
+    ));
+    if (trackedCards.length > 0) {
       let resolved = 0;
-      for (const card of stillRunning) {
+      for (const card of trackedCards) {
         const threadId = card.agentSessionId;
         if (!threadId) continue;
         const filePath = findCodexAgentFile({ agentSessionId: threadId });
         if (!filePath) continue;
-        if (!isAgentFinishedByOwnTranscript({ toolType: 'codex', filePath })) continue;
+        const completion = readAgentCompletionProof({ toolType: 'codex', filePath });
+        if (!completion.finished) continue;
+        if (card.subagentStatus === 'running') resolved += 1;
         card.subagentStatus = 'completed';
         card.description = card.baseDescription;
         if (!card.result) card.result = 'Агент завершил работу (по его собственной истории).';
-        resolved += 1;
+        if (completion.completedAt > 0) {
+          card.completedAt = completion.completedAt;
+          if (Number(card.startedAt) > 0) {
+            card.durationMs = Math.max(0, completion.completedAt - Number(card.startedAt));
+          }
+        }
       }
       if (resolved > 0) {
         console.log('[CodexSubagents] closed by own transcript: ' + resolved
-          + '/' + stillRunning.length + ' session=' + String(sessionId).slice(0, 8));
+          + '/' + trackedCards.length + ' session=' + String(sessionId).slice(0, 8));
       }
     }
 
@@ -4087,7 +4209,7 @@ function codexToolName(call) {
   if (!call) return 'tool';
   if (call.type === 'web_search_call') return 'web_search';
   if (call.type === 'tool_search_call' || call.type === 'tool_search_output') return 'tool_search';
-  return call.name || call.tool_name || call.type || 'tool';
+  return call.toolName || call.name || call.tool_name || call.type || 'tool';
 }
 
 function codexToolGroup(call) {
@@ -4107,34 +4229,8 @@ function parseCodexCallArgs(call) {
   if (!call) return {};
   if (call.type === 'web_search_call') return call.action || {};
   if (call.type === 'tool_search_call') return call.arguments || {};
+  if (call.args && typeof call.args === 'object') return call.args;
   return parseToolArguments(call);
-}
-
-function shouldIncludeCodexTool(group, toolName, opts) {
-  if (!opts.includeClaude) return false;
-  if (group === 'editing') return !!opts.includeEditing;
-  if (group === 'bash') return !!opts.includeBash;
-  if (group === 'mcp') return !!opts.includeTools;
-  if (group === 'web') return !!opts.includeWebSearch;
-  if (group === 'toolSearch') return !!opts.includeToolSearch;
-  if (group === 'tools') return !!opts.includeOtherTools;
-  if (group === 'subagent') {
-    if (opts.includeSubagentHistory) return true;
-    return !!opts.includeSubagentResult && toolName === 'wait_agent';
-  }
-  return false;
-}
-
-function codexToolLabel(call) {
-  const name = codexToolName(call);
-  const namespace = call?.namespace || '';
-  if (name === 'apply_patch') return '🧩 apply_patch';
-  if (CODEX_SHELL_TOOLS.has(name)) return `🖥 ${name}`;
-  if (namespace === 'multi_agent_v1' || namespace === 'collaboration' || CODEX_SUBAGENT_NAMES.has(name)) return `🧵 ${name}`;
-  if (namespace && namespace.startsWith('mcp__')) return `🔌 ${namespace} / ${name}`;
-  if (name === 'web_search') return '🌐 web_search';
-  if (name === 'tool_search') return '🧰 tool_search';
-  return `⚙️ ${name}`;
 }
 
 function normalizeCodexToolOutput(outputPayload) {
@@ -4148,22 +4244,54 @@ function normalizeCodexToolOutput(outputPayload) {
 function formatCodexToolForExport(call, outputPayload, opts) {
   const group = codexToolGroup(call);
   const name = codexToolName(call);
-  if (!shouldIncludeCodexTool(group, name, opts)) return null;
-
   const args = parseCodexCallArgs(call);
   const output = normalizeCodexToolOutput(outputPayload);
-  const body = { request: args };
-  if (output) body.response = output;
-  if (outputPayload?.is_error) body.isError = true;
+  if (group === 'subagent') {
+    const subject = String(
+      args.task_name || args.label || args.target || args.agent_id
+      || (name === 'wait_agent' ? 'result' : 'subagent'),
+    ).trim();
+    // Result-only means the terminal result carrier, not the spawn receipt.
+    const result = opts.includeSubagentHistory || name === 'wait_agent' ? output : '';
+    return formatCopyAction({
+      toolName: 'Subagent',
+      description: subject,
+      args,
+      result,
+      isError: !!outputPayload?.is_error,
+    }, opts);
+  }
 
-  return [
-    '🛠 TOOL:',
-    codexToolLabel(call),
-    '```json',
-    stringifyCompact(body),
-    '```',
-    '',
-  ].join('\n');
+  let actions = [];
+  if (call?.type === 'web_search_call' || name === 'web_search') {
+    actions = [{ toolName: 'WebSearch', args, result: output, isError: !!outputPayload?.is_error }];
+  } else if (call?.type === 'tool_search_call' || call?.type === 'tool_search_output' || name === 'tool_search') {
+    actions = [{ toolName: 'Tool Search', args, result: output, isError: !!outputPayload?.is_error }];
+  } else {
+    const decoded = codexHistoryActionsForCall({
+      callId: call?.call_id || call?.id || '',
+      toolName: name,
+      args,
+      namespace: call?.namespace || '',
+      patchApplyEvents: call?.patchApplyEvents,
+    }, output, !!outputPayload?.is_error);
+    actions = (decoded.actions || []).map((action) => (
+      action?.tool === 'Task'
+        ? {
+            toolName: 'Subagent',
+            description: action.description,
+            args: action.args || {},
+            result: action.result,
+            isError: action.isError,
+          }
+        : (action.rawTool || action)
+    ));
+  }
+
+  const formatted = actions
+    .map((action) => formatCopyAction(action, opts))
+    .filter(Boolean);
+  return formatted.length > 0 ? formatted.join('\n\n') : null;
 }
 
 function removeLastCodexTurns(entries, numTurns) {
@@ -4230,15 +4358,26 @@ function isCodexResponseUserRecord(record) {
   return record?.type === 'response_item' && payload.type === 'message' && payload.role === 'user';
 }
 
+function isCodexTurnPreambleRecord(record) {
+  const payload = record?.payload || {};
+  if (record?.type === 'turn_context') return true;
+  if (record?.type === 'event_msg' && payload.type === 'task_started') return true;
+  if (record?.type !== 'response_item' || payload.type !== 'message') return false;
+  if (payload.role === 'developer') return true;
+  if (payload.role !== 'user') return false;
+  const text = codexUserMessageAuditText(record) || '';
+  return isCodexEnvironmentContextUserText(text)
+    || isCodexProjectInstructionsUserText(text);
+}
+
 function codexPendingStartForUserMessage(pending, message) {
-  const expected = normalizeCodexText(message);
-  if (!expected) return pending.length;
+  if (!normalizeCodexText(message)) return pending.length;
   let duplicateIdx = -1;
   for (let i = pending.length - 1; i >= 0; i--) {
     const record = pending[i]?.record;
     if (!isCodexResponseUserRecord(record)) continue;
-    const text = normalizeCodexText(codexUserMessageAuditText(record));
-    if (text === expected) {
+    const text = codexUserMessageAuditText(record) || '';
+    if (codexUserCarrierTextsMatch(text, message)) {
       duplicateIdx = i;
       break;
     }
@@ -4264,18 +4403,7 @@ function codexPendingStartForUserMessage(pending, message) {
     return start;
   }
   let start = duplicateIdx;
-  while (start > 0) {
-    const prev = pending[start - 1]?.record;
-    if (prev?.type === 'turn_context') {
-      start -= 1;
-      continue;
-    }
-    if (prev?.type === 'event_msg' && prev.payload?.type === 'task_started') {
-      start -= 1;
-      continue;
-    }
-    break;
-  }
+  while (start > 0 && isCodexTurnPreambleRecord(pending[start - 1]?.record)) start -= 1;
   return start;
 }
 
@@ -4314,7 +4442,10 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
     const fallbackIndex = pending.findIndex((item) => {
       if (!isCodexResponseUserRecord(item?.record)) return false;
       const text = codexUserMessageAuditText(item.record) || '';
-      return !!text && !text.includes('<subagent_notification>');
+      return !!text
+        && !text.includes('<subagent_notification>')
+        && !isCodexEnvironmentContextUserText(text)
+        && !isCodexProjectInstructionsUserText(text);
     });
     if (fallbackIndex >= 0) {
       const fallbackText = codexUserMessageAuditText(pending[fallbackIndex].record) || '';
@@ -4498,6 +4629,113 @@ async function writeCodexJsonlExclusive(filePath, records) {
     if (created) await fs.promises.unlink(filePath).catch(() => {});
     throw error;
   }
+}
+
+function buildCodexEmptySessionMetaRecord({ sessionId, cwd, timestamp }) {
+  return {
+    timestamp,
+    type: 'session_meta',
+    payload: {
+      session_id: sessionId,
+      id: sessionId,
+      timestamp,
+      cwd,
+      // Match the ownership class emitted by interactive Codex. The app's
+      // discovery layer intentionally excludes exec/app-server/subagent
+      // rollouts from user-tab writer adoption.
+      originator: 'codex-tui',
+      cli_version: '0.0.0',
+      source: 'cli',
+      thread_source: 'user',
+      model_provider: 'openai',
+    },
+  };
+}
+
+async function materializeEmptyCodexSession({
+  cwd,
+  sessionId = null,
+  now = new Date(),
+  sessionsDir = CODEX_SESSIONS_DIR,
+} = {}) {
+  const exactCwd = typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : null;
+  if (!exactCwd) {
+    const error = new Error('codex_empty_session_cwd_required');
+    error.code = 'codex_empty_session_cwd_required';
+    throw error;
+  }
+  const exactSessionId = typeof sessionId === 'string' && sessionId.trim()
+    ? sessionId.trim()
+    : crypto.randomUUID();
+  const timestamp = now.toISOString();
+  const { yyyy, mm, dd } = codexDateParts(now);
+  const dir = path.join(sessionsDir, yyyy, mm, dd);
+  await fs.promises.mkdir(dir, { recursive: true });
+  const records = [buildCodexEmptySessionMetaRecord({
+    sessionId: exactSessionId,
+    cwd: exactCwd,
+    timestamp,
+  })];
+
+  let filePath = '';
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const suffix = attempt === 0 ? '' : '-' + attempt;
+    filePath = path.join(
+      dir,
+      `rollout-${codexRolloutTimestamp(now)}-${exactSessionId}${suffix}.jsonl`,
+    );
+    try {
+      await writeCodexJsonlExclusive(filePath, records);
+      invalidateCodexJsonlCache(filePath);
+      return {
+        success: true,
+        committed: true,
+        sessionId: exactSessionId,
+        filePath,
+        createdAt: timestamp,
+        records,
+      };
+    } catch (error) {
+      if (error?.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+  const error = new Error('codex_empty_session_path_unavailable');
+  error.code = 'codex_empty_session_path_unavailable';
+  throw error;
+}
+
+function isCodexRealUserRecord(record) {
+  const text = codexUserMessageAuditText(record);
+  if (text === null) return false;
+  return !isCodexEnvironmentContextUserText(text)
+    && !isCodexProjectInstructionsUserText(text);
+}
+
+function inspectCodexConversationMaterialization(records, sessionId = null) {
+  const list = Array.isArray(records) ? records : [];
+  const meta = getSessionMeta(list);
+  const exactSessionId = typeof sessionId === 'string' && sessionId.trim()
+    ? sessionId.trim()
+    : null;
+  if (!meta?.id || (exactSessionId && meta.id !== exactSessionId)) {
+    return {
+      materialized: false,
+      metadataOnly: false,
+      userRecords: 0,
+      reason: 'session-meta-missing-or-mismatched',
+    };
+  }
+  const userRecords = list.filter(isCodexRealUserRecord).length;
+  const userTurns = buildCodexTimeline(list, meta.id)
+    .filter((entry) => entry?.type === 'user').length;
+  return {
+    materialized: userTurns > 0,
+    metadataOnly: userTurns === 0,
+    userRecords,
+    userTurns,
+    reason: userTurns > 0 ? 'user-history-present' : 'session-meta-only',
+  };
 }
 
 function rewriteCodexEditedForkMetadata(
@@ -4910,14 +5148,16 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
       selectedCompactLines: selectedCompactLines.size,
     };
   }
+  const compactCompanionPairs = codexCompactCompanionPairs(records);
+  const selectedCompactCompanionLines = new Set(
+    [...selectedCompactLines]
+      .map((line) => compactCompanionPairs.get(line))
+      .filter((line) => Number.isFinite(line)),
+  );
   const isSelectedCompactCompanion = (wrapper) => {
     if (!isCodexCompactRecord(wrapper.record)) return false;
     const line = Number(wrapper.line);
-    if (!Number.isFinite(line)) return false;
-    for (const compactLine of selectedCompactLines) {
-      if (line > compactLine && line <= compactLine + 3) return true;
-    }
-    return false;
+    return Number.isFinite(line) && selectedCompactCompanionLines.has(line);
   };
   const shouldRemoveWrapper = (wrapper) => {
     if (Number.isFinite(wrapper.turnKey) && selectedTurnKeys.has(Number(wrapper.turnKey))) return true;
@@ -5326,9 +5566,18 @@ async function deleteCodexRange({
 
 function codexCopyOptions(params = {}) {
   const includeTools = params.includeTools ?? false;
+  const includeBash = params.includeBash ?? false;
   return {
     includeEditing: params.includeEditing ?? false,
     includeReading: params.includeReading ?? false,
+    includeSearch: params.includeSearch ?? includeBash,
+    includeRun: params.includeRun ?? includeBash,
+    includeGit: params.includeGit ?? includeBash,
+    includeMcp: params.includeMcp ?? includeTools,
+    includeWeb: params.includeWeb ?? params.includeWebSearch ?? false,
+    includePlan: params.includePlan ?? params.includeToolSearch ?? params.includeOtherTools ?? false,
+    includeOther: params.includeOther ?? params.includeOtherTools ?? params.includeToolSearch ?? includeTools,
+    includeActions: params.includeActions ?? true,
     fromStart: params.fromStart ?? true,
     includeSubagentResult: params.includeSubagentResult ?? false,
     includeSubagentHistory: params.includeSubagentHistory ?? false,
@@ -5336,7 +5585,7 @@ function codexCopyOptions(params = {}) {
     includeClaude: params.includeClaude ?? true,
     includeText: params.includeText ?? true,
     includeThinking: params.includeThinking ?? true,
-    includeBash: params.includeBash ?? false,
+    includeBash,
     includeTools,
     includeWebSearch: params.includeWebSearch ?? false,
     includeToolSearch: params.includeToolSearch ?? false,
@@ -5344,24 +5593,48 @@ function codexCopyOptions(params = {}) {
   };
 }
 
-function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), options = {}) {
+function compactCopyTokenCount(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count <= 0) return '';
+  if (count < 1000) return String(Math.floor(count));
+  const rounded = count >= 10_000
+    ? Math.round(count / 1000)
+    : Math.round(count / 100) / 10;
+  return String(rounded).replace(/\.0$/, '') + 'k';
+}
+
+function codexCompactCopyLine(preTokens, postTokens) {
+  const pre = Number(preTokens);
+  const post = Number(postTokens);
+  const preText = compactCopyTokenCount(pre);
+  const postText = compactCopyTokenCount(post);
+  if (preText && postText) {
+    const reduced = pre > post ? compactCopyTokenCount(pre - post) : '';
+    return `Context compacted · ${preText} → ${postText} tokens${reduced ? `, −${reduced}` : ''} (encrypted)`;
+  }
+  if (postText) return `Context compacted · ${postText} tokens (encrypted)`;
+  return 'Context compacted (encrypted)';
+}
+
+function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
   const entries = [];
   const pendingResponseUsers = [];
+  const pendingProjectInstructions = [];
   const compactCompanionLines = codexCompactCompanionLines(records);
   const pendingCalls = new Map();
   let currentTurnIndex = -1;
   let pendingThinking = '';
   let currentTurnCanonicalUserText = null;
-  const expandedCompactUuids = options.expandedCompactUuids instanceof Set
-    ? options.expandedCompactUuids
-    : new Set();
+  let latestTokenCountInfo = null;
 
   const push = (entry) => entries.push({ ...entry, turnIndex: currentTurnIndex });
-  const compactText = (payload, sourceUuid) => (
-    expandedCompactUuids.has(sourceUuid)
-      ? compactEventContent(payload)
-      : compactEventTitle(payload)
-  );
+  const compactText = (payload) => {
+    const last = latestTokenCountInfo?.last_token_usage
+      || latestTokenCountInfo?.total_token_usage
+      || {};
+    const preTokens = Number(last.total_tokens || last.input_tokens || 0) || undefined;
+    return codexCompactCopyLine(preTokens, compactPostTokenCount(payload));
+  };
 
   for (const record of records) {
     const payload = record.payload || {};
@@ -5373,7 +5646,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
       const sourceUuid = stableUuid(sessionId, record.__line, 'codex-compact');
       push({
         kind: 'compact',
-        text: compactText(payload, sourceUuid),
+        text: compactText(payload),
         sourceUuid,
       });
       continue;
@@ -5381,14 +5654,31 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
 
     if (record.type === 'event_msg') {
       if (payload.type === 'task_started') currentTurnCanonicalUserText = null;
-      if (payload.type === 'user_message') {
+      if (payload.type === 'patch_apply_end') {
+        attachCodexPatchApplyEvent(pendingCalls, payload);
+      } else if (payload.type === 'user_message') {
         // Codex persists a built-in subagent completion as an event_msg with a
         // user role, but it is a service carrier inside the current external
         // turn. Timeline already ignores it; the clean result projection must
         // keep the same boundary or it drops the final assistant tail.
         if (isCodexSubagentNotification(payload)) continue;
         const userText = payload.message || extractTextContent(payload.content) || '';
+        const presentedUserText = codexUserMessagePresentationText(record);
         if (isCodexEnvironmentContextUserText(userText)) continue;
+        if (isCodexProjectInstructionsUserText(userText)) {
+          // Project instructions are a service preamble of the following
+          // real user turn. Timeline does not mint an editable dot for them,
+          // so clean copy must not consume a turn coordinate either.
+          const pendingIndex = pendingProjectInstructions.findIndex((candidate) => (
+            codexUserCarrierTextsMatch(candidate, userText)
+          ));
+          if (pendingIndex >= 0) {
+            pendingProjectInstructions.splice(pendingIndex, 1);
+          }
+          currentTurnCanonicalUserText = userText;
+          continue;
+        }
+        pendingProjectInstructions.length = 0;
         const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
           codexUserCarrierTextsMatch(candidate.text, userText)
         ));
@@ -5397,19 +5687,13 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
           : null;
         if (!pending) currentTurnIndex += 1;
         if (opts.includeUser) {
-          const images = [
-            ...(Array.isArray(payload.local_images) ? payload.local_images : []),
-            ...(Array.isArray(payload.images) ? payload.images : []),
-          ];
-          const imageLines = images.map((img) => `[image: ${typeof img === 'string' ? img : 'attached image'}]`);
-          const presentedText = [userText, ...imageLines].filter(Boolean).join('\n');
           if (pending?.entry) {
-            pending.entry.text = presentedText;
+            pending.entry.text = presentedUserText;
             pending.entry.sourceUuid = stableUuid(sessionId, record.__line, 'codex-user');
           } else {
             const entry = {
               kind: 'user',
-              text: presentedText,
+              text: presentedUserText,
               sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
             };
             push(entry);
@@ -5419,16 +5703,22 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
       } else if (payload.type === 'thread_rolled_back') {
         removeLastCodexTurns(entries, Number(payload.num_turns || payload.turns || 1));
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
+        pendingProjectInstructions.length = 0;
       } else if (isCompactPayload(payload)) {
         if (!compactCompanionLines.has(record.__line)) {
           const sourceUuid = stableUuid(sessionId, record.__line, 'codex-compact');
           push({
             kind: 'compact',
-            text: compactText(payload, sourceUuid),
+            text: compactText(payload),
             sourceUuid,
           });
         }
-      } else if (payload.type === 'task_complete') pendingResponseUsers.length = 0;
+      } else if (payload.type === 'token_count') {
+        latestTokenCountInfo = payload.info || latestTokenCountInfo;
+      } else if (payload.type === 'task_complete') {
+        pendingResponseUsers.length = 0;
+        pendingProjectInstructions.length = 0;
+      }
       continue;
     }
 
@@ -5436,9 +5726,16 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
 
     if (payload.type === 'message' && payload.role === 'user') {
       const userText = codexUserMessageAuditText(record) || '';
+      const presentedUserText = codexUserMessagePresentationText(record);
       if (!userText
         || userText.includes('<subagent_notification>')
         || isCodexEnvironmentContextUserText(userText)) continue;
+      if (isCodexProjectInstructionsUserText(userText)) {
+        pendingProjectInstructions.push(userText);
+        currentTurnCanonicalUserText = userText;
+        continue;
+      }
+      pendingProjectInstructions.length = 0;
       if (currentTurnCanonicalUserText
         && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, userText)) {
         continue;
@@ -5448,7 +5745,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
       if (opts.includeUser) {
         entry = {
           kind: 'user',
-          text: userText,
+          text: presentedUserText,
           sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
         };
         push(entry);
@@ -5490,7 +5787,15 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
 
     if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
       const callId = payload.call_id || payload.id || stableUuid(sessionId, record.__line, 'codex-call');
-      pendingCalls.set(callId, payload);
+      pendingCalls.set(callId, {
+        ...payload,
+        callId,
+        toolName: codexToolName(payload),
+        args: parseCodexCallArgs(payload),
+        namespace: payload.namespace || '',
+        turnId: payload.turn_id || '',
+        patchApplyEvents: [],
+      });
       continue;
     }
 
@@ -5533,7 +5838,7 @@ function formatCodexCleanExport(entries, sessionId, cwd, meta, title = '# Codex 
     } else if (entry.kind === 'tool') {
       out.push(text);
     } else if (entry.kind === 'compact') {
-      out.push('═══ COMPACTED ═══', text, '');
+      out.push(text, '');
     }
   }
   return out.join('\n');
@@ -5570,20 +5875,30 @@ function buildCodexRangeExport(records, sessionId, cwd, opts, startUuid, endUuid
     }
   }
 
-  // Context-menu "Copy compact" passes start=end for one compact marker.
-  // Expand only that case; multi-entry ranges keep compact markers shallow.
-  const expandedCompactUuids = selected.length === 1 && selected[0]?.type === 'compact'
-    ? new Set([selected[0].uuid])
-    : new Set();
-  const cleanEntries = buildCodexCleanEntries(records, sessionId, codexCopyOptions(opts), {
-    expandedCompactUuids,
-  });
+  // Compact is a structural, selectable Timeline point. Its encrypted body is
+  // never expanded into replacement_history; the clean projection carries
+  // exactly one metadata line for both single-point and range copy.
+  const cleanEntries = buildCodexCleanEntries(records, sessionId, codexCopyOptions(opts));
   const filtered = cleanEntries.filter((entry) => {
     if (entry.kind === 'compact') return selectedCompacts.has(entry.sourceUuid);
     return typeof entry.turnIndex === 'number' && selectedTurns.has(entry.turnIndex);
   });
 
   if (filtered.length === 0) {
+    const cleanTurnIndexes = cleanEntries
+      .map((entry) => entry.turnIndex)
+      .filter((turnIndex) => typeof turnIndex === 'number');
+    const cleanTurnRange = cleanTurnIndexes.length > 0
+      ? `${Math.min(...cleanTurnIndexes)}..${Math.max(...cleanTurnIndexes)}`
+      : 'none';
+    console.warn('[CodexCopyRange] empty projection'
+      + ' session=' + String(sessionId || '').slice(0, 8)
+      + ' start=' + String(startUuid || '').slice(0, 16)
+      + ' end=' + String(endUuid || '').slice(0, 16)
+      + ' selected=' + selected.map((entry) => `${entry.type}@${entry.turnIndex ?? '-'}:${String(entry.uuid || '').slice(0, 8)}`).join(',')
+      + ' selectedTurns=' + [...selectedTurns].join(',')
+      + ' selectedCompacts=' + selectedCompacts.size
+      + ' cleanTurnRange=' + cleanTurnRange);
     return { success: false, error: 'Selected range has no copyable content' };
   }
 
@@ -8063,6 +8378,201 @@ function register({ projectManager, transcriptService } = {}) {
     } catch {}
   }
 
+  module.exports._api.materializeEmptySession = materializeEmptyCodexSession;
+  module.exports._api.inspectConversationMaterialization = inspectCodexConversationMaterialization;
+
+  module.exports._api.injectHistoryContext = async function ({
+    sessionId = null,
+    cwd,
+    prompt,
+    imagePaths = [],
+    model = null,
+    effort = null,
+    itemId = null,
+    onBeforeCommit = null,
+  } = {}) {
+    const exactCwd = typeof cwd === 'string' && path.isAbsolute(cwd)
+      ? cwd
+      : null;
+    const exactPrompt = typeof prompt === 'string' ? prompt : '';
+    if (!exactCwd) return { success: false, committed: false, error: 'history_context_cwd_required' };
+    if (!exactPrompt.trim()) return { success: false, committed: false, error: 'history_context_prompt_required' };
+    const exactModel = typeof model === 'string' ? model.trim() : '';
+    const exactEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+    if (!exactModel || !exactEffort) {
+      return {
+        success: false,
+        committed: false,
+        error: 'codex_history_context_settings_required',
+      };
+    }
+    const exactItemId = typeof itemId === 'string' && itemId.trim()
+      ? itemId.trim()
+      : 'msg_' + crypto.randomUUID();
+    const item = await buildCodexHistoryContextItem(exactPrompt, exactItemId, { imagePaths });
+    const requestedSessionId = typeof sessionId === 'string' && sessionId.trim()
+      ? sessionId.trim()
+      : null;
+    const lockKey = requestedSessionId || ('fresh:' + exactItemId);
+    const previous = _codexHistoryContextInflight.get(lockKey) || Promise.resolve();
+    let committed = false;
+    let appendStarted = false;
+    const work = previous.catch(() => {}).then(async () => {
+      let exactSessionId = requestedSessionId;
+      let filePath = null;
+      let fresh = false;
+      try {
+        if (!exactSessionId) {
+          const materialized = await materializeEmptyCodexSession({ cwd: exactCwd });
+          exactSessionId = materialized.sessionId;
+          filePath = materialized.filePath;
+          fresh = true;
+        } else {
+          const found = await findCodexSessionFile(exactSessionId, exactCwd);
+          filePath = found?.filePath || null;
+        }
+        if (!exactSessionId || !filePath) {
+          throw new Error('codex_history_context_session_not_found');
+        }
+
+        const loadedBefore = await loadSessionRecords(exactSessionId, exactCwd);
+        if (!loadedBefore.success || loadedBefore.filePath !== filePath) {
+          throw new Error(loadedBefore.error || 'codex_history_context_source_unavailable');
+        }
+        const expectedSource = loadedBefore.sourceSnapshot;
+        if (!expectedSource) throw new Error('codex_history_context_source_snapshot_missing');
+
+        const timestamp = new Date().toISOString();
+        const responseTimestamp = new Date(Date.parse(timestamp) + 1).toISOString();
+        const eventTimestamp = new Date(Date.parse(timestamp) + 2).toISOString();
+        const settingsRecord = {
+          timestamp,
+          type: 'event_msg',
+          payload: {
+            type: 'thread_settings_applied',
+            thread_settings: {
+              model: exactModel,
+              reasoning_effort: exactEffort,
+            },
+            source: 'noted-terminal-history-context',
+            source_session_id: exactSessionId,
+            proof_at: Date.parse(timestamp),
+          },
+        };
+        const responseRecord = {
+          timestamp: responseTimestamp,
+          type: 'response_item',
+          payload: item,
+        };
+        const presentationText = codexUserMessagePresentationText(responseRecord) || exactPrompt;
+        const eventRecord = {
+          timestamp: eventTimestamp,
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: presentationText,
+            kind: 'plain',
+          },
+        };
+        const serialized = JSON.stringify(settingsRecord) + '\n'
+          + JSON.stringify(responseRecord) + '\n'
+          + JSON.stringify(eventRecord) + '\n';
+
+        if (typeof onBeforeCommit === 'function') await onBeforeCommit({
+          provider: 'codex',
+          sessionId: exactSessionId,
+          itemId: exactItemId,
+          fresh,
+        });
+
+        const handle = await fs.promises.open(filePath, 'a+');
+        try {
+          const sourceNow = await handle.stat();
+          if (sourceNow.size !== Number(expectedSource.size)
+            || sourceNow.mtimeMs !== Number(expectedSource.mtimeMs)) {
+            const error = new Error('codex_history_context_source_changed');
+            error.code = 'codex_history_context_source_changed';
+            throw error;
+          }
+          if (sourceNow.size > 0) {
+            const tail = Buffer.alloc(1);
+            await handle.read(tail, 0, 1, sourceNow.size - 1);
+            if (tail[0] !== 0x0a) {
+              const error = new Error('codex_history_context_partial_tail');
+              error.code = 'codex_history_context_partial_tail';
+              throw error;
+            }
+          }
+          appendStarted = true;
+          await handle.appendFile(serialized, 'utf8');
+          committed = true;
+        } finally {
+          await handle.close();
+        }
+
+        invalidateCodexJsonlCache(filePath);
+        const loaded = await loadSessionRecords(exactSessionId, exactCwd);
+        if (!loaded.success) {
+          const error = new Error(loaded.error || 'codex_history_context_record_unavailable');
+          error.historyContextCommitted = committed;
+          throw error;
+        }
+        const record = loaded.records.find((candidate) => (
+          candidate?.type === 'response_item'
+          && candidate?.payload?.type === 'message'
+          && candidate?.payload?.role === 'user'
+          && String(candidate?.payload?.id || '') === exactItemId
+        ));
+        if (!record) {
+          const error = new Error('codex_history_context_record_identity_missing');
+          error.historyContextCommitted = committed;
+          error.historyContextOutcomeUnknown = appendStarted && !committed;
+          throw error;
+        }
+        committed = true;
+        const auditTimestamp = recordTimestamp(record);
+        return {
+          success: true,
+          committed: true,
+          provider: 'codex',
+          sessionId: exactSessionId,
+          itemId: exactItemId,
+          entryUuid: stableUuid(exactSessionId, record.__line, 'codex-user'),
+          sourceIdentity: stableSourceIdentity(exactSessionId, record, 'codex-user'),
+          recordByteOffset: Number.isFinite(record.__byteOffset)
+            ? Number(record.__byteOffset)
+            : null,
+          auditTimestamp,
+          fresh,
+          filePath: loaded.filePath,
+          presentationText: codexUserMessagePresentationText(record),
+        };
+      } catch (error) {
+        if (fresh && filePath && appendStarted !== true) {
+          await fs.promises.unlink(filePath).catch(() => null);
+          invalidateCodexJsonlCache(filePath);
+        }
+        throw error;
+      }
+    });
+    _codexHistoryContextInflight.set(lockKey, work);
+    try {
+      return await work;
+    } catch (error) {
+      if (error.historyContextCommitted === undefined) {
+        error.historyContextCommitted = committed;
+      }
+      if (error.historyContextOutcomeUnknown === undefined) {
+        error.historyContextOutcomeUnknown = appendStarted && !committed;
+      }
+      throw error;
+    } finally {
+      if (_codexHistoryContextInflight.get(lockKey) === work) {
+        _codexHistoryContextInflight.delete(lockKey);
+      }
+    }
+  };
+
   ipcMain.handle('codex:get-account-profiles', async () => ({
     success: true,
     profiles: codexAccountProfileManager?.listPublicProfiles() || [],
@@ -8565,10 +9075,14 @@ module.exports = {
     resolveCodexHistoryMutationSettingsProof,
     ensureCodexEditedForkSettingsProof,
     writeCodexJsonlExclusive,
+    buildCodexEmptySessionMetaRecord,
+    materializeEmptySession: materializeEmptyCodexSession,
+    inspectConversationMaterialization: inspectCodexConversationMaterialization,
     editCodexRange,
     deleteCodexRange,
     forkCodexFromLatestCompact,
     loadSessionRecords,
+    injectHistoryContext: null,
     buildCodexFullHistory,
     createCodexHistoryProjector,
     projectCodexFullHistoryFromFile,

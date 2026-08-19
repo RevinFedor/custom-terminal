@@ -99,6 +99,20 @@ test('Codex manual xterm compact stays pending until task_started, while public 
     'Codex context telemetry is not the durable compacted record');
 });
 
+test('History slash compact supplies the provider before arming its pending operation', () => {
+  const handler = sourceBetween(
+    mainSource,
+    "ipcMain.handle('codex:send-live-slash-command'",
+    '// ========== GEMINI REWIND',
+  );
+  const compactBranch = sourceBetween(
+    handler,
+    "if (String(command || '').trim() === '/compact')",
+    'const result = await sendCodexLiveSlashCommand',
+  );
+  assert.match(compactBranch, /compactOperations\.armPending\(\{[\s\S]{0,180}provider:\s*'codex'/);
+});
+
 test('Claude accepted compact queue rows become slash history instead of stale SENT', () => {
   const projection = sourceBetween(
     claudeHistorySource,

@@ -4,6 +4,7 @@ type PopoverLayout = {
   left: number;
   top: number;
   maxWidth: number;
+  maxHeight: number;
 };
 
 interface CenteredUpwardPopoverProps extends React.HTMLAttributes<HTMLDivElement> {
@@ -75,17 +76,37 @@ const CenteredUpwardPopover = forwardRef<HTMLDivElement, CenteredUpwardPopoverPr
         Math.max(intendedLeft, leftLimit),
         Math.max(leftLimit, rightLimit - width),
       );
-      const next = { left, top: anchor.top, maxWidth };
+      // Prefer the space above the trigger, but never let the card leave the
+      // application viewport. When a History row sits close to the top after
+      // scrolling, clamping the top edge keeps the full card reachable; its
+      // own vertical scroller handles the reduced height instead of rendering
+      // content behind the title bar/outside the window.
+      const viewportBottom = Math.max(edgePadding + 1, window.innerHeight - edgePadding);
+      const maxHeight = Math.max(1, viewportBottom - edgePadding);
+      const measuredHeight = Math.min(
+        Math.max(wrapper.scrollHeight, wrapper.offsetHeight),
+        maxHeight,
+      );
+      // The wrapper includes `gap` as transparent bottom padding. That keeps a
+      // continuous hover bridge between trigger and card for menus which close
+      // on pointer leave, while the visible card still ends `gap` px above it.
+      const intendedTop = anchor.top - measuredHeight;
+      const top = Math.min(
+        Math.max(intendedTop, edgePadding),
+        Math.max(edgePadding, viewportBottom - measuredHeight),
+      );
+      const next = { left, top, maxWidth, maxHeight };
 
       setLayout((current) => (
         current
         && Math.abs(current.left - next.left) < 0.5
         && Math.abs(current.top - next.top) < 0.5
         && Math.abs(current.maxWidth - next.maxWidth) < 0.5
+        && Math.abs(current.maxHeight - next.maxHeight) < 0.5
           ? current
           : next
       ));
-    }, [edgePadding, getAnchorRect, horizontalAlign]);
+    }, [edgePadding, gap, getAnchorRect, horizontalAlign]);
 
     useLayoutEffect(() => {
       measure();
@@ -114,8 +135,11 @@ const CenteredUpwardPopover = forwardRef<HTMLDivElement, CenteredUpwardPopoverPr
           left: layout?.left ?? 0,
           top: layout?.top ?? 0,
           maxWidth: layout?.maxWidth ?? `calc(100vw - ${edgePadding * 2}px)`,
+          maxHeight: layout?.maxHeight ?? `calc(100vh - ${edgePadding * 2}px)`,
           paddingBottom: gap,
-          transform: 'translateY(-100%)',
+          boxSizing: 'border-box',
+          overflowY: 'auto',
+          overflowX: 'hidden',
           zIndex,
           visibility: layout ? 'visible' : 'hidden',
           ...style,

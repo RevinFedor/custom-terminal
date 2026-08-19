@@ -38,6 +38,12 @@ osascript -e "tell application \"${APP_NAME}\" to quit" 2>/dev/null || true
 # appeared, even though JSONL was intact (forensic: 2026-05-26 16:06 restart).
 # Now we sleep a real 0.25s per tick and compare elapsed wall-clock, so the
 # default deadline genuinely covers the drain budget.
+# Отметка времени ДО закрытия — по ней в конце проверяем, вышло приложение
+# само или упало. Отчёт macOS о падении появляется в этой папке с задержкой в
+# секунду-другую, поэтому смотреть надо на файлы новее этой отметки.
+CRASH_DIR="${HOME}/Library/Logs/DiagnosticReports"
+QUIT_MARKER="$(mktemp -t noted-quit-marker)"
+
 START_TS=$(date +%s)
 while is_running; do
   ELAPSED=$(( $(date +%s) - START_TS ))
@@ -60,6 +66,34 @@ done
 if is_running; then
   echo "[graceful-quit] WARNING: app still running after deadline+SIGTERM; forcing SIGKILL"
   pkill -9 -f "/Applications/${APP_NAME}.app" 2>/dev/null || true
+fi
+
+# Приложение больше не запущено — но КАК оно закончилось? Штатный выход и
+# аварийное завершение выглядят отсюда одинаково, а разница принципиальная:
+# при падении уборка обрывается на середине, и установка продолжается поверх
+# недозакрытого состояния, ничего об этом не сказав.
+#
+# Пять таких падений 18–19.08 прошли незамеченными именно потому, что этот
+# скрипт печатал «done» в обоих случаях. Молчание тут — это не отсутствие
+# проблемы, это отсутствие проверки.
+#
+# Отчёт macOS появляется с задержкой, поэтому даём ему пару секунд.
+CRASHED=""
+if [ -d "${CRASH_DIR}" ]; then
+  for _ in 1 2 3 4 5 6; do
+    CRASHED="$(find "${CRASH_DIR}" -maxdepth 1 -name "${APP_NAME}-*.ips" -newer "${QUIT_MARKER}" 2>/dev/null | head -1)"
+    [ -n "${CRASHED}" ] && break
+    sleep 0.5
+  done
+fi
+rm -f "${QUIT_MARKER}" 2>/dev/null || true
+
+if [ -n "${CRASHED}" ]; then
+  echo "[graceful-quit] ВНИМАНИЕ: приложение не вышло штатно, а аварийно завершилось."
+  echo "[graceful-quit] отчёт: ${CRASHED}"
+  echo "[graceful-quit] уборка при закрытии оборвана на середине; установка продолжается."
+else
+  echo "[graceful-quit] приложение вышло штатно"
 fi
 
 echo "[graceful-quit] done"

@@ -9,6 +9,9 @@ export const CODEX_PRESENCE_SNAPSHOT_FIELDS = Object.freeze([
   'readSessionId',
   'readIdentitySource',
   'savedSessionId',
+  'conversationMaterialized',
+  'timelineCount',
+  'materializationReason',
   'canCopySessionId',
   'hasTerm',
   'lastNotReady',
@@ -83,6 +86,7 @@ export function isCodexRuntimeWriterUsable(runtimeSnapshot, {
  * that label while the live writer is still unresolved.
  */
 export function isCodexRuntimeForkReady(runtimeSnapshot) {
+  if (runtimeSnapshot?.conversationMaterialized !== true) return false;
   return runtimeSnapshot?.liveLifecycle === false
     || isCodexRuntimeWriterUsable(runtimeSnapshot);
 }
@@ -149,10 +153,13 @@ export function projectCodexPtyPresence(runtimeSnapshot, { fallbackBusy = false 
       manualActionRequired,
       manualActionType: runtimeSnapshot.manualActionType || null,
       sessionId,
-      conversationMaterialized: !!savedSessionId,
+      conversationMaterialized: runtimeSnapshot.conversationMaterialized === true,
       canResume: status === 'inactive' && !!sessionId,
       canCopySessionId: !!readSessionId,
-      materializationReason: savedSessionId ? 'codex-session-id' : 'no-session-id',
+      timelineCount: Number.isFinite(Number(runtimeSnapshot.timelineCount))
+        ? Number(runtimeSnapshot.timelineCount)
+        : null,
+      materializationReason: runtimeSnapshot.materializationReason || null,
       runtimeSnapshot,
     },
   };

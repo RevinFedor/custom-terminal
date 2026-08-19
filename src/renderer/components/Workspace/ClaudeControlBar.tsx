@@ -52,7 +52,11 @@ import {
 } from '../../utils/dictationManager';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
-import { getHistoryAgentRuntime, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
+import {
+  getHistoryAgentRuntime,
+  startFreshCodexSession,
+  type AgentPtyStatus,
+} from '../../utils/historyAgentRuntimes';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { readCodexDraftAuthority } from '../../utils/codexDraftAuthority.mjs';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
@@ -1778,6 +1782,8 @@ export default function ClaudeControlBar({
   // the cursor across every Start/Stop — the same reason Mic/Enter stay put.
   const showDraftMenuControl = isPrimaryHistoryAgent || showLivePtyInputActions;
   const [enterPending, setEnterPending] = useState(false);
+  const [enterCmdHeld, setEnterCmdHeld] = useState(false);
+  const [enterHovered, setEnterHovered] = useState(false);
   const cancelPendingEnterRef = useRef(false);
   const dictationSnapshot = useDictationSnapshot();
   const dictationState = dictationSnapshot.owner?.tabId === tabId
@@ -1788,6 +1794,10 @@ export default function ClaudeControlBar({
       historyCanAcceptSubmitIntent
       && (dictationState.recording || dictationState.stopping)
     );
+  const enterRecordMode = isPrimaryHistoryAgent
+    && historySubmitButtonEnabled
+    && enterHovered
+    && enterCmdHeld;
   // Turn-level busy, NOT process-level. `sdkBusy` is fed by claude:busy-state,
   // which main emits for BOTH SDK and PTY Claude (spinner + stop-hook), filtered
   // by tabId — so it goes false between turns on both. Using isCommandRunning
@@ -1808,7 +1818,21 @@ export default function ClaudeControlBar({
   useEffect(() => {
     cancelPendingEnterRef.current = false;
     setEnterPending(false);
+    setEnterHovered(false);
   }, [tabId]);
+
+  useEffect(() => {
+    const sync = (event: KeyboardEvent) => setEnterCmdHeld(event.metaKey);
+    const clear = () => setEnterCmdHeld(false);
+    window.addEventListener('keydown', sync, true);
+    window.addEventListener('keyup', sync, true);
+    window.addEventListener('blur', clear);
+    return () => {
+      window.removeEventListener('keydown', sync, true);
+      window.removeEventListener('keyup', sync, true);
+      window.removeEventListener('blur', clear);
+    };
+  }, []);
 
   const activeCodexModel = codexModels.find(m => m.id === codexModel) || codexModels[0];
   const visibleCodexModels = useMemo(() => {
@@ -3046,7 +3070,7 @@ export default function ClaudeControlBar({
       if (sessionType === 'codex') {
         store.setTabCommandType(tabId, 'codex');
         store.markAiLaunchAutoTitle(tabId, 'codex');
-        const runResult = await runCodexCommand({ tabId, command: 'codex', cwd: launchCwd });
+        const runResult = await startFreshCodexSession({ tabId, cwd: launchCwd });
         if (runResult?.success === false || runResult?.accepted === false) {
           clearSessionLifecycleAction(actionReason + ':launch-rejected');
         } else {
@@ -3288,7 +3312,11 @@ export default function ClaudeControlBar({
     });
   };
 
-  const sendComposerInput = async () => {
+  const sendComposerInput = async ({
+    recordWithoutReply = false,
+  }: {
+    recordWithoutReply?: boolean;
+  } = {}) => {
     if (!showComposerInputActions || enterPending) return;
     if (
       isPrimaryHistoryAgent
@@ -3313,7 +3341,13 @@ export default function ClaudeControlBar({
             // History's canonical send action; HistoryPanel owns readiness,
             // images, rollback and the actual agent submit.
             window.dispatchEvent(new CustomEvent('history-panel:submit-composer', {
-              detail: { tabId, source: 'dictation-enter' },
+              detail: {
+                tabId,
+                source: recordWithoutReply
+                  ? 'dictation-record-context'
+                  : 'dictation-enter',
+                recordWithoutReply,
+              },
             }));
           } else {
             sendRawEnterToPty();
@@ -3327,7 +3361,13 @@ export default function ClaudeControlBar({
     }
     if (isPrimaryHistoryAgent) {
       window.dispatchEvent(new CustomEvent('history-panel:submit-composer', {
-        detail: { tabId, source: 'control-bar-enter' },
+        detail: {
+          tabId,
+          source: recordWithoutReply
+            ? 'control-bar-record-context'
+            : 'control-bar-enter',
+          recordWithoutReply,
+        },
       }));
       focusHistoryComposer();
       return;
@@ -3497,7 +3537,7 @@ export default function ClaudeControlBar({
       store.markAiLaunchAutoTitle(tabId, 'codex');
       terminalRegistry.get(tabId)?.scrollToBottom();
       focusTerminal();
-      const runResult = await runCodexCommand({ tabId, command: 'codex', cwd: launchCwd });
+      const runResult = await startFreshCodexSession({ tabId, cwd: launchCwd });
       if (runResult?.success === false || runResult?.accepted === false) {
         clearSessionLifecycleAction(actionReason + ':launch-rejected');
       }
@@ -4137,23 +4177,44 @@ export default function ClaudeControlBar({
         {showComposerInputActions && (
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
             <MicButton tabId={tabId} sessionType={sessionType} />
-            <ControlHint label={enterPending ? 'Жду доставку диктовки…' : 'Отправить текущий ввод'}>
+            <ControlHint label={enterPending
+              ? 'Жду доставку диктовки…'
+              : enterRecordMode
+                ? 'Записать текущий ввод в историю без ответа агента'
+                : 'Отправить текущий ввод · Cmd+наведение: записать без ответа'}>
             <button
               onMouseDown={(e) => e.preventDefault()}
-              onClick={sendComposerInput}
+              onMouseEnter={() => setEnterHovered(true)}
+              onMouseLeave={() => setEnterHovered(false)}
+              onClick={(event) => {
+                const recordWithoutReply = isPrimaryHistoryAgent
+                  && historySubmitButtonEnabled
+                  && event.metaKey;
+                void sendComposerInput({ recordWithoutReply });
+              }}
               disabled={enterPending || (isPrimaryHistoryAgent && !historySubmitButtonEnabled)}
               aria-busy={enterPending}
-              className={`inline-flex items-center justify-center transition-colors ${enterPending || (isPrimaryHistoryAgent && !historySubmitButtonEnabled) ? '' : 'cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white'}`}
+              className={`inline-flex items-center justify-center transition-colors ${enterPending || (isPrimaryHistoryAgent && !historySubmitButtonEnabled) ? '' : enterRecordMode ? 'cursor-pointer' : 'cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white'}`}
               style={{
                 height: 22,
                 minWidth: 50,
                 padding: '0 8px',
-                background: enterPending ? 'rgba(218,119,86,0.12)' : 'transparent',
-                border: `1px solid ${enterPending ? 'rgba(218,119,86,0.45)' : 'rgba(255,255,255,0.12)'}`,
+                background: enterPending
+                  ? 'rgba(218,119,86,0.12)'
+                  : enterRecordMode
+                    ? 'rgba(124,58,237,0.72)'
+                    : 'transparent',
+                border: `1px solid ${enterPending
+                  ? 'rgba(218,119,86,0.45)'
+                  : enterRecordMode
+                    ? 'rgba(196,181,253,0.78)'
+                    : 'rgba(255,255,255,0.12)'}`,
                 borderRadius: 4,
                 color: enterPending
                   ? '#FF9466'
-                  : isPrimaryHistoryAgent && !historySubmitButtonEnabled ? '#666' : '#bbb',
+                  : enterRecordMode
+                    ? '#f5f3ff'
+                    : isPrimaryHistoryAgent && !historySubmitButtonEnabled ? '#666' : '#bbb',
                 cursor: enterPending || (isPrimaryHistoryAgent && !historySubmitButtonEnabled) ? 'default' : 'pointer',
                 fontSize: 11,
                 fontWeight: 500,
@@ -4163,7 +4224,9 @@ export default function ClaudeControlBar({
               title={enterPending
                 ? 'Waiting for dictation delivery…'
                 : isPrimaryHistoryAgent
-                  ? `Send visible History input to ${sessionType === 'codex' ? 'Codex' : 'Claude'}`
+                  ? enterRecordMode
+                    ? 'Записать в историю без запуска ответа'
+                    : `Send visible History input to ${sessionType === 'codex' ? 'Codex' : 'Claude'} · Cmd+hover: record without reply`
                   : `Send Enter to ${sessionType === 'codex' ? 'Codex' : 'Claude'}`}
             >
               {enterPending ? (

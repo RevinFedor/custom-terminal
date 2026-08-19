@@ -5,8 +5,7 @@ import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore } from '../../../store/useUIStore';
 import { generateAITitle } from '../../../utils/generateAITitle';
 import { usePromptsStore } from '../../../store/usePromptsStore';
-import { RotateCcw, Clock, ChevronDown, ChevronRight, ChevronLeft, User as UserIcon } from 'lucide-react';
-import ActionsPanel from './ActionsPanel';
+import { RotateCcw, Clock, ChevronDown, ChevronRight, ChevronLeft } from 'lucide-react';
 import CopySessionButton, { ClaudeSparkle } from '../CopySessionButton';
 import SessionActionChip from '../SessionActionChip';
 import { terminalRegistry } from '../../../utils/terminalRegistry';
@@ -38,34 +37,6 @@ interface InfoPanelProps {
   project?: Project;
 }
 
-
-// Module-scope so React reuses the DOM node across re-renders. Defining ChipText
-// inline inside the render body made every InfoPanel re-render create a new
-// component type → React allocated a fresh <button> node each time → trusted
-// clicks landed on a node that no longer existed by mouseup, so the synthetic
-// `click` event never fired (verified through MCP: pointerdown/up arrived, but
-// the post-pointerdown elementFromPoint returned a *different* BUTTON instance
-// at the same coords). Only User/Claude chips kept working because they were
-// raw <button> in JSX, not via inline component.
-const CHIP_ON = '#DA7756';
-const CHIP_OFF = '#555';
-const ChipText = ({ active, children, onClick, title, italic = false }:
-  { active: boolean; children: React.ReactNode; onClick: () => void; title: string; italic?: boolean }) => (
-  <button
-    onClick={onClick}
-    title={title}
-    className="cursor-pointer hover:opacity-80 transition-opacity"
-    style={{
-      background: 'transparent', border: 'none', padding: 0,
-      color: active ? CHIP_ON : CHIP_OFF,
-      fontSize: 9.5,
-      fontFamily: 'ui-monospace, SFMono-Regular, monospace',
-      fontStyle: italic ? 'italic' : 'normal',
-      lineHeight: 1.2,
-      letterSpacing: '-0.01em',
-    }}
-  >{children}</button>
-);
 
 export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [claudeSessionId, setClaudeSessionId] = useState<string | null>(null);
@@ -121,34 +92,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   const [isValidating, setIsValidating] = useState(false);
   const validationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { showToast, claudeDefaultPromptEnabled } = useUIStore();
-  // Live copy-flags — reactive so the markers row updates when user toggles in the popup.
-  const includeUser = useUIStore((s) => s.copyIncludeUser);
-  const includeClaude = useUIStore((s) => s.copyIncludeClaude);
-  const includeText = useUIStore((s) => s.copyIncludeText);
-  const includeThinking = useUIStore((s) => s.copyIncludeThinking);
-  const includeReading = useUIStore((s) => s.copyIncludeReading);
-  const includeEditing = useUIStore((s) => s.copyIncludeEditing);
-  const includeBash = useUIStore((s) => s.copyIncludeBash);
-  const includeTools = useUIStore((s) => s.copyIncludeTools);
-  const includeSubagentResult = useUIStore((s) => s.copyIncludeSubagentResult);
-  const includeSubagentHistory = useUIStore((s) => s.copyIncludeSubagentHistory);
-  const setCopyIncludeUser = useUIStore((s) => s.setCopyIncludeUser);
-  const setCopyIncludeClaude = useUIStore((s) => s.setCopyIncludeClaude);
-  const setCopyIncludeText = useUIStore((s) => s.setCopyIncludeText);
-  const setCopyIncludeThinking = useUIStore((s) => s.setCopyIncludeThinking);
-  const setCopyIncludeReading = useUIStore((s) => s.setCopyIncludeReading);
-  const setCopyIncludeEditing = useUIStore((s) => s.setCopyIncludeEditing);
-  const setCopyIncludeBash = useUIStore((s) => s.setCopyIncludeBash);
-  const setCopyIncludeTools = useUIStore((s) => s.setCopyIncludeTools);
-  const setCopyIncludeSubagentResult = useUIStore((s) => s.setCopyIncludeSubagentResult);
-  const setCopyIncludeSubagentHistory = useUIStore((s) => s.setCopyIncludeSubagentHistory);
-  const fromStart = useUIStore((s) => s.copyFromStart);
-  const setCopyFromStart = useUIStore((s) => s.setCopyFromStart);
-  // Sub-pill preferred mode — what the right-half displays when subagents are OFF.
-  // Lets the right-half stay clickable independently of the left ("sub-") toggle,
-  // so user can pre-select "full" before turning subagents on. When subagents are
-  // ON, the displayed label is derived from real flags, not this state.
-  const [subPreferred, setSubPreferred] = useState<'result' | 'full'>('result');
   const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const isHistoryOpen = activeTabId ? (historyPanelOpenTabs[activeTabId] ?? false) : false;
@@ -857,11 +800,6 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           </div>
         </div>
       )}
-
-      {/* КОМАНДЫ — moved to ProjectToolbar as a [📚 Docs] popover button. The
-          ActionsPanel (Update Docs / Update API → Haiku pipeline) is now reached
-          by clicking that button in the top toolbar instead of expanding the
-          section here. See Workspace/DocsButton.tsx. */}
 
       {hasGeminiSession && historyTurns.length > 0 && (
         <div className="mb-4">

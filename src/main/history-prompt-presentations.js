@@ -564,5 +564,6 @@ module.exports = {
   decorateHistoryPromptPresentations,
   normalizePromptPresentationSnapshot,
   promptTransportHash,
+  recoverManagedHistoryImageRefs,
   saveAuditedPromptPresentation,
 };

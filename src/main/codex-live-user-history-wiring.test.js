@@ -27,7 +27,14 @@ test('Codex user audit ownership is resolved before the live row is published', 
     1,
     'one rollout record must consume its audit at most once',
   );
-  assert.match(body, /\.\.\.\(promptOwner \? \{ promptOwner \} : \{\}\)/);
+  assert.match(
+    body,
+    /projectCodexLiveMessageForPublication\(state, record, liveMessage, \{[\s\S]{0,120}promptOwner/,
+  );
+  assert.match(
+    body,
+    /\.\.\.\(projected\.promptOwner \? \{ promptOwner: projected\.promptOwner \} : \{\}\)/,
+  );
 });
 
 test('Codex live and durable user rows share the exact rollout source identity', () => {
@@ -38,6 +45,26 @@ test('Codex live and durable user rows share the exact rollout source identity',
   );
   const audit = functionBody('processCodexUserMessagePasteAudit', 'processCodexSourceAuditOnlyText');
   assert.match(audit, /rememberCodexLivePromptOwner\(state, result\)/);
+});
+
+test('Codex live user carriers pair across watcher appends before publication', () => {
+  const project = functionBody(
+    'projectCodexLiveMessageForPublication',
+    'summarizeCodexTurnChunk',
+  );
+  assert.match(project, /state\.liveUserCarrierPairer\.accept\(\{/);
+  assert.match(project, /text: codexUserMessagePresentationText\(record\)/);
+  assert.match(project, /byteOffset: record\.__byteOffset/);
+  assert.match(project, /publish: carrierKind !== CODEX_LIVE_USER_RESPONSE_CARRIER/);
+
+  const body = functionBody('processCodexTurnLine', 'inferCodexBusyFromText');
+  assert.doesNotMatch(
+    body,
+    /responseUserRecord && !preferredResponseUserCarrier\)\s*\?\s*null/,
+    'a response carrier must reach the cross-append pairer even when its event is in this chunk',
+  );
+  assert.match(body, /for \(const projected of liveProjection\.projections\)/);
+  assert.match(body, /message: projected\.message/);
 });
 
 test('top-level compact publishes a lightweight exact-position History row', () => {

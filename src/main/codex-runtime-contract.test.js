@@ -7,6 +7,7 @@ const {
   attachCodexSettingsProofOwner,
   authorizeCodexServiceTierProofOwnerHandoff,
   codexLiveSlashAllowsTurnBusy,
+  codexSlashCommandAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
@@ -48,6 +49,17 @@ test('history action availability separates stopped history, idle Resume, confir
     canRewriteHistory: true,
     canDeleteHistory: true,
     reason: null,
+  });
+
+  assert.deepEqual(projectCodexHistoryActionAvailability({
+    liveLifecycle: false,
+    savedSessionId: 'metadata-only',
+    conversationMaterialized: false,
+  }), {
+    canNativeRewind: false,
+    canRewriteHistory: false,
+    canDeleteHistory: false,
+    reason: 'history-session-empty',
   });
 
   assert.deepEqual(projectCodexHistoryActionAvailability({
@@ -387,6 +399,25 @@ test('only the native FAST service-tier command is admitted during an active tur
   assert.equal(codexLiveSlashAllowsTurnBusy('fast'), false);
 });
 
+test('an owned History slash command may enter the provider queue without widening control-bar commands', () => {
+  assert.equal(codexSlashCommandAllowsTurnBusy({
+    command: '/status',
+    queuedHistoryCommand: true,
+  }), true);
+  assert.equal(codexSlashCommandAllowsTurnBusy({
+    command: '/compact',
+    queuedHistoryCommand: true,
+  }), true);
+  assert.equal(codexSlashCommandAllowsTurnBusy({
+    command: '/status',
+    queuedHistoryCommand: false,
+  }), false);
+  assert.equal(codexSlashCommandAllowsTurnBusy({
+    command: '/fast',
+    queuedHistoryCommand: false,
+  }), true);
+});
+
 test('first exact OSC command-start confirms the launch-preclaimed generation once', () => {
   assert.deepEqual(advanceOscCommandGeneration({
     runSeq: 13,
@@ -499,6 +530,32 @@ test('command launch settings restore both Resume and Fork from proven source se
     model: 'gpt-5.6-sol',
     effort: null,
     settingsSource: 'new-thread-without-conversation-only-effort',
+  });
+});
+
+test('metadata-only Resume uses new-thread settings without source turn context', () => {
+  assert.deepEqual(planCodexCommandLaunchSettings({
+    command: 'codex-c',
+    materializedFresh: true,
+    sourceSettingsStatus: 'absent',
+    model: 'gpt-5.6-terra',
+    effort: 'max',
+  }), {
+    allowed: true,
+    model: 'gpt-5.6-terra',
+    effort: 'max',
+    settingsSource: 'materialized-new-thread',
+  });
+  assert.deepEqual(planCodexCommandLaunchSettings({
+    command: 'codex-c',
+    materializedFresh: true,
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+  }), {
+    allowed: true,
+    model: 'gpt-5.6-sol',
+    effort: null,
+    settingsSource: 'materialized-new-thread-without-conversation-only-effort',
   });
 });
 

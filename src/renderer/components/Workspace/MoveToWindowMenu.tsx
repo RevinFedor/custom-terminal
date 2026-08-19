@@ -36,14 +36,33 @@ interface WindowCell {
   widthPct: number;
 }
 
-/** Строка меню + карта окон, которая появляется по наведению. */
+/**
+ * Что делает выбор окна.
+ *
+ * `move` — перенести НАЗВАННУЮ ВКЛАДКУ в конец полосы выбранного окна (пункт
+ * меню вкладки). `swap` — поменять местами два ОКНА целиком, со всеми их
+ * вкладками (пункт меню перегородки).
+ *
+ * Картинка одна и та же, потому что вопрос один и тот же: «какое окно». Разное
+ * — что произойдёт с выбранным, и это сказано подписями на самих прямоугольниках
+ * и тем, какое из них помечено как своё. Юзер про обмен: *«я нажимаю на эту
+ * кнопку, выбираю другое окно, и эти два окна меняются местами»*.
+ */
+export type WindowPickMode = 'move' | 'swap';
+
+/** Карта окон: наводишь на прямоугольник — выбрал окно. */
 export default function MoveToWindowMenu({
   projectId,
   tabId,
+  mode = 'move',
+  sourcePaneIndex = null,
   onDone,
 }: {
-  projectId: string;
-  tabId: string;
+  projectId?: string;
+  tabId?: string;
+  mode?: WindowPickMode;
+  /** Для обмена: окно, ОТКУДА меняем. Его прямоугольник помечен как своё. */
+  sourcePaneIndex?: number | null;
   onDone: () => void;
 }) {
   // Строковый отпечаток, не массив: селектор, возвращающий объекты, — новая
@@ -101,8 +120,15 @@ export default function MoveToWindowMenu({
   }, [windows]);
   const columnCount = columnWidths.length;
 
-  const moveTo = (target: WindowCell) => {
+  const pick = (target: WindowCell) => {
     const store = useWorkspaceStore.getState();
+    if (mode === 'swap') {
+      if (sourcePaneIndex === null || sourcePaneIndex === undefined) return;
+      store.swapSplitPanes(sourcePaneIndex, target.index);
+      onDone();
+      return;
+    }
+    if (!projectId || !tabId) return;
     if (store.splitPanes.length === 0) {
       // Разделения нет — единственное окно это центр, и его полоса живёт у
       // проекта. Тот же путь, что у двойного клика по шапке.
@@ -119,13 +145,18 @@ export default function MoveToWindowMenu({
   // Берём НОМЕР ОКНА (`index`), а не позицию в списке: список идёт в экранном
   // порядке, и как только он разойдётся с порядком хранения, сравнение начнёт
   // гасить чужой прямоугольник — тот, куда человек как раз и целился.
-  const homeIndex = windows.find((w) => w.tabs.some((e) => e.tabId === tabId))?.index ?? -1;
+  //
+  // При обмене «своё» — это окно, ОТКУДА меняем: поменять окно с самим собой
+  // нельзя, и прямоугольник должен об этом сказать, а не молча ничего не делать.
+  const homeIndex = mode === 'swap'
+    ? (sourcePaneIndex ?? -1)
+    : (windows.find((w) => w.tabs.some((e) => e.tabId === tabId))?.index ?? -1);
 
   return (
     <div className="p-2">
-      <div className="px-1 pb-2 text-[11px] text-[#888]">
-        Наведите на окно — вкладка встанет в конец его полосы
-      </div>
+      {/* Строки-объяснения здесь нет намеренно (юзер, 2026-08-18): картинка
+          повторяет раскладку на экране и читается без расшифровки, а подпись
+          пересказывала жест, который человек как раз и делает. */}
       <div
         data-move-to-window-map
         style={{
@@ -155,7 +186,9 @@ export default function MoveToWindowMenu({
                   type="button"
                   disabled={here}
                   data-move-to-window={w.index}
-                  title={here ? 'Вкладка уже в этом окне' : `Перенести в окно ${w.index + 1}`}
+                  title={mode === 'swap'
+                    ? (here ? 'Это и есть текущее окно' : `Поменять местами с окном ${w.index + 1}`)
+                    : (here ? 'Вкладка уже в этом окне' : `Перенести в окно ${w.index + 1}`)}
                   onMouseEnter={(e) => {
                     if (here) return;
                     (e.currentTarget as HTMLElement).style.borderColor = 'rgba(255,255,255,0.75)';
@@ -169,7 +202,7 @@ export default function MoveToWindowMenu({
                       ? 'rgba(255,255,255,0.03)'
                       : 'rgba(255,255,255,0.06)';
                   }}
-                  onClick={() => { if (!here) moveTo(w); }}
+                  onClick={() => { if (!here) pick(w); }}
                   style={{
                     // Доля высоты — с экрана. Фиксированная высота у всех и была
                     // тем самым враньём: окно во всю колонку рисовалось
@@ -203,7 +236,7 @@ export default function MoveToWindowMenu({
                     whiteSpace: 'nowrap',
                     maxWidth: '100%',
                   }}>
-                    {here ? 'вкладка здесь' : label}
+                    {here ? (mode === 'swap' ? 'это окно' : 'вкладка здесь') : label}
                   </span>
                 </button>
               );

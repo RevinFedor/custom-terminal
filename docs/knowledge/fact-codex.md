@@ -10,6 +10,21 @@ Codex поддержан как третий PTY-agent рядом с Claude и G
 
 Авторитетный session id Codex берётся не из PTY-вывода, а из первой записи `session_meta.payload.id` в rollout JSONL. Файлы лежат по датам: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Парсер обязан игнорировать битую последнюю строку: Codex пишет append-only JSONL во время работы, и в момент чтения хвост может быть неполным.
 
+Новая Codex-вкладка больше не живёт без session id до первого prompt. Main
+атомарно создаёт metadata-only rollout с одним `session_meta`, сразу закрепляет
+его UUID за вкладкой и запускает обычный `codex resume <UUID>`. Реальный Codex
+0.147 принимает такой файл без User-записи и без предварительной регистрации.
+Model/effort остаются launch intent и подтверждаются готовым TUI, а не самим
+фактом записи metadata. Процессная активность по-прежнему определяется
+OSC/process-tree proof и не выводится из UUID.
+
+History-режим «записать без ответа» использует тот же нативный rollout, без
+app-server: после доказанного Stop и проверки revision одним append добавляются
+`thread_settings_applied`, Responses `response_item(role=user)` и canonical
+`event_msg.user_message`. Это model-visible контекст без `turn/start`; затем тот
+же UUID открывается через Resume. Обычный Enter остаётся PTY-доставкой с
+post-Enter rollout-аудитом.
+
 Поиск сессии среди кандидатов не имеет права запускать full parser. Discovery читает ограниченный head до первой non-metadata записи (hard ceiling 512 KiB / 32 records) и не кладёт эти records в full-history cache. Шрам: до разделения discovery и parsing один boot разбирал 1.3–1.75 GB посторонних rollout-файлов лишь ради проверки `session_meta`. Exact filename suffix остаётся быстрым путём, content scan — bounded fallback. Ресурсный контракт: [`fact-transcript-сервис.md`](fact-transcript-сервис.md).
 
 Аргумент `codex resume <sourceId>` задаёт источник истории, но не доказывает, что запущенный Codex пишет в rollout с тем же id. Codex 0.145 реально встречается в двух режимах: либо дописывает source-файл на месте, либо создаёт child rollout с новым `session_meta.payload.id` и `forked_from_id=<sourceId>`. Прод-симптом второго варианта: Codex TUI показывает `Working`, а фиолетовый loader исчезает, context и Timeline/History остаются на source-файле. 2026-07-22 source `019f3d1a…` был так принят за writer, хотя живой ход писался в child `019f8a92…`.
@@ -21,6 +36,8 @@ Codex поддержан как третий PTY-agent рядом с Claude и G
 Готовый composer во время resume ещё не превращает source в writer, но завершает startup-loader и разрешает обычный ручной ввод. До первого submit обе copy-поверхности могут использовать exact idle read identity, не меняя writer-state. Перед первыми paste/Enter main ставит отдельный launch-scoped барьер read identity; неотправленная попытка снимает его, но после записанного Enter он переживает TTL временного prompt-сигнала и остаётся до causal source-vs-child resolution либо смены lifecycle. После durable adoption read identity становится точным writer child либо подтверждённым source-in-place. `inputReady`, read identity и `writerConfirmed` — независимые оси: mutation/API-команды всё ещё ждут writer, даже когда Copy уже безопасен.
 
 Ручной Enter и автоматическая отправка используют общий локальный порядок PTY-байтов, но не общий status-preflight. Ручной Enter записывается сразу и запускает наблюдение writer после write. Автоматический путь до paste отдельно защищается от чужого draft, затем пишет paste+Enter без промежуточного render-ACK и ждёт rollout `user_message`; это не превращает ручной жест в «одно launch-scoped действие» и не ставит process/session lookup перед клавишей.
+
+Standalone slash-команды Codex (`/status`, `/compact`, `/fast` и другие однострочные команды без attachments/chips) не являются conversation prompt: Codex может выполнить их, не записав `event_msg.user_message`. History поэтому отправляет их через отдельную TUI-транзакцию, которая сначала видит полную команду в текущем composer-фрейме, затем пишет Enter и помечает локальную строку `SENT` без обычного user-message audit. Во время активного ответа тот же History-путь может положить команду в нативную очередь; control-bar slash без queue остаётся запрещён, кроме собственного `/fast`-контракта. Многострочный текст или slash с вложениями остаётся обычным prompt и обязан получить transcript proof. `/compact` после submit дополнительно подтверждает operational lifecycle через `task_started` и terminal compact evidence; служебный `Conversation compacted` не является user-message carrier.
 
 Child rollout может скопировать сотни мегабайт source-истории и переписать её внешние timestamps так, будто все строки созданы сейчас. Поэтому `mtime`, внешний timestamp и последние 8 MiB не доказывают live-turn. Граница ищется по внутреннему `payload.started_at` относительно launch-time и хранится как физический byte offset.
 
@@ -118,7 +135,9 @@ Launch failure — часть того же shell boundary, а не состоя
 
 Текст на экране сам по себе не является текущим состоянием. Visible-buffer проверяется только по актуальному интерактивному кадру — suffix от активного или последнего line-leading composer'а, — поэтому старая строка `Starting MCP servers` выше уже готового input не блокирует readiness и не разрешает restart. Headless xterm применяет байты синхронизированной перерисовки раньше, чем Codex завершает кадр, поэтому main хранит последний полностью закрытый кадр: пока следующий кадр открыт, readiness/watchdog читают закрытую версию, а не промежуточно стёртую строку. На 15-секундной границе destructive recovery заново подтверждает тот же launch, watchdog, PTY/mirror generation, user-input generation, текущий MCP-blocker и отсутствие готового composer'а/in-flight prompt; более новый закрытый кадр допустим только если он всё ещё семантически показывает тот же blocker. Недоступный proof означает повторную ограниченную проверку и сохранение процесса, а replacement запускается только после подтверждённого успешного Stop; внутренний retry не публикует промежуточный `inactive` как новый пользовательский lifecycle.
 
-Поздний MCP-blocker может прийти уже после того, как Codex показал чистый composer и вкладка стала готовой. Первые сырые байты такого кадра только немедленно закрывают ввод и действия; они ещё не доказывают, что blocker действительно нарисован. Решение принимается после commit ровно этой записи в тот же main/headless terminal и только при совпадении terminal, lifecycle, run, input revision, launch, mirror и write sequence. Подтверждённый blocker снимает прежнюю готовность и запускает обычный watchdog, чистый committed composer возвращает готовность, переходный кадр остаётся закрытым до следующего commit, а устаревшее поколение отбрасывается. Во время этого ожидания нельзя сбрасывать process, writer/session ownership, модель, effort или FAST: меняется только право вводить текст.
+Поздний MCP-blocker может прийти уже после того, как Codex показал чистый composer и вкладка стала готовой. Первые сырые байты такого кадра временно закрывают только автоматические действия; они ещё не доказывают, что blocker действительно нарисован. Физическая клавиатура сильнее диагностического proof: любой user/unknown-origin input отменяет pending proof и прозрачно проходит в PTY, а terminal protocol reply не отменяет его. Решение по автоматике принимается после commit ровно этой записи в тот же main/headless terminal и только при совпадении terminal, lifecycle, run, input revision, launch, mirror и write sequence. Подтверждённый blocker снимает прежнюю готовность и запускает обычный watchdog; committed кадр без текущего MCP-blocker освобождает proof даже если app-owned `/model` временно держит slash help; устаревшее поколение отбрасывается. Во время этого ожидания нельзя сбрасывать process, writer/session ownership, модель, effort или FAST.
+
+Если settings-picker уже вставил точный `/model`, но pending proof остановил Enter, транзакция сначала ждёт исход того же committed MCP-кадра. При отсутствии текущего blocker она повторно доказывает неизменный `/model` и продолжает ровно одним Enter. При blocker/failure cleanup разрешён только когда свежий draft proof всё ещё дословно равен app-owned `/model`, а terminal/run/lifecycle/mirror/input identity не менялись; тогда один Ctrl+C очищает строку и пустота подтверждается повторно. Изменённый пользователем draft, новая generation или unknown proof не трогаются. Любой исход освобождает pending proof и PTY-operation — диагностический watcher не может стать модальным терминалом.
 
 Desktop-плашка является проекцией текущего lifecycle, а не накопителем старых диагнозов. Текущее `starting/active/inactive` Codex перезаписывает прежний timeout-error; красный вид разрешён только явному актуальному `startupFailed`. Сигнал ready/finished и завершение Claude startup-defaults gate инвалидируют уже запущенные presence-пробы, иначе поздний ответ старой проверки способен воскресить закрытый loader. Пользовательские симптомы нарушения одного класса: плашка исчезает и возвращается, готовый Codex внезапно получает `Terminal input did not become ready`, либо процесс визуально как будто запускается второй раз.
 
@@ -146,13 +165,28 @@ SSE-клиент должен считать turn завершённым тол�
 
 Первый Inbox-turn имеет отдельный watcher edge. Prompt может быть вставлен уже после `tui-ready`, но до того как rollout watcher обнаружил `session_meta` и создал turn-watcher. Поэтому paste audit для `codex:append-input` / external run стадируется до turn-watcher'а; когда session detection наконец приходит, turn-watcher стартует с `offset=0` только при pending audit и сразу делает catch-up scan по уже записанному `event_msg.user_message`. Без этого первый `/api/inbox/runs` мог физически отправить prompt и получить ответ в терминале, но API падал как `codex_turn_watcher_unavailable` / не мог доказать `done`. Не переносить offset=0 на обычный polling: он нужен как recovery только для pending audit первого turn'а.
 
-TTL launch-watcher'а — ограничение фонового наблюдателя, а не срок жизни готового Codex composer'а. Fresh Codex может простоять без первого prompt дольше TTL; rollout при этом ещё отсутствует, а будущий `session_meta.timestamp` сохраняет время запуска процесса, не время поздней отправки. Поэтому main хранит launch identity отдельно от активного watcher'а и перед каждым реальным submit переармирует discovery по исходной временной границе: общий контракт используют `codex:send-command`, `codex:append-input`, terminal MCP и ручной Enter. Renderer/xterm unmount не закрывает main-side Codex watcher — его lifecycle принадлежит PTY process exit/kill или успешной promotion в turn-watcher. Симптом нарушения: TUI реально работает, но desktop показывает `commandRunning=true, turnBusy=false, session=none`, а native получает пустую History.
+Metadata-only rollout существует до запуска TUI, поэтому app-created Fresh сразу
+имеет точный watcher/read identity и может простоять без первого prompt сколько
+угодно. Первый submit больше не занимается поиском session id: он только
+подтверждает, пишет ли Resume в source на месте или в новый child. Старый
+re-arm discovery остаётся только страховкой для вручную запущенного внешнего
+`codex`, который обошёл app-created materialization. Renderer/xterm unmount не
+закрывает main-side watcher — его lifecycle принадлежит PTY process exit/kill
+или writer handoff.
 
-## Инициализация внешнего Codex
+## Инициализация Codex
 
-Не использовать rollout JSONL как initialization API. Файлы `$CODEX_HOME/sessions/**/rollout-*.jsonl`, SQLite state и session indexes принадлежат Codex: ручное создание UUID/JSONL может пройти один раз и сломаться на следующем schema/metadata изменении. Для внешнего запуска интеграционные инструкции передаются поддержанными путями: `AGENTS.md`, profile config с `developer_instructions`, `-c` как fallback для коротких overrides, а в будущем — Codex SDK/app-server.
+Rollout не является произвольным внешним API. Разрешены только две узкие
+операции Noted Terminal, закреплённые тестами текущего Codex: metadata-only
+создание новой сессии и append user-context после доказанного Stop. UUID во
+всех полях и имени файла совпадает; создание идёт exclusive-create, append —
+по неизменной file revision и целой newline-границе. Копировать чужой rollout
+как шаблон или дописывать живому writer запрещено.
 
-Для Noted Terminal это значит: внешний системный prompt/контракт обёртки должен попасть в Codex profile до старта PTY, а не дописываться в rollout и не отправляться как скрытый user prompt после запуска. Если профиль записать нельзя, допустим `-c developer_instructions=...`; если и это невозможно, лучше честно запустить без override и отразить это в статусе, чем мутировать Codex-owned файлы.
+Системные инструкции по-прежнему передаются через `AGENTS.md`/profile
+`developer_instructions`; metadata-only rollout не содержит скрытого prompt и
+не расходует контекст модели. После обновления Codex этот контракт обязательно
+проверяется физическим `create → codex resume <UUID>` до изменения схемы.
 
 ## Timeline и History
 
@@ -165,6 +199,18 @@ Codex middle-history edit не требует app-server. Текущая мод�
 Project Terminal API использует тот же core для `/api/terminal-tabs/:tabId/edit-range` и `/api/terminal-tabs/:tabId/delete-range`, но это не desktop Timeline flow. Внешний клиент должен сам остановить Codex через `/stop`, дождаться `inactive`, передать границы диапазона, а после успешного ответа сам вызвать `/resume`: routes намеренно режут только inactive rollout и возвращают конфликт для active/stopping, чтобы не закрепить неполный turn. Успешная Codex-мутация создаёт `newSessionId`; web-server просит renderer adopt'нуть его в tab state (`adoptedSessionId`), иначе следующий resume продолжит старый rollout и внешне будет выглядеть как «API изменил историю, но чат открылся прежний».
 
 Delete Range использует тот же copy-on-write контракт, что Edit Range, но без replacement-записи. План строится по видимым Timeline-объектам: выбранный user-turn владеет зеркальной user-записью, assistant/reasoning/tool records и результатами инструментов до следующего turn; выбранный compact владеет своим compact record и companion marker. Из нового rollout исключаются все raw records этих владельцев, остальные сохраняют порядок. `compact` не является границей и не заставляет удалять префикс. Исходный файл остаётся неизменным даже для полного префикса или большого middle-range; результат всегда отдельная локальная сессия с `forked_from_id`. Новый rollout пишется последовательными порциями с exclusive-create, а не собирается целиком второй гигантской строкой в памяти; при ошибке недописанный файл удаляется, уже существующий файл не перезаписывается.
+
+Автоматически приложенный `# AGENTS.md/CLAUDE.md instructions …` — не
+отдельный пользовательский ход. В History он может оставаться видимым chip'ом,
+но получает координату следующего реального prompt; в Timeline отдельной точки
+нет, а Rewind/Delete на самом chip недоступны. При rewrite его raw
+`developer + instructions + turn_context` preamble принадлежит следующему
+canonical user-carrier. Иначе Timeline чеканит адресуемую точку без raw
+`turnKey`, и любой диапазон через неё падает `no exact rollout identity`.
+Аналогично paired image-carriers связываются общим точным image-aware matcher,
+а `compacted` удаляет свой `context_compacted` companion по семантической паре,
+не по расстоянию в строках: между ними законно стоят `world_state`,
+`turn_context` и `token_count`.
 
 `event_msg.token_count` питает **три** независимых потребителя, и каждый берёт своё поле — не путать: точки Timeline (выше), usage-чип лимитов (`payload.rate_limits`, см. `## Usage limits`) и живой контекст-метр в ControlBar (`info.last_token_usage.total_tokens / info.model_context_window`, канал `codex:context-update`, см. `fact-claude-control-bar.md::Context % bridge`). **Ловушка, заложенная в `contextPct` внутри самого `codex:get-timeline`:** он делит `total_token_usage.total_tokens` (кумулятив за всю сессию) на окно → на длинной сессии это десятки миллионов / 258k = тысячи процентов, клампится в вечные 100%. Это поле сейчас не рендерится в renderer (Timeline-метр контекста живёт в ControlBar по `last_token_usage`), поэтому баг латентный и не чинён — но при любом будущем выводе контекст-% из Timeline формулу `total_token_usage` копировать нельзя, правильный знаменатель-числитель — `last_token_usage` (последний запрос ≈ занятость окна, т.к. Codex каждый ход пере-отправляет всю историю).
 

@@ -96,3 +96,34 @@ test('кнопки внутри чипа ужаты именно в полосе
   assert.match(history, /\[data-history-composer-prompt-band\] \.hp-composer-chip-action \{\s*\n\s*width: 14px;/);
   assert.match(history, /\.hp-composer-chip-action \{\s*\n\s*width: 18px;/);
 });
+
+test('чип в полосе непрозрачный: переписка под ним не просвечивает', () => {
+  // Слой над рамкой сам по себе прозрачный, а под ним идёт переписка. Своего
+  // фона у чипа 13% плотности — замерено, сквозь него проходило 87% того, что
+  // под ним, и на светлой строке текста подпись чипа падала до контраста 1.28
+  // (нечитаемо). С непрозрачной подложкой — 8.85.
+  const rule = history.slice(
+    history.indexOf('[data-history-composer-prompt-band] .cb-composer-chip {'),
+    history.indexOf('[data-history-composer-prompt-band] .hp-composer-chip-action'),
+  );
+  assert.ok(rule.length > 0);
+
+  // Подложка берётся от рамки ввода тем же токеном, что и плашка состояния
+  // рядом: поменяется фон рамки — подложка поедет за ним, без второй правки.
+  assert.match(rule, /background-color: var\(--cb-composer-bg, #0f0f0f\);/);
+  assert.match(history, /background: 'var\(--cb-composer-bg, #0f0f0f\)'/,
+    'плашка состояния обязана держать тот же токен — иначе две подложки разойдутся');
+
+  // Свой цвет чипа ложится СВЕРХУ подложки, поэтому оттенок сохраняется.
+  assert.match(rule, /background-image: linear-gradient\(\s*\n\s*var\(--cb-composer-chip-prompt-bg\),/);
+
+  // Записи «два цвета через запятую» тут быть не может: в сокращённой записи
+  // фона несколько слоёв — это только изображения, цвет допустим лишь
+  // последним, и такую запись браузер отбрасывает ЦЕЛИКОМ. Поймано замером:
+  // чип оставался прозрачным, хотя правило выглядело верным.
+  assert.doesNotMatch(
+    rule,
+    /background:\s*\n\s*var\(--cb-composer-chip-prompt-bg\),/,
+    'сокращённая запись с двумя цветами не применяется вовсе',
+  );
+});

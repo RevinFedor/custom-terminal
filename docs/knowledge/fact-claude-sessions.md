@@ -57,8 +57,24 @@ Thinking mode при запуске обеспечивается `alwaysThinking
 - **Feedback:** Статус блокировки транслируется в Renderer через IPC `claude:ctrlc-danger-zone`.
 - **Подробнее:** См. `knowledge/fix-claude-ctrlc-exit.md`.
 
-## Prefilled Sessions (Documentation Update Flow)
-Механизм создания Claude сессии «извне» с предзаполненными сообщениями для Update API → Haiku пайплайна.
+## Prefilled Sessions (удалено)
+
+> Механизм создания Claude-сессии «извне» с предзаполненными сообщениями
+> (`claude:create-prefilled-session`) удалён 2026-08-18 вместе с пайплайном
+> обновления документации — см. [`fact-docs-update.md`](fact-docs-update.md).
+> Раздел сохранён: структура JSONL описана верно и пригодится, если такой
+> механизм понадобится снова.
+
+Это Claude-only свойство, не общий agent transcript API. Claude 2.1.234
+принимает обычную root/tip user-запись без `userType: external` и включает её в
+контекст следующего хода, не отвечая на неё при Resume. Поэтому режим History
+«записать без ответа» использует эту возможность только после доказанного Stop,
+проверки отсутствия другого владельца JSONL и неизменной file revision. После
+user-записи добавляется непустая app-owned assistant boundary из одного невидимого
+разделителя U+2063: Claude считает turn завершённым и не создаёт synthetic `No response requested.`,
+а History/Timeline/Copy скрывают только этот exact marker. Модель при этом не
+вызывается. Затем сессия открывается через Resume и остаётся idle. Обычная отправка по
+Enter по-прежнему идёт через PTY + post-Enter audit; эти контракты не смешиваются.
 
 ### JSONL Structure
 При создании prefilled сессии в JSONL записываются 2 записи:

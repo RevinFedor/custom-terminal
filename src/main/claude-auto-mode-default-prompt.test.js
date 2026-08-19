@@ -125,8 +125,8 @@ test('main wires the modal through current-frame proof and selects keep bypass',
   assert.match(handler, /'\\r',[\s\S]{0,80}'confirm-keep-bypass'/);
   assert.match(handler, /expectedTerm\.write\(data\)/);
   assert.doesNotMatch(handler, /safePasteAndSubmit/);
-  assert.match(main, /!autoModeDefaultPromptHint[\s\S]{0,180}!claudePromptReady\.has/);
-  assert.match(main, /currentState === 'WAITING_PROMPT'[\s\S]{0,120}!autoModeDefaultPromptHint/);
+  assert.match(main, /!onboardingPromptHint[\s\S]{0,180}!claudePromptReady\.has/);
+  assert.match(main, /currentState === 'WAITING_PROMPT'[\s\S]{0,120}!onboardingPromptHint/);
   assert.match(main, /cancelled false prompt debounce/);
   assert.match(handler, /hint disproven by current composer/);
   assert.match(handler, /publishClaudePromptReady\(tabId, 'auto-mode onboarding dismissed'\)/);

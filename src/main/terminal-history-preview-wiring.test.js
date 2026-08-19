@@ -76,6 +76,8 @@ test('canonical transcript records are observed before provisional text is retir
   assert.match(mainSource, /observeTerminalHistoryCanonicalLiveMessage\(liveDetail\)/);
   assert.match(mainSource, /sourceEndOffset: detail\.recordEndByteOffset/);
   assert.match(mainSource, /canonicalText: text/);
+  assert.match(mainSource, /semanticItemId: message\?\.semanticItemId \|\| null/);
+  assert.match(mainSource, /semanticItemId: typeof payload\.id === 'string' \? payload\.id : null/);
   assert.match(mainSource, /terminalHistoryStructuredBoundaryKind/);
   assert.match(mainSource, /terminalHistoryStructuredProofTexts/);
   assert.match(mainSource, /structuredTexts/);

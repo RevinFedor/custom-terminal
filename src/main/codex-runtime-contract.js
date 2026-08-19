@@ -300,7 +300,19 @@ function planCodexCommandLaunchSettings({
   sourceSettingsStatus = 'absent',
   sourceModel = null,
   sourceEffort = null,
+  materializedFresh = false,
 } = {}) {
+  if (command === 'codex-c' && materializedFresh === true) {
+    const normalizedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+    return {
+      allowed: true,
+      model: model || null,
+      effort: normalizedEffort === 'ultra' ? null : (effort || null),
+      settingsSource: normalizedEffort === 'ultra'
+        ? 'materialized-new-thread-without-conversation-only-effort'
+        : 'materialized-new-thread',
+    };
+  }
   if (command === 'codex-c' && preferRequestedSettings === true) {
     const requestedModel = typeof model === 'string' ? model.trim() : '';
     const requestedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
@@ -606,6 +618,13 @@ function validateCodexPickerRuntimeAdmission({
 
 function codexLiveSlashAllowsTurnBusy(command) {
   return /^\/fast$/i.test(String(command || '').trim());
+}
+
+function codexSlashCommandAllowsTurnBusy({
+  command,
+  queuedHistoryCommand = false,
+} = {}) {
+  return codexLiveSlashAllowsTurnBusy(command) || queuedHistoryCommand === true;
 }
 
 function attachCodexSettingsProofOwner(result, currentWriterSessionId = null) {
@@ -1048,10 +1067,11 @@ function projectCodexRuntimeStatus({
   // already established. It is not a new process launch: keep the visible
   // lifecycle active while input/action admission remains false.
   if (inputProofPending === true && composerEstablished === true) return 'active';
-  // Readiness and transcript identity are separate axes. A fresh Codex run has
-  // no rollout/session id until its first user message, but once the current
-  // PTY generation has a real composer it is no longer "starting". Identity-
-  // dependent actions stay gated by writerUsableForMutation/canCopySessionId.
+  // Readiness and writer identity are separate axes. App-created Fresh already
+  // owns a metadata-only session id, but that still does not prove which
+  // rollout the live process will write after its first user message. Once the
+  // current PTY generation has a real composer it is no longer "starting";
+  // mutations remain gated by writerUsableForMutation.
   if (liveLifecycle === true && inputReady) return 'active';
   // A fallible lookup may revoke identity without erasing an already-proven
   // visual lifecycle. This branch never restores the public session ID.
@@ -1069,15 +1089,22 @@ function projectCodexHistoryActionAvailability({
   promptOrTurnInFlight = false,
   writerUsableForMutation = false,
   provisionalResumeAvailable = false,
+  conversationMaterialized = true,
 } = {}) {
-  const hasSavedHistory = typeof savedSessionId === 'string' && savedSessionId.trim().length > 0;
+  const hasSavedHistory = conversationMaterialized === true
+    && typeof savedSessionId === 'string'
+    && savedSessionId.trim().length > 0;
   if (liveLifecycle === false) {
     const allowed = hasSavedHistory;
     return {
       canNativeRewind: allowed,
       canRewriteHistory: allowed,
       canDeleteHistory: allowed,
-      reason: allowed ? null : 'history-session-missing',
+      reason: allowed
+        ? null
+        : conversationMaterialized === false
+          ? 'history-session-empty'
+          : 'history-session-missing',
     };
   }
   if (liveLifecycle !== true) {
@@ -1110,6 +1137,14 @@ function projectCodexHistoryActionAvailability({
       canRewriteHistory: false,
       canDeleteHistory: false,
       reason: 'composer-not-ready',
+    };
+  }
+  if (conversationMaterialized === false) {
+    return {
+      canNativeRewind: false,
+      canRewriteHistory: false,
+      canDeleteHistory: false,
+      reason: 'history-session-empty',
     };
   }
   const confirmedWriter = writerUsableForMutation === true;
@@ -1182,6 +1217,7 @@ module.exports = {
   authorizeCodexServiceTierProofOwnerHandoff,
   attachCodexSettingsProofOwner,
   codexLiveSlashAllowsTurnBusy,
+  codexSlashCommandAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,

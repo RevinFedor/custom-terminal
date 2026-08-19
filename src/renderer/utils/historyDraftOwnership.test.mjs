@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   interruptedPromptDraftMatchesHandoff,
   mergeFailedHistoryAuthoringSnapshot,
+  mergeFailedHistoryAuthoringSnapshots,
   resolveInterruptedPromptOwnership,
 } from './historyDraftOwnership.mjs';
 
@@ -111,4 +112,16 @@ test('raw whitespace is preserved while only the missing draft boundary is inser
   });
 
   assert.equal(result.text, 'old \n\nnew');
+});
+
+test('cascade rollback restores A B C before a newer unsent D', () => {
+  const restored = mergeFailedHistoryAuthoringSnapshots({
+    currentText: 'D',
+    snapshots: [
+      { text: 'A' },
+      { text: 'B' },
+      { text: 'C' },
+    ],
+  });
+  assert.equal(restored.text, 'A\n\nB\n\nC\n\nD');
 });

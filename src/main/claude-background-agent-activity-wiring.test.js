@@ -28,6 +28,7 @@ test('Claude background activity is observed in main before History filtering', 
 test('tab loader hydrates main-owned background state and ignores History mount state', () => {
   assert.match(main, /ipcMain\.handle\('agent:list-background-work'/);
   assert.match(main, /tabBackgroundWorkRevisionByTab\.get\(tabId\)/);
+  assert.match(main, /agents:\s*getTabBackgroundWorkAgents\(tabId\)/);
   assert.match(tabBar, /ipcRenderer\.invoke\('agent:list-background-work', \{ tabIds \}\)/);
   assert.match(tabBar, /useRef<Map<string, number>>\(new Map\(\)\)/);
   assert.match(tabBar, /acceptTabBackgroundWorkRecord/);

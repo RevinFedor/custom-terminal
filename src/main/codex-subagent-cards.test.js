@@ -378,3 +378,21 @@ test('subagent_notification for an unknown agent is a no-op', () => {
   );
   assert.equal(handled, false);
 });
+
+test('terminal child evidence freezes the exact elapsed duration', () => {
+  const tracker = createCodexSubagentTracker();
+  const card = tracker.registerSpawn({
+    callId: 'call_timed',
+    toolName: 'spawn_agent',
+    namespace: 'collaboration',
+    timestamp: '2026-08-18T20:07:32.000Z',
+    args: { task_name: 'timed' },
+  });
+  tracker.onAgentMessage({
+    author: '/root/timed',
+    content: 'Message Type: FINAL_ANSWER\nPayload:\ndone',
+  }, (value) => String(value), '2026-08-18T20:12:42.000Z');
+  assert.equal(card.subagentStatus, 'completed');
+  assert.equal(card.durationMs, 310_000);
+  assert.equal(card.completedAt, Date.parse('2026-08-18T20:12:42.000Z'));
+});

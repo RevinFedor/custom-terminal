@@ -1,0 +1,62 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  inspectClaudeTrustFolderPromptSnapshot,
+  looksLikeClaudeTrustFolderPromptHintText,
+  looksLikeClaudeTrustFolderPromptText,
+} = require('./claude-trust-folder-state');
+
+const prompt = [
+  'Accessing workspace:',
+  '/Users/fedor/Desktop/sc-desktop',
+  'Quick safety check: Is this a project you created or one you trust?',
+  "Claude Code'll be able to read, edit, and execute files here.",
+  'Security guide',
+  '❯ 1. Yes, I trust this folder',
+  '  2. No, exit',
+];
+
+test('recognizes the complete Claude folder trust prompt with Yes selected', () => {
+  assert.equal(looksLikeClaudeTrustFolderPromptText(prompt.join('\n')), true);
+  assert.deepEqual(inspectClaudeTrustFolderPromptSnapshot({
+    success: true,
+    lines: prompt.map((text) => ({ text })),
+  }), {
+    visible: true,
+    selectedOption: 1,
+    reason: 'trust-prompt-visible',
+  });
+});
+
+test('does not auto-confirm when No is selected or selection is unproven', () => {
+  const noSelected = prompt.map((line) => line
+    .replace('❯ 1.', '  1.')
+    .replace('  2. No', '❯ 2. No'));
+  assert.equal(inspectClaudeTrustFolderPromptSnapshot({
+    success: true,
+    lines: noSelected.map((text) => ({ text })),
+  }).selectedOption, 2);
+  assert.equal(inspectClaudeTrustFolderPromptSnapshot({
+    success: true,
+    lines: prompt.map((text) => ({ text: text.replace('❯ 1.', '  1.') })),
+  }).selectedOption, null);
+});
+
+test('a quoted option or partial prompt is never actionable', () => {
+  assert.equal(looksLikeClaudeTrustFolderPromptText('❯ 1. Yes, I trust this folder'), false);
+  assert.equal(inspectClaudeTrustFolderPromptSnapshot({
+    success: true,
+    lines: [{ text: 'User said: Quick safety check and 1. Yes, I trust this folder' }],
+  }).visible, false);
+});
+
+test('the unique safety-check title blocks readiness before the whole menu arrives', () => {
+  assert.equal(looksLikeClaudeTrustFolderPromptHintText(
+    'Quick safety check: Is this a project you created or one you trust?',
+  ), true);
+  assert.equal(looksLikeClaudeTrustFolderPromptText(
+    'Quick safety check: Is this a project you created or one you trust?',
+  ), false);
+});

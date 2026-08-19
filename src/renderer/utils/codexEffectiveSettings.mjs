@@ -43,7 +43,9 @@ export function planCodexLaunchSettingsPersistence({
   result,
   payload,
 } = {}) {
-  const isFreshLaunch = typeof command === 'string' && command.trim() === 'codex';
+  const normalizedCommand = typeof command === 'string' ? command.trim() : '';
+  const isFreshLaunch = normalizedCommand === 'codex'
+    || (normalizedCommand === 'codex-c' && payload?.materializedFresh === true);
   const wasAccepted = result?.success !== false && result?.accepted !== false;
   if (!isFreshLaunch || !wasAccepted) return null;
 

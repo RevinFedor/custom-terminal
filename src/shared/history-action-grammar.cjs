@@ -30,6 +30,13 @@ const BASH_SEARCH_WORDS = new Set([
   'whereis', 'locate', 'ag',
 ]);
 
+// Shell HTTP clients are still COMMANDS. Keep the vocabulary exported for
+// consumers that need to recognise the program, but never promote curl/wget
+// to the provider-owned Web family: they are commonly local API probes.
+const BASH_WEB_WORDS = new Set(['curl', 'wget', 'http', 'https', 'httpie']);
+const BASH_EDIT_WORDS = new Set(['cp', 'mv', 'rm', 'touch', 'truncate']);
+const BASH_REDIRECT_EDIT_WORDS = new Set(['cat', 'echo', 'printf', 'tee']);
+
 /**
  * The literal first token misleads in a quarter of real commands (`cd X && …`,
  * `P=/path node …`, leading `echo` banners). Walk past those wrappers to the
@@ -129,6 +136,52 @@ function pythonEditInfo(command, word) {
   return { isEdit, target };
 }
 
+function shellEditInfo(command, word) {
+  const python = pythonEditInfo(command, word);
+  const isEphemeralTarget = (target) => /^\/?tmp\//.test(String(target || '').replace(/^\.\//, ''));
+  if (python.isEdit) return isEphemeralTarget(python.target) ? { isEdit: false, target: '' } : python;
+  const text = String(command || '');
+  const actingWord = String(word || effectiveBashWord(text)).toLowerCase();
+  const targetFromArguments = () => {
+    const stage = splitShellStages(text).find((candidate) => {
+      const first = tokenizeCommand(candidate)[0] || '';
+      return (String(first).split('/').pop() || '').toLowerCase() === actingWord;
+    }) || text;
+    return tokenizeCommand(stage).slice(1).reverse().find(looksLikePath) || '';
+  };
+
+  if (BASH_EDIT_WORDS.has(actingWord)) {
+    const target = targetFromArguments();
+    return isEphemeralTarget(target) ? { isEdit: false, target: '' } : { isEdit: true, target };
+  }
+  if (actingWord === 'sed' && /(?:^|\s)(?:--in-place(?:=\S*)?|-[A-Za-z]*i[^\s]*)(?=\s|$)/.test(text)) {
+    const target = targetFromArguments();
+    return isEphemeralTarget(target) ? { isEdit: false, target: '' } : { isEdit: true, target };
+  }
+  if (actingWord === 'perl' && /(?:^|\s)-[A-Za-z]*i[^\s]*(?=\s|$)/.test(text)) {
+    const target = targetFromArguments();
+    return isEphemeralTarget(target) ? { isEdit: false, target: '' } : { isEdit: true, target };
+  }
+  if (actingWord === 'tee') {
+    const target = targetFromArguments();
+    if (target && !isEphemeralTarget(target)) return { isEdit: true, target };
+  }
+
+  const firstToken = tokenizeCommand(firstShellStage(text))[0] || '';
+  const redirectOwner = actingWord || (String(firstToken).split('/').pop() || '').toLowerCase();
+  if (!BASH_REDIRECT_EDIT_WORDS.has(redirectOwner)) return { isEdit: false, target: '' };
+  const redirect = /(^|[\s;|&])(\d*)>>?\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g;
+  let match;
+  while ((match = redirect.exec(text)) !== null) {
+    if (match[2] && match[2] !== '1') continue;
+    const target = String(match[3] || match[4] || match[5] || '');
+    if (!target || target.startsWith('&') || /^\/dev\/(?:null|stdout|stderr)$/.test(target)) continue;
+    if (isEphemeralTarget(target)) continue;
+    return { isEdit: true, target };
+  }
+  return { isEdit: false, target: '' };
+}
+
 /**
  * mcp__server__method → { server, method }. The method drops a repeated
  * server prefix (`electron__electron_evaluate` reads as `evaluate`).
@@ -167,8 +220,8 @@ function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } = {}) {
   switch (name) {
     case 'Bash': {
       const word = effectiveBashWord(args?.command);
-      const pythonEdit = pythonEditInfo(args?.command, word);
-      if (pythonEdit.isEdit) return { family: 'edit', bashWord: word || undefined };
+      const shellEdit = shellEditInfo(args?.command, word);
+      if (shellEdit.isEdit) return { family: 'edit', bashWord: word || undefined };
       const family = bashFamily(word);
       // Git subcommand (diff/status/push…) — the collapsed-group digest for
       // the git family; repeating the word "git" both in the verb and the
@@ -188,6 +241,7 @@ function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } = {}) {
     case 'Edit':
     case 'Write':
     case 'MultiEdit':
+    case 'Update':
     // A patch that never applied (Codex: the script building it crashed).
     // It touched no file, so it must not claim one — but it IS an attempt to
     // change files, and leaving it in `other` kept it out of every block, so
@@ -667,10 +721,10 @@ function historyActionHeadline({ toolName, args, family, bashWord, bashDetail, m
   if (name === 'Bash') {
     const command = typeof args?.command === 'string' ? args.command : '';
     const word = bashWord || effectiveBashWord(command);
-    const pythonEdit = pythonEditInfo(command, word);
-    const fam2 = fam || (pythonEdit.isEdit ? 'edit' : bashFamily(word));
+    const shellEdit = shellEditInfo(command, word);
+    const fam2 = fam || (shellEdit.isEdit ? 'edit' : bashFamily(word));
     if (fam2 === 'edit') {
-      return { verb: 'Edit', subject: historyDisplayPath(pythonEdit.target), detail: '' };
+      return { verb: 'Edit', subject: historyDisplayPath(shellEdit.target), detail: '' };
     }
     const { subject, detail } = extractBashSubject(command, fam2, word);
     if (fam2 === 'git') {
@@ -693,6 +747,7 @@ function historyActionHeadline({ toolName, args, family, bashWord, bashDetail, m
         detail: historyDisplayPath(detail),
       };
     }
+    if (fam2 === 'web') return { verb: 'Web', subject: word || 'request', detail: '' };
     // A plain run: the SHORT form of the command — the program plus its first
     // meaningful argument (`npm run build`, `node scripts/x.js`). The literal
     // pipeline belongs in the expanded body only: a `printf … | rg … | sort`
@@ -744,7 +799,7 @@ function historyActionPresentationMeta({ toolName, args, family, bashWord, bashD
     const command = typeof args?.command === 'string' ? args.command : '';
     const word = bashWord || classified.bashWord || effectiveBashWord(command);
     rawPathTarget = fam === 'edit'
-      ? String(pythonEditInfo(command, word).target || '')
+      ? String(shellEditInfo(command, word).target || '')
       : String(extractBashSubject(command, fam, word).subject || '');
   }
   if (fam === 'search') {
@@ -795,6 +850,8 @@ function historyActionPresentationMeta({ toolName, args, family, bashWord, bashD
 module.exports = {
   BASH_READ_WORDS,
   BASH_SEARCH_WORDS,
+  BASH_EDIT_WORDS,
+  BASH_WEB_WORDS,
   FAMILY_LABELS,
   HISTORY_CAPTION_MAX_CHARS,
   bashFamily,

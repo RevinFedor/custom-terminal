@@ -66,11 +66,25 @@ function extractCollabFinalAnswer(text) {
   return value.slice(value.indexOf('\n', payloadIndex) + 1).trim();
 }
 
+function timestampMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function createCodexSubagentTracker() {
   const cardByCallId = new Map();
   const cardByAgentKey = new Map();
 
-  const setStatus = (card, status) => {
+  const stampTerminalTiming = (card, observedAt) => {
+    const completedAt = timestampMs(observedAt);
+    if (!completedAt) return;
+    card.completedAt = completedAt;
+    if (Number(card.startedAt) > 0) {
+      card.durationMs = Math.max(0, completedAt - Number(card.startedAt));
+    }
+  };
+  const setStatus = (card, status, observedAt = null) => {
     if (!card) return;
     // Terminal states are monotonic: a late "interacted" activity replayed
     // from catch-up must not resurrect a completed card as running.
@@ -81,6 +95,9 @@ function createCodexSubagentTracker() {
     if (card.spawnRejected) return;
     card.subagentStatus = status;
     card.description = card.baseDescription + statusSuffix(status);
+    if (status === 'completed' || status === 'interrupted') {
+      stampTerminalTiming(card, observedAt);
+    }
   };
   const statusSuffix = (status) => {
     if (status === 'running') return ' · running';
@@ -99,6 +116,7 @@ function createCodexSubagentTracker() {
         baseDescription,
         description: baseDescription + ' · running',
         subagentStatus: 'running',
+        startedAt: timestampMs(call?.timestamp),
       };
       if (card.toolUseId) cardByCallId.set(card.toolUseId, card);
       // v2 task_name maps to agent_path `/root/<task_name>`; register both.
@@ -130,7 +148,7 @@ function createCodexSubagentTracker() {
      * Identity presence is the structural test; error phrases are only used
      * as the human-readable reason, never as the detector.
      */
-    attachSpawnOutput(callId, outputPayload) {
+    attachSpawnOutput(callId, outputPayload, observedAt = null) {
       const card = cardByCallId.get(String(callId || ''));
       if (!card) return;
       const output = parseMaybeJson(outputPayload);
@@ -148,6 +166,7 @@ function createCodexSubagentTracker() {
         card.subagentStatus = 'interrupted';
         card.description = card.baseDescription + ' · не запущен';
         card.result = reason || 'Запуск агента отклонён.';
+        stampTerminalTiming(card, observedAt);
         return;
       }
       if (agentId) {
@@ -164,7 +183,7 @@ function createCodexSubagentTracker() {
     },
 
     /** v2 sub_agent_activity event: exact link spawn call → child rollout. */
-    onSubAgentActivity(payload = {}) {
+    onSubAgentActivity(payload = {}, observedAt = null) {
       const eventId = String(payload.event_id || '').trim();
       const agentPath = String(payload.agent_path || '').trim();
       const threadId = String(payload.agent_thread_id || '').trim();
@@ -178,11 +197,11 @@ function createCodexSubagentTracker() {
         cardByAgentKey.set(threadId, card);
       }
       if (kind === 'started' || kind === 'interacted') setStatus(card, 'running');
-      else if (kind === 'interrupted') setStatus(card, 'interrupted');
+      else if (kind === 'interrupted') setStatus(card, 'interrupted', observedAt);
     },
 
     /** v2 agent_message response_item: FINAL_ANSWER carries the result. */
-    onAgentMessage(payload = {}, extractTextContent) {
+    onAgentMessage(payload = {}, extractTextContent, observedAt = null) {
       const author = String(payload.author || '').trim();
       if (!author) return false;
       const card = cardByAgentKey.get(author);
@@ -195,6 +214,7 @@ function createCodexSubagentTracker() {
         card.result = finalAnswer;
         card.subagentStatus = 'completed';
         card.description = card.baseDescription;
+        stampTerminalTiming(card, observedAt);
         return true;
       }
       // Interim MESSAGE payloads are encrypted — count them as activity only.
@@ -211,7 +231,7 @@ function createCodexSubagentTracker() {
      * ever arrived, and the chip climbed to 4m+ as running. Returns true
      * when a card consumed the notification.
      */
-    onSubagentNotification(text) {
+    onSubagentNotification(text, observedAt = null) {
       const value = String(text || '');
       if (!value.includes('<subagent_notification>')) return false;
       const body = (value.match(/<subagent_notification>([\s\S]*?)<\/subagent_notification>/) || [])[1]
@@ -225,9 +245,10 @@ function createCodexSubagentTracker() {
           card.result = status.completed;
           card.subagentStatus = 'completed';
           card.description = card.baseDescription;
+          stampTerminalTiming(card, observedAt);
           handled = true;
         } else if (status.interrupted !== undefined || status.errored !== undefined) {
-          setStatus(card, 'interrupted');
+          setStatus(card, 'interrupted', observedAt);
           handled = true;
         }
       };
@@ -252,9 +273,10 @@ function createCodexSubagentTracker() {
           }
           card.subagentStatus = 'completed';
           card.description = card.baseDescription;
+          stampTerminalTiming(card, observedAt);
           handled = true;
         } else if (/interrupted|errored/i.test(body)) {
-          setStatus(card, 'interrupted');
+          setStatus(card, 'interrupted', observedAt);
           handled = true;
         }
       }
@@ -266,7 +288,7 @@ function createCodexSubagentTracker() {
      * cards. Returns true when the output was absorbed (no separate card
      * needed for the control call).
      */
-    absorbControlOutput(call, outputPayload) {
+    absorbControlOutput(call, outputPayload, observedAt = null) {
       if (!isCodexSubagentControlCall(call)) return false;
       const name = String(call?.toolName || '');
       const output = parseMaybeJson(outputPayload);
@@ -287,6 +309,9 @@ function createCodexSubagentTracker() {
         if (card && !card.spawnRejected) {
           card.subagentStatus = 'running';
           card.description = card.baseDescription + ' · running';
+          card.startedAt = timestampMs(call?.timestamp) || timestampMs(observedAt) || card.startedAt;
+          delete card.completedAt;
+          delete card.durationMs;
           absorbed = true;
         }
       } else if (name === 'wait_agent') {
@@ -301,6 +326,7 @@ function createCodexSubagentTracker() {
               card.result = completed;
               card.subagentStatus = 'completed';
               card.description = card.baseDescription;
+              stampTerminalTiming(card, observedAt);
             }
           }
         }
@@ -327,11 +353,13 @@ function createCodexSubagentTracker() {
             card.result = completed;
             card.subagentStatus = 'completed';
             card.description = card.baseDescription;
+            stampTerminalTiming(card, observedAt);
           } else if (card.subagentStatus !== 'completed') {
             // Closed without its own result: terminal, but not a success.
             card.subagentStatus = 'interrupted';
             card.description = card.baseDescription + ' · закрыт';
             if (!card.result) card.result = 'Агент закрыт до завершения задачи.';
+            stampTerminalTiming(card, observedAt);
           }
         }
         absorbed = !!card;
@@ -355,6 +383,10 @@ function createCodexSubagentTracker() {
 
     hasCards() {
       return cardByCallId.size > 0;
+    },
+
+    allCards() {
+      return [...cardByCallId.values()];
     },
 
     /**

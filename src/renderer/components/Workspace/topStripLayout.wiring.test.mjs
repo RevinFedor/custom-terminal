@@ -150,17 +150,51 @@ test('кнопка индекса в узком ряду показывает с
   assert.match(semantic, /\{!compact && <span style=\{\{ color: '#22c55e' \}\}>\{status\.fresh\}<\/span>\}/);
 });
 
-test('полоска Run after стоит ВЫШЕ бокового окна, а не под ним', () => {
-  // Она перестала отходить влево при открытии бокового окна — уступать место
-  // окну, которое закрывается одной клавишей, ей нечего. Но на прежнем слое
-  // это означало не «стоит на месте», а «спряталась под ним».
-  const host = workspace.slice(workspace.indexOf('data-workspace-prompt-queue-host'));
-  const style = host.slice(0, host.indexOf('/>'));
-  const hostZ = Number((style.match(/zIndex: (\d+)/) || [])[1]);
+test('полоска Run after стоит ВЫШЕ бокового окна — в ОБЕИХ раскладках', () => {
+  // Она перестала отходить в сторону при открытии бокового окна — уступать
+  // место окну, которое закрывается одной клавишей, ей нечего. Но на слое ниже
+  // это означает не «стоит на месте», а «спряталась под ним».
+  //
+  // Раскладок две, и раньше проверялась только одиночная: в режиме панелей своя
+  // копия полоски осталась под боковым окном той же панели. Правило одно на обе,
+  // поэтому и читаются обе — иначе следующая раскладка снова разойдётся молча.
+  const zOf = (source, marker) => {
+    const at = source.indexOf(marker);
+    assert.ok(at > 0, `не найдено: ${marker}`);
+    const style = source.slice(at, source.indexOf('/>', at));
+    return Number((style.match(/zIndex: (\d+)/) || [])[1]);
+  };
+
   const frame = readRepo('src/renderer/components/Workspace/FloatingTerminalFrame.tsx');
-  const panelZ = Number((frame.match(/zIndex: floating \? (\d+)/) || [])[1]);
-  assert.ok(Number.isFinite(hostZ) && Number.isFinite(panelZ));
-  assert.ok(hostZ > panelZ, `полоска (${hostZ}) должна быть выше бокового окна (${panelZ})`);
+  // Боковой ТЕРМИНАЛ — одна рама на обе раскладки.
+  const sideTerminalZ = Number((frame.match(/zIndex: floating \? (\d+)/) || [])[1]);
+  assert.ok(Number.isFinite(sideTerminalZ));
+
+  const singleHostZ = zOf(workspace, 'data-workspace-prompt-queue-host');
+  assert.ok(
+    singleHostZ > sideTerminalZ,
+    `одиночный режим: полоска (${singleHostZ}) должна быть выше бокового окна (${sideTerminalZ})`,
+  );
+
+  const pane = read('SplitPaneSurface.tsx');
+  const paneHostZ = zOf(pane, 'data-split-pane-queue-host');
+  // Боковой ЧАТ панели — второй возможный сосед по слоту ⌘]. Открывается тем же
+  // жестом, и ответ «кто кого закрывает» обязан быть тем же.
+  const paneSideHistoryZ = zOf(pane, 'data-split-pane-side-history');
+  assert.ok(
+    paneHostZ > sideTerminalZ,
+    `режим панелей: полоска (${paneHostZ}) должна быть выше бокового терминала (${sideTerminalZ})`,
+  );
+  assert.ok(
+    paneHostZ > paneSideHistoryZ,
+    `режим панелей: полоска (${paneHostZ}) должна быть выше бокового чата (${paneSideHistoryZ})`,
+  );
+
+  // Рамка окна панели остаётся выше всего: граница не должна прерываться тем,
+  // что внутри неё лежит.
+  const chrome = readRepo('src/renderer/components/Workspace/SplitPaneChrome.tsx');
+  const frameZ = Number((chrome.match(/SPLIT_PANE_FOCUS_FRAME_Z = (\d+)/) || [])[1]);
+  assert.ok(frameZ > paneHostZ, `рамка окна (${frameZ}) должна оставаться выше полоски (${paneHostZ})`);
 });
 
 test('кнопки шапки отвечают на курсор — все, а не через одну', () => {
@@ -183,9 +217,6 @@ test('кнопки инструментов боковой панели той �
   const row = read('SidebarToolsRow.tsx');
   assert.match(row, /height: 26,/);
   assert.match(row, /fontSize: 11,/);
-  const docs = read('DocsButton.tsx');
-  assert.match(docs, /height: 26,/);
-  assert.match(docs, /fontSize: 11,/);
   // Кнопка индекса живёт в том же ряду и обязана совпадать с соседями.
   const semantic = read('SemanticIndexButton.tsx');
   assert.match(semantic, /height: 26,\s*\n\s*minWidth: 26,/);

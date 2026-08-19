@@ -232,14 +232,13 @@ export default function PaneTabStrip({
     return () => ro.disconnect();
   }, [measure]);
 
-  // The SHOWN chip must be legible: the window's content is that tab, so a header
-  // where its chip has scrolled away contradicts what is underneath it. Only
-  // matters when the change came from elsewhere (sidebar, Ctrl+Tab, a closing
-  // neighbour) — a click on a visible chip moves nothing, by construction.
-  useLayoutEffect(() => {
+  // Подвинуть полосу так, чтобы НАЗВАННЫЙ чип был виден целиком, и ровно
+  // настолько, насколько нужно. Чип, уже помещающийся в окно, не двигает
+  // полосу вообще — поэтому это безопасно звать на каждый повод.
+  const revealChip = useCallback((targetTabId: string) => {
     const el = scrollerRef.current;
-    if (!el || !inStrip) return;
-    const node = el.querySelector<HTMLElement>(`[data-strip-item][data-strip-tab-id="${CSS.escape(shownTabId)}"]`);
+    if (!el || !targetTabId) return;
+    const node = el.querySelector<HTMLElement>(`[data-strip-item][data-strip-tab-id="${CSS.escape(targetTabId)}"]`);
     if (!node) return;
     const next = scrollOffsetForChip({
       chip: { left: node.offsetLeft, width: node.offsetWidth },
@@ -247,7 +246,27 @@ export default function PaneTabStrip({
       viewportWidth: el.clientWidth,
     });
     if (next !== el.scrollLeft) { el.scrollLeft = next; measure(); }
-  }, [shownTabId, inStrip, measure]);
+  }, [measure]);
+
+  // Возврат В ЭТО ОКНО — тоже повод показать его вкладку целиком.
+  //
+  // Человек мог увести полосу вбок, уйти работать в соседнее окно и вернуться:
+  // вкладка здесь всё та же, значит `shownTabId` не менялся, и правило «показать
+  // при смене» молчало — окно встречало обрезанным именем той самой вкладки,
+  // которая в нём и открыта. Юзер: *«потом я уехал от неё обратно, переключился
+  // на другое окно… если обратно переключаюсь, тоже должно доскроллиться»*.
+  const paneFocused = useWorkspaceStore((s) => (
+    paneIndex === null || paneIndex === undefined ? true : s.splitFocusedIndex === paneIndex
+  ));
+
+  // The SHOWN chip must be legible: the window's content is that tab, so a header
+  // where its chip has scrolled away contradicts what is underneath it. Fires
+  // wherever the change came from — sidebar, Ctrl+Tab, a closing neighbour, or
+  // coming back to this window.
+  useLayoutEffect(() => {
+    if (!inStrip) return;
+    revealChip(shownTabId);
+  }, [shownTabId, inStrip, paneFocused, revealChip]);
 
   const runs = groupStripByProject(entries);
   const indexOfTab = new Map(entries.map((entry, i) => [entry.tabId, i]));
@@ -279,6 +298,19 @@ export default function PaneTabStrip({
         ref={scrollerRef}
         data-pane-tab-strip-scroller
         onScroll={measure}
+        // Клик по чипу, наполовину ушедшему за край, доводит полосу до него.
+        //
+        // Обрезанный чип остаётся кликабельным — значит им и пользуются, — и
+        // выбранной оказывалась вкладка, чьё имя так и осталось разрезанным
+        // краем окна. Ловим на ПОГРУЖЕНИИ: сам чип останавливает всплытие, и
+        // обычный обработчик на полосе до неё бы не дошёл. Работает и когда
+        // кликнули уже показанную вкладку — там `shownTabId` не меняется, и
+        // правило «показать при смене» промолчало бы.
+        onClickCapture={(e) => {
+          const node = (e.target as HTMLElement | null)?.closest?.('[data-strip-item]') as HTMLElement | null;
+          const clicked = node?.dataset?.stripTabId;
+          if (clicked) revealChip(clicked);
+        }}
         // Wheel over the strip scrolls it sideways: the row is one line tall and
         // there is nothing to scroll vertically here, so a vertical wheel that
         // did nothing would read as a dead surface.
@@ -313,7 +345,17 @@ export default function PaneTabStrip({
                 key={tabId}
                 data-strip-item
                 data-strip-tab-id={tabId}
-                style={{ display: 'inline-flex', minWidth: 0 }}
+                // Чип НЕ сжимается в полосе. Обёртка — элемент flex-строки, а
+                // flex по умолчанию ужимает элементы, лишь бы строка влезла:
+                // ширина обёртки становилась меньше чипа, а сам чип шире не
+                // становился (`whiteSpace: nowrap`, обрезки нет намеренно —
+                // под нижней кромкой висят квадратики задач). Итог — чипы
+                // наезжали друг на друга, и прокручивать было нечего: строка
+                // «влезала».
+                //
+                // Одиночному чипу сжатие оставлено: он делит строку с кнопками
+                // окна, и там длинное имя не должно выдавливать их за край.
+                style={{ display: 'inline-flex', flexShrink: inStrip ? 0 : 1, minWidth: 0 }}
               >
                 <PaneTabChip
                   projectId={run.projectId}

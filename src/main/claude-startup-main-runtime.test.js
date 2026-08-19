@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   applyClaudeStartupIntent,
   classifyClaudeStartupDeliveryProof,
+  classifyClaudeStartupRetryComposer,
   createClaudeStartupMainRuntime,
   normalizeClaudeStartupIntent,
   resolveClaudeSettingsAcrossForkChain,
@@ -210,6 +211,113 @@ test('only explicit no-Enter plus the exact composer command proves startup non-
   });
   assert.equal(exactAfterEnterWasWritten.outcome, PROOF.UNRESOLVED);
   assert.equal(exactAfterEnterWasWritten.submitProof, 'written');
+});
+
+test('a swallowed startup paste is repasted once only after exact empty proof in the same generation', () => {
+  const scan = {
+    success: false,
+    outcome: PROOF.UNRESOLVED,
+    reason: 'stdout-not-found',
+  };
+  const startupPromptProof = {
+    terminalRunSeq: 7,
+    inputRevision: 12,
+    terminalLifecycleGeneration: 'lifecycle:4',
+    mirrorGeneration: 'mirror:9',
+  };
+  const composer = {
+    success: true,
+    exact: false,
+    empty: true,
+    terminalIdentityStable: true,
+    startupGenerationStable: true,
+    terminalRunSeq: 7,
+    inputRevision: 13,
+    terminalLifecycleGeneration: 'lifecycle:4',
+    mirrorGeneration: 'mirror:9',
+  };
+  const sendResult = {
+    success: true,
+    submitted: false,
+    pasteWritten: true,
+    reason: 'claude-startup-command-not-proven-at-enter',
+    startupPromptProof,
+  };
+
+  const retryable = classifyClaudeStartupDeliveryProof({ scan, composer, sendResult });
+  assert.equal(retryable.outcome, PROOF.ABSENT);
+  assert.equal(retryable.reason, 'exact-empty-after-paste-before-enter');
+  assert.deepEqual(retryable.recovery, { kind: 'repaste-after-empty' });
+
+  for (const changed of [
+    { inputRevision: 14 },
+    { terminalRunSeq: 8 },
+    { terminalLifecycleGeneration: 'lifecycle:5' },
+    { mirrorGeneration: 'mirror:10' },
+    { startupGenerationStable: false },
+    { terminalIdentityStable: false },
+  ]) {
+    const unresolved = classifyClaudeStartupDeliveryProof({
+      scan,
+      composer: { ...composer, ...changed },
+      sendResult,
+    });
+    assert.equal(unresolved.outcome, PROOF.UNRESOLVED, JSON.stringify(changed));
+  }
+  assert.equal(classifyClaudeStartupDeliveryProof({
+    scan,
+    composer,
+    sendResult: { ...sendResult, submitted: true },
+  }).outcome, PROOF.UNRESOLVED);
+});
+
+test('a delayed exact retry command is transaction-owned and must never enter the user stash', () => {
+  assert.deepEqual(classifyClaudeStartupRetryComposer({
+    recovery: { kind: 'repaste-after-empty' },
+    command: '/effort max',
+    composer: {
+      proofOutcome: 'found',
+      hasDraft: true,
+      source: 'headless-main:claude-composer:prompt-cursor-row-923',
+      text: '/effort max',
+    },
+  }), {
+    ownership: 'transaction-command',
+    action: 'submit-existing-input',
+    reason: 'exact-retry-command-restored-before-repaste',
+  });
+
+  for (const changed of [
+    { recovery: null },
+    { command: '/effort high' },
+    { composer: { proofOutcome: 'found', hasDraft: true, source: 'renderer', text: '/effort max' } },
+    { composer: { proofOutcome: 'found', hasDraft: true, source: 'headless-main:test', text: '/effort max plus user text' } },
+  ]) {
+    const result = classifyClaudeStartupRetryComposer({
+      recovery: { kind: 'repaste-after-empty' },
+      command: '/effort max',
+      composer: {
+        proofOutcome: 'found',
+        hasDraft: true,
+        source: 'headless-main:test',
+        text: '/effort max',
+      },
+      ...changed,
+    });
+    assert.notEqual(result.ownership, 'transaction-command', JSON.stringify(changed));
+  }
+
+  assert.equal(classifyClaudeStartupRetryComposer({
+    recovery: { kind: 'repaste-after-empty' },
+    command: '/model claude-opus-5[1m]',
+    composer: {
+      proofOutcome: 'found',
+      hasDraft: true,
+      source: 'claude-hook-grab-input',
+      exactCapture: true,
+      text: '/model claude-opus-5[1m]',
+    },
+  }).action, 'submit-existing-input');
 });
 
 test('both readiness signals join one main-owned sequence', async () => {

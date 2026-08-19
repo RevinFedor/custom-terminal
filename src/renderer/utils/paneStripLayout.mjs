@@ -124,10 +124,17 @@ export function groupOverflowByKind(hiddenIds, kindOf) {
  * Scroll offset that brings one chip fully into view, moving as little as
  * possible — and never moving at all when it already fits.
  *
- * Used when the shown chip changes from somewhere OTHER than a click on it
- * (activation from the sidebar, Ctrl+Tab, a chip closing and its neighbour
- * taking over): the tab whose content fills the window must be the one whose
- * chip is legible, or the header contradicts the window under it.
+ * Used whenever the shown chip changes, from wherever: activation from the
+ * sidebar, Ctrl+Tab, a neighbour closing — and from a click on a chip that is
+ * only half on screen. That last case is the reason this is not conditioned on
+ * "the change came from elsewhere": a chip clipped by the edge is still
+ * clickable, so clicking it selected a tab whose own name stayed cut in half.
+ * Юзер: *«если я на эту вкладку кликаю, пусть она доскроллится ровно
+ * настолько, насколько нужно, чтобы показаться целиком»*.
+ *
+ * Moving as little as possible is what makes it safe to run on EVERY change:
+ * a chip already fully visible returns the offset unchanged, so the strip
+ * never jumps under a click that did not need it.
  *
  * @returns {number} the new scrollLeft
  */

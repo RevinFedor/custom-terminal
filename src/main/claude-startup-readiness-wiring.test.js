@@ -88,6 +88,19 @@ test('startup preserves a real native draft before applying settings', () => {
   );
 });
 
+test('startup retry submits its own restored slash command instead of stashing it as user text', () => {
+  assert.match(
+    mainSource,
+    /classifyClaudeStartupRetryComposer\(\{[\s\S]{0,300}retryRecovery[\s\S]{0,700}existingOwnedCommand:\s*true/,
+    'the retry must classify the exact restored command before the native stash branch',
+  );
+  assert.match(
+    mainSource,
+    /submitExistingInput = recovery\?\.kind === 'submit-existing-input'[\s\S]{0,180}composerAdmission\?\.existingOwnedCommand === true[\s\S]{0,400}inspectClaudeExactSettingInput/,
+    'the transaction-owned command must use the exact submit-existing-input path',
+  );
+});
+
 test('ambiguous residual cells use exact Claude input without becoming fail-open', () => {
   assert.match(
     mainSource,
@@ -107,6 +120,24 @@ test('bytes held before Enter remain delivery-unknown until exact transaction pr
   assert.match(
     mainSource,
     /result\?\.error === 'claude_prompt_not_stable'[\s\S]{0,120}result\?\.pasteWritten === true[\s\S]{0,500}success: true,[\s\S]{0,100}submitted: false/,
+  );
+});
+
+test('a same-generation exact-empty proof repastes once without weakening Enter admission', () => {
+  assert.match(
+    mainSource,
+    /startupPromptProof:\s*startupEnterBoundary\.proof \|\| null/,
+    'the withheld Enter must return the exact frame identity that rejected it',
+  );
+  assert.match(
+    mainSource,
+    /startupGenerationStable:[\s\S]{0,120}claudeLaunchGenerationByTab\.get\(tabId\)\?\.generation === generation/,
+    'the Ctrl+G proof must attest the same launch generation',
+  );
+  assert.match(
+    mainSource,
+    /const capturedIdentity = \{[\s\S]{0,500}terminalIdentityStable:[\s\S]{0,500}mirrorGeneration:/,
+    'the exact editor result must carry run, lifecycle, input, and mirror identity',
   );
 });
 

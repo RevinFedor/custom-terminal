@@ -48,6 +48,132 @@ function fixture(sessionId = 'range-session') {
 const timelineTexts = (records, sessionId) => _api.buildCodexTimeline(records, sessionId)
   .map((entry) => ({ type: entry.type, content: entry.content }));
 
+const PROJECT_INSTRUCTIONS = `# AGENTS.md instructions for /tmp/project
+
+<INSTRUCTIONS>
+Keep the project contract.
+</INSTRUCTIONS>`;
+
+test('project instructions stay inside the following real turn and never become a deletable Timeline user', () => {
+  const sessionId = 'range-project-instructions';
+  const records = fixture(sessionId);
+  records.push(rec('event_msg', { type: 'task_started' }));
+  records.push(rec('response_item', {
+    type: 'message',
+    role: 'developer',
+    content: [{ type: 'input_text', text: '<permissions instructions>safe</permissions instructions>' }],
+  }));
+  records.push(rec('response_item', {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: PROJECT_INSTRUCTIONS }],
+  }));
+  records.push(rec('turn_context', { model: 'gpt-5.6-sol', effort: 'max' }));
+
+  const preambleMaterialization = _api.inspectConversationMaterialization(records, sessionId);
+  assert.equal(preambleMaterialization.metadataOnly, true);
+  assert.equal(preambleMaterialization.userTurns, 0);
+
+  records.push(rec('response_item', {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: 'delete the real prompt' }],
+  }));
+  records.push(rec('event_msg', { type: 'user_message', message: 'delete the real prompt' }));
+  records.push(rec('response_item', {
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'output_text', text: 'answer' }],
+  }));
+  records.push(rec('event_msg', { type: 'task_complete' }));
+
+  const timeline = _api.buildCodexTimeline(records, sessionId);
+  assert.deepEqual(
+    timeline.filter((entry) => entry.type === 'user').map((entry) => entry.content),
+    ['delete the real prompt'],
+  );
+  assert.equal(timeline.some((entry) => entry.content === PROJECT_INSTRUCTIONS), false);
+
+  const fullHistory = _api.buildCodexFullHistory(records, sessionId);
+  const instructionHistoryEntry = fullHistory.find((entry) => entry.content === PROJECT_INSTRUCTIONS);
+  const promptHistoryEntry = fullHistory.find((entry) => entry.content === 'delete the real prompt');
+  assert.equal(instructionHistoryEntry?.serviceCarrier, 'project-instructions');
+  assert.equal(instructionHistoryEntry?.turnIndex, promptHistoryEntry?.turnIndex);
+
+  const target = timeline.find((entry) => entry.content === 'delete the real prompt');
+  const wrappers = _api.buildCodexVisibleRecordWrappers(records, sessionId);
+  const canonical = wrappers.find((wrapper) => wrapper.sourceUuid === target.uuid);
+  const instructions = wrappers.find((wrapper) => wrapper.line === 3);
+  assert.ok(Number.isFinite(canonical?.turnKey));
+  assert.equal(instructions?.turnKey, canonical.turnKey);
+
+  const plan = _api.planCodexRangeRewrite(records, sessionId, target.uuid, target.uuid);
+  assert.equal(plan.success, true);
+  assert.equal(plan.removedUsers, 1);
+  assert.equal(plan.outputRecords.some((record) => JSON.stringify(record).includes('AGENTS.md instructions')), false);
+  assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), []);
+});
+
+test('compact deletion removes its semantic companion across world-state and settings records', () => {
+  const sessionId = 'range-compact-gap';
+  const records = fixture(sessionId);
+  records.push(...userTurn('keep-before'));
+  records.push(rec('compacted', { replacement_history: [] }));
+  records.push(rec('world_state', { cwd: '/tmp/project' }));
+  records.push(rec('turn_context', { model: 'gpt-5.6-sol', effort: 'max' }));
+  records.push(rec('event_msg', { type: 'token_count', info: {} }));
+  records.push(rec('event_msg', { type: 'context_compacted' }));
+
+  const timeline = _api.buildCodexTimeline(records, sessionId);
+  const target = timeline.find((entry) => entry.type === 'compact');
+  assert.equal(timeline.filter((entry) => entry.type === 'compact').length, 1);
+
+  const plan = _api.planCodexRangeRewrite(records, sessionId, target.uuid, target.uuid);
+  assert.equal(plan.success, true);
+  assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), [
+    { type: 'user', content: 'keep-before' },
+  ]);
+});
+
+test('image response carrier and canonical event share one exact deletable turn', () => {
+  const sessionId = 'range-image-pair';
+  const imagePath = '/tmp/noted-terminal-codex-image-input/image.png';
+  const records = fixture(sessionId);
+  records.push(rec('turn_context', { model: 'gpt-5.6-sol', effort: 'max' }));
+  records.push(rec('event_msg', { type: 'task_started' }));
+  records.push(rec('response_item', {
+    type: 'message',
+    role: 'user',
+    content: [{
+      type: 'input_text',
+      text: `<image name=[Image #1] path="${imagePath}">[Image #1]</image>\n[Image #1] delete image turn`,
+    }],
+    local_images: [imagePath],
+  }));
+  records.push(rec('event_msg', {
+    type: 'user_message',
+    message: '[Image #1] delete image turn',
+    images: [],
+    local_images: [imagePath],
+  }));
+  records.push(rec('response_item', {
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'output_text', text: 'answer' }],
+  }));
+  records.push(rec('event_msg', { type: 'task_complete' }));
+
+  const timeline = _api.buildCodexTimeline(records, sessionId);
+  const users = timeline.filter((entry) => entry.type === 'user');
+  assert.equal(users.length, 1);
+  assert.match(users[0].content, /delete image turn/);
+
+  const plan = _api.planCodexRangeRewrite(records, sessionId, users[0].uuid, users[0].uuid);
+  assert.equal(plan.success, true);
+  assert.equal(plan.removedUsers, 1);
+  assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), []);
+});
+
 test('single-turn delete uses exact carrier identity and does not consume the following compact', () => {
   const sessionId = 'range-single';
   const records = fixture(sessionId);

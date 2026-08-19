@@ -43,10 +43,27 @@ const DOCS_ONLY_STORAGE_KEY = 'noted-terminal.git.docsOnlyAiContext';
 const DEFAULT_PANEL_SIZE = { width: 1040, height: 640 };
 const MIN_PANEL_SIZE = { width: 760, height: 420 };
 const PANEL_MARGIN = 16;
-// Ниже этой ширины ОКНА (не экрана) чип Git показывает только значок: строку
-// он делит с полосой вкладок, и обрезанное многоточием название стоит места
-// больше, чем сообщает.
+// Ниже этой ширины ОКНА (не экрана) чип Git показывает только значок и число:
+// строку он делит с полосой вкладок, и обрезанное многоточием название стоит
+// места больше, чем сообщает. Юзер: *«если вкладка меньше — не должно
+// отображаться название, а чисто значок и число»*.
+//
+// Порог мерится по САМОМУ ОКНУ. Шапка окна — строка внутри него и всегда шире
+// своего содержимого, поэтому на ней «узко» не наступало никогда: название
+// показывалось в любом окне, сколько его ни сужай. Окно — та коробка, чью
+// ширину человек и меняет перегородкой.
 const GIT_CHIP_BRANCH_MIN_HOST_PX = 520;
+// Ширина чипа Git постоянна — она не зависит от того, что он сейчас показывает.
+//
+// Он стоит в одной строке с полосой вкладок, и каждое изменение его ширины
+// отбирает или отдаёт место самим вкладкам: полоса перемеряется, счётчики «×N»
+// пересчитываются, чипы дёргаются. Поэтому у названия ветки и у числа изменений
+// свои постоянные окошки: короткое имя не сжимает чип, длинное не раздувает, а
+// «проверяю репозиторий» занимает ровно столько же, сколько готовый ответ.
+// Юзер: *«он не должен менять ширину, сейчас он меняет ширину на момент
+// лоудера»*.
+const GIT_CHIP_NAME_SLOT_PX = 72;
+const GIT_CHIP_COUNT_SLOT_PX = 38;
 const MIN_LEFT_PANE_WIDTH = 320;
 const MIN_RIGHT_PANE_WIDTH = 380;
 const HISTORY_PAGE_SIZE = 60;
@@ -457,7 +474,11 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
   // одним окном во весь экран любой процент от монитора не значит ничего.
   const [showBranchName, setShowBranchName] = useState(true);
   useEffect(() => {
-    const host = triggerRef.current?.closest('[data-split-attach-row]')
+    // Коробка ОКНА, а не строки заголовка внутри него. Заголовок — строка на
+    // всю ширину окна, но её собственная ширина всегда достаточна для своего
+    // содержимого, поэтому порог по ней не наступал никогда.
+    const host = triggerRef.current?.closest('[data-terminal-pane-wrapper]')
+      || triggerRef.current?.closest('[data-split-attach-row]')
       || triggerRef.current?.parentElement;
     if (!host || typeof ResizeObserver === 'undefined') return undefined;
     const measure = () => {
@@ -1866,6 +1887,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
 
   if (!status?.isRepo) {
     if (projectPath && (statusLoading || hydratedStateKey !== panelStateKey)) {
+      // ТА ЖЕ коробка, что у готового чипа: значок ветки, окошко названия,
+      // овал счётчика с кольцом. Раньше здесь стоял другой чип — «⟳ Git», — и
+      // при первом же ответе Git строка заголовка перестраивалась.
       return (
         <button
           disabled
@@ -1883,8 +1907,42 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
             cursor: 'default',
           }}
         >
-          <Loader2 size={12} className="animate-spin" />
-          <span style={{ fontWeight: 700 }}>Git</span>
+          <GitBranch size={12} />
+          {showBranchName && (
+            <span
+              aria-hidden
+              style={{
+                width: GIT_CHIP_NAME_SLOT_PX,
+                height: 7,
+                borderRadius: 3,
+                background: 'rgba(255,255,255,0.10)',
+                flexShrink: 0,
+              }}
+            />
+          )}
+          <span
+            style={{
+              position: 'relative',
+              width: GIT_CHIP_COUNT_SLOT_PX,
+              height: 16,
+              borderRadius: 999,
+              background: 'rgba(255,255,255,0.06)',
+              flexShrink: 0,
+            }}
+          >
+            <span
+              aria-hidden
+              className="animate-spin"
+              style={{
+                position: 'absolute',
+                inset: -2,
+                borderRadius: 999,
+                border: '1.5px solid transparent',
+                borderTopColor: 'rgba(148,163,184,0.75)',
+                pointerEvents: 'none',
+              }}
+            />
+          </span>
         </button>
       );
     }
@@ -2012,7 +2070,16 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
         <GitBranch size={12} />
         {/* Название ветки исчезает в узком окне — см. showBranchName. */}
         {showBranchName && (
-          <span style={{ maxWidth: 72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 700 }}>
+          <span style={{
+            // Ширина ОКОШКА, а не текста: иначе переход с `main` на длинную
+            // ветку двигал бы всю строку заголовка.
+            width: GIT_CHIP_NAME_SLOT_PX,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            fontWeight: 700,
+            flexShrink: 0,
+          }}>
             {status.branch}
           </span>
         )}
@@ -2026,7 +2093,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
         <span
           style={{
             position: 'relative',
-            minWidth: 28,
+            // Постоянное окошко: «clean», «70» и «merge» занимают одно и то же
+            // место, поэтому первый же коммит не перестраивает строку.
+            width: GIT_CHIP_COUNT_SLOT_PX,
             height: 16,
             padding: '0 5px',
             borderRadius: 999,

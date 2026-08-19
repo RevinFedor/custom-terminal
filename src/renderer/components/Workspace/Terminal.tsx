@@ -112,6 +112,7 @@ import { log } from '../../utils/logger';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
+import { startFreshCodexSession } from '../../utils/historyAgentRuntimes';
 import {
   isCodexSettingsPickerVisible,
   parseCodexModelChangeAcknowledgement,
@@ -353,9 +354,6 @@ const normalizeTerminalBufferCheckpoint = (
   }
   return value;
 };
-
-// Get setTerminalSelection outside of component to avoid re-renders
-const getSetTerminalSelection = () => useUIStore.getState().setTerminalSelection;
 
 // Get Claude session setter/getter outside of component
 const getSetClaudeSessionId = () => useWorkspaceStore.getState().setClaudeSessionId;
@@ -688,13 +686,18 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       store.setTabCommandType(tabId, 'codex');
       store.markAiLaunchAutoTitle(tabId, 'codex');
       const codexCwd = getTabCwd(tabId);
-      console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex" }');
-      void launchPendingAgentAction(tabId, pendingAction.type, 'codex:run-command', buildCodexRunPayload({
-        tabId,
-        command: 'codex',
-        cwd: codexCwd,
-        developerInstructions: pendingAction.developerInstructions,
-      }));
+      console.log('[RESTORE] 12. Materializing fresh Codex session before Resume');
+      if (!pendingAgentActionLaunches.has(tabId)) {
+        pendingAgentActionLaunches.add(tabId);
+        void startFreshCodexSession({
+          tabId,
+          cwd: codexCwd,
+          developerInstructions: pendingAction.developerInstructions,
+        }).then((result) => {
+          if (result.success) clearTabPendingAction(tabId);
+          else console.warn('[RESTORE] Pending Codex start retained:', result.error);
+        }).finally(() => pendingAgentActionLaunches.delete(tabId));
+      }
       break;
     }
 
@@ -2724,14 +2727,6 @@ function Terminal({
         ipcRenderer.send('terminal:input', tabId, data, { xtermInputOrigin });
       });
 
-      // Track selection changes and update global state
-      term.onSelectionChange(() => {
-        if (active) {
-          const selection = term.getSelection() || '';
-          getSetTerminalSelection()(selection);
-        }
-      });
-
       // === INPUT INTERCEPTION for Claude Commands ===
       // Intercept Enter key to replace claude/claude-c/claude-f with explicit --resume
       // Commands: claude (new), claude-c (continue), claude-f (fork)
@@ -3012,7 +3007,7 @@ function Terminal({
           }
 
           useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'codex');
-          void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd }));
+          void startFreshCodexSession({ tabId, cwd });
           return false;
         }
 
@@ -3239,7 +3234,7 @@ function Terminal({
   // Uses effectiveActive (active && currentView==='terminal') to prevent unmount/remount on view switch
   useEffect(() => {
     if (!effectiveActive || !isActiveProject) {
-      // Clear global selection when terminal becomes inactive
+      // Диагностика перехода вкладки в неактивное состояние.
       if (!effectiveActive) {
         console.warn(`[Terminal:deactivate] tabId=${tabId}`, {
           active,
@@ -3247,7 +3242,6 @@ function Terminal({
           projectCurrentView,
           isActiveProject,
         });
-        getSetTerminalSelection()('');
       }
       return;
     }
@@ -3341,10 +3335,6 @@ function Terminal({
           const xtermInputOrigin = takeXtermInputOrigin();
           armNativeCodexPickerProof(term, data, xtermInputOrigin);
           ipcRenderer.send('terminal:input', tabId, data, { xtermInputOrigin });
-        });
-        term.onSelectionChange(() => {
-          const selection = term.getSelection() || '';
-          getSetTerminalSelection()(selection);
         });
 
         // === INPUT INTERCEPTION for Claude Commands (same as initTerminal) ===
@@ -3519,7 +3509,7 @@ function Terminal({
             }
             useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'codex');
             const cwd2 = getTabCwd(tabId);
-            void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd: cwd2 }));
+            void startFreshCodexSession({ tabId, cwd: cwd2 });
             return false;
           }
 
@@ -3804,9 +3794,6 @@ function Terminal({
               'buffer.baseY': term.buffer.active.baseY,
             });
           });
-
-          const selection = term.getSelection() || '';
-          getSetTerminalSelection()(selection);
         } finally {
           // Release all PTY chunks captured while the old xterm queue was
           // draining. Push each metadata-bearing chunk through the same pump;
@@ -3886,9 +3873,6 @@ function Terminal({
   // Prompt under the cursor so it's keyboard-focused immediately.
   const openTerminalContextMenu = async (focusInsertPrompt = false) => {
     const hasSelection = xtermInstance.current?.hasSelection() || false;
-    const selection = xtermInstance.current?.getSelection() || '';
-    if (selection) getSetTerminalSelection()(selection);
-
     const promptsResult = await ipcRenderer.invoke('prompts:get');
     const prompts = promptsResult.success ? promptsResult.data : [];
 

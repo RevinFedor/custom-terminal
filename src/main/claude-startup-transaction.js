@@ -131,10 +131,12 @@ class ClaudeStartupTransaction {
     if (proof.outcome === PROOF.ABSENT && !this.retryUsed) {
       // Automatic retry is allowed for exactly one case: the command provably
       // was not submitted. The prover requires both facts: the send path
-      // explicitly reports that Enter was not written, and the current
-      // composer still contains the exact command. A missing JSONL row,
-      // an empty/unknown composer, or an uncertain Enter is unresolved because
-      // the command may already have applied.
+      // explicitly reports that Enter was not written, plus either (a) the
+      // current composer still contains the exact command, or (b) the command
+      // disappeared before Enter and an exact Ctrl+G read proved an empty
+      // composer across the same terminal/run/lifecycle generation. A missing
+      // JSONL row, an unowned empty/unknown composer, or an uncertain Enter is
+      // unresolved because the command may already have applied.
       this.retryUsed = true;
       this.deps.log('[StartupRetry] decision=absent action=auto-retry'
         + ' tab=' + String(this.tabId).slice(-12)

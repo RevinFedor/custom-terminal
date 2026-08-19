@@ -1,3 +1,7 @@
+import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
+
+const TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS = 2048;
+
 /**
  * Keeps one trailing transcript refresh until both the turn and the Timeline
  * surface are ready. An invalidation is never consumed merely because its
@@ -19,6 +23,109 @@ export function planTimelineTranscriptRefresh({
     pending: refresh ? false : nextPending,
     refresh,
   };
+}
+
+function timelineSentHandoffPreview(value) {
+  const text = String(value || '').trim();
+  if (text.length <= TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS) return text;
+  return text.slice(0, TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS).trimEnd() + '\n…';
+}
+
+function timelineEntryMatchesSentHandoff(entry, handoffEntry) {
+  if (historyEntryHasExactIdentity(entry, handoffEntry?.uuid)) return true;
+  return historyEntryHasExactIdentity(entry, handoffEntry?.sourceIdentity);
+}
+
+/**
+ * A confirmed History send already owns an exact durable user record even
+ * while Timeline's expensive transcript refresh remains deferred by a busy
+ * turn. Project only that one addressable point; never infer it from text or
+ * timestamps and never project queue/provider acceptance without audit proof.
+ */
+export function projectTimelineSentHandoff(handoff, {
+  toolType,
+  sessionId,
+} = {}) {
+  if (!handoff || handoff.queueStatus !== 'sent') return null;
+  if (handoff.toolType !== toolType) return null;
+  const proof = handoff.auditProof;
+  if (!proof || typeof proof !== 'object') return null;
+  const exactSessionId = String(proof.sessionId || '').trim();
+  const currentSessionId = String(sessionId || '').trim();
+  if (!exactSessionId || !currentSessionId || exactSessionId !== currentSessionId) return null;
+
+  // Timeline actions address the canonical row by UUID. Source identity is
+  // retained for response_item → event_msg alias reconciliation, but it is not
+  // converted into a made-up UUID when an older receipt lacks that address.
+  const entryUuid = String(proof.entryUuid || '').trim();
+  if (!entryUuid) return null;
+  const sourceIdentity = String(proof.sourceIdentity || '').trim();
+  const submittedAt = Number(handoff.submittedAt);
+  const timestamp = String(proof.auditTimestamp || '').trim()
+    || new Date(Number.isFinite(submittedAt) ? submittedAt : Date.now()).toISOString();
+  const semanticTags = handoff.source === 'prompt-loop'
+    ? [{ kind: 'prompt-origin', source: 'loop' }]
+    : undefined;
+
+  return {
+    uuid: entryUuid,
+    type: 'user',
+    timestamp,
+    content: timelineSentHandoffPreview(handoff.text),
+    sessionId: exactSessionId,
+    hasImage: Array.isArray(handoff.imagePaths) && handoff.imagePaths.length > 0,
+    handoffId: String(handoff.handoffId || ''),
+    isSentHandoffProjection: true,
+    ...(sourceIdentity ? { sourceIdentity } : {}),
+    ...(semanticTags ? { semanticTags } : {}),
+  };
+}
+
+export function projectTimelineSentHandoffs(handoffs, owner = {}) {
+  if (!Array.isArray(handoffs)) return [];
+  return handoffs
+    .map((handoff) => projectTimelineSentHandoff(handoff, owner))
+    .filter(Boolean);
+}
+
+/** Keep captured SENT points after History consumes its local card. */
+export function upsertTimelineSentHandoffEntries(current, incoming) {
+  const next = Array.isArray(current) ? [...current] : [];
+  for (const candidate of Array.isArray(incoming) ? incoming : []) {
+    if (!candidate?.handoffId) continue;
+    for (let index = next.length - 1; index >= 0; index -= 1) {
+      if (next[index]?.handoffId === candidate.handoffId
+        || timelineEntryMatchesSentHandoff(next[index], candidate)) {
+        next.splice(index, 1);
+      }
+    }
+    next.push(candidate);
+  }
+  next.sort((left, right) => {
+    const timeDelta = Date.parse(left?.timestamp || '') - Date.parse(right?.timestamp || '');
+    if (Number.isFinite(timeDelta) && timeDelta !== 0) return timeDelta;
+    return String(left?.handoffId || '').localeCompare(String(right?.handoffId || ''));
+  });
+  return next;
+}
+
+export function retainUnmaterializedTimelineSentHandoffs(canonicalEntries, handoffEntries) {
+  const canonical = Array.isArray(canonicalEntries) ? canonicalEntries : [];
+  return upsertTimelineSentHandoffEntries([], handoffEntries)
+    .filter((handoffEntry) => !canonical.some((entry) => (
+      timelineEntryMatchesSentHandoff(entry, handoffEntry)
+    )));
+}
+
+/**
+ * Canonical transcript rows always win. UUID/source aliases remove the light
+ * point in the same render, so the later durable refresh cannot create a
+ * duplicate even when a response_item was promoted to event_msg.
+ */
+export function mergeTimelineEntriesWithSentHandoffs(canonicalEntries, handoffEntries) {
+  const canonical = Array.isArray(canonicalEntries) ? canonicalEntries : [];
+  const projected = retainUnmaterializedTimelineSentHandoffs(canonical, handoffEntries);
+  return projected.length > 0 ? [...canonical, ...projected] : canonical;
 }
 
 /**

@@ -96,7 +96,6 @@ const newTextPromptId = () => `prompt-${Date.now().toString(36)}-${(promptIdSequ
 const VR_GREEN = '#22c55e';
 const VR_RED = '#ef4444';
 
-const DEFAULT_DOC_FILE_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md';
 
 // Track if settings was opened at least once (for default tab)
 let hasOpenedBefore = false;
@@ -1627,7 +1626,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setTabGeometry = useUIStore((s) => s.setTabGeometry);
   const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
   const setProjectTabGeometry = useUIStore((s) => s.setProjectTabGeometry);
-  const { showToast, docPrompt, setDocPromptUseFile, setDocPromptFilePath, setDocPromptInlineContent, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
+  const { showToast, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
   const { prompts: aiPrompts, loadPrompts: loadAIPrompts, savePrompt: saveAIPrompt, deletePrompt: deleteAIPrompt, rewindPromptId, setRewindPromptId } = usePromptsStore();
 
   // Claude Default Prompt
@@ -1654,10 +1653,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     return () => { cancelled = true; };
   }, [isOpen]);
 
-  // Doc prompt local state
-  const [localDocFilePath, setLocalDocFilePath] = useState('');
-  const [localDocInlineContent, setLocalDocInlineContent] = useState('');
-
   // User prompts (text insertion snippets, not AI prompts)
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [promptGroups, setPromptGroups] = useState<PromptGroup[]>([]);
@@ -1670,9 +1665,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   // Editing states
   const [editingClaude, setEditingClaude] = useState(false);
   const [editingPromptId, setEditingPromptId] = useState<string | null>(null); // AI prompt being edited
-  const [editingDocPrompt, setEditingDocPrompt] = useState(false);
-  const [editingPostCheck, setEditingPostCheck] = useState(false);
-  const [localPostCheckContent, setLocalPostCheckContent] = useState('');
   const [editingInsertionIndex, setEditingInsertionIndex] = useState<number | null>(null);
   const [localInsertionTitle, setLocalInsertionTitle] = useState('');
   const [localInsertionContent, setLocalInsertionContent] = useState('');
@@ -1711,8 +1703,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
   // Refs for editing containers (to check if blur target is inside)
   const claudeEditRef = useRef<HTMLDivElement>(null);
-  const docEditRef = useRef<HTMLDivElement>(null);
-  const postCheckEditRef = useRef<HTMLDivElement>(null);
 
 
   // Track tab changes
@@ -1744,11 +1734,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       // Load AI prompts from DB
       loadAIPrompts();
 
-      // Load doc prompt local state
-      setLocalDocFilePath(docPrompt.filePath);
-      setLocalDocInlineContent(docPrompt.inlineContent);
-      setLocalPostCheckContent(useUIStore.getState().postCheckPrompt);
-
       // Load user prompts (text insertion snippets) and groups
       ipcRenderer.invoke('prompts:get').then((result: { success: boolean; data?: Prompt[] }) => {
         if (result.success && result.data) {
@@ -1766,13 +1751,11 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       // Reset editing states when modal closes
       setEditingClaude(false);
       setEditingPromptId(null);
-      setEditingDocPrompt(false);
-      setEditingPostCheck(false);
       setEditingInsertionIndex(null);
       setPromptTreeRename(null);
       setPromptTreeContextMenu(null);
     }
-  }, [isOpen, docPrompt]);
+  }, [isOpen]);
 
   // Helper: check if blur target is inside container
   const isBlurInsideContainer = (e: React.FocusEvent, containerRef: React.RefObject<HTMLDivElement | null>) => {
@@ -1785,14 +1768,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const saveClaudePromptImmediate = useCallback((value: string) => {
     ipcRenderer.invoke('app:setState', { key: 'claudeDefaultPrompt', value });
   }, []);
-
-  const saveDocFilePathImmediate = useCallback((value: string) => {
-    setDocPromptFilePath(value);
-  }, [setDocPromptFilePath]);
-
-  const saveDocInlineContentImmediate = useCallback((value: string) => {
-    setDocPromptInlineContent(value);
-  }, [setDocPromptInlineContent]);
 
   const savePromptsImmediate = useCallback(async (newPrompts: Prompt[]) => {
     await ipcRenderer.invoke('prompts:save', newPrompts);
@@ -2166,16 +2141,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     }
   };
 
-  const handleDocBlur = (e: React.FocusEvent) => {
-    if (isBlurInsideContainer(e, docEditRef)) return;
-    if (docPrompt.useFile) {
-      saveDocFilePathImmediate(localDocFilePath);
-    } else {
-      saveDocInlineContentImmediate(localDocInlineContent);
-    }
-    setEditingDocPrompt(false);
-  };
-
 
   // Start editing an AI prompt (auto-saves current before switching)
   const startEditingAIPrompt = (prompt: AIPrompt) => {
@@ -2273,12 +2238,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     await savePromptsImmediate(newPrompts);
     showToast('Deleted', 'success');
     setEditingInsertionIndex(null);
-  };
-
-  const resetDoc = () => {
-    setLocalDocFilePath(DEFAULT_DOC_FILE_PATH);
-    setDocPromptFilePath(DEFAULT_DOC_FILE_PATH);
-    setDocPromptUseFile(true);
   };
 
   const switchAISubTab = (next: AISubTab) => {
@@ -3290,71 +3249,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   </div>
                   <div style={{ fontSize: 11, color: claudeDefaultPromptEnabled ? VR_DIM : '#555', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', opacity: claudeDefaultPromptEnabled ? 1 : 0.5 }}>
                     {claudeDefaultPrompt || 'Не задан'}
-                  </div>
-                </>
-              )}
-            </div>
-
-            <div
-              ref={docEditRef}
-              onClick={() => !editingDocPrompt && setEditingDocPrompt(true)}
-              style={{ padding: 10, background: editingDocPrompt ? '#24242a' : VR_CARD, border: `1px solid ${editingDocPrompt ? VR_GREEN : VR_BORDER}`, borderRadius: 8, cursor: editingDocPrompt ? 'default' : 'pointer', marginBottom: 7 }}
-            >
-              {editingDocPrompt ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 11, color: VR_DIM }}>Источник:</span>
-                    <button onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(true); }} style={{ padding: '4px 9px', backgroundColor: docPrompt.useFile ? VR_GREEN : VR_FIELD, color: docPrompt.useFile ? '#fff' : VR_DIM, border: `1px solid ${docPrompt.useFile ? VR_GREEN : VR_BORDER}`, borderRadius: 7, fontSize: 11, cursor: 'pointer' }}>Файл</button>
-                    <button onClick={(e) => { e.stopPropagation(); setDocPromptUseFile(false); }} style={{ padding: '4px 9px', backgroundColor: !docPrompt.useFile ? VR_GREEN : VR_FIELD, color: !docPrompt.useFile ? '#fff' : VR_DIM, border: `1px solid ${!docPrompt.useFile ? VR_GREEN : VR_BORDER}`, borderRadius: 7, fontSize: 11, cursor: 'pointer' }}>Inline</button>
-                  </div>
-                  {docPrompt.useFile ? (
-                    <input type="text" value={localDocFilePath} onChange={(e) => setLocalDocFilePath(e.target.value)} onBlur={handleDocBlur} placeholder="Путь к файлу..." autoFocus style={{ ...vrFieldStyle, fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 11.5 }} />
-                  ) : (
-                    <textarea value={localDocInlineContent} onChange={(e) => setLocalDocInlineContent(e.target.value)} onBlur={handleDocBlur} rows={4} autoFocus style={{ ...vrFieldStyle, height: 'auto', minHeight: 120, resize: 'vertical', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }} />
-                  )}
-                  <button onClick={(e) => { e.stopPropagation(); resetDoc(); }} style={{ alignSelf: 'flex-start', padding: 0, backgroundColor: 'transparent', color: VR_DIM, border: 'none', fontSize: 11, cursor: 'pointer' }}>Сбросить</button>
-                </div>
-              ) : (
-                <>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                    <span style={{ fontSize: 13, color: VR_GREEN, fontWeight: 650 }}>Documentation</span>
-                    <VRTag accent={docPrompt.useFile}>{docPrompt.useFile ? 'ФАЙЛ' : 'INLINE'}</VRTag>
-                  </div>
-                  <div style={{ fontSize: 11, color: VR_DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {docPrompt.useFile ? localDocFilePath : (localDocInlineContent || 'Не задан')}
-                  </div>
-                </>
-              )}
-            </div>
-
-            <div
-              ref={postCheckEditRef}
-              onClick={() => !editingPostCheck && setEditingPostCheck(true)}
-              style={{ padding: 10, background: editingPostCheck ? '#24242a' : VR_CARD, border: `1px solid ${editingPostCheck ? '#a78bfa' : VR_BORDER}`, borderRadius: 8, cursor: editingPostCheck ? 'default' : 'pointer' }}
-            >
-              {editingPostCheck ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <span style={{ fontSize: 11, color: '#a78bfa', fontWeight: 650 }}>Post-check</span>
-                  <textarea
-                    value={localPostCheckContent}
-                    onChange={(e) => setLocalPostCheckContent(e.target.value)}
-                    onBlur={(e) => {
-                      if (isBlurInsideContainer(e, postCheckEditRef)) return;
-                      useUIStore.getState().setPostCheckPrompt(localPostCheckContent);
-                      setEditingPostCheck(false);
-                    }}
-                    rows={5}
-                    autoFocus
-                    style={{ ...vrFieldStyle, height: 'auto', minHeight: 140, resize: 'vertical', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }}
-                  />
-                </div>
-              ) : (
-                <>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                    <span style={{ fontSize: 13, color: '#a78bfa', fontWeight: 650 }}>Post-check</span>
-                  </div>
-                  <div style={{ fontSize: 11, color: VR_DIM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {localPostCheckContent || 'Не задан'}
                   </div>
                 </>
               )}

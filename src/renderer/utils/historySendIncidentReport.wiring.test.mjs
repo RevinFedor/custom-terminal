@@ -19,6 +19,8 @@ test('History send errors copy a self-contained incident report', () => {
   assert.match(report, /occurredAt: Date\.now\(\)/);
   assert.match(report, /incidentReport,[\s\S]{0,220}incidentPreview/,
     'the complete report must be both copyable and expandable');
+  assert.match(report, /'error',\s*6000,\s*true,\s*incidentReport/,
+    'terminal and AI lifecycle errors must remain until the user dismisses them');
 
   const catchStart = panel.indexOf('} catch (e: any) {', panel.indexOf('const runAction'));
   const catchEnd = panel.indexOf('} finally {', catchStart);

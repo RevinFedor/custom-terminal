@@ -8,6 +8,8 @@ import ClaudeControlBar from './ClaudeControlBar';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
 import { useAgentLifecycle } from './useAgentLifecycle';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
+import InterruptedSessionOverlay from './InterruptedSessionOverlay';
+import { continueInterruptedSession } from '../../utils/continueInterruptedSession';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -67,6 +69,20 @@ export default function SplitPaneSurface({
     tabId,
     enabled: workspaceVisible,
   });
+  // Плашка «сессия была прервана» — по СВОЕЙ вкладке, из своей же сводки: она
+  // говорит про одну вкладку, и накрывать ею соседние окна значит спрашивать
+  // про эту вкладку там, где её нет.
+  const isRestoring = useWorkspaceStore((state) => state.isRestoring);
+  const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedState);
+  const dismissInterruptedSession = useWorkspaceStore((state) => state.dismissInterruptedSession);
+  const interruptedLifecycle = paneLifecycleStatus?.kind === 'interrupted' ? paneLifecycleStatus : null;
+  const interruptedSessionId = interruptedLifecycle?.sessionId || null;
+  // Движок берётся из поля сводки, а не из её заголовка: разбор подписи связал
+  // бы возобновление с текстом, и правка формулировки молча сломала бы
+  // «продолжить».
+  const interruptedEngine = interruptedLifecycle?.engine || null;
+  const showInterrupted = !!interruptedLifecycle && !isRestoring;
+
   const terminalIsPrimary = useUIStore((state) => resolveTabTerminalPrimary(state, tabId));
   const setTabTerminalIsPrimary = useUIStore((state) => state.setTabTerminalIsPrimary);
   const historyPanelWidth = useUIStore((state) => state.historyPanelWidth);
@@ -260,9 +276,19 @@ export default function SplitPaneSurface({
             </div>
           )}
 
-          {/* Run after strip host — the pane's service layer. Above both
-              surfaces (z 120), below the pane's side panels (z 130), never
-              dimmed and never hidden by the mode toggle.
+          {/* Run after strip host — the pane's service layer. Above BOTH its
+              surfaces и выше его боковых окон (у тех 130), никогда не гасится и
+              не прячется переключателем режима.
+
+              Полоска принадлежит окну целиком, а боковая панель — временный
+              гость поверх его центра, вызываемый одной клавишей. Гость не может
+              закрывать собой постоянный орган управления: полоска перестала
+              отходить в сторону при его открытии, и на слое ниже это означало
+              бы не «стоит на месте», а «спряталась под ним». То же правило и
+              тем же числом действует в одиночном режиме
+              (Workspace.tsx::promptQueuePortalHostId) — раскладки разные, а
+              ответ на вопрос «кто кого закрывает» один.
+
               `bottom` is the measured height of this pane's docked input, so
               the strip stops ABOVE the composer instead of overlapping it. The
               same number moves the pane's terminal upward, so the two cannot
@@ -278,7 +304,7 @@ export default function SplitPaneSurface({
               left: 0,
               right: 0,
               bottom: Math.max(0, historyControlsHeight),
-              zIndex: 120,
+              zIndex: 140,
               pointerEvents: 'none',
             }}
           />
@@ -331,6 +357,31 @@ export default function SplitPaneSurface({
           </div>
         )}
       </div>
+
+      {/* Плашка «сессия была прервана» — ВНУТРИ своего окна.
+          Растянута на панель, а не на всю рабочую область: она говорит про одну
+          вкладку, и накрывать ею соседние окна значит спрашивать про эту вкладку
+          там, где её нет. Слой выше содержимого панели, но ниже её рамки (200):
+          граница окна не должна прерываться его же плашкой. */}
+      {showInterrupted && interruptedSessionId && (
+        <div style={{ position: 'absolute', inset: 0, zIndex: 150, pointerEvents: 'auto' }}>
+          <InterruptedSessionOverlay
+            tabId={tabId}
+            sessionId={interruptedSessionId}
+            engine={interruptedEngine || 'claude'}
+            onContinue={() => {
+              void continueInterruptedSession({
+                tabId,
+                projectId,
+                sessionId: interruptedSessionId,
+                engine: interruptedEngine,
+                clearInterruptedState,
+              });
+            }}
+            onDismiss={() => dismissInterruptedSession(tabId)}
+          />
+        </div>
+      )}
 
       {/* ── The pane's own Timeline column at its right edge ── */}
       {showTimeline && (

@@ -1,12 +1,36 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  mergeTimelineEntriesWithSentHandoffs,
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
+  projectTimelineSentHandoff,
   recordHistorySurfacePresented,
   readPresentedHistorySurface,
+  upsertTimelineSentHandoffEntries,
   __resetPresentedHistorySurfacesForTest,
 } from './timelineTranscriptRefresh.mjs';
+
+function sentHandoff(overrides = {}) {
+  return {
+    handoffId: 'handoff-a',
+    toolType: 'codex',
+    sessionIdHint: 'session-a',
+    queueStatus: 'sent',
+    submittedAt: Date.parse('2026-08-18T22:08:25.131Z'),
+    text: '<saved_prompt name="FULL документация">full body</saved_prompt>',
+    source: 'history-panel',
+    imagePaths: [],
+    auditProof: {
+      sessionId: 'session-a',
+      entryUuid: 'codex-user-session-a-687',
+      sourceIdentity: 'codex-user-source-session-a-2232297',
+      auditTimestamp: '2026-08-18T22:08:26.286Z',
+      actualHash: 'exact-hash',
+    },
+    ...overrides,
+  };
+}
 
 test('hidden Timeline retains invalidation until Project Home closes', () => {
   const hidden = planTimelineTranscriptRefresh({
@@ -121,4 +145,88 @@ test('a newer presentation for the same tab overwrites the old record', () => {
     readPresentedHistorySurface({ tabId: 'tab-1', sessionId: 's-9', toolType: 'codex' })?.proof,
     'b',
   );
+});
+
+test('exact SENT handoff projects one lightweight addressable Timeline point while busy', () => {
+  const point = projectTimelineSentHandoff(sentHandoff({
+    text: 'x'.repeat(70_000),
+    imagePaths: [{ id: 1, path: '/tmp/image.png' }],
+  }), { toolType: 'codex', sessionId: 'session-a' });
+  assert.equal(point.uuid, 'codex-user-session-a-687');
+  assert.equal(point.sourceIdentity, 'codex-user-source-session-a-2232297');
+  assert.equal(point.handoffId, 'handoff-a');
+  assert.equal(point.hasImage, true);
+  assert.ok(point.content.length < 2_100);
+});
+
+test('queue intent, wrong owner, and receipts without canonical UUID never mint a point', () => {
+  assert.equal(projectTimelineSentHandoff(sentHandoff({ queueStatus: 'queued' }), {
+    toolType: 'codex', sessionId: 'session-a',
+  }), null);
+  assert.equal(projectTimelineSentHandoff(sentHandoff(), {
+    toolType: 'codex', sessionId: 'session-b',
+  }), null);
+  assert.equal(projectTimelineSentHandoff(sentHandoff({
+    auditProof: {
+      sessionId: 'session-a',
+      sourceIdentity: 'source-only',
+      auditTimestamp: '2026-08-18T22:08:26.286Z',
+      actualHash: 'exact-hash',
+    },
+  }), { toolType: 'codex', sessionId: 'session-a' }), null);
+});
+
+test('canonical UUID or source alias replaces the light point without fuzzy text matching', () => {
+  const responsePoint = projectTimelineSentHandoff(sentHandoff(), {
+    toolType: 'codex', sessionId: 'session-a',
+  });
+  const promotedCanonical = {
+    uuid: 'codex-user-session-a-690',
+    sourceIdentity: 'codex-user-source-session-a-2232400',
+    sourceIdentityAliases: ['codex-user-source-session-a-2232297'],
+    type: 'user',
+    timestamp: '2026-08-18T22:08:26.300Z',
+    content: 'canonical body',
+  };
+  assert.deepEqual(
+    mergeTimelineEntriesWithSentHandoffs([promotedCanonical], [responsePoint]),
+    [promotedCanonical],
+  );
+
+  const sameTextDifferentIdentity = {
+    ...promotedCanonical,
+    uuid: 'different-user',
+    sourceIdentity: 'different-source',
+    sourceIdentityAliases: [],
+    content: responsePoint.content,
+  };
+  assert.equal(
+    mergeTimelineEntriesWithSentHandoffs([sameTextDifferentIdentity], [responsePoint]).length,
+    2,
+  );
+});
+
+test('byte-identical consecutive sends keep distinct handoff identities', () => {
+  const first = projectTimelineSentHandoff(sentHandoff(), {
+    toolType: 'codex', sessionId: 'session-a',
+  });
+  const second = projectTimelineSentHandoff(sentHandoff({
+    handoffId: 'handoff-b',
+    auditProof: {
+      ...sentHandoff().auditProof,
+      entryUuid: 'codex-user-session-a-688',
+      sourceIdentity: 'codex-user-source-session-a-2232399',
+    },
+  }), { toolType: 'codex', sessionId: 'session-a' });
+  assert.deepEqual(
+    upsertTimelineSentHandoffEntries([], [first, second]).map((entry) => entry.handoffId),
+    ['handoff-a', 'handoff-b'],
+  );
+});
+
+test('Loop uses the same SENT projection and keeps its semantic origin tag', () => {
+  const point = projectTimelineSentHandoff(sentHandoff({ source: 'prompt-loop' }), {
+    toolType: 'codex', sessionId: 'session-a',
+  });
+  assert.deepEqual(point.semanticTags, [{ kind: 'prompt-origin', source: 'loop' }]);
 });

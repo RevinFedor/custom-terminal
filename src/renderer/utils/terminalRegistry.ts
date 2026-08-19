@@ -225,7 +225,6 @@ const defaultSearchOptions: ISearchOptions = {
   }
 };
 
-const GEMINI_BRAILLE_RE = /[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/;
 const CODEX_NON_DRAFT_LINE_RE = /(OpenAI Codex|model:|directory:|permissions:|Use \/skills|Full Access|Context \d+%|weekly \d+%|Starting MCP|esc to interrupt|Select Model|Tip:|Model changed|^\s*[a-z0-9][a-z0-9_.-]*\s+(?:none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+fast)?(?:\s*·|$)|^╭|^╰|^│)/i;
 const CODEX_EMPTY_COMPOSER_HINT_RE = /Use \/skills to list available skills/i;
 
@@ -443,21 +442,6 @@ function summarizeXtermLineStyles(line: any): { styles: string[]; firstTextStyle
 }
 
 export const terminalRegistry = {
-  /** Check if Gemini spinner (Braille characters) is visible on screen for a given tab */
-  hasSpinnerOnScreen(tabId: string): boolean {
-    const term = terminals.get(tabId);
-    if (!term) return false;
-    const buf = term.buffer.active;
-    // Check last 5 visible lines for Braille (spinner is at bottom of Ink TUI)
-    for (let i = 0; i < 5; i++) {
-      const lineIdx = buf.baseY + buf.cursorY - i;
-      if (lineIdx < 0) break;
-      const line = buf.getLine(lineIdx);
-      if (line && GEMINI_BRAILLE_RE.test(line.translateToString())) return true;
-    }
-    return false;
-  },
-
   register(tabId: string, terminal: XTerminal, searchAddon?: SearchAddon) {
     ensureRendererBoundaryState(tabId, terminal);
     terminals.set(tabId, terminal);

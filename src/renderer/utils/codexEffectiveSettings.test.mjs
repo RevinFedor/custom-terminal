@@ -52,6 +52,21 @@ test('persists selected settings only after an accepted fresh Codex launch', () 
   });
 });
 
+test('metadata-only Resume persists its accepted pair as a fresh launch', () => {
+  assert.deepEqual(planCodexLaunchSettingsPersistence({
+    command: 'codex-c',
+    result: { success: true, accepted: true },
+    payload: {
+      model: 'gpt-5.6-terra',
+      effort: 'max',
+      materializedFresh: true,
+    },
+  }), {
+    codexModel: 'gpt-5.6-terra',
+    codexEffort: 'max',
+  });
+});
+
 test('does not persist launch payload for Continue, Fork, failure, or rejection', () => {
   const payload = { model: 'gpt-5.6-sol', effort: 'max' };
   assert.equal(planCodexLaunchSettingsPersistence({

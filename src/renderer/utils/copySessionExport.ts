@@ -14,23 +14,8 @@
 const { ipcRenderer } = window.require('electron');
 
 import { requireCodexSurfaceSessionId } from './codexWriterIdentity';
-
-export interface CopySessionFilters {
-  includeEditing: boolean;
-  includeReading: boolean;
-  fromStart: boolean;
-  includeSubagentResult: boolean;
-  includeSubagentHistory: boolean;
-  includeUser: boolean;
-  includeClaude: boolean;
-  includeText: boolean;
-  includeThinking: boolean;
-  includeBash: boolean;
-  includeTools: boolean;
-  includeWebSearch: boolean;
-  includeToolSearch: boolean;
-  includeOtherTools: boolean;
-}
+import type { CopySessionFilters } from './copySessionFilters';
+export type { CopySessionFilters } from './copySessionFilters';
 
 interface CopySessionTab {
   id: string;

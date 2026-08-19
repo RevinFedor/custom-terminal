@@ -73,6 +73,7 @@ export function buildTimelineCornerBadges({
   isLoop = false,
   docsEditedCount = 0,
   docsSearchCount = 0,
+  subagentCount = 0,
   collapsedGroupSize = 0,
   compactClusterSize = 0,
 } = {}) {
@@ -80,7 +81,7 @@ export function buildTimelineCornerBadges({
   const groupCount = collapsedGroupSize > 1 ? String(collapsedGroupSize) : null;
   const count = compactCount || groupCount;
   const countTone = compactCount ? 'compact' : count ? 'group' : null;
-  const cacheKey = `${isLoop ? 1 : 0}${docsEditedCount > 0 ? 1 : 0}${docsSearchCount > 0 ? 1 : 0}:${countTone || ''}:${count || ''}`;
+  const cacheKey = `${isLoop ? 1 : 0}${docsEditedCount > 0 ? 1 : 0}${docsSearchCount > 0 ? 1 : 0}:a${Math.max(0, Number(subagentCount) || 0)}:${countTone || ''}:${count || ''}`;
   const cached = cornerBadgeCache.get(cacheKey);
   if (cached) return cached;
 
@@ -88,8 +89,12 @@ export function buildTimelineCornerBadges({
   if (isLoop) icons.push('loop');
   if (docsEditedCount > 0) icons.push('docs-edit');
   if (docsSearchCount > 0) icons.push('docs-search');
+  if (subagentCount > 0) icons.push('agents');
 
-  const ordered = icons.map(kind => ({ kind }));
+  const ordered = icons.map(kind => ({
+    kind,
+    ...(kind === 'agents' ? { text: String(subagentCount) } : {}),
+  }));
   if (count) {
     const countItem = { kind: 'count', text: count, tone: countTone };
     if (countTone === 'compact' && ordered.length > 0) ordered.splice(1, 0, countItem);

@@ -81,28 +81,6 @@ function sanitizeFileForPrompt(raw, filePath) {
 }
 
 function register({ projectManager }) {
-  // ── Global Commands ──
-
-  ipcMain.handle('commands:get-global', async () => {
-    try {
-      const commands = projectManager.getGlobalCommands();
-      return { success: true, data: commands };
-    } catch (error) {
-      console.error('[main] Error getting global commands:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-  ipcMain.handle('commands:save-global', async (event, commands) => {
-    try {
-      projectManager.saveGlobalCommands(commands);
-      return { success: true };
-    } catch (error) {
-      console.error('[main] Error saving global commands:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
   // ── Prompts ──
 
   ipcMain.handle('prompts:get', async () => {

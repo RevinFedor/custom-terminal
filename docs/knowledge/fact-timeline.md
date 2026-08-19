@@ -18,6 +18,13 @@
    - **Сиреневый `Chat`** — открывает то же Gemini/review-окно без автоматической отправки. Источник уже собран и виден отдельным раскрываемым блоком, а в composer лежит настроенный Rewind-промпт вместе с подключёнными к нему файлами. `Ctrl+A` заменяет инструкцию целиком; дописывание в конец уточняет её. До явного `Send`, ответа Gemini и `Применить` сохранённая история не меняется.
    Три сиреневых действия показываются только для обычных user-entry с доступным session id; служебные записи обслуживает delete-flow выше. Range-выделение использует `AI`/`Chat`, но не показывает native или suffix-Rewind: произвольный диапазон не задаёт однозначную точку возврата. Rewrite-входы переиспользуют существующие `delete-range`, `executeRangeAction('edit')` и `openEditRangeChat`, а не создают новые JSONL-парсеры.
 
+   Codex project-instructions (`# AGENTS.md/CLAUDE.md instructions …`) остаются
+   видимым attachment-chip в History, но не являются Timeline user-entry и не
+   получают собственные destructive actions. Их raw provider-записи входят в
+   preamble следующего настоящего user-turn. Поэтому Selection/Delete никогда
+   не адресует служебный UUID, а диапазон через compact/project-context остаётся
+   точным.
+
    **Visibility/authority:** янтарный native Rewind подчиняется live-runtime readiness и во время `busy/starting/stopping` остаётся видимым disabled. Сиреневый suffix-Rewind и Delete владеют полным сценарием `stop → mutate именно показанную сохранённую session → restart`, поэтому не зависят от предварительного Codex writer-proof, не исчезают в `provisional-source` после Resume и не блокируются обычным turn loader. Disabled для них означает только уже начавшуюся destructive preparation/mutation. Прод-шрам 2026-08-17, `tab-3608`: после успешного Delete `01a00f1a → a1fd561d` Resume оставался `provisional-source` более двух минут; старая проверка `canRewriteHistory/canDeleteHistory` спрятала сиреневую строку и выключила Delete, пока ручной Escape случайно не создал writer-proof.
    Кнопка Rewind под user-сообщением History передаёт сюда raw UUID и использует тот же eligibility guard/handler; второй rollback-flow запрещён.
    Native Rewind Claude/Codex удерживает одну общую PTY-транзакцию. Внутренний
@@ -99,6 +106,26 @@
     - Orchestration-turn не участвует в AI prompt summary, auto-title и ручной semantic outline: его устойчивый смысл уже задан tag'ом и `runId`, а пересказ служебного уведомления создавал бы второй, менее точный label.
     - Legacy backfill за ограниченный период может распознать точный служебный prefix, но записывает только sidecar и идемпотентно пропускает уже размеченные identity. Это миграционная процедура, не runtime-эвристика.
 - **Transcript refresh:** Timeline больше не владеет постоянным 2s polling'ом JSONL/rollout. Для Claude/Codex он подписывается на main-process `SessionTranscriptService` и обновляется по `agent-transcript:changed`; visibility-resume делает reconciliation refresh, но это страховка от пропущенного события, а не clock системы. Старый `isVisible` guard защищал только renderer, но не решал проблему нескольких readers одного большого файла. Подробности — `fact-transcript-сервис.md`.
+  - Полный Timeline refresh во время `busy` по-прежнему откладывается: новый
+    user-carrier не даёт права разбирать весь растущий transcript во время
+    streaming. Но `CONFIRMING → SENT` уже является точным фактом доставки.
+    Timeline подписывается на тот же History handoff; exact audit переводит
+    его в SENT, а targeted History adoption дополняет handoff canonical UUID
+    перед presentation ACK/consume. В этот же момент появляется одна лёгкая
+    user-точка с canonical UUID, source identity и bounded preview.
+    На следующем durable refresh запись с тем же UUID либо source alias
+    заменяет эту точку в том же render без дубля; текст и близкое время в
+    сопоставлении не участвуют. Благодаря реальному UUID Selection, Copy и
+    Rewind адресуют ту же provider-запись ещё до окончания ответа. Bounded
+    preview не запускает auto-title, prompt summary и semantic outline:
+    существующие группы остаются стабильны, а новый turn присоединяется к ним
+    только после canonical refresh. Provider queue без post-submit audit, startup AGENTS/environment
+    carrier и receipt без canonical UUID точку не создают. Один контракт
+    обслуживает обычный текст, saved-prompt chip, images, Queue и Loop; Loop
+    сохраняет свой `prompt-origin` tag. Прод-шрам: длинный prompt-only chip в
+    `new_project_1780063688522_5r84fv-tab-174`, handoff
+    `msz7s7je-9p72ve`: `task_started` пришёл перед `user_message`, History уже
+    показала SENT, а Timeline дважды отложила новую точку как `turn-busy`.
   - **rAF-debounced Scroll Check (Feb 2026):** Функция `checkScrollPosition` (обновляющая кнопку "scroll down" и viewport rect в registry) вызывается только один раз за кадр анимации (requestAnimationFrame). Ink differential renderer генерирует множество `onWriteParsed` событий в секунду — без дебаунса каждое событие вызывает пересчет Timeline и React re-render. rAF-дебаунс коллапсирует N событий в одно, предотвращая рывки при прокрутке длинных ответов.
 
 ### Sizing & Scrolling
@@ -302,7 +329,11 @@ Desktop сначала делает `validateOnly` по ещё живой вкл
 
 **Работа в режиме выделения:**
 - При наведении на другие точки — синий индикатор показывает выбранный диапазон.
-- **Одинарный клик по другой точке** → popup-меню с выбором: "Копировать", "Редактировать" или split-кнопкой удаления.
+- **Старт диапазона:** ПКМ одиночной точки показывает split 80/20 — широкая
+  зона `Выбрать` включает ту же range state-machine, что double-click, узкая
+  иконка сохраняет single Copy. Следующий клик по другой итерации только задаёт
+  вторую границу и открывает range-меню; навигация Timeline/History этим кликом
+  не выполняется, включая read-only presentation.
 - **Одинарный клик по начальной точке** → отменяет выделение.
 - **Клик вне таймлайна** → отменяет выделение.
 - **ПКМ в режиме выделения** → "Отменить копирование".

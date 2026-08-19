@@ -7,6 +7,57 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { SessionTranscriptService } = require('./session-transcript-service');
+const claudeData = require('./ipc/claude-data');
+const {
+  CLAUDE_HISTORY_CONTEXT_ACK_MODEL,
+  CLAUDE_HISTORY_CONTEXT_ACK_TEXT,
+} = require('./agent-history-context-injection');
+
+test('Claude history-only boundary reaches lifecycle observers but never the live History renderer', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-live-history-context-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session-context.jsonl');
+  const record = {
+    type: 'assistant',
+    uuid: 'history-context-boundary',
+    timestamp: '2026-08-19T00:00:00.000Z',
+    message: {
+      role: 'assistant',
+      model: CLAUDE_HISTORY_CONTEXT_ACK_MODEL,
+      content: [{ type: 'text', text: CLAUDE_HISTORY_CONTEXT_ACK_TEXT }],
+      stop_reason: 'end_turn',
+    },
+  };
+  const line = JSON.stringify(record) + '\n';
+  await fs.promises.writeFile(filePath, line);
+  const raw = [];
+  const live = [];
+  const rendered = [];
+  const service = new SessionTranscriptService({
+    getMainWindow: () => ({
+      isDestroyed: () => false,
+      webContents: { send: (...args) => rendered.push(args) },
+    }),
+    webBroadcast: null,
+    onRawRecord: (detail) => raw.push(detail),
+    onLiveMessage: (detail) => live.push(detail),
+    claudeData,
+    codexData: null,
+  });
+
+  await service._broadcastClaudeDelta({
+    filePath,
+    size: Buffer.byteLength(line),
+    offset: 0,
+    leftover: '',
+    sessionId: 'session-context',
+    consumers: new Map([['history:tab-context', { tabId: 'tab-context' }]]),
+  }, 0);
+
+  assert.equal(raw.length, 1, 'main lifecycle still observes the provider record');
+  assert.deepEqual(live, []);
+  assert.deepEqual(rendered, []);
+});
 
 test('Claude live observer receives exact byte boundary before renderer fan-out', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-live-preview-'));

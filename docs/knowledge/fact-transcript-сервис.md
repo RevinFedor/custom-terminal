@@ -91,6 +91,13 @@ Durable revision строится из identity и метаданных реал
 
 Локальные `sending/queued/sent`, rewind marker, handoff metadata и временные suppression не входят в durable snapshot. Они живут в отдельном LRU-overlay с лимитами восемь owners / 512 элементов / 2 MiB и восстанавливаются при переключении вкладки. Смешать их с server rows опасно в обе стороны: локальный prompt пропадёт на remount до записи в transcript, а suppression-filtered server array может навсегда скрыть строку после истечения TTL. Ближайшее истечение suppression запускает одноразовую reconciliation из raw snapshot; постоянный timer polling не нужен.
 
+Timeline не снимает busy-дефер этого сервиса ради одного нового prompt. После
+exact SENT targeted History projection дополняет общий handoff canonical UUID
+до presentation consume, и Timeline временно добавляет только bounded
+user-marker. Следующий обычный snapshot заменяет его по UUID/source alias. Это
+presentation-overlay, а не второй transcript reader и не отдельный polling
+clock.
+
 Каждая committed привязка History к owner получает монотонное поколение. Проверка только по owner-key недостаточна для A → B → A: поздний ответ первого A снова совпадёт по ключу и перетрёт более новый A. Любая state/cache write после async должна подтвердить и key, и generation.
 
 **Дегидрация тяжёлых payload (реализовано).** Tool-результаты/thinking/compact больше порога (16KB) покидают main как превью 2KB + детерминированная ссылка (`result:<tool_use_id>` / `thinking:<uuid>` / `compact:<uuid>`); полный текст renderer получает по требованию через `history:get-tool-payload` при раскрытии карточки (render-cap 4MB на один проход, «сколько скрыто» пишется в самом превью). Это не молчаливое truncation: preview+identity сохраняют доступ к полному результату. Оригиналы — в общем byte-bounded stash (`history-payload-dehydrate.js`, LRU 192MiB); stash-miss для Codex перезапускает проекцию (records LRU-кэшированы), для Claude — точечный re-extract из recordMap включая склейку background-notification (`rebuildHistoryPayloadStash`), потому что payload identity детерминирована per source record. **Дегидрация строго opt-in per call** (`dehydrate: true` шлёт только desktop HistoryPanel): web/iOS/Timeline потребители тех же каналов получают полные payload, пока не заведут собственный rehydration-путь — молча выдать им превью было бы capability downgrade. Compact у Claude не дегидрируется (короткая проза + branch look-ahead extraction); у Codex — дегидрируется (replacement_history бывает сотни MB). Смежное правило для live-overlay: durable-строка с `resultRef` покрывает live tool-result по факту наличия ссылки, не по равенству текста — иначе превью никогда не совпадёт с полным live-текстом и reconcile зациклит refreshes.

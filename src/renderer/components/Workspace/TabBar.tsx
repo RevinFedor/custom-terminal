@@ -18,9 +18,10 @@ import { isNaturalAgentTurnEndReason } from '../../utils/agentCompletionOutcome.
 import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
-import { PaneMapCells, usePaneMapColumns } from './PaneMap';
+import { TabPaneMap } from './PaneMap';
 import { paneIndexHoldingTab } from '../../utils/splitPanesModel.mjs';
 import { copySessionsToClipboard, tabHasCopyableSession } from '../../utils/copySessionExport';
+import { copySessionFiltersFromState } from '../../utils/copySessionFilters';
 import MoveToWindowMenu from './MoveToWindowMenu';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
@@ -80,6 +81,7 @@ import {
 import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
+import { resolveSubmenuSide, submenuArrow, WIDEST_SUBMENU_WIDTH } from '../../utils/submenuSide.mjs';
 import { acceptTabBackgroundWorkRecord } from '../../utils/tabBackgroundWorkState.mjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -1320,7 +1322,6 @@ const TabItem = memo(({
   const tabGeo = useUIStore((s) => s.tabGeometry);
 
   // Shared with the switcher and the recent-tabs list — one mark, one meaning.
-  const paneMapColumns = usePaneMapColumns(projectId, tab.id);
 
   // Get color config
   // SDK tabs share `color: 'claude'` with PTY claude tabs (so existing palette
@@ -2490,7 +2491,7 @@ const TabItem = memo(({
               right of the name and left of the action cluster; the slot keeps
               its width even when the tab is in no pane, so the name never
               shifts as the tab enters or leaves the workspace. */}
-          {isVerticalMode && !isCollapsed && <PaneMapCells columns={paneMapColumns} />}
+          {isVerticalMode && !isCollapsed && <TabPaneMap projectId={projectId} tabId={tab.id} />}
 
           {hasVerticalRightActionCluster && (
             <div
@@ -3749,9 +3750,8 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   // A live subagent keeps the tab's ordinary loader on — that is intended, not
   // a bug: work IS attributable to this session, so the tab looks busy exactly
   // like it does during its own turn. (The purple orchestration loader is a
-  // different signal and stays separate.) The real defects around this are
-  // elsewhere: the count is only computed while History is mounted, and a
-  // finished agent keeps counting until the parent notices.
+  // different signal and stays separate.) The count and exact active call ids
+  // are main-owned, so closing History cannot erase or resurrect them.
   const isTabTurnBusy = (tab: TabData): boolean => {
     const pasteBusy = pasteBusyMap.get(tab.id) || false;
     const backgroundWork = backgroundWorkMap.get(tab.id) || false;
@@ -3774,6 +3774,8 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const [contextMenuPos, setContextMenuPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  // Сторона вложенных списков — одна на всё меню, см. utils/submenuSide.mjs.
+  const [submenuSide, setSubmenuSide] = useState<'left' | 'right'>('right');
 
   const isCmdPressed = useCmdKey();
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
@@ -6435,6 +6437,16 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     if (x !== contextMenuPos.x || y !== contextMenuPos.y) {
       setContextMenuPos({ x, y });
     }
+    // Вложенные списки решаются здесь же: корневое меню уже вжато в окно, и
+    // только теперь известно, где его правый край окажется на самом деле.
+    // Считается по УЖЕ вычисленному x, а не по прежнему положению, иначе первое
+    // открытие у края решало бы по координатам предыдущего.
+    setSubmenuSide(resolveSubmenuSide({
+      menuLeft: x,
+      menuRight: x + rect.width,
+      submenuWidth: WIDEST_SUBMENU_WIDTH,
+      viewportWidth: window.innerWidth,
+    }));
   }, [contextMenu, groupContextMenu, emptyContextMenu, contextScripts.length, contextShScripts.length, openProjects]);
 
   useLayoutEffect(() => {
@@ -9237,7 +9249,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
           {(() => {
             // Canonical AI tints used elsewhere in the app:
             // Claude #DA7756 = Provider row primary (InfoPanel)
-            // Gemini  #4E86F8 = TAB_COLORS.gemini, ApiSettingsModal, ActionsPanel copy accent
+            // Gemini  #4E86F8 = TAB_COLORS.gemini, copy-session accent
             // Codex   #10A37F = TAB_COLORS.codex
             const CLAUDE_TINT = '#DA7756';
             const GEMINI_TINT = '#4E86F8';
@@ -9607,9 +9619,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
               >
                 <FolderInput size={12} className="text-[#888] flex-shrink-0" />
                 <span>Move to Project</span>
-                <span className="text-[#666] ml-auto">›</span>
+                <span className="text-[#666] ml-auto">{submenuArrow(submenuSide)}</span>
               </button>
-              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/tab-project-move:block">
+              <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/tab-project-move:block`}>
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-md shadow-2xl py-1 min-w-[190px]">
                   {projectMoveTargetIds.map((targetProjectId) => (
                       <button
@@ -9775,7 +9789,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                                 >
                                   {displayedCommandLabel}
                                 </span>
-                                <span className="text-[#666]">{'\u203A'}</span>
+                                <span className="text-[#666]">{submenuArrow(submenuSide)}</span>
                               </span>
                             </button>
                             {selectedCommand && (
@@ -9791,7 +9805,9 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                               </button>
                             )}
                           </div>
-                          <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/restart-script:block">
+                          <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/restart-script:block`}>
                             <div className="bg-[#2a2a2a] border border-[#444] rounded-md shadow-2xl py-1 min-w-[220px] max-h-[300px] overflow-y-auto">
                               {scriptTargets.length === 0 && (
                                 <div className="context-menu-submenu-empty">No scripts</div>
@@ -9844,10 +9860,12 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                         }}
                       />
                     ))}
-                    <span className="text-[#666] ml-1">›</span>
+                    <span className="text-[#666] ml-1">{submenuArrow(submenuSide)}</span>
                   </span>
                 </button>
-                <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/status:block">
+                <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/status:block`}>
                   <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[220px]">
                     {ctxSessionStatuses.length === 0 && (
                       <div className="px-4 py-2 text-[12px] text-[#666] italic">
@@ -9899,10 +9917,12 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                                   />
                                 );
                               })()}
-                              <span className="text-[#555]">›</span>
+                              <span className="text-[#555]">{submenuArrow(submenuSide)}</span>
                             </span>
                           </button>
-                          <div className="absolute left-full bottom-0 -ml-2 pl-2 hidden group-hover/background:block">
+                          <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} bottom-0 hidden group-hover/background:block`}>
                             <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[165px]">
                               {TAB_COLORS.map((c) => {
                                 const currentColor = workspace.tabs.get(contextMenu.tabId)?.color || 'default';
@@ -10000,9 +10020,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                   Scripts
                   {(contextScripts.length + contextShScripts.length) > 0 && <span className="text-[10px] text-[#555]">{contextScripts.length + contextShScripts.length}</span>}
                 </span>
-                <span className="text-[#666]">{'\u203A'}</span>
+                <span className="text-[#666]">{submenuArrow(submenuSide)}</span>
               </button>
-              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/scripts:block">
+              <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/scripts:block`}>
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[160px] max-h-[300px] overflow-y-auto">
                   {/* Stop: <name> moved to the top-level Close+Stop split-pill (mirrors Stop Claude UX).
                       Kept here only as a fallback dropdown action if for some reason the split isn't
@@ -10075,9 +10097,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                   <span className="truncate">Info</span>
                   <span className="text-[10px] text-[#555]">{commandHistoryByTab.get(contextMenu.tabId)?.length || 0}</span>
                 </span>
-                <span className="text-[#666]">{'\u203A'}</span>
+                <span className="text-[#666]">{submenuArrow(submenuSide)}</span>
               </button>
-              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/command-info:block">
+              <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/command-info:block`}>
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 w-[280px] max-h-[300px] overflow-y-auto">
                   <div className="px-3 py-1.5 text-[11px] text-[#888] border-b border-[#333]">
                     Command history
@@ -10102,9 +10126,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                   <Columns2 size={12} className="text-[#888] flex-shrink-0" />
                   <span className="truncate">Move to window</span>
                 </span>
-                <span className="text-[#666]">{'\u203A'}</span>
+                <span className="text-[#666]">{submenuArrow(submenuSide)}</span>
               </button>
-              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/move-window:block">
+              <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/move-window:block`}>
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl w-[260px]">
                   <MoveToWindowMenu
                     projectId={projectId}
@@ -10283,22 +10309,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                     const res = await copySessionsToClipboard({
                       tabs: copyable as any,
                       fallbackCwd: project?.path || '',
-                      filters: {
-                        includeEditing: ui.copyIncludeEditing,
-                        includeReading: ui.copyIncludeReading,
-                        fromStart: ui.copyFromStart,
-                        includeSubagentResult: ui.copyIncludeSubagentResult,
-                        includeSubagentHistory: ui.copyIncludeSubagentHistory,
-                        includeUser: ui.copyIncludeUser,
-                        includeClaude: ui.copyIncludeClaude,
-                        includeText: ui.copyIncludeText,
-                        includeThinking: ui.copyIncludeThinking,
-                        includeBash: ui.copyIncludeBash,
-                        includeTools: ui.copyIncludeTools,
-                        includeWebSearch: ui.copyIncludeWebSearch,
-                        includeToolSearch: ui.copyIncludeToolSearch,
-                        includeOtherTools: ui.copyIncludeOtherTools,
-                      },
+                      filters: copySessionFiltersFromState(ui),
                     });
                     if (res.copied > 0) {
                       const sizeKB = Math.round(res.content.length / 1024);
@@ -10342,9 +10353,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                     Revert Session
                     <span className="text-[10px] text-[#555]">{hist.length}</span>
                   </span>
-                  <span className="text-[#666]">{'›'}</span>
+                  <span className="text-[#666]">{submenuArrow(submenuSide)}</span>
                 </button>
-                <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/revert:block">
+                <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/revert:block`}>
                   <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[260px]">
                     {hist.map((entry, idx) => (
                       <button
@@ -10436,9 +10449,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
               >
                 <FolderInput size={12} className="text-[#888] flex-shrink-0" />
                 <span>Move to Project</span>
-                <span className="text-[#666] ml-auto">›</span>
+                <span className="text-[#666] ml-auto">{submenuArrow(submenuSide)}</span>
               </button>
-              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/group-project-move:block">
+              <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/group-project-move:block`}>
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-md shadow-2xl py-1 min-w-[190px]">
                   {projectMoveTargetIds.map((targetProjectId) => (
                       <button
@@ -10482,10 +10497,12 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                       }}
                     />
                   ))}
-                  <span className="text-[#666] ml-1">›</span>
+                  <span className="text-[#666] ml-1">{submenuArrow(submenuSide)}</span>
                 </span>
               </button>
-              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/group-status:block">
+              <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/group-status:block`}>
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[220px]">
                   {ctxSessionStatuses.length === 0 && (
                     <div className="px-4 py-2 text-[12px] text-[#666] italic">
@@ -10533,10 +10550,12 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                             />
                           );
                         })()}
-                        <span className="text-[#555]">›</span>
+                        <span className="text-[#555]">{submenuArrow(submenuSide)}</span>
                       </span>
                     </button>
-                    <div className="absolute left-full bottom-0 -ml-2 pl-2 hidden group-hover/group-background:block">
+                    <div className={`absolute ${submenuSide === 'left'
+                  ? 'right-full -mr-2 pr-2'
+                  : 'left-full -ml-2 pl-2'} bottom-0 hidden group-hover/group-background:block`}>
                       <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[165px]">
                         {TAB_COLORS.map((c) => {
                           const currentColor = group.color || 'default';

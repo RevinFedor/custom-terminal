@@ -24,15 +24,42 @@ Bash после 60 символов, не тянул результаты для
 рисовать настоящие карточки, парсер теперь к каждому **не-Task** tool_use крепит
 сырой носитель `{ tool: '__raw__', rawTool: {toolName, args, result, isError} }`
 (полный input + результат через generic `findToolResult()`). HistoryPanel рендерит
-их через `ToolCallPart`, thinking → `ThinkBlock`, текст → `Markdown`. **Субагенты
-(Task) НЕ тронуты** — остаются на legacy `SubAgentBlock` (просьба «субагентов пока
-не трогаем»). Legacy-shape'ы (`FileAction`/string — Gemini/старый кэш) сохранены как
+их через `ToolCallPart`, thinking → `ThinkBlock`, текст → `Markdown`.
+Presentation-обвязка групп вынесена в
+`Workspace/HistoryTranscriptPresentation.tsx`: основной History и вложенная
+история субагента используют одни `HistoryCollapsedGroupRow`, rail/foot,
+семантическую грамматику, `ToolCallPart`, `ThinkBlock`, `Markdown` и
+`ConversationMessage`. Сам lifecycle Task-карточки остаётся в `HistoryPanel` —
+presentation-компонент не решает, жив ли агент и где лежит его rollout.
+Legacy-shape'ы (`FileAction`/string — Gemini/старый кэш) сохранены как
 фоллбэк, рендерятся в исходном порядке (turn чередует Bash→Edit→Task). Пакетные
 компоненты **context-free** (ноль зависимостей от Zustand/контекста) — поэтому
 безопасны вне SDK-таба. **Главное правило при правках парсера:** main-процесс не
 hot-reload'ится — нужен рестарт Electron (dev: рестарт `npm run dev`-таба; prod:
 `build:install`), иначе `rawTool` не появится и HistoryPanel молча уйдёт в legacy-
 фоллбэк.
+
+### Вложенный transcript субагента
+
+`HistoryTranscriptPresentation` принимает компактные `HistoryTranscriptStep[]`
+и прогоняет tool-steps через тот же `history-action-grammar` и
+`buildHistoryDisplayUnits`, что основную ленту. Поэтому Read/Search/Edit/Run,
+MCP, group counters, docs-colour, chevron и весь левый rail больше не имеют
+отдельной subagent-копии. Старый `TaskAction.history` адаптируется функцией
+`historyTurnsToTranscriptSteps`; live `subagent:read-steps` сразу отдаёт
+tool args/family/MCP identity и user/assistant role. Основная лента сохраняет
+Virtuoso и scroll anchoring у себя, вложенная использует внутреннее раскрытие
+пакетных карточек — presentation одинаков, механика viewport разная.
+
+Incremental reader хранит call/result pairing между byte-offset reads:
+результат обновляет ту же `HistoryTranscriptStep.id`, а не рисует
+вторую карточку. Codex child `exec` декодируется тем же
+`codexHistoryActionsForCall`, что parent History; async-cell `wait` закрывает
+исходный Run. User/assistant text не обрезается reader-ом:
+collapse и `<pasted_content>`-чипы принадлежат presentation-слою. Сам
+`HistoryTranscriptPresentation` теперь живёт в едином docked Agent
+Inspector над composer: Task-строка в основной Virtuoso-ленте
+лишь выбирает агента и не владеет вложенным scroll-container.
 
 Codex History использует тот же `ToolCallPart`, поэтому верхнеуровневый `exec` нельзя
 «чинить визуально» внутри пакета: это transport-envelope нового rollout, а не новый

@@ -5,7 +5,6 @@ import ControlHint from '../UI/ControlHint';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore, selectFocusedProjectId } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
-import DocsButton from './DocsButton';
 import ClaudeUsageButton from './ClaudeUsageButton';
 import ResourceUsageButton from './ResourceUsageButton';
 import TimelineToolsButton from './TimelineToolsButton';
@@ -514,9 +513,6 @@ export default function WorkspaceTitleBarTools() {
       {!isSystemProject && <ResourceUsageButton />}
 
       <ClaudeUsageButton />
-
-      {/* Действия с документацией (Update Docs / Update API). */}
-      {!isSystemProject && <DocsButton />}
 
     </div>
   );

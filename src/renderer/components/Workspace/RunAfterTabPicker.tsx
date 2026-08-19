@@ -8,6 +8,7 @@ import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { resolveRunAfterTabStatus } from '../../utils/runAfterTabStatus.mjs';
 import ControlHint from '../UI/ControlHint';
+import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
 import { TabProcessBar, TabStatusMarker } from './TabSignals';
 
 const { ipcRenderer } = window.require('electron');
@@ -263,26 +264,6 @@ function projectLabel(projectPath: string, projectId: string): string {
   return clean.split(/[\\/]/).filter(Boolean).pop() || projectId.slice(-8);
 }
 
-function pointInRect(rect: DOMRect, x: number, y: number, tolerance = HOVER_CLOSE_TOLERANCE): boolean {
-  return (
-    x >= rect.left - tolerance &&
-    x <= rect.right + tolerance &&
-    y >= rect.top - tolerance &&
-    y <= rect.bottom + tolerance
-  );
-}
-
-function pointInHoverBridge(triggerRect: DOMRect, menuRect: DOMRect, x: number, y: number, side: 'left' | 'right'): boolean {
-  const left = side === 'right'
-    ? Math.min(triggerRect.right, menuRect.left)
-    : Math.min(menuRect.right, triggerRect.left);
-  const right = side === 'right'
-    ? Math.max(triggerRect.right, menuRect.left)
-    : Math.max(menuRect.right, triggerRect.left);
-  const top = Math.min(triggerRect.top, menuRect.top) - HOVER_CLOSE_TOLERANCE;
-  const bottom = Math.max(triggerRect.bottom, menuRect.bottom) + HOVER_CLOSE_TOLERANCE;
-  return x >= left - HOVER_CLOSE_TOLERANCE && x <= right + HOVER_CLOSE_TOLERANCE && y >= top && y <= bottom;
-}
 
 export function RunAfterTabPicker({
   tabId,
@@ -529,11 +510,16 @@ export function RunAfterTabPicker({
         const triggerRect = triggerRef.current?.getBoundingClientRect();
         const menuRect = menuRef.current?.getBoundingClientRect();
         if (!triggerRect || !menuRect) return;
-        const x = e.clientX;
-        const y = e.clientY;
-        if (pointInRect(triggerRect, x, y)) return;
-        if (pointInRect(menuRect, x, y)) return;
-        if (pointInHoverBridge(triggerRect, menuRect, x, y, side)) return;
+        // Список и его кнопка плюс зазор между ними — одно целое. Сторона не
+        // задаётся: список раскрывается влево или вправо в зависимости от места
+        // у края экрана, а зазор всегда лежит там, где блоки разошлись.
+        if (pointInHoverCluster({
+          hub: menuRect,
+          satellites: [triggerRect],
+          x: e.clientX,
+          y: e.clientY,
+          pad: HOVER_CLOSE_TOLERANCE,
+        })) return;
         setOpen(false);
       });
     };
@@ -542,7 +528,7 @@ export function RunAfterTabPicker({
       if (frame) cancelAnimationFrame(frame);
       window.removeEventListener('mousemove', onMove, true);
     };
-  }, [open, openOnHover, side]);
+  }, [open, openOnHover]);
 
   const handleOpen = useCallback(() => {
     const panelRect = panelRef.current?.getBoundingClientRect() ?? null;

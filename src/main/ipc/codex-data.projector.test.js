@@ -297,8 +297,8 @@ test('response_item-only user turn is visible in both History and Timeline', () 
   const timelineUsers = timeline.finalize().filter((entry) => entry.type === 'user');
   assert.equal(historyUsers.length, 1);
   assert.equal(timelineUsers.length, 1);
-  assert.equal(historyUsers[0].content, ' [Image] response-only prompt');
-  assert.equal(timelineUsers[0].content, ' [Image] response-only prompt');
+  assert.equal(historyUsers[0].content, ' [Image #1] response-only prompt');
+  assert.equal(timelineUsers[0].content, ' [Image #1] response-only prompt');
   assert.equal(timelineUsers[0].hasImage, true);
   assert.equal(historyUsers[0].sourceIdentity, 'codex-user-source-response-only-session-200');
   assert.equal(timelineUsers[0].responseComplete, true);

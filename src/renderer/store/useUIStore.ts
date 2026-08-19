@@ -44,9 +44,7 @@ type FilePreviewScrollMemory = Record<string, { top: number; at: number }>;
 
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
-export type ApiGeminiModel = GeminiModelId;
 export type AIModel = GeminiModelId;
-export type ApiClaudeModel = 'claude-opus-4.6' | 'claude-sonnet-4.5';
 
 // Re-export from canonical source. Older code imports DefaultClaudeEffort from useUIStore
 // because the type used to be defined here; we keep the alias so we don't touch dozens
@@ -139,13 +137,6 @@ export interface HistoryComposerAvailability {
 }
 
 export type PromptQueueInputSurface = 'terminal' | 'history';
-
-export interface ApiSettings {
-  claudeModel: ApiClaudeModel;
-  claudeThinking: ThinkingLevel;
-  geminiModel: ApiGeminiModel;
-  geminiThinking: ThinkingLevel;
-}
 
 /* Session status (label + color) — назначается вкладке через ПКМ → Status.
    id = stable handle, который Tab.sessionStatus сохраняет в SQLite.
@@ -349,15 +340,6 @@ function saveProjectTabGeometry(s: ProjectTabGeometrySettings) {
 }
 
 
-interface DocPromptSettings {
-
-  useFile: boolean; // true = read from file path, false = use inline content
-
-  filePath: string;
-
-  inlineContent: string;
-
-}
 
 
 
@@ -517,27 +499,6 @@ interface UIStore {
   // Claude Default Prompt toggle
   claudeDefaultPromptEnabled: boolean;
   setClaudeDefaultPromptEnabled: (enabled: boolean) => void;
-
-  // Documentation Prompt (for Update Docs feature)
-
-  docPrompt: DocPromptSettings;
-
-  setDocPromptUseFile: (useFile: boolean) => void;
-
-  setDocPromptFilePath: (path: string) => void;
-
-  setDocPromptInlineContent: (content: string) => void;
-
-
-
-
-  // Terminal Selection (global state for selected text)
-
-  terminalSelection: string;
-
-  setTerminalSelection: (text: string) => void;
-
-
 
   // File Explorer
 
@@ -700,7 +661,7 @@ interface UIStore {
 
   closeSessionModal: (value: string | null) => void;
 
-  // Copy Settings (shared between ActionsPanel and Timeline)
+  // Copy Settings (shared between CopySessionButton and Timeline)
   // Sidebar (file explorer) behavior toggles
   sidebarPersistFile: boolean;
   sidebarOverlayCloseOnClickOutside: boolean;
@@ -716,6 +677,12 @@ interface UIStore {
   copyIncludeClaude: boolean;
   copyIncludeText: boolean;
   copyIncludeThinking: boolean;
+  copyIncludeActions: boolean;
+  copyIncludeSearch: boolean;
+  copyIncludeRun: boolean;
+  copyIncludeGit: boolean;
+  copyIncludeMcp: boolean;
+  copyIncludePlan: boolean;
   copyIncludeBash: boolean;
   copyIncludeTools: boolean;
   copyIncludeWebSearch: boolean;
@@ -730,6 +697,12 @@ interface UIStore {
   setCopyIncludeClaude: (v: boolean) => void;
   setCopyIncludeText: (v: boolean) => void;
   setCopyIncludeThinking: (v: boolean) => void;
+  setCopyIncludeActions: (v: boolean) => void;
+  setCopyIncludeSearch: (v: boolean) => void;
+  setCopyIncludeRun: (v: boolean) => void;
+  setCopyIncludeGit: (v: boolean) => void;
+  setCopyIncludeMcp: (v: boolean) => void;
+  setCopyIncludePlan: (v: boolean) => void;
   setCopyIncludeBash: (v: boolean) => void;
   setCopyIncludeTools: (v: boolean) => void;
   setCopyIncludeWebSearch: (v: boolean) => void;
@@ -855,28 +828,6 @@ interface UIStore {
   setNotesEditorShowLineNumbers: (on: boolean) => void;
   notesPreviewShowLineNumbers: boolean;
   setNotesPreviewShowLineNumbers: (on: boolean) => void;
-
-  // API Settings Modal
-  apiSettingsOpen: boolean;
-  openApiSettings: () => void;
-  closeApiSettings: () => void;
-  apiSettings: ApiSettings;
-  setApiClaudeModel: (model: ApiClaudeModel) => void;
-  setApiGeminiModel: (model: ApiGeminiModel) => void;
-  setApiClaudeThinking: (level: ThinkingLevel) => void;
-  setApiGeminiThinking: (level: ThinkingLevel) => void;
-
-  // Auto-apply toggle (Update API → Haiku auto-submits confirmation)
-  autoApplyDocs: boolean;
-  setAutoApplyDocs: (on: boolean) => void;
-
-  // Post-check toggle (lightweight verification after main analysis)
-  postCheckDocs: boolean;
-  setPostCheckDocs: (on: boolean) => void;
-
-  // Post-check prompt text
-  postCheckPrompt: string;
-  setPostCheckPrompt: (text: string) => void;
 
   // Параллелизм семантической индексации — сколько Codex worker'ов запускает
   // MCP docs_reindex. Default 10, диапазон 1-20.
@@ -1080,32 +1031,6 @@ const saveThinkingLevel = (level: ThinkingLevel) => {
 
 
 
-const DEFAULT_DOC_PROMPT_PATH = '/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md';
-
-const loadDocPrompt = (): DocPromptSettings => {
-  try {
-    const saved = localStorage.getItem('noted-terminal-doc-prompt');
-    if (saved) {
-      return JSON.parse(saved);
-    }
-  } catch (e) {
-    console.error('Failed to load doc prompt:', e);
-  }
-  return {
-    useFile: true,
-    filePath: DEFAULT_DOC_PROMPT_PATH,
-    inlineContent: ''
-  };
-};
-
-const saveDocPrompt = (settings: DocPromptSettings) => {
-  try {
-    localStorage.setItem('noted-terminal-doc-prompt', JSON.stringify(settings));
-  } catch (e) {
-    console.error('Failed to save doc prompt:', e);
-  }
-};
-
 const saveFontSettings = (settings: { terminalFontSize: number; tabsFontSize: number; projectTabsFontSize: number; sidebarFontSize: number }) => {
   try {
     localStorage.setItem('noted-terminal-font-settings', JSON.stringify(settings));
@@ -1304,7 +1229,6 @@ const loadPromptQueueWidth = (): number => {
 const initialEditorSettings = loadEditorSettings();
 const initialModel = loadSelectedModel();
 const initialThinkingLevel = loadThinkingLevel();
-const initialDocPrompt = loadDocPrompt();
 
 const loadClaudeDefaultPromptEnabled = (): boolean => {
   try {
@@ -1326,11 +1250,13 @@ const saveClaudeDefaultPromptEnabled = (enabled: boolean) => {
 
 const initialClaudeDefaultPromptEnabled = loadClaudeDefaultPromptEnabled();
 
-// Copy settings — flat shape kept for backwards compatibility with existing callsites.
-// New hierarchical fields (copyIncludeUser/Claude/Text/Thinking/Bash/Tools) added in v2.
-// Defaults preserve old behavior: everything user did before remains visible; new groups
-// (Bash/Tools) default OFF so power users don't suddenly get 200KB Bash logs in their paste.
+// Copy settings v3: message kinds + provider-neutral semantic action families.
+// Legacy Claude/Bash/Tools fields stay readable during migration/HMR skew, but
+// the public UI and current exporters use Actions + Read/Search/Edit/Run/Git/
+// MCP/Web/Plan/Other. Detail families default mostly OFF so an upgrade cannot
+// suddenly put hundreds of KB of tool output into the clipboard.
 type CopySettings = {
+  copySettingsVersion: number;
   copyIncludeEditing: boolean;
   copyIncludeReading: boolean;
   copyFromStart: boolean;
@@ -1340,6 +1266,12 @@ type CopySettings = {
   copyIncludeClaude: boolean;
   copyIncludeText: boolean;
   copyIncludeThinking: boolean;
+  copyIncludeActions: boolean;
+  copyIncludeSearch: boolean;
+  copyIncludeRun: boolean;
+  copyIncludeGit: boolean;
+  copyIncludeMcp: boolean;
+  copyIncludePlan: boolean;
   copyIncludeBash: boolean;
   copyIncludeTools: boolean;
   copyIncludeWebSearch: boolean;
@@ -1352,7 +1284,11 @@ const loadCopySettings = (): CopySettings => {
     const saved = localStorage.getItem('noted-terminal-copy-settings');
     if (saved) {
       const parsed = JSON.parse(saved);
+      const semanticV3 = Number(parsed.copySettingsVersion || 0) >= 3
+        || Object.prototype.hasOwnProperty.call(parsed, 'copyIncludeActions');
+      const legacyAgentEnabled = parsed.copyIncludeClaude ?? true;
       return {
+        copySettingsVersion: 3,
         copyIncludeEditing: parsed.copyIncludeEditing ?? true,
         copyIncludeReading: parsed.copyIncludeReading ?? false,
         copyFromStart: parsed.copyFromStart ?? true,
@@ -1360,23 +1296,36 @@ const loadCopySettings = (): CopySettings => {
         copyIncludeSubagentHistory: parsed.copyIncludeSubagentHistory ?? false,
         copyIncludeUser: parsed.copyIncludeUser ?? true,
         copyIncludeClaude: parsed.copyIncludeClaude ?? true,
-        copyIncludeText: parsed.copyIncludeText ?? true,
-        copyIncludeThinking: parsed.copyIncludeThinking ?? true,
+        copyIncludeText: semanticV3 ? (parsed.copyIncludeText ?? true) : (legacyAgentEnabled && (parsed.copyIncludeText ?? true)),
+        copyIncludeThinking: semanticV3 ? (parsed.copyIncludeThinking ?? true) : (legacyAgentEnabled && (parsed.copyIncludeThinking ?? true)),
+        copyIncludeActions: semanticV3 ? (parsed.copyIncludeActions ?? true) : legacyAgentEnabled,
+        // v2 put local search, Git and every remaining command behind one
+        // Bash transport toggle. Preserve that user's chosen DEPTH while
+        // splitting it into semantic action families.
+        copyIncludeSearch: parsed.copyIncludeSearch ?? parsed.copyIncludeBash ?? false,
+        copyIncludeRun: parsed.copyIncludeRun ?? parsed.copyIncludeBash ?? false,
+        copyIncludeGit: parsed.copyIncludeGit ?? parsed.copyIncludeBash ?? false,
+        copyIncludeMcp: parsed.copyIncludeMcp ?? parsed.copyIncludeTools ?? false,
+        copyIncludePlan: parsed.copyIncludePlan ?? parsed.copyIncludeToolSearch ?? parsed.copyIncludeOtherTools ?? false,
         copyIncludeBash: parsed.copyIncludeBash ?? false,
         copyIncludeTools: parsed.copyIncludeTools ?? false,
         copyIncludeWebSearch: parsed.copyIncludeWebSearch ?? parsed.copyIncludeTools ?? false,
         copyIncludeToolSearch: parsed.copyIncludeToolSearch ?? parsed.copyIncludeTools ?? false,
-        copyIncludeOtherTools: parsed.copyIncludeOtherTools ?? parsed.copyIncludeTools ?? false,
+        copyIncludeOtherTools: parsed.copyIncludeOtherTools ?? parsed.copyIncludeToolSearch ?? parsed.copyIncludeTools ?? false,
       };
     }
   } catch (e) {
     console.error('Failed to load copy settings:', e);
   }
   return {
+    copySettingsVersion: 3,
     copyIncludeEditing: true, copyIncludeReading: false, copyFromStart: true,
     copyIncludeSubagentResult: false, copyIncludeSubagentHistory: false,
     copyIncludeUser: true, copyIncludeClaude: true,
     copyIncludeText: true, copyIncludeThinking: true,
+    copyIncludeActions: true,
+    copyIncludeSearch: false, copyIncludeRun: false, copyIncludeGit: false,
+    copyIncludeMcp: false, copyIncludePlan: false,
     copyIncludeBash: false, copyIncludeTools: false,
     copyIncludeWebSearch: false, copyIncludeToolSearch: false, copyIncludeOtherTools: false,
   };
@@ -1390,7 +1339,7 @@ const saveCopySettings = (settings: Partial<CopySettings>) => {
     } catch {
       prev = {};
     }
-    localStorage.setItem('noted-terminal-copy-settings', JSON.stringify({ ...prev, ...settings }));
+    localStorage.setItem('noted-terminal-copy-settings', JSON.stringify({ ...prev, ...settings, copySettingsVersion: 3 }));
   } catch (e) {
     console.error('Failed to save copy settings:', e);
   }
@@ -2375,35 +2324,6 @@ const loadDragAreaWidth = (): number => {
 };
 const initialDragAreaWidth = loadDragAreaWidth();
 
-// API Settings (for [api] button in ActionsPanel)
-const loadApiSettings = (): ApiSettings => {
-  try {
-    const saved = localStorage.getItem('noted-terminal-api-settings');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      return {
-        claudeModel: parsed.claudeModel || 'claude-sonnet-4.5',
-        claudeThinking: parsed.claudeThinking || 'HIGH',
-        geminiModel: isGeminiModelId(parsed.geminiModel) ? parsed.geminiModel : 'gemini-3-flash-preview',
-        geminiThinking: parsed.geminiThinking || 'HIGH',
-      };
-    }
-  } catch (e) {
-    console.error('Failed to load API settings:', e);
-  }
-  return { claudeModel: 'claude-sonnet-4.5', claudeThinking: 'HIGH', geminiModel: 'gemini-3-flash-preview', geminiThinking: 'HIGH' };
-};
-
-const saveApiSettings = (settings: ApiSettings) => {
-  try {
-    localStorage.setItem('noted-terminal-api-settings', JSON.stringify(settings));
-  } catch (e) {
-    console.error('Failed to save API settings:', e);
-  }
-};
-
-const initialApiSettings = loadApiSettings();
-
 const HISTORY_COMPOSER_DRAFTS_STORAGE_KEY = 'noted-terminal-history-composer-drafts';
 
 // Автосохранение черновика поля ввода, пока пользователь печатает.
@@ -2793,31 +2713,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ claudeDefaultPromptEnabled: enabled });
     saveClaudeDefaultPromptEnabled(enabled);
   },
-
-  // Documentation Prompt
-  docPrompt: initialDocPrompt,
-  setDocPromptUseFile: (useFile) => {
-    const current = get().docPrompt;
-    const updated = { ...current, useFile };
-    set({ docPrompt: updated });
-    saveDocPrompt(updated);
-  },
-  setDocPromptFilePath: (filePath) => {
-    const current = get().docPrompt;
-    const updated = { ...current, filePath };
-    set({ docPrompt: updated });
-    saveDocPrompt(updated);
-  },
-  setDocPromptInlineContent: (inlineContent) => {
-    const current = get().docPrompt;
-    const updated = { ...current, inlineContent };
-    set({ docPrompt: updated });
-    saveDocPrompt(updated);
-  },
-
-  // Terminal Selection
-  terminalSelection: '',
-  setTerminalSelection: (text) => set({ terminalSelection: text }),
 
   setTerminalFontSize: (size) => {
     const clamped = Math.max(8, Math.min(24, size));
@@ -3321,6 +3216,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
   copyIncludeClaude: initialCopySettings.copyIncludeClaude,
   copyIncludeText: initialCopySettings.copyIncludeText,
   copyIncludeThinking: initialCopySettings.copyIncludeThinking,
+  copyIncludeActions: initialCopySettings.copyIncludeActions,
+  copyIncludeSearch: initialCopySettings.copyIncludeSearch,
+  copyIncludeRun: initialCopySettings.copyIncludeRun,
+  copyIncludeGit: initialCopySettings.copyIncludeGit,
+  copyIncludeMcp: initialCopySettings.copyIncludeMcp,
+  copyIncludePlan: initialCopySettings.copyIncludePlan,
   copyIncludeBash: initialCopySettings.copyIncludeBash,
   copyIncludeTools: initialCopySettings.copyIncludeTools,
   copyIncludeWebSearch: initialCopySettings.copyIncludeWebSearch,
@@ -3426,6 +3327,30 @@ export const useUIStore = create<UIStore>((set, get) => ({
       copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
       copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
     });
+  },
+  setCopyIncludeActions: (v) => {
+    set({ copyIncludeActions: v });
+    saveCopySettings({ copyIncludeActions: v });
+  },
+  setCopyIncludeSearch: (v) => {
+    set({ copyIncludeSearch: v });
+    saveCopySettings({ copyIncludeSearch: v });
+  },
+  setCopyIncludeRun: (v) => {
+    set({ copyIncludeRun: v });
+    saveCopySettings({ copyIncludeRun: v });
+  },
+  setCopyIncludeGit: (v) => {
+    set({ copyIncludeGit: v });
+    saveCopySettings({ copyIncludeGit: v });
+  },
+  setCopyIncludeMcp: (v) => {
+    set({ copyIncludeMcp: v });
+    saveCopySettings({ copyIncludeMcp: v });
+  },
+  setCopyIncludePlan: (v) => {
+    set({ copyIncludePlan: v });
+    saveCopySettings({ copyIncludePlan: v });
   },
   setCopyIncludeBash: (v) => {
     set({ copyIncludeBash: v });
@@ -3801,57 +3726,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setNotesPreviewShowLineNumbers: (on) => {
     set({ notesPreviewShowLineNumbers: on });
     try { localStorage.setItem('noted-terminal-notes-preview-line-numbers', String(on)); } catch {}
-  },
-
-  // API Settings Modal
-  apiSettingsOpen: false,
-  openApiSettings: () => set({ apiSettingsOpen: true }),
-  closeApiSettings: () => set({ apiSettingsOpen: false }),
-  apiSettings: initialApiSettings,
-  setApiClaudeModel: (model) => {
-    const current = get().apiSettings;
-    const updated = { ...current, claudeModel: model };
-    set({ apiSettings: updated });
-    saveApiSettings(updated);
-  },
-  setApiClaudeThinking: (level) => {
-    const current = get().apiSettings;
-    const updated = { ...current, claudeThinking: level };
-    set({ apiSettings: updated });
-    saveApiSettings(updated);
-  },
-  setApiGeminiModel: (model) => {
-    const current = get().apiSettings;
-    const updated = { ...current, geminiModel: model };
-    set({ apiSettings: updated });
-    saveApiSettings(updated);
-  },
-  setApiGeminiThinking: (level) => {
-    const current = get().apiSettings;
-    const updated = { ...current, geminiThinking: level };
-    set({ apiSettings: updated });
-    saveApiSettings(updated);
-  },
-
-  // Auto-apply docs toggle
-  autoApplyDocs: localStorage.getItem('noted-terminal-auto-apply-docs') === 'true',
-  setAutoApplyDocs: (on) => {
-    set({ autoApplyDocs: on });
-    localStorage.setItem('noted-terminal-auto-apply-docs', String(on));
-  },
-
-  // Post-check docs toggle
-  postCheckDocs: localStorage.getItem('noted-terminal-post-check-docs') === 'true',
-  setPostCheckDocs: (on) => {
-    set({ postCheckDocs: on });
-    localStorage.setItem('noted-terminal-post-check-docs', String(on));
-  },
-
-  // Post-check prompt text
-  postCheckPrompt: localStorage.getItem('noted-terminal-post-check-prompt') || `Проверь свой план по двум критериям:\n1. Есть ли в сессии места где разработчик получил 0 результатов / пустой ответ / ошибку парсинга данных, и потом выяснил что формат данных отличался от ожидаемого? Если да — это шрам формата данных, запиши.\n2. Предлагаешь ли ты изменения в CLAUDE.md? Если да — проверь: это guard rail / anti-pattern / инфраструктурная инструкция? Если нет — убери, knowledge-файлы находятся через семантический поиск.`,
-  setPostCheckPrompt: (text) => {
-    set({ postCheckPrompt: text });
-    localStorage.setItem('noted-terminal-post-check-prompt', text);
   },
 
   // Параллелизм семантической индексации (MCP docs_reindex parallel=N).

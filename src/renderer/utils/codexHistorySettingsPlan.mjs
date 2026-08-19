@@ -21,6 +21,20 @@ export function resolveCodexSettingsRuntimeProof(runtimeSnapshot) {
   const activeWriterSessionId = runtimeSnapshot?.writerConfirmed === true
     ? normalizeSessionId(runtimeSnapshot?.provenWriterSessionId)
     : '';
+  const confirmedSettingsOwner = normalizeSessionId(
+    runtimeSnapshot?.codexCurrentSettingsOwnerId,
+  );
+  const confirmedSettingsModel = normalizeCurrentSetting(
+    runtimeSnapshot?.codexCurrentModel,
+  );
+  const confirmedSettingsEffort = normalizeCurrentSetting(
+    runtimeSnapshot?.codexCurrentEffort,
+  );
+  const confirmedWriterSettingsProven = runtimeState === 'live'
+    && !!activeWriterSessionId
+    && confirmedSettingsOwner === activeWriterSessionId
+    && !!confirmedSettingsModel
+    && !!confirmedSettingsEffort;
   const provisionalOwner = normalizeSessionId(
     runtimeSnapshot?.codexProvisionalSettingsOwnerId,
   );
@@ -39,9 +53,15 @@ export function resolveCodexSettingsRuntimeProof(runtimeSnapshot) {
     runtimeState,
     activeWriterSessionId,
     currentSettingsOwnerId: activeWriterSessionId
-      || (provisionalSettingsProven ? provisionalOwner : ''),
-    currentSettingsModel: provisionalSettingsProven ? provisionalModel : '',
-    currentSettingsEffort: provisionalSettingsProven ? provisionalEffort : '',
+      ? (confirmedWriterSettingsProven ? activeWriterSessionId : '')
+      : (provisionalSettingsProven ? provisionalOwner : ''),
+    currentSettingsModel: confirmedWriterSettingsProven
+      ? confirmedSettingsModel
+      : (provisionalSettingsProven ? provisionalModel : ''),
+    currentSettingsEffort: confirmedWriterSettingsProven
+      ? confirmedSettingsEffort
+      : (provisionalSettingsProven ? provisionalEffort : ''),
+    confirmedWriterSettingsProven,
     provisionalSettingsProven,
   };
 }
@@ -104,10 +124,10 @@ export function planCodexHistorySettings({
   const effortRequested = normalizeRequestedSetting(requestedEffort);
   const hasRequestedSettings = !!(modelRequested || effortRequested);
   const runtimeProof = resolveCodexSettingsRuntimeProof(runtimeSnapshot);
-  const effectiveModel = runtimeProof.provisionalSettingsProven
+  const effectiveModel = runtimeProof.currentSettingsOwnerId
     ? runtimeProof.currentSettingsModel
     : normalizeCurrentSetting(currentModel);
-  const effectiveEffort = runtimeProof.provisionalSettingsProven
+  const effectiveEffort = runtimeProof.currentSettingsOwnerId
     ? runtimeProof.currentSettingsEffort
     : normalizeCurrentSetting(currentEffort);
   const willQueue = queue === true || statusAtSend === 'busy';
@@ -115,6 +135,10 @@ export function planCodexHistorySettings({
     requestedModel,
     requestedEffort,
   });
+  const requestedSettingsAlreadyApplied = hasRequestedSettings
+    && !!runtimeProof.currentSettingsOwnerId
+    && (!modelRequested || modelRequested === effectiveModel)
+    && (!effortRequested || effortRequested === effectiveEffort);
 
   if (!hasRequestedSettings) {
     return {
@@ -126,6 +150,15 @@ export function planCodexHistorySettings({
   }
 
   if (willQueue) {
+    if (requestedSettingsAlreadyApplied) {
+      return {
+        hasRequestedSettings: false,
+        settingsAlreadyApplied: true,
+        blocked: false,
+        model: effectiveModel,
+        effort: effectiveEffort,
+      };
+    }
     return {
       hasRequestedSettings: true,
       blocked: true,

@@ -88,6 +88,9 @@ export interface HistoryPromptHandoff {
   text: string;
   promptChips: readonly Readonly<HistoryPromptHandoffChip>[];
   imagePaths: readonly Readonly<HistoryPromptHandoffImageRef>[];
+  authoringText: string;
+  authoringChips: readonly Readonly<Record<string, any>>[];
+  authoringImagePaths: readonly Readonly<HistoryPromptHandoffImageRef>[];
   submittedAt: number;
   source: string;
   statusAtSend: HistoryPromptHandoffAgentStatus;
@@ -109,6 +112,9 @@ export interface BeginHistoryPromptHandoffInput {
   text: string;
   promptChips?: readonly HistoryPromptHandoffChip[];
   imagePaths?: readonly HistoryPromptHandoffImageRef[];
+  authoringText?: string;
+  authoringChips?: readonly Record<string, any>[];
+  authoringImagePaths?: readonly HistoryPromptHandoffImageRef[];
   submittedAt?: number;
   source?: string;
   statusAtSend?: HistoryPromptHandoffAgentStatus;
@@ -125,6 +131,13 @@ export interface SettleHistoryPromptHandoffInput {
   proof?: HistoryPromptHandoffAuditProof | null;
   requiresAuditIdentity?: boolean;
   changedAt?: number;
+}
+
+export interface AdoptHistoryPromptHandoffCanonicalInput {
+  entryUuid: string;
+  sessionId?: string | null;
+  sourceIdentity?: string | null;
+  sourceIdentityAliases?: readonly string[] | null;
 }
 
 export interface BindHistoryPromptHandoffSendIdentityInput {
@@ -275,6 +288,7 @@ export type HistoryPromptHandoffChange =
   | { type: 'provider-queue-accepted'; handoffId: string }
   | { type: 'bind-send-identity'; handoffId: string }
   | { type: 'settle'; handoffId: string }
+  | { type: 'canonical-adopt'; handoffId: string }
   | { type: 'retract'; handoffId: string; reason: string }
   | { type: 'consume'; handoffId: string }
   | { type: 'evict'; handoffId: string; reason: 'bounds' };
@@ -396,6 +410,7 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
     + stringBytes(value.toolType)
     + stringBytes(value.sessionIdHint)
     + stringBytes(value.text)
+    + stringBytes(value.authoringText)
     + stringBytes(value.source)
     + stringBytes(value.statusAtSend)
     + stringBytes(value.queueStatus)
@@ -422,6 +437,8 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
       + stringBytes(ref.availability)
       + stringBytes(ref.error);
   }
+  for (const chip of value.authoringChips) bytes += stringBytes(JSON.stringify(chip));
+  for (const ref of value.authoringImagePaths) bytes += RECORD_OVERHEAD_BYTES + stringBytes(ref.path);
   if (value.auditProof) {
     bytes += RECORD_OVERHEAD_BYTES
       + stringBytes(value.auditProof.auditTimestamp)
@@ -599,6 +616,8 @@ function freezeHandoff(value: HistoryPromptHandoff): Readonly<HistoryPromptHando
     ...value,
     promptChips: Object.freeze(value.promptChips.map(freezeChip)),
     imagePaths: Object.freeze(value.imagePaths.map(freezeImageRef)),
+    authoringChips: Object.freeze(value.authoringChips.map((chip) => Object.freeze({ ...chip }))),
+    authoringImagePaths: Object.freeze(value.authoringImagePaths.map(freezeImageRef)),
     auditProof: freezeProof(value.auditProof),
     providerQueueProof: freezeProviderQueueProof(value.providerQueueProof),
   });
@@ -911,6 +930,9 @@ export class HistoryPromptHandoffStore {
       text: String(input.text || ''),
       promptChips: input.promptChips || [],
       imagePaths: input.imagePaths || [],
+      authoringText: typeof input.authoringText === 'string' ? input.authoringText : String(input.text || ''),
+      authoringChips: input.authoringChips || [],
+      authoringImagePaths: input.authoringImagePaths || input.imagePaths || [],
       submittedAt,
       source: typeof input.source === 'string' ? input.source : '',
       statusAtSend: input.statusAtSend || 'unknown',
@@ -1209,6 +1231,60 @@ export class HistoryPromptHandoffStore {
     this.enforceLimits(tabId, handoffId);
     if (!this.tabs.get(tabId)?.has(handoffId)) return undefined;
     this.notify(tabId, { type: 'settle', handoffId });
+    return next;
+  }
+
+  adoptCanonicalEntry(
+    tabIdValue: string,
+    handoffIdValue: string,
+    input: AdoptHistoryPromptHandoffCanonicalInput,
+  ): Readonly<HistoryPromptHandoff> | undefined {
+    const tabId = requireKey(tabIdValue, 'tabId');
+    const handoffId = requireKey(handoffIdValue, 'handoffId');
+    const entryUuid = requireKey(input.entryUuid, 'entryUuid');
+    const tab = this.tabs.get(tabId);
+    const current = tab?.get(handoffId);
+    const proof = current?.value.auditProof || null;
+    if (!tab || !current || current.value.queueStatus !== 'sent' || !proof) return undefined;
+
+    const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : '';
+    if (proof.sessionId && sessionId && proof.sessionId !== sessionId) return undefined;
+    const sourceIdentity = typeof input.sourceIdentity === 'string'
+      ? input.sourceIdentity.trim()
+      : '';
+    const sourceIdentityAliases = Array.isArray(input.sourceIdentityAliases)
+      ? input.sourceIdentityAliases
+        .filter((identity) => typeof identity === 'string' && identity.trim())
+        .map((identity) => identity.trim())
+      : [];
+    const canonicalIdentity = {
+      uuid: entryUuid,
+      sourceIdentity,
+      sourceIdentityAliases,
+    };
+    const exactAuditIdentity = proof.entryUuid || proof.sourceIdentity || '';
+    if (!historyEntryHasExactIdentity(canonicalIdentity, exactAuditIdentity)) return undefined;
+    if (proof.entryUuid === entryUuid) return current.value;
+
+    // History has already resolved the provider alias to the canonical row.
+    // Enrich the same immutable handoff before its presentation ACK consumes
+    // it; status/hash/source ownership remain unchanged.
+    const next = freezeHandoff({
+      ...current.value,
+      auditProof: {
+        ...proof,
+        entryUuid,
+        sourceIdentity: proof.sourceIdentity || sourceIdentity || undefined,
+      },
+    });
+    const approxBytes = estimateHandoffBytes(next);
+    if (approxBytes > this.limits.maxBytes) return undefined;
+    this.approxBytes += approxBytes - current.approxBytes;
+    tab.set(handoffId, { value: next, approxBytes });
+    this.promoteTab(tabId);
+    this.enforceLimits(tabId, handoffId);
+    if (!this.tabs.get(tabId)?.has(handoffId)) return undefined;
+    this.notify(tabId, { type: 'canonical-adopt', handoffId });
     return next;
   }
 
@@ -1578,6 +1654,12 @@ export const settleHistoryPromptHandoff = (
   handoffId: string,
   input: SettleHistoryPromptHandoffInput,
 ) => historyPromptHandoffStore.settle(tabId, handoffId, input);
+
+export const adoptHistoryPromptHandoffCanonicalEntry = (
+  tabId: string,
+  handoffId: string,
+  input: AdoptHistoryPromptHandoffCanonicalInput,
+) => historyPromptHandoffStore.adoptCanonicalEntry(tabId, handoffId, input);
 
 export const retractHistoryPromptHandoff = (
   tabId: string,

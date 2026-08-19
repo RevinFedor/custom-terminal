@@ -84,7 +84,7 @@ test('provisional Resume accepts an image-bearing response_item user carrier wit
   assert.equal(consumed.records[0].byteOffset, 36_563_744);
   assert.equal(
     codexUserMessageAuditText(consumed.records[0].record),
-    ' [Image] <pasted_content>question</pasted_content> [Image] ',
+    ' [Image #1] <pasted_content>question</pasted_content> [Image #2] ',
   );
 });
 

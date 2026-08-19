@@ -192,7 +192,19 @@ function stubActionSummary(actions) {
         isError: raw.isError === true ? true : undefined,
       });
     } else if (action.tool === 'Task') {
-      summary.push({ toolUseId: action.toolUseId, toolName: 'Task', family: 'task' });
+      summary.push({
+        toolUseId: action.toolUseId,
+        toolName: 'Task',
+        family: 'task',
+        description: action.description,
+        subagentStatus: action.subagentStatus,
+        agentSessionId: action.agentSessionId,
+        agentId: action.agentId,
+        taskPrompt: action.taskPrompt,
+        startedAt: action.startedAt,
+        completedAt: action.completedAt,
+        durationMs: action.durationMs,
+      });
     }
   }
   return summary.length > 0 ? summary : undefined;

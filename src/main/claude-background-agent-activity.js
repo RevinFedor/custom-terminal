@@ -38,6 +38,7 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
         .map(([toolUseId, call]) => ({
           toolUseId,
           agentId: call.agentId || '',
+          startedAt: Number(call.startedAt) || 0,
         }))
       : [];
     return {
@@ -119,7 +120,11 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
         if (toolUseId && !state.calls.has(toolUseId)) {
           // A tool call alone is not yet a launched agent. The parent turn is
           // already busy, so the tab loader needs no speculative extra owner.
-          state.calls.set(toolUseId, { status: 'awaiting-acceptance', agentId: '' });
+          state.calls.set(toolUseId, {
+            status: 'awaiting-acceptance',
+            agentId: '',
+            startedAt: Date.parse(record?.timestamp || '') || Date.now(),
+          });
           changed = true;
         }
       } else if (name === 'SendMessage') {
@@ -128,6 +133,7 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
         for (const call of state.calls.values()) {
           if (call.agentId === target && call.status !== 'running') {
             call.status = 'running';
+            call.startedAt = Date.parse(record?.timestamp || '') || Date.now();
             changed = true;
           }
         }
@@ -161,7 +167,11 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
         // notification. The notification itself is exact background-task
         // identity, so a running status is sufficient to recover liveness.
         if (isTerminalNotificationStatus(notification?.status)) continue;
-        call = { status: 'running', agentId };
+        call = {
+          status: 'running',
+          agentId,
+          startedAt: Date.parse(record?.timestamp || notification?.timestamp || '') || Date.now(),
+        };
         state.calls.set(toolUseId, call);
       }
       if (agentId) call.agentId = agentId;
