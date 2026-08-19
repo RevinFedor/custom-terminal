@@ -57,6 +57,53 @@ test('a new Claude spinner verb is status, not the first streamed answer frame',
   assert.equal(withAnswer.text, 'Первый абзац уже печатается.');
 });
 
+test('Claude short Doing activity and its viewport-clipped dim thinking tail stay out of preview', () => {
+  const thinkingStyle = {
+    firstTextStyle: 'fg=50331648:10066329,bg=0:-1,dim,italic',
+    styles: ['fg=50331648:10066329,bg=0:-1,dim,italic x48'],
+    hasDim: true,
+    allTextDim: true,
+    hasNonDefaultFg: true,
+  };
+  const activityStyle = {
+    firstTextStyle: 'fg=50331648:16761095,bg=0:-1,bold',
+    styles: ['fg=50331648:16761095,bg=0:-1 x48'],
+    hasNonDefaultFg: true,
+  };
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row('open a new window instead, mirroring what a plain', thinkingStyle),
+      row('     click currently does. I need to find the relevant…', thinkingStyle),
+      row(''),
+      row('✽ Doing… (51s · ↓ 2.0k tokens · thought for 20s)', activityStyle),
+      row('  ⎿ Tip: Use /clear to start fresh', thinkingStyle),
+      row('❯ '),
+    ],
+  });
+  assert.equal(result.status, 'empty');
+  assert.deepEqual(result.filteredBlockKinds, ['activity', 'branch-status']);
+  assert.equal(result.styleEvidenceUsed, true);
+});
+
+test('ordinary assistant prose before Claude Doing activity remains visible', () => {
+  const result = extractTerminalHistoryPreviewText({
+    provider: 'claude',
+    physicalLines: [
+      row('⏺ Настоящий ответ перед следующим служебным кадром.'),
+      row(''),
+      row('✶ Doing… (almost done thinking with max effort)', {
+        firstTextStyle: 'fg=50331648:16761095,bg=0:-1',
+        hasNonDefaultFg: true,
+      }),
+      row('❯ '),
+    ],
+  });
+  assert.equal(result.status, 'text');
+  assert.equal(result.text, 'Настоящий ответ перед следующим служебным кадром.');
+  assert.deepEqual(result.filteredBlockKinds, ['activity']);
+});
+
 test('Claude activity block may include an assistant bullet and changing multi-line tip', () => {
   const result = extractTerminalHistoryPreviewText({
     provider: 'claude',

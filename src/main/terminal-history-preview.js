@@ -222,7 +222,7 @@ const FRAME_ONLY_LINE_RES = [
 // continuation rows (usually `⎿ Tip:`). It is always the suffix immediately
 // before the composer. This preserves ordinary answer text and avoids keeping
 // an ever-growing catalogue of Claude's strings.
-const CLAUDE_ACTIVITY_ANCHOR_RE = /^\s*(?:⏺|●)?\s*[✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❈❉❊❋·*]\s*[A-Z][\p{L}\p{M}-]{2,64}(?:ing|ed)(?:…|\.\.\.)?(?:\s*(?:\([^)]*\)|for\s+\d+\w*(?:\s+\d+\w*)*))?\s*$/iu;
+const CLAUDE_ACTIVITY_ANCHOR_RE = /^\s*(?:⏺|●)?\s*[✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❈❉❊❋·*]\s*[A-Z][\p{L}\p{M}-]{1,64}(?:ing|ed)(?:…|\.\.\.)?(?:\s*(?:\([^)]*\)|for\s+\d+\w*(?:\s+\d+\w*)*))?\s*$/iu;
 // Codex owns the whole activity footer. Its stable grammar ends at the
 // keyboard affordance inside `(...)`; telemetry after that is deliberately
 // free-form and has already changed from `background tasks` to `background
@@ -536,6 +536,39 @@ function isTrailingTerminalBlockContinuation(line, provider) {
     || TERMINAL_BLOCK_CONTINUATION_RE.test(raw.trimStart());
 }
 
+// Claude can scroll the expandable-thinking root above the owned viewport
+// while leaving its dim/italic body immediately above the activity footer.
+// In that frame the body no longer has a textual anchor, but it still has two
+// independent structural receipts: every cell is dim and the next row is an
+// exact Claude activity anchor. Absorb only that adjacent dim prefix. A real
+// assistant block with the provider `⏺` root, or ordinary non-dim prose, is a
+// hard boundary and remains eligible for preview.
+function claudeActivityDimPrefixStart(lines, activityIndex) {
+  const source = Array.isArray(lines) ? lines : [];
+  let start = activityIndex;
+  let cursor = activityIndex - 1;
+  let sawDimText = false;
+  let blankRows = 0;
+  while (cursor >= 0) {
+    const raw = String(source[cursor]?.text || '');
+    if (!raw.trim()) {
+      if (blankRows >= 1) break;
+      blankRows += 1;
+      start = cursor;
+      cursor -= 1;
+      continue;
+    }
+    if (STRONG_COMPOSER_RE.test(raw)
+      || TERMINAL_ROOT_BLOCK_MARKER.claude.test(raw)) break;
+    const style = terminalLineStyleEvidence(source[cursor]);
+    if (style.allTextDim !== true) break;
+    sawDimText = true;
+    start = cursor;
+    cursor -= 1;
+  }
+  return sawDimText ? start : activityIndex;
+}
+
 function filterTerminalSystemBlocks(lines, provider) {
   const source = Array.isArray(lines) ? lines : [];
   const excluded = new Set();
@@ -544,9 +577,13 @@ function filterTerminalSystemBlocks(lines, provider) {
   for (let index = 0; index < source.length; index += 1) {
     const anchor = classifyTerminalSystemBlockAt(source, index, provider);
     if (!anchor) continue;
+    const anchorStart = provider === 'claude' && anchor.kind === 'activity'
+      ? claudeActivityDimPrefixStart(source, index)
+      : index;
     if (!kinds.includes(anchor.kind)) kinds.push(anchor.kind);
     styleEvidence = styleEvidence || anchor.styleEvidence === true;
-    for (let covered = index; covered <= anchor.endIndex; covered += 1) {
+    if (anchorStart < index) styleEvidence = true;
+    for (let covered = anchorStart; covered <= anchor.endIndex; covered += 1) {
       excluded.add(covered);
     }
     let next = anchor.endIndex + 1;

@@ -14,7 +14,7 @@ import {
   normalizeSplitSizes,
   resizeFractions,
   splitAvailability,
-  splitDividerDescriptors,
+  splitDividerDescriptors, splitCornerDescriptors,
 } from '../../utils/splitPanesModel.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
@@ -252,7 +252,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         pointerEvents: 'auto',
       }}
     >
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, position: 'relative' }}>
       {/* The strip: project icon per RUN of same-project chips, then the chips.
           The icon labels a run rather than riding on every chip — with one icon
           per chip it sits BETWEEN two of them and it is unreadable which of the
@@ -265,9 +265,37 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         onCreateTab={createTabInThisWindow}
       />
 
-      {/* No spacer: the strip itself takes the free width, so the split button
-          stays pinned right whether there is one chip or twelve. */}
+      {/* Действия окна (Git + деление) — АБСОЛЮТНЫМ слоем поверх правого края
+          полосы, а не соседями по строке. Пока они держали место в строке,
+          нефокусное узкое окно отдавал им ширину под НЕВИДИМЫЕ кнопки, и чипы
+          обрезались там, где на экране пусто. Юзер: *«пространство под гит и
+          значки… остаётся и перекрывает вкладки, хотя там же пусто»*, *«гит по
+          сути будет отображаться поверх этой полоски»*.
 
+          Кнопки видны ТОЛЬКО у окна в фокусе (см. globals.css) — прежнее
+          «проявиться при наведении на шапку» умерло вместе с местом: у
+          нефокусного окна вся строка принадлежит вкладкам, и кнопка,
+          всплывающая над чипом при случайном наведении, читалась бы как
+          перекрытие. Фокусному окну подложка ряда закрывает чипы под кнопками —
+          это честнее, чем резерв: платит только окно, у которого кнопки
+          действительно на экране. */}
+      <div
+        data-split-pane-actions
+        style={{
+          position: 'absolute',
+          right: 0,
+          top: '50%',
+          transform: 'translateY(-50%)',
+          display: 'flex',
+          alignItems: 'center',
+          zIndex: 4,
+          // Подложка цвета шапки: кнопки лежат ПОВЕРХ полосы, и без фона чипы
+          // просвечивали бы сквозь них. Лёгкое затемнение слева обрывом не
+          // читается — край мягкий.
+          background: 'linear-gradient(90deg, rgba(30,30,30,0) 0%, rgba(30,30,30,0.96) 14px, rgba(30,30,30,0.96) 100%)',
+          paddingLeft: 18,
+        }}
+      >
       {/* Git — рядом с кнопкой деления, слева от неё.
           Он следует за директорией ПОКАЗАННОЙ ЗДЕСЬ вкладки, а не активной: в
           верхней полосе Git отвечал про одну вкладку на всё приложение, и с
@@ -367,6 +395,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
       >
         <Columns2 size={12} />
       </button>
+      </div>
       </div>
 
       {/* Line 2 — where this tab's terminal actually is. */}
@@ -618,6 +647,9 @@ type LiveSizes = { cols: number[]; rows: number[][] };
 export function SplitDividerLayer() {
   const panes = useWorkspaceStore((s) => s.splitPanes);
   const committedSizes = useWorkspaceStore((s) => s.splitSizes);
+  // Уголки рисуются только у окна В ФОКУСЕ (см. splitCornerDescriptors — там
+  // почему), поэтому слой следит и за фокусом.
+  const focusedIndex = useWorkspaceStore((s) => s.splitFocusedIndex);
   const [liveSizes, setLiveSizes] = useState<LiveSizes | null>(null);
   const layerRef = React.useRef<HTMLDivElement | null>(null);
   const liveRef = React.useRef<LiveSizes | null>(null);
@@ -658,6 +690,7 @@ export function SplitDividerLayer() {
   const sizes = liveSizes ?? committedSizes;
   const dividers = splitDividerDescriptors(panes, sizes);
   if (dividers.length === 0) return null;
+  const corners = splitCornerDescriptors(panes, focusedIndex, sizes);
 
   // Reposition the pane wrappers straight in the DOM — the exact styles the
   // memo would write, minus the memo. Wrapper lookup by the pane-index attr
@@ -677,10 +710,17 @@ export function SplitDividerLayer() {
     });
   };
 
-  const startDrag = (
-    e: React.MouseEvent,
-    divider: ReturnType<typeof splitDividerDescriptors>[number],
-  ) => {
+  // Обе перегородки описываются парой (колоночная? какая строчная?), и уголок —
+  // это просто divider с ДВУМЯ осями сразу: та же математика resizeFractions,
+  // дважды за ход. Отдельного «диагонального» пути нет — иначе клампы минимума
+  // разошлись бы с одиночными перегородками.
+  type DragAxes = {
+    id: string;
+    col?: { dividerIndex: number };
+    row?: { columnIndex: number; dividerIndex: number };
+    cursor: string;
+  };
+  const startDrag = (e: React.MouseEvent, axes: DragAxes) => {
     if (e.button !== 0) return;
     e.preventDefault();
     const layer = layerRef.current;
@@ -693,21 +733,23 @@ export function SplitDividerLayer() {
     // Drag math runs against the sizes AT GRAB TIME (normalized to the current
     // structure), so the min-size clamp never accumulates across moves.
     const base = normalizeSplitSizes(panes, sizes) as LiveSizes;
-    draggingIdRef.current = divider.id;
+    draggingIdRef.current = axes.id;
     paintDivider(strip, true);
     const onMove = (ev: MouseEvent) => {
-      let next: LiveSizes;
-      if (divider.kind === 'col') {
+      let cols = base.cols;
+      let rows = base.rows;
+      if (axes.col) {
         const deltaFr = (ev.clientX - startX) / hostRect.width;
-        next = { cols: resizeFractions(base.cols, divider.dividerIndex, deltaFr), rows: base.rows };
-      } else {
+        cols = resizeFractions(base.cols, axes.col.dividerIndex, deltaFr);
+      }
+      if (axes.row) {
         // Columns are full height, so a row's fraction is of the host height.
         const deltaFr = (ev.clientY - startY) / hostRect.height;
-        const rows = base.rows.map((r, c) => (
-          c === divider.columnIndex ? resizeFractions(r, divider.dividerIndex, deltaFr) : r
+        rows = base.rows.map((r, c) => (
+          c === axes.row!.columnIndex ? resizeFractions(r, axes.row!.dividerIndex, deltaFr) : r
         ));
-        next = { cols: base.cols, rows };
       }
+      const next: LiveSizes = { cols, rows };
       liveRef.current = next;
       setLiveSizes(next); // repositions the strips (this thin layer only)
       applyLiveGeometry(next); // repositions the pane wrappers, no store write
@@ -733,7 +775,7 @@ export function SplitDividerLayer() {
       if (finalSizes) useWorkspaceStore.getState().commitSplitSizes(finalSizes);
     };
     cancelDragRef.current = stopListening;
-    document.body.style.cursor = divider.kind === 'col' ? 'col-resize' : 'row-resize';
+    document.body.style.cursor = axes.cursor;
     document.body.style.userSelect = 'none';
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
@@ -750,7 +792,9 @@ export function SplitDividerLayer() {
         <div
           key={d.id}
           data-split-divider={d.id}
-          onMouseDown={(e) => startDrag(e, d)}
+          onMouseDown={(e) => startDrag(e, d.kind === 'col'
+            ? { id: d.id, col: { dividerIndex: d.dividerIndex }, cursor: 'col-resize' }
+            : { id: d.id, row: { columnIndex: d.columnIndex, dividerIndex: d.dividerIndex }, cursor: 'row-resize' })}
           // Double-click = back to the equal split, all dividers at once.
           // (Micro-jitter between the two clicks is harmless: a near-equal
           // drag packs to null anyway — see EQUAL_EPS in the model.)
@@ -799,6 +843,32 @@ export function SplitDividerLayer() {
             }}
           />
         </div>
+      ))}
+      {/* Уголки фокусного окна: квадрат-зона на пересечении двух перегородок,
+          тянет обе сразу. Лежит ПОСЛЕ перегородок — при наложении зон угол
+          выигрывает, иначе он был бы недостижим: любой его пиксель принадлежит
+          и вертикальной, и горизонтальной зоне. Ничего не рисует — курсор
+          nwse/nesw и есть весь его язык, как у углов окон в ОС. */}
+      {corners.map((corner) => (
+        <div
+          key={corner.id}
+          data-split-corner={corner.id}
+          onMouseDown={(e) => startDrag(e, {
+            id: corner.id,
+            col: { dividerIndex: corner.colDividerIndex },
+            row: { columnIndex: corner.rowColumnIndex, dividerIndex: corner.rowDividerIndex },
+            cursor: corner.cursor,
+          })}
+          style={{
+            position: 'absolute',
+            pointerEvents: 'auto',
+            left: `calc(${corner.xPct}% - ${SPLIT_DIVIDER_HIT_PX / 2}px)`,
+            top: `calc(${corner.yPct}% - ${SPLIT_DIVIDER_HIT_PX / 2}px)`,
+            width: SPLIT_DIVIDER_HIT_PX,
+            height: SPLIT_DIVIDER_HIT_PX,
+            cursor: corner.cursor,
+          }}
+        />
       ))}
     </div>
   );

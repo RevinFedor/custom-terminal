@@ -149,7 +149,7 @@ test('main returns the generated attempt identity to the exact History handoff',
   );
   ordered(resultBody, [
     ['scenario result received', 'const result = await sendAgentPromptScenario({'],
-    ['local slash proof classified', 'const localSlashReceipt = projectCodexLocalSlashSendResult({'],
+    ['local slash proof classified', 'const localSlashReceipt = projectAgentLocalCommandSendResult({'],
     ['physical ownership classified', 'const resultOwnershipTransferred ='],
     ['ordinary send identity gated away from local slash', 'if (resultOwnershipTransferred && !localSlashReceipt.handled)'],
     ['attempt identity bound', 'bindHistoryPromptHandoffSendIdentity('],

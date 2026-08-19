@@ -29,7 +29,7 @@ import {
 import { openTabContextMenuAt, TAB_RENAME_REQUEST_EVENT } from './TabBar';
 import {
   TabProcessBar,
-  TabStatusMarker,
+  TabStatusMarkerButton,
   TabTaskMarker,
   TASK_MARKER_GAP_PX,
   TASK_MARKER_LANE_HEIGHT_PX,
@@ -414,7 +414,9 @@ export default function PaneTabChip({
         radius={4}
         zIndex={4}
       />
-      <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} />
+      {/* Кликабельный маркер: смена статуса на месте, без активации вкладки
+          и без смены фокуса окна — тот же компонент, что на карточке списка. */}
+      <TabStatusMarkerButton projectId={projectId} tabId={tabId} color={statusMeta?.color} title={statusMeta?.label} />
       {/* Молнии Fast и числа заполнения контекста здесь НЕТ — они живут только
           на карточке в боковом списке (юзер, 2026-08-18). Боковой список — это
           обзор: там читают состояние всех вкладок сразу, и метки отвечают на

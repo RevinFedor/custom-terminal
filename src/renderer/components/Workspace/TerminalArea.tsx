@@ -372,6 +372,14 @@ function TerminalArea({
       // (Reported: right-click pane 1's chip from pane 2, then click inside
       // pane 1 — the menu closed AND pane 1 took focus.)
       if (notePointerDownForDismissal(document)) return;
+      // Маркеры статусов и их меню НЕ двигают фокус окон: их смысл — «сменить
+      // цвет, ничего не активируя» (юзер: «при этом фокус не меняется вообще
+      // никак»). Гашение события на самой кнопке сюда не достаёт: этот
+      // обработчик стоит на window в capture-фазе и срабатывает раньше цели,
+      // поэтому исключение живёт здесь, по data-атрибутам.
+      if ((e.target as HTMLElement)?.closest?.(
+        '[data-tab-status-marker-button], [data-tab-status-marker-menu], [data-task-plan-status-trigger], [data-task-plan-status-menu]',
+      )) return;
       const el = (e.target as HTMLElement)?.closest?.('[data-split-pane-index]');
       if (!el) return;
       const idx = Number(el.getAttribute('data-split-pane-index'));

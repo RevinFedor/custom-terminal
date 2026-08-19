@@ -50,4 +50,7 @@ test('normal Queue and Loop prompts share the desktop durable receipt contract',
   assert.match(receipt, /isLocalSlashCommandPrompt\(rawPrompt\) && !hasStructuredPayload/);
   // И правило больше не сужено до automation-источников.
   assert.doesNotMatch(receipt, /DESKTOP_AUTOMATION_SEND_SOURCES\.has\(source\) && rawPrompt/);
+  assert.match(runner, /isStandaloneAgentLocalCommand\(\{/);
+  assert.match(runner, /projectAgentLocalCommandSendResult\(\{/);
+  assert.match(runner, /requiresAuditIdentity:\s*!localCommandCandidate/);
 });

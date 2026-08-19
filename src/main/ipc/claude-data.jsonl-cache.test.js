@@ -305,3 +305,120 @@ test('materialization of a growing session costs a stat, not a full read', async
     fs.rmSync(projectDir, { recursive: true, force: true });
   }
 });
+
+test('a materialized session does not re-parse after an mtime-only touch', () => {
+  const { getSessionMaterialization, _api: api } = require('./claude-data');
+  api.resetSessionMaterializationCacheForTests();
+
+  const sessionId = 'materialization-touch-' + process.pid;
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const projectDir = path.join(projectsDir, '-tmp-materialization-touch-' + process.pid);
+  fs.mkdirSync(projectDir, { recursive: true });
+  const filePath = path.join(projectDir, sessionId + '.jsonl');
+  const realReadFileSync = fs.readFileSync;
+  let fullReads = 0;
+  fs.readFileSync = function patched(target, ...rest) {
+    if (target === filePath) fullReads += 1;
+    return realReadFileSync.call(this, target, ...rest);
+  };
+
+  try {
+    writeRecords(filePath, sessionId, 20);
+    assert.equal(getSessionMaterialization(sessionId, null).materialized, true);
+    assert.equal(fullReads, 1);
+
+    const future = new Date(Date.now() + 60_000);
+    fs.utimesSync(filePath, future, future);
+    assert.equal(getSessionMaterialization(sessionId, null).materialized, true);
+    assert.equal(
+      fullReads,
+      1,
+      'once materialized=true is proven, a timestamp-only change cannot make the file empty',
+    );
+  } finally {
+    fs.readFileSync = realReadFileSync;
+    api.resetSessionMaterializationCacheForTests();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('materialization cache stays warm across a 45-session round robin', () => {
+  const { getSessionMaterialization, _api: api } = require('./claude-data');
+  api.resetSessionMaterializationCacheForTests();
+
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const projectDir = path.join(projectsDir, '-tmp-materialization-round-robin-' + process.pid);
+  fs.mkdirSync(projectDir, { recursive: true });
+  const files = new Set();
+  const sessions = [];
+  for (let index = 0; index < 45; index += 1) {
+    const sessionId = 'materialization-round-' + process.pid + '-' + index;
+    const filePath = path.join(projectDir, sessionId + '.jsonl');
+    writeRecords(filePath, sessionId, 2);
+    sessions.push(sessionId);
+    files.add(filePath);
+  }
+
+  const realReadFileSync = fs.readFileSync;
+  let fullReads = 0;
+  fs.readFileSync = function patched(target, ...rest) {
+    if (files.has(target)) fullReads += 1;
+    return realReadFileSync.call(this, target, ...rest);
+  };
+
+  try {
+    for (const sessionId of sessions) {
+      assert.equal(getSessionMaterialization(sessionId, null).materialized, true);
+    }
+    assert.equal(fullReads, 45, 'cold round reads each small fixture once');
+
+    for (const sessionId of sessions) {
+      assert.equal(getSessionMaterialization(sessionId, null).materialized, true);
+    }
+    assert.equal(
+      fullReads,
+      45,
+      'the second 45-tab sweep must be entirely warm instead of 45 fresh full reads',
+    );
+  } finally {
+    fs.readFileSync = realReadFileSync;
+    api.resetSessionMaterializationCacheForTests();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('active-branch messages reuse the incremental reader instead of readFileSync', async () => {
+  assert.equal(
+    typeof _api.getActiveBranchMessages,
+    'function',
+    'public Claude History/SDK must reuse the shared incremental JSONL reader',
+  );
+
+  const sessionId = 'active-branch-cache-' + process.pid;
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const projectDir = path.join(projectsDir, '-tmp-active-branch-cache-' + process.pid);
+  fs.mkdirSync(projectDir, { recursive: true });
+  const filePath = path.join(projectDir, sessionId + '.jsonl');
+  writeRecords(filePath, sessionId, 30);
+
+  const realReadFileSync = fs.readFileSync;
+  let syncReads = 0;
+  fs.readFileSync = function patched(target, ...rest) {
+    if (target === filePath) syncReads += 1;
+    return realReadFileSync.call(this, target, ...rest);
+  };
+
+  try {
+    const first = await _api.getActiveBranchMessages({ sessionId, cwd: null });
+    const second = await _api.getActiveBranchMessages({ sessionId, cwd: null });
+    assert.equal(first.success, true);
+    assert.equal(second.success, true);
+    assert.equal(first.messages.length, 30);
+    assert.equal(second.messages.length, 30);
+    assert.equal(syncReads, 0, 'neither cold nor warm public history may block main with readFileSync');
+  } finally {
+    fs.readFileSync = realReadFileSync;
+    _api.resetJsonlCacheForTests();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});

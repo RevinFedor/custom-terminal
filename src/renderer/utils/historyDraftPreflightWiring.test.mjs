@@ -26,7 +26,7 @@ test('History draft reads use the same three-valued preflight as scenario sends'
 
 test('History carries exact empty evidence through the scenario to the physical paste boundary', () => {
   assert.match(source, /claudeExactEmptyEvidence = terminalDraft\.claudeExactEmptyEvidence \|\| null/);
-  assert.match(source, /sendAgentPromptScenario\(\{[\s\S]{0,1000}claudeExactEmptyEvidence,/);
+  assert.match(source, /sendAgentPromptScenario\(\{[\s\S]{0,1200}initialComposerProof:\s*claudeExactEmptyEvidence/);
 });
 
 test('History send clears the mounted editor and persistent draft at the same handoff boundary', () => {

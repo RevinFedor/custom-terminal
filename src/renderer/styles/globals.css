@@ -198,6 +198,48 @@
   to { transform: rotate(360deg); }
 }
 
+/* Дуга-лоадер, обходящая контур элемента ЛЮБОЙ формы — круг, овал, скруглённый
+   квадрат.
+
+   Прежний способ — вращать transform'ом рамку с одной окрашенной стороной —
+   верен только для круга: круг совпадает сам с собой при любом повороте, а
+   повёрнутый овал НЕТ, и дуга на каждом кадре вылезала за контур («на овале
+   сбоит, потому что овал — это овал»). Здесь коробка не вращается вовсе:
+   крутится УГОЛ конического градиента, а полоса вырезана маской по границе
+   собственной формы элемента (кольцо = вся коробка минус content-box), поэтому
+   дуга обнимает контур на каждом кадре. Толщину задаёт padding.
+
+   Настройки через переменные: --noted-ring-color (дуга), --noted-ring-track
+   (остальное кольцо; по умолчанию прозрачное), --noted-ring-thickness.
+
+   Под «Уменьшать движение» НЕ гасится: движение дуги — сам сигнал «идёт
+   работа», а не украшение (см. инцидент с точкой периметра, 2026-08-18). */
+@property --noted-ring-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes noted-ring-sweep {
+  to { --noted-ring-angle: 360deg; }
+}
+.noted-shape-ring {
+  position: absolute;
+  pointer-events: none;
+  border-radius: inherit;
+  padding: var(--noted-ring-thickness, 1.5px);
+  background:
+    conic-gradient(
+      from var(--noted-ring-angle),
+      var(--noted-ring-color, #fbbf24) 0deg 86deg,
+      var(--noted-ring-track, transparent) 86deg 360deg
+    );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: noted-ring-sweep 0.9s linear infinite;
+}
+
 @keyframes tab-title-naming-sweep {
   0% { background-position: 180% 0; }
   100% { background-position: -80% 0; }
@@ -687,18 +729,23 @@
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.42);
 }
 
-/* Действия панели (кнопка деления; дальше — будущие) видимы у панели В ФОКУСЕ,
-   у прочих появляются при наведении на шапку — паттерн заголовка групп VS Code
-   (утверждено 2026-08-17). Скрытие — прозрачностью, НЕ размонтированием: кнопка
-   держит своё место, и раскладка шапки не дёргается (урок «кнопка пропала» —
-   13.1). pointer-events не трогаем: невидимая кнопка кликабельна только после
-   наведения, которое её и проявило, так что мёртвых зон нет. */
-[data-split-attach-row]:not([data-focused]) [data-split-button] {
+/* Действия панели (Git + кнопка деления) видимы ТОЛЬКО у панели в фокусе.
+
+   Раньше они у прочих проявлялись при наведении на шапку (паттерн VS Code),
+   а слой держал место в строке. С переездом слоя в position:absolute ПОВЕРХ
+   полосы чипов (SplitPaneChrome::data-split-pane-actions) hover-проявление
+   убрано вместе с местом: у нефокусного окна вся строка отдана вкладкам, и
+   кнопка, всплывающая над чипом от случайного наведения, читалась бы как
+   перекрытие. Юзер: *«она не должна появляться при ховере… там у меня
+   пространство вкладок»*.
+
+   Скрытие — прозрачностью, НЕ размонтированием (урок «кнопка пропала» — 13.1),
+   но теперь с pointer-events: слой лежит поверх чипов, и невидимый он не имеет
+   права съедать их клики. */
+[data-split-attach-row]:not([data-focused]) [data-split-pane-actions] {
   opacity: 0;
+  pointer-events: none;
   transition: opacity 0.12s ease;
-}
-[data-split-attach-row]:not([data-focused]):hover [data-split-button] {
-  opacity: 1;
 }
 
 /* Полоса вкладок в шапке окна прокручивается вбок, но своей полосы прокрутки не

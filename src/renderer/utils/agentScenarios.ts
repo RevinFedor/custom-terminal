@@ -5,7 +5,6 @@ import type {
   HistoryAgentRuntime,
 } from './historyAgentRuntimes';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './claudeStartupDefaultsReady';
-import { terminalRegistry } from './terminalRegistry';
 import { useUIStore, type HistoryPromptDraftImageRef } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { requireCommittedCodexRewind } from './codexRewindCommit';
@@ -14,33 +13,21 @@ import { selectRewindOperation } from '../store/rewindOperationState';
 import { useRewindOperationStore } from '../store/useRewindOperationStore';
 import {
   cancelCoordinatedAgentSendFollowers,
-  createCoordinatedAgentSendCancellationWait,
   getCoordinatedAgentSendCancellation,
-  isCoordinatedAgentSendCancellationRequested,
   settleCoordinatedAgentSend,
 } from './agentActionCoordinator.mjs';
+import { runAgentSendFlow } from './agentSendFlow.mjs';
+import { createAgentReadyWait } from './agentSendPreparation';
+import { createAgentSendAdapter } from './agentSendAdapter';
 import {
-  applyAgentDraftCaptureResolution,
-  buildExactDraftCaptureProof,
-  classifyAgentDraftPreflight,
-  resolveAgentDraftConflict,
-} from './agentDraftPreflight.mjs';
+  agentSendSettingsContractError,
+  type AgentHistoryRestartSettings,
+  type AgentSettingsIntent,
+} from './agentSendSettingsContract';
 import { buildClaudeRewindPromptProjection } from './composerChips.mjs';
 import { enqueueAgentSendScenario } from './agentSendSequencer.mjs';
-import { showAgentDraftScreenContradictionToast } from './agentDraftContradictionToast.mjs';
-import { getCodexRuntimeReadSessionId } from './codexPtyPresence.mjs';
 
 const { ipcRenderer } = window.require('electron');
-
-const buildDraftCaptureProof = (tabId: string, proof: AgentDraftInspection) => (
-  buildExactDraftCaptureProof(
-    proof,
-    terminalRegistry.getDraftDiagnosticSnapshot(tabId, {
-      promptRow: (proof as any)?.promptRow,
-      cursorRow: (proof as any)?.cursorRow,
-    }),
-  )
-);
 
 export interface SendAgentPromptScenarioArgs {
   tabId: string;
@@ -55,11 +42,16 @@ export interface SendAgentPromptScenarioArgs {
   source?: string;
   statusAtSend?: string;
   queue?: boolean;
-  model?: string;
-  effort?: string;
-  thinking?: string;
+  // Required discriminant: every caller must say whether this prompt carries
+  // an explicit settings mutation. Ambient display/launch values have no field
+  // here and therefore cannot accidentally reach a provider picker.
+  settingsIntent: AgentSettingsIntent;
+  // Separate lifecycle evidence used only by record-without-reply. It can be
+  // written into/reopened with history but is never interpreted as a request
+  // to mutate the live provider before this prompt.
+  historyRestartSettings?: AgentHistoryRestartSettings;
   returnDraftOnConflict?: boolean;
-  claudeExactEmptyEvidence?: Record<string, unknown> | null;
+  initialComposerProof?: Record<string, unknown> | null;
   coordinatedSendToken?: number | null;
   // Explicit alternate gesture: stop the provider, persist the immutable
   // authoring snapshot into model-visible history WITHOUT a model turn, then
@@ -95,73 +87,34 @@ export interface SendAgentPromptScenarioArgs {
   };
 }
 
+interface AgentSendFlowContext {
+  complete?: boolean;
+  result?: any;
+  historyContextResult: any;
+  restartPerformed: boolean;
+  restartSessionId?: string | null;
+  requestedStatusAtClick?: AgentPtyStatus;
+  requestedStatusForSend?: AgentPtyStatus;
+  recordWithoutReply: boolean;
+}
+
+interface AgentSendReadyContext {
+  status: Extract<AgentPtyStatus, 'active' | 'busy'>;
+  submitCapability: 'direct' | 'queue';
+  runtimeSnapshot: unknown;
+}
+
+interface AgentSendComposerContext {
+  complete: false;
+  exactEmptyEvidence?: Record<string, unknown> | null;
+  refreshExactEmptyEvidence?: () => Promise<any>;
+}
+
 const normalizeStatus = (value: unknown): AgentPtyStatus | undefined => {
   return value === 'active' || value === 'busy' || value === 'inactive' || value === 'starting' || value === 'stopping' || value === 'unknown'
     ? value
     : undefined;
 };
-
-const needsExactDraftCapture = (visual: any, decision: any) => (
-  decision?.decision === 'conflict'
-  || (decision?.decision === 'unknown' && visual?.exactCaptureRecommended === true)
-);
-
-const isClaudeFrameChangedBeforeExactCapture = (captured: any) => (
-  captured?.success === false
-  && captured?.error === 'claude_draft_state_unknown_before_paste'
-  && captured?.proofReason === 'claude-current-frame-changed-before-exact-capture'
-);
-
-async function captureDraftWithOneCommittedFrameRefresh({
-  tabId,
-  toolType,
-  runtime,
-  initialVisual,
-  mode,
-  reason,
-  assertSendNotCancelled,
-}: {
-  tabId: string;
-  toolType: AgentHistoryTool;
-  runtime: HistoryAgentRuntime;
-  initialVisual: any;
-  mode: 'copy' | 'grab';
-  reason: string;
-  assertSendNotCancelled: () => void;
-}) {
-  let visual = initialVisual;
-  let decision = classifyAgentDraftPreflight(visual);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    if (!needsExactDraftCapture(visual, decision)) {
-      return { visual, decision, captured: null, attemptedCapture: false };
-    }
-    const captured = mode === 'grab'
-      ? await runtime.grabDraft(tabId, {
-          draftProof: buildDraftCaptureProof(tabId, visual),
-        })
-      : await runtime.copyDraft(tabId, {
-          draftProof: buildDraftCaptureProof(tabId, visual),
-        });
-    assertSendNotCancelled();
-    if (
-      toolType !== 'claude'
-      || !isClaudeFrameChangedBeforeExactCapture(captured)
-      || attempt > 0
-      || !runtime.probeDraft
-    ) {
-      return { visual, decision, captured, attemptedCapture: true };
-    }
-
-    // Process discovery may itself cause Claude to publish a newer complete
-    // TUI frame. Re-prove that exact frame once inside the same serialized send
-    // scenario; no input has been touched yet, so this preserves the original
-    // intent without weakening the empty-composer proof.
-    visual = await runtime.probeDraft(tabId, reason + ':committed-frame-refresh');
-    assertSendNotCancelled();
-    decision = classifyAgentDraftPreflight(visual);
-  }
-  return { visual, decision, captured: null, attemptedCapture: false };
-}
 
 async function runAgentPromptScenario({
   tabId,
@@ -176,11 +129,10 @@ async function runAgentPromptScenario({
   source,
   statusAtSend,
   queue,
-  model,
-  effort,
-  thinking,
+  settingsIntent,
+  historyRestartSettings,
   returnDraftOnConflict,
-  claudeExactEmptyEvidence,
+  initialComposerProof,
   coordinatedSendToken,
   recordWithoutReply,
   onRestartPhase,
@@ -203,423 +155,158 @@ async function runAgentPromptScenario({
       }
     }
   };
+  const adapter = createAgentSendAdapter({
+    tabId,
+    toolType,
+    runtime,
+    assertSendNotCancelled,
+  });
   const requestedStatusAtClick = normalizeStatus(statusAtSend);
-  let restartPerformed = false;
-  let restartSessionId = sessionId;
-  let historySessionAuthority: 'live-writer' | 'history-hint' | 'fresh' = sessionId
-    ? 'history-hint'
-    : 'fresh';
-  let historyContextResult: any = null;
-  if (recordWithoutReply === true) {
-    let presence = await runtime.getPresence(tabId).catch((err: any) => {
-      console.warn('[AgentScenario:record-context] presence failed before stop tool=' + toolType
-        + ' tab=' + String(tabId).slice(-12) + ' ' + (err?.message || err));
-      return null;
-    });
-    assertSendNotCancelled();
-    if (!presence || presence.status === 'unknown') {
-      throw new Error(runtime.label + ' status could not be verified before recording context');
-    }
-    if (presence.status === 'stopping') {
-      throw new Error(runtime.label + ' is already stopping; wait before recording context');
-    }
-    if (presence.status === 'busy' || presence.status === 'starting') {
-      throw new Error(runtime.label + ' must be idle before recording context');
-    }
-    const livePresence = presence.status === 'active'
-      || presence.status === 'busy'
-      || presence.status === 'starting';
-    if (livePresence) {
-      const provenLiveSessionId = presence.sessionId
-        || (toolType === 'codex'
-          ? getCodexRuntimeReadSessionId(presence.runtimeSnapshot)
-          : null);
-      if (provenLiveSessionId) {
-        restartSessionId = provenLiveSessionId;
-        historySessionAuthority = 'live-writer';
-      } else if (
-        !sessionId
-        || (toolType === 'claude' && presence.conversationMaterialized === false)
-      ) {
-        restartSessionId = null;
-        historySessionAuthority = 'fresh';
-      } else {
-        throw new Error(runtime.label + ' live writer session could not be verified before recording context');
-      }
-    }
-    if (toolType === 'claude' && restartSessionId) {
-      const conversationMaterialized = presence.conversationMaterialized === true
-        || presence.canResume === true;
-      const conversationProvenFresh = presence.conversationMaterialized === false
-        && presence.canResume !== true;
-      if (!conversationMaterialized && !conversationProvenFresh) {
-        throw new Error('Claude conversation state could not be verified before recording context');
-      }
-      restartSessionId = conversationMaterialized ? restartSessionId : null;
-      if (!restartSessionId) historySessionAuthority = 'fresh';
-    }
-    if (presence.status === 'active' || presence.status === 'busy' || presence.status === 'starting') {
-      onRestartPhase?.('stopping');
-      console.log('[AgentScenario:record-context] stop tool=' + toolType
-        + ' tab=' + String(tabId).slice(-12)
-        + ' status=' + presence.status);
-      const stopped = await stopAgentProcessScenario({
-        tabId,
-        toolType,
-        runtime,
-        reason: 'record-history-context',
+  const settingsContractError = agentSendSettingsContractError({
+    toolType,
+    recordWithoutReply,
+    settingsIntent,
+    historyRestartSettings,
+  });
+  if (settingsContractError) {
+    return {
+      success: false,
+      accepted: false,
+      submitted: false,
+      pasteWritten: false,
+      code: 'agent_send_settings_contract_invalid',
+      error: settingsContractError,
+    };
+  }
+  return runAgentSendFlow({
+    prepareContext: async () => {
+      const prepared = await adapter.prepareRecordContext({
+        enabled: recordWithoutReply === true,
+        sessionId,
+        cwd,
+        prompt,
+        handoffId,
+        source,
+        historyRestartSettings,
+        presentationSnapshot,
+        coordinatedSendToken,
+        requestedStatusAtClick,
+        onRestartPhase,
+        onHistoryRecorded,
       });
-      assertSendNotCancelled();
-      if (stopped?.success === false) {
-        // A concurrent clean exit may win the stop request. Accept it only
-        // after a fresh authoritative presence read proves the process gone.
-        presence = await runtime.getPresence(tabId).catch(() => null);
-        if (presence?.status !== 'inactive') {
-          throw new Error(stopped?.error || runtime.label + ' could not stop before recording context');
-        }
+      if (prepared.complete) return { complete: true, result: prepared.result };
+      return {
+        ...prepared,
+        requestedStatusAtClick,
+        // After an explicit record-context Stop, click-time `starting` is stale.
+        requestedStatusForSend: recordWithoutReply === true ? 'inactive' : requestedStatusAtClick,
+        recordWithoutReply: recordWithoutReply === true,
+      };
+    },
+    ensureReady: async (context: AgentSendFlowContext): Promise<AgentSendReadyContext> => {
+      const readyForSend = await adapter.ensureReady({
+        sessionId: context.recordWithoutReply ? context.restartSessionId : sessionId,
+        cwd,
+        coordinatedSendToken,
+        requestedStatusAtSend: context.requestedStatusForSend,
+        resumePausedGoal: context.recordWithoutReply ? false : undefined,
+      });
+      const statusForSend = readyForSend.status;
+      if (!context.recordWithoutReply) assertSendNotCancelled();
+      if (statusForSend === 'active' || statusForSend === 'busy') {
+        onReadyForSend?.(statusForSend);
       }
-      restartPerformed = true;
-    }
-    onRestartPhase?.('starting');
-    assertSendNotCancelled();
-    historyContextResult = await runtime.recordHistoryContext(tabId, prompt, {
-      sessionId: restartSessionId,
-      sessionAuthority: historySessionAuthority,
-      cwd,
-      handoffId,
-      source,
-      model,
-      effort,
-      presentationSnapshot,
-    });
-    if (historyContextResult?.success === false && historyContextResult?.accepted !== true) {
-      throw Object.assign(
-        new Error(historyContextResult?.error || 'History context was not recorded'),
-        { historyContextResult },
-      );
-    }
-    restartSessionId = historyContextResult?.sessionId || null;
-    if (!restartSessionId) {
-      if (coordinatedSendToken) {
-          cancelCoordinatedAgentSendFollowers(
-            tabId,
-            coordinatedSendToken,
-            'history-context-session-unresolved',
-            Date.now(),
-            { cascadeRestore: false },
-        );
+      if (context.requestedStatusForSend
+        && statusForSend
+        && context.requestedStatusForSend !== statusForSend) {
+        console.log('[AgentScenario:send] status override tool=' + toolType
+          + ' tab=' + String(tabId).slice(-12)
+          + ' requested=' + context.requestedStatusForSend
+          + ' effective=' + statusForSend);
       }
       return {
-        ...(historyContextResult || {}),
-        requestedStatusAtSend: requestedStatusAtClick,
-        effectiveStatusAtSend: 'inactive',
-        recordWithoutReply: true,
-        restartPerformed,
-        restartSessionId: null,
-        reopened: false,
+        status: statusForSend,
+        submitCapability: readyForSend.submitCapability,
+        runtimeSnapshot: readyForSend?.presence?.runtimeSnapshot || null,
       };
-    }
-    if (toolType === 'codex') {
-      const adopted = await useWorkspaceStore.getState().setCodexSessionId(
-        tabId,
-        restartSessionId,
-        'historyContext',
-      );
-      if (!adopted) {
-        if (coordinatedSendToken) {
-          cancelCoordinatedAgentSendFollowers(
-            tabId,
-            coordinatedSendToken,
-            'history-context-session-not-adopted',
-            Date.now(),
-            { cascadeRestore: false },
-          );
-        }
-        return {
-          ...historyContextResult,
+    },
+    recoverReadyFailure: async (error: any, context: AgentSendFlowContext) => {
+      if (!context.recordWithoutReply || context.historyContextResult?.historyRecorded !== true) {
+        throw error;
+      }
+      return {
+        complete: true,
+        result: {
+          ...context.historyContextResult,
           success: true,
           requestedStatusAtSend: requestedStatusAtClick,
           effectiveStatusAtSend: 'inactive',
           recordWithoutReply: true,
-          restartPerformed,
-          restartSessionId,
+          restartPerformed: context.restartPerformed,
+          restartSessionId: context.restartSessionId,
           reopened: false,
-          reopenWarning: 'Codex history was recorded, but the tab could not adopt the new session',
+          reopenWarning: String(error?.message || error),
+        },
+      };
+    },
+    finishAfterReady: async (context: AgentSendFlowContext, ready: AgentSendReadyContext) => context.recordWithoutReply
+      ? {
+          complete: true,
+          result: {
+            ...(context.historyContextResult || {}),
+            requestedStatusAtSend: requestedStatusAtClick,
+            effectiveStatusAtSend: ready.status,
+            recordWithoutReply: true,
+            restartPerformed: context.restartPerformed,
+            restartSessionId: context.restartSessionId,
+            reopened: true,
+          },
+        }
+      : { complete: false },
+    proveComposer: async (_context: AgentSendFlowContext, ready: AgentSendReadyContext) => {
+      const composer = await adapter.proveComposer({
+        statusForSend: ready.status,
+        source,
+        returnDraftOnConflict,
+        initialExactEmptyEvidence: initialComposerProof,
+      });
+      if (composer.complete === true) {
+        return {
+          complete: true,
+          result: { ...(composer.result || {}), originalPrompt: prompt },
         };
       }
-    } else {
-      useWorkspaceStore.getState().setClaudeSessionId(
-        tabId,
-        restartSessionId,
-        'historyContext',
-      );
-    }
-    if (historyContextResult?.historyRecorded === true) {
-      await onHistoryRecorded?.(historyContextResult);
-    }
-  }
-  // After the explicit stop, `starting` from the click-time snapshot is stale.
-  const requestedStatusForSend = recordWithoutReply === true
-    ? 'inactive'
-    : requestedStatusAtClick;
-  let statusForSend: AgentPtyStatus | undefined;
-  let runtimeSnapshotForSend: any = null;
-  try {
-    const readyForSend = await ensureAgentReadyForSend({
-      tabId,
-      toolType,
-      runtime,
-      sessionId: recordWithoutReply === true ? restartSessionId : sessionId,
-      cwd,
-      coordinatedSendToken,
-      requestedStatusAtSend: requestedStatusForSend,
-      resumePausedGoal: recordWithoutReply === true ? false : undefined,
-    });
-    statusForSend = readyForSend?.status || requestedStatusForSend;
-    runtimeSnapshotForSend = readyForSend?.presence?.runtimeSnapshot || null;
-  } catch (error: any) {
-    if (recordWithoutReply === true && historyContextResult?.historyRecorded === true) {
-      return {
-        ...historyContextResult,
-        success: true,
-        requestedStatusAtSend: requestedStatusAtClick,
-        effectiveStatusAtSend: 'inactive',
-        recordWithoutReply: true,
-        restartPerformed,
-        restartSessionId,
-        reopened: false,
-        reopenWarning: String(error?.message || error),
-      };
-    }
-    throw error;
-  }
-  if (recordWithoutReply !== true) assertSendNotCancelled();
-  if (statusForSend === 'active' || statusForSend === 'busy') {
-    onReadyForSend?.(statusForSend);
-  }
-  if (requestedStatusForSend && statusForSend && requestedStatusForSend !== statusForSend) {
-    console.log('[AgentScenario:send] status override tool=' + toolType
-      + ' tab=' + String(tabId).slice(-12)
-      + ' requested=' + requestedStatusForSend
-      + ' effective=' + statusForSend);
-  }
-  if (recordWithoutReply === true) {
-    return {
-      ...(historyContextResult || {}),
-      requestedStatusAtSend: requestedStatusAtClick,
-      effectiveStatusAtSend: statusForSend,
-      recordWithoutReply: true,
-      restartPerformed,
-      restartSessionId,
-      reopened: true,
-    };
-  }
-
-  const canInspectDraft = !!runtime.probeDraft || !!runtime.inspectDraft;
-  let exactEmptyEvidenceForSend = toolType === 'claude'
-    ? (claudeExactEmptyEvidence || null)
-    : null;
-  if ((statusForSend === 'active' || statusForSend === 'busy') && canInspectDraft) {
-    let visual = runtime.probeDraft
-      ? await runtime.probeDraft(tabId, 'agent-send-preflight:' + (source || 'unknown'))
-      : runtime.inspectDraft!(tabId);
-    assertSendNotCancelled();
-    let draftDecision = classifyAgentDraftPreflight(visual);
-    if (needsExactDraftCapture(visual, draftDecision)) {
-      const captureMode = returnDraftOnConflict === true ? 'grab' : 'copy';
-      const capture = await captureDraftWithOneCommittedFrameRefresh({
-        tabId,
-        toolType,
-        runtime,
-        initialVisual: visual,
-        mode: captureMode,
-        reason: 'agent-send-preflight:' + (source || 'unknown'),
-        assertSendNotCancelled,
+      return composer as AgentSendComposerContext;
+    },
+    runProviderOperation: async (
+      context: AgentSendFlowContext,
+      ready: AgentSendReadyContext,
+      composer: AgentSendComposerContext,
+    ) => {
+      assertSendNotCancelled();
+      const result = await adapter.runProviderOperation({
+        prompt,
+        handoffId,
+        sendAttemptId,
+        sendOperationKey,
+        source,
+        statusForSend: ready.status,
+        submitCapability: queue === true ? 'queue' : ready.submitCapability,
+        settingsIntent,
+        runtimeSnapshot: ready.runtimeSnapshot,
+        composer,
+        presentationSnapshot,
       });
-      visual = capture.visual;
-      draftDecision = capture.decision;
-      if (!capture.attemptedCapture) {
-        // A refreshed committed frame can itself become an exact clear/unknown
-        // verdict. Let the ordinary decision below consume that newer proof.
-      } else {
-        const captured = capture.captured;
-        const conflict = resolveAgentDraftConflict(visual, captured, {
-          attemptedCapture: true,
-        });
-        if (conflict.decision === 'capture-failed' && captureMode === 'grab') {
-          return {
-            tabId,
-            toolType,
-            success: false,
-            ok: false,
-            submitted: false,
-            accepted: false,
-            code: 'terminal_draft_grab_failed',
-            error: conflict.error,
-            draftPreview: visual.preview || '',
-            draftSource: visual.source || '',
-            originalPrompt: prompt,
-          };
-        }
-        if (conflict.decision === 'clear') {
-          draftDecision = applyAgentDraftCaptureResolution(draftDecision, conflict);
-          if (toolType === 'claude') exactEmptyEvidenceForSend = captured;
-          showAgentDraftScreenContradictionToast(useUIStore.getState(), {
-            tabId,
-            label: runtime.label,
-          });
-          console.warn('[AgentScenario:send] screen draft false-positive resolved by exact empty Ctrl+G'
-            + ' tool=' + toolType
-            + ' tab=' + String(tabId).slice(-12)
-            + ' mode=' + captureMode
-            + ' reason=' + conflict.reason);
-        } else {
-          if (!String(conflict.draftText || '').trim() && Number(conflict.draftImages || 0) === 0) {
-            return {
-              tabId,
-              toolType,
-              success: false,
-              ok: false,
-              submitted: false,
-              accepted: false,
-              code: 'terminal_draft_state_unknown',
-              error: conflict.reason || 'Terminal draft state could not be proven',
-              draftPreview: visual.preview || '',
-              draftSource: visual.source || '',
-              originalPrompt: prompt,
-            };
-          }
-          return {
-            tabId,
-            toolType,
-            success: false,
-            ok: false,
-            submitted: false,
-            accepted: false,
-            code: 'terminal_draft_conflict',
-            error: 'Terminal has an unsent draft',
-            draftText: captureMode === 'grab' ? conflict.draftText : '',
-            draftPreview: visual.preview || '',
-            draftSource: visual.source || '',
-            draftImages: captureMode === 'grab' ? conflict.draftImages : 0,
-            originalPrompt: prompt,
-          };
-        }
-      }
-    }
-    if (draftDecision.decision === 'unknown') {
       return {
-        tabId,
-        toolType,
-        success: false,
-        ok: false,
-        submitted: false,
-        accepted: false,
-        code: 'terminal_draft_state_unknown',
-        error: 'Terminal draft state is unknown; send stopped before touching input',
-        draftPreview: visual.preview || '',
-        draftSource: visual.source || '',
-        proofOutcome: visual.proofOutcome || 'unknown',
-        proofReason: draftDecision.reason,
-        originalPrompt: prompt,
+        ...(result || {}),
+        requestedStatusAtSend: requestedStatusAtClick,
+        effectiveStatusAtSend: ready.status,
+        recordWithoutReply: false,
+        restartPerformed: context.restartPerformed,
+        restartSessionId: undefined,
       };
-    }
-  }
-
-  const refreshClaudeExactEmptyEvidence = toolType === 'claude' && canInspectDraft
-    ? async () => {
-        let visual = runtime.probeDraft
-          ? await runtime.probeDraft(
-              tabId,
-              'agent-send-post-settings-proof:' + (source || 'unknown'),
-            )
-          : runtime.inspectDraft!(tabId);
-        assertSendNotCancelled();
-        let draftDecision = classifyAgentDraftPreflight(visual);
-        if (needsExactDraftCapture(visual, draftDecision)) {
-          const capture = await captureDraftWithOneCommittedFrameRefresh({
-            tabId,
-            toolType,
-            runtime,
-            initialVisual: visual,
-            mode: 'copy',
-            reason: 'agent-send-post-settings-proof:' + (source || 'unknown'),
-            assertSendNotCancelled,
-          });
-          visual = capture.visual;
-          draftDecision = capture.decision;
-          if (!capture.attemptedCapture) {
-            if (draftDecision.decision === 'clear') {
-              return { success: true, evidence: null };
-            }
-            return {
-              success: false,
-              code: 'terminal_draft_state_unknown',
-              error: 'Claude composer state is unknown after settings changed',
-            };
-          }
-          const captured = capture.captured;
-          const conflict = resolveAgentDraftConflict(visual, captured, {
-            attemptedCapture: true,
-          });
-          if (conflict.decision === 'clear') {
-            draftDecision = applyAgentDraftCaptureResolution(draftDecision, conflict);
-            showAgentDraftScreenContradictionToast(useUIStore.getState(), {
-              tabId,
-              label: runtime.label,
-            });
-            return { success: true, evidence: captured };
-          }
-          if (String(conflict.draftText || '').trim() || Number(conflict.draftImages || 0) > 0) {
-            return {
-              success: false,
-              code: 'terminal_draft_conflict',
-              error: 'Terminal has an unsent draft after Claude settings changed',
-            };
-          }
-          return {
-            success: false,
-            code: 'terminal_draft_state_unknown',
-            error: conflict.error || conflict.reason || 'Claude composer state is unknown after settings changed',
-          };
-        }
-        if (draftDecision.decision === 'unknown') {
-          return {
-            success: false,
-            code: 'terminal_draft_state_unknown',
-            error: 'Claude composer state is unknown after settings changed',
-          };
-        }
-        return { success: true, evidence: null };
-      }
-    : undefined;
-
-  assertSendNotCancelled();
-  const effectivePresentationSnapshot = presentationSnapshot;
-  const result = await runtime.sendPrompt(tabId, prompt, {
-    handoffId: typeof handoffId === 'string' ? handoffId : undefined,
-    sendAttemptId: typeof sendAttemptId === 'string' ? sendAttemptId : undefined,
-    sendOperationKey: typeof sendOperationKey === 'string' ? sendOperationKey : undefined,
-    source: typeof source === 'string' ? source : 'mobile-native',
-    statusAtSend: statusForSend,
-    queue: queue === true || statusForSend === 'busy',
-    model: typeof model === 'string' ? model : undefined,
-    effort: typeof effort === 'string' ? effort : undefined,
-    thinking: typeof thinking === 'string' ? thinking : undefined,
-    runtimeSnapshot: runtimeSnapshotForSend,
-    claudeExactEmptyEvidence: exactEmptyEvidenceForSend,
-    refreshClaudeExactEmptyEvidence,
-    presentationSnapshot: effectivePresentationSnapshot,
-    ...(toolType === 'claude' ? { assertNotCancelled: assertSendNotCancelled } : {}),
+    },
   });
-  return {
-    ...(result || {}),
-    requestedStatusAtSend: requestedStatusAtClick,
-    effectiveStatusAtSend: statusForSend,
-    recordWithoutReply: false,
-    restartPerformed,
-    restartSessionId: undefined,
-  };
 }
 
 export function sendAgentPromptScenario(
@@ -742,50 +429,6 @@ export function inspectAgentDraftScenario({
     };
   }
   return { tabId, toolType, ...(result || {}) };
-}
-
-// One-shot wake-up on the runtime's ready event. A ready signal is a WAKE
-// HINT, not readiness truth: Codex can emit tui-ready and revoke it ~70ms
-// later when an MCP-startup blocker appears, then emit a fresh ready after
-// startup completes. Callers therefore drive this from a re-arming loop
-// (arm listener → check presence → sleep) so a revoked signal fails one
-// check and the next armed wait catches the re-emitted ready. The deadline
-// is the only failure edge.
-function createAgentReadyWait(tabId: string, runtime: HistoryAgentRuntime, timeoutMs = 30000, purpose = 'ready') {
-  let cleanup = () => {};
-  const promise = new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const finish = (err?: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (err) reject(err);
-      else resolve();
-    };
-    const timer = setTimeout(() => {
-      finish(new Error(runtime.label + ' did not become ready for ' + purpose));
-    }, timeoutMs);
-    const handler = (_event: any, data: { tabId?: string } = {}) => {
-      if (data?.tabId !== tabId) return;
-      finish();
-    };
-    cleanup = () => {
-      clearTimeout(timer);
-      if (runtime.readyEvent) ipcRenderer.removeListener(runtime.readyEvent, handler);
-    };
-    if (!runtime.readyEvent) {
-      // No push signal for this runtime: resolve after a short pause so the
-      // caller's re-arming loop becomes a paced presence poll instead of a
-      // zero-delay busy-spin for the whole deadline.
-      setTimeout(() => finish(), Math.min(500, timeoutMs));
-    } else {
-      ipcRenderer.on(runtime.readyEvent, handler);
-    }
-  });
-  return {
-    promise,
-    cancel: () => cleanup(),
-  };
 }
 
 function isAgentRewindBlockedStatus(status?: AgentPtyStatus | null): boolean {
@@ -1172,186 +815,6 @@ export async function revalidatePreparedCodexRewindRuntime({
     throw new Error('Codex turn state is not confirmed idle; wait and repeat Rewind');
   }
   return { ...prepared, lineageDepth: mapped.lineageDepth };
-}
-
-async function ensureAgentReadyForSend({
-  tabId,
-  toolType,
-  runtime,
-  sessionId,
-  cwd,
-  coordinatedSendToken,
-  requestedStatusAtSend,
-  resumePausedGoal,
-}: {
-  tabId: string;
-  toolType: AgentHistoryTool;
-  runtime: HistoryAgentRuntime;
-  sessionId?: string | null;
-  cwd?: string;
-  coordinatedSendToken?: number | null;
-  requestedStatusAtSend?: AgentPtyStatus;
-  resumePausedGoal?: boolean;
-}) {
-  const assertSendNotCancelled = () => {
-    if (
-      coordinatedSendToken
-      && isCoordinatedAgentSendCancellationRequested(tabId, coordinatedSendToken)
-    ) {
-      throw new Error('Send cancelled before terminal submission');
-    }
-  };
-  const waitStartupDefaultsIfNeeded = async () => {
-    if (toolType === 'claude') await waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, 15000, 'agent-send');
-    assertSendNotCancelled();
-  };
-  let presence = await runtime.getPresence(tabId).catch((err: any) => {
-    console.warn('[AgentScenario:send] presence failed before send tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' ' + (err?.message || err));
-    return null;
-  });
-  assertSendNotCancelled();
-  const resolved = (status: AgentPtyStatus) => ({ status, presence });
-  console.log('[AgentScenario:send] presence before tool=' + toolType
-    + ' tab=' + String(tabId).slice(-12)
-    + ' status=' + (presence?.status || 'unknown')
-    + ' inputReady=' + !!presence?.inputReady
-    + ' busy=' + !!presence?.isBusy);
-  const isReadyComposer = () => !!presence?.inputReady
-    && (presence.status === 'active' || (toolType === 'codex' && presence.status === 'starting'));
-  if (presence?.status === 'stopping') {
-    throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
-  }
-  if (presence?.status === 'busy') return resolved('busy');
-  if (isReadyComposer()) {
-    await waitStartupDefaultsIfNeeded();
-    presence = await runtime.getPresence(tabId).catch(() => null);
-    assertSendNotCancelled();
-    if (presence?.status === 'stopping') {
-      throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
-    }
-    if (presence?.status === 'busy') return resolved('busy');
-    if (isReadyComposer()) return resolved('active');
-  }
-  if (presence?.status === 'active' && !presence?.inputReady && sessionId && runtime.inspectDraft) {
-    const draftState = runtime.inspectDraft(tabId);
-    if (draftState?.source === 'no-terminal' && !terminalRegistry.get(tabId)) {
-      console.log('[AgentScenario:send] renderer terminal not mounted; continue with PTY/audit path tool='
-        + toolType + ' tab=' + String(tabId).slice(-12));
-      return resolved('active');
-    }
-  }
-
-  const launchAlreadyInProgress = requestedStatusAtSend === 'starting';
-  if ((!presence || presence.status === 'inactive') && !launchAlreadyInProgress) {
-    const hasSession = typeof sessionId === 'string' && sessionId.length > 0;
-    const actionLabel = hasSession ? 'resume' : 'start-fresh';
-    if (!hasSession && !runtime.startFresh) {
-      throw new Error(runtime.label + ' session is inactive and cannot start fresh');
-    }
-    console.log('[AgentScenario:send] ' + actionLabel + ' before send tool=' + toolType + ' tab=' + String(tabId).slice(-12));
-    const resumeResult = hasSession
-      ? await runtime.resume({ tabId, sessionId, cwd, resumePausedGoal })
-      : await runtime.startFresh!({ tabId, cwd });
-    if (resumeResult?.success === false) {
-      throw new Error(resumeResult.error || runtime.label + ' ' + actionLabel + ' failed before send');
-    }
-    assertSendNotCancelled();
-  } else if ((!presence || presence.status === 'inactive') && launchAlreadyInProgress) {
-    console.log('[AgentScenario:send] wait for existing launch tool=' + toolType
-      + ' tab=' + String(tabId).slice(-12)
-      + ' presence=' + (presence?.status || 'unknown'));
-  }
-
-  // Re-arming readiness loop. Enter is one submit intent: the scenario owns
-  // Start/Resume → readiness → submit and must survive a REVOKED ready
-  // signal. Codex emits tui-ready, can invalidate it ~70ms later on an
-  // MCP-startup blocker, then emits a fresh ready when startup completes.
-  // The old single-listener wait consumed the revoked signal, saw
-  // starting/inputReady=false once and rolled the send back — the proven
-  // "Enter needs a second press" bug (production 21:30 + two E2E repros).
-  // Each pass arms the listener BEFORE probing so no edge is lost; only the
-  // deadline fails the wait.
-  const deadline = Date.now() + 30000;
-  for (let pass = 0; ; pass += 1) {
-    assertSendNotCancelled();
-    const remainingMs = deadline - Date.now();
-    const readyWait = createAgentReadyWait(tabId, runtime, Math.max(1, remainingMs), 'send');
-    const cancellationWait = coordinatedSendToken
-      ? createCoordinatedAgentSendCancellationWait(tabId, coordinatedSendToken)
-      : null;
-    try {
-      presence = await runtime.getPresence(tabId).catch(() => null);
-      assertSendNotCancelled();
-      if (pass > 0) {
-        console.log('[AgentScenario:send] presence after wait tool=' + toolType
-          + ' tab=' + String(tabId).slice(-12)
-          + ' pass=' + pass
-          + ' status=' + (presence?.status || 'unknown')
-          + ' inputReady=' + !!presence?.inputReady
-          + ' busy=' + !!presence?.isBusy);
-      }
-      if (toolType === 'claude' && presence?.status === 'starting') {
-        // The first Claude prompt glyph is only a wake-up hint. Startup can
-        // still own the composer with /model or /effort, so wait for the exact
-        // launch gate and then re-read one coherent presence snapshot.
-        await waitStartupDefaultsIfNeeded();
-        presence = await runtime.getPresence(tabId).catch(() => null);
-        assertSendNotCancelled();
-        if (presence?.status === 'stopping') {
-          throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
-        }
-        if (presence?.status === 'busy') return resolved('busy');
-        if (isReadyComposer()) return resolved('active');
-        if (remainingMs <= 0) {
-          throw new Error(runtime.label + ' session is not ready for send');
-        }
-        // Startup defaults may finish before the lifecycle publishes the next
-        // complete composer frame. Keep this pass's already-armed listener and
-        // sleep on that event; an immediate `continue` here spins thousands of
-        // presence reads while Claude is legitimately still starting.
-        if (cancellationWait) {
-          const outcome = await Promise.race([
-            readyWait.promise.then(() => 'ready'),
-            cancellationWait.promise.then(() => 'cancelled'),
-          ]);
-          if (outcome === 'cancelled') assertSendNotCancelled();
-        } else {
-          await readyWait.promise;
-        }
-        continue;
-      }
-      if (presence?.status === 'stopping') {
-        throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
-      }
-      if (presence?.status === 'busy') return resolved('busy');
-      if (isReadyComposer()) {
-        readyWait.cancel();
-        await waitStartupDefaultsIfNeeded();
-        presence = await runtime.getPresence(tabId).catch(() => null);
-        assertSendNotCancelled();
-        if (presence?.status === 'stopping') {
-          throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
-        }
-        if (presence?.status === 'busy') return resolved('busy');
-        if (isReadyComposer()) return resolved('active');
-      }
-      if (remainingMs <= 0) {
-        throw new Error(runtime.label + ' session is not ready for send');
-      }
-      if (cancellationWait) {
-        const outcome = await Promise.race([
-          readyWait.promise.then(() => 'ready'),
-          cancellationWait.promise.then(() => 'cancelled'),
-        ]);
-        if (outcome === 'cancelled') assertSendNotCancelled();
-      } else {
-        await readyWait.promise;
-      }
-    } finally {
-      readyWait.cancel();
-      cancellationWait?.cancel();
-    }
-  }
 }
 
 export async function rewindAgentTimelineScenario({

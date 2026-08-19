@@ -40,6 +40,9 @@ import ControlHint from '../UI/ControlHint';
 const { ipcRenderer, clipboard } = window.require('electron');
 
 const DOCS_ONLY_STORAGE_KEY = 'noted-terminal.git.docsOnlyAiContext';
+// Порог показа названия ветки — НАСТРОЙКА, не константа: «узко» у каждого своё
+// (сколько окон, какой монитор), и юзер попросил ручку в Git settings.
+const BRANCH_MIN_STORAGE_KEY = 'noted-terminal.git.branchNameMinHostPx';
 const DEFAULT_PANEL_SIZE = { width: 1040, height: 640 };
 const MIN_PANEL_SIZE = { width: 760, height: 420 };
 const PANEL_MARGIN = 16;
@@ -52,7 +55,7 @@ const PANEL_MARGIN = 16;
 // своего содержимого, поэтому на ней «узко» не наступало никогда: название
 // показывалось в любом окне, сколько его ни сужай. Окно — та коробка, чью
 // ширину человек и меняет перегородкой.
-const GIT_CHIP_BRANCH_MIN_HOST_PX = 520;
+const GIT_CHIP_BRANCH_MIN_HOST_PX = 520; // default; живое значение — в настройке ниже
 // Ширина чипа Git постоянна — она не зависит от того, что он сейчас показывает.
 //
 // Он стоит в одной строке с полосой вкладок, и каждое изменение его ширины
@@ -241,6 +244,22 @@ type Props = {
 
 type GitToolbarAction = GitRunAfterAction | 'commit' | 'push' | 'fetch' | 'undo' | 'checkout' | 'merge' | 'abort-merge';
 type GitRunAfterStatusPhase = 'idle' | 'waiting' | 'running' | 'success';
+
+function loadBranchMinHostPx() {
+  try {
+    const raw = Number(window.localStorage.getItem(BRANCH_MIN_STORAGE_KEY));
+    if (Number.isFinite(raw) && raw >= 0) return Math.min(2000, Math.round(raw));
+  } catch { /* fall through */ }
+  return GIT_CHIP_BRANCH_MIN_HOST_PX;
+}
+
+function saveBranchMinHostPx(value: number) {
+  try {
+    window.localStorage.setItem(BRANCH_MIN_STORAGE_KEY, String(value));
+  } catch {
+    // Local UI preference only.
+  }
+}
 
 function loadDocsOnlySetting() {
   try {
@@ -473,6 +492,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
   // Порог считается от ширины ОКНА, а не экрана: кнопка живёт в окне, и на 4K с
   // одним окном во весь экран любой процент от монитора не значит ничего.
   const [showBranchName, setShowBranchName] = useState(true);
+  const [branchMinHostPx, setBranchMinHostPx] = useState(loadBranchMinHostPx);
   useEffect(() => {
     // Коробка ОКНА, а не строки заголовка внутри него. Заголовок — строка на
     // всю ширину окна, но её собственная ширина всегда достаточна для своего
@@ -485,13 +505,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
       const width = (host as HTMLElement).getBoundingClientRect().width;
       // Ширина, а не число колонок: колонка — позиция в списке, а места на
       // экране у неё столько, сколько дали перегородки.
-      setShowBranchName(width >= GIT_CHIP_BRANCH_MIN_HOST_PX);
+      setShowBranchName(width >= branchMinHostPx);
     };
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(host as HTMLElement);
     return () => ro.disconnect();
-  }, []);
+  }, [branchMinHostPx]);
 
   const [panelSize, setPanelSize] = useState(() => normalizePanelSize(DEFAULT_PANEL_SIZE));
   // Размер нужен ПРИ РАСЧЁТЕ места, но читать его из замыкания нельзя: сторона
@@ -1932,15 +1952,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
           >
             <span
               aria-hidden
-              className="animate-spin"
+              className="noted-shape-ring"
               style={{
-                position: 'absolute',
                 inset: -2,
                 borderRadius: 999,
-                border: '1.5px solid transparent',
-                borderTopColor: 'rgba(148,163,184,0.75)',
-                pointerEvents: 'none',
-              }}
+                '--noted-ring-color': 'rgba(148,163,184,0.75)',
+              } as React.CSSProperties}
             />
           </span>
         </button>
@@ -2113,18 +2130,19 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
         >
           {compactText}
           {gitNavbarStatusPhase === 'running' || gitNavbarStatusPhase === 'waiting' ? (
+            // Дуга по КОНТУРУ овала (.noted-shape-ring), не вращение рамки:
+            // повёрнутый овал не совпадает сам с собой, и прежний transform-
+            // спиннер на каждом кадре вылезал за контур. Дуга из conic-градиента
+            // под маской формы обнимает границу любой скруглённой коробки.
             <span
               data-git-chip-spinner
               aria-hidden
-              className="animate-spin"
+              className="noted-shape-ring"
               style={{
-                position: 'absolute',
                 inset: -2,
                 borderRadius: 999,
-                border: '1.5px solid transparent',
-                borderTopColor: gitNavbarStatusPhase === 'running' ? '#fbbf24' : 'rgba(251,191,36,0.55)',
-                pointerEvents: 'none',
-              }}
+                '--noted-ring-color': gitNavbarStatusPhase === 'running' ? '#fbbf24' : 'rgba(251,191,36,0.55)',
+              } as React.CSSProperties}
             />
           ) : gitNavbarStatusPhase === 'success' ? (
             <span
@@ -2197,9 +2215,14 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
               <SettingsView
                 docsOnlyWhenPresent={docsOnlyWhenPresent}
                 commitDescriptionLines={commitDescriptionLines}
+                branchNameMinHostPx={branchMinHostPx}
                 onBack={() => setSettingsOpen(false)}
                 onToggleDocsOnly={toggleDocsOnly}
                 onCommitDescriptionLinesChange={setCommitDescriptionLines}
+                onBranchNameMinHostPxChange={(px) => {
+                  setBranchMinHostPx(px);
+                  saveBranchMinHostPx(px);
+                }}
               />
             ) : (
               <div
@@ -3332,17 +3355,22 @@ function HistoryCommitContextMenu({
 function SettingsView({
   docsOnlyWhenPresent,
   commitDescriptionLines,
+  branchNameMinHostPx,
   onBack,
   onToggleDocsOnly,
   onCommitDescriptionLinesChange,
+  onBranchNameMinHostPxChange,
 }: {
   docsOnlyWhenPresent: boolean;
   commitDescriptionLines: number;
+  branchNameMinHostPx: number;
   onBack: () => void;
   onToggleDocsOnly: () => void;
   onCommitDescriptionLinesChange: (lines: number) => void;
+  onBranchNameMinHostPxChange: (px: number) => void;
 }) {
   const normalizedLines = normalizeCommitDescriptionLines(commitDescriptionLines);
+  const branchStep = 40;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 280 }}>
       <div style={{ height: 46, display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
@@ -3425,6 +3453,33 @@ function SettingsView({
               disabled={normalizedLines >= 6}
               style={stepperButtonStyle(normalizedLines >= 6)}
               title="Show more lines"
+            >
+              <Plus size={12} />
+            </button>
+          </span>
+        </div>
+        <div style={{ ...settingsRowStyle, marginTop: 10 }}>
+          <span style={{ minWidth: 0 }}>
+            <span style={{ display: 'block', fontSize: 12, fontWeight: 750, color: '#f8fafc' }}>Branch name min width</span>
+            <span style={{ display: 'block', fontSize: 10.5, color: '#8b949e', marginTop: 3, lineHeight: 1.35 }}>
+              Hide the branch name when the window is narrower than this (px). 0 — always show.
+            </span>
+          </span>
+          <span style={stepperStyle}>
+            <button
+              onClick={() => onBranchNameMinHostPxChange(Math.max(0, branchNameMinHostPx - branchStep))}
+              disabled={branchNameMinHostPx <= 0}
+              style={stepperButtonStyle(branchNameMinHostPx <= 0)}
+              title="Show the name in narrower windows"
+            >
+              <Minus size={12} />
+            </button>
+            <span style={{ ...stepperValueStyle, minWidth: 44 }}>{branchNameMinHostPx}</span>
+            <button
+              onClick={() => onBranchNameMinHostPxChange(Math.min(2000, branchNameMinHostPx + branchStep))}
+              disabled={branchNameMinHostPx >= 2000}
+              style={stepperButtonStyle(branchNameMinHostPx >= 2000)}
+              title="Hide the name earlier"
             >
               <Plus size={12} />
             </button>

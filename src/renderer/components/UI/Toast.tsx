@@ -290,6 +290,11 @@ function ToastCard({
   toggleToastDetails: (id: string) => void;
   animatedToastIdsRef: React.MutableRefObject<Set<string>>;
 }) {
+        const [copyConfirmed, setCopyConfirmed] = React.useState(false);
+        const copyResetTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+        React.useEffect(() => () => {
+          if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current);
+        }, []);
         const details = String(toast.details || '').trim();
         const hasDetails = details.length > 0;
         const expanded = hasDetails && expandedProp;
@@ -420,11 +425,15 @@ function ToastCard({
                     e.stopPropagation();
                     const { clipboard } = window.require('electron');
                     clipboard.writeText(toast.copyText!);
-                    e.currentTarget.textContent = 'ok';
-                    setTimeout(() => { if (e.currentTarget) e.currentTarget.textContent = 'copy'; }, 800);
+                    setCopyConfirmed(true);
+                    if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current);
+                    copyResetTimerRef.current = setTimeout(() => {
+                      copyResetTimerRef.current = null;
+                      setCopyConfirmed(false);
+                    }, 800);
                   }}
                 >
-                  copy
+                  {copyConfirmed ? 'ok' : 'copy'}
                 </span>
               )}
             </div>

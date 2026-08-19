@@ -223,9 +223,16 @@ const {
   createSubagentStepProjectionState,
   findClaudeAgentFile,
   findCodexAgentFile,
-  readAgentSteps,
+  findCodexSubagentNewTaskBoundary,
+  extractSubagentPayloadFromRecord,
+  readAgentStepsAsync,
   isAgentFinishedByOwnTranscript,
 } = require(path.join(srcMainDir, 'subagent-transcript'));
+const {
+  HISTORY_PAYLOAD_DEHYDRATE_THRESHOLD,
+  HISTORY_PAYLOAD_PREVIEW_CHARS,
+  capPayloadForRender,
+} = require(path.join(srcMainDir, 'history-payload-dehydrate'));
 const {
   classifyClaudeMissingPromptExactCaptureAdmission,
   hasConflictingPtyWriteOperation,
@@ -754,6 +761,11 @@ const {
 const {
   rewriteCodexDeveloperProfile,
 } = require(path.join(srcMainDir, 'codex-profile-config'));
+const {
+  buildCodexStopCapturedSettingsProof,
+  classifyCodexStopSettingsCapture,
+  validateCodexStopCapturedSettingsAuthority,
+} = require(path.join(srcMainDir, 'codex-history-restart-settings-proof'));
 const {
   CODEX_ALL_MODELS_VALUE,
   CODEX_EFFORT_APPLICATION_CONVERSATION,
@@ -15254,17 +15266,18 @@ const MCP_PORT_FILE = path.join(MCP_PORT_DIR, 'mcp-port-' + process.pid);
 // real user prompts. Compact boundaries are reported as their own turn type.
 
 function _buildActiveBranch(recordMap, lastRecord) {
-  const branch = [];
+  const reversed = [];
   let cur = lastRecord ? lastRecord.uuid : null;
   const seen = new Set();
   while (cur && !seen.has(cur)) {
     seen.add(cur);
     const rec = recordMap.get(cur);
     if (!rec) break;
-    branch.unshift(rec);
+    reversed.push(rec);
     cur = rec.logicalParentUuid || rec.parentUuid;
   }
-  return branch;
+  reversed.reverse();
+  return reversed;
 }
 
 function _isNoisePrompt(text) {
@@ -15482,7 +15495,44 @@ function _groupIntoTurns(branch) {
 
 // Load + cache turns for a session. Returns the same shape used by all
 // /overseer/session/:id/* handlers.
-const _overseerTurnsCache = new Map(); // sessionId → { mtimeMs, turns, lastRecord, recordMap }
+const _overseerTurnsCache = new Map(); // sessionId → { size, turns, recordMap, ... }
+// This cache retains the full parsed recordMap. Leaving it unbounded defeated
+// claude-data's 192MB eviction budget: cross-session search over 45 tabs kept
+// every evicted map strongly reachable here and could rebuild a multi-GB heap.
+const OVERSEER_TURNS_CACHE_MAX_SOURCE_BYTES = 192 * 1024 * 1024;
+const OVERSEER_TURNS_CACHE_MAX_ENTRIES = 64;
+let _overseerTurnsCacheRawBytes = 0;
+
+function _deleteOverseerTurnsCache(cacheKey) {
+  const cached = _overseerTurnsCache.get(cacheKey);
+  if (!cached) return false;
+  _overseerTurnsCache.delete(cacheKey);
+  _overseerTurnsCacheRawBytes = Math.max(
+    0,
+    _overseerTurnsCacheRawBytes - (Number(cached.size) || 0),
+  );
+  return true;
+}
+
+function _getOverseerTurnsCache(cacheKey) {
+  const cached = _overseerTurnsCache.get(cacheKey) || null;
+  if (!cached) return null;
+  _overseerTurnsCache.delete(cacheKey);
+  _overseerTurnsCache.set(cacheKey, cached);
+  return cached;
+}
+
+function _setOverseerTurnsCache(cacheKey, result) {
+  _deleteOverseerTurnsCache(cacheKey);
+  _overseerTurnsCache.set(cacheKey, result);
+  _overseerTurnsCacheRawBytes += Number(result?.size) || 0;
+  while (_overseerTurnsCacheRawBytes > OVERSEER_TURNS_CACHE_MAX_SOURCE_BYTES
+    || _overseerTurnsCache.size > OVERSEER_TURNS_CACHE_MAX_ENTRIES) {
+    const oldest = _overseerTurnsCache.keys().next().value;
+    if (oldest === undefined) break;
+    _deleteOverseerTurnsCache(oldest);
+  }
+}
 
 async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
   if (!codexDataModule?._api?.loadSessionRecords || !codexDataModule?._api?.buildCodexFullHistory) {
@@ -15491,7 +15541,7 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
     throw err;
   }
   const cacheKey = 'codex:' + sessionId;
-  if (options.forceFresh === true) _overseerTurnsCache.delete(cacheKey);
+  if (options.forceFresh === true) _deleteOverseerTurnsCache(cacheKey);
   const loaded = await codexDataModule._api.loadSessionRecords(sessionId, cwd, {
     forceFresh: options.forceFresh === true,
   });
@@ -15501,7 +15551,7 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
     throw err;
   }
   const stat = fs.statSync(loaded.filePath);
-  const cached = _overseerTurnsCache.get(cacheKey);
+  const cached = _getOverseerTurnsCache(cacheKey);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
     const annotations = _loadSessionAnnotations(sessionId, cached.turns);
     return { ...cached, ...annotations, filePath: loaded.filePath };
@@ -15661,7 +15711,7 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
     sessionMeta,
     ...annotations,
   };
-  _overseerTurnsCache.set(cacheKey, result);
+  _setOverseerTurnsCache(cacheKey, result);
   return result;
 }
 
@@ -15672,8 +15722,8 @@ async function _loadSessionTurns(sessionId, cwd, options = {}) {
   }
   const stat = fs.statSync(located.filePath);
   const cacheKey = 'claude:' + sessionId;
-  if (options.forceFresh === true) _overseerTurnsCache.delete(cacheKey);
-  const cached = _overseerTurnsCache.get(cacheKey);
+  if (options.forceFresh === true) _deleteOverseerTurnsCache(cacheKey);
+  const cached = _getOverseerTurnsCache(cacheKey);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
     // Annotations (notes, rewind markers) can change WITHOUT JSONL changing,
     // so we always re-read them per request — cheap point lookups on SQLite.
@@ -15701,7 +15751,7 @@ async function _loadSessionTurns(sessionId, cwd, options = {}) {
     recordMap,
     ...annotations,
   };
-  _overseerTurnsCache.set(cacheKey, result);
+  _setOverseerTurnsCache(cacheKey, result);
   return result;
 }
 
@@ -17369,7 +17419,7 @@ async function handleOverseerMutation(rawUrl, payload) {
 
     // Invalidate overseer turns cache for the edited session (file mtime changed,
     // but explicit clear avoids one stale read).
-    _overseerTurnsCache.delete('claude:' + workingSessionId);
+    _deleteOverseerTurnsCache('claude:' + workingSessionId);
 
     return { body: {
       mode,
@@ -34907,6 +34957,7 @@ function validateOrchestrationAutoStopGuard(authority, observedIdentity) {
 
 async function stopAiProcessInTab(tabId, options = {}) {
   const stopReason = options?.reason || 'manual-stop';
+  const captureCodexRestartSettings = options?.captureCodexRestartSettings === true;
   const preserveCodexLaunchPayload = options?.preserveCodexLaunchPayload === true;
   const preservePublicLifecycle = options?.preservePublicLifecycle === true;
   const retainStoppingState = options?.retainStoppingState === true;
@@ -34917,7 +34968,10 @@ async function stopAiProcessInTab(tabId, options = {}) {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'tab not found' };
   const requestedToolType = resolveAiToolTypeForTab(tabId, options?.toolType || null);
-  if (requestedToolType && !preSignalGuard) markAiStopping(tabId, requestedToolType, stopReason);
+  let capturedCodexRestartSettings = null;
+  if (requestedToolType && !preSignalGuard && !captureCodexRestartSettings) {
+    markAiStopping(tabId, requestedToolType, stopReason);
+  }
   const finishStop = (result, broadcastInactive = false) => {
     const resolvedToolType = resolveAiToolTypeForTab(
       tabId,
@@ -34932,7 +34986,9 @@ async function stopAiProcessInTab(tabId, options = {}) {
     if (result?.success === false && result?.runtimeStopped !== true) {
       restoreAiRuntimeStatusAfterFailedStop(tabId, resolvedToolType, 'stop-failed:' + stopReason);
     }
-    return result;
+    return result?.success === true && capturedCodexRestartSettings?.proof
+      ? { ...result, restartSettingsProof: capturedCodexRestartSettings.proof }
+      : result;
   };
   const evaluatePreSignalGuard = (observedIdentity) => {
     if (!preSignalGuard) return { allowed: true, reason: null };
@@ -34986,7 +35042,9 @@ async function stopAiProcessInTab(tabId, options = {}) {
       children: stopProcessTreeSnapshot?.children,
       shellPid: term.pid,
     });
-    if (!preSignalGuard) markAiStopping(tabId, processName, stopReason);
+    if (!preSignalGuard && !captureCodexRestartSettings) {
+      markAiStopping(tabId, processName, stopReason);
+    }
     if (Number(stopCandidate.depth) === 1) {
       console.log('[StopAI] matched direct child tab=' + tabId
         + ' pid=' + childPid
@@ -35073,6 +35131,17 @@ async function stopAiProcessInTab(tabId, options = {}) {
       + ' descendantError=' + (descendantDiagError || '-')
       + ' lookupStatus=' + (aiProcessLookup.status || '-'));
     console.log('[StopAI] no AI process found for tab ' + tabId + ' shellPid=' + term.pid);
+    if (captureCodexRestartSettings) {
+      return finishStop({
+        success: false,
+        accepted: false,
+        submitted: false,
+        pasteWritten: false,
+        processName: requestedToolType || null,
+        error: 'codex_history_context_settings_proof_unavailable',
+        reason: 'live-codex-process-not-found',
+      }, false);
+    }
     if (aiProcessLookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
       const error = aiProcessLookup.error?.message
         || String(aiProcessLookup.error || 'process_lookup_failed');
@@ -35184,6 +35253,92 @@ async function stopAiProcessInTab(tabId, options = {}) {
     return finishStop({ success: false, error: 'no AI process found' }, false);
   }
 
+  if (captureCodexRestartSettings) {
+    if (processName !== 'codex') {
+      return finishStop({
+        success: false,
+        accepted: false,
+        submitted: false,
+        pasteWritten: false,
+        processName,
+        error: 'codex_history_context_settings_proof_unavailable',
+        reason: 'effective-provider-is-not-codex',
+      }, false);
+    }
+    const currentScreen = await inspectCurrentCodexMcpStartupScreen(
+      tabId,
+      'history-context-pre-stop-settings',
+    );
+    const writerProof = getCodexWriterProofSnapshot(tabId);
+    const provisionalSettings = writerProof ? null : getCodexProvisionalSettingsSnapshot(tabId);
+    const ownerKind = writerProof ? 'writer' : provisionalSettings ? 'launch' : null;
+    const ownerId = writerProof?.sessionId
+      || provisionalSettings?.codexProvisionalSettingsOwnerId
+      || null;
+    const composerSettings = currentScreen?.success
+      ? parseCodexVerifiedComposerFooter(currentScreen.currentFrameText || '')
+      : null;
+    const draftState = currentScreen?.success
+      ? getHeadlessCodexDraftState(tabId, 'history-context-pre-stop-draft')
+      : null;
+    const built = buildCodexStopCapturedSettingsProof({
+      model: composerSettings?.model,
+      effort: composerSettings?.effort,
+      ownerKind,
+      ownerId,
+      lifecycleGeneration: currentScreen?.terminalLifecycleGeneration,
+      runSeq: currentScreen?.terminalRunSeq,
+      inputRevision: currentScreen?.inputRevision,
+      mirrorGeneration: currentScreen?.mirrorGeneration,
+      committedFrameGeneration: currentScreen?.committedFrameGeneration,
+      writeSeq: currentScreen?.writeSeq,
+      observedAt: Date.now(),
+    });
+    const captureDecision = classifyCodexStopSettingsCapture({
+      screenSuccess: currentScreen?.success === true,
+      screenError: currentScreen?.error,
+      destructiveProofAvailable: currentScreen?.destructiveProofAvailable === true,
+      synchronizedOutputOpen: currentScreen?.synchronizedOutputOpen === true,
+      liveSynchronizedOutputOpen: currentScreen?.liveSynchronizedOutputOpen === true,
+      committedFrameReplay: currentScreen?.committedFrameReplay === true,
+      inspectedReady: currentScreen?.inspected?.ready === true,
+      inspectedReason: currentScreen?.inspected?.reason,
+      terminalOwnerMatches: terminals.get(tabId) === term,
+      draftSuccess: draftState?.success === true,
+      draftHasDraft: draftState?.hasDraft,
+      draftSourceOwned: String(draftState?.source || '').startsWith('headless-main:'),
+      turnBusy: codexTurnWatchers.get(tabId)?.busy === true,
+      promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+      settingsProofValid: built.valid === true,
+      settingsProofReason: built.reason,
+    });
+    if (!captureDecision.allowed) {
+      const reason = captureDecision.reason;
+      console.warn('[HistoryContextSettings] capture rejected tab=' + String(tabId).slice(-12)
+        + ' reason=' + reason + ' action=preserve-process');
+      return finishStop({
+        success: false,
+        accepted: false,
+        submitted: false,
+        pasteWritten: false,
+        processName: 'codex',
+        error: 'codex_history_context_settings_proof_unavailable',
+        reason,
+      }, false);
+    }
+    capturedCodexRestartSettings = {
+      proof: built.proof,
+      terminalToken: term,
+    };
+    console.log('[HistoryContextSettings] captured tab=' + String(tabId).slice(-12)
+      + ' owner=' + built.proof.owner.kind + ':' + String(built.proof.owner.id).slice(0, 12)
+      + ' model=' + built.proof.model
+      + ' effort=' + built.proof.effort
+      + ' scope=' + built.proof.scope
+      + ' run=' + built.proof.authority.runSeq
+      + ' input=' + built.proof.authority.inputRevision);
+  }
+
   const _diagStopIdentity = resolveActivityIdentity(tabId, processName);
   const _diagStopSid = _diagStopIdentity.sessionId || bridgeKnownSessions.get(tabId) || codexKnownSessions.get(tabId) || null;
   const _diagStopBusy = processName === 'codex'
@@ -35284,24 +35439,98 @@ async function stopAiProcessInTab(tabId, options = {}) {
   //
   // Sequence: write \x03 → poll kill(0) up to 300ms → if dead, done. Otherwise
   // fall through to the existing SIGTERM→800ms→SIGKILL escalation.
-  if (preSignalGuard) {
+  if (preSignalGuard || capturedCodexRestartSettings) {
     const guardDecision = evaluatePreSignalGuard(currentAiLifecycleIdentity(tabId, {
       processStatus: 'found',
       processPid: childPid,
       processName,
     }));
-    if (!guardDecision.allowed) {
+    const revalidatedScreen = capturedCodexRestartSettings
+      ? await inspectCurrentCodexMcpStartupScreen(
+          tabId,
+          'history-context-pre-signal-settings',
+        )
+      : null;
+    const revalidatedComposerSettings = revalidatedScreen?.success
+      ? parseCodexVerifiedComposerFooter(revalidatedScreen.currentFrameText || '')
+      : null;
+    const revalidatedDraftState = revalidatedScreen?.success
+      ? getHeadlessCodexDraftState(tabId, 'history-context-pre-signal-draft')
+      : null;
+    const revalidatedCaptureDecision = capturedCodexRestartSettings
+      ? classifyCodexStopSettingsCapture({
+          screenSuccess: revalidatedScreen?.success === true,
+          screenError: revalidatedScreen?.error,
+          destructiveProofAvailable: revalidatedScreen?.destructiveProofAvailable === true,
+          synchronizedOutputOpen: revalidatedScreen?.synchronizedOutputOpen === true,
+          liveSynchronizedOutputOpen: revalidatedScreen?.liveSynchronizedOutputOpen === true,
+          committedFrameReplay: revalidatedScreen?.committedFrameReplay === true,
+          inspectedReady: revalidatedScreen?.inspected?.ready === true,
+          inspectedReason: revalidatedScreen?.inspected?.reason,
+          terminalOwnerMatches: terminals.get(tabId) === capturedCodexRestartSettings.terminalToken,
+          draftSuccess: revalidatedDraftState?.success === true,
+          draftHasDraft: revalidatedDraftState?.hasDraft,
+          draftSourceOwned: String(revalidatedDraftState?.source || '').startsWith('headless-main:'),
+          turnBusy: codexTurnWatchers.get(tabId)?.busy === true,
+          promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+          settingsProofValid: !!revalidatedComposerSettings,
+          settingsProofReason: 'composer-settings-unavailable',
+        })
+      : { allowed: true, reason: null };
+    const currentWriterProof = getCodexWriterProofSnapshot(tabId);
+    const currentProvisionalSettings = currentWriterProof
+      ? null
+      : getCodexProvisionalSettingsSnapshot(tabId);
+    const restartSettingsDecision = capturedCodexRestartSettings
+      ? validateCodexStopCapturedSettingsAuthority(
+          capturedCodexRestartSettings.proof,
+          {
+            lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+            runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+            inputRevision: revalidatedScreen?.inputRevision ?? getTerminalInputRevision(tabId),
+            mirrorGeneration: revalidatedScreen?.mirrorGeneration,
+            committedFrameGeneration: revalidatedScreen?.committedFrameGeneration,
+            writeSeq: revalidatedScreen?.writeSeq,
+            ownerKind: currentWriterProof ? 'writer' : currentProvisionalSettings ? 'launch' : null,
+            ownerId: currentWriterProof?.sessionId
+              || currentProvisionalSettings?.codexProvisionalSettingsOwnerId
+              || null,
+            model: revalidatedComposerSettings?.model,
+            effort: revalidatedComposerSettings?.effort,
+            turnBusy: codexTurnWatchers.get(tabId)?.busy === true
+              || hasCodexPromptOrTurnInFlight(tabId),
+          },
+        )
+      : { valid: true, reason: null };
+    const exactTerminalOwner = !capturedCodexRestartSettings
+      || terminals.get(tabId) === capturedCodexRestartSettings.terminalToken;
+    if (!guardDecision.allowed
+      || !revalidatedCaptureDecision.allowed
+      || !restartSettingsDecision.valid
+      || !exactTerminalOwner) {
+      const rejectionReason = !guardDecision.allowed
+        ? guardDecision.reason
+        : !revalidatedCaptureDecision.allowed
+          ? revalidatedCaptureDecision.reason || 'committed-headless-frame-changed'
+        : !exactTerminalOwner
+          ? 'terminal-owner-changed'
+          : restartSettingsDecision.reason;
       console.warn('[StopAI] pre-signal guard rejected tab=' + String(tabId).slice(-12)
         + ' reason=' + stopReason
         + ' pid=' + childPid
-        + ' guard=' + (guardDecision.reason || 'unknown')
+        + ' guard=' + (rejectionReason || 'unknown')
         + ' action=preserve-process');
       return finishStop({
         success: false,
+        accepted: false,
+        submitted: false,
+        pasteWritten: false,
         processName,
-        error: 'stop_guard_rejected',
+        error: capturedCodexRestartSettings
+          ? 'codex_history_context_settings_proof_stale'
+          : 'stop_guard_rejected',
         guardRejected: true,
-        guardReason: guardDecision.reason || null,
+        guardReason: rejectionReason || null,
       }, false);
     }
     markAiStopping(tabId, processName, stopReason, {
@@ -35390,6 +35619,7 @@ ipcMain.handle('terminal:stop-ai-process', async (_event, request) => {
   return stopAiProcessInTabSerialized(payload.tabId, {
     toolType: payload.toolType || null,
     reason: payload.reason || 'manual-stop',
+    captureCodexRestartSettings: payload.captureCodexRestartSettings === true,
     preSignalGuard: authority?.kind === 'orchestration-auto-stop'
       ? (observedIdentity) => validateOrchestrationAutoStopGuard(authority, observedIdentity)
       : undefined,
@@ -54489,10 +54719,233 @@ ipcMain.handle('claude-sdk:get-subagent-messages', async (event, { sessionId, ag
 //   - Claude learns its agentId only from the completion notification, so a
 //     RUNNING agent is located positionally (newest file in the session's
 //     subagents dir whose first record is this exact task text).
-// Resolution is cached per chip key: the file never moves, and re-scanning the
-// projects tree on every tick is what made tab switches janky before.
+// Resolution is cached by chip plus exact child/thread identity: the file
+// never moves, and re-scanning the projects tree on every tick is what made
+// tab switches janky before. A reused visual chip can never inherit another
+// child's file.
 const subagentFilePathCache = new Map();
 const subagentStepReaderCache = new Map();
+const subagentCodexBoundaryCache = new Map();
+const subagentCodexBoundaryInflight = new Map();
+const subagentCodexBoundaryScanState = new Map();
+const subagentReaderLeases = new Map();
+const subagentPayloadSourceCache = new Map();
+const SUBAGENT_FILE_PATH_CACHE_MAX = 512;
+const SUBAGENT_STEP_READER_CACHE_MAX = 128;
+const SUBAGENT_PAYLOAD_SOURCE_CACHE_MAX = 4096;
+const SUBAGENT_BOUNDARY_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+
+const trimSubagentBoundaryCache = (cache) => {
+  const entryBytes = (value) => 256
+    + String(value?.bootstrapInstruction?.text || '').length * 2;
+  let totalBytes = 0;
+  for (const value of cache.values()) totalBytes += entryBytes(value);
+  while (cache.size > SUBAGENT_FILE_PATH_CACHE_MAX
+    || totalBytes > SUBAGENT_BOUNDARY_CACHE_MAX_BYTES) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    const value = cache.get(oldest);
+    cache.delete(oldest);
+    totalBytes = Math.max(0, totalBytes - entryBytes(value));
+  }
+};
+
+const subagentPayloadPreview = (text) => {
+  const preview = String(text || '').slice(0, HISTORY_PAYLOAD_PREVIEW_CHARS);
+  const hiddenKb = Math.max(1, Math.round((String(text || '').length - preview.length) / 1024));
+  return preview + '\n… (+' + hiddenKb + ' KB — полный вывод загрузится при раскрытии)';
+};
+
+const previewSubagentArgValue = (value, depth = 0) => {
+  if (typeof value === 'string') {
+    return value.length > HISTORY_PAYLOAD_PREVIEW_CHARS
+      ? subagentPayloadPreview(value)
+      : value;
+  }
+  if (value == null || typeof value !== 'object') return value;
+  if (depth >= 4) return '[nested payload — load full arguments to inspect]';
+  if (Array.isArray(value)) {
+    return value.slice(0, 40).map((item) => previewSubagentArgValue(item, depth + 1));
+  }
+  const out = {};
+  for (const [key, item] of Object.entries(value).slice(0, 80)) {
+    out[key] = previewSubagentArgValue(item, depth + 1);
+  }
+  return out;
+};
+
+const rememberSubagentPayloadSource = (payloadId, source) => {
+  if (!payloadId || !source) return;
+  subagentPayloadSourceCache.delete(payloadId);
+  subagentPayloadSourceCache.set(payloadId, source);
+  while (subagentPayloadSourceCache.size > SUBAGENT_PAYLOAD_SOURCE_CACHE_MAX) {
+    const oldest = subagentPayloadSourceCache.keys().next().value;
+    if (oldest === undefined) break;
+    subagentPayloadSourceCache.delete(oldest);
+  }
+};
+
+const dehydrateSubagentStepPayloads = ({ steps, filePath, toolType, sessionId }) => {
+  if (!Array.isArray(steps)) return steps;
+  const fileIdentity = crypto.createHash('sha1').update(String(filePath || '')).digest('hex').slice(0, 12);
+  for (const step of steps) {
+    const source = step?._payloadSource || null;
+    if (source && typeof step.result === 'string'
+      && step.result.length > HISTORY_PAYLOAD_DEHYDRATE_THRESHOLD) {
+      const payloadId = [
+        'subagent-result',
+        fileIdentity,
+        String(sessionId || 'unknown'),
+        String(source.byteOffset),
+        String(step.id || source.toolUseId || ''),
+      ].join(':');
+      rememberSubagentPayloadSource(payloadId, {
+        filePath,
+        toolType,
+        sessionId: String(sessionId || ''),
+        ...source,
+      });
+      step.resultRef = { payloadId, totalChars: step.result.length };
+      step.result = subagentPayloadPreview(step.result);
+    }
+    const argsSource = step?._argsPayloadSource || null;
+    let argsText = '';
+    if (argsSource && step?.args && typeof step.args === 'object') {
+      try { argsText = JSON.stringify(step.args); } catch { argsText = ''; }
+    }
+    if (argsSource && argsText.length > HISTORY_PAYLOAD_DEHYDRATE_THRESHOLD) {
+      const payloadId = [
+        'subagent-args',
+        fileIdentity,
+        String(sessionId || 'unknown'),
+        String(argsSource.byteOffset),
+        String(step.id || argsSource.toolUseId || ''),
+      ].join(':');
+      rememberSubagentPayloadSource(payloadId, {
+        filePath,
+        toolType,
+        sessionId: String(sessionId || ''),
+        ...argsSource,
+      });
+      step.argsRef = { payloadId, totalChars: argsText.length };
+      step.args = previewSubagentArgValue(step.args);
+    }
+    if (step && Object.prototype.hasOwnProperty.call(step, '_payloadSource')) {
+      delete step._payloadSource;
+    }
+    if (step && Object.prototype.hasOwnProperty.call(step, '_argsPayloadSource')) {
+      delete step._argsPayloadSource;
+    }
+  }
+  return steps;
+};
+
+const acquireSubagentReaderLease = (readerId) => {
+  const id = String(readerId || '');
+  if (!id) return { released: false, inflight: 1, anonymous: true };
+  let lease = subagentReaderLeases.get(id) || null;
+  if (lease?.released) return null;
+  if (!lease) {
+    lease = { released: false, inflight: 0 };
+    subagentReaderLeases.set(id, lease);
+  }
+  lease.inflight += 1;
+  return lease;
+};
+
+const finishSubagentReaderLease = (readerId, lease) => {
+  const id = String(readerId || '');
+  if (!lease) return;
+  lease.inflight = Math.max(0, Number(lease.inflight) - 1);
+  if (id && lease.released && lease.inflight === 0
+    && subagentReaderLeases.get(id) === lease) {
+    subagentReaderLeases.delete(id);
+  }
+};
+
+const releaseSubagentReaderLease = (readerId) => {
+  const id = String(readerId || '');
+  if (!id) return;
+  const lease = subagentReaderLeases.get(id) || { released: false, inflight: 0 };
+  lease.released = true;
+  if (lease.inflight > 0) subagentReaderLeases.set(id, lease);
+  else subagentReaderLeases.delete(id);
+};
+
+const subagentFileLocatorKey = ({
+  chipKey,
+  toolType,
+  parentSessionId,
+  agentId,
+  agentSessionId,
+  spawnedAt,
+}) => [
+  String(toolType || ''),
+  String(chipKey || ''),
+  String(agentSessionId || agentId || ''),
+  String(parentSessionId || ''),
+  String(spawnedAt || ''),
+].join('|');
+
+const getCachedSubagentFilePath = (key) => {
+  const value = subagentFilePathCache.get(key) || null;
+  if (!value) return null;
+  subagentFilePathCache.delete(key);
+  subagentFilePathCache.set(key, value);
+  return value;
+};
+
+const setCachedSubagentFilePath = (key, filePath) => {
+  if (!key || !filePath) return;
+  subagentFilePathCache.delete(key);
+  subagentFilePathCache.set(key, filePath);
+  while (subagentFilePathCache.size > SUBAGENT_FILE_PATH_CACHE_MAX) {
+    const oldest = subagentFilePathCache.keys().next().value;
+    if (oldest === undefined) break;
+    subagentFilePathCache.delete(oldest);
+  }
+};
+
+const getCodexSubagentBoundary = async (filePath, expectedSessionId) => {
+  const key = `${String(expectedSessionId || '')}|${filePath}`;
+  const cached = subagentCodexBoundaryCache.get(key) || null;
+  if (cached) {
+    subagentCodexBoundaryCache.delete(key);
+    subagentCodexBoundaryCache.set(key, cached);
+    return cached;
+  }
+  const existing = subagentCodexBoundaryInflight.get(key);
+  if (existing) return existing;
+  const task = findCodexSubagentNewTaskBoundary({
+    filePath,
+    expectedSessionId,
+    resume: subagentCodexBoundaryScanState.get(key) || null,
+  })
+    .then((result) => {
+      // A missing v2 boundary can mean the live child has not flushed it yet;
+      // do not freeze that absence. Stable hits and legacy/no-boundary
+      // protocols are safe to cache.
+      if (result?.found
+        || (result?.requiresBoundary === false && result?.rootMetaSeen === true)) {
+        subagentCodexBoundaryScanState.delete(key);
+        subagentCodexBoundaryCache.delete(key);
+        subagentCodexBoundaryCache.set(key, result);
+        trimSubagentBoundaryCache(subagentCodexBoundaryCache);
+      } else {
+        subagentCodexBoundaryScanState.delete(key);
+        subagentCodexBoundaryScanState.set(key, result);
+        trimSubagentBoundaryCache(subagentCodexBoundaryScanState);
+      }
+      return result;
+    })
+    .finally(() => {
+      if (subagentCodexBoundaryInflight.get(key) === task) {
+        subagentCodexBoundaryInflight.delete(key);
+      }
+    });
+  subagentCodexBoundaryInflight.set(key, task);
+  return task;
+};
 
 ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
   const {
@@ -54507,18 +54960,35 @@ ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
     spawnedAt,
     offset = 0,
   } = payload;
+  const readerLease = acquireSubagentReaderLease(readerId);
+  if (!readerLease) {
+    return { success: false, error: 'subagent reader released', steps: [], offset: 0, size: 0 };
+  }
   try {
-    let filePath = chipKey ? subagentFilePathCache.get(chipKey) : null;
+    if (readerLease.released) {
+      return { success: false, error: 'subagent reader released', steps: [], offset: 0, size: 0 };
+    }
+    const fileLocatorKey = subagentFileLocatorKey({
+      chipKey,
+      toolType,
+      parentSessionId,
+      agentId,
+      agentSessionId,
+      spawnedAt,
+    });
+    let filePath = getCachedSubagentFilePath(fileLocatorKey);
     if (filePath && !fs.existsSync(filePath)) {
-      subagentFilePathCache.delete(chipKey);
-      subagentStepReaderCache.delete(String(chipKey || `${toolType}:${filePath}`));
+      subagentFilePathCache.delete(fileLocatorKey);
+      for (const [cachedReaderId, cachedReader] of subagentStepReaderCache) {
+        if (cachedReader?.filePath === filePath) subagentStepReaderCache.delete(cachedReaderId);
+      }
       filePath = null;
     }
     if (!filePath) {
       filePath = toolType === 'codex'
         ? findCodexAgentFile({ agentSessionId: agentSessionId || agentId })
         : findClaudeAgentFile({ parentSessionId, cwd, agentId, taskText, spawnedAt });
-      if (filePath && chipKey) subagentFilePathCache.set(chipKey, filePath);
+      if (filePath) setCachedSubagentFilePath(fileLocatorKey, filePath);
     }
     if (!filePath) {
       // Not an error: a just-spawned agent may not have flushed its file yet.
@@ -54527,39 +54997,142 @@ ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
     const requestedOffset = Math.max(0, Number(offset) || 0);
     const cacheKey = String(readerId || chipKey || `${toolType}:${filePath}`);
     let reader = subagentStepReaderCache.get(cacheKey);
-    let reset = requestedOffset === 0;
-    if (!reader
+    if (reader) {
+      subagentStepReaderCache.delete(cacheKey);
+      subagentStepReaderCache.set(cacheKey, reader);
+    }
+    const resetRequested = requestedOffset === 0;
+    const readerNeedsReplay = !reader
       || reader.filePath !== filePath
       || reader.toolType !== toolType
-      || (!reset && Number(reader.offset) !== requestedOffset)) {
+      || (!resetRequested && Number(reader.offset) !== requestedOffset);
+    const reset = resetRequested || readerNeedsReplay;
+    let initialReadOffset = reset ? 0 : requestedOffset;
+    let codexBoundary = null;
+    if (toolType === 'codex' && reset) {
+      codexBoundary = await getCodexSubagentBoundary(filePath, agentSessionId || agentId);
+      if (readerLease.released) {
+        return { success: false, error: 'subagent reader released', steps: [], offset: 0, size: 0 };
+      }
+      if (codexBoundary?.rootMetaSeen !== true) {
+        let size = 0;
+        try { size = fs.statSync(filePath).size; } catch {}
+        return { success: true, steps: [], offset: 0, size, pending: true };
+      }
+      if (codexBoundary?.requiresBoundary === true && codexBoundary?.found !== true) {
+        let size = 0;
+        try { size = fs.statSync(filePath).size; } catch {}
+        return { success: true, steps: [], offset: 0, size, pending: true };
+      }
+      if (codexBoundary?.found === true) {
+        initialReadOffset = Math.max(0, Number(codexBoundary.offset) || 0);
+      }
+    }
+    const createProjectionState = () => createSubagentStepProjectionState({
+      codexSessionId: toolType === 'codex' ? (agentSessionId || agentId) : '',
+      codexRootMetaSeen: codexBoundary?.found === true,
+      codexAgentPath: codexBoundary?.agentPath || '',
+      codexNeedsNewTaskBoundary: codexBoundary?.requiresBoundary === true,
+      codexNewTaskBoundarySeen: codexBoundary?.found === true,
+      sourceLine: codexBoundary?.found === true
+        ? Number(codexBoundary.nextSourceLine) || 0
+        : 0,
+      prefaceSteps: codexBoundary?.bootstrapInstruction
+        ? [codexBoundary.bootstrapInstruction]
+        : [],
+    });
+    if (reset) {
       reader = {
         filePath,
         toolType,
         offset: 0,
-        projectionState: createSubagentStepProjectionState(),
+        projectionState: createProjectionState(),
       };
       subagentStepReaderCache.set(cacheKey, reader);
-      if (subagentStepReaderCache.size > 256) {
+      while (subagentStepReaderCache.size > SUBAGENT_STEP_READER_CACHE_MAX) {
         const oldest = subagentStepReaderCache.keys().next().value;
-        if (oldest && oldest !== cacheKey) subagentStepReaderCache.delete(oldest);
+        if (oldest === undefined) break;
+        subagentStepReaderCache.delete(oldest);
       }
-      reset = true;
-    } else if (reset) {
-      reader.offset = 0;
-      reader.projectionState = createSubagentStepProjectionState();
     }
-    const result = readAgentSteps({
+    const result = await readAgentStepsAsync({
       toolType,
       filePath,
-      offset: reset ? 0 : requestedOffset,
+      sessionId: toolType === 'codex' ? (agentSessionId || agentId) : '',
+      offset: reset ? initialReadOffset : requestedOffset,
       projectionState: reader.projectionState,
       codexDecodeCall: codexDataModule?._api?.codexHistoryActionsForCall,
     });
+    if (readerLease.released) {
+      subagentStepReaderCache.delete(cacheKey);
+      return { success: false, error: 'subagent reader released', steps: [], offset: 0, size: 0 };
+    }
+    if (result?.success === true) {
+      dehydrateSubagentStepPayloads({
+        steps: result.steps,
+        filePath,
+        toolType,
+        sessionId: toolType === 'codex'
+          ? (codexBoundary?.sessionId || agentSessionId || agentId)
+          : (agentSessionId || agentId || parentSessionId),
+      });
+    }
     if (result?.success === true) reader.offset = Number(result.offset) || 0;
     return { ...result, reset: reset || result?.reset === true };
   } catch (error) {
     console.error('[SubagentSteps] read failed:', error.message);
     return { success: false, error: String(error.message || error), steps: [], offset: 0, size: 0 };
+  } finally {
+    finishSubagentReaderLease(readerId, readerLease);
+  }
+});
+
+ipcMain.on('subagent:release-reader', (_event, payload = {}) => {
+  const readerId = String(payload?.readerId || '');
+  if (!readerId) return;
+  releaseSubagentReaderLease(readerId);
+  subagentStepReaderCache.delete(readerId);
+});
+
+ipcMain.handle('subagent:get-step-payload', async (_event, payload = {}) => {
+  const payloadId = String(payload?.payloadId || '');
+  const source = subagentPayloadSourceCache.get(payloadId) || null;
+  if (!source) return { success: false, error: 'subagent payload reference expired' };
+  subagentPayloadSourceCache.delete(payloadId);
+  subagentPayloadSourceCache.set(payloadId, source);
+  let handle;
+  try {
+    handle = await fs.promises.open(source.filePath, 'r');
+    const readRecord = async (ref) => {
+      const length = Math.max(0, Number(ref?.byteLength) || 0);
+      if (!length) throw new Error('subagent payload source is empty');
+      const buffer = Buffer.alloc(length);
+      const read = await handle.read(buffer, 0, length, Number(ref?.byteOffset) || 0);
+      if (read.bytesRead !== length) throw new Error('subagent payload source changed');
+      return JSON.parse(buffer.toString('utf8'));
+    };
+    const record = await readRecord(source);
+    const relatedRecord = source.callSource ? await readRecord(source.callSource) : null;
+    const text = extractSubagentPayloadFromRecord({
+      toolType: source.toolType,
+      record,
+      source,
+      relatedRecord,
+      codexDecodeCall: codexDataModule?._api?.codexHistoryActionsForCall,
+    });
+    if (typeof text !== 'string') {
+      return { success: false, error: 'subagent payload is unavailable' };
+    }
+    return {
+      success: true,
+      payloadId,
+      payloadKind: String(source.kind || '').endsWith('-args') ? 'args' : 'result',
+      ...capPayloadForRender(text),
+    };
+  } catch (error) {
+    return { success: false, error: String(error?.message || error) };
+  } finally {
+    if (handle) { try { await handle.close(); } catch {} }
   }
 });
 
@@ -54962,49 +55535,12 @@ ipcMain.handle('claude-sdk:active-branch-messages', async (event, { sessionId, c
   const t0 = Date.now();
   const sidShort = sessionId.slice(0, 8);
   try {
-    const tFind0 = Date.now();
-    const found = findSessionFile(sessionId, cwd);
-    const findMs = Date.now() - tFind0;
-    if (!found) {
-      console.log(`[SDKHistory:Main] sid=${sidShort} NOT_FOUND findMs=${findMs}`);
-      return { success: false, error: 'session file not found', messages: [] };
-    }
-    let fileSize = 0;
-    try { fileSize = require('fs').statSync(found.filePath).size; } catch {}
-    const tRead0 = Date.now();
-    const content = require('fs').readFileSync(found.filePath, 'utf-8');
-    const readMs = Date.now() - tRead0;
-    const tParse0 = Date.now();
-    const lines = content.trim().split('\n').filter(l => l.trim());
-    const recordMap = new Map();
-    let last = null;
-    for (const line of lines) {
-      try {
-        const e = JSON.parse(line);
-        if (e.uuid) { recordMap.set(e.uuid, e); last = e; }
-      } catch {}
-    }
-    const parseMs = Date.now() - tParse0;
-    if (!last) {
-      console.log(`[SDKHistory:Main] sid=${sidShort} sizeKB=${(fileSize/1024).toFixed(0)} lines=${lines.length} EMPTY totalMs=${Date.now()-t0}`);
-      return { success: true, messages: [] };
-    }
-    // Active branch = walk back from last via parentUuid, then reverse.
-    const tWalk0 = Date.now();
-    const branch = [];
-    let cur = last.uuid;
-    const seen = new Set();
-    while (cur && !seen.has(cur)) {
-      seen.add(cur);
-      const rec = recordMap.get(cur);
-      if (!rec) break;
-      branch.unshift(rec);
-      cur = rec.logicalParentUuid || rec.parentUuid;
-    }
-    const walkMs = Date.now() - tWalk0;
-    const totalMs = Date.now() - t0;
-    console.log(`[SDKHistory:Main] sid=${sidShort} sizeKB=${(fileSize/1024).toFixed(0)} lines=${lines.length} branchLen=${branch.length} findMs=${findMs} readMs=${readMs} parseMs=${parseMs} walkMs=${walkMs} totalMs=${totalMs}`);
-    return { success: true, messages: branch };
+    const result = await claudeDataApi.getActiveBranchMessages({ sessionId, cwd });
+    console.log('[SDKHistory:Main] sid=' + sidShort
+      + ' branchLen=' + (result?.messages?.length || 0)
+      + ' source=incremental-cache'
+      + ' totalMs=' + (Date.now() - t0));
+    return result;
   } catch (err) {
     console.error('[SDKHistory:Main] sid=' + sidShort + ' failed:', err.message);
     return { success: false, error: String(err.message || err), messages: [] };
@@ -55018,10 +55554,12 @@ ipcMain.handle('claude-sdk:active-branch-messages', async (event, { sessionId, c
 ipcMain.handle('claude-sdk:timeline-entries', async (event, { sessionId, cwd }) => {
   if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
   try {
-    const found = findSessionFile(sessionId, cwd);
-    if (!found) return { success: false, error: 'session file not found', entries: [] };
-    const entries = parseTimelineEntries(found.filePath);
-    return { success: true, entries, sessionId, filePath: found.filePath };
+    return await claudeDataApi.getTimeline({
+      sessionId,
+      cwd,
+      source: 'claude-sdk',
+      reason: 'timeline-entries',
+    });
   } catch (err) {
     console.error('[ClaudeSDK] timeline-entries failed:', err.message);
     return { success: false, error: String(err.message || err), entries: [] };

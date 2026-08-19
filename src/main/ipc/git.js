@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { callGeminiApi } = require('./gemini-api');
 const { buildChildProcessEnv } = require('../child-process-env');
+const { createGitStatusCoordinator } = require('./git-status-coordinator');
 
 const GIT_TIMEOUT_MS = 90 * 1000;
 const GIT_MAX_BUFFER = 32 * 1024 * 1024;
@@ -217,6 +218,26 @@ async function getStatusForRoot(root) {
     merge,
   };
 }
+
+// UI panes ask for the same repository snapshot in bursts. Preserve exact
+// freshness between non-overlapping requests, but let overlapping callers
+// share root resolution + one status bundle. Distinct repositories are
+// bounded so a multi-project workspace cannot fan out dozens of Git process
+// groups at once.
+const gitStatusCoordinator = createGitStatusCoordinator({
+  maxConcurrentRoots: 2,
+  maxConcurrentRootLookups: 2,
+  resolveRoot: (projectPath) => getRepoRoot(projectPath),
+  readStatus: (root) => getStatusForRoot(root),
+  onEvent: (event) => {
+    if (event.kind !== 'status-complete' || event.joined <= 0) return;
+    console.log('[GitStatusCoordinator] root=' + path.basename(event.root || '')
+      + ' joined=' + event.joined
+      + ' durMs=' + event.durationMs
+      + ' active=' + event.active
+      + ' queued=' + event.queued);
+  },
+});
 
 async function readUntrackedFile(root, relPath) {
   const abs = path.join(root, relPath);
@@ -935,9 +956,8 @@ function stopGitStatusWatcher(key) {
 function register({ projectManager }) {
   ipcMain.handle('git:status', async (event, { projectPath }) => {
     try {
-      const root = await getRepoRoot(projectPath);
-      if (!root) return { success: true, isRepo: false };
-      const status = await getStatusForRoot(root);
+      const status = await gitStatusCoordinator.request(projectPath);
+      if (!status) return { success: true, isRepo: false };
       return { success: true, ...status };
     } catch (error) {
       return { success: false, error: error.message };

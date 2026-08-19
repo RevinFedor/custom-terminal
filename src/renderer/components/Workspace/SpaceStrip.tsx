@@ -17,7 +17,7 @@ import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
-import { SPACE_STRIP_H } from '../../constants/layout';
+import { PROJECT_CARD_MAX_H, SPACE_STRIP_H } from '../../constants/layout';
 
 /** «×N» — пространства, полностью ушедшие за край. Тот же ответ, что в шапке окна. */
 function SpaceOverflowCount({ side, count, onClick }: {
@@ -60,6 +60,10 @@ function SpaceChip({ id, name, index, active, onRename }: {
   active: boolean;
   onRename: (id: string, name: string) => void;
 }) {
+  // Кегль и мера карточки — те же, что у карточек проектов наверху. Полоса
+  // пространств и полоса проектов это две строки одного языка: свой мелкий
+  // размер делал бы её похожей на служебную подпись, а не на переключатель.
+  const fontSize = useUIStore((s) => s.projectTabsFontSize);
   // Число рядом с именем — сколько РАЗНЫХ вкладок разложено здесь. Показывается
   // всегда, включая «1»: число, которое то появляется, то исчезает, читается как
   // оповещение о событии, а это просто размер.
@@ -109,11 +113,11 @@ function SpaceChip({ id, name, index, active, onRename }: {
         gap: 5,
         flexShrink: 0,
         maxWidth: 220,
-        height: 19,
-        padding: '0 7px',
+        height: PROJECT_CARD_MAX_H,
+        padding: '0 8px',
         borderRadius: 4,
-        fontSize: 11,
-        lineHeight: '19px',
+        fontSize,
+        lineHeight: `${PROJECT_CARD_MAX_H}px`,
         whiteSpace: 'nowrap',
         cursor: 'pointer',
         userSelect: 'none',
@@ -162,7 +166,7 @@ function SpaceChip({ id, name, index, active, onRename }: {
         data-space-tab-count
         style={{
           flexShrink: 0,
-          fontSize: 9.5,
+          fontSize: Math.max(9, fontSize - 2.5),
           fontWeight: 700,
           fontVariantNumeric: 'tabular-nums',
           color: active ? '#b9b9c0' : '#75757c',

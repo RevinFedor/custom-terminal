@@ -154,6 +154,7 @@ export interface AgentSendPromptOptions {
 
 export interface AgentHistoryContextOptions {
   sessionId?: string | null;
+  sessionAuthority?: 'live-writer' | 'history-hint' | 'fresh';
   cwd?: string;
   handoffId?: string;
   source?: string;
@@ -208,6 +209,7 @@ export interface HistoryAgentRuntime {
   stopProcess: (tabId: string, options?: {
     reason?: string | null;
     authority?: Record<string, unknown> | null;
+    captureCodexRestartSettings?: boolean;
   }) => Promise<any>;
   grabDraft: (tabId: string, options?: AgentDraftGrabOptions) => Promise<AgentDraftGrabResult>;
   copyDraft: (tabId: string, options?: AgentDraftGrabOptions) => Promise<AgentDraftGrabResult>;
@@ -774,6 +776,7 @@ function interruptCodexTurn(
 async function stopCodexProcess(tabId: string, options: {
   reason?: string | null;
   authority?: Record<string, unknown> | null;
+  captureCodexRestartSettings?: boolean;
 } = {}): Promise<any> {
   if (!tabId) return { success: false, error: 'tabId required' };
   const existing = codexStopInflight.get(tabId);
@@ -787,6 +790,7 @@ async function stopCodexProcess(tabId: string, options: {
     toolType: 'codex',
     ...(options.reason ? { reason: options.reason } : {}),
     ...(options.authority ? { authority: options.authority } : {}),
+    ...(options.captureCodexRestartSettings ? { captureCodexRestartSettings: true } : {}),
   })
     .then((result: any) => {
       console.log('[CodexHistoryActions:stop-process] done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' error=' + (result?.error || '-'));
@@ -906,7 +910,6 @@ async function recordAgentHistoryContext(
   prompt: string,
   options: AgentHistoryContextOptions = {},
 ) {
-  const codexSettings = toolType === 'codex' ? getCodexLaunchOptions(tabId) : {};
   return ipcRenderer.invoke('agent:record-history-context', {
     tabId,
     toolType,
@@ -916,8 +919,8 @@ async function recordAgentHistoryContext(
     prompt,
     handoffId: options.handoffId || null,
     source: options.source || 'history-panel',
-    model: options.model || codexSettings.model || null,
-    effort: options.effort || codexSettings.effort || null,
+    model: options.model || null,
+    effort: options.effort || null,
     presentationSnapshot: options.presentationSnapshot || null,
   }).catch((error: any) => ({
     success: false,

@@ -23,6 +23,7 @@
 //     same color and thickness.
 
 import React, { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
@@ -153,6 +154,59 @@ export function tabFastBadgeOutsidePx(gapPx: number, size = TAB_FAST_BADGE_SIZE_
   return Math.max(0, Math.min(wanted, Math.floor(Number(gapPx) || 0)));
 }
 
+/**
+ * Подпись на ВЕРХНЕЙ границе карточки — что сделает ⌘-клик.
+ *
+ * Тем же приёмом, что молния Fast: садится на границу карточки, а не внутрь и
+ * не снаружи. Отличия два, и оба намеренные.
+ *
+ * Первое: смещена ВНУТРЬ вкладки, а не поровну по шву. Подпись длинная, и
+ * ровно по границе она делила бы шов пополам — было бы не понять, к какой из
+ * двух вкладок она относится. У молнии эта же задача решена долей высоты
+ * снаружи; здесь — тем, что бо́льшая часть строки лежит на своей карточке.
+ *
+ * Второе: появляется только при зажатом ⌘, потому что описывает не состояние
+ * вкладки, а то, что произойдёт от жеста. Постоянная подпись на каждой карточке
+ * была бы шумом.
+ */
+export const TAB_CMD_HINT_FONT_PX = 12;
+
+export function TabCmdHint({ text, visible }: { text: string; visible: boolean }) {
+  if (!visible) return null;
+  return (
+    <span
+      data-tab-cmd-hint
+      aria-hidden
+      style={{
+        position: 'absolute',
+        // Смещение ВНУТРЬ: строка стоит на границе, но бо́льшей частью лежит на
+        // своей карточке, а не на шве между двумя.
+        top: -Math.round(TAB_CMD_HINT_FONT_PX * 0.28),
+        left: 8,
+        maxWidth: 'calc(100% - 16px)',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        padding: '0 4px',
+        borderRadius: 3,
+        // Фон под текстом обязателен: строка ложится и на рамку карточки, и на
+        // зазор, и на соседнюю вкладку — без подложки она читалась бы как часть
+        // чужого имени.
+        background: 'rgba(20,20,24,0.94)',
+        boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.22)',
+        color: '#e8e8ea',
+        fontSize: TAB_CMD_HINT_FONT_PX,
+        fontWeight: 600,
+        lineHeight: 1.35,
+        pointerEvents: 'none',
+        zIndex: 9,
+      }}
+    >
+      {text}
+    </span>
+  );
+}
+
 export function TabFastBadge({
   active,
   title = 'Codex Fast: priority',
@@ -214,6 +268,147 @@ export function TabFastBadge({
         <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
       </svg>
     </span>
+  );
+}
+
+/**
+ * Маркер статуса, по которому МОЖНО КЛИКНУТЬ: открывает выбор статуса на месте,
+ * не активируя вкладку.
+ *
+ * Раньше маркер был чисто индикатором, и смена статуса жила только в
+ * контекстном меню вкладки — три шага ради одного цвета. Юзер: *«при наведении
+ * должен быть курсор pointer, я на него нажимаю, при этом никакого фокуса по
+ * вкладке, перехода нет… выбираю нужный тип, и он сменяется, при этом фокус не
+ * меняется вообще никак»*.
+ *
+ * ОДИН компонент на все три поверхности (карточка списка, чип в шапке окна,
+ * строка плана задач использует свой пикер задачных статусов — это другой
+ * словарь). Список статусов и его вид — те же, что в контекстном меню вкладки:
+ * второй набор строк разошёлся бы с первым на первом же изменении палитры.
+ *
+ * Событийная изоляция — обе фазы: pointerdown (фокус окон и панелей живёт на
+ * capture-фазе pointerdown) и click (активация вкладки). stopPropagation на
+ * одном click недостаточен — карточка взяла бы фокус ещё на нажатии.
+ */
+export function TabStatusMarkerButton({
+  projectId,
+  tabId,
+  color,
+  title,
+  sizePx,
+  left = 5,
+  topOffsetPx = 1,
+  zIndex = 6,
+}: TabStatusMarkerProps & { projectId: string; tabId: string }) {
+  const shape = useUIStore((s) => s.statusMarker.shape);
+  const settingsSize = useUIStore((s) => s.statusMarker.sizePx);
+  const statuses = useUIStore((s) => s.sessionStatuses);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  useEffect(() => {
+    if (!menu) return undefined;
+    const close = () => setMenu(null);
+    // mousedown, не click: любой клик мимо меню закрывает его ДО того, как
+    // дойдёт до цели, — тот же порядок, что у остальных меню приложения.
+    window.addEventListener('mousedown', close);
+    window.addEventListener('blur', close);
+    return () => {
+      window.removeEventListener('mousedown', close);
+      window.removeEventListener('blur', close);
+    };
+  }, [menu]);
+  if (!color) return null;
+  const size = sizePx ?? settingsSize;
+  const currentId = useWorkspaceStore.getState()
+    .openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus;
+  return (
+    <>
+      <span
+        data-tab-status-marker
+        data-tab-status-marker-button
+        title={title}
+        onPointerDown={(e) => {
+          // Никакого фокуса вкладке/окну: фокус живёт на capture-pointerdown,
+          // и одного stopPropagation на click уже поздно.
+          e.stopPropagation();
+          if (e.button !== 0) e.preventDefault();
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY });
+        }}
+        onDoubleClick={(e) => e.stopPropagation()}
+        style={{
+          position: 'absolute',
+          left: `${left}px`,
+          top: `calc(50% + ${topOffsetPx}px)`,
+          transform: 'translateY(-50%)',
+          width: `${size}px`,
+          height: `${size}px`,
+          borderRadius: shape === 'square' ? '2px' : '50%',
+          backgroundColor: color,
+          border: '1px solid rgba(0,0,0,0.4)',
+          cursor: 'pointer',
+          zIndex,
+        }}
+      />
+      {menu && createPortal(
+        <div
+          data-tab-status-marker-menu
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: 'fixed',
+            left: Math.max(8, Math.min(menu.x, window.innerWidth - 228)),
+            top: Math.max(8, Math.min(menu.y + 6, window.innerHeight - Math.min(320, 16 + statuses.length * 30))),
+            width: 220,
+            maxHeight: 312,
+            overflowY: 'auto',
+            zIndex: 2147482600,
+            padding: 3,
+            borderRadius: 8,
+            background: '#18181b',
+            border: '1px solid #3a3a40',
+            boxShadow: '0 14px 34px rgba(0,0,0,0.6)',
+          }}
+        >
+          {statuses.map((s) => {
+            const selected = currentId === s.id;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  // Повторный клик на активный статус снимает его — как в
+                  // контекстном меню вкладки (один жест, один смысл).
+                  useWorkspaceStore.getState()
+                    .setTabSessionStatus(projectId, tabId, selected ? null : s.id);
+                  setMenu(null);
+                }}
+                style={{
+                  display: 'flex', alignItems: 'center', width: '100%', gap: 8,
+                  padding: '5px 7px', color: '#ccc', background: 'transparent',
+                  border: 0, borderRadius: 5, cursor: 'pointer', textAlign: 'left',
+                  fontSize: 12, outline: 'none',
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.07)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+              >
+                <span style={{
+                  width: 11, height: 11, flexShrink: 0,
+                  borderRadius: shape === 'square' ? 2 : '50%',
+                  backgroundColor: s.color, border: '1px solid rgba(0,0,0,0.4)',
+                }} />
+                <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.label}</span>
+                {selected && <span style={{ marginLeft: 'auto', color: '#fff' }}>✓</span>}
+              </button>
+            );
+          })}
+        </div>,
+        document.body,
+      )}
+    </>
   );
 }
 

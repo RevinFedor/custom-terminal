@@ -1,6 +1,10 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { clearPendingResume, markPendingResume } from './pendingResume';
 import { planClaudePtySettings } from './claudePtySettingPlan.mjs';
+import {
+  isStandaloneAgentLocalCommand,
+  normalizeAgentLocalCommand,
+} from './agentLocalCommand.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -539,6 +543,24 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
     ' chars=' + prompt.length);
   const work = (async () => {
     const assertNotCancelled = options.assertNotCancelled || (() => {});
+    const localCommand = isStandaloneAgentLocalCommand({
+      prompt,
+      imageCount: options.presentationSnapshot?.imagePaths?.length || 0,
+      chipCount: options.presentationSnapshot?.promptChips?.length || 0,
+    }) ? normalizeAgentLocalCommand(prompt) : null;
+    if (localCommand) {
+      assertNotCancelled();
+      const result = await ipcRenderer.invoke('claude:send-command', tabId, localCommand, {
+        source: options.source || 'claude-pty-local-command',
+        handoffId: options.handoffId || null,
+        stashFirst: false,
+        awaitUserMessageAudit: false,
+      });
+      return {
+        ...(result || {}),
+        localSlashCommand: true,
+      };
+    }
     const requestedModel = String(options.model || '').trim();
     const requestedEffort = String(options.effort || '').trim();
     const workspaceState = useWorkspaceStore.getState() as any;
@@ -712,6 +734,7 @@ export function interruptClaudePtyTurn(tabId: string): { success: boolean; inter
 export async function stopClaudePtyProcess(tabId: string, options: {
   reason?: string | null;
   authority?: Record<string, unknown> | null;
+  captureCodexRestartSettings?: boolean;
 } = {}): Promise<any> {
   if (!tabId) return { success: false, error: 'tabId required' };
   const existing = stopInflight.get(tabId);

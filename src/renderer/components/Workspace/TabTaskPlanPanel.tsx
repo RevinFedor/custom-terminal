@@ -1707,7 +1707,15 @@ export default function TabTaskPlanPanel({
           ) : (
             <button
               type="button"
+              data-task-plan-status-trigger
               title={status ? `Изменить статус: ${status.label}` : 'Выбрать статус'}
+              // pointerdown тоже гасится: фокус окон живёт на window-capture
+              // pointerdown (TerminalArea), и клик по маркеру не имеет права
+              // активировать вкладку. Там же этот data-атрибут в исключениях.
+              onPointerDown={(event) => {
+                event.stopPropagation();
+                if (event.button !== 0) event.preventDefault();
+              }}
               onClick={(event) => {
                 event.stopPropagation();
                 const rect = event.currentTarget.getBoundingClientRect();

@@ -8,6 +8,7 @@ const read = (relative) => fs.readFileSync(path.join(repoRoot, relative), 'utf8'
 const panel = read('renderer/components/Workspace/HistoryPanel.tsx');
 const receipt = read('main/agent-history-send-receipt.js');
 const runtime = read('renderer/utils/historyAgentRuntimes.ts');
+const claudeRuntime = read('renderer/utils/claudePtyActions.ts');
 const main = read('main/main.js');
 
 /**
@@ -62,11 +63,13 @@ test('правило покрывает ВСЕ источники History, а н
   assert.match(fn, /isLocalSlashCommandPrompt\(rawPrompt\) && !hasStructuredPayload/);
 });
 
-test('History routes standalone Codex slash through exact TUI ingestion instead of user_message audit', () => {
+test('History routes standalone Claude/Codex slash through local TUI ingestion instead of user_message audit', () => {
   assert.match(runtime, /isStandaloneCodexLocalSlashCommand\(\{/);
   assert.match(runtime, /ipcRenderer\.invoke\('codex:send-live-slash-command'/);
+  assert.match(claudeRuntime, /isStandaloneAgentLocalCommand\(\{/);
+  assert.match(claudeRuntime, /ipcRenderer\.invoke\('claude:send-command'/);
   assert.match(main, /localCommandProof = 'codex-tui-input-frame-and-enter'/);
-  assert.match(panel, /projectCodexLocalSlashSendResult\(\{/);
+  assert.match(panel, /projectAgentLocalCommandSendResult\(\{/);
   assert.match(panel, /requiresAuditIdentity: !localSlashReceipt\.handled/);
 });
 

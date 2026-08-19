@@ -2110,69 +2110,72 @@ export default function ClaudeControlBar({
   const popupRefs = useRef<Record<PopupKey, HTMLDivElement | null>>({ draft: null, provider: null, model: null, effort: null });
   const modelEffortPopupRef = useRef<HTMLDivElement | null>(null);
 
-  // Ловушка, из-за которой наивная версия начинает мигать: после переноса блоки
-  // стоят в столбик, и их «естественная» ширина уже не читается — обе становятся
-  // равны ширине бара, условие переворачивается, строки схлопываются обратно, и
-  // так по кругу. Поэтому меряем сумму детей (нужная ширина содержимого, а не
-  // выданная раскладкой) — она одинакова в обоих состояниях. Именно сумму, а
-  // не scrollWidth: у левого блока в конце распорка, и scrollWidth равен
-  // выданной ширине — см. measureClusterContentWidth.
-  // useLayoutEffect, а не useEffect: правый кластер рендерится внутри вызова
-  // функции ниже, поэтому его ref привязывается позже — обычный эффект успевал
-  // прочитать пустую ссылку, сбросить перенос и больше не пересчитаться, потому
-  // что зависимости не менялись. Слой раскладки видит уже привязанные ссылки.
+  // This component survives A→B tab switches. A hidden readings node cannot
+  // re-measure itself, so carrying A's remembered width into B could keep B
+  // hidden forever. Reset before the first layout decision of the new owner.
+  useLayoutEffect(() => {
+    readingsWidthRef.current = 0;
+    setReadingsShed(false);
+    setClustersWrapped(false);
+  }, [tabId]);
+
+  // ONE function owns the geometry answer. The former pair of layout effects
+  // duplicated this body; one once used scrollWidth while the other summed
+  // children, and their disagreement formed the React #185 render loop. Keep
+  // both invalidation sources (render + ResizeObserver), but route them through
+  // this single calculation.
+  const measureControlBar = useCallback(() => {
+    const root = rootRef.current;
+    const left = leftClusterRef.current;
+    const right = rightClusterRef.current;
+    if (!root || !left || !right) {
+      setClustersWrapped(false);
+      return;
+    }
+    const style = window.getComputedStyle(root);
+    const padding = (parseFloat(style.paddingLeft) || 0)
+      + (parseFloat(style.paddingRight) || 0);
+    const availableWidth = root.clientWidth - padding;
+    // Content width, not scrollWidth: the left cluster ends in a flex spacer,
+    // so scrollWidth is the granted width (600/600 measured) rather than the
+    // 521px its real children need.
+    const leftWidth = measureClusterContentWidth(left, LEFT_CLUSTER_INNER_GAP_PX);
+    const rightWidth = measureClusterContentWidth(right, RIGHT_CLUSTER_INNER_GAP_PX);
+    const readingsNode = readingsRef.current;
+    if (readingsNode) {
+      const width = readingsNode.getBoundingClientRect().width;
+      if (width > 0) readingsWidthRef.current = width;
+    }
+    if (dockedInComposer) {
+      setClustersWrapped(false);
+      setReadingsShed(shouldShedControlBarReadings({
+        availableWidth,
+        leftWidth,
+        rightWidth,
+        readingsWidth: readingsWidthRef.current,
+        readingsGapPx: LEFT_CLUSTER_INNER_GAP_PX,
+        readingsHidden: !readingsNode,
+        minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+      }));
+      return;
+    }
+    setReadingsShed(false);
+    setClustersWrapped(shouldWrapControlBar({
+      availableWidth,
+      leftWidth,
+      rightWidth,
+      minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
+    }));
+  }, [dockedInComposer]);
+
+  // Observe geometry-only changes that do not render this component (pane
+  // resize/pin). Do not measure in setup: the unconditional layout effect below
+  // already owns this commit, so setup+render cannot force layout twice.
   useLayoutEffect(() => {
     const root = rootRef.current;
     const left = leftClusterRef.current;
     const right = rightClusterRef.current;
-    // Правый кластер скрывается целиком на новой вкладке — переносить нечего.
-    if (!root || !left || !right) {
-      setClustersWrapped(false);
-      return undefined;
-    }
-    const measure = () => {
-      const style = window.getComputedStyle(root);
-      const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
-      // Ширина СОДЕРЖИМОГО, а не выданная раскладкой: у левого блока в конце
-      // стоит распорка, прижимающая счётчик контекста к правому краю, поэтому
-      // scrollWidth всегда равен ширине бара (замерено: 600 из 600 при
-      // реальной сумме детей 521). С таким числом сравнение становится
-      // самоссылочным — оно растёт вместе с доступной шириной, и бар уже
-      // никогда не «влезает» обратно в одну строку.
-      const availableWidth = root.clientWidth - padding;
-      const leftWidth = measureClusterContentWidth(left, LEFT_CLUSTER_INNER_GAP_PX);
-      const rightWidth = measureClusterContentWidth(right, RIGHT_CLUSTER_INNER_GAP_PX);
-      const readingsNode = readingsRef.current;
-      if (readingsNode) {
-        const width = readingsNode.getBoundingClientRect().width;
-        if (width > 0) readingsWidthRef.current = width;
-      }
-      if (dockedInComposer) {
-        setClustersWrapped(false);
-        setReadingsShed(shouldShedControlBarReadings({
-          availableWidth,
-          leftWidth,
-          rightWidth,
-          readingsWidth: readingsWidthRef.current,
-          // Вместе с показаниями из замера уходит и отступ перед ними —
-          // тот же, с которым мерили блок строкой выше. Без него две
-          // раскладки расходятся ровно на этот отступ, и на полосе такой
-          // ширины показания мигают без остановки.
-          readingsGapPx: LEFT_CLUSTER_INNER_GAP_PX,
-          readingsHidden: !readingsNode,
-          minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
-        }));
-        return;
-      }
-      setReadingsShed(false);
-      setClustersWrapped(shouldWrapControlBar({
-        availableWidth,
-        leftWidth,
-        rightWidth,
-        minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
-      }));
-    };
-    measure();
+    if (!root || !left || !right) return undefined;
     // Ширина бара меняется и без ресайза окна: перетаскивание границы боковой
     // панели, закреп, появление/исчезновение чипов, смена подписи модели.
     //
@@ -2182,7 +2185,7 @@ export default function ClaudeControlBar({
     // ускоряет реакцию, а не является условием: тот же расчёт выполняется на
     // каждом рендере бара (эффект ниже без списка зависимостей), а рендер
     // случается при любой смене раскладки, подписи или набора чипов.
-    const observer = new ResizeObserver(measure);
+    const observer = new ResizeObserver(measureControlBar);
     observer.observe(root);
     observer.observe(left);
     observer.observe(right);
@@ -2191,65 +2194,17 @@ export default function ClaudeControlBar({
     // окна, закреп), а в скрытом окне наблюдатель за размером не срабатывает
     // вообще — замерено: ширина изменилась 1145 → 620, ни одного вызова. Тогда
     // единственный оставшийся сигнал — событие ресайза окна.
-    window.addEventListener('resize', measure);
+    window.addEventListener('resize', measureControlBar);
     return () => {
       observer.disconnect();
-      window.removeEventListener('resize', measure);
+      window.removeEventListener('resize', measureControlBar);
     };
-  }, [showRightCluster, sessionType, tabId, hasArtifactSession, contextPct > 0, showCacheChip, dockedInComposer]);
+  }, [measureControlBar, showRightCluster, sessionType, tabId, hasArtifactSession, contextPct > 0, showCacheChip]);
 
-  // Второй, безусловный источник того же расчёта: без списка зависимостей он
-  // выполняется после каждого рендера. Это и есть страховка от скрытого окна и
-  // от смены ширины, о которой наблюдатель не сообщил. Само по себе цикла не
-  // даёт: setClustersWrapped с тем же значением React не считает изменением, а
-  // сумма детей одинакова в обеих раскладках (в столбик блоки не сжимаются).
-  // ОБЯЗАТЕЛЬНОЕ условие безопасности этого эффекта — мерить ТЕМ ЖЕ способом,
-  // что и эффект выше. Пока здесь стоял scrollWidth, два эффекта отвечали на
-  // один вопрос по-разному и переписывали ответы друг друга по кругу.
+  // Hidden windows may not deliver ResizeObserver at all. Every actual render
+  // therefore performs the same single measurement before paint.
   useLayoutEffect(() => {
-    const root = rootRef.current;
-    const left = leftClusterRef.current;
-    const right = rightClusterRef.current;
-    if (!root || !left || !right) return;
-    const style = window.getComputedStyle(root);
-    const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
-    const availableWidth = root.clientWidth - padding;
-    if (dockedInComposer) {
-      // Здесь тоже нельзя мерить scrollWidth целиком по той же причине, что и
-      // выше: у левого блока распорка. Считаем детей.
-      const readingsNode = readingsRef.current;
-      if (readingsNode) {
-        const width = readingsNode.getBoundingClientRect().width;
-        if (width > 0) readingsWidthRef.current = width;
-      }
-      setClustersWrapped(false);
-      setReadingsShed(shouldShedControlBarReadings({
-        availableWidth,
-        leftWidth: measureClusterContentWidth(left, LEFT_CLUSTER_INNER_GAP_PX),
-        rightWidth: measureClusterContentWidth(right, RIGHT_CLUSTER_INNER_GAP_PX),
-        readingsWidth: readingsWidthRef.current,
-        readingsGapPx: LEFT_CLUSTER_INNER_GAP_PX,
-        readingsHidden: !readingsNode,
-        minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
-      }));
-      return;
-    }
-    setReadingsShed(false);
-    // Тот же способ замера, что и в эффекте выше, и это обязательное условие.
-    // Здесь стоял scrollWidth — ровно то число, от которого предостерегает
-    // measureClusterContentWidth: у левого блока в конце распорка, поэтому
-    // scrollWidth равен выданной ширине, а не нужной. Получалось, что два
-    // эффекта в одном компоненте отвечали на один вопрос по-разному: один
-    // говорил «влезает», другой «не влезает», каждый переписывал ответ
-    // другого, и каждая запись вызывала новый рендер — бесконечный круг,
-    // который React обрывает ошибкой #185 (прод 17.08 20:34:09 и 20:41:05,
-    // «Something went wrong» на весь экран).
-    setClustersWrapped(shouldWrapControlBar({
-      availableWidth,
-      leftWidth: measureClusterContentWidth(left, LEFT_CLUSTER_INNER_GAP_PX),
-      rightWidth: measureClusterContentWidth(right, RIGHT_CLUSTER_INNER_GAP_PX),
-      minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
-    }));
+    measureControlBar();
   });
 
   useEffect(() => {

@@ -61,6 +61,7 @@ import {
   isTimelineGroupExpanded,
   timelineMarkerGeometry,
 } from '../../utils/timelineMarkerPresentation.mjs';
+import { mapTimelinePromptBoundaries } from '../../utils/timelinePromptBoundaryMap.mjs';
 import {
   normalizeForkMarkerEntryUuids,
   normalizeForkMarkers,
@@ -153,14 +154,16 @@ function isAttributeEntry(entry: { type?: string; isCompactSummary?: boolean }):
 
 const DOCS_TIMELINE_COLORS = {
   edited: {
-    hover: '#86efac',
-    visible: '#4ade80',
-    dim: '#22c55e',
-    glow: '74, 222, 128',
-    tooltip: 'rgba(74, 222, 128, 0.9)',
-    tooltipMuted: 'rgba(74, 222, 128, 0.82)',
-    borderClass: 'border-green-500/15',
-    hoverClass: 'hover:bg-green-500/5',
+    // Emerald, not the generic completed-action green (#4ade80): otherwise
+    // the docs pencil/icon is technically recoloured but looks unchanged.
+    hover: '#6ee7b7',
+    visible: '#34d399',
+    dim: '#059669',
+    glow: '52, 211, 153',
+    tooltip: 'rgba(52, 211, 153, 0.9)',
+    tooltipMuted: 'rgba(52, 211, 153, 0.82)',
+    borderClass: 'border-emerald-500/15',
+    hoverClass: 'hover:bg-emerald-500/5',
   },
   search: {
     hover: '#d9f99d',
@@ -305,12 +308,30 @@ const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) =>
 const StatusLabelPortal: React.FC<{
   label: string;
   top: number;
+  contentTop: number;
+  scrollOwner: HTMLElement;
   rightOffset: number;
   color: string;
   className?: string;
-}> = ({ label, top, rightOffset, color }) => {
+}> = ({ label, top, contentTop, scrollOwner, rightOffset, color }) => {
+  const labelRef = useRef<HTMLDivElement>(null);
+  const updatePosition = useCallback(() => {
+    const node = labelRef.current;
+    if (!node || !scrollOwner?.isConnected) return;
+    node.style.top = `${scrollOwner.getBoundingClientRect().top + contentTop}px`;
+  }, [contentTop, scrollOwner]);
+  useLayoutEffect(() => {
+    updatePosition();
+    window.addEventListener('scroll', updatePosition, true);
+    window.addEventListener('resize', updatePosition);
+    return () => {
+      window.removeEventListener('scroll', updatePosition, true);
+      window.removeEventListener('resize', updatePosition);
+    };
+  }, [updatePosition]);
   return createPortal(
     <div
+      ref={labelRef}
       data-timeline-portal
       className="fixed pointer-events-none transition-all duration-300"
       style={{
@@ -1484,6 +1505,13 @@ function Timeline({
   const [expandedDocsSearch, setExpandedDocsSearch] = useState<Set<string>>(new Set());
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const selectionStartIdRef = useRef<string | null>(null);
+  // Right-click has its own single-entry selection. It deliberately does not
+  // reuse selectionStartId: that state means "the first point of a range" and
+  // would make the next ordinary click unexpectedly open multi-select actions.
+  const [contextSelectedEntryId, setContextSelectedEntryId] = useState<string | null>(null);
+  useEffect(() => {
+    setContextSelectedEntryId(null);
+  }, [tabId]);
   const [queuedRewindTargetRequest, setQueuedRewindTargetRequest] = useState<{
     requestId: string;
   } | null>(null);
@@ -3828,6 +3856,7 @@ function Timeline({
         setCopiedRange(null);
         setSelectionStartId(null);
         selectionStartIdRef.current = null;
+        setContextSelectedEntryId(null);
         setContextMenu(null);
         setClickedState(null);
         setActiveTooltipIndex(null);
@@ -4285,21 +4314,35 @@ function Timeline({
   // effect: entries/tabId/isGemini → terminalRegistry.bindEntryToPromptBoundary for each user entry (skips attribute entries; OSC 7777 markers anchor scrollToEntry; entries without markers fall back to SearchAddon)
   useEffect(() => {
     if (usesTextSearchAnchors || entries.length === 0) return;
-    const boundaryCount = terminalRegistry.getPromptBoundaryCount(tabId);
-    if (boundaryCount === 0) return;
+    const boundaries = terminalRegistry.getPromptBoundarySnapshot(tabId);
+    if (boundaries.length === 0) return;
 
-    // User-type entries only (skip compact, continued, docs_edit, docs_search)
-    let promptSeq = 0;
-    for (const entry of entries) {
-      if (isAttributeEntry(entry)) continue;
-      // Try to bind this entry to the next available prompt boundary
-      // Boundary 0 = prompt after first response → where second message was typed
-      // For entry 0 (first message), there's no boundary (it was typed at the initial prompt)
-      // So entry 1 → boundary 0, entry 2 → boundary 1, etc.
-      if (promptSeq > 0) {
-        terminalRegistry.bindEntryToPromptBoundary(tabId, entry.uuid, promptSeq - 1);
+    // Match the viewport path exactly: Claude compact/plan boundaries make
+    // older terminal rows unreachable, and a resumed/forked buffer owns only
+    // the newest K+1 entries for K live OSC boundaries.
+    let lastBoundaryIdx = -1;
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (entry.type === 'compact' || entry.isPlan) {
+        lastBoundaryIdx = entry.type === 'compact' && entries[index + 1]?.isCompactSummary
+          ? index + 1
+          : index;
       }
-      promptSeq++;
+    }
+    const realIndices: number[] = [];
+    entries.forEach((entry, index) => {
+      if (index <= lastBoundaryIdx || isAttributeEntry(entry)) return;
+      realIndices.push(index);
+    });
+    const mapped = mapTimelinePromptBoundaries({
+      entryIndices: realIndices,
+      boundaries,
+    });
+    for (const binding of mapped.bindings) {
+      const entry = entries[binding.entryIndex];
+      if (entry) {
+        terminalRegistry.bindEntryToPromptBoundary(tabId, entry.uuid, binding.promptSeq);
+      }
     }
   }, [entries, tabId, usesTextSearchAnchors]);
 
@@ -4405,7 +4448,7 @@ function Timeline({
         // Entry N was typed at the prompt shown after Entry N-1's response = boundary N-1.
         // For forked sessions: only the most recent entries have boundaries in this terminal.
         // We map from the END so that the newest entries match the newest boundaries.
-        const boundaryLines = terminalRegistry.getPromptBoundaryLines(tabId);
+        const boundaries = terminalRegistry.getPromptBoundarySnapshot(tabId);
 
         // Collect indices of "real" entries (non-compact, non-continued, non-docs_edit, non-docs_search) after lastBoundaryIdx
         const realIndices: number[] = [];
@@ -4415,17 +4458,13 @@ function Timeline({
           realIndices.push(index);
         });
 
-        if (boundaryLines.length > 0 && realIndices.length > 0) {
-          // Primary: K prompt boundaries → last K+1 real entries get positions
-          const positionable = boundaryLines.length + 1;
-          const startFrom = Math.max(0, realIndices.length - positionable);
-
-          // First positionable entry → position 0 (typed at initial prompt)
-          pos[realIndices[startFrom]] = 0;
-
-          // Subsequent entries → prompt boundary lines in order
-          for (let i = 1; i < positionable && (startFrom + i) < realIndices.length; i++) {
-            pos[realIndices[startFrom + i]] = boundaryLines[i - 1];
+        if (boundaries.length > 0 && realIndices.length > 0) {
+          const mapped = mapTimelinePromptBoundaries({
+            entryIndices: realIndices,
+            boundaries,
+          });
+          for (const [entryIndex, line] of mapped.positions) {
+            pos[entryIndex] = line;
           }
         } else if (realIndices.length > 0) {
           // Fallback: no prompt boundaries registered yet (startup, HMR, etc.)
@@ -4686,6 +4725,9 @@ function Timeline({
   // ════════════════════════════════════════════════════════════
 
   const handleEntryClick = (entry: TimelineEntry, e?: React.MouseEvent) => {
+    // A normal click starts a new navigation/selection gesture, so the old
+    // right-click marker must not remain on a different row.
+    setContextSelectedEntryId(null);
     if (queuedRewindTargetRequest) {
       e?.preventDefault();
       e?.stopPropagation();
@@ -5018,6 +5060,7 @@ function Timeline({
       return;
     }
     if (readOnly) return;
+    setContextSelectedEntryId(null);
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
@@ -5031,6 +5074,9 @@ function Timeline({
     e.preventDefault();
     e.stopPropagation();
     if (queuedRewindTargetRequest) return;
+    // In read-only Timeline there is no action menu, but the clicked record is
+    // still worth pinning visually so the gesture has a persistent target.
+    if (!selectionStartIdRef.current) setContextSelectedEntryId(entry.uuid);
     if (readOnly) return;
 
     // Position: anchor popup's RIGHT edge to Timeline's LEFT edge (mirrors note tooltip).
@@ -5062,6 +5108,7 @@ function Timeline({
   };
 
   const startRangeSelection = (entry: TimelineEntry) => {
+    setContextSelectedEntryId(null);
     selectionStartIdRef.current = entry.uuid;
     setSelectionStartId(entry.uuid);
     setContextMenu(null);
@@ -7725,7 +7772,7 @@ function Timeline({
                   summaryText={summaryEligible ? (promptSummaries[summaryKey]?.summary?.trim() || '') : ''}
                   summaryLoading={summaryEligible && promptSummaryLoadingKeys.has(summaryKey)}
                   isGroupExpanded={isGroupExpanded}
-                  active={isSelected(entry, index)}
+                  active={isSelected(entry, index) || contextSelectedEntryId === entry.uuid}
                   forkMarkerVisible={!!forkMarker && !isOldHistory}
                   isPlanModeBoundary={isPlanModeBoundary && !isOldHistory}
                   isInViewport={isInViewport}
@@ -7830,6 +7877,8 @@ function Timeline({
               <StatusLabelPortal
                 label="COPYING..."
                 top={fixedTop}
+                contentTop={rect.top + 10}
+                scrollOwner={innerWrapperRef.current}
                 rightOffset={rightOffset}
                 color="#3b82f6"
               />
@@ -7867,6 +7916,8 @@ function Timeline({
                     ? 'RESTARTING...'
                     : 'DELETING...'}
                 top={fixedTop}
+                contentTop={rect.top + 10}
+                scrollOwner={innerWrapperRef.current}
                 rightOffset={rightOffset}
                 color="#ef4444"
               />
@@ -7899,6 +7950,8 @@ function Timeline({
               <StatusLabelPortal
                 label="DONE"
                 top={fixedTop}
+                contentTop={rect.top + 10}
+                scrollOwner={innerWrapperRef.current}
                 rightOffset={rightOffset}
                 color="#22c55e"
               />
@@ -7968,6 +8021,8 @@ function Timeline({
               <StatusLabelPortal
                 label={label}
                 top={fixedTop}
+                contentTop={rect.top + 10}
+                scrollOwner={innerWrapperRef.current}
                 rightOffset={rightOffset}
                 color={color}
               />
@@ -8040,6 +8095,8 @@ function Timeline({
                 <StatusLabelPortal
                   label={label}
                   top={fixedTop}
+                  contentTop={rect.top + 10}
+                  scrollOwner={innerWrapperRef.current}
                   rightOffset={rightOffset}
                   color={color}
                 />

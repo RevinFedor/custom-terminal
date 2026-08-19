@@ -1,4 +1,8 @@
 import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
+import {
+  isStandaloneAgentLocalCommand,
+  projectAgentLocalCommandSendResult,
+} from './agentLocalCommand.mjs';
 
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
 
@@ -1450,7 +1454,14 @@ const createHistoryPromptHandoffId = () => {
 export function historyPromptHandoffAuditProofFromSendResult(
   result: any,
 ): HistoryPromptHandoffAuditProof | null {
-  const audit = result?.codexAudit || result?.pasteAudit || null;
+  const topLevelExactAudit = result?.exactAuditConfirmed === true
+    && typeof result?.auditTimestamp === 'string'
+    && result.auditTimestamp
+    && typeof result?.actualHash === 'string'
+    && result.actualHash
+    ? result
+    : null;
+  const audit = result?.codexAudit || result?.pasteAudit || topLevelExactAudit;
   if (!audit || audit.success !== true || !audit.auditTimestamp || !audit.actualHash) {
     return null;
   }
@@ -1575,27 +1586,44 @@ export async function runHistoryPromptHandoff(
   const handoffId = typeof input.handoffId === 'string' && input.handoffId.trim()
     ? input.handoffId.trim()
     : createHistoryPromptHandoffId();
+  const localCommandCandidate = isStandaloneAgentLocalCommand({
+    prompt: input.text,
+    imageCount: input.imagePaths?.length || 0,
+    chipCount: input.promptChips?.length || 0,
+  });
   store.begin({
     ...input,
     handoffId,
-    requiresAuditIdentity: true,
+    requiresAuditIdentity: !localCommandCandidate,
   });
 
   try {
     const result = await input.send(handoffId);
-    const providerQueueReturned = historyPromptAuditIsProviderQueueReturn(
-      result?.pasteAudit || result,
-    );
-    const transferred = !result
+    const localCommandReceipt = projectAgentLocalCommandSendResult({
+      candidate: localCommandCandidate,
+      result,
+    });
+    const providerQueueReturned = !localCommandReceipt.handled
+      && historyPromptAuditIsProviderQueueReturn(result?.pasteAudit || result);
+    const transferred = localCommandReceipt.handled
+      ? localCommandReceipt.transferred === true
+      : !result
       || typeof result !== 'object'
       || result.success !== false
       || result.submitted === true;
-    const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(result);
-    const proof = historyPromptHandoffAuditProofFromSendResult(result);
-    const queueStatus: SettledHistoryPromptHandoffStatus = providerQueueReturned
-      ? 'cancelled'
+    const unconfirmedStatus = localCommandReceipt.handled
+      ? (localCommandReceipt.queueStatus === 'delivery-unknown' ? 'delivery-unknown' : null)
+      : historyPromptHandoffUnconfirmedStatusFromSendResult(result);
+    const proof = localCommandReceipt.handled
+      ? null
+      : historyPromptHandoffAuditProofFromSendResult(result);
+    const queueStatus: SettledHistoryPromptHandoffStatus = localCommandReceipt.handled && transferred
+      ? localCommandReceipt.queueStatus
       : !transferred
-      || (result?.success === false && result?.submitted === true && !unconfirmedStatus)
+      ? 'failed'
+      : providerQueueReturned
+      ? 'cancelled'
+      : (result?.success === false && result?.submitted === true && !unconfirmedStatus)
       ? 'failed'
       : unconfirmedStatus
         || (result?.queued === true ? 'queued' : 'sent');
@@ -1603,6 +1631,8 @@ export async function runHistoryPromptHandoff(
       queueStatus,
       reason: !transferred
         ? 'send-refused-before-submit'
+        : localCommandReceipt.handled
+          ? localCommandReceipt.reason || 'agent-local-command-result'
         : providerQueueReturned
           ? 'provider-queue-returned-to-terminal-composer'
         : queueStatus === 'failed'
@@ -1613,7 +1643,7 @@ export async function runHistoryPromptHandoff(
               ? 'send-delivery-unknown'
             : 'send-result',
       ...(proof ? { proof } : {}),
-      requiresAuditIdentity: transferred,
+      requiresAuditIdentity: transferred && !localCommandReceipt.handled,
     });
     return result && typeof result === 'object'
       ? { ...result, handoffId: result.handoffId || handoffId }

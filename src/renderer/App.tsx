@@ -90,6 +90,10 @@ import {
   sendAgentPromptScenario,
   stopAgentProcessScenario,
 } from './utils/agentScenarios';
+import {
+  AGENT_SETTINGS_INTENT_NONE,
+  createAgentSettingsIntent,
+} from './utils/agentSendSettingsContract';
 import { runHistoryPromptHandoff } from './utils/historyPromptHandoffs';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/claudeStartupDefaultsReady';
@@ -871,16 +875,18 @@ const ProjectTabItem = memo(({
             }}
           >
             {isProjectBusy && (
+              // Дуга по контуру (.noted-shape-ring): счётчик — овал при 2+
+              // процессах (padding раздаёт ширину), а вращаемая рамка верна
+              // только для круга — на овале она вылезала за контур.
               <span
-                className="absolute inset-0 rounded-full"
+                className="noted-shape-ring absolute inset-0 rounded-full"
                 style={{
-                  border: isProjectInheritedBusy
-                    ? '2px solid color-mix(in srgb, var(--process-bar-inherited-color, #A855F7) 20%, transparent)'
-                    : '2px solid rgba(74, 222, 128, 0.2)',
-                  borderTopColor: isProjectInheritedBusy ? 'var(--process-bar-inherited-color, #A855F7)' : '#4ade80',
-                  boxSizing: 'border-box',
-                  animation: 'tab-dot-spin 0.8s linear infinite',
-                }}
+                  '--noted-ring-thickness': '2px',
+                  '--noted-ring-color': isProjectInheritedBusy ? 'var(--process-bar-inherited-color, #A855F7)' : '#4ade80',
+                  '--noted-ring-track': isProjectInheritedBusy
+                    ? 'color-mix(in srgb, var(--process-bar-inherited-color, #A855F7) 20%, transparent)'
+                    : 'rgba(74, 222, 128, 0.2)',
+                } as React.CSSProperties}
               />
             )}
             {activeProcessCount > 0 ? activeProcessCount : null}
@@ -2409,19 +2415,19 @@ function App() {
             throw new Error('target tab is not idle and input-ready for compact');
           }
           const provider = described.toolType;
-          const sent = provider === 'codex'
-            ? await ipcRenderer.invoke('codex:send-live-slash-command', {
-              tabId,
-              command: '/compact',
-              handoffId,
-              hasDraft: false,
-              turnBusy: false,
-            })
-            : await ipcRenderer.invoke('claude:send-command', tabId, '/compact', {
-              source: 'orchestration-pre-task-compact',
-              handoffId,
-              stashFirst: false,
-            });
+          const sent = await sendAgentPromptScenario({
+            tabId,
+            toolType: provider,
+            runtime: described.runtime,
+            sessionId: described.sessionId,
+            cwd: described.tab.cwd,
+            prompt: '/compact',
+            handoffId,
+            source: 'orchestration-pre-task-compact',
+            statusAtSend: presence.status,
+            settingsIntent: AGENT_SETTINGS_INTENT_NONE,
+            returnDraftOnConflict: false,
+          });
           if (sent?.success !== true || sent?.submitted === false) {
             throw new Error(sent?.error || sent?.reason || 'compact command was not accepted');
           }
@@ -4207,9 +4213,12 @@ function App() {
                 source: promptSource,
                 statusAtSend,
                 queue,
-                model,
-                effort,
-                thinking,
+                settingsIntent: createAgentSettingsIntent({
+                  provider: toolType,
+                  model,
+                  effort,
+                  thinking,
+                }),
                 returnDraftOnConflict,
                 presentationSnapshot: {
                   historySessionId: sessionId,
@@ -4259,6 +4268,7 @@ function App() {
             cwd: tab?.cwd,
             prompt,
             source: 'legacy-sendClaudeMessage',
+            settingsIntent: AGENT_SETTINGS_INTENT_NONE,
           });
           const ok = result?.success !== false;
           return reply(ok, result || { tabId }, ok ? undefined : result?.error);

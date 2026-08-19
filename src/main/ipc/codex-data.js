@@ -30,7 +30,10 @@ const {
   isCodexEnvironmentContextUserText,
   isCodexProjectInstructionsUserText,
 } = require('../codex-prompt-audit');
-const { classifyHistoryAction } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
+const {
+  classifyHistoryAction,
+  historyActionPresentationMeta,
+} = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
 const {
   formatCopyAction,
 } = require('../copy-action-format');
@@ -87,6 +90,24 @@ const CODEX_JSONL_CACHE_MAX_RAW_BYTES = 768 * 1024 * 1024;
 // its own refreshes — every live append then cost a full 3.1s re-parse
 // instead of the incremental range read (tab-3163, 06.08 11:37 loadMs=3147).
 const CODEX_JSONL_CACHE_MAX_FILES = 6;
+// Потолок на ОДИН файл, который вообще разрешено разбирать в память целиком.
+//
+// Почему он обязан быть: в проде лежат пять файлов больше гигабайта (максимум
+// 1369 МБ). Разобранные объекты стоят кратно больше исходных байтов, поэтому
+// один такой разбор гарантированно убивает процесс — «нехватка памяти» и
+// мгновенное закрытие приложения без единой строки в логе. Именно так ушёл
+// вылет 19.08 08:41: за три минуты память поднялась с 2.0 до 3.6 ГБ на потоке
+// полных чтений, среди которых был файл на 717 МБ.
+//
+// Потолок считается по размеру на диске, а картинки внутри сжатий отбрасываются
+// ещё до разбора (см. stripCompactedInlineImages), поэтому фактический вес в
+// памяти в разы меньше числа ниже. Замерено на реальном файле пользователя
+// (1340 МБ): без обрезки разбор занимает 1725 МБ памяти, с обрезкой — 532 МБ.
+// 1.5 ГБ на диске — это заведомо выше любого файла, который встречается в
+// проде (максимум 1369 МБ), и заведомо ниже того, что убивает процесс после
+// обрезки. Отказ здесь честный и виден в логе; молчаливое падение всего
+// приложения — нет.
+const CODEX_JSONL_PARSE_MAX_BYTES = 1536 * 1024 * 1024;
 const CODEX_SESSION_META_HEAD_MAX_BYTES = 512 * 1024;
 const CODEX_SESSION_META_HEAD_CHUNK_BYTES = 16 * 1024;
 const CODEX_SESSION_META_HEAD_MAX_RECORDS = 32;
@@ -307,7 +328,9 @@ function shortKnowledgeDocsPath(filePath) {
   );
   const isClaudeMd = baseName === 'CLAUDE.md';
   if (!isDocsPath && !isClaudeMd) return null;
-  return segs.length >= 2 ? segs.slice(-2).join('/') : segs[0];
+  return docsIndex >= 0
+    ? segs.slice(docsIndex).join('/')
+    : baseName;
 }
 
 function addUniqueAttr(entry, key, value) {
@@ -321,6 +344,25 @@ function addUniqueAttr(entry, key, value) {
 function addDocsEdited(entry, filePath) {
   const shortName = shortKnowledgeDocsPath(filePath);
   if (shortName) addUniqueAttr(entry, 'docsEdited', shortName);
+}
+
+function addSemanticDocsEdits(entry, actions) {
+  for (const action of Array.isArray(actions) ? actions : []) {
+    const raw = action?.rawTool;
+    if (!raw) continue;
+    const presentation = historyActionPresentationMeta({
+      toolName: raw.toolName,
+      args: raw.args || {},
+      family: raw.family,
+      bashWord: raw.bashWord,
+      bashDetail: raw.bashDetail,
+      mcpServer: raw.mcpServer,
+      mcpMethod: raw.mcpMethod,
+    });
+    if (presentation.docsKind !== 'edit') continue;
+    const docsPath = presentation.targetLabel || presentation.targetKey;
+    if (docsPath) addUniqueAttr(entry, 'docsEdited', docsPath);
+  }
 }
 
 function extractPatchTouchedFiles(patchText) {
@@ -1466,6 +1508,38 @@ function collectCodexDocsAttributes(currentUser, payload) {
       : (typeof payload.arguments === 'string' ? payload.arguments : '');
     collectCodexExecDocsAttributes(currentUser, source);
   }
+
+  // Keep Timeline on the same semantic grammar as History. This covers
+  // nested exec_command calls whose shell body writes docs via Python/cat/sed
+  // instead of apply_patch — the transport tool name itself says only `exec`.
+  // Do not run the full nested-call decoder for every search/read command in a
+  // giant rollout: History can only prove a docs edit when the literal target
+  // is present anyway, so this cheap gate preserves Timeline parse cost.
+  const editCapableTransport = toolName === 'exec'
+    || toolName === 'apply_patch'
+    || toolName === 'exec_command'
+    || toolName === 'run_command';
+  let semanticSource = '';
+  try {
+    semanticSource = typeof payload.arguments === 'string'
+      ? payload.arguments
+      : typeof payload.input === 'string'
+        ? payload.input
+        : JSON.stringify(payload.arguments ?? payload.input ?? args);
+  } catch {
+    semanticSource = '';
+  }
+  if (!editCapableTransport || !/(?:^|[\\/])docs[\\/]|\bCLAUDE\.md\b/i.test(semanticSource)) return;
+  const callArgs = payload.arguments != null
+    ? parseToolArguments(payload)
+    : (typeof payload.input === 'string' ? { input: payload.input } : (payload.input || args));
+  const decoded = codexHistoryActionsForCall({
+    callId: payload.call_id || payload.id || '',
+    toolName,
+    namespace,
+    args: callArgs && typeof callArgs === 'object' ? callArgs : { value: callArgs },
+  }, '', false);
+  addSemanticDocsEdits(currentUser, decoded.actions);
 }
 
 function extractTextContent(content) {
@@ -1781,6 +1855,37 @@ async function readCodexSessionMetadata(filePath, options = {}) {
   }
 }
 
+/**
+ * Картинки внутри записи о сжатии контекста — единственное, что делает файлы
+ * истории гигантскими, и единственное, что мы из них НЕ показываем.
+ *
+ * Как получается гигабайт. При переполнении контекста Codex сохраняет всю
+ * предыдущую переписку одной строкой, и каждое следующее сжатие включает в
+ * себя предыдущее. Скриншот, попавший в диалог один раз, копируется в каждое
+ * последующее сжатие. Замерено на реальном файле пользователя: 1340 МБ, из них
+ * 1260 МБ — 64 строки сжатий, а внутри них 1236 МБ (98%) — картинки, вписанные
+ * прямо в текст. Без них тот же файл весит 104 МБ.
+ *
+ * Почему их можно выбросить именно здесь. Показ сжатия и так подставляет вместо
+ * картинки пометку «[image omitted]» (см. formatReplacementHistory) — то есть
+ * до экрана эти байты не доходили НИКОГДА. Разбирались, копировались в память
+ * и выбрасывались. Именно этот бессмысленный груз убил приложение 19.08 08:41.
+ *
+ * Границы. Режется ТОЛЬКО содержимое записи `compacted`. Картинки в обычных
+ * сообщениях не трогаются: они нужны для повтора запроса с изображением
+ * (см. materializeBuffer в main). Обрезка делается по сырому тексту строки ДО
+ * разбора — иначе гигабайт всё равно окажется в памяти, просто чуть позже.
+ */
+const CODEX_COMPACT_IMAGE_DATA_URL = /"(image_url|imageUrl)"\s*:\s*"data:image\/[^"]*"/g;
+
+function stripCompactedInlineImages(line) {
+  // Дешёвая проверка перед дорогой заменой: обычные строки не должны платить.
+  if (line.length < 4096) return line;
+  if (line.lastIndexOf('"type":"compacted"', 400) === -1) return line;
+  if (line.indexOf('"data:image/') === -1) return line;
+  return line.replace(CODEX_COMPACT_IMAGE_DATA_URL, '"$1":"[image omitted]"');
+}
+
 async function readJsonlRange(filePath, startByte, endByte, options = {}) {
   const records = options.records || [];
   let lineCount = Number(options.lineCount) || 0;
@@ -1804,7 +1909,8 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
     let lineStart = 0;
     let newlineIndex = data.indexOf(0x0a, lineStart);
     while (newlineIndex >= 0) {
-      const line = data.subarray(lineStart, newlineIndex).toString('utf8').trim();
+      const rawLine = data.subarray(lineStart, newlineIndex).toString('utf8').trim();
+      const line = stripCompactedInlineImages(rawLine);
       if (line) {
         try {
           const record = JSON.parse(line);
@@ -1963,6 +2069,29 @@ async function scanCodexStableSourceRewindProof(filePath, {
   }
 }
 
+/** Наши кадры стека вызова, ради ответа «кто заказал полное чтение файла».
+ * Только имена функций проекта: кадры Node и внутренние обёртки шума дают
+ * больше, чем смысла. */
+function _describeJsonlReadCaller() {
+  try {
+    const stack = String(new Error().stack || '').split('\n').slice(2, 40);
+    const names = [];
+    for (const line of stack) {
+      const m = line.match(/at\s+(?:async\s+)?([A-Za-z_$][\w$.]*)\s/);
+      if (!m) continue;
+      const name = m[1];
+      if (name.startsWith('_parseJsonlFile') || name === 'parseJsonlFile') continue;
+      if (name.startsWith('process.') || name.startsWith('Object.')) continue;
+      if (names[names.length - 1] === name) continue;
+      names.push(name);
+      if (names.length >= 4) break;
+    }
+    return names.length ? names.join('<') : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 async function _parseJsonlFileIncremental(filePath) {
   let stat;
   try {
@@ -1976,6 +2105,17 @@ async function _parseJsonlFileIncremental(filePath) {
   if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
     touchCodexJsonlCacheEntry(filePath, cached);
     return cached.records;
+  }
+
+  // Файл, который нельзя разобрать целиком, не разбираем вовсе. Дописи к уже
+  // разобранному файлу (ветка ниже) под запрет не попадают: там читается
+  // только новый хвост, а не весь файл.
+  if (!cached && stat.size > CODEX_JSONL_PARSE_MAX_BYTES) {
+    console.warn('[CodexJsonlCache] refused file=' + path.basename(filePath)
+      + ' sizeMB=' + Math.round(stat.size / (1024 * 1024))
+      + ' maxMB=' + Math.round(CODEX_JSONL_PARSE_MAX_BYTES / (1024 * 1024))
+      + ' by=' + _describeJsonlReadCaller());
+    return [];
   }
 
   if (cached && stat.size > cached.size) {
@@ -2028,7 +2168,13 @@ async function _parseJsonlFileIncremental(filePath) {
     ' leftoverBytes=' + result.leftoverBuffer.length +
     ' cacheFiles=' + _codexJsonlCache.size +
     ' cacheRawMB=' + Math.round(_codexJsonlCacheRawBytes / (1024 * 1024)) +
-    (cached ? ' reason=rewrite-or-shrink' : ' reason=first-read'));
+    (cached ? ' reason=rewrite-or-shrink' : ' reason=first-read')
+    // Кто именно заказал полное чтение. Без этого в проде видно ЧТО читается,
+    // но не видно КЕМ: 19.08 05:38–05:41 через кэш прогнали 195 разных файлов,
+    // память ушла с 2.0 до 3.6 ГБ и процесс упал — а в логе не было ни одного
+    // вызывающего. Стек здесь стоит дёшево (одно полное чтение — сотни
+    // миллисекунд) и печатается только в этот момент, не на попадания в кэш.
+    + ' by=' + _describeJsonlReadCaller());
   return result.records;
 }
 

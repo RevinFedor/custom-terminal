@@ -61,8 +61,17 @@ const CenteredUpwardPopover = forwardRef<HTMLDivElement, CenteredUpwardPopoverPr
 
       const viewportRight = window.innerWidth - edgePadding;
       const anchorCenter = anchor.left + anchor.width / 2;
-      const timeline = document.querySelector('[data-timeline]') as HTMLElement | null;
-      const timelineLeft = timeline?.getBoundingClientRect().left;
+      // Split mode can mount several Timeline columns. The first document
+      // match may belong to another pane; constrain against the nearest column
+      // actually to the right of this anchor.
+      const timelineLeft = Array.from(
+        document.querySelectorAll('[data-timeline]') as NodeListOf<HTMLElement>,
+      ).map((timeline) => timeline.getBoundingClientRect().left)
+        .filter((left) => left > anchorCenter + edgePadding)
+        .reduce<number | null>(
+          (nearest, left) => nearest === null ? left : Math.min(nearest, left),
+          null,
+        );
       const rightLimit = timelineLeft != null && timelineLeft > anchorCenter + edgePadding
         ? Math.min(viewportRight, timelineLeft - edgePadding)
         : viewportRight;

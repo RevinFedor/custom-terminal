@@ -61,7 +61,7 @@ test('F4 real Codex runtime preserves its softened post-Enter state as audit-pen
     'the renderer may soften the History error, but it must keep the pending receipt for Project API, MCP, and Inbox',
   );
   const pendingStart = historyPanelSource.indexOf(
-    'const unconfirmedStatus = sendIdentityFailure',
+    'const unconfirmedStatus = localSlashReceipt.handled',
   );
   assert.ok(pendingStart >= 0);
   const pendingSendBoundary = historyPanelSource.slice(pendingStart, pendingStart + 3_500);
@@ -78,12 +78,12 @@ test('F4 real Codex runtime preserves its softened post-Enter state as audit-pen
   // provider-queue return is excluded — not the exact former spelling.
   assert.match(
     pendingSendBoundary,
-    /sendDeliveryUnconfirmed = [\s\S]{0,120}unconfirmedStatus !== null/,
+    /sendDeliveryUnconfirmed = localSlashReceipt\.handled[\s\S]{0,320}unconfirmedStatus !== null/,
     'History must preserve the prompt while rendering a post-Enter soft timeout as unresolved rather than final sent',
   );
   assert.match(
     pendingSendBoundary,
-    /sendDeliveryUnconfirmed = !providerQueueReturned/,
+    /: !providerQueueReturned && \(/,
     'a prompt returned to the terminal composer is cancelled, not an unconfirmed delivery',
   );
   assert.match(

@@ -9,6 +9,10 @@ const panelSource = fs.readFileSync(
   path.join(repoRoot, 'src/renderer/components/Workspace/HistoryPanel.tsx'),
   'utf8',
 );
+const presentationSource = fs.readFileSync(
+  path.join(repoRoot, 'src/renderer/components/Workspace/HistoryTranscriptPresentation.tsx'),
+  'utf8',
+);
 
 /**
  * Collapsing an expanded block from the FOOT of its rail.
@@ -33,9 +37,9 @@ test('the view lands on the block header, not on wherever the click was', () => 
   // disappeared".
   assert.match(footHandler, /data-history-group/, 'must locate the block header');
   assert.match(footHandler, /getBoundingClientRect/, 'header position decides the landing');
-  // Header still visible → nothing moves at all.
-  assert.match(footHandler, /headerOffset !== null && headerOffset < 0/);
-  assert.match(footHandler, /scrollTopBefore \+ headerOffset/);
+  // Only a missing/off-screen header enters the navigation branch. A visible
+  // header receives no post-collapse scroll command.
+  assert.match(footHandler, /headerOffset === null \|\| headerOffset < 0/);
 });
 
 test('a header scrolled out of the virtualized DOM is reached by index', () => {
@@ -47,12 +51,12 @@ test('a header scrolled out of the virtualized DOM is reached by index', () => {
   assert.match(footHandler, /landedHeader\.getBoundingClientRect/);
 });
 
-test('the shrink is held against the TARGET position, not the old one', () => {
-  // The existing tail-reserve machinery arms exactly the pixels the landing
-  // position needs; passing the pre-click scrollTop here would let a block
-  // near the bottom be clamped away from the header.
-  assert.match(footHandler, /holdHistoryShrinkFrame\(scroller, target, historyRevealOps/);
-  assert.match(footHandler, /exactTarget: true/, 'late Virtuoso compensation cannot move the landed header');
+test('the collapse keeps header navigation but creates no empty tail reserve', () => {
+  // The product deliberately accepts the browser's post-collapse scroll
+  // range. If the header cannot physically reach the top without blank space,
+  // it only needs to remain visible; no synthetic Footer is allowed.
+  assert.doesNotMatch(footHandler, /holdHistoryShrinkFrame|armTailReserve|tailSpacer/);
+  assert.doesNotMatch(panelSource, /data-history-tail-spacer|historyTailSpacerRef/);
   // Following must be released BEFORE the resize (same order as every other
   // collapse path), or a stale tail pin rides the shrink to the new bottom.
   const unpin = footHandler.indexOf('unpinTail()');
@@ -64,11 +68,11 @@ test('the foot renders on the LAST member only and adds no height', () => {
   // One control per block, at the end of the rail.
   assert.match(panelSource, /expandedGroup\.last && \(\s*<HistoryGroupFoot/);
   assert.match(panelSource, /expandedSubgroup\.last && \(\s*<HistoryGroupFoot/);
-  assert.match(panelSource, /const HistoryGroupFoot =/);
+  assert.match(presentationSource, /(?:const|function) HistoryGroupFoot/);
   // Absolutely positioned over the rail's own bottom segment: the block's
   // height is unchanged, which is what keeps measured-geometry snapshots and
   // the collapse math honest.
-  const css = panelSource.slice(panelSource.indexOf('.hp-history-group-foot {'));
-  assert.match(css.slice(0, 400), /position: absolute/);
-  assert.match(css.slice(0, 400), /bottom: 0/);
+  const css = panelSource.slice(panelSource.indexOf("/* The rail's FOOT:"));
+  assert.match(css.slice(0, 1000), /position: absolute/);
+  assert.match(css.slice(0, 1000), /bottom: 0/);
 });

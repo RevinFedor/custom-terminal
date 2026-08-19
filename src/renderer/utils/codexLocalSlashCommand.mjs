@@ -1,18 +1,17 @@
-export function normalizeCodexLocalSlashCommand(rawPrompt) {
-  if (typeof rawPrompt !== 'string') return null;
-  const normalized = rawPrompt.trim();
-  if (!normalized || normalized.includes('\n') || normalized.includes('\r')) return null;
-  return /^\/[^\s/]+(?:[ \t].*)?$/.test(normalized) ? normalized : null;
-}
+import {
+  isStandaloneAgentLocalCommand,
+  normalizeAgentLocalCommand,
+  projectAgentLocalCommandSendResult,
+} from './agentLocalCommand.mjs';
+
+export const normalizeCodexLocalSlashCommand = normalizeAgentLocalCommand;
 
 export function isStandaloneCodexLocalSlashCommand({
   prompt,
   imageCount = 0,
   chipCount = 0,
 } = {}) {
-  return Number(imageCount) === 0
-    && Number(chipCount) === 0
-    && normalizeCodexLocalSlashCommand(prompt) !== null;
+  return isStandaloneAgentLocalCommand({ prompt, imageCount, chipCount });
 }
 
 /**
@@ -25,34 +24,12 @@ export function projectCodexLocalSlashSendResult({
   candidate = false,
   result = null,
 } = {}) {
-  if (!candidate || result?.localSlashCommand !== true) {
-    return { handled: false };
+  const projected = projectAgentLocalCommandSendResult({ candidate, result });
+  if (projected.reason === 'agent-local-command-submitted') {
+    return { ...projected, reason: 'codex-local-slash-submitted' };
   }
-  if (result?.submitted !== true) {
-    return {
-      handled: true,
-      transferred: false,
-      requiresAuditIdentity: false,
-      queueStatus: null,
-      deliveryUnconfirmed: false,
-    };
+  if (projected.reason === 'agent-local-command-submit-outcome-unknown') {
+    return { ...projected, reason: 'codex-local-slash-submit-outcome-unknown' };
   }
-  if (result?.success === true) {
-    return {
-      handled: true,
-      transferred: true,
-      requiresAuditIdentity: false,
-      queueStatus: 'sent',
-      deliveryUnconfirmed: false,
-      reason: 'codex-local-slash-submitted',
-    };
-  }
-  return {
-    handled: true,
-    transferred: true,
-    requiresAuditIdentity: false,
-    queueStatus: 'delivery-unknown',
-    deliveryUnconfirmed: true,
-    reason: 'codex-local-slash-submit-outcome-unknown',
-  };
+  return projected;
 }

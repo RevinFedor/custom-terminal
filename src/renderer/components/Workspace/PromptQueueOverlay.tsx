@@ -1449,11 +1449,20 @@ export function PromptQueueOverlay({
       if (replayButton?.contains(target)) return;
       const currentChip = editingId ? chipRefs.current.get(editingId) : null;
       if (currentChip?.contains(target)) return;
+      // Ховер-превью: клики по его строкам и по полоске кнопок — внутри
+      // кластера, они переключают модалку сами и не считаются «снаружи».
+      const previewPanel = queueHoverPreviewPanelRef.current;
+      if (previewPanel?.contains(target)) return;
+      if (previewPanel && railRef.current?.contains(target)) return;
       if (editorPinned && shouldPreservePinnedEditorOnOutsideClick(targetElement)) {
         commitEditor({ close: false });
         return;
       }
       commitEditor();
+      // Клик снаружи закрывает весь кластер целиком: модалку И карточки
+      // превью — «пока я не кликну в каком-то другом месте, чтобы они
+      // закрылись».
+      setQueueHoverPreviewOpen(false);
     };
     window.addEventListener('mousedown', onMouseDown, true);
     return () => window.removeEventListener('mousedown', onMouseDown, true);
@@ -2334,6 +2343,19 @@ export function PromptQueueOverlay({
     setQueueHoverPreviewOpen(false);
   }, [collapsed, items.length]);
 
+  // Превью закрылось (разворот панели, пустая очередь, уход курсора) — модалка,
+  // открытая ИЗ него, не может остаться висеть одна: её якорь-строка исчезла.
+  // Развёрнутая панель не задета: там queueHoverPreviewOpen и так false.
+  const editorOpenRef = useRef(false);
+  editorOpenRef.current = editorOpen;
+  const prevPreviewOpenRef = useRef(false);
+  useEffect(() => {
+    if (prevPreviewOpenRef.current && !queueHoverPreviewOpen && collapsed && editorOpenRef.current) {
+      commitEditor();
+    }
+    prevPreviewOpenRef.current = queueHoverPreviewOpen;
+  }, [collapsed, commitEditor, queueHoverPreviewOpen]);
+
   // Окно живёт, пока курсор внутри своего целого: полоска кнопок, сама панель
   // и всё, что открыто ИЗ неё (список вкладок, меню сообщения, меню действий),
   // плюс зазоры между панелью и этими блоками. Зазор — визуальная деталь; для
@@ -2347,6 +2369,11 @@ export function PromptQueueOverlay({
     if (!queueHoverPreviewOpen) return;
     const onMouseMove = (event: MouseEvent) => {
       if (dragIdRef.current) return;
+      // Клик по строке закрепил модалку: пока она открыта, кластер держится
+      // КЛИКОМ, а не курсором — «могу увести курсор куда угодно». Закрытием
+      // владеет mousedown снаружи (см. outside-обработчик редактора), который
+      // гасит и модалку, и превью одним кликом.
+      if (editorOpen) return;
       const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect() ?? null;
       if (!previewRect) return;
       const satellites: (DOMRect | null)[] = [
@@ -2365,7 +2392,7 @@ export function PromptQueueOverlay({
     };
     window.addEventListener('mousemove', onMouseMove);
     return () => window.removeEventListener('mousemove', onMouseMove);
-  }, [queueHoverPreviewOpen]);
+  }, [editorOpen, queueHoverPreviewOpen]);
 
   useEffect(() => {
     return () => {
@@ -2415,6 +2442,11 @@ export function PromptQueueOverlay({
     && queueHoverPreviewOpen
     && items.length > 0;
   const panelAttached = panelOpen || queueHoverPreviewVisible;
+  // Модалка-редактор существует в ОБОИХ режимах панели: в развёрнутом и в
+  // ховер-превью свёрнутого рейла. Превью — это тот же список сообщений, а не
+  // витрина без действий: клик по строке открывает ту же боковую модалку
+  // (юзер: «я кликаю на строку, у меня появляется сбоку модалка»).
+  const editorSurfaceVisible = (!collapsed && !panelClosing) || queueHoverPreviewVisible;
   const arrowExpanded = !collapsed && !panelClosing;
   const addEditorActive = editorOpen && !isSpecialPromptMode && editingId === null;
   const railRunBg = autoRun
@@ -2971,7 +3003,7 @@ export function PromptQueueOverlay({
                     e.stopPropagation();
                     return;
                   }
-                  if (isMetaAction || queueHoverPreviewVisible) return;
+                  if (isMetaAction) return;
                   openEditor(it.id, 'pin');
                 }}
                 onContextMenu={(e) => openChipContextMenu(it.id, e)}
@@ -3691,7 +3723,7 @@ export function PromptQueueOverlay({
       {/* Expanded chip content is a sibling of the editor, not a child inside
           its title/body column. On normal desktop widths it sits immediately
           to the left; narrow layouts fall back below without covering input. */}
-      {!collapsed && !panelClosing && editorOpen && editorAnchor && hasEditorPreview && (
+      {editorSurfaceVisible && editorOpen && editorAnchor && hasEditorPreview && createPortal(
         <div
           ref={editorPreviewRef}
           className="pq-editor-preview-sibling"
@@ -3752,13 +3784,18 @@ export function PromptQueueOverlay({
               />
             </div>
           ) : null}
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* Editor slideout — docked to the LEFT of the queue panel, no scrim.
           Anchored by editorAnchor: top aligned to chip/list/panel, right edge stays fixed.
           Resize controls only width; height stays content-driven by textarea rows. */}
-      {!collapsed && !panelClosing && editorOpen && editorAnchor && (
+      {/* Модалка порталится в body: внутри окна сплита она сидела бы в его
+          стековом контексте, и DOM-позднее соседнее окно закрывало бы её.
+          Юзер: «менюшка может идти через другие окна и перекрывать окна
+          снизу» — для этого она должна жить выше ВСЕХ окон, как меню. */}
+      {editorSurfaceVisible && editorOpen && editorAnchor && createPortal(
         <div
           ref={editorRef}
           style={{
@@ -4071,7 +4108,8 @@ export function PromptQueueOverlay({
               zIndex: 71,
             }}
           />
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* Pulse animation keyframes + hide number-input spinner.

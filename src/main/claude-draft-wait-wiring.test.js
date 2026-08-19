@@ -15,6 +15,14 @@ const scenarios = fs.readFileSync(
   path.join(root, 'src/renderer/utils/agentScenarios.ts'),
   'utf8',
 );
+const preparation = fs.readFileSync(
+  path.join(root, 'src/renderer/utils/agentSendPreparation.ts'),
+  'utf8',
+);
+const providerContract = fs.readFileSync(
+  path.join(root, 'src/renderer/utils/agentSendProviderContract.ts'),
+  'utf8',
+);
 
 test('Claude startup send waits for a parsed headless composer edge, never a timer success', () => {
   const start = main.indexOf('async function waitForTerminalClaudeDraftState');
@@ -30,11 +38,11 @@ test('Claude startup send waits for a parsed headless composer edge, never a tim
 });
 
 test('one startup Send waits for the gate and re-reads presence before transport', () => {
-  const start = scenarios.indexOf('async function ensureAgentReadyForSend');
-  const end = scenarios.indexOf('export async function rewindAgentTimelineScenario', start);
-  const body = scenarios.slice(start, end);
-  assert.match(body, /presence\?\.status === 'starting'[\s\S]{0,520}await waitStartupDefaultsIfNeeded\(\)/);
-  assert.match(body, /await waitStartupDefaultsIfNeeded\(\);[\s\S]{0,140}presence = await runtime\.getPresence/);
-  assert.match(body, /if \(presence\?\.status === 'busy'\) return 'busy'/);
-  assert.match(body, /if \(isReadyComposer\(\)\) return 'active'/);
+  assert.match(scenarios, /adapter\.ensureReady\(\{/);
+  assert.match(providerContract, /waitForStartupGate:[\s\S]*waitForClaudeStartupDefaultsReadyWithVisibleFallback/);
+  assert.match(providerContract, /startupGateOwnsComposer:\s*\(presence\)\s*=>\s*presence\?\.status === 'starting'/);
+  assert.match(preparation, /if \(providerContract\.startupGateOwnsComposer\(presence\)\)[\s\S]{0,180}await waitStartupGate\(\)/);
+  assert.match(preparation, /await waitStartupGate\(\);[\s\S]{0,180}presence = await runtime\.getPresence/);
+  assert.match(preparation, /if \(submitCapability\(\) === 'queue'\) return resolved\('busy', 'queue'\)/);
+  assert.match(preparation, /if \(submitCapability\(\) === 'direct'\) return resolved\('active', 'direct'\)/);
 });

@@ -2103,13 +2103,11 @@ function Terminal({
 
       fit.fit();
 
-      const dims = fit.proposeDimensions();
-
       const colsAfter = term.cols;
       const rowsAfter = term.rows;
       const dimsChanged = colsBefore !== colsAfter || rowsBefore !== rowsAfter;
 
-      if (dims && dimsChanged) {
+      if (dimsChanged) {
         console.warn(`[safeFit] tabId=${tabId} RESIZED ${colsBefore}x${rowsBefore} → ${colsAfter}x${rowsAfter}, sending resize to PTY`);
         // [FocusDiag2026-05] focus snapshot AFTER fit when dims changed — catches
         // the moment Prompt-queue overlay mount triggers a fit that shrinks the
@@ -2125,8 +2123,12 @@ function Terminal({
         console.warn('[FocusDiag2026-05][safeFit-resize] tab=' + tabId.slice(-12) + ' before=' + focusBefore + ' after=' + focusAfter + ' dims=' + colsBefore + 'x' + rowsBefore + '→' + colsAfter + 'x' + rowsAfter + ' ts=' + Date.now());
         ipcRenderer.send('terminal:resize', {
           tabId,
-          cols: dims.cols,
-          rows: dims.rows,
+          // fit() already measured AND applied this exact snapshot to xterm.
+          // A second proposeDimensions() can observe the post-resize layout
+          // and return a different answer, leaving PTY and canvas wrapped at
+          // different columns.
+          cols: colsAfter,
+          rows: rowsAfter,
           expectedPid: rendererBoundPtyPid.current ?? terminalPidRef.current,
         });
       }

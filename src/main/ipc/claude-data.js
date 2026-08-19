@@ -36,7 +36,10 @@ const {
   promoteQueuedCompactEntry,
 } = require('../claude-compact-queue-projection');
 const { applyHistoryEntryWindow } = require('../history-entry-window');
-const { classifyHistoryAction } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
+const {
+  classifyHistoryAction,
+  historyActionPresentationMeta,
+} = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
 const {
   actionDetailsEnabled,
   copyActionFamily,
@@ -75,35 +78,6 @@ function _endPerfOp(id) {
   if (!id) return;
   const ops = global.__notedPerfOps;
   if (ops && typeof ops.delete === 'function') ops.delete(id);
-}
-
-function shortKnowledgeDocsPath(filePath) {
-  if (!filePath || typeof filePath !== 'string') return null;
-  const normalized = filePath.replace(/\\/g, '/').trim();
-  if (!normalized) return null;
-  const segs = normalized.split('/').filter(Boolean);
-  const baseName = segs[segs.length - 1] || '';
-  const docsIndex = segs.findIndex((seg) => seg.toLowerCase() === 'docs');
-  const lower = normalized.toLowerCase();
-  const semanticIndexSibling = (() => {
-    if (docsIndex < 0 || !path.isAbsolute(normalized)) return false;
-    try {
-      const parent = path.join('/', ...segs.slice(0, docsIndex));
-      return fs.existsSync(path.join(parent, '.semantic-index.json'));
-    } catch {
-      return false;
-    }
-  })();
-  const isDocsPath = docsIndex >= 0 && (
-    !path.isAbsolute(normalized) ||
-    semanticIndexSibling ||
-    lower === 'docs' ||
-    lower.startsWith('docs/') ||
-    lower.includes('/docs/')
-  );
-  const isClaudeMd = baseName === 'CLAUDE.md';
-  if (!isDocsPath && !isClaudeMd) return null;
-  return segs.length >= 2 ? segs.slice(-2).join('/') : segs[0];
 }
 
 // ========== JSONL INCREMENTAL CACHE ==========
@@ -1888,6 +1862,51 @@ function deriveClaudeAsyncAgentStatus(notification) {
   return 'interrupted';
 }
 
+async function getActiveBranchMessages({ sessionId, cwd } = {}) {
+  if (!sessionId) {
+    return { success: false, error: 'sessionId required', messages: [] };
+  }
+  try {
+    const {
+      mergedMap: recordMap,
+      lastRecord,
+      historySources,
+    } = await resolveSessionChain(sessionId, cwd);
+    if (!lastRecord) {
+      return { success: true, messages: [], sessionId };
+    }
+    // Walk newest→oldest with O(1) append, then reverse once. The previous
+    // public SDK path used branch.unshift(record) and synchronously parsed the
+    // whole file for every request; on long sessions that was both O(n²) and a
+    // main-process freeze.
+    const reversed = [];
+    const seen = new Set();
+    let currentUuid = lastRecord.uuid;
+    while (currentUuid && !seen.has(currentUuid)) {
+      seen.add(currentUuid);
+      const record = recordMap.get(currentUuid);
+      if (!record) break;
+      reversed.push(record);
+      currentUuid = record.logicalParentUuid || record.parentUuid;
+    }
+    reversed.reverse();
+    return {
+      success: true,
+      messages: reversed,
+      sessionId,
+      filePath: historySources?.at(-1)?.filePath || null,
+      sourceSnapshots: historySources || [],
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error),
+      messages: [],
+      sessionId,
+    };
+  }
+}
+
 // Programmatic API for handlers below. Populated by register() so that other
 // modules (HTTP routes in main.js, overseer MCP endpoints) can call the SAME
 // implementation that IPC uses, without going through ipcMain.
@@ -1899,6 +1918,8 @@ const _api = {
   appendHistoryContext: null, // ({sessionId?, cwd, prompt, entryUuid?, onBeforeCommit?}) → exact user record without a model turn
   getConfirmedSettings: null, // ({tabId, sessionId?, cwd?}) → active-branch model/effort proof
   getFullHistory: null, // (payload, {sender?}) → main-owned structured History
+  getTimeline: null, // payload → same incremental Claude Timeline projection as IPC
+  getActiveBranchMessages,
   parseClaudeStructuredPatchHunks,
   extractClaudeToolDiffHunks,
   rebuildHistoryPayloadStash,
@@ -3862,7 +3883,7 @@ function register({
   // Get Claude session timeline for navigation
   // Reads JSONL file and returns filtered entries for Timeline component
   // Uses BACKTRACE algorithm to handle Escape/Undo branches correctly
-  ipcMain.handle('claude:get-timeline', async (event, {
+  const getTimeline = async ({
     sessionId,
     cwd,
     source = 'unknown',
@@ -3871,7 +3892,7 @@ function register({
     visible = null,
     instanceId = '',
     ifRevision = null,
-  }) => {
+  } = {}) => {
     const timelineStartedAt = nodePerformance.now();
     const timelineStartAbs = nodePerformance.timeOrigin + timelineStartedAt;
     const shortSession = sessionId ? sessionId.substring(0, 8) : 'none';
@@ -4343,11 +4364,31 @@ function register({
                 if (content.some(c => c && c.type === 'thinking')) responseHasThinking = true;
                 for (const block of content) {
                   if (block.type !== 'tool_use') continue;
-                  if ((block.name === 'Edit' || block.name === 'Write')) {
-                    const fp = block.input?.file_path || '';
-                    const shortName = shortKnowledgeDocsPath(fp);
-                    if (shortName) {
-                      docsEditedSet.add(shortName);
+                  // Timeline must classify the same semantic action as
+                  // History. Claude often writes through Bash (`python`,
+                  // `cat >>`, `sed -i`, `tee`) instead of its native Edit
+                  // tool; checking tool names alone lost the docs pencil even
+                  // though History already rendered the row as Edit.
+                  const editCapableTool = block.name === 'Bash'
+                    || block.name === 'Edit'
+                    || block.name === 'Write'
+                    || block.name === 'MultiEdit'
+                    || block.name === 'Update';
+                  const docsHint = String(
+                    block.input?.file_path
+                    || block.input?.path
+                    || block.input?.command
+                    || '',
+                  );
+                  if (editCapableTool && /(?:^|[\\/])docs[\\/]|\bCLAUDE\.md\b/i.test(docsHint)) {
+                    const actionPresentation = historyActionPresentationMeta({
+                      toolName: block.name,
+                      args: block.input || {},
+                    });
+                    if (actionPresentation.docsKind === 'edit') {
+                      const docsPath = actionPresentation.targetLabel
+                        || actionPresentation.targetKey;
+                      if (docsPath) docsEditedSet.add(docsPath);
                     }
                   }
                   if (block.name === 'mcp__knowledge__docs_search') {
@@ -4490,7 +4531,9 @@ function register({
       _endPerfOp(opId);
       return { success: false, error: error.message };
     }
-  });
+  };
+  _api.getTimeline = getTimeline;
+  ipcMain.handle('claude:get-timeline', (_event, payload = {}) => getTimeline(payload));
 
   // Export Claude session as clean text (with options and backtrace)
   ipcMain.handle('claude:export-clean-session', async (event, {
@@ -6545,6 +6588,23 @@ function getSessionMaterialization(sessionId, cwd) {
       && cached.size === stat.size
       && cached.mtimeMs === stat.mtimeMs
     ) {
+      sessionMaterializationCache.delete(sessionId);
+      sessionMaterializationCache.set(sessionId, cached);
+      return cached.result;
+    }
+    // Once a non-empty conversation has been proven, an mtime-only change at
+    // the same byte size cannot turn it into an empty file. Keep the exact
+    // count from the proven snapshot and refresh the witness in place. An
+    // unmaterialized/metadata-only file still falls through and is re-read,
+    // because a same-size rewrite could legitimately add its first prompt.
+    if (
+      cached
+      && stat
+      && cached.filePath === found.filePath
+      && cached.size === stat.size
+      && cached.result?.timelineCount > 0
+    ) {
+      cached.mtimeMs = stat.mtimeMs;
       sessionMaterializationCache.delete(sessionId);
       sessionMaterializationCache.set(sessionId, cached);
       return cached.result;

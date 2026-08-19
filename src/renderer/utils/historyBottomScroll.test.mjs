@@ -42,14 +42,15 @@ test('history materializes its final transcript row before pixel scrolling', () 
   const frames = createFrameQueue();
   const indexCalls = [];
   const scrollCalls = [];
+  const scroller = {
+    scrollHeight: 900,
+    scrollTo: (options) => scrollCalls.push(options),
+  };
 
   scheduleHistoryBottomScroll({
     virtuoso: { scrollToIndex: (options) => indexCalls.push(options) },
     itemCount: 3,
-    getScroller: () => ({
-      scrollHeight: 900,
-      scrollTo: (options) => scrollCalls.push(options),
-    }),
+    getScroller: () => scroller,
     smooth: true,
     requestFrame: frames.requestFrame,
   });
@@ -89,7 +90,12 @@ test('content growth preserves tail-follow intent until a real user gesture move
   assert.equal(reconcileHistoryTailFollowIntent({
     currentIntent: false,
     physicalPinned: true,
-  }), true, 'manually reaching the tail re-enables follow');
+  }), false, 'layout still sitting on the old bottom cannot undo an explicit unpin');
+  assert.equal(reconcileHistoryTailFollowIntent({
+    currentIntent: false,
+    physicalPinned: true,
+    userReachedBottom: true,
+  }), true, 'a real downward gesture reaching the tail re-enables follow');
 });
 
 test('live tail pin coalesces updates into one direct pixel scroll on one frame', () => {
@@ -143,4 +149,61 @@ test('live tail pin does not schedule when the viewport was not exactly pinned',
 
   assert.equal(scheduler.schedule({ shouldPin: false }), false);
   frames.flush();
+});
+
+test('a pending tail pin stays with the scroller that scheduled it', () => {
+  const frames = createFrameQueue();
+  const writes = [];
+  const scrollerA = {
+    scrollHeight: 1200,
+    scrollTo: (options) => writes.push({ owner: 'A', ...options }),
+  };
+  const scrollerB = {
+    scrollHeight: 2400,
+    scrollTo: (options) => writes.push({ owner: 'B', ...options }),
+  };
+  let currentScroller = scrollerA;
+  const scheduler = createHistoryTailPinScheduler({
+    getScroller: () => currentScroller,
+    requestFrame: frames.requestFrame,
+  });
+
+  scheduler.schedule({ shouldPin: true });
+  currentScroller = scrollerB;
+  frames.flush();
+
+  assert.deepEqual(
+    writes,
+    [],
+    'an operation armed by owner A must be rejected after the mounted scroller becomes B',
+  );
+});
+
+test('the delayed final pixel scroll cannot cross an owner remount', () => {
+  const frames = createFrameQueue();
+  const writes = [];
+  const scrollerA = {
+    scrollHeight: 900,
+    scrollTo: (options) => writes.push({ owner: 'A', ...options }),
+  };
+  const scrollerB = {
+    scrollHeight: 1800,
+    scrollTo: (options) => writes.push({ owner: 'B', ...options }),
+  };
+  let currentScroller = scrollerA;
+
+  scheduleHistoryBottomScroll({
+    virtuoso: { scrollToIndex: () => {} },
+    itemCount: 3,
+    getScroller: () => currentScroller,
+    requestFrame: frames.requestFrame,
+  });
+  currentScroller = scrollerB;
+  frames.flush();
+
+  assert.deepEqual(
+    writes,
+    [],
+    'the second-frame footer correction belongs to A and must not write into B',
+  );
 });

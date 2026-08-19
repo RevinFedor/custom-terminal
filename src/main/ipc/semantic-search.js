@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const readline = require('readline');
 const { performance } = require('perf_hooks');
 
 // ========== GEMINI EMBEDDING PROVIDER ==========
@@ -175,43 +176,40 @@ function blobToEmbedding(blob) {
  * Long responses are split into sub-chunks of MAX_CHUNK_CHARS.
  * Returns array of { text, role, startLine, endLine }.
  */
-function chunkSessionFile(filePath) {
-  let content;
+async function chunkSessionFile(filePath) {
+  const messages = [];
   try {
-    content = fs.readFileSync(filePath, 'utf-8');
+    const input = fs.createReadStream(filePath, { encoding: 'utf8' });
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    let lineNumber = 0;
+    for await (const rawLine of lines) {
+      lineNumber += 1;
+      const line = rawLine.trim();
+      if (!line) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (!entry.message) continue;
+        const role = entry.message.role || entry.role || entry.type;
+        if (role !== 'user' && role !== 'assistant') continue;
+
+        let text = '';
+        const msgContent = entry.message.content;
+        if (typeof msgContent === 'string') {
+          text = msgContent;
+        } else if (Array.isArray(msgContent)) {
+          text = msgContent
+            .filter(b => b.type === 'text')
+            .map(b => b.text)
+            .join('\n');
+        }
+
+        text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+        if (!text) continue;
+        messages.push({ role, text, line: lineNumber, timestamp: entry.timestamp || null });
+      } catch {}
+    }
   } catch {
     return [];
-  }
-
-  const lines = content.split('\n');
-  const messages = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (!entry.message) continue;
-      const role = entry.message.role || entry.role || entry.type;
-      if (role !== 'user' && role !== 'assistant') continue;
-
-      let text = '';
-      const msgContent = entry.message.content;
-      if (typeof msgContent === 'string') {
-        text = msgContent;
-      } else if (Array.isArray(msgContent)) {
-        text = msgContent
-          .filter(b => b.type === 'text')
-          .map(b => b.text)
-          .join('\n');
-      }
-
-      // Strip system reminders from user messages
-      text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
-      if (!text) continue;
-
-      messages.push({ role, text, line: i + 1, timestamp: entry.timestamp || null });
-    } catch {}
   }
 
   // Group into Q+A pairs
@@ -335,12 +333,25 @@ function initSearchTables(db) {
     CREATE TABLE IF NOT EXISTS indexed_files (
       file_path TEXT PRIMARY KEY,
       file_hash TEXT NOT NULL,
+      file_size INTEGER,
+      file_mtime_ms REAL,
       session_id TEXT NOT NULL,
       project_slug TEXT NOT NULL,
       chunk_count INTEGER DEFAULT 0,
       indexed_at INTEGER DEFAULT (strftime('%s', 'now'))
     )
   `);
+  // Existing profiles predate the metadata witness. Add it in place instead
+  // of forcing a semantic-index rebuild merely to change the tracker schema.
+  const indexedFileColumns = new Set(
+    db.prepare('PRAGMA table_info(indexed_files)').all().map((column) => column.name),
+  );
+  if (!indexedFileColumns.has('file_size')) {
+    db.exec('ALTER TABLE indexed_files ADD COLUMN file_size INTEGER');
+  }
+  if (!indexedFileColumns.has('file_mtime_ms')) {
+    db.exec('ALTER TABLE indexed_files ADD COLUMN file_mtime_ms REAL');
+  }
 
   // FTS5 for keyword fallback
   db.exec(`
@@ -431,8 +442,13 @@ function initTabIterationSearchTables(db) {
  * Compute SHA256 hash of a file.
  */
 function fileHash(filePath) {
-  const content = fs.readFileSync(filePath);
-  return crypto.createHash('sha256').update(content).digest('hex');
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const input = fs.createReadStream(filePath);
+    input.on('data', (chunk) => hash.update(chunk));
+    input.on('error', reject);
+    input.on('end', () => resolve(hash.digest('hex')));
+  });
 }
 
 /**
@@ -448,15 +464,38 @@ function isFileIndexed(db, filePath, hash) {
   return !!hasEmbeddings;
 }
 
+function hasIndexedEmbeddings(db, filePath) {
+  return !!db.prepare(
+    'SELECT 1 FROM session_chunks WHERE file_path = ? AND embedding IS NOT NULL LIMIT 1'
+  ).get(filePath);
+}
+
 /**
  * Index a single session JSONL file.
  * Returns { chunked, embedded, skipped } counts.
  */
 async function indexSessionFile(db, filePath, sessionId, projectSlug) {
-  const hash = fileHash(filePath);
+  const stat = fs.statSync(filePath);
+  const indexed = db.prepare(
+    'SELECT file_hash, file_size, file_mtime_ms FROM indexed_files WHERE file_path = ?'
+  ).get(filePath);
+  if (indexed
+    && Number(indexed.file_size) === stat.size
+    && Number(indexed.file_mtime_ms) === stat.mtimeMs
+    && hasIndexedEmbeddings(db, filePath)) {
+    return { chunked: 0, embedded: 0, skipped: true };
+  }
+
+  // Changed/legacy tracker: hash asynchronously so a manual index of a 111MB
+  // session cannot stop the Electron main loop. A matching hash upgrades old
+  // tracker rows with the cheap metadata witness for every later request.
+  const hash = await fileHash(filePath);
 
   // Skip if already indexed with same hash
   if (isFileIndexed(db, filePath, hash)) {
+    db.prepare(
+      'UPDATE indexed_files SET file_size = ?, file_mtime_ms = ? WHERE file_path = ?'
+    ).run(stat.size, stat.mtimeMs, filePath);
     return { chunked: 0, embedded: 0, skipped: true };
   }
 
@@ -469,7 +508,7 @@ async function indexSessionFile(db, filePath, sessionId, projectSlug) {
   db.prepare('DELETE FROM session_chunks WHERE file_path = ?').run(filePath);
 
   // Chunk the file
-  const chunks = chunkSessionFile(filePath);
+  const chunks = await chunkSessionFile(filePath);
   if (chunks.length === 0) {
     return { chunked: 0, embedded: 0, skipped: false };
   }
@@ -514,9 +553,10 @@ async function indexSessionFile(db, filePath, sessionId, projectSlug) {
 
     // Update indexed_files tracker
     db.prepare(`
-      INSERT OR REPLACE INTO indexed_files (file_path, file_hash, session_id, project_slug, chunk_count, indexed_at)
-      VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
-    `).run(filePath, hash, sessionId, projectSlug, chunks.length);
+      INSERT OR REPLACE INTO indexed_files
+        (file_path, file_hash, file_size, file_mtime_ms, session_id, project_slug, chunk_count, indexed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+    `).run(filePath, hash, stat.size, stat.mtimeMs, sessionId, projectSlug, chunks.length);
   });
 
   insertAll();

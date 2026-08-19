@@ -45,6 +45,26 @@ async function buildScenarioBundle() {
             isBusy: state.status === 'busy',
             conversationMaterialized: materialized,
             canResume: materialized,
+            runtimeSnapshot: runtime.toolType === 'codex'
+              ? (options.presenceSessionId || options.sessionId
+                ? {
+                    liveLifecycle: state.status !== 'inactive',
+                    writerConfirmed: state.status !== 'inactive',
+                    provenWriterSessionId: options.presenceSessionId || options.sessionId,
+                    codexCurrentSettingsOwnerId: options.presenceSessionId || options.sessionId,
+                    codexCurrentModel: options.runtimeModel || 'gpt-5.6-sol',
+                    codexCurrentEffort: options.runtimeEffort || 'max',
+                    codexCurrentSettingsProofAt: options.runtimeProofAt || 123,
+                  }
+                : {
+                    liveLifecycle: state.status !== 'inactive',
+                    writerConfirmed: false,
+                    codexProvisionalSettingsOwnerId: 'launch:test-launch',
+                    codexProvisionalModel: 'gpt-5.6-sol',
+                    codexProvisionalEffort: 'max',
+                    codexProvisionalSettingsProofAt: 123,
+                  })
+              : undefined,
           };
         },
         resume: async ({ sessionId }) => {
@@ -66,11 +86,50 @@ async function buildScenarioBundle() {
         stopProcess: async (_tabId, stopOptions) => {
           state.events.push(['stop', stopOptions?.reason || null]);
           if (options.stopFailure) return { success: false, error: 'stop failed' };
+          if (runtime.toolType === 'codex' && stopOptions?.captureCodexRestartSettings) {
+            if (options.stopSettingsProofFailure) {
+              return {
+                success: false,
+                submitted: false,
+                error: 'codex_history_context_settings_proof_unavailable',
+                reason: options.stopSettingsProofFailure,
+              };
+            }
+            const ownerId = options.presenceSessionId || options.sessionId || 'launch:test-launch';
+            const ownerKind = options.presenceSessionId || options.sessionId ? 'writer' : 'launch';
+            const effort = options.stopCapturedEffort || 'max';
+            state.status = 'inactive';
+            return {
+              success: true,
+              restartSettingsProof: {
+                kind: 'codex-stop-captured-settings',
+                model: options.stopCapturedModel || 'gpt-5.6-sol',
+                effort,
+                scope: effort === 'ultra' ? 'conversation-only' : 'persistent-default',
+                owner: { kind: ownerKind, id: ownerId },
+                observedAt: 200,
+                authority: {
+                  lifecycleGeneration: 'lifecycle-test',
+                  runSeq: 1,
+                  inputRevision: 0,
+                  mirrorGeneration: 'mirror-test',
+                  committedFrameGeneration: 1,
+                  writeSeq: 1,
+                },
+              },
+            };
+          }
           state.status = 'inactive';
           return { success: true };
         },
         recordHistoryContext: async (_tabId, prompt, recordOptions) => {
-          state.events.push(['record', prompt, recordOptions.sessionId ?? null]);
+          state.events.push([
+            'record',
+            prompt,
+            recordOptions.sessionId ?? null,
+            recordOptions.model ?? null,
+            recordOptions.effort ?? null,
+          ]);
           if (options.recordFailure) {
             return { success: false, accepted: false, historyOnly: true, error: 'record failed' };
           }
@@ -112,6 +171,15 @@ async function buildScenarioBundle() {
         source: 'history-panel',
         statusAtSend: options.initialStatus || 'active',
         queue: true,
+        settingsIntent: { kind: 'none' },
+        historyRestartSettings: options.historyRestartSettings
+          || (runtime.toolType === 'codex'
+            ? {
+                kind: 'codex-launch-settings',
+                model: 'gpt-5.6-sol',
+                effort: 'max',
+              }
+            : undefined),
         recordWithoutReply: true,
         onRestartPhase: (phase) => state.events.push(['phase', phase]),
       });
@@ -196,7 +264,7 @@ test('record-context stops, writes history, resumes, and never starts a model tu
   assert.equal(result.modelTurnStarted, false);
   assert.equal(result.reopened, true);
   assert.deepEqual(events.filter((event) => event[0] === 'stop'), [['stop', 'record-history-context']]);
-  assert.deepEqual(events.filter((event) => event[0] === 'record'), [['record', 'record-context-prompt', 'saved-session']]);
+  assert.deepEqual(events.filter((event) => event[0] === 'record'), [['record', 'record-context-prompt', 'saved-session', null, null]]);
   assert.deepEqual(events.filter((event) => event[0] === 'resume'), [['resume', 'saved-session']]);
   assert.equal(events.some((event) => event[0] === 'send'), false);
   assert.ok(events.findIndex((event) => event[0] === 'stop') < events.findIndex((event) => event[0] === 'record'));
@@ -207,18 +275,130 @@ test('sessionless Codex materializes through provider history then resumes that 
   const { events } = await bundle.runRecordContext({
     initialStatus: 'active', toolType: 'codex', sessionId: null, recordedSessionId: 'codex-created',
   });
-  assert.deepEqual(events.filter((event) => event[0] === 'record'), [['record', 'record-context-prompt', null]]);
+  assert.deepEqual(events.filter((event) => event[0] === 'record'), [[
+    'record', 'record-context-prompt', null, 'gpt-5.6-sol', 'max',
+  ]]);
   assert.deepEqual(events.filter((event) => event[0] === 'bindCodex'), [['bindCodex', 'codex-created']]);
   assert.deepEqual(events.filter((event) => event[0] === 'resume'), [['resume', 'codex-created']]);
   assert.equal(events.some((event) => event[0] === 'startFresh'), false);
   assert.equal(events.some((event) => event[0] === 'send'), false);
 });
 
+test('live Codex restart settings come from the same main-owned runtime proof before Stop', async () => {
+  const { events } = await bundle.runRecordContext({
+    initialStatus: 'active',
+    toolType: 'codex',
+    sessionId: 'writer-a',
+    historyRestartSettings: {
+      kind: 'codex-runtime-proof',
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      owner: { kind: 'writer', id: 'writer-a' },
+      proofAt: 123,
+    },
+  });
+  assert.deepEqual(events.filter((event) => event[0] === 'record'), [[
+    'record', 'record-context-prompt', 'writer-a', 'gpt-5.6-sol', 'max',
+  ]]);
+  assert.ok(events.findIndex((event) => event[0] === 'stop')
+    < events.findIndex((event) => event[0] === 'record'));
+});
+
+test('main-captured settings outrank a stale renderer restart hint', async () => {
+  const { result, events } = await bundle.runRecordContext({
+    initialStatus: 'active',
+    toolType: 'codex',
+    sessionId: 'writer-a',
+    historyRestartSettings: {
+      kind: 'codex-runtime-proof',
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      owner: { kind: 'writer', id: 'writer-b' },
+      proofAt: 123,
+    },
+  });
+  assert.equal(result.success, true);
+  assert.deepEqual(events.filter((event) => event[0] === 'record'), [[
+    'record', 'record-context-prompt', 'writer-a', 'gpt-5.6-sol', 'max',
+  ]]);
+});
+
+test('conversation-only Ultra keeps record-without-reply available without comparing persistent effort', async () => {
+  const { result, events } = await bundle.runRecordContext({
+    initialStatus: 'active',
+    toolType: 'codex',
+    sessionId: 'writer-a',
+    stopCapturedEffort: 'ultra',
+    historyRestartSettings: {
+      kind: 'codex-settings-unavailable',
+      reason: 'live-proof-required',
+    },
+  });
+  assert.equal(result.success, true);
+  assert.deepEqual(events.filter((event) => event[0] === 'record'), [[
+    'record', 'record-context-prompt', 'writer-a', 'gpt-5.6-sol', 'ultra',
+  ]]);
+});
+
+test('proofAt is not compared across renderer and main clocks when pair and owner match', async () => {
+  const { result, events } = await bundle.runRecordContext({
+    initialStatus: 'active',
+    toolType: 'codex',
+    sessionId: 'writer-a',
+    runtimeProofAt: 5000,
+    historyRestartSettings: {
+      kind: 'codex-runtime-proof',
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      owner: { kind: 'writer', id: 'writer-a' },
+      proofAt: 7000,
+    },
+  });
+  assert.equal(result.success, true);
+  assert.deepEqual(events.filter((event) => event[0] === 'record'), [[
+    'record', 'record-context-prompt', 'writer-a', 'gpt-5.6-sol', 'max',
+  ]]);
+});
+
+test('unavailable committed footer returns structured failure and preserves the live process', async () => {
+  const { result, events } = await bundle.runRecordContext({
+    initialStatus: 'active',
+    toolType: 'codex',
+    sessionId: 'writer-a',
+    stopSettingsProofFailure: 'committed-headless-frame-unavailable',
+  });
+  assert.equal(result.code, 'codex_history_context_settings_required');
+  assert.equal(result.reason, 'committed-headless-frame-unavailable');
+  assert.equal(result.submitted, false);
+  assert.equal(events.some((event) => event[0] === 'record'), false);
+  assert.equal(events.some((event) => event[0] === 'resume'), false);
+});
+
+test('stopped Codex settings gap is structured and does not Stop, write, or Resume', async () => {
+  for (const reason of ['pair-missing', 'model-migration-pending']) {
+    const { result, events } = await bundle.runRecordContext({
+      initialStatus: 'inactive',
+      toolType: 'codex',
+      sessionId: 'writer-a',
+      historyRestartSettings: {
+        kind: 'codex-settings-unavailable',
+        reason,
+      },
+    });
+    assert.equal(result.submitted, false);
+    assert.equal(result.code, 'codex_history_context_settings_required');
+    assert.equal(result.reason, reason);
+    assert.equal(events.some((event) => event[0] === 'stop'), false);
+    assert.equal(events.some((event) => event[0] === 'record'), false);
+    assert.equal(events.some((event) => event[0] === 'resume'), false);
+  }
+});
+
 test('technical Claude UUID without conversation is not reused as a false Resume source', async () => {
   const { events } = await bundle.runRecordContext({
     initialStatus: 'active', sessionId: 'technical-id', conversationMaterialized: false, recordedSessionId: 'claude-created',
   });
-  assert.deepEqual(events.filter((event) => event[0] === 'record'), [['record', 'record-context-prompt', null]]);
+  assert.deepEqual(events.filter((event) => event[0] === 'record'), [['record', 'record-context-prompt', null, null, null]]);
   assert.deepEqual(events.filter((event) => event[0] === 'resume'), [['resume', 'claude-created']]);
 });
 

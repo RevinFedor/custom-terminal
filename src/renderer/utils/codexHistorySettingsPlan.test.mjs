@@ -5,6 +5,7 @@ import {
   codexSettingsProofMatchesRuntimeOwner,
   isCompleteCodexSettingsRequest,
   planCodexHistorySettings,
+  resolveCodexHistoryRestartSettingsState,
   resolveCodexSettingsRuntimeProof,
 } from './codexHistorySettingsPlan.mjs';
 
@@ -256,6 +257,83 @@ test('busy prompt without settings remains eligible for the normal queue flow', 
   });
 });
 
+test('ordinary History prompt never turns ambient settings into a mutation request', () => {
+  assert.equal(resolveCodexHistoryRestartSettingsState({
+    recordWithoutReply: false,
+    mutationProof: {
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+      sessionId: 'writer-a',
+      proofAt: 1,
+    },
+    launchSettings: {
+      model: 'gpt-5.6-sol',
+      effort: 'low',
+    },
+  }), null);
+});
+
+test('record-without-reply requires main pre-Stop capture for conversation-only Ultra', () => {
+  assert.deepEqual(resolveCodexHistoryRestartSettingsState({
+    recordWithoutReply: true,
+    mutationProof: {
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+      sessionId: 'writer-a',
+      proofAt: 1,
+    },
+    launchSettings: {
+      model: 'gpt-5.6-luna',
+      effort: 'medium',
+    },
+  }), {
+    source: 'unavailable',
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+    reason: 'live-proof-required',
+  });
+});
+
+test('record-without-reply keeps a durable non-Ultra writer hint distinct from launch settings', () => {
+  assert.deepEqual(resolveCodexHistoryRestartSettingsState({
+    recordWithoutReply: true,
+    mutationProof: {
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      sessionId: 'writer-a',
+      proofAt: 1,
+    },
+    launchSettings: {
+      model: 'gpt-5.6-luna',
+      effort: 'medium',
+    },
+  }), {
+    source: 'exact-session-proof',
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    ownerKind: 'writer',
+    ownerId: 'writer-a',
+    proofAt: 1,
+  });
+});
+
+test('model migration and missing pair remain explicit unavailable states', () => {
+  assert.deepEqual(resolveCodexHistoryRestartSettingsState({
+    recordWithoutReply: true,
+    launchSettings: { modelMigrationPending: true },
+  }), {
+    source: 'unavailable',
+    reason: 'model-migration-pending',
+  });
+  assert.deepEqual(resolveCodexHistoryRestartSettingsState({
+    recordWithoutReply: true,
+    launchSettings: {},
+  }), {
+    source: 'unavailable',
+    reason: 'pair-missing',
+  });
+});
+
 test('partial request fails closed when the inherited effective value is unknown', () => {
   const missingEffort = planCodexHistorySettings({
     requestedModel: 'gpt-5.6-sol',
@@ -292,6 +370,8 @@ test('runtime proof resolver accepts only the explicitly confirmed live writer',
     currentSettingsOwnerId: '',
     currentSettingsModel: '',
     currentSettingsEffort: '',
+    currentSettingsProofAt: 0,
+    currentSettingsOwnerKind: '',
     confirmedWriterSettingsProven: false,
     provisionalSettingsProven: false,
   });
@@ -305,6 +385,8 @@ test('runtime proof resolver accepts only the explicitly confirmed live writer',
     currentSettingsOwnerId: '',
     currentSettingsModel: '',
     currentSettingsEffort: '',
+    currentSettingsProofAt: 0,
+    currentSettingsOwnerKind: '',
     confirmedWriterSettingsProven: false,
     provisionalSettingsProven: false,
   });
@@ -314,6 +396,8 @@ test('runtime proof resolver accepts only the explicitly confirmed live writer',
     currentSettingsOwnerId: '',
     currentSettingsModel: '',
     currentSettingsEffort: '',
+    currentSettingsProofAt: 0,
+    currentSettingsOwnerKind: '',
     confirmedWriterSettingsProven: false,
     provisionalSettingsProven: false,
   });

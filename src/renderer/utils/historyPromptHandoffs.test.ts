@@ -1006,6 +1006,30 @@ test('external send publishes History handoff before transport and settles the s
   ]);
 });
 
+test('external Claude/Codex local command settles without a conversation audit identity', async () => {
+  for (const toolType of ['claude', 'codex'] as const) {
+    const store = new HistoryPromptHandoffStore(limits());
+    await runHistoryPromptHandoff({
+      tabId: 'tab-' + toolType,
+      handoffId: 'local-' + toolType,
+      toolType,
+      text: '/status',
+      source: 'project-api',
+      statusAtSend: 'active',
+      send: async () => ({
+        success: true,
+        submitted: true,
+        localSlashCommand: true,
+      }),
+    }, store);
+    const handoff = store.getSnapshot('tab-' + toolType)[0];
+    assert.equal(handoff?.queueStatus, 'sent');
+    assert.equal(handoff?.requiresAuditIdentity, false);
+    assert.equal(handoff?.auditProof, null);
+    assert.equal(handoff?.statusReason, 'agent-local-command-submitted');
+  }
+});
+
 test('post-Enter receipts remain visibly unconfirmed instead of becoming SENT', async () => {
   const store = new HistoryPromptHandoffStore(limits());
 
@@ -1154,7 +1178,7 @@ test('manual History and Run After share the receipt presentation mapping', () =
   );
   assert.match(
     historyPanelSource,
-    /projectCodexLocalSlashSendResult\(\{/,
+    /projectAgentLocalCommandSendResult\(\{/,
   );
   assert.match(
     historyPanelSource,
@@ -1174,11 +1198,11 @@ test('manual History and Run After share the receipt presentation mapping', () =
   );
   assert.match(
     queueRunnerSource,
-    /const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult\(res\)/,
+    /const unconfirmedStatus = localCommandReceipt\.handled[\s\S]{0,260}historyPromptHandoffUnconfirmedStatusFromSendResult\(res\)/,
   );
   assert.match(
     queueRunnerSource,
-    /const providerQueueReturned = historyPromptAuditIsProviderQueueReturn\([\s\S]{0,100}res\?\.pasteAudit \|\| res/,
+    /const providerQueueReturned = !localCommandReceipt\.handled[\s\S]{0,120}historyPromptAuditIsProviderQueueReturn\(res\?\.pasteAudit \|\| res/,
   );
   assert.match(
     queueRunnerSource,

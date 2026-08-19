@@ -6,6 +6,48 @@ const test = require('node:test');
 
 const { SessionTranscriptService } = require('./session-transcript-service');
 
+test('Claude Timeline delegates to the shared incremental projection API', async () => {
+  let incrementalCalls = 0;
+  let legacyFullParses = 0;
+  const claudeData = {
+    findSessionFile: () => ({ filePath: '/tmp/legacy-should-not-be-read.jsonl' }),
+    parseTimelineEntries: () => {
+      legacyFullParses += 1;
+      return [];
+    },
+    _api: {
+      getTimeline: async (payload) => {
+        incrementalCalls += 1;
+        return {
+          success: true,
+          entries: [{ uuid: 'u1', type: 'user', content: 'hello' }],
+          sessionId: payload.sessionId,
+          filePath: '/tmp/incremental.jsonl',
+          revision: { token: 'r1' },
+        };
+      },
+    },
+  };
+  const service = new SessionTranscriptService({
+    getMainWindow: () => null,
+    webBroadcast: null,
+    claudeData,
+    codexData: null,
+  });
+
+  const result = await service.getTimeline({
+    toolType: 'claude',
+    sessionId: 'session-claude',
+    cwd: '/tmp',
+    tabId: 'tab-claude',
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.entries.length, 1);
+  assert.equal(incrementalCalls, 1);
+  assert.equal(legacyFullParses, 0, 'the service must not call synchronous parseTimelineEntries');
+});
+
 // getHistory routing around the file-cursor projector:
 // - dehydrate consumers (desktop panel) go through projectCodexFullHistoryFromFile
 //   and never call loadSessionRecords;

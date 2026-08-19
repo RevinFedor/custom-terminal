@@ -50,10 +50,12 @@ import {
   paneIndexHoldingTab,
   reprojectPaneTabs,
   insertIntoStrip,
+  replaceInStrip,
   removeFromStrip,
   arrangePanes,
   swapPanes,
   allPaneTabIds,
+  collapseLonePane,
 } from '../utils/splitPanesModel.mjs';
 import {
   addSpace,
@@ -2255,10 +2257,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({
       spaces: saved,
       activeSpaceId: res.activeSpaceId,
-      // Новое пространство ПУСТОЕ: ни окон, ни вкладок. Указатели проектов
-      // остаются на месте — пустое окно всё равно должно предлагать запуск
-      // где-то, а не в никуда.
-      splitPanes: [],
+      // Новое пространство — ОДНО ПУСТОЕ ОКНО, а не «окон нет».
+      //
+      // Разница видна сразу: «окон нет» в этом приложении означает одиночный
+      // режим, а он всегда показывает вкладку центра — ту самую, на которой
+      // человек стоял. Со стороны это читается как «моя вкладка переехала в
+      // новое пространство», хотя переезжать ей туда незачем: пространство
+      // создают, чтобы разложить вкладки самому. Юзер: *«мы создали новое
+      // пространство, я потом буду туда по отдельности тыкать какие-то
+      // вкладки… у меня будет пустое окно»*.
+      //
+      // Пустое окно — уже существующее состояние с кнопками запуска и двойным
+      // кликом, поэтому новых экранов не появляется. Как только в него кладут
+      // вкладку, раскладка сама схлопывается в одиночный режим
+      // (resolveSplitActivation): одно окно с вкладкой и есть одиночный режим.
+      //
+      // Указатели проектов остаются на месте — пустому окну надо знать, где
+      // запускать.
+      splitPanes: [{ projectId: '', tabId: '' }],
       splitFocusedIndex: 0,
       splitSizes: null,
       centerStrips: {},
@@ -2452,6 +2468,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const st = get();
     const res = addTabToPane(st.splitPanes, paneIndex, projectId, tabId);
     if (!res) return;
+    // Одно окно с вкладкой — это одиночный режим. Случай приходит из нового
+    // рабочего пространства: оно открывается одним ПУСТЫМ окном, и вкладка,
+    // положенная сюда из меню окон, его заполняет. Правило общее — оно же
+    // работает при активации и при удалении окон.
+    if (collapseLonePane(res.panes)) {
+      set({ splitPanes: [], splitFocusedIndex: 0, splitSizes: null });
+      get().activateCenterTab(projectId, tabId);
+      get().saveSession();
+      return;
+    }
     set({ splitPanes: res.panes });
     console.log('[Split] stripAdd pane=' + paneIndex
       + ' tab=' + String(tabId).slice(-12)
@@ -4360,7 +4386,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           const key = get().activeProjectId || projectId;
           const strip = get().centerStrips[key];
           if (strip && strip.length > 0) {
-            const next = insertIntoStrip(strip, projectId, tabId);
+            // ЗАМЕНА показанного чипа, не добавление в конец — то же правило,
+            // что у окон в разделённом виде (resolveSplitActivation): обычный
+            // клик МЕНЯЕТ текущее окно, в конец кладут явные жесты (двойной
+            // клик, «Move to window»), а новое окно открывает ⌘-клик.
+            const shownBefore = key === projectId
+              ? prevActiveId
+              : (openProjects.get(key)?.activeTabId ?? null);
+            const next = replaceInStrip(strip, shownBefore || '', projectId, tabId);
             if (next !== strip) set({ centerStrips: { ...get().centerStrips, [key]: next } });
           }
         }

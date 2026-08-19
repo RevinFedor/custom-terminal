@@ -2,10 +2,15 @@ import { useEffect } from 'react';
 import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, hasRuntimeWorkflowArm, isLoopPromptActive, isPromptQueueEditorLocked, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queueSendTransferredOwnership, subscribePromptQueueEditorLocks, subscribePromptQueueHydration, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { terminalRegistry } from '../utils/terminalRegistry';
 import { isNaturalAgentTurnEndReason, isRecoverableAgentTurnInterruption } from '../utils/agentCompletionOutcome.mjs';
 import { choosePromptQueueContinuationForOutcome, isWorkflowOutcomeAtOrAfterArm, planWorkflowReconciliation } from '../utils/promptQueueReconciliation.mjs';
 import { getHistoryAgentRuntime } from '../utils/historyAgentRuntimes';
+import { sendAgentPromptScenario } from '../utils/agentScenarios';
+import { AGENT_SETTINGS_INTENT_NONE } from '../utils/agentSendSettingsContract';
+import {
+  isStandaloneAgentLocalCommand,
+  projectAgentLocalCommandSendResult,
+} from '../utils/agentLocalCommand.mjs';
 import { getClaudeStartupDefaultsGateSnapshot } from '../utils/claudeStartupDefaultsGate';
 import { serializeComposerDraft } from '../utils/composerChips.mjs';
 import { getFirstDelayRemainingMs, MAX_BROWSER_TIMEOUT_MS } from '../utils/promptQueueDelay';
@@ -171,6 +176,7 @@ function sendQueueCommand(
     };
   },
   source: 'prompt-queue' | 'prompt-loop' = 'prompt-queue',
+  statusAtSend: string = 'active',
 ): Promise<unknown> {
   const agent = getPromptQueueAgent(tabId);
   if (!agent) {
@@ -180,26 +186,22 @@ function sendQueueCommand(
       error: 'provider_owner_unknown',
     });
   }
-  const channel = agent === 'codex' ? 'codex:send-command' : 'claude:send-command';
-  const isSlashCommand = String(payload || '').trimStart().startsWith('/');
-  const options = {
-    source,
-    awaitUserMessageAudit: agent === 'claude' && !isSlashCommand,
+  const runtime = getHistoryAgentRuntime(agent);
+  return sendAgentPromptScenario({
+    tabId,
+    toolType: agent,
+    runtime,
+    sessionId: getPromptQueueSessionId(tabId, agent),
+    cwd: getTabCwd(tabId),
+    prompt: payload,
     handoffId: handoff.handoffId,
-    statusAtSend: 'active',
+    source,
+    statusAtSend,
+    queue: statusAtSend === 'busy',
+    settingsIntent: AGENT_SETTINGS_INTENT_NONE,
+    returnDraftOnConflict: false,
     presentationSnapshot: handoff.presentationSnapshot,
-  };
-  const term = terminalRegistry.get(tabId);
-  const before = typeof document !== 'undefined' ? document.activeElement?.tagName?.toLowerCase() || '-' : '-';
-  try { term?.focus(); } catch {}
-  const after = typeof document !== 'undefined' ? document.activeElement?.tagName?.toLowerCase() || '-' : '-';
-  console.log('[PromptQueueRunner] focus before send tab=' + tabId.slice(-8) + ' agent=' + agent + ' hadTerm=' + !!term + ' active=' + before + '→' + after + ' slash=' + isSlashCommand + ' awaitAudit=' + options.awaitUserMessageAudit);
-  if (typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => {
-      try { terminalRegistry.get(tabId)?.focus(); } catch {}
-    });
-  }
-  return ipcRenderer.invoke(channel, tabId, payload, options);
+  });
 }
 
 type EffectiveTriggerOptions = { clearStaleTarget?: boolean };
@@ -366,14 +368,6 @@ type DeferredOwnerSend = {
 // result separate from `queueAwaitingBusyStart` (which means Enter was already
 // accepted) and retry exactly once when the owner's TUI becomes input-ready.
 const deferredOwnerSends = new Map<string, DeferredOwnerSend>();
-// Launch-if-needed bookkeeping: one launch initiation per queue head. The
-// runner and direct History Enter share one product operation — "deliver the
-// prompt" — so an inactive owner is started/resumed through the same runtime
-// launch boundary History uses, then the send stays deferred until the
-// authoritative tui-ready retries it. Without this the queue waits forever
-// for a readiness signal nothing will ever produce (the proven Run After
-// entry-point gap).
-const queueOwnerLaunchInitiated = new Map<string, { headId: string; at: number }>();
 const claudeQueueStartupPending = new Set<string>();
 const queueReadinessWakePending = new Map<string, string>();
 let queueSendAttemptSequence = 0;
@@ -460,9 +454,6 @@ async function readQueueOwnerReadiness(ownerTabId: string): Promise<{
 
 function clearDeferredOwnerSend(ownerTabId: string, reason: string): void {
   queueReadinessWakePending.delete(ownerTabId);
-  // Launch bookkeeping follows the deferred intent: once the deferred send is
-  // gone (committed, disarmed, stale) the next queue head may launch again.
-  queueOwnerLaunchInitiated.delete(ownerTabId);
   if (!deferredOwnerSends.delete(ownerTabId)) return;
   console.log('[PromptQueueRunner] deferred owner cleared owner=' + ownerTabId.slice(-8) + ' reason=' + reason);
   signalContinuationRelease(ownerTabId, 'deferred-cleared:' + reason);
@@ -770,86 +761,15 @@ function beginValidatedQueueSend(
       clearDeferredOwnerAttempt(ownerTabId, attempt, 'readiness-became-stale');
       return;
     }
-    if (!readiness.ready) {
-      // Launch-if-needed: an INACTIVE owner will never emit the readiness
-      // signal this deferred send waits for. Run After is the same product
-      // operation as Enter on a stopped tab, so initiate Start/Resume through
-      // the shared runtime launch boundary and keep the send deferred until
-      // authoritative tui-ready retries it. One initiation per queue head —
-      // a failed/blocked launch must not loop.
-      if (readiness.status === 'inactive') {
-        const initiated = queueOwnerLaunchInitiated.get(ownerTabId);
-        if (initiated?.headId !== head.id) {
-          queueOwnerLaunchInitiated.set(ownerTabId, { headId: head.id, at: Date.now() });
-          const agent = getPromptQueueAgent(ownerTabId);
-          if (!agent) {
-            queueOwnerLaunchInitiated.delete(ownerTabId);
-            clearDeferredOwnerAttempt(ownerTabId, attempt, 'provider-owner-unknown');
-            return;
-          }
-          const runtime = getHistoryAgentRuntime(agent);
-          const ownerSessionId = getPromptQueueSessionId(ownerTabId, agent);
-          const ownerCwd = getTabCwd(ownerTabId);
-          console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
-            + ' inactive → LAUNCH_FOR_QUEUE agent=' + agent
-            + ' mode=' + (ownerSessionId ? 'resume' : 'start-fresh')
-            + ' session=' + (ownerSessionId ? ownerSessionId.slice(0, 8) : 'none'));
-          let launchFailure: string | null = null;
-          try {
-            const launch = ownerSessionId
-              ? await runtime.resume({ tabId: ownerTabId, sessionId: ownerSessionId, cwd: ownerCwd })
-              : runtime.startFresh
-                ? await runtime.startFresh({ tabId: ownerTabId, cwd: ownerCwd })
-                : { success: false, error: 'cannot start fresh' };
-            if (launch?.success === false) {
-              launchFailure = String(launch?.error || 'unknown');
-            }
-          } catch (error: any) {
-            launchFailure = String(error?.message || error);
-          }
-          if (launchFailure) {
-            // A refusal can be benign: a concurrent launch (History Enter,
-            // auto-resume) may own the shell right now, in which case the
-            // readiness event WILL arrive and the deferred send must stay.
-            // Re-probe presence and only treat proven-still-inactive as the
-            // terminal outcome; that one follows the DISARM contract —
-            // waiting silently for a readiness signal nothing will produce
-            // is the exact stall this feature closes.
-            const recheck = await readQueueOwnerReadiness(ownerTabId);
-            if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
-              // A newer arm/head owns the queue now; the stale failure must
-              // not disarm it. Its own launch path re-runs from scratch.
-              clearDeferredOwnerAttempt(ownerTabId, attempt, 'launch-failure-became-stale');
-              return;
-            }
-            if (recheck.status === 'inactive') {
-              console.warn('[PromptQueueRunner] ' + label + ' launch-for-queue failed owner=' + ownerTabId.slice(-8)
-                + ' error=' + launchFailure + ' recheck=inactive → DISARM');
-              clearDeferredOwnerAttempt(ownerTabId, attempt, 'launch-for-queue-failed');
-              const store = usePromptQueueStore.getState();
-              if (kind === 'loop') store.setLoopPromptEnabled(ownerTabId, false);
-              else {
-                store.setAutoRun(ownerTabId, false);
-                store.setStopAfter(ownerTabId, false);
-              }
-              useUIStore.getState().showToast(
-                'Run after остановлен: не удалось запустить агента (' + launchFailure + ')',
-                'error',
-                5000,
-                false,
-                undefined,
-                undefined,
-                undefined,
-                ownerTabId,
-              );
-              return;
-            }
-            console.warn('[PromptQueueRunner] ' + label + ' launch-for-queue refused owner=' + ownerTabId.slice(-8)
-              + ' error=' + launchFailure + ' recheck=' + recheck.status
-              + ' → keep deferred (concurrent launch owns readiness)');
-          }
-        }
-      }
+    const scenarioStatusAtSend = ['active', 'busy', 'inactive', 'starting', 'stopping', 'unknown']
+      .includes(readiness.status)
+      ? readiness.status
+      : 'starting';
+    const scenarioCanPrepare = scenarioStatusAtSend === 'active'
+      || scenarioStatusAtSend === 'inactive'
+      || scenarioStatusAtSend === 'starting'
+      || readiness.reason.startsWith('claude-startup-defaults-');
+    if (!readiness.ready && !scenarioCanPrepare) {
       console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
         + ' trigger=' + triggerTabId.slice(-8)
         + ' → WAIT owner readiness status=' + readiness.status
@@ -857,7 +777,6 @@ function beginValidatedQueueSend(
         + ' reason=' + readiness.reason);
       return;
     }
-    queueOwnerLaunchInitiated.delete(ownerTabId);
 
     const validation = kind === 'loop'
       ? { ready: true, state: 'ready' as const, item: head }
@@ -945,6 +864,11 @@ function beginValidatedQueueSend(
     attemptedHandoffId = handoffId;
     const sessionIdHint = getPromptQueueSessionId(ownerTabId, agent);
     const beforeCount = countEnabledQueuedPrompts(latestQueue.items);
+    const localCommandCandidate = isStandaloneAgentLocalCommand({
+      prompt: payload,
+      imageCount: validation.item.imagePaths?.length || 0,
+      chipCount: promptChips.length,
+    });
     if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
       queueAwaitingBusyStart.delete(ownerTabId);
       clearDeferredOwnerAttempt(ownerTabId, attempt, 'send-boundary-became-stale');
@@ -970,8 +894,8 @@ function beginValidatedQueueSend(
       imagePaths: validation.item.imagePaths || [],
       submittedAt: Date.now(),
       source: kind === 'loop' ? 'prompt-loop' : 'prompt-queue',
-      statusAtSend: 'active',
-      requiresAuditIdentity: true,
+      statusAtSend: scenarioStatusAtSend,
+      requiresAuditIdentity: !localCommandCandidate,
     });
     const res: any = await sendQueueCommand(ownerTabId, payload, {
       handoffId,
@@ -983,14 +907,21 @@ function beginValidatedQueueSend(
           ? { semanticTags: [{ kind: 'prompt-origin' as const, source: 'loop' as const }] }
           : {}),
       },
-    }, kind === 'loop' ? 'prompt-loop' : 'prompt-queue');
+    }, kind === 'loop' ? 'prompt-loop' : 'prompt-queue', scenarioStatusAtSend);
     if (promptQueueReceiptReplayNeedsNoBusyStart(res)) {
       queueAwaitingBusyStart.delete(ownerTabId);
       console.log('[PromptQueueRunner] ' + label + ' durable replay owner='
         + ownerTabId.slice(-8) + ' handoff=' + handoffId + ' state=' + res.status
         + ' → no new busy edge expected');
     }
-    if (!queueSendTransferredOwnership(res)) {
+    const localCommandReceipt = projectAgentLocalCommandSendResult({
+      candidate: localCommandCandidate,
+      result: res,
+    });
+    const ownershipTransferred = localCommandReceipt.handled
+      ? localCommandReceipt.transferred === true
+      : queueSendTransferredOwnership(res);
+    if (!ownershipTransferred) {
       queueAwaitingBusyStart.delete(ownerTabId);
       if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
         retractHistoryPromptHandoff(ownerTabId, handoffId, 'send-response-became-stale');
@@ -1020,23 +951,30 @@ function beginValidatedQueueSend(
       console.error('[PromptQueueRunner] ' + label + ' send refused owner=' + ownerTabId, res?.error);
       return;
     }
-    const auditProof = historyPromptHandoffAuditProofFromSendResult(res);
-    const unconfirmedStatus = historyPromptHandoffUnconfirmedStatusFromSendResult(res);
-    const providerQueueReturned = historyPromptAuditIsProviderQueueReturn(
-      res?.pasteAudit || res,
-    );
+    const auditProof = localCommandReceipt.handled
+      ? null
+      : historyPromptHandoffAuditProofFromSendResult(res);
+    const unconfirmedStatus = localCommandReceipt.handled
+      ? (localCommandReceipt.queueStatus === 'delivery-unknown' ? 'delivery-unknown' : null)
+      : historyPromptHandoffUnconfirmedStatusFromSendResult(res);
+    const providerQueueReturned = !localCommandReceipt.handled
+      && historyPromptAuditIsProviderQueueReturn(res?.pasteAudit || res);
     const finalAuditFailure = res?.success === false
       && res?.submitted === true
       && !unconfirmedStatus
       && !providerQueueReturned;
     settleHistoryPromptHandoff(ownerTabId, handoffId, {
-      queueStatus: providerQueueReturned
+      queueStatus: localCommandReceipt.handled
+        ? localCommandReceipt.queueStatus
+        : providerQueueReturned
         ? 'cancelled'
         : finalAuditFailure
         ? 'failed'
         : unconfirmedStatus
           || (res?.queued === true ? 'queued' : 'sent'),
-      reason: providerQueueReturned
+      reason: localCommandReceipt.handled
+        ? localCommandReceipt.reason || 'agent-local-command-result'
+        : providerQueueReturned
         ? 'provider-queue-returned-to-terminal-composer'
         : finalAuditFailure
         ? 'send-submitted-audit-failed'
@@ -1049,7 +987,7 @@ function beginValidatedQueueSend(
       // Enter transfers delivery ownership, so the queue item is committed,
       // but text/time similarity is never allowed to impersonate audit proof.
       // A slow Codex rollout settles this same handoff over the late-audit IPC.
-      requiresAuditIdentity: true,
+      requiresAuditIdentity: !localCommandReceipt.handled,
     });
     if (res && res.success === false && res.submitted === true) {
       console.warn('[PromptQueueRunner] ' + label + ' submitted but audit unverified owner=' + ownerTabId.slice(-8)

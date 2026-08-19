@@ -167,6 +167,7 @@ import {
   reconcileHistoryTailFollowIntent,
   scheduleHistoryBottomScroll,
 } from '../../utils/historyBottomScroll.mjs';
+import { createHistoryScrollSeekController } from '../../utils/historyScrollSeek.mjs';
 import { flushHistoryDurableWithRetry } from '../../utils/historyDurableFlush.mjs';
 import {
   applyHistoryLiveToolResultsToEntry,
@@ -190,13 +191,11 @@ import {
   resolveHistoryDisplayTarget,
 } from '../../utils/historyDisplayUnits.mjs';
 import {
-  createHistoryTailSpacer,
   historyContentDistanceFromBottom,
-  historyTailReserveDeficitAfterShrink,
-  historyTailReserveGrowthBurn,
   isHistoryAtContentBottom,
-  isUserOwnedScrollBurn,
-} from '../../utils/historyTailSpacer.mjs';
+} from '../../utils/historyBottomGeometry.mjs';
+import { isHistoryHydrationTargetStub } from '../../utils/historyHydrationTarget.mjs';
+import { stabilizeHistoryRevealAnchor } from '../../utils/historyRevealAnchor.mjs';
 import {
   acceptHistoryPromptHandoffProviderQueue,
   adoptHistoryPromptHandoffCanonicalEntry,
@@ -223,9 +222,9 @@ import {
   type HistoryPromptHandoffStatus,
 } from '../../utils/historyPromptHandoffs';
 import {
-  isStandaloneCodexLocalSlashCommand,
-  projectCodexLocalSlashSendResult,
-} from '../../utils/codexLocalSlashCommand.mjs';
+  isStandaloneAgentLocalCommand,
+  projectAgentLocalCommandSendResult,
+} from '../../utils/agentLocalCommand.mjs';
 import {
   historyEntryHasExactIdentity,
   matchesHistoryPromptAdoption,
@@ -243,6 +242,11 @@ import {
   planCodexHistorySettingsProjection,
   resolveCodexEffectiveSettings,
 } from '../../utils/codexEffectiveSettings.mjs';
+import { resolveCodexHistoryRestartSettingsState } from '../../utils/codexHistorySettingsPlan.mjs';
+import {
+  AGENT_SETTINGS_INTENT_NONE,
+  createAgentHistoryRestartSettings,
+} from '../../utils/agentSendSettingsContract';
 import {
   getCodexHistoryMutationSettingsProof,
   getCodexLaunchOptions,
@@ -502,10 +506,6 @@ interface HistoryVirtuosoContext {
   // display unit: second ticks stay inside the Footer and cannot rebuild
   // grouping, hydration or Virtuoso item geometry.
   responseTiming: HistoryResponseTailTiming | null;
-  // Transient tail reserve (fake scroll) armed by a near-bottom collapse.
-  // Rendered as Footer height so the frame does not jump; burns on upward
-  // scroll. Presentation-only — never part of saved positions.
-  tailSpacerPx: number;
 }
 
 interface CompactOperationalPhase {
@@ -819,15 +819,6 @@ const HistoryTerminalPreviewFooter = memo(({ context }: {
       )}
       {context?.responseTiming && (
         <HistoryResponseTailTimer timing={context.responseTiming} />
-      )}
-      {(context?.tailSpacerPx ?? 0) > 0 && (
-        // Fake scroll reserve from a near-bottom collapse: holds the frame
-        // still, burns away on upward scroll (see historyTailSpacer.mjs).
-        <div
-          data-history-tail-spacer
-          aria-hidden="true"
-          style={{ height: context!.tailSpacerPx, pointerEvents: 'none' }}
-        />
       )}
     </>
   );
@@ -1462,110 +1453,21 @@ function findHistoryScrollParent(element: HTMLElement | null): HTMLElement | nul
  * Expanding IS leaving the bottom, so the pin turns off first.
  *
  * Collapse: height above the click point is unchanged, so normally nothing
- * moves either. The one failure mode is at the BOTTOM: the shrunken content
- * cannot fill the viewport any more, the browser clamps scrollTop and the
- * frame jumps down. The missing height is reserved as fake empty space below
- * the content (the tail spacer) in the same task — the frame stays put, the
- * reserve burns away as the user scrolls up. Virtuoso can propagate a
- * mid-list shrink through a late measurement pass, so the clamp check runs
- * again one frame later.
+ * moves either. Near the BOTTOM the browser may clamp scrollTop after the
+ * content shrinks. That native clamp is now intentional: History no longer
+ * manufactures empty footer space to preserve an otherwise impossible pixel
+ * position. A collapse from a rail/foot still lands on the group's header by
+ * identity; ordinary card/header collapses accept the browser's final range.
  *
  * Both directions work per-scroller (several History panels can be mounted
  * at once — column mode): the panel registers its scroller's operations
  * here, and the shared toggle helper looks them up by the scroller it found.
  */
 interface HistoryRevealScrollerOps {
-  /** Grow the tail reserve by px and commit it synchronously. */
-  armTailReserve(px: number, reason?: string): void;
   /** Turn off tail-following (the user is now reading, not following). */
   unpinTail(): void;
-  /** True while/just after a REAL gesture (wheel, touch, scroll keys,
-   * scrollbar drag). Programmatic writers cannot fake this. */
-  isUserGestureRecent(): boolean;
-  /** A held frame may accept the gesture that established its initial reading
-   * position, but must yield to every gesture that happens afterwards. */
-  getUserGestureGeneration(): number;
-  isUserGestureActive(): boolean;
-  /** During a shrink the browser may already clamp live scrollTop. The hold
-   * target is the pre-change reading position used by spacer reconciliation. */
-  beginTailHold(scrollTop: number): number;
-  isTailHoldCurrent(token: number): boolean;
-  endTailHold(token: number): void;
 }
 const historyRevealOpsByScroller = new WeakMap<HTMLElement, HistoryRevealScrollerOps>();
-
-/**
- * Keep the frame still after any tail shrink (group collapse or terminal
- * preview replacement). Two writers fight the held position (both measured
- * live, 16.08):
- *   1. the browser CLAMP — the shrunken content cannot fill the viewport at
- *      the old scrollTop, scrollTop snaps to the new maximum;
- *   2. Virtuoso's own shrink compensation — its measurement pass lands up to
- *      ~250ms later and moves scrollTop again.
- * Any deficit becomes tail reserve (fake space below the content), and the
- * position is re-asserted every frame for a short window so the late writer
- * loses too. A real user gesture ends the hold immediately — from that
- * moment the position belongs to the user.
- */
-function holdHistoryShrinkFrame(
-  scroller: HTMLElement,
-  scrollTopBefore: number,
-  ops: HistoryRevealScrollerOps,
-  options: {
-    reason?: string;
-    allowExistingGesture?: boolean;
-    gestureGenerationAtStart?: number;
-    exactTarget?: boolean;
-    onFinish?: () => void;
-  } = {},
-): () => void {
-  const HOLD_MS = 400;
-  const startedAt = performance.now();
-  const gestureGenerationAtStart = options.gestureGenerationAtStart
-    ?? ops.getUserGestureGeneration();
-  const tailHoldToken = ops.beginTailHold(scrollTopBefore);
-  let cancelled = false;
-  let finished = false;
-  const finish = () => {
-    if (finished) return;
-    finished = true;
-    ops.endTailHold(tailHoldToken);
-    options.onFinish?.();
-  };
-  // Standing in reserved space is reading, not tail-following — unpin once,
-  // or followOutput treats the next unit change as a reason to jump.
-  ops.unpinTail();
-  const step = () => {
-    if (cancelled || !scroller.isConnected || !ops.isTailHoldCurrent(tailHoldToken)) {
-      finish();
-      return;
-    }
-    const userTookOwnership = options.allowExistingGesture
-      ? ops.isUserGestureActive()
-        || ops.getUserGestureGeneration() !== gestureGenerationAtStart
-      : ops.isUserGestureRecent();
-    if (userTookOwnership) { finish(); return; }
-    const deficit = historyTailReserveDeficitAfterShrink(scroller, scrollTopBefore);
-    // >2px: fractional row heights produce ±1px deficits that would arm a
-    // useless 1px reserve (and trip the mustBeZero diagnostics later).
-    if (deficit > 2) ops.armTailReserve(deficit, options.reason);
-    if (options.exactTarget && Math.abs(scroller.scrollTop - scrollTopBefore) > 0.5) {
-      scroller.scrollTop = scrollTopBefore;
-    } else if (scroller.scrollTop < scrollTopBefore - 0.5) {
-      scroller.scrollTop = scrollTopBefore;
-    }
-    if (performance.now() - startedAt < HOLD_MS) {
-      requestAnimationFrame(step);
-    } else {
-      finish();
-    }
-  };
-  step();
-  return () => {
-    cancelled = true;
-    finish();
-  };
-}
 
 function applyHistoryRevealUpdate(
   anchor: HTMLElement | null,
@@ -1588,9 +1490,7 @@ function applyHistoryRevealUpdate(
     flushSync(update);
     return;
   }
-  const scrollTopBefore = scroller.scrollTop;
   flushSync(update);
-  if (ops) holdHistoryShrinkFrame(scroller, scrollTopBefore, ops);
 }
 
 /**
@@ -2506,9 +2406,6 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
   const [steps, setSteps] = useState<SubagentStep[]>([]);
   const [pending, setPending] = useState(false);
   const offsetRef = useRef(0);
-  const readerIdRef = useRef(
-    `history-subagent-reader:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`,
-  );
   const canLocateTranscript = toolType === 'codex'
     || !!chip?.agentSessionId
     || !!chip?.agentId
@@ -2518,6 +2415,16 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
   useEffect(() => {
     if (!chipKey) { setSteps([]); setPending(false); offsetRef.current = 0; return; }
     let cancelled = false;
+    let tickInFlight = false;
+    let drainTimer: number | null = null;
+    const effectReaderId = [
+      'history-subagent-reader',
+      tabId,
+      toolType,
+      chip?.agentSessionId || chip?.agentId || chipKey,
+      Date.now().toString(36),
+      Math.random().toString(36).slice(2),
+    ].join(':');
     offsetRef.current = 0;
     setSteps([]);
     setPending(true);
@@ -2528,6 +2435,10 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     // life (E2E ct-e2e27).
     let resolvedThreadId = chip?.agentSessionId || '';
     const tick = async () => {
+      if (cancelled || tickInFlight) return;
+      tickInFlight = true;
+      let shouldDrain = false;
+      const previousOffset = offsetRef.current;
       try {
         if (toolType === 'codex' && !resolvedThreadId) {
           const resolved = await ipcRenderer.invoke('subagent:resolve-codex-thread', {
@@ -2536,8 +2447,9 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
           });
           if (resolved?.threadId) resolvedThreadId = resolved.threadId;
         }
+        if (cancelled) return;
         const res = await ipcRenderer.invoke('subagent:read-steps', {
-          readerId: readerIdRef.current,
+          readerId: effectReaderId,
           chipKey,
           toolType,
           parentSessionId: sessionId,
@@ -2550,7 +2462,8 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
         });
         if (cancelled) return;
         if (res?.success && Array.isArray(res.steps)) {
-          offsetRef.current = Number(res.offset) || offsetRef.current;
+          const nextOffset = Number(res.offset) || offsetRef.current;
+          offsetRef.current = nextOffset;
           if (res.steps.length > 0) {
             // Calls and results may cross byte-read boundaries. The reader
             // returns the same stable id when a result arrives; update that
@@ -2564,7 +2477,12 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
             setSteps([]);
           } else if (!res.pending) {
             setPending(false);
+          } else if (chip?.status !== 'running' && nextOffset <= previousOffset) {
+            // A completed malformed/unfinished file cannot make progress.
+            // Stop the local loader; the durable Task result remains visible.
+            setPending(false);
           }
+          shouldDrain = res.pending === true && nextOffset > previousOffset;
         } else if (chip?.status !== 'running') {
           setPending(false);
         }
@@ -2573,6 +2491,14 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
         // agent gets one bounded attempt and then shows the durable result or
         // the explicit unavailable state instead of an eternal loader.
         if (chip?.status !== 'running' && !cancelled) setPending(false);
+      } finally {
+        tickInFlight = false;
+        if (shouldDrain && !cancelled) {
+          drainTimer = window.setTimeout(() => {
+            drainTimer = null;
+            void tick();
+          }, 8);
+        }
       }
     };
     void tick();
@@ -2582,8 +2508,10 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     return () => {
       cancelled = true;
       if (timer !== null) window.clearInterval(timer);
+      if (drainTimer !== null) window.clearTimeout(drainTimer);
+      ipcRenderer.send('subagent:release-reader', { readerId: effectReaderId });
     };
-  }, [chipKey, toolType, cwd, sessionId, chip?.agentId, chip?.agentSessionId, chip?.taskPrompt, chip?.label, chip?.startedAt, chip?.status]);
+  }, [chipKey, tabId, toolType, cwd, sessionId, chip?.agentId, chip?.agentSessionId, chip?.taskPrompt, chip?.label, chip?.startedAt, chip?.status]);
 
   return { steps, pending };
 }
@@ -2610,6 +2538,14 @@ const HistoryBackgroundDetailPane = memo(({
   const running = chip.status === 'running'
     || (chip.kind === 'bash' && chip.status !== 'completed' && chip.status !== 'interrupted');
   const interrupted = chip.status === 'interrupted';
+  const scrollMemoryKey = [
+    tabId,
+    toolType,
+    sessionId,
+    chip.key,
+    chip.agentSessionId || chip.agentId || '',
+    String(chip.startedAt || ''),
+  ].join('|');
   const statusLabel = running ? 'Working' : interrupted ? 'Interrupted' : 'Completed';
   const statusColor = running ? '#d97706' : interrupted ? '#d97706' : '#4ade80';
   const durationMs = Number(chip.durationMs) > 0
@@ -2622,8 +2558,18 @@ const HistoryBackgroundDetailPane = memo(({
   const restoredScrollRef = useRef(false);
   const programmaticScrollRef = useRef(false);
   const { steps: liveSteps, pending: stepsPending } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
+  const [answerCopied, setAnswerCopied] = useState(false);
+  const answerCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
   useEffect(() => setShowThinking(false), [chip.key]);
+  useEffect(() => {
+    setAnswerCopied(false);
+    return () => {
+      if (answerCopiedTimerRef.current) window.clearTimeout(answerCopiedTimerRef.current);
+      answerCopiedTimerRef.current = null;
+    };
+  }, [chip.key]);
   // Reasoning dwarfs everything else (784 thinking records vs 39 answers on a
   // real Codex agent), so it is folded away unless explicitly asked for.
   const visibleSteps = useMemo(
@@ -2655,16 +2601,79 @@ const HistoryBackgroundDetailPane = memo(({
     () => liveSteps.reduce((sum, step) => sum + (step.kind === 'thinking' ? 1 : 0), 0),
     [liveSteps],
   );
-  const stepCount = presentedSteps.length;
+  const fullAgentAnswer = useMemo(() => {
+    const durable = String(chip.taskResult || '').trim();
+    if (durable) return durable;
+    const final = [...liveSteps].reverse().find((step) => (
+      step.kind === 'message' && step.role === 'assistant' && step.final === true
+    ));
+    return String(final?.text || '').trim();
+  }, [chip.taskResult, liveSteps]);
+  const copyAgentAnswer = useCallback(() => {
+    if (!fullAgentAnswer) return;
+    clipboard.writeText(fullAgentAnswer);
+    setAnswerCopied(true);
+    if (answerCopiedTimerRef.current) window.clearTimeout(answerCopiedTimerRef.current);
+    answerCopiedTimerRef.current = window.setTimeout(() => {
+      answerCopiedTimerRef.current = null;
+      setAnswerCopied(false);
+    }, 900);
+  }, [fullAgentAnswer]);
+  const loadSubagentPayload = useCallback(async (ref: { payloadId: string; totalChars: number }) => {
+    const result = await ipcRenderer.invoke('subagent:get-step-payload', {
+      payloadId: ref.payloadId,
+    });
+    if (!result?.success || typeof result.payload !== 'string') return null;
+    return result.truncatedForRender
+      ? result.payload
+        + '\n… (показаны первые '
+        + Math.round(result.payload.length / 1024)
+        + ' KB из '
+        + Math.round((result.totalChars || ref.totalChars || 0) / 1024)
+        + ' KB)'
+      : result.payload;
+  }, []);
+  const openSubagentMessageContextMenu = useCallback((
+    event: React.MouseEvent<HTMLDivElement>,
+    step: HistoryTranscriptStep,
+  ) => {
+    const selection = window.getSelection();
+    if (
+      selection
+      && !selection.isCollapsed
+      && selection.anchorNode
+      && event.currentTarget.contains(selection.anchorNode)
+    ) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest('button, a, input, textarea, select, [contenteditable="true"]')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const provider = toolType === 'codex' ? 'Codex' : 'Claude';
+    const timestamp = step.timestamp ? new Date(step.timestamp) : null;
+    ipcRenderer.send('show-history-entry-context-menu', {
+      copyText: [
+        'Agent: ' + provider + ' subagent',
+        'Role: ' + (step.role || 'assistant'),
+        timestamp && !Number.isNaN(timestamp.getTime())
+          ? 'Time: ' + timestamp.toLocaleString()
+          : null,
+        (step.messageId || step.id) ? 'Message ID: ' + (step.messageId || step.id) : null,
+        (step.sessionId || chip.agentSessionId)
+          ? 'Session ID: ' + (step.sessionId || chip.agentSessionId)
+          : null,
+        'Parent Tab ID: ' + tabId,
+      ].filter(Boolean).join('\n'),
+    });
+  }, [chip.agentSessionId, tabId, toolType]);
   useEffect(() => {
     restoredScrollRef.current = false;
-    const saved = historySubagentScrollMemory.get(chip.key);
+    const saved = historySubagentScrollMemory.get(scrollMemoryKey);
     followBottomRef.current = saved?.followBottom ?? true;
     return () => {
       const el = scrollRef.current;
       if (!el) return;
-      historySubagentScrollMemory.delete(chip.key);
-      historySubagentScrollMemory.set(chip.key, {
+      historySubagentScrollMemory.delete(scrollMemoryKey);
+      historySubagentScrollMemory.set(scrollMemoryKey, {
         scrollTop: el.scrollTop,
         followBottom: followBottomRef.current,
       });
@@ -2673,14 +2682,14 @@ const HistoryBackgroundDetailPane = memo(({
         if (oldest) historySubagentScrollMemory.delete(oldest);
       }
     };
-  }, [chip.key]);
+  }, [scrollMemoryKey]);
   // Follow new work only while the reader was already at the bottom. A user
   // inspecting an older step owns their position; collapse/reopen and tab
   // switches restore that exact nested scroll instead of snapping to tail.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const saved = historySubagentScrollMemory.get(chip.key);
+    const saved = historySubagentScrollMemory.get(scrollMemoryKey);
     programmaticScrollRef.current = true;
     if (!restoredScrollRef.current && saved && !saved.followBottom) {
       el.scrollTop = Math.min(saved.scrollTop, Math.max(0, el.scrollHeight - el.clientHeight));
@@ -2689,8 +2698,11 @@ const HistoryBackgroundDetailPane = memo(({
       el.scrollTop = el.scrollHeight;
       restoredScrollRef.current = true;
     }
+    setShowScrollToBottom(
+      el.scrollHeight - el.clientHeight - el.scrollTop > 12,
+    );
     requestAnimationFrame(() => { programmaticScrollRef.current = false; });
-  }, [chip.key, stepCount]);
+  }, [scrollMemoryKey, presentedSteps]);
   return (
     <div
       data-history-background-detail
@@ -2699,6 +2711,7 @@ const HistoryBackgroundDetailPane = memo(({
         minHeight: 0,
         display: 'flex',
         flexDirection: 'column',
+        position: 'relative',
         borderTop: '1px solid #2a2a2a',
         background: '#111111',
       }}
@@ -2723,6 +2736,22 @@ const HistoryBackgroundDetailPane = memo(({
             ? formatBackgroundElapsed(chip.startedAt)
             : durationMs > 0 ? formatSubagentDuration(durationMs) : ''}
         </span>
+        {fullAgentAnswer && (
+          <button
+            type="button"
+            onClick={copyAgentAnswer}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 4,
+              background: 'none', border: '1px solid #333', borderRadius: 4,
+              color: answerCopied ? '#4ade80' : '#999', fontSize: '0.9em',
+              padding: '1px 7px', cursor: 'pointer',
+            }}
+            title={answerCopied ? 'Ответ скопирован' : 'Копировать полный ответ агента'}
+          >
+            {answerCopied ? <Check size={10} /> : <Copy size={10} />}
+            {answerCopied ? 'Скопировано' : 'Копировать'}
+          </button>
+        )}
         <button
           type="button"
           onClick={() => onJumpToCard(chip.entryUuid)}
@@ -2752,8 +2781,9 @@ const HistoryBackgroundDetailPane = memo(({
           if (programmaticScrollRef.current) return;
           const el = event.currentTarget;
           followBottomRef.current = el.scrollHeight - el.clientHeight - el.scrollTop <= 12;
-          historySubagentScrollMemory.delete(chip.key);
-          historySubagentScrollMemory.set(chip.key, {
+          setShowScrollToBottom(!followBottomRef.current);
+          historySubagentScrollMemory.delete(scrollMemoryKey);
+          historySubagentScrollMemory.set(scrollMemoryKey, {
             scrollTop: el.scrollTop,
             followBottom: followBottomRef.current,
           });
@@ -2771,6 +2801,8 @@ const HistoryBackgroundDetailPane = memo(({
               steps={presentedSteps}
               isTurnBusy={running}
               onCopy={(text) => clipboard.writeText(text)}
+              loadPayload={loadSubagentPayload}
+              onMessageContextMenu={openSubagentMessageContextMenu}
             />
             {thinkingCount > 0 && (
               <button
@@ -2798,6 +2830,36 @@ const HistoryBackgroundDetailPane = memo(({
           </div>
         )}
       </div>
+      {showScrollToBottom && (
+        <button
+          type="button"
+          aria-label="К последнему шагу агента"
+          title="К последнему шагу"
+          onClick={() => {
+            const el = scrollRef.current;
+            if (!el) return;
+            programmaticScrollRef.current = true;
+            el.scrollTop = el.scrollHeight;
+            followBottomRef.current = true;
+            setShowScrollToBottom(false);
+            historySubagentScrollMemory.delete(scrollMemoryKey);
+            historySubagentScrollMemory.set(scrollMemoryKey, {
+              scrollTop: el.scrollTop,
+              followBottom: true,
+            });
+            requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+          }}
+          style={{
+            position: 'absolute', right: 10, bottom: 10, zIndex: 2,
+            width: 28, height: 28, display: 'inline-flex', alignItems: 'center',
+            justifyContent: 'center', borderRadius: 7, border: '1px solid #3a3a3a',
+            background: '#181818', color: '#9ca3af', cursor: 'pointer',
+            boxShadow: '0 4px 14px rgba(0,0,0,0.35)',
+          }}
+        >
+          <ArrowDownToLine size={14} />
+        </button>
+      )}
     </div>
   );
 });
@@ -3145,6 +3207,13 @@ const findHistoryToolInnerScroller = (
   }
   return null;
 };
+
+// A wheel over an expanded tool body is physically consumed in the capture
+// handler below. The same native event still reaches other listeners on the
+// scroller unless it is stopped immediately; remember that exact object so
+// the outer History intent handler does not also unpin/cancel restore for a
+// movement that never belonged to the feed.
+const historyInnerOwnedWheelEvents = new WeakSet<Event>();
 
 const openHistoryEntryContextMenu = (
   event: React.MouseEvent<HTMLDivElement>,
@@ -4616,6 +4685,11 @@ const historyPanelStyleText = `@keyframes hp-flash {
   /* Nested subagent detail uses #111 rather than the primary History canvas. */
   background: #111111;
 }
+.hp-history-nested-transcript .cb-assistant-meta-row {
+  /* A reply-level Copy belongs to the lower-right edge of that reply. Keep it
+     in flow so it cannot cover the final line or change measured height. */
+  justify-content: flex-end;
+}
 /* Collapsed group unit: fixed two-line geometry (header + detail line). The
    detail line NEVER disappears on completion — its content changes from the
    live operation to the member digest (owner contract: constant tail
@@ -4709,7 +4783,7 @@ const historyPanelStyleText = `@keyframes hp-flash {
    to docs. (No backticks in here: this CSS is a JS template string, and one
    stray backtick closes it — the known empty-window scar.) */
 .hp-history-group-token--docs-search .hp-history-group-token-label { color: #bef264; }
-.hp-history-group-token--docs-edit .hp-history-group-token-label { color: #4ade80; }
+.hp-history-group-token--docs-edit .hp-history-group-token-label { color: #34d399; }
 /* Automatically injected project instructions are attached context, not a
    sentence the user typed. They reuse the purple saved-prompt chip and the
    same full-text popover; only the leading provider mark adds provenance. */
@@ -4933,9 +5007,16 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-history-group[data-history-docs-kind="search"] > .hp-history-group-head .cb-tool-ic.cb-c-done {
   color: #bef264;
 }
+.hp-tool-scroll-scope[data-history-docs-kind="search"] .cb-tool-label {
+  color: #bef264;
+}
 .hp-tool-scroll-scope[data-history-docs-kind="edit"] .cb-tool-ic.cb-c-done,
 .hp-history-group[data-history-docs-kind="edit"] > .hp-history-group-head .cb-tool-ic.cb-c-done {
-  color: #4ade80;
+  /* Distinct from generic completed-action green (#4ade80). */
+  color: #34d399;
+}
+.hp-tool-scroll-scope[data-history-docs-kind="edit"] .cb-tool-label {
+  color: #34d399;
 }
 /* No open/close animation, by decision (16.08): rows in the virtualized list
    change height in one frame, and the toggle handlers compensate scrollTop in
@@ -5829,6 +5910,7 @@ function AgentHistoryControls({
   overlayComposer = false,
   agentInputSurface: agentInputSurfaceProp,
   suppressWindowEscape = false,
+  interactionDisabled = false,
   compactComposer = false,
 }: {
   tabId: string;
@@ -5894,6 +5976,10 @@ function AgentHistoryControls({
   agentInputSurface?: boolean;
   // Split: only the FOCUSED pane's composer listens to window-level Escape.
   suppressWindowEscape?: boolean;
+  // Deferred owner handoff keeps the old component mounted for two paint
+  // frames. Its portalled composer must be inert too, not only the transcript
+  // curtain inside the panel subtree.
+  interactionDisabled?: boolean;
   // Pane stacked in a column → short surface, so the input starts at one row.
   compactComposer?: boolean;
 }) {
@@ -6049,6 +6135,10 @@ function AgentHistoryControls({
   }, []);
   const statusCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const promptTextareaRef = useRef<ComposerEditorHandle | null>(null);
+  useLayoutEffect(() => {
+    if (!interactionDisabled) return;
+    promptTextareaRef.current?.dom?.blur();
+  }, [interactionDisabled]);
   const initialComposerView = useUIStore.getState().historyComposerViewByTab[tabId];
   const promptCaretRef = useRef<{ start: number; end: number }>({
     start: initialComposerView?.selectionStart || 0,
@@ -7629,14 +7719,13 @@ function AgentHistoryControls({
         const promptChipsForHistory = sourceDraftChips
           .filter((chip) => chip.kind === 'prompt')
           .map((chip) => ({ ...chip, kind: 'prompt' as const }));
-        const localCodexSlashCandidate = !recordWithoutReply
-          && runtime.toolType === 'codex'
-          && isStandaloneCodexLocalSlashCommand({
+        const localCommandCandidate = !recordWithoutReply
+          && isStandaloneAgentLocalCommand({
             prompt: sendPayload,
             imageCount: sendDraftImages.length,
             chipCount: promptChipsForHistory.length,
           });
-        const requiresAuditIdentity = !localCodexSlashCandidate;
+        const requiresAuditIdentity = !localCommandCandidate;
         beginHistoryPromptHandoff({
           tabId: actionTabId,
           handoffId,
@@ -7721,12 +7810,28 @@ function AgentHistoryControls({
         }
         delayedDeliveryWarningHandoffRef.current = null;
         setDraftWarning(null);
-        const codexMutationProof = runtime.toolType === 'codex' && sessionId
+        // A normal prompt does not request model/effort at all. The live
+        // ControlBar picker has already applied them, while cold Start/Resume
+        // gets them from buildCodexRunPayload. Only record-without-reply stops
+        // and reopens the writer, so only that lifecycle operation carries the
+        // exact pair across its restart boundary.
+        const codexMutationProof = runtime.toolType === 'codex'
+          && recordWithoutReply
+          && statusAtSend === 'active'
+          && sessionId
           ? getCodexHistoryMutationSettingsProof(tabId, sessionId)
           : null;
-        const codexLaunchSettings = runtime.toolType === 'codex'
+        const codexLaunchSettings = runtime.toolType === 'codex' && recordWithoutReply
           ? getCodexLaunchOptions(tabId)
           : null;
+        const codexRestartSettingsState = resolveCodexHistoryRestartSettingsState({
+          recordWithoutReply,
+          mutationProof: codexMutationProof,
+          launchSettings: codexLaunchSettings,
+        });
+        const historyRestartSettings = codexRestartSettingsState
+          ? createAgentHistoryRestartSettings(codexRestartSettingsState)
+          : undefined;
         const result = await sendAgentPromptScenario({
           tabId,
           toolType: runtime.toolType,
@@ -7744,10 +7849,10 @@ function AgentHistoryControls({
           source: 'history-panel',
           statusAtSend,
           queue: !recordWithoutReply && statusAtSend === 'busy',
-          model: codexMutationProof?.model || codexLaunchSettings?.model,
-          effort: codexMutationProof?.effort || codexLaunchSettings?.effort,
+          settingsIntent: AGENT_SETTINGS_INTENT_NONE,
+          historyRestartSettings,
           returnDraftOnConflict: true,
-          claudeExactEmptyEvidence,
+          initialComposerProof: claudeExactEmptyEvidence,
           coordinatedSendToken,
           recordWithoutReply,
           onRestartPhase: (phase) => {
@@ -7824,8 +7929,8 @@ function AgentHistoryControls({
         });
         sendFailureResult = result;
         sendCoordinatedSettlement = result?.coordinatedSettlement || null;
-        const localSlashReceipt = projectCodexLocalSlashSendResult({
-          candidate: localCodexSlashCandidate,
+        const localSlashReceipt = projectAgentLocalCommandSendResult({
+          candidate: localCommandCandidate,
           result,
         });
         const resultOwnershipTransferred = localSlashReceipt.handled
@@ -7943,7 +8048,12 @@ function AgentHistoryControls({
           ' deliveryUnconfirmed=' + sendDeliveryUnconfirmed +
           ' submitted=' + !!result?.submitted +
           ' success=' + (result?.success === null ? 'unknown' : result?.success !== false));
-        if (!sendOwnershipTransferred) throw new Error(result?.error || 'Send failed before submit');
+        if (!sendOwnershipTransferred) {
+          throw Object.assign(
+            new Error(result?.error || 'Send failed before submit'),
+            result && typeof result === 'object' ? result : {},
+          );
+        }
         if (!isCurrentAction()) return;
         onPromptStatusChange(
           handoffId,
@@ -10138,6 +10248,8 @@ function AgentHistoryControls({
     <div
       ref={controlsRef}
       data-history-controls
+      inert={interactionDisabled}
+      aria-hidden={interactionDisabled ? true : undefined}
       style={{
         // The centered surface used to lift this row OUT of the column with
         // `position: absolute` so transcript rows showed around the floating
@@ -10461,200 +10573,9 @@ const HISTORY_VIRTUOSO_COMPONENTS = {
   ScrollSeekPlaceholder: HistoryScrollSeekPlaceholder,
 };
 
-// Velocity gates for swapping real rows for placeholders. The economics
-// changed when diff bodies went collapsed-by-default: a mounted row is now a
-// header, not a 200-row diff, so the 04.08 justification for a low gate
-// (314/327ms mounts during ramp-up) no longer holds — and the low gate had a
-// real cost: the user's ordinary vigorous scroll measures 1437-2267 px/s
-// (live 06.08 15:26, eight ENTER/EXIT blink cycles in ~20s of reading
-// scroll, each swapping the viewport rows→skeletons→rows). Enter now
-// demands an unmistakable fling; exit stays low so rows return the moment
-// the user slows down to look.
-const HISTORY_SCROLL_SEEK_ENTER_PX_PER_S = 3000;
-const HISTORY_SCROLL_SEEK_EXIT_PX_PER_S = 500;
-// Minimum time placeholders stay on once entered. Virtuoso samples velocity
-// per frame, and a heavy frame mid-fling reports velocity=0 on the next
-// sample — without a hold, the gate oscillated at boundary speed (live
-// 04.08 21:59: ENTER velocity=-3021 followed by EXIT velocity=0 within one
-// frame, then the just-unmasked real rows mounted for 314/327ms and the
-// cycle repeated). The hold turns that oscillation into one steady
-// placeholder window; a real stop pays at most this delay before rows
-// return, which is below perception at reading speed.
-const HISTORY_SCROLL_SEEK_MIN_HOLD_MS = 150;
-// Wheel-burst = a LOWERED bar, never a bypass. The original design let a hot
-// burst window answer "on" regardless of measured velocity, because the first
-// velocity sample after idle divides the jump by seconds of idle time and a
-// violent fling read as slow (796ms real-row mount before the first ENTER,
-// retest 04.08 22:08). But ordinary trackpad reading-scroll also emits single
-// ticks ≥600px, and the bypass flipped placeholders at genuine velocities of
-// 670-957 px/s — a third of the enter threshold (tab-3163, 06.08 11:12), then
-// the seek EXIT remounted the whole viewport in one 504ms commit. Ordinary
-// scroll must never flicker into skeletons, so now a violent tick only arms
-// the window, and entry still demands a MEASURED velocity above the confirm
-// tier below. Consequences, frame by frame: a single violent tick from idle
-// mounts its one new range real (its first sample reads bogus-slow, below any
-// tier — acceptable now that diff bodies are collapsed by default and rows
-// are cheap); a sustained fling enters on its first GENUINE sample, one tier
-// earlier than the cold threshold. Scrollbar drags have no wheel events and
-// keep the pure velocity path.
-const HISTORY_WHEEL_BURST_DELTA_PX = 600;
-const HISTORY_WHEEL_BURST_HOLD_MS = 250;
-// Confirm tier: measured px/s required to enter while the burst window is
-// hot. First shipped at 1400 ("between ordinary 670-957 and fling 3021") —
-// live retest same day (15:26 МСК) showed the user's ordinary vigorous
-// reading-scroll measures 1437-2267 px/s, i.e. INSIDE that guess, and every
-// tick ≥600px armed the burst, so the gate blinked rows→skeletons→rows
-// eight times in 20s. Skeletons are for scrubbing, not reading: the tier
-// must sit above any speed at which the user still tracks content. 2600
-// keeps the burst meaningful (a real fling's genuine samples are ≥3000)
-// while everything the user did in that session stays on real rows.
-const HISTORY_SCROLL_SEEK_BURST_CONFIRM_PX_PER_S = 2600;
-let historyWheelBurstUntil = 0;
-// Machine-motion cooldown. The in-flight suppressors cover a restore WHILE
-// it runs, but Virtuoso's velocity sample for the restore's own jump arrives
-// a few frames AFTER the restore releases its token — measured live (06.08
-// 15:26): SCROLL_RESTORE mode=measured-layout settles, and 26ms later the
-// gate saw velocity=464679 (the scrollTop magnitude, physically impossible
-// for a gesture) and flipped the freshly-restored viewport to skeletons for
-// ~350ms on a MOTIONLESS screen — a guaranteed flash on every warm return to
-// a mid-list position, felt as «перешёл на вкладку и сразу всё дёргается».
-// Every jump machine stamps this on completion; enter() refuses while hot.
-// A real fling that starts inside the window just gets its skeletons up to
-// 450ms late — rows are cheap since diffs collapsed, so that is invisible.
-const HISTORY_MACHINE_SCROLL_COOLDOWN_MS = 450;
-let historyMachineScrollCooldownUntil = 0;
-const stampHistoryMachineScrollCooldown = (): void => {
-  historyMachineScrollCooldownUntil = performance.now() + HISTORY_MACHINE_SCROLL_COOLDOWN_MS;
-};
-// The scroller the kick re-asks. Updated on every real scroll tick of
-// whichever panel is scrolling (handleScroll), so it always points at the
-// element whose seek mode could be stuck — including scrollbar drags, which
-// produce no wheel events at all.
-let historySeekScroller: HTMLElement | null = null;
-const armHistoryWheelBurst = (deltaY: number): void => {
-  if (Math.abs(deltaY) >= HISTORY_WHEEL_BURST_DELTA_PX) {
-    historyWheelBurstUntil = performance.now() + HISTORY_WHEEL_BURST_HOLD_MS;
-  }
-};
-// Re-consult kick. Virtuoso consults the exit gate ONLY when its velocity
-// stream emits, and the stream emits only on scroll activity — so REFUSING
-// the last emission of a fling would freeze placeholders on a motionless
-// screen with nothing left to re-ask the gate (the exact 44s-stuck failure
-// mode, just with a different trigger). Any refusal therefore arms a timer
-// that, once the burst window and hold have both expired with no new wheel,
-// nudges the scroller by ONE real pixel (restored next frame). A synthetic
-// scroll event with the SAME scrollTop does NOT work — proven live (retest
-// 04.08 22:27: kick dispatched, no EXIT, 18 placeholders frozen): the
-// list's scroll pipeline dedupes unchanged positions, so only genuine
-// movement is guaranteed to emit. 1px is invisible, fires no wheel/touch
-// handlers (so it cannot cancel restores), and the restore step only runs
-// if nobody else moved the scroller meanwhile.
-let historySeekKickTimer: ReturnType<typeof setTimeout> | null = null;
-const scheduleHistorySeekKick = (): void => {
-  if (historySeekKickTimer) clearTimeout(historySeekKickTimer);
-  const now = performance.now();
-  const wait = Math.max(
-    HISTORY_SCROLL_SEEK_MIN_HOLD_MS,
-    historyWheelBurstUntil - now,
-  ) + 60;
-  historySeekKickTimer = setTimeout(() => {
-    historySeekKickTimer = null;
-    if (!historyScrollSeekActive) return;
-    if (performance.now() < historyWheelBurstUntil) {
-      // A newer wheel re-armed the burst — its own motion re-consults.
-      scheduleHistorySeekKick();
-      return;
-    }
-    const scroller = historySeekScroller;
-    if (!scroller || !scroller.isConnected) {
-      // The seeking list is gone (owner switch remounted it). The new list
-      // starts with placeholders off; keep the diagnostic flag honest.
-      historyScrollSeekActive = false;
-      notifyHistorySeekExit();
-      return;
-    }
-    const original = scroller.scrollTop;
-    const nudged = original > 0 ? original - 1 : original + 1;
-    scroller.scrollTop = nudged;
-    requestAnimationFrame(() => {
-      // Restore only if the nudge is still the last write — a user gesture
-      // or a restore loop that moved the scroller meanwhile owns the
-      // position now.
-      if (scroller.isConnected && Math.abs(scroller.scrollTop - nudged) <= 0.5) {
-        scroller.scrollTop = original;
-      }
-    });
-  }, wait);
-};
-// Programmatic position restores jump via scrollToIndex and read as huge
-// velocity (ENTER velocity=51087 observed) — but produce no further scroll
-// samples, so the seek mode STUCK with placeholders on a motionless screen
-// (EXIT heldMs=44258 in the retest). A tail-pinned reader has the same
-// hazard from followOutput auto-jumps during streaming. The panel registers
-// a suppressor so machine-driven motion never engages placeholders; a real
-// upward gesture un-pins the tail (handleUserScrollIntent) before the wheel
-// burst is consulted, so user flings are unaffected. A Set because the
-// config object is module-level while the panel can have more than one
-// mounted instance (primary + preview).
-const historySeekSuppressors = new Set<() => boolean>();
-// Transition-only diagnostics: Virtuoso consults `enter` while placeholders
-// are off and `exit` while they are on, so flipping the flag inside each gate
-// logs exactly one line per mode change. Without a log line, "placeholders
-// engaged" is unobservable to tests — a silent mechanism cannot be verified
-// (the SCROLL_RESTORE_CANCEL scar).
-let historyScrollSeekActive = false;
-let historyScrollSeekEnteredAt = 0;
-const HISTORY_SCROLL_SEEK_CONFIG = {
-  enter: (velocity: number) => {
-    for (const suppressed of historySeekSuppressors) {
-      if (suppressed()) return false;
-    }
-    // Trailing echo of a programmatic jump (restore/Timeline-jump released
-    // its token, Virtuoso's sample of that jump lands frames later).
-    if (performance.now() < historyMachineScrollCooldownUntil) return false;
-    const burst = performance.now() < historyWheelBurstUntil;
-    // Burst lowers the bar; measured velocity must still clear it. The old
-    // `burst || …` short-circuit entered at velocity=670 on ordinary scroll.
-    const threshold = burst
-      ? HISTORY_SCROLL_SEEK_BURST_CONFIRM_PX_PER_S
-      : HISTORY_SCROLL_SEEK_ENTER_PX_PER_S;
-    const on = Math.abs(velocity) > threshold;
-    if (on && !historyScrollSeekActive) {
-      historyScrollSeekActive = true;
-      historyScrollSeekEnteredAt = performance.now();
-      historyDiag('SCROLL_SEEK_ENTER velocity=' + Math.round(velocity)
-        + ' burst=' + (burst ? '1' : '0'));
-      // The mode may have been entered on the LAST emission of the stream
-      // (single-tick fling); guarantee a future consultation regardless.
-      scheduleHistorySeekKick();
-    }
-    return on;
-  },
-  exit: (velocity: number) => {
-    // A hot burst window means the fling is still being fed — do not flap.
-    if (performance.now() < historyWheelBurstUntil) {
-      scheduleHistorySeekKick();
-      return false;
-    }
-    if (Math.abs(velocity) >= HISTORY_SCROLL_SEEK_EXIT_PX_PER_S) return false;
-    if (
-      historyScrollSeekActive
-      && performance.now() - historyScrollSeekEnteredAt < HISTORY_SCROLL_SEEK_MIN_HOLD_MS
-    ) {
-      // Refusing what may be the stream's final emission — self-schedule the
-      // re-ask that the stream itself will no longer provide.
-      scheduleHistorySeekKick();
-      return false;
-    }
-    if (historyScrollSeekActive) {
-      historyScrollSeekActive = false;
-      historyDiag('SCROLL_SEEK_EXIT velocity=' + Math.round(velocity)
-        + ' heldMs=' + Math.round(performance.now() - historyScrollSeekEnteredAt));
-      notifyHistorySeekExit();
-    }
-    return true;
-  },
-};
+// Scroll-seek's mutable velocity/cooldown/kick state is created per mounted
+// HistoryPanel below. Split mode may show several real panels at once, so a
+// module singleton would make one pane suppress or nudge another.
 
 // Row-level hydration window. Rows within this radius of what the user is
 // reading arrive with content; the rest arrive as identity stubs (see
@@ -10753,20 +10674,6 @@ const requestHistoryMountWaveStep = (lane: HistoryMountWaveLane): void => {
   lane.wants = true;
   pumpHistoryMountWaveArbiter();
 };
-// Scroll-seek placeholders replace itemContent wholesale, so during seek the
-// DOM contains no shell rows at all. A wave that consulted that DOM would
-// declare itself drained on nothing — and seek exit would then mount every
-// real card in one giant commit, resurrecting the exact long task the wave
-// removes. Waves pause while seek is on and resume on these exit signals.
-const historySeekExitListeners = new Set<() => void>();
-const notifyHistorySeekExit = (): void => {
-  for (const listener of [...historySeekExitListeners]) {
-    historySeekExitListeners.delete(listener);
-    try { listener(); } catch { /* wave resume is best-effort */ }
-  }
-};
-
-
 function HistoryPanel({
   tabId,
   sessionId,
@@ -11622,14 +11529,9 @@ function HistoryPanel({
   // Expansion state belongs to the owner (scar: state surviving an owner
   // switch was read by the wrong tab). Reset on owner change.
   const expandedGroupOwnerRef = useRef(historyOwnerKey);
-  const tailSpacerOwnerResetRef = useRef<(() => void) | null>(null);
   if (expandedGroupOwnerRef.current !== historyOwnerKey) {
     expandedGroupOwnerRef.current = historyOwnerKey;
     if (expandedGroupKeys.size > 0) setExpandedGroupKeys(new Set());
-    // Owner guard 4: the tail reserve never crosses an owner switch. The
-    // spacer ref is created later in the component; route through a ref set
-    // after creation so render order stays legal.
-    tailSpacerOwnerResetRef.current?.();
   }
   // Previous (rows, options, units) triple for the incremental append path —
   // owner-scoped: another tab's rows must never serve as a diff baseline.
@@ -11750,89 +11652,6 @@ function HistoryPanel({
     });
     return true;
   }, [tabId]);
-  // ---- Tail spacer: fake scroll reserve for near-bottom collapses ----
-  // One value source (owner guard 1): everything that does bottom math reads
-  // historyTailSpacerRef.current.get(). The reserve renders inside the
-  // Footer (historyTailSpacerPx), burns on upward scroll, zeroes on restore
-  // start / owner change / tail growth. Never persisted.
-  const [historyTailSpacerPx, setHistoryTailSpacerPx] = useState(0);
-  // One diagnostic line per armed reserve when programmatic scroll tried to
-  // consume it — enough to recognise the 17.08 pattern in a prod trace
-  // without flooding (the blocked case fires dozens of times per collapse).
-  const historyTailSpacerBurnBlockLoggedRef = useRef(false);
-  // Content bottom seen by the last reconciliation. The reserve follows the
-  // GROWTH of the content, never the reader's position — see the effect below.
-  const historyTailSpacerContentBottomRef = useRef<number | null>(null);
-  const historyTailSpacerRef = useRef(createHistoryTailSpacer({
-    onChange: (px: number, reason?: string) => {
-      // Each fresh reserve gets its own "programmatic burn was blocked" line.
-      if (reason !== 'burn') historyTailSpacerBurnBlockLoggedRef.current = false;
-      if (px === 0) historyTailSpacerContentBottomRef.current = null;
-      setHistoryTailSpacerPx(px);
-    },
-    diag: (line: string) => historyDiag(line + ' tab=' + tabId.slice(-12)),
-  }));
-  const historyTailHoldSeqRef = useRef(0);
-  const historyTailHoldTargetRef = useRef<{ token: number; scrollTop: number } | null>(null);
-  tailSpacerOwnerResetRef.current = () => {
-    historyTailHoldTargetRef.current = null;
-    historyTailSpacerRef.current.reset('owner-change');
-  };
-  // Reserve reconciliation, every commit while a reserve is armed. The
-  // reserve's invariant is «spacer == clamp deficit»: exactly the height
-  // missing between the viewport bottom and the real content bottom. New
-  // rows, a STREAMING growth of the last block (same row count — length
-  // watching missed it, reported live 16.08 «при обновлении последнего
-  // блока пустое пространство пропадает»), a late Virtuoso re-measure: all
-  // of them change the deficit, and the reserve follows it downward. It
-  // never grows here (arming is the collapse path's job), so the position
-  // cannot clamp by construction; growth that covers the whole reserve means
-  // the content genuinely refilled the space → full reset.
-  useLayoutEffect(() => {
-    const spacer = historyTailSpacerRef.current;
-    const spacerPx = spacer.get();
-    if (spacerPx <= 0) return;
-    const scroller = virtuosoScrollerRef.current;
-    if (!scroller) { spacer.reset('no-scroller'); return; }
-    // Высоту резерва берём ИЗ РАЗМЕТКИ, а не из намерения. Виртуализация
-    // применяет новую высоту подвала на коммит-другой позже, поэтому
-    // «желаемые» пиксели и то, что реально попало в высоту прокрутки, какое-то
-    // время расходятся. Пока здесь стояло намеренное число, первый замер
-    // делался до применения (резерва в разметке ещё нет), второй — после, и
-    // разница читалась как «контент вырос ровно на величину резерва» → резерв
-    // схлопывался целиком одним скачком. Прод 18.08 00:29 (tab-3314), трижды
-    // подряд: `add px=332`, через секунду первое же движение `burn px=1`, и
-    // сразу `zero reason=content-refilled`. Пользователь описал это как рывок
-    // и «пустое пространство схлопнулось разом, а должно постепенно».
-    // С фактической высотой оба замера дают ОДНО И ТО ЖЕ дно контента: до
-    // применения высота равна нулю, после — равна резерву, и вычитание
-    // приводит их к одному числу.
-    const spacerNode = scroller.querySelector('[data-history-tail-spacer]');
-    const renderedSpacerPx = spacerNode
-      ? Math.round((spacerNode as HTMLElement).offsetHeight)
-      : 0;
-    const contentBottom = Math.round(scroller.scrollHeight - renderedSpacerPx);
-    const previousBottom = historyTailSpacerContentBottomRef.current;
-    historyTailSpacerContentBottomRef.current = contentBottom;
-    if (previousBottom === null) return;
-    // ONLY content growth may shrink the reserve here. Deriving the reserve
-    // from the reader's distance to the bottom double-counts every upward
-    // pixel: the scroll handler already burned it, and then this effect (which
-    // runs on the very commit that burn triggered) measured a smaller deficit
-    // and burned the SAME pixels again. Prod 17.08 19:25–19:26 shows the pairs
-    // literally — «burn px=1 src=user-scroll» immediately followed by
-    // «burn px=1 src=deficit-reconcile» — reported live as «один скролл
-    // работает как за два, иногда с анимацией»: the reserve collapsed at
-    // double speed, so the content under the cursor slid up an extra step.
-    // Content growth is the only thing that genuinely refills the fake space,
-    // and it is independent of where the reader stands.
-    const refill = historyTailReserveGrowthBurn({
-      spacerPx, previousContentBottom: previousBottom, contentBottom,
-    });
-    if (refill <= 0) return;
-    if (refill >= spacerPx) spacer.reset('content-refilled');
-    else spacer.burn(refill, 'content-growth');
-  });
   const visibleTerminalPreview = terminalPreview?.tabId === tabId
     && terminalPreview.toolType === toolType
     && (!sessionId || !terminalPreview.sessionId || terminalPreview.sessionId === sessionId)
@@ -11842,9 +11661,8 @@ function HistoryPanel({
     () => ({
       terminalPreview: visibleTerminalPreview,
       responseTiming: responseTailTiming,
-      tailSpacerPx: historyTailSpacerPx,
     }),
-    [visibleTerminalPreview, responseTailTiming, historyTailSpacerPx],
+    [visibleTerminalPreview, responseTailTiming],
   );
   const visibleLiveToolResults = liveToolResultsRef.current.ownerKey === historyOwnerKey
     ? liveToolResults
@@ -12156,12 +11974,25 @@ function HistoryPanel({
   // temporarily increases scrollHeight before the follow scroll lands; that
   // must not look like the user scrolled away from the tail.
   const isAtBottomRef = useRef(true);
+  // react-virtuoso has a separate SIZE_INCREASED fallback that checks whether
+  // the followOutput PROP itself is strictly false; a callback returning false
+  // is still treated as enabled. Mirror intent into a primitive prop so an
+  // explicit reveal-unpin reaches the library before the row count changes.
+  const [historyFollowOutputEnabled, setHistoryFollowOutputEnabled] = useState(true);
+  const historyFollowOutputEnabledRef = useRef(true);
+  const setHistoryTailFollowIntent = useCallback((next: boolean) => {
+    isAtBottomRef.current = next;
+    if (historyFollowOutputEnabledRef.current === next) return;
+    historyFollowOutputEnabledRef.current = next;
+    setHistoryFollowOutputEnabled(next);
+  }, []);
   const historyPointerScrollActiveRef = useRef(false);
   // Timestamp of the last REAL scroll gesture (wheel/touch/scroll keys).
   // Programmatic scrollTop writes cannot move it; the collapse hold loop
   // reads it to yield to the user instantly.
   const historyUserGestureAtRef = useRef(0);
   const historyUserGestureGenerationRef = useRef(0);
+  const historyUserScrollDirectionRef = useRef<'up' | 'down' | null>(null);
   // Bumped by real user scroll intent and by owner change; the scroll-restore
   // convergence loop checks it each frame so it never fights the user.
   const scrollRestoreGenRef = useRef(0);
@@ -12187,9 +12018,46 @@ function HistoryPanel({
   // mounted item range. Virtuoso unmounts off-screen items, so highlights
   // re-apply on every range change via the same effect (matchPositions deps).
   const virtuosoScrollerRef = useRef<HTMLElement | null>(null);
+  // Declared beside the seek controller because suppression is panel-local:
+  // a Timeline jump in pane A must not disable placeholders in pane B.
+  const historyScrollInFlightRef = useRef<{
+    uuid: string;
+    gen: number;
+    startedAt: number;
+    attempts: number;
+  } | null>(null);
+  const historyScrollSeekController = useMemo(
+    () => createHistoryScrollSeekController({
+      isSuppressed: () => (
+        historyRestoreInFlightRef.current !== 0
+        || historyScrollInFlightRef.current !== null
+        || isAtBottomRef.current
+      ),
+      onTransition: (event) => {
+        if (event.kind === 'enter') {
+          historyDiag('SCROLL_SEEK_ENTER velocity=' + Math.round(event.velocity)
+            + ' burst=' + (event.burst ? '1' : '0')
+            + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current));
+        } else {
+          historyDiag('SCROLL_SEEK_EXIT velocity=' + Math.round(event.velocity || 0)
+            + ' heldMs=' + Math.round(event.heldMs || 0)
+            + ' reason=' + event.reason
+            + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current));
+        }
+      },
+    }),
+    [],
+  );
+  useEffect(
+    () => () => historyScrollSeekController.dispose(),
+    [historyScrollSeekController],
+  );
   const historyTailPinScheduler = useMemo(
     () => createHistoryTailPinScheduler({
       getScroller: () => virtuosoScrollerRef.current,
+      getOwnerToken: () => (
+        historyOwnerKeyRef.current + ':' + historyOwnerGenerationRef.current
+      ),
     }),
     [],
   );
@@ -12197,67 +12065,188 @@ function HistoryPanel({
     () => () => historyTailPinScheduler.cancel(),
     [historyTailPinScheduler],
   );
-  // Card- and group-level toggles both need this panel's tail operations.
+  // Card- and group-level toggles both need this panel's follow ownership.
   // Card toggles run through the shared applyHistoryRevealUpdate helper,
   // which looks the ops up by scroller element (column mode mounts several
   // panels at once) — registered from the scrollerRef callback below so it
-  // exists before the first possible click. Closes over refs and the stable
-  // scheduler only — safe to create once.
+  // exists before the first possible click.
   const historyRevealOps = useMemo<HistoryRevealScrollerOps>(() => ({
-    armTailReserve: (px: number, reason = 'collapse-hold') => {
-      flushSync(() => {
-        historyTailSpacerRef.current.arm(
-          historyTailSpacerRef.current.get() + px,
-          reason,
-        );
-      });
-    },
     unpinTail: () => {
-      isAtBottomRef.current = false;
+      // Separate synchronous commit: Virtuoso must observe literal
+      // followOutput=false BEFORE the following commit changes item count.
+      flushSync(() => setHistoryTailFollowIntent(false));
+      // A wheel that reached the tail immediately before this click no longer
+      // owns the resize commit. Otherwise its recent "down" proof re-pins the
+      // group expansion to the new bottom and moves the clicked header up.
+      historyUserGestureAtRef.current = 0;
+      historyUserScrollDirectionRef.current = null;
       historyTailPinScheduler.cancel();
     },
-    isUserGestureRecent: () => (
-      historyPointerScrollActiveRef.current
-      || performance.now() - historyUserGestureAtRef.current < 500
-    ),
-    getUserGestureGeneration: () => historyUserGestureGenerationRef.current,
-    isUserGestureActive: () => historyPointerScrollActiveRef.current,
-    beginTailHold: (scrollTop: number) => {
-      const token = ++historyTailHoldSeqRef.current;
-      historyTailHoldTargetRef.current = { token, scrollTop };
-      return token;
-    },
-    isTailHoldCurrent: (token: number) => historyTailHoldTargetRef.current?.token === token,
-    endTailHold: (token: number) => {
-      if (historyTailHoldTargetRef.current?.token === token) {
-        historyTailHoldTargetRef.current = null;
+  }), [historyTailPinScheduler, setHistoryTailFollowIntent]);
+  // Correlated geometry proof for the reported first-toggle-only jerk. A group
+  // click can coincide with tab activation, a cold display-unit signature,
+  // Virtuoso remeasurement or a competing machine scroll. The old one-line
+  // GROUP_EXPAND/GROUP_COLLAPSE log named the click but none of those writers,
+  // so a visible nudge was indistinguishable from ordinary legal reflow.
+  // This observer is read-only: it records the click frame, two layout frames
+  // and the post-measure settle without steering scroll or React state.
+  const historyGroupToggleTraceSeqRef = useRef(0);
+  const traceHistoryGroupToggleGeometry = useCallback((
+    groupKey: string,
+    action: 'expand' | 'collapse',
+    source: string,
+  ) => {
+    const scroller = virtuosoScrollerRef.current;
+    if (!scroller) return;
+    const token = ++historyGroupToggleTraceSeqRef.current;
+    const ownerKey = historyOwnerKeyRef.current;
+    const ownerGeneration = historyOwnerGenerationRef.current;
+    const startedAt = performance.now();
+    const sample = (phase: 'before' | 'frame1' | 'frame2' | 'settled') => {
+      if (!scroller.isConnected) return;
+      if (
+        historyOwnerKeyRef.current !== ownerKey
+        || historyOwnerGenerationRef.current !== ownerGeneration
+      ) {
+        historyDiag('GROUP_GEOMETRY tab=' + tabId.slice(-12)
+          + ' token=' + token
+          + ' action=' + action
+          + ' source=' + source
+          + ' phase=' + phase
+          + ' stale=owner');
+        return;
       }
-    },
-  }), [historyTailPinScheduler]);
+      let header: HTMLElement | null = null;
+      for (const node of Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-group]'))) {
+        if (node.getAttribute('data-history-group') === groupKey) { header = node; break; }
+      }
+      const scrollerRect = scroller.getBoundingClientRect();
+      const headerRect = header?.getBoundingClientRect() || null;
+      const groupUnitIndex = displayUnitsRef.current.findIndex(
+        (unit: any) => unit?.kind === 'group' && unit.key === groupKey,
+      );
+      const groupUnit = groupUnitIndex >= 0
+        ? displayUnitsRef.current[groupUnitIndex] as any
+        : null;
+      const groupEntries = Array.isArray(groupUnit?.entries) ? groupUnit.entries : [];
+      const state = useWorkspaceStore.getState();
+      let activeTab = false;
+      for (const workspace of state.openProjects.values()) {
+        if (!workspace.tabs.has(tabId)) continue;
+        activeTab = workspace.activeTabId === tabId;
+        break;
+      }
+      historyDiag('GROUP_GEOMETRY tab=' + tabId.slice(-12)
+        + ' token=' + token
+        + ' action=' + action
+        + ' source=' + source
+        + ' phase=' + phase
+        + ' elapsedMs=' + Math.round(performance.now() - startedAt)
+        + ' active=' + (activeTab ? 1 : 0)
+        + ' unitIdx=' + groupUnitIndex
+        + ' units=' + displayUnitsRef.current.length
+        + ' members=' + groupEntries.length
+        + ' memberStubs=' + groupEntries.filter((entry: any) => entry?.rowStub).length
+        + ' expanded=' + (groupUnit?.expanded === true ? 1 : 0)
+        + ' header=' + (header ? 1 : 0)
+        + ' headerTop=' + (headerRect ? Math.round(headerRect.top - scrollerRect.top) : 'na')
+        + ' headerHeight=' + (headerRect ? Math.round(headerRect.height) : 'na')
+        + ' scrollTop=' + Math.round(scroller.scrollTop)
+        + ' scrollHeight=' + Math.round(scroller.scrollHeight)
+        + ' clientHeight=' + Math.round(scroller.clientHeight)
+        + ' range=' + visibleRangeRef.current.start + '-' + visibleRangeRef.current.end
+        + ' shells=' + scroller.querySelectorAll('[data-history-mount-shell]').length
+        + ' stubs=' + scroller.querySelectorAll('[data-history-row-stub]').length
+        + ' follow=' + (isAtBottomRef.current ? 1 : 0)
+        + ' restore=' + (historyRestoreInFlightRef.current ? 1 : 0)
+        + ' jump=' + (historyScrollInFlightRef.current ? 1 : 0)
+        + ' hydration=' + (hydrationRequestInFlightRef.current ? 1 : 0)
+        + ' wave=' + (mountWaveActiveRef.current ? 1 : 0));
+    };
+    sample('before');
+    requestAnimationFrame(() => {
+      sample('frame1');
+      requestAnimationFrame(() => {
+        sample('frame2');
+        setTimeout(() => sample('settled'), 200);
+      });
+    });
+  }, [tabId]);
   // Group toggles obey the same stationary-click law as card toggles (see
   // applyHistoryRevealUpdate): the clicked header does not move. Expand
   // grows the list BELOW the header (unpin first, or followOutput treats the
   // growth as new content and jumps to the new bottom — the reported
-  // «нажимаю, и строчка уходит вверх»); collapse keeps scrollTop and turns
-  // any clamp deficit into tail reserve. Toggles are click-driven, so the
-  // header is on screen by construction — no above-viewport branch.
+  // «нажимаю, и строчка уходит вверх»). Collapse accepts the browser's new
+  // scroll range; no fake footer is created. Toggles are click-driven, so the
+  // header is on screen by construction.
   const expandGroupPreservingViewport = useCallback((groupKey: string, reason: string) => {
+    const scroller = virtuosoScrollerRef.current;
+    let clickedHeader: HTMLElement | null = null;
+    if (scroller) {
+      for (const node of Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-group]'))) {
+        if (node.getAttribute('data-history-group') === groupKey) { clickedHeader = node; break; }
+      }
+    }
+    const scrollerTop = scroller?.getBoundingClientRect().top ?? 0;
+    const targetHeaderTop = clickedHeader
+      ? clickedHeader.getBoundingClientRect().top - scrollerTop
+      : null;
+    const ownerKey = historyOwnerKeyRef.current;
+    const ownerGeneration = historyOwnerGenerationRef.current;
+    const gestureGeneration = historyUserGestureGenerationRef.current;
     historyDiag('GROUP_EXPAND tab=' + tabId.slice(-12)
       + ' key=' + groupKey.slice(0, 24)
       + ' reason=' + reason);
+    traceHistoryGroupToggleGeometry(groupKey, 'expand', reason);
     historyRevealOps.unpinTail();
-    setExpandedGroupKeys((previous) => {
-      if (previous.has(groupKey)) return previous;
-      const next = new Set(previous);
-      next.add(groupKey);
-      return next;
+    flushSync(() => {
+      setExpandedGroupKeys((previous) => {
+        if (previous.has(groupKey)) return previous;
+        const next = new Set(previous);
+        next.add(groupKey);
+        return next;
+      });
     });
-  }, [historyRevealOps, tabId]);
+    if (scroller && targetHeaderTop !== null) {
+      stabilizeHistoryRevealAnchor({
+        targetTop: targetHeaderTop,
+        readAnchorTop: () => {
+          if (!scroller.isConnected) return null;
+          for (const node of Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-group]'))) {
+            if (node.getAttribute('data-history-group') === groupKey) {
+              return node.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+            }
+          }
+          return null;
+        },
+        adjustScrollBy: (delta: number) => {
+          scroller.scrollTop += delta;
+        },
+        isCurrent: () => (
+          scroller.isConnected
+          && historyOwnerKeyRef.current === ownerKey
+          && historyOwnerGenerationRef.current === ownerGeneration
+        ),
+        hasUserGesture: () => (
+          historyPointerScrollActiveRef.current
+          || historyUserGestureGenerationRef.current !== gestureGeneration
+        ),
+        onFinish: (outcome: any) => {
+          historyDiag('GROUP_ANCHOR_SETTLE tab=' + tabId.slice(-12)
+            + ' key=' + groupKey.slice(0, 24)
+            + ' reason=' + reason
+            + ' outcome=' + outcome.reason
+            + ' frames=' + outcome.frames
+            + ' writes=' + outcome.writes
+            + ' maxDriftPx=' + Math.round(outcome.maxDriftPx));
+        },
+      });
+    }
+  }, [historyRevealOps, tabId, traceHistoryGroupToggleGeometry]);
   const collapseGroupPreservingViewport = useCallback((groupKey: string) => {
-    const scroller = virtuosoScrollerRef.current;
-    const scrollTopBefore = scroller?.scrollTop ?? 0;
     // Same order as the card path: following off BEFORE the resize, or a
     // stale tail pin rides the shrink to the new bottom (+246px measured).
+    traceHistoryGroupToggleGeometry(groupKey, 'collapse', 'header');
     historyRevealOps.unpinTail();
     flushSync(() => {
       setExpandedGroupKeys((previous) => {
@@ -12267,10 +12256,7 @@ function HistoryPanel({
         return next;
       });
     });
-    if (scroller) {
-      holdHistoryShrinkFrame(scroller, scrollTopBefore, historyRevealOps);
-    }
-  }, [historyRevealOps]);
+  }, [historyRevealOps, traceHistoryGroupToggleGeometry]);
   /**
    * Collapse from the expanded rail — either any segment of its vertical line
    * or the arrow at the foot.
@@ -12283,20 +12269,15 @@ function HistoryPanel({
    * expansion collapsed INTO.
    *
    * Two cases, one rule («land on the header»):
-   *  - header still on screen → hold position; the header does not move, so
-   *    nothing moves at all — the best possible outcome;
+   *  - header still on screen → do not add another scroll command;
    *  - header scrolled off above → put it back at the top of the viewport.
-   * The shrink-hold machinery is reused as-is: passing the TARGET position
-   * makes it arm exactly the tail reserve that position needs, so a block near
-   * the bottom cannot be clamped away from it.
+   * Near the physical bottom the browser may clamp the requested top position;
+   * visibility of the header is the contract, not an impossible empty tail.
    */
   const collapseGroupFromFoot = useCallback((
     groupKey: string,
     source: 'foot' | 'rail' = 'foot',
   ) => {
-    const collapseReason = source === 'rail'
-      ? 'group-rail-collapse'
-      : 'group-foot-collapse';
     const scroller = virtuosoScrollerRef.current;
     if (!scroller) {
       collapseGroupPreservingViewport(groupKey);
@@ -12309,20 +12290,17 @@ function HistoryPanel({
     for (const node of Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-group]'))) {
       if (node.getAttribute('data-history-group') === groupKey) { header = node; break; }
     }
-    const scrollTopBefore = scroller.scrollTop;
     const headerOffset = header
       ? header.getBoundingClientRect().top - scroller.getBoundingClientRect().top
       : null;
     const headerIndex = displayUnits.findIndex(
       (unit: any) => unit?.kind === 'group' && unit.key === groupKey,
     );
-    const target = headerOffset !== null && headerOffset < 0
-      ? Math.max(0, scrollTopBefore + headerOffset - 8)
-      : scrollTopBefore;
     historyDiag('GROUP_COLLAPSE tab=' + tabId.slice(-12)
       + ' key=' + groupKey.slice(0, 24)
       + ' reason=' + source
       + ' headerOffset=' + (headerOffset === null ? 'virtualized' : Math.round(headerOffset)));
+    traceHistoryGroupToggleGeometry(groupKey, 'collapse', source);
     historyRevealOps.unpinTail();
     flushSync(() => {
       setExpandedGroupKeys((previous) => {
@@ -12355,109 +12333,11 @@ function HistoryPanel({
             - scroller.getBoundingClientRect().top;
           const landedTarget = Math.max(0, scroller.scrollTop + landedOffset - 8);
           scroller.scrollTop = landedTarget;
-          holdHistoryShrinkFrame(scroller, landedTarget, historyRevealOps, {
-            reason: collapseReason,
-            exactTarget: true,
-          });
         });
       });
       return;
     }
-    if (target !== scrollTopBefore) scroller.scrollTop = target;
-    holdHistoryShrinkFrame(scroller, target, historyRevealOps, { reason: collapseReason });
-  }, [collapseGroupPreservingViewport, displayUnits, historyRevealOps, tabId]);
-
-  // A provisional terminal footer is not a durable History row, but it still
-  // changes the same scroller's physical height. Capture the reading position
-  // BEFORE replacing/clearing it. If the resulting footer is shorter and the
-  // browser clamps the viewport, the existing tail reserve replaces exactly
-  // the missing pixels. Appends that only grow the footer cost two cheap frame
-  // checks and never arm a reserve.
-  const terminalPreviewGeometryTransitionRef = useRef<{
-    ownerKey: string;
-    scrollTopBefore: number;
-    scrollHeightBefore: number;
-    followBottom: boolean;
-    gestureGeneration: number;
-    reason: string;
-  } | null>(null);
-  const terminalPreviewGeometryFramesRef = useRef<{
-    first: number;
-    second: number;
-  } | null>(null);
-  const captureTerminalPreviewGeometry = useCallback((reason: string) => {
-    const scroller = virtuosoScrollerRef.current;
-    if (!scroller) return;
-    const pending = terminalPreviewGeometryTransitionRef.current;
-    // Several coalesced preview events before React paints are one physical
-    // resize. Preserve the earliest pre-change geometry, not an intermediate
-    // already-clamped sample.
-    if (pending?.ownerKey === historyOwnerKey) return;
-    terminalPreviewGeometryTransitionRef.current = {
-      ownerKey: historyOwnerKey,
-      scrollTopBefore: scroller.scrollTop,
-      scrollHeightBefore: scroller.scrollHeight,
-      followBottom: isAtBottomRef.current,
-      gestureGeneration: historyUserGestureGenerationRef.current,
-      reason,
-    };
-  }, [historyOwnerKey]);
-  useLayoutEffect(() => {
-    const pending = terminalPreviewGeometryTransitionRef.current;
-    if (!pending || pending.ownerKey !== historyOwnerKey) {
-      if (pending) terminalPreviewGeometryTransitionRef.current = null;
-      return;
-    }
-    if (terminalPreviewGeometryFramesRef.current) return;
-    const frames = { first: 0, second: 0 };
-    terminalPreviewGeometryFramesRef.current = frames;
-    frames.first = requestAnimationFrame(() => {
-      frames.second = requestAnimationFrame(() => {
-        if (terminalPreviewGeometryFramesRef.current !== frames) return;
-        terminalPreviewGeometryFramesRef.current = null;
-        const transition = terminalPreviewGeometryTransitionRef.current;
-        terminalPreviewGeometryTransitionRef.current = null;
-        if (!transition || transition.ownerKey !== historyOwnerKey) return;
-        const scroller = virtuosoScrollerRef.current;
-        if (!scroller?.isConnected) return;
-        const gestureChanged = historyUserGestureGenerationRef.current
-          !== transition.gestureGeneration;
-        const deficit = historyTailReserveDeficitAfterShrink(
-          scroller,
-          transition.scrollTopBefore,
-        );
-        historyDiag('TERMINAL_PREVIEW_GEOMETRY tab=' + tabId.slice(-12)
-          + ' reason=' + transition.reason
-          + ' beforeTop=' + Math.round(transition.scrollTopBefore)
-          + ' beforeHeight=' + Math.round(transition.scrollHeightBefore)
-          + ' afterTop=' + Math.round(scroller.scrollTop)
-          + ' afterHeight=' + Math.round(scroller.scrollHeight)
-          + ' deficit=' + deficit
-          + ' followBefore=' + (transition.followBottom ? '1' : '0')
-          + ' followNow=' + (isAtBottomRef.current ? '1' : '0')
-          + ' gestureChanged=' + (gestureChanged ? '1' : '0'));
-        if (isAtBottomRef.current) {
-          historyTailPinScheduler.schedule({ shouldPin: true });
-          return;
-        }
-        if (gestureChanged || deficit <= 2) return;
-        holdHistoryShrinkFrame(scroller, transition.scrollTopBefore, historyRevealOps, {
-          reason: 'terminal-preview-shrink-hold',
-          allowExistingGesture: true,
-          gestureGenerationAtStart: transition.gestureGeneration,
-        });
-      });
-    });
-  }, [historyOwnerKey, historyRevealOps, historyTailPinScheduler, tabId, terminalPreview]);
-  useLayoutEffect(() => () => {
-    const frames = terminalPreviewGeometryFramesRef.current;
-    if (frames) {
-      cancelAnimationFrame(frames.first);
-      if (frames.second) cancelAnimationFrame(frames.second);
-      terminalPreviewGeometryFramesRef.current = null;
-    }
-    terminalPreviewGeometryTransitionRef.current = null;
-  }, [historyOwnerKey]);
+  }, [collapseGroupPreservingViewport, displayUnits, historyRevealOps, tabId, traceHistoryGroupToggleGeometry]);
   // Visible index range from Virtuoso. Drives the visible-uuid set without
   // an IntersectionObserver (cheaper, exact: no threshold guessing).
   const visibleRangeRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
@@ -12619,6 +12499,7 @@ function HistoryPanel({
       return;
     }
     if (event.cancelable) event.preventDefault();
+    historyInnerOwnedWheelEvents.add(event);
     event.stopPropagation();
     innerScroller.scrollTop += delta;
   }, []);
@@ -12703,11 +12584,11 @@ function HistoryPanel({
     if (matchPositions.length > 0) {
       setCurrentMatchIdx(0);
       const match = matchPositions[0];
-      isAtBottomRef.current = false;
+      setHistoryTailFollowIntent(false);
       historyTailPinScheduler.cancel();
       virtuosoRef.current?.scrollToIndex({ index: match.entryIdx, align: 'center', behavior: 'smooth' });
     }
-  }, [historyTailPinScheduler, searchQuery]);
+  }, [historyTailPinScheduler, searchQuery, setHistoryTailFollowIntent]);
 
   // Navigate to current match entry. A match found by main can live outside
   // the hydrated span (that is the whole reason the search moved to main), so
@@ -12716,7 +12597,7 @@ function HistoryPanel({
   const scrollToMatch = useCallback((idx: number) => {
     if (idx < 0 || idx >= matchPositions.length) return;
     const match = matchPositions[idx];
-    isAtBottomRef.current = false;
+    setHistoryTailFollowIntent(false);
     historyTailPinScheduler.cancel();
     // A match inside a collapsed series: expand its group first so the
     // highlight pass has real text to walk. The unit index shifts after the
@@ -12734,14 +12615,14 @@ function HistoryPanel({
     // rowStub check runs by uuid over the ENTRY array (match.entryIdx is a
     // display-unit index and must not address the server-entry array).
     if (toolType === 'codex') {
-      const serverEntry = presentationEntriesRef.current.find(
-        (row) => row.uuid === match.entryUuid,
-      );
-      if ((serverEntry as any)?.rowStub) {
+      if (isHistoryHydrationTargetStub(
+        presentationEntriesRef.current,
+        match.entryUuid,
+      )) {
         requestHistoryHydrationAt(match.entryUuid, 'search-match', ' idx=' + match.entryIdx);
       }
     }
-  }, [expandGroupForUuid, historyTailPinScheduler, matchPositions, requestHistoryHydrationAt, toolType]);
+  }, [expandGroupForUuid, historyTailPinScheduler, matchPositions, requestHistoryHydrationAt, setHistoryTailFollowIntent, toolType]);
 
   const goNextMatch = useCallback(() => {
     if (matchPositions.length === 0) return;
@@ -12906,17 +12787,25 @@ function HistoryPanel({
   // Reads the latest length via ref so consumer effects don't need to depend
   // on `entries` (the callback identity stays stable).
   const scrollToBottom = useCallback((smooth = false) => {
-    // Reaching the real bottom is a terminal state for the tail reserve.
-    historyTailSpacerRef.current.reset('scroll-to-bottom');
+    // Explicit command is itself the intent proof; the resulting scroll event
+    // must not depend on a preceding wheel/keyboard gesture.
+    setHistoryTailFollowIntent(true);
     scheduleHistoryBottomScroll({
       virtuoso: virtuosoRef.current,
       itemCount: lengthRef.current,
       getScroller: () => virtuosoScrollerRef.current,
+      getOwnerToken: () => (
+        historyOwnerKeyRef.current + ':' + historyOwnerGenerationRef.current
+      ),
       smooth,
     });
-  }, []);
+  }, [setHistoryTailFollowIntent]);
 
   const handleControlsHeightChange = useCallback((height: number) => {
+    // During the deferred owner beat this measurement belongs to the OLD tab;
+    // applying it to the new workspace would mix owners even though the rows
+    // are hidden behind the curtain.
+    if (staleOwnerCurtain) return;
     const nextHeight = Math.max(0, Math.ceil(height));
     if (controlsHeightRef.current === nextHeight) return;
     const previousHeight = controlsHeightRef.current;
@@ -12941,7 +12830,6 @@ function HistoryPanel({
     const grew = Math.max(0, nextHeight - previousHeight);
     const liveAtBottom = scroller
       ? isHistoryAtContentBottom(scroller, {
-        spacerPx: historyTailSpacerRef.current.get(),
         slackPx: grew,
       })
       : null;
@@ -12959,7 +12847,7 @@ function HistoryPanel({
     if (mainSurface) {
       historyTailPinScheduler.schedule({ shouldPin: shouldKeepTailVisible });
     }
-  }, [historyTailPinScheduler, mainSurface, onControlsHeightChange, tabId]);
+  }, [historyTailPinScheduler, mainSurface, onControlsHeightChange, staleOwnerCurtain, tabId]);
 
   const appendLocalPromptEntry = useCallback((
     text: string,
@@ -14795,7 +14683,7 @@ function HistoryPanel({
     // New owner starts pinned to the tail until ITS rows report otherwise;
     // a leftover false from the previous owner would suppress followOutput
     // on a tab that opens at the bottom.
-    isAtBottomRef.current = true;
+    setHistoryTailFollowIntent(true);
     if (scrollSaveTimerRef.current) {
       // A scroll-idle save armed by the previous owner must not observe the
       // next owner's scroller (the timer's own stale-guard also covers this;
@@ -15171,9 +15059,6 @@ function HistoryPanel({
       return;
     }
     initialLoadDoneRef.current = true;
-    // Owner guard 2: any restore/convergence starts from a zero tail reserve —
-    // the tail branches measure distance to the REAL bottom.
-    historyTailSpacerRef.current.mustBeZero('restore-start');
     // Geometry restores the PIXEL position the user left — which is the wrong
     // target for a tail-pinned reader when rows arrived while they were away:
     // the old tail offset is now mid-list, and nothing after mount would
@@ -15230,7 +15115,7 @@ function HistoryPanel({
           historyRestoreInFlightRef.current = 0;
           // The gate's velocity sample of this machine jump arrives AFTER
           // the release — cover the echo window (velocity=464679 flash).
-          stampHistoryMachineScrollCooldown();
+          historyScrollSeekController.stampMachineScrollCooldown();
         }
       };
       const measureDrift = () => {
@@ -15312,7 +15197,7 @@ function HistoryPanel({
     const settleRestoreAndBankGeometry = (ownerAtRestore: string, restoreToken: number) => {
       if (historyRestoreInFlightRef.current === restoreToken) {
         historyRestoreInFlightRef.current = 0;
-        stampHistoryMachineScrollCooldown();
+        historyScrollSeekController.stampMachineScrollCooldown();
         // The machine stopped moving, so the visible range finally means a
         // reading position: check it once. Ranges published DURING the hunt
         // were refused above, and this is the event that says they may now be
@@ -15351,7 +15236,7 @@ function HistoryPanel({
       if (index !== undefined) {
         // The restored position is mid-list: Virtuoso followOutput must not
         // treat a live append as "user is at the tail" and yank away.
-        isAtBottomRef.current = false;
+        setHistoryTailFollowIntent(false);
         const ownerAtRestore = historyOwnerKey;
         const generationAtRestore = historyOwnerGenerationRef.current;
         const restoreGenAtStart = ++scrollRestoreGenRef.current;
@@ -15572,7 +15457,6 @@ function HistoryPanel({
           + ' current=' + String(previous?.previewId || '').slice(-18));
         return;
       }
-      if (previous) captureTerminalPreviewGeometry('apply');
       terminalPreviewRef.current = incoming as TerminalHistoryPreview;
       setTerminalPreview(incoming as TerminalHistoryPreview);
       historyDiag('TERMINAL_PREVIEW_APPLY tab=' + tabId.slice(-12)
@@ -15598,7 +15482,6 @@ function HistoryPanel({
       if (detail.action === 'clear') {
         const previous = terminalPreviewRef.current;
         if (!previous || previous.previewId === detail.previewId) {
-          if (previous) captureTerminalPreviewGeometry('clear');
           terminalPreviewRef.current = null;
           setTerminalPreview(null);
         }
@@ -15629,7 +15512,7 @@ function HistoryPanel({
       terminalPreviewRef.current = null;
       setTerminalPreview(null);
     };
-  }, [captureTerminalPreviewGeometry, sessionId, tabId, terminalHistoryStreamingEnabled, toolType]);
+  }, [sessionId, tabId, terminalHistoryStreamingEnabled, toolType]);
 
   useEffect(() => {
     const onTerminalPreviewDiagnosticResult = (_event: any, detail: any) => {
@@ -15672,23 +15555,17 @@ function HistoryPanel({
 
   useLayoutEffect(() => {
     if (!terminalPreview || !isAtBottomRef.current) return;
-    let secondFrame = 0;
-    const firstFrame = requestAnimationFrame(() => {
-      secondFrame = requestAnimationFrame(() => {
-        const scroller = virtuosoScrollerRef.current;
-        if (!scroller || !isAtBottomRef.current) return;
-        scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    historyTailPinScheduler.schedule({
+      shouldPin: true,
+      delayFrames: 2,
+      onApplied: (scroller: HTMLElement) => {
         historyDiag('TERMINAL_PREVIEW_PIN tab=' + tabId.slice(-12)
           + ' preview=' + terminalPreview.previewId.slice(-18)
           + ' seq=' + terminalPreview.previewSeq
           + ' scrollTop=' + Math.round(scroller.scrollTop));
-      });
+      },
     });
-    return () => {
-      cancelAnimationFrame(firstFrame);
-      if (secondFrame) cancelAnimationFrame(secondFrame);
-    };
-  }, [tabId, terminalPreview?.previewId, terminalPreview?.previewSeq]);
+  }, [historyTailPinScheduler, tabId, terminalPreview?.previewId, terminalPreview?.previewSeq]);
 
   // Both PTY agents expose canonical incremental transcript records. Project
   // that same stream into desktop History while the turn is busy,
@@ -15966,12 +15843,6 @@ function HistoryPanel({
   // the loop must survive the re-render caused by clearing historyScrollToUuid.
   const scrollGenRef = useRef(0);
   const scrollMountedRef = useRef(true);
-  const historyScrollInFlightRef = useRef<{
-    uuid: string;
-    gen: number;
-    startedAt: number;
-    attempts: number;
-  } | null>(null);
   const lastProgrammaticHistoryScrollRef = useRef<{
     uuid: string;
     doneAt: number;
@@ -15981,22 +15852,6 @@ function HistoryPanel({
     scrollEventLogged: boolean;
   } | null>(null);
   const historyTouchYRef = useRef<number | null>(null);
-  // Machine-driven motion must not engage scroll-seek placeholders. All three
-  // jump machines read as enormous velocity to Virtuoso but stop producing
-  // samples the moment they land — the retest (04.08 22:08) showed seek mode
-  // stuck on a motionless screen for 44s after a position restore (ENTER
-  // velocity=51087, no further samples to trigger exit). Registered per
-  // mounted panel; any instance's active machine suppresses entry.
-  useEffect(() => {
-    const suppressor = () =>
-      historyRestoreInFlightRef.current !== 0
-      || historyScrollInFlightRef.current !== null
-      || isAtBottomRef.current;
-    historySeekSuppressors.add(suppressor);
-    return () => {
-      historySeekSuppressors.delete(suppressor);
-    };
-  }, []);
 
   // ===== Mount wave: step machine =====
   // One step = pick the topmost mounted shell in (or nearest to) the
@@ -16025,8 +15880,8 @@ function HistoryPanel({
     // Scroll-seek replaces every row with its own placeholder — the DOM has
     // no shells to count, and "no shells" must not read as "wave drained"
     // (seek exit would then mount the whole viewport in one giant commit).
-    if (historyScrollSeekActive) {
-      historySeekExitListeners.add(() => requestHistoryMountWaveStep(lane));
+    if (historyScrollSeekController.isActive()) {
+      historyScrollSeekController.onExitOnce(() => requestHistoryMountWaveStep(lane));
       return;
     }
     const scroller = virtuosoScrollerRef.current;
@@ -16097,13 +15952,8 @@ function HistoryPanel({
     meta.pendingStepUuids = targets;
     // Tail-pin capture BEFORE the commit: an exact-height shell swap should
     // not move the tail, but sub-pixel rounding across many rows can drift
-    // it — same protection the Timeline expand wave uses. Measured against
-    // the CONTENT bottom: with a reserve armed the bare geometry reads
-    // "not at the bottom" for a reader standing exactly there, and the hold
-    // below would silently stop running.
-    meta.keepBottom = isHistoryAtContentBottom(scroller, {
-      spacerPx: historyTailSpacerRef.current.get(),
-    });
+    // it — same protection the Timeline expand wave uses.
+    meta.keepBottom = isHistoryAtContentBottom(scroller);
     if (!meta.loggedStart) {
       meta.loggedStart = true;
       historyDiag('MOUNT_WAVE_START tab=' + tabId.slice(-12)
@@ -16190,14 +16040,10 @@ function HistoryPanel({
       // is the exact fight the restore token exists to prevent).
       if (meta.keepBottom && !historyRestoreInFlightRef.current) {
         const scroller = virtuosoScrollerRef.current;
-        const spacerPx = historyTailSpacerRef.current.get();
-        if (scroller && !isHistoryAtContentBottom(scroller, { spacerPx })) {
-          // Re-pin to the CONTENT bottom. Aiming at the raw scroll maximum
-          // with a reserve armed would scroll INTO the fake empty space and
-          // push the very rows the user is reading off the top.
+        if (scroller && !isHistoryAtContentBottom(scroller)) {
           scroller.scrollTop = Math.max(
             0,
-            scroller.scrollHeight - scroller.clientHeight - spacerPx,
+            scroller.scrollHeight - scroller.clientHeight,
           );
         }
       }
@@ -16260,6 +16106,7 @@ function HistoryPanel({
   }, [tabId]);
 
   const handleUserScrollIntent = useCallback((event: Event) => {
+    if (event.type === 'wheel' && historyInnerOwnedWheelEvents.delete(event)) return;
     const reason = event.type === 'touchmove' ? 'user-touchmove' : 'user-wheel';
     historyUserGestureAtRef.current = performance.now();
     historyUserGestureGenerationRef.current += 1;
@@ -16274,21 +16121,28 @@ function HistoryPanel({
     }
     let isUpwardIntent = false;
     if (event.type === 'wheel') {
-      isUpwardIntent = (event as WheelEvent).deltaY < 0;
+      const deltaY = (event as WheelEvent).deltaY;
+      isUpwardIntent = deltaY < 0;
+      historyUserScrollDirectionRef.current = deltaY < 0
+        ? 'up'
+        : deltaY > 0 ? 'down' : null;
       // Pre-engage the seek gate for violent flings: the wheel event carries
       // the delta BEFORE the scroll sample exists, so the first frame of a
       // hard fling can already render placeholders instead of paying a full
       // heavy-row mount (the 796ms pre-ENTER task from the 22:08 retest).
-      armHistoryWheelBurst((event as WheelEvent).deltaY);
+      historyScrollSeekController.armWheelBurst((event as WheelEvent).deltaY);
     } else if (event.type === 'touchmove') {
       const touch = (event as TouchEvent).touches[0];
       const nextY = touch?.clientY ?? null;
       const previousY = historyTouchYRef.current;
       isUpwardIntent = nextY !== null && previousY !== null && nextY > previousY;
+      historyUserScrollDirectionRef.current = previousY === null || nextY === null
+        ? null
+        : isUpwardIntent ? 'up' : 'down';
       historyTouchYRef.current = nextY;
     }
     if (isUpwardIntent) {
-      isAtBottomRef.current = false;
+      setHistoryTailFollowIntent(false);
       historyTailPinScheduler.cancel();
     }
     // Any real wheel/touch takes position ownership from a running restore
@@ -16314,10 +16168,12 @@ function HistoryPanel({
 
   const handleHistoryTouchStart = useCallback((event: TouchEvent) => {
     historyTouchYRef.current = event.touches[0]?.clientY ?? null;
+    historyUserScrollDirectionRef.current = null;
   }, []);
 
   const handleHistoryTouchEnd = useCallback(() => {
     historyTouchYRef.current = null;
+    historyUserScrollDirectionRef.current = null;
   }, []);
 
   const handleHistoryScrollerPointerDown = useCallback((event: PointerEvent) => {
@@ -16332,6 +16188,7 @@ function HistoryPanel({
       historyPointerScrollActiveRef.current = true;
       historyUserGestureAtRef.current = performance.now();
       historyUserGestureGenerationRef.current += 1;
+      historyUserScrollDirectionRef.current = null;
       const burst = hydrationBurstRef.current;
       burst.since = performance.now();
       burst.count = 0;
@@ -16341,6 +16198,7 @@ function HistoryPanel({
 
   const handleHistoryScrollerPointerEnd = useCallback(() => {
     historyPointerScrollActiveRef.current = false;
+    historyUserScrollDirectionRef.current = null;
   }, []);
 
   const handleHistoryScrollerKeyIntent = useCallback((event: KeyboardEvent) => {
@@ -16356,8 +16214,9 @@ function HistoryPanel({
       || event.key === 'PageUp'
       || event.key === 'Home'
       || (event.key === ' ' && event.shiftKey);
+    historyUserScrollDirectionRef.current = movesUp ? 'up' : 'down';
     if (!movesUp) return;
-    isAtBottomRef.current = false;
+    setHistoryTailFollowIntent(false);
     historyTailPinScheduler.cancel();
   }, [historyTailPinScheduler]);
 
@@ -16439,7 +16298,7 @@ function HistoryPanel({
       historyJumpHydrationActiveRef.current = false;
       // Same echo hazard as position restores: the jump's own velocity
       // sample lands after the in-flight suppressor clears.
-      stampHistoryMachineScrollCooldown();
+      historyScrollSeekController.stampMachineScrollCooldown();
       historyDiag('SCROLL_TO_DONE tab=' + tabId.slice(-12) +
         ' uuid=' + targetUuid.slice(0, 8) +
         panelDiagContextRef.current +
@@ -16492,7 +16351,7 @@ function HistoryPanel({
       }
       const now = performance.now();
       const targetIsStub = toolType === 'codex'
-        && !!(entriesRef.current[currentIdx] as any)?.rowStub;
+        && isHistoryHydrationTargetStub(entriesRef.current, targetUuid);
       if (targetIsStub) {
         if (stubWaitStartedAt === null) stubWaitStartedAt = now;
         historyJumpHydrationActiveRef.current = true;
@@ -16587,8 +16446,8 @@ function HistoryPanel({
   const handleScroll = useCallback(() => {
     const el = virtuosoScrollerRef.current;
     if (!el) return;
-    // Keep the seek-kick target on the element that is actually moving.
-    historySeekScroller = el;
+    // Keep the panel-local seek kick on the element that is actually moving.
+    historyScrollSeekController.setScroller(el);
     const deltaTop = el.scrollTop - lastScrollTopRef.current;
     // The hydration burst breaker is deliberately NOT re-armed on mere
     // scrollTop movement: every reload of the loop this breaker exists to
@@ -16621,52 +16480,29 @@ function HistoryPanel({
           ' jumpScrollTop=' + Math.round(lastJump.scrollTop));
       }
     }
-    // Tail-spacer burn: scrolling AWAY from the bottom consumes the reserve
-    // by the distance travelled, so the fake bottom shrinks toward the real
-    // one and disappears by the time the user is back in the content.
-    // Ownership proof required (prod 17.08, tab-3314): after a collapse the
-    // browser clamp, Virtuoso's late measurement pass and the hold loop all
-    // emit scroll events with a negative delta. Burning on the raw delta let
-    // the reserve consume itself in ~0.8s with no gesture at all — ~40 burns
-    // down to zero — and the frame jumped. Only a real upward gesture (or an
-    // in-progress scrollbar drag) may consume it; a live hold vetoes all.
-    const spacer = historyTailSpacerRef.current;
-    if (spacer.get() > 0 && deltaTop < 0) {
-      const userOwned = isUserOwnedScrollBurn({
-        holdActive: historyTailHoldTargetRef.current !== null,
-        pointerScrollActive: historyPointerScrollActiveRef.current,
-        msSinceGesture: performance.now() - historyUserGestureAtRef.current,
-      });
-      if (userOwned) {
-        spacer.burn(-deltaTop, 'user-scroll');
-      } else if (!historyTailSpacerBurnBlockLoggedRef.current) {
-        historyTailSpacerBurnBlockLoggedRef.current = true;
-        historyDiag('TAIL_SPACER burn-blocked tab=' + tabId.slice(-12)
-          + ' px=' + spacer.get()
-          + ' delta=' + Math.round(-deltaTop)
-          + ' hold=' + (historyTailHoldTargetRef.current !== null ? 1 : 0)
-          + ' gen=' + historyUserGestureGenerationRef.current
-          + ' sinceGestureMs=' + Math.round(
-            performance.now() - historyUserGestureAtRef.current,
-          ));
-      }
-    }
-    const spacerPx = spacer.get();
-    // Bottom math is against the CONTENT bottom (reserve subtracted) — guard 1
-    // of the approved contract: with a reserve armed, standing at the visual
-    // bottom must still read as "at the tail", or follow-output silently dies.
-    // Since the composer became the column's last row, the scroller's bottom
-    // IS the input's top border — no overlay spacer to discount any more.
-    const distFromBottom = historyContentDistanceFromBottom(el, spacerPx);
-    const physicalPinned = isHistoryAtContentBottom(el, { spacerPx });
-    isAtBottomRef.current = reconcileHistoryTailFollowIntent({
+    // Since the composer is the column's last row, the physical scroller
+    // bottom is the only bottom. There is no synthetic footer to subtract.
+    const distFromBottom = historyContentDistanceFromBottom(el);
+    const physicalPinned = isHistoryAtContentBottom(el);
+    const recentGestureDirection = performance.now() - historyUserGestureAtRef.current <= 500
+      ? historyUserScrollDirectionRef.current
+      : null;
+    const pointerDirection = historyPointerScrollActiveRef.current
+      ? deltaTop < 0 ? 'up' : deltaTop > 0 ? 'down' : null
+      : null;
+    setHistoryTailFollowIntent(reconcileHistoryTailFollowIntent({
       currentIntent: isAtBottomRef.current,
       physicalPinned,
       userMovedAway: !physicalPinned && (
-        historyPointerScrollActiveRef.current
+        pointerDirection === 'up'
+        || recentGestureDirection === 'up'
         || historyScrollInFlightRef.current !== null
       ),
-    });
+      userReachedBottom: physicalPinned && (
+        pointerDirection === 'down'
+        || recentGestureDirection === 'down'
+      ),
+    }));
     if (scrollArrowRef.current) {
       scrollArrowRef.current.style.display = distFromBottom > 150 ? '' : 'none';
     }
@@ -16712,13 +16548,9 @@ function HistoryPanel({
       // Virtualized heights are estimates until measured, so scrollTop stops
       // meaning anything across remounts/re-measures; the anchor survives
       // both and an app restart (localStorage).
-      // «Follow the tail» is stored with the anchor, so it must be answered
-      // against the content bottom too: a reserve armed by a collapse would
-      // otherwise persist "the user was reading mid-list" for someone who is
-      // standing at the tail, and the next visit would refuse to follow.
       const anchor = captureHistoryAnchorFromDom(
         el,
-        isHistoryAtContentBottom(el, { spacerPx: historyTailSpacerRef.current.get() }),
+        isHistoryAtContentBottom(el),
       );
       if (anchor) {
         setHistoryReadingAnchor(saveKey, {
@@ -16931,8 +16763,9 @@ function HistoryPanel({
       // Overlay geometry belongs to the centered layout only; docked below the
       // terminal the composer is a normal bottom row of the workspace column.
       overlayComposer={mainSurface}
-      agentInputSurface={agentInputSurface}
-      suppressWindowEscape={suppressGlobalHotkeys}
+      agentInputSurface={agentInputSurface && !staleOwnerCurtain}
+      suppressWindowEscape={suppressGlobalHotkeys || staleOwnerCurtain}
+      interactionDisabled={staleOwnerCurtain}
       compactComposer={compactComposer}
     />
   ) : null;
@@ -16970,7 +16803,7 @@ function HistoryPanel({
       // itself. Same defect and same fix as FloatingTerminalFrame — see the
       // long note there. `embedded` placements are laid out inline and are only
       // closed when their width is 0.
-      inert={embedded ? (!embeddedFill && !slideIn) : !isOpen}
+      inert={(embedded ? (!embeddedFill && !slideIn) : !isOpen) || staleOwnerCurtain}
       data-history-owner={historyOwnerDomId}
       data-history-session={sessionId || undefined}
       data-history-viewport-ready={
@@ -17288,6 +17121,7 @@ function HistoryPanel({
                 historyPointerScrollActiveRef.current = false;
               }
               virtuosoScrollerRef.current = el as HTMLElement | null;
+              historyScrollSeekController.setScroller(el as HTMLElement | null);
               if (el && mountWaveActiveRef.current && mountWaveLaneRef.current) {
                 // Virtuoso attaches the scroller AFTER the panel's own layout
                 // effects on a fresh mount, so the effect-driven arm saw
@@ -17500,7 +17334,7 @@ function HistoryPanel({
             // of full markdown rows — mounting-and-discarding dozens of heavy
             // cards per frame is what made fast scrolling stutter. Real rows
             // return as soon as velocity drops (see the config's exit gate).
-            scrollSeekConfiguration={HISTORY_SCROLL_SEEK_CONFIG}
+            scrollSeekConfiguration={historyScrollSeekController.configuration}
             // Per-owner measured average for rows not yet measured. Without
             // it Virtuoso sizes the unknown region from the FIRST measured
             // row — a 40px prompt or a 500px diff card — and the scrollbar
@@ -17520,9 +17354,7 @@ function HistoryPanel({
             // growing footer moves the physical bottom before our next frame;
             // that must keep following. Wheel/touch/keyboard/scrollbar actions
             // explicitly turn the intent off, and reaching the tail turns it on.
-            followOutput={() => {
-              return isAtBottomRef.current ? 'auto' : false;
-            }}
+            followOutput={historyFollowOutputEnabled ? 'auto' : false}
             className="hp-history-transcript"
             style={{
               height: '100%',

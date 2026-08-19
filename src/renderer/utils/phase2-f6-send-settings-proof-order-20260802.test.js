@@ -171,13 +171,18 @@ async function buildScenarioBundle() {
         tabId: 'phase2-f6-tab',
         toolType: 'claude',
         runtime,
-        prompt: 'phase2 user prompt',
+        prompt: options.prompt || 'phase2 user prompt',
         handoffId: options.handoffId || 'phase2-f6-handoff',
         source: 'terminal-mcp',
         statusAtSend: 'active',
-        model: options.model,
-        effort: options.effort,
-        thinking: options.thinking,
+        settingsIntent: options.model || options.effort || options.thinking
+          ? {
+              kind: 'explicit-change',
+              model: options.model,
+              effort: options.effort,
+              thinking: options.thinking,
+            }
+          : { kind: 'none' },
         coordinatedSendToken: options.coordinatedSendToken,
       });
     }
@@ -371,6 +376,29 @@ test('F6 complete shared scenario -> Claude runtime -> IPC path reproves after s
     assert.equal(state.events.some((entry) => entry.kind === 'setting-write'), false);
     assert.equal(Boolean(state.lastPaste?.reserved), true);
     assert.equal(result?.submitted, true);
+  });
+
+  await t.test('Claude local slash uses command proof and never waits for a conversation user row', async () => {
+    const state = resetState();
+    const result = await scenario.runClaudeScenario({
+      handoffId: 'phase2-f6-local-status',
+      prompt: '/status',
+    });
+    assert.deepEqual({
+      commandWrites: state.events
+        .filter((entry) => entry.kind === 'setting-write')
+        .map((entry) => entry.command),
+      physicalPasteCount: state.events.filter((entry) => (
+        entry.kind === 'physical-paste-boundary'
+      )).length,
+      localSlashCommand: result?.localSlashCommand,
+      deliveryOutcome: result?.deliveryOutcome,
+    }, {
+      commandWrites: ['/status'],
+      physicalPasteCount: 0,
+      localSlashCommand: true,
+      deliveryOutcome: 'local-command-confirmed',
+    });
   });
 
   await t.test('Stop after /model proof cancels the remaining /effort and user prompt writes', async () => {

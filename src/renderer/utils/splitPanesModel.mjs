@@ -137,6 +137,28 @@ export const isEmptyPane = (p) => !p || !p.tabId;
 
 const clampIndex = (panes, index) => Math.max(0, Math.min(panes.length - 1, index | 0));
 
+/**
+ * ОДНО окно с вкладкой — это одиночный режим, просто другими словами.
+ *
+ * Правило старое (им заканчивается удаление окон), но раньше оно жило только
+ * там: раскладка «из одного» иначе и не получалась. С рабочими пространствами
+ * получается — новое пространство открывается одним ПУСТЫМ окном, и первая же
+ * положенная туда вкладка его заполняет. Без схлопывания вокруг единственной
+ * вкладки на весь экран остались бы рамка фокуса и шапка панели, то есть
+ * состояние, которого в приложении никогда не было.
+ *
+ * Пустое окно НЕ схлопывается: оно и есть содержимое пустого пространства, а
+ * «окон нет» здесь означает одиночный режим, который всегда показывает вкладку
+ * центра — то есть чужая вкладка сама приехала бы в пустое пространство.
+ *
+ * Возвращает `null`, когда схлопывать нечего.
+ */
+export function collapseLonePane(panes) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (list.length !== 1 || !list[0] || !list[0].tabId) return null;
+  return { panes: [], focusedIndex: 0 };
+}
+
 const finalizeRemoval = (panes, focusedIndex, idx) => {
   const filtered = panes.filter((_, i) => i !== idx);
   const real = filtered.filter((p) => !isEmptyPane(p));
@@ -164,25 +186,23 @@ const finalizeRemoval = (panes, focusedIndex, idx) => {
 // Three cases:
 //   • the tab is SHOWN somewhere      → focus that pane, change nothing;
 //   • the tab has a CHIP somewhere    → focus that pane and show it there;
-//   • the tab is nowhere              → it JOINS the focused window's strip, at
-//                                       the END, and is shown there.
+//   • the tab is nowhere              → it REPLACES the shown chip of the
+//                                       focused window, in place.
 //
-// The last case used to REPLACE the shown chip in place, on the theory that
-// ordinary navigation must never grow a strip — a person switches tabs dozens of
-// times an hour, and a strip growing from that would swallow the whole tab list
-// (and empty Ctrl+Tab with it, since it skips everything a window holds).
+// The last case has been BOTH ways, and the second reversal is deliberate, not
+// a forgotten lesson. Первая версия заменяла; юзер попросил добавление в конец
+// (*«чтобы когда я слева нажимаю на вкладку, она не заменяла текущую, а
+// открывалась в конце»*) — тогда обычный клик был ЕДИНСТВЕННЫМ жестом, и
+// замена молча уносила из окна вкладку, которую человек сам туда положил.
+// С появлением ⌘-клика («открыть в новом окне») жестов стало два, и роли
+// разделились: обычный клик МЕНЯЕТ текущее окно, ⌘ добавляет новое. Юзер о
+// возвращённом append: *«клик по вкладке не кладёт, меняет окно, а добавляет в
+// конце»* — то есть рост полосы от навигации снова стал багом.
 //
-// That theory was right about the danger and wrong about the remedy. Replacing
-// meant the window silently LOST a tab on every sidebar click: the chip the user
-// had put there is gone, and nothing said it would be. Юзер: *«сделай так, чтобы
-// когда я слева нажимаю на вкладку, она не заменяла текущую, а открывалась в
-// конце»*. Appending keeps both tabs and puts the newcomer where new things go —
-// the end, the same place the double-click gesture puts them.
-//
-// The runaway strip stays bounded by the OTHER rule instead: a tab already held
-// by some window is never added again, it is shown where it lives (case two). So
-// a strip grows only by tabs that were nowhere, and each of them lands exactly
-// once. Closing a chip is still the way to shrink it.
+// В КОНЕЦ полосы вкладка попадает жестами, которые так и называются: двойной
+// клик по шапке, «Move to window», перетаскивание. Активация — «покажи здесь»,
+// и её след в полосе — замена показанного чипа, с уходом прежнего в историю
+// окна (⌘[ вернёт его).
 export function resolveSplitActivation(panes, focusedIndex, projectId, tabId) {
   if (!Array.isArray(panes) || panes.length === 0) {
     return { panes: [], focusedIndex: 0, changed: false };
@@ -205,21 +225,24 @@ export function resolveSplitActivation(panes, focusedIndex, projectId, tabId) {
   const at = clampIndex(panes, focusedIndex);
   const slot = panes[at];
   const next = panes.slice();
-  // APPEND to the focused window's strip and show the newcomer. The end, not
-  // beside the shown chip: "newest goes last" is where the double-click gesture
-  // puts a tab too, and a chip inserted mid-strip would shift the positions the
-  // user is navigating by.
+  // REPLACE the shown chip in place: the incoming tab takes the slot the shown
+  // one occupied, so the positions the user navigates by do not shift, and the
+  // strip does not grow from ordinary navigation. The outgoing tab leaves the
+  // window (its chip is gone) and lands in the pane's history — the pane's own
+  // ⌘[ brings it back.
   //
-  // An EMPTY window (a placeholder) has no strip at all — the tab simply fills
-  // it, which `paneTabs` already reports as an empty list.
+  // An EMPTY window (a placeholder) has no strip at all — replaceInStrip on an
+  // empty list is an insert, so the tab simply fills it.
   //
   // The pane keeps its COLUMN, and this is why the strip is rebuilt through
   // `paneWithTabs(slot, …)` rather than written as a bare {projectId, tabId}:
   // that dropped the column and the pane silently jumped out of its stack —
   // measured live, filling the lower row of a split column turned two stacked
   // 409px rows into two 623px side-by-side columns.
-  const grown = paneTabs(slot).concat([{ projectId, tabId }]);
-  next[at] = paneWithHistoryFrom(paneWithTabs(slot, grown, tabId), slot);
+  const swapped = replaceInStrip(paneTabs(slot), slot.tabId, projectId, tabId);
+  next[at] = paneWithHistoryFrom(paneWithTabs(slot, swapped, tabId), slot);
+  const lone = collapseLonePane(next);
+  if (lone) return { ...lone, changed: true };
   return { panes: next, focusedIndex: at, changed: true };
 }
 
@@ -718,7 +741,7 @@ export function addPane(panes, focusedIndex, current, added) {
     next[emptyIdx] = slot && slot.column !== undefined
       ? { ...added, column: slot.column }
       : added;
-    return { panes: next, focusedIndex: emptyIdx };
+    return collapseLonePane(next) || { panes: next, focusedIndex: emptyIdx };
   }
   // Appending puts the tab in a NEW column, so the column cap decides.
   if (paneColumns(panes).length >= MAX_SPLIT_COLUMNS) return null;
@@ -990,8 +1013,21 @@ export function sanitizePanes(panes, focusedIndex, tabExists) {
       const { prevProjectId, prevTabId, ...rest } = p;
       return history.length > 0 ? { ...rest, history } : stripHistory(rest);
     });
-  // An all-empty layout is not a layout — nothing to come back to.
-  if (unique.length < 2 || !unique.some((p) => p.tabId)) return { panes: [], focusedIndex: 0 };
+  // Раскладка из одних пустых окон — ТОЖЕ раскладка. Это ровно то, как выглядит
+  // только что созданное рабочее пространство: окно есть, вкладок в нём нет.
+  //
+  // Раньше здесь стояло «нет ни одной вкладки — значит, нечего восстанавливать»,
+  // и это было верно, пока пустая панель означала «нажал деление, ещё не выбрал
+  // вкладку». С пространствами такое состояние стало обычным и долгим, а его
+  // потеря означает не «стало пусто», а обратное: без окон приложение переходит
+  // в одиночный режим, который ВСЕГДА показывает вкладку центра — то есть чужая
+  // вкладка сама приезжает в пустое пространство.
+  //
+  // Схлопывание одинокого НАСТОЯЩЕГО окна остаётся: одно окно с вкладкой и есть
+  // одиночный режим, это не потеря, а то же самое другими словами.
+  if (unique.length === 0) return { panes: [], focusedIndex: 0 };
+  const loneUnique = collapseLonePane(unique);
+  if (loneUnique) return loneUnique;
   // Truncation keeps whole COLUMNS: a flat slice can cut a stacked column in
   // half and leave a lone row where the user had a pair. Restores are already
   // within the caps in practice — this is the backstop for a hand-edited or
@@ -1001,8 +1037,10 @@ export function sanitizePanes(panes, focusedIndex, tabExists) {
     rows.slice(0, MAX_ROWS_PER_COLUMN).forEach(({ pane }) => kept.push(pane));
   });
   const next = normalizeColumns(kept);
-  if (next.length < 2) return { panes: [], focusedIndex: 0 };
-  return { panes: next, focusedIndex: clampIndex(next, focusedIndex) };
+  if (next.length === 0) return { panes: [], focusedIndex: 0 };
+  // То же правило после обрезки по пределам: уходит только одинокое окно С
+  // ВКЛАДКОЙ (оно же одиночный режим), пустое остаётся.
+  return collapseLonePane(next) || { panes: next, focusedIndex: clampIndex(next, focusedIndex) };
 }
 
 // ── Раскладка целиком, одним описанием ────────────────────────────────────
@@ -1301,6 +1339,63 @@ export function splitSizesFingerprint(sizes) {
   const f = (x) => Math.round(x * 1000);
   return (sizes.cols || []).map(f).join(',')
     + '|' + (sizes.rows || []).map((r) => r.map(f).join(',')).join(';');
+}
+
+/**
+ * Уголки ФОКУСНОГО окна, где встречаются колоночная и строчная перегородки, —
+ * ручки диагонального ресайза.
+ *
+ * Только у окна в фокусе, и это не украшение, а разрешение конфликта: в углу
+ * сходятся до четырёх окон, и «чей» это угол, без правила не ответить. Фокус
+ * уже выбран человеком — юзер: *«это работает только на той вкладке, на
+ * которой у меня фокус, потому что там очевидно скапливаются конфликты»*.
+ *
+ * Каждый уголок называет ДВЕ перегородки: колоночную (общую для всей
+ * раскладки) и строчную СВОЕЙ колонки. Пример юзера: колонка 1 — две вкладки
+ * друг над другом, колонка 2 — одна; фокус на нижней вкладке колонки 1, её
+ * правый верхний угол тянет одновременно границу колонок и границу строк
+ * первой колонки.
+ */
+export function splitCornerDescriptors(panes, focusedIndex, sizes = null) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (list.length < 2) return [];
+  const columns = paneColumns(list);
+  const norm = normalizeSplitSizes(list, sizes);
+  const at = clampIndex(list, focusedIndex);
+  let c = -1;
+  let j = -1;
+  columns.forEach((rows, columnIndex) => rows.forEach((row, rowIndex) => {
+    if (row.index === at) { c = columnIndex; j = rowIndex; }
+  }));
+  if (c < 0) return [];
+  let left = 0;
+  for (let i = 0; i < c; i += 1) left += norm.cols[i] * 100;
+  let top = 0;
+  for (let i = 0; i < j; i += 1) top += norm.rows[c][i] * 100;
+  const xEdges = [];
+  if (c > 0) xEdges.push({ side: 'left', dividerIndex: c - 1, xPct: left });
+  if (c < columns.length - 1) {
+    xEdges.push({ side: 'right', dividerIndex: c, xPct: left + norm.cols[c] * 100 });
+  }
+  const yEdges = [];
+  if (j > 0) yEdges.push({ side: 'top', dividerIndex: j - 1, yPct: top });
+  if (j < columns[c].length - 1) {
+    yEdges.push({ side: 'bottom', dividerIndex: j, yPct: top + norm.rows[c][j] * 100 });
+  }
+  const out = [];
+  xEdges.forEach((x) => yEdges.forEach((y) => {
+    out.push({
+      id: `corner:${x.side}:${y.side}`,
+      colDividerIndex: x.dividerIndex,
+      rowColumnIndex: c,
+      rowDividerIndex: y.dividerIndex,
+      xPct: x.xPct,
+      yPct: y.yPct,
+      // Диагональ курсора — по паре сторон: right+top и left+bottom это ↗↙.
+      cursor: (x.side === 'right') === (y.side === 'top') ? 'nesw-resize' : 'nwse-resize',
+    });
+  }));
+  return out;
 }
 
 /**

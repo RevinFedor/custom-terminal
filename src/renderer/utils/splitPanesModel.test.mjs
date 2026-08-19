@@ -192,8 +192,19 @@ test('окно, оставленное пустым, переживает пер
   const withEmpty = sanitizePanes([p('p1', 'a'), EMPTY], 1, exists);
   assert.equal(withEmpty.panes.length, 2, 'оба окна вернулись');
   assert.equal(withEmpty.panes[1].tabId, '');
-  // …но раскладка из одних пустых окон — не раскладка.
-  assert.deepEqual(sanitizePanes([EMPTY, EMPTY], 0, exists), { panes: [], focusedIndex: 0 });
+  // Раскладка из ОДНИХ пустых окон тоже переживает: это ровно то, как выглядит
+  // только что созданное рабочее пространство. Раньше здесь стояло обратное —
+  // «пустых вкладок нет, значит нечего восстанавливать», — и это стоило потери
+  // пустого пространства: без окон приложение уходит в одиночный режим, а он
+  // всегда показывает вкладку центра, то есть чужая вкладка сама приезжала в
+  // пустое пространство.
+  const allEmpty = sanitizePanes([EMPTY, EMPTY], 0, exists);
+  assert.equal(allEmpty.panes.length, 2, 'пустые окна остались');
+  const lone = sanitizePanes([EMPTY], 0, exists);
+  assert.equal(lone.panes.length, 1, 'одно пустое окно — состояние нового пространства');
+  // А одинокое окно С ВКЛАДКОЙ схлопывается: это и есть одиночный режим,
+  // просто другими словами.
+  assert.deepEqual(sanitizePanes([p('p1', 'a')], 0, exists), { panes: [], focusedIndex: 0 });
 });
 
 test('paneRects splits width evenly', () => {
@@ -522,26 +533,20 @@ test('opening a tab in a pane records what that pane showed before', () => {
 // ── Per-pane visit history (the per-pane Ctrl+Tab switcher) ───────────────
 
 test('the history is a LIST: every DEPARTED tab stacks, most recent first', () => {
-  // Активация теперь ДОБАВЛЯЕТ чип, а не заменяет, поэтому «ушло с экрана» и
-  // «ушло из окна» — разные события, и запоминать надо второе. Чипы убираем
-  // явно: это и есть уход из окна.
+  // Активация ЗАМЕНЯЕТ показанный чип, значит каждая активация — это и уход
+  // прежней вкладки из окна: история пишется тем же ходом.
   let panes = [p('p1', 'a'), p('p1', 'b')];
   for (const tab of ['c', 'd', 'e']) {
     panes = resolveSplitActivation(panes, 1, 'p1', tab).panes;
-    const gone = { c: 'b', d: 'c', e: 'd' }[tab];
-    panes = removeTabFromPane(panes, 1, gone).panes;
   }
   assert.deepEqual(paneHistory(panes[1]).map((e) => e.tabId), ['d', 'c', 'b']);
 });
 
 test('revisiting a tab moves it to the head instead of duplicating', () => {
   let panes = [p('p1', 'a'), p('p1', 'b')];
-  panes = resolveSplitActivation(panes, 1, 'p1', 'c').panes;
-  panes = removeTabFromPane(panes, 1, 'b').panes;              // history: b
+  panes = resolveSplitActivation(panes, 1, 'p1', 'c').panes;   // history: b
   panes = resolveSplitActivation(panes, 1, 'p1', 'b').panes;   // history: c — 'b' снова здесь
-  panes = removeTabFromPane(panes, 1, 'c').panes;
-  panes = resolveSplitActivation(panes, 1, 'p1', 'd').panes;
-  panes = removeTabFromPane(panes, 1, 'b').panes;              // history: b, c
+  panes = resolveSplitActivation(panes, 1, 'p1', 'd').panes;   // history: b, c
   assert.deepEqual(paneHistory(panes[1]).map((e) => e.tabId), ['b', 'c']);
 });
 
@@ -555,23 +560,20 @@ test('the legacy one-step prev fields read as a one-entry history', () => {
 
 test('the history is capped', () => {
   let panes = [p('p1', 'a'), p('p1', 'b')];
-  let previous = 'b';
   for (let i = 0; i < PANE_HISTORY_CAP + 10; i += 1) {
     panes = resolveSplitActivation(panes, 1, 'p1', 't' + i).panes;
-    panes = removeTabFromPane(panes, 1, previous).panes;
-    previous = 't' + i;
   }
   assert.equal(paneHistory(panes[1]).length, PANE_HISTORY_CAP);
 });
 
 test('restorablePaneHistory hides dead tabs and tabs visible in any pane', () => {
   const showThenDrop = (list, tab, gone) => (
-    removeTabFromPane(resolveSplitActivation(list, 1, 'p1', tab).panes, 1, gone).panes
+    resolveSplitActivation(list, 1, 'p1', tab).panes
   );
   let panes = [p('p1', 'a'), p('p1', 'b')];
-  panes = showThenDrop(panes, 'c', 'b');   // history: b
-  panes = showThenDrop(panes, 'd', 'c');   // history: c, b
-  panes = showThenDrop(panes, 'e', 'd');   // history: d, c, b
+  panes = showThenDrop(panes, 'c');   // history: b
+  panes = showThenDrop(panes, 'd');   // history: c, b
+  panes = showThenDrop(panes, 'e');   // history: d, c, b
   // 'c' was closed; 'a' shows in pane 0 but is not in this history anyway.
   const alive = (projectId, tabId) => tabId !== 'c';
   assert.deepEqual(
@@ -579,31 +581,31 @@ test('restorablePaneHistory hides dead tabs and tabs visible in any pane', () =>
     ['d', 'b'],
   );
   // …and stepping back lands on the first RESTORABLE entry, not a dead head.
-  const deadHead = showThenDrop(panes, 'f', 'e');  // history: e, d, c, b
+  const deadHead = showThenDrop(panes, 'f');  // history: e, d, c, b
   const back = restorePanePreviousTab(deadHead, 1, 'f', (pid, tid) => tid !== 'e');
   assert.equal(back.panes[1].tabId, 'd', 'skips the closed head entry');
 });
 
 test('middle-click on a history row forgets the entry without closing the tab', () => {
   let panes = [p('p1', 'a'), p('p1', 'b')];
-  panes = removeTabFromPane(resolveSplitActivation(panes, 1, 'p1', 'c').panes, 1, 'b').panes;
-  panes = removeTabFromPane(resolveSplitActivation(panes, 1, 'p1', 'd').panes, 1, 'c').panes;
+  panes = resolveSplitActivation(panes, 1, 'p1', 'c').panes;
+  panes = resolveSplitActivation(panes, 1, 'p1', 'd').panes;
   const res = dropFromPaneHistory(panes, 1, 'c');
   assert.deepEqual(paneHistory(res.panes[1]).map((e) => e.tabId), ['b']);
   assert.equal(dropFromPaneHistory(res.panes, 1, 'nope'), null, 'no change → null, no store write');
 });
 
 test('closing a tab purges it from every pane history', () => {
-  const showThenDrop = (list, at, tab, gone) => (
-    removeTabFromPane(resolveSplitActivation(list, at, 'p1', tab).panes, at, gone).panes
+  const showThenDrop = (list, at, tab) => (
+    resolveSplitActivation(list, at, 'p1', tab).panes
   );
   let panes = [p('p1', 'a'), p('p1', 'b')];
-  panes = showThenDrop(panes, 0, 'x', 'a');   // pane0 history: a
-  panes = showThenDrop(panes, 1, 'y', 'b');   // pane1 history: b
-  panes = showThenDrop(panes, 1, 'z', 'y');   // pane1 history: y, b
+  panes = showThenDrop(panes, 0, 'x');   // pane0 history: a
+  panes = showThenDrop(panes, 1, 'y');   // pane1 history: b
+  panes = showThenDrop(panes, 1, 'z');   // pane1 history: y, b
   // 'b' лежит в истории окна 1; проведём его ещё и через окно 0.
-  panes = showThenDrop(panes, 0, 'b', 'x');   // pane0 history: x, a
-  panes = showThenDrop(panes, 0, 'w', 'b');   // pane0 history: b, x, a
+  panes = showThenDrop(panes, 0, 'b');   // pane0 history: x, a
+  panes = showThenDrop(panes, 0, 'w');   // pane0 history: b, x, a
   const res = dropTabFromAllPaneHistories(panes, 'b');
   assert.ok(res);
   assert.ok(!paneHistory(res.panes[0]).some((e) => e.tabId === 'b'));
@@ -613,24 +615,20 @@ test('closing a tab purges it from every pane history', () => {
 
 test('sanitizePanes scrubs dead tabs out of surviving histories', () => {
   let panes = [p('p1', 'a'), p('p1', 'b')];
-  panes = removeTabFromPane(resolveSplitActivation(panes, 1, 'p1', 'c').panes, 1, 'b').panes;
-  panes = removeTabFromPane(resolveSplitActivation(panes, 1, 'p1', 'd').panes, 1, 'c').panes;
+  panes = resolveSplitActivation(panes, 1, 'p1', 'c').panes;
+  panes = resolveSplitActivation(panes, 1, 'p1', 'd').panes;
   const alive = (pid, tid) => tid !== 'c';
   const res = sanitizePanes(panes, 1, alive);
   assert.deepEqual(paneHistory(res.panes[1]).map((e) => e.tabId), ['b']);
 });
 
-test('файл, открытый в окне, возвращается СВОИМ ЖЕ чипом', () => {
-  // Пока активация заменяла показанную вкладку, открытие файла уносило агента
-  // из окна, и «шаг назад» был единственной дорогой обратно. Теперь агент
-  // остаётся чипом рядом — возвращаться некуда, туда просто кликают.
+test('файл, открытый в окне, возвращается ШАГОМ НАЗАД к прежней вкладке', () => {
+  // Активация заменяет показанный чип, поэтому открытие файла уводит агента из
+  // окна — и «шаг назад» (средний клик по чипу файла) обязан приводить обратно.
   const opened = resolveSplitActivation([p('p1', 'a'), p('p1', 'b')], 1, 'p1', 'file').panes;
-  assert.deepEqual(paneTabs(opened[1]).map((e) => e.tabId), ['b', 'file']);
-  assert.equal(restorePanePreviousTab(opened, 1, 'file'), null, 'нечего восстанавливать');
-  // Убрали чип файла — показ переходит соседу, тому же агенту.
-  const closed = removeTabFromPane(opened, 1, 'file');
-  assert.equal(closed.panes[1].tabId, 'b');
-  assert.equal(closed.emptied, false, 'окно живо');
+  assert.deepEqual(paneTabs(opened[1]).map((e) => e.tabId), ['file']);
+  const back = restorePanePreviousTab(opened, 1, 'file');
+  assert.equal(back.panes[1].tabId, 'b', 'агент вернулся');
 });
 
 test('restore returns null when there is nothing to step back to', () => {
@@ -642,10 +640,7 @@ test('restore returns null when there is nothing to step back to', () => {
 test('restore refuses a tab that was closed meanwhile', () => {
   // Ушедшая из окна вкладка попадает в историю; закрытая не должна из неё
   // вернуться и оставить панель ссылающейся в никуда.
-  const opened = removeTabFromPane(
-    resolveSplitActivation([p('p1', 'a'), p('p1', 'b')], 1, 'p1', 'file').panes,
-    1, 'b',
-  ).panes;
+  const opened = resolveSplitActivation([p('p1', 'a'), p('p1', 'b')], 1, 'p1', 'file').panes;
   const alive = (projectId, tabId) => tabId !== 'b'; // 'b' was closed
   assert.equal(restorePanePreviousTab(opened, 1, 'file', alive), null,
     'a dead tab must not come back as an empty pane');
@@ -653,10 +648,7 @@ test('restore refuses a tab that was closed meanwhile', () => {
 
 test('restore refuses a tab already visible in another pane', () => {
   // Two panes showing one tab is not a layout the workspace allows.
-  const opened = removeTabFromPane(
-    resolveSplitActivation([p('p1', 'a'), p('p1', 'b')], 1, 'p1', 'file').panes,
-    1, 'b',
-  ).panes;
+  const opened = resolveSplitActivation([p('p1', 'a'), p('p1', 'b')], 1, 'p1', 'file').panes;
   const withDup = [p('p1', 'b'), opened[1]];
   assert.equal(restorePanePreviousTab(withDup, 1, 'file'), null);
 });
@@ -664,10 +656,7 @@ test('restore refuses a tab already visible in another pane', () => {
 test('stepping back keeps the pane in its column', () => {
   const stacked = addEmptyPaneVertical([], 0, p('p1', 'a'), null, 'below').panes;
   const filled = resolveSplitActivation(stacked, 1, 'p1', 'b').panes;
-  const withFile = removeTabFromPane(
-    resolveSplitActivation(filled, 1, 'p1', 'file').panes,
-    1, 'b',
-  ).panes;
+  const withFile = resolveSplitActivation(filled, 1, 'p1', 'file').panes;
   const back = restorePanePreviousTab(withFile, 1, 'file');
   assert.equal(paneColumns(back.panes).length, 1, 'still one column');
   assert.equal(paneGridRects(back.panes)[1].topPct, 50, 'still the lower row');
@@ -747,16 +736,19 @@ test('полоса помнит проект каждой вкладки — о�
   assert.equal(res.panes[0].projectId, 'p9');
 });
 
-test('клик по вкладке, которой нигде нет, ДОБАВЛЯЕТ её в конец полосы', () => {
+test('клик по вкладке, которой нигде нет, ЗАМЕНЯЕТ показанный чип на его месте', () => {
   const panes = addTabToPane([p('p1', 'a'), p('p2', 'b')], 0, 'p1', 'c').panes;
   // Показана 'c', в полосе [a, c].
   const res = resolveSplitActivation(panes, 0, 'p1', 'zzz');
-  assert.deepEqual(res.panes[0].tabs, [p('p1', 'a'), p('p1', 'c'), p('p1', 'zzz')]);
+  assert.deepEqual(res.panes[0].tabs, [p('p1', 'a'), p('p1', 'zzz')]);
   assert.equal(res.panes[0].tabId, 'zzz');
-  // Замена уносила из окна вкладку, которую человек туда сам положил. От
-  // бесконечного роста полосу держит другое правило: вкладка, уже лежащая в
-  // каком-то окне, не добавляется второй раз (её показывают там, где она есть),
-  // значит каждая попадает сюда ровно один раз.
+  // Чип встаёт НА МЕСТО прежнего, не в конец: позиции, по которым человек
+  // ориентируется, не сдвигаются. Прежняя вкладка уходит в историю окна (⌘[).
+  // Здесь был период append-семантики; с появлением ⌘-клика «открыть в новом
+  // окне» роли разделились обратно: обычный клик МЕНЯЕТ текущее окно, в конец
+  // кладут явные жесты (двойной клик по шапке, Move to window).
+  // 'a' уже лежала в истории с момента, когда её показ сменился на 'c'.
+  assert.deepEqual(paneHistory(res.panes[0]).map((e) => e.tabId), ['c', 'a']);
 });
 
 test('активация вкладки, у которой уже есть чип, идёт В ЕЁ окно', () => {

@@ -10,6 +10,7 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
 
 const history = read('renderer/components/Workspace/HistoryPanel.tsx');
 const scenarios = read('renderer/utils/agentScenarios.ts');
+const sendAdapter = read('renderer/utils/agentSendAdapter.ts');
 const claudeActions = read('renderer/utils/claudePtyActions.ts');
 const main = read('main/main.js');
 const postEnterStart = main.indexOf('async function inspectClaudePostEnterTimeoutAtWriteBoundary');
@@ -27,13 +28,13 @@ test('History exact-empty proof reaches the final Claude paste boundary', () => 
   );
   assert.match(
     history,
-    /sendAgentPromptScenario\(\{[\s\S]{0,1200}claudeExactEmptyEvidence,/,
+    /sendAgentPromptScenario\(\{[\s\S]{0,1400}initialComposerProof:\s*claudeExactEmptyEvidence/,
     'History must pass the capture into the shared scenario',
   );
   assert.match(
-    scenarios,
-    /runtime\.sendPrompt\(tabId, prompt, \{[\s\S]{0,800}claudeExactEmptyEvidence: exactEmptyEvidenceForSend/,
-    'the shared scenario must keep the proof attached to the same send',
+    sendAdapter,
+    /claudeExactEmptyEvidence:\s*input\.composer\?\.exactEmptyEvidence[\s\S]{0,900}runtime\.sendPrompt\(tabId, input\.prompt, options\)/,
+    'the provider adapter must keep the proof attached to the same send',
   );
   assert.match(
     claudeActions,

@@ -11,6 +11,66 @@ const normalizeSessionId = (value) => {
   return value.trim();
 };
 
+/**
+ * History has two different operations that used to share the same loose
+ * model/effort fields:
+ *
+ * - a normal prompt, where the control bar / launch path already owns settings;
+ * - record-without-reply, which stops and resumes the writer and therefore must
+ *   carry the exact pair across that lifecycle boundary.
+ *
+ * Ambient values shown by the control bar are never a per-prompt settings
+ * request. Keeping this projection explicit prevents a busy prompt from being
+ * rejected as if the user had asked to reopen the model picker.
+ */
+export function resolveCodexHistoryRestartSettingsState({
+  recordWithoutReply,
+  mutationProof,
+  launchSettings,
+} = {}) {
+  if (recordWithoutReply !== true) return null;
+  const proofModel = normalizeRequestedSetting(mutationProof?.model);
+  const proofEffort = normalizeRequestedSetting(mutationProof?.effort);
+  const exactProofAvailable = !!proofModel
+    && !!proofEffort
+    && !!normalizeSessionId(mutationProof?.sessionId)
+    && Number.isFinite(Number(mutationProof?.proofAt))
+    && Number(mutationProof.proofAt) > 0;
+  const model = exactProofAvailable
+    ? proofModel
+    : normalizeRequestedSetting(launchSettings?.model);
+  const effort = exactProofAvailable
+    ? proofEffort
+    : normalizeRequestedSetting(launchSettings?.effort);
+  if (!model || !effort) {
+    return {
+      source: 'unavailable',
+      reason: launchSettings?.modelMigrationPending === true
+        ? 'model-migration-pending'
+        : 'pair-missing',
+    };
+  }
+  return {
+    source: exactProofAvailable && proofEffort !== 'ultra'
+      ? 'exact-session-proof'
+      : exactProofAvailable
+        ? 'unavailable'
+        : 'launch-intent',
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+    ...(exactProofAvailable && proofEffort !== 'ultra' ? {
+      ownerKind: 'writer',
+      ownerId: normalizeSessionId(mutationProof.sessionId),
+      proofAt: Number(mutationProof.proofAt),
+    } : exactProofAvailable ? {
+      reason: 'live-proof-required',
+    } : {
+      ...(launchSettings?.modelSource ? { modelSource: launchSettings.modelSource } : {}),
+      ...(launchSettings?.effortSource ? { effortSource: launchSettings.effortSource } : {}),
+    }),
+  };
+}
+
 export function resolveCodexSettingsRuntimeProof(runtimeSnapshot) {
   const liveLifecycle = runtimeSnapshot?.liveLifecycle;
   const runtimeState = liveLifecycle === true
@@ -30,6 +90,7 @@ export function resolveCodexSettingsRuntimeProof(runtimeSnapshot) {
   const confirmedSettingsEffort = normalizeCurrentSetting(
     runtimeSnapshot?.codexCurrentEffort,
   );
+  const confirmedSettingsProofAt = Number(runtimeSnapshot?.codexCurrentSettingsProofAt || 0);
   const confirmedWriterSettingsProven = runtimeState === 'live'
     && !!activeWriterSessionId
     && confirmedSettingsOwner === activeWriterSessionId
@@ -43,6 +104,9 @@ export function resolveCodexSettingsRuntimeProof(runtimeSnapshot) {
   );
   const provisionalEffort = normalizeCurrentSetting(
     runtimeSnapshot?.codexProvisionalEffort,
+  );
+  const provisionalSettingsProofAt = Number(
+    runtimeSnapshot?.codexProvisionalSettingsProofAt || 0,
   );
   const provisionalSettingsProven = runtimeState === 'live'
     && !activeWriterSessionId
@@ -61,6 +125,12 @@ export function resolveCodexSettingsRuntimeProof(runtimeSnapshot) {
     currentSettingsEffort: confirmedWriterSettingsProven
       ? confirmedSettingsEffort
       : (provisionalSettingsProven ? provisionalEffort : ''),
+    currentSettingsProofAt: confirmedWriterSettingsProven
+      ? confirmedSettingsProofAt
+      : (provisionalSettingsProven ? provisionalSettingsProofAt : 0),
+    currentSettingsOwnerKind: confirmedWriterSettingsProven
+      ? 'writer'
+      : (provisionalSettingsProven ? 'launch' : ''),
     confirmedWriterSettingsProven,
     provisionalSettingsProven,
   };

@@ -26,7 +26,7 @@ import MoveToWindowMenu from './MoveToWindowMenu';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
-import { TabProcessBar, TabStatusMarker, TabFastBadge, TabContextUsageBadge, useTabContextUsage } from './TabSignals';
+import { TabProcessBar, TabStatusMarkerButton, TabFastBadge, TabCmdHint, TabContextUsageBadge, useTabContextUsage } from './TabSignals';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 // Removed: framer-motion import - was causing lag on project switch
@@ -1596,6 +1596,15 @@ const TabItem = memo(({
   // position — left|right (юзер выбирает в Settings). Цвет полоски и shimmer
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
+  // Доступен ли ⌘-клик «открыть в новом окне». Вкладка, уже лежащая в каком-то
+  // окне, второго себе завести не может — живой терминал один, — и обещать это
+  // подписью нельзя: клик тогда просто перейдёт на вкладку.
+  //
+  // Селектор отдаёт булево, не массив окон: подписка на сами окна перерисовывала
+  // бы каждую строку списка на любую запись в стор (правило Fingerprint).
+  const canOpenInNewWindow = useWorkspaceStore(
+    (s) => paneIndexHoldingTab(s.splitPanes, tab.id) < 0,
+  );
   const restartAfterTriggerIds = getRestartAfterTriggerIds(tab);
   const restartAfterConfigured = restartAfterTriggerIds.length > 0 || !!tab.restartAfterCommand;
   const restartAfterCommandLabel = formatRestartAfterCommandLabel(tab.restartAfterCommand)
@@ -2066,6 +2075,10 @@ const TabItem = memo(({
                   нижней. Рисуется независимо от полоски: Fast может быть
                   доказан и когда процесс уже не идёт. */}
               <TabFastBadge active={codexFastActive} />
+              {/* Что сделает ⌘-клик — на границе карточки, пока ⌘ зажат.
+                  Жест «открыть в новом окне» иначе пришлось бы помнить: он
+                  ничем не отличается от обычного клика до самого нажатия. */}
+              <TabCmdHint text="открыть в новом окне" visible={cmdPeekMode && effectiveHovered && canOpenInNewWindow} />
               {/* Заполнение контекста — число в правом НИЖНЕМ углу, той же
                   механикой, что молния: абсолютная позиция, часть высоты
                   снаружи, выступ ограничен зазором. Цвет и формат наследуются
@@ -2123,7 +2136,13 @@ const TabItem = memo(({
                   поднимается, чтобы освободить нижний шов.
                   Если полоска процесса справа — маркер всё равно слева (так лучше
                   читается рядом с текстом названия таба). */}
-              <TabStatusMarker
+              {/* Кликабельный: открывает выбор статуса НА МЕСТЕ, не активируя
+                  вкладку (юзер: «никакого фокуса по вкладке, перехода нет»).
+                  Квадратики задач ниже НЕ кликабельны — они про заметки, и
+                  меняются там. */}
+              <TabStatusMarkerButton
+                projectId={projectId}
+                tabId={tab.id}
                 color={statusMeta?.color}
                 title={statusMeta?.label}
                 sizePx={showTaskMarkerLane ? TASK_MARKER_PRIMARY_SIZE_PX : undefined}
@@ -3977,7 +3996,22 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const handleTabClick = (e: React.MouseEvent, tabId: string) => {
     if (e.shiftKey) {
       selectTabRange(projectId, tabId);
-    } else if (e.metaKey || e.ctrlKey) {
+    } else if (e.metaKey) {
+      // ⌘-клик — «открыть в НОВОМ окне». Обычный клик кладёт вкладку в окно, где
+      // сейчас фокус (то есть меняет текущее окно), а этот жест заводит рядом
+      // ещё одно. Подпись про него появляется на рамке карточки, пока ⌘ зажат
+      // (TabItem::«открыть в новом окне»), — чтобы жест не приходилось помнить.
+      //
+      // Отказ возможен: вкладка уже лежит в каком-то окне, или колонок больше
+      // некуда добавлять. Тогда это обычная активация — клик обязан куда-то
+      // приводить, а не молчать.
+      if (!useWorkspaceStore.getState().addTabToSplit(projectId, tabId)) {
+        useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+      }
+    } else if (e.altKey || e.ctrlKey) {
+      // Множественный выбор переехал с ⌘ на ⌥: сам выбор никуда не делся, у него
+      // сменилась клавиша, потому что ⌘ занял открытие в новом окне. Ctrl оставлен
+      // на всякий случай, хотя на macOS система обычно превращает его в правый клик.
       toggleTabSelection(projectId, tabId, true);
     } else {
       const clickedTab = workspace?.tabs.get(tabId);

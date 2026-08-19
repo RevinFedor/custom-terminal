@@ -15,6 +15,8 @@ import {
   BrainIcon,
   ChatMessage,
   ColoredToolIcon,
+  ComposerChip,
+  defaultOpenForTool,
   ThinkBlock,
   ToolCallPart,
   toolIcon,
@@ -436,12 +438,21 @@ export const HistoryGroupRail = ({
 
 export interface HistoryTranscriptStep {
   id?: string;
-  kind: 'tool' | 'message' | 'thinking';
+  messageId?: string;
+  kind: 'tool' | 'message' | 'thinking' | 'instruction' | 'boundary';
   role?: 'user' | 'assistant';
   text: string;
+  timestamp?: string;
+  sessionId?: string;
+  phase?: string;
+  turnId?: string;
+  instructionFileName?: string;
+  instructionScope?: string;
   tool?: string;
   args?: Record<string, any>;
+  argsRef?: { payloadId: string; totalChars: number };
   result?: string;
+  resultRef?: { payloadId: string; totalChars: number };
   family?: string;
   bashWord?: string;
   bashDetail?: string;
@@ -513,11 +524,35 @@ export function historyTurnsToTranscriptSteps(turns: HistoryTranscriptTurn[] = [
 
 const transcriptStepsToEntries = (steps: HistoryTranscriptStep[]) => steps.map((step, index) => {
   const uuid = step.id || `subagent-step-${index}`;
+  if (step.kind === 'boundary') {
+    return { uuid, role: 'boundary', content: '', actions: [], transcriptStep: step };
+  }
+  if (step.kind === 'instruction') {
+    return {
+      uuid,
+      role: 'attachment',
+      content: '',
+      actions: [],
+      transcriptStep: step,
+    };
+  }
   if (step.kind === 'thinking') {
-    return { uuid, role: 'assistant', content: '', thinking: step.text, hasThinking: true, actions: [] };
+    return { uuid, role: 'assistant', content: '', thinking: step.text, hasThinking: true, actions: [], transcriptStep: step };
   }
   if (step.kind === 'message') {
-    return { uuid, role: step.role === 'user' ? 'user' : 'assistant', content: step.text, actions: [] };
+    return {
+      uuid,
+      role: step.role === 'user' ? 'user' : 'assistant',
+      content: step.text,
+      timestamp: step.timestamp,
+      sessionId: step.sessionId,
+      messageId: step.messageId,
+      phase: step.phase,
+      textPhase: step.phase || (step.final ? 'final_answer' : undefined),
+      turnId: step.turnId,
+      actions: [],
+      transcriptStep: step,
+    };
   }
   const toolName = String(step.tool || 'Tool');
   const args = step.args || (step.text ? { summary: step.text } : {});
@@ -532,13 +567,16 @@ const transcriptStepsToEntries = (steps: HistoryTranscriptStep[]) => steps.map((
     uuid,
     role: 'assistant',
     content: '',
+    transcriptStep: step,
     actions: [{
       tool: '__raw__',
       rawTool: {
         toolUseId: uuid,
         toolName,
         args,
+        argsRef: step.argsRef,
         result: step.result,
+        resultRef: step.resultRef,
         isError: step.isError,
         family,
         bashWord: step.bashWord || classified.bashWord,
@@ -553,15 +591,32 @@ const transcriptStepsToEntries = (steps: HistoryTranscriptStep[]) => steps.map((
 const renderTranscriptStepEntry = (
   entry: any,
   onCopy?: (text: string) => void,
+  loadPayload?: (ref: { payloadId: string; totalChars: number }) => Promise<string | null>,
+  onMessageContextMenu?: (
+    event: React.MouseEvent<HTMLDivElement>,
+    step: HistoryTranscriptStep,
+  ) => void,
 ) => {
+  if (entry.transcriptStep?.kind === 'boundary') return null;
+  if (entry.transcriptStep?.kind === 'instruction') {
+    const step = entry.transcriptStep as HistoryTranscriptStep;
+    return <HistoryTranscriptInstructionChip step={step} />;
+  }
   if (entry.role === 'user') {
     return (
-      <ChatMessage entry={{
-        kind: 'user',
-        id: entry.uuid,
-        entryUuid: entry.uuid,
-        text: entry.content,
-      }} />
+      <div
+        data-history-transcript-message={entry.uuid}
+        onContextMenu={onMessageContextMenu && entry.transcriptStep
+          ? (event) => onMessageContextMenu(event, entry.transcriptStep)
+          : undefined}
+      >
+        <ChatMessage entry={{
+          kind: 'user',
+          id: entry.uuid,
+          entryUuid: entry.uuid,
+          text: entry.content,
+        }} />
+      </div>
     );
   }
   if (entry.thinking) {
@@ -569,21 +624,82 @@ const renderTranscriptStepEntry = (
   }
   if (entry.content) {
     return (
-      <ChatMessage
-        entry={{
-          kind: 'assistant',
-          id: entry.uuid,
-          entryUuid: entry.uuid,
-          text: entry.content,
-        }}
-        ctx={onCopy ? {
-          actions: { onCopy: (item) => onCopy('text' in item ? item.text || '' : '') },
-        } : undefined}
-      />
+      <div
+        data-history-transcript-message={entry.uuid}
+        onContextMenu={onMessageContextMenu && entry.transcriptStep
+          ? (event) => onMessageContextMenu(event, entry.transcriptStep)
+          : undefined}
+      >
+        <ChatMessage
+          entry={{
+            kind: 'assistant',
+            id: entry.uuid,
+            entryUuid: entry.uuid,
+            text: entry.content,
+          }}
+          ctx={onCopy ? {
+            actions: { onCopy: (item) => onCopy('text' in item ? item.text || '' : '') },
+          } : undefined}
+        />
+      </div>
     );
   }
   const raw = entry.actions?.[0]?.rawTool;
   if (!raw) return null;
+  return <HistoryTranscriptToolCall raw={raw} onCopy={onCopy} loadPayload={loadPayload} />;
+};
+
+const HistoryTranscriptInstructionChip = memo(({
+  step,
+}: {
+  step: HistoryTranscriptStep;
+}) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ padding: '2px 12px' }}>
+      <ComposerChip
+        kind="prompt"
+        label={step.instructionFileName || 'AGENTS.md'}
+        preview={step.instructionScope || undefined}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setOpen((value) => !value);
+        }}
+      />
+      {open && (
+        <pre className="cb-paste-chip-body" style={{ marginTop: 4, whiteSpace: 'pre-wrap' }}>
+          {step.text}
+        </pre>
+      )}
+    </div>
+  );
+});
+
+const HistoryTranscriptToolCall = memo(({
+  raw,
+  onCopy,
+  loadPayload,
+}: {
+  raw: any;
+  onCopy?: (text: string) => void;
+  loadPayload?: (ref: { payloadId: string; totalChars: number }) => Promise<string | null>;
+}) => {
+  const [open, setOpen] = useState(() => defaultOpenForTool(raw.toolName));
+  const [fullResult, setFullResult] = useState<string | null>(null);
+  const [fullArgs, setFullArgs] = useState<Record<string, any> | null>(null);
+  const [resultPending, setResultPending] = useState(false);
+  const [argsPending, setArgsPending] = useState(false);
+  const [payloadFailed, setPayloadFailed] = useState(false);
+  const resultRef = raw.resultRef as { payloadId: string; totalChars: number } | undefined;
+  const argsRef = raw.argsRef as { payloadId: string; totalChars: number } | undefined;
+  const resultRequestRef = React.useRef<{ id: string; promise: Promise<string | null> } | null>(null);
+  const argsRequestRef = React.useRef<{ id: string; promise: Promise<Record<string, any> | null> } | null>(null);
+  const currentResultIdRef = React.useRef('');
+  const currentArgsIdRef = React.useRef('');
+  currentResultIdRef.current = resultRef?.payloadId || '';
+  currentArgsIdRef.current = argsRef?.payloadId || '';
+  const presentedArgs = fullArgs ?? raw.args ?? {};
   const presentation = historyActionPresentationMeta({
     toolName: raw.toolName,
     args: raw.args,
@@ -593,12 +709,135 @@ const renderTranscriptStepEntry = (
     mcpServer: raw.mcpServer,
     mcpMethod: raw.mcpMethod,
   });
+  const hydrateResult = React.useCallback(async () => {
+    if (!resultRef || !loadPayload) return fullResult;
+    if (fullResult != null) return fullResult;
+    const id = resultRef.payloadId;
+    if (resultRequestRef.current?.id === id) return resultRequestRef.current.promise;
+    setResultPending(true);
+    setPayloadFailed(false);
+    const promise = loadPayload(resultRef).then((loaded) => {
+      if (typeof loaded === 'string' && currentResultIdRef.current === id) {
+        setFullResult(loaded);
+        return loaded;
+      }
+      if (currentResultIdRef.current === id) setPayloadFailed(true);
+      return null;
+    }).catch(() => {
+      if (currentResultIdRef.current === id) setPayloadFailed(true);
+      return null;
+    }).finally(() => {
+      if (resultRequestRef.current?.id === id) resultRequestRef.current = null;
+      if (currentResultIdRef.current === id) setResultPending(false);
+    });
+    resultRequestRef.current = { id, promise };
+    return promise;
+  }, [fullResult, loadPayload, resultRef]);
+  const hydrateArgs = React.useCallback(async () => {
+    if (!argsRef || !loadPayload) return fullArgs;
+    if (fullArgs != null) return fullArgs;
+    const id = argsRef.payloadId;
+    if (argsRequestRef.current?.id === id) return argsRequestRef.current.promise;
+    setArgsPending(true);
+    setPayloadFailed(false);
+    const promise = loadPayload(argsRef).then((loaded) => {
+      if (typeof loaded !== 'string') {
+        if (currentArgsIdRef.current === id) setPayloadFailed(true);
+        return null;
+      }
+      try {
+        const parsed = JSON.parse(loaded);
+        if (currentArgsIdRef.current === id && parsed && typeof parsed === 'object') {
+          setFullArgs(parsed);
+          return parsed;
+        }
+      } catch {
+        if (currentArgsIdRef.current === id) setPayloadFailed(true);
+      }
+      return null;
+    }).catch(() => {
+      if (currentArgsIdRef.current === id) setPayloadFailed(true);
+      return null;
+    }).finally(() => {
+      if (argsRequestRef.current?.id === id) argsRequestRef.current = null;
+      if (currentArgsIdRef.current === id) setArgsPending(false);
+    });
+    argsRequestRef.current = { id, promise };
+    return promise;
+  }, [argsRef, fullArgs, loadPayload]);
+  const toggleOpen = React.useCallback(() => {
+    const next = !open;
+    setOpen(next);
+    if (next && resultRef) void hydrateResult();
+    if (next && argsRef) void hydrateArgs();
+  }, [argsRef?.payloadId, hydrateArgs, hydrateResult, open, resultRef?.payloadId]);
+  const copy = React.useCallback(async (text: string) => {
+    const [loadedResult, loadedArgs] = await Promise.all([
+      resultRef ? hydrateResult() : Promise.resolve(null),
+      argsRef ? hydrateArgs() : Promise.resolve(null),
+    ]);
+    let copyText = text;
+    if (loadedArgs) {
+      const previewCommand = typeof raw.args?.command === 'string' ? raw.args.command : '';
+      const fullCommand = typeof loadedArgs.command === 'string' ? loadedArgs.command : '';
+      if (previewCommand && fullCommand && copyText.startsWith(previewCommand)) {
+        copyText = fullCommand + copyText.slice(previewCommand.length);
+      } else if (raw.toolName === 'Write'
+        && typeof raw.args?.content === 'string'
+        && typeof loadedArgs.content === 'string'
+        && copyText.endsWith(raw.args.content)) {
+        copyText = copyText.slice(0, copyText.length - raw.args.content.length)
+          + loadedArgs.content;
+      } else {
+        const previewJson = raw.args && Object.keys(raw.args).length > 0
+          ? JSON.stringify(raw.args, null, 2)
+          : '';
+        const fullJson = JSON.stringify(loadedArgs, null, 2);
+        if (previewJson && copyText.includes(previewJson)) {
+          copyText = copyText.replace(previewJson, fullJson);
+        }
+      }
+    }
+    if (loadedResult != null && typeof raw.result === 'string' && copyText.endsWith(raw.result)) {
+      copyText = copyText.slice(0, copyText.length - raw.result.length) + loadedResult;
+    }
+    onCopy?.(copyText);
+  }, [argsRef, hydrateArgs, hydrateResult, onCopy, raw.args, raw.result, resultRef]);
+
+  React.useEffect(() => {
+    setOpen(defaultOpenForTool(raw.toolName));
+  }, [raw.toolName, raw.toolUseId]);
+
+  React.useEffect(() => {
+    setFullResult(null);
+    setResultPending(false);
+    setPayloadFailed(false);
+    resultRequestRef.current = null;
+  }, [resultRef?.payloadId]);
+
+  React.useEffect(() => {
+    setFullArgs(null);
+    setArgsPending(false);
+    setPayloadFailed(false);
+    argsRequestRef.current = null;
+  }, [argsRef?.payloadId]);
+
+  React.useEffect(() => {
+    if (open && resultRef) void hydrateResult();
+    if (open && argsRef) void hydrateArgs();
+  }, [argsRef?.payloadId, hydrateArgs, hydrateResult, open, resultRef?.payloadId]);
+
+  React.useEffect(() => {
+    if (!open && fullResult != null) setFullResult(null);
+    if (!open && fullArgs != null) setFullArgs(null);
+  }, [fullArgs, fullResult, open]);
+
   return (
     <div className="hp-tool-scroll-scope" data-history-docs-kind={presentation.docsKind || undefined}>
       <ToolCallPart
         toolName={raw.toolName}
-        args={raw.args || {}}
-        result={raw.result}
+        args={presentedArgs}
+        result={fullResult ?? raw.result}
         isError={raw.isError}
         family={raw.family}
         headline={historyActionHeadline({
@@ -612,11 +851,22 @@ const renderTranscriptStepEntry = (
         })}
         mcpServer={raw.mcpServer}
         mcpMethod={raw.mcpMethod}
-        onCopy={onCopy}
+        collapse={{ open, onToggle: toggleOpen }}
+        onCopy={onCopy ? copy : undefined}
       />
+      {open && (resultPending || argsPending) && (
+        <div style={{ padding: '2px 8px', color: '#818cf8', fontSize: '0.8em' }}>
+          загружается полный вывод…
+        </div>
+      )}
+      {open && payloadFailed && (
+        <div style={{ padding: '2px 8px', color: '#d97706', fontSize: '0.8em' }}>
+          полный вывод не загрузился — показан фрагмент
+        </div>
+      )}
     </div>
   );
-};
+});
 
 /** Compact transcript renderer for nested surfaces such as a live subagent
  * pane. It uses the exact same action grammar, group projection, icons,
@@ -626,11 +876,18 @@ export const HistoryTranscriptPresentation = memo(({
   steps,
   isTurnBusy = false,
   onCopy,
+  loadPayload,
+  onMessageContextMenu,
   className = '',
 }: {
   steps: HistoryTranscriptStep[];
   isTurnBusy?: boolean;
   onCopy?: (text: string) => void;
+  loadPayload?: (ref: { payloadId: string; totalChars: number }) => Promise<string | null>;
+  onMessageContextMenu?: (
+    event: React.MouseEvent<HTMLDivElement>,
+    step: HistoryTranscriptStep,
+  ) => void;
   className?: string;
 }) => {
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(() => new Set());
@@ -684,7 +941,7 @@ export const HistoryTranscriptPresentation = memo(({
         const entry = unit.entry;
         const expandedGroup = unit.expandedGroup;
         const expandedSubgroup = unit.expandedSubgroup;
-        const body = renderTranscriptStepEntry(entry, onCopy);
+        const body = renderTranscriptStepEntry(entry, onCopy, loadPayload, onMessageContextMenu);
         if (!expandedGroup && !expandedSubgroup) {
           return <React.Fragment key={entry.uuid}>{body}</React.Fragment>;
         }

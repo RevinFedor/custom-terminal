@@ -509,6 +509,23 @@ class SessionTranscriptService {
         revision,
       };
     }
+    const getClaudeTimeline = this.claudeData?._api?.getTimeline;
+    if (typeof getClaudeTimeline === 'function') {
+      const projected = await getClaudeTimeline({
+        ...payload,
+        sessionId,
+        cwd,
+        source: payload.source || 'transcript-service',
+      });
+      return {
+        ...(projected || {}),
+        sessionId,
+        toolType,
+      };
+    }
+    // Compatibility for minimal test doubles / older embedded providers. The
+    // production module always exposes getTimeline above, so public HTTP/iOS
+    // requests reuse the incremental reader instead of this legacy full parse.
     const found = this.claudeData?.findSessionFile?.(sessionId, cwd);
     if (!found) return { success: true, entries: [], sessionId, toolType };
     const entries = this.claudeData.parseTimelineEntries(found.filePath);
