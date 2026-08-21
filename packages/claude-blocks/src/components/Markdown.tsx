@@ -6,7 +6,7 @@
    Цвета/типографика — через токены theme.css, не инлайн.
    ============================================================ */
 import React, { useState, useCallback } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
@@ -120,6 +120,29 @@ function handleProseCopy(e: React.ClipboardEvent<HTMLDivElement>) {
   copyText(md);
 }
 
+// Links in assistant replies are both ordinary web links and frequently local
+// file references.  The package deliberately only REQUESTS the desktop menu:
+// the host owns Finder / GT Editor / Sublime, while mobile and other consumers
+// retain their browser-native context menu.
+function showMarkdownLinkContextMenu(href: string): boolean {
+  try {
+    const electron = (typeof window !== 'undefined') ? (window as any).require?.('electron') : null;
+    if (!electron?.ipcRenderer?.send) return false;
+    electron.ipcRenderer.send('show-markdown-link-context-menu', { href });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// react-markdown treats file: as unsafe by default.  Local file links are a
+// first-class desktop affordance here; main still validates the path before it
+// exposes any OS-level action, while every other protocol keeps the library's
+// default sanitizer.
+function markdownUrlTransform(url: string): string {
+  return /^file:/i.test(url) ? url : defaultUrlTransform(url);
+}
+
 export const Markdown: React.FC<{ text: string }> = ({ text }) => {
   if (!text.trim()) return null;
   return (
@@ -127,6 +150,7 @@ export const Markdown: React.FC<{ text: string }> = ({ text }) => {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeHexHighlight]}
+        urlTransform={markdownUrlTransform}
         components={{
           pre({ children }) {
             const codeNode: any = Array.isArray(children) ? children[0] : children;
@@ -138,6 +162,21 @@ export const Markdown: React.FC<{ text: string }> = ({ text }) => {
           code({ className, children, ...props }) {
             // inline `code` only (block handled in pre). Hue-shift, no pill.
             return <code className={className || ''} {...props}>{children}</code>;
+          },
+          a({ href, children, node: _node, ...props }) {
+            return (
+              <a
+                {...props}
+                href={href}
+                onContextMenu={(event) => {
+                  if (!href || !showMarkdownLinkContextMenu(href)) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+              >
+                {children}
+              </a>
+            );
           },
         }}
       >

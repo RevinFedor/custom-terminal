@@ -65,10 +65,12 @@ import {
   restoreSpaces,
   spaceIndexHoldingTab,
   spaceTabCount,
+  spaceTabIds,
   spaceBusyTabCount,
   switchSpace as switchSpaceInList,
   emptySpaceLayout,
   dropTabsFromOtherSpaces,
+  updateSpaceMetadata,
 } from '../utils/workspaceSpacesModel.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
@@ -369,7 +371,38 @@ interface AutoTabTitleIntent {
 const aiLaunchSnapshots = new Map<string, AiLaunchSnapshot>();
 const pendingAutoTabTitles = new Map<string, PendingAutoTabTitle>();
 const autoTabTitleIntents = new Map<string, AutoTabTitleIntent>();
-const AUTO_TAB_TITLE_PENDING_TTL_MS = 10 * 60 * 1000;
+
+export interface PendingAutoTabTitleRegistration extends PendingAutoTabTitle {
+  tabId: string;
+}
+
+type PendingAutoTabTitleListener = (pending: PendingAutoTabTitleRegistration[]) => void;
+const pendingAutoTabTitleListeners = new Set<PendingAutoTabTitleListener>();
+let pendingAutoTabTitleNotifyQueued = false;
+
+const pendingAutoTabTitleSnapshot = (): PendingAutoTabTitleRegistration[] => (
+  Array.from(pendingAutoTabTitles, ([tabId, pending]) => ({ tabId, ...pending }))
+);
+
+const notifyPendingAutoTabTitleListeners = (): void => {
+  // Arm happens before setClaude/CodexSessionId finishes its store write. A
+  // synchronous listener would inspect the old tab binding and clear the new
+  // registration as a mismatch. One coalesced microtask observes the committed
+  // session id without introducing a timer or polling loop.
+  if (pendingAutoTabTitleNotifyQueued) return;
+  pendingAutoTabTitleNotifyQueued = true;
+  queueMicrotask(() => {
+    pendingAutoTabTitleNotifyQueued = false;
+    const snapshot = pendingAutoTabTitleSnapshot();
+    pendingAutoTabTitleListeners.forEach((listener) => listener(snapshot));
+  });
+};
+
+export const subscribePendingAutoTabTitles = (listener: PendingAutoTabTitleListener): (() => void) => {
+  pendingAutoTabTitleListeners.add(listener);
+  listener(pendingAutoTabTitleSnapshot());
+  return () => pendingAutoTabTitleListeners.delete(listener);
+};
 
 const setAutoTabTitleIntent = (
   tabId: string,
@@ -395,16 +428,6 @@ const getAutoTabTitleIntent = (tabId: string, toolType: AutoTabTitleTool): AutoT
   const intent = autoTabTitleIntents.get(tabId);
   if (!intent) return null;
 
-  if (Date.now() - intent.at > AUTO_TAB_TITLE_PENDING_TTL_MS) {
-    autoTabTitleIntents.delete(tabId);
-    console.warn(
-      '[Store:AutoTabTitleIntent] expire tab=' + tabId.slice(-8) +
-      ' type=' + intent.toolType +
-      ' mode=' + intent.mode
-    );
-    return null;
-  }
-
   if (intent.toolType !== toolType) return null;
   return intent;
 };
@@ -413,6 +436,7 @@ const clearPendingAutoTabTitle = (tabId: string, reason: string): void => {
   const pending = pendingAutoTabTitles.get(tabId);
   if (!pending) return;
   pendingAutoTabTitles.delete(tabId);
+  notifyPendingAutoTabTitleListeners();
   console.warn(
     '[Store:AutoTabTitle] clear tab=' + tabId.slice(-8) +
     ' type=' + pending.toolType +
@@ -436,6 +460,7 @@ const armPendingAutoTabTitle = (
     sourceSessionId: options.sourceSessionId,
     at: Date.now(),
   });
+  notifyPendingAutoTabTitleListeners();
   console.warn(
     '[Store:AutoTabTitle] arm tab=' + tabId.slice(-8) +
     ' type=' + toolType +
@@ -557,11 +582,6 @@ const getPendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessi
   const pending = pendingAutoTabTitles.get(tabId);
   if (!pending) return null;
 
-  if (Date.now() - pending.at > AUTO_TAB_TITLE_PENDING_TTL_MS) {
-    clearPendingAutoTabTitle(tabId, 'expired');
-    return null;
-  }
-
   if (pending.toolType !== toolType || pending.sessionId !== sessionId) {
     clearPendingAutoTabTitle(tabId, 'mismatch');
     return null;
@@ -576,6 +596,7 @@ const consumePendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, s
 
   pendingAutoTabTitles.delete(tabId);
   autoTabTitleIntents.delete(tabId);
+  notifyPendingAutoTabTitleListeners();
   console.warn(
     '[Store:AutoTabTitle] consume tab=' + tabId.slice(-8) +
     ' type=' + toolType +
@@ -640,6 +661,7 @@ export interface TabHistoryRestoreEntry {
   process_was_running?: number | boolean | null;
   session_status?: string | null;
   group_id?: string | null;
+  window_scoped?: number | boolean | null;
 }
 
 export interface TabHistoryRestoreResult {
@@ -778,6 +800,13 @@ interface Tab {
   restartAfterArmed?: boolean;
   groupId?: string; // One-level TabBar group membership. Separate from parentTabId (sub-agents).
   visualParentTabId?: string; // Visual-only tab nesting in TabBar. Never use for MCP sub-agents.
+  /**
+   * Created by a gesture inside a pane/centre strip. That window strip is the
+   * primary navigation surface, so the sidebar may hide this tab while it
+   * still has a window placement. Durable so restart does not duplicate it in
+   * the sidebar again.
+   */
+  windowScoped?: boolean;
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
   claudeActive?: boolean; // True if Claude CLI is running inside PTY (not just shell alive)
   claudeBusy?: boolean; // True if Claude CLI spinner is active (from claude:busy-state)
@@ -1013,6 +1042,7 @@ const restoreTabOptions = (savedTab: any) => ({
   isCollapsed: savedTab.isCollapsed,
   groupId: savedTab.groupId,
   visualParentTabId: savedTab.visualParentTabId,
+  windowScoped: savedTab.windowScoped,
   sessionStatus: savedTab.sessionStatus,
   completionNotificationPersistent: savedTab.completionNotificationPersistent,
   restartAfterTabId: savedTab.restartAfterTabId,
@@ -1097,6 +1127,7 @@ const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err
     isCollapsed: savedTab.isCollapsed,
     groupId: savedTab.groupId,
     visualParentTabId: savedTab.visualParentTabId,
+    windowScoped: savedTab.windowScoped,
     nameSetManually: savedTab.nameSetManually,
     sessionStatus: savedTab.sessionStatus,
     completionNotificationPersistent: savedTab.completionNotificationPersistent || undefined,
@@ -1563,20 +1594,36 @@ interface WorkspaceStore {
    * пространства» значило бы переписать их все ради одного нового слоя.
    * Пространство при переключении СНИМАЕТ их себе и КЛАДЁТ обратно.
    */
-  spaces: Array<{ id: string; name: string; layout: Record<string, any> }>;
+  spaces: Array<{
+    id: string;
+    name: string;
+    /** Цветная SVG/PNG-иконка workflow. undefined бывает только у legacy-записи. */
+    icon?: string | null;
+    /** Упорядоченные проекты workflow; первый — default для пустой раскладки. */
+    projectIds: string[];
+    layout: Record<string, any>;
+  }>;
   /** Вкладка, которую показывал центр этого пространства (проект + id). */
   activeSpaceTab: { projectId: string; tabId: string } | null;
   activeSpaceId: string;
-  addWorkspaceSpace: () => void;
+  addWorkspaceSpace: (options?: { activate?: boolean; name?: string }) => string | null;
   removeWorkspaceSpace: (id: string) => void;
   renameWorkspaceSpace: (id: string, name: string) => void;
+  updateWorkspaceSpaceMetadata: (
+    id: string,
+    updates: { icon?: string | null; projectIds?: string[] },
+  ) => boolean;
   switchWorkspaceSpace: (id: string) => void;
   /** Сколько РАЗНЫХ вкладок разложено в пространстве — число рядом с именем. */
   workspaceSpaceTabCount: (id: string) => number;
   /** Сколько вкладок пространства сейчас заняты работой (второе число в чипе). */
   workspaceSpaceBusyTabCount: (id: string) => number;
+  /** IDs вкладок workflow; current workflow читается из live layout. */
+  workspaceSpaceTabIds: (id: string) => string[];
   /** Номер пространства, где лежит вкладка, или -1. Для карточки в списке. */
   workspaceSpaceIndexOfTab: (tabId: string) => number;
+  /** Вкладка реально присутствует хотя бы в одной pane/centre strip. */
+  isTabPlacedInWorkspace: (tabId: string) => boolean;
   /**
    * Under WHICH key the centre's strip lives — the project whose tab the centre
    * is showing, not the project of the tab being talked about. The two differ as
@@ -1650,11 +1697,11 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; restoreId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
-  reopenLastClosedTab: (projectId: string) => Promise<TabHistoryRestoreResult>;
+  reopenLastClosedTab: (projectId: string, options?: { targetPaneIndex?: number }) => Promise<TabHistoryRestoreResult>;
   switchTab: (projectId: string, tabId: string) => void;
   setActiveTabGroup: (projectId: string, groupId: string | null) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -1662,6 +1709,8 @@ interface WorkspaceStore {
   setTabTitleNaming: (tabId: string, naming: boolean) => void;
   getPendingAutoTabTitle: (tabId: string, toolType: AutoTabTitleTool, sessionId: string) => PendingAutoTabTitle | null;
   consumePendingAutoTabTitle: (tabId: string, toolType: AutoTabTitleTool, sessionId: string) => boolean;
+  clearPendingAutoTabTitle: (tabId: string, reason: string) => void;
+  recoverPendingAutoTabTitle: (tabId: string, toolType: AutoTabTitleTool, sessionId: string, mode: AutoTabTitleMode) => boolean;
 
   // Selection
   toggleTabSelection: (projectId: string, tabId: string, multi?: boolean) => void;
@@ -1772,7 +1821,7 @@ interface WorkspaceStore {
   reorderProjects: (orderedProjectIds: string[]) => void;
 
   // Claude SDK tabs
-  createSDKTab: (projectId: string, name?: string, options?: { afterTabId?: string; groupId?: string; visualParentTabId?: string; background?: boolean }) => Promise<string>;
+  createSDKTab: (projectId: string, name?: string, options?: { afterTabId?: string; groupId?: string; visualParentTabId?: string; background?: boolean; windowScoped?: boolean }) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
   updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking' | 'sdkMidstreamPending' | 'sdkComposerChips'>>) => void;
   // Merge a partial BgTask patch by taskId. Creates the entry if missing.
@@ -1896,6 +1945,7 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     restartAfterArmed: tab.restartAfterArmed,
     groupId: tab.groupId,
     visualParentTabId: tab.visualParentTabId,
+    windowScoped: tab.windowScoped,
     nameSetManually: tab.nameSetManually,
     // Which session ids this tab has carried, and who wrote each one. This is
     // what the "Revert Session" menu offers — the last line of defence when the
@@ -2161,6 +2211,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       || res.panes.find((p) => p.tabId)
       || null;
     if (next && next.tabId) get().activateCenterTab(next.projectId, next.tabId);
+    else if (get().activeSpaceTab?.tabId === tabId) set({ activeSpaceTab: null });
     get().saveSession();
     return true;
   },
@@ -2273,15 +2324,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   // приложению не нужен экран, которого больше нигде нет. До первого
   // восстановления это то самое единственное, и его раскладка — та, что уже
   // лежит в сторе.
-  spaces: [{ id: 'space-1', name: 'main', layout: {} }],
+  spaces: [{ id: 'space-1', name: 'main', icon: null, projectIds: [], layout: {} }],
   activeSpaceTab: null,
   activeSpaceId: 'space-1',
 
-  addWorkspaceSpace: () => {
+  addWorkspaceSpace: (options) => {
     const st = get();
     const id = 'space-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
-    const res = addSpace(st.spaces, st.activeSpaceId, id);
-    if (!res) return;
+    const activate = options?.activate !== false;
+    const res = addSpace(st.spaces, st.activeSpaceId, id, options?.name, { icon: null, projectIds: [] });
+    if (!res) return null;
+    // Settings создаёт workflow В ФОНЕ: добавление записи не должно выбрасывать
+    // человека из текущих окон в новую пустую раскладку. Двойной клик по самой
+    // полосе сохраняет прежний контракт и активирует созданное пространство.
+    if (!activate) {
+      set({ spaces: res.spaces });
+      console.log('[Spaces] add-background id=' + id + ' total=' + res.spaces.length);
+      get().saveSession();
+      return id;
+    }
     // Уходящее пространство обязано забрать свою раскладку С СОБОЙ, иначе
     // следующее переключение затрёт её пустой: раскладка живёт в общем
     // состоянии, а не внутри пространства.
@@ -2315,6 +2376,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     });
     console.log('[Spaces] add id=' + res.activeSpaceId + ' total=' + saved.length);
     get().saveSession();
+    return id;
   },
 
   removeWorkspaceSpace: (id) => {
@@ -2342,6 +2404,70 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!res) return;
     set({ spaces: res.spaces });
     get().saveSession();
+  },
+
+  updateWorkspaceSpaceMetadata: (id, updates) => {
+    const st = get();
+    // Inbox — системная рабочая поверхность, не directory-project и не ребёнок
+    // пользовательского workflow. Legacy layout мог вывести его из active
+    // project; на входе metadata отсекаем его ещё раз как boundary-инвариант.
+    const safeUpdates = Object.prototype.hasOwnProperty.call(updates, 'projectIds')
+      ? { ...updates, projectIds: (updates.projectIds || []).filter((projectId) => !isInboxProjectId(projectId)) }
+      : updates;
+    const res = updateSpaceMetadata(st.spaces, id, safeUpdates);
+    if (!res) return false;
+
+    let spaces = res.spaces;
+    if (Object.prototype.hasOwnProperty.call(safeUpdates, 'projectIds')) {
+      // Settings рисует настоящее дерево, не теги: у проекта один workflow-
+      // родитель. Переназначение переносит project-chip целиком и не оставляет
+      // дубликат, который потом дважды посчитал бы один процесс в двух badge.
+      const claimed = new Set(res.space.projectIds || []);
+      if (claimed.size > 0) {
+        spaces = spaces.map((space: any) => (
+          space.id === id
+            ? space
+            : {
+              ...space,
+              projectIds: (space.projectIds || []).filter((projectId: string) => !claimed.has(projectId)),
+            }
+        ));
+      }
+    }
+    const defaultProjectId = res.space.projectIds?.[0] || null;
+    const topLevel: Record<string, any> = {};
+    // Первый выбранный проект становится default только для действительно
+    // пустого workflow. Уже разложенные окна/текущий проект не двигаем:
+    // настройка связи не имеет права перестраивать рабочее место.
+    if (defaultProjectId) {
+      const isActive = id === st.activeSpaceId;
+      const sourceLayout = isActive ? st : (res.space.layout || {});
+      const hasProjectContext = !!sourceLayout.activeProjectId || !!sourceLayout.focusedProjectId;
+      if (!hasProjectContext) {
+        if (isActive) {
+          topLevel.activeProjectId = defaultProjectId;
+          topLevel.focusedProjectId = defaultProjectId;
+        } else {
+          spaces = spaces.map((space: any) => (
+            space.id === id
+              ? {
+                ...space,
+                layout: {
+                  ...emptySpaceLayout(),
+                  ...(space.layout || {}),
+                  activeProjectId: defaultProjectId,
+                  focusedProjectId: defaultProjectId,
+                },
+              }
+              : space
+          ));
+        }
+      }
+    }
+
+    set({ spaces, ...topLevel });
+    get().saveSession();
+    return true;
   },
 
   switchWorkspaceSpace: (id) => {
@@ -2439,12 +2565,44 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return spaceBusyTabCount({ ...space, layout }, allPaneTabIds, isBusy);
   },
 
+  workspaceSpaceTabIds: (id) => {
+    const st = get();
+    const space = st.spaces.find((candidate: any) => candidate.id === id);
+    if (!space) return [];
+    const layout = id === st.activeSpaceId ? captureSpaceLayout(st) : space.layout;
+    return Array.from(spaceTabIds({ ...space, layout }, allPaneTabIds));
+  },
+
   workspaceSpaceIndexOfTab: (tabId) => {
     const st = get();
     const withLive = st.spaces.map((space: any) => (
       space.id === st.activeSpaceId ? { ...space, layout: captureSpaceLayout(st) } : space
     ));
     return spaceIndexHoldingTab(withLive, tabId, allPaneTabIds);
+  },
+
+  isTabPlacedInWorkspace: (tabId) => {
+    if (!tabId) return false;
+    const st = get();
+    const layoutHasTab = (layout: any) => {
+      // A lone pane collapses to the single centre and intentionally stops
+      // storing a one-item strip. `activeSpaceTab` is the durable placement for
+      // that shape; without it a just-created window tab would immediately
+      // reappear in the sidebar after the collapse.
+      if (layout?.activeSpaceTab?.tabId === tabId) return true;
+      if ((layout?.splitPanes || []).some((pane: any) => (
+        paneTabs(pane).some((entry: any) => entry?.tabId === tabId)
+      ))) return true;
+      return Object.values(layout?.centerStrips || {}).some((raw: any) => (
+        (Array.isArray(raw) ? raw : []).some((entry: any) => entry?.tabId === tabId)
+      ));
+    };
+    // Active space lives in top-level state; its saved snapshot is one switch
+    // behind and must never decide sidebar visibility.
+    if (layoutHasTab(st)) return true;
+    return st.spaces.some((space: any) => (
+      space.id !== st.activeSpaceId && layoutHasTab(space.layout)
+    ));
   },
 
   // ПОД КАКИМ КЛЮЧОМ лежит полоса одиночного центра.
@@ -3028,8 +3186,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         ...restoredSpacesRaw,
         spaces: restoredSpacesRaw.spaces.map((space: any) => (
           space.id === restoredSpacesRaw.activeSpaceId
-            ? { ...space, layout: { ...space.layout, ...restoredLayout } }
-            : space
+            ? {
+              ...space,
+              projectIds: (space.projectIds || []).filter((projectId: string) => !isInboxProjectId(projectId)),
+              layout: { ...space.layout, ...restoredLayout },
+            }
+            : {
+              ...space,
+              projectIds: (space.projectIds || []).filter((projectId: string) => !isInboxProjectId(projectId)),
+            }
         )),
       };
       set({
@@ -3489,6 +3654,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       isCollapsed: (options as any)?.isCollapsed,
       groupId: options?.groupId,
       visualParentTabId: (options as any)?.visualParentTabId,
+      windowScoped: (options as any)?.windowScoped === true || undefined,
       nameSetManually: (options as any)?.nameSetManually,
       sessionStatus: (options as any)?.sessionStatus,
       completionNotificationPersistent: (options as any)?.completionNotificationPersistent || undefined,
@@ -3654,6 +3820,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       nameSetManually: (options as any)?.nameSetManually,
       groupId: targetGroupId,
       visualParentTabId,
+      windowScoped: (options as any)?.windowScoped === true || undefined,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
       lastActivatedAt: (options as any)?.lastActivatedAt,
       restartAfterTabId: (options as any)?.restartAfterTabId || undefined,
@@ -3892,6 +4059,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           codexModelMigrationConfigAlreadyTarget: tab.codexModelMigrationConfigAlreadyTarget,
           sessionStatus: tab.sessionStatus,
           groupId: tab.groupId,
+          windowScoped: tab.windowScoped,
           position: closedPosition >= 0 ? closedPosition : null,
           processWasRunning,
         }
@@ -4013,6 +4181,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     clearTerminalBuffer(tabId); // Clean up serialized buffer
 
     workspace.tabs.delete(tabId);
+    clearPendingAutoTabTitle(tabId, 'tab-closed');
+    autoTabTitleIntents.delete(tabId);
     for (const remainingTab of workspace.tabs.values()) {
       if (remainingTab.visualParentTabId === tabId) remainingTab.visualParentTabId = undefined;
     }
@@ -4288,6 +4458,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         sessionStatus: entry.session_status || undefined,
         nameSetManually: entry.name_set_manually === 1,
         groupId: restoredGroupId,
+        windowScoped: entry.window_scoped === 1 || undefined,
         background,
         restoreId: expectedTabId || undefined,
       });
@@ -4381,7 +4552,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   // Shift+Cmd+T restores the latest row serially per project. Rapid repeated
   // key presses walk backwards through History instead of racing on one row.
-  reopenLastClosedTab: (projectId) => {
+  reopenLastClosedTab: (projectId, options) => {
+    // Capture the pane named by the gesture, not whatever happens to be focused
+    // after the async history/PTY work completes.
+    const requestedPaneIndex = Number.isInteger(options?.targetPaneIndex)
+      ? Number(options?.targetPaneIndex)
+      : -1;
     const previous = reopenLastClosedQueues.get(projectId)
       || Promise.resolve<TabHistoryRestoreResult>({ tabId: null });
     const restore = previous
@@ -4398,9 +4574,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             message: 'Предыдущее восстановление не завершено; повтор остановлен',
           });
         }
+        const paneTargetExists = requestedPaneIndex >= 0 && !!get().splitPanes[requestedPaneIndex];
         return get().restoreTabHistoryEntry(projectId, undefined, {
+          // Keep createTab from selecting a project-wide active tab before the
+          // pane slot exists. Placement below is the visible commit.
+          background: paneTargetExists,
           restorePosition: true,
           resumePolicy: 'if-process-was-running',
+        }).then((result) => {
+          if (!result.tabId || !paneTargetExists) return result;
+          const current = get();
+          if (current.splitPanes[requestedPaneIndex]) {
+            current.addTabToSplitPaneStrip(requestedPaneIndex, projectId, result.tabId);
+          } else {
+            // The pane disappeared while PTY creation was in flight. Preserve
+            // access to the restored tab instead of silently losing the action.
+            current.activateCenterTab(projectId, result.tabId);
+          }
+          return result;
         });
       });
     reopenLastClosedQueues.set(projectId, restore);
@@ -4588,6 +4779,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         }
         tab.name = cleanName;
         tab.nameSetManually = true;
+        clearPendingAutoTabTitle(tabId, 'manual-name');
+        autoTabTitleIntents.delete(tabId);
         set({ openProjects: new Map(openProjects) });
 
         // Save tabs
@@ -4631,6 +4824,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab.name === uniqueName) {
         if (options.markNameSetManually && !tab.nameSetManually) {
           tab.nameSetManually = true;
+          clearPendingAutoTabTitle(tabId, 'explicit-title-refresh');
+          autoTabTitleIntents.delete(tabId);
           set({ openProjects: new Map(openProjects) });
           saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-rename');
           console.warn('[Store:autoRenameTab] tab=' + tabId.slice(-8) + ' unchanged but marked manual ' + JSON.stringify(uniqueName));
@@ -4643,6 +4838,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       tab.name = uniqueName;
       if (options.markNameSetManually) {
         tab.nameSetManually = true;
+        clearPendingAutoTabTitle(tabId, 'explicit-title-refresh');
+        autoTabTitleIntents.delete(tabId);
       }
       // Automatic generated names remain auto-owned. Explicit context-menu
       // refresh can opt into nameSetManually so future automatic launch naming
@@ -4678,6 +4875,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   consumePendingAutoTabTitle: (tabId, toolType, sessionId) => {
     return consumePendingAutoTabTitle(tabId, toolType, sessionId);
+  },
+
+  clearPendingAutoTabTitle: (tabId, reason) => {
+    clearPendingAutoTabTitle(tabId, reason);
+    autoTabTitleIntents.delete(tabId);
+  },
+
+  recoverPendingAutoTabTitle: (tabId, toolType, sessionId, mode) => {
+    if (!tabId || !sessionId || pendingAutoTabTitles.has(tabId)) return false;
+    armPendingAutoTabTitle(tabId, toolType, sessionId, { mode });
+    console.warn(
+      '[Store:AutoTabTitle] recover tab=' + tabId.slice(-8) +
+      ' type=' + toolType +
+      ' sid=' + sessionId.slice(0, 8) +
+      ' mode=' + mode
+    );
+    return true;
   },
 
   reorderTabs: (projectId, oldIndex, newIndex) => {
@@ -6562,6 +6776,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       groupId: options?.groupId,
       visualParentTabId: options?.visualParentTabId,
       background: options?.background,
+      windowScoped: options?.windowScoped,
     });
   },
 
@@ -6753,6 +6968,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           overlayDismissed: tab.overlayDismissed, notes: tab.notes, taskPlan: tab.taskPlan, tabType: tab.tabType,
           filePath: tab.filePath, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
           groupId: tab.groupId, visualParentTabId: tab.visualParentTabId,
+          windowScoped: tab.windowScoped,
           completionNotificationPersistent: tab.completionNotificationPersistent,
           restartAfterTabId: tab.restartAfterTabId,
           restartAfterTabIds: tab.restartAfterTabIds,

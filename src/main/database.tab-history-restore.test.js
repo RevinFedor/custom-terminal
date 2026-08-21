@@ -91,6 +91,27 @@ test('tab-history restore reads non-destructively, preserves migration provenanc
   );
   assert.equal(restoredMigration.codexModelMigrationConfigAlreadyTarget, true);
 
+  const windowScopedHistoryId = Number(manager.archiveTab(firstProject.id, {
+    tabId: 'window-scoped-history',
+    name: 'window only',
+    cwd: '/tmp',
+    windowScoped: true,
+  }));
+  const windowScopedHistory = manager.getTabHistoryEntry(windowScopedHistoryId, firstProject.id);
+  assert.equal(windowScopedHistory.window_scoped, 1, 'close must preserve window-strip ownership');
+  assert.equal(manager.deleteTabHistoryEntry(windowScopedHistoryId), true);
+
+  assert.deepEqual(manager.saveTabs(firstProject.id, [{
+    tabId: 'window-scoped-live',
+    name: 'window only live',
+    cwd: '/tmp',
+    windowScoped: true,
+  }], true), { success: true });
+  const windowScopedLive = manager.getProjectById(firstProject.id).tabs.find(
+    (tab) => tab.tabId === 'window-scoped-live',
+  );
+  assert.equal(windowScopedLive.windowScoped, true, 'restart must not duplicate the tab into the sidebar');
+
   assert.equal(manager.getLatestTabHistory(firstProject.id).id, migrationHistoryId);
   assert.equal(manager.getLatestTabHistory(firstProject.id).id, migrationHistoryId, 'read must not consume the row');
   assert.deepEqual(

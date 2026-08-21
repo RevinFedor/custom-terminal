@@ -173,13 +173,9 @@ export interface PaneTabStripProps {
    */
   wrap?: boolean;
   /**
-   * Сколько правого края полосы закрыто кнопками окна, лежащими ПОВЕРХ неё.
-   *
-   * Счётчик «×N» говорит, что ушло за край экрана. Пока он мерил по всей
-   * ширине окна прокрутки, чип, полностью скрытый под кнопками Git и деления,
-   * считался показанным — то есть счётчик молчал ровно про ту вкладку, которую
-   * человек и не видит. Поэтому видимая область заканчивается там, где
-   * начинаются кнопки.
+   * Compatibility-only: action buttons used to overlay the strip and passed a
+   * guessed covered width. They are flex siblings now, so this value must not
+   * participate in measurement or reveal geometry.
    */
   endInsetPx?: number;
 }
@@ -187,17 +183,19 @@ export interface PaneTabStripProps {
 export default function PaneTabStrip({
   entries, shownTabId, paneIndex, inSplit, onCreateTab, wrap = false, endInsetPx = 0,
 }: PaneTabStripProps) {
+  // Keep the old optional prop source-compatible without reviving inset math.
+  void endInsetPx;
   const scrollerRef = useRef<HTMLDivElement | null>(null);
-  // Разбивка по видам, а не два числа: счётчик красится в цвет своего агента, и
-  // строка «×2 оранжевый» отвечает на вопрос, ради которого в полосу и смотрят.
+  // Разбивка по видам, не два числа: badge inherits the tab kind/color.
   const [overflow, setOverflow] = useState<{
     left: Array<{ kind: string; count: number }>;
     right: Array<{ kind: string; count: number }>;
   }>({ left: [], right: [] });
+  const desiredOverflowKeyRef = useRef('L:|R:');
+  const pendingRevealRef = useRef<string | null>(null);
+  const revealSettlePassRef = useRef(0);
   const inStrip = entries.length > 1;
 
-  // Вид вкладки = её цвет, тот же самый, что у чипа: вторая таблица цветов на
-  // одну полосу разошлась бы с первой на первой же новой раскраске.
   const kindOfTab = useCallback((tabId: string) => {
     const st = useWorkspaceStore.getState();
     const owner = entries.find((e) => e.tabId === tabId)?.projectId;
@@ -207,26 +205,20 @@ export default function PaneTabStrip({
       : 'default';
   }, [entries]);
 
-  // Цвет вкладки меняется в тот момент, когда в ней стартует агент, — и часто
-  // это вкладка, уже ушедшая за край. Без подписки квадратик остался бы серым
-  // до случайной прокрутки, то есть врал бы ровно о том, ради чего он есть.
-  // Строка, не массив: селектор с объектами — новая ссылка на каждую запись в
-  // стор, а полоса стоит в шапке КАЖДОГО окна (правило Fingerprint).
+  // Primitive fingerprint: colours can change while their chips are offscreen.
   const kindsKey = useWorkspaceStore((s) => entries
     .map((e) => s.openProjects.get(e.projectId)?.tabs.get(e.tabId)?.color || '-')
     .join(','));
 
-  const measure = useCallback(() => {
+  const measure = useCallback((): boolean => {
     const el = scrollerRef.current;
-    if (!el) return;
-    // В режиме переноса за краем ничего нет: всё, что не влезло по ширине,
-    // видно строкой ниже. Счётчик «×2» там означал бы спрятанные вкладки,
-    // которые человек видит своими глазами.
+    if (!el) return false;
     if (wrap) {
-      setOverflow((prev) => (prev.left.length === 0 && prev.right.length === 0
-        ? prev
-        : { left: [], right: [] }));
-      return;
+      const key = 'L:|R:';
+      if (desiredOverflowKeyRef.current === key) return false;
+      desiredOverflowKeyRef.current = key;
+      setOverflow({ left: [], right: [] });
+      return true;
     }
     const chips = Array.from(el.querySelectorAll<HTMLElement>('[data-strip-item]'))
       .map((node) => ({
@@ -237,68 +229,96 @@ export default function PaneTabStrip({
     const next = resolveStripOverflow({
       chips,
       scrollLeft: el.scrollLeft,
-      viewportWidth: Math.max(0, el.clientWidth - Math.max(0, endInsetPx)),
+      // Badge stacks are real flex siblings; clientWidth is already the
+      // currently committed visible width. No guessed inset participates.
+      viewportWidth: el.clientWidth,
     });
     const left = groupOverflowByKind(next.hiddenLeftIds, kindOfTab);
     const right = groupOverflowByKind(next.hiddenRightIds, kindOfTab);
-    const same = (a: Array<{ kind: string; count: number }>, b: Array<{ kind: string; count: number }>) => (
-      a.length === b.length && a.every((g, i) => g.kind === b[i].kind && g.count === b[i].count)
-    );
-    setOverflow((prev) => (
-      same(prev.left, left) && same(prev.right, right) ? prev : { left, right }
-    ));
-  }, [endInsetPx, kindOfTab, wrap]);
+    const key = 'L:' + left.map((g) => `${g.kind}:${g.count}`).join(',')
+      + '|R:' + right.map((g) => `${g.kind}:${g.count}`).join(',');
+    // Update desired identity BEFORE React state. Scroll/layout callbacks fired
+    // before the commit now dedupe synchronously instead of queuing the same
+    // object repeatedly.
+    if (desiredOverflowKeyRef.current === key) return false;
+    desiredOverflowKeyRef.current = key;
+    setOverflow({ left, right });
+    return true;
+  }, [kindOfTab, wrap]);
 
-  // Measured after layout, not on a timer: the counts are a statement about what
-  // is on screen RIGHT NOW, and a frame of "+0" while the numbers catch up reads
-  // as "nothing is hidden" — the one thing they exist to deny.
-  useLayoutEffect(measure, [measure, entries.length, shownTabId, kindsKey, endInsetPx]);
-  useEffect(() => {
-    const el = scrollerRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') return undefined;
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [measure]);
+  // `measure` returns a boolean for reveal coordination; never hand that value
+  // to React as an effect cleanup (`destroy is not a function`).
+  useLayoutEffect(() => { measure(); }, [measure, entries.length, shownTabId, kindsKey]);
 
-  // Подвинуть полосу так, чтобы НАЗВАННЫЙ чип был виден целиком, и ровно
-  // настолько, насколько нужно. Чип, уже помещающийся в окно, не двигает
-  // полосу вообще — поэтому это безопасно звать на каждый повод.
-  const revealChip = useCallback((targetTabId: string) => {
+  const revealChip = useCallback((targetTabId: string): { moved: boolean; overflowChanged: boolean } => {
     const el = scrollerRef.current;
-    if (!el || !targetTabId || wrap) return;
+    if (!el || !targetTabId || wrap) return { moved: false, overflowChanged: false };
     const node = el.querySelector<HTMLElement>(`[data-strip-item][data-strip-tab-id="${CSS.escape(targetTabId)}"]`);
-    if (!node) return;
+    if (!node) return { moved: false, overflowChanged: false };
+    // Both rectangles belong to this exact committed layout, including the
+    // real width already taken by one or several overflow badges.
+    const chipRect = node.getBoundingClientRect();
+    const viewportRect = el.getBoundingClientRect();
     const next = scrollOffsetForChip({
-      chip: { left: node.offsetLeft, width: node.offsetWidth },
+      chip: { left: chipRect.left, right: chipRect.right },
+      viewport: { left: viewportRect.left, right: viewportRect.right },
       scrollLeft: el.scrollLeft,
-      // Та же видимая область, что у счётчика: довести чип «до края окна» и
-      // оставить его под кнопками — значит не довести.
-      viewportWidth: Math.max(0, el.clientWidth - Math.max(0, endInsetPx)),
     });
-    if (next !== el.scrollLeft) { el.scrollLeft = next; measure(); }
-  }, [endInsetPx, measure, wrap]);
+    const moved = next !== el.scrollLeft;
+    if (moved) {
+      el.scrollLeft = next;
+    }
+    return { moved, overflowChanged: measure() };
+  }, [measure, wrap]);
 
-  // Возврат В ЭТО ОКНО — тоже повод показать его вкладку целиком.
-  //
-  // Человек мог увести полосу вбок, уйти работать в соседнее окно и вернуться:
-  // вкладка здесь всё та же, значит `shownTabId` не менялся, и правило «показать
-  // при смене» молчало — окно встречало обрезанным именем той самой вкладки,
-  // которая в нём и открыта. Юзер: *«потом я уехал от неё обратно, переключился
-  // на другое окно… если обратно переключаюсь, тоже должно доскроллиться»*.
+  const requestReveal = useCallback((targetTabId: string) => {
+    if (!targetTabId || wrap) return;
+    pendingRevealRef.current = targetTabId;
+    revealSettlePassRef.current = 0;
+    const result = revealChip(targetTabId);
+    if (!result.overflowChanged) pendingRevealRef.current = null;
+  }, [revealChip, wrap]);
+
   const paneFocused = useWorkspaceStore((s) => (
     paneIndex === null || paneIndex === undefined ? true : s.splitFocusedIndex === paneIndex
   ));
 
-  // The SHOWN chip must be legible: the window's content is that tab, so a header
-  // where its chip has scrolled away contradicts what is underneath it. Fires
-  // wherever the change came from — sidebar, Ctrl+Tab, a closing neighbour, or
-  // coming back to this window.
+  // Immediate pass for the current layout. A fully visible chip is a strict
+  // no-op; a clipped one moves by exactly the clipping delta.
   useLayoutEffect(() => {
-    if (!inStrip) return;
-    revealChip(shownTabId);
-  }, [shownTabId, inStrip, paneFocused, revealChip]);
+    if (!inStrip || wrap) return;
+    requestReveal(shownTabId);
+  }, [shownTabId, inStrip, paneFocused, requestReveal, wrap]);
 
+  // A requested badge state has now committed. Re-read the real rect once and
+  // continue only if that measurement requested another badge footprint.
+  // Passive effect = no nested layout-state loop. A hard cap is a fail-safe for
+  // a browser rounding oscillation; normal convergence is one or two passes.
+  useEffect(() => {
+    const targetTabId = pendingRevealRef.current;
+    if (!targetTabId || wrap) return;
+    revealSettlePassRef.current += 1;
+    if (revealSettlePassRef.current > 4) {
+      console.warn('[PaneTabStrip] reveal-settle-cap tab=' + targetTabId.slice(-12));
+      pendingRevealRef.current = null;
+      return;
+    }
+    const result = revealChip(targetTabId);
+    if (!result.overflowChanged) pendingRevealRef.current = null;
+  }, [overflow, revealChip, wrap]);
+
+  // ResizeObserver only measures committed browser geometry. It never forces
+  // the shown tab back during an ordinary user scroll; follow-up reveal is
+  // owned solely by the request above.
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => {
+      measure();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [measure]);
   const runs = groupStripByProject(entries);
   const indexOfTab = new Map(entries.map((entry, i) => [entry.tabId, i]));
 
@@ -348,7 +368,7 @@ export default function PaneTabStrip({
         onClickCapture={(e) => {
           const node = (e.target as HTMLElement | null)?.closest?.('[data-strip-item]') as HTMLElement | null;
           const clicked = node?.dataset?.stripTabId;
-          if (clicked) revealChip(clicked);
+          if (clicked) requestReveal(clicked);
         }}
         // Wheel over the strip scrolls it sideways: the row is one line tall and
         // there is nothing to scroll vertically here, so a vertical wheel that

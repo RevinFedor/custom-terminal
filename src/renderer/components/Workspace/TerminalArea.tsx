@@ -4,7 +4,7 @@ import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
-import { useSplitAttachRowHeight, PANE_HEADER_HEIGHT_VAR, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
+import { useSplitAttachRowHeight, splitPaneHeaderHeightVar, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
 import { motion, AnimatePresence } from 'framer-motion';
 import { HIDDEN_PANE_INDEX, isEmptyPane, paneIsStacked, resolveTabPaneShape, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
@@ -461,6 +461,24 @@ function TerminalArea({
     // в сфокусированное окно, а кликнуть могли по кнопке в шапке соседнего.
     if (store.splitFocusedIndex !== paneIndex) store.focusSplitPane(paneIndex);
 
+    // `createTab` only creates/persists a tab. Its direct activeTabId write does
+    // not update splitPanes, so relying on activation here produced the exact
+    // split-brain the user saw: the sidebar selected the new tab while the
+    // empty pane still had no tab id. Create in background, then make the pane
+    // placement the single visible commit.
+    const placeInTargetPane = (createdTabId: string) => {
+      if (!createdTabId) return;
+      const current = useWorkspaceStore.getState();
+      if (current.splitPanes[paneIndex]) {
+        current.addTabToSplitPaneStrip(paneIndex, targetProjectId, createdTabId);
+      } else {
+        // The user may have removed the placeholder while PTY creation was in
+        // flight. Do not leave a live tab unreachable; ordinary activation is
+        // the safe fallback and the sidebar visibility guard will expose it.
+        current.activateCenterTab(targetProjectId, createdTabId);
+      }
+    };
+
     const projectPath = workspace.projectPath && !workspace.projectPath.startsWith('__unset__')
       ? workspace.projectPath
       : '';
@@ -470,24 +488,34 @@ function TerminalArea({
     if (action === 'terminal') {
       // Вкладка без агента: живой shell. Отдельного типа вкладки нет — «пустая»
       // это описание, а не состояние (см. emptyTab.mjs).
-      await useWorkspaceStore.getState().createTab(targetProjectId, EMPTY_TAB_NAME, cwd, {
+      const createdTabId = await useWorkspaceStore.getState().createTab(targetProjectId, EMPTY_TAB_NAME, cwd, {
         skipInitialRename: true,
+        background: true,
+        windowScoped: true,
       });
+      placeInTargetPane(createdTabId);
       return;
     }
     if (action === 'sdk') {
-      await useWorkspaceStore.getState().createSDKTab(targetProjectId);
+      const createdTabId = await useWorkspaceStore.getState().createSDKTab(targetProjectId, undefined, {
+        background: true,
+        windowScoped: true,
+      });
+      placeInTargetPane(createdTabId);
       return;
     }
     if (action === 'claude' || action === 'codex') {
       // Тот же контракт, что у всех прочих точек запуска: вкладка несёт
       // pendingAction, а CLI поднимает Terminal.tsx, когда shell готов. Свой
       // запуск отсюда гонялся бы с ним и стартовал два процесса в одном PTY.
-      await useWorkspaceStore.getState().createTab(targetProjectId, undefined, cwd, {
+      const createdTabId = await useWorkspaceStore.getState().createTab(targetProjectId, undefined, cwd, {
         color: action,
         pendingAction: { type: action === 'codex' ? 'codex-new' : 'claude-new' },
         skipInitialRename: true,
+        background: true,
+        windowScoped: true,
       });
+      placeInTargetPane(createdTabId);
       return;
     }
     // Форки из буфера: без UUID в буфере создавать вкладку незачем — пустая
@@ -510,12 +538,14 @@ function TerminalArea({
       const sdkTabId = await useWorkspaceStore.getState().createSDKTab(
         targetProjectId,
         `${clipSid.slice(0, 8)}_fork`,
+        { background: true, windowScoped: true },
       );
       useWorkspaceStore.getState().updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
+      placeInTargetPane(sdkTabId);
       return;
     }
     const isCodex = action === 'codex-fork';
-    await useWorkspaceStore.getState().createTab(
+    const createdTabId = await useWorkspaceStore.getState().createTab(
       targetProjectId,
       `${clipSid.slice(0, 8)}_${isCodex ? 'codex' : 'fork'}`,
       cwd,
@@ -524,8 +554,11 @@ function TerminalArea({
         pendingAction: { type: isCodex ? 'codex-fork' : 'claude-fork', sessionId: clipSid },
         nameSetManually: false,
         skipInitialRename: true,
+        background: true,
+        windowScoped: true,
       },
     );
+    placeInTargetPane(createdTabId);
   }, []);
 
   const terminals = useMemo(() => {
@@ -698,10 +731,12 @@ function TerminalArea({
           );
         }
 
-        // Persistent wrapper: single mode = full-size transparent layer, split
-        // mode = pane rect with attach row + focus frame. pointerEvents:none —
-        // each tab surface re-enables its own hits when presented, so hidden
-        // full-size wrappers never shadow the panes below them.
+        // Persistent per-TAB wrapper: single mode = full-size transparent
+        // layer, split mode = pane content rect. Pane chrome/focus frame live in
+        // one stable per-WINDOW sibling below; putting them here remounted the
+        // whole header and reset strip scroll on every chip switch.
+        // pointerEvents:none — each tab surface re-enables its own hits when
+        // presented, so hidden full-size wrappers never shadow panes below.
         const focusedPane = shownInPane && tab.id === splitFocusedTabId;
         // Открыта ли у окна боковая панель-«гость» (терминал при
         // переписке-primary, переписка при терминале-primary). Считается тем же
@@ -754,14 +789,6 @@ function TerminalArea({
               pointerEvents: 'none',
             }}
           >
-            {shownInPane && (
-              <SplitPaneAttachRow
-                projectId={projId}
-                tabId={tab.id}
-                focused={focusedPane}
-                paneIndex={paneIndex}
-              />
-            )}
             {/* Toast anchor of THIS tab. A toast about this tab is portalled here,
                 so it appears at the top-right of the surface it is about instead
                 of the top-right of the whole window (where a message about the
@@ -776,7 +803,7 @@ function TerminalArea({
                 // сколько заняли чипы. Запасное значение — прежнее
                 // предсказание по настройкам, на случай окна без своей шапки.
                 top: shownInPane
-                  ? `calc(var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px) + 8px)`
+                  ? `calc(var(${splitPaneHeaderHeightVar(paneIndex)}, ${attachRowH}px) + 8px)`
                   : 8,
                 right: 8,
                 zIndex: 210,
@@ -794,7 +821,7 @@ function TerminalArea({
                 position: 'absolute',
                 // Та же измеренная высота шапки — см. комментарий у якоря
                 // уведомлений выше.
-                top: shownInPane ? `var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px)` : 0,
+                top: shownInPane ? `var(${splitPaneHeaderHeightVar(paneIndex)}, ${attachRowH}px)` : 0,
                 // A pane's content stops 2px short of the frame. The frame is a
                 // 1px line drawn ON the pane's edge; content that reaches the
                 // same pixel column touches it, and anything light there — a
@@ -830,10 +857,50 @@ function TerminalArea({
                 </SplitPaneSurface>
               ) : inner}
             </div>
-            {shownInPane && <SplitPaneFocusFrame focused={focusedPane} />}
           </div>
         );
       });
+    });
+
+    // One chrome tree per WINDOW, not per shown tab.
+    //
+    // The header used to live inside `pane:${tab.id}` above. Switching a chip
+    // therefore unmounted the old PaneTabStrip and mounted a new one with
+    // scrollLeft=0; Git/split/⋮ were physically replaced too. From the user's
+    // side this looked exactly like focus-dependent disappearing actions and
+    // a strip that forgot its horizontal position. The stable pane-index key
+    // keeps one scroller/actions row while only its shown tab prop changes.
+    splitPanes.forEach((pane, paneIndex) => {
+      if (isEmptyPane(pane)) return;
+      const tab = currentOpenProjects.get(pane.projectId)?.tabs.get(pane.tabId);
+      if (!tab) return;
+      const focusedPane = paneIndex === state.splitFocusedIndex;
+      const paneOverlayOpen = tab.tabType !== 'claude-sdk'
+        && tab.tabType !== 'file'
+        && resolvePtyAgentOwner(tab) !== null
+        && (resolveTabTerminalPrimary({ terminalIsPrimaryTabs, newTabPrimarySurface }, tab.id)
+          ? !!historyPanelOpenTabs[tab.id]
+          : !!sideTerminalOpenTabs[tab.id]);
+      result.push(
+        <div
+          key={`pane:chrome:${paneIndex}`}
+          data-terminal-pane-chrome-host={paneIndex}
+          data-split-pane-index={paneIndex}
+          style={{
+            ...splitPaneRectStyle(paneIndex, splitPanes, splitSizes),
+            zIndex: paneOverlayOpen ? (focusedPane ? 12 : 1) : 2,
+            pointerEvents: 'none',
+          }}
+        >
+          <SplitPaneAttachRow
+            projectId={pane.projectId}
+            tabId={pane.tabId}
+            focused={focusedPane}
+            paneIndex={paneIndex}
+          />
+          <SplitPaneFocusFrame focused={focusedPane} />
+        </div>
+      );
     });
 
     splitPanes.forEach((pane, paneIndex) => {
@@ -1021,6 +1088,7 @@ function TerminalArea({
   // This keeps terminal instances alive and prevents jitter
   return (
     <div
+      data-terminal-area-root
       className="absolute inset-0 bg-bg-main"
       onDoubleClick={handleDoubleClick}
     >

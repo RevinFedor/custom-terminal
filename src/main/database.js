@@ -434,6 +434,12 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN visual_parent_tab_id TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
+    // Tabs created from a pane/centre strip use that strip as their primary
+    // navigation surface. Persist the ownership hint so an app restart does
+    // not duplicate those tabs in the left sidebar.
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN window_scoped INTEGER DEFAULT 0`);
+    } catch (e) { /* column already exists */ }
     // When this tab was last ACTIVATED (ms epoch). Recency of tab visits must be
     // a durable property of the tab itself, not an array in the session blob:
     // Ctrl+Tab / Cmd+P order is global across projects, and the per-project
@@ -757,6 +763,8 @@ class DatabaseManager {
     // closing a whole group deletes the container, and later restore must degrade
     // to a flat tab instead of resurrecting a removed folder.
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN group_id TEXT DEFAULT NULL`); } catch (e) {}
+    // Preserve window-only navigation ownership across close/reopen.
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN window_scoped INTEGER DEFAULT 0`); } catch (e) {}
     // Migration: linked file tabs preserve the absolute path across restart and Shift+Cmd+T restore.
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN file_path TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN task_plan TEXT DEFAULT NULL`); } catch (e) {}
@@ -1809,6 +1817,7 @@ class DatabaseManager {
         isCollapsed: t.is_collapsed === 1,
         groupId: t.tab_group_id || undefined,
         visualParentTabId: t.visual_parent_tab_id || undefined,
+        windowScoped: t.window_scoped === 1 || undefined,
         tabId: t.tab_id || undefined,
         sessionStatus: t.session_status || undefined,
         completionNotificationPersistent: t.completion_notification_persistent === 1 || undefined,
@@ -3712,8 +3721,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats, last_activated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats, last_activated_at, window_scoped)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -3813,7 +3822,7 @@ class DatabaseManager {
           )
           ? persistedCodexSettings
           : incomingCodexSettings;
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, claudeSessionId, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson, lastActivatedAt);
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, claudeSessionId, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson, lastActivatedAt, tab.windowScoped ? 1 : 0);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
@@ -4180,8 +4189,8 @@ class DatabaseManager {
       ? String(sourceTabId || archivedTab.tabId || archivedTab.id).trim() || null
       : null;
     const insert = this.db.prepare(`
-      INSERT INTO tab_history (project_id, tab_id, name, name_set_manually, cwd, color, notes, task_plan, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, message_count, position, process_was_running, session_status, group_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tab_history (project_id, tab_id, name, name_set_manually, cwd, color, notes, task_plan, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, message_count, position, process_was_running, session_status, group_id, window_scoped)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const archive = this.db.transaction(() => {
       const info = insert.run(
@@ -4219,7 +4228,8 @@ class DatabaseManager {
         archivedTab.position ?? null,
         archivedTab.processWasRunning ? 1 : 0,
         archivedTab.sessionStatus || null,
-        archivedTab.groupId || null
+        archivedTab.groupId || null,
+        archivedTab.windowScoped ? 1 : 0
       );
       return info.lastInsertRowid;
     });

@@ -3,6 +3,7 @@ const path = require('path');
 const pty = require('node-pty');
 const fs = require('fs');
 const os = require('os');
+const { fileURLToPath } = require('node:url');
 const { stripVTControlCharacters } = require('node:util');
 const crypto = require('crypto');
 const http = require('http');
@@ -15013,6 +15014,107 @@ function createWindow() {
 }
 
 // Context Menu IPC
+// Markdown links may point to web pages or to a local file mentioned in an AI
+// reply.  Keep the OS actions in main: the shared markdown package only asks
+// for this menu, so it remains usable in non-Electron consumers too.
+function localPathFromMarkdownLink(rawHref) {
+  const href = typeof rawHref === 'string' ? rawHref.trim() : '';
+  if (!href || href.length > 16 * 1024) return null;
+
+  if (href.startsWith('file:')) {
+    try {
+      const parsed = new URL(href);
+      return parsed.protocol === 'file:' ? fileURLToPath(parsed) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // A Markdown #fragment is a document anchor, not part of the local path.
+  // Decode after removing it so an encoded literal # in a filename survives.
+  const fragmentIndex = href.indexOf('#');
+  const withoutFragment = fragmentIndex >= 0 ? href.slice(0, fragmentIndex) : href;
+  let decoded = withoutFragment;
+  try { decoded = decodeURIComponent(withoutFragment); } catch {}
+  return path.isAbsolute(decoded) ? decoded : null;
+}
+
+function describeMarkdownLink(rawHref) {
+  const href = typeof rawHref === 'string' ? rawHref.trim() : '';
+  const filePath = localPathFromMarkdownLink(href);
+  if (!filePath) return { href, kind: 'link' };
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.isFile()) return { href, filePath, kind: 'file' };
+    if (stat.isDirectory()) return { href, filePath, kind: 'directory' };
+  } catch {
+    // Copying a stale path is still useful; opening actions must not pretend
+    // that a file which no longer exists can be opened.
+  }
+  return { href, filePath, kind: 'path' };
+}
+
+function openMarkdownFileInGtEditor(filePath, isDirectory) {
+  const folder = isDirectory ? filePath : path.dirname(filePath);
+  const query = new URLSearchParams({ folder });
+  if (!isDirectory) query.set('file', path.basename(filePath));
+  const target = 'gteditor://open?' + query.toString();
+  void shell.openExternal(target).catch((error) => {
+    console.error('[MarkdownLink] GT Editor open failed:', error?.message || error);
+  });
+}
+
+ipcMain.on('show-markdown-link-context-menu', (event, payload = {}) => {
+  const target = describeMarkdownLink(payload?.href);
+  if (!target.href) return;
+
+  const template = [];
+  if (target.kind === 'file') {
+    template.push(
+      {
+        label: 'Открыть в Finder',
+        click: () => shell.showItemInFolder(target.filePath),
+      },
+      {
+        label: 'Открыть в GT Editor',
+        click: () => openMarkdownFileInGtEditor(target.filePath, false),
+      },
+      {
+        label: 'Открыть в Sublime Text',
+        click: () => {
+          void openFileInSublime(target.filePath).then((result) => {
+            if (!result?.success) {
+              console.warn('[MarkdownLink] Sublime open failed:', result?.error || 'unknown error');
+            }
+          });
+        },
+      },
+      { type: 'separator' },
+      { label: 'Копировать путь', click: () => clipboard.writeText(target.filePath) },
+    );
+  } else if (target.kind === 'directory') {
+    template.push(
+      {
+        label: 'Открыть в Finder',
+        click: () => shell.showItemInFolder(target.filePath),
+      },
+      {
+        label: 'Открыть в GT Editor',
+        click: () => openMarkdownFileInGtEditor(target.filePath, true),
+      },
+      { type: 'separator' },
+      { label: 'Копировать путь', click: () => clipboard.writeText(target.filePath) },
+    );
+  } else if (target.kind === 'path') {
+    template.push({ label: 'Копировать путь', click: () => clipboard.writeText(target.filePath) });
+  } else {
+    template.push({ label: 'Копировать ссылку', click: () => clipboard.writeText(target.href) });
+  }
+
+  const menu = Menu.buildFromTemplate(template);
+  menu.popup({ window: BrowserWindow.fromWebContents(event.sender) });
+});
+
 ipcMain.on('show-history-entry-context-menu', (event, { copyText } = {}) => {
   if (typeof copyText !== 'string' || !copyText.trim()) return;
 
@@ -35877,7 +35979,7 @@ function execFileAsync(command, args, options = {}) {
   });
 }
 
-ipcMain.handle('file:open-in-sublime', async (event, filePath) => {
+async function openFileInSublime(filePath) {
   try {
     if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) {
       return { success: false, error: 'Invalid file path' };
@@ -35924,6 +36026,10 @@ ipcMain.handle('file:open-in-sublime', async (event, filePath) => {
     console.error('[FileOps:Sublime] Error opening file:', error);
     return { success: false, error: error.message };
   }
+}
+
+ipcMain.handle('file:open-in-sublime', async (event, filePath) => {
+  return openFileInSublime(filePath);
 });
 
 ipcMain.handle('file:read-directory', async (event, dirPath) => {

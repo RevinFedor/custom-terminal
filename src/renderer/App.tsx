@@ -102,6 +102,8 @@ import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSett
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
 import { PROJECT_CARD_MAX_H, TITLE_BAR_H } from './constants/layout';
 import { generateTabTitleFromSession } from './utils/generateTabTitle';
+import { startAutoTabTitleCoordinator } from './utils/autoTabTitleCoordinator';
+import { runWorkflowIconHierarchyMigration } from './utils/runWorkflowIconHierarchyMigration';
 import { linkFileTab } from './utils/linkFileTab';
 import { resolveDockBusyBadgeState } from './utils/dockBusyBadgeState.mjs';
 import { shouldNavigateProjectsWithArrow } from './utils/projectArrowNavigation.mjs';
@@ -494,11 +496,8 @@ interface ProjectTabItemProps {
   isActive: boolean;
   fontSize: number;
   forceRightIndicator?: boolean;
-  activeProcessCount?: number; // Count of running processes in project
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
   completionNotificationCount?: number; // Count of completed tabs with armed notification
-  isProjectBusy?: boolean; // Any tab in project has Claude/Gemini thinking
-  isProjectInheritedBusy?: boolean; // A source tab is waiting for a Terminal MCP child
   isProjectAwaiting?: boolean; // Any tab in project blocked on AskUserQuestion (needs answer)
   isEditing: boolean;
   editValue: string;
@@ -523,7 +522,6 @@ const ProjectTabItem = memo(({
   isActive,
   fontSize,
   forceRightIndicator = false,
-  activeProcessCount = 0,
   interruptedCount = 0,
   completionNotificationCount = 0,
   isEditing,
@@ -537,8 +535,6 @@ const ProjectTabItem = memo(({
   onDoubleClick,
   onTabDrop,
   isAreaActive,
-  isProjectBusy = false,
-  isProjectInheritedBusy = false,
   isProjectAwaiting = false,
   isPinnedSystem = false
 }: ProjectTabItemProps) => {
@@ -711,7 +707,7 @@ const ProjectTabItem = memo(({
   // подсветить карточку должен уметь и Ctrl+Q.
   const textColor = isActive
     ? 'text-black'
-    : activeProcessCount > 0 || isProjectBusy || hovered
+    : hovered
       ? 'text-white'
       : 'text-gray-400';
   const dropState = structuredDropState
@@ -836,6 +832,7 @@ const ProjectTabItem = memo(({
           <>
             {projectIcon ? (
               <img
+                data-project-icon={projectId}
                 src={projectIcon}
                 alt=""
                 className="w-4 h-4 rounded-[3px] object-cover flex-shrink-0"
@@ -859,38 +856,6 @@ const ProjectTabItem = memo(({
               ? <span className="sr-only">{projectName}</span>
               : <span className="max-w-[120px] truncate">{projectName}</span>}
           </>
-        )}
-        {(activeProcessCount > 0 || isProjectBusy) && !isEditing && (
-          <span
-            className="relative flex items-center justify-center text-[10px] font-medium rounded-full"
-            style={{
-              minWidth: '16px',
-              height: '16px',
-              padding: '0 4px',
-              backgroundColor: isProjectInheritedBusy
-                ? 'color-mix(in srgb, var(--process-bar-inherited-color, #A855F7) 24%, transparent)'
-                : (isActive ? 'rgba(74, 222, 128, 0.3)' : 'rgba(74, 222, 128, 0.2)'),
-              color: isProjectInheritedBusy ? 'var(--process-bar-inherited-color, #A855F7)' : (isActive ? '#166534' : '#4ade80'),
-              boxSizing: 'border-box',
-            }}
-          >
-            {isProjectBusy && (
-              // Дуга по контуру (.noted-shape-ring): счётчик — овал при 2+
-              // процессах (padding раздаёт ширину), а вращаемая рамка верна
-              // только для круга — на овале она вылезала за контур.
-              <span
-                className="noted-shape-ring absolute inset-0 rounded-full"
-                style={{
-                  '--noted-ring-thickness': '2px',
-                  '--noted-ring-color': isProjectInheritedBusy ? 'var(--process-bar-inherited-color, #A855F7)' : '#4ade80',
-                  '--noted-ring-track': isProjectInheritedBusy
-                    ? 'color-mix(in srgb, var(--process-bar-inherited-color, #A855F7) 20%, transparent)'
-                    : 'rgba(74, 222, 128, 0.2)',
-                } as React.CSSProperties}
-              />
-            )}
-            {activeProcessCount > 0 ? activeProcessCount : null}
-          </span>
         )}
         {completionNotificationCount > 0 && !isEditing && (
           <Tooltip content="Tab completion notification ready">
@@ -1034,6 +999,11 @@ function App() {
   // runner above tolerates queue items appearing after mount (subscribes to
   // store deltas), so this doesn't need to block render.
   useEffect(() => { hydratePromptQueueStore(); }, []);
+  // Fresh-launch naming is a lifecycle side effect, not a Timeline UI side
+  // effect. The global coordinator keeps the exact transcript subscription
+  // alive for background/unmounted tabs and reads durable history even while a
+  // long turn keeps visual Timeline refresh intentionally deferred.
+  useEffect(() => startAutoTabTitleCoordinator(), []);
   useEffect(() => {
     const unsubscribe = subscribeOrchestrationRunChanges((change) => {
       const workspace = useWorkspaceStore.getState();
@@ -1079,16 +1049,9 @@ function App() {
   // Settings → Размеры: иначе он выпадает из ряда по высоте и по вертикальному
   // центру (симптом: «он по вертикали находится выше, чем должен»).
   const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
-  const inheritedBusyProjectKey = useOrchestrationStore((s) => (
-    Array.from(s.inheritedBusyProjectIds).sort().join('\u0000')
-  ));
   const inheritedBusyTabKey = useOrchestrationStore((s) => (
     Array.from(s.inheritedBusyTabIds).sort().join('\u0000')
   ));
-  const inheritedBusyProjectIds = useMemo(
-    () => new Set(inheritedBusyProjectKey ? inheritedBusyProjectKey.split('\u0000') : []),
-    [inheritedBusyProjectKey],
-  );
   const inheritedBusyTabIds = useMemo(
     () => new Set(inheritedBusyTabKey ? inheritedBusyTabKey.split('\u0000') : []),
     [inheritedBusyTabKey],
@@ -1523,6 +1486,13 @@ function App() {
     (async () => {
       await loadProjects();
       await restoreSession();
+      try {
+        await runWorkflowIconHierarchyMigration();
+      } catch (error) {
+        // No marker is written on a partial failure, so the idempotent plan can
+        // retry on the next production launch. Boot itself must stay usable.
+        console.error('[WorkflowIconMigration] failed:', error);
+      }
       if (!cancelled) {
         const state = useWorkspaceStore.getState();
         if (!state.openProjects.has(INBOX_PROJECT_ID)) {
@@ -5349,13 +5319,23 @@ function App() {
         (e as any).stopImmediatePropagation();
       }
       const ws = useWorkspaceStore.getState();
-      const activeProjectId = ws.activeProjectId;
-      if (!activeProjectId) return;
+      const targetPaneIndex = ws.splitPanes.length > 0 ? ws.splitFocusedIndex : -1;
+      const targetPane = targetPaneIndex >= 0 ? ws.splitPanes[targetPaneIndex] : null;
+      // In split mode the shortcut belongs to the pane that owns focus. An
+      // empty placeholder has no project yet, so it inherits the currently
+      // focused sidebar project; a populated pane restores from its own
+      // project's history.
+      const restoreProjectId = targetPane?.projectId
+        || ws.getFocusedProjectId()
+        || ws.activeProjectId;
+      if (!restoreProjectId) return;
       // Fire pulse SYNCHRONOUSLY before IPC — the user sees TabBar flash within
       // the same frame as the keypress, even though createTab + claude-c resume
       // can take 300-800ms. Without this, the hotkey feels deaf during the gap.
       useUIStore.getState().triggerReopenPulse();
-      ws.reopenLastClosedTab(activeProjectId).then((res) => {
+      ws.reopenLastClosedTab(restoreProjectId, targetPaneIndex >= 0
+        ? { targetPaneIndex }
+        : undefined).then((res) => {
         if (!res.tabId) {
           if (res.reason === 'empty') showToast('Нет закрытых вкладок', 'info');
           else if (res.reason === 'busy' || res.reason === 'cancelled') showToast(res.message || 'Восстановление отменено', 'info');
@@ -5482,8 +5462,6 @@ function App() {
   const inboxWorkspace = openProjects.get(INBOX_PROJECT_ID);
   const getProjectTabIndicators = (projectId: string, workspace?: any) => {
     let activeCount = 0;
-    let hasBusyTab = false;
-    let hasPasteBusyTab = false;
     let hasAwaitingTab = false;
     let completionNotificationCount = 0;
     let interruptedCount = 0;
@@ -5491,21 +5469,16 @@ function App() {
     workspace?.tabs?.forEach((tab: any, tabId: string) => {
       const hasLiveProcess = !!processStatus.get(tabId) || !!tab.sdkProcessAlive;
       if (hasLiveProcess) activeCount++;
-      if (busyTabs.get(tabId)) hasBusyTab = true;
-      if (pasteBusyTabs.get(tabId)) hasPasteBusyTab = true;
       if (awaitingTabs.get(tabId)) hasAwaitingTab = true;
       if (tab.completionNotificationFired) completionNotificationCount++;
       if (isTabInterrupted(tab)) interruptedCount++;
     });
 
-    const hasInheritedBusyTab = inheritedBusyProjectIds.has(projectId);
     return {
       activeCount,
       hasAwaitingTab,
       completionNotificationCount,
       interruptedCount,
-      hasProjectInheritedShimmer: hasInheritedBusyTab && !hasBusyTab && !hasPasteBusyTab,
-      hasProjectShimmer: hasBusyTab || hasPasteBusyTab || hasInheritedBusyTab,
     };
   };
   const inboxIndicators = getProjectTabIndicators(INBOX_PROJECT_ID, inboxWorkspace);
@@ -5721,11 +5694,8 @@ function App() {
             index={-1}
             isActive={view === 'workspace' && focusedProjectId === INBOX_PROJECT_ID}
             fontSize={projectTabsFontSize}
-            activeProcessCount={inboxIndicators.activeCount}
             interruptedCount={inboxIndicators.interruptedCount}
             completionNotificationCount={inboxIndicators.completionNotificationCount}
-            isProjectBusy={inboxIndicators.hasProjectShimmer}
-            isProjectInheritedBusy={inboxIndicators.hasProjectInheritedShimmer}
             isProjectAwaiting={inboxIndicators.hasAwaitingTab}
             isEditing={false}
             editValue=""
@@ -5778,11 +5748,8 @@ function App() {
                 isActive={isActive}
                 fontSize={projectTabsFontSize}
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
-                activeProcessCount={indicators.activeCount}
                 interruptedCount={indicators.interruptedCount}
                 completionNotificationCount={indicators.completionNotificationCount}
-                isProjectBusy={indicators.hasProjectShimmer}
-                isProjectInheritedBusy={indicators.hasProjectInheritedShimmer}
                 isProjectAwaiting={indicators.hasAwaitingTab}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}
@@ -5893,7 +5860,12 @@ function App() {
               Узел пустой и без геометрии: меню внутри позиционируются
               относительно окна сами. */}
           <div ref={workspaceOverlayHostRef} data-workspace-overlay-host />
-          <Workspace />
+          <Workspace
+            processStatus={processStatus}
+            busyTabs={busyTabs}
+            pasteBusyTabs={pasteBusyTabs}
+            inheritedBusyTabIds={inheritedBusyTabIds}
+          />
         </div>
       </div>
 

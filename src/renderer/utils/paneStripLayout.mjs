@@ -136,15 +136,49 @@ export function groupOverflowByKind(hiddenIds, kindOf) {
  * a chip already fully visible returns the offset unchanged, so the strip
  * never jumps under a click that did not need it.
  *
+ * `viewport` is the preferred form for DOM callers: both rectangles then come
+ * from the SAME layout and already include whatever real neighbours (for
+ * example an overflow badge stack) took from the scroller. `viewportWidth` is
+ * kept for callers whose chip coordinates already live in scroll-content
+ * space.
+ *
+ * There is deliberately no visual margin here. A chip flush with either edge
+ * is fully visible, so moving it would turn activation into gratuitous strip
+ * motion. If a chip is clipped, the clipped edge itself supplies the exact
+ * delta to the nearest viewport edge.
+ *
+ * @param {object} args
+ * @param {{left: number, right?: number, width?: number}} args.chip
+ * @param {number} args.scrollLeft
+ * @param {{left: number, right: number}} [args.viewport]
+ * @param {number} [args.viewportWidth]
  * @returns {number} the new scrollLeft
  */
-export function scrollOffsetForChip({ chip, scrollLeft, viewportWidth, marginPx = 8 }) {
+export function scrollOffsetForChip({ chip, scrollLeft, viewport, viewportWidth }) {
   const from = Number(scrollLeft) || 0;
   if (!chip) return from;
-  const width = Number(viewportWidth) || 0;
+
+  const hasViewport = viewport
+    && Number.isFinite(Number(viewport.left))
+    && Number.isFinite(Number(viewport.right));
+  const viewportLeft = hasViewport ? Number(viewport.left) : from;
+  const viewportRight = hasViewport
+    ? Number(viewport.right)
+    : viewportLeft + (Number(viewportWidth) || 0);
   const left = Number(chip.left) || 0;
-  const right = left + (Number(chip.width) || 0);
-  if (left < from + marginPx) return Math.max(0, left - marginPx);
-  if (right > from + width - marginPx) return Math.max(0, right - width + marginPx);
+  const right = Number.isFinite(Number(chip.right))
+    ? Number(chip.right)
+    : left + (Number(chip.width) || 0);
+
+  if (viewportRight <= viewportLeft) return from;
+  // Fully visible means exactly that; touching an edge is not clipping.
+  if (left >= viewportLeft && right <= viewportRight) return from;
+  // A chip wider than the viewport cannot be made whole. If it already covers
+  // the complete viewport, moving to either edge would only hide more of the
+  // opposite side and would oscillate on the next reveal.
+  if (left <= viewportLeft && right >= viewportRight) return from;
+
+  if (left < viewportLeft) return Math.max(0, from + left - viewportLeft);
+  if (right > viewportRight) return Math.max(0, from + right - viewportRight);
   return from;
 }

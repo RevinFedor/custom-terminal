@@ -19,8 +19,13 @@ export function publishCodexSurfaceReadIdentity(tabId, runtimeSnapshot) {
   if (!key) return null;
   const next = getCodexRuntimeReadSessionId(runtimeSnapshot);
   const previous = byTab.get(key) || null;
+  // A first-submit barrier temporarily makes copy identity unresolved while
+  // Codex decides source-in-place vs child. Keep the last exact read-only
+  // surface visible through that handoff; command-started clears it explicitly
+  // at the generation boundary, and exact writer adoption replaces it.
   if (next) byTab.set(key, next);
-  else byTab.delete(key);
+  else if (runtimeSnapshot?.liveLifecycle !== true) byTab.delete(key);
+  else return previous;
   if (previous !== next) notify(key);
   return next;
 }

@@ -19,6 +19,7 @@ const workspace = fs.readFileSync(path.join(workspaceDir, 'Workspace.tsx'), 'utf
 const snapshot = fs.readFileSync(path.join(here, '..', 'utils', 'sessionSnapshot.mjs'), 'utf8');
 const layoutConsts = fs.readFileSync(path.join(here, '..', 'constants', 'layout.ts'), 'utf8');
 const tabBar = fs.readFileSync(path.join(workspaceDir, 'TabBar.tsx'), 'utf8');
+const tabListRows = fs.readFileSync(path.join(workspaceDir, 'TabListRows.tsx'), 'utf8');
 const signals = fs.readFileSync(path.join(workspaceDir, 'TabSignals.tsx'), 'utf8');
 const spacesModel = fs.readFileSync(path.join(here, '..', 'utils', 'workspaceSpacesModel.mjs'), 'utf8');
 
@@ -70,16 +71,18 @@ test('клик по вкладке из другого пространства 
 });
 
 test('полоса читает пространства строкой, а не массивом', () => {
-  // Селектор, отдающий объекты, — новая ссылка на каждую запись в стор
-  // (правило Fingerprint).
-  assert.match(strip, /s\.spaces\.map\(\(x\) => `\$\{x\.id\}:\$\{x\.name\}`\)\.join\(','\)/);
+  // Родитель подписан только на порядок id. Имя/иконка/projectIds читаются
+  // гранулярно самим чипом; длинный data URL не пересобирается на каждый write
+  // стора и selector не возвращает массив (Fingerprint Pattern).
+  assert.match(strip, /s\.spaces\.map\(\(space\) => space\.id\)\.join\('\\u0000'\)/);
+  assert.match(strip, /s\.spaces\.find\(\(space\) => space\.id === id\)\?\.icon/);
 });
 
 test('полоса стоит НАД окнами и внутри рабочей области', () => {
   // Пространство помнит раскладку окон — значит говорит про то, что справа от
   // бокового списка, а не про сам список.
   const center = workspace.indexOf('data-workspace-center');
-  const at = workspace.indexOf('<SpaceStrip />');
+  const at = workspace.indexOf('<SpaceStrip');
   assert.ok(at > center, 'внутри центральной колонки');
   assert.ok(at < workspace.indexOf('<TerminalArea'), 'выше окон');
 });
@@ -109,16 +112,18 @@ test('карта в списке рисует раскладку ТОГО про
 });
 
 
-test('новое пространство — ПУСТОЕ ОКНО, а не «окон нет»', () => {
+test('новое пространство — ПУСТОЕ ОКНО, а Settings может создать его в фоне', () => {
   // «Окон нет» в этом приложении означает одиночный режим, а он всегда
   // показывает вкладку центра — со стороны это читается как «моя вкладка
   // переехала в новое пространство». Юзер: *«мы создали новое пространство, я
   // потом буду туда по отдельности тыкать какие-то вкладки… у меня будет пустое
   // окно»*.
-  const add = store.slice(store.indexOf('addWorkspaceSpace: () => {'));
+  const add = store.slice(store.indexOf('addWorkspaceSpace: (options) => {'));
   const body = add.slice(0, add.indexOf('\n  },'));
   assert.match(body, /splitPanes: \[\{ projectId: '', tabId: '' \}\]/);
   assert.ok(!/splitPanes: \[\],/.test(body), 'пустой список окон вернул бы одиночный режим');
+  assert.match(body, /if \(!activate\) \{/);
+  assert.match(body, /set\(\{ spaces: res\.spaces \}\)/);
 });
 
 test('одинокое окно С ВКЛАДКОЙ схлопывается, ПУСТОЕ остаётся — одним правилом', () => {
@@ -145,36 +150,49 @@ test('полоса пространств той же меры, что стро�
   assert.match(strip, /useUIStore\(\(s\) => s\.projectTabsFontSize\)/);
 });
 
-test('⌘-клик добавляет вкладку в ТЕКУЩЕЕ окно последним чипом, и подпись про это стоит на рамке', () => {
-  // Обычный клик ЗАМЕНЯЕТ показанную вкладку окна; ⌘ ставит рядом, не выгоняя
-  // прежнюю. Нового окна жест больше не заводит: деление области — отдельная
-  // кнопка в шапке, и один жест не может иногда класть чип, а иногда
-  // перекраивать раскладку.
-  assert.match(tabBar, /\} else if \(e\.metaKey\) \{/);
+test('plain/Shift добавляют в ТЕКУЩЕЕ окно, Cmd сохраняет прежнюю активацию', () => {
+  const click = tabBar.slice(
+    tabBar.indexOf('const handleTabClick = (e: React.MouseEvent, tabId: string) => {'),
+    tabBar.indexOf('// OSC 133 Event-driven process status'),
+  );
+  // Alt/Ctrl по-прежнему означают multi-select. Shift больше не range-select:
+  // он является явной формой того же add/open, что обычный клик.
+  assert.match(click, /if \(e\.altKey \|\| e\.ctrlKey\) \{[\s\S]{0,260}toggleTabSelection\(projectId, tabId, true\)/);
+  assert.doesNotMatch(click, /selectTabRange/);
+  // Только чистый Cmd идёт в старую единую активацию; Shift+Cmd намеренно
+  // остаётся Shift-режимом добавления.
+  assert.match(click, /if \(e\.metaKey && !e\.shiftKey\) \{[\s\S]{0,260}activateTabFromSidebar\(tabId\)/);
+  assert.match(click, /addTabToFocusedWindow\(tabId\);/);
+  // Добавление идёт последним чипом через существующие strip-методы.
   assert.match(tabBar, /store\.addTabToSplitPaneStrip\(paneIndex, projectId, tabId\);/);
-  // В одиночном центре «окно» — это сам центр: то же действие, другая
-  // поверхность, поэтому оба пути обязаны быть в одном ветвлении.
   assert.match(tabBar, /store\.addTabToCenterStrip\(projectId, tabId\);/);
   assert.doesNotMatch(tabBar, /addTabToSplit\(projectId, tabId\)\)/, 'жест больше не создаёт окно');
-  // Множественный выбор не потерян — у него сменилась клавиша.
-  assert.match(tabBar, /\} else if \(e\.altKey \|\| e\.ctrlKey\) \{/);
-  assert.match(tabBar, /toggleTabSelection\(projectId, tabId, true\)/);
-  // Подпись — на границе карточки, смещена ВНУТРЬ, 12px, только пока ⌘ зажат и
-  // только там, где жест сработает: вкладку, которую окно уже ПОКАЗЫВАЕТ,
-  // добавить в него нельзя.
+
+  // Подпись — та же плашка на границе карточки, но её включает Shift. Cmd
+  // остаётся отдельным сигналом для Restart/Stop/Clear.
   assert.match(signals, /export const TAB_CMD_HINT_FONT_PX = 12;/);
   assert.match(signals, /top: -Math\.round\(TAB_CMD_HINT_FONT_PX \* 0\.28\)/);
-  assert.match(tabBar, /<TabCmdHint text="добавить в это окно" visible=\{cmdPeekMode && effectiveHovered && canOpenInNewWindow\} \/>/);
-  assert.match(tabBar, /s\.splitPanes\[paneIndex\]\?\.tabId !== tab\.id/);
+  assert.match(tabBar, /visible=\{shiftPeekMode && effectiveHovered && targetWindowAction !== null\}/);
+  assert.match(tabBar, /verticalRestartStopMode[\s\S]{0,500}cmdPeekMode/);
+  // Один resolver обслуживает sidebar и switcher; показанная в target строка
+  // даёт null, существующий скрытый чип — open, новая — add.
+  assert.match(tabListRows, /if \(pane\.projectId === projectId && pane\.tabId === tabId\) return null;/);
+  assert.match(tabListRows, /\? 'open' : 'add'/);
 });
 
-test('вкладка, созданная жестом окна, — отдельная строка бокового списка', () => {
+test('windowScoped скрыт только при реальном placement и возвращается fallback-строкой', () => {
   const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
-  // Наследование «визуального родителя» прятало новую вкладку внутрь чужой
-  // карточки: слева её будто не было вовсе.
+  // Вкладка, созданная прямо в полосе, помечена владельцем этой поверхности,
+  // но не притворяется visual-child другой строки.
+  assert.match(chrome, /windowScoped: true,/);
   assert.match(chrome, /visualParentTabId: '',/);
-  assert.match(store, /const rejectsInheritedParent = options\?\.visualParentTabId === '';/);
-  assert.match(store, /!activeGroupId && !rejectsInheritedParent/);
+  assert.match(store, /isTabPlacedInWorkspace: \(tabId\) => \{/);
+  // Селектор возвращает строковой fingerprint, не Map/массив. Скрытие требует
+  // ОБА факта; optional false/undefined или потерянное placement оставляют row.
+  assert.match(tabBar, /const hiddenWindowScopedTabIdsKey = useWorkspaceStore\(\(state\) => \{/);
+  assert.match(tabBar, /candidate\.windowScoped === true && state\.isTabPlacedInWorkspace\(candidate\.id\)/);
+  assert.match(tabBar, /\.join\('\\u0000'\)/);
+  assert.match(tabBar, /const visibleTabs = allTabs\.filter\(\(tab\) => !hiddenWindowScopedTabIds\.has\(tab\.id\)\)/);
 });
 
 test('пространство возвращает вкладку, на которой человек стоял', () => {
@@ -194,23 +212,34 @@ test('пространство возвращает вкладку, на кот�
   assert.match(store, /if \(!alreadyShown\) get\(\)\.activateCenterTab\(savedTab\.projectId, savedTab\.tabId\);/);
 });
 
-test('чип пространства: второе число — работающие вкладки, наведение подсвечивает', () => {
-  // Оба числа считаются по ОДНОМУ множеству вкладок: два независимых обхода
-  // разошлись бы, и человек увидел бы «работает 3 из 2».
-  assert.match(spacesModel, /export function spaceTabIds\(space, tabIdsOfPanes\)/);
-  assert.match(spacesModel, /export function spaceBusyTabCount\(space, tabIdsOfPanes, isBusy\)/);
-  assert.match(spacesModel, /return spaceTabIds\(space, tabIdsOfPanes\)\.size;/);
-  assert.match(store, /workspaceSpaceBusyTabCount: \(id\) => \{/);
-  // Занятость — тот же признак, по которому вкладка сама рисует индикатор.
-  assert.match(store, /if \(tab\) return isAiBusyTab\(tab\);/);
-  // Ноль не показывается: «0 работает» — это не факт, а шум.
-  assert.match(strip, /\{busy > 0 && \(/);
-  assert.match(strip, /data-space-busy-count/);
+test('activity badge переехал с проекта на workflow и считает его дочерние проекты', () => {
+  const app = fs.readFileSync(path.join(here, '..', 'App.tsx'), 'utf8');
+  // Старые два числа workflow и project-level зелёный badge удалены.
+  assert.doesNotMatch(strip, /data-space-tab-count|data-space-busy-count/);
+  assert.doesNotMatch(app, /activeProcessCount\?: number/);
+  // Workflow читает все вкладки явно привязанных проектов: фоновый процесс не
+  // исчезает только потому, что его chip сейчас не разложен в окне.
+  assert.match(strip, /projectIds\.forEach\(\(projectId\) => \{/);
+  assert.match(strip, /s\.openProjects\.get\(projectId\)\?\.tabs\.forEach/);
+  assert.match(strip, /processStatus\.get\(tabId\) \|\| sdkAlive/);
+  assert.match(strip, /busyTabs\.get\(tabId\) \|\| pasteBusyTabs\.get\(tabId\) \|\| inheritedBusyTabIds\.has\(tabId\)/);
+  assert.match(strip, /data-workflow-activity-count/);
+  assert.match(strip, /className="noted-shape-ring absolute inset-0 rounded-full"/);
   // Наведение отвечает «попадёшь сюда» и НЕ дотягивает до текущего состояния —
   // иначе полоса перестанет отвечать, где человек находится.
   assert.match(strip, /const \[hovered, setHovered\] = useState\(false\);/);
   assert.match(strip, /onMouseEnter=\{\(\) => setHovered\(true\)\}/);
   assert.match(strip, /hovered \? 'rgba\(255,255,255,0\.055\)' : 'transparent'/);
+});
+
+test('workflow metadata durable и project имеет одного родителя', () => {
+  assert.match(spacesModel, /projectIds: Array\.isArray\(s\.projectIds\)/);
+  assert.match(spacesModel, /icon: typeof s\.icon === 'string'/);
+  assert.match(spacesModel, /export function updateSpaceMetadata/);
+  assert.match(store, /updateWorkspaceSpaceMetadata: \(id, updates\) => \{/);
+  assert.match(store, /const claimed = new Set\(res\.space\.projectIds \|\| \[\]\)/);
+  assert.match(store, /filter\(\(projectId: string\) => !claimed\.has\(projectId\)\)/);
+  assert.match(snapshot, /\? \{ \.\.\.space, layout: captureSpaceLayout\(state\) \}/);
 });
 
 
@@ -281,14 +310,15 @@ test('шапка окна СООБЩАЕТ измеренную высоту, а
   // а содержимое окна отступает на неё.
   const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
   assert.match(chrome, /export const PANE_HEADER_HEIGHT_VAR = '--pane-header-h';/);
-  assert.match(chrome, /host\.style\.setProperty\(PANE_HEADER_HEIGHT_VAR, h \+ 'px'\)/);
+  assert.match(chrome, /splitPaneHeaderHeightVar = \(paneIndex: number\)/);
+  assert.match(chrome, /host\.style\.setProperty\(heightVar, h \+ 'px'\)/);
   // И снимается при размонтировании: окно переживает свою шапку (пустая панель
   // рисует собственную), и чужая высота сдвинула бы её содержимое.
-  assert.match(chrome, /host\.style\.removeProperty\(PANE_HEADER_HEIGHT_VAR\)/);
+  assert.match(chrome, /host\.style\.removeProperty\(heightVar\)/);
   // Запасное значение обязательно — у пустой панели своя шапка, она эту
   // переменную не ставит.
   const area = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
-  assert.match(area, /var\(\$\{PANE_HEADER_HEIGHT_VAR\}, \$\{attachRowH\}px\)/);
+  assert.match(area, /var\(\$\{splitPaneHeaderHeightVar\(paneIndex\)\}, \$\{attachRowH\}px\)/);
   const workspace = fs.readFileSync(path.join(workspaceDir, 'Workspace.tsx'), 'utf8');
   assert.match(workspace, /data-pane-header-host/);
   assert.match(workspace, /height: `var\(\$\{PANE_HEADER_HEIGHT_VAR\}, \$\{attachRowH\}px\)`/);
@@ -324,7 +354,7 @@ test('маркер статуса кликабелен и не активиру�
 });
 
 test('дуга-лоадер следует форме, а не вращает рамку', () => {
-  // Вращаемая рамка верна только для круга; овал Git и овал счётчика проекта
+  // Вращаемая рамка верна только для круга; овал Git и овал счётчика workflow
   // используют conic-градиент под маской формы.
   const css = fs.readFileSync(path.join(here, '..', 'styles', 'globals.css'), 'utf8');
   assert.match(css, /\.noted-shape-ring \{/);
@@ -333,8 +363,7 @@ test('дуга-лоадер следует форме, а не вращает р
   const git = fs.readFileSync(path.join(workspaceDir, 'GitStatusButton.tsx'), 'utf8');
   assert.match(git, /data-git-chip-spinner[\s\S]{0,200}noted-shape-ring/);
   assert.ok(!/data-git-chip-spinner[\s\S]{0,300}animate-spin/.test(git), 'овал git больше не вращает рамку');
-  const app = fs.readFileSync(path.join(here, '..', '..', 'renderer', 'App.tsx'), 'utf8');
-  assert.match(app, /noted-shape-ring absolute inset-0 rounded-full/);
+  assert.match(strip, /noted-shape-ring absolute inset-0 rounded-full/);
 });
 
 test('порог имени ветки Git — настройка, а не константа', () => {

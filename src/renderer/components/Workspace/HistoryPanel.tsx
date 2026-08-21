@@ -168,6 +168,11 @@ import {
   scheduleHistoryBottomScroll,
 } from '../../utils/historyBottomScroll.mjs';
 import { createHistoryScrollSeekController } from '../../utils/historyScrollSeek.mjs';
+import {
+  advanceHistoryPresentationProof,
+  createHistoryPresentationProof,
+  historyPresentationOwnsWrite,
+} from '../../utils/historyPresentationOwnership.mjs';
 import { flushHistoryDurableWithRetry } from '../../utils/historyDurableFlush.mjs';
 import {
   applyHistoryLiveToolResultsToEntry,
@@ -642,6 +647,11 @@ interface HistoryPanelProps {
   // owner. Content is hidden, not unmounted: the frozen rows are what makes
   // the handoff cheap.
   staleOwnerCurtain?: boolean;
+  // Mounted is not presented. Persistent split/space panes stay alive under
+  // `visibility:hidden + inert`; background layout there may keep measuring,
+  // but it must never claim a new user reading position. The parent owns this
+  // proof because it alone knows which pane is actually on screen.
+  presented?: boolean;
   // Split workspace: several REAL History instances are mounted (one per
   // pane), but window-level keyboard shortcuts (Escape-interrupt, Cmd+F) must
   // have exactly ONE owner — the focused pane. Non-focused panes stay fully
@@ -729,11 +739,13 @@ const HISTORY_PENDING_DELIVERY_BLOCK_NOTICE =
 const HISTORY_USER_TEXT_COLLAPSE_THRESHOLD = 600;
 const HISTORY_USER_TEXT_COLLAPSED_CHARS = 400;
 
-const HistoryResponseTailTimer = memo(({ timing }: {
+const HistoryResponseTailTimer = memo(({ timing, placement = 'tail' }: {
   timing: HistoryResponseTailTiming;
+  placement?: 'tail' | 'entry';
 }) => {
-  // The one-second clock is deliberately local to the O(1) Footer. Keeping it
-  // out of HistoryPanel means a tick changes one text node, not the transcript
+  // The one-second clock is deliberately local to the running tail instance.
+  // Completed entry instances never tick. Keeping the clock out of
+  // HistoryPanel means a tick changes one text node, not the transcript
   // projection and every visible virtual row.
   const [clock, setClock] = useState(() => Date.now());
   useEffect(() => {
@@ -747,10 +759,13 @@ const HistoryResponseTailTimer = memo(({ timing }: {
     <div
       data-history-tail-response-timer
       data-state={timing.state}
+      data-placement={placement}
       aria-label={label || undefined}
       title={timing.state === 'running'
         ? 'Общее время текущего ответа'
-        : 'Общее время последнего завершённого ответа'}
+        : placement === 'entry'
+          ? 'Общее время этого завершённого ответа'
+          : 'Общее время завершённого ответа'}
       className="hp-history-response-tail"
     >
       <span className="hp-history-response-tail-label">{label}</span>
@@ -4109,6 +4124,10 @@ const HistoryAssistantEntry = memo(({
 
   const hasAssistantContent = !!entry.content;
   const hasAssistantActions = !!entry.actions?.length;
+  const completedResponseTiming = useMemo(
+    () => resolveHistoryResponseTailTiming(null, [entry]) as HistoryResponseTailTiming | null,
+    [entry],
+  );
   const isStandaloneToolRow = !hasAssistantContent
     && ((hasAssistantActions && !entry.thinking)
       // A thinking-only row is service chrome exactly like a tool-only row:
@@ -4139,6 +4158,9 @@ const HistoryAssistantEntry = memo(({
             </MessageActionButton>
           </Tooltip>
         </MessageActionRail>
+      ) : undefined}
+      footer={completedResponseTiming ? (
+        <HistoryResponseTailTimer timing={completedResponseTiming} placement="entry" />
       ) : undefined}
       className={isStandaloneToolRow ? 'hp-assistant-tool-only' : undefined}
     >
@@ -4852,6 +4874,13 @@ const historyPanelStyleText = `@keyframes hp-flash {
 }
 .hp-history-response-tail-label {
   white-space: nowrap;
+}
+/* Completed timing belongs to the response that produced it. Inside an
+   assistant row the outer ConversationMessage already supplies the History
+   inset, so repeating the tail's 12px padding would indent the label twice. */
+.hp-history-response-tail[data-placement="entry"] {
+  min-height: 18px;
+  padding: 4px 0 0;
 }
 .hp-history-response-tail[data-state="running"] .hp-history-response-tail-label {
   color: transparent;
@@ -8695,7 +8724,7 @@ function AgentHistoryControls({
   // specialized slash transaction (exact input frame + Enter), never by the
   // ordinary conversation audit. Command output may remain terminal-only.
   const canSend = canAcceptSubmitIntent
-    && displayedInputStatus === null
+    && activeInputStatus === null
     && (prompt.trim().length > 0 || draftChips.length > 0);
   const canGrabDraft = (status === 'active' || status === 'busy') && !pendingQuestion && !controlsLocked;
   const canInterruptTurn = isTurnBusy && !controlsLocked;
@@ -10738,6 +10767,7 @@ function HistoryPanel({
   onControlsHeightChange,
   suppressGlobalHotkeys = false,
   staleOwnerCurtain = false,
+  presented = true,
 }: HistoryPanelProps) {
   // Live input surface of the tab in BOTH agent layouts. Everything that makes
   // History the place the user types into — availability published to grab /
@@ -10889,6 +10919,12 @@ function HistoryPanel({
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
   const resetPanelWidth = useCallback(() => setHistoryPanelWidth(HISTORY_PANEL_DEFAULT_WIDTH), [setHistoryPanelWidth]);
   const panelRef = useRef<HTMLDivElement>(null);
+  const historyPresentationProofRef = useRef(createHistoryPresentationProof(presented));
+  historyPresentationProofRef.current = advanceHistoryPresentationProof(
+    historyPresentationProofRef.current,
+    presented,
+  );
+  const historyPresentationVisit = historyPresentationProofRef.current.visit;
   const rewindPreview = storedRewindPreview && (!storedRewindPreview.sessionId || storedRewindPreview.sessionId === sessionId)
     ? storedRewindPreview
     : null;
@@ -11545,17 +11581,19 @@ function HistoryPanel({
     ) as HistoryResponseTailTiming | null,
     [visibleResponseActivityTiming],
   );
-  const completedResponseTailTiming = useMemo<HistoryResponseTailTiming | null>(
-    () => resolveHistoryResponseTailTiming(
-      null,
-      displayEntries,
-    ) as HistoryResponseTailTiming | null,
-    [displayEntries],
-  );
-  // While a response is live, appends may rebuild the durable row array but
-  // must not churn Footer context. The live interval object stays referentially
-  // stable until an actual activity edge; durable timing takes over afterwards.
-  const responseTailTiming = liveResponseTailTiming || completedResponseTailTiming;
+  // The shared tail owns only the running interval and the short completed →
+  // durable binding handoff. Once the exact final response carries this
+  // interval, that response renders its own `Worked for …`; keeping the same
+  // timer in the Footer would duplicate it and would again make completion
+  // look like metadata of only the latest iteration.
+  const responseTailTiming = useMemo<HistoryResponseTailTiming | null>(() => {
+    if (!liveResponseTailTiming) return null;
+    if (liveResponseTailTiming.state !== 'completed') return liveResponseTailTiming;
+    const intervalId = Number(liveResponseTailTiming.intervalId);
+    const isBoundToVisibleResponse = Number.isFinite(intervalId)
+      && displayEntries.some((entry) => Number(entry.responseTiming?.intervalId) === intervalId);
+    return isBoundToVisibleResponse ? null : liveResponseTailTiming;
+  }, [displayEntries, liveResponseTailTiming]);
   // ===== Display units: series collapsing (последняя ступень проекции) =====
   // Approved contract (docs/tmp/визуал-history.md::Вердикт): the unit list is
   // presentation-only; group keys are internal; everything that crosses this
@@ -12083,7 +12121,8 @@ function HistoryPanel({
   const historyScrollSeekController = useMemo(
     () => createHistoryScrollSeekController({
       isSuppressed: () => (
-        historyRestoreInFlightRef.current !== 0
+        !historyPresentationProofRef.current.presented
+        || historyRestoreInFlightRef.current !== 0
         || historyScrollInFlightRef.current !== null
         || isAtBottomRef.current
       ),
@@ -12103,7 +12142,11 @@ function HistoryPanel({
     [],
   );
   const historyScrollerOwnerToken = useCallback(
-    () => historyOwnerKeyRef.current + ':' + historyOwnerGenerationRef.current,
+    () => {
+      const proof = historyPresentationProofRef.current;
+      return historyOwnerKeyRef.current + ':' + historyOwnerGenerationRef.current
+        + ':p' + (proof.presented ? '1' : '0') + ':v' + proof.visit;
+    },
     [],
   );
   useEffect(
@@ -12113,9 +12156,11 @@ function HistoryPanel({
   const historyTailPinScheduler = useMemo(
     () => createHistoryTailPinScheduler({
       getScroller: () => virtuosoScrollerRef.current,
-      getOwnerToken: () => (
-        historyOwnerKeyRef.current + ':' + historyOwnerGenerationRef.current
-      ),
+      getOwnerToken: () => {
+        const proof = historyPresentationProofRef.current;
+        return historyOwnerKeyRef.current + ':' + historyOwnerGenerationRef.current
+          + ':p' + (proof.presented ? '1' : '0') + ':v' + proof.visit;
+      },
     }),
     [],
   );
@@ -12123,6 +12168,41 @@ function HistoryPanel({
     () => () => historyTailPinScheduler.cancel(),
     [historyTailPinScheduler],
   );
+  // Virtuoso follows appends when the number of presentation rows grows, but
+  // a live answer often mutates the existing tail row (streamed assistant
+  // text) or extends the current collapsed group without increasing the unit
+  // count. In that case followOutput sees no append even though the transcript
+  // visibly grew below the reader. Keep the physical edge aligned whenever
+  // the reader still owns tail-follow intent. A real upward gesture clears the
+  // intent and cancels this scheduler in the gesture handlers below.
+  const keepHistoryTailPinnedAfterMutation = useCallback((
+    reason: string,
+    allowPhysicalBottomRearm = false,
+  ) => {
+    // Hidden persistent panes keep receiving transcript data, but they do not
+    // own viewport writes. Their next visible visit restores the saved
+    // follow-bottom/reading anchor through the presentation handoff.
+    if (!historyPresentationProofRef.current.presented) return false;
+    const scroller = virtuosoScrollerRef.current;
+    const shouldFollow = isAtBottomRef.current || (
+      allowPhysicalBottomRearm
+      && !!scroller
+      && isHistoryAtContentBottom(scroller)
+    );
+    if (!shouldFollow) return false;
+    const rearmed = !isAtBottomRef.current;
+    if (rearmed) setHistoryTailFollowIntent(true);
+    const scheduled = historyTailPinScheduler.schedule({
+      shouldPin: true,
+      delayFrames: 2,
+    });
+    if (scheduled) {
+      historyDiag('TAIL_MUTATION_PIN tab=' + tabId.slice(-12)
+        + ' reason=' + reason
+        + ' rearmed=' + (rearmed ? '1' : '0'));
+    }
+    return scheduled;
+  }, [historyTailPinScheduler, setHistoryTailFollowIntent, tabId]);
   // Card- and group-level toggles both need this panel's follow ownership.
   // Card toggles run through the shared applyHistoryRevealUpdate helper,
   // which looks the ops up by scroller element (column mode mounts several
@@ -12930,16 +13010,23 @@ function HistoryPanel({
     // Explicit command is itself the intent proof; the resulting scroll event
     // must not depend on a preceding wheel/keyboard gesture.
     setHistoryTailFollowIntent(true);
+    const presentation = historyPresentationProofRef.current;
+    historyDiag('SCROLL_BOTTOM_COMMAND tab=' + tabId.slice(-12)
+      + ' presented=' + (presentation.presented ? '1' : '0')
+      + ' visit=' + presentation.visit
+      + ' smooth=' + (smooth ? '1' : '0'));
     scheduleHistoryBottomScroll({
       virtuoso: virtuosoRef.current,
       itemCount: lengthRef.current,
       getScroller: () => virtuosoScrollerRef.current,
-      getOwnerToken: () => (
-        historyOwnerKeyRef.current + ':' + historyOwnerGenerationRef.current
-      ),
+      getOwnerToken: () => {
+        const proof = historyPresentationProofRef.current;
+        return historyOwnerKeyRef.current + ':' + historyOwnerGenerationRef.current
+          + ':p' + (proof.presented ? '1' : '0') + ':v' + proof.visit;
+      },
       smooth,
     });
-  }, [setHistoryTailFollowIntent]);
+  }, [setHistoryTailFollowIntent, tabId]);
 
   const handleControlsHeightChange = useCallback((height: number) => {
     // During the deferred owner beat this measurement belongs to the OLD tab;
@@ -12975,6 +13062,7 @@ function HistoryPanel({
       : null;
     const shouldKeepTailVisible = isAtBottomRef.current
       && (liveAtBottom === null || liveAtBottom);
+    const presentation = historyPresentationProofRef.current;
     controlsHeightRef.current = nextHeight;
     onControlsHeightChange?.(nextHeight);
     historyDiag('COMPOSER_HEIGHT tab=' + tabId.slice(-12) +
@@ -12983,8 +13071,10 @@ function HistoryPanel({
       ' main=' + (mainSurface ? '1' : '0') +
       ' atBottom=' + (shouldKeepTailVisible ? '1' : '0') +
       ' cachedAtBottom=' + (isAtBottomRef.current ? '1' : '0') +
-      ' liveAtBottom=' + (liveAtBottom === null ? 'na' : liveAtBottom ? '1' : '0'));
-    if (mainSurface) {
+      ' liveAtBottom=' + (liveAtBottom === null ? 'na' : liveAtBottom ? '1' : '0') +
+      ' presented=' + (presentation.presented ? '1' : '0') +
+      ' visit=' + presentation.visit);
+    if (mainSurface && presentation.presented) {
       historyTailPinScheduler.schedule({ shouldPin: shouldKeepTailVisible });
     }
   }, [historyTailPinScheduler, mainSurface, onControlsHeightChange, staleOwnerCurtain, tabId]);
@@ -13017,6 +13107,16 @@ function HistoryPanel({
       : now;
     const handoffId = meta.handoffId || createPromptHandoffId();
     const resolvedSessionId = meta.auditSessionId || meta.sessionId || sessionId;
+    const isNewPromptPresentation = !presentationEntriesRef.current.some((candidate) =>
+      isLocalPromptEntry(candidate) && candidate.handoffId === handoffId
+    );
+    // Submitting from the physical bottom is explicit intent to keep following
+    // the new turn. This repairs a stale false intent left by a previous
+    // reveal/collapse without pulling a reader who is genuinely above the
+    // tail. The two-frame pin lands after the optimistic row commits.
+    if (isNewPromptPresentation) {
+      keepHistoryTailPinnedAfterMutation('prompt-submitted', true);
+    }
     const entry: FullHistoryEntry = {
       uuid: LOCAL_PROMPT_PREFIX + tabId + '-' + handoffId,
       role: 'queued',
@@ -13091,7 +13191,7 @@ function HistoryPanel({
       persistVolatileOverlay(historySnapshotOwner, nextEntries);
       return nextEntries;
     });
-  }, [historySnapshotOwner, persistVolatileOverlay, sessionId, tabId]);
+  }, [historySnapshotOwner, keepHistoryTailPinnedAfterMutation, persistVolatileOverlay, sessionId, tabId]);
 
   const updateLocalPromptEntry = useCallback((
     handoffId: string,
@@ -14308,6 +14408,12 @@ function HistoryPanel({
             persistVolatileOverlay(historySnapshotOwner, newEntries);
             return newEntries;
           });
+          // A settled refresh may replace the live tail in-place or extend an
+          // already-collapsed final group, neither of which guarantees a
+          // Virtuoso item-count append. Preserve the same tail ownership as
+          // the live stream instead of leaving the completed answer below the
+          // viewport.
+          keepHistoryTailPinnedAfterMutation('durable-refresh');
           historyDiag('LOAD_APPLY tab=' + tabId.slice(-12) +
             ' session=' + sessionId.slice(0, 8) +
             ' seq=' + loadSequence +
@@ -14377,7 +14483,7 @@ function HistoryPanel({
       // reported as "(open)" forever and blame this load for later freezes.
       endLoadMark();
     }
-  }, [sessionId, cwd, historyOwnerKey, historySnapshotOwner, persistVolatileOverlay, scrollToBottom, setHistoryRewindPreview, tabId, toolType, reconcileLiveToolResultsAgainstDurable, consumeMaterializedPromptHandoffs]);
+  }, [sessionId, cwd, historyOwnerKey, historySnapshotOwner, keepHistoryTailPinnedAfterMutation, persistVolatileOverlay, scrollToBottom, setHistoryRewindPreview, tabId, toolType, reconcileLiveToolResultsAgainstDurable, consumeMaterializedPromptHandoffs]);
 
   // One heavyweight History IPC may be active per owner. Events that arrive
   // while it is running collapse into one trailing reconciliation instead of
@@ -14703,7 +14809,8 @@ function HistoryPanel({
   // Timeline cannot be released by an async result that has not reached DOM.
   useEffect(() => {
     if (
-      surfaceLoading
+      !historyPresentationProofRef.current.presented
+      || surfaceLoading
       || transcriptEntries.length !== 0
       || presentedOwnerKey !== historyOwnerKey
       || historyOwnerKeyRef.current !== historyOwnerKey
@@ -14711,13 +14818,19 @@ function HistoryPanel({
 
     const ownerAtSchedule = historyOwnerKey;
     const generationAtSchedule = historyOwnerGenerationRef.current;
-    const presentedProofKey = ownerAtSchedule + ':' + generationAtSchedule;
+    const presentationVisitAtSchedule = historyPresentationProofRef.current.visit;
+    const presentedProofKey = ownerAtSchedule + ':' + generationAtSchedule
+      + ':pv' + presentationVisitAtSchedule;
     let secondFrame = 0;
     const firstFrame = requestAnimationFrame(() => {
       secondFrame = requestAnimationFrame(() => {
         if (
           historyOwnerKeyRef.current !== ownerAtSchedule
           || historyOwnerGenerationRef.current !== generationAtSchedule
+          || !historyPresentationOwnsWrite(
+            historyPresentationProofRef.current,
+            presentationVisitAtSchedule,
+          )
           || surfacePresentedOwnerRef.current === presentedProofKey
           || !panelRef.current?.querySelector('[data-history-empty-state]')
         ) return;
@@ -14735,6 +14848,7 @@ function HistoryPanel({
         historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
           + ' owner=' + historyOwnerDigest(ownerAtSchedule)
           + ' generation=' + generationAtSchedule
+          + ' presentationVisit=' + presentationVisitAtSchedule
           + ' cache=' + cacheAtPaint
           + ' domRows=0 foreignDomRows=0'
           + ' loader=' + (visibleSurfaceLoading ? 'visible' : 'hidden')
@@ -14761,10 +14875,54 @@ function HistoryPanel({
     surfaceLoading,
     tabId,
     transcriptEntries.length,
+    presented,
+    historyPresentationVisit,
   ]);
 
   // Initial load on mount / session change / tool type switch
   const initialLoadDoneRef = useRef(false);
+  const appliedHistoryPresentationRef = useRef({
+    presented,
+    visit: historyPresentationVisit,
+  });
+  useLayoutEffect(() => {
+    const proof = historyPresentationProofRef.current;
+    const previous = appliedHistoryPresentationRef.current;
+    if (previous.presented === proof.presented && previous.visit === proof.visit) return;
+    appliedHistoryPresentationRef.current = {
+      presented: proof.presented,
+      visit: proof.visit,
+    };
+
+    // Position restore is per PRESENTATION visit, not just per mounted owner.
+    // Persistent window panes remain mounted while inert; any layout motion in
+    // that state is machine geometry, not a new reading place. Re-arm the
+    // existing owner restore so the next visible visit reapplies the last
+    // user-confirmed tail/anchor through the same convergence machinery.
+    initialLoadDoneRef.current = false;
+    scrollRestoreGenRef.current += 1;
+    if (scrollSaveTimerRef.current) {
+      clearTimeout(scrollSaveTimerRef.current);
+      scrollSaveTimerRef.current = null;
+    }
+    historyTailPinScheduler.cancel();
+    if (!proof.presented) {
+      viewportPaintProbeRef.current?.cancel();
+      surfacePresentedProbeRef.current?.cancel();
+    }
+    historyDiag('PRESENTATION_STATE tab=' + tabId.slice(-12)
+      + ' presented=' + (proof.presented ? '1' : '0')
+      + ' visit=' + proof.visit
+      + ' mode=' + (mainSurface ? 'main' : agentSidePanel ? 'side' : 'legacy')
+      + ' follow=' + (isAtBottomRef.current ? '1' : '0'));
+  }, [
+    agentSidePanel,
+    historyPresentationVisit,
+    historyTailPinScheduler,
+    mainSurface,
+    presented,
+    tabId,
+  ]);
   // Cancels a warm-return verify pass that has not fired yet (owner left
   // before its two-frame delay elapsed).
   const deferredWarmRefreshCancelRef = useRef<(() => void) | null>(null);
@@ -15183,6 +15341,8 @@ function HistoryPanel({
   // An explicit Timeline jump (historyScrollToUuid) owns the position and
   // must not be raced by a competing restore.
   useEffect(() => {
+    const presentationAtRestore = historyPresentationProofRef.current;
+    if (!presentationAtRestore.presented) return;
     if (surfaceLoading || initialLoadDoneRef.current) return;
     // Same mountability gates as the render stub: passive effects of the
     // TRANSITIONAL commit (owner prop changed, takeover not yet re-rendered)
@@ -15209,6 +15369,14 @@ function HistoryPanel({
     // cache was already at the tail measures drift≈0 and settles on the first
     // frame, so the common case pays nothing.
     const frozenRestoreAnchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
+    if (presentationAtRestore.resumes > 0) {
+      historyDiag('PRESENTATION_RESTORE tab=' + tabId.slice(-12)
+        + ' visit=' + presentationAtRestore.visit
+        + ' mode=' + (frozenRestoreAnchor?.followBottom
+          ? 'tail'
+          : frozenRestoreAnchor ? 'anchor' : 'fallback')
+        + ' follow=' + (isAtBottomRef.current ? '1' : '0'));
+    }
     // Geometry owns the position only for a PROVEN mid-list reading place. No
     // anchor at all means the user never scrolled this owner — they were at
     // the tail (the initial position), and the anchor writer simply never ran
@@ -15263,6 +15431,10 @@ function HistoryPanel({
           historyOwnerKeyRef.current !== driftOwner
           || historyOwnerGenerationRef.current !== driftGeneration
           || scrollRestoreGenRef.current !== restoreGenAtStart
+          || !historyPresentationOwnsWrite(
+            historyPresentationProofRef.current,
+            presentationAtRestore.visit,
+          )
         ) {
           releaseRestoreToken();
           return;
@@ -15325,6 +15497,10 @@ function HistoryPanel({
       if (scrollRestoreGenRef.current !== restoreGenAtStart) return 'superseded-or-user-scroll';
       if (historyOwnerKeyRef.current !== ownerAtRestore) return 'owner-change';
       if (historyOwnerGenerationRef.current !== generationAtRestore) return 'owner-change';
+      if (!historyPresentationOwnsWrite(
+        historyPresentationProofRef.current,
+        presentationAtRestore.visit,
+      )) return 'presentation-change';
       return null;
     };
     // A settled hunt is the one moment the position is BOTH correct and fully
@@ -15359,6 +15535,10 @@ function HistoryPanel({
       try {
         virtuosoRef.current?.getState((snapshot) => {
           if (historyOwnerKeyRef.current !== ownerAtRestore) return;
+          if (!historyPresentationOwnsWrite(
+            historyPresentationProofRef.current,
+            presentationAtRestore.visit,
+          )) return;
           const saved = saveHistoryMeasuredLayout(ownerAtRestore, snapshot as any, layoutItems);
           if (saved) {
             historyDiag('LAYOUT_SAVE tab=' + tabId.slice(-12)
@@ -15552,7 +15732,7 @@ function HistoryPanel({
     // on the render where `entries` landed, and without this dep nothing
     // re-triggers the restore for a cache-hit switch (entries don't change
     // again).
-  }, [surfaceLoading, tabId, historyOwnerKey, historyOwnerVisit, ownerChangedBeforeLayoutHandoff, entries, restoredMeasuredLayout]);
+  }, [surfaceLoading, tabId, historyOwnerKey, historyOwnerVisit, ownerChangedBeforeLayoutHandoff, entries, restoredMeasuredLayout, presented, historyPresentationVisit]);
 
   // Terminal bytes can appear before Claude/Codex has materialized the
   // corresponding assistant record in JSONL. Main owns that provisional
@@ -15825,6 +16005,7 @@ function HistoryPanel({
         }
       }
       if (!projectionChanged && !toolResultsChanged) return;
+      keepHistoryTailPinnedAfterMutation('live-message');
       deferredTranscriptRefreshRef.current = true;
       if (!isTurnBusyRef.current) {
         void flushLiveHistoryToDurable('live-message-after-turn', ownerKey);
@@ -15838,6 +16019,7 @@ function HistoryPanel({
   }, [
     flushLiveHistoryToDurable,
     historyOwnerKey,
+    keepHistoryTailPinnedAfterMutation,
     sessionId,
     tabId,
     toolType,
@@ -16138,12 +16320,22 @@ function HistoryPanel({
       if (meta.bankedDone) return;
       meta.bankedDone = true;
       meta.pendingStepUuids = null;
+      const presentation = historyPresentationProofRef.current;
+      if (!presentation.presented) {
+        historyDiag('LAYOUT_SAVE_SKIP tab=' + tabId.slice(-12)
+          + ' at=wave-done reason=not-presented visit=' + presentation.visit);
+        return;
+      }
       if (historyRestoreInFlightRef.current) return;
       const layoutKey = historyOwnerKeyRef.current;
       const layoutItems = lengthRef.current;
       try {
         virtuosoRef.current?.getState((snapshot) => {
           if (historyOwnerKeyRef.current !== layoutKey) return;
+          if (!historyPresentationOwnsWrite(
+            historyPresentationProofRef.current,
+            presentation.visit,
+          )) return;
           const saved = saveHistoryMeasuredLayout(layoutKey, snapshot as any, layoutItems);
           if (saved) {
             historyDiag('LAYOUT_SAVE tab=' + tabId.slice(-12)
@@ -16583,9 +16775,29 @@ function HistoryPanel({
   // it updates synchronously on every wheel tick (needed for the FAB toggle).
   const lastScrollTopRef = useRef(0);
   const scrollDirectionRef = useRef<'down' | 'up'>('down');
+  const dormantScrollLoggedRef = useRef(false);
   const handleScroll = useCallback(() => {
     const el = virtuosoScrollerRef.current;
     if (!el) return;
+    const presentation = historyPresentationProofRef.current;
+    if (!presentation.presented) {
+      // A permanently mounted dormant pane still receives scroll events from
+      // composer resize, Virtuoso measurement and background appends. Those
+      // are useful layout work, but none is evidence that the user moved.
+      // Keep only the velocity baseline; do not touch follow intent, reading
+      // anchor, pixel position or measured-layout scroll offset.
+      lastScrollTopRef.current = el.scrollTop;
+      if (!dormantScrollLoggedRef.current) {
+        dormantScrollLoggedRef.current = true;
+        historyDiag('SCROLL_DORMANT_SKIP tab=' + tabId.slice(-12)
+          + ' visit=' + presentation.visit
+          + ' scrollTop=' + Math.round(el.scrollTop)
+          + ' scrollHeight=' + Math.round(el.scrollHeight)
+          + ' follow=' + (isAtBottomRef.current ? '1' : '0'));
+      }
+      return;
+    }
+    dormantScrollLoggedRef.current = false;
     // Keep the panel-local seek kick on the element that is actually moving.
     historyScrollSeekController.setScroller(el, historyScrollerOwnerToken());
     const deltaTop = el.scrollTop - lastScrollTopRef.current;
@@ -16670,12 +16882,24 @@ function HistoryPanel({
     // different one and a ref read would file this position under the
     // destination tab's key (the proven cross-tab poisoning bug).
     const saveKey = scrollPositionKeyRef.current;
+    const savePresentationVisit = presentation.visit;
     scrollSaveTimerRef.current = setTimeout(() => {
       // Stale-guard: fire only while the same owner is still presented and
       // the scroller shows ITS rows. An owner switch mid-debounce discards
       // the save — the anchor already stored on the previous idle tick wins.
       if (scrollPositionKeyRef.current !== saveKey) return;
       if (!el.isConnected) return;
+      if (!historyPresentationOwnsWrite(
+        historyPresentationProofRef.current,
+        savePresentationVisit,
+      )) {
+        historyDiag('SCROLL_SAVE_SKIP tab=' + tabId.slice(-12)
+          + ' reason=presentation-change'
+          + ' capturedVisit=' + savePresentationVisit
+          + ' currentVisit=' + historyPresentationProofRef.current.visit
+          + ' presented=' + (historyPresentationProofRef.current.presented ? '1' : '0'));
+        return;
+      }
       // A restore hunt re-jumps every frame, but a heavy row mount can hold
       // a frame past the 150ms debounce — and this callback then recorded a
       // MID-HUNT position as the user's reading place (anchor, pixels and
@@ -16700,7 +16924,9 @@ function HistoryPanel({
         historyDiag('SCROLL_SAVE tab=' + tabId.slice(-12)
           + ' uuid=' + anchor.uuid.slice(0, 8)
           + ' offset=' + anchor.offsetPx
-          + ' followBottom=' + (anchor.followBottom ? '1' : '0'));
+          + ' followBottom=' + (anchor.followBottom ? '1' : '0')
+          + ' presented=1'
+          + ' visit=' + savePresentationVisit);
       }
       // Deferral state of what is on screen NOW. The presentation-time count
       // only describes the first frame of the owner, so scrolling to a diff
@@ -16727,6 +16953,10 @@ function HistoryPanel({
       try {
         virtuosoRef.current?.getState((snapshot) => {
           if (historyOwnerKeyRef.current !== layoutKey) return; // owner moved on
+          if (!historyPresentationOwnsWrite(
+            historyPresentationProofRef.current,
+            savePresentationVisit,
+          )) return;
           saveHistoryMeasuredLayout(layoutKey, snapshot as any, layoutItems);
         });
       } catch { /* geometry is optional; never break position saving */ }
@@ -17007,6 +17237,8 @@ function HistoryPanel({
       inert={(embedded ? (!embeddedFill && !slideIn) : !isOpen) || staleOwnerCurtain}
       data-history-owner={historyOwnerDomId}
       data-history-session={sessionId || undefined}
+      data-history-presented={presented ? '1' : '0'}
+      data-history-presentation-visit={historyPresentationVisit}
       data-history-viewport-ready={
         viewportReadyOwnerKey === historyOwnerKey ? '1' : '0'
       }
@@ -17316,6 +17548,8 @@ function HistoryPanel({
                 // shells after the initial arm already drained its queue.
                 requestHistoryMountWaveStep(mountWaveLaneRef.current);
               }
+              const presentationAtRange = historyPresentationProofRef.current;
+              if (!presentationAtRange.presented) return;
               const viewportPaintOwner: HistoryViewportPaintOwner = {
                 key: historyOwnerKey,
                 generation: historyOwnerGenerationRef.current,
@@ -17336,6 +17570,10 @@ function HistoryPanel({
                   () => (
                     historyOwnerKeyRef.current === ownerAtRange
                     && historyOwnerGenerationRef.current === generationAtRange
+                    && historyPresentationOwnsWrite(
+                      historyPresentationProofRef.current,
+                      presentationAtRange.visit,
+                    )
                     && !!virtuosoScrollerRef.current?.querySelector(
                       `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
                     )
@@ -17344,6 +17582,10 @@ function HistoryPanel({
                     if (
                       historyOwnerKeyRef.current !== ownerAtRange
                       || historyOwnerGenerationRef.current !== generationAtRange
+                      || !historyPresentationOwnsWrite(
+                        historyPresentationProofRef.current,
+                        presentationAtRange.visit,
+                      )
                     ) return;
                     viewportReadyOwnerKeyRef.current = ownerAtRange;
                     setViewportReadyOwnerKey(ownerAtRange);
@@ -17356,7 +17598,8 @@ function HistoryPanel({
                   },
                 );
               }
-              const presentedProofKey = historyOwnerKey + ':' + viewportPaintOwner.generation;
+              const presentedProofKey = historyOwnerKey + ':' + viewportPaintOwner.generation
+                + ':pv' + presentationAtRange.visit;
               if (
                 surfacePresentedOwnerRef.current !== presentedProofKey
                 && !surfacePresentedProbeRef.current?.isActive(viewportPaintOwner)
@@ -17372,6 +17615,10 @@ function HistoryPanel({
                     if (
                       historyOwnerKeyRef.current !== ownerAtRange
                       || historyOwnerGenerationRef.current !== generationAtRange
+                      || !historyPresentationOwnsWrite(
+                        historyPresentationProofRef.current,
+                        presentationAtRange.visit,
+                      )
                     ) return false;
                     // Same real-content requirement as the viewport probe: a
                     // mount-wave shell must not produce SURFACE_PRESENTED —
@@ -17395,6 +17642,10 @@ function HistoryPanel({
                     if (
                       historyOwnerKeyRef.current !== ownerAtRange
                       || historyOwnerGenerationRef.current !== generationAtRange
+                      || !historyPresentationOwnsWrite(
+                        historyPresentationProofRef.current,
+                        presentationAtRange.visit,
+                      )
                     ) return;
                     const allDomRows = virtuosoScrollerRef.current
                       ?.querySelectorAll('[data-uuid]').length || 0;
@@ -17423,6 +17674,7 @@ function HistoryPanel({
                     historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
                       + ' owner=' + historyOwnerDigest(ownerAtRange)
                       + ' generation=' + generationAtRange
+                      + ' presentationVisit=' + presentationAtRange.visit
                       + ' cache=' + cacheAtRange
                       + ' domRows=' + domRows
                       + ' foreignDomRows=' + Math.max(0, allDomRows - domRows)
@@ -17454,6 +17706,10 @@ function HistoryPanel({
                     // but not creating it is the actual fix.
                     const layoutItems = lengthRef.current;
                     requestAnimationFrame(() => requestAnimationFrame(() => {
+                    if (!historyPresentationOwnsWrite(
+                      historyPresentationProofRef.current,
+                      presentationAtRange.visit,
+                    )) return;
                     // A restore hunt still owns the scroller two frames after
                     // presentation on cold tail returns — its jump positions
                     // are not a baseline worth keeping, and the hunt's own
@@ -17467,6 +17723,10 @@ function HistoryPanel({
                     try {
                       virtuosoRef.current?.getState((snapshot) => {
                         if (historyOwnerKeyRef.current !== ownerAtRange) return;
+                        if (!historyPresentationOwnsWrite(
+                          historyPresentationProofRef.current,
+                          presentationAtRange.visit,
+                        )) return;
                         const saved = saveHistoryMeasuredLayout(
                           ownerAtRange, snapshot as any, layoutItems,
                         );

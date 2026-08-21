@@ -107,6 +107,10 @@ export default function SplitPaneSurface({
   const aiBusy = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.aiBusy === true);
   const projectPath = useWorkspaceStore((state) => state.openProjects.get(projectId)?.projectPath || cwd);
   const workspaceVisible = useWorkspaceStore((state) => state.view === 'workspace');
+  // A pane may stay mounted forever after background prewarm. `focused` is
+  // deliberately NOT used: every visible split pane may own its scroll even
+  // when another pane owns global hotkeys. Dormant means genuinely off-screen.
+  const historySurfacePresented = workspaceVisible && !dormant;
 
   // Поверхности окна СТРОЯТСЯ ОДИН РАЗ и живут дальше — как терминал.
   //
@@ -357,6 +361,7 @@ export default function SplitPaneSurface({
                 onToggleTerminal={toggleSideTerminal}
                 onControlsHeightChange={handleControlsHeight}
                 suppressGlobalHotkeys={!focused}
+                presented={historySurfacePresented}
                 lifecycleStatus={paneLifecycleStatus}
                 compactComposer={stacked}
               />
@@ -419,6 +424,7 @@ export default function SplitPaneSurface({
                 onToggleTerminal={toggleSideHistory}
                 onControlsHeightChange={handleControlsHeight}
                 suppressGlobalHotkeys={!focused}
+                presented={historySurfacePresented && sideHistoryOpen}
                 lifecycleStatus={paneLifecycleStatus}
                 compactComposer={stacked}
               />

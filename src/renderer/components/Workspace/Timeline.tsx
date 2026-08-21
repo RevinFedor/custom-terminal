@@ -6,7 +6,7 @@ import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { useUIStore, type HistoryPromptDraftImageRef } from '../../store/useUIStore';
-import { useWorkspaceStore, type PendingAutoTabTitle } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useRewindOperationStore } from '../../store/useRewindOperationStore';
 import {
   classifyRewindCancelReply,
@@ -17,8 +17,8 @@ import {
   type RewindOperation,
   type RewindOperationMode,
 } from '../../store/rewindOperationState';
-import { TAB_TITLE_PROMPT_ID, TIMELINE_GROUPING_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
-import { generateTabTitleFromPrompt, generateTimelineActionLabelFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
+import { TIMELINE_GROUPING_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
+import { generateTimelineActionLabelFromPrompt, isEligibleTabTitleEntry } from '../../utils/generateTabTitle';
 import { timelineSummaryKey, timelineSummarySourceHash, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import {
   timelineOutlineKey,
@@ -195,8 +195,7 @@ const TimelineCornerBadges: React.FC<{
   const rightColumnCount = items.filter(item => item.slot.endsWith('right')).length;
   const dense = !isExpandedLayout && rightColumnCount >= 3;
 
-  return <>
-    {items.map((badge) => {
+  const badges = items.map((badge) => {
       const isInner = badge.slot === 'middle-inner';
       const isTop = badge.slot === 'top-right';
       const isBottom = badge.slot === 'bottom-right';
@@ -204,8 +203,8 @@ const TimelineCornerBadges: React.FC<{
         position: 'absolute',
         zIndex: 2,
         right: isExpandedLayout
-          ? (isInner ? '18px' : '5px')
-          : (isInner ? '10px' : '2px'),
+          ? (isInner ? '19px' : '6px')
+          : (isInner ? '11px' : '3px'),
         ...(isTop
           ? { top: isExpandedLayout ? '3px' : '1px' }
           : isBottom
@@ -290,8 +289,32 @@ const TimelineCornerBadges: React.FC<{
           style={positionStyle}
         />
       );
-    })}
-  </>;
+    });
+
+  if (isExpandedLayout) return <>{badges}</>;
+
+  // Dots-only segments use flex-grow to distribute a sparse Timeline over the
+  // full available height. The dot stays centred, but badges positioned from
+  // the segment's top/bottom used to drift all the way to the panel edges when
+  // only one iteration existed. Give them a marker-sized local coordinate
+  // system centred on the dot: the visual spacing is now identical whether
+  // the Timeline holds one iteration or fifty.
+  return (
+    <div
+      data-timeline-marker-badges
+      className="pointer-events-none"
+      style={{
+        position: 'absolute',
+        left: 0,
+        right: 0,
+        top: '50%',
+        height: dense ? '22px' : '20px',
+        transform: 'translateY(-50%)',
+      }}
+    >
+      {badges}
+    </div>
+  );
 };
 
 // Portal for tooltip to escape overflow:hidden
@@ -466,11 +489,6 @@ interface CodexTimelineSessionMeta {
   forkLiveStartLine?: number;
 }
 
-function sessionIdLooseMatch(left?: string, right?: string): boolean {
-  if (!left || !right) return false;
-  return left === right || left.startsWith(right) || right.startsWith(left);
-}
-
 function renderSingleStarHighlights(text: string): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
   let cursor = 0;
@@ -496,56 +514,6 @@ function renderSingleStarHighlights(text: string): React.ReactNode[] {
     break;
   }
   return nodes;
-}
-
-function selectAutoTabTitlePrompt(
-  entries: TimelineEntry[],
-  pending: PendingAutoTabTitle,
-  toolType: 'claude' | 'codex',
-  forkMarkers: ForkMarker[],
-  forkMarkerLastSnapIndex: number[],
-  codexSessionMeta: CodexTimelineSessionMeta | null
-): TimelineEntry | undefined {
-  if (pending.mode !== 'fork') {
-    return entries.find((entry) => !entry.isSentHandoffProjection && isEligibleTabTitleEntry(entry));
-  }
-
-  if (toolType === 'claude') {
-    if (forkMarkers.length === 0) return undefined;
-    const boundaryIndex = forkMarkerLastSnapIndex.length > 0
-      ? Math.max(...forkMarkerLastSnapIndex)
-      : -1;
-    return entries.find((entry, index) => index > boundaryIndex && !entry.isSentHandoffProjection && !getOrchestrationTag(entry) && isEligibleTabTitleEntry(entry));
-  }
-
-  const forkedFromId = codexSessionMeta?.forked_from_id;
-  if (pending.sourceSessionId && forkedFromId && !sessionIdLooseMatch(forkedFromId, pending.sourceSessionId)) {
-    return undefined;
-  }
-
-  const forkLiveStartLine = typeof codexSessionMeta?.forkLiveStartLine === 'number'
-    ? codexSessionMeta.forkLiveStartLine
-    : undefined;
-  if (forkLiveStartLine !== undefined) {
-    return entries.find((entry) => {
-      return typeof entry.sourceLine === 'number'
-        && entry.sourceLine > forkLiveStartLine
-        && !entry.isSentHandoffProjection
-        && !getOrchestrationTag(entry)
-        && isEligibleTabTitleEntry(entry);
-    });
-  }
-  if (forkedFromId || pending.sourceSessionId) return undefined;
-
-  const startedAt = codexSessionMeta?.timestamp ? Date.parse(codexSessionMeta.timestamp) : NaN;
-  if (!Number.isFinite(startedAt)) return undefined;
-  return entries.find((entry) => {
-    const entryAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
-    return Number.isFinite(entryAt) && entryAt >= startedAt + 1000
-      && !entry.isSentHandoffProjection
-      && !getOrchestrationTag(entry)
-      && isEligibleTabTitleEntry(entry);
-  });
 }
 
 function isGenericAiTabName(name: unknown, toolType: 'claude' | 'codex'): boolean {
@@ -765,8 +733,6 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
 // Module-level: survives component remount (project switch destroys Timeline instance)
 const _savedEditRangeMap = new Map<string, any>();
 const SAVED_MAP_MAX = 20;
-const _autoTabTitleAttempted = new Set<string>();
-const _autoTabTitleInFlight = new Set<string>();
 const TIMELINE_SNAPSHOT_CACHE_MAX_OWNERS = 8;
 const TIMELINE_SNAPSHOT_CACHE_MAX_ENTRIES = 20_000;
 
@@ -3963,194 +3929,36 @@ function Timeline({
     jumpTimelineToBottomAfterLayout();
   }, [tabId, sessionId, isVisible, isExpandedLayout, entries.length, jumpTimelineToBottomAfterLayout]);
 
-  // Auto-generate a tab title once the first real user prompt is materialized
-  // in the transcript. Uses Timeline entries instead of raw terminal input so
-  // service commands and metadata do not become tab names.
+  // Legacy generic-fork recovery only. Real fresh/fork auto-title work belongs
+  // to the App-global coordinator, so it keeps working while this visual
+  // Timeline is hidden, unmounted, or intentionally deferring refresh during
+  // a long busy turn.
   useEffect(() => {
-    if (!sessionId || entries.length === 0) return;
-    if (toolType !== 'claude' && toolType !== 'codex') return;
-
+    if (!sessionId || toolType !== 'claude' || forkMarkers.length === 0) return;
     const store = useWorkspaceStore.getState();
-    const attemptKey = `${toolType}:${sessionId}`;
-    if (_autoTabTitleAttempted.has(attemptKey)) {
-      store.consumePendingAutoTabTitle(tabId, toolType, sessionId);
-      return;
-    }
-    if (_autoTabTitleInFlight.has(attemptKey)) return;
-
-    let pendingAutoTitle = store.getPendingAutoTabTitle(tabId, toolType, sessionId);
-    let recoveredGenericForkTitle = false;
-    if (!pendingAutoTitle && toolType === 'claude' && forkMarkers.length > 0) {
-      let tab: any = null;
-      for (const [, workspace] of store.openProjects) {
-        const candidate = workspace.tabs.get(tabId);
-        if (candidate) { tab = candidate; break; }
-      }
-      const currentSessionId = tab?.claudeSessionId;
-      if (tab
-          && currentSessionId === sessionId
-          && !tab.nameSetManually
-          && isGenericAiTabName(tab.name, toolType)) {
-        pendingAutoTitle = {
-          toolType,
-          sessionId,
-          mode: 'fork',
-          at: Date.now(),
-        };
-        recoveredGenericForkTitle = true;
-        console.warn(
-          '[Timeline:AutoTabTitle]' +
-          ' recover-generic-fork' +
-          ' tab=' + tabId.slice(-8) +
-          ' tool=' + toolType +
-          ' session=' + sessionId.slice(0, 8) +
-          ' name=' + JSON.stringify(tab.name)
-        );
-      }
-    }
-    if (!pendingAutoTitle) return;
-
-    const firstUserPrompt = selectAutoTabTitlePrompt(
-      entries,
-      pendingAutoTitle,
-      toolType,
-      forkMarkers,
-      forkMarkerLastSnapIndex,
-      codexSessionMeta
-    );
-    if (!firstUserPrompt) return;
-    console.warn(
-      '[Timeline:AutoTabTitle]' +
-      ' candidate' +
-      ' tab=' + tabId.slice(-8) +
-      ' tool=' + toolType +
-      ' session=' + sessionId.slice(0, 8) +
-      ' mode=' + pendingAutoTitle.mode +
-      ' entries=' + entries.length +
-      ' promptChars=' + String(firstUserPrompt.content || '').length
-    );
+    // An explicit launch registration is already owned by the coordinator.
+    if (store.getPendingAutoTabTitle(tabId, 'claude', sessionId)) return;
 
     let tab: any = null;
     for (const [, workspace] of store.openProjects) {
       const candidate = workspace.tabs.get(tabId);
       if (candidate) { tab = candidate; break; }
     }
-    if (!tab) return;
-    if (tab.nameSetManually) {
+    if (!tab
+        || tab.claudeSessionId !== sessionId
+        || tab.nameSetManually
+        || !isGenericAiTabName(tab.name, 'claude')) return;
+
+    if (store.recoverPendingAutoTabTitle(tabId, 'claude', sessionId, 'fork')) {
       console.warn(
-        '[Timeline:AutoTabTitle]' +
-        ' skip=manual-name' +
+        '[Timeline:AutoTabTitle] recover-generic-fork' +
         ' tab=' + tabId.slice(-8) +
-        ' tool=' + toolType +
+        ' tool=claude' +
         ' session=' + sessionId.slice(0, 8) +
         ' name=' + JSON.stringify(tab.name)
       );
-      store.consumePendingAutoTabTitle(tabId, toolType, sessionId);
-      _autoTabTitleAttempted.add(attemptKey);
-      return;
     }
-
-    const currentSessionId = toolType === 'codex' ? tab.codexSessionId : tab.claudeSessionId;
-    if (currentSessionId !== sessionId) {
-      console.warn(
-        '[Timeline:AutoTabTitle]' +
-        ' skip=session-mismatch' +
-        ' tab=' + tabId.slice(-8) +
-        ' tool=' + toolType +
-        ' wanted=' + sessionId.slice(0, 8) +
-        ' current=' + (currentSessionId ? String(currentSessionId).slice(0, 8) : 'none')
-      );
-      return;
-    }
-
-    _autoTabTitleInFlight.add(attemptKey);
-    const titleToolType = toolType;
-    const titleSessionId = sessionId;
-    const titleTabId = tabId;
-    const titleAttemptKey = attemptKey;
-    const sourcePrompt = trimTabTitlePrompt(firstUserPrompt.content);
-    console.warn(
-      '[Timeline:AutoTabTitle]' +
-      ' start' +
-      ' tab=' + titleTabId.slice(-8) +
-      ' tool=' + titleToolType +
-      ' session=' + titleSessionId.slice(0, 8) +
-      ' sourceChars=' + sourcePrompt.length
-    );
-    store.setTabTitleNaming(titleTabId, true);
-
-    void (async () => {
-      try {
-        const promptConfig = usePromptsStore.getState().getPromptById(TAB_TITLE_PROMPT_ID);
-        const title = await generateTabTitleFromPrompt(sourcePrompt, promptConfig);
-        if (!title) {
-          console.warn(
-            '[Timeline:AutoTabTitle]' +
-            ' generated-null' +
-            ' tab=' + titleTabId.slice(-8) +
-            ' tool=' + titleToolType +
-            ' session=' + titleSessionId.slice(0, 8)
-          );
-          if (!recoveredGenericForkTitle) {
-            useWorkspaceStore.getState().consumePendingAutoTabTitle(titleTabId, titleToolType, titleSessionId);
-          }
-          _autoTabTitleAttempted.add(titleAttemptKey);
-          return;
-        }
-        console.warn(
-          '[Timeline:AutoTabTitle]' +
-          ' rename' +
-          ' tab=' + titleTabId.slice(-8) +
-          ' tool=' + titleToolType +
-          ' session=' + titleSessionId.slice(0, 8) +
-          ' title=' + JSON.stringify(title)
-        );
-        const renamed = useWorkspaceStore.getState().autoRenameTab(titleTabId, title, {
-          toolType: titleToolType,
-          sessionId: titleSessionId,
-        });
-        if (renamed) {
-          if (!recoveredGenericForkTitle) {
-            useWorkspaceStore.getState().consumePendingAutoTabTitle(titleTabId, titleToolType, titleSessionId);
-          }
-          _autoTabTitleAttempted.add(titleAttemptKey);
-        } else {
-          console.warn(
-            '[Timeline:AutoTabTitle]' +
-            ' rename-skipped' +
-            ' tab=' + titleTabId.slice(-8) +
-            ' tool=' + titleToolType +
-            ' session=' + titleSessionId.slice(0, 8) +
-            ' title=' + JSON.stringify(title)
-          );
-          if (!recoveredGenericForkTitle) {
-            useWorkspaceStore.getState().consumePendingAutoTabTitle(titleTabId, titleToolType, titleSessionId);
-          }
-          _autoTabTitleAttempted.add(titleAttemptKey);
-        }
-      } catch (err: any) {
-        console.warn(
-          '[Timeline:AutoTabTitle]' +
-          ' error' +
-          ' tab=' + titleTabId.slice(-8) +
-          ' tool=' + titleToolType +
-          ' session=' + titleSessionId.slice(0, 8) +
-          ' message=' + (err?.message || err)
-        );
-      } finally {
-        console.warn(
-          '[Timeline:AutoTabTitle]' +
-          ' finish' +
-          ' tab=' + titleTabId.slice(-8) +
-          ' tool=' + titleToolType +
-          ' session=' + titleSessionId.slice(0, 8)
-        );
-        _autoTabTitleInFlight.delete(titleAttemptKey);
-        useWorkspaceStore.getState().setTabTitleNaming(titleTabId, false);
-      }
-    })();
-  }, [entries, sessionId, tabId, toolType, forkMarkers, forkMarkerLastSnapIndex, codexSessionMeta]);
-
+  }, [sessionId, tabId, toolType, forkMarkers]);
   // effect: subscribe to main-process transcript watcher. UI refreshes on
   // durable JSONL/rollout changes; visibility resume does one reconciliation
   // refresh instead of running a permanent polling loop.

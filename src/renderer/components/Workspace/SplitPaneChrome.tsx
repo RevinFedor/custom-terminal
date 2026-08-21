@@ -42,6 +42,9 @@ const { ipcRenderer } = window.require('electron');
  * не ставит, и без запасного значения содержимое уехало бы под верхний край.
  */
 export const PANE_HEADER_HEIGHT_VAR = '--pane-header-h';
+export const splitPaneHeaderHeightVar = (paneIndex: number): string => (
+  `${PANE_HEADER_HEIGHT_VAR}-${paneIndex}`
+);
 
 // Fallback height only (empty-pane header, restore paths that render before
 // settings are read). Real rows size themselves from the chip via
@@ -213,13 +216,14 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
     const newTabId = await store.createTab(owner, EMPTY_TAB_NAME, cwd, {
       skipInitialRename: true,
       background: true,
-      // Вкладка окна — САМОСТОЯТЕЛЬНАЯ строка бокового списка, а не продолжение
-      // чужой ветки. По умолчанию новая вкладка наследует «визуального
-      // родителя» от активной — правило для вкладок, созданных ОТ вкладки. Но
-      // двойной клик по шапке окна означает «дай мне ещё одну вкладку здесь»:
-      // унаследовав родителя активной, она пряталась внутрь его карточки, и в
-      // списке слева её будто не было вовсе. Юзер: *«создаётся вкладка, которая
-      // не создаётся слева в боковом меню как отдельный терминал»*.
+      // The pane strip is this tab's primary navigation surface. It still
+      // lives in the project/store (one PTY, normal persistence and search),
+      // but the sidebar must not duplicate it while the chip remains placed in
+      // a window. If every placement is later removed, the sidebar may reveal
+      // it as a safety fallback instead of making a live PTY unreachable.
+      windowScoped: true,
+      // Do not inherit another sidebar row's visual parent. Window ownership
+      // is expressed by `windowScoped`, not by pretending this is a child tab.
       visualParentTabId: '',
     });
     if (!newTabId) return;
@@ -248,19 +252,20 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   // перегородки, и запись в стор на каждый кадр перестраивала бы все окна.
   React.useLayoutEffect(() => {
     const el = rowRef.current;
-    // Кому сообщать. В разделённой области это ОКНО, внутри которого шапка
-    // (у каждого окна свой ответ). В одиночном режиме окна нет — там шапка
-    // стоит в колонке центра, и переменную принимает она. Порядок важен:
-    // колонка центра — общий предок и для окон тоже, и найдись она первой,
-    // все окна писали бы своё число в одно место.
-    const host = (el?.closest('[data-terminal-pane-wrapper]')
-      || el?.closest('[data-pane-header-host]')
-      || el?.parentElement) as HTMLElement | null;
+    // Кому сообщать. Стабильные split-шапки — siblings терминальных tab-wrapper'ов,
+    // поэтому публикуют pane-scoped переменную на общем TerminalArea root.
+    // Одиночная шапка по-прежнему пишет обычную переменную в свой header-host.
+    const heightVar = paneIndex === null || paneIndex === undefined
+      ? PANE_HEADER_HEIGHT_VAR
+      : splitPaneHeaderHeightVar(paneIndex);
+    const host = (paneIndex === null || paneIndex === undefined
+      ? (el?.closest('[data-pane-header-host]') || el?.parentElement)
+      : el?.closest('[data-terminal-area-root]')) as HTMLElement | null;
     if (!el || !host) return undefined;
     const publish = () => {
       const h = Math.ceil(el.getBoundingClientRect().height);
       if (!h) return;
-      host.style.setProperty(PANE_HEADER_HEIGHT_VAR, h + 'px');
+      host.style.setProperty(heightVar, h + 'px');
     };
     publish();
     if (typeof ResizeObserver === 'undefined') return undefined;
@@ -270,9 +275,9 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
       ro.disconnect();
       // Окно переживает свою шапку (пустая панель рисует собственную): оставить
       // после себя чужую высоту значило бы сдвинуть её содержимое.
-      host.style.removeProperty(PANE_HEADER_HEIGHT_VAR);
+      host.style.removeProperty(heightVar);
     };
-  }, [stripWrap, rowH]);
+  }, [paneIndex, stripWrap, rowH]);
 
 
   // Clamp the strip menu into the window — тем же способом, что и меню деления.
@@ -381,24 +386,11 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         wrap={stripWrap}
       />
 
-      {/* Действия окна (три точки, Git, деление) — ОДИН ряд у правого края.
-
-          В обычном режиме ряд лежит СЛОЕМ поверх полосы вкладок: пока он
-          держал место в строке, нефокусное узкое окно отдавало ширину под
-          НЕВИДИМЫЕ кнопки и чипы обрезались там, где на экране пусто. Юзер:
-          *«пространство под гит и значки… остаётся и перекрывает вкладки, хотя
-          там же пусто»*.
-
-          В режиме ПЕРЕНОСА он встаёт В ПОТОК, соседом первой строки чипов, и
-          места под себя больше не отнимает у них поверх: прокрутки там нет,
-          прятать за кнопками нечего, а перенос обязан считать эти кнопки —
-          иначе последний чип первой строки уезжает под них. Юзер: *«если
-          включён перенос… он ведёт себя как блок, по логике переноса строк»*.
-
-          Три точки видны ВСЕГДА, Git и деление — только у окна в фокусе (см.
-          globals.css): меню полосы отвечает про вкладки этого окна, а не про
-          действия над ним, и спрашивать его у соседнего окна человек вправе,
-          не переводя туда фокус. */}
+      {/* Действия окна (Git, деление, три точки) — один ПОСТОЯННЫЙ flex-ряд у
+          правого края. Он является соседом scroller'а и виден независимо от
+          фокуса: появление/исчезновение между pointerdown и mouseup двигало бы
+          чипы под курсором и меняло clientWidth/scrollLeft. Три точки стоят
+          последними, потому что управляют полосой целиком. */}
       <div
         data-split-pane-actions
         style={{
@@ -413,8 +405,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           //
           // Ряд — обычный сосед полосы: не сжимается, чипы заканчиваются на
           // его левом крае, видимой области полосы соответствует её clientWidth
-          // без поправок. Вне фокуса Git и деление убраны ИЗ РАСКЛАДКИ
-          // (display:none в globals.css), и их место честно занимают чипы.
+          // без поправок. Фокус не участвует ни в layout, ни в visibility.
           position: 'relative',
           flexShrink: 0,
           // Ростом с ОДИН чип: в переносе шапка выше на столько строк, сколько
@@ -460,11 +451,8 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         </div>
       )}
 
-      {/* VS Code header pattern (approved 2026-08-17): pane ACTIONS show on
-          the focused pane only; an unfocused pane reveals them on header
-          hover (see globals.css [data-split-attach-row]). The button stays
-          mounted either way — the reveal is opacity, so the header layout
-          never shifts and the "кнопка пропала" bug class stays impossible. */}
+      {/* Split remains mounted and visible in every pane. `splitCan` changes
+          only whether the action is available; it never changes geometry. */}
       <button
         data-split-button
         data-split-horizontal={splitCan.horizontal ? '1' : '0'}

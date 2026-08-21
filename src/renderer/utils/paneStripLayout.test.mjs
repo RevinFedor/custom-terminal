@@ -92,12 +92,38 @@ test('квадратик на каждый вид, в порядке появл�
   assert.deepEqual(groupOverflowByKind([], () => 'claude'), []);
 });
 
-test('показанная вкладка подтягивается в видимую часть, но не дёргается зря', () => {
+test('уже полностью видимый активируемый чип не двигает полосу', () => {
   const view = { scrollLeft: 100, viewportWidth: 200 };
-  // Уже целиком видна — сдвига нет.
+  // Обе границы намеренно вплотную к viewport. Внутренний «запас» здесь
+  // превращал корректный клик в лишнее движение полосы.
+  assert.equal(scrollOffsetForChip({ chip: { left: 100, width: 60 }, ...view }), 100);
+  assert.equal(scrollOffsetForChip({ chip: { left: 240, width: 60 }, ...view }), 100);
   assert.equal(scrollOffsetForChip({ chip: { left: 120, width: 60 }, ...view }), 100);
-  // Ушла влево — подтягиваем ровно настолько, чтобы показалась.
-  assert.equal(scrollOffsetForChip({ chip: { left: 40, width: 60 }, ...view }), 32);
-  // Не влезла справа — так же минимально.
-  assert.equal(scrollOffsetForChip({ chip: { left: 280, width: 60 }, ...view }), 148);
+});
+
+test('обрезанный чип доезжает минимально до ближайшего видимого края', () => {
+  const view = { scrollLeft: 100, viewportWidth: 200 };
+  // Ушла влево — левый край чипа совмещается с левым краем viewport.
+  assert.equal(scrollOffsetForChip({ chip: { left: 40, width: 60 }, ...view }), 40);
+  // Не влезла справа — правый край совмещается с правым, без лишнего inset.
+  assert.equal(scrollOffsetForChip({ chip: { left: 280, width: 60 }, ...view }), 140);
+});
+
+test('перед reveal перечитывается viewport после смены footprint badge-stack', () => {
+  const chip = { left: 230, right: 290 };
+
+  // До появления стека «×N» чип целиком помещается и не должен двигаться.
+  assert.equal(scrollOffsetForChip({
+    chip,
+    viewport: { left: 100, right: 300 },
+    scrollLeft: 100,
+  }), 100);
+
+  // После layout стек Claude+Codex реально отнял место справа. Геометрия
+  // скроллера, а не предполагаемая ширина badge, задаёт новую границу.
+  assert.equal(scrollOffsetForChip({
+    chip,
+    viewport: { left: 100, right: 276 },
+    scrollLeft: 100,
+  }), 114);
 });

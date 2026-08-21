@@ -20,6 +20,51 @@
 /** Имя первого пространства. Оно же — имя того, что было до этой фичи. */
 export const DEFAULT_SPACE_NAME = 'main';
 
+const normalizeProjectIds = (raw) => {
+  const seen = new Set();
+  const out = [];
+  (Array.isArray(raw) ? raw : []).forEach((value) => {
+    const id = typeof value === 'string' ? value.trim() : '';
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  });
+  return out;
+};
+
+/**
+ * Проекты, с которыми уже связана раскладка workflow.
+ *
+ * До появления явного списка `projectIds` единственным durable-доказательством
+ * связи была сама раскладка: выбранный проект, окна и полосы вкладок. Миграция
+ * читает все эти места, не только `activeProjectId`, иначе workflow с окнами
+ * нескольких проектов превратился бы в однопроектный только потому, что один
+ * из них был в фокусе в момент закрытия приложения.
+ */
+export function inferSpaceProjectIds(layout) {
+  const source = layout && typeof layout === 'object' ? layout : {};
+  const ids = [];
+  const seen = new Set();
+  const add = (value) => {
+    const id = typeof value === 'string' ? value.trim() : '';
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    ids.push(id);
+  };
+
+  add(source.activeProjectId);
+  add(source.focusedProjectId);
+  add(source.activeSpaceTab?.projectId);
+  (Array.isArray(source.splitPanes) ? source.splitPanes : []).forEach((pane) => {
+    add(pane?.projectId);
+    (Array.isArray(pane?.tabs) ? pane.tabs : []).forEach((entry) => add(entry?.projectId));
+  });
+  Object.values(source.centerStrips || {}).forEach((strip) => {
+    (Array.isArray(strip) ? strip : []).forEach((entry) => add(entry?.projectId));
+  });
+  return ids;
+}
+
 /**
  * Содержимое пространства — ровно те поля раскладки, которые до сих пор лежали
  * в сторе по одному экземпляру на всё приложение.
@@ -98,11 +143,22 @@ const nextName = (spaces, base) => {
 export function restoreSpaces(saved, fallbackLayout) {
   const list = (Array.isArray(saved && saved.spaces) ? saved.spaces : [])
     .filter((s) => s && typeof s.id === 'string' && s.id)
-    .map((s) => ({
-      id: s.id,
-      name: typeof s.name === 'string' && s.name.trim() ? s.name : DEFAULT_SPACE_NAME,
-      layout: { ...emptySpaceLayout(), ...(s.layout && typeof s.layout === 'object' ? s.layout : {}) },
-    }));
+    .map((s) => {
+      const layout = { ...emptySpaceLayout(), ...(s.layout && typeof s.layout === 'object' ? s.layout : {}) };
+      return {
+        id: s.id,
+        name: typeof s.name === 'string' && s.name.trim() ? s.name : DEFAULT_SPACE_NAME,
+        // `undefined` здесь отличается от `null`: undefined = legacy-запись,
+        // которой workflow-icon ещё никогда не назначали; null = пользователь
+        // явно очистил её. Это позволяет one-shot migration скопировать старую
+        // цветную project-icon ровно один раз и больше не воскрешать её.
+        icon: typeof s.icon === 'string' ? s.icon : (s.icon === null ? null : undefined),
+        projectIds: Array.isArray(s.projectIds)
+          ? normalizeProjectIds(s.projectIds)
+          : inferSpaceProjectIds(layout),
+        layout,
+      };
+    });
   if (list.length > 0) {
     const activeId = list.some((s) => s.id === (saved && saved.activeSpaceId))
       ? saved.activeSpaceId
@@ -112,6 +168,8 @@ export function restoreSpaces(saved, fallbackLayout) {
   const first = {
     id: 'space-1',
     name: DEFAULT_SPACE_NAME,
+    icon: undefined,
+    projectIds: inferSpaceProjectIds(fallbackLayout),
     layout: { ...emptySpaceLayout(), ...(fallbackLayout || {}) },
   };
   return { spaces: [first], activeSpaceId: first.id };
@@ -127,15 +185,53 @@ export function restoreSpaces(saved, fallbackLayout) {
  * `id` приходит СНАРУЖИ: модель обязана оставаться чистой, а генератор
  * идентификаторов — это как раз то, что делает функцию нечистой.
  */
-export function addSpace(spaces, activeSpaceId, id, name) {
+export function addSpace(spaces, activeSpaceId, id, name, metadata = {}) {
   const list = Array.isArray(spaces) ? spaces : [];
   if (!id || list.some((s) => s.id === id)) return null;
   const created = {
     id,
     name: nextName(list, (name && String(name).trim()) || 'Пространство'),
+    icon: typeof metadata.icon === 'string' ? metadata.icon : null,
+    projectIds: normalizeProjectIds(metadata.projectIds),
     layout: emptySpaceLayout(),
   };
   return { spaces: list.concat([created]), activeSpaceId: id, createdId: id };
+}
+
+/**
+ * Иконка и список проектов — metadata workflow, а не часть его раскладки.
+ * Меняем их отдельно, чтобы выбор иконки/проекта в Settings никогда не мог
+ * затереть окна, размеры или фокус, сохранённые параллельно.
+ */
+export function updateSpaceMetadata(spaces, id, updates) {
+  const list = Array.isArray(spaces) ? spaces : [];
+  const at = list.findIndex((space) => space && space.id === id);
+  if (at === -1 || !updates || typeof updates !== 'object') return null;
+  const current = list[at];
+  const next = { ...current };
+  let changed = false;
+
+  if (Object.prototype.hasOwnProperty.call(updates, 'icon')) {
+    const icon = typeof updates.icon === 'string' ? updates.icon : null;
+    if (current.icon !== icon) {
+      next.icon = icon;
+      changed = true;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(updates, 'projectIds')) {
+    const projectIds = normalizeProjectIds(updates.projectIds);
+    const before = normalizeProjectIds(current.projectIds);
+    if (projectIds.length !== before.length || projectIds.some((value, index) => value !== before[index])) {
+      next.projectIds = projectIds;
+      changed = true;
+    }
+  }
+
+  if (!changed) return null;
+  const out = list.slice();
+  out[at] = next;
+  return { spaces: out, space: next };
 }
 
 /**
@@ -218,6 +314,10 @@ export function spaceTabIds(space, tabIdsOfPanes) {
   Object.values(layout.centerStrips || {}).forEach((strip) => {
     (Array.isArray(strip) ? strip : []).forEach((e) => { if (e && e.tabId) ids.add(e.tabId); });
   });
+  // Одиночный центр без multi-chip strip не имеет pane/strip записи. Его
+  // durable placement — activeSpaceTab; без неё workflow с одной вкладкой
+  // показывал бы activity=0 ровно в самом обычном режиме.
+  if (layout.activeSpaceTab?.tabId) ids.add(layout.activeSpaceTab.tabId);
   if (ids.size === 0 && layout.activeProjectId && layout.activeTabId) ids.add(layout.activeTabId);
   return ids;
 }

@@ -15,6 +15,7 @@
 
 import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
 import { PROJECT_CARD_MAX_H, SPACE_STRIP_H } from '../../constants/layout';
@@ -53,25 +54,80 @@ function SpaceOverflowCount({ side, count, onClick }: {
   );
 }
 
-function SpaceChip({ id, name, index, active, onRename }: {
+type SpaceActivityProps = {
+  processStatus: ReadonlyMap<string, boolean>;
+  busyTabs: ReadonlyMap<string, boolean>;
+  pasteBusyTabs: ReadonlyMap<string, boolean>;
+  inheritedBusyTabIds: ReadonlySet<string>;
+};
+
+function SpaceChip({
+  id,
+  active,
+  onRename,
+  processStatus,
+  busyTabs,
+  pasteBusyTabs,
+  inheritedBusyTabIds,
+}: {
   id: string;
-  name: string;
-  index: number;
   active: boolean;
   onRename: (id: string, name: string) => void;
-}) {
+} & SpaceActivityProps) {
+  // Metadata подписана по одному workflow. Родитель держит только fingerprint
+  // списка id, поэтому выбор большой data-URL иконки не заставляет всю полосу
+  // подписываться на массив `spaces` целиком.
+  const name = useWorkspaceStore((s) => s.spaces.find((space) => space.id === id)?.name || 'Workflow');
+  const configuredIcon = useWorkspaceStore((s) => s.spaces.find((space) => space.id === id)?.icon);
+  const projectIdsKey = useWorkspaceStore((s) => (
+    s.spaces.find((space) => space.id === id)?.projectIds?.join('\u0000') || ''
+  ));
+  const defaultProjectId = projectIdsKey ? projectIdsKey.split('\u0000')[0] : '';
+  const fallbackProjectIcon = useProjectsStore((s) => (
+    defaultProjectId ? (s.projects[defaultProjectId]?.icon || null) : null
+  ));
+  // undefined = legacy workflow, которому ещё не успели скопировать старую
+  // цветную иконку. null = пользователь явно очистил иконку.
+  const icon = configuredIcon === undefined ? fallbackProjectIcon : configuredIcon;
   // Кегль и мера карточки — те же, что у карточек проектов наверху. Полоса
   // пространств и полоса проектов это две строки одного языка: свой мелкий
   // размер делал бы её похожей на служебную подпись, а не на переключатель.
   const fontSize = useUIStore((s) => s.projectTabsFontSize);
-  // Число рядом с именем — сколько РАЗНЫХ вкладок разложено здесь. Показывается
-  // всегда, включая «1»: число, которое то появляется, то исчезает, читается как
-  // оповещение о событии, а это просто размер.
-  const count = useWorkspaceStore((s) => s.workspaceSpaceTabCount(id));
-  // Второе число — сколько из этих вкладок СЕЙЧАС работают (агент отвечает).
-  // Отвечает на «идёт ли там что-то, пока я смотрю в другое пространство»;
-  // ноль не показывается вовсе — «0 работает» это не факт, а шум.
-  const busy = useWorkspaceStore((s) => s.workspaceSpaceBusyTabCount(id));
+  // Зелёный badge физически ПЕРЕЕХАЛ с project-row на workflow-row, поэтому
+  // считает тот же сигнал всех вкладок дочерних проектов, а не только вкладки,
+  // которые сейчас разложены в окнах. Иначе фоновый процесс исчезал бы из
+  // навигации, стоило его вкладке не попасть в текущую раскладку.
+  //
+  // SDK alive хранится в самой вкладке и участвует в fingerprint: terminal
+  // process/busy карты приходят из App пропсами, а SDK-переход при неизменном
+  // layout иначе не перерисовал бы chip.
+  const activityKey = useWorkspaceStore((s) => {
+    const projectIds = s.spaces.find((space) => space.id === id)?.projectIds || [];
+    const entries: string[] = [];
+    projectIds.forEach((projectId) => {
+      s.openProjects.get(projectId)?.tabs.forEach((tab, tabId) => {
+        entries.push(`${tabId}\u001f${tab.sdkProcessAlive ? '1' : '0'}`);
+      });
+    });
+    return entries.join('\u001e');
+  });
+  const activity = React.useMemo(() => {
+    const entries = activityKey
+      ? activityKey.split('\u001e').map((part) => {
+        const at = part.lastIndexOf('\u001f');
+        return { tabId: part.slice(0, at), sdkAlive: part.slice(at + 1) === '1' };
+      })
+      : [];
+    let activeCount = 0;
+    let hasBusy = false;
+    entries.forEach(({ tabId, sdkAlive }) => {
+      if (processStatus.get(tabId) || sdkAlive) activeCount += 1;
+      if (busyTabs.get(tabId) || pasteBusyTabs.get(tabId) || inheritedBusyTabIds.has(tabId)) {
+        hasBusy = true;
+      }
+    });
+    return { activeCount, hasBusy };
+  }, [activityKey, processStatus, busyTabs, pasteBusyTabs, inheritedBusyTabIds]);
   const [renaming, setRenaming] = useState(false);
   // Наведение подсвечивает чип: до этого единственным ответом на «я сейчас
   // попаду сюда» была форма курсора, и полоса читалась как неживая. Юзер:
@@ -200,67 +256,91 @@ function SpaceChip({ id, name, index, active, onRename }: {
           }}
         />
       ) : (
-        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</span>
+        <>
+          {icon ? (
+            <img
+              data-workflow-icon={id}
+              src={icon}
+              alt=""
+              draggable={false}
+              style={{ width: 16, height: 16, borderRadius: 4, objectFit: 'cover', flexShrink: 0 }}
+            />
+          ) : (
+            <span
+              aria-hidden
+              style={{
+                width: 16,
+                height: 16,
+                borderRadius: 4,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0,
+                border: '1px solid rgba(255,255,255,0.16)',
+                background: 'rgba(255,255,255,0.06)',
+                color: '#9b9ba1',
+                fontSize: 9,
+                fontWeight: 700,
+              }}
+            >
+              {name.trim().slice(0, 1).toUpperCase() || 'W'}
+            </span>
+          )}
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</span>
+        </>
       )}
-      <span
-        data-space-tab-count
-        style={{
-          flexShrink: 0,
-          fontSize: Math.max(9, fontSize - 2.5),
-          fontWeight: 700,
-          fontVariantNumeric: 'tabular-nums',
-          color: active ? '#b9b9c0' : '#75757c',
-        }}
-      >
-        {count}
-      </span>
-      {/* «·N» — сколько из них сейчас работают. Отделено точкой, а не скобками
-          или дробью: это не «N из M», а второй, независимый факт о том же
-          месте. Появляется только когда работа действительно идёт, и держит
-          свой цвет в обоих состояниях чипа — «там что-то происходит» не должно
-          тускнеть от того, что человек стоит в другом пространстве. */}
-      {busy > 0 && (
+      {(activity.activeCount > 0 || activity.hasBusy) && (
         <span
-          data-space-busy-count
-          title={`Работают: ${busy}`}
-          className="space-busy-glow"
+          data-workflow-activity-count
+          title={activity.activeCount > 0
+            ? `Запущено вкладок: ${activity.activeCount}`
+            : 'В workflow идёт активная работа'}
+          className="relative flex items-center justify-center text-[10px] font-medium rounded-full"
           style={{
+            position: 'relative',
             flexShrink: 0,
-            display: 'inline-flex',
+            display: 'flex',
             alignItems: 'center',
-            gap: 2,
-            fontSize: Math.max(9, fontSize - 2.5),
-            fontWeight: 700,
-            fontVariantNumeric: 'tabular-nums',
-            // ЯНТАРНЫЙ, литералом. `var(--color-accent)` — это синий #007acc
-            // (юзер: «какой нахуй синий цвет, лоудер обозначается оранжевым,
-            // желательно переливающимся»). Язык занятости в приложении —
-            // янтарь #d97706; перелив — классом space-busy-glow (globals.css).
-            color: '#d97706',
+            justifyContent: 'center',
+            minWidth: 16,
+            height: 16,
+            padding: '0 4px',
+            borderRadius: 999,
+            backgroundColor: active ? 'rgba(74, 222, 128, 0.3)' : 'rgba(74, 222, 128, 0.2)',
+            color: active ? '#86efac' : '#4ade80',
+            boxSizing: 'border-box',
           }}
         >
-          <span aria-hidden style={{ opacity: 0.55 }}>·</span>
-          {busy}
+          {activity.hasBusy && (
+            <span
+              className="noted-shape-ring absolute inset-0 rounded-full"
+              style={{
+                '--noted-ring-thickness': '2px',
+                '--noted-ring-color': '#4ade80',
+                '--noted-ring-track': 'rgba(74, 222, 128, 0.2)',
+              } as React.CSSProperties}
+            />
+          )}
+          {activity.activeCount > 0 ? activity.activeCount : null}
         </span>
       )}
     </span>
   );
 }
 
-export default function SpaceStrip() {
+export default function SpaceStrip({
+  processStatus,
+  busyTabs,
+  pasteBusyTabs,
+  inheritedBusyTabIds,
+}: SpaceActivityProps) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const [overflow, setOverflow] = useState({ left: 0, right: 0 });
   // Строковый отпечаток, не массив: селектор, отдающий объекты, — новая ссылка
   // на каждую запись в стор (правило Fingerprint).
-  const spacesKey = useWorkspaceStore((s) => s.spaces.map((x) => `${x.id}:${x.name}`).join(','));
+  const spacesKey = useWorkspaceStore((s) => s.spaces.map((space) => space.id).join('\u0000'));
   const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
-  const spaces = React.useMemo(
-    () => spacesKey.split(',').filter(Boolean).map((pair) => {
-      const at = pair.indexOf(':');
-      return { id: pair.slice(0, at), name: pair.slice(at + 1) };
-    }),
-    [spacesKey],
-  );
+  const spaceIds = React.useMemo(() => spacesKey.split('\u0000').filter(Boolean), [spacesKey]);
   const renameSpace = useCallback((id: string, name: string) => {
     useWorkspaceStore.getState().renameWorkspaceSpace(id, name);
   }, []);
@@ -352,14 +432,16 @@ export default function SpaceStrip() {
           scrollbarWidth: 'none',
         }}
       >
-        {spaces.map((space, index) => (
+        {spaceIds.map((spaceId) => (
           <SpaceChip
-            key={space.id}
-            id={space.id}
-            name={space.name}
-            index={index}
-            active={space.id === activeSpaceId}
+            key={spaceId}
+            id={spaceId}
+            active={spaceId === activeSpaceId}
             onRename={renameSpace}
+            processStatus={processStatus}
+            busyTabs={busyTabs}
+            pasteBusyTabs={pasteBusyTabs}
+            inheritedBusyTabIds={inheritedBusyTabIds}
           />
         ))}
       </div>

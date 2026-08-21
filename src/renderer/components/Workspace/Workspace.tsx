@@ -113,7 +113,19 @@ const waitForAgentTurnToSettle = ({
   void verify();
 });
 
-export default function Workspace() {
+type WorkspaceProps = {
+  processStatus: ReadonlyMap<string, boolean>;
+  busyTabs: ReadonlyMap<string, boolean>;
+  pasteBusyTabs: ReadonlyMap<string, boolean>;
+  inheritedBusyTabIds: ReadonlySet<string>;
+};
+
+export default function Workspace({
+  processStatus,
+  busyTabs,
+  pasteBusyTabs,
+  inheritedBusyTabIds,
+}: WorkspaceProps) {
   // DEBUG: Track Workspace mount/unmount
   useEffect(() => {
     console.warn('[Workspace:MOUNT]');
@@ -1597,6 +1609,11 @@ export default function Workspace() {
       terminalIsPrimary={terminalIsPrimary}
       lifecycleStatus={agentSurfacePairAvailable ? agentLifecycleStatus : null}
       inputBusy={agentPasteBusyByTab.get(deferredHistoryOwner.tabId) === true}
+      presented={workspaceView === 'workspace'
+        && currentView === 'terminal'
+        && historyOwnerIsCurrent
+        && !historyStaleHidden
+        && historyPlacementForRender.isOpen}
       onControlsHeightChange={
         historyPlacementForRender.isPrimary || historyPlacementForRender.sidePanel
           ? handleHistoryControlsHeight
@@ -1699,7 +1716,12 @@ export default function Workspace() {
             говорит про то, что справа от списка. Обычная строка в колонке, а не
             наложение: всё ниже честно уменьшается на её высоту, и окна не
             уезжают под неё. */}
-        <SpaceStrip />
+        <SpaceStrip
+          processStatus={processStatus}
+          busyTabs={busyTabs}
+          pasteBusyTabs={pasteBusyTabs}
+          inheritedBusyTabIds={inheritedBusyTabIds}
+        />
 
         <div className="flex-1 flex flex-col min-w-0 relative">
           {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}

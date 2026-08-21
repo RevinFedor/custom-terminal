@@ -27,15 +27,22 @@ test('exact Resume read identity is visible without becoming a writer binding', 
   unsubscribe();
 });
 
-test('unproven or lifecycle-mismatched identity clears the read-only surface', () => {
+test('first-submit unresolved window preserves the exact surface until adoption', () => {
   publishCodexSurfaceReadIdentity('tab-a', resumeSource());
   assert.equal(publishCodexSurfaceReadIdentity('tab-a', {
     canCopySessionId: false,
     liveLifecycle: true,
     readIdentitySource: 'resume-source',
     readSessionId: 'resume-source',
-  }), null);
-  assert.equal(getCodexSurfaceReadSessionId('tab-a'), null);
+  }), 'resume-source');
+  assert.equal(getCodexSurfaceReadSessionId('tab-a'), 'resume-source');
+  assert.equal(publishCodexSurfaceReadIdentity('tab-a', {
+    canCopySessionId: true,
+    liveLifecycle: true,
+    readIdentitySource: 'live-writer',
+    readSessionId: 'writer-child',
+  }), 'writer-child');
+  assert.equal(getCodexSurfaceReadSessionId('tab-a'), 'writer-child');
 });
 
 test('explicit clear is tab-scoped', () => {

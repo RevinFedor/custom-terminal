@@ -372,7 +372,7 @@ test('the ctrl list recomputes when the panes change', () => {
 test('middle click forgets a row and does NOT navigate or close the window', () => {
   const rowDown = block(switcher, 'onPointerDown={(e) => {\n                    e.preventDefault();', '}}\n                />');
   const forgetAt = rowDown.indexOf('forgetRow(row)');
-  const commitAt = rowDown.indexOf('commitRow(row)');
+  const commitAt = rowDown.indexOf('commitRow(row, e.shiftKey)');
   assert.ok(forgetAt >= 0 && commitAt > forgetAt, 'the middle-click branch must precede the pick');
   assert.match(rowDown, /if \(e\.button === 1\) \{ forgetRow\(row\); return; \}/);
   const forget = block(switcher, 'const forgetRow = useCallback(', '}, []);');

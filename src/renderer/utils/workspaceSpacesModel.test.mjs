@@ -8,6 +8,7 @@ import {
   addSpace,
   captureSpaceLayout,
   emptySpaceLayout,
+  inferSpaceProjectIds,
   removeSpace,
   renameSpace,
   restoreSpaces,
@@ -15,6 +16,7 @@ import {
   spaceTabCount,
   switchSpace,
   dropTabsFromOtherSpaces,
+  updateSpaceMetadata,
 } from './workspaceSpacesModel.mjs';
 import { allPaneTabIds, dropTabFromAllPaneStrips } from './splitPanesModel.mjs';
 
@@ -37,10 +39,59 @@ test('восстановление: активным становится сох
   assert.equal(restoreSpaces({ ...saved, activeSpaceId: 'нет такого' }, {}).activeSpaceId, 's1');
 });
 
+test('legacy workflow получает проекты из всей раскладки, а новая metadata сохраняется как есть', () => {
+  const legacy = restoreSpaces({
+    spaces: [{
+      id: 's1',
+      name: 'main',
+      layout: {
+        activeProjectId: 'p1',
+        splitPanes: [{ projectId: 'p2', tabId: 'a', tabs: [{ projectId: 'p3', tabId: 'b' }] }],
+        centerStrips: { p4: [{ projectId: 'p4', tabId: 'c' }] },
+      },
+    }],
+    activeSpaceId: 's1',
+  }, {});
+  assert.deepEqual(legacy.spaces[0].projectIds, ['p1', 'p2', 'p3', 'p4']);
+  assert.equal(legacy.spaces[0].icon, undefined, 'отсутствующая legacy icon остаётся различима от явного reset');
+
+  const modern = restoreSpaces({
+    spaces: [{ id: 's1', name: 'main', icon: 'data:image/svg+xml,x', projectIds: ['p4', 'p4', 'p2'], layout: {} }],
+    activeSpaceId: 's1',
+  }, {});
+  assert.equal(modern.spaces[0].icon, 'data:image/svg+xml,x');
+  assert.deepEqual(modern.spaces[0].projectIds, ['p4', 'p2']);
+});
+
+test('проекты workflow выводятся и из активной вкладки, и из вложенных pane chips', () => {
+  assert.deepEqual(inferSpaceProjectIds({
+    activeSpaceTab: { projectId: 'p0', tabId: 'z' },
+    splitPanes: [{
+      projectId: 'p1',
+      tabId: 'a',
+      tabs: [{ projectId: 'p2', tabId: 'b' }, { projectId: 'p1', tabId: 'a' }],
+    }],
+  }), ['p0', 'p1', 'p2']);
+});
+
 test('новое пространство ПУСТОЕ — ничего не создаётся само', () => {
   const res = addSpace([space('s1', 'main')], 's1', 's2');
   assert.deepEqual(res.spaces[1].layout, emptySpaceLayout());
+  assert.deepEqual(res.spaces[1].projectIds, []);
+  assert.equal(res.spaces[1].icon, null);
   assert.equal(res.activeSpaceId, 's2', 'и сразу становится текущим');
+});
+
+test('metadata workflow меняется без перезаписи раскладки', () => {
+  const before = space('s1', 'main', { splitPanes: [p('p1', 'a')] });
+  const res = updateSpaceMetadata([before], 's1', {
+    icon: 'data:image/svg+xml,new',
+    projectIds: ['p2', 'p1', 'p2'],
+  });
+  assert.equal(res.space.icon, 'data:image/svg+xml,new');
+  assert.deepEqual(res.space.projectIds, ['p2', 'p1']);
+  assert.equal(res.space.layout, before.layout, 'layout сохраняет identity и содержимое');
+  assert.equal(updateSpaceMetadata(res.spaces, 's1', { projectIds: ['p2', 'p1'] }), null);
 });
 
 test('имена не повторяются: второе «Пространство» получает номер', () => {
@@ -108,6 +159,13 @@ test('число считает и полосу одиночного центр�
     centerStrips: { p1: [{ projectId: 'p1', tabId: 'a' }, { projectId: 'p1', tabId: 'b' }] },
   });
   assert.equal(spaceTabCount(s, allPaneTabIds), 2);
+});
+
+test('одиночный центр без strip считается по activeSpaceTab', () => {
+  const s = space('s1', 'main', {
+    activeSpaceTab: { projectId: 'p1', tabId: 'solo' },
+  });
+  assert.equal(spaceTabCount(s, allPaneTabIds), 1);
 });
 
 test('в каком пространстве лежит вкладка — номер для карточки в списке', () => {

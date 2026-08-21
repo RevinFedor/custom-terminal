@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import {
   beginCoordinatedAgentSend,
   bindCoordinatedAgentSendHandoff,
-  cancelCoordinatedAgentSendFollowers,
   createCoordinatedAgentSendCancellationWait,
   getCoordinatedAgentAction,
   isCoordinatedAgentSendCancellationRequested,

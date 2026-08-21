@@ -35,6 +35,13 @@ post-Enter rollout-аудитом.
 
 Готовый composer во время resume ещё не превращает source в writer, но завершает startup-loader и разрешает обычный ручной ввод. До первого submit обе copy-поверхности могут использовать exact idle read identity, не меняя writer-state. Перед первыми paste/Enter main ставит отдельный launch-scoped барьер read identity; неотправленная попытка снимает его, но после записанного Enter он переживает TTL временного prompt-сигнала и остаётся до causal source-vs-child resolution либо смены lifecycle. После durable adoption read identity становится точным writer child либо подтверждённым source-in-place. `inputReady`, read identity и `writerConfirmed` — независимые оси: mutation/API-команды всё ещё ждут writer, даже когда Copy уже безопасен.
 
+Desktop History, Timeline и `Cmd+]` используют этот же read identity как
+временный read-only surface owner. Они не ждут первого `user_message` и не
+записывают source в `tab.codexSessionId`: durable binding остаётся только за
+writer adoption. Иначе Resume реально показывает старую историю в TUI, но
+desktop считает session ID пустым, блокирует hotkey и рисует пустую History до
+тестового первого prompt.
+
 Ручной Enter и автоматическая отправка используют общий локальный порядок PTY-байтов, но не общий status-preflight. Ручной Enter записывается сразу и запускает наблюдение writer после write. Автоматический путь до paste отдельно защищается от чужого draft, затем пишет paste+Enter без промежуточного render-ACK и ждёт rollout `user_message`; это не превращает ручной жест в «одно launch-scoped действие» и не ставит process/session lookup перед клавишей.
 
 Standalone slash-команды Codex (`/status`, `/compact`, `/fast` и другие однострочные команды без attachments/chips) не являются conversation prompt: Codex может выполнить их, не записав `event_msg.user_message`. History поэтому отправляет их через отдельную TUI-транзакцию, которая сначала видит полную команду в текущем composer-фрейме, затем пишет Enter и помечает локальную строку `SENT` без обычного user-message audit. Во время активного ответа тот же History-путь может положить команду в нативную очередь; control-bar slash без queue остаётся запрещён, кроме собственного `/fast`-контракта. Многострочный текст или slash с вложениями остаётся обычным prompt и обязан получить transcript proof. `/compact` после submit дополнительно подтверждает operational lifecycle через `task_started` и terminal compact evidence; служебный `Conversation compacted` не является user-message carrier.

@@ -9,6 +9,11 @@ import {
   type AIPrompt,
 } from '../store/usePromptsStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import {
+  normalizeForkMarkers,
+  resolveForkMarkerBoundary,
+  selectDirectForkMarker,
+} from './forkMarkerSnapshot.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -27,6 +32,11 @@ export interface TabTitleSourceEntry {
   type?: string;
   content?: string;
   isCompactSummary?: boolean;
+  isSentHandoffProjection?: boolean;
+  sourceLine?: number;
+  timestamp?: string;
+  uuid?: string;
+  semanticTags?: Array<{ kind?: string }>;
 }
 
 export type RefreshTabTitleReason =
@@ -42,6 +52,7 @@ export type RefreshTabTitleReason =
 export interface RefreshTabTitleResult {
   ok: boolean;
   title?: string;
+  sourcePrompt?: string;
   reason?: RefreshTabTitleReason;
   error?: string;
 }
@@ -53,6 +64,8 @@ export interface GenerateTabTitleFromSessionOptions {
   tabId?: string;
   source: string;
   reason: string;
+  mode?: 'fresh' | 'fork';
+  sourceSessionId?: string;
 }
 
 interface PromptUsageMetadata {
@@ -78,6 +91,82 @@ export function isEligibleTabTitleEntry(entry: TabTitleSourceEntry): boolean {
   if (text.startsWith('This session is being continued from a previous conversation')) return false;
   if (text.startsWith('[Request interrupted') || text === '[User cancelled]') return false;
   return true;
+}
+
+interface AutoTabTitleCandidatePending {
+  sessionId: string;
+  mode: 'fresh' | 'fork';
+  sourceSessionId?: string;
+}
+
+interface AutoTabTitleCodexSessionMeta {
+  forked_from_id?: string;
+  timestamp?: string;
+  forkLiveStartLine?: number;
+}
+
+const hasOrchestrationTag = (entry: TabTitleSourceEntry): boolean => (
+  Array.isArray(entry.semanticTags)
+  && entry.semanticTags.some((tag) => tag?.kind === 'orchestration')
+);
+
+const sessionIdLooseMatch = (left?: string, right?: string): boolean => {
+  if (!left || !right) return false;
+  return left === right || left.startsWith(right) || right.startsWith(left);
+};
+
+/**
+ * Selects the first REAL prompt owned by this fresh/fork launch. Presentation
+ * components and the headless coordinator both use this one policy so a hidden
+ * tab cannot get a different title from the same tab after Timeline mounts.
+ */
+export function selectAutoTabTitlePrompt(
+  entries: TabTitleSourceEntry[],
+  pending: AutoTabTitleCandidatePending,
+  toolType: 'claude' | 'codex',
+  forkMarkers: any[] = [],
+  codexSessionMeta: AutoTabTitleCodexSessionMeta | null = null,
+): TabTitleSourceEntry | undefined {
+  const eligible = (entry: TabTitleSourceEntry) => (
+    !entry.isSentHandoffProjection
+    && !hasOrchestrationTag(entry)
+    && isEligibleTabTitleEntry(entry)
+  );
+
+  if (pending.mode !== 'fork') return entries.find(eligible);
+
+  if (toolType === 'claude') {
+    const normalized = normalizeForkMarkers(forkMarkers);
+    const direct = selectDirectForkMarker(normalized, pending.sessionId, entries);
+    if (!direct || direct.snapshot_complete === false) return undefined;
+    const boundaryIndex = resolveForkMarkerBoundary(entries, direct).boundaryIndex;
+    return entries.find((entry, index) => index > boundaryIndex && eligible(entry));
+  }
+
+  const forkedFromId = codexSessionMeta?.forked_from_id;
+  if (pending.sourceSessionId && forkedFromId
+      && !sessionIdLooseMatch(forkedFromId, pending.sourceSessionId)) {
+    return undefined;
+  }
+
+  const forkLiveStartLine = typeof codexSessionMeta?.forkLiveStartLine === 'number'
+    ? codexSessionMeta.forkLiveStartLine
+    : undefined;
+  if (forkLiveStartLine !== undefined) {
+    return entries.find((entry) => (
+      typeof entry.sourceLine === 'number'
+      && entry.sourceLine > forkLiveStartLine
+      && eligible(entry)
+    ));
+  }
+  if (forkedFromId || pending.sourceSessionId) return undefined;
+
+  const startedAt = codexSessionMeta?.timestamp ? Date.parse(codexSessionMeta.timestamp) : NaN;
+  if (!Number.isFinite(startedAt)) return undefined;
+  return entries.find((entry) => {
+    const entryAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+    return Number.isFinite(entryAt) && entryAt >= startedAt + 1000 && eligible(entry);
+  });
 }
 
 export function trimTabTitlePrompt(content: string): string {
@@ -452,12 +541,17 @@ export async function generateTimelineActionLabelFromPrompt(
   });
 }
 
-export async function generateTabTitleFromSession(options: GenerateTabTitleFromSessionOptions): Promise<RefreshTabTitleResult> {
+export async function readTabTitlePromptFromSession(
+  options: GenerateTabTitleFromSessionOptions,
+): Promise<RefreshTabTitleResult> {
   const sessionId = String(options.sessionId || '').trim();
   if (!sessionId) return { ok: false, reason: 'no-session' };
 
-  const channel = options.toolType === 'codex' ? 'codex:get-timeline' : 'claude:get-timeline';
-  const timelineResult = await ipcRenderer.invoke(channel, {
+  // Use the shared headless transcript service, not Timeline's visual cache.
+  // It reads durable JSONL/rollout even while the turn is busy or no pane has
+  // ever mounted a Timeline component.
+  const timelineResult = await ipcRenderer.invoke('agent-transcript:get-timeline', {
+    toolType: options.toolType,
     sessionId,
     cwd: options.cwd,
     source: options.source,
@@ -474,15 +568,50 @@ export async function generateTabTitleFromSession(options: GenerateTabTitleFromS
     };
   }
 
-  const entries = Array.isArray(timelineResult.entries) ? timelineResult.entries : [];
-  const firstUserPrompt = entries.find(isEligibleTabTitleEntry);
+  let forkMarkers: any[] = [];
+  if (options.mode === 'fork' && options.toolType === 'claude') {
+    const markersResult = await ipcRenderer.invoke('timeline:get-session-history-events', {
+      sessionId,
+      tabId: options.tabId,
+      source: options.source,
+      reason: options.reason,
+    });
+    if (!markersResult?.success) {
+      return {
+        ok: false,
+        reason: 'timeline-error',
+        error: markersResult?.error || 'Fork boundary unavailable',
+      };
+    }
+    forkMarkers = Array.isArray(markersResult.markers) ? markersResult.markers : [];
+  }
+
+  const entries = (Array.isArray(timelineResult.entries) ? timelineResult.entries : []) as TabTitleSourceEntry[];
+  const firstUserPrompt = selectAutoTabTitlePrompt(
+    entries,
+    {
+      sessionId,
+      mode: options.mode || 'fresh',
+      sourceSessionId: options.sourceSessionId,
+    },
+    options.toolType,
+    forkMarkers,
+    timelineResult.sessionMeta || null,
+  );
   if (!firstUserPrompt?.content) return { ok: false, reason: 'no-user-prompt' };
 
+  return { ok: true, sourcePrompt: trimTabTitlePrompt(firstUserPrompt.content) };
+}
+
+export async function generateTabTitleFromSession(options: GenerateTabTitleFromSessionOptions): Promise<RefreshTabTitleResult> {
+  const source = await readTabTitlePromptFromSession(options);
+  if (!source.ok || !source.sourcePrompt) return source;
+
   const promptConfig = usePromptsStore.getState().getPromptById(TAB_TITLE_PROMPT_ID);
-  const title = await generateTabTitleFromPrompt(trimTabTitlePrompt(firstUserPrompt.content), promptConfig);
+  const title = await generateTabTitleFromPrompt(source.sourcePrompt, promptConfig);
   if (!title) return { ok: false, reason: 'generation-failed' };
 
-  return { ok: true, title };
+  return { ok: true, title, sourcePrompt: source.sourcePrompt };
 }
 
 export async function refreshGeneratedTabTitle(

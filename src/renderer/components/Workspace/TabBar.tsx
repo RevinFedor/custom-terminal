@@ -27,6 +27,7 @@ import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { TabProcessBar, TabStatusMarkerButton, TabFastBadge, TabCmdHint, TabContextUsageBadge, useTabContextUsage } from './TabSignals';
+import { resolveTabWindowAction } from './TabListRows';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 // Removed: framer-motion import - was causing lag on project switch
@@ -95,6 +96,56 @@ const TAB_POST_DROP_REVEAL_PEEK_ROWS = 3;
 const TAB_POST_DROP_REVEAL_MAX_WAIT_FRAMES = 45;
 const TAB_DND_NAVIGATION_DWELL_MS = 500;
 const STRUCTURED_PROJECT_DROP_EVENT = 'structured-tab-project-target';
+
+// Shift drives the sidebar's "add/open in this window" preview. Keep it
+// separate from useCmdKey: Cmd still owns Restart/Stop/Clear alternatives.
+// There can be several hidden menu-owner TabBars, so all instances share one
+// listener set instead of installing another window listener per project.
+type ShiftKeySubscriber = (pressed: boolean) => void;
+const shiftKeySubscribers = new Set<ShiftKeySubscriber>();
+let shiftKeyPressed = false;
+let shiftKeyListenersAttached = false;
+
+const publishShiftKey = (pressed: boolean) => {
+  if (shiftKeyPressed === pressed) return;
+  shiftKeyPressed = pressed;
+  shiftKeySubscribers.forEach((subscriber) => subscriber(pressed));
+};
+
+const onShiftKeyDown = (event: KeyboardEvent) => {
+  if (event.key === 'Shift') publishShiftKey(true);
+};
+const onShiftKeyUp = (event: KeyboardEvent) => {
+  if (event.key === 'Shift') publishShiftKey(false);
+};
+const onShiftKeyBlur = () => publishShiftKey(false);
+const onShiftMouseMove = (event: MouseEvent) => publishShiftKey(event.shiftKey === true);
+
+function useShiftKey(): boolean {
+  const [pressed, setPressed] = useState(shiftKeyPressed);
+  useEffect(() => {
+    shiftKeySubscribers.add(setPressed);
+    setPressed(shiftKeyPressed);
+    if (!shiftKeyListenersAttached) {
+      shiftKeyListenersAttached = true;
+      window.addEventListener('keydown', onShiftKeyDown);
+      window.addEventListener('keyup', onShiftKeyUp);
+      window.addEventListener('blur', onShiftKeyBlur);
+      window.addEventListener('mousemove', onShiftMouseMove, true);
+    }
+    return () => {
+      shiftKeySubscribers.delete(setPressed);
+      if (shiftKeySubscribers.size > 0 || !shiftKeyListenersAttached) return;
+      shiftKeyListenersAttached = false;
+      window.removeEventListener('keydown', onShiftKeyDown);
+      window.removeEventListener('keyup', onShiftKeyUp);
+      window.removeEventListener('blur', onShiftKeyBlur);
+      window.removeEventListener('mousemove', onShiftMouseMove, true);
+      shiftKeyPressed = false;
+    };
+  }, []);
+  return pressed;
+}
 
 // Open the sidebar's tab context menu from ANOTHER surface (the split-pane
 // header). A window event rather than a lifted store field: the menu is
@@ -351,6 +402,7 @@ interface TabData {
   isCollapsed?: boolean;
   groupId?: string;
   visualParentTabId?: string;
+  windowScoped?: boolean;
   parentTabId?: string;
   sessionStatus?: string;
   completionNotificationPersistent?: boolean;
@@ -1014,6 +1066,7 @@ interface TabItemProps {
   isDragBlockedTarget?: boolean;
   isAnyDragging?: boolean;
   cmdPeekMode?: boolean; // CMD held AND cursor in TabBar; enables alternate Restart actions (Stop/Clear).
+  shiftPeekMode?: boolean; // Shift held AND cursor in TabBar; previews add/open in the focused window.
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
   isBusy?: boolean; // AI agent is actively thinking/streaming
@@ -1078,6 +1131,7 @@ const TabItem = memo(({
   isDragBlockedTarget = false,
   isAnyDragging = false,
   cmdPeekMode = false,
+  shiftPeekMode = false,
   isCollapsed = false,
   hasSession = false,
   isBusy = false,
@@ -1596,19 +1650,12 @@ const TabItem = memo(({
   // position — left|right (юзер выбирает в Settings). Цвет полоски и shimmer
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
-  // Доступен ли ⌘-клик «добавить в текущее окно». Вкладка, которую окно уже
-  // ПОКАЗЫВАЕТ, добавить в него нельзя — она там и так; обещать это подписью
-  // нельзя, клик ничего не изменит. Лежащую чипом в другом окне добавить можно:
-  // чип переезжает.
-  //
-  // Селектор отдаёт булево, не массив окон: подписка на сами окна перерисовывала
-  // бы каждую строку списка на любую запись в стор (правило Fingerprint).
-  const canOpenInNewWindow = useWorkspaceStore((s) => {
-    const paneIndex = s.splitPanes.length > 0 ? s.splitFocusedIndex : -1;
-    if (paneIndex >= 0) return s.splitPanes[paneIndex]?.tabId !== tab.id;
-    const key = s.activeProjectId;
-    return !!key && s.openProjects.get(key)?.activeTabId !== tab.id;
-  });
+  // Exact action for THIS row in the focused window. Primitive selector:
+  // layout writes re-render only rows whose answer changes, never subscribers
+  // to the panes/openProjects containers themselves.
+  const targetWindowAction = useWorkspaceStore((s) => (
+    resolveTabWindowAction(s, projectId, tab.id)
+  ));
   const restartAfterTriggerIds = getRestartAfterTriggerIds(tab);
   const restartAfterConfigured = restartAfterTriggerIds.length > 0 || !!tab.restartAfterCommand;
   const restartAfterCommandLabel = formatRestartAfterCommandLabel(tab.restartAfterCommand)
@@ -2079,10 +2126,14 @@ const TabItem = memo(({
                   нижней. Рисуется независимо от полоски: Fast может быть
                   доказан и когда процесс уже не идёт. */}
               <TabFastBadge active={codexFastActive} />
-              {/* Что сделает ⌘-клик — на границе карточки, пока ⌘ зажат.
-                  Жест «открыть в новом окне» иначе пришлось бы помнить: он
-                  ничем не отличается от обычного клика до самого нажатия. */}
-              <TabCmdHint text="добавить в это окно" visible={cmdPeekMode && effectiveHovered && canOpenInNewWindow} />
+              {/* Shift reveals the add/open action for this hovered row. Cmd is
+                  deliberately NOT reused here: it still owns the Restart /
+                  Stop / Clear alternatives below. A shown target resolves to
+                  null, so the plaque never promises a no-op. */}
+              <TabCmdHint
+                text={targetWindowAction === 'open' ? 'открыть в этом окне' : 'добавить в это окно'}
+                visible={shiftPeekMode && effectiveHovered && targetWindowAction !== null}
+              />
               {/* Заполнение контекста — число в правом НИЖНЕМ углу, той же
                   механикой, что молния: абсолютная позиция, часть высоты
                   снаружи, выступ ограничен зазором. Цвет и формат наследуются
@@ -3633,7 +3684,6 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const createTabGroup = useWorkspaceStore((state) => state.createTabGroup);
   const applyTabLayout = useWorkspaceStore((state) => state.applyTabLayout);
   const toggleTabSelection = useWorkspaceStore((state) => state.toggleTabSelection);
-  const selectTabRange = useWorkspaceStore((state) => state.selectTabRange);
   const clearSelection = useWorkspaceStore((state) => state.clearSelection);
   const showWorkspace = useWorkspaceStore((state) => state.showWorkspace);
   // Following a moved tab/group is TAB navigation, not project navigation:
@@ -3807,9 +3857,29 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const [submenuSide, setSubmenuSide] = useState<'left' | 'right'>('right');
 
   const isCmdPressed = useCmdKey();
+  const isShiftPressed = useShiftKey();
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
 
   const workspace = openProjects.get(projectId);
+  // Tabs born inside a window strip use that strip as their primary navigation
+  // surface. Hide only while the store can prove a real placement; once every
+  // pane/centre/space placement is gone, the id drops out of this STRING and
+  // the sidebar row returns as a safety fallback. The selector never returns
+  // the tabs Map or a layout array (Fingerprint Pattern).
+  const hiddenWindowScopedTabIdsKey = useWorkspaceStore((state) => {
+    if (menuOnlyForProject) return '';
+    const projectTabs = state.openProjects.get(projectId)?.tabs;
+    if (!projectTabs) return '';
+    return Array.from(projectTabs.values())
+      .filter((candidate) => candidate.windowScoped === true && state.isTabPlacedInWorkspace(candidate.id))
+      .map((candidate) => candidate.id)
+      .sort()
+      .join('\u0000');
+  });
+  const hiddenWindowScopedTabIds = useMemo(
+    () => new Set(hiddenWindowScopedTabIdsKey ? hiddenWindowScopedTabIdsKey.split('\u0000') : []),
+    [hiddenWindowScopedTabIdsKey],
+  );
   const viewingSubAgentTabId = workspace?.viewingSubAgentTabId ?? null;
   const viewingSubAgentParentId = viewingSubAgentTabId ? workspace?.tabs.get(viewingSubAgentTabId)?.parentTabId ?? null : null;
   const project = projects[projectId] || (workspace ? {
@@ -4007,76 +4077,81 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     return result?.confirmed === true;
   };
 
-  const handleTabClick = (e: React.MouseEvent, tabId: string) => {
-    if (e.shiftKey) {
-      selectTabRange(projectId, tabId);
-    } else if (e.metaKey) {
-      // ⌘-клик — «ДОБАВИТЬ вкладку в текущее окно», последним чипом справа.
-      // Обычный клик ЗАМЕНЯЕТ то, что окно показывает; этот жест ставит вкладку
-      // рядом, не выгоняя прежнюю. Юзер: *«не в новом окне открыть… в новой
-      // вкладке в текущем окне, в котором я нахожусь. То есть открывается новая
-      // вкладка, справа последняя»*.
-      //
-      // Нового окна больше не заводит: делить область — отдельный жест (кнопка
-      // деления в шапке окна), и вешать его на ту же клавишу значило бы, что
-      // один жест иногда кладёт чип, а иногда перекраивает раскладку.
-      //
-      // В одиночном центре «окно» — это сам центр, и добавление идёт в его
-      // полосу; действие то же самое, поверхность другая.
-      const store = useWorkspaceStore.getState();
-      const paneIndex = store.splitPanes.length > 0 ? store.splitFocusedIndex : -1;
-      if (paneIndex >= 0) {
-        store.addTabToSplitPaneStrip(paneIndex, projectId, tabId);
-      } else {
-        store.addTabToCenterStrip(projectId, tabId);
-      }
-    } else if (e.altKey || e.ctrlKey) {
-      // Множественный выбор переехал с ⌘ на ⌥: сам выбор никуда не делся, у него
-      // сменилась клавиша, потому что ⌘ занял открытие в новом окне. Ctrl оставлен
-      // на всякий случай, хотя на macOS система обычно превращает его в правый клик.
-      toggleTabSelection(projectId, tabId, true);
-    } else {
-      const clickedTab = workspace?.tabs.get(tabId);
-      if (clickedTab?.tabType === 'file' && centerInThisProject && tabId === workspace?.activeTabId) {
-        const historyTargetId = [...(workspace.tabHistory || [])]
-          .reverse()
-          .find((id) => id !== tabId && workspace.tabs.get(id)?.tabType !== 'file');
-        const fallbackParentId = clickedTab.visualParentTabId && workspace.tabs.has(clickedTab.visualParentTabId)
-          ? clickedTab.visualParentTabId
-          : null;
-        const returnTargetId = historyTargetId || fallbackParentId;
-        if (returnTargetId) {
-          console.warn('[TabBar:click] file-tab-toggle-back tabId=' + tabId + ' target=' + returnTargetId + ' ts=' + Date.now());
-          useWorkspaceStore.getState().activateCenterTab(projectId, returnTargetId);
-          return;
-        }
-      }
-      if (currentView === 'home' && tabId === workspace?.activeTabId) {
-        console.warn('[TabBar:click] return-from-home active-tab project=' + projectId + ' tabId=' + tabId + ' ts=' + Date.now());
-      }
-      console.warn('[TabBar:click] switchTab tabId=' + tabId + ' ts=' + Date.now());
-      // If clicking the already-active Gemini tab while viewing a sub-agent → return to Gemini
-      if (tabId === workspace?.activeTabId && viewingSubAgentTabId) {
-        useWorkspaceStore.getState().setViewingSubAgent(null);
-      }
-      // Click-cost split (16.08: tab-click handlerMs grew 75→300ms between
-      // builds with `during=none-marked` — this names the two halves).
-      // syncMs inside switchTab covers the store move; activateMs here covers
-      // everything the click does synchronously, so activateMs - syncMs is
-      // the cost living OUTSIDE switchTab (view flips, reveal, subscribers).
-      const activateStartedAt = performance.now();
-      const endClickMark = markRendererActivity('tab-click:' + tabId.slice(-8));
-      try {
-        useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
-      } finally {
-        endClickMark();
-        const activateMs = performance.now() - activateStartedAt;
-        if (activateMs >= 50) {
-          console.warn('[Perf:TabClick] tab=' + tabId.slice(-12)
-            + ' activateMs=' + activateMs.toFixed(1));
-        }
+  const addTabToFocusedWindow = (tabId: string) => {
+    const store = useWorkspaceStore.getState();
+    // Avoid the centre-strip one-chip write and, more importantly, avoid
+    // promising an action when this exact row is already shown in the target.
+    const action = resolveTabWindowAction(store, projectId, tabId);
+    if (action === null) return;
+    const paneIndex = store.splitPanes.length > 0 ? store.splitFocusedIndex : -1;
+    if (paneIndex >= 0) store.addTabToSplitPaneStrip(paneIndex, projectId, tabId);
+    // The pane helper already opens an existing chip. The centre add helper
+    // intentionally returns early for an existing chip, so its `open` case
+    // goes through the same unified activation as clicking that chip itself.
+    else if (action === 'open') store.activateCenterTab(projectId, tabId);
+    else store.addTabToCenterStrip(projectId, tabId);
+  };
+
+  const activateTabFromSidebar = (tabId: string) => {
+    const clickedTab = workspace?.tabs.get(tabId);
+    if (clickedTab?.tabType === 'file' && centerInThisProject && tabId === workspace?.activeTabId) {
+      const historyTargetId = [...(workspace.tabHistory || [])]
+        .reverse()
+        .find((id) => id !== tabId && workspace.tabs.get(id)?.tabType !== 'file');
+      const fallbackParentId = clickedTab.visualParentTabId && workspace.tabs.has(clickedTab.visualParentTabId)
+        ? clickedTab.visualParentTabId
+        : null;
+      const returnTargetId = historyTargetId || fallbackParentId;
+      if (returnTargetId) {
+        console.warn('[TabBar:click] file-tab-toggle-back tabId=' + tabId + ' target=' + returnTargetId + ' ts=' + Date.now());
+        useWorkspaceStore.getState().activateCenterTab(projectId, returnTargetId);
+        return;
       }
     }
+    if (currentView === 'home' && tabId === workspace?.activeTabId) {
+      console.warn('[TabBar:click] return-from-home active-tab project=' + projectId + ' tabId=' + tabId + ' ts=' + Date.now());
+    }
+    console.warn('[TabBar:click] switchTab tabId=' + tabId + ' ts=' + Date.now());
+    // If clicking the already-active Gemini tab while viewing a sub-agent → return to Gemini
+    if (tabId === workspace?.activeTabId && viewingSubAgentTabId) {
+      useWorkspaceStore.getState().setViewingSubAgent(null);
+    }
+    // Click-cost split (16.08: tab-click handlerMs grew 75→300ms between
+    // builds with `during=none-marked` — this names the two halves).
+    // syncMs inside switchTab covers the store move; activateMs here covers
+    // everything the click does synchronously, so activateMs - syncMs is
+    // the cost living OUTSIDE switchTab (view flips, reveal, subscribers).
+    const activateStartedAt = performance.now();
+    const endClickMark = markRendererActivity('tab-click:' + tabId.slice(-8));
+    try {
+      useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+    } finally {
+      endClickMark();
+      const activateMs = performance.now() - activateStartedAt;
+      if (activateMs >= 50) {
+        console.warn('[Perf:TabClick] tab=' + tabId.slice(-12)
+          + ' activateMs=' + activateMs.toFixed(1));
+      }
+    }
+  };
+
+  const handleTabClick = (e: React.MouseEvent, tabId: string) => {
+    if (e.altKey || e.ctrlKey) {
+      // Alt/Ctrl keep multi-select. Shift no longer means range selection: it
+      // is the explicit form of the same add/open action as a plain click.
+      toggleTabSelection(projectId, tabId, true);
+      return;
+    }
+    if (e.metaKey && !e.shiftKey) {
+      // Cmd preserves the old plain-click contract: unified activation, with
+      // all split/space/file-toggle rules in the existing choke point.
+      activateTabFromSidebar(tabId);
+      return;
+    }
+    // Plain click and Shift+click both append/move to the focused pane/centre.
+    // Shift is useful as an explicit modifier mode because it also reveals the
+    // row-scoped plaque before commit. Shift+Cmd follows Shift deliberately.
+    addTabToFocusedWindow(tabId);
   };
   // OSC 133 Event-driven process status (replaces polling)
   // Stable listeners — subscribe once, never re-create
@@ -6684,7 +6759,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   if (!workspace || !project) return null;
 
   const allTabs = Array.from(workspace.tabs.values());
-  const visibleTabs = allTabs;
+  const visibleTabs = allTabs.filter((tab) => !hiddenWindowScopedTabIds.has(tab.id));
   const mainTabsBase = visibleTabs;
   const tabGroups = workspace.tabGroups || [];
   // A drag preview is the live layout. Drop only persists this already-visible
@@ -8744,6 +8819,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                       isDragBlockedTarget={false}
                       isAnyDragging={isMultiSelect ? tabbarVisualLockActive : sharedTabbarVisualLockActive}
                       cmdPeekMode={!sharedOutlineDragActive && isCmdPressed && isMouseInTabBar}
+                      shiftPeekMode={!sharedOutlineDragActive && isShiftPressed && isMouseInTabBar}
                       isCollapsed={!!tab.isCollapsed}
                       isViewingSubAgent={viewingSubAgentParentId === tab.id}
                       completionNotificationArmed={!!tab.completionNotificationArmed}
@@ -8857,6 +8933,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                     isDragBlockedTarget={dragPreview?.status === 'blocked' && !!dragPreview.targetTabIds?.includes(tab.id)}
                     isAnyDragging={tabbarVisualLockActive}
                     cmdPeekMode={isCmdPressed && isMouseInTabBar}
+                    shiftPeekMode={isShiftPressed && isMouseInTabBar}
                     isCollapsed={!!tab.isCollapsed}
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
                     completionNotificationArmed={!!tab.completionNotificationArmed}
@@ -9325,6 +9402,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                     isDragTarget={!!dragPreview?.targetTabIds?.includes(tab.id)}
                     isAnyDragging={isDraggingTab}
                     cmdPeekMode={isCmdPressed && isMouseInTabBar}
+                    shiftPeekMode={isShiftPressed && isMouseInTabBar}
                     isCollapsed={!!tab.isCollapsed}
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
                     completionNotificationArmed={!!tab.completionNotificationArmed}

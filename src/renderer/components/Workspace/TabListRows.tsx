@@ -27,8 +27,9 @@ import {
   flattenRgbaOnTabbarPanel,
   getTabChromeColorConfig,
 } from './tabChrome';
-import { TabProcessBar, TabStatusMarker } from './TabSignals';
+import { TabCmdHint, TabProcessBar, TabStatusMarker } from './TabSignals';
 import { TabPaneMap } from './PaneMap';
+import { paneTabs } from '../../utils/splitPanesModel.mjs';
 
 export interface TabListTab {
   id: string;
@@ -60,6 +61,55 @@ export interface TabListRowTab {
 export type TabListRow = TabListRowProject | TabListRowTab;
 
 export interface SessionStatusLike { id: string; color?: string; label?: string }
+
+export type TabWindowAction = 'add' | 'open' | null;
+
+interface TabWindowStateLike {
+  splitPanes: Array<{
+    projectId: string;
+    tabId: string;
+    tabs?: Array<{ projectId: string; tabId: string }>;
+  }>;
+  splitFocusedIndex: number;
+  activeProjectId: string | null;
+  centerStrips: Record<string, Array<{ projectId: string; tabId: string }>>;
+  openProjects: ReadonlyMap<string, { activeTabId: string | null }>;
+}
+
+/**
+ * What Shift/plain click can do to this exact row in the focused window.
+ *
+ * `null` means the row is already SHOWN there, so an affordance would promise
+ * a no-op. `open` means its chip is already in the target strip but another
+ * chip is shown; `add` means it will be appended (or moved from another
+ * window). One resolver feeds both the sidebar and the global switcher.
+ */
+export function resolveTabWindowAction(
+  state: TabWindowStateLike,
+  projectId: string,
+  tabId: string,
+): TabWindowAction {
+  if (!projectId || !tabId) return null;
+
+  if (state.splitPanes.length > 0) {
+    const pane = state.splitPanes[state.splitFocusedIndex];
+    if (!pane) return null;
+    if (pane.projectId === projectId && pane.tabId === tabId) return null;
+    return paneTabs(pane).some((entry: { projectId: string; tabId: string }) => (
+      entry.projectId === projectId && entry.tabId === tabId
+    )) ? 'open' : 'add';
+  }
+
+  const centerProjectId = state.activeProjectId;
+  if (!centerProjectId) return null;
+  const shownTabId = state.openProjects.get(centerProjectId)?.activeTabId || '';
+  if (centerProjectId === projectId && shownTabId === tabId) return null;
+  const strip = state.centerStrips[centerProjectId] || [];
+  if (strip.some((entry) => entry.projectId === projectId && entry.tabId === tabId)) return 'open';
+  // addTabToCenterStrip needs either a real strip or the currently shown chip
+  // as its base. With neither, there is no honest target to advertise.
+  return shownTabId || strip.length > 0 ? 'add' : null;
+}
 
 /** Project separator. Deliberately not clickable and deliberately quiet. */
 export function TabListProjectHeader({
@@ -129,6 +179,8 @@ export interface TabListTabRowProps {
    * project it belongs to.
    */
   paneMapProjectId?: string | null;
+  /** Shift/plain-click action in the currently focused window. */
+  windowAction?: TabWindowAction;
   /**
    * "Ты здесь": the row is the tab the user is on, shown as a reference point
    * rather than as a destination (Ctrl+Tab's row 1).
@@ -155,6 +207,7 @@ export function TabListTabRow({
   onPointerDown,
   trailingLabel,
   paneMapProjectId,
+  windowAction = null,
   anchor = false,
 }: TabListTabRowProps) {
   const chrome = getTabChromeColorConfig(tab as any);
@@ -172,6 +225,7 @@ export function TabListTabRow({
       data-tab-list-row={tab.id}
       data-switcher-index={index}
       data-tab-list-anchor={anchor ? '1' : undefined}
+      data-tab-window-action={windowAction || undefined}
       onPointerEnter={onPointerEnter}
       onPointerDown={onPointerDown}
       title={anchor
@@ -192,7 +246,9 @@ export function TabListTabRow({
           ? 'inset 0 0 0 1px rgba(255,255,255,0.30)'
           : (anchor ? 'inset 2px 0 0 0 #6e6e76' : 'none'),
         marginBottom: 1,
-        overflow: 'hidden',
+        // The modifier hint sits on the row's top seam. Text and trailing
+        // labels own their clipping, so the host can stay open for that seam.
+        overflow: 'visible',
         userSelect: 'none',
         opacity: missing ? 0.55 : 1,
       }}
@@ -207,6 +263,10 @@ export function TabListTabRow({
         zIndex={1}
       />
       <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} left={6} />
+      <TabCmdHint
+        text={windowAction === 'open' ? 'открыть в этом окне' : 'добавить в это окно'}
+        visible={windowAction !== null}
+      />
 
       {tab.tabType === 'file' && (
         // Red icon = the linked file is gone from disk.

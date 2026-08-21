@@ -27,7 +27,12 @@ import {
 } from '../../utils/iterationSearchModel.mjs';
 import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
 import { TOP_STRIP_H } from '../../constants/layout';
-import { TabListProjectHeader, TabListTabRow } from './TabListRows';
+import {
+  TabListProjectHeader,
+  TabListTabRow,
+  resolveTabWindowAction,
+  type TabWindowAction,
+} from './TabListRows';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 
 // Ctrl+Tab (MRU hold-and-release) + Cmd+P (search) switcher over ALL open
@@ -553,6 +558,12 @@ const iterationMemory: IterationMemory = {
 export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyTabs }: TabSwitcherOverlayProps) {
   const [mode, setMode] = useState<Mode | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(-1);
+  const [shiftPressed, setShiftPressed] = useState(false);
+  const shiftPressedRef = useRef(false);
+  const setShiftMode = useCallback((pressed: boolean) => {
+    shiftPressedRef.current = pressed;
+    setShiftPressed((previous) => previous === pressed ? previous : pressed);
+  }, []);
   const [query, setQuery] = useState('');
   const [scope, setScope] = useState<SearchScope>('tabs');
   const [iterationHits, setIterationHits] = useState<IterationHit[]>(() => iterationMemory.hits);
@@ -672,6 +683,17 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     }
     return computeRowsFromStores(mode === 'search' ? query : '', mode === 'ctrl');
   }, [visible, openProjects, projectHistory, projectsMeta, globalTabMru, query, mode, missingProbeTick, onScreenKey, activeTabId, iterationMode, iterationHits]);
+  const selectedTabRow = rows[selectedIndex]?.kind === 'tab'
+    ? rows[selectedIndex] as RowTab
+    : null;
+  // Primitive per-target selector: changing another pane or another row does
+  // not subscribe this global overlay to a Map/array reference. Hover uses the
+  // same selectedIndex as the keyboard, so this is also the hovered row's
+  // exact add/open/no-op answer.
+  const selectedWindowAction = useWorkspaceStore((state): TabWindowAction => {
+    if (!shiftPressed || !selectedTabRow || selectedTabRow.missing) return null;
+    return resolveTabWindowAction(state, selectedTabRow.projectId, selectedTabRow.tab.id);
+  });
   useEffect(() => {
     if (!visible) return;
     const paths: string[] = [];
@@ -963,7 +985,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     requestAnimationFrame(() => useUIStore.getState().setHistoryScrollToUuid(target.entryUuid));
   }, []);
 
-  const commitRow = useCallback((row: Row | undefined) => {
+  const commitRow = useCallback((row: Row | undefined, addToFocusedWindow = false) => {
     close();
     if (!row) return;
     if (row.kind === 'iteration') {
@@ -971,6 +993,19 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       return;
     }
     if (row.kind !== 'tab') return;
+    if (addToFocusedWindow) {
+      const state = useWorkspaceStore.getState();
+      // Resolve again at commit time: the focused pane is the user's target
+      // and may have changed after the row was rendered. A shown target is a
+      // deliberate no-op and never creates a one-chip centre strip.
+      const action = resolveTabWindowAction(state, row.projectId, row.tab.id);
+      if (action === null) return;
+      const paneIndex = state.splitPanes.length > 0 ? state.splitFocusedIndex : -1;
+      if (paneIndex >= 0) state.addTabToSplitPaneStrip(paneIndex, row.projectId, row.tab.id);
+      else if (action === 'open') state.activateCenterTab(row.projectId, row.tab.id);
+      else state.addTabToCenterStrip(row.projectId, row.tab.id);
+      return;
+    }
     // Single activation entry point: applies the split rules (a tab already
     // visible in a pane → focus jumps to that pane; hidden → it replaces the
     // focused pane's slot) and the cross-project view switch. switchTab inside
@@ -1056,6 +1091,11 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
 
     const onKeyDown = (e: KeyboardEvent) => {
       const cur = modeRef.current;
+      // Shift that OPENED Ctrl+Shift+Tab belongs to reverse cycling, not to the
+      // add/open action. The alternate action arms only when Shift is pressed
+      // after the overlay already exists (the user phrased it exactly this
+      // way: open the global menu, THEN hold Shift).
+      if (e.key === 'Shift' && cur !== null) setShiftMode(true);
       // Ctrl+Tab — open or step. Layout-agnostic (Tab is Tab everywhere).
       if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'Tab') {
         swallow(e);
@@ -1088,7 +1128,11 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
         // so keystrokes don't leak into the terminal underneath.
         if (e.key === 'ArrowDown') { swallow(e); selectByKeyboard((p) => stepIndex(rowsRef.current, p, +1)); return; }
         if (e.key === 'ArrowUp') { swallow(e); selectByKeyboard((p) => stepIndex(rowsRef.current, p, -1)); return; }
-        if (e.key === 'Enter') { swallow(e); commitRow(rowsRef.current[selectedIndexRef.current]); return; }
+        if (e.key === 'Enter') {
+          swallow(e);
+          commitRow(rowsRef.current[selectedIndexRef.current], shiftPressedRef.current);
+          return;
+        }
       }
       if (cur === 'search') {
         // Tab переключает, ЧТО ищет строка. Клавиша выбрана по смыслу жеста:
@@ -1105,11 +1149,16 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
         // it works даже когда фокус ушёл с input.
         if (e.key === 'ArrowDown') { swallow(e); selectByKeyboard((p) => stepIndex(rowsRef.current, p, +1)); return; }
         if (e.key === 'ArrowUp') { swallow(e); selectByKeyboard((p) => stepIndex(rowsRef.current, p, -1)); return; }
-        if (e.key === 'Enter') { swallow(e); commitRow(rowsRef.current[selectedIndexRef.current]); return; }
+        if (e.key === 'Enter') {
+          swallow(e);
+          commitRow(rowsRef.current[selectedIndexRef.current], shiftPressedRef.current);
+          return;
+        }
       }
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') setShiftMode(false);
       if (modeRef.current !== 'ctrl') return;
       if (e.key === 'Control') {
         let effectiveRows = rowsRef.current;
@@ -1129,11 +1178,17 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
             activeWs?.activeTabId || null,
           );
         }
-        commitRow(effectiveRows[idx]);
+        commitRow(effectiveRows[idx], shiftPressedRef.current);
       }
     };
 
-    const onBlur = () => { if (modeRef.current === 'ctrl') close(); };
+    const onBlur = () => {
+      setShiftMode(false);
+      if (modeRef.current === 'ctrl') close();
+    };
+    // Lost keyup self-correction: every real mouse move carries the current
+    // modifier truth, including while the pointer is already over a row.
+    const onMouseMove = (e: MouseEvent) => setShiftMode(e.shiftKey === true);
 
     // Mouse entry point (toolbar button). Toggles like Cmd+P so a second click
     // on the same button closes the panel instead of re-opening it.
@@ -1144,15 +1199,17 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
 
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
+    window.addEventListener('mousemove', onMouseMove, true);
     window.addEventListener('blur', onBlur);
     window.addEventListener(TAB_SWITCHER_OPEN_EVENT, onExternalOpen);
     return () => {
       window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('keyup', onKeyUp, true);
+      window.removeEventListener('mousemove', onMouseMove, true);
       window.removeEventListener('blur', onBlur);
       window.removeEventListener(TAB_SWITCHER_OPEN_EVENT, onExternalOpen);
     };
-  }, [openCtrl, openSearch, close, commitRow]);
+  }, [openCtrl, openSearch, close, commitRow, setShiftMode]);
 
   // Refs mirroring latest rows/selection for the stable key handlers above.
   const rowsRef = useRef<Row[]>(rows);
@@ -1225,6 +1282,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     <div
       data-tab-switcher-root
       data-tab-switcher-mode={mode || ''}
+      data-tab-switcher-shift-mode={shiftPressed ? 'true' : undefined}
       style={{
         position: 'fixed',
         inset: 0,
@@ -1680,6 +1738,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                   inheritedBusy={isInheritedBusy(tab.id)}
                   sessionStatuses={sessionStatuses}
                   anchor={anchor}
+                  windowAction={shiftPressed && selected ? selectedWindowAction : null}
                   // Layout map: which pane this tab is already open in. Same mark
                   // as the sidebar card, so "this is the side pane's tab" is
                   // visible while choosing.
@@ -1696,7 +1755,9 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                     if (e.button === 1) { forgetRow(row); return; }
                     if (e.button !== 0) return;
                     if (missing) return; // vanished file — dead row, not a target
-                    commitRow(row);
+                    // The pointer event is the authoritative modifier snapshot
+                    // for this click; a stale global key flag must not reroute it.
+                    commitRow(row, e.shiftKey);
                   }}
                 />
               </div>
